@@ -69,9 +69,12 @@ export class Invalidator {
   /** Invalidates every query under `keys`; the key `[]` means everything. */
   add(keys: readonly QueryKey[]): void {
     for (const key of keys) {
+      if (key.length === 0) {
+        this.#everythingPending = true;
+        continue;
+      }
       this.#awaitFetches(key);
-      if (key.length === 0) this.#everythingPending = true;
-      else this.#pending.set(JSON.stringify(key), key);
+      this.#pending.set(JSON.stringify(key), key);
     }
     this.#schedule();
     this.#scheduleEverything();
@@ -132,6 +135,7 @@ export class Invalidator {
       this.#everythingTimer = undefined;
       this.#everythingPending = false;
       this.#lastEverything = Date.now();
+      this.#awaitFetches([]);
       this.#invalidate({});
     }, wait);
   }

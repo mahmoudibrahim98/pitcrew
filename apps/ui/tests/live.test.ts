@@ -250,6 +250,35 @@ describe('invalidator', () => {
     expect(spy.mock.calls[1]?.[0]).toMatchObject({ queryKey: ['tasks', 'list'] });
     invalidator.stop();
   });
+
+  it('does not let a query settling mid-fetch bypass the everything rate limit', async () => {
+    // A steady stream of unknown-type events calls `add([[]])` repeatedly. Each refetch the
+    // everything timer triggers is itself a fetch in flight; `add` used to await it too (it
+    // matches everything's `[]` prefix), so its settling queued an unrate-limited exact refetch
+    // and the chain sustained itself well past `everythingMs`.
+    vi.useFakeTimers();
+    const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false } } });
+    let calls = 0;
+    const unsubscribe = new QueryObserver(queryClient, {
+      queryKey: ['thing'],
+      queryFn: async () => {
+        calls += 1;
+        await sleep(300);
+        return calls;
+      },
+    }).subscribe(() => {});
+    await vi.advanceTimersByTimeAsync(400); // the initial fetch settles
+
+    const invalidator = new Invalidator(queryClient, { windowMs: 250, everythingMs: 5_000 });
+    for (let t = 0; t < 10_000; t += 200) {
+      invalidator.add([[]]);
+      await vi.advanceTimersByTimeAsync(200);
+    }
+    // 1 initial fetch + at most 3 refetches over 10 s at a 5 s rate limit.
+    expect(calls).toBeLessThanOrEqual(4);
+    invalidator.stop();
+    unsubscribe();
+  });
 });
 
 describe('live cache with a scripted stream', () => {
@@ -403,6 +432,31 @@ describe('live cache with a scripted stream', () => {
 
     const queryFn = vi.fn(async () => [task('Z', 'done')]);
     const unsubscribe = new QueryObserver(queryClient, { queryKey: done, queryFn }).subscribe(() => {});
+    await vi.waitFor(() => expect(queryFn).toHaveBeenCalledTimes(1));
+    unsubscribe();
+  });
+
+  it('keeps an invalidated task detail invalidated through a patch for the same task, so it refetches on mount', async () => {
+    const { queryClient, emit } = setup();
+    const detail = keys.tasks.detail('X');
+    queryClient.setQueryData(detail, task('X', 'todo'));
+    // X is reassigned while its detail is not mounted: invalidates, does not write.
+    emit({ type: 'task_assigned', data: { task: 'X', assignee: 'M2' } });
+    await vi.waitFor(() => expect(queryClient.getQueryState(detail)?.isInvalidated).toBe(true));
+
+    // A patch for the very same task must not write over the pending invalidation.
+    emit({
+      type: 'subtasks_replaced',
+      data: {
+        task: 'X',
+        subtasks: [{ id: '01JB0000000000000000000S01', text: 'nope', done: false, source: { kind: 'human' } }],
+      },
+    });
+    expect(queryClient.getQueryState(detail)?.isInvalidated).toBe(true);
+    expect(queryClient.getQueryData<Task>(detail)?.subtasks).toEqual([]);
+
+    const queryFn = vi.fn(async () => task('X', 'todo'));
+    const unsubscribe = new QueryObserver(queryClient, { queryKey: detail, queryFn }).subscribe(() => {});
     await vi.waitFor(() => expect(queryFn).toHaveBeenCalledTimes(1));
     unsubscribe();
   });
