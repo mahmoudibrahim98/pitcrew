@@ -100,7 +100,24 @@ mod probe {
     impl Drop for Probe {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_file(format!("{}.pid", self.0.display()));
         }
+    }
+
+    #[test]
+    fn hanging_probe_times_out_and_is_reaped() {
+        let probe = Probe::new("#!/bin/sh\nprintf '%s' \"$$\" > \"$0.pid\"\nexec sleep 10\n");
+        let started = std::time::Instant::now();
+        assert!(matches!(detect_tmux(&probe.0), Err(DetectError::TimedOut)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let pid = std::fs::read_to_string(format!("{}.pid", probe.0.display())).expect("probe pid");
+        let alive = std::process::Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("check child process");
+        assert!(!alive.success(), "timed-out child still exists");
     }
 
     #[test]

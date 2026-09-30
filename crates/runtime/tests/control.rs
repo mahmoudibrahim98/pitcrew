@@ -128,6 +128,14 @@ fn cases() -> Vec<(Vec<u8>, Notification)> {
         ),
         (b"%pause %0\n".to_vec(), Pause { pane: PaneId(0) }),
         (b"%continue %0\n".to_vec(), Continue { pane: PaneId(0) }),
+        (
+            b"%pane-mode-changed %3\n".to_vec(),
+            PaneModeChanged { pane: PaneId(3) },
+        ),
+        (
+            b"%pane-mode-changed %0\r\n".to_vec(),
+            PaneModeChanged { pane: PaneId(0) },
+        ),
         (b"%exit\n".to_vec(), Exit { reason: None }),
         (
             b"%exit server exited\n".to_vec(),
@@ -309,10 +317,8 @@ proptest! {
 
 #[test]
 fn bounded_lines_and_replies_latch_desync() {
-    let limits = ParserLimits {
-        max_line_bytes: 20,
-        max_reply_bytes: 5,
-    };
+    // Five wire bytes plus 32 bytes for each of the three body lines.
+    let limits = ParserLimits::new(20, 101);
     for split in 0..=22 {
         let mut parser = ControlParser::with_limits(limits);
         let wire = b"123456789012345678901\n";
@@ -339,11 +345,11 @@ fn bounded_lines_and_replies_latch_desync() {
     );
     assert_eq!(
         parser.feed(b"\n"),
-        Err(DesyncError::ReplyTooLarge { limit: 5 })
+        Err(DesyncError::ReplyTooLarge { limit: 101 })
     );
     assert_eq!(
         parser.feed(b""),
-        Err(DesyncError::ReplyTooLarge { limit: 5 })
+        Err(DesyncError::ReplyTooLarge { limit: 101 })
     );
 
     let mut parser = ControlParser::with_limits(limits);
@@ -351,10 +357,7 @@ fn bounded_lines_and_replies_latch_desync() {
         .feed(b"%begin 1 2 0\nab\n\n\n%end 1 2 0\n%begin 1 3 0\n1234\n%end 1 3 0\n")
         .expect("budget resets");
     assert_eq!(replies.len(), 2);
-    let mut parser = ControlParser::with_limits(ParserLimits {
-        max_line_bytes: 20,
-        max_reply_bytes: 0,
-    });
+    let mut parser = ControlParser::with_limits(ParserLimits::new(20, 0));
     assert_eq!(
         parser
             .feed(b"%begin 1 2 0\n%end 1 2 0\n")
@@ -374,6 +377,11 @@ fn finish_reports_partial_lines_and_open_replies() {
         (b"%out".as_slice(), false, 4),
         (b"%begin 1 2 0\n".as_slice(), true, 0),
         (b"%begin 1 2 0\npartial".as_slice(), true, 7),
+        (
+            b"%begin 1 2 0\npartial reply\n%exit gone\r\n".as_slice(),
+            true,
+            0,
+        ),
     ] {
         let mut parser = ControlParser::new();
         assert!(parser.feed(input).expect("feed").is_empty());
@@ -389,7 +397,7 @@ fn finish_reports_partial_lines_and_open_replies() {
 }
 
 #[test]
-fn crlf_flags_and_exit_inside_reply() {
+fn crlf_flags_and_top_level_exit() {
     let mut parser = ControlParser::new();
     let actual = parser.feed(b"%begin 1 2 0\r\nbody\r\n%end 1 2 1\r\n%error 1 2 1\n%end 1 2 0\r\n%output %0 a\\015\r\n%exit reason\r\n").expect("parse");
     assert_eq!(
@@ -416,16 +424,55 @@ fn crlf_flags_and_exit_inside_reply() {
         ]
     );
     assert_eq!(parser.finish(), Ok(()));
-    let mut parser = ControlParser::new();
-    assert_eq!(
+}
+
+#[test]
+fn pane_titles_and_window_names_cannot_abort_replies() {
+    for (vector, body) in [
+        ("pane title", b"%exit forged\n".as_slice()),
+        (
+            "window name",
+            b"name\n%exit forged\n%output %1 injected\n".as_slice(),
+        ),
+        (
+            "CRLF body",
+            b"%exit forged\r\n%output %1 injected\r\n".as_slice(),
+        ),
+    ] {
+        let wire = [b"%begin 1 2 0\n".as_slice(), body, b"%end 1 2 0\n"].concat();
+        let expected = vec![Notification::CommandReply(CommandReply {
+            time: 1,
+            number: 2,
+            flags: 0,
+            failed: false,
+            lines: body[..body.len() - 1]
+                .split(|&byte| byte == b'\n')
+                .map(<[u8]>::to_vec)
+                .collect(),
+        })];
+        for split in 0..=wire.len() {
+            let mut parser = ControlParser::new();
+            let mut actual = parser.feed(&wire[..split]).expect("first chunk");
+            actual.extend(parser.feed(&wire[split..]).expect("second chunk"));
+            assert_eq!(actual, expected, "{vector}, split {split}");
+            assert_eq!(parser.finish(), Ok(()));
+        }
+    }
+}
+
+#[test]
+fn empty_reply_lines_consume_allocation_budget() {
+    let mut parser = ControlParser::with_limits(ParserLimits::new(20, 66));
+    assert!(
         parser
-            .feed(b"%begin 1 2 0\npartial reply\n%exit gone\r\n")
-            .expect("exit"),
-        vec![Notification::Exit {
-            reason: Some(b"gone".to_vec())
-        }]
+            .feed(b"%begin 1 2 0\n\n\n")
+            .expect("two empty lines")
+            .is_empty()
     );
-    assert_eq!(parser.finish(), Ok(()));
+    assert_eq!(
+        parser.feed(b"\n"),
+        Err(DesyncError::ReplyTooLarge { limit: 66 })
+    );
 }
 
 #[test]

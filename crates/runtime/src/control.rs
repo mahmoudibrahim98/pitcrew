@@ -104,6 +104,9 @@ pub enum Notification {
     Continue {
         pane: PaneId,
     },
+    PaneModeChanged {
+        pane: PaneId,
+    },
     Exit {
         reason: Option<Vec<u8>>,
     },
@@ -116,13 +119,23 @@ pub enum Notification {
     },
 }
 
-/// Wire storage limits. LF is excluded from the line limit; every reply body
-/// line includes its LF in the reply budget so empty lines also consume budget.
+/// Storage limits. LF is excluded from the line limit; every reply body line
+/// charges its wire bytes, one LF, and 32 bytes of allocation overhead.
 /// The optional transport CR counts towards both limits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ParserLimits {
     pub max_line_bytes: usize,
     pub max_reply_bytes: usize,
+}
+
+impl ParserLimits {
+    pub const fn new(max_line_bytes: usize, max_reply_bytes: usize) -> Self {
+        Self {
+            max_line_bytes,
+            max_reply_bytes,
+        }
+    }
 }
 
 impl Default for ParserLimits {
@@ -136,6 +149,7 @@ impl Default for ParserLimits {
 
 /// The connection cannot be parsed safely. Drop its parser and reconnect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DesyncError {
     LineTooLong {
         limit: usize,
@@ -251,13 +265,6 @@ impl ControlParser {
             &line
         };
         let (name, args) = split(normalized);
-        if name == b"%exit" {
-            // Exit aborts any open reply. The caller fails its outstanding command;
-            // incomplete response data is never emitted as a successful reply.
-            self.reply = None;
-            self.reply_bytes = 0;
-            return Ok(parse_notification(name, args));
-        }
         if let Some(reply) = &mut self.reply {
             // tmux never interleaves notifications in a reply. Even lines starting
             // with '%' are response data unless they are the matching end guard.
@@ -271,12 +278,17 @@ impl ControlParser {
                 return Ok(self.reply.take().map(Notification::CommandReply));
             }
             let available = self.limits.max_reply_bytes - self.reply_bytes;
-            if line.len() >= available {
+            // Include the LF and per-line allocation cost, including empty lines.
+            let Some(cost) = line
+                .len()
+                .checked_add(1 + 32)
+                .filter(|&cost| cost <= available)
+            else {
                 return Err(self.fail(DesyncError::ReplyTooLarge {
                     limit: self.limits.max_reply_bytes,
                 }));
-            }
-            self.reply_bytes += line.len() + 1;
+            };
+            self.reply_bytes += cost;
             reply.lines.push(line);
             return Ok(None);
         }
@@ -394,6 +406,9 @@ fn parse_notification(name: &[u8], args: &[u8]) -> Option<Notification> {
             pane: PaneId::parse(args)?,
         },
         b"%continue" => Continue {
+            pane: PaneId::parse(args)?,
+        },
+        b"%pane-mode-changed" => PaneModeChanged {
             pane: PaneId::parse(args)?,
         },
         b"%exit" => Exit {

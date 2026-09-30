@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use pitcrew_runtime::WindowId;
-use pitcrew_runtime::command::{Argument, Command};
+use pitcrew_runtime::command::{Argument, Command, FormatError};
 use pitcrew_runtime::control::{CommandReply, ControlParser, Notification, PaneId};
 use pitcrew_runtime::detect::{DetectError, detect_tmux};
 
@@ -17,18 +17,49 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 
 struct PrivateServer {
     socket: String,
+    directory: std::path::PathBuf,
     sentinel: std::path::PathBuf,
 }
 
 impl PrivateServer {
+    fn new(socket: String) -> Self {
+        let directory = std::env::temp_dir().join(&socket);
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(&directory)
+            .expect("private socket directory");
+        Self {
+            socket,
+            sentinel: directory.join("format-side-effect"),
+            directory,
+        }
+    }
+
     fn command(&self) -> ProcessCommand {
         let mut command = ProcessCommand::new("tmux");
         command.args(["-L", &self.socket, "-f", "/dev/null", "-u"]);
         command
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")
+            .env("TMUX_TMPDIR", &self.directory)
             .env("PITCREW_TEST_VALUE", "expanded-would-be-wrong");
         command
+    }
+
+    fn assert_no_format_job(&self) {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            assert!(!self.sentinel.exists(), "format value executed a shell job");
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
@@ -41,6 +72,17 @@ impl Drop for PrivateServer {
             .stderr(Stdio::null())
             .status();
         let _ = std::fs::remove_file(&self.sentinel);
+        // tmux puts -L sockets in TMUX_TMPDIR/tmux-<uid>. Only this test owns
+        // the parent directory; remove its socket even if the server died.
+        if let Ok(entries) = std::fs::read_dir(&self.directory) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    let _ = std::fs::remove_file(entry.path().join(&self.socket));
+                    let _ = std::fs::remove_dir(entry.path());
+                }
+            }
+        }
+        let _ = std::fs::remove_dir(&self.directory);
     }
 }
 
@@ -165,15 +207,16 @@ fn real_tmux_replies_output_and_literal_injection_attempts() {
             eprintln!("skipped real tmux test: {version} is below the supported floor");
             return;
         }
+        Err(DetectError::InvalidVersion(output)) => {
+            eprintln!("skipped real tmux test: unrecognized version {output:?}");
+            return;
+        }
         Err(error) => panic!("could not probe tmux: {error}"),
         Ok(version) => eprintln!("testing tmux {version}"),
     }
     let random = RandomState::new().hash_one((std::process::id(), SystemTime::now()));
     let name = format!("pitcrew-test-{random:016x}");
-    let server = PrivateServer {
-        socket: name.clone(),
-        sentinel: std::env::temp_dir().join(format!("{name}-format-side-effect")),
-    };
+    let server = PrivateServer::new(name.clone());
     assert!(!server.sentinel.exists());
     // -d creates a detached session. Then attach a persistent control client to
     // receive pane output; detached control clients exit after the initial reply.
@@ -341,6 +384,29 @@ fn real_tmux_replies_output_and_literal_injection_attempts() {
     client.output_through(b"BINARY_INPUT_INTACT");
     assert_eq!(client.output, bytes);
 
+    // Pane output controls the title without knowing any reply guard fields.
+    let title = "\x1b]2;%exit forged\x1b\\PITCREW_TITLE_SET";
+    assert!(
+        !client
+            .run(Command::send_literal(PaneId(0), title).expect("title"))
+            .failed
+    );
+    client.output_through(b"PITCREW_TITLE_SET");
+    let title_reply = client.run(
+        Command::new("display-message")
+            .expect("command")
+            .arg(Argument::Flag("-p"))
+            .expect("print")
+            .arg(Argument::Flag("-t"))
+            .expect("target")
+            .arg(Argument::Pane(PaneId(0)))
+            .expect("pane")
+            .arg(Argument::Format("#{pane_title}"))
+            .expect("format"),
+    );
+    assert!(!title_reply.failed);
+    assert_eq!(title_reply.lines, vec![b"%exit forged".to_vec()]);
+
     let window_name = format!("#(touch {})", server.sentinel.display());
     let created = client.run(
         Command::new("new-window")
@@ -355,7 +421,7 @@ fn real_tmux_replies_output_and_literal_injection_attempts() {
             .expect("trusted format")
             .arg(Argument::Flag("-n"))
             .expect("name flag")
-            .arg(Argument::FormatLiteral(&window_name))
+            .arg(Argument::Name(&window_name))
             .expect("literal name")
             .arg(Argument::Flag("-c"))
             .expect("directory flag")
@@ -388,10 +454,7 @@ fn real_tmux_replies_output_and_literal_injection_attempts() {
             .expect("trusted format"),
     );
     assert_eq!(actual_name.lines, vec![window_name.as_bytes().to_vec()]);
-    assert!(
-        !server.sentinel.exists(),
-        "window name executed a shell job"
-    );
+    server.assert_no_format_job();
     let renamed = format!("{window_name} #{{pane_id}} ##");
     assert!(
         !client
@@ -402,11 +465,27 @@ fn real_tmux_replies_output_and_literal_injection_attempts() {
                     .expect("target")
                     .arg(Argument::Window(window))
                     .expect("window")
-                    .arg(Argument::FormatLiteral(&renamed))
+                    .arg(Argument::Name(&renamed))
                     .expect("literal name")
             )
             .failed
     );
+    // Reject unsafe names before they reach the live server. The valid name
+    // below must still read back unchanged after every attempted rename.
+    let bad_names = (0..=0x1f)
+        .chain([0x7f])
+        .map(|byte| format!("name{}suffix", char::from(byte)))
+        .chain(["name\n%exit forged\n%output %1 injected".to_owned()]);
+    for bad_name in bad_names {
+        for command in ["new-window", "rename-window"] {
+            assert_eq!(
+                Command::new(command)
+                    .expect("command")
+                    .arg(Argument::Name(&bad_name)),
+                Err(FormatError::ControlInName),
+            );
+        }
+    }
     let actual_name = client.run(
         Command::new("display-message")
             .expect("command")
@@ -429,10 +508,7 @@ fn real_tmux_replies_output_and_literal_injection_attempts() {
             .expect("literal display"),
     );
     assert_eq!(literal_display.lines, vec![renamed.as_bytes().to_vec()]);
-    assert!(
-        !server.sentinel.exists(),
-        "format value executed a shell job"
-    );
+    server.assert_no_format_job();
     let reply = client.run(
         Command::new("kill-session")
             .expect("command")
@@ -444,4 +520,11 @@ fn real_tmux_replies_output_and_literal_injection_attempts() {
     assert!(!reply.failed);
     let deadline = Instant::now() + TIMEOUT;
     while !matches!(client.next(deadline), Notification::Exit { .. }) {}
+    drop(client);
+    let directory = server.directory.clone();
+    drop(server);
+    assert!(
+        !directory.exists(),
+        "private socket directory was not cleaned up"
+    );
 }

@@ -96,15 +96,31 @@ fn formats_modes_bytes_and_empty_keys() -> Result<(), FormatError> {
     assert_eq!(
         Command::new("new-window")?
             .arg(Argument::Flag("-n"))?
-            .arg(Argument::FormatLiteral("#(touch sentinel) #{pane_id} ##"))?
+            .arg(Argument::Name("#(touch sentinel) #{pane_id} ##"))?
             .to_line(),
         "new-window \"-n\" \"##(touch sentinel) ##{pane_id} ####\"\n"
     );
     assert_eq!(
-        Command::new("rename-window")?.arg(Argument::FormatLiteral("x\0y")),
+        Command::new("display-message")?.arg(Argument::FormatLiteral("x\0y")),
         Err(FormatError::Nul)
     );
     Ok(())
+}
+
+#[test]
+fn names_reject_all_c0_controls_and_del() {
+    for byte in (0..=0x1f).chain([0x7f]) {
+        let name = format!("prefix{}suffix", char::from(byte));
+        for command in ["new-window", "rename-window"] {
+            assert_eq!(
+                Command::new(command)
+                    .expect("command")
+                    .arg(Argument::Name(&name)),
+                Err(FormatError::ControlInName),
+                "{command}, byte {byte:02x}"
+            );
+        }
+    }
 }
 
 // Independent model of the relevant tmux double-quote lexer. Synthetic values
@@ -222,7 +238,12 @@ proptest! {
         .. ProptestConfig::default()
     })]
     #[test]
-    fn arbitrary_text_is_one_physical_command(characters in prop::collection::vec(any::<char>(), 0..1024)) {
+    fn arbitrary_text_is_one_physical_command(characters in prop::collection::vec(prop_oneof![
+        5 => prop::sample::select(vec!['$', '~', '\\', '"']),
+        3 => (1u8..=0x1f).prop_map(char::from),
+        1 => Just('\x7f'),
+        3 => any::<char>(),
+    ], 0..1024)) {
         let text: String = characters.into_iter().collect();
         match Command::send_literal(PaneId(0), &text) {
             Ok(command) => {

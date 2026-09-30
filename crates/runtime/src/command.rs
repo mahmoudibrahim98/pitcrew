@@ -3,7 +3,7 @@
 //! This is not shell quoting or quoting for tmux's process argv. The low-level
 //! builder protects argument boundaries; callers still choose trusted commands
 //! and flags (commands such as `run-shell` intentionally interpret their values).
-//! Use `FormatLiteral` for user values in format-expanding options, and `Text`
+//! Use `Name` for names, `FormatLiteral` for other format-expanding options, and `Text`
 //! only where tmux does not expand formats. Requires tmux 3.2 or newer.
 
 use std::fmt::{self, Write};
@@ -18,8 +18,11 @@ use crate::keys::tmux_key;
 pub enum Argument<'a> {
     /// Text for an argument which does NOT expand tmux formats, such as `send-keys -l`.
     Text(&'a str),
-    /// User text for one format-expansion pass (`-n`, `-c`, `rename-window`, etc.).
+    /// A user name (`-n`, `rename-window`): rejects C0 controls and DEL, doubles `#`.
+    Name(&'a str),
+    /// User text for one format-expansion pass (such as `-c`).
     /// Doubles every `#` before quoting. Not shell quoting or recursive expansion protection.
+    /// `display-message` also expands strftime sequences: first escape `%` as `%%`.
     FormatLiteral(&'a str),
     /// A deliberately authored format expression. Never put untrusted text here.
     Format(&'static str),
@@ -43,6 +46,8 @@ pub enum FormatError {
     InvalidCommandName,
     /// tmux strings are NUL-terminated; silently truncating input would be incorrect.
     Nul,
+    /// Names must not contain C0 controls or DEL, which tmux can emit verbatim.
+    ControlInName,
 }
 
 impl fmt::Display for FormatError {
@@ -52,6 +57,7 @@ impl fmt::Display for FormatError {
                 "tmux command names must contain only lowercase ASCII letters and hyphens"
             }
             Self::Nul => "tmux text arguments cannot contain NUL",
+            Self::ControlInName => "tmux names cannot contain C0 controls or DEL",
         })
     }
 }
@@ -81,6 +87,12 @@ impl Command {
     pub fn arg(mut self, arg: Argument<'_>) -> Result<Self, FormatError> {
         let value = match arg {
             Argument::Text(text) => quote_argument(text)?,
+            Argument::Name(text) => {
+                if text.bytes().any(|byte| byte <= 0x1f || byte == 0x7f) {
+                    return Err(FormatError::ControlInName);
+                }
+                quote_argument(&text.replace('#', "##"))?
+            }
             Argument::FormatLiteral(text) => quote_argument(&text.replace('#', "##"))?,
             Argument::Format(format) => quote_argument(format)?,
             Argument::Flag(flag) => quote_argument(flag)?,

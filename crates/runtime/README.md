@@ -6,8 +6,10 @@ Terminal runtimes: tmux control mode and the PTY supervisor, behind pitcrew-inte
 
 The current implementation provides the building blocks for the runtimes. **tmux 3.2 is the
 minimum supported portable release.** `detect_tmux(path)` executes `path -V` directly and
-returns a parsed `TmuxVersion` or a fallback error. It recognizes letter suffixes (`3.3a`),
-development releases (`next-3.4`), and OpenBSD's separate OS numbering (`openbsd-7.4`).
+returns a parsed `TmuxVersion` or a fallback error. The probe is limited to two seconds and
+4 KiB per output stream; a timed-out process is killed and reaped. Version parsing recognizes
+letter suffixes (`3.3a`), development releases (`next-3.4`), and OpenBSD's separate OS numbering
+(`openbsd-7.4`).
 OpenBSD 6.9 is the minimum base-system version: its
 [manual](https://man.openbsd.org/OpenBSD-6.9/tmux.1) documents the required escaping and flow
 control. Older or unrecognized versions must use the PTY runtime. Version detection checks
@@ -16,22 +18,26 @@ the executable; the runtime must also verify any already-running server it conne
 - `control::ControlParser::feed(&[u8])` returns `Result<Vec<Notification>, DesyncError>`.
   It accepts arbitrary byte boundaries, decodes pane output once, and preserves reply lines,
   names, and unknown arguments as bytes. Reply guards must match timestamp, command number,
-  and flags. Notification-looking reply lines stay literal, except `%exit`, which aborts the
-  pending reply and emits `Exit`; callers must fail the outstanding command. `Other` retains
+  and flags. All notification-looking reply lines, including `%exit`, stay literal until the
+  matching end/error guard. EOF during a reply reports `UnexpectedEof` through `finish()`.
+  `Other` retains
   a lossless name and whether the line began with `%`. One trailing CR is stripped from marker
   and notification lines; reply body bytes remain untouched. Input is the LF-delimited `-C`
   protocol, not the terminal wrapper emitted by `-CC`.
-  `with_limits(ParserLimits)` bounds pending lines (default 1 MiB) and reply body wire bytes
-  (default 4 MiB, including one LF per line so empty lines consume budget). Storage also has
-  bounded per-line vector overhead. Exceeding either limit clears buffered state and latches
+  `with_limits(ParserLimits::new(line_limit, reply_limit))` bounds pending lines (default 1 MiB)
+  and reply storage (default 4 MiB). Each body line charges its byte length, one LF, and 32 bytes
+  of allocation overhead, including empty lines. Exceeding either limit clears state and latches
   a desync error. Notifications from a failing call are discarded; reconnect with a new parser.
   Consume the parser with `finish()` at EOF to check for an open reply and/or partial line.
 - `command::Command` builds a single command line from `Argument` values, including distinct
   pane, window, and session IDs. `Flag` identifies trusted flags, `Format` holds deliberately
   authored static format expressions, and `FormatLiteral` doubles every `#` before quoting.
-  Use `FormatLiteral` for all user values in format-expanding options: window names (`-n`,
-  `rename-window`), working directories (`-c`), and displayed text (`display-message`). It
-  protects one format-expansion pass; it does not make shell-command arguments safe.
+  Use `Name` for user names (`-n`, `rename-window`): it also doubles `#` and rejects all C0
+  controls and DEL, which tmux can otherwise emit verbatim. Use `FormatLiteral` for other user
+  values in format-expanding options, such as working directories (`-c`). For displayed text
+  (`display-message`), first escape `%` as `%%` as well: tmux also runs strftime (`%d` becomes
+  the day), so `FormatLiteral` alone is insufficient. These protect one format-expansion pass;
+  they do not make shell-command arguments safe.
   `Text` is for values whose command does not expand formats, including terminal input.
   `Command::send_literal` uses `send-keys -l`, terminates options with `--`, and never enables
   format expansion. Text arguments reject NUL; newline and other controls use octal escapes.
@@ -67,6 +73,7 @@ property tests exercise arbitrary stream boundaries, Unicode quoting through an 
 double-quote lexer model, and replay reads against an unbounded `Vec<u8>` model.
 The real-tmux test uses a random private socket,
 skips with a diagnostic when tmux is absent, and cleans up its clients and server on failure.
+Unknown and unsupported versions also skip. The private socket file and directory are removed.
 It verifies successful and failed replies, literal window names without format side effects,
 delivery after cancelling copy mode, binary input, and literal text containing quotes,
 semicolons, backslashes, variables, shell-looking text, newlines, formats, and Unicode.
