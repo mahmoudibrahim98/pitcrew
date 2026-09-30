@@ -78,12 +78,18 @@ impl EventSink for CollectSink {
 }
 
 /// Wraps a [`FakeSource`] whose items can be replaced (to "append"), and logs every
-/// `read_from` cursor offset.
+/// `read_from` cursor offset. Every transcript serves the same items.
 #[derive(Debug)]
 pub struct LoggedFake {
     transcripts: Vec<TranscriptRef>,
     inner: Mutex<FakeSource>,
     pub reads: Mutex<Vec<u64>>,
+    /// Items served per read (the plain fake serves one).
+    per_read: usize,
+    /// How long each read takes.
+    delay: Duration,
+    /// Reads of this transcript panic.
+    panic_on: Mutex<Option<PathBuf>>,
 }
 
 impl LoggedFake {
@@ -92,7 +98,27 @@ impl LoggedFake {
             inner: Mutex::new(FakeSource::new(Engine::Claude, transcripts.clone(), items)),
             transcripts,
             reads: Mutex::new(Vec::new()),
+            per_read: 1,
+            delay: Duration::ZERO,
+            panic_on: Mutex::new(None),
         }
+    }
+
+    /// Serves up to `n` items per read.
+    pub fn per_read(mut self, n: usize) -> Self {
+        self.per_read = n.max(1);
+        self
+    }
+
+    /// Makes every read take `d`.
+    pub fn delay(mut self, d: Duration) -> Self {
+        self.delay = d;
+        self
+    }
+
+    /// Makes reads of `path` panic.
+    pub fn panic_on(&self, path: &Path) {
+        *self.panic_on.lock().unwrap() = Some(path.canonicalize().unwrap());
     }
 
     pub fn set_items(&self, items: Vec<TranscriptItem>) {
@@ -116,7 +142,22 @@ impl SourceAdapter for LoggedFake {
 
     fn read_from(&self, t: &TranscriptRef, cursor: &Cursor) -> Result<ParseChunk, SourceError> {
         self.reads.lock().unwrap().push(cursor.offset);
-        self.inner.lock().unwrap().read_from(t, cursor)
+        let bad = self.panic_on.lock().unwrap().as_deref() == Some(t.path.as_path());
+        assert!(!bad, "fake adapter: cannot parse {}", t.path.display());
+        if !self.delay.is_zero() {
+            std::thread::sleep(self.delay);
+        }
+        let inner = self.inner.lock().unwrap();
+        let mut chunk = inner.read_from(t, cursor)?;
+        for _ in 1..self.per_read {
+            let next = inner.read_from(t, &chunk.cursor)?;
+            if next.items.is_empty() {
+                break;
+            }
+            chunk.items.extend(next.items);
+            chunk.cursor = next.cursor;
+        }
+        Ok(chunk)
     }
 
     fn read_page(
@@ -134,6 +175,32 @@ pub fn turn(i: u64) -> TranscriptItem {
         at: 1_790_000_000_000 + i64::try_from(i).unwrap(),
         offset: i,
     }
+}
+
+pub fn prompt(i: u64) -> TranscriptItem {
+    TranscriptItem::UserPrompt {
+        at: 1_790_000_000_000 + i64::try_from(i).unwrap(),
+        text: "go on".into(),
+        offset: i,
+    }
+}
+
+/// Polls `f` until it is true or `timeout` passes.
+pub fn eventually(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + timeout;
+    while Instant::now() < end {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    f()
+}
+
+/// Sets a file's mtime to `ago` before now.
+pub fn age(path: &Path, ago: Duration) {
+    let f = std::fs::File::options().write(true).open(path).unwrap();
+    f.set_modified(std::time::SystemTime::now() - ago).unwrap();
 }
 
 pub fn transcript_ref(path: &Path) -> TranscriptRef {

@@ -4,10 +4,17 @@
 
 mod common;
 
-use common::{CollectSink, LoggedFake, append, config, labels, transcript_ref, turn};
-use pitcrew_protocol::events::EventBody;
+use common::{
+    CollectSink, LoggedFake, age, append, config, eventually, labels, prompt, transcript_ref, turn,
+};
+use pitcrew_interfaces::source::{
+    Cursor, ParseChunk, SourceAdapter, SourceError, TranscriptItem, TranscriptPage, TranscriptRef,
+};
+use pitcrew_protocol::events::{Event, EventBody};
+use pitcrew_protocol::model::Engine;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[test]
@@ -101,17 +108,30 @@ fn new_items_arrive_fast_and_a_restart_resumes_from_the_cursor() {
     );
 }
 
-/// Accepts the first `n` batches, then refuses everything.
+/// Accepts the first `n` batches, then refuses everything. Remembers every batch offered.
 struct Refusing {
-    left: std::sync::Mutex<usize>,
+    left: Mutex<usize>,
     inner: CollectSink,
+    offered: Mutex<Vec<Vec<Event>>>,
+}
+
+impl Refusing {
+    fn new(accept: usize) -> Self {
+        Self {
+            left: Mutex::new(accept),
+            inner: CollectSink::default(),
+            offered: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn offered(&self) -> Vec<Vec<Event>> {
+        self.offered.lock().unwrap().clone()
+    }
 }
 
 impl pitcrew_runner::EventSink for Refusing {
-    fn accept(
-        &self,
-        events: &[pitcrew_protocol::events::Event],
-    ) -> Result<(), pitcrew_runner::SinkError> {
+    fn accept(&self, events: &[Event]) -> Result<(), pitcrew_runner::SinkError> {
+        self.offered.lock().unwrap().push(events.to_vec());
         let mut left = self.left.lock().unwrap();
         if *left == 0 {
             return Err(pitcrew_runner::SinkError("hub away".into()));
@@ -134,10 +154,7 @@ fn unaccepted_events_are_sent_again_after_a_restart_and_accepted_ones_are_not() 
     ));
 
     // The sink takes two batches (discovery + item 0, then item 1) and then refuses.
-    let refusing = Arc::new(Refusing {
-        left: std::sync::Mutex::new(2),
-        inner: CollectSink::default(),
-    });
+    let refusing = Arc::new(Refusing::new(2));
     let runner = pitcrew_runner::start(
         config(home.path(), state.path()),
         vec![source.clone()],
@@ -249,4 +266,250 @@ fn a_full_sink_applies_backpressure_without_dropping() {
         })
         .collect();
     assert_eq!(offsets, (0..ITEMS).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_crash_between_split_batches_resends_the_same_ids() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let path = home.path().join("proj").join("long.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"x").unwrap();
+
+    // 300 turns in one read: session_discovered plus 300 turn_ended events, more than the 256 a
+    // batch holds, so the discovery read goes out as two batches. Each prompt also changes the
+    // state, which the discovery read folds silently.
+    let items: Vec<TranscriptItem> = (0..300u64)
+        .flat_map(|i| [prompt(2 * i), turn(2 * i + 1)])
+        .collect();
+    let source = Arc::new(LoggedFake::new(vec![transcript_ref(&path)], items).per_read(usize::MAX));
+
+    // The sink takes the first batch; the runner then "crashes" with the second one unsaved.
+    let refusing = Arc::new(Refusing::new(1));
+    let runner = pitcrew_runner::start(
+        config(home.path(), state.path()),
+        vec![source.clone()],
+        refusing.clone(),
+    )
+    .unwrap();
+    assert!(eventually(Duration::from_secs(5), || refusing
+        .offered()
+        .len()
+        >= 2));
+    runner.stop();
+    let accepted = refusing.inner.events();
+    let refused = refusing.offered()[1].clone();
+    assert_eq!(accepted.len(), 256);
+    assert_eq!(refused.len(), 45);
+    assert_eq!(common::label(&accepted[0]), "discovered:Idle");
+
+    // After the restart the read is replayed. The refused events come again with the same ids,
+    // and only session_discovered (already accepted, same id) is repeated.
+    let sink = Arc::new(CollectSink::default());
+    let runner = pitcrew_runner::start(
+        config(home.path(), state.path()),
+        vec![source.clone()],
+        sink.clone(),
+    )
+    .unwrap();
+    sink.wait_for(1 + refused.len(), Duration::from_secs(5))
+        .expect("replayed events");
+    std::thread::sleep(Duration::from_millis(300));
+    runner.stop();
+    let resent = sink.events();
+    assert_eq!(resent.len(), 1 + refused.len(), "{:?}", labels(&resent));
+    assert_eq!(
+        resent[0].id, accepted[0].id,
+        "session_discovered keeps its id"
+    );
+    let ids = |events: &[Event]| events.iter().map(|e| e.id).collect::<Vec<_>>();
+    assert_eq!(labels(&resent[1..]), labels(&refused));
+    assert_eq!(ids(&resent[1..]), ids(&refused));
+}
+
+/// Like OpenCode: progress lives in `cursor.state` (a row id); the offset never moves.
+struct StateCursor {
+    path: PathBuf,
+    items: Vec<TranscriptItem>,
+}
+
+impl SourceAdapter for StateCursor {
+    fn engine(&self) -> Engine {
+        Engine::Claude
+    }
+
+    fn discover(&self, _home: &Path) -> Result<Vec<TranscriptRef>, SourceError> {
+        Ok(vec![transcript_ref(&self.path)])
+    }
+
+    fn read_from(&self, _t: &TranscriptRef, cursor: &Cursor) -> Result<ParseChunk, SourceError> {
+        let next = cursor
+            .state
+            .as_ref()
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let Some(item) = self.items.get(usize::try_from(next).unwrap()) else {
+            return Ok(ParseChunk {
+                cursor: cursor.clone(),
+                ..ParseChunk::default()
+            });
+        };
+        Ok(ParseChunk {
+            cursor: Cursor {
+                offset: 0,
+                state: Some(serde_json::json!(next + 1)),
+            },
+            meta: None,
+            items: vec![item.clone()],
+        })
+    }
+
+    fn read_page(
+        &self,
+        _t: &TranscriptRef,
+        _before: Option<u64>,
+        _limit: usize,
+    ) -> Result<TranscriptPage, SourceError> {
+        Ok(TranscriptPage {
+            items: Vec::new(),
+            from: 0,
+            to: 0,
+            at_start: true,
+        })
+    }
+}
+
+#[test]
+fn progress_in_the_cursor_state_keeps_reading() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let path = home.path().join("opencode.db");
+    std::fs::write(&path, b"x").unwrap();
+    let source = Arc::new(StateCursor {
+        path: path.clone(),
+        items: (0..3).map(turn).collect(),
+    });
+    let sink = Arc::new(CollectSink::default());
+    let runner = pitcrew_runner::start(
+        config(home.path(), state.path()),
+        vec![source],
+        sink.clone(),
+    )
+    .unwrap();
+    // No file changes after the start: all three items come from the discovery read alone.
+    let all = sink.wait_for(4, Duration::from_secs(3));
+    runner.stop();
+    assert!(all.is_some(), "{:?}", labels(&sink.events()));
+    assert_eq!(
+        labels(&sink.events()),
+        ["discovered:Idle", "turn@0", "turn@1", "turn@2"]
+    );
+}
+
+/// The session name the fake gives a transcript: its file stem.
+fn discovered_names(events: &[Event]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|e| match &e.body {
+            EventBody::SessionDiscovered { session } => Some(session.native_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn new_transcripts_are_indexed_newest_first() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let hour = Duration::from_secs(3600);
+    let mut refs = Vec::new();
+    for (name, hours) in [("a", 3), ("b", 1), ("c", 2)] {
+        let path = home.path().join("proj").join(format!("{name}.jsonl"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"x").unwrap();
+        age(&path, hour * hours);
+        refs.push(transcript_ref(&path));
+    }
+    let source = Arc::new(LoggedFake::new(refs, Vec::new()));
+    let sink = Arc::new(CollectSink::default());
+    let runner = pitcrew_runner::start(
+        config(home.path(), state.path()),
+        vec![source],
+        sink.clone(),
+    )
+    .unwrap();
+    sink.wait_for(3, Duration::from_secs(5)).expect("discovery");
+    runner.stop();
+    assert_eq!(discovered_names(&sink.events()), ["b", "c", "a"]);
+}
+
+#[test]
+fn stop_is_prompt_during_a_long_backfill() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let refs: Vec<TranscriptRef> = (0..100)
+        .map(|i| {
+            let path = home.path().join("proj").join(format!("s{i:03}.jsonl"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+            transcript_ref(&path)
+        })
+        .collect();
+    // 100 transcripts at 30 ms a read: a 3 s backfill.
+    let source = Arc::new(LoggedFake::new(refs, Vec::new()).delay(Duration::from_millis(30)));
+    let sink = Arc::new(CollectSink::default());
+    let runner = pitcrew_runner::start(
+        config(home.path(), state.path()),
+        vec![source.clone()],
+        sink.clone(),
+    )
+    .unwrap();
+    sink.wait_for(2, Duration::from_secs(5))
+        .expect("backfill started");
+    let asked = Instant::now();
+    runner.stop();
+    let took = asked.elapsed();
+    println!(
+        "stop during backfill took {took:?} after {} of 100 reads",
+        source.reads().len()
+    );
+    assert!(took < Duration::from_millis(500), "{took:?}");
+    assert!(source.reads().len() < 100);
+}
+
+#[test]
+fn a_panicking_adapter_skips_one_transcript_not_the_runner() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let dir = home.path().join("proj");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (bad, good) = (dir.join("bad.jsonl"), dir.join("good.jsonl"));
+    std::fs::write(&bad, b"x").unwrap();
+    std::fs::write(&good, b"x").unwrap();
+    let source = Arc::new(LoggedFake::new(
+        vec![transcript_ref(&bad), transcript_ref(&good)],
+        vec![turn(0)],
+    ));
+    source.panic_on(&bad);
+    let sink = Arc::new(CollectSink::default());
+    let runner = pitcrew_runner::start(
+        config(home.path(), state.path()),
+        vec![source.clone()],
+        sink.clone(),
+    )
+    .unwrap();
+    sink.wait_for(2, Duration::from_secs(5))
+        .expect("the good one");
+
+    // The watcher is still alive: a new item in the good transcript arrives.
+    source.set_items(vec![turn(0), turn(1)]);
+    append(&good, b"x");
+    sink.wait_for(3, Duration::from_secs(5))
+        .expect("event after the panic");
+    runner.stop();
+    assert_eq!(discovered_names(&sink.events()), ["good"]);
+    assert_eq!(
+        labels(&sink.events()),
+        ["discovered:Idle", "turn@0", "turn@1"]
+    );
 }

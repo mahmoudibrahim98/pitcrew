@@ -56,10 +56,35 @@ impl Write for LogWriter {
     }
 }
 
-fn reindex_notes() -> usize {
+const REINDEXED: &str = "re-indexing it from the start";
+const DROPPED: &str = "transcript deleted; no longer watching it";
+
+/// Log lines that contain `note` and mention the canonical `path` (tests run in parallel, each in
+/// its own folder).
+fn notes(note: &str, path: &str) -> usize {
     String::from_utf8_lossy(&logs().lock().unwrap())
-        .matches("re-indexing it from the start")
+        .lines()
+        .filter(|l| l.contains(note) && l.contains(path))
         .count()
+}
+
+fn canonical(path: &Path) -> String {
+    path.canonicalize().unwrap().display().to_string()
+}
+
+fn reindex_notes(path: &Path) -> usize {
+    notes(REINDEXED, &canonical(path))
+}
+
+fn session_of(e: &pitcrew_protocol::events::Event) -> Option<pitcrew_protocol::ids::SessionId> {
+    match &e.body {
+        EventBody::SessionDiscovered { session } => Some(session.id),
+        EventBody::SessionStateChanged { session, .. }
+        | EventBody::ToolRan { session, .. }
+        | EventBody::FileEdited { session, .. }
+        | EventBody::TurnEnded { session, .. } => Some(*session),
+        _ => None,
+    }
 }
 
 #[test]
@@ -214,7 +239,7 @@ fn truncation_and_replacement_are_reindexed_from_the_start() {
     std::thread::sleep(Duration::from_millis(300));
     let n = sink.len();
     assert_eq!(common::label(&sink.events()[n - 1]), "turn@6514");
-    let before = reindex_notes();
+    let before = reindex_notes(&path);
 
     // Truncate in place to the first three lines.
     std::fs::write(&path, lines[..3].concat()).unwrap();
@@ -222,7 +247,7 @@ fn truncation_and_replacement_are_reindexed_from_the_start() {
     std::thread::sleep(Duration::from_millis(300));
     let events = sink.events();
     assert_eq!(labels(&events[n..]), ["state:Working", "tool:TodoWrite"]);
-    assert_eq!(reindex_notes(), before + 1, "a note in the log");
+    assert_eq!(reindex_notes(&path), before + 1, "a note in the log");
 
     // Replace with a new file (a new inode), larger than the truncated one.
     let n = events.len();
@@ -237,9 +262,159 @@ fn truncation_and_replacement_are_reindexed_from_the_start() {
     let after = labels(&events[n..]);
     assert_eq!(after.first().map(String::as_str), Some("tool:TodoWrite"));
     assert_eq!(after.last().map(String::as_str), Some("turn@6514"));
-    assert_eq!(reindex_notes(), before + 2, "a note in the log");
+    assert_eq!(reindex_notes(&path), before + 2, "a note in the log");
 
     // Re-indexed content gets new event ids, never a collision with the first reading.
     let ids: std::collections::HashSet<_> = events.iter().map(|e| e.id).collect();
     assert_eq!(ids.len(), events.len());
+}
+
+#[test]
+fn a_deleted_transcript_is_dropped_and_keeps_its_session_if_it_returns() {
+    let _ = logs();
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let path = session_file(home.path());
+    let lines = fixture_lines();
+    std::fs::write(&path, lines[..5].concat()).unwrap();
+
+    let sink = Arc::new(CollectSink::default());
+    let runner = pitcrew_runner::start(
+        config(home.path(), state.path()),
+        vec![Arc::new(ClaudeAdapter::new())],
+        sink.clone(),
+    )
+    .unwrap();
+    sink.wait_for(3, WAIT).expect("discovery");
+    let session = session_of(&sink.events()[0]).unwrap();
+    let file = canonical(&path);
+    assert_eq!(notes(REINDEXED, &file), 0);
+
+    std::fs::remove_file(&path).unwrap();
+    assert!(
+        common::eventually(WAIT, || notes(DROPPED, &file) == 1),
+        "the deletion is noticed"
+    );
+
+    // A file comes back at the path (restored, or rewritten; it may even reuse the inode): same
+    // session, read again from the start.
+    std::fs::write(&path, lines.concat()).unwrap();
+    runner.rescan();
+    sink.wait_for(4, WAIT).expect("events after it came back");
+    std::thread::sleep(Duration::from_millis(300));
+    runner.stop();
+    let events = sink.events();
+    assert!(events[3..].iter().all(|e| session_of(e) == Some(session)));
+    assert_eq!(
+        labels(&events[3..5]),
+        ["tool:TodoWrite", "tool:Read"],
+        "from the start: {:?}",
+        labels(&events)
+    );
+    assert_eq!(common::label(events.last().unwrap()), "turn@6514");
+    assert_eq!(notes(REINDEXED, &file), 1);
+    assert_eq!(notes(DROPPED, &file), 1);
+}
+
+#[test]
+fn a_new_session_in_a_cold_project_folder_is_discovered_at_once() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let path = session_file(home.path());
+    let lines = fixture_lines();
+    std::fs::write(&path, lines[..1].concat()).unwrap();
+    // Untouched for two days: cold.
+    common::age(&path, Duration::from_secs(2 * 24 * 60 * 60));
+
+    let sink = Arc::new(CollectSink::default());
+    // Rediscovery and sweeps every 10 minutes: only a folder watch can find the new session.
+    let runner = pitcrew_runner::start(
+        config(home.path(), state.path()),
+        vec![Arc::new(ClaudeAdapter::new())],
+        sink.clone(),
+    )
+    .unwrap();
+    sink.wait_for(1, WAIT).expect("the cold session");
+
+    std::fs::write(path.with_file_name("next.jsonl"), lines[..1].concat()).unwrap();
+    let found = sink.wait_for(2, WAIT);
+    runner.stop();
+    assert!(found.is_some(), "{:?}", labels(&sink.events()));
+}
+
+#[test]
+fn the_first_session_in_an_empty_home_is_discovered_at_once() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let sink = Arc::new(CollectSink::default());
+    let runner = pitcrew_runner::start(
+        config(home.path(), state.path()),
+        vec![Arc::new(ClaudeAdapter::new())],
+        sink.clone(),
+    )
+    .unwrap();
+    // Let the start finish; the home has no `projects` folder yet.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let path = session_file(home.path());
+    std::fs::write(&path, fixture_lines()[..1].concat()).unwrap();
+    let found = sink.wait_for(1, WAIT);
+    runner.stop();
+    assert!(found.is_some(), "not discovered without a rescan");
+}
+
+/// On HPC a home is often reached through a symlink (`/home` → `/gpfs/home`), and may not exist
+/// before the first `claude` run. Either way a transcript must keep its session id when the home
+/// is later named by its real path.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_home_keeps_its_session_ids_even_if_it_appears_later() {
+    let root = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let real = root.path().join("real");
+    let link = root.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let lines = fixture_lines();
+
+    // First run: the home is a symlink to a folder that does not exist yet.
+    let sink = Arc::new(CollectSink::default());
+    let runner = pitcrew_runner::start(
+        config(&link, state.path()),
+        vec![Arc::new(ClaudeAdapter::new())],
+        sink.clone(),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::create_dir(&real).unwrap();
+    let path = session_file(&link);
+    std::fs::write(&path, lines[..5].concat()).unwrap();
+    runner.rescan();
+    sink.wait_for(3, WAIT)
+        .expect("discovered once the home exists");
+    // Changes are seen through the watch on the real folders.
+    append(&path, &lines[5..].concat());
+    sink.wait_for(11, WAIT).expect("appended lines");
+    std::thread::sleep(Duration::from_millis(300));
+    runner.stop();
+    let first = sink.events();
+    assert_eq!(first.len(), 11, "{:?}", labels(&first));
+    let session = session_of(&first[0]).unwrap();
+
+    // Second run, the same home by its real path: nothing is sent again...
+    let runner = pitcrew_runner::start(
+        config(&real, state.path()),
+        vec![Arc::new(ClaudeAdapter::new())],
+        sink.clone(),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(sink.len(), 11, "{:?}", labels(&sink.events()[11..]));
+
+    // ...and a new line belongs to the same session.
+    append(&real.join(path.strip_prefix(&link).unwrap()), &lines[0]);
+    sink.wait_for(12, WAIT).expect("event for the new line");
+    runner.stop();
+    let last = sink.events().pop().unwrap();
+    assert_eq!(common::label(&last), "state:Working");
+    assert_eq!(session_of(&last), Some(session));
 }
