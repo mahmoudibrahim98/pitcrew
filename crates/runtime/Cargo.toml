@@ -10,6 +10,10 @@ authors.workspace = true
 
 [dependencies]
 pitcrew-protocol.workspace = true
+pitcrew-interfaces.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true
