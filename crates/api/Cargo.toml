@@ -11,12 +11,19 @@ authors.workspace = true
 [dependencies]
 pitcrew-protocol.workspace = true
 pitcrew-auth.workspace = true
-pitcrew-store.workspace = true
+pitcrew-interfaces.workspace = true
+# `StoreSource` (feature `store`, on by default). Crates that only need `client` can turn it off
+# and skip SQLite.
+pitcrew-store = { workspace = true, optional = true }
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tracing.workspace = true
+
+[features]
+default = ["store"]
+store = ["dep:pitcrew-store"]
 
 [target.'cfg(windows)'.dependencies]
 # The named pipe's security descriptor. The version tokio already uses.
@@ -29,6 +36,7 @@ windows-sys = { version = "=0.61.2", features = [
 ] }
 
 [dev-dependencies]
+pitcrew-fixtures.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "sync"] }

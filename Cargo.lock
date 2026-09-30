@@ -589,6 +589,8 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "pitcrew-auth",
+ "pitcrew-fixtures",
+ "pitcrew-interfaces",
  "pitcrew-protocol",
  "pitcrew-store",
  "proptest",

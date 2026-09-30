@@ -115,7 +115,7 @@ async fn the_started_intake_feeds_its_sink() {
 
     let f = Fixture::new();
     let sink = Arc::new(Recording::default());
-    let intake = HookIntake::start(sink.clone(), 8);
+    let intake = HookIntake::start(sink.clone(), 8).unwrap();
     let (status, _) = call(
         app(&f, intake),
         post("/v1/hooks/claude/Stop", Some(&f.device_token), "{}"),
@@ -129,4 +129,64 @@ async fn the_started_intake_feeds_its_sink() {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     assert_eq!(*sink.0.lock().unwrap(), vec!["Stop".to_owned()]);
+}
+
+/// A sink that blocks for a while on every event, and panics on events named `Boom`.
+#[derive(Debug, Default)]
+struct Awkward(std::sync::Mutex<Vec<String>>);
+
+impl pitcrew_api::HookSink for Awkward {
+    fn deliver(&self, event: pitcrew_api::HookEvent) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(event.event != "Boom", "the sink panics");
+        self.0.lock().unwrap().push(event.event);
+    }
+}
+
+// A single-threaded runtime: a sink that blocked it would stall the requests below.
+#[tokio::test(flavor = "current_thread")]
+async fn a_blocking_or_panicking_sink_never_stalls_requests() {
+    let f = Fixture::new();
+    let sink = Arc::new(Awkward::default());
+    let intake = HookIntake::start(sink.clone(), 8).unwrap();
+    let app = app(&f, intake.clone());
+    let started = std::time::Instant::now();
+    for name in ["One", "Boom", "Two"] {
+        let (status, _) = call(
+            app.clone(),
+            post(
+                &format!("/v1/hooks/claude/{name}"),
+                Some(&f.agent_token),
+                "{}",
+            ),
+        )
+        .await;
+        assert_eq!(status, 202);
+    }
+    // Three requests against a sink that takes 150 ms in total answered well before it finished.
+    assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    for _ in 0..200 {
+        if sink.0.lock().unwrap().len() == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        *sink.0.lock().unwrap(),
+        vec!["One".to_owned(), "Two".to_owned()]
+    );
+    assert_eq!(intake.dropped(), 0);
+}
+
+#[tokio::test]
+async fn a_path_that_is_not_utf8_is_invalid() {
+    let f = Fixture::new();
+    let (intake, _delivered) = HookIntake::unread(8);
+    let (status, body) = call(
+        app(&f, intake),
+        post("/v1/hooks/claude/%FF%FE", Some(&f.agent_token), "{}"),
+    )
+    .await;
+    assert_eq!(status, 400);
+    assert_eq!(body["code"], "invalid");
 }
