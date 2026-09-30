@@ -18,6 +18,7 @@ import {
 } from '../data/index.ts';
 import { consoleApiFor, type ConsoleApi } from './api.ts';
 import { matchesFacets, NO_FACETS, type SessionFacets, type SessionPlaces } from './facets.ts';
+import { useNow } from './format.ts';
 import { deliveredPrompts, EMPTY_VIEW, TranscriptWindow, type PendingPrompt, type WindowView } from './transcript.ts';
 import type { EndMode, Key, TranscriptPage } from './types.ts';
 
@@ -224,15 +225,22 @@ export const usePendingPrompts = create<PendingState>()((set) => ({
 
 const NONE: PendingPrompt[] = [];
 
-/** This session's pending prompts, dropping those the transcript now shows. */
+/** How long a sent prompt shows before the transcript has it; after that it is dropped. */
+const PENDING_FOR = 120_000;
+
+/** This session's pending prompts, dropping those the transcript now shows and stale ones. */
 export function usePending(sessionId: string, view: WindowView): PendingPrompt[] {
   const pending = usePendingPrompts((s) => s.bySession[sessionId] ?? NONE);
   const remove = usePendingPrompts((s) => s.remove);
-  const delivered = deliveredPrompts(pending, view.items);
+  const now = useNow();
+  const done = deliveredPrompts(pending, view.items);
+  for (const prompt of pending) {
+    if (now - prompt.sentAt > PENDING_FOR) done.add(prompt.id);
+  }
   useEffect(() => {
-    if (delivered.size > 0) remove(sessionId, delivered);
-  }, [delivered, remove, sessionId]);
-  return delivered.size === 0 ? pending : pending.filter((p) => !delivered.has(p.id));
+    if (done.size > 0) remove(sessionId, done);
+  }, [done, remove, sessionId]);
+  return done.size === 0 ? pending : pending.filter((p) => !done.has(p.id));
 }
 
 // ─── Writes ─────────────────────────────────────────────────────────────────────────────────────
