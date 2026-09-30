@@ -157,7 +157,7 @@ are **pending** until it merges.
 
 | Id | Threat | Control | Where | Tested by | Owner | Status |
 |---|---|---|---|---|---|---|
-| T34 | A compromised or vulnerable dependency | `cargo-deny` in CI: licences, RustSec advisories, yanked crates, crates.io only, no git sources; lockfiles and `--locked`; pnpm waits a day before installing a new version (`minimumReleaseAge`), runs install scripts only for listed packages, and saves exact versions; Dependabot, grouped weekly. | `deny.toml`, `.github/workflows/ci.yml` (`deny` job), `pnpm-workspace.yaml`, `.npmrc`, `.github/dependabot.yml` | CI | 0 | In place. `fuzz/Cargo.lock` is outside `cargo-deny` (dev only, never shipped; the nightly job can check it). |
+| T34 | A compromised or vulnerable dependency | `cargo-deny` in CI: licences, RustSec advisories, yanked crates, crates.io only, no git sources; lockfiles and `--locked`; pnpm waits a day before installing a new version (`minimumReleaseAge`), runs install scripts only for listed packages, and saves exact versions; Dependabot, grouped weekly. | `deny.toml`, `.github/workflows/ci.yml` (`deny` job), `pnpm-workspace.yaml`, `.npmrc`, `.github/dependabot.yml` | CI | 0 | In place. The fuzz workspace is outside the root check: `fuzz/deny.toml` applies the same policy plus an NCSA exception for `libfuzzer-sys` (never shipped); the nightly job runs it (O20). |
 | T35 | A compromised workflow or Action | Actions pinned by commit SHA; `permissions: contents: read`; `persist-credentials: false`; on pull requests the guard scripts come from the base branch. | `.github/workflows/ci.yml`, `scripts/ci/` | CI | 0 | In place; `zizmor` proposed (O21) |
 | T36 | A tampered installer or update | Code signing on all three OSes, macOS notarisation, a signed Tauri updater, an SBOM and build-provenance attestations per release. | `packaging/`, `.github/workflows/release*.yml` (P, branch `s/P/bench-and-release`) | | P, K | Planned |
 | T37 | Private data lands in the public repository | A scrub gate with hashed words and secret patterns, on files and commit metadata; fixtures are synthetic; `private/` folders are ignored. | `scripts/ci/scrub-gate.mjs`, `.github/scrub/hashes.txt`, `.gitignore` | `scripts/ci/test/` | 0 | In place |
@@ -176,7 +176,7 @@ What reviews of merged or in-review branches found, and where each stands.
 | Id | Finding | Fix | Where | Tested by | Owner | Status |
 |---|---|---|---|---|---|---|
 | R1 | **Nested-router authentication bypass.** Authentication and the device-only guard were applied with `route_layer`, which does not wrap the fallback of a nested router. A nested router with its own fallback (a file server, for instance) was reachable with no token, or with an agent token on a device-only route. | Both are applied with `layer`, which covers nested fallbacks. `router()` documents that nothing may be merged into the returned router. An empty `RouterParts` no longer panics. | `crates/api/src/lib.rs` (`router`), `crates/auth/src/http.rs` (`device_only`, `require_device`) | `crates/api/tests/auth.rs` `nested_fallbacks_are_authenticated_and_scoped`, `an_empty_router_parts_serves_host_info`; fuzz `api_request` (the app nests a device router with a fallback) | H | Fixed on `main` |
-| R2 | **tmux format and `%exit` forging.** A version of the parser that ended an open reply on `%exit` let pane content (a title, a window name) inject notifications, including `%output` for another pane. Names could hold control characters that split lines, and `#{…}`/`#(…)` formats. | Reply bodies stay opaque until their own guard (as on `main`); names refuse C0 and DEL; format literals are escaped. | `crates/runtime/src/control.rs`; branch `s/B/control-hardening` (`command.rs`) | `crates/runtime/tests/control.rs`; fuzz `tmux_control` property 2, which fails if a body line escapes its reply | B | `main` is not affected; the hardening branch must keep `%exit` as body text before it merges (O15) |
+| R2 | **tmux format and `%exit` forging.** A version of the parser that ended an open reply on `%exit` let pane content (a title, a window name) inject notifications, including `%output` for another pane. Names could hold control characters that split lines, and `#{…}`/`#(…)` formats. | Reply bodies stay opaque until their own guard (as on `main`); names refuse C0 and DEL; format literals are escaped. | `crates/runtime/src/control.rs`; branch `s/B/control-hardening` (`command.rs`) | `crates/runtime/tests/control.rs`; fuzz `tmux_control` property 2, which fails if a body line escapes its reply | B | `main` is not affected. Branch B at `e77c7a0` keeps `%exit` as body text, and `tmux_control` (adapted to `feed` returning `Result`) ran 60 s against it without a failure. Merge pending (O15). |
 | R3 | **Token in the build.** `VITE_PITCREW_TOKEN` from a developer's `.env.local` was inlined by `vite build`, in production and in other modes. | Read only in development; the build fails when it is set; only the needed keys reach the bundle. | branch `s/L/skeleton-and-data` (`apps/ui/src/data/config.ts`, `apps/ui/vite.config.ts`) | `config.test.ts`; a real build with the variable set (branch) | L | Fixed on the branch, not merged (O4) |
 | R4 | **Unbounded parser inputs.** Uncapped session facts plus a clone-and-compare of all facts on every line let a small crafted file hang `read_from`; `read_page` kept every turn-duration record; several item payloads were uncapped; the tmux parser had no line or reply limit. | Ingest: facts capped or dropped, `set_first`/`set_latest` instead of cloning, at most `limit + 1` records per page, every payload capped. tmux: `ParserLimits` with a latched desync error (branch B). | `crates/ingest/src/bound.rs`, `jsonl.rs`, `claude/mod.rs`; branch `s/B/control-hardening` (`control.rs`) | ingest tests above; fuzz targets in §8 | A, B | Ingest fixed on `main`; tmux Planned (O15) |
 | R5 | **Socket and pipe squatting.** Directories were made private after creation, so a shared group could plant a socket or a registry in the window; existing files and sockets were trusted without an owner check; the pipe was named after the user name; clients had no way to check who served a pipe; the loopback check for development TCP could be skipped. | See T2, T3 and T4: owner checks before use, `O_NOFOLLOW`, a SID-named pipe, client checks, an opaque `Bound`. | `crates/auth/src/private.rs`, `crates/api/src/listener/`, `crates/api/src/client.rs` | the tests under T2–T4 | H | Fixed on `main`; clients must adopt the checks (O1) |
@@ -200,13 +200,13 @@ What reviews of merged or in-review branches found, and where each stands.
 | O12 | Terminal: disable OSC 52 clipboard writes by default, allow only `http(s)` links, treat titles as text. | M |
 | O13 | Typed, borrowed per-line structs instead of a full `serde_json::Value` (memory amplification on long lines). | A |
 | O14 | Claude discovery: do not follow symlinked project folders out of the home. | A |
-| O15 | Merge the tmux hardening (limits, names, formats) with `%exit` kept as body text; then adapt the `tmux_control` target to `feed` returning `Result`. | B, Q |
+| O15 | Merge the tmux hardening (limits, names, formats; `%exit` stays body text); then change the `tmux_control` target to `feed` returning `Result` (an error on a small input is a finding). | B, Q |
 | O16 | The runner protocol reader caps a line (for example 16 MiB) before `decode_line`, and bounds `Events` batches and `TerminalOutput`. | D, J, 0 |
 | O17 | Authenticate runners to hubs before a runner can attach over anything but the user's own transport. | 0, J |
 | O18 | Set small `max_message_size` / `max_frame_size` on the delta stream's WebSocket, and bounded ones on the terminal WebSocket. | H |
 | O19 | The runner's file API: roots, canonicalisation, symlink escapes, size caps, backups; a Q review before merge. | D |
-| O20 | Add the nightly fuzz workflow (§8.3). | 0 |
-| O21 | CodeQL and `zizmor` for the workflows; the fuzz lockfile under `cargo-deny` in the nightly job. | 0 |
+| O20 | Add the nightly fuzz workflow (§8.3), including `cargo deny` with `fuzz/deny.toml`. | 0 |
+| O21 | CodeQL and `zizmor` for the workflows; `cargo-audit` (or keep `cargo-deny` advisories as the one source). | 0 |
 | O22 | Record the residual risk of R6 in ADR-0006. | 0 |
 
 ## 8. Fuzzing
@@ -222,6 +222,15 @@ cargo +nightly fuzz run adapter_read -- -dict=fuzz/dict/claude.dict -max_total_t
 A crash leaves its input in `fuzz/artifacts/<target>/`; `cargo +nightly fuzz fmt <target> <file>`
 prints it and `cargo +nightly fuzz tmin <target> <file>` minimises it. Turn it into a regression
 test in the owning stream's crate.
+
+- Run `cargo fuzz` from the repository (it sets `-artifact_prefix` to `fuzz/artifacts/`). A fuzz
+  binary run directly writes `crash-*` files to its working directory unless given
+  `-artifact_prefix=`.
+- Under `strace` or `gdb`, pass `-detect_leaks=0`: LeakSanitizer cannot run under ptrace, and
+  libFuzzer then records a "crash" of the empty input (`crash-da39a3ee…`) at exit. That artifact
+  is not a finding; every target passes the empty input.
+- The adapter targets write the transcript to a scratch folder: `PITCREW_FUZZ_TMP` if set, else
+  `/dev/shm` (about twice as fast as a disk), else the temporary folder.
 
 ### 8.1 Targets
 
@@ -240,12 +249,19 @@ The round-trip checks use `serde_json`'s `float_roundtrip` feature, so they cann
 last bit of a float. `fuzz/src/lib.rs` copies the ingest caps (they are crate-private); if the
 caps change, change them there too.
 
+**Last local run** (2026-09-30, `main` at `f365897`, 60 s per target, one job, WSL on a shared
+14-core machine): no failure in any target. `claude_parse_line` 5,887 exec/s,
+`codex_parse_line` 5,258, `adapter_read` 136, `adapter_cursor` 948, `tmux_control` 3,104,
+`runner_decode_line` 4,670, `api_json` 1,749, `api_request` 2,894.
+
 ### 8.2 Limits of the current targets
 
 - Inputs are small (libFuzzer's default maximum is about 4 KiB, or the largest seed), so the
   64 KiB carried-line and 16 MiB line thresholds are only reached by stream A's own tests.
 - `tmux_control` targets `feed` as it is on `main`; branch B changes it to return a `Result`
   (O15).
+- `adapter_read` is slow (about 140 exec/s): each input writes a file and reads it many times
+  (whole, in two parts, then page by page).
 - Not fuzzed yet: the OpenCode adapter (branch `s/A/opencode-adapter`), the store's row decoding
   (private), `TokenHash::from_hex` and the registry parser (private), the command quoting in
   `crates/runtime/src/command.rs` against a tmux lexer model.

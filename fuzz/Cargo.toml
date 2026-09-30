@@ -1,8 +1,8 @@
 # Owned by stream Q. A cargo-fuzz project with its own workspace: the root workspace excludes
 # `fuzz/`, so stable builds never see it. Needs a nightly toolchain:
 #
-#   ./fuzz/seed.sh                                   # seed corpora from crates/fixtures
-#   cargo +nightly fuzz run <target> -- -max_total_time=60
+#   python3 fuzz/seed.py                 # seed fuzz/corpus/<target>/ from crates/fixtures
+#   cargo +nightly fuzz run <target> -- -dict=fuzz/dict/<name>.dict -max_total_time=60
 #
 # Targets and what each checks are listed in docs/security/threat-model.md ("Fuzzing").
 
