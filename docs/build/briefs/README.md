@@ -27,9 +27,10 @@ The integrator has already created your worktree on your brief's branch. **Do no
 worktrees or branches, and do not switch branches.** Before any other work:
 
 1. `git branch --show-current` must print exactly the branch named in your brief.
-2. `git merge-base --is-ancestor main HEAD` must succeed (your branch starts from `main`).
-3. If `git log main..HEAD` shows commits, a previous run started this work: read them and
+2. If `git log main..HEAD` shows commits, a previous run started this work: read them and
    continue from there.
+3. `main` may have moved on since your branch was created. That is expected: **do not rebase
+   onto or merge `main`**. The integrator resolves that when merging your branch.
 
 If the branch is wrong, or you are on `main`, **stop and tell the user**. Edit only files inside
 this worktree.
