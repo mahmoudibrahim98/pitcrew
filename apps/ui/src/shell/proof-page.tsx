@@ -1,5 +1,5 @@
 // A minimal page proving the data layer: projects, workstreams, open asks and live sessions from
-// the hub, and a move that comes back through the stream. The real shell replaces it.
+// the hub, and a move that comes back through the stream. Kept as a dev-only route (/dev/proof).
 
 import { Button, StatusPill, ThemeToggle, type Tone } from '../design/index.ts';
 import {
@@ -76,7 +76,7 @@ export function ProofPage() {
   const error = [workspace, projects, workstreams, tasks, sessions, asks].find((q) => q.error)?.error;
 
   return (
-    <div className="mx-auto max-w-5xl px-6 py-8">
+    <main className="mx-auto min-h-dvh max-w-5xl bg-bg px-6 py-8 text-ink">
       <header className="mb-6 flex items-center gap-3">
         <h1 className="text-xl font-semibold">{workspace.data?.workspace.name ?? 'PitCrew'}</h1>
         <span data-testid="stream-status">
@@ -109,7 +109,7 @@ export function ProofPage() {
           />
         ))}
       </div>
-    </div>
+    </main>
   );
 }
 
@@ -142,7 +142,7 @@ function ProjectCard(props: {
       className="rounded-lg border border-line bg-card"
     >
       <header className="flex items-center gap-2 border-b border-line px-4 py-3">
-        <span className="font-mono text-xs text-muted">{project.key}</span>
+        <span className="font-mono text-xs text-ink-2">{project.key}</span>
         <h2 id={`project-${project.id}`} className="text-lg font-semibold">
           {project.name}
         </h2>
@@ -164,7 +164,7 @@ function ProjectCard(props: {
           />
         ))}
         {props.workstreams.length === 0 && (
-          <li className="px-4 py-3 text-sm text-muted">No workstreams yet.</li>
+          <li className="px-4 py-3 text-sm text-ink-2">No workstreams yet.</li>
         )}
       </ul>
     </section>
@@ -178,7 +178,7 @@ function WorkstreamRow(props: { workstream: Workstream; tasks: Task[]; sessions:
       <div className="flex items-center gap-2">
         <h3 className="font-medium">{workstream.name}</h3>
         <StatusPill tone={HEALTH[workstream.health].tone}>{HEALTH[workstream.health].label}</StatusPill>
-        <span className="text-xs text-muted">{workstream.status}</span>
+        <span className="text-xs text-ink-2">{workstream.status}</span>
       </div>
 
       {props.sessions.length > 0 && (
@@ -186,7 +186,7 @@ function WorkstreamRow(props: { workstream: Workstream; tasks: Task[]; sessions:
           {props.sessions.map((session) => (
             <li key={session.id} className="flex items-center gap-2 text-sm">
               <StatusPill tone={SESSION[session.state]}>{session.state}</StatusPill>
-              <span className="font-mono text-xs text-muted">{session.engine}</span>
+              <span className="font-mono text-xs text-ink-2">{session.engine}</span>
               <span className="truncate text-ink-2">
                 {session.status_line ?? session.title ?? session.cwd}
               </span>
@@ -211,7 +211,7 @@ function TaskRow({ task }: { task: Task }) {
   const next = NEXT[task.status];
   return (
     <li className="flex items-center gap-2 text-sm" data-testid={`task-${task.key}`}>
-      <span className="w-14 shrink-0 font-mono text-xs text-muted">{task.key}</span>
+      <span className="w-14 shrink-0 font-mono text-xs text-ink-2">{task.key}</span>
       <span className="truncate">{task.title}</span>
       <span className="ml-auto" data-testid={`status-${task.key}`}>
         <StatusPill tone={TASK[task.status].tone}>{TASK[task.status].label}</StatusPill>
