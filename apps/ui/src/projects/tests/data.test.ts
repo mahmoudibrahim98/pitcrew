@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { Api, Event, Member } from '../../data/index.ts';
-import { fetchActivity, mentionsIn, newUlid, withRevisions, type ActivityPage } from '../data.ts';
+import { ACTIVITY_BUDGET, fetchActivity, mentionsIn, newUlid, withRevisions, type ActivityPage } from '../data.ts';
 import { describeEvent, plainNames } from '../format.ts';
+import { fakePage } from './fake-events.ts';
 
 const member = (id: string, handle: string): Member => ({ id, kind: 'agent', handle, name: handle.slice(1) });
 
@@ -13,52 +14,84 @@ const event = (rev: number): Event => ({
   body: { type: 'session_ended', data: { session: 'S' } },
 });
 
-/** A fake `/v1/events` over revisions 1..total, honouring `before` and `limit` like the hub. */
-function fakeEvents(total: number) {
+/** An `Api` whose only call is the fake events feed (an event's `at` is its revision). */
+function fakeEvents(total: number, matches?: (rev: number) => boolean, scan?: number) {
   const calls: Record<string, string | undefined>[] = [];
+  const feed = { total, event, ...(matches === undefined ? {} : { matches }), ...(scan === undefined ? {} : { scan }) };
   const api = {
     request: async (_method: string, _path: string, init: { query: Record<string, string | undefined> }) => {
       calls.push(init.query);
-      const limit = Number(init.query.limit);
-      const before = init.query.before === undefined ? total + 1 : Number(init.query.before);
-      const revs: number[] = [];
-      for (let rev = before - 1; rev >= 1 && revs.length < limit; rev--) revs.push(rev);
-      revs.reverse();
-      const page: ActivityPage = {
-        events: revs.map(event),
-        from_rev: revs[0] ?? 0,
-        to_rev: revs.at(-1) ?? 0,
-        at_start: (revs[0] ?? 1) <= 1,
-      };
-      return page;
+      return fakePage(feed, init.query);
     },
   } as unknown as Api;
   return { api, calls };
 }
 
+const revsOf = (page: ActivityPage) => page.events.map((e) => e.at);
+
 describe('fetchActivity', () => {
-  it('asks once for up to 500 events', async () => {
+  it('asks for one page first', async () => {
     const { api, calls } = fakeEvents(120);
-    const page = await fetchActivity(api, { task: 'T' }, 100);
-    expect(calls).toEqual([{ task: 'T', project: undefined, workstream: undefined, session: undefined, before: undefined, limit: '100' }]);
-    expect(page).toMatchObject({ from_rev: 21, to_rev: 120, at_start: false });
-    expect(page.events).toHaveLength(100);
+    const page = await fetchActivity(api, { task: 'T' }, undefined);
+    expect(calls).toEqual([
+      { task: 'T', project: undefined, workstream: undefined, session: undefined, before: undefined, limit: '50' },
+    ]);
+    expect(page).toMatchObject({ from_rev: 71, to_rev: 120, at_start: false });
+    expect(revsOf(page)).toEqual(Array.from({ length: 50 }, (_, i) => 71 + i));
   });
 
-  it('pages back past the 500 cap, oldest first', async () => {
+  it('covers everything down to `reach` in 500s, then adds a page', async () => {
     const { api, calls } = fakeEvents(1_200);
-    const page = await fetchActivity(api, {}, 700);
+    const page = await fetchActivity(api, {}, 1_151);
     expect(calls.map((c) => [c.before, c.limit])).toEqual([
       [undefined, '500'],
-      ['701', '200'],
+      ['701', '50'],
     ]);
-    expect(page.events.map((e) => e.at)).toEqual(Array.from({ length: 700 }, (_, i) => 501 + i));
-    expect(page).toMatchObject({ from_rev: 501, to_rev: 1_200, at_start: false });
+    expect(revsOf(page)).toEqual(Array.from({ length: 550 }, (_, i) => 651 + i));
+    expect(page).toMatchObject({ from_rev: 651, to_rev: 1_200, at_start: false });
+  });
+
+  it('keeps paging through empty pages that are not at the start, within a budget', async () => {
+    // Matches at 5–7 and 950–952, 100 revisions scanned per request: a gap of about 900.
+    const matches = (rev: number) => (rev >= 5 && rev <= 7) || (rev >= 950 && rev <= 952);
+    const { api, calls } = fakeEvents(1_000, matches, 100);
+
+    const first = await fetchActivity(api, { task: 'T' }, undefined);
+    expect(calls).toHaveLength(ACTIVITY_BUDGET);
+    expect(calls.map((c) => c.before)).toEqual([undefined, '950', '850', '750', '650', '550', '450', '350']);
+    expect(revsOf(first)).toEqual([950, 951, 952]);
+    // Where it stopped, to resume from; not the end.
+    expect(first).toMatchObject({ from_rev: 250, to_rev: 952, at_start: false });
+
+    calls.length = 0;
+    const second = await fetchActivity(api, { task: 'T' }, first.from_rev);
+    expect(revsOf(second)).toEqual([5, 6, 7, 950, 951, 952]);
+    expect(second).toMatchObject({ to_rev: 952, at_start: true });
+  });
+
+  it('spends at most its budget on a feed with nothing in reach', async () => {
+    const { api, calls } = fakeEvents(100_000, () => false, 100);
+    const page = await fetchActivity(api, { task: 'T' }, undefined);
+    expect(calls).toHaveLength(ACTIVITY_BUDGET);
+    expect(page).toEqual({ events: [], from_rev: 99_201, to_rev: 0, at_start: false });
+  });
+
+  it('stops on a page that cannot be continued', async () => {
+    const calls: unknown[] = [];
+    const api = {
+      request: async () => {
+        calls.push(1);
+        return { events: [], from_rev: 0, to_rev: 0, at_start: false } satisfies ActivityPage;
+      },
+    } as unknown as Api;
+    const page = await fetchActivity(api, { task: 'T' }, undefined);
+    expect(calls).toHaveLength(1);
+    expect(page.at_start).toBe(true);
   });
 
   it('stops at the start', async () => {
     const { api } = fakeEvents(30);
-    const page = await fetchActivity(api, {}, 600);
+    const page = await fetchActivity(api, {}, undefined);
     expect(page.events).toHaveLength(30);
     expect(page.at_start).toBe(true);
   });

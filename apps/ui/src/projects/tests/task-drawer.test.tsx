@@ -5,7 +5,9 @@ import { fireEvent, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Event } from '../../data/index.ts';
 import { Board } from '../board.tsx';
+import { ACTIVITY_BUDGET } from '../data.ts';
 import { TaskDrawer, withMentions } from '../task-drawer.tsx';
+import { fakePage } from './fake-events.ts';
 import { AGENT_TOKEN, demo, eventually, otherClient, renderWithHub, startHub, stopHub, type Hub } from './harness.tsx';
 
 const drawer = (taskId: string) => <TaskDrawer taskId={taskId} open onOpenChange={() => {}} />;
@@ -19,6 +21,42 @@ describe('TaskDrawer', () => {
 
   afterEach(async () => {
     await stopHub(hub);
+  });
+
+  it('loads older history across a long gap of empty pages', async () => {
+    // PAP-1's events at revisions 5–7 and 950–952 of 1,000, with 100 revisions scanned per
+    // request: the hub answers empty pages that are not at the start in between.
+    const feed = {
+      total: 1_000,
+      scan: 100,
+      matches: (rev: number) => (rev >= 5 && rev <= 7) || (rev >= 950 && rev <= 952),
+      event: (rev: number): Event => ({
+        id: `01JB0000000000000000EV${String(rev).padStart(4, '0')}`,
+        at: 1_790_000_000_000 + rev * 60_000,
+        workspace: '01JB000000000000000WSP0001',
+        author: demo.sam,
+        body: { type: 'task_assigned', data: { task: demo.pap1, assignee: demo.writer } },
+      }),
+    };
+    let feedRequests = 0;
+    const withGap: typeof fetch = (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname !== '/v1/events' || url.searchParams.get('task') !== demo.pap1) return fetch(input, init);
+      feedRequests += 1;
+      const page = fakePage(feed, Object.fromEntries(url.searchParams));
+      return Promise.resolve(
+        new Response(JSON.stringify(page), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+      );
+    };
+    renderWithHub(drawer(demo.pap1), hub, { fetch: withGap });
+    const dialog = await screen.findByRole('dialog', { name: 'Draft the method section' });
+    const history = () => within(dialog).getByRole('list', { name: 'History' });
+    await eventually(() => expect(within(history()).getAllByRole('listitem')).toHaveLength(3));
+    expect(feedRequests).toBe(ACTIVITY_BUDGET);
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Load older' }));
+    await eventually(() => expect(within(history()).getAllByRole('listitem')).toHaveLength(6));
+    expect(within(dialog).queryByRole('button', { name: 'Load older' })).toBeNull();
   });
 
   it('shows PAP-1’s agent-plan subtasks, marked and read-only for people', async () => {

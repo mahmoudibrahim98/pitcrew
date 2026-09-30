@@ -57,10 +57,19 @@ export async function stopHub(hub: Hub): Promise<void> {
 
 /**
  * Renders inside `DataProvider`. The stream always uses the device token (it is device-only);
- * `token` sets the one the API calls carry, so a test can act as the agent @writer.
+ * `token` sets the one the API calls carry, so a test can act as the agent @writer. `fetch`
+ * stands between the API client and the hub, to slow or rewrite answers.
  */
-export function renderWithHub(ui: ReactNode, hub: Hub, options: { token?: string; nav?: ProjectsNav } = {}) {
-  const api = createApi({ baseUrl: hub.url, token: options.token ?? DEVICE_TOKEN });
+export function renderWithHub(
+  ui: ReactNode,
+  hub: Hub,
+  options: { token?: string; nav?: ProjectsNav; fetch?: typeof fetch } = {},
+) {
+  const api = createApi({
+    baseUrl: hub.url,
+    token: options.token ?? DEVICE_TOKEN,
+    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+  });
   const queryClient = createQueryClient();
   clients.add(queryClient);
   const result = render(

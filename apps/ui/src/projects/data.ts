@@ -161,11 +161,27 @@ function eventQuery(filters: EventFilters, before: number | undefined, limit: nu
   };
 }
 
-/** The newest `limit` matching events, oldest first, in as few requests as the 500 cap allows. */
+/**
+ * Requests one call may spend looking past what is already shown. With filters the hub scans a
+ * bounded window per request, so a sparse feed can answer with empty pages for a while.
+ */
+export const ACTIVITY_BUDGET = 8;
+/** A safety cap on the requests that re-cover what is already shown. */
+const COVER_CAP = 40;
+
+/**
+ * A window of activity, newest first in the feed and oldest first in `events`: every matching
+ * event from the newest down to `reach` (a `from_rev` an earlier call returned), then up to one
+ * page more, within `ACTIVITY_BUDGET` requests.
+ *
+ * Only `at_start` ends the feed. An empty page that is not at the start says where its scan
+ * stopped (`from_rev`), and the next request carries on from there. The returned `from_rev` is
+ * where to resume: pass it as `reach` to get the next page too.
+ */
 export async function fetchActivity(
   api: Api,
   filters: EventFilters,
-  limit: number,
+  reach: number | undefined,
   signal?: AbortSignal,
 ): Promise<ActivityPage> {
   const get = (before: number | undefined, n: number) =>
@@ -173,36 +189,62 @@ export async function fetchActivity(
       query: eventQuery(filters, before, Math.min(n, EVENTS_MAX_LIMIT)),
       signal,
     });
-  const newest = await get(undefined, limit);
-  let { events, from_rev, at_start } = newest;
-  while (events.length < limit && !at_start && from_rev > 0) {
-    const older = await get(from_rev, limit - events.length);
-    if (older.events.length === 0) break;
-    events = [...older.events, ...events];
-    from_rev = older.from_rev;
-    at_start = older.at_start;
+  let events: Event[] = [];
+  let before: number | undefined;
+  let toRev = 0;
+  let atStart = false;
+  let covering = 0;
+  let spent = 0;
+  let found = 0;
+  for (;;) {
+    const past = reach === undefined || (before !== undefined && before <= reach);
+    const done = past ? found >= ACTIVITY_PAGE || spent >= ACTIVITY_BUDGET : covering >= COVER_CAP;
+    if (atStart || done) break;
+    const page = await get(before, past ? ACTIVITY_PAGE - found : EVENTS_MAX_LIMIT);
+    if (past) {
+      spent += 1;
+      found += page.events.length;
+    } else {
+      covering += 1;
+    }
+    events = [...page.events, ...events];
+    if (toRev === 0 && page.events.length > 0) toRev = page.to_rev;
+    atStart = page.at_start;
+    // A page that is not at the start but gives no older position cannot be continued: stop
+    // there rather than ask for the same thing again.
+    if (!atStart && (page.from_rev <= 0 || (before !== undefined && page.from_rev >= before))) {
+      atStart = true;
+    }
+    before = page.from_rev;
   }
-  return { events, from_rev, to_rev: newest.to_rev, at_start };
+  return { events, from_rev: before ?? 0, to_rev: toRev, at_start: atStart };
 }
 
 /**
- * Activity (`GET /v1/events`), newest `pages × 50` events. Keyed under `['events']`, which every
- * stream event invalidates, so the feed stays live; "load older" asks for one more page, and the
- * whole window refetches in one request, so pages never drift apart as new events arrive.
+ * Activity (`GET /v1/events`) as one live window, keyed under `['events']` (every stream event
+ * invalidates it, so the feed stays current). "Load older" moves the window's `reach` down to
+ * where the last call stopped; the whole window then refetches from the newest event, so older
+ * and newer parts never drift apart as events arrive.
  */
 export function useActivity(filters: EventFilters = {}) {
   const api = useApi();
-  const [pages, setPages] = useState(1);
-  const limit = pages * ACTIVITY_PAGE;
   const filterKey = JSON.stringify(filters);
+  const [older, setOlder] = useState<{ filters: string; reach: number } | null>(null);
+  const reach = older !== null && older.filters === filterKey ? older.reach : undefined;
   const query = useLiveQuery({
-    queryKey: [...keys.events, 'list', filters, { limit }],
-    queryFn: ({ signal }) => fetchActivity(api, filters, limit, signal),
-    // While a bigger window loads, keep showing the smaller one (same filters only).
+    queryKey: [...keys.events, 'list', filters, { reach: reach ?? null }],
+    queryFn: ({ signal }) => fetchActivity(api, filters, reach, signal),
+    // While a longer window loads, keep showing the shorter one (same filters only).
     placeholderData: (previous, previousQuery) =>
       previousQuery !== undefined && JSON.stringify(previousQuery.queryKey[2]) === filterKey ? previous : undefined,
   });
-  return { ...query, loadOlder: () => setPages((n) => n + 1) };
+  const page = query.data;
+  const loadOlder = () => {
+    if (page !== undefined && !page.at_start && !query.isPlaceholderData) {
+      setOlder({ filters: filterKey, reach: page.from_rev });
+    }
+  };
+  return { ...query, loadOlder };
 }
 
 /**
