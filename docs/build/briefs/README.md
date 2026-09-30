@@ -22,9 +22,12 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [I-cli-and-hooks](I-cli-and-hooks.md) | I · CLI and hooks | `s/I/cli-and-hooks` | Sonnet-class | In progress |
 | [J-ssh-connection](J-ssh-connection.md) | J · Remote and HPC | `s/J/ssh-connection` | Opus-class | In review |
 | [L-skeleton-and-data](L-skeleton-and-data.md) | L · UI foundation | `s/L/skeleton-and-data` | Opus-class | In review: round 3 |
-| [L-shell](L-shell.md) | L · UI foundation | `s/L/shell` | Opus-class | Ready (after skeleton-and-data merges) |
-| [M-console-components](M-console-components.md) | M · Agent console | `s/M/console-components` | Opus-class | Ready (after skeleton-and-data merges) |
-| [N-projects-components](N-projects-components.md) | N · Projects layout | `s/N/projects-components` | Sonnet-class | Ready (after skeleton-and-data merges) |
+| [L-shell](L-shell.md) | L · UI foundation | `s/L/shell` | Opus-class | In progress (based on skeleton-and-data) |
+| [M-console-components](M-console-components.md) | M · Agent console | `s/M/console-components` | Opus-class | In progress (based on skeleton-and-data) |
+| [N-projects-components](N-projects-components.md) | N · Projects layout | `s/N/projects-components` | Sonnet-class | In progress (based on skeleton-and-data) |
+| [F-activity-blocks](F-activity-blocks.md) | F · Recap | `s/F/activity-blocks` | Opus-class | In progress |
+| [P-bench-and-release](P-bench-and-release.md) | P · Packaging | `s/P/bench-and-release` | Sonnet-class | In progress |
+| [Q-threat-model-and-fuzz](Q-threat-model-and-fuzz.md) | Q · Security | `s/Q/threat-model-and-fuzz` | Opus-class | In progress |
 
 The branch name matters: CI's path guard reads the stream from it (`s/<stream>/<topic>`). The
 integrator adds new briefs here as streams progress, and marks them done when merged.
