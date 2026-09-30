@@ -1,0 +1,190 @@
+//! Test helpers: a collecting sink, a source that logs its reads, and a fast configuration.
+
+#![allow(dead_code, clippy::unwrap_used)]
+
+use pitcrew_interfaces::fake::FakeSource;
+use pitcrew_interfaces::source::{
+    Cursor, ParseChunk, SourceAdapter, SourceError, TranscriptItem, TranscriptPage, TranscriptRef,
+};
+use pitcrew_protocol::events::{Event, EventBody};
+use pitcrew_protocol::ids::{MachineId, MemberId, WorkspaceId};
+use pitcrew_protocol::model::{Engine, Receipt};
+use pitcrew_runner::{EventSink, RunnerConfig, SinkError, Timing};
+use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex};
+use std::time::{Duration, Instant};
+
+/// Collects events; can be closed so `accept` blocks (to test backpressure).
+#[derive(Debug, Default)]
+pub struct CollectSink {
+    events: Mutex<Vec<(Instant, Event)>>,
+    closed: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl CollectSink {
+    pub fn close(&self) {
+        *self.closed.lock().unwrap() = true;
+    }
+
+    pub fn open(&self) {
+        *self.closed.lock().unwrap() = false;
+        self.cv.notify_all();
+    }
+
+    pub fn events(&self) -> Vec<Event> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, e)| e.clone())
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.events.lock().unwrap().len()
+    }
+
+    /// Waits until at least `n` events have arrived; returns when the n-th arrived.
+    pub fn wait_for(&self, n: usize, timeout: Duration) -> Option<Instant> {
+        let end = Instant::now() + timeout;
+        let mut events = self.events.lock().unwrap();
+        while events.len() < n {
+            let now = Instant::now();
+            if now >= end {
+                return None;
+            }
+            events = self.cv.wait_timeout(events, end - now).unwrap().0;
+        }
+        Some(events[n - 1].0)
+    }
+}
+
+impl EventSink for CollectSink {
+    fn accept(&self, events: &[Event]) -> Result<(), SinkError> {
+        let mut closed = self.closed.lock().unwrap();
+        while *closed {
+            closed = self.cv.wait(closed).unwrap();
+        }
+        drop(closed);
+        let now = Instant::now();
+        self.events
+            .lock()
+            .unwrap()
+            .extend(events.iter().cloned().map(|e| (now, e)));
+        self.cv.notify_all();
+        Ok(())
+    }
+}
+
+/// Wraps a [`FakeSource`] whose items can be replaced (to "append"), and logs every
+/// `read_from` cursor offset.
+#[derive(Debug)]
+pub struct LoggedFake {
+    transcripts: Vec<TranscriptRef>,
+    inner: Mutex<FakeSource>,
+    pub reads: Mutex<Vec<u64>>,
+}
+
+impl LoggedFake {
+    pub fn new(transcripts: Vec<TranscriptRef>, items: Vec<TranscriptItem>) -> Self {
+        Self {
+            inner: Mutex::new(FakeSource::new(Engine::Claude, transcripts.clone(), items)),
+            transcripts,
+            reads: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn set_items(&self, items: Vec<TranscriptItem>) {
+        *self.inner.lock().unwrap() =
+            FakeSource::new(Engine::Claude, self.transcripts.clone(), items);
+    }
+
+    pub fn reads(&self) -> Vec<u64> {
+        self.reads.lock().unwrap().clone()
+    }
+}
+
+impl SourceAdapter for LoggedFake {
+    fn engine(&self) -> Engine {
+        Engine::Claude
+    }
+
+    fn discover(&self, home: &Path) -> Result<Vec<TranscriptRef>, SourceError> {
+        self.inner.lock().unwrap().discover(home)
+    }
+
+    fn read_from(&self, t: &TranscriptRef, cursor: &Cursor) -> Result<ParseChunk, SourceError> {
+        self.reads.lock().unwrap().push(cursor.offset);
+        self.inner.lock().unwrap().read_from(t, cursor)
+    }
+
+    fn read_page(
+        &self,
+        t: &TranscriptRef,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<TranscriptPage, SourceError> {
+        self.inner.lock().unwrap().read_page(t, before, limit)
+    }
+}
+
+pub fn turn(i: u64) -> TranscriptItem {
+    TranscriptItem::TurnEnded {
+        at: 1_790_000_000_000 + i64::try_from(i).unwrap(),
+        offset: i,
+    }
+}
+
+pub fn transcript_ref(path: &Path) -> TranscriptRef {
+    TranscriptRef {
+        engine: Engine::Claude,
+        path: path.to_path_buf(),
+        inner_id: None,
+        size: 0,
+        modified: 0,
+    }
+}
+
+/// A configuration with the default 100 ms debounce, and slow sweeps so notifications must do
+/// the work.
+pub fn config(home: &Path, state: &Path) -> RunnerConfig {
+    let mut c = RunnerConfig::new(WorkspaceId::new(), MachineId::new(), MemberId::new(), state)
+        .with_home(Engine::Claude, home);
+    c.timing = Timing {
+        cold_interval: Duration::from_secs(600),
+        rediscover_interval: Duration::from_secs(600),
+        ..Timing::default()
+    };
+    c
+}
+
+pub fn append(path: &Path, bytes: &[u8]) {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    f.write_all(bytes).unwrap();
+    f.sync_all().unwrap();
+}
+
+/// A short label per event, for comparing sequences.
+pub fn label(e: &Event) -> String {
+    match &e.body {
+        EventBody::SessionDiscovered { session } => format!("discovered:{:?}", session.state),
+        EventBody::SessionStateChanged { to, .. } => format!("state:{to:?}"),
+        EventBody::ToolRan { tool, .. } => format!("tool:{tool}"),
+        EventBody::FileEdited { path, .. } => format!("edit:{path}"),
+        EventBody::TurnEnded {
+            receipt: Receipt::Transcript { offset, .. },
+            ..
+        } => format!("turn@{offset}"),
+        other => format!("{other:?}"),
+    }
+}
+
+pub fn labels(events: &[Event]) -> Vec<String> {
+    events.iter().map(label).collect()
+}
+
+pub fn fixture_transcript() -> PathBuf {
+    pitcrew_fixtures::data_dir().join("transcripts/claude/demo-session.jsonl")
+}
