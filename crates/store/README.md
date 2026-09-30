@@ -69,24 +69,61 @@ Then:
   returns an error, the whole append rolls back: nothing is stored, no revision is used, nothing
   is announced. An error is a bug, never skipped;
 - `projection_state (name, version, rev)` records each projection's progress. On open, a
-  projection whose `version` changed (or that is new) is rebuilt: `reset`, then the log replayed
-  1,000 events at a time. One that is behind the log (another process appended without it)
-  catches up. Each rebuild or catch-up is one transaction, so readers never see half a rebuild.
-  An append also catches up a projection that fell behind while the store was open;
-- `Store::rebuild(name)` rebuilds one on demand;
+  projection whose stored `version` is older (or that is new) is rebuilt: `reset`, then the log
+  replayed 1,000 events at a time. One that is behind the log (another process appended without
+  it) catches up. Each rebuild or catch-up is one transaction, so readers never see half a
+  rebuild. A stored version **newer** than this build's is refused with
+  `Error::ProjectionVersion`, like a newer schema: rebuilding it would undo the newer build;
+- an append only catches up on revisions, for a projection another process appended past without
+  it. If another process rebuilt a projection at a **different version** after this store
+  opened, the append fails with `Error::ProjectionVersion` and stores nothing. Rebuilding it
+  back instead would replay the whole log under the write lock on every append, in both
+  processes. Two builds with different projection versions cannot share a store;
+- `Store::rebuild(name)` rebuilds one on demand (and also refuses a newer stored version);
 - bump `version()` whenever `apply` changes meaning. `reset` followed by replaying the log must
   give the same tables as applying events one append at a time; test that.
 
 **SQL access.** `pitcrew_store::sql` re-exports the store's `rusqlite`, so domain crates use the
 workspace's one version and the same `Transaction` type without their own dependency. `apply`
-and `reset` get the write transaction: do not commit, and touch only your own tables.
+and `reset` get the write transaction: do not commit, and touch only your own tables. A
+`DbError` wraps a `sql::Error`; `DbError::as_sql()` reaches it (e.g. for its error code).
 
 **Reads.** `Store::read(|conn| …)` runs a closure on a separate **read-only** connection inside
-one read transaction (a consistent snapshot). Reads never take the write lock, so a slow read
-does not hold up appends and an append does not block reads (WAL). Keep reads short: they share
-one connection, and a long-open read stops the WAL from being checkpointed. The closure's error
-type is anything a store `Error` converts into, e.g. `pitcrew_store::Result<T>`, where `?` on a
-`sql::Error` works.
+one read transaction (a consistent snapshot from the closure's first query until it returns,
+even if appends commit meanwhile). Reads never take the write lock, so a slow read does not hold
+up appends and an append does not block reads (WAL). `since` and `before` use the same
+connection, so they do not wait for an append or a `Store::rebuild` either; `latest_rev` stays on
+the writer. Keep reads short: they share one connection, and a long-open read stops the WAL from
+being checkpointed. The closure's error type is anything a store `Error` converts into, e.g.
+`pitcrew_store::Result<T>`, where `?` on a `sql::Error` works.
+
+**Do not call `read`, `since` or `before` inside a `read` closure: it deadlocks** (they wait for
+the connection the closure holds). Appending inside one is fine.
+
+**Closing.** The read connection closes before the write connection, so the writer is the last
+to close and checkpoints the WAL: no `-wal` or `-shm` file is left, and the `.db` alone holds
+every commit.
+
+### Rules for projections
+
+For every domain crate (E, F, G) that writes one:
+
+- **`apply` has no side effects.** It writes only its own tables in the transaction it is given:
+  no appending events, no files, network or channels, and no reading the clock. It must give the
+  same tables when the log is replayed a year later; time comes from `event.at`.
+- **`apply` never reads other projections' tables.** Their state at that moment depends on
+  registration order and on their own rebuilds. Join across projections in `Store::read`.
+- **No foreign keys between different projections' tables.** One projection's `reset` must not
+  cascade into, or be blocked by, another's rows.
+- **Who acted comes from the event:** `event.author` and `event.on_behalf_of` of the
+  `StoredEvent`, never the caller of the current request (a replay has no caller).
+- **A migration that reshapes a projection's tables ships with a `version()` bump,** so the next
+  open rebuilds the tables from the log instead of keeping rows in the old shape.
+- **Inside `read`, the revision the data reflects is `projection_state.rev`** for that
+  projection, queried in the same closure. Not `MAX(events.rev)` (another process may have
+  appended events not yet applied) and not `Store::latest_rev()` (outside the snapshot).
+- **A future NFS mode** (`journal_mode=DELETE` plus EXCLUSIVE locking) has no concurrent
+  readers: it must route `read` (and `since`, `before`) through the write connection.
 
 ## Timings
 
