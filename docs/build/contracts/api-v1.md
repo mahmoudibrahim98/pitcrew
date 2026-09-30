@@ -41,7 +41,7 @@ Every failure returns an `ApiError` body, `{"code": "…", "message": "…"}`:
 | `unauthorized` | 401 | No token, or an unknown one |
 | `forbidden` | 403 | The token's scope does not allow it, or an agent writes to something not its own |
 | `not_found` | 404 | No such resource **in the path**; also an unknown route or method |
-| `conflict` | 409 | An allowed caller, but the rules say no: a move `can_move` rejects, dispatching a done or canceled task |
+| `conflict` | 409 | An allowed caller, but the rules say no: a move `can_move` rejects, dispatching a done or canceled task, a project key already in use, a `blocked_by` cycle |
 | `invalid` | 400 | Malformed body or query, unknown enum value, an unknown id **in the body**, a body over 1 MiB, a WebSocket route called without an upgrade |
 | `unavailable` | 503 | The session's machine is unreachable |
 | `internal` | 500 | Anything else |
@@ -69,9 +69,32 @@ the task key (`PAP-4`).
 |---|---|---|
 | `GET /v1/projects` | → `Project[]` | |
 | `GET /v1/projects/{id}` | → `Project` | |
+| `POST /v1/projects` | `NewProject` → `Project` (201) | See below. `409 conflict` if the key is in use. Emits `project_created`. |
 | `GET /v1/workstreams?project=` | → `Workstream[]` | |
 | `GET /v1/workstreams/{id}` | → `Workstream` | |
+| `POST /v1/workstreams` | `NewWorkstream` → `Workstream` (201) | See below. `404 not_found` for an unknown project. Emits `workstream_created`. |
 | `PATCH /v1/workstreams/{id}` | `{ "status"?, "health"? }` → `Workstream` | Emits `workstream_changed`. |
+
+`NewProject`, `NewWorkstream` and `NewTask` are Rust types in `crates/protocol/src/api.rs`.
+
+`NewProject`: `{ "key": ProjectKey, "name": String, "lead"?: MemberId, "members"?: MemberId[],
+"status"?: ProjectStatus, "start"?: Date, "due"?: Date, "root"?: Location }`. The hub assigns `id`;
+`external` starts empty.
+- `key` is a `ProjectKey`: 2 to 10 characters, an uppercase ASCII letter, then uppercase letters or
+  digits (`PAP`, `TL2`). Any other key is `400 invalid`; a key another project has is
+  `409 conflict`. Task keys are `<key>-<n>`, starting at 1.
+- `name` must not be blank.
+- `lead` defaults to the caller. `members` defaults to the lead alone; the lead is always a member
+  (put first when the list leaves it out), and duplicates are dropped. An unknown member is `400`.
+- `status` defaults to `in_progress`.
+- Dates are `YYYY-MM-DD`, and `start` ≤ `due` when both are set (`400`).
+- `root` names a known machine and a non-empty path (`400`).
+
+`NewWorkstream`: `{ "project": ProjectId, "name": String, "status"?: WorkstreamStatus,
+"locations"?: Location[] }`. The hub assigns `id`; `health` starts `on_track` and `external` empty.
+- An unknown `project` is `404 not_found`, although it is in the body.
+- `name` must not be blank. `status` defaults to `active`. Each location names a known machine and
+  a non-empty path (`400`).
 
 ### Tasks
 
@@ -79,6 +102,7 @@ the task key (`PAP-4`).
 |---|---|---|
 | `GET /v1/tasks?project=&workstream=&assignee=&status=` | → `Task[]` | All filters optional; `status` may repeat. **agent** |
 | `GET /v1/tasks/{id-or-key}` | → `Task` | **agent** |
+| `PATCH /v1/tasks/{id-or-key}` | `TaskPatch` → `Task` | See "Editing a task". Emits `task_updated` with the fields that changed, or nothing. |
 | `POST /v1/tasks` | `NewTask` → `Task` (201) | See below. Emits `task_created`. |
 | `POST /v1/tasks/{id}/move` | `{ "to": TaskStatus }` → `Task` | The mover comes from the token: `device` → `person`; `agent` → `agent` (own tasks only, else 403). `409 conflict` if `can_move` is false. Emits `task_moved`. **agent** |
 | `POST /v1/tasks/{id}/assign` | `{ "assignee": MemberId \| null }` → `Task` | The key is required; `null` unassigns. Emits `task_assigned`. |
@@ -90,6 +114,29 @@ the task key (`PAP-4`).
 "description"?: String, "status"?: TaskStatus (default "todo"), "priority"?: Priority,
 "assignee"?: MemberId, "labels"?: String[], "due"?: Date }`. The hub assigns `id` and the next
 `key` in the project.
+
+**Editing a task.** `TaskPatch` (in `crates/protocol/src/model.rs`):
+`{ "workstream"?: WorkstreamId | null, "title"?: String, "description"?: String,
+"priority"?: Priority, "labels"?: String[], "start"?: Date | null, "due"?: Date | null,
+"blocked_by"?: TaskId[], "accept_auto"?: bool }`.
+- A field left out is unchanged. `null` clears `workstream`, `start` and `due`; on the other fields
+  `null` is the same as leaving the field out. `labels` and `blocked_by` replace the whole list.
+- Status, assignee and subtasks have their own routes. Like any unknown field, they are ignored.
+- The hub checks the whole patch before it changes anything:
+
+| Rule | Error |
+|---|---|
+| `title` is 1 to 500 characters (Unicode code points) after trimming whitespace; the trimmed title is stored | `400 invalid` |
+| `labels` are trimmed and deduplicated (the first stays); then each is 1 to 64 characters, and there are at most 32 | `400 invalid` |
+| `workstream` is a known workstream of the task's project | `400 invalid` |
+| `blocked_by` holds ids of existing tasks, never the task's own id; duplicates are dropped | `400 invalid` |
+| `blocked_by` creates no cycle: no task in it already waits on this task, directly or through other tasks | `409 conflict` |
+| `start` and `due` are `YYYY-MM-DD`, and `start` ≤ `due` when the task will have both (a new `start` is checked against the current `due`, and the other way round) | `400 invalid` |
+| `priority` is a `Priority`, `accept_auto` a boolean, and the other fields strings or lists of strings | `400 invalid` |
+
+- The hub then compares the checked values with the task's. `task_updated` carries only the fields
+  that differ (lists compare in order), with `null` for a field it cleared. A patch that changes
+  nothing, `{}` included, returns the task and emits nothing.
 
 **Dispatch.** Starts a session for the agent on the task:
 - `409 conflict` if the task is done or canceled.
@@ -132,8 +179,23 @@ not start at byte 0).
 | `POST /v1/asks` | `{ "kind", "to", "title", "body"?, "options"?, "task"?, "session"?, "receipts"? }` → `Ask` (201) | Emits `ask_raised`. **agent** |
 | `POST /v1/asks/{id}/answer` | `{ "option"?: usize, "text"?: String }` → `Ask` | See below. Emits `ask_answered`. **agent** |
 | `GET /v1/briefs` | → `Brief[]` | |
-| `PUT /v1/briefs/{project\|workstream}/{id}` | `{ "text", "next"?, "pinned" }` → `Brief` | A person's edit (`source: "person"`). Emits `brief_accepted`. |
+| `PUT /v1/briefs/{project\|workstream}/{id}` | `{ "text", "next"?, "pinned" }` → `Brief` | A person's brief, or a proposal they accept. See "Briefs". Emits `brief_accepted`. |
 | `GET /v1/events?before=&limit=&project=&workstream=&task=&session=` | → `{ "events": Event[], "from_rev": u64, "to_rev": u64, "at_start": bool }` | See below. |
+
+**Briefs.** The brief in force for a project or workstream is the one its newest `brief_accepted`
+put there. Its **pending proposal** is the newest `brief_proposed` for that target, if it is newer
+(a higher `rev`) than that `brief_accepted`, or if the target has no `brief_accepted` yet.
+- `PUT` stores `text`, `next` and `pinned`, and `brief_accepted` carries all three. Like
+  `brief_proposed`, it leaves `next` out when there is none.
+- **Accepting a proposal.** When the `PUT`'s `text` and `next` both equal the pending proposal's
+  (a missing `next` equals only a missing `next`), the hub copies the proposal's `receipts` into
+  `brief_accepted`, and the brief's `source` is `back_office`.
+- Any other `PUT` is the person's own text: `source` is `person`, and it has no receipts.
+- **Keep current** is a `PUT` of the current text. It needs no new event kind: the accepted brief is
+  then newer than the proposal, so nothing is pending. The brief becomes the person's.
+- A `brief_accepted` written by an agent (the back office applying a brief itself) also has
+  `source: back_office`. Projections rebuild `Brief` from the log with these same rules, in
+  revision order; its `receipts` are those of the `brief_accepted`.
 
 **Who may answer an ask:**
 - A `device` token: asks addressed to that person, or to an agent that person owns.
@@ -174,7 +236,8 @@ be contiguous. Pass `from_rev` as `before` for the previous page. Default limit 
 - `{"type":"ping","at":…}` every 20 s. A client that sees nothing for 60 s reconnects.
 - Agents and hooks use HTTP; the stream is for `device` tokens in v1.
 - **Client rule:** keep server state in TanStack Query, and on each event invalidate exactly the
-  keys it touches (e.g. `task_moved` → that task, its lists and its workstream).
+  keys it touches (e.g. `task_moved` → that task, its lists and its workstream; `task_updated` →
+  that task, its lists, and its old and new workstream).
 
 ## Terminals: `GET /v1/sessions/{id}/terminal?cols=&rows=&from=` (WebSocket, device tokens)
 
