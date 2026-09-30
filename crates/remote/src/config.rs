@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 
 /// ssh's own limit on nested `Include`s.
 const MAX_INCLUDE_DEPTH: usize = 16;
+/// The most files read for one listing. Without cycles, includes can still fan out: 16 levels
+/// of two includes each would be 2^16 reads.
+const MAX_FILES: usize = 256;
 
 /// Hosts found in an ssh config, and anything the reader skipped.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -54,6 +57,8 @@ pub fn list_hosts_in(path: &Path, home: &Path) -> HostList {
         home,
         list: HostList::default(),
         seen: HashSet::new(),
+        stack: vec![identity(path)],
+        files: 1,
     };
     match fs::read_to_string(path) {
         Ok(text) => reader.read(&text, path, 0),
@@ -66,10 +71,19 @@ pub fn list_hosts_in(path: &Path, home: &Path) -> HostList {
     reader.list
 }
 
+/// A file's canonical path, so two spellings of one file compare equal.
+fn identity(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 struct Reader<'a> {
     home: &'a Path,
     list: HostList,
     seen: HashSet<String>,
+    /// The files being read, outermost first: including one of them again is a cycle.
+    stack: Vec<PathBuf>,
+    /// Files read so far.
+    files: usize,
 }
 
 impl Reader<'_> {
@@ -118,8 +132,28 @@ impl Reader<'_> {
             self.home.join(".ssh").join(pattern)
         };
         for file in expand_glob(&path) {
+            let id = identity(&file);
+            if self.stack.contains(&id) {
+                self.list.notes.push(format!(
+                    "{} includes itself; skipped the cycle",
+                    file.display()
+                ));
+                continue;
+            }
+            if self.files >= MAX_FILES {
+                self.list.notes.push(format!(
+                    "more than {MAX_FILES} config files; skipped {}",
+                    file.display()
+                ));
+                continue;
+            }
+            self.files += 1;
             match fs::read_to_string(&file) {
-                Ok(text) => self.read(&text, &file, depth + 1),
+                Ok(text) => {
+                    self.stack.push(id);
+                    self.read(&text, &file, depth + 1);
+                    self.stack.pop();
+                }
                 Err(e) => self
                     .list
                     .notes
@@ -296,13 +330,39 @@ mod tests {
     }
 
     #[test]
-    fn include_cycles_stop() {
+    fn include_cycles_are_skipped() {
         let home = tempfile::tempdir().unwrap();
         let ssh = home.path().join(".ssh");
-        write(&ssh.join("config"), "Host a\nInclude config\n");
+        // Used to read 2^16 files.
+        write(&ssh.join("config"), "Host a\nInclude config config\n");
         let list = list_hosts_in(&ssh.join("config"), home.path());
         assert_eq!(list.hosts, ["a"]);
-        assert!(list.notes.iter().any(|n| n.contains("too deeply")));
+        assert_eq!(list.notes.len(), 2, "{:?}", list.notes);
+        assert!(list.notes.iter().all(|n| n.contains("includes itself")));
+
+        // A longer cycle, through another spelling of the same file.
+        write(&ssh.join("config"), "Host a\nInclude b\n");
+        write(&ssh.join("b"), "Host b\nInclude ~/.ssh/./config\n");
+        let list = list_hosts_in(&ssh.join("config"), home.path());
+        assert_eq!(list.hosts, ["a", "b"]);
+        assert_eq!(list.notes.len(), 1, "{:?}", list.notes);
+    }
+
+    #[test]
+    fn fan_out_is_bounded() {
+        let home = tempfile::tempdir().unwrap();
+        let ssh = home.path().join(".ssh");
+        write(&ssh.join("config"), "Include l1\n");
+        for level in 1..16 {
+            write(
+                &ssh.join(format!("l{level}")),
+                &format!("Host h{level}\nInclude l{0} l{0}\n", level + 1),
+            );
+        }
+        write(&ssh.join("l16"), "Host h16\n");
+        let list = list_hosts_in(&ssh.join("config"), home.path());
+        assert_eq!(list.hosts.len(), 16);
+        assert!(list.notes.iter().any(|n| n.contains("more than")));
     }
 
     #[test]
