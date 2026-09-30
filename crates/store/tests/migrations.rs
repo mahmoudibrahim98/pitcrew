@@ -70,6 +70,79 @@ fn concurrent_opens_of_a_fresh_file_both_succeed() {
     }
 }
 
+const PARENT_CHILD: &str = "
+    CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT NOT NULL) STRICT;
+    CREATE TABLE child (
+      id     INTEGER PRIMARY KEY,
+      parent INTEGER NOT NULL REFERENCES parent (id) ON DELETE CASCADE
+    ) STRICT;
+    INSERT INTO parent (id, name) VALUES (1, 'a'), (2, 'b');
+    INSERT INTO child (id, parent) VALUES (10, 1), (11, 1), (12, 2);";
+
+fn count(path: &Path, table: &str) -> i64 {
+    raw(path)
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+        .expect("count")
+}
+
+#[test]
+fn a_table_rebuild_keeps_cascading_children() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("store.db");
+    let list = [
+        migration(1, "init", INIT_SQL),
+        migration(150, "parent_child", PARENT_CHILD),
+        // The documented rebuild: new table, copy, drop old, rename.
+        migration(
+            151,
+            "rebuild_parent",
+            "CREATE TABLE parent_new (id INTEGER PRIMARY KEY, name TEXT NOT NULL, note TEXT) STRICT;
+             INSERT INTO parent_new (id, name) SELECT id, name FROM parent;
+             DROP TABLE parent;
+             ALTER TABLE parent_new RENAME TO parent;",
+        ),
+    ];
+    let store = Store::open_with_migrations(&path, StoreOptions::default(), &list).expect("open");
+    assert_eq!(store.schema_version().expect("version"), Some(151));
+    drop(store);
+    assert_eq!(count(&path, "parent"), 2);
+    assert_eq!(count(&path, "child"), 3);
+
+    // Foreign keys are back on afterwards: the cascade still works.
+    let conn = raw(&path);
+    conn.execute_batch("PRAGMA foreign_keys = ON; DELETE FROM parent WHERE id = 1;")
+        .expect("delete");
+    drop(conn);
+    assert_eq!(count(&path, "child"), 1);
+}
+
+#[test]
+fn a_migration_leaving_a_dangling_reference_fails() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("store.db");
+    let list = [
+        migration(1, "init", INIT_SQL),
+        migration(150, "parent_child", PARENT_CHILD),
+        migration(
+            151,
+            "orphan",
+            "INSERT INTO child (id, parent) VALUES (13, 99);",
+        ),
+    ];
+    let err = Store::open_with_migrations(&path, StoreOptions::default(), &list).expect_err("fail");
+    assert!(
+        matches!(err, Error::Migration { version: 151, .. }),
+        "{err:?}"
+    );
+    let cause = std::error::Error::source(&err).expect("source").to_string();
+    assert!(cause.contains("foreign key check failed"), "{cause}");
+    assert_eq!(count(&path, "child"), 3);
+    assert_eq!(
+        applied(&path).iter().map(|a| a.0).collect::<Vec<_>>(),
+        vec![1, 150]
+    );
+}
+
 #[test]
 fn opening_twice_applies_nothing_new() {
     let dir = tempfile::tempdir().expect("tempdir");

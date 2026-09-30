@@ -4,7 +4,7 @@
 //! streams (ADR-0004), so files from several streams interleave. The store records what it has
 //! applied in `schema_migrations` and applies any known migration that is missing, each in its own
 //! IMMEDIATE transaction that re-checks `schema_migrations`, so several processes can open a fresh
-//! file at once.
+//! file at once. Foreign keys are off while a migration runs and checked before it commits.
 
 use crate::error::{DbError, Error, Result};
 use crate::scan;
@@ -112,33 +112,62 @@ pub(crate) fn apply(conn: &mut Connection, migrations: &[Migration]) -> Result<V
             name: m.name.to_string(),
             source: DbError::new(source),
         };
-        // IMMEDIATE, so two processes opening the store serialise here instead of failing with
-        // SQLITE_BUSY; the loser then sees the winner's row and skips the migration.
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
+        // SQLite's procedure for schema changes: foreign keys off outside the transaction (the
+        // pragma is a no-op inside one), so a table rebuild's DROP TABLE does not cascade or null
+        // child rows; check the keys before commit; turn them back on even on error.
+        conn.pragma_update(None, "foreign_keys", "OFF")
             .map_err(fail)?;
-        let done = tx
-            .query_row(
-                "SELECT 1 FROM schema_migrations WHERE version = ?1",
-                [m.version],
-                |_| Ok(()),
-            )
-            .optional()
-            .map_err(fail)?
-            .is_some();
-        if done {
-            continue;
+        let result = apply_one(conn, m);
+        let restored = conn.pragma_update(None, "foreign_keys", "ON");
+        if result.map_err(fail)? {
+            now_applied.push(m.version);
         }
-        tx.execute_batch(&m.sql).map_err(fail)?;
-        tx.execute(
-            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
-            rusqlite::params![m.version, m.name.as_ref(), now_ms()],
-        )
-        .map_err(fail)?;
-        tx.commit().map_err(fail)?;
-        now_applied.push(m.version);
+        restored.map_err(fail)?;
     }
     Ok(now_applied)
+}
+
+/// Applies one migration unless another process already has. Returns whether it applied it.
+/// Foreign keys must be off.
+fn apply_one(conn: &mut Connection, m: &Migration) -> rusqlite::Result<bool> {
+    // IMMEDIATE, so two processes opening the store serialise here instead of failing with
+    // SQLITE_BUSY; the loser then sees the winner's row and skips the migration.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let done = tx
+        .query_row(
+            "SELECT 1 FROM schema_migrations WHERE version = ?1",
+            [m.version],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if done {
+        return Ok(false);
+    }
+    tx.execute_batch(&m.sql)?;
+    let dangling = tx
+        .query_row("PRAGMA foreign_key_check", [], |r| {
+            Ok(format!(
+                "foreign key check failed: a row in {} (rowid {}) references a missing row in {}",
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<i64>>(1)?
+                    .map_or_else(|| "none".to_owned(), |id| id.to_string()),
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .optional()?;
+    if let Some(msg) = dangling {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+            Some(msg),
+        ));
+    }
+    tx.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+        rusqlite::params![m.version, m.name.as_ref(), now_ms()],
+    )?;
+    tx.commit()?;
+    Ok(true)
 }
 
 /// The highest applied version, or `None` for an empty database.
