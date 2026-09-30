@@ -1,11 +1,17 @@
 //! Line framing for JSONL transcripts: forwards from a byte offset, and backwards from the end.
 //!
-//! Both directions bound memory: a line longer than [`MAX_LINE_BYTES`] is never buffered, only
-//! measured and reported.
+//! Both directions bound memory by [`MAX_LINE_BYTES`]. Forwards, a line is buffered until it
+//! passes that size, then its buffer is dropped and the rest is only measured; backwards, a line's
+//! length is known before it is read, so a longer one is never read at all. Too-long lines are
+//! reported, not parsed.
+//!
+//! One deviation from `never re-read`: an incomplete last line longer than
+//! [`MAX_CARRIED_BYTES`] is not carried in the cursor. When it is completed and still fits in
+//! [`MAX_LINE_BYTES`], its first part is read once more.
 
 use std::io::{self, Read, Seek, SeekFrom};
 
-/// Lines longer than this are skipped and reported, never buffered.
+/// Lines longer than this are skipped and reported.
 pub const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 /// A partial last line up to this size is carried in the cursor, so the next read does not read
@@ -78,8 +84,9 @@ enum Mode {
     Buffer,
     /// Too long: only counting.
     Skip,
-    /// Its start was not kept: counting, then reading it again if it fits.
-    Measure,
+    /// Its first `prefix` bytes were not kept: buffering the rest, then reading the prefix again
+    /// if the whole line fits.
+    Measure { prefix: u64 },
 }
 
 /// Reads complete lines from `start` to the end of `file`, calling `on_line` with each line's
@@ -104,10 +111,12 @@ pub(crate) fn read_forward<F: Read + Seek>(
         }) => (Vec::new(), len, Mode::Skip),
         Some(Pending {
             len, bytes: None, ..
-        }) => (Vec::new(), len, Mode::Measure),
+        }) => (Vec::new(), len, Mode::Measure { prefix: len }),
         _ => (Vec::new(), 0, Mode::Buffer),
     };
-    let mut phys = start + line_len;
+    let mut phys = start
+        .checked_add(line_len)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "resume offset overflows"))?;
     file.seek(SeekFrom::Start(phys))?;
 
     let mut line_start = start;
@@ -133,19 +142,24 @@ pub(crate) fn read_forward<F: Read + Seek>(
                     line = Vec::new();
                 }
                 Mode::Buffer => line.extend_from_slice(seg),
-                Mode::Measure if line_len > MAX_LINE_BYTES as u64 => mode = Mode::Skip,
-                Mode::Measure | Mode::Skip => {}
+                Mode::Measure { .. } if line_len > MAX_LINE_BYTES as u64 => {
+                    mode = Mode::Skip;
+                    line = Vec::new();
+                }
+                Mode::Measure { .. } => line.extend_from_slice(seg),
+                Mode::Skip => {}
             }
             let Some(i) = newline else { break };
             match mode {
                 Mode::Buffer => on_line(line_start, Line::Data(strip_cr(&line))),
                 Mode::Skip => on_line(line_start, Line::TooLong(line_len)),
-                Mode::Measure => {
-                    let mut whole = vec![0u8; usize::try_from(line_len).unwrap_or(0)];
+                Mode::Measure { prefix } => {
+                    let mut whole = vec![0u8; usize::try_from(prefix).unwrap_or(0)];
                     file.seek(SeekFrom::Start(line_start))?;
                     file.read_exact(&mut whole)?;
                     file.seek(SeekFrom::Start(phys))?;
-                    bytes_read += line_len;
+                    bytes_read += prefix;
+                    whole.extend_from_slice(&line);
                     on_line(line_start, Line::Data(strip_cr(&whole)));
                 }
             }
@@ -169,7 +183,7 @@ pub(crate) fn read_forward<F: Read + Seek>(
             bytes: Some(line),
             too_long: false,
         }),
-        Mode::Buffer | Mode::Measure => Some(Pending {
+        Mode::Buffer | Mode::Measure { .. } => Some(Pending {
             len: line_len,
             bytes: None,
             too_long: false,
@@ -337,8 +351,8 @@ mod tests {
         )
         .expect("read");
         assert_eq!(lines, vec![(2, big.len() + 2), (big.len() as u64 + 5, 1)]);
-        // The rest of the file, plus the completed line once more.
-        assert_eq!(second.bytes_read, 5 + big.len() as u64 + 2);
+        // The rest of the file, plus the part of the line read by the first call.
+        assert_eq!(second.bytes_read, 5 + big.len() as u64);
     }
 
     #[test]

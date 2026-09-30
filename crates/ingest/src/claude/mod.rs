@@ -8,7 +8,8 @@ mod parse;
 pub use parse::{ClaudeRecord, RecordFacts, parse_line};
 
 use crate::lines::{self, Backward, Line, OwnedLine, Pending, SkipReason, SkippedLine};
-use crate::text::{from_hex, to_hex, truncate_chars};
+use crate::text::{from_hex, title, to_hex};
+use parse::MAX_TITLE_CHARS;
 use pitcrew_interfaces::source::{
     Cursor, ParseChunk, SessionMeta, SourceAdapter, SourceError, TranscriptItem, TranscriptPage,
     TranscriptRef,
@@ -19,9 +20,6 @@ use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
-
-/// Longest title taken from a first prompt, in characters.
-const MAX_PROMPT_TITLE_CHARS: usize = 120;
 
 /// Reads Claude Code transcripts. Read-only: files are only ever opened for reading.
 #[derive(Clone, Copy, Debug, Default)]
@@ -85,11 +83,18 @@ impl ClaudeAdapter {
             .clone()
             .and_then(|s| serde_json::from_value(s).ok())
             .unwrap_or_default();
+        // A carried line that no longer fits the file (or whose length overflows) is dropped and
+        // read again from the cursor.
         let resume = state
             .pending
             .take()
             .and_then(CarriedLine::into_pending)
-            .filter(|p| cursor.offset + p.len <= len);
+            .filter(|p| {
+                cursor
+                    .offset
+                    .checked_add(p.len)
+                    .is_some_and(|end| end <= len)
+            });
 
         let mut items = Vec::new();
         let mut skipped = Vec::new();
@@ -102,14 +107,16 @@ impl ClaudeAdapter {
                 |offset, line| match parse_framed(offset, line) {
                     Ok(rec) => {
                         meta_changed |= state.meta.absorb(&rec);
-                        push_record(&mut state.last, rec, &mut items);
+                        push_record(&mut state.last, rec.items, rec.soft_turn_end, &mut items);
                     }
                     Err(skip) => skipped.push(skip),
                 },
             )?;
+        let mut log = SkipLog::default();
         for skip in &skipped {
-            tracing::warn!(path = %transcript.path.display(), offset = skip.offset, len = skip.len, reason = ?skip.reason, "skipped transcript line");
+            log.note(&transcript.path, skip);
         }
+        log.finish(&transcript.path);
 
         state.pending = fwd.pending.map(CarriedLine::from);
         let meta = meta_changed.then(|| state.meta.to_meta(&transcript.path));
@@ -185,24 +192,29 @@ impl SourceAdapter for ClaudeAdapter {
         let end = back.align(before.unwrap_or(len))?;
 
         // Collect item-bearing records newest first until `limit` items are certain to be kept.
-        let mut records: Vec<(u64, ClaudeRecord)> = Vec::new();
+        // A turn-duration record is undecided until the record before it is known; one that is
+        // certain to be dropped is removed at once, so at most `limit + 1` records are held.
+        let mut records: Vec<PageRecord> = Vec::new();
         let mut kept = 0usize;
         let mut pos = end;
         let mut exhausted = false;
+        let mut log = SkipLog::default();
         while kept < limit {
-            let Some((offset, rec)) = prev_record(&mut back, &mut pos, &transcript.path)? else {
+            let Some(rec) = prev_record(&mut back, &mut pos, &transcript.path, &mut log)? else {
                 exhausted = true;
                 break;
             };
-            if let Some((_, later)) = records.last() {
-                if later.soft_turn_end && !ends_turn(&rec) {
+            if records.last().is_some_and(|later| later.soft) {
+                if rec.ends_turn() {
+                    records.pop();
+                } else {
                     kept += 1;
                 }
             }
-            if !rec.soft_turn_end {
+            if !rec.soft {
                 kept += rec.items.len();
             }
-            records.push((offset, rec));
+            records.push(rec);
         }
 
         // The record just before the page decides a leading turn-duration record, and whether
@@ -210,18 +222,19 @@ impl SourceAdapter for ClaudeAdapter {
         let context = if exhausted {
             None
         } else {
-            prev_record(&mut back, &mut pos, &transcript.path)?.map(|(_, rec)| rec)
+            prev_record(&mut back, &mut pos, &transcript.path, &mut log)?
         };
+        log.finish(&transcript.path);
         let at_start = context.is_none();
-        let mut last = context.map(|rec| last_kind(&rec));
+        let mut last = context.map(|rec| rec.last_kind());
 
         records.reverse();
         let from = records
             .first()
-            .map_or(if at_start { 0 } else { end }, |(off, _)| *off);
+            .map_or(if at_start { 0 } else { end }, |rec| rec.offset);
         let mut items = Vec::new();
-        for (_, rec) in records {
-            push_record(&mut last, rec, &mut items);
+        for rec in records {
+            push_record(&mut last, rec.items, rec.soft, &mut items);
         }
         Ok(TranscriptPage {
             items,
@@ -285,12 +298,52 @@ fn parse_framed(offset: u64, line: Line<'_>) -> Result<ClaudeRecord, SkippedLine
     }
 }
 
+/// Skipped lines for one call: one warning with the count, details at debug level.
+#[derive(Debug, Default)]
+struct SkipLog {
+    count: usize,
+    first: Option<u64>,
+}
+
+impl SkipLog {
+    fn note(&mut self, path: &Path, skip: &SkippedLine) {
+        self.count += 1;
+        self.first.get_or_insert(skip.offset);
+        tracing::debug!(path = %path.display(), offset = skip.offset, len = skip.len, reason = ?skip.reason, "skipped transcript line");
+    }
+
+    fn finish(&self, path: &Path) {
+        if let Some(first) = self.first {
+            tracing::warn!(path = %path.display(), count = self.count, first_offset = first, "skipped transcript lines");
+        }
+    }
+}
+
+/// A record held while building a page: just what the page needs.
+#[derive(Debug)]
+struct PageRecord {
+    offset: u64,
+    items: Vec<TranscriptItem>,
+    soft: bool,
+}
+
+impl PageRecord {
+    fn ends_turn(&self) -> bool {
+        ends_turn(&self.items)
+    }
+
+    fn last_kind(&self) -> LastKind {
+        last_kind(&self.items)
+    }
+}
+
 /// The next older record that yields items, moving `pos` to its start.
 fn prev_record<F: io::Read + io::Seek>(
     back: &mut Backward<'_, F>,
     pos: &mut u64,
     path: &Path,
-) -> io::Result<Option<(u64, ClaudeRecord)>> {
+    log: &mut SkipLog,
+) -> io::Result<Option<PageRecord>> {
     while let Some((start, line)) = back.prev_line(*pos)? {
         *pos = start;
         let parsed = match &line {
@@ -298,11 +351,15 @@ fn prev_record<F: io::Read + io::Seek>(
             OwnedLine::TooLong(len) => parse_framed(start, Line::TooLong(*len)),
         };
         match parsed {
-            Ok(rec) if !rec.items.is_empty() => return Ok(Some((start, rec))),
-            Ok(_) => {}
-            Err(skip) => {
-                tracing::warn!(path = %path.display(), offset = skip.offset, len = skip.len, reason = ?skip.reason, "skipped transcript line");
+            Ok(rec) if !rec.items.is_empty() => {
+                return Ok(Some(PageRecord {
+                    offset: start,
+                    items: rec.items,
+                    soft: rec.soft_turn_end,
+                }));
             }
+            Ok(_) => {}
+            Err(skip) => log.note(path, &skip),
         }
     }
     Ok(None)
@@ -316,27 +373,32 @@ enum LastKind {
     Other,
 }
 
-fn ends_turn(rec: &ClaudeRecord) -> bool {
-    matches!(rec.items.last(), Some(TranscriptItem::TurnEnded { .. }))
+fn ends_turn(items: &[TranscriptItem]) -> bool {
+    matches!(items.last(), Some(TranscriptItem::TurnEnded { .. }))
 }
 
-fn last_kind(rec: &ClaudeRecord) -> LastKind {
-    if ends_turn(rec) {
+fn last_kind(items: &[TranscriptItem]) -> LastKind {
+    if ends_turn(items) {
         LastKind::TurnEnded
     } else {
         LastKind::Other
     }
 }
 
-/// Appends a record's items. A turn-duration record ends the turn only if something happened
-/// since the last `TurnEnded`, so `end_turn` followed by a turn-duration record is one turn end.
-fn push_record(last: &mut Option<LastKind>, rec: ClaudeRecord, out: &mut Vec<TranscriptItem>) {
-    if rec.items.is_empty() {
+/// Appends a record's items. A turn-duration (`soft`) record ends the turn only if something
+/// happened since the last `TurnEnded`, so `end_turn` then a turn-duration record is one turn end.
+fn push_record(
+    last: &mut Option<LastKind>,
+    items: Vec<TranscriptItem>,
+    soft: bool,
+    out: &mut Vec<TranscriptItem>,
+) {
+    if items.is_empty() {
         return;
     }
-    let kind = last_kind(&rec);
-    if !rec.soft_turn_end || *last == Some(LastKind::Other) {
-        out.extend(rec.items);
+    let kind = last_kind(&items);
+    if !soft || *last == Some(LastKind::Other) {
+        out.extend(items);
     }
     *last = Some(kind);
 }
@@ -405,38 +467,49 @@ impl MetaAcc {
     /// Folds in one record; returns whether anything changed. The session id, agent id, cwd,
     /// start time and sidechain flag are the first seen; branch, model and titles the latest.
     fn absorb(&mut self, rec: &ClaudeRecord) -> bool {
-        let before = self.clone();
+        /// Sets an empty slot; returns whether it changed.
+        fn first<T: Clone>(slot: &mut Option<T>, v: Option<&T>) -> bool {
+            match (slot.is_none(), v) {
+                (true, Some(v)) => {
+                    *slot = Some(v.clone());
+                    true
+                }
+                _ => false,
+            }
+        }
+        /// Replaces the slot with a new, different value; returns whether it changed.
+        fn latest<T: Clone + PartialEq>(slot: &mut Option<T>, v: Option<&T>) -> bool {
+            match v {
+                Some(v) if slot.as_ref() != Some(v) => {
+                    *slot = Some(v.clone());
+                    true
+                }
+                _ => false,
+            }
+        }
         let f = &rec.facts;
-        fn first<T: Clone>(slot: &mut Option<T>, v: Option<&T>) {
-            if slot.is_none() {
-                *slot = v.cloned();
-            }
-        }
-        fn latest<T: Clone>(slot: &mut Option<T>, v: Option<&T>) {
-            if v.is_some() {
-                *slot = v.cloned();
-            }
-        }
-        first(&mut self.session_id, f.session_id.as_ref());
-        first(&mut self.agent_id, f.agent_id.as_ref());
-        first(&mut self.cwd, f.cwd.as_ref());
-        first(&mut self.started, f.timestamp.as_ref());
-        first(&mut self.sidechain, f.is_sidechain.as_ref());
-        latest(&mut self.branch, f.branch.as_ref());
-        latest(&mut self.model, f.model.as_ref());
-        latest(&mut self.custom_title, f.custom_title.as_ref());
-        latest(&mut self.summary, f.summary.as_ref());
+        let mut changed = first(&mut self.session_id, f.session_id.as_ref());
+        changed |= first(&mut self.agent_id, f.agent_id.as_ref());
+        changed |= first(&mut self.cwd, f.cwd.as_ref());
+        changed |= first(&mut self.started, f.timestamp.as_ref());
+        changed |= first(&mut self.sidechain, f.is_sidechain.as_ref());
+        changed |= latest(&mut self.branch, f.branch.as_ref());
+        changed |= latest(&mut self.model, f.model.as_ref());
+        changed |= latest(&mut self.custom_title, f.custom_title.as_ref());
+        changed |= latest(&mut self.summary, f.summary.as_ref());
         if self.first_prompt.is_none() {
             self.first_prompt = rec.items.iter().find_map(|item| match item {
-                TranscriptItem::UserPrompt { text, .. } => Some(prompt_title(text)),
+                TranscriptItem::UserPrompt { text, .. } => Some(title(text, MAX_TITLE_CHARS)),
                 _ => None,
             });
+            changed |= self.first_prompt.is_some();
         }
-        *self != before
+        changed
     }
 
     fn to_meta(&self, path: &Path) -> SessionMeta {
-        let in_subagents = path.components().any(|c| c.as_os_str() == "subagents");
+        let in_subagents =
+            path.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("subagents"));
         let is_subagent = in_subagents || self.sidechain == Some(true);
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned());
         // Sub-agent records carry their parent's session id, so they are named by agent id.
@@ -459,10 +532,4 @@ impl MetaAcc {
             is_subagent,
         }
     }
-}
-
-/// A first prompt as a title: whitespace collapsed, cut short.
-fn prompt_title(text: &str) -> String {
-    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate_chars(&collapsed, MAX_PROMPT_TITLE_CHARS)
 }

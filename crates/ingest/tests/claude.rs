@@ -449,9 +449,10 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
-    fn fixture_in_random_chunks_matches_one_read(cuts in prop::collection::vec(0usize..4000, 0..12)) {
+    fn fixture_in_random_chunks_matches_one_read(cuts in prop::collection::vec(any::<prop::sample::Index>(), 0..12)) {
         let dir = tempfile::tempdir().expect("tempdir");
         let data = fixture();
+        let cuts = resolve(&cuts, &data);
         let full = read_all(&fixture_path());
         let chunked = read_in_chunks(dir.path(), &data, &cuts);
         prop_assert_eq!(&chunked.items, &full.items);
@@ -463,11 +464,12 @@ proptest! {
     fn generated_in_random_chunks_matches_one_read(
         lines in prop::collection::vec((0u8..10, text_strategy()), 0..40),
         trailing_newline in any::<bool>(),
-        cuts in prop::collection::vec(0usize..20_000, 0..12),
+        cuts in prop::collection::vec(any::<prop::sample::Index>(), 0..12),
         limit in 1usize..6,
     ) {
         let dir = tempfile::tempdir().expect("tempdir");
         let data = synthetic(&lines, trailing_newline);
+        let cuts = resolve(&cuts, &data);
         let path = dir.path().join("full.jsonl");
         fs::write(&path, &data).expect("write");
         let full = read_all(&path);
@@ -478,6 +480,228 @@ proptest! {
         prop_assert!(chunked.bytes_read <= data.len() as u64);
         prop_assert_eq!(page_all(&path, limit), full.items);
     }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    /// A line between 64 KiB and 16 MiB, cut by writes, is not carried in the cursor. Once complete,
+    /// only the part read by earlier calls is read again.
+    #[test]
+    fn generated_with_a_large_line_in_random_chunks(
+        before in prop::collection::vec((0u8..10, text_strategy()), 0..10),
+        after in prop::collection::vec((0u8..10, text_strategy()), 0..10),
+        big in 70_000usize..1_500_000,
+        cuts in prop::collection::vec(any::<prop::sample::Index>(), 1..6),
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut data = synthetic(&before, true);
+        data.extend(prompt(&"b".repeat(big), "2026-01-01T00:00:00Z").into_bytes());
+        data.push(b'\n');
+        data.extend(synthetic(&after, true));
+        let cuts = resolve(&cuts, &data);
+        let path = dir.path().join("full.jsonl");
+        fs::write(&path, &data).expect("write");
+        let full = read_all(&path);
+        let chunked = read_in_chunks(dir.path(), &data, &cuts);
+        prop_assert_eq!(&chunked.items, &full.items);
+        prop_assert_eq!(&chunked.meta, &full.meta);
+        let longest_partial = cuts.iter().map(|&p| partial_len(&data, p)).max().unwrap_or(0);
+        prop_assert!(chunked.bytes_read <= data.len() as u64 + longest_partial);
+    }
+}
+
+fn resolve(cuts: &[prop::sample::Index], data: &[u8]) -> Vec<usize> {
+    cuts.iter().map(|i| i.index(data.len() + 1)).collect()
+}
+
+/// Length of the incomplete line a read stopping at `p` would leave behind.
+fn partial_len(data: &[u8], p: usize) -> u64 {
+    let start = data[..p]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |i| i + 1);
+    (p - start) as u64
+}
+
+#[test]
+fn huge_summary_then_blank_lines_is_fast_and_short() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("attack.jsonl");
+    let summary = json!({"type": "summary", "summary": "a".repeat(15 * 1024 * 1024)});
+    let mut data = format!("{summary}\n").into_bytes();
+    data.extend(std::iter::repeat_n(b'\n', 100_000));
+    fs::write(&path, &data).expect("write");
+
+    let start = std::time::Instant::now();
+    let c = read_all(&path);
+    let took = start.elapsed();
+    assert!(took.as_secs() < 5, "took {took:?}");
+    let title = c.meta.and_then(|m| m.title).expect("title");
+    assert!(
+        title.chars().count() <= 121,
+        "{} chars",
+        title.chars().count()
+    );
+    let state = serde_json::to_string(&c.cursor.state).expect("state");
+    assert!(state.len() < 2048, "cursor state is {} bytes", state.len());
+}
+
+#[test]
+fn a_flood_of_turn_duration_records_pages_correctly() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("turns.jsonl");
+    let turn = json!({"type": "system", "subtype": "turn_duration", "durationMs": 1}).to_string();
+    let mut data = format!("{}\n", prompt("go", "2026-01-01T00:00:00Z"));
+    for _ in 0..20_000 {
+        data.push_str(&turn);
+        data.push('\n');
+    }
+    fs::write(&path, &data).expect("write");
+    let full = read_all(&path).items;
+    assert_eq!(full.len(), 2, "one prompt, one turn end");
+    // Deciding the kept turn end needs the prompt before it, and pages hold whole records.
+    let page = ClaudeAdapter
+        .read_page(&tref(&path), None, 1)
+        .expect("page");
+    assert_eq!(page.items, full);
+    assert!(page.at_start);
+}
+
+#[test]
+fn a_home_under_a_subagents_folder_is_not_a_subagent() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let home = root.path().join("subagents").join("claude");
+    let project = home.join("projects").join("-w");
+    fs::create_dir_all(&project).expect("mkdir");
+    fs::write(
+        project.join("s.jsonl"),
+        prompt("hi", "2026-01-01T00:00:00Z") + "\n",
+    )
+    .expect("write");
+    let found = ClaudeAdapter.discover(&home).expect("discover");
+    assert_eq!(found.len(), 1);
+    assert!(!read_all(&found[0].path).meta.expect("meta").is_subagent);
+}
+
+#[test]
+fn before_inside_a_line_pages_from_the_line_boundary() {
+    let t = tref(&fixture_path());
+    let data = fixture();
+    let full = read_all(&fixture_path()).items;
+    let boundary = nth_line_start(&data, 5) as u64; // start of line 6
+    let page = ClaudeAdapter
+        .read_page(&t, Some(boundary + 17), 1000)
+        .expect("page");
+    assert_eq!(page.to, boundary);
+    assert!(page.at_start);
+    let expected: Vec<_> = full
+        .iter()
+        .filter(|i| i.offset() < boundary)
+        .cloned()
+        .collect();
+    assert_eq!(page.items, expected);
+
+    let past_end = ClaudeAdapter
+        .read_page(&t, Some(u64::MAX), 1000)
+        .expect("page");
+    assert_eq!((past_end.items, past_end.to), (full, data.len() as u64));
+}
+
+#[test]
+fn limit_zero_gives_an_empty_page() {
+    let len = fixture().len() as u64;
+    let page = ClaudeAdapter
+        .read_page(&tref(&fixture_path()), None, 0)
+        .expect("page");
+    assert!(page.items.is_empty());
+    assert_eq!((page.from, page.to, page.at_start), (len, len, false));
+}
+
+#[test]
+fn a_cursor_past_the_end_is_an_error() {
+    let t = tref(&fixture_path());
+    let cursor = Cursor {
+        offset: fixture().len() as u64 + 1,
+        state: None,
+    };
+    assert!(matches!(
+        ClaudeAdapter.read(&t, &cursor),
+        Err(pitcrew_interfaces::source::SourceError::Unreadable { .. })
+    ));
+
+    // A corrupt carried line whose length overflows is ignored, not a panic.
+    let cursor = Cursor {
+        offset: 10,
+        state: Some(json!({"pending": {"len": u64::MAX, "too_long": true}})),
+    };
+    let report = ClaudeAdapter.read(&t, &cursor).expect("read");
+    assert_eq!(report.chunk.cursor.offset, fixture().len() as u64);
+}
+
+/// Items with their offsets removed, for comparing files whose line endings differ.
+fn without_offsets(items: &[TranscriptItem]) -> Vec<serde_json::Value> {
+    items
+        .iter()
+        .map(|i| {
+            let mut v = serde_json::to_value(i).expect("json");
+            v.as_object_mut().expect("object").remove("offset");
+            v
+        })
+        .collect()
+}
+
+#[test]
+fn crlf_files_give_the_same_items() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("crlf.jsonl");
+    let crlf = String::from_utf8(fixture())
+        .expect("utf8")
+        .replace('\n', "\r\n");
+    fs::write(&path, &crlf).expect("write");
+    let got = read_all(&path);
+    let want = read_all(&fixture_path());
+    assert!(got.skipped.is_empty());
+    assert_eq!(without_offsets(&got.items), without_offsets(&want.items));
+    assert_eq!(got.meta, want.meta);
+    assert_eq!(page_all(&path, 3), got.items);
+    let chunked = read_in_chunks(dir.path(), crlf.as_bytes(), &[100, 1001, 1002, 4000]);
+    assert_eq!(chunked.items.len(), got.items.len());
+}
+
+#[test]
+fn a_large_partial_line_round_trips_through_the_cursor() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("large.jsonl");
+    let first = prompt("first", "2026-01-01T00:00:00Z");
+    let large = prompt(&"q".repeat(100_000), "2026-01-01T00:00:01Z");
+    let data = format!("{first}\n{large}\n");
+    let cut = first.len() + 1 + 80_000;
+    fs::write(&path, &data.as_bytes()[..cut]).expect("write");
+
+    let one = ClaudeAdapter
+        .read(&tref(&path), &Cursor::default())
+        .expect("read");
+    let state = serde_json::to_string(&one.chunk.cursor.state).expect("state");
+    assert!(
+        state.len() < 1024,
+        "large partial lines are not carried: {state}"
+    );
+    assert_eq!(one.chunk.cursor.offset, first.len() as u64 + 1);
+
+    let mut f = OpenOptions::new().append(true).open(&path).expect("open");
+    f.write_all(&data.as_bytes()[cut..]).expect("append");
+    drop(f);
+    let two = ClaudeAdapter
+        .read(&tref(&path), &one.chunk.cursor)
+        .expect("read");
+    assert_eq!(two.chunk.items.len(), 1);
+    assert_eq!(prompt_text(&two.chunk.items[0]).len(), 100_000);
+    assert_eq!(
+        one.bytes_read + two.bytes_read,
+        data.len() as u64 + 80_000,
+        "only the part read before is read again"
+    );
 }
 
 /// `cargo test -p pitcrew-ingest --release -- --ignored --nocapture read_page_on_200mb`

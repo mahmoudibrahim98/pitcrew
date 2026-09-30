@@ -18,6 +18,21 @@ pub(crate) fn first_line(s: &str, max: usize) -> String {
     truncate_chars(s.trim().lines().next().unwrap_or("").trim(), max)
 }
 
+/// `s` as a one-line title: whitespace collapsed, cut to `max` characters.
+pub(crate) fn title(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    for word in s.split_whitespace() {
+        if out.chars().count() > max {
+            break;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    truncate_chars(&out, max)
+}
+
 /// Up to `lines` non-empty lines of `s`, cut to `max` characters in total.
 pub(crate) fn summary(s: &str, lines: usize, max: usize) -> String {
     let joined = s

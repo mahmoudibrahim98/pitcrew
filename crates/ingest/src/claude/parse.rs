@@ -6,7 +6,7 @@
 //! [`ClaudeRecord::soft_turn_end`].
 
 use crate::lines::SkipReason;
-use crate::text::{first_line, summary, truncate_chars};
+use crate::text::{first_line, summary, title, truncate_chars};
 use crate::time::parse_rfc3339_ms;
 use pitcrew_interfaces::source::{PlanItem, PlanStatus, TranscriptItem};
 use pitcrew_protocol::model::TimestampMs;
@@ -25,6 +25,22 @@ const MAX_INPUT_STRING_CHARS: usize = 1024;
 const MAX_INPUT_JSON_BYTES: usize = 16 * 1024;
 /// Longest diff kept, in bytes.
 const MAX_DIFF_BYTES: usize = 64 * 1024;
+/// Ids, model and branch longer than this (in bytes) are dropped as implausible.
+const MAX_ID_BYTES: usize = 256;
+/// A cwd or file path longer than this (in bytes) is dropped or cut.
+const MAX_PATH_BYTES: usize = 4096;
+/// Longest custom title or summary, in characters.
+pub(crate) const MAX_TITLE_CHARS: usize = 120;
+/// Tool names, in characters.
+const MAX_TOOL_CHARS: usize = 100;
+/// Plan lines: at most this many, each cut to this many characters.
+const MAX_PLAN_ITEMS: usize = 200;
+const MAX_PLAN_TEXT_CHARS: usize = 1000;
+/// Questions: count per call, text, option count and option label length.
+const MAX_QUESTIONS: usize = 20;
+const MAX_QUESTION_CHARS: usize = 4000;
+const MAX_OPTIONS: usize = 50;
+const MAX_OPTION_CHARS: usize = 200;
 
 /// Text blocks that Claude Code writes into user records but a person did not type.
 const INJECTED_PREFIXES: &[&str] = &[
@@ -117,10 +133,23 @@ fn str_at<'a>(obj: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     obj.get(key).and_then(Value::as_str)
 }
 
-fn non_empty(s: Option<&str>) -> Option<String> {
+/// A trimmed, non-empty value no longer than `max` bytes; longer values are dropped, not cut,
+/// because a cut id or path would name something else.
+fn bounded(s: Option<&str>, max: usize) -> Option<String> {
     s.map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && s.len() <= max)
         .map(str::to_owned)
+}
+
+/// A title-like value: whitespace collapsed, cut to [`MAX_TITLE_CHARS`].
+fn title_value(s: Option<&str>) -> Option<String> {
+    s.map(|s| title(s, MAX_TITLE_CHARS))
+        .filter(|s| !s.is_empty())
+}
+
+/// A call id, cut the same way on both the call and the result so they still pair.
+fn call_id(s: &str) -> String {
+    truncate_chars(s, MAX_ID_BYTES)
 }
 
 fn facts(rec: &Map<String, Value>) -> RecordFacts {
@@ -134,18 +163,18 @@ fn facts(rec: &Map<String, Value>) -> RecordFacts {
         .flatten()
         .filter(|m| !m.starts_with('<'));
     RecordFacts {
-        session_id: non_empty(str_at(rec, "sessionId")),
-        agent_id: non_empty(str_at(rec, "agentId")),
-        cwd: non_empty(str_at(rec, "cwd")),
-        branch: non_empty(str_at(rec, "gitBranch")),
-        model: non_empty(model),
+        session_id: bounded(str_at(rec, "sessionId"), MAX_ID_BYTES),
+        agent_id: bounded(str_at(rec, "agentId"), MAX_ID_BYTES),
+        cwd: bounded(str_at(rec, "cwd"), MAX_PATH_BYTES),
+        branch: bounded(str_at(rec, "gitBranch"), MAX_ID_BYTES),
+        model: bounded(model, MAX_ID_BYTES),
         timestamp: str_at(rec, "timestamp").and_then(parse_rfc3339_ms),
         is_sidechain: rec.get("isSidechain").and_then(Value::as_bool),
         custom_title: (kind == Some("custom-title"))
-            .then(|| non_empty(str_at(rec, "customTitle")))
+            .then(|| title_value(str_at(rec, "customTitle")))
             .flatten(),
         summary: (kind == Some("summary"))
-            .then(|| non_empty(str_at(rec, "summary")))
+            .then(|| title_value(str_at(rec, "summary")))
             .flatten(),
     }
 }
@@ -170,13 +199,13 @@ fn user(rec: &Map<String, Value>, at: TimestampMs, offset: u64, out: &mut Vec<Tr
                         }
                     }
                     Some("tool_result") => {
-                        let Some(call_id) = block.get("tool_use_id").and_then(Value::as_str) else {
+                        let Some(id) = block.get("tool_use_id").and_then(Value::as_str) else {
                             continue;
                         };
                         had_result = true;
                         out.push(TranscriptItem::ToolResult {
                             at,
-                            call_id: call_id.to_owned(),
+                            call_id: call_id(id),
                             is_error: block
                                 .get("is_error")
                                 .and_then(Value::as_bool)
@@ -280,7 +309,7 @@ fn push_text(text: &str, at: TimestampMs, offset: u64, out: &mut Vec<TranscriptI
 }
 
 fn tool_use(block: &Value, at: TimestampMs, offset: u64, out: &mut Vec<TranscriptItem>) {
-    let (Some(call_id), Some(tool)) = (
+    let (Some(id), Some(tool)) = (
         block.get("id").and_then(Value::as_str),
         block.get("name").and_then(Value::as_str),
     ) else {
@@ -289,8 +318,8 @@ fn tool_use(block: &Value, at: TimestampMs, offset: u64, out: &mut Vec<Transcrip
     let input = block.get("input").unwrap_or(&Value::Null);
     out.push(TranscriptItem::ToolUse {
         at,
-        call_id: call_id.to_owned(),
-        tool: tool.to_owned(),
+        call_id: call_id(id),
+        tool: truncate_chars(tool, MAX_TOOL_CHARS),
         target: target(tool, input),
         input: (!input.is_null()).then(|| bounded_input(input)),
         offset,
@@ -382,16 +411,15 @@ fn plan(input: &Value) -> Option<Vec<PlanItem>> {
             .iter()
             .filter_map(|t| {
                 let text = t.get("content").and_then(Value::as_str)?;
+                let text = truncate_chars(text, MAX_PLAN_TEXT_CHARS);
                 let status = match t.get("status").and_then(Value::as_str) {
                     Some("in_progress") => PlanStatus::InProgress,
                     Some("completed") => PlanStatus::Completed,
                     _ => PlanStatus::Pending,
                 };
-                Some(PlanItem {
-                    text: text.to_owned(),
-                    status,
-                })
+                Some(PlanItem { text, status })
             })
+            .take(MAX_PLAN_ITEMS)
             .collect(),
     )
 }
@@ -409,19 +437,20 @@ fn questions(input: &Value, at: TimestampMs, offset: u64, out: &mut Vec<Transcri
                             .and_then(Value::as_str)
                             .or_else(|| o.as_str())
                     })
-                    .map(str::to_owned)
+                    .take(MAX_OPTIONS)
+                    .map(|label| truncate_chars(label, MAX_OPTION_CHARS))
                     .collect()
             })
             .unwrap_or_default();
         Some(TranscriptItem::Question {
             at,
-            text: text.to_owned(),
+            text: truncate_chars(text, MAX_QUESTION_CHARS),
             options,
             offset,
         })
     };
     match input.get("questions").and_then(Value::as_array) {
-        Some(qs) => out.extend(qs.iter().filter_map(one)),
+        Some(qs) => out.extend(qs.iter().filter_map(one).take(MAX_QUESTIONS)),
         None => out.extend(one(input)),
     }
 }
@@ -429,9 +458,12 @@ fn questions(input: &Value, at: TimestampMs, offset: u64, out: &mut Vec<Transcri
 /// A `FileEdit` from an edit tool's `toolUseResult`: counts and diff from `structuredPatch`, or the
 /// whole content for a newly created file.
 fn file_edit(result: &Value, at: TimestampMs, offset: u64) -> Option<TranscriptItem> {
-    let path = result.get("filePath").and_then(Value::as_str)?;
+    let path = truncate_chars(
+        result.get("filePath").and_then(Value::as_str)?,
+        MAX_PATH_BYTES,
+    );
     let hunks = result.get("structuredPatch").and_then(Value::as_array);
-    let mut diff = Diff::new(path);
+    let mut diff = Diff::new(&path);
     let (mut added, mut removed) = (0u32, 0u32);
 
     match hunks {
@@ -474,7 +506,7 @@ fn file_edit(result: &Value, at: TimestampMs, offset: u64) -> Option<TranscriptI
     }
     Some(TranscriptItem::FileEdit {
         at,
-        path: path.to_owned(),
+        path,
         added,
         removed,
         diff: Some(diff.finish()),
@@ -596,6 +628,111 @@ mod tests {
         };
         assert_eq!(target, "/a");
         assert!(input.to_string().len() < MAX_INPUT_JSON_BYTES);
+    }
+
+    #[test]
+    fn an_input_too_large_after_cutting_becomes_a_preview() {
+        let keys: Map<String, Value> = (0..100)
+            .map(|i| (format!("k{i}"), Value::String("y".repeat(1000))))
+            .collect();
+        let line = json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t1", "name": "Custom", "input": Value::Object(keys)}
+        ]}});
+        let [
+            TranscriptItem::ToolUse {
+                input: Some(input), ..
+            },
+        ] = &items(&line.to_string())[..]
+        else {
+            panic!("expected one tool use");
+        };
+        assert_eq!(input["truncated"], json!(true));
+        let preview = input["preview"].as_str().expect("preview");
+        assert_eq!(preview.chars().count(), MAX_INPUT_STRING_CHARS + 1);
+    }
+
+    #[test]
+    fn every_payload_is_capped() {
+        // Each value just over its cap, so the test stays small.
+        let long = "z".repeat(MAX_QUESTION_CHARS + 10);
+        let label = "l".repeat(MAX_OPTION_CHARS + 10);
+        let todos: Vec<Value> = (0..MAX_PLAN_ITEMS + 10)
+            .map(|_| json!({"content": long, "status": "pending"}))
+            .collect();
+        let options: Vec<Value> = (0..MAX_OPTIONS + 10)
+            .map(|_| json!({"label": label}))
+            .collect();
+        let questions: Vec<Value> = (0..MAX_QUESTIONS + 10)
+            .map(|_| json!({"question": long, "options": options}))
+            .collect();
+        let line = json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": long, "name": long, "input": {}},
+            {"type": "tool_use", "id": "p", "name": "TodoWrite", "input": {"todos": todos}},
+            {"type": "tool_use", "id": "q", "name": "AskUserQuestion", "input": {"questions": questions}},
+        ]}});
+        let got = items(&line.to_string());
+        let TranscriptItem::ToolUse { call_id, tool, .. } = &got[0] else {
+            panic!("tool use first");
+        };
+        assert!(call_id.chars().count() <= MAX_ID_BYTES + 1);
+        assert!(tool.chars().count() <= MAX_TOOL_CHARS + 1);
+        let TranscriptItem::PlanUpdated { items: plan, .. } = &got[2] else {
+            panic!("plan third");
+        };
+        assert_eq!(plan.len(), MAX_PLAN_ITEMS);
+        assert!(
+            plan.iter()
+                .all(|p| p.text.chars().count() <= MAX_PLAN_TEXT_CHARS + 1)
+        );
+        let asked: Vec<_> = got
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::Question { text, options, .. } => Some((text, options)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(asked.len(), MAX_QUESTIONS);
+        for (text, options) in asked {
+            assert!(text.chars().count() <= MAX_QUESTION_CHARS + 1);
+            assert_eq!(options.len(), MAX_OPTIONS);
+            assert!(
+                options
+                    .iter()
+                    .all(|o| o.chars().count() <= MAX_OPTION_CHARS + 1)
+            );
+        }
+
+        let result = json!({"type": "user",
+            "message": {"content": [{"type": "tool_result", "tool_use_id": long, "content": "ok"}]},
+            "toolUseResult": {"filePath": "p".repeat(10_000), "structuredPatch": [
+                {"oldStart": 1, "oldLines": 0, "newStart": 1, "newLines": 1, "lines": ["+a"]}]}});
+        let got = items(&result.to_string());
+        let (
+            TranscriptItem::ToolResult { call_id: rid, .. },
+            TranscriptItem::FileEdit { path, .. },
+        ) = (&got[0], &got[1])
+        else {
+            panic!("result then edit");
+        };
+        assert_eq!(rid, call_id, "cut ids still pair");
+        assert!(path.chars().count() <= MAX_PATH_BYTES + 1);
+    }
+
+    #[test]
+    fn oversized_facts_are_dropped_or_cut() {
+        let long = "f".repeat(100_000);
+        let line = json!({"type": "summary", "sessionId": long, "cwd": long, "gitBranch": long,
+                          "summary": format!("  a   short\n start {long}")});
+        let facts = parse_line(line.to_string().as_bytes(), 0)
+            .expect("parses")
+            .facts;
+        assert_eq!(
+            (facts.session_id, facts.cwd, facts.branch),
+            (None, None, None)
+        );
+        let summary = facts.summary.expect("summary");
+        assert!(summary.starts_with("a short start ff"));
+        assert_eq!(summary.chars().count(), MAX_TITLE_CHARS + 1);
     }
 
     #[test]
