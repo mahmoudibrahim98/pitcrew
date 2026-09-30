@@ -406,6 +406,9 @@ export function BoardView({
     }
   };
 
+  const laneHeading = lanes.length > 1 || lanes[0]?.title !== undefined;
+  const pickedTask = picked === null ? undefined : find(picked.task);
+
   const renderCard = (lane: string) => (task: Task) => {
     const assignee = task.assignee === undefined ? undefined : members.get(task.assignee);
     const owner = assignee?.owner === undefined ? undefined : members.get(assignee.owner);
@@ -421,6 +424,7 @@ export function BoardView({
         target={picked?.task === task.id ? picked.target : undefined}
         pending={pending.has(task.id)}
         instructionsId={instructionsId}
+        headingLevel={laneHeading ? 5 : 4}
         onOpen={() => onOpen(task)}
         onHandleClick={handleClick(task)}
         onHandleKeyDown={handleKeyDown(task)}
@@ -429,9 +433,6 @@ export function BoardView({
       />
     );
   };
-
-  const laneHeading = lanes.length > 1 || lanes[0]?.title !== undefined;
-  const pickedTask = picked === null ? undefined : find(picked.task);
 
   return (
     <div

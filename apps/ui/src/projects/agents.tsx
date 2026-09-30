@@ -53,7 +53,7 @@ export function AgentsNow({
             return (
               <li key={session.id} data-session={session.id} className="flex items-start gap-2 py-2">
                 {agent !== undefined ? (
-                  <Avatar member={agent} owner={owner} size="md" />
+                  <Avatar member={agent} owner={owner} size="md" decorative />
                 ) : (
                   <span aria-hidden className="size-7 shrink-0 rounded-sm bg-sunken" />
                 )}

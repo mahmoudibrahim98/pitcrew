@@ -14,7 +14,8 @@ export function AuthorAvatar({ event, members }: { event: Event; members: Readon
   const author = members.get(event.author);
   if (author === undefined) return <span aria-hidden className="size-5 shrink-0" />;
   const owner = author.owner === undefined ? undefined : members.get(author.owner);
-  return <Avatar member={author} owner={owner} />;
+  // The handle is written next to it.
+  return <Avatar member={author} owner={owner} decorative />;
 }
 
 /** Events, newest first, each as "who did what, when". */

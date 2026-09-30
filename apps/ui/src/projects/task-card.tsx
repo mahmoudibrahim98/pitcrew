@@ -24,6 +24,8 @@ export interface TaskCardProps {
   /** The server has not answered a move yet. */
   pending: boolean;
   instructionsId: string;
+  /** One below the column's heading. */
+  headingLevel: 4 | 5;
   onOpen: () => void;
   onHandleClick: () => void;
   onHandleKeyDown: (e: KeyboardEvent<HTMLButtonElement>) => void;
@@ -42,6 +44,7 @@ export function TaskCard({
   target,
   pending,
   instructionsId,
+  headingLevel,
   onOpen,
   onHandleClick,
   onHandleKeyDown,
@@ -50,6 +53,7 @@ export function TaskCard({
 }: TaskCardProps) {
   const titleId = useId();
   const priority = PRIORITY[task.priority];
+  const Heading = headingLevel === 4 ? 'h4' : 'h5';
   return (
     <article
       aria-labelledby={titleId}
@@ -62,17 +66,20 @@ export function TaskCard({
         pending && 'opacity-80',
       )}
     >
-      <div className="flex items-center gap-2 text-xs">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs whitespace-nowrap">
         <span className="font-mono text-ink-2">{task.key}</span>
         {task.priority !== 'none' && (
-          <span className={cx('font-medium', priority.tone === 'risk' ? 'text-risk' : priority.tone === 'warn' ? 'text-warn' : 'text-ink-2')}>
+          <span
+            className={cx(
+              'font-medium',
+              priority.tone === 'risk' ? 'text-risk' : priority.tone === 'warn' ? 'text-warn' : 'text-ink-2',
+            )}
+          >
             <span className="sr-only">Priority: </span>
             {priority.label}
           </span>
         )}
-        {needsYou && (
-          <span className="rounded-pill bg-warn-soft px-1.5 py-px font-medium text-warn">Needs you</span>
-        )}
+        {needsYou && <span className="rounded-pill bg-warn-soft px-1.5 py-px font-medium text-warn">Needs you</span>}
         <span className="ml-auto">
           {task.assignee === undefined ? (
             <span className="text-ink-2">Unassigned</span>
@@ -81,11 +88,11 @@ export function TaskCard({
           )}
         </span>
       </div>
-      <h3 id={titleId} className="text-sm leading-snug font-medium">
+      <Heading id={titleId} className="text-sm leading-snug font-medium">
         <button type="button" onClick={onOpen} className="cursor-pointer rounded-sm text-left hover:underline">
           {task.title}
         </button>
-      </h3>
+      </Heading>
       {session !== undefined && (
         <p className="flex min-w-0 items-center gap-1.5 text-xs text-ink-2">
           <StatusPill tone={SESSION_STATE[session.state].tone}>{SESSION_STATE[session.state].label}</StatusPill>
