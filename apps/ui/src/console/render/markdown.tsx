@@ -2,53 +2,11 @@
 // text is always a text node, and a link is made only for an http, https or mailto target, and
 // opens outside the app.
 
-import { createContext, use, type ReactNode } from 'react';
+import type { ReactNode } from 'react';
 import { cx } from '../../lib/cx.ts';
 import { useParsed } from './client.ts';
+import { ExternalLink, safeHref } from './links.tsx';
 import type { Block, Inline } from './markdown-parse.ts';
-
-const SAFE_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
-
-/** The URL to link to, or undefined for anything but an absolute http, https or mailto URL. */
-export function safeHref(raw: string): string | undefined {
-  let url: URL;
-  try {
-    // The URL parser drops tabs, newlines and surrounding spaces, as a browser would.
-    url = new URL(raw);
-  } catch {
-    return undefined;
-  }
-  return SAFE_PROTOCOLS.has(url.protocol) ? url.href : undefined;
-}
-
-/** How the host opens a link outside the app (the desktop shell passes its opener). */
-const OpenExternalContext = createContext<((url: string) => void) | undefined>(undefined);
-
-export function OpenExternalProvider(props: { open: (url: string) => void; children: ReactNode }) {
-  return <OpenExternalContext value={props.open}>{props.children}</OpenExternalContext>;
-}
-
-export function ExternalLink({ href, children }: { href: string; children: ReactNode }) {
-  const open = use(OpenExternalContext);
-  return (
-    <a
-      href={href}
-      target="_blank"
-      rel="noopener noreferrer"
-      className="text-accent-text underline decoration-line-2 underline-offset-2 hover:decoration-current"
-      onClick={
-        open === undefined
-          ? undefined
-          : (event) => {
-              event.preventDefault();
-              open(href);
-            }
-      }
-    >
-      {children}
-    </a>
-  );
-}
 
 function renderInlines(nodes: readonly Inline[], inLink: boolean): ReactNode[] {
   return nodes.map((node, i) => renderInline(node, i, inLink));

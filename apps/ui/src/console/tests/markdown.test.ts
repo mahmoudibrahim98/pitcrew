@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { parseInline, parseMarkdown, plainText, type Block, type Inline } from '../render/markdown-parse.ts';
-import { safeHref } from '../render/markdown.tsx';
+import { safeHref } from '../render/links.tsx';
 
 const text = (v: string): Inline => ({ t: 'text', v });
 
