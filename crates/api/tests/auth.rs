@@ -117,6 +117,89 @@ async fn unknown_routes_and_methods_are_not_found() {
     assert_eq!(body["code"], "not_found");
 }
 
+/// Status and raw body text.
+async fn call_text(app: axum::Router, path: &str, bearer: Option<&str>) -> (u16, String) {
+    use tower::ServiceExt as _;
+    let response = app.oneshot(get_request(path, bearer)).await.unwrap();
+    let status = response.status().as_u16();
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    (status, String::from_utf8(body.to_vec()).unwrap())
+}
+
+#[tokio::test]
+async fn nested_fallbacks_are_authenticated_and_scoped() {
+    let f = Fixture::new();
+    let device_nested = "/v1/files/a/b";
+    let agent_nested = "/v1/agent-files/a/b";
+
+    assert_eq!(call_text(f.app(), device_nested, None).await.0, 401);
+    assert_eq!(
+        call_text(f.app(), device_nested, Some(&f.agent_token))
+            .await
+            .0,
+        403
+    );
+    assert_eq!(
+        call_text(f.app(), device_nested, Some(&f.device_token)).await,
+        (200, "device fallback".to_owned())
+    );
+
+    assert_eq!(call_text(f.app(), agent_nested, None).await.0, 401);
+    assert_eq!(
+        call_text(f.app(), agent_nested, Some(&f.agent_token)).await,
+        (200, "agent fallback".to_owned())
+    );
+
+    // Nested routes themselves, too.
+    assert_eq!(call_text(f.app(), "/v1/files/x", None).await.0, 401);
+    assert_eq!(
+        call_text(f.app(), "/v1/files/x", Some(&f.agent_token))
+            .await
+            .0,
+        403
+    );
+}
+
+#[tokio::test]
+async fn an_empty_router_parts_serves_host_info() {
+    let tokens: std::sync::Arc<dyn pitcrew_auth::TokenStore> =
+        std::sync::Arc::new(pitcrew_auth::FileTokenStore::in_memory());
+    let app = pitcrew_api::router(
+        pitcrew_api::local_host_info("0.0.0-test", vec![], vec![]),
+        tokens,
+        pitcrew_api::RouterParts::new().device(axum::Router::new()),
+    );
+    let (status, _) = call(app.clone(), get_request("/v1/host/info", None)).await;
+    assert_eq!(status, 200);
+    let (status, body) = call(app, get_request("/v1/nope", None)).await;
+    assert_eq!(status, 404);
+    assert_eq!(body["code"], "not_found");
+}
+
+#[tokio::test]
+async fn two_authorization_headers_are_unauthorized() {
+    let f = Fixture::new();
+    let request = axum::http::Request::builder()
+        .uri("/v1/me")
+        .header("authorization", format!("Bearer {}", f.device_token))
+        .header("authorization", format!("Bearer {}", f.device_token))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let (status, _) = call(f.app(), request).await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn unauthorized_responses_carry_a_bearer_challenge() {
+    use tower::ServiceExt as _;
+    let f = Fixture::new();
+    let response = f.app().oneshot(get_request("/v1/me", None)).await.unwrap();
+    assert_eq!(response.status().as_u16(), 401);
+    assert_eq!(response.headers()["www-authenticate"], "Bearer");
+}
+
 #[tokio::test]
 async fn host_info_needs_no_token() {
     let f = Fixture::new();

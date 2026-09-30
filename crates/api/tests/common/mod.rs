@@ -50,12 +50,23 @@ impl Fixture {
 
     pub fn app(&self) -> Router {
         let whoami = get(|Authenticated(caller): Authenticated| async move { Json(caller) });
+        // Nested routers with their own fallbacks, like a file server would have.
+        let nested = |name: &'static str| {
+            Router::new()
+                .route("/{id}", get(|| async { "route" }))
+                .fallback(move || async move { name })
+        };
         let parts = RouterParts::new()
-            .agent(Router::new().route("/v1/me", whoami.clone()))
+            .agent(
+                Router::new()
+                    .route("/v1/me", whoami.clone())
+                    .nest("/v1/agent-files", nested("agent fallback")),
+            )
             .device(
                 Router::new()
                     .route("/v1/device-only", whoami)
-                    .route("/v1/ws", get(ws_whoami)),
+                    .route("/v1/ws", get(ws_whoami))
+                    .nest("/v1/files", nested("device fallback")),
             );
         let store: Arc<dyn TokenStore> = self.tokens.clone();
         pitcrew_api::router(

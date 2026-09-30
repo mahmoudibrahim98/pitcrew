@@ -7,7 +7,8 @@
 use axum::Json;
 use axum::Router;
 use axum::extract::{FromRequestParts, Request};
-use axum::http::StatusCode;
+use axum::http::header::WWW_AUTHENTICATE;
+use axum::http::{HeaderValue, StatusCode};
 use axum::http::request::Parts;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -61,6 +62,10 @@ impl IntoResponse for ErrorResponse {
     fn into_response(self) -> Response {
         let status = StatusCode::from_u16(self.0.code.http_status())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        if self.0.code == ErrorCode::Unauthorized {
+            let challenge = [(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"))];
+            return (status, challenge, Json(self.0)).into_response();
+        }
         (status, Json(self.0)).into_response()
     }
 }
@@ -118,8 +123,10 @@ fn needs_device(method: &str, path: &str) -> ErrorResponse {
 /// Middleware that lets only device tokens through. Agents get `403 forbidden`.
 ///
 /// ```ignore
-/// router.route_layer(axum::middleware::from_fn(pitcrew_auth::require_device))
+/// router.layer(axum::middleware::from_fn(pitcrew_auth::require_device))
 /// ```
+///
+/// Use `layer`, not `route_layer`: `route_layer` skips the fallbacks of nested routers.
 pub async fn require_device(request: Request, next: Next) -> Response {
     match request.extensions().get::<Caller>() {
         Some(caller) if caller.is_person() => next.run(request).await,
@@ -128,14 +135,13 @@ pub async fn require_device(request: Request, next: Next) -> Response {
     }
 }
 
-/// Marks every route already in `router` as device-only (see [`require_device`]).
-///
-/// The router must have at least one route: axum panics on a route layer over none.
+/// Marks every route already in `router` as device-only (see [`require_device`]), including the
+/// fallbacks of routers nested in it.
 pub fn device_only<S>(router: Router<S>) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    router.route_layer(middleware::from_fn(require_device))
+    router.layer(middleware::from_fn(require_device))
 }
 
 #[cfg(test)]

@@ -48,8 +48,8 @@ pub const PROTOCOL_VERSION: u32 = pitcrew_protocol::PROTOCOL_VERSION;
 /// route fails closed.
 #[derive(Debug, Default)]
 pub struct RouterParts {
-    agent: Option<Router>,
-    device: Option<Router>,
+    agent: Router,
+    device: Router,
 }
 
 impl RouterParts {
@@ -62,42 +62,31 @@ impl RouterParts {
     /// Adds routes that agents may call too.
     #[must_use]
     pub fn agent(mut self, routes: Router) -> Self {
-        self.agent = Some(merge(self.agent.take(), routes));
+        self.agent = self.agent.merge(routes);
         self
     }
 
     /// Adds routes that only a person's device may call.
     #[must_use]
     pub fn device(mut self, routes: Router) -> Self {
-        self.device = Some(merge(self.device.take(), routes));
+        self.device = self.device.merge(routes);
         self
-    }
-}
-
-fn merge(existing: Option<Router>, routes: Router) -> Router {
-    match existing {
-        Some(existing) => existing.merge(routes),
-        None => routes,
     }
 }
 
 /// Builds the app: host info, then `parts` behind authentication, then a JSON 404.
 ///
-/// Each part must hold at least one route if given (axum panics on a route layer over none).
+/// Authentication wraps every part with `layer`, not `route_layer`, so it also covers fallbacks
+/// of nested routers (a `nest(..)` with its own `fallback_service`, e.g. a file server).
+///
+/// **Do not merge more routes into the returned router**: they would be unauthenticated. Add
+/// them to `parts` instead.
 pub fn router(host_info: HostInfo, tokens: Arc<dyn TokenStore>, parts: RouterParts) -> Router {
     let host_info = Arc::new(host_info);
-    let has_routes = parts.agent.is_some() || parts.device.is_some();
-    let mut authenticated = Router::new();
-    if let Some(agent) = parts.agent {
-        authenticated = authenticated.merge(agent);
-    }
-    if let Some(device) = parts.device {
-        authenticated = authenticated.merge(pitcrew_auth::device_only(device));
-    }
-    if has_routes {
-        authenticated =
-            authenticated.route_layer(middleware::from_fn_with_state(tokens, auth::authenticate));
-    }
+    let authenticated = parts
+        .agent
+        .merge(pitcrew_auth::device_only(parts.device))
+        .layer(middleware::from_fn_with_state(tokens, auth::authenticate));
     Router::new()
         .route(
             "/v1/host/info",
