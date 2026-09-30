@@ -838,7 +838,14 @@ dependencies = [
 name = "pitcrew-recap"
 version = "0.0.0"
 dependencies = [
+ "insta",
+ "pitcrew-fixtures",
  "pitcrew-protocol",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "ulid",
 ]
 
 [[package]]
