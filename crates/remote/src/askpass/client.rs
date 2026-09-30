@@ -10,9 +10,9 @@ use std::io::{self, Read, Write};
 
 /// Exit status: the answer was printed.
 pub const EXIT_ANSWERED: i32 = 0;
-/// Exit status: the user cancelled.
-pub const EXIT_CANCELLED: i32 = 1;
-/// Exit status: the bridge failed (not set up, unreachable, or the server's proof was wrong).
+/// Exit status: no answer. The bridge failed (not set up, unreachable, or the server's proof
+/// was wrong), or the listener closed without answering. A cancel never gets here while ssh
+/// lives: the caller kills ssh first.
 pub const EXIT_FAILED: i32 = 2;
 
 /// Runs the askpass program: `args` are its arguments (ssh passes the prompt as the first),
@@ -37,29 +37,26 @@ pub fn main_with(
         );
         return EXIT_FAILED;
     };
-    let reply = connect(&addr).and_then(|mut stream| ask(&mut stream, &key, kind, prompt));
-    match reply {
-        Ok(WireReply::Text { text }) => {
-            let mut text = text.into_bytes();
-            let written = out
-                .write_all(&text)
-                .and_then(|()| out.write_all(b"\n"))
-                .and_then(|()| out.flush());
-            text.fill(0);
-            match written {
-                Ok(()) => EXIT_ANSWERED,
-                Err(e) => {
-                    let _ = writeln!(err, "pitcrew-askpass: {e}");
-                    EXIT_FAILED
-                }
-            }
+    let reply = match connect(&addr).and_then(|mut stream| ask(&mut stream, &key, kind, prompt)) {
+        Ok(reply) => reply,
+        Err(e) => {
+            let _ = writeln!(err, "pitcrew-askpass: {e}");
+            return EXIT_FAILED;
         }
+    };
+    let answer = match &reply {
+        WireReply::Text { text } => text.as_bytes(),
         // `yes` answers a host-key question; ssh also takes it for a confirmation.
-        Ok(WireReply::Accept) => match writeln!(out, "yes").and_then(|()| out.flush()) {
-            Ok(()) => EXIT_ANSWERED,
-            Err(_) => EXIT_FAILED,
-        },
-        Ok(WireReply::Cancel) => EXIT_CANCELLED,
+        WireReply::Accept => b"yes",
+    };
+    let written = out
+        .write_all(answer)
+        .and_then(|()| out.write_all(b"\n"))
+        .and_then(|()| out.flush());
+    // Dropping the reply overwrites a typed answer.
+    drop(reply);
+    match written {
+        Ok(()) => EXIT_ANSWERED,
         Err(e) => {
             let _ = writeln!(err, "pitcrew-askpass: {e}");
             EXIT_FAILED
@@ -115,26 +112,35 @@ pub(crate) fn send(stream: &mut impl Write, message: &impl serde::Serialize) -> 
     stream.flush()
 }
 
-/// Reads one line, a byte at a time so nothing past it is consumed.
+/// Reads one line, a byte at a time so nothing past it is consumed. The line may hold a
+/// secret: its buffer is allocated once, so it never leaves copies behind when growing, and is
+/// overwritten before it is freed.
 pub(crate) fn receive<T: serde::de::DeserializeOwned>(stream: &mut impl Read) -> io::Result<T> {
-    let mut line = Vec::new();
+    let mut line = Vec::with_capacity(MAX_LINE);
+    let result = read_line(stream, &mut line)
+        .and_then(|()| serde_json::from_slice(&line).map_err(|e| bad(&e.to_string())));
+    line.fill(0);
+    std::hint::black_box(&line);
+    result
+}
+
+fn read_line(stream: &mut impl Read, line: &mut Vec<u8>) -> io::Result<()> {
     let mut byte = [0u8; 1];
     loop {
         if stream.read(&mut byte)? == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
-                "the listener closed the connection",
+                "the listener closed the connection without an answer",
             ));
         }
         if byte[0] == b'\n' {
-            break;
+            return Ok(());
         }
         if line.len() >= MAX_LINE {
             return Err(bad("line too long"));
         }
         line.push(byte[0]);
     }
-    serde_json::from_slice(&line).map_err(|e| bad(&e.to_string()))
 }
 
 #[cfg(unix)]

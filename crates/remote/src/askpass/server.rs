@@ -1,34 +1,46 @@
 //! The listener side: one per ssh call, alive until the call ends.
 
 use super::{
-    ADDR_ENV, Ask, Hello, KEY_ENV, KEY_LEN, MAX_LINE, NONCE_LEN, PromptHandler, PromptRequest,
-    Reply, ServerHello, WireReply, client_proof, from_hex, random, same, server_proof, to_hex,
+    ADDR_ENV, Ask, CancelTrigger, Hello, KEY_ENV, KEY_LEN, MAX_LINE, NONCE_LEN, PromptCancel,
+    PromptHandler, PromptRequest, ServerHello, WireReply, client_proof, from_hex, random, same,
+    server_proof, to_hex,
 };
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
-use tokio::task::JoinHandle;
+use tokio::sync::watch;
+use tokio::task::{JoinHandle, JoinSet};
 
 /// How long a client has to finish the handshake. The user's answer has no limit.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// A running listener. Dropping it stops listening and removes the socket.
+/// A running listener. Dropping it stops listening, ends every connection (which fires their
+/// prompts' [`PromptCancel`]s) and removes the socket.
 pub(crate) struct AskpassServer {
     addr: String,
-    key: [u8; KEY_LEN],
-    cancelled: Arc<AtomicBool>,
+    shared: Arc<Shared>,
+    /// The accept loop. It owns the connections' tasks, so aborting it ends them too.
     task: JoinHandle<()>,
 }
 
-#[derive(Clone)]
 struct Shared {
     key: [u8; KEY_LEN],
     host: String,
     handler: Arc<dyn PromptHandler>,
-    cancelled: Arc<AtomicBool>,
+    /// Set when the user cancels (or a reply is refused): ssh must be killed before anything
+    /// else happens, and no prompt is shown or answered from then on.
+    refused: watch::Sender<bool>,
+    /// How many prompts are waiting for the user, so time limits can pause.
+    open: watch::Sender<usize>,
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        self.key.fill(0);
+        std::hint::black_box(&self.key);
+    }
 }
 
 impl AskpassServer {
@@ -39,32 +51,43 @@ impl AskpassServer {
         host: &str,
         handler: Arc<dyn PromptHandler>,
     ) -> io::Result<Self> {
-        let key = random::<KEY_LEN>()?;
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let shared = Shared {
-            key,
+        let shared = Arc::new(Shared {
+            key: random::<KEY_LEN>()?,
             host: host.to_owned(),
             handler,
-            cancelled: cancelled.clone(),
-        };
+            refused: watch::Sender::new(false),
+            open: watch::Sender::new(0),
+        });
         let name = to_hex(&random::<8>()?);
-        let (addr, task) = listen(dir, &name, shared)?;
-        Ok(Self {
-            addr,
-            key,
-            cancelled,
-            task,
-        })
+        let (addr, task) = listen(dir, &name, shared.clone())?;
+        Ok(Self { addr, shared, task })
     }
 
     /// The variables `pitcrew-askpass` needs, besides `SSH_ASKPASS` itself.
     pub(crate) fn env(&self) -> [(&'static str, String); 2] {
-        [(ADDR_ENV, self.addr.clone()), (KEY_ENV, to_hex(&self.key))]
+        [
+            (ADDR_ENV, self.addr.clone()),
+            (KEY_ENV, to_hex(&self.shared.key)),
+        ]
     }
 
-    /// Whether the user cancelled any prompt during this call.
-    pub(crate) fn cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::SeqCst)
+    /// Whether the user cancelled a prompt in this call.
+    pub(crate) fn refused(&self) -> bool {
+        *self.shared.refused.borrow()
+    }
+
+    /// Completes when the user cancels a prompt. The caller must then kill ssh; until the
+    /// server is dropped, the cancelled prompt is not answered.
+    pub(crate) async fn wait_refused(&self) {
+        let mut rx = self.shared.refused.subscribe();
+        if rx.wait_for(|refused| *refused).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// The number of prompts waiting for the user, as it changes.
+    pub(crate) fn open_prompts(&self) -> watch::Receiver<usize> {
+        self.shared.open.subscribe()
     }
 }
 
@@ -81,12 +104,20 @@ impl Drop for AskpassServer {
         self.task.abort();
         #[cfg(unix)]
         let _ = std::fs::remove_file(&self.addr);
-        self.key.fill(0);
     }
 }
 
+/// Starts a connection's task, first dropping the finished ones.
+fn track<S>(conns: &mut JoinSet<()>, stream: S, shared: &Arc<Shared>)
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    while conns.try_join_next().is_some() {}
+    conns.spawn(serve(stream, shared.clone()));
+}
+
 #[cfg(unix)]
-fn listen(dir: &Path, name: &str, shared: Shared) -> io::Result<(String, JoinHandle<()>)> {
+fn listen(dir: &Path, name: &str, shared: Arc<Shared>) -> io::Result<(String, JoinHandle<()>)> {
     crate::private::ensure_private_dir(dir)?;
     let path = dir.join(format!("ask-{name}"));
     let addr = path
@@ -96,54 +127,60 @@ fn listen(dir: &Path, name: &str, shared: Shared) -> io::Result<(String, JoinHan
     let listener = tokio::net::UnixListener::bind(&path)?;
     let task = tokio::spawn(async move {
         let uid = crate::private::euid();
+        let mut conns = JoinSet::new();
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             };
-            if !stream.peer_cred().is_ok_and(|c| c.uid() == uid) {
-                continue;
+            if stream.peer_cred().is_ok_and(|c| c.uid() == uid) {
+                track(&mut conns, stream, &shared);
             }
-            tokio::spawn(serve(stream, shared.clone()));
         }
     });
     Ok((addr, task))
 }
 
 #[cfg(windows)]
-fn listen(_dir: &Path, name: &str, shared: Shared) -> io::Result<(String, JoinHandle<()>)> {
-    use tokio::net::windows::named_pipe::ServerOptions;
+fn listen(_dir: &Path, name: &str, shared: Arc<Shared>) -> io::Result<(String, JoinHandle<()>)> {
+    use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
     let addr = format!(r"\\.\pipe\pitcrew-askpass-{name}");
-    let create = |first: bool| {
+    let create = |addr: &str, first: bool| -> io::Result<NamedPipeServer> {
         ServerOptions::new()
             .first_pipe_instance(first)
             .reject_remote_clients(true)
-            .create(&addr)
+            .create(addr)
     };
     // `first_pipe_instance` fails if the name exists, so nobody can have squatted it.
-    let mut next = create(true)?;
+    let first = create(&addr, true)?;
     let task = {
         let addr = addr.clone();
         tokio::spawn(async move {
+            let mut conns = JoinSet::new();
+            let mut next = Some(first);
+            let mut delay = Duration::from_millis(50);
             loop {
-                if next.connect().await.is_err() {
-                    match ServerOptions::new()
-                        .reject_remote_clients(true)
-                        .create(&addr)
-                    {
-                        Ok(fresh) => next = fresh,
-                        Err(_) => return,
-                    }
-                    continue;
-                }
-                let Ok(fresh) = ServerOptions::new()
-                    .reject_remote_clients(true)
-                    .create(&addr)
-                else {
-                    return;
+                // A new instance can fail for a moment (e.g. under load); retry rather than
+                // leave ssh with nobody to ask.
+                let server = match next.take() {
+                    Some(server) => server,
+                    None => match create(&addr, false) {
+                        Ok(server) => {
+                            delay = Duration::from_millis(50);
+                            server
+                        }
+                        Err(_) => {
+                            tokio::time::sleep(delay).await;
+                            delay = (delay * 2).min(Duration::from_secs(2));
+                            continue;
+                        }
+                    },
                 };
-                let connected = std::mem::replace(&mut next, fresh);
-                tokio::spawn(serve(connected, shared.clone()));
+                if server.connect().await.is_ok() {
+                    // The next instance first, so a client never finds the name missing.
+                    next = create(&addr, false).ok();
+                    track(&mut conns, server, &shared);
+                }
             }
         })
     };
@@ -151,50 +188,86 @@ fn listen(_dir: &Path, name: &str, shared: Shared) -> io::Result<(String, JoinHa
 }
 
 #[cfg(not(any(unix, windows)))]
-fn listen(_dir: &Path, _name: &str, _shared: Shared) -> io::Result<(String, JoinHandle<()>)> {
+fn listen(_dir: &Path, _name: &str, _shared: Arc<Shared>) -> io::Result<(String, JoinHandle<()>)> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "no local sockets on this platform",
     ))
 }
 
-/// One askpass connection. Any protocol error just drops it; the askpass program then exits
-/// non-zero and ssh treats that as no answer.
-async fn serve<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, shared: Shared) {
+/// Counts a prompt as open while it lives.
+struct OpenPrompt<'a>(&'a watch::Sender<usize>);
+
+impl<'a> OpenPrompt<'a> {
+    fn new(open: &'a watch::Sender<usize>) -> Self {
+        open.send_modify(|n| *n += 1);
+        Self(open)
+    }
+}
+
+impl Drop for OpenPrompt<'_> {
+    fn drop(&mut self) {
+        self.0.send_modify(|n| *n = n.saturating_sub(1));
+    }
+}
+
+/// One askpass connection. A protocol error just drops it; the askpass program then exits
+/// non-zero.
+async fn serve<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, shared: Arc<Shared>) {
     let Ok(Ok(ask)) =
         tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut stream, &shared.key)).await
     else {
         return;
     };
+    if *shared.refused.borrow() {
+        // The user already said no in this call, and ssh is being killed. Never ask again, and
+        // never answer: any reply, even a failure, lets ssh send an empty credential.
+        return hold(stream).await;
+    }
+    let kind = ask.kind;
     let request = PromptRequest {
         host: shared.host.clone(),
-        kind: ask.kind,
+        kind,
         prompt: ask.prompt,
     };
-    let handler = shared.handler.clone();
-    let reply = tokio::task::spawn_blocking(move || handler.prompt(&request))
-        .await
-        .unwrap_or(Reply::Cancel);
-    let wire = match reply {
-        Reply::Text(secret) => WireReply::Text {
-            text: secret.expose().to_owned(),
-        },
-        Reply::Accept => WireReply::Accept,
-        Reply::Cancel => {
-            shared.cancelled.store(true, Ordering::SeqCst);
-            WireReply::Cancel
+    // Dropped with this task, which fires the handler's token when the call ends.
+    let (stale, cancel): (CancelTrigger, PromptCancel) = PromptCancel::pair();
+    let reply = {
+        let _open = OpenPrompt::new(&shared.open);
+        let answer = shared.handler.prompt(request, cancel);
+        let mut extra = [0u8; 1];
+        tokio::select! {
+            reply = answer => Some(reply),
+            // The client sends nothing more until it has its answer. End of stream (ssh closed
+            // a notice, or died) or anything else means nobody waits for this prompt.
+            _ = stream.read(&mut extra) => None,
         }
     };
+    let Some(reply) = reply else {
+        stale.cancel();
+        return;
+    };
+    let Some(wire) = WireReply::for_prompt(kind, reply) else {
+        shared.refused.send_replace(true);
+        return hold(stream).await;
+    };
+    if *shared.refused.borrow() {
+        // Another prompt of this call was cancelled meanwhile; ssh is being killed.
+        return hold(stream).await;
+    }
     if let Ok(mut line) = serde_json::to_vec(&wire) {
         line.push(b'\n');
         let _ = stream.write_all(&line).await;
         let _ = stream.flush().await;
         line.fill(0);
+        std::hint::black_box(&line);
     }
-    if let WireReply::Text { text } = wire {
-        let mut bytes = text.into_bytes();
-        bytes.fill(0);
-    }
+}
+
+/// Keeps a connection open, unanswered, until the call ends and the task is aborted.
+async fn hold<S>(stream: S) {
+    let _stream = stream;
+    std::future::pending::<()>().await;
 }
 
 async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
@@ -258,20 +331,44 @@ async fn receive<S: AsyncRead + Unpin, T: serde::de::DeserializeOwned>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::client;
-    use super::super::{PromptKind, Secret};
+    use super::super::{PromptFuture, PromptKind, Reply, Secret, client};
     use super::*;
     use std::sync::Mutex;
 
     struct Scripted {
-        seen: Mutex<Vec<PromptRequest>>,
-        answer: fn(&PromptRequest) -> Reply,
+        seen: Mutex<Vec<(PromptRequest, PromptCancel)>>,
+        answer: fn(&PromptRequest) -> Option<Reply>,
+    }
+
+    impl Scripted {
+        fn new(answer: fn(&PromptRequest) -> Option<Reply>) -> Arc<Self> {
+            Arc::new(Self {
+                seen: Mutex::new(Vec::new()),
+                answer,
+            })
+        }
+
+        fn kinds(&self) -> Vec<(String, PromptKind)> {
+            let seen = self.seen.lock().unwrap();
+            seen.iter().map(|(r, _)| (r.host.clone(), r.kind)).collect()
+        }
+
+        fn token(&self, i: usize) -> PromptCancel {
+            self.seen.lock().unwrap()[i].1.clone()
+        }
     }
 
     impl PromptHandler for Scripted {
-        fn prompt(&self, request: &PromptRequest) -> Reply {
-            self.seen.lock().unwrap().push(request.clone());
-            (self.answer)(request)
+        /// `None` from the script means the user never answers.
+        fn prompt(&self, request: PromptRequest, cancel: PromptCancel) -> PromptFuture<'_> {
+            let answer = (self.answer)(&request);
+            self.seen.lock().unwrap().push((request, cancel));
+            Box::pin(async move {
+                match answer {
+                    Some(reply) => reply,
+                    None => std::future::pending().await,
+                }
+            })
         }
     }
 
@@ -288,69 +385,149 @@ mod tests {
         (code, String::from_utf8(out).unwrap())
     }
 
+    fn spawn_client(
+        env: &[(&'static str, String); 2],
+        prompt: &str,
+    ) -> tokio::task::JoinHandle<(i32, String)> {
+        let env = env.clone();
+        let prompt = prompt.to_owned();
+        tokio::task::spawn_blocking(move || run_client(env, &prompt))
+    }
+
+    async fn eventually(what: &str, check: impl Fn() -> bool) {
+        for _ in 0..500 {
+            if check() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
-    async fn answers_cancels_and_wrong_keys() {
+    async fn answers_and_wrong_keys() {
         let dir = tempfile::tempdir().unwrap();
-        let rt_dir = dir.path().join("rt");
-        let handler = Arc::new(Scripted {
-            seen: Mutex::new(Vec::new()),
-            answer: |r| match r.kind {
+        let handler = Scripted::new(|r| {
+            Some(match r.kind {
                 PromptKind::Password => Reply::Text(Secret::new("s3cr3t")),
                 PromptKind::HostKey => Reply::Accept,
                 _ => Reply::Cancel,
-            },
+            })
         });
-        let server = AskpassServer::start(&rt_dir, "cluster", handler.clone()).unwrap();
+        let server =
+            AskpassServer::start(&dir.path().join("rt"), "cluster", handler.clone()).unwrap();
         let env = server.env();
 
-        let (code, out) = {
-            let env = env.clone();
-            tokio::task::spawn_blocking(move || run_client(env, "u@cluster's password: "))
-                .await
-                .unwrap()
-        };
+        let (code, out) = spawn_client(&env, "u@cluster's password: ").await.unwrap();
         assert_eq!((code, out.as_str()), (client::EXIT_ANSWERED, "s3cr3t\n"));
-        assert!(!server.cancelled());
-
-        let (code, out) = {
-            let env = env.clone();
-            tokio::task::spawn_blocking(move || {
-                run_client(
-                    env,
-                    "Are you sure you want to continue connecting (yes/no)? ",
-                )
-            })
-            .await
-            .unwrap()
-        };
+        let (code, out) = spawn_client(
+            &env,
+            "Are you sure you want to continue connecting (yes/no)? ",
+        )
+        .await
+        .unwrap();
         assert_eq!((code, out.as_str()), (client::EXIT_ANSWERED, "yes\n"));
-
-        let (code, out) = {
-            let env = env.clone();
-            tokio::task::spawn_blocking(move || run_client(env, "Verification code: "))
-                .await
-                .unwrap()
-        };
-        assert_eq!((code, out.as_str()), (client::EXIT_CANCELLED, ""));
-        assert!(server.cancelled());
+        assert!(!server.refused());
 
         let mut wrong = env.clone();
         wrong[1].1 = to_hex(&[7u8; KEY_LEN]);
-        let (code, out) = tokio::task::spawn_blocking(move || run_client(wrong, "Password: "))
-            .await
-            .unwrap();
+        let (code, out) = spawn_client(&wrong, "Password: ").await.unwrap();
         assert_eq!((code, out.as_str()), (client::EXIT_FAILED, ""));
 
-        let seen = handler.seen.lock().unwrap();
-        let kinds: Vec<_> = seen.iter().map(|r| (r.host.as_str(), r.kind)).collect();
         assert_eq!(
-            kinds,
+            handler.kinds(),
             [
-                ("cluster", PromptKind::Password),
-                ("cluster", PromptKind::HostKey),
-                ("cluster", PromptKind::Otp),
+                ("cluster".to_owned(), PromptKind::Password),
+                ("cluster".to_owned(), PromptKind::HostKey),
             ]
         );
+    }
+
+    /// A cancel is never answered, later prompts are not shown, and nothing reaches the client
+    /// until the server goes away.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancel_is_held_until_the_call_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Scripted::new(|r| {
+            Some(match r.kind {
+                // Accept for a password is refused like a cancel.
+                PromptKind::Password => Reply::Accept,
+                _ => Reply::Cancel,
+            })
+        });
+        let server =
+            AskpassServer::start(&dir.path().join("rt"), "cluster", handler.clone()).unwrap();
+        let env = server.env();
+
+        let first = spawn_client(&env, "u@cluster's password: ");
+        tokio::time::timeout(Duration::from_secs(5), server.wait_refused())
+            .await
+            .unwrap();
+        let second = spawn_client(&env, "Verification code: ");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!first.is_finished() && !second.is_finished());
+        assert_eq!(
+            handler.kinds().len(),
+            1,
+            "a prompt was shown after a cancel"
+        );
+
+        drop(server);
+        assert_eq!(first.await.unwrap(), (client::EXIT_FAILED, String::new()));
+        assert_eq!(second.await.unwrap(), (client::EXIT_FAILED, String::new()));
+    }
+
+    /// ssh closes a notice by killing askpass: the handler's token fires, and the prompt no
+    /// longer counts as open.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prompt_goes_stale_when_askpass_leaves() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Scripted::new(|_| None);
+        let server =
+            AskpassServer::start(&dir.path().join("rt"), "cluster", handler.clone()).unwrap();
+        let open = server.open_prompts();
+        let env = server.env();
+        let key = super::super::key_from_hex(&env[1].1).unwrap();
+
+        let stream = std::os::unix::net::UnixStream::connect(&env[0].1).unwrap();
+        let closer = stream.try_clone().unwrap();
+        let asking = std::thread::spawn(move || {
+            let mut stream = stream;
+            client::ask(&mut stream, &key, PromptKind::Notice, "Touch your key").is_ok()
+        });
+        eventually("the notice", || handler.kinds().len() == 1).await;
+        let notice = handler.token(0);
+        assert!(!notice.is_cancelled());
+        assert_eq!(*open.borrow(), 1);
+
+        closer.shutdown(std::net::Shutdown::Both).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), notice.cancelled())
+            .await
+            .unwrap();
+        eventually("the prompt to close", || *open.borrow() == 0).await;
+        assert!(!asking.join().unwrap());
+        assert!(!server.refused());
+    }
+
+    /// Dropping the call (here, the server) makes a pending prompt see cancellation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pending_prompt_sees_the_call_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Scripted::new(|_| None);
+        let server =
+            AskpassServer::start(&dir.path().join("rt"), "cluster", handler.clone()).unwrap();
+        let pending = spawn_client(&server.env(), "Password: ");
+        eventually("the password prompt", || handler.kinds().len() == 1).await;
+        let password = handler.token(0);
+        assert!(!password.is_cancelled());
+
+        drop(server);
+        tokio::time::timeout(Duration::from_secs(5), password.cancelled())
+            .await
+            .unwrap();
+        assert!(password.is_cancelled());
+        assert_eq!(pending.await.unwrap(), (client::EXIT_FAILED, String::new()));
     }
 
     #[test]
