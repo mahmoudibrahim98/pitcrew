@@ -10,8 +10,23 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub(crate) struct FileStat {
     pub size: u64,
     pub mtime: TimestampMs,
-    /// Changes when the file is replaced by a new one (a new inode).
+    /// Changes when the file is replaced by a new one (a new inode). Compare with [`same_file`].
     pub identity: Option<String>,
+}
+
+/// Whether two identities name the same file. On Unix only the inode counts: the device number
+/// changes across reboots and remounts (NFS, btrfs), which is not a replacement. Unknown
+/// identities match anything, leaving the size check to judge.
+pub(crate) fn same_file(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => inode_part(a) == inode_part(b),
+        _ => true,
+    }
+}
+
+/// `dev:ino` → `ino`; other forms are compared whole.
+fn inode_part(identity: &str) -> &str {
+    identity.rsplit(':').next().unwrap_or(identity)
 }
 
 pub(crate) fn stat(path: &Path) -> std::io::Result<FileStat> {
@@ -29,6 +44,7 @@ pub(crate) fn millis(t: SystemTime) -> TimestampMs {
     })
 }
 
+/// `dev:ino`. The device is kept for diagnosis only; [`same_file`] ignores it.
 #[cfg(unix)]
 fn identity(meta: &Metadata) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
@@ -184,6 +200,17 @@ mod tests {
         let b = stat(&p).expect("stat");
         assert_eq!(a.size, b.size);
         #[cfg(unix)]
-        assert_ne!(a.identity, b.identity);
+        assert!(!same_file(a.identity.as_deref(), b.identity.as_deref()));
+        assert!(same_file(a.identity.as_deref(), a.identity.as_deref()));
+    }
+
+    #[test]
+    fn only_the_inode_decides_sameness() {
+        // A reboot or remount changes the device number, not the file.
+        assert!(same_file(Some("64769:42"), Some("2049:42")));
+        assert!(!same_file(Some("64769:42"), Some("64769:43")));
+        assert!(same_file(None, Some("1:2")));
+        assert!(same_file(Some("c100"), Some("c100")));
+        assert!(!same_file(Some("c100"), Some("c200")));
     }
 }

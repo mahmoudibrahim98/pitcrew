@@ -436,7 +436,7 @@ impl Watcher {
         if row.caught_up
             && row.size == st.size
             && row.mtime == st.mtime
-            && row.identity == st.identity
+            && fsinfo::same_file(row.identity.as_deref(), st.identity.as_deref())
         {
             return Ok(false);
         }
@@ -652,11 +652,12 @@ struct Wake {
     rediscover: bool,
 }
 
-/// A smaller file, or a different file at the same path, means it was truncated or replaced.
-/// Multi-session stores (`inner_id`) change size for other reasons and are not judged this way.
+/// A smaller file, or a different file (inode) at the same path, means it was truncated or
+/// replaced. Multi-session stores (`inner_id`) change size for other reasons and are not judged
+/// this way.
 fn needs_reindex(row: &Row, st: &FileStat) -> bool {
     let read_before = row.cursor != Cursor::default();
-    let replaced = matches!((&row.identity, &st.identity), (Some(a), Some(b)) if a != b);
+    let replaced = !fsinfo::same_file(row.identity.as_deref(), st.identity.as_deref());
     row.inner_id.is_none() && read_before && (st.size < row.size || replaced)
 }
 
@@ -816,6 +817,16 @@ mod tests {
         let mut fresh = row();
         fresh.cursor = Cursor::default();
         assert!(!needs_reindex(&fresh, &stat(5, "1:2")));
+    }
+
+    #[test]
+    fn a_new_device_number_is_not_a_replacement() {
+        // After a reboot or an NFS remount `st_dev` differs; same inode, same size.
+        let r = row();
+        assert!(!needs_reindex(&r, &stat(10, "7:1")));
+        assert!(!needs_reindex(&r, &stat(20, "7:1")));
+        // The shrink rule still applies.
+        assert!(needs_reindex(&r, &stat(5, "7:1")));
     }
 
     #[test]
