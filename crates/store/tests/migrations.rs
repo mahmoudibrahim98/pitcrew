@@ -2,6 +2,7 @@ use pitcrew_store::migrations::{self, Migration};
 use pitcrew_store::{Error, Store, StoreOptions};
 use std::borrow::Cow;
 use std::path::Path;
+use std::sync::{Arc, Barrier};
 
 const INIT_SQL: &str = include_str!("../migrations/0001_init.sql");
 
@@ -34,6 +35,112 @@ fn embedded_includes_init() {
     assert_eq!(all.first().map(|m| m.version), Some(1));
     assert_eq!(all[0].name, "init");
     assert!(all.windows(2).all(|w| w[0].version < w[1].version));
+}
+
+#[test]
+fn embedded_matches_the_migrations_directory() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let on_disk = migrations::load_dir(&dir).expect("load");
+    assert_eq!(migrations::embedded(), on_disk.as_slice());
+}
+
+#[test]
+fn concurrent_opens_of_a_fresh_file_both_succeed() {
+    const OPENERS: usize = 4;
+    for _ in 0..5 {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = Arc::new(dir.path().join("store.db"));
+        let barrier = Arc::new(Barrier::new(OPENERS));
+        let handles: Vec<_> = (0..OPENERS)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Store::open(path.as_path(), StoreOptions::default()).map(drop)
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("thread").expect("open");
+        }
+        let versions: Vec<u32> = applied(&path).iter().map(|a| a.0).collect();
+        let expected: Vec<u32> = migrations::embedded().iter().map(|m| m.version).collect();
+        assert_eq!(versions, expected);
+    }
+}
+
+const PARENT_CHILD: &str = "
+    CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT NOT NULL) STRICT;
+    CREATE TABLE child (
+      id     INTEGER PRIMARY KEY,
+      parent INTEGER NOT NULL REFERENCES parent (id) ON DELETE CASCADE
+    ) STRICT;
+    INSERT INTO parent (id, name) VALUES (1, 'a'), (2, 'b');
+    INSERT INTO child (id, parent) VALUES (10, 1), (11, 1), (12, 2);";
+
+fn count(path: &Path, table: &str) -> i64 {
+    raw(path)
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+        .expect("count")
+}
+
+#[test]
+fn a_table_rebuild_keeps_cascading_children() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("store.db");
+    let list = [
+        migration(1, "init", INIT_SQL),
+        migration(150, "parent_child", PARENT_CHILD),
+        // The documented rebuild: new table, copy, drop old, rename.
+        migration(
+            151,
+            "rebuild_parent",
+            "CREATE TABLE parent_new (id INTEGER PRIMARY KEY, name TEXT NOT NULL, note TEXT) STRICT;
+             INSERT INTO parent_new (id, name) SELECT id, name FROM parent;
+             DROP TABLE parent;
+             ALTER TABLE parent_new RENAME TO parent;",
+        ),
+    ];
+    let store = Store::open_with_migrations(&path, StoreOptions::default(), &list).expect("open");
+    assert_eq!(store.schema_version().expect("version"), Some(151));
+    drop(store);
+    assert_eq!(count(&path, "parent"), 2);
+    assert_eq!(count(&path, "child"), 3);
+
+    // Foreign keys are back on afterwards: the cascade still works.
+    let conn = raw(&path);
+    conn.execute_batch("PRAGMA foreign_keys = ON; DELETE FROM parent WHERE id = 1;")
+        .expect("delete");
+    drop(conn);
+    assert_eq!(count(&path, "child"), 1);
+}
+
+#[test]
+fn a_migration_leaving_a_dangling_reference_fails() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("store.db");
+    let list = [
+        migration(1, "init", INIT_SQL),
+        migration(150, "parent_child", PARENT_CHILD),
+        migration(
+            151,
+            "orphan",
+            "INSERT INTO child (id, parent) VALUES (13, 99);",
+        ),
+    ];
+    let err = Store::open_with_migrations(&path, StoreOptions::default(), &list).expect_err("fail");
+    assert!(
+        matches!(err, Error::Migration { version: 151, .. }),
+        "{err:?}"
+    );
+    let cause = std::error::Error::source(&err).expect("source").to_string();
+    assert!(cause.contains("foreign key check failed"), "{cause}");
+    assert_eq!(count(&path, "child"), 3);
+    assert_eq!(
+        applied(&path).iter().map(|a| a.0).collect::<Vec<_>>(),
+        vec![1, 150]
+    );
 }
 
 #[test]
@@ -112,6 +219,10 @@ fn a_failed_migration_leaves_nothing_behind() {
         "{err:?}"
     );
     assert!(err.to_string().contains("0101_broken"), "{err}");
+    // The cause is the source, not repeated in the message.
+    let cause = std::error::Error::source(&err).expect("source").to_string();
+    assert!(cause.contains("syntax error"), "{cause}");
+    assert!(!err.to_string().contains(&cause), "{err}");
 
     let conn = raw(&path);
     let half: i64 = conn

@@ -21,7 +21,9 @@ mod scan;
 mod store;
 
 pub use error::{DbError, Error, Result};
-pub use store::{EventFilter, RevRange, Store, StoreOptions, StoredEvent, event_type};
+pub use store::{
+    EventFilter, MAX_SUBSCRIBER_CAPACITY, RevRange, Store, StoreOptions, StoredEvent, event_type,
+};
 
 /// The protocol version this crate was built against.
 pub const PROTOCOL_VERSION: u32 = pitcrew_protocol::PROTOCOL_VERSION;

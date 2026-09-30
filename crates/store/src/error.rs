@@ -1,14 +1,25 @@
+use pitcrew_protocol::ids::EventId;
 use std::fmt;
 
-/// Errors from the store.
+/// Errors from the store. Messages do not repeat their cause; walk `source()` for it.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     /// SQLite reported an error.
-    #[error("database error: {0}")]
+    #[error("database error")]
     Database(#[source] DbError),
+    /// An appended event has an id that is already stored, or appears twice in the batch. `id` is
+    /// the first such id; others may follow it. **Nothing from the batch was stored**, including
+    /// its new events. A caller retrying a batch must not treat this as done: drop the ids already
+    /// stored and append the rest, which [`Store::append_new`](crate::Store::append_new) does in
+    /// one transaction.
+    #[error("event {id} is already in the log")]
+    DuplicateEvent {
+        /// The repeated id.
+        id: EventId,
+    },
     /// A migration failed to apply; nothing from it was kept.
-    #[error("migration {version:04}_{name} failed: {source}")]
+    #[error("migration {version:04}_{name} failed")]
     Migration {
         /// Its number.
         version: u32,
@@ -48,7 +59,7 @@ pub enum Error {
         got: String,
     },
     /// An event could not be encoded or decoded as JSON.
-    #[error("event JSON: {0}")]
+    #[error("event JSON")]
     Json(#[from] serde_json::Error),
     /// A stored row does not decode into an event.
     #[error("stored event at rev {rev} is invalid: {reason}")]
