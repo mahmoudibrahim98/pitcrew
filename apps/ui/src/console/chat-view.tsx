@@ -3,7 +3,7 @@
 // before, and the rows in view stay where they are (the list is anchored to its end).
 
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, useAsks, useSession } from '../data/index.ts';
 import { cx } from '../lib/cx.ts';
 import { ChatRowView, PlanChecklist, type RowContext } from './chat-rows.tsx';
@@ -27,6 +27,8 @@ const ESTIMATE: Record<ChatRowType, number> = {
 
 /** How close to the top (px) a scroll loads the page before. */
 const LOAD_OLDER_WITHIN = 400;
+/** How close to the end (px) counts as being at the end, which new rows then follow. */
+const STAY_AT_END_WITHIN = 48;
 
 export interface ChatViewProps {
   sessionId: string;
@@ -76,7 +78,7 @@ function ChatViewBody({ sessionId, pageSize, className }: ChatViewProps) {
     paddingEnd: 8,
     anchorTo: 'end',
     followOnAppend: true,
-    scrollEndThreshold: 48,
+    scrollEndThreshold: STAY_AT_END_WITHIN,
   });
 
   // Open at the end, once the first rows are there.
@@ -88,10 +90,35 @@ function ChatViewBody({ sessionId, pageSize, className }: ChatViewProps) {
     }
   }, [rows.length, virtualizer]);
 
-  const { loadOlder } = transcript;
+  // At the end, stay there when the view itself shrinks or grows (the plan bar appears, the
+  // composer grows); the virtualiser only follows rows that change.
+  const atEnd = useRef(true);
+  useEffect(() => {
+    const element = scrollRef.current;
+    if (element === null || typeof ResizeObserver !== 'function') return;
+    let height = element.clientHeight;
+    const observer = new ResizeObserver(() => {
+      if (element.clientHeight === height) return;
+      height = element.clientHeight;
+      if (opened.current && atEnd.current) virtualizer.scrollToEnd();
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [virtualizer]);
+
+  const { loadOlder, loadingOlder } = transcript;
+  // A page that does not fill the view (or still ends near its top) cannot be scrolled up to load
+  // the one before, so load it now.
+  useEffect(() => {
+    const element = scrollRef.current;
+    if (element !== null && opened.current && !loadingOlder && element.scrollTop < LOAD_OLDER_WITHIN) loadOlder();
+  }, [view, loadingOlder, loadOlder]);
+
   const onScroll = () => {
     const element = scrollRef.current;
-    if (element !== null && opened.current && element.scrollTop < LOAD_OLDER_WITHIN) loadOlder();
+    if (element === null) return;
+    atEnd.current = element.scrollHeight - element.clientHeight - element.scrollTop <= STAY_AT_END_WITHIN;
+    if (opened.current && element.scrollTop < LOAD_OLDER_WITHIN) loadOlder();
   };
 
   const s = session.data;
@@ -129,10 +156,10 @@ function ChatViewBody({ sessionId, pageSize, className }: ChatViewProps) {
             <button
               type="button"
               onClick={loadOlder}
-              disabled={transcript.loadingOlder}
+              disabled={loadingOlder}
               className="pointer-events-auto rounded-pill border border-line bg-card px-3 py-0.5 text-xs text-ink-2 shadow-pop hover:bg-hover disabled:opacity-70"
             >
-              {transcript.loadingOlder ? 'Loading earlier…' : 'Load earlier'}
+              {loadingOlder ? 'Loading earlier…' : 'Load earlier'}
             </button>
           </div>
         )}

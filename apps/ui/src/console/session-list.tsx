@@ -188,7 +188,7 @@ export function SessionListView(props: SessionListViewProps) {
         onFocus={() => {
           if (activeId === undefined) moveTo(sessionIndexes.find((i) => rows[i]?.key === selectedId) ?? sessionIndexes[0]);
         }}
-        className="relative w-full outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-inset"
+        className="group relative w-full outline-none"
         style={{ height: virtualizer.getTotalSize() }}
       >
         {virtualizer.getVirtualItems().map((item) => {
@@ -263,7 +263,8 @@ function SessionRow(props: {
       className={cx(
         'mx-1 flex h-[52px] cursor-pointer flex-col justify-center gap-0.5 rounded-md px-3',
         props.selected ? 'bg-accent-soft' : 'hover:bg-hover',
-        props.active && 'ring-2 ring-accent ring-inset',
+        // The keyboard's place in the list, shown while the list has keyboard focus.
+        props.active && 'group-focus-visible:ring-2 group-focus-visible:ring-accent group-focus-visible:ring-inset',
       )}
     >
       <div className="flex min-w-0 items-center gap-2">
