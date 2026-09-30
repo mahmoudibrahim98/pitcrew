@@ -169,3 +169,35 @@ async fn seeding_twice_is_refused() {
     assert_eq!(err.code(), pitcrew_protocol::api::ErrorCode::Conflict);
     assert_eq!(work.store().latest_rev().expect("rev"), rev);
 }
+
+/// Parity with the real mock hub, not just the fixture it serves. Dump the mock's answers with
+/// a script that fetches each GET route in an `index.json` (`{ "name": "/v1/..." }`) into
+/// `<name>.json`, then run with `PITCREW_MOCK_DUMP=<that folder> cargo test -p pitcrew-hub-work
+/// --test seed -- --ignored`. Every answer must match, except briefs' `next` (a contract gap).
+#[tokio::test]
+#[ignore = "needs a dump of the mock hub's answers in PITCREW_MOCK_DUMP"]
+async fn seeded_routes_answer_like_the_running_mock_hub() {
+    let dump =
+        std::path::PathBuf::from(std::env::var("PITCREW_MOCK_DUMP").expect("PITCREW_MOCK_DUMP"));
+    let read = |name: &str| -> Value {
+        let text = std::fs::read_to_string(dump.join(name)).expect("dump file");
+        serde_json::from_str(&text).expect("dump JSON")
+    };
+    let index: std::collections::BTreeMap<String, String> =
+        serde_json::from_value(read("index.json")).expect("index");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let work = seeded(dir.path());
+    let app = app(&work);
+    for (name, path) in &index {
+        let mut mock = read(&format!("{name}.json"));
+        let got = get(&app, person(SAM), path).await;
+        expect(&got, 200);
+        if name == "briefs" {
+            for brief in mock.as_array_mut().expect("array") {
+                brief.as_object_mut().expect("object").remove("next");
+            }
+        }
+        assert_eq!(got.1, mock, "{path}");
+        println!("same as the mock hub: GET {path}");
+    }
+}
