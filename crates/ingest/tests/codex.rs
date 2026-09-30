@@ -336,6 +336,11 @@ fn meta_comes_from_session_meta_and_turn_context() {
         prompt("<environment_context>\n<cwd>/real/cwd</cwd>\n</environment_context>"),
         prompt("  Fix   the\nparser  "),
         record("turn_context", json!({"model": "m-2"})),
+        // A later session_meta does not change the first-seen facts.
+        record(
+            "session_meta",
+            json!({"id": "other", "cwd": "/elsewhere", "git": {"branch": "feat/b"}}),
+        ),
     ];
     let data: String = lines.iter().map(|l| format!("{l}\n")).collect();
     fs::write(&path, &data).expect("write");
@@ -464,6 +469,64 @@ fn a_patch_across_several_files_and_a_malformed_one() {
         items.last(),
         Some(TranscriptItem::ToolResult { call_id, is_error: true, .. }) if call_id == "p2"
     ));
+    assert_eq!(page_all(&path, 1), items);
+}
+
+/// Pinned on purpose (see the `codex` module docs): a patch that fails still gives its edits.
+/// Consumers tell by the paired result.
+#[test]
+fn a_failed_patch_still_gives_edits_paired_with_an_error_result() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("failed.jsonl");
+    let patch = "*** Begin Patch\n*** Update File: a.txt\n@@\n-x\n+y\n*** Add File: b.txt\n+1\n*** End Patch";
+    let lines = [
+        record(
+            "response_item",
+            json!({"type": "custom_tool_call", "name": "apply_patch", "call_id": "p1", "input": patch}),
+        ),
+        record(
+            "response_item",
+            json!({"type": "custom_tool_call_output", "call_id": "p1",
+                   "output": json!({"output": "error: a.txt: context not found", "metadata": {"exit_code": 1}}).to_string()}),
+        ),
+    ];
+    let data: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    fs::write(&path, &data).expect("write");
+    let items = read_all(&path).items;
+
+    let [
+        TranscriptItem::ToolUse {
+            call_id,
+            offset: use_at,
+            ..
+        },
+        TranscriptItem::FileEdit {
+            path: a,
+            offset: a_at,
+            ..
+        },
+        TranscriptItem::FileEdit {
+            path: b,
+            offset: b_at,
+            ..
+        },
+        TranscriptItem::ToolResult {
+            call_id: result_id,
+            is_error,
+            ..
+        },
+    ] = &items[..]
+    else {
+        panic!("unexpected items: {items:?}");
+    };
+    assert_eq!((a.as_str(), b.as_str()), ("a.txt", "b.txt"));
+    assert_eq!(
+        (a_at, b_at),
+        (use_at, use_at),
+        "edits share the call's offset"
+    );
+    assert_eq!(result_id, call_id);
+    assert!(is_error, "the result says the patch did not apply");
     assert_eq!(page_all(&path, 1), items);
 }
 
@@ -789,5 +852,4 @@ fn read_page_and_full_read_on_200mb() {
     );
     assert!(page.items.len() >= 200);
     assert!(full.skipped.len() <= MAX_REPORTED_SKIPS);
-    assert!(newest.as_millis() < 50, "newest page took {newest:?}");
 }

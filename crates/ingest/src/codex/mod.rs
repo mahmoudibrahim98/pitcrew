@@ -1,5 +1,18 @@
 //! Codex CLI rollouts: `<home>/sessions/YYYY/MM/DD/rollout-<time>-<uuid>.jsonl`, plus
 //! `<home>/archived_sessions/`, where `home` is `~/.codex` or a `CODEX_HOME`.
+//!
+//! # File edits
+//!
+//! An `apply_patch` call gives its `FileEdit`s from the call record, one per file, **whether or
+//! not the patch applied**. Each `FileEdit` has the same `offset` as its `ToolUse`, whose
+//! `call_id` leads to the `ToolResult`; that result's `is_error` says whether the patch applied.
+//! Consumers that only want applied edits must check it. (The Claude adapter emits edits only
+//! from a successful result; a later change may defer Codex edits the same way.)
+//!
+//! `FileEdit.path` is the path written in the patch, usually relative to the call's `workdir`
+//! or the session's cwd; it is not resolved. For a moved file it is the new path. Diffs keep
+//! Codex's hunk headers as written (`@@` or `@@ <context>`, without line ranges), so update diffs
+//! are not strict unified diffs; added files get `@@ -0,0 +1,N @@`.
 
 mod parse;
 
@@ -218,15 +231,15 @@ struct MetaAcc {
 }
 
 impl MetaAcc {
-    /// Folds in one record; returns whether anything changed. The session id, cwd, start time
-    /// and sub-agent flag are the first seen; branch and model the latest.
+    /// Folds in one record; returns whether anything changed. The session id, cwd, branch, start
+    /// time and sub-agent flag are the first seen (from `session_meta`); the model the latest.
     fn absorb(&mut self, rec: &CodexRecord) -> bool {
         let f = &rec.facts;
         let mut changed = set_first(&mut self.session_id, f.session_id.as_ref());
         changed |= set_first(&mut self.cwd, f.cwd.as_ref());
         changed |= set_first(&mut self.started, f.timestamp.as_ref());
         changed |= set_first(&mut self.subagent, f.is_subagent.as_ref());
-        changed |= set_latest(&mut self.branch, f.branch.as_ref());
+        changed |= set_first(&mut self.branch, f.branch.as_ref());
         changed |= set_latest(&mut self.model, f.model.as_ref());
         if self.first_prompt.is_none() {
             self.first_prompt = rec.items.iter().find_map(|item| match item {

@@ -200,7 +200,14 @@ fn message(p: &Map<String, Value>, at: TimestampMs, offset: u64, out: &mut Vec<T
             let typed: Vec<&str> = texts
                 .into_iter()
                 .map(str::trim)
-                .filter(|t| !t.is_empty() && !is_injected(t))
+                .filter(|t| !t.is_empty())
+                .filter(|t| {
+                    let injected = is_injected(t);
+                    if injected {
+                        tracing::debug!(offset, start = %first_line(t, 60), "dropped injected context from a user message");
+                    }
+                    !injected
+                })
                 .collect();
             if !typed.is_empty() {
                 out.push(TranscriptItem::UserPrompt {
@@ -223,8 +230,8 @@ fn message(p: &Map<String, Value>, at: TimestampMs, offset: u64, out: &mut Vec<T
     }
 }
 
-/// Injected context: a known prefix, or text wholly wrapped in one tag whose name looks like
-/// Codex's (`<snake_case>` or `<UPPER>`), which a person would rarely type.
+/// Injected context: a known prefix, or text wholly wrapped in one `<snake_case>` tag, the form
+/// Codex uses for its wrappers. Other tags (`<TODO>`, `<b>`) are kept as typed.
 fn is_injected(text: &str) -> bool {
     if INJECTED_PREFIXES.iter().any(|p| text.starts_with(p)) {
         return true;
@@ -235,10 +242,9 @@ fn is_injected(text: &str) -> bool {
     let Some(name) = rest.split_once('>').map(|(n, _)| n) else {
         return false;
     };
-    let codex_like = !name.is_empty()
-        && name.len() <= 64
-        && name.bytes().all(|b| b.is_ascii_alphabetic() || b == b'_')
-        && (name.contains('_') || name.bytes().all(|b| b.is_ascii_uppercase()));
+    let codex_like = name.len() <= 64
+        && name.contains('_')
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
     codex_like && text.ends_with(&format!("</{name}>"))
 }
 
@@ -300,19 +306,39 @@ fn patch_text<'a>(tool: &str, args: Args<'a>) -> Option<&'a str> {
             .and_then(Value::as_str)
             .or_else(|| v.as_str()),
         (_, Args::Json(v)) => {
-            let parts = command_parts(v.get("command").or_else(|| v.get("cmd"))?);
-            if !parts
-                .iter()
-                .any(|p| p.contains("apply_patch") || p.contains("applypatch"))
-            {
-                return None;
-            }
-            parts
-                .iter()
-                .find_map(|p| p.find("*** Begin Patch").map(|i| &p[i..]))
+            shell_patch(&command_parts(v.get("command").or_else(|| v.get("cmd"))?))
         }
         (_, Args::Text(_)) => None,
     }
+}
+
+const BEGIN_PATCH: &str = "*** Begin Patch";
+
+/// A patch given to `apply_patch` in a command: as an argument when the command is
+/// `apply_patch <patch>`, or as a heredoc whose opening line is `apply_patch <<...` just before
+/// `*** Begin Patch`. A heredoc that only writes a patch somewhere is not an edit.
+fn shell_patch<'a>(parts: &[&'a str]) -> Option<&'a str> {
+    let is_tool = |w: &str| matches!(w, "apply_patch" | "applypatch");
+    if let Some((first, rest)) = parts.split_first()
+        && is_tool(first.trim())
+    {
+        return rest
+            .iter()
+            .find_map(|p| p.find(BEGIN_PATCH).map(|i| &p[i..]));
+    }
+    parts.iter().find_map(|p| {
+        let i = p.find(BEGIN_PATCH)?;
+        let before = p[..i].trim_end_matches([' ', '\t']).strip_suffix('\n')?;
+        let opener = before.rsplit('\n').next().unwrap_or(before);
+        let words: Vec<&str> = opener
+            .split(|c: char| c.is_whitespace() || ";&|()".contains(c))
+            .filter(|w| !w.is_empty())
+            .collect();
+        words
+            .windows(2)
+            .any(|w| is_tool(w[0]) && w[1].starts_with("<<"))
+            .then(|| &p[i..])
+    })
 }
 
 /// The strings of a command: an array's elements, or a single string.
@@ -667,13 +693,19 @@ mod tests {
             "<user_instructions>be brief</user_instructions>",
             "# AGENTS.md instructions for /w\n\n<INSTRUCTIONS>x</INSTRUCTIONS>",
             "<some_new_wrapper>\nstuff\n</some_new_wrapper>",
-            "<NOTE>x</NOTE>",
         ] {
             let v = item(json!({"type": "message", "role": "user",
                                 "content": [{"type": "input_text", "text": text}]}));
             assert!(items(&v).is_empty(), "{text}");
         }
-        for text in ["<b>bold</b> please", "use <div>x</div>", "x < y"] {
+        for text in [
+            "<b>bold</b> please",
+            "use <div>x</div>",
+            "x < y",
+            "<TODO>ship the parser</TODO>",
+            "<NOTE>x</NOTE>",
+            "<Mixed_Case>x</Mixed_Case>",
+        ] {
             let v = item(json!({"type": "message", "role": "user",
                                 "content": [{"type": "input_text", "text": text}]}));
             assert_eq!(items(&v).len(), 1, "{text}");
@@ -789,6 +821,35 @@ mod tests {
             "arguments": json!({"command": ["apply_patch", "*** Begin Patch\n*** Add File: y\n+1\n*** End Patch"]}).to_string()}),
         );
         assert_eq!(edits(&items(&two))[0].0, "y");
+
+        let chained = "cd /w && apply_patch <<\"EOF\"\n*** Begin Patch\n*** Add File: z\n+1\n*** End Patch\nEOF";
+        let three = item(
+            json!({"type": "function_call", "name": "shell_command", "call_id": "s",
+                                "arguments": json!({"command": chained}).to_string()}),
+        );
+        assert_eq!(edits(&items(&three))[0].0, "z");
+    }
+
+    #[test]
+    fn a_heredoc_that_only_writes_a_patch_is_not_an_edit() {
+        for script in [
+            "cat > fixtures/t.patch <<'EOF'\n*** Begin Patch\n*** Update File: x\n-a\n+b\n*** End Patch\nEOF\n# used by the apply_patch tests",
+            "echo apply_patch; cat <<EOF\n*** Begin Patch\n*** Add File: y\n+1\n*** End Patch\nEOF",
+            "grep -r 'apply_patch' . && printf '%s' '*** Begin Patch'",
+        ] {
+            let call = item(
+                json!({"type": "function_call", "name": "shell", "call_id": "s",
+                "arguments": json!({"command": ["bash", "-lc", script]}).to_string()}),
+            );
+            let got = items(&call);
+            assert!(edits(&got).is_empty(), "{script}");
+            assert_eq!(got.len(), 1);
+        }
+        let echo = item(
+            json!({"type": "function_call", "name": "shell", "call_id": "s",
+            "arguments": json!({"command": ["echo", "apply_patch", "*** Begin Patch\n*** Add File: y\n+1\n*** End Patch"]}).to_string()}),
+        );
+        assert!(edits(&items(&echo)).is_empty());
     }
 
     #[test]
@@ -844,10 +905,34 @@ mod tests {
             total <= MAX_PATCH_DIFF_BYTES + MAX_PATCH_FILES * 64,
             "{total}"
         );
+        // Once the patch's budget is spent, later files keep their counts but carry no diff.
+        let first_none = got
+            .iter()
+            .position(|e| e.3.is_none())
+            .expect("budget runs out");
+        assert!(first_none > 0);
+        assert!(got[first_none..].iter().all(|e| e.3.is_none()));
+    }
+
+    #[test]
+    fn one_large_file_diff_is_capped() {
+        const MARKER: &str = "… (diff truncated)\n";
+        let mut patch = String::from("*** Begin Patch\n*** Update File: big.txt\n@@\n");
+        for _ in 0..4000 {
+            patch.push_str("+a fairly long line of added text, repeated many times\n");
+        }
+        patch.push_str("*** End Patch");
+        assert!(patch.len() > 200 * 1024);
+        let call = item(json!({"type": "custom_tool_call", "name": "apply_patch",
+                               "call_id": "p", "input": patch}));
+        let got = edits(&items(&call));
+        let diff = got[0].3.as_ref().expect("diff");
+        assert_eq!(got[0].1, 4000);
+        assert!(diff.ends_with(MARKER));
         assert!(
-            got.iter()
-                .filter_map(|e| e.3.as_ref())
-                .all(|d| d.len() <= MAX_DIFF_BYTES + 64)
+            diff.len() <= MAX_DIFF_BYTES + MARKER.len(),
+            "{}",
+            diff.len()
         );
     }
 
