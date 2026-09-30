@@ -13,8 +13,9 @@ use crate::ids::{
     AskId, DispatchId, EventId, MachineId, MemberId, SessionId, TaskId, WorkspaceId, WorkstreamId,
 };
 use crate::model::{
-    Answer, Ask, Dispatch, DispatchOutcome, Health, LinkBasis, Liveness, Mover, Project, Receipt,
-    Session, SessionState, Subtask, Task, TaskStatus, TimestampMs, Workstream, WorkstreamStatus,
+    Answer, Ask, Dispatch, DispatchOutcome, Health, LinkBasis, Liveness, Machine, Member, Mover,
+    Persona, Project, Receipt, Session, SessionState, Subtask, Task, TaskStatus, Team, TimestampMs,
+    Workstream, WorkstreamStatus,
 };
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +62,28 @@ impl Event {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum EventBody {
+    // Workspace membership: written by the hub.
+    /// A machine was added to the workspace, or its details changed.
+    MachineAdded {
+        /// The machine.
+        machine: Machine,
+    },
+    /// A member (a person or an agent) joined the workspace, or their details changed.
+    MemberAdded {
+        /// The member.
+        member: Member,
+    },
+    /// A persona was created or changed.
+    PersonaSaved {
+        /// The persona.
+        persona: Persona,
+    },
+    /// A team was created or changed.
+    TeamSaved {
+        /// The team.
+        team: Team,
+    },
+
     // Machines and sessions: written by runners.
     /// A machine became reachable, unreachable or stopped.
     MachineLiveness {
@@ -118,6 +141,20 @@ pub enum EventBody {
         added: u32,
         /// Lines removed.
         removed: u32,
+        /// Where the edit is in the transcript.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipt: Option<Receipt>,
+    },
+    /// A session's facts changed after it was discovered, e.g. a custom title set later.
+    SessionUpdated {
+        /// The session.
+        session: SessionId,
+        /// New title, if it changed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        /// New git branch, if it changed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
     },
     /// A session was linked to a workstream or task.
     SessionLinked {

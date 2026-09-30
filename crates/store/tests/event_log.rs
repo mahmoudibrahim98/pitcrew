@@ -369,6 +369,12 @@ fn other_bodies() -> Vec<EventBody> {
         json!({"type": "decision_recorded", "data": {"workstream": demo.workstreams[1].id,
             "text": "Report four seeds.", "why": "Seed 3 diverged.",
             "receipts": [{"kind": "job", "scheduler": "slurm", "id": "4815164"}]}}),
+        json!({"type": "machine_added", "data": {"machine": demo.machines[1]}}),
+        json!({"type": "member_added", "data": {"member": demo.members[1]}}),
+        json!({"type": "persona_saved", "data": {"persona": demo.personas[0]}}),
+        json!({"type": "team_saved", "data": {"team": demo.teams[0]}}),
+        json!({"type": "session_updated", "data": {"session": session.id,
+            "title": "Method section, second pass"}}),
     ];
     bodies
         .into_iter()
