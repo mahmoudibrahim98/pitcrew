@@ -1,13 +1,39 @@
 //! Building the remote command line, and checking host names.
 //!
-//! ssh hands the remote side a single string, which the user's login shell parses. Every
-//! argument is therefore quoted with POSIX single quotes: inside them nothing is special, and a
-//! literal `'` is written as `'\''`. This is correct for sh, bash, dash, ksh and zsh. csh and
-//! tcsh also accept it, except that they reject a newline inside quotes; fish reads `\\` inside
-//! single quotes as one backslash. Commands meant for any login shell should avoid newlines and
-//! backslashes, or wrap themselves in `sh -c` with a single-line script (as the probe does).
+//! ssh hands the remote side one string, which the user's **login shell** parses. That shell
+//! may be sh, bash, zsh, ksh, fish, csh or tcsh, and they disagree about quoting: fish reads
+//! `\\` and `\'` inside single quotes as escapes, and csh and tcsh expand `!` inside single
+//! quotes and refuse a newline there. So the command travels in one fixed, shell-neutral
+//! wrapper:
+//!
+//! ```text
+//! /bin/sh -c 'eval "$(printf "\ooo\ooo…")"'
+//! ```
+//!
+//! Each `\ooo` is one byte of the POSIX command line, as three octal digits. The string the
+//! login shell sees is therefore the wrapper's fixed characters plus backslashes that are each
+//! followed by a digit. It has no `\\`, no `\'`, no `!`, no newline, no quote inside the single
+//! quotes, and its only `$` is the wrapper's. Every shell named above hands the single-quoted
+//! part to `/bin/sh` unchanged. There `printf` turns the escapes back into the command line, and
+//! `eval` runs it with POSIX semantics.
+//!
+//! The command line quotes each argument with POSIX single quotes (a literal `'` is written
+//! `'\''`). The command name is always quoted, so it is never a reserved word, an assignment or
+//! an option to `eval`.
+//!
+//! Needs `/bin/sh` with `$(…)` on the remote side: every Linux, macOS and BSD has it. Shells
+//! whose single quotes are not literal for the characters above (e.g. xonsh) are not supported.
 
 use crate::SshError;
+
+/// The wrapper, before and after the escapes.
+const HEAD: &str = "/bin/sh -c 'eval \"$(printf \"";
+const TAIL: &str = "\")\"'";
+
+/// The longest command [`remote_command`] builds: Linux limits a single argument to 128 KiB,
+/// and the login shell receives the command as one. Each byte of the POSIX command line takes
+/// four, so the command line itself can be about 32 KiB.
+pub const MAX_REMOTE_COMMAND: usize = 128 * 1024 - 1;
 
 /// Characters that never need quoting. `=` is left out on purpose: an unquoted `A=b` in first
 /// position is an assignment, not a command. `~`, `#`, `*`, `?`, `[`, `{` are left out too.
@@ -21,6 +47,10 @@ pub fn sh_quote(word: &str) -> String {
     if !word.is_empty() && word.chars().all(is_plain) {
         return word.to_owned();
     }
+    always_quote(word)
+}
+
+fn always_quote(word: &str) -> String {
     let mut out = String::with_capacity(word.len() + 2);
     out.push('\'');
     for c in word.chars() {
@@ -34,44 +64,84 @@ pub fn sh_quote(word: &str) -> String {
     out
 }
 
-/// Joins `argv` into one command line for the remote shell.
+/// Joins `argv` into one POSIX command line: the command name always quoted, every other
+/// argument quoted when it needs it. This is what the remote `/bin/sh` runs; send it with
+/// [`remote_command`], never as it is.
 ///
 /// # Errors
 /// `argv` is empty, or an argument contains a NUL byte (which no process can receive).
-pub fn remote_command<S: AsRef<str>>(argv: &[S]) -> Result<String, SshError> {
+pub fn posix_command<S: AsRef<str>>(argv: &[S]) -> Result<String, SshError> {
     if argv.is_empty() {
         return Err(SshError::InvalidArgument("the command is empty".to_owned()));
     }
     let mut words = Vec::with_capacity(argv.len());
-    for arg in argv {
+    for (i, arg) in argv.iter().enumerate() {
         let arg = arg.as_ref();
         if arg.contains('\0') {
             return Err(SshError::InvalidArgument(
                 "an argument contains a NUL byte".to_owned(),
             ));
         }
-        words.push(sh_quote(arg));
+        words.push(if i == 0 {
+            always_quote(arg)
+        } else {
+            sh_quote(arg)
+        });
     }
     Ok(words.join(" "))
 }
 
-/// Checks a host name (an alias from `~/.ssh/config`, a DNS name, or `user@host`) before it is
-/// put on ssh's command line. It must not look like an option, and must not contain whitespace
-/// or control characters.
+/// The string to hand ssh for running `argv` under any login shell: [`posix_command`] inside the
+/// shell-neutral wrapper described in the module docs.
+///
+/// # Errors
+/// As [`posix_command`], or the result is longer than [`MAX_REMOTE_COMMAND`].
+pub fn remote_command<S: AsRef<str>>(argv: &[S]) -> Result<String, SshError> {
+    let line = posix_command(argv)?;
+    // `$(…)` drops trailing newlines; the line ends with a quote or a plain character.
+    debug_assert!(!line.ends_with('\n'));
+    let len = HEAD.len() + 4 * line.len() + TAIL.len();
+    if len > MAX_REMOTE_COMMAND {
+        return Err(SshError::InvalidArgument(format!(
+            "the command is too long ({len} bytes once wrapped; the limit is {MAX_REMOTE_COMMAND})"
+        )));
+    }
+    let mut out = String::with_capacity(len);
+    out.push_str(HEAD);
+    for byte in line.bytes() {
+        out.push('\\');
+        for shift in [6, 3, 0] {
+            out.push(char::from(b'0' + ((byte >> shift) & 7)));
+        }
+    }
+    out.push_str(TAIL);
+    Ok(out)
+}
+
+/// Whether `c` may appear in a host name given to ssh.
+fn is_host_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '%' | '[' | ']' | '@' | '-')
+}
+
+/// Checks a host name (an alias from `~/.ssh/config`, a DNS name, an address, or `user@host`)
+/// before it is put on ssh's command line. Only `A-Z a-z 0-9 . _ : % [ ] @ -` are allowed:
+/// older OpenSSH (e.g. 9.5, bundled with Windows) passes other characters on to
+/// `ProxyCommand %h` and `Match exec`, where a shell would read them. It must not look like an
+/// option, before or after `@`.
 ///
 /// # Errors
 /// [`SshError::InvalidHost`] naming the problem.
 pub fn validate_host(host: &str) -> Result<(), SshError> {
     let problem = if host.is_empty() {
-        Some("it is empty")
+        Some("it is empty".to_owned())
     } else if host.starts_with('-') {
-        Some("it starts with '-'")
-    } else if host.chars().any(char::is_whitespace) {
-        Some("it contains whitespace")
-    } else if host.chars().any(char::is_control) {
-        Some("it contains a control character")
+        Some("it starts with '-'".to_owned())
+    } else if host.contains("@-") {
+        Some("the part after '@' starts with '-'".to_owned())
     } else {
-        None
+        host.chars()
+            .find(|&c| !is_host_char(c))
+            .map(|c| format!("it contains {c:?}"))
     };
     match problem {
         Some(why) => Err(SshError::InvalidHost(format!("{host:?}: {why}"))),
@@ -154,6 +224,82 @@ pub(crate) fn sh_split(line: &str) -> Result<Vec<String>, String> {
     Ok(words)
 }
 
+/// Login-shell families, for [`login_split`].
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Dialect {
+    /// sh, bash, dash, ksh, zsh: single quotes are literal.
+    Posix,
+    /// fish: `\\` and `\'` are escapes inside single quotes.
+    Fish,
+    /// csh, tcsh: `!` is expanded inside single quotes, and a newline there is an error.
+    Csh,
+}
+
+/// A model of how each login-shell family splits a line of plain words and single-quoted words.
+/// Anything else outside quotes is an error: the wrapper needs nothing more.
+#[cfg(test)]
+pub(crate) fn login_split(line: &str, dialect: Dialect) -> Result<Vec<String>, String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            '\'' => {
+                in_word = true;
+                loop {
+                    match (chars.next(), dialect) {
+                        (Some('\''), _) => break,
+                        (Some('\\'), Dialect::Fish)
+                            if matches!(chars.peek(), Some('\\' | '\'')) =>
+                        {
+                            word.extend(chars.next());
+                        }
+                        (Some('!'), Dialect::Csh) => return Err("history expansion".to_owned()),
+                        (Some('\n'), Dialect::Csh) => return Err("newline in quotes".to_owned()),
+                        (Some(c), _) => word.push(c),
+                        (None, _) => return Err("unterminated single quote".to_owned()),
+                    }
+                }
+            }
+            c if c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '.' | '_') => {
+                in_word = true;
+                word.push(c);
+            }
+            c => return Err(format!("unquoted {c:?}")),
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    Ok(words)
+}
+
+/// Undoes [`remote_command`], strictly: the wrapper exactly, then only `\ooo` escapes. Returns
+/// the POSIX command line, or `None` if `wrapped` has any other shape.
+#[cfg(test)]
+pub(crate) fn unwrap_remote(wrapped: &str) -> Option<String> {
+    let escapes = wrapped.strip_prefix(HEAD)?.strip_suffix(TAIL)?.as_bytes();
+    if escapes.is_empty() || escapes.len() % 4 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(escapes.len() / 4);
+    for chunk in escapes.chunks(4) {
+        let [b'\\', a @ b'0'..=b'3', b @ b'0'..=b'7', c @ b'0'..=b'7'] = *chunk else {
+            return None;
+        };
+        bytes.push(((a - b'0') << 6) | ((b - b'0') << 3) | (c - b'0'));
+    }
+    String::from_utf8(bytes).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,24 +333,79 @@ mod tests {
     }
 
     #[test]
-    fn a_command_round_trips() {
-        let argv = ["rm", "-rf", "it's; $(x) `y`\n", "--", "日本"];
-        let line = remote_command(&argv).unwrap();
-        assert_eq!(sh_split(&line).unwrap(), argv);
+    fn the_command_name_is_always_quoted() {
+        assert_eq!(posix_command(&["ls", "-la"]).unwrap(), "'ls' -la");
+        assert_eq!(posix_command(&["-rf"]).unwrap(), "'-rf'");
+        assert_eq!(posix_command(&["if", "x"]).unwrap(), "'if' x");
     }
 
     #[test]
-    fn nul_and_empty_commands_are_refused() {
+    fn a_command_round_trips() {
+        let argv = ["rm", "-rf", "it's; $(x) `y`\n", "--", "日本"];
+        let line = posix_command(&argv).unwrap();
+        assert_eq!(sh_split(&line).unwrap(), argv);
+        assert_eq!(
+            unwrap_remote(&remote_command(&argv).unwrap()).unwrap(),
+            line
+        );
+    }
+
+    #[test]
+    fn the_wrapper_looks_like_this() {
+        assert_eq!(
+            remote_command(&["echo", "a'b"]).unwrap(),
+            r#"/bin/sh -c 'eval "$(printf "\047\145\143\150\157\047\040\047\141\047\134\047\047\142\047")"'"#
+        );
+    }
+
+    #[test]
+    fn nul_empty_and_huge_commands_are_refused() {
         assert!(remote_command::<&str>(&[]).is_err());
         assert!(remote_command(&["a\0b"]).is_err());
+        let big = "x".repeat(MAX_REMOTE_COMMAND / 4);
+        assert!(remote_command(&["echo", &big]).is_err());
+        let fits = "x".repeat(MAX_REMOTE_COMMAND / 4 - 40);
+        assert!(remote_command(&["echo", &fits]).is_ok());
     }
 
     #[test]
     fn host_names_are_checked() {
-        for good in ["cluster", "user@login.example.org", "10.0.0.1", "[::1]"] {
+        for good in [
+            "cluster",
+            "user@login.example.org",
+            "first.last@node-01",
+            "10.0.0.1",
+            "[::1]",
+            "fe80::1%eth0",
+            "gpu_node:2",
+        ] {
             validate_host(good).unwrap();
         }
-        for bad in ["", "-oProxyCommand=x", "a b", "a\tb", "a\nb", "a\u{7f}b"] {
+        for bad in [
+            "",
+            "-oProxyCommand=x",
+            "user@-oProxyCommand=x",
+            "a@b@-c",
+            "a b",
+            "a\tb",
+            "a\nb",
+            "a\u{7f}b",
+            "a;b",
+            "a$b",
+            "a`b`",
+            "a'b",
+            "a\"b",
+            "a|b",
+            "a&b",
+            "a(b)",
+            "a/b",
+            "a\\b",
+            "a*b",
+            "a!b",
+            "a~b",
+            "a{b}",
+            "ä",
+        ] {
             assert!(validate_host(bad).is_err(), "{bad:?}");
         }
     }
@@ -217,12 +418,55 @@ mod tests {
         assert_eq!(sh_split(r#"a "b c" d\ e"#).unwrap(), ["a", "b c", "d e"]);
     }
 
+    /// The dialect models read the review's attacks the way the real shells do.
+    #[test]
+    fn the_login_models_see_the_old_attacks() {
+        // The old output for argv [`\'; touch pwned; #`]: fish ends the quote early.
+        let old = r"'\'\''; touch pwned; #'";
+        assert!(login_split(old, Dialect::Fish).is_err());
+        assert!(login_split("'a!b'", Dialect::Csh).is_err());
+        assert!(login_split("'a\nb'", Dialect::Csh).is_err());
+        assert_eq!(
+            login_split(r"x 'a\\b'", Dialect::Fish).unwrap(),
+            ["x", r"a\b"]
+        );
+        assert_eq!(
+            login_split(r"x 'a\\b'", Dialect::Posix).unwrap(),
+            ["x", r"a\\b"]
+        );
+    }
+
+    fn check_wrapped(argv: &[String]) -> Result<(), TestCaseError> {
+        let wrapped = remote_command(argv).unwrap();
+        // Nothing any login shell reads specially, apart from the wrapper's own characters.
+        prop_assert!(wrapped.is_ascii());
+        prop_assert!(!wrapped.contains("\\\\"), "{wrapped}");
+        prop_assert!(!wrapped.contains("\\'"), "{wrapped}");
+        prop_assert!(!wrapped.contains('!'));
+        prop_assert!(!wrapped.contains('\n'));
+        prop_assert!(!wrapped.chars().any(|c| c.is_ascii_control()));
+        prop_assert_eq!(wrapped.matches('$').count(), 1);
+        prop_assert_eq!(wrapped.matches('\'').count(), 2);
+        // Every family of login shell passes the same script to /bin/sh.
+        let inner = login_split(&wrapped, Dialect::Posix).unwrap();
+        prop_assert_eq!(inner.len(), 3);
+        prop_assert_eq!(&inner[..2], &["/bin/sh", "-c"]);
+        for dialect in [Dialect::Fish, Dialect::Csh] {
+            prop_assert_eq!(&login_split(&wrapped, dialect).unwrap(), &inner);
+        }
+        // ...which decodes to a command line that splits back into argv exactly.
+        let line = unwrap_remote(&wrapped).unwrap();
+        prop_assert!(!line.ends_with('\n'));
+        prop_assert_eq!(&sh_split(&line).unwrap(), argv);
+        Ok(())
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
 
         #[test]
         fn quoting_round_trips(argv in prop::collection::vec("[^\\x00]*", 1..6)) {
-            let line = remote_command(&argv).unwrap();
+            let line = posix_command(&argv).unwrap();
             prop_assert_eq!(sh_split(&line).unwrap(), argv);
         }
 
@@ -230,8 +474,23 @@ mod tests {
         fn quoting_round_trips_shell_heavy_input(
             argv in prop::collection::vec("[ -~\\n\\t'\"\\\\$`;é]{0,12}", 1..6)
         ) {
-            let line = remote_command(&argv).unwrap();
+            let line = posix_command(&argv).unwrap();
             prop_assert_eq!(sh_split(&line).unwrap(), argv);
+        }
+
+        /// Arbitrary argv: the wrapped command never contains a sequence that fish, csh or tcsh
+        /// reads differently from sh.
+        #[test]
+        fn wrapped_commands_are_shell_neutral(argv in prop::collection::vec("[^\\x00]*", 1..6)) {
+            check_wrapped(&argv)?;
+        }
+
+        /// The same, biased towards the characters that broke fish and csh.
+        #[test]
+        fn wrapped_commands_are_shell_neutral_for_hostile_input(
+            argv in prop::collection::vec("[\\\\'!\\n\"$`;# a-z]{0,16}", 1..6)
+        ) {
+            check_wrapped(&argv)?;
         }
     }
 }

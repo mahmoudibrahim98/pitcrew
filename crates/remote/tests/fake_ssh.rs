@@ -261,7 +261,8 @@ fn exact_argument_list() {
             "ControlPersist=10m".to_owned(),
         ]);
     }
-    want.extend(["--", "cluster", "echo 'hi there'"].map(str::to_owned));
+    want.extend(["--", "cluster"].map(str::to_owned));
+    want.push(pitcrew_remote::quote::remote_command(&["echo", "hi there"]).unwrap());
     let log = fake.log();
     assert_eq!(log.args, want);
     assert_eq!(log.askpass, None);
@@ -286,7 +287,11 @@ fn exact_argument_list() {
     let log = fake.log();
     assert!(!log.args.iter().any(|a| a == "BatchMode=yes"));
     let dash = log.args.iter().position(|a| a == "--").unwrap();
-    assert_eq!(&log.args[dash..], ["--", "user@cluster", "true"]);
+    assert_eq!(&log.args[dash..dash + 2], ["--", "user@cluster"]);
+    assert_eq!(
+        log.args[dash + 2],
+        pitcrew_remote::quote::remote_command(&["true"]).unwrap()
+    );
     assert_eq!(log.askpass.as_deref(), Some(askpass().as_str()));
     assert_eq!(log.askpass_require.as_deref(), Some("force"));
     assert!(log.has_bridge_env);
