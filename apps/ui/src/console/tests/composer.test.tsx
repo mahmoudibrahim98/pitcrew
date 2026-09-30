@@ -2,10 +2,11 @@
 // @vitest-environment-options {"url": "http://localhost:5173/"}
 
 import { cleanup, fireEvent, screen, within } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ChatView } from '../chat-view.tsx';
 import { Composer } from '../composer.tsx';
 import {
+  eventually,
   ID,
   renderWithHub,
   startHub,
@@ -46,7 +47,7 @@ describe('Composer against the mock hub', () => {
     const { requests } = renderWithHub(hub, <Pane sessionId={ID.ses4} />);
     await screen.findByText(/The Codex reader now keeps/);
     const input = screen.getByRole('textbox', { name: 'Message to the agent' });
-    await vi.waitFor(() => expect(input).toHaveProperty('disabled', false));
+    await eventually(() => expect(input).toHaveProperty('disabled', false));
 
     fireEvent.change(input, { target: { value: 'Summarise the parser change\nin two lines' } });
     fireEvent.keyDown(input, { key: 'Enter', shiftKey: true });
@@ -60,7 +61,7 @@ describe('Composer against the mock hub', () => {
     expect(posts(requests, `/v1/sessions/${ID.ses4}/send`).map((r) => r.body)).toEqual([
       { text: 'Summarise the parser change\nin two lines' },
     ]);
-    await vi.waitFor(() => expect(document.querySelectorAll('[data-row="pending"]')).toHaveLength(0));
+    await eventually(() => expect(document.querySelectorAll('[data-row="pending"]')).toHaveLength(0));
     const prompts = [...document.querySelectorAll('[data-row="prompt"]')].map((p) => p.textContent);
     expect(prompts.at(-1)).toContain('Summarise the parser change\nin two lines');
   }, 15_000);
@@ -69,19 +70,19 @@ describe('Composer against the mock hub', () => {
     hub = await startHub();
     const { requests } = renderWithHub(hub, <Pane sessionId={ID.ses1} />);
     const stop = await screen.findByRole('button', { name: 'Stop' });
-    await vi.waitFor(() => expect(stop).toHaveProperty('disabled', false));
+    await eventually(() => expect(stop).toHaveProperty('disabled', false));
     fireEvent.click(stop);
-    await vi.waitFor(() => expect(posts(requests, `/v1/sessions/${ID.ses1}/interrupt`)).toHaveLength(1));
+    await eventually(() => expect(posts(requests, `/v1/sessions/${ID.ses1}/interrupt`)).toHaveLength(1));
     // The mock stops the turn: SES0001 now waits, so there is nothing left to stop.
-    await vi.waitFor(() => expect(screen.getByRole('button', { name: 'Stop' })).toHaveProperty('disabled', true), {
+    await eventually(() => expect(screen.getByRole('button', { name: 'Stop' })).toHaveProperty('disabled', true), {
       timeout: 4_000,
     });
 
     fireEvent.click(screen.getByRole('button', { name: 'Send Escape' }));
-    await vi.waitFor(() => expect(posts(requests, `/v1/sessions/${ID.ses1}/keys`)).toHaveLength(1));
-    await vi.waitFor(() => expect(screen.getByRole('button', { name: 'Send Ctrl+C' })).toHaveProperty('disabled', false));
+    await eventually(() => expect(posts(requests, `/v1/sessions/${ID.ses1}/keys`)).toHaveLength(1));
+    await eventually(() => expect(screen.getByRole('button', { name: 'Send Ctrl+C' })).toHaveProperty('disabled', false));
     fireEvent.click(screen.getByRole('button', { name: 'Send Ctrl+C' }));
-    await vi.waitFor(() =>
+    await eventually(() =>
       expect(posts(requests, `/v1/sessions/${ID.ses1}/keys`).map((r) => r.body)).toEqual([
         { keys: ['escape'] },
         { keys: ['ctrl_c'] },
@@ -123,7 +124,7 @@ describe('Composer against the mock hub', () => {
     };
     renderWithHub(hub, <Composer sessionId={ID.ses4} />, { fetch: unavailable });
     const input = screen.getByRole('textbox', { name: 'Message to the agent' });
-    await vi.waitFor(() => expect(input).toHaveProperty('disabled', false));
+    await eventually(() => expect(input).toHaveProperty('disabled', false));
     fireEvent.change(input, { target: { value: 'Are you there?' } });
     fireEvent.keyDown(input, { key: 'Enter' });
     await screen.findByText('This laptop cannot be reached right now.');
@@ -135,13 +136,13 @@ describe('Composer against the mock hub', () => {
     hub = await startHub();
     renderWithHub(hub, <Pane sessionId={ID.ses4} />);
     const input = await screen.findByRole('textbox', { name: 'Message to the agent' });
-    await vi.waitFor(() => expect(input).toHaveProperty('disabled', false));
+    await eventually(() => expect(input).toHaveProperty('disabled', false));
     const payload = '<img src=x onerror=alert(1)> [x](javascript:alert(1))';
     fireEvent.change(input, { target: { value: payload } });
     fireEvent.keyDown(input, { key: 'Enter' });
     const quoted = /Mock reply to "<img src=x onerror=alert\(1\)>/;
     await screen.findByText(quoted, undefined, { timeout: 5_000 });
-    await vi.waitFor(() => expect(document.querySelector('[data-markdown="pending"]')).toBeNull());
+    await eventually(() => expect(document.querySelector('[data-markdown="pending"]')).toBeNull());
     const markdown = screen.getByText(quoted).closest('[data-markdown]') as HTMLElement;
     expect(markdown.dataset.markdown).toBe('ready');
     expect(document.querySelectorAll('img, script')).toHaveLength(0);

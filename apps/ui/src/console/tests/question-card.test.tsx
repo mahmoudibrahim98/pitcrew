@@ -2,11 +2,12 @@
 // @vitest-environment-options {"url": "http://localhost:5173/"}
 
 import { fireEvent, screen, within } from '@testing-library/react';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { useAsks, type Ask, type Session } from '../../data/index.ts';
 import { ChatView } from '../chat-view.tsx';
 import { keysForOption, QuestionCard } from '../question-card.tsx';
 import {
+  eventually,
   ID,
   otherClient,
   renderWithHub,
@@ -38,12 +39,12 @@ describe('QuestionCard against the mock hub', () => {
     hub = await startHub();
     const { requests } = renderWithHub(hub, <ChatView sessionId={ID.ses3} />);
     const card = await screen.findByRole('region', { name: 'Question: Merge the benchmark change into parsers?' });
-    await vi.waitFor(() => expect(within(card).getByText('from @reviewer')).toBeTruthy());
+    await eventually(() => expect(within(card).getByText('from @reviewer')).toBeTruthy());
     const merge = within(card).getByRole('button', { name: 'Merge it' });
     expect(merge).toHaveProperty('disabled', false);
 
     fireEvent.click(merge);
-    await vi.waitFor(() => expect(within(card).getByTestId('answer').textContent).toBe('Answered: Merge it'));
+    await eventually(() => expect(within(card).getByTestId('answer').textContent).toBe('Answered: Merge it'));
     expect(posts(requests, `/v1/asks/${ID.ask1}/answer`).map((r) => r.body)).toEqual([{ option: 0 }]);
     expect(within(card).getByRole('button', { name: 'Merge it' })).toHaveProperty('disabled', true);
     expect(card.dataset.answered).toBe('true');
@@ -66,7 +67,7 @@ describe('QuestionCard against the mock hub', () => {
     expect(within(card).getByText(/Loss went to NaN/)).toBeTruthy();
     fireEvent.change(within(card).getByRole('textbox'), { target: { value: 'Rerun it at half the rate' } });
     fireEvent.click(within(card).getByRole('button', { name: 'Answer' }));
-    await vi.waitFor(() =>
+    await eventually(() =>
       expect(within(card).getByTestId('answer').textContent).toBe('Answered: Rerun it at half the rate'),
     );
     expect(posts(requests, '/v1/asks/01JB000000000000000ASK0002/answer').map((r) => r.body)).toEqual([
@@ -83,7 +84,7 @@ describe('QuestionCard against the mock hub', () => {
     const { requests } = renderWithHub(hub, <QuestionCard session={session} question={question} open />);
     const card = await screen.findByRole('region', { name: 'Question: Which parser?' });
     fireEvent.click(within(card).getByRole('button', { name: 'C' }));
-    await vi.waitFor(() => expect(within(card).getByTestId('answer').textContent).toBe('Sent: C'));
+    await eventually(() => expect(within(card).getByTestId('answer').textContent).toBe('Sent: C'));
     expect(posts(requests, `/v1/sessions/${ID.ses4}/keys`).map((r) => r.body)).toEqual([
       { keys: ['down', 'down', 'enter'] },
     ]);

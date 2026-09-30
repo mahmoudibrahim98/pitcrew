@@ -9,6 +9,7 @@ import { NO_FACETS, type SessionFacets } from '../facets.ts';
 import { SessionFilters } from '../session-filters.tsx';
 import { SessionList, SessionListView } from '../session-list.tsx';
 import {
+  eventually,
   ID,
   otherClient,
   renderWithHub,
@@ -64,12 +65,13 @@ describe('SessionList against the mock hub', () => {
       '# Unsorted',
       ID.ses5,
     ]);
-    const row = rowOf(ID.ses1);
-    expect(row).not.toBeNull();
-    const text = row?.textContent ?? '';
-    for (const part of ['Claude', 'Draft method section', '@writer', 'Working', 'Editing method.tex (§3.2)']) {
-      expect(text).toContain(part);
-    }
+    // The agent's handle comes from the members query, which may land after the list.
+    await eventually(() => {
+      const text = rowOf(ID.ses1)?.textContent ?? '';
+      for (const part of ['Claude', 'Draft method section', '@writer', 'Working', 'Editing method.tex (§3.2)']) {
+        expect(text).toContain(part);
+      }
+    });
     expect(rowOf(ID.ses5)?.textContent).toContain('Unreachable');
     expect(rowOf(ID.ses6)?.textContent).toContain('Ended');
     expect(rowOf(ID.ses3)?.textContent).toContain('Waiting');
@@ -84,18 +86,18 @@ describe('SessionList against the mock hub', () => {
 
     const api = otherClient(hub);
     await api.request('POST', `/v1/sessions/${ID.ses4}/send`, { body: { text: 'Summarise the change' } });
-    await vi.waitFor(() => expect(rowOf(ID.ses4)?.dataset.state).toBe('working'), { timeout: 4_000 });
+    await eventually(() => expect(rowOf(ID.ses4)?.dataset.state).toBe('working'), { timeout: 4_000 });
     expect(rowOf(ID.ses4)?.textContent).toContain('Thinking');
 
     const started = await api.request<Session>('POST', '/v1/sessions', {
       body: { machine: ID.laptop, engine: 'codex', cwd: '/home/sam/scratch' },
     });
-    await vi.waitFor(() => expect(within(rowOf(started.id) as HTMLElement).getByTestId('starting')).toBeTruthy(), {
+    await eventually(() => expect(within(rowOf(started.id) as HTMLElement).getByTestId('starting')).toBeTruthy(), {
       timeout: 4_000,
     });
     expect(rowOf(started.id)?.textContent).toContain('scratch');
     // Unlinked and in no project's folder: Unsorted.
-    await vi.waitFor(() => expect(rowOf(started.id)?.dataset.state).toBe('working'), { timeout: 5_000 });
+    await eventually(() => expect(rowOf(started.id)?.dataset.state).toBe('working'), { timeout: 5_000 });
   }, 15_000);
 
   it('moves with the keyboard and selects with Enter or a click', async () => {
@@ -134,14 +136,14 @@ describe('SessionList against the mock hub', () => {
     const { container } = renderWithHub(hub, <Pane />);
     await screen.findByRole('listbox', { name: 'Sessions' });
     fireEvent.click(await screen.findByRole('checkbox', { name: /Codex/ }));
-    await vi.waitFor(() => expect(outline(container).filter((r) => !r.startsWith('#'))).toEqual([ID.ses2]));
+    await eventually(() => expect(outline(container).filter((r) => !r.startsWith('#'))).toEqual([ID.ses2]));
 
     fireEvent.click(screen.getByRole('checkbox', { name: /Codex/ }));
     fireEvent.click(screen.getByRole('checkbox', { name: /^Unsorted/ }));
-    await vi.waitFor(() => expect(outline(container)).toEqual(['# Unsorted', ID.ses5]));
+    await eventually(() => expect(outline(container)).toEqual(['# Unsorted', ID.ses5]));
 
     fireEvent.click(screen.getByRole('button', { name: 'Clear' }));
-    await vi.waitFor(() => expect(outline(container).filter((r) => !r.startsWith('#'))).toHaveLength(6));
+    await eventually(() => expect(outline(container).filter((r) => !r.startsWith('#'))).toHaveLength(6));
   });
 });
 

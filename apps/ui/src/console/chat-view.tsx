@@ -64,7 +64,13 @@ function ChatViewBody({ sessionId, pageSize, className }: ChatViewProps) {
     (question: ItemOf<'question'>) => askForQuestion(asks.data, sessionId, question),
     [asks.data, sessionId],
   );
-  const ctx: RowContext = { session: session.data, askFor, expanded, toggle };
+  const ctx: RowContext = {
+    session: session.data,
+    askFor,
+    asksKnown: asks.data !== undefined || asks.isError,
+    expanded,
+    toggle,
+  };
 
   const scrollRef = useRef<HTMLDivElement>(null);
   // eslint-disable-next-line react-hooks/incompatible-library -- this component opts out of the compiler ('use no memo').

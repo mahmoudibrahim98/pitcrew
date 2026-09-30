@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Task, Workstream } from '../../data/index.ts';
 import { SessionHeader } from '../session-header.tsx';
 import {
+  eventually,
   ID,
   renderWithHub,
   startHub,
@@ -32,14 +33,16 @@ describe('SessionHeader against the mock hub', () => {
     );
     await screen.findByRole('heading', { name: 'Draft method section' });
     const header = screen.getByRole('banner');
-    await vi.waitFor(() => expect(header.textContent).toContain('This laptop'));
-    for (const text of ['Working', 'Claude', '@writer', 'main', '/home/sam/work/diffusion-paper/paper']) {
-      expect(header.textContent).toContain(text);
-    }
+    // Machines, members, the task and the workstream arrive as separate queries.
+    await eventually(() => {
+      for (const text of ['This laptop', 'Working', 'Claude', '@writer', 'main', '/home/sam/work/diffusion-paper/paper']) {
+        expect(header.textContent).toContain(text);
+      }
+    });
     const work = within(header).getByRole('navigation', { name: 'Linked work' });
     fireEvent.click(await within(work).findByRole('button', { name: 'PAP-1 · Draft the method section' }));
     expect(onOpenTask).toHaveBeenCalledWith(expect.objectContaining({ key: 'PAP-1' }));
-    fireEvent.click(within(work).getByRole('button', { name: 'Submission' }));
+    fireEvent.click(await within(work).findByRole('button', { name: 'Submission' }));
     expect(onOpenWorkstream).toHaveBeenCalledWith(expect.objectContaining({ name: 'Submission' }));
   });
 
@@ -47,7 +50,7 @@ describe('SessionHeader against the mock hub', () => {
     hub = await startHub();
     renderWithHub(hub, <SessionHeader sessionId={ID.ses5} />);
     await screen.findByRole('heading', { name: 'Try a cosine schedule' });
-    await vi.waitFor(() => expect(screen.getByRole('banner').textContent).toContain('gpu-box(unreachable)'));
+    await eventually(() => expect(screen.getByRole('banner').textContent).toContain('gpu-box(unreachable)'));
     fireEvent.keyDown(screen.getByRole('button', { name: 'Session actions' }), { key: 'Enter' });
     const menu = await screen.findByRole('menu');
     expect(within(menu).getByRole('menuitem', { name: 'End session…' }).getAttribute('aria-disabled')).toBe('true');
@@ -67,7 +70,7 @@ describe('SessionHeader against the mock hub', () => {
     fireEvent.click(within(menu).getByRole('menuitem', { name: 'End session…' }));
     const confirm = await screen.findByRole('alertdialog', { name: 'End this session?' });
     fireEvent.click(within(confirm).getByRole('button', { name: 'Kill now' }));
-    await vi.waitFor(() => expect(screen.getByRole('banner').textContent).toContain('Ended'), { timeout: 4_000 });
+    await eventually(() => expect(screen.getByRole('banner').textContent).toContain('Ended'), { timeout: 4_000 });
     expect(requests.filter((r) => r.path === `/v1/sessions/${ID.ses4}/end`).map((r) => r.body)).toEqual([
       { mode: 'kill' },
     ]);

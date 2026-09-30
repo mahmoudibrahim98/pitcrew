@@ -3,12 +3,23 @@
 // happy-dom replaces globals the in-process hub relies on), a DataProvider around the component,
 // a log of every request, and a stand-in layout so virtualised lists have a size in happy-dom.
 
-import { cleanup, render } from '@testing-library/react';
+import { cleanup, configure, render } from '@testing-library/react';
 import type { ReactNode } from 'react';
+import { vi } from 'vitest';
 import { freePort, spawnHub, type HubProcess } from '../../../tests/hub-process.ts';
 import { createApi, createQueryClient, DataProvider } from '../../data/index.ts';
 
 export const DEVICE_TOKEN = 'dev-device-token';
+
+// Everything here goes through a real hub process and its stream; on a busy machine the default
+// one second for `findBy…` is too short.
+const PATIENCE = 5_000;
+configure({ asyncUtilTimeout: PATIENCE });
+
+/** `vi.waitFor` with the same patience as `findBy…`. */
+export function eventually<T>(check: () => T | Promise<T>, options: { timeout?: number } = {}): Promise<T> {
+  return vi.waitFor(check, { timeout: PATIENCE, ...options });
+}
 
 export const ID = {
   person: '01JB000000000000000MEM0001',

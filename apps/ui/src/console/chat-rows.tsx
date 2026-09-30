@@ -13,6 +13,11 @@ import type { ItemOf, PlanItem } from './types.ts';
 export interface RowContext {
   session: Session | undefined;
   askFor: (question: ItemOf<'question'>) => Ask | undefined;
+  /**
+   * The asks have loaded. Until then a question is not answerable here: it may have been raised
+   * as an ask, and answering it with keys instead would bypass the ask.
+   */
+  asksKnown: boolean;
   expanded: ReadonlySet<string>;
   toggle: (key: string) => void;
 }
@@ -217,7 +222,7 @@ export function ChatRowView({ row, ctx }: { row: ChatRow; ctx: RowContext }) {
           question={row.item}
           ask={ctx.askFor(row.item)}
           answer={row.answer}
-          open={row.open}
+          open={row.open && ctx.asksKnown}
         />
       );
     case 'turn':
