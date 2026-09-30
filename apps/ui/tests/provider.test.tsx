@@ -100,6 +100,6 @@ describe('DataProvider', () => {
     hub = await spawnHub(port);
     await screen.findByText('Tooling', undefined, { timeout: 8_000 });
     await vi.waitFor(() => expect(screen.getByText('status: live')).toBeTruthy());
-    expect(screen.queryByText('workspace: -')).toBeNull();
+    await vi.waitFor(() => expect(screen.queryByText('workspace: -')).toBeNull());
   }, 15_000);
 });
