@@ -7,6 +7,8 @@
 //! - [`Bound`] listens on a [`Listen`] transport and serves the app.
 //! - [`serve`] does both.
 //! - [`client`] holds the checks a client makes before trusting a daemon with a token.
+//! - [`stream`] serves `GET /v1/stream` from an [`EventSource`] (the store, or memory).
+//! - [`hooks`] serves `POST /v1/hooks/{engine}/{event}` into a [`HookSink`].
 //!
 //! Authentication inserts an `axum::Extension<Caller>` (from `pitcrew-protocol`) into every
 //! authenticated request. Domain crates read it with `pitcrew_auth::Authenticated` or
@@ -17,15 +19,21 @@
 
 mod auth;
 pub mod client;
+pub mod hooks;
 mod host;
 mod listener;
+pub mod source;
+pub mod stream;
 
+pub use hooks::{HookEvent, HookIntake, HookSink, LogHookSink};
 pub use host::{local_host_info, local_machine_info};
 pub use listener::{Bound, Listen};
 #[cfg(windows)]
 pub use listener::{NamedPipe, PipeAddr, default_pipe_name};
 #[cfg(unix)]
 pub use listener::{SOCKET_NAME, UnixSocket};
+pub use source::{EventSource, MemorySource, StoreSource};
+pub use stream::StreamConfig;
 
 use axum::Json;
 use axum::Router;

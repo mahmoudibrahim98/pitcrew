@@ -34,13 +34,44 @@ planted by another user never receives a token:
 - Failures are `ApiError` bodies: `401 unauthorized` (none, unknown, revoked, or not `Bearer`),
   `403 forbidden` (agent on a device route), `404 not_found` (unknown route or method).
 
+## Live updates: `GET /v1/stream?since=`
+
+`stream::routes(source, StreamConfig::default())`, mounted as a **device** route.
+
+- The source is an `EventSource`: `StoreSource::new(store, log_id)` for the hub's store, or
+  `MemorySource` for tests and development. `StoreSource` takes the log id from the caller until
+  `Store::log_id()` lands (brief C-projections).
+- First frame `hello {rev, log}`; if `since < rev`, the missed events in `events` frames of at
+  most 500; then live batches, coalesced over 75 ms; `ping` every 20 s.
+- Exact resume: the pump subscribes before reading `rev`, always reads from the last revision it
+  sent, and skips announced ranges it already covered. A lagged subscription re-reads the latest
+  revision and catches up.
+- Backpressure: each client has a queue of `queue_frames` frames (default 64). A frame that
+  cannot be queued within `send_timeout` (default 10 s) disconnects the client, which resumes
+  with `since`.
+
+## Hooks: `POST /v1/hooks/{engine}/{event}`
+
+`hooks::routes(HookIntake::start(sink, capacity))`, mounted as an **agent** route.
+
+- `engine` must be an `Engine` (`claude`, `codex`, `opencode`); `event` must match
+  `[A-Za-z][A-Za-z0-9_-]{0,63}`; the body must be a JSON object of at most 1 MiB. Anything else
+  is `400 invalid`.
+- The route answers `202` at once and queues a `HookEvent` (with the `Caller`) for the
+  `HookSink`. When the queue is full the event is dropped and counted (`HookIntake::dropped`).
+- `LogHookSink` only logs; the runner (stream D) provides the real sink.
+
 ## For the composition root
 
 ```rust
 let tokens: Arc<dyn TokenStore> = Arc::new(FileTokenStore::open(&state_dir)?);
 let info = pitcrew_api::local_host_info(env!("CARGO_PKG_VERSION"), vec![HostRole::Hub, HostRole::Runner], caps);
+let source: Arc<dyn EventSource> = Arc::new(StoreSource::new(store.clone(), log_id));
+let hooks = HookIntake::start(Arc::new(LogHookSink), 1024);
 let parts = RouterParts::new()
+    .agent(pitcrew_api::hooks::routes(hooks))
     .agent(hub_work::agent_routes())    // routes marked **agent** in api-v1.md
+    .device(pitcrew_api::stream::routes(source, StreamConfig::default()))
     .device(hub_work::device_routes()); // everything else
 pitcrew_api::serve(&Listen::private_default(run_dir)?, info, tokens, parts, shutdown).await?;
 ```
