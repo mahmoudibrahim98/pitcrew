@@ -301,6 +301,57 @@ fn fresh(path: &Path, projections: bool) -> Store {
     Store::open_with(path, StoreOptions::default(), list).expect("open")
 }
 
+/// Every task's document matches its filter columns and its child rows.
+fn task_documents_agree_with_their_columns(work: &WorkService) {
+    type Row = (String, String, Option<String>, String, Vec<String>);
+    let rows: Vec<Row> = work
+        .read(|c| {
+            let mut stmt = c.prepare(
+                "SELECT t.id, t.status, t.assignee, t.doc,
+                   (SELECT json_group_array(s.id || ':' || s.text || ':' || s.done || ':' ||
+                      COALESCE(s.agent, '-')) FROM (SELECT * FROM work_subtasks s
+                      WHERE s.task = t.id ORDER BY s.position) s)
+                 FROM work_tasks t",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    let lines: String = r.get(4)?;
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        serde_json::from_str(&lines).expect("lines"),
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .expect("read");
+    assert!(rows.len() > 10);
+    for (id, status, assignee, doc, lines) in rows {
+        let task: pitcrew_protocol::model::Task = serde_json::from_str(&doc).expect("doc");
+        assert_eq!(task.id.0.to_string(), id);
+        assert_eq!(
+            serde_json::to_value(task.status).expect("status"),
+            status.as_str()
+        );
+        assert_eq!(task.assignee.map(|a| a.0.to_string()), assignee);
+        let expected: Vec<String> = task
+            .subtasks
+            .iter()
+            .map(|s| {
+                let agent = match s.source {
+                    SubtaskSource::Human => "-".to_owned(),
+                    SubtaskSource::AgentPlan { agent } => agent.0.to_string(),
+                };
+                format!("{}:{}:{}:{agent}", s.id.0, s.text, i32::from(s.done))
+            })
+            .collect();
+        assert_eq!(lines, expected, "{}", task.key);
+    }
+}
+
 #[test]
 fn rebuilding_every_projection_gives_identical_tables() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -313,6 +364,7 @@ fn rebuilding_every_projection_gives_identical_tables() {
             "{table} is empty; the workload should fill it"
         );
     }
+    task_documents_agree_with_their_columns(&work);
 
     for name in NAMES {
         work.store().rebuild(name).expect("rebuild");

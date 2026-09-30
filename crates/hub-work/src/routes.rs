@@ -20,6 +20,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request};
 use axum::http::StatusCode;
+use axum::http::header::{CONTENT_TYPE, HeaderName};
 use axum::http::request::Parts;
 use axum::routing::{get, post, put};
 use pitcrew_protocol::api::Caller;
@@ -313,14 +314,21 @@ async fn patch_workstream(
 
 // ─── Tasks ───────────────────────────────────────────────────────────────────────────────────────
 
-async fn list_tasks(Work(w): Work, Who(_): Who, params: Params) -> Reply<Vec<Task>> {
+/// The task list is sent as stored (see [`WorkService::tasks_json`]), so a long list is not
+/// decoded and encoded again.
+async fn list_tasks(
+    Work(w): Work,
+    Who(_): Who,
+    params: Params,
+) -> Result<([(HeaderName, &'static str); 1], String), WorkError> {
     let filter = TaskFilter {
         project: params.one("project")?,
         workstream: params.one("workstream")?,
         assignee: params.one("assignee")?,
         statuses: params.all("status")?,
     };
-    Ok(Json(blocking(w, move |w| w.tasks(&filter)).await?))
+    let body = blocking(w, move |w| w.tasks_json(&filter)).await?;
+    Ok(([(CONTENT_TYPE, "application/json")], body))
 }
 
 async fn get_task(Work(w): Work, Who(_): Who, Segments(id): Segments<String>) -> Reply<Task> {

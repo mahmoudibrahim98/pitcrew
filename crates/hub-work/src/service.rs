@@ -220,6 +220,16 @@ impl WorkService {
         self.read(|c| query::tasks(c, filter))
     }
 
+    /// The same list as [`WorkService::tasks`], already as a JSON array (what `GET /v1/tasks`
+    /// sends), built from the stored documents without decoding them.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub fn tasks_json(&self, filter: &TaskFilter) -> Result<String> {
+        self.read(|c| query::tasks_json(c, filter))
+    }
+
     /// One task, by id or key; `not_found` if unknown.
     ///
     /// # Errors

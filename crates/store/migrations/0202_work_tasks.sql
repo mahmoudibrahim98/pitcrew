@@ -1,22 +1,20 @@
 -- 0202_work_tasks: tasks, their subtasks, dependencies and labels.
 -- Owned by stream E; filled by the `work.tasks` projection (crates/hub-work).
+--
+-- `doc` is the whole task as the API returns it (the protocol's `Task` as JSON), so a list is one
+-- indexed query. The other columns are what lists filter and sort on, and the child tables index
+-- subtasks, dependencies and labels one by one. The projection keeps all of them in step.
 
 CREATE TABLE IF NOT EXISTS work_tasks (
   id          TEXT    PRIMARY KEY,
-  rev         INTEGER NOT NULL,
+  rev         INTEGER NOT NULL,  -- the revision that created it; lists are in this order
   project     TEXT    NOT NULL,
   key_prefix  TEXT    NOT NULL,  -- the project key in the task key: PAP in PAP-4
   number      INTEGER NOT NULL,  -- the number in the task key: 4 in PAP-4
   workstream  TEXT,
-  title       TEXT    NOT NULL,
-  description TEXT    NOT NULL,
   status      TEXT    NOT NULL,
-  priority    TEXT    NOT NULL,
   assignee    TEXT,
-  start       TEXT,
-  due         TEXT,
-  source      TEXT,              -- ExternalRef as JSON
-  accept_auto INTEGER NOT NULL
+  doc         TEXT    NOT NULL   -- Task as JSON
 ) STRICT;
 -- Keys are allocated per project and never shared.
 CREATE UNIQUE INDEX IF NOT EXISTS work_tasks_by_key ON work_tasks (key_prefix, number);
@@ -38,6 +36,7 @@ CREATE TABLE IF NOT EXISTS work_subtasks (
   agent    TEXT,
   PRIMARY KEY (task, position)
 ) STRICT;
+CREATE INDEX IF NOT EXISTS work_subtasks_by_agent ON work_subtasks (agent);
 
 -- `task` is blocked by `blocked_by`.
 CREATE TABLE IF NOT EXISTS work_task_deps (

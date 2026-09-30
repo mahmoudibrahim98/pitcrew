@@ -12,7 +12,7 @@ use pitcrew_protocol::ids::{
 };
 use pitcrew_protocol::model::{
     Ask, AskState, Brief, BriefTarget, Date, Dispatch, Location, Machine, Member, Persona, Project,
-    Session, SessionState, Subtask, SubtaskSource, Task, TaskStatus, Team, Workstream,
+    Session, SessionState, Task, TaskStatus, Team, Workstream,
 };
 use pitcrew_store::sql::types::{Type, Value};
 use pitcrew_store::sql::{self, Connection, OptionalExtension, Row, params, params_from_iter};
@@ -105,8 +105,10 @@ impl Where {
         }
     }
 
-    fn any_of(&mut self, column: &str, values: Vec<String>) {
-        if values.is_empty() {
+    fn any_of(&mut self, column: &str, mut values: Vec<String>) {
+        if values.len() <= 1 {
+            // `=` rather than a one-value `IN`, so the planner treats both alike.
+            self.eq(column, values.pop());
             return;
         }
         let mut marks = Vec::with_capacity(values.len());
@@ -390,98 +392,60 @@ pub fn workstream(conn: &Connection, id: &WorkstreamId) -> Result<Option<Workstr
 
 // ─── Tasks ───────────────────────────────────────────────────────────────────────────────────────
 
-const TASK_COLS: &str = "t.id, t.project, t.key_prefix, t.number, t.workstream, t.title, \
-                         t.description, t.status, t.priority, t.assignee, t.start, t.due, \
-                         t.source, t.accept_auto";
-
-fn task_row(r: &Row<'_>) -> sql::Result<(String, Task)> {
-    let key = TaskKey::new(project_key(r, 2)?, r.get(3)?).map_err(|e| conversion(3, e))?;
-    Ok((
-        r.get(0)?,
-        Task {
-            id: col(r, 0)?,
-            key,
-            project: col(r, 1)?,
-            workstream: opt_col(r, 4)?,
-            title: r.get(5)?,
-            description: r.get(6)?,
-            status: enum_col(r, 7)?,
-            priority: enum_col(r, 8)?,
-            assignee: opt_col(r, 9)?,
-            labels: Vec::new(),
-            start: opt_date(r, 10)?,
-            due: opt_date(r, 11)?,
-            blocked_by: Vec::new(),
-            source: opt_json_col(r, 12)?,
-            accept_auto: r.get(13)?,
-            subtasks: Vec::new(),
-        },
-    ))
-}
-
-fn subtask_row(r: &Row<'_>) -> sql::Result<Subtask> {
-    Ok(Subtask {
-        id: col(r, 1)?,
-        text: r.get(2)?,
-        done: r.get(3)?,
-        source: match opt_col::<MemberId>(r, 4)? {
-            None => SubtaskSource::Human,
-            Some(agent) => SubtaskSource::AgentPlan { agent },
-        },
-    })
-}
-
-/// Tasks matching `filter` (a WHERE over `work_tasks t`), with their subtasks, dependencies and
-/// labels, in creation order. Four queries however many tasks match.
-fn load_tasks(conn: &Connection, filter: &Where) -> Result<Vec<Task>> {
-    let where_sql = filter.sql();
-    let join = |child: &str, cols: &str| {
-        format!(
-            "SELECT c.task, {cols} FROM {child} c JOIN work_tasks t ON t.id = c.task {where_sql}
-             ORDER BY c.task, c.position"
-        )
-    };
-    let mut subtasks = children(
-        conn,
-        &join("work_subtasks", "c.id, c.text, c.done, c.agent"),
-        &filter.params,
-        subtask_row,
-    )?;
-    let mut deps = children(
-        conn,
-        &join("work_task_deps", "c.blocked_by"),
-        &filter.params,
-        |r| col::<TaskId>(r, 1),
-    )?;
-    let mut labels = children(
-        conn,
-        &join("work_task_labels", "c.label"),
-        &filter.params,
-        |r| r.get::<_, String>(1),
-    )?;
+/// Calls `each` with the JSON document of every task matching `filter` (a WHERE over
+/// `work_tasks t`), in creation order. One indexed query, however many tasks match.
+fn task_docs(
+    conn: &Connection,
+    filter: &Where,
+    mut each: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {TASK_COLS} FROM work_tasks t {where_sql} ORDER BY t.rev, t.id"
+        "SELECT t.doc FROM work_tasks t {} ORDER BY t.rev",
+        filter.sql()
     ))?;
-    let rows = stmt.query_map(params_from_iter(filter.params.iter()), task_row)?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (key, mut task) = row?;
-        task.subtasks = subtasks.remove(&key).unwrap_or_default();
-        task.blocked_by = deps.remove(&key).unwrap_or_default();
-        task.labels = labels.remove(&key).unwrap_or_default();
-        out.push(task);
+    let mut rows = stmt.query(params_from_iter(filter.params.iter()))?;
+    while let Some(row) = rows.next()? {
+        each(row.get_ref(0)?.as_str().map_err(|e| conversion(0, e))?)?;
     }
-    Ok(out)
+    Ok(())
 }
 
-/// Tasks matching `filter`, in creation order.
-pub fn tasks(conn: &Connection, filter: &TaskFilter) -> Result<Vec<Task>> {
+fn task_where(filter: &TaskFilter) -> Result<Where> {
     let mut w = Where::default();
     w.eq("t.project", filter.project.as_ref().map(IdText::text));
     w.eq("t.workstream", filter.workstream.as_ref().map(IdText::text));
     w.eq("t.assignee", filter.assignee.as_ref().map(IdText::text));
     w.any_of("t.status", texts(&filter.statuses)?);
-    load_tasks(conn, &w)
+    Ok(w)
+}
+
+fn load_tasks(conn: &Connection, filter: &Where) -> Result<Vec<Task>> {
+    let mut out = Vec::new();
+    task_docs(conn, filter, |doc| {
+        out.push(serde_json::from_str(doc)?);
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Tasks matching `filter`, in creation order.
+pub fn tasks(conn: &Connection, filter: &TaskFilter) -> Result<Vec<Task>> {
+    load_tasks(conn, &task_where(filter)?)
+}
+
+/// Tasks matching `filter`, in creation order, as a JSON array: exactly what serializing
+/// [`tasks`] gives, without decoding and re-encoding each task. For lists served as they are.
+pub fn tasks_json(conn: &Connection, filter: &TaskFilter) -> Result<String> {
+    let mut out = String::from("[");
+    task_docs(conn, &task_where(filter)?, |doc| {
+        if out.len() > 1 {
+            out.push(',');
+        }
+        out.push_str(doc);
+        Ok(())
+    })?;
+    out.push(']');
+    Ok(out)
 }
 
 /// One task, by id or key.
