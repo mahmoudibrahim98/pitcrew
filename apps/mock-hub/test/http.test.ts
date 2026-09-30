@@ -57,6 +57,21 @@ describe('host info and auth', () => {
       assert.equal(res.body.code, 'not_found');
       assert.equal(typeof res.body.message, 'string');
     }));
+
+  it('accepts hook events from agents and rejects malformed ones', () =>
+    withServer(async (server) => {
+      const ok = await call(server, 'POST', '/v1/hooks/claude/Stop', {
+        token: AGENT,
+        json: { session_id: 'abc', hook_event_name: 'Stop' },
+      });
+      assert.equal(ok.status, 202);
+      const engine = await call<ApiError>(server, 'POST', '/v1/hooks/emacs/Stop', { token: AGENT, json: {} });
+      assert.equal(engine.status, 400);
+      const event = await call<ApiError>(server, 'POST', '/v1/hooks/codex/%3Bbad', { token: AGENT, json: {} });
+      assert.equal(event.status, 400);
+      const noToken = await call<ApiError>(server, 'POST', '/v1/hooks/claude/Stop', { json: {} });
+      assert.equal(noToken.status, 401);
+    }));
 });
 
 describe('tasks', () => {

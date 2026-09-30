@@ -146,14 +146,21 @@ revisions of the first and last returned events (both 0 for an empty page); with
 need not be contiguous. `at_start` is true when no older matching event exists. Pass `from_rev`
 as `before` for the previous page. Default limit 100, max 500.
 
+### Hooks
+
+| Method and path | Body → response | Notes |
+|---|---|---|
+| `POST /v1/hooks/{engine}/{event}` | the CLI's hook payload (a JSON object, ≤ 1 MiB) → 202 | Sent by `pitcrew hook`. `engine` is an `Engine`; `event` is the CLI's own event name (e.g. `SessionStart`, `Stop`), matching `[A-Za-z][A-Za-z0-9_-]{0,63}`. The hub uses it for session state and never blocks the caller. **agent** |
+
 ## Live updates: `GET /v1/stream?since=<rev>` (WebSocket, device tokens)
 
 - Text frames, each one `StreamFrame` JSON.
-- The first frame is `{"type":"hello","rev":N}`. If `since` is given and older than `N`, the
-  server then sends the missed events as `events` frames before live ones. A client that
+- The first frame is `{"type":"hello","rev":N,"log":"<id>"}`. If `since` is given and older than
+  `N`, the server then sends the missed events as `events` frames before live ones. A client that
   reconnects with its last `to_rev` receives exactly what it missed.
-- **If `since` is newer than `N`**, the hub's history was reset (e.g. a restarted mock): the
-  client must drop its cached state and refetch.
+- **`log` identifies the hub's event log.** It is created with the store and never changes.
+  Revisions only count within one log: if `log` differs from the one the client's cache came
+  from, or `since` is newer than `N`, the client must drop its cached state and refetch.
 - `events` frames carry `from_rev..=to_rev` and the events in order. Small changes are batched
   over 50–100 ms.
 - `{"type":"ping","at":…}` every 20 s. A client that sees nothing for 60 s reconnects.
