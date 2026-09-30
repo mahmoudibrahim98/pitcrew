@@ -179,8 +179,10 @@ export interface LiveOptions {
    * to tell a rejected token from an unreachable hub; a WebSocket failure does not say which.
    */
   probe?: () => Promise<unknown>;
-  /** Failures before probing. */
+  /** Failures before the first probe. */
   probeAfter?: number;
+  /** Failures between later probes in the same outage, in case the reason changes. */
+  probeEvery?: number;
 }
 
 export interface Live {
@@ -199,23 +201,42 @@ export function createLive(options: LiveOptions): Live {
     options.windowMs === undefined ? {} : { windowMs: options.windowMs },
   );
   const probeAfter = options.probeAfter ?? 3;
+  const probeEvery = options.probeEvery ?? 5;
+  let probing = false;
+  /** The last warning logged in this outage; each reason is logged once. */
+  let warned: string | undefined;
 
   async function diagnose(): Promise<void> {
-    let problem: LiveProblem = 'unreachable';
+    if (probing) return;
+    probing = true;
+    // Without a probe, all we know is that the stream cannot connect.
+    let problem: LiveProblem | undefined = 'unreachable';
     try {
-      await options.probe?.();
-    } catch (error) {
-      if (error instanceof ApiError && (error.code === 'unauthorized' || error.code === 'forbidden')) {
-        problem = 'unauthorized';
+      if (options.probe !== undefined) {
+        await options.probe();
+        // The hub answers and accepts the token; only the stream fails.
+        problem = undefined;
       }
+    } catch (error) {
+      problem =
+        error instanceof ApiError && (error.code === 'unauthorized' || error.code === 'forbidden')
+          ? 'unauthorized'
+          : 'unreachable';
+    } finally {
+      probing = false;
     }
-    if (store.getState().status === 'live') return;
+    if (store.getState().status !== 'reconnecting') return;
     store.setState({ problem });
-    console.warn(
+    const warning =
       problem === 'unauthorized'
         ? `pitcrew: ${options.baseUrl} rejected the token; the stream keeps retrying.`
-        : `pitcrew: cannot reach ${options.baseUrl}; the stream keeps retrying.`,
-    );
+        : problem === 'unreachable'
+          ? `pitcrew: cannot reach ${options.baseUrl}; the stream keeps retrying.`
+          : `pitcrew: ${options.baseUrl} answers, but its stream keeps failing; retrying.`;
+    if (warning !== warned) {
+      warned = warning;
+      console.warn(warning);
+    }
   }
 
   const stream = new StreamClient({
@@ -245,6 +266,7 @@ export function createLive(options: LiveOptions): Live {
         synced: was.synced || status === 'live',
         problem: status === 'live' ? undefined : was.problem,
       });
+      if (status === 'live') warned = undefined;
       if (status === 'live' && was.status === 'reconnecting') {
         void queryClient.refetchQueries({
           type: 'active',
@@ -253,8 +275,9 @@ export function createLive(options: LiveOptions): Live {
       }
     },
     onFailure(attempts) {
-      // Once per outage: the count starts over only after a stable connection.
-      if (attempts === probeAfter) void diagnose();
+      // `attempts` starts over only after a stable connection, so this counts within an outage.
+      const since = attempts - probeAfter;
+      if (since === 0 || (since > 0 && since % probeEvery === 0)) void diagnose();
     },
   });
 

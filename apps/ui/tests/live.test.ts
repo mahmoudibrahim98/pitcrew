@@ -4,7 +4,7 @@ import { ApiError, createApi, type Api } from '../src/data/api.ts';
 import { keys } from '../src/data/keys.ts';
 import { createLive, Invalidator, type Live } from '../src/data/live.ts';
 import type { EventBody, Session, Task } from '../src/data/types.ts';
-import { DEVICE_TOKEN, fakeSockets, startServer, type RunningServer } from './helpers.ts';
+import { DEVICE_TOKEN, fakeSockets, startServer, type FakeSocket, type RunningServer } from './helpers.ts';
 
 describe('live cache against the mock hub', () => {
   let hub: RunningServer;
@@ -503,5 +503,46 @@ describe('live cache with a scripted stream', () => {
     sockets.at(-1)?.send({ type: 'hello', rev: 1, log: 'LOG-A' });
     expect(live.store.getState().problem).toBeUndefined();
     warn.mockRestore();
+  });
+
+  async function fail(sockets: FakeSocket[], times: number): Promise<void> {
+    for (let i = 0; i < times; i++) {
+      const count = sockets.length;
+      sockets.at(-1)?.drop();
+      await vi.waitFor(() => expect(sockets.length).toBe(count + 1));
+    }
+  }
+
+  it('does not call the hub unreachable when the probe gets through', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const probe = vi.fn(async () => ({ member: 'M' }));
+    const { live, sockets } = setup({ probe });
+    await fail(sockets, 2);
+    await vi.waitFor(() => expect(warn).toHaveBeenCalledTimes(1));
+    expect(warn.mock.calls[0]?.[0]).toContain('answers, but its stream keeps failing');
+    expect(live.store.getState().problem).toBeUndefined();
+  });
+
+  it('probes again every five failures, and says so when the reason changes', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let answer = new ApiError('unavailable', 'Cannot reach the hub', 0);
+    const probe = vi.fn(async () => {
+      throw answer;
+    });
+    const { live, sockets } = setup({ probe });
+    await fail(sockets, 2);
+    await vi.waitFor(() => expect(live.store.getState().problem).toBe('unreachable'));
+
+    answer = new ApiError('unauthorized', 'Unknown token', 401);
+    await fail(sockets, 4);
+    expect(probe).toHaveBeenCalledTimes(1);
+    await fail(sockets, 1); // five after the first probe
+    await vi.waitFor(() => expect(live.store.getState().problem).toBe('unauthorized'));
+    expect(probe).toHaveBeenCalledTimes(2);
+
+    await fail(sockets, 5); // the same reason again: probed, not logged again
+    await vi.waitFor(() => expect(probe).toHaveBeenCalledTimes(3));
+    expect(live.store.getState().problem).toBe('unauthorized');
+    expect(warn).toHaveBeenCalledTimes(2);
   });
 });
