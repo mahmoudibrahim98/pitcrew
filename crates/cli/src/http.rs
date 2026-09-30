@@ -6,8 +6,8 @@ use std::io::{self, Read, Write};
 /// Longest response head accepted.
 const MAX_HEAD: usize = 64 * 1024;
 
-/// A request to send.
-#[derive(Clone, Copy, Debug)]
+/// A request to send. Its `Debug` output never shows the token.
+#[derive(Clone, Copy)]
 pub struct Request<'a> {
     /// `GET`, `POST`, …
     pub method: &'a str,
@@ -19,6 +19,18 @@ pub struct Request<'a> {
     pub token: Option<&'a str>,
     /// A JSON body.
     pub body: Option<&'a [u8]>,
+}
+
+impl std::fmt::Debug for Request<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Request")
+            .field("method", &self.method)
+            .field("target", &self.target)
+            .field("host", &self.host)
+            .field("token", &self.token.map(|_| "<redacted>"))
+            .field("body_len", &self.body.map(<[u8]>::len))
+            .finish()
+    }
 }
 
 impl Request<'_> {
@@ -82,16 +94,17 @@ pub fn exchange<S: Read + Write>(
     read_response(stream, request.method == "HEAD", max_body)
 }
 
-/// Reads one response, skipping any interim (1xx) ones.
+/// Reads one response, skipping any interim (1xx) ones. Besides the body cap, everything read
+/// (heads, interim responses, chunk lines, trailers) counts against `max_body + MAX_HEAD`.
 ///
 /// # Errors
-/// I/O errors, a malformed response, or a body over `max_body`.
+/// I/O errors, a malformed response, a body over `max_body`, or more bytes than the total cap.
 pub fn read_response<R: Read>(
     stream: &mut R,
     head_only: bool,
     max_body: usize,
 ) -> io::Result<Response> {
-    let mut reader = Buffered::new(stream);
+    let mut reader = Buffered::new(stream, max_body.saturating_add(MAX_HEAD));
     loop {
         let head = reader.read_head()?;
         let parsed = parse_head(&head)?;
@@ -178,71 +191,95 @@ fn parse_head(head: &[u8]) -> io::Result<Head> {
     })
 }
 
-/// A small read buffer over the stream. The end of the stream, including a broken pipe (how a
-/// Windows pipe ends), reads as 0.
+/// A small read buffer over the stream that reads at most `limit` bytes in all. The end of the
+/// stream, including a broken pipe (how a Windows pipe ends), reads as 0.
 struct Buffered<'a, R> {
     inner: &'a mut R,
+    /// Storage; only `pos..end` holds unconsumed bytes. It grows, and is never cleared, so a
+    /// server sending one byte at a time costs no more than one sending many.
     buf: Vec<u8>,
     pos: usize,
+    end: usize,
+    limit: usize,
+    /// How many more bytes may be read from the stream.
+    remaining: usize,
 }
 
 impl<'a, R: Read> Buffered<'a, R> {
-    fn new(inner: &'a mut R) -> Self {
+    fn new(inner: &'a mut R, limit: usize) -> Self {
         Self {
             inner,
-            buf: Vec::with_capacity(8192),
+            buf: Vec::new(),
             pos: 0,
+            end: 0,
+            limit,
+            remaining: limit,
         }
     }
 
-    /// Reads more into the buffer. Returns how many bytes came.
+    /// Moves the unconsumed bytes to the front and reads more after them. Returns how many
+    /// bytes came. With the budget spent it still reads one byte, to tell the end of the stream
+    /// from a response that is too large.
     fn fill(&mut self) -> io::Result<usize> {
-        if self.pos == self.buf.len() {
-            self.buf.clear();
+        if self.pos > 0 {
+            self.buf.copy_within(self.pos..self.end, 0);
+            self.end -= self.pos;
             self.pos = 0;
         }
-        let start = self.buf.len();
-        self.buf.resize(start + 8192, 0);
+        let want = self.remaining.clamp(1, 8192);
+        if self.buf.len() < self.end + want {
+            self.buf.resize(self.end + want, 0);
+        }
         let n = loop {
-            match self.inner.read(&mut self.buf[start..]) {
-                Ok(n) => break n,
+            match self.inner.read(&mut self.buf[self.end..self.end + want]) {
+                Ok(n) => break n.min(want),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) if e.kind() == io::ErrorKind::BrokenPipe => break 0,
-                Err(e) => {
-                    self.buf.truncate(start);
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
         };
-        self.buf.truncate(start + n);
+        self.end += n;
+        self.remaining = self
+            .remaining
+            .checked_sub(n)
+            .ok_or_else(|| too_large(self.limit))?;
         Ok(n)
     }
 
     fn pending(&self) -> &[u8] {
-        &self.buf[self.pos..]
+        &self.buf[self.pos..self.end]
     }
 
-    /// Up to and including the blank line; returned without it.
-    fn read_head(&mut self) -> io::Result<Vec<u8>> {
+    /// The bytes up to `delimiter` (consumed with it), at most `max` of them. The search resumes
+    /// where the last one stopped, so a line that trickles in byte by byte stays linear.
+    fn read_until(&mut self, delimiter: &[u8], max: usize, what: &str) -> io::Result<Vec<u8>> {
         let mut searched = 0;
         loop {
-            if let Some(i) = find(&self.pending()[searched..], b"\r\n\r\n") {
+            if let Some(i) = find(&self.pending()[searched..], delimiter) {
                 let end = self.pos + searched + i;
-                let head = self.buf[self.pos..end].to_vec();
-                self.pos = end + 4;
-                return Ok(head);
+                let found = self.buf[self.pos..end].to_vec();
+                self.pos = end + delimiter.len();
+                return Ok(found);
             }
-            searched = self.pending().len().saturating_sub(3);
-            if self.pending().len() > MAX_HEAD {
-                return Err(malformed("the head is too long"));
+            searched = self
+                .pending()
+                .len()
+                .saturating_sub(delimiter.len().saturating_sub(1));
+            if self.pending().len() > max {
+                return Err(malformed(&format!("{what} is too long")));
             }
             if self.fill()? == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "the daemon closed the connection without answering",
+                    "the response ended early",
                 ));
             }
         }
+    }
+
+    /// Up to and including the blank line; returned without it.
+    fn read_head(&mut self) -> io::Result<Vec<u8>> {
+        self.read_until(b"\r\n\r\n", MAX_HEAD, "the head")
     }
 
     fn read_exact_vec(&mut self, len: usize) -> io::Result<Vec<u8>> {
@@ -265,7 +302,7 @@ impl<'a, R: Read> Buffered<'a, R> {
         let mut out = Vec::new();
         loop {
             out.extend_from_slice(self.pending());
-            self.pos = self.buf.len();
+            self.pos = self.end;
             if out.len() > max {
                 return Err(too_large(max));
             }
@@ -276,22 +313,7 @@ impl<'a, R: Read> Buffered<'a, R> {
     }
 
     fn read_line(&mut self) -> io::Result<Vec<u8>> {
-        loop {
-            if let Some(i) = find(self.pending(), b"\r\n") {
-                let line = self.buf[self.pos..self.pos + i].to_vec();
-                self.pos += i + 2;
-                return Ok(line);
-            }
-            if self.pending().len() > MAX_HEAD {
-                return Err(malformed("a chunk line is too long"));
-            }
-            if self.fill()? == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "the response ended early",
-                ));
-            }
-        }
+        self.read_until(b"\r\n", MAX_HEAD, "a chunk line")
     }
 
     fn read_chunked(&mut self, max: usize) -> io::Result<Vec<u8>> {
@@ -310,7 +332,8 @@ impl<'a, R: Read> Buffered<'a, R> {
                 while !self.read_line()?.is_empty() {}
                 return Ok(out);
             }
-            if out.len() + size > max {
+            // `out.len() <= max` always holds, so this cannot overflow.
+            if size > max - out.len() {
                 return Err(too_large(max));
             }
             out.extend(self.read_exact_vec(size)?);
@@ -400,6 +423,118 @@ mod tests {
         assert!(read(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nshort").is_err());
         let big = [b"HTTP/1.1 200 OK\r\n\r\n".as_slice(), &[b'x'; 2000]].concat();
         assert!(read(&big).is_err());
+    }
+
+    /// Sends `start`, then `repeat` forever, counting what it hands out.
+    struct Endless {
+        bytes: Vec<u8>,
+        start: usize,
+        pos: usize,
+        served: usize,
+    }
+
+    impl Endless {
+        fn new(start: &[u8], repeat: &[u8]) -> Self {
+            Self {
+                bytes: [start, repeat].concat(),
+                start: start.len(),
+                pos: 0,
+                served: 0,
+            }
+        }
+    }
+
+    impl Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = buf.len().min(self.bytes.len() - self.pos);
+            buf[..n].copy_from_slice(&self.bytes[self.pos..self.pos + n]);
+            self.pos += n;
+            if self.pos == self.bytes.len() {
+                self.pos = self.start;
+            }
+            self.served += n;
+            Ok(n)
+        }
+    }
+
+    /// Reads with `max_body` 1024, so at most 1024 + 64 KiB (+1 to see the end) in all.
+    fn read_endless(stream: &mut Endless) -> io::Error {
+        let err = read_response(stream, false, 1024).unwrap_err();
+        assert!(
+            stream.served <= 1024 + MAX_HEAD + 1,
+            "read {}",
+            stream.served
+        );
+        err
+    }
+
+    #[test]
+    fn a_huge_chunk_size_is_refused_without_overflow() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\nffffffffffffffff\r\nyyyy";
+        let err = read(raw).unwrap_err();
+        assert!(err.to_string().contains("larger than"), "{err}");
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1ffffffffffffffff\r\n";
+        assert!(read(raw).is_err());
+    }
+
+    #[test]
+    fn everything_read_counts_against_the_cap() {
+        // Tiny chunks with long extensions: the body stays small, the response does not.
+        let ext = [b"1;e=".as_slice(), &[b'a'; 1000], b"\r\nx\r\n"].concat();
+        let mut stream = Endless::new(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n",
+            &ext,
+        );
+        let err = read_endless(&mut stream);
+        assert!(err.to_string().contains("larger than"), "{err}");
+
+        // Interim responses that never end.
+        let mut stream = Endless::new(b"", b"HTTP/1.1 100 Continue\r\n\r\n");
+        let err = read_endless(&mut stream);
+        assert!(err.to_string().contains("larger than"), "{err}");
+
+        // Trailers that never end.
+        let mut stream = Endless::new(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n",
+            b"X-T: 1\r\n",
+        );
+        read_endless(&mut stream);
+
+        // One endless header line.
+        let mut stream = Endless::new(b"HTTP/1.1 200 OK\r\nX: ", b"a");
+        read_endless(&mut stream);
+    }
+
+    #[test]
+    fn chunk_lines_split_across_reads() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1a;name=value\r\nabcdefghijklmnopqrstuvwxyz\r\n0\r\n\r\n";
+        let r = read_response(&mut Trickle(raw), false, 1024).unwrap();
+        assert_eq!(r.body, b"abcdefghijklmnopqrstuvwxyz");
+    }
+
+    #[test]
+    fn a_response_exactly_at_the_cap_is_fine() {
+        let head = b"HTTP/1.1 200 OK\r\n\r\n";
+        let raw = [head.as_slice(), &[b'x'; 1024][..]].concat();
+        let limit = head.len() + 1024;
+        let mut reader = &raw[..];
+        let mut buffered = Buffered::new(&mut reader, limit);
+        buffered.read_head().unwrap();
+        assert_eq!(buffered.read_to_end_capped(1024).unwrap().len(), 1024);
+    }
+
+    #[test]
+    fn debug_never_shows_the_token() {
+        let req = Request {
+            method: "GET",
+            target: "/v1/me",
+            host: "localhost",
+            token: Some("pca_secret"),
+            body: Some(b"{}"),
+        };
+        let shown = format!("{req:?}");
+        assert!(!shown.contains("pca_secret"), "{shown}");
+        assert!(shown.contains(r#"token: Some("<redacted>")"#), "{shown}");
     }
 
     #[test]
