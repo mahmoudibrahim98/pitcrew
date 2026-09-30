@@ -14,7 +14,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [B-control-hardening](B-control-hardening.md) | B · Runtime | `s/B/control-hardening` | Opus-class | In review: fixes requested |
 | [C-open-and-log](C-open-and-log.md) | C · Store | `s/C/open-and-log` | Sonnet-class | **Merged** |
 | [C-store-hardening](C-store-hardening.md) | C · Store | `s/C/store-hardening` | Sonnet-class | **Merged** |
-| [C-projections](C-projections.md) | C · Store | `s/C/projections` | Sonnet-class | In review: small fixes |
+| [C-projections](C-projections.md) | C · Store | `s/C/projections` | Sonnet-class | **Merged** |
 | [E-work-core](E-work-core.md) | E · Work model | `s/E/work-core` | Opus-class | Ready (based on C-projections) |
 | [D-watch-and-index](D-watch-and-index.md) | D · Runner | `s/D/watch-and-index` | Opus-class | In review: fixes in progress |
 | [H-listener-and-tokens](H-listener-and-tokens.md) | H · API and auth | `s/H/listener-and-tokens` | Opus-class | **Merged** |
@@ -31,6 +31,12 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [P-bench-and-release](P-bench-and-release.md) | P · Packaging | `s/P/bench-and-release` | Sonnet-class | In progress |
 | [Q-threat-model-and-fuzz](Q-threat-model-and-fuzz.md) | Q · Security | `s/Q/threat-model-and-fuzz` | Opus-class | In progress |
 
+| [A-scan](A-scan.md) | A · Ingest | `s/A/scan` | Sonnet-class | Ready (after opencode-adapter merges) |
+| [D-hub-link](D-hub-link.md) | D · Runner | `s/D/hub-link` | Opus-class | Ready (after watch-and-index merges) |
+| [F-briefs-and-office](F-briefs-and-office.md) | F · Recap | `s/F/briefs-and-office` | Opus-class | Ready (after activity-blocks merges) |
+| [I-hook-install](I-hook-install.md) | I · CLI and hooks | `s/I/hook-install` | Sonnet-class | Ready (after cli-and-hooks merges) |
+| [J-deploy](J-deploy.md) | J · Remote and HPC | `s/J/deploy` | Opus-class | Ready (after ssh-connection merges) |
+| [O-onboarding-components](O-onboarding-components.md) | O · Onboarding | `s/O/onboarding-components` | Sonnet-class | In progress (based on L-shell) |
 The branch name matters: CI's path guard reads the stream from it (`s/<stream>/<topic>`). The
 integrator adds new briefs here as streams progress, and marks them done when merged.
 
