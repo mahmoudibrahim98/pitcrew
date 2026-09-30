@@ -8,6 +8,7 @@ import { LAYOUTS, useWorkspaceId } from '../layout.ts';
 import { paths } from '../paths.ts';
 import { lastPath, storedLayout } from '../store.ts';
 import { NotFoundPage } from './not-found.tsx';
+import { LOADING, Page } from './page.tsx';
 
 /** Replaces the location with `href` (a path with its search). */
 function Redirect({ href }: { href: string }) {
@@ -41,7 +42,7 @@ export function OpenWorkstream() {
   const ws = useWorkspaceId();
   const { workstream: id }: { workstream?: string } = useParams({ strict: false });
   const workstreams = useWorkstreams().data;
-  if (workstreams === undefined) return null;
+  if (workstreams === undefined) return <Page title={LOADING} placeholder={false} />;
   const workstream = workstreams.find((w) => w.id === id);
   if (workstream === undefined) return <NotFoundPage />;
   return <Redirect href={paths.workstream(ws, workstream.project, workstream.id)} />;

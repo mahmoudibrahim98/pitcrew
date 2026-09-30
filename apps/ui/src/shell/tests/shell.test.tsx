@@ -2,14 +2,16 @@
 // @vitest-environment-options {"url": "http://localhost:5173/"}
 
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import type { QueryClient } from '@tanstack/react-query';
 import { createMemoryHistory, createRoute, RouterProvider } from '@tanstack/react-router';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { createApi } from '../src/data/api.ts';
-import { createQueryClient, DataProvider } from '../src/data/provider.tsx';
-import { defineFeature, type Feature } from '../src/shell/feature.ts';
-import { createAppRouter } from '../src/shell/routes.tsx';
-import { initialShellState, useShell } from '../src/shell/store.ts';
-import { freePort, spawnHub, type HubProcess } from './hub-process.ts';
+import { freePort, spawnHub, type HubProcess } from '../../../tests/hub-process.ts';
+import { createApi } from '../../data/api.ts';
+import { createQueryClient, DataProvider } from '../../data/provider.tsx';
+import type { SocketFactory } from '../../data/stream.ts';
+import { defineFeature, type Feature } from '../feature.ts';
+import { createAppRouter } from '../routes.tsx';
+import { initialShellState, useShell } from '../store.ts';
 
 const TOKEN = 'dev-device-token';
 const WORKSPACE = '01JB000000000000000WSP0001';
@@ -24,22 +26,36 @@ afterAll(async () => {
   await hub.close();
 });
 
-afterEach(() => {
+let queryClient: QueryClient | undefined;
+
+afterEach(async () => {
   cleanup();
+  // Abort fetches still in flight, so none is cut off when the hub stops.
+  await queryClient?.cancelQueries();
+  queryClient?.clear();
   localStorage.clear();
   useShell.setState(initialShellState);
 });
 
-function renderApp(features: Feature[], path = '/') {
+function renderApp(features: Feature[], path = '/', socket?: SocketFactory) {
   const router = createAppRouter(features, { history: createMemoryHistory({ initialEntries: [path] }) });
   const api = createApi({ baseUrl: hub.url, token: TOKEN });
+  queryClient = createQueryClient();
   render(
-    <DataProvider api={api} queryClient={createQueryClient()} token={TOKEN}>
+    <DataProvider
+      api={api}
+      queryClient={queryClient}
+      token={TOKEN}
+      {...(socket === undefined ? {} : { socket })}
+    >
       <RouterProvider router={router} />
     </DataProvider>,
   );
   return router;
 }
+
+/** A stream that never says hello, so every live query stays loading. */
+const silentStream: SocketFactory = () => ({ onmessage: null, onclose: null, onerror: null, close: () => undefined });
 
 const sidebar = () => screen.getByRole('complementary', { name: 'Sidebar' });
 
@@ -136,6 +152,11 @@ describe('feature registration', () => {
     expect(router.state.location.pathname).toBe(
       `/w/${WORKSPACE}/projects/01JB000000000000000PRJ0001/workstreams/01JB000000000000000WST0002`,
     );
+  });
+
+  it('shows the loading page while a workstream known only by id loads', async () => {
+    renderApp([], `/w/${WORKSPACE}/workstreams/01JB000000000000000WST0002`, silentStream);
+    await screen.findByRole('heading', { level: 1, name: 'Loading…' }, { timeout: 8_000 });
   });
 
   it('shows a not-found page inside the frame for unknown paths', async () => {
