@@ -405,6 +405,42 @@ fn discovery_finds_sessions_and_subagents() {
     );
 }
 
+/// Links below `projects/` are not followed out of it. Unix only: creating links on Windows can
+/// need privileges.
+#[cfg(unix)]
+#[test]
+fn discovery_does_not_follow_links_out_of_the_projects_root() {
+    use std::os::unix::fs::symlink;
+    let line = prompt("hi", "2026-01-01T00:00:00Z") + "\n";
+    let outside = tempfile::tempdir().expect("tempdir");
+    let far = outside.path().join("-far-proj");
+    fs::create_dir_all(far.join("sess-9").join("subagents")).expect("mkdir");
+    fs::write(far.join("sess-9.jsonl"), &line).expect("write");
+    fs::write(far.join("sess-9/subagents/agent-a.jsonl"), &line).expect("write");
+
+    let home = tempfile::tempdir().expect("tempdir");
+    let project = home.path().join("projects").join("-w-proj");
+    fs::create_dir_all(project.join("sess-2")).expect("mkdir");
+    fs::write(project.join("sess-1.jsonl"), &line).expect("write");
+    // A linked project folder, a linked transcript, a linked session folder and a linked
+    // `subagents` folder, all pointing outside.
+    symlink(&far, home.path().join("projects").join("-linked")).expect("link");
+    symlink(far.join("sess-9.jsonl"), project.join("sess-9.jsonl")).expect("link");
+    symlink(far.join("sess-9"), project.join("sess-9")).expect("link");
+    symlink(
+        far.join("sess-9/subagents"),
+        project.join("sess-2/subagents"),
+    )
+    .expect("link");
+
+    let found = ClaudeAdapter.discover(home.path()).expect("discover");
+    let names: Vec<_> = found
+        .iter()
+        .map(|t| t.path.strip_prefix(home.path()).expect("under home"))
+        .collect();
+    assert_eq!(names, [Path::new("projects/-w-proj/sess-1.jsonl")]);
+}
+
 #[test]
 fn end_turn_then_turn_duration_is_one_turn_end() {
     let full = read_all(&fixture_path()).items;
@@ -553,7 +589,11 @@ fn huge_summary_then_blank_lines_is_fast_and_short() {
     let start = std::time::Instant::now();
     let c = read_all(&path);
     let took = start.elapsed();
-    assert!(took.as_secs() < 5, "took {took:?}");
+    // The work is linear: every byte is read once. The time bound only catches a blow-up (a
+    // quadratic walk would take hours); debug builds under load are many times slower.
+    assert_eq!(c.bytes_read, data.len() as u64);
+    let bound = if cfg!(debug_assertions) { 60 } else { 5 };
+    assert!(took.as_secs() < bound, "took {took:?}");
     let title = c.meta.and_then(|m| m.title).expect("title");
     assert!(
         title.chars().count() <= 121,
