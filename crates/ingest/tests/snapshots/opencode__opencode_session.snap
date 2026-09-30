@@ -1,0 +1,427 @@
+---
+source: crates/ingest/tests/opencode.rs
+expression: "Golden\n{ meta: c.meta, items: c.items, sub_session: sub.meta, sub_items: sub.items, }"
+---
+{
+  "meta": {
+    "native_id": "ses_f0e99d47fffeKy9Pf34qY6Nb3w",
+    "cwd": "/home/dev/lab-tools",
+    "branch": null,
+    "title": "Dry-run flag for the sync script",
+    "model": "demo-coder-2",
+    "started": 1790756400000,
+    "is_subagent": false
+  },
+  "items": [
+    {
+      "kind": "user_prompt",
+      "at": 1790756401000,
+      "text": "Add a --dry-run flag to scripts/sync.py and a test for it.",
+      "offset": 7334938218496002
+    },
+    {
+      "kind": "assistant_text",
+      "at": 1790756402200,
+      "text": "I'll read the script and plan the change.",
+      "offset": 7334938223411201
+    },
+    {
+      "kind": "tool_use",
+      "at": 1790756402820,
+      "call_id": "call_c47WQAmL9xVQ2zg4mZao",
+      "tool": "read",
+      "target": "/home/dev/lab-tools/scripts/sync.py",
+      "input": {
+        "filePath": "/home/dev/lab-tools/scripts/sync.py"
+      },
+      "offset": 7334938225868801
+    },
+    {
+      "kind": "tool_result",
+      "at": 1790756403320,
+      "call_id": "call_c47WQAmL9xVQ2zg4mZao",
+      "is_error": false,
+      "summary": "<file>\n00001| import argparse\n00002|",
+      "offset": 7334938225868801
+    },
+    {
+      "kind": "tool_use",
+      "at": 1790756403690,
+      "call_id": "call_yHUig43kiJfahqSIjOug",
+      "tool": "todowrite",
+      "target": "3 items",
+      "input": {
+        "todos": [
+          {
+            "content": "Add --dry-run to the parser",
+            "priority": "high",
+            "status": "in_progress"
+          },
+          {
+            "content": "Skip writes when dry",
+            "priority": "high",
+            "status": "pending"
+          },
+          {
+            "content": "Test the flag",
+            "priority": "medium",
+            "status": "pending"
+          }
+        ]
+      },
+      "offset": 7334938229432321
+    },
+    {
+      "kind": "plan_updated",
+      "at": 1790756403690,
+      "items": [
+        {
+          "text": "Add --dry-run to the parser",
+          "status": "in_progress"
+        },
+        {
+          "text": "Skip writes when dry",
+          "status": "pending"
+        },
+        {
+          "text": "Test the flag",
+          "status": "pending"
+        }
+      ],
+      "offset": 7334938229432321
+    },
+    {
+      "kind": "tool_result",
+      "at": 1790756404190,
+      "call_id": "call_yHUig43kiJfahqSIjOug",
+      "is_error": false,
+      "summary": "[\n  {\n    \"content\": \"Add --dry-run to the parser\",",
+      "offset": 7334938229432321
+    },
+    {
+      "kind": "tool_use",
+      "at": 1790756404560,
+      "call_id": "call_lFPPwtV5ASPZHu8qRtZH",
+      "tool": "edit",
+      "target": "/home/dev/lab-tools/scripts/sync.py",
+      "input": {
+        "filePath": "/home/dev/lab-tools/scripts/sync.py",
+        "newString": "parser = argparse.ArgumentParser()\nparser.add_argument(\"--dry-run\", action=\"store_true\")",
+        "oldString": "parser = argparse.ArgumentParser()"
+      },
+      "offset": 7334938232995841
+    },
+    {
+      "kind": "tool_result",
+      "at": 1790756405060,
+      "call_id": "call_lFPPwtV5ASPZHu8qRtZH",
+      "is_error": false,
+      "summary": "Edit applied successfully.",
+      "offset": 7334938232995841
+    },
+    {
+      "kind": "file_edit",
+      "at": 1790756405060,
+      "path": "/home/dev/lab-tools/scripts/sync.py",
+      "added": 1,
+      "removed": 0,
+      "diff": "Index: /home/dev/lab-tools/scripts/sync.py\n===================================================================\n--- /home/dev/lab-tools/scripts/sync.py\n+++ /home/dev/lab-tools/scripts/sync.py\n@@ -1,1 +1,2 @@\n-parser = argparse.ArgumentParser()\n+parser = argparse.ArgumentParser()\n+parser.add_argument(\"--dry-run\", action=\"store_true\")\n",
+      "offset": 7334938232995841
+    },
+    {
+      "kind": "tool_use",
+      "at": 1790756406255,
+      "call_id": "call_eP3C4DSA7Lc360a9Y6yN",
+      "tool": "bash",
+      "target": "python -m pytest tests/test_sync.py -q",
+      "input": {
+        "command": "python -m pytest tests/test_sync.py -q",
+        "description": "Run the sync tests"
+      },
+      "offset": 7334938239938561
+    },
+    {
+      "kind": "tool_result",
+      "at": 1790756406755,
+      "call_id": "call_eP3C4DSA7Lc360a9Y6yN",
+      "is_error": true,
+      "summary": "F\n1 failed in 0.21s",
+      "offset": 7334938239938561
+    },
+    {
+      "kind": "tool_use",
+      "at": 1790756407125,
+      "call_id": "call_U77sVTUUJ596lLlGUriA",
+      "tool": "write",
+      "target": "/home/dev/lab-tools/tests/test_dry_run.py",
+      "input": {
+        "content": "def test_dry_run():\n    assert run(['--dry-run']) == 0\n",
+        "filePath": "/home/dev/lab-tools/tests/test_dry_run.py"
+      },
+      "offset": 7334938243502081
+    },
+    {
+      "kind": "tool_result",
+      "at": 1790756407625,
+      "call_id": "call_U77sVTUUJ596lLlGUriA",
+      "is_error": false,
+      "summary": "Wrote file successfully.",
+      "offset": 7334938243502081
+    },
+    {
+      "kind": "file_edit",
+      "at": 1790756407625,
+      "path": "/home/dev/lab-tools/tests/test_dry_run.py",
+      "added": 2,
+      "removed": 0,
+      "diff": "--- /dev/null\n+++ /home/dev/lab-tools/tests/test_dry_run.py\n@@ -0,0 +1,2 @@\n+def test_dry_run():\n+    assert run(['--dry-run']) == 0\n",
+      "offset": 7334938243502081
+    },
+    {
+      "kind": "tool_use",
+      "at": 1790756407995,
+      "call_id": "call_Jft5isGXNwAMnEYYnWLe",
+      "tool": "bash",
+      "target": "python -m pytest -q",
+      "input": {
+        "command": "python -m pytest -q",
+        "description": "Run all tests"
+      },
+      "offset": 7334938247065601
+    },
+    {
+      "kind": "tool_result",
+      "at": 1790756408495,
+      "call_id": "call_Jft5isGXNwAMnEYYnWLe",
+      "is_error": false,
+      "summary": "....\n4 passed in 0.40s",
+      "offset": 7334938247065601
+    },
+    {
+      "kind": "tool_use",
+      "at": 1790756408865,
+      "call_id": "call_CXVMk11oHUGCiczMSpxk",
+      "tool": "question",
+      "target": "Should --dry-run also print the planned writes?",
+      "input": {
+        "questions": [
+          {
+            "header": "Output",
+            "multiple": false,
+            "options": [
+              {
+                "description": "List each write",
+                "label": "Yes"
+              },
+              {
+                "description": "Stay quiet",
+                "label": "No"
+              }
+            ],
+            "question": "Should --dry-run also print the planned writes?"
+          }
+        ]
+      },
+      "offset": 7334938250629121
+    },
+    {
+      "kind": "question",
+      "at": 1790756408865,
+      "text": "Should --dry-run also print the planned writes?",
+      "options": [
+        "Yes",
+        "No"
+      ],
+      "offset": 7334938250629121
+    },
+    {
+      "kind": "tool_result",
+      "at": 1790756409365,
+      "call_id": "call_CXVMk11oHUGCiczMSpxk",
+      "is_error": false,
+      "summary": "User answered: Yes",
+      "offset": 7334938250629121
+    },
+    {
+      "kind": "assistant_text",
+      "at": 1790756409715,
+      "text": "Added `--dry-run`; the new test passes and dry runs list the planned writes.",
+      "offset": 7334938254192641
+    },
+    {
+      "kind": "turn_ended",
+      "at": 1790756410215,
+      "offset": 7334938256240641
+    },
+    {
+      "kind": "user_prompt",
+      "at": 1790756411235,
+      "text": "Also document the flag in the README, and check other scripts for writes.",
+      "offset": 7334938260418562
+    },
+    {
+      "kind": "tool_use",
+      "at": 1790756412055,
+      "call_id": "call_task_vXQqwuW8Y9XW",
+      "tool": "task",
+      "target": "Find scripts that write files",
+      "input": {
+        "description": "Find scripts that write files",
+        "prompt": "List every script under scripts/ that writes files.",
+        "subagent_type": "explore"
+      },
+      "offset": 7334938263695361
+    },
+    {
+      "kind": "tool_result",
+      "at": 1790756415265,
+      "call_id": "call_task_vXQqwuW8Y9XW",
+      "is_error": false,
+      "summary": "scripts/sync.py and scripts/export.py write files.",
+      "offset": 7334938263695361
+    },
+    {
+      "kind": "tool_use",
+      "at": 1790756415635,
+      "call_id": "call_TSj1OLXdIWz47woEu65G",
+      "tool": "apply_patch",
+      "target": "README.md (+1 more)",
+      "input": {
+        "patchText": "*** Begin Patch\n*** Update File: README.md\n@@ ## Usage\n+Pass `--dry-run` to see the planned writes.\n*** Add File: docs/dry-run.md\n+# Dry runs\n+Nothing is written.\n*** End Patch"
+      },
+      "offset": 7334938278359041
+    },
+    {
+      "kind": "tool_result",
+      "at": 1790756416135,
+      "call_id": "call_TSj1OLXdIWz47woEu65G",
+      "is_error": false,
+      "summary": "Success. Updated the following files:\nM README.md\nA docs/dry-run.md",
+      "offset": 7334938278359041
+    },
+    {
+      "kind": "file_edit",
+      "at": 1790756416135,
+      "path": "README.md",
+      "added": 1,
+      "removed": 0,
+      "diff": "--- README.md\n+++ README.md\n@@ ## Usage\n+Pass `--dry-run` to see the planned writes.\n",
+      "offset": 7334938278359041
+    },
+    {
+      "kind": "file_edit",
+      "at": 1790756416135,
+      "path": "docs/dry-run.md",
+      "added": 2,
+      "removed": 0,
+      "diff": "--- /dev/null\n+++ docs/dry-run.md\n@@ -0,0 +1,2 @@\n+# Dry runs\n+Nothing is written.\n",
+      "offset": 7334938278359041
+    },
+    {
+      "kind": "tool_use",
+      "at": 1790756416505,
+      "call_id": "call_yGP9YwWaViK5H3piBRv4",
+      "tool": "edit",
+      "target": "/home/dev/lab-tools/scripts/export.py",
+      "input": {
+        "filePath": "/home/dev/lab-tools/scripts/export.py",
+        "newString": "open(out, 'x')",
+        "oldString": "open(out, 'w')"
+      },
+      "offset": 7334938281922561
+    },
+    {
+      "kind": "tool_result",
+      "at": 1790756417005,
+      "call_id": "call_yGP9YwWaViK5H3piBRv4",
+      "is_error": true,
+      "summary": "oldString not found in content",
+      "offset": 7334938281922561
+    },
+    {
+      "kind": "assistant_text",
+      "at": 1790756417855,
+      "text": "README updated; export.py needs a closer look.",
+      "offset": 7334938287534081
+    },
+    {
+      "kind": "turn_ended",
+      "at": 1790756418255,
+      "offset": 7334938289172481
+    },
+    {
+      "kind": "user_prompt",
+      "at": 1790756419275,
+      "text": "Run the slow integration suite.",
+      "offset": 7334938293350402
+    },
+    {
+      "kind": "tool_use",
+      "at": 1790756420095,
+      "call_id": "call_UHWfCFWn05Gq59Pb2P1J",
+      "tool": "bash",
+      "target": "python -m pytest -m slow",
+      "input": {
+        "command": "python -m pytest -m slow",
+        "description": "Slow suite"
+      },
+      "offset": 7334938296627201
+    },
+    {
+      "kind": "tool_result",
+      "at": 1790756420095,
+      "call_id": "call_UHWfCFWn05Gq59Pb2P1J",
+      "is_error": true,
+      "summary": "interrupted: the tool did not finish",
+      "offset": 7334938296627201
+    }
+  ],
+  "sub_session": {
+    "native_id": "ses_f0e99a644ffeGYQr83wlMvTgbq",
+    "cwd": "/home/dev/lab-tools",
+    "branch": null,
+    "title": "List every script under scripts/ that writes files.",
+    "model": "demo-coder-2",
+    "started": 1790756412165,
+    "is_subagent": true
+  },
+  "sub_items": [
+    {
+      "kind": "user_prompt",
+      "at": 1790756413165,
+      "text": "List every script under scripts/ that writes files.",
+      "offset": 7334938268323842
+    },
+    {
+      "kind": "tool_use",
+      "at": 1790756413985,
+      "call_id": "call_vyCrS8Q7PSK4gFR4DgJo",
+      "tool": "grep",
+      "target": "open\\(.*[\"']w",
+      "input": {
+        "include": "*.py",
+        "pattern": "open\\(.*[\"']w"
+      },
+      "offset": 7334938271600641
+    },
+    {
+      "kind": "tool_result",
+      "at": 1790756414485,
+      "call_id": "call_vyCrS8Q7PSK4gFR4DgJo",
+      "is_error": false,
+      "summary": "Found 2 matches\nscripts/sync.py:\n  Line 40: with open(out, 'w') as f:",
+      "offset": 7334938271600641
+    },
+    {
+      "kind": "assistant_text",
+      "at": 1790756414835,
+      "text": "scripts/sync.py and scripts/export.py write files.",
+      "offset": 7334938275164161
+    },
+    {
+      "kind": "turn_ended",
+      "at": 1790756415235,
+      "offset": 7334938276802561
+    }
+  ]
+}

@@ -665,6 +665,7 @@ dependencies = [
  "pitcrew-interfaces",
  "pitcrew-protocol",
  "proptest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
