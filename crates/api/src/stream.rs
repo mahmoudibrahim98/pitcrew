@@ -14,6 +14,7 @@
 //!    [`StreamConfig::send_timeout`], the client is disconnected. It resumes with `since`.
 
 use crate::source::{EventSource, SourceError};
+use crate::util::{close, close_code, now_ms};
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
@@ -21,7 +22,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use pitcrew_auth::{ErrorResponse, WS_PROTOCOL};
 use pitcrew_protocol::api::{ErrorCode, StreamFrame};
-use pitcrew_protocol::model::TimestampMs;
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +31,9 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 /// The most events in one `events` frame (`docs/build/contracts/api-v1.md`).
 pub const MAX_PAGE: usize = 500;
+
+/// The largest message a stream client may send. Clients have nothing to say on this stream.
+const MAX_INBOUND: usize = 4 * 1024;
 
 /// Tuning for the delta stream. The defaults follow the contract.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +107,8 @@ async fn stream(
     };
     upgrade
         .protocols([WS_PROTOCOL])
+        .max_message_size(MAX_INBOUND)
+        .max_frame_size(MAX_INBOUND)
         .on_upgrade(move |socket| session(socket, state, query.since))
 }
 
@@ -145,6 +150,13 @@ async fn session(mut socket: WebSocket, state: StreamState, since: Option<u64>) 
         }
     };
     tracing::debug!(?end, "stream closed");
+    let (code, reason) = match end {
+        Some(StreamEnd::SlowClient) => (close_code::TRY_AGAIN_LATER, "too slow; resume with since"),
+        Some(StreamEnd::SourceClosed) => (close_code::GOING_AWAY, "the event log closed"),
+        Some(StreamEnd::SourceFailed) | None => (close_code::INTERNAL, "the event log failed"),
+        Some(StreamEnd::ClientGone) => return,
+    };
+    close(&mut socket, code, reason).await;
 }
 
 /// Writes frames for one client into `out` until the client goes away, falls behind, or the
@@ -187,7 +199,9 @@ pub async fn pump(
         }
     }
 
-    let mut ping = tokio::time::interval_at(Instant::now() + config.ping_every, config.ping_every);
+    // `interval` panics on a zero period.
+    let ping_every = config.ping_every.max(Duration::from_millis(1));
+    let mut ping = tokio::time::interval_at(Instant::now() + ping_every, ping_every);
     ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut known = pump.last_sent;
     let mut deadline: Option<Instant> = None;
@@ -299,14 +313,6 @@ async fn sleep_until(deadline: Option<Instant>) {
     }
 }
 
-fn now_ms() -> TimestampMs {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| {
-            TimestampMs::try_from(d.as_millis()).unwrap_or(TimestampMs::MAX)
-        })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,7 +360,11 @@ mod tests {
     }
 
     impl Client {
-        fn connect(source: &Arc<MemorySource>, since: Option<u64>, config: StreamConfig) -> Self {
+        fn connect<S: EventSource>(
+            source: &Arc<S>,
+            since: Option<u64>,
+            config: StreamConfig,
+        ) -> Self {
             let (frames, queue) = mpsc::channel(config.queue_frames);
             let source: Arc<dyn EventSource> = source.clone();
             let task = tokio::spawn(pump(source, since, config, frames));
@@ -465,6 +475,125 @@ mod tests {
         }
     }
 
+    /// A source that appends at awkward moments and announces ranges out of order, so the
+    /// ordering rules are tested deterministically.
+    #[derive(Debug)]
+    struct Scripted {
+        inner: MemorySource,
+        revs: tokio::sync::broadcast::Sender<crate::source::RevRange>,
+        append_in_latest: std::sync::Mutex<Option<usize>>,
+        append_in_first_since: std::sync::Mutex<Option<usize>>,
+    }
+
+    impl Scripted {
+        fn new(existing: usize) -> Arc<Self> {
+            let inner = MemorySource::new("log", 64);
+            inner.append_quietly(events(existing));
+            Arc::new(Self {
+                inner,
+                revs: tokio::sync::broadcast::channel(64).0,
+                append_in_latest: std::sync::Mutex::new(None),
+                append_in_first_since: std::sync::Mutex::new(None),
+            })
+        }
+
+        fn append(&self, n: usize) {
+            let range = self.inner.append_quietly(events(n));
+            let _ = self.revs.send(range);
+        }
+
+        /// Appends each batch, then announces their ranges newest first.
+        fn append_out_of_order(&self, batches: &[usize]) {
+            let ranges: Vec<_> = batches
+                .iter()
+                .map(|n| self.inner.append_quietly(events(*n)))
+                .collect();
+            for range in ranges.into_iter().rev() {
+                let _ = self.revs.send(range);
+            }
+        }
+    }
+
+    impl EventSource for Scripted {
+        fn log_id(&self) -> String {
+            self.inner.log_id()
+        }
+
+        fn latest_rev(&self) -> Result<u64, SourceError> {
+            let latest = self.inner.latest_rev()?;
+            if let Some(n) = self.append_in_latest.lock().unwrap().take() {
+                self.append(n);
+            }
+            Ok(latest)
+        }
+
+        fn since(
+            &self,
+            rev: u64,
+            limit: usize,
+        ) -> Result<Vec<crate::source::StoredEvent>, SourceError> {
+            if let Some(n) = self.append_in_first_since.lock().unwrap().take() {
+                self.append(n);
+            }
+            self.inner.since(rev, limit)
+        }
+
+        fn before(
+            &self,
+            rev: u64,
+            limit: usize,
+        ) -> Result<Vec<crate::source::StoredEvent>, SourceError> {
+            self.inner.before(rev, limit)
+        }
+
+        fn subscribe(&self) -> crate::source::Subscription {
+            crate::source::Subscription::new(self.revs.subscribe())
+        }
+    }
+
+    /// Reads until the client has seen `upto`, then checks it saw `1..=upto` exactly once.
+    async fn assert_sees_all(client: &mut Client, upto: u64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while client.last < upto && Instant::now() < deadline {
+            client.read(Duration::from_millis(100)).await;
+        }
+        // Nothing more (no repeats) arrives afterwards.
+        while client.read(Duration::from_millis(50)).await {}
+        assert_eq!(client.seen, (1..=upto).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn an_append_while_reading_the_latest_revision_arrives_once() {
+        let source = Scripted::new(3);
+        *source.append_in_latest.lock().unwrap() = Some(2);
+        let mut client = Client::connect(&source, Some(0), quick());
+        assert_sees_all(&mut client, 5).await;
+        assert_eq!(client.hello, Some((3, "log".to_owned())));
+    }
+
+    #[tokio::test]
+    async fn an_append_during_the_replay_arrives_once() {
+        for page in [2, 3, 10] {
+            let source = Scripted::new(3);
+            *source.append_in_first_since.lock().unwrap() = Some(2);
+            let config = StreamConfig { page, ..quick() };
+            let mut client = Client::connect(&source, Some(0), config);
+            assert_sees_all(&mut client, 5).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ranges_announced_out_of_order_arrive_once_in_order() {
+        let source = Scripted::new(0);
+        let mut client = Client::connect(&source, Some(0), quick());
+        assert!(client.read(Duration::from_secs(1)).await, "hello");
+        source.append_out_of_order(&[2, 3, 1]);
+        assert_sees_all(&mut client, 6).await;
+        // Again, after part of the log was sent.
+        source.append_out_of_order(&[1, 4]);
+        assert_sees_all(&mut client, 11).await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_slow_client_is_dropped_and_others_keep_up() {
         let source = Arc::new(MemorySource::new("log", 1024));
@@ -474,8 +603,13 @@ mod tests {
             page: 1,
             ..quick()
         };
+        // The fast client gets a generous timeout, so a busy machine cannot make it "slow".
+        let fast_config = StreamConfig {
+            send_timeout: Duration::from_secs(10),
+            ..config
+        };
         let slow = Client::connect(&source, Some(0), config);
-        let mut fast = Client::connect(&source, Some(0), config);
+        let mut fast = Client::connect(&source, Some(0), fast_config);
         for _ in 0..20 {
             source.append(events(1));
             tokio::time::sleep(Duration::from_millis(2)).await;

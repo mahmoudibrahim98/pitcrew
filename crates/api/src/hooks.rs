@@ -4,8 +4,10 @@
 //! [`HookSink`] through a bounded channel. When the channel is full the event is dropped and
 //! counted, so a hook never blocks its agent.
 
+use crate::util::now_ms;
 use axum::Router;
 use axum::body::Bytes;
+use axum::extract::rejection::{BytesRejection, PathRejection};
 use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::StatusCode;
 use axum::routing::post;
@@ -13,6 +15,7 @@ use pitcrew_auth::{Authenticated, ErrorResponse};
 use pitcrew_protocol::api::{Caller, ErrorCode};
 use pitcrew_protocol::model::{Engine, TimestampMs};
 use std::fmt;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc;
@@ -37,7 +40,9 @@ pub struct HookEvent {
 
 /// Receives hook events. The runner (stream D) implements it; until then, [`LogHookSink`].
 ///
-/// `deliver` runs on a background task, one event at a time; it should not block for long.
+/// `deliver` runs on a dedicated thread, one event at a time, so it **may block** (e.g. write to
+/// SQLite). While it blocks, new events queue up to the intake's capacity and then are dropped.
+/// A panic in `deliver` is logged and the next event is delivered as usual.
 pub trait HookSink: Send + Sync + fmt::Debug + 'static {
     /// Handles one event.
     fn deliver(&self, event: HookEvent);
@@ -66,20 +71,28 @@ pub struct HookIntake {
 }
 
 impl HookIntake {
-    /// Starts a task that feeds `sink` from a channel holding at most `capacity` events. Must be
-    /// called inside a tokio runtime. The task ends when every `HookIntake` clone is dropped.
-    #[must_use]
-    pub fn start(sink: Arc<dyn HookSink>, capacity: usize) -> Self {
+    /// Starts a thread that feeds `sink` from a channel holding at most `capacity` events. The
+    /// thread ends when every `HookIntake` clone is dropped.
+    ///
+    /// # Errors
+    /// The thread cannot be spawned.
+    pub fn start(sink: Arc<dyn HookSink>, capacity: usize) -> std::io::Result<Self> {
         let (queue, mut events) = mpsc::channel::<HookEvent>(capacity.max(1));
-        tokio::spawn(async move {
-            while let Some(event) = events.recv().await {
-                sink.deliver(event);
-            }
-        });
-        Self {
+        std::thread::Builder::new()
+            .name("pitcrew-hook-sink".to_owned())
+            .spawn(move || {
+                while let Some(event) = events.blocking_recv() {
+                    let delivered =
+                        std::panic::catch_unwind(AssertUnwindSafe(|| sink.deliver(event)));
+                    if delivered.is_err() {
+                        tracing::error!("the hook sink panicked; continuing with the next event");
+                    }
+                }
+            })?;
+        Ok(Self {
             queue,
             dropped: Arc::new(AtomicU64::new(0)),
-        }
+        })
     }
 
     /// A channel that nothing reads, for tests: it fills after `capacity` events.
@@ -122,10 +135,12 @@ pub fn routes(intake: HookIntake) -> Router {
 async fn receive(
     State(intake): State<HookIntake>,
     Authenticated(caller): Authenticated,
-    Path((engine, event)): Path<(String, String)>,
-    body: Result<Bytes, axum::extract::rejection::BytesRejection>,
+    path: Result<Path<(String, String)>, PathRejection>,
+    body: Result<Bytes, BytesRejection>,
 ) -> Result<StatusCode, ErrorResponse> {
     let invalid = |message: String| ErrorResponse::new(ErrorCode::Invalid, message);
+    let Path((engine, event)) =
+        path.map_err(|_| invalid("The engine and event must be plain text.".to_owned()))?;
     let engine: Engine = serde_json::from_value(serde_json::Value::String(engine.clone()))
         .map_err(|_| invalid(format!("Unknown engine {engine:?}.")))?;
     if !is_event_name(&event) {
@@ -134,7 +149,13 @@ async fn receive(
             event.chars().take(80).collect::<String>()
         )));
     }
-    let body = body.map_err(|_| invalid(format!("The body must be at most {MAX_BODY} bytes.")))?;
+    let body = body.map_err(|rejection| {
+        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            invalid(format!("The body must be at most {MAX_BODY} bytes."))
+        } else {
+            invalid("The body could not be read.".to_owned())
+        }
+    })?;
     let payload = match serde_json::from_slice(&body) {
         Ok(serde_json::Value::Object(payload)) => payload,
         _ => return Err(invalid("The body must be a JSON object.".to_owned())),
@@ -155,14 +176,6 @@ fn is_event_name(name: &str) -> bool {
     chars.next().is_some_and(|c| c.is_ascii_alphabetic())
         && name.len() <= 64
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-}
-
-fn now_ms() -> TimestampMs {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| {
-            TimestampMs::try_from(d.as_millis()).unwrap_or(TimestampMs::MAX)
-        })
 }
 
 #[cfg(test)]

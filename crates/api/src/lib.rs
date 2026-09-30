@@ -8,6 +8,8 @@
 //! - [`serve`] does both.
 //! - [`client`] holds the checks a client makes before trusting a daemon with a token.
 //! - [`stream`] serves `GET /v1/stream` from an [`EventSource`] (the store, or memory).
+//! - [`terminal`] serves `GET /v1/sessions/{id}/terminal` from [`Terminals`].
+//! - [`activity`] serves `GET /v1/events` from the same [`EventSource`].
 //! - [`hooks`] serves `POST /v1/hooks/{engine}/{event}` into a [`HookSink`].
 //!
 //! Authentication inserts an `axum::Extension<Caller>` (from `pitcrew-protocol`) into every
@@ -17,6 +19,7 @@
 //! **Owned by stream H.** The work packages are in `docs/build/streams/H.md`. Build against
 //! `pitcrew-protocol` and `pitcrew-interfaces` only, never another stream's internals.
 
+pub mod activity;
 mod auth;
 pub mod client;
 pub mod hooks;
@@ -24,6 +27,8 @@ mod host;
 mod listener;
 pub mod source;
 pub mod stream;
+pub mod terminal;
+mod util;
 
 pub use hooks::{HookEvent, HookIntake, HookSink, LogHookSink};
 pub use host::{local_host_info, local_machine_info};
@@ -32,8 +37,11 @@ pub use listener::{Bound, Listen};
 pub use listener::{NamedPipe, PipeAddr, default_pipe_name};
 #[cfg(unix)]
 pub use listener::{SOCKET_NAME, UnixSocket};
-pub use source::{EventSource, MemorySource, StoreSource};
+#[cfg(feature = "store")]
+pub use source::StoreSource;
+pub use source::{EventSource, MemorySource};
 pub use stream::StreamConfig;
+pub use terminal::{Attachment, RuntimeTerminals, TerminalConfig, TerminalError, Terminals};
 
 use axum::Json;
 use axum::Router;

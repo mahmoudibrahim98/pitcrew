@@ -53,7 +53,7 @@ async fn the_stream_is_for_devices_and_websockets() {
     assert_eq!(body["code"], "invalid");
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "store"))]
 mod unix {
     use super::*;
     use pitcrew_api::{Bound, Listen, SOCKET_NAME, StoreSource};
