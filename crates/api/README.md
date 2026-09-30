@@ -49,6 +49,9 @@ planted by another user never receives a token:
 - Backpressure: each client has a queue of `queue_frames` frames (default 64). A frame that
   cannot be queued within `send_timeout` (default 10 s) disconnects the client, which resumes
   with `since`.
+- Close codes: **1013** too slow (resume with `since`), **1001** the event source closed or the
+  hub is shutting down, **1011** the event source failed. A client's Close is answered before
+  the socket is dropped.
 
 ## Hooks: `POST /v1/hooks/{engine}/{event}`
 
@@ -60,8 +63,8 @@ planted by another user never receives a token:
 - The route answers `202` at once and queues a `HookEvent` (with the `Caller`) for the
   `HookSink`. When the queue is full the event is dropped and counted (`HookIntake::dropped`).
 - `LogHookSink` only logs; the runner (stream D) provides the real sink. `deliver` runs on its
-  own thread and may block (e.g. on SQLite); a panic in it is logged and the next event is
-  delivered.
+  own thread and may block (e.g. on SQLite). A panic in it loses that one event: it is logged
+  with the panic's message, and **the sink keeps receiving** the next events.
 
 ## Terminals: `GET /v1/sessions/{id}/terminal?cols=&rows=&from=`
 
@@ -70,14 +73,37 @@ planted by another user never receives a token:
 - `Terminals` finds a session's terminal; `RuntimeTerminals::new(runtime)` implements it over
   any `Runtime`, with `link(session, terminal)` until the runner provides the mapping. Unknown
   sessions are `404`; an unreachable runtime is `503`.
+- **The `Attachment` contract** (for whoever implements `Terminals`): every method may block but
+  must return within bounded time, answering `Unavailable` rather than hanging; `exited()` may
+  say `true` only once all output is readable; `NotFound` from `read` or `exited` during a
+  stream means the program ended. `changes()` is an optional push hint (a `watch::Receiver`
+  that changes on new output and on exit); without it the route polls.
+- `cols` and `rows` are `terminal::SIZES` (1..=1000); outside it the query is `400` and a
+  `resize` closes with 1007. The upgrade is checked (after the `404`) before anything touches
+  the terminal, so a plain GET never resizes it.
 - Output is binary frames of at most 64 KiB from `from` (default 0). If the buffer lost `from`,
   `{"type":"truncated","from":N}` comes first. A client counts the bytes it received and
   reconnects with `from=<that offset>`; nothing is lost or repeated.
+- Idle cost: without `changes()`, polling backs off from 20 ms to 250 ms while nothing happens
+  (one `read` and one `exited()` per round) and starts over on any input or output.
+- Every call into the seam runs on the blocking pool, at most `max_calls` (64) at once across
+  all clients, and is given up after `call_timeout` (5 s): `503` before the upgrade, 1011 after.
+  A stalled runtime ties up at most `max_calls` threads.
 - Client binary frames are keystrokes; `{"type":"resize","cols","rows"}` resizes; other types
-  are ignored; malformed control JSON closes with 1007. When the program exits, the rest of the
-  output, then `{"type":"exit"}`, then close 1000.
-- A client that stops reading is closed with 1013 and resumes by offset. Several clients may
-  attach; each gets the output, and their keystrokes interleave in arrival order.
+  are ignored; malformed control JSON closes with 1007. When the program exits, or its terminal
+  disappears, the rest of the output, then `{"type":"exit"}`, then close 1000.
+- A client that stops reading is closed with 1013 and resumes by offset. So is one that does
+  not answer the Ping sent every 20 s within 20 s. Several clients may attach; each gets the
+  output, and their keystrokes interleave in arrival order.
+- Close codes: **1000** after `exit`, **1007** malformed control, **1013** too slow or no Pong
+  (reconnect with `from`), **1011** runtime failure, **1001** hub shutting down. A client's
+  Close is answered before the socket is dropped.
+
+## Shutdown
+
+`Bound::serve` (and `serve`) tell every open WebSocket when `shutdown` completes; they close
+with 1001, and `serve` waits up to 2 s for them before returning. Hyper's graceful shutdown alone
+does not wait for upgraded connections.
 
 ## Activity: `GET /v1/events?before=&limit=&task=&session=`
 
@@ -86,9 +112,12 @@ stream.
 
 - Oldest first within a page, the newest page without `before` (exclusive); `limit` defaults to
   100, max 500.
-- `session` and `task` match events whose body names the id, found by scanning back at most
-  10,000 events per request. A page that ran out of budget may be short or empty, with
-  `at_start` false and `from_rev` where the scan stopped.
+- The page is `pitcrew_protocol::api::EventsPage`. **Only `at_start` ends paging.**
+- `session` and `task` match events with a `session` (or `task`) field, at any depth, holding
+  the id or an object with that `id`; the id under another key (a `parent`, `blocked_by`, free
+  text) does not match. Matches are found by scanning back at most 10,000 events per request. A
+  page that ran out of budget may be short or empty, with `at_start` false, `to_rev` 0 and
+  `from_rev` where the scan stopped.
 - `project` and `workstream` answer `400 invalid` until the hub has a project index.
 
 ## Features
@@ -103,13 +132,13 @@ let tokens: Arc<dyn TokenStore> = Arc::new(FileTokenStore::open(&state_dir)?);
 let info = pitcrew_api::local_host_info(env!("CARGO_PKG_VERSION"), vec![HostRole::Hub, HostRole::Runner], caps);
 let source: Arc<dyn EventSource> = Arc::new(StoreSource::new(store.clone(), log_id));
 let hooks = HookIntake::start(Arc::new(LogHookSink), 1024)?;
-let terminals = Arc::new(RuntimeTerminals::new(runtime.clone())); // the runner links sessions
+let terminals = Arc::new(RuntimeTerminals::new(runtime.clone())); // the runner keeps it to link sessions
 let parts = RouterParts::new()
     .agent(pitcrew_api::hooks::routes(hooks))
     .agent(hub_work::agent_routes())    // routes marked **agent** in api-v1.md
     .device(pitcrew_api::stream::routes(source.clone(), StreamConfig::default()))
     .device(pitcrew_api::activity::routes(source))
-    .device(pitcrew_api::terminal::routes(terminals, TerminalConfig::default()))
+    .device(pitcrew_api::terminal::routes(terminals.clone(), TerminalConfig::default()))
     .device(hub_work::device_routes()); // everything else
 pitcrew_api::serve(&Listen::private_default(run_dir)?, info, tokens, parts, shutdown).await?;
 ```
