@@ -623,6 +623,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pitcrew-benches"
+version = "0.0.0"
+dependencies = [
+ "pitcrew-protocol",
+]
+
+[[package]]
 name = "pitcrew-cli"
 version = "0.0.0"
 dependencies = [
