@@ -8,12 +8,17 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | Brief | Stream | Branch | Suggested model | Status |
 |---|---|---|---|---|
 | [A-claude-adapter](A-claude-adapter.md) | A · Ingest | `s/A/claude-adapter` | Opus-class | **Merged** |
-| [A-codex-adapter](A-codex-adapter.md) | A · Ingest | `s/A/codex-adapter` | Opus-class | Ready |
+| [A-codex-adapter](A-codex-adapter.md) | A · Ingest | `s/A/codex-adapter` | Opus-class | In progress |
 | [B-control-mode-and-buffer](B-control-mode-and-buffer.md) | B · Runtime | `s/B/control-mode-and-buffer` | Opus-class | **Merged** |
-| [B-control-hardening](B-control-hardening.md) | B · Runtime | `s/B/control-hardening` | Opus-class | Ready |
+| [B-control-hardening](B-control-hardening.md) | B · Runtime | `s/B/control-hardening` | Opus-class | In progress |
 | [C-open-and-log](C-open-and-log.md) | C · Store | `s/C/open-and-log` | Sonnet-class | **Merged** |
-| [C-store-hardening](C-store-hardening.md) | C · Store | `s/C/store-hardening` | Sonnet-class | Ready |
-| [H-listener-and-tokens](H-listener-and-tokens.md) | H · API and auth | `s/H/listener-and-tokens` | Opus-class | In review: fixes requested |
+| [C-store-hardening](C-store-hardening.md) | C · Store | `s/C/store-hardening` | Sonnet-class | In review: round 2 |
+| [C-projections](C-projections.md) | C · Store | `s/C/projections` | Sonnet-class | Ready (after store-hardening merges) |
+| [D-watch-and-index](D-watch-and-index.md) | D · Runner | `s/D/watch-and-index` | Opus-class | Ready |
+| [H-listener-and-tokens](H-listener-and-tokens.md) | H · API and auth | `s/H/listener-and-tokens` | Opus-class | **Merged** |
+| [H-delta-stream](H-delta-stream.md) | H · API and auth | `s/H/delta-stream` | Opus-class | Ready |
+| [I-cli-and-hooks](I-cli-and-hooks.md) | I · CLI and hooks | `s/I/cli-and-hooks` | Sonnet-class | Ready |
+| [J-ssh-connection](J-ssh-connection.md) | J · Remote and HPC | `s/J/ssh-connection` | Opus-class | Ready |
 | [L-skeleton-and-data](L-skeleton-and-data.md) | L · UI foundation | `s/L/skeleton-and-data` | Opus-class | In review: fixes requested |
 
 The branch name matters: CI's path guard reads the stream from it (`s/<stream>/<topic>`). The
@@ -44,10 +49,12 @@ this worktree.
   agents don't block each other:
 
   ```bash
-  wsl.exe -d Ubuntu-22.04 --cd "$PWD" -- bash -lc 'CARGO_TARGET_DIR=$HOME/.cache/pitcrew-target-<stream letter> cargo test --workspace'
+  wsl.exe -d Ubuntu-22.04 --cd "$PWD" -- bash -lc 'CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR=$HOME/.cache/pitcrew-target-<stream letter> cargo test --workspace'
   ```
 
   The same form works for `cargo fmt --all`, `cargo clippy …` and `cargo test -p <crate>`.
+  Keep `CARGO_BUILD_JOBS=4`: several agents build at once, and unbounded parallel builds have
+  run the machine out of memory.
 - **Linux and macOS:** run `cargo` directly.
 - **Node 24** runs natively. `npm test` runs the mock-hub and CI-script tests.
   `npm run mock-hub` serves the fake daemon on `http://127.0.0.1:47317`. Its tokens are
