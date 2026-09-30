@@ -7,12 +7,36 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 
 | Brief | Stream | Branch | Suggested model | Status |
 |---|---|---|---|---|
-| [A-claude-adapter](A-claude-adapter.md) | A · Ingest | `s/A/claude-adapter` | Opus-class | Ready |
-| [B-control-mode-and-buffer](B-control-mode-and-buffer.md) | B · Runtime | `s/B/control-mode-and-buffer` | Opus-class | Ready |
-| [C-open-and-log](C-open-and-log.md) | C · Store | `s/C/open-and-log` | Sonnet-class | Ready |
-| [H-listener-and-tokens](H-listener-and-tokens.md) | H · API and auth | `s/H/listener-and-tokens` | Opus-class | Ready |
-| [L-skeleton-and-data](L-skeleton-and-data.md) | L · UI foundation | `s/L/skeleton-and-data` | Opus-class | Ready |
+| [A-claude-adapter](A-claude-adapter.md) | A · Ingest | `s/A/claude-adapter` | Opus-class | **Merged** |
+| [A-codex-adapter](A-codex-adapter.md) | A · Ingest | `s/A/codex-adapter` | Opus-class | **Merged** |
+| [A-opencode-adapter](A-opencode-adapter.md) | A · Ingest | `s/A/opencode-adapter` | Opus-class | In progress |
+| [B-control-mode-and-buffer](B-control-mode-and-buffer.md) | B · Runtime | `s/B/control-mode-and-buffer` | Opus-class | **Merged** |
+| [B-control-hardening](B-control-hardening.md) | B · Runtime | `s/B/control-hardening` | Opus-class | In review: fixes requested |
+| [C-open-and-log](C-open-and-log.md) | C · Store | `s/C/open-and-log` | Sonnet-class | **Merged** |
+| [C-store-hardening](C-store-hardening.md) | C · Store | `s/C/store-hardening` | Sonnet-class | **Merged** |
+| [C-projections](C-projections.md) | C · Store | `s/C/projections` | Sonnet-class | **Merged** |
+| [E-work-core](E-work-core.md) | E · Work model | `s/E/work-core` | Opus-class | Ready (based on C-projections) |
+| [D-watch-and-index](D-watch-and-index.md) | D · Runner | `s/D/watch-and-index` | Opus-class | In review: fixes in progress |
+| [H-listener-and-tokens](H-listener-and-tokens.md) | H · API and auth | `s/H/listener-and-tokens` | Opus-class | **Merged** |
+| [H-delta-stream](H-delta-stream.md) | H · API and auth | `s/H/delta-stream` | Opus-class | **Merged** |
+| [H-terminal-and-activity](H-terminal-and-activity.md) | H · API and auth | `s/H/terminal-and-activity` | Opus-class | **Merged** |
+| [H-terminal-hardening](H-terminal-hardening.md) | H · API and auth | `s/H/terminal-hardening` | Opus-class | In progress |
+| [I-cli-and-hooks](I-cli-and-hooks.md) | I · CLI and hooks | `s/I/cli-and-hooks` | Sonnet-class | In progress |
+| [J-ssh-connection](J-ssh-connection.md) | J · Remote and HPC | `s/J/ssh-connection` | Opus-class | In review: fixes in progress |
+| [L-skeleton-and-data](L-skeleton-and-data.md) | L · UI foundation | `s/L/skeleton-and-data` | Opus-class | In review: round 3 |
+| [L-shell](L-shell.md) | L · UI foundation | `s/L/shell` | Opus-class | In progress (based on skeleton-and-data) |
+| [M-console-components](M-console-components.md) | M · Agent console | `s/M/console-components` | Opus-class | In progress (based on skeleton-and-data) |
+| [N-projects-components](N-projects-components.md) | N · Projects layout | `s/N/projects-components` | Sonnet-class | In progress (based on skeleton-and-data) |
+| [F-activity-blocks](F-activity-blocks.md) | F · Recap | `s/F/activity-blocks` | Opus-class | In progress |
+| [P-bench-and-release](P-bench-and-release.md) | P · Packaging | `s/P/bench-and-release` | Sonnet-class | In progress |
+| [Q-threat-model-and-fuzz](Q-threat-model-and-fuzz.md) | Q · Security | `s/Q/threat-model-and-fuzz` | Opus-class | In progress |
 
+| [A-scan](A-scan.md) | A · Ingest | `s/A/scan` | Sonnet-class | Ready (after opencode-adapter merges) |
+| [D-hub-link](D-hub-link.md) | D · Runner | `s/D/hub-link` | Opus-class | Ready (after watch-and-index merges) |
+| [F-briefs-and-office](F-briefs-and-office.md) | F · Recap | `s/F/briefs-and-office` | Opus-class | Ready (after activity-blocks merges) |
+| [I-hook-install](I-hook-install.md) | I · CLI and hooks | `s/I/hook-install` | Sonnet-class | Ready (after cli-and-hooks merges) |
+| [J-deploy](J-deploy.md) | J · Remote and HPC | `s/J/deploy` | Opus-class | Ready (after ssh-connection merges) |
+| [O-onboarding-components](O-onboarding-components.md) | O · Onboarding | `s/O/onboarding-components` | Sonnet-class | In progress (based on L-shell) |
 The branch name matters: CI's path guard reads the stream from it (`s/<stream>/<topic>`). The
 integrator adds new briefs here as streams progress, and marks them done when merged.
 
@@ -26,9 +50,10 @@ The integrator has already created your worktree on your brief's branch. **Do no
 worktrees or branches, and do not switch branches.** Before any other work:
 
 1. `git branch --show-current` must print exactly the branch named in your brief.
-2. `git merge-base --is-ancestor main HEAD` must succeed (your branch starts from `main`).
-3. If `git log main..HEAD` shows commits, a previous run started this work: read them and
+2. If `git log main..HEAD` shows commits, a previous run started this work: read them and
    continue from there.
+3. `main` may have moved on since your branch was created. That is expected: **do not rebase
+   onto or merge `main`**. The integrator resolves that when merging your branch.
 
 If the branch is wrong, or you are on `main`, **stop and tell the user**. Edit only files inside
 this worktree.
@@ -40,10 +65,12 @@ this worktree.
   agents don't block each other:
 
   ```bash
-  wsl.exe -d Ubuntu-22.04 --cd "$PWD" -- bash -lc 'CARGO_TARGET_DIR=$HOME/.cache/pitcrew-target-<stream letter> cargo test --workspace'
+  wsl.exe -d Ubuntu-22.04 --cd "$PWD" -- bash -lc 'CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR=$HOME/.cache/pitcrew-target-<stream letter> cargo test --workspace'
   ```
 
   The same form works for `cargo fmt --all`, `cargo clippy …` and `cargo test -p <crate>`.
+  Keep `CARGO_BUILD_JOBS=4`: several agents build at once, and unbounded parallel builds have
+  run the machine out of memory.
 - **Linux and macOS:** run `cargo` directly.
 - **Node 24** runs natively. `npm test` runs the mock-hub and CI-script tests.
   `npm run mock-hub` serves the fake daemon on `http://127.0.0.1:47317`. Its tokens are

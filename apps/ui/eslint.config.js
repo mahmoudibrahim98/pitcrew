@@ -24,7 +24,16 @@ export default tseslint.config(
           paths: [
             {
               name: '@tanstack/react-query',
-              importNames: ['useQuery', 'useQueries', 'useSuspenseQuery', 'useInfiniteQuery'],
+              importNames: [
+                'useQuery',
+                'useQueries',
+                'useInfiniteQuery',
+                'useSuspenseQuery',
+                'useSuspenseQueries',
+                'useSuspenseInfiniteQuery',
+                'usePrefetchQuery',
+                'usePrefetchInfiniteQuery',
+              ],
               message:
                 'Use useLiveQuery from src/data (or a hook built on it): plain useQuery can fetch before the stream syncs and miss events.',
             },

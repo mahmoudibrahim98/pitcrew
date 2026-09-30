@@ -123,15 +123,36 @@ pub struct ApiError {
     pub message: String,
 }
 
+/// `GET /v1/events`: a page of the activity log, oldest first within the page.
+///
+/// Page backwards by passing `from_rev` as `before`. Only `at_start` ends paging: with filters, a
+/// page may hold fewer than `limit` events (even none) while older matches still exist.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventsPage {
+    /// The events, oldest first.
+    pub events: Vec<Event>,
+    /// Revision of the first returned event; with no events, where the scan stopped (0 at the
+    /// start of the log).
+    pub from_rev: u64,
+    /// Revision of the last returned event, or 0 when the page is empty.
+    pub to_rev: u64,
+    /// True when no older matching event exists.
+    pub at_start: bool,
+}
+
 /// Frames on `GET /v1/stream?since=<rev>`. `rev` is the hub's event revision. A client that
 /// reconnects with `since` receives exactly what it missed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamFrame {
-    /// First frame: the current revision.
+    /// First frame: the current revision, and which event log it counts in.
     Hello {
         /// Current revision.
         rev: u64,
+        /// Identifies this hub's event log; it is created with the store and never changes.
+        /// Revisions only mean something within one log: a client whose cached state came from
+        /// a different `log` must drop it and refetch.
+        log: String,
     },
     /// New events, covering revisions `from_rev..=to_rev`.
     Events {

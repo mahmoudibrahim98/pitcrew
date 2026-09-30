@@ -87,7 +87,12 @@ describe('DataProvider', () => {
     const port = await freePort();
 
     const baseUrl = `http://127.0.0.1:${port}`;
-    const api = createApi({ baseUrl, token: DEVICE_TOKEN });
+    // Until the hub runs, requests (the connection probe) fail as a refused connection would.
+    // happy-dom's fetch would print each refusal to the real stderr, past vitest.
+    let listening = false;
+    const fetcher: typeof fetch = (input, init) =>
+      listening ? fetch(input, init) : Promise.reject(new TypeError('fetch failed'));
+    const api = createApi({ baseUrl, token: DEVICE_TOKEN, fetch: fetcher });
     render(
       <DataProvider api={api} queryClient={createQueryClient()} token={DEVICE_TOKEN}>
         <Projects />
@@ -98,6 +103,7 @@ describe('DataProvider', () => {
     expect(screen.getByText('workspace: -')).toBeTruthy();
 
     hub = await spawnHub(port);
+    listening = true;
     await screen.findByText('Tooling', undefined, { timeout: 8_000 });
     await vi.waitFor(() => expect(screen.getByText('status: live')).toBeTruthy());
     await vi.waitFor(() => expect(screen.queryByText('workspace: -')).toBeNull());

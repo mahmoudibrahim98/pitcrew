@@ -4,7 +4,7 @@ import { ApiError, createApi, type Api } from '../src/data/api.ts';
 import { keys } from '../src/data/keys.ts';
 import { createLive, Invalidator, type Live } from '../src/data/live.ts';
 import type { EventBody, Session, Task } from '../src/data/types.ts';
-import { DEVICE_TOKEN, fakeSockets, startServer, type RunningServer } from './helpers.ts';
+import { DEVICE_TOKEN, fakeSockets, startServer, type FakeSocket, type RunningServer } from './helpers.ts';
 
 describe('live cache against the mock hub', () => {
   let hub: RunningServer;
@@ -146,9 +146,58 @@ describe('live cache against the mock hub', () => {
   });
 });
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 describe('invalidator', () => {
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it('refetches each query that was fetching once, after its own fetch settles', async () => {
+    vi.useFakeTimers();
+    const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false } } });
+    const calls = { a: 0, b: 0 };
+    const observe = (name: 'a' | 'b', ms: number) =>
+      new QueryObserver(queryClient, {
+        queryKey: ['things', name],
+        queryFn: async () => {
+          calls[name] += 1;
+          await sleep(ms);
+          return calls[name];
+        },
+      }).subscribe(() => {});
+    const unsubscribe = [observe('a', 300), observe('b', 600)];
+    await vi.advanceTimersByTimeAsync(10);
+
+    const invalidator = new Invalidator(queryClient, { windowMs: 250 });
+    invalidator.add([['things']]);
+    await vi.advanceTimersByTimeAsync(100);
+    invalidator.add([['things']]); // a second event while both still load
+    await vi.advanceTimersByTimeAsync(500); // a settled at 300 and refetched at the next flush
+    expect(calls).toEqual({ a: 2, b: 1 });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(calls).toEqual({ a: 2, b: 2 });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(calls).toEqual({ a: 2, b: 2 });
+    invalidator.stop();
+    for (const stop of unsubscribe) stop();
+  });
+
+  it('forgets fetches it was waiting for once stopped', async () => {
+    vi.useFakeTimers();
+    const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false } } });
+    const queryFn = vi.fn(async () => {
+      await sleep(300);
+      return 1;
+    });
+    const unsubscribe = new QueryObserver(queryClient, { queryKey: ['thing'], queryFn }).subscribe(() => {});
+    await vi.advanceTimersByTimeAsync(10);
+    const invalidator = new Invalidator(queryClient, { windowMs: 250 });
+    invalidator.add([['thing']]);
+    invalidator.stop();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(queryFn).toHaveBeenCalledTimes(1);
+    unsubscribe();
   });
 
   it('does not cancel a fetch in flight, and invalidates again once it settles', async () => {
@@ -201,6 +250,35 @@ describe('invalidator', () => {
     expect(spy.mock.calls[1]?.[0]).toMatchObject({ queryKey: ['tasks', 'list'] });
     invalidator.stop();
   });
+
+  it('does not let a query settling mid-fetch bypass the everything rate limit', async () => {
+    // A steady stream of unknown-type events calls `add([[]])` repeatedly. Each refetch the
+    // everything timer triggers is itself a fetch in flight; `add` used to await it too (it
+    // matches everything's `[]` prefix), so its settling queued an unrate-limited exact refetch
+    // and the chain sustained itself well past `everythingMs`.
+    vi.useFakeTimers();
+    const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false } } });
+    let calls = 0;
+    const unsubscribe = new QueryObserver(queryClient, {
+      queryKey: ['thing'],
+      queryFn: async () => {
+        calls += 1;
+        await sleep(300);
+        return calls;
+      },
+    }).subscribe(() => {});
+    await vi.advanceTimersByTimeAsync(400); // the initial fetch settles
+
+    const invalidator = new Invalidator(queryClient, { windowMs: 250, everythingMs: 5_000 });
+    for (let t = 0; t < 10_000; t += 200) {
+      invalidator.add([[]]);
+      await vi.advanceTimersByTimeAsync(200);
+    }
+    // 1 initial fetch + at most 3 refetches over 10 s at a 5 s rate limit.
+    expect(calls).toBeLessThanOrEqual(4);
+    invalidator.stop();
+    unsubscribe();
+  });
 });
 
 describe('live cache with a scripted stream', () => {
@@ -210,16 +288,18 @@ describe('live cache with a scripted stream', () => {
   afterEach(() => {
     for (const live of lives.splice(0)) live.stop();
     for (const qc of queryClients.splice(0)) qc.clear();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
-  function setup(options: { probe?: () => Promise<unknown> } = {}) {
+  function setup(options: { probe?: () => Promise<unknown>; windowMs?: number } = {}) {
     const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false } } });
     const { factory, sockets } = fakeSockets();
     const live = createLive({
       queryClient,
       baseUrl: 'http://127.0.0.1:47317',
       socket: factory,
-      windowMs: 10,
+      windowMs: options.windowMs ?? 10,
       backoff: { initialMs: 5, maxMs: 10 },
       probeAfter: 2,
       ...(options.probe === undefined ? {} : { probe: options.probe }),
@@ -269,6 +349,142 @@ describe('live cache with a scripted stream', () => {
     resolvers[1]?.([task('OLD'), task('NEW')]);
     await vi.waitFor(() => expect(observer.getCurrentResult().data?.map((t) => t.id)).toEqual(['OLD', 'NEW']));
     unsubscribe();
+  });
+
+  it('refetches a bounded number of times when a patch races slow list fetches', async () => {
+    vi.useFakeTimers();
+    const { queryClient, emit } = setup({ windowMs: 250 });
+    const durations = [300, 450, 600, 350, 500];
+    let fetches = 0;
+    const calls = { todo: 0, done: 0 };
+    const observe = (status: 'todo' | 'done') =>
+      new QueryObserver(queryClient, {
+        queryKey: keys.tasks.list({ status: [status] }),
+        queryFn: async () => {
+          calls[status] += 1;
+          await sleep(durations[fetches++ % durations.length] ?? 300);
+          return [] as Task[];
+        },
+      }).subscribe(() => {});
+    const unsubscribe = [observe('todo')];
+    await vi.advanceTimersByTimeAsync(700); // the todo list has loaded
+    unsubscribe.push(observe('done')); // the done list is loading
+    await vi.advanceTimersByTimeAsync(20);
+
+    emit({ type: 'task_created', data: { task: task('NEW') } });
+    await vi.advanceTimersByTimeAsync(10_000);
+    // The todo list took the patch; the done list refetched once, after its racing fetch.
+    expect(calls).toEqual({ todo: 1, done: 2 });
+    expect(queryClient.getQueryData<Task[]>(keys.tasks.list({ status: ['todo'] }))?.map((t) => t.id)).toEqual(['NEW']);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(calls).toEqual({ todo: 1, done: 2 });
+    for (const stop of unsubscribe) stop();
+  });
+
+  it('refetches a fast list once while a slow sibling loads, and the slow one once after', async () => {
+    vi.useFakeTimers();
+    const { queryClient, emit } = setup({ windowMs: 250 });
+    const calls = { fast: 0, slow: 0 };
+    const unsubscribe = [
+      new QueryObserver(queryClient, {
+        queryKey: keys.tasks.list({ status: ['todo'] }),
+        queryFn: async () => {
+          calls.fast += 1;
+          await sleep(50);
+          return [] as Task[];
+        },
+      }).subscribe(() => {}),
+    ];
+    await vi.advanceTimersByTimeAsync(100);
+    // `['tasks', 'list', {}]`: a prefix of the filtered list's key as well.
+    unsubscribe.push(
+      new QueryObserver(queryClient, {
+        queryKey: keys.tasks.list(),
+        queryFn: async () => {
+          calls.slow += 1;
+          await sleep(3_000);
+          return [] as Task[];
+        },
+      }).subscribe(() => {}),
+    );
+    await vi.advanceTimersByTimeAsync(20);
+
+    emit({ type: 'task_moved', data: { task: 'T1', from: 'todo', to: 'done', mover: { kind: 'person' } } });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(calls).toEqual({ fast: 2, slow: 1 });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(calls).toEqual({ fast: 2, slow: 2 });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(calls).toEqual({ fast: 2, slow: 2 });
+    for (const stop of unsubscribe) stop();
+  });
+
+  it('keeps an invalidated list invalidated through an unrelated patch, so it refetches on mount', async () => {
+    const { queryClient, emit } = setup();
+    const done = keys.tasks.list({ status: ['done'] });
+    queryClient.setQueryData(done, [task('X', 'done')]);
+    // X moves while the list is not mounted.
+    emit({ type: 'task_moved', data: { task: 'X', from: 'done', to: 'todo', mover: { kind: 'person' } } });
+    await vi.waitFor(() => expect(queryClient.getQueryState(done)?.isInvalidated).toBe(true));
+
+    emit({ type: 'task_created', data: { task: task('Y') } }); // a todo task: not for this list
+    expect(queryClient.getQueryState(done)?.isInvalidated).toBe(true);
+
+    const queryFn = vi.fn(async () => [task('Z', 'done')]);
+    const unsubscribe = new QueryObserver(queryClient, { queryKey: done, queryFn }).subscribe(() => {});
+    await vi.waitFor(() => expect(queryFn).toHaveBeenCalledTimes(1));
+    unsubscribe();
+  });
+
+  it('keeps an invalidated task detail invalidated through a patch for the same task, so it refetches on mount', async () => {
+    const { queryClient, emit } = setup();
+    const detail = keys.tasks.detail('X');
+    queryClient.setQueryData(detail, task('X', 'todo'));
+    // X is reassigned while its detail is not mounted: invalidates, does not write.
+    emit({ type: 'task_assigned', data: { task: 'X', assignee: 'M2' } });
+    await vi.waitFor(() => expect(queryClient.getQueryState(detail)?.isInvalidated).toBe(true));
+
+    // A patch for the very same task must not write over the pending invalidation.
+    emit({
+      type: 'subtasks_replaced',
+      data: {
+        task: 'X',
+        subtasks: [{ id: '01JB0000000000000000000S01', text: 'nope', done: false, source: { kind: 'human' } }],
+      },
+    });
+    expect(queryClient.getQueryState(detail)?.isInvalidated).toBe(true);
+    expect(queryClient.getQueryData<Task>(detail)?.subtasks).toEqual([]);
+
+    const queryFn = vi.fn(async () => task('X', 'todo'));
+    const unsubscribe = new QueryObserver(queryClient, { queryKey: detail, queryFn }).subscribe(() => {});
+    await vi.waitFor(() => expect(queryFn).toHaveBeenCalledTimes(1));
+    unsubscribe();
+  });
+
+  it('leaves alone lists an event does not change', () => {
+    const { queryClient, emit } = setup();
+    const done = keys.tasks.list({ status: ['done'] });
+    queryClient.setQueryData(done, [task('X', 'done')]);
+    const before = queryClient.getQueryState(done)?.dataUpdateCount;
+    emit({ type: 'task_created', data: { task: task('Y') } });
+    emit({ type: 'subtasks_replaced', data: { task: 'Y', subtasks: [] } });
+    expect(queryClient.getQueryState(done)?.dataUpdateCount).toBe(before);
+  });
+
+  it('refetches everything instead of throwing on a malformed event', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // A patched type without its task, and a mapped type without its dispatch.
+    const malformed = [
+      { type: 'task_created', data: {} },
+      { type: 'dispatch_started', data: {} },
+    ] as unknown as EventBody[];
+    for (const body of malformed) {
+      const { queryClient, emit } = setup();
+      queryClient.setQueryData(['thing'], 1);
+      expect(() => emit(body)).not.toThrow();
+      await vi.waitFor(() => expect(queryClient.getQueryState(['thing'])?.isInvalidated).toBe(true));
+    }
+    expect(warn).toHaveBeenCalledTimes(2);
   });
 
   it('falls back to refetching when a patch cannot apply', async () => {
@@ -341,5 +557,46 @@ describe('live cache with a scripted stream', () => {
     sockets.at(-1)?.send({ type: 'hello', rev: 1, log: 'LOG-A' });
     expect(live.store.getState().problem).toBeUndefined();
     warn.mockRestore();
+  });
+
+  async function fail(sockets: FakeSocket[], times: number): Promise<void> {
+    for (let i = 0; i < times; i++) {
+      const count = sockets.length;
+      sockets.at(-1)?.drop();
+      await vi.waitFor(() => expect(sockets.length).toBe(count + 1));
+    }
+  }
+
+  it('does not call the hub unreachable when the probe gets through', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const probe = vi.fn(async () => ({ member: 'M' }));
+    const { live, sockets } = setup({ probe });
+    await fail(sockets, 2);
+    await vi.waitFor(() => expect(warn).toHaveBeenCalledTimes(1));
+    expect(warn.mock.calls[0]?.[0]).toContain('answers, but its stream keeps failing');
+    expect(live.store.getState().problem).toBeUndefined();
+  });
+
+  it('probes again every five failures, and says so when the reason changes', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    let answer = new ApiError('unavailable', 'Cannot reach the hub', 0);
+    const probe = vi.fn(async () => {
+      throw answer;
+    });
+    const { live, sockets } = setup({ probe });
+    await fail(sockets, 2);
+    await vi.waitFor(() => expect(live.store.getState().problem).toBe('unreachable'));
+
+    answer = new ApiError('unauthorized', 'Unknown token', 401);
+    await fail(sockets, 4);
+    expect(probe).toHaveBeenCalledTimes(1);
+    await fail(sockets, 1); // five after the first probe
+    await vi.waitFor(() => expect(live.store.getState().problem).toBe('unauthorized'));
+    expect(probe).toHaveBeenCalledTimes(2);
+
+    await fail(sockets, 5); // the same reason again: probed, not logged again
+    await vi.waitFor(() => expect(probe).toHaveBeenCalledTimes(3));
+    expect(live.store.getState().problem).toBe('unauthorized');
+    expect(warn).toHaveBeenCalledTimes(2);
   });
 });

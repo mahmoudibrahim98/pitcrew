@@ -10,9 +10,9 @@ See `docs/build/streams/L.md` and `docs/build/contracts/api-v1.md`. Import from 
 | `types.ts` | Hand-written wire types mirroring the serde names, until generated types exist. `EVENT_TYPES` lists every `EventBody` type. |
 | `keys.ts` | Query keys. Lists and details sit under separate prefixes (`['tasks', 'list', filters]`, `['tasks', 'detail', id]`). |
 | `stream.ts` | `StreamClient`: subprotocol auth, resume by `since`, reset when `since` is ahead of `hello.rev`, when `hello.log` changes, or on a revision gap; capped back-off that starts over only after a stable connection; reconnect after 60 s of silence. No React. |
-| `patches.ts` | Events that carry the whole object (`task_created`, `subtasks_replaced`, `session_discovered`) are written into the cache. |
+| `patches.ts` | Events that carry the whole object (`task_created`, `subtasks_replaced`, `session_discovered`) are written into the cache, except into queries already invalidated (they refetch anyway). |
 | `invalidation.ts` | One entry per event type → the keys it touches. Every event also touches `['events']`. |
-| `live.ts` | Wires it together: patches, then coalesced invalidation (250 ms window, fetches in flight are not cancelled but refetched after they settle); `resetQueries()` on a reset; failed queries refetch when the stream comes back; after repeated failures it probes `GET /v1/me` and reports `problem: 'unauthorized' \| 'unreachable'`. |
+| `live.ts` | Wires it together: patches, then coalesced invalidation (250 ms window). Fetches in flight are not cancelled; each query whose fetch was in flight when an event touched it is refetched once, by its exact key, after that fetch settles. `resetQueries()` on a reset; failed queries refetch when the stream comes back. After 3 connection failures, and every 5 more, it probes `GET /v1/me` and reports `problem: 'unauthorized' \| 'unreachable'` (none when the probe succeeds and only the stream fails). |
 | `provider.tsx` | `<DataProvider>`, `useApi()`, `useConnection()` (`status`, `synced`, `problem`), `useLiveQuery()`, `createQueryClient()`. |
 | `hooks.ts` | Shared hooks: workspace, members, projects, workstreams, tasks, sessions, asks, and `useMoveTask`. |
 
