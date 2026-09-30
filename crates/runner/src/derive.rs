@@ -139,6 +139,7 @@ pub(crate) fn apply(
                     path: relative_to(path, cwd),
                     added: *added,
                     removed: *removed,
+                    receipt: None,
                 },
             });
             (*at, Next::Working)

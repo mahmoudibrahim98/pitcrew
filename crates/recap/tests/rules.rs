@@ -63,6 +63,7 @@ fn edit(s: SessionId, path: &str, added: u32, removed: u32) -> EventBody {
         path: path.into(),
         added,
         removed,
+        receipt: None,
     }
 }
 

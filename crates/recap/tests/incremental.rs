@@ -168,6 +168,7 @@ proptest! {
                         path: text(i),
                         added: big,
                         removed: u32::MAX,
+                        receipt: None,
                     },
                     2 => EventBody::AskRaised {
                         ask: Ask {

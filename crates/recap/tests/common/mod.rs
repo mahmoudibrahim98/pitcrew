@@ -158,6 +158,7 @@ pub fn session(
         started: 0,
         last_activity: 0,
         terminal: None,
+        parent: None,
     }
 }
 
@@ -228,6 +229,7 @@ pub fn gen_events(specs: &[Spec], w: &World, start: i64, first_id: u64) -> Vec<E
                     path: FILES[b % FILES.len()].into(),
                     added: u32::from(a as u8),
                     removed: u32::from(b as u8 / 3),
+                    receipt: None,
                 },
             ),
             6 => (

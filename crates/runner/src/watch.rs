@@ -1326,6 +1326,7 @@ fn session_of(row: &Row, tref: &TranscriptRef, machine: MachineId) -> Session {
         started: meta.started.unwrap_or(last_activity),
         last_activity,
         terminal: None,
+        parent: None,
     }
 }
 
