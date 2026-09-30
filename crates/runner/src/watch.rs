@@ -679,7 +679,6 @@ fn split(
                 commit: Commit::Partial {
                     session: row.session,
                     emitted_through: through,
-                    discovered: true,
                 },
             });
         }
