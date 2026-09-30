@@ -15,14 +15,27 @@ fn main() {
     let mut stdin = stdin.lock();
 
     // The hook skips argument parsing, prints nothing and always exits 0, even if the daemon
-    // hangs.
-    if args.get(1).is_some_and(|a| a == "hook") {
+    // hangs or the hook itself panics.
+    if let Some(hook_args) = pitcrew_cli::hook_args(&args) {
+        let debug = env(pitcrew_cli::hook::DEBUG_VAR).is_some_and(|v| !v.is_empty());
+        std::panic::set_hook(Box::new(move |info| {
+            if debug {
+                let info = pitcrew_cli::display::line(&info.to_string());
+                eprintln!("pitcrew hook: {info}");
+            }
+            std::process::exit(0);
+        }));
         exit_after(pitcrew_cli::hook::DEADLINE, 0, None);
-        let result = pitcrew_cli::hook::run(&args[2..], &env, &mut stdin, stdin_is_terminal);
+        // Lets tests check the panic hook; debug builds only.
+        #[cfg(debug_assertions)]
+        if env("PITCREW_HOOK_TEST_PANIC").is_some() {
+            panic!("a test panic in the hook");
+        }
+        let result = pitcrew_cli::hook::run(hook_args, &env, &mut stdin, stdin_is_terminal);
         if let Err(e) = result
-            && env(pitcrew_cli::hook::DEBUG_VAR).is_some_and(|v| !v.is_empty())
+            && debug
         {
-            eprintln!("pitcrew hook: {e}");
+            eprintln!("pitcrew hook: {}", pitcrew_cli::display::line(&e.message));
         }
         std::process::exit(0);
     }

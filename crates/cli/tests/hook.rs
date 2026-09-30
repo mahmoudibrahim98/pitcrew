@@ -13,10 +13,18 @@ use std::time::{Duration, Instant};
 
 const PAYLOAD: &str = r#"{"session_id":"00000000-0000-4000-8000-000000000000","hook_event_name":"Stop","cwd":"/work/example"}"#;
 
-/// Runs the binary with only `env` among the `PITCREW_*` variables.
+/// Runs `pitcrew hook <args>` with only `env` among the `PITCREW_*` variables.
 fn hook(args: &[&str], env: &[(&str, &str)], stdin: Option<&[u8]>) -> (Output, Duration) {
+    let all: Vec<&str> = std::iter::once("hook")
+        .chain(args.iter().copied())
+        .collect();
+    pitcrew(&all, env, stdin)
+}
+
+/// Runs `pitcrew <args>` with only `env` among the `PITCREW_*` variables.
+fn pitcrew(args: &[&str], env: &[(&str, &str)], stdin: Option<&[u8]>) -> (Output, Duration) {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_pitcrew"));
-    cmd.arg("hook").args(args);
+    cmd.args(args);
     for var in [
         "PITCREW_SOCKET",
         "PITCREW_PIPE",
@@ -24,6 +32,7 @@ fn hook(args: &[&str], env: &[(&str, &str)], stdin: Option<&[u8]>) -> (Output, D
         "PITCREW_TOKEN",
         "PITCREW_TOKEN_FILE",
         "PITCREW_HOOK_DEBUG",
+        "PITCREW_HOOK_TEST_PANIC",
     ] {
         cmd.env_remove(var);
     }
@@ -164,6 +173,49 @@ fn bad_input_is_not_sent() {
         assert_silent_success(&output);
     }
     assert!(server.requests().is_empty());
+}
+
+#[test]
+fn a_panic_in_the_hook_is_silent_unless_debugging() {
+    // `PITCREW_HOOK_TEST_PANIC` makes a debug build panic on the hook path.
+    let env = [("PITCREW_TOKEN", TOKEN), ("PITCREW_HOOK_TEST_PANIC", "1")];
+    let (output, _) = hook(&["claude", "Stop"], &env, Some(PAYLOAD.as_bytes()));
+    assert_silent_success(&output);
+
+    let debug = [env[0], env[1], ("PITCREW_HOOK_DEBUG", "1")];
+    let (output, _) = hook(&["claude", "Stop"], &debug, Some(PAYLOAD.as_bytes()));
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("a test panic in the hook"), "{err}");
+}
+
+#[test]
+fn a_global_flag_before_hook_keeps_the_fast_path() {
+    let server = accepting();
+    let env = [
+        ("PITCREW_URL", server.url.as_str()),
+        ("PITCREW_TOKEN", TOKEN),
+    ];
+    let (output, _) = pitcrew(
+        &["--json", "hook", "claude", "Stop"],
+        &env,
+        Some(PAYLOAD.as_bytes()),
+    );
+    assert_silent_success(&output);
+    assert_eq!(server.requests()[0].route(), "POST /v1/hooks/claude/Stop");
+
+    // Only the fast path has the test panic and its debug message.
+    let debug = [
+        env[0],
+        env[1],
+        ("PITCREW_HOOK_DEBUG", "1"),
+        ("PITCREW_HOOK_TEST_PANIC", "1"),
+    ];
+    let (output, _) = pitcrew(&["--json", "hook", "claude", "Stop"], &debug, None);
+    assert_eq!(output.status.code(), Some(0));
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("a test panic in the hook"), "{err}");
 }
 
 #[test]
