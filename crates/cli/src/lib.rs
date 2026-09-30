@@ -15,6 +15,7 @@
 
 pub mod client;
 pub mod config;
+pub mod display;
 pub mod error;
 pub mod hook;
 pub mod http;
@@ -31,6 +32,23 @@ use transport::Timeouts;
 
 /// Largest text read from stdin (plans, `-` texts).
 pub const MAX_STDIN: usize = 1 << 20;
+
+/// The arguments after `hook` when this run is the hook: `hook` is the first argument after the
+/// program name and any global `--json` flags. `main` then takes the fast, silent path.
+#[must_use]
+pub fn hook_args(args: &[OsString]) -> Option<&[OsString]> {
+    let first = args
+        .iter()
+        .skip(1)
+        .position(|a| a != "--json")
+        .map(|i| i + 1)?;
+    (args[first] == "hook").then(|| &args[first + 1..])
+}
+
+/// Checks a task argument before anything is sent (see `verbs::task_ref`).
+fn task_arg(value: &str) -> std::result::Result<String, String> {
+    verbs::task_ref(value).map_err(|e| e.message)
+}
 
 /// Where a run reads and writes. `main` passes the process's own streams; tests pass buffers.
 pub struct Io<'a> {
@@ -84,12 +102,14 @@ enum Command {
     /// Start work on a task: move it to in_progress.
     Claim {
         /// Task key (PAP-4) or id.
+        #[arg(value_parser = task_arg)]
         task: String,
     },
     /// Report progress: comment on a task, and move it to review when asked.
     #[command(group(ArgGroup::new("what").required(true).multiple(true).args(["note", "review"])))]
     Report {
         /// Task key or id.
+        #[arg(value_parser = task_arg)]
         task: String,
         /// A note to post as a comment (`-` reads it from stdin).
         #[arg(long)]
@@ -101,6 +121,7 @@ enum Command {
     /// Comment on a task.
     Comment {
         /// Task key or id.
+        #[arg(value_parser = task_arg)]
         task: String,
         /// The comment (`-` reads it from stdin).
         #[arg(required = true)]
@@ -124,7 +145,7 @@ enum Command {
         #[arg(long)]
         body: Option<String>,
         /// The task it is about.
-        #[arg(long)]
+        #[arg(long, value_parser = task_arg)]
         task: Option<String>,
         /// question, decision, review, approval or mention.
         #[arg(long, default_value = "question")]
@@ -168,11 +189,13 @@ enum TaskCommand {
     /// Show a task: its brief, status and subtasks.
     Show {
         /// Task key or id.
+        #[arg(value_parser = task_arg)]
         task: String,
     },
     /// Move a task to another status.
     Move {
         /// Task key or id.
+        #[arg(value_parser = task_arg)]
         task: String,
         /// backlog, todo, in_progress, review, done or canceled.
         status: String,
@@ -180,6 +203,7 @@ enum TaskCommand {
     /// Replace your own plan on a task with the one on stdin (one step per line; `[x]` done).
     Plan {
         /// Task key or id.
+        #[arg(value_parser = task_arg)]
         task: String,
     },
 }
@@ -216,10 +240,11 @@ pub fn run(args: Vec<OsString>, env: Env<'_>, io: &mut Io<'_>) -> i32 {
     match execute(cli.command, env, io, cli.json) {
         Ok(()) => 0,
         Err(e) => {
+            // Messages can quote the daemon, so text mode makes them safe to print.
             let text = if cli.json {
                 format!("{}\n", e.to_json())
             } else {
-                format!("pitcrew: {e}\n")
+                format!("pitcrew: {}\n", display::line(&e.message))
             };
             let _ = io.stderr.write_all(text.as_bytes());
             e.exit_code()
@@ -230,7 +255,7 @@ pub fn run(args: Vec<OsString>, env: Env<'_>, io: &mut Io<'_>) -> i32 {
 fn execute(command: Command, env: Env<'_>, io: &mut Io<'_>, json: bool) -> Result<()> {
     let client = client::Client::from_env(env, Timeouts::VERB)?;
     client.check_version()?;
-    let mut verb = verbs::Verb::new(client, io, json);
+    let mut verb = verbs::Verb::connect(client, io, json)?;
     match command {
         Command::Whoami => verb.whoami(),
         Command::Task(TaskCommand::List { mine, status }) => verb.task_list(mine, &status),
@@ -263,5 +288,40 @@ fn execute(command: Command, env: Env<'_>, io: &mut Io<'_>, json: bool) -> Resul
         Command::Check => verb.check(),
         // Handled in `run`.
         Command::Hook { .. } => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<OsString> {
+        list.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn the_hook_is_found_after_global_flags() {
+        let hook = |list: &[&str]| {
+            let all = args(list);
+            hook_args(&all).map(<[OsString]>::to_vec)
+        };
+        assert_eq!(
+            hook(&["pitcrew", "hook", "claude", "Stop"]),
+            Some(args(&["claude", "Stop"]))
+        );
+        assert_eq!(
+            hook(&["pitcrew", "--json", "--json", "hook", "codex"]),
+            Some(args(&["codex"]))
+        );
+        assert_eq!(hook(&["pitcrew", "hook"]), Some(Vec::new()));
+        for other in [
+            &["pitcrew"][..],
+            &["pitcrew", "--json"],
+            &["pitcrew", "task", "hook"],
+            &["pitcrew", "--help", "hook"],
+            &["pitcrew", "whoami"],
+        ] {
+            assert_eq!(hook(other), None, "{other:?}");
+        }
     }
 }

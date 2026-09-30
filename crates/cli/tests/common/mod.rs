@@ -56,8 +56,8 @@ impl Recorded {
 /// `(status, body)` for a request.
 pub type Handler = Arc<dyn Fn(&Recorded) -> (u16, String) + Send + Sync>;
 
-/// Answers `routes` (`"METHOD /path"` → status and JSON), `GET /v1/host/info` by default, and
-/// 404 for anything else.
+/// Answers `routes` (`"METHOD /path"` → status and JSON); by default `GET /v1/host/info` and
+/// `GET /v1/me` (the agent @writer); 404 for anything else.
 pub fn routes(routes: &[(&str, u16, Value)]) -> Handler {
     let mut table: HashMap<String, (u16, String)> = routes
         .iter()
@@ -66,6 +66,9 @@ pub fn routes(routes: &[(&str, u16, Value)]) -> Handler {
     table
         .entry("GET /v1/host/info".into())
         .or_insert_with(|| (200, host_info(1, 1).to_string()));
+    table
+        .entry("GET /v1/me".into())
+        .or_insert_with(|| (200, writer().to_string()));
     Arc::new(move |req| {
         table.get(&req.route()).cloned().unwrap_or_else(|| {
             (
@@ -98,6 +101,10 @@ pub fn members() -> Value {
 
 pub fn writer() -> Value {
     members()[1].clone()
+}
+
+pub fn sam() -> Value {
+    members()[0].clone()
 }
 
 pub fn task(id: &str, key: &str, status: &str) -> Value {
@@ -199,11 +206,11 @@ impl FakeServer {
         self.requests.lock().unwrap().clone()
     }
 
-    /// Requests other than the version check.
+    /// Requests other than the two every verb makes first: the version check and `GET /v1/me`.
     pub fn api_requests(&self) -> Vec<Recorded> {
         self.requests()
             .into_iter()
-            .filter(|r| r.target != "/v1/host/info")
+            .filter(|r| r.target != "/v1/host/info" && r.target != "/v1/me")
             .collect()
     }
 }

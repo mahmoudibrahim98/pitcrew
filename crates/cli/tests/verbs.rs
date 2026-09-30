@@ -563,6 +563,122 @@ fn the_hook_subcommand_through_the_parser_is_silent() {
     assert_eq!((code, out.as_str(), err.as_str()), (0, "", ""));
 }
 
+#[test]
+fn a_persons_token_is_refused_and_nothing_changes() {
+    let server = FakeServer::tcp(routes(&[
+        ("GET /v1/me", 200, sam()),
+        (
+            "GET /v1/tasks/PAP-1",
+            200,
+            task(TASK1, "PAP-1", "in_progress"),
+        ),
+        (
+            &format!("PUT /v1/tasks/{TASK1}/subtasks"),
+            200,
+            task(TASK1, "PAP-1", "in_progress"),
+        ),
+    ]));
+    for args in [
+        &["task", "plan", "PAP-1"][..],
+        &["whoami"],
+        &["claim", "PAP-1"],
+        &["check"],
+    ] {
+        let (code, out, err) = run_on(&server, args, "- [ ] Replace everything\n");
+        assert_eq!(code, 2, "{args:?}: {err}");
+        assert_eq!(out, "");
+        assert!(err.contains("only agent tokens are accepted"), "{err}");
+        assert!(err.contains("@sam, a person"), "{err}");
+    }
+    let routes: Vec<String> = server.requests().iter().map(Recorded::route).collect();
+    assert!(
+        routes
+            .iter()
+            .all(|r| r == "GET /v1/host/info" || r == "GET /v1/me"),
+        "{routes:?}"
+    );
+}
+
+#[test]
+fn task_references_other_than_keys_and_ids_are_refused_before_sending() {
+    let server = FakeServer::tcp(routes(&[]));
+    for args in [
+        &["task", "show", ".."][..],
+        &["task", "show", "."],
+        &["task", "move", "../me", "review"],
+        &["task", "plan", "PAP-1/.."],
+        &["claim", "%2e%2e"],
+        &["report", "..", "--review"],
+        &["comment", ".", "hi"],
+        &["ask", "@sam", "x", "--task", ".."],
+    ] {
+        let (code, _, err) = run_on(&server, args, "");
+        assert_eq!(code, 2, "{args:?}");
+        assert!(err.contains("not a task key"), "{err}");
+    }
+    assert!(server.requests().is_empty());
+}
+
+#[test]
+fn text_output_strips_control_characters_and_json_keeps_them() {
+    let evil_title = "Fix \u{1b}]0;owned\u{7}the \u{1b}[31mbug\u{1b}[0m\u{202e}txt.exe";
+    let mut hostile = task(TASK1, "PAP-1", "in_progress");
+    hostile["title"] = json!(evil_title);
+    hostile["description"] = json!("Line one\u{1b}[2J\nLine two\u{2066}");
+    hostile["labels"] = json!(["a\u{1b}[1mb"]);
+    hostile["subtasks"][0]["text"] = json!("Out\u{9b}31mline");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let answered = json!({
+        "id": ASK1, "kind": "question", "from": WRITER, "to": SAM, "task": TASK1,
+        "title": evil_title, "body": "", "options": ["Y\u{1b}[5mes"], "receipts": [],
+        "state": "answered",
+        // A server-sent index that `+ 1` would overflow.
+        "answer": {"by": SAM, "option": u64::MAX, "text": "ok\u{1b}[8m", "at": now},
+        "created": now
+    });
+    let server = FakeServer::tcp(routes(&[
+        ("GET /v1/members", 200, members()),
+        ("GET /v1/tasks/PAP-1", 200, hostile.clone()),
+        ("GET /v1/tasks", 200, json!([hostile.clone()])),
+        ("GET /v1/asks", 200, json!([answered])),
+        (
+            "POST /v1/tasks/PAP-1/move",
+            409,
+            api_error("conflict", "No \u{1b}[31mway\u{202e}"),
+        ),
+    ]));
+    for args in [
+        &["task", "show", "PAP-1"][..],
+        &["task", "list"],
+        &["check"],
+    ] {
+        let (code, out, err) = run_on(&server, args, "");
+        assert_eq!((code, err.as_str()), (0, ""), "{args:?}");
+        assert!(
+            !out.contains(['\u{1b}', '\u{7}', '\u{9b}', '\u{202e}', '\u{2066}']),
+            "{args:?}: {out:?}"
+        );
+        assert!(out.contains("Fix ]0;ownedthe [31mbug[0mtxt.exe"), "{out:?}");
+    }
+    let (_, out, _) = run_on(&server, &["check"], "");
+    assert!(out.contains("[1) Y[5mes]"), "{out}");
+    assert!(
+        out.contains(&format!("\u{2192} {}) ; \"ok[8m\"", u64::MAX)),
+        "{out}"
+    );
+
+    let (code, _, err) = run_on(&server, &["task", "move", "PAP-1", "review"], "");
+    assert_eq!(code, 4);
+    assert_eq!(err, "pitcrew: No [31mway\n");
+
+    let (code, out, _) = run_on(&server, &["--json", "task", "show", "PAP-1"], "");
+    assert_eq!(code, 0);
+    assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), hostile);
+}
+
 #[cfg(unix)]
 mod unix {
     use super::*;

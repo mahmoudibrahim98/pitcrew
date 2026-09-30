@@ -1,6 +1,11 @@
 //! The agent verbs. Each prints short, plain text, or with `--json` the daemon's JSON.
+//!
+//! They act only with an agent token: the first thing each does is ask the daemon whose token
+//! it holds, and a person's token is refused (stream I never acts with device tokens). In text
+//! output every string from the daemon goes through [`crate::display`].
 
 use crate::client::{Client, from_value};
+use crate::display;
 use crate::error::{Error, Kind, Result};
 use crate::http::encode;
 use crate::plan;
@@ -20,22 +25,41 @@ const RECENT_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const STATUSES: &str = "backlog, todo, in_progress, review, done, canceled";
 const ASK_KINDS: &str = "question, decision, review, approval, mention";
 
-/// A verb's working state: the client, the output, and what it has already fetched.
+/// A verb's working state: the client, the output, the caller, and what it has fetched.
 pub(crate) struct Verb<'io, 'a> {
     client: Client,
     io: &'io mut Io<'a>,
     json: bool,
+    /// The token's member, an agent.
+    me: Member,
+    /// The same, as the daemon sent it.
+    me_value: Value,
     members: Option<Vec<Member>>,
 }
 
 impl<'io, 'a> Verb<'io, 'a> {
-    pub(crate) fn new(client: Client, io: &'io mut Io<'a>, json: bool) -> Self {
-        Self {
+    /// Asks the daemon whose token this is, and refuses anyone but an agent.
+    ///
+    /// # Errors
+    /// `invalid` for a person's token; any error from the daemon.
+    pub(crate) fn connect(client: Client, io: &'io mut Io<'a>, json: bool) -> Result<Self> {
+        let me_value = client.get("/me")?;
+        let me: Member = from_value(me_value.clone())?;
+        if me.kind != MemberKind::Agent {
+            return Err(Error::invalid(format!(
+                "only agent tokens are accepted, and this one belongs to {}, a person; use the \
+                 agent token the runner sets in PITCREW_TOKEN",
+                display::line(&me.handle)
+            )));
+        }
+        Ok(Self {
             client,
             io,
             json,
+            me,
+            me_value,
             members: None,
-        }
+        })
     }
 
     // ─── Output ──────────────────────────────────────────────────────────────────────────────
@@ -57,10 +81,6 @@ impl<'io, 'a> Verb<'io, 'a> {
 
     // ─── Lookups ─────────────────────────────────────────────────────────────────────────────
 
-    fn me(&mut self) -> Result<Member> {
-        from_value(self.client.get("/me")?)
-    }
-
     fn members(&mut self) -> Result<&[Member]> {
         if self.members.is_none() {
             self.members = Some(from_value(self.client.get("/members")?)?);
@@ -68,13 +88,13 @@ impl<'io, 'a> Verb<'io, 'a> {
         Ok(self.members.as_deref().unwrap_or_default())
     }
 
-    /// `@handle`, or the id when the member is unknown.
+    /// `@handle`, safe to print, or the id when the member is unknown.
     fn handle(&mut self, id: MemberId) -> Result<String> {
         Ok(self
             .members()?
             .iter()
             .find(|m| m.id == id)
-            .map_or_else(|| id.to_string(), |m| m.handle.clone()))
+            .map_or_else(|| id.to_string(), |m| display::line(&m.handle)))
     }
 
     /// A member by `@handle`, handle, or id.
@@ -91,13 +111,13 @@ impl<'io, 'a> Verb<'io, 'a> {
             .find(|m| m.handle.trim_start_matches('@').eq_ignore_ascii_case(want))
             .map(|m| m.id)
             .ok_or_else(|| {
-                let known: Vec<&str> = members.iter().map(|m| m.handle.as_str()).collect();
+                let known: Vec<String> = members.iter().map(|m| display::line(&m.handle)).collect();
                 Error::invalid(format!("no member {who}; members: {}", known.join(", ")))
             })
     }
 
     fn task(&mut self, reference: &str) -> Result<(Task, Value)> {
-        let value = self.client.get(&task_path(reference, ""))?;
+        let value = self.client.get(&task_path(reference, "")?)?;
         Ok((from_value(value.clone())?, value))
     }
 
@@ -121,7 +141,7 @@ impl<'io, 'a> Verb<'io, 'a> {
     ) -> Result<(Value, bool)> {
         match self
             .client
-            .post(&task_path(reference, "/move"), &json!({ "to": to }))
+            .post(&task_path(reference, "/move")?, &json!({ "to": to }))
         {
             Ok(value) => Ok((value, true)),
             Err(e) if repeatable && e.kind == Kind::Conflict => {
@@ -139,23 +159,26 @@ impl<'io, 'a> Verb<'io, 'a> {
     // ─── Verbs ───────────────────────────────────────────────────────────────────────────────
 
     pub(crate) fn whoami(&mut self) -> Result<()> {
-        let value = self.client.get("/me")?;
         if self.json {
+            let value = self.me_value.clone();
             return self.print_json(&value);
         }
-        let me: Member = from_value(value)?;
-        let what = match (me.kind, me.owner) {
-            (MemberKind::Agent, Some(owner)) => format!("an agent of {}", self.handle(owner)?),
-            (MemberKind::Agent, None) => "an agent".to_owned(),
-            (MemberKind::Human, _) => "a person".to_owned(),
+        let what = match self.me.owner {
+            Some(owner) => format!("an agent of {}", self.handle(owner)?),
+            None => "an agent".to_owned(),
         };
-        self.print(&format!("{} ({}), {what}\n", me.handle, me.name))
+        let text = format!(
+            "{} ({}), {what}\n",
+            display::line(&self.me.handle),
+            display::line(&self.me.name)
+        );
+        self.print(&text)
     }
 
     pub(crate) fn task_list(&mut self, mine: bool, statuses: &[String]) -> Result<()> {
         let mut query: Vec<(&str, String)> = Vec::new();
         if mine {
-            query.push(("assignee", self.me()?.id.0.to_string()));
+            query.push(("assignee", self.me.id.0.to_string()));
         }
         for status in statuses {
             let status: TaskStatus = parse_enum("status", status, STATUSES)?;
@@ -181,7 +204,7 @@ impl<'io, 'a> Verb<'io, 'a> {
                 task.key.to_string(),
                 wire(&task.status),
                 assignee,
-                task.title.clone(),
+                display::line(&task.title),
             ]);
         }
         self.print(&table(&rows))
@@ -192,7 +215,7 @@ impl<'io, 'a> Verb<'io, 'a> {
         if self.json {
             return self.print_json(&value);
         }
-        let mut out = format!("{}  {}\n", task.key, task.title);
+        let mut out = format!("{}  {}\n", task.key, display::line(&task.title));
         let mut facts = vec![format!("status {}", wire(&task.status))];
         if task.priority != pitcrew_protocol::model::Priority::None {
             facts.push(format!("priority {}", wire(&task.priority)));
@@ -201,10 +224,11 @@ impl<'io, 'a> Verb<'io, 'a> {
             facts.push(format!("assignee {}", self.handle(id)?));
         }
         if let Some(due) = &task.due {
-            facts.push(format!("due {}", due.0));
+            facts.push(format!("due {}", display::line(&due.0)));
         }
         if !task.labels.is_empty() {
-            facts.push(format!("labels {}", task.labels.join(", ")));
+            let labels: Vec<String> = task.labels.iter().map(|l| display::line(l)).collect();
+            facts.push(format!("labels {}", labels.join(", ")));
         }
         let _ = writeln!(out, "{}", facts.join(" · "));
         if !task.blocked_by.is_empty() {
@@ -216,8 +240,9 @@ impl<'io, 'a> Verb<'io, 'a> {
                 .collect();
             let _ = writeln!(out, "blocked by {}", blockers.join(", "));
         }
-        if !task.description.trim().is_empty() {
-            let _ = write!(out, "\n{}\n", task.description.trim_end());
+        let description = display::text(&task.description);
+        if !description.trim().is_empty() {
+            let _ = write!(out, "\n{}\n", description.trim_end());
         }
         if !task.subtasks.is_empty() {
             out.push_str("\nSubtasks:\n");
@@ -229,7 +254,7 @@ impl<'io, 'a> Verb<'io, 'a> {
                     }
                     pitcrew_protocol::model::SubtaskSource::Human => String::new(),
                 };
-                let _ = writeln!(out, "  [{mark}] {}{origin}", sub.text);
+                let _ = writeln!(out, "  [{mark}] {}{origin}", display::line(&sub.text));
             }
         }
         self.print(&out)
@@ -253,15 +278,14 @@ impl<'io, 'a> Verb<'io, 'a> {
         }
         let text = read_stdin(self.io)?;
         let steps = plan::parse(&text)?;
-        let me = self.me()?;
         let (task, _) = self.task(reference)?;
-        let subtasks = plan::to_subtasks(steps, me.id, &task.subtasks);
+        let subtasks = plan::to_subtasks(steps, self.me.id, &task.subtasks);
         let (total, done) = (subtasks.len(), subtasks.iter().filter(|s| s.done).count());
         let body = serde_json::to_value(&subtasks)
             .map_err(|e| Error::internal(format!("cannot encode the plan: {e}")))?;
         let value = self
             .client
-            .put(&task_path(&task.id.0.to_string(), "/subtasks"), &body)?;
+            .put(&task_path(&task.id.0.to_string(), "/subtasks")?, &body)?;
         if self.json {
             return self.print_json(&value);
         }
@@ -293,12 +317,13 @@ impl<'io, 'a> Verb<'io, 'a> {
         if note.is_none() && !review {
             return Err(Error::invalid("give --note <text>, --review, or both"));
         }
+        let key = task_ref(reference)?;
         let note = note
             .map(|n| text_arg(&[n.to_owned()], self.io))
             .transpose()?;
         let comment = match note {
             Some(text) => Some(self.client.post(
-                &task_path(reference, "/comments"),
+                &task_path(reference, "/comments")?,
                 &json!({ "text": text, "mentions": [] }),
             )?),
             None => None,
@@ -312,7 +337,6 @@ impl<'io, 'a> Verb<'io, 'a> {
             let task = moved.as_ref().map(|(v, _)| v.clone());
             return self.print_json(&json!({ "comment": comment, "task": task }));
         }
-        let key = task_ref(reference);
         let mut out = String::new();
         if comment.is_some() {
             let _ = writeln!(out, "Noted on {key}.");
@@ -335,19 +359,20 @@ impl<'io, 'a> Verb<'io, 'a> {
         text: &[String],
         mentions: &[String],
     ) -> Result<()> {
+        let key = task_ref(reference)?;
         let text = text_arg(text, self.io)?;
         let ids = mentions
             .iter()
             .map(|m| self.member_id(m))
             .collect::<Result<Vec<_>>>()?;
         let value = self.client.post(
-            &task_path(reference, "/comments"),
+            &task_path(reference, "/comments")?,
             &json!({ "text": text, "mentions": ids }),
         )?;
         if self.json {
             return self.print_json(&value);
         }
-        let mut out = format!("Commented on {}.", task_ref(reference));
+        let mut out = format!("Commented on {key}.");
         if !ids.is_empty() {
             let handles = ids
                 .iter()
@@ -382,7 +407,7 @@ impl<'io, 'a> Verb<'io, 'a> {
             "Asked {} ({}): {}\n",
             self.handle(ask.to)?,
             ask.id,
-            ask.title
+            display::line(&ask.title)
         );
         if !ask.options.is_empty() {
             let _ = writeln!(out, "  options: {}", numbered(&ask.options));
@@ -421,7 +446,7 @@ impl<'io, 'a> Verb<'io, 'a> {
     }
 
     pub(crate) fn check(&mut self) -> Result<()> {
-        let me = self.me()?;
+        let me = self.me.clone();
         let asks: Vec<Ask> = from_value(self.client.get("/asks")?)?;
         let now = now_ms();
         let recent = |at: i64| now.saturating_sub(at) <= RECENT_MS;
@@ -505,7 +530,7 @@ impl<'io, 'a> Verb<'io, 'a> {
             let key = keys.get(&task).cloned().unwrap_or_else(|| task.to_string());
             let _ = write!(line, " on {key}");
         }
-        let _ = write!(line, ": {}", ask.title);
+        let _ = write!(line, ": {}", display::line(&ask.title));
         if !ask.options.is_empty() {
             let _ = write!(line, "  [{}]", numbered(&ask.options));
         }
@@ -513,10 +538,14 @@ impl<'io, 'a> Verb<'io, 'a> {
             let mut parts = Vec::new();
             if let Some(i) = answer.option {
                 let chosen = ask.options.get(i).map_or("", String::as_str);
-                parts.push(format!("{}) {chosen}", i + 1));
+                parts.push(format!(
+                    "{}) {}",
+                    i.saturating_add(1),
+                    display::line(chosen)
+                ));
             }
             if let Some(text) = &answer.text {
-                parts.push(format!("{text:?}"));
+                parts.push(format!("\"{}\"", display::line(text)));
             }
             let _ = write!(line, "\n      → {}", parts.join("; "));
         }
@@ -537,19 +566,28 @@ pub(crate) struct AskArgs {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────────────────────
 
-/// A task key in upper case (`pap-1` → `PAP-1`); anything else (an id) as given.
-fn task_ref(reference: &str) -> String {
+/// A task reference as the daemon takes it: a key in upper case (`pap-1` → `PAP-1`), or an id
+/// (`tsk_…` or a bare ULID) as a bare ULID. Anything else is refused here, so nothing but these
+/// shapes (never `.` or `..`) reaches a path.
+///
+/// # Errors
+/// `invalid` for anything that is neither a key nor an id.
+pub(crate) fn task_ref(reference: &str) -> Result<String> {
     let trimmed = reference.trim();
     let upper = trimmed.to_ascii_uppercase();
-    if trimmed.contains('-') && upper.parse::<TaskKey>().is_ok() {
-        upper
-    } else {
-        trimmed.to_owned()
+    if let Ok(key) = upper.parse::<TaskKey>() {
+        return Ok(key.to_string());
     }
+    if let Ok(id) = trimmed.parse::<TaskId>() {
+        return Ok(id.0.to_string());
+    }
+    Err(Error::invalid(format!(
+        "{reference:?} is not a task key (like PAP-4) or a task id (tsk_…)"
+    )))
 }
 
-fn task_path(reference: &str, rest: &str) -> String {
-    format!("/tasks/{}{rest}", encode(&task_ref(reference)))
+fn task_path(reference: &str, rest: &str) -> Result<String> {
+    Ok(format!("/tasks/{}{rest}", encode(&task_ref(reference)?)))
 }
 
 fn query_string(pairs: &[(&str, String)]) -> String {
@@ -606,7 +644,7 @@ fn numbered(options: &[String]) -> String {
     options
         .iter()
         .enumerate()
-        .map(|(i, o)| format!("{}) {o}", i + 1))
+        .map(|(i, o)| format!("{}) {}", i.saturating_add(1), display::line(o)))
         .collect::<Vec<_>>()
         .join("  ")
 }
@@ -646,14 +684,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn task_refs() {
-        assert_eq!(task_ref(" pap-12 "), "PAP-12");
-        assert_eq!(task_ref("PAP-1"), "PAP-1");
+    fn task_refs_are_keys_or_ids_only() {
+        assert_eq!(task_ref(" pap-12 ").unwrap(), "PAP-12");
+        assert_eq!(task_ref("PAP-1").unwrap(), "PAP-1");
         assert_eq!(
-            task_ref("tsk_01JB000000000000000TSK0001"),
-            "tsk_01JB000000000000000TSK0001"
+            task_ref("tsk_01JB000000000000000TSK0001").unwrap(),
+            "01JB000000000000000TSK0001"
         );
-        assert_eq!(task_path("a/b", "/move"), "/tasks/a%2Fb/move");
+        assert_eq!(
+            task_ref("01JB000000000000000TSK0001").unwrap(),
+            "01JB000000000000000TSK0001"
+        );
+        assert_eq!(task_path("pap-3", "/move").unwrap(), "/tasks/PAP-3/move");
+        for bad in [
+            ".", "..", "", " ", "a/b", "../me", "PAP", "PAP-0", "PAP-1/..", "p-1", "PAP-1?x",
+            "tsk_", "%2e%2e",
+        ] {
+            let err = task_ref(bad).unwrap_err();
+            assert_eq!(err.kind, Kind::Invalid, "{bad:?}");
+            assert!(task_path(bad, "/move").is_err(), "{bad:?}");
+        }
     }
 
     #[test]
