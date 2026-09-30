@@ -1,0 +1,115 @@
+/* PitCrew design tokens. Owned by stream 0; stream L builds components on them.
+   Source of truth: tokens.json (keep both in step). Light by default; dark follows the system
+   unless data-theme="light" is set, and data-theme="dark" forces dark. */
+
+:root {
+  --pc-font-sans: "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --pc-font-mono: "Geist Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --pc-text-xs: 11px;
+  --pc-text-sm: 12.5px;
+  --pc-text-md: 13.5px;
+  --pc-text-lg: 15px;
+  --pc-text-xl: 18px;
+  --pc-text-2xl: 22px;
+  --pc-radius-sm: 5px;
+  --pc-radius-md: 8px;
+  --pc-radius-lg: 10px;
+  --pc-radius-pill: 999px;
+  --pc-space-1: 4px;
+  --pc-space-2: 8px;
+  --pc-space-3: 12px;
+  --pc-space-4: 16px;
+  --pc-space-5: 24px;
+  --pc-space-6: 32px;
+  --pc-sidebar-width: 248px;
+  --pc-row-height: 32px;
+  --pc-duration-fast: 120ms;
+  --pc-duration-base: 180ms;
+  --pc-bg: #FFFFFF;
+  --pc-sidebar: #F7F7F8;
+  --pc-sunken: #F4F4F5;
+  --pc-card: #FFFFFF;
+  --pc-hover: #F4F4F5;
+  --pc-ink: #18181B;
+  --pc-ink-2: #52525B;
+  --pc-muted: #85858F;
+  --pc-line: #E7E7EA;
+  --pc-line-2: #D4D4D8;
+  --pc-accent: #5B5BD6;
+  --pc-accent-hover: #4A4AC4;
+  --pc-accent-soft: #EEEEFC;
+  --pc-accent-text: #4141B5;
+  --pc-on-accent: #FFFFFF;
+  --pc-ok: #15803D;
+  --pc-ok-soft: #E7F5EC;
+  --pc-warn: #B45F06;
+  --pc-warn-soft: #FDF1E2;
+  --pc-risk: #D02626;
+  --pc-risk-soft: #FCEBEB;
+  --pc-progress: #D97706;
+  --pc-shadow: 0 16px 40px rgba(24,24,27,.14);
+  color-scheme: light;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --pc-bg: #111113;
+    --pc-sidebar: #161618;
+    --pc-sunken: #1C1C1F;
+    --pc-card: #18181B;
+    --pc-hover: #222225;
+    --pc-ink: #EDEDEF;
+    --pc-ink-2: #B4B4BB;
+    --pc-muted: #82828C;
+    --pc-line: #27272A;
+    --pc-line-2: #3A3A40;
+    --pc-accent: #8B8CF8;
+    --pc-accent-hover: #A5A6FA;
+    --pc-accent-soft: #23234A;
+    --pc-accent-text: #C4C5FD;
+    --pc-on-accent: #0E0E1A;
+    --pc-ok: #4ADE80;
+    --pc-ok-soft: #14291B;
+    --pc-warn: #F2A65A;
+    --pc-warn-soft: #2E2213;
+    --pc-risk: #F87171;
+    --pc-risk-soft: #2F1818;
+    --pc-progress: #F59E0B;
+    --pc-shadow: 0 16px 40px rgba(0,0,0,.55);
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  --pc-bg: #111113;
+  --pc-sidebar: #161618;
+  --pc-sunken: #1C1C1F;
+  --pc-card: #18181B;
+  --pc-hover: #222225;
+  --pc-ink: #EDEDEF;
+  --pc-ink-2: #B4B4BB;
+  --pc-muted: #82828C;
+  --pc-line: #27272A;
+  --pc-line-2: #3A3A40;
+  --pc-accent: #8B8CF8;
+  --pc-accent-hover: #A5A6FA;
+  --pc-accent-soft: #23234A;
+  --pc-accent-text: #C4C5FD;
+  --pc-on-accent: #0E0E1A;
+  --pc-ok: #4ADE80;
+  --pc-ok-soft: #14291B;
+  --pc-warn: #F2A65A;
+  --pc-warn-soft: #2E2213;
+  --pc-risk: #F87171;
+  --pc-risk-soft: #2F1818;
+  --pc-progress: #F59E0B;
+  --pc-shadow: 0 16px 40px rgba(0,0,0,.55);
+  color-scheme: dark;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --pc-duration-fast: 0ms;
+    --pc-duration-base: 0ms;
+  }
+}

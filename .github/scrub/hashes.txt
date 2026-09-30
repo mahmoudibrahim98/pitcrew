@@ -1,0 +1,7 @@
+# SHA-256 of lowercase tokens that must never appear in this public repository.
+# Checked by scripts/ci/scrub-gate.mjs. Add one with: node scripts/ci/hash-token.mjs <token>
+#
+# Only for LONG, UNGUESSABLE tokens (e.g. an internal host name with random parts). A hash of a
+# short word, a name or a number can be reversed by brute force, which would publish the very word
+# it protects. Put those in the SCRUB_PATTERNS repository secret instead (newline-separated
+# regexes); maintainers keep a local copy outside the repository.

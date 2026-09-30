@@ -1,0 +1,18 @@
+[package]
+name = "pitcrew-interfaces"
+description = "Contracts between PitCrew crates: terminal runtimes and transcript source adapters. Owned by stream 0."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[dependencies]
+pitcrew-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,11 @@
+# Owned by stream 0. The UI streams share apps/ui (stream L owns its package.json).
+packages:
+  - "apps/ui"
+  - "apps/mock-hub"
+  - "packages/*"
+
+# Supply chain: wait a day before installing a newly published version, and run install
+# scripts only for the packages listed here.
+minimumReleaseAge: 1440
+onlyBuiltDependencies:
+  - esbuild

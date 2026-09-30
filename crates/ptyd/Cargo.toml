@@ -1,0 +1,19 @@
+[package]
+name = "pitcrew-ptyd"
+description = "pitcrew-ptyd: a small, rarely-updated process that owns PTYs where tmux is unavailable, so daemon upgrades do not kill sessions. Owned by stream B."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "pitcrew-ptyd"
+path = "src/main.rs"
+
+[dependencies]
+pitcrew-protocol.workspace = true
+
+[lints]
+workspace = true

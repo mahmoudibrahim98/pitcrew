@@ -1,0 +1,11 @@
+{
+  "name": "@pitcrew/tokens",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "description": "PitCrew design tokens as CSS custom properties and JSON.",
+  "exports": {
+    "./tokens.css": "./tokens.css",
+    "./tokens.json": "./tokens.json"
+  }
+}

@@ -1,0 +1,15 @@
+[package]
+name = "pitcrew-hub-work"
+description = "Hub work model: projects, workstreams, tasks and subtasks, asks, dispatch and queue, roles, orders, personas, teams. Owned by stream E."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[dependencies]
+pitcrew-protocol.workspace = true
+
+[lints]
+workspace = true

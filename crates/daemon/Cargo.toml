@@ -1,0 +1,19 @@
+[package]
+name = "pitcrew-daemon"
+description = "pitcrewd: the composition root that wires hub, runner and API together. Owned by stream 0."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "pitcrewd"
+path = "src/main.rs"
+
+[dependencies]
+pitcrew-protocol.workspace = true
+
+[lints]
+workspace = true

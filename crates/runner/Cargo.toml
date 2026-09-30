@@ -1,0 +1,15 @@
+[package]
+name = "pitcrew-runner"
+description = "Runner service: watchers, session linking, derived events to the hub, file API. Owned by stream D."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[dependencies]
+pitcrew-protocol.workspace = true
+
+[lints]
+workspace = true

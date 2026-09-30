@@ -1,0 +1,15 @@
+[package]
+name = "pitcrew-legacy"
+description = "Importer from the predecessor portal's state into the PitCrew store. Owned by stream O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[dependencies]
+pitcrew-protocol.workspace = true
+
+[lints]
+workspace = true

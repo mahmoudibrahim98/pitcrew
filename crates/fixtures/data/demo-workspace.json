@@ -1,0 +1,749 @@
+{
+  "workspace": { "id": "01JB000000000000000WSP0001", "name": "Demo Lab" },
+  "machines": [
+    {
+      "id": "01JB000000000000000MCH0001",
+      "name": "This laptop",
+      "kind": "local",
+      "info": { "hostname": "laptop", "os": "linux", "arch": "x86_64", "has_tmux": true, "home_on_network_fs": false },
+      "liveness": "live"
+    },
+    {
+      "id": "01JB000000000000000MCH0002",
+      "name": "cluster",
+      "kind": "ssh",
+      "info": { "hostname": "login01", "os": "linux", "arch": "x86_64", "has_tmux": true, "scheduler": "slurm", "home_on_network_fs": true },
+      "liveness": "live"
+    },
+    {
+      "id": "01JB000000000000000MCH0003",
+      "name": "gpu-box",
+      "kind": "ssh",
+      "info": { "hostname": "gpu-box", "os": "linux", "arch": "x86_64", "has_tmux": false, "home_on_network_fs": false },
+      "liveness": "unverifiable"
+    }
+  ],
+  "members": [
+    { "id": "01JB000000000000000MEM0001", "kind": "human", "handle": "@sam", "name": "Sam Rivera" },
+    { "id": "01JB000000000000000MEM0002", "kind": "agent", "handle": "@writer", "name": "Writer", "owner": "01JB000000000000000MEM0001", "persona": "01JB000000000000000PER0001" },
+    { "id": "01JB000000000000000MEM0003", "kind": "agent", "handle": "@runner", "name": "Runner", "owner": "01JB000000000000000MEM0001", "persona": "01JB000000000000000PER0002" },
+    { "id": "01JB000000000000000MEM0004", "kind": "agent", "handle": "@reviewer", "name": "Reviewer", "owner": "01JB000000000000000MEM0001", "persona": "01JB000000000000000PER0003" },
+    { "id": "01JB000000000000000MEM0005", "kind": "agent", "handle": "@builder", "name": "Builder", "owner": "01JB000000000000000MEM0001", "persona": "01JB000000000000000PER0004" },
+    { "id": "01JB000000000000000MEM0006", "kind": "agent", "handle": "@office", "name": "Back office", "owner": "01JB000000000000000MEM0001" }
+  ],
+  "personas": [
+    { "id": "01JB000000000000000PER0001", "name": "Writer", "engine": "claude", "instructions": "Write clear academic prose. Keep claims tied to results.", "permission_mode": "accept_edits" },
+    { "id": "01JB000000000000000PER0002", "name": "Runner", "engine": "codex", "instructions": "Run and watch experiments. Never cancel a job without asking.", "permission_mode": "default" },
+    { "id": "01JB000000000000000PER0003", "name": "Reviewer", "engine": "claude", "instructions": "Review changes and results. Do not edit files.", "permission_mode": "plan" },
+    { "id": "01JB000000000000000PER0004", "name": "Builder", "engine": "opencode", "permission_mode": "default" }
+  ],
+  "teams": [
+    {
+      "id": "01JB000000000000000TEA0001",
+      "name": "Paper team",
+      "lead": "01JB000000000000000MEM0001",
+      "members": ["01JB000000000000000MEM0001", "01JB000000000000000MEM0002", "01JB000000000000000MEM0003", "01JB000000000000000MEM0004"]
+    }
+  ],
+  "projects": [
+    {
+      "id": "01JB000000000000000PRJ0001",
+      "key": "PAP",
+      "name": "Paper · Diffusion study",
+      "status": "in_progress",
+      "lead": "01JB000000000000000MEM0001",
+      "members": ["01JB000000000000000MEM0001", "01JB000000000000000MEM0002", "01JB000000000000000MEM0003", "01JB000000000000000MEM0004"],
+      "start": "2026-09-01",
+      "due": "2026-11-15",
+      "root": { "machine": "01JB000000000000000MCH0001", "path": "/home/sam/work/diffusion-paper" },
+      "external": [{ "system": "github", "key": "demo-lab/diffusion-paper", "url": "https://github.com/demo-lab/diffusion-paper" }]
+    },
+    {
+      "id": "01JB000000000000000PRJ0002",
+      "key": "TL",
+      "name": "Tooling",
+      "status": "in_progress",
+      "lead": "01JB000000000000000MEM0001",
+      "members": ["01JB000000000000000MEM0001", "01JB000000000000000MEM0004", "01JB000000000000000MEM0005"],
+      "root": { "machine": "01JB000000000000000MCH0001", "path": "/home/sam/work/lab-tools" },
+      "external": [{ "system": "github", "key": "demo-lab/lab-tools", "url": "https://github.com/demo-lab/lab-tools" }]
+    }
+  ],
+  "workstreams": [
+    {
+      "id": "01JB000000000000000WST0001",
+      "project": "01JB000000000000000PRJ0001",
+      "name": "Submission",
+      "status": "active",
+      "health": "on_track",
+      "locations": [{ "machine": "01JB000000000000000MCH0001", "path": "/home/sam/work/diffusion-paper/paper" }],
+      "external": []
+    },
+    {
+      "id": "01JB000000000000000WST0002",
+      "project": "01JB000000000000000PRJ0001",
+      "name": "Seed runs",
+      "status": "active",
+      "health": "at_risk",
+      "locations": [{ "machine": "01JB000000000000000MCH0002", "path": "/scratch/sam/diffusion-runs" }],
+      "external": [{ "system": "github", "key": "demo-lab/diffusion-paper milestone 2", "url": "https://github.com/demo-lab/diffusion-paper/milestone/2" }]
+    },
+    {
+      "id": "01JB000000000000000WST0003",
+      "project": "01JB000000000000000PRJ0002",
+      "name": "Parsers",
+      "status": "active",
+      "health": "on_track",
+      "locations": [{ "machine": "01JB000000000000000MCH0001", "path": "/home/sam/work/lab-tools", "branch": "parsers" }],
+      "external": []
+    },
+    {
+      "id": "01JB000000000000000WST0004",
+      "project": "01JB000000000000000PRJ0001",
+      "name": "Ablation: noise schedule",
+      "status": "idea",
+      "health": "on_track",
+      "locations": [],
+      "external": []
+    }
+  ],
+  "tasks": [
+    {
+      "id": "01JB000000000000000TSK0001",
+      "key": "PAP-1",
+      "project": "01JB000000000000000PRJ0001",
+      "workstream": "01JB000000000000000WST0001",
+      "title": "Draft the method section",
+      "description": "Draft §3 Method from notes/method-outline.md. Keep it under two pages.",
+      "status": "in_progress",
+      "priority": "high",
+      "assignee": "01JB000000000000000MEM0002",
+      "labels": ["writing"],
+      "due": "2026-10-10",
+      "blocked_by": [],
+      "accept_auto": false,
+      "subtasks": [
+        { "id": "01JB000000000000000SBT0001", "text": "Read notes/method-outline.md", "done": true, "source": { "kind": "agent_plan", "agent": "01JB000000000000000MEM0002" } },
+        { "id": "01JB000000000000000SBT0002", "text": "Write §3.1 Model", "done": true, "source": { "kind": "agent_plan", "agent": "01JB000000000000000MEM0002" } },
+        { "id": "01JB000000000000000SBT0003", "text": "Write §3.2 Noise schedule", "done": false, "source": { "kind": "agent_plan", "agent": "01JB000000000000000MEM0002" } },
+        { "id": "01JB000000000000000SBT0004", "text": "Write §3.3 Training objective", "done": false, "source": { "kind": "agent_plan", "agent": "01JB000000000000000MEM0002" } }
+      ]
+    },
+    {
+      "id": "01JB000000000000000TSK0002",
+      "key": "PAP-2",
+      "project": "01JB000000000000000PRJ0001",
+      "workstream": "01JB000000000000000WST0001",
+      "title": "Make figure 3 from the seed runs",
+      "description": "Loss curves for seeds 1–5 with a shaded min/max band.",
+      "status": "todo",
+      "priority": "medium",
+      "assignee": "01JB000000000000000MEM0002",
+      "labels": ["figures"],
+      "blocked_by": ["01JB000000000000000TSK0004"],
+      "accept_auto": false,
+      "subtasks": []
+    },
+    {
+      "id": "01JB000000000000000TSK0003",
+      "key": "PAP-3",
+      "project": "01JB000000000000000PRJ0001",
+      "workstream": "01JB000000000000000WST0001",
+      "title": "Respond to co-author comments",
+      "description": "Answer every comment in comments.md. Flag anything that changes a claim.",
+      "status": "review",
+      "priority": "high",
+      "assignee": "01JB000000000000000MEM0002",
+      "labels": ["writing"],
+      "blocked_by": [],
+      "accept_auto": false,
+      "subtasks": []
+    },
+    {
+      "id": "01JB000000000000000TSK0004",
+      "key": "PAP-4",
+      "project": "01JB000000000000000PRJ0001",
+      "workstream": "01JB000000000000000WST0002",
+      "title": "Run seeds 1–5 on the cluster",
+      "description": "Submit seeds 1–5 with configs/base.yaml and watch them to epoch 40.",
+      "status": "in_progress",
+      "priority": "high",
+      "assignee": "01JB000000000000000MEM0003",
+      "labels": ["compute"],
+      "blocked_by": [],
+      "source": { "system": "github", "key": "demo-lab/diffusion-paper#12", "url": "https://github.com/demo-lab/diffusion-paper/issues/12" },
+      "accept_auto": false,
+      "subtasks": [
+        { "id": "01JB000000000000000SBT0005", "text": "Submit seeds 1–5", "done": true, "source": { "kind": "agent_plan", "agent": "01JB000000000000000MEM0003" } },
+        { "id": "01JB000000000000000SBT0006", "text": "Check first-epoch losses", "done": true, "source": { "kind": "agent_plan", "agent": "01JB000000000000000MEM0003" } },
+        { "id": "01JB000000000000000SBT0007", "text": "Watch to epoch 40", "done": false, "source": { "kind": "agent_plan", "agent": "01JB000000000000000MEM0003" } }
+      ]
+    },
+    {
+      "id": "01JB000000000000000TSK0005",
+      "key": "PAP-5",
+      "project": "01JB000000000000000PRJ0001",
+      "workstream": "01JB000000000000000WST0002",
+      "title": "Decide what to do about seed 3",
+      "description": "Seed 3 diverged at epoch 9. Rerun with a lower learning rate, or drop it and report four seeds.",
+      "status": "todo",
+      "priority": "urgent",
+      "labels": ["compute"],
+      "blocked_by": [],
+      "accept_auto": false,
+      "subtasks": []
+    },
+    {
+      "id": "01JB000000000000000TSK0006",
+      "key": "PAP-6",
+      "project": "01JB000000000000000PRJ0001",
+      "workstream": "01JB000000000000000WST0002",
+      "title": "Aggregate the results table",
+      "status": "backlog",
+      "priority": "low",
+      "labels": [],
+      "blocked_by": ["01JB000000000000000TSK0004"],
+      "accept_auto": false,
+      "subtasks": []
+    },
+    {
+      "id": "01JB000000000000000TSK0007",
+      "key": "PAP-7",
+      "project": "01JB000000000000000PRJ0001",
+      "workstream": "01JB000000000000000WST0001",
+      "title": "Set up the submission checklist",
+      "status": "done",
+      "priority": "medium",
+      "assignee": "01JB000000000000000MEM0001",
+      "labels": [],
+      "blocked_by": [],
+      "accept_auto": false,
+      "subtasks": [
+        { "id": "01JB000000000000000SBT0008", "text": "Venue page limit and format", "done": true, "source": { "kind": "human" } },
+        { "id": "01JB000000000000000SBT0009", "text": "Anonymisation check", "done": true, "source": { "kind": "human" } }
+      ]
+    },
+    {
+      "id": "01JB000000000000000TSK0008",
+      "key": "TL-1",
+      "project": "01JB000000000000000PRJ0002",
+      "workstream": "01JB000000000000000WST0003",
+      "title": "Parse Codex rollouts incrementally",
+      "description": "Read from a byte offset; never re-read a file from the start.",
+      "status": "in_progress",
+      "priority": "medium",
+      "assignee": "01JB000000000000000MEM0005",
+      "labels": ["performance"],
+      "blocked_by": [],
+      "source": { "system": "github", "key": "demo-lab/lab-tools#31", "url": "https://github.com/demo-lab/lab-tools/issues/31" },
+      "accept_auto": false,
+      "subtasks": []
+    },
+    {
+      "id": "01JB000000000000000TSK0009",
+      "key": "TL-2",
+      "project": "01JB000000000000000PRJ0002",
+      "workstream": "01JB000000000000000WST0003",
+      "title": "Add a fixture for the OpenCode store",
+      "status": "todo",
+      "priority": "low",
+      "labels": ["tests"],
+      "blocked_by": [],
+      "accept_auto": true,
+      "subtasks": []
+    },
+    {
+      "id": "01JB000000000000000TSK0010",
+      "key": "TL-3",
+      "project": "01JB000000000000000PRJ0002",
+      "workstream": "01JB000000000000000WST0003",
+      "title": "Review the parser benchmarks",
+      "status": "in_progress",
+      "priority": "medium",
+      "assignee": "01JB000000000000000MEM0004",
+      "labels": ["performance"],
+      "blocked_by": [],
+      "accept_auto": false,
+      "subtasks": []
+    }
+  ],
+  "sessions": [
+    {
+      "id": "01JB000000000000000SES0001",
+      "engine": "claude",
+      "native_id": "2b6f1a8e-4c1d-4f5e-9a37-0c8d1e2f3a4b",
+      "machine": "01JB000000000000000MCH0001",
+      "cwd": "/home/sam/work/diffusion-paper/paper",
+      "branch": "main",
+      "title": "Draft method section",
+      "agent": "01JB000000000000000MEM0002",
+      "workstream": "01JB000000000000000WST0001",
+      "task": "01JB000000000000000TSK0001",
+      "link_basis": "dispatch",
+      "state": "working",
+      "status_line": "Editing method.tex (§3.2)",
+      "started": 1790755200000,
+      "last_activity": 1790762400000,
+      "terminal": "01JB000000000000000TRM0001"
+    },
+    {
+      "id": "01JB000000000000000SES0002",
+      "engine": "codex",
+      "native_id": "7c1e9d2a-0b3f-4e6a-8d5c-1f2e3a4b5c6d",
+      "machine": "01JB000000000000000MCH0002",
+      "cwd": "/scratch/sam/diffusion-runs",
+      "branch": "main",
+      "title": "Seed runs 1–5",
+      "agent": "01JB000000000000000MEM0003",
+      "workstream": "01JB000000000000000WST0002",
+      "task": "01JB000000000000000TSK0004",
+      "link_basis": "dispatch",
+      "state": "working",
+      "status_line": "Watching job 4815162 · epoch 12/40",
+      "started": 1790668800000,
+      "last_activity": 1790762280000,
+      "terminal": "01JB000000000000000TRM0002"
+    },
+    {
+      "id": "01JB000000000000000SES0003",
+      "engine": "claude",
+      "native_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+      "machine": "01JB000000000000000MCH0001",
+      "cwd": "/home/sam/work/lab-tools",
+      "branch": "parsers",
+      "title": "Review parser benchmarks",
+      "agent": "01JB000000000000000MEM0004",
+      "workstream": "01JB000000000000000WST0003",
+      "task": "01JB000000000000000TSK0010",
+      "link_basis": "dispatch",
+      "state": "waiting",
+      "status_line": "Asks: merge the benchmark change?",
+      "started": 1790758800000,
+      "last_activity": 1790761800000,
+      "terminal": "01JB000000000000000TRM0003"
+    },
+    {
+      "id": "01JB000000000000000SES0004",
+      "engine": "opencode",
+      "native_id": "ses_01jb9demo00000000000000001",
+      "machine": "01JB000000000000000MCH0001",
+      "cwd": "/home/sam/work/lab-tools",
+      "branch": "parsers",
+      "title": "Codex rollout parser",
+      "agent": "01JB000000000000000MEM0005",
+      "workstream": "01JB000000000000000WST0003",
+      "task": "01JB000000000000000TSK0008",
+      "link_basis": "claimed",
+      "state": "idle",
+      "status_line": "Turn ended · 3 files changed",
+      "started": 1790756400000,
+      "last_activity": 1790760600000,
+      "terminal": "01JB000000000000000TRM0004"
+    },
+    {
+      "id": "01JB000000000000000SES0005",
+      "engine": "claude",
+      "native_id": "0f1e2d3c-4b5a-4968-8776-655443322110",
+      "machine": "01JB000000000000000MCH0003",
+      "cwd": "/home/sam/experiments/noise-schedule",
+      "title": "Try a cosine schedule",
+      "state": "unreachable",
+      "started": 1790582400000,
+      "last_activity": 1790665200000
+    },
+    {
+      "id": "01JB000000000000000SES0006",
+      "engine": "claude",
+      "native_id": "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+      "machine": "01JB000000000000000MCH0001",
+      "cwd": "/home/sam/work/diffusion-paper/paper",
+      "branch": "main",
+      "title": "Co-author responses",
+      "agent": "01JB000000000000000MEM0002",
+      "workstream": "01JB000000000000000WST0001",
+      "task": "01JB000000000000000TSK0003",
+      "link_basis": "dispatch",
+      "state": "ended",
+      "started": 1790672400000,
+      "last_activity": 1790677200000
+    }
+  ],
+  "dispatches": [
+    {
+      "id": "01JB000000000000000DSP0001",
+      "task": "01JB000000000000000TSK0001",
+      "agent": "01JB000000000000000MEM0002",
+      "session": "01JB000000000000000SES0001",
+      "brief": "Draft §3 Method from notes/method-outline.md. Keep it under two pages.",
+      "started": 1790755200000
+    },
+    {
+      "id": "01JB000000000000000DSP0002",
+      "task": "01JB000000000000000TSK0004",
+      "agent": "01JB000000000000000MEM0003",
+      "session": "01JB000000000000000SES0002",
+      "brief": "Submit seeds 1–5 with configs/base.yaml and watch them to epoch 40.",
+      "started": 1790668800000
+    },
+    {
+      "id": "01JB000000000000000DSP0003",
+      "task": "01JB000000000000000TSK0010",
+      "agent": "01JB000000000000000MEM0004",
+      "session": "01JB000000000000000SES0003",
+      "brief": "Check the parser benchmark numbers on the parsers branch before the PR opens.",
+      "started": 1790758800000
+    },
+    {
+      "id": "01JB000000000000000DSP0004",
+      "task": "01JB000000000000000TSK0003",
+      "agent": "01JB000000000000000MEM0002",
+      "session": "01JB000000000000000SES0006",
+      "brief": "Answer every comment in comments.md. Flag anything that changes a claim.",
+      "started": 1790672400000,
+      "ended": 1790677200000,
+      "outcome": "succeeded",
+      "summary": "Drafted answers to all 14 comments; 2 need your call."
+    }
+  ],
+  "asks": [
+    {
+      "id": "01JB000000000000000ASK0001",
+      "kind": "question",
+      "from": "01JB000000000000000MEM0004",
+      "to": "01JB000000000000000MEM0001",
+      "task": "01JB000000000000000TSK0010",
+      "session": "01JB000000000000000SES0003",
+      "title": "Merge the benchmark change into parsers?",
+      "body": "Incremental parsing is 9.1× faster on the 400 MB fixture. One test is 4% slower on tiny files.",
+      "options": ["Merge it", "Hold, I'll look"],
+      "receipts": [{ "kind": "transcript", "session": "01JB000000000000000SES0003", "offset": 48213 }],
+      "state": "open",
+      "created": 1790761800000
+    },
+    {
+      "id": "01JB000000000000000ASK0002",
+      "kind": "decision",
+      "from": "01JB000000000000000MEM0006",
+      "to": "01JB000000000000000MEM0001",
+      "task": "01JB000000000000000TSK0005",
+      "session": "01JB000000000000000SES0002",
+      "title": "Seed 3 diverged at epoch 9. Rerun or drop it?",
+      "body": "Loss went to NaN at step 18,400. Seeds 1, 2, 4 and 5 are healthy at epoch 12.",
+      "options": ["Rerun with lr 1e-4", "Drop seed 3", "I'll look first"],
+      "receipts": [
+        { "kind": "job", "scheduler": "slurm", "id": "4815164" },
+        { "kind": "transcript", "session": "01JB000000000000000SES0002", "offset": 120544 }
+      ],
+      "state": "open",
+      "created": 1790761200000
+    },
+    {
+      "id": "01JB000000000000000ASK0003",
+      "kind": "review",
+      "from": "01JB000000000000000MEM0002",
+      "to": "01JB000000000000000MEM0001",
+      "task": "01JB000000000000000TSK0003",
+      "session": "01JB000000000000000SES0006",
+      "title": "Co-author responses are ready for review",
+      "body": "All 14 comments answered. Comments 6 and 11 need your call.",
+      "options": [],
+      "receipts": [{ "kind": "file", "location": { "machine": "01JB000000000000000MCH0001", "path": "/home/sam/work/diffusion-paper/paper/responses.md" } }],
+      "state": "open",
+      "created": 1790677200000
+    },
+    {
+      "id": "01JB000000000000000ASK0004",
+      "kind": "approval",
+      "from": "01JB000000000000000MEM0005",
+      "to": "01JB000000000000000MEM0001",
+      "task": "01JB000000000000000TSK0008",
+      "session": "01JB000000000000000SES0004",
+      "title": "Open a pull request on demo-lab/lab-tools",
+      "body": "parsers → main: incremental Codex rollout parser.",
+      "options": ["Approve", "Decline"],
+      "receipts": [],
+      "state": "answered",
+      "answer": { "by": "01JB000000000000000MEM0001", "option": 0, "at": 1790760900000 },
+      "created": 1790760600000
+    }
+  ],
+  "briefs": [
+    {
+      "target": { "kind": "project", "id": "01JB000000000000000PRJ0001" },
+      "text": "The method section is about half drafted. Seeds 1, 2, 4 and 5 are training on the cluster (epoch 12 of 40); seed 3 diverged and is waiting for your decision. Answers to co-author comments are drafted and waiting for review.",
+      "next": "Decide on seed 3; figure 3 can start when the runs finish.",
+      "pinned": false,
+      "source": "back_office",
+      "updated": 1790762100000,
+      "receipts": [
+        { "kind": "event", "id": "01JB000000000000000EVT0010" },
+        { "kind": "job", "scheduler": "slurm", "id": "4815162" }
+      ]
+    },
+    {
+      "target": { "kind": "workstream", "id": "01JB000000000000000WST0001" },
+      "text": "§3.1 is done and §3.2 is in progress. Answers to co-author comments are drafted, with two open points.",
+      "next": "Review responses.md.",
+      "pinned": false,
+      "source": "back_office",
+      "updated": 1790762100000,
+      "receipts": [{ "kind": "event", "id": "01JB000000000000000EVT0007" }]
+    },
+    {
+      "target": { "kind": "workstream", "id": "01JB000000000000000WST0002" },
+      "text": "Four of five seeds are healthy at epoch 12 of 40, about 14 hours to go. Seed 3 diverged at epoch 9.",
+      "next": "Rerun or drop seed 3.",
+      "pinned": true,
+      "source": "person",
+      "updated": 1790761500000,
+      "receipts": []
+    },
+    {
+      "target": { "kind": "workstream", "id": "01JB000000000000000WST0003" },
+      "text": "The incremental Codex parser works on the parsers branch; the benchmark shows a 9.1× speed-up. The pull request is approved and waiting to be opened.",
+      "next": "Answer the reviewer's merge question.",
+      "pinned": false,
+      "source": "back_office",
+      "updated": 1790762100000,
+      "receipts": [{ "kind": "transcript", "session": "01JB000000000000000SES0003", "offset": 48213 }]
+    }
+  ],
+  "events": [
+    {
+      "id": "01JB000000000000000EVT0001",
+      "at": 1790668800000,
+      "workspace": "01JB000000000000000WSP0001",
+      "author": "01JB000000000000000MEM0001",
+      "body": {
+        "type": "dispatch_started",
+        "data": {
+          "dispatch": {
+            "id": "01JB000000000000000DSP0002",
+            "task": "01JB000000000000000TSK0004",
+            "agent": "01JB000000000000000MEM0003",
+            "session": "01JB000000000000000SES0002",
+            "brief": "Submit seeds 1–5 with configs/base.yaml and watch them to epoch 40.",
+            "started": 1790668800000
+          }
+        }
+      }
+    },
+    {
+      "id": "01JB000000000000000EVT0002",
+      "at": 1790677200000,
+      "workspace": "01JB000000000000000WSP0001",
+      "author": "01JB000000000000000MEM0002",
+      "on_behalf_of": "01JB000000000000000MEM0001",
+      "body": {
+        "type": "dispatch_finished",
+        "data": { "dispatch": "01JB000000000000000DSP0004", "outcome": "succeeded", "summary": "Drafted answers to all 14 comments; 2 need your call." }
+      }
+    },
+    {
+      "id": "01JB000000000000000EVT0003",
+      "at": 1790677200000,
+      "workspace": "01JB000000000000000WSP0001",
+      "author": "01JB000000000000000MEM0002",
+      "on_behalf_of": "01JB000000000000000MEM0001",
+      "body": {
+        "type": "task_moved",
+        "data": { "task": "01JB000000000000000TSK0003", "from": "in_progress", "to": "review", "mover": { "kind": "agent", "on_own_task": true } }
+      }
+    },
+    {
+      "id": "01JB000000000000000EVT0004",
+      "at": 1790755200000,
+      "workspace": "01JB000000000000000WSP0001",
+      "author": "01JB000000000000000MEM0001",
+      "body": {
+        "type": "dispatch_started",
+        "data": {
+          "dispatch": {
+            "id": "01JB000000000000000DSP0001",
+            "task": "01JB000000000000000TSK0001",
+            "agent": "01JB000000000000000MEM0002",
+            "session": "01JB000000000000000SES0001",
+            "brief": "Draft §3 Method from notes/method-outline.md. Keep it under two pages.",
+            "started": 1790755200000
+          }
+        }
+      }
+    },
+    {
+      "id": "01JB000000000000000EVT0005",
+      "at": 1790755260000,
+      "workspace": "01JB000000000000000WSP0001",
+      "author": "01JB000000000000000MEM0002",
+      "on_behalf_of": "01JB000000000000000MEM0001",
+      "body": {
+        "type": "task_moved",
+        "data": { "task": "01JB000000000000000TSK0001", "from": "todo", "to": "in_progress", "mover": { "kind": "agent", "on_own_task": true } }
+      }
+    },
+    {
+      "id": "01JB000000000000000EVT0006",
+      "at": 1790756100000,
+      "workspace": "01JB000000000000000WSP0001",
+      "author": "01JB000000000000000MEM0002",
+      "on_behalf_of": "01JB000000000000000MEM0001",
+      "body": {
+        "type": "subtasks_replaced",
+        "data": {
+          "task": "01JB000000000000000TSK0001",
+          "subtasks": [
+            { "id": "01JB000000000000000SBT0001", "text": "Read notes/method-outline.md", "done": true, "source": { "kind": "agent_plan", "agent": "01JB000000000000000MEM0002" } },
+            { "id": "01JB000000000000000SBT0002", "text": "Write §3.1 Model", "done": true, "source": { "kind": "agent_plan", "agent": "01JB000000000000000MEM0002" } },
+            { "id": "01JB000000000000000SBT0003", "text": "Write §3.2 Noise schedule", "done": false, "source": { "kind": "agent_plan", "agent": "01JB000000000000000MEM0002" } },
+            { "id": "01JB000000000000000SBT0004", "text": "Write §3.3 Training objective", "done": false, "source": { "kind": "agent_plan", "agent": "01JB000000000000000MEM0002" } }
+          ]
+        }
+      }
+    },
+    {
+      "id": "01JB000000000000000EVT0007",
+      "at": 1790757900000,
+      "workspace": "01JB000000000000000WSP0001",
+      "author": "01JB000000000000000MEM0002",
+      "on_behalf_of": "01JB000000000000000MEM0001",
+      "body": {
+        "type": "file_edited",
+        "data": { "session": "01JB000000000000000SES0001", "path": "method.tex", "added": 84, "removed": 12 }
+      }
+    },
+    {
+      "id": "01JB000000000000000EVT0008",
+      "at": 1790758800000,
+      "workspace": "01JB000000000000000WSP0001",
+      "author": "01JB000000000000000MEM0001",
+      "body": {
+        "type": "dispatch_started",
+        "data": {
+          "dispatch": {
+            "id": "01JB000000000000000DSP0003",
+            "task": "01JB000000000000000TSK0010",
+            "agent": "01JB000000000000000MEM0004",
+            "session": "01JB000000000000000SES0003",
+            "brief": "Check the parser benchmark numbers on the parsers branch before the PR opens.",
+            "started": 1790758800000
+          }
+        }
+      }
+    },
+    {
+      "id": "01JB000000000000000EVT0009",
+      "at": 1790759700000,
+      "workspace": "01JB000000000000000WSP0001",
+      "author": "01JB000000000000000MEM0003",
+      "on_behalf_of": "01JB000000000000000MEM0001",
+      "body": {
+        "type": "tool_ran",
+        "data": {
+          "session": "01JB000000000000000SES0002",
+          "tool": "Bash",
+          "target": "squeue --me",
+          "outcome": "5 jobs: 4 running, 1 failed",
+          "failed": false,
+          "receipt": { "kind": "transcript", "session": "01JB000000000000000SES0002", "offset": 118220 }
+        }
+      }
+    },
+    {
+      "id": "01JB000000000000000EVT0010",
+      "at": 1790761200000,
+      "workspace": "01JB000000000000000WSP0001",
+      "author": "01JB000000000000000MEM0006",
+      "on_behalf_of": "01JB000000000000000MEM0001",
+      "body": {
+        "type": "ask_raised",
+        "data": {
+          "ask": {
+            "id": "01JB000000000000000ASK0002",
+            "kind": "decision",
+            "from": "01JB000000000000000MEM0006",
+            "to": "01JB000000000000000MEM0001",
+            "task": "01JB000000000000000TSK0005",
+            "session": "01JB000000000000000SES0002",
+            "title": "Seed 3 diverged at epoch 9. Rerun or drop it?",
+            "body": "Loss went to NaN at step 18,400. Seeds 1, 2, 4 and 5 are healthy at epoch 12.",
+            "options": ["Rerun with lr 1e-4", "Drop seed 3", "I'll look first"],
+            "receipts": [
+              { "kind": "job", "scheduler": "slurm", "id": "4815164" },
+              { "kind": "transcript", "session": "01JB000000000000000SES0002", "offset": 120544 }
+            ],
+            "state": "open",
+            "created": 1790761200000
+          }
+        }
+      }
+    },
+    {
+      "id": "01JB000000000000000EVT0011",
+      "at": 1790761260000,
+      "workspace": "01JB000000000000000WSP0001",
+      "author": "01JB000000000000000MEM0006",
+      "on_behalf_of": "01JB000000000000000MEM0001",
+      "body": {
+        "type": "workstream_changed",
+        "data": { "workstream": "01JB000000000000000WST0002", "status": "active", "health": "at_risk" }
+      }
+    },
+    {
+      "id": "01JB000000000000000EVT0012",
+      "at": 1790761500000,
+      "workspace": "01JB000000000000000WSP0001",
+      "author": "01JB000000000000000MEM0001",
+      "body": {
+        "type": "brief_accepted",
+        "data": {
+          "target": { "kind": "workstream", "id": "01JB000000000000000WST0002" },
+          "text": "Four of five seeds are healthy at epoch 12 of 40, about 14 hours to go. Seed 3 diverged at epoch 9.",
+          "pinned": true
+        }
+      }
+    },
+    {
+      "id": "01JB000000000000000EVT0013",
+      "at": 1790761800000,
+      "workspace": "01JB000000000000000WSP0001",
+      "author": "01JB000000000000000MEM0004",
+      "on_behalf_of": "01JB000000000000000MEM0001",
+      "body": {
+        "type": "session_state_changed",
+        "data": { "session": "01JB000000000000000SES0003", "from": "working", "to": "waiting", "status_line": "Asks: merge the benchmark change?" }
+      }
+    },
+    {
+      "id": "01JB000000000000000EVT0014",
+      "at": 1790761920000,
+      "workspace": "01JB000000000000000WSP0001",
+      "author": "01JB000000000000000MEM0005",
+      "on_behalf_of": "01JB000000000000000MEM0001",
+      "body": {
+        "type": "comment_posted",
+        "data": {
+          "task": "01JB000000000000000TSK0008",
+          "text": "@reviewer can you check the benchmark numbers before I open the PR?",
+          "mentions": ["01JB000000000000000MEM0004"]
+        }
+      }
+    },
+    {
+      "id": "01JB000000000000000EVT0015",
+      "at": 1790762100000,
+      "workspace": "01JB000000000000000WSP0001",
+      "author": "01JB000000000000000MEM0006",
+      "on_behalf_of": "01JB000000000000000MEM0001",
+      "body": {
+        "type": "brief_proposed",
+        "data": {
+          "target": { "kind": "project", "id": "01JB000000000000000PRJ0001" },
+          "text": "The method section is about half drafted. Seeds 1, 2, 4 and 5 are training on the cluster (epoch 12 of 40); seed 3 diverged and is waiting for your decision. Answers to co-author comments are drafted and waiting for review.",
+          "receipts": [
+            { "kind": "event", "id": "01JB000000000000000EVT0010" },
+            { "kind": "job", "scheduler": "slurm", "id": "4815162" }
+          ]
+        }
+      }
+    }
+  ]
+}

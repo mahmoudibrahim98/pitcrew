@@ -1,0 +1,18 @@
+[package]
+name = "pitcrew-protocol"
+description = "Shared types for PitCrew: domain model, events, runner-hub protocol and API frames. Owned by stream 0."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+ulid.workspace = true
+
+[lints]
+workspace = true

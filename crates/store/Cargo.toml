@@ -1,0 +1,15 @@
+[package]
+name = "pitcrew-store"
+description = "SQLite store: migrations, the append-only event log, projections, and NFS-safe mode. Owned by stream C."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[dependencies]
+pitcrew-protocol.workspace = true
+
+[lints]
+workspace = true

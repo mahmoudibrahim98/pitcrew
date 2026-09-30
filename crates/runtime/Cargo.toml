@@ -1,0 +1,15 @@
+[package]
+name = "pitcrew-runtime"
+description = "Terminal runtimes: tmux control mode and the PTY supervisor, behind pitcrew-interfaces::runtime::Runtime. Owned by stream B."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[dependencies]
+pitcrew-protocol.workspace = true
+
+[lints]
+workspace = true

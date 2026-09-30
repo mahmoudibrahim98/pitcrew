@@ -1,0 +1,10 @@
+-- Synthetic data for schema.sql: one session by the Builder agent.
+INSERT INTO session VALUES ('ses_01jb9demo00000000000000001', 'prj_demo_lab_tools', NULL, '/home/sam/work/lab-tools', 'Codex rollout parser', '1.0.0', 1790756400000, 1790760600000);
+INSERT INTO message VALUES ('msg_demo_0001', 'ses_01jb9demo00000000000000001', 1790756400000, 1790756400000, '{"role":"user","time":{"created":1790756400000}}');
+INSERT INTO part VALUES ('prt_demo_0001', 'msg_demo_0001', 'ses_01jb9demo00000000000000001', 1790756400000, 1790756400000, '{"type":"text","text":"Parse Codex rollouts incrementally: read from a byte offset, never from the start."}');
+INSERT INTO message VALUES ('msg_demo_0002', 'ses_01jb9demo00000000000000001', 1790756460000, 1790760600000, '{"role":"assistant","modelID":"demo-model","providerID":"demo","time":{"created":1790756460000,"completed":1790760600000}}');
+INSERT INTO part VALUES ('prt_demo_0002', 'msg_demo_0002', 'ses_01jb9demo00000000000000001', 1790756460000, 1790756460000, '{"type":"text","text":"I will keep a cursor per file and resume from it."}');
+INSERT INTO part VALUES ('prt_demo_0003', 'msg_demo_0002', 'ses_01jb9demo00000000000000001', 1790756500000, 1790756520000, '{"type":"tool","tool":"edit","callID":"call_demo_1","state":{"status":"completed","input":{"filePath":"/home/sam/work/lab-tools/src/codex.rs"},"output":"Edited src/codex.rs"}}');
+INSERT INTO part VALUES ('prt_demo_0004', 'msg_demo_0002', 'ses_01jb9demo00000000000000001', 1790756600000, 1790756640000, '{"type":"tool","tool":"bash","callID":"call_demo_2","state":{"status":"completed","input":{"command":"cargo test -p parsers"},"output":"test result: ok. 18 passed; 0 failed"}}');
+INSERT INTO part VALUES ('prt_demo_0005', 'msg_demo_0002', 'ses_01jb9demo00000000000000001', 1790756700000, 1790756700000, '{"type":"todo","todos":[{"content":"Keep a cursor per file","status":"completed"},{"content":"Benchmark on a 400 MB rollout","status":"in_progress"}]}');
+INSERT INTO part VALUES ('prt_demo_0006', 'msg_demo_0002', 'ses_01jb9demo00000000000000001', 1790760600000, 1790760600000, '{"type":"step-finish","reason":"stop"}');

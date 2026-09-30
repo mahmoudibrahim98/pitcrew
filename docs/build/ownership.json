@@ -1,0 +1,71 @@
+{
+  "$comment": "Which stream owns which paths. Enforced by scripts/ci/path-guard.mjs on pull requests and checked for gaps and overlaps by scripts/ci/ownership-audit.mjs. Globs: '*' stays within one path segment, '**' crosses segments. Human-readable version: ownership.md. Owned by stream 0.",
+  "version": 1,
+  "shared": ["Cargo.lock", "pnpm-lock.yaml"],
+  "branches": {
+    "stream": "s/<stream>/<topic>",
+    "integrator": "integrator/<topic>",
+    "dependabot": "dependabot/**"
+  },
+  "dependabot": ["**/Cargo.toml", "**/package.json", ".github/workflows/*.yml", "Cargo.lock", "pnpm-lock.yaml"],
+  "streams": {
+    "0": {
+      "name": "Contracts and skeleton",
+      "paths": [
+        "Cargo.toml", "rust-toolchain.toml", "clippy.toml", "deny.toml", "rustfmt.toml",
+        "package.json", "pnpm-workspace.yaml", ".npmrc",
+        ".gitignore", ".gitattributes", ".editorconfig",
+        "LICENSE", "NOTICE", "README.md", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md", "SECURITY.md",
+        ".github/workflows/ci.yml", ".github/pull_request_template.md", ".github/CODEOWNERS",
+        ".github/dependabot.yml", ".github/ISSUE_TEMPLATE/**", ".github/scrub/**", ".github/actions/**",
+        "scripts/ci/**", "scripts/*", ".cargo/**", ".vscode/**",
+        "crates/protocol/**", "crates/interfaces/**", "crates/fixtures/**", "crates/daemon/**",
+        "crates/store/migrations/00*", "crates/store/migrations/*.md",
+        "apps/mock-hub/**", "packages/tokens/**", "packages/protocol-ts/**",
+        "docs/*.md", "docs/adr/**", "docs/build/**"
+      ]
+    },
+    "A": { "name": "Ingest", "paths": ["crates/ingest/**"] },
+    "B": { "name": "Runtime", "paths": ["crates/runtime/**", "crates/ptyd/**"] },
+    "C": {
+      "name": "Store",
+      "paths": [
+        "crates/store/*", "crates/store/src/**", "crates/store/tests/**",
+        "crates/store/benches/**", "crates/store/migrations/01*"
+      ]
+    },
+    "D": { "name": "Runner service", "paths": ["crates/runner/**"] },
+    "E": { "name": "Hub: work model", "paths": ["crates/hub-work/**", "crates/store/migrations/02*"] },
+    "F": {
+      "name": "Recap and back office",
+      "paths": ["crates/recap/**", "crates/office/**", "crates/store/migrations/03*"]
+    },
+    "G": {
+      "name": "Integrations",
+      "paths": ["crates/sync-github/**", "crates/sync-jira/**", "crates/store/migrations/04*"]
+    },
+    "H": { "name": "API and auth", "paths": ["crates/api/**", "crates/auth/**"] },
+    "I": { "name": "Agent CLI and hooks", "paths": ["crates/cli/**"] },
+    "J": { "name": "Remote and HPC", "paths": ["crates/remote/**"] },
+    "K": { "name": "Desktop shell", "paths": ["apps/desktop/**"] },
+    "L": {
+      "name": "UI foundation",
+      "paths": [
+        "apps/ui/*", "apps/ui/public/**", "apps/ui/src/*",
+        "apps/ui/src/design/**", "apps/ui/src/shell/**", "apps/ui/src/data/**",
+        "apps/ui/src/lib/**", "apps/ui/src/assets/**", "apps/ui/tests/**", "apps/ui/e2e/**"
+      ]
+    },
+    "M": { "name": "UI: Agent console", "paths": ["apps/ui/src/console/**"] },
+    "N": { "name": "UI: Projects layout", "paths": ["apps/ui/src/projects/**"] },
+    "O": {
+      "name": "Onboarding and import",
+      "paths": ["apps/ui/src/onboarding/**", "crates/legacy/**", "crates/store/migrations/05*"]
+    },
+    "P": {
+      "name": "Packaging and release",
+      "paths": ["packaging/**", ".github/workflows/release*.yml", "benches/**"]
+    },
+    "Q": { "name": "Security", "paths": ["docs/security/**", "fuzz/**"] }
+  }
+}

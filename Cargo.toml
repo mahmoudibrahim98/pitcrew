@@ -1,0 +1,81 @@
+# Owned by stream 0 (integrator). Every crate is registered here up front, so other streams never
+# need to edit this file. Add dependencies to your own crate's Cargo.toml; propose shared versions
+# in [workspace.dependencies] through a contract-change pull request.
+
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/desktop/src-tauri"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+publish = false
+authors = ["The PitCrew Authors"]
+
+[workspace.dependencies]
+# Shared versions. Use `name.workspace = true` (add features in your crate as needed), so the
+# whole workspace agrees on one version of each.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+ulid = { version = "1", features = ["serde"] }
+anyhow = "1"
+tokio = "1.53"
+tokio-util = "0.7"
+futures-util = "0.3"
+bytes = "1"
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = "0.7"
+hyper = "1"
+hyper-util = "0.1"
+interprocess = "2"
+rusqlite = { version = "0.40", features = ["bundled"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+notify = "8"
+portable-pty = "0.9"
+vt100 = "0.16"
+clap = { version = "4.6", features = ["derive"] }
+directories = "6"
+sha2 = "0.11"
+base64 = "0.23"
+# Tests and benchmarks.
+tempfile = "3"
+proptest = "1"
+insta = { version = "1", features = ["json"] }
+criterion = "0.8"
+
+# Workspace crates.
+pitcrew-protocol = { path = "crates/protocol" }
+pitcrew-interfaces = { path = "crates/interfaces" }
+pitcrew-fixtures = { path = "crates/fixtures" }
+pitcrew-ingest = { path = "crates/ingest" }
+pitcrew-runtime = { path = "crates/runtime" }
+pitcrew-store = { path = "crates/store" }
+pitcrew-runner = { path = "crates/runner" }
+pitcrew-hub-work = { path = "crates/hub-work" }
+pitcrew-recap = { path = "crates/recap" }
+pitcrew-office = { path = "crates/office" }
+pitcrew-sync-github = { path = "crates/sync-github" }
+pitcrew-sync-jira = { path = "crates/sync-jira" }
+pitcrew-api = { path = "crates/api" }
+pitcrew-auth = { path = "crates/auth" }
+pitcrew-remote = { path = "crates/remote" }
+pitcrew-legacy = { path = "crates/legacy" }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "warn"
+unwrap_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

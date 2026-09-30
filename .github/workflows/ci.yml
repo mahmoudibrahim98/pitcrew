@@ -1,0 +1,117 @@
+# Owned by stream 0. Actions are pinned by commit SHA; Dependabot keeps them current.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  guards:
+    name: Guards (ownership, paths, scrub)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+      # On a pull request, run the BASE branch's guard scripts against the PR's files, so a PR
+      # cannot weaken the guards that check it. Pushes to main use their own copy.
+      - name: Pick the guard scripts
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          guards="$GITHUB_WORKSPACE"
+          if [ "$EVENT" = "pull_request" ] && git cat-file -e "origin/$BASE_REF:scripts/ci/path-guard.mjs" 2>/dev/null; then
+            guards="$RUNNER_TEMP/guards"
+            mkdir -p "$guards"
+            git archive "origin/$BASE_REF" scripts/ci | tar -x -C "$guards"
+          fi
+          echo "GUARDS=$guards/scripts/ci" >> "$GITHUB_ENV"
+          echo "PITCREW_REPO_ROOT=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+      - name: Every file has exactly one owner
+        run: node "$GUARDS/ownership-audit.mjs"
+      - name: The branch only touches its stream's paths
+        if: github.event_name == 'pull_request'
+        env:
+          GITHUB_HEAD_REF: ${{ github.head_ref }}
+          BASE_REF: ${{ github.base_ref }}
+        run: node "$GUARDS/path-guard.mjs" --base "origin/$BASE_REF"
+      - name: No private data (files and commits)
+        env:
+          SCRUB_PATTERNS: ${{ secrets.SCRUB_PATTERNS }}
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            node "$GUARDS/scrub-gate.mjs" --base "origin/$BASE_REF"
+          else
+            node "$GUARDS/scrub-gate.mjs"
+          fi
+
+  node:
+    name: Node tests (mock hub, CI scripts)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+      - run: node --test "apps/mock-hub/test/*.test.ts" "scripts/ci/test/*.test.mjs"
+
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Format
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+
+  deny:
+    name: Licences and advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check

@@ -1,0 +1,15 @@
+{
+  "name": "pitcrew",
+  "private": true,
+  "license": "Apache-2.0",
+  "description": "Workspace root. Owned by stream 0; UI streams add their own package.json under apps/ui.",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "test": "node --test \"apps/mock-hub/test/*.test.ts\" \"scripts/ci/test/*.test.mjs\"",
+    "mock-hub": "node apps/mock-hub/src/server.ts",
+    "guard:ownership": "node scripts/ci/ownership-audit.mjs",
+    "guard:scrub": "node scripts/ci/scrub-gate.mjs"
+  }
+}
