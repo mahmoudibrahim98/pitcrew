@@ -170,16 +170,79 @@ pub fn classify(tool: &str, target: &str) -> Option<Check> {
         .min()
 }
 
+/// Words next to which a lowercase `nan` is a value: "loss nan", "grad norm nan".
+const METRIC_WORDS: &[&str] = &[
+    "loss",
+    "losses",
+    "grad",
+    "grads",
+    "gradient",
+    "gradients",
+    "norm",
+    "value",
+    "values",
+    "val",
+    "weight",
+    "weights",
+    "output",
+    "outputs",
+    "logits",
+    "metric",
+    "score",
+    "reward",
+    "acc",
+    "accuracy",
+    "lr",
+    "ppl",
+    "perplexity",
+];
+
+/// The words of a text (runs of letters and digits) with their byte offsets.
+fn words(text: &str) -> impl Iterator<Item = (usize, &str)> {
+    let mut pos = 0;
+    text.split_inclusive(|c: char| !c.is_alphanumeric())
+        .filter_map(move |piece| {
+            let start = pos;
+            pos += piece.len();
+            let word = piece.trim_end_matches(|c: char| !c.is_alphanumeric());
+            (!word.is_empty()).then_some((start, word))
+        })
+}
+
+fn is_number(word: &str) -> bool {
+    word.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Whether a text reports a diverged run, e.g. "Seed 3 diverged at epoch 9" or "loss went to
-/// NaN".
+/// NaN". `NaN` and `NAN` count as written; a lowercase `nan` only as a value: after `=` or `:`
+/// ("loss=nan"), or next to a number or a metric word ("grad norm nan", "step 1200 nan"). So a
+/// colleague called Nan, or a French "nan", is not a divergence.
 #[must_use]
 pub fn mentions_divergence(text: &str) -> bool {
-    prefix(text, TARGET_CHARS * 2)
-        .split(|c: char| !c.is_alphanumeric())
-        .any(|w| {
-            w.eq_ignore_ascii_case("nan")
-                || w.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("diverg"))
-        })
+    let text = prefix(text, TARGET_CHARS * 2);
+    let mut prev: Option<&str> = None;
+    let mut all = words(text).peekable();
+    while let Some((start, w)) = all.next() {
+        let next = all.peek().map(|(_, n)| *n);
+        let found = if w.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("diverg")) {
+            true
+        } else if w == "NaN" || w == "NAN" {
+            true
+        } else if w == "nan" {
+            let before = text.get(..start).unwrap_or_default().trim_end();
+            let assigned = before.ends_with(['=', ':']);
+            let beside =
+                |x: Option<&str>| x.is_some_and(|x| is_number(x) || is_one_of(x, METRIC_WORDS));
+            assigned || beside(prev) || beside(next)
+        } else {
+            false
+        };
+        if found {
+            return true;
+        }
+        prev = Some(w);
+    }
+    false
 }
 
 #[cfg(test)]
@@ -260,9 +323,31 @@ mod tests {
         ));
         assert!(mentions_divergence("Loss went to NaN at step 18,400."));
         assert!(mentions_divergence("DIVERGENCE detected"));
+        assert!(mentions_divergence("NAN in layer 3"));
+        assert!(mentions_divergence("loss=nan"));
+        assert!(mentions_divergence("epoch 9 | loss: nan | lr 1e-4"));
+        assert!(mentions_divergence("grad norm nan at step 12"));
+        assert!(mentions_divergence("val_loss nan"));
+        assert!(mentions_divergence("step 1200 nan"));
         assert!(!mentions_divergence("5 jobs: 4 running, 1 failed"));
         assert!(!mentions_divergence("nanoseconds and financial"));
         assert!(!mentions_divergence("\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}"));
         assert!(!mentions_divergence(""));
+        assert!(!mentions_divergence("loss is finite"));
+    }
+
+    #[test]
+    fn a_name_or_a_french_nan_is_not_a_divergence() {
+        assert!(!mentions_divergence("Nan said she would rerun seed 3."));
+        assert!(!mentions_divergence("Ask Nan: rerun or drop?"));
+        assert!(!mentions_divergence("Thanks, Nan!"));
+        assert!(!mentions_divergence("nan, je ne pense pas"));
+        assert!(!mentions_divergence("Nan, c'est bon."));
+        assert!(!mentions_divergence("mais nan, ça marche"));
+        assert!(!mentions_divergence("nAn"));
+        assert!(!mentions_divergence("déjà vu, nan"));
+        // Offsets stay right after multi-byte characters.
+        assert!(mentions_divergence("é é loss=nan"));
+        assert!(mentions_divergence("déjà: loss nan"));
     }
 }
