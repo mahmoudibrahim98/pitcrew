@@ -1,0 +1,95 @@
+# Owned by stream Q. A cargo-fuzz project with its own workspace: the root workspace excludes
+# `fuzz/`, so stable builds never see it. Needs a nightly toolchain:
+#
+#   ./fuzz/seed.sh                                   # seed corpora from crates/fixtures
+#   cargo +nightly fuzz run <target> -- -max_total_time=60
+#
+# Targets and what each checks are listed in docs/security/threat-model.md ("Fuzzing").
+
+[package]
+name = "pitcrew-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pitcrew-protocol = { path = "../crates/protocol" }
+pitcrew-interfaces = { path = "../crates/interfaces" }
+pitcrew-ingest = { path = "../crates/ingest" }
+pitcrew-runtime = { path = "../crates/runtime" }
+pitcrew-api = { path = "../crates/api" }
+pitcrew-auth = { path = "../crates/auth" }
+serde = "1"
+# `float_roundtrip` makes parse(print(x)) == x for every f64, so the round-trip checks cannot
+# fail on the last bit of a float. It only changes float parsing.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+axum = "0.8"
+tokio = { version = "1.53", features = ["rt"] }
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "claude_parse_line"
+path = "fuzz_targets/claude_parse_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codex_parse_line"
+path = "fuzz_targets/codex_parse_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "adapter_read"
+path = "fuzz_targets/adapter_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "adapter_cursor"
+path = "fuzz_targets/adapter_cursor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tmux_control"
+path = "fuzz_targets/tmux_control.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "runner_decode_line"
+path = "fuzz_targets/runner_decode_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_json"
+path = "fuzz_targets/api_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_request"
+path = "fuzz_targets/api_request.rs"
+test = false
+doc = false
+bench = false
