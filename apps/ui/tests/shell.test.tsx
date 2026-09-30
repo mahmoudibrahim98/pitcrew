@@ -130,6 +130,14 @@ describe('feature registration', () => {
     await vi.waitFor(() => expect(useShell.getState().workspaces[WORKSPACE]?.layout).toBe('console'));
   });
 
+  it('sends a workstream known only by id to its path under its project', async () => {
+    const router = renderApp([], `/w/${WORKSPACE}/workstreams/01JB000000000000000WST0002`);
+    await screen.findByRole('heading', { level: 1, name: 'Seed runs' }, { timeout: 8_000 });
+    expect(router.state.location.pathname).toBe(
+      `/w/${WORKSPACE}/projects/01JB000000000000000PRJ0001/workstreams/01JB000000000000000WST0002`,
+    );
+  });
+
   it('shows a not-found page inside the frame for unknown paths', async () => {
     renderApp([], `/w/${WORKSPACE}/nowhere`);
     await screen.findByRole('heading', { level: 1, name: 'Page not found' }, { timeout: 8_000 });

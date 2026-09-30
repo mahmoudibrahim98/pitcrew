@@ -16,6 +16,7 @@ import {
 } from '../design/index.ts';
 import { isOpenTask, useMyOpenAsks } from './data.ts';
 import type { CreateEntry, Feature } from './feature.ts';
+import { OpenWorkstream } from './pages/open.tsx';
 import type { WorkspaceRoute } from './routes.tsx';
 import { useShell } from './store.ts';
 
@@ -100,6 +101,12 @@ function placeholderRoutes(parent: WorkspaceRoute): AnyRoute[] {
     route('my-tasks', 'MyTasksPage', { layout: 'projects', title: 'My tasks' }),
     route('projects/$project', 'ProjectPage', { layout: 'projects' }),
     route('projects/$project/workstreams/$workstream', 'WorkstreamPage', { layout: 'projects' }),
+    createRoute({
+      getParentRoute: () => parent,
+      path: 'workstreams/$workstream',
+      component: OpenWorkstream,
+      staticData: { layout: 'projects' },
+    }),
     route('tasks/$task', 'TaskPage', { layout: 'projects' }),
     route('console', 'ConsolePage', { layout: 'console', title: 'Agent console' }),
     route('console/$session', 'SessionPage', { layout: 'console' }),

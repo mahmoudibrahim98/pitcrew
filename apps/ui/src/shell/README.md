@@ -91,6 +91,7 @@ rely on these paths; build them with `paths` from `index.ts`.
 | `my-tasks` | `myTasks(ws)` | projects | N |
 | `projects/$project` | `project(ws, id)` | projects | N |
 | `projects/$project/workstreams/$workstream` | `workstream(ws, project, id)` | projects | N |
+| `workstreams/$workstream` (redirects to the path above) | `workstreamById(ws, id)` | projects | shell |
 | `tasks/$task` (key or id) | `task(ws, key)` | projects | N |
 | `console` | `console(ws)` | console | M |
 | `console/$session` | `session(ws, id)` | console | M |
@@ -140,6 +141,17 @@ The shell has placeholder dialogs for `task`, `agent`, `project` and `team`. A f
 `CreateEntry` with the same `id` replaces the placeholder; other ids add items. `dialog` is the
 body (it gets `close()`); the shell supplies the modal, its title (`title`, default "New
 <label>"), focus handling and a Suspense boundary. The palette lists every item as "New …".
+
+## Wiring components that already exist
+
+- **Merging:** keep your `index.ts` exports and add `export const feature = defineFeature({ … })`
+  from `../shell/index.ts` (the stub is one line).
+- **Projects (N):** give `ProjectsNavProvider` handlers built on `paths` and `useRouter().navigate({ href })`:
+  `openTask` → `paths.task`, `openProject` → `paths.project`, `openWorkstream` →
+  `paths.workstreamById`, `openSession` → `paths.session`, `openInbox` → `paths.inbox`. The
+  shell's Inbox badge uses the same query key as `useInbox`, so they share one fetch.
+- **Console (M):** `console` and `console/$session` are the list and the session; `SessionFilters`
+  fits the `sidebar` slot of a `layout: 'console'` feature.
 
 ## Testing a feature against the shell
 

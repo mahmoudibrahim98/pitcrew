@@ -1,12 +1,13 @@
 // `/` opens the workspace (for now the hub's one workspace); `/w/$ws` opens its stored layout
 // where it was last left.
 
-import { useRouter } from '@tanstack/react-router';
+import { useParams, useRouter } from '@tanstack/react-router';
 import { useEffect } from 'react';
-import { useConnection, useWorkspace } from '../../data/index.ts';
+import { useConnection, useWorkspace, useWorkstreams } from '../../data/index.ts';
 import { LAYOUTS, useWorkspaceId } from '../layout.ts';
 import { paths } from '../paths.ts';
 import { lastPath, storedLayout } from '../store.ts';
+import { NotFoundPage } from './not-found.tsx';
 
 /** Replaces the location with `href` (a path with its search). */
 function Redirect({ href }: { href: string }) {
@@ -33,6 +34,17 @@ export function OpenWorkspace() {
       </p>
     </main>
   );
+}
+
+/** `workstreams/$workstream`: for callers that know a workstream but not its project. */
+export function OpenWorkstream() {
+  const ws = useWorkspaceId();
+  const { workstream: id }: { workstream?: string } = useParams({ strict: false });
+  const workstreams = useWorkstreams().data;
+  if (workstreams === undefined) return null;
+  const workstream = workstreams.find((w) => w.id === id);
+  if (workstream === undefined) return <NotFoundPage />;
+  return <Redirect href={paths.workstream(ws, workstream.project, workstream.id)} />;
 }
 
 export function OpenLayout() {

@@ -13,6 +13,8 @@ export const paths = {
   project: (ws: string, project: string) => `/w/${seg(ws)}/projects/${seg(project)}`,
   workstream: (ws: string, project: string, workstream: string) =>
     `/w/${seg(ws)}/projects/${seg(project)}/workstreams/${seg(workstream)}`,
+  /** Redirects to `workstream(…)`, for callers that do not know the project. */
+  workstreamById: (ws: string, workstream: string) => `/w/${seg(ws)}/workstreams/${seg(workstream)}`,
   /** By key (`PAP-4`) or id. */
   task: (ws: string, task: string) => `/w/${seg(ws)}/tasks/${seg(task)}`,
   console: (ws: string) => `/w/${seg(ws)}/console`,

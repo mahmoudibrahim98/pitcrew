@@ -33,7 +33,7 @@ export function keyLabel(key: string): string {
   }
 }
 
-/** For `aria-keyshortcuts`: `['mod', 'k']` → `Control+K` (or `Meta+K`). */
+/** For `aria-keyshortcuts` (UI Events key values): `['mod', 'k']` → `Control+K` (or `Meta+K`). */
 export function ariaShortcut(keys: readonly string[]): string {
   return keys
     .map((key) => {
@@ -41,7 +41,6 @@ export function ariaShortcut(keys: readonly string[]): string {
       if (lower === 'mod') return isMac ? 'Meta' : 'Control';
       if (lower === 'shift') return 'Shift';
       if (lower === 'alt') return 'Alt';
-      if (key === '.') return 'Period';
       return key.length === 1 ? key.toUpperCase() : key;
     })
     .join('+');
