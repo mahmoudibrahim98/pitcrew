@@ -103,6 +103,13 @@ describe('api client error mapping', () => {
     expect(await failure(api.projects())).toMatchObject({ code: 'unavailable', status: 0 });
   });
 
+  it('turns a 2xx without JSON into an ApiError', async () => {
+    const ok = new Response('<html>captive portal</html>', { status: 200 });
+    const error = await failure(respond(ok).projects());
+    expect(error).toMatchObject({ code: 'internal', status: 200 });
+    expect(error.message).toContain('without JSON');
+  });
+
   it('returns nothing for 204', async () => {
     const api = respond(new Response(null, { status: 204 }));
     await expect(api.request('POST', '/v1/sessions/S/interrupt')).resolves.toBeUndefined();

@@ -1,10 +1,10 @@
 import { QueryClient, QueryObserver } from '@tanstack/react-query';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createApi, type Api } from '../src/data/api.ts';
+import { ApiError, createApi, type Api } from '../src/data/api.ts';
 import { keys } from '../src/data/keys.ts';
 import { createLive, Invalidator, type Live } from '../src/data/live.ts';
-import type { Task } from '../src/data/types.ts';
-import { DEVICE_TOKEN, startServer, type RunningServer } from './helpers.ts';
+import type { EventBody, Session, Task } from '../src/data/types.ts';
+import { DEVICE_TOKEN, fakeSockets, startServer, type RunningServer } from './helpers.ts';
 
 describe('live cache against the mock hub', () => {
   let hub: RunningServer;
@@ -186,5 +186,160 @@ describe('invalidator', () => {
     vi.advanceTimersByTime(4_000);
     expect(spy).toHaveBeenCalledTimes(2);
     invalidator.stop();
+  });
+
+  it('does not hold other keys while everything waits for its rate limit', () => {
+    vi.useFakeTimers();
+    const queryClient = new QueryClient();
+    const spy = vi.spyOn(queryClient, 'invalidateQueries');
+    const invalidator = new Invalidator(queryClient, { windowMs: 250, everythingMs: 5_000 });
+    invalidator.add([[]]);
+    vi.advanceTimersByTime(250);
+    invalidator.add([[], ['tasks', 'list']]);
+    vi.advanceTimersByTime(250);
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(spy.mock.calls[1]?.[0]).toMatchObject({ queryKey: ['tasks', 'list'] });
+    invalidator.stop();
+  });
+});
+
+describe('live cache with a scripted stream', () => {
+  const queryClients: QueryClient[] = [];
+  const lives: Live[] = [];
+
+  afterEach(() => {
+    for (const live of lives.splice(0)) live.stop();
+    for (const qc of queryClients.splice(0)) qc.clear();
+  });
+
+  function setup(options: { probe?: () => Promise<unknown> } = {}) {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false } } });
+    const { factory, sockets } = fakeSockets();
+    const live = createLive({
+      queryClient,
+      baseUrl: 'http://127.0.0.1:47317',
+      socket: factory,
+      windowMs: 10,
+      backoff: { initialMs: 5, maxMs: 10 },
+      probeAfter: 2,
+      ...(options.probe === undefined ? {} : { probe: options.probe }),
+    });
+    queryClients.push(queryClient);
+    lives.push(live);
+    live.start();
+    sockets[0]?.send({ type: 'hello', rev: 1, log: 'LOG-A' });
+    let rev = 1;
+    const emit = (body: EventBody) => {
+      rev += 1;
+      sockets.at(-1)?.send({
+        type: 'events',
+        from_rev: rev,
+        to_rev: rev,
+        events: [{ id: `E${rev}`, at: 0, workspace: 'W', author: 'M', body }],
+      });
+    };
+    return { queryClient, live, sockets, emit };
+  }
+
+  const task = (id: string, status: Task['status'] = 'todo'): Task => ({
+    id,
+    key: `T-${id}`,
+    project: 'P',
+    title: id,
+    description: '',
+    status,
+    priority: 'none',
+    labels: [],
+    blocked_by: [],
+    accept_auto: false,
+    subtasks: [],
+  });
+
+  it('refetches after a fetch that was in flight when a patch landed', async () => {
+    const { queryClient, emit } = setup();
+    const resolvers: ((tasks: Task[]) => void)[] = [];
+    const queryFn = vi.fn(() => new Promise<Task[]>((resolve) => resolvers.push(resolve)));
+    const observer = new QueryObserver(queryClient, { queryKey: keys.tasks.list(), queryFn });
+    const unsubscribe = observer.subscribe(() => {});
+    await vi.waitFor(() => expect(queryFn).toHaveBeenCalledTimes(1));
+
+    emit({ type: 'task_created', data: { task: task('NEW') } });
+    resolvers[0]?.([task('OLD')]); // answered before the task existed
+    await vi.waitFor(() => expect(queryFn).toHaveBeenCalledTimes(2));
+    resolvers[1]?.([task('OLD'), task('NEW')]);
+    await vi.waitFor(() => expect(observer.getCurrentResult().data?.map((t) => t.id)).toEqual(['OLD', 'NEW']));
+    unsubscribe();
+  });
+
+  it('falls back to refetching when a patch cannot apply', async () => {
+    const { queryClient, emit } = setup();
+    queryClient.setQueryData(keys.tasks.list(), { not: 'a list' });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    emit({ type: 'task_created', data: { task: task('NEW') } });
+    await vi.waitFor(() =>
+      expect(queryClient.getQueryCache().find({ queryKey: keys.tasks.list() })?.state.isInvalidated).toBe(true),
+    );
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('takes a rediscovered session out of a list it no longer matches', () => {
+    const { queryClient, emit } = setup();
+    const session: Session = {
+      id: 'S1',
+      engine: 'claude',
+      native_id: 'n',
+      machine: 'M1',
+      cwd: '/work',
+      state: 'working',
+      started: 0,
+      last_activity: 0,
+    };
+    queryClient.setQueryData(keys.sessions.list({ state: 'working' }), [session]);
+    queryClient.setQueryData(keys.sessions.list(), [session]);
+    emit({ type: 'session_discovered', data: { session: { ...session, state: 'idle' } } });
+    expect(queryClient.getQueryData<Session[]>(keys.sessions.list({ state: 'working' }))).toEqual([]);
+    expect(queryClient.getQueryData<Session[]>(keys.sessions.list())?.[0]?.state).toBe('idle');
+  });
+
+  it('refetches failed active queries when the stream comes back', async () => {
+    const { queryClient, live, sockets } = setup();
+    let fail = true;
+    const queryFn = vi.fn(async () => {
+      if (fail) throw new Error('hub unreachable');
+      return 'ok';
+    });
+    const observer = new QueryObserver(queryClient, { queryKey: ['thing'], queryFn });
+    const unsubscribe = observer.subscribe(() => {});
+    await vi.waitFor(() => expect(observer.getCurrentResult().status).toBe('error'));
+
+    fail = false;
+    sockets[0]?.drop();
+    await vi.waitFor(() => expect(sockets).toHaveLength(2));
+    sockets[1]?.send({ type: 'hello', rev: 1, log: 'LOG-A' });
+    expect(live.store.getState().status).toBe('live');
+    await vi.waitFor(() => expect(observer.getCurrentResult().data).toBe('ok'));
+    expect(queryFn).toHaveBeenCalledTimes(2);
+    unsubscribe();
+  });
+
+  it('says once that the token was rejected, after repeated failures', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const probe = vi.fn(async () => {
+      throw new ApiError('unauthorized', 'Unknown token', 401);
+    });
+    const { live, sockets } = setup({ probe });
+    for (let i = 0; i < 4; i++) {
+      const count = sockets.length;
+      sockets.at(-1)?.drop();
+      await vi.waitFor(() => expect(sockets.length).toBe(count + 1));
+    }
+    await vi.waitFor(() => expect(live.store.getState().problem).toBe('unauthorized'));
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    sockets.at(-1)?.send({ type: 'hello', rev: 1, log: 'LOG-A' });
+    expect(live.store.getState().problem).toBeUndefined();
+    warn.mockRestore();
   });
 });

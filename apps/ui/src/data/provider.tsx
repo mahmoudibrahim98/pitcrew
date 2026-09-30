@@ -32,7 +32,8 @@ function useLive<T>(select: (state: LiveState) => T): T {
 export function useConnection(): LiveState {
   const status = useLive((s) => s.status);
   const synced = useLive((s) => s.synced);
-  return { status, synced };
+  const problem = useLive((s) => s.problem);
+  return { status, synced, problem };
 }
 
 /**
@@ -82,6 +83,7 @@ export function DataProvider(props: {
       queryClient: props.queryClient,
       baseUrl: props.api.baseUrl,
       token: props.token,
+      probe: () => props.api.me(),
       ...(props.socket === undefined ? {} : { socket: props.socket }),
     }),
   );

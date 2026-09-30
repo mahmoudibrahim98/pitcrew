@@ -71,7 +71,7 @@ export function ProofPage() {
   const tasks = useTasks();
   const sessions = useSessions();
   const asks = useAsks({ state: 'open' });
-  const { status } = useConnection();
+  const { status, problem } = useConnection();
 
   const error = [workspace, projects, workstreams, tasks, sessions, asks].find((q) => q.error)?.error;
 
@@ -80,7 +80,11 @@ export function ProofPage() {
       <header className="mb-6 flex items-center gap-3">
         <h1 className="text-xl font-semibold">{workspace.data?.workspace.name ?? 'PitCrew'}</h1>
         <span data-testid="stream-status">
-          <StatusPill tone={STREAM[status].tone}>{STREAM[status].label}</StatusPill>
+          {problem === 'unauthorized' ? (
+            <StatusPill tone="risk">Token rejected</StatusPill>
+          ) : (
+            <StatusPill tone={STREAM[status].tone}>{STREAM[status].label}</StatusPill>
+          )}
         </span>
         <div className="ml-auto">
           <ThemeToggle />
