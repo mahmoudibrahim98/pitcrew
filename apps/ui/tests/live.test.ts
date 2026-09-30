@@ -390,6 +390,49 @@ describe('live cache with a scripted stream', () => {
     for (const stop of unsubscribe) stop();
   });
 
+  it('keeps an invalidated list invalidated through an unrelated patch, so it refetches on mount', async () => {
+    const { queryClient, emit } = setup();
+    const done = keys.tasks.list({ status: ['done'] });
+    queryClient.setQueryData(done, [task('X', 'done')]);
+    // X moves while the list is not mounted.
+    emit({ type: 'task_moved', data: { task: 'X', from: 'done', to: 'todo', mover: { kind: 'person' } } });
+    await vi.waitFor(() => expect(queryClient.getQueryState(done)?.isInvalidated).toBe(true));
+
+    emit({ type: 'task_created', data: { task: task('Y') } }); // a todo task: not for this list
+    expect(queryClient.getQueryState(done)?.isInvalidated).toBe(true);
+
+    const queryFn = vi.fn(async () => [task('Z', 'done')]);
+    const unsubscribe = new QueryObserver(queryClient, { queryKey: done, queryFn }).subscribe(() => {});
+    await vi.waitFor(() => expect(queryFn).toHaveBeenCalledTimes(1));
+    unsubscribe();
+  });
+
+  it('leaves alone lists an event does not change', () => {
+    const { queryClient, emit } = setup();
+    const done = keys.tasks.list({ status: ['done'] });
+    queryClient.setQueryData(done, [task('X', 'done')]);
+    const before = queryClient.getQueryState(done)?.dataUpdateCount;
+    emit({ type: 'task_created', data: { task: task('Y') } });
+    emit({ type: 'subtasks_replaced', data: { task: 'Y', subtasks: [] } });
+    expect(queryClient.getQueryState(done)?.dataUpdateCount).toBe(before);
+  });
+
+  it('refetches everything instead of throwing on a malformed event', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    // A patched type without its task, and a mapped type without its dispatch.
+    const malformed = [
+      { type: 'task_created', data: {} },
+      { type: 'dispatch_started', data: {} },
+    ] as unknown as EventBody[];
+    for (const body of malformed) {
+      const { queryClient, emit } = setup();
+      queryClient.setQueryData(['thing'], 1);
+      expect(() => emit(body)).not.toThrow();
+      await vi.waitFor(() => expect(queryClient.getQueryState(['thing'])?.isInvalidated).toBe(true));
+    }
+    expect(warn).toHaveBeenCalledTimes(2);
+  });
+
   it('falls back to refetching when a patch cannot apply', async () => {
     const { queryClient, emit } = setup();
     queryClient.setQueryData(keys.tasks.list(), { not: 'a list' });

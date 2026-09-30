@@ -224,9 +224,15 @@ export function createLive(options: LiveOptions): Live {
     ...(options.socket === undefined ? {} : { socket: options.socket }),
     ...(options.backoff === undefined ? {} : { backoff: options.backoff }),
     onEvents(events) {
-      const { touched, failed } = applyPatches(queryClient, events);
-      invalidator.afterFetches(touched);
-      invalidator.add([...keysToInvalidate(events, cache), ...failed]);
+      try {
+        const { touched, failed } = applyPatches(queryClient, events);
+        invalidator.afterFetches(touched);
+        invalidator.add([...keysToInvalidate(events, cache), ...failed]);
+      } catch (error) {
+        // A malformed event. `rev` has moved past the batch, so refetch rather than lose it.
+        console.warn('pitcrew: could not apply an event batch; refetching everything', error);
+        invalidator.add([[]]);
+      }
     },
     onReset() {
       invalidator.stop();
