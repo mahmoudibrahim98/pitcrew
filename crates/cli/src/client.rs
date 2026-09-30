@@ -26,11 +26,21 @@ pub struct Host {
 }
 
 /// A daemon to call, with the token to call it with.
-#[derive(Debug)]
 pub struct Client {
     endpoint: Endpoint,
     token: String,
     timeouts: Timeouts,
+}
+
+/// Never shows the token.
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("endpoint", &self.endpoint)
+            .field("token", &"<redacted>")
+            .field("timeouts", &self.timeouts)
+            .finish()
+    }
 }
 
 impl Client {
@@ -164,4 +174,20 @@ pub fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T> {
 pub fn from_value<T: DeserializeOwned>(value: Value) -> Result<T> {
     serde_json::from_value(value)
         .map_err(|e| Error::internal(format!("unexpected answer from the daemon: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_never_shows_the_token() {
+        let client = Client {
+            endpoint: Endpoint::dev_url("http://127.0.0.1:1").unwrap(),
+            token: "pca_secret".into(),
+            timeouts: Timeouts::HOOK,
+        };
+        let shown = format!("{client:?}");
+        assert!(!shown.contains("pca_secret"), "{shown}");
+    }
 }
