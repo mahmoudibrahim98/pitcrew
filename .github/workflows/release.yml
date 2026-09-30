@@ -68,7 +68,8 @@ jobs:
           RUST_TARGETS: ${{ matrix.rust-targets }}
         run: |
           read -r -a targets <<<"$RUST_TARGETS"
-          rustup toolchain install stable --profile minimal --target "${targets[@]}"
+          rustup toolchain install stable --profile minimal
+          rustup target add --toolchain stable "${targets[@]}"
           rustc --version
 
       # Zig from PyPI in a venv, pinned by hash; cargo-zigbuild runs `python3 -m ziglang`.
