@@ -3,6 +3,8 @@
 //! This is not shell quoting or quoting for tmux's process argv. The low-level
 //! builder protects argument boundaries; callers still choose trusted commands
 //! and flags (commands such as `run-shell` intentionally interpret their values).
+//! Use `FormatLiteral` for user values in format-expanding options, and `Text`
+//! only where tmux does not expand formats. Requires tmux 3.2 or newer.
 
 use std::fmt::{self, Write};
 
@@ -14,11 +16,24 @@ use crate::keys::tmux_key;
 /// A single tmux argument, never a fragment of command syntax.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Argument<'a> {
+    /// Text for an argument which does NOT expand tmux formats, such as `send-keys -l`.
     Text(&'a str),
+    /// User text for one format-expansion pass (`-n`, `-c`, `rename-window`, etc.).
+    /// Doubles every `#` before quoting. Not shell quoting or recursive expansion protection.
+    FormatLiteral(&'a str),
+    /// A deliberately authored format expression. Never put untrusted text here.
+    Format(&'static str),
+    /// A trusted option or option terminator, such as `-t` or `--`.
+    Flag(&'static str),
+    /// An unambiguous pane target.
     Pane(PaneId),
+    /// An unambiguous window target.
     Window(WindowId),
+    /// An unambiguous session target.
     Session(SessionId),
+    /// A protocol key, formatted for `send-keys` without `-l`.
     Key(Key),
+    /// An unsigned numeric argument.
     Number(u64),
 }
 
@@ -62,10 +77,13 @@ impl Command {
         })
     }
 
-    /// Append one quoted argument. Text includes trusted flags such as `-t`.
+    /// Append one quoted argument, with format escaping when requested.
     pub fn arg(mut self, arg: Argument<'_>) -> Result<Self, FormatError> {
         let value = match arg {
             Argument::Text(text) => quote_argument(text)?,
+            Argument::FormatLiteral(text) => quote_argument(&text.replace('#', "##"))?,
+            Argument::Format(format) => quote_argument(format)?,
+            Argument::Flag(flag) => quote_argument(flag)?,
             Argument::Key(key) => quote_argument(tmux_key(key))?,
             Argument::Pane(id) => quote_argument(&id.to_string())?,
             Argument::Window(id) => quote_argument(&id.to_string())?,
@@ -84,29 +102,74 @@ impl Command {
         line
     }
 
-    /// Send text literally to a pane: no key lookup, flag injection, or format expansion.
+    /// Send text with key-name lookup and format expansion disabled.
     ///
+    /// In copy mode, tmux still dispatches characters through the mode's key table.
+    /// Query [`Self::pane_in_mode`] and cancel copy mode before writing, checking
+    /// each reply. The runtime must serialize this sequence and account for other
+    /// clients changing modes concurrently.
     /// Newlines are delivered as input to the pane, just like other text. What
     /// the program in that pane does with input is outside the command formatter.
     pub fn send_literal(pane: PaneId, text: &str) -> Result<Self, FormatError> {
         Self::new("send-keys")?
-            .arg(Argument::Text("-l"))?
-            .arg(Argument::Text("-t"))?
+            .arg(Argument::Flag("-l"))?
+            .arg(Argument::Flag("-t"))?
             .arg(Argument::Pane(pane))?
-            .arg(Argument::Text("--"))?
+            .arg(Argument::Flag("--"))?
             .arg(Argument::Text(text))
     }
 
     /// Send named keys in order, letting tmux handle the pane's terminal modes.
-    pub fn send_keys(pane: PaneId, keys: &[Key]) -> Result<Self, FormatError> {
+    /// An empty key list produces no command.
+    pub fn send_keys(pane: PaneId, keys: &[Key]) -> Result<Option<Self>, FormatError> {
+        if keys.is_empty() {
+            return Ok(None);
+        }
         let mut command = Self::new("send-keys")?
-            .arg(Argument::Text("-t"))?
+            .arg(Argument::Flag("-t"))?
             .arg(Argument::Pane(pane))?
-            .arg(Argument::Text("--"))?;
+            .arg(Argument::Flag("--"))?;
         for &key in keys {
             command = command.arg(Argument::Key(key))?;
         }
-        Ok(command)
+        Ok(Some(command))
+    }
+
+    /// Send arbitrary bytes (including NUL and invalid UTF-8) with `send-keys -H`.
+    /// Cancel copy mode first, as for [`Self::send_literal`]. Empty input is a no-op.
+    pub fn send_bytes(pane: PaneId, bytes: &[u8]) -> Result<Option<Self>, FormatError> {
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        let mut command = Self::new("send-keys")?
+            .arg(Argument::Flag("-H"))?
+            .arg(Argument::Flag("-t"))?
+            .arg(Argument::Pane(pane))?
+            .arg(Argument::Flag("--"))?;
+        for byte in bytes {
+            command = command.arg(Argument::Text(&format!("{byte:02x}")))?;
+        }
+        Ok(Some(command))
+    }
+
+    /// Query the mode depth as a decimal integer (`0` means normal input).
+    pub fn pane_in_mode(pane: PaneId) -> Result<Self, FormatError> {
+        Self::new("display-message")?
+            .arg(Argument::Flag("-p"))?
+            .arg(Argument::Flag("-t"))?
+            .arg(Argument::Pane(pane))?
+            .arg(Argument::Format("#{pane_in_mode}"))
+    }
+
+    /// Leave the current copy mode. Check the reply, then query again before input.
+    /// Other pane modes may not support `cancel`; do not send text on failure.
+    pub fn cancel_copy_mode(pane: PaneId) -> Result<Self, FormatError> {
+        Self::new("send-keys")?
+            .arg(Argument::Flag("-X"))?
+            .arg(Argument::Flag("-t"))?
+            .arg(Argument::Pane(pane))?
+            .arg(Argument::Flag("--"))?
+            .arg(Argument::Text("cancel"))
     }
 }
 
@@ -129,7 +192,7 @@ pub fn quote_argument(text: &str) -> Result<String, FormatError> {
             }
             '\u{1}'..='\u{1f}' | '\u{7f}' => {
                 // Writing to a String cannot fail.
-                write!(quoted, "\\{:03o}", character as u32).expect("write to String");
+                let _ = write!(quoted, "\\{:03o}", character as u32);
             }
             _ => quoted.push(character),
         }

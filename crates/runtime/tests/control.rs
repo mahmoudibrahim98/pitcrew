@@ -1,5 +1,6 @@
 use pitcrew_runtime::control::{
-    CommandReply, ControlParser, Notification, PaneId, SessionId, WindowId,
+    CommandReply, ControlParser, DesyncError, Notification, PaneId, ParserLimits, SessionId,
+    WindowId,
 };
 use proptest::prelude::*;
 
@@ -137,14 +138,16 @@ fn cases() -> Vec<(Vec<u8>, Notification)> {
         (
             b"%future args  \\134\xff\n".to_vec(),
             Other {
-                name: "future".into(),
+                notification: true,
+                name: b"future".to_vec(),
                 args: b"args  \\134\xff".to_vec(),
             },
         ),
         (
             b"%future\n".to_vec(),
             Other {
-                name: "future".into(),
+                notification: true,
+                name: b"future".to_vec(),
                 args: vec![],
             },
         ),
@@ -191,15 +194,16 @@ fn every_notification_at_every_single_split() {
     for (wire, expected) in cases() {
         for split in 0..=wire.len() {
             let mut parser = ControlParser::new();
-            let mut actual = parser.feed(&wire[..split]);
-            assert!(parser.feed(b"").is_empty());
-            actual.extend(parser.feed(&wire[split..]));
+            let mut actual = parser.feed(&wire[..split]).expect("parse");
+            assert!(parser.feed(b"").expect("empty feed").is_empty());
+            actual.extend(parser.feed(&wire[split..]).expect("parse"));
+            assert_eq!(parser.finish(), Ok(()));
             assert_eq!(actual, vec![expected.clone()], "split {split}: {wire:?}");
         }
         let mut parser = ControlParser::new();
         let actual: Vec<_> = wire
             .chunks(1)
-            .flat_map(|chunk| parser.feed(chunk))
+            .flat_map(|chunk| parser.feed(chunk).expect("parse"))
             .collect();
         assert_eq!(actual, vec![expected]);
     }
@@ -211,10 +215,11 @@ fn only_matching_guards_finish_a_reply() {
     assert!(
         parser
             .feed(b"%begin 1 2 0\n%end 1 3 0\n%error 2 2 0\n%begin 1 5 0\n%end 1 2")
+            .expect("parse")
             .is_empty()
     );
     assert_eq!(
-        parser.feed(b" 0\n"),
+        parser.feed(b" 0\n").expect("parse"),
         vec![Notification::CommandReply(CommandReply {
             time: 1,
             number: 2,
@@ -251,12 +256,12 @@ fn malformed_records_are_preserved_and_do_not_break_later_records() {
         let mut wire = line.to_vec();
         wire.push(b'\n');
         assert!(matches!(
-            parser.feed(&wire).as_slice(),
+            parser.feed(&wire).expect("parse").as_slice(),
             [Notification::Other { .. }]
         ));
     }
     assert_eq!(
-        parser.feed(b"%sessions-changed\n"),
+        parser.feed(b"%sessions-changed\n").expect("parse"),
         vec![Notification::SessionsChanged]
     );
 }
@@ -287,7 +292,7 @@ proptest! {
         stream.extend(b"%output %44 ");
         stream.extend(encode_output(&payload));
         stream.push(b'\n');
-        let expected = ControlParser::new().feed(&stream);
+        let expected = ControlParser::new().feed(&stream).expect("parse");
         prop_assert_eq!(expected.last(), Some(&Notification::Output { pane: PaneId(44), data: payload }));
         let mut boundaries: Vec<_> = cuts.into_iter().map(|cut| cut % (stream.len() + 1)).collect();
         boundaries.extend([0, stream.len()]);
@@ -295,8 +300,156 @@ proptest! {
         let mut parser = ControlParser::new();
         let mut actual = Vec::new();
         for pair in boundaries.windows(2) {
-            actual.extend(parser.feed(&stream[pair[0]..pair[1]]));
+            actual.extend(parser.feed(&stream[pair[0]..pair[1]]).expect("parse"));
         }
         prop_assert_eq!(actual, expected);
+        prop_assert_eq!(parser.finish(), Ok(()));
     }
+}
+
+#[test]
+fn bounded_lines_and_replies_latch_desync() {
+    let limits = ParserLimits {
+        max_line_bytes: 20,
+        max_reply_bytes: 5,
+    };
+    for split in 0..=22 {
+        let mut parser = ControlParser::with_limits(limits);
+        let wire = b"123456789012345678901\n";
+        let first = parser.feed(&wire[..split]);
+        let result = if first.is_err() {
+            first
+        } else {
+            parser.feed(&wire[split..])
+        };
+        assert_eq!(result, Err(DesyncError::LineTooLong { limit: 20 }));
+        assert_eq!(
+            parser.feed(b"%exit\n"),
+            Err(DesyncError::LineTooLong { limit: 20 })
+        );
+        assert_eq!(parser.finish(), Err(DesyncError::LineTooLong { limit: 20 }));
+    }
+    let mut parser = ControlParser::with_limits(limits);
+    assert!(parser.feed(b"12345678901234567890\n").is_ok());
+    assert!(
+        parser
+            .feed(b"%begin 1 2 0\nab\n\n\n")
+            .expect("exact budget")
+            .is_empty()
+    );
+    assert_eq!(
+        parser.feed(b"\n"),
+        Err(DesyncError::ReplyTooLarge { limit: 5 })
+    );
+    assert_eq!(
+        parser.feed(b""),
+        Err(DesyncError::ReplyTooLarge { limit: 5 })
+    );
+
+    let mut parser = ControlParser::with_limits(limits);
+    let replies = parser
+        .feed(b"%begin 1 2 0\nab\n\n\n%end 1 2 0\n%begin 1 3 0\n1234\n%end 1 3 0\n")
+        .expect("budget resets");
+    assert_eq!(replies.len(), 2);
+    let mut parser = ControlParser::with_limits(ParserLimits {
+        max_line_bytes: 20,
+        max_reply_bytes: 0,
+    });
+    assert_eq!(
+        parser
+            .feed(b"%begin 1 2 0\n%end 1 2 0\n")
+            .expect("empty reply")
+            .len(),
+        1
+    );
+    assert_eq!(
+        parser.feed(b"%begin 1 3 0\n\n"),
+        Err(DesyncError::ReplyTooLarge { limit: 0 })
+    );
+}
+
+#[test]
+fn finish_reports_partial_lines_and_open_replies() {
+    for (input, unfinished_reply, partial_line_bytes) in [
+        (b"%out".as_slice(), false, 4),
+        (b"%begin 1 2 0\n".as_slice(), true, 0),
+        (b"%begin 1 2 0\npartial".as_slice(), true, 7),
+    ] {
+        let mut parser = ControlParser::new();
+        assert!(parser.feed(input).expect("feed").is_empty());
+        assert_eq!(
+            parser.finish(),
+            Err(DesyncError::UnexpectedEof {
+                unfinished_reply,
+                partial_line_bytes
+            })
+        );
+    }
+    assert_eq!(ControlParser::new().finish(), Ok(()));
+}
+
+#[test]
+fn crlf_flags_and_exit_inside_reply() {
+    let mut parser = ControlParser::new();
+    let actual = parser.feed(b"%begin 1 2 0\r\nbody\r\n%end 1 2 1\r\n%error 1 2 1\n%end 1 2 0\r\n%output %0 a\\015\r\n%exit reason\r\n").expect("parse");
+    assert_eq!(
+        actual,
+        vec![
+            Notification::CommandReply(CommandReply {
+                time: 1,
+                number: 2,
+                flags: 0,
+                failed: false,
+                lines: vec![
+                    b"body\r".to_vec(),
+                    b"%end 1 2 1\r".to_vec(),
+                    b"%error 1 2 1".to_vec()
+                ]
+            }),
+            Notification::Output {
+                pane: PaneId(0),
+                data: b"a\r".to_vec()
+            },
+            Notification::Exit {
+                reason: Some(b"reason".to_vec())
+            },
+        ]
+    );
+    assert_eq!(parser.finish(), Ok(()));
+    let mut parser = ControlParser::new();
+    assert_eq!(
+        parser
+            .feed(b"%begin 1 2 0\npartial reply\n%exit gone\r\n")
+            .expect("exit"),
+        vec![Notification::Exit {
+            reason: Some(b"gone".to_vec())
+        }]
+    );
+    assert_eq!(parser.finish(), Ok(()));
+}
+
+#[test]
+fn other_preserves_prefix_and_invalid_utf8() {
+    assert_eq!(
+        ControlParser::new()
+            .feed(b"%\xff args\r\n\xff args\r\n%future x\r\r\n")
+            .expect("parse"),
+        vec![
+            Notification::Other {
+                notification: true,
+                name: vec![0xff],
+                args: b"args".to_vec()
+            },
+            Notification::Other {
+                notification: false,
+                name: vec![0xff],
+                args: b"args\r".to_vec()
+            },
+            Notification::Other {
+                notification: true,
+                name: b"future".to_vec(),
+                args: b"x\r".to_vec()
+            },
+        ]
+    );
 }

@@ -59,7 +59,9 @@ fn command_boundaries_and_typed_arguments() -> Result<(), FormatError> {
         "send-keys \"-l\" \"-t\" \"%3\" \"--\" \"-F #{pane_id}\"\n"
     );
     assert_eq!(
-        Command::send_keys(PaneId(2), &[Key::Enter, Key::CtrlC])?.to_line(),
+        Command::send_keys(PaneId(2), &[Key::Enter, Key::CtrlC])?
+            .expect("nonempty keys")
+            .to_line(),
         "send-keys \"-t\" \"%2\" \"--\" \"Enter\" \"C-c\"\n"
     );
     assert_eq!(
@@ -73,6 +75,147 @@ fn command_boundaries_and_typed_arguments() -> Result<(), FormatError> {
     Ok(())
 }
 
+#[test]
+fn formats_modes_bytes_and_empty_keys() -> Result<(), FormatError> {
+    assert_eq!(Command::send_keys(PaneId(0), &[])?, None);
+    assert_eq!(Command::send_bytes(PaneId(0), &[])?, None);
+    assert_eq!(
+        Command::send_bytes(PaneId(2), b"\0\xff\x80\r")?
+            .expect("bytes")
+            .to_line(),
+        "send-keys \"-H\" \"-t\" \"%2\" \"--\" \"00\" \"ff\" \"80\" \"0d\"\n"
+    );
+    assert_eq!(
+        Command::pane_in_mode(PaneId(2))?.to_line(),
+        "display-message \"-p\" \"-t\" \"%2\" \"#{pane_in_mode}\"\n"
+    );
+    assert_eq!(
+        Command::cancel_copy_mode(PaneId(2))?.to_line(),
+        "send-keys \"-X\" \"-t\" \"%2\" \"--\" \"cancel\"\n"
+    );
+    assert_eq!(
+        Command::new("new-window")?
+            .arg(Argument::Flag("-n"))?
+            .arg(Argument::FormatLiteral("#(touch sentinel) #{pane_id} ##"))?
+            .to_line(),
+        "new-window \"-n\" \"##(touch sentinel) ##{pane_id} ####\"\n"
+    );
+    assert_eq!(
+        Command::new("rename-window")?.arg(Argument::FormatLiteral("x\0y")),
+        Err(FormatError::Nul)
+    );
+    Ok(())
+}
+
+// Independent model of the relevant tmux double-quote lexer. Synthetic values
+// make accidental variable/home expansion observable without reading the host.
+fn lex_double_quote(input: &[u8]) -> Result<(Vec<u8>, &[u8]), &'static str> {
+    if input.first() != Some(&b'"') {
+        return Err("missing opening quote");
+    }
+    let mut output = Vec::new();
+    let mut index = 1;
+    while let Some(&byte) = input.get(index) {
+        index += 1;
+        match byte {
+            b'"' => return Ok((output, &input[index..])),
+            b'\n' | 0 => return Err("invalid physical line"),
+            b'\\' => {
+                let escaped = *input.get(index).ok_or("incomplete escape")?;
+                index += 1;
+                if (b'0'..=b'7').contains(&escaped) {
+                    let mut value = u16::from(escaped - b'0');
+                    for _ in 0..2 {
+                        let digit = *input.get(index).ok_or("short octal")?;
+                        if !(b'0'..=b'7').contains(&digit) {
+                            return Err("invalid octal");
+                        }
+                        value = value * 8 + u16::from(digit - b'0');
+                        index += 1;
+                    }
+                    output.push(u8::try_from(value).map_err(|_| "octal overflow")?);
+                } else {
+                    output.push(match escaped {
+                        b'n' => b'\n',
+                        b'r' => b'\r',
+                        b't' => b'\t',
+                        b'e' => 27,
+                        other => other,
+                    });
+                }
+            }
+            b'$' => {
+                let start = index;
+                let braced = input.get(index) == Some(&b'{');
+                if braced {
+                    index += 1;
+                }
+                while input
+                    .get(index)
+                    .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                {
+                    index += 1;
+                }
+                if braced {
+                    if input.get(index) != Some(&b'}') {
+                        return Err("invalid variable");
+                    }
+                    index += 1;
+                }
+                if start == index {
+                    output.push(b'$');
+                } else {
+                    output.extend(b"synthetic-value");
+                }
+            }
+            b'~' if output.is_empty() => {
+                while input
+                    .get(index)
+                    .is_some_and(|b| *b != b'/' && *b != b'"' && !b.is_ascii_whitespace())
+                {
+                    index += 1;
+                }
+                output.extend(b"/synthetic/home");
+            }
+            other => output.push(other),
+        }
+    }
+    Err("missing closing quote")
+}
+
+#[test]
+fn lexer_catches_expansion_and_escape_regressions() {
+    assert_eq!(
+        lex_double_quote(br#""$FOO"tail"#).expect("lex"),
+        (b"synthetic-value".to_vec(), b"tail".as_slice())
+    );
+    assert_eq!(
+        lex_double_quote(br#""~user/path""#).expect("lex").0,
+        b"/synthetic/home/path"
+    );
+    assert_eq!(
+        lex_double_quote(br#""\134\012\"\$\~""#).expect("lex").0,
+        b"\\\n\"$~"
+    );
+    for input in [
+        "$FOO",
+        "${FOO}",
+        "~user/path",
+        "\\",
+        "\\012",
+        "\"",
+        "a\nb",
+        "\x7f",
+        "FOO=bar",
+        "%hidden x",
+    ] {
+        let quoted = quote_argument(input).expect("quote");
+        let (value, rest) = lex_double_quote(quoted.as_bytes()).expect("lex");
+        assert_eq!(value, input.as_bytes());
+        assert!(rest.is_empty());
+    }
+}
+
 proptest! {
     #![proptest_config(ProptestConfig {
         failure_persistence: Some(Box::new(proptest::test_runner::FileFailurePersistence::WithSource("proptest-regressions"))),
@@ -83,6 +226,10 @@ proptest! {
         let text: String = characters.into_iter().collect();
         match Command::send_literal(PaneId(0), &text) {
             Ok(command) => {
+                let quoted = quote_argument(&text).expect("valid text");
+                let (decoded, rest) = lex_double_quote(quoted.as_bytes()).expect("lex quoted text");
+                prop_assert_eq!(decoded, text.as_bytes());
+                prop_assert!(rest.is_empty());
                 let line = command.to_line();
                 prop_assert_eq!(line.bytes().filter(|&b| b == b'\n').count(), 1);
                 prop_assert!(line.ends_with('\n'));
