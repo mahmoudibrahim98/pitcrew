@@ -2,16 +2,19 @@
 //!
 //! - Events come oldest first within a page; without `before`, the newest page. `before` is an
 //!   exclusive revision. `limit` defaults to 100 and is capped at 500.
-//! - `from_rev` and `to_rev` are the revisions of the first and last events (both 0 for an empty
-//!   page). Pass `from_rev` as `before` for the previous page. `at_start` is true when nothing
+//! - The page is `pitcrew_protocol::api::EventsPage`. `from_rev` and `to_rev` are the revisions
+//!   of the first and last events (both 0 for an empty page at the start). Pass `from_rev` as
+//!   `before` for the previous page. **Only `at_start` ends paging**: it is true when nothing
 //!   older matches.
-//! - **Filters.** `session` and `task` match events whose body names that id anywhere (the
-//!   session a turn ran in, the task a comment is on, an ask's task, …). Events that reach the
-//!   entity only through another one (a turn in a session linked to the task) are not included
-//!   until the hub has projections. Filtered pages are found by scanning back at most
-//!   [`SCAN_BUDGET`] events per request; if the budget runs out first, the page may hold fewer
-//!   than `limit` events (even none) with `at_start` false, and `from_rev` is where the scan
-//!   stopped, so the next request continues from there.
+//! - **Filters.** `session` and `task` match events whose body has, at any depth, a `session`
+//!   (or `task`) field holding that id, either as the id itself or as an object with that `id`:
+//!   the session a turn ran in, a discovered session, the task a comment is on, an ask's task, a
+//!   receipt's session, and so on. The id elsewhere (a session's `parent`, a task's `blocked_by`,
+//!   free text) does not match. Events that reach the entity only through another one (a turn
+//!   in a session linked to the task) are not included until the hub has projections. Filtered
+//!   pages are found by scanning back at most [`SCAN_BUDGET`] events per request; if the budget
+//!   runs out first, the page may hold fewer than `limit` events (even none) with `at_start`
+//!   false, and `from_rev` is where the scan stopped, so the next request continues from there.
 //! - `project` and `workstream` need an index the hub does not have yet (stream E), and answer
 //!   `400 invalid` with [`NEEDS_INDEX`].
 
@@ -20,10 +23,10 @@ use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use pitcrew_auth::ErrorResponse;
-use pitcrew_protocol::api::ErrorCode;
+use pitcrew_protocol::api::{ErrorCode, EventsPage};
 use pitcrew_protocol::events::Event;
 use pitcrew_protocol::ids::{SessionId, TaskId};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::sync::Arc;
 
 /// Events per page when `limit` is absent.
@@ -38,18 +41,52 @@ pub const NEEDS_INDEX: &str = "Filtering activity by project or workstream needs
 
 const SCAN_PAGE: usize = 500;
 
-/// One page of activity.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EventsPage {
-    /// The events, oldest first.
-    pub events: Vec<Event>,
-    /// Revision of the first event (see the module docs for a filtered page that ran out of
-    /// budget).
-    pub from_rev: u64,
-    /// Revision of the last event.
-    pub to_rev: u64,
-    /// Whether nothing older matches.
-    pub at_start: bool,
+/// A filter on activity: events with a `key` field, at any depth, that holds `id` or an object
+/// whose `id` is `id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Filter {
+    key: &'static str,
+    id: String,
+}
+
+impl Filter {
+    /// Events about this session.
+    #[must_use]
+    pub fn session(id: SessionId) -> Self {
+        Self {
+            key: "session",
+            id: id.0.to_string(),
+        }
+    }
+
+    /// Events about this task.
+    #[must_use]
+    pub fn task(id: TaskId) -> Self {
+        Self {
+            key: "task",
+            id: id.0.to_string(),
+        }
+    }
+
+    /// Whether `value` has a `key` field naming the id, at any depth.
+    fn matches(&self, value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(map) => map
+                .iter()
+                .any(|(key, field)| (key == self.key && self.names(field)) || self.matches(field)),
+            serde_json::Value::Array(items) => items.iter().any(|item| self.matches(item)),
+            _ => false,
+        }
+    }
+
+    /// Whether `field` is the id, or an object with that `id`.
+    fn names(&self, field: &serde_json::Value) -> bool {
+        let id = match field {
+            serde_json::Value::Object(map) => map.get("id"),
+            other => Some(other),
+        };
+        id.and_then(serde_json::Value::as_str) == Some(self.id.as_str())
+    }
 }
 
 /// The activity route. Mount it as a **device** route (`RouterParts::device`).
@@ -83,18 +120,18 @@ async fn events(
         Some(0) => return Err(invalid("`limit` must be at least 1.".to_owned())),
         Some(n) => n.min(MAX_LIMIT),
     };
-    let mut needles = Vec::new();
+    let mut filters = Vec::new();
     if let Some(session) = &query.session {
         let id: SessionId = session
             .parse()
             .map_err(|_| invalid(format!("{session:?} is not a session id.")))?;
-        needles.push(id.0.to_string());
+        filters.push(Filter::session(id));
     }
     if let Some(task) = &query.task {
         let id: TaskId = task
             .parse()
             .map_err(|_| invalid(format!("{task:?} is not a task id.")))?;
-        needles.push(id.0.to_string());
+        filters.push(Filter::task(id));
     }
     let before = query.before;
     let page = tokio::task::spawn_blocking(move || {
@@ -102,7 +139,7 @@ async fn events(
             Some(before) => before,
             None => source.latest_rev()?.saturating_add(1),
         };
-        page(&*source, before, limit, &needles)
+        page(&*source, before, limit, &filters)
     })
     .await
     .map_err(|e| {
@@ -118,7 +155,7 @@ async fn events(
     Ok(Json(page))
 }
 
-/// The newest `limit` events below `before` whose bodies name every id in `needles`.
+/// The newest `limit` events below `before` that match every filter.
 ///
 /// # Errors
 /// The source cannot be read.
@@ -126,9 +163,9 @@ pub fn page(
     source: &dyn EventSource,
     before: u64,
     limit: usize,
-    needles: &[String],
+    filters: &[Filter],
 ) -> Result<EventsPage, SourceError> {
-    if needles.is_empty() {
+    if filters.is_empty() {
         // One extra event tells whether older ones exist.
         let mut events = source.before(before, limit.saturating_add(1))?;
         let at_start = events.len() <= limit;
@@ -155,7 +192,7 @@ pub fn page(
         cursor = first.rev;
         scanned += chunk.len();
         for event in chunk.into_iter().rev() {
-            if names_all(&event.event, needles) {
+            if matches_all(&event.event, filters) {
                 found.push(event);
                 if found.len() > limit {
                     found.pop();
@@ -183,14 +220,12 @@ fn page_of(events: Vec<StoredEvent>, at_start: bool, scanned_to: u64) -> EventsP
     }
 }
 
-/// Whether the event's body holds each needle as a whole JSON string.
-fn names_all(event: &Event, needles: &[String]) -> bool {
-    let Ok(body) = serde_json::to_string(&event.body) else {
+/// Whether the event's body matches every filter.
+fn matches_all(event: &Event, filters: &[Filter]) -> bool {
+    let Ok(body) = serde_json::to_value(&event.body) else {
         return false;
     };
-    needles
-        .iter()
-        .all(|needle| body.contains(&format!("\"{needle}\"")))
+    filters.iter().all(|filter| filter.matches(&body))
 }
 
 #[cfg(test)]
@@ -255,13 +290,97 @@ mod tests {
     fn a_filtered_scan_that_runs_out_of_budget_says_where_it_stopped() {
         let source = MemorySource::new("log", 4);
         source.append(filler(SCAN_BUDGET + 1500));
-        let needle = [MachineId::new().0.to_string()];
-        let first = page(&source, u64::MAX, 10, &needle).unwrap();
+        let filter = [Filter::session(SessionId::new())];
+        let first = page(&source, u64::MAX, 10, &filter).unwrap();
         assert!(first.events.is_empty());
         assert!(!first.at_start);
         assert_eq!(first.from_rev, 1501);
-        let rest = page(&source, first.from_rev, 10, &needle).unwrap();
+        assert_eq!(first.to_rev, 0);
+        let rest = page(&source, first.from_rev, 10, &filter).unwrap();
         assert!(rest.events.is_empty());
         assert!(rest.at_start);
+    }
+
+    /// Filters match the `session` or `task` field, not the id anywhere in the body.
+    #[test]
+    fn filters_match_by_key_not_by_substring() {
+        use pitcrew_protocol::model::{LinkBasis, Receipt};
+        let demo = pitcrew_fixtures::demo_workspace().unwrap();
+        let (x, y, t) = (SessionId::new(), SessionId::new(), TaskId::new());
+        let discovered = |id: SessionId, parent: Option<SessionId>| {
+            let mut session = demo.sessions[0].clone();
+            session.id = id;
+            session.parent = parent;
+            session.task = None;
+            EventBody::SessionDiscovered { session }
+        };
+        let mut blocked = demo.tasks[0].clone();
+        blocked.id = TaskId::new();
+        blocked.blocked_by = vec![t];
+        let linked = |session: SessionId| EventBody::SessionLinked {
+            session,
+            workstream: None,
+            task: Some(t),
+            basis: LinkBasis::Manual,
+        };
+        // (body, matches session=x, matches task=t)
+        let cases = [
+            (EventBody::SessionEnded { session: x }, true, false),
+            (discovered(x, None), true, false),
+            (discovered(y, Some(x)), false, false),
+            (
+                EventBody::CommentPosted {
+                    task: None,
+                    workstream: None,
+                    text: x.0.to_string(),
+                    mentions: vec![],
+                },
+                false,
+                false,
+            ),
+            (
+                EventBody::TurnEnded {
+                    session: y,
+                    receipt: Receipt::Transcript {
+                        session: x,
+                        offset: 0,
+                    },
+                },
+                true,
+                false,
+            ),
+            (linked(y), false, true),
+            (linked(x), true, true),
+            (EventBody::TaskCreated { task: blocked }, false, false),
+        ];
+        let source = MemorySource::new("log", 4);
+        source.append(
+            cases
+                .iter()
+                .map(|(body, ..)| Event::now(WorkspaceId::new(), MemberId::new(), body.clone()))
+                .collect(),
+        );
+        let revs = |filters: &[Filter]| -> Vec<u64> {
+            let page = page(&source, u64::MAX, 100, filters).unwrap();
+            assert!(page.at_start);
+            let all = source.before(u64::MAX, 100).unwrap();
+            page.events
+                .iter()
+                .map(|e| all.iter().find(|s| s.event == *e).unwrap().rev)
+                .collect()
+        };
+        let expected = |pick: fn(&(EventBody, bool, bool)) -> bool| -> Vec<u64> {
+            (1..)
+                .zip(&cases)
+                .filter(|(_, c)| pick(c))
+                .map(|(rev, _)| rev)
+                .collect()
+        };
+        assert_eq!(revs(&[Filter::session(x)]), expected(|c| c.1));
+        assert_eq!(revs(&[Filter::task(t)]), expected(|c| c.2));
+        assert_eq!(
+            revs(&[Filter::session(x), Filter::task(t)]),
+            expected(|c| c.1 && c.2)
+        );
     }
 }
