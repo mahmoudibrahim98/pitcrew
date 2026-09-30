@@ -43,6 +43,7 @@ fn identity(meta: &Metadata) -> Option<String> {
 }
 
 /// Filesystem types where change notifications are missing or unreliable, so the watcher polls.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const NETWORK_FS: &[&str] = &[
     "nfs",
     "nfs4",
@@ -82,6 +83,7 @@ pub(crate) fn is_network_fs(path: &Path) -> bool {
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn is_network_type(fs: &str) -> bool {
     let fs = fs.strip_prefix("fuse.").unwrap_or(fs);
     NETWORK_FS.contains(&fs) || matches!(fs, "sshfs" | "rclone" | "s3fs")

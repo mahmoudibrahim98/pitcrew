@@ -5,6 +5,7 @@
 //! cargo test -p pitcrew-runner --release --test idle_cpu -- --ignored --nocapture
 //! ```
 
+#![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used)]
 
 mod common;
@@ -22,7 +23,6 @@ const WINDOW: Duration = Duration::from_secs(20);
 const BUDGET_PERCENT: f64 = 0.5;
 
 /// User plus system CPU time of this process, in clock ticks (100 per second on Linux).
-#[cfg(target_os = "linux")]
 fn cpu_ticks() -> u64 {
     let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
     let after_name = &stat[stat.rfind(')').unwrap() + 2..];
@@ -31,7 +31,6 @@ fn cpu_ticks() -> u64 {
     fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
 }
 
-#[cfg(target_os = "linux")]
 fn measure(poll: PollMode) -> f64 {
     let home = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
@@ -88,7 +87,6 @@ fn measure(poll: PollMode) -> f64 {
     percent
 }
 
-#[cfg(target_os = "linux")]
 #[test]
 #[ignore = "slow: measures idle CPU over 20 s per mode"]
 fn idle_cpu_with_50_transcripts() {
