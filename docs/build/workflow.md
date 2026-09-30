@@ -40,7 +40,12 @@ pull requests, green checks, honest reports, never merge.**
 
 ## The worker brief
 
-The integrator starts each agent with this brief (fill in the brackets):
+Ready-made briefs live in [briefs/](briefs/). An agent is started with one line:
+"Follow `docs/build/briefs/<brief>.md`". Each brief builds on `briefs/README.md`, which holds
+the setup, environment, rules, definition of done and report format shared by all of them.
+
+To write a new brief, copy an existing one. For a quick one-off, this template also works (fill
+in the brackets):
 
 ```text
 You are the agent for stream [X] of PitCrew: [stream name].

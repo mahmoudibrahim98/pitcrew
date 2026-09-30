@@ -10,6 +10,7 @@ worktree and branch, owning its own paths, working against shared contracts and 
 | [contracts.md](contracts.md) | The contracts every stream codes against, and how to change them |
 | [contracts/api-v1.md](contracts/api-v1.md) | The daemon's HTTP and WebSocket API |
 | [streams/](streams/) | One card per stream: goal, paths, dependencies, work packages, acceptance, what not to touch |
+| [briefs/](briefs/) | Ready-to-run assignments: tell an agent "Follow `docs/build/briefs/<brief>.md`" |
 
 ## The streams
 

@@ -3,6 +3,7 @@
   "private": true,
   "license": "Apache-2.0",
   "description": "Workspace root. Owned by stream 0; UI streams add their own package.json under apps/ui.",
+  "packageManager": "pnpm@10.34.6",
   "engines": {
     "node": ">=22.18"
   },
