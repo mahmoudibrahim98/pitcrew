@@ -2,6 +2,7 @@ use pitcrew_store::migrations::{self, Migration};
 use pitcrew_store::{Error, Store, StoreOptions};
 use std::borrow::Cow;
 use std::path::Path;
+use std::sync::{Arc, Barrier};
 
 const INIT_SQL: &str = include_str!("../migrations/0001_init.sql");
 
@@ -34,6 +35,39 @@ fn embedded_includes_init() {
     assert_eq!(all.first().map(|m| m.version), Some(1));
     assert_eq!(all[0].name, "init");
     assert!(all.windows(2).all(|w| w[0].version < w[1].version));
+}
+
+#[test]
+fn embedded_matches_the_migrations_directory() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let on_disk = migrations::load_dir(&dir).expect("load");
+    assert_eq!(migrations::embedded(), on_disk.as_slice());
+}
+
+#[test]
+fn concurrent_opens_of_a_fresh_file_both_succeed() {
+    const OPENERS: usize = 4;
+    for _ in 0..5 {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = Arc::new(dir.path().join("store.db"));
+        let barrier = Arc::new(Barrier::new(OPENERS));
+        let handles: Vec<_> = (0..OPENERS)
+            .map(|_| {
+                let path = Arc::clone(&path);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Store::open(path.as_path(), StoreOptions::default()).map(drop)
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("thread").expect("open");
+        }
+        let versions: Vec<u32> = applied(&path).iter().map(|a| a.0).collect();
+        let expected: Vec<u32> = migrations::embedded().iter().map(|m| m.version).collect();
+        assert_eq!(versions, expected);
+    }
 }
 
 #[test]
@@ -112,6 +146,10 @@ fn a_failed_migration_leaves_nothing_behind() {
         "{err:?}"
     );
     assert!(err.to_string().contains("0101_broken"), "{err}");
+    // The cause is the source, not repeated in the message.
+    let cause = std::error::Error::source(&err).expect("source").to_string();
+    assert!(cause.contains("syntax error"), "{cause}");
+    assert!(!err.to_string().contains(&cause), "{err}");
 
     let conn = raw(&path);
     let half: i64 = conn

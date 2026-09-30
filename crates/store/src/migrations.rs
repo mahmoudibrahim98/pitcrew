@@ -3,11 +3,12 @@
 //! Every `migrations/NNNN_<name>.sql` file is embedded at build time. Number ranges belong to
 //! streams (ADR-0004), so files from several streams interleave. The store records what it has
 //! applied in `schema_migrations` and applies any known migration that is missing, each in its own
-//! transaction.
+//! IMMEDIATE transaction that re-checks `schema_migrations`, so several processes can open a fresh
+//! file at once.
 
 use crate::error::{DbError, Error, Result};
 use crate::scan;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -111,7 +112,23 @@ pub(crate) fn apply(conn: &mut Connection, migrations: &[Migration]) -> Result<V
             name: m.name.to_string(),
             source: DbError::new(source),
         };
-        let tx = conn.transaction().map_err(fail)?;
+        // IMMEDIATE, so two processes opening the store serialise here instead of failing with
+        // SQLITE_BUSY; the loser then sees the winner's row and skips the migration.
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(fail)?;
+        let done = tx
+            .query_row(
+                "SELECT 1 FROM schema_migrations WHERE version = ?1",
+                [m.version],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(fail)?
+            .is_some();
+        if done {
+            continue;
+        }
         tx.execute_batch(&m.sql).map_err(fail)?;
         tx.execute(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",

@@ -1,6 +1,9 @@
-use pitcrew_protocol::events::Event;
+use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::EventId;
-use pitcrew_store::{EventFilter, RevRange, Store, StoreOptions, event_type};
+use pitcrew_store::{Error, EventFilter, RevRange, Store, StoreOptions, event_type};
+use serde_json::json;
+use std::collections::BTreeSet;
+use std::sync::{Arc, Barrier};
 use tempfile::TempDir;
 
 fn fixture_events() -> Vec<Event> {
@@ -144,13 +147,46 @@ fn before_filters_by_type() {
             .expect("before")
             .is_empty()
     );
+    // An empty type list matches everything, as the doc says.
     let empty = EventFilter::default().types(Vec::<String>::new());
-    assert!(
-        store
-            .before(u64::MAX, 100, &empty)
-            .expect("before")
-            .is_empty()
+    assert_eq!(empty, EventFilter::default());
+    assert_eq!(
+        store.before(u64::MAX, 100, &empty).expect("before").len(),
+        15
     );
+    let mut raw_empty = EventFilter::default();
+    raw_empty.types = Some(Vec::new());
+    assert_eq!(
+        store
+            .before(u64::MAX, 100, &raw_empty)
+            .expect("before")
+            .len(),
+        15
+    );
+}
+
+#[test]
+fn filtered_before_uses_the_type_rev_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("store.db");
+    drop(Store::open(&path, StoreOptions::default()).expect("open"));
+    let conn = rusqlite::Connection::open(&path).expect("raw");
+    // The same shape as `before` with one type.
+    let plan: Vec<String> = conn
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT rev FROM events
+             WHERE rev < ?1 AND type IN (?2) ORDER BY rev DESC LIMIT ?3",
+        )
+        .expect("prepare")
+        .query_map(rusqlite::params![100, "task_moved", 10], |r| {
+            r.get::<_, String>(3)
+        })
+        .expect("query")
+        .collect::<rusqlite::Result<_>>()
+        .expect("rows");
+    let plan = plan.join("\n");
+    assert!(plan.contains("events_by_type_rev"), "{plan}");
+    assert!(!plan.contains("TEMP B-TREE"), "{plan}");
 }
 
 #[test]
@@ -161,7 +197,23 @@ fn a_failed_append_appends_nothing() {
     // The last event repeats an id that is already stored.
     let mut batch = events[5..].to_vec();
     batch.push(events[0].clone());
-    store.append(&batch).expect_err("duplicate id");
+    let err = store.append(&batch).expect_err("duplicate id");
+    assert!(
+        matches!(err, Error::DuplicateEvent { id } if id == events[0].id),
+        "{err:?}"
+    );
+    assert_eq!(store.latest_rev().expect("rev"), 5);
+
+    // A repeat inside one batch is the same error.
+    let mut fresh = events[5].clone();
+    fresh.id = EventId::new();
+    let err = store
+        .append(&[fresh.clone(), fresh.clone()])
+        .expect_err("repeat in batch");
+    assert!(
+        matches!(err, Error::DuplicateEvent { id } if id == fresh.id),
+        "{err:?}"
+    );
     assert_eq!(store.latest_rev().expect("rev"), 5);
 
     let range = store.append(&events[5..]).expect("append rest");
@@ -220,4 +272,171 @@ fn reopening_keeps_the_log() {
     let mut more = events[0].clone();
     more.id = EventId::new();
     assert_eq!(store.append(&[more]).expect("append").from_rev, 16);
+}
+
+/// Every `EventBody` tag, read from serde's "unknown variant" message so a new variant in the
+/// protocol shows up here without editing this test.
+fn all_event_types() -> BTreeSet<String> {
+    let err = serde_json::from_value::<EventBody>(json!({"type": "__none__", "data": {}}))
+        .expect_err("unknown tag");
+    let msg = err.to_string();
+    let list = msg
+        .split_once("expected one of ")
+        .map(|(_, rest)| rest)
+        .unwrap_or_else(|| panic!("unexpected serde message: {msg}"));
+    list.split('`')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// One event for each body the fixture's log does not already have, built from fixture records.
+fn other_bodies() -> Vec<EventBody> {
+    let demo = pitcrew_fixtures::demo_workspace().expect("fixture");
+    let session = &demo.sessions[0];
+    let bodies = [
+        json!({"type": "machine_liveness", "data": {
+            "machine": demo.machines[2].id, "liveness": "stopped"}}),
+        json!({"type": "session_discovered", "data": {"session": session}}),
+        json!({"type": "turn_ended", "data": {"session": session.id,
+            "receipt": {"kind": "transcript", "session": session.id, "offset": 4096}}}),
+        json!({"type": "session_linked", "data": {"session": session.id,
+            "workstream": demo.workstreams[0].id, "task": demo.tasks[0].id, "basis": "folder"}}),
+        json!({"type": "session_ended", "data": {"session": session.id}}),
+        json!({"type": "project_created", "data": {"project": demo.projects[0]}}),
+        json!({"type": "workstream_created", "data": {"workstream": demo.workstreams[1]}}),
+        json!({"type": "task_created", "data": {"task": demo.tasks[3]}}),
+        json!({"type": "task_assigned", "data": {"task": demo.tasks[4].id,
+            "assignee": demo.members[2].id}}),
+        json!({"type": "ask_answered", "data": {"ask": demo.asks[1].id,
+            "answer": {"by": demo.members[0].id, "option": 1, "text": "Drop it.",
+                       "at": 1_790_762_500_000_i64}}}),
+        json!({"type": "decision_recorded", "data": {"workstream": demo.workstreams[1].id,
+            "text": "Report four seeds.", "why": "Seed 3 diverged.",
+            "receipts": [{"kind": "job", "scheduler": "slurm", "id": "4815164"}]}}),
+    ];
+    bodies
+        .into_iter()
+        .map(|b| serde_json::from_value(b).expect("body"))
+        .collect()
+}
+
+#[test]
+fn every_event_body_variant_round_trips() {
+    let (_dir, store) = open();
+    let mut events = fixture_events();
+    let template = events[0].clone();
+    for body in other_bodies() {
+        let mut e = template.clone();
+        e.id = EventId::new();
+        e.body = body;
+        events.push(e);
+    }
+    let covered: BTreeSet<String> = events
+        .iter()
+        .map(|e| event_type(&e.body).expect("type"))
+        .collect();
+    assert_eq!(covered, all_event_types(), "add a body for the new variant");
+
+    store.append(&events).expect("append");
+    let back: Vec<Event> = store
+        .since(0, 1000)
+        .expect("since")
+        .into_iter()
+        .map(|e| e.event)
+        .collect();
+    assert_eq!(back, events);
+}
+
+fn numbered_events(n: usize) -> Vec<Event> {
+    fixture_events()
+        .into_iter()
+        .cycle()
+        .take(n)
+        .map(|mut e| {
+            e.id = EventId::new();
+            e
+        })
+        .collect()
+}
+
+#[test]
+fn concurrent_appenders_notify_in_order() {
+    const THREADS: usize = 8;
+    const BATCHES: usize = 25;
+    let (_dir, store) = open();
+    let store = Arc::new(store);
+    let mut rx = store.subscribe();
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let handles: Vec<_> = (0..THREADS)
+        .map(|i| {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                // Batches of different sizes, so ranges from different threads differ.
+                let events = numbered_events(BATCHES * (i + 1));
+                barrier.wait();
+                for batch in events.chunks(i + 1) {
+                    store.append(batch).expect("append");
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().expect("thread");
+    }
+
+    let mut next = 1;
+    let mut count = 0;
+    while let Ok(range) = rx.try_recv() {
+        assert_eq!(
+            range.from_rev, next,
+            "ranges must be contiguous and increasing"
+        );
+        assert!(range.to_rev >= range.from_rev);
+        next = range.to_rev + 1;
+        count += 1;
+    }
+    assert_eq!(count, THREADS * BATCHES);
+    assert_eq!(next - 1, store.latest_rev().expect("rev"));
+}
+
+#[test]
+fn two_stores_on_one_file_append_concurrently() {
+    const BATCHES: usize = 50;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("store.db");
+    let stores: Vec<Arc<Store>> = (0..2)
+        .map(|_| Arc::new(Store::open(&path, StoreOptions::default()).expect("open")))
+        .collect();
+    let barrier = Arc::new(Barrier::new(stores.len()));
+    let handles: Vec<_> = stores
+        .iter()
+        .map(|store| {
+            let store = Arc::clone(store);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let events = numbered_events(BATCHES * 4);
+                barrier.wait();
+                for batch in events.chunks(4) {
+                    store.append(batch).expect("append");
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().expect("thread");
+    }
+    let total = u64::try_from(BATCHES * 4 * stores.len()).expect("fits");
+    for store in &stores {
+        assert_eq!(store.latest_rev().expect("rev"), total);
+    }
+    let revs: Vec<u64> = stores[0]
+        .since(0, 10_000)
+        .expect("since")
+        .iter()
+        .map(|e| e.rev)
+        .collect();
+    assert_eq!(revs, (1..=total).collect::<Vec<_>>());
 }
