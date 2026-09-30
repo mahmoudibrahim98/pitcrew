@@ -2,7 +2,6 @@
 // picking it up with the keyboard, asks the hub to move it; the card shows in its new column while
 // the request is out, and snaps back with the server's message if the hub says no.
 
-import { useQueryClient } from '@tanstack/react-query';
 import { ToggleGroup } from 'radix-ui';
 import {
   useEffect,
@@ -39,6 +38,7 @@ import {
   useWorkstreams,
 } from './data.ts';
 import { PRIORITY, SESSION_STATE, STATUS_ORDER, TASK_STATUS, shortId } from './format.ts';
+import { useOptimisticMoves } from './moves.ts';
 import { useProjectsNav } from './nav.tsx';
 import { TaskCard } from './task-card.tsx';
 import { TaskDrawer } from './task-drawer.tsx';
@@ -53,16 +53,6 @@ export interface Lane {
 }
 
 const NO_WORKSTREAM = 'none';
-
-/** How long an accepted move outranks list refreshes that still show the old status. */
-const SETTLE_MS = 3_000;
-
-interface PendingMove {
-  from: TaskStatus;
-  to: TaskStatus;
-  /** The list's `dataUpdatedAt` when the hub accepted the move; absent while in flight. */
-  acceptedAt?: number;
-}
 
 function keyNumber(key: string): number {
   const n = Number(key.slice(key.lastIndexOf('-') + 1));
@@ -104,7 +94,6 @@ export function Board({ project, workstream, groupBy = 'status', title = 'Board'
   if (workstream !== undefined) filters.workstream = workstream;
 
   const headingId = useId();
-  const queryClient = useQueryClient();
   const nav = useProjectsNav();
   const tasks = useTasks(filters);
   const sessions = useSessions();
@@ -114,43 +103,15 @@ export function Board({ project, workstream, groupBy = 'status', title = 'Board'
   const parent = useOptionalWorkstream(project === undefined ? workstream : undefined);
   const move = useMoveTask();
   const create = useCreateTask();
-
-  const [grouping, setGrouping] = useState<BoardGrouping>(groupBy);
-  const [moves, setMoves] = useState<ReadonlyMap<TaskId, PendingMove>>(new Map());
-  const [notice, setNotice] = useState<string | null>(null);
-  const [drawerTask, setDrawerTask] = useState<TaskId | null>(null);
-
-  const statusOf = (task: Task): TaskStatus => {
-    const pending = moves.get(task.id);
-    if (pending === undefined) return task.status;
-    if (pending.acceptedAt === undefined) return pending.to;
-    const catchingUp = task.status === pending.from && tasks.dataUpdatedAt - pending.acceptedAt < SETTLE_MS;
-    return catchingUp ? pending.to : task.status;
-  };
-
-  const requestMove = (task: Task, to: TaskStatus) => {
-    if (statusOf(task) === to) return;
-    const from = task.status;
-    setNotice(null);
-    setMoves((m) => new Map(m).set(task.id, { from, to }));
+  const moves = useOptimisticMoves({
     // `mutateAsync`, not `mutate`: per-call callbacks of `mutate` fire only for the latest call, and
     // several cards can be in flight at once.
-    move.mutateAsync({ task: task.id, to }).then(
-      () => {
-        const acceptedAt = queryClient.getQueryState(keys.tasks.list(filters))?.dataUpdatedAt ?? 0;
-        setMoves((m) => new Map(m).set(task.id, { from, to, acceptedAt }));
-      },
-      (error: unknown) => {
-        setMoves((m) => {
-          const next = new Map(m);
-          next.delete(task.id);
-          return next;
-        });
-        const reason = error instanceof Error ? error.message : String(error);
-        setNotice(`Couldn’t move ${task.key} to ${TASK_STATUS[to].label}: ${reason}`);
-      },
-    );
-  };
+    send: (task, to) => move.mutateAsync({ task: task.id, to }),
+    listKey: keys.tasks.list(filters),
+  });
+
+  const [grouping, setGrouping] = useState<BoardGrouping>(groupBy);
+  const [drawerTask, setDrawerTask] = useState<TaskId | null>(null);
 
   const workstreamNames = new Map((workstreams.data ?? []).map((w) => [w.id, w.name]));
   const list = tasks.data ?? [];
@@ -187,7 +148,6 @@ export function Board({ project, workstream, groupBy = 'status', title = 'Board'
     else setDrawerTask(task.id);
   };
 
-  const pending = new Set([...moves].filter(([, m]) => m.acceptedAt === undefined).map(([id]) => id));
   const needsYou = new Set((inbox.data ?? []).flatMap((ask) => (ask.task === undefined ? [] : [ask.task])));
 
   return (
@@ -212,14 +172,18 @@ export function Board({ project, workstream, groupBy = 'status', title = 'Board'
         </ToggleGroup.Root>
       </header>
 
-      {notice !== null && (
-        <div role="alert" className="flex items-start gap-2 rounded-sm border border-risk bg-risk-soft p-2 text-sm text-risk">
-          <p className="flex-1">{notice}</p>
-          <Button variant="ghost" onClick={() => setNotice(null)}>
-            Dismiss
+      {[...moves.notices].map(([task, notice]) => (
+        <div
+          key={task}
+          role="alert"
+          className="flex items-start gap-2 rounded-sm border border-risk bg-risk-soft p-2 text-sm text-risk"
+        >
+          <p className="flex-1">{notice.text}</p>
+          <Button variant="ghost" onClick={() => moves.dismiss(task)}>
+            Dismiss<span className="sr-only"> the note about {notice.key}</span>
           </Button>
         </div>
-      )}
+      ))}
       {tasks.error !== null && <ErrorNote error={tasks.error} what="load the tasks" />}
       {create.error !== null && <ErrorNote error={create.error} what="add the task" />}
       {tasks.isPending && tasks.error === null && <p className="text-sm text-ink-2">Loading tasks…</p>}
@@ -227,14 +191,14 @@ export function Board({ project, workstream, groupBy = 'status', title = 'Board'
       {tasks.data !== undefined && (
         <BoardView
           tasks={list}
-          statusOf={statusOf}
-          pending={pending}
+          statusOf={moves.statusOf}
+          pending={moves.inFlight}
           sessions={sessionsByTask(sessions.data ?? [])}
           needsYou={needsYou}
           members={members}
           lanes={lanes}
           laneOf={(task) => (grouping === 'status' ? 'all' : (task.workstream ?? NO_WORKSTREAM))}
-          onMove={requestMove}
+          onMove={moves.move}
           onOpen={open}
           {...(createIn === undefined ? {} : { onCreate: createIn })}
         />

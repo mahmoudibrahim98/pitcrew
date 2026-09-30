@@ -3,7 +3,7 @@
 
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Member, Task, TaskStatus } from '../../data/index.ts';
+import { keys, type Member, type Task, type TaskStatus } from '../../data/index.ts';
 import { Board, BoardView } from '../board.tsx';
 import { AGENT_TOKEN, demo, eventually, otherClient, renderWithHub, startHub, stopHub, type Hub } from './harness.tsx';
 
@@ -96,6 +96,55 @@ describe('Board', () => {
     await eventually(() => expect(cardsIn('Review')).toEqual(['PAP-3']));
     expect(cardsIn('In progress')).toContain('PAP-2');
   });
+
+  it('keeps one note per refused move', async () => {
+    // As @writer: PAP-3 review → done and PAP-1 in progress → todo are both refused.
+    renderWithHub(<Board project={demo.paper} />, hub, { token: AGENT_TOKEN });
+    await screen.findByText('Respond to co-author comments');
+    drag(card('PAP-3'), column('Done'));
+    drag(card('PAP-1'), column('Todo'));
+    await eventually(() => expect(screen.getAllByRole('alert')).toHaveLength(2));
+    const notes = screen.getAllByRole('alert').map((a) => a.textContent ?? '');
+    expect(notes.some((n) => n.startsWith('Couldn’t move PAP-3 to Done'))).toBe(true);
+    expect(notes.some((n) => n.startsWith('Couldn’t move PAP-1 to Todo'))).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss the note about PAP-3' }));
+    expect(screen.getAllByRole('alert')).toHaveLength(1);
+    expect(cardsIn('Review')).toEqual(['PAP-3']);
+    expect(cardsIn('In progress')).toContain('PAP-1');
+  });
+
+  it('does not flip an accepted move back when a slow, stale refresh lands late', async () => {
+    // The next GET /v1/tasks is answered by the hub at once (before the move), but reaches the
+    // board 4 s later: longer than the old 3 s settle window.
+    let slow = false;
+    const slowFetch: typeof fetch = async (input, init) => {
+      const res = await fetch(input, init);
+      const url = new URL(String(input));
+      if (!slow || url.pathname !== '/v1/tasks' || (init?.method ?? 'GET') !== 'GET') return res;
+      slow = false;
+      const body = await res.text();
+      await new Promise((r) => setTimeout(r, 4_000));
+      return new Response(body, { status: res.status, headers: { 'Content-Type': 'application/json' } });
+    };
+    const { queryClient } = renderWithHub(<Board project={demo.paper} />, hub, { fetch: slowFetch });
+    await screen.findByText('Make figure 3 from the seed runs');
+    slow = true;
+    void queryClient.invalidateQueries({ queryKey: keys.tasks.lists });
+    await eventually(() => expect(slow).toBe(false));
+
+    const seen: (string | null)[] = [];
+    const sample = setInterval(() => {
+      seen.push(card('PAP-2').closest('[data-status]')?.getAttribute('data-status') ?? null);
+    }, 20);
+    drag(card('PAP-2'), column('In progress'));
+    // The stale list lands at about 4 s, the event's refresh after it.
+    await new Promise((r) => setTimeout(r, 5_500));
+    clearInterval(sample);
+    expect(seen.length).toBeGreaterThan(100);
+    expect(seen.filter((s) => s !== 'in_progress')).toEqual([]);
+    expect(cardsIn('In progress')).toContain('PAP-2');
+    expect(screen.queryByRole('alert')).toBeNull();
+  }, 20_000);
 
   it('moves a card with the keyboard, and keeps focus on it', async () => {
     const { api } = renderWithHub(<Board project={demo.paper} />, hub);
