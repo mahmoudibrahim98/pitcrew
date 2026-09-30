@@ -21,8 +21,10 @@
 //! a [`Summary`] whose every clause is a [`Span`] with receipts. [`RuleSummarizer`] is the
 //! default and needs no model; [`FakeSummarizer`] stands in for a model in tests.
 //!
-//! Everything here is pure and deterministic: no clock, no I/O, no model calls. All event text is
-//! untrusted: it is cleaned and capped before it is kept, and nothing panics on any input.
+//! Everything here is pure and deterministic: no clock, no I/O, no model calls. Internal maps hash
+//! with a random seed each, but no output follows their order, so the same input always gives
+//! byte-identical output. All event text is untrusted: it is cleaned and capped before it is kept,
+//! and nothing panics on any input.
 
 #![forbid(unsafe_code)]
 

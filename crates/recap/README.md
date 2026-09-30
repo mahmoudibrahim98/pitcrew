@@ -31,5 +31,8 @@ tasks and receipts per block are capped by `Config`.
 - `tests/rules.rs`: one scenario per rule.
 - `tests/incremental.rs`: property tests (batching never changes the blocks; hostile input never
   panics) and the receipt checks.
+- Both `demo.rs` and `incremental.rs` check that two independent runs give byte-identical JSON.
+  Every internal map hashes with its own random seed, so output order must never depend on map
+  order: anything taken from a map is sorted first.
 - `tests/perf.rs`: 100,000 generated events in under 500 ms. It runs only in release:
   `cargo test --release -p pitcrew-recap --test perf -- --nocapture`.

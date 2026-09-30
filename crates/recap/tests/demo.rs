@@ -134,6 +134,22 @@ fn rules_are_deterministic() {
     assert_eq!(a, b);
 }
 
+/// Each map inside the engine hashes with its own random seed, so two independent runs iterate
+/// their maps in different orders. Nothing in the output may follow that order: it is always
+/// sorted first. Two runs must therefore give byte-identical JSON.
+#[test]
+fn output_never_depends_on_the_hash_seed() {
+    let run = || {
+        let (_, dir, blocks) = demo_blocks();
+        let recaps = day_recaps(&blocks, &dir, 0, &RuleSummarizer).expect("rules never fail");
+        (
+            serde_json::to_string(&blocks).expect("blocks serialize"),
+            serde_json::to_string(&recaps).expect("recaps serialize"),
+        )
+    };
+    assert_eq!(run(), run());
+}
+
 #[test]
 fn the_gap_decides_what_is_one_burst() {
     let ws = demo();
