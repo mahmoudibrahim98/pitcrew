@@ -31,7 +31,10 @@ export const keys = {
     lists: ['sessions', 'list'] as const,
     list: (filters: SessionFilters = {}) => ['sessions', 'list', filters] as const,
     detail: (id: string) => ['sessions', 'detail', id] as const,
-    transcript: (id: string) => ['sessions', 'transcript', id] as const,
+    /** The newest transcript page, the only one live events change. */
+    transcript: (id: string) => ['sessions', 'transcript', id, 'tail'] as const,
+    /** An older page, fetched with `before`; never invalidated by the stream. */
+    transcriptPage: (id: string, before: number) => ['sessions', 'transcript', id, { before }] as const,
   },
   asks: {
     lists: ['asks', 'list'] as const,

@@ -14,11 +14,13 @@ export function Button({
   variant = 'secondary',
   asChild = false,
   className,
+  type = 'button',
   ...props
 }: ComponentProps<'button'> & { variant?: Variant; asChild?: boolean }) {
   const Component = asChild ? Slot.Root : 'button';
   return (
     <Component
+      type={asChild ? undefined : type}
       className={cx(
         'inline-flex h-7 items-center gap-1.5 rounded-sm px-2.5 text-sm font-medium transition-colors',
         'disabled:pointer-events-none disabled:opacity-50',

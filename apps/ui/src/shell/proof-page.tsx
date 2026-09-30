@@ -71,7 +71,7 @@ export function ProofPage() {
   const tasks = useTasks();
   const sessions = useSessions();
   const asks = useAsks({ state: 'open' });
-  const status = useConnection((s) => s.status);
+  const { status } = useConnection();
 
   const error = [workspace, projects, workstreams, tasks, sessions, asks].find((q) => q.error)?.error;
 

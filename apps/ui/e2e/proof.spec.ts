@@ -11,9 +11,9 @@ test('shows the demo workspace and a move arrives through the stream', async ({ 
   await expect(page.getByRole('heading', { level: 2 }).first()).toBeVisible();
   await expect(page.getByRole('list', { name: 'Live sessions' }).first()).toBeVisible();
 
-  // The first task the proof page can move from Todo to In progress.
-  const row = page.locator('[data-testid^="task-"]').filter({ hasText: 'Todo' }).first();
-  const key = (await row.getAttribute('data-testid'))?.replace('task-', '') ?? '';
+  // The first task whose status pill says Todo (not a "→ Todo" button).
+  const pill = page.locator('[data-testid^="status-"]', { hasText: /^Todo$/ }).first();
+  const key = (await pill.getAttribute('data-testid'))?.replace('status-', '') ?? '';
   expect(key).not.toBe('');
   await expect(page.getByTestId(`status-${key}`)).toHaveText('Todo');
 

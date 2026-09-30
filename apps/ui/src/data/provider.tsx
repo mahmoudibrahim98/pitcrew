@@ -1,14 +1,20 @@
 // Gives the tree the API client and the query cache, and keeps the cache live through the stream.
 
-import { QueryClient, QueryClientProvider, useQuery, useQueryClient } from '@tanstack/react-query';
-import { createContext, use, useEffect, type ReactNode } from 'react';
-import { create } from 'zustand';
+import {
+  QueryClient,
+  QueryClientProvider,
+  useQuery,
+  type QueryKey,
+  type UseQueryOptions,
+} from '@tanstack/react-query';
+import { createContext, use, useEffect, useState, type ReactNode } from 'react';
+import { useStore } from 'zustand';
 import { ApiError, type Api } from './api.ts';
-import { keys } from './keys.ts';
-import { connectLive } from './live.ts';
-import type { StreamStatus } from './stream.ts';
+import { createLive, type Live, type LiveState } from './live.ts';
+import type { SocketFactory } from './stream.ts';
 
 const ApiContext = createContext<Api | null>(null);
+const LiveContext = createContext<Live | null>(null);
 
 export function useApi(): Api {
   const api = use(ApiContext);
@@ -16,8 +22,36 @@ export function useApi(): Api {
   return api;
 }
 
+function useLive<T>(select: (state: LiveState) => T): T {
+  const live = use(LiveContext);
+  if (live === null) throw new Error('useLive must be used inside <DataProvider>');
+  return useStore(live.store, select);
+}
+
 /** The stream's state, for UI that shows whether data is live. */
-export const useConnection = create<{ status: StreamStatus }>(() => ({ status: 'stopped' }));
+export function useConnection(): LiveState {
+  const status = useLive((s) => s.status);
+  const synced = useLive((s) => s.synced);
+  return { status, synced };
+}
+
+/**
+ * `useQuery` for server state. It stays idle until the stream is synced, so no fetch can miss an
+ * event. Every data hook, including the features' own, goes through this.
+ */
+export function useLiveQuery<TData, TKey extends QueryKey = QueryKey>(
+  options: UseQueryOptions<TData, Error, TData, TKey>,
+) {
+  const synced = useLive((s) => s.synced);
+  const { enabled } = options;
+  return useQuery({
+    ...options,
+    enabled:
+      typeof enabled === 'function'
+        ? (query) => synced && enabled(query)
+        : synced && enabled !== false,
+  });
+}
 
 const NO_RETRY = new Set(['unauthorized', 'forbidden', 'not_found', 'conflict', 'invalid']);
 
@@ -35,45 +69,32 @@ export function createQueryClient(): QueryClient {
   });
 }
 
-type Workspace = Awaited<ReturnType<Api['workspace']>>;
-
-function LiveUpdates({ api, token }: { api: Api; token: string | undefined }): null {
-  const queryClient = useQueryClient();
-  const ready = useQuery({
-    queryKey: keys.workspace,
-    queryFn: ({ signal }) => api.workspace(signal),
-    select: () => true,
-  }).data;
-
-  useEffect(() => {
-    if (ready !== true) return;
-    // Resume from the revision of the first workspace read, so nothing between that read and
-    // the connection is missed. Later refetches of the workspace do not restart the stream.
-    const since = queryClient.getQueryData<Workspace>(keys.workspace)?.rev;
-    const client = connectLive({
-      queryClient,
-      baseUrl: api.baseUrl,
-      token,
-      since,
-      onStatus: (status) => useConnection.setState({ status }),
-    });
-    return () => client.stop();
-  }, [ready, api, token, queryClient]);
-
-  return null;
-}
-
 export function DataProvider(props: {
   api: Api;
   queryClient: QueryClient;
   token: string | undefined;
+  /** For tests. */
+  socket?: SocketFactory;
   children: ReactNode;
 }) {
+  const [live] = useState(() =>
+    createLive({
+      queryClient: props.queryClient,
+      baseUrl: props.api.baseUrl,
+      token: props.token,
+      ...(props.socket === undefined ? {} : { socket: props.socket }),
+    }),
+  );
+
+  useEffect(() => {
+    live.start();
+    return () => live.stop();
+  }, [live]);
+
   return (
     <QueryClientProvider client={props.queryClient}>
       <ApiContext value={props.api}>
-        <LiveUpdates api={props.api} token={props.token} />
-        {props.children}
+        <LiveContext value={live}>{props.children}</LiveContext>
       </ApiContext>
     </QueryClientProvider>
   );

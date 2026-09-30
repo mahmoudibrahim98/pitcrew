@@ -18,14 +18,42 @@ describe('invalidation map', () => {
     }
   });
 
+  it('matches every EventBody variant in crates/protocol', () => {
+    const source = readFileSync(new URL('../../../crates/protocol/src/events.rs', import.meta.url), 'utf8');
+    const start = source.indexOf('pub enum EventBody {');
+    expect(start).toBeGreaterThan(-1);
+    const body = source.slice(start, source.indexOf('\n}', start));
+    // Variants sit at one level of indentation; serde renames them to snake_case.
+    const variants = [...body.matchAll(/^ {4}([A-Z]\w*)\s*[{(,]/gm)].map((m) =>
+      (m[1] ?? '').replace(/(?<!^)([A-Z])/g, '_$1').toLowerCase(),
+    );
+    expect(variants.length).toBeGreaterThan(0);
+    expect(variants.sort()).toEqual([...EVENT_TYPES].sort());
+  });
+
   it('matches every event type in the mock hub', () => {
-    // The mock hub mirrors crates/protocol; a type there but not here means a missing entry.
     const source = readFileSync(new URL('../../mock-hub/src/types.ts', import.meta.url), 'utf8');
     const union = source.slice(source.indexOf('export type EventBody'), source.indexOf('export interface HostInfo'));
     const types = [...union.matchAll(/type: '([a-z_]+)'/g)].map((m) => m[1]);
     expect(types.sort()).toEqual([...EVENT_TYPES].sort());
   });
 
+  it('leaves events that carry whole objects to the patches, apart from the activity feed', () => {
+    const task = { id: 'T9' } as never;
+    expect(keysToInvalidate([event({ type: 'task_created', data: { task } })], noCache)).toEqual([keys.events]);
+    expect(
+      keysToInvalidate([event({ type: 'subtasks_replaced', data: { task: 'T9', subtasks: [] } })], noCache),
+    ).toEqual([keys.events]);
+  });
+
+  it('touches only the newest transcript page', () => {
+    const touched = keysToInvalidate(
+      [event({ type: 'file_edited', data: { session: 'S1', path: 'a.txt', added: 1, removed: 0 } })],
+      noCache,
+    );
+    expect(touched).toContainEqual(keys.sessions.transcript('S1'));
+    expect(touched).not.toContainEqual(['sessions', 'transcript', 'S1']);
+  });
   it('task_moved touches the task, the task lists and its workstream', () => {
     const cache: CacheLookup = { taskWorkstream: (id) => (id === 'T1' ? 'WS1' : undefined) };
     const touched = keysToInvalidate(

@@ -31,6 +31,8 @@ export interface StreamOptions {
   backoff?: { initialMs: number; maxMs: number };
   /** Reconnect when nothing arrives for this long. The hub pings every 20 s. */
   silenceMs?: number;
+  /** The back-off starts over once a connection has stayed up this long. */
+  stableMs?: number;
   random?: () => number;
 }
 
@@ -40,8 +42,9 @@ const BEARER_PREFIX = 'pitcrew.bearer.';
 const browserSocket: SocketFactory = (url, protocols) =>
   new WebSocket(url, protocols) as unknown as SocketLike;
 
+/** Relative to the API base, so a path prefix (`https://host/hub/`) is kept. */
 export function streamUrl(baseUrl: string, since: number | undefined): string {
-  const url = new URL('/v1/stream', baseUrl);
+  const url = new URL('v1/stream', baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   if (since !== undefined) url.searchParams.set('since', String(since));
   return url.toString();
@@ -67,6 +70,7 @@ export class StreamClient {
   #attempt = 0;
   #retryTimer: ReturnType<typeof setTimeout> | undefined;
   #silenceTimer: ReturnType<typeof setTimeout> | undefined;
+  #stableTimer: ReturnType<typeof setTimeout> | undefined;
   #status: StreamStatus = 'stopped';
 
   constructor(options: StreamOptions) {
@@ -129,7 +133,11 @@ export class StreamClient {
   #handle(frame: StreamFrame, since: number | undefined): void {
     switch (frame.type) {
       case 'hello':
-        this.#attempt = 0;
+        // A server that accepts and then drops us must not reset the back-off.
+        this.#stableTimer = setTimeout(() => {
+          this.#stableTimer = undefined;
+          this.#attempt = 0;
+        }, this.#options.stableMs ?? 5_000);
         if (since !== undefined && since > frame.rev) {
           this.#rev = frame.rev;
           this.#setStatus('live');
@@ -143,7 +151,13 @@ export class StreamClient {
       case 'events': {
         const rev = this.#rev ?? 0;
         if (frame.to_rev <= rev) return;
-        // Frames are contiguous; skip any events already seen.
+        if (frame.from_rev > rev + 1) {
+          // Frames are contiguous, so a gap means we lost events: start over.
+          this.#rev = frame.to_rev;
+          this.#options.onReset(frame.to_rev);
+          return;
+        }
+        // Skip any events already seen.
         const fresh =
           frame.from_rev <= rev ? frame.events.slice(rev - frame.from_rev + 1) : frame.events;
         this.#rev = frame.to_rev;
@@ -189,8 +203,10 @@ export class StreamClient {
   #clearTimers(): void {
     if (this.#retryTimer !== undefined) clearTimeout(this.#retryTimer);
     if (this.#silenceTimer !== undefined) clearTimeout(this.#silenceTimer);
+    if (this.#stableTimer !== undefined) clearTimeout(this.#stableTimer);
     this.#retryTimer = undefined;
     this.#silenceTimer = undefined;
+    this.#stableTimer = undefined;
   }
 
   #setStatus(status: StreamStatus): void {

@@ -44,6 +44,46 @@
     U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
 }
 
+@font-face {
+  font-family: 'Geist Mono';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url('../node_modules/@fontsource-variable/geist-mono/files/geist-mono-symbols2-wght-normal.woff2')
+    format('woff2-variations');
+  unicode-range: U+2000-2001, U+2004-2008, U+200A, U+23B8-23BD, U+2500-259F;
+}
+/* Arrows are in no Fontsource subset; these are the full variable fonts from the Geist release
+   (src/assets/fonts, OFL.txt), fetched only when an arrow is on screen. */
+@font-face {
+  font-family: 'Geist';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url('./assets/fonts/Geist-Variable.woff2') format('woff2-variations');
+  unicode-range: U+2190-21FF;
+}
+@font-face {
+  font-family: 'Geist Mono';
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url('./assets/fonts/GeistMono-Variable.woff2') format('woff2-variations');
+  unicode-range: U+2190-21FF;
+}
+
+/* `dark:` follows the same rules as the tokens: the system, unless data-theme says otherwise. */
+@custom-variant dark {
+  &:where([data-theme='dark'], [data-theme='dark'] *) {
+    @slot;
+  }
+  @media (prefers-color-scheme: dark) {
+    &:where(:root:not([data-theme='light']), :root:not([data-theme='light']) *) {
+      @slot;
+    }
+  }
+}
+
 /* Tailwind's theme is the tokens: `bg-card`, `text-ink-2`, `border-line`, `rounded-md`, `text-sm`,
    `font-mono`… resolve to the --pc-* properties, so light and dark follow the tokens. The default
    palette is dropped so nothing off-token slips in. */

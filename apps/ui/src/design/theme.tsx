@@ -12,13 +12,15 @@ export const useTheme = create<{ theme: ThemeChoice; setTheme(theme: ThemeChoice
   }),
 );
 
+export function applyTheme(theme: ThemeChoice): void {
+  const root = document.documentElement;
+  if (theme === 'system') root.removeAttribute('data-theme');
+  else root.setAttribute('data-theme', theme);
+}
+
 export function useApplyTheme(): void {
   const theme = useTheme((s) => s.theme);
-  useEffect(() => {
-    const root = document.documentElement;
-    if (theme === 'system') root.removeAttribute('data-theme');
-    else root.setAttribute('data-theme', theme);
-  }, [theme]);
+  useEffect(() => applyTheme(theme), [theme]);
 }
 
 const CHOICES: { value: ThemeChoice; label: string }[] = [

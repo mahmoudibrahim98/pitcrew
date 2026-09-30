@@ -2,8 +2,13 @@ import { RouterProvider } from '@tanstack/react-router';
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { apiBaseUrl, apiToken, createApi, createQueryClient, DataProvider } from './data/index.ts';
+import { applyTheme, useTheme } from './design/index.ts';
 import './index.css';
 import { router } from './router.tsx';
+
+// Before the first paint, so a persisted theme does not flash (the store reads localStorage
+// synchronously).
+applyTheme(useTheme.getState().theme);
 
 const api = createApi({ baseUrl: apiBaseUrl, token: apiToken });
 const queryClient = createQueryClient();

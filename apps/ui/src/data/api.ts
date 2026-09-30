@@ -134,7 +134,11 @@ export function createApi(options: ApiOptions) {
     if (res.status === 204) {
       return undefined as T;
     }
-    return (await res.json()) as T;
+    try {
+      return (await res.json()) as T;
+    } catch {
+      throw new ApiError('internal', `${method} ${path} answered ${res.status} without JSON`, res.status);
+    }
   }
 
   const get = <T>(path: string, query?: Query, signal?: AbortSignal) =>

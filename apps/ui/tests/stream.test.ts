@@ -154,8 +154,51 @@ describe('stream client timing', () => {
     stream.stop();
   });
 
-  it('uses wss for an https base', () => {
+  it('uses wss for an https base, and keeps a path prefix', () => {
     expect(streamUrl('https://hub.localhost', undefined)).toBe('wss://hub.localhost/v1/stream');
+    expect(streamUrl('http://127.0.0.1:9000/hub', 3)).toBe('ws://127.0.0.1:9000/hub/v1/stream?since=3');
+    expect(streamUrl('http://127.0.0.1:9000/hub/', undefined)).toBe('ws://127.0.0.1:9000/hub/v1/stream');
+  });
+
+  it('resets on a gap in revisions instead of skipping ahead', () => {
+    const resets: number[] = [];
+    const { factory, sockets } = fakeSockets();
+    const received: Event[] = [];
+    const stream = new StreamClient({
+      baseUrl: 'http://127.0.0.1:47317',
+      since: 5,
+      socket: factory,
+      onEvents: (events) => received.push(...events),
+      onReset: (rev) => resets.push(rev),
+    });
+    stream.start();
+    sockets[0]?.send({ type: 'hello', rev: 9 });
+    sockets[0]?.send({ type: 'events', from_rev: 8, to_rev: 9, events: [taskMoved('E8'), taskMoved('E9')] });
+    expect(resets).toEqual([9]);
+    expect(received).toEqual([]);
+    expect(stream.rev).toBe(9);
+    sockets[0]?.send({ type: 'events', from_rev: 10, to_rev: 10, events: [taskMoved('E10')] });
+    expect(received.map((e) => e.id)).toEqual(['E10']);
+    stream.stop();
+  });
+
+  it('keeps backing off when a server accepts and then drops the connection', () => {
+    const { stream, sockets } = setup();
+    stream.start();
+    const delays: number[] = [];
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const count = sockets.length;
+      sockets[count - 1]?.send({ type: 'hello', rev: 1 });
+      sockets[count - 1]?.drop();
+      let waited = 0;
+      while (sockets.length === count) {
+        vi.advanceTimersByTime(50);
+        waited += 50;
+      }
+      delays.push(waited);
+    }
+    expect(delays).toEqual([100, 200, 400, 800]);
+    stream.stop();
   });
 
   it('reconnects after 60 s of silence, resuming from its revision', () => {
@@ -179,7 +222,7 @@ describe('stream client timing', () => {
     stream.stop();
   });
 
-  it('backs off exponentially up to the ceiling, and resets the back-off on hello', () => {
+  it('backs off exponentially up to the ceiling, and starts over once a connection is stable', () => {
     const { stream, sockets } = setup();
     stream.start();
     const delays: number[] = [];
@@ -196,6 +239,7 @@ describe('stream client timing', () => {
     expect(delays).toEqual([100, 200, 400, 800, 1000, 1000]);
 
     sockets.at(-1)?.send({ type: 'hello', rev: 1 });
+    vi.advanceTimersByTime(5_000);
     sockets.at(-1)?.drop();
     vi.advanceTimersByTime(100);
     expect(sockets).toHaveLength(8);

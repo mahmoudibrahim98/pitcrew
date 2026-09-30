@@ -1,5 +1,7 @@
 // Event → query keys. On each event from the stream, the UI invalidates exactly the keys the
-// event touches (API v1, "Client rule"). Every event also invalidates the activity feed.
+// event touches (API v1, "Client rule"). Every event also invalidates the activity feed. Events
+// that carry the whole object are applied by patches.ts instead, so their entries here are
+// what the patch cannot cover.
 
 import { keys } from './keys.ts';
 import type { Event, EventBody, EventType, TaskId, WorkstreamId } from './types.ts';
@@ -29,7 +31,7 @@ const taskAndWorkstream = (id: string, cache: CacheLookup): QueryKey[] => {
 
 export const invalidationMap: InvalidationMap = {
   machine_liveness: () => [keys.machines],
-  session_discovered: (d) => session(d.session.id),
+  session_discovered: () => [],
   session_state_changed: (d) => session(d.session),
   turn_ended: (d) => [...session(d.session), keys.sessions.transcript(d.session)],
   tool_ran: (d) => [keys.sessions.detail(d.session), keys.sessions.transcript(d.session)],
@@ -39,13 +41,10 @@ export const invalidationMap: InvalidationMap = {
   project_created: (d) => [keys.projects.lists, keys.projects.detail(d.project.id)],
   workstream_created: (d) => [keys.workstreams.lists, keys.workstreams.detail(d.workstream.id)],
   workstream_changed: (d) => [keys.workstreams.lists, keys.workstreams.detail(d.workstream)],
-  task_created: (d) =>
-    d.task.workstream === undefined
-      ? task(d.task.id)
-      : [...task(d.task.id), keys.workstreams.detail(d.task.workstream)],
+  task_created: () => [],
   task_moved: (d, cache) => taskAndWorkstream(d.task, cache),
   task_assigned: (d) => task(d.task),
-  subtasks_replaced: (d) => task(d.task),
+  subtasks_replaced: () => [],
   dispatch_started: (d) => [keys.dispatches, keys.tasks.detail(d.dispatch.task)],
   dispatch_finished: () => [keys.dispatches],
   ask_raised: () => [keys.asks.lists],
