@@ -1,0 +1,3 @@
+# Real transcripts for local checks. Never commit them.
+/private/
+/tests/private/
