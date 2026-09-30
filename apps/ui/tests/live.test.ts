@@ -146,9 +146,58 @@ describe('live cache against the mock hub', () => {
   });
 });
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 describe('invalidator', () => {
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it('refetches each query that was fetching once, after its own fetch settles', async () => {
+    vi.useFakeTimers();
+    const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false } } });
+    const calls = { a: 0, b: 0 };
+    const observe = (name: 'a' | 'b', ms: number) =>
+      new QueryObserver(queryClient, {
+        queryKey: ['things', name],
+        queryFn: async () => {
+          calls[name] += 1;
+          await sleep(ms);
+          return calls[name];
+        },
+      }).subscribe(() => {});
+    const unsubscribe = [observe('a', 300), observe('b', 600)];
+    await vi.advanceTimersByTimeAsync(10);
+
+    const invalidator = new Invalidator(queryClient, { windowMs: 250 });
+    invalidator.add([['things']]);
+    await vi.advanceTimersByTimeAsync(100);
+    invalidator.add([['things']]); // a second event while both still load
+    await vi.advanceTimersByTimeAsync(500); // a settled at 300 and refetched at the next flush
+    expect(calls).toEqual({ a: 2, b: 1 });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(calls).toEqual({ a: 2, b: 2 });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(calls).toEqual({ a: 2, b: 2 });
+    invalidator.stop();
+    for (const stop of unsubscribe) stop();
+  });
+
+  it('forgets fetches it was waiting for once stopped', async () => {
+    vi.useFakeTimers();
+    const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false } } });
+    const queryFn = vi.fn(async () => {
+      await sleep(300);
+      return 1;
+    });
+    const unsubscribe = new QueryObserver(queryClient, { queryKey: ['thing'], queryFn }).subscribe(() => {});
+    await vi.advanceTimersByTimeAsync(10);
+    const invalidator = new Invalidator(queryClient, { windowMs: 250 });
+    invalidator.add([['thing']]);
+    invalidator.stop();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(queryFn).toHaveBeenCalledTimes(1);
+    unsubscribe();
   });
 
   it('does not cancel a fetch in flight, and invalidates again once it settles', async () => {
@@ -210,16 +259,18 @@ describe('live cache with a scripted stream', () => {
   afterEach(() => {
     for (const live of lives.splice(0)) live.stop();
     for (const qc of queryClients.splice(0)) qc.clear();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
   });
 
-  function setup(options: { probe?: () => Promise<unknown> } = {}) {
+  function setup(options: { probe?: () => Promise<unknown>; windowMs?: number } = {}) {
     const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false } } });
     const { factory, sockets } = fakeSockets();
     const live = createLive({
       queryClient,
       baseUrl: 'http://127.0.0.1:47317',
       socket: factory,
-      windowMs: 10,
+      windowMs: options.windowMs ?? 10,
       backoff: { initialMs: 5, maxMs: 10 },
       probeAfter: 2,
       ...(options.probe === undefined ? {} : { probe: options.probe }),
@@ -269,6 +320,74 @@ describe('live cache with a scripted stream', () => {
     resolvers[1]?.([task('OLD'), task('NEW')]);
     await vi.waitFor(() => expect(observer.getCurrentResult().data?.map((t) => t.id)).toEqual(['OLD', 'NEW']));
     unsubscribe();
+  });
+
+  it('refetches a bounded number of times when a patch races slow list fetches', async () => {
+    vi.useFakeTimers();
+    const { queryClient, emit } = setup({ windowMs: 250 });
+    const durations = [300, 450, 600, 350, 500];
+    let fetches = 0;
+    const calls = { todo: 0, done: 0 };
+    const observe = (status: 'todo' | 'done') =>
+      new QueryObserver(queryClient, {
+        queryKey: keys.tasks.list({ status: [status] }),
+        queryFn: async () => {
+          calls[status] += 1;
+          await sleep(durations[fetches++ % durations.length] ?? 300);
+          return [] as Task[];
+        },
+      }).subscribe(() => {});
+    const unsubscribe = [observe('todo')];
+    await vi.advanceTimersByTimeAsync(700); // the todo list has loaded
+    unsubscribe.push(observe('done')); // the done list is loading
+    await vi.advanceTimersByTimeAsync(20);
+
+    emit({ type: 'task_created', data: { task: task('NEW') } });
+    await vi.advanceTimersByTimeAsync(10_000);
+    // The todo list took the patch; the done list refetched once, after its racing fetch.
+    expect(calls).toEqual({ todo: 1, done: 2 });
+    expect(queryClient.getQueryData<Task[]>(keys.tasks.list({ status: ['todo'] }))?.map((t) => t.id)).toEqual(['NEW']);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(calls).toEqual({ todo: 1, done: 2 });
+    for (const stop of unsubscribe) stop();
+  });
+
+  it('refetches a fast list once while a slow sibling loads, and the slow one once after', async () => {
+    vi.useFakeTimers();
+    const { queryClient, emit } = setup({ windowMs: 250 });
+    const calls = { fast: 0, slow: 0 };
+    const unsubscribe = [
+      new QueryObserver(queryClient, {
+        queryKey: keys.tasks.list({ status: ['todo'] }),
+        queryFn: async () => {
+          calls.fast += 1;
+          await sleep(50);
+          return [] as Task[];
+        },
+      }).subscribe(() => {}),
+    ];
+    await vi.advanceTimersByTimeAsync(100);
+    // `['tasks', 'list', {}]`: a prefix of the filtered list's key as well.
+    unsubscribe.push(
+      new QueryObserver(queryClient, {
+        queryKey: keys.tasks.list(),
+        queryFn: async () => {
+          calls.slow += 1;
+          await sleep(3_000);
+          return [] as Task[];
+        },
+      }).subscribe(() => {}),
+    );
+    await vi.advanceTimersByTimeAsync(20);
+
+    emit({ type: 'task_moved', data: { task: 'T1', from: 'todo', to: 'done', mover: { kind: 'person' } } });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(calls).toEqual({ fast: 2, slow: 1 });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(calls).toEqual({ fast: 2, slow: 2 });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(calls).toEqual({ fast: 2, slow: 2 });
+    for (const stop of unsubscribe) stop();
   });
 
   it('falls back to refetching when a patch cannot apply', async () => {
