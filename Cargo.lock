@@ -663,7 +663,17 @@ dependencies = [
 name = "pitcrew-hub-work"
 version = "0.0.0"
 dependencies = [
+ "axum",
+ "pitcrew-fixtures",
  "pitcrew-protocol",
+ "pitcrew-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]
