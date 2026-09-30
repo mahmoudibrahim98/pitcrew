@@ -8,8 +8,34 @@ license.workspace = true
 publish.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "pitcrew-askpass"
+path = "src/bin/pitcrew-askpass.rs"
+
+[[test]]
+# Its own `main`: the test binary doubles as the fake `ssh` it drives.
+name = "fake_ssh"
+path = "tests/fake_ssh.rs"
+harness = false
+
 [dependencies]
 pitcrew-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "process", "rt", "sync", "time"] }
+# OS randomness for askpass keys and nonces. Already in the lockfile through `ulid`.
+getrandom = "=0.3.4"
+
+[target.'cfg(unix)'.dependencies]
+# Effective uid without unsafe code. The version tempfile already uses.
+rustix = { version = "=1.1.5", features = ["process"] }
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

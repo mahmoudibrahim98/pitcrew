@@ -4,6 +4,26 @@
 //!
 //! **Owned by stream J.** The work packages are in `docs/build/streams/J.md`. Build against
 //! `pitcrew-protocol` and `pitcrew-interfaces` only, never another stream's internals.
+//!
+//! This layer talks to any host the user can already reach with their own **system OpenSSH**:
+//! - [`list_hosts`] reads `~/.ssh/config`; [`Ssh::resolve`] asks `ssh -G` what a host means;
+//! - [`Ssh::run`] runs a command with every argument quoted, agent and X11 forwarding off, and
+//!   host keys confirmed through the user;
+//! - [`askpass`] brings password, passphrase, one-time-code and host-key prompts to the
+//!   desktop without storing them;
+//! - [`Ssh::probe`] reports what the machine is.
+
+pub mod askpass;
+mod config;
+mod private;
+pub mod probe;
+pub mod quote;
+mod ssh;
+
+pub use askpass::{PromptHandler, PromptKind, PromptRequest, Reply, Secret};
+pub use config::{HostList, home_dir, list_hosts, list_hosts_in};
+pub use probe::Probe;
+pub use ssh::{DEFAULT_CONNECT_TIMEOUT, Output, ResolvedHost, Ssh, SshError};
 
 /// The protocol version this crate was built against.
 pub const PROTOCOL_VERSION: u32 = pitcrew_protocol::PROTOCOL_VERSION;
