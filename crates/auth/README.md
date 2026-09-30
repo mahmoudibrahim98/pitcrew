@@ -11,7 +11,16 @@ Device and agent tokens, scopes, and author stamping (ADR-0006).
 - Only the SHA-256 of a token is stored, with its `Caller` and creation time. Lookups compare
   hashes in constant time.
 - `TokenStore` mints, verifies, revokes and rotates. `FileTokenStore` keeps the registry in
-  `<state dir>/tokens.json`, written atomically (mode 0600 in a 0700 directory on Unix).
+  `<state dir>/tokens.json`, written atomically through a uniquely named temporary file.
+- **Single writer:** only the daemon opens `FileTokenStore`; the CLI and the desktop mint and
+  revoke through the API. The store holds an exclusive lock on `tokens.lock` for its lifetime,
+  so a second opener fails with `TokenError::Locked`.
+- **Private on disk (Unix):** the state directory is created 0700, and an existing one must
+  already be ours with no group or other access; it is never re-permissioned. The registry is
+  opened without following symlinks and must be ours and not writable by others. Anything else
+  fails closed.
+- **Windows:** files take their directory's ACL, so the state directory must be under the
+  user's profile (e.g. `%LOCALAPPDATA%`).
 - An agent token must name its owner (`on_behalf_of`); a device token must not.
 - `SecretToken`'s `Debug` prints only the prefix. Logs name tokens by `TokenId` (`tok_…`).
 

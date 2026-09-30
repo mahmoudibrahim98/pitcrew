@@ -5,7 +5,7 @@
 mod pipe;
 #[cfg(windows)]
 #[allow(unsafe_code)]
-mod pipe_security;
+pub(crate) mod pipe_security;
 #[cfg(unix)]
 mod unix;
 
@@ -33,7 +33,7 @@ pub enum Listen {
         /// The socket's directory.
         dir: PathBuf,
     },
-    /// A named pipe, e.g. `\\.\pipe\pitcrewd-<user>`. Windows only.
+    /// A named pipe, e.g. `\\.\pipe\pitcrewd-<user SID>` (`default_pipe_name`). Windows only.
     Pipe {
         /// The full pipe name.
         name: String,
@@ -49,31 +49,49 @@ pub enum Listen {
 
 impl Listen {
     /// The platform's private transport: a unix socket in `run_dir` on Unix, or on Windows the
-    /// pipe `\\.\pipe\pitcrewd-<user>` (`run_dir` is unused).
-    #[must_use]
-    pub fn private_default(run_dir: PathBuf) -> Self {
-        if cfg!(windows) {
-            let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".to_owned());
+    /// pipe `\\.\pipe\pitcrewd-<user SID>` (`run_dir` is unused). The SID, unlike the user name,
+    /// cannot be chosen by another user.
+    ///
+    /// # Errors
+    /// On Windows, the current user's SID cannot be read.
+    pub fn private_default(run_dir: PathBuf) -> io::Result<Self> {
+        #[cfg(windows)]
+        {
             let _ = run_dir;
-            Self::Pipe {
-                name: format!(r"\\.\pipe\pitcrewd-{user}"),
-            }
-        } else {
-            Self::Unix { dir: run_dir }
+            Ok(Self::Pipe {
+                name: default_pipe_name()?,
+            })
+        }
+        #[cfg(not(windows))]
+        {
+            Ok(Self::Unix { dir: run_dir })
         }
     }
 }
 
-/// A bound listener, ready to serve.
+/// `\\.\pipe\pitcrewd-<current user's SID>`.
+///
+/// # Errors
+/// The SID cannot be read.
+#[cfg(windows)]
+pub fn default_pipe_name() -> io::Result<String> {
+    Ok(format!(
+        r"\\.\pipe\pitcrewd-{}",
+        pipe_security::current_user_sid()?
+    ))
+}
+
+/// A bound listener, ready to serve. Only [`Bound::bind`] makes one, so its checks (such as
+/// loopback-only TCP) cannot be skipped.
 #[derive(Debug)]
-pub enum Bound {
-    /// A unix socket.
+pub struct Bound(Inner);
+
+#[derive(Debug)]
+enum Inner {
     #[cfg(unix)]
     Unix(UnixSocket),
-    /// A named pipe.
     #[cfg(windows)]
     Pipe(NamedPipe),
-    /// Loopback TCP (development).
     DevTcp(tokio::net::TcpListener),
 }
 
@@ -82,13 +100,13 @@ impl Bound {
     ///
     /// # Errors
     /// The transport is not available on this platform, a TCP address is not loopback, or
-    /// binding fails (see [`UnixSocket::bind`] and [`NamedPipe::bind`]).
+    /// binding fails (see `UnixSocket::bind` and `NamedPipe::bind`).
     pub async fn bind(listen: &Listen) -> io::Result<Self> {
-        match listen {
+        let inner = match listen {
             #[cfg(unix)]
-            Listen::Unix { dir } => UnixSocket::bind(dir).map(Self::Unix),
+            Listen::Unix { dir } => Inner::Unix(UnixSocket::bind(dir)?),
             #[cfg(windows)]
-            Listen::Pipe { name } => NamedPipe::bind(name).map(Self::Pipe),
+            Listen::Pipe { name } => Inner::Pipe(NamedPipe::bind(name)?),
             Listen::DevTcp { addr } => {
                 if !addr.ip().is_loopback() {
                     return Err(io::Error::new(
@@ -97,35 +115,38 @@ impl Bound {
                     ));
                 }
                 tracing::warn!(%addr, "listening on loopback TCP: for development only");
-                tokio::net::TcpListener::bind(addr).await.map(Self::DevTcp)
+                Inner::DevTcp(tokio::net::TcpListener::bind(addr).await?)
             }
             #[allow(unreachable_patterns)]
-            other => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("{other:?} is not available on this platform"),
-            )),
-        }
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("{other:?} is not available on this platform"),
+                ));
+            }
+        };
+        Ok(Self(inner))
     }
 
     /// Where it listens, for people and logs.
     #[must_use]
     pub fn describe(&self) -> String {
-        match self {
+        match &self.0 {
             #[cfg(unix)]
-            Self::Unix(socket) => socket.path().display().to_string(),
+            Inner::Unix(socket) => socket.path().display().to_string(),
             #[cfg(windows)]
-            Self::Pipe(pipe) => pipe.name().to_owned(),
-            Self::DevTcp(tcp) => tcp
+            Inner::Pipe(pipe) => pipe.name().to_owned(),
+            Inner::DevTcp(tcp) => tcp
                 .local_addr()
                 .map_or_else(|e| format!("tcp (unknown: {e})"), |a| format!("http://{a}")),
         }
     }
 
-    /// The TCP address, for [`Bound::DevTcp`].
+    /// The TCP address, when listening on development TCP.
     #[must_use]
     pub fn tcp_addr(&self) -> Option<SocketAddr> {
-        match self {
-            Self::DevTcp(tcp) => tcp.local_addr().ok(),
+        match &self.0 {
+            Inner::DevTcp(tcp) => tcp.local_addr().ok(),
             #[allow(unreachable_patterns)]
             _ => None,
         }
@@ -139,27 +160,26 @@ impl Bound {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        match self {
+        match self.0 {
             #[cfg(unix)]
-            Self::Unix(socket) => {
+            Inner::Unix(socket) => {
                 axum::serve(socket, app)
                     .with_graceful_shutdown(shutdown)
                     .await
             }
             #[cfg(windows)]
-            Self::Pipe(pipe) => {
+            Inner::Pipe(pipe) => {
                 axum::serve(pipe, app)
                     .with_graceful_shutdown(shutdown)
                     .await
             }
-            Self::DevTcp(tcp) => {
+            Inner::DevTcp(tcp) => {
                 let app = app.layer(middleware::from_fn(local_host_only));
                 axum::serve(tcp, app).with_graceful_shutdown(shutdown).await
             }
         }
     }
 }
-
 /// The DNS-rebinding guard for development TCP.
 async fn local_host_only(request: Request, next: Next) -> Response {
     let host = request

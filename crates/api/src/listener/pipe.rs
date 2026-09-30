@@ -90,3 +90,24 @@ impl axum::serve::Listener for NamedPipe {
         Ok(PipeAddr(self.name.clone()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::listener::pipe_security::{current_user_sid, dacl_sddl};
+
+    #[tokio::test]
+    async fn only_the_current_user_has_access() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!(r"\\.\pipe\pitcrewd-unit-{}-{nanos}", std::process::id());
+        let pipe = NamedPipe::bind(&name).unwrap();
+        let sddl = dacl_sddl(&pipe.next).unwrap();
+        let sid = current_user_sid().unwrap();
+        assert!(sddl.starts_with("D:P"), "{sddl}");
+        assert_eq!(sddl.matches("(A;").count(), 1, "{sddl}");
+        assert!(sddl.contains(&sid), "{sddl} lacks {sid}");
+    }
+}

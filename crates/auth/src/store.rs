@@ -3,13 +3,17 @@
 //! Stream H owns no database migrations, so the first store is a small file in the daemon's
 //! state directory. It sits behind [`TokenStore`] so it can move into the hub store later.
 
+use crate::private::{
+    ExclusiveLock, create_new_private_file, create_private_dir, open_private_file,
+};
 use crate::token::{SecretToken, TokenHash, TokenId, claimed_scope};
 use pitcrew_protocol::api::{Caller, TokenScope};
 use pitcrew_protocol::model::TimestampMs;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{PoisonError, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -36,7 +40,13 @@ pub enum TokenError {
     NotFound(TokenId),
     /// The OS could not supply randomness.
     #[error("could not generate a token: {0}")]
-    Random(getrandom::Error),
+    Random(String),
+    /// Another process (or another store in this one) already has the registry open.
+    #[error("token registry {} is in use by another process", path.display())]
+    Locked {
+        /// The lock file.
+        path: PathBuf,
+    },
     /// The registry file could not be read or written.
     #[error("token registry {}: {source}", path.display())]
     Io {
@@ -112,35 +122,64 @@ const FILE_VERSION: u32 = 1;
 
 /// A token registry kept in memory and, unless created with [`FileTokenStore::in_memory`],
 /// written atomically to `tokens.json` (mode 0600 on Unix) on every change.
+///
+/// **Single writer.** Only the daemon opens the registry; everything else (the CLI, the desktop)
+/// mints and revokes through the API. [`FileTokenStore::open`] holds an exclusive lock on
+/// `tokens.lock` for the store's lifetime, so a second opener fails with
+/// [`TokenError::Locked`].
+///
+/// **Windows:** files take the ACL of their directory, so `state_dir` must be under the user's
+/// profile (e.g. `%LOCALAPPDATA%`).
 #[derive(Debug)]
 pub struct FileTokenStore {
     path: Option<PathBuf>,
     entries: RwLock<Vec<Entry>>,
+    _lock: Option<ExclusiveLock>,
 }
 
 impl FileTokenStore {
     /// The registry's file name inside the state directory.
     pub const FILE_NAME: &'static str = "tokens.json";
+    /// The lock file's name inside the state directory.
+    pub const LOCK_NAME: &'static str = "tokens.lock";
 
-    /// Opens (or creates) the registry in `state_dir`. The directory is created if missing, with
-    /// mode 0700 on Unix.
+    /// Opens (or creates) the registry in `state_dir` and locks it.
+    ///
+    /// On Unix, `state_dir` is created with mode 0700 if missing; an existing one must already be
+    /// owned by us with no group or other access. The registry file must be ours, not a symlink,
+    /// and not writable by others. Anything else fails closed.
     ///
     /// # Errors
-    /// The directory cannot be created, or the file cannot be read or is malformed.
+    /// The directory or file is not private, the registry is locked or malformed, or I/O fails.
     pub fn open(state_dir: &Path) -> Result<Self, TokenError> {
-        create_private_dir(state_dir).map_err(|source| TokenError::Io {
-            path: state_dir.to_path_buf(),
-            source,
+        let io_err = |path: &Path| {
+            let path = path.to_path_buf();
+            move |source| TokenError::Io { path, source }
+        };
+        create_private_dir(state_dir).map_err(io_err(state_dir))?;
+        let lock_path = state_dir.join(Self::LOCK_NAME);
+        let lock = ExclusiveLock::acquire(&lock_path).map_err(|e| {
+            if e.kind() == io::ErrorKind::WouldBlock {
+                TokenError::Locked {
+                    path: lock_path.clone(),
+                }
+            } else {
+                io_err(&lock_path)(e)
+            }
         })?;
         let path = state_dir.join(Self::FILE_NAME);
-        let entries = match fs::read(&path) {
-            Ok(bytes) => parse(&path, &bytes)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(source) => return Err(TokenError::Io { path, source }),
+        let entries = match open_private_file(&path).map_err(io_err(&path))? {
+            Some(mut file) => {
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).map_err(io_err(&path))?;
+                parse(&path, &bytes)?
+            }
+            None => Vec::new(),
         };
         Ok(Self {
             path: Some(path),
             entries: RwLock::new(entries),
+            _lock: Some(lock),
         })
     }
 
@@ -150,6 +189,7 @@ impl FileTokenStore {
         Self {
             path: None,
             entries: RwLock::new(Vec::new()),
+            _lock: None,
         }
     }
 
@@ -244,7 +284,8 @@ fn check_caller(caller: &Caller) -> Result<(), TokenError> {
 }
 
 fn new_entry(caller: Caller) -> Result<(Entry, SecretToken), TokenError> {
-    let token = SecretToken::generate(caller.scope).map_err(TokenError::Random)?;
+    let token =
+        SecretToken::generate(caller.scope).map_err(|e| TokenError::Random(e.to_string()))?;
     let entry = Entry {
         info: TokenInfo {
             id: TokenId::new(),
@@ -271,6 +312,8 @@ fn parse(path: &Path, bytes: &[u8]) -> Result<Vec<Entry>, TokenError> {
     if file.version != FILE_VERSION {
         return Err(malformed(format!("unsupported version {}", file.version)));
     }
+    let mut ids = HashSet::new();
+    let mut hashes = HashSet::new();
     file.tokens
         .into_iter()
         .map(|r| {
@@ -278,6 +321,12 @@ fn parse(path: &Path, bytes: &[u8]) -> Result<Vec<Entry>, TokenError> {
                 .ok_or_else(|| malformed(format!("token {} has a bad sha256", r.id)))?;
             check_caller(&r.caller)
                 .map_err(|_| malformed(format!("token {} has an invalid caller", r.id)))?;
+            if !ids.insert(r.id) {
+                return Err(malformed(format!("token {} appears twice", r.id)));
+            }
+            if !hashes.insert(hash.0) {
+                return Err(malformed(format!("token {} repeats another's hash", r.id)));
+            }
             Ok(Entry {
                 info: TokenInfo {
                     id: r.id,
@@ -290,7 +339,8 @@ fn parse(path: &Path, bytes: &[u8]) -> Result<Vec<Entry>, TokenError> {
         .collect()
 }
 
-/// Writes to a temporary file in the same directory, syncs it, and renames it over the target.
+/// Writes to a new, uniquely named temporary file in the same directory, syncs it, and renames
+/// it over the target.
 fn persist(path: &Path, entries: &[Entry]) -> Result<(), TokenError> {
     let io_err = |source| TokenError::Io {
         path: path.to_path_buf(),
@@ -311,38 +361,19 @@ fn persist(path: &Path, entries: &[Entry]) -> Result<(), TokenError> {
     let mut json = serde_json::to_vec_pretty(&file).map_err(|e| io_err(io::Error::other(e)))?;
     json.push(b'\n');
 
-    let tmp = path.with_extension("json.tmp");
-    let mut out = private_file(&tmp).map_err(io_err)?;
-    out.write_all(&json).map_err(io_err)?;
-    out.sync_all().map_err(io_err)?;
-    drop(out);
-    fs::rename(&tmp, path).map_err(io_err)?;
+    let tmp = path.with_extension(format!("json.{}.tmp", ulid::Ulid::new()));
+    let written = create_new_private_file(&tmp).and_then(|mut out| {
+        out.write_all(&json)?;
+        out.sync_all()?;
+        drop(out);
+        fs::rename(&tmp, path)
+    });
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(io_err(e));
+    }
     sync_parent(path);
     Ok(())
-}
-
-#[cfg(unix)]
-fn private_file(path: &Path) -> io::Result<fs::File> {
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    // `mode` only applies when the file is created.
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    Ok(file)
-}
-
-#[cfg(not(unix))]
-fn private_file(path: &Path) -> io::Result<fs::File> {
-    // On Windows the file inherits the ACL of the user's profile directory.
-    fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
 }
 
 #[cfg(unix)]
@@ -355,33 +386,18 @@ fn sync_parent(path: &Path) {
 
 #[cfg(not(unix))]
 fn sync_parent(_path: &Path) {}
-
-/// Creates `dir` (and its parents) if missing, and makes it private: mode 0700 on Unix. Fails if
-/// it is not a directory or, on Unix, cannot be made private (e.g. another user owns it).
-///
-/// # Errors
-/// The directory cannot be created or its mode set.
-pub fn create_private_dir(dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
-    let meta = fs::symlink_metadata(dir)?;
-    if !meta.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{} is not a directory", dir.display()),
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use pitcrew_protocol::MemberId;
+
+    /// A fresh private (0700) directory; `tempdir()` itself may be 0755.
+    fn private_tmp() -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("private");
+        create_private_dir(&dir).unwrap();
+        (tmp, dir)
+    }
 
     fn person() -> Caller {
         Caller {
@@ -470,8 +486,8 @@ mod tests {
 
     #[test]
     fn the_registry_round_trips_and_never_holds_a_raw_token() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = dir.path().join("state");
+        let (_tmp, dir) = private_tmp();
+        let state = dir.as_path().join("state");
         let me = person();
         let bot = agent(me.member);
 
@@ -489,7 +505,12 @@ mod tests {
             assert!(!file.contains(token.expose()));
             assert!(!file.contains(&token.expose()[4..]));
         }
-        assert!(!state.join("tokens.json.tmp").exists());
+        let leftovers: Vec<_> = fs::read_dir(&state)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty());
 
         let store = FileTokenStore::open(&state).unwrap();
         assert_eq!(store.verify(device.expose()), Some(me));
@@ -503,8 +524,8 @@ mod tests {
     #[test]
     fn the_registry_and_its_directory_are_private() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = tempfile::tempdir().unwrap();
-        let state = dir.path().join("state");
+        let (_tmp, dir) = private_tmp();
+        let state = dir.as_path().join("state");
         let store = FileTokenStore::open(&state).unwrap();
         store.mint(person()).unwrap();
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
@@ -512,23 +533,157 @@ mod tests {
         assert_eq!(mode(&state.join(FileTokenStore::FILE_NAME)), 0o600);
     }
 
-    #[test]
-    fn a_malformed_registry_is_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join(FileTokenStore::FILE_NAME), "{").unwrap();
-        assert!(matches!(
-            FileTokenStore::open(dir.path()),
-            Err(TokenError::Malformed { .. })
-        ));
+    /// Writes a registry file that passes the permission checks.
+    fn write_registry(dir: &Path, contents: &str) {
+        let path = dir.join(FileTokenStore::FILE_NAME);
+        fs::write(&path, contents).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    fn record(id: &str, sha256: &str, caller: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "id": id, "sha256": sha256, "caller": caller, "created_at": 0 })
     }
 
     #[test]
+    fn malformed_registries_are_errors() {
+        let id = TokenId::new().0.to_string();
+        let other_id = TokenId::new().0.to_string();
+        let hash = "ab".repeat(32);
+        let other_hash = "cd".repeat(32);
+        let device = serde_json::to_value(person()).unwrap();
+        let mut agent_without_owner = serde_json::to_value(agent(MemberId::new())).unwrap();
+        agent_without_owner
+            .as_object_mut()
+            .unwrap()
+            .remove("on_behalf_of");
+        let registry = |version: u32, tokens: Vec<serde_json::Value>| {
+            serde_json::json!({ "version": version, "tokens": tokens }).to_string()
+        };
+        let cases = [
+            ("not json", "{".to_owned()),
+            ("bad version", registry(2, vec![])),
+            ("bad sha256", registry(1, vec![record(&id, "zz", &device)])),
+            (
+                "invalid caller",
+                registry(1, vec![record(&id, &hash, &agent_without_owner)]),
+            ),
+            (
+                "duplicate id",
+                registry(
+                    1,
+                    vec![
+                        record(&id, &hash, &device),
+                        record(&id, &other_hash, &device),
+                    ],
+                ),
+            ),
+            (
+                "duplicate hash",
+                registry(
+                    1,
+                    vec![
+                        record(&id, &hash, &device),
+                        record(&other_id, &hash, &device),
+                    ],
+                ),
+            ),
+        ];
+        for (name, contents) in cases {
+            let (_tmp, dir) = private_tmp();
+            write_registry(dir.as_path(), &contents);
+            assert!(
+                matches!(
+                    FileTokenStore::open(dir.as_path()),
+                    Err(TokenError::Malformed { .. })
+                ),
+                "{name}"
+            );
+        }
+
+        let (_tmp, dir) = private_tmp();
+        write_registry(
+            dir.as_path(),
+            &registry(
+                1,
+                vec![
+                    record(&id, &hash, &device),
+                    record(&other_id, &other_hash, &device),
+                ],
+            ),
+        );
+        assert_eq!(FileTokenStore::open(dir.as_path()).unwrap().list().len(), 2);
+    }
+
+    #[test]
+    fn only_one_store_may_open_a_registry() {
+        let (_tmp, dir) = private_tmp();
+        let first = FileTokenStore::open(dir.as_path()).unwrap();
+        assert!(matches!(
+            FileTokenStore::open(dir.as_path()),
+            Err(TokenError::Locked { .. })
+        ));
+        drop(first);
+        FileTokenStore::open(dir.as_path()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_registry_others_can_write_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_tmp, dir) = private_tmp();
+        write_registry(dir.as_path(), r#"{"version":1,"tokens":[]}"#);
+        let path = dir.as_path().join(FileTokenStore::FILE_NAME);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o620)).unwrap();
+        assert!(matches!(
+            FileTokenStore::open(dir.as_path()),
+            Err(TokenError::Io { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_registry_is_refused() {
+        let (_tmp, dir) = private_tmp();
+        let elsewhere = tempfile::tempdir().unwrap();
+        write_registry(elsewhere.path(), r#"{"version":1,"tokens":[]}"#);
+        std::os::unix::fs::symlink(
+            elsewhere.path().join(FileTokenStore::FILE_NAME),
+            dir.as_path().join(FileTokenStore::FILE_NAME),
+        )
+        .unwrap();
+        assert!(matches!(
+            FileTokenStore::open(dir.as_path()),
+            Err(TokenError::Io { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_open_state_directory_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_tmp, dir) = private_tmp();
+        fs::set_permissions(dir.as_path(), fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(matches!(
+            FileTokenStore::open(dir.as_path()),
+            Err(TokenError::Io { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_failed_write_leaves_the_store_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = FileTokenStore::open(dir.path()).unwrap();
-        // A directory where the temporary file should go makes the write fail.
-        fs::create_dir(dir.path().join("tokens.json.tmp")).unwrap();
-        assert!(matches!(store.mint(person()), Err(TokenError::Io { .. })));
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_tmp, dir) = private_tmp();
+        let store = FileTokenStore::open(dir.as_path()).unwrap();
+        // A read-only directory makes creating the temporary file fail.
+        fs::set_permissions(dir.as_path(), fs::Permissions::from_mode(0o500)).unwrap();
+        let result = store.mint(person());
+        fs::set_permissions(dir.as_path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(result, Err(TokenError::Io { .. })));
         assert!(store.list().is_empty());
     }
 }

@@ -168,6 +168,40 @@ mod tests {
     }
 
     #[test]
+    fn reads_any_order_spacing_or_a_bearer_only_offer() {
+        for offer in [
+            "pitcrew.bearer.abc",
+            "pitcrew.bearer.abc, pitcrew.v1",
+            "  pitcrew.v1 ,   pitcrew.bearer.abc  ",
+        ] {
+            let map = headers(&[("upgrade", "WebSocket"), ("sec-websocket-protocol", offer)]);
+            assert_eq!(bearer_token(&map), Ok("abc".into()), "{offer:?}");
+        }
+        // Split across two header lines.
+        let map = headers(&[
+            ("upgrade", "websocket"),
+            ("sec-websocket-protocol", "pitcrew.v1"),
+            ("sec-websocket-protocol", "pitcrew.bearer.abc"),
+        ]);
+        assert_eq!(bearer_token(&map), Ok("abc".into()));
+        // Two bearer entries are ambiguous.
+        let map = headers(&[
+            ("upgrade", "websocket"),
+            (
+                "sec-websocket-protocol",
+                "pitcrew.bearer.a, pitcrew.bearer.b",
+            ),
+        ]);
+        assert_eq!(bearer_token(&map), Err(Missing::Ambiguous));
+    }
+
+    #[test]
+    fn two_authorization_headers_are_ambiguous() {
+        let map = headers(&[("authorization", "Bearer a"), ("authorization", "Bearer a")]);
+        assert_eq!(bearer_token(&map), Err(Missing::Ambiguous));
+    }
+
+    #[test]
     fn scrub_removes_the_token_and_keeps_other_protocols() {
         let mut map = headers(&[
             ("authorization", "Bearer abc"),

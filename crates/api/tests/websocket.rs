@@ -50,6 +50,8 @@ async fn websockets_authenticate_by_subprotocol() {
 
     let device = format!("pitcrew.v1, pitcrew.bearer.{}", f.device_token);
     let agent = format!("pitcrew.v1, pitcrew.bearer.{}", f.agent_token);
+    let bearer_first = format!("pitcrew.bearer.{}, pitcrew.v1", f.device_token);
+    let spaced = format!("  pitcrew.v1 ,   pitcrew.bearer.{}  ", f.device_token);
     let person = serde_json::to_value(f.person).unwrap();
     let results = tokio::task::spawn_blocking(move || {
         (
@@ -57,6 +59,8 @@ async fn websockets_authenticate_by_subprotocol() {
             connect(addr, &agent),
             connect(addr, "pitcrew.v1"),
             connect(addr, "pitcrew.v1, pitcrew.bearer.pcd_unknown"),
+            connect(addr, &bearer_first),
+            connect(addr, &spaced),
         )
     })
     .await
@@ -70,6 +74,14 @@ async fn websockets_authenticate_by_subprotocol() {
     assert_eq!(results.1, Err(403));
     assert_eq!(results.2, Err(401));
     assert_eq!(results.3, Err(401));
+    for offered in [results.4, results.5] {
+        let (answered, message) = offered.unwrap();
+        assert_eq!(answered, "pitcrew.v1");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&message).unwrap(),
+            person
+        );
+    }
 
     stop.send(()).unwrap();
     server.await.unwrap().unwrap();

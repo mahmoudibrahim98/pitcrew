@@ -13,6 +13,7 @@ use tokio::sync::oneshot;
 
 async fn request(pipe: &str, path: &str, bearer: Option<&str>) -> (u16, serde_json::Value) {
     let mut client = ClientOptions::new().open(pipe).unwrap();
+    pitcrew_api::client::check_pipe_server(&client).unwrap();
     let auth = bearer
         .map(|t| format!("Authorization: Bearer {t}\r\n"))
         .unwrap_or_default();
@@ -35,7 +36,8 @@ async fn serves_over_a_named_pipe() {
     let bound = Bound::bind(&listen).await.unwrap();
     assert_eq!(bound.describe(), name);
 
-    // Only the first instance may create the name, so nobody can squat it.
+    // Only the first instance may create the name: the daemon never joins a pipe someone else
+    // created. (Clients guard the other direction with `check_pipe_server`.)
     assert!(Bound::bind(&listen).await.is_err());
 
     let (stop, stopped) = oneshot::channel::<()>();

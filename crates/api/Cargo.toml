@@ -12,7 +12,6 @@ authors.workspace = true
 pitcrew-protocol.workspace = true
 pitcrew-auth.workspace = true
 axum.workspace = true
-thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "time"] }
 tracing.workspace = true
 
@@ -22,6 +21,7 @@ windows-sys = { version = "=0.61.2", features = [
   "Win32_Foundation",
   "Win32_Security",
   "Win32_Security_Authorization",
+  "Win32_System_Pipes",
   "Win32_System_Threading",
 ] }
 

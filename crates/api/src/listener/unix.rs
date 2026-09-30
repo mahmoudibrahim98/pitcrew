@@ -1,6 +1,6 @@
 //! A unix socket in a private directory, accepting only the daemon's own user.
 
-use pitcrew_auth::create_private_dir;
+use pitcrew_auth::{create_private_dir, euid};
 use std::io;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -10,39 +10,36 @@ use tokio::net::{UnixListener, UnixStream, unix};
 pub const SOCKET_NAME: &str = "pitcrewd.sock";
 
 /// A bound unix socket that drops connections from other users. Removes its socket file when
-/// dropped.
+/// dropped, if the file is still the one it created.
 #[derive(Debug)]
 pub struct UnixSocket {
     listener: UnixListener,
     path: PathBuf,
     uid: u32,
+    /// `(dev, ino)` of the socket file it created.
+    file_id: (u64, u64),
 }
 
 impl UnixSocket {
-    /// Makes `dir` private (0700), removes a stale socket, and binds `dir/pitcrewd.sock`.
+    /// Creates `dir` with mode 0700 (or checks that an existing one is ours and private),
+    /// removes a stale socket, and binds `dir/pitcrewd.sock`.
     ///
     /// # Errors
-    /// The directory cannot be made private (e.g. another user owns it); another daemon is
-    /// listening on the socket; something other than a socket is in the way; binding fails.
+    /// The directory is not private or another user owns it; another daemon is listening on the
+    /// socket; something other than our own socket is in the way; binding fails.
     pub fn bind(dir: &Path) -> io::Result<Self> {
+        // Checks owner and mode before anything inside the directory is touched.
         create_private_dir(dir)?;
         let path = dir.join(SOCKET_NAME);
         remove_stale(&path)?;
         let listener = UnixListener::bind(&path)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        // We just created the socket, so its owner is our effective uid.
-        let uid = std::fs::metadata(&path)?.uid();
-        if std::fs::metadata(dir)?.uid() != uid {
-            let _ = std::fs::remove_file(&path);
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("{} is owned by another user", dir.display()),
-            ));
-        }
+        let meta = std::fs::symlink_metadata(&path)?;
         Ok(Self {
             listener,
             path,
-            uid,
+            uid: euid(),
+            file_id: (meta.dev(), meta.ino()),
         })
     }
 
@@ -53,8 +50,8 @@ impl UnixSocket {
     }
 }
 
-/// Removes a socket left behind by a daemon that is gone. Refuses to touch a live socket or
-/// anything that is not a socket.
+/// Removes a socket left behind by a daemon that is gone. Refuses to touch a live socket, a
+/// socket owned by someone else, or anything that is not a socket.
 fn remove_stale(path: &Path) -> io::Result<()> {
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) => meta,
@@ -65,6 +62,12 @@ fn remove_stale(path: &Path) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!("{} exists and is not a socket", path.display()),
+        ));
+    }
+    if meta.uid() != euid() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is owned by another user", path.display()),
         ));
     }
     match std::os::unix::net::UnixStream::connect(path) {
@@ -82,10 +85,14 @@ fn remove_stale(path: &Path) -> io::Result<()> {
 
 impl Drop for UnixSocket {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Leave a socket that a newer daemon put in our place.
+        let ours =
+            std::fs::symlink_metadata(&self.path).is_ok_and(|m| (m.dev(), m.ino()) == self.file_id);
+        if ours {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
-
 impl axum::serve::Listener for UnixSocket {
     type Io = UnixStream;
     type Addr = unix::SocketAddr;
@@ -151,20 +158,22 @@ mod tests {
 
     #[tokio::test]
     async fn something_else_in_the_way_is_left_alone() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(SOCKET_NAME), "keep me").unwrap();
-        let err = UnixSocket::bind(dir.path()).unwrap_err();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("run");
+        create_private_dir(&dir).unwrap();
+        std::fs::write(dir.join(SOCKET_NAME), "keep me").unwrap();
+        let err = UnixSocket::bind(&dir).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(
-            std::fs::read_to_string(dir.path().join(SOCKET_NAME)).unwrap(),
+            std::fs::read_to_string(dir.join(SOCKET_NAME)).unwrap(),
             "keep me"
         );
     }
 
     #[tokio::test]
     async fn connections_from_another_uid_are_dropped() {
-        let dir = tempfile::tempdir().unwrap();
-        let socket = UnixSocket::bind(dir.path()).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = UnixSocket::bind(&tmp.path().join("run")).unwrap();
         let path = socket.path().to_path_buf();
         let other_uid = socket.uid.wrapping_add(1);
         let app = Router::new().route("/", get(|| async { "hello" }));
@@ -183,5 +192,32 @@ mod tests {
             String::from_utf8_lossy(&reply)
         );
         server.abort();
+    }
+
+    #[test]
+    fn an_open_directory_is_refused_before_anything_is_touched() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("run");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let err = UnixSocket::bind(&dir).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!dir.join(SOCKET_NAME).exists());
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o775, "the directory is not re-permissioned");
+    }
+
+    #[tokio::test]
+    async fn drop_leaves_a_socket_that_replaced_ours() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("run");
+        let socket = UnixSocket::bind(&dir).unwrap();
+        let path = socket.path().to_path_buf();
+        // Another socket takes the name.
+        std::fs::remove_file(&path).unwrap();
+        let _other = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        drop(socket);
+        assert!(path.exists());
     }
 }

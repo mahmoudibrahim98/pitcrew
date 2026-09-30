@@ -6,6 +6,7 @@
 //!   bearer-token authentication, and `404 not_found` for anything else.
 //! - [`Bound`] listens on a [`Listen`] transport and serves the app.
 //! - [`serve`] does both.
+//! - [`client`] holds the checks a client makes before trusting a daemon with a token.
 //!
 //! Authentication inserts an `axum::Extension<Caller>` (from `pitcrew-protocol`) into every
 //! authenticated request. Domain crates read it with `pitcrew_auth::Authenticated` or
@@ -15,13 +16,14 @@
 //! `pitcrew-protocol` and `pitcrew-interfaces` only, never another stream's internals.
 
 mod auth;
+pub mod client;
 mod host;
 mod listener;
 
 pub use host::{local_host_info, local_machine_info};
 pub use listener::{Bound, Listen};
 #[cfg(windows)]
-pub use listener::{NamedPipe, PipeAddr};
+pub use listener::{NamedPipe, PipeAddr, default_pipe_name};
 #[cfg(unix)]
 pub use listener::{SOCKET_NAME, UnixSocket};
 
