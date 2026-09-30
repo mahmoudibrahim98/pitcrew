@@ -14,13 +14,14 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [B-control-hardening](B-control-hardening.md) | B · Runtime | `s/B/control-hardening` | Opus-class | In review: fixes requested |
 | [C-open-and-log](C-open-and-log.md) | C · Store | `s/C/open-and-log` | Sonnet-class | **Merged** |
 | [C-store-hardening](C-store-hardening.md) | C · Store | `s/C/store-hardening` | Sonnet-class | **Merged** |
-| [C-projections](C-projections.md) | C · Store | `s/C/projections` | Sonnet-class | In progress |
-| [D-watch-and-index](D-watch-and-index.md) | D · Runner | `s/D/watch-and-index` | Opus-class | In review |
+| [C-projections](C-projections.md) | C · Store | `s/C/projections` | Sonnet-class | In review: small fixes |
+| [E-work-core](E-work-core.md) | E · Work model | `s/E/work-core` | Opus-class | Ready (based on C-projections) |
+| [D-watch-and-index](D-watch-and-index.md) | D · Runner | `s/D/watch-and-index` | Opus-class | In review: fixes in progress |
 | [H-listener-and-tokens](H-listener-and-tokens.md) | H · API and auth | `s/H/listener-and-tokens` | Opus-class | **Merged** |
 | [H-delta-stream](H-delta-stream.md) | H · API and auth | `s/H/delta-stream` | Opus-class | **Merged** |
-| [H-terminal-and-activity](H-terminal-and-activity.md) | H · API and auth | `s/H/terminal-and-activity` | Opus-class | In progress |
+| [H-terminal-and-activity](H-terminal-and-activity.md) | H · API and auth | `s/H/terminal-and-activity` | Opus-class | In review |
 | [I-cli-and-hooks](I-cli-and-hooks.md) | I · CLI and hooks | `s/I/cli-and-hooks` | Sonnet-class | In progress |
-| [J-ssh-connection](J-ssh-connection.md) | J · Remote and HPC | `s/J/ssh-connection` | Opus-class | In review |
+| [J-ssh-connection](J-ssh-connection.md) | J · Remote and HPC | `s/J/ssh-connection` | Opus-class | In review: fixes in progress |
 | [L-skeleton-and-data](L-skeleton-and-data.md) | L · UI foundation | `s/L/skeleton-and-data` | Opus-class | In review: round 3 |
 | [L-shell](L-shell.md) | L · UI foundation | `s/L/shell` | Opus-class | In progress (based on skeleton-and-data) |
 | [M-console-components](M-console-components.md) | M · Agent console | `s/M/console-components` | Opus-class | In progress (based on skeleton-and-data) |
