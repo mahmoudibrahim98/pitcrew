@@ -167,8 +167,8 @@ export function TopBar() {
             className="text-ink-2"
           >
             <SearchIcon />
-            <span className="sr-only @3xl:not-sr-only">Search</span>
-            <span className="hidden @4xl:inline-flex">
+            <span className="sr-only @4xl:not-sr-only">Search</span>
+            <span className="hidden @5xl:inline-flex">
               <Kbd keys={SHORTCUTS.palette} />
             </span>
           </Button>
@@ -182,8 +182,8 @@ export function TopBar() {
             className="aria-pressed:border-accent aria-pressed:bg-accent-soft aria-pressed:text-accent-text"
           >
             <SparkleIcon />
-            <span className="sr-only @3xl:not-sr-only">Orchestrator</span>
-            <span className="hidden @4xl:inline-flex">
+            <span className="sr-only @4xl:not-sr-only">Orchestrator</span>
+            <span className="hidden @5xl:inline-flex">
               <Kbd keys={SHORTCUTS.orchestrator} />
             </span>
           </Button>
