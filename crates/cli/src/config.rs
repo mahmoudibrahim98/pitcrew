@@ -114,22 +114,18 @@ impl Endpoint {
         Self::Unix { dir }
     }
 
-    /// A local pipe. Remote pipes (`\\server\pipe\…`) are refused: opening one would talk to
-    /// another machine.
+    /// A local pipe (see [`is_local_pipe_name`]).
     ///
     /// # Errors
-    /// `invalid` if the name is not `\\.\pipe\…`.
+    /// `invalid` if the name is not `\\.\pipe\<name>` with a plain name.
     #[cfg(windows)]
     pub fn pipe(name: String) -> Result<Self> {
-        let prefix = r"\\.\pipe\";
-        let local = name
-            .get(..prefix.len())
-            .is_some_and(|p| p.eq_ignore_ascii_case(prefix));
-        if local && name.len() > prefix.len() {
+        if is_local_pipe_name(&name) {
             Ok(Self::Pipe { name })
         } else {
             Err(Error::invalid(format!(
-                r"PITCREW_PIPE must be a local pipe, \\.\pipe\<name>, not {name}"
+                r"PITCREW_PIPE must be a local pipe, \\.\pipe\<name> with a name of letters, \
+                 digits, dots, dashes and underscores, not {name:?}"
             )))
         }
     }
@@ -194,6 +190,23 @@ impl Endpoint {
             _ => "localhost",
         }
     }
+}
+
+/// `\\.\pipe\<name>` where the name is `[A-Za-z0-9._-]+` and does not end in a dot.
+///
+/// Win32 normalizes `\\.\` paths, so a name with `\`, `/` or `..` could leave the pipe namespace:
+/// `\\.\pipe\..\UNC\host\share` is an SMB path (it would send our credentials to that host), and
+/// `\\.\pipe\..\C:\x` a file. Trailing dots are stripped too, so `.`, `..` and `x.` are refused.
+#[must_use]
+pub fn is_local_pipe_name(full: &str) -> bool {
+    let Some(name) = strip_prefix_ignore_case(full, r"\\.\pipe\") else {
+        return false;
+    };
+    !name.is_empty()
+        && !name.ends_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 fn strip_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
@@ -442,14 +455,43 @@ mod tests {
         assert!(err.message.contains("PITCREW_SOCKET"));
     }
 
+    #[test]
+    fn only_plain_local_pipe_names() {
+        for name in [
+            r"\\.\pipe\pitcrewd-S-1-5-21-1000",
+            r"\\.\PIPE\pitcrew.test_2-a",
+            r"\\.\pipe\.hidden",
+        ] {
+            assert!(is_local_pipe_name(name), "{name}");
+        }
+        for name in [
+            r"\\.\pipe\..",
+            r"\\.\pipe\.",
+            r"\\.\pipe\...",
+            r"\\.\pipe\x.",
+            r"\\.\pipe\..\UNC\host\share\x",
+            r"\\.\pipe\..\C:\Windows\win.ini",
+            r"\\.\pipe\a\b",
+            r"\\.\pipe\a/b",
+            r"\\.\pipe\../x",
+            r"\\.\pipe\",
+            r"\\.\pipe\a b",
+            r"\\server\pipe\x",
+            r"\\?\pipe\x",
+            "pitcrewd",
+            r"C:\x",
+        ] {
+            assert!(!is_local_pipe_name(name), "{name}");
+        }
+    }
+
     #[cfg(windows)]
     #[test]
-    fn only_local_pipes() {
-        assert!(Endpoint::pipe(r"\\.\pipe\pitcrewd-x".into()).is_ok());
-        assert!(Endpoint::pipe(r"\\.\PIPE\pitcrewd-x".into()).is_ok());
-        for name in [r"\\server\pipe\x", r"\\.\pipe\", "pitcrewd", r"C:\x"] {
-            assert!(Endpoint::pipe(name.into()).is_err(), "{name}");
-        }
+    fn a_pipe_from_the_environment_is_checked() {
+        let env = env_of(&[("PITCREW_PIPE", r"\\.\pipe\..\UNC\host\share\x")]);
+        assert_eq!(Endpoint::from_env(&env).unwrap_err().kind, Kind::Invalid);
+        let env = env_of(&[("PITCREW_PIPE", r"\\.\pipe\pitcrewd-x")]);
+        assert!(Endpoint::from_env(&env).is_ok());
     }
 
     #[test]
