@@ -48,6 +48,34 @@ pub fn collect(dir: &Path) -> io::Result<BTreeMap<String, Measured>> {
     Ok(out)
 }
 
+/// Folds a retry's results into `into`, keeping each benchmark's lower median and lower best:
+/// a metric passes when any attempt at it passes.
+pub fn merge(into: &mut BTreeMap<String, Measured>, retry: BTreeMap<String, Measured>) {
+    for (id, m) in retry {
+        into.entry(id)
+            .and_modify(|old| {
+                old.median_ns = old.median_ns.min(m.median_ns);
+                old.best_ns = old.best_ns.min(m.best_ns);
+            })
+            .or_insert(m);
+    }
+}
+
+/// A criterion filter (a regex over benchmark ids) selecting the benchmarks of metrics that
+/// regressed or went over budget, which a retry may clear if the cause was noise. `None` when
+/// there is nothing to retry.
+#[must_use]
+pub fn retry_filter(summary: &Summary) -> Option<String> {
+    let benches: Vec<&str> = summary
+        .metrics
+        .iter()
+        .filter(|l| matches!(l.status, Status::Regressed | Status::OverBudget))
+        .filter_map(|l| METRICS.iter().find(|m| m.name == l.name))
+        .map(|m| m.bench)
+        .collect();
+    (!benches.is_empty()).then(|| format!("^({})$", benches.join("|")))
+}
+
 fn visit(dir: &Path, out: &mut BTreeMap<String, Measured>) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
@@ -494,6 +522,50 @@ mod tests {
             bytes: None,
         };
         assert_eq!(value(rate, &no_bytes), None);
+    }
+
+    #[test]
+    fn a_retry_can_clear_noise_but_not_a_real_regression() {
+        let base = to_baseline(
+            &compare(Mode::Quick, "m", &all_quick(1.0), None, DEFAULT_THRESHOLD),
+            None,
+            None,
+        );
+        let mut first = all_quick(1.0);
+        first.insert(
+            "store/since_100".to_owned(),
+            Measured {
+                median_ns: 1.8e6,
+                best_ns: 1.5e6,
+                bytes: None,
+            },
+        );
+        let s = compare(Mode::Quick, "m", &first, Some(&base), DEFAULT_THRESHOLD);
+        assert!(!s.passed);
+        assert_eq!(
+            retry_filter(&s).as_deref(),
+            Some("^(store/since_100)$"),
+            "only the failing benchmark is retried"
+        );
+
+        // The retry measures it at the baseline's speed: the lower values win, and it passes.
+        let mut merged = first.clone();
+        let retry = run(1.0, 1.0)
+            .into_iter()
+            .filter(|(id, _)| id == "store/since_100")
+            .collect();
+        merge(&mut merged, retry);
+        assert_eq!(merged["store/since_100"].best_ns, 1e6);
+        assert_eq!(merged["store/since_100"].median_ns, 1.2e6);
+        let s = compare(Mode::Quick, "m", &merged, Some(&base), DEFAULT_THRESHOLD);
+        assert!(s.passed, "{}", render(&s));
+        assert_eq!(retry_filter(&s), None);
+
+        // A retry that is as slow as the first attempt keeps the regression.
+        let mut still = first.clone();
+        merge(&mut still, first);
+        let s = compare(Mode::Quick, "m", &still, Some(&base), DEFAULT_THRESHOLD);
+        assert!(!s.passed);
     }
 
     #[test]
