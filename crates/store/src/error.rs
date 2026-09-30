@@ -18,6 +18,30 @@ pub enum Error {
         /// The repeated id.
         id: EventId,
     },
+    /// A projection's `apply` or `reset` failed. The append, rebuild or open it was part of is
+    /// rolled back: no event is stored and no revision used.
+    #[error("projection {name} failed at rev {rev}")]
+    Projection {
+        /// The projection.
+        name: String,
+        /// The event being applied, or 0 while resetting.
+        rev: u64,
+        /// Why.
+        #[source]
+        source: crate::projection::BoxError,
+    },
+    /// Two projections passed to one store share a name.
+    #[error("two projections are named {name}")]
+    DuplicateProjection {
+        /// The name.
+        name: String,
+    },
+    /// No projection by this name is registered.
+    #[error("no projection named {name}")]
+    UnknownProjection {
+        /// The name.
+        name: String,
+    },
     /// A migration failed to apply; nothing from it was kept.
     #[error("migration {version:04}_{name} failed")]
     Migration {

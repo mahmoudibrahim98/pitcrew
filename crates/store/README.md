@@ -50,6 +50,44 @@ To start a stream (the hello frame) without gaps or repeats: subscribe, then rea
 `latest_rev()` as `N`, send history up to `N`, then forward received ranges, skipping those with
 `to_rev <= N`.
 
+`log_id()` is a ULID written to `meta` when the store is created (or on the first open of an
+older store) and never changed. It is the `log` in the hello frame: revisions only compare within
+one log.
+
+## Projections
+
+Tables derived from the log (pages, the Inbox, recaps) are **projections**. A domain crate:
+
+1. creates its tables in its own migration range (`02xx` for E, and so on);
+2. implements `pitcrew_store::Projection`: `name()` (stable, unique, e.g. `work.tasks`),
+   `version()`, `reset(&Transaction)` (clear its tables) and `apply(&Transaction, &StoredEvent)`;
+3. passes it to `Store::open_with(path, options, vec![Box::new(…)])`.
+
+Then:
+
+- every `append` applies its events to every projection **in the same transaction**. If `apply`
+  returns an error, the whole append rolls back: nothing is stored, no revision is used, nothing
+  is announced. An error is a bug, never skipped;
+- `projection_state (name, version, rev)` records each projection's progress. On open, a
+  projection whose `version` changed (or that is new) is rebuilt: `reset`, then the log replayed
+  1,000 events at a time. One that is behind the log (another process appended without it)
+  catches up. Each rebuild or catch-up is one transaction, so readers never see half a rebuild.
+  An append also catches up a projection that fell behind while the store was open;
+- `Store::rebuild(name)` rebuilds one on demand;
+- bump `version()` whenever `apply` changes meaning. `reset` followed by replaying the log must
+  give the same tables as applying events one append at a time; test that.
+
+**SQL access.** `pitcrew_store::sql` re-exports the store's `rusqlite`, so domain crates use the
+workspace's one version and the same `Transaction` type without their own dependency. `apply`
+and `reset` get the write transaction: do not commit, and touch only your own tables.
+
+**Reads.** `Store::read(|conn| …)` runs a closure on a separate **read-only** connection inside
+one read transaction (a consistent snapshot). Reads never take the write lock, so a slow read
+does not hold up appends and an append does not block reads (WAL). Keep reads short: they share
+one connection, and a long-open read stops the WAL from being checkpointed. The closure's error
+type is anything a store `Error` converts into, e.g. `pitcrew_store::Result<T>`, where `?` on a
+`sql::Error` works.
+
 ## Timings
 
 `cargo test -p pitcrew-store --release --test perf -- --ignored --nocapture`. Targets: append
@@ -64,6 +102,8 @@ Measured 2026-09-30 on a laptop (Intel Core Ultra 5 135U, 14 threads, 16 GB), WS
 | `since(rev, 100)`, 100 pages | 0.31–0.36 ms | 1.39 ms |
 | `before(rev, 100)`, one type (1 in 5 events), 21 pages | 0.28–0.36 ms | 1.01 ms |
 | `before(rev, 100)`, two types, 27 pages | 0.29–0.36 ms | 0.94 ms |
+| Append 10,000 events in batches of 100, two projections | 345–396 ms total (without: 310–340 ms, same session) | — |
+| Rebuild one projection over 10,000 events | 45–76 ms | — |
 
 With other agents building on the same machine, worst pages reached about 10–13 ms, for `main`'s
 code as well; the targets hold on an idle machine.
