@@ -1,6 +1,8 @@
 //! Timings for the acceptance targets. Run with:
 //! `cargo test -p pitcrew-store --release --test perf -- --ignored --nocapture`
 
+mod common;
+
 use pitcrew_protocol::events::Event;
 use pitcrew_protocol::ids::EventId;
 use pitcrew_store::{EventFilter, Store, StoreOptions, event_type};
@@ -88,4 +90,43 @@ fn append_10k_and_page() {
             "filtered before ({label}) took {worst:?}"
         );
     }
+}
+
+#[test]
+#[ignore = "timing; run in release"]
+fn append_10k_with_two_projections() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Store::open_with_migrations(
+        dir.path().join("store.db"),
+        StoreOptions::default(),
+        &common::toy_migrations(),
+        common::both(),
+    )
+    .expect("open");
+    let fixture = pitcrew_fixtures::demo_workspace().expect("fixture").events;
+    let events: Vec<Event> = fixture
+        .iter()
+        .cycle()
+        .take(10_000)
+        .map(|e| {
+            let mut e = e.clone();
+            e.id = EventId::new();
+            e
+        })
+        .collect();
+
+    let start = Instant::now();
+    for batch in events.chunks(100) {
+        store.append(batch).expect("append");
+    }
+    let append = start.elapsed();
+    assert_eq!(store.latest_rev().expect("rev"), 10_000);
+
+    let start = Instant::now();
+    store.rebuild("toy.by_type").expect("rebuild");
+    let rebuild = start.elapsed();
+
+    println!("append 10,000 events in batches of 100, two projections: {append:?}");
+    println!("rebuild one projection over 10,000 events: {rebuild:?}");
+    assert!(append < Duration::from_secs(1), "append took {append:?}");
 }

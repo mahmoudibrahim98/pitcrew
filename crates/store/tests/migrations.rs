@@ -102,7 +102,8 @@ fn a_table_rebuild_keeps_cascading_children() {
              ALTER TABLE parent_new RENAME TO parent;",
         ),
     ];
-    let store = Store::open_with_migrations(&path, StoreOptions::default(), &list).expect("open");
+    let store = Store::open_with_migrations(&path, StoreOptions::default(), &list, Vec::new())
+        .expect("open");
     assert_eq!(store.schema_version().expect("version"), Some(151));
     drop(store);
     assert_eq!(count(&path, "parent"), 2);
@@ -129,7 +130,8 @@ fn a_migration_leaving_a_dangling_reference_fails() {
             "INSERT INTO child (id, parent) VALUES (13, 99);",
         ),
     ];
-    let err = Store::open_with_migrations(&path, StoreOptions::default(), &list).expect_err("fail");
+    let err = Store::open_with_migrations(&path, StoreOptions::default(), &list, Vec::new())
+        .expect_err("fail");
     assert!(
         matches!(err, Error::Migration { version: 151, .. }),
         "{err:?}"
@@ -189,12 +191,16 @@ fn unknown_older_migration_is_refused() {
         migration(1, "init", INIT_SQL),
         migration(150, "other_branch", "CREATE TABLE b (x INTEGER) STRICT;"),
     ];
-    drop(Store::open_with_migrations(&path, StoreOptions::default(), &a).expect("open a"));
+    drop(
+        Store::open_with_migrations(&path, StoreOptions::default(), &a, Vec::new())
+            .expect("open a"),
+    );
     let b = [
         migration(1, "init", INIT_SQL),
         migration(200, "later", "CREATE TABLE c (x INTEGER) STRICT;"),
     ];
-    let err = Store::open_with_migrations(&path, StoreOptions::default(), &b).expect_err("refuse");
+    let err = Store::open_with_migrations(&path, StoreOptions::default(), &b, Vec::new())
+        .expect_err("refuse");
     assert!(
         matches!(err, Error::UnknownMigration { version: 150 }),
         "{err:?}"
@@ -213,7 +219,8 @@ fn a_failed_migration_leaves_nothing_behind() {
             "CREATE TABLE half (x INTEGER) STRICT; THIS IS NOT SQL;",
         ),
     ];
-    let err = Store::open_with_migrations(&path, StoreOptions::default(), &list).expect_err("fail");
+    let err = Store::open_with_migrations(&path, StoreOptions::default(), &list, Vec::new())
+        .expect_err("fail");
     assert!(
         matches!(err, Error::Migration { version: 101, .. }),
         "{err:?}"
@@ -265,7 +272,8 @@ fn migrations_in_a_directory_are_picked_up() {
     assert_eq!(list[1].name, "widgets");
 
     let path = dir.path().join("store.db");
-    let store = Store::open_with_migrations(&path, StoreOptions::default(), &list).expect("open");
+    let store = Store::open_with_migrations(&path, StoreOptions::default(), &list, Vec::new())
+        .expect("open");
     assert_eq!(store.schema_version().expect("version"), Some(301));
     drop(store);
     let tables: i64 = raw(&path)
@@ -285,7 +293,10 @@ fn migrations_in_a_directory_are_picked_up() {
     )
     .expect("write");
     let list = migrations::load_dir(&mdir).expect("reload");
-    drop(Store::open_with_migrations(&path, StoreOptions::default(), &list).expect("reopen"));
+    drop(
+        Store::open_with_migrations(&path, StoreOptions::default(), &list, Vec::new())
+            .expect("reopen"),
+    );
     let after = applied(&path);
     assert_eq!(after.len(), before.len() + 1);
     assert!(after.iter().any(|a| a.0 == 205 && a.1 == "labels"));
