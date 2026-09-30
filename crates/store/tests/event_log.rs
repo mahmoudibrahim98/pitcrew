@@ -166,27 +166,81 @@ fn before_filters_by_type() {
 }
 
 #[test]
-fn filtered_before_uses_the_type_rev_index() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("store.db");
-    drop(Store::open(&path, StoreOptions::default()).expect("open"));
-    let conn = rusqlite::Connection::open(&path).expect("raw");
-    // The same shape as `before` with one type.
-    let plan: Vec<String> = conn
-        .prepare(
-            "EXPLAIN QUERY PLAN SELECT rev FROM events
-             WHERE rev < ?1 AND type IN (?2) ORDER BY rev DESC LIMIT ?3",
-        )
-        .expect("prepare")
-        .query_map(rusqlite::params![100, "task_moved", 10], |r| {
-            r.get::<_, String>(3)
+fn before_with_several_types_pages_in_order() {
+    let (_dir, store) = open();
+    let events = fixture_events();
+    store.append(&events).expect("append");
+
+    let a = event_type(&events[0].body).expect("type");
+    let b = event_type(&events[2].body).expect("type");
+    assert_ne!(a, b);
+    let expected: Vec<u64> = events
+        .iter()
+        .zip(1u64..)
+        .filter(|(e, _)| {
+            let t = event_type(&e.body).expect("type");
+            t == a || t == b
         })
-        .expect("query")
-        .collect::<rusqlite::Result<_>>()
-        .expect("rows");
-    let plan = plan.join("\n");
-    assert!(plan.contains("events_by_type_rev"), "{plan}");
-    assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        .map(|(_, rev)| rev)
+        .collect();
+    // A repeated type must not repeat rows.
+    let filter = EventFilter::default().types([a.clone(), b.clone(), a.clone()]);
+
+    // Page back two at a time and stitch the pages together.
+    let mut got = Vec::new();
+    let mut rev = u64::MAX;
+    loop {
+        let page = store.before(rev, 2, &filter).expect("before");
+        let Some(first) = page.first() else { break };
+        rev = first.rev;
+        let mut revs: Vec<u64> = page.iter().map(|e| e.rev).collect();
+        revs.append(&mut got);
+        got = revs;
+    }
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn append_new_stores_only_unknown_ids() {
+    let (_dir, store) = open();
+    let events = fixture_events();
+    let (e1, e2, e3) = (&events[0], &events[1], &events[2]);
+    store.append(&[e1.clone(), e2.clone()]).expect("append");
+
+    // A retry that differs from the original: e2 is stored, e3 is not.
+    let err = store
+        .append(&[e2.clone(), e3.clone()])
+        .expect_err("duplicate");
+    assert!(matches!(err, Error::DuplicateEvent { id } if id == e2.id));
+    assert_eq!(store.latest_rev().expect("rev"), 2);
+
+    let (range, skipped) = store
+        .append_new(&[e2.clone(), e3.clone(), e3.clone()])
+        .expect("append_new");
+    assert_eq!(
+        range,
+        RevRange {
+            from_rev: 3,
+            to_rev: 3
+        }
+    );
+    assert_eq!(skipped, vec![e2.id, e3.id]);
+    let stored: Vec<EventId> = store
+        .since(0, 10)
+        .expect("since")
+        .into_iter()
+        .map(|e| e.event.id)
+        .collect();
+    assert_eq!(stored, vec![e1.id, e2.id, e3.id]);
+
+    // All known: nothing appended, nobody told.
+    let mut rx = store.subscribe();
+    let (range, skipped) = store
+        .append_new(std::slice::from_ref(e1))
+        .expect("append_new");
+    assert!(range.is_empty());
+    assert_eq!(skipped, vec![e1.id]);
+    assert!(rx.try_recv().is_err());
 }
 
 #[test]

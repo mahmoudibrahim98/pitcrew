@@ -8,8 +8,11 @@ pub enum Error {
     /// SQLite reported an error.
     #[error("database error")]
     Database(#[source] DbError),
-    /// An appended event has an id that is already stored, or appears twice in the batch.
-    /// Nothing from the batch was appended. A runner retrying a batch can treat this as done.
+    /// An appended event has an id that is already stored, or appears twice in the batch. `id` is
+    /// the first such id; others may follow it. **Nothing from the batch was stored**, including
+    /// its new events. A caller retrying a batch must not treat this as done: drop the ids already
+    /// stored and append the rest, which [`Store::append_new`](crate::Store::append_new) does in
+    /// one transaction.
     #[error("event {id} is already in the log")]
     DuplicateEvent {
         /// The repeated id.

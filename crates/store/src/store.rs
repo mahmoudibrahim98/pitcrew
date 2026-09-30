@@ -3,6 +3,7 @@ use crate::migrations::{self, Migration};
 use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{EventId, MemberId, WorkspaceId};
 use rusqlite::{Connection, OpenFlags, Row, TransactionBehavior};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -160,22 +161,51 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`Error::DuplicateEvent`] if an event id is already stored (or repeated in `events`),
-    /// otherwise database or JSON errors. Nothing is appended then.
+    /// [`Error::DuplicateEvent`] if an event id is already stored or repeated in `events`,
+    /// otherwise database or JSON errors. Nothing is appended then. To retry a batch that may be
+    /// partly stored, use [`Store::append_new`].
     pub fn append(&self, events: &[Event]) -> Result<RevRange> {
+        Ok(self.append_inner(events, false)?.0)
+    }
+
+    /// Like [`Store::append`], but skips events whose id is already stored (or appears earlier in
+    /// `events`) instead of failing, all in one transaction. Returns the new revisions and the
+    /// skipped ids, in batch order. For a runner retrying a batch after an unknown outcome.
+    ///
+    /// # Errors
+    ///
+    /// Database or JSON errors; nothing is appended then.
+    pub fn append_new(&self, events: &[Event]) -> Result<(RevRange, Vec<EventId>)> {
+        self.append_inner(events, true)
+    }
+
+    fn append_inner(&self, events: &[Event], skip_known: bool) -> Result<(RevRange, Vec<EventId>)> {
+        if events.is_empty() {
+            return Ok((
+                RevRange {
+                    from_rev: 1,
+                    to_rev: 0,
+                },
+                Vec::new(),
+            ));
+        }
         let mut conn = self.conn();
         // IMMEDIATE takes the write lock up front. A deferred transaction would read first, and
         // WAL mode fails a read-to-write upgrade with SQLITE_BUSY at once, ignoring busy_timeout.
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let before = latest_rev(&tx)?;
+        let mut skipped = Vec::new();
         {
-            let mut insert = tx.prepare_cached(
+            let mut insert = tx.prepare_cached(if skip_known {
                 "INSERT INTO events (id, at, workspace, author, on_behalf_of, type, data)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            )?;
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT (id) DO NOTHING"
+            } else {
+                "INSERT INTO events (id, at, workspace, author, on_behalf_of, type, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
+            })?;
             for event in events {
                 let (kind, data) = encode_body(&event.body)?;
-                insert
+                let inserted = insert
                     .execute(rusqlite::params![
                         event.id.0.to_string(),
                         event.at,
@@ -186,6 +216,9 @@ impl Store {
                         data,
                     ])
                     .map_err(|e| duplicate_or(e, event.id))?;
+                if inserted == 0 {
+                    skipped.push(event.id);
+                }
             }
         }
         let after = latest_rev(&tx)?;
@@ -200,7 +233,7 @@ impl Store {
             let _ = self.revs.send(range);
         }
         drop(conn);
-        Ok(range)
+        Ok((range, skipped))
     }
 
     /// The newest revision, or 0 for an empty log.
@@ -237,22 +270,7 @@ impl Store {
     ///
     /// Database errors, or [`Error::Corrupt`] for a row that does not decode.
     pub fn before(&self, rev: u64, limit: usize, filter: &EventFilter) -> Result<Vec<StoredEvent>> {
-        let mut sql = String::from(
-            "SELECT rev, id, at, workspace, author, on_behalf_of, type, data
-             FROM events WHERE rev < ?",
-        );
-        let mut params: Vec<rusqlite::types::Value> = vec![to_sql_rev(rev).into()];
-        if let Some(types) = filter.types.as_ref().filter(|t| !t.is_empty()) {
-            sql.push_str(" AND type IN (");
-            for (i, t) in types.iter().enumerate() {
-                sql.push_str(if i == 0 { "?" } else { ", ?" });
-                params.push(t.clone().into());
-            }
-            sql.push(')');
-        }
-        sql.push_str(" ORDER BY rev DESC LIMIT ?");
-        params.push(to_limit(limit).into());
-
+        let (sql, params) = before_query(rev, limit, filter);
         let conn = self.conn();
         let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params), read_row)?;
@@ -261,9 +279,10 @@ impl Store {
         Ok(events)
     }
 
-    /// A receiver of the revision ranges appended from now on, in order and contiguous. A
-    /// receiver that falls more than `subscriber_capacity` ranges behind gets `Lagged` and should
-    /// catch up with [`Store::since`].
+    /// A receiver of the revision ranges appended through this `Store` from now on. When it is
+    /// the only writer to the file, the ranges are in order and contiguous. A receiver that falls
+    /// more than `subscriber_capacity` ranges behind gets `Lagged` and should catch up with
+    /// [`Store::since`].
     ///
     /// To start a stream without missing or repeating events: subscribe first, then read
     /// [`Store::latest_rev`] as `N` and send the history up to `N`, then forward received ranges,
@@ -311,17 +330,57 @@ fn set_wal(conn: &Connection, timeout: Duration) -> Result<String> {
                 if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
                     && std::time::Instant::now() < deadline =>
             {
-                std::thread::sleep(Duration::from_millis(5));
+                // 5-10 ms, jittered so racing openers do not retry in lockstep.
+                let jitter = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.subsec_nanos() % 5_000);
+                std::thread::sleep(Duration::from_micros(5_000 + u64::from(jitter)));
             }
             other => return Ok(other?),
         }
     }
 }
 
-/// The only unique column an insert sets is `events.id`, so a uniqueness failure is a duplicate.
+const EVENT_COLUMNS: &str = "rev, id, at, workspace, author, on_behalf_of, type, data";
+
+/// The SQL and parameters of [`Store::before`]. With types, one arm per type walks
+/// `events_by_type_rev` backwards and `UNION ALL ... ORDER BY` merges the arms, so a page reads
+/// about `limit` rows per type instead of sorting every match.
+fn before_query(
+    rev: u64,
+    limit: usize,
+    filter: &EventFilter,
+) -> (String, Vec<rusqlite::types::Value>) {
+    let rev = to_sql_rev(rev);
+    let types: BTreeSet<&str> = filter.types.iter().flatten().map(String::as_str).collect();
+    let mut params: Vec<rusqlite::types::Value> = Vec::new();
+    let mut sql = if types.is_empty() {
+        params.push(rev.into());
+        format!("SELECT {EVENT_COLUMNS} FROM events WHERE rev < ?")
+    } else {
+        let arms: Vec<String> = types
+            .into_iter()
+            .map(|t| {
+                params.push(t.to_owned().into());
+                params.push(rev.into());
+                format!("SELECT {EVENT_COLUMNS} FROM events WHERE type = ? AND rev < ?")
+            })
+            .collect();
+        arms.join(" UNION ALL ")
+    };
+    sql.push_str(" ORDER BY rev DESC LIMIT ?");
+    params.push(to_limit(limit).into());
+    (sql, params)
+}
+
+/// Maps a uniqueness failure on `events.id` to [`Error::DuplicateEvent`]; any other unique
+/// constraint (a later migration may add one) stays a database error.
 fn duplicate_or(e: rusqlite::Error, id: EventId) -> Error {
-    match e.sqlite_error() {
-        Some(f) if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE => {
+    match &e {
+        rusqlite::Error::SqliteFailure(f, Some(msg))
+            if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                && msg == "UNIQUE constraint failed: events.id" =>
+        {
             Error::DuplicateEvent { id }
         }
         _ => e.into(),
@@ -438,6 +497,57 @@ mod tests {
         // 1 is NORMAL.
         assert_eq!(pragma("synchronous"), "1");
         assert_eq!(pragma("foreign_keys"), "1");
+    }
+
+    fn plan(store: &Store, filter: &EventFilter) -> String {
+        let (sql, params) = before_query(100, 10, filter);
+        let conn = store.conn();
+        let mut stmt = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("prepare");
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params), |r| {
+                r.get::<_, String>(3)
+            })
+            .expect("query")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("rows");
+        rows.join("\n")
+    }
+
+    #[test]
+    fn filtered_before_walks_the_index_without_sorting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            Store::open(dir.path().join("store.db"), StoreOptions::default()).expect("open");
+        for filter in [
+            EventFilter::default().types(["task_moved"]),
+            EventFilter::default().types(["task_moved", "file_edited"]),
+            EventFilter::default().types(["task_moved", "file_edited", "ask_raised"]),
+        ] {
+            let plan = plan(&store, &filter);
+            assert!(plan.contains("events_by_type_rev"), "{plan}");
+            assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        }
+        let plan = plan(&store, &EventFilter::default());
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+    }
+
+    #[test]
+    fn other_unique_failures_are_not_duplicate_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store =
+            Store::open(dir.path().join("store.db"), StoreOptions::default()).expect("open");
+        let conn = store.conn();
+        conn.execute_batch("CREATE TABLE u (x INTEGER UNIQUE) STRICT; INSERT INTO u VALUES (1);")
+            .expect("setup");
+        let e = conn
+            .execute("INSERT INTO u VALUES (1)", [])
+            .expect_err("unique");
+        assert!(matches!(
+            duplicate_or(e, EventId::new()),
+            Error::Database(_)
+        ));
     }
 
     #[test]
