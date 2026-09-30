@@ -14,14 +14,18 @@
 mod common;
 
 use common::*;
-use std::io::Write as _;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const RUNS: usize = 200;
 const PAYLOAD: &str = r#"{"session_id":"00000000-0000-4000-8000-000000000000","transcript_path":"/work/example/session.jsonl","cwd":"/work/example","hook_event_name":"Stop","stop_hook_active":false}"#;
 
+/// Spawns the hook `RUNS` times. Its stdin is a file, so the measurement does not depend on this
+/// process being scheduled to write it.
 fn time_runs(env: &[(String, String)]) -> Vec<Duration> {
+    let tmp = tempfile::tempdir().unwrap();
+    let payload = tmp.path().join("payload.json");
+    std::fs::write(&payload, PAYLOAD).unwrap();
     let mut times = Vec::with_capacity(RUNS);
     for _ in 0..RUNS {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_pitcrew"));
@@ -36,14 +40,11 @@ fn time_runs(env: &[(String, String)]) -> Vec<Duration> {
             cmd.env_remove(var);
         }
         cmd.envs(env.iter().map(|(k, v)| (k, v)))
-            .stdin(Stdio::piped())
+            .stdin(std::fs::File::open(&payload).unwrap())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let started = Instant::now();
-        let mut child = cmd.spawn().unwrap();
-        // Without a token the hook exits before reading stdin, so the write may fail.
-        let _ = child.stdin.take().unwrap().write_all(PAYLOAD.as_bytes());
-        let status = child.wait().unwrap();
+        let status = cmd.status().unwrap();
         times.push(started.elapsed());
         assert!(status.success());
     }
