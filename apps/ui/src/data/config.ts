@@ -20,8 +20,13 @@ export function resolveToken(env: Env): string | undefined {
   return env.DEV ? env.VITE_PITCREW_TOKEN || DEV_TOKEN : undefined;
 }
 
-export const apiBaseUrl: string = resolveApi(import.meta.env);
-// The literal `import.meta.env.DEV` check lets the bundler drop the dev token from production code.
-export const apiToken: string | undefined = import.meta.env.DEV
-  ? resolveToken(import.meta.env)
-  : undefined;
+// Only the named keys: a bare `import.meta.env` would inline every VITE_* variable into the
+// bundle. The literal `import.meta.env.DEV` checks let the bundler drop the token from builds.
+const env: Env = {
+  DEV: import.meta.env.DEV,
+  VITE_PITCREW_API: import.meta.env.VITE_PITCREW_API,
+  VITE_PITCREW_TOKEN: import.meta.env.DEV ? import.meta.env.VITE_PITCREW_TOKEN : undefined,
+};
+
+export const apiBaseUrl: string = resolveApi(env);
+export const apiToken: string | undefined = import.meta.env.DEV ? resolveToken(env) : undefined;

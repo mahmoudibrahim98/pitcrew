@@ -1,10 +1,10 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { build, type ConfigEnv, type Rolldown, type UserConfig } from 'vite';
-import { afterEach, describe, expect, it } from 'vitest';
+import { build, type Rolldown } from 'vite';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { DEFAULT_API, DEV_TOKEN, resolveApi, resolveToken } from '../src/data/config.ts';
-import viteConfig from '../vite.config.ts';
-
-const configFor = viteConfig as (env: ConfigEnv) => UserConfig;
 
 describe('API config', () => {
   it('uses the dev token, or VITE_PITCREW_TOKEN, only in development', () => {
@@ -20,51 +20,56 @@ describe('API config', () => {
   });
 });
 
-describe('vite config', () => {
-  const saved = process.env.VITE_PITCREW_TOKEN;
+describe('builds', () => {
+  const root = fileURLToPath(new URL('..', import.meta.url));
+  const saved = { token: process.env.VITE_PITCREW_TOKEN, nodeEnv: process.env.NODE_ENV };
+  let envDir: string;
+
+  beforeEach(() => {
+    // An env folder of our own, so a developer's .env.local cannot change the outcome.
+    envDir = mkdtempSync(join(tmpdir(), 'pitcrew-env-'));
+    delete process.env.VITE_PITCREW_TOKEN;
+    // Vitest sets NODE_ENV=test, which would make every build a development build.
+    process.env.NODE_ENV = 'production';
+  });
 
   afterEach(() => {
-    if (saved === undefined) delete process.env.VITE_PITCREW_TOKEN;
-    else process.env.VITE_PITCREW_TOKEN = saved;
+    rmSync(envDir, { recursive: true, force: true });
+    if (saved.token === undefined) delete process.env.VITE_PITCREW_TOKEN;
+    else process.env.VITE_PITCREW_TOKEN = saved.token;
+    process.env.NODE_ENV = saved.nodeEnv;
   });
 
-  it('refuses a production build while VITE_PITCREW_TOKEN is set', () => {
+  const run = (mode: string) =>
+    build({ root, mode, envDir, logLevel: 'silent', build: { write: false } });
+
+  it.each(['production', 'staging', 'development'])(
+    'refuses a %s build while VITE_PITCREW_TOKEN is set in an .env file',
+    async (mode) => {
+      writeFileSync(join(envDir, '.env.local'), 'VITE_PITCREW_TOKEN=local-token\n');
+      await expect(run(mode)).rejects.toThrow(/VITE_PITCREW_TOKEN/);
+    },
+    60_000,
+  );
+
+  it('refuses a build while VITE_PITCREW_TOKEN is set in the shell', async () => {
     process.env.VITE_PITCREW_TOKEN = 'local-token';
-    expect(() => configFor({ mode: 'production', command: 'build' })).toThrow(/VITE_PITCREW_TOKEN/);
-    // Development may use it.
-    expect(() => configFor({ mode: 'development', command: 'serve' })).not.toThrow();
-  });
+    await expect(run('staging')).rejects.toThrow(/VITE_PITCREW_TOKEN/);
+  }, 60_000);
 
-  it('builds for production without it', () => {
-    delete process.env.VITE_PITCREW_TOKEN;
-    expect(configFor({ mode: 'production', command: 'build' }).build?.modulePreload).toEqual({ polyfill: false });
-  });
-});
-
-describe('production build', () => {
-  it('carries no token and no inline script', async () => {
-    delete process.env.VITE_PITCREW_TOKEN;
-    const root = fileURLToPath(new URL('..', import.meta.url));
-    // Vitest sets NODE_ENV=test, which would make this a development build.
-    const nodeEnv = process.env.NODE_ENV;
-    process.env.NODE_ENV = 'production';
-    let result: Awaited<ReturnType<typeof build>>;
-    try {
-      result = await build({ root, mode: 'production', logLevel: 'silent', build: { write: false } });
-    } finally {
-      process.env.NODE_ENV = nodeEnv;
-    }
+  it('builds with no token, no other env values and no inline script', async () => {
+    writeFileSync(join(envDir, '.env'), 'VITE_UNRELATED_SECRET=do-not-ship\n');
+    const result = await run('production');
     const outputs = (Array.isArray(result) ? result : [result]) as Rolldown.RolldownOutput[];
     const files = outputs.flatMap((o) => o.output);
-    const text = (name: string) => {
-      const file = files.find((f) => f.fileName === name);
-      if (file === undefined) throw new Error(`no ${name}`);
-      return file.type === 'chunk' ? file.code : String(file.source);
-    };
-    for (const chunk of files.filter((f) => f.type === 'chunk')) {
-      expect(chunk.type === 'chunk' && chunk.code.includes('dev-device-token')).toBe(false);
+    for (const file of files) {
+      if (file.type !== 'chunk') continue;
+      expect(file.code).not.toContain('dev-device-token');
+      expect(file.code).not.toContain('do-not-ship');
     }
-    const scripts = [...text('index.html').matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)];
+    const html = files.find((f) => f.fileName === 'index.html');
+    const source = html?.type === 'asset' ? String(html.source) : '';
+    const scripts = [...source.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)];
     expect(scripts.length).toBeGreaterThan(0);
     for (const [tag, body] of scripts) {
       expect(tag).toMatch(/\ssrc="/);
