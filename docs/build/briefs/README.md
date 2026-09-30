@@ -1,7 +1,7 @@
 # Briefs
 
-A brief is one agent's assignment: one stream, one branch, one goal. To start an agent, open a
-Claude Code session in this repository (or in a worktree of it) and say:
+A brief is one agent's assignment: one stream, one branch, one goal. The integrator creates a
+git worktree on the brief's branch, opens a Claude Code session in it, and says:
 
 > Follow `docs/build/briefs/<brief>.md`.
 
@@ -13,32 +13,25 @@ Claude Code session in this repository (or in a worktree of it) and say:
 | [H-listener-and-tokens](H-listener-and-tokens.md) | H · API and auth | `s/H/listener-and-tokens` | Opus-class | Ready |
 | [L-skeleton-and-data](L-skeleton-and-data.md) | L · UI foundation | `s/L/skeleton-and-data` | Opus-class | Ready |
 
-The integrator adds new briefs here as streams progress, and marks them done when merged.
+The branch name matters: CI's path guard reads the stream from it (`s/<stream>/<topic>`). The
+integrator adds new briefs here as streams progress, and marks them done when merged.
 
 ---
 
 Everything below applies to **every** brief. Read it before starting.
 
-## 1. Set up your workspace
+## 1. Check your workspace
 
-You work in **your own git worktree on your brief's branch**, never directly in the integrator's
-checkout of `main`.
+The integrator has already created your worktree on your brief's branch. **Do not create
+worktrees or branches, and do not switch branches.** Before any other work:
 
-1. Run `git rev-parse --show-toplevel` and `git branch --show-current`.
-2. **Already on your brief's branch?** A previous run started it. Read `git log main..HEAD` and
+1. `git branch --show-current` must print exactly the branch named in your brief.
+2. `git merge-base --is-ancestor main HEAD` must succeed (your branch starts from `main`).
+3. If `git log main..HEAD` shows commits, a previous run started this work: read them and
    continue from there.
-3. **In a worktree created for you** (the branch is neither `main` nor yours): rename the branch
-   with `git branch -m <your branch>`. Check it starts from `main`:
-   `git merge-base --is-ancestor main HEAD`.
-4. **In the integrator's checkout, on `main`:** create your worktree next to it and work only
-   there:
 
-   ```bash
-   git worktree add ../pitcrew-wt/<stream letter> -b <your branch> main
-   ```
-
-   Then run every command from inside that folder and edit only files under it. Never edit files
-   in the integrator's checkout.
+If the branch is wrong, or you are on `main`, **stop and tell the user**. Edit only files inside
+this worktree.
 
 ## 2. Environment
 
