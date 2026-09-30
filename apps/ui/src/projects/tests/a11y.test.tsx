@@ -6,7 +6,7 @@
 // shell's Playwright axe run in a real browser.
 //
 // `axe-core` is not a dependency of @pitcrew/ui yet (apps/ui/package.json belongs to stream L), so
-// it is loaded by name at run time and this suite is skipped, visibly, until it is installed.
+// it is loaded by name at run time; until it is installed the suite is skipped and a todo says why.
 
 import { fireEvent, screen, within } from '@testing-library/react';
 import type { ReactNode } from 'react';
@@ -33,7 +33,7 @@ const axe = await import(/* @vite-ignore */ AXE).then(
   (m: { default?: Axe } & Axe) => m.default ?? m,
   () => undefined,
 );
-if (axe === undefined) console.warn('axe-core is not installed; the accessibility suite is skipped.');
+if (axe === undefined) it.todo('accessibility (axe): add axe-core to @pitcrew/ui to run these checks');
 
 /**
  * The whole document, as axe sees it. Radix's focus guards are left out: they are invisible,

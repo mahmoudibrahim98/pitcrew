@@ -109,7 +109,8 @@ describe('Home', () => {
     const since = await screen.findByRole('region', { name: 'Since you last looked' });
     const changes = await within(since).findByRole('list', { name: 'Changes' });
     expect(within(changes).getAllByRole('listitem')).toHaveLength(10);
-    fireEvent.click(within(since).getByRole('button', { name: 'Mark all as seen' }));
+    // The button waits for the workspace id, which keys what was seen.
+    fireEvent.click(await within(since).findByRole('button', { name: 'Mark all as seen' }));
     await within(since).findByText('Nothing new since you last looked.');
     expect(JSON.parse(localStorage.getItem('pitcrew.projects.last-seen') ?? '{}')).toMatchObject({
       state: { byWorkspace: { '01JB000000000000000WSP0001': 15 } },

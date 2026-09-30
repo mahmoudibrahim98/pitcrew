@@ -50,4 +50,4 @@ corepack pnpm exec vitest run --dir src/projects
 
 The package's `test` script only includes `apps/ui/tests/**` (stream L's); it should also pick up
 `src/**/*.test.{ts,tsx}`. The axe suite (`tests/a11y.test.tsx`) needs `axe-core`, which is not a
-dependency yet; it is skipped, with a warning, until it is.
+dependency yet; until it is, the suite is skipped and reported as a todo.
