@@ -26,6 +26,8 @@ export interface StreamOptions {
   /** The hub's history is behind `since` (it was reset): drop cached state and refetch. */
   onReset(rev: number): void;
   onStatus?(status: StreamStatus): void;
+  /** A connection failed; `attempts` counts failures since the last stable connection. */
+  onFailure?(attempts: number): void;
   socket?: SocketFactory;
   /** Delay before reconnect attempt n is `min(maxMs, initialMs * 2^n)`, with jitter. */
   backoff?: { initialMs: number; maxMs: number };
@@ -66,6 +68,8 @@ export class StreamClient {
   readonly #options: StreamOptions;
   readonly #socketFactory: SocketFactory;
   #rev: number | undefined;
+  /** The hub's event log (`hello.log`); revisions only compare within one log. */
+  #log: string | undefined;
   #socket: SocketLike | undefined;
   #attempt = 0;
   #retryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -132,13 +136,18 @@ export class StreamClient {
 
   #handle(frame: StreamFrame, since: number | undefined): void {
     switch (frame.type) {
-      case 'hello':
+      case 'hello': {
         // A server that accepts and then drops us must not reset the back-off.
         this.#stableTimer = setTimeout(() => {
           this.#stableTimer = undefined;
           this.#attempt = 0;
         }, this.#options.stableMs ?? 5_000);
-        if (since !== undefined && since > frame.rev) {
+        // A different log is a different history (a restarted or replaced hub), even when its
+        // revision has already passed ours. Hubs that predate `log` send none.
+        const otherLog =
+          frame.log !== undefined && this.#log !== undefined && frame.log !== this.#log;
+        if (frame.log !== undefined) this.#log = frame.log;
+        if (otherLog || (since !== undefined && since > frame.rev)) {
           this.#rev = frame.rev;
           this.#setStatus('live');
           this.#options.onReset(frame.rev);
@@ -148,6 +157,7 @@ export class StreamClient {
         if (since === undefined) this.#rev = frame.rev;
         this.#setStatus('live');
         return;
+      }
       case 'events': {
         const rev = this.#rev ?? 0;
         if (frame.to_rev <= rev) return;
@@ -186,6 +196,7 @@ export class StreamClient {
     const jitter = 0.5 + (this.#options.random ?? Math.random)() * 0.5;
     this.#attempt += 1;
     this.#retryTimer = setTimeout(() => this.#connect(), ceiling * jitter);
+    this.#options.onFailure?.(this.#attempt);
   }
 
   /** Forgets the current socket so its late callbacks are ignored, and returns it. */

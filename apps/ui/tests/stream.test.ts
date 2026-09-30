@@ -182,6 +182,41 @@ describe('stream client timing', () => {
     stream.stop();
   });
 
+  it('resets when a restarted hub has another log, even if its rev is past ours', () => {
+    const resets: number[] = [];
+    const { factory, sockets } = fakeSockets();
+    const received: Event[] = [];
+    const stream = new StreamClient({
+      baseUrl: 'http://127.0.0.1:47317',
+      socket: factory,
+      onEvents: (events) => received.push(...events),
+      onReset: (rev) => resets.push(rev),
+      backoff: { initialMs: 100, maxMs: 100 },
+      random: () => 1,
+    });
+    stream.start();
+    sockets[0]?.send({ type: 'hello', rev: 5, log: 'LOG-A' });
+    sockets[0]?.send({ type: 'events', from_rev: 6, to_rev: 7, events: [taskMoved('E6'), taskMoved('E7')] });
+
+    // Same log after a reconnect: resume, no reset.
+    sockets[0]?.drop();
+    vi.advanceTimersByTime(100);
+    expect(sockets[1]?.url).toContain('since=7');
+    sockets[1]?.send({ type: 'hello', rev: 7, log: 'LOG-A' });
+    expect(resets).toEqual([]);
+
+    // Another log whose rev (30) is already past our since (7).
+    sockets[1]?.drop();
+    vi.advanceTimersByTime(100);
+    sockets[2]?.send({ type: 'hello', rev: 30, log: 'LOG-B' });
+    // The hub replays "missed" events from the new log; they must not be applied.
+    sockets[2]?.send({ type: 'events', from_rev: 8, to_rev: 30, events: [taskMoved('X8')] });
+    expect(resets).toEqual([30]);
+    expect(stream.rev).toBe(30);
+    expect(received.map((e) => e.id)).toEqual(['E6', 'E7']);
+    stream.stop();
+  });
+
   it('keeps backing off when a server accepts and then drops the connection', () => {
     const { stream, sockets } = setup();
     stream.start();

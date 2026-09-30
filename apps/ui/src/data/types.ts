@@ -306,7 +306,7 @@ export interface ApiErrorBody {
 }
 
 export type StreamFrame =
-  | { type: 'hello'; rev: number }
+  | { type: 'hello'; rev: number; log: string }
   | { type: 'events'; from_rev: number; to_rev: number; events: Event[] }
   | { type: 'ping'; at: TimestampMs };
 
