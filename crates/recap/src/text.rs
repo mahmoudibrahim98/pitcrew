@@ -86,7 +86,9 @@ pub(crate) fn clean_tail(s: &str, max: usize) -> String {
         return String::new();
     }
     // Only the last few bytes can matter; start at a character boundary.
-    let mut start = s.len().saturating_sub(max.saturating_mul(4).saturating_add(64));
+    let mut start = s
+        .len()
+        .saturating_sub(max.saturating_mul(4).saturating_add(64));
     while start < s.len() && !s.is_char_boundary(start) {
         start += 1;
     }
@@ -107,6 +109,19 @@ pub(crate) fn clean_tail(s: &str, max: usize) -> String {
     } else {
         chars.into_iter().collect()
     }
+}
+
+/// The first `max` characters of `s`, without copying.
+pub(crate) fn prefix(s: &str, max: usize) -> &str {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => s.get(..i).unwrap_or(s),
+        None => s,
+    }
+}
+
+/// Whether a path can be kept as it is: short, with nothing [`clean_tail`] would change.
+pub(crate) fn is_plain_path(s: &str) -> bool {
+    s.len() <= PATH_CHARS && !s.chars().any(|c| c.is_control() || is_hidden(c))
 }
 
 /// The last component of a path, for prose.
@@ -134,6 +149,16 @@ pub(crate) fn receipt_ok(r: &Receipt) -> bool {
     }
 }
 
+/// Pushes onto a vector that is usually tiny, growing it from one element instead of four. Most
+/// blocks hold one or two of each thing, and a block's size is what bounds how fast many of them
+/// can be built.
+pub(crate) fn push_small<T>(list: &mut Vec<T>, item: T) {
+    if list.len() == list.capacity() {
+        list.reserve_exact(list.len().max(1));
+    }
+    list.push(item);
+}
+
 /// Appends receipts that are new to `list`, keeping the first `cap`.
 pub(crate) fn push_first<'a>(
     list: &mut Vec<Receipt>,
@@ -145,7 +170,7 @@ pub(crate) fn push_first<'a>(
             break;
         }
         if receipt_ok(r) && !list.contains(r) {
-            list.push(r.clone());
+            push_small(list, r.clone());
         }
     }
 }
@@ -172,7 +197,9 @@ pub(crate) fn push_latest<'a>(
     }
     let keep = (cap - fresh.len()).min(list.len());
     list.truncate(keep);
-    list.extend(fresh);
+    for r in fresh {
+        push_small(list, r);
+    }
 }
 
 #[cfg(test)]
@@ -202,6 +229,21 @@ mod tests {
         assert_eq!(clean_tail("é".repeat(500).as_str(), 3), "…éé");
         assert_eq!(clean_tail("a\u{202E}b\nc", 10), "ab c");
         assert_eq!(clean_tail("abc", 0), "");
+    }
+
+    #[test]
+    fn prefix_and_plain_paths() {
+        assert_eq!(prefix("héllo", 2), "hé");
+        assert_eq!(prefix("hi", 5), "hi");
+        assert_eq!(prefix("hi", 0), "");
+        assert!(is_plain_path("paper/method.tex"));
+        assert!(!is_plain_path("a\u{202E}b"));
+        assert!(!is_plain_path(&"x".repeat(PATH_CHARS + 1)));
+        // A plain path is kept exactly as clean_tail would keep it.
+        assert_eq!(
+            clean_tail("paper/method.tex", PATH_CHARS),
+            "paper/method.tex"
+        );
     }
 
     #[test]

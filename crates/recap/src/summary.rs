@@ -265,7 +265,9 @@ impl Summarizer for FakeSummarizer {
     fn summarize(&self, draft: &Draft) -> Result<Summary, SummaryError> {
         self.calls.fetch_add(1, Ordering::Relaxed);
         if self.fail {
-            return Err(SummaryError::Unavailable("fake summarizer set to fail".into()));
+            return Err(SummaryError::Unavailable(
+                "fake summarizer set to fail".into(),
+            ));
         }
         let mut w = Writer::default();
         w.sep("fake: ");

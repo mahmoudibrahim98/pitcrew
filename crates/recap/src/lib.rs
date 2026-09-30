@@ -32,6 +32,7 @@ mod checks;
 mod day;
 mod directory;
 mod draft;
+mod hash;
 mod summary;
 mod text;
 mod time;
@@ -43,8 +44,8 @@ pub use day::{Day, DayRecap, block_line, day_recaps, days};
 pub use directory::Directory;
 pub use draft::{draft_line, draft_paragraph};
 pub use summary::{
-    Clause, Draft, DraftKind, FakeSummarizer, RuleSummarizer, Sentence, Span, Summarizer,
-    Summary, SummaryError, verify,
+    Clause, Draft, DraftKind, FakeSummarizer, RuleSummarizer, Sentence, Span, Summarizer, Summary,
+    SummaryError, verify,
 };
 pub use time::date_of;
 

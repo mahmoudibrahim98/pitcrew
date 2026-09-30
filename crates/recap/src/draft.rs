@@ -58,10 +58,7 @@ pub fn draft_paragraph(blocks: &[&Block], directory: &Directory) -> Draft {
         let receipts = block_ids(rest);
         sentences.push(Sentence {
             clauses: vec![Clause {
-                text: format!(
-                    "{} more",
-                    plural(rest.len(), "burst of work", "bursts of work")
-                ),
+                text: plural(rest.len(), "more burst of work", "more bursts of work"),
                 receipts,
             }],
         });
@@ -100,7 +97,7 @@ fn block_clauses(block: &Block, dir: &Directory, detail: Detail) -> Vec<Clause> 
         receipts,
     }));
     if block.counts.tools_run > 0 && !block.tool_receipts.is_empty() {
-        let tools = plural64(u64::from(block.counts.tools_run), "tool", "tools");
+        let tools = counted(u64::from(block.counts.tools_run), "a tool", "tools");
         let text = match block.counts.tools_failed {
             0 => format!("ran {tools}"),
             f => format!("ran {tools} ({f} failed)"),
@@ -116,7 +113,7 @@ fn block_clauses(block: &Block, dir: &Directory, detail: Detail) -> Vec<Clause> 
             actor: worker,
             text: format!(
                 "finished {}",
-                plural64(u64::from(block.counts.turns), "turn", "turns")
+                counted(u64::from(block.counts.turns), "a turn", "turns")
             ),
             receipts: block.turn_receipts.clone(),
         });
@@ -249,10 +246,7 @@ fn totals(blocks: &[&Block]) -> Sentence {
 }
 
 fn sum(blocks: &[&Block], f: impl Fn(&Block) -> u64) -> u64 {
-    blocks
-        .iter()
-        .map(|&b| f(b))
-        .fold(0u64, u64::saturating_add)
+    blocks.iter().map(|&b| f(b)).fold(0u64, u64::saturating_add)
 }
 
 /// Receipts picked from each block, the first few overall.
@@ -346,7 +340,10 @@ impl Names<'_> {
     }
 
     fn workstream(&self, id: WorkstreamId) -> String {
-        self.0.workstream_name(id).unwrap_or("a workstream").to_owned()
+        self.0
+            .workstream_name(id)
+            .unwrap_or("a workstream")
+            .to_owned()
     }
 
     fn list(&self, ids: &[MemberId]) -> String {
@@ -410,7 +407,10 @@ fn fact_text(fact: &Fact, n: &Names<'_>, detail: Detail) -> String {
             None => format!("unassigned {}", n.task(*task)),
         },
         FactKind::PlanUpdated { task, done, total } => {
-            format!("updated the plan for {} ({done} of {total} done)", n.task(*task))
+            format!(
+                "updated the plan for {} ({done} of {total} done)",
+                n.task(*task)
+            )
         }
         FactKind::Checks {
             check,
@@ -437,7 +437,10 @@ fn fact_text(fact: &Fact, n: &Names<'_>, detail: Detail) -> String {
             more => format!("{} jobs diverged", more.len()),
         },
         FactKind::AskRaised {
-            ask_kind, to, title, ..
+            ask_kind,
+            to,
+            title,
+            ..
         } => {
             let to = n.member(*to);
             let base = match ask_kind {
@@ -547,6 +550,15 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 fn plural64(n: u64, one: &str, many: &str) -> String {
     if n == 1 {
         format!("1 {one}")
+    } else {
+        format!("{n} {many}")
+    }
+}
+
+/// Like [`plural64`], but `one` is said in full ("a tool").
+fn counted(n: u64, one: &str, many: &str) -> String {
+    if n == 1 {
+        one.to_owned()
     } else {
         format!("{n} {many}")
     }

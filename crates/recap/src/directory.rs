@@ -3,13 +3,13 @@
 //! event log is usually read from a recent point, not from the start) and kept current from
 //! events.
 
+use crate::hash::IdMap;
 use crate::text::{NAME_CHARS, clean};
 use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{
     AskId, DispatchId, MemberId, ProjectId, SessionId, TaskId, WorkstreamId,
 };
 use pitcrew_protocol::model::{Ask, AskKind, Dispatch, Member, Session, Task, Workstream};
-use std::collections::HashMap;
 use std::hash::Hash;
 
 /// Most entries kept per kind. Ids come from untrusted events; past this, new ones are ignored.
@@ -53,23 +53,23 @@ pub(crate) struct AskInfo {
 /// `add_*` methods; the block builder then keeps it current with [`Directory::observe`].
 #[derive(Clone, Debug, Default)]
 pub struct Directory {
-    members: HashMap<MemberId, String>,
-    sessions: HashMap<SessionId, SessionInfo>,
-    tasks: HashMap<TaskId, TaskInfo>,
-    task_sessions: HashMap<TaskId, SessionId>,
-    workstreams: HashMap<WorkstreamId, WorkstreamInfo>,
-    dispatches: HashMap<DispatchId, DispatchInfo>,
-    asks: HashMap<AskId, AskInfo>,
+    members: IdMap<MemberId, String>,
+    sessions: IdMap<SessionId, SessionInfo>,
+    tasks: IdMap<TaskId, TaskInfo>,
+    task_sessions: IdMap<TaskId, SessionId>,
+    workstreams: IdMap<WorkstreamId, WorkstreamInfo>,
+    dispatches: IdMap<DispatchId, DispatchInfo>,
+    asks: IdMap<AskId, AskInfo>,
 }
 
-fn put<K: Hash + Eq, V>(map: &mut HashMap<K, V>, key: K, value: V) {
+fn put<K: Hash + Eq, V>(map: &mut IdMap<K, V>, key: K, value: V) {
     if map.len() < MAX_ENTRIES || map.contains_key(&key) {
         map.insert(key, value);
     }
 }
 
 fn session_entry(
-    map: &mut HashMap<SessionId, SessionInfo>,
+    map: &mut IdMap<SessionId, SessionInfo>,
     id: SessionId,
 ) -> Option<&mut SessionInfo> {
     if map.len() < MAX_ENTRIES || map.contains_key(&id) {

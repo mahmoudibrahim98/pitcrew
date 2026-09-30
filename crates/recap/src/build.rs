@@ -16,21 +16,23 @@
 use crate::block::{Block, BlockKey, Config, Counts, Fact, FactKind, FileTouch};
 use crate::checks::{classify, mentions_divergence};
 use crate::directory::Directory;
+use crate::hash::IdMap;
 use crate::text::{
-    JOB_CHARS, PATH_CHARS, TITLE_CHARS, clean, clean_tail, push_first, push_latest,
+    JOB_CHARS, PATH_CHARS, TITLE_CHARS, clean, clean_tail, is_plain_path, push_first, push_latest,
+    push_small,
 };
 use pitcrew_protocol::events::{Event, EventBody};
-use pitcrew_protocol::ids::{MemberId, SessionId, TaskId};
-use pitcrew_protocol::model::{
-    BriefTarget, Receipt, SessionState, TaskStatus, TimestampMs,
-};
-use std::collections::{BTreeSet, HashMap};
+use pitcrew_protocol::ids::{EventId, MemberId, SessionId, TaskId};
+use pitcrew_protocol::model::{BriefTarget, Receipt, SessionState, TaskStatus, TimestampMs};
+use std::collections::BTreeSet;
 
 /// Builds the blocks for a run of events in log order. `directory` is what was known before the
 /// first event; it is updated from the events as they are read.
 #[must_use]
 pub fn blocks(events: &[Event], directory: &Directory, config: &Config) -> Vec<Block> {
     let mut builder = BlockBuilder::new(config.clone(), directory.clone());
+    // Nobody asks this builder for changes.
+    builder.track = false;
     for event in events {
         builder.push(event);
     }
@@ -51,11 +53,13 @@ pub struct BlockChanges {
 pub struct BlockBuilder {
     config: Config,
     directory: Directory,
-    open: HashMap<BlockKey, Block>,
+    open: IdMap<BlockKey, Block>,
     /// `(end, key)` of every open block, oldest first, to find blocks to close.
     idle: BTreeSet<(TimestampMs, BlockKey)>,
     closed: Vec<Block>,
     touched: BTreeSet<BlockKey>,
+    /// Whether to record which open blocks changed, for [`BlockBuilder::take_changes`].
+    track: bool,
     skipped: u64,
 }
 
@@ -78,10 +82,11 @@ impl BlockBuilder {
         Self {
             config: config.normalized(),
             directory,
-            open: HashMap::new(),
+            open: IdMap::default(),
             idle: BTreeSet::new(),
             closed: Vec::new(),
             touched: BTreeSet::new(),
+            track: true,
             skipped: 0,
         }
     }
@@ -125,7 +130,9 @@ impl BlockBuilder {
                 self.idle.insert((block.end, key));
             }
         }
-        self.touched.insert(key);
+        if self.track {
+            self.touched.insert(key);
+        }
     }
 
     /// Adds a batch of events and returns what changed.
@@ -287,8 +294,29 @@ impl BlockBuilder {
     }
 }
 
+/// Sorts blocks by start, then id, keeping the given order for ties. Blocks are large, so this
+/// sorts their positions and then swaps each block into place along the permutation's cycles.
 fn sort(blocks: &mut [Block]) {
-    blocks.sort_by(|a, b| (a.start, a.id).cmp(&(b.start, b.id)));
+    let mut keys: Vec<(TimestampMs, EventId, usize)> = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.start, b.id, i))
+        .collect();
+    keys.sort_unstable();
+    // `from[k]` is the current position of the block that belongs at `k`.
+    let mut from: Vec<usize> = keys.into_iter().map(|(_, _, i)| i).collect();
+    for start in 0..from.len() {
+        let mut here = start;
+        loop {
+            let src = from[here];
+            from[here] = here;
+            if src == start || src == here {
+                break;
+            }
+            blocks.swap(here, src);
+            here = src;
+        }
+    }
 }
 
 fn new_block(key: BlockKey, event: &Event) -> Block {
@@ -325,7 +353,7 @@ fn inc(n: &mut u32) {
 
 fn push_unique<T: PartialEq + Copy>(list: &mut Vec<T>, item: T, cap: usize) {
     if list.len() < cap && !list.contains(&item) {
-        list.push(item);
+        push_small(list, item);
     }
 }
 
@@ -335,12 +363,24 @@ fn clamp_u32(n: usize) -> u32 {
 
 /// Adds one event to its block.
 fn apply(block: &mut Block, event: &Event, task: Option<TaskId>, dir: &Directory, cfg: &Config) {
+    // Links change only with a block's first event, a task's event, or an event that relinks the
+    // session; skipping the lookups otherwise keeps tool runs and edits cheap.
+    let relink = block.counts.events == 0
+        || task.is_some()
+        || matches!(
+            event.body,
+            EventBody::SessionLinked { .. }
+                | EventBody::SessionDiscovered { .. }
+                | EventBody::DispatchStarted { .. }
+        );
     inc(&mut block.counts.events);
     block.last = event.id;
     block.start = block.start.min(event.at);
     block.end = block.end.max(event.at);
     push_unique(&mut block.actors, event.author, cfg.max_actors);
-    link(block, task, dir, cfg);
+    if relink {
+        link(block, task, dir, cfg);
+    }
 
     let ev = Receipt::Event { id: event.id };
     let mut facts = Facts {
@@ -386,7 +426,7 @@ fn apply(block: &mut Block, event: &Event, task: Option<TaskId>, dir: &Directory
             let b = &mut *facts.block;
             b.agent = b.agent.or(Some(event.author));
             inc(&mut b.counts.turns);
-            push_first(&mut b.turn_receipts, [receipt], cfg.max_receipts);
+            push_first(&mut b.turn_receipts, [&ev, receipt], cfg.max_receipts);
         }
         EventBody::SessionDiscovered { session } => facts.add(
             FactKind::SessionStarted {
@@ -487,15 +527,7 @@ fn apply(block: &mut Block, event: &Event, task: Option<TaskId>, dir: &Directory
             inc(&mut facts.block.counts.asks_raised);
             let mut evidence: Vec<&Receipt> = vec![&ev];
             evidence.extend(ask.receipts.iter().take(cfg.max_receipts));
-            facts.add(
-                FactKind::AskRaised {
-                    ask: ask.id,
-                    ask_kind: ask.kind,
-                    to: ask.to,
-                    title: clean(&ask.title, TITLE_CHARS),
-                },
-                &evidence,
-            );
+            // The divergence comes first: it is why the ask was raised.
             if mentions_divergence(&ask.title) || mentions_divergence(&ask.body) {
                 let jobs: Vec<String> = ask
                     .receipts
@@ -507,6 +539,15 @@ fn apply(block: &mut Block, event: &Event, task: Option<TaskId>, dir: &Directory
                     .collect();
                 facts.diverged(&jobs, &evidence);
             }
+            facts.add(
+                FactKind::AskRaised {
+                    ask: ask.id,
+                    ask_kind: ask.kind,
+                    to: ask.to,
+                    title: clean(&ask.title, TITLE_CHARS),
+                },
+                &evidence,
+            );
         }
         EventBody::AskAnswered { ask, .. } => {
             inc(&mut facts.block.counts.asks_answered);
@@ -612,20 +653,30 @@ fn edit_file(block: &mut Block, path: &str, added: u32, removed: u32, ev: &Recei
     inc(&mut c.file_edits);
     c.lines_added = c.lines_added.saturating_add(u64::from(added));
     c.lines_removed = c.lines_removed.saturating_add(u64::from(removed));
-    let path = clean_tail(path, PATH_CHARS);
+    // Most paths are already clean; only copy the ones that are kept.
+    let cleaned;
+    let path = if is_plain_path(path) {
+        path
+    } else {
+        cleaned = clean_tail(path, PATH_CHARS);
+        cleaned.as_str()
+    };
     if let Some(file) = block.files.iter_mut().find(|f| f.path == path) {
         inc(&mut file.edits);
         file.added = file.added.saturating_add(u64::from(added));
         file.removed = file.removed.saturating_add(u64::from(removed));
         push_latest(&mut file.receipts, [ev], cfg.max_receipts);
     } else if block.files.len() < cfg.max_files {
-        block.files.push(FileTouch {
-            path,
-            edits: 1,
-            added: u64::from(added),
-            removed: u64::from(removed),
-            receipts: vec![ev.clone()],
-        });
+        push_small(
+            &mut block.files,
+            FileTouch {
+                path: path.to_owned(),
+                edits: 1,
+                added: u64::from(added),
+                removed: u64::from(removed),
+                receipts: vec![ev.clone()],
+            },
+        );
     } else {
         inc(&mut block.files_omitted);
     }
@@ -646,14 +697,21 @@ impl Facts<'_> {
             inc(&mut self.block.facts_omitted);
             return;
         }
-        let mut receipts = Vec::new();
-        push_first(&mut receipts, evidence.iter().copied(), self.cfg.max_receipts);
-        self.block.facts.push(Fact {
-            by: self.by,
-            at: self.at,
-            kind,
-            receipts,
-        });
+        let mut receipts = Vec::with_capacity(evidence.len().min(self.cfg.max_receipts));
+        push_first(
+            &mut receipts,
+            evidence.iter().copied(),
+            self.cfg.max_receipts,
+        );
+        push_small(
+            &mut self.block.facts,
+            Fact {
+                by: self.by,
+                at: self.at,
+                kind,
+                receipts,
+            },
+        );
     }
 
     /// Replaces the fact that `same` matches with `kind`, keeping its first receipts and adding
@@ -661,7 +719,11 @@ impl Facts<'_> {
     fn merge(&mut self, same: impl Fn(&FactKind) -> bool, kind: FactKind, evidence: &[&Receipt]) {
         if let Some(fact) = self.block.facts.iter_mut().find(|f| same(&f.kind)) {
             fact.kind = kind;
-            push_latest(&mut fact.receipts, evidence.iter().copied(), self.cfg.max_receipts);
+            push_latest(
+                &mut fact.receipts,
+                evidence.iter().copied(),
+                self.cfg.max_receipts,
+            );
         } else {
             self.add(kind, evidence);
         }

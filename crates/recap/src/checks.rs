@@ -1,8 +1,8 @@
 //! Rules that read tool runs and text: which commands are checks (tests, builds, lint), and which
 //! texts report a diverged job. They are plain keyword rules over untrusted text, so they only
-//! ever look at a bounded prefix and never fail.
+//! ever look at a bounded prefix, never allocate and never fail.
 
-use crate::text::TARGET_CHARS;
+use crate::text::{TARGET_CHARS, basename, prefix};
 use serde::{Deserialize, Serialize};
 
 /// A kind of check a command runs. The order is the strength used for command chains.
@@ -15,14 +15,6 @@ pub enum Check {
     Lint,
     /// A build or compile, e.g. `cargo build` or `latexmk`.
     Build,
-}
-
-/// Tools whose target is a shell command.
-fn is_shell_tool(tool: &str) -> bool {
-    let t = tool.to_ascii_lowercase();
-    ["bash", "shell", "exec", "command", "terminal", "powershell", "cmd"]
-        .iter()
-        .any(|k| t.contains(k))
 }
 
 /// Programs that are test runners on their own.
@@ -51,34 +43,73 @@ const RUNNERS: &[&str] = &[
 ];
 const LINT_WORDS: &[&str] = &["clippy", "lint", "eslint", "ruff", "mypy", "vet"];
 const BUILD_WORDS: &[&str] = &["build", "check", "compile"];
+/// Words in a tool's name that mark it as running shell commands.
+const SHELL_TOOLS: &[&str] = &[
+    "bash",
+    "shell",
+    "exec",
+    "command",
+    "terminal",
+    "powershell",
+    "cmd",
+];
+
+/// Whether `hay` contains `needle`, ignoring ASCII case.
+fn contains_ci(hay: &str, needle: &str) -> bool {
+    let (h, n) = (hay.as_bytes(), needle.as_bytes());
+    n.is_empty() || h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
+fn is_one_of(word: &str, list: &[&str]) -> bool {
+    list.iter().any(|w| word.eq_ignore_ascii_case(w))
+}
+
+fn strip_exe(program: &str) -> &str {
+    let cut = program.len().saturating_sub(4);
+    match program.get(cut..) {
+        Some(ext) if ext.eq_ignore_ascii_case(".exe") => program.get(..cut).unwrap_or(program),
+        _ => program,
+    }
+}
+
+/// The stronger of two findings.
+fn strongest(a: Option<Check>, b: Option<Check>) -> Option<Check> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
 
 /// Classifies one shell command, e.g. `RUST_LOG=1 cargo test -p x`.
 fn classify_command(cmd: &str) -> Option<Check> {
     let mut words = cmd
         .split_whitespace()
         .skip_while(|w| w.contains('=') && !w.starts_with('-'));
-    let program = words.next()?;
-    let program = crate::text::basename(program).to_ascii_lowercase();
-    let program = program.strip_suffix(".exe").unwrap_or(&program);
-    if TEST_PROGRAMS.contains(&program) {
+    let program = strip_exe(basename(words.next()?));
+    if is_one_of(program, TEST_PROGRAMS) {
         return Some(Check::Tests);
     }
-    if LINT_PROGRAMS.contains(&program) {
+    if is_one_of(program, LINT_PROGRAMS) {
         return Some(Check::Lint);
     }
-    if RUNNERS.contains(&program) {
-        let rest: Vec<String> = words.take(4).map(str::to_ascii_lowercase).collect();
-        if rest.iter().any(|w| w.contains("test")) {
-            return Some(Check::Tests);
-        }
-        if rest.iter().any(|w| LINT_WORDS.contains(&w.as_str())) {
-            return Some(Check::Lint);
-        }
-        if rest.iter().any(|w| BUILD_WORDS.contains(&w.as_str())) {
-            return Some(Check::Build);
+    if is_one_of(program, RUNNERS) {
+        let found = words.take(4).fold(None, |found, w| {
+            let this = if contains_ci(w, "test") {
+                Some(Check::Tests)
+            } else if is_one_of(w, LINT_WORDS) {
+                Some(Check::Lint)
+            } else if is_one_of(w, BUILD_WORDS) {
+                Some(Check::Build)
+            } else {
+                None
+            };
+            strongest(found, this)
+        });
+        if found.is_some() {
+            return found;
         }
     }
-    BUILD_PROGRAMS.contains(&program).then_some(Check::Build)
+    is_one_of(program, BUILD_PROGRAMS).then_some(Check::Build)
 }
 
 /// Which check a tool run is, if any. Only shell-like tools count, and a chain such as
@@ -86,11 +117,12 @@ fn classify_command(cmd: &str) -> Option<Check> {
 /// build).
 #[must_use]
 pub fn classify(tool: &str, target: &str) -> Option<Check> {
-    if !is_shell_tool(tool) {
+    let tool = prefix(tool, 64);
+    if !SHELL_TOOLS.iter().any(|k| contains_ci(tool, k)) {
         return None;
     }
-    let head: String = target.chars().take(TARGET_CHARS).collect();
-    head.split(['&', ';', '|', '\n'])
+    prefix(target, TARGET_CHARS)
+        .split(['&', ';', '|', '\n'])
         .filter_map(classify_command)
         .min()
 }
@@ -99,12 +131,12 @@ pub fn classify(tool: &str, target: &str) -> Option<Check> {
 /// NaN".
 #[must_use]
 pub fn mentions_divergence(text: &str) -> bool {
-    let head: String = text.chars().take(TARGET_CHARS * 2).collect();
-    head.split(|c: char| !c.is_alphanumeric()).any(|w| {
-        w.eq_ignore_ascii_case("nan")
-            || w.get(..6)
-                .is_some_and(|p| p.eq_ignore_ascii_case("diverg"))
-    })
+    prefix(text, TARGET_CHARS * 2)
+        .split(|c: char| !c.is_alphanumeric())
+        .any(|w| {
+            w.eq_ignore_ascii_case("nan")
+                || w.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("diverg"))
+        })
 }
 
 #[cfg(test)]
@@ -118,6 +150,7 @@ mod tests {
         assert_eq!(c("RUST_LOG=debug cargo test"), Some(Check::Tests));
         assert_eq!(c("python -m pytest tests/"), Some(Check::Tests));
         assert_eq!(c("/usr/bin/pytest -x"), Some(Check::Tests));
+        assert_eq!(c("C:\\tools\\PYTEST.EXE"), Some(Check::Tests));
         assert_eq!(c("npm test"), Some(Check::Tests));
         assert_eq!(c("go test ./..."), Some(Check::Tests));
         assert_eq!(c("cargo clippy --all-targets"), Some(Check::Lint));
@@ -128,13 +161,16 @@ mod tests {
         assert_eq!(c("make"), Some(Check::Build));
         assert_eq!(c("make test"), Some(Check::Tests));
         assert_eq!(c("cd paper && latexmk && cargo test"), Some(Check::Tests));
+        assert_eq!(c("cargo build && cargo clippy"), Some(Check::Lint));
         assert_eq!(c("grep -r test src"), None);
         assert_eq!(c("git commit -m 'fix test'"), None);
         assert_eq!(c("git checkout main"), None);
         assert_eq!(c("squeue --me"), None);
         assert_eq!(c(""), None);
+        assert_eq!(c(".exe"), None);
         assert_eq!(classify("Read", "tests/foo.rs"), None);
         assert_eq!(classify("exec_command", "pytest"), Some(Check::Tests));
+        assert_eq!(classify("", "pytest"), None);
     }
 
     #[test]
@@ -146,6 +182,7 @@ mod tests {
         assert!(mentions_divergence("DIVERGENCE detected"));
         assert!(!mentions_divergence("5 jobs: 4 running, 1 failed"));
         assert!(!mentions_divergence("nanoseconds and financial"));
+        assert!(!mentions_divergence("\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}"));
         assert!(!mentions_divergence(""));
     }
 }

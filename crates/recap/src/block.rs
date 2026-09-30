@@ -1,9 +1,7 @@
 //! Activity blocks: bursts of work, each with what changed and receipts.
 
 use crate::checks::Check;
-use pitcrew_protocol::ids::{
-    AskId, EventId, MemberId, ProjectId, SessionId, TaskId, WorkstreamId,
-};
+use pitcrew_protocol::ids::{AskId, EventId, MemberId, ProjectId, SessionId, TaskId, WorkstreamId};
 use pitcrew_protocol::model::{
     AskKind, BriefTarget, DispatchOutcome, Health, Receipt, TaskStatus, TimestampMs,
     WorkstreamStatus,
