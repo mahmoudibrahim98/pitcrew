@@ -5,7 +5,15 @@ import { cleanup, fireEvent, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ChatView } from '../chat-view.tsx';
 import { Composer } from '../composer.tsx';
-import { ID, renderWithHub, startHub, stubLayout, type HubProcess, type Logged } from './harness.tsx';
+import {
+  ID,
+  renderWithHub,
+  startHub,
+  stubLayout,
+  unmountAndSettle,
+  type HubProcess,
+  type Logged,
+} from './harness.tsx';
 
 const posts = (requests: Logged[], path: string) => requests.filter((r) => r.method === 'POST' && r.path === path);
 
@@ -27,7 +35,7 @@ describe('Composer against the mock hub', () => {
   });
 
   afterEach(async () => {
-    cleanup();
+    await unmountAndSettle();
     unstub();
     await hub?.close();
     hub = undefined;

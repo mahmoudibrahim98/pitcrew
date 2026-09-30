@@ -1,17 +1,23 @@
 // @vitest-environment happy-dom
 // @vitest-environment-options {"url": "http://localhost:5173/"}
 
-import { cleanup, fireEvent, screen, within } from '@testing-library/react';
+import { fireEvent, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Task, Workstream } from '../../data/index.ts';
 import { SessionHeader } from '../session-header.tsx';
-import { ID, renderWithHub, startHub, type HubProcess } from './harness.tsx';
+import {
+  ID,
+  renderWithHub,
+  startHub,
+  unmountAndSettle,
+  type HubProcess,
+} from './harness.tsx';
 
 describe('SessionHeader against the mock hub', () => {
   let hub: HubProcess | undefined;
 
   afterEach(async () => {
-    cleanup();
+    await unmountAndSettle();
     await hub?.close();
     hub = undefined;
   });

@@ -8,7 +8,16 @@ import type { Project, Session, Workstream } from '../../data/index.ts';
 import { NO_FACETS, type SessionFacets } from '../facets.ts';
 import { SessionFilters } from '../session-filters.tsx';
 import { SessionList, SessionListView } from '../session-list.tsx';
-import { ID, otherClient, renderWithHub, scrollTo, startHub, stubLayout, type HubProcess } from './harness.tsx';
+import {
+  ID,
+  otherClient,
+  renderWithHub,
+  scrollTo,
+  startHub,
+  stubLayout,
+  unmountAndSettle,
+  type HubProcess,
+} from './harness.tsx';
 
 /** The list as the user reads it: group headers and session ids, in order. */
 function outline(container: HTMLElement): string[] {
@@ -31,7 +40,7 @@ describe('SessionList against the mock hub', () => {
   });
 
   afterEach(async () => {
-    cleanup();
+    await unmountAndSettle();
     unstub();
     await hub?.close();
     hub = undefined;

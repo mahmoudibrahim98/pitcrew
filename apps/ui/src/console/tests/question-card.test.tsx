@@ -1,12 +1,21 @@
 // @vitest-environment happy-dom
 // @vitest-environment-options {"url": "http://localhost:5173/"}
 
-import { cleanup, fireEvent, screen, within } from '@testing-library/react';
+import { fireEvent, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useAsks, type Ask, type Session } from '../../data/index.ts';
 import { ChatView } from '../chat-view.tsx';
 import { keysForOption, QuestionCard } from '../question-card.tsx';
-import { ID, otherClient, renderWithHub, startHub, stubLayout, type HubProcess, type Logged } from './harness.tsx';
+import {
+  ID,
+  otherClient,
+  renderWithHub,
+  startHub,
+  stubLayout,
+  unmountAndSettle,
+  type HubProcess,
+  type Logged,
+} from './harness.tsx';
 
 const posts = (requests: Logged[], path: string) => requests.filter((r) => r.method === 'POST' && r.path === path);
 
@@ -19,7 +28,7 @@ describe('QuestionCard against the mock hub', () => {
   });
 
   afterEach(async () => {
-    cleanup();
+    await unmountAndSettle();
     unstub();
     await hub?.close();
     hub = undefined;

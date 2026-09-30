@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 // @vitest-environment-options {"url": "http://localhost:5173/"}
 
-import { cleanup, fireEvent, screen, within } from '@testing-library/react';
+import { fireEvent, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   appendRecord,
@@ -14,7 +14,16 @@ import {
 } from '../../../../mock-hub/src/transcripts.ts';
 import type { Session } from '../../data/index.ts';
 import { ChatView } from '../chat-view.tsx';
-import { ID, renderWithHub, scrollTo, startHub, stubLayout, type HubProcess, type Logged } from './harness.tsx';
+import {
+  ID,
+  renderWithHub,
+  scrollTo,
+  startHub,
+  stubLayout,
+  unmountAndSettle,
+  type HubProcess,
+  type Logged,
+} from './harness.tsx';
 
 const SYNTHETIC = '01JB0000000000000000SYNTH1';
 
@@ -93,7 +102,7 @@ describe('ChatView against the mock hub', () => {
   });
 
   afterEach(async () => {
-    cleanup();
+    await unmountAndSettle();
     unstub();
     await hub?.close();
     hub = undefined;
@@ -295,7 +304,7 @@ describe('ChatView with hostile transcript content', () => {
   });
 
   afterEach(async () => {
-    cleanup();
+    await unmountAndSettle();
     unstub();
     await hub?.close();
     hub = undefined;

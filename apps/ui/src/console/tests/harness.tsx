@@ -3,7 +3,7 @@
 // happy-dom replaces globals the in-process hub relies on), a DataProvider around the component,
 // a log of every request, and a stand-in layout so virtualised lists have a size in happy-dom.
 
-import { render } from '@testing-library/react';
+import { cleanup, render } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { freePort, spawnHub, type HubProcess } from '../../../tests/hub-process.ts';
 import { createApi, createQueryClient, DataProvider } from '../../data/index.ts';
@@ -37,6 +37,19 @@ export interface Logged {
   body: unknown;
 }
 
+const inFlight = new Set<Promise<unknown>>();
+
+/**
+ * Unmounts, then waits for requests still in flight, so stopping the hub next does not reset
+ * them (happy-dom's fetch would print each reset to the real stderr).
+ */
+export async function unmountAndSettle(): Promise<void> {
+  cleanup();
+  const deadline = new Promise((done) => setTimeout(done, 2_000));
+  await Promise.race([Promise.allSettled([...inFlight]), deadline]);
+  await new Promise((done) => setTimeout(done, 20));
+}
+
 export function renderWithHub(hub: { url: string }, ui: ReactNode, options: { fetch?: typeof fetch } = {}) {
   const requests: Logged[] = [];
   const inner = options.fetch ?? ((input: RequestInfo | URL, init?: RequestInit) => fetch(input, init));
@@ -48,7 +61,13 @@ export function renderWithHub(hub: { url: string }, ui: ReactNode, options: { fe
       query: url.searchParams,
       body: typeof init?.body === 'string' ? JSON.parse(init.body) : undefined,
     });
-    return inner(input, init);
+    const response = inner(input, init);
+    inFlight.add(response);
+    void response.then(
+      () => inFlight.delete(response),
+      () => inFlight.delete(response),
+    );
+    return response;
   };
   const api = createApi({ baseUrl: hub.url, token: DEVICE_TOKEN, fetch: fetcher });
   const queryClient = createQueryClient();

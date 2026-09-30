@@ -7,7 +7,7 @@ import { ApiError, useMembers, useSession, type Task, type Workstream } from '..
 import { Button, StatusPill } from '../design/index.ts';
 import { cx } from '../lib/cx.ts';
 import { useEndSession, useMachines, useTaskById, useWorkstreamById } from './data.ts';
-import { ENGINE_LABEL, LIVENESS, sessionTitle, STATE } from './format.ts';
+import { ENGINE_LABEL, inputBlocked, LIVENESS, sessionTitle, STATE } from './format.ts';
 
 export interface SessionHeaderProps {
   sessionId: string;
@@ -43,7 +43,11 @@ export function SessionHeader(props: SessionHeaderProps) {
   const machine = machines.data?.find((m) => m.id === s.machine);
   const agent = s.agent === undefined ? undefined : members.data?.find((m) => m.id === s.agent);
   const state = STATE[s.state];
-  const canEnd = s.state !== 'ended' && s.state !== 'unreachable' && machine?.liveness !== 'unverifiable';
+  const linkedTask = task.data;
+  const linkedWorkstream = workstream.data;
+  const { onOpenTask, onOpenWorkstream } = props;
+  // The same rule as the composer's: an ended or unreachable session takes no command (409, 503).
+  const canEnd = inputBlocked(s, machine) === undefined;
 
   const finish = (mode: 'graceful' | 'kill') =>
     end.mutate(mode, { onSuccess: () => setConfirming(false) });
@@ -113,22 +117,18 @@ export function SessionHeader(props: SessionHeaderProps) {
 
       {(s.task !== undefined || s.workstream !== undefined) && (
         <nav aria-label="Linked work" className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
-          {task.data !== undefined && (
+          {linkedTask !== undefined && (
             <LinkedWork
               label="Task"
-              text={`${task.data.key} · ${task.data.title}`}
-              onOpen={props.onOpenTask === undefined ? undefined : () => task.data && props.onOpenTask?.(task.data)}
+              text={`${linkedTask.key} · ${linkedTask.title}`}
+              onOpen={onOpenTask === undefined ? undefined : () => onOpenTask(linkedTask)}
             />
           )}
-          {workstream.data !== undefined && (
+          {linkedWorkstream !== undefined && (
             <LinkedWork
               label="Workstream"
-              text={workstream.data.name}
-              onOpen={
-                props.onOpenWorkstream === undefined
-                  ? undefined
-                  : () => workstream.data && props.onOpenWorkstream?.(workstream.data)
-              }
+              text={linkedWorkstream.name}
+              onOpen={onOpenWorkstream === undefined ? undefined : () => onOpenWorkstream(linkedWorkstream)}
             />
           )}
         </nav>
