@@ -9,7 +9,7 @@ members = ["crates/*", "apps/desktop/src-tauri"]
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 license = "Apache-2.0"
 publish = false
 authors = ["The PitCrew Authors"]
