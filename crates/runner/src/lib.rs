@@ -8,9 +8,10 @@
 //! This first part notices every agent session on the machine and keeps a restart-safe index of
 //! them ([`start`]):
 //! - each configured [`SourceAdapter`] discovers transcripts; each gets a [`SessionId`] that never
-//!   changes;
-//! - hot transcripts (changed in the last day) have their folders watched, cold ones are checked
-//!   on a slow sweep, and homes on network filesystems are polled;
+//!   changes, keyed by the transcript's canonical path;
+//! - homes and the project folders in them are watched, and so are the folders of hot transcripts
+//!   (changed in the last day); every transcript is also re-checked on a slow sweep, and homes on
+//!   network filesystems are polled instead;
 //! - each change reads from the stored cursor, never from the start, and the items become
 //!   `session_discovered`, `session_state_changed`, `tool_ran`, `file_edited` and `turn_ended`
 //!   events for an [`EventSink`], through a bounded channel;
@@ -40,15 +41,13 @@ use std::thread::JoinHandle;
 /// The protocol version this crate was built against.
 pub const PROTOCOL_VERSION: u32 = pitcrew_protocol::PROTOCOL_VERSION;
 
-/// Errors starting the runner.
+/// Errors starting the runner. Without file notifications (e.g. at the inotify instance limit)
+/// the runner still starts, polling every home.
 #[derive(Debug, thiserror::Error)]
 pub enum RunnerError {
-    /// The index could not be opened.
+    /// The index could not be opened or read, or another runner holds it.
     #[error(transparent)]
     Store(#[from] StoreError),
-    /// File notifications could not be set up.
-    #[error("file watcher: {0}")]
-    Notify(#[from] notify::Error),
     /// A thread could not be started.
     #[error("runner thread: {0}")]
     Thread(#[from] std::io::Error),
@@ -99,13 +98,17 @@ impl Drop for RunnerHandle {
 ///
 /// # Errors
 ///
-/// If the index cannot be opened, notifications cannot be set up, or a thread cannot start.
+/// If the index cannot be opened or read (or another runner is using the state directory), or a
+/// thread cannot start.
 pub fn start(
     config: RunnerConfig,
     adapters: Vec<Arc<dyn SourceAdapter>>,
     sink: Arc<dyn EventSink>,
 ) -> Result<RunnerHandle, RunnerError> {
-    let store = Arc::new(Mutex::new(store::Store::open(&config.state_dir)?));
+    let store = store::Store::open(&config.state_dir)?;
+    // Starting with an empty index would give every transcript a new session id.
+    let rows = store.load_all()?;
+    let store = Arc::new(Mutex::new(store));
     let (tx, rx) = std::sync::mpsc::sync_channel(config.channel_capacity.max(1));
     let shared = Arc::new(watch::Shared::default());
     let stopping = Arc::new(AtomicBool::new(false));
@@ -120,10 +123,11 @@ pub fn start(
         max_batch: config.max_batch_events,
         homes: config.homes,
         adapters,
+        rows,
         store: Arc::clone(&store),
         tx,
         shared: Arc::clone(&shared),
-    })?;
+    });
 
     let dispatcher = {
         let stopping = Arc::clone(&stopping);

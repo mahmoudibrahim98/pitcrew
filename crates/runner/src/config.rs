@@ -20,9 +20,9 @@ pub enum PollMode {
     /// Poll homes on network filesystems (NFS, SMB, Lustre, 9p, …); notify elsewhere.
     #[default]
     Auto,
-    /// Always poll.
+    /// Always poll, as for a network filesystem.
     Always,
-    /// Never poll; always use notifications.
+    /// Never poll; always use notifications (unless they cannot be set up at all).
     Never,
 }
 
@@ -34,9 +34,10 @@ pub struct Timing {
     /// Transcripts modified within this window are hot: their folders are watched.
     pub hot_window: Duration,
     /// How often every transcript is re-checked by size and mtime (cold ones, and a safety net
-    /// for missed notifications).
+    /// for missed notifications). Homes polled as network filesystems use four times this.
     pub cold_interval: Duration,
-    /// How often the adapters' `discover` runs again, to find sessions in new folders.
+    /// How often the adapters' `discover` runs again, to find sessions in new folders. Homes
+    /// polled as network filesystems use four times this.
     pub rediscover_interval: Duration,
     /// Fastest poll of a hot transcript on a polled filesystem.
     pub poll_min: Duration,

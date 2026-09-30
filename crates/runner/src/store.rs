@@ -21,8 +21,8 @@ const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_transcripts.sql")
 const DB_FILE: &str = "runner.sqlite3";
 const LOCK_FILE: &str = "runner.lock";
 
-const COLUMNS: &str = "session_id, engine, path, inner_id, cursor, size, mtime, identity, caught_up,
-     generation, discovered, emitted_through, meta, facts";
+const COLUMNS: &str = "session_id, engine, path, inner_id, cursor, size, mtime, identity, \
+                       caught_up, generation, discovered, emitted_through, meta, facts";
 
 /// Errors from the runner store.
 #[derive(Debug, thiserror::Error)]
@@ -157,13 +157,10 @@ impl Store {
         let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {COLUMNS} FROM transcripts WHERE path = ?1 AND inner_id = ?2"
         ))?;
-        stmt.query_row(
-            params![path_text(path)?, inner_id.unwrap_or("")],
-            raw_row,
-        )
-        .optional()?
-        .map(RawRow::decode)
-        .transpose()
+        stmt.query_row(params![path_text(path)?, inner_id.unwrap_or("")], raw_row)
+            .optional()?
+            .map(RawRow::decode)
+            .transpose()
     }
 
     /// Moves a row to the transcript's new canonical path (a folder above it became a symlink).
@@ -468,7 +465,12 @@ mod tests {
 
         let found = reopened.find(&full.path, None).expect("find");
         assert_eq!(found.as_ref().map(|r| r.session), Some(full.session));
-        assert!(reopened.find(&full.path, Some("x")).expect("find").is_none());
+        assert!(
+            reopened
+                .find(&full.path, Some("x"))
+                .expect("find")
+                .is_none()
+        );
         reopened
             .set_path(full.session, Path::new("/real/a.jsonl"))
             .expect("set path");
@@ -486,10 +488,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let first = Store::open(dir.path()).expect("open");
         let second = Store::open(dir.path());
-        assert!(
-            matches!(second, Err(StoreError::Locked(_))),
-            "{second:?}"
-        );
+        assert!(matches!(second, Err(StoreError::Locked(_))), "{second:?}");
         drop(first);
         Store::open(dir.path()).expect("open after the first closed");
     }
@@ -505,7 +504,13 @@ mod tests {
         drop(store);
         let err = Store::open(dir.path()).expect_err("too new");
         assert!(
-            matches!(err, StoreError::TooNew { found: 99, known: 1 }),
+            matches!(
+                err,
+                StoreError::TooNew {
+                    found: 99,
+                    known: 1
+                }
+            ),
             "{err}"
         );
     }
