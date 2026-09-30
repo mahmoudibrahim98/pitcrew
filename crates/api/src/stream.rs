@@ -12,14 +12,18 @@
 //!    is sent twice. If the subscription lags, it re-reads the latest revision and catches up.
 //! 4. A client that stops reading fills the queue; once a frame cannot be queued within
 //!    [`StreamConfig::send_timeout`], the client is disconnected. It resumes with `since`.
+//!
+//! Close codes: 1013 too slow (resume with `since`), 1001 the event source closed or the hub is
+//! shutting down, 1011 the event source failed. A client's Close is answered before the socket
+//! is dropped.
 
 use crate::source::{EventSource, SourceError};
-use crate::util::{close, close_code, now_ms};
-use axum::Router;
+use crate::util::{HubShutdown, close, close_code, finish, now_ms};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
+use axum::{Extension, Router};
 use pitcrew_auth::{ErrorResponse, WS_PROTOCOL};
 use pitcrew_protocol::api::{ErrorCode, StreamFrame};
 use serde::Deserialize;
@@ -74,6 +78,8 @@ pub enum StreamEnd {
     SourceClosed,
     /// The event source failed to read.
     SourceFailed,
+    /// The hub is shutting down.
+    ShuttingDown,
 }
 
 /// The routes of the delta stream. Mount them as **device** routes (`RouterParts::device`).
@@ -96,6 +102,7 @@ struct StreamQuery {
 
 async fn stream(
     State(state): State<StreamState>,
+    shutdown: Option<Extension<HubShutdown>>,
     query: Result<Query<StreamQuery>, axum::extract::rejection::QueryRejection>,
     upgrade: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Response {
@@ -105,11 +112,12 @@ async fn stream(
     let Ok(upgrade) = upgrade else {
         return invalid("GET /v1/stream needs a WebSocket upgrade.");
     };
+    let shutdown = shutdown.map(|Extension(shutdown)| shutdown);
     upgrade
         .protocols([WS_PROTOCOL])
         .max_message_size(MAX_INBOUND)
         .max_frame_size(MAX_INBOUND)
-        .on_upgrade(move |socket| session(socket, state, query.since))
+        .on_upgrade(move |socket| session(socket, state, query.since, shutdown))
 }
 
 fn invalid(message: &str) -> Response {
@@ -117,13 +125,21 @@ fn invalid(message: &str) -> Response {
 }
 
 /// Runs the pump and writes its frames to the socket until either side ends.
-async fn session(mut socket: WebSocket, state: StreamState, since: Option<u64>) {
+async fn session(
+    mut socket: WebSocket,
+    state: StreamState,
+    since: Option<u64>,
+    shutdown: Option<HubShutdown>,
+) {
     let (frames, mut queue) = mpsc::channel(state.config.queue_frames.max(1));
     let pump = pump(state.source, since, state.config, frames);
     tokio::pin!(pump);
+    let shutdown = HubShutdown::wait(shutdown);
+    tokio::pin!(shutdown);
     let end = loop {
         tokio::select! {
             end = &mut pump => break Some(end),
+            () = &mut shutdown => break Some(StreamEnd::ShuttingDown),
             frame = queue.recv() => {
                 let Some(frame) = frame else { break None };
                 let text = match serde_json::to_string(&frame) {
@@ -143,7 +159,11 @@ async fn session(mut socket: WebSocket, state: StreamState, since: Option<u64>) 
                 }
             }
             incoming = socket.recv() => match incoming {
-                None | Some(Err(_) | Ok(Message::Close(_))) => break Some(StreamEnd::ClientGone),
+                None | Some(Err(_)) => break Some(StreamEnd::ClientGone),
+                Some(Ok(Message::Close(_))) => {
+                    finish(&mut socket).await;
+                    break Some(StreamEnd::ClientGone);
+                }
                 // The client has nothing to say on this stream; pongs and the like are ignored.
                 Some(Ok(_)) => {}
             },
@@ -153,6 +173,7 @@ async fn session(mut socket: WebSocket, state: StreamState, since: Option<u64>) 
     let (code, reason) = match end {
         Some(StreamEnd::SlowClient) => (close_code::TRY_AGAIN_LATER, "too slow; resume with since"),
         Some(StreamEnd::SourceClosed) => (close_code::GOING_AWAY, "the event log closed"),
+        Some(StreamEnd::ShuttingDown) => (close_code::GOING_AWAY, "the hub is shutting down"),
         Some(StreamEnd::SourceFailed) | None => (close_code::INTERNAL, "the event log failed"),
         Some(StreamEnd::ClientGone) => return,
     };
@@ -160,7 +181,8 @@ async fn session(mut socket: WebSocket, state: StreamState, since: Option<u64>) 
 }
 
 /// Writes frames for one client into `out` until the client goes away, falls behind, or the
-/// source ends. See the module docs for the ordering rules.
+/// source ends. See the module docs for the ordering rules. Public for tests and benchmarks.
+#[doc(hidden)]
 pub async fn pump(
     source: Arc<dyn EventSource>,
     since: Option<u64>,

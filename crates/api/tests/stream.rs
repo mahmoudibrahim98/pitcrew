@@ -53,6 +53,51 @@ async fn the_stream_is_for_devices_and_websockets() {
     assert_eq!(body["code"], "invalid");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_close_is_answered() {
+    use pitcrew_api::{Bound, Listen};
+    use tungstenite::client::IntoClientRequest as _;
+    use tungstenite::http::HeaderValue;
+
+    let f = Fixture::new();
+    let source: Arc<dyn EventSource> = Arc::new(MemorySource::new("log", 16));
+    let bound = Bound::bind(&Listen::DevTcp {
+        addr: "127.0.0.1:0".parse().unwrap(),
+    })
+    .await
+    .unwrap();
+    let addr = bound.tcp_addr().unwrap();
+    tokio::spawn(bound.serve(app(&f, source), std::future::pending()));
+    let token = f.device_token.clone();
+    tokio::task::spawn_blocking(move || {
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = format!("ws://{addr}/v1/stream")
+            .into_client_request()
+            .unwrap();
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            HeaderValue::from_str(&format!("pitcrew.v1, pitcrew.bearer.{token}")).unwrap(),
+        );
+        let (mut socket, _) = tungstenite::client(request, stream).unwrap();
+        assert!(matches!(
+            socket.read().unwrap(),
+            tungstenite::Message::Text(_)
+        ));
+        socket.close(None).unwrap();
+        // The server's reply, not a reset.
+        assert!(matches!(socket.read(), Ok(tungstenite::Message::Close(_))));
+        assert!(matches!(
+            socket.read(),
+            Err(tungstenite::Error::ConnectionClosed)
+        ));
+    })
+    .await
+    .unwrap();
+}
+
 #[cfg(all(unix, feature = "store"))]
 mod unix {
     use super::*;
