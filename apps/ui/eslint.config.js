@@ -13,6 +13,26 @@ export default tseslint.config(
   },
   // The app runs in a webview: browser globals only.
   { files: ['src/**/*.{ts,tsx}'], languageOptions: { globals: globals.browser } },
+  // Server state goes through src/data, whose useLiveQuery waits for the stream to sync.
+  {
+    files: ['src/**/*.{ts,tsx}'],
+    ignores: ['src/data/**'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          paths: [
+            {
+              name: '@tanstack/react-query',
+              importNames: ['useQuery', 'useQueries', 'useSuspenseQuery', 'useInfiniteQuery'],
+              message:
+                'Use useLiveQuery from src/data (or a hook built on it): plain useQuery can fetch before the stream syncs and miss events.',
+            },
+          ],
+        },
+      ],
+    },
+  },
   // Config, tests and specs run in Node (the provider test also gets a DOM from happy-dom).
   {
     files: ['*.{ts,js}', 'tests/**/*.{ts,tsx}', 'e2e/**/*.ts'],
