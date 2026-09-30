@@ -30,6 +30,22 @@ pub enum Error {
         #[source]
         source: crate::projection::BoxError,
     },
+    /// The store holds a projection at another version than this build's, and the store will not
+    /// rebuild it:
+    /// - on open or [`Store::rebuild`](crate::Store::rebuild), only when the stored version is
+    ///   **higher** (a newer PitCrew rebuilt it; this build would undo that). Upgrade.
+    /// - on an append, for any difference: another process, running another version of the
+    ///   projection, rebuilt it after this store opened. Rebuilding it back on every append would
+    ///   replay the whole log each time. Nothing is appended; stop one of the two processes.
+    #[error("projection {name} is at version {stored} in the store, but this build has {ours}")]
+    ProjectionVersion {
+        /// The projection.
+        name: String,
+        /// The version in `projection_state`.
+        stored: u32,
+        /// This build's version.
+        ours: u32,
+    },
     /// Two projections passed to one store share a name.
     #[error("two projections are named {name}")]
     DuplicateProjection {
@@ -95,7 +111,8 @@ pub enum Error {
     },
 }
 
-/// An opaque SQLite error, so the public API does not depend on `rusqlite`'s types.
+/// A SQLite error. It wraps the store's `rusqlite` error, re-exported as
+/// [`sql::Error`](crate::sql::Error); [`DbError::as_sql`] reaches it, e.g. for its error code.
 pub struct DbError(rusqlite::Error);
 
 impl fmt::Debug for DbError {
@@ -125,6 +142,13 @@ impl From<rusqlite::Error> for Error {
 impl DbError {
     pub(crate) fn new(e: rusqlite::Error) -> Self {
         Self(e)
+    }
+
+    /// The underlying error, e.g. for
+    /// [`sqlite_error_code`](crate::sql::Error::sqlite_error_code).
+    #[must_use]
+    pub fn as_sql(&self) -> &crate::sql::Error {
+        &self.0
     }
 }
 

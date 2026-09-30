@@ -57,16 +57,25 @@ fn concurrent_opens_of_a_fresh_file_both_succeed() {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    Store::open(path.as_path(), StoreOptions::default()).map(drop)
+                    Store::open(path.as_path(), StoreOptions::default())
+                        .map(|store| store.log_id().to_owned())
                 })
             })
             .collect();
-        for h in handles {
-            h.join().expect("thread").expect("open");
-        }
+        let ids: Vec<String> = handles
+            .into_iter()
+            .map(|h| h.join().expect("thread").expect("open"))
+            .collect();
         let versions: Vec<u32> = applied(&path).iter().map(|a| a.0).collect();
         let expected: Vec<u32> = migrations::embedded().iter().map(|m| m.version).collect();
         assert_eq!(versions, expected);
+        // One log id, whichever opener wrote it.
+        let stored: String = raw(&path)
+            .query_row("SELECT value FROM meta WHERE key = 'log_id'", [], |r| {
+                r.get(0)
+            })
+            .expect("log id");
+        assert!(ids.iter().all(|id| *id == stored), "{ids:?} vs {stored}");
     }
 }
 

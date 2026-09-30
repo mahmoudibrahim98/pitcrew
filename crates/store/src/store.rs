@@ -93,14 +93,23 @@ impl EventFilter {
     }
 }
 
+/// How many prepared statements each connection keeps. Projections prepare their own, and
+/// rusqlite's default of 16 would evict the store's.
+const STATEMENT_CACHE: usize = 128;
+
 /// The hub's SQLite store.
 pub struct Store {
-    /// The one write connection. Appends, rebuilds and the log reads that must see appends in
-    /// order go through it.
-    conn: Mutex<Connection>,
-    /// A read-only connection for [`Store::read`], so projection reads never wait on the write
-    /// lock (WAL readers and the writer do not block each other).
+    /// A read-only connection for [`Store::read`], [`Store::since`] and [`Store::before`], so
+    /// they never wait on the write lock (WAL readers and the writer do not block each other).
+    ///
+    /// Declared before `conn` so it closes first: fields drop in order, and only the last
+    /// connection to close checkpoints the WAL and deletes `-wal` and `-shm`. A read-only
+    /// connection cannot, so if it closed last the files would stay and the `.db` alone would
+    /// miss recent commits.
     reader: Mutex<Connection>,
+    /// The one write connection. Appends, rebuilds, `latest_rev` and the schema version go
+    /// through it.
+    conn: Mutex<Connection>,
     projections: Vec<Box<dyn Projection>>,
     log_id: String,
     revs: broadcast::Sender<RevRange>,
@@ -138,8 +147,10 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// As [`Store::open`], plus [`Error::DuplicateProjection`] for two projections with one name
-    /// and [`Error::Projection`] if a rebuild or catch-up fails.
+    /// As [`Store::open`], plus [`Error::DuplicateProjection`] for two projections with one name,
+    /// [`Error::Projection`] if a rebuild or catch-up fails, and [`Error::ProjectionVersion`] if
+    /// the store holds a projection at a higher version than this build's (a newer PitCrew
+    /// rebuilt it).
     pub fn open_with(
         path: impl AsRef<Path>,
         options: StoreOptions,
@@ -174,6 +185,7 @@ impl Store {
             | OpenFlags::SQLITE_OPEN_URI;
         let mut conn = Connection::open_with_flags(path, flags)?;
         conn.busy_timeout(options.busy_timeout)?;
+        conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
         // Local disks only for now; NFS mode (journal_mode=DELETE plus a lease) comes later.
         let mode = set_wal(&conn, options.busy_timeout)?;
         if !mode.eq_ignore_ascii_case("wal") {
@@ -200,14 +212,15 @@ impl Store {
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
         reader.busy_timeout(options.busy_timeout)?;
+        reader.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
 
         let capacity = options
             .subscriber_capacity
             .clamp(1, MAX_SUBSCRIBER_CAPACITY);
         let (revs, _) = broadcast::channel(capacity);
         Ok(Self {
-            conn: Mutex::new(conn),
             reader: Mutex::new(reader),
+            conn: Mutex::new(conn),
             projections,
             log_id,
             revs,
@@ -222,13 +235,14 @@ impl Store {
     }
 
     /// Resets the projection called `name` and replays the whole log into it, in one
-    /// transaction. Appends wait until it is done; [`Store::read`] sees the old tables until it
-    /// commits.
+    /// transaction. Appends wait until it is done; [`Store::read`], [`Store::since`] and
+    /// [`Store::before`] do not, and see the old tables until it commits.
     ///
     /// # Errors
     ///
     /// [`Error::UnknownProjection`] if no projection by that name was registered,
-    /// [`Error::Projection`] if it fails (nothing changes then), or database errors.
+    /// [`Error::Projection`] if it fails, [`Error::ProjectionVersion`] if the store holds it at a
+    /// higher version than this build's, or database errors. Nothing changes on an error.
     pub fn rebuild(&self, name: &str) -> Result<()> {
         let p = self
             .projections
@@ -236,10 +250,17 @@ impl Store {
             .find(|p| p.name() == name)
             .ok_or_else(|| Error::UnknownProjection {
                 name: name.to_owned(),
-            })?;
+            })?
+            .as_ref();
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        projection::rebuild(&tx, p.as_ref())?;
+        if let Some(cp) = projection::checkpoint(&tx, name)?
+            && cp.version > p.version()
+        {
+            // A newer build owns it; rebuilding with this one would downgrade it.
+            return Err(projection::version_mismatch(p, cp.version));
+        }
+        projection::rebuild(&tx, p)?;
         tx.commit()?;
         Ok(())
     }
@@ -249,8 +270,18 @@ impl Store {
     ///
     /// Reads use their own connection: they never take the write lock, and a long read does not
     /// hold up appends (in WAL mode readers and the writer do not block each other). Keep reads
-    /// short anyway: reads share that one connection, and a long-open read stops the WAL from
-    /// being checkpointed. Writes through it fail.
+    /// short anyway: [`Store::since`] and [`Store::before`] share that one connection and wait
+    /// for the closure, and a long-open read stops the WAL from being checkpointed. Writes
+    /// through it fail.
+    ///
+    /// The snapshot starts at the closure's first query and holds until it returns, even if
+    /// events are appended meanwhile. So the revision a projection's tables reflect is its
+    /// `projection_state.rev`, read inside the closure: not [`Store::latest_rev`], which is
+    /// outside the snapshot, nor `MAX(events.rev)`, which may include events another process
+    /// appended without this projection.
+    ///
+    /// **Do not call `read`, [`Store::since`] or [`Store::before`] inside the closure**: they
+    /// wait for the connection the closure holds, which deadlocks. Appending inside it is fine.
     ///
     /// `E` is any error that a store [`Error`] converts into, including [`Error`] itself, which
     /// `?` on a [`sql::Error`](crate::sql::Error) produces.
@@ -265,7 +296,7 @@ impl Store {
     where
         E: From<Error>,
     {
-        let reader = self.reader.lock().unwrap_or_else(PoisonError::into_inner);
+        let reader = self.reader();
         let tx = reader
             .unchecked_transaction()
             .map_err(|e| E::from(Error::from(e)))?;
@@ -290,8 +321,10 @@ impl Store {
     /// # Errors
     ///
     /// [`Error::DuplicateEvent`] if an event id is already stored or repeated in `events`,
-    /// otherwise database or JSON errors. Nothing is appended then. To retry a batch that may be
-    /// partly stored, use [`Store::append_new`].
+    /// [`Error::Projection`] if a projection fails, [`Error::ProjectionVersion`] if another
+    /// process rebuilt a projection at another version since this store opened, otherwise
+    /// database or JSON errors. Nothing is appended then. To retry a batch that may be partly
+    /// stored, use [`Store::append_new`].
     pub fn append(&self, events: &[Event]) -> Result<RevRange> {
         Ok(self.append_inner(events, false)?.0)
     }
@@ -302,7 +335,7 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Database or JSON errors; nothing is appended then.
+    /// As [`Store::append`], except for [`Error::DuplicateEvent`]; nothing is appended then.
     pub fn append_new(&self, events: &[Event]) -> Result<(RevRange, Vec<EventId>)> {
         self.append_inner(events, true)
     }
@@ -385,7 +418,13 @@ impl Store {
         for p in &self.projections {
             let p = p.as_ref();
             match projection::checkpoint(tx, p.name())? {
-                Some(cp) if cp.rev == before && cp.version == p.version() => {
+                // Another process runs another version of this projection and rebuilt it after
+                // this store opened. Rebuilding it back here would replay the whole log under the
+                // write lock, and the other process would do the same on its next append.
+                Some(cp) if cp.version != p.version() => {
+                    return Err(projection::version_mismatch(p, cp.version));
+                }
+                Some(cp) if cp.rev == before => {
                     for event in stored {
                         p.apply(tx, event)
                             .map_err(projection::failed(p, event.rev))?;
@@ -399,10 +438,11 @@ impl Store {
                         },
                     )?;
                 }
-                // Another process changed the log or the checkpoint since this store opened (it
-                // appended without this projection, or ran another version of it): bring it up
-                // to date from the log, new events included.
-                _ => projection::sync(tx, p)?,
+                // Another process appended without this projection since this store last applied
+                // it: catch up from its checkpoint, the new events included.
+                Some(cp) => projection::replay(tx, p, cp.rev)?,
+                // Nothing deletes checkpoints; one removed by hand is rebuilt, once.
+                None => projection::rebuild(tx, p)?,
             }
         }
         Ok(())
@@ -418,23 +458,26 @@ impl Store {
     }
 
     /// Up to `limit` events after `rev`, oldest first. `since(0, n)` starts at the beginning.
+    /// Runs on the read connection, so it does not wait for an append or a rebuild, and sees
+    /// every append that has returned. Do not call it inside [`Store::read`] (it deadlocks).
     ///
     /// # Errors
     ///
     /// Database errors, or [`Error::Corrupt`] for a row that does not decode.
     pub fn since(&self, rev: u64, limit: usize) -> Result<Vec<StoredEvent>> {
-        read_events_after(&self.conn(), rev, limit)
+        read_events_after(&self.reader(), rev, limit)
     }
 
     /// Up to `limit` events matching `filter` just before `rev`, oldest first. For paging back
-    /// through history: pass the first returned revision as the next `rev`.
+    /// through history: pass the first returned revision as the next `rev`. Runs on the read
+    /// connection, like [`Store::since`]; do not call it inside [`Store::read`].
     ///
     /// # Errors
     ///
     /// Database errors, or [`Error::Corrupt`] for a row that does not decode.
     pub fn before(&self, rev: u64, limit: usize, filter: &EventFilter) -> Result<Vec<StoredEvent>> {
         let (sql, params) = before_query(rev, limit, filter);
-        let conn = self.conn();
+        let conn = self.reader();
         let mut stmt = conn.prepare_cached(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(params), read_row)?;
         let mut events = rows.map(|r| r?.decode()).collect::<Result<Vec<_>>>()?;
@@ -462,6 +505,10 @@ impl Store {
         // A panic mid-transaction rolls the transaction back when it drops, so the connection is
         // still usable.
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn reader(&self) -> MutexGuard<'_, Connection> {
+        self.reader.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 

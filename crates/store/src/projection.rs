@@ -5,8 +5,10 @@
 //! - applies every appended event to it **inside the append's transaction**, so the log and the
 //!   projection never disagree; a failing `apply` rolls the append back;
 //! - records how far each projection got in `projection_state (name, version, rev)`;
-//! - on open, rebuilds a projection whose `version` changed (`reset`, then replay the log) and
-//!   catches up one that is behind the log.
+//! - on open, rebuilds a projection whose stored `version` is older (`reset`, then replay the
+//!   log), catches up one that is behind the log, and refuses one whose stored version is newer.
+//!
+//! The rules a projection must follow are in the crate README ("Rules for projections").
 //!
 //! Projections write SQL through [`crate::sql`], the store's own `rusqlite`, so every crate uses
 //! the workspace's version and the same transaction type.
@@ -25,13 +27,17 @@ const REPLAY_BATCH: usize = 1_000;
 ///
 /// `reset` followed by `apply` for every event in the log, in revision order, must give the same
 /// tables as applying the events one append at a time. Both run inside a write transaction: do
-/// not commit, and do not touch other projections' tables or the `events` table.
+/// not commit, and do not touch other projections' tables or the `events` table. `apply` depends
+/// only on the event and the projection's own tables: no side effects, no clock, and who acted
+/// comes from the stored event's `author` and `on_behalf_of`, never the live caller. The crate
+/// README has the full rules.
 pub trait Projection: Send + Sync {
     /// A stable, unique name, e.g. `work.tasks`. It keys the projection's checkpoint.
     fn name(&self) -> &str;
 
-    /// The projection's version. Bump it when `apply` changes meaning; the next open rebuilds
-    /// the projection from the log.
+    /// The projection's version. Bump it when `apply` changes meaning or a migration reshapes
+    /// its tables; the next open rebuilds the projection from the log. A store whose stored
+    /// version is higher (a newer build) is refused.
     fn version(&self) -> u32;
 
     /// Clears the projection's tables, before a rebuild.
@@ -93,11 +99,22 @@ pub(crate) fn failed(p: &dyn Projection, rev: u64) -> impl FnOnce(BoxError) -> E
     }
 }
 
-/// Brings `p` up to date inside `tx`: rebuilds it if its version changed or it has no
-/// checkpoint, otherwise replays what it is missing.
+/// The error for a stored checkpoint at version `stored` that `p` does not match.
+pub(crate) fn version_mismatch(p: &dyn Projection, stored: u32) -> Error {
+    Error::ProjectionVersion {
+        name: p.name().to_owned(),
+        stored,
+        ours: p.version(),
+    }
+}
+
+/// Brings `p` up to date inside `tx` when the store opens: rebuilds it if its version is older
+/// than ours or it has no checkpoint, otherwise replays what it is missing. A newer stored
+/// version is refused, like a newer schema: rebuilding it here would undo the newer build's work.
 pub(crate) fn sync(tx: &Transaction<'_>, p: &dyn Projection) -> Result<()> {
     match checkpoint(tx, p.name())? {
         Some(cp) if cp.version == p.version() => replay(tx, p, cp.rev),
+        Some(cp) if cp.version > p.version() => Err(version_mismatch(p, cp.version)),
         _ => rebuild(tx, p),
     }
 }
