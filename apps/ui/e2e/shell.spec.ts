@@ -126,10 +126,26 @@ test('Ctrl K opens the palette and jumps to PAP-4', async ({ page }, info) => {
   const search = page.getByRole('button', { name: /^Search/ });
   await search.focus();
   await page.keyboard.press('Control+KeyK');
+  await expect(input).toBeFocused();
   await page.keyboard.type('seed runs');
   await expect(page.getByRole('option').first()).toContainText('Seed runs');
   await page.keyboard.press('ArrowDown');
   await expect(page.getByRole('option').nth(1)).toHaveAttribute('aria-selected', 'true');
+
+  // In the palette's text field, the other shell shortcuts leave the field alone; Ctrl K closes.
+  // (The modal hides the page from the accessibility tree, so these look it up by markup.)
+  await page.keyboard.press('Control+KeyB');
+  await page.keyboard.press('Control+KeyJ');
+  await page.keyboard.press('Control+Period');
+  await expect(page.locator('aside[data-collapsed]')).toHaveAttribute('data-collapsed', 'false');
+  await expect(page.locator('aside[aria-label="Orchestrator"]')).toHaveCount(0);
+  await expect(page).toHaveURL(/\/tasks\/PAP-4$/);
+  await page.keyboard.press('Control+KeyK');
+  await expect(page.getByRole('dialog')).toHaveCount(0);
+  await expect(search).toBeFocused();
+
+  await search.focus();
+  await page.keyboard.press('Control+KeyK');
   await page.keyboard.press('Escape');
   await expect(page.getByRole('dialog')).toHaveCount(0);
   await expect(search).toBeFocused();
@@ -196,6 +212,20 @@ test('"+ New" opens placeholder dialogs from the keyboard', async ({ page }, inf
   await page.keyboard.press('Escape');
   await expect(dialog).toHaveCount(0);
   await expect(trigger).toBeFocused();
+
+  // Opened from the palette, a dialog gives focus back to what had it before the palette.
+  const home = sidebar(page).getByRole('link', { name: 'Home', exact: true });
+  await home.focus();
+  await page.keyboard.press('Control+KeyK');
+  await expect(page.getByRole('combobox', { name: 'Search' })).toBeFocused();
+  await page.keyboard.type('new team');
+  await expect(page.getByRole('option').first()).toContainText('New team');
+  await page.keyboard.press('Enter');
+  const team = page.getByRole('dialog', { name: 'New team' });
+  await expect(team).toBeVisible();
+  await page.keyboard.press('Escape');
+  await expect(team).toHaveCount(0);
+  await expect(home).toBeFocused();
 });
 
 test('Ctrl B collapses the sidebar to a rail of labelled icons', async ({ page }, info) => {

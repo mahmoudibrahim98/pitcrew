@@ -26,6 +26,8 @@ interface Transient {
   paletteOpen: boolean;
   /** The "+ New" dialog on screen, by entry id. */
   creating: string | null;
+  /** What had focus before that dialog opened, to give focus back to. */
+  creatingFrom: Element | null;
 }
 
 interface Actions {
@@ -36,7 +38,8 @@ interface Actions {
   setOrchestratorOpen(open: boolean): void;
   setOrchestratorWidth(width: number): void;
   setPaletteOpen(open: boolean): void;
-  setCreating(id: string | null): void;
+  /** Opens a "+ New" dialog, or closes it with null. `from` gets focus back when it closes. */
+  setCreating(id: string | null, from?: Element | null): void;
 }
 
 export type ShellState = Persisted & Transient & Actions;
@@ -49,6 +52,7 @@ export const initialShellState: Persisted & Transient = {
   orchestratorWidth: ORCHESTRATOR_WIDTH.initial,
   paletteOpen: false,
   creating: null,
+  creatingFrom: null,
 };
 
 function prefs(state: Persisted, ws: string): WorkspacePrefs {
@@ -74,7 +78,9 @@ export const useShell = create<ShellState>()(
       setOrchestratorOpen: (orchestratorOpen) => set({ orchestratorOpen }),
       setOrchestratorWidth: (orchestratorWidth) => set({ orchestratorWidth }),
       setPaletteOpen: (paletteOpen) => set({ paletteOpen }),
-      setCreating: (creating) => set({ creating }),
+      setCreating: (creating, from = null) =>
+        // Closing keeps `creatingFrom`: the dialog reads it as it hands focus back.
+        set((s) => ({ creating, creatingFrom: creating === null ? s.creatingFrom : from })),
     }),
     {
       name: 'pitcrew.shell',
