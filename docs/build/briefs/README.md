@@ -23,6 +23,8 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [J-ssh-connection](J-ssh-connection.md) | J · Remote and HPC | `s/J/ssh-connection` | Opus-class | In review |
 | [L-skeleton-and-data](L-skeleton-and-data.md) | L · UI foundation | `s/L/skeleton-and-data` | Opus-class | In review: round 3 |
 | [L-shell](L-shell.md) | L · UI foundation | `s/L/shell` | Opus-class | Ready (after skeleton-and-data merges) |
+| [M-console-components](M-console-components.md) | M · Agent console | `s/M/console-components` | Opus-class | Ready (after skeleton-and-data merges) |
+| [N-projects-components](N-projects-components.md) | N · Projects layout | `s/N/projects-components` | Sonnet-class | Ready (after skeleton-and-data merges) |
 
 The branch name matters: CI's path guard reads the stream from it (`s/<stream>/<topic>`). The
 integrator adds new briefs here as streams progress, and marks them done when merged.
