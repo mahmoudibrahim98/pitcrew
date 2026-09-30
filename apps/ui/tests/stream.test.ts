@@ -1,0 +1,230 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createApi } from '../src/data/api.ts';
+import { StreamClient, streamUrl, type StreamStatus } from '../src/data/stream.ts';
+import type { Event, Task, TaskStatus } from '../src/data/types.ts';
+import { DEVICE_TOKEN, fakeSockets, recordingSocket, startServer, type RunningServer } from './helpers.ts';
+
+const NEXT: Record<TaskStatus, TaskStatus> = {
+  backlog: 'todo',
+  todo: 'in_progress',
+  in_progress: 'review',
+  review: 'done',
+  done: 'todo',
+  canceled: 'todo',
+};
+
+function taskMoved(id: string): Event {
+  return {
+    id,
+    at: 0,
+    workspace: 'W',
+    author: 'M',
+    body: { type: 'task_moved', data: { task: 'T', from: 'todo', to: 'review', mover: { kind: 'person' } } },
+  };
+}
+
+describe('stream client against the mock hub', () => {
+  let hub: RunningServer;
+  const clients: StreamClient[] = [];
+
+  beforeEach(async () => {
+    hub = await startServer({ port: 0 });
+  });
+
+  afterEach(async () => {
+    for (const client of clients.splice(0)) client.stop();
+    await hub.close();
+  });
+
+  function client(options: { since?: number; onReset?: (rev: number) => void } = {}) {
+    const received: Event[] = [];
+    const statuses: StreamStatus[] = [];
+    const socket = recordingSocket();
+    const stream = new StreamClient({
+      baseUrl: hub.url,
+      token: DEVICE_TOKEN,
+      since: options.since,
+      socket: socket.factory,
+      onEvents: (events) => received.push(...events),
+      onReset: options.onReset ?? (() => {}),
+      onStatus: (status) => statuses.push(status),
+      backoff: { initialMs: 10, maxMs: 50 },
+    });
+    clients.push(stream);
+    return { stream, received, statuses, urls: socket.urls };
+  }
+
+  async function moveSomeTask(): Promise<Task> {
+    const api = createApi({ baseUrl: hub.url, token: DEVICE_TOKEN });
+    const [task] = await api.tasks({ status: ['todo'] });
+    if (task === undefined) throw new Error('the fixture has no todo task');
+    return api.moveTask(task.id, NEXT[task.status]);
+  }
+
+  it('starts from hello, then resumes from the last to_rev after a disconnect', async () => {
+    const { stream, received, statuses, urls } = client();
+    stream.start();
+    await vi.waitFor(() => expect(stream.status).toBe('live'));
+    const start = stream.rev ?? -1;
+    expect(start).toBeGreaterThan(0);
+    expect(urls[0]).not.toContain('since=');
+
+    const first = await moveSomeTask();
+    await vi.waitFor(() => expect(stream.rev).toBe(start + 1));
+    expect(received.map((e) => e.body.type)).toEqual(['task_moved']);
+    expect(received[0]?.body).toMatchObject({ type: 'task_moved', data: { task: first.id } });
+
+    // Missed while disconnected.
+    stream.stop();
+    const second = await moveSomeTask();
+
+    stream.start();
+    await vi.waitFor(() => expect(stream.rev).toBe(start + 2));
+    expect(urls[1]).toContain(`since=${start + 1}`);
+    expect(received).toHaveLength(2);
+    expect(received[1]?.body).toMatchObject({ type: 'task_moved', data: { task: second.id } });
+    expect(statuses).toEqual(['connecting', 'live', 'stopped', 'connecting', 'live']);
+  });
+
+  it('resets when since is ahead of hello.rev', async () => {
+    const resets: number[] = [];
+    const { stream, received } = client({ since: 10_000, onReset: (rev) => resets.push(rev) });
+    stream.start();
+    await vi.waitFor(() => expect(resets).toHaveLength(1));
+    expect(resets[0]).toBeLessThan(10_000);
+    expect(stream.rev).toBe(resets[0]);
+    expect(received).toEqual([]);
+
+    // Live events after the reset arrive as usual.
+    await moveSomeTask();
+    await vi.waitFor(() => expect(received).toHaveLength(1));
+  });
+
+  it('resets after the hub restarts with a shorter history, and reconnects by itself', async () => {
+    const resets: number[] = [];
+    const { stream } = client({ onReset: (rev) => resets.push(rev) });
+    stream.start();
+    await vi.waitFor(() => expect(stream.status).toBe('live'));
+    const start = stream.rev ?? -1;
+    await moveSomeTask();
+    await vi.waitFor(() => expect(stream.rev).toBe(start + 1));
+
+    const port = hub.port;
+    await hub.close();
+    await vi.waitFor(() => expect(stream.status).toBe('reconnecting'));
+    hub = await startServer({ port });
+
+    await vi.waitFor(() => expect(resets).toEqual([start]));
+    expect(stream.rev).toBe(start);
+    expect(stream.status).toBe('live');
+  });
+});
+
+describe('stream client timing', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  function setup(since?: number) {
+    const { factory, sockets } = fakeSockets();
+    const received: Event[] = [];
+    const stream = new StreamClient({
+      baseUrl: 'http://127.0.0.1:47317',
+      token: DEVICE_TOKEN,
+      since,
+      socket: factory,
+      onEvents: (events) => received.push(...events),
+      onReset: () => {},
+      backoff: { initialMs: 100, maxMs: 1000 },
+      random: () => 1,
+    });
+    return { stream, sockets, received };
+  }
+
+  it('authenticates with subprotocols, never the query string', () => {
+    const { stream, sockets } = setup(7);
+    stream.start();
+    expect(sockets[0]?.protocols).toEqual(['pitcrew.v1', `pitcrew.bearer.${DEVICE_TOKEN}`]);
+    expect(sockets[0]?.url).toBe('ws://127.0.0.1:47317/v1/stream?since=7');
+    expect(sockets[0]?.url).not.toContain(DEVICE_TOKEN);
+    stream.stop();
+  });
+
+  it('uses wss for an https base', () => {
+    expect(streamUrl('https://hub.localhost', undefined)).toBe('wss://hub.localhost/v1/stream');
+  });
+
+  it('reconnects after 60 s of silence, resuming from its revision', () => {
+    const { stream, sockets } = setup();
+    stream.start();
+    sockets[0]?.send({ type: 'hello', rev: 5 });
+    sockets[0]?.send({ type: 'events', from_rev: 6, to_rev: 6, events: [taskMoved('E6')] });
+
+    vi.advanceTimersByTime(59_999);
+    expect(sockets).toHaveLength(1);
+    sockets[0]?.send({ type: 'ping', at: 0 }); // any frame resets the timer
+    vi.advanceTimersByTime(59_999);
+    expect(sockets).toHaveLength(1);
+
+    vi.advanceTimersByTime(1);
+    expect(sockets[0]?.closed).toBe(true);
+    expect(stream.status).toBe('reconnecting');
+    vi.advanceTimersByTime(100);
+    expect(sockets).toHaveLength(2);
+    expect(sockets[1]?.url).toContain('since=6');
+    stream.stop();
+  });
+
+  it('backs off exponentially up to the ceiling, and resets the back-off on hello', () => {
+    const { stream, sockets } = setup();
+    stream.start();
+    const delays: number[] = [];
+    for (let attempt = 0; attempt < 6; attempt++) {
+      const count = sockets.length;
+      sockets[count - 1]?.drop();
+      let waited = 0;
+      while (sockets.length === count) {
+        vi.advanceTimersByTime(50);
+        waited += 50;
+      }
+      delays.push(waited);
+    }
+    expect(delays).toEqual([100, 200, 400, 800, 1000, 1000]);
+
+    sockets.at(-1)?.send({ type: 'hello', rev: 1 });
+    sockets.at(-1)?.drop();
+    vi.advanceTimersByTime(100);
+    expect(sockets).toHaveLength(8);
+    stream.stop();
+  });
+
+  it('skips events it has already seen', () => {
+    const { stream, sockets, received } = setup(5);
+    stream.start();
+    sockets[0]?.send({ type: 'hello', rev: 7 });
+    sockets[0]?.send({ type: 'events', from_rev: 6, to_rev: 7, events: [taskMoved('E6'), taskMoved('E7')] });
+    sockets[0]?.send({ type: 'events', from_rev: 7, to_rev: 8, events: [taskMoved('E7'), taskMoved('E8')] });
+    sockets[0]?.send({ type: 'events', from_rev: 8, to_rev: 8, events: [taskMoved('E8')] });
+    expect(received.map((e) => e.id)).toEqual(['E6', 'E7', 'E8']);
+    expect(stream.rev).toBe(8);
+    stream.stop();
+  });
+
+  it('ignores callbacks from a socket it has let go', () => {
+    const { stream, sockets, received } = setup();
+    stream.start();
+    const old = sockets[0];
+    old?.send({ type: 'hello', rev: 1 });
+    stream.stop();
+    old?.send({ type: 'events', from_rev: 2, to_rev: 2, events: [taskMoved('E2')] });
+    old?.drop();
+    vi.advanceTimersByTime(10_000);
+    expect(received).toEqual([]);
+    expect(sockets).toHaveLength(1);
+    expect(stream.status).toBe('stopped');
+  });
+});
