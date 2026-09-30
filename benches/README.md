@@ -15,8 +15,11 @@ cargo bench -p pitcrew-benches   # criterion alone (full mode; PITCREW_BENCH_MOD
 `run.sh` runs the criterion benchmarks, then `pitcrew-bench-report`, which reads criterion's
 results, prints a table and writes a JSON summary (default
 `<target>/pitcrew-bench/summary.json`). It exits non-zero when a metric is **more than 10% worse**
-than the baseline, is **over its budget**, or **did not run**. Generated inputs go in the system
-temp dir and are deleted as each benchmark finishes; at most one 200 MiB file exists at a time.
+than the baseline, is **over its budget**, or **did not run**. Before failing, it runs the
+failing benchmarks again, up to twice (`--retries N`), keeping each one's lowest median and
+lowest best: noise fails one attempt, a real regression fails them all. Generated inputs go in
+the system temp dir and are deleted as each benchmark finishes; at most one 200 MiB file exists
+at a time.
 
 ## What is measured
 
@@ -32,10 +35,9 @@ temp dir and are deleted as each benchmark finishes; at most one 200 MiB file ex
 
 Each metric has two numbers. `value` is criterion's **median** per iteration, the typical cost,
 and is checked against the **budget**. `best` is the fastest sample's time per iteration, and is
-checked against the **baseline**: other work on the machine (parallel builds, landing on an
-efficiency core, an fsync stall) only ever adds time, so `best` moves far less between runs than
-the median, and a 10% threshold does not flake on a shared machine. A code change that slows the
-work down still slows the fastest sample.
+checked against the **baseline**: other work on the machine (parallel builds, an fsync stall)
+only ever adds time, so `best` moves less between runs than the median. A code change that slows
+the work down still slows the fastest sample.
 
 Transcripts are synthetic, shaped like the fixtures, with one 24 KiB tool result per turn; they
 are in the page cache when measured, so `read_page` is the parse cost, not a cold disk read.
@@ -69,4 +71,22 @@ failures: `regressed`, `over_budget`, `missing`.
 Numbers only compare within a class: a CI runner needs its own baseline, recorded on that runner
 with `--write-baseline`. The report warns when the machine differs from the baseline's.
 
-<!-- baseline-notes -->
+The committed baseline comes from the stream's laptop (Intel Core Ultra 5 135U: 2 performance,
+8 efficiency and 2 low-power cores; WSL2), recorded while other agents were building. **On that
+machine a 10% gate is not reliable**: WSL cannot pin work to a core type, and the same binary
+measured this far apart within a few hours (best per iteration):
+
+| Metric | Run A | Slowest run | Run B (the baseline) | Quick runs after B |
+|---|---|---|---|---|
+| `transcript.claude.read_page.20mib` | 0.92 ms | 3.72 ms | 1.83 ms | 1.44, 1.92, 1.16 ms |
+| `transcript.claude.read_from.20mib` | 416 MiB/s | 73 MiB/s | 235 MiB/s | 199, 176, 369 MiB/s |
+| `store.before.page_100.one_type` | 0.29 ms | 1.05 ms | 0.51 ms | 0.44, 0.37, 0.35 ms |
+| `control.parse` | 370 MiB/s | 139 MiB/s | 255 MiB/s | 263, 241, 360 MiB/s |
+| `stream.append_to_frame.memory` | 76.3 ms | 76.2 ms | 76.4 ms | 76.3, 76.3, 76.2 ms |
+
+Only the stream latency, which a timer dominates, holds still. Without retries, one of five quick
+runs against this baseline passed; with the default two retries, three of three did, each after
+re-running one to four benchmarks. The retries make the laptop usable for a local check, but a
+real regression under about 2x could hide in this noise: use the laptop baseline to see orders
+of magnitude and the budgets' headroom, and gate on a quiet, dedicated runner with its own
+baseline.
