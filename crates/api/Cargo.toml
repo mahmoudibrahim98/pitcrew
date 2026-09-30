@@ -10,6 +10,28 @@ authors.workspace = true
 
 [dependencies]
 pitcrew-protocol.workspace = true
+pitcrew-auth.workspace = true
+axum.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "time"] }
+tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# The named pipe's security descriptor. The version tokio already uses.
+windows-sys = { version = "=0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread", "sync"] }
+# Blocking WebSocket client for the subprotocol test. The version axum's `ws` feature already uses.
+tungstenite = "=0.29.0"
+tower = { workspace = true, features = ["util"] }
 
 [lints]
 workspace = true
