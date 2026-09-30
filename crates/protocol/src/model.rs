@@ -617,6 +617,9 @@ pub struct Session {
     /// The terminal it runs in, if the runner owns one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal: Option<TerminalId>,
+    /// For a sub-agent's session, the session that started it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<SessionId>,
 }
 
 /// How a dispatch ended.

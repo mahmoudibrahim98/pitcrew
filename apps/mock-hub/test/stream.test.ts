@@ -48,7 +48,7 @@ describe('event stream', () => {
     withServer(async (server) => {
       const first = await connect(server, DEVICE);
       assert.equal(first.protocol, 'pitcrew.v1');
-      assert.deepEqual(await first.nextJson(), { type: 'hello', rev: 15 });
+      assert.deepEqual(await first.nextJson(), { type: 'hello', rev: 15, log: server.logId });
 
       const moved = await call(server, 'POST', '/v1/tasks/PAP-2/move', {
         token: DEVICE,
@@ -77,7 +77,7 @@ describe('event stream', () => {
       await call(server, 'POST', '/v1/tasks/PAP-6/assign', { token: DEVICE, json: { assignee: ID.runner } });
 
       const second = await connect(server, DEVICE, live.to_rev);
-      assert.deepEqual(await second.nextJson(), { type: 'hello', rev: 18 });
+      assert.deepEqual(await second.nextJson(), { type: 'hello', rev: 18, log: server.logId });
       const missed = await second.nextJson<EventsFrame>();
       assert.equal(missed.from_rev, 17);
       assert.equal(missed.to_rev, 18);
@@ -93,7 +93,7 @@ describe('event stream', () => {
   it('replays from any revision, including the fixture events', () =>
     withServer(async (server) => {
       const socket = await connect(server, DEVICE, 12);
-      assert.deepEqual(await socket.nextJson(), { type: 'hello', rev: 15 });
+      assert.deepEqual(await socket.nextJson(), { type: 'hello', rev: 15, log: server.logId });
       const replay = await socket.nextJson<EventsFrame>();
       assert.equal(replay.from_rev, 13);
       assert.equal(replay.to_rev, 15);

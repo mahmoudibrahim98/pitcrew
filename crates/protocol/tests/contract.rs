@@ -236,10 +236,13 @@ fn host_info_and_stream_frames() {
     };
     let back: HostInfo = serde_json::from_value(serde_json::to_value(&info).unwrap()).unwrap();
     assert_eq!(back, info);
-    let frame = StreamFrame::Hello { rev: 7 };
+    let frame = StreamFrame::Hello {
+        rev: 7,
+        log: "01JB000000000000000LOG0001".into(),
+    };
     assert_eq!(
         serde_json::to_value(&frame).unwrap(),
-        json!({"type": "hello", "rev": 7})
+        json!({"type": "hello", "rev": 7, "log": "01JB000000000000000LOG0001"})
     );
 }
 
