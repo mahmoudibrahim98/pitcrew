@@ -18,6 +18,7 @@ pub mod claude;
 pub mod codex;
 mod jsonl;
 mod lines;
+mod patch;
 mod text;
 mod time;
 
