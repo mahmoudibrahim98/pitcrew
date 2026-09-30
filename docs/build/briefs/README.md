@@ -20,7 +20,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [H-listener-and-tokens](H-listener-and-tokens.md) | H · API and auth | `s/H/listener-and-tokens` | Opus-class | **Merged** |
 | [H-delta-stream](H-delta-stream.md) | H · API and auth | `s/H/delta-stream` | Opus-class | **Merged** |
 | [H-terminal-and-activity](H-terminal-and-activity.md) | H · API and auth | `s/H/terminal-and-activity` | Opus-class | **Merged** |
-| [H-terminal-hardening](H-terminal-hardening.md) | H · API and auth | `s/H/terminal-hardening` | Opus-class | In progress |
+| [H-terminal-hardening](H-terminal-hardening.md) | H · API and auth | `s/H/terminal-hardening` | Opus-class | In review |
 | [I-cli-and-hooks](I-cli-and-hooks.md) | I · CLI and hooks | `s/I/cli-and-hooks` | Sonnet-class | In review: fixes in progress |
 | [J-ssh-connection](J-ssh-connection.md) | J · Remote and HPC | `s/J/ssh-connection` | Opus-class | In review: fixes in progress |
 | [L-skeleton-and-data](L-skeleton-and-data.md) | L · UI foundation | `s/L/skeleton-and-data` | Opus-class | **Merged** |
@@ -33,6 +33,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 
 | [0-work-edits](0-work-edits.md) | 0 · Contracts | `integrator/work-edits` | Opus-class | In progress |
 | [C-nfs-and-maintenance](C-nfs-and-maintenance.md) | C · Store | `s/C/nfs-and-maintenance` | Sonnet-class | In progress |
+| [G-github-read](G-github-read.md) | G · Integrations | `s/G/github-read` | Sonnet-class | In progress |
 | [A-scan](A-scan.md) | A · Ingest | `s/A/scan` | Sonnet-class | Ready (after opencode-adapter merges) |
 | [D-hub-link](D-hub-link.md) | D · Runner | `s/D/hub-link` | Opus-class | In progress |
 | [F-briefs-and-office](F-briefs-and-office.md) | F · Recap | `s/F/briefs-and-office` | Opus-class | In progress |
