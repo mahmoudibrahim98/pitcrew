@@ -30,6 +30,12 @@ let parts = RouterParts::new()
     .agent(pitcrew_hub_work::agent_routes().layer(Extension(Arc::clone(&work))))
     .device(pitcrew_hub_work::device_routes().layer(Extension(Arc::clone(&work))));
 let refs: Arc<dyn pitcrew_hub_work::EventRefs> = work.clone(); // GET /v1/events filters (stream H)
+let recaps: Arc<dyn pitcrew_hub_work::RecapIndex> = work.clone(); // GET /v1/recaps/* (stream H)
+// Optional: build the recap index now, off the request path (it reads the whole log once).
+tokio::task::spawn_blocking({
+    let work = Arc::clone(&work);
+    move || work.sync_recaps()
+});
 
 // The back office: after each append batch, apply what it emitted (see "The back office").
 tokio::spawn(async move {
@@ -168,6 +174,74 @@ elsewhere. It walks the index of the filter's most specific field and checks the
 row, examining at most `REF_SCAN_BUDGET` (10,000) rows per call. `scanned_to` is where to
 continue; it is 0 only when the search reached the start of the log (nothing older matches), and
 a non-zero one does not promise older matches.
+
+## Recaps (`RecapIndex`)
+
+`GET /v1/recaps/blocks` and `GET /v1/recaps/days` (api-v1, "Recaps") are answered by the recap
+index, `src/recap.rs`. Stream H's routes call it through a seam the daemon adapts, as for
+`EventRefs`:
+
+```rust
+// pitcrew_hub_work::RecapIndex, implemented by WorkService. Both block: call them on the blocking
+// pool.
+fn recap_blocks(&self, filter: &BlockFilter, before: Option<EventId>, limit: Option<usize>)
+    -> Result<BlocksPage>;
+fn recap_days(&self, scope: DaysScope, tz_minutes: i32, before: Option<&Date>,
+    limit: Option<usize>) -> Result<DaysPage>;
+// BlockFilter { session, task, workstream, project }: all Option, combined; none = every block.
+// DaysScope::Workstream(id) | DaysScope::Project(id).
+```
+
+- **What it serves.** Blocks newest first by id, each with its `block_line`; `before` exclusive,
+  any event id. Days: `day_recaps` with the `RuleSummarizer` over the blocks whose `workstream`
+  (or `project`) it is, newest date first and, within a date, the entry without a workstream first,
+  then by workstream id; pages hold whole dates. `limit: None` is the protocol's default (50 blocks,
+  7 dates) and more than the cap (200, 30) counts as the cap. A page that is not at the start is
+  never empty; an unknown id is an empty page with `at_start`. What the contract calls `400`
+  (`limit` 0, `tz` beyond ±840, a `before` that is not `YYYY-MM-DD`) is `invalid` here too, so the
+  seam never panics whatever reaches it.
+- **Kept current on read.** `Recaps` (the index itself, pure and in memory) feeds the recap
+  engine's `BlockBuilder` every event in log order and keeps every block, open and closed, indexed
+  by session, task, workstream and project. The service's `Recaps` starts empty: **every query
+  first reads the log from the last revision the index applied** (`Store::since`, 1,000 events at a
+  time, each page applied whole or not at all), then answers. That is the back office's "from the
+  first revision not looked at" without a subscription: no event is missed or applied twice,
+  appends by another process included, and a client that refetches after a stream frame gets the
+  frame's event. The first query builds the index from the whole log;
+  `WorkService::sync_recaps()` does it eagerly (see "Wiring") and returns the revision it reflects.
+- **From the log, not from the projections.** The engine's `Directory` (which session works on
+  which task, which task is in which workstream) starts empty and learns from the events from
+  revision 1, so a block's links are those in force when its events happened, and an index kept
+  current for months equals one rebuilt today. Seeding it with today's projections would put
+  today's links ahead of yesterday's events. Names in lines and paragraphs are the current ones:
+  the directory plus `member_added` (which the engine's directory does not follow).
+- **A refused `task_created`** (in `work_task_clashes`, see "One writer") is not activity: it is
+  left out, so a task the hub never had is in no recap.
+- **Day paragraphs are cached** by scope, `tz`, date and workstream, with the `(id, last)` of every
+  block each covers. A query writes a paragraph again only when its blocks changed (one grew, began,
+  or moved to another day or workstream) or a name may have changed (a member, task key,
+  workstream name or ask re-stated); a growing block rewrites only its own day. At most
+  `DAY_CACHE_ENTRIES` (2,048) are kept, least recently used out first.
+- **Memory.** Every block stays in memory (they are derived, never stored): one to six kilobytes
+  each as JSON, depending on how much it holds (see "Timings"). A hub restart rebuilds them.
+
+**Known differences from the activity index** (both are the engine's rules, stream F):
+- The engine's directory takes a session's link from every `session_discovered` and
+  `session_linked`, where the hub keeps a firm link (a dispatch's, a person's) over an inferred one
+  (see "Sessions: firm links stay"). A dispatched session that the runner later re-discovers with a
+  folder link is then linked differently in recaps than in `work.refs` from that point on.
+- A stale `task_moved` (one the tasks projection ignores, which only a second writer makes) still
+  counts as a move.
+
+**The seeded demo is not the fixture.** `crates/fixtures/data/demo-recaps.json` is the engine over
+the demo's slice of events, with the demo's lists known beforehand; fed exactly that, the index
+serves it, alone and through a store (`tests/recaps.rs`). A hub seeded with `seed` serves something
+else, because its log is different: the seed's own events (`task_created`, `session_discovered`,
+`dispatch_started`, `ask_raised`, `brief_accepted`, ...) are activity and make blocks of their own;
+they are grouped by kind, each at its own time, before a slice that is partly older, so
+out-of-order times split and join blocks (the engine closes a block on seeing an event more than
+20 minutes later); and their ids are new ULIDs, so the blocks they begin sort first, in no stable
+order among themselves. Of the fixture's 10 blocks, 3 come back unchanged; the seeded hub has 24.
 
 ## Dispatch
 
@@ -347,6 +421,17 @@ query `400`; bodies over 1 MiB are `400`. A `500` is logged in full and its body
   mounted bare and guarded), authorization before validation, who answers asks.
 - `tests/refs.rs`: the reference index against an independent oracle over the demo, paging,
   the scan budget, links over time, the query plans.
+- `tests/recaps.rs`: the recap index serves `demo-recaps.json` when fed the fixture's events (in
+  memory, and through a store whose log holds them after what the fixture knew), and why the
+  seeded demo differs; every page, filter and day of a generated log through the hub against the
+  engine over the whole log at once, at page sizes from 1 to over the cap; filters combined,
+  `before`, defaults and caps; odd and hostile input; a growing open block; the day cache (a
+  repeated query writes nothing, a growing block rewrites only its day, a new name rewrites all,
+  the bound); refused task creations; appends from another connection; receipts; shared use from
+  several threads. `tests/recap_props.rs`: property tests that an index kept current through
+  random batches, with queries in between, equals a rebuild and the engine over the whole log,
+  through a store and in memory (with small engine caps and caches); and every receipt points
+  into the log. `tests/recap_common/` holds the generator and the oracle.
 - `tests/sessions.rs`, `tests/dispatch.rs`, `tests/routes.rs`, `tests/self_moving.rs`: the other
   routes and commands. `tests/task_shape.rs`: the `Task` shape pin.
 
@@ -375,6 +460,20 @@ build, with several other agents compiling on the same machine (so the numbers a
 The route sends the stored documents as they are; decoding them into `Task`s is what the service
 lists cost on top. An earlier run on a quieter machine measured about half the task lists'
 medians.
+
+**The recap index**: `cargo test -p pitcrew-hub-work --release --test recap_perf -- --ignored
+--nocapture` builds a log of 100,000 generated events, then times a fresh service's first
+`sync_recaps` (the rebuild) and the queries. Measured 2026-10-01 on the same laptop, release build,
+under load (load average about 10 on 14 threads: other agents were compiling):
+
+| 100,000 events | Blocks | Rebuild, best / median of 5 | Reading the log alone | The engine alone |
+|---|---|---|---|---|
+| sparse: 200 sessions, events up to 2 min apart | 62,058 (72.5 MB as JSON, lines included) | 1,022 / 1,281 ms | 599 ms | 182 ms |
+| bursty: 24 sessions, bursts seconds apart | 2,819 (16.7 MB) | 328 / 566 ms | 284 ms | 37 ms |
+
+Queries, median of 21 (sparse / bursty): the newest 50 blocks 0.15 / 0.49 ms; a session's 200
+blocks 1.3 / 1.3 ms; a project's 30 days from the cache 4.5 / 0.45 ms (cold: 39 / 17 ms); a page
+right after one new event 1.6 / 0.9 ms. Reading and decoding the log is most of a rebuild.
 
 ## Differences from the mock hub
 
