@@ -15,7 +15,7 @@ The first-run wizard and the add-a-machine wizard. See `docs/build/streams/O.md`
 | `machine-target-picker.tsx` | This computer, a WSL distro, or an SSH host from `discoverHosts()` — never a free-typed host. |
 | `steps/*.tsx` | One component per step. The add-a-machine wizard reuses `workspace-step.tsx`, `machine-check-step.tsx`, `install-helper-step.tsx`, `sign-in-step.tsx`, `scan-step.tsx`, `create-step.tsx` and `import-step.tsx`; each reads `useWizard().mode` where its copy or fields differ. |
 | `first-run-page.tsx`, `add-machine-page.tsx` | The two routes' components (`routes.tsx`), lazy-loaded. |
-| `*.test.ts(x)` | Vitest and Testing Library, against the fake. See "Running this stream's tests" below. |
+| `*.test.ts(x)` | Vitest and Testing Library, against the fake. Picked up by the root `apps/ui/vitest.config.ts`'s `src/**/*.test.{ts,tsx}` — just `corepack pnpm --filter @pitcrew/ui test`. |
 
 ## The `OnboardingApi` contract (proposed)
 
@@ -33,11 +33,11 @@ implementation. Types are in `api.ts`, reusing `Engine`, `Project`, `Workstream`
 | `checkMachine(target)` | `MachineTarget → MachineCheckResult` | CLI versions, tmux, git, gh, disk, and SLURM (SSH targets only). Each row: `status`, `detail`, `fixable`. |
 | `fixMachineRow(target, row)` | `(MachineTarget, CheckRowId) → MachineCheckRow` | Rejects if the row is not `fixable`. |
 | `launcherOptions(target)` | `MachineTarget → LauncherOption[]` | Which of `direct` / `tmux` / `systemd-user` / `slurm` this machine supports, and which is recommended (ADR-0009's "default detected"). |
-| `streamInstallHelper(options, onEvent)` | `(InstallHelperOptions, cb) → Streamed` | Streams `log` lines; `slurm` first sends `script-preview` with the **exact** script, before anything is submitted. Ends with `done` or `error`. `Streamed.cancel()` stops it (a step unmounting mid-install). |
+| `streamInstallHelper(options, onEvent)` | `(InstallHelperOptions, cb) → Streamed` | Streams `log` lines; `slurm` first sends `script-preview` with the **exact** script, before anything is submitted. Ends with `done` or `error`. `Streamed.cancel()` stops it (a step unmounting mid-install) — a real implementation must stop the **server-side** deploy, not just detach the listener, or React StrictMode's dev-only double-mount (cancel, then start again) ends up running it twice. |
 | `agentAccounts()` | `() → AgentAccount[]` | One row per engine: `signedIn`, and the account label if so. |
 | `startSignIn(engine, machine)` | `(Engine, MachineTarget) → { terminalSessionId }` | Opens the CLI's own login **in a terminal on that machine** (ADR-0010: PitCrew never reads or copies its OAuth tokens). The id is meant to open in the Agent console (stream M); until that's registered, the wizard links to the shell's placeholder session page. |
 | `integrationStatus()` | `() → IntegrationStatus[]` | GitHub, Jira, Linear, GitLab. Stream G owns the real connections. |
-| `streamScan(target, onEvent)` | `(ScanTarget, cb) → Streamed` | Streams `progress`, ends with `done` carrying counts (by engine, folder, month) and suggested projects/workstreams. |
+| `streamScan(target, onEvent)` | `(ScanTarget, cb) → Streamed` | Streams `progress`, ends with `done` carrying counts (by engine, folder, month) and suggested projects/workstreams. Same `Streamed.cancel()` contract as `streamInstallHelper`: stop the server-side walk, not just the listener. |
 | `createFromScan(selection)` | `ProjectSelection[] → { projects: Project[], workstreams: Workstream[] }` | What the "Create" step submits after the user ticks, renames and regroups. **Not in `api-v1.md` at all**: there is no `POST /v1/projects` or `POST /v1/workstreams` today. |
 | `importSessions(filter)` | `ImportFilter → { count }` | A dry run: counts what the filter would import without importing anything. |
 | `commitImport(filter)` | `ImportFilter → { imported }` | Commits it. Sessions are read in place and never moved (ADR-0010); reversible (`link_basis: "imported"` can be unlinked later — that unlink route doesn't exist yet either). |
@@ -73,18 +73,14 @@ That's a change to `src/shell/**`, outside this stream's paths — flagged here 
 
 ## Running this stream's tests
 
-Vitest's `include` in `apps/ui/vitest.config.ts` (owned by stream L) is `['tests/**/*.test.{ts,tsx}']`,
-so `pnpm test` does not pick up tests colocated under `src/onboarding/**`. Rather than touch a file
-outside this stream's paths, there's a second, scoped config here:
+`apps/ui/vitest.config.ts`'s `include` now covers `src/**/*.test.{ts,tsx}`, so this stream's tests
+run with everyone else's:
 
 ```
-corepack pnpm --filter @pitcrew/ui exec vitest run --config src/onboarding/vitest.config.ts
+corepack pnpm --filter @pitcrew/ui test
 ```
 
-For CI to run these too, stream L (or the integrator) should add `'src/**/*.test.{ts,tsx}'` to the
-root config's `include` — at which point this file's own config becomes redundant and can go.
-
-The same gap exists for Playwright: `apps/ui/playwright.config.ts` (also L's) has `testDir: 'e2e'`,
+Playwright is a different story: `apps/ui/playwright.config.ts` (L's) has `testDir: 'e2e'`,
 and `apps/ui/e2e/**` is L's path too. The onboarding end-to-end spec lives at
 `src/onboarding/e2e/onboarding.e2e.spec.ts`, with its own `src/onboarding/e2e/playwright.config.ts`
 (same ports and webServer shape as the root one, so it is a drop-in once moved). Run it with:

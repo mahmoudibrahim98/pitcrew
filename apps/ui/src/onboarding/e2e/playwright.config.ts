@@ -1,3 +1,4 @@
+/// <reference types="node" />
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defineConfig } from '@playwright/test';
@@ -7,6 +8,12 @@ import { defineConfig } from '@playwright/test';
 // "Running this stream's tests". Same shape and ports as the root config; every path is absolute
 // (computed from this file's own location) so it does not depend on the runner's cwd or on
 // Playwright's webServer `cwd` support.
+//
+// This file (and its sibling spec) sit under `src/`, so `tsc -b` checks them against
+// `tsconfig.app.json` (browser-only `types`), not `tsconfig.node.json` (which has Node's types but
+// only looks in `e2e/`, `tests/` and `src/**/tests/**` — not `src/onboarding/e2e/`, and neither
+// config is this stream's to edit). The reference directive above pulls in `@types/node` for this
+// file alone, regardless of `tsconfig.app.json`'s `types` array.
 // Run with:
 //   corepack pnpm --filter @pitcrew/ui exec playwright test --config src/onboarding/e2e/playwright.config.ts
 const here = path.dirname(fileURLToPath(import.meta.url));
