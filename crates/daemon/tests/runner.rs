@@ -472,13 +472,13 @@ fn the_runner_stops_before_the_store_closes_and_a_restart_repeats_nothing() {
 
 /// Makes `dir` as the daemon would accept it: private (0700) on Unix.
 fn private_dir(dir: &Path) {
-    let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt as _;
-        builder.mode(0o700);
+        std::fs::DirBuilder::new().mode(0o700).create(dir).unwrap();
     }
-    builder.create(dir).unwrap();
+    #[cfg(not(unix))]
+    std::fs::create_dir(dir).unwrap();
 }
 
 /// A runner that cannot start (here its index cannot be made: `runner` in the state directory is
