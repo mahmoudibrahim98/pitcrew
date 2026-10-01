@@ -108,6 +108,17 @@ describe('POST /v1/setup', () => {
         { ...SETUP, workspace_name: 'Lab\u0007' },
         { ...SETUP, person: { name: 'Sam\u0007', handle: '@sam' } },
         { ...SETUP, machine_name: 'Laptop\u0007' },
+        // Nothing but whitespace is empty once trimmed.
+        { ...SETUP, workspace_name: ' \t\n ' },
+        { ...SETUP, person: { name: ' 　', handle: '@sam' } },
+        { ...SETUP, machine_name: '  ' },
+        // Counted after trimming: still too long.
+        { ...SETUP, workspace_name: ` ${long(81)} ` },
+        // The handle is not trimmed.
+        { ...SETUP, person: { name: 'Sam', handle: ' @sam' } },
+        { ...SETUP, person: { name: 'Sam', handle: '@sam ' } },
+        // U+0085 at an end is a control character, which trimming keeps: refused.
+        { ...SETUP, workspace_name: 'Lab\u0085' },
       ];
       for (const json of cases) {
         refused(await call(server, 'POST', '/v1/setup', { token: DEVICE, json }), 400, JSON.stringify(json));
@@ -146,6 +157,27 @@ describe('POST /v1/setup', () => {
 
       const machines = await call<Machine[]>(server, 'GET', '/v1/machines', { token: DEVICE });
       assert.deepEqual(machines.body, [machine]);
+    }));
+
+  it('trims the three names, counts them after trimming, and stores them trimmed', () =>
+    fresh(async (server) => {
+      const padded = {
+        workspace_name: `  ${'x'.repeat(80)}\t`,
+        person: { name: '　Sam Rivera\n', handle: '@sam' },
+        machine_name: ' This  laptop ',
+      };
+      const res = await call<SetupDone>(server, 'POST', '/v1/setup', { token: DEVICE, json: padded });
+      assert.equal(res.status, 200);
+      assert.equal(res.body.workspace.name, 'x'.repeat(80));
+      assert.equal(res.body.me.name, 'Sam Rivera');
+      assert.equal(res.body.machine.name, 'This  laptop', 'whitespace inside a name stays');
+
+      const workspace = await call<WorkspaceReply>(server, 'GET', '/v1/workspace', { token: DEVICE });
+      assert.equal(workspace.body.workspace.name, 'x'.repeat(80));
+      const me = await call<Member>(server, 'GET', '/v1/me', { token: DEVICE });
+      assert.equal(me.body.name, 'Sam Rivera');
+      const machines = await call<Machine[]>(server, 'GET', '/v1/machines', { token: DEVICE });
+      assert.equal(machines.body[0]?.name, 'This  laptop');
     }));
 
   it('answers 409 once set up, and never creates a second person', () =>

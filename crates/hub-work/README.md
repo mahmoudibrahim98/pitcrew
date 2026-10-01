@@ -417,8 +417,10 @@ run"). `WorkService::set_up(caller, Setup) -> Result<SetupDone>` (`src/setup.rs`
 through the one writer:
 
 - device tokens only (`forbidden` for an agent, checked before the body);
-- every field checked exactly as the contract says (lengths, the handle's shape, no control
-  characters), `400` before the `409`s;
+- every field checked exactly as the contract says (the three names trimmed, then counted in
+  code points and stored trimmed; the handle's shape, not trimmed; no control characters), `400`
+  before the `409`s. Whitespace is what JavaScript's `trim` removes (Unicode's `White_Space`
+  except U+0085, plus U+FEFF), so this hub and the mock hub store the same names;
 - `409 conflict` once the workspace already has a person, or if the handle is taken (by another
   member the hub already knows, e.g. a back office added before a person existed) — so a retried
   request never makes a second person: the first call to commit wins, every other sees the

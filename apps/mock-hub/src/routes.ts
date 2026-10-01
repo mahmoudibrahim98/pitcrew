@@ -330,13 +330,19 @@ const SETUP_HANDLE = /^@[a-z0-9_-]{1,32}$/;
 /** C0 and C1 control characters, disallowed in every `Setup` string. */
 const CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F]/;
 
-function requireSetupText(value: string, field: string, max: number): void {
-  if (charCount(value) < 1 || charCount(value) > max) {
-    throw invalid(`${field} must be 1 to ${max} characters.`);
+/**
+ * A `Setup` name: trimmed of whitespace, then 1 to `max` characters (code points) with no control
+ * character. Returns the trimmed value, which is what is stored (api-v1.md, "The first run").
+ */
+function setupText(value: string, field: string, max: number): string {
+  const trimmed = value.trim();
+  if (charCount(trimmed) < 1 || charCount(trimmed) > max) {
+    throw invalid(`${field} must be 1 to ${max} characters after trimming.`);
   }
-  if (CONTROL_CHARS.test(value)) {
+  if (CONTROL_CHARS.test(trimmed)) {
     throw invalid(`${field} must not contain control characters.`);
   }
+  return trimmed;
 }
 
 /**
@@ -351,17 +357,15 @@ const setupHub: Handler = (hub, ctx) => {
     throw conflict('This workspace is already set up.');
   }
   const fields = new Fields(ctx.body);
-  const workspaceName = fields.text('workspace_name');
-  requireSetupText(workspaceName, 'workspace_name', 80);
+  const workspaceName = setupText(fields.string('workspace_name'), 'workspace_name', 80);
   const person = new Fields(fields.raw('person'), fields.name('person'));
-  const name = person.text('name');
-  requireSetupText(name, 'person.name', 80);
+  const name = setupText(person.string('name'), 'person.name', 80);
+  // The handle is not trimmed.
   const handle = person.string('handle');
   if (!SETUP_HANDLE.test(handle)) {
     throw invalid('person.handle must be "@" followed by 1 to 32 of a-z, 0-9, "_" or "-".');
   }
-  const machineName = fields.text('machine_name');
-  requireSetupText(machineName, 'machine_name', 60);
+  const machineName = setupText(fields.string('machine_name'), 'machine_name', 60);
   if (hub.members.some((m) => m.handle === handle)) {
     throw conflict(`The handle ${handle} is already taken.`);
   }
