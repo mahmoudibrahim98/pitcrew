@@ -129,6 +129,29 @@ it already does.
 **Cleanup.** When the webview reloads or the window closes, the gateway closes every socket that
 window opened.
 
+## Navigation from outside the window
+
+Deep links (`pitcrew://w/<ws>/inbox`, `pitcrew://w/<ws>/task/<id>`,
+`pitcrew://w/<ws>/session/<id>`, `pitcrew://w/<ws>/project/<id>` and
+`pitcrew://w/<ws>/workstream/<id>`), and clicks on the app's own notifications, open a place in the
+UI. The gateway emits the Tauri event `gateway://navigate`, then shows and focuses the main window.
+Its payload is a typed target, not a path:
+
+```ts
+interface NavigateTarget {
+  workspace: string;                                              // a workspace id (ULID)
+  kind: 'inbox' | 'task' | 'session' | 'project' | 'workstream';
+  id?: string;                                                    // required unless kind is 'inbox'
+}
+```
+
+- **The gateway accepts only those link shapes.** Every id is a bare ULID or a known display
+  form. Anything else from a deep link is dropped and logged (shortened), never forwarded.
+- **The UI checks the target again,** maps it to its own route (`paths.task(ws, id)`, and so on),
+  and navigates. An unknown workspace goes to `/` with a notice.
+- **Deep links arrive from any web page,** so they never act: they only navigate. No deep link
+  answers an ask, moves a task, or sends input.
+
 ## Security notes
 
 - Only the app's own windows can call these commands (Tauri capabilities). No remote URL is ever
