@@ -7,8 +7,12 @@
 //!   (`tauri://localhost`, or `http://tauri.localhost` on Windows); debug builds load the Vite dev
 //!   server named by `devUrl`. A release build without the bundled UI does not compile.
 //! - **The CSP** is in `tauri.conf.json`; **the capability** in `capabilities/main.json`: the
-//!   gateway's commands and listening to `gateway://workspaces`, nothing else.
-//! - **Single instance**: a second launch focuses the first one's window.
+//!   gateway's commands and listening to its events, nothing else. The app alone emits
+//!   `gateway://workspaces` and `gateway://navigate`.
+//! - **Single instance**: a second launch focuses the first one's window, and opens the deep link
+//!   it was given, if any ([`crate::navigate`]).
+//! - **In the background** ([`crate::shell`]): closing the window keeps the app in the tray, when
+//!   there is one and the person has not chosen to quit on close.
 //! - **Cleanup**: when the page reloads or the window closes, the gateway closes every socket that
 //!   page opened. When the app quits, the supervisor stops the daemon if it started it.
 
@@ -16,9 +20,12 @@ use crate::daemon::endpoint::Endpoint;
 use crate::daemon::supervisor::{Options, Supervisor};
 use crate::daemon::{LocalConnector, follow, locate};
 use crate::gateway::Gateway;
+use crate::navigate::{self, Navigator};
+use crate::preferences::PreferenceStore;
 use crate::registry::{self, GatewayWorkspace, Registry};
 use crate::settings::Settings;
-use crate::{commands, logging};
+use crate::shell::Shell;
+use crate::{commands, logging, scheme, tray};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -49,9 +56,14 @@ pub fn run() -> ExitCode {
     logging::init();
     let started = std::time::Instant::now();
     let builder = tauri::Builder::default()
-        // First, so a second instance hands over and exits before anything else starts.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            focus_main(app);
+        // Managed before any plugin, so a link handed over while the app starts is held, not
+        // dropped.
+        .manage(Navigator::default())
+        // First, so a second instance hands over and exits before anything else starts. It
+        // hands over its command line: a deep link, when the desktop opened one (on Windows the
+        // plugin joins the arguments with `|` and splits them again).
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            navigate::open_links(app, args.iter().skip(1));
         }))
         .setup(move |app| {
             setup(app)?;
@@ -65,16 +77,24 @@ pub fn run() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    app.run(|handle, event| {
-        if let RunEvent::Exit = event {
-            shutdown(handle);
+    app.run(|handle, event| match event {
+        RunEvent::Exit => shutdown(handle),
+        // macOS hands deep links over as Apple Events, to the running app, already parsed: dot
+        // segments are resolved by then (see `navigate`).
+        #[cfg(target_os = "macos")]
+        RunEvent::Opened { urls } => {
+            navigate::open_links(handle, urls.iter().map(Url::as_str));
         }
+        #[cfg(target_os = "macos")]
+        RunEvent::Reopen { .. } => navigate::focus_main(handle),
+        _ => {}
     });
     ExitCode::SUCCESS
 }
 
 /// The parts of the app that tests drive too, with the mock runtime: the commands and the
-/// cleanup hooks. The gateway itself is managed state (`app.manage(Gateway::new(…))`).
+/// window hooks. The gateway itself is managed state (`app.manage(Gateway::new(…))`), and so are
+/// the [`Navigator`] and the [`Shell`] when there are.
 pub fn configure<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder
         .invoke_handler(tauri::generate_handler![
@@ -89,21 +109,41 @@ pub fn configure<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
 }
 
 /// A page started loading (a reload, or the first load): the sockets its predecessor opened
-/// close.
+/// close, and navigation waits until the new page listens.
 pub fn on_page_load<R: Runtime>(webview: &Webview<R>, payload: &PageLoadPayload<'_>) {
-    if payload.event() == PageLoadEvent::Started
-        && let Some(gateway) = webview.try_state::<Gateway>()
-    {
+    if payload.event() != PageLoadEvent::Started {
+        return;
+    }
+    if let Some(gateway) = webview.try_state::<Gateway>() {
         gateway.page_started(webview.label());
+    }
+    if webview.label() == MAIN
+        && let Some(navigator) = webview.try_state::<Navigator>()
+    {
+        navigator.page_started();
     }
 }
 
-/// A window closed: the sockets its page opened close.
+/// The main window's close keeps the app in the tray (when [`Shell::keeps_running_on_close`]);
+/// a window that is gone has its sockets closed.
 pub fn on_window_event<R: Runtime>(window: &Window<R>, event: &WindowEvent) {
-    if let WindowEvent::Destroyed = event
-        && let Some(gateway) = window.try_state::<Gateway>()
-    {
-        gateway.forget(window.label());
+    match event {
+        WindowEvent::CloseRequested { api, .. } if window.label() == MAIN => {
+            if let Some(shell) = window.try_state::<Shell>()
+                && shell.keeps_running_on_close()
+            {
+                api.prevent_close();
+                let _ = window.hide();
+                tracing::debug!("the window closed into the tray");
+                shell.closed_to_tray();
+            }
+        }
+        WindowEvent::Destroyed => {
+            if let Some(gateway) = window.try_state::<Gateway>() {
+                gateway.forget(window.label());
+            }
+        }
+        _ => {}
     }
 }
 
@@ -123,7 +163,8 @@ struct Daemon(Mutex<Option<Supervisor>>);
 fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let handle = app.handle().clone();
     let paths = app.path();
-    let settings = Settings::load(&paths.app_config_dir()?).with_env(|name| std::env::var_os(name));
+    let config_dir = paths.app_config_dir()?;
+    let settings = Settings::load(&config_dir).with_env(|name| std::env::var_os(name));
     let state_dir = settings
         .state_dir_or_default()
         .ok_or("cannot find this user's local data folder; set stateDir in settings.json")?;
@@ -148,10 +189,26 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         paths.app_local_data_dir()?.join(registry::FILE_NAME),
     ));
     let emitter = handle.clone();
-    registry.on_change(move |list| emit_workspaces(&emitter, list));
+    registry.on_change(move |list| {
+        emit_workspaces(&emitter, list);
+        if let Some(shell) = emitter.try_state::<Shell>() {
+            shell.attention.sync(list);
+        }
+        tray::refresh(&emitter);
+    });
     let local = Arc::new(LocalConnector::new(endpoint.clone()));
     registry.attach_local(Arc::clone(&local) as Arc<dyn crate::gateway::Connector>);
     app.manage(Gateway::new(Arc::clone(&registry)));
+    let shell = Shell::start(
+        &handle,
+        Arc::clone(&registry),
+        PreferenceStore::load(&config_dir),
+    );
+    app.manage(shell);
+    if let Some(shell) = app.try_state::<Shell>() {
+        shell.create_tray(&handle);
+    }
+    std::thread::spawn(scheme::register);
 
     let runtime = tauri::async_runtime::handle();
     let supervisor = Supervisor::start(
@@ -163,6 +220,16 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     app.manage(Daemon(Mutex::new(Some(supervisor))));
 
     main_window(app)?;
+    // A deep link that launched the app: held until the page listens.
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .filter_map(|arg| arg.into_string().ok())
+        .collect();
+    if let Some(target) = navigate::targets_in(&args).pop()
+        && let Some(navigator) = app.try_state::<Navigator>()
+    {
+        navigator.navigate(&handle, target);
+    }
     Ok(())
 }
 
@@ -233,16 +300,11 @@ pub fn is_app_url(origins: &[(String, String, Option<u16>)], url: &Url) -> bool 
     origins.contains(&origin_of(url))
 }
 
-fn focus_main<R: Runtime>(app: &AppHandle<R>) {
-    if let Some(window) = app.get_webview_window(MAIN) {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
-    }
-}
-
-/// When the app quits: stop the daemon if this app started it.
+/// When the app quits: stop watching, and stop the daemon if this app started it.
 fn shutdown<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(shell) = app.try_state::<Shell>() {
+        shell.stop();
+    }
     let supervisor = app
         .try_state::<Daemon>()
         .and_then(|daemon| daemon.0.lock().ok().and_then(|mut s| s.take()));

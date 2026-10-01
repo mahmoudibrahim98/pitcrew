@@ -12,21 +12,35 @@
 //! Every argument is taken as raw JSON and checked here, so a malformed call fails with a
 //! `GatewayError` (`invalid`) like any other gateway failure, not with Tauri's own message.
 
+use crate::app::MAIN;
 use crate::gateway::{
     Delivery, Gateway, GatewayError, GatewayRequest, GatewayResponse, Payload, Sink, SinkClosed,
 };
+use crate::navigate::Navigator;
 use crate::registry::GatewayWorkspace;
 use serde::Serialize;
 use serde_json::Value;
 use std::str::FromStr as _;
 use std::sync::{Arc, Mutex};
 use tauri::ipc::{Channel, InvokeResponseBody, JavaScriptChannelId};
-use tauri::{Runtime, State, Webview};
+use tauri::{Manager as _, Runtime, State, Webview};
 
 /// `gateway_workspaces() → GatewayWorkspace[]`.
+///
+/// The UI asks for the list once it listens to the gateway's events, so from the main window
+/// this also releases a navigation held for the page ([`Navigator::page_listening`]).
 #[tauri::command]
-pub fn gateway_workspaces(gateway: State<'_, Gateway>) -> Vec<GatewayWorkspace> {
-    gateway.workspaces()
+pub fn gateway_workspaces<R: Runtime>(
+    gateway: State<'_, Gateway>,
+    webview: Webview<R>,
+) -> Vec<GatewayWorkspace> {
+    let list = gateway.workspaces();
+    if webview.label() == MAIN
+        && let Some(navigator) = webview.try_state::<Navigator>()
+    {
+        navigator.page_listening(webview.app_handle());
+    }
+    list
 }
 
 /// `gateway_request(req) → GatewayResponse`.

@@ -1,6 +1,6 @@
 {
   "identifier": "main",
-  "description": "The main window: the gateway's commands and listening to gateway://workspaces. No shell, fs, http or opener access, and no events the webview can emit.",
+  "description": "The main window: the gateway's commands and listening to its events (gateway://workspaces, gateway://navigate). No shell, fs, http, opener or notification access, and no events the webview can emit.",
   "local": true,
   "windows": ["main"],
   "permissions": [

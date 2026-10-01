@@ -3,7 +3,8 @@
 //!
 //! It answers like API v1, and on purpose adds headers that hold the token to every response,
 //! so a test can prove that no daemon header but `Content-Type` reaches the webview. Its sockets
-//! follow a script named in the query (`?script=order`); see [`socket`].
+//! follow a script named in the query (`?script=order`); see [`socket`]. Without a script,
+//! `/v1/stream` is the live stream of its asks ([`FakeDaemon::raise`]), resumable with `since`.
 
 #![allow(dead_code, clippy::unwrap_used, clippy::expect_used)]
 
@@ -18,6 +19,7 @@ use axum::routing::{any, get, post};
 use pitcrew_desktop::daemon::LocalConnector;
 use pitcrew_desktop::daemon::endpoint::Endpoint;
 use pitcrew_desktop::gateway::{Delivery, Sink, SinkClosed};
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path as FsPath, PathBuf};
@@ -27,6 +29,54 @@ use std::time::{Duration, Instant};
 /// The demo workspace's id and name, as `GET /v1/workspace` answers.
 pub const WORKSPACE_ID: &str = "01JA0000000000000000000000";
 pub const WORKSPACE_NAME: &str = "Demo Lab";
+
+/// The members: the person the token acts for (`GET /v1/me`), an agent, another person.
+pub const SAM: &str = "01JA0000000000000000000001";
+pub const WRITER: &str = "01JA0000000000000000000002";
+pub const OTHER: &str = "01JA0000000000000000000003";
+
+/// Ask `n`'s id.
+pub fn ask_id(n: u8) -> String {
+    format!("01JB00000000000000000000{n:02}")
+}
+
+/// An open question, ask `n`, from `from` to `to`.
+pub fn ask(n: u8, from: &str, to: &str) -> Value {
+    json!({
+        "id": ask_id(n), "kind": "question", "from": from, "to": to,
+        "title": format!("Question {n}"), "body": "", "options": [], "receipts": [],
+        "state": "open", "created": 1,
+    })
+}
+
+fn members() -> Value {
+    json!([
+        { "id": SAM, "kind": "human", "handle": "@sam", "name": "Sam" },
+        { "id": WRITER, "kind": "agent", "handle": "@writer", "name": "Writer", "owner": SAM },
+        { "id": OTHER, "kind": "human", "handle": "@kim", "name": "Kim" },
+    ])
+}
+
+/// The fake daemon's event log and asks.
+#[derive(Debug)]
+struct Log {
+    rev: u64,
+    id: String,
+    /// `events` frames by their revision.
+    history: Vec<(u64, Value)>,
+    asks: Vec<Value>,
+    /// `GET /v1/asks` answers 500.
+    asks_fail: bool,
+}
+
+/// What a live stream is sent.
+#[derive(Clone, Debug)]
+enum Live {
+    /// An `events` frame at this revision.
+    Frame(u64, String),
+    /// Drop the connection without a close frame.
+    Drop,
+}
 
 /// What the fake daemon saw.
 #[derive(Debug, Default)]
@@ -41,6 +91,12 @@ pub struct Seen {
     pub pongs: Vec<Vec<u8>>,
     /// Bytes its `flood` sockets sent before they stopped.
     pub flooded: Vec<usize>,
+    /// Each live stream's `since`, in the order they opened.
+    pub streams: Vec<Option<String>>,
+    /// When each live stream opened.
+    pub stream_times: Vec<Instant>,
+    /// `GET /v1/asks` calls.
+    pub ask_reads: usize,
 }
 
 #[derive(Clone)]
@@ -49,6 +105,8 @@ struct Fake {
     seen: Arc<Mutex<Seen>>,
     /// Becomes true when the fake daemon stops; handlers that hang end then.
     stopping: tokio::sync::watch::Receiver<bool>,
+    log: Arc<Mutex<Log>>,
+    live: tokio::sync::broadcast::Sender<Live>,
 }
 
 /// A fake daemon serving on its own thread and runtime.
@@ -56,6 +114,8 @@ pub struct FakeDaemon {
     pub state_dir: PathBuf,
     pub token: String,
     pub seen: Arc<Mutex<Seen>>,
+    log: Arc<Mutex<Log>>,
+    live: tokio::sync::broadcast::Sender<Live>,
     stop: Option<tokio::sync::watch::Sender<bool>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -78,10 +138,20 @@ impl FakeDaemon {
 
         let seen = Arc::new(Mutex::new(Seen::default()));
         let (stop, stopping) = tokio::sync::watch::channel(false);
+        let log = Arc::new(Mutex::new(Log {
+            rev: 7,
+            id: "log-1".into(),
+            history: Vec::new(),
+            asks: Vec::new(),
+            asks_fail: false,
+        }));
+        let (live, _) = tokio::sync::broadcast::channel(256);
         let fake = Fake {
             token: token.to_owned(),
             seen: Arc::clone(&seen),
             stopping: stopping.clone(),
+            log: Arc::clone(&log),
+            live: live.clone(),
         };
         let thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -105,9 +175,92 @@ impl FakeDaemon {
             state_dir: state_dir.to_owned(),
             token: token.to_owned(),
             seen,
+            log,
+            live,
             stop: Some(stop),
             thread: Some(thread),
         }
+    }
+
+    /// Appends an event to the log and sends it to the live streams, as an `events` frame.
+    fn append(&self, log: &mut Log, kind: &str, data: Value) {
+        log.rev += 1;
+        let rev = log.rev;
+        let frame = json!({
+            "type": "events", "from_rev": rev, "to_rev": rev,
+            "events": [{
+                "id": format!("01JE{rev:022}"), "at": 1, "workspace": WORKSPACE_ID,
+                "author": WRITER, "body": { "type": kind, "data": data },
+            }],
+        });
+        log.history.push((rev, frame.clone()));
+        let _ = self.live.send(Live::Frame(rev, frame.to_string()));
+    }
+
+    /// Raises `ask` (from [`ask`]): `ask_raised`.
+    pub fn raise(&self, ask: Value) {
+        let mut log = self.log.lock().unwrap();
+        log.asks.push(ask.clone());
+        self.append(&mut log, "ask_raised", json!({ "ask": ask }));
+    }
+
+    /// Answers ask `n`: `ask_answered`.
+    pub fn answer(&self, n: u8) {
+        let mut log = self.log.lock().unwrap();
+        let id = ask_id(n);
+        for ask in &mut log.asks {
+            if ask["id"] == id {
+                ask["state"] = json!("answered");
+            }
+        }
+        self.append(
+            &mut log,
+            "ask_answered",
+            json!({ "ask": id, "answer": { "by": SAM, "text": "yes", "at": 2 } }),
+        );
+    }
+
+    /// Another kind of event, which "needs you" ignores.
+    pub fn other_event(&self) {
+        let mut log = self.log.lock().unwrap();
+        self.append(
+            &mut log,
+            "task_moved",
+            json!({ "task": "01JC0000000000000000000000" }),
+        );
+    }
+
+    /// The current revision.
+    pub fn rev(&self) -> u64 {
+        self.log.lock().unwrap().rev
+    }
+
+    /// Starts a new event log (the daemon's store was replaced): revisions start again.
+    pub fn new_log(&self, id: &str) {
+        let mut log = self.log.lock().unwrap();
+        log.id = id.to_owned();
+        log.rev = 1;
+        log.history.clear();
+    }
+
+    /// Makes `GET /v1/asks` answer 500 (or not).
+    pub fn fail_asks(&self, fail: bool) {
+        self.log.lock().unwrap().asks_fail = fail;
+    }
+
+    /// When each live stream opened.
+    pub fn stream_times(&self) -> Vec<Instant> {
+        self.seen.lock().unwrap().stream_times.clone()
+    }
+
+    /// Drops every live stream's connection, without a close frame.
+    pub fn drop_streams(&self) {
+        let _ = self.live.send(Live::Drop);
+    }
+
+    /// Each live stream's `since`, in order.
+    pub fn streams(&self) -> Vec<Option<String>> {
+        self.seen.lock().unwrap().streams.clone()
     }
 
     /// Where it listens.
@@ -167,6 +320,9 @@ impl Drop for FakeDaemon {
 fn router(fake: Fake) -> Router {
     Router::new()
         .route("/v1/workspace", get(workspace))
+        .route("/v1/me", get(me))
+        .route("/v1/members", get(list_members))
+        .route("/v1/asks", get(list_asks))
         .route("/v1/tasks", get(tasks))
         .route("/v1/echo", post(echo))
         .route("/v1/query", get(query))
@@ -262,6 +418,94 @@ async fn tasks() -> Response {
         .into_response()
 }
 
+fn json_response(value: &Value) -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        value.to_string(),
+    )
+        .into_response()
+}
+
+async fn me() -> Response {
+    json_response(&members()[0])
+}
+
+async fn list_members() -> Response {
+    json_response(&members())
+}
+
+/// `GET /v1/asks?to=&state=`.
+async fn list_asks(State(fake): State<Fake>, Query(q): Query<HashMap<String, String>>) -> Response {
+    fake.seen.lock().unwrap().ask_reads += 1;
+    if fake.log.lock().unwrap().asks_fail {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "failing on purpose",
+        );
+    }
+    let asks: Vec<Value> = fake
+        .log
+        .lock()
+        .unwrap()
+        .asks
+        .iter()
+        .filter(|a| q.get("to").is_none_or(|to| a["to"] == *to))
+        .filter(|a| q.get("state").is_none_or(|state| a["state"] == *state))
+        .cloned()
+        .collect();
+    json_response(&Value::Array(asks))
+}
+
+/// The live stream: `hello`, then what `since` missed, then live frames, until the client closes
+/// or [`FakeDaemon::drop_streams`].
+async fn live(mut socket: WebSocket, since: Option<String>, fake: Fake) {
+    {
+        let mut seen = fake.seen.lock().unwrap();
+        seen.streams.push(since.clone());
+        seen.stream_times.push(Instant::now());
+    }
+    let since: u64 = since.and_then(|s| s.parse().ok()).unwrap_or(u64::MAX);
+    let (mut frames, hello, missed, mut sent) = {
+        let log = fake.log.lock().unwrap();
+        let frames = fake.live.subscribe();
+        let hello = json!({ "type": "hello", "rev": log.rev, "log": log.id }).to_string();
+        let missed: Vec<String> = log
+            .history
+            .iter()
+            .filter(|(rev, _)| since < *rev)
+            .map(|(_, frame)| frame.to_string())
+            .collect();
+        (frames, hello, missed, log.rev)
+    };
+    if socket.send(Message::Text(hello.into())).await.is_err() {
+        return;
+    }
+    for frame in missed {
+        if socket.send(Message::Text(frame.into())).await.is_err() {
+            return;
+        }
+    }
+    loop {
+        tokio::select! {
+            next = frames.recv() => match next {
+                Ok(Live::Frame(rev, frame)) if rev > sent => {
+                    sent = rev;
+                    if socket.send(Message::Text(frame.into())).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(Live::Frame(..)) => {}
+                Ok(Live::Drop) | Err(_) => return,
+            },
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                Some(Ok(_)) => {}
+            },
+        }
+    }
+}
+
 async fn plain() -> Response {
     (StatusCode::NO_CONTENT, "").into_response()
 }
@@ -306,9 +550,14 @@ async fn stream(
     Query(q): Query<HashMap<String, String>>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let script = q.get("script").cloned().unwrap_or_else(|| "hold".into());
-    ws.protocols(["pitcrew.v1"])
-        .on_upgrade(move |socket| run(socket, script, fake))
+    let ws = ws.protocols(["pitcrew.v1"]);
+    match q.get("script").cloned() {
+        Some(script) => ws.on_upgrade(move |socket| run(socket, script, fake)),
+        None => {
+            let since = q.get("since").cloned();
+            ws.on_upgrade(move |socket| live(socket, since, fake))
+        }
+    }
 }
 
 async fn terminal(
