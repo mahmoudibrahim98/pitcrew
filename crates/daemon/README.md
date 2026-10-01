@@ -108,9 +108,8 @@ owner (its first person, whom the device token also acts as):
 Why an event at first start rather than seeding: the office's member is workspace data like any
 other, so it belongs in the log, where every projection (and a rebuild) sees it; and the run log
 must know the member before it is registered on the store, so the daemon finds it (or adds it)
-first.
-The member is created once and reused, because the run log's settings, the member included, must
-stay the same for the life of the store.
+first. The member is created once and reused, because the run log's settings, the member included,
+must stay the same for the life of the store.
 
 **No token.** The office acts inside this process through the hub's `WorkService`
 (`OfficeCommands`), so it has no token: none is minted, and nothing about it is written to the
@@ -261,9 +260,11 @@ against blocks, and the `400`, `403` and `401` answers. Two recap rows differ by
 (`400` on the mock, which serves `tz=0` only; `200` here) and the quiet workstream `WST0004`, whose
 `workstream_created` the daemon's seed appends, so it has a day here and none in the fixture.
 Paging loops are left out of the per-request status comparison (`record: false`), so the requests
-after them still line up although the two servers hold different numbers of blocks. The mock hub has no back office; with the daemon's on (the
-default), a check that reads the newest event right after a write may see `@office`'s reminders
-instead, depending on timing. `--no-office` runs the daemon without it, to compare the hub alone.
+after them still line up although the two servers hold different numbers of blocks.
+
+The mock hub has no back office; with the daemon's on (the default), a check that reads the newest
+event right after a write may see `@office`'s reminders instead, depending on timing.
+`--no-office` runs the daemon without it, to compare the hub alone.
 
 ## Tests
 
