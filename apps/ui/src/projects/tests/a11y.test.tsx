@@ -86,17 +86,22 @@ describe('accessibility (axe)', () => {
     expect(await violations({ modal: true })).toEqual([]);
   });
 
-  it('Inbox', async () => {
-    renderWithHub(
-      <main>
-        <Inbox />
-      </main>,
-      hub,
-    );
-    await screen.findByText('Merge the benchmark change into parsers?');
-    await screen.findByText('PAP-5');
-    expect(await violations()).toEqual([]);
-  });
+  it(
+    'Inbox',
+    async () => {
+      renderWithHub(
+        <main>
+          <Inbox />
+        </main>,
+        hub,
+      );
+      // The question card is a lazy chunk (stream M's); the first load in this file can be slow.
+      await screen.findByText('Merge the benchmark change into parsers?', {}, { timeout: 15_000 });
+      await screen.findByText('PAP-5');
+      expect(await violations()).toEqual([]);
+    },
+    20_000,
+  );
 
   it('ProjectOverview, WorkstreamOverview and Home', async () => {
     const { unmount } = renderWithHub(
