@@ -51,10 +51,15 @@ fn strip_quoted_and_code(body: &str) -> String {
 
 /// Whether `s` is safe to treat as one `owner` or `repo` name component of a cross-repo closing
 /// reference (`owner/repo#n`): GitHub's own allowed characters (`[A-Za-z0-9._-]+`), and never
-/// exactly `..` — which passes that character class (both bytes are literally `.`) but is a
-/// reserved path-traversal segment once spliced into a URL (round 3 review item S-5).
+/// exactly `.` or `..` — both pass that character class (every byte is literally `.`) but are
+/// reserved dot-segments once spliced into a URL path. Round 3 review item S-5 closed `..`; round
+/// 3's fuzzing (R32) found `.` was still accepted — `Fixes example-org/.#1` builds the link
+/// `https://github.com/example-org/./issues/1`, which a WHATWG parser resolves to
+/// `https://github.com/example-org/issues/1`, a different page than the `example-org/.#1` key
+/// claims to point at (GitHub itself allows neither `.` nor `..` as an owner or repo name).
 fn is_valid_repo_component(s: &str) -> bool {
     !s.is_empty()
+        && s != "."
         && s != ".."
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
@@ -146,6 +151,17 @@ mod tests {
         // into `https://github.com/{owner_repo}/issues/{n}`.
         assert!(linked_issues("Fixes ../evil#1", REPO).is_empty());
         assert!(linked_issues("Fixes evil/..#1", REPO).is_empty());
+    }
+
+    #[test]
+    fn r32_a_dot_owner_or_repo_is_rejected() {
+        // Stream Q's open-r32-dot-repo-in-closing-reference regression: a single `.` passes the
+        // same bare character-class check `..` did, and resolves to the *parent* page once
+        // spliced into the link — `https://github.com/example-org/./issues/1` is
+        // `https://github.com/example-org/issues/1` to a WHATWG parser, not the issue the
+        // `example-org/.#1` key claims.
+        assert!(linked_issues("Fixes example-org/.#1", REPO).is_empty());
+        assert!(linked_issues("Fixes ./evil#1", REPO).is_empty());
     }
 
     #[test]

@@ -23,14 +23,31 @@ use serde_json::Value;
 pub fn adf_to_text(node: &Value) -> String {
     let mut out = String::new();
     let mut nodes_visited = 0usize;
-    walk(node, 0, &mut nodes_visited, &mut out);
+    // A running character count, kept alongside `out` rather than recomputed from it (R29: the
+    // previous version re-scanned the whole output with `out.chars().count()` at every node and
+    // every child, making one flatten quadratic in the output size — 692 ms for a 763 KiB
+    // description in a release build, against 0.9 ms for either half of it alone).
+    let mut chars_written = 0usize;
+    walk(node, 0, &mut nodes_visited, &mut chars_written, &mut out);
     cap_chars(&out, MAX_BODY_CHARS)
 }
 
-fn walk(node: &Value, depth: usize, nodes_visited: &mut usize, out: &mut String) {
-    if depth > MAX_ADF_DEPTH
-        || *nodes_visited >= MAX_ADF_NODES
-        || out.chars().count() >= MAX_BODY_CHARS
+/// Appends `text` to `out` and keeps `chars_written` in step with it, so callers never need to
+/// re-derive the character count from `out` itself (see [`adf_to_text`]'s doc on why that was the
+/// R29 quadratic-time bug).
+fn push(out: &mut String, chars_written: &mut usize, text: &str) {
+    out.push_str(text);
+    *chars_written += text.chars().count();
+}
+
+fn walk(
+    node: &Value,
+    depth: usize,
+    nodes_visited: &mut usize,
+    chars_written: &mut usize,
+    out: &mut String,
+) {
+    if depth > MAX_ADF_DEPTH || *nodes_visited >= MAX_ADF_NODES || *chars_written >= MAX_BODY_CHARS
     {
         return;
     }
@@ -43,7 +60,7 @@ fn walk(node: &Value, depth: usize, nodes_visited: &mut usize, out: &mut String)
     match node_type {
         "text" => {
             if let Some(text) = obj.get("text").and_then(Value::as_str) {
-                out.push_str(text);
+                push(out, chars_written, text);
             }
         }
         "mention" => {
@@ -53,7 +70,7 @@ fn walk(node: &Value, depth: usize, nodes_visited: &mut usize, out: &mut String)
                 .and_then(|a| a.get("text"))
                 .and_then(Value::as_str)
                 .unwrap_or("@someone");
-            out.push_str(label);
+            push(out, chars_written, label);
         }
         "emoji" => {
             let shortname = obj
@@ -61,10 +78,10 @@ fn walk(node: &Value, depth: usize, nodes_visited: &mut usize, out: &mut String)
                 .and_then(|a| a.get("shortName"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            out.push_str(shortname);
+            push(out, chars_written, shortname);
         }
-        "hardBreak" => out.push('\n'),
-        "rule" => out.push_str("\n---\n"),
+        "hardBreak" => push(out, chars_written, "\n"),
+        "rule" => push(out, chars_written, "\n---\n"),
         "inlineCard" | "blockCard" | "embedCard" => {
             // A link card with no visible text of its own: show the bare URL as literal text, not
             // as something to open or follow.
@@ -73,7 +90,7 @@ fn walk(node: &Value, depth: usize, nodes_visited: &mut usize, out: &mut String)
                 .and_then(|a| a.get("url"))
                 .and_then(Value::as_str)
             {
-                out.push_str(url);
+                push(out, chars_written, url);
             }
         }
         _ => {}
@@ -81,10 +98,10 @@ fn walk(node: &Value, depth: usize, nodes_visited: &mut usize, out: &mut String)
 
     if let Some(children) = obj.get("content").and_then(Value::as_array) {
         for child in children {
-            if *nodes_visited >= MAX_ADF_NODES || out.chars().count() >= MAX_BODY_CHARS {
+            if *nodes_visited >= MAX_ADF_NODES || *chars_written >= MAX_BODY_CHARS {
                 break;
             }
-            walk(child, depth + 1, nodes_visited, out);
+            walk(child, depth + 1, nodes_visited, chars_written, out);
         }
         // Block-level nodes get a trailing newline once their children are flattened, so
         // paragraphs/headings/list items don't run together; inline nodes (text, mention, …)
@@ -93,7 +110,7 @@ fn walk(node: &Value, depth: usize, nodes_visited: &mut usize, out: &mut String)
             node_type,
             "paragraph" | "heading" | "listItem" | "blockquote" | "codeBlock" | "tableRow"
         ) {
-            out.push('\n');
+            push(out, chars_written, "\n");
         }
     }
 }
@@ -178,6 +195,34 @@ mod tests {
         let doc = json!({"type": "doc", "content": content});
         let text = adf_to_text(&doc);
         assert!(text.chars().count() < MAX_BODY_CHARS);
+    }
+
+    #[test]
+    fn r29_flattening_stays_fast_on_a_large_document_with_many_trailing_nodes() {
+        // Stream Q's open-r29-quadratic-walk regression: one large text node (four-byte
+        // characters, so the output is hundreds of KB even while staying under the character
+        // cap), followed by thousands of further nodes. The pre-fix `walk` recounted the whole
+        // output (`out.chars().count()`) at every one of those trailing nodes, making one
+        // flatten quadratic in the output size: 692 ms for a 763 KiB description in a release
+        // build, against 0.9 ms for either half alone. A running count keeps this linear, so
+        // this must finish well within a generous bound even in an unoptimised test build.
+        let big_text: String = std::iter::repeat_n('\u{1F600}', 65_280).collect(); // 😀, 4 bytes
+        let mut content = vec![json!({
+            "type": "paragraph",
+            "content": [{"type": "text", "text": big_text}],
+        })];
+        content.extend((0..20_000).map(|_| json!({"type": "text", "text": ""})));
+        let doc = json!({"type": "doc", "content": content});
+
+        let started = std::time::Instant::now();
+        let text = adf_to_text(&doc);
+        let took = started.elapsed();
+
+        assert!(!text.is_empty());
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "flattening took {took:?}, which is quadratic-walk slow, not linear-walk fast"
+        );
     }
 
     #[test]

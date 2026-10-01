@@ -61,14 +61,25 @@ fn effective_port(url: &Url) -> Option<u16> {
 }
 
 /// Whether `path` is `base`, or a path segment under it, comparing WHATWG-normalised path
-/// segments (not a bare string prefix, so a path can't be smuggled past the check by appending
-/// characters right after the base — `/api/v3evil` is not under `/api/v3`). `Url::path()` has
-/// already resolved `.`/`..` (including the percent-encoded and backslash-separated spellings —
-/// see the module doc) by the time this ever sees it, so no further dot-segment walking is needed
-/// here, just a segment-wise prefix comparison.
+/// segments strictly — an empty segment counts, so `/api//v3/x` and `//api/v3/x` are never under
+/// `/api/v3` (round 3 finding R31: the previous version dropped empty segments before comparing,
+/// so a server, or a proxy, that merges repeated slashes could send a `next` link an actual
+/// WHATWG-driven transport would also treat as under the base, while a stricter proxy in front of
+/// it might route the raw, unmerged path somewhere else entirely — the same kind of escape R9
+/// closed for `.`/`..` segments). Not a bare string prefix either, so a path can't be smuggled
+/// past the check by appending characters right after the base (`/api/v3evil` is not under
+/// `/api/v3`).
+///
+/// `base`'s own single trailing slash, if it has one, is dropped first: a configured API base of
+/// `.../api/v3/` means "this directory and everything under it", the same as `.../api/v3` — not
+/// one more empty segment every path must also carry right after `v3`. This is the only place
+/// empty segments are ever ignored; an empty segment anywhere else in `path` still has to match
+/// `base` segment-for-segment. `Url::path()` has already resolved `.`/`..` (including the
+/// percent-encoded and backslash-separated spellings — see the module doc) by the time this ever
+/// sees it, so no further dot-segment walking is needed here.
 fn path_is_under(path: &str, base: &str) -> bool {
-    let path_segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    let base_segs: Vec<&str> = base.split('/').filter(|s| !s.is_empty()).collect();
+    let path_segs: Vec<&str> = path.split('/').collect();
+    let base_segs: Vec<&str> = base.strip_suffix('/').unwrap_or(base).split('/').collect();
     path_segs.len() >= base_segs.len() && path_segs[..base_segs.len()] == base_segs[..]
 }
 
@@ -85,8 +96,14 @@ fn path_is_under(path: &str, base: &str) -> bool {
 /// Also rejects, independent of the comparison above (see [`has_forbidden_raw_bytes`] for the
 /// first three): `next` with embedded userinfo, or a fragment. Malformed input (either side fails
 /// to parse as an absolute URL) is untrusted: this returns `None`, never panics.
+///
+/// `pub` (rather than `pub(crate)`) and `#[doc(hidden)]` only so stream Q's fuzz harness can call
+/// this directly instead of only reaching it indirectly through `sync::sync` — **not public API**:
+/// it may change shape or disappear without notice, and no caller outside this crate's own fuzz
+/// targets should depend on it.
+#[doc(hidden)]
 #[must_use]
-pub(crate) fn trusted_next_url(next: &str, api_base: &str) -> Option<Url> {
+pub fn trusted_next_url(next: &str, api_base: &str) -> Option<Url> {
     if has_forbidden_raw_bytes(next) {
         return None;
     }
@@ -334,6 +351,47 @@ mod tests {
                 ENTERPRISE_BASE
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn r31_an_empty_segment_in_the_middle_of_the_next_links_path_is_not_under_the_api_base() {
+        // Stream Q's open-r31-empty-segment-in-next-link regression: a server that merges
+        // repeated slashes would treat `/api//v3/...` as `/api/v3/...`, but a stricter proxy in
+        // front of it might route the raw, unmerged path somewhere else — the same kind of
+        // divergence R9 closed for `.`/`..` segments.
+        assert!(
+            trusted_next_url(
+                "https://ghe.example.com/api//v3/repos/example-org/demo-repo/milestones?page=2",
+                ENTERPRISE_BASE
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn r31_a_leading_empty_segment_in_the_next_links_path_is_not_under_the_api_base() {
+        // Stream Q's open-r31-leading-empty-segment-in-next-link regression.
+        assert!(
+            trusted_next_url(
+                "https://ghe.example.com//api/v3/repos/example-org/demo-repo/milestones?page=2",
+                ENTERPRISE_BASE
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_trailing_slash_on_the_configured_api_base_still_trusts_a_legitimate_next_link() {
+        // The R31 fix compares path segments strictly (empty ones included), except for exactly
+        // one trailing slash on `base` itself, which means "this directory and everything under
+        // it" — not one more empty segment every `next` link must also carry.
+        assert!(
+            trusted_next_url(
+                "https://ghe.example.com/api/v3/repos/example-org/demo-repo/milestones?page=2",
+                "https://ghe.example.com/api/v3/"
+            )
+            .is_some()
         );
     }
 

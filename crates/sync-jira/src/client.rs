@@ -9,7 +9,7 @@
 use crate::auth::JiraAuth;
 use crate::bounds::{
     CURSOR_SAFETY_MARGIN_HOURS, MAX_ITEMS_PER_SYNC, MAX_PAGE_BODY_BYTES, MAX_PAGES_PER_CALL,
-    backoff_secs,
+    SECONDARY_BACKOFF_CAP_SECS, backoff_secs,
 };
 use crate::deployment::Deployment;
 use crate::time::JiraTimestamp;
@@ -223,7 +223,12 @@ impl<'t, T: Transport> JiraClient<'t, T> {
                     .header("retry-after")
                     .and_then(|v| v.trim().parse::<i64>().ok());
                 let until = if let Some(retry_after) = retry_after {
-                    now_unix + retry_after
+                    // R28: a server's `Retry-After` is an untrusted `i64` — a hostile value near
+                    // `i64::MAX` must not overflow `now_unix + retry_after` (a panic with overflow
+                    // checks, a deadline wrapped into the past in release), and an enormous but
+                    // in-range value must not be trusted outright either. Clamp to the same range
+                    // this crate ever itself backs off for, then add with saturation.
+                    now_unix.saturating_add(retry_after.clamp(0, SECONDARY_BACKOFF_CAP_SECS))
                 } else {
                     *attempts = attempts.saturating_add(1);
                     now_unix + backoff_secs(*attempts)
@@ -425,6 +430,47 @@ mod tests {
             panic!("expected RateLimited");
         };
         assert_eq!(rl.until, 2_000_000_030);
+    }
+
+    #[tokio::test]
+    async fn r28_a_hostile_retry_after_is_capped_not_overflowed() {
+        // Stream Q's open-r28-retry-after-overflow regression: `Retry-After: 9223372036854775807`
+        // (i64::MAX) used to overflow `now_unix + retry_after` — a panic with overflow checks, a
+        // deadline wrapped into the past in release, so the very next call would retry at once
+        // instead of actually backing off.
+        let url = "https://jira.example.com/rest/api/3/search/jql?jql=project%20in%20%28%22DEMO%22%29&maxResults=100&fields=summary";
+        let transport = ReplayTransport::from_exchanges(vec![exchange(
+            url,
+            429,
+            vec![("Retry-After", "9223372036854775807")],
+            "",
+        )]);
+        let c = client(&transport);
+        let mut attempts = 0u32;
+        let now_unix = 1_790_755_200;
+        let Outcome::RateLimited(rl) = c
+            .search(
+                &JiraCloud,
+                &query("project in (\"DEMO\")", &["summary"], None),
+                now_unix,
+                &mut attempts,
+                Limits::default(),
+            )
+            .await
+            .expect("search")
+        else {
+            panic!("expected RateLimited");
+        };
+        assert!(
+            rl.until <= now_unix + SECONDARY_BACKOFF_CAP_SECS,
+            "a hostile retry-after must be capped, not trusted outright: {}",
+            rl.until
+        );
+        assert!(
+            rl.until > now_unix,
+            "a hostile retry-after must not wrap into a deadline already in the past: {}",
+            rl.until
+        );
     }
 
     #[tokio::test]

@@ -30,6 +30,13 @@ pub const MAX_LABEL_CHARS: usize = 100;
 /// place to dump an attacker-sized string.
 pub const MAX_REPORTED_URL_CHARS: usize = 300;
 
+/// Cap, in bytes, on an `html_url` kept verbatim in an `ExternalRef` (round 3 review item O30,
+/// R10's residual: the rest of R10 — scheme, host, hidden characters — was fixed, but a trusted
+/// scheme and host never meant a *reasonable* length either). Matches the console's own display
+/// cap for a link shown to a person, so a kept URL this crate accepts is never longer than the UI
+/// is willing to show in full.
+pub const MAX_KEPT_URL_BYTES: usize = 2_048;
+
 /// Base delay for secondary-rate-limit backoff when the server gives no `retry-after`.
 pub const SECONDARY_BACKOFF_BASE_SECS: i64 = 2;
 
@@ -80,9 +87,10 @@ impl Default for Limits {
 /// enough that duplicating it is cheaper than a new cross-stream dependency) — **when this set
 /// changes, `pitcrew_recap::text::is_hidden` needs the identical change**, or the two diverge on
 /// exactly the kind of input this exists to catch; that crate is owned by stream F, outside this
-/// stream's path ownership, so round 3's addition here (tag characters, soft hyphen, the Mongolian
-/// vowel separator, and the two line/paragraph separators) could not be mirrored there in this
-/// same change and is called out in this round's report instead.
+/// stream's path ownership. Round 3's addition here (tag characters, soft hyphen, the Mongolian
+/// vowel separator, and the two line/paragraph separators) could not be mirrored there in that
+/// same change, but `s/F/recap-hardening` (R33) has since made `pitcrew_recap::text::is_hidden`
+/// match this set exactly — the two sets agree again as of this round.
 fn is_hidden(c: char) -> bool {
     matches!(
         c,
