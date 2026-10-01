@@ -288,7 +288,8 @@ decides:
   file, so a large import's peak disk use is roughly double the data it imports, and `-wal` is left
   that size afterwards (there is no `journal_size_limit` set): `import` runs
   `PRAGMA wal_checkpoint(TRUNCATE)` itself, right after a successful commit, local mode only, so
-  this does not linger past the call that caused it. (`synchronous=NORMAL` does not mean "no
+  this does not linger past the call that caused it (best effort: its own failure does not fail
+  the import, which has already committed by then). (`synchronous=NORMAL` does not mean "no
   fsync" the way it might for a single short transaction in rollback-journal mode: in WAL mode its
   fsyncs happen at *checkpoint* time, not at every commit, so one long transaction is not simply
   saving several commits' worth of fsyncs — see "Timings" for what a long import actually measured
