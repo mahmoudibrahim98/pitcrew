@@ -1,7 +1,7 @@
 // "+ New": a menu of the registered create items, each opening its dialog. The palette's "New …"
 // commands open the same dialogs.
 
-import { Suspense } from 'react';
+import { Suspense, useId } from 'react';
 import {
   Button,
   Dialog,
@@ -14,9 +14,42 @@ import {
   PlusIcon,
 } from '../design/index.ts';
 import { useRegistry } from './context.ts';
+import type { ResolvedCreate } from './registry.ts';
 import { useShell } from './store.ts';
 
 const TRIGGER_ID = 'shell-new';
+
+/**
+ * One "+ New" item. A `disabled` entry stays focusable, so its reason (an accessible description)
+ * is reachable from the keyboard, but selecting it does nothing and the menu stays open.
+ */
+function NewMenuItem({ entry, onOpen }: { entry: ResolvedCreate; onOpen(id: string): void }) {
+  const reasonId = useId();
+  const disabled = entry.disabled !== undefined;
+  return (
+    <MenuItem
+      aria-disabled={disabled || undefined}
+      aria-describedby={disabled ? reasonId : undefined}
+      className={disabled ? 'opacity-50' : undefined}
+      onSelect={(event) => {
+        if (disabled) {
+          event.preventDefault();
+          return;
+        }
+        onOpen(entry.id);
+      }}
+    >
+      {entry.label}
+      {disabled && (
+        // aria-hidden keeps it out of the item's accessible *name* (computed from content); the
+        // aria-describedby above still exposes it as the *description* once the item is focused.
+        <span id={reasonId} aria-hidden className="sr-only">
+          {entry.disabled}
+        </span>
+      )}
+    </MenuItem>
+  );
+}
 
 export function NewMenu() {
   const registry = useRegistry();
@@ -38,9 +71,11 @@ export function NewMenu() {
       >
         <MenuLabel>Create</MenuLabel>
         {registry.create.map((entry) => (
-          <MenuItem key={entry.id} onSelect={() => setCreating(entry.id, document.getElementById(TRIGGER_ID))}>
-            {entry.label}
-          </MenuItem>
+          <NewMenuItem
+            key={entry.id}
+            entry={entry}
+            onOpen={(id) => setCreating(id, document.getElementById(TRIGGER_ID))}
+          />
         ))}
       </MenuContent>
     </Menu>
@@ -59,7 +94,8 @@ export function CreateDialog() {
   const from = useShell((s) => s.creatingFrom);
   const setCreating = useShell((s) => s.setCreating);
   const entry = registry.create.find((e) => e.id === creating);
-  if (entry === undefined) return null;
+  // Defensive: the menu and the palette never open a disabled entry's dialog.
+  if (entry === undefined || entry.disabled !== undefined) return null;
   const Body = entry.dialog;
   const close = () => setCreating(null);
   return (

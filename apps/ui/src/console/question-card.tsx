@@ -5,11 +5,19 @@
 //   is sent as a prompt.
 
 import { useId, useState, type FormEvent } from 'react';
-import { ApiError, useMembers, type Ask, type AskKind, type Session } from '../data/index.ts';
+import {
+  ApiError,
+  useMembers,
+  type Ask,
+  type AskKind,
+  type Key,
+  type Session,
+  type TranscriptItemOf,
+} from '../data/index.ts';
 import { Button } from '../design/index.ts';
 import { cx } from '../lib/cx.ts';
 import { useAnswerAsk, useSendKeys, useSendText } from './data.ts';
-import type { ItemOf, Key } from './types.ts';
+import { isComposing } from './ime.ts';
 
 const KIND_LABEL: Record<AskKind, string> = {
   question: 'Question',
@@ -30,7 +38,7 @@ export type QuestionCardProps =
     }
   | {
       session: Session;
-      question: ItemOf<'question'>;
+      question: TranscriptItemOf<'question'>;
       /** The ask the question was raised as, if any: answers then go to it. */
       ask?: Ask | undefined;
       /** The answer the transcript already records. */
@@ -117,7 +125,7 @@ export function QuestionCard(props: QuestionCardProps) {
         props.className,
       )}
     >
-      <div className="mb-1 flex items-center gap-2 text-xs text-muted">
+      <div className="mb-1 flex items-center gap-2 text-xs text-ink-2">
         <span className={cx('font-medium', answerable ? 'text-warn' : 'text-ink-2')}>
           {KIND_LABEL[ask?.kind ?? 'question']}
         </span>
@@ -151,6 +159,10 @@ export function QuestionCard(props: QuestionCardProps) {
             id={inputId}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              // The Enter that accepts an IME candidate must not submit the answer.
+              if (e.key === 'Enter' && isComposing(e)) e.preventDefault();
+            }}
             placeholder={options.length > 0 ? 'Or answer in your own words…' : 'Your answer…'}
             className="h-7 min-w-0 flex-1 rounded-sm border border-line-2 bg-bg px-2 text-sm"
           />
@@ -166,7 +178,7 @@ export function QuestionCard(props: QuestionCardProps) {
         </p>
       )}
       {answered === undefined && !answerable && ask === undefined && props.open === true && !sessionLive && (
-        <p className="mt-2 text-xs text-muted">The session cannot take input, so this cannot be answered here.</p>
+        <p className="mt-2 text-xs text-ink-2">The session cannot take input, so this cannot be answered here.</p>
       )}
       {error !== null && (
         <p role="alert" className="mt-2 text-xs text-risk">

@@ -1,8 +1,9 @@
 // The session list: every session, grouped by project and workstream plus Unsorted, virtualised.
-// Arrow keys, Home, End and Page keys move through sessions; Enter or a click selects one.
+// Arrow keys, Home, End and Page keys move through sessions (and select them, if the caller wants
+// the selection to follow); Enter or a click selects one.
 
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { ApiError, useMembers, type Member, type Session } from '../data/index.ts';
 import { StatusPill } from '../design/index.ts';
 import { cx } from '../lib/cx.ts';
@@ -78,12 +79,20 @@ const PROJECT_HEIGHT = 32;
 const WORKSTREAM_HEIGHT = 26;
 const PAGE = 10;
 
+/** How a session was chosen: a click, or Enter or Space in the list. */
+export type SelectVia = 'pointer' | 'keyboard';
+
 export interface SessionListViewProps {
   sessions: readonly Session[];
   places: SessionPlaces;
   members?: readonly Member[] | undefined;
   selectedId?: string | undefined;
-  onSelect: (session: Session) => void;
+  onSelect: (session: Session, via: SelectVia) => void;
+  /**
+   * The arrow, Page, Home and End keys moved to `session`. Pass it to make the selection follow
+   * the keys (as the console does when the chosen session shows beside the list).
+   */
+  onActiveChange?: ((session: Session) => void) | undefined;
   /** Shown when there are no sessions. */
   empty?: string;
   className?: string;
@@ -93,7 +102,7 @@ export interface SessionListViewProps {
 /** The list itself, from data it is given. `SessionList` feeds it from the hub. */
 export function SessionListView(props: SessionListViewProps) {
   'use no memo'; // TanStack Virtual's instance changes under the React Compiler's memoisation.
-  const { sessions, places, selectedId, onSelect } = props;
+  const { sessions, places, selectedId, onSelect, onActiveChange } = props;
   const rows = useMemo(() => groupSessions(sessions, places), [sessions, places]);
   const handles = useMemo(
     () => new Map((props.members ?? []).map((m) => [m.id, m.handle] as const)),
@@ -114,6 +123,12 @@ export function SessionListView(props: SessionListViewProps) {
   });
 
   const [active, setActive] = useState<string | undefined>(selectedId);
+  // A selection made elsewhere (a link, the palette) moves the keyboard's place to it.
+  const [seenSelected, setSeenSelected] = useState(selectedId);
+  if (selectedId !== seenSelected) {
+    setSeenSelected(selectedId);
+    if (selectedId !== undefined) setActive(selectedId);
+  }
   const sessionIndexes = useMemo(
     () => rows.flatMap((row, i) => (row.type === 'session' ? [i] : [])),
     [rows],
@@ -121,11 +136,23 @@ export function SessionListView(props: SessionListViewProps) {
   const activeRow = active === undefined ? -1 : rows.findIndex((r) => r.type === 'session' && r.session.id === active);
   const activeId = activeRow === -1 ? undefined : active;
 
-  const moveTo = (index: number | undefined) => {
+  // Brings a newly selected session into view, once; later updates to the list leave the scroll be.
+  const scrolledTo = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    if (selectedId === undefined || scrolledTo.current === selectedId) return;
+    const index = rows.findIndex((r) => r.type === 'session' && r.session.id === selectedId);
+    if (index === -1) return;
+    scrolledTo.current = selectedId;
+    virtualizer.scrollToIndex(index, { align: 'auto' });
+  }, [selectedId, rows, virtualizer]);
+
+  /** Moves the keyboard's place to row `index`; `follow` also tells `onActiveChange`. */
+  const moveTo = (index: number | undefined, follow = true) => {
     const row = index === undefined ? undefined : rows[index];
     if (index === undefined || row?.type !== 'session') return;
     setActive(row.session.id);
     virtualizer.scrollToIndex(index, { align: 'auto' });
+    if (follow && row.session.id !== active) onActiveChange?.(row.session);
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
@@ -156,7 +183,7 @@ export function SessionListView(props: SessionListViewProps) {
       case 'Enter':
       case ' ': {
         const row = rows[activeRow];
-        if (row?.type === 'session') onSelect(row.session);
+        if (row?.type === 'session') onSelect(row.session, 'keyboard');
         break;
       }
       default:
@@ -167,7 +194,7 @@ export function SessionListView(props: SessionListViewProps) {
 
   if (rows.length === 0) {
     return (
-      <div className={cx('flex h-full items-center justify-center p-6 text-sm text-muted', props.className)}>
+      <div className={cx('flex h-full items-center justify-center p-6 text-sm text-ink-2', props.className)}>
         {props.empty ?? 'No sessions.'}
       </div>
     );
@@ -186,7 +213,10 @@ export function SessionListView(props: SessionListViewProps) {
         aria-activedescendant={activeId === undefined ? undefined : optionId(activeId)}
         onKeyDown={onKeyDown}
         onFocus={() => {
-          if (activeId === undefined) moveTo(sessionIndexes.find((i) => rows[i]?.key === selectedId) ?? sessionIndexes[0]);
+          // Focus alone marks a place to start from; it selects nothing.
+          if (activeId === undefined) {
+            moveTo(sessionIndexes.find((i) => rows[i]?.key === selectedId) ?? sessionIndexes[0], false);
+          }
         }}
         className="group relative w-full outline-none"
         style={{ height: virtualizer.getTotalSize() }}
@@ -211,7 +241,7 @@ export function SessionListView(props: SessionListViewProps) {
                   active={row.session.id === activeId}
                   onClick={() => {
                     setActive(row.session.id);
-                    onSelect(row.session);
+                    onSelect(row.session, 'pointer');
                   }}
                 />
               ) : (
@@ -231,10 +261,10 @@ function GroupHeader({ row }: { row: Extract<ListRow, { type: 'project' | 'works
   return row.type === 'project' ? (
     <div className="flex h-full items-end gap-2 px-3 pb-1 text-xs font-semibold tracking-wide text-ink-2 uppercase">
       <span className="truncate">{row.label}</span>
-      <span className="font-normal text-muted">{row.count}</span>
+      <span className="font-normal text-ink-2">{row.count}</span>
     </div>
   ) : (
-    <div className="flex h-full items-center gap-2 pr-3 pl-5 text-xs text-muted">
+    <div className="flex h-full items-center gap-2 pr-3 pl-5 text-xs text-ink-2">
       <span className="truncate">{row.label}</span>
       <span>{row.count}</span>
     </div>
@@ -268,13 +298,13 @@ function SessionRow(props: {
       )}
     >
       <div className="flex min-w-0 items-center gap-2">
-        <span className="shrink-0 font-mono text-[10px] tracking-wide text-muted uppercase">
+        <span className="shrink-0 font-mono text-[10px] tracking-wide text-ink-2 uppercase">
           {ENGINE_LABEL[session.engine]}
         </span>
         <span className={cx('min-w-0 flex-1 truncate text-sm font-medium', session.state === 'ended' && 'text-ink-2')}>
           {sessionTitle(session)}
         </span>
-        <time dateTime={new Date(session.last_activity).toISOString()} className="shrink-0 text-xs text-muted">
+        <time dateTime={new Date(session.last_activity).toISOString()} className="shrink-0 text-xs text-ink-2">
           {relativeTime(session.last_activity, props.now)}
         </time>
       </div>
@@ -289,7 +319,7 @@ function SessionRow(props: {
           <>
             <StatusPill tone={state.tone}>{state.label}</StatusPill>
             {session.status_line !== undefined && (
-              <span className="min-w-0 truncate text-muted">{session.status_line}</span>
+              <span className="min-w-0 truncate text-ink-2">{session.status_line}</span>
             )}
           </>
         )}
@@ -301,7 +331,9 @@ function SessionRow(props: {
 export interface SessionListProps {
   facets?: SessionFacets;
   selectedId?: string | undefined;
-  onSelect: (session: Session) => void;
+  onSelect: (session: Session, via: SelectVia) => void;
+  /** See `SessionListViewProps.onActiveChange`. */
+  onActiveChange?: ((session: Session) => void) | undefined;
   className?: string;
 }
 
@@ -318,7 +350,7 @@ export function SessionList(props: SessionListProps) {
     );
   }
   if (isPending) {
-    return <p className="p-6 text-sm text-muted">Loading sessions…</p>;
+    return <p className="p-6 text-sm text-ink-2">Loading sessions…</p>;
   }
   return (
     <SessionListView
@@ -327,6 +359,7 @@ export function SessionList(props: SessionListProps) {
       members={members.data}
       selectedId={props.selectedId}
       onSelect={props.onSelect}
+      onActiveChange={props.onActiveChange}
       empty={all.length === 0 ? 'No sessions yet.' : 'No sessions match these filters.'}
       {...(props.className === undefined ? {} : { className: props.className })}
     />

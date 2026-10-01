@@ -3,16 +3,22 @@
 
 import { DropdownMenu } from 'radix-ui';
 import { useState } from 'react';
-import { ApiError, useMembers, useSession, type Task, type Workstream } from '../data/index.ts';
+import { ApiError, useMachines, useMembers, useSession, type Task, type Workstream } from '../data/index.ts';
 import { Button, StatusPill } from '../design/index.ts';
 import { cx } from '../lib/cx.ts';
-import { useEndSession, useMachines, useTaskById, useWorkstreamById } from './data.ts';
+import { useEndSession, useTaskById, useWorkstreamById } from './data.ts';
 import { ENGINE_LABEL, inputBlocked, LIVENESS, sessionTitle, STATE } from './format.ts';
 
 export interface SessionHeaderProps {
   sessionId: string;
   onOpenTask?: (task: Task) => void;
   onOpenWorkstream?: (workstream: Workstream) => void;
+  /**
+   * Where the task and workstream links point. With them the links are real links (they open in
+   * a new tab, and show their target); a plain click still calls `onOpenTask` or `onOpenWorkstream`.
+   */
+  taskHref?: (task: Task) => string;
+  workstreamHref?: (workstream: Workstream) => string;
   /** Placeholders until their flows exist: the menu shows them disabled without a handler. */
   onHandOff?: () => void;
   onFork?: () => void;
@@ -34,7 +40,7 @@ export function SessionHeader(props: SessionHeaderProps) {
 
   if (session.data === undefined) {
     return (
-      <header className={cx('border-b border-line px-4 py-3 text-sm text-muted', props.className)}>
+      <header className={cx('border-b border-line px-4 py-3 text-sm text-ink-2', props.className)}>
         {session.error !== null ? 'Could not load the session.' : 'Loading the session…'}
       </header>
     );
@@ -83,17 +89,17 @@ export function SessionHeader(props: SessionHeaderProps) {
 
       <dl className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-ink-2">
         <div className="flex gap-1">
-          <dt className="text-muted">Engine</dt>
+          <dt className="text-ink-2">Engine</dt>
           <dd>{ENGINE_LABEL[s.engine]}</dd>
         </div>
         {agent !== undefined && (
           <div className="flex gap-1">
-            <dt className="text-muted">Agent</dt>
+            <dt className="text-ink-2">Agent</dt>
             <dd>{agent.handle}</dd>
           </div>
         )}
         <div className="flex gap-1">
-          <dt className="text-muted">Machine</dt>
+          <dt className="text-ink-2">Machine</dt>
           <dd>
             {machine?.name ?? '…'}
             {machine !== undefined && machine.liveness !== 'live' && (
@@ -103,12 +109,12 @@ export function SessionHeader(props: SessionHeaderProps) {
         </div>
         {s.branch !== undefined && (
           <div className="flex gap-1">
-            <dt className="text-muted">Branch</dt>
+            <dt className="text-ink-2">Branch</dt>
             <dd className="font-mono">{s.branch}</dd>
           </div>
         )}
         <div className="flex min-w-0 gap-1">
-          <dt className="text-muted">Folder</dt>
+          <dt className="text-ink-2">Folder</dt>
           <dd className="truncate font-mono" title={s.cwd}>
             {s.cwd}
           </dd>
@@ -121,6 +127,7 @@ export function SessionHeader(props: SessionHeaderProps) {
             <LinkedWork
               label="Task"
               text={`${linkedTask.key} · ${linkedTask.title}`}
+              href={props.taskHref?.(linkedTask)}
               onOpen={onOpenTask === undefined ? undefined : () => onOpenTask(linkedTask)}
             />
           )}
@@ -128,6 +135,7 @@ export function SessionHeader(props: SessionHeaderProps) {
             <LinkedWork
               label="Workstream"
               text={linkedWorkstream.name}
+              href={props.workstreamHref?.(linkedWorkstream)}
               onOpen={onOpenWorkstream === undefined ? undefined : () => onOpenWorkstream(linkedWorkstream)}
             />
           )}
@@ -161,22 +169,53 @@ function PlaceholderItem({ label, onSelect }: { label: string; onSelect: (() => 
   return (
     <DropdownMenu.Item className={itemClass} disabled={onSelect === undefined} onSelect={() => onSelect?.()}>
       {label}
-      {onSelect === undefined && <span className="text-xs text-muted">Soon</span>}
+      {onSelect === undefined && <span className="text-xs text-ink-2">Soon</span>}
     </DropdownMenu.Item>
   );
 }
 
-function LinkedWork({ label, text, onOpen }: { label: string; text: string; onOpen: (() => void) | undefined }) {
+const LINK = 'truncate text-accent-text underline-offset-2 hover:underline';
+
+function LinkedWork({
+  label,
+  text,
+  href,
+  onOpen,
+}: {
+  label: string;
+  text: string;
+  href: string | undefined;
+  onOpen: (() => void) | undefined;
+}) {
+  let target = <span className="truncate">{text}</span>;
+  if (href !== undefined) {
+    target = (
+      <a
+        href={href}
+        className={LINK}
+        onClick={(event) => {
+          // A modified or middle click opens the link the browser's way (a new tab, a window).
+          if (onOpen === undefined || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+            return;
+          }
+          event.preventDefault();
+          onOpen();
+        }}
+      >
+        {text}
+      </a>
+    );
+  } else if (onOpen !== undefined) {
+    target = (
+      <button type="button" onClick={onOpen} className={LINK}>
+        {text}
+      </button>
+    );
+  }
   return (
     <span className="flex min-w-0 items-center gap-1">
-      <span className="text-muted">{label}</span>
-      {onOpen === undefined ? (
-        <span className="truncate">{text}</span>
-      ) : (
-        <button type="button" onClick={onOpen} className="truncate text-accent-text underline-offset-2 hover:underline">
-          {text}
-        </button>
-      )}
+      <span className="text-ink-2">{label}</span>
+      {target}
     </span>
   );
 }

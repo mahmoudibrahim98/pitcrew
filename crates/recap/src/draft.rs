@@ -543,11 +543,11 @@ fn health_word(h: Health) -> &'static str {
     }
 }
 
-fn plural(n: usize, one: &str, many: &str) -> String {
+pub(crate) fn plural(n: usize, one: &str, many: &str) -> String {
     plural64(u64::try_from(n).unwrap_or(u64::MAX), one, many)
 }
 
-fn plural64(n: u64, one: &str, many: &str) -> String {
+pub(crate) fn plural64(n: u64, one: &str, many: &str) -> String {
     if n == 1 {
         format!("1 {one}")
     } else {

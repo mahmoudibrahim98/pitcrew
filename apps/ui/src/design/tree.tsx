@@ -18,6 +18,7 @@ import {
   type SetStateAction,
 } from 'react';
 import { cx } from '../lib/cx.ts';
+import { FOCUS_RING } from './focus.ts';
 import { ChevronRightIcon } from './icons.tsx';
 
 interface TreeState {
@@ -160,7 +161,8 @@ export function TreeItem({
         style={{ paddingLeft: 4 + (level - 1) * 14 }}
         className={cx(
           'flex h-7 min-w-0 items-center gap-1 rounded-sm pr-2 text-sm text-ink-2 outline-none select-none',
-          'hover:bg-hover hover:text-ink focus-visible:outline-2 focus-visible:outline-accent',
+          'hover:bg-hover hover:text-ink',
+          FOCUS_RING,
           'aria-[current=page]:bg-card aria-[current=page]:font-medium aria-[current=page]:text-ink aria-[current=page]:shadow-[0_0_0_1px_var(--pc-line)]',
           className,
         )}

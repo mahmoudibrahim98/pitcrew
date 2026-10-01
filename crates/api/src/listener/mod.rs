@@ -14,16 +14,19 @@ pub use pipe::{NamedPipe, PipeAddr};
 #[cfg(unix)]
 pub use unix::{SOCKET_NAME, UnixSocket};
 
-use axum::Router;
+use crate::util::HubShutdown;
 use axum::extract::Request;
 use axum::http::header::HOST;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
+use axum::{Extension, Router};
 use pitcrew_auth::ErrorResponse;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 /// Where to listen.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,13 +157,24 @@ impl Bound {
 
     /// Serves `app` until `shutdown` completes, then finishes in-flight requests.
     ///
+    /// WebSockets (the stream, terminals) are told when `shutdown` completes and close with 1001;
+    /// this waits up to two seconds for them before returning.
+    ///
     /// # Errors
     /// Only as `axum::serve` reports them; accept errors are logged and retried.
     pub async fn serve<F>(self, app: Router, shutdown: F) -> io::Result<()>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        match self.0 {
+        let (going, signal) = HubShutdown::channel();
+        let going = Arc::new(going);
+        let app = app.layer(Extension(signal));
+        let announce = Arc::clone(&going);
+        let shutdown = async move {
+            shutdown.await;
+            announce.send_replace(true);
+        };
+        let served = match self.0 {
             #[cfg(unix)]
             Inner::Unix(socket) => {
                 axum::serve(socket, app)
@@ -177,9 +191,18 @@ impl Bound {
                 let app = app.layer(middleware::from_fn(local_host_only));
                 axum::serve(tcp, app).with_graceful_shutdown(shutdown).await
             }
-        }
+        };
+        // Upgraded connections left hyper, so its graceful shutdown does not wait for them. Each
+        // open socket holds a receiver: wait (briefly) until they have all said goodbye.
+        going.send_replace(true);
+        let _ = tokio::time::timeout(SOCKETS_GRACE, going.closed()).await;
+        served
     }
 }
+
+/// How long [`Bound::serve`] waits for open WebSockets to close after shutdown.
+const SOCKETS_GRACE: Duration = Duration::from_secs(2);
+
 /// The DNS-rebinding guard for development TCP.
 async fn local_host_only(request: Request, next: Next) -> Response {
     let host = request

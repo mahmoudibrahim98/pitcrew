@@ -1,6 +1,104 @@
-// The Projects layout feature (stream N). A stub from stream L so the app builds; stream N fills
-// it in. The interface is documented in src/shell/README.md.
+// Stream N's public surface: the Projects layout feature (routes, nav, commands, "+ New"), and its
+// components. The components are lazy, so the projects code loads only when a projects route is
+// visited; render them inside <Suspense> if you use them directly.
 
-import { defineFeature } from '../shell/index.ts';
+import { createRoute, lazyRouteComponent, type AnyRoute } from '@tanstack/react-router';
+import { lazy } from 'react';
+import { defineFeature, type WorkspaceRoute } from '../shell/index.ts';
 
-export const feature = defineFeature({ id: 'projects', layout: 'projects' });
+/** Every route under one pathless layout, so `ProjectsNavProvider` wires up once (`layout.tsx`). */
+function projectsRoutes(parent: WorkspaceRoute): AnyRoute[] {
+  const projectsLayout = createRoute({
+    getParentRoute: () => parent,
+    id: 'projects-layout',
+    component: lazyRouteComponent(() => import('./layout.tsx'), 'ProjectsLayout'),
+  });
+  return [
+    projectsLayout.addChildren([
+      createRoute({
+        getParentRoute: () => projectsLayout,
+        path: 'home',
+        staticData: { title: 'Home' },
+        component: lazyRouteComponent(() => import('./home.tsx'), 'Home'),
+      }),
+      createRoute({
+        getParentRoute: () => projectsLayout,
+        path: 'inbox',
+        staticData: { layout: 'both', title: 'Inbox' },
+        component: lazyRouteComponent(() => import('./inbox.tsx'), 'Inbox'),
+      }),
+      createRoute({
+        getParentRoute: () => projectsLayout,
+        path: 'my-tasks',
+        staticData: { title: 'My tasks' },
+        component: lazyRouteComponent(() => import('./my-tasks.tsx'), 'MyTasksPage'),
+      }),
+      createRoute({
+        getParentRoute: () => projectsLayout,
+        path: 'projects',
+        staticData: { title: 'Projects' },
+        component: lazyRouteComponent(() => import('./projects-list.tsx'), 'ProjectsListPage'),
+      }),
+      createRoute({
+        getParentRoute: () => projectsLayout,
+        path: 'members',
+        staticData: { title: 'Members' },
+        component: lazyRouteComponent(() => import('./members.tsx'), 'MembersPage'),
+      }),
+      createRoute({
+        getParentRoute: () => projectsLayout,
+        path: 'projects/$project',
+        component: lazyRouteComponent(() => import('./project-page.tsx'), 'ProjectPage'),
+      }),
+      createRoute({
+        getParentRoute: () => projectsLayout,
+        path: 'projects/$project/workstreams/$workstream',
+        component: lazyRouteComponent(() => import('./workstream-page.tsx'), 'WorkstreamPage'),
+      }),
+      createRoute({
+        getParentRoute: () => projectsLayout,
+        path: 'tasks/$task',
+        component: lazyRouteComponent(() => import('./task-page.tsx'), 'TaskPage'),
+      }),
+    ]),
+  ];
+}
+
+export const feature = defineFeature({
+  id: 'projects',
+  layout: 'projects',
+  routes: projectsRoutes,
+  // Both sort before the shell's own "Agent console" (order 40): e2e/shell.spec.ts's keyboard
+  // test tabs from it straight to the projects tree, which comes right after the top nav list.
+  nav: [
+    { id: 'projects-list', label: 'Projects', to: 'projects', order: 25 },
+    { id: 'members', label: 'Members', to: 'members', order: 35 },
+  ],
+  commands: [{ id: 'go-projects', label: 'Go to Projects', group: 'Go to', run: (c) => c.go('projects') }],
+  create: [{ id: 'task', label: 'Task', order: 10, dialog: lazy(() => import('./new-task.tsx').then((m) => ({ default: m.NewTaskDialog }))) }],
+});
+
+export const Home = lazy(() => import('./home.tsx').then((m) => ({ default: m.Home })));
+export const Inbox = lazy(() => import('./inbox.tsx').then((m) => ({ default: m.Inbox })));
+export const Board = lazy(() => import('./board.tsx').then((m) => ({ default: m.Board })));
+export const TaskDrawer = lazy(() => import('./task-drawer.tsx').then((m) => ({ default: m.TaskDrawer })));
+export const TaskDetail = lazy(() => import('./task-drawer.tsx').then((m) => ({ default: m.TaskDetail })));
+export const WhereItStands = lazy(() => import('./where-it-stands.tsx').then((m) => ({ default: m.WhereItStands })));
+export const ProjectOverview = lazy(() => import('./overview.tsx').then((m) => ({ default: m.ProjectOverview })));
+export const WorkstreamOverview = lazy(() =>
+  import('./overview.tsx').then((m) => ({ default: m.WorkstreamOverview })),
+);
+export const WorkstreamsTable = lazy(() => import('./overview.tsx').then((m) => ({ default: m.WorkstreamsTable })));
+export const ActivityFeed = lazy(() => import('./activity.tsx').then((m) => ({ default: m.ActivityFeed })));
+export const AgentsNow = lazy(() => import('./agents.tsx').then((m) => ({ default: m.AgentsNow })));
+export const MyTasksPage = lazy(() => import('./my-tasks.tsx').then((m) => ({ default: m.MyTasksPage })));
+export const ProjectsListPage = lazy(() => import('./projects-list.tsx').then((m) => ({ default: m.ProjectsListPage })));
+export const MembersPage = lazy(() => import('./members.tsx').then((m) => ({ default: m.MembersPage })));
+export const ProjectPage = lazy(() => import('./project-page.tsx').then((m) => ({ default: m.ProjectPage })));
+export const WorkstreamPage = lazy(() => import('./workstream-page.tsx').then((m) => ({ default: m.WorkstreamPage })));
+export const TaskPage = lazy(() => import('./task-page.tsx').then((m) => ({ default: m.TaskPage })));
+
+export { ProjectsNavProvider, useProjectsNav, type ProjectsNav } from './nav.tsx';
+/** Open asks to me, for the sidebar's Inbox badge. */
+export { useInbox } from './data.ts';
+export type { BoardGrouping, BoardProps } from './board.tsx';

@@ -1,10 +1,10 @@
 // Facet filters for the session list: machine, engine, state, project and workstream. Controlled:
 // the caller keeps the value and passes it to `SessionList`.
 
-import { useId, type ReactNode } from 'react';
-import type { Engine, SessionState } from '../data/index.ts';
+import { useId, useRef, type ReactNode } from 'react';
+import { useMachines, type Engine, type SessionState } from '../data/index.ts';
 import { cx } from '../lib/cx.ts';
-import { useConsoleSessions, useMachines } from './data.ts';
+import { useConsoleSessions } from './data.ts';
 import { hasFacets, NO_FACETS, placeOf, UNSORTED, type SessionFacets } from './facets.ts';
 import { ENGINE_LABEL, ENGINES, LIVENESS, SESSION_STATES, STATE } from './format.ts';
 
@@ -29,6 +29,13 @@ export interface SessionFiltersProps {
 export function SessionFilters({ value, onChange, className }: SessionFiltersProps) {
   const { all, places } = useConsoleSessions();
   const machines = useMachines();
+  const root = useRef<HTMLDivElement>(null);
+
+  const clear = () => {
+    onChange(NO_FACETS);
+    // The Clear button goes away; focus stays in the filters rather than falling to the page.
+    root.current?.querySelector<HTMLInputElement>('input[type="checkbox"]')?.focus();
+  };
 
   const counts = (name: FacetName) => {
     const map = new Map<string, number>();
@@ -98,15 +105,16 @@ export function SessionFilters({ value, onChange, className }: SessionFiltersPro
   ];
 
   return (
-    <div className={cx('flex flex-col gap-4 p-3 text-sm', className)} role="group" aria-label="Session filters">
+    <div
+      ref={root}
+      className={cx('flex flex-col gap-4 p-3 text-sm', className)}
+      role="group"
+      aria-label="Session filters"
+    >
       <div className="flex items-center justify-between">
         <span className="text-xs font-semibold tracking-wide text-ink-2 uppercase">Filters</span>
         {hasFacets(value) && (
-          <button
-            type="button"
-            className="rounded-sm px-1.5 text-xs text-accent-text hover:bg-hover"
-            onClick={() => onChange(NO_FACETS)}
-          >
+          <button type="button" className="rounded-sm px-1.5 text-xs text-accent-text hover:bg-hover" onClick={clear}>
             Clear
           </button>
         )}
@@ -114,6 +122,7 @@ export function SessionFilters({ value, onChange, className }: SessionFiltersPro
       {sections.map((section) => (
         <FacetSection
           key={section.name}
+          name={section.name}
           title={section.title}
           options={section.options}
           selected={value[section.name]}
@@ -127,6 +136,7 @@ export function SessionFilters({ value, onChange, className }: SessionFiltersPro
 }
 
 function FacetSection(props: {
+  name: FacetName;
   title: string;
   options: Option[];
   selected: readonly string[];
@@ -135,8 +145,8 @@ function FacetSection(props: {
   const id = useId();
   if (props.options.length === 0) return null;
   return (
-    <fieldset aria-labelledby={id} className="flex flex-col gap-0.5">
-      <legend id={id} className="mb-1 text-xs text-muted">
+    <fieldset aria-labelledby={id} data-facet={props.name} className="flex flex-col gap-0.5">
+      <legend id={id} className="mb-1 text-xs text-ink-2">
         {props.title}
       </legend>
       {props.options.map((option) => (
@@ -151,7 +161,7 @@ function FacetSection(props: {
             className="accent-(--pc-accent)"
           />
           <span className="min-w-0 flex-1 truncate">{option.label}</span>
-          <span className="text-xs text-muted tabular-nums">{option.count}</span>
+          <span className="text-xs text-ink-2 tabular-nums">{option.count}</span>
         </label>
       ))}
     </fieldset>

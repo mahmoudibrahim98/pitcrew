@@ -189,7 +189,8 @@ impl Writer {
 }
 
 /// The default summarizer: joins clauses with commas; a paragraph's sentences start with a
-/// capital and end with a full stop. Deterministic and free.
+/// capital and end with a full stop (unless they already end in `.`, `?` or `!`). Deterministic
+/// and free.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RuleSummarizer;
 
@@ -215,7 +216,8 @@ impl RuleSummarizer {
                 let capitalize = draft.kind == DraftKind::Paragraph && i == 0;
                 w.clause(&clause.text, &clause.receipts, capitalize);
             }
-            if draft.kind == DraftKind::Paragraph {
+            // A sentence that already ends in a question ("…, paused?") keeps its own mark.
+            if draft.kind == DraftKind::Paragraph && !w.summary.text.ends_with(['.', '?', '!']) {
                 w.sep(".");
             }
         }
@@ -346,6 +348,22 @@ mod tests {
                 "Évidence first"
             ]
         );
+        assert_eq!(verify(&s, &draft), Ok(()));
+    }
+
+    #[test]
+    fn a_question_keeps_its_mark() {
+        let draft = Draft {
+            kind: DraftKind::Paragraph,
+            sentences: vec![Sentence {
+                clauses: vec![
+                    clause("quiet for 4 days", vec![ev(1)]),
+                    clause("paused?", vec![ev(1)]),
+                ],
+            }],
+        };
+        let s = RuleSummarizer.render(&draft);
+        assert_eq!(s.text, "Quiet for 4 days, paused?");
         assert_eq!(verify(&s, &draft), Ok(()));
     }
 

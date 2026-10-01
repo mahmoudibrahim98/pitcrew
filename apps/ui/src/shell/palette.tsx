@@ -86,14 +86,16 @@ function useItems(opener: Element | null): Item[] {
         fields: [c.label, ...(c.keywords ?? [])],
         run: () => c.run(context),
       })),
-    ...registry.create.map<Item>((e) => ({
-      id: `create:${e.id}`,
-      kind: 'create',
-      label: `New ${e.label.toLowerCase()}`,
-      hint: 'Create',
-      fields: [`New ${e.label}`, 'create', 'add'],
-      run: () => setCreating(e.id, opener),
-    })),
+    ...registry.create
+      .filter((e) => e.disabled === undefined)
+      .map<Item>((e) => ({
+        id: `create:${e.id}`,
+        kind: 'create',
+        label: `New ${e.label.toLowerCase()}`,
+        hint: 'Create',
+        fields: [`New ${e.label}`, 'create', 'add'],
+        run: () => setCreating(e.id, opener),
+      })),
     ...projects.map<Item>((p) => ({
       id: `project:${p.id}`,
       kind: 'project',

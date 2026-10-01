@@ -65,7 +65,7 @@ pub fn seeded(dir: &Path) -> Arc<WorkService> {
     let demo = demo();
     let work = Arc::new(WorkService::new(
         open(&dir.join("hub.db")),
-        demo.workspace.id,
+        demo.workspace.clone(),
     ));
     work.seed(&demo).expect("seed");
     work

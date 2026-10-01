@@ -1086,6 +1086,7 @@ dependencies = [
  "pitcrew-interfaces",
  "pitcrew-protocol",
  "proptest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
@@ -1113,7 +1114,17 @@ dependencies = [
 name = "pitcrew-office"
 version = "0.0.0"
 dependencies = [
+ "insta",
+ "pitcrew-fixtures",
  "pitcrew-protocol",
+ "pitcrew-recap",
+ "pitcrew-store",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "ulid",
 ]
 
 [[package]]
@@ -1151,7 +1162,17 @@ dependencies = [
 name = "pitcrew-remote"
 version = "0.0.0"
 dependencies = [
+ "getrandom",
  "pitcrew-protocol",
+ "proptest",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1567,6 +1588,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "similar"
 version = "2.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1702,6 +1733,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
