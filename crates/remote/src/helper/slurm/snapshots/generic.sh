@@ -26,9 +26,14 @@ pc_modules=''
 # 4. waits for the helper, passes SIGTERM on to it (scancel, the time limit), and removes what
 #    it made on the way out: the endpoint while it names this job, and the socket it started.
 
-# Functions imported from the environment (bash exports them) must not stand in for tools.
-unset -f awk cat cd chmod command date head hostname id kill ls mkdir mv printf ps pwd \
-  readlink rm rmdir sed sleep test tr umask uname wait wc 2>/dev/null
+# Functions imported from the environment (bash exports them), or defined by the modules' set-up
+# script, must not stand in for tools; nor may that script's aliases.
+pc_unshadow() {
+  unset -f awk cat cd chmod command date head hostname id kill ls mkdir mv printf ps pwd \
+    readlink rm rmdir sed sleep test tr umask uname wait wc 2>/dev/null
+  unalias -a 2>/dev/null
+}
+pc_unshadow
 unset IFS ENV BASH_ENV CDPATH
 PATH=$pc_tool_path${PATH:+:$PATH}
 export PATH
@@ -300,6 +305,7 @@ if [ -n "$pc_modules_init" ]; then
   . "$pc_modules_init"
   set +eu
   unset IFS
+  pc_unshadow
   pc_traps
 fi
 if [ -n "$pc_modules" ]; then

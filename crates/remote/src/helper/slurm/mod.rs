@@ -21,8 +21,9 @@
 //! lock, after the same checks of the way to the root) takes the job script from stdin, checks
 //! that it arrived whole and unchanged (its length, first lines, last line and sha256), and
 //! refuses while another launcher's helper uses the root. It unsets the `SBATCH_*`, `SQUEUE_*`,
-//! `SCANCEL_*` and `SACCT_*` variables (which would override the directives, hide a job from
-//! `squeue -j`, or make scancel ask or skip), and runs `sbatch --parsable` under `umask 077`, with
+//! `SCANCEL_*` and `SACCT_*` variables and `SLURM_CLUSTERS` (which would override the
+//! directives, hide a job from `squeue -j`, make scancel ask or skip, or send the commands to
+//! another cluster), and runs `sbatch --parsable` under `umask 077`, with
 //! the job name, working directory (the root) and output (`run/slurm-<id>.out`) on the command
 //! line too. It reads the job id from sbatch's standard output only, keeps the cluster sbatch
 //! names (`<id>;<cluster>`, then asked about with `-M`), and records the job in `run/slurm.json`
@@ -223,7 +224,9 @@ pub struct Submitted {
 pub struct Cancelled {
     /// The job that was recorded, if any.
     pub job: Option<u64>,
-    /// Whether `scancel` was sent: the job was ours and still queued or running.
+    /// Whether this call cancelled the job: it was ours and still queued or running, scancel
+    /// answered 0, and the job then ended `CANCELLED` as far as squeue or sacct can tell (not
+    /// when it ended on its own because scancel's filters left it out).
     pub cancelled: bool,
     /// The helper's pid on the node, when it had started.
     pub pid: Option<u32>,

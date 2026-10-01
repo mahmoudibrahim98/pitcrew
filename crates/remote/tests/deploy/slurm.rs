@@ -67,6 +67,9 @@ struct Config {
     cluster: Option<String>,
     /// scancel fails with this message.
     scancel_error: Option<String>,
+    /// scancel answers 0 but cancels nothing (its filters left the job out), and the job then
+    /// ends on its own.
+    scancel_misses: bool,
 }
 
 impl Default for Config {
@@ -86,6 +89,7 @@ impl Default for Config {
             partitions: vec!["batch*".to_owned(), "gpu".to_owned()],
             cluster: None,
             scancel_error: None,
+            scancel_misses: false,
         }
     }
 }
@@ -121,9 +125,16 @@ struct FakeJob {
     cluster: Option<String>,
 }
 
+/// The cluster a tool was sent to: `-M <cluster>`, or else, as real SLURM, `SLURM_CLUSTERS`.
+fn cluster_asked(args: &[String]) -> Option<String> {
+    value(args, "-M")
+        .map(str::to_owned)
+        .or_else(|| std::env::var("SLURM_CLUSTERS").ok())
+}
+
 /// Whether a tool asked with `args` (`-M <cluster>` or not) sees `job`.
 fn on_its_cluster(job: &FakeJob, args: &[String]) -> bool {
-    value(args, "-M") == job.cluster.as_deref()
+    cluster_asked(args) == job.cluster
 }
 
 fn now() -> u64 {
@@ -335,7 +346,10 @@ fn sbatch(dir: &Path, config: &Config, args: &[String]) -> ExitCode {
             .filter(|(k, _)| k != SLURM_ENV && k != DIR_ENV)
             .collect(),
         directives,
-        cluster: config.cluster.clone(),
+        cluster: config
+            .cluster
+            .clone()
+            .or_else(|| std::env::var("SLURM_CLUSTERS").ok()),
     };
     save(dir, &job);
     if config.start {
@@ -344,7 +358,7 @@ fn sbatch(dir: &Path, config: &Config, args: &[String]) -> ExitCode {
     // A warning first, as real sites often print, then the id; then a number on stderr that
     // only a reader of both streams would take for the id.
     eprintln!("sbatch: warning: this is a fake SLURM");
-    match (parsable, &config.cluster) {
+    match (parsable, &job.cluster) {
         (true, Some(cluster)) => println!("{id};{cluster}"),
         (true, None) => println!("{id}"),
         (false, _) => println!("Submitted batch job {id}"),
@@ -512,6 +526,15 @@ fn scancel(dir: &Path, config: &Config, args: &[String]) -> ExitCode {
     if let Some(error) = &config.scancel_error {
         eprintln!("{error}");
         return ExitCode::from(1);
+    }
+    if config.scancel_misses {
+        job.state = "COMPLETED".to_owned();
+        job.exit = Some((0, 0));
+        save(dir, &job);
+        if let Some(pgid) = job.pgid {
+            kill_group(pgid, rustix::process::Signal::TERM);
+        }
+        return ExitCode::SUCCESS;
     }
     // As real scancel: the filters given, and those in the environment, restrict what it
     // cancels; with SCANCEL_INTERACTIVE it asks first (and reads no answer here).
@@ -757,7 +780,8 @@ fn send_usr_signals(pid: u32) {
 
 /// A site whose `module` command comes from a set-up script in the machine's directory, which
 /// logs what it loads to `loaded.log` and fails for `broken/…`. The script also changes `IFS`
-/// and the shell's traps, as a careless one might.
+/// and the shell's traps, and shadows tools the job uses with a function (`date`) and an alias
+/// (`pwd`), as a careless one might.
 fn module_site(m: &Machine, socket: SocketPlace) -> Site {
     let init = m.dir.path().join("modules-init.sh");
     let log = m.dir.path().join("loaded.log");
@@ -770,7 +794,9 @@ fn module_site(m: &Machine, socket: SocketPlace) -> Site {
              }}\n\
              IFS=:\n\
              trap - EXIT HUP INT TERM\n\
-             trap '' USR1 USR2\n",
+             trap '' USR1 USR2\n\
+             date() {{ echo 0; }}\n\
+             alias pwd='echo /nowhere'\n",
             log.display()
         ),
     )
@@ -793,7 +819,8 @@ fn slurm_submit_pending_running_stop() {
         ..Config::default()
     });
     // Variables a user's profile may set: they would override the script's directives, hide
-    // the pending job from squeue -j, or make scancel ask, or skip the running job.
+    // the pending job from squeue -j, make scancel ask, or skip the running job, or send it all
+    // to another cluster.
     for (name, value) in [
         ("SBATCH_PARTITION", "debug"),
         ("SBATCH_JOB_NAME", "impostor"),
@@ -802,6 +829,7 @@ fn slurm_submit_pending_running_stop() {
         ("SCANCEL_STATE", "PENDING"),
         ("SCANCEL_INTERACTIVE", "1"),
         ("SACCT_FORMAT", "JobName"),
+        ("SLURM_CLUSTERS", "other-cluster"),
     ] {
         m.env.push((name.to_owned(), value.to_owned()));
     }
@@ -851,7 +879,7 @@ fn slurm_submit_pending_running_stop() {
             fake.directives
         );
     }
-    for family in ["SBATCH_", "SQUEUE_", "SCANCEL_", "SACCT_"] {
+    for family in ["SBATCH_", "SQUEUE_", "SCANCEL_", "SACCT_", "SLURM_CLUSTERS"] {
         assert!(
             fake.env.iter().all(|(k, _)| !k.starts_with(family)),
             "{family}"
@@ -1142,6 +1170,19 @@ fn slurm_failures_are_clear() {
     assert!(alive(again.endpoint.pid));
     sim.set(|c| c.scancel_error = None);
     assert!(block_on(launcher.cancel(&target)).unwrap().cancelled);
+
+    // scancel answers 0 but its filters left the job out, and the job ends on its own: it is
+    // not reported as cancelled.
+    let started = block_on(launcher.start(&target)).unwrap();
+    sim.set(|c| c.scancel_misses = true);
+    let missed = block_on(launcher.cancel(&target)).unwrap();
+    assert!(!missed.cancelled, "{missed:?}");
+    assert!(
+        matches!(&missed.state, JobState::Ended { state: Some(s), .. } if s == "COMPLETED"),
+        "{missed:?}"
+    );
+    eventually("the helper to be gone", || !alive(started.endpoint.pid));
+    sim.set(|c| c.scancel_misses = false);
 
     // A job that does not leave the queue in time: stop says so, and keeps the record, so
     // stopping again finishes the job.
@@ -1876,7 +1917,12 @@ fn slurm_jobs_on_a_named_cluster() {
     let status = block_on(launcher.job_status(&target)).unwrap();
     assert!(status.ready(), "{status:?}");
     assert_eq!(status.cluster.as_deref(), Some("example-cluster"));
-    assert!(read(&m.run_dir().join("slurm.json")).ends_with(",\"cluster\":\"example-cluster\"}\n"));
+    let record = m.run_dir().join("slurm.json");
+    let text = read(&record);
+    assert!(
+        text.ends_with(",\"cluster\":\"example-cluster\"}\n"),
+        "{text}"
+    );
     // Submitting again finds the same job there, rather than submitting another.
     assert!(!block_on(launcher.submit(&target)).unwrap().submitted_now);
     let cancelled = block_on(launcher.cancel(&target)).unwrap();
@@ -1887,6 +1933,23 @@ fn slurm_jobs_on_a_named_cluster() {
     }
     assert_eq!(sim.calls("sbatch").len(), 1);
     assert_eq!(sim.job(id).state, "CANCELLED");
+
+    // A cluster name that would read as an option is never passed on: not from sbatch's
+    // answer, nor from a record.
+    sim.set(|c| c.cluster = Some("-oops".to_owned()));
+    let err = block_on(launcher.submit(&target)).unwrap_err();
+    assert!(matches!(&err, HelperError::SubmitFailed(_)), "{err:?}");
+    std::fs::write(
+        &record,
+        text.replace("\"cluster\":\"example-cluster\"", "\"cluster\":\"-oops\""),
+    )
+    .unwrap();
+    assert!(!block_on(launcher.job_status(&target)).unwrap().ready());
+    for tool in ["squeue", "scancel", "sacct"] {
+        for call in sim.calls(tool) {
+            assert!(!call.iter().any(|a| a.contains("oops")), "{call:?}");
+        }
+    }
 }
 
 /// A job with modules and a node-local socket, run by each POSIX shell as the machine's `sh`.
@@ -1904,6 +1967,13 @@ fn slurm_under_every_posix_sh() {
         let launcher = launcher(&script);
         let started = block_on(launcher.start(&target))
             .unwrap_or_else(|e| panic!("{}: {e}", shell.display()));
+        // The set-up script's `date` function did not stand in for the real one.
+        assert!(
+            started.endpoint.started > 1_000_000_000_000,
+            "{}: {:?}",
+            shell.display(),
+            started.endpoint
+        );
         assert!(
             started.endpoint.socket.starts_with(tmp.to_str().unwrap()),
             "{}",

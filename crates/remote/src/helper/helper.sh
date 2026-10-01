@@ -778,9 +778,10 @@ pc_rec=run/slurm.json
 
 # Variables that change what sbatch, squeue, scancel and sacct do: SBATCH_* override the job
 # script's directives, SQUEUE_STATES and its kin filter even `squeue -j`, SCANCEL_* can make
-# scancel ask or skip, SACCT_* change sacct's output. Unset, so each does what its command line
-# says.
+# scancel ask or skip, SACCT_* change sacct's output, and SLURM_CLUSTERS sends them all to
+# another cluster. Unset, so each does what its command line says.
 pc_slurm_env() {
+  unset SLURM_CLUSTERS
   for pc_v in $(env | sed -n \
     -e 's/^\(SBATCH_[ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_]*\)=.*$/\1/p' \
     -e 's/^\(SQUEUE_[ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_]*\)=.*$/\1/p' \
@@ -832,7 +833,7 @@ pc_job_recorded() {
   pc_fields=${pc_fields#* }
   pc_rname=${pc_fields%% *}
   pc_rsub=${pc_fields#* }
-  pc_rcl=$(printf '%s\n' "$pc_rline" | sed -n 's/^.*,"cluster":"\([0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._-]*\)"}$/\1/p')
+  pc_rcl=$(printf '%s\n' "$pc_rline" | sed -n 's/^.*,"cluster":"\([0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_][0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._-]*\)"}$/\1/p')
   [ -n "$pc_rname" ]
 }
 
@@ -1078,7 +1079,7 @@ pc_slurm_submit() {
   # On stdout, `<id>` or `<id>;<cluster>`; warnings go to stderr.
   pc_jid=$(printf '%s\n' "$pc_out" | sed -n \
     -e '/^[0123456789][0123456789]*$/p' \
-    -e '/^[0123456789][0123456789]*;[0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._-][0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._-]*$/p' \
+    -e '/^[0123456789][0123456789]*;[0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_][0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._-]*$/p' \
     | tail -n 1)
   if [ "$pc_rc" -ne 0 ] || [ -z "$pc_jid" ]; then
     pc_fail submit_failed "$(tail -n 3 "$pc_tmp2" 2>/dev/null) $(printf '%s\n' "$pc_out" | tail -n 1)"
@@ -1146,7 +1147,7 @@ pc_slurm_stop() {
     # The name and owner again, for scancel itself to check.
     pc_cout=$(pc_on scancel --user="$pc_me" --name="$pc_rname" "$pc_rjob" 2>&1)
     pc_crc=$?
-    if [ "$pc_crc" -eq 0 ]; then pc_say cancelled 1; else pc_say scancel_error "$(pc_flat "$pc_cout")"; fi
+    if [ "$pc_crc" -ne 0 ]; then pc_say scancel_error "$(pc_flat "$pc_cout")"; fi
     pc_deadline=$(($(date +%s) + $3))
     while :; do
       pc_queue "$pc_rjob"
@@ -1156,10 +1157,24 @@ pc_slurm_stop() {
         if [ "$pc_crc" -ne 0 ]; then
           pc_fail slurm "scancel $pc_rjob failed: $(pc_flat "$pc_cout")"
         fi
+        # scancel answered 0 but cancelled nothing (its filters left the job out), or the job
+        # is slow to end.
         pc_fail stop_failed "job $pc_rjob is still $pc_qstate after ${3}s"
       fi
       sleep 1
     done
+    # Cancelled: scancel answered 0 and the job ended cancelled, not on its own (scancel's
+    # filters could have left it out), as far as squeue or sacct can tell.
+    if [ "$pc_crc" -eq 0 ]; then
+      if [ "$pc_q" = ours ]; then
+        pc_end_state=$pc_qstate
+      elif [ "$pc_q" = gone ] && pc_acct "$pc_rjob"; then
+        pc_end_state=${pc_astate%% *}
+      else
+        pc_end_state=CANCELLED
+      fi
+      if [ "$pc_end_state" = CANCELLED ]; then pc_say cancelled 1; fi
+    fi
   fi
   pc_job_report
   pc_forget "$pc_rjob"
