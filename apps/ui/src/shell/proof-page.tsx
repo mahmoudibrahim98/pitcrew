@@ -6,6 +6,7 @@ import {
   ApiError,
   useAsks,
   useConnection,
+  useGatewayWorkspaces,
   useMoveTask,
   useProjects,
   useSessions,
@@ -65,6 +66,15 @@ const STREAM: Record<StreamStatus, { tone: Tone; label: string }> = {
 };
 
 export function ProofPage() {
+  // It reads the browser's one hub; the desktop app has a data scope per workspace instead.
+  return useGatewayWorkspaces() === null ? (
+    <Proof />
+  ) : (
+    <main className="mx-auto min-h-dvh max-w-5xl bg-bg px-6 py-8 text-sm text-ink">The proof page runs in a browser.</main>
+  );
+}
+
+function Proof() {
   const workspace = useWorkspace();
   const projects = useProjects();
   const workstreams = useWorkstreams();
