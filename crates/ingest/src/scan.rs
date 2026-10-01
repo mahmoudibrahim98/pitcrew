@@ -7,13 +7,20 @@
 //!
 //! Discovery is sequential (each adapter's `discover` is already a bounded directory walk that
 //! does not follow symlinks); the light reads run on a bounded pool of threads, claimed
-//! dynamically from a shared queue so one huge OpenCode store does not stall the others.
-//! `progress` always runs on the caller's own thread, at most every 100 ms.
+//! dynamically from a shared queue so one huge OpenCode store does not stall the others. A panic
+//! while reading one unit is caught and counted as unreadable rather than losing the rest of its
+//! thread's results. `progress` always runs on the caller's own thread, at most every 100 ms.
 //!
 //! Because the light reads only look at a transcript's first bytes, a `cwd` or `branch` reflects
 //! the session's **start**, not necessarily a later change (the Claude adapter's own cursor-based
 //! `branch` is "latest seen"; here it is "first seen"). That is an accepted trade-off for a fast,
 //! bounded scan; a full import (stream D) sees the final value.
+//!
+//! Grouping and exclusion (projects, workstreams, the home/system-folder guard) compare paths by
+//! [`cmp_key`], which case-folds on a case-insensitive filesystem (Windows, and macOS's default):
+//! two spellings of the same real folder are one project, never two, and the home directory is
+//! excluded whatever case it is spelled in. Every grouped path still keeps one of its original
+//! spellings for display.
 
 use crate::claude::{self, ClaudeAdapter};
 use crate::codex::{self, CodexAdapter};
@@ -25,10 +32,11 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Read;
+use std::panic::UnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How much of a transcript's start the scan reads for its session facts: enough for the first
 /// few records (session id, cwd, branch, start time), never the rest of the file.
@@ -41,7 +49,14 @@ const DEFAULT_BRANCHES: &[&str] = &["main", "master", "trunk", "develop", "head"
 /// Non-git cwds sharing a parent become one suggested project only once this many of them exist;
 /// a lone one is its own project (named after itself, not its parent).
 const MIN_GROUPED_SIBLINGS: usize = 2;
+/// However many threads a caller asks for, this many worker threads at most.
+const MAX_THREADS: usize = 64;
 const DAY_MS: i64 = 86_400_000;
+
+/// Whether this machine's filesystem compares paths case-insensitively: Windows, and macOS's
+/// default APFS/HFS+ (both case-preserving but case-insensitive). Linux's common filesystems are
+/// case-sensitive, so two differently-cased cwds there really are different folders.
+const CASE_INSENSITIVE_PATHS: bool = cfg!(any(windows, target_os = "macos"));
 
 // ─── Input ───────────────────────────────────────────────────────────────────────────────────
 
@@ -72,13 +87,34 @@ pub fn default_homes() -> Vec<ScanHome> {
 }
 
 /// Options for [`scan`].
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 pub struct ScanOptions {
     /// Now, for ranking by recent activity (sessions in the last 30 and 90 days). Tests pass a
-    /// fixed time so rankings are deterministic.
+    /// fixed time so rankings are deterministic; [`ScanOptions::default`] uses the real clock.
     pub now: TimestampMs,
     /// Worker threads for the light reads; `None` picks the machine's available parallelism.
+    /// Capped at [`MAX_THREADS`] either way.
     pub threads: Option<usize>,
+}
+
+impl Default for ScanOptions {
+    /// `now` is the real clock, not the epoch: a caller that does not set it still gets correct
+    /// recency ranking, rather than every session silently looking infinitely old (`now = 0`
+    /// would make every real timestamp come out *after* "now", so nothing is ever "recent").
+    fn default() -> Self {
+        Self {
+            now: now_ms(),
+            threads: None,
+        }
+    }
+}
+
+/// The current time in Unix milliseconds, for [`ScanOptions::default`].
+fn now_ms() -> TimestampMs {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| TimestampMs::try_from(d.as_millis()).unwrap_or(TimestampMs::MAX))
+        .unwrap_or(0)
 }
 
 // ─── Output ──────────────────────────────────────────────────────────────────────────────────
@@ -150,7 +186,8 @@ pub struct ScanCounts {
     pub by_engine: Vec<EngineCount>,
     /// Per account home.
     pub by_home: Vec<HomeCount>,
-    /// Per folder, busiest first.
+    /// Per folder, busiest first. Folders that are the same real place but spelled differently
+    /// (see the module docs) are counted together, under one of their original spellings.
     pub by_folder: Vec<FolderCount>,
     /// Per month, most recent first.
     pub by_month: Vec<MonthCount>,
@@ -213,7 +250,8 @@ pub struct ScanReport {
     /// Suggested projects, most recently active first.
     pub suggestions: Vec<Suggestion>,
     /// Folders or transcripts skipped because they could not be read (permission denied, a
-    /// vanished file, a locked store). Not fatal: the rest of the scan still ran.
+    /// vanished file, a locked store) or whose read panicked. Not fatal: the rest of the scan
+    /// still ran.
     pub unreadable: u64,
 }
 
@@ -244,10 +282,16 @@ pub fn scan(
     }
 
     let total: usize = units.iter().map(Unit::len).sum();
-    let threads = options.threads.unwrap_or_else(default_parallelism).max(1);
+    let threads = options
+        .threads
+        .unwrap_or_else(default_parallelism)
+        .clamp(1, MAX_THREADS);
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
-    let (tx, rx) = mpsc::sync_channel::<String>(64);
+    // Carries which unit (by index) a worker just finished, so the main thread can build its
+    // label lazily -- only once, right before a progress tick actually needs it -- instead of
+    // every worker formatting a path string that may just be dropped because the channel is full.
+    let (tx, rx) = mpsc::sync_channel::<usize>(64);
 
     let facts: Vec<Option<SessionFacts>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(threads);
@@ -263,9 +307,9 @@ pub fn scan(
                     let Some(unit) = units.get(i) else {
                         break;
                     };
-                    let results = unit.run();
+                    let results = run_unit(unit);
                     done.fetch_add(results.len(), Ordering::Relaxed);
-                    let _ = tx.try_send(unit.label());
+                    let _ = tx.try_send(i);
                     out.extend(results);
                 }
                 out
@@ -274,10 +318,10 @@ pub fn scan(
         drop(tx);
 
         let mut last_emit = Instant::now();
-        let mut last_path: Option<String> = None;
+        let mut last_index: Option<usize> = None;
         loop {
             match rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(p) => last_path = Some(p),
+                Ok(i) => last_index = Some(i),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
@@ -285,7 +329,7 @@ pub fn scan(
                 progress(ScanProgress {
                     scanned: done.load(Ordering::Relaxed),
                     total: Some(total),
-                    path: last_path.take(),
+                    path: last_index.take().map(|i| units[i].label()),
                 });
                 last_emit = Instant::now();
             }
@@ -314,7 +358,7 @@ pub fn scan(
 
     ScanReport {
         counts: aggregate_counts(&session_facts),
-        suggestions: build_suggestions(&session_facts, homes, options.now),
+        suggestions: build_suggestions(&session_facts, homes, options.now, CASE_INSENSITIVE_PATHS),
         unreadable,
     }
 }
@@ -366,6 +410,27 @@ impl Unit {
             Self::OpenCode { home, path, refs } => opencode_batch(home, path, refs),
         }
     }
+}
+
+/// Runs one unit, turning a panic into `unit.len()` `None`s (counted as unreadable by the
+/// caller) instead of losing everything else its worker thread already collected. No adapter is
+/// supposed to panic on untrusted transcript bytes, but transcripts are attacker-controllable
+/// text, so one bad file must not erase a thread's other results.
+fn run_unit(unit: &Unit) -> Vec<Option<SessionFacts>> {
+    run_catching_panics(unit.len(), || unit.label(), || unit.run())
+}
+
+/// The mechanism behind [`run_unit`], generic so it is testable with a closure that panics on
+/// purpose rather than needing a real adapter bug. `label` is only called if `f` actually panics.
+fn run_catching_panics(
+    len: usize,
+    label: impl FnOnce() -> String,
+    f: impl FnOnce() -> Vec<Option<SessionFacts>> + UnwindSafe,
+) -> Vec<Option<SessionFacts>> {
+    std::panic::catch_unwind(f).unwrap_or_else(|_| {
+        tracing::warn!(path = %label(), "a scan unit panicked; counted as unreadable");
+        vec![None; len]
+    })
 }
 
 /// Splits `refs` into work units: one per Claude/Codex transcript, or OpenCode sessions grouped
@@ -542,7 +607,9 @@ fn aggregate_counts(facts: &[SessionFacts]) -> ScanCounts {
     let mut subagent_sessions = 0usize;
     let mut by_engine: HashMap<Engine, usize> = HashMap::new();
     let mut by_home: HashMap<(Engine, String), usize> = HashMap::new();
-    let mut by_folder: HashMap<String, usize> = HashMap::new();
+    // Keyed by cmp_key so two spellings of one real folder count together; the value keeps one
+    // original spelling (the first seen) for display.
+    let mut by_folder: HashMap<String, (String, usize)> = HashMap::new();
     let mut by_month: HashMap<String, usize> = HashMap::new();
     let mut first_activity: Option<TimestampMs> = None;
     let mut last_activity: Option<TimestampMs> = None;
@@ -562,7 +629,9 @@ fn aggregate_counts(facts: &[SessionFacts]) -> ScanCounts {
             .entry((f.engine, f.home.to_string_lossy().into_owned()))
             .or_default() += 1;
         if let Some(cwd) = &f.cwd {
-            *by_folder.entry(cwd.clone()).or_default() += 1;
+            let key = cmp_key(Path::new(cwd), CASE_INSENSITIVE_PATHS);
+            let entry = by_folder.entry(key).or_insert_with(|| (cwd.clone(), 0));
+            entry.1 += 1;
         }
         if let Some(started) = f.started {
             *by_month
@@ -592,7 +661,7 @@ fn aggregate_counts(facts: &[SessionFacts]) -> ScanCounts {
     });
 
     let mut by_folder: Vec<FolderCount> = by_folder
-        .into_iter()
+        .into_values()
         .map(|(path, count)| FolderCount { path, count })
         .collect();
     by_folder.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.path.cmp(&b.path)));
@@ -615,6 +684,46 @@ fn aggregate_counts(facts: &[SessionFacts]) -> ScanCounts {
     }
 }
 
+// ─── Comparison keys (grouping and exclusion, never display) ───────────────────────────────────
+
+/// A path's comparison key, never for display: separators normalised to `/`, and case-folded
+/// when `case_insensitive`. Real call sites pass [`CASE_INSENSITIVE_PATHS`]; tests pass an
+/// explicit value, so Windows-style grouping and exclusion are checked on any host, not only one
+/// actually running on a case-insensitive filesystem.
+fn cmp_key(path: &Path, case_insensitive: bool) -> String {
+    let s = path.to_string_lossy().replace('\\', "/");
+    if case_insensitive {
+        s.to_ascii_lowercase()
+    } else {
+        s
+    }
+}
+
+/// The first path component of `cwd` below `root`, keeping its original spelling, found by
+/// comparing components with `case_insensitive` folding rather than a literal `strip_prefix` (a
+/// session's cwd need not match the suggestion's canonical root spelling exactly). `None` if
+/// `cwd` is not under `root`.
+fn first_segment_below(cwd: &Path, root: &Path, case_insensitive: bool) -> Option<String> {
+    let mut cwd_parts = cwd.components();
+    for root_part in root.components() {
+        let cwd_part = cwd_parts.next()?;
+        let same = if case_insensitive {
+            cwd_part
+                .as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&root_part.as_os_str().to_string_lossy())
+        } else {
+            cwd_part == root_part
+        };
+        if !same {
+            return None;
+        }
+    }
+    cwd_parts
+        .next()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+}
+
 // ─── Suggestions ─────────────────────────────────────────────────────────────────────────────
 
 fn recency_counts(sessions: &[&SessionFacts], now: TimestampMs) -> (usize, usize) {
@@ -629,56 +738,69 @@ fn recency_counts(sessions: &[&SessionFacts], now: TimestampMs) -> (usize, usize
     (within(30), within(90))
 }
 
-/// Climbs from `cwd` to the nearest ancestor containing a `.git` (directory or file).
+/// Climbs from `cwd` to the nearest ancestor containing a `.git` (directory or file). Uses
+/// `symlink_metadata` so a `.git` that is itself a symlink is not followed, matching how the
+/// adapters treat symlinks elsewhere in this crate.
 fn git_root(cwd: &Path) -> Option<PathBuf> {
     cwd.ancestors()
-        .find(|a| fs::metadata(a.join(".git")).is_ok())
+        .find(|a| fs::symlink_metadata(a.join(".git")).is_ok())
         .map(Path::to_path_buf)
 }
 
-/// Resolves every distinct cwd to a project root and whether it is a git root. A cwd with no
-/// `.git` above it is grouped with its siblings under their shared parent once there are at least
-/// [`MIN_GROUPED_SIBLINGS`] of them; a lone one is its own root.
-fn resolve_roots(cwds: &[PathBuf]) -> HashMap<PathBuf, (PathBuf, bool)> {
-    let mut out = HashMap::with_capacity(cwds.len());
+/// Resolves every distinct cwd to a project root and whether it is a git root, grouping by
+/// [`cmp_key`] so two spellings of the same folder (a different drive-letter case, or `\` vs `/`)
+/// are not treated as different roots. The returned root keeps one of the original spellings, not
+/// a normalised one. Keyed by `cmp_key(cwd)`.
+fn resolve_roots(cwds: &[PathBuf], case_insensitive: bool) -> HashMap<String, (PathBuf, bool)> {
+    let mut out: HashMap<String, (PathBuf, bool)> = HashMap::with_capacity(cwds.len());
     let mut non_git: Vec<&PathBuf> = Vec::new();
     for cwd in cwds {
         match git_root(cwd) {
             Some(root) => {
-                out.insert(cwd.clone(), (root, true));
+                out.insert(cmp_key(cwd, case_insensitive), (root, true));
             }
             None => non_git.push(cwd),
         }
     }
-    let mut by_parent: HashMap<&Path, usize> = HashMap::new();
+    // Count non-git siblings by their parent's key, keeping one spelling of the parent.
+    let mut by_parent_key: HashMap<String, (PathBuf, usize)> = HashMap::new();
     for cwd in &non_git {
         if let Some(parent) = cwd.parent() {
-            *by_parent.entry(parent).or_default() += 1;
+            let key = cmp_key(parent, case_insensitive);
+            let entry = by_parent_key
+                .entry(key)
+                .or_insert_with(|| (parent.to_path_buf(), 0));
+            entry.1 += 1;
         }
     }
     for cwd in non_git {
         let root = match cwd.parent() {
-            Some(parent)
-                if by_parent
-                    .get(parent)
-                    .is_some_and(|n| *n >= MIN_GROUPED_SIBLINGS) =>
-            {
-                parent.to_path_buf()
+            Some(parent) => {
+                let key = cmp_key(parent, case_insensitive);
+                match by_parent_key.get(&key) {
+                    Some((canonical, n)) if *n >= MIN_GROUPED_SIBLINGS => canonical.clone(),
+                    _ => cwd.clone(),
+                }
             }
-            _ => cwd.clone(),
+            None => cwd.clone(),
         };
-        out.insert(cwd.clone(), (root, false));
+        out.insert(cmp_key(cwd, case_insensitive), (root, false));
     }
     out
 }
 
 /// A root never worth suggesting: the user's home, a scanned engine home, a filesystem/drive
-/// root, or a well-known OS folder directly below one.
-fn is_excluded_root(path: &Path, homes: &[ScanHome]) -> bool {
-    if crate::user_home().is_some_and(|home| path == home) {
+/// root, or a well-known OS folder directly below one. The home and scanned-home checks compare
+/// by [`cmp_key`], so a differently-cased spelling of the same real folder is still excluded.
+fn is_excluded_root(path: &Path, homes: &[ScanHome], case_insensitive: bool) -> bool {
+    let key = cmp_key(path, case_insensitive);
+    if crate::user_home().is_some_and(|home| cmp_key(&home, case_insensitive) == key) {
         return true;
     }
-    if homes.iter().any(|h| path == h.home) {
+    if homes
+        .iter()
+        .any(|h| cmp_key(&h.home, case_insensitive) == key)
+    {
         return true;
     }
     let Some(parent) = path.parent() else {
@@ -717,40 +839,46 @@ fn build_suggestions(
     facts: &[SessionFacts],
     homes: &[ScanHome],
     now: TimestampMs,
+    case_insensitive: bool,
 ) -> Vec<Suggestion> {
     let with_cwd: Vec<&SessionFacts> = facts
         .iter()
         .filter(|f| !f.is_subagent && f.cwd.is_some())
         .collect();
 
-    let mut distinct_cwds: Vec<PathBuf> = with_cwd
-        .iter()
-        .filter_map(|f| f.cwd.as_deref())
-        .map(PathBuf::from)
-        .collect();
+    // Distinct cwds, deduped by comparison key so grouping sees one spelling per real folder.
+    let mut distinct: HashMap<String, PathBuf> = HashMap::new();
+    for f in &with_cwd {
+        if let Some(cwd) = f.cwd.as_deref() {
+            let p = PathBuf::from(cwd);
+            distinct.entry(cmp_key(&p, case_insensitive)).or_insert(p);
+        }
+    }
+    let mut distinct_cwds: Vec<PathBuf> = distinct.into_values().collect();
     distinct_cwds.sort();
-    distinct_cwds.dedup();
-    let roots = resolve_roots(&distinct_cwds);
+    let roots = resolve_roots(&distinct_cwds, case_insensitive);
 
-    let mut by_root: HashMap<PathBuf, Vec<&SessionFacts>> = HashMap::new();
-    let mut is_git_root: HashMap<&PathBuf, bool> = HashMap::new();
+    let mut by_root: HashMap<String, (PathBuf, bool, Vec<&SessionFacts>)> = HashMap::new();
     for f in &with_cwd {
         let Some(cwd) = f.cwd.as_deref().map(Path::new) else {
             continue;
         };
-        let Some((root, is_git)) = roots.get(cwd) else {
+        let Some((root, is_git)) = roots.get(&cmp_key(cwd, case_insensitive)) else {
             continue;
         };
-        if is_excluded_root(root, homes) {
+        if is_excluded_root(root, homes, case_insensitive) {
             continue;
         }
-        is_git_root.entry(root).or_insert(*is_git);
-        by_root.entry(root.clone()).or_default().push(f);
+        let key = cmp_key(root, case_insensitive);
+        let entry = by_root
+            .entry(key)
+            .or_insert_with(|| (root.clone(), *is_git, Vec::new()));
+        entry.2.push(f);
     }
 
     let mut suggestions: Vec<Suggestion> = by_root
-        .into_iter()
-        .map(|(root, sessions)| {
+        .into_values()
+        .map(|(root, is_git, sessions)| {
             let (recent_30d, recent_90d) = recency_counts(&sessions, now);
             Suggestion {
                 id: root.to_string_lossy().into_owned(),
@@ -759,11 +887,11 @@ fn build_suggestions(
                     |n| n.to_string_lossy().into_owned(),
                 ),
                 path: root.to_string_lossy().into_owned(),
-                is_git: is_git_root.get(&root).copied().unwrap_or(false),
+                is_git,
                 session_count: sessions.len(),
                 recent_30d,
                 recent_90d,
-                workstreams: build_workstreams(&root, &sessions, now),
+                workstreams: build_workstreams(&root, &sessions, now, case_insensitive),
             }
         })
         .collect();
@@ -779,23 +907,29 @@ fn build_suggestions(
 }
 
 /// Workstreams inside one project root: an active sub-folder (its first path segment under the
-/// root) or a non-default branch. A session can count toward one of each.
+/// root) or a non-default branch. A session can count toward one of each. Sub-folder grouping
+/// uses [`cmp_key`]-style case-folding when `case_insensitive`; branch grouping never does, since
+/// git branch names are case-sensitive on every platform.
 fn build_workstreams(
     root: &Path,
     sessions: &[&SessionFacts],
     now: TimestampMs,
+    case_insensitive: bool,
 ) -> Vec<WorkstreamSuggestion> {
-    let mut by_folder: HashMap<String, Vec<&SessionFacts>> = HashMap::new();
+    // Keyed by the folded folder name; the value keeps the first-seen original spelling.
+    let mut by_folder: HashMap<String, (String, Vec<&SessionFacts>)> = HashMap::new();
     let mut by_branch: HashMap<String, Vec<&SessionFacts>> = HashMap::new();
     for &f in sessions {
         if let Some(cwd) = f.cwd.as_deref().map(Path::new)
-            && let Ok(rel) = cwd.strip_prefix(root)
-            && let Some(first) = rel.components().next()
+            && let Some(seg) = first_segment_below(cwd, root, case_insensitive)
         {
-            by_folder
-                .entry(first.as_os_str().to_string_lossy().into_owned())
-                .or_default()
-                .push(f);
+            let key = if case_insensitive {
+                seg.to_ascii_lowercase()
+            } else {
+                seg.clone()
+            };
+            let entry = by_folder.entry(key).or_insert_with(|| (seg, Vec::new()));
+            entry.1.push(f);
         }
         if let Some(branch) = f.branch.as_deref() {
             let trimmed = branch.trim();
@@ -809,7 +943,7 @@ fn build_workstreams(
 
     let root_label = root.to_string_lossy().into_owned();
     let mut out: Vec<WorkstreamSuggestion> = by_folder
-        .into_iter()
+        .into_values()
         .map(|(folder, sess)| {
             let (recent_30d, recent_90d) = recency_counts(&sess, now);
             WorkstreamSuggestion {
@@ -879,19 +1013,17 @@ mod tests {
             PathBuf::from("/w/notes/b"),
             PathBuf::from("/w/alone"),
         ];
-        let roots = resolve_roots(&cwds);
+        let roots = resolve_roots(&cwds, false);
+        let key = |p: &str| cmp_key(Path::new(p), false);
         assert_eq!(
-            roots[&PathBuf::from("/w/notes/a")],
+            roots[&key("/w/notes/a")],
             (PathBuf::from("/w/notes"), false)
         );
         assert_eq!(
-            roots[&PathBuf::from("/w/notes/b")],
+            roots[&key("/w/notes/b")],
             (PathBuf::from("/w/notes"), false)
         );
-        assert_eq!(
-            roots[&PathBuf::from("/w/alone")],
-            (PathBuf::from("/w/alone"), false)
-        );
+        assert_eq!(roots[&key("/w/alone")], (PathBuf::from("/w/alone"), false));
     }
 
     #[test]
@@ -900,13 +1032,84 @@ mod tests {
             engine: Engine::Claude,
             home: PathBuf::from("/home/u/.claude"),
         }];
-        assert!(is_excluded_root(Path::new("/"), &homes));
-        assert!(is_excluded_root(Path::new("/usr"), &homes));
-        assert!(is_excluded_root(Path::new("/home/u/.claude"), &homes));
-        assert!(!is_excluded_root(Path::new("/home/u/code/proj"), &homes));
+        assert!(is_excluded_root(Path::new("/"), &homes, false));
+        assert!(is_excluded_root(Path::new("/usr"), &homes, false));
+        assert!(is_excluded_root(
+            Path::new("/home/u/.claude"),
+            &homes,
+            false
+        ));
+        assert!(!is_excluded_root(
+            Path::new("/home/u/code/proj"),
+            &homes,
+            false
+        ));
         if let Some(home) = crate::user_home() {
-            assert!(is_excluded_root(&home, &homes));
+            assert!(is_excluded_root(&home, &homes, false));
         }
+    }
+
+    #[test]
+    fn path_key_folds_case_and_separators_for_windows_style_paths() {
+        // Windows-style spellings of the same folder, checked without needing to run on Windows:
+        // `Path::components()` cannot split a `\`-separated string correctly on a Unix host, but
+        // `cmp_key` is a pure string function and does not depend on that.
+        let a = cmp_key(Path::new(r"C:\Work\Proj"), true);
+        let b = cmp_key(Path::new("c:/WORK/proj"), true);
+        assert_eq!(a, b);
+        assert_eq!(a, "c:/work/proj");
+
+        // Case-sensitively (as on Linux), two different spellings are two different keys.
+        assert_ne!(
+            cmp_key(Path::new("/Work/Proj"), false),
+            cmp_key(Path::new("/work/proj"), false)
+        );
+    }
+
+    #[test]
+    fn home_and_scanned_homes_are_excluded_even_with_different_casing() {
+        let homes = [ScanHome {
+            engine: Engine::Claude,
+            home: PathBuf::from("C:/Users/Sam/.claude"),
+        }];
+        // A differently-cased drive letter and folder name, same real place.
+        assert!(is_excluded_root(
+            Path::new("c:/users/sam/.claude"),
+            &homes,
+            true
+        ));
+        // Case-sensitively, as on Linux, a different spelling is a different path.
+        assert!(!is_excluded_root(
+            Path::new("c:/users/sam/.claude"),
+            &homes,
+            false
+        ));
+        // A real project a few levels under a differently-cased home is still fine.
+        assert!(!is_excluded_root(
+            Path::new("C:/Users/Sam/code/proj"),
+            &homes,
+            true
+        ));
+    }
+
+    #[test]
+    fn projects_group_differently_cased_spellings_of_one_cwd_only_when_case_insensitive() {
+        let sessions = [
+            facts("/w/Proj/a", Some("main"), 1000),
+            facts("/w/proj/a", Some("main"), 1000), // the same real folder, spelled differently
+        ];
+        let homes: [ScanHome; 0] = [];
+
+        let sensitive = build_suggestions(&sessions, &homes, 10_000, false);
+        assert_eq!(
+            sensitive.len(),
+            2,
+            "case-sensitively, as on Linux, these are two different paths: {sensitive:?}"
+        );
+
+        let insensitive = build_suggestions(&sessions, &homes, 10_000, true);
+        assert_eq!(insensitive.len(), 1, "{insensitive:?}");
+        assert_eq!(insensitive[0].session_count, 2);
     }
 
     #[test]
@@ -918,7 +1121,7 @@ mod tests {
             facts("/w/proj", Some("feat/x"), 1000),
         ];
         let refs: Vec<&SessionFacts> = sessions.iter().collect();
-        let ws = build_workstreams(Path::new("/w/proj"), &refs, 10_000);
+        let ws = build_workstreams(Path::new("/w/proj"), &refs, 10_000, false);
         let folder = ws
             .iter()
             .find(|w| w.name == "apps")
@@ -933,6 +1136,23 @@ mod tests {
         assert!(
             !ws.iter().any(|w| w.branch.as_deref() == Some("main")),
             "default branch is not a workstream"
+        );
+    }
+
+    #[test]
+    fn workstream_subfolders_group_case_insensitively_but_keep_a_spelling() {
+        let sessions = [
+            facts("/w/proj/Apps/web", Some("main"), 1000),
+            facts("/w/proj/apps/api", Some("main"), 1000),
+        ];
+        let refs: Vec<&SessionFacts> = sessions.iter().collect();
+        let ws = build_workstreams(Path::new("/w/proj"), &refs, 10_000, true);
+        assert_eq!(ws.len(), 1, "{ws:?}");
+        assert_eq!(ws[0].session_count, 2);
+        assert!(
+            ["Apps", "apps"].contains(&ws[0].name.as_str()),
+            "{}",
+            ws[0].name
         );
     }
 
@@ -954,5 +1174,30 @@ mod tests {
     fn engine_rank_orders_known_engines_before_future_ones() {
         assert!(engine_rank(Engine::Claude) < engine_rank(Engine::Codex));
         assert!(engine_rank(Engine::Codex) < engine_rank(Engine::OpenCode));
+    }
+
+    #[test]
+    fn scan_options_default_now_tracks_the_real_clock_not_the_epoch() {
+        let before = now_ms();
+        let got = ScanOptions::default().now;
+        let after = now_ms();
+        assert!(
+            (before..=after).contains(&got),
+            "{got} not in {before}..={after}"
+        );
+    }
+
+    /// A panic while reading one unit is caught and counted as unreadable, not lost -- and does
+    /// not take down anything else a worker thread already collected. This prints a "thread
+    /// panicked" message to stderr (the default panic hook still runs before `catch_unwind`
+    /// returns); that is expected noise from the one deliberate panic below, not a failure.
+    #[test]
+    fn a_panicking_unit_is_caught_and_counted_unreadable_not_lost() {
+        let out = run_catching_panics(
+            3,
+            || "synthetic.jsonl".to_owned(),
+            || panic!("synthetic panic for the test"),
+        );
+        assert_eq!(out, vec![None, None, None]);
     }
 }
