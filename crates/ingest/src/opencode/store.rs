@@ -8,23 +8,33 @@
 //! most [`BUSY_TIMEOUT`], then fails with [`io::ErrorKind::WouldBlock`] so the caller retries
 //! later.
 //!
+//! An `immutable` read takes no lock, so a writer that starts meanwhile could change pages under
+//! it. Such a read is checked: the store's length and mtime and which side files exist are noted
+//! before opening and compared again by [`Store::finish`] after the last query; any change, or a
+//! "malformed" error during the read, discards the result as [`io::ErrorKind::WouldBlock`].
+//!
 //! Columns are looked up first: a store from an older or newer OpenCode version with missing
 //! optional columns still reads, and one missing a required table or column is reported as
 //! unreadable rather than panicking.
 
+use crate::bound::{MAX_ID_BYTES, bounded};
+use crate::lines::MAX_LINE_BYTES;
 use pitcrew_interfaces::source::SourceError;
-use rusqlite::types::ValueRef;
+use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Row, params};
 use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// How long a read waits for a writer's lock before giving up.
 pub(crate) const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Ids longer than this are ignored as implausible (real ids are 30 bytes).
 const MAX_ROW_ID_BYTES: usize = 256;
+
+/// Message payloads larger than this are not parsed: their facts read as unknown.
+const MAX_MESSAGE_BYTES: usize = MAX_LINE_BYTES;
 
 /// One session row.
 #[derive(Clone, Debug, Default)]
@@ -56,6 +66,21 @@ pub(crate) struct MessageRow {
     pub created: i64,
 }
 
+/// Where a walk over a session's messages continues: below this `(time_created, id)`, compared
+/// as SQLite stores them.
+#[derive(Clone, Debug)]
+pub(crate) struct MessageKey(Value, String);
+
+/// One message of a walk, newest first.
+#[derive(Clone, Debug)]
+pub(crate) struct MessageStep {
+    pub id: String,
+    pub created: i64,
+    /// Whether the message has no parts.
+    pub partless: bool,
+    pub key: MessageKey,
+}
+
 /// What a message's payload says, read by SQLite's JSON functions so large payloads are never
 /// copied out.
 #[derive(Clone, Debug, Default)]
@@ -63,6 +88,8 @@ pub(crate) struct MessageFacts {
     pub role: Option<String>,
     pub completed: bool,
     pub failed: bool,
+    /// `time.completed`, when it is a number.
+    pub ended: Option<i64>,
     pub model: Option<String>,
 }
 
@@ -74,23 +101,49 @@ struct Schema {
     part: HashSet<String>,
 }
 
+/// What an unlocked read compares before and after: the store's length and mtime, and which side
+/// files exist.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileState {
+    len: u64,
+    modified: Option<SystemTime>,
+    wal: bool,
+    shm: bool,
+}
+
+impl FileState {
+    fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            wal: side_file(path, "-wal").exists(),
+            shm: side_file(path, "-shm").exists(),
+        })
+    }
+}
+
 /// An open, read-only store, inside one read transaction so every query sees the same snapshot.
 pub(crate) struct Store {
     conn: Connection,
     path: PathBuf,
     schema: Schema,
     part_rowid: bool,
+    /// For an `immutable` (unlocked) read, the store as it was before opening.
+    unlocked: Option<FileState>,
 }
 
 impl Store {
     /// Opens `path` read-only.
     pub(crate) fn open(path: &Path) -> Result<Self, SourceError> {
-        let err = |e| sql_error(path, e);
+        let quiet = quiet_wal_uri(path)?;
+        let unlocked = quiet.as_ref().map(|(_, before)| before.clone());
+        let err = |e| sql_error(path, e, unlocked.is_some());
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_URI;
-        let conn = match quiet_wal_uri(path)? {
-            Some(uri) => Connection::open_with_flags(uri, flags),
+        let conn = match &quiet {
+            Some((uri, _)) => Connection::open_with_flags(uri, flags),
             None => Connection::open_with_flags(path, flags),
         }
         .map_err(err)?;
@@ -108,7 +161,19 @@ impl Store {
             path: path.to_path_buf(),
             schema,
             part_rowid,
+            unlocked,
         })
+    }
+
+    /// Call after the last query: an unlocked read of a store that changed meanwhile may have
+    /// mixed old and new pages, so it fails with [`io::ErrorKind::WouldBlock`] to be retried.
+    pub(crate) fn finish(&self) -> Result<(), SourceError> {
+        match &self.unlocked {
+            Some(before) if FileState::of(&self.path).as_ref() != Some(before) => {
+                Err(retry_later(&self.path, "changed during an unlocked read"))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// One row from a cached statement: reads run the same few queries per part.
@@ -122,7 +187,7 @@ impl Store {
     }
 
     fn err(&self, e: rusqlite::Error) -> SourceError {
-        sql_error(&self.path, e)
+        sql_error(&self.path, e, self.unlocked.is_some())
     }
 
     fn unreadable(&self, reason: String) -> SourceError {
@@ -163,19 +228,28 @@ impl Store {
         Ok(())
     }
 
-    /// Every session with its size (bytes of part payloads).
-    pub(crate) fn sessions(&self) -> Result<Vec<(SessionRow, u64)>, SourceError> {
-        let sql = format!(
-            "SELECT s.id, {parent}, {updated}, {size} FROM session s",
+    /// The query behind [`Store::sessions`]. Its work is one index lookup per session: payloads
+    /// are never read.
+    fn sessions_sql(&self) -> String {
+        format!(
+            "SELECT s.id, {parent}, {updated}, {change} FROM session s",
             parent = col(&self.schema.session, "s.parent_id", "parent_id", "NULL"),
             updated = col(&self.schema.session, "s.time_updated", "time_updated", "0"),
-            size = if self.schema.part.contains("session_id") && self.schema.part.contains("data") {
-                "(SELECT SUM(octet_length(p.data)) FROM part p WHERE p.session_id = s.id)"
+            change = if self.part_rowid && self.schema.part.contains("session_id") {
+                // `part_session_idx` answers this from the end of the session's range.
+                "(SELECT max(p.rowid) FROM part p WHERE p.session_id = s.id)"
             } else {
                 "0"
             },
-        );
-        let mut stmt = self.conn.prepare(&sql).map_err(|e| self.err(e))?;
+        )
+    }
+
+    /// Every session, with the highest rowid of its parts (0 without parts).
+    pub(crate) fn sessions(&self) -> Result<Vec<(SessionRow, u64)>, SourceError> {
+        let mut stmt = self
+            .conn
+            .prepare(&self.sessions_sql())
+            .map_err(|e| self.err(e))?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((
@@ -191,12 +265,12 @@ impl Store {
             .map_err(|e| self.err(e))?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, mut session, size) = row.map_err(|e| self.err(e))?;
+            let (id, mut session, change) = row.map_err(|e| self.err(e))?;
             let Some(id) = id.filter(|id| id.len() <= MAX_ROW_ID_BYTES) else {
                 continue;
             };
             session.id = id;
-            out.push((session, size));
+            out.push((session, change));
         }
         Ok(out)
     }
@@ -251,17 +325,8 @@ impl Store {
         let mut out = Vec::new();
         for row in rows {
             let (id, message_id, created, updated, size) = row.map_err(|e| self.err(e))?;
-            let ok = |s: &Option<String>| s.as_ref().is_some_and(|s| s.len() <= MAX_ROW_ID_BYTES);
-            if let (true, true, Some(id), Some(message_id)) =
-                (ok(&id), ok(&message_id), id, message_id)
-            {
-                out.push(PartRow {
-                    id,
-                    message_id,
-                    created,
-                    updated,
-                    size: size.map(|n| u64::try_from(n).unwrap_or(0)),
-                });
+            if let Some(row) = part_row(id, message_id, created, updated, size) {
+                out.push(row);
             }
         }
         Ok(out)
@@ -281,17 +346,25 @@ impl Store {
         below: Option<i64>,
         limit: usize,
     ) -> Result<Vec<(i64, Option<PartRow>)>, SourceError> {
+        // An inclusive bound, so a row at `i64::MAX` is read too.
+        let upper = match below {
+            None => i64::MAX,
+            Some(b) => match b.checked_sub(1) {
+                Some(upper) => upper,
+                None => return Ok(Vec::new()),
+            },
+        };
         let p = &self.schema.part;
         let sql = format!(
             "SELECT rowid, id, message_id, {}, {}, octet_length(data) FROM part
-             WHERE session_id = ?1 AND rowid < ?2 ORDER BY rowid DESC LIMIT ?3",
+             WHERE session_id = ?1 AND rowid <= ?2 ORDER BY rowid DESC LIMIT ?3",
             col(p, "time_created", "time_created", "0"),
             col(p, "time_updated", "time_updated", "0"),
         );
         let mut stmt = self.conn.prepare_cached(&sql).map_err(|e| self.err(e))?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         let rows = stmt
-            .query_map(params![session, below.unwrap_or(i64::MAX), limit], |row| {
+            .query_map(params![session, upper, limit], |row| {
                 Ok((
                     int(row, 0),
                     text(row, 1),
@@ -306,21 +379,7 @@ impl Store {
         for row in rows {
             let (rowid, id, message_id, created, updated, size) = row.map_err(|e| self.err(e))?;
             // Rows with unusable ids are `None`: passed over, but they still move the walk on.
-            let row = match (id, message_id) {
-                (Some(id), Some(message_id))
-                    if id.len() <= MAX_ROW_ID_BYTES && message_id.len() <= MAX_ROW_ID_BYTES =>
-                {
-                    Some(PartRow {
-                        id,
-                        message_id,
-                        created,
-                        updated,
-                        size: size.map(|n| u64::try_from(n).unwrap_or(0)),
-                    })
-                }
-                _ => None,
-            };
-            out.push((rowid, row));
+            out.push((rowid, part_row(id, message_id, created, updated, size)));
         }
         Ok(out)
     }
@@ -359,27 +418,147 @@ impl Store {
         .map_err(|e| self.err(e))
     }
 
-    /// The session's newest message.
-    pub(crate) fn newest_message(&self, session: &str) -> Result<Option<MessageRow>, SourceError> {
-        let order = col(
-            &self.schema.message,
-            "time_created",
-            "time_created",
-            "rowid",
-        );
+    /// The ids and creation times of one message's parts.
+    pub(crate) fn message_parts(&self, message: &str) -> Result<Vec<(String, i64)>, SourceError> {
         let sql = format!(
-            "SELECT id, {} FROM message WHERE session_id = ?1 ORDER BY {order} DESC, id DESC LIMIT 1",
-            col(&self.schema.message, "time_created", "time_created", "0"),
+            "SELECT id, {} FROM part WHERE message_id = ?1",
+            col(&self.schema.part, "time_created", "time_created", "0"),
+        );
+        let mut stmt = self.conn.prepare_cached(&sql).map_err(|e| self.err(e))?;
+        let rows = stmt
+            .query_map(params![message], |row| Ok((text(row, 0), int(row, 1))))
+            .map_err(|e| self.err(e))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, created) = row.map_err(|e| self.err(e))?;
+            if let Some(id) = id.filter(|id| id.len() <= MAX_ROW_ID_BYTES) {
+                out.push((id, created));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The session's newest assistant message.
+    pub(crate) fn newest_assistant(
+        &self,
+        session: &str,
+    ) -> Result<Option<MessageRow>, SourceError> {
+        let m = &self.schema.message;
+        let sql = format!(
+            "SELECT id, {created} FROM message WHERE session_id = ?1
+               AND CASE WHEN typeof(data) != 'text' THEN 0
+                        WHEN octet_length(data) > {MAX_MESSAGE_BYTES} THEN 0
+                        WHEN json_valid(data) THEN json_extract(data, '$.role') = 'assistant'
+                        ELSE 0 END
+             ORDER BY {order} DESC, id DESC LIMIT 1",
+            created = col(m, "time_created", "time_created", "0"),
+            // A literal would be read as a column number.
+            order = col(m, "time_created", "time_created", "rowid"),
         );
         self.cached_row(&sql, params![session], |row| {
-            Ok(text(row, 0).map(|id| MessageRow {
-                id,
-                created: int(row, 1),
-            }))
+            Ok(text(row, 0)
+                .filter(|id| id.len() <= MAX_ROW_ID_BYTES)
+                .map(|id| MessageRow {
+                    id,
+                    created: int(row, 1),
+                }))
         })
         .optional()
         .map(Option::flatten)
         .map_err(|e| self.err(e))
+    }
+
+    /// Up to `limit` of the session's messages below `below` (from the newest when `None`),
+    /// newest first by `(time_created, id)`.
+    pub(crate) fn messages_below(
+        &self,
+        session: &str,
+        below: Option<&MessageKey>,
+        limit: usize,
+    ) -> Result<Vec<MessageStep>, SourceError> {
+        let timed = self.schema.message.contains("time_created");
+        let (created, order) = if timed {
+            ("m.time_created", "m.time_created DESC, m.id DESC")
+        } else {
+            ("0", "m.id DESC")
+        };
+        let bound = match (below, timed) {
+            (None, _) => "",
+            (Some(_), true) => "AND (m.time_created, m.id) < (?2, ?3)",
+            (Some(_), false) => "AND m.id < ?3",
+        };
+        let partless = if self.schema.part.contains("message_id") {
+            "NOT EXISTS (SELECT 1 FROM part p WHERE p.message_id = m.id)"
+        } else {
+            "0"
+        };
+        let sql = format!(
+            "SELECT {created}, m.id, {partless} FROM message m
+             WHERE m.session_id = ?1 AND typeof(m.id) = 'text'
+               AND octet_length(m.id) <= {MAX_ROW_ID_BYTES} {bound}
+             ORDER BY {order} LIMIT ?4"
+        );
+        let (top, id) = match below {
+            Some(MessageKey(created, id)) => (created.clone(), id.clone()),
+            None => (Value::Null, String::new()),
+        };
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare_cached(&sql).map_err(|e| self.err(e))?;
+        let rows = stmt
+            .query_map(params![session, top, id, limit], |row| {
+                Ok((
+                    row.get::<_, Value>(0)?,
+                    int(row, 0),
+                    text(row, 1),
+                    int(row, 2),
+                ))
+            })
+            .map_err(|e| self.err(e))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (raw, created, id, partless) = row.map_err(|e| self.err(e))?;
+            if let Some(id) = id {
+                out.push(MessageStep {
+                    key: MessageKey(raw, id.clone()),
+                    id,
+                    created,
+                    partless: partless != 0,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Where a walk for messages below position-time `ms` can start: below the first message
+    /// created at or after `ms`, as long as that message's id time `check` confirms it is not
+    /// older (`check` gets its id and creation time). `None` starts at the top.
+    pub(crate) fn messages_from(
+        &self,
+        session: &str,
+        ms: i64,
+        check: impl FnOnce(&str, i64) -> bool,
+    ) -> Result<Option<MessageKey>, SourceError> {
+        if !self.schema.message.contains("time_created") {
+            return Ok(None);
+        }
+        let first = self
+            .cached_row(
+                "SELECT id, time_created FROM message
+                 WHERE session_id = ?1 AND time_created >= ?2 AND typeof(id) = 'text'
+                 ORDER BY time_created, id LIMIT 1",
+                params![session, ms],
+                |row| Ok((text(row, 0), int(row, 1))),
+            )
+            .optional()
+            .map_err(|e| self.err(e))?;
+        Ok(match first {
+            // Nothing that new: every message is below.
+            None => Some(MessageKey(Value::Integer(ms), String::new())),
+            Some((Some(id), created)) if check(&id, created) => {
+                Some(MessageKey(Value::Integer(ms), String::new()))
+            }
+            _ => None,
+        })
     }
 
     /// A message's creation time, if the message exists.
@@ -412,21 +591,32 @@ impl Store {
         .map_err(|e| self.err(e))
     }
 
-    /// What one message's payload says. Unreadable payloads give empty facts.
+    /// What one message's payload says. Payloads that are not text, larger than
+    /// [`MAX_MESSAGE_BYTES`] or not JSON give empty facts.
     pub(crate) fn message_facts(&self, id: &str) -> Result<MessageFacts, SourceError> {
-        const SQL: &str = "SELECT
+        // The size is checked before the payload is parsed.
+        let sql = format!(
+            "SELECT
             CASE WHEN json_type(d, '$.role') = 'text' THEN json_extract(d, '$.role') END,
             json_type(d, '$.time.completed') IS NOT NULL AND json_type(d, '$.time.completed') != 'null',
             json_type(d, '$.error') IS NOT NULL AND json_type(d, '$.error') != 'null',
-            CASE WHEN json_type(d, '$.modelID') = 'text' THEN json_extract(d, '$.modelID') END
-            FROM (SELECT CASE WHEN typeof(data) = 'text' AND json_valid(data) THEN data END AS d
-                  FROM message WHERE id = ?1)";
-        self.cached_row(SQL, params![id], |row| {
+            CASE WHEN json_type(d, '$.time.completed') IN ('integer', 'real')
+                 THEN json_extract(d, '$.time.completed') END,
+            CASE WHEN json_type(d, '$.modelID') = 'text'
+                  AND octet_length(json_extract(d, '$.modelID')) <= {MAX_ID_BYTES}
+                 THEN json_extract(d, '$.modelID') END
+            FROM (SELECT CASE WHEN typeof(data) != 'text' THEN NULL
+                              WHEN octet_length(data) > {MAX_MESSAGE_BYTES} THEN NULL
+                              WHEN json_valid(data) THEN data END AS d
+                  FROM message WHERE id = ?1)"
+        );
+        self.cached_row(&sql, params![id], |row| {
             Ok(MessageFacts {
                 role: text(row, 0),
                 completed: int(row, 1) != 0,
                 failed: int(row, 2) != 0,
-                model: text(row, 3),
+                ended: opt_int(row, 3),
+                model: bounded(text(row, 4).as_deref(), MAX_ID_BYTES),
             })
         })
         .optional()
@@ -462,29 +652,58 @@ impl Store {
     }
 }
 
+fn part_row(
+    id: Option<String>,
+    message_id: Option<String>,
+    created: i64,
+    updated: i64,
+    size: Option<i64>,
+) -> Option<PartRow> {
+    match (id, message_id) {
+        (Some(id), Some(message_id))
+            if id.len() <= MAX_ROW_ID_BYTES && message_id.len() <= MAX_ROW_ID_BYTES =>
+        {
+            Some(PartRow {
+                id,
+                message_id,
+                created,
+                updated,
+                size: size.map(|n| u64::try_from(n).unwrap_or(0)),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn side_file(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
 /// For a WAL-mode store whose `-wal` or `-shm` file is missing (OpenCode is not running), an
-/// `immutable` URI: a read-only connection would otherwise create those files. With both present,
-/// `None`, and the store is read through them like any WAL reader.
+/// `immutable` URI, with the store's state before opening: a read-only connection would
+/// otherwise create those files. With both present, `None`, and the store is read through them
+/// like any WAL reader.
 ///
 /// `immutable` skips locking, which is safe while nothing writes. If OpenCode starts during the
-/// read, its writes go to a new `-wal`; only a checkpoint rewrites the main file, which a
-/// read of milliseconds is very unlikely to meet, and a torn read fails with an error and is
-/// retried. A `-wal` left without its `-shm` by a crash is not read until OpenCode recovers it.
-fn quiet_wal_uri(path: &Path) -> Result<Option<String>, SourceError> {
+/// read, its writes go to a new `-wal`, and only a checkpoint rewrites the main file; either is
+/// caught by [`Store::finish`] or as a "malformed" error, and the read is retried. A `-wal` left
+/// without its `-shm` by a crash is not read until OpenCode recovers it.
+fn quiet_wal_uri(path: &Path) -> Result<Option<(String, FileState)>, SourceError> {
     use std::io::Read;
+    // Noted first, so any change from here on is seen.
+    let Some(before) = FileState::of(path) else {
+        // Let SQLite report a missing or unreadable file.
+        return Ok(None);
+    };
     let mut header = [0u8; 20];
     let n = match std::fs::File::open(path).and_then(|mut f| f.read(&mut header)) {
         Ok(n) => n,
-        // Let SQLite report a missing or unreadable file.
         Err(_) => return Ok(None),
     };
     let wal_mode = n == header.len() && (header[18] == 2 || header[19] == 2);
-    let side = |suffix: &str| {
-        let mut name = path.as_os_str().to_owned();
-        name.push(suffix);
-        PathBuf::from(name).exists()
-    };
-    if !wal_mode || (side("-wal") && side("-shm")) {
+    if !wal_mode || (before.wal && before.shm) {
         return Ok(None);
     }
     let Some(text) = path.to_str() else {
@@ -506,7 +725,7 @@ fn quiet_wal_uri(path: &Path) -> Result<Option<String>, SourceError> {
         }
     }
     uri.push_str("?mode=ro&immutable=1");
-    Ok(Some(uri))
+    Ok(Some((uri, before)))
 }
 
 /// `expr` if `table` has `column`, else `fallback`.
@@ -546,18 +765,166 @@ fn int(row: &Row<'_>, i: usize) -> i64 {
     opt_int(row, i).unwrap_or(0)
 }
 
-/// A busy or locked store is a retry-later I/O error; anything else makes it unreadable.
-pub(crate) fn sql_error(path: &Path, e: rusqlite::Error) -> SourceError {
+fn retry_later(path: &Path, why: &str) -> SourceError {
+    SourceError::Io(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!("{}: {why}; retry later", path.display()),
+    ))
+}
+
+/// A busy or locked store is a retry-later I/O error, and so is a "malformed" page met by an
+/// `unlocked` read (a writer may have been checkpointing); anything else makes it unreadable.
+pub(crate) fn sql_error(path: &Path, e: rusqlite::Error, unlocked: bool) -> SourceError {
     match e.sqlite_error_code() {
         Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => {
-            SourceError::Io(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                format!("{} is locked by a writer; retry later", path.display()),
-            ))
+            retry_later(path, "locked by a writer")
+        }
+        Some(ErrorCode::DatabaseCorrupt) if unlocked => {
+            retry_later(path, "changed during an unlocked read")
         }
         _ => SourceError::Unreadable {
             path: path.to_path_buf(),
             reason: e.to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::StatementStatus;
+
+    fn wal_store(dir: &Path) -> PathBuf {
+        let path = dir.join("opencode.db");
+        let conn = Connection::open(&path).expect("open");
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+            .expect("wal");
+        assert_eq!(mode, "wal");
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, time_updated INTEGER);
+             CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT);
+             CREATE INDEX part_session_idx ON part (session_id);
+             INSERT INTO session VALUES ('ses_a', 5);",
+        )
+        .expect("schema");
+        drop(conn);
+        assert!(!side_file(&path, "-wal").exists(), "closed cleanly");
+        path
+    }
+
+    #[test]
+    fn an_unlocked_read_of_a_store_that_changed_is_retried() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = wal_store(dir.path());
+
+        let store = Store::open(&path).expect("open");
+        assert!(store.unlocked.is_some(), "no side files: read unlocked");
+        assert_eq!(store.sessions().expect("sessions").len(), 1);
+        store.finish().expect("nothing changed");
+
+        // A writer starts (creating -wal and -shm) and commits during the read.
+        let store = Store::open(&path).expect("open");
+        assert_eq!(store.sessions().expect("sessions").len(), 1);
+        let writer = Connection::open(&path).expect("writer");
+        writer
+            .execute("INSERT INTO session VALUES ('ses_b', 6)", [])
+            .expect("write");
+        let err = store.finish().expect_err("changed");
+        assert!(
+            matches!(&err, SourceError::Io(e) if e.kind() == io::ErrorKind::WouldBlock),
+            "{err}"
+        );
+        drop(writer);
+
+        // The main file rewritten (here: only its mtime) also counts.
+        let store = Store::open(&path).expect("open");
+        assert!(store.unlocked.is_some());
+        let later = SystemTime::now() + Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|f| f.set_modified(later))
+            .expect("touch");
+        assert!(store.finish().is_err());
+
+        // A locked read (through existing side files) is not checked this way.
+        let writer = Connection::open(&path).expect("writer");
+        writer
+            .execute("INSERT INTO session VALUES ('ses_c', 7)", [])
+            .expect("write");
+        let store = Store::open(&path).expect("open");
+        assert!(store.unlocked.is_none());
+        assert_eq!(store.sessions().expect("sessions").len(), 3);
+        store.finish().expect("locked reads need no check");
+    }
+
+    #[test]
+    fn malformed_pages_mean_retry_only_for_unlocked_reads() {
+        let corrupt = || {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+                None,
+            )
+        };
+        let p = Path::new("x.db");
+        assert!(matches!(
+            sql_error(p, corrupt(), true),
+            SourceError::Io(e) if e.kind() == io::ErrorKind::WouldBlock
+        ));
+        assert!(matches!(
+            sql_error(p, corrupt(), false),
+            SourceError::Unreadable { .. }
+        ));
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        assert!(matches!(sql_error(p, busy, false), SourceError::Io(_)));
+    }
+
+    /// Listing sessions does not read parts: its work is the same for 10 parts as for 5000.
+    #[test]
+    fn listing_sessions_does_not_scan_parts() {
+        let steps = |parts: usize| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("opencode.db");
+            let conn = Connection::open(&path).expect("open");
+            conn.execute_batch(
+                "CREATE TABLE session (id TEXT PRIMARY KEY, time_updated INTEGER);
+                 CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, data TEXT);
+                 CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT);
+                 CREATE INDEX part_session_idx ON part (session_id);
+                 INSERT INTO session VALUES ('ses_a', 1), ('ses_b', 2);",
+            )
+            .expect("schema");
+            let payload = "x".repeat(2000);
+            conn.execute_batch("BEGIN").expect("begin");
+            for i in 0..parts {
+                let session = if i % 2 == 0 { "ses_a" } else { "ses_b" };
+                conn.execute(
+                    "INSERT INTO part VALUES (?1, 'msg', ?2, ?3)",
+                    params![format!("prt_{i}"), session, payload],
+                )
+                .expect("insert");
+            }
+            conn.execute_batch("COMMIT").expect("commit");
+            drop(conn);
+            let store = Store::open(&path).expect("open");
+            let listed = store.sessions().expect("sessions");
+            assert_eq!(listed.len(), 2);
+            assert!(listed.iter().all(|(_, change)| *change > 0));
+            let mut stmt = store.conn.prepare(&store.sessions_sql()).expect("sql");
+            let mut rows = stmt.query([]).expect("query");
+            while rows.next().expect("row").is_some() {}
+            drop(rows);
+            stmt.get_status(StatementStatus::VmStep)
+        };
+        let (few, many) = (steps(10), steps(5000));
+        assert!(
+            many <= few + 10,
+            "{few} VM steps for 10 parts, {many} for 5000"
+        );
     }
 }

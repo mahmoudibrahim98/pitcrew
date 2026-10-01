@@ -412,15 +412,143 @@ fn a_running_tool_shows_its_call_then_its_result() {
 }
 
 #[test]
-fn an_interrupted_tool_is_reported_as_failed() {
+fn an_interrupted_tool_is_reported_as_failed_and_ends_the_turn() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = full_store(dir.path());
     let (main, _) = session_ids();
     let items = read_all(&db, &main).items;
+    let at = items
+        .iter()
+        .position(|i| matches!(i, TranscriptItem::ToolUse { target, .. } if target == "python -m pytest -m slow"))
+        .expect("the slow suite");
+    let offset = items[at].offset();
     assert!(matches!(
-        &items[items.len() - 2..],
-        [TranscriptItem::ToolUse { tool, .. }, TranscriptItem::ToolResult { is_error: true, summary, .. }]
-            if tool == "bash" && summary.starts_with("interrupted")
+        &items[at..at + 3],
+        [
+            TranscriptItem::ToolUse { .. },
+            TranscriptItem::ToolResult { is_error: true, summary, .. },
+            TranscriptItem::TurnEnded { offset: end, .. },
+        ] if summary.starts_with("interrupted") && *end == offset
+    ));
+}
+
+/// Reads `ops[..cut]`, then the rest, from a cursor; returns both reads and the one-read items.
+fn read_in_two(ops: &[Value], cut: usize) -> (ReadReport, ReadReport, Vec<TranscriptItem>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (main, _) = session_ids();
+    let db = store_with(dir.path(), "opencode.db", &schema(), &ops[..cut]);
+    let t = tref(&db, &main);
+    let first = OpenCodeAdapter.read(&t, &Cursor::default()).expect("read");
+    apply_all(&writer(&db), &ops[cut..]);
+    let second = OpenCodeAdapter.read(&t, &first.chunk.cursor).expect("read");
+    let full_dir = tempfile::tempdir().expect("tempdir");
+    let full = read_all(
+        &store_with(full_dir.path(), "full.db", &schema(), ops),
+        &main,
+    )
+    .items;
+    (first, second, full)
+}
+
+fn op_index(ops: &[Value], pred: impl Fn(&Value) -> bool) -> usize {
+    ops.iter().position(pred).expect("op")
+}
+
+/// Prompts typed while the agent is busy are written at once, between the running message's
+/// parts. They do not settle that message: its text and tool arrive whole, once.
+#[test]
+fn a_prompt_typed_mid_turn_settles_nothing() {
+    let ops = history();
+    for prompt in [
+        "And make it print timings.",
+        "Keep quiet by default.",
+        "Use the logging module.",
+    ] {
+        let cut = op_index(&ops, |op| op["row"]["data"]["text"] == prompt) + 1;
+        let (first, second, full) = read_in_two(&ops, cut);
+        assert!(
+            first
+                .chunk
+                .items
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::UserPrompt { text, .. } if text == prompt)),
+            "{prompt}: the prompt is read at once"
+        );
+        let mut items = first.chunk.items;
+        items.extend(second.chunk.items);
+        assert_eq!(by_position(items.clone()), full, "{prompt}");
+        let texts: Vec<&str> = items
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::AssistantText { text, .. } if text.starts_with("Adding") => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["Adding --verbose to the parser."], "{prompt}");
+        // The edit: its call with its input, a successful result and the edit, once each.
+        let edit = items
+            .iter()
+            .find(|i| matches!(i, TranscriptItem::FileEdit { diff: Some(d), .. } if d.contains("--verbose")))
+            .expect("the edit")
+            .offset();
+        let at_edit: Vec<_> = items.iter().filter(|i| i.offset() == edit).collect();
+        assert!(
+            matches!(
+                &at_edit[..],
+                [
+                    TranscriptItem::ToolUse { input: Some(input), .. },
+                    TranscriptItem::ToolResult { is_error: false, .. },
+                    TranscriptItem::FileEdit { .. },
+                ] if input.get("filePath").is_some()
+            ),
+            "{prompt}: {at_edit:?}"
+        );
+    }
+}
+
+/// A turn stopped after its text has already been read still ends: the turn end comes after its
+/// last part. A request that failed before writing anything ends at its own position.
+#[test]
+fn failed_turns_end_even_after_their_parts_were_read() {
+    let ops = history();
+    let cut = op_index(&ops, |op| {
+        op["table"] == "message"
+            && op["row"]["data"]["error"]["name"] == "MessageAbortedError"
+            && ops.iter().any(|o| {
+                o["row"]["message_id"] == op["row"]["id"]
+                    && o["row"]["data"]["text"]
+                        == "It skips every write and lists what it would do."
+            })
+    });
+    let (first, second, full) = read_in_two(&ops, cut);
+    let text = first
+        .chunk
+        .items
+        .iter()
+        .find(|i| matches!(i, TranscriptItem::AssistantText { text, .. } if text.starts_with("It skips")))
+        .expect("the text is read before the abort")
+        .offset();
+    assert!(
+        !first
+            .chunk
+            .items
+            .iter()
+            .any(|i| matches!(i, TranscriptItem::TurnEnded { offset, .. } if *offset == text))
+    );
+    assert!(matches!(
+        &second.chunk.items[0],
+        TranscriptItem::TurnEnded { offset, .. } if *offset == text
+    ));
+    let mut items = first.chunk.items;
+    items.extend(second.chunk.items);
+    assert_eq!(by_position(items), full);
+    // The request that failed before any output.
+    assert!(matches!(
+        &full[full.len() - 2..],
+        [TranscriptItem::UserPrompt { text, offset: asked, .. }, TranscriptItem::TurnEnded { offset: ended, .. }]
+            if text == "And in French?" && ended > asked
     ));
 }
 
@@ -681,13 +809,19 @@ fn malformed_and_huge_payloads_are_skipped() {
     let before = read_all(&db, &main).items;
 
     let conn = Connection::open(&db).expect("open");
-    let msg: String = conn
-        .query_row(
-            "SELECT id FROM message WHERE session_id = ?1 ORDER BY time_created DESC LIMIT 1",
-            [&main],
-            |r| r.get(0),
-        )
-        .expect("message");
+    let t = 1_790_800_000_000i64;
+    // A new, completed assistant message holds the extra parts.
+    let msg = "msg_extra";
+    conn.execute(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?3, ?4)",
+        rusqlite::params![
+            msg,
+            main,
+            t - 1,
+            json!({"role": "assistant", "time": {"created": t - 1, "completed": t + 10}}).to_string()
+        ],
+    )
+    .expect("message");
     let add = |id: &str, t: i64, data: rusqlite::types::Value| {
         conn.execute(
             "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
@@ -695,7 +829,6 @@ fn malformed_and_huge_payloads_are_skipped() {
         )
         .expect("insert");
     };
-    let t = 1_790_800_000_000i64;
     use rusqlite::types::Value as V;
     add(
         "prt_bad_utf8",
@@ -911,6 +1044,280 @@ fn a_part_table_without_rowids_is_listed_whole() {
 #[test]
 fn settle_window_is_what_the_docs_say() {
     assert_eq!(SETTLE_MS, 60_000);
+}
+
+/// The writes as `opencode import` leaves them: messages keep their times, but parts are
+/// written with their original ids and the import time, weeks later, as `time_created` and
+/// `time_updated`.
+fn imported(ops: &[Value]) -> Vec<Value> {
+    let import = 1_793_500_000_000i64;
+    ops.iter()
+        .map(|op| {
+            let mut op = op.clone();
+            if op["table"] == "part" {
+                op["row"]["time_created"] = json!(import);
+                op["row"]["time_updated"] = json!(import);
+            }
+            op
+        })
+        .collect()
+}
+
+#[test]
+fn imported_sessions_settle() {
+    let ops = imported(&history());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = store_with(dir.path(), "opencode.db", &schema(), &ops);
+    let (main, _) = session_ids();
+    let c = read_all(&db, &main);
+    // Positions still come from the ids, so the items are those of the original session.
+    let original_dir = tempfile::tempdir().expect("tempdir");
+    assert_eq!(
+        c.items,
+        read_all(&full_store(original_dir.path()), &main).items
+    );
+    // Every part was made long before the import, so the frontier passes them all.
+    let state = c.cursor.state.clone().expect("state");
+    assert!(state.get("open").is_none(), "nothing left open: {state}");
+    assert_eq!(c.cursor.offset, c.items.last().expect("items").offset());
+    let again = OpenCodeAdapter
+        .read(&tref(&db, &main), &c.cursor)
+        .expect("read");
+    assert!(again.chunk.items.is_empty());
+    assert_eq!(page_all(&db, &main, 5), c.items);
+}
+
+/// Rowids at both ends of the `i64` range: every part is read, and paging from the middle
+/// searches the whole range without overflowing.
+#[test]
+fn extreme_rowids_are_read_and_paged() {
+    let (mut ops, session) = long_session(3, 1, 1);
+    let parts: Vec<usize> = (0..ops.len())
+        .filter(|&i| ops[i]["table"] == "part")
+        .collect();
+    let n = i128::try_from(parts.len() - 1).expect("fits");
+    for (k, &i) in parts.iter().enumerate() {
+        let k = i128::try_from(k).expect("fits");
+        let span = i128::from(i64::MAX) - i128::from(i64::MIN);
+        let rowid = i128::from(i64::MIN) + span * k / n;
+        ops[i]["row"]["rowid"] = json!(i64::try_from(rowid).expect("in range"));
+    }
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = store_with(dir.path(), "opencode.db", &schema(), &ops);
+    let rowids: (i64, i64) = Connection::open(&db)
+        .expect("open")
+        .query_row("SELECT min(rowid), max(rowid) FROM part", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .expect("bounds");
+    assert_eq!(rowids, (i64::MIN, i64::MAX));
+    let full = read_all(&db, &session).items;
+    assert_eq!(full.len(), 3 * 14, "the part at rowid i64::MAX is read too");
+    for limit in [1, 5, 100] {
+        assert_eq!(page_all(&db, &session, limit), full, "limit {limit}");
+    }
+    let t = tref(&db, &session);
+    for k in [1, full.len() / 2, full.len() - 1] {
+        let before = full[k].offset();
+        let page = OpenCodeAdapter
+            .read_page(&t, Some(before), 3)
+            .expect("page");
+        let older: Vec<_> = full
+            .iter()
+            .filter(|i| i.offset() < before)
+            .cloned()
+            .collect();
+        assert_eq!(
+            page.items,
+            older[older.len().saturating_sub(page.items.len())..]
+        );
+    }
+}
+
+/// A message payload over the size cap is not parsed, and a model name over the id cap is not
+/// kept.
+#[test]
+fn oversized_messages_are_not_parsed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = full_store(dir.path());
+    let (main, _) = session_ids();
+    let conn = Connection::open(&db).expect("open");
+    let t = 1_790_800_000_000i64;
+    let message = |id: &str, t: i64, data: Value| {
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?3, ?4)",
+            rusqlite::params![id, main, t, data.to_string()],
+        )
+        .expect("insert");
+    };
+    let done = json!({"created": t, "completed": t + 1});
+    message(
+        "msg_long_model",
+        t,
+        json!({"role": "assistant", "modelID": "m".repeat(1000), "time": done}),
+    );
+    message(
+        "msg_big",
+        t + 1,
+        json!({"role": "assistant", "modelID": "huge-model", "time": done,
+               "pad": "x".repeat(pitcrew_ingest::MAX_LINE_BYTES)}),
+    );
+    drop(conn);
+    let c = read_all(&db, &main);
+    assert_eq!(
+        c.meta.and_then(|m| m.model).as_deref(),
+        Some("demo-coder-2"),
+        "neither the unparsed payload's model nor the overlong one"
+    );
+}
+
+/// A creation time far in the future gives the largest position, and a page still shows it.
+#[test]
+fn a_part_with_a_huge_creation_time_is_capped_and_paged() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = full_store(dir.path());
+    let (main, _) = session_ids();
+    let conn = Connection::open(&db).expect("open");
+    let t = 1_790_800_000_000i64;
+    conn.execute(
+        "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES ('msg_x', ?1, ?2, ?2, ?3)",
+        rusqlite::params![main, t, json!({"role": "user", "time": {"created": t}}).to_string()],
+    )
+    .expect("message");
+    conn.execute(
+        "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES ('prt_x', 'msg_x', ?1, ?2, ?2, ?3)",
+        rusqlite::params![main, i64::MAX, json!({"type": "text", "text": "from the future"}).to_string()],
+    )
+    .expect("part");
+    drop(conn);
+    let full = read_all(&db, &main).items;
+    let last = full.last().expect("items");
+    assert_eq!(last.offset(), pitcrew_ingest::opencode::MAX_POSITION);
+    let page = OpenCodeAdapter
+        .read_page(&tref(&db, &main), None, 1)
+        .expect("page");
+    assert_eq!(page.items, std::slice::from_ref(last));
+    assert_eq!(page.to, pitcrew_ingest::opencode::MAX_POSITION + 1);
+    assert_eq!(page_all(&db, &main, 4), full);
+}
+
+/// A tool whose call was shown, and whose part then becomes too large or unreadable, still gets
+/// a result.
+#[test]
+fn a_shown_call_whose_part_becomes_unreadable_still_gets_a_result() {
+    let ops = history();
+    let running = op_index(&ops, |op| {
+        op["row"]["data"]["tool"] == "question" && op["row"]["data"]["state"]["status"] == "running"
+    }) + 1;
+    let part = ops[running - 1]["row"]["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
+    let call = ops[running - 1]["row"]["data"]["callID"]
+        .as_str()
+        .expect("call")
+        .to_owned();
+    let (main, _) = session_ids();
+    let huge = json!({"type": "tool", "tool": "question", "callID": call, "state": {
+        "status": "completed", "input": {}, "output": "y".repeat(pitcrew_ingest::MAX_LINE_BYTES)}})
+    .to_string();
+    for (data, reason) in [
+        (huge, "the part is too large"),
+        (
+            "{\"type\": \"tool\", ".to_owned(),
+            "the part is not readable",
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = store_with(dir.path(), "live.db", &schema(), &ops[..running]);
+        let first = read_all(&db, &main);
+        assert!(
+            first
+                .items
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::ToolUse { call_id, .. } if *call_id == call))
+        );
+        writer(&db)
+            .execute(
+                "UPDATE part SET data = ?1 WHERE id = ?2",
+                rusqlite::params![data, part],
+            )
+            .expect("update");
+        let next = OpenCodeAdapter
+            .read(&tref(&db, &main), &first.cursor)
+            .expect("read");
+        assert_eq!(next.skipped.len(), 1, "{reason}");
+        assert!(
+            next.chunk.items.iter().any(|i| matches!(
+                i,
+                TranscriptItem::ToolResult { call_id, summary, .. }
+                    if *call_id == call && summary == &format!("result not read: {reason}")
+            )),
+            "{reason}: {:?}",
+            next.chunk.items
+        );
+    }
+}
+
+/// Overwrites everything after the first page (the schema) with junk.
+fn corrupt_pages(db: &Path) {
+    let mut bytes = fs::read(db).expect("read");
+    assert!(bytes.len() > 8192);
+    for b in &mut bytes[4096..] {
+        *b = 0x5a;
+    }
+    fs::write(db, bytes).expect("write");
+}
+
+/// An unlocked read (a WAL-mode store with no `-wal` or `-shm`) that meets a malformed page may
+/// have raced a checkpoint: it is retried, not reported unreadable. A locked read is reported.
+#[test]
+fn malformed_pages_in_an_unlocked_read_mean_retry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = full_store(dir.path());
+    let conn = Connection::open(&db).expect("open");
+    conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0))
+        .expect("wal");
+    drop(conn);
+    corrupt_pages(&db);
+    let (main, _) = session_ids();
+    let err = OpenCodeAdapter
+        .read(&tref(&db, &main), &Cursor::default())
+        .expect_err("malformed");
+    assert!(
+        matches!(&err, SourceError::Io(e) if e.kind() == io::ErrorKind::WouldBlock),
+        "{err}"
+    );
+    assert!(matches!(
+        OpenCodeAdapter.discover(dir.path()),
+        Err(SourceError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock
+    ));
+
+    let other = tempfile::tempdir().expect("tempdir");
+    let db = full_store(other.path());
+    corrupt_pages(&db);
+    assert!(matches!(
+        OpenCodeAdapter.read(&tref(&db, &main), &Cursor::default()),
+        Err(SourceError::Unreadable { .. })
+    ));
+}
+
+/// One store that cannot be read is skipped; the others are still listed.
+#[test]
+fn an_unreadable_store_does_not_hide_the_others() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let good = full_store(home.path());
+    let bad = home.path().join("opencode-bad.db");
+    fs::copy(&good, &bad).expect("copy");
+    corrupt_pages(&bad);
+    let found = OpenCodeAdapter.discover(home.path()).expect("discover");
+    assert_eq!(found.len(), 2);
+    assert!(found.iter().all(|t| t.path == good));
+    // Again: still listed (the warning is logged once per change).
+    assert_eq!(
+        OpenCodeAdapter.discover(home.path()).expect("discover"),
+        found
+    );
 }
 
 /// `cargo test -p pitcrew-ingest --release --test opencode -- --ignored --nocapture large_session`

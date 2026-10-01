@@ -230,6 +230,54 @@ step_start(a4)
 tool(a4, "bash", {"command": "python -m pytest -m slow", "description": "Slow suite"}, {}, stop_at="running")
 update_message(a4, error={"name": "MessageAbortedError", "data": {"message": "The operation was aborted."}},
                time_completed=tick(10))
+
+# --- prompts typed while the agent is busy ------------------------------------------------------
+# OpenCode writes each prompt at once and queues it: the running message carries on, and the
+# next assistant message answers the queued prompts once it has finished.
+u4 = user_msg(SID, "Now add a --verbose flag too.")
+a5 = assistant_msg(SID, u4)
+step_start(a5)
+t = tick()
+tx = part(a5, {"type": "text", "text": "Adding ", "time": {"start": t}}, t)
+tx = update(tx, {"type": "text", "text": "Adding --verbose ", "time": {"start": t}})
+user_msg(SID, "And make it print timings.")  # while the text streams
+tx = update(tx, {"type": "text", "text": "Adding --verbose to the parser.", "time": {"start": t}})
+update(tx, {"type": "text", "text": "Adding --verbose to the parser.", "time": {"start": t, "end": tick(50)}})
+call = "call_" + "".join(rnd.choice(B62) for _ in range(20))
+ep = part(a5, {"type": "tool", "tool": "edit", "callID": call,
+               "state": {"status": "pending", "input": {}, "raw": ""}})
+user_msg(SID, "Keep quiet by default.")  # while the tool is pending
+start = tick(20)
+edit_input = {"filePath": f"{DIR}/scripts/sync.py", "oldString": new[1],
+              "newString": new[1] + "\nparser.add_argument(\"--verbose\", action=\"store_true\")"}
+ep = update(ep, {"type": "tool", "tool": "edit", "callID": call,
+                 "state": {"status": "running", "input": edit_input, "time": {"start": start}}})
+u6 = user_msg(SID, "Use the logging module.")  # while the tool runs
+vpatch = unified(f"{DIR}/scripts/sync.py", [new[1]], [new[1], "parser.add_argument(\"--verbose\", action=\"store_true\")"])
+update(ep, {"type": "tool", "tool": "edit", "callID": call,
+            "state": {"status": "completed", "input": edit_input, "output": "Edit applied successfully.",
+                      "time": {"start": start, "end": tick(400)},
+                      "metadata": {"diff": vpatch, "truncated": False,
+                                   "filediff": {"file": f"{DIR}/scripts/sync.py", "additions": 1, "deletions": 0, "patch": vpatch}}}})
+step_finish(a5, "tool-calls")
+update_message(a5, finish="tool-calls", time_completed=tick(10))
+a6 = assistant_msg(SID, u6)
+step_start(a6)
+text(a6, ["--verbose logs timings ", "through the logging module and is off by default."])
+step_finish(a6, "stop")
+update_message(a6, finish="stop", time_completed=tick(10))
+
+# --- a turn stopped after its text, then a request that failed before any output ----------------
+u7 = user_msg(SID, "Explain the flag in one line.")
+a7 = assistant_msg(SID, u7)
+step_start(a7)
+text(a7, ["It skips every write ", "and lists what it would do."])
+update_message(a7, error={"name": "MessageAbortedError", "data": {"message": "The operation was aborted."}},
+               time_completed=tick(10))
+u8 = user_msg(SID, "And in French?")
+a8 = assistant_msg(SID, u8)
+update_message(a8, error={"name": "APIError", "data": {"message": "Rate limit exceeded", "isRetryable": False}},
+               time_completed=tick(10))
 s = dict(s, time_updated=now[0])
 put("session", s)
 

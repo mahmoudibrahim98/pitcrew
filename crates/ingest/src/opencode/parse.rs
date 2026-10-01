@@ -44,8 +44,9 @@ pub enum Role {
 pub struct MessageInfo {
     /// Who wrote it.
     pub role: Role,
-    /// Whether the message can no longer change: it completed or failed, or a newer message
-    /// exists in the session. Unfinished parts of a settled message are final as they are.
+    /// Whether the message can no longer change: it completed or failed, or a newer assistant
+    /// message exists in the session. Unfinished parts of a settled message are final as they
+    /// are.
     pub settled: bool,
     /// The model, for assistant messages.
     pub model: Option<String>,
@@ -107,7 +108,7 @@ impl PartItems {
 }
 
 /// Parses one part's `data`. `offset` is the part's position (see the module docs of
-/// [`crate::opencode`]) and `created` its row's `time_created`.
+/// [`crate::opencode`]) and `created` its creation time, used where the payload has none.
 ///
 /// # Errors
 ///
