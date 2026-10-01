@@ -26,6 +26,26 @@ It listens on `http://127.0.0.1:47317` (never on other interfaces) and prints on
 | `dev-device-token` | `@sam` (`01JB000000000000000MEM0001`), the person | `device`: every route |
 | `dev-agent-token` | `@writer` (`01JB000000000000000MEM0002`), an agent owned by @sam | `agent`: routes marked **agent**; reads everything, writes only to its own tasks and sessions |
 
+### Fresh mode: starting before setup
+
+`PITCREW_MOCK_FRESH=1 node apps/mock-hub/src/server.ts` (PowerShell: `$env:PITCREW_MOCK_FRESH = '1'`)
+serves an empty workspace instead of the demo: no members, machines or work (projects, tasks,
+sessions, asks, events), and `GET /v1/workspace` answers `setup_needed: true`. The two tokens still
+authenticate, but neither has a `Member` yet, so `GET /v1/me` answers `404` for both until
+`POST /v1/setup` is called with the device token (api-v1.md, "The first run"):
+
+```sh
+curl -X POST -H "Authorization: Bearer dev-device-token" -H "Content-Type: application/json" \
+  -d '{"workspace_name":"Demo Lab","person":{"name":"Sam Rivera","handle":"@sam"},"machine_name":"This laptop"}' \
+  http://127.0.0.1:47317/v1/setup
+```
+
+Setup appends `member_added` and `machine_added` (one call to `hub.append` each, delivered to a
+connected `GET /v1/stream` client in the same batch), makes the device token's member `@sam`
+(`01JB000000000000000MEM0001`, the same id the demo uses), and from then on the mock behaves like
+the demo, minus its seeded members, machines and work. `startServer({ fresh: true })` sets this up
+for tests (`ServerOptions.fresh`); `test/setup.test.ts` covers both modes.
+
 ```sh
 curl http://127.0.0.1:47317/v1/host/info
 curl -H "Authorization: Bearer dev-device-token" "http://127.0.0.1:47317/v1/tasks?status=todo"
@@ -51,6 +71,13 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
 
 - **Every route in the contract**, with the `ApiError` body and status for each failure (400, 401,
   403, 404, 409, 503). Task routes accept an id, a prefixed id (`tsk_…`) or a key (`PAP-4`).
+- **The first run** (`POST /v1/setup`, "Fresh mode" above). `GET /v1/workspace` answers
+  `setup_needed: true` while the workspace has no person. In demo mode setup always answers 409; in
+  fresh mode it validates `workspace_name`, `person.name`, `person.handle` and `machine_name`
+  exactly as the contract says (lengths, the handle's shape, no control characters), answers 409
+  once already set up or on a handle clash, and otherwise appends `member_added` and
+  `machine_added` for the device token's own member, so it and `GET /v1/me` mean that person from
+  then on.
 - **Auth and scopes.** Agent tokens reach only routes marked **agent**. They read the whole
   workspace, but write only to their own tasks (assignee, or holder of an active dispatch) and
   sessions; any other write, a move included, is `403 forbidden`. An agent's subtask list replaces
@@ -129,10 +156,10 @@ a single entry point.
 
 | File | What |
 |---|---|
-| `src/server.ts` | Entry point: HTTP, CORS, bodies, WebSocket upgrades. Exports `startServer({ port })`. |
-| `src/routes.ts` | The routes, tokens and scope rules. |
+| `src/server.ts` | Entry point: HTTP, CORS, bodies, WebSocket upgrades. Exports `startServer({ port, fresh })`. |
+| `src/routes.ts` | The routes, tokens and scope rules, including `POST /v1/setup`. |
 | `src/live.ts` | The event stream and terminal sockets. |
-| `src/state.ts` | In-memory state, the event log and its revisions. |
+| `src/state.ts` | In-memory state, the event log and its revisions; `freshWorkspace()` for fresh mode. |
 | `src/simulate.ts` | Simulated session liveness. |
 | `src/transcripts.ts` | Canned transcripts and paging. |
 | `src/recaps.ts` | The recap routes, paged from the recaps fixture. |
