@@ -7,10 +7,13 @@
 //! 3. Apply `ask_raised`, `ask_answered` and `member_added` as they come.
 //! 4. When the stream ends (a close, a broken connection, 60 s of silence), wait (1 s, doubling
 //!    to 30 s; at once when the workspace becomes ready again) and resume with `since`, as the UI
-//!    does.
+//!    does. The wait starts again from 1 s only after a snapshot that worked, or a stream that
+//!    stayed up 60 s: a daemon that fails right after its `hello` is retried less and less often.
 //!
 //! Bounded: frames and bodies have size limits, the tracker keeps a bounded set, and a snapshot
-//! the tracker asks for is taken at most once a minute.
+//! the tracker asks for is taken at most once a minute. A snapshot too large to read counts as
+//! "512+" and is tried again after 10 minutes; a frame too large to read starts afresh from a
+//! snapshot, since resuming would meet it again.
 
 use super::tracker::{Count, NewAsk, Tracker};
 use crate::gateway::{Connector, GatewayError, http, socket};
@@ -24,7 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::Instant;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 /// The watcher's limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +48,11 @@ pub struct Limits {
     pub first_backoff: Duration,
     /// The longest wait before reconnecting.
     pub max_backoff: Duration,
+    /// The wait starts again from `first_backoff` after a snapshot that worked, or once a
+    /// stream has stayed up this long.
+    pub healthy_after: Duration,
+    /// The wait after a snapshot too large to read (the count then reads "`max_open`+").
+    pub too_large_backoff: Duration,
     /// The shortest time between two snapshots asked for by the tracker.
     pub refetch_every: Duration,
 }
@@ -60,6 +68,8 @@ impl Default for Limits {
             idle: Duration::from_secs(60),
             first_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(30),
+            healthy_after: Duration::from_secs(60),
+            too_large_backoff: Duration::from_secs(10 * 60),
             refetch_every: Duration::from_secs(60),
         }
     }
@@ -79,6 +89,7 @@ enum WatchError {
     Gateway(GatewayError),
     Request(&'static str, String),
     Status(&'static str, u16),
+    TooLarge(&'static str),
     Malformed(&'static str),
     Timeout(&'static str),
 }
@@ -89,6 +100,7 @@ impl fmt::Display for WatchError {
             Self::Gateway(e) => write!(f, "{e}"),
             Self::Request(route, e) => write!(f, "{route}: {e}"),
             Self::Status(route, status) => write!(f, "{route} answered HTTP {status}"),
+            Self::TooLarge(route) => write!(f, "{route} is too large to read"),
             Self::Malformed(what) => write!(f, "malformed {what}"),
             Self::Timeout(what) => write!(f, "no {what} in time"),
         }
@@ -158,17 +170,38 @@ pub(crate) async fn watch(
             Ok(connector) => watcher.session(&*connector).await,
             Err(e) => Err(e.into()),
         };
-        match ended {
-            Ok(why) => tracing::debug!(workspace = %watcher.id, why, "the attention stream ended"),
-            Err(e) => {
-                tracing::debug!(workspace = %watcher.id, error = %e, "the attention stream is down");
+        let pause = match ended {
+            Err(WatchError::TooLarge(route)) => {
+                // Too many asks to read: say "N+", and do not fetch them again soon.
+                tracing::info!(workspace = %watcher.id, route, "the asks are too many to read; counting them as more than the bound");
+                watcher.report.count(
+                    &watcher.id,
+                    Count {
+                        open: limits.max_open,
+                        more: true,
+                    },
+                );
+                limits.too_large_backoff
             }
-        }
+            ended => {
+                match ended {
+                    Ok(why) => {
+                        tracing::debug!(workspace = %watcher.id, why, "the attention stream ended");
+                    }
+                    Err(e) => {
+                        tracing::debug!(workspace = %watcher.id, error = %e, "the attention stream is down");
+                    }
+                }
+                let pause = watcher.wait;
+                watcher.wait = (pause * 2).min(limits.max_backoff);
+                pause
+            }
+        };
+        tracing::debug!(workspace = %watcher.id, ms = pause.as_millis(), "reconnecting after a pause");
         tokio::select! {
-            () = tokio::time::sleep(watcher.wait) => {}
+            () = tokio::time::sleep(pause) => {}
             () = poke.notified() => {}
         }
-        watcher.wait = (watcher.wait * 2).min(limits.max_backoff);
     }
 }
 
@@ -213,7 +246,10 @@ impl Watcher {
                 Some(Err(e)) => return Err(WatchError::Request("/v1/stream", e.to_string())),
             }
         };
-        self.wait = limits.first_backoff;
+        // The wait before the next attempt starts again only once this one has proved itself:
+        // a snapshot that worked, or a stream that stayed up (not merely a `hello`).
+        let up_since = Instant::now();
+        let mut healthy = false;
         let resumable = self
             .cursor
             .as_ref()
@@ -234,6 +270,10 @@ impl Watcher {
                 fetched = Some(Instant::now());
                 refetch = false;
             }
+            if !healthy && up_since.elapsed() >= limits.healthy_after {
+                healthy = true;
+                self.wait = limits.first_backoff;
+            }
             let next = match tokio::time::timeout(limits.idle, ws.next()).await {
                 Ok(next) => next,
                 Err(_) => return Ok("silent"),
@@ -243,6 +283,14 @@ impl Watcher {
                 Some(Ok(Message::Close(_))) | None => return Ok("closed"),
                 // Pings are answered by tungstenite as it reads.
                 Some(Ok(_)) => continue,
+                Some(Err(WsError::Capacity(_))) => {
+                    // Resuming would meet the same frame: start afresh, from a snapshot.
+                    self.cursor = None;
+                    return Err(WatchError::Request(
+                        "/v1/stream",
+                        "a frame over the limit".into(),
+                    ));
+                }
                 Some(Err(e)) => return Err(WatchError::Request("/v1/stream", e.to_string())),
             };
             let Ok(Frame::Events { to_rev, events }) = serde_json::from_str::<Frame>(&text) else {
@@ -281,6 +329,7 @@ impl Watcher {
         let count = self.tracker.count();
         tracing::debug!(workspace = %self.id, open = count.open, more = count.more, "attention snapshot");
         self.report.count(&self.id, count);
+        self.wait = self.limits.first_backoff;
         Ok(())
     }
 
@@ -308,7 +357,10 @@ impl Watcher {
         )
         .await;
         drop(connected.token);
-        let reply = reply.map_err(|e| WatchError::Request(route, e.to_string()))?;
+        let reply = reply.map_err(|e| match e {
+            http::HttpError::TooLarge(_) => WatchError::TooLarge(route),
+            e => WatchError::Request(route, e.to_string()),
+        })?;
         if reply.status != 200 {
             return Err(WatchError::Status(route, reply.status));
         }

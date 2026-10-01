@@ -65,6 +65,8 @@ struct Log {
     /// `events` frames by their revision.
     history: Vec<(u64, Value)>,
     asks: Vec<Value>,
+    /// `GET /v1/asks` answers 500.
+    asks_fail: bool,
 }
 
 /// What a live stream is sent.
@@ -91,6 +93,8 @@ pub struct Seen {
     pub flooded: Vec<usize>,
     /// Each live stream's `since`, in the order they opened.
     pub streams: Vec<Option<String>>,
+    /// When each live stream opened.
+    pub stream_times: Vec<Instant>,
     /// `GET /v1/asks` calls.
     pub ask_reads: usize,
 }
@@ -139,6 +143,7 @@ impl FakeDaemon {
             id: "log-1".into(),
             history: Vec::new(),
             asks: Vec::new(),
+            asks_fail: false,
         }));
         let (live, _) = tokio::sync::broadcast::channel(256);
         let fake = Fake {
@@ -236,6 +241,16 @@ impl FakeDaemon {
         log.id = id.to_owned();
         log.rev = 1;
         log.history.clear();
+    }
+
+    /// Makes `GET /v1/asks` answer 500 (or not).
+    pub fn fail_asks(&self, fail: bool) {
+        self.log.lock().unwrap().asks_fail = fail;
+    }
+
+    /// When each live stream opened.
+    pub fn stream_times(&self) -> Vec<Instant> {
+        self.seen.lock().unwrap().stream_times.clone()
     }
 
     /// Drops every live stream's connection, without a close frame.
@@ -422,6 +437,13 @@ async fn list_members() -> Response {
 /// `GET /v1/asks?to=&state=`.
 async fn list_asks(State(fake): State<Fake>, Query(q): Query<HashMap<String, String>>) -> Response {
     fake.seen.lock().unwrap().ask_reads += 1;
+    if fake.log.lock().unwrap().asks_fail {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "failing on purpose",
+        );
+    }
     let asks: Vec<Value> = fake
         .log
         .lock()
@@ -438,7 +460,11 @@ async fn list_asks(State(fake): State<Fake>, Query(q): Query<HashMap<String, Str
 /// The live stream: `hello`, then what `since` missed, then live frames, until the client closes
 /// or [`FakeDaemon::drop_streams`].
 async fn live(mut socket: WebSocket, since: Option<String>, fake: Fake) {
-    fake.seen.lock().unwrap().streams.push(since.clone());
+    {
+        let mut seen = fake.seen.lock().unwrap();
+        seen.streams.push(since.clone());
+        seen.stream_times.push(Instant::now());
+    }
     let since: u64 = since.and_then(|s| s.parse().ok()).unwrap_or(u64::MAX);
     let (mut frames, hello, missed, mut sent) = {
         let log = fake.log.lock().unwrap();

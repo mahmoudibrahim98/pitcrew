@@ -250,3 +250,112 @@ fn an_unreachable_daemon_is_retried_and_ready_reconnects_at_once() {
     drop(attention);
     rt.shutdown_timeout(Duration::from_secs(2));
 }
+
+/// A runtime, and the attention of a registry holding `daemon`'s workspace, ready.
+fn watching(daemon: &FakeDaemon, limits: Limits) -> (tokio::runtime::Runtime, Attention) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let registry = Arc::new(Registry::in_memory());
+    registry
+        .insert(
+            WorkspaceRecord {
+                id: WORKSPACE_ID.into(),
+                name: WORKSPACE_NAME.into(),
+                kind: WorkspaceKind::Local,
+                connection: Connection::Local,
+            },
+            Some(Arc::new(daemon.connector())),
+            WorkspaceState::Ready,
+        )
+        .unwrap();
+    let attention = Attention::with_limits(
+        Arc::clone(&registry),
+        Arc::new(Recorder::default()),
+        rt.handle().clone(),
+        limits,
+    );
+    attention.sync(&list(&registry));
+    (rt, attention)
+}
+
+#[test]
+fn a_snapshot_that_keeps_failing_backs_off_to_the_cap() {
+    let tmp = tempfile::tempdir().unwrap();
+    let daemon = FakeDaemon::start(&tmp.path().join("state"), TOKEN);
+    daemon.raise(ask(1, WRITER, SAM));
+    // Every hello is fine; every snapshot fails.
+    daemon.fail_asks(true);
+    let (rt, attention) = watching(
+        &daemon,
+        Limits {
+            first_backoff: Duration::from_millis(50),
+            max_backoff: Duration::from_millis(400),
+            ..Limits::default()
+        },
+    );
+    std::thread::sleep(Duration::from_millis(2600));
+    let times = daemon.stream_times();
+    let gaps: Vec<u128> = times
+        .windows(2)
+        .map(|w| w[1].duration_since(w[0]).as_millis())
+        .collect();
+    // 50, 100, 200, then 400 ms: about 9 attempts, not one every 50 ms (about 40).
+    assert!((5..=12).contains(&times.len()), "attempts: {gaps:?}");
+    assert!(gaps[0] >= 40 && gaps[1] >= 80 && gaps[2] >= 160, "{gaps:?}");
+    assert!(
+        gaps[3..].iter().all(|g| (320..900).contains(g)),
+        "capped: {gaps:?}"
+    );
+    assert_eq!(count(&attention), None);
+
+    // It works again: counted, and the wait starts again from the first one.
+    daemon.fail_asks(false);
+    wait_until("the count", || count(&attention) == open(1));
+    let opened = daemon.stream_times().len();
+    let dropped = Instant::now();
+    daemon.drop_streams();
+    wait_until("the reconnect", || daemon.stream_times().len() > opened);
+    let back = *daemon.stream_times().last().unwrap();
+    assert!(
+        back.duration_since(dropped) < Duration::from_millis(300),
+        "reconnected after {:?}",
+        back.duration_since(dropped)
+    );
+    drop(attention);
+    rt.shutdown_timeout(Duration::from_secs(2));
+}
+
+#[test]
+fn too_many_asks_read_as_more_and_are_not_fetched_again_soon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let daemon = FakeDaemon::start(&tmp.path().join("state"), TOKEN);
+    for n in 1..=10 {
+        daemon.raise(ask(n, WRITER, SAM));
+    }
+    let (rt, attention) = watching(
+        &daemon,
+        Limits {
+            max_open: 3,
+            // /v1/me and /v1/members fit; ten asks do not.
+            max_body: 600,
+            first_backoff: Duration::from_millis(50),
+            too_large_backoff: Duration::from_secs(30),
+            ..Limits::default()
+        },
+    );
+    wait_until("the count", || {
+        count(&attention)
+            == Some(Count {
+                open: 3,
+                more: true,
+            })
+    });
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(daemon.stream_times().len(), 1, "no hot retry");
+    assert_eq!(daemon.seen.lock().unwrap().ask_reads, 1);
+    drop(attention);
+    rt.shutdown_timeout(Duration::from_secs(2));
+}
