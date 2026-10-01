@@ -7,10 +7,17 @@
 //!   ids that are bare ULIDs or a known display form; anything else is dropped and logged,
 //!   shortened. A link only navigates: it never answers, moves or sends anything.
 //! - **The raw text is parsed**, not a URL library's normalised form, so `..`, percent-encoding,
-//!   queries and fragments are refused rather than resolved.
+//!   queries and fragments are refused rather than resolved. That holds where the text arrives
+//!   raw: the command line on Linux and Windows. **On macOS** Tauri hands links over already
+//!   parsed (`RunEvent::Opened`), and the URL parser has resolved dot segments (`..`, `%2e`) by
+//!   then; the strict parser still decides on the result, so such a link can only open one of
+//!   the allowed places.
+//! - **On Windows** the single-instance plugin passes a second launch's arguments joined with `|`
+//!   and splits them again, so a link holding `|` arrives as several arguments, each parsed on
+//!   its own (no valid link holds `|`).
 //! - **A link that launched the app** arrives before the UI listens. The [`Navigator`] holds the
 //!   latest one until the main page asks for the workspace list (`gateway_workspaces`), which the
-//!   UI does once it listens to the gateway's events.
+//!   UI does once it listens to the gateway's events, and for [`HOLD`] (60 s) at most.
 
 use crate::app::MAIN;
 use crate::gateway::error::shorten;
@@ -19,6 +26,7 @@ use pitcrew_protocol::ids::{ProjectId, SessionId, TaskId, TaskKey, WorkspaceId, 
 use serde::Serialize;
 use std::str::FromStr as _;
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter as _, EventTarget, Manager as _, Runtime};
 
 /// The event the gateway emits with a [`NavigateTarget`].
@@ -260,41 +268,62 @@ where
     targets
 }
 
-/// Delivers targets to the main window, holding the latest one while the page is not listening.
-#[derive(Debug, Default)]
+/// How long a target waits for the page to listen before it is dropped (the contract's 60 s).
+pub const HOLD: Duration = Duration::from_secs(60);
+
+/// Delivers targets to the main window, holding the latest one while the page is not listening,
+/// for [`HOLD`] at most.
+#[derive(Debug)]
 pub struct Navigator {
     state: Mutex<State>,
+    hold: Duration,
+}
+
+impl Default for Navigator {
+    fn default() -> Self {
+        Self::with_hold(HOLD)
+    }
 }
 
 #[derive(Debug, Default)]
 struct State {
     /// The main page has asked for the workspace list since it last started loading.
     listening: bool,
-    /// The latest target that arrived while it was not.
-    pending: Option<NavigateTarget>,
+    /// The latest target that arrived while it was not, and when.
+    pending: Option<(NavigateTarget, Instant)>,
 }
 
 impl Navigator {
+    /// A navigator that holds a target for `hold` at most (tests).
+    #[must_use]
+    pub fn with_hold(hold: Duration) -> Self {
+        Self {
+            state: Mutex::default(),
+            hold,
+        }
+    }
+
     /// Opens `target`: emits it to the main window (or holds it until the page listens), then
     /// shows and focuses the window.
     pub fn navigate<R: Runtime>(&self, app: &AppHandle<R>, target: NavigateTarget) {
-        let now = {
-            let mut state = self.lock();
-            if state.listening {
-                Some(target)
-            } else {
-                tracing::debug!(
-                    kind = target.kind.name(),
-                    "holding a target until the page listens"
-                );
-                state.pending = Some(target);
-                None
-            }
-        };
-        if let Some(target) = now {
+        if let Some(target) = self.offer(target) {
             emit(app, &target);
         }
         focus_main(app);
+    }
+
+    /// `target` to emit now, or `None` when it is held for the page.
+    fn offer(&self, target: NavigateTarget) -> Option<NavigateTarget> {
+        let mut state = self.lock();
+        if state.listening {
+            return Some(target);
+        }
+        tracing::debug!(
+            kind = target.kind.name(),
+            "holding a target until the page listens"
+        );
+        state.pending = Some((target, Instant::now()));
+        None
     }
 
     /// The main page started loading: targets wait for it.
@@ -302,22 +331,38 @@ impl Navigator {
         self.lock().listening = false;
     }
 
-    /// The main page asked for the workspace list, so it listens: a held target goes now.
+    /// The main page asked for the workspace list, so it listens: a held target goes now, unless
+    /// it has waited too long.
     pub fn page_listening<R: Runtime>(&self, app: &AppHandle<R>) {
-        let pending = {
-            let mut state = self.lock();
-            state.listening = true;
-            state.pending.take()
-        };
-        if let Some(target) = pending {
+        if let Some(target) = self.listening() {
             emit(app, &target);
         }
     }
 
-    /// The target held for the page, if any (tests).
+    /// Marks the page as listening; the held target to emit, if it is still fresh.
+    fn listening(&self) -> Option<NavigateTarget> {
+        let mut state = self.lock();
+        state.listening = true;
+        let (target, at) = state.pending.take()?;
+        if at.elapsed() < self.hold {
+            Some(target)
+        } else {
+            tracing::info!(
+                kind = target.kind.name(),
+                "dropped a target the page did not ask for in time"
+            );
+            None
+        }
+    }
+
+    /// The target held for the page, if any and still fresh (tests).
     #[must_use]
     pub fn pending(&self) -> Option<NavigateTarget> {
-        self.lock().pending.clone()
+        self.lock()
+            .pending
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < self.hold)
+            .map(|(target, _)| target.clone())
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -537,6 +582,28 @@ mod tests {
         assert!(looks_like_link("PITCREW:x"));
         assert!(!looks_like_link("pitcrew"));
         assert!(!looks_like_link("ïtcrew:"));
+    }
+
+    #[test]
+    fn a_held_target_expires() {
+        assert_eq!(Navigator::default().hold, Duration::from_secs(60));
+        let navigator = Navigator::with_hold(Duration::from_millis(40));
+        // Held while the page does not listen; dropped once it has waited too long.
+        assert_eq!(navigator.offer(NavigateTarget::inbox(WS)), None);
+        assert_eq!(navigator.pending(), Some(NavigateTarget::inbox(WS)));
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(navigator.pending(), None);
+        assert_eq!(navigator.listening(), None, "too old to deliver");
+        // Listening now: the next one goes at once.
+        assert_eq!(
+            navigator.offer(NavigateTarget::task(WS, TASK)),
+            Some(NavigateTarget::task(WS, TASK))
+        );
+        // A fresh one is delivered when the page listens again.
+        navigator.page_started();
+        assert_eq!(navigator.offer(NavigateTarget::inbox(WS)), None);
+        assert_eq!(navigator.listening(), Some(NavigateTarget::inbox(WS)));
+        assert_eq!(navigator.pending(), None);
     }
 
     #[test]

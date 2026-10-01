@@ -56,8 +56,12 @@ pub fn run() -> ExitCode {
     logging::init();
     let started = std::time::Instant::now();
     let builder = tauri::Builder::default()
+        // Managed before any plugin, so a link handed over while the app starts is held, not
+        // dropped.
+        .manage(Navigator::default())
         // First, so a second instance hands over and exits before anything else starts. It
-        // hands over its command line: a deep link, when the desktop opened one.
+        // hands over its command line: a deep link, when the desktop opened one (on Windows the
+        // plugin joins the arguments with `|` and splits them again).
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             navigate::open_links(app, args.iter().skip(1));
         }))
@@ -75,7 +79,8 @@ pub fn run() -> ExitCode {
     };
     app.run(|handle, event| match event {
         RunEvent::Exit => shutdown(handle),
-        // macOS hands deep links over as Apple Events, to the running app.
+        // macOS hands deep links over as Apple Events, to the running app, already parsed: dot
+        // segments are resolved by then (see `navigate`).
         #[cfg(target_os = "macos")]
         RunEvent::Opened { urls } => {
             navigate::open_links(handle, urls.iter().map(Url::as_str));
@@ -194,7 +199,6 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let local = Arc::new(LocalConnector::new(endpoint.clone()));
     registry.attach_local(Arc::clone(&local) as Arc<dyn crate::gateway::Connector>);
     app.manage(Gateway::new(Arc::clone(&registry)));
-    app.manage(Navigator::default());
     let shell = Shell::start(
         &handle,
         Arc::clone(&registry),
