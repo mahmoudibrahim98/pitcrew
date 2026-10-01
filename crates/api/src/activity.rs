@@ -41,6 +41,10 @@ pub const NEEDS_INDEX: &str = "Filtering activity by project or workstream needs
 
 const SCAN_PAGE: usize = 500;
 
+/// How deep a filter looks into an event body. Today's bodies nest a few levels; the cap keeps a
+/// future body carrying raw nested JSON from recursing deeply.
+pub const MAX_DEPTH: usize = 32;
+
 /// A filter on activity: events with a `key` field, at any depth, that holds `id` or an object
 /// whose `id` is `id`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,13 +72,22 @@ impl Filter {
         }
     }
 
-    /// Whether `value` has a `key` field naming the id, at any depth.
+    /// Whether `value` has a `key` field naming the id, at any depth up to [`MAX_DEPTH`].
     fn matches(&self, value: &serde_json::Value) -> bool {
+        self.matches_within(value, MAX_DEPTH)
+    }
+
+    fn matches_within(&self, value: &serde_json::Value, depth: usize) -> bool {
+        let Some(deeper) = depth.checked_sub(1) else {
+            return false;
+        };
         match value {
-            serde_json::Value::Object(map) => map
-                .iter()
-                .any(|(key, field)| (key == self.key && self.names(field)) || self.matches(field)),
-            serde_json::Value::Array(items) => items.iter().any(|item| self.matches(item)),
+            serde_json::Value::Object(map) => map.iter().any(|(key, field)| {
+                (key == self.key && self.names(field)) || self.matches_within(field, deeper)
+            }),
+            serde_json::Value::Array(items) => {
+                items.iter().any(|item| self.matches_within(item, deeper))
+            }
             _ => false,
         }
     }
@@ -299,6 +312,25 @@ mod tests {
         let rest = page(&source, first.from_rev, 10, &filter).unwrap();
         assert!(rest.events.is_empty());
         assert!(rest.at_start);
+    }
+
+    #[test]
+    fn the_walk_stops_at_max_depth() {
+        let id = SessionId::new();
+        let filter = Filter::session(id);
+        // The object holding `session` at `level`, 1 being the body itself.
+        let nested = |level: usize| {
+            let mut value = serde_json::json!({ "session": id.0.to_string() });
+            for _ in 1..level {
+                value = serde_json::json!({ "inner": [value] });
+            }
+            value
+        };
+        // Arrays count as a level too: `{"inner": [..]}` adds two.
+        assert!(filter.matches(&nested(1)));
+        assert!(filter.matches(&nested(MAX_DEPTH / 2)));
+        assert!(!filter.matches(&nested(MAX_DEPTH / 2 + 1)));
+        assert!(!filter.matches(&nested(1000)));
     }
 
     /// Filters match the `session` or `task` field, not the id anywhere in the body.
