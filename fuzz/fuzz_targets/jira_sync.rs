@@ -24,11 +24,11 @@
 //! - the credential never appears in errors or in the outcome's `Debug`;
 //! - the state and changes survive a JSON round trip;
 //! - no arithmetic overflows on server numbers (R28: a `Retry-After` near `i64::MAX`; R30: a Data
-//!   Center `startAt` near `u64::MAX`).
+//!   Center `startAt` near `u64::MAX`; both fixed).
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use pitcrew_fuzz::{is_hidden_char, percent_decode, roundtrip, scripted_response, skip_known};
+use pitcrew_fuzz::{is_hidden_char, percent_decode, roundtrip, scripted_response};
 use pitcrew_protocol::model::ExternalRef;
 use pitcrew_sync_github::{Request, Response, Transport, TransportError};
 use pitcrew_sync_jira::bounds::{
@@ -87,15 +87,7 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 }
 
 fn response(bytes: &[u8]) -> Response {
-    let (status, headers, mut body) = scripted_response(bytes);
-    if skip_known()
-        && let Ok(mut page) = serde_json::from_slice::<serde_json::Value>(&body)
-        && page["startAt"].as_u64().is_some_and(|n| n > 1 << 53)
-    {
-        // Known finding R30: a `startAt` near `u64::MAX` overflows the next offset.
-        page["startAt"] = 0.into();
-        body = page.to_string().into_bytes();
-    }
+    let (status, headers, body) = scripted_response(bytes);
     Response {
         status,
         headers,

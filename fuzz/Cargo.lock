@@ -996,6 +996,7 @@ dependencies = [
  "pitcrew-interfaces",
  "pitcrew-protocol",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "tracing",

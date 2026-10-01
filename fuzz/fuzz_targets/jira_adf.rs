@@ -16,13 +16,13 @@
 //! - **hidden characters gone**: no bidi control, zero-width character, tag character and the
 //!   like (`pitcrew_fuzz::is_hidden_char`) survives;
 //! - **bounded depth and nodes**: no text from a node past the depth or node caps (`Ω`, `Ж`);
-//! - **bounded work**: one document takes at most a quarter of a second (R29: the walk recounts
-//!   the output on every node, so 20,000 nodes after 65,000 characters take far longer than a
-//!   linear walk).
+//! - **bounded work**: one document takes at most a quarter of a second (R29, fixed: the walk
+//!   recounted the output on every node, so 20,000 nodes after 65,000 characters took far longer
+//!   than a linear walk; it now keeps a running count).
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use pitcrew_fuzz::{is_hidden_char, skip_known};
+use pitcrew_fuzz::is_hidden_char;
 use pitcrew_sync_jira::adf::adf_to_text;
 use pitcrew_sync_jira::bounds::{MAX_ADF_DEPTH, MAX_ADF_NODES, MAX_BODY_CHARS};
 use serde_json::{Value, json};
@@ -258,7 +258,5 @@ fuzz_target!(|input: &[u8]| {
         assert!(!text.contains(DEEP), "text from past the depth cap");
         assert!(!text.contains(LATE), "text from past the node cap");
     }
-    if !skip_known() {
-        assert!(took <= BUDGET, "one document took {took:?}");
-    }
+    assert!(took <= BUDGET, "one document took {took:?}");
 });

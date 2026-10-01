@@ -12,14 +12,14 @@
 //! - **strict keys**: a recipe that loads has only the documented keys, each with its documented
 //!   type (strings, a whole number for `cpus`, lists of strings for `sbatch` and `modules`);
 //! - **what loads, renders**: a recipe that loads passes `Site::check` and `JobSpec::new`, and
-//!   `JobSpec::render` makes a script for a plain target (R26: unless a value holds `hetjob` or
-//!   `packjob`); the script's header is sound (see `pitcrew_fuzz::slurm::check_script`) and holds
-//!   each of the recipe's `#SBATCH` options as its own line;
+//!   `JobSpec::render` makes a script for a plain target (R26, fixed: a value holding `hetjob` or
+//!   `packjob` is refused when the recipe loads); the script's header is sound (see
+//!   `pitcrew_fuzz::slurm::check_script`) and holds each of the recipe's `#SBATCH` options as its
+//!   own line;
 //! - an error is one line with no control characters (it reaches the UI and logs).
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use pitcrew_fuzz::skip_known;
 use pitcrew_fuzz::slurm::{check_script, target};
 use pitcrew_remote::helper::slurm::{JobOptions, JobSpec, MAX_SITE_FILE, SITE_KEYS, Site};
 
@@ -133,17 +133,9 @@ fuzz_target!(|input: &[u8]| {
         .unwrap_or_else(|e| panic!("a recipe that loads fails Site::check: {e}"));
     let spec = JobSpec::new(&site, &JobOptions::default())
         .unwrap_or_else(|e| panic!("a recipe that loads fails JobSpec::new: {e}"));
-    let script = match spec.render(target()) {
-        Ok(script) => script,
-        Err(e) => {
-            let words = format!("{:?}", site.defaults).to_ascii_lowercase();
-            if skip_known() && (words.contains("hetjob") || words.contains("packjob")) {
-                // Known finding R26: recipes with these words load but never render.
-                return;
-            }
-            panic!("a recipe that loads does not render: {e}");
-        }
-    };
+    let script = spec
+        .render(target())
+        .unwrap_or_else(|e| panic!("a recipe that loads does not render: {e}"));
     let text = script.text();
     check_script(text);
     for option in &site.defaults.sbatch {

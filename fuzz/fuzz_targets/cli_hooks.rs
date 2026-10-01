@@ -411,20 +411,9 @@ fn check_round_trip(engine: Engine, before: Option<&[u8]>, after: Option<&[u8]>)
         // An empty file is replaced by a fresh document; there is nothing to give back.
         return;
     }
-    // Codex's installer drops a leading BOM (reported as R24; the meaning is the same), so the
-    // bytes are compared without it there.
-    let bytes = |b: Option<&[u8]>| {
-        b.map(|b| {
-            let text = String::from_utf8_lossy(b).into_owned();
-            match engine {
-                Engine::Codex => text.strip_prefix(BOM).map_or(text.clone(), str::to_owned),
-                _ => text,
-            }
-        })
-    };
+    // Byte for byte, a leading BOM included (R24, fixed: Codex's installer used to drop one).
     assert_eq!(
-        bytes(after),
-        bytes(before),
+        after, before,
         "install then uninstall did not give the file back"
     );
 }

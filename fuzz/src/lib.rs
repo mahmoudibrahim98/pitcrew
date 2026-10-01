@@ -14,7 +14,8 @@ use std::sync::OnceLock;
 
 /// Whether to relax the checks for findings already reported and listed in
 /// `docs/security/threat-model.md` §8 (`PITCREW_FUZZ_SKIP_KNOWN=1`), so a run can look past them.
-/// Off by default: a known finding still fails the target until it is fixed.
+/// Off by default: a known finding still fails the target until it is fixed. No target relaxes a
+/// check at the moment: every finding with an input in `fuzz/regressions/` is fixed.
 #[must_use]
 pub fn skip_known() -> bool {
     static SKIP: OnceLock<bool> = OnceLock::new();
@@ -23,28 +24,36 @@ pub fn skip_known() -> bool {
 
 /// Characters that are invisible or change the direction of text: the set untrusted text must
 /// lose before people or agents read it (bidi controls and isolates, zero-width characters, the
-/// byte-order mark, the soft hyphen, the Mongolian vowel separator, the line and paragraph
-/// separators, and the Unicode tag characters that can smuggle text to a model). Written here from
-/// the threat model, not copied from a crate under test.
+/// byte-order mark, the soft hyphen, the combining grapheme joiner, the Mongolian vowel separator,
+/// the Hangul fillers, variation selectors, the interlinear annotation marks, the line and
+/// paragraph separators, and the Unicode tag characters that can smuggle text to a model). Written
+/// here from the threat model (T55, T66), not copied from a crate under test.
 #[must_use]
 pub fn is_hidden_char(c: char) -> bool {
     matches!(
         c,
         '\u{00AD}'
+            | '\u{034F}'
             | '\u{061C}'
+            | '\u{115F}'
+            | '\u{1160}'
             | '\u{180E}'
             | '\u{200B}'..='\u{200F}'
             | '\u{2028}'..='\u{202E}'
             | '\u{2060}'..='\u{2064}'
             | '\u{2066}'..='\u{2069}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
             | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF9}'..='\u{FFFB}'
             | '\u{E0000}'..='\u{E007F}'
+            | '\u{E0100}'..='\u{E01EF}'
     )
 }
 
 /// A scripted HTTP response, `STATUS\nName: value\n…\n\nBODY`: a status that does not parse is
-/// 200. With [`skip_known`], a `Retry-After` of more than 10 characters is cut to 10, past the
-/// known overflow in both tracker clients (R28).
+/// 200.
 #[must_use]
 pub fn scripted_response(bytes: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
     let text = String::from_utf8_lossy(bytes);
@@ -56,13 +65,7 @@ pub fn scripted_response(bytes: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) 
         .unwrap_or(200);
     let headers = lines
         .filter_map(|l| l.split_once(':'))
-        .map(|(k, v)| {
-            let (k, mut v) = (k.trim().to_owned(), v.trim().to_owned());
-            if skip_known() && k.eq_ignore_ascii_case("retry-after") && v.len() > 10 {
-                v = v.chars().take(10).collect();
-            }
-            (k, v)
-        })
+        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
         .collect();
     (status, headers, body.as_bytes().to_vec())
 }

@@ -21,7 +21,7 @@
 //! - errors, issues and the outcome's `Debug` never contain the token;
 //! - titles, bodies and labels are within their caps, and the state and changes survive a JSON
 //!   round trip;
-//! - no arithmetic overflows on server numbers (R28: a `retry-after` near `i64::MAX`).
+//! - no arithmetic overflows on server numbers (R28, fixed: a `retry-after` near `i64::MAX`).
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
