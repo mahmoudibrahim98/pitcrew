@@ -79,8 +79,8 @@ impl Default for Limits {
 pub(crate) trait Report: Send + Sync + 'static {
     /// The workspace's count changed.
     fn count(&self, workspace: &str, count: Count);
-    /// A new ask for the person arrived.
-    fn new_ask(&self, workspace: &str, ask: NewAsk);
+    /// New asks for the person arrived, in one frame.
+    fn new_asks(&self, workspace: &str, asks: Vec<NewAsk>);
 }
 
 /// Why a stream ended or never started. Never holds a token, a body or a frame.
@@ -297,12 +297,15 @@ impl Watcher {
                 continue;
             };
             let before = self.tracker.count();
+            let mut new = Vec::new();
             for event in events {
                 let applied = self.tracker.apply(&event.body.kind, event.body.data);
                 refetch |= applied.refetch;
-                if let Some(ask) = applied.new {
-                    self.report.new_ask(&self.id, ask);
-                }
+                new.extend(applied.new);
+            }
+            // One report per frame: the notifications look at the window once for all of them.
+            if !new.is_empty() {
+                self.report.new_asks(&self.id, new);
             }
             if let Some(cursor) = &mut self.cursor {
                 cursor.rev = cursor.rev.max(to_rev);

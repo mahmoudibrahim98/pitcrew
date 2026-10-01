@@ -28,8 +28,9 @@ impl AttentionSink for Recorder {
         *self.changes.lock().unwrap() += 1;
     }
 
-    fn new_ask(&self, workspace: &str, ask: NewAsk) {
-        self.asks.lock().unwrap().push((workspace.to_owned(), ask));
+    fn new_asks(&self, workspace: &str, asks: Vec<NewAsk>) {
+        let mut seen = self.asks.lock().unwrap();
+        seen.extend(asks.into_iter().map(|ask| (workspace.to_owned(), ask)));
     }
 }
 

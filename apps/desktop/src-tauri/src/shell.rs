@@ -146,17 +146,18 @@ impl Shell {
     }
 }
 
-/// Notifications are shown while they are on and the window is not in front of the person.
+/// Notifications are shown while they are on and the window is not in front of the person. Each
+/// window question is a round trip to the main thread, so the one that usually settles it (is it
+/// focused?) comes first, and none is asked when notifications are off.
 fn allowed<R: Runtime>(app: &AppHandle<R>) -> bool {
     let on = app
         .try_state::<Shell>()
         .is_some_and(|shell| shell.preferences.get().notifications);
-    let looking = app.get_webview_window(MAIN).is_some_and(|window| {
-        window.is_visible().unwrap_or(false)
-            && window.is_focused().unwrap_or(false)
+    on && !app.get_webview_window(MAIN).is_some_and(|window| {
+        window.is_focused().unwrap_or(false)
+            && window.is_visible().unwrap_or(false)
             && !window.is_minimized().unwrap_or(false)
-    });
-    on && !looking
+    })
 }
 
 /// "Needs you" goes to the tray and the notifications.
@@ -167,9 +168,9 @@ impl<R: Runtime> AttentionSink for Sink<R> {
         tray::refresh(&self.0);
     }
 
-    fn new_ask(&self, workspace: &str, ask: NewAsk) {
+    fn new_asks(&self, workspace: &str, asks: Vec<NewAsk>) {
         if let Some(shell) = self.0.try_state::<Shell>() {
-            shell.notifications.new_ask(workspace, ask);
+            shell.notifications.new_asks(workspace, asks);
         }
     }
 }
@@ -195,7 +196,7 @@ mod tests {
 
     impl AttentionSink for Nowhere {
         fn counts_changed(&self) {}
-        fn new_ask(&self, _workspace: &str, _ask: NewAsk) {}
+        fn new_asks(&self, _workspace: &str, _asks: Vec<NewAsk>) {}
     }
 
     fn shell(preferences: Preferences, shown: &Arc<Shown>) -> Shell {

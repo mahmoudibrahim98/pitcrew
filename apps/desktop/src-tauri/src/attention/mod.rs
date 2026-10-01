@@ -25,8 +25,8 @@ use tokio::sync::Notify;
 pub trait AttentionSink: Send + Sync + 'static {
     /// A workspace's count changed; [`Attention::counts`] has the new ones.
     fn counts_changed(&self);
-    /// A new ask for the person arrived in `workspace`.
-    fn new_ask(&self, workspace: &str, ask: NewAsk);
+    /// New asks for the person arrived in `workspace`, in one frame of its stream.
+    fn new_asks(&self, workspace: &str, asks: Vec<NewAsk>);
 }
 
 /// The watchers and their counts.
@@ -65,8 +65,8 @@ impl watch::Report for Shared {
         }
     }
 
-    fn new_ask(&self, workspace: &str, ask: NewAsk) {
-        self.sink.new_ask(workspace, ask);
+    fn new_asks(&self, workspace: &str, asks: Vec<NewAsk>) {
+        self.sink.new_asks(workspace, asks);
     }
 }
 

@@ -223,10 +223,14 @@ impl Tracker {
 
     fn learn(&mut self, member: Member) {
         if self.names.len() < self.max_members || self.names.contains_key(&member.id) {
-            self.names.insert(member.id, member.name);
+            let name = member.name.chars().take(MAX_NAME).collect();
+            self.names.insert(member.id, name);
         }
     }
 }
+
+/// The longest member name kept, in characters (a notification shows fewer).
+const MAX_NAME: usize = 60;
 
 #[cfg(test)]
 mod tests {
@@ -348,6 +352,11 @@ mod tests {
                 .from,
             None
         );
+        // Names are kept short.
+        let mut long = member(9, "x");
+        long.name = "é".repeat(10_000);
+        t.apply("member_added", json!({ "member": long }));
+        assert_eq!(t.name_of(&id(9)).unwrap().chars().count(), MAX_NAME);
     }
 
     #[test]

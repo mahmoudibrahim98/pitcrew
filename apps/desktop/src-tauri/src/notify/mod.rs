@@ -58,9 +58,9 @@ pub trait Notifier: Send + Sync + 'static {
     fn show(&self, notice: Notice);
 }
 
-/// `text` for a notification: control characters (newlines and tabs become spaces) and bidi and
-/// zero-width characters removed, whitespace collapsed, and cut to `max` characters, the last
-/// being `…` when cut.
+/// `text` for a notification: control characters (newlines and tabs become spaces), bidi
+/// controls and characters that show as nothing (zero-width, tags, variation selectors, fillers)
+/// removed, whitespace collapsed, and cut to `max` characters, the last being `…` when cut.
 #[must_use]
 pub fn clean(text: &str, max: usize) -> String {
     let mut out = String::with_capacity(text.len().min(max * 4));
@@ -104,18 +104,35 @@ pub fn clean(text: &str, max: usize) -> String {
     out
 }
 
-/// Bidi controls, zero-width characters and the byte-order mark.
+/// Bidi controls, and characters that show as nothing or hide what follows: zero-width
+/// characters, the soft hyphen, the combining grapheme joiner, the Mongolian vowel separator,
+/// the Hangul fillers, variation selectors, interlinear annotation marks, tag characters and the
+/// byte-order mark.
 fn is_invisible(c: char) -> bool {
     matches!(
         c,
-        '\u{061C}'
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'
+            | '\u{1160}'
+            | '\u{180E}'
             | '\u{200B}'..='\u{200F}'
             | '\u{202A}'..='\u{202E}'
             | '\u{2060}'..='\u{2064}'
             | '\u{2066}'..='\u{2069}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
             | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF9}'..='\u{FFFB}'
+            | '\u{E0000}'..='\u{E007F}'
+            | '\u{E0100}'..='\u{E01EF}'
     )
 }
+
+/// What a notification says when an ask's text cleans down to nothing.
+pub const NO_TEXT: &str = "An agent needs you";
 
 /// What an asker of `kind` is doing, after their name.
 fn phrase(kind: AskKind) -> &'static str {
@@ -149,9 +166,14 @@ pub fn notice_for(workspace: &str, ask: &NewAsk) -> Notice {
         Some(task) => NavigateTarget::task(workspace, task.0.to_string()),
         None => NavigateTarget::inbox(workspace),
     };
+    let body = clean(&text, MAX_BODY);
     Notice {
         title: clean(&format!("{} {}", name_of(ask), phrase(ask.kind)), MAX_TITLE),
-        body: clean(&text, MAX_BODY),
+        body: if body.is_empty() {
+            NO_TEXT.to_owned()
+        } else {
+            body
+        },
         target: Some(target),
     }
 }
@@ -298,16 +320,26 @@ impl Notifications {
         Self { inner, task }
     }
 
-    /// A new ask for the person in `workspace`.
-    pub fn new_ask(&self, workspace: &str, ask: NewAsk) {
+    /// New asks for the person in `workspace` (one frame's worth: whether they may be shown is
+    /// asked once).
+    pub fn new_asks(&self, workspace: &str, asks: Vec<NewAsk>) {
+        if asks.is_empty() {
+            return;
+        }
         if !(self.inner.allowed)() {
             tracing::debug!(
                 workspace,
+                asks = asks.len(),
                 "no notification: the window is in front, or notifications are off"
             );
             return;
         }
-        self.inner.limiter().offer(workspace, ask, Instant::now());
+        let now = Instant::now();
+        let mut limiter = self.inner.limiter();
+        for ask in asks {
+            limiter.offer(workspace, ask, now);
+        }
+        drop(limiter);
         self.inner.wake.notify_one();
     }
 
@@ -436,6 +468,39 @@ mod tests {
         assert_eq!(clean(&wide, 200).chars().count(), 200);
         assert_eq!(clean("abc", 3), "abc");
         assert_eq!(clean("abcd", 3), "ab…");
+        // Characters that show as nothing, or hide what follows.
+        assert_eq!(
+            clean(
+                "a\u{AD}b\u{34F}c\u{180E}d\u{115F}\u{1160}\u{3164}\u{FFA0}e\u{FE0F}\u{E0100}f\u{FFF9}g\u{FFFB}",
+                50
+            ),
+            "abcdefg"
+        );
+        let tagged: String = "hi"
+            .chars()
+            .chain(
+                "ignore all"
+                    .chars()
+                    .map(|c| char::from_u32(0xE0000 + c as u32).unwrap()),
+            )
+            .collect();
+        assert_eq!(clean(&tagged, 50), "hi", "tag characters are dropped");
+        assert_eq!(clean("\u{E0001}\u{3164}\u{200B}", 50), "");
+    }
+
+    #[test]
+    fn a_text_that_cleans_to_nothing_says_so() {
+        let blank = ask(
+            2,
+            AskKind::Question,
+            Some("Writer"),
+            "\u{3164}\u{200B}\u{E0041}",
+        );
+        let n = notice_for(WS, &blank);
+        assert_eq!(n.body, NO_TEXT);
+        assert_eq!(n.title, "Writer has a question");
+        let nameless = ask(2, AskKind::Question, Some("\u{115F}\u{FFA0}"), "q");
+        assert_eq!(notice_for(WS, &nameless).title, "An agent has a question");
     }
 
     #[test]
@@ -541,18 +606,29 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_pacing_runs_on_its_own() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let shown = Arc::new(Recorder::default());
         let allowed = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let gate = Arc::clone(&allowed);
+        let checks = Arc::new(AtomicUsize::new(0));
+        let (gate, counted) = (Arc::clone(&allowed), Arc::clone(&checks));
         let notifications = Notifications::new(
             Arc::clone(&shown) as Arc<dyn Notifier>,
             RateLimiter::new(Duration::from_millis(50), Duration::from_millis(300)),
-            move || gate.load(std::sync::atomic::Ordering::SeqCst),
+            move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                gate.load(Ordering::SeqCst)
+            },
             &tokio::runtime::Handle::current(),
         );
-        for n in 0..3 {
-            notifications.new_ask(WS, ask(n, AskKind::Question, Some("A"), "q"));
-        }
+        notifications.new_asks(WS, vec![]);
+        // One frame's asks: the window is looked at once, not once per ask.
+        notifications.new_asks(
+            WS,
+            (0..3)
+                .map(|n| ask(n, AskKind::Question, Some("A"), "q"))
+                .collect(),
+        );
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
         let wait_for = |n: usize| {
             let shown = Arc::clone(&shown);
             async move {
@@ -569,14 +645,14 @@ mod tests {
         assert_eq!(shown.0.lock().unwrap()[0].title, "3 agents need you");
 
         // Not allowed (the window is focused): nothing, even later.
-        allowed.store(false, std::sync::atomic::Ordering::SeqCst);
-        notifications.new_ask(WS, ask(9, AskKind::Question, Some("A"), "hidden"));
+        allowed.store(false, Ordering::SeqCst);
+        notifications.new_asks(WS, vec![ask(9, AskKind::Question, Some("A"), "hidden")]);
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(shown.0.lock().unwrap().len(), 1);
 
         // Allowed again: after the cooldown, the next one.
-        allowed.store(true, std::sync::atomic::Ordering::SeqCst);
-        notifications.new_ask(WS, ask(9, AskKind::Approval, Some("B"), "deploy"));
+        allowed.store(true, Ordering::SeqCst);
+        notifications.new_asks(WS, vec![ask(9, AskKind::Approval, Some("B"), "deploy")]);
         wait_for(2).await;
         assert_eq!(shown.0.lock().unwrap()[1].title, "B asks for approval");
     }

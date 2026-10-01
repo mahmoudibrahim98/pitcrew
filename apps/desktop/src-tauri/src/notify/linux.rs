@@ -3,8 +3,9 @@
 //!
 //! - Connected on first use; a failed call drops the connection, and the next notification tries
 //!   again. No service (a desktop without one): logged once, nothing shown.
-//! - The body is escaped when the service reads markup (`body-markup`), so an ask's text can
-//!   never be a link or an image.
+//! - The body and the title are escaped when the service reads markup (`body-markup`; the spec
+//!   reads it only in the body, some services in the title too), so an ask's text can never be a
+//!   link or an image.
 //! - Clicks are matched to the notifications this app showed: at most [`KEEP`] are remembered,
 //!   and each is forgotten when the service closes it.
 
@@ -139,10 +140,11 @@ impl Inner {
         let Some(current) = live.as_ref() else {
             return;
         };
-        let body = if current.markup {
-            escape(&notice.body)
+        // The spec reads markup only in the body, but some services read it in the summary too.
+        let (summary, body) = if current.markup {
+            (escape(&notice.title), escape(&notice.body))
         } else {
-            notice.body.clone()
+            (notice.title.clone(), notice.body.clone())
         };
         let actions: &[&str] = if current.actions {
             &["default", "Open"]
@@ -155,7 +157,7 @@ impl Inner {
                 "PitCrew",
                 0,
                 "",
-                &notice.title,
+                &summary,
                 &body,
                 actions,
                 HashMap::new(),
@@ -358,7 +360,7 @@ mod tests {
 
     fn notice(n: u32) -> Notice {
         Notice {
-            title: format!("Writer has a question {n}"),
+            title: format!("Writer <i>&</i> has a question {n}"),
             body: "Use <b>bold</b> & <a href=\"x\">links</a>?".into(),
             target: Some(NavigateTarget::inbox(format!(
                 "01JA00000000000000000000{n:02}"
@@ -373,7 +375,10 @@ mod tests {
         until("the notification", || seen.lock().unwrap().len() == 1).await;
         let first = seen.lock().unwrap()[0].clone();
         assert_eq!(first.app, "PitCrew");
-        assert_eq!(first.summary, "Writer has a question 1");
+        assert_eq!(
+            first.summary,
+            "Writer &lt;i&gt;&amp;&lt;/i&gt; has a question 1"
+        );
         assert_eq!(
             first.body,
             "Use &lt;b&gt;bold&lt;/b&gt; &amp; &lt;a href=\"x\"&gt;links&lt;/a&gt;?"
@@ -423,6 +428,7 @@ mod tests {
         until("the notification", || seen.lock().unwrap().len() == 1).await;
         let first = seen.lock().unwrap()[0].clone();
         assert_eq!(first.body, "Use <b>bold</b> & <a href=\"x\">links</a>?");
+        assert_eq!(first.summary, "Writer <i>&</i> has a question 1");
         assert!(first.actions.is_empty());
     }
 

@@ -67,14 +67,16 @@ struct Texts(Mutex<Vec<String>>);
 impl AttentionSink for Texts {
     fn counts_changed(&self) {}
 
-    fn new_ask(&self, workspace: &str, ask: NewAsk) {
-        let notice = notice_for(workspace, &ask);
-        self.0.lock().unwrap().push(format!(
-            "{} | {} | {}",
-            notice.title,
-            notice.body,
-            serde_json::to_string(&notice.target).unwrap()
-        ));
+    fn new_asks(&self, workspace: &str, asks: Vec<NewAsk>) {
+        for ask in asks {
+            let notice = notice_for(workspace, &ask);
+            self.0.lock().unwrap().push(format!(
+                "{} | {} | {}",
+                notice.title,
+                notice.body,
+                serde_json::to_string(&notice.target).unwrap()
+            ));
+        }
     }
 }
 
