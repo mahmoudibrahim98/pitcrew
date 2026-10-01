@@ -47,6 +47,8 @@ export interface Logged {
   path: string;
   query: URLSearchParams;
   body: unknown;
+  /** The response status, once it arrives (`null` until then, `-1` if the request fails). */
+  status: number | null;
 }
 
 const inFlight = new Set<Promise<unknown>>();
@@ -76,17 +78,25 @@ export function renderWithHub(
   const inner = options.fetch ?? ((input: RequestInfo | URL, init?: RequestInit) => fetch(input, init));
   const fetcher: typeof fetch = (input, init) => {
     const url = new URL(String(input));
-    requests.push({
+    const entry: Logged = {
       method: init?.method ?? 'GET',
       path: url.pathname,
       query: url.searchParams,
       body: typeof init?.body === 'string' ? JSON.parse(init.body) : undefined,
-    });
+      status: null,
+    };
+    requests.push(entry);
     const response = inner(input, init);
     inFlight.add(response);
     void response.then(
-      () => inFlight.delete(response),
-      () => inFlight.delete(response),
+      (res) => {
+        entry.status = res.status;
+        inFlight.delete(response);
+      },
+      () => {
+        entry.status = -1;
+        inFlight.delete(response);
+      },
     );
     return response;
   };
