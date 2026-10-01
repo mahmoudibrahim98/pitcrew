@@ -32,7 +32,12 @@ pub(crate) fn path(env: Env<'_>) -> Result<PathBuf> {
 const MARKER_TAIL: [&str; 3] = ["hook", "codex", "notify"];
 
 fn target_notify(exe: &str) -> Vec<String> {
-    vec![exe.to_owned(), "hook".to_owned(), "codex".to_owned(), "notify".to_owned()]
+    vec![
+        exe.to_owned(),
+        "hook".to_owned(),
+        "codex".to_owned(),
+        "notify".to_owned(),
+    ]
 }
 
 fn is_ours(values: &[String]) -> bool {
@@ -73,7 +78,10 @@ fn wrapper_path(config_path: &Path) -> PathBuf {
 /// passed to the wrapper (just the JSON payload, as far as `notify` ever gives it any).
 fn wrapper_script_unix(original: &[String], exe: &str) -> String {
     let mut out = String::from("#!/bin/sh\n");
-    let _ = writeln!(out, "# {CHAIN_MARKER}. Safe to remove, or run: pitcrew hooks uninstall");
+    let _ = writeln!(
+        out,
+        "# {CHAIN_MARKER}. Safe to remove, or run: pitcrew hooks uninstall"
+    );
     let recorded = serde_json::to_string(original).unwrap_or_default();
     let _ = writeln!(out, "# {ORIGINAL_PREFIX}{recorded}");
     for part in original {
@@ -93,14 +101,21 @@ fn wrapper_script_unix(original: &[String], exe: &str) -> String {
 /// enough; `notify` only ever gives it the one JSON argument).
 fn wrapper_script_windows(original: &[String], exe: &str) -> String {
     let mut out = String::from("@echo off\n");
-    let _ = writeln!(out, "rem {CHAIN_MARKER}. Safe to remove, or run: pitcrew hooks uninstall");
+    let _ = writeln!(
+        out,
+        "rem {CHAIN_MARKER}. Safe to remove, or run: pitcrew hooks uninstall"
+    );
     let recorded = serde_json::to_string(original).unwrap_or_default();
     let _ = writeln!(out, "rem {ORIGINAL_PREFIX}{recorded}");
     for part in original {
         let _ = write!(out, "{} ", super::cmd_quote_windows(part));
     }
     out.push_str("%*\n");
-    let _ = writeln!(out, "{} hook codex notify %*", super::cmd_quote_windows(exe));
+    let _ = writeln!(
+        out,
+        "{} hook codex notify %*",
+        super::cmd_quote_windows(exe)
+    );
     out.push_str("exit /b 0\n");
     out
 }
@@ -238,33 +253,40 @@ pub(crate) fn plan_uninstall(env: Env<'_>) -> Result<Plan> {
     let Some(existing) = doc.get("notify").and_then(as_strings) else {
         return Ok(missing_plan(path));
     };
-    if !is_ours(&existing) {
+
+    // A `--chain` install points `notify` at our wrapper script instead of at us directly, so
+    // `is_ours` (which looks for our own `hook codex notify` tail) never matches it; recognise it
+    // instead by `notify` being exactly our wrapper's path, with the wrapper file itself still
+    // carrying our marker (so a stale wrapper left over from an old, no-longer-active chain is
+    // not mistaken for one that is still wired in).
+    let wrapper_path = wrapper_path(&path);
+    let wrapper_before = super::read_optional(&wrapper_path)?;
+    let is_chained = existing.len() == 1
+        && existing[0] == wrapper_path.to_string_lossy()
+        && wrapper_before.as_deref().is_some_and(is_our_wrapper);
+
+    if !is_ours(&existing) && !is_chained {
         return Ok(missing_plan(path));
     }
 
-    let wrapper_path = wrapper_path(&path);
-    let wrapper_before = super::read_optional(&wrapper_path)?;
     let mut changes = Vec::new();
-    match &wrapper_before {
-        Some(bytes) if is_our_wrapper(bytes) => {
-            let text = String::from_utf8_lossy(bytes);
-            match parse_recorded_original(&text) {
-                Some(original) => set_notify(&mut doc, &original),
-                None => {
-                    doc.as_table_mut().remove("notify");
-                }
+    if is_chained {
+        let text = String::from_utf8_lossy(wrapper_before.as_deref().unwrap_or_default());
+        match parse_recorded_original(&text) {
+            Some(original) => set_notify(&mut doc, &original),
+            None => {
+                doc.as_table_mut().remove("notify");
             }
-            changes.push(Change {
-                path: wrapper_path,
-                before: wrapper_before,
-                after: Vec::new(),
-                delete: true,
-                executable: false,
-            });
         }
-        _ => {
-            doc.as_table_mut().remove("notify");
-        }
+        changes.push(Change {
+            path: wrapper_path,
+            before: wrapper_before,
+            after: Vec::new(),
+            delete: true,
+            executable: false,
+        });
+    } else {
+        doc.as_table_mut().remove("notify");
     }
     changes.push(file_change(path.clone(), before, doc));
     Ok(Plan {

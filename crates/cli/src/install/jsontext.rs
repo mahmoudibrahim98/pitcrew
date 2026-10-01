@@ -195,15 +195,16 @@ pub(crate) fn array(b: &[u8], open: usize) -> Arr {
         elements.push(e);
         i = next;
     }
-    Arr {
-        elements,
-        close: i,
-    }
+    Arr { elements, close: i }
 }
 
 /// Removes one entry (object member or array element) from `doc`, keeping the container valid:
 /// a non-last entry is deleted together with its own trailing comma; the last entry is deleted
-/// together with the comma that used to follow the previous one (there is none to put back).
+/// together with the comma that used to follow the previous one (there is none to put back). The
+/// only remaining entry is deleted together with one surrounding `\n` + indent run on each side
+/// (at most one, matching exactly what `append`'s empty-container branch would have added),
+/// leaving the container exactly as it was before that entry's own insertion — not just its own
+/// span, which would otherwise leave an orphaned blank line behind.
 #[must_use]
 pub(crate) fn remove(doc: &str, entries: &[Entry], index: usize) -> String {
     let e = entries[index];
@@ -212,7 +213,22 @@ pub(crate) fn remove(doc: &str, entries: &[Entry], index: usize) -> String {
     } else if index > 0 {
         (entries[index - 1].value_end, e.end)
     } else {
-        (e.start, e.end)
+        let bytes = doc.as_bytes();
+        let mut start = e.start;
+        while start > 0 && matches!(bytes[start - 1], b' ' | b'\t') {
+            start -= 1;
+        }
+        if start > 0 && bytes[start - 1] == b'\n' {
+            start -= 1;
+        }
+        let mut end = e.end;
+        while end < bytes.len() && matches!(bytes[end], b' ' | b'\t') {
+            end += 1;
+        }
+        if end < bytes.len() && bytes[end] == b'\n' {
+            end += 1;
+        }
+        (start, end)
     };
     format!("{}{}", &doc[..del_start], &doc[del_end..])
 }

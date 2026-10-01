@@ -164,7 +164,10 @@ pub(crate) fn plan_uninstall(env: Env<'_>) -> Result<Plan> {
                 Ok(Plan {
                     target: Target::OpenCode,
                     status: Status::Conflicting,
-                    detail: format!("{} was not created by pitcrew; leaving it alone", path.display()),
+                    detail: format!(
+                        "{} was not created by pitcrew; leaving it alone",
+                        path.display()
+                    ),
                     changes: vec![],
                 })
             }
@@ -233,6 +236,9 @@ mod tests {
         let plan = plan_uninstall(&env).unwrap();
         assert!(plan.status == Status::Conflicting);
         assert!(plan.changes.is_empty());
-        assert_eq!(std::fs::read_to_string(&p).unwrap(), "// someone else's plugin\n");
+        assert_eq!(
+            std::fs::read_to_string(&p).unwrap(),
+            "// someone else's plugin\n"
+        );
     }
 }

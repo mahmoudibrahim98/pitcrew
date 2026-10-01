@@ -22,7 +22,6 @@ use crate::config::Env;
 use crate::error::{Error, Kind, Result};
 use crate::{HooksAction, Io};
 use std::fmt::Write as _;
-use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -125,11 +124,13 @@ fn config_dir(env: Env<'_>, var_name: &str, default_subdir: &str) -> Result<Path
     if let Some(dir) = env_str(env, var_name) {
         return Ok(PathBuf::from(dir));
     }
-    user_home(env).map(|h| h.join(default_subdir)).ok_or_else(|| {
-        Error::invalid(format!(
-            "cannot find the home directory for {var_name}'s default; set {var_name} or HOME"
-        ))
-    })
+    user_home(env)
+        .map(|h| h.join(default_subdir))
+        .ok_or_else(|| {
+            Error::invalid(format!(
+                "cannot find the home directory for {var_name}'s default; set {var_name} or HOME"
+            ))
+        })
 }
 
 /// Set (in debug builds only) to make `install`/`diff` act as if `pitcrew` were installed at this
@@ -189,12 +190,20 @@ fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
     match std::fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(Error::internal(format!("cannot read {}: {e}", path.display()))),
+        Err(e) => Err(Error::internal(format!(
+            "cannot read {}: {e}",
+            path.display()
+        ))),
     }
 }
 
 /// Runs one `hooks` subcommand.
-pub(crate) fn dispatch(action: HooksAction, env: Env<'_>, io: &mut Io<'_>, json: bool) -> Result<()> {
+pub(crate) fn dispatch(
+    action: HooksAction,
+    env: Env<'_>,
+    io: &mut Io<'_>,
+    json: bool,
+) -> Result<()> {
     let (engine, action, yes, chain) = match action {
         HooksAction::Status { engine } => (engine.engine, Action::Status, false, false),
         HooksAction::Diff { engine, chain } => (engine.engine, Action::Diff, false, chain),
@@ -309,7 +318,13 @@ fn print_status(io: &mut Io<'_>, plans: &[Plan], json: bool) -> Result<()> {
     }
     let mut out = String::new();
     for p in plans {
-        let _ = writeln!(out, "{:<9} {:<11} {}", p.target.name(), p.status.label(), p.detail);
+        let _ = writeln!(
+            out,
+            "{:<9} {:<11} {}",
+            p.target.name(),
+            p.status.label(),
+            p.detail
+        );
     }
     write_text(io, &out)
 }
@@ -341,7 +356,13 @@ fn print_diff(io: &mut Io<'_>, plans: &[Plan], json: bool) -> Result<()> {
     }
     let mut out = String::new();
     for p in plans {
-        let _ = writeln!(out, "## {} \u{2014} {} ({})", p.target.name(), p.status.label(), p.detail);
+        let _ = writeln!(
+            out,
+            "## {} \u{2014} {} ({})",
+            p.target.name(),
+            p.status.label(),
+            p.detail
+        );
         if p.changes.is_empty() {
             out.push_str("(no change)\n\n");
             continue;
@@ -362,7 +383,13 @@ fn conflict_error(conflicts: &[&Plan]) -> Error {
     )
 }
 
-fn apply_plans(io: &mut Io<'_>, plans: &[Plan], json: bool, yes: bool, uninstalling: bool) -> Result<()> {
+fn apply_plans(
+    io: &mut Io<'_>,
+    plans: &[Plan],
+    json: bool,
+    yes: bool,
+    uninstalling: bool,
+) -> Result<()> {
     let pending: Vec<&Plan> = plans.iter().filter(|p| !p.changes.is_empty()).collect();
     let conflicts: Vec<&Plan> = plans
         .iter()
@@ -509,7 +536,13 @@ fn apply_change(c: &Change) -> Result<()> {
     let result = std::fs::write(&tmp, &c.after)
         .map_err(|e| Error::internal(format!("cannot write {}: {e}", tmp.display())))
         .and_then(|()| copy_permissions(&c.path, &tmp))
-        .and_then(|()| if c.executable { make_executable(&tmp) } else { Ok(()) })
+        .and_then(|()| {
+            if c.executable {
+                make_executable(&tmp)
+            } else {
+                Ok(())
+            }
+        })
         .and_then(|()| {
             std::fs::rename(&tmp, &c.path)
                 .map_err(|e| Error::internal(format!("cannot replace {}: {e}", c.path.display())))
@@ -531,10 +564,7 @@ mod tests {
             shell_quote_unix("/home/sam/my apps/pitcrew"),
             "'/home/sam/my apps/pitcrew'"
         );
-        assert_eq!(
-            shell_quote_unix("it's/pitcrew"),
-            r"'it'\''s/pitcrew'"
-        );
+        assert_eq!(shell_quote_unix("it's/pitcrew"), r"'it'\''s/pitcrew'");
     }
 
     #[test]

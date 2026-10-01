@@ -123,7 +123,14 @@ fn insert_event(doc: &str, exe: &str, event: &str) -> String {
                 brackets(&child_indent, &matcher_object(exe, event))
             );
             let entries: Vec<Entry> = hooks_obj.members.iter().map(|m| m.entry).collect();
-            jsontext::append(doc, &entries, hooks_obj.close, &new_text, &child_indent, &hooks_indent)
+            jsontext::append(
+                doc,
+                &entries,
+                hooks_obj.close,
+                &new_text,
+                &child_indent,
+                &hooks_indent,
+            )
         }
         Some(m) => {
             if bytes.get(m.entry.value_start) != Some(&b'[') {
@@ -162,14 +169,18 @@ fn inspect(doc: &str) -> Result<Vec<bool>> {
     let bytes = doc.as_bytes();
     let start = jsontext::skip_ws(bytes, 0);
     if bytes.get(start) != Some(&b'{') {
-        return Err(Error::invalid("the top level of settings.json is not an object"));
+        return Err(Error::invalid(
+            "the top level of settings.json is not an object",
+        ));
     }
     let root = jsontext::object(bytes, start);
     let Some(hooks_member) = root.members.iter().find(|m| m.key == "hooks") else {
         return Ok(vec![false; EVENTS.len()]);
     };
     if bytes.get(hooks_member.entry.value_start) != Some(&b'{') {
-        return Err(Error::invalid("\"hooks\" in settings.json is not an object"));
+        return Err(Error::invalid(
+            "\"hooks\" in settings.json is not an object",
+        ));
     }
     let hooks_obj = jsontext::object(bytes, hooks_member.entry.value_start);
     let mut installed = Vec::with_capacity(EVENTS.len());
@@ -224,7 +235,12 @@ pub(crate) fn plan_install(env: Env<'_>, exe: &str) -> Result<Plan> {
 
     match serde_json::from_str::<serde_json::Value>(&original) {
         Ok(serde_json::Value::Object(_)) => {}
-        Ok(_) => return Err(Error::invalid(format!("{} is not a JSON object", path.display()))),
+        Ok(_) => {
+            return Err(Error::invalid(format!(
+                "{} is not a JSON object",
+                path.display()
+            )));
+        }
         Err(e) => {
             return Err(Error::invalid(format!(
                 "{} is not valid JSON: {e}",
@@ -353,7 +369,10 @@ fn drop_if_empty(doc: &str, path: &[&str]) -> String {
     if bytes.get(member.entry.value_start) != Some(&b'{') {
         return doc.to_owned();
     }
-    if !jsontext::object(bytes, member.entry.value_start).members.is_empty() {
+    if !jsontext::object(bytes, member.entry.value_start)
+        .members
+        .is_empty()
+    {
         return doc.to_owned();
     }
     let entries: Vec<Entry> = parent.members.iter().map(|m| m.entry).collect();
@@ -384,7 +403,10 @@ pub(crate) fn plan_uninstall(env: Env<'_>) -> Result<Plan> {
         serde_json::from_str::<serde_json::Value>(&original),
         Ok(serde_json::Value::Object(_))
     ) {
-        return Err(Error::invalid(format!("{} is not a valid JSON object", path.display())));
+        return Err(Error::invalid(format!(
+            "{} is not a valid JSON object",
+            path.display()
+        )));
     }
 
     let mut doc = original.clone();
@@ -450,7 +472,10 @@ mod tests {
         assert_eq!(plan.changes.len(), 1);
         let after = String::from_utf8(plan.changes[0].after.clone()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&after).unwrap();
-        assert_eq!(value["hooks"]["Stop"][0]["hooks"][0]["command"], format!("{EXE} hook claude Stop"));
+        assert_eq!(
+            value["hooks"]["Stop"][0]["hooks"][0]["command"],
+            format!("{EXE} hook claude Stop")
+        );
         std::fs::write(&plan.changes[0].path, &after).unwrap();
 
         // Installing again against this file is a no-op.
