@@ -9,6 +9,7 @@ import { createStore, type StoreApi } from 'zustand/vanilla';
 import type { Api } from './api.ts';
 import type { Live } from './live.ts';
 import { DataScope } from './provider.tsx';
+import type { GatewayPrompt, PromptReply, RemoteGateway } from './remote.ts';
 import type { Transport } from './transport.ts';
 
 export type WorkspaceState = 'connecting' | 'ready' | 'unreachable' | 'needs_pairing';
@@ -37,6 +38,16 @@ export interface Gateway {
   onNavigate(listener: (target: unknown) => void): Promise<() => void>;
   /** The transport for a workspace; `name` gives its current name, for messages. */
   transport(id: string, name: () => string): Transport;
+  /**
+   * Remote workspaces and SSH's prompts (`remote.ts`). The real gateway always has them; a test's
+   * gateway may leave them out.
+   */
+  remote?: RemoteGateway | undefined;
+}
+
+/** SSH's questions waiting for an answer, oldest first. Never their answers. */
+export interface PromptQueue {
+  prompts: readonly GatewayPrompt[];
 }
 
 export interface WorkspaceList {
@@ -82,10 +93,20 @@ export interface WorkspaceRegistry {
    * check it against, together, so there is no separate read of the list that could race it.
    */
   onNavigate(listener: (target: unknown, workspaces: readonly GatewayWorkspace[]) => void): Promise<() => void>;
+  /** The gateway's remote commands, if it has them. */
+  readonly remote: RemoteGateway | null;
+  /** `gateway://prompt`s not yet answered or withdrawn. */
+  readonly prompts: StoreApi<PromptQueue>;
+  /**
+   * Answers a prompt and takes it off the queue. The reply goes to the gateway once; nothing
+   * here keeps or logs it, and a failed reply is not retried.
+   */
+  replyPrompt(id: string, reply: PromptReply): void;
 }
 
 export const WorkspacesContext = createContext<WorkspaceRegistry | null>(null);
 const NONE: StoreApi<WorkspaceList> = createStore<WorkspaceList>(() => ({}));
+const NO_PROMPTS: StoreApi<PromptQueue> = createStore<PromptQueue>(() => ({ prompts: [] }));
 
 /** The gateway's workspaces in the desktop app; `null` in a browser, where the hub has one. */
 export function useGatewayWorkspaces(): WorkspacesView | null {
@@ -116,6 +137,28 @@ export function useGatewayNavigate(onTarget: (target: unknown, workspaces: reado
       unlisten?.();
     };
   }, [workspaces, onTarget]);
+}
+
+/**
+ * The gateway's remote commands (connect a machine, remove a workspace) in the desktop app;
+ * `null` in a browser, where there are none, so the UI can say so.
+ */
+export function useRemoteGateway(): RemoteGateway | null {
+  return use(WorkspacesContext)?.remote ?? null;
+}
+
+/** SSH's prompts and how to answer them, in the desktop app; `null` in a browser. */
+export interface GatewayPrompts {
+  /** Oldest first: show the first, the rest wait. */
+  prompts: readonly GatewayPrompt[];
+  reply(id: string, reply: PromptReply): void;
+}
+
+export function useGatewayPrompts(): GatewayPrompts | null {
+  const workspaces = use(WorkspacesContext);
+  const prompts = useStore(workspaces?.prompts ?? NO_PROMPTS, (s) => s.prompts);
+  if (workspaces === null || workspaces.remote === null) return null;
+  return { prompts, reply: (id, reply) => workspaces.replyPrompt(id, reply) };
 }
 
 /** What `WorkspaceScope` shows when it has no workspace to give. */

@@ -12,10 +12,12 @@ import { createApi } from './api.ts';
 import { createGateway } from './gateway.ts';
 import { createLive } from './live.ts';
 import { createQueryClient } from './provider.tsx';
+import type { GatewayPrompt, PromptReply, RemoteGateway } from './remote.ts';
 import {
   WorkspacesContext,
   type Gateway,
   type GatewayWorkspace,
+  type PromptQueue,
   type WorkspaceData,
   type WorkspaceList,
   type WorkspaceRegistry,
@@ -49,7 +51,11 @@ export interface WorkspacesOptions {
 /** The workspaces and their data scopes. No React here. */
 export class Workspaces implements WorkspaceRegistry {
   readonly store: StoreApi<WorkspaceList> = createStore<WorkspaceList>(() => ({}));
+  /** SSH's prompts, never their answers (those live in the dialog's own state only). */
+  readonly prompts: StoreApi<PromptQueue> = createStore<PromptQueue>(() => ({ prompts: [] }));
+  readonly remote: RemoteGateway | null;
   readonly #gateway: Gateway;
+  #unlistenPrompts: Array<() => void> = [];
   readonly #createQueryClient: () => QueryClient;
   readonly #data = new Map<string, WorkspaceData>();
   /** Workspaces opened so far: their streams run, also in the background, until `stop()`. */
@@ -84,6 +90,7 @@ export class Workspaces implements WorkspaceRegistry {
 
   constructor(gateway: Gateway, options: WorkspacesOptions = {}) {
     this.#gateway = gateway;
+    this.remote = gateway.remote ?? null;
     this.#createQueryClient = options.createQueryClient ?? createQueryClient;
     this.#listBackoff = options.listBackoff ?? { initialMs: 1_000, maxMs: 30_000 };
     this.#backgroundMs = options.backgroundMs ?? 10 * 60_000;
@@ -109,6 +116,9 @@ export class Workspaces implements WorkspaceRegistry {
     this.#unlistenWorkspaces = undefined;
     this.#unlistenNavigate?.();
     this.#unlistenNavigate = undefined;
+    for (const unlisten of this.#unlistenPrompts.splice(0)) unlisten();
+    // Nobody is left to answer them; the gateway withdraws or times them out.
+    this.prompts.setState({ prompts: [] });
     if (this.#listTimer !== undefined) clearTimeout(this.#listTimer);
     this.#listTimer = undefined;
     this.#clearPendingNavigate();
@@ -203,6 +213,46 @@ export class Workspaces implements WorkspaceRegistry {
     }
   }
 
+  replyPrompt(id: string, reply: PromptReply): void {
+    if (!this.#dropPrompt(id) || this.remote === null) return;
+    // Not logged, whatever happens: a rejection's message could quote what was sent.
+    this.remote.replyPrompt(id, reply).catch(() => console.warn('pitcrew: the gateway did not take a prompt reply.'));
+  }
+
+  #queuePrompt(prompt: GatewayPrompt): void {
+    const { prompts } = this.prompts.getState();
+    // A prompt asked again (same id) keeps its place, with the newer text.
+    const index = prompts.findIndex((p) => p.id === prompt.id);
+    this.prompts.setState({
+      prompts: index === -1 ? [...prompts, prompt] : prompts.map((p, i) => (i === index ? prompt : p)),
+    });
+  }
+
+  /** Takes a prompt off the queue; false if it was not on it (answered, or withdrawn). */
+  #dropPrompt(id: string): boolean {
+    const { prompts } = this.prompts.getState();
+    if (!prompts.some((p) => p.id === id)) return false;
+    this.prompts.setState({ prompts: prompts.filter((p) => p.id !== id) });
+    return true;
+  }
+
+  /** Follows the gateway's prompts, from the start: a reconnect at launch can ask for a password. */
+  async #followPrompts(current: () => boolean): Promise<void> {
+    const remote = this.remote;
+    if (remote === null) return;
+    const subscribe = async (what: string, start: () => Promise<() => void>) => {
+      try {
+        const unlisten = await start();
+        if (current()) this.#unlistenPrompts.push(unlisten);
+        else unlisten();
+      } catch (error) {
+        if (current()) console.warn(`pitcrew: cannot follow ${what}`, error);
+      }
+    };
+    await subscribe('gateway://prompt', () => remote.onPrompt((prompt) => current() && this.#queuePrompt(prompt)));
+    await subscribe('gateway://prompt-closed', () => remote.onPromptClosed((id) => current() && this.#dropPrompt(id)));
+  }
+
   #cancelLeave(id: string): void {
     const timer = this.#leaving.get(id);
     if (timer !== undefined) {
@@ -237,6 +287,8 @@ export class Workspaces implements WorkspaceRegistry {
     } catch (error) {
       if (current()) console.warn('pitcrew: cannot follow gateway://navigate', error);
     }
+    // Independent of the list: not awaited, so it cannot hold up the first read.
+    void this.#followPrompts(current);
     if (current()) await this.#read(generation);
   }
 
