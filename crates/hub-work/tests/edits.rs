@@ -13,6 +13,8 @@ use pitcrew_protocol::ids::{EventId, ProjectId, ProjectKey};
 use pitcrew_protocol::model::{Project, ProjectStatus, TaskPatch};
 use serde_json::{Value, json};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tower::ServiceExt as _;
 
 const UNKNOWN_PROJECT: &str = "01JB000000000000000PRJ0099";
 const UNKNOWN_WORKSTREAM: &str = "01JB000000000000000WST0099";
@@ -871,4 +873,95 @@ fn project_statuses_default_in_the_command_too() {
         )
         .expect_err("agent");
     assert_eq!(err.code(), pitcrew_protocol::api::ErrorCode::Forbidden);
+}
+
+/// Sends a raw body (not a `serde_json::Value`, which cannot hold a repeated key).
+async fn raw(app: &axum::Router, method: &str, path: &str, body: String) -> (u16, Value) {
+    let mut request = axum::extract::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body))
+        .expect("request");
+    request.extensions_mut().insert(person(SAM));
+    let response = app.clone().oneshot(request).await.expect("infallible");
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    (status, serde_json::from_slice(&bytes).expect("JSON"))
+}
+
+/// A key given twice counts once, with its last value, as `JSON.parse` does in the mock hub.
+#[tokio::test]
+async fn a_repeated_key_takes_its_last_value() {
+    let hub = hub();
+    let res = raw(
+        &hub.app,
+        "PATCH",
+        "/v1/tasks/PAP-1",
+        r#"{"title":"First","title":"Second","labels":["a"],"labels":["b","b"]}"#.to_owned(),
+    )
+    .await;
+    expect(&res, 200);
+    assert_eq!(res.1["title"], "Second");
+    assert_eq!(res.1["labels"], json!(["b"]));
+}
+
+/// Lists as long as a 1 MiB body allows are checked in time linear in their length: every label
+/// repeated, every label distinct (refused at the 33rd), every blocker the same task, unknown
+/// blockers, and as many project members.
+#[tokio::test]
+async fn long_lists_are_checked_without_quadratic_work() {
+    let hub = hub();
+    let budget = Duration::from_secs(5);
+    let timed = |started: Instant, what: &str| {
+        let took = started.elapsed();
+        assert!(took < budget, "{what} took {took:?}");
+    };
+
+    let started = Instant::now();
+    let same = vec!["writing"; 90_000];
+    let res = hub.patch("PAP-2", json!({ "labels": same })).await;
+    expect(&res, 200);
+    assert_eq!(res.1["labels"], json!(["writing"]));
+    timed(started, "90,000 repeated labels");
+
+    let started = Instant::now();
+    let distinct: Vec<String> = (0..80_000).map(|i| format!("l{i}")).collect();
+    expect(
+        &hub.patch("PAP-2", json!({ "labels": distinct })).await,
+        400,
+    );
+    timed(started, "80,000 distinct labels");
+
+    let started = Instant::now();
+    let blockers = vec![PAP8; 30_000];
+    let res = hub.patch("PAP-2", json!({ "blocked_by": blockers })).await;
+    expect(&res, 200);
+    assert_eq!(res.1["blocked_by"], json!([PAP8]));
+    timed(started, "30,000 repeated blockers");
+
+    // Every distinct id is looked up in one query: 20,000 unknown ones are a 400.
+    let started = Instant::now();
+    let unknown: Vec<String> = (0..20_000_u32)
+        .map(|i| format!("01JB000000000000000T{i:06}"))
+        .collect();
+    expect(
+        &hub.patch("PAP-2", json!({ "blocked_by": unknown })).await,
+        400,
+    );
+    timed(started, "20,000 unknown blockers");
+
+    let started = Instant::now();
+    let members = vec![WRITER; 30_000];
+    let res = hub
+        .post(
+            "/v1/projects",
+            json!({ "key": "BIG", "name": "Many members", "members": members }),
+        )
+        .await;
+    expect(&res, 201);
+    assert_eq!(res.1["members"], json!([SAM, WRITER]));
+    timed(started, "30,000 repeated members");
 }

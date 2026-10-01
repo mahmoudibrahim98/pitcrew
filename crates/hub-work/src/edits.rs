@@ -4,6 +4,11 @@
 //! Each command checks the whole request before it changes anything: every `400` comes before the
 //! one `409` (a `blocked_by` cycle, or a project key in use), so a malformed request is a `400` even
 //! when it would also conflict.
+//!
+//! **Bounded work.** A body may be 1 MiB, so lists in it may be long. The checks that need no table
+//! (trimming, lengths, deduplication) run before the command lock, in one pass with a hash set
+//! that stops at the first label past the limit; the checks against the tables take one query per
+//! list (`json_each` over the ids), however long it is. Nothing is quadratic in a list's length.
 
 use crate::commands::{known_member, not_empty, require_person};
 use crate::error::{Result, WorkError};
@@ -11,11 +16,13 @@ use crate::query::{self, TaskRef};
 use crate::service::{WorkService, no_task};
 use pitcrew_protocol::api::{Caller, NewProject, NewWorkstream};
 use pitcrew_protocol::events::EventBody;
-use pitcrew_protocol::ids::{ProjectId, TaskId, WorkstreamId};
+use pitcrew_protocol::ids::{ProjectId, WorkstreamId};
 use pitcrew_protocol::model::{
     Date, Health, Location, Project, ProjectStatus, Task, TaskPatch, Workstream, WorkstreamStatus,
 };
 use pitcrew_store::sql::Connection;
+use std::collections::HashSet;
+use std::hash::Hash;
 
 /// Longest task title, in characters (Unicode code points), after trimming.
 pub const TITLE_CHARS: usize = 500;
@@ -58,49 +65,80 @@ fn known_location(conn: &Connection, location: &Location, field: &str) -> Result
     not_empty(&location.path, &format!("{field}.path"))
 }
 
+/// The list without repeats, the first of each kept, in one pass.
+fn deduplicated<T: Copy + Eq + Hash>(mut list: Vec<T>) -> Vec<T> {
+    let mut seen = HashSet::with_capacity(list.len().min(1024));
+    list.retain(|item| seen.insert(*item));
+    list
+}
+
 /// Labels trimmed and deduplicated (the first stays), each 1 to [`LABEL_CHARS`] characters, at most
-/// [`MAX_LABELS`].
-fn checked_labels(labels: Vec<String>) -> Result<Vec<String>> {
-    let mut out: Vec<String> = Vec::with_capacity(labels.len());
+/// [`MAX_LABELS`]. One pass, which stops at the first bad label or at the first distinct label past
+/// the limit, so a long list costs no more than reading it.
+fn checked_labels(labels: &[String]) -> Result<Vec<String>> {
+    let mut seen: HashSet<&str> = HashSet::with_capacity(MAX_LABELS + 1);
+    let mut out = Vec::new();
     for label in labels {
         let label = label.trim();
-        if !out.iter().any(|l| l == label) {
-            out.push(label.to_owned());
+        // `len` first: a label of more bytes than 4 per character allowed is too long anyway.
+        if label.is_empty() || label.len() > LABEL_CHARS * 4 || label.chars().count() > LABEL_CHARS
+        {
+            return Err(WorkError::invalid(format!(
+                "Each label must be 1 to {LABEL_CHARS} characters after trimming; {:?} is not.",
+                label.chars().take(LABEL_CHARS + 1).collect::<String>()
+            )));
         }
-    }
-    if let Some(bad) = out
-        .iter()
-        .find(|l| l.is_empty() || l.chars().count() > LABEL_CHARS)
-    {
-        return Err(WorkError::invalid(format!(
-            "Each label must be 1 to {LABEL_CHARS} characters after trimming; {bad:?} is not."
-        )));
-    }
-    if out.len() > MAX_LABELS {
-        return Err(WorkError::invalid(format!(
-            "A task has at most {MAX_LABELS} labels; this one would have {}.",
-            out.len()
-        )));
+        if seen.insert(label) {
+            out.push(label.to_owned());
+            if out.len() > MAX_LABELS {
+                return Err(WorkError::invalid(format!(
+                    "A task has at most {MAX_LABELS} labels; this one would have more."
+                )));
+            }
+        }
     }
     Ok(out)
 }
 
-/// Checks a patch against api-v1's rules for `task`, and returns it normalised: the title trimmed,
-/// labels trimmed and deduplicated, blockers deduplicated. A `blocked_by` cycle is checked last,
-/// so every `400` comes before the `409`.
-fn checked_patch(conn: &Connection, task: &Task, patch: TaskPatch) -> Result<TaskPatch> {
-    let TaskPatch {
-        workstream,
+/// The checks of a patch that need no table, before the command lock: the title trimmed and
+/// bounded, labels checked ([`checked_labels`]), dates well formed and in order when the patch
+/// sets both, blockers deduplicated.
+fn normalized_patch(patch: TaskPatch) -> Result<TaskPatch> {
+    let title = match patch.title {
+        Some(title) => {
+            let trimmed = title.trim();
+            let too_long = trimmed.len() > TITLE_CHARS * 4 || trimmed.chars().count() > TITLE_CHARS;
+            if trimmed.is_empty() || too_long {
+                return Err(WorkError::invalid(format!(
+                    "title must be 1 to {TITLE_CHARS} characters after trimming."
+                )));
+            }
+            Some(trimmed.to_owned())
+        }
+        None => None,
+    };
+    let labels = patch.labels.as_deref().map(checked_labels).transpose()?;
+    for (date, field) in [(&patch.start, "start"), (&patch.due, "due")] {
+        if let Some(Some(date)) = date {
+            well_formed(date, field)?;
+        }
+    }
+    if let (Some(Some(start)), Some(Some(due))) = (&patch.start, &patch.due) {
+        start_before_due(Some(start), Some(due))?;
+    }
+    Ok(TaskPatch {
         title,
-        description,
-        priority,
         labels,
-        start,
-        due,
-        blocked_by,
-        accept_auto,
-    } = patch;
-    if let Some(Some(id)) = &workstream {
+        blocked_by: patch.blocked_by.map(deduplicated),
+        ..patch
+    })
+}
+
+/// The checks of a normalised patch against the tables, for `task`: the workstream belongs to the
+/// task's project; blockers exist and are not the task; start and due are in order as the task
+/// will be; and last, so every `400` comes first, `blocked_by` closes no cycle (`409`).
+fn checked_patch(conn: &Connection, task: &Task, patch: TaskPatch) -> Result<TaskPatch> {
+    if let Some(Some(id)) = &patch.workstream {
         let found = query::workstream(conn, id)?
             .ok_or_else(|| WorkError::invalid(format!("workstream: no workstream {id}.")))?;
         if found.project != task.project {
@@ -110,76 +148,36 @@ fn checked_patch(conn: &Connection, task: &Task, patch: TaskPatch) -> Result<Tas
             )));
         }
     }
-    let title = match title {
-        Some(title) => {
-            let trimmed = title.trim();
-            let chars = trimmed.chars().count();
-            if chars == 0 || chars > TITLE_CHARS {
-                return Err(WorkError::invalid(format!(
-                    "title must be 1 to {TITLE_CHARS} characters after trimming."
-                )));
-            }
-            Some(trimmed.to_owned())
-        }
-        None => None,
-    };
-    let labels = labels.map(checked_labels).transpose()?;
-    for (date, field) in [(&start, "start"), (&due, "due")] {
-        if let Some(Some(date)) = date {
-            well_formed(date, field)?;
-        }
-    }
     // The rule holds for the task as it will be: a new start against the current due, and the
     // other way round.
-    let will_start = start.as_ref().map_or(task.start.as_ref(), Option::as_ref);
-    let will_be_due = due.as_ref().map_or(task.due.as_ref(), Option::as_ref);
+    let will_start = patch
+        .start
+        .as_ref()
+        .map_or(task.start.as_ref(), Option::as_ref);
+    let will_be_due = patch.due.as_ref().map_or(task.due.as_ref(), Option::as_ref);
     start_before_due(will_start, will_be_due)?;
-    let blocked_by = match blocked_by {
-        Some(ids) => {
-            let mut out: Vec<TaskId> = Vec::with_capacity(ids.len());
-            for (i, id) in ids.into_iter().enumerate() {
-                if query::task(conn, &TaskRef::Id(id))?.is_none() {
-                    return Err(WorkError::invalid(format!(
-                        "blocked_by[{i}]: no task {id}."
-                    )));
-                }
-                if id == task.id {
-                    return Err(WorkError::invalid(format!(
-                        "{} cannot be blocked by itself.",
-                        task.key
-                    )));
-                }
-                if !out.contains(&id) {
-                    out.push(id);
-                }
-            }
-            Some(out)
+    if let Some(blockers) = &patch.blocked_by {
+        if let Some(i) = blockers.iter().position(|id| *id == task.id) {
+            return Err(WorkError::invalid(format!(
+                "blocked_by[{i}]: {} cannot be blocked by itself.",
+                task.key
+            )));
         }
-        None => None,
-    };
-    if let Some(blockers) = &blocked_by {
-        for blocker in blockers {
-            if query::waits_on(conn, blocker, &task.id)? {
-                let key = query::task(conn, &TaskRef::Id(*blocker))?
-                    .map_or_else(|| blocker.to_string(), |t| t.key.to_string());
-                return Err(WorkError::conflict(format!(
-                    "{key} already waits on {}, so {} cannot wait on it.",
-                    task.key, task.key
-                )));
-            }
+        if let Some((i, id)) = query::first_unknown_task(conn, blockers)? {
+            return Err(WorkError::invalid(format!(
+                "blocked_by[{i}]: no task {id}."
+            )));
+        }
+        if let Some(blocker) = query::first_waiting_on(conn, &task.id, blockers)? {
+            let key = query::task(conn, &TaskRef::Id(blocker))?
+                .map_or_else(|| blocker.to_string(), |t| t.key.to_string());
+            return Err(WorkError::conflict(format!(
+                "{key} already waits on {}, so {} cannot wait on it.",
+                task.key, task.key
+            )));
         }
     }
-    Ok(TaskPatch {
-        workstream,
-        title,
-        description,
-        priority,
-        labels,
-        start,
-        due,
-        blocked_by,
-        accept_auto,
-    })
+    Ok(patch)
 }
 
 /// The fields of `wanted` whose values differ from the task's (lists compared in order).
@@ -216,10 +214,12 @@ impl WorkService {
     /// close a cycle.
     pub fn patch_task(&self, caller: &Caller, task: &TaskRef, patch: TaskPatch) -> Result<Task> {
         require_person(caller, "Editing a task")?;
+        // Checked before the lock; its error waits until the task is known to exist (404 first).
+        let normalized = normalized_patch(patch);
         let _guard = self.lock();
         let (task, changes) = self.read(|c| {
             let task = query::task(c, task)?.ok_or_else(|| no_task(task))?;
-            let wanted = checked_patch(c, &task, patch)?;
+            let wanted = checked_patch(c, &task, normalized?)?;
             let changes = changed_fields(&task, wanted);
             Ok((task, changes))
         })?;
@@ -258,17 +258,12 @@ impl WorkService {
         }
         start_before_due(new.start.as_ref(), new.due.as_ref())?;
         let lead = new.lead.unwrap_or(caller.member);
-        let mut members = Vec::new();
-        for id in new.members.unwrap_or_default() {
-            if !members.contains(&id) {
-                members.push(id);
-            }
-        }
+        let mut members = deduplicated(new.members.unwrap_or_default());
         let _guard = self.lock();
         self.read(|c| {
             known_member(c, &lead, "lead")?;
-            for (i, id) in members.iter().enumerate() {
-                known_member(c, id, &format!("members[{i}]"))?;
+            if let Some((i, id)) = query::first_unknown_member(c, &members)? {
+                return Err(WorkError::invalid(format!("members[{i}]: no member {id}.")));
             }
             if let Some(root) = &new.root {
                 known_location(c, root, "root")?;
@@ -319,10 +314,16 @@ impl WorkService {
         require_person(caller, "Creating a workstream")?;
         not_empty(&new.name, "name")?;
         let locations = new.locations.unwrap_or_default();
+        for (i, location) in locations.iter().enumerate() {
+            not_empty(&location.path, &format!("locations[{i}].path"))?;
+        }
+        let machines: Vec<_> = locations.iter().map(|l| l.machine).collect();
         let _guard = self.lock();
         self.read(|c| {
-            for (i, location) in locations.iter().enumerate() {
-                known_location(c, location, &format!("locations[{i}]"))?;
+            if let Some((i, id)) = query::first_unknown_machine(c, &machines)? {
+                return Err(WorkError::invalid(format!(
+                    "locations[{i}].machine: no machine {id}."
+                )));
             }
             match query::project(c, &new.project)? {
                 Some(_) => Ok(()),
@@ -356,22 +357,30 @@ fn key_in_use(holder: &Project) -> WorkError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pitcrew_protocol::ids::TaskId;
+
+    fn labels(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_owned()).collect()
+    }
 
     #[test]
     fn labels_are_trimmed_deduplicated_and_bounded() {
-        let labels = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         assert_eq!(
-            checked_labels(labels(&[" figures ", "paper", "figures"])).expect("ok"),
+            checked_labels(&labels(&[" figures ", "paper", "figures"])).expect("ok"),
             labels(&["figures", "paper"])
         );
-        assert!(checked_labels(labels(&["ok", "  "])).is_err());
-        assert!(checked_labels(vec!["y".repeat(LABEL_CHARS + 1)]).is_err());
-        assert!(checked_labels(vec!["z".repeat(LABEL_CHARS)]).is_ok());
+        assert!(checked_labels(&labels(&["ok", "  "])).is_err());
+        assert!(checked_labels(&["y".repeat(LABEL_CHARS + 1)]).is_err());
+        assert!(checked_labels(&["z".repeat(LABEL_CHARS)]).is_ok());
         // Code points, not bytes.
-        assert!(checked_labels(vec!["é".repeat(LABEL_CHARS)]).is_ok());
+        assert!(checked_labels(&["é".repeat(LABEL_CHARS)]).is_ok());
         let many: Vec<String> = (0..=MAX_LABELS).map(|i| format!("l{i}")).collect();
-        assert!(checked_labels(many.clone()).is_err());
-        assert!(checked_labels(many[..MAX_LABELS].to_vec()).is_ok());
+        assert!(checked_labels(&many).is_err());
+        assert!(checked_labels(&many[..MAX_LABELS]).is_ok());
+        // Repeats do not count: the limit is on distinct labels.
+        let mut repeated = many[..MAX_LABELS].to_vec();
+        repeated.extend(std::iter::repeat_n(" l0 ".to_owned(), 100_000));
+        assert_eq!(checked_labels(&repeated).expect("ok").len(), MAX_LABELS);
     }
 
     #[test]
@@ -381,5 +390,11 @@ mod tests {
         assert!(start_before_due(Some(&d("2026-10-01")), Some(&d("2026-10-01"))).is_ok());
         assert!(start_before_due(None, Some(&d("2026-10-01"))).is_ok());
         assert!(start_before_due(Some(&d("2026-10-01")), None).is_ok());
+    }
+
+    #[test]
+    fn blockers_and_members_keep_the_first_of_each() {
+        let (a, b) = (TaskId::new(), TaskId::new());
+        assert_eq!(deduplicated(vec![a, b, a, a, b]), [a, b]);
     }
 }
