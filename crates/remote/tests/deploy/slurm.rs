@@ -37,17 +37,17 @@ const TOOLS: [&str; 6] = ["sbatch", "squeue", "scancel", "sacct", "srun", "sinfo
 /// How the fake SLURM behaves: `config.json` in its directory.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
-struct Config {
+pub(crate) struct Config {
     /// Run jobs as soon as they are submitted; else they stay pending until released.
-    start: bool,
+    pub(crate) start: bool,
     /// Why pending jobs wait.
     reason: String,
     /// The node jobs run on.
-    node: String,
+    pub(crate) node: String,
     /// The shell that runs job scripts (the machine's `sh`).
     interpreter: Option<String>,
     /// `$TMPDIR` in jobs.
-    tmpdir: Option<PathBuf>,
+    pub(crate) tmpdir: Option<PathBuf>,
     /// sbatch refuses every job with this message.
     sbatch_error: Option<String>,
     /// squeue fails with this message (the controller is down).
@@ -96,13 +96,13 @@ impl Default for Config {
 
 /// One job: `jobs/<id>.json`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct FakeJob {
+pub(crate) struct FakeJob {
     id: u64,
     name: String,
     uid: u32,
-    state: String,
+    pub(crate) state: String,
     reason: String,
-    node: String,
+    pub(crate) node: String,
     /// The time limit, in seconds; `None` is unlimited.
     limit: Option<u64>,
     /// When it started to run (seconds since the epoch).
@@ -233,6 +233,7 @@ pub(crate) fn act_as_slurm(tool: &str) -> ExitCode {
         "squeue" => squeue(&dir, &config, &args),
         "scancel" => scancel(&dir, &config, &args),
         "sacct" => sacct(&dir, &config, &args),
+        "srun" if args.iter().any(|a| a.starts_with("--jobid=")) => srun_step(&dir, &args),
         "srun" if args.first().map(String::as_str) == Some("--help") => {
             println!("Usage: srun [OPTIONS(0)... [executable(0) [args(0)...]]]");
             println!("  -A, --account=name          charge job to specified account");
@@ -465,6 +466,61 @@ fn run_job(dir: &Path, config: &Config, id: u64) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `srun --jobid=<id> --overlap [--nodes=1 --ntasks=1 --nodelist=<node> --quiet] <command…>`:
+/// a step in a running job of this user's, on its node (this machine), with srun's stdin and
+/// stdout. As real srun, without `--overlap` a job whose resources are all used refuses a step.
+fn srun_step(dir: &Path, args: &[String]) -> ExitCode {
+    let at = args
+        .iter()
+        .position(|a| !a.starts_with("--"))
+        .unwrap_or(args.len());
+    let (options, command) = args.split_at(at);
+    let option = |name: &str| {
+        options
+            .iter()
+            .find_map(|a| a.strip_prefix(&format!("--{name}=")))
+    };
+    let id: u64 = option("jobid").unwrap().parse().unwrap();
+    let job = try_load(dir, id).filter(|j| j.state == "RUNNING");
+    let Some(job) = job else {
+        eprintln!(
+            "srun: error: Unable to confirm allocation for job {id}: Invalid job id specified"
+        );
+        return ExitCode::from(1);
+    };
+    if job.uid != rustix::process::getuid().as_raw() {
+        eprintln!("srun: error: Access/permission denied for job {id}");
+        return ExitCode::from(1);
+    }
+    if !options.iter().any(|a| a == "--overlap") {
+        eprintln!(
+            "srun: Job {id} step creation temporarily disabled, retrying (Requested nodes are \
+             busy)"
+        );
+        return ExitCode::from(1);
+    }
+    if option("nodelist").is_some_and(|n| n != job.node) {
+        eprintln!(
+            "srun: error: Unable to create step for job {id}: Requested node configuration is \
+             not available"
+        );
+        return ExitCode::from(1);
+    }
+    let Some((program, rest)) = command.split_first() else {
+        eprintln!("srun: fatal: No command given to execute.");
+        return ExitCode::from(1);
+    };
+    let err = Command::new(program)
+        .args(rest)
+        .env_remove(SLURM_ENV)
+        .env_remove(DIR_ENV)
+        .env("SLURM_JOB_ID", id.to_string())
+        .env("SLURMD_NODENAME", &job.node)
+        .exec();
+    eprintln!("srun: error: execve(): {program}: {err}");
+    ExitCode::from(2)
+}
+
 fn squeue(dir: &Path, config: &Config, args: &[String]) -> ExitCode {
     if let Some(error) = &config.squeue_error {
         eprintln!("{error}");
@@ -617,12 +673,12 @@ fn sacct(dir: &Path, config: &Config, args: &[String]) -> ExitCode {
 // ─── Fixtures ──────────────────────────────────────────────────────────────────────────────
 
 /// The fake SLURM of one machine.
-struct Sim {
+pub(crate) struct Sim {
     dir: PathBuf,
 }
 
 impl Sim {
-    fn set(&self, change: impl FnOnce(&mut Config)) {
+    pub(crate) fn set(&self, change: impl FnOnce(&mut Config)) {
         let mut config = load_config(&self.dir);
         change(&mut config);
         write_atomic(
@@ -631,11 +687,11 @@ impl Sim {
         );
     }
 
-    fn job(&self, id: u64) -> FakeJob {
+    pub(crate) fn job(&self, id: u64) -> FakeJob {
         load(&self.dir, id)
     }
 
-    fn save(&self, job: &FakeJob) {
+    pub(crate) fn save(&self, job: &FakeJob) {
         save(&self.dir, job);
     }
 
@@ -653,7 +709,7 @@ impl Sim {
 
     /// The node under a running job fails: everything in it is killed, with no time to clean
     /// up.
-    fn fail_node(&self, id: u64) {
+    pub(crate) fn fail_node(&self, id: u64) {
         let mut job = self.job(id);
         job.state = "NODE_FAIL".to_owned();
         job.exit = Some((0, 9));
@@ -662,7 +718,7 @@ impl Sim {
     }
 
     /// The arguments of each call to `tool`.
-    fn calls(&self, tool: &str) -> Vec<Vec<String>> {
+    pub(crate) fn calls(&self, tool: &str) -> Vec<Vec<String>> {
         std::fs::read_to_string(self.dir.join("calls.log"))
             .unwrap_or_default()
             .lines()
@@ -710,11 +766,11 @@ fn machine_with(sh: Option<&Path>, config: Config) -> (Machine, Sim) {
     (m, sim)
 }
 
-fn machine(config: Config) -> (Machine, Sim) {
+pub(crate) fn machine(config: Config) -> (Machine, Sim) {
     machine_with(None, config)
 }
 
-fn options() -> LaunchOptions {
+pub(crate) fn options() -> LaunchOptions {
     LaunchOptions {
         ready_timeout: Duration::from_secs(15),
         stop_timeout: Duration::from_secs(10),
@@ -725,7 +781,7 @@ fn options() -> LaunchOptions {
 }
 
 /// The script for `site` and `job`, with a short wait in the job.
-fn render(target: &Target, site: &Site, job: &JobOptions) -> JobScript {
+pub(crate) fn render(target: &Target, site: &Site, job: &JobOptions) -> JobScript {
     JobSpec::new(site, job)
         .unwrap()
         .with_wait(Duration::from_secs(10))
@@ -734,7 +790,7 @@ fn render(target: &Target, site: &Site, job: &JobOptions) -> JobScript {
         .unwrap()
 }
 
-fn launcher(script: &JobScript) -> SlurmLauncher {
+pub(crate) fn launcher(script: &JobScript) -> SlurmLauncher {
     SlurmLauncher::new(options()).with_script(script.clone())
 }
 

@@ -15,12 +15,14 @@
 //! `PITCREW_TEST_SHELLS` (`:`-separated paths, as for `login_shells.rs`) adds a run of the whole
 //! flow with each POSIX shell among them as the machine's `sh`.
 //!
-//! The SLURM launcher's cases are in `deploy/slurm.rs`, where the binary also plays SLURM.
+//! The SLURM launcher's cases are in `deploy/slurm.rs`, where the binary also plays SLURM; the
+//! tunnel's and the stdio bridge's are in `deploy/tunnel.rs`, where the fake `ssh` also plays
+//! links (ControlMasters), forwards and channels.
 //!
-//! Nothing a case starts outlives it: everything started on a fake machine carries this run's
-//! mark in its environment, and after each case (passed or panicked) the runner waits a little,
-//! kills what still carries it, and fails the case if there was any. At the end it checks that
-//! nothing is left. (Linux only: it reads `/proc`.)
+//! Nothing a case starts outlives it: everything started on a fake machine (the fake `ssh`
+//! itself included) carries this run's mark in its environment, and after each case (passed or
+//! panicked) the runner waits a little, kills what still carries it, and fails the case if there
+//! was any. At the end it checks that nothing is left. (Linux only: it reads `/proc`.)
 
 // Test code; clippy's allow-unwrap-in-tests only sees `#[test]` functions.
 #![allow(clippy::unwrap_used)]
@@ -41,6 +43,10 @@ fn main() -> ExitCode {
 #[cfg(unix)]
 #[path = "deploy/slurm.rs"]
 mod slurm;
+
+#[cfg(unix)]
+#[path = "deploy/tunnel.rs"]
+mod tunnel;
 
 #[cfg(unix)]
 mod unix {
@@ -152,9 +158,27 @@ mod unix {
     }
 
     fn act_as_ssh() -> Option<u8> {
-        let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+        let exe = std::env::current_exe().ok()?;
+        let dir = exe.parent()?.to_path_buf();
         let remote: Remote =
             serde_json::from_str(&std::fs::read_to_string(dir.join(REMOTE)).ok()?).ok()?;
+        // The fake itself carries the run's mark too, so that one left running (a tunnel's
+        // link, say) is found: started without it (the tunnel gives ssh a minimal
+        // environment), it starts again with it.
+        if std::env::var_os(RUN_ENV).is_none()
+            && let Some((_, mark)) = remote.env.iter().find(|(k, _)| k == RUN_ENV)
+        {
+            let err = Command::new(&exe)
+                .args(std::env::args_os().skip(1))
+                .env(RUN_ENV, mark)
+                .exec();
+            eprintln!("fake ssh: cannot mark itself: {err}");
+            return Some(255);
+        }
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if let Some(code) = crate::tunnel::fake(&remote, &dir, &args) {
+            return Some(code);
+        }
         Some(fake_ssh(&remote, &dir))
     }
 
@@ -321,7 +345,7 @@ mod unix {
 
     /// Undoes the shell-neutral wrapper:
     /// `/bin/sh -c 'unset -f printf 2>/dev/null; eval "$(printf "\ooo…")"'`.
-    fn decode(wrapped: &str) -> Option<String> {
+    pub(crate) fn decode(wrapped: &str) -> Option<String> {
         let escapes = wrapped
             .strip_prefix("/bin/sh -c 'unset -f printf 2>/dev/null; eval \"$(printf \"")?
             .strip_suffix("\")\"'")?;
@@ -336,9 +360,22 @@ mod unix {
         String::from_utf8(bytes).ok()
     }
 
-    /// `pitcrewd serve --listen unix:<path>`: binds the socket and waits to be killed. `exit`
-    /// fails at once, saying why on stderr; `nosocket` never binds.
+    /// `pitcrewd serve --listen unix:<path>`: binds the socket, serves each connection (see
+    /// [`crate::tunnel::serve_connection`]) and waits to be killed. `exit` fails at once, saying
+    /// why on stderr; `nosocket` never binds. `connect --socket <path>` is the real stdio bridge.
     fn act_as_daemon(mode: &str) -> ExitCode {
+        if mode == "connect" {
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            return match args.as_slice() {
+                [connect, flag, socket] if connect == "connect" && flag == "--socket" => {
+                    pitcrew_remote::bridge::run(Path::new(socket))
+                }
+                _ => {
+                    eprintln!("usage: pitcrewd connect --socket <path>");
+                    ExitCode::from(pitcrew_remote::bridge::EXIT_USAGE)
+                }
+            };
+        }
         let socket = std::env::args()
             .skip(1)
             .find_map(|a| a.strip_prefix("unix:").map(PathBuf::from));
@@ -362,8 +399,9 @@ mod unix {
                 let _ = std::fs::remove_file(&socket);
                 let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
                 println!("fake pitcrewd listening");
-                for stream in listener.incoming() {
-                    drop(stream);
+                for stream in listener.incoming().flatten() {
+                    let socket = socket.clone();
+                    std::thread::spawn(move || crate::tunnel::serve_connection(stream, &socket));
                 }
                 ExitCode::SUCCESS
             }
@@ -439,9 +477,21 @@ mod unix {
         }
     }
 
+    /// Deploys the stand-in helper (1.0.0) to `m` and starts it with the direct launcher.
+    pub(crate) fn deploy_and_start(m: &Machine) {
+        let target = m.plain();
+        block_on(deploy(&target, &helper("1.0.0"), &quick())).unwrap();
+        block_on(DirectLauncher::new(launch_options()).start(&target)).unwrap();
+    }
+
+    /// Stops the helper [`deploy_and_start`] started.
+    pub(crate) fn stop_helper(m: &Machine) {
+        block_on(DirectLauncher::new(launch_options()).stop(&m.plain())).unwrap();
+    }
+
     /// `pitcrewd`, played by this binary: a hard link (or copy) named so that the process's
     /// name is `pitcrewd`, as the launchers check.
-    fn daemon() -> PathBuf {
+    pub(crate) fn daemon() -> PathBuf {
         static DIR: Mutex<Option<tempfile::TempDir>> = Mutex::new(None);
         let mut dir = DIR.lock().unwrap();
         let dir = dir.get_or_insert_with(|| {
@@ -475,10 +525,11 @@ mod unix {
             "#!/bin/sh\n\
              case \"$1\" in\n\
              --version) echo 'pitcrewd {version} (protocol 1)' ;;\n\
-             serve) echo \"pitcrewd script: $0\" >&2; {trap}{DAEMON_ENV}={mode} exec '{}' \"$@\" ;;\n\
+             serve) echo \"pitcrewd script: $0\" >&2; {trap}{DAEMON_ENV}={mode} exec '{daemon}' \"$@\" ;;\n\
+             connect) {DAEMON_ENV}=connect exec '{daemon}' \"$@\" ;;\n\
              *) exit 2 ;;\n\
              esac\n",
-            daemon().display()
+            daemon = daemon().display()
         );
         if padding > 0 {
             script.push_str(&format!("# {}\n", "x".repeat(padding)));
@@ -2478,7 +2529,12 @@ mod unix {
                 everything_under_every_posix_sh,
             ),
         ];
-        let cases: Vec<(&str, fn())> = cases.iter().chain(slurm::CASES).copied().collect();
+        let cases: Vec<(&str, fn())> = cases
+            .iter()
+            .chain(slurm::CASES)
+            .chain(crate::tunnel::CASES)
+            .copied()
+            .collect();
         let filters: Vec<String> = std::env::args()
             .skip(1)
             .filter(|a| !a.starts_with('-'))

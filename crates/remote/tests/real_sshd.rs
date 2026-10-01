@@ -97,3 +97,154 @@ async fn deploys_to_a_real_host() {
     assert_eq!(status.state, HelperState::NotRunning);
     assert_eq!(status.installed.as_deref(), Some("0.0.0-test"));
 }
+
+#[cfg(unix)]
+mod tunnel {
+    use super::host;
+    use pitcrew_remote::helper::{HelperFuture, Started, Status, Stopped};
+    use pitcrew_remote::{
+        Connector, ConnectorOptions, Daemon, Endpoint, HelperError, HelperState, Launcher, Layout,
+        LinkState, Platform, Ssh, Target, Transport,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// A launcher that says the helper runs at `endpoint`.
+    #[derive(Debug)]
+    struct Fixed(Endpoint);
+
+    impl Launcher for Fixed {
+        fn name(&self) -> &'static str {
+            "direct"
+        }
+
+        fn start<'a>(&'a self, _: &'a Target) -> HelperFuture<'a, Started> {
+            Box::pin(async { Err(HelperError::InvalidArgument("not here".to_owned())) })
+        }
+
+        fn status<'a>(&'a self, _: &'a Target) -> HelperFuture<'a, Status> {
+            let endpoint = self.0.clone();
+            Box::pin(async move {
+                Ok(Status {
+                    state: HelperState::Running,
+                    endpoint: Some(endpoint),
+                    installed: None,
+                    socket_ready: true,
+                    tmux_session: None,
+                    slurm: None,
+                })
+            })
+        }
+
+        fn stop<'a>(&'a self, _: &'a Target) -> HelperFuture<'a, Stopped> {
+            Box::pin(async {
+                Ok(Stopped {
+                    pid: None,
+                    forced: false,
+                })
+            })
+        }
+    }
+
+    /// The tunnel through a real OpenSSH: its own ControlMaster, a forward added to it, many
+    /// connections, and everything gone on close. Only on a host that shares this machine's files
+    /// (`localhost`-style), where a stand-in daemon served by this test can be reached; skipped on
+    /// any other.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tunnels_to_a_real_host() {
+        let Some(host) = host() else {
+            eprintln!("skipped: PITCREW_TEST_SSH_HOST is not set");
+            return;
+        };
+        let dir = tempfile::Builder::new().prefix("pc").tempdir().unwrap();
+        let run = dir.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        let socket = run.join("pitcrewd.sock");
+        let ssh = Ssh::default().with_runtime_dir(dir.path().join("rt"));
+        let here = ssh
+            .run(&host, &["test", "-d", run.to_str().unwrap()])
+            .await
+            .unwrap();
+        if !here.success() {
+            eprintln!("skipped: {host} does not share this machine's files");
+            return;
+        }
+        // The stand-in daemon: HTTP for the probe, an echo for the rest.
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let served = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut head = [0u8; 4];
+                    if stream.read_exact(&mut head).await.is_err() {
+                        return;
+                    }
+                    if &head == b"GET " {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                            .await;
+                        return;
+                    }
+                    let _ = stream.write_all(&head).await;
+                    let (mut from, mut to) = stream.split();
+                    let _ = tokio::io::copy(&mut from, &mut to).await;
+                    let _ = to.shutdown().await;
+                });
+            }
+        });
+        let endpoint = Endpoint {
+            pid: std::process::id(),
+            host: "here".to_owned(),
+            version: "1.0.0".to_owned(),
+            started: 0,
+            launcher: "direct".to_owned(),
+            socket: socket.to_str().unwrap().to_owned(),
+            job: None,
+        };
+        let target = Target::with_layout(
+            ssh,
+            &host,
+            Layout::at(dir.path().to_str().unwrap()).unwrap(),
+            Platform::LinuxX86_64,
+        )
+        .unwrap();
+        let connector = Connector::start(
+            Daemon::new(target, Arc::new(Fixed(endpoint))),
+            ConnectorOptions::default(),
+        )
+        .unwrap();
+        let mut state = connector.watch();
+        let connected = tokio::time::timeout(
+            Duration::from_secs(60),
+            state.wait_for(|s| s.is_connected() || matches!(s, LinkState::Unreachable { .. })),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .clone();
+        assert_eq!(
+            connected,
+            LinkState::Connected {
+                transport: Transport::Forwarded
+            }
+        );
+        for i in 0..4u8 {
+            let mut stream = connector.connect().await.unwrap();
+            let data: Vec<u8> = (0..100_000u32).map(|n| (n as u8) ^ i ^ 0x55).collect();
+            stream.write_all(&data).await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut back = Vec::new();
+            stream.read_to_end(&mut back).await.unwrap();
+            assert!(back == data, "the echo differs");
+        }
+        connector.close().await;
+        assert_eq!(connector.state(), LinkState::Closed);
+        served.abort();
+        let left: Vec<_> = std::fs::read_dir(dir.path().join("rt"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with('t'))
+            .collect();
+        assert!(left.is_empty(), "the private directory is left");
+    }
+}
