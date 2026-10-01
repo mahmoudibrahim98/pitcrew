@@ -19,6 +19,9 @@
 //! events, the office gives the same entries, and an event it has seen (by revision) is ignored,
 //! so a replay never acts twice. Its state saves row by row and restores exactly.
 //!
+//! [`RunLog`] is the run log as a store projection (`office.runs`): it replays the rules inside
+//! each append, so `office_runs` rebuilds identically from the log.
+//!
 //! ## The first rules
 //!
 //! - [`DispatchToReview`]: a dispatch finished successfully → move its task to review, as
@@ -44,6 +47,7 @@ mod guard;
 mod office;
 mod rule;
 mod rules;
+mod runlog;
 mod state;
 mod world;
 
@@ -54,6 +58,7 @@ pub use rule::{Context, Memo, Rule};
 pub use rules::{
     DispatchToReview, JobDiverged, QuietWorkstream, RemindStaleAsks, TestsFailing, default_rules,
 };
+pub use runlog::{RUN_LOG, ReadError, RunLog, read_runs};
 pub use state::StateRow;
 pub use world::{
     AskInfo, AskPos, DispatchInfo, MemberInfo, QuietPos, SessionInfo, TaskInfo, WorkstreamInfo,
