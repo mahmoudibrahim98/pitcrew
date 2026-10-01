@@ -40,11 +40,15 @@ fn main() {
         std::process::exit(0);
     }
 
-    exit_after(
-        VERB_DEADLINE,
-        5,
-        Some("pitcrew: gave up waiting for the daemon after 60 s"),
-    );
+    // `hooks …` never talks to the daemon, and `install`/`uninstall` may be waiting on a person
+    // at a confirmation prompt, so it gets no watchdog.
+    if !pitcrew_cli::is_hooks_command(&args) {
+        exit_after(
+            VERB_DEADLINE,
+            5,
+            Some("pitcrew: gave up waiting for the daemon after 60 s"),
+        );
+    }
     // Not locked for the whole run, so the watchdog can still print.
     let mut stdout = std::io::stdout();
     let mut stderr = std::io::stderr();

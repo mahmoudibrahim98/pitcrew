@@ -23,6 +23,11 @@ pitcrew-api.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Format-preserving TOML editing for `pitcrew hooks install` on Codex's config.toml (keeps the
+# user's comments and layout). MIT OR Apache-2.0; not yet in the workspace table (stream I only).
+# The integrator should consider moving this to the root `[workspace.dependencies]` if another
+# stream needs it too.
+toml_edit = "=0.25.15"
 
 [target.'cfg(unix)'.dependencies]
 pitcrew-auth.workspace = true
