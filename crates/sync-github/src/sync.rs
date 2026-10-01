@@ -3,8 +3,8 @@
 //! the returned state and decides what to do with the changes; this function does no I/O beyond
 //! the `Transport` it is given, and never touches the event log.
 
-use crate::bounds::Limits;
-use crate::change::{UpstreamChange, diff_issue, diff_milestone, diff_pull};
+use crate::bounds::{Limits, MAX_REPORTED_URL_CHARS, cap_chars};
+use crate::change::{UpstreamChange, diff_issue, diff_milestone, diff_pull, expected_web_host};
 use crate::client::{GithubClient, Outcome};
 use crate::state::{ListCache, RepoState, ResumeCursor, SyncState};
 use crate::time::GithubTimestamp;
@@ -162,8 +162,12 @@ enum ResourceResult {
     Error(String),
 }
 
+/// Builds the `SyncIssue` message for a rejected `Link: rel="next"`. `url` is untrusted — it is
+/// exactly what a server (or a proxy in front of it) sent — so it is hidden-character-stripped and
+/// length-capped before going into a message a person reads (round 3 review nit).
 fn blocked_link_message(url: &str) -> String {
-    format!("ignored a paginated \"next\" link outside the configured API base: {url}")
+    let safe = cap_chars(url, MAX_REPORTED_URL_CHARS);
+    format!("ignored a paginated \"next\" link outside the configured API base: {safe}")
 }
 
 async fn sync_issues<T: Transport>(
@@ -171,6 +175,7 @@ async fn sync_issues<T: Transport>(
     repo: &str,
     repo_state: &mut RepoState,
     now_unix: i64,
+    web_host: &str,
     limits: Limits,
 ) -> ResourceResult {
     let mut attempts = repo_state.secondary_backoff_attempts;
@@ -201,7 +206,7 @@ async fn sync_issues<T: Transport>(
                     continue;
                 }
                 let previous = repo_state.issue_snapshots.get(&issue.number);
-                match diff_issue(repo, issue, previous, &mut malformed_fields) {
+                match diff_issue(repo, issue, previous, web_host, &mut malformed_fields) {
                     Some((mut found, snapshot)) => {
                         changes.append(&mut found);
                         repo_state.issue_snapshots.insert(issue.number, snapshot);
@@ -238,6 +243,7 @@ async fn sync_pulls<T: Transport>(
     repo: &str,
     repo_state: &mut RepoState,
     now_unix: i64,
+    web_host: &str,
     limits: Limits,
 ) -> ResourceResult {
     let mut attempts = repo_state.secondary_backoff_attempts;
@@ -291,7 +297,7 @@ async fn sync_pulls<T: Transport>(
             let mut malformed_fields = 0u32;
             for pr in &list.items {
                 let previous = repo_state.pull_snapshots.get(&pr.number);
-                match diff_pull(repo, pr, previous, &mut malformed_fields) {
+                match diff_pull(repo, pr, previous, web_host, &mut malformed_fields) {
                     Some((mut found, snapshot)) => {
                         changes.append(&mut found);
                         repo_state.pull_snapshots.insert(pr.number, snapshot);
@@ -363,6 +369,7 @@ async fn sync_milestones<T: Transport>(
     repo_state: &mut RepoState,
     now_unix: i64,
     now: &GithubTimestamp,
+    web_host: &str,
     limits: Limits,
 ) -> ResourceResult {
     let mut attempts = repo_state.secondary_backoff_attempts;
@@ -388,8 +395,14 @@ async fn sync_milestones<T: Transport>(
             let mut malformed_fields = 0u32;
             for milestone in &list.items {
                 let previous = repo_state.milestone_snapshots.get(&milestone.number);
-                let (mut found, snapshot) =
-                    diff_milestone(repo, milestone, previous, now, &mut malformed_fields);
+                let (mut found, snapshot) = diff_milestone(
+                    repo,
+                    milestone,
+                    previous,
+                    now,
+                    web_host,
+                    &mut malformed_fields,
+                );
                 changes.append(&mut found);
                 repo_state
                     .milestone_snapshots
@@ -436,6 +449,10 @@ async fn sync_with_limits<T: Transport>(
     if let Some(base) = &config.api_base {
         client = client.with_api_base(base.clone());
     }
+    // Derived once for the whole call (round 3 review item S-5): the web host every `html_url`
+    // must match to be trusted. See `expected_web_host`'s doc for why this is not simply
+    // `config.api_base` itself.
+    let web_host = expected_web_host(config.api_base.as_deref());
 
     for repo in &config.repos {
         let owner_repo = repo.as_str();
@@ -450,6 +467,7 @@ async fn sync_with_limits<T: Transport>(
             &mut repo_state,
             config.now_unix,
             &config.now,
+            &web_host,
             limits,
         )
         .await;
@@ -465,6 +483,7 @@ async fn sync_with_limits<T: Transport>(
                     owner_repo,
                     &mut repo_state,
                     config.now_unix,
+                    &web_host,
                     limits,
                 )
                 .await;
@@ -480,6 +499,7 @@ async fn sync_with_limits<T: Transport>(
                             owner_repo,
                             &mut repo_state,
                             config.now_unix,
+                            &web_host,
                             limits,
                         )
                         .await;

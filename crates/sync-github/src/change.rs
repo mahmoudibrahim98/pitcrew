@@ -1,7 +1,9 @@
 //! [`UpstreamChange`]: what changed upstream since the last sync, and the diffing that produces
 //! it from a freshly read item and its last snapshot.
 
-use crate::bounds::{MAX_BODY_CHARS, MAX_TITLE_CHARS, cap_chars, cap_labels, strip_hidden};
+use crate::bounds::{
+    MAX_BODY_CHARS, MAX_TITLE_CHARS, cap_chars, cap_labels, contains_hidden, strip_hidden,
+};
 use crate::links::linked_issues;
 use crate::state::{CloseReason, IssueSnapshot, MilestoneSnapshot, PullSnapshot};
 use crate::time::GithubTimestamp;
@@ -9,27 +11,58 @@ use crate::wire::{WireIssue, WireMilestone, WirePullRequest};
 use pitcrew_protocol::model::{ExternalRef, ExternalSystem};
 use serde::{Deserialize, Serialize};
 
-/// Whether `url` is safe to carry verbatim into an [`ExternalRef`]: only `https`. GitHub.com and
-/// every GitHub Enterprise Server deployment this crate has seen use TLS, so this is a deliberate
-/// decision, not an oversight — plain `http` is rejected too. Round 2 review item R10: a server
-/// could otherwise put anything in `html_url` (`javascript:...`, `data:...`, a bare path, ...) and
-/// have it stored and possibly later treated as directly clickable.
-fn has_trusted_url_scheme(url: &str) -> bool {
-    url::Url::parse(url).is_ok_and(|u| u.scheme() == "https")
+/// The web host an `html_url` must match to be trusted (round 3 review item S-5). GitHub.com's
+/// API and its web UI are on *different* hosts (`api.github.com` vs `github.com`), so this is
+/// derived from, not simply copied from, the configured `api_base`: `None` (the default, talking
+/// to `api.github.com`) means the web host is `github.com`. `Some(api_base)` (GitHub Enterprise
+/// Server) means the web host is GHES's own host — its web UI and its API share one host, just
+/// different paths — found by parsing `api_base`. A wholly malformed `api_base` (this crate's own
+/// configuration, never server data) falls back to its raw text, which then simply never matches
+/// any real `html_url` host, rejecting every one rather than trusting an unintended one.
+pub(crate) fn expected_web_host(api_base: Option<&str>) -> String {
+    match api_base {
+        None => "github.com".to_string(),
+        Some(base) => url::Url::parse(base)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_else(|| base.to_string()),
+    }
 }
 
-/// Resolves `html_url` into the URL an [`ExternalRef`] should carry: the server's own value when
-/// it parses and is `https`, the crate's own constructed fallback otherwise (also used when the
-/// server sent none at all). Increments `*malformed_fields` only for the "sent but rejected" case
-/// — an absent `html_url` is normal, not malformed.
+/// Whether `raw` is safe to carry verbatim into an [`ExternalRef`], returning its *parsed* form
+/// (round 3 review item S-5: the caller stores that, `parsed.as_str()`, not `raw` itself, so the
+/// check and what gets kept can never diverge).
+///
+/// Trusted means: it parses; its scheme is `https` (GitHub.com and every GitHub Enterprise Server
+/// deployment this crate has seen use TLS — a deliberate decision, not an oversight; plain `http`
+/// is rejected too — round 2 review item R10); its host is *exactly* `expected_web_host` (S-5:
+/// round 2's fix checked only the scheme, so a server could still send an `html_url` on any other
+/// `https` host entirely — this pins it to the one web origin this sync is actually about, the
+/// same reasoning `origin::trusted_next_url` uses for the API host); and it contains no hidden or
+/// direction-changing character (S-5 again — unlike title/body/label text, a URL is not safe to
+/// silently *edit*: dropping a character out of it can change what it points to without that
+/// being obvious, so one found in a URL means refusing the whole value, not stripping it).
+fn trusted_html_url(raw: &str, expected_web_host: &str) -> Option<url::Url> {
+    if contains_hidden(raw) {
+        return None;
+    }
+    let parsed = url::Url::parse(raw).ok()?;
+    (parsed.scheme() == "https" && parsed.host_str() == Some(expected_web_host)).then_some(parsed)
+}
+
+/// Resolves `html_url` into the URL an [`ExternalRef`] should carry: the server's own value,
+/// parsed (see [`trusted_html_url`]), when it is trusted, the crate's own constructed fallback
+/// otherwise (also used when the server sent none at all). Increments `*malformed_fields` only
+/// for the "sent but rejected" case — an absent `html_url` is normal, not malformed.
 fn resolved_url(
     html_url: Option<&str>,
+    expected_web_host: &str,
     fallback: impl FnOnce() -> String,
     malformed_fields: &mut u32,
 ) -> String {
-    match html_url {
-        Some(u) if has_trusted_url_scheme(u) => u.to_string(),
-        Some(_) => {
+    match html_url.and_then(|u| trusted_html_url(u, expected_web_host)) {
+        Some(parsed) => parsed.as_str().to_string(),
+        None if html_url.is_some() => {
             *malformed_fields += 1;
             fallback()
         }
@@ -41,6 +74,7 @@ fn issue_ref(
     owner_repo: &str,
     number: u64,
     html_url: Option<&str>,
+    expected_web_host: &str,
     malformed_fields: &mut u32,
 ) -> ExternalRef {
     ExternalRef {
@@ -48,6 +82,7 @@ fn issue_ref(
         key: format!("{owner_repo}#{number}"),
         url: Some(resolved_url(
             html_url,
+            expected_web_host,
             || format!("https://github.com/{owner_repo}/issues/{number}"),
             malformed_fields,
         )),
@@ -58,6 +93,7 @@ fn pull_ref(
     owner_repo: &str,
     number: u64,
     html_url: Option<&str>,
+    expected_web_host: &str,
     malformed_fields: &mut u32,
 ) -> ExternalRef {
     ExternalRef {
@@ -65,6 +101,7 @@ fn pull_ref(
         key: format!("{owner_repo}#{number}"),
         url: Some(resolved_url(
             html_url,
+            expected_web_host,
             || format!("https://github.com/{owner_repo}/pull/{number}"),
             malformed_fields,
         )),
@@ -75,6 +112,7 @@ fn milestone_ref(
     owner_repo: &str,
     number: u64,
     html_url: Option<&str>,
+    expected_web_host: &str,
     malformed_fields: &mut u32,
 ) -> ExternalRef {
     ExternalRef {
@@ -82,6 +120,7 @@ fn milestone_ref(
         key: format!("{owner_repo}#milestone:{number}"),
         url: Some(resolved_url(
             html_url,
+            expected_web_host,
             || format!("https://github.com/{owner_repo}/milestone/{number}"),
             malformed_fields,
         )),
@@ -252,12 +291,14 @@ fn snapshot_of(issue: &WireIssue) -> IssueSnapshot {
 /// well-formed, in which case the whole item is treated as malformed (skipped, and counted by the
 /// caller) rather than snapshotted or diffed with a timestamp that can't be trusted as a cursor.
 /// `*malformed_fields` is incremented once for each of `issue`'s and its milestone's `html_url`
-/// that was present but rejected (an untrusted scheme — R10) and silently replaced by this
-/// crate's own constructed URL; the item itself is still processed normally either way.
+/// that was present but rejected (an untrusted scheme or host, or a hidden character — R10, S-5)
+/// and silently replaced by this crate's own constructed URL; the item itself is still processed
+/// normally either way.
 pub(crate) fn diff_issue(
     owner_repo: &str,
     issue: &WireIssue,
     previous: Option<&IssueSnapshot>,
+    expected_web_host: &str,
     malformed_fields: &mut u32,
 ) -> Option<(Vec<UpstreamChange>, IssueSnapshot)> {
     if !GithubTimestamp::new(&issue.updated_at).is_well_formed() {
@@ -268,6 +309,7 @@ pub(crate) fn diff_issue(
         owner_repo,
         issue.number,
         issue.html_url.as_deref(),
+        expected_web_host,
         malformed_fields,
     );
     let at = next.updated_at.clone();
@@ -276,6 +318,7 @@ pub(crate) fn diff_issue(
             owner_repo,
             m.number,
             m.html_url.as_deref(),
+            expected_web_host,
             malformed_fields,
         )
     });
@@ -367,6 +410,7 @@ pub(crate) fn diff_pull(
     owner_repo: &str,
     pr: &WirePullRequest,
     previous: Option<&PullSnapshot>,
+    expected_web_host: &str,
     malformed_fields: &mut u32,
 ) -> Option<(Vec<UpstreamChange>, PullSnapshot)> {
     if !GithubTimestamp::new(&pr.updated_at).is_well_formed() {
@@ -377,6 +421,7 @@ pub(crate) fn diff_pull(
         owner_repo,
         pr.number,
         pr.html_url.as_deref(),
+        expected_web_host,
         malformed_fields,
     );
     let at = next.updated_at.clone();
@@ -430,6 +475,7 @@ pub(crate) fn diff_milestone(
     milestone: &WireMilestone,
     previous: Option<&MilestoneSnapshot>,
     at: &GithubTimestamp,
+    expected_web_host: &str,
     malformed_fields: &mut u32,
 ) -> (Vec<UpstreamChange>, MilestoneSnapshot) {
     let next = milestone_snapshot_of(milestone);
@@ -437,6 +483,7 @@ pub(crate) fn diff_milestone(
         owner_repo,
         milestone.number,
         milestone.html_url.as_deref(),
+        expected_web_host,
         malformed_fields,
     );
     let mut changes = Vec::new();
@@ -478,6 +525,19 @@ pub(crate) fn diff_milestone(
 mod malformed_timestamp_tests {
     use super::*;
 
+    #[test]
+    fn expected_web_host_is_github_com_by_default_not_the_api_host() {
+        assert_eq!(expected_web_host(None), "github.com");
+    }
+
+    #[test]
+    fn expected_web_host_is_derived_from_a_ghes_api_base() {
+        assert_eq!(
+            expected_web_host(Some("https://ghe.example.com/api/v3")),
+            "ghe.example.com"
+        );
+    }
+
     fn issue(updated_at: &str) -> WireIssue {
         WireIssue {
             number: 1,
@@ -506,6 +566,8 @@ mod malformed_timestamp_tests {
         }
     }
 
+    const GITHUB_COM: &str = "github.com";
+
     #[test]
     fn a_well_formed_issue_timestamp_diffs_normally() {
         let mut malformed_fields = 0u32;
@@ -513,6 +575,7 @@ mod malformed_timestamp_tests {
             "example-org/demo-repo",
             &issue("2026-01-01T00:00:00Z"),
             None,
+            GITHUB_COM,
             &mut malformed_fields,
         );
         assert!(result.is_some());
@@ -527,6 +590,7 @@ mod malformed_timestamp_tests {
                 "example-org/demo-repo",
                 &issue("not-a-timestamp"),
                 None,
+                GITHUB_COM,
                 &mut malformed_fields
             )
             .is_none()
@@ -536,6 +600,7 @@ mod malformed_timestamp_tests {
                 "example-org/demo-repo",
                 &issue("2026-01-01T00:00:00.000Z"),
                 None,
+                GITHUB_COM,
                 &mut malformed_fields
             )
             .is_none(),
@@ -550,6 +615,7 @@ mod malformed_timestamp_tests {
             "example-org/demo-repo",
             &pull("2026-01-01T00:00:00Z"),
             None,
+            GITHUB_COM,
             &mut malformed_fields,
         );
         assert!(result.is_some());
@@ -564,6 +630,7 @@ mod malformed_timestamp_tests {
                 "example-org/demo-repo",
                 &pull(""),
                 None,
+                GITHUB_COM,
                 &mut malformed_fields
             )
             .is_none()
@@ -579,6 +646,7 @@ mod malformed_timestamp_tests {
             "example-org/demo-repo",
             &malicious,
             None,
+            GITHUB_COM,
             &mut malformed_fields,
         )
         .expect("the item itself is still processed");
@@ -594,6 +662,7 @@ mod malformed_timestamp_tests {
             "example-org/demo-repo",
             &http_issue,
             None,
+            GITHUB_COM,
             &mut malformed_fields,
         )
         .expect("the item itself is still processed");
@@ -609,10 +678,91 @@ mod malformed_timestamp_tests {
             "example-org/demo-repo",
             &ok_issue,
             None,
+            GITHUB_COM,
             &mut malformed_fields,
         )
         .expect("well-formed");
         assert_eq!(malformed_fields, 0);
+        assert_eq!(
+            changes[0].source().url.as_deref(),
+            Some("https://github.com/example-org/demo-repo/issues/1")
+        );
+    }
+
+    #[test]
+    fn an_html_url_on_an_unexpected_host_is_untrusted() {
+        // Round 3 review item S-5: round 2's R10 fix checked only the scheme, so a server could
+        // still redirect `html_url` to any other `https` host entirely.
+        let mut malformed_fields = 0u32;
+        let mut redirected = issue("2026-01-01T00:00:00Z");
+        redirected.html_url =
+            Some("https://attacker.example/example-org/demo-repo/issues/1".to_string());
+        diff_issue(
+            "example-org/demo-repo",
+            &redirected,
+            None,
+            GITHUB_COM,
+            &mut malformed_fields,
+        )
+        .expect("the item itself is still processed");
+        assert_eq!(malformed_fields, 1);
+    }
+
+    #[test]
+    fn an_html_url_on_the_ghes_web_host_is_trusted() {
+        let mut malformed_fields = 0u32;
+        let mut on_ghes = issue("2026-01-01T00:00:00Z");
+        on_ghes.html_url =
+            Some("https://ghe.example.com/example-org/demo-repo/issues/1".to_string());
+        let (changes, _snapshot) = diff_issue(
+            "example-org/demo-repo",
+            &on_ghes,
+            None,
+            "ghe.example.com",
+            &mut malformed_fields,
+        )
+        .expect("well-formed");
+        assert_eq!(malformed_fields, 0);
+        assert_eq!(
+            changes[0].source().url.as_deref(),
+            Some("https://ghe.example.com/example-org/demo-repo/issues/1")
+        );
+    }
+
+    #[test]
+    fn an_html_url_with_a_hidden_character_is_untrusted() {
+        let mut malformed_fields = 0u32;
+        let mut spoofed = issue("2026-01-01T00:00:00Z");
+        spoofed.html_url =
+            Some("https://github.com/example-org/demo-repo\u{200B}/issues/1".to_string());
+        diff_issue(
+            "example-org/demo-repo",
+            &spoofed,
+            None,
+            GITHUB_COM,
+            &mut malformed_fields,
+        )
+        .expect("the item itself is still processed");
+        assert_eq!(malformed_fields, 1);
+    }
+
+    #[test]
+    fn an_html_url_is_stored_in_its_parsed_form() {
+        // Round 3 review item S-2/S-5: the stored URL is `Url::parse(..).as_str()`, not the raw
+        // server text, so the check and what is kept can never diverge.
+        let mut malformed_fields = 0u32;
+        let mut ok_issue = issue("2026-01-01T00:00:00Z");
+        // An already-valid URL round-trips unchanged; this mainly documents that the stored value
+        // comes from the parser, not a straight copy of `html_url`.
+        ok_issue.html_url = Some("https://github.com/example-org/demo-repo/issues/1".to_string());
+        let (changes, _snapshot) = diff_issue(
+            "example-org/demo-repo",
+            &ok_issue,
+            None,
+            GITHUB_COM,
+            &mut malformed_fields,
+        )
+        .expect("well-formed");
         assert_eq!(
             changes[0].source().url.as_deref(),
             Some("https://github.com/example-org/demo-repo/issues/1")
@@ -630,6 +780,7 @@ mod malformed_timestamp_tests {
             "example-org/demo-repo",
             &spoofed,
             None,
+            GITHUB_COM,
             &mut malformed_fields,
         )
         .expect("well-formed");

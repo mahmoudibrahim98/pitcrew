@@ -25,6 +25,11 @@ pub const MAX_LABELS: usize = 50;
 /// Cap on one label's length, in characters.
 pub const MAX_LABEL_CHARS: usize = 100;
 
+/// Cap on an untrusted URL's length when it is quoted inside a `SyncIssue` message or a log line
+/// (e.g. a rejected `Link: rel="next"`) — these are diagnostic text for a person to read, not a
+/// place to dump an attacker-sized string.
+pub const MAX_REPORTED_URL_CHARS: usize = 300;
+
 /// Base delay for secondary-rate-limit backoff when the server gives no `retry-after`.
 pub const SECONDARY_BACKOFF_BASE_SECS: i64 = 2;
 
@@ -65,21 +70,43 @@ impl Default for Limits {
 /// Characters that change text direction or are invisible. Dropped from any upstream text this
 /// crate stores or re-emits (round 2 review item R10), so a crafted title, body, label or name
 /// cannot make a change — or anything downstream reading it, such as a summary or a UI list —
-/// display differently from what it actually says. The same character set
-/// `pitcrew_recap::text::clean`'s own `is_hidden` drops, reimplemented here rather than taken as a
-/// dependency on that crate: `pitcrew-recap` depends on sync data flowing *up* to it, not the
-/// other way around, and this check is small enough that duplicating it is cheaper than a new
-/// cross-stream dependency.
+/// display differently from what it actually says, and so a run of Unicode tag characters cannot
+/// smuggle text invisible to a person but readable by another LLM into a title, body or label (a
+/// prompt-injection vector into whatever later reads these fields — round 3 review item S-6).
+///
+/// This is meant to be the *same* character set `pitcrew_recap::text::clean`'s own `is_hidden`
+/// drops, reimplemented here rather than taken as a dependency on that crate (`pitcrew-recap`
+/// depends on sync data flowing *up* to it, not the other way around, and this check is small
+/// enough that duplicating it is cheaper than a new cross-stream dependency) — **when this set
+/// changes, `pitcrew_recap::text::is_hidden` needs the identical change**, or the two diverge on
+/// exactly the kind of input this exists to catch; that crate is owned by stream F, outside this
+/// stream's path ownership, so round 3's addition here (tag characters, soft hyphen, the Mongolian
+/// vowel separator, and the two line/paragraph separators) could not be mirrored there in this
+/// same change and is called out in this round's report instead.
 fn is_hidden(c: char) -> bool {
     matches!(
         c,
-        '\u{061C}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{FEFF}'
+        '\u{00AD}'            // soft hyphen
+            | '\u{061C}'      // Arabic letter mark
+            | '\u{180E}'      // Mongolian vowel separator
+            | '\u{200B}'..='\u{200F}' // zero-width space/joiners, LTR/RTL marks
+            | '\u{2028}'..='\u{2029}' // line/paragraph separator
+            | '\u{202A}'..='\u{202E}' // bidi embedding/override
+            | '\u{2060}'..='\u{2064}' // word joiner, invisible operators
+            | '\u{2066}'..='\u{2069}' // bidi isolates
+            | '\u{FEFF}'      // byte-order mark / zero-width no-break space
+            | '\u{E0000}'..='\u{E007F}' // Unicode tag characters
     )
+}
+
+/// Whether `s` contains any [`is_hidden`] character. For text that gets *stripped* (titles,
+/// bodies, labels, names — see [`strip_hidden`]), silently dropping the character is the right
+/// call. For text where silently editing it would be unsafe — a URL, where dropping a character
+/// changes what it points to without that being obvious — round 3 review item S-5 instead refuses
+/// the whole value outright when this is `true`, rather than storing a silently-modified one.
+#[must_use]
+pub fn contains_hidden(s: &str) -> bool {
+    s.chars().any(is_hidden)
 }
 
 /// Drops [`is_hidden`] characters, keeping everything else untouched. Unlike
@@ -131,6 +158,13 @@ mod tests {
     }
 
     #[test]
+    fn contains_hidden_detects_but_does_not_modify() {
+        assert!(contains_hidden("ab\u{202E}cd"));
+        assert!(!contains_hidden("plain text"));
+        assert!(!contains_hidden(""));
+    }
+
+    #[test]
     fn strip_hidden_drops_bidi_overrides_and_zero_width_characters() {
         assert_eq!(strip_hidden("ab\u{202E}cd"), "abcd");
         assert_eq!(strip_hidden("a\u{200B}b\u{FEFF}c"), "abc");
@@ -138,6 +172,26 @@ mod tests {
         // the hidden/direction-changing set is removed here; any further normalisation is a
         // display-layer concern.
         assert_eq!(strip_hidden("a\nb\tc"), "a\nb\tc");
+    }
+
+    #[test]
+    fn strip_hidden_drops_round_3s_additions() {
+        // Round 3 review item S-6.
+        assert_eq!(strip_hidden("a\u{00AD}b"), "ab", "soft hyphen");
+        assert_eq!(
+            strip_hidden("a\u{180E}b"),
+            "ab",
+            "Mongolian vowel separator"
+        );
+        assert_eq!(
+            strip_hidden("a\u{2028}b\u{2029}c"),
+            "abc",
+            "line/paragraph separator"
+        );
+        // Unicode tag characters: invisible to a person, but a channel some LLMs have been shown
+        // to read as smuggled instruction text — the prompt-injection concern this set exists for.
+        let tagged = format!("hello{}{}", '\u{E0068}', '\u{E0069}');
+        assert_eq!(strip_hidden(&tagged), "hello");
     }
 
     #[test]

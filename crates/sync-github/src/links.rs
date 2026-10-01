@@ -49,6 +49,17 @@ fn strip_quoted_and_code(body: &str) -> String {
     out
 }
 
+/// Whether `s` is safe to treat as one `owner` or `repo` name component of a cross-repo closing
+/// reference (`owner/repo#n`): GitHub's own allowed characters (`[A-Za-z0-9._-]+`), and never
+/// exactly `..` — which passes that character class (both bytes are literally `.`) but is a
+/// reserved path-traversal segment once spliced into a URL (round 3 review item S-5).
+fn is_valid_repo_component(s: &str) -> bool {
+    !s.is_empty()
+        && s != ".."
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+}
+
 /// Parses `#n` (using `default_repo`) or `owner/repo#n` from one trimmed token.
 fn parse_ref(token: &str, default_repo: &str) -> Option<ExternalRef> {
     let token = trim_punct(token);
@@ -59,7 +70,11 @@ fn parse_ref(token: &str, default_repo: &str) -> Option<ExternalRef> {
     let hash = token.find('#')?;
     let (repo, rest) = token.split_at(hash);
     let n: u64 = rest[1..].parse().ok()?;
-    if !repo.is_empty() && repo.matches('/').count() == 1 {
+    let (owner, name) = repo.split_once('/')?;
+    if repo.matches('/').count() == 1
+        && is_valid_repo_component(owner)
+        && is_valid_repo_component(name)
+    {
         return Some(issue_ref(repo, n));
     }
     None
@@ -122,6 +137,22 @@ mod tests {
     fn a_cross_repo_reference() {
         let refs = linked_issues("Fixes other-org/other-repo#45.", REPO);
         assert_eq!(refs[0].key, "other-org/other-repo#45");
+    }
+
+    #[test]
+    fn a_dot_dot_owner_or_repo_is_rejected() {
+        // Round 3 review item S-5: ".." passes a bare `[A-Za-z0-9._-]+` character-class check
+        // (both bytes are literally '.') but is a reserved path-traversal segment once spliced
+        // into `https://github.com/{owner_repo}/issues/{n}`.
+        assert!(linked_issues("Fixes ../evil#1", REPO).is_empty());
+        assert!(linked_issues("Fixes evil/..#1", REPO).is_empty());
+    }
+
+    #[test]
+    fn an_owner_or_repo_with_a_disallowed_character_is_rejected() {
+        // Single tokens (no embedded whitespace), so the scan reaches `parse_ref` at all.
+        assert!(linked_issues("Fixes ow@ner/repo#1", REPO).is_empty());
+        assert!(linked_issues("Fixes owner/rep@o#1", REPO).is_empty());
     }
 
     #[test]
