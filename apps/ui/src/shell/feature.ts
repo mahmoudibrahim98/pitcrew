@@ -4,7 +4,7 @@
 
 import type { AnyRoute } from '@tanstack/react-router';
 import type { ComponentType } from 'react';
-import type { WorkspaceRoute } from './routes.tsx';
+import type { ShellRootRoute, WorkspaceRoute } from './routes.tsx';
 
 /** The two layouts over the same data (ADR-0008). */
 export type LayoutId = 'projects' | 'console';
@@ -17,6 +17,13 @@ declare module '@tanstack/react-router' {
     layout?: LayoutScope;
     /** The page's name in the breadcrumb when no route param names it ("Inbox", "Board"). */
     title?: string;
+    /**
+     * The route serves a workspace that is not set up yet (the first-run wizard, at
+     * `paths.setup`). The shell sends a workspace with `setup_needed` to `paths.setup` from every
+     * other route, but not from this one; shows it without the sidebar and top bar; and never
+     * remembers it as a layout's last page.
+     */
+    setup?: boolean;
   }
 }
 
@@ -99,6 +106,12 @@ export interface Feature {
    * whose path matches one of the shell's placeholders (see README.md) replaces it.
    */
   routes?: (parent: WorkspaceRoute) => AnyRoute[];
+  /**
+   * Routes outside any workspace, for what runs before there is one (the desktop's "connect a
+   * remote machine" wizard, at `paths.connect()`). Called once per router with the root route as
+   * the parent. They render without the frame and without a workspace's data; lazy-load them.
+   */
+  rootRoutes?: (root: ShellRootRoute) => AnyRoute[];
   nav?: readonly NavEntry[];
   commands?: readonly Command[];
   create?: readonly CreateEntry[];

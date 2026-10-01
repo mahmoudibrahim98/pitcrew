@@ -6,7 +6,16 @@ import type { ReactNode } from 'react';
 import type { GatewayWorkspace } from '../../data/index.ts';
 import { Button } from '../../design/index.ts';
 
-export function StatusScreen({ children, onRetry }: { children: ReactNode; onRetry?: () => void }) {
+export function StatusScreen({
+  children,
+  onRetry,
+  action,
+}: {
+  children: ReactNode;
+  onRetry?: () => void;
+  /** What the person can do from here (a button). */
+  action?: ReactNode;
+}) {
   return (
     <main className="grid min-h-dvh place-items-center bg-bg px-6 text-ink">
       <div className="flex flex-col items-center gap-3">
@@ -14,6 +23,7 @@ export function StatusScreen({ children, onRetry }: { children: ReactNode; onRet
           {children}
         </p>
         {onRetry !== undefined && <Button onClick={onRetry}>Retry</Button>}
+        {action}
       </div>
     </main>
   );

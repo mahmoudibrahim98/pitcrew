@@ -19,6 +19,7 @@ import { useGatewayNavigation } from './gateway-navigate.ts';
 import { Notice } from './notice.tsx';
 import { NotFoundPage, RootNotFound } from './pages/not-found.tsx';
 import { OpenLayout, OpenWorkspace } from './pages/open.tsx';
+import { GatewayPrompts } from './prompts.tsx';
 import { composeFeatures, servedPaths, withLayout } from './registry.ts';
 
 function Root() {
@@ -28,6 +29,8 @@ function Root() {
     <>
       <Notice />
       <Outlet />
+      {/* SSH's questions, in the desktop app, whatever is on screen: mounted once, here. */}
+      <GatewayPrompts />
     </>
   );
 }
@@ -35,6 +38,9 @@ function Root() {
 function createShellRoot() {
   return createRootRoute({ component: Root, notFoundComponent: RootNotFound });
 }
+
+/** The parent of every feature's `rootRoutes`: `/`. */
+export type ShellRootRoute = ReturnType<typeof createShellRoot>;
 
 export function createWorkspaceRoute(root: ReturnType<typeof createShellRoot>) {
   return createRoute({
@@ -66,6 +72,7 @@ export function createAppRouter(features: readonly Feature[], options: { history
       ...placeholders,
       ...featureRoutes,
     ]),
+    ...features.flatMap((f) => f.rootRoutes?.(root) ?? []),
   ];
   if (import.meta.env.DEV) {
     children.push(

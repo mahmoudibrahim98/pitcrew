@@ -1,13 +1,14 @@
 // The frame every page lives in: sidebar, top bar, the page, and the Orchestrator panel. It sits
 // inside the workspace's data scope (in the desktop app, each workspace has its own).
 
-import { Outlet, useRouter } from '@tanstack/react-router';
+import { Outlet, useRouter, useRouterState } from '@tanstack/react-router';
 import { lazy, Suspense, useEffect, type MouseEvent } from 'react';
 import {
   useGatewayWorkspace,
   useGatewayWorkspaces,
   useWorkspace,
   WorkspaceScope,
+  type GatewayWorkspace,
   type ScopeFallback,
 } from '../data/index.ts';
 import { TooltipProvider } from '../design/index.ts';
@@ -15,7 +16,9 @@ import { CreateDialog } from './create.tsx';
 import { LayoutMemory, useLayout, useWorkspaceId } from './layout.ts';
 import { OrchestratorPanel } from './orchestrator.tsx';
 import { NotFoundPage } from './pages/not-found.tsx';
+import { Redirect } from './pages/open.tsx';
 import { StatusScreen, WorkspacesFailed, WorkspaceUnavailable } from './pages/unavailable.tsx';
+import { paths } from './paths.ts';
 import { useShellShortcuts } from './shortcuts.ts';
 import { Sidebar } from './sidebar.tsx';
 import { useShell } from './store.ts';
@@ -63,27 +66,51 @@ export function WorkspaceFrame() {
 }
 
 function Frame() {
-  const router = useRouter();
   const ws = useWorkspaceId();
-  const layout = useLayout();
-  const known = useWorkspace().data?.workspace;
+  const info = useWorkspace().data;
   // The gateway's entry, in the desktop app: a workspace it cannot reach shows why, not a page.
   const gateway = useGatewayWorkspace();
   const unavailable = gateway?.state === 'unreachable' || gateway?.state === 'needs_pairing' ? gateway : undefined;
-  const paletteOpen = useShell((s) => s.paletteOpen);
-  const orchestratorOpen = useShell((s) => s.orchestratorOpen);
+  // The first-run wizard's own routes: exempt from the redirect below, and shown bare.
+  const setupRoute = useRouterState({ select: (s) => s.matches.some((m) => m.staticData?.setup === true) });
   const setLastWorkspace = useShell((s) => s.setLastWorkspace);
-  useShellShortcuts(router, ws);
-  usePrefetchPalette();
   useEffect(() => setLastWorkspace(ws), [setLastWorkspace, ws]);
 
-  if (known !== undefined && known.id !== ws) {
+  if (info !== undefined && info.workspace.id !== ws) {
     return (
       <main className="min-h-dvh bg-bg text-ink">
         <NotFoundPage />
       </main>
     );
   }
+  // A hub with no person yet goes through setup first. No loop: the wizard's routes are exempt,
+  // and a finished setup turns `setup_needed` off in the cache before anything navigates.
+  if (info?.setup_needed === true && !setupRoute) {
+    return (
+      <>
+        <Redirect href={paths.setup(ws)} />
+        <StatusScreen>Opening setup…</StatusScreen>
+      </>
+    );
+  }
+  if (setupRoute) {
+    return (
+      <main id="main" tabIndex={-1} className="min-h-dvh bg-bg text-ink outline-none">
+        {unavailable === undefined ? <Outlet /> : <WorkspaceUnavailable workspace={unavailable} />}
+      </main>
+    );
+  }
+  return <FullFrame unavailable={unavailable} />;
+}
+
+function FullFrame({ unavailable }: { unavailable: GatewayWorkspace | undefined }) {
+  const router = useRouter();
+  const ws = useWorkspaceId();
+  const layout = useLayout();
+  const paletteOpen = useShell((s) => s.paletteOpen);
+  const orchestratorOpen = useShell((s) => s.orchestratorOpen);
+  useShellShortcuts(router, ws);
+  usePrefetchPalette();
 
   return (
     <TooltipProvider>

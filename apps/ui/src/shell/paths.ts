@@ -19,4 +19,8 @@ export const paths = {
   task: (ws: string, task: string) => `/w/${seg(ws)}/tasks/${seg(task)}`,
   console: (ws: string) => `/w/${seg(ws)}/console`,
   session: (ws: string, session: string) => `/w/${seg(ws)}/console/${seg(session)}`,
+  /** The first-run wizard: where a workspace with `setup_needed` is sent (filled by onboarding). */
+  setup: (ws: string) => `/w/${seg(ws)}/onboarding`,
+  /** Connect a remote machine, in the desktop app; outside any workspace (filled by onboarding). */
+  connect: () => '/connect',
 };
