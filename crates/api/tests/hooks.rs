@@ -9,7 +9,9 @@ use axum::http::Request;
 use common::{Fixture, call};
 use pitcrew_api::{HookIntake, RouterParts, hooks, local_host_info};
 use pitcrew_auth::TokenStore;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 fn app(f: &Fixture, intake: HookIntake) -> axum::Router {
     let tokens: Arc<dyn TokenStore> = f.tokens.clone();
@@ -122,59 +124,94 @@ async fn the_started_intake_feeds_its_sink() {
     )
     .await;
     assert_eq!(status, 202);
-    for _ in 0..100 {
-        if !sink.0.lock().unwrap().is_empty() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    eventually("the event to reach the sink", || {
+        !sink.0.lock().unwrap().is_empty()
+    })
+    .await;
     assert_eq!(*sink.0.lock().unwrap(), vec!["Stop".to_owned()]);
 }
 
-/// A sink that blocks for a while on every event, and panics on events named `Boom`.
-#[derive(Debug, Default)]
-struct Awkward(std::sync::Mutex<Vec<String>>);
-
-impl pitcrew_api::HookSink for Awkward {
-    fn deliver(&self, event: pitcrew_api::HookEvent) {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        assert!(event.event != "Boom", "the sink panics");
-        self.0.lock().unwrap().push(event.event);
+/// Polls `done` until it holds. The deadline only turns a hang into a failure; nothing here
+/// depends on how fast the machine is.
+async fn eventually(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
-// A single-threaded runtime: a sink that blocked it would stall the requests below.
+/// A sink that blocks every event until the test opens its gate, and panics on events named
+/// `Boom`.
+#[derive(Debug)]
+struct Gated {
+    /// Opened by dropping its sender.
+    gate: Mutex<std::sync::mpsc::Receiver<()>>,
+    /// Events that reached `deliver`.
+    entered: AtomicUsize,
+    /// Events `deliver` finished.
+    delivered: Mutex<Vec<String>>,
+}
+
+impl pitcrew_api::HookSink for Gated {
+    fn deliver(&self, event: pitcrew_api::HookEvent) {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        // The timeout only keeps an intake that wrongly called the sink on the request's own
+        // thread from hanging the test: it would then fail below instead.
+        let _ = self
+            .gate
+            .lock()
+            .unwrap()
+            .recv_timeout(Duration::from_secs(30));
+        assert!(event.event != "Boom", "the sink panics");
+        self.delivered.lock().unwrap().push(event.event);
+    }
+}
+
+// A single-threaded runtime: a sink that ran on it would hold up the requests below.
 #[tokio::test(flavor = "current_thread")]
 async fn a_blocking_or_panicking_sink_never_stalls_requests() {
     let f = Fixture::new();
-    let sink = Arc::new(Awkward::default());
+    let (open, gate) = std::sync::mpsc::channel::<()>();
+    let sink = Arc::new(Gated {
+        gate: Mutex::new(gate),
+        entered: AtomicUsize::new(0),
+        delivered: Mutex::default(),
+    });
     let intake = HookIntake::start(sink.clone(), 8).unwrap();
     let app = app(&f, intake.clone());
-    let started = std::time::Instant::now();
-    for name in ["One", "Boom", "Two"] {
-        let (status, _) = call(
-            app.clone(),
-            post(
-                &format!("/v1/hooks/claude/{name}"),
-                Some(&f.agent_token),
-                "{}",
-            ),
-        )
-        .await;
-        assert_eq!(status, 202);
-    }
-    // Three requests against a sink that takes 150 ms in total answered well before it finished.
-    assert!(started.elapsed() < std::time::Duration::from_millis(100));
-    for _ in 0..200 {
-        if sink.0.lock().unwrap().len() == 2 {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    let hook = |name: &str| {
+        let request = post(
+            &format!("/v1/hooks/claude/{name}"),
+            Some(&f.agent_token),
+            "{}",
+        );
+        call(app.clone(), request)
+    };
+
+    assert_eq!(hook("One").await.0, 202);
+    // The sink is now stuck on the first event, and stays stuck until the gate opens.
+    eventually("the sink to take the first event", || {
+        sink.entered.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(hook("Boom").await.0, 202);
+    assert_eq!(hook("Two").await.0, 202);
+    // All three were answered while the sink had finished none of them.
+    assert_eq!(sink.entered.load(Ordering::SeqCst), 1);
+    assert!(sink.delivered.lock().unwrap().is_empty());
+
+    drop(open);
+    // The panic on `Boom` loses that event only: `Two` still arrives.
+    eventually("both good events to be delivered", || {
+        sink.delivered.lock().unwrap().len() == 2
+    })
+    .await;
     assert_eq!(
-        *sink.0.lock().unwrap(),
+        *sink.delivered.lock().unwrap(),
         vec!["One".to_owned(), "Two".to_owned()]
     );
+    assert_eq!(sink.entered.load(Ordering::SeqCst), 3);
     assert_eq!(intake.dropped(), 0);
 }
 

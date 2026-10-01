@@ -14,6 +14,7 @@ use axum::routing::post;
 use pitcrew_auth::{Authenticated, ErrorResponse};
 use pitcrew_protocol::api::{Caller, ErrorCode};
 use pitcrew_protocol::model::{Engine, TimestampMs};
+use std::any::Any;
 use std::fmt;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -42,7 +43,10 @@ pub struct HookEvent {
 ///
 /// `deliver` runs on a dedicated thread, one event at a time, so it **may block** (e.g. write to
 /// SQLite). While it blocks, new events queue up to the intake's capacity and then are dropped.
-/// A panic in `deliver` is logged and the next event is delivered as usual.
+///
+/// A panic in `deliver` loses that event only: it is logged with its message, and **the sink
+/// keeps receiving** the following events. A sink holding state behind a lock should therefore
+/// cope with a poisoned lock (`PoisonError::into_inner`) rather than panic again.
 pub trait HookSink: Send + Sync + fmt::Debug + 'static {
     /// Handles one event.
     fn deliver(&self, event: HookEvent);
@@ -84,8 +88,11 @@ impl HookIntake {
                 while let Some(event) = events.blocking_recv() {
                     let delivered =
                         std::panic::catch_unwind(AssertUnwindSafe(|| sink.deliver(event)));
-                    if delivered.is_err() {
-                        tracing::error!("the hook sink panicked; continuing with the next event");
+                    if let Err(payload) = delivered {
+                        tracing::error!(
+                            panic = panic_message(&*payload),
+                            "the hook sink panicked; it keeps receiving the next events"
+                        );
                     }
                 }
             })?;
@@ -178,9 +185,29 @@ fn is_event_name(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// The message of a caught panic (`panic!` gives a `&str` or a `String`).
+fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("(a panic without a message)")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_event_name;
+    use super::{is_event_name, panic_message};
+
+    #[test]
+    fn panic_messages() {
+        let caught = |f: fn()| std::panic::catch_unwind(f).unwrap_err();
+        assert_eq!(panic_message(&*caught(|| panic!("plain"))), "plain");
+        let n = 3;
+        let formatted = std::panic::catch_unwind(move || panic!("formatted {n}")).unwrap_err();
+        assert_eq!(panic_message(&*formatted), "formatted 3");
+        let other = std::panic::catch_unwind(|| std::panic::panic_any(7_u8)).unwrap_err();
+        assert_eq!(panic_message(&*other), "(a panic without a message)");
+    }
 
     #[test]
     fn event_names() {

@@ -94,10 +94,10 @@ impl axum::serve::Listener for NamedPipe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::listener::pipe_security::{current_user_sid, dacl_sddl};
+    use crate::listener::pipe_security::{current_user_sid, dacl_sddl, owner_sid};
 
     #[tokio::test]
-    async fn only_the_current_user_has_access() {
+    async fn the_current_user_owns_it_and_alone_has_access() {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -109,5 +109,13 @@ mod tests {
         assert!(sddl.starts_with("D:P"), "{sddl}");
         assert_eq!(sddl.matches("(A;").count(), 1, "{sddl}");
         assert!(sddl.contains(&sid), "{sddl} lacks {sid}");
+        // Named explicitly, so even an elevated daemon's pipe is owned by the user.
+        assert_eq!(owner_sid(&pipe.next).unwrap(), sid);
+        // A client reads the same owner through its own handle.
+        let client = tokio::net::windows::named_pipe::ClientOptions::new()
+            .open(&name)
+            .unwrap();
+        assert_eq!(owner_sid(&client).unwrap(), sid);
+        crate::client::check_pipe_server(&client).unwrap();
     }
 }
