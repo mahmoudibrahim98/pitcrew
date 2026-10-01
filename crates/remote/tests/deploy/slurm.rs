@@ -1,14 +1,14 @@
-// The SLURM launcher against a fake SLURM, included into `deploy.rs`'s `unix` module (whose
-// harness it uses). `sbatch`, `squeue`, `scancel`, `sacct`, `srun` and `sinfo` are this test
-// binary too (`PITCREW_FAKE_SLURM=<tool>`), keeping their state in files beside the machine.
-// Running a job runs its script with the machine's `sh` and the environment sbatch had, in the
-// job's own process group, as slurmstepd would on a compute node: here the compute node is
-// this machine, named `node017`. scancel sends SIGTERM to that group, and SIGKILL after a
-// "KillWait".
+//! The SLURM launcher against a fake SLURM, using `deploy.rs`'s harness. `sbatch`, `squeue`,
+//! `scancel`, `sacct`, `srun` and `sinfo` are this test binary too (`PITCREW_FAKE_SLURM=<tool>`),
+//! keeping their state in files beside the machine. Running a job runs its script with the
+//! machine's `sh` and the environment sbatch had, in the job's own process group, as slurmstepd
+//! would on a compute node: here the compute node is this machine, named `node017`. scancel
+//! sends SIGTERM to that group, and SIGKILL after a "KillWait".
 
-use super::{
-    Machine, Remote, alive, assert_private, block_on, comm, eventually, helper, helper_from,
-    helper_script, me, mode, posix_shells, private_dir, quick, script_len, shim, umask_of,
+use crate::unix::{
+    Machine, RUN_ENV, Remote, alive, assert_private, block_on, comm, eventually, helper,
+    helper_from, helper_script, me, mode, posix_shells, private_dir, quick, run_mark, script_len,
+    shim, umask_of,
 };
 use pitcrew_protocol::model::Scheduler;
 use pitcrew_remote::helper::slurm::{self, Cancelled, JobExit, LastHop, Site, SocketPlace};
@@ -25,7 +25,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, SystemTime};
 
 /// Makes the binary play a SLURM tool, or the fake's own helpers (`run`, `killer`, `release`).
-pub(super) const SLURM_ENV: &str = "PITCREW_FAKE_SLURM";
+pub(crate) const SLURM_ENV: &str = "PITCREW_FAKE_SLURM";
 /// The fake's state directory.
 const DIR_ENV: &str = "PITCREW_FAKE_SLURM_DIR";
 const VERSION: &str = "slurm 23.02.7";
@@ -185,7 +185,7 @@ fn slurm_time(secs: u64) -> String {
     }
 }
 
-pub(super) fn act_as_slurm(tool: &str) -> ExitCode {
+pub(crate) fn act_as_slurm(tool: &str) -> ExitCode {
     let dir = PathBuf::from(std::env::var_os(DIR_ENV).unwrap());
     let args: Vec<String> = std::env::args().skip(1).collect();
     if TOOLS.contains(&tool) {
@@ -223,12 +223,20 @@ pub(super) fn act_as_slurm(tool: &str) -> ExitCode {
         }
         "run" => run_job(&dir, &config, id()),
         "killer" => {
-            std::thread::sleep(Duration::from_secs(config.kill_wait));
-            let job = load(&dir, id());
-            if job.state == "COMPLETING"
-                && let Some(pgid) = job.pgid
-            {
-                kill_group(pgid, rustix::process::Signal::KILL);
+            // KillWait: SIGKILL if the job is still ending then; gone at once if it ended.
+            let deadline = std::time::Instant::now() + Duration::from_secs(config.kill_wait);
+            loop {
+                let job = load(&dir, id());
+                if job.state != "COMPLETING" {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    if let Some(pgid) = job.pgid {
+                        kill_group(pgid, rustix::process::Signal::KILL);
+                    }
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
             }
             ExitCode::SUCCESS
         }
@@ -560,6 +568,7 @@ impl Sim {
         let ok = Command::new(me())
             .env(SLURM_ENV, "release")
             .env(DIR_ENV, &self.dir)
+            .env(RUN_ENV, run_mark())
             .arg(id.to_string())
             .status()
             .unwrap();
@@ -1439,7 +1448,7 @@ fn slurm_under_every_posix_sh() {
     println!("SLURM jobs run with sh = {checked:?}");
 }
 
-pub(super) const CASES: &[(&str, fn())] = &[
+pub(crate) const CASES: &[(&str, fn())] = &[
     (
         "slurm_submit_pending_running_stop",
         slurm_submit_pending_running_stop,

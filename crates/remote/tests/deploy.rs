@@ -16,6 +16,11 @@
 //! flow with each POSIX shell among them as the machine's `sh`.
 //!
 //! The SLURM launcher's cases are in `deploy/slurm.rs`, where the binary also plays SLURM.
+//!
+//! Nothing a case starts outlives it: everything started on a fake machine carries this run's
+//! mark in its environment, and after each case (passed or panicked) the runner waits a little,
+//! kills what still carries it, and fails the case if there was any. At the end it checks that
+//! nothing is left. (Linux only: it reads `/proc`.)
 
 // Test code; clippy's allow-unwrap-in-tests only sees `#[test]` functions.
 #![allow(clippy::unwrap_used)]
@@ -34,12 +39,12 @@ fn main() -> ExitCode {
 }
 
 #[cfg(unix)]
-mod unix {
-    /// The SLURM launcher against a fake SLURM.
-    mod slurm {
-        include!("deploy/slurm.rs");
-    }
+#[path = "deploy/slurm.rs"]
+mod slurm;
 
+#[cfg(unix)]
+mod unix {
+    use crate::slurm;
     use pitcrew_remote::helper::{HashTool, MIN_TMUX, Progress, parse_tmux_version, tmux_name};
     use pitcrew_remote::{
         DeployOptions, DirectLauncher, Endpoint, Helper, HelperError, HelperState, Input,
@@ -97,53 +102,53 @@ mod unix {
 
     /// How the fake `ssh` behaves, from `remote.json` beside it.
     #[derive(Clone, Default, Serialize, Deserialize)]
-    struct Remote {
+    pub(crate) struct Remote {
         #[serde(default)]
-        home: PathBuf,
+        pub(crate) home: PathBuf,
         #[serde(default)]
-        path: String,
+        pub(crate) path: String,
         #[serde(default)]
-        env: Vec<(String, String)>,
+        pub(crate) env: Vec<(String, String)>,
         /// Drop the connection after this many bytes of stdin.
         #[serde(default)]
-        cut_after: Option<u64>,
+        pub(crate) cut_after: Option<u64>,
         /// ...and kill the remote command outright, rather than leave it to see end of file.
         #[serde(default)]
-        kill: bool,
+        pub(crate) kill: bool,
         /// Stop relaying stdin for `pause_ms` after this many bytes (once).
         #[serde(default)]
-        pause_after: Option<u64>,
+        pub(crate) pause_after: Option<u64>,
         #[serde(default)]
-        pause_ms: u64,
+        pub(crate) pause_ms: u64,
         /// Flip the byte at this offset of stdin.
         #[serde(default)]
-        corrupt_at: Option<u64>,
+        pub(crate) corrupt_at: Option<u64>,
         /// For a call running this script command, read nothing and hang.
         #[serde(default)]
-        hang_on: Option<String>,
+        pub(crate) hang_on: Option<String>,
         /// Swallow this many bytes of stdin before the command sees any, as a shell start-up
         /// file that reads stdin would...
         #[serde(default)]
-        eat: Option<u64>,
+        pub(crate) eat: Option<u64>,
         /// ...only in calls running this script command.
         #[serde(default)]
-        eat_on: Option<String>,
+        pub(crate) eat_on: Option<String>,
         /// Run the command's interpreter (`/bin/sh` in the command line) as this shell instead,
         /// and the whole command line with it. Without the wrapper, which `login_shells.rs`
         /// covers.
         #[serde(default)]
-        interpreter: Option<String>,
+        pub(crate) interpreter: Option<String>,
         /// The umask the remote command starts with.
         #[serde(default)]
-        umask: Option<String>,
+        pub(crate) umask: Option<String>,
     }
 
     #[derive(Debug, Serialize, Deserialize)]
-    struct CallLog {
+    pub(crate) struct CallLog {
         /// The command line, unwrapped.
-        line: String,
+        pub(crate) line: String,
         /// Bytes of stdin relayed.
-        stdin: u64,
+        pub(crate) stdin: u64,
     }
 
     fn act_as_ssh() -> Option<u8> {
@@ -390,13 +395,13 @@ mod unix {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    fn me() -> PathBuf {
+    pub(crate) fn me() -> PathBuf {
         let me = std::env::current_exe().unwrap();
         assert!(!me.to_str().unwrap().contains('\''));
         me
     }
 
-    fn which(name: &str) -> Option<PathBuf> {
+    pub(crate) fn which(name: &str) -> Option<PathBuf> {
         let path = std::env::var_os("PATH")?;
         std::env::split_paths(&path)
             .map(|dir| dir.join(name))
@@ -404,7 +409,7 @@ mod unix {
     }
 
     /// A script named `name` in `bin`.
-    fn shim(bin: &Path, name: &str, body: &str) {
+    pub(crate) fn shim(bin: &Path, name: &str, body: &str) {
         let path = bin.join(name);
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -460,7 +465,7 @@ mod unix {
     /// A stand-in helper: a script that answers `--version` and runs the fake daemon for
     /// `serve`. `mode` is the daemon's (`serve`, `exit`, `nosocket`), or `stubborn` for one
     /// that ignores SIGTERM. `padding` bytes of comment make it bigger.
-    fn helper_script(version: &str, mode: &str, padding: usize) -> Vec<u8> {
+    pub(crate) fn helper_script(version: &str, mode: &str, padding: usize) -> Vec<u8> {
         let (trap, mode) = match mode {
             "stubborn" => ("trap '' TERM; ", "serve"),
             other => ("", other),
@@ -480,12 +485,12 @@ mod unix {
         script.into_bytes()
     }
 
-    fn helper_from(version: &str, bytes: Vec<u8>) -> Helper {
+    pub(crate) fn helper_from(version: &str, bytes: Vec<u8>) -> Helper {
         let hash = hex(&Sha256::digest(&bytes));
         Helper::new(Platform::LinuxX86_64, version, &hash, bytes).unwrap()
     }
 
-    fn helper(version: &str) -> Helper {
+    pub(crate) fn helper(version: &str) -> Helper {
         helper_from(version, helper_script(version, "serve", 0))
     }
 
@@ -493,7 +498,7 @@ mod unix {
         helper_from(version, helper_script(version, "serve", padding))
     }
 
-    fn quick() -> DeployOptions {
+    pub(crate) fn quick() -> DeployOptions {
         DeployOptions {
             timeout: Duration::from_secs(60),
             lock_wait: Duration::from_secs(5),
@@ -513,24 +518,24 @@ mod unix {
     }
 
     /// One "remote machine": a home, and a sandbox `PATH`.
-    struct Machine {
-        dir: tempfile::TempDir,
-        home: PathBuf,
-        bin: PathBuf,
-        env: Vec<(String, String)>,
+    pub(crate) struct Machine {
+        pub(crate) dir: tempfile::TempDir,
+        pub(crate) home: PathBuf,
+        pub(crate) bin: PathBuf,
+        pub(crate) env: Vec<(String, String)>,
         /// The shell standing in for `/bin/sh` in the command line, if not `/bin/sh`.
-        interpreter: Option<String>,
-        fakes: AtomicU32,
+        pub(crate) interpreter: Option<String>,
+        pub(crate) fakes: AtomicU32,
     }
 
     /// A fake `ssh` for one machine.
-    struct Fake {
-        dir: PathBuf,
-        ssh: Ssh,
+    pub(crate) struct Fake {
+        pub(crate) dir: PathBuf,
+        pub(crate) ssh: Ssh,
     }
 
     impl Fake {
-        fn calls(&self) -> Vec<CallLog> {
+        pub(crate) fn calls(&self) -> Vec<CallLog> {
             std::fs::read_to_string(self.dir.join(CALLS))
                 .unwrap_or_default()
                 .lines()
@@ -538,29 +543,29 @@ mod unix {
                 .collect()
         }
 
-        fn paused(&self) -> bool {
+        pub(crate) fn paused(&self) -> bool {
             self.dir.join(PAUSED).exists()
         }
     }
 
     impl Machine {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self::build(Path::new("/bin/sh"), |_| {})
         }
 
-        fn with_tools(customize: impl FnOnce(&Path)) -> Self {
+        pub(crate) fn with_tools(customize: impl FnOnce(&Path)) -> Self {
             Self::build(Path::new("/bin/sh"), customize)
         }
 
         /// A machine whose `/bin/sh` is `sh`, run by a link named `sh` (as `/bin/sh` is), so
         /// shells that look at their name (bash, zsh) behave as they would there.
-        fn with_shell(sh: &Path) -> Self {
+        pub(crate) fn with_shell(sh: &Path) -> Self {
             let mut m = Self::build(sh, |_| {});
             m.interpreter = Some(m.bin.join("sh").to_str().unwrap().to_owned());
             m
         }
 
-        fn build(sh: &Path, customize: impl FnOnce(&Path)) -> Self {
+        pub(crate) fn build(sh: &Path, customize: impl FnOnce(&Path)) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let home = dir.path().join("home");
             std::fs::create_dir(&home).unwrap();
@@ -578,7 +583,7 @@ mod unix {
             }
         }
 
-        fn fake(&self, remote: Remote) -> Fake {
+        pub(crate) fn fake(&self, remote: Remote) -> Fake {
             let n = self.fakes.fetch_add(1, Ordering::SeqCst);
             let dir = self.dir.path().join(format!("f{n}"));
             std::fs::create_dir(&dir).unwrap();
@@ -586,7 +591,9 @@ mod unix {
             if std::fs::hard_link(me(), &ssh).is_err() {
                 std::fs::copy(me(), &ssh).unwrap();
             }
-            let mut env = self.env.clone();
+            // Everything the remote command starts carries the run's mark (see `sweep`).
+            let mut env = vec![(RUN_ENV.to_owned(), run_mark().to_owned())];
+            env.extend(self.env.iter().cloned());
             env.extend(remote.env.iter().cloned());
             let path = if remote.path.is_empty() {
                 self.bin.to_str().unwrap().to_owned()
@@ -608,16 +615,16 @@ mod unix {
             Fake { dir, ssh }
         }
 
-        fn layout(&self) -> Layout {
+        pub(crate) fn layout(&self) -> Layout {
             Layout::in_home(self.home.to_str().unwrap()).unwrap()
         }
 
-        fn target(&self, fake: &Fake) -> Target {
+        pub(crate) fn target(&self, fake: &Fake) -> Target {
             self.target_at(fake, self.layout())
         }
 
         /// A target with another root; the tool path is the sandbox.
-        fn target_at(&self, fake: &Fake, layout: Layout) -> Target {
+        pub(crate) fn target_at(&self, fake: &Fake, layout: Layout) -> Target {
             Target::with_layout(fake.ssh.clone(), "cluster", layout, Platform::LinuxX86_64)
                 .unwrap()
                 .with_tool_path(self.bin.to_str().unwrap())
@@ -625,34 +632,34 @@ mod unix {
         }
 
         /// A target through a fake that just relays.
-        fn plain(&self) -> Target {
+        pub(crate) fn plain(&self) -> Target {
             self.target(&self.fake(Remote::default()))
         }
 
-        fn root(&self) -> PathBuf {
+        pub(crate) fn root(&self) -> PathBuf {
             self.home.join(".pitcrew")
         }
 
-        fn bin_dir(&self) -> PathBuf {
+        pub(crate) fn bin_dir(&self) -> PathBuf {
             self.root().join("bin")
         }
 
-        fn run_dir(&self) -> PathBuf {
+        pub(crate) fn run_dir(&self) -> PathBuf {
             self.root().join("run")
         }
 
-        fn lock(&self) -> PathBuf {
+        pub(crate) fn lock(&self) -> PathBuf {
             self.bin_dir().join(".lock")
         }
 
-        fn link(&self, name: &str) -> Option<String> {
+        pub(crate) fn link(&self, name: &str) -> Option<String> {
             std::fs::read_link(self.bin_dir().join(name))
                 .ok()
                 .map(|p| p.to_str().unwrap().to_owned())
         }
 
         /// The version directories, sorted.
-        fn versions(&self) -> Vec<String> {
+        pub(crate) fn versions(&self) -> Vec<String> {
             let mut names: Vec<String> = std::fs::read_dir(self.bin_dir())
                 .unwrap()
                 .map(|e| e.unwrap())
@@ -665,7 +672,7 @@ mod unix {
         }
 
         /// Upload temporaries anywhere under `bin/`.
-        fn temporaries(&self) -> Vec<PathBuf> {
+        pub(crate) fn temporaries(&self) -> Vec<PathBuf> {
             let Ok(dirs) = std::fs::read_dir(self.bin_dir()) else {
                 return Vec::new();
             };
@@ -683,7 +690,7 @@ mod unix {
         }
     }
 
-    fn mode(path: &Path) -> u32 {
+    pub(crate) fn mode(path: &Path) -> u32 {
         std::fs::symlink_metadata(path)
             .unwrap()
             .permissions()
@@ -693,7 +700,7 @@ mod unix {
 
     /// Nothing under `root` is open to the group or others (links aside). The helper's socket
     /// is its own, made with the user's umask; the 0700 directory it is in keeps others out.
-    fn assert_private(root: &Path) {
+    pub(crate) fn assert_private(root: &Path) {
         let mut stack = vec![root.to_path_buf()];
         while let Some(path) = stack.pop() {
             let meta = std::fs::symlink_metadata(&path).unwrap();
@@ -713,7 +720,7 @@ mod unix {
         }
     }
 
-    fn private_dir(path: &Path) {
+    pub(crate) fn private_dir(path: &Path) {
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -721,7 +728,7 @@ mod unix {
             .unwrap();
     }
 
-    fn runtime() -> tokio::runtime::Runtime {
+    pub(crate) fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -729,11 +736,11 @@ mod unix {
             .unwrap()
     }
 
-    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
         runtime().block_on(future)
     }
 
-    fn eventually(what: &str, check: impl Fn() -> bool) {
+    pub(crate) fn eventually(what: &str, check: impl Fn() -> bool) {
         let start = Instant::now();
         while !check() {
             assert!(
@@ -744,7 +751,7 @@ mod unix {
         }
     }
 
-    fn alive(pid: u32) -> bool {
+    pub(crate) fn alive(pid: u32) -> bool {
         i32::try_from(pid)
             .ok()
             .and_then(rustix::process::Pid::from_raw)
@@ -756,7 +763,7 @@ mod unix {
             })
     }
 
-    fn comm(pid: u32) -> String {
+    pub(crate) fn comm(pid: u32) -> String {
         std::fs::read_to_string(format!("/proc/{pid}/comm"))
             .unwrap_or_default()
             .trim()
@@ -764,7 +771,7 @@ mod unix {
     }
 
     /// The umask of a process (`self`, or a pid), as /proc prints it: `0022`.
-    fn umask_of(pid: &str) -> String {
+    pub(crate) fn umask_of(pid: &str) -> String {
         std::fs::read_to_string(format!("/proc/{pid}/status"))
             .unwrap()
             .lines()
@@ -792,7 +799,7 @@ mod unix {
         pid
     }
 
-    fn script_len() -> u64 {
+    pub(crate) fn script_len() -> u64 {
         SCRIPT.len() as u64
     }
 
@@ -2087,7 +2094,11 @@ mod unix {
         block_on(launcher.stop(&m.plain())).unwrap();
 
         // A recycled pid that is not pitcrewd is never signalled.
-        let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
+        let mut sleeper = Command::new("sleep")
+            .arg("30")
+            .env(RUN_ENV, run_mark())
+            .spawn()
+            .unwrap();
         write_endpoint(
             &m,
             &Endpoint {
@@ -2125,7 +2136,7 @@ mod unix {
 
     // ─── Every sh ──────────────────────────────────────────────────────────────────────────
 
-    fn posix_shells() -> Vec<PathBuf> {
+    pub(crate) fn posix_shells() -> Vec<PathBuf> {
         let listed = std::env::var_os("PITCREW_TEST_SHELLS").filter(|v| !v.is_empty());
         let shells: Vec<PathBuf> = match listed {
             Some(list) => std::env::split_paths(&list).collect(),
@@ -2161,6 +2172,76 @@ mod unix {
             checked.push(shell.display().to_string());
         }
         println!("deployed and launched with sh = {checked:?}");
+    }
+
+    // ─── Leftover processes ────────────────────────────────────────────────────────────────
+
+    /// Every process a case starts on a fake machine carries this variable, set to
+    /// [`run_mark`]: the fake `ssh` puts it in the remote command's environment, and helpers,
+    /// tmux servers and fake SLURM jobs inherit it. Commands a case starts itself get it too.
+    pub(crate) const RUN_ENV: &str = "PITCREW_TEST_RUN";
+
+    /// This run's mark: unique to this test process.
+    pub(crate) fn run_mark() -> &'static str {
+        static MARK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        MARK.get_or_init(|| {
+            let nanos = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            format!("deploy-{}-{nanos}", std::process::id())
+        })
+    }
+
+    /// The live processes carrying this run's mark, with their command lines. Linux only (it
+    /// reads `/proc`); empty elsewhere. A zombie has no environment, so it does not count.
+    fn marked() -> Vec<(u32, String)> {
+        let want = format!("{RUN_ENV}={}", run_mark());
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(|entry| {
+                let pid: u32 = entry.ok()?.file_name().to_str()?.parse().ok()?;
+                let env = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+                if !env.split(|b| *b == 0).any(|v| v == want.as_bytes()) {
+                    return None;
+                }
+                let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+                let cmd = String::from_utf8_lossy(&cmd).replace('\0', " ");
+                Some((pid, cmd.trim().to_owned()))
+            })
+            .collect()
+    }
+
+    /// Waits up to `grace` for this run's processes to end, then kills those left (SIGKILL)
+    /// and returns them.
+    fn sweep(grace: Duration) -> Vec<(u32, String)> {
+        let start = Instant::now();
+        loop {
+            let left = marked();
+            if left.is_empty() || start.elapsed() >= grace {
+                for (pid, _) in &left {
+                    if let Some(pid) = i32::try_from(*pid)
+                        .ok()
+                        .and_then(rustix::process::Pid::from_raw)
+                    {
+                        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                    }
+                }
+                return left;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Kills this run's processes when dropped: at the end of the run, or if it unwinds.
+    struct Sweeper;
+
+    impl Drop for Sweeper {
+        fn drop(&mut self) {
+            sweep(Duration::ZERO);
+        }
     }
 
     // ─── Runner ────────────────────────────────────────────────────────────────────────────
@@ -2267,6 +2348,8 @@ mod unix {
         let list_only = std::env::args().any(|a| a == "--list");
         let mut failed = Vec::new();
         let mut ran = 0;
+        // Kills whatever this run started, however the run ends.
+        let sweeper = Sweeper;
         for (name, case) in &cases {
             if !filters.is_empty() && !filters.iter().any(|f| name.contains(f.as_str())) {
                 continue;
@@ -2277,7 +2360,13 @@ mod unix {
             }
             ran += 1;
             let start = Instant::now();
-            let ok = std::panic::catch_unwind(case).is_ok();
+            let mut ok = std::panic::catch_unwind(case).is_ok();
+            // A case passes only if it leaves nothing running, and leaves nothing either way.
+            let left = sweep(Duration::from_secs(5));
+            if !left.is_empty() {
+                println!("{name} left these running (now killed): {left:?}");
+                ok = false;
+            }
             println!(
                 "test {name} ... {} ({:.1}s)",
                 if ok { "ok" } else { "FAILED" },
@@ -2287,9 +2376,19 @@ mod unix {
                 failed.push(*name);
             }
         }
+        drop(sweeper);
         drop_daemon();
         if list_only {
             return ExitCode::SUCCESS;
+        }
+        // Nothing this run started may still run.
+        std::thread::sleep(Duration::from_millis(200));
+        let left = marked();
+        if cfg!(target_os = "linux") {
+            println!("processes this run left behind: {left:?}");
+        }
+        if !left.is_empty() {
+            failed.push("(processes left behind)");
         }
         println!(
             "\ntest result: {}. {} passed; {} failed",
