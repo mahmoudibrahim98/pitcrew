@@ -119,8 +119,8 @@ since it starts at `last + 1`. What the office appends is announced too, and loo
 batch. Each action applied is logged at info (`the back office acted rule=…`); each action the hub
 refuses, as a warning (`the hub refused a back-office action`, from hub-work).
 
-**Restarts.** `office.json` holds `last` for the store's log, rewritten at most once a second and
-when the loop stops. The next start runs from there again: `run_office` is idempotent (an action
+**Restarts.** `office.json` holds `last` for the store's log, rewritten within a second of each
+run (at most once a second) and when the loop stops. The next start runs from there again: `run_office` is idempotent (an action
 already in the log is `replayed` and appends nothing), so what a crash left unapplied is applied
 then, and nothing twice. With `--demo` the office starts at revision 1, so it also looks at the
 seed. Without `office.json` (the first start with the office on, or after `--no-office`) it starts

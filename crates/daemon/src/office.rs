@@ -16,8 +16,8 @@
 //!
 //! **Restarts.** `office.json` records `last` for this store's log. The next start runs from there
 //! again: `run_office` is idempotent, so what was applied is skipped (`replayed`) and what was not,
-//! say after a crash between an append and its run, is applied then. It is rewritten at most once
-//! a second while the office runs, and when it stops. Without it (the first start with the office
+//! say after a crash between an append and its run, is applied then. It is rewritten within a
+//! second of each run (at most once a second), and when the loop stops. Without it (the first start with the office
 //! on, or after `--no-office`, which removes it) the office starts at the end of the log, so it
 //! never acts on what was appended while it was off.
 
@@ -41,7 +41,8 @@ use tokio::task::JoinHandle;
 pub const HANDLE: &str = "@office";
 /// Its display name, as in the demo.
 const NAME: &str = "Back office";
-/// How often, at most, `office.json` is rewritten while the office runs.
+/// How often, at most, `office.json` is rewritten while the office runs; progress is saved this
+/// long after a run at the latest.
 const SAVE_EVERY: Duration = Duration::from_secs(1);
 /// The first wait before a failed range is tried again without an append; it doubles from there.
 const RETRY_FIRST: Duration = Duration::from_secs(1);
@@ -307,18 +308,20 @@ async fn run(
                 if ran {
                     last = to_rev;
                     backoff = RETRY_FIRST;
-                    if saved_at.elapsed() >= SAVE_EVERY {
-                        save(&progress, last).await;
-                        saved = last;
-                        saved_at = Instant::now();
-                    }
                 }
                 !ran
             }
             Some(_) => false,
         };
 
-        // Wait for a stop, the next append, or the time to try again.
+        // Wait for a stop, the next append, the time to save progress, or to try again.
+        let save_at = (saved != last).then(|| saved_at + SAVE_EVERY);
+        let save_due = async move {
+            match save_at {
+                Some(at) => tokio::time::sleep_until(at.into()).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         let retry = async {
             if failing {
                 tokio::time::sleep(backoff).await;
@@ -329,6 +332,12 @@ async fn run(
         tokio::select! {
             biased;
             _ = stopped.changed() => break,
+            () = save_due => {
+                save(&progress, last).await;
+                saved = last;
+                saved_at = Instant::now();
+                continue;
+            }
             () = retry => {
                 backoff = backoff.saturating_mul(2).min(RETRY_MAX);
                 target = None;

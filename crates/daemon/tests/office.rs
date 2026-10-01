@@ -225,16 +225,15 @@ fn a_restart_does_not_duplicate_office_actions() {
     });
     let latest = settle(&daemon, &device);
     let office_events = by_office(&daemon.all_events(&device)).len();
+    // Progress is saved within a second of a run, without waiting for a stop.
+    let progress = state.join("office.json");
+    let read =
+        || -> Value { serde_json::from_str(&std::fs::read_to_string(&progress).unwrap()).unwrap() };
+    eventually("office.json catches up", || read()["done"] == latest);
     daemon.stop();
     drop(daemon);
-
-    let progress = state.join("office.json");
-    let saved: Value = serde_json::from_str(&std::fs::read_to_string(&progress).unwrap()).unwrap();
-    #[cfg(unix)]
-    assert_eq!(
-        saved["done"], latest,
-        "a clean stop saves where the office got to"
-    );
+    let saved = read();
+    assert_eq!(saved["done"], latest);
 
     // A plain restart has nothing to run again.
     let mut daemon = Daemon::start(&state, &[]);
