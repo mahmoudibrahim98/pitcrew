@@ -41,16 +41,19 @@ Everything goes through the user's own **system OpenSSH** and `~/.ssh/config`.
     Job Object needs four Win32 calls; `src/job.rs` is the crate's only unsafe code.
   - **Errors:** ssh's own messages go to a log (`-E`, at `LogLevel=ERROR`) apart from the remote
     stderr. Exit 255 is an error only when that log shows ssh failing, and its kind comes only
-    from ssh's own message formats, matched as whole lines; lines carrying server text (a
-    disconnect reason, an algorithm offer) never pick the kind. Informational lines never turn
-    a remote command's own 255 into an error.
+    from ssh's own message formats, matched as whole lines. ssh logs server text without
+    escaping newlines, so reading stops at ssh's terminal message (e.g. "Permission denied
+    (…).", whose method list is the server's) and at lines carrying server text (a disconnect
+    reason, an algorithm offer, a refused channel). Informational lines never turn a remote
+    command's own 255 into an error.
   - `Ssh::run_limited` adds an output cap and a timeout that pauses while a prompt is open.
 - **Askpass bridge.** With `Ssh::with_prompts(askpass, handler)`, ssh runs `pitcrew-askpass`
   for passwords, passphrases, one-time codes and host keys; it asks the desktop's
   `PromptHandler` over a private socket (a named pipe on Windows, which the client opens at
   identification level only). Both ends prove a per-call key first. Answers are never stored
-  or logged. Needs OpenSSH 8.4+ on the local machine. Without a handler, calls run in
-  `BatchMode` and fail instead of prompting.
+  or logged. Needs OpenSSH 8.4+ on the local machine. The askpass path must be absolute and
+  exist (a missing one would fail every prompt). Without a handler, calls run in `BatchMode`
+  and fail instead of prompting.
   - The handler is async and gets a `PromptCancel` that fires when the prompt goes stale (ssh
     closed it, or the call ended); the dialog should close then.
   - **ssh never sees askpass fail**, since it would then send an empty password and ask again:
@@ -58,8 +61,11 @@ Everything goes through the user's own **system OpenSSH** and `~/.ssh/config`.
       in that call are not shown. (For a yes/no question, Cancel simply answers "no".)
     - If the bridge closes without an answer (PitCrew quit or crashed, or the handshake
       failed), `pitcrew-askpass` kills the ssh that asked, but only while it is still its
-      parent (pinned with a pidfd on Linux). On Windows it waits instead, and the Job Object
-      ends both.
+      parent and shares its process group, so never a reaper that adopted it (pinned with a
+      pidfd on Linux). On Windows it waits instead, and the Job Object ends both.
+    - While PitCrew runs, a client that says hello and then fails the handshake stops the
+      call with `SshError::Bridge` (on Windows by ending the job); so does ssh being killed
+      by its askpass.
   - `PromptKind` is a hint: server-written prompts (`(user@host) …`) are never classed as a
     passphrase or host key, Accept is refused for secrets and Text for yes/no questions. The
     UI must show the raw prompt, escaped. `UpdateHostKeys=ask`'s "Accept updated hostkeys?" is

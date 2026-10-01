@@ -73,6 +73,9 @@ struct Scenario {
     /// `ProxyCommand`), and exit at once (Unix).
     #[serde(default)]
     linger: bool,
+    /// Run askpass with this key instead of the bridge's: it then fails the handshake.
+    #[serde(default)]
+    askpass_key: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -175,7 +178,11 @@ fn fake_ssh(scenario: &Scenario, dir: &Path) -> u8 {
     for prompt in &scenario.prompts {
         let mut answered = false;
         for _ in 0..prompt.tries.max(1) {
-            let answer = ask(prompt.text.as_str(), prompt.hint.as_deref());
+            let answer = ask(
+                prompt.text.as_str(),
+                prompt.hint.as_deref(),
+                scenario.askpass_key.as_deref(),
+            );
             if prompt.sent {
                 let mut sent = std::fs::OpenOptions::new()
                     .create(true)
@@ -257,12 +264,15 @@ fn fake_ssh(scenario: &Scenario, dir: &Path) -> u8 {
 }
 
 /// Runs askpass like ssh: its output without the newline when it exits 0, else nothing.
-fn ask(text: &str, hint: Option<&str>) -> Option<String> {
+fn ask(text: &str, hint: Option<&str>, key: Option<&str>) -> Option<String> {
     let program = std::env::var("SSH_ASKPASS").ok()?;
     let mut command = std::process::Command::new(program);
     command.arg(text);
     if let Some(hint) = hint {
         command.env("SSH_ASKPASS_PROMPT", hint);
+    }
+    if let Some(key) = key {
+        command.env("PITCREW_ASKPASS_KEY", key);
     }
     let out = command.output().ok()?;
     out.status.success().then(|| {
@@ -674,8 +684,9 @@ fn askpass_round_trip() {
 }
 
 /// The fake behaves like ssh: when askpass fails, it sends an empty password and asks again.
-/// (Here askpass cannot even start.) This is what a cancel must never lead to.
+/// This is what PitCrew's askpass must never let happen.
 fn the_fake_sends_empty_credentials_when_askpass_fails() {
+    // A missing askpass would fail at every prompt: refused before ssh runs.
     let fake = Fake::new(&Scenario {
         prompts: vec![password("s3cr3t")],
         ..Scenario::default()
@@ -683,8 +694,41 @@ fn the_fake_sends_empty_credentials_when_askpass_fails() {
     let missing = fake.dir.path().join("no-such-askpass");
     let ssh = fake.ssh().with_prompts(&missing, Handler::new(|_| None));
     let err = block_on(ssh.run("cluster", &["true"])).unwrap_err();
-    assert!(matches!(err, SshError::AuthFailed { .. }), "{err:?}");
-    assert_eq!(fake.sent(), ["empty", "empty", "empty"]);
+    assert!(matches!(err, SshError::InvalidArgument(_)), "{err:?}");
+    assert!(!fake.ran());
+
+    // One that exists but always fails (not ours): the fake, like ssh, sends empty passwords.
+    if cfg!(unix) {
+        let ssh = fake
+            .ssh()
+            .with_prompts("/bin/false", Handler::new(|_| None));
+        let err = block_on(ssh.run("cluster", &["true"])).unwrap_err();
+        assert!(matches!(err, SshError::AuthFailed { .. }), "{err:?}");
+        assert_eq!(fake.sent(), ["empty", "empty", "empty"]);
+    }
+}
+
+/// An askpass that fails the handshake while the app runs (here, it has the wrong key) gives
+/// up and stops ssh. The server sees it give up after its hello and fails the call, rather than
+/// leaving it to look like a signal (Unix) or wait forever (Windows). Nothing is sent.
+fn a_failed_handshake_fails_the_call() {
+    let fake = Fake::new(&Scenario {
+        prompts: vec![password("s3cr3t")],
+        askpass_key: Some("07".repeat(32)),
+        stdout: "in\n".into(),
+        ..Scenario::default()
+    });
+    let handler = Handler::new(|_| Some(Reply::Text(Secret::new("s3cr3t"))));
+    let ssh = fake.ssh().with_prompts(askpass(), handler.clone());
+    let limits = Limits {
+        max_output: None,
+        timeout: Some(Duration::from_secs(20)),
+    };
+    let err = block_on(ssh.run_limited("cluster", &["true"], limits)).unwrap_err();
+    assert!(matches!(err, SshError::Bridge(_)), "{err:?}");
+    assert!(handler.kinds().is_empty(), "nobody was asked");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(fake.sent(), Vec::<String>::new());
 }
 
 /// Cancel kills ssh before askpass hears anything: no empty password is sent, nobody is asked
@@ -1271,6 +1315,10 @@ fn run_tests() -> ExitCode {
         (
             "quitting_mid_prompt_sends_nothing",
             quitting_mid_prompt_sends_nothing,
+        ),
+        (
+            "a_failed_handshake_fails_the_call",
+            a_failed_handshake_fails_the_call,
         ),
         ("timeouts_and_exit_codes", timeouts_and_exit_codes),
         ("limits_stop_ssh", limits_stop_ssh),

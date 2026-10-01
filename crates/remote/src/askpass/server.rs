@@ -25,15 +25,55 @@ pub(crate) struct AskpassServer {
     task: JoinHandle<()>,
 }
 
+/// Why the server stopped a call. ssh must then be killed before anything else happens, and no
+/// prompt is shown or answered from then on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stop {
+    /// The user cancelled a prompt, or its answer was refused.
+    Cancelled,
+    /// A client that spoke the protocol failed the handshake. Our askpass stops ssh when it
+    /// gets no answer (on Unix by killing it, on Windows by waiting for the job to end), so the
+    /// call cannot go on.
+    BridgeFailed,
+}
+
+impl Stop {
+    /// The error the call ends with.
+    pub(crate) fn error(self) -> crate::SshError {
+        match self {
+            Self::Cancelled => crate::SshError::Cancelled,
+            Self::BridgeFailed => crate::SshError::Bridge(
+                "an askpass program failed the handshake; ssh was stopped".to_owned(),
+            ),
+        }
+    }
+}
+
 struct Shared {
     key: [u8; KEY_LEN],
     host: String,
     handler: Arc<dyn PromptHandler>,
-    /// Set when the user cancels (or a reply is refused): ssh must be killed before anything
-    /// else happens, and no prompt is shown or answered from then on.
-    refused: watch::Sender<bool>,
+    /// Set once, when the call must stop.
+    stopped: watch::Sender<Option<Stop>>,
     /// How many prompts are waiting for the user, so time limits can pause.
     open: watch::Sender<usize>,
+}
+
+impl Shared {
+    /// Stops the call, unless it is already stopped (the first reason wins).
+    fn stop(&self, why: Stop) {
+        self.stopped.send_if_modified(|stopped| {
+            let first = stopped.is_none();
+            if first {
+                *stopped = Some(why);
+            }
+            first
+        });
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.borrow().is_some()
+    }
 }
 
 impl Drop for Shared {
@@ -55,7 +95,7 @@ impl AskpassServer {
             key: random::<KEY_LEN>()?,
             host: host.to_owned(),
             handler,
-            refused: watch::Sender::new(false),
+            stopped: watch::Sender::new(None),
             open: watch::Sender::new(0),
         });
         let name = to_hex(&random::<8>()?);
@@ -71,17 +111,18 @@ impl AskpassServer {
         ]
     }
 
-    /// Whether the user cancelled a prompt in this call.
-    pub(crate) fn refused(&self) -> bool {
-        *self.shared.refused.borrow()
+    /// Whether, and why, this call was stopped.
+    pub(crate) fn stopped(&self) -> Option<Stop> {
+        *self.shared.stopped.borrow()
     }
 
-    /// Completes when the user cancels a prompt. The caller must then kill ssh; until the
-    /// server is dropped, the cancelled prompt is not answered.
-    pub(crate) async fn wait_refused(&self) {
-        let mut rx = self.shared.refused.subscribe();
-        if rx.wait_for(|refused| *refused).await.is_err() {
-            std::future::pending::<()>().await;
+    /// Completes when the call must stop (see [`Stop`]). The caller must then kill ssh; until
+    /// the server is dropped, nothing is answered.
+    pub(crate) async fn wait_stopped(&self) -> Stop {
+        let mut rx = self.shared.stopped.subscribe();
+        match rx.wait_for(Option::is_some).await.map(|stopped| *stopped) {
+            Ok(Some(why)) => why,
+            _ => std::future::pending().await,
         }
     }
 
@@ -208,15 +249,26 @@ impl Drop for OpenPrompt<'_> {
     }
 }
 
-/// One askpass connection. A protocol error just drops it; the askpass program then exits
-/// non-zero.
+/// One askpass connection.
+///
+/// A handshake that fails after a well-formed hello stops the call ([`Stop::BridgeFailed`]):
+/// only a client that knows the protocol gets that far, and if it is ours it is now stopping
+/// ssh for want of an answer. Anything that fails earlier (garbage, or a connection that never
+/// says hello) is just dropped, so that strays cannot end a call.
 async fn serve<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, shared: Arc<Shared>) {
-    let Ok(Ok(ask)) =
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut stream, &shared.key)).await
-    else {
+    let mut greeted = false;
+    let shook = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        handshake(&mut stream, &shared.key, &mut greeted),
+    )
+    .await;
+    let Ok(Ok(ask)) = shook else {
+        if greeted {
+            shared.stop(Stop::BridgeFailed);
+        }
         return;
     };
-    if *shared.refused.borrow() {
+    if shared.is_stopped() {
         // The user already said no in this call, and ssh is being killed. Never ask again, and
         // never answer: any reply, even a failure, lets ssh send an empty credential.
         return hold(stream).await;
@@ -245,11 +297,11 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, shared: Arc<Sha
         return;
     };
     let Some(wire) = WireReply::for_prompt(kind, reply) else {
-        shared.refused.send_replace(true);
+        shared.stop(Stop::Cancelled);
         return hold(stream).await;
     };
-    if *shared.refused.borrow() {
-        // Another prompt of this call was cancelled meanwhile; ssh is being killed.
+    if shared.is_stopped() {
+        // The call was stopped meanwhile; ssh is being killed.
         return hold(stream).await;
     }
     if let Ok(mut line) = serde_json::to_vec(&wire) {
@@ -267,14 +319,17 @@ async fn hold<S>(stream: S) {
     std::future::pending::<()>().await;
 }
 
+/// The handshake. `greeted` is set once the client has sent a well-formed hello.
 async fn handshake<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     key: &[u8; KEY_LEN],
+    greeted: &mut bool,
 ) -> io::Result<Ask> {
     let hello: Hello = receive(stream).await?;
     let nc = from_hex(&hello.nonce)
         .filter(|n| hello.v == 1 && n.len() == NONCE_LEN)
         .ok_or_else(|| bad("bad hello"))?;
+    *greeted = true;
     let ns = random::<NONCE_LEN>()?;
     send(
         stream,
@@ -429,17 +484,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((code, out.as_str()), (client::EXIT_ANSWERED, "no\n"));
-        assert!(!server.refused());
+        assert_eq!(server.stopped(), None);
 
-        // A listener without the key: no answer, which the program turns into stopping ssh.
-        let mut wrong = env.clone();
-        wrong[1].1 = to_hex(&[7u8; KEY_LEN]);
-        let (code, out) = spawn_client(&wrong, "Password: ").await.unwrap();
-        assert_eq!((code, out.as_str()), (client::EXIT_NO_ANSWER, ""));
+        // Without the key: no answer, which the program turns into stopping ssh.
         let mut broken = env.clone();
         broken[1].1 = "not hex".to_owned();
         let (code, _) = spawn_client(&broken, "Password: ").await.unwrap();
         assert_eq!(code, client::EXIT_NO_ANSWER);
+        let mut wrong = env.clone();
+        wrong[1].1 = to_hex(&[7u8; KEY_LEN]);
+        let (code, out) = spawn_client(&wrong, "Password: ").await.unwrap();
+        assert_eq!((code, out.as_str()), (client::EXIT_NO_ANSWER, ""));
+        // That client said hello and then gave up on our proof: the call stops.
+        eventually("the call to stop", || server.stopped().is_some()).await;
+        assert_eq!(server.stopped(), Some(Stop::BridgeFailed));
 
         assert_eq!(
             handler.kinds(),
@@ -449,6 +507,42 @@ mod tests {
                 ("cluster".to_owned(), PromptKind::Confirm),
             ]
         );
+    }
+
+    /// Connections that never say a proper hello (strays, garbage) are dropped without
+    /// stopping the call; one that says hello and then fails does stop it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_a_failed_handshake_after_hello_stops_the_call() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Scripted::new(|_| Some(Reply::Cancel));
+        let server =
+            AskpassServer::start(&dir.path().join("rt"), "cluster", handler.clone()).unwrap();
+        let addr = server.env()[0].1.clone();
+        let connect = || std::os::unix::net::UnixStream::connect(&addr).unwrap();
+
+        drop(connect());
+        connect().write_all(b"garbage\n").unwrap();
+        connect()
+            .write_all(b"{\"v\":2,\"nonce\":\"00\"}\n")
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(server.stopped(), None);
+
+        // A well-formed hello, then a bad proof.
+        let mut stream = connect();
+        stream
+            .write_all(b"{\"v\":1,\"nonce\":\"000102030405060708090a0b0c0d0e0f\"}\n")
+            .unwrap();
+        stream
+            .write_all(b"{\"proof\":\"00\",\"kind\":\"password\",\"prompt\":\"x\"}\n")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), server.wait_stopped())
+            .await
+            .unwrap();
+        assert_eq!(server.stopped(), Some(Stop::BridgeFailed));
+        assert!(handler.kinds().is_empty());
     }
 
     /// A cancel is never answered, later prompts are not shown, and nothing reaches the client
@@ -468,9 +562,10 @@ mod tests {
         let env = server.env();
 
         let first = spawn_client(&env, "u@cluster's password: ");
-        tokio::time::timeout(Duration::from_secs(5), server.wait_refused())
+        let why = tokio::time::timeout(Duration::from_secs(5), server.wait_stopped())
             .await
             .unwrap();
+        assert_eq!(why, Stop::Cancelled);
         let second = spawn_client(&env, "Verification code: ");
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(!first.is_finished() && !second.is_finished());
@@ -521,7 +616,8 @@ mod tests {
             .unwrap();
         eventually("the prompt to close", || *open.borrow() == 0).await;
         assert!(!asking.join().unwrap());
-        assert!(!server.refused());
+        // A stale prompt is not a failed handshake: the call goes on.
+        assert_eq!(server.stopped(), None);
     }
 
     /// Dropping the call (here, the server) makes a pending prompt see cancellation.

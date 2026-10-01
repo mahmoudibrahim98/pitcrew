@@ -96,6 +96,10 @@ pub enum SshError {
     /// The user cancelled a prompt. ssh was stopped before it could answer anything.
     #[error("cancelled")]
     Cancelled,
+    /// The prompt bridge failed during the call (an askpass program failed the handshake, or
+    /// got no answer); ssh was stopped before it could send anything.
+    #[error("the prompt bridge failed: {0}")]
+    Bridge(String),
     /// The call ran longer than its [`Limits::timeout`]; ssh was stopped.
     #[error("no result within {0:?}")]
     TimedOut(Duration),
@@ -167,7 +171,9 @@ pub(crate) fn last_line(text: &str) -> String {
 /// The result of a remote command that ran.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Output {
-    /// Exit code; `None` if it was killed by a signal.
+    /// Exit code; `None` if ssh itself was killed by a signal, in a call without prompts. (A
+    /// remote command killed by a signal makes ssh exit 255. With prompts, ssh killed by a
+    /// signal is [`SshError::Bridge`]: askpass stops it when it gets no answer.)
     pub code: Option<i32>,
     /// Standard output.
     pub stdout: Vec<u8>,
@@ -388,13 +394,22 @@ impl Ssh {
     ) -> Result<Output, SshError> {
         validate_host(host)?;
         let remote = remote_command(argv)?;
-        if let Some(prompts) = &self.prompts
-            && !prompts.program.is_absolute()
-        {
-            return Err(SshError::InvalidArgument(format!(
-                "the askpass program {} is not an absolute path",
-                prompts.program.display()
-            )));
+        if let Some(prompts) = &self.prompts {
+            // ssh would look a relative name up on PATH. And a missing program means askpass
+            // fails at every prompt, so ssh would send empty passwords: refuse both up front.
+            let problem = if !prompts.program.is_absolute() {
+                Some("is not an absolute path")
+            } else if !prompts.program.is_file() {
+                Some("does not exist")
+            } else {
+                None
+            };
+            if let Some(problem) = problem {
+                return Err(SshError::InvalidArgument(format!(
+                    "the askpass program {} {problem}",
+                    prompts.program.display()
+                )));
+            }
         }
         let dir = self.runtime_dir()?;
         let log = SshLog::new(&dir)?;
@@ -422,13 +437,22 @@ impl Ssh {
             }
         };
         let (status, stdout, stderr) = drive(command, server.as_ref(), limits).await?;
-        let refused = server.as_ref().is_some_and(AskpassServer::refused);
+        let stopped = server.as_ref().and_then(AskpassServer::stopped);
+        let prompted = server.is_some();
         drop(server);
+        if let Some(why) = stopped {
+            // ssh exited on its own just as the call was being stopped.
+            return Err(why.error());
+        }
         let code = status.code();
+        if code.is_none() && prompted {
+            // ssh itself was killed by a signal (a remote command killed by one makes ssh exit
+            // 255): askpass stops ssh when the bridge gives it no answer.
+            return Err(SshError::Bridge(
+                "ssh was stopped: the prompt bridge gave askpass no answer".to_owned(),
+            ));
+        }
         if code == Some(255) {
-            if refused {
-                return Err(SshError::Cancelled);
-            }
             let said = log.read();
             let mut detail = said.clone();
             detail.push_str(&String::from_utf8_lossy(&stderr));
@@ -487,7 +511,8 @@ impl Ssh {
 }
 
 /// Runs `command` to the end: its exit status, stdout and stderr. Stops it, with everything it
-/// started, when the user cancels a prompt of `server` or the call breaks `limits`.
+/// started, when `server` stops the call (the user cancelled a prompt, or a client failed the
+/// handshake) or the call breaks `limits`.
 async fn drive(
     command: tokio::process::Command,
     server: Option<&AskpassServer>,
@@ -495,9 +520,9 @@ async fn drive(
 ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), SshError> {
     let mut child = Running::spawn(command)?;
     let outcome = {
-        let refused = async {
+        let stopped = async {
             match server {
-                Some(server) => server.wait_refused().await,
+                Some(server) => server.wait_stopped().await,
                 None => std::future::pending().await,
             }
         };
@@ -512,13 +537,14 @@ async fn drive(
         };
         tokio::select! {
             done = collect(&mut child.child, limits.max_output) => done,
-            () = refused => Err(SshError::Cancelled),
+            why = stopped => Err(why.error()),
             after = expired => Err(SshError::TimedOut(after)),
         }
     };
     if outcome.is_err() {
         // Kill before the server goes: a cancelled prompt is answered only by its connection
-        // closing, when nothing is left to act on it.
+        // closing, when nothing is left to act on it. On Windows this ends the job, and with it
+        // an askpass that is waiting there for want of an answer.
         child.kill().await;
     }
     outcome
