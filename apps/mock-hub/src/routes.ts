@@ -1248,6 +1248,7 @@ function directRefs(hub: Hub, body: EventBody): EventFilter {
     case 'tool_ran':
     case 'file_edited':
     case 'session_ended':
+    case 'session_updated':
       return { session: body.data.session };
     case 'session_linked':
       return { session: body.data.session, task: body.data.task, workstream: body.data.workstream };
@@ -1286,6 +1287,10 @@ function directRefs(hub: Hub, body: EventBody): EventFilter {
     case 'decision_recorded':
       return { workstream: body.data.workstream };
     case 'machine_liveness':
+    case 'machine_added':
+    case 'member_added':
+    case 'persona_saved':
+    case 'team_saved':
       return {};
   }
 }

@@ -376,6 +376,11 @@ export type EventBody =
       data: { session: SessionId; workstream?: WorkstreamId; task?: TaskId; basis: LinkBasis };
     }
   | { type: 'session_ended'; data: { session: SessionId } }
+  | { type: 'session_updated'; data: { session: SessionId; title?: string; branch?: string } }
+  | { type: 'machine_added'; data: { machine: Machine } }
+  | { type: 'member_added'; data: { member: Member } }
+  | { type: 'persona_saved'; data: { persona: Persona } }
+  | { type: 'team_saved'; data: { team: Team } }
   | { type: 'project_created'; data: { project: Project } }
   | { type: 'workstream_created'; data: { workstream: Workstream } }
   | {

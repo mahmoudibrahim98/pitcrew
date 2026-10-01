@@ -11,7 +11,7 @@ The PitCrew interface: React 19, TypeScript, Vite. Runs in the Tauri desktop app
 | `src/projects` | N | Projects layout |
 | `src/onboarding` | O | First-run and machine-setup wizards |
 
-Stream L sets up the package (`package.json`, Vite and TypeScript config) first. Each feature folder exports its routes and navigation entries from `index.ts`; the shell composes them. See `docs/build/streams/`.
+Each feature folder exports `feature` from `index.ts` (its routes, sidebar entries, palette commands and "+ New" items); `src/router.tsx` hands them to the shell, which composes them. The interface is in [`src/shell/README.md`](src/shell/README.md). See `docs/build/streams/`.
 
 ## Run it
 
@@ -25,10 +25,13 @@ corepack pnpm --filter @pitcrew/ui dev    # the UI on http://127.0.0.1:5173
 | `dev` | Vite dev server on 127.0.0.1:5173 |
 | `build` | Type-check, then a production build into `dist/` |
 | `preview` | Serve `dist/` on 127.0.0.1:4173 |
-| `test` | Vitest: the data layer against the real mock hub |
-| `e2e` | Playwright: the page against its own mock hub (ports 47399 and 5199). `PLAYWRIGHT_CHANNEL=msedge` or `chrome` uses an installed browser. |
+| `test` | Vitest: the data layer, the shell and the design components, against the real mock hub on a free port |
+| `e2e` | Playwright: the shell against its own mock hub (ports 47399 and 5199; `E2E_HUB_PORT` and `E2E_UI_PORT` move them), with axe checks. `PLAYWRIGHT_CHANNEL=msedge` or `chrome` uses an installed browser. |
+| `size` | After `build`: fails if the initial JS is over 250 kB gzipped |
 | `typecheck` | `tsc -b` |
 | `lint` | ESLint |
+
+The dev server also serves the data layer's proof page at `/dev/proof`; production builds leave it out.
 
 ## Environment (development only)
 
