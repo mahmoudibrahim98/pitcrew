@@ -67,10 +67,7 @@ async fn serve(f: &Fixture, source: Arc<dyn EventSource>) -> std::net::SocketAdd
 }
 
 /// Connects to `/v1/stream` and reads the hello.
-fn connect(
-    addr: std::net::SocketAddr,
-    token: &str,
-) -> tungstenite::WebSocket<std::net::TcpStream> {
+fn connect(addr: std::net::SocketAddr, token: &str) -> tungstenite::WebSocket<std::net::TcpStream> {
     use tungstenite::client::IntoClientRequest as _;
     use tungstenite::http::HeaderValue;
     let stream = std::net::TcpStream::connect(addr).unwrap();
