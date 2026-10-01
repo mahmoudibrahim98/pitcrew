@@ -839,8 +839,13 @@ impl Store {
                 // so a large import leaves `-wal` roughly the size of what it just wrote until
                 // something else happens to checkpoint it. Fold those frames back into the main
                 // file and truncate `-wal` now, before releasing the lock, rather than leaving
-                // that for whatever operation next happens to trigger a checkpoint.
-                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+                // that for whatever operation next happens to trigger a checkpoint. Best effort,
+                // and not `?`: the commit just above already succeeded, so the import itself is
+                // done and "on any error, nothing is appended" must stay true of this call — a
+                // checkpoint failing here (a transient lock from a concurrent reader, say) is a
+                // disk-space and performance concern, not a correctness one; the next checkpoint,
+                // by any operation, catches up.
+                let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
             }
             (from_rev, total)
         };
