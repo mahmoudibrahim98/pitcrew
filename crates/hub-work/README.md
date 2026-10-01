@@ -16,7 +16,10 @@ let store = Arc::new(Store::open_with(
     StoreOptions::default(),
     pitcrew_hub_work::projections_with_office(&office),   // the work tables + the office's run log
 )?);
-let mut appended = store.subscribe();                     // before anything appends
+// Subscribe, then read where the log is, now, before anything appends (the seed included): every
+// later revision is the back office's to look at.
+let mut appended = store.subscribe();
+let mut last = store.latest_rev()?;
 // The one writer for this store (see "One writer").
 let work = Arc::new(
     WorkService::new(Arc::clone(&store), workspace)      // a protocol `Workspace` (id and name)
@@ -30,29 +33,33 @@ let refs: Arc<dyn pitcrew_hub_work::EventRefs> = work.clone(); // GET /v1/events
 
 // The back office: after each append batch, apply what it emitted (see "The back office").
 tokio::spawn(async move {
-    let mut last = store.latest_rev()?;                   // never re-apply older batches
     loop {
-        let revs = match appended.recv().await {
-            Ok(revs) if revs.to_rev <= last => continue,
-            Ok(revs) => RevRange { from_rev: revs.from_rev.max(last + 1), to_rev: revs.to_rev },
-            Err(RecvError::Lagged(_)) => RevRange { from_rev: last + 1, to_rev: store.latest_rev()? },
+        let to_rev = match appended.recv().await {
+            Ok(revs) => revs.to_rev,
+            Err(RecvError::Lagged(_)) => store.latest_rev()?,
             Err(RecvError::Closed) => break,
         };
-        last = revs.to_rev;
+        if to_rev <= last {
+            continue;
+        }
+        // From the first revision not looked at: this also covers revisions another process
+        // appended, which `subscribe` does not announce.
+        let revs = RevRange { from_rev: last + 1, to_rev };
         let (work, office) = (Arc::clone(&work), Arc::clone(&office));
         let run = tokio::task::spawn_blocking(move || work.run_office(&office, revs)).await??;
+        last = to_rev;
         // `run.refused()`: actions the hub would not apply (already logged as warnings).
     }
 });
 ```
 
-(Errors elided: the loop logs a failed `run_office` and goes on.) Without a back office, open the
-store with `pitcrew_hub_work::projections()` and skip the loop.
+(Errors elided: on a failed `run_office` the loop logs it and tries the same range again later;
+re-running a range is safe.) Without a back office, open the store with
+`pitcrew_hub_work::projections()` and skip the loop.
 
-To serve the demo workspace, open an empty store and call
-`work.seed(&pitcrew_fixtures::demo_workspace()?)` (the service's workspace must be the demo's),
-then `work.run_office(&office, seeded)` with the revisions `seed` returns, if the loop above was
-not running yet.
+To serve the demo workspace, open an empty store, start the loop, and call
+`work.seed(&pitcrew_fixtures::demo_workspace()?)` (the service's workspace must be the demo's);
+the loop applies what the office makes of the seed like any other batch.
 
 ## One writer
 
@@ -224,7 +231,13 @@ whatever it sent.
 
 Every `400` comes before a `409`: a request that is malformed and would also conflict is a `400`.
 Object bodies must be JSON objects (serde would otherwise read an array as a struct's fields by
-position); `PUT /v1/tasks/{id}/subtasks` takes an array.
+position); `PUT /v1/tasks/{id}/subtasks` takes an array. A key given twice in a body counts once,
+with its last value, as `JSON.parse` does in the mock hub.
+
+Lists in a body (up to 1 MiB) cost time linear in their length: the checks that need no table run
+before the command lock, labels in one pass that stops at the 33rd distinct one, repeats dropped
+with a hash set; the checks against the tables take one query per list (`json_each`), and a
+`blocked_by` cycle is one recursive query over the tasks waiting on the edited one.
 
 ## The back office
 
@@ -254,8 +267,8 @@ authored by the office's member, on behalf of its owner:
 | Action | Applied when | Else |
 |---|---|---|
 | `TaskMoved` | the mover is `Mover::BackOffice` (recorded with the task's own `accept_auto`, whatever the action claimed), `from` is the task's status, and `can_move` allows it, so review → done only with `accept_auto` | 403 another mover; 404 unknown task; 409 |
-| `AskAnswered` | an open question or mention addressed to the office or another agent of its owner; the answer is the office's (`by`, `at`) | 403 a person's ask, a decision, approval or review, another owner's agent; 404; 400 bad option or no answer; 409 answered |
-| `CommentPosted` | on a known task or workstream, known mentions, text not blank | 404; 400 |
+| `AskAnswered` | an open question or mention addressed to the office itself, as api-v1 lets any agent answer; the answer is the office's (`by`, `at`) | 403 an ask to anyone else, a decision, approval or review; 404; 400 bad option or no answer; 409 answered |
+| `CommentPosted` | on a known task or workstream (when it names both, the task is in that workstream), known mentions, text not blank | 404; 400 |
 | any other event | never | 403 |
 | `raise_ask` | a known addressee, task and session; not an approval | 403 approval; 400 |
 | `propose_brief` | a known target: `brief_proposed`, and with it `accepted_body()` when the proposal says auto-accept, unless the brief in force is pinned (then only proposed) | 404 |
@@ -263,16 +276,24 @@ authored by the office's member, on behalf of its owner:
 Every action must cite receipts (400 without). The office's member must be an agent; a person
 cannot be the back office.
 
+**Running a range again is safe.** The events an action appends get ids derived from the store's
+`log_id`, the run-log entry's revision and `seq`, and the event's place in the action (a ULID with
+the entry's time and 80 bits of a SHA-256 of those), and are appended with `append_new`. An action
+whose first event is already in the log is reported as `replayed` and appends nothing. So:
+- after a restart, the daemon may re-run the range it is not sure it finished (e.g. from the last
+  revision it recorded as done): what was applied is skipped, what was not is applied now. A crash
+  between an append and its `run_office` loses nothing if the daemon re-runs that range;
+- re-run recent ranges only: an action the hub refused then is tried again, against the state now.
+
 **What the daemon must know.**
-- Call `run_office` once per batch. Replaying a batch re-applies its actions (a move is refused as
-  stale, but an ask or comment is raised again), so after a restart start from the store's latest
-  revision, as the loop in "Wiring" does.
-- A crash between an append and its `run_office` loses that batch's actions; they stay in the run
-  log as emitted. Recovering them needs a record of what was applied, which nothing in the log
-  holds yet.
+- Read `last` right after `subscribe()` and before anything appends, and run each range from
+  `last + 1`, as in "Wiring": a batch appended between the two would otherwise be missed, and a
+  batch appended by another process is never announced.
 - An action the office emitted and the hub refused (the office's view was out of date, e.g. after
   a racing writer's stale move) is `emitted` in `office_runs`: a projection cannot record what the
   hub later did. `run_office` returns and logs the refusal.
+- The store's run log and the `BackOffice` must have the same rules: `run_office` fails when a
+  revision has more entries than the office's rules can make.
 
 ## Routes
 
@@ -308,13 +329,15 @@ query `400`; bodies over 1 MiB are `400`. A `500` is logged in full and its body
   `POST /v1/projects`, `POST /v1/workstreams`, and briefs' next steps and proposals) and compares
   statuses, error codes and bodies, with created ids matched up and brief times left out.
 - `tests/edits.rs`, `tests/briefs.rs`: every rule and error code of the three routes and of
-  briefs, through the routes (the cases of the mock hub's `edits.test.ts`), and project key
-  clashes from a racing writer.
+  briefs, through the routes (the cases of the mock hub's `edits.test.ts`), project key clashes
+  from a racing writer, repeated JSON keys, and lists as long as a 1 MiB body allows.
 - `tests/office.rs`: a finished dispatch moves its task to review; actions the office's guard
   refuses are logged `refused` and refused by the hub too; an action emitted on an out-of-date
   view is refused by the hub; every (from, to, mover) through `OfficeCommands` against
-  `can_move`; answers, asks, comments and brief proposals (pinned and not); a run log several
-  pages long applied whole, once, in order.
+  `can_move`; answers (only the office's own asks), asks, comments and brief proposals (pinned
+  and not); a run log several pages long applied whole, once, in order; a range run twice
+  appends once, and a re-run after a crash applies only what was missing; a run log with other
+  rules than the `BackOffice` is an error.
 - `tests/rebuild.rs`: rebuilding every projection, building them on open, and applying one event
   per append all give identical tables, over every table, with task edits, key clashes, new
   projects and workstreams, and pending and accepted proposals in the log.

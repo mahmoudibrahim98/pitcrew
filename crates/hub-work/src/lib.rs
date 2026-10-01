@@ -22,7 +22,7 @@
 //! ```no_run
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! use pitcrew_hub_work::{BackOffice, WorkService, projections_with_office};
-//! use pitcrew_store::{Store, StoreOptions};
+//! use pitcrew_store::{RevRange, Store, StoreOptions};
 //! use std::sync::Arc;
 //!
 //! let demo = pitcrew_fixtures::demo_workspace()?;
@@ -33,19 +33,26 @@
 //!     StoreOptions::default(),
 //!     projections_with_office(&office),
 //! )?);
+//! // Subscribe, then read where the log is, before anything appends: every later revision is the
+//! // back office's to look at.
 //! let mut appended = store.subscribe();
+//! let mut last = store.latest_rev()?;
 //! // The one writer for this store; share this `Arc`.
-//! let work = Arc::new(WorkService::new(store, demo.workspace.clone()));
-//! let seeded = work.seed(&demo)?;
-//! work.run_office(&office, seeded)?;
+//! let work = Arc::new(WorkService::new(Arc::clone(&store), demo.workspace.clone()));
+//! work.seed(&demo)?;
 //! // The API layer mounts the routes and adds the service as an extension:
 //! let agent = pitcrew_hub_work::agent_routes::<()>().layer(axum::Extension(Arc::clone(&work)));
 //! let device = pitcrew_hub_work::device_routes::<()>().layer(axum::Extension(Arc::clone(&work)));
 //! // ... and filters activity through the reference index:
 //! let refs: Arc<dyn pitcrew_hub_work::EventRefs> = work.clone();
-//! // After each append (from any writer), the back office applies what it emitted:
+//! // After each append (the seed, any writer's, the office's own), the back office applies what
+//! // it emitted, from the first revision it has not looked at: that also covers revisions other
+//! // processes appended, which are not announced.
 //! while let Ok(revs) = appended.try_recv() {
-//!     work.run_office(&office, revs)?;
+//!     if revs.to_rev > last {
+//!         work.run_office(&office, RevRange { from_rev: last + 1, to_rev: revs.to_rev })?;
+//!         last = revs.to_rev;
+//!     }
 //! }
 //! # let _ = (agent, device, refs);
 //! # Ok(()) }
