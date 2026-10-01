@@ -70,10 +70,13 @@ export function TaskDetail({
   taskId,
   Title = 'h2',
   close,
+  combineHeading = false,
 }: {
   taskId: TaskId;
   Title?: TitleComponent;
   close?: ReactNode;
+  /** One heading reading "KEY · Title" instead of the key on its own line above it (a page of its own, not a drawer). */
+  combineHeading?: boolean;
 }) {
   const task = useTask(taskId);
   const me = useMe();
@@ -98,10 +101,14 @@ export function TaskDetail({
   return (
     <article className="flex flex-col gap-5">
       <header className="flex items-start gap-2">
-        <div className="flex flex-col gap-1">
-          <span className="font-mono text-xs text-ink-2">{data.key}</span>
-          <Title className="text-xl leading-tight font-semibold">{data.title}</Title>
-        </div>
+        {combineHeading ? (
+          <Title className="text-xl leading-tight font-semibold">{`${data.key} · ${data.title}`}</Title>
+        ) : (
+          <div className="flex flex-col gap-1">
+            <span className="font-mono text-xs text-ink-2">{data.key}</span>
+            <Title className="text-xl leading-tight font-semibold">{data.title}</Title>
+          </div>
+        )}
         <span className="ml-auto">{close}</span>
       </header>
       <Fields task={data} person={person} />

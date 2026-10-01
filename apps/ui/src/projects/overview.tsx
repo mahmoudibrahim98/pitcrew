@@ -130,6 +130,23 @@ export function NeedsYouPanel({ project, workstream }: { project?: ProjectId; wo
   );
 }
 
+/** "Where the project stands", its workstreams, what needs you, agents and activity — no header. */
+export function ProjectOverviewBody({ project }: { project: ProjectId }) {
+  return (
+    <div className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+      <div className="flex min-w-0 flex-col gap-4">
+        <WhereItStands target={{ kind: 'project', id: project }} title="Where the project stands" />
+        <WorkstreamsTable project={project} />
+        <ActivityFeed filters={{ project }} />
+      </div>
+      <div className="flex min-w-0 flex-col gap-4">
+        <NeedsYouPanel project={project} />
+        <AgentsNow project={project} title="Agents on it" />
+      </div>
+    </div>
+  );
+}
+
 export function ProjectOverview({ project }: { project: ProjectId }) {
   const data = useProject(project);
   const p = data.data;
@@ -144,16 +161,38 @@ export function ProjectOverview({ project }: { project: ProjectId }) {
           {p?.due !== undefined && <span className="text-sm text-ink-2">Due {formatDay(p.due)}</span>}
         </div>
       </header>
-      <div className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
-        <div className="flex min-w-0 flex-col gap-4">
-          <WhereItStands target={{ kind: 'project', id: project }} title="Where the project stands" />
-          <WorkstreamsTable project={project} />
-          <ActivityFeed filters={{ project }} />
-        </div>
-        <div className="flex min-w-0 flex-col gap-4">
-          <NeedsYouPanel project={project} />
-          <AgentsNow project={project} title="Agents on it" />
-        </div>
+      <ProjectOverviewBody project={project} />
+    </div>
+  );
+}
+
+/** "Where it stands", task counts, what needs you, agents and activity — no header. */
+export function WorkstreamOverviewBody({ workstream }: { workstream: WorkstreamId }) {
+  const tasks = useTasks({ workstream });
+  const counts = STATUS_ORDER.map((status) => ({
+    status,
+    count: (tasks.data ?? []).filter((t) => t.status === status).length,
+  })).filter((c) => c.count > 0 || c.status !== 'canceled');
+  return (
+    <div className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
+      <div className="flex min-w-0 flex-col gap-4">
+        <WhereItStands target={{ kind: 'workstream', id: workstream }} />
+        <Panel title="Tasks">
+          <ul aria-label="Tasks by status" className="flex flex-wrap gap-2">
+            {counts.map(({ status, count }) => (
+              <li key={status}>
+                <StatusPill tone={TASK_STATUS[status].tone}>
+                  {TASK_STATUS[status].label} {count}
+                </StatusPill>
+              </li>
+            ))}
+          </ul>
+        </Panel>
+        <ActivityFeed filters={{ workstream }} />
+      </div>
+      <div className="flex min-w-0 flex-col gap-4">
+        <NeedsYouPanel workstream={workstream} />
+        <AgentsNow workstream={workstream} title="Agents on it" />
       </div>
     </div>
   );
@@ -161,15 +200,10 @@ export function ProjectOverview({ project }: { project: ProjectId }) {
 
 export function WorkstreamOverview({ workstream }: { workstream: WorkstreamId }) {
   const data = useOptionalWorkstream(workstream);
-  const tasks = useTasks({ workstream });
   const names = useNames();
   const nav = useProjectsNav();
   const w = data.data;
   const openProject = nav.openProject;
-  const counts = STATUS_ORDER.map((status) => ({
-    status,
-    count: (tasks.data ?? []).filter((t) => t.status === status).length,
-  })).filter((c) => c.count > 0 || c.status !== 'canceled');
   return (
     <div className="flex flex-col gap-4">
       <header className="flex flex-col gap-1">
@@ -192,27 +226,7 @@ export function WorkstreamOverview({ workstream }: { workstream: WorkstreamId })
           )}
         </div>
       </header>
-      <div className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
-        <div className="flex min-w-0 flex-col gap-4">
-          <WhereItStands target={{ kind: 'workstream', id: workstream }} />
-          <Panel title="Tasks">
-            <ul aria-label="Tasks by status" className="flex flex-wrap gap-2">
-              {counts.map(({ status, count }) => (
-                <li key={status}>
-                  <StatusPill tone={TASK_STATUS[status].tone}>
-                    {TASK_STATUS[status].label} {count}
-                  </StatusPill>
-                </li>
-              ))}
-            </ul>
-          </Panel>
-          <ActivityFeed filters={{ workstream }} />
-        </div>
-        <div className="flex min-w-0 flex-col gap-4">
-          <NeedsYouPanel workstream={workstream} />
-          <AgentsNow workstream={workstream} title="Agents on it" />
-        </div>
-      </div>
+      <WorkstreamOverviewBody workstream={workstream} />
     </div>
   );
 }
