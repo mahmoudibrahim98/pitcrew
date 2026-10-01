@@ -24,6 +24,8 @@ export class FakeSocket implements SocketLike {
   onclose: (() => void) | null = null;
   onerror: (() => void) | null = null;
   closed = false;
+  /** As a real `WebSocket`'s: bytes sent but not yet taken by the connection. */
+  bufferedAmount = 0;
   readonly url: string;
   readonly protocols: string[];
 
