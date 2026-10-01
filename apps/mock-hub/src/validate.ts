@@ -56,7 +56,8 @@ export function oneOf<T extends string>(value: unknown, values: readonly T[], wh
 
 /**
  * Typed access to one JSON object from a request. `null` counts as absent, as it does for a Rust
- * `Option`. Every getter throws a 400 naming the field.
+ * `Option`, except where a handler asks `isNull` (the nullable fields of a task patch). Every
+ * getter throws a 400 naming the field.
  */
 export class Fields {
   readonly #object: Record<string, unknown>;
@@ -73,6 +74,11 @@ export class Fields {
   /** Whether the key is present at all, even as `null`. */
   has(key: string): boolean {
     return Object.hasOwn(this.#object, key);
+  }
+
+  /** Whether the key is present as `null`: for nullable fields, where `null` means "clear". */
+  isNull(key: string): boolean {
+    return this.has(key) && this.#object[key] === null;
   }
 
   /** The raw value, for nested objects; `undefined` when absent or `null`. */

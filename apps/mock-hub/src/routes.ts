@@ -27,6 +27,7 @@ import {
   KEYS,
   PERMISSION_MODES,
   PRIORITIES,
+  PROJECT_STATUSES,
   RECEIPT_KINDS,
   SCHEDULERS,
   SESSION_STATES,
@@ -48,6 +49,8 @@ import {
   type Session,
   type Subtask,
   type Task,
+  type TaskId,
+  type TaskPatch,
   type TaskStatus,
   type TokenScope,
   type Workstream,
@@ -314,6 +317,98 @@ function hostInfo(hub: Hub): HostInfo {
 
 // ─── Projects and workstreams ───────────────────────────────────────────────────────────────────
 
+/** `ProjectKey` in ids.rs: 2–10 characters, an uppercase letter, then uppercase letters or digits. */
+const PROJECT_KEY = /^[A-Z][A-Z0-9]{1,9}$/;
+
+/**
+ * Creates a project. The lead defaults to the caller and is always a member; the status defaults
+ * to `in_progress`. A key already in use is a 409.
+ */
+const createProject: Handler = (hub, ctx) => {
+  const fields = new Fields(ctx.body);
+  const key = fields.string('key');
+  if (!PROJECT_KEY.test(key)) {
+    throw invalid('key must be 2 to 10 characters: an uppercase letter, then uppercase letters or digits.');
+  }
+  const name = fields.text('name');
+  const leadId = fields.optString('lead');
+  const lead = leadId === undefined ? ctx.caller.member.id : memberRef(hub, leadId, 'lead').id;
+  const members: MemberId[] = [];
+  for (const [i, id] of (fields.optStringArray('members') ?? []).entries()) {
+    const member = memberRef(hub, id, `members[${i}]`).id;
+    if (!members.includes(member)) {
+      members.push(member);
+    }
+  }
+  if (!members.includes(lead)) {
+    members.unshift(lead);
+  }
+  const status = fields.optEnum('status', PROJECT_STATUSES) ?? 'in_progress';
+  const start = fields.optDate('start');
+  const due = fields.optDate('due');
+  requireStartBeforeDue(start, due);
+  const rootValue = fields.raw('root');
+  const root = rootValue === undefined ? undefined : knownLocation(hub, rootValue, fields.name('root'));
+  const taken = hub.projects.find((p) => p.key === key);
+  if (taken !== undefined) {
+    throw conflict(`The key ${key} is already used by "${taken.name}".`);
+  }
+  const project: Project = {
+    id: ulid(),
+    key,
+    name,
+    status,
+    lead,
+    members,
+    start,
+    due,
+    root,
+    external: [],
+  };
+  hub.projects.push(project);
+  hub.append(ctx.caller.member.id, { type: 'project_created', data: { project } });
+  return created(project);
+};
+
+/** Creates a workstream: `active` and `on_track` unless the body says otherwise. */
+const createWorkstream: Handler = (hub, ctx) => {
+  const fields = new Fields(ctx.body);
+  const projectId = fields.string('project');
+  const name = fields.text('name');
+  const status = fields.optEnum('status', WORKSTREAM_STATUSES) ?? 'active';
+  const locations = (fields.optArray('locations') ?? []).map((value, i) =>
+    knownLocation(hub, value, fields.name(`locations[${i}]`)),
+  );
+  // The contract makes an unknown project a 404 here, although it is in the body.
+  const project = found(hub.findProject(projectId), `No project ${projectId}.`);
+  const workstream: Workstream = {
+    id: ulid(),
+    project: project.id,
+    name,
+    status,
+    health: 'on_track',
+    locations,
+    external: [],
+  };
+  hub.workstreams.push(workstream);
+  hub.append(ctx.caller.member.id, { type: 'workstream_created', data: { workstream } });
+  return created(workstream);
+};
+
+/** A location on a machine the workspace knows. */
+function knownLocation(hub: Hub, value: unknown, where: string): Location {
+  const location = readLocation(value, where);
+  const machine = known(hub.findMachine(location.machine), `${where}.machine: no machine ${location.machine}.`);
+  return { ...location, machine: machine.id };
+}
+
+/** Dates are `YYYY-MM-DD`, so text order is date order. */
+function requireStartBeforeDue(start: string | undefined, due: string | undefined): void {
+  if (start !== undefined && due !== undefined && start > due) {
+    throw invalid(`start (${start}) must not be after due (${due}).`);
+  }
+}
+
 const listWorkstreams: Handler = (hub, ctx) => {
   const project = queryValue(ctx.query, 'project');
   return ok(hub.workstreams.filter((w) => project === undefined || w.project === project));
@@ -442,6 +537,201 @@ function assign(hub: Hub, author: MemberId, task: Task, assignee: MemberId | und
   if (task.assignee !== assignee) {
     task.assignee = assignee;
     hub.append(author, { type: 'task_assigned', data: { task: task.id, assignee } });
+  }
+}
+
+const TITLE_MAX = 500;
+const LABEL_MAX = 64;
+const LABELS_MAX = 32;
+
+/** Length in characters as Rust counts them (`chars().count()`): Unicode code points. */
+const charCount = (text: string): number => [...text].length;
+
+/**
+ * Edits a task's fields (a `TaskPatch`). The whole patch is checked first; then only the fields
+ * that change are written, and `task_updated` carries exactly those. A patch that changes nothing
+ * returns the task and emits nothing.
+ */
+const patchTask: Handler = (hub, ctx) => {
+  const task = taskAt(hub, ctx.param('id'));
+  const patch = changedFields(task, readTaskPatch(hub, task, new Fields(ctx.body)));
+  if (Object.keys(patch).length > 0) {
+    applyPatch(task, patch);
+    hub.append(ctx.caller.member.id, { type: 'task_updated', data: { task: task.id, patch } });
+  }
+  return ok(task);
+};
+
+/** The patch in the body, checked against the rules and normalised (trimmed, deduplicated). */
+function readTaskPatch(hub: Hub, task: Task, fields: Fields): TaskPatch {
+  const patch: TaskPatch = {};
+  if (fields.isNull('workstream')) {
+    patch.workstream = null;
+  } else {
+    const id = fields.optString('workstream');
+    if (id !== undefined) {
+      const workstream = known(hub.findWorkstream(id), `workstream: no workstream ${id}.`);
+      if (workstream.project !== task.project) {
+        throw invalid(`workstream "${workstream.name}" belongs to another project than ${task.key}.`);
+      }
+      patch.workstream = workstream.id;
+    }
+  }
+  const title = fields.optString('title')?.trim();
+  if (title !== undefined) {
+    if (charCount(title) < 1 || charCount(title) > TITLE_MAX) {
+      throw invalid(`title must be 1 to ${TITLE_MAX} characters after trimming.`);
+    }
+    patch.title = title;
+  }
+  const description = fields.optString('description');
+  if (description !== undefined) {
+    patch.description = description;
+  }
+  const priority = fields.optEnum('priority', PRIORITIES);
+  if (priority !== undefined) {
+    patch.priority = priority;
+  }
+  const labels = fields.optStringArray('labels');
+  if (labels !== undefined) {
+    patch.labels = readLabels(labels);
+  }
+  const start = fields.isNull('start') ? null : fields.optDate('start');
+  const due = fields.isNull('due') ? null : fields.optDate('due');
+  if (start !== undefined) {
+    patch.start = start;
+  }
+  if (due !== undefined) {
+    patch.due = due;
+  }
+  // The rule holds for the task as it will be, so a new start is checked against the old due.
+  requireStartBeforeDue(
+    start === undefined ? task.start : (start ?? undefined),
+    due === undefined ? task.due : (due ?? undefined),
+  );
+  const blockers = fields.optStringArray('blocked_by');
+  if (blockers !== undefined) {
+    patch.blocked_by = readBlockers(hub, task, blockers);
+  }
+  if (fields.raw('accept_auto') !== undefined) {
+    patch.accept_auto = fields.bool('accept_auto');
+  }
+  // Last, so a malformed body is a 400 even when it would also close a cycle.
+  if (patch.blocked_by !== undefined) {
+    requireNoCycle(hub, task, patch.blocked_by);
+  }
+  return patch;
+}
+
+/** Labels trimmed and deduplicated (first one wins), each 1–64 characters, at most 32. */
+function readLabels(labels: string[]): string[] {
+  const unique = [...new Set(labels.map((label) => label.trim()))];
+  const bad = unique.find((label) => charCount(label) < 1 || charCount(label) > LABEL_MAX);
+  if (bad !== undefined) {
+    throw invalid(`Each label must be 1 to ${LABEL_MAX} characters after trimming; "${bad}" is not.`);
+  }
+  if (unique.length > LABELS_MAX) {
+    throw invalid(`A task has at most ${LABELS_MAX} labels; this one would have ${unique.length}.`);
+  }
+  return unique;
+}
+
+/** Existing tasks other than `task`, deduplicated. */
+function readBlockers(hub: Hub, task: Task, ids: string[]): TaskId[] {
+  const blockers: TaskId[] = [];
+  for (const [i, id] of ids.entries()) {
+    const blocker = known(hub.findTaskById(id), `blocked_by[${i}]: no task ${id}.`);
+    if (blocker.id === task.id) {
+      throw invalid(`${task.key} cannot be blocked by itself.`);
+    }
+    if (!blockers.includes(blocker.id)) {
+      blockers.push(blocker.id);
+    }
+  }
+  return blockers;
+}
+
+/** A 409 if `task` waiting on `blockers` closes a cycle: some blocker already waits on `task`. */
+function requireNoCycle(hub: Hub, task: Task, blockers: TaskId[]): void {
+  for (const blocker of blockers) {
+    const seen = new Set<TaskId>();
+    const stack: TaskId[] = [blocker];
+    for (let id = stack.pop(); id !== undefined; id = stack.pop()) {
+      if (id === task.id) {
+        const key = hub.findTaskById(blocker)?.key ?? blocker;
+        throw conflict(`${key} already waits on ${task.key}, so ${task.key} cannot wait on it.`);
+      }
+      if (!seen.has(id)) {
+        seen.add(id);
+        stack.push(...(hub.findTaskById(id)?.blocked_by ?? []));
+      }
+    }
+  }
+}
+
+/** The fields of `wanted` whose values differ from the task's (lists compared in order). */
+function changedFields(task: Task, wanted: TaskPatch): TaskPatch {
+  const sameList = (a: readonly string[], b: readonly string[]): boolean =>
+    a.length === b.length && a.every((value, i) => value === b[i]);
+  const patch: TaskPatch = {};
+  if (wanted.workstream !== undefined && wanted.workstream !== (task.workstream ?? null)) {
+    patch.workstream = wanted.workstream;
+  }
+  if (wanted.title !== undefined && wanted.title !== task.title) {
+    patch.title = wanted.title;
+  }
+  if (wanted.description !== undefined && wanted.description !== task.description) {
+    patch.description = wanted.description;
+  }
+  if (wanted.priority !== undefined && wanted.priority !== task.priority) {
+    patch.priority = wanted.priority;
+  }
+  if (wanted.labels !== undefined && !sameList(wanted.labels, task.labels)) {
+    patch.labels = wanted.labels;
+  }
+  if (wanted.start !== undefined && wanted.start !== (task.start ?? null)) {
+    patch.start = wanted.start;
+  }
+  if (wanted.due !== undefined && wanted.due !== (task.due ?? null)) {
+    patch.due = wanted.due;
+  }
+  if (wanted.blocked_by !== undefined && !sameList(wanted.blocked_by, task.blocked_by)) {
+    patch.blocked_by = wanted.blocked_by;
+  }
+  if (wanted.accept_auto !== undefined && wanted.accept_auto !== task.accept_auto) {
+    patch.accept_auto = wanted.accept_auto;
+  }
+  return patch;
+}
+
+/** `TaskPatch::apply`: `null` clears a field. */
+function applyPatch(task: Task, patch: TaskPatch): void {
+  if (patch.workstream !== undefined) {
+    task.workstream = patch.workstream ?? undefined;
+  }
+  if (patch.title !== undefined) {
+    task.title = patch.title;
+  }
+  if (patch.description !== undefined) {
+    task.description = patch.description;
+  }
+  if (patch.priority !== undefined) {
+    task.priority = patch.priority;
+  }
+  if (patch.labels !== undefined) {
+    task.labels = [...patch.labels];
+  }
+  if (patch.start !== undefined) {
+    task.start = patch.start ?? undefined;
+  }
+  if (patch.due !== undefined) {
+    task.due = patch.due ?? undefined;
+  }
+  if (patch.blocked_by !== undefined) {
+    task.blocked_by = [...patch.blocked_by];
+  }
+  if (patch.accept_auto !== undefined) {
+    task.accept_auto = patch.accept_auto;
   }
 }
 
@@ -806,30 +1096,67 @@ const answerAsk: Handler = (hub, ctx) => {
 
 // ─── Briefs ─────────────────────────────────────────────────────────────────────────────────────
 
+/**
+ * A person's brief. Accepting the pending proposal unchanged (same text and next step) copies its
+ * receipts into `brief_accepted`, and the brief stays the back office's; any other text is the
+ * person's own, without receipts. "Keep current" is a PUT of the current text.
+ */
 const putBrief: Handler = (hub, ctx) => {
   const target = briefTarget(hub, ctx.param('kind'), ctx.param('id'));
   const fields = new Fields(ctx.body);
+  const text = fields.string('text');
+  const next = fields.optString('next');
+  const pinned = fields.bool('pinned');
+  const proposal = pendingProposal(hub, target);
+  const acceptsProposal = proposal !== undefined && proposal.text === text && proposal.next === next;
+  const receipts = acceptsProposal ? structuredClone(proposal.receipts) : [];
+  // Serde skips a `None` next and empty receipts, so the mock leaves them out too.
+  const event = hub.append(ctx.caller.member.id, {
+    type: 'brief_accepted',
+    data: {
+      target,
+      text,
+      ...(next === undefined ? {} : { next }),
+      pinned,
+      ...(receipts.length === 0 ? {} : { receipts }),
+    },
+  });
   const brief: Brief = {
     target,
-    text: fields.string('text'),
-    next: fields.optString('next'),
-    pinned: fields.bool('pinned'),
-    source: 'person',
-    updated: Date.now(),
-    receipts: [],
+    text,
+    next,
+    pinned,
+    source: acceptsProposal ? 'back_office' : 'person',
+    updated: event.at,
+    receipts,
   };
-  const index = hub.briefs.findIndex((b) => b.target.kind === target.kind && b.target.id === target.id);
+  const index = hub.briefs.findIndex((b) => sameTarget(b.target, target));
   if (index === -1) {
     hub.briefs.push(brief);
   } else {
     hub.briefs[index] = brief;
   }
-  hub.append(ctx.caller.member.id, {
-    type: 'brief_accepted',
-    data: { target, text: brief.text, pinned: brief.pinned },
-  });
   return ok(brief);
 };
+
+const sameTarget = (a: BriefTarget, b: BriefTarget): boolean => a.kind === b.kind && a.id === b.id;
+
+/**
+ * The pending proposal: the newest `brief_proposed` for the target, if it is newer (a higher
+ * revision) than the newest `brief_accepted`, which put the brief in force.
+ */
+function pendingProposal(
+  hub: Hub,
+  target: BriefTarget,
+): { text: string; next?: string; receipts: Receipt[] } | undefined {
+  for (let rev = hub.rev; rev >= 1; rev--) {
+    const body = hub.eventAt(rev)?.body;
+    if ((body?.type === 'brief_proposed' || body?.type === 'brief_accepted') && sameTarget(body.data.target, target)) {
+      return body.type === 'brief_proposed' ? body.data : undefined;
+    }
+  }
+  return undefined;
+}
 
 function briefTarget(hub: Hub, kind: string, id: string): BriefTarget {
   if (kind === 'project') {
@@ -925,6 +1252,7 @@ function directRefs(hub: Hub, body: EventBody): EventFilter {
       return { task: body.data.task.id };
     case 'task_moved':
     case 'task_assigned':
+    case 'task_updated':
     case 'subtasks_replaced':
       return { task: body.data.task };
     case 'dispatch_started':
@@ -1000,14 +1328,17 @@ const ROUTES: Route[] = [
   route('GET', '/v1/projects/:id', 'device', (hub, ctx) =>
     ok(found(hub.findProject(ctx.param('id')), `No project ${ctx.param('id')}.`)),
   ),
+  route('POST', '/v1/projects', 'device', createProject),
   route('GET', '/v1/workstreams', 'device', listWorkstreams),
   route('GET', '/v1/workstreams/:id', 'device', (hub, ctx) =>
     ok(found(hub.findWorkstream(ctx.param('id')), `No workstream ${ctx.param('id')}.`)),
   ),
+  route('POST', '/v1/workstreams', 'device', createWorkstream),
   route('PATCH', '/v1/workstreams/:id', 'device', patchWorkstream),
   // Tasks.
   route('GET', '/v1/tasks', 'agent', listTasks),
   route('GET', '/v1/tasks/:id', 'agent', (hub, ctx) => ok(taskAt(hub, ctx.param('id')))),
+  route('PATCH', '/v1/tasks/:id', 'device', patchTask),
   route('POST', '/v1/tasks', 'device', createTask),
   route('POST', '/v1/tasks/:id/move', 'agent', moveTask),
   route('POST', '/v1/tasks/:id/assign', 'device', assignTask),

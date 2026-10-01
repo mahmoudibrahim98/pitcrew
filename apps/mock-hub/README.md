@@ -58,6 +58,14 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
 - **Move rules** are `TaskStatus::can_move` ported exactly; a refused move is `409 conflict`.
 - **Dispatch** assigns an unassigned task to the agent (`task_assigned`), then emits
   `dispatch_started` and `session_discovered`. Done or canceled tasks answer 409.
+- **Creating projects and workstreams** (`POST /v1/projects`, `POST /v1/workstreams`) with the
+  contract's defaults; a project key already in use is 409, an unknown project for a workstream 404.
+- **Editing tasks** (`PATCH /v1/tasks/{id-or-key}`): every rule in the contract (title, labels,
+  workstream, `blocked_by` with cycles as 409, dates). `task_updated` carries only the fields that
+  changed, and a patch that changes nothing emits nothing.
+- **Briefs.** `PUT` stores `next`, and `brief_accepted` carries it. Accepting the pending proposal
+  unchanged (the fixture's revision 15 for PAP is one) copies its receipts, and the brief stays the
+  back office's.
 - **The event log.** The fixture's 15 events are revisions 1–15; every change appends an event with
   a new ULID. `GET /v1/events` pages it (`before` is exclusive, `at_start` says whether older
   matching events exist) and filters by project, workstream, task or session.
@@ -83,7 +91,6 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
   on their own, workstream health never changes by itself, and mentions do not create asks.
 - A resize changes nothing, and `model`, `persona` and `permission_mode` on a new session are only
   checked, not used (the contract says they are not echoed on `Session`).
-
 ## Safety
 
 It binds 127.0.0.1 only, and answers only requests addressed to `localhost`, `127.0.0.1` or

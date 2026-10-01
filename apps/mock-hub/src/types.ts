@@ -244,6 +244,22 @@ export interface Task {
   subtasks: Subtask[];
 }
 
+/**
+ * `TaskPatch`: a partial update of a task. A field left out is unchanged; `null` clears
+ * `workstream`, `start` and `due`. In `task_updated` it holds only the fields that changed.
+ */
+export interface TaskPatch {
+  workstream?: WorkstreamId | null;
+  title?: string;
+  description?: string;
+  priority?: Priority;
+  labels?: string[];
+  start?: CalendarDate | null;
+  due?: CalendarDate | null;
+  blocked_by?: TaskId[];
+  accept_auto?: boolean;
+}
+
 // ─── Sessions and dispatches ────────────────────────────────────────────────────────────────────
 
 export interface Session {
@@ -369,6 +385,7 @@ export type EventBody =
   | { type: 'task_created'; data: { task: Task } }
   | { type: 'task_moved'; data: { task: TaskId; from: TaskStatus; to: TaskStatus; mover: Mover } }
   | { type: 'task_assigned'; data: { task: TaskId; assignee?: MemberId } }
+  | { type: 'task_updated'; data: { task: TaskId; patch: TaskPatch } }
   | { type: 'subtasks_replaced'; data: { task: TaskId; subtasks: Subtask[] } }
   | { type: 'dispatch_started'; data: { dispatch: Dispatch } }
   | {
@@ -381,8 +398,14 @@ export type EventBody =
       type: 'comment_posted';
       data: { task?: TaskId; workstream?: WorkstreamId; text: string; mentions: MemberId[] };
     }
-  | { type: 'brief_proposed'; data: { target: BriefTarget; text: string; receipts: Receipt[] } }
-  | { type: 'brief_accepted'; data: { target: BriefTarget; text: string; pinned: boolean } }
+  | {
+      type: 'brief_proposed';
+      data: { target: BriefTarget; text: string; next?: string; receipts: Receipt[] };
+    }
+  | {
+      type: 'brief_accepted';
+      data: { target: BriefTarget; text: string; next?: string; pinned: boolean; receipts?: Receipt[] };
+    }
   | {
       type: 'decision_recorded';
       data: { workstream?: WorkstreamId; text: string; why?: string; receipts: Receipt[] };
