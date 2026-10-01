@@ -23,12 +23,14 @@ pub(crate) const JOB_BEGIN: &str = "#!/bin/sh\n# pitcrew-job-script-begin\n";
 /// How long the job waits for its record and for the helper's socket, by default.
 pub const DEFAULT_JOB_WAIT: Duration = Duration::from_secs(60);
 
-/// The `#SBATCH` options a site recipe or the user may add (as `--name` or `--name=value`).
-/// Options PitCrew sets itself (`--job-name`, `--chdir`, `--output`, `--error`, `--parsable`)
-/// are not on it, nor ones that would change which job or which cluster status and stop look at
-/// (`--array`, `--clusters`, `--wrap`, `--wait`, `--uid`, …), nor the typed options of
-/// [`JobOptions`] (`--partition`, `--account`, `--qos`, `--time`, `--cpus-per-task`, `--mem`,
-/// `--gres`). Abbreviations, which sbatch would accept, are not either.
+/// The `#SBATCH` options a site recipe or the user may add, as `--name=value` (or `--name` alone
+/// for those in [`SBATCH_FLAGS`]). Options PitCrew sets itself (`--job-name`, `--chdir`,
+/// `--output`, `--error`, `--parsable`) are not on it, nor ones that would change which job or
+/// which cluster status and stop look at (`--array`, `--clusters`, `--wrap`, `--wait`, `--uid`,
+/// …), nor ones that change the helper's environment or where mail goes (`--export`,
+/// `--get-user-env`, `--propagate`, `--mail-user`), nor the typed options of [`JobOptions`]
+/// (`--partition`, `--account`, `--qos`, `--time`, `--cpus-per-task`, `--mem`, `--gres`).
+/// Abbreviations, which sbatch would accept, are not either.
 pub const ALLOWED_SBATCH: &[&str] = &[
     "acctg-freq",
     "begin",
@@ -45,8 +47,6 @@ pub const ALLOWED_SBATCH: &[&str] = &[
     "distribution",
     "exclude",
     "exclusive",
-    "export",
-    "get-user-env",
     "gpu-bind",
     "gpu-freq",
     "gpus",
@@ -58,7 +58,6 @@ pub const ALLOWED_SBATCH: &[&str] = &[
     "kill-on-invalid-dep",
     "licenses",
     "mail-type",
-    "mail-user",
     "mcs-label",
     "mem-bind",
     "mem-per-cpu",
@@ -79,7 +78,6 @@ pub const ALLOWED_SBATCH: &[&str] = &[
     "prefer",
     "priority",
     "profile",
-    "propagate",
     "requeue",
     "reservation",
     "signal",
@@ -93,6 +91,25 @@ pub const ALLOWED_SBATCH: &[&str] = &[
     "use-min-nodes",
     "wckey",
 ];
+
+/// The options of [`ALLOWED_SBATCH`] that may stand alone, without `=value`. sbatch reads all
+/// `#SBATCH` words as one command line, so any other option without its value would take the
+/// next directive as its value.
+pub const SBATCH_FLAGS: &[&str] = &[
+    "contiguous",
+    "exclusive",
+    "nice",
+    "no-kill",
+    "no-requeue",
+    "oversubscribe",
+    "requeue",
+    "spread-job",
+    "use-min-nodes",
+];
+
+/// Words that SLURM up to 20.11 reads anywhere in an `#SBATCH` line (case-insensitively) as the
+/// start of another component of a heterogeneous job. Status and stop could then lose the job.
+const HETJOB_WORDS: [&str; 2] = ["hetjob", "packjob"];
 
 /// A SLURM time limit, or time left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,9 +255,9 @@ fn check_plain_path(what: &str, path: &str, max: usize) -> Result<(), HelperErro
     }
 }
 
-/// Checks one extra `#SBATCH` option: `--name` or `--name=value`, the name on
-/// [`ALLOWED_SBATCH`], the value 1 to 256 characters of `A-Z a-z 0-9 _ . , : = + / @ % & | [ ]
-/// ( ) * -`.
+/// Checks one extra `#SBATCH` option: `--name=value`, or `--name` alone for [`SBATCH_FLAGS`];
+/// the name on [`ALLOWED_SBATCH`], the value 1 to 256 characters of `A-Z a-z 0-9 _ . , : = + / @
+/// % & | [ ] ( ) * -`.
 ///
 /// # Errors
 /// [`HelperError::InvalidArgument`] naming the problem.
@@ -264,21 +281,47 @@ pub fn check_sbatch_option(option: &str) -> Result<(), HelperError> {
              account, QOS, time, CPUs, memory and GPUs have their own settings)",
         ));
     }
-    if let Some(value) = value {
-        let ok = (1..=256).contains(&value.len())
-            && value
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "_.,:=+/@%&|[]()*-".contains(c));
-        if !ok {
+    match value {
+        Some(value) => {
+            let ok = (1..=256).contains(&value.len())
+                && value
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_.,:=+/@%&|[]()*-".contains(c));
+            if !ok {
+                return Err(invalid(
+                    "#SBATCH option",
+                    option,
+                    "its value must be 1 to 256 characters of A-Z a-z 0-9 _ . , : = + / @ % & | \
+                     [ ] ( ) * -",
+                ));
+            }
+        }
+        None if !SBATCH_FLAGS.contains(&name) => {
             return Err(invalid(
                 "#SBATCH option",
                 option,
-                "its value must be 1 to 256 characters of A-Z a-z 0-9 _ . , : = + / @ % & | [ ] \
-                 ( ) * -",
+                "needs =value (sbatch would take the next directive as its value)",
             ));
         }
+        None => {}
     }
     Ok(())
+}
+
+/// Refuses an `#SBATCH` line holding `hetjob` or `packjob` in any case: SLURM up to 20.11 would
+/// split the job there.
+fn check_no_hetjob(line: &str) -> Result<(), HelperError> {
+    let lower = line.to_ascii_lowercase();
+    match HETJOB_WORDS.iter().find(|word| lower.contains(*word)) {
+        Some(word) => Err(invalid(
+            "#SBATCH line",
+            line,
+            &format!(
+                "holds \"{word}\", where SLURM up to 20.11 would start another part of the job"
+            ),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// The option's name: `--constraint=a100` is `constraint`.
@@ -502,6 +545,9 @@ impl JobSpec {
         add("mem", &o.memory);
         add("gres", &o.gres);
         directives.extend(o.sbatch.iter().cloned());
+        for directive in &directives {
+            check_no_hetjob(directive)?;
+        }
 
         let mut text = String::from(JOB_BEGIN);
         text.push_str(&format!(
@@ -689,7 +735,7 @@ mod tests {
             sbatch: vec![
                 "--constraint=a100&ib".into(),
                 "--exclusive".into(),
-                "--mail-user=someone@example.org".into(),
+                "--mail-type=END".into(),
                 "--signal=B:TERM@60".into(),
             ],
         };
@@ -743,13 +789,27 @@ mod tests {
             "--comment=",
             "--constraint=a\n#SBATCH --uid=0",
             "--Constraint=a",
+            // They would change the helper's environment, or send mail elsewhere.
+            "--export=ALL,LD_PRELOAD=/tmp/x.so",
+            "--get-user-env",
+            "--propagate=ALL",
+            "--mail-user=someone@example.org",
+            // Without its value, an option would take the next directive as one.
+            "--constraint",
+            "--comment",
+            "--exclude",
         ] {
             let mut options = good.clone();
             options.sbatch.push(line.into());
             assert!(options.check().is_err(), "{line:?}");
         }
-        // `--constraint` alone is an allowed name; sbatch itself says it needs a value.
-        check_sbatch_option("--constraint").unwrap();
+        // True flags may stand alone, or take a value.
+        for flag in SBATCH_FLAGS {
+            check_sbatch_option(&format!("--{flag}")).unwrap();
+            assert!(ALLOWED_SBATCH.contains(flag), "{flag}");
+        }
+        check_sbatch_option("--exclusive=user").unwrap();
+        check_sbatch_option("--nice=10").unwrap();
         for module in ["python/3.12", "tool/1.0@abc", "compiler:2", "cuda"] {
             check_module(module).unwrap();
         }
@@ -954,6 +1014,48 @@ mod tests {
             script.job_name(),
             default_job_name(&Layout::at("/home/someone/.pitcrew").unwrap())
         );
+    }
+
+    /// SLURM up to 20.11 splits a job at `hetjob` or `packjob` anywhere in an `#SBATCH` line.
+    #[test]
+    fn hetjob_words_are_refused_anywhere() {
+        let refused = |options: JobOptions, root: &str| {
+            let spec = JobSpec::new(&generic(), &options).unwrap();
+            let err = spec.render(&target(root)).unwrap_err();
+            assert!(err.to_string().contains("job\""), "{err}");
+        };
+        let root = "/home/someone/.pitcrew";
+        refused(
+            JobOptions {
+                partition: Some("hetjobs".into()),
+                ..JobOptions::default()
+            },
+            root,
+        );
+        refused(
+            JobOptions {
+                account: Some("PackJob".into()),
+                ..JobOptions::default()
+            },
+            root,
+        );
+        refused(
+            JobOptions {
+                job_name: Some("my-HETJOB".into()),
+                ..JobOptions::default()
+            },
+            root,
+        );
+        refused(
+            JobOptions {
+                sbatch: vec!["--comment=a-packjob-b".into()],
+                ..JobOptions::default()
+            },
+            root,
+        );
+        refused(JobOptions::default(), "/home/packjob/.pitcrew");
+        let fine = JobSpec::new(&generic(), &JobOptions::default()).unwrap();
+        fine.render(&target(root)).unwrap();
     }
 
     #[test]

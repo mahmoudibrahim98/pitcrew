@@ -5,6 +5,11 @@
 //! A recipe file is read strictly: an unknown key, a table, or a value of the wrong type is an
 //! error, and every value is checked as [`super::JobSpec::new`] checks it. See
 //! `example-site.toml` beside this file, and the crate's README.
+//!
+//! **A recipe is trusted like a shell script the user runs.** Its `modules_init` script is
+//! sourced in the job and its modules are loaded there, so a recipe can run code as the user
+//! on the cluster. The checks keep its values from breaking the job script or changing which job
+//! PitCrew acts on; they do not make a recipe from someone else safe to use unread.
 
 use super::spec::{self, JobOptions, WallTime};
 use crate::helper::HelperError;
@@ -85,7 +90,8 @@ impl SocketPlace {
 }
 
 /// What a cluster needs for the helper's job. Values are checked when a [`super::JobSpec`] is
-/// made from it, whoever wrote the recipe.
+/// made from it, whoever wrote the recipe, but the recipe is trusted like a shell script the
+/// user runs: its modules and their set-up script run as the user (see the module docs).
 pub trait SiteRecipe: fmt::Debug + Send + Sync {
     /// Its name: 1 to 64 characters of `a-z 0-9 _ -`.
     fn name(&self) -> &str;

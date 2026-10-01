@@ -15,12 +15,15 @@ cpus = 2                   # --cpus-per-task
 memory = "8G"              # --mem
 gres = "gpu:1"             # --gres
 
-# More #SBATCH options, as long options. Only options that cannot change which job PitCrew
-# tracks, or where its files go, are accepted (see ALLOWED_SBATCH in the crate's docs).
+# More #SBATCH options, as long options with their values (--name=value). Only options that
+# cannot change which job PitCrew tracks, where its files go, or the helper's environment are
+# accepted (see ALLOWED_SBATCH in the crate's docs).
 sbatch = ["--constraint=a100", "--nodes=1"]
 
 # Environment modules the job loads before it starts the helper. If /bin/sh on the compute
-# nodes has no `module` command, name the script that sets it up.
+# nodes has no `module` command, name the script that sets it up: the job sources it, so it,
+# any link to it and the directories on the way must belong to root or you and be writable by
+# no one else. A recipe is trusted like a shell script you run.
 modules_init = "/etc/profile.d/modules.sh"
 modules = ["example-toolchain/1.0", "nodejs/22"]
 
