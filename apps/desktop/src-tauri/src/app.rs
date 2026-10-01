@@ -8,7 +8,10 @@
 //!   server named by `devUrl`. A release build without the bundled UI does not compile.
 //! - **The CSP** is in `tauri.conf.json`; **the capability** in `capabilities/main.json`: the
 //!   gateway's commands and listening to its events, nothing else. The app alone emits
-//!   `gateway://workspaces` and `gateway://navigate`.
+//!   `gateway://workspaces`, `gateway://navigate`, `gateway://prompt` and
+//!   `gateway://prompt-closed`, to the main window only.
+//! - **Remote workspaces** ([`crate::remote`]): their tunnels are made again at start, SSH's
+//!   questions go to the main window, and their tunnels close when the app quits.
 //! - **Single instance**: a second launch focuses the first one's window, and opens the deep link
 //!   it was given, if any ([`crate::navigate`]).
 //! - **In the background** ([`crate::shell`]): closing the window keeps the app in the tray, when
@@ -20,9 +23,13 @@ use crate::daemon::endpoint::Endpoint;
 use crate::daemon::supervisor::{Options, Supervisor};
 use crate::daemon::{LocalConnector, follow, locate};
 use crate::gateway::Gateway;
+use crate::keychain::OsKeychain;
 use crate::navigate::{self, Navigator};
 use crate::preferences::PreferenceStore;
 use crate::registry::{self, GatewayWorkspace, Registry};
+use crate::remote::helpers::{self, Helpers};
+use crate::remote::prompt::{PROMPT_CLOSED_EVENT, PROMPT_EVENT, PromptClosed};
+use crate::remote::{PromptEvent, PromptHub, RemoteOptions, Remotes};
 use crate::settings::Settings;
 use crate::shell::Shell;
 use crate::{commands, logging, scheme, tray};
@@ -103,6 +110,12 @@ pub fn configure<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
             commands::gateway_socket_open,
             commands::gateway_socket_send,
             commands::gateway_socket_close,
+            commands::gateway_ssh_hosts,
+            commands::gateway_remote_probe,
+            commands::gateway_remote_plan,
+            commands::gateway_remote_add,
+            commands::gateway_workspace_remove,
+            commands::gateway_prompt_reply,
         ])
         .on_page_load(on_page_load)
         .on_window_event(on_window_event)
@@ -117,10 +130,13 @@ pub fn on_page_load<R: Runtime>(webview: &Webview<R>, payload: &PageLoadPayload<
     if let Some(gateway) = webview.try_state::<Gateway>() {
         gateway.page_started(webview.label());
     }
-    if webview.label() == MAIN
-        && let Some(navigator) = webview.try_state::<Navigator>()
-    {
-        navigator.page_started();
+    if webview.label() == MAIN {
+        if let Some(navigator) = webview.try_state::<Navigator>() {
+            navigator.page_started();
+        }
+        if let Some(remotes) = webview.try_state::<Remotes>() {
+            remotes.prompts().page_started();
+        }
     }
 }
 
@@ -155,6 +171,55 @@ pub fn emit_workspaces<R: Runtime>(app: &AppHandle<R>, list: &[GatewayWorkspace]
     if let Err(e) = app.emit_to(target, WORKSPACES_EVENT, list) {
         tracing::warn!(error = %e, "cannot emit the workspace list");
     }
+}
+
+/// Sends an SSH prompt to the main window as `gateway://prompt`, or withdraws one with
+/// `gateway://prompt-closed`.
+pub fn emit_prompt<R: Runtime>(app: &AppHandle<R>, event: &PromptEvent) {
+    let target = EventTarget::WebviewWindow {
+        label: MAIN.to_owned(),
+    };
+    let emitted = match event {
+        PromptEvent::Open(prompt) => app.emit_to(target, PROMPT_EVENT, prompt),
+        PromptEvent::Closed(id) => {
+            app.emit_to(target, PROMPT_CLOSED_EVENT, PromptClosed { id: id.clone() })
+        }
+    };
+    if let Err(e) = emitted {
+        tracing::warn!(error = %e, "cannot emit a prompt event");
+    }
+}
+
+/// The remote workspaces' options from the settings: the ssh to use, `pitcrew-askpass` next to
+/// the app (or as set), and the helpers installed with it (`helpers/` beside the program or in
+/// the app's resources) or as set.
+fn remote_options(
+    settings: &Settings,
+    beside: Option<&std::path::Path>,
+    resources: Option<&std::path::Path>,
+) -> RemoteOptions {
+    let askpass = helpers::locate_askpass(settings.askpass.as_deref(), beside);
+    if let Err(e) = &askpass {
+        tracing::warn!(error = %e, "remote machines cannot ask for passwords");
+    }
+    let helpers = match &settings.helpers {
+        Some(dir) => Helpers::in_dir(dir.clone()),
+        None => Helpers::new(
+            [resources, beside]
+                .into_iter()
+                .flatten()
+                .map(|dir| dir.join("helpers"))
+                .collect(),
+        ),
+    };
+    RemoteOptions::new(
+        settings
+            .ssh
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("ssh")),
+        askpass,
+        helpers,
+    )
 }
 
 /// The supervisor, kept to stop the daemon when the app quits.
@@ -216,8 +281,22 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         runtime.inner(),
     );
     local.notify_failures(supervisor.poke_handle());
-    runtime.spawn(follow(supervisor.state(), local, registry));
+    runtime.spawn(follow(supervisor.state(), local, Arc::clone(&registry)));
     app.manage(Daemon(Mutex::new(Some(supervisor))));
+
+    let asker = handle.clone();
+    let prompts = Arc::new(PromptHub::new(move |event| emit_prompt(&asker, event)));
+    let resources = paths.resource_dir().ok();
+    let remotes = Remotes::new(
+        remote_options(&settings, beside.as_deref(), resources.as_deref()),
+        registry,
+        Arc::new(OsKeychain::default()),
+        prompts,
+        runtime.inner().clone(),
+    );
+    remotes.resume();
+    remotes.watch_wakes();
+    app.manage(remotes);
 
     main_window(app)?;
     // A deep link that launched the app: held until the page listens.
@@ -300,10 +379,21 @@ pub fn is_app_url(origins: &[(String, String, Option<u16>)], url: &Url) -> bool 
     origins.contains(&origin_of(url))
 }
 
-/// When the app quits: stop watching, and stop the daemon if this app started it.
+/// When the app quits: stop watching, close the remote tunnels, and stop the daemon if this app
+/// started it.
 fn shutdown<R: Runtime>(app: &AppHandle<R>) {
     if let Some(shell) = app.try_state::<Shell>() {
         shell.stop();
+    }
+    if let Some(remotes) = app.try_state::<Remotes>() {
+        tauri::async_runtime::block_on(async {
+            if tokio::time::timeout(QUIT_TIMEOUT, remotes.shutdown())
+                .await
+                .is_err()
+            {
+                tracing::warn!("the remote connections did not close in time");
+            }
+        });
     }
     let supervisor = app
         .try_state::<Daemon>()

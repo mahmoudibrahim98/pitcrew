@@ -183,10 +183,15 @@ pub fn locate_askpass(configured: Option<&Path>, beside: Option<&Path>) -> Resul
         LocateError::NotFound => format!(
             "{ASKPASS} is not next to the app{}: PitCrew needs it to ask for SSH passwords, \
              passphrases and codes. Install it there, or set \"askpass\" in settings.json",
-            beside.map(|d| format!(" ({})", d.display())).unwrap_or_default()
+            beside
+                .map(|d| format!(" ({})", d.display()))
+                .unwrap_or_default()
         ),
         LocateError::NotAProgram(path) => {
-            format!("the configured askpass, {}, is not a program", path.display())
+            format!(
+                "the configured askpass, {}, is not a program",
+                path.display()
+            )
         }
         other => other.to_string(),
     })
@@ -226,7 +231,8 @@ mod tests {
         let bytes = b"#!/bin/sh\necho pitcrewd 1.2.3\n";
         let artefact = Platform::LinuxX86_64.artefact();
         std::fs::write(dir.join(artefact), bytes).unwrap();
-        let manifest = serde_json::json!({ "version": "1.2.3", "sha256": { artefact: hex_sha256(bytes) } });
+        let manifest =
+            serde_json::json!({ "version": "1.2.3", "sha256": { artefact: hex_sha256(bytes) } });
         std::fs::write(dir.join(MANIFEST), manifest.to_string()).unwrap();
         let found = helpers.find(Platform::LinuxX86_64).unwrap();
         assert_eq!(found.version, "1.2.3");
@@ -266,7 +272,9 @@ mod tests {
         std::fs::write(dir.join(MANIFEST), manifest.to_string()).unwrap();
         std::fs::set_permissions(dir.join(artefact), std::fs::Permissions::from_mode(0o666))
             .unwrap();
-        let e = Helpers::in_dir(dir).find(Platform::LinuxX86_64).unwrap_err();
+        let e = Helpers::in_dir(dir)
+            .find(Platform::LinuxX86_64)
+            .unwrap_err();
         assert!(e.contains("written by other users"), "{e}");
     }
 

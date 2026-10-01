@@ -10,7 +10,9 @@
 //! - [`daemon`]: finding, starting and supervising the local `pitcrewd`, and connecting to it with
 //!   the client checks of `pitcrew_api::client`.
 //! - [`registry`]: the workspaces, saved in the app's local data directory.
-//! - [`keychain`]: where remote workspaces' device tokens will live.
+//! - [`remote`]: remote workspaces: adding a machine (probe, plan, add), its tunnel, SSH's
+//!   prompts in the app, and removing it.
+//! - [`keychain`]: where remote workspaces' device tokens live.
 //! - [`app`]: the Tauri wiring: the window, its CSP and capability, single instance, cleanup.
 //! - [`navigate`]: deep links (`pitcrew://…`) and notification clicks, as `gateway://navigate`.
 //! - [`shell`]: the app in the background: "needs you" ([`attention`]), notifications
@@ -30,6 +32,7 @@ pub mod notify;
 pub mod preferences;
 pub mod redact;
 pub mod registry;
+pub mod remote;
 pub mod scheme;
 pub mod settings;
 pub mod shell;

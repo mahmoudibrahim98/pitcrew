@@ -1,6 +1,6 @@
 {
   "identifier": "main",
-  "description": "The main window: the gateway's commands and listening to its events (gateway://workspaces, gateway://navigate). No shell, fs, http, opener or notification access, and no events the webview can emit.",
+  "description": "The main window: the gateway's commands (workspaces, requests, sockets, adding and removing remote machines, answering SSH prompts) and listening to its events (gateway://workspaces, gateway://navigate, gateway://prompt, gateway://prompt-closed). No shell, fs, http, opener or notification access, and no events the webview can emit.",
   "local": true,
   "windows": ["main"],
   "permissions": [
@@ -9,6 +9,12 @@
     "allow-gateway-socket-open",
     "allow-gateway-socket-send",
     "allow-gateway-socket-close",
+    "allow-gateway-ssh-hosts",
+    "allow-gateway-remote-probe",
+    "allow-gateway-remote-plan",
+    "allow-gateway-remote-add",
+    "allow-gateway-workspace-remove",
+    "allow-gateway-prompt-reply",
     "core:event:allow-listen",
     "core:event:allow-unlisten"
   ]

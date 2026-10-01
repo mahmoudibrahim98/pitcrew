@@ -16,15 +16,18 @@
 //!   (`UpdateHostKeys=ask`'s "Accept updated hostkeys?", a key's use to confirm) and its notices
 //!   ("touch your security key") are shown as `host_key`: accept answers yes, anything else no
 //!   (for a notice, it stops ssh).
-//! - **A page that reloads** gets the open prompts again when it next asks for the workspaces
-//!   ([`PromptHub::page_listening`]), so a prompt raised while no page listened (at start, a
-//!   reconnect) is not lost.
+//! - **A page that (re)loads** gets the open prompts again when it first asks for the workspaces
+//!   ([`PromptHub::page_listening`]), so a prompt raised while no page listened (at start, while
+//!   reconnecting) is not lost. Prompts are keyed by id: the UI shows one id once.
 
 use crate::gateway::GatewayError;
-use pitcrew_remote::{PromptCancel, PromptFuture, PromptHandler, PromptKind, PromptRequest, Reply, Secret};
+use pitcrew_remote::{
+    PromptCancel, PromptFuture, PromptHandler, PromptKind, PromptRequest, Reply, Secret,
+};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::oneshot;
 
@@ -97,6 +100,8 @@ pub struct PromptClosed {
 type Emit = Arc<dyn Fn(&PromptEvent) + Send + Sync>;
 
 struct Pending {
+    /// Tells the oldest first.
+    seq: u64,
     prompt: GatewayPrompt,
     reply: oneshot::Sender<Reply>,
 }
@@ -105,6 +110,9 @@ struct Pending {
 pub struct PromptHub {
     emit: Emit,
     pending: Mutex<HashMap<String, Pending>>,
+    next: AtomicU64,
+    /// No page has listened since the main page last (re)loaded.
+    replay: AtomicBool,
 }
 
 impl fmt::Debug for PromptHub {
@@ -122,21 +130,36 @@ impl PromptHub {
         Self {
             emit: Arc::new(emit),
             pending: Mutex::default(),
+            next: AtomicU64::new(0),
+            replay: AtomicBool::new(true),
         }
     }
 
     /// The prompts waiting for an answer, oldest first.
     #[must_use]
     pub fn open(&self) -> Vec<GatewayPrompt> {
-        let mut open: Vec<GatewayPrompt> = self.lock().values().map(|p| p.prompt.clone()).collect();
-        open.sort_by(|a, b| a.id.cmp(&b.id));
-        open
+        let mut open: Vec<(u64, GatewayPrompt)> = self
+            .lock()
+            .values()
+            .map(|p| (p.seq, p.prompt.clone()))
+            .collect();
+        open.sort_by_key(|(seq, _)| *seq);
+        open.into_iter().map(|(_, prompt)| prompt).collect()
     }
 
-    /// The page started listening: every open prompt is emitted again.
+    /// The main page started loading: what it may have missed is emitted again once it listens.
+    pub fn page_started(&self) {
+        self.replay.store(true, Ordering::SeqCst);
+    }
+
+    /// The main page listens (it asked for the workspaces): the first time since it loaded,
+    /// every open prompt is emitted again. The UI keys prompts by id, so one it saw already is
+    /// not shown twice.
     pub fn page_listening(&self) {
-        for prompt in self.open() {
-            (self.emit)(&PromptEvent::Open(prompt));
+        if self.replay.swap(false, Ordering::SeqCst) {
+            for prompt in self.open() {
+                (self.emit)(&PromptEvent::Open(prompt));
+            }
         }
     }
 
@@ -222,6 +245,7 @@ impl PromptHandler for PromptHub {
             self.lock().insert(
                 id.clone(),
                 Pending {
+                    seq: self.next.fetch_add(1, Ordering::Relaxed),
                     prompt: prompt.clone(),
                     reply,
                 },
@@ -287,7 +311,9 @@ mod tests {
     fn hub() -> (Arc<PromptHub>, Arc<Mutex<Vec<PromptEvent>>>) {
         let events: Arc<Mutex<Vec<PromptEvent>>> = Arc::default();
         let seen = Arc::clone(&events);
-        let hub = Arc::new(PromptHub::new(move |e| seen.lock().unwrap().push(e.clone())));
+        let hub = Arc::new(PromptHub::new(move |e| {
+            seen.lock().unwrap().push(e.clone())
+        }));
         (hub, events)
     }
 
@@ -325,8 +351,11 @@ mod tests {
         let asking = tokio::spawn({
             let hub = Arc::clone(&hub);
             async move {
-                hub.prompt(request(PromptKind::Password, "(sam@hpc-login) Password: "), cancel)
-                    .await
+                hub.prompt(
+                    request(PromptKind::Password, "(sam@hpc-login) Password: "),
+                    cancel,
+                )
+                .await
             }
         });
         let prompt = opened(&events, 0).await;
@@ -361,7 +390,10 @@ mod tests {
         let (_trigger, cancel) = PromptCancel::pair();
         let asking = tokio::spawn({
             let hub = Arc::clone(&hub);
-            async move { hub.prompt(request(PromptKind::Otp, "Verification code: "), cancel).await }
+            async move {
+                hub.prompt(request(PromptKind::Otp, "Verification code: "), cancel)
+                    .await
+            }
         });
         let prompt = opened(&events, 0).await;
         assert_eq!(prompt.kind, PromptKindName::Otp);
@@ -371,7 +403,10 @@ mod tests {
         let (trigger, cancel) = PromptCancel::pair();
         let asking = tokio::spawn({
             let hub = Arc::clone(&hub);
-            async move { hub.prompt(request(PromptKind::Password, "Password: "), cancel).await }
+            async move {
+                hub.prompt(request(PromptKind::Password, "Password: "), cancel)
+                    .await
+            }
         });
         let prompt = opened(&events, 1).await;
         // A page that reloads gets it again.
@@ -384,7 +419,10 @@ mod tests {
             events.lock().unwrap().last(),
             Some(&PromptEvent::Closed(prompt.id.clone()))
         );
-        assert!(hub.reply(&prompt.id, Some(Secret::new("late")), None).is_err());
+        assert!(
+            hub.reply(&prompt.id, Some(Secret::new("late")), None)
+                .is_err()
+        );
     }
 
     #[tokio::test]

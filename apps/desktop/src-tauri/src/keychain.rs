@@ -1,7 +1,9 @@
-//! Where device tokens for remote workspaces will live (ADR-0006: "stored in the OS keychain").
+//! Where device tokens for remote workspaces live (ADR-0006: "stored in the OS keychain").
 //!
-//! Nothing uses this yet besides its tests; remote pairing will. The local workspace's token is
-//! never copied here: it stays in the daemon's own token file, read on every connection.
+//! Pairing a remote workspace keeps its hub's token here, under the workspace's id; its
+//! connector reads it for each connection, and removing the workspace deletes it. The local
+//! workspace's token is never copied here: it stays in the daemon's own token file, read on
+//! every connection.
 
 use crate::token::DeviceToken;
 use std::collections::HashMap;

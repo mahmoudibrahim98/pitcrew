@@ -7,8 +7,8 @@
 
 use crate::gateway::GatewayError;
 use crate::registry::{JobRequest, LauncherKind};
-use pitcrew_remote::helper::slurm::{WallTime, parse_wall_time};
 use pitcrew_remote::JobOptions;
+use pitcrew_remote::helper::slurm::{WallTime, parse_wall_time};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -219,7 +219,11 @@ mod tests {
         store.insert("later".into(), 2, start + PLAN_TTL + Duration::from_secs(1));
         assert_eq!(store.len(), 2, "the expired one went");
         for n in 0..MAX_PLANS + 5 {
-            store.insert(format!("p{n}"), n, start + PLAN_TTL + Duration::from_secs(2 + n as u64));
+            store.insert(
+                format!("p{n}"),
+                n,
+                start + PLAN_TTL + Duration::from_secs(2 + n as u64),
+            );
         }
         assert_eq!(store.len(), MAX_PLANS);
         assert_eq!(
@@ -228,7 +232,11 @@ mod tests {
             "the oldest went first"
         );
         let last = format!("p{}", MAX_PLANS + 4);
-        assert!(store.take(&last, start + PLAN_TTL + Duration::from_secs(100)).is_ok());
+        assert!(
+            store
+                .take(&last, start + PLAN_TTL + Duration::from_secs(100))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -291,7 +299,10 @@ mod tests {
             serde_json::json!({ "host": "hpc-login", "launcher": "slurm", "job": { "nodes": 2 } }),
             serde_json::json!({ "launcher": "direct" }),
         ] {
-            assert!(serde_json::from_value::<RemotePlanRequest>(bad.clone()).is_err(), "{bad}");
+            assert!(
+                serde_json::from_value::<RemotePlanRequest>(bad.clone()).is_err(),
+                "{bad}"
+            );
         }
         let plan = RemotePlan {
             plan: "p".into(),

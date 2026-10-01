@@ -47,7 +47,7 @@ pub enum Connection {
     Local,
     /// A helper on another machine, through the tunnel of `pitcrew-remote`, with the token kept
     /// in the OS keychain.
-    Remote(RemoteConnection),
+    Remote(Box<RemoteConnection>),
 }
 
 /// How a remote workspace's helper was started, and so how it is found, checked and stopped.
@@ -733,6 +733,85 @@ mod tests {
         );
         registry.set_state("R", WorkspaceState::Ready, None);
         assert!(registry.connector("R").is_ok());
+    }
+
+    fn remote(id: &str) -> WorkspaceRecord {
+        WorkspaceRecord {
+            id: id.into(),
+            name: "Cluster".into(),
+            kind: WorkspaceKind::Remote,
+            connection: Connection::Remote(Box::new(RemoteConnection {
+                host: "hpc-login".into(),
+                launcher: LauncherKind::Slurm,
+                root: "/home/sam/.pitcrew".into(),
+                platform: "x86_64-unknown-linux-musl".into(),
+                site: Some("generic".into()),
+                job: Some(JobRequest {
+                    partition: Some("gpu".into()),
+                    time: Some("08:00:00".into()),
+                    ..JobRequest::default()
+                }),
+                last_hop: Some(HopKind::Srun),
+                transport: None,
+            })),
+        }
+    }
+
+    #[test]
+    fn remote_workspaces_are_saved_reloaded_and_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join(FILE_NAME);
+        let registry = Registry::load(file.clone());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&events);
+        registry.on_change(move |list| seen.lock().unwrap().push(list.to_vec()));
+        registry
+            .insert(
+                remote("01JR"),
+                Some(Arc::new(Nowhere)),
+                WorkspaceState::Ready,
+            )
+            .unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            saved["workspaces"][0]["connection"],
+            serde_json::json!({
+                "type": "remote", "host": "hpc-login", "launcher": "slurm",
+                "root": "/home/sam/.pitcrew", "platform": "x86_64-unknown-linux-musl",
+                "site": "generic", "job": { "partition": "gpu", "time": "08:00:00" },
+                "lastHop": "srun"
+            })
+        );
+
+        // The transport is remembered once, and saved.
+        registry.set_transport("01JR", Transport::Stdio).unwrap();
+        registry.set_transport("01JR", Transport::Stdio).unwrap();
+        let reloaded = Registry::load(file.clone());
+        let Some(WorkspaceRecord {
+            connection: Connection::Remote(saved),
+            ..
+        }) = reloaded.record("01JR")
+        else {
+            panic!("not reloaded");
+        };
+        assert_eq!(saved.transport, Some(Transport::Stdio));
+        assert_eq!(reloaded.list()[0].state, WorkspaceState::Connecting);
+        assert!(
+            reloaded.connector("01JR").is_err(),
+            "no connector until attached"
+        );
+        reloaded.attach("01JR", Arc::new(Nowhere));
+        assert!(reloaded.connector("01JR").is_ok());
+
+        // Removing forgets it, saves, and says so.
+        let before = events.lock().unwrap().len();
+        let removed = registry.remove("01JR").unwrap().unwrap();
+        assert_eq!(removed.id, "01JR");
+        assert!(registry.list().is_empty());
+        assert_eq!(events.lock().unwrap().len(), before + 1);
+        assert_eq!(registry.remove("01JR").unwrap(), None);
+        assert!(Registry::load(file).list().is_empty());
     }
 
     #[test]
