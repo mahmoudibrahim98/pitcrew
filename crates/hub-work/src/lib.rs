@@ -7,9 +7,10 @@
 //!   and append its events, stamped from the [`Caller`](pitcrew_protocol::api::Caller);
 //! - [`routes`]: the work routes of API v1, split into [`agent_routes`] and [`device_routes`] for
 //!   `RouterParts::agent` and `RouterParts::device`;
-//! - two seams for other streams: [`EventRefs`] (the activity reference index, for the API
-//!   layer's `GET /v1/events` filters) and [`Dispatcher`] (starting dispatched sessions, for the
-//!   runner link);
+//! - three seams for other streams: [`EventRefs`] (the activity reference index, for the API
+//!   layer's `GET /v1/events` filters), [`RecapIndex`] (blocks and day recaps, for the recap
+//!   routes; see [`recap`]) and [`Dispatcher`] (starting dispatched sessions, for the runner
+//!   link);
 //! - the back office acting on the hub ([`BackOffice`], [`OfficeCommands`]): its run log is a
 //!   projection ([`projections_with_office`]), and the daemon calls [`WorkService::run_office`]
 //!   after each append to apply what it emitted.
@@ -43,8 +44,11 @@
 //! // The API layer mounts the routes and adds the service as an extension:
 //! let agent = pitcrew_hub_work::agent_routes::<()>().layer(axum::Extension(Arc::clone(&work)));
 //! let device = pitcrew_hub_work::device_routes::<()>().layer(axum::Extension(Arc::clone(&work)));
-//! // ... and filters activity through the reference index:
+//! // ... filters activity through the reference index, and serves recaps from the recap index
+//! // (built from the log on first use; `sync_recaps` builds it now):
 //! let refs: Arc<dyn pitcrew_hub_work::EventRefs> = work.clone();
+//! let recaps: Arc<dyn pitcrew_hub_work::RecapIndex> = work.clone();
+//! work.sync_recaps()?;
 //! // After each append (the seed, any writer's, the office's own), the back office applies what
 //! // it emitted, from the first revision it has not looked at: that also covers revisions other
 //! // processes appended, which are not announced.
@@ -54,7 +58,7 @@
 //!         last = revs.to_rev;
 //!     }
 //! }
-//! # let _ = (agent, device, refs);
+//! # let _ = (agent, device, refs, recaps);
 //! # Ok(()) }
 //! ```
 //!
@@ -71,6 +75,7 @@ mod error;
 mod office;
 pub mod projection;
 pub mod query;
+pub mod recap;
 pub mod routes;
 mod seed;
 mod service;
@@ -85,6 +90,7 @@ pub use pitcrew_protocol::api::{NewProject, NewTask, NewWorkstream};
 pub use pitcrew_protocol::model::TaskPatch;
 pub use projection::projections;
 pub use query::{AskFilter, REF_SCAN_BUDGET, RefFilter, SessionFilter, TaskFilter, TaskRef};
+pub use recap::{BlockFilter, DAY_CACHE_ENTRIES, DaysScope, RecapIndex, Recaps};
 pub use routes::{agent_routes, device_routes, routes};
 pub use seed::demo_events;
 pub use service::{Clock, WorkService, WorkspaceAt};
