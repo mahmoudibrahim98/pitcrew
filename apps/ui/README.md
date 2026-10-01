@@ -69,3 +69,13 @@ reach. See `apps/ui/e2e/helpers.ts`.
 Geist and Geist Mono (SIL OFL 1.1) are bundled: the Latin subsets and Geist Mono's box-drawing
 subset from `@fontsource-variable`, plus the full variable fonts in `src/assets/fonts` for arrows,
 which no Fontsource subset has (loaded only when an arrow is on screen). No font CDN.
+
+## Terminal (xterm.js)
+
+`@xterm/xterm`, `@xterm/addon-webgl` and `@xterm/addon-fit` (MIT, pure JS, no install scripts) are
+dependencies of `@pitcrew/ui` so stream M's terminal pane (`src/console`, work package 4) can use
+them, but nothing imports them yet — they are pulled in lazily when a terminal pane first mounts,
+so they stay out of the initial bundle and `pnpm size` is unaffected. xterm.js 6.0 removed the
+canvas renderer addon (`@xterm/addon-canvas`, which has no release compatible with `@xterm/xterm`
+^6 — its last stable, 0.7.0, still peers on `^5.0.0`); the fallback for WebGL is xterm's built-in
+DOM renderer, not a separate addon.
