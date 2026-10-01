@@ -212,6 +212,9 @@ async fn events(
         session: id(query.session.as_deref(), "session")?,
     };
     let before = query.before;
+    // Failures are logged in full; clients only hear that the log could not be read (the detail
+    // may be the store's or the index's, such as SQL text or a path).
+    let failed = || ErrorResponse::new(ErrorCode::Internal, "Could not read the event log.");
     let page = tokio::task::spawn_blocking(move || {
         let before = match before {
             Some(before) => before,
@@ -221,14 +224,12 @@ async fn events(
     })
     .await
     .map_err(|e| {
-        ErrorResponse::new(
-            ErrorCode::Internal,
-            format!("Reading activity panicked: {e}"),
-        )
+        tracing::error!(error = %e, "reading activity panicked");
+        failed()
     })?
     .map_err(|e| {
         tracing::error!(error = %e, "reading activity failed");
-        ErrorResponse::new(ErrorCode::Internal, "Could not read the event log.")
+        failed()
     })?;
     Ok(Json(page))
 }

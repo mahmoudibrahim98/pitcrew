@@ -129,6 +129,21 @@ impl EventRefs for BrokenRefs {
     }
 }
 
+/// An index that panics.
+#[derive(Debug)]
+struct PanickingRefs;
+
+impl EventRefs for PanickingRefs {
+    fn revs_matching(
+        &self,
+        _: &RefFilter,
+        _: u64,
+        _: usize,
+    ) -> Result<(Vec<u64>, u64), SourceError> {
+        panic!("SELECT rev FROM work_event_refs failed at /very/secret/place");
+    }
+}
+
 fn parse<T: FromStr>(value: &serde_json::Value) -> Option<T>
 where
     T::Err: std::fmt::Debug,
@@ -838,26 +853,29 @@ async fn with_an_index_bad_ids_are_invalid_and_without_one_project_is_400() {
 }
 
 #[tokio::test]
-async fn an_index_that_fails_is_a_500_without_its_detail() {
+async fn an_index_that_fails_or_panics_is_a_500_without_its_detail() {
     let f = Fixture::new();
     let demo = pitcrew_fixtures::demo_workspace().unwrap();
     let (_, source) = self::demo();
-    let app = indexed(&f, source, Arc::new(BrokenRefs));
-    for query in [
-        format!("project={}", demo.projects[0].id.0),
-        format!("task={}", demo.tasks[0].id.0),
-        format!("session={}", demo.sessions[0].id.0),
-    ] {
-        let (status, body) = call(
-            app.clone(),
-            get_request(&format!("/v1/events?{query}"), Some(&f.device_token)),
-        )
-        .await;
-        assert_eq!(status, 500, "{query}");
-        assert_eq!(body["code"], "internal");
-        assert_eq!(body["message"], "Could not read the event log.");
+    let refs: [Arc<dyn EventRefs>; 2] = [Arc::new(BrokenRefs), Arc::new(PanickingRefs)];
+    for refs in refs {
+        let app = indexed(&f, source.clone(), refs);
+        for query in [
+            format!("project={}", demo.projects[0].id.0),
+            format!("task={}", demo.tasks[0].id.0),
+            format!("session={}", demo.sessions[0].id.0),
+        ] {
+            let (status, body) = call(
+                app.clone(),
+                get_request(&format!("/v1/events?{query}"), Some(&f.device_token)),
+            )
+            .await;
+            assert_eq!(status, 500, "{query}");
+            assert_eq!(body["code"], "internal");
+            assert_eq!(body["message"], "Could not read the event log.", "{query}");
+        }
+        // Unfiltered activity does not need the index.
+        let (status, _) = call(app, get_request("/v1/events", Some(&f.device_token))).await;
+        assert_eq!(status, 200);
     }
-    // Unfiltered activity does not need the index.
-    let (status, _) = call(app, get_request("/v1/events", Some(&f.device_token))).await;
-    assert_eq!(status, 200);
 }
