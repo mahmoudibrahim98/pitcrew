@@ -39,7 +39,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [0-daemon-solo](0-daemon-solo.md) | 0 · Composition root | `integrator/daemon-solo` | Opus-class | **Merged** |
 | [N-projects-wiring](N-projects-wiring.md) | N · Projects layout | `s/N/projects-wiring` | Sonnet-class | **Merged** |
 | [L-shell-polish](L-shell-polish.md) | L · UI foundation | `s/L/shell-polish` | Sonnet-class | **Merged** |
-| [E-edits-and-office](E-edits-and-office.md) | E · Work model | `s/E/edits-and-office` | Opus-class | In progress |
+| [E-edits-and-office](E-edits-and-office.md) | E · Work model | `s/E/edits-and-office` | Opus-class | **Merged** |
 | [H-activity-index](H-activity-index.md) | H · API and auth | `s/H/activity-index` | Opus-class | In progress |
 | [J-slurm](J-slurm.md) | J · Remote and HPC | `s/J/slurm` | Opus-class | In progress |
 | [A-scan](A-scan.md) | A · Ingest | `s/A/scan` | Sonnet-class | **Merged** |
