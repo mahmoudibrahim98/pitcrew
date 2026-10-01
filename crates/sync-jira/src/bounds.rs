@@ -28,6 +28,15 @@ pub const MAX_ADF_DEPTH: usize = 32;
 /// must not be allowed to take unbounded work either.
 pub const MAX_ADF_NODES: usize = 20_000;
 
+/// A safety margin, in hours, applied wherever the stored cursor instant meets the account's time
+/// zone: subtracted when rendering the cursor into a query (see
+/// [`crate::time::account_minute`]'s caller in `crate::sync`), and added when deciding whether the
+/// item cap's bypass should still apply (see `crate::client::JiraClient::search`). It covers
+/// version drift between this crate's bundled tzdata and the one Jira's own JVM uses, and any
+/// residual imprecision left over from zone resolution — on top of, not instead of, comparing
+/// cursors as real instants (the fix for round 2's blocking item).
+pub const CURSOR_SAFETY_MARGIN_HOURS: i64 = 1;
+
 #[cfg(test)]
 mod tests {
     use super::*;

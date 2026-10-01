@@ -5,23 +5,29 @@
 //! documents this explicitly for both the v2 and v3 REST APIs — which is *not necessarily* the
 //! time zone of the account making the request. JQL's own bare datetime literals
 //! (`updated >= "2026-01-02 03:04"`), by contrast, are interpreted in the **searching account's**
-//! own profile zone (read from `/myself`; see [`resolve_account_zone`]). An earlier version of
-//! this module assumed the two were the same and just truncated the wire text; when the site zone
-//! sits east of the account zone, that silently drops a trailing slice of the minute the cursor
-//! landed on, and updates in that gap are never synced. [`account_minute`] is the fix: it parses
-//! `updated` into an absolute instant and re-renders it in the account's own zone before handing
-//! it to [`crate::jql::incremental_query`].
+//! own profile zone (read fresh from `/myself` on every sync; see [`resolve_account_zone`] — a
+//! cached zone, combined with a cursor stored pre-rendered in that zone's local time, silently
+//! reintroduces the skip below if the account's profile zone ever changes between syncs, which is
+//! why `crate::sync` now reads it every call and `crate::state::ProjectState::cursor` stores an
+//! instant rather than rendered text). An earlier version of this module assumed the site and
+//! account zones were the same and just truncated the wire text; when the site zone sits east of
+//! the account zone, that silently drops a trailing slice of the minute the cursor landed on, and
+//! updates in that gap are never synced. [`account_minute`] is the fix: it renders an already-
+//! parsed instant in the account's own zone, to be called only at the point a query is actually
+//! built (never stored), so a changed account zone is reflected immediately on the next sync.
 
 use jiff::Timestamp;
 use jiff::tz::{AmbiguousOffset, Offset, TimeZone};
 use serde::{Deserialize, Serialize};
 
 /// An upstream timestamp, kept as Jira's own text (with the *site's* offset, not the account's).
-/// Still useful as-is for same-call ordering and for snapshot equality checks: every timestamp a
-/// single Jira instance returns carries the same site offset, so lexicographic comparison between
-/// two of them is still chronological order — it is only the *cursor* (crossing into a different
-/// zone) that needs real conversion, which is what [`account_minute`] is for.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+/// Deliberately **not** `Ord`/`PartialOrd`: a site observing daylight saving time uses a
+/// *different* offset across its own history, so two of this site's own timestamps do not
+/// generally compare correctly as raw text once summer and winter examples are mixed (only values
+/// sharing the one offset the site happened to be at are guaranteed to sort correctly that way).
+/// Anything that needs real chronological order — the cursor, the per-call "newest seen" tracking
+/// — compares [`to_instant`](Self::to_instant) values instead.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct JiraTimestamp(pub String);
 
@@ -57,10 +63,22 @@ impl JiraTimestamp {
     }
 }
 
+/// [`resolve_account_zone`]'s result: the zone to use, and whether resolving it had to fall back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedZone {
+    /// The zone to render cursors in.
+    pub zone: TimeZone,
+    /// `true` if `name` was absent or did not resolve, and `zone` is the UTC-12 fallback —
+    /// callers surface this as a `SyncIssue` (not just the one-per-process log line below), since
+    /// it means every cursor this sync renders is less precise than it should be.
+    pub fell_back: bool,
+}
+
 /// Looks up `name` (an IANA zone, e.g. `"America/New_York"`, as `/myself` reports it) in the
 /// bundled zone database. If `name` is absent or unrecognised, falls back to a fixed UTC-12
 /// offset — the most western offset in use — and logs the fallback once per process (never on
-/// every call: a persistently-unresolvable zone would otherwise log on every single sync).
+/// every call: a persistently-unresolvable zone would otherwise log on every single sync — see
+/// [`ResolvedZone::fell_back`] for the per-call signal instead).
 ///
 /// UTC-12 is safe specifically *because* it is extremal: for any real IANA zone Z and any
 /// instant, Z's civil (wall-clock) rendering of that instant is never earlier than UTC-12's.
@@ -68,14 +86,20 @@ impl JiraTimestamp {
 /// zone would have been — it can only cause redundant re-fetching of already-synced items
 /// (harmless: diffing against the stored snapshot makes that a no-op), never a skip.
 #[must_use]
-pub fn resolve_account_zone(name: Option<&str>) -> TimeZone {
+pub fn resolve_account_zone(name: Option<&str>) -> ResolvedZone {
     if let Some(name) = name
         && let Ok(tz) = TimeZone::get(name)
     {
-        return tz;
+        return ResolvedZone {
+            zone: tz,
+            fell_back: false,
+        };
     }
     log_fallback_once(name);
-    fallback_zone()
+    ResolvedZone {
+        zone: fallback_zone(),
+        fell_back: true,
+    }
 }
 
 fn fallback_zone() -> TimeZone {
@@ -173,12 +197,24 @@ mod tests {
     }
 
     #[test]
-    fn lexicographic_order_matches_chronological_order_within_one_site_offset() {
-        let a = ts("2026-01-02T03:04:05.000-0500");
-        let b = ts("2026-01-02T03:04:06.000-0500");
-        let c = ts("2026-01-03T00:00:00.000-0500");
+    fn to_instant_orders_correctly_even_across_different_site_offsets() {
+        // Unlike comparing the raw wire text, to_instant()'s result orders correctly regardless
+        // of whether the two timestamps share an offset — e.g. a DST site's own summer and winter
+        // examples, which `JiraTimestamp` itself is deliberately not `Ord` for (see its doc).
+        let a = ts("2026-01-02T03:04:05.000-0500")
+            .to_instant()
+            .expect("parses");
+        let b = ts("2026-01-02T03:04:06.000-0500")
+            .to_instant()
+            .expect("parses");
+        let c = ts("2026-01-02T09:00:00.000+0900")
+            .to_instant()
+            .expect("parses"); // = 2026-01-02T00:00:00Z
         assert!(a < b);
-        assert!(b < c);
+        assert!(
+            c < a,
+            "09:00+0900 is 00:00Z, earlier than either -0500 example"
+        );
     }
 
     #[test]
@@ -234,18 +270,34 @@ mod tests {
     }
 
     #[test]
+    fn account_minute_steps_back_across_a_dst_fold_first_occurrence_too() {
+        // The *first* occurrence of the same ambiguous "01:30" (as EDT, -04): 2026-11-01T05:30Z.
+        // An hour earlier in wall-clock terms than the second occurrence's instant, but both must
+        // step back to the exact same safe, unambiguous cursor — the fold is a property of the
+        // civil minute itself, not of which instant happened to produce it.
+        let zone = TimeZone::get("America/New_York").expect("bundled tzdb has this zone");
+        let instant = ts("2026-11-01T05:30:00.000+0000")
+            .to_instant()
+            .expect("parses");
+        assert_eq!(account_minute(instant, &zone), "2026-11-01 00:30");
+    }
+
+    #[test]
     fn unknown_zone_name_falls_back_to_utc_minus_twelve() {
-        let zone = resolve_account_zone(Some("Not/A_Real_Zone"));
+        let resolved = resolve_account_zone(Some("Not/A_Real_Zone"));
+        assert!(resolved.fell_back);
         let instant = ts("2026-01-02T00:00:00.000+0000")
             .to_instant()
             .expect("parses");
         // UTC-12 is 12 hours behind UTC, so 2026-01-02T00:00Z is still 2026-01-01 there.
-        assert_eq!(account_minute(instant, &zone), "2026-01-01 12:00");
+        assert_eq!(account_minute(instant, &resolved.zone), "2026-01-01 12:00");
     }
 
     #[test]
     fn absent_zone_name_falls_back_to_utc_minus_twelve() {
-        let zone = resolve_account_zone(None);
+        let resolved = resolve_account_zone(None);
+        assert!(resolved.fell_back);
+        let zone = resolved.zone;
         let instant = ts("2026-01-02T00:00:00.000+0000")
             .to_instant()
             .expect("parses");
@@ -254,7 +306,8 @@ mod tests {
 
     #[test]
     fn a_recognised_zone_name_resolves_to_itself() {
-        let zone = resolve_account_zone(Some("UTC"));
-        assert_eq!(zone, TimeZone::UTC);
+        let resolved = resolve_account_zone(Some("UTC"));
+        assert!(!resolved.fell_back);
+        assert_eq!(resolved.zone, TimeZone::UTC);
     }
 }

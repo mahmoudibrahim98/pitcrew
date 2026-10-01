@@ -7,11 +7,14 @@
 //! `updated >=` cursor (see [`crate::jql`]).
 
 use crate::auth::JiraAuth;
-use crate::bounds::{MAX_ITEMS_PER_SYNC, MAX_PAGE_BODY_BYTES, MAX_PAGES_PER_CALL, backoff_secs};
+use crate::bounds::{
+    CURSOR_SAFETY_MARGIN_HOURS, MAX_ITEMS_PER_SYNC, MAX_PAGE_BODY_BYTES, MAX_PAGES_PER_CALL,
+    backoff_secs,
+};
 use crate::deployment::Deployment;
-use crate::time::{JiraTimestamp, account_minute};
+use crate::time::JiraTimestamp;
 use crate::wire::WireIssue;
-use jiff::tz::TimeZone;
+use jiff::Timestamp;
 use pitcrew_sync_github::transport::{Method, Request, Transport, TransportError};
 use std::collections::HashSet;
 
@@ -63,19 +66,20 @@ impl Default for Limits {
     }
 }
 
-/// What to search and how: grouped into one struct (rather than four separate `search` parameters)
-/// to stay under clippy's argument-count lint, and because the four genuinely travel together —
-/// `fields` and `old_cursor_minute` only make sense alongside the `jql` they were built from, and
-/// `zone` only matters for converting items read *from* that same search.
+/// What to search and how: grouped into one struct (rather than separate `search` parameters) to
+/// stay under clippy's argument-count lint, and because these genuinely travel together — `fields`
+/// and `old_cursor_instant` only make sense alongside the `jql` they were built from.
 #[derive(Clone, Copy)]
 pub(crate) struct SearchQuery<'a> {
     pub jql: &'a str,
     pub fields: &'a [&'a str],
-    /// The searching account's own time zone — see [`crate::time::account_minute`].
-    pub zone: &'a TimeZone,
-    /// The cursor `jql` was built from (`None` on a first sync). See `search`'s doc for why this
-    /// is needed even though it is also baked into `jql` itself.
-    pub old_cursor_minute: Option<&'a str>,
+    /// The cursor `jql` was built from (already rendered into it, minus the safety margin;
+    /// `None` on a first sync) — the **bare** instant, not margin-adjusted. `search` adds
+    /// [`CURSOR_SAFETY_MARGIN_HOURS`] itself when deciding whether the item cap's bypass (see its
+    /// doc) should still apply, the same margin [`crate::sync`] subtracts when rendering `jql`'s
+    /// own `>=` bound — so both operations move outward from the one stored value, instead of one
+    /// of them silently compounding the other's adjustment.
+    pub old_cursor_instant: Option<Timestamp>,
 }
 
 /// One `search` call's outcome: successfully parsed issues, plus bookkeeping for the caller's
@@ -84,10 +88,18 @@ pub(crate) struct SearchQuery<'a> {
 pub(crate) struct SearchResult {
     pub items: Vec<WireIssue>,
     pub malformed_skipped: u32,
-    /// The latest `updated`, converted to the account's zone and floored to the minute (see
-    /// [`crate::time::account_minute`]), seen in this call across every page fetched. Already in
-    /// the exact text [`crate::jql::incremental_query`] needs for the next call's cursor.
-    pub max_minute: Option<String>,
+    /// The latest `fields.updated`, as an instant, seen in this call across every page fetched.
+    /// The caller renders this (see [`crate::time::account_minute`]) only when it next needs to
+    /// build a query — never stored pre-rendered, so a later change to the account's own zone is
+    /// reflected immediately rather than silently baked into a stale cursor.
+    pub max_instant: Option<Timestamp>,
+    /// `true` if the item cap's bypass (see [`JiraClient::search`]'s doc) was still engaged —
+    /// every item collected so far was still at or before the cursor instant plus the safety
+    /// margin — when `limits.max_pages` ran out. More updates share that window than one call's
+    /// page budget can read, so this project is not making progress past it yet; the caller
+    /// surfaces this as a `SyncIssue` rather than failing silently. No continuation is persisted
+    /// to resume mid-window on the next call — see this crate's README for that known gap.
+    pub stuck_window_exhausted: bool,
 }
 
 /// A Jira REST client over any [`Transport`], generic over the deployment ([`Deployment`]) each
@@ -150,17 +162,17 @@ impl<'t, T: Transport> JiraClient<'t, T> {
     /// Runs `query.jql`, following pagination through `deployment` up to `limits.max_pages`/
     /// `limits.max_items`, honouring a 429 rate limit.
     ///
-    /// `query.zone` is the searching account's own time zone, used to convert each item's
-    /// `updated` into the account-local minute the caller's cursor is built from (see
-    /// [`crate::time::account_minute`]). `query.old_cursor_minute` is the cursor `query.jql` was
-    /// already built from (`None` on a first sync): when the item cap is reached but every item
-    /// collected so far still shares that exact minute, the cap is **not** enforced — pagination
-    /// keeps going (still bounded by `limits.max_pages`) until an item past that minute is seen,
-    /// or the data runs out. Without this, a project with more updates in one minute than
-    /// `limits.max_items` would see its cursor get stuck on that minute forever: every call would
-    /// re-fetch the identical capped batch and never make progress (a livelock). Re-fetching
-    /// already-seen items the rest of the time is harmless — diffing against the stored snapshot
-    /// (see `crate::sync`) makes that a no-op.
+    /// `query.old_cursor_instant` is the cursor `query.jql` was already built from (`None` on a
+    /// first sync). When the item cap is reached but every item collected so far is still at or
+    /// before that instant *plus* [`CURSOR_SAFETY_MARGIN_HOURS`], the cap is **not** enforced —
+    /// pagination keeps going (still bounded by `limits.max_pages`) until an item past that
+    /// threshold is seen, or the data runs out. Without this, a project with more updates in one
+    /// window than `limits.max_items` would see its cursor get stuck there forever: every call
+    /// would re-fetch the identical capped batch and never make progress (a livelock).
+    /// Re-fetching already-seen items the rest of the time is harmless — diffing against the
+    /// stored snapshot (see `crate::sync`) makes that a no-op. If the page budget *also* runs out
+    /// before an item past the threshold is seen, [`SearchResult::stuck_window_exhausted`] is set
+    /// — this one call could not resolve it, and the caller surfaces that visibly.
     pub(crate) async fn search<D: Deployment>(
         &self,
         deployment: &D,
@@ -172,19 +184,33 @@ impl<'t, T: Transport> JiraClient<'t, T> {
         let SearchQuery {
             jql,
             fields,
-            zone,
-            old_cursor_minute,
+            old_cursor_instant,
         } = *query;
+        // The bypass threshold: `None` (first sync) never bypasses. `search_result.stuck_window_exhausted`
+        // tracks whether the walk was still under this threshold when it ran out of page budget.
+        let threshold = old_cursor_instant.and_then(|c| {
+            c.checked_add(jiff::SignedDuration::from_hours(CURSOR_SAFETY_MARGIN_HOURS))
+                .ok()
+        });
         let mut page = deployment.first_page();
         let mut items = Vec::new();
         let mut malformed = 0u32;
-        let mut max_minute: Option<String> = None;
+        let mut max_instant: Option<Timestamp> = None;
         // Dedupes an issue appearing twice within this one call — e.g. offset-based pagination
         // (Data Center) can repeat or skip a row when an item is updated concurrently with the
         // walk shifting it across a page boundary. Across *calls*, the same overlap is handled by
         // diffing against the stored snapshot (see `crate::sync`), which is naturally a no-op when
         // nothing actually changed; this only guards one call's own page walk.
         let mut seen_this_call: HashSet<(String, String)> = HashSet::new();
+        // Whether the item cap's bypass was engaged (still at-or-before `threshold`) the last time
+        // it was checked. Combined with `ran_out_of_pages` after the loop, this is exactly "the
+        // walk never got a chance to find out whether it had moved past the stuck window".
+        let mut still_stuck = false;
+        // Cleared by every path that ends the walk for a reason *other* than exhausting
+        // `limits.max_pages` (a clean natural completion, a non-stuck cap hit, a malformed or
+        // oversized page). Only staying `true` all the way to the end of the `for` loop means the
+        // page budget itself was the limiting factor.
+        let mut ran_out_of_pages = true;
 
         for _ in 0..limits.max_pages {
             let request =
@@ -218,11 +244,13 @@ impl<'t, T: Transport> JiraClient<'t, T> {
                 // call's unchanged cursor simply re-walks from the top — see `crate::sync`.
                 tracing::warn!(url = %url, len = response.body.len(), "oversized search response page, stopping this call");
                 malformed += 1;
+                ran_out_of_pages = false;
                 break;
             }
             let Ok((raw_items, next)) = deployment.parse_search_page(&response.body) else {
                 tracing::warn!(url = %url, "could not parse a search response page, stopping this call");
                 malformed += 1;
+                ran_out_of_pages = false;
                 break;
             };
 
@@ -230,15 +258,16 @@ impl<'t, T: Transport> JiraClient<'t, T> {
             for value in raw_items {
                 if items.len() >= limits.max_items {
                     // See this method's doc: only actually stop if the walk has already moved
-                    // past the old cursor's minute. `max_minute` reflects the most recently
-                    // processed item (items arrive in ascending `updated` order), so this is
-                    // exactly "has every item so far stayed within the cursor minute".
-                    let still_at_cursor_minute = match (max_minute.as_deref(), old_cursor_minute) {
-                        (Some(seen), Some(cursor)) => seen == cursor,
+                    // past the cursor-plus-margin threshold. `max_instant` reflects the most
+                    // recently processed item (items arrive in ascending `updated` order), so
+                    // this is exactly "has every item so far stayed within the stuck window".
+                    still_stuck = match (max_instant, threshold) {
+                        (Some(seen), Some(t)) => seen <= t,
                         _ => false,
                     };
-                    if !still_at_cursor_minute {
+                    if !still_stuck {
                         cap_hit = true;
+                        ran_out_of_pages = false;
                         break;
                     }
                 }
@@ -252,11 +281,10 @@ impl<'t, T: Transport> JiraClient<'t, T> {
                             continue;
                         }
                         let ts = JiraTimestamp::new(&issue.fields.updated);
-                        if let Some(instant) = ts.to_instant() {
-                            let minute = account_minute(instant, zone);
-                            if max_minute.as_deref().is_none_or(|m| minute.as_str() > m) {
-                                max_minute = Some(minute);
-                            }
+                        if let Some(instant) = ts.to_instant()
+                            && max_instant.is_none_or(|m| instant > m)
+                        {
+                            max_instant = Some(instant);
                         }
                         items.push(issue);
                     }
@@ -271,14 +299,18 @@ impl<'t, T: Transport> JiraClient<'t, T> {
             }
             match next {
                 Some(next_page) => page = next_page,
-                None => break,
+                None => {
+                    ran_out_of_pages = false;
+                    break;
+                }
             }
         }
 
         Ok(Outcome::Ok(SearchResult {
             items,
             malformed_skipped: malformed,
-            max_minute,
+            max_instant,
+            stuck_window_exhausted: ran_out_of_pages && still_stuck,
         }))
     }
 }
@@ -321,15 +353,17 @@ mod tests {
     fn query<'a>(
         jql: &'a str,
         fields: &'a [&'a str],
-        zone: &'a TimeZone,
-        old_cursor_minute: Option<&'a str>,
+        old_cursor_instant: Option<Timestamp>,
     ) -> SearchQuery<'a> {
         SearchQuery {
             jql,
             fields,
-            zone,
-            old_cursor_minute,
+            old_cursor_instant,
         }
+    }
+
+    fn instant(s: &str) -> Timestamp {
+        s.parse().expect("valid RFC 3339 instant")
     }
 
     #[test]
@@ -353,12 +387,11 @@ mod tests {
             "",
         )]);
         let c = client(&transport);
-        let zone = TimeZone::UTC;
         let mut attempts = 0u32;
         let Outcome::RateLimited(rl) = c
             .search(
                 &JiraCloud,
-                &query("project in (\"DEMO\")", &["summary"], &zone, None),
+                &query("project in (\"DEMO\")", &["summary"], None),
                 2_000_000_000,
                 &mut attempts,
                 Limits::default(),
@@ -379,11 +412,10 @@ mod tests {
         for _ in 0..3 {
             let transport = ReplayTransport::from_exchanges(vec![exchange(url, 429, vec![], "")]);
             let c = client(&transport);
-            let zone = TimeZone::UTC;
             let Outcome::RateLimited(rl) = c
                 .search(
                     &JiraCloud,
-                    &query("project in (\"DEMO\")", &["summary"], &zone, None),
+                    &query("project in (\"DEMO\")", &["summary"], None),
                     2_000_000_000,
                     &mut attempts,
                     Limits::default(),
@@ -410,12 +442,11 @@ mod tests {
             r#"{"errorMessages":["Unauthorized"]}"#,
         )]);
         let c = client(&transport);
-        let zone = TimeZone::UTC;
         let mut attempts = 0u32;
         let err = c
             .search(
                 &JiraCloud,
-                &query("project in (\"DEMO\")", &["summary"], &zone, None),
+                &query("project in (\"DEMO\")", &["summary"], None),
                 2_000_000_000,
                 &mut attempts,
                 Limits::default(),
@@ -438,7 +469,6 @@ mod tests {
         let transport =
             ReplayTransport::from_exchanges(vec![exchange(url, 200, vec![], &body.to_string())]);
         let c = client(&transport);
-        let zone = TimeZone::UTC;
         let mut attempts = 0u32;
         let limits = Limits {
             max_pages: 10,
@@ -447,7 +477,7 @@ mod tests {
         let Outcome::Ok(result) = c
             .search(
                 &JiraCloud,
-                &query("project in (\"DEMO\")", &["summary"], &zone, None),
+                &query("project in (\"DEMO\")", &["summary"], None),
                 0,
                 &mut attempts,
                 limits,
@@ -458,6 +488,10 @@ mod tests {
             panic!("expected Ok");
         };
         assert_eq!(result.items.len(), 1, "stopped right at the item cap");
+        assert!(
+            !result.stuck_window_exhausted,
+            "no cursor: nothing to be stuck on"
+        );
         assert_eq!(
             transport.remaining(),
             0,
@@ -466,38 +500,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_item_cap_is_bypassed_while_every_item_is_still_at_the_old_cursor_minute() {
-        // Three issues share the exact same minute as the old cursor, with a cap of 2: without
-        // the bypass, this call would stop after 2 items, the cursor would stay on that same
-        // minute (since the newest item seen is still that minute), and the next call would
-        // re-issue an identical query and hit the identical cap forever — a livelock. A fourth
-        // issue sits one minute later, which must still end the walk once reached.
+    async fn the_item_cap_is_bypassed_while_every_item_is_still_within_the_margin_of_the_cursor() {
+        // Three issues sit within the 1-hour safety margin of the old cursor, with a cap of 2:
+        // without the bypass, this call would stop after 2 items, the cursor would stay within
+        // that same window (since the newest item seen is still within it), and the next call
+        // would re-issue an identical query and hit the identical cap forever — a livelock. A
+        // fourth issue sits two hours later, past the margin, which must still end the walk once
+        // reached.
         let url = "https://jira.example.com/rest/api/3/search/jql?jql=project%20in%20%28%22DEMO%22%29%20AND%20updated%20%3E%3D%20%222026-01-01%2000%3A05%22&maxResults=100&fields=summary";
         let body = serde_json::json!({
             "issues": [
                 {"id":"1","key":"DEMO-1","fields":{"summary":"a","status":{"name":"To Do","statusCategory":{"key":"new"}},"issuetype":{"name":"Story"},"updated":"2026-01-01T00:05:00.000+0000"}},
                 {"id":"2","key":"DEMO-2","fields":{"summary":"b","status":{"name":"To Do","statusCategory":{"key":"new"}},"issuetype":{"name":"Story"},"updated":"2026-01-01T00:05:30.000+0000"}},
                 {"id":"3","key":"DEMO-3","fields":{"summary":"c","status":{"name":"To Do","statusCategory":{"key":"new"}},"issuetype":{"name":"Story"},"updated":"2026-01-01T00:05:45.000+0000"}},
-                {"id":"4","key":"DEMO-4","fields":{"summary":"d","status":{"name":"To Do","statusCategory":{"key":"new"}},"issuetype":{"name":"Story"},"updated":"2026-01-01T00:06:00.000+0000"}},
+                {"id":"4","key":"DEMO-4","fields":{"summary":"d","status":{"name":"To Do","statusCategory":{"key":"new"}},"issuetype":{"name":"Story"},"updated":"2026-01-01T02:00:00.000+0000"}},
             ],
         });
         let transport =
             ReplayTransport::from_exchanges(vec![exchange(url, 200, vec![], &body.to_string())]);
         let c = client(&transport);
-        let zone = TimeZone::UTC;
         let mut attempts = 0u32;
         let limits = Limits {
             max_pages: 10,
             max_items: 2,
         };
+        let cursor = instant("2026-01-01T00:05:00Z");
         let Outcome::Ok(result) = c
             .search(
                 &JiraCloud,
                 &query(
                     "project in (\"DEMO\") AND updated >= \"2026-01-01 00:05\"",
                     &["summary"],
-                    &zone,
-                    Some("2026-01-01 00:05"),
+                    Some(cursor),
                 ),
                 0,
                 &mut attempts,
@@ -508,8 +542,9 @@ mod tests {
         else {
             panic!("expected Ok");
         };
-        // All 4 items came through — the cap (2) was exceeded because the first 3 all shared the
-        // cursor minute, and the walk only stopped once DEMO-4 (a later minute) was reached.
+        // All 4 items came through — the cap (2) was exceeded because the first 3 were all within
+        // the cursor's 1-hour margin, and the walk only stopped once DEMO-4 (two hours later, past
+        // the margin) was reached.
         assert_eq!(
             result
                 .items
@@ -518,7 +553,73 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["DEMO-1", "DEMO-2", "DEMO-3", "DEMO-4"]
         );
-        assert_eq!(result.max_minute.as_deref(), Some("2026-01-01 00:06"));
+        assert_eq!(result.max_instant, Some(instant("2026-01-01T02:00:00Z")));
+        assert!(
+            !result.stuck_window_exhausted,
+            "the walk reached past the window on its own; the page budget was never the limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_page_budget_running_out_while_still_stuck_is_reported_not_silent() {
+        // Two pages, two items apiece, every item within the cursor's margin, and only 2 pages of
+        // budget: the walk never gets a chance to find an item past the stuck window before the
+        // page budget itself runs out. This must be visible to the caller (stuck_window_exhausted),
+        // not just a silent truncation.
+        let url1 = "https://jira.example.com/rest/api/3/search/jql?jql=project%20in%20%28%22DEMO%22%29%20AND%20updated%20%3E%3D%20%222026-01-01%2000%3A05%22&maxResults=100&fields=summary";
+        let url2 = format!("{url1}&nextPageToken=page2");
+        let page1 = serde_json::json!({
+            "issues": [
+                {"id":"1","key":"DEMO-1","fields":{"summary":"a","status":{"name":"To Do","statusCategory":{"key":"new"}},"issuetype":{"name":"Story"},"updated":"2026-01-01T00:05:00.000+0000"}},
+                {"id":"2","key":"DEMO-2","fields":{"summary":"b","status":{"name":"To Do","statusCategory":{"key":"new"}},"issuetype":{"name":"Story"},"updated":"2026-01-01T00:05:10.000+0000"}},
+            ],
+            "nextPageToken": "page2",
+        });
+        let page2 = serde_json::json!({
+            "issues": [
+                {"id":"3","key":"DEMO-3","fields":{"summary":"c","status":{"name":"To Do","statusCategory":{"key":"new"}},"issuetype":{"name":"Story"},"updated":"2026-01-01T00:05:20.000+0000"}},
+                {"id":"4","key":"DEMO-4","fields":{"summary":"d","status":{"name":"To Do","statusCategory":{"key":"new"}},"issuetype":{"name":"Story"},"updated":"2026-01-01T00:05:30.000+0000"}},
+            ],
+            "nextPageToken": "page3",
+        });
+        let transport = ReplayTransport::from_exchanges(vec![
+            exchange(url1, 200, vec![], &page1.to_string()),
+            exchange(&url2, 200, vec![], &page2.to_string()),
+        ]);
+        let c = client(&transport);
+        let mut attempts = 0u32;
+        let limits = Limits {
+            max_pages: 2,
+            max_items: 2,
+        };
+        let cursor = instant("2026-01-01T00:05:00Z");
+        let Outcome::Ok(result) = c
+            .search(
+                &JiraCloud,
+                &query(
+                    "project in (\"DEMO\") AND updated >= \"2026-01-01 00:05\"",
+                    &["summary"],
+                    Some(cursor),
+                ),
+                0,
+                &mut attempts,
+                limits,
+            )
+            .await
+            .expect("search")
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(result.items.len(), 4, "both pages were fully read");
+        assert!(
+            result.stuck_window_exhausted,
+            "the page budget ran out before any item past the cursor's margin was seen"
+        );
+        assert_eq!(
+            transport.remaining(),
+            0,
+            "a third page was never requested — the page cap, not more data, stopped the walk"
+        );
     }
 
     #[tokio::test]
@@ -537,7 +638,6 @@ mod tests {
         let transport =
             ReplayTransport::from_exchanges(vec![exchange(url, 200, vec![], &body.to_string())]);
         let c = client(&transport);
-        let zone = TimeZone::UTC;
         let mut attempts = 0u32;
         let limits = Limits {
             max_pages: 10,
@@ -546,7 +646,7 @@ mod tests {
         let Outcome::Ok(result) = c
             .search(
                 &JiraCloud,
-                &query("project in (\"DEMO\")", &["summary"], &zone, None),
+                &query("project in (\"DEMO\")", &["summary"], None),
                 0,
                 &mut attempts,
                 limits,
@@ -557,5 +657,6 @@ mod tests {
             panic!("expected Ok");
         };
         assert_eq!(result.items.len(), 2, "the ordinary cap still applies");
+        assert!(!result.stuck_window_exhausted);
     }
 }

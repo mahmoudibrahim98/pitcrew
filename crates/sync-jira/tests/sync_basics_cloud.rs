@@ -95,12 +95,15 @@ async fn first_sync_then_incremental_then_idempotent() {
     assert_eq!(done[0].source().key, "DEMO-2");
 
     let project = outcome1.state.projects.get("DEMO").expect("project state");
-    assert_eq!(project.cursor.as_deref(), Some("2026-01-01 00:03"));
+    assert_eq!(project.cursor.as_deref(), Some("2026-01-01T00:03:00Z"));
     assert_eq!(project.issue_snapshots.len(), 2);
     assert_eq!(project.epic_snapshots.len(), 1);
 
     // --- Call 2: incremental, two pages, several kinds of change at once. ---
-    let jql2 = jql_for("DEMO", Some("2026-01-01 00:03"));
+    let jql2 = jql_for(
+        "DEMO",
+        query_cursor_text(project.cursor.as_deref(), "UTC").as_deref(),
+    );
     let page1 = pitcrew_sync_jira::PageState::Cloud {
         next_page_token: None,
     };
@@ -111,6 +114,7 @@ async fn first_sync_then_incremental_then_idempotent() {
     let url2b = cloud_search_url(&jql2, &page2);
 
     let transport2 = ReplayTransport::from_exchanges(vec![
+        myself_exchange(CLOUD_API_BASE, "UTC"),
         ok(
             &url2a,
             cloud_page(
@@ -163,7 +167,7 @@ async fn first_sync_then_incremental_then_idempotent() {
     assert_eq!(
         transport2.remaining(),
         0,
-        "both pages should be used, and /myself must not be re-requested"
+        "both pages, and the (re-requested) /myself, should all be used"
     );
 
     assert_eq!(
@@ -207,26 +211,32 @@ async fn first_sync_then_incremental_then_idempotent() {
     );
 
     let project2 = outcome2.state.projects.get("DEMO").expect("project state");
-    assert_eq!(project2.cursor.as_deref(), Some("2026-01-01 00:07"));
+    assert_eq!(project2.cursor.as_deref(), Some("2026-01-01T00:07:00Z"));
 
     // --- Call 3: nothing changed upstream (just the overlap minute again). Idempotence. ---
-    let jql3 = jql_for("DEMO", Some("2026-01-01 00:07"));
+    let jql3 = jql_for(
+        "DEMO",
+        query_cursor_text(project2.cursor.as_deref(), "UTC").as_deref(),
+    );
     let page3 = pitcrew_sync_jira::PageState::Cloud {
         next_page_token: None,
     };
     let url3 = cloud_search_url(&jql3, &page3);
-    let transport3 = ReplayTransport::from_exchanges(vec![ok(
-        &url3,
-        cloud_page(
-            vec![epic_json(
-                "DEMO-10",
-                "Platform Epic",
-                "new",
-                "2026-01-01T00:07:00.000+0000",
-            )],
-            None,
+    let transport3 = ReplayTransport::from_exchanges(vec![
+        myself_exchange(CLOUD_API_BASE, "UTC"),
+        ok(
+            &url3,
+            cloud_page(
+                vec![epic_json(
+                    "DEMO-10",
+                    "Platform Epic",
+                    "new",
+                    "2026-01-01T00:07:00.000+0000",
+                )],
+                None,
+            ),
         ),
-    )]);
+    ]);
 
     let state_before = outcome2.state;
     let outcome3 =

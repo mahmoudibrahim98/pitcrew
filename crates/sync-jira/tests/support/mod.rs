@@ -5,8 +5,11 @@
 
 #![allow(dead_code)]
 
+use jiff::{SignedDuration, Timestamp, tz::TimeZone};
 use pitcrew_sync_github::fixture::RecordedExchange;
+use pitcrew_sync_jira::bounds::CURSOR_SAFETY_MARGIN_HOURS;
 use pitcrew_sync_jira::jql::{ProjectRef, incremental_query};
+use pitcrew_sync_jira::time::account_minute;
 use pitcrew_sync_jira::{Deployment, JiraAuth, JiraCloud, JiraDataCenter, PageState};
 use serde_json::Value;
 
@@ -16,6 +19,21 @@ use serde_json::Value;
 pub fn jql_for(project: &str, cursor: Option<&str>) -> String {
     let project = ProjectRef::new(project).expect("valid project key");
     incremental_query(&project, cursor)
+}
+
+/// The exact `"YYYY-MM-DD HH:MM"` cursor text `sync()` renders into its JQL for a stored cursor
+/// instant (RFC 3339 text, `ProjectState::cursor`'s own shape) and account zone: the margin
+/// subtraction and the zone rendering, done the same way production code does it, so a test's
+/// expected URL can never silently drift from what `sync()` actually builds. `None` input (no
+/// stored cursor) maps to `None` output (a first sync's query has no cursor clause at all).
+pub fn query_cursor_text(stored_cursor_rfc3339: Option<&str>, zone_name: &str) -> Option<String> {
+    let instant: Timestamp = stored_cursor_rfc3339?
+        .parse()
+        .expect("valid RFC 3339 instant");
+    let zone = TimeZone::get(zone_name).expect("valid IANA zone");
+    let margin = SignedDuration::from_hours(CURSOR_SAFETY_MARGIN_HOURS);
+    let margined = instant.checked_sub(margin).expect("no underflow in tests");
+    Some(account_minute(margined, &zone))
 }
 
 pub const CLOUD_API_BASE: &str = "https://jira.example.com/rest/api/3";

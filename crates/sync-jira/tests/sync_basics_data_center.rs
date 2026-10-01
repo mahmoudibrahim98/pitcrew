@@ -101,25 +101,31 @@ async fn first_sync_paginates_by_start_at_then_idempotent() {
     );
 
     let project = outcome1.state.projects.get("DEMO").expect("project state");
-    assert_eq!(project.cursor.as_deref(), Some("2026-01-01 00:03"));
+    assert_eq!(project.cursor.as_deref(), Some("2026-01-01T05:03:00Z"));
 
     // --- Second call: only the overlap minute's own (unchanged) item comes back. Idempotence. ---
-    let jql2 = jql_for("DEMO", Some("2026-01-01 00:03"));
+    let jql2 = jql_for(
+        "DEMO",
+        query_cursor_text(project.cursor.as_deref(), "America/New_York").as_deref(),
+    );
     let page = pitcrew_sync_jira::PageState::DataCenter { start_at: 0 };
     let url = dc_search_url(&jql2, &page);
-    let transport2 = ReplayTransport::from_exchanges(vec![ok(
-        &url,
-        dc_page(
-            vec![issue_json(
-                "DEMO-3",
-                "Docs typo",
-                "new",
-                "2026-01-01T00:03:00.000-0500",
-            )],
-            0,
-            1,
+    let transport2 = ReplayTransport::from_exchanges(vec![
+        myself_exchange(DC_API_BASE, "America/New_York"),
+        ok(
+            &url,
+            dc_page(
+                vec![issue_json(
+                    "DEMO-3",
+                    "Docs typo",
+                    "new",
+                    "2026-01-01T00:03:00.000-0500",
+                )],
+                0,
+                1,
+            ),
         ),
-    )]);
+    ]);
 
     let state_before = outcome1.state;
     let outcome2 = pitcrew_sync_jira::sync::sync(
@@ -134,7 +140,7 @@ async fn first_sync_paginates_by_start_at_then_idempotent() {
     assert_eq!(
         transport2.remaining(),
         0,
-        "/myself must not be re-requested"
+        "/myself is re-requested, and the single search page, should both be used"
     );
     assert_eq!(
         outcome2.state, state_before,
