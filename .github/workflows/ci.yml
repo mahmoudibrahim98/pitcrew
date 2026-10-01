@@ -130,6 +130,40 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo clippy -p pitcrew-api --no-default-features --all-targets --locked -- -D warnings
 
+  # The desktop shell is its own Cargo workspace (see the root Cargo.toml), checked here.
+  desktop:
+    name: Desktop shell (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: WebKitGTK and the other libraries Tauri links on Linux
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: apps/desktop/src-tauri -> target
+      - name: Format
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check
+      - name: Clippy
+        run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked
+
   deny:
     name: Licences and advisories
     runs-on: ubuntu-latest
@@ -141,3 +175,8 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
+      - name: The desktop shell's workspace
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          manifest-path: apps/desktop/src-tauri/Cargo.toml

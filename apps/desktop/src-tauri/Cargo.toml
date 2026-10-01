@@ -1,19 +1,38 @@
+# Owned by stream K. The desktop shell is its own Cargo workspace: the root workspace excludes it,
+# so Tauri's dependencies never reach the other crates' builds. Check it with
+# `cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --locked`.
+# Keep the package fields and lints below in step with the root Cargo.toml.
+
 [package]
 name = "pitcrew-desktop"
 description = "The Tauri desktop shell (Rust side). Stream K replaces this stub with the Tauri app. Owned by stream K."
-version.workspace = true
-edition.workspace = true
-rust-version.workspace = true
-license.workspace = true
-publish.workspace = true
-authors.workspace = true
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+publish = false
+authors = ["The PitCrew Authors"]
+
+[workspace]
+members = ["."]
 
 [[bin]]
 name = "pitcrew-desktop"
 path = "src/main.rs"
 
 [dependencies]
-pitcrew-protocol.workspace = true
+pitcrew-protocol = { path = "../../../crates/protocol" }
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "warn"
+unwrap_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
