@@ -500,6 +500,42 @@ impl SourceAdapter for OpenCodeAdapter {
     }
 }
 
+/// Facts the scan needs for one session: cheap enough to look up for every discovered session,
+/// since it is one indexed row and reads no part or message payloads.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LightMeta {
+    pub cwd: Option<String>,
+    pub started: Option<TimestampMs>,
+    pub is_subagent: bool,
+}
+
+/// [`LightMeta`] for several sessions of one store, opening it once. Sessions the store no
+/// longer has (deleted between discovery and this call) are left out, not an error.
+pub(crate) fn light_meta(
+    path: &Path,
+    ids: &[&str],
+) -> Result<HashMap<String, LightMeta>, SourceError> {
+    let store = Store::open(path)?;
+    if !store.has_sessions() {
+        return Ok(HashMap::new());
+    }
+    let mut out = HashMap::with_capacity(ids.len());
+    for &id in ids {
+        if let Some(row) = store.session(id)? {
+            out.insert(
+                id.to_owned(),
+                LightMeta {
+                    cwd: bounded(row.directory.as_deref(), MAX_PATH_BYTES),
+                    started: (row.created > 0).then_some(row.created),
+                    is_subagent: row.parent_id.as_deref().is_some_and(|p| !p.is_empty()),
+                },
+            );
+        }
+    }
+    store.finish()?;
+    Ok(out)
+}
+
 fn session_id(transcript: &TranscriptRef) -> Result<&str, SourceError> {
     transcript
         .inner_id

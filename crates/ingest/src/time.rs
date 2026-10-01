@@ -60,6 +60,25 @@ pub(crate) fn parse_rfc3339_ms(s: &str) -> Option<TimestampMs> {
     Some(secs * 1000 + millis)
 }
 
+/// `YYYY-MM` (UTC) for a timestamp, for grouping by month. The inverse of [`days_from_civil`]
+/// (Howard Hinnant's `civil_from_days`).
+pub(crate) fn year_month(ms: TimestampMs) -> String {
+    let days = ms.div_euclid(86_400_000);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = if m <= 2 {
+        yoe + era * 400 + 1
+    } else {
+        yoe + era * 400
+    };
+    format!("{y:04}-{m:02}")
+}
+
 fn digits(b: &[u8]) -> Option<i64> {
     b.iter().try_fold(0i64, |acc, c| {
         c.is_ascii_digit().then(|| acc * 10 + i64::from(c - b'0'))
@@ -79,7 +98,15 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_rfc3339_ms;
+    use super::{parse_rfc3339_ms, year_month};
+
+    #[test]
+    fn year_month_matches_known_dates() {
+        assert_eq!(year_month(0), "1970-01");
+        assert_eq!(year_month(1_790_755_200_000), "2026-09");
+        assert_eq!(year_month(951_782_400_000), "2000-02"); // leap day
+        assert_eq!(year_month(-1), "1969-12"); // just before the epoch
+    }
 
     #[test]
     fn parses_common_forms() {
