@@ -14,6 +14,9 @@ import type { Gateway, GatewayWorkspace } from './workspaces.tsx';
 /** Emitted with the whole list whenever it changes. */
 export const WORKSPACES_EVENT = 'gateway://workspaces';
 
+/** Emitted with a `NavigateTarget`: a deep link, or a click on the app's own notifications. */
+export const NAVIGATE_EVENT = 'gateway://navigate';
+
 export interface GatewayRequest {
   workspace: string;
   method: Method;
@@ -42,6 +45,7 @@ export function createGateway(): Gateway {
   return {
     workspaces: () => call<GatewayWorkspace[]>('gateway_workspaces', {}),
     onWorkspaces: (listener) => listen<GatewayWorkspace[]>(WORKSPACES_EVENT, (event) => listener(event.payload)),
+    onNavigate: (listener) => listen<unknown>(NAVIGATE_EVENT, (event) => listener(event.payload)),
     transport: (id, name) => gatewayTransport(id, name),
   };
 }
@@ -112,6 +116,14 @@ function openedId(answer: unknown): number | undefined {
 /** Consecutive binary frames are sent as one, up to this size. */
 const BATCH_BYTES = 256 * 1024;
 
+/**
+ * The most the outbox holds before this transport gives up on the sender and closes, as the
+ * daemon does to a receiver that falls behind (desktop-gateway.md, "Back-pressure": 8 MiB).
+ */
+const MAX_OUTBOX_BYTES = 8 * 1024 * 1024;
+
+const textEncoder = new TextEncoder();
+
 function asArrayBuffer(message: unknown): ArrayBuffer | undefined {
   if (message instanceof ArrayBuffer) return message;
   if (Object.prototype.toString.call(message) === '[object ArrayBuffer]') return message as ArrayBuffer;
@@ -132,7 +144,10 @@ function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
  * A gateway socket as a `TransportSocket`. Messages arrive on a channel, in order, `close` last.
  * Sends go one at a time, in order (the gateway's commands may otherwise run concurrently).
  * A frame the gateway refuses ends the socket with 1011, so the caller reconnects rather than
- * carry on with a hole in what it sent.
+ * carry on with a hole in what it sent. `bufferedAmount` is the outbox's own bytes, so a sender
+ * can watch it the way it would a browser `WebSocket`'s; a sender that does not is cut off with
+ * 1013 once the outbox passes `MAX_OUTBOX_BYTES`, as the daemon does to a receiver that falls
+ * behind.
  */
 class GatewaySocket implements TransportSocket {
   onopen: (() => void) | null = null;
@@ -162,10 +177,33 @@ class GatewaySocket implements TransportSocket {
     );
   }
 
+  get bufferedAmount(): number {
+    return this.#queuedBytes();
+  }
+
   send(data: string | ArrayBuffer | Uint8Array): void {
     if (this.#state === 'closing' || this.#state === 'closed') return;
     // A copy: the caller may reuse its buffer.
     this.#outbox.push(typeof data === 'string' ? data : data instanceof Uint8Array ? data.slice() : new Uint8Array(data.slice(0)));
+    if (this.#queuedBytes() > MAX_OUTBOX_BYTES) {
+      this.#overflow();
+      return;
+    }
+    this.#flush();
+  }
+
+  #queuedBytes(): number {
+    let total = 0;
+    for (const item of this.#outbox) total += typeof item === 'string' ? textEncoder.encode(item).byteLength : item.byteLength;
+    return total;
+  }
+
+  /** The outbox grew past `MAX_OUTBOX_BYTES`: drop it and close, as a sender ignoring back-pressure earns. */
+  #overflow(): void {
+    this.#warn(`a gateway socket sender outran the connection (${this.#queuedBytes()} bytes queued); closing it with 1013.`);
+    this.#outbox.length = 0;
+    this.#state = 'closing';
+    this.#closeWith = { code: 1013, reason: 'the sender ignored back-pressure' };
     this.#flush();
   }
 

@@ -230,6 +230,38 @@ describe('sockets through the gateway', () => {
     expect(fake?.maxInFlight).toBe(1);
   });
 
+  it('reports bufferedAmount for what is queued, and closes with 1013 when a sender ignores it', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const socket = gatewayTransport(WS).openSocket('/v1/sessions/S1/terminal?cols=80&rows=24');
+    const closes: (SocketClose | undefined)[] = [];
+    socket.onclose = (close) => closes.push(close);
+    let opened = false;
+    socket.onopen = () => (opened = true);
+    await vi.waitFor(() => expect(opened).toBe(true));
+    expect(socket.bufferedAmount).toBe(0);
+
+    const chunk = new Uint8Array(1024 * 1024); // 1 MiB
+    // The first dispatches at once (it leaves the outbox while in flight); the rest pile up behind
+    // it, since nothing here awaits a send before queuing the next.
+    socket.send(chunk);
+    for (let i = 0; i < 4; i++) socket.send(chunk);
+    expect(socket.bufferedAmount).toBe(4 * 1024 * 1024);
+
+    // Past the 8 MiB cap: the outbox is dropped and the socket closes, as the daemon does to a
+    // receiver that falls behind (desktop-gateway.md, "Back-pressure").
+    for (let i = 0; i < 5; i++) socket.send(chunk);
+    await vi.waitFor(() => expect(closes).toHaveLength(1));
+    expect(closes[0]).toMatchObject({ code: 1013, reason: 'the sender ignored back-pressure' });
+    expect(socket.bufferedAmount).toBe(0);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain('closing it with 1013');
+
+    const [fake] = gateway.sockets;
+    // Only the one frame already dispatched reaches the daemon; the backlog behind it is dropped.
+    expect(fake?.sent).toHaveLength(1);
+    warn.mockRestore();
+  });
+
   it('ends the socket with 1011 when a send is refused, and says why once', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const socket = gatewayTransport(WS).openSocket('/v1/sessions/S1/terminal?cols=80&rows=24');

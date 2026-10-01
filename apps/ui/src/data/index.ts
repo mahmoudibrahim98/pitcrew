@@ -27,6 +27,7 @@ export {
 export type * from './types.ts';
 export { CHECKS, TRANSCRIPT_KINDS } from './types.ts';
 export {
+  useGatewayNavigate,
   useGatewayWorkspaces,
   WorkspaceScope,
   type GatewayWorkspace,

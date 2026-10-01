@@ -11,6 +11,7 @@ honours reduced motion through the tokens' durations. See `docs/build/streams/L.
 | `Dialog`, `DialogContent`, `DialogFooter`, `DialogClose` | Modal dialogs (Radix): focus trapped, Esc closes. `DialogContent` takes `title` (required; `hideTitle` keeps it for screen readers only) and `description`. |
 | `Tooltip`, `TooltipProvider` | A label on hover and focus, with an optional shortcut. It supplements an accessible name, never replaces one. |
 | `Kbd` | A shortcut hint: `<Kbd keys={['mod', 'k']} />` reads Ctrl K, or ⌘ K on macOS. |
+| `Popover` | A non-modal popover for evidence and details: hover or focus previews it, activating it opens it. |
 | `Avatar` | People are round with initials; agents are square and carry their owner's initial, and their name says "(agent of …)". |
 | `Badge` | Counts and tags: `accent`, `warn`, `risk`, `neutral`, `plain`; `label` adds screen-reader text ("3 open asks"). |
 | `StatusPill` | A status with a coloured dot. |
@@ -18,6 +19,24 @@ honours reduced motion through the tokens' durations. See `docs/build/streams/L.
 | `Tree`, `TreeItem` | A navigation tree (ARIA treeview): one tab stop, arrows move and open, Home and End, type-ahead. Items are usually links (`TreeItem` wraps its child). |
 | `ThemeToggle`, `useTheme`, `applyTheme` | Light, system or dark, persisted. |
 | icons | A small stroke icon set (`HomeIcon`, `InboxIcon`, …), decorative (`aria-hidden`). |
+
+## Popover
+
+Built from the popover `projects/recap-text.tsx` built for recap evidence (stream N will switch
+to this one; `src/projects` stays as it is until then). `children` is the trigger's content (often
+text); `content` is what the popover shows. Four states, the same as a recap clause's:
+
+- **`closed`**: nothing shown.
+- **`hover`**: the pointer rests on the trigger for 300 ms (closes 200 ms after it leaves, unless
+  it moved into the content, say to follow a link there); touch never previews.
+- **`focus`**: the trigger has keyboard focus. The content is `inert`, so Tab moves on past it
+  instead of landing inside a preview.
+- **`open`**: activated (click, Enter or Space, or the trigger already focused). Focus moves into
+  the content; Escape closes it and returns focus to the trigger, without previewing it again.
+
+Renders inline by default, right after the trigger in the DOM (so it reads in document order and
+positions against it with no extra setup); pass `portal` for a trigger inside a container that
+would clip the content or stack it under something else.
 
 ## Focus rings
 

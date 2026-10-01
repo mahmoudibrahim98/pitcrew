@@ -111,6 +111,13 @@ export class FakeGateway {
   holdOpens = false;
   /** Set to answer `gateway_socket_open` with this instead of `{ socket }`. */
   openAnswer: unknown;
+  /**
+   * `gateway_workspaces` waits for `resolveWorkspaces()`, to test the webview's own ordering
+   * against it: the real gateway holds a launch-time deep link until this first call, so a test
+   * can hold it open, `navigate()`, and only then answer, as a slow first read would.
+   */
+  holdWorkspacesRead = false;
+  resolveWorkspaces: () => void = () => {};
   /** Set to make these commands fail. */
   refuseList: { code: GatewayErrorCode; message: string } | undefined;
   refuseSends: { code: GatewayErrorCode; message: string } | undefined;
@@ -138,6 +145,13 @@ export class FakeGateway {
     await emit('gateway://workspaces', structuredClone(workspaces));
   }
 
+  /** Emits `gateway://navigate` with `target`, as the gateway does for a deep link or a click on
+   * the app's own notifications. `target` is sent as given, even if it would not be a valid
+   * `NavigateTarget`: the point is to test the webview's own checks. */
+  async navigate(target: unknown): Promise<void> {
+    await emit('gateway://navigate', target);
+  }
+
   socketsFor(workspace: string): FakeGatewaySocket[] {
     return this.sockets.filter((s) => s.workspace === workspace);
   }
@@ -147,7 +161,8 @@ export class FakeGateway {
     switch (cmd) {
       case 'gateway_workspaces':
         if (this.refuseList !== undefined) return failure(this.refuseList.code, this.refuseList.message);
-        return structuredClone(this.workspaces);
+        if (!this.holdWorkspacesRead) return structuredClone(this.workspaces);
+        return new Promise((resolve) => (this.resolveWorkspaces = () => resolve(structuredClone(this.workspaces))));
       case 'gateway_request':
         return this.#request(args.req as GatewayRequest);
       case 'gateway_socket_open':

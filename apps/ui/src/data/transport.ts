@@ -47,6 +47,12 @@ export interface TransportSocket extends SocketLike {
    * it, in order; once `close()` is called or the socket has closed, they are dropped.
    */
   send(data: string | ArrayBuffer | Uint8Array): void;
+  /**
+   * Bytes sent but not yet taken by the connection: the browser `WebSocket`'s own
+   * `bufferedAmount`, or, in the desktop app, the bytes still queued in the gateway transport's
+   * outbox. A sender that keeps writing without watching this is outrunning the connection.
+   */
+  readonly bufferedAmount: number;
 }
 
 export interface Transport {
@@ -150,6 +156,8 @@ interface RawSocket extends SocketLike {
   onopen?: (() => void) | null;
   readyState?: number;
   binaryType?: string;
+  /** A real `WebSocket` always has this; a test's fake may not. */
+  bufferedAmount?: number;
   send?(data: string | ArrayBuffer | Uint8Array): void;
 }
 
@@ -165,6 +173,9 @@ function wrapBrowserSocket(raw: RawSocket): TransportSocket {
     onmessage: null,
     onclose: null,
     onerror: null,
+    get bufferedAmount() {
+      return raw.bufferedAmount ?? 0;
+    },
     send(data) {
       if (state === 'opening') waiting.push(data);
       else if (state === 'open') raw.send?.(data);
