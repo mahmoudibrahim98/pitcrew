@@ -10,6 +10,16 @@ authors.workspace = true
 
 [dependencies]
 pitcrew-protocol.workspace = true
+pitcrew-interfaces.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+pitcrew-fixtures.workspace = true
+insta.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -35,7 +35,7 @@ export function streamSince(query: URLSearchParams): number | undefined {
  */
 export function openStream(hub: Hub, conn: WebSocketConnection, since: number | undefined): void {
   let cursor = hub.rev;
-  sendFrame(conn, { type: 'hello', rev: cursor });
+  sendFrame(conn, { type: 'hello', rev: cursor, log: hub.logId });
   if (since !== undefined && since < cursor) {
     sendEvents(conn, since, hub.eventsAfter(since));
   }

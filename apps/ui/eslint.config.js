@@ -24,7 +24,16 @@ export default tseslint.config(
           paths: [
             {
               name: '@tanstack/react-query',
-              importNames: ['useQuery', 'useQueries', 'useSuspenseQuery', 'useInfiniteQuery'],
+              importNames: [
+                'useQuery',
+                'useQueries',
+                'useInfiniteQuery',
+                'useSuspenseQuery',
+                'useSuspenseQueries',
+                'useSuspenseInfiniteQuery',
+                'usePrefetchQuery',
+                'usePrefetchInfiniteQuery',
+              ],
               message:
                 'Use useLiveQuery from src/data (or a hook built on it): plain useQuery can fetch before the stream syncs and miss events.',
             },
@@ -33,9 +42,16 @@ export default tseslint.config(
       ],
     },
   },
-  // Config, tests and specs run in Node (the provider test also gets a DOM from happy-dom).
+  // Config, tests and specs run in Node (tests that render also get a DOM from happy-dom). Tests
+  // live in tests/ or next to the code.
   {
-    files: ['*.{ts,js}', 'tests/**/*.{ts,tsx}', 'e2e/**/*.ts'],
+    files: [
+      '*.{ts,js,mjs}',
+      'tests/**/*.{ts,tsx}',
+      'e2e/**/*.ts',
+      'src/**/*.test.{ts,tsx}',
+      'src/**/tests/**/*.{ts,tsx}',
+    ],
     languageOptions: { globals: { ...globals.node, ...globals.browser } },
   },
 );

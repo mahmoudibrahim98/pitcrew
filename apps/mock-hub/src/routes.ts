@@ -59,6 +59,7 @@ import {
   conflict,
   forbidden,
   invalid,
+  isRecord,
   notFound,
   oneOf,
   queryEnums,
@@ -911,6 +912,7 @@ function directRefs(hub: Hub, body: EventBody): EventFilter {
     case 'tool_ran':
     case 'file_edited':
     case 'session_ended':
+    case 'session_updated':
       return { session: body.data.session };
     case 'session_linked':
       return { session: body.data.session, task: body.data.task, workstream: body.data.workstream };
@@ -948,9 +950,32 @@ function directRefs(hub: Hub, body: EventBody): EventFilter {
     case 'decision_recorded':
       return { workstream: body.data.workstream };
     case 'machine_liveness':
+    case 'machine_added':
+    case 'member_added':
+    case 'persona_saved':
+    case 'team_saved':
       return {};
   }
 }
+
+// ─── Hooks ──────────────────────────────────────────────────────────────────────────────────────
+
+const HOOK_EVENT = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+
+/** Accepts a hook event from `pitcrew hook`. The mock checks its shape and otherwise ignores it. */
+const receiveHook: Handler = (_hub, ctx) => {
+  const engine = ctx.param('engine');
+  if (!(ENGINES as readonly string[]).includes(engine)) {
+    throw invalid(`Unknown engine "${engine}".`);
+  }
+  if (!HOOK_EVENT.test(ctx.param('event'))) {
+    throw invalid('The hook event name is malformed.');
+  }
+  if (!isRecord(ctx.body)) {
+    throw invalid('The body must be the hook payload, a JSON object.');
+  }
+  return { status: 202 };
+};
 
 // ─── WebSocket routes, reached without an upgrade ───────────────────────────────────────────────
 
@@ -1012,5 +1037,6 @@ const ROUTES: Route[] = [
   route('GET', '/v1/briefs', 'device', (hub) => ok(hub.briefs)),
   route('PUT', '/v1/briefs/:kind/:id', 'device', putBrief),
   route('GET', '/v1/events', 'device', listEvents),
+  route('POST', '/v1/hooks/:engine/:event', 'agent', receiveHook),
   route('GET', '/v1/stream', 'device', needsWebSocket),
 ];

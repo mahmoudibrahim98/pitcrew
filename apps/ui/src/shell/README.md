@@ -75,7 +75,35 @@ A `Feature` has:
 - **Ids are unique across features** (features, nav entries, commands, "+ New" items). A duplicate
   throws when the router is created.
 - **Shortcuts** Ctrl . (layout), Ctrl K (palette), Ctrl J (Orchestrator) and Ctrl B (sidebar) are
-  the shell's, with Cmd on macOS. Bind your own on your own elements, not on `window`.
+  the shell's, with Cmd on macOS. Bind your own on your own elements, not on `window`. See below
+  for keeping the shell's out of your way.
+- **Tests** go in your folder, as `*.test.ts(x)` (for example `src/projects/tests/board.test.tsx`).
+  Vitest picks them up, and `tsconfig.node.json` checks them with Node's types, so they can import
+  `tests/hub-process.ts` (a mock hub in a child process, for tests under happy-dom) by relative path.
+
+## Keys: claiming them from the shell
+
+The shell listens for its shortcuts on `window`, and stays out of the way of whatever has focus:
+
+| Focus is… | Ctrl K | Ctrl J, Ctrl B, Ctrl . |
+|---|---|---|
+| anywhere else | palette | Orchestrator, sidebar, layout |
+| in an editable element (`input`, `textarea`, `select`, contenteditable) | palette | go to the element |
+| in or under a **key-owning surface** | goes to the surface | go to the surface |
+
+A key-owning surface is any element with `data-shell-keys="none"`; everything inside it keeps
+every key, and the shell prevents nothing there. Mark a terminal, a code editor or anything else
+that needs Ctrl K, J, B or . with it:
+
+```tsx
+import { ownsShellKeys } from '../shell/index.ts';
+
+<div {...ownsShellKeys} className="terminal">…</div>   // = data-shell-keys="none"
+```
+
+`SHELL_KEYS_ATTRIBUTE` is the attribute's name. A key the shell handles is not passed on to the
+browser (Ctrl J would open downloads), and holding it down toggles nothing after the first press.
+A key the shell does not handle is never prevented.
 
 ## Routes, paths and layouts
 

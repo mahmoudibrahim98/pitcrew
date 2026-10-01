@@ -140,6 +140,8 @@ export class Hub {
   readonly person: MemberId;
   /** A counter per session; a delayed reply lands only if its turn is still the current one. */
   readonly turns = new Map<SessionId, number>();
+  /** Identifies this event log. A new one per mock start, so clients notice the reset. */
+  readonly logId: string = ulid();
 
   readonly #log: Event[];
   readonly #listeners = new Set<() => void>();

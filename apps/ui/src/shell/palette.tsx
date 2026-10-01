@@ -53,7 +53,8 @@ const ICONS = {
 const ROW_HEIGHT = 36;
 const PAGE = 8;
 
-function useItems(): Item[] {
+/** Everything the palette finds. A "+ New" dialog it opens gives focus back to `opener`. */
+function useItems(opener: Element | null): Item[] {
   const router = useRouter();
   const ws = useWorkspaceId();
   const layout = useLayout();
@@ -69,7 +70,7 @@ function useItems(): Item[] {
     workspace: ws,
     go: (path) => go(paths.under(ws, path)),
     switchLayout: (target) => switchLayout(router, ws, target),
-    create: (id) => setCreating(id),
+    create: (id) => setCreating(id, opener),
   };
   const projectName = new Map(projects.map((p) => [p.id, p.name]));
 
@@ -91,7 +92,7 @@ function useItems(): Item[] {
       label: `New ${e.label.toLowerCase()}`,
       hint: 'Create',
       fields: [`New ${e.label}`, 'create', 'add'],
-      run: () => setCreating(e.id),
+      run: () => setCreating(e.id, opener),
     })),
     ...projects.map<Item>((p) => ({
       id: `project:${p.id}`,
@@ -131,10 +132,10 @@ function useItems(): Item[] {
   ];
 }
 
-function Results({ close }: { close(): void }) {
+function Results({ close, opener }: { close(): void; opener: Element | null }) {
   // TanStack Virtual keeps state in a mutable object the compiler cannot see change.
   'use no memo';
-  const items = useItems();
+  const items = useItems(opener);
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
@@ -287,6 +288,7 @@ export function Palette() {
         }}
       >
         <Results
+          opener={opener}
           close={() => {
             hrefAtRun.current = window.location.href;
             setOpen(false);

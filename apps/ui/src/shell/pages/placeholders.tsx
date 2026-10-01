@@ -18,6 +18,7 @@ import { isOpenTask, useMyOpenAsks } from '../data.ts';
 import { useWorkspaceId } from '../layout.ts';
 import { paths } from '../paths.ts';
 import { NotFoundPage } from './not-found.tsx';
+import { LOADING, Page } from './page.tsx';
 
 const HEALTH: Record<Health, { tone: Tone; label: string }> = {
   on_track: { tone: 'ok', label: 'On track' },
@@ -47,19 +48,6 @@ const LINK = 'font-medium text-ink hover:underline underline-offset-2';
 
 function useRouteParams(): { project?: string; workstream?: string; task?: string; session?: string } {
   return useParams({ strict: false });
-}
-
-function Page({ title, eyebrow, children }: { title: string; eyebrow?: string | undefined; children?: ReactNode }) {
-  return (
-    <div className="mx-auto flex max-w-4xl flex-col gap-4 px-6 py-6">
-      <header>
-        {eyebrow !== undefined && <p className="font-mono text-xs text-ink-2">{eyebrow}</p>}
-        <h1 className="text-xl font-semibold">{title}</h1>
-        <p className="mt-1 text-sm text-ink-2">A placeholder until its feature fills this page.</p>
-      </header>
-      {children}
-    </div>
-  );
 }
 
 function List({ label, empty, children }: { label: string; empty: string; children: ReactNode[] }) {
@@ -142,7 +130,7 @@ export function ProjectPage() {
   const project = projects?.find((p) => p.id === id);
   if (projects !== undefined && project === undefined) return <NotFoundPage />;
   return (
-    <Page title={project?.name ?? 'Loading…'} eyebrow={project?.key}>
+    <Page title={project?.name ?? LOADING} eyebrow={project?.key}>
       <List label="Workstreams" empty="No workstreams yet.">
         {workstreams.map((w) => (
           <Row key={w.id}>
@@ -167,7 +155,7 @@ export function WorkstreamPage() {
   const project = useProjects().data?.find((p) => p.id === workstream?.project);
   if (workstreams !== undefined && workstream === undefined) return <NotFoundPage />;
   return (
-    <Page title={workstream?.name ?? 'Loading…'} eyebrow={project?.name}>
+    <Page title={workstream?.name ?? LOADING} eyebrow={project?.name}>
       <List label="Tasks" empty="No tasks yet.">
         {tasks.map((t) => (
           <Row key={t.id}>
@@ -193,7 +181,7 @@ export function TaskPage() {
   const workstream = useWorkstreams().data?.find((w) => w.id === task?.workstream);
   if (tasks !== undefined && task === undefined) return <NotFoundPage />;
   return (
-    <Page title={task === undefined ? 'Loading…' : `${task.key} · ${task.title}`}>
+    <Page title={task === undefined ? LOADING : `${task.key} · ${task.title}`}>
       {task !== undefined && (
         <dl className="grid grid-cols-[max-content_1fr] gap-x-6 gap-y-2 text-sm">
           <dt className="text-ink-2">Status</dt>
@@ -242,7 +230,7 @@ export function SessionPage() {
   const session = sessions?.find((s) => s.id === id);
   if (sessions !== undefined && session === undefined) return <NotFoundPage />;
   return (
-    <Page title={session?.title ?? session?.cwd ?? 'Loading…'} eyebrow={session?.engine}>
+    <Page title={session?.title ?? session?.cwd ?? LOADING} eyebrow={session?.engine}>
       {session !== undefined && (
         <p className="flex items-center gap-2 text-sm">
           <StatusPill tone={SESSION[session.state]}>{session.state}</StatusPill>

@@ -1,0 +1,48 @@
+---
+source: crates/recap/tests/demo.rs
+expression: out
+---
+2026-09-29 · Seed runs 1–5 · 1
+@sam dispatched @runner to PAP-4
+  - "@sam dispatched @runner to PAP-4" <- evt:EVT0001
+
+2026-09-29 · Co-author responses · 2
+@writer finished PAP-3, moved PAP-3 to review
+  - "@writer finished PAP-3" <- evt:EVT0002
+  - "moved PAP-3 to review" <- evt:EVT0003
+
+2026-09-30 · Draft method section · 3
+@sam dispatched @writer to PAP-1, @writer moved PAP-1 to in progress, updated the plan for PAP-1 (2 of 4 done)
+  - "@sam dispatched @writer to PAP-1" <- evt:EVT0004
+  - "@writer moved PAP-1 to in progress" <- evt:EVT0005
+  - "updated the plan for PAP-1 (2 of 4 done)" <- evt:EVT0006
+
+2026-09-30 · Draft method section · 1
+@writer edited method.tex (+84 −12)
+  - "@writer edited method.tex (+84 −12)" <- evt:EVT0007
+
+2026-09-30 · Review parser benchmarks · 1
+@sam dispatched @reviewer to TL-3
+  - "@sam dispatched @reviewer to TL-3" <- evt:EVT0008
+
+2026-09-30 · Seed runs 1–5 · 1
+@runner ran a tool
+  - "@runner ran a tool" <- evt:EVT0009, transcript:SES0002@118220
+
+2026-09-30 · Seed runs 1–5 · 1
+job 4815164 diverged, @office asked @sam for a decision
+  - "job 4815164 diverged" <- evt:EVT0010, job:4815164, transcript:SES0002@120544
+  - "@office asked @sam for a decision" <- evt:EVT0010, job:4815164, transcript:SES0002@120544
+
+2026-09-30 · Seed runs · 2
+@office marked Seed runs at risk, @sam pinned the brief for Seed runs
+  - "@office marked Seed runs at risk" <- evt:EVT0011
+  - "@sam pinned the brief for Seed runs" <- evt:EVT0012
+
+2026-09-30 · Review parser benchmarks · 1
+@reviewer stopped to wait for an answer
+  - "@reviewer stopped to wait for an answer" <- evt:EVT0013
+
+2026-09-30 · Parsers · 1
+@builder commented on TL-1 and mentioned @reviewer
+  - "@builder commented on TL-1 and mentioned @reviewer" <- evt:EVT0014

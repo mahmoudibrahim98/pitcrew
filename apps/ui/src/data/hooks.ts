@@ -16,6 +16,12 @@ export function useWorkspace() {
   return useLiveQuery({ queryKey: keys.workspace, queryFn: ({ signal }) => api.workspace(signal) });
 }
 
+/** Machines and their liveness (`machine_liveness` keeps it fresh). */
+export function useMachines() {
+  const api = useApi();
+  return useLiveQuery({ queryKey: keys.machines, queryFn: ({ signal }) => api.machines(signal) });
+}
+
 export function useMembers() {
   const api = useApi();
   return useLiveQuery({ queryKey: keys.members, queryFn: ({ signal }) => api.members(signal) });

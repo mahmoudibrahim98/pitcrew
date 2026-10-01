@@ -12,4 +12,5 @@ export {
 } from './feature.ts';
 export { LAYOUTS, useLayout, useWorkspaceId } from './layout.ts';
 export { paths } from './paths.ts';
+export { ownsShellKeys, SHELL_KEYS_ATTRIBUTE, SHORTCUTS } from './shortcuts.ts';
 export type { WorkspaceRoute } from './routes.tsx';

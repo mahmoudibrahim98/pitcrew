@@ -49,6 +49,8 @@ export interface RunningServer {
   /** For example `http://127.0.0.1:47317`. */
   url: string;
   port: number;
+  /** This run's event-log id, as sent in the stream's `hello`. */
+  logId: string;
   close(): Promise<void>;
 }
 
@@ -71,7 +73,12 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
   });
   await listen(server, options.port ?? DEFAULT_PORT);
   const { port } = server.address() as AddressInfo;
-  return { url: `http://${HOST}:${port}`, port, close: () => shutdown(server, hub, sockets) };
+  return {
+    url: `http://${HOST}:${port}`,
+    port,
+    logId: hub.logId,
+    close: () => shutdown(server, hub, sockets),
+  };
 }
 
 function listen(server: Server, port: number): Promise<void> {

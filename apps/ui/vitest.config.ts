@@ -1,10 +1,11 @@
 import { defineConfig } from 'vitest/config';
 
-// Tests cover the data layer, in Node against the real mock hub; the provider test uses happy-dom.
-// No React Compiler here.
+// Tests run in Node against the real mock hub; files that render opt into happy-dom with a
+// `@vitest-environment` comment. They live in tests/ or next to the code, as src/**/*.test.ts(x)
+// (features keep theirs in their own folders, e.g. src/projects/tests/). No React Compiler here.
 export default defineConfig({
   test: {
-    include: ['tests/**/*.test.{ts,tsx}'],
+    include: ['tests/**/*.test.{ts,tsx}', 'src/**/*.test.{ts,tsx}'],
     environment: 'node',
     testTimeout: 10_000,
   },
