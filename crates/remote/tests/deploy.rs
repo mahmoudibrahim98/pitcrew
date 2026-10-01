@@ -14,6 +14,8 @@
 //!
 //! `PITCREW_TEST_SHELLS` (`:`-separated paths, as for `login_shells.rs`) adds a run of the whole
 //! flow with each POSIX shell among them as the machine's `sh`.
+//!
+//! The SLURM launcher's cases are in `deploy/slurm.rs`, where the binary also plays SLURM.
 
 // Test code; clippy's allow-unwrap-in-tests only sees `#[test]` functions.
 #![allow(clippy::unwrap_used)]
@@ -33,6 +35,11 @@ fn main() -> ExitCode {
 
 #[cfg(unix)]
 mod unix {
+    /// The SLURM launcher against a fake SLURM.
+    mod slurm {
+        include!("deploy/slurm.rs");
+    }
+
     use pitcrew_remote::helper::{HashTool, MIN_TMUX, Progress, parse_tmux_version, tmux_name};
     use pitcrew_remote::{
         DeployOptions, DirectLauncher, Endpoint, Helper, HelperError, HelperState, Input,
@@ -67,11 +74,15 @@ mod unix {
         "dd", "cat", "ls", "awk", "sed", "tr", "cut", "head", "tail", "wc", "mkdir", "rm", "mv",
         "ln", "chmod", "id", "uname", "date", "find", "readlink", "sleep", "setsid", "nohup",
         "tmux", "ps", "printf", "kill", "[", "test", "stat", "df", "mount", "cksum", "hostid",
+        "env", "rmdir", "hostname", "timeout",
     ];
 
     pub fn main() -> ExitCode {
         if let Ok(tool) = std::env::var(TOOL_ENV) {
             return act_as_tool(&tool);
+        }
+        if let Ok(tool) = std::env::var(slurm::SLURM_ENV) {
+            return slurm::act_as_slurm(&tool);
         }
         if let Ok(mode) = std::env::var(DAEMON_ENV) {
             return act_as_daemon(&mode);
@@ -2034,6 +2045,7 @@ mod unix {
             started: 1_790_000_000_000,
             launcher: "direct".to_owned(),
             socket: m.layout().socket(),
+            job: None,
         };
         write_endpoint(&m, &foreign);
         let status = block_on(launcher.status(&m.plain())).unwrap();
@@ -2247,6 +2259,7 @@ mod unix {
                 everything_under_every_posix_sh,
             ),
         ];
+        let cases: Vec<(&str, fn())> = cases.iter().chain(slurm::CASES).copied().collect();
         let filters: Vec<String> = std::env::args()
             .skip(1)
             .filter(|a| !a.starts_with('-'))
@@ -2254,7 +2267,7 @@ mod unix {
         let list_only = std::env::args().any(|a| a == "--list");
         let mut failed = Vec::new();
         let mut ran = 0;
-        for (name, case) in cases {
+        for (name, case) in &cases {
             if !filters.is_empty() && !filters.iter().any(|f| name.contains(f.as_str())) {
                 continue;
             }
