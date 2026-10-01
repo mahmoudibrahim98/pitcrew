@@ -33,6 +33,11 @@ corepack pnpm --filter @pitcrew/ui dev    # the UI on http://127.0.0.1:5173
 
 The dev server also serves the data layer's proof page at `/dev/proof`; production builds leave it out.
 
+**`strictPort: true`** (`vite.config.ts`, `dev` and `preview`): if 5173 (or 4173) is taken, the
+server fails instead of silently starting on the next free port. A debug desktop build trusts
+whatever answers on 5173 with no CSP and the gateway attached (`apps/desktop/src-tauri/README.md`),
+so it must fail loudly rather than load a stranger's page there.
+
 ### Running the e2e suite against a real `pitcrewd`
 
 By default `corepack pnpm --filter @pitcrew/ui e2e` starts its own mock hub (`apps/mock-hub`) and
