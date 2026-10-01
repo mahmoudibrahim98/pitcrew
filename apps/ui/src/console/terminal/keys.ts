@@ -9,8 +9,13 @@
 // Why Ctrl+Shift+X: xterm.js sends nothing at all for Ctrl+Shift with a letter (a terminal cannot
 // tell it from Ctrl+letter, so it drops it), so no program in the terminal can be waiting for it;
 // shells, editors, tmux, screen and the agent CLIs bind Ctrl+letter, Alt+letter, Esc sequences and
-// F-keys instead. No browser binds Ctrl+Shift+X, the X reads as "leave", and it needs no F-key
-// (laptops hide those behind Fn). Ctrl, not Cmd, on every platform, as terminal keys are.
+// F-keys instead. No operating system takes it before the page (unlike Ctrl+Shift+Esc), and the
+// one browser binding, Firefox's text-direction switch in text fields, is prevented when it
+// releases. The X reads as "leave", and it needs no F-key (laptops hide those behind Fn). Ctrl,
+// not Cmd, on every platform, as terminal keys are.
+//
+// Ctrl+Shift+V is left alone in control mode too (xterm sends nothing for it either), so the
+// browser pastes, as terminal emulators do; Ctrl+V itself is the program's (^V).
 
 import { isMac } from '../../lib/platform.ts';
 
