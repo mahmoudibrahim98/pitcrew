@@ -44,8 +44,8 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [A-scan](A-scan.md) | A · Ingest | `s/A/scan` | Sonnet-class | **Merged** |
 | [D-hub-link](D-hub-link.md) | D · Runner | `s/D/hub-link` | Opus-class | In progress |
 | [F-briefs-and-office](F-briefs-and-office.md) | F · Recap | `s/F/briefs-and-office` | Opus-class | **Merged** |
-| [I-hook-install](I-hook-install.md) | I · CLI and hooks | `s/I/hook-install` | Sonnet-class | In progress |
-| [J-deploy](J-deploy.md) | J · Remote and HPC | `s/J/deploy` | Opus-class | In progress |
+| [I-hook-install](I-hook-install.md) | I · CLI and hooks | `s/I/hook-install` | Sonnet-class | **Merged** |
+| [J-deploy](J-deploy.md) | J · Remote and HPC | `s/J/deploy` | Opus-class | **Merged** |
 | [O-onboarding-components](O-onboarding-components.md) | O · Onboarding | `s/O/onboarding-components` | Sonnet-class | **Merged** |
 The branch name matters: CI's path guard reads the stream from it (`s/<stream>/<topic>`). The
 integrator adds new briefs here as streams progress, and marks them done when merged.
