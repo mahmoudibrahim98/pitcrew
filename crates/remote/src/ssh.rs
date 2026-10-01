@@ -143,6 +143,14 @@ pub enum SshError {
         /// What ssh printed.
         stderr: String,
     },
+    /// The server refused another session on a shared connection (sshd's `MaxSessions`, 10 by
+    /// default and lower on some sites): the connection itself is fine, and a session ends
+    /// before another can open.
+    #[error("the server refused another session on the connection (its MaxSessions)")]
+    SessionRefused {
+        /// What ssh printed.
+        stderr: String,
+    },
     /// Any other failure that ssh logged with exit code 255, or a failure of `ssh -G`.
     #[error("ssh failed with exit code {code}: {}", last_line(stderr))]
     Ssh {
@@ -342,6 +350,7 @@ pub const MINIMAL_ENV: &[&str] = &[
     "PROCESSOR_ARCHITECTURE",
     "NUMBER_OF_PROCESSORS",
     "OS",
+    "HOME",
     "SSH_AUTH_SOCK",
 ];
 
@@ -448,6 +457,11 @@ impl Ssh {
         self.prompts.is_some()
     }
 
+    /// Whether connections are reused (a ControlMaster; Unix).
+    pub(crate) fn multiplexes(&self) -> bool {
+        self.multiplex
+    }
+
     /// `ConnectTimeout`, in whole seconds (at least 1).
     pub(crate) fn connect_timeout_secs(&self) -> u64 {
         let secs =
@@ -536,6 +550,8 @@ impl Ssh {
             "PermitLocalCommand=no",
             "ClearAllForwardings=yes",
             "RemoteCommand=none",
+            // A `~.` at the start of a line in the data must not end the session.
+            "EscapeChar=none",
             "ServerAliveInterval=15",
             "ServerAliveCountMax=3",
             "StrictHostKeyChecking=ask",
@@ -574,10 +590,14 @@ impl Ssh {
         host: &str,
         args: Vec<String>,
         stdin: bool,
+        env: &[(&str, &str)],
     ) -> Result<(Running, Option<AskpassServer>), SshError> {
         self.check_askpass()?;
         let mut command = self.command();
         command.args(args).env_remove("SSH_ASKPASS_PROMPT");
+        for (name, value) in env {
+            command.env(name, value);
+        }
         if stdin {
             command.stdin(Stdio::piped());
         }
@@ -815,6 +835,7 @@ fn through_args(
         "PermitLocalCommand=no",
         "ClearAllForwardings=yes",
         "RemoteCommand=none",
+        "EscapeChar=none",
         "BatchMode=yes",
         "ControlMaster=no",
         // Without the master, ssh would log in itself: make that fail at once instead.
@@ -1138,6 +1159,8 @@ enum Said {
     ConnectTimeout,
     Unreachable,
     AuthFailed,
+    /// A ControlMaster's server refused a session (`MaxSessions`).
+    SessionRefused,
     /// Some other error of ssh's.
     Other,
     /// Informational, even at `LogLevel=ERROR`: not a failure.
@@ -1227,6 +1250,16 @@ fn read_line(line: &str) -> (Said, bool) {
     {
         return (Said::Other, true);
     }
+    // A mux client whose master's server said no to the session: "<function>: session request
+    // failed: Session open refused by peer". The text is the master's own (the server's reason is
+    // not in it). Not terminal: ssh then tries to log in itself, which PitCrew's calls through a
+    // master make fail at once.
+    if line
+        .strip_suffix(": session request failed: Session open refused by peer")
+        .is_some_and(|name| !name.is_empty() && !name.contains(char::is_whitespace))
+    {
+        return (Said::SessionRefused, false);
+    }
     if line.starts_with("Warning: ")
         || (line.starts_with("ControlSocket ")
             && line.ends_with(" already exists, disabling multiplexing"))
@@ -1264,7 +1297,9 @@ pub(crate) fn classify_failure(logged: &str, detail: String) -> Option<SshError>
     }
     let stderr = detail;
     let has = |said: Said| kinds.contains(&said);
-    Some(if has(Said::HostKeyChanged) {
+    Some(if has(Said::SessionRefused) {
+        SshError::SessionRefused { stderr }
+    } else if has(Said::HostKeyChanged) {
         SshError::HostKeyChanged { stderr }
     } else if has(Said::HostKeyRejected) {
         SshError::HostKeyRejected { stderr }
@@ -1322,6 +1357,7 @@ mod tests {
             SshError::ConnectTimeout { .. } => "timeout",
             SshError::Unreachable { .. } => "unreachable",
             SshError::AuthFailed { .. } => "auth",
+            SshError::SessionRefused { .. } => "sessions",
             SshError::Ssh { code: 255, .. } => "ssh",
             _ => "other",
         })
@@ -1365,6 +1401,11 @@ mod tests {
                 "auth",
             ),
             ("Permission denied (publickey).\r\n", "auth"),
+            (
+                "mux_client_request_session: session request failed: Session open refused by \
+                 peer\r\nkex_exchange_identification: Connection closed by remote host\r\n",
+                "sessions",
+            ),
             (
                 "mux_client_request_session: read from master failed: Broken pipe\r\n",
                 "ssh",

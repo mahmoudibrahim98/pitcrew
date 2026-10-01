@@ -502,6 +502,8 @@ fn exact_argument_list() {
         "-o",
         "RemoteCommand=none",
         "-o",
+        "EscapeChar=none",
+        "-o",
         "ServerAliveInterval=15",
         "-o",
         "ServerAliveCountMax=3",

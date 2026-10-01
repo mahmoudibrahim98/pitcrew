@@ -1,13 +1,14 @@
 //! The forwarded socket (Unix): the link's master listens on a socket in the connector's private
 //! directory and forwards each connection to the daemon's socket (`ssh -O forward -L
-//! <local>:<remote>`), so a connection costs a channel and nothing more.
+//! <local>:<remote>`), so a connection costs a channel and nothing more. A forwarded channel is
+//! not a session: sshd's `MaxSessions` does not count it.
 //!
 //! The master binds it with `StreamLocalBindMask=0177` inside the 0700 directory. A site that
 //! forbids forwarding unix sockets (`AllowStreamLocalForwarding no`) lets the master listen but
 //! refuses every channel: ssh closes the connection at once, and logs "open failed:
 //! administratively prohibited" (at `INFO`). [`check`] sends one HTTP request through it
 //! (`GET /v1/host/info`, the API's one route without a token) and tells a refused forward
-//! apart from a working one.
+//! apart from a working one, and both from a silent network.
 
 use super::link::{self, Link};
 use crate::{Ssh, SshError};
@@ -25,11 +26,12 @@ pub(crate) const PROBE: &[u8] =
 pub(crate) enum Broken {
     /// The site forbids forwarding unix sockets: ssh's log says so.
     Forbidden,
-    /// The connection closed with no answer, for another reason (no daemon behind it, say).
+    /// The connection closed with no answer: the server answered the channel with a failure
+    /// (no daemon behind the socket, say), or the daemon closed it.
     Closed,
-    /// No answer in time.
+    /// No answer in time: the network, or the daemon, is silent.
     Silent,
-    /// Something else failed.
+    /// The local socket failed (the master's listener is gone).
     Failed(String),
 }
 
@@ -42,6 +44,16 @@ impl std::fmt::Display for Broken {
             Self::Failed(why) => f.write_str(why),
         }
     }
+}
+
+/// Whether ssh can forward `path` as given: `-L` splits at `:`, and ssh expands `%`, `$` and
+/// `~` in forwarded socket paths, so only `A-Z a-z 0-9 . _ + - / @ , =` pass. A socket that does
+/// not is reached with the stdio bridge, which gets it quoted.
+pub(crate) fn fits(path: &str) -> bool {
+    path.starts_with('/')
+        && path.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-' | '/' | '@' | ',' | '=')
+        })
 }
 
 /// Adds the forward `local` → `remote` to `link`'s master.
@@ -68,12 +80,6 @@ pub(crate) async fn add(
 /// `-L <local>:<remote>`, for paths ssh splits correctly and expands nothing in.
 fn spec(local: &Path, remote: &str) -> Result<[String; 2], SshError> {
     let local = local.to_str().unwrap_or("");
-    let fits = |p: &str| {
-        p.starts_with('/')
-            && !p
-                .chars()
-                .any(|c| c.is_whitespace() || c.is_control() || matches!(c, ':' | '%' | '$' | '~'))
-    };
     if !fits(local) || !fits(remote) {
         return Err(SshError::InvalidArgument(
             "a socket path ssh cannot forward".to_owned(),
@@ -94,7 +100,7 @@ pub(crate) async fn check(
     let broken = match answered {
         Ok(Ok(true)) => return Ok(()),
         Ok(Ok(false)) => Broken::Closed,
-        Ok(Err(e)) => Broken::Failed(e.to_string()),
+        Ok(Err(e)) => Broken::Failed(e.kind().to_string()),
         Err(_) => Broken::Silent,
     };
     // ssh logs the refusal just as it closes the connection: give it a moment.
@@ -178,10 +184,15 @@ mod tests {
                 "/run/user/1000/pitcrew-ssh/t1/fwd:/home/sam/.pitcrew/run/pitcrewd.sock"
             ]
         );
+        assert!(fits("/home/jdoe@ad.example/.pitcrew/run/pitcrewd.sock"));
         for (local, remote) in [
             ("/tmp/a:b/fwd", "/x/pitcrewd.sock"),
             ("/tmp/fwd", "/x:y/pitcrewd.sock"),
             ("/tmp/%d/fwd", "/x/pitcrewd.sock"),
+            ("/tmp/fwd", "/home/$USER/pitcrewd.sock"),
+            ("/tmp/fwd", "/home/~sam/pitcrewd.sock"),
+            ("/tmp/fwd", "/home/a b/pitcrewd.sock"),
+            ("/tmp/fwd", "/home/[x]/pitcrewd.sock"),
             ("relative", "/x/pitcrewd.sock"),
         ] {
             assert!(

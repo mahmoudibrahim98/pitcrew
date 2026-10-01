@@ -4,14 +4,23 @@
 //!   directory, `ControlPersist=no`): every call of the tunnel (the endpoint check, each stdio
 //!   bridge, a forward) is a channel of it, so a machine is logged in to once per (re)connection,
 //!   whatever the number of connections. It is ready once its control socket exists.
-//! - **Windows:** OpenSSH there has no ControlMaster, so it is only a heartbeat: a connection
-//!   whose keepalives notice a lost network. It is ready once ssh logs that it authenticated.
+//! - **Windows** (or without connection reuse): OpenSSH there has no ControlMaster, so it is
+//!   only a heartbeat: a connection whose keepalives notice a lost network. It is ready once ssh
+//!   logs that it authenticated.
 //!
-//! Its keepalives ([`KEEPALIVE_INTERVAL`], [`KEEPALIVE_COUNT`]) make ssh give up on a silent
-//! server within six seconds, so a lost network is noticed well within ten. Agent and X11
-//! forwarding, local commands and the user's configured forwardings stay off, as for every
-//! call. Its log (`-E`, at `INFO`, so that "Timeout, server not responding." is in it) gives
-//! the reason when it ends.
+//! **Keepalives** (`ServerAliveInterval` [`KEEPALIVE_INTERVAL`]) end it after a silence that
+//! depends on what else watches the network:
+//! - a *patient* link, whose forwarded socket the connector probes ([`KEEPALIVE_COUNT_PATIENT`]):
+//!   the probe reports a silence within ten seconds, and the link waits 30 s before giving up,
+//!   so a short outage costs no new login (no new one-time code);
+//! - otherwise ([`KEEPALIVE_COUNT`]): the keepalives are the only sign of a silent network (a
+//!   probe of its own would cost a session, which sshd's `MaxSessions` limits, or a refused
+//!   forward, which sshd logs), so the link gives up after 8 s.
+//!
+//! Agent and X11 forwarding, local commands and the user's configured forwardings stay off, as
+//! for every call; so does `ForkAfterAuthentication` where the user's config turns it on (the
+//! link would leave the connector's watch). Its log (`-E`, at `INFO`, so that "Timeout, server
+//! not responding." is in it) gives the reason when it ends.
 
 use crate::askpass::server::AskpassServer;
 use crate::quote::validate_host;
@@ -24,12 +33,17 @@ use tokio::io::AsyncReadExt as _;
 
 /// Seconds between keepalives when the server is silent (`ServerAliveInterval`).
 pub const KEEPALIVE_INTERVAL: u32 = 2;
-/// Unanswered keepalives before ssh gives up (`ServerAliveCountMax`): it does so after
-/// `(KEEPALIVE_COUNT + 1) × KEEPALIVE_INTERVAL` seconds of silence.
-pub const KEEPALIVE_COUNT: u32 = 2;
+/// Unanswered keepalives before a link without a probed forward gives up
+/// (`ServerAliveCountMax`): after `(KEEPALIVE_COUNT + 1) × KEEPALIVE_INTERVAL` = 8 seconds of
+/// silence.
+pub const KEEPALIVE_COUNT: u32 = 3;
+/// The same for a patient link, whose forward is probed: after 30 seconds of silence.
+pub const KEEPALIVE_COUNT_PATIENT: u32 = 14;
 
-// The brief's bound: a lost connection is noticed within ten seconds.
-const _: () = assert!((KEEPALIVE_COUNT + 1) * KEEPALIVE_INTERVAL + 2 < 10);
+// The brief's bound: a lost connection is noticed within ten seconds (the monitor polls once a
+// second); a patient link notices through its probe instead.
+const _: () = assert!((KEEPALIVE_COUNT + 1) * KEEPALIVE_INTERVAL + 1 < 10);
+const _: () = assert!((KEEPALIVE_COUNT_PATIENT + 1) * KEEPALIVE_INTERVAL == 30);
 
 /// How a link reaches its host when that is a compute node.
 #[derive(Clone, Copy, Debug)]
@@ -60,6 +74,10 @@ pub(crate) struct LinkSpec<'a> {
     pub(crate) host: &'a str,
     /// For a compute node, the way through the login node.
     pub(crate) via: Option<Via<'a>>,
+    /// A ControlMaster (Unix, with connection reuse), or a heartbeat.
+    pub(crate) master: bool,
+    /// Wait 30 s of silence before giving up (a probed forward watches), else 8 s.
+    pub(crate) patient: bool,
 }
 
 /// A running link.
@@ -84,12 +102,18 @@ impl Link {
     pub(crate) async fn start(spec: LinkSpec<'_>, wait: Duration) -> Result<Self, SshError> {
         validate_host(spec.host)?;
         let log = SshLog::new(spec.dir)?;
-        let control = cfg!(unix).then(|| spec.dir.join(spec.name));
-        let args = link_args(&spec, log.path(), control.as_deref())?;
+        let control = spec.master.then(|| spec.dir.join(spec.name));
+        let fork = knows_fork_after_authentication(spec.ssh, spec.host).await;
+        let args = link_args(&spec, log.path(), control.as_deref(), fork)?;
         if let Some(control) = &control {
             let _ = std::fs::remove_file(control);
         }
-        let (mut proc, askpass) = spec.ssh.spawn(spec.dir, spec.host, args, false)?;
+        // ssh runs a ProxyCommand with `$SHELL -c "exec …"`; ours is written for sh.
+        let env: &[(&str, &str)] = match spec.via {
+            Some(Via::Master { .. }) => &[("SHELL", "/bin/sh")],
+            _ => &[],
+        };
+        let (mut proc, askpass) = spec.ssh.spawn(spec.dir, spec.host, args, false, env)?;
         let stderr = drain(&mut proc);
         let mut link = Self {
             host: spec.host.to_owned(),
@@ -277,18 +301,42 @@ pub(crate) fn is_socket(path: &Path) -> bool {
     }
 }
 
-/// The link's arguments: `-N` and the options in the module docs.
+/// Whether the user's config, for `host`, sets `ForkAfterAuthentication` at all: `ssh -G` prints
+/// the option only where ssh knows it (OpenSSH 8.7 and newer), and only there may the link pass
+/// it, as `no`. When `ssh -G` fails, `false`: the link then fails visibly if ssh forks.
+async fn knows_fork_after_authentication(ssh: &Ssh, host: &str) -> bool {
+    let mut command = ssh.command();
+    command.args(["-G", "--", host]);
+    match crate::ssh::drive(command, None, crate::RESOLVE_LIMITS, None).await {
+        Ok((status, stdout, _)) if status.success() => {
+            knows_fork(&String::from_utf8_lossy(&stdout))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `ssh -G`'s output names `ForkAfterAuthentication`.
+fn knows_fork(resolved: &str) -> bool {
+    resolved.lines().any(|line| {
+        line.split_once(' ')
+            .is_some_and(|(key, _)| key.eq_ignore_ascii_case("forkafterauthentication"))
+    })
+}
+
+/// The link's arguments: `-N` and the options in the module docs. `fork`: ssh knows
+/// `ForkAfterAuthentication` (see [`knows_fork_after_authentication`]).
 pub(crate) fn link_args(
     spec: &LinkSpec<'_>,
     log: &Path,
     control: Option<&Path>,
+    fork: bool,
 ) -> Result<Vec<String>, SshError> {
     let log = log.to_str().ok_or_else(|| {
         SshError::InvalidArgument("the runtime directory is not valid UTF-8".to_owned())
     })?;
     let mut args: Vec<String> = ["-N", "-T", "-E", log].map(str::to_owned).to_vec();
     let mut options: Vec<String> = [
-        // Windows has no control socket to watch for: "Authenticated to" is a VERBOSE line.
+        // Without a control socket to watch for, "Authenticated to" (a VERBOSE line) says ready.
         if control.is_some() {
             "LogLevel=INFO"
         } else {
@@ -304,8 +352,16 @@ pub(crate) fn link_args(
     ]
     .map(str::to_owned)
     .to_vec();
+    if fork {
+        options.push("ForkAfterAuthentication=no".to_owned());
+    }
+    let count = if spec.patient {
+        KEEPALIVE_COUNT_PATIENT
+    } else {
+        KEEPALIVE_COUNT
+    };
     options.push(format!("ServerAliveInterval={KEEPALIVE_INTERVAL}"));
-    options.push(format!("ServerAliveCountMax={KEEPALIVE_COUNT}"));
+    options.push(format!("ServerAliveCountMax={count}"));
     options.push(format!(
         "ConnectTimeout={}",
         spec.ssh.connect_timeout_secs()
@@ -339,8 +395,9 @@ pub(crate) fn link_args(
 }
 
 /// `ProxyCommand=exec <ssh> … -W '[%h]:%p' -- <login>`: the node's connection as a channel of
-/// the login link. Every part is quoted for `/bin/sh` and has its `%` doubled for ssh, apart from
-/// the `%h` and `%p` ssh fills in.
+/// the login link. ssh runs it with `$SHELL -c`, so the link sets `SHELL=/bin/sh` for it; every
+/// part is quoted for sh and has its `%` doubled for ssh, apart from the `%h` and `%p` ssh fills
+/// in.
 pub(crate) fn proxy_through(
     program: &Path,
     control: &Path,
@@ -439,6 +496,8 @@ mod tests {
             name: "login",
             host: "hpc-login",
             via,
+            master: true,
+            patient: false,
         }
     }
 
@@ -453,7 +512,13 @@ mod tests {
         let ssh = Ssh::new("ssh");
         let dir = Path::new("/run/user/1000/pitcrew-ssh/t0123abcd");
         let control = dir.join("login");
-        let args = link_args(&spec(&ssh, dir, None), &dir.join("log-1"), Some(&control)).unwrap();
+        let args = link_args(
+            &spec(&ssh, dir, None),
+            &dir.join("log-1"),
+            Some(&control),
+            false,
+        )
+        .unwrap();
         assert_eq!(
             args[..4],
             [
@@ -475,7 +540,7 @@ mod tests {
             ("ControlPersist", "no"),
             ("StreamLocalBindMask", "0177"),
             ("ServerAliveInterval", "2"),
-            ("ServerAliveCountMax", "2"),
+            ("ServerAliveCountMax", "3"),
         ] {
             assert_eq!(option(&args, name), Some(value), "{name}");
         }
@@ -484,6 +549,15 @@ mod tests {
             Some("/run/user/1000/pitcrew-ssh/t0123abcd/login")
         );
         assert_eq!(args[args.len() - 2..], ["--", "hpc-login"]);
+        assert_eq!(option(&args, "ForkAfterAuthentication"), None);
+        // Patient, where ssh knows ForkAfterAuthentication.
+        let patient = LinkSpec {
+            patient: true,
+            ..spec(&ssh, dir, None)
+        };
+        let args = link_args(&patient, &dir.join("log-1"), Some(&control), true).unwrap();
+        assert_eq!(option(&args, "ServerAliveCountMax"), Some("14"));
+        assert_eq!(option(&args, "ForkAfterAuthentication"), Some("no"));
 
         // Through the login link: the hop is a client of its master, never a login.
         let login_control = dir.join("login");
@@ -498,6 +572,7 @@ mod tests {
             ),
             &dir.join("log-2"),
             Some(&dir.join("node")),
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -512,9 +587,13 @@ mod tests {
         );
         // Windows: ssh's own jump.
         let args = link_args(
-            &spec(&ssh, dir, Some(Via::Jump("hpc-login"))),
+            &LinkSpec {
+                master: false,
+                ..spec(&ssh, dir, Some(Via::Jump("hpc-login")))
+            },
             &dir.join("log-3"),
             None,
+            false,
         )
         .unwrap();
         let at = args.iter().position(|a| a == "-J").unwrap();
@@ -551,6 +630,13 @@ mod tests {
         }
         // A control path ssh would expand.
         assert!(proxy_through(Path::new("ssh"), Path::new("/tmp/%d/login"), "h").is_err());
+    }
+
+    #[test]
+    fn fork_after_authentication_is_read_from_ssh_g() {
+        assert!(knows_fork("hostname h\nforkafterauthentication yes\n"));
+        assert!(knows_fork("ForkAfterAuthentication no\n"));
+        assert!(!knows_fork("hostname h\nport 22\n"));
     }
 
     #[test]

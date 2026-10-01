@@ -1,19 +1,24 @@
-//! One connection through the stdio bridge: `ssh <host> exec <pitcrewd> connect --socket <path>`
-//! (or, for a job whose node takes no ssh, `… exec srun --jobid <id> --overlap … <pitcrewd>
-//! connect …` on the login node), its stdin and stdout being the connection.
+//! One connection through the stdio bridge: `ssh <host> exec <pitcrewd> connect --socket <path>
+//! --nonce <hex>` (or, for a job whose node takes no ssh, `… exec srun --jobid <id> --overlap …
+//! <pitcrewd> connect … --framed`, on the login node), its stdin and stdout being the
+//! connection.
 //!
-//! On Unix the call is a client of the link's ControlMaster: a channel, never a login. On
-//! Windows each one logs in (OpenSSH there has no ControlMaster), with prompts going to the
-//! askpass bridge as for any call.
+//! On Unix the call is a client of the link's ControlMaster: a channel (a session, which sshd's
+//! `MaxSessions` counts), never a login. On Windows each one logs in (OpenSSH there has no
+//! ControlMaster), with prompts going to the askpass bridge as for any call.
 //!
 //! Whatever the login shell prints before the bridge starts is skipped: the connection begins
-//! after the bridge's [`READY`] mark. If the mark does not come, the bridge's exit code and its
-//! last line on stderr say why.
+//! after the bridge's ready mark, which carries this call's random nonce. If the mark does not
+//! come, the bridge's exit code and its last line on stderr say why. Through `srun` the bridge
+//! frames its output ([`crate::bridge`]), and this end takes the frames apart.
+//!
+//! The ssh behind a connection belongs to a task that stops it (and what it started) when the
+//! stream is dropped, or when the connector closes.
 
 use super::TunnelError;
 use crate::askpass::server::AskpassServer;
-use crate::bridge::{EXIT_NO_DAEMON, EXIT_UNSAFE, EXIT_USAGE, READY};
-use crate::ssh::{Running, SshLog, classify_failure, expire, last_line};
+use crate::bridge::{EXIT_NO_DAEMON, EXIT_UNSAFE, EXIT_USAGE, FRAME_HEADER, ready_mark};
+use crate::ssh::{SshLog, classify_failure, expire, last_line};
 use crate::{Ssh, SshError};
 use std::io;
 use std::path::Path;
@@ -23,22 +28,39 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, ReadBuf};
 use tokio::process::{ChildStdin, ChildStdout};
+use tokio::sync::{oneshot, watch};
 
 /// The most a login shell may print before the bridge's mark.
 const MAX_PREAMBLE: usize = 64 * 1024;
 
-/// One connection's ssh, and its stdin and stdout as a byte stream. Dropping it stops ssh.
+/// The largest frame accepted (the bridge sends at most 64 KiB).
+const MAX_FRAME: usize = 1024 * 1024;
+
+/// One connection's stdin and stdout as a byte stream. Dropping it stops its ssh.
 #[derive(Debug)]
 pub(crate) struct StdioStream {
-    /// Kills ssh when dropped.
-    _proc: Running,
     stdin: Option<ChildStdin>,
     stdout: ChildStdout,
-    /// What came after the mark in the read that found it.
-    pending: Vec<u8>,
+    /// Bytes read from stdout, not yet handed out (after the mark; still framed if framed).
+    raw: Vec<u8>,
     pos: usize,
-    _askpass: Option<AskpassServer>,
-    _log: SshLog,
+    /// Framed (through srun): where in the frames the reading is.
+    frames: Option<Frames>,
+    /// Dropped with the stream: the task that owns ssh then stops it.
+    _owner: oneshot::Sender<()>,
+}
+
+/// Where the decoding of the bridge's frames stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Frames {
+    /// Before a header.
+    Header,
+    /// Inside a frame, with this many bytes of it to come.
+    Body(usize),
+    /// After a frame's bytes, before its `\n`; `true` for the end mark.
+    Trailer(bool),
+    /// After the end mark.
+    End,
 }
 
 /// What to run.
@@ -50,12 +72,17 @@ pub(crate) struct Opening<'a> {
     pub(crate) dir: &'a Path,
     /// The host, as given to ssh.
     pub(crate) host: &'a str,
-    /// The command on the host, quoted by [`crate::quote::remote_command`].
+    /// The command on the host, quoted by [`crate::quote::remote_command`]; `--nonce` (and
+    /// `--framed`) are added.
     pub(crate) argv: Vec<String>,
+    /// Ask the bridge for frames (through srun).
+    pub(crate) framed: bool,
     /// Options before `--` (`-J <login>` on Windows).
     pub(crate) extra: Vec<String>,
     /// How long the mark may take, not counting time spent on prompts.
     pub(crate) wait: Duration,
+    /// Turns `true` when the connector closes: the connection's ssh is stopped then.
+    pub(crate) closing: watch::Receiver<bool>,
 }
 
 /// Starts the command and waits for the bridge's mark.
@@ -64,11 +91,18 @@ pub(crate) struct Opening<'a> {
 /// - [`TunnelError::Refused`]: the bridge refused the socket (it is not this user's alone), or
 ///   the helper has no `connect` command;
 /// - [`TunnelError::NoDaemon`]: nothing listens on the socket, or the helper is missing;
-/// - [`TunnelError::Ssh`]: ssh failed (with no master, a call through it fails at once);
+/// - [`TunnelError::Ssh`]: ssh failed ([`SshError::SessionRefused`] when the server allows no
+///   more sessions; with no master, a call through it fails at once);
 /// - [`TunnelError::Bridge`]: anything else, with what it said.
 pub(crate) async fn open(opening: Opening<'_>) -> Result<StdioStream, TunnelError> {
     crate::quote::validate_host(opening.host)?;
-    let remote = crate::quote::remote_command(&opening.argv)?;
+    let nonce = crate::askpass::to_hex(&crate::askpass::random::<8>().map_err(SshError::Setup)?);
+    let mut argv = opening.argv;
+    argv.extend(["--nonce".to_owned(), nonce.clone()]);
+    if opening.framed {
+        argv.push("--framed".to_owned());
+    }
+    let remote = crate::quote::remote_command(&argv)?;
     let log = SshLog::new(opening.dir)?;
     let args = opening.ssh.args(
         opening.dir,
@@ -77,7 +111,9 @@ pub(crate) async fn open(opening: Opening<'_>) -> Result<StdioStream, TunnelErro
         remote,
         &opening.extra,
     )?;
-    let (mut proc, askpass) = opening.ssh.spawn(opening.dir, opening.host, args, true)?;
+    let (mut proc, askpass) = opening
+        .ssh
+        .spawn(opening.dir, opening.host, args, true, &[])?;
     let (Some(stdin), Some(mut stdout), Some(stderr)) = (
         proc.child.stdin.take(),
         proc.child.stdout.take(),
@@ -89,6 +125,7 @@ pub(crate) async fn open(opening: Opening<'_>) -> Result<StdioStream, TunnelErro
     };
     let kept = keep_tail(stderr);
     let open = askpass.as_ref().map(AskpassServer::open_prompts);
+    let mark = ready_mark(Some(&nonce));
     let found = {
         let stopped = async {
             match &askpass {
@@ -96,31 +133,55 @@ pub(crate) async fn open(opening: Opening<'_>) -> Result<StdioStream, TunnelErro
                 None => std::future::pending().await,
             }
         };
+        let mut closing = opening.closing.clone();
         tokio::select! {
-            found = find_mark(&mut stdout) => found,
+            found = find_mark(&mut stdout, &mark) => found,
             why = stopped => Err(Some(why.error().into())),
             () = expire(opening.wait, open) => Err(Some(TunnelError::Bridge(format!(
                 "the bridge did not start within {:?}",
                 opening.wait
             )))),
+            _ = closing.wait_for(|c| *c) => Err(Some(TunnelError::NotConnected(
+                super::LinkState::Closed,
+            ))),
         }
     };
     match found {
-        Ok(pending) => Ok(StdioStream {
-            _proc: proc,
-            stdin: Some(stdin),
-            stdout,
-            pending,
-            pos: 0,
-            _askpass: askpass,
-            _log: log,
-        }),
+        Ok(raw) => {
+            let (owner, dropped) = oneshot::channel::<()>();
+            let mut closing = opening.closing;
+            // Owns ssh (and the prompt bridge and its log) until the stream or the connector
+            // goes; it stops ssh then, unless it ended by itself.
+            tokio::spawn(async move {
+                let _askpass = askpass;
+                let _log = log;
+                tokio::select! {
+                    _ = proc.child.wait() => return,
+                    _ = dropped => {}
+                    _ = closing.wait_for(|c| *c) => {}
+                }
+                proc.kill().await;
+            });
+            Ok(StdioStream {
+                stdin: Some(stdin),
+                stdout,
+                raw,
+                pos: 0,
+                frames: opening.framed.then_some(Frames::Header),
+                _owner: owner,
+            })
+        }
         Err(Some(error)) => {
             proc.kill().await;
             Err(error)
         }
         Err(None) => {
-            // stdout ended without the mark: ssh or the bridge exited. Their word says why.
+            // stdout ended without the mark: ssh or the bridge exited. A cancelled prompt
+            // (askpass then stops ssh) says why first; else their word does.
+            if let Some(why) = askpass.as_ref().and_then(AskpassServer::stopped) {
+                proc.kill().await;
+                return Err(why.error().into());
+            }
             let status = tokio::time::timeout(Duration::from_secs(5), proc.child.wait()).await;
             proc.kill().await;
             let code = status.ok().and_then(Result::ok).and_then(|s| s.code());
@@ -131,8 +192,8 @@ pub(crate) async fn open(opening: Opening<'_>) -> Result<StdioStream, TunnelErro
     }
 }
 
-/// Reads until [`READY`], returning what came after it. `Err(None)` at end of file.
-async fn find_mark(stdout: &mut ChildStdout) -> Result<Vec<u8>, Option<TunnelError>> {
+/// Reads until `mark`, returning what came after it. `Err(None)` at end of file.
+async fn find_mark(stdout: &mut ChildStdout, mark: &[u8]) -> Result<Vec<u8>, Option<TunnelError>> {
     let mut seen: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 16 * 1024];
     loop {
@@ -142,10 +203,10 @@ async fn find_mark(stdout: &mut ChildStdout) -> Result<Vec<u8>, Option<TunnelErr
             Err(e) => return Err(Some(TunnelError::Io(e))),
         };
         seen.extend_from_slice(buf.get(..n).unwrap_or_default());
-        if let Some(at) = seen.windows(READY.len()).position(|w| w == READY) {
-            return Ok(seen.split_off(at + READY.len()));
+        if let Some(at) = seen.windows(mark.len()).position(|w| w == mark) {
+            return Ok(seen.split_off(at + mark.len()));
         }
-        if seen.len() > MAX_PREAMBLE + READY.len() {
+        if seen.len() > MAX_PREAMBLE + mark.len() {
             return Err(Some(TunnelError::Bridge(format!(
                 "more than {MAX_PREAMBLE} bytes came before the bridge started: is something \
                  in the login shell's start-up files printing?"
@@ -155,16 +216,16 @@ async fn find_mark(stdout: &mut ChildStdout) -> Result<Vec<u8>, Option<TunnelErr
 }
 
 /// The error for a bridge that ended before its mark, from ssh's log, the exit code (the
-/// bridge's, or the shell's) and the last line on stderr.
+/// bridge's, or the shell's) and the last line on stderr, with no paths in it.
 fn failure(log: &str, stderr: &str, code: Option<i32>) -> TunnelError {
-    let said = last_line(stderr);
+    let said = super::scrub(&last_line(stderr));
     let said = if said.is_empty() {
         format!("it exited with {code:?}")
     } else {
         said
     };
     if code == Some(255)
-        && let Some(error) = classify_failure(log, format!("{log}{stderr}"))
+        && let Some(error) = classify_failure(log, super::scrub(&format!("{log}{stderr}")))
     {
         return TunnelError::Ssh(error);
     }
@@ -175,11 +236,12 @@ fn failure(log: &str, stderr: &str, code: Option<i32>) -> TunnelError {
              app?): {said}"
         )),
         Some(EXIT_NO_DAEMON) => TunnelError::NoDaemon(said),
-        // The shell found no such program: the helper's version is gone.
-        Some(126 | 127) => TunnelError::NoDaemon(format!("the helper is not there: {said}")),
+        // The shell found no such program: the helper's version is gone. (Its line names the
+        // path, so it is left out.)
+        Some(126 | 127) => TunnelError::NoDaemon("the helper is not there".to_owned()),
         Some(255) => TunnelError::Ssh(SshError::Ssh {
             code: 255,
-            stderr: format!("{log}{stderr}"),
+            stderr: super::scrub(&format!("{log}{stderr}")),
         }),
         _ => TunnelError::Bridge(said),
     }
@@ -206,6 +268,86 @@ fn keep_tail(mut stderr: tokio::process::ChildStderr) -> Arc<Mutex<Vec<u8>>> {
     kept
 }
 
+/// What decoding produced.
+enum Decoded {
+    /// Bytes went into the buffer.
+    Bytes,
+    /// The end mark: end of file.
+    End,
+    /// More bytes are needed.
+    More,
+}
+
+impl StdioStream {
+    /// The bytes not yet decoded.
+    fn rest(&self) -> &[u8] {
+        self.raw.get(self.pos..).unwrap_or_default()
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.pos += n;
+        if self.pos >= self.raw.len() {
+            self.raw.clear();
+            self.pos = 0;
+        }
+    }
+
+    /// Takes frames apart into `buf`, as far as the bytes read allow.
+    fn decode(&mut self, frames: Frames, buf: &mut ReadBuf<'_>) -> io::Result<Decoded> {
+        let bad = |why: &str| io::Error::new(io::ErrorKind::InvalidData, why.to_owned());
+        let mut state = frames;
+        let decoded = loop {
+            match state {
+                Frames::End => break Decoded::End,
+                Frames::Header => {
+                    let Some(header) = self.rest().get(..FRAME_HEADER) else {
+                        break Decoded::More;
+                    };
+                    let len = std::str::from_utf8(header)
+                        .ok()
+                        .and_then(|h| h.strip_suffix(':'))
+                        .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
+                        .and_then(|h| usize::from_str_radix(h, 16).ok())
+                        .filter(|len| *len <= MAX_FRAME)
+                        .ok_or_else(|| bad("a frame from the bridge has a bad header"))?;
+                    self.consume(FRAME_HEADER);
+                    state = if len == 0 {
+                        Frames::Trailer(true)
+                    } else {
+                        Frames::Body(len)
+                    };
+                }
+                Frames::Body(left) => {
+                    let n = left.min(self.rest().len()).min(buf.remaining());
+                    if n == 0 {
+                        break Decoded::More;
+                    }
+                    buf.put_slice(self.rest().get(..n).unwrap_or_default());
+                    self.consume(n);
+                    state = if left == n {
+                        Frames::Trailer(false)
+                    } else {
+                        Frames::Body(left - n)
+                    };
+                    break Decoded::Bytes;
+                }
+                Frames::Trailer(end) => {
+                    let Some(&byte) = self.rest().first() else {
+                        break Decoded::More;
+                    };
+                    if byte != b'\n' {
+                        return Err(bad("a frame from the bridge does not end its line"));
+                    }
+                    self.consume(1);
+                    state = if end { Frames::End } else { Frames::Header };
+                }
+            }
+        };
+        self.frames = Some(state);
+        Ok(decoded)
+    }
+}
+
 impl AsyncRead for StdioStream {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -213,17 +355,39 @@ impl AsyncRead for StdioStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if let Some(rest) = this.pending.get(this.pos..).filter(|r| !r.is_empty()) {
-            let n = rest.len().min(buf.remaining());
-            buf.put_slice(rest.get(..n).unwrap_or_default());
-            this.pos += n;
-            if this.pos >= this.pending.len() {
-                this.pending = Vec::new();
-                this.pos = 0;
+        let Some(mut frames) = this.frames else {
+            // Plain: what came after the mark first, then stdout as it is.
+            if !this.rest().is_empty() {
+                let n = this.rest().len().min(buf.remaining());
+                buf.put_slice(this.rest().get(..n).unwrap_or_default());
+                this.consume(n);
+                return Poll::Ready(Ok(()));
             }
-            return Poll::Ready(Ok(()));
+            return Pin::new(&mut this.stdout).poll_read(cx, buf);
+        };
+        loop {
+            match this.decode(frames, buf)? {
+                Decoded::Bytes | Decoded::End => return Poll::Ready(Ok(())),
+                Decoded::More => {}
+            }
+            let mut chunk = [0u8; 16 * 1024];
+            let mut read = ReadBuf::new(&mut chunk);
+            match Pin::new(&mut this.stdout).poll_read(cx, &mut read) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(())) => {}
+            }
+            if read.filled().is_empty() {
+                // The output ended without the end mark: at a frame's boundary it is still an
+                // end, else the stream was cut.
+                return Poll::Ready(match this.frames {
+                    Some(Frames::Header | Frames::End) => Ok(()),
+                    _ => Err(io::ErrorKind::UnexpectedEof.into()),
+                });
+            }
+            this.raw.extend_from_slice(read.filled());
+            frames = this.frames.unwrap_or(Frames::End);
         }
-        Pin::new(&mut this.stdout).poll_read(cx, buf)
     }
 }
 
@@ -287,8 +451,16 @@ mod tests {
             matches!(&err, TunnelError::Refused(why) if why.contains("older")),
             "{err:?}"
         );
-        let err = failure("", "sh: 1: /x/pitcrewd: not found\n", Some(127));
-        assert!(matches!(err, TunnelError::NoDaemon(_)), "{err:?}");
+        // The shell's line names the path: it is left out.
+        let err = failure(
+            "",
+            "sh: 1: /home/sam/.pitcrew/bin/1.0/pitcrewd: not found\n",
+            Some(127),
+        );
+        assert!(
+            matches!(&err, TunnelError::NoDaemon(why) if !why.contains('/')),
+            "{err:?}"
+        );
         let err = failure(
             "kex_exchange_identification: Connection closed by remote host\n",
             "",
@@ -298,9 +470,19 @@ mod tests {
             matches!(err, TunnelError::Ssh(SshError::Unreachable { .. })),
             "{err:?}"
         );
-        let err = failure("", "\x1b[31msomething\n", Some(1));
+        let err = failure(
+            "mux_client_request_session: session request failed: Session open refused by peer\n\
+             kex_exchange_identification: Connection closed by remote host\n",
+            "",
+            Some(255),
+        );
         assert!(
-            matches!(&err, TunnelError::Bridge(why) if why == "?[31msomething"),
+            matches!(err, TunnelError::Ssh(SshError::SessionRefused { .. })),
+            "{err:?}"
+        );
+        let err = failure("", "\x1b[31msomething at /home/sam/x\n", Some(1));
+        assert!(
+            matches!(&err, TunnelError::Bridge(why) if why == "?[31msomething at …"),
             "{err:?}"
         );
     }

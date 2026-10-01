@@ -151,7 +151,7 @@ pub(crate) fn route_from(
             ));
         }
         return Ok(Route {
-            socket: checked_socket(&endpoint.socket)?,
+            socket: checked_socket(&endpoint.socket, layout, Some(job))?,
             bridge: bridge(layout, &endpoint.version)?,
             node: Some(Node {
                 name: node.clone(),
@@ -186,15 +186,54 @@ pub(crate) fn route_from(
         )));
     };
     Ok(Route {
-        socket: checked_socket(&endpoint.socket)?,
+        socket: checked_socket(&endpoint.socket, layout, None)?,
         bridge: bridge(layout, &endpoint.version)?,
         node: None,
     })
 }
 
-fn checked_socket(socket: &str) -> Result<String, NoRoute> {
+fn checked_socket(socket: &str, layout: &Layout, job: Option<u64>) -> Result<String, NoRoute> {
     check_socket(socket).map_err(NoRoute::Invalid)?;
+    pin_socket(socket, layout, job).map_err(NoRoute::Invalid)?;
     Ok(socket.to_owned())
+}
+
+/// The socket must be where the launcher puts it, so that a record cannot point the tunnel (a
+/// forward, which makes no checks of its own on the machine) at another socket:
+/// - the direct and tmux launchers: `<root>/run/pitcrewd.sock`;
+/// - a SLURM job: that, or its own node-local socket,
+///   `<dir>/pitcrew-<job>.<pid>/pitcrewd.sock`, where the job script made `<dir>` of
+///   `A-Z a-z 0-9 . _ + - /` (from `$TMPDIR`, else `/tmp`).
+pub(crate) fn pin_socket(socket: &str, layout: &Layout, job: Option<u64>) -> Result<(), String> {
+    if socket == layout.socket() {
+        return Ok(());
+    }
+    let node_local = job.is_some_and(|job| {
+        let Some(dir) = socket.strip_suffix("/pitcrewd.sock") else {
+            return false;
+        };
+        let Some((parent, name)) = dir.rsplit_once('/') else {
+            return false;
+        };
+        let pid = name
+            .strip_prefix(&format!("pitcrew-{job}."))
+            .unwrap_or_default();
+        let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-' | '/');
+        !pid.is_empty()
+            && pid.len() <= 10
+            && pid.bytes().all(|b| b.is_ascii_digit())
+            && parent.starts_with('/')
+            && parent.chars().all(plain)
+    });
+    if node_local {
+        Ok(())
+    } else {
+        Err(
+            "the helper's socket is not where its launcher puts it (the root's run/pitcrewd.sock, \
+             or the job's own pitcrew-<job>.<pid> directory)"
+                .to_owned(),
+        )
+    }
 }
 
 /// The helper binary of `version`, whose `connect` runs the bridge.
@@ -213,10 +252,10 @@ fn clean(text: &str) -> String {
     crate::helper::script::clean(text)
 }
 
-/// A socket path from a record: absolute, at most 100 bytes, `<dir>/pitcrewd.sock`, and made of
-/// characters that neither ssh (which expands `%`, `$` and `~` in forwarded socket paths, and
-/// splits `-L` at `:`) nor a shell reads specially: `A-Z a-z 0-9 . _ + - /`, with no empty,
-/// `.` or `..` component.
+/// A socket path from a record: absolute, at most 100 bytes, `<dir>/pitcrewd.sock`, with no
+/// control character and no empty, `.` or `..` component. Any other character is fine for the
+/// stdio bridge, which gets it quoted as one argument; a forward takes fewer (see
+/// `forward::spec`) and is not tried for a path it cannot carry.
 pub(crate) fn check_socket(socket: &str) -> Result<(), String> {
     // Not the path itself: it carries the user's name.
     let bad = |why: &str| Err(format!("the helper's socket path {why}"));
@@ -229,11 +268,8 @@ pub(crate) fn check_socket(socket: &str) -> Result<(), String> {
     if !socket.ends_with("/pitcrewd.sock") {
         return bad("does not end in /pitcrewd.sock");
     }
-    if !socket
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-' | '/'))
-    {
-        return bad("has characters other than A-Z a-z 0-9 . _ + - /");
+    if socket.chars().any(char::is_control) {
+        return bad("has a control character");
     }
     if socket
         .split('/')
@@ -241,6 +277,23 @@ pub(crate) fn check_socket(socket: &str) -> Result<(), String> {
         .any(|part| part.is_empty() || part == "." || part == "..")
     {
         return bad("has an empty, . or .. component");
+    }
+    Ok(())
+}
+
+/// A node reached with ssh must not be one of the user's own `Host` aliases (concrete names in
+/// `aliases`, from their ssh config): the cluster names the node, and must not pick which of
+/// the user's hosts, with its settings, the tunnel connects to. ssh compares host names without
+/// regard to case. (Wildcard patterns and `Match` blocks still apply to node names, as for any
+/// host: a hostile cluster can choose a name one of them matches.)
+pub(crate) fn check_not_an_alias(node: &str, aliases: &[String]) -> Result<(), String> {
+    if aliases.iter().any(|alias| alias.eq_ignore_ascii_case(node)) {
+        return Err(format!(
+            "the job's node {:?} is also a Host in your ssh config; PitCrew does not let a \
+             cluster choose which of your hosts it connects to (rename that Host to use the \
+             tunnel)",
+            clean(node)
+        ));
     }
     Ok(())
 }
@@ -483,19 +536,74 @@ mod tests {
         check_socket(SOCKET).unwrap();
         check_socket(NODE_SOCKET).unwrap();
         check_socket("/scratch/u+1/.pitcrew/run/pitcrewd.sock").unwrap();
+        // The bridge gets the path quoted: a home like this one is fine for it.
+        check_socket("/home/jdoe@ad.example/.pitcrew/run/pitcrewd.sock").unwrap();
+        check_socket("/home/a b/pitcrewd.sock").unwrap();
         let long = format!("/{}/pitcrewd.sock", "d".repeat(90));
         for bad in [
             "",
             "pitcrewd.sock",
-            "/home/a b/pitcrewd.sock",
-            "/home/~sam/pitcrewd.sock",
             "/home//sam/pitcrewd.sock",
             "/home/./pitcrewd.sock",
+            "/home/../pitcrewd.sock",
             "/home/sam/pitcrewd.sock.old",
             "/home/sam/pitcrewd.sock\n",
+            "/home/sa\u{1b}m/pitcrewd.sock",
             long.as_str(),
         ] {
             assert!(check_socket(bad).is_err(), "{bad:?}");
         }
+    }
+
+    /// The socket must be where the launcher puts it.
+    #[test]
+    fn sockets_are_pinned_to_their_launcher() {
+        let layout = layout();
+        pin_socket(SOCKET, &layout, None).unwrap();
+        pin_socket(SOCKET, &layout, Some(4242)).unwrap();
+        pin_socket(NODE_SOCKET, &layout, Some(4242)).unwrap();
+        pin_socket(
+            "/local/scratch/pitcrew-4242.9/pitcrewd.sock",
+            &layout,
+            Some(4242),
+        )
+        .unwrap();
+        for (socket, job) in [
+            // Not a job: only the root's socket.
+            (NODE_SOCKET, None),
+            // Another job's directory, or not the shape the job script makes.
+            ("/tmp/pitcrew-4241.77/pitcrewd.sock", Some(4242)),
+            ("/tmp/pitcrew-4242./pitcrewd.sock", Some(4242)),
+            ("/tmp/pitcrew-4242.7x/pitcrewd.sock", Some(4242)),
+            ("/tmp/other/pitcrewd.sock", Some(4242)),
+            ("/tmp/a b/pitcrew-4242.77/pitcrewd.sock", Some(4242)),
+            // Another user's root, or another socket of this user's.
+            ("/home/other/.pitcrew/run/pitcrewd.sock", None),
+            ("/home/sam/.pitcrew/pitcrewd.sock", None),
+            ("/run/user/1000/gnupg/pitcrewd.sock", Some(4242)),
+        ] {
+            assert!(
+                pin_socket(socket, &layout, job).is_err(),
+                "{socket} {job:?}"
+            );
+        }
+        // Through route_from: a direct helper recorded with a job's socket shape.
+        let moved = status(
+            HelperState::Running,
+            Some(endpoint("login01", "/tmp/pitcrew-1.2/pitcrewd.sock", None)),
+        );
+        assert!(matches!(
+            route_from(&moved, &layout, LastHop::Ssh, "hpc-login"),
+            Err(NoRoute::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn nodes_that_are_the_users_hosts_are_refused() {
+        let aliases = vec!["hpc-login".to_owned(), "Node017".to_owned()];
+        check_not_an_alias("node018", &aliases).unwrap();
+        let err = check_not_an_alias("node017", &aliases).unwrap_err();
+        assert!(err.contains("ssh config"), "{err}");
+        assert!(check_not_an_alias("HPC-LOGIN", &aliases).is_err());
     }
 }

@@ -2,9 +2,9 @@
 //!
 //! Where a site forbids forwarding unix sockets (`AllowStreamLocalForwarding no`), or the laptop
 //! cannot forward one (Windows), the tunnel ([`crate::tunnel`]) runs
-//! `ssh <host> exec pitcrewd connect --socket <path>` for each connection and speaks to the
-//! daemon through ssh's stdin and stdout. This module is that command; the daemon's CLI calls
-//! [`run`] (or [`connect_stdio`]).
+//! `ssh <host> exec pitcrewd connect --socket <path> --nonce <hex>` for each connection and
+//! speaks to the daemon through ssh's stdin and stdout. This module is that command; the
+//! daemon's CLI calls [`main`] with the arguments after `connect` (or [`connect_stdio`]).
 //!
 //! **Before any byte is passed on**, it makes the checks a client of the daemon makes:
 //! - the socket's directory is a real directory (not a symbolic link) owned by this user, with
@@ -12,22 +12,140 @@
 //! - the socket is a socket (not a link) owned by this user;
 //! - the process listening on it runs as this user (`SO_PEERCRED`, `getpeereid`).
 //!
-//! Then it prints [`READY`] on stdout, and copies stdin to the socket and the socket to stdout.
-//! The laptop discards whatever comes before `READY` (a start-up file's chatter). Either side
-//! may half-close: end of file on stdin shuts down the socket's write side, and the daemon's
-//! end of file closes stdout, while the other direction goes on. It returns once the client has
+//! Then it prints its ready mark on stdout ([`ready_mark`]: [`READY`], with the caller's nonce
+//! when it gave one), and copies stdin to the socket and the socket to stdout. The laptop
+//! discards whatever comes before the mark (a start-up file's chatter). Either side may
+//! half-close: end of file on stdin shuts down the socket's write side, and the daemon's end of
+//! file closes stdout, while the other direction goes on. It returns once the client has
 //! finished (end of file on stdin) and the daemon has too, or as soon as the daemon has closed
 //! its side completely, or the client went away.
+//!
+//! **Framed** (`--framed`, for `srun`, whose output forwarding may hold back a line until it
+//! ends): what goes to stdout is cut into frames, `<length: 8 hex digits>:<bytes>\n`, each
+//! ending a line; `00000000:\n` marks the daemon's end of file. stdin stays plain.
+//!
+//! **The command line** ([`main`]): `--socket <path> [--framed] [--nonce <hex>]`, the
+//! arguments after `pitcrewd connect`.
+//!
+//! **Blocking:** [`connect_stdio`] blocks its thread with plain reads and writes. It works
+//! inside or outside a tokio runtime (the one async call it needs runs on a thread of its own),
+//! but from async code call it with `spawn_blocking`.
 //!
 //! Errors name what is wrong, never the path (which carries the user's name). Unix only; on
 //! other systems [`connect_stdio`] fails with [`BridgeError::Unsupported`].
 
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-/// What the bridge prints once its checks have passed, before the daemon's first byte. The NUL
-/// keeps any start-up file's text from looking like it.
+/// The ready mark without a nonce: what the bridge prints once its checks have passed, before
+/// the daemon's first byte. The NUL keeps any start-up file's text from looking like it.
 pub const READY: &[u8] = b"\0pitcrew-bridge 1 ready\n";
+
+/// The longest nonce accepted (hex digits).
+pub const MAX_NONCE: usize = 64;
+
+/// The length of a frame's header: 8 hex digits and `:`.
+pub const FRAME_HEADER: usize = 9;
+
+/// The mark the bridge prints for `nonce`: `\0pitcrew-bridge 1 ready <nonce>\n`, or [`READY`]
+/// without one.
+#[must_use]
+pub fn ready_mark(nonce: Option<&str>) -> Vec<u8> {
+    match nonce {
+        Some(nonce) => {
+            let mut mark = READY.strip_suffix(b"\n").unwrap_or(READY).to_vec();
+            mark.push(b' ');
+            mark.extend_from_slice(nonce.as_bytes());
+            mark.push(b'\n');
+            mark
+        }
+        None => READY.to_vec(),
+    }
+}
+
+/// What the bridge is asked to do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Options {
+    /// The daemon's socket.
+    pub socket: PathBuf,
+    /// Frame what goes to stdout (see the module docs).
+    pub framed: bool,
+    /// Put this in the ready mark: 1 to [`MAX_NONCE`] lower-case hex digits.
+    pub nonce: Option<String>,
+}
+
+impl Options {
+    /// Plain, for `socket`.
+    #[must_use]
+    pub fn new(socket: impl Into<PathBuf>) -> Self {
+        Self {
+            socket: socket.into(),
+            framed: false,
+            nonce: None,
+        }
+    }
+
+    /// Reads `--socket <path> [--framed] [--nonce <hex>]`, strictly.
+    ///
+    /// # Errors
+    /// [`BridgeError::Usage`] naming the problem.
+    pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Self, BridgeError> {
+        let usage = |why: &str| {
+            Err(BridgeError::Usage(format!(
+                "{why}; usage: pitcrewd connect --socket <path> [--framed] [--nonce <hex>]"
+            )))
+        };
+        let (mut socket, mut framed, mut nonce) = (None, false, None);
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            match arg.to_str() {
+                Some("--socket") if socket.is_none() => match args.next() {
+                    Some(path) => socket = Some(PathBuf::from(path)),
+                    None => return usage("--socket needs a path"),
+                },
+                Some("--framed") if !framed => framed = true,
+                Some("--nonce") if nonce.is_none() => {
+                    let value = args.next().and_then(|v| v.into_string().ok());
+                    match value {
+                        Some(v) if valid_nonce(&v) => nonce = Some(v),
+                        _ => return usage("--nonce needs 1 to 64 lower-case hex digits"),
+                    }
+                }
+                _ => return usage("an unknown or repeated argument"),
+            }
+        }
+        let Some(socket) = socket else {
+            return usage("--socket is missing");
+        };
+        Ok(Self {
+            socket,
+            framed,
+            nonce,
+        })
+    }
+}
+
+fn valid_nonce(nonce: &str) -> bool {
+    (1..=MAX_NONCE).contains(&nonce.len())
+        && nonce
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// `pitcrewd connect <args>`: reads the arguments ([`Options::parse`]), runs
+/// [`connect_stdio`], says any error on stderr (as `pitcrewd connect: …`) and turns it into the
+/// exit code. What the daemon's CLI calls with the arguments after `connect`.
+#[must_use]
+pub fn main<I: IntoIterator<Item = OsString>>(args: I) -> ExitCode {
+    match Options::parse(args).and_then(|options| connect_stdio(&options)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("pitcrewd connect: {e}");
+            ExitCode::from(e.exit_code())
+        }
+    }
+}
 
 /// Exit code: the command line was wrong (also clap's, for an unknown subcommand).
 pub const EXIT_USAGE: u8 = 2;
@@ -72,36 +190,40 @@ impl BridgeError {
     }
 }
 
-/// `pitcrewd connect --socket <path>`: [`connect_stdio`], with an error said on stderr (as
-/// `pitcrewd connect: …`) and turned into the exit code.
+/// `pitcrewd connect --socket <socket>`, plain: [`main`] for code that has a path.
 #[must_use]
 pub fn run(socket: &Path) -> ExitCode {
-    match connect_stdio(socket) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("pitcrewd connect: {e}");
-            ExitCode::from(e.exit_code())
-        }
-    }
+    main([OsString::from("--socket"), socket.as_os_str().to_owned()])
 }
 
-/// Connects stdin and stdout to the daemon listening on `socket`, after the checks in the
-/// module docs. Returns when the connection is over (see the module docs); a thread may still
-/// be blocked reading stdin then, so the process should exit.
+/// Connects stdin and stdout to the daemon listening on `options.socket`, after the checks in
+/// the module docs. Returns when the connection is over (see the module docs); a thread may
+/// still be blocked reading stdin then, so the process should exit.
 ///
 /// # Errors
-/// A check fails ([`BridgeError::Unsafe`]), nothing listens ([`BridgeError::NoDaemon`]), or
-/// connecting or writing [`READY`] fails. Once `READY` is out, the end of the connection,
-/// however it came, is not an error.
+/// A check fails ([`BridgeError::Unsafe`]), nothing listens ([`BridgeError::NoDaemon`]), the
+/// nonce is not hex, or connecting or writing the ready mark fails. Once the mark is out, the
+/// end of the connection, however it came, is not an error.
 #[cfg(unix)]
-pub fn connect_stdio(socket: &Path) -> Result<(), BridgeError> {
+pub fn connect_stdio(options: &Options) -> Result<(), BridgeError> {
     use std::io::Write as _;
-    let stream = unix::open(socket)?;
+    if options.nonce.as_deref().is_some_and(|n| !valid_nonce(n)) {
+        return Err(BridgeError::Usage(
+            "the nonce must be 1 to 64 lower-case hex digits".to_owned(),
+        ));
+    }
+    let stream = unix::open(&options.socket)?;
     let mut out = std::io::stdout();
-    out.write_all(READY)
+    out.write_all(&ready_mark(options.nonce.as_deref()))
         .and_then(|()| out.flush())
         .map_err(BridgeError::Io)?;
-    unix::pump(stream, std::io::stdin(), out, unix::close_stdout);
+    unix::pump(
+        stream,
+        std::io::stdin(),
+        out,
+        options.framed,
+        unix::close_stdout,
+    );
     Ok(())
 }
 
@@ -110,8 +232,8 @@ pub fn connect_stdio(socket: &Path) -> Result<(), BridgeError> {
 /// # Errors
 /// Always [`BridgeError::Unsupported`].
 #[cfg(not(unix))]
-pub fn connect_stdio(socket: &Path) -> Result<(), BridgeError> {
-    let _ = socket;
+pub fn connect_stdio(options: &Options) -> Result<(), BridgeError> {
+    let _ = options;
     Err(BridgeError::Unsupported)
 }
 
@@ -201,17 +323,26 @@ pub(crate) mod unix {
 
     /// The uid of the process that listens on `stream`'s other end. tokio has the portable
     /// call (`SO_PEERCRED` on Linux, `getpeereid` elsewhere); the stream goes in and comes back.
+    /// It runs on a thread of its own with a runtime of its own, so the caller may be inside a
+    /// runtime or not (a runtime cannot be dropped inside another's context).
     fn peer_uid(stream: UnixStream) -> io::Result<(u32, UnixStream)> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .build()?;
-        let _entered = runtime.enter();
-        stream.set_nonblocking(true)?;
-        let stream = tokio::net::UnixStream::from_std(stream)?;
-        let uid = stream.peer_cred()?.uid();
-        let stream = stream.into_std()?;
-        stream.set_nonblocking(false)?;
-        Ok((uid, stream))
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_io()
+                        .build()?;
+                    let _entered = runtime.enter();
+                    stream.set_nonblocking(true)?;
+                    let stream = tokio::net::UnixStream::from_std(stream)?;
+                    let uid = stream.peer_cred()?.uid();
+                    let stream = stream.into_std()?;
+                    stream.set_nonblocking(false)?;
+                    Ok((uid, stream))
+                })
+                .join()
+                .unwrap_or_else(|_| Err(io::Error::other("the peer check failed")))
+        })
     }
 
     /// Ends this process's standard output: points it at `/dev/null`, so the client reads end
@@ -223,13 +354,14 @@ pub(crate) mod unix {
         }
     }
 
-    /// Copies `input` to `socket` on a thread and `socket` to `output` here, with half-closes
-    /// passed on (see the module docs). `close_output` ends `output` once the daemon has
-    /// finished sending.
+    /// Copies `input` to `socket` on a thread and `socket` to `output` here (in frames when
+    /// `framed`), with half-closes passed on (see the module docs). `close_output` ends `output`
+    /// once the daemon has finished sending.
     pub(crate) fn pump<R, W>(
         socket: UnixStream,
         input: R,
         mut output: W,
+        framed: bool,
         close_output: impl FnOnce(W),
     ) where
         R: Read + Send + 'static,
@@ -253,11 +385,7 @@ pub(crate) mod unix {
                     let Some(chunk) = buf.get(..n) else {
                         break false;
                     };
-                    if output
-                        .write_all(chunk)
-                        .and_then(|()| output.flush())
-                        .is_err()
-                    {
+                    if send(&mut output, chunk, framed).is_err() {
                         // The client went away.
                         break false;
                     }
@@ -266,7 +394,7 @@ pub(crate) mod unix {
                 Err(_) => break false,
             }
         };
-        if !daemon_done {
+        if !daemon_done || (framed && send(&mut output, &[], true).is_err()) {
             let _ = socket.shutdown(Shutdown::Both);
             return;
         }
@@ -274,6 +402,19 @@ pub(crate) mod unix {
         // the daemon has closed its side altogether.
         close_output(output);
         while !up.is_finished() && !hung_up(&socket) {}
+    }
+
+    /// Writes `chunk` (a frame of it when `framed`; an empty frame is the end mark) and flushes.
+    fn send<W: Write>(output: &mut W, chunk: &[u8], framed: bool) -> io::Result<()> {
+        if framed {
+            let header = format!("{:08x}:", chunk.len());
+            output.write_all(header.as_bytes())?;
+            output.write_all(chunk)?;
+            output.write_all(b"\n")?;
+        } else {
+            output.write_all(chunk)?;
+        }
+        output.flush()
     }
 
     /// stdin to the socket; at its end, the socket's write side is shut down.
@@ -387,7 +528,7 @@ mod tests {
         let (mut client_in, bridge_in) = UnixStream::pair().unwrap();
         let (bridge_out, mut client_out) = UnixStream::pair().unwrap();
         let pumping = std::thread::spawn(move || {
-            pump(bridge_side, bridge_in, bridge_out, |out| {
+            pump(bridge_side, bridge_in, bridge_out, false, |out| {
                 let _ = out.shutdown(std::net::Shutdown::Write);
             });
         });
@@ -414,7 +555,7 @@ mod tests {
         let (_client_in, bridge_in) = UnixStream::pair().unwrap();
         let (bridge_out, mut client_out) = UnixStream::pair().unwrap();
         let pumping = std::thread::spawn(move || {
-            pump(bridge_side, bridge_in, bridge_out, drop);
+            pump(bridge_side, bridge_in, bridge_out, false, drop);
         });
         let mut daemon = daemon;
         daemon.write_all(b"done").unwrap();
@@ -423,5 +564,61 @@ mod tests {
         client_out.read_to_end(&mut got).unwrap();
         assert_eq!(got, b"done");
         pumping.join().unwrap();
+    }
+
+    /// Framed: every frame ends a line, and an empty frame marks the end.
+    #[test]
+    fn frames_end_lines() {
+        let (daemon, bridge_side) = UnixStream::pair().unwrap();
+        let (_client_in, bridge_in) = UnixStream::pair().unwrap();
+        let (bridge_out, mut client_out) = UnixStream::pair().unwrap();
+        let pumping = std::thread::spawn(move || {
+            pump(bridge_side, bridge_in, bridge_out, true, drop);
+        });
+        let mut daemon = daemon;
+        daemon.write_all(b"no newline").unwrap();
+        drop(daemon);
+        let mut got = Vec::new();
+        client_out.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"0000000a:no newline\n00000000:\n");
+        pumping.join().unwrap();
+    }
+
+    #[test]
+    fn arguments_are_read_strictly() {
+        let parse = |args: &[&str]| Options::parse(args.iter().map(OsString::from));
+        assert_eq!(
+            parse(&["--socket", "/r/pitcrewd.sock"]).unwrap(),
+            Options::new("/r/pitcrewd.sock")
+        );
+        let all = parse(&["--framed", "--nonce", "0a1b", "--socket", "/r/x.sock"]).unwrap();
+        assert!(all.framed);
+        assert_eq!(all.nonce.as_deref(), Some("0a1b"));
+        for bad in [
+            &[][..],
+            &["--socket"],
+            &["--socket", "/a", "--socket", "/b"],
+            &["--socket", "/a", "--nonce", "XYZ"],
+            &["--socket", "/a", "--nonce", ""],
+            &["--socket", "/a", "--verbose"],
+            &["/a"],
+        ] {
+            let err = parse(bad).unwrap_err();
+            assert_eq!(err.exit_code(), EXIT_USAGE, "{bad:?}");
+        }
+        assert_eq!(ready_mark(None), READY);
+        assert_eq!(ready_mark(Some("ab12")), b"\0pitcrew-bridge 1 ready ab12\n");
+    }
+
+    /// The peer check works from inside a runtime too (a daemon CLI with an async main).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_peer_check_works_inside_a_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run = tmp.path().join("run");
+        std::fs::create_dir(&run).unwrap();
+        private(&run);
+        let socket = run.join("pitcrewd.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        open(&socket).unwrap();
     }
 }
