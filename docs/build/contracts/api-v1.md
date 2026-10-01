@@ -214,11 +214,18 @@ be contiguous. Pass `from_rev` as `before` for the previous page. Default limit 
 - **Only `at_start` ends paging.** With filters the hub scans a bounded window per request, so a
   page may hold fewer than `limit` events, even none. An empty page that is not at the start has
   `to_rev = 0` and `from_rev` = where the scan stopped; keep paging from it.
-- **Filters match events that name the entity directly:** `session` matches events carrying that
-  session id, and `task` those carrying that task id. Events that reach it only through a link
-  (a turn in a session linked to the task; `dispatch_finished`, which names the dispatch) are not
-  included until the hub has an index for them. `project` and `workstream` answer `400 invalid`
-  until then.
+- **Filters combine:** an event must match every filter given. `session` and `task` match
+  events that name that session or task: a `session` or `task` field, at any depth, holding the
+  id or an object with that `id`.
+- **With the hub's activity index** (a hub running the work model has one), filters also follow
+  links as they were when each event happened:
+  - `task` also matches the events of sessions linked to the task (turns, tool runs, file edits),
+    and the `dispatch_finished` and `ask_answered` of its dispatches and asks;
+  - `session` also matches the `dispatch_finished` and `ask_answered` of its dispatches and asks;
+  - `project` and `workstream` match events about the project or workstream, including those of
+    its tasks and their sessions.
+- **Without the index**, `project` and `workstream` answer `400 invalid`, and `task` and
+  `session` match only events that name them.
 
 ### Hooks
 
