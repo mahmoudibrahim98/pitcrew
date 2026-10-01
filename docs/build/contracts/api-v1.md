@@ -56,12 +56,45 @@ the task key (`PAP-4`).
 | Method and path | Body → response | Notes |
 |---|---|---|
 | `GET /v1/host/info` | → `HostInfo` | No auth. Check `protocol_min ≤ yours ≤ protocol` before anything else. |
-| `GET /v1/me` | → `Member` | The token's member. **agent** |
-| `GET /v1/workspace` | → `{ "workspace": Workspace, "rev": u64 }` | `rev` is the current event revision. |
+| `GET /v1/me` | → `Member` | The token's member. **agent** `404` before setup (see below). |
+| `GET /v1/workspace` | → `{ "workspace": Workspace, "rev": u64, "setup_needed": bool }` | `rev` is the current event revision. `setup_needed` is `true` while the workspace has no person (a fresh hub); omitted means `false`. |
+| `POST /v1/setup` | `Setup` → `{ "workspace": Workspace, "me": Member, "machine": Machine }` | The first run (see below). Device tokens only. |
 | `GET /v1/machines` | → `Machine[]` | |
 | `GET /v1/members` | → `Member[]` | **agent** |
 | `GET /v1/personas` | → `Persona[]` | |
 | `GET /v1/teams` | → `Team[]` | |
+
+#### The first run: `POST /v1/setup`
+
+A fresh hub has a device token but no person, no machine and no name. The desktop's onboarding
+(or `pitcrewd init`) sets it up once:
+
+```json
+{ "workspace_name": "Demo Lab",
+  "person": { "name": "Sam Rivera", "handle": "@sam" },
+  "machine_name": "This laptop" }
+```
+
+- **The person is the device token's member.** The token already acts as a member id that nothing
+  knows. Setup appends `member_added` for that id (kind `human`, no owner) with this name and
+  handle, so the token and `GET /v1/me` mean this person from then on.
+- **The machine** is appended with `machine_added`: kind `local`, liveness `live`. It is the hub's
+  own machine, and the one its runner watches.
+- **Both events go in one append,** authored by the person. The workspace's name is kept by the
+  hub, not in the event log, and `GET /v1/workspace` returns it from then on.
+- **Validation:**
+  - `workspace_name` is 1–80 characters;
+  - `person.name` is 1–80 characters;
+  - `person.handle` is `@` followed by 1–32 of `a-z 0-9 _ -`;
+  - `machine_name` is 1–60 characters.
+  - None of them may contain control characters. Anything else is `400 invalid`.
+- **Once only:** `409 conflict` when the workspace already has a person, or when the handle is
+  taken. An agent token gets `403`.
+- **After setup,** the hub starts what needed a person: the back office, and the runner on this
+  machine. `setup_needed` becomes `false`.
+- **The mock** starts with the demo's person, so `setup_needed` is `false` and setup answers
+  `409`. Start it with `PITCREW_MOCK_FRESH=1` for an empty workspace (no members, machines or
+  work) whose setup succeeds once.
 
 ### Projects and workstreams
 
