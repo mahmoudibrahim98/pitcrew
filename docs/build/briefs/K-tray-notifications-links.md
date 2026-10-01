@@ -34,8 +34,8 @@ anywhere opens the right place in the app.
    - **Title:** the asking agent and the kind (question, decision, review, approval).
    - **Body:** the ask's text, cleaned (control and bidi characters removed) and capped at 200
      characters.
-   - **Clicking it** navigates to the ask's place: `gateway://navigate` to `/w/<ws>/inbox`, or to
-     the task (the contract's typed `NavigateTarget`).
+   - **Clicking it** navigates to the ask's place: `gateway://navigate` with a `NavigateTarget` of
+     kind `inbox`, or `task` when the ask is about one.
    - **Rate-limit** them, so a burst becomes one notification ("3 agents need you").
    - A setting turns notifications off. The tauri notification plugin is fine, with minimal
      permissions.
