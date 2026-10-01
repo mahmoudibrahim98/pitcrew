@@ -56,14 +56,21 @@ fn target_notify_chained(exe: &str) -> Vec<String> {
 }
 
 /// Whether `values` ends with our marker (`hook codex notify`), with or without a trailing
-/// `--chain` — so a moved executable is recognised whether or not it is chained.
+/// `--chain` — so a moved executable is recognised whether or not it is chained — **and** its
+/// first element actually names `pitcrew`/`pitcrew.exe`. Without that second check, a foreign
+/// `notify = ["some-other-tool", "hook", "codex", "notify"]` that merely happens to share our
+/// trailing three words would be claimed as ours too.
 fn is_ours(values: &[String]) -> bool {
     let core = if values.last().map(String::as_str) == Some(CHAIN_FLAG) {
         &values[..values.len() - 1]
     } else {
         values
     };
-    core.len() >= MARKER_TAIL.len() && core[core.len() - MARKER_TAIL.len()..] == MARKER_TAIL
+    core.len() >= MARKER_TAIL.len()
+        && core[core.len() - MARKER_TAIL.len()..] == MARKER_TAIL
+        && core
+            .first()
+            .is_some_and(|first| super::is_our_exe_name(&super::quoted_word_file_name(first)))
 }
 
 /// Whether `values` is specifically our *chained* form.
@@ -747,5 +754,22 @@ mod tests {
         assert!(is_ours(&direct) && !is_chained(&direct));
         assert!(is_ours(&chained) && is_chained(&chained));
         assert!(!is_ours(&["terminal-notifier".to_owned()]));
+    }
+
+    #[test]
+    fn is_ours_also_checks_the_program_name_not_just_the_trailing_words() {
+        // Shares our exact trailing three words, but the program itself is not us.
+        let foreign = vec![
+            "some-other-tool".to_owned(),
+            "hook".to_owned(),
+            "codex".to_owned(),
+            "notify".to_owned(),
+        ];
+        assert!(!is_ours(&foreign));
+        assert!(!is_chained(&{
+            let mut v = foreign;
+            v.push(CHAIN_FLAG.to_owned());
+            v
+        }));
     }
 }

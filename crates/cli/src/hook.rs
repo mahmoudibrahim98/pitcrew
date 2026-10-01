@@ -4,12 +4,20 @@
 //! - The payload is the CLI's hook JSON: from stdin (Claude Code), or the argument after the
 //!   event (Codex's `notify` passes it that way). At most 1 MiB; a larger one is dropped.
 //! - It is `POST`ed to `/v1/hooks/{engine}/{event}` with short timeouts.
-//! - `--chain` (only ever written by `pitcrew hooks install --chain` into Codex's `notify`, as
-//!   `["<exe>", "hook", "codex", "notify", "--chain"]`) also runs whatever program `--chain`
-//!   recorded as the original `notify`, directly via [`std::process::Command`] — no shell, no
-//!   `cmd.exe` — with its own recorded arguments and the same payload Codex gave us, appended
-//!   exactly as Codex itself appends it. It is spawned, not waited on, so a slow or hanging
-//!   original notifier can never make a hook run over [`DEADLINE`] or block the agent.
+//! - `--chain` (accepted only for `codex notify`, and only ever written there by `pitcrew hooks
+//!   install --chain`, as `["<exe>", "hook", "codex", "notify", "--chain"]`) also runs whatever
+//!   program `--chain` recorded as the original `notify`, directly via [`std::process::Command`]
+//!   — no shell, no `cmd.exe` — with its own recorded arguments and the same payload Codex gave
+//!   us, appended exactly as Codex itself appends it. This runs **first**, before any of our own
+//!   delivery (which needs a token, a reachable daemon, and a valid payload, none of which the
+//!   original notifier ever needed): a person running Codex from a plain terminal with no
+//!   `PITCREW_TOKEN` set, or with the daemon down, must still get their original notification,
+//!   not silently lose it because *our* delivery happened to fail first. It is spawned, not
+//!   waited on, so a slow or hanging original notifier can never make a hook run over
+//!   [`DEADLINE`] or block the agent; its own process group (Unix) keeps it running even if
+//!   Codex kills ours, and [`CHAINED_VAR`] on its environment stops it from ever chaining again,
+//!   even if the original is itself (directly or through a shell) another `pitcrew hook codex
+//!   notify --chain`.
 //! - The caller (`main`) always exits 0 and prints nothing, whatever happens here, and stops the
 //!   process after [`DEADLINE`] even if the daemon hangs.
 
@@ -31,6 +39,11 @@ pub const DEADLINE: Duration = Duration::from_millis(500);
 /// Set to anything to have `pitcrew hook` print why it did not deliver an event (to stderr).
 pub const DEBUG_VAR: &str = "PITCREW_HOOK_DEBUG";
 
+/// Set on a `--chain`-spawned original's own environment, and checked before ever chaining: stops
+/// a cycle where the recorded "original" is itself (or runs, even through a shell) `pitcrew hook
+/// codex notify --chain` — which would otherwise spawn itself forever.
+const CHAINED_VAR: &str = "PITCREW_CHAINED";
+
 /// Sends one hook event. `args` are the arguments after `hook`.
 ///
 /// # Errors
@@ -42,7 +55,14 @@ pub fn run(
     stdin_is_terminal: bool,
 ) -> Result<()> {
     let (engine, event, chain, payload) = parse_args(args)?;
-    // Nothing to do without a token or a daemon; check before touching stdin.
+
+    // Before anything of our own can fail: a token, a reachable daemon and a valid payload are
+    // all things the *original* notifier never needed, so none of them may stand between Codex
+    // and it.
+    if chain {
+        run_chained(env, payload.as_deref());
+    }
+
     let token = token_from_env(env)?;
     let endpoint = Endpoint::from_env(env)?;
     let body = match &payload {
@@ -61,24 +81,25 @@ pub fn run(
         token: Some(&token),
         body: Some(&body),
     };
-    let result = http::exchange(&mut conn, &request, 64 * 1024)
-        .map_err(|e| Error::internal(format!("POST {target}: {e}")));
-
-    if chain {
-        run_chained(env, payload.as_deref());
-    }
-
-    match result? {
-        response if response.is_success() => Ok(()),
-        response => Err(Error::from_response(response.status, &response.body)),
+    let response = http::exchange(&mut conn, &request, 64 * 1024)
+        .map_err(|e| Error::internal(format!("POST {target}: {e}")))?;
+    if response.is_success() {
+        Ok(())
+    } else {
+        Err(Error::from_response(response.status, &response.body))
     }
 }
 
 /// Runs whatever `install --chain` recorded as the original `notify`, if any: spawned, never
 /// waited on, so a slow or hanging original notifier can never make this hook run over
-/// [`DEADLINE`]. Silent by design, like every other way this hook can fail to deliver — the
-/// caller only ever sees `--chain`'s effect on `notify` itself, never a reason it didn't run.
+/// [`DEADLINE`]. A no-op if [`CHAINED_VAR`] is already set (we are, ourselves, something a chain
+/// spawned) — never chain from inside a chain. Silent by design, like every other way this hook
+/// can fail to deliver — the caller only ever sees `--chain`'s effect on `notify` itself, never a
+/// reason it didn't run.
 fn run_chained(env: Env<'_>, payload: Option<&str>) {
+    if env(CHAINED_VAR).is_some() {
+        return;
+    }
     let Some(original) = crate::install::codex_chained_original(env) else {
         return;
     };
@@ -90,19 +111,26 @@ fn run_chained(env: Env<'_>, payload: Option<&str>) {
     if let Some(payload) = payload {
         cmd.arg(payload);
     }
+    cmd.env(CHAINED_VAR, "1");
     // Not inherited: a spawned child keeps an inherited stdout/stderr pipe open for as long as
     // it runs, which would make whoever is reading *our* output (Codex, a test harness) wait for
     // the original notifier to exit too, defeating "the hook always exits quickly".
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    // Its own process group: Codex killing our own process group (a common way to tear a tool
+    // and its children down together) must not take the original notifier down with us.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
     let _ = cmd.spawn();
 }
 
-/// `<engine> <event> [--chain] [payload]`, checked as the API checks them. `--chain` (only ever
-/// written by us, right after `<event>`) is accepted for any engine/event — it only *does*
-/// anything for `codex notify`, where a recorded original exists; elsewhere `run_chained` finds
-/// none and is a no-op.
+/// `<engine> <event> [--chain] [payload]`, checked as the API checks them. `--chain` is
+/// recognised only for `codex notify` — the only shape `install --chain` ever writes; anywhere
+/// else, a literal argument spelled `--chain` is just an (unusual, but not our business) payload.
 fn parse_args(args: &[OsString]) -> Result<(String, String, bool, Option<String>)> {
     let text = |i: usize, what: &str| -> Result<Option<String>> {
         args.get(i)
@@ -116,7 +144,9 @@ fn parse_args(args: &[OsString]) -> Result<(String, String, bool, Option<String>
     let usage = || Error::invalid("usage: pitcrew hook <engine> <event> [--chain] [payload]");
     let engine = text(0, "engine")?.ok_or_else(usage)?.to_ascii_lowercase();
     let event = text(1, "event")?.ok_or_else(usage)?;
-    let chain = args.get(2).and_then(|a| a.to_str()) == Some("--chain");
+    let chain = engine == "codex"
+        && event == "notify"
+        && args.get(2).and_then(|a| a.to_str()) == Some("--chain");
     let payload_index = if chain { 3 } else { 2 };
     let payload = text(payload_index, "payload")?;
     if args.len() > payload_index + 1 {
@@ -200,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn chain_flag_is_recognised_right_after_the_event_and_only_there() {
+    fn chain_flag_is_recognised_only_for_codex_notify() {
         let (_, _, chain, payload) =
             parse_args(&args(&["codex", "notify", "--chain", "{\"a\":1}"])).unwrap();
         assert!(chain);
@@ -211,12 +241,15 @@ mod tests {
         assert!(chain);
         assert!(payload.is_none());
 
-        // --chain is recognised positionally for any engine/event, not just codex/notify (it
-        // only ever *does* anything when a chain is actually recorded for codex); harmless
-        // elsewhere, since `run_chained` then simply finds nothing to run.
+        // Anywhere else, a literal argument spelled "--chain" is just an (odd) payload, not the
+        // flag — install --chain never writes this shape for any engine/event but codex/notify.
         let (_, _, chain, payload) = parse_args(&args(&["claude", "Stop", "--chain"])).unwrap();
-        assert!(chain);
-        assert!(payload.is_none());
+        assert!(!chain);
+        assert_eq!(payload.as_deref(), Some("--chain"));
+
+        let (_, _, chain, payload) = parse_args(&args(&["codex", "exec", "--chain"])).unwrap();
+        assert!(!chain);
+        assert_eq!(payload.as_deref(), Some("--chain"));
     }
 
     #[test]

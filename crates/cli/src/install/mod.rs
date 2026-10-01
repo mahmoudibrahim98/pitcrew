@@ -173,19 +173,25 @@ fn exe_path(env: Env<'_>) -> Result<String> {
 }
 
 /// Whether `word` safely names a single program and nothing else: either wrapped start-to-end in
-/// one matching pair of quotes (`'…'` or `"…"`), or free of whitespace and of the characters a
-/// shell gives a second meaning to (`; & | < > ( ) $` and a backtick). Without this check,
-/// `quoted_word_file_name`'s "take the last path segment" would read the program name out of
-/// something like `afplay ding.aiff; ~/bin/pitcrew` — a multi-word foreign command that merely
-/// ends by mentioning `pitcrew` — and wrongly call it ours.
+/// one matching pair of quotes (`'…'` or `"…"`), with the quote character never appearing again
+/// inside except as the escape this module's own quoting produces (`'\''`, `""`), or free of
+/// whitespace and of the characters a shell gives a second meaning to (`; & | < > ( ) $` and a
+/// backtick). Without this check, `quoted_word_file_name`'s "take the last path segment" would
+/// read the program name out of something like `afplay ding.aiff; ~/bin/pitcrew` — a multi-word
+/// foreign command that merely ends by mentioning `pitcrew` — and wrongly call it ours; checking
+/// only the first and last byte of a *quoted* word has exactly the same hole one level up, e.g.
+/// `'/usr/bin/afplay' ding.aiff; '/home/u/bin/pitcrew'` starts and ends with `'` but is still two
+/// words with an unescaped `'` closing the first one early.
 #[must_use]
 pub(crate) fn is_single_shell_word(word: &str) -> bool {
     if word.len() >= 2 {
         let bytes = word.as_bytes();
-        let first = bytes[0];
-        let last = bytes[bytes.len() - 1];
-        if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
-            return true;
+        let inner = &bytes[1..bytes.len() - 1];
+        if bytes[0] == b'\'' && bytes[bytes.len() - 1] == b'\'' {
+            return no_unescaped_quote(inner, b'\'', b"'\\''");
+        }
+        if bytes[0] == b'"' && bytes[bytes.len() - 1] == b'"' {
+            return no_unescaped_quote(inner, b'"', b"\"\"");
         }
     }
     !word.is_empty()
@@ -196,6 +202,25 @@ pub(crate) fn is_single_shell_word(word: &str) -> bool {
                     b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')' | b'$' | b'`'
                 )
         })
+}
+
+/// Whether `quote` only ever appears in `inner` as part of `escape` (the full byte sequence this
+/// module's own quoting uses for one embedded literal quote character) — never bare, which would
+/// mean the word's own closing quote came early and whatever follows is a second, unquoted word.
+fn no_unescaped_quote(inner: &[u8], quote: u8, escape: &[u8]) -> bool {
+    let mut i = 0;
+    while i < inner.len() {
+        if inner[i] == quote {
+            if inner[i..].starts_with(escape) {
+                i += escape.len();
+            } else {
+                return false;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    true
 }
 
 /// The file name of the program a (possibly quoted) command-line word names, case-insensitively
@@ -839,6 +864,18 @@ mod tests {
         assert!(!is_single_shell_word("$(echo /bin/pitcrew)"));
         assert!(!is_single_shell_word("`echo /bin/pitcrew`"));
         assert!(!is_single_shell_word(""));
+        // Starts and ends with a quote character, but is still two shell words: the first
+        // quote's own closing `'`/`"` comes early, unescaped.
+        assert!(!is_single_shell_word(
+            "'/usr/bin/afplay' ding.aiff; '/home/u/bin/pitcrew'"
+        ));
+        assert!(!is_single_shell_word(
+            "\"C:\\a.exe\" & \"C:\\x\\pitcrew.exe\""
+        ));
+        // But a genuinely single quoted word, including one with a properly escaped embedded
+        // quote, is still accepted.
+        assert!(is_single_shell_word("'it'\\''s/pitcrew'"));
+        assert!(is_single_shell_word("\"C:\\a\"\"b.exe\""));
     }
 
     #[test]
