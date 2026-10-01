@@ -354,6 +354,7 @@ async fn briefs_are_put_by_people() {
         body: EventBody::BriefProposed {
             target: BriefTarget::Workstream(SEED_RUNS.parse().expect("id")),
             text: "Seeds 1, 2, 4, 5 finished.".into(),
+            next: None,
             receipts: vec![receipt.clone()],
         },
     };

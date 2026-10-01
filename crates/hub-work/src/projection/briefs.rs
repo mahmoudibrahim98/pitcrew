@@ -1,13 +1,14 @@
 //! `work.briefs`: the "Where it stands" in force for each project and workstream, and the latest
 //! proposal for each.
 //!
-//! A `brief_accepted` event carries only the text and the pin, so the rest is derived here:
+//! A `brief_accepted` event carries the text, the pin, `next` and receipts; this projection uses
+//! only the text and the pin and derives the rest:
 //! - `updated` is the event's time;
 //! - it is the back office's (`source: back_office`) when the back office applied it itself (an
 //!   agent's event, so `on_behalf_of` is set) or when its text is exactly the latest proposal's,
 //!   i.e. a person accepted the proposal unchanged. Otherwise a person wrote it;
 //! - an accepted proposal keeps the proposal's receipts; a person's own text has none.
-//! - `next` is not in the event yet (a contract gap), so it is always empty.
+//! - `next` is in the event now, but this projection does not read it yet, so it is always empty.
 
 use super::{clear, exec};
 use crate::codec::{IdText, enum_text, json, sql_rev};
@@ -55,6 +56,7 @@ impl Projection for Briefs {
                 target,
                 text,
                 receipts,
+                ..
             } => {
                 let (kind, id) = target_columns(target);
                 exec(
@@ -82,6 +84,7 @@ impl Projection for Briefs {
                 target,
                 text,
                 pinned,
+                ..
             } => {
                 let (kind, id) = target_columns(target);
                 let proposal: Option<(String, String)> = tx

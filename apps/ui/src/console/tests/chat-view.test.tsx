@@ -7,60 +7,24 @@ import {
   appendRecord,
   assistantText,
   cannedTranscripts,
-  transcriptPage,
   userPrompt,
   type ItemDraft,
   type TranscriptRecord,
 } from '../../../../mock-hub/src/transcripts.ts';
-import type { Session } from '../../data/index.ts';
 import { ChatView } from '../chat-view.tsx';
 import {
   eventually,
   ID,
   renderWithHub,
   scrollTo,
+  serveSynthetic,
   startHub,
   stubLayout,
+  SYNTHETIC,
   unmountAndSettle,
   type HubProcess,
   type Logged,
 } from './harness.tsx';
-
-const SYNTHETIC = '01JB0000000000000000SYNTH1';
-
-function syntheticSession(): Session {
-  return {
-    id: SYNTHETIC,
-    engine: 'claude',
-    native_id: 'synthetic',
-    machine: ID.laptop,
-    cwd: '/work/synthetic',
-    title: 'Synthetic',
-    state: 'idle',
-    started: 0,
-    last_activity: 0,
-  };
-}
-
-const json = (body: unknown) =>
-  new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
-
-/** Serves one made-up session and its transcript with the mock hub's own paging; the rest goes to the hub. */
-function serveSynthetic(records: TranscriptRecord[]): typeof fetch {
-  const session = syntheticSession();
-  return (input, init) => {
-    const url = new URL(String(input));
-    if (url.pathname === `/v1/sessions/${SYNTHETIC}/transcript`) {
-      const before = url.searchParams.get('before');
-      const limit = url.searchParams.get('limit');
-      return Promise.resolve(
-        json(transcriptPage(records, before === null ? undefined : Number(before), limit === null ? 200 : Number(limit))),
-      );
-    }
-    if (url.pathname === `/v1/sessions/${SYNTHETIC}`) return Promise.resolve(json(session));
-    return fetch(input, init);
-  };
-}
 
 const transcriptCalls = (requests: Logged[], session: string) =>
   requests.filter((r) => r.path === `/v1/sessions/${session}/transcript`);

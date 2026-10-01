@@ -363,6 +363,8 @@ fn other_bodies() -> Vec<EventBody> {
         json!({"type": "task_created", "data": {"task": demo.tasks[3]}}),
         json!({"type": "task_assigned", "data": {"task": demo.tasks[4].id,
             "assignee": demo.members[2].id}}),
+        json!({"type": "task_updated", "data": {"task": demo.tasks[4].id,
+            "patch": {"title": "Rerun seed 3", "due": null, "labels": ["gpu"]}}}),
         json!({"type": "ask_answered", "data": {"ask": demo.asks[1].id,
             "answer": {"by": demo.members[0].id, "option": 1, "text": "Drop it.",
                        "at": 1_790_762_500_000_i64}}}),

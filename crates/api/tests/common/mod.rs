@@ -95,6 +95,18 @@ pub async fn call(app: Router, request: Request<Body>) -> (u16, serde_json::Valu
     (status, serde_json::from_slice(&body).unwrap_or_default())
 }
 
+/// Any event, for filling a log.
+pub fn event() -> pitcrew_protocol::events::Event {
+    pitcrew_protocol::events::Event::now(
+        pitcrew_protocol::WorkspaceId::new(),
+        MemberId::new(),
+        pitcrew_protocol::events::EventBody::MachineLiveness {
+            machine: pitcrew_protocol::MachineId::new(),
+            liveness: pitcrew_protocol::model::Liveness::Live,
+        },
+    )
+}
+
 pub fn get_request(path: &str, bearer: Option<&str>) -> Request<Body> {
     let mut builder = Request::builder().uri(path);
     if let Some(token) = bearer {

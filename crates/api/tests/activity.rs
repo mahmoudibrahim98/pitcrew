@@ -5,9 +5,10 @@
 mod common;
 
 use common::{Fixture, call, get_request};
-use pitcrew_api::activity::{self, EventsPage, NEEDS_INDEX};
+use pitcrew_api::activity::{self, NEEDS_INDEX};
 use pitcrew_api::{EventSource, MemorySource, RouterParts, local_host_info};
 use pitcrew_auth::TokenStore;
+use pitcrew_protocol::api::EventsPage;
 use pitcrew_protocol::events::Event;
 use std::sync::Arc;
 

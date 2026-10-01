@@ -3,22 +3,98 @@
 
 import { fireEvent, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { appendRecord, userPrompt, type TranscriptRecord } from '../../../../mock-hub/src/transcripts.ts';
 import { useAsks, type Ask, type Session } from '../../data/index.ts';
 import { ChatView } from '../chat-view.tsx';
 import { keysForOption, QuestionCard } from '../question-card.tsx';
 import {
   eventually,
+  holdPath,
   ID,
   otherClient,
   renderWithHub,
+  serveSynthetic,
   startHub,
   stubLayout,
+  SYNTHETIC,
   unmountAndSettle,
   type HubProcess,
   type Logged,
 } from './harness.tsx';
 
 const posts = (requests: Logged[], path: string) => requests.filter((r) => r.method === 'POST' && r.path === path);
+
+/** A transcript ending in a question no ask was raised for. */
+function openQuestion(): TranscriptRecord[] {
+  const at = 1_790_000_000_000;
+  const records: TranscriptRecord[] = [];
+  appendRecord(records, [userPrompt(at, 'Pick a parser for the new format.')]);
+  appendRecord(records, [{ kind: 'question', at, text: 'Which parser?', options: ['Streaming', 'Batch'] }]);
+  return records;
+}
+
+/** Whether `card` offers any way to answer: an enabled option or a text field. */
+function answerable(card: HTMLElement): boolean {
+  const options = within(card).queryAllByRole('button').filter((b) => !(b as HTMLButtonElement).disabled);
+  return options.length > 0 || within(card).queryByRole('textbox') !== null;
+}
+
+describe('QuestionCard while the asks are loading', () => {
+  let hub: HubProcess | undefined;
+  let unstub: () => void = () => {};
+
+  beforeEach(() => {
+    unstub = stubLayout({ viewport: 20_000, row: 40 });
+  });
+
+  afterEach(async () => {
+    await unmountAndSettle();
+    unstub();
+    await hub?.close();
+    hub = undefined;
+  });
+
+  it('offers no keys for a question raised as an ask, then answers the ask once asks are in', async () => {
+    hub = await startHub();
+    const asks = holdPath('/v1/asks');
+    const { requests } = renderWithHub(hub, <ChatView sessionId={ID.ses3} />, { fetch: asks.fetch });
+    // The card needs the session, so it is there once the session has loaded; the asks have not.
+    const card = await screen.findByRole('region', { name: 'Question: Merge the benchmark change into parsers?' });
+    expect(requests.some((r) => r.path === '/v1/asks')).toBe(true);
+    expect(answerable(card)).toBe(false);
+    fireEvent.click(within(card).getByRole('button', { name: 'Merge it' }));
+    expect(posts(requests, `/v1/sessions/${ID.ses3}/keys`)).toHaveLength(0);
+
+    asks.release();
+    await eventually(() => expect(within(card).getByText('from @reviewer')).toBeTruthy());
+    const merge = within(card).getByRole('button', { name: 'Merge it' });
+    expect(merge).toHaveProperty('disabled', false);
+    fireEvent.click(merge);
+    await eventually(() => expect(within(card).getByTestId('answer').textContent).toBe('Answered: Merge it'));
+    expect(posts(requests, `/v1/asks/${ID.ask1}/answer`).map((r) => r.body)).toEqual([{ option: 0 }]);
+    expect(posts(requests, `/v1/sessions/${ID.ses3}/keys`)).toHaveLength(0);
+  }, 15_000);
+
+  it('offers no keys for a question without an ask until asks are in, then answers with keys', async () => {
+    hub = await startHub();
+    const asks = holdPath('/v1/asks');
+    const { requests } = renderWithHub(hub, <ChatView sessionId={SYNTHETIC} />, {
+      fetch: serveSynthetic(openQuestion(), asks.fetch),
+    });
+    const card = await screen.findByRole('region', { name: 'Question: Which parser?' });
+    expect(answerable(card)).toBe(false);
+    fireEvent.click(within(card).getByRole('button', { name: 'Batch' }));
+    expect(posts(requests, `/v1/sessions/${SYNTHETIC}/keys`)).toHaveLength(0);
+
+    asks.release();
+    await eventually(() => expect(within(card).getByRole('button', { name: 'Batch' })).toHaveProperty('disabled', false));
+    // A CLI's picker takes keys, not text: no text field for a question with options.
+    expect(within(card).queryByRole('textbox')).toBeNull();
+    fireEvent.click(within(card).getByRole('button', { name: 'Batch' }));
+    await eventually(() => expect(within(card).getByTestId('answer').textContent).toBe('Sent: Batch'));
+    expect(posts(requests, `/v1/sessions/${SYNTHETIC}/keys`).map((r) => r.body)).toEqual([{ keys: ['down', 'enter'] }]);
+  }, 15_000);
+});
 
 describe('QuestionCard against the mock hub', () => {
   let hub: HubProcess | undefined;

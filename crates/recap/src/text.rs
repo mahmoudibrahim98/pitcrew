@@ -30,10 +30,12 @@ fn is_hidden(c: char) -> bool {
     )
 }
 
-/// Cleans text for display: hidden characters are dropped, control characters and whitespace
-/// runs become one space, the ends are trimmed, and at most `max` characters are kept (the last
-/// one is `…` when the text was cut). Work is bounded by `max`, not by the input length.
-pub(crate) fn clean(s: &str, max: usize) -> String {
+/// Cleans untrusted text for display: hidden and direction-changing characters are dropped,
+/// control characters and whitespace runs become one space, the ends are trimmed, and at most
+/// `max` characters are kept (the last one is `…` when the text was cut). Work is bounded by
+/// `max`, not by the input length.
+#[must_use]
+pub fn clean(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }

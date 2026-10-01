@@ -6,8 +6,9 @@
 import { cleanup, configure, render } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { vi } from 'vitest';
+import { transcriptPage, type TranscriptRecord } from '../../../../mock-hub/src/transcripts.ts';
 import { freePort, spawnHub, type HubProcess } from '../../../tests/hub-process.ts';
-import { createApi, createQueryClient, DataProvider } from '../../data/index.ts';
+import { createApi, createQueryClient, DataProvider, type Session } from '../../data/index.ts';
 
 export const DEVICE_TOKEN = 'dev-device-token';
 
@@ -88,6 +89,65 @@ export function renderWithHub(hub: { url: string }, ui: ReactNode, options: { fe
     </DataProvider>,
   );
   return { ...result, api, queryClient, requests };
+}
+
+/** A made-up session the hub does not know, served by `serveSynthetic`. */
+export const SYNTHETIC = '01JB0000000000000000SYNTH1';
+
+export function syntheticSession(): Session {
+  return {
+    id: SYNTHETIC,
+    engine: 'claude',
+    native_id: 'synthetic',
+    machine: ID.laptop,
+    cwd: '/work/synthetic',
+    title: 'Synthetic',
+    state: 'idle',
+    started: 0,
+    last_activity: 0,
+  };
+}
+
+const json = (body: unknown) =>
+  new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+
+/**
+ * Serves the synthetic session and `records` as its transcript, with the mock hub's own paging;
+ * everything else goes to `next` (the hub, by default). The session never changes.
+ */
+export function serveSynthetic(records: TranscriptRecord[], next: typeof fetch = fetch): typeof fetch {
+  const session = syntheticSession();
+  return (input, init) => {
+    const url = new URL(String(input));
+    if (url.pathname === `/v1/sessions/${SYNTHETIC}/transcript`) {
+      const before = url.searchParams.get('before');
+      const limit = url.searchParams.get('limit');
+      return Promise.resolve(
+        json(transcriptPage(records, before === null ? undefined : Number(before), limit === null ? 200 : Number(limit))),
+      );
+    }
+    if (url.pathname === `/v1/sessions/${SYNTHETIC}`) return Promise.resolve(json(session));
+    // Send, keys, interrupt and end are accepted and do nothing.
+    if (init?.method === 'POST' && url.pathname.startsWith(`/v1/sessions/${SYNTHETIC}/`)) {
+      return Promise.resolve(new Response(null, { status: 204 }));
+    }
+    return next(input, init);
+  };
+}
+
+/** Holds every request for `path` until `release()`; the rest go to `next` (the hub, by default). */
+export function holdPath(path: string, next: typeof fetch = fetch): { fetch: typeof fetch; release(): void } {
+  let release = () => {};
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return {
+    fetch: async (input, init) => {
+      if (new URL(String(input)).pathname === path) await gate;
+      return next(input, init);
+    },
+    release,
+  };
 }
 
 /** Another client of the same hub, to change things behind the UI's back. */

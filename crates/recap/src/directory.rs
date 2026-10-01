@@ -172,8 +172,8 @@ impl Directory {
         );
     }
 
-    /// Learns from one event: new sessions, tasks, workstreams, dispatches and asks, and session
-    /// links.
+    /// Learns from one event: new sessions, tasks, workstreams, dispatches and asks, session
+    /// links, and tasks moved to another workstream.
     pub fn observe(&mut self, event: &Event) {
         match &event.body {
             EventBody::SessionDiscovered { session } => self.add_session(session),
@@ -196,6 +196,12 @@ impl Directory {
                 }
             }
             EventBody::TaskCreated { task } => self.add_task(task),
+            EventBody::TaskUpdated { task, patch } => {
+                if let (Some(workstream), Some(info)) = (patch.workstream, self.tasks.get_mut(task))
+                {
+                    info.workstream = workstream;
+                }
+            }
             EventBody::WorkstreamCreated { workstream } => self.add_workstream(workstream),
             EventBody::DispatchStarted { dispatch } => self.add_dispatch(dispatch),
             EventBody::AskRaised { ask } => self.add_ask(ask),
