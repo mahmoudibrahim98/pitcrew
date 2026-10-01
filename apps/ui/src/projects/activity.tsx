@@ -1,5 +1,6 @@
-// Activity: what happened, newest first, from `GET /v1/events`. "Summary" is where stream F's
-// recaps will go; "All events" is the raw feed.
+// Activity: what happened, newest first. "Summary" is the recap (`recaps.tsx`): a paragraph per
+// day for a project or workstream, the blocks of work for a task or session. "All events" is the
+// raw feed from `GET /v1/events`.
 
 import { ToggleGroup } from 'radix-ui';
 import { useState } from 'react';
@@ -8,6 +9,7 @@ import { ApiError, type Event, type Member, type MemberId } from '../data/index.
 import { useActivity, useMemberMap, useNames, type EventFilters } from './data.ts';
 import { describeEvent, formatWhen, type Names } from './format.ts';
 import { Avatar } from './people.tsx';
+import { RecapSummary, WorkBlocks } from './recaps.tsx';
 import { ErrorNote, Panel } from './ui.tsx';
 
 export function AuthorAvatar({ event, members }: { event: Event; members: ReadonlyMap<MemberId, Member> }) {
@@ -53,6 +55,15 @@ export function EventList({
 
 type View = 'summary' | 'all';
 
+/** The recap for the same filters: day paragraphs for a workstream or project, blocks of work for a task or session. */
+function Summary({ filters }: { filters: EventFilters }) {
+  if (filters.workstream !== undefined) return <RecapSummary scope={{ workstream: filters.workstream }} />;
+  if (filters.project !== undefined) return <RecapSummary scope={{ project: filters.project }} />;
+  if (filters.task !== undefined) return <WorkBlocks filters={{ task: filters.task }} />;
+  if (filters.session !== undefined) return <WorkBlocks filters={{ session: filters.session }} />;
+  return <p className="text-sm text-ink-2">Summaries are kept per project, workstream, task and session.</p>;
+}
+
 const TOGGLE_ITEM =
   'h-6 rounded-sm px-2 text-xs text-ink-2 data-[state=on]:bg-card data-[state=on]:text-ink data-[state=on]:shadow-sm';
 
@@ -95,7 +106,7 @@ export function ActivityFeed({
       }
     >
       {view === 'summary' ? (
-        <p className="text-sm text-ink-2">Summaries of what happened will appear here. Switch to All events for the full feed.</p>
+        <Summary filters={filters} />
       ) : unavailable ? (
         <p className="text-sm text-ink-2">Activity isn’t available here yet.</p>
       ) : (

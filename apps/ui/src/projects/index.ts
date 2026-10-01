@@ -97,6 +97,8 @@ export const MembersPage = lazy(() => import('./members.tsx').then((m) => ({ def
 export const ProjectPage = lazy(() => import('./project-page.tsx').then((m) => ({ default: m.ProjectPage })));
 export const WorkstreamPage = lazy(() => import('./workstream-page.tsx').then((m) => ({ default: m.WorkstreamPage })));
 export const TaskPage = lazy(() => import('./task-page.tsx').then((m) => ({ default: m.TaskPage })));
+/** A session's blocks of work under a "Work" heading (`level` 2 or 3), for the console's session page. */
+export const SessionWork = lazy(() => import('./recaps.tsx').then((m) => ({ default: m.SessionWork })));
 
 export { ProjectsNavProvider, useProjectsNav, type ProjectsNav } from './nav.tsx';
 /** Open asks to me, for the sidebar's Inbox badge. */
