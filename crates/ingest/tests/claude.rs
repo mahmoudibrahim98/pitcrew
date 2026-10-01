@@ -3,7 +3,7 @@
 use pitcrew_ingest::claude::{ClaudeAdapter, ReadReport};
 use pitcrew_ingest::{SkipReason, SkippedLine};
 use pitcrew_interfaces::source::{
-    Cursor, SessionMeta, SourceAdapter, TranscriptItem, TranscriptRef,
+    Cursor, SessionMeta, SourceAdapter, SourceError, TranscriptItem, TranscriptRef,
 };
 use pitcrew_protocol::model::Engine;
 use proptest::prelude::*;
@@ -11,13 +11,19 @@ use serde_json::json;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 fn fixture_path() -> PathBuf {
     pitcrew_fixtures::data_dir().join("transcripts/claude/demo-session.jsonl")
 }
 
+/// The fixture's bytes, read from disk once per test binary. Under load, WSL's reads of `/mnt/c`
+/// can glitch; a proptest case reading the file itself (not through the adapter) on every one of
+/// its up to 64 cases multiplied that risk hundreds of times over.
 fn fixture() -> Vec<u8> {
-    fs::read(fixture_path()).expect("fixture")
+    static DATA: OnceLock<Vec<u8>> = OnceLock::new();
+    DATA.get_or_init(|| fs::read(fixture_path()).expect("fixture"))
+        .clone()
 }
 
 fn tref(path: &Path) -> TranscriptRef {
@@ -31,7 +37,7 @@ fn tref(path: &Path) -> TranscriptRef {
 }
 
 /// Everything one or more reads produced.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Collected {
     items: Vec<TranscriptItem>,
     meta: Option<SessionMeta>,
@@ -52,14 +58,33 @@ impl Collected {
     }
 }
 
+/// Retries once on a transient I/O error (WSL's reads of `/mnt/c` can glitch under load), so the
+/// test fails only on a second, real error, with both in the message. A parse or logic failure
+/// (`SourceError::Unreadable`) is never retried away.
+fn read_retry<T>(mut attempt: impl FnMut() -> Result<T, SourceError>) -> T {
+    match attempt() {
+        Ok(v) => v,
+        Err(SourceError::Io(first)) => match attempt() {
+            Ok(v) => v,
+            Err(second) => panic!("read failed twice: first {first}, then {second}"),
+        },
+        Err(e) => panic!("read: {e}"),
+    }
+}
+
 fn read_all(path: &Path) -> Collected {
     let mut c = Collected::default();
-    c.absorb(
-        ClaudeAdapter
-            .read(&tref(path), &Cursor::default())
-            .expect("read"),
-    );
+    c.absorb(read_retry(|| {
+        ClaudeAdapter.read(&tref(path), &Cursor::default())
+    }));
     c
+}
+
+/// The fixture's golden read, computed once per test binary: proptest cases compare against it
+/// instead of reading the same file from disk again on every one of their (up to 64) cases.
+fn full_fixture() -> Collected {
+    static FULL: OnceLock<Collected> = OnceLock::new();
+    FULL.get_or_init(|| read_all(&fixture_path())).clone()
 }
 
 /// Writes `data` to a new file in `cuts.len() + 1` pieces, reading after each append.
@@ -79,7 +104,7 @@ fn read_in_chunks(dir: &Path, data: &[u8], cuts: &[usize]) -> Collected {
         f.write_all(&data[written..p]).expect("append");
         drop(f);
         written = p;
-        c.absorb(ClaudeAdapter.read(&tref(&path), &c.cursor).expect("read"));
+        c.absorb(read_retry(|| ClaudeAdapter.read(&tref(&path), &c.cursor)));
     }
     c
 }
@@ -90,7 +115,7 @@ fn page_all(path: &Path, limit: usize) -> Vec<TranscriptItem> {
     let mut pages = Vec::new();
     let mut before = None;
     for _ in 0..10_000 {
-        let page = ClaudeAdapter.read_page(&t, before, limit).expect("page");
+        let page = read_retry(|| ClaudeAdapter.read_page(&t, before, limit));
         assert!(page.from <= page.to);
         if let Some(b) = before {
             assert_eq!(page.to, b, "pages must join up");
@@ -113,7 +138,7 @@ struct Golden {
 
 #[test]
 fn golden_demo_session() {
-    let c = read_all(&fixture_path());
+    let c = full_fixture();
     assert!(c.skipped.is_empty(), "{:?}", c.skipped);
     assert_eq!(c.cursor.offset, fixture().len() as u64);
     insta::assert_json_snapshot!(
@@ -127,7 +152,7 @@ fn golden_demo_session() {
 
 #[test]
 fn fixture_pages_join_up_to_the_full_read() {
-    let full = read_all(&fixture_path()).items;
+    let full = full_fixture().items;
     for limit in 1..=full.len() + 1 {
         assert_eq!(page_all(&fixture_path(), limit), full, "limit {limit}");
     }
@@ -136,16 +161,14 @@ fn fixture_pages_join_up_to_the_full_read() {
 #[test]
 fn newest_page_comes_first() {
     let t = tref(&fixture_path());
-    let full = read_all(&fixture_path()).items;
-    let page = ClaudeAdapter.read_page(&t, None, 2).expect("page");
+    let full = full_fixture().items;
+    let page = read_retry(|| ClaudeAdapter.read_page(&t, None, 2));
     assert!(!page.at_start);
     assert_eq!(page.to, fixture().len() as u64);
     assert_eq!(page.items, full[full.len() - page.items.len()..]);
     assert_eq!(page.from, page.items[0].offset());
 
-    let first = ClaudeAdapter
-        .read_page(&t, Some(page.from), 1000)
-        .expect("page");
+    let first = read_retry(|| ClaudeAdapter.read_page(&t, Some(page.from), 1000));
     assert!(first.at_start);
     assert_eq!(first.items.len() + page.items.len(), full.len());
 }
@@ -160,9 +183,7 @@ fn empty_file() {
     assert_eq!(c.cursor.offset, 0);
     assert_eq!(c.meta.map(|m| m.native_id).as_deref(), Some("empty"));
 
-    let page = ClaudeAdapter
-        .read_page(&tref(&path), None, 50)
-        .expect("page");
+    let page = read_retry(|| ClaudeAdapter.read_page(&tref(&path), None, 50));
     assert!(page.items.is_empty() && page.at_start);
     assert_eq!((page.from, page.to), (0, 0));
 }
@@ -177,22 +198,18 @@ fn truncated_last_line_is_completed_later() {
     assert!(line12 < data.len());
     fs::write(&path, &data[..line12]).expect("write");
 
-    let first = ClaudeAdapter
-        .read(&tref(&path), &Cursor::default())
-        .expect("read");
+    let first = read_retry(|| ClaudeAdapter.read(&tref(&path), &Cursor::default()));
     assert_eq!(first.chunk.cursor.offset, nth_line_start(&data, 11) as u64);
     assert!(first.skipped.is_empty());
 
     let mut f = OpenOptions::new().append(true).open(&path).expect("open");
     f.write_all(&data[line12..]).expect("append");
     drop(f);
-    let second = ClaudeAdapter
-        .read(&tref(&path), &first.chunk.cursor)
-        .expect("read");
+    let second = read_retry(|| ClaudeAdapter.read(&tref(&path), &first.chunk.cursor));
 
     let mut items = first.chunk.items;
     items.extend(second.chunk.items);
-    assert_eq!(items, read_all(&fixture_path()).items);
+    assert_eq!(items, full_fixture().items);
     assert_eq!(first.bytes_read + second.bytes_read, data.len() as u64);
 }
 
@@ -288,9 +305,7 @@ fn a_flood_of_junk_lines_reports_only_the_first() {
         data.push_str("junk\n");
     }
     fs::write(&path, &data).expect("write");
-    let report = ClaudeAdapter
-        .read(&tref(&path), &Cursor::default())
-        .expect("read");
+    let report = read_retry(|| ClaudeAdapter.read(&tref(&path), &Cursor::default()));
     assert_eq!(report.chunk.items.len(), 1);
     assert_eq!(report.skipped.len(), pitcrew_ingest::MAX_REPORTED_SKIPS);
     assert_eq!(report.skipped_total, 1000);
@@ -363,7 +378,7 @@ fn discovery_finds_sessions_and_subagents() {
     fs::write(project.join("notes.txt"), "x").expect("write");
     fs::write(home.path().join("projects").join("stray.jsonl"), "{}\n").expect("write");
 
-    let found = ClaudeAdapter.discover(home.path()).expect("discover");
+    let found = read_retry(|| ClaudeAdapter.discover(home.path()));
     let names: Vec<_> = found
         .iter()
         .map(|t| {
@@ -397,12 +412,7 @@ fn discovery_finds_sessions_and_subagents() {
         .collect();
     assert_eq!(flags, [("sess-0", true), ("ag-7", true), ("s-1", false)]);
 
-    assert!(
-        ClaudeAdapter
-            .discover(&home.path().join("missing"))
-            .expect("ok")
-            .is_empty()
-    );
+    assert!(read_retry(|| ClaudeAdapter.discover(&home.path().join("missing"))).is_empty());
 }
 
 /// Links below `projects/` are not followed out of it. Unix only: creating links on Windows can
@@ -433,7 +443,7 @@ fn discovery_does_not_follow_links_out_of_the_projects_root() {
     )
     .expect("link");
 
-    let found = ClaudeAdapter.discover(home.path()).expect("discover");
+    let found = read_retry(|| ClaudeAdapter.discover(home.path()));
     let names: Vec<_> = found
         .iter()
         .map(|t| t.path.strip_prefix(home.path()).expect("under home"))
@@ -443,7 +453,7 @@ fn discovery_does_not_follow_links_out_of_the_projects_root() {
 
 #[test]
 fn end_turn_then_turn_duration_is_one_turn_end() {
-    let full = read_all(&fixture_path()).items;
+    let full = full_fixture().items;
     let ends = full
         .iter()
         .filter(|i| matches!(i, TranscriptItem::TurnEnded { .. }))
@@ -506,7 +516,7 @@ proptest! {
         let dir = tempfile::tempdir().expect("tempdir");
         let data = fixture();
         let cuts = resolve(&cuts, &data);
-        let full = read_all(&fixture_path());
+        let full = full_fixture();
         let chunked = read_in_chunks(dir.path(), &data, &cuts);
         prop_assert_eq!(&chunked.items, &full.items);
         prop_assert_eq!(&chunked.meta, &full.meta);
@@ -618,9 +628,7 @@ fn a_flood_of_turn_duration_records_pages_correctly() {
     let full = read_all(&path).items;
     assert_eq!(full.len(), 2, "one prompt, one turn end");
     // Deciding the kept turn end needs the prompt before it, and pages hold whole records.
-    let page = ClaudeAdapter
-        .read_page(&tref(&path), None, 1)
-        .expect("page");
+    let page = read_retry(|| ClaudeAdapter.read_page(&tref(&path), None, 1));
     assert_eq!(page.items, full);
     assert!(page.at_start);
 }
@@ -636,7 +644,7 @@ fn a_home_under_a_subagents_folder_is_not_a_subagent() {
         prompt("hi", "2026-01-01T00:00:00Z") + "\n",
     )
     .expect("write");
-    let found = ClaudeAdapter.discover(&home).expect("discover");
+    let found = read_retry(|| ClaudeAdapter.discover(&home));
     assert_eq!(found.len(), 1);
     assert!(!read_all(&found[0].path).meta.expect("meta").is_subagent);
 }
@@ -645,11 +653,9 @@ fn a_home_under_a_subagents_folder_is_not_a_subagent() {
 fn before_inside_a_line_pages_from_the_line_boundary() {
     let t = tref(&fixture_path());
     let data = fixture();
-    let full = read_all(&fixture_path()).items;
+    let full = full_fixture().items;
     let boundary = nth_line_start(&data, 5) as u64; // start of line 6
-    let page = ClaudeAdapter
-        .read_page(&t, Some(boundary + 17), 1000)
-        .expect("page");
+    let page = read_retry(|| ClaudeAdapter.read_page(&t, Some(boundary + 17), 1000));
     assert_eq!(page.to, boundary);
     assert!(page.at_start);
     let expected: Vec<_> = full
@@ -659,18 +665,14 @@ fn before_inside_a_line_pages_from_the_line_boundary() {
         .collect();
     assert_eq!(page.items, expected);
 
-    let past_end = ClaudeAdapter
-        .read_page(&t, Some(u64::MAX), 1000)
-        .expect("page");
+    let past_end = read_retry(|| ClaudeAdapter.read_page(&t, Some(u64::MAX), 1000));
     assert_eq!((past_end.items, past_end.to), (full, data.len() as u64));
 }
 
 #[test]
 fn limit_zero_gives_an_empty_page() {
     let len = fixture().len() as u64;
-    let page = ClaudeAdapter
-        .read_page(&tref(&fixture_path()), None, 0)
-        .expect("page");
+    let page = read_retry(|| ClaudeAdapter.read_page(&tref(&fixture_path()), None, 0));
     assert!(page.items.is_empty());
     assert_eq!((page.from, page.to, page.at_start), (len, len, false));
 }
@@ -684,7 +686,7 @@ fn a_cursor_past_the_end_is_an_error() {
     };
     assert!(matches!(
         ClaudeAdapter.read(&t, &cursor),
-        Err(pitcrew_interfaces::source::SourceError::Unreadable { .. })
+        Err(SourceError::Unreadable { .. })
     ));
 
     // A corrupt carried line whose length overflows is ignored, not a panic.
@@ -692,7 +694,7 @@ fn a_cursor_past_the_end_is_an_error() {
         offset: 10,
         state: Some(json!({"pending": {"len": u64::MAX, "too_long": true}})),
     };
-    let report = ClaudeAdapter.read(&t, &cursor).expect("read");
+    let report = read_retry(|| ClaudeAdapter.read(&t, &cursor));
     assert_eq!(report.chunk.cursor.offset, fixture().len() as u64);
 }
 
@@ -717,7 +719,7 @@ fn crlf_files_give_the_same_items() {
         .replace('\n', "\r\n");
     fs::write(&path, &crlf).expect("write");
     let got = read_all(&path);
-    let want = read_all(&fixture_path());
+    let want = full_fixture();
     assert!(got.skipped.is_empty());
     assert_eq!(without_offsets(&got.items), without_offsets(&want.items));
     assert_eq!(got.meta, want.meta);
@@ -736,9 +738,7 @@ fn a_large_partial_line_round_trips_through_the_cursor() {
     let cut = first.len() + 1 + 80_000;
     fs::write(&path, &data.as_bytes()[..cut]).expect("write");
 
-    let one = ClaudeAdapter
-        .read(&tref(&path), &Cursor::default())
-        .expect("read");
+    let one = read_retry(|| ClaudeAdapter.read(&tref(&path), &Cursor::default()));
     let state = serde_json::to_string(&one.chunk.cursor.state).expect("state");
     assert!(
         state.len() < 1024,
@@ -749,9 +749,7 @@ fn a_large_partial_line_round_trips_through_the_cursor() {
     let mut f = OpenOptions::new().append(true).open(&path).expect("open");
     f.write_all(&data.as_bytes()[cut..]).expect("append");
     drop(f);
-    let two = ClaudeAdapter
-        .read(&tref(&path), &one.chunk.cursor)
-        .expect("read");
+    let two = read_retry(|| ClaudeAdapter.read(&tref(&path), &one.chunk.cursor));
     assert_eq!(two.chunk.items.len(), 1);
     assert_eq!(prompt_text(&two.chunk.items[0]).len(), 100_000);
     assert_eq!(
