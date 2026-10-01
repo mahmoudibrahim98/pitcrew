@@ -54,6 +54,11 @@ export const invalidationMap: InvalidationMap = {
   task_created: () => [],
   task_moved: (d, cache) => taskAndWorkstream(d.task, cache),
   task_assigned: (d) => task(d.task),
+  // A workstream change touches the old workstream (from the cache) and the new one.
+  task_updated: (d, cache) =>
+    typeof d.patch.workstream === 'string'
+      ? [...taskAndWorkstream(d.task, cache), keys.workstreams.detail(d.patch.workstream)]
+      : taskAndWorkstream(d.task, cache),
   subtasks_replaced: () => [],
   dispatch_started: (d) => [keys.dispatches, keys.tasks.detail(d.dispatch.task)],
   dispatch_finished: () => [keys.dispatches],

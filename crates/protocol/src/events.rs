@@ -14,8 +14,8 @@ use crate::ids::{
 };
 use crate::model::{
     Answer, Ask, Dispatch, DispatchOutcome, Health, LinkBasis, Liveness, Machine, Member, Mover,
-    Persona, Project, Receipt, Session, SessionState, Subtask, Task, TaskStatus, Team, TimestampMs,
-    Workstream, WorkstreamStatus,
+    Persona, Project, Receipt, Session, SessionState, Subtask, Task, TaskPatch, TaskStatus, Team,
+    TimestampMs, Workstream, WorkstreamStatus,
 };
 use serde::{Deserialize, Serialize};
 
@@ -219,6 +219,14 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         assignee: Option<MemberId>,
     },
+    /// A task's title, description, priority, labels, dates, dependencies, workstream or
+    /// acceptance policy changed (`PATCH /v1/tasks/{id-or-key}`).
+    TaskUpdated {
+        /// The task.
+        task: TaskId,
+        /// Only the fields that changed, with their new values.
+        patch: TaskPatch,
+    },
     /// A task's subtasks were replaced, for example from an agent's updated plan.
     SubtasksReplaced {
         /// The task.
@@ -279,17 +287,31 @@ pub enum EventBody {
         target: BriefTarget,
         /// Proposed text.
         text: String,
+        /// Proposed next step, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next: Option<String>,
         /// Evidence for every claim.
         receipts: Vec<Receipt>,
     },
     /// A brief was accepted, applied automatically or edited.
+    ///
+    /// When a person accepts the pending proposal unchanged (the newest `brief_proposed` for the
+    /// target, newer than the brief in force, with the same text and next step), the hub copies
+    /// the proposal's receipts here, and the brief's source is the back office, as it is when the
+    /// back office applies a brief itself. See `docs/build/contracts/api-v1.md`.
     BriefAccepted {
         /// Which brief.
         target: BriefTarget,
         /// The text now in force.
         text: String,
+        /// The next step now in force, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next: Option<String>,
         /// Whether a person pinned it. Pinned briefs only get proposals.
         pinned: bool,
+        /// Evidence, copied from the proposal it accepts; empty for a person's own text.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        receipts: Vec<Receipt>,
     },
     /// A decision was recorded.
     DecisionRecorded {
