@@ -55,6 +55,7 @@ impl Projection for Briefs {
                 target,
                 text,
                 receipts,
+                ..
             } => {
                 let (kind, id) = target_columns(target);
                 exec(
@@ -82,6 +83,7 @@ impl Projection for Briefs {
                 target,
                 text,
                 pinned,
+                ..
             } => {
                 let (kind, id) = target_columns(target);
                 let proposal: Option<(String, String)> = tx
