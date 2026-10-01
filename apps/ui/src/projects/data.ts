@@ -314,12 +314,31 @@ export function useAnswerAsk() {
   });
 }
 
-/** A person's edit of "Where it stands"; pinning is an edit with `pinned` set. */
+/**
+ * A person's edit of "Where it stands"; pinning, and "Keep current" (which clears any pending
+ * proposal), are an edit with the same text.
+ */
 export function useSaveBrief() {
   const api = useApi();
   return useMutation({
     mutationFn: ({ target, text, next, pinned }: { target: BriefTarget; text: string; next?: string; pinned: boolean }) =>
-      api.request<Brief>('PUT', `/v1/briefs/${target.kind}/${id(target.id)}`, { body: { text, next, pinned } }),
+      api.editBrief(target, { text, pinned, ...(next === undefined ? {} : { next }) }),
+  });
+}
+
+/** Accepts the back office's pending proposal: its text and next step become the brief in force. */
+export function useAcceptBrief() {
+  const api = useApi();
+  return useMutation({
+    mutationFn: ({
+      target,
+      proposal,
+      pinned,
+    }: {
+      target: BriefTarget;
+      proposal: { text: string; next?: string };
+      pinned: boolean;
+    }) => api.acceptBrief(target, proposal, pinned),
   });
 }
 
