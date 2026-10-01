@@ -94,7 +94,12 @@ fn unix_listen_binds_exactly_that_socket_and_a_stop_removes_it() {
             daemon.stderr()
         );
         assert!(!socket.exists(), "SIG{signal} left the socket behind");
-        assert!(daemon.stderr().contains("stopped"), "{}", daemon.stderr());
+        let logs = daemon.stderr();
+        assert!(logs.contains("stopped"), "{logs}");
+        // The back office stopped before the store closed.
+        let office = logs.find("the back office stopped").unwrap_or(usize::MAX);
+        let store = logs.find("store closed").unwrap_or(0);
+        assert!(office < store, "SIG{signal}:\n{logs}");
     }
 
     // Only `<dir>/pitcrewd.sock`, the name pitcrew-api binds.
@@ -208,6 +213,7 @@ fn demo_serves_the_work_model_with_real_tokens() {
     let machines = daemon.get("/v1/machines", Some(&agent));
     assert_eq!(machines.status, 403);
     assert_eq!(machines.code(), "forbidden");
+    let before_move = daemon.latest_rev(&device);
     let moved = daemon.post(
         "/v1/tasks/PAP-2/move",
         Some(&agent),
@@ -215,8 +221,15 @@ fn demo_serves_the_work_model_with_real_tokens() {
     );
     assert_eq!(moved.status, 200, "{}", moved.body);
 
-    // Activity pages the log, newest last; the agent's move is the newest event.
-    let page = daemon.get("/v1/events?limit=1", Some(&device)).json();
+    // Activity pages the log, newest last; the agent's move is the event after what was there.
+    // (The back office may append after it: the demo's asks are days old by the wall clock.)
+    let page = daemon
+        .get(
+            &format!("/v1/events?limit=1&before={}", before_move + 2),
+            Some(&device),
+        )
+        .json();
+    assert_eq!(page["to_rev"], before_move + 1);
     let event = &page["events"][0];
     assert_eq!(event["author"], id::WRITER);
     assert_eq!(event["on_behalf_of"], id::SAM);
@@ -264,13 +277,9 @@ fn demo_serves_the_work_model_with_real_tokens() {
     assert_eq!(session.json()["id"], id::SES1);
 
     // No runner is attached yet, so a dispatch is unavailable and records nothing: no dispatch,
-    // no session, and no assignment of the unassigned PAP-5.
-    let latest = |daemon: &Daemon| {
-        daemon.get("/v1/events?limit=1", Some(&device)).json()["to_rev"]
-            .as_u64()
-            .unwrap()
-    };
-    let before = latest(&daemon);
+    // no session, and no assignment of the unassigned PAP-5. (Only the back office may still be
+    // appending what it makes of the move above.)
+    let before = daemon.latest_rev(&device);
     let dispatch = daemon.post(
         "/v1/tasks/PAP-5/dispatch",
         Some(&device),
@@ -278,7 +287,19 @@ fn demo_serves_the_work_model_with_real_tokens() {
     );
     assert_eq!(dispatch.status, 503, "{}", dispatch.body);
     assert_eq!(dispatch.code(), "unavailable");
-    assert_eq!(latest(&daemon), before, "a dispatch appended events");
+    let page = daemon.get("/v1/events?limit=500", Some(&device)).json();
+    let from = page["from_rev"].as_u64().unwrap();
+    let appended: Vec<&Value> = page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .skip(usize::try_from(before + 1 - from).unwrap())
+        .filter(|e| e["author"] != id::OFFICE)
+        .collect();
+    assert!(
+        appended.is_empty(),
+        "a dispatch appended events: {appended:?}"
+    );
     let pap5 = daemon.get("/v1/tasks/PAP-5", Some(&device)).json();
     assert!(pap5["assignee"].is_null(), "{pap5}");
     let by_agent = daemon.post(
@@ -374,25 +395,42 @@ fn a_move_through_the_api_appears_on_the_stream() {
     );
     assert_eq!(moved.status, 200, "{}", moved.body);
 
+    // The move comes first. The back office may append after it (the demo's asks are days old by
+    // the wall clock), in the same frame or later ones.
     let frame = stream.next_json(WAIT);
     assert_eq!(frame["type"], "events", "{frame}");
     assert_eq!(frame["from_rev"], rev + 1);
-    assert_eq!(frame["to_rev"], rev + 1);
-    let event = &frame["events"][0];
+    let to_rev = frame["to_rev"].as_u64().unwrap();
+    let events = frame["events"].as_array().unwrap();
+    assert_eq!(events.len() as u64, to_rev - rev);
+    let event = &events[0];
     assert_eq!(event["body"]["type"], "task_moved");
     assert_eq!(event["body"]["data"]["task"], id::PAP2);
     assert_eq!(event["body"]["data"]["to"], "in_progress");
     assert_eq!(event["author"], id::SAM);
+    for later in &events[1..] {
+        assert_eq!(later["author"], id::OFFICE, "{later}");
+    }
 
-    // A client that reconnects with what it had gets exactly what it missed.
+    // A client that reconnects with what it had gets exactly what it missed: every revision
+    // after `since` up to the hello's, in order, the move first.
     let mut again = Ws::connect(daemon.port, &format!("/v1/stream?since={rev}"), &device).unwrap();
     let hello = again.next_json(WAIT);
-    assert_eq!(hello["rev"], rev + 1);
+    let now = hello["rev"].as_u64().unwrap();
+    assert!(now > rev);
     assert_eq!(hello["log"], log.as_str());
-    let missed = again.next_json(WAIT);
-    assert_eq!(missed["type"], "events");
-    assert_eq!(missed["from_rev"], rev + 1);
-    assert_eq!(missed["events"][0]["body"]["data"]["task"], id::PAP2);
+    let mut next = rev + 1;
+    let mut first = None;
+    while next <= now {
+        let missed = again.next_json(WAIT);
+        assert_eq!(missed["type"], "events", "{missed}");
+        assert_eq!(missed["from_rev"], next);
+        first.get_or_insert_with(|| missed["events"][0].clone());
+        next = missed["to_rev"].as_u64().unwrap() + 1;
+    }
+    let first = first.unwrap();
+    assert_eq!(first["body"]["data"]["task"], id::PAP2);
+    assert_eq!(first["author"], id::SAM);
 }
 
 #[test]
@@ -430,6 +468,10 @@ fn sigterm_stops_cleanly_and_a_restart_keeps_everything() {
     assert!(status.success(), "{status}:\n{}", daemon.stderr());
     let logs = daemon.stderr();
     assert!(logs.contains("store closed"), "{logs}");
+    // The back office stopped first, and saved where it got to.
+    let office = logs.find("the back office stopped").unwrap_or(usize::MAX);
+    assert!(office < logs.find("store closed").unwrap(), "{logs}");
+    assert!(state.join("office.json").is_file());
     // The store closed cleanly: its WAL was checkpointed into hub.db and removed.
     assert!(state.join("hub.db").is_file());
     for leftover in ["hub.db-wal", "hub.db-shm"] {
