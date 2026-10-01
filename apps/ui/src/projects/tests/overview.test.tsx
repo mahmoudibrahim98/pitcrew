@@ -57,8 +57,10 @@ describe('ProjectOverview and WorkstreamOverview', () => {
     const events = await within(activity).findByRole('list', { name: 'Events' });
     expect(within(events).getByText('moved PAP-3 from In progress to Review')).toBeTruthy();
     expect(within(events).queryByText(/Parse Codex/)).toBeNull();
+    // Summary: the project's day paragraphs (see recaps.test.tsx).
     fireEvent.click(within(activity).getByRole('radio', { name: 'Summary' }));
-    expect(within(activity).getByText(/Summaries of what happened will appear here/)).toBeTruthy();
+    await within(activity).findByRole('list', { name: 'Days' });
+    expect(within(activity).queryByRole('list', { name: 'Events' })).toBeNull();
   });
 
   it('shows a workstream with its tasks and activity, live', async () => {

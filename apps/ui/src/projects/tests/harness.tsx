@@ -11,6 +11,7 @@ import type { ReactNode } from 'react';
 import { vi } from 'vitest';
 import { createApi, createQueryClient, DataProvider, type Api } from '../../data/index.ts';
 import { ProjectsNavProvider, type ProjectsNav } from '../nav.tsx';
+import { RecapTzProvider } from '../recap-tz.tsx';
 
 // Several hubs start at once when the files run in parallel; give data time to arrive.
 const PATIENCE_MS = 5_000;
@@ -58,7 +59,8 @@ export async function stopHub(hub: Hub): Promise<void> {
 /**
  * Renders inside `DataProvider`. The stream always uses the device token (it is device-only);
  * `token` sets the one the API calls carry, so a test can act as the agent @writer. `fetch`
- * stands between the API client and the hub, to slow or rewrite answers.
+ * stands between the API client and the hub, to slow or rewrite answers. Recap days use `tz=0`,
+ * the only offset the mock hub has days for, whatever the machine's own time zone.
  */
 export function renderWithHub(
   ui: ReactNode,
@@ -74,7 +76,9 @@ export function renderWithHub(
   clients.add(queryClient);
   const result = render(
     <DataProvider api={api} queryClient={queryClient} token={DEVICE_TOKEN}>
-      <ProjectsNavProvider value={options.nav ?? {}}>{ui}</ProjectsNavProvider>
+      <RecapTzProvider tz={0}>
+        <ProjectsNavProvider value={options.nav ?? {}}>{ui}</ProjectsNavProvider>
+      </RecapTzProvider>
     </DataProvider>,
   );
   return { ...result, api, queryClient };

@@ -1,5 +1,6 @@
 // The task drawer: fields, subtasks (the agent's plan lines marked and read-only), the agent run,
-// dependencies, comments with @mentions, and the task's history from activity.
+// dependencies, comments with @mentions, the blocks of work on it (recaps), and the task's history
+// from activity.
 
 import { Dialog } from 'radix-ui';
 import { useId, useState, type ComponentType, type FormEvent, type ReactNode } from 'react';
@@ -27,6 +28,7 @@ import {
 import { PRIORITY, SESSION_STATE, STATUS_ORDER, TASK_STATUS, formatDay, formatWhen, isWebUrl } from './format.ts';
 import { useProjectsNav } from './nav.tsx';
 import { MemberChip, memberLabel } from './people.tsx';
+import { WorkBlocks } from './recaps.tsx';
 import { ErrorNote, Field, MaybeLink, inputClass } from './ui.tsx';
 
 type TitleComponent = ComponentType<{ className?: string; children?: ReactNode }> | 'h2';
@@ -120,6 +122,9 @@ export function TaskDetail({
       <AgentRun task={data} person={person} level={level} />
       <Dependencies task={data} level={level} />
       <Comments task={data} level={level} />
+      <Section title="Work" level={level}>
+        <WorkBlocks filters={{ task: data.id }} />
+      </Section>
       <History task={data} level={level} />
     </article>
   );
