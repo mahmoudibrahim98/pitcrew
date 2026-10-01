@@ -1,13 +1,28 @@
 // xterm's options for output that comes from an agent and whatever it ran, so is hostile:
 // no proposed API, no window reports, a bounded scrollback, links only for http and https on a
-// modifier-click, and no OSC titles or clipboard (see `SWALLOWED_OSC`). The console README
-// explains each choice.
+// modifier-click with a bounded length, and no OSC titles or clipboard (see `SWALLOWED_OSC`).
+// The console README explains each choice.
 
 import type { ILinkHandler, ITerminalOptions, ITheme } from '@xterm/xterm';
 import type { TerminalFont } from './theme.ts';
 
-/** Lines kept above the screen. At most 1,000 columns, that bounds the scrollback's memory. */
+/**
+ * Lines kept above the screen. This bounds the number of rows, not every byte they hold: a cell
+ * can carry any number of combining marks. Links are bounded on their own (`MAX_LINK_LENGTH`).
+ */
 export const SCROLLBACK = 5_000;
+
+/**
+ * The longest OSC 8 link target kept. xterm accepts targets of up to 10 MB and keeps every link
+ * without an `id` with its line; a longer one is dropped, and its text shows as plain text.
+ */
+export const MAX_LINK_LENGTH = 2048;
+
+/** Whether an OSC 8 payload (`params;uri`) has a target longer than `MAX_LINK_LENGTH`. */
+export function isOversizedLink(data: string): boolean {
+  const separator = data.indexOf(';');
+  return separator !== -1 && data.length - separator - 1 > MAX_LINK_LENGTH;
+}
 
 /**
  * OSC sequences dropped before xterm acts on them: 0, 1 and 2 set the title (it never reaches
