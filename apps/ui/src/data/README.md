@@ -6,10 +6,10 @@ See `docs/build/streams/L.md`, `docs/build/contracts/api-v1.md` and
 
 | File | What |
 |---|---|
-| `transport.ts` | The seam every request and socket goes through: `Transport` (`request(method, path, body) → { status, contentType, body }`, `openSocket(path) → TransportSocket`). `browserTransport()`: `fetch` and `WebSocket` with the bearer token (development). `isDesktop()`: `window.__TAURI_INTERNALS__` exists. |
-| `gateway.ts` | The desktop transport: the gateway's commands and channels, exactly as the contract says. No token, header or `VITE_*` value. |
-| `desktop.tsx` | The desktop app's workspaces: `gateway_workspaces()` and `gateway://workspaces`, and one data scope per workspace (`Workspaces`, `<WorkspacesProvider>`). With `gateway.ts` and `@tauri-apps/api`, loaded only in the desktop app, by dynamic import; elsewhere import from them with `import type` only. |
-| `workspaces.tsx` | What the shell sees of them: `useGatewayWorkspaces()` (`null` in a browser), `<WorkspaceScope ws>`, and the gateway's types. |
+| `transport.ts` | The seam every request and socket goes through: `Transport` (`request(method, path, body) → { status, contentType, body }`, `openSocket(path) → TransportSocket`). `browserTransport()`: `fetch` and `WebSocket` with the bearer token (development). `TransportSocket.bufferedAmount` is bytes sent but not yet taken: the real `WebSocket`'s own, here. `isDesktop()`: `window.__TAURI_INTERNALS__` exists. |
+| `gateway.ts` | The desktop transport: the gateway's commands and channels, exactly as the contract says. No token, header or `VITE_*` value. `GatewaySocket.bufferedAmount` is the bytes still queued in its own outbox; past 8 MiB there the socket closes itself with 1013 (`the sender ignored back-pressure`), as the daemon does to a receiver that falls behind — a sender is expected to watch it, the same as a browser `WebSocket`'s. |
+| `desktop.tsx` | The desktop app's workspaces: `gateway_workspaces()` and `gateway://workspaces`, and one data scope per workspace (`Workspaces`, `<WorkspacesProvider>`). `open(id)`/`leave(id)` track which workspace is in view: a workspace left in the background for `backgroundMs` (10 minutes) has its stream closed, resumed with `since` by the next `open()` — see "Workspaces in the desktop app" below. `onNavigate()` subscribes to `gateway://navigate` before the first `gateway_workspaces()` call — the gateway holds a launch-time deep link until then — and holds a target that still arrives first until the list is known (`pendingNavigateMs`, 60 s, after which it is dropped rather than acted on with a stale list), so every delivery carries the list to check the target against. With `gateway.ts` and `@tauri-apps/api`, loaded only in the desktop app, by dynamic import; elsewhere import from them with `import type` only. |
+| `workspaces.tsx` | What the shell sees of them: `useGatewayWorkspaces()` (`null` in a browser), `<WorkspaceScope ws>`, `useGatewayNavigate(onTarget)` (follows `gateway://navigate`, raw and unvalidated — the shell checks it, `shell/gateway-navigate.ts` — together with the workspace list, already known by the time it fires), and the gateway's types. |
 | `root.tsx` | `<AppData>`: picks the data layer once, at start, and loads it on demand: `desktop.tsx` in the desktop app; `browser.tsx` in a browser, in development only. A production build outside the desktop app fails closed: an error screen, no request. |
 | `browser.tsx` | The browser's data layer (development): `<DataProvider>` over `browserTransport` with `config.ts`. Never loaded in the desktop app; not in production builds. |
 | `errors.ts` | `ApiError { code, status }`, and `GatewayError` (an `ApiError` with status 0 and the gateway's own `gateway` code). |
@@ -61,10 +61,15 @@ frame). We chose this over putting the workspace in every key because:
 - TanStack Query observers bind to their client when they mount, so the scope is keyed by `ws`:
   switching remounts the frame and nothing of the old workspace lingers on screen.
 
-A workspace's stream keeps running in the background once opened, so switching back shows a
-fresh cache at once. When the gateway marks a workspace `ready` again, its stream reconnects at
-once (also when a connection attempt was still out). A workspace that is `unreachable` or
-`needs_pairing` shows that state in the frame, not a spinner.
+A workspace's stream keeps running in the background once opened, so switching back shows a fresh
+cache at once — for up to 10 minutes out of view (`Workspaces.leave()`, called when its
+`WorkspaceScope` unmounts): past that its stream closes, to cap how many stay fully connected while
+nobody is looking. Switching back to it (`open()`, cancelling the pending close if it was still
+waiting) starts its stream again, resuming with `since` from the stream's own last revision, same
+as any other reconnect; its cache is untouched meanwhile, so nothing refetches that a `since`
+catch-up will not also cover. When the gateway marks a workspace `ready` again, its stream
+reconnects at once (also when a connection attempt was still out). A workspace that is
+`unreachable` or `needs_pairing` shows that state in the frame, not a spinner.
 
 The gateway emits `gateway://workspaces` only on changes, so a failed `gateway_workspaces()` is
 read again with back-off (1 s doubling to 30 s) until the list is known; the shell shows the error

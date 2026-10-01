@@ -15,13 +15,21 @@ import { RegistryContext } from './context.ts';
 import { shellFeature } from './core.tsx';
 import type { Feature } from './feature.ts';
 import { WorkspaceFrame } from './frame.tsx';
+import { useGatewayNavigation } from './gateway-navigate.ts';
+import { Notice } from './notice.tsx';
 import { NotFoundPage, RootNotFound } from './pages/not-found.tsx';
 import { OpenLayout, OpenWorkspace } from './pages/open.tsx';
 import { composeFeatures, servedPaths, withLayout } from './registry.ts';
 
 function Root() {
   useApplyTheme();
-  return <Outlet />;
+  useGatewayNavigation();
+  return (
+    <>
+      <Notice />
+      <Outlet />
+    </>
+  );
 }
 
 function createShellRoot() {

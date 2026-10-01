@@ -17,6 +17,9 @@ See `docs/build/streams/L.md` and ADR-0008.
 | `frame.tsx`, `sidebar.tsx`, `projects-tree.tsx`, `top-bar.tsx`, `orchestrator.tsx`, `create.tsx` | The frame's parts. The frame sits in the workspace's data scope (`WorkspaceScope`, keyed by `$ws`). |
 | `palette.tsx`, `fuzzy.ts` | The palette (a lazy chunk) and its fuzzy matching. |
 | `pages/` | Placeholders at the well-known paths, the not-found page, the redirects from `/` and `/w/$ws`, and `unavailable.tsx` (a workspace the desktop gateway cannot reach, or that needs pairing). |
+| `proof-page.tsx` | The data layer's proof page, a dev-only route at `/dev/proof`. |
+| `gateway-navigate.ts` | `gateway://navigate` (deep links, the app's own notifications), in the desktop only: `parseNavigateTarget` and `navigateHref` are the pure checks, `useGatewayNavigation()` wires them to the router. See "Navigating from outside the window" below. |
+| `notice.tsx` | `<Notice>`: a brief, dismissible message with nowhere better to show (an unknown-workspace deep link, today), from `useShell`'s `notice`. Mounted once, at the root, above `/`'s redirect. |
 
 ## Workspaces in the desktop app
 
@@ -30,8 +33,27 @@ the desktop app"):
 - a workspace that is `unreachable` or `needs_pairing` keeps the frame (so another is one click
   away) and shows why in the main area, with the gateway's `detail`; the top bar's pill says so;
 - `/` opens the workspace last opened, or the first ready one; an id the gateway does not list
-  is not found.
-| `proof-page.tsx` | The data layer's proof page, a dev-only route at `/dev/proof`. |
+  is not found;
+- a workspace out of view for 10 minutes has its stream closed, resumed with `since` when it is
+  opened again (`src/data/README.md`, "Workspaces in the desktop app").
+
+## Navigating from outside the window
+
+`gateway://navigate` (`docs/build/contracts/desktop-gateway.md`), in the desktop only: a deep link
+or a click on the app's own notifications gives a typed `NavigateTarget`
+(`{ workspace, kind, id? }`), already shape-checked by the gateway. `gateway-navigate.ts` checks it
+again — `parseNavigateTarget` (the workspace is a ULID, `kind` is one of the five, `id` is required
+unless `kind` is `inbox`) — and maps it to a route with `paths.inbox`/`task`/`session`/`project`/
+`workstreamById` (`navigateHref`), never by treating a field as a URL or a path to concatenate.
+Anything that does not parse is dropped and logged, shortened; a well-formed target whose workspace
+the gateway does not currently list goes to `/` with a notice (`store.ts`'s `notice`, shown by
+`<Notice>`) instead of guessing a path for it. `useGatewayNavigation()` wires this to the router and
+is mounted once, in `routes.tsx`'s root component.
+
+A target that arrives at launch, before the gateway's workspace list is first known, is never
+checked against a stale (empty) list: the data layer holds it — up to 60 seconds, the contract's
+own limit, after which it is dropped — and only calls `useGatewayNavigate`'s listener once the list
+has arrived, with that list (`src/data/README.md`, `desktop.tsx`).
 
 ## Registering a feature
 

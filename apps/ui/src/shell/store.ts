@@ -30,6 +30,8 @@ interface Transient {
   creating: string | null;
   /** What had focus before that dialog opened, to give focus back to. */
   creatingFrom: Element | null;
+  /** A brief message with nowhere better to show (an unknown-workspace deep link, say). */
+  notice: string | null;
 }
 
 interface Actions {
@@ -43,6 +45,7 @@ interface Actions {
   setPaletteOpen(open: boolean): void;
   /** Opens a "+ New" dialog, or closes it with null. `from` gets focus back when it closes. */
   setCreating(id: string | null, from?: Element | null): void;
+  setNotice(notice: string | null): void;
 }
 
 export type ShellState = Persisted & Transient & Actions;
@@ -57,6 +60,7 @@ export const initialShellState: Persisted & Transient = {
   paletteOpen: false,
   creating: null,
   creatingFrom: null,
+  notice: null,
 };
 
 function prefs(state: Persisted, ws: string): WorkspacePrefs {
@@ -87,6 +91,7 @@ export const useShell = create<ShellState>()(
       setCreating: (creating, from = null) =>
         // Closing keeps `creatingFrom`: the dialog reads it as it hands focus back.
         set((s) => ({ creating, creatingFrom: creating === null ? s.creatingFrom : from })),
+      setNotice: (notice) => set({ notice }),
     }),
     {
       name: 'pitcrew.shell',
