@@ -10,10 +10,11 @@ See `docs/build/streams/L.md`, `docs/build/contracts/api-v1.md` and
 | `gateway.ts` | The desktop transport: the gateway's commands and channels, exactly as the contract says. No token, header or `VITE_*` value. |
 | `desktop.tsx` | The desktop app's workspaces: `gateway_workspaces()` and `gateway://workspaces`, and one data scope per workspace (`Workspaces`, `<WorkspacesProvider>`). With `gateway.ts` and `@tauri-apps/api`, loaded only in the desktop app, by dynamic import; elsewhere import from them with `import type` only. |
 | `workspaces.tsx` | What the shell sees of them: `useGatewayWorkspaces()` (`null` in a browser), `<WorkspaceScope ws>`, and the gateway's types. |
-| `root.tsx` | `<AppData>`: picks the transport once, at start. In a browser, `<DataProvider>` over `browserTransport` with `config.ts`; in the desktop app, it loads `desktop.tsx`. |
+| `root.tsx` | `<AppData>`: picks the data layer once, at start, and loads it on demand: `desktop.tsx` in the desktop app; `browser.tsx` in a browser, in development only. A production build outside the desktop app fails closed: an error screen, no request. |
+| `browser.tsx` | The browser's data layer (development): `<DataProvider>` over `browserTransport` with `config.ts`. Never loaded in the desktop app; not in production builds. |
 | `errors.ts` | `ApiError { code, status }`, and `GatewayError` (an `ApiError` with status 0 and the gateway's own `gateway` code). |
 | `api.ts` | `createApi({ transport })` (or `{ baseUrl, token, fetch }`, which makes a browser transport): every failure is an `ApiError` (status 0 when unreachable, `internal` for a 2xx without JSON). Reads for every list in the contract, one `events` page, transcript pages; writes for projects and workstreams (create), tasks (create, patch, move, assign, subtasks, comment, dispatch), asks (answer), briefs (edit, pin, accept) and sessions (send, keys, interrupt, end). |
-| `config.ts` | `browserConfig()`: `VITE_PITCREW_API` (default `http://127.0.0.1:47317`) and `VITE_PITCREW_TOKEN` (default `dev-device-token`), dev server only; any build fails while the token is set. Called only in a browser. |
+| `config.ts` | `browserConfig()`: `VITE_PITCREW_API` (default `http://127.0.0.1:47317`) and `VITE_PITCREW_TOKEN` (default `dev-device-token`), dev server only; any build fails while the token is set. Loaded only by `browser.tsx`. The only file that may read `import.meta.env` (ESLint; `import.meta.env.DEV` is allowed anywhere). |
 | `types.ts` | Hand-written wire types mirroring the serde names, until generated types exist: the model, `Brief`, `EventsPage` (alias `ActivityPage`), transcripts (`TranscriptItem`, `TranscriptPage`, `PlanItem`), `Key`, `EndMode`, and request bodies. `EVENT_TYPES` lists every `EventBody` type, `TRANSCRIPT_KINDS` every transcript item kind. |
 | `keys.ts` | Query keys. Lists and details sit under separate prefixes (`['tasks', 'list', filters]`, `['tasks', 'detail', id]`). |
 | `stream.ts` | `StreamClient({ transport })`: resume by `since`, reset when `since` is ahead of `hello.rev`, when `hello.log` changes, or on a revision gap; capped back-off that starts over only after a stable connection; reconnect after 60 s of silence, or at once with `retryNow()`. `streamPath()`, `terminalPath()`. No React. |
@@ -28,8 +29,9 @@ See `docs/build/streams/L.md`, `docs/build/contracts/api-v1.md` and
 `<AppData>` (in `main.tsx`) picks one transport at start and nothing else changes for features:
 they call `useApi()`, `useLiveQuery()` and `useOpenSocket()` either way.
 
-- **Browser** (development): `fetch` and `WebSocket` to `VITE_PITCREW_API`, with the dev token as
-  `Authorization: Bearer` and as the `pitcrew.bearer.` subprotocol.
+- **Browser** (development only): `fetch` and `WebSocket` to `VITE_PITCREW_API`, with the dev
+  token as `Authorization: Bearer` and as the `pitcrew.bearer.` subprotocol. A production build
+  opened in a browser shows an error screen and reaches no daemon.
 - **Desktop app**: `gateway_request`, `gateway_socket_open`/`send`/`close` and
   `gateway_workspaces`, through `@tauri-apps/api` (loaded on demand; `pnpm size` fails if it
   reaches the initial JS). **No token, `Authorization` header or `VITE_PITCREW_*` value is read
@@ -60,8 +62,12 @@ frame). We chose this over putting the workspace in every key because:
 
 A workspace's stream keeps running in the background once opened, so switching back shows a
 fresh cache at once. When the gateway marks a workspace `ready` again, its stream reconnects at
-once. A workspace that is `unreachable` or `needs_pairing` shows that state in the frame, not a
-spinner.
+once (also when a connection attempt was still out). A workspace that is `unreachable` or
+`needs_pairing` shows that state in the frame, not a spinner.
+
+The gateway emits `gateway://workspaces` only on changes, so a failed `gateway_workspaces()` is
+read again with back-off (1 s doubling to 30 s) until the list is known; the shell shows the error
+with a Retry button (`useGatewayWorkspaces().retry()`).
 
 ## Sockets for features: `useOpenSocket()`
 
@@ -71,17 +77,29 @@ The console's terminal (stream M) opens its socket through the same transport as
 import { terminalPath, useOpenSocket } from '../data/index.ts';
 
 const open = useOpenSocket();
-const socket = open(terminalPath(session, { cols, rows, from }));
-socket.onmessage = ({ data }) => (typeof data === 'string' ? control(data) : write(new Uint8Array(data as ArrayBuffer)));
-socket.onclose = (close) => reconnectUnless(close?.code === 1000); // 1013: reconnect with `from`
-socket.send(new TextEncoder().encode('ls\r'));                  // keystrokes: a binary frame
-socket.send(JSON.stringify({ type: 'resize', cols, rows }));    // control: a text frame
-socket.close();
+useEffect(() => {
+  const socket = open(terminalPath(session, { cols, rows, from }));
+  socket.onmessage = ({ data }) => (typeof data === 'string' ? control(data) : write(new Uint8Array(data as ArrayBuffer)));
+  socket.onclose = (close) => reconnectUnless(close?.code === 1000); // 1011, 1013, 1006: reconnect with `from`
+  socket.send(new TextEncoder().encode('ls\r'));                    // keystrokes: a binary frame
+  socket.send(JSON.stringify({ type: 'resize', cols, rows }));      // control: a text frame
+  return () => {
+    // Detach first, as StreamClient.stop() does: the close we ask for is still reported to
+    // `onclose`, which would otherwise reconnect after the component has gone.
+    socket.onopen = socket.onmessage = socket.onerror = socket.onclose = null;
+    socket.close();
+  };
+}, [open, session]);
 ```
 
-`TransportSocket` behaves the same in both transports: `onopen`, `onmessage` (text as strings,
-binary as `ArrayBuffer`s), `onerror`, `onclose({ code, reason, error? })` once and last; `send()`
-before it opens waits for it, in order; `close()` before it opens sends nothing.
+`TransportSocket` behaves the same in both transports:
+- `onopen`; `onmessage` (text as strings, binary as `ArrayBuffer`s); `onerror`;
+  `onclose({ code, reason, error? })`, once and last, **also after your own `close()`**. Set the
+  handlers to `null` before closing a socket you are done with.
+- `send()` before it opens waits for it, in order; `close()` before it opens sends nothing.
+- In the desktop app, a frame the gateway refuses ends the socket with 1011 (the frames after it
+  are dropped, not sent with a hole before them), and a close the gateway cannot do ends it with
+  1006. Either way, reconnect.
 
 ## Rules for features
 
