@@ -31,14 +31,27 @@ impl ReplayBuffer {
         }
     }
 
+    /// Resume absolute numbering at `offset`, with the default capacity.
+    pub fn starting_at(offset: u64) -> Self {
+        Self::with_capacity_at(DEFAULT_CAPACITY, offset)
+    }
+
+    /// Resume numbering with an explicit history capacity.
+    pub fn with_capacity_at(capacity: usize, offset: u64) -> Self {
+        Self {
+            end: offset,
+            ..Self::new(capacity)
+        }
+    }
+
     /// Append output, retaining only the newest `capacity` bytes.
     ///
-    /// Panics if the lifetime output length would exceed `u64::MAX` bytes.
+    /// At `u64::MAX`, numbering saturates and unaddressable bytes are discarded.
+    /// Retained bytes keep their original offsets; further appends are no-ops.
     pub fn append(&mut self, bytes: &[u8]) {
-        self.end = self
-            .end
-            .checked_add(bytes.len() as u64)
-            .expect("terminal output offset overflow");
+        let next_end = self.end.saturating_add(bytes.len() as u64);
+        let bytes = &bytes[..(next_end - self.end) as usize];
+        self.end = next_end;
         if bytes.len() >= self.capacity {
             self.data.clear();
             self.data.extend(&bytes[bytes.len() - self.capacity..]);

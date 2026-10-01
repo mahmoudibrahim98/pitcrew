@@ -87,6 +87,8 @@ A fresh hub has a device token but no person, no machine and no name. The deskto
   - `person.name` is 1–80 characters;
   - `person.handle` is `@` followed by 1–32 of `a-z 0-9 _ -`;
   - `machine_name` is 1–60 characters.
+  - The three names are counted in Unicode code points after trimming whitespace, and stored
+    trimmed. The handle is not trimmed.
   - None of them may contain control characters. Anything else is `400 invalid`.
 - **Once only:** `409 conflict` when the workspace already has a person, or when the handle is
   taken. An agent token gets `403`.

@@ -29,7 +29,7 @@ use axum::http::StatusCode;
 use axum::http::header::{CONTENT_TYPE, HeaderName};
 use axum::http::request::Parts;
 use axum::routing::{get, patch, post, put};
-use pitcrew_protocol::api::{Caller, NewProject, NewTask, NewWorkstream};
+use pitcrew_protocol::api::{Caller, NewProject, NewTask, NewWorkstream, Setup, SetupDone};
 use pitcrew_protocol::events::{BriefTarget, Event};
 use pitcrew_protocol::ids::{AskId, MemberId, ProjectId, SessionId, WorkstreamId};
 use pitcrew_protocol::model::{
@@ -71,6 +71,7 @@ where
 {
     Router::new()
         .route("/v1/workspace", get(get_workspace))
+        .route("/v1/setup", post(post_setup))
         .route("/v1/machines", get(list_machines))
         .route("/v1/personas", get(list_personas))
         .route("/v1/teams", get(list_teams))
@@ -301,6 +302,16 @@ where
 
 async fn get_workspace(Work(w): Work, Person(_): Person) -> Reply<WorkspaceAt> {
     Ok(Json(blocking(w, WorkService::workspace_at).await?))
+}
+
+/// `POST /v1/setup`: the first run of a fresh hub. Device tokens only (`Person` rejects an agent
+/// before the body is read, as the contract's "once only" rules require).
+async fn post_setup(
+    Work(w): Work,
+    Person(caller): Person,
+    Body(setup): Body<Setup>,
+) -> Reply<SetupDone> {
+    Ok(Json(blocking(w, move |w| w.set_up(&caller, setup)).await?))
 }
 
 async fn me(Work(w): Work, Who(caller): Who) -> Reply<Member> {
