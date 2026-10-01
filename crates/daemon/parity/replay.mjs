@@ -4,13 +4,18 @@
 // each test on a fresh server (as the mock's `withServer` does), and prints every check that
 // fails on either side.
 //
-//   node crates/daemon/parity/replay.mjs --pitcrewd <path to pitcrewd> [--json <report.json>]
+//   node crates/daemon/parity/replay.mjs --pitcrewd <path to pitcrewd> [--no-office] [--json <report.json>]
 //
 // The daemon runs `serve --demo --listen tcp:127.0.0.1:0` on a new temporary state directory per
 // test, and its tokens come from `device.token` (the demo's @sam) and `demo-agent.token`
 // (@writer), standing in for the mock's `dev-device-token` and `dev-agent-token`. Checks marked
 // "extra" are not in the mock's tests: they restate a revision-dependent check relative to the
 // server's own log, so the two servers can be compared although their logs differ in length.
+//
+// The mock hub has no back office. The daemon runs one by default, and after a write it may
+// append its own events (the demo's asks are days old by the wall clock, so it reminds @sam of
+// them), racing a check that reads the newest event. `--no-office` passes `--no-office` to the
+// daemon, to compare the hub alone with the mock.
 //
 // Needs Node 24 (it imports the mock hub's TypeScript directly). Exits 0 when it ran, whatever
 // the differences; it is a report, not a test.
@@ -41,11 +46,11 @@ async function startMock() {
   return { url: server.url, device: 'dev-device-token', agent: 'dev-agent-token', close: () => server.close() };
 }
 
-function startDaemon(binary) {
+function startDaemon(binary, { office }) {
   return async () => {
     const state = mkdtempSync(join(tmpdir(), 'pitcrew-parity-'));
     const dir = join(state, 'state');
-    const args = ['--state-dir', dir, 'serve', '--demo', '--listen', 'tcp:127.0.0.1:0'];
+    const args = ['--state-dir', dir, 'serve', '--demo', '--listen', 'tcp:127.0.0.1:0', ...(office ? [] : ['--no-office'])];
     // A script stands in for the binary when checking this file itself.
     const [command, argv] = /\.m?js$/.test(binary) ? [process.execPath, [binary, ...args]] : [binary, args];
     const child = spawn(command, argv, {
@@ -531,13 +536,16 @@ async function runAll(start) {
 const show = (value) => (value === undefined ? 'undefined' : JSON.stringify(value)).slice(0, 160);
 
 async function main() {
-  const { values } = parseArgs({ options: { pitcrewd: { type: 'string' }, json: { type: 'string' } } });
+  const { values } = parseArgs({
+    options: { pitcrewd: { type: 'string' }, 'no-office': { type: 'boolean' }, json: { type: 'string' } },
+  });
   if (!values.pitcrewd) {
-    console.error('usage: node crates/daemon/parity/replay.mjs --pitcrewd <path> [--json <file>]');
+    console.error('usage: node crates/daemon/parity/replay.mjs --pitcrewd <path> [--no-office] [--json <file>]');
     process.exit(2);
   }
+  const office = !values['no-office'];
   const mock = await runAll(startMock);
-  const daemon = await runAll(startDaemon(values.pitcrewd));
+  const daemon = await runAll(startDaemon(values.pitcrewd, { office }));
 
   const rows = [];
   let checks = 0;
@@ -573,7 +581,7 @@ async function main() {
       }
     }
   }
-  console.log(`# Parity: mock hub vs pitcrewd\n`);
+  console.log(`# Parity: mock hub vs pitcrewd (back office ${office ? 'on' : 'off'})\n`);
   console.log(`${Object.keys(TESTS).length} tests, ${checks} checks; ${rows.length} rows differ or fail.\n`);
   console.log('| Test | Check | Expected | Mock hub | pitcrewd |');
   console.log('|---|---|---|---|---|');
