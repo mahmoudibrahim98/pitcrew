@@ -1124,6 +1124,7 @@ name = "pitcrew-fixtures"
 version = "0.0.0"
 dependencies = [
  "pitcrew-protocol",
+ "pitcrew-recap",
  "serde",
  "serde_json",
 ]

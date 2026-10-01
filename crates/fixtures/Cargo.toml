@@ -13,5 +13,10 @@ pitcrew-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+[dev-dependencies]
+# Writes and checks `data/demo-recaps.json`. A dev-dependency only: the recap engine's own tests
+# depend on this crate.
+pitcrew-recap.workspace = true
+
 [lints]
 workspace = true
