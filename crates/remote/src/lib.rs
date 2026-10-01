@@ -11,16 +11,20 @@
 //!   forwarding off and host keys confirmed through the user;
 //! - [`askpass`] brings password, passphrase, one-time-code and host-key prompts to the
 //!   desktop without storing them;
-//! - [`Ssh::probe`] reports what the machine is.
+//! - [`Ssh::probe`] reports what the machine is;
+//! - [`helper`] deploys the static helper there ([`deploy`]) and starts, checks and stops it
+//!   ([`Launcher`]).
 
 pub mod askpass;
 mod config;
+pub mod helper;
 // The crate's only unsafe code: a Job Object for ssh on Windows.
 #[cfg(windows)]
 mod job;
 mod private;
 pub mod probe;
 pub mod quote;
+mod report;
 mod ssh;
 
 pub use askpass::{
@@ -28,9 +32,14 @@ pub use askpass::{
     Secret,
 };
 pub use config::{HostList, home_dir, list_hosts, list_hosts_in};
+pub use helper::{
+    DeployOptions, Deployed, DirectLauncher, Endpoint, Helper, HelperError, HelperState,
+    LaunchOptions, Launcher, Layout, Platform, Started, Status, Stopped, Target, TmuxLauncher,
+    deploy,
+};
 pub use probe::{PROBE_LIMITS, Probe};
 pub use ssh::{
-    DEFAULT_CONNECT_TIMEOUT, Limits, Output, RESOLVE_LIMITS, ResolvedHost, Ssh, SshError,
+    DEFAULT_CONNECT_TIMEOUT, Input, Limits, Output, RESOLVE_LIMITS, ResolvedHost, Ssh, SshError,
 };
 
 /// The protocol version this crate was built against.

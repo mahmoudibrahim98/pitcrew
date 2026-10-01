@@ -18,6 +18,12 @@ name = "fake_ssh"
 path = "tests/fake_ssh.rs"
 harness = false
 
+[[test]]
+# Likewise: the fake `ssh`, `pitcrewd` and hash tools are this binary.
+name = "deploy"
+path = "tests/deploy.rs"
+harness = false
+
 [dependencies]
 pitcrew-protocol.workspace = true
 serde.workspace = true
