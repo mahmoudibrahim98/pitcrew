@@ -2,18 +2,20 @@
 //!
 //! Start:
 //! 1. The token registry, which locks the state directory: a second daemon stops here.
-//! 2. The store with the work model's projections, to learn the workspace (`workspace.json` holds
-//!    its name) and, with `--demo`, to refuse a store with data. Unless `--no-office`, also who
-//!    the back office acts as, `@office` ([`crate::office::member`]); when it can run, the store
-//!    is opened again with the office's run log as well, which needs that member. When it cannot,
-//!    `office.json` is removed.
+//! 2. The store, opened once, with the work model's projections, to learn the workspace
+//!    (`workspace.json` holds its name) and, with `--demo`, to refuse a store with data. Unless
+//!    `--no-office`, also who the back office acts as, `@office` ([`crate::office::member`]); when
+//!    it can run, the office's run log, which needs that member, is registered on the open store
+//!    (`Store::register`), so a network filesystem's lease is never let go of in between. When it
+//!    cannot, `office.json` is removed.
 //! 3. The one `WorkService` for the store, with the hub's own machine (the workspace's local one).
 //!    It has no dispatcher until the runner link exists, so a dispatch answers 503 and records
 //!    nothing.
 //! 4. With `--demo`: mint the tokens, seed the demo workspace.
 //! 5. The device token: reused from `device.token` while it still verifies, else minted.
-//! 6. The back office's loop, the routes (`RouterParts`, with the activity index), the listener,
-//!    and one line on stdout: `pitcrewd listening on <where>`.
+//! 6. The recap index's warm-up on the blocking pool, not waited for; the back office's loop; the
+//!    routes (`RouterParts`, with the activity index and the recaps); the listener; and one line
+//!    on stdout: `pitcrewd listening on <where>`.
 //!
 //! Stop (Ctrl+C or Ctrl+Break, or SIGTERM or SIGHUP on Unix): the server stops accepting and
 //! finishes in-flight requests (`pitcrew-api` closes open WebSockets with 1001) while the back
@@ -23,13 +25,14 @@
 use crate::cli::{ListenArg, ServeArgs};
 use crate::no_runner::NoRunner;
 use crate::office::Office;
+use crate::recaps::WorkRecaps;
 use crate::refs::WorkRefs;
 use crate::state::{StateDir, read_token, read_workspace, write_token, write_workspace};
 use anyhow::{Context as _, bail};
 use axum::Extension;
 use pitcrew_api::{
-    Activity, Bound, EventRefs, EventSource, HookIntake, Listen, LogHookSink, RouterParts,
-    StoreSource, StreamConfig, TerminalConfig, Terminals,
+    Activity, Bound, EventRefs, EventSource, HookIntake, Listen, LogHookSink, RecapSource, Recaps,
+    RouterParts, StoreSource, StreamConfig, TerminalConfig, Terminals,
 };
 use pitcrew_auth::{FileTokenStore, TokenError, TokenStore};
 use pitcrew_fixtures::DemoWorkspace;
@@ -104,6 +107,16 @@ struct Hub {
 /// Steps 1–5: the token registry, the store, the workspace and its service, the back office's
 /// member, the demo, the device token. Without `office`, the back office does not run.
 fn open(state: &StateDir, demo: bool, office: bool) -> anyhow::Result<Hub> {
+    open_with(state, demo, office, StoreOptions::default())
+}
+
+/// [`open`], with the store opened with `options` (tests force a network filesystem's mode).
+fn open_with(
+    state: &StateDir,
+    demo: bool,
+    office: bool,
+    options: StoreOptions,
+) -> anyhow::Result<Hub> {
     let tokens = match FileTokenStore::open(state.root()) {
         Ok(tokens) => Arc::new(tokens),
         Err(TokenError::Locked { path }) => bail!(
@@ -120,9 +133,9 @@ fn open(state: &StateDir, demo: bool, office: bool) -> anyhow::Result<Hub> {
     };
 
     let path = state.store();
-    // The work model alone first: the back office's run log needs its member before the store
-    // opens with it, and the member may have to be found or added in the store.
-    let store = open_store(&path, pitcrew_hub_work::projections())?;
+    // The work model alone first: the back office's run log needs its member, which may have to
+    // be found or added in the store, so it is registered once that is done.
+    let store = open_store(&path, options, pitcrew_hub_work::projections())?;
     let latest = store.latest_rev().context("cannot read the store")?;
 
     let demo = if demo {
@@ -147,21 +160,20 @@ fn open(state: &StateDir, demo: bool, office: bool) -> anyhow::Result<Hub> {
     };
     // Built once: its run log in the store and `run_office` must use the same settings.
     let back_office = member.map(|m| Arc::new(BackOffice::new(m)));
-    let store = match &back_office {
-        Some(back_office) => {
-            // Closed first, so this process has one connection to the file again.
-            drop(store);
-            open_store(
-                &path,
-                pitcrew_hub_work::projections_with_office(back_office),
-            )?
-        }
-        None => {
-            // Whatever is appended while the office is off is never acted on later.
-            crate::office::forget(state);
-            store
-        }
-    };
+    match &back_office {
+        // On the store as it is open, so a network filesystem's lease is held throughout. The run
+        // log catches up as it would at an open, over a `member_added` just appended too.
+        Some(back_office) => store
+            .register(Box::new(back_office.run_log()))
+            .with_context(|| {
+                format!(
+                    "cannot add the back office's run log to the store {}",
+                    path.display()
+                )
+            })?,
+        // Whatever is appended while the office is off is never acted on later.
+        None => crate::office::forget(state),
+    }
     let store = Arc::new(store);
 
     // The one writer of this store (hub-work's "One writer"): everything shares this `Arc`.
@@ -217,8 +229,12 @@ fn open(state: &StateDir, demo: bool, office: bool) -> anyhow::Result<Hub> {
 }
 
 /// Opens the store at `path` with `projections`.
-fn open_store(path: &Path, projections: Vec<Box<dyn Projection>>) -> anyhow::Result<Store> {
-    Store::open_with(path, StoreOptions::default(), projections)
+fn open_store(
+    path: &Path,
+    options: StoreOptions,
+    projections: Vec<Box<dyn Projection>>,
+) -> anyhow::Result<Store> {
+    Store::open_with(path, options, projections)
         .with_context(|| format!("cannot open the store {}", path.display()))
 }
 
@@ -382,6 +398,7 @@ async fn run(
     } = hub;
     let mut stop = Stop::listen().context("cannot listen for stop signals")?;
     let office_work = Arc::clone(&work);
+    warm_up_recaps(&work);
 
     let events: Arc<dyn EventSource> =
         Arc::new(StoreSource::new(Arc::clone(&store), store.log_id()));
@@ -390,6 +407,9 @@ async fn run(
     let terminals: Arc<dyn Terminals> = Arc::new(NoRunner::new(Arc::clone(&work)));
     // The activity index (`project=`, `workstream=`, and wider `task=` and `session=` matches).
     let refs: Arc<dyn EventRefs> = Arc::new(WorkRefs(Arc::clone(&work)));
+    // The recap index (`GET /v1/recaps/blocks` and `/days`), kept current on every query.
+    let index: Arc<WorkService> = Arc::clone(&work);
+    let recaps: Arc<dyn RecapSource> = Arc::new(WorkRecaps(index));
     let parts = RouterParts::new()
         .agent(pitcrew_api::hooks::routes(hooks))
         .agent(pitcrew_hub_work::agent_routes().layer(Extension(Arc::clone(&work))))
@@ -398,6 +418,7 @@ async fn run(
             StreamConfig::default(),
         ))
         .device(Activity::new(events).with_refs(refs).routes())
+        .device(Recaps::new(recaps).routes())
         .device(pitcrew_api::terminal::routes(
             terminals,
             TerminalConfig::default(),
@@ -481,6 +502,31 @@ async fn run(
     drop(tokens);
     close_store(store).await;
     failed.map_or(Ok(()), Err)
+}
+
+/// Builds the recap index once, on the blocking pool, so the first recap request does not read the
+/// whole log itself (hub-work's "Wiring"). Not waited for: a recap request meanwhile waits for the
+/// index and finds it built, and if building fails (logged), the next request goes on from where it
+/// stopped, as every query catches the index up with the log anyway.
+fn warm_up_recaps(work: &Arc<WorkService>) {
+    let work = Arc::clone(work);
+    // Detached: the index is the service's, and it is done when it is done.
+    drop(tokio::task::spawn_blocking(move || {
+        let started = Instant::now();
+        match work.sync_recaps() {
+            Ok(rev) => tracing::info!(
+                rev,
+                ms = started.elapsed().as_millis(),
+                "built the recap index"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                ms = started.elapsed().as_millis(),
+                "building the recap index failed; the first recap request goes on from where it \
+                 stopped"
+            ),
+        }
+    }));
 }
 
 /// Waits for the server to finish, at most [`DRAIN`].
@@ -930,6 +976,103 @@ mod tests {
         let saved: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(state.office()).unwrap()).unwrap();
         assert_eq!(saved["done"], latest);
+    }
+
+    /// The store's single-host lease (network mode) is taken once, when the store opens, and held
+    /// until it closes: the back office's run log is registered on the open store, while the office
+    /// starts, runs and acts, instead of a second open that would let go of the lease for a moment.
+    ///
+    /// Generation numbers alone cannot show that: a store that lets go of its lease deletes its
+    /// own generation file, so taking it again on a free path takes the same generation. What does
+    /// show it is the lease's clock, which is read once per acquisition (and by the renewal thread,
+    /// but only every `lease_ttl / 3`, an hour here), and the lease file, the same throughout.
+    #[test]
+    fn the_lease_is_taken_once_and_held_while_the_office_runs() {
+        use pitcrew_hub_work::TaskRef;
+        use pitcrew_protocol::model::{DispatchOutcome, TaskStatus};
+        use pitcrew_store::{Clock, FsMode, SystemClock};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// The system clock, counting how often it is read.
+        #[derive(Debug, Default)]
+        struct Counting(AtomicUsize);
+        impl Clock for Counting {
+            fn now_ms(&self) -> i64 {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                SystemClock.now_ms()
+            }
+        }
+
+        let (_tmp, state) = state();
+        let clock = Arc::new(Counting::default());
+        let mut options = StoreOptions::default();
+        options.fs = FsMode::Network;
+        options.lease_ttl = Duration::from_secs(3 * 60 * 60);
+        options.clock = Arc::clone(&clock) as Arc<dyn Clock>;
+        let acquired = || clock.0.load(Ordering::SeqCst);
+        // Every lease file of the store, with what it holds.
+        let leases = || -> Vec<(String, String)> {
+            let mut found: Vec<(String, String)> = std::fs::read_dir(state.root())
+                .unwrap()
+                .map(|e| e.unwrap())
+                .filter(|e| e.file_name().to_string_lossy().starts_with("hub.db.lease."))
+                .map(|e| {
+                    let text = std::fs::read_to_string(e.path()).unwrap();
+                    (e.file_name().to_string_lossy().into_owned(), text)
+                })
+                .collect();
+            found.sort();
+            found
+        };
+
+        let Hub {
+            tokens,
+            store,
+            work,
+            office,
+        } = open_with(&state, true, true, options).unwrap();
+        assert_eq!(acquired(), 1, "the lease was taken more than once");
+        let held = leases();
+        assert_eq!(held.len(), 1, "{held:?}");
+        assert_eq!(held[0].0, "hub.db.lease.1");
+        let lease: serde_json::Value = serde_json::from_str(&held[0].1).unwrap();
+        assert_eq!(lease["pid"], std::process::id());
+
+        // The office starts, and acts through the store: its run log is registered.
+        let demo = pitcrew_fixtures::demo_workspace().unwrap();
+        let sam = demo_person(&demo).unwrap();
+        let writer: MemberId = "01JB000000000000000MEM0002".parse().unwrap();
+        let pap1 = TaskRef::parse("PAP-1").unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let running = office.unwrap().spawn(Arc::clone(&work));
+            append(
+                work.store(),
+                work.workspace(),
+                writer,
+                Some(sam),
+                vec![EventBody::DispatchFinished {
+                    dispatch: "01JB000000000000000DSP0001".parse().unwrap(),
+                    outcome: DispatchOutcome::Succeeded,
+                    summary: None,
+                }],
+            );
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while work.task(&pap1).unwrap().status != TaskStatus::Review {
+                assert!(Instant::now() < deadline, "PAP-1 never moved to review");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            running.stop(Duration::from_secs(20)).await;
+        });
+        assert_eq!(acquired(), 1, "the lease was taken again");
+        assert_eq!(leases(), held, "the lease changed hands");
+
+        // Closing the store lets go of it.
+        drop((work, store, tokens));
+        assert!(leases().is_empty(), "{:?}", leases());
     }
 
     /// `office.json` as JSON, if it is a file.

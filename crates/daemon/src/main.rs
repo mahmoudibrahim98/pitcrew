@@ -19,6 +19,7 @@ mod cli;
 mod cors;
 mod no_runner;
 mod office;
+mod recaps;
 mod refs;
 mod serve;
 mod state;
