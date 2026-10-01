@@ -1,7 +1,7 @@
 // Facet filters for the session list: machine, engine, state, project and workstream. Controlled:
 // the caller keeps the value and passes it to `SessionList`.
 
-import { useId, type ReactNode } from 'react';
+import { useId, useRef, type ReactNode } from 'react';
 import { useMachines, type Engine, type SessionState } from '../data/index.ts';
 import { cx } from '../lib/cx.ts';
 import { useConsoleSessions } from './data.ts';
@@ -29,6 +29,13 @@ export interface SessionFiltersProps {
 export function SessionFilters({ value, onChange, className }: SessionFiltersProps) {
   const { all, places } = useConsoleSessions();
   const machines = useMachines();
+  const root = useRef<HTMLDivElement>(null);
+
+  const clear = () => {
+    onChange(NO_FACETS);
+    // The Clear button goes away; focus stays in the filters rather than falling to the page.
+    root.current?.querySelector<HTMLInputElement>('input[type="checkbox"]')?.focus();
+  };
 
   const counts = (name: FacetName) => {
     const map = new Map<string, number>();
@@ -98,15 +105,16 @@ export function SessionFilters({ value, onChange, className }: SessionFiltersPro
   ];
 
   return (
-    <div className={cx('flex flex-col gap-4 p-3 text-sm', className)} role="group" aria-label="Session filters">
+    <div
+      ref={root}
+      className={cx('flex flex-col gap-4 p-3 text-sm', className)}
+      role="group"
+      aria-label="Session filters"
+    >
       <div className="flex items-center justify-between">
         <span className="text-xs font-semibold tracking-wide text-ink-2 uppercase">Filters</span>
         {hasFacets(value) && (
-          <button
-            type="button"
-            className="rounded-sm px-1.5 text-xs text-accent-text hover:bg-hover"
-            onClick={() => onChange(NO_FACETS)}
-          >
+          <button type="button" className="rounded-sm px-1.5 text-xs text-accent-text hover:bg-hover" onClick={clear}>
             Clear
           </button>
         )}

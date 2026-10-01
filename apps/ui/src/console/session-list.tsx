@@ -194,7 +194,7 @@ export function SessionListView(props: SessionListViewProps) {
 
   if (rows.length === 0) {
     return (
-      <div className={cx('flex h-full items-center justify-center p-6 text-sm text-muted', props.className)}>
+      <div className={cx('flex h-full items-center justify-center p-6 text-sm text-ink-2', props.className)}>
         {props.empty ?? 'No sessions.'}
       </div>
     );
@@ -261,10 +261,10 @@ function GroupHeader({ row }: { row: Extract<ListRow, { type: 'project' | 'works
   return row.type === 'project' ? (
     <div className="flex h-full items-end gap-2 px-3 pb-1 text-xs font-semibold tracking-wide text-ink-2 uppercase">
       <span className="truncate">{row.label}</span>
-      <span className="font-normal text-muted">{row.count}</span>
+      <span className="font-normal text-ink-2">{row.count}</span>
     </div>
   ) : (
-    <div className="flex h-full items-center gap-2 pr-3 pl-5 text-xs text-muted">
+    <div className="flex h-full items-center gap-2 pr-3 pl-5 text-xs text-ink-2">
       <span className="truncate">{row.label}</span>
       <span>{row.count}</span>
     </div>
@@ -298,13 +298,13 @@ function SessionRow(props: {
       )}
     >
       <div className="flex min-w-0 items-center gap-2">
-        <span className="shrink-0 font-mono text-[10px] tracking-wide text-muted uppercase">
+        <span className="shrink-0 font-mono text-[10px] tracking-wide text-ink-2 uppercase">
           {ENGINE_LABEL[session.engine]}
         </span>
         <span className={cx('min-w-0 flex-1 truncate text-sm font-medium', session.state === 'ended' && 'text-ink-2')}>
           {sessionTitle(session)}
         </span>
-        <time dateTime={new Date(session.last_activity).toISOString()} className="shrink-0 text-xs text-muted">
+        <time dateTime={new Date(session.last_activity).toISOString()} className="shrink-0 text-xs text-ink-2">
           {relativeTime(session.last_activity, props.now)}
         </time>
       </div>
@@ -319,7 +319,7 @@ function SessionRow(props: {
           <>
             <StatusPill tone={state.tone}>{state.label}</StatusPill>
             {session.status_line !== undefined && (
-              <span className="min-w-0 truncate text-muted">{session.status_line}</span>
+              <span className="min-w-0 truncate text-ink-2">{session.status_line}</span>
             )}
           </>
         )}
@@ -350,7 +350,7 @@ export function SessionList(props: SessionListProps) {
     );
   }
   if (isPending) {
-    return <p className="p-6 text-sm text-muted">Loading sessions…</p>;
+    return <p className="p-6 text-sm text-ink-2">Loading sessions…</p>;
   }
   return (
     <SessionListView

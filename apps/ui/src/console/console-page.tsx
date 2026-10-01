@@ -7,7 +7,16 @@
 // the arrow keys choose the session shown beside it; Enter opens it and goes to the composer.
 
 import { defaultStringifySearch, useParams, useRouter, useSearch } from '@tanstack/react-router';
-import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode, type RefObject } from 'react';
+import {
+  useEffect,
+  useEffectEvent,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactNode,
+  type RefObject,
+} from 'react';
 import { ApiError, useSession, type Session } from '../data/index.ts';
 import { Badge, Button, ChevronRightIcon, ConsoleIcon, Kbd, ResizablePanel } from '../design/index.ts';
 import { paths, useWorkspaceId } from '../shell/index.ts';
@@ -42,23 +51,35 @@ const find = (root: HTMLElement | null, selector: string) => root?.querySelector
 /** Whether the console is narrower than `NARROW_BELOW`: one pane at a time. */
 function useNarrow(root: RefObject<HTMLElement | null>): boolean {
   const [narrow, setNarrow] = useState(false);
-  useEffect(() => {
+  useLayoutEffect(() => {
     const element = root.current;
-    if (element === null || typeof ResizeObserver !== 'function') return;
-    // The observer reports the first size as soon as it starts.
-    const observer = new ResizeObserver(() => {
+    if (element === null) return;
+    // A width of 0 is no layout at all (a hidden tab, a test), not a narrow console.
+    const measure = () => {
       const width = element.clientWidth;
       setNarrow(width > 0 && width < NARROW_BELOW);
-    });
+    };
+    // Measured before the first paint, so a narrow window does not flash the wide layout.
+    measure();
+    if (typeof ResizeObserver !== 'function') return;
+    const observer = new ResizeObserver(measure);
     observer.observe(element);
     return () => observer.disconnect();
   }, [root]);
   return narrow;
 }
 
+/** Focus is nowhere in particular: on the page itself, as a closing palette or dialog leaves it. */
+const adrift = () => {
+  const active = document.activeElement;
+  return active === null || active === document.body || active.tagName === 'MAIN';
+};
+
 /**
- * Focuses an element that may not be on screen yet (a pane still loading). It waits a moment
- * first, so it lands after the palette or a dialog has handed focus back, then retries for a while.
+ * Focuses an element that may not be on screen yet (a pane still loading), retrying for a while.
+ * The palette hands focus back to the page as it closes, which can come after a command has run,
+ * so for two seconds focus that drifts back to the page is put back; focus moved anywhere else
+ * stays where it was moved.
  */
 function useFocusSoon(): (target: () => HTMLElement | null, fallback?: () => HTMLElement | null) => void {
   const timer = useRef<number | undefined>(undefined);
@@ -66,11 +87,18 @@ function useFocusSoon(): (target: () => HTMLElement | null, fallback?: () => HTM
   return (target, fallback) => {
     window.clearTimeout(timer.current);
     let tries = 0;
+    let placed: HTMLElement | null = null;
     const attempt = () => {
       tries += 1;
-      const element = target() ?? (tries >= 12 ? fallback?.() : null);
-      if (element != null) element.focus();
-      else if (tries < 40) timer.current = window.setTimeout(attempt, 50);
+      if (placed === null) {
+        placed = target() ?? (tries >= 12 ? (fallback?.() ?? null) : null);
+        placed?.focus();
+      } else if (adrift()) {
+        // The element may have been drawn afresh since (the list as its filters change).
+        if (!placed.isConnected) placed = target() ?? placed;
+        placed.focus();
+      }
+      if (tries < 40) timer.current = window.setTimeout(attempt, 50);
     };
     timer.current = window.setTimeout(attempt, 50);
   };
@@ -137,14 +165,20 @@ export function ConsolePage() {
     }
     focusSoon(() => find(root.current, PANE_FOCUS.list));
   };
-  useEffect(() => {
-    const run = () => {
-      const intent = takeIntent();
-      if (intent !== undefined) apply(intent);
-    };
-    run();
-    return onIntent(run);
+  const takeRequest = useEffectEvent(() => {
+    const intent = takeIntent();
+    if (intent !== undefined) apply(intent);
   });
+  useEffect(() => {
+    // A tick after mounting, so that a mount React undoes at once (Strict Mode, in development)
+    // leaves the request to the mount that stays.
+    const timer = window.setTimeout(() => takeRequest(), 0);
+    const off = onIntent(() => takeRequest());
+    return () => {
+      window.clearTimeout(timer);
+      off();
+    };
+  }, []);
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key !== 'F6' || event.ctrlKey || event.metaKey || event.altKey) return;

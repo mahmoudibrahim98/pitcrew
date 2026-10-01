@@ -1,5 +1,5 @@
 // The Agent console's public surface. `feature` registers it with the shell (src/shell/README.md):
-// the routes `console` and `console/$session`, palette commands and a "+ New" item. The app loads
+// the routes `console` and `console/$session`, and palette commands. The app loads
 // this file at start, so it stays small: the page and every component are lazy chunks (render the
 // components inside a <Suspense>), and markdown and diff parsing run in their own worker chunk.
 
@@ -88,17 +88,9 @@ export const feature = defineFeature({
   layout: 'console',
   routes,
   // The shell's own "Agent console" entry (with its working and waiting counts) is the console's
-  // place in the sidebar; the console adds none of its own.
+  // place in the sidebar; the console adds none of its own. No "+ New" item yet: starting a
+  // session needs a flow that does not exist, and an entry cannot be shown disabled with a reason.
   commands: commands.map((command) => ({ ...command, layout: 'both' })),
-  create: [
-    {
-      id: 'session',
-      label: 'Session',
-      title: 'New session',
-      order: 25,
-      dialog: lazy(() => import('./new-session.tsx')),
-    },
-  ],
 });
 
 export const SessionList = lazy(() => import('./session-list.tsx').then((m) => ({ default: m.SessionList })));

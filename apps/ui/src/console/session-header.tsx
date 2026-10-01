@@ -40,7 +40,7 @@ export function SessionHeader(props: SessionHeaderProps) {
 
   if (session.data === undefined) {
     return (
-      <header className={cx('border-b border-line px-4 py-3 text-sm text-muted', props.className)}>
+      <header className={cx('border-b border-line px-4 py-3 text-sm text-ink-2', props.className)}>
         {session.error !== null ? 'Could not load the session.' : 'Loading the session…'}
       </header>
     );
@@ -89,17 +89,17 @@ export function SessionHeader(props: SessionHeaderProps) {
 
       <dl className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-ink-2">
         <div className="flex gap-1">
-          <dt className="text-muted">Engine</dt>
+          <dt className="text-ink-2">Engine</dt>
           <dd>{ENGINE_LABEL[s.engine]}</dd>
         </div>
         {agent !== undefined && (
           <div className="flex gap-1">
-            <dt className="text-muted">Agent</dt>
+            <dt className="text-ink-2">Agent</dt>
             <dd>{agent.handle}</dd>
           </div>
         )}
         <div className="flex gap-1">
-          <dt className="text-muted">Machine</dt>
+          <dt className="text-ink-2">Machine</dt>
           <dd>
             {machine?.name ?? '…'}
             {machine !== undefined && machine.liveness !== 'live' && (
@@ -109,12 +109,12 @@ export function SessionHeader(props: SessionHeaderProps) {
         </div>
         {s.branch !== undefined && (
           <div className="flex gap-1">
-            <dt className="text-muted">Branch</dt>
+            <dt className="text-ink-2">Branch</dt>
             <dd className="font-mono">{s.branch}</dd>
           </div>
         )}
         <div className="flex min-w-0 gap-1">
-          <dt className="text-muted">Folder</dt>
+          <dt className="text-ink-2">Folder</dt>
           <dd className="truncate font-mono" title={s.cwd}>
             {s.cwd}
           </dd>
@@ -169,7 +169,7 @@ function PlaceholderItem({ label, onSelect }: { label: string; onSelect: (() => 
   return (
     <DropdownMenu.Item className={itemClass} disabled={onSelect === undefined} onSelect={() => onSelect?.()}>
       {label}
-      {onSelect === undefined && <span className="text-xs text-muted">Soon</span>}
+      {onSelect === undefined && <span className="text-xs text-ink-2">Soon</span>}
     </DropdownMenu.Item>
   );
 }

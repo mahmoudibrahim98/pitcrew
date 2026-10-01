@@ -64,7 +64,7 @@ export function Composer({ sessionId, className }: ComposerProps) {
   return (
     <div className={cx('border-t border-line bg-card px-3 py-2', className)}>
       {blocked !== undefined && (
-        <p id={reasonId} role="status" className="mb-1.5 text-xs text-muted">
+        <p id={reasonId} role="status" className="mb-1.5 text-xs text-ink-2">
           {blocked}
         </p>
       )}

@@ -1,13 +1,13 @@
 // @vitest-environment happy-dom
 // @vitest-environment-options {"url": "http://localhost:5173/"}
 
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { useState } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Project, Session, Workstream } from '../../data/index.ts';
 import { NO_FACETS, type SessionFacets } from '../facets.ts';
 import { SessionFilters } from '../session-filters.tsx';
-import { SessionList, SessionListView } from '../session-list.tsx';
+import { SessionList, SessionListView, type SelectVia } from '../session-list.tsx';
 import {
   eventually,
   ID,
@@ -102,24 +102,51 @@ describe('SessionList against the mock hub', () => {
 
   it('moves with the keyboard and selects with Enter or a click', async () => {
     hub = await startHub();
-    const onSelect = vi.fn<(session: Session) => void>();
-    renderWithHub(hub, <SessionList onSelect={onSelect} />);
+    const onSelect = vi.fn<(session: Session, via: SelectVia) => void>();
+    const onActiveChange = vi.fn<(session: Session) => void>();
+    renderWithHub(hub, <SessionList onSelect={onSelect} onActiveChange={onActiveChange} />);
     const listbox = await screen.findByRole('listbox', { name: 'Sessions' });
     listbox.focus();
     fireEvent.focus(listbox);
     expect(listbox.getAttribute('aria-activedescendant')).toContain(ID.ses1);
+    // Focus marks a place to start from; it chooses nothing.
+    expect(onActiveChange).not.toHaveBeenCalled();
     fireEvent.keyDown(listbox, { key: 'ArrowDown' });
     expect(listbox.getAttribute('aria-activedescendant')).toContain(ID.ses6);
+    expect(onActiveChange).toHaveBeenLastCalledWith(expect.objectContaining({ id: ID.ses6 }));
     fireEvent.keyDown(listbox, { key: 'End' });
     expect(listbox.getAttribute('aria-activedescendant')).toContain(ID.ses5);
+    expect(onActiveChange).toHaveBeenLastCalledWith(expect.objectContaining({ id: ID.ses5 }));
+    // At the end already: End again reports nothing new.
+    fireEvent.keyDown(listbox, { key: 'End' });
+    expect(onActiveChange).toHaveBeenCalledTimes(2);
     fireEvent.keyDown(listbox, { key: 'Enter' });
-    expect(onSelect).toHaveBeenLastCalledWith(expect.objectContaining({ id: ID.ses5 }));
+    expect(onSelect).toHaveBeenLastCalledWith(expect.objectContaining({ id: ID.ses5 }), 'keyboard');
     fireEvent.keyDown(listbox, { key: 'Home' });
     fireEvent.keyDown(listbox, { key: 'ArrowUp' });
     expect(listbox.getAttribute('aria-activedescendant')).toContain(ID.ses1);
 
     fireEvent.click(rowOf(ID.ses2) as HTMLElement);
-    expect(onSelect).toHaveBeenLastCalledWith(expect.objectContaining({ id: ID.ses2 }));
+    expect(onSelect).toHaveBeenLastCalledWith(expect.objectContaining({ id: ID.ses2 }), 'pointer');
+  });
+
+  it('follows a selection made elsewhere', async () => {
+    hub = await startHub();
+    let choose: (id: string) => void = () => {};
+    function Pane() {
+      const [selected, setSelected] = useState<string>();
+      choose = setSelected;
+      return <SessionList selectedId={selected} onSelect={() => {}} />;
+    }
+    renderWithHub(hub, <Pane />);
+    const listbox = await screen.findByRole('listbox', { name: 'Sessions' });
+    expect(listbox.getAttribute('aria-activedescendant')).toBeNull();
+    act(() => choose(ID.ses3));
+    await eventually(() => expect(listbox.getAttribute('aria-activedescendant')).toContain(ID.ses3));
+    expect(rowOf(ID.ses3)?.getAttribute('aria-selected')).toBe('true');
+    // The arrows carry on from there.
+    fireEvent.keyDown(listbox, { key: 'ArrowDown' });
+    expect(listbox.getAttribute('aria-activedescendant')).toContain(ID.ses4);
   });
 
   it('filters by facets', async () => {

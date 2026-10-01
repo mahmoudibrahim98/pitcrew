@@ -125,7 +125,7 @@ export function QuestionCard(props: QuestionCardProps) {
         props.className,
       )}
     >
-      <div className="mb-1 flex items-center gap-2 text-xs text-muted">
+      <div className="mb-1 flex items-center gap-2 text-xs text-ink-2">
         <span className={cx('font-medium', answerable ? 'text-warn' : 'text-ink-2')}>
           {KIND_LABEL[ask?.kind ?? 'question']}
         </span>
@@ -178,7 +178,7 @@ export function QuestionCard(props: QuestionCardProps) {
         </p>
       )}
       {answered === undefined && !answerable && ask === undefined && props.open === true && !sessionLive && (
-        <p className="mt-2 text-xs text-muted">The session cannot take input, so this cannot be answered here.</p>
+        <p className="mt-2 text-xs text-ink-2">The session cannot take input, so this cannot be answered here.</p>
       )}
       {error !== null && (
         <p role="alert" className="mt-2 text-xs text-risk">
