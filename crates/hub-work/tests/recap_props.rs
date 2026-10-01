@@ -165,12 +165,12 @@ proptest! {
         let mut log = world.setup(&mut ids, T0 - 86_400_000);
         log.extend(gen_events(&quiet(&specs, !names_change), &world, &mut ids, T0));
 
-        let mut whole = Recaps::with_config(cfg.clone(), Directory::new());
+        let mut whole = Recaps::with_config(cfg.clone(), None);
         whole.push(&log);
         let whole = Core(Mutex::new(whole));
 
         let batched = Core(Mutex::new(
-            Recaps::with_config(cfg.clone(), Directory::new()).with_day_cache(cache),
+            Recaps::with_config(cfg.clone(), None).with_day_cache(cache),
         ));
         let mut question = queries.iter().cycle();
         for batch in batches(&log, &sizes) {

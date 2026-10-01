@@ -9,8 +9,8 @@ use pitcrew_hub_work::{
     BlockFilter, DaysScope, RecapIndex, Recaps, WorkService, demo_events, projections,
 };
 use pitcrew_protocol::events::{Event, EventBody};
-use pitcrew_protocol::ids::EventId;
-use pitcrew_protocol::model::{Date, Receipt};
+use pitcrew_protocol::ids::{AskId, EventId, MemberId, TaskId, TaskKey};
+use pitcrew_protocol::model::{Ask, AskKind, AskState, Date, LinkBasis, Receipt};
 use pitcrew_protocol::recap::{BlockKey, DayRecap, RecapBlock};
 use pitcrew_recap::Directory;
 use pitcrew_store::{Store, StoreOptions};
@@ -20,6 +20,7 @@ use recap_common::{
 };
 use std::collections::HashSet;
 use std::sync::Arc;
+use ulid::Ulid;
 
 fn demo() -> DemoWorkspace {
     demo_workspace().expect("the demo workspace parses")
@@ -83,7 +84,7 @@ fn demo_scopes(ws: &DemoWorkspace) -> Vec<DaysScope> {
 #[test]
 fn the_fixtures_events_give_the_fixture() {
     let ws = demo();
-    let mut recaps = Recaps::new(demo_directory(&ws));
+    let mut recaps = Recaps::new(Some(demo_directory(&ws)));
     recaps.push(&ws.events);
     let page = recaps
         .blocks(&BlockFilter::default(), None, Some(200))
@@ -288,6 +289,35 @@ fn pages_and_filters_match_the_engine() {
         assert_eq!(got, expected, "limit {limit}");
     }
     check_receipts(&expected, &allowed_receipts(&events));
+    // Spot checks without any filter code: a workstream's or project's blocks are the unfiltered
+    // list's blocks with that workstream or project, in the same order.
+    let every = all_blocks(&work, &BlockFilter::default(), 200);
+    for w in &world.workstreams {
+        let filter = BlockFilter {
+            workstream: Some(w.id),
+            ..BlockFilter::default()
+        };
+        let mine: Vec<RecapBlock> = every
+            .iter()
+            .filter(|b| b.block.workstream == Some(w.id))
+            .cloned()
+            .collect();
+        assert!(!mine.is_empty());
+        assert_eq!(all_blocks(&work, &filter, 7), mine);
+    }
+    for p in &world.projects {
+        let filter = BlockFilter {
+            project: Some(p.id),
+            ..BlockFilter::default()
+        };
+        let mine: Vec<RecapBlock> = every
+            .iter()
+            .filter(|b| b.block.project == Some(p.id))
+            .cloned()
+            .collect();
+        assert!(!mine.is_empty());
+        assert_eq!(all_blocks(&work, &filter, 7), mine);
+    }
 }
 
 /// Filters combine, `before` is exclusive and may be any id, and the defaults and caps are the
@@ -581,20 +611,31 @@ fn an_open_block_grows() {
     assert_eq!(later_day.days[0].blocks.len(), 2);
 }
 
+/// Pushes `events` and keeps them, for a rebuild to compare with.
+fn feed(recaps: &mut Recaps, log: &mut Vec<Event>, events: Vec<Event>) {
+    recaps.push(&events);
+    log.extend(events);
+}
+
 /// A repeated query writes no paragraph again; a block that grows rewrites only the days it is
-/// in; a new name rewrites them all.
+/// in; a rename rewrites them all; a new member, task or ask that nothing named yet rewrites none;
+/// and learning the name of something a block already named rewrites them all, as a rebuild would
+/// write them.
 #[test]
 fn the_day_cache_rewrites_only_what_changed() {
     let world = World::new(1, 2, 4, 4);
     let mut ids = Ids::default();
-    let mut recaps = Recaps::new(Directory::new());
-    recaps.push(&world.setup(&mut ids, T0 - 3 * 86_400_000));
+    let mut recaps = Recaps::new(None);
+    let mut log = Vec::new();
+    let setup = world.setup(&mut ids, T0 - 3 * 86_400_000);
+    feed(&mut recaps, &mut log, setup);
     // A day of work in each workstream, three days running (kind 0: a tool run in session `a`;
     // sessions 0 and 1 work on tasks of workstreams 0 and 1).
     for day in 0..3 {
         for a in 0..2u8 {
             let at = T0 - (2 - day) * 86_400_000 + i64::from(a) * 3_600_000;
-            recaps.push(&gen_events(&[(0, a, 0, false, 0)], &world, &mut ids, at));
+            let run = gen_events(&[(0, a, 0, false, 0)], &world, &mut ids, at);
+            feed(&mut recaps, &mut log, run);
         }
     }
     let scope = DaysScope::Project(world.projects[0].id);
@@ -611,12 +652,8 @@ fn the_day_cache_rewrites_only_what_changed() {
 
     // Session 1's last block grows: only its day and workstream is written again.
     let last_at = T0 + 3_600_000;
-    recaps.push(&gen_events(
-        &[(4, 1, 0, false, 0)],
-        &world,
-        &mut ids,
-        last_at + 60_000,
-    ));
+    let edit = gen_events(&[(4, 1, 0, false, 0)], &world, &mut ids, last_at + 60_000);
+    feed(&mut recaps, &mut log, edit);
     let grown = recaps.days(scope, 0, None, None).expect("days");
     assert_eq!(recaps.days_written(), written + 1);
     let changed: Vec<_> = grown
@@ -629,7 +666,8 @@ fn the_day_cache_rewrites_only_what_changed() {
 
     // An agent's new handle may be in any paragraph: they are all written again.
     let before = recaps.days_written();
-    recaps.push(&gen_events(&[(16, 0, 0, false, 0)], &world, &mut ids, T0));
+    let rename = gen_events(&[(16, 0, 0, false, 0)], &world, &mut ids, T0);
+    feed(&mut recaps, &mut log, rename);
     let renamed = recaps.days(scope, 0, None, None).expect("days");
     assert_eq!(
         recaps.days_written(),
@@ -642,6 +680,104 @@ fn the_day_cache_rewrites_only_what_changed() {
             .iter()
             .any(|d| d.summary.text.contains("@agent0x0"))
     );
+
+    // A new member, and a new task with an ask about it next week: nothing named them before,
+    // so the only paragraph written is next week's.
+    let next_week = T0 + 7 * 86_400_000;
+    let project = &world.projects[0];
+    let ws0 = world.workstreams[0].id;
+    let new_task = recap_common::task(
+        TaskId(Ulid::from(900u128)),
+        TaskKey::new(project.key.clone(), 900).expect("key"),
+        project.id,
+        Some(ws0),
+    );
+    let newcomer = recap_common::agent(MemberId(Ulid::from(901u128)), world.person, "@newcomer");
+    let ask = Ask {
+        id: AskId(Ulid::from(902u128)),
+        kind: AskKind::Question,
+        from: world.agents[0],
+        to: world.person,
+        task: Some(new_task.id),
+        session: None,
+        title: "Which seed?".into(),
+        body: String::new(),
+        options: vec![],
+        receipts: vec![],
+        state: AskState::Open,
+        answer: None,
+        created: next_week,
+    };
+    let news = vec![
+        world.event(
+            &mut ids,
+            next_week,
+            world.person,
+            EventBody::MemberAdded { member: newcomer },
+        ),
+        world.event(
+            &mut ids,
+            next_week,
+            world.person,
+            EventBody::TaskCreated {
+                task: new_task.clone(),
+            },
+        ),
+        world.event(
+            &mut ids,
+            next_week + 60_000,
+            world.agents[0],
+            EventBody::AskRaised { ask },
+        ),
+    ];
+    let before = recaps.days_written();
+    feed(&mut recaps, &mut log, news);
+    let with_news = recaps.days(scope, 0, None, None).expect("days");
+    assert_eq!(recaps.days_written(), before + 1, "only next week's");
+    assert_eq!(with_news.days[1..], renamed.days[..]);
+
+    // A session linked to a task nobody has created yet: its paragraph says "a task". When the
+    // task is created, two days on, the paragraph that named it is written with its key.
+    let early = recap_common::task(
+        TaskId(Ulid::from(903u128)),
+        TaskKey::new(project.key.clone(), 903).expect("key"),
+        project.id,
+        Some(ws0),
+    );
+    let link = world.event(
+        &mut ids,
+        next_week + 120_000,
+        world.person,
+        EventBody::SessionLinked {
+            session: world.sessions[0].id,
+            workstream: Some(ws0),
+            task: Some(early.id),
+            basis: LinkBasis::Manual,
+        },
+    );
+    feed(&mut recaps, &mut log, vec![link]);
+    let linked = recaps.days(scope, 0, None, None).expect("days");
+    let text = |page: &pitcrew_protocol::recap::DaysPage, date: &Date| -> String {
+        page.days
+            .iter()
+            .filter(|d| d.date == *date)
+            .map(|d| d.summary.text.clone())
+            .collect()
+    };
+    let week_date = pitcrew_recap::date_of(next_week, 0);
+    assert!(text(&linked, &week_date).contains("linked the session to a task"));
+    let created = world.event(
+        &mut ids,
+        next_week + 2 * 86_400_000,
+        world.person,
+        EventBody::TaskCreated { task: early },
+    );
+    feed(&mut recaps, &mut log, vec![created]);
+    let named = recaps.days(scope, 0, None, None).expect("days");
+    assert!(text(&named, &week_date).contains("linked the session to PAP-903"));
+    let mut rebuilt = Recaps::new(None);
+    rebuilt.push(&log);
+    assert_eq!(rebuilt.days(scope, 0, None, None).expect("days"), named);
 }
 
 /// The cache keeps at most its capacity, the least recently used out first, and answers the same
@@ -658,9 +794,9 @@ fn the_day_cache_is_bounded() {
         T0,
     ));
     let oracle = Oracle::new(&log);
-    let mut small = Recaps::new(Directory::new()).with_day_cache(5);
+    let mut small = Recaps::new(None).with_day_cache(5);
     small.push(&log);
-    let mut none = Recaps::new(Directory::new()).with_day_cache(0);
+    let mut none = Recaps::new(None).with_day_cache(0);
     none.push(&log);
     for tz in (-840..=840).step_by(60) {
         for scope in scopes(&world) {
@@ -678,7 +814,7 @@ fn the_day_cache_is_bounded() {
     }
     assert_eq!(small.cached_days(), 5);
     // The default holds a whole view and more.
-    let mut default = Recaps::new(Directory::new());
+    let mut default = Recaps::new(None);
     default.push(&log);
     for scope in scopes(&world) {
         default.days(scope, 0, None, Some(30)).expect("days");

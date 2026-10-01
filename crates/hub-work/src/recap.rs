@@ -46,12 +46,12 @@ use crate::codec::sql_rev;
 use crate::error::{Result, WorkError};
 use crate::projection::Tasks;
 use crate::service::WorkService;
-use pitcrew_protocol::events::{Event, EventBody};
-use pitcrew_protocol::ids::{EventId, ProjectId, SessionId, TaskId, WorkstreamId};
-use pitcrew_protocol::model::{Date, TimestampMs};
+use pitcrew_protocol::events::{BriefTarget, Event, EventBody};
+use pitcrew_protocol::ids::{AskId, EventId, MemberId, ProjectId, SessionId, TaskId, WorkstreamId};
+use pitcrew_protocol::model::{AskKind, Date, TimestampMs};
 use pitcrew_protocol::recap::{
     BLOCKS_DEFAULT_LIMIT, BLOCKS_MAX_LIMIT, Block, BlocksPage, DAYS_DEFAULT_LIMIT, DAYS_MAX_LIMIT,
-    DayRecap, DaysPage, MAX_TZ_MINUTES, RecapBlock,
+    DayRecap, DaysPage, FactKind, MAX_TZ_MINUTES, RecapBlock,
 };
 use pitcrew_recap::{
     BlockBuilder, Config, Directory, RuleSummarizer, block_line, date_of, day_recaps,
@@ -60,6 +60,7 @@ use pitcrew_store::sql::{Connection, OptionalExtension, params};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 use std::ops::Bound;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{MutexGuard, PoisonError};
 
 /// The most day paragraphs a [`Recaps`] keeps by default.
@@ -214,6 +215,141 @@ fn remove_id<K: Hash + Eq>(map: &mut HashMap<K, BTreeSet<EventId>>, key: K, id: 
     }
 }
 
+/// Most ids [`Unnamed`] and the asks' descriptions hold. Ids come from untrusted events; past this,
+/// every name learned counts as a change.
+const MAX_NAMED: usize = 100_000;
+
+/// Members, tasks and workstreams a block names while their names are not known. Lines and
+/// paragraphs call them "someone", "a task" or "a workstream"; when one of them becomes known,
+/// paragraphs already written may say it differently now.
+#[derive(Debug, Default)]
+struct Unnamed {
+    members: HashSet<MemberId>,
+    tasks: HashSet<TaskId>,
+    workstreams: HashSet<WorkstreamId>,
+    /// A set was full: any name learned may be one of them.
+    overflow: bool,
+}
+
+impl Unnamed {
+    fn add<K: Hash + Eq>(set: &mut HashSet<K>, overflow: &mut bool, id: K) {
+        if set.len() < MAX_NAMED || set.contains(&id) {
+            set.insert(id);
+        } else {
+            *overflow = true;
+        }
+    }
+
+    fn member(&mut self, names: &Directory, id: MemberId) {
+        if names.handle(id).is_none() {
+            Self::add(&mut self.members, &mut self.overflow, id);
+        }
+    }
+
+    fn task(&mut self, names: &Directory, id: TaskId) {
+        if names.task_key(id).is_none() {
+            Self::add(&mut self.tasks, &mut self.overflow, id);
+        }
+    }
+
+    fn workstream(&mut self, names: &Directory, id: WorkstreamId) {
+        if names.workstream_name(id).is_none() {
+            Self::add(&mut self.workstreams, &mut self.overflow, id);
+        }
+    }
+
+    /// Notes everything `block` names, in its facts or links, that `names` does not know.
+    fn note(&mut self, names: &Directory, asks: &HashMap<AskId, AskName>, block: &Block) {
+        for m in block.agent.iter().chain(&block.actors) {
+            self.member(names, *m);
+        }
+        for t in &block.tasks {
+            self.task(names, *t);
+        }
+        if let Some(w) = block.workstream {
+            self.workstream(names, w);
+        }
+        for fact in &block.facts {
+            self.member(names, fact.by);
+            // Every kind, so that a new one is a compile error here until it is looked at.
+            match &fact.kind {
+                FactKind::SessionStarted { .. }
+                | FactKind::SessionWaiting { .. }
+                | FactKind::SessionEnded
+                | FactKind::Checks { .. }
+                | FactKind::JobDiverged { .. }
+                | FactKind::DecisionRecorded { .. } => {}
+                FactKind::SessionLinked { workstream, task } => {
+                    if let Some(w) = workstream {
+                        self.workstream(names, *w);
+                    }
+                    if let Some(t) = task {
+                        self.task(names, *t);
+                    }
+                }
+                FactKind::DispatchStarted { task, agent } => {
+                    self.task(names, *task);
+                    self.member(names, *agent);
+                }
+                FactKind::DispatchFinished { task, .. } => {
+                    if let Some(t) = task {
+                        self.task(names, *t);
+                    }
+                }
+                FactKind::TaskCreated { task }
+                | FactKind::TaskMoved { task, .. }
+                | FactKind::PlanUpdated { task, .. } => self.task(names, *task),
+                FactKind::TaskAssigned { task, assignee } => {
+                    self.task(names, *task);
+                    if let Some(a) = assignee {
+                        self.member(names, *a);
+                    }
+                }
+                FactKind::AskRaised { to, .. } => self.member(names, *to),
+                FactKind::AskAnswered { ask } => {
+                    if let Some((_, from)) = asks.get(ask) {
+                        self.member(names, *from);
+                    }
+                }
+                FactKind::Commented {
+                    task,
+                    workstream,
+                    mentions,
+                } => {
+                    if let Some(t) = task {
+                        self.task(names, *t);
+                    }
+                    if let Some(w) = workstream {
+                        self.workstream(names, *w);
+                    }
+                    for m in mentions {
+                        self.member(names, *m);
+                    }
+                }
+                FactKind::WorkstreamCreated { workstream }
+                | FactKind::WorkstreamChanged { workstream, .. } => {
+                    self.workstream(names, *workstream);
+                }
+                FactKind::BriefAccepted { target, .. } => {
+                    if let BriefTarget::Workstream(w) = target {
+                        self.workstream(names, *w);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// What describes an answer to an ask: its kind and who asked.
+type AskName = (AskKind, MemberId);
+
+/// Runs a call into the recap engine. The engine is not meant to panic on any input; if it does,
+/// that is an internal error for this request, not a poisoned index that every request rebuilds.
+fn guarded<T>(what: &str, f: impl FnOnce() -> T) -> Result<T> {
+    catch_unwind(AssertUnwindSafe(f))
+        .map_err(|_| WorkError::internal(format!("the recap engine panicked {what}")))
+}
+
 /// One cached paragraph's place.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct DayKey {
@@ -271,8 +407,10 @@ impl DayCache {
             return Ok(hit.recaps.clone());
         }
         let owned: Vec<Block> = blocks.iter().map(|b| (*b).clone()).collect();
-        let recaps = day_recaps(&owned, names, key.tz, &RuleSummarizer)
-            .map_err(|e| WorkError::internal(format!("writing a day recap: {e}")))?;
+        let recaps = guarded("writing a day recap", || {
+            day_recaps(&owned, names, key.tz, &RuleSummarizer)
+        })?
+        .map_err(|e| WorkError::internal(format!("writing a day recap: {e}")))?;
         self.made = self.made.saturating_add(1);
         if self.capacity == 0 {
             return Ok(recaps);
@@ -313,8 +451,18 @@ pub struct Recaps {
     builder: BlockBuilder,
     /// Names for lines and paragraphs: the directory as events keep it, plus members.
     names: Directory,
-    /// Changes whenever a name may have changed, so cached paragraphs are written again.
+    /// Changes whenever a name a paragraph may show changes, so cached paragraphs are written
+    /// again: a member, task or workstream renamed, an ask re-stated as another kind or by
+    /// another asker, or a name learned for something a block already named.
     names_gen: u64,
+    /// What blocks name that `names` does not know yet.
+    unnamed: Unnamed,
+    /// Each ask raised, as its answers describe it.
+    asks: HashMap<AskId, AskName>,
+    /// Whether a seed directory came first: it may know asks this index has not seen raised.
+    seeded: bool,
+    /// Events the engine panicked on, left out.
+    failed: u64,
     blocks: BTreeMap<EventId, Block>,
     sessions: HashMap<SessionId, BTreeSet<EventId>>,
     tasks: HashMap<TaskId, BTreeSet<EventId>>,
@@ -334,20 +482,26 @@ impl std::fmt::Debug for Recaps {
 
 impl Recaps {
     /// Recaps with the engine's default settings (the contract's gap and caps). `seed` is what was
-    /// known before the first event pushed: empty for a log read from its start, or the
+    /// known before the first event pushed: `None` for a log read from its start, or the
     /// projections' lists for a slice of one.
     #[must_use]
-    pub fn new(seed: Directory) -> Self {
+    pub fn new(seed: Option<Directory>) -> Self {
         Self::with_config(Config::default(), seed)
     }
 
     /// Recaps with other engine settings.
     #[must_use]
-    pub fn with_config(config: Config, seed: Directory) -> Self {
+    pub fn with_config(config: Config, seed: Option<Directory>) -> Self {
+        let seeded = seed.is_some();
+        let seed = seed.unwrap_or_default();
         Self {
             builder: BlockBuilder::new(config, seed.clone()),
             names: seed,
             names_gen: 0,
+            unnamed: Unnamed::default(),
+            asks: HashMap::new(),
+            seeded,
+            failed: 0,
             blocks: BTreeMap::new(),
             sessions: HashMap::new(),
             tasks: HashMap::new(),
@@ -365,15 +519,36 @@ impl Recaps {
     }
 
     /// Adds events, in log order after those pushed before.
+    ///
+    /// An event the engine panics on is left out (and logged, and counted in
+    /// [`Recaps::failed_events`]) rather than taking the index down; a rebuild leaves it out the
+    /// same way.
     pub fn push(&mut self, events: &[Event]) {
         for event in events {
-            self.learn_names(event);
-            self.builder.push(event);
+            let taken = catch_unwind(AssertUnwindSafe(|| {
+                self.learn_names(event);
+                #[cfg(test)]
+                tests::fail_here(event.id);
+                self.builder.push(event);
+            }));
+            if taken.is_err() {
+                self.failed = self.failed.saturating_add(1);
+                tracing::error!(
+                    event = %event.id,
+                    "the recap engine failed on an event: recaps leave it out"
+                );
+            }
         }
         let changes = self.builder.take_changes();
         for block in changes.closed.into_iter().chain(changes.open) {
             self.put(block);
         }
+    }
+
+    /// How many events the engine failed on (see [`Recaps::push`]).
+    #[must_use]
+    pub fn failed_events(&self) -> u64 {
+        self.failed
     }
 
     /// How many blocks there are, open and closed.
@@ -466,7 +641,7 @@ impl Recaps {
             }
             blocks.push(RecapBlock {
                 block: block.clone(),
-                line: block_line(block, &self.names),
+                line: guarded("writing a block's line", || block_line(block, &self.names))?,
             });
         }
         Ok(BlocksPage {
@@ -569,29 +744,61 @@ impl Recaps {
         Ok(DaysPage { days, at_start })
     }
 
-    /// Keeps the names current. Paragraphs written before a name changed are written again.
+    /// Keeps the names current. When a name a written paragraph may show changes, every
+    /// paragraph is written again: a rename, or a name learned for something a block named while
+    /// it was unknown. A new member, task or workstream that nothing named yet changes nothing.
     fn learn_names(&mut self, event: &Event) {
         let changed = match &event.body {
             EventBody::MemberAdded { member } => {
                 let before = self.names.handle(member.id).map(str::to_owned);
                 self.names.add_member(member);
-                before.as_deref() != self.names.handle(member.id)
+                let after = self.names.handle(member.id);
+                match before {
+                    Some(before) => after != Some(before.as_str()),
+                    None => {
+                        after.is_some()
+                            && (self.unnamed.overflow || self.unnamed.members.remove(&member.id))
+                    }
+                }
             }
             EventBody::TaskCreated { task } => {
                 let before = self.names.task_key(task.id).map(str::to_owned);
                 self.names.observe(event);
-                before.as_deref() != self.names.task_key(task.id)
+                let after = self.names.task_key(task.id);
+                match before {
+                    Some(before) => after != Some(before.as_str()),
+                    None => {
+                        after.is_some()
+                            && (self.unnamed.overflow || self.unnamed.tasks.remove(&task.id))
+                    }
+                }
             }
             EventBody::WorkstreamCreated { workstream } => {
-                let before = self.names.workstream_name(workstream.id).map(str::to_owned);
+                let id = workstream.id;
+                let before = self.names.workstream_name(id).map(str::to_owned);
                 self.names.observe(event);
-                before.as_deref() != self.names.workstream_name(workstream.id)
+                let after = self.names.workstream_name(id);
+                match before {
+                    Some(before) => after != Some(before.as_str()),
+                    None => {
+                        after.is_some()
+                            && (self.unnamed.overflow || self.unnamed.workstreams.remove(&id))
+                    }
+                }
             }
-            // An answer is described by its ask's kind and asker, which the directory does not
-            // give back to compare: any ask counts as a change.
-            EventBody::AskRaised { .. } => {
+            EventBody::AskRaised { ask } => {
                 self.names.observe(event);
-                true
+                let now = (ask.kind, ask.from);
+                if let Some(was) = self.asks.get_mut(&ask.id) {
+                    std::mem::replace(was, now) != now
+                } else if self.asks.len() < MAX_NAMED {
+                    // An answer can only be placed once its ask is known, so a new ask is in no
+                    // paragraph yet; unless the seed knew it, perhaps differently.
+                    self.asks.insert(ask.id, now);
+                    self.seeded
+                } else {
+                    true
+                }
             }
             _ => {
                 self.names.observe(event);
@@ -605,6 +812,7 @@ impl Recaps {
 
     /// Stores a block that began or changed, and re-indexes it if its links or start moved.
     fn put(&mut self, block: Block) {
+        self.unnamed.note(&self.names, &self.asks, &block);
         let links = Links::of(&block);
         match self.blocks.get(&block.id).map(Links::of) {
             Some(old) if old == links => {}
@@ -736,7 +944,7 @@ pub(crate) struct RecapSync {
 impl Default for RecapSync {
     fn default() -> Self {
         Self {
-            recaps: Recaps::new(Directory::new()),
+            recaps: Recaps::new(None),
             rev: 0,
         }
     }
@@ -841,6 +1049,65 @@ impl RecapIndex for WorkService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pitcrew_protocol::ids::WorkspaceId;
+    use pitcrew_protocol::model::Receipt;
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_ON: Cell<Option<EventId>> = const { Cell::new(None) };
+    }
+
+    /// Makes the engine "panic" on one event, on this thread.
+    pub(super) fn fail_here(id: EventId) {
+        if FAIL_ON.with(Cell::get) == Some(id) {
+            panic!("the recap engine fails on this event, for the test");
+        }
+    }
+
+    fn tool_run(n: u128, minute: i64) -> Event {
+        let session = SessionId(ulid::Ulid::from(7u128));
+        Event {
+            id: EventId(ulid::Ulid::from(n)),
+            at: 1_790_755_200_000 + minute * 60_000,
+            workspace: WorkspaceId(ulid::Ulid::from(2u128)),
+            author: MemberId(ulid::Ulid::from(4u128)),
+            on_behalf_of: None,
+            body: EventBody::ToolRan {
+                session,
+                tool: "Bash".into(),
+                target: "cargo test".into(),
+                outcome: "ok".into(),
+                failed: false,
+                receipt: Receipt::Transcript { session, offset: 0 },
+            },
+        }
+    }
+
+    #[test]
+    fn an_event_the_engine_fails_on_is_left_out_as_a_rebuild_leaves_it_out() {
+        let events: Vec<Event> = (1..=4).map(|n| tool_run(n, n as i64)).collect();
+        FAIL_ON.with(|f| f.set(Some(events[1].id)));
+        let mut live = Recaps::new(None);
+        for e in &events {
+            live.push(std::slice::from_ref(e));
+        }
+        let mut rebuilt = Recaps::new(None);
+        rebuilt.push(&events);
+        FAIL_ON.with(|f| f.set(None));
+        assert_eq!(live.failed_events(), 1);
+        assert_eq!(rebuilt.failed_events(), 1);
+        let page = live
+            .blocks(&BlockFilter::default(), None, None)
+            .expect("still answers");
+        assert_eq!(page.blocks.len(), 1);
+        assert_eq!(page.blocks[0].block.counts.tools_run, 3);
+        assert_eq!(
+            rebuilt
+                .blocks(&BlockFilter::default(), None, None)
+                .expect("blocks"),
+            page
+        );
+    }
 
     #[test]
     fn day_start_is_the_inverse_of_date_of() {

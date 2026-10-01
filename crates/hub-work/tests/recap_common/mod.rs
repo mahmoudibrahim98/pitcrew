@@ -141,7 +141,7 @@ impl World {
         }
     }
 
-    fn event(&self, ids: &mut Ids, at: i64, author: MemberId, body: EventBody) -> Event {
+    pub fn event(&self, ids: &mut Ids, at: i64, author: MemberId, body: EventBody) -> Event {
         Event {
             id: ids.next(),
             at,
@@ -610,6 +610,19 @@ impl SplitMix {
 
 // ─── The oracle ──────────────────────────────────────────────────────────────────────────────
 
+/// The contract's filters, written out here rather than taken from `BlockFilter::matches`, so the
+/// oracle does not share the index's code: `session` is the block's session, `task` one of its
+/// (listed) tasks, `workstream` its workstream, `project` its project, all that are given.
+pub fn linked(filter: &BlockFilter, block: &Block) -> bool {
+    let checks = [
+        filter.session.map(|s| block.session == Some(s)),
+        filter.task.map(|t| block.tasks.contains(&t)),
+        filter.workstream.map(|w| block.workstream == Some(w)),
+        filter.project.map(|p| block.project == Some(p)),
+    ];
+    checks.into_iter().flatten().all(|ok| ok)
+}
+
 /// The recap engine over a whole log at once, from an empty directory: what any index fed the
 /// same events must serve.
 pub struct Oracle {
@@ -644,7 +657,7 @@ impl Oracle {
         let mut out: Vec<RecapBlock> = self
             .blocks
             .iter()
-            .filter(|b| filter.matches(b))
+            .filter(|b| linked(filter, b))
             .map(|b| RecapBlock {
                 block: b.clone(),
                 line: block_line(b, &self.names),
@@ -712,7 +725,7 @@ pub fn all_blocks(index: &dyn RecapIndex, filter: &BlockFilter, limit: usize) ->
             assert_eq!(page.blocks.len(), limit.min(200));
         }
         for b in &page.blocks {
-            assert!(filter.matches(&b.block));
+            assert!(linked(filter, &b.block));
             if let Some(before) = before {
                 assert!(b.block.id < before, "before is exclusive");
             }
