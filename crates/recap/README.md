@@ -27,12 +27,12 @@ Recap engine: activity blocks, summaries with receipts, and Where-it-stands prop
   the receipts of the facts behind it. `propose_workstream` writes it as a `BriefProposal`
   through a `Summarizer` (verified like any summary), and `propose_project` rolls a project's
   standings up, with the most pressing next step of them all. `BriefProposal::body()` is the
-  `BriefProposed` event the caller appends; the next step travels in the text ("… Next: …")
-  until the protocol has a `next` field. Pinned briefs only get proposals; an unpinned one is
-  marked `AutoAccept` when the workspace's `BriefPolicy` allows it, and `accepted_body()` gives
-  the `BriefAccepted` to append after it. A proposal that says what the brief in force already
-  says is not made. `propose_paused` is the back office's "paused?" question for a quiet
-  workstream.
+  `BriefProposed` event the caller appends, with the next step ("Review PAP-3.") in its own
+  `next` field. Pinned briefs only get proposals; an unpinned one is marked `AutoAccept` when the
+  workspace's `BriefPolicy` allows it, and `accepted_body()` gives the `BriefAccepted` to append
+  after it: the same text and next step, with the proposal's receipts. A proposal that says what
+  the brief in force, or its pending proposal, already says (text and next step) is not made.
+  `propose_paused` is the back office's "paused?" question for a quiet workstream.
 
 Everything is pure and deterministic. Event text is untrusted: it is cleaned (control and
 direction-changing characters removed) and capped before it is kept, and counts, files, facts,

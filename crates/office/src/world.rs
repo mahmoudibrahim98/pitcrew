@@ -282,6 +282,7 @@ impl World {
             EventBody::TaskCreated { task } => task.workstream,
             EventBody::TaskMoved { task, .. }
             | EventBody::TaskAssigned { task, .. }
+            | EventBody::TaskUpdated { task, .. }
             | EventBody::SubtasksReplaced { task, .. } => of_task(*task),
             EventBody::DispatchStarted { dispatch } => of_task(dispatch.task),
             EventBody::DispatchFinished { dispatch, .. } => of_dispatch(*dispatch),
@@ -351,6 +352,18 @@ impl World {
             }
             EventBody::TaskMoved { task, to, .. } => {
                 self.tasks.update(task, |t| t.status = *to);
+            }
+            EventBody::TaskUpdated { task, patch } => {
+                // A patch can move the task to another workstream, or turn automatic acceptance
+                // off; like any event, it cannot turn it back on (facts only tighten).
+                self.tasks.update(task, |t| {
+                    if let Some(workstream) = patch.workstream {
+                        t.workstream = workstream;
+                    }
+                    if patch.accept_auto == Some(false) {
+                        t.accept_auto = false;
+                    }
+                });
             }
             EventBody::DispatchStarted { dispatch } => {
                 self.dispatches.insert(

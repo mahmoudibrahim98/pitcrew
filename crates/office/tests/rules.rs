@@ -354,7 +354,7 @@ fn proposals(entries: &[Entry]) -> Vec<String> {
     entries
         .iter()
         .filter_map(|e| match &e.action {
-            Action::ProposeBrief { proposal } => Some(proposal.text()),
+            Action::ProposeBrief { proposal } => Some(proposal.text().to_owned()),
             _ => None,
         })
         .collect()
@@ -384,9 +384,16 @@ fn a_quiet_active_workstream_is_asked_if_it_is_paused_once_per_spell() {
     );
     assert_eq!(
         proposal.text(),
-        "No activity for 3 days (since 2026-09-30), paused? Next: mark it paused, or give it a \
-         next step."
+        "No activity for 3 days (since 2026-09-30), paused?"
     );
+    assert_eq!(
+        proposal.next_text(),
+        Some("Mark it paused, or give it a next step.")
+    );
+    assert!(matches!(
+        proposal.body(),
+        EventBody::BriefProposed { next: Some(n), .. } if n == "Mark it paused, or give it a next step."
+    ));
 
     // A day later stream 1 is quiet too; stream 2 is not asked again.
     log.push(

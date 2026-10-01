@@ -10,7 +10,7 @@ use pitcrew_office::{
 use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{AskId, MemberId, TaskId};
 use pitcrew_protocol::model::{
-    Answer, AskKind, DispatchOutcome, MemberKind, Mover, Receipt, TaskStatus,
+    Answer, AskKind, DispatchOutcome, MemberKind, Mover, Receipt, TaskPatch, TaskStatus,
 };
 use pitcrew_recap::BriefProposal;
 use proptest::prelude::*;
@@ -124,7 +124,9 @@ fn never_asks_to_send_anything_outward() {
                 body: EventBody::BriefAccepted {
                     target: pitcrew_protocol::model::BriefTarget::Workstream(w),
                     text: "done".into(),
+                    next: None,
                     pinned: false,
+                    receipts: evidence(),
                 },
                 because: evidence(),
             },
@@ -273,6 +275,27 @@ fn never_marks_done_without_automatic_acceptance() {
             Outcome::Emitted,
         ]
     );
+}
+
+#[test]
+fn a_task_patch_turns_automatic_acceptance_off_but_never_back_on() {
+    let mut log = Log::new();
+    let auto = log.world.tasks[3];
+    let person = log.world.person;
+    let patch = |accept_auto| EventBody::TaskUpdated {
+        task: auto,
+        patch: TaskPatch {
+            accept_auto: Some(accept_auto),
+            ..TaskPatch::default()
+        },
+    };
+    log.push(HOUR, person, patch(false))
+        .push(HOUR, person, patch(true));
+    let outcomes = obey(
+        &mut log,
+        vec![move_task(auto, TaskStatus::Review, TaskStatus::Done, true)],
+    );
+    assert_eq!(outcomes, [refused(Refusal::MarksDone)]);
 }
 
 #[test]

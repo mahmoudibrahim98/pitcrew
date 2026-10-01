@@ -12,7 +12,7 @@ use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{AskId, MemberId, SessionId, SubtaskId, TaskId};
 use pitcrew_protocol::model::{
     Answer, Ask, AskKind, AskState, Brief, BriefSource, BriefTarget, Mover, Receipt, Subtask,
-    SubtaskSource, TaskStatus,
+    SubtaskSource, TaskPatch, TaskStatus,
 };
 use pitcrew_recap::{
     Block, BriefPolicy, BriefProposal, Config, Directory, Disposition, FakeSummarizer,
@@ -49,15 +49,41 @@ fn check(p: &BriefProposal, allowed: &HashSet<Receipt>) {
     for r in &p.receipts {
         assert!(allowed.contains(r), "receipt not in the input: {r:?}");
     }
-    let EventBody::BriefProposed { text, receipts, .. } = p.body() else {
+    let EventBody::BriefProposed {
+        target,
+        text,
+        next,
+        receipts,
+    } = p.body()
+    else {
         panic!("body is a brief proposal");
     };
-    assert_eq!(text, p.text());
+    assert_eq!(target, p.target);
+    assert_eq!(text, p.summary.text);
+    assert_eq!(next.as_deref(), p.next.as_ref().map(|n| n.text.as_str()));
+    assert!(!text.contains("Next:"), "the next step has its own field");
     assert_eq!(receipts, p.receipts);
+    // Applying it automatically accepts it unchanged: same text and next step, its receipts.
+    match p.accepted_body() {
+        Some(EventBody::BriefAccepted {
+            target: t,
+            text: accepted,
+            next: accepted_next,
+            pinned,
+            receipts: r,
+        }) => {
+            assert_eq!(p.disposition, Disposition::AutoAccept);
+            assert_eq!((t, accepted, accepted_next), (target, text, next));
+            assert!(!pinned);
+            assert_eq!(r, receipts);
+        }
+        Some(other) => panic!("not an acceptance: {other:?}"),
+        None => assert_eq!(p.disposition, Disposition::Propose),
+    }
 }
 
 fn show(label: &str, p: &BriefProposal) -> String {
-    let mut out = format!("== {label} · {:?}\n{}\n", p.disposition, p.text());
+    let mut out = format!("== {label} · {:?}\n", p.disposition);
     out.push_str(&show_summary(&p.summary));
     if let Some(n) = &p.next {
         out.push_str("next: ");
@@ -158,17 +184,42 @@ fn a_proposal_that_says_what_is_in_force_is_not_made() {
         .expect("a proposal");
     let same = Brief {
         target,
-        text: p.text(),
-        next: None,
+        text: p.text().to_owned(),
+        next: p.next_text().map(str::to_owned),
         pinned: false,
         source: BriefSource::BackOffice,
         updated: 0,
         receipts: p.receipts.clone(),
+        proposal: None,
     };
-    assert_eq!(
-        propose_workstream(s, Some(&same), AUTO, &RuleSummarizer).unwrap(),
-        None
-    );
+    let again = |brief: &Brief| propose_workstream(s, Some(brief), AUTO, &RuleSummarizer).unwrap();
+    assert_eq!(again(&same), None);
+
+    // The same text with another next step is news.
+    let other_next = Brief {
+        next: Some("Something else.".into()),
+        ..same.clone()
+    };
+    assert_eq!(again(&other_next), Some(p.clone()));
+
+    // While it waits as the pending proposal of an older brief, it is not proposed again.
+    let older = Brief {
+        text: "An older brief.".into(),
+        next: None,
+        proposal: Some(pitcrew_protocol::model::BriefProposal {
+            text: p.text().to_owned(),
+            next: p.next_text().map(str::to_owned),
+            receipts: p.receipts.clone(),
+            at: 0,
+        }),
+        ..same.clone()
+    };
+    assert_eq!(again(&older), None);
+    let without = Brief {
+        proposal: None,
+        ..older
+    };
+    assert_eq!(again(&without), Some(p));
 }
 
 #[test]
@@ -364,11 +415,37 @@ fn tasks_checks_and_asks_read_as_where_it_stands() {
     let p = propose_workstream(&st, None, BriefPolicy::default(), &RuleSummarizer)
         .unwrap()
         .expect("a proposal");
-    assert_eq!(
-        p.text(),
-        "GEN-1 is in review. Tests pass again. Next: review GEN-1."
-    );
+    assert_eq!(p.text(), "GEN-1 is in review. Tests pass again.");
+    assert_eq!(p.next_text(), Some("Review GEN-1."));
     check(&p, &allowed_receipts(&log.events));
+}
+
+#[test]
+fn a_task_moved_to_another_workstream_counts_there() {
+    let w = World::new(3, 5, 2);
+    let t = w.tasks[0];
+    let mut log = Log::new();
+    log.add(
+        &w,
+        w.person,
+        EventBody::TaskUpdated {
+            task: t,
+            patch: TaskPatch {
+                workstream: Some(Some(w.workstreams[1])),
+                ..TaskPatch::default()
+            },
+        },
+    )
+    .add(
+        &w,
+        w.person,
+        moved(t, TaskStatus::InProgress, TaskStatus::Review),
+    );
+    let all = blocks(&log.events, &w.dir, &Config::default());
+    let refs: Vec<&Block> = all.iter().collect();
+    let in_review = |ws| texts(&standing(ws, &refs, &w.dir)).contains(&"GEN-1 is in review".into());
+    assert!(in_review(w.workstreams[1]));
+    assert!(!in_review(w.workstreams[0]));
 }
 
 #[test]
@@ -406,8 +483,11 @@ fn a_quiet_workstream_gets_a_paused_question() {
     );
     assert_eq!(
         p.text(),
-        "No activity for 4 days (since 2026-09-30), paused? Next: mark it paused, or give it a \
-         next step."
+        "No activity for 4 days (since 2026-09-30), paused?"
+    );
+    assert_eq!(
+        p.next_text(),
+        Some("Mark it paused, or give it a next step.")
     );
     assert_eq!(p.disposition, Disposition::Propose);
     assert_eq!(p.receipts, [Receipt::Event { id: event_id(7) }]);
@@ -451,9 +531,9 @@ fn a_project_rolls_up_its_workstreams_and_their_most_pressing_step() {
     .expect("a roll-up");
     assert_eq!(
         p.text(),
-        "Stream 1: tests are failing. Stream 2: waiting on @lead to decide \"Drop seed 3?\". \
-         Next: @lead to decide \"Drop seed 3?\"."
+        "Stream 1: tests are failing. Stream 2: waiting on @lead to decide \"Drop seed 3?\"."
     );
+    assert_eq!(p.next_text(), Some("@lead to decide \"Drop seed 3?\"."));
     check(&p, &allowed_receipts(&log.events));
 }
 

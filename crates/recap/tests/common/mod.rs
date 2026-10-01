@@ -463,7 +463,8 @@ pub fn allowed_receipts(events: &[Event]) -> HashSet<Receipt> {
             }
             EventBody::AskRaised { ask } => out.extend(ask.receipts.iter().cloned()),
             EventBody::DecisionRecorded { receipts, .. }
-            | EventBody::BriefProposed { receipts, .. } => out.extend(receipts.iter().cloned()),
+            | EventBody::BriefProposed { receipts, .. }
+            | EventBody::BriefAccepted { receipts, .. } => out.extend(receipts.iter().cloned()),
             _ => {}
         }
     }

@@ -166,22 +166,24 @@ impl BriefProposal {
         }
     }
 
-    /// The full text: the summary, then "Next: …". The protocol's `BriefProposed` has no `next`
-    /// field yet, so the next step travels in the text.
+    /// The brief's text: where it stands, without the next step.
     #[must_use]
-    pub fn text(&self) -> String {
-        let summary = self.summary.text.as_str();
-        match self.next.as_ref().map(|n| n.text.as_str()) {
-            Some(next) if !next.is_empty() => {
-                let next = end_sentence(&format!("Next: {next}"));
-                if summary.is_empty() {
-                    next
-                } else {
-                    format!("{summary} {next}")
-                }
-            }
-            _ => summary.to_owned(),
-        }
+    pub fn text(&self) -> &str {
+        &self.summary.text
+    }
+
+    /// The next step's text, e.g. "Review PAP-3.", if there is one.
+    #[must_use]
+    pub fn next_text(&self) -> Option<&str> {
+        self.next
+            .as_ref()
+            .map(|n| n.text.as_str())
+            .filter(|t| !t.is_empty())
+    }
+
+    /// Whether it says `text` with the next step `next`.
+    fn says(&self, text: &str, next: Option<&str>) -> bool {
+        self.text() == text && self.next_text() == next
     }
 
     /// The `BriefProposed` event body. The caller appends it.
@@ -189,29 +191,24 @@ impl BriefProposal {
     pub fn body(&self) -> EventBody {
         EventBody::BriefProposed {
             target: self.target,
-            text: self.text(),
+            text: self.text().to_owned(),
+            next: self.next_text().map(str::to_owned),
             receipts: self.receipts.clone(),
         }
     }
 
     /// For [`Disposition::AutoAccept`], the `BriefAccepted` body that applies the proposal
-    /// (unpinned). `None` when a person must accept it.
+    /// unchanged (unpinned): the same text and next step, and the proposal's receipts. `None`
+    /// when a person must accept it.
     #[must_use]
     pub fn accepted_body(&self) -> Option<EventBody> {
         (self.disposition == Disposition::AutoAccept).then(|| EventBody::BriefAccepted {
             target: self.target,
-            text: self.text(),
+            text: self.text().to_owned(),
+            next: self.next_text().map(str::to_owned),
             pinned: false,
+            receipts: self.receipts.clone(),
         })
-    }
-}
-
-/// Adds a full stop unless the text already ends a sentence.
-fn end_sentence(s: &str) -> String {
-    if s.ends_with(['.', '?', '!']) {
-        s.to_owned()
-    } else {
-        format!("{s}.")
     }
 }
 
@@ -773,9 +770,10 @@ pub fn draft_rollup(standings: &[&Standing]) -> Draft {
     }
 }
 
-fn line(c: &Clause) -> Draft {
+/// The draft for a next step: one sentence, e.g. "Review PAP-3.", as `Brief::next` is written.
+fn next_draft(c: &Clause) -> Draft {
     Draft {
-        kind: DraftKind::Line,
+        kind: DraftKind::Paragraph,
         sentences: vec![Sentence {
             clauses: vec![c.clone()],
         }],
@@ -797,7 +795,7 @@ fn write(
     }
     let next = match next {
         Some(c) => {
-            let d = line(c);
+            let d = next_draft(c);
             let s = summarizer.summarize(&d)?;
             verify(&s, &d)?;
             Some(s).filter(|s| !s.spans.is_empty())
@@ -805,15 +803,22 @@ fn write(
         None => None,
     };
     let proposal = BriefProposal::new(target, summary, next, disposition(current, policy));
-    // Nothing new: the brief in force already says this.
-    if current.is_some_and(|b| b.target == target && b.text == proposal.text()) {
+    // Nothing new: the brief in force, or the proposal already waiting, says this.
+    let repeats = current.filter(|b| b.target == target).is_some_and(|b| {
+        proposal.says(&b.text, b.next.as_deref())
+            || b.proposal
+                .as_ref()
+                .is_some_and(|p| proposal.says(&p.text, p.next.as_deref()))
+    });
+    if repeats {
         return Ok(None);
     }
     Ok(Some(proposal))
 }
 
 /// Proposes a workstream's brief from its standing. `current` is the brief in force, if any: a
-/// pinned one only gets a proposal, and a proposal that says the same is not made (`None`).
+/// pinned one only gets a proposal, and a proposal that says the same as it, or as its pending
+/// [`Brief::proposal`], is not made (`None`).
 ///
 /// # Errors
 ///
@@ -911,7 +916,7 @@ pub fn propose_paused(
     BriefProposal::new(
         BriefTarget::Workstream(workstream),
         RuleSummarizer.render(&draft),
-        Some(RuleSummarizer.render(&line(&next))),
+        Some(RuleSummarizer.render(&next_draft(&next))),
         Disposition::Propose,
     )
 }

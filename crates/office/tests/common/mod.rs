@@ -198,9 +198,10 @@ pub fn show(e: &Entry, names: &BTreeMap<String, String>) -> String {
                 pitcrew_protocol::model::BriefTarget::Project(p) => name(p.0.to_string()),
             };
             format!(
-                "propose brief for {target} ({:?}): {:?}",
+                "propose brief for {target} ({:?}): {:?}, next: {:?}",
                 proposal.disposition,
-                proposal.text()
+                proposal.text(),
+                proposal.next_text()
             )
         }
     };

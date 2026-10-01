@@ -10,9 +10,9 @@ rev 49 #1 · remind_stale_asks · emitted · ask Mention to @sam: "Reminder: See
     <- evt:EVT0010, job:4815164, transcript@120544
 rev 49 #2 · remind_stale_asks · emitted · ask Mention to @sam: "Reminder: Merge the benchmark change into parsers?" / "Open for 4 days, since 2026-09-30."
     <- evt:000000Y, transcript@48213
-rev 49 #3 · quiet_workstream · emitted · propose brief for Submission (Propose): "No activity for 4 days (since 2026-09-30), paused? Next: mark it paused, or give it a next step."
+rev 49 #3 · quiet_workstream · emitted · propose brief for Submission (Propose): "No activity for 4 days (since 2026-09-30), paused?", next: Some("Mark it paused, or give it a next step.")
     <- evt:EVT0007
-rev 49 #4 · quiet_workstream · emitted · propose brief for Seed runs (Propose): "No activity for 4 days (since 2026-09-30), paused? Next: mark it paused, or give it a next step."
+rev 49 #4 · quiet_workstream · emitted · propose brief for Seed runs (Propose): "No activity for 4 days (since 2026-09-30), paused?", next: Some("Mark it paused, or give it a next step.")
     <- evt:EVT0012
-rev 49 #5 · quiet_workstream · emitted · propose brief for Parsers (Propose): "No activity for 4 days (since 2026-09-30), paused? Next: mark it paused, or give it a next step."
+rev 49 #5 · quiet_workstream · emitted · propose brief for Parsers (Propose): "No activity for 4 days (since 2026-09-30), paused?", next: Some("Mark it paused, or give it a next step.")
     <- evt:EVT0014
