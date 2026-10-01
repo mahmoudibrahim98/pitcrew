@@ -23,7 +23,9 @@ export function MembersPage() {
       {members.error !== null && <ErrorNote error={members.error} what="load the members" />}
       {members.data !== undefined && rows.length === 0 && <p className="text-sm text-ink-2">No members yet.</p>}
       {rows.length > 0 && (
-        <div className="overflow-x-auto rounded-md border border-line bg-card">
+        // tabIndex so a keyboard user can scroll it horizontally: the table has no links of its
+        // own to tab through first (unlike WorkstreamsTable's names).
+        <div tabIndex={0} className="overflow-x-auto rounded-md border border-line bg-card">
           <table className="w-full text-sm">
             <caption className="sr-only">Members</caption>
             <thead>

@@ -68,9 +68,11 @@ export const feature = defineFeature({
   id: 'projects',
   layout: 'projects',
   routes: projectsRoutes,
+  // Both sort before the shell's own "Agent console" (order 40): e2e/shell.spec.ts's keyboard
+  // test tabs from it straight to the projects tree, which comes right after the top nav list.
   nav: [
-    { id: 'projects-list', label: 'Projects', to: 'projects', order: 35 },
-    { id: 'members', label: 'Members', to: 'members', order: 90 },
+    { id: 'projects-list', label: 'Projects', to: 'projects', order: 25 },
+    { id: 'members', label: 'Members', to: 'members', order: 35 },
   ],
   commands: [{ id: 'go-projects', label: 'Go to Projects', group: 'Go to', run: (c) => c.go('projects') }],
   create: [{ id: 'task', label: 'Task', order: 10, dialog: lazy(() => import('./new-task.tsx').then((m) => ({ default: m.NewTaskDialog }))) }],

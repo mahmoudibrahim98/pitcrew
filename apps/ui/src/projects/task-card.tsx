@@ -96,7 +96,9 @@ export function TaskCard({
             {priority.label}
           </span>
         )}
-        {needsYou && <span className="rounded-pill bg-warn-soft px-1.5 py-px font-medium text-warn">Needs you</span>}
+        {/* `text-warn` on `bg-warn-soft` falls short of 4.5:1 in the light theme (see
+            design/status-pill.tsx); `text-ink-2` keeps the tinted background as the cue. */}
+        {needsYou && <span className="rounded-pill bg-warn-soft px-1.5 py-px font-medium text-ink-2">Needs you</span>}
         <span className="ml-auto">
           {task.assignee === undefined ? (
             <span className="text-ink-2">Unassigned</span>
