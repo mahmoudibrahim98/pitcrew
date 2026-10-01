@@ -49,6 +49,10 @@ mod slurm;
 mod tunnel;
 
 #[cfg(unix)]
+#[path = "deploy/tunnel_fake.rs"]
+mod tunnel_fake;
+
+#[cfg(unix)]
 mod unix {
     use crate::slurm;
     use pitcrew_remote::helper::{HashTool, MIN_TMUX, Progress, parse_tmux_version, tmux_name};
@@ -97,6 +101,9 @@ mod unix {
         }
         if let Ok(mode) = std::env::var(DAEMON_ENV) {
             return act_as_daemon(&mode);
+        }
+        if let Ok(spec) = std::env::var(crate::tunnel_fake::APP_ENV) {
+            return crate::tunnel_fake::act_as_app(Path::new(&spec));
         }
         if let Some(code) = act_as_ssh() {
             return ExitCode::from(code);
@@ -176,7 +183,7 @@ mod unix {
             return Some(255);
         }
         let args: Vec<String> = std::env::args().skip(1).collect();
-        if let Some(code) = crate::tunnel::fake(&remote, &dir, &args) {
+        if let Some(code) = crate::tunnel_fake::fake(&remote, &dir, &args) {
             return Some(code);
         }
         Some(fake_ssh(&remote, &dir))
@@ -361,20 +368,12 @@ mod unix {
     }
 
     /// `pitcrewd serve --listen unix:<path>`: binds the socket, serves each connection (see
-    /// [`crate::tunnel::serve_connection`]) and waits to be killed. `exit` fails at once, saying
+    /// [`crate::tunnel_fake::serve_connection`]) and waits to be killed. `exit` fails at once, saying
     /// why on stderr; `nosocket` never binds. `connect --socket <path>` is the real stdio bridge.
     fn act_as_daemon(mode: &str) -> ExitCode {
         if mode == "connect" {
-            let args: Vec<String> = std::env::args().skip(1).collect();
-            return match args.as_slice() {
-                [connect, flag, socket] if connect == "connect" && flag == "--socket" => {
-                    pitcrew_remote::bridge::run(Path::new(socket))
-                }
-                _ => {
-                    eprintln!("usage: pitcrewd connect --socket <path>");
-                    ExitCode::from(pitcrew_remote::bridge::EXIT_USAGE)
-                }
-            };
+            // `pitcrewd connect <args>`, as the daemon's CLI will run it.
+            return pitcrew_remote::bridge::main(std::env::args_os().skip(2));
         }
         let socket = std::env::args()
             .skip(1)
@@ -401,7 +400,9 @@ mod unix {
                 println!("fake pitcrewd listening");
                 for stream in listener.incoming().flatten() {
                     let socket = socket.clone();
-                    std::thread::spawn(move || crate::tunnel::serve_connection(stream, &socket));
+                    std::thread::spawn(move || {
+                        crate::tunnel_fake::serve_connection(stream, &socket);
+                    });
                 }
                 ExitCode::SUCCESS
             }

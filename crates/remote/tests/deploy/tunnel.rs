@@ -1,783 +1,30 @@
 //! The tunnel ([`Connector`]) and the stdio bridge, against `deploy.rs`'s fake machine (with
-//! `slurm.rs`'s fake SLURM for jobs).
-//!
-//! The fake `ssh` also plays the tunnel's calls, as OpenSSH does them:
-//! - `ssh -N … -o ControlMaster=yes -o ControlPath=<p> -- <host>`, a link: it "connects" (or
-//!   fails, if the network is down), asks for a password through `SSH_ASKPASS` where the machine
-//!   wants one, listens on `<p>`, and serves its clients: `check`, `forward` (it then listens on
-//!   the local socket and relays each connection to the daemon's socket, or logs "open failed:
-//!   administratively prohibited" and closes it where the machine forbids forwarding),
-//!   `session` and `stdio` channels. With a `ProxyCommand` it first runs it, as ssh does, and
-//!   ends when it ends. Its keepalives time out as ssh's would: after
-//!   `(ServerAliveCountMax + 1) × ServerAliveInterval` seconds of a down network.
-//! - `ssh -O <op> -o ControlPath=<p> -- <host>`: asks the link.
-//! - `ssh -o ControlMaster=no -o ControlPath=<p> … -- <host> <command>`: a channel of the link
-//!   running the command on the machine (like the plain fake: `/bin/sh -c`, in its home, with its
-//!   `PATH`), stdin and stdout relayed with their ends; with no link there it fails the way
-//!   `ProxyCommand=false` makes ssh fail. `-W` is a channel the `ProxyCommand` uses.
-//!
-//! It refuses (exit 255) a tunnel call without the options PitCrew must pass: agent and X11
-//! forwarding and local commands off; for a link also the configured forwardings cleared,
-//! host keys asked about and keepalives set; for a channel no login of its own.
-//!
-//! The machine's state is in files beside it: `net` (`down`: keepalives time out and new
-//! connections fail; `frozen`: nothing answers and nothing times out, as for a laptop asleep;
-//! absent: up), `no-forwarding` (`AllowStreamLocalForwarding no`), `password` (links to
-//! `cluster` ask for it; each ask is logged to `asked.log` as `text` or `empty`, never the
-//! answer). Each tunnel call is logged to `tunnel.log`.
-//!
-//! The fake daemon (`pitcrewd serve`) echoes every connection, half-closes like it, answers
-//! `GET` with HTTP, and on `close-write\n` says `closing\n`, half-closes, and appends what it
-//! still receives to `<socket>.got`.
+//! `slurm.rs`'s fake SLURM for jobs). How the fake `ssh` plays the tunnel's calls, and the
+//! machine's state files, are in `tunnel_fake.rs`.
 
 use crate::slurm::{self as fake_slurm, Config};
+use crate::tunnel_fake::{
+    APP_ENV, ASKED, AppSpec, CLOSE_WRITE, DROP_AFTER, FORWARD_FAIL_ONCE, MAX_SESSIONS, NET,
+    NO_FORWARDING, Net, PASSWORD, REFUSED, TUNNEL_LOG, TunnelCall,
+};
 use crate::unix::{
-    Machine, RUN_ENV, Remote, alive, daemon, decode, deploy_and_start, launch_options, mode,
+    Machine, RUN_ENV, Remote, alive, daemon, deploy_and_start, launch_options, me, mode,
     private_dir, quick, run_mark, runtime, stop_helper,
 };
 use pitcrew_remote::helper::slurm::{LastHop, Site, SocketPlace};
 use pitcrew_remote::{
     Connector, ConnectorOptions, Daemon, DirectLauncher, JobOptions, Launcher as _, LinkState,
     Platform, PromptCancel, PromptFuture, PromptHandler, PromptKind, PromptRequest, Reply, Secret,
-    SlurmLauncher, Ssh, Target, Transport, Unreachable, WallClock, deploy,
+    SlurmLauncher, Ssh, SshError, Target, Transport, TunnelError, Unreachable, WallClock, deploy,
 };
-use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::io::{BufRead as _, BufReader, Read, Write};
-use std::net::Shutdown;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::CommandExt as _;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-const TUNNEL_LOG: &str = "tunnel.log";
-const ASKED: &str = "asked.log";
-const NET: &str = "net";
-const NO_FORWARDING: &str = "no-forwarding";
-/// One line per forwarded channel the machine refused.
-const REFUSED: &str = "refused.log";
-const PASSWORD: &str = "password";
-/// What the fake daemon reads to half-close first.
-const CLOSE_WRITE: &[u8] = b"close-write\n";
-
-// ─── The fake ssh, for the tunnel ──────────────────────────────────────────────────────────
-
-/// One call's arguments, as ssh reads them.
-#[derive(Debug, Default)]
-struct Call {
-    options: Vec<(String, String)>,
-    flags: Vec<String>,
-    config: Option<String>,
-    log: Option<PathBuf>,
-    op: Option<String>,
-    forward: Option<String>,
-    stdio: Option<String>,
-    jump: Option<String>,
-    host: String,
-    command: Option<String>,
-}
-
-impl Call {
-    fn parse(args: &[String]) -> Self {
-        let mut call = Self::default();
-        let mut args = args.iter();
-        while let Some(arg) = args.next() {
-            let mut value = || args.next().cloned().unwrap_or_default();
-            match arg.as_str() {
-                "-o" => {
-                    let option = value();
-                    let (key, val) = option.split_once('=').unwrap_or((&option, ""));
-                    call.options.push((key.to_owned(), val.to_owned()));
-                }
-                "-F" => call.config = Some(value()),
-                "-E" => call.log = Some(PathBuf::from(value())),
-                "-O" => call.op = Some(value()),
-                "-L" => call.forward = Some(value()),
-                "-W" => call.stdio = Some(value()),
-                "-J" => call.jump = Some(value()),
-                "--" => {
-                    call.host = value();
-                    call.command = args.next().cloned();
-                    break;
-                }
-                flag => call.flags.push(flag.to_owned()),
-            }
-        }
-        call
-    }
-
-    /// An option's value, the first given winning, as ssh's.
-    fn option(&self, name: &str) -> Option<&str> {
-        self.options
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
-    }
-
-    fn flag(&self, flag: &str) -> bool {
-        self.flags.iter().any(|f| f == flag)
-    }
-
-    fn kind(&self) -> Option<&'static str> {
-        if self.op.is_some() {
-            Some("control")
-        } else if self.flag("-N") {
-            Some("link")
-        } else if self.stdio.is_some() {
-            Some("stdio")
-        } else if self.option("ControlMaster") == Some("no") {
-            Some("session")
-        } else {
-            None
-        }
-    }
-
-    /// What ssh logs (`-E`), from any thread.
-    fn say(&self, line: &str) {
-        match &self.log {
-            Some(path) => {
-                if let Ok(mut file) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(path)
-                {
-                    let _ = writeln!(file, "{line}");
-                }
-            }
-            None => eprintln!("{line}"),
-        }
-    }
-}
-
-/// One line of `tunnel.log`.
-#[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct TunnelCall {
-    pub(crate) pid: u32,
-    pub(crate) kind: String,
-    pub(crate) host: String,
-    pub(crate) op: Option<String>,
-    /// For a session, the command line, unwrapped.
-    pub(crate) line: Option<String>,
-    pub(crate) proxy: Option<String>,
-    pub(crate) args: Vec<String>,
-}
-
-/// The machine's network.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Net {
-    Up,
-    Down,
-    Frozen,
-}
-
-fn net(machine: &Path) -> Net {
-    match std::fs::read_to_string(machine.join(NET)).as_deref() {
-        Ok("down") => Net::Down,
-        Ok("frozen") => Net::Frozen,
-        _ => Net::Up,
-    }
-}
-
-/// Waits for the network to be up (for ever: a link's keepalives end the process).
-fn wait_up(machine: &Path) {
-    while net(machine) != Net::Up {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// Plays the tunnel's calls; `None` for any other call (the plain fake plays it).
-pub(crate) fn fake(remote: &Remote, dir: &Path, args: &[String]) -> Option<u8> {
-    let call = Call::parse(args);
-    let kind = call.kind()?;
-    let machine = dir.parent()?.to_path_buf();
-    log_call(&machine, &call, kind);
-    if let Err(why) = check_options(&call, kind) {
-        call.say(&format!("fake ssh: refused: {why}"));
-        return Some(255);
-    }
-    Some(match kind {
-        "control" => control_op(&call),
-        "link" => link(&machine, &call),
-        "stdio" => stdio_forward(&call),
-        _ => session(remote, &call),
-    })
-}
-
-fn log_call(machine: &Path, call: &Call, kind: &str) {
-    let entry = TunnelCall {
-        pid: std::process::id(),
-        kind: kind.to_owned(),
-        host: call.host.clone(),
-        op: call.op.clone(),
-        line: call.command.as_deref().and_then(decode),
-        proxy: call.option("ProxyCommand").map(str::to_owned),
-        args: std::env::args().skip(1).collect(),
-    };
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(machine.join(TUNNEL_LOG))
-    {
-        let _ = writeln!(file, "{}", serde_json::to_string(&entry).unwrap());
-    }
-}
-
-/// The options PitCrew must pass, by kind of call.
-fn check_options(call: &Call, kind: &str) -> Result<(), String> {
-    let want = |name: &str, value: &str| {
-        if call
-            .option(name)
-            .is_some_and(|v| v.eq_ignore_ascii_case(value))
-        {
-            Ok(())
-        } else {
-            Err(format!("{name}={value} is missing"))
-        }
-    };
-    if kind == "control" {
-        return if call.config.as_deref() == Some("none") {
-            Ok(())
-        } else {
-            Err("-F none is missing".to_owned())
-        };
-    }
-    want("ForwardAgent", "no")?;
-    want("ForwardX11", "no")?;
-    want("PermitLocalCommand", "no")?;
-    if kind == "link" {
-        want("ClearAllForwardings", "yes")?;
-        want("StrictHostKeyChecking", "ask")?;
-        want("ControlMaster", "yes")?;
-        want("ControlPersist", "no")?;
-        for keepalive in ["ServerAliveInterval", "ServerAliveCountMax"] {
-            if call
-                .option(keepalive)
-                .and_then(|v| v.parse::<u64>().ok())
-                .is_none()
-            {
-                return Err(format!("{keepalive} is missing"));
-            }
-        }
-    } else {
-        want("ControlMaster", "no")?;
-        want("ProxyCommand", "false")?;
-        want("BatchMode", "yes")?;
-        if call.config.as_deref() != Some("none") {
-            return Err("-F none is missing".to_owned());
-        }
-    }
-    Ok(())
-}
-
-/// Connects to the link at the call's `ControlPath`.
-fn to_master(call: &Call) -> std::io::Result<UnixStream> {
-    let path = call
-        .option("ControlPath")
-        .ok_or_else(|| std::io::Error::other("no ControlPath"))?;
-    UnixStream::connect(path)
-}
-
-/// Sends one request to the link and reads its answer line (`None` at end of file).
-fn ask_master(stream: &mut UnixStream, request: &str) -> Option<String> {
-    stream.write_all(format!("{request}\n").as_bytes()).ok()?;
-    let mut line = String::new();
-    let mut reader = BufReader::new(stream.try_clone().ok()?);
-    match reader.read_line(&mut line) {
-        Ok(n) if n > 0 => Some(line.trim_end().to_owned()),
-        _ => None,
-    }
-}
-
-/// `ssh -O <op>`.
-fn control_op(call: &Call) -> u8 {
-    let Ok(mut master) = to_master(call) else {
-        eprintln!(
-            "Control socket connect({}): No such file or directory",
-            call.option("ControlPath").unwrap_or("")
-        );
-        return 255;
-    };
-    let request = match (call.op.as_deref(), &call.forward) {
-        (Some("forward"), Some(spec)) => {
-            let (local, remote) = spec.split_once(':').unwrap_or((spec, ""));
-            format!("forward {local} {remote}")
-        }
-        (Some(op), _) => op.to_owned(),
-        (None, _) => return 255,
-    };
-    match ask_master(&mut master, &request) {
-        Some(answer) if answer.starts_with("ok") => {
-            if call.op.as_deref() == Some("check") {
-                eprintln!("Master running (pid={})", answer.trim_start_matches("ok "));
-            }
-            0
-        }
-        Some(answer) => {
-            eprintln!("{answer}");
-            255
-        }
-        None => 255,
-    }
-}
-
-/// `ssh -N`: a link, as a ControlMaster.
-fn link(machine: &Path, call: &Call) -> u8 {
-    let host = call.host.clone();
-    if net(machine) != Net::Up {
-        std::thread::sleep(Duration::from_millis(200));
-        call.say(&format!(
-            "ssh: connect to host {host} port 22: Network is unreachable"
-        ));
-        return 255;
-    }
-    // A node through the login link: the ProxyCommand carries the connection.
-    let lost = Arc::new(AtomicBool::new(false));
-    let mut carrier = None;
-    if let Some(proxy) = call.option("ProxyCommand") {
-        let command = proxy
-            .replace("%%", "\u{0}")
-            .replace("%h", &host)
-            .replace("%p", "22")
-            .replace('\u{0}', "%");
-        let mut child = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(&command)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let (banner, got) = std::sync::mpsc::channel();
-        let gone = lost.clone();
-        std::thread::spawn(move || {
-            let mut reader = BufReader::new(stdout);
-            let mut line = String::new();
-            let ok = reader.read_line(&mut line).is_ok() && line.starts_with("SSH-2.0-");
-            let _ = banner.send(ok);
-            // The connection lasts as long as the command's output.
-            let _ = std::io::copy(&mut reader, &mut std::io::sink());
-            gone.store(true, Ordering::SeqCst);
-        });
-        if got.recv_timeout(Duration::from_secs(10)) != Ok(true) {
-            call.say("kex_exchange_identification: Connection closed by remote host");
-            let _ = child.kill();
-            let _ = child.wait();
-            return 255;
-        }
-        carrier = Some(child);
-    }
-    if host == "cluster"
-        && let Ok(expected) = std::fs::read_to_string(machine.join(PASSWORD))
-        && !sign_in(machine, &host, expected.trim_end())
-    {
-        call.say(&format!(
-            "someone@{host}: Permission denied (publickey,password)."
-        ));
-        return 255;
-    }
-    call.say(&format!(
-        "Authenticated to {host} ([192.0.2.10]:22) using \"publickey\"."
-    ));
-    let control = PathBuf::from(call.option("ControlPath").unwrap());
-    let _ = std::fs::remove_file(&control);
-    let listener = UnixListener::bind(&control).unwrap();
-    let exit = Arc::new(AtomicBool::new(false));
-    let mask = call
-        .option("StreamLocalBindMask")
-        .and_then(|m| u32::from_str_radix(m, 8).ok())
-        .unwrap_or(0o177);
-    {
-        let machine = machine.to_path_buf();
-        let log = call.log.clone();
-        let exit = exit.clone();
-        std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let machine = machine.clone();
-                let log = log.clone();
-                let exit = exit.clone();
-                std::thread::spawn(move || serve_mux(stream, &machine, log, mask, &exit));
-            }
-        });
-    }
-    let interval: u64 = call
-        .option("ServerAliveInterval")
-        .and_then(|v| v.parse().ok())
-        .unwrap();
-    let count: u64 = call
-        .option("ServerAliveCountMax")
-        .and_then(|v| v.parse().ok())
-        .unwrap();
-    let silence = Duration::from_secs((count + 1) * interval);
-    let mut down_since: Option<Instant> = None;
-    let code = loop {
-        std::thread::sleep(Duration::from_millis(100));
-        if lost.load(Ordering::SeqCst) {
-            call.say("Connection closed by UNKNOWN port 65535");
-            break 255;
-        }
-        if exit.load(Ordering::SeqCst) {
-            break 0;
-        }
-        match net(machine) {
-            Net::Down => {
-                if down_since.get_or_insert_with(Instant::now).elapsed() >= silence {
-                    call.say(&format!("Timeout, server {host} not responding."));
-                    break 255;
-                }
-            }
-            // Asleep: nothing answers, and nothing notices.
-            Net::Up | Net::Frozen => down_since = None,
-        }
-    };
-    let _ = std::fs::remove_file(&control);
-    if let Some(mut child) = carrier {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    code
-}
-
-/// Asks for the password through askpass, as ssh does: three tries, each logged as `text` or
-/// `empty` (never the answer).
-fn sign_in(machine: &Path, host: &str, expected: &str) -> bool {
-    let Ok(program) = std::env::var("SSH_ASKPASS") else {
-        return false;
-    };
-    for _ in 0..3 {
-        let out = Command::new(&program)
-            .arg(format!("someone@{host}'s password: "))
-            .output();
-        let answer = out
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .trim_end_matches('\n')
-                    .to_owned()
-            })
-            .unwrap_or_default();
-        let mut asked = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(machine.join(ASKED))
-            .unwrap();
-        writeln!(
-            asked,
-            "{}",
-            if answer.is_empty() { "empty" } else { "text" }
-        )
-        .unwrap();
-        if answer == expected {
-            return true;
-        }
-    }
-    false
-}
-
-/// One client of a link.
-fn serve_mux(
-    mut stream: UnixStream,
-    machine: &Path,
-    log: Option<PathBuf>,
-    mask: u32,
-    exit: &AtomicBool,
-) {
-    let mut line = String::new();
-    if BufReader::new(stream.try_clone().unwrap())
-        .read_line(&mut line)
-        .is_err()
-    {
-        return;
-    }
-    let words: Vec<&str> = line.split_whitespace().collect();
-    let say = |text: &str| {
-        Call {
-            log: log.clone(),
-            ..Call::default()
-        }
-        .say(text);
-    };
-    match words.as_slice() {
-        ["check"] => {
-            let _ = writeln!(stream, "ok {}", std::process::id());
-        }
-        ["exit"] => {
-            exit.store(true, Ordering::SeqCst);
-            let _ = writeln!(stream, "ok");
-        }
-        ["forward", local, remote] => {
-            match listen_forward(local, remote, machine, log.clone(), mask) {
-                Ok(()) => {
-                    let _ = writeln!(stream, "ok");
-                }
-                Err(e) => {
-                    say(&format!("fake ssh: forward failed: {e}"));
-                    let _ = writeln!(stream, "fail {e}");
-                }
-            }
-        }
-        ["session" | "stdio", ..] => {
-            // A channel opens only while the network answers.
-            wait_up(machine);
-            let _ = writeln!(stream, "ok");
-            // Held until the client goes.
-            let _ = std::io::copy(&mut stream, &mut std::io::sink());
-        }
-        _ => {
-            let _ = writeln!(stream, "fail unknown request");
-        }
-    }
-}
-
-/// The master's listener for a forward: each connection is a channel to `remote`.
-fn listen_forward(
-    local: &str,
-    remote: &str,
-    machine: &Path,
-    log: Option<PathBuf>,
-    mask: u32,
-) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    // StreamLocalBindUnlink=yes.
-    let _ = std::fs::remove_file(local);
-    let listener = UnixListener::bind(local)?;
-    std::fs::set_permissions(local, std::fs::Permissions::from_mode(0o666 & !mask))?;
-    let machine = machine.to_path_buf();
-    let remote = remote.to_owned();
-    std::thread::spawn(move || {
-        for client in listener.incoming().flatten() {
-            let machine = machine.clone();
-            let remote = remote.clone();
-            let say = {
-                let log = log.clone();
-                move |text: &str| {
-                    Call {
-                        log: log.clone(),
-                        ..Call::default()
-                    }
-                    .say(text);
-                }
-            };
-            std::thread::spawn(move || {
-                if machine.join(NO_FORWARDING).exists() {
-                    say("channel 3: open failed: administratively prohibited: open failed");
-                    // Counted, for the cases.
-                    if let Ok(mut refused) = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(machine.join(REFUSED))
-                    {
-                        let _ = writeln!(refused, "refused");
-                    }
-                    drop(client);
-                    return;
-                }
-                wait_up(&machine);
-                match UnixStream::connect(&remote) {
-                    Ok(daemon) => relay(client, daemon),
-                    Err(_) => {
-                        say("channel 3: open failed: connect failed: No such file or directory");
-                        drop(client);
-                    }
-                }
-            });
-        }
-    });
-    Ok(())
-}
-
-/// Copies both ways, passing each end of file on as a half-close.
-fn relay(a: UnixStream, b: UnixStream) {
-    let (mut a_in, mut b_out) = (a.try_clone().unwrap(), b.try_clone().unwrap());
-    let up = std::thread::spawn(move || {
-        let _ = std::io::copy(&mut a_in, &mut b_out);
-        let _ = b_out.shutdown(Shutdown::Write);
-    });
-    let (mut b_in, mut a_out) = (b, a);
-    let _ = std::io::copy(&mut b_in, &mut a_out);
-    let _ = a_out.shutdown(Shutdown::Write);
-    let _ = up.join();
-}
-
-/// `ssh -W`: a channel the `ProxyCommand` carries a node's connection on.
-fn stdio_forward(call: &Call) -> u8 {
-    let Ok(mut master) = to_master(call) else {
-        eprintln!("Control socket connect: No such file or directory");
-        return 255;
-    };
-    if ask_master(
-        &mut master,
-        &format!("stdio {}", call.stdio.as_deref().unwrap_or("")),
-    )
-    .is_none_or(|a| a != "ok")
-    {
-        return 255;
-    }
-    println!("SSH-2.0-fake");
-    std::io::stdout().flush().unwrap();
-    // The node's connection ends (the client stops reading) or the login link does.
-    std::thread::spawn(|| {
-        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
-        std::process::exit(0);
-    });
-    let _ = std::io::copy(&mut master, &mut std::io::sink());
-    255
-}
-
-/// A channel running a command on the machine.
-fn session(remote: &Remote, call: &Call) -> u8 {
-    let Ok(mut master) = to_master(call) else {
-        // ProxyCommand=false: ssh would have logged in itself; it fails instead.
-        call.say("kex_exchange_identification: Connection closed by remote host");
-        return 255;
-    };
-    if ask_master(&mut master, "session").is_none() {
-        call.say("mux_client_request_session: read from master failed: Broken pipe");
-        return 255;
-    }
-    let Some(command) = &call.command else {
-        return 255;
-    };
-    // As the plain fake: another shell as the machine's `sh` runs the command line itself
-    // (the wrapper is `login_shells.rs`'s).
-    let (shell, script) = match (&remote.interpreter, decode(command)) {
-        (Some(sh), Some(line)) => (
-            sh.clone(),
-            line.replacen("'/bin/sh' -c", &format!("'{sh}' -c"), 1),
-        ),
-        _ => ("/bin/sh".to_owned(), command.clone()),
-    };
-    let mut child = Command::new(&shell)
-        .arg("-c")
-        .arg(&script)
-        .current_dir(&remote.home)
-        .env("HOME", &remote.home)
-        .env("PATH", &remote.path)
-        .envs(remote.env.iter().map(|(k, v)| (k, v)))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .spawn()
-        .unwrap();
-    let pid = child.id();
-    // The link going away ends the channel.
-    {
-        let log = call.log.clone();
-        std::thread::spawn(move || {
-            let _ = std::io::copy(&mut master, &mut std::io::sink());
-            if let Some(group) = i32::try_from(pid)
-                .ok()
-                .and_then(rustix::process::Pid::from_raw)
-            {
-                let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
-            }
-            Call {
-                log,
-                ..Call::default()
-            }
-            .say("mux_client_read_packet: read header failed: Broken pipe");
-            std::process::exit(255);
-        });
-    }
-    let mut to_remote = child.stdin.take().unwrap();
-    std::thread::spawn(move || {
-        let _ = std::io::copy(&mut std::io::stdin(), &mut to_remote);
-    });
-    let mut from_remote = child.stdout.take().unwrap();
-    let out = std::thread::spawn(move || {
-        let mut out = std::io::stdout();
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            match from_remote.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if out.write_all(&buf[..n]).and_then(|()| out.flush()).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-        // The command's end of output, passed on.
-        if let Ok(null) = std::fs::OpenOptions::new().write(true).open("/dev/null") {
-            let _ = rustix::stdio::dup2_stdout(&null);
-        }
-    });
-    let mut errors = child.stderr.take().unwrap();
-    let err = std::thread::spawn(move || {
-        let _ = std::io::copy(&mut errors, &mut std::io::stderr());
-    });
-    let status = child.wait().unwrap();
-    let _ = out.join();
-    let _ = err.join();
-    status
-        .code()
-        .and_then(|c| u8::try_from(c).ok())
-        .unwrap_or(255)
-}
-
-// ─── The fake daemon's connections ─────────────────────────────────────────────────────────
-
-/// See the module docs.
-pub(crate) fn serve_connection(mut stream: UnixStream, socket: &Path) {
-    let mut head = Vec::new();
-    let mut byte = [0u8; 1];
-    while head.len() < CLOSE_WRITE.len() {
-        match stream.read(&mut byte) {
-            Ok(1) => head.push(byte[0]),
-            _ => break,
-        }
-    }
-    if head.starts_with(b"GET ") {
-        let mut request = head;
-        while !request.ends_with(b"\r\n\r\n") {
-            match stream.read(&mut byte) {
-                Ok(1) => request.push(byte[0]),
-                _ => break,
-            }
-        }
-        let _ = stream.write_all(
-            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\n\
-              connection: close\r\n\r\n{}",
-        );
-        return;
-    }
-    if head == CLOSE_WRITE {
-        let _ = stream.write_all(b"closing\n");
-        let _ = stream.shutdown(Shutdown::Write);
-        let mut rest = Vec::new();
-        let _ = stream.read_to_end(&mut rest);
-        let got = PathBuf::from(format!("{}.got", socket.display()));
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(got)
-        {
-            let _ = file.write_all(&rest);
-        }
-        return;
-    }
-    if stream.write_all(&head).is_err() {
-        return;
-    }
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if stream.write_all(&buf[..n]).is_err() {
-                    return;
-                }
-            }
-        }
-    }
-    let _ = stream.shutdown(Shutdown::Write);
-}
-
 // ─── Fixtures ──────────────────────────────────────────────────────────────────────────────
 
 /// The askpass binary.
@@ -792,12 +39,14 @@ fn options() -> ConnectorOptions {
         connect_wait: Duration::from_secs(15),
         bridge_wait: Duration::from_secs(15),
         check_every: Duration::from_secs(2),
-        probe_every: Duration::from_secs(30),
-        probe_timeout: Duration::from_secs(3),
+        probe_every: Duration::from_secs(2),
+        probe_timeout: Duration::from_secs(2),
         backoff_min: Duration::from_millis(200),
         backoff_max: Duration::from_secs(2),
         give_up_after: Duration::from_secs(60),
         retry_every: Duration::from_secs(2),
+        // Never the developer's own ~/.ssh/config.
+        ssh_config: Some(PathBuf::from("/nonexistent/pitcrew-test-ssh-config")),
         ..ConnectorOptions::default()
     }
 }
@@ -896,6 +145,47 @@ fn net_set(m: &Machine, state: Net) {
     }
 }
 
+/// The process of the newest link to `host`.
+fn newest_link(m: &Machine, host: &str) -> u32 {
+    tunnel_calls(m)
+        .iter()
+        .rev()
+        .find(|c| c.kind == "link" && c.host == host)
+        .unwrap()
+        .pid
+}
+
+/// Kills the newest link to `host`, as a connection reset would end it.
+fn kill_link(m: &Machine, host: &str) {
+    let pid = rustix::process::Pid::from_raw(i32::try_from(newest_link(m, host)).unwrap());
+    rustix::process::kill_process(pid.unwrap(), rustix::process::Signal::KILL).unwrap();
+}
+
+/// How many links the machine's fake ssh started.
+fn links(m: &Machine) -> usize {
+    tunnel_calls(m).iter().filter(|c| c.kind == "link").count()
+}
+
+/// Opens a connection, trying again while the server refuses another session (one just
+/// closed may take a moment to be freed).
+fn open_when_free(
+    rt: &tokio::runtime::Runtime,
+    connector: &Connector,
+) -> pitcrew_remote::TunnelStream {
+    let start = Instant::now();
+    loop {
+        match rt.block_on(connector.connect()) {
+            Ok(stream) => return stream,
+            Err(TunnelError::Ssh(SshError::SessionRefused { .. }))
+                if start.elapsed() < Duration::from_secs(10) =>
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => panic!("{e:?}"),
+        }
+    }
+}
+
 /// The tunnel calls the machine's fake ssh saw.
 fn tunnel_calls(m: &Machine) -> Vec<TunnelCall> {
     std::fs::read_to_string(m.dir.path().join(TUNNEL_LOG))
@@ -905,9 +195,22 @@ fn tunnel_calls(m: &Machine) -> Vec<TunnelCall> {
         .collect()
 }
 
-/// A target whose ssh is a fresh fake of `m`.
+/// A target whose ssh is a fresh fake of `m`, with connection reuse.
 fn target(m: &Machine) -> Target {
-    m.target(&m.fake(Remote::default()))
+    reuse(m, &m.fake(Remote::default()))
+}
+
+/// `m` through `fake`, with connection reuse (a ControlMaster), as on Unix.
+fn reuse(m: &Machine, fake: &crate::unix::Fake) -> Target {
+    on(m, fake.ssh.clone().with_multiplex(true))
+}
+
+/// `m` through `ssh`.
+fn on(m: &Machine, ssh: Ssh) -> Target {
+    Target::with_layout(ssh, "cluster", m.layout(), Platform::LinuxX86_64)
+        .unwrap()
+        .with_tool_path(m.bin.to_str().unwrap())
+        .unwrap()
 }
 
 /// The connectors' private directories under a fake's runtime directory.
@@ -952,7 +255,7 @@ fn tunnel_forwarded_socket_with_many_connections() {
     let fake = m.fake(Remote::default());
     let rt = runtime();
     let launcher = Arc::new(DirectLauncher::new(launch_options()));
-    let connector = start(&rt, Daemon::new(m.target(&fake), launcher), options());
+    let connector = start(&rt, Daemon::new(reuse(&m, &fake), launcher), options());
     wait_for(
         &rt,
         &connector,
@@ -1027,7 +330,8 @@ fn tunnel_forwarding_refused_then_the_stdio_bridge() {
     assert_eq!(connector.transport(), Some(Transport::Stdio));
     let data = pattern(100_000, 7);
     assert!(echo(&rt, &connector, &data) == data);
-    // The bridge ran in channels of the link, as `exec <helper> connect --socket <socket>`.
+    // The bridge ran in sessions of the link, as `exec <helper> connect --socket <socket>
+    // --nonce <hex>`, a fresh nonce each time.
     let calls = tunnel_calls(&m);
     let socket = m.layout().socket();
     let bridge = pitcrew_remote::quote::posix_command(&[
@@ -1036,14 +340,20 @@ fn tunnel_forwarding_refused_then_the_stdio_bridge() {
         "connect",
         "--socket",
         &socket,
+        "--nonce",
     ])
     .unwrap();
-    assert!(
-        calls
-            .iter()
-            .any(|c| c.kind == "session" && c.line.as_deref() == Some(bridge.as_str())),
-        "{calls:?}"
-    );
+    let nonces: Vec<&str> = calls
+        .iter()
+        .filter(|c| c.kind == "session")
+        .filter_map(|c| c.line.as_deref()?.strip_prefix(&format!("{bridge} ")))
+        .collect();
+    assert!(nonces.len() >= 2, "{calls:?}");
+    for nonce in &nonces {
+        assert_eq!(nonce.len(), 16, "{nonce}");
+        assert!(nonce.bytes().all(|b| b.is_ascii_hexdigit()), "{nonce}");
+    }
+    assert_ne!(nonces[0], nonces[1]);
     let forwards = |calls: &[TunnelCall]| {
         calls
             .iter()
@@ -1206,7 +516,13 @@ fn tunnel_bridge_through_srun_to_a_node_local_socket() {
         socket,
     ]
     .to_vec();
-    assert!(steps.contains(&want), "{steps:?}");
+    // Then this call's `--nonce <hex>`, and `--framed`.
+    assert!(
+        steps
+            .iter()
+            .any(|s| s.starts_with(&want) && s.last().is_some_and(|a| a == "--framed")),
+        "{steps:?}"
+    );
     // No link to the node: the login node's link carried it all.
     assert!(
         tunnel_calls(&m)
@@ -1330,6 +646,32 @@ fn tunnel_a_node_that_fails_the_check_is_refused() {
     );
     rt.block_on(connector.close());
 
+    // A node named like one of the user's own Hosts: never connected to.
+    let config = m.dir.path().join("ssh_config");
+    std::fs::write(&config, "Host node017\n  HostName 192.0.2.17\n").unwrap();
+    let before = calls_to_nodes(&m);
+    let aliased = ConnectorOptions {
+        ssh_config: Some(config),
+        ..options()
+    };
+    let connector = start(
+        &rt,
+        Daemon::new(target(&m), Arc::new(launcher.clone())),
+        aliased,
+    );
+    let state = wait_for(&rt, &connector, "refused", Duration::from_secs(30), |s| {
+        matches!(
+            s,
+            LinkState::Unreachable {
+                why: Unreachable::Refused,
+                ..
+            }
+        )
+    });
+    assert!(state.to_string().contains("ssh config"), "{state}");
+    assert_eq!(calls_to_nodes(&m), before);
+    rt.block_on(connector.close());
+
     // A name that would be an option or a shell word, in both squeue and the record, with
     // either last hop.
     let endpoint = m.run_dir().join("endpoint.json");
@@ -1428,8 +770,9 @@ fn tunnel_a_dropped_stream_is_unverifiable_within_ten_seconds_then_recovers() {
 }
 
 /// The laptop slept: its wall clock jumped while the monotonic one stood still. The link has not
-/// noticed (nothing answers, nothing times out), but the connector checks at once, finds no
-/// answer, and reconnects when the network answers.
+/// noticed (nothing answers, nothing times out), but the connector checks at once and finds no
+/// answer; it checks again every second while the forward is silent, and is connected again
+/// once the network answers.
 fn tunnel_a_wall_clock_jump() {
     let m = Machine::new();
     deploy_and_start(&m);
@@ -1596,11 +939,12 @@ fn tunnel_askpass_during_a_reconnect() {
     std::fs::write(m.dir.path().join(PASSWORD), "s3cr3t").unwrap();
     let answers = Answers::new();
     let fake = m.fake(Remote::default());
-    let ssh: Ssh = fake.ssh.clone().with_prompts(askpass(), answers.clone());
-    let target = Target::with_layout(ssh, "cluster", m.layout(), Platform::LinuxX86_64)
-        .unwrap()
-        .with_tool_path(m.bin.to_str().unwrap())
-        .unwrap();
+    let ssh: Ssh = fake
+        .ssh
+        .clone()
+        .with_multiplex(true)
+        .with_prompts(askpass(), answers.clone());
+    let target = on(&m, ssh);
     let rt = runtime();
     let launcher = Arc::new(DirectLauncher::new(launch_options()));
     let connector = start(&rt, Daemon::new(target, launcher), options());
@@ -1621,6 +965,9 @@ fn tunnel_askpass_during_a_reconnect() {
         Duration::from_secs(15),
         unverifiable,
     );
+    // Down until the link gives up (its keepalives), so that reconnecting signs in again.
+    let link = newest_link(&m, "cluster");
+    crate::unix::eventually("the link to time out", || !alive(link));
     net_set(&m, Net::Up);
     wait_for(
         &rt,
@@ -1633,17 +980,11 @@ fn tunnel_askpass_during_a_reconnect() {
     let asked = std::fs::read_to_string(m.dir.path().join(ASKED)).unwrap();
     assert_eq!(asked.lines().collect::<Vec<_>>(), ["text", "text"]);
 
-    // Cancelled while reconnecting: no more attempts, no more prompts, until a retry.
+    // Cancelled while reconnecting: no more attempts, no more prompts, until a retry. (The link
+    // is patient now that the forward is known to work: it is broken outright, as a reset
+    // connection would be.)
     answers.queue.lock().unwrap().push_back(Reply::Cancel);
-    net_set(&m, Net::Down);
-    wait_for(
-        &rt,
-        &connector,
-        "unverifiable",
-        Duration::from_secs(15),
-        unverifiable,
-    );
-    net_set(&m, Net::Up);
+    kill_link(&m, "cluster");
     wait_for(
         &rt,
         &connector,
@@ -1716,6 +1057,519 @@ fn tunnel_under_every_posix_sh() {
         checked.push(shell.display().to_string());
     }
     println!("tunnels checked with sh = {checked:?}");
+}
+
+// ─── Limits and failures ───────────────────────────────────────────────────────────────────
+
+/// sshd's `MaxSessions` reached: one connection more is refused, as that connection's error
+/// alone. Watching opens no session, the state stays connected and the link stays; once one
+/// ends, the next opens.
+fn tunnel_a_session_over_max_sessions_is_refused_alone() {
+    let m = Machine::new();
+    deploy_and_start(&m);
+    std::fs::write(m.dir.path().join(MAX_SESSIONS), "2").unwrap();
+    let rt = runtime();
+    let launcher = Arc::new(DirectLauncher::new(launch_options()));
+    let stdio = ConnectorOptions {
+        transport: Some(Transport::Stdio),
+        ..options()
+    };
+    let connector = start(&rt, Daemon::new(target(&m), launcher), stdio);
+    wait_for(
+        &rt,
+        &connector,
+        "connected",
+        Duration::from_secs(30),
+        connected(Transport::Stdio),
+    );
+    let a = open_when_free(&rt, &connector);
+    let b = open_when_free(&rt, &connector);
+    let err = rt.block_on(connector.connect()).unwrap_err();
+    assert!(
+        matches!(err, TunnelError::Ssh(SshError::SessionRefused { .. })),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("MaxSessions"), "{err}");
+    // Checks (`-O check`) and keepalives go on meanwhile; nothing else.
+    let sessions = |m: &Machine| {
+        tunnel_calls(m)
+            .iter()
+            .filter(|c| c.kind == "session")
+            .count()
+    };
+    let before = sessions(&m);
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(
+        connector.state(),
+        LinkState::Connected {
+            transport: Transport::Stdio
+        }
+    );
+    assert_eq!(sessions(&m), before, "watching opened sessions");
+    assert_eq!(links(&m), 1);
+    // Both still carry their connections; then the next one opens.
+    let data = pattern(20_000, 19);
+    let (back_a, back_b) =
+        rt.block_on(async { tokio::join!(exchange(a, data.clone()), exchange(b, data.clone())) });
+    assert!(back_a == data && back_b == data);
+    let c = open_when_free(&rt, &connector);
+    assert!(rt.block_on(exchange(c, data.clone())) == data);
+    rt.block_on(connector.close());
+    stop_helper(&m);
+}
+
+/// A forward that failed for another reason than a refusal: the bridge carries the
+/// connections, nothing is remembered, and the forward is tried again next time.
+fn tunnel_a_forward_that_failed_once_is_not_remembered() {
+    let m = Machine::new();
+    deploy_and_start(&m);
+    std::fs::write(m.dir.path().join(FORWARD_FAIL_ONCE), "").unwrap();
+    let rt = runtime();
+    let launcher = Arc::new(DirectLauncher::new(launch_options()));
+    let connector = start(&rt, Daemon::new(target(&m), launcher), options());
+    wait_for(
+        &rt,
+        &connector,
+        "connected through the bridge",
+        Duration::from_secs(30),
+        connected(Transport::Stdio),
+    );
+    assert_eq!(connector.transport(), None);
+    let data = pattern(20_000, 21);
+    assert!(echo(&rt, &connector, &data) == data);
+
+    net_set(&m, Net::Down);
+    wait_for(
+        &rt,
+        &connector,
+        "unverifiable",
+        Duration::from_secs(15),
+        unverifiable,
+    );
+    net_set(&m, Net::Up);
+    wait_for(
+        &rt,
+        &connector,
+        "connected through a forward",
+        Duration::from_secs(30),
+        connected(Transport::Forwarded),
+    );
+    assert_eq!(connector.transport(), Some(Transport::Forwarded));
+    assert!(echo(&rt, &connector, &data) == data);
+    rt.block_on(connector.close());
+    stop_helper(&m);
+}
+
+/// Through srun, which passes a job step's output on a line at a time: the bridge frames its
+/// output, so a reply without a newline still comes at once. And watching starts no job step:
+/// one proves the way, then one per connection.
+fn tunnel_srun_line_buffering_and_job_steps() {
+    let site = Site {
+        name: "node-local".to_owned(),
+        socket: SocketPlace::NodeLocal,
+        last_hop: LastHop::SrunOverlap,
+        ..Site::default()
+    };
+    let (m, sim) = fake_slurm::machine(Config::default());
+    let tmp = m.dir.path().join("node-tmp");
+    private_dir(&tmp);
+    sim.set(|c| {
+        c.tmpdir = Some(tmp.clone());
+        c.line_buffered = true;
+    });
+    let plain = m.plain();
+    pitcrew_remote_deploy(&plain);
+    let script = fake_slurm::render(&plain, &site, &JobOptions::default());
+    let launcher = fake_slurm::launcher(&script);
+    crate::unix::block_on(launcher.start(&plain)).unwrap();
+
+    let rt = runtime();
+    let daemon =
+        Daemon::new(target(&m), Arc::new(launcher.clone())).with_last_hop(LastHop::SrunOverlap);
+    let connector = start(&rt, daemon, options());
+    wait_for(
+        &rt,
+        &connector,
+        "connected through srun",
+        Duration::from_secs(30),
+        connected(Transport::Stdio),
+    );
+    assert_eq!(sim.calls("srun").len(), 1);
+    assert!(
+        sim.calls("srun")[0].iter().any(|a| a == "--framed"),
+        "{:?}",
+        sim.calls("srun")
+    );
+    rt.block_on(async {
+        let mut stream = connector.connect().await.unwrap();
+        for word in [&b"ping"[..], b"pong"] {
+            stream.write_all(word).await.unwrap();
+            stream.flush().await.unwrap();
+            let mut got = [0u8; 4];
+            tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut got))
+                .await
+                .expect("a reply without a newline was held back")
+                .unwrap();
+            assert_eq!(&got[..], word);
+        }
+    });
+    let data = pattern(100_000, 23);
+    assert!(echo(&rt, &connector, &data) == data);
+    // Several rounds of checks later: still one step per connection.
+    std::thread::sleep(Duration::from_secs(6));
+    assert_eq!(sim.calls("srun").len(), 3);
+    rt.block_on(connector.close());
+    crate::unix::block_on(launcher.cancel(&plain)).unwrap();
+}
+
+/// An app that died with its connector running leaves its link (a ControlMaster, which outlives
+/// it) and its directory. The next connector stops that link and removes the directory, and
+/// leaves those of live connectors alone.
+fn tunnel_links_left_by_a_crash_are_stopped() {
+    let m = Machine::new();
+    deploy_and_start(&m);
+    let fake = m.fake(Remote::default());
+    let rt = runtime();
+    let launcher = Arc::new(DirectLauncher::new(launch_options()));
+    let live = start(
+        &rt,
+        Daemon::new(reuse(&m, &fake), launcher.clone()),
+        options(),
+    );
+    wait_for(
+        &rt,
+        &live,
+        "connected",
+        Duration::from_secs(30),
+        connected(Transport::Forwarded),
+    );
+
+    let spec = m.dir.path().join("app.json");
+    let app = AppSpec {
+        ssh: fake.dir.join("ssh"),
+        runtime_dir: fake.dir.join("rt"),
+        root: m.layout().root().to_owned(),
+        tool_path: m.bin.to_str().unwrap().to_owned(),
+    };
+    std::fs::write(&spec, serde_json::to_vec(&app).unwrap()).unwrap();
+    let status = Command::new(me())
+        .env(APP_ENV, &spec)
+        .env(RUN_ENV, run_mark())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status()
+        .unwrap();
+    assert!(status.success(), "the app did not connect: {status:?}");
+    let pids: Vec<u32> = tunnel_calls(&m)
+        .iter()
+        .filter(|c| c.kind == "link")
+        .map(|c| c.pid)
+        .collect();
+    assert_eq!(pids.len(), 2);
+    let (live_link, left) = (pids[0], pids[1]);
+    assert!(alive(left), "the crashed app's link is gone already");
+    let dirs = private_dirs(&fake);
+    assert_eq!(dirs.len(), 2, "{dirs:?}");
+
+    let next = start(&rt, Daemon::new(reuse(&m, &fake), launcher), options());
+    wait_for(
+        &rt,
+        &next,
+        "connected",
+        Duration::from_secs(30),
+        connected(Transport::Forwarded),
+    );
+    crate::unix::eventually("the crashed app's link to stop", || !alive(left));
+    let now = private_dirs(&fake);
+    assert_eq!(now.len(), 2, "{now:?}");
+    let gone: Vec<&PathBuf> = dirs.iter().filter(|d| !now.contains(d)).collect();
+    assert_eq!(gone.len(), 1, "{dirs:?} {now:?}");
+    assert!(alive(live_link));
+    let data = pattern(10_000, 27);
+    assert!(echo(&rt, &live, &data) == data);
+    rt.block_on(live.close());
+    rt.block_on(next.close());
+    stop_helper(&m);
+}
+
+/// A burst of failed connections (the helper refuses its socket now): one check of where the
+/// daemon is, not one per connection.
+fn tunnel_a_burst_of_failures_makes_one_check() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let m = Machine::new();
+    deploy_and_start(&m);
+    let rt = runtime();
+    let launcher = Arc::new(DirectLauncher::new(launch_options()));
+    let stdio = ConnectorOptions {
+        transport: Some(Transport::Stdio),
+        ..options()
+    };
+    let connector = start(&rt, Daemon::new(target(&m), launcher), stdio);
+    wait_for(
+        &rt,
+        &connector,
+        "connected",
+        Duration::from_secs(30),
+        connected(Transport::Stdio),
+    );
+    // The helper's `connect` refuses from now on.
+    let binary = PathBuf::from(m.layout().binary("1.0.0"));
+    let script = std::fs::read_to_string(&binary).unwrap();
+    let mut refusing: String = script
+        .lines()
+        .map(|line| {
+            if line.starts_with("connect)") {
+                "connect) echo 'pitcrewd connect: the socket is not safe to use: x' >&2; exit 3 ;;"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    refusing.push('\n');
+    let was = mode(&binary);
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(&binary, refusing).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(was)).unwrap();
+
+    let checks = |m: &Machine| {
+        tunnel_calls(m)
+            .iter()
+            .filter(|c| {
+                c.kind == "session" && !c.line.as_deref().is_some_and(|l| l.contains(" connect "))
+            })
+            .count()
+    };
+    let before = checks(&m);
+    let burst = Instant::now();
+    rt.block_on(async {
+        for _ in 0..15 {
+            let err = connector.connect().await.unwrap_err();
+            assert!(matches!(err, TunnelError::Refused(_)), "{err:?}");
+        }
+    });
+    let took = burst.elapsed();
+    assert!(took < Duration::from_secs(8), "the burst took {took:?}");
+    crate::unix::eventually("a check", || checks(&m) > before);
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(checks(&m) - before, 1, "checks for a burst of 15 failures");
+    assert_eq!(links(&m), 1);
+    assert!(connector.state().is_connected(), "{}", connector.state());
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(&binary, script).unwrap();
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(was)).unwrap();
+    let data = pattern(10_000, 29);
+    assert!(echo(&rt, &connector, &data) == data);
+    rt.block_on(connector.close());
+    stop_helper(&m);
+}
+
+/// Without connection reuse (as on Windows) each connection signs in by itself. Closing the
+/// connector ends the open ones; a sign-in cancelled for a connection stops the attempts (no
+/// more prompts) until the person retries.
+fn tunnel_without_connection_reuse() {
+    let m = Machine::new();
+    deploy_and_start(&m);
+    std::fs::write(m.dir.path().join(PASSWORD), "s3cr3t").unwrap();
+    let answers = Answers::new();
+    let fake = m.fake(Remote::default());
+    let ssh = fake
+        .ssh
+        .clone()
+        .with_multiplex(false)
+        .with_prompts(askpass(), answers.clone());
+    let target = on(&m, ssh);
+    let rt = runtime();
+    let launcher = Arc::new(DirectLauncher::new(launch_options()));
+    let connector = start(
+        &rt,
+        Daemon::new(target.clone(), launcher.clone()),
+        options(),
+    );
+    wait_for(
+        &rt,
+        &connector,
+        "connected",
+        Duration::from_secs(30),
+        connected(Transport::Stdio),
+    );
+    let asked = answers.asked();
+    let data = pattern(10_000, 31);
+    assert!(echo(&rt, &connector, &data) == data);
+    assert_eq!(answers.asked(), asked + 1, "a connection signs in");
+
+    // Two held open: closing ends them, and their ssh.
+    let mut held = vec![
+        rt.block_on(connector.connect()).unwrap(),
+        rt.block_on(connector.connect()).unwrap(),
+    ];
+    let logins: Vec<u32> = tunnel_calls(&m)
+        .iter()
+        .filter(|c| c.kind == "login")
+        .map(|c| c.pid)
+        .collect();
+    rt.block_on(connector.close());
+    rt.block_on(async {
+        for stream in &mut held {
+            let mut buf = [0u8; 16];
+            let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+                .await
+                .expect("a connection outlived the connector");
+            assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+        }
+    });
+    crate::unix::eventually("the connections' ssh to end", || {
+        logins.iter().all(|pid| !alive(*pid))
+    });
+
+    // A prompt cancelled for a connection.
+    let connector = start(&rt, Daemon::new(target, launcher), options());
+    wait_for(
+        &rt,
+        &connector,
+        "connected",
+        Duration::from_secs(30),
+        connected(Transport::Stdio),
+    );
+    answers.queue.lock().unwrap().push_back(Reply::Cancel);
+    let err = rt.block_on(connector.connect()).unwrap_err();
+    assert!(
+        matches!(err, TunnelError::Ssh(SshError::Cancelled)),
+        "{err:?}"
+    );
+    wait_for(
+        &rt,
+        &connector,
+        "unreachable: sign-in",
+        Duration::from_secs(15),
+        |s| {
+            matches!(
+                s,
+                LinkState::Unreachable {
+                    why: Unreachable::SignIn,
+                    ..
+                }
+            )
+        },
+    );
+    let asked = answers.asked();
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(answers.asked(), asked, "asked again after a cancel");
+    connector.retry();
+    wait_for(
+        &rt,
+        &connector,
+        "connected after the retry",
+        Duration::from_secs(30),
+        connected(Transport::Stdio),
+    );
+    assert!(echo(&rt, &connector, &data) == data);
+    rt.block_on(connector.close());
+    stop_helper(&m);
+}
+
+/// A link that keeps dropping soon after it connects: each drop counts towards giving up, the
+/// connector ends unreachable, saying so, and waits for a wake or a retry.
+fn tunnel_a_link_that_keeps_dropping_is_given_up() {
+    let m = Machine::new();
+    deploy_and_start(&m);
+    std::fs::write(m.dir.path().join(DROP_AFTER), "2").unwrap();
+    let rt = runtime();
+    let launcher = Arc::new(DirectLauncher::new(launch_options()));
+    let short = ConnectorOptions {
+        give_up_after: Duration::from_secs(5),
+        ..options()
+    };
+    let connector = start(&rt, Daemon::new(target(&m), launcher), short);
+    let state = wait_for(
+        &rt,
+        &connector,
+        "unreachable",
+        Duration::from_secs(40),
+        |s| {
+            matches!(
+                s,
+                LinkState::Unreachable {
+                    why: Unreachable::Network,
+                    ..
+                }
+            )
+        },
+    );
+    assert!(state.to_string().contains("keeps dropping"), "{state}");
+    let tried = links(&m);
+    assert!(tried >= 2, "{tried}");
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(links(&m), tried, "it tried again by itself");
+
+    std::fs::remove_file(m.dir.path().join(DROP_AFTER)).unwrap();
+    connector.retry();
+    wait_for(
+        &rt,
+        &connector,
+        "connected after the retry",
+        Duration::from_secs(30),
+        connected(Transport::Forwarded),
+    );
+    rt.block_on(connector.close());
+    stop_helper(&m);
+}
+
+/// A link known to carry a working forward is patient: a short silence makes the state
+/// unverifiable within seconds (the forward's probe goes unanswered), but the link stays, and
+/// when answers come again the state is connected again, on the same link.
+fn tunnel_a_short_silence_keeps_a_patient_link() {
+    let m = Machine::new();
+    deploy_and_start(&m);
+    let rt = runtime();
+    let launcher = Arc::new(DirectLauncher::new(launch_options()));
+    let known = ConnectorOptions {
+        transport: Some(Transport::Forwarded),
+        ..options()
+    };
+    let connector = start(&rt, Daemon::new(target(&m), launcher), known);
+    wait_for(
+        &rt,
+        &connector,
+        "connected",
+        Duration::from_secs(30),
+        connected(Transport::Forwarded),
+    );
+    let calls = tunnel_calls(&m);
+    let link = calls.iter().find(|c| c.kind == "link").unwrap();
+    assert!(
+        link.args.iter().any(|a| a == "ServerAliveCountMax=14"),
+        "{:?}",
+        link.args
+    );
+
+    let lost = Instant::now();
+    net_set(&m, Net::Down);
+    let state = wait_for(
+        &rt,
+        &connector,
+        "unverifiable",
+        Duration::from_secs(15),
+        unverifiable,
+    );
+    let noticed = lost.elapsed();
+    println!("the silence was noticed after {noticed:.1?}: {state}");
+    assert!(noticed < Duration::from_secs(10), "{noticed:?}");
+    // Longer than an impatient link would last.
+    std::thread::sleep(Duration::from_secs(8));
+    net_set(&m, Net::Up);
+    wait_for(
+        &rt,
+        &connector,
+        "connected again",
+        Duration::from_secs(15),
+        connected(Transport::Forwarded),
+    );
+    assert_eq!(links(&m), 1, "the link was replaced");
+    let data = pattern(10_000, 33);
+    assert!(echo(&rt, &connector, &data) == data);
+    rt.block_on(connector.close());
+    stop_helper(&m);
 }
 
 // ─── The bridge alone ──────────────────────────────────────────────────────────────────────
@@ -1928,6 +1782,38 @@ pub(crate) const CASES: &[(&str, fn())] = &[
         tunnel_askpass_during_a_reconnect,
     ),
     ("tunnel_under_every_posix_sh", tunnel_under_every_posix_sh),
+    (
+        "tunnel_a_session_over_max_sessions_is_refused_alone",
+        tunnel_a_session_over_max_sessions_is_refused_alone,
+    ),
+    (
+        "tunnel_a_forward_that_failed_once_is_not_remembered",
+        tunnel_a_forward_that_failed_once_is_not_remembered,
+    ),
+    (
+        "tunnel_srun_line_buffering_and_job_steps",
+        tunnel_srun_line_buffering_and_job_steps,
+    ),
+    (
+        "tunnel_links_left_by_a_crash_are_stopped",
+        tunnel_links_left_by_a_crash_are_stopped,
+    ),
+    (
+        "tunnel_a_burst_of_failures_makes_one_check",
+        tunnel_a_burst_of_failures_makes_one_check,
+    ),
+    (
+        "tunnel_without_connection_reuse",
+        tunnel_without_connection_reuse,
+    ),
+    (
+        "tunnel_a_link_that_keeps_dropping_is_given_up",
+        tunnel_a_link_that_keeps_dropping_is_given_up,
+    ),
+    (
+        "tunnel_a_short_silence_keeps_a_patient_link",
+        tunnel_a_short_silence_keeps_a_patient_link,
+    ),
     (
         "bridge_is_byte_exact_both_ways",
         bridge_is_byte_exact_both_ways,

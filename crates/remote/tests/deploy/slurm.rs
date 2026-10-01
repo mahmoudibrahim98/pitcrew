@@ -70,11 +70,15 @@ pub(crate) struct Config {
     /// scancel answers 0 but cancels nothing (its filters left the job out), and the job then
     /// ends on its own.
     scancel_misses: bool,
+    /// srun passes a step's output on a line at a time, holding back a line until it ends (as
+    /// some SLURM versions' I/O forwarding does).
+    pub(crate) line_buffered: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
+            line_buffered: false,
             start: true,
             reason: "Priority".to_owned(),
             node: NODE.to_owned(),
@@ -233,7 +237,9 @@ pub(crate) fn act_as_slurm(tool: &str) -> ExitCode {
         "squeue" => squeue(&dir, &config, &args),
         "scancel" => scancel(&dir, &config, &args),
         "sacct" => sacct(&dir, &config, &args),
-        "srun" if args.iter().any(|a| a.starts_with("--jobid=")) => srun_step(&dir, &args),
+        "srun" if args.iter().any(|a| a.starts_with("--jobid=")) => {
+            srun_step(&dir, &args, config.line_buffered)
+        }
         "srun" if args.first().map(String::as_str) == Some("--help") => {
             println!("Usage: srun [OPTIONS(0)... [executable(0) [args(0)...]]]");
             println!("  -A, --account=name          charge job to specified account");
@@ -468,8 +474,9 @@ fn run_job(dir: &Path, config: &Config, id: u64) -> ExitCode {
 
 /// `srun --jobid=<id> --overlap [--nodes=1 --ntasks=1 --nodelist=<node> --quiet] <command…>`:
 /// a step in a running job of this user's, on its node (this machine), with srun's stdin and
-/// stdout. As real srun, without `--overlap` a job whose resources are all used refuses a step.
-fn srun_step(dir: &Path, args: &[String]) -> ExitCode {
+/// stdout (a line at a time when `line_buffered`). As real srun, without `--overlap` a job
+/// whose resources are all used refuses a step.
+fn srun_step(dir: &Path, args: &[String], line_buffered: bool) -> ExitCode {
     let at = args
         .iter()
         .position(|a| !a.starts_with("--"))
@@ -510,15 +517,35 @@ fn srun_step(dir: &Path, args: &[String]) -> ExitCode {
         eprintln!("srun: fatal: No command given to execute.");
         return ExitCode::from(1);
     };
-    let err = Command::new(program)
-        .args(rest)
+    let mut step = Command::new(program);
+    step.args(rest)
         .env_remove(SLURM_ENV)
         .env_remove(DIR_ENV)
         .env("SLURM_JOB_ID", id.to_string())
-        .env("SLURMD_NODENAME", &job.node)
-        .exec();
-    eprintln!("srun: error: execve(): {program}: {err}");
-    ExitCode::from(2)
+        .env("SLURMD_NODENAME", &job.node);
+    if !line_buffered {
+        let err = step.exec();
+        eprintln!("srun: error: execve(): {program}: {err}");
+        return ExitCode::from(2);
+    }
+    let mut child = step.stdout(Stdio::piped()).spawn().unwrap();
+    let mut from = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut out = std::io::stdout();
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        match std::io::BufRead::read_until(&mut from, b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                // A line goes on once it ends (or the output does).
+                if out.write_all(&line).and_then(|()| out.flush()).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    let status = child.wait().unwrap();
+    ExitCode::from(u8::try_from(status.code().unwrap_or(1)).unwrap_or(1))
 }
 
 fn squeue(dir: &Path, config: &Config, args: &[String]) -> ExitCode {
