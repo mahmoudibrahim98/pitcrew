@@ -56,6 +56,7 @@ mod fsinfo;
 mod held;
 mod hooks;
 mod link;
+mod plain;
 mod sink;
 mod store;
 mod store_sink;

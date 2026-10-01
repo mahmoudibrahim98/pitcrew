@@ -12,6 +12,7 @@
 
 use crate::config::EngineHome;
 use crate::derive::Reported;
+use crate::plain;
 use crate::store::TerminalRow;
 use crate::terminals::RunnerTerminals;
 use crate::watch::{Origin, Shared, Signal, Target};
@@ -391,24 +392,40 @@ pub(crate) struct Launch<'a> {
 
 /// The program and arguments for a launch. `new_id` is the session id to give a new Claude
 /// session.
+///
+/// No value can be read as an option:
+/// - session ids and models must be plain (see `plain`), or the launch is refused and the
+///   refusal logged: a resumed session's id comes from its transcript;
+/// - every option takes its value in the same argument (`--model=<m>`);
+/// - free text (the brief) and positional ids come after `--`.
 pub(crate) fn start_spec(
     launch: &Launch<'_>,
     new_id: Option<&str>,
     env: Vec<(String, String)>,
     options: &CommandOptions,
 ) -> Result<StartSpec, String> {
+    let resume = launch
+        .resume
+        .map(|id| checked("session id", id, plain::is_id))
+        .transpose()?;
+    let new_id = new_id
+        .map(|id| checked("session id", id, plain::is_id))
+        .transpose()?;
+    let model = launch
+        .model
+        .map(|m| checked("model", m, plain::is_model))
+        .transpose()?;
     let mut args: Vec<String> = Vec::new();
-    let mut push = |a: &[&str]| args.extend(a.iter().map(|s| (*s).to_owned()));
     let mode = launch.mode;
     let program = match launch.engine {
         Engine::Claude => {
-            match (launch.resume, new_id) {
-                (Some(id), _) => push(&["--resume", id]),
-                (None, Some(id)) => push(&["--session-id", id]),
+            match (resume, new_id) {
+                (Some(id), _) => args.push(format!("--resume={id}")),
+                (None, Some(id)) => args.push(format!("--session-id={id}")),
                 (None, None) => {}
             }
-            if let Some(m) = launch.model {
-                push(&["--model", m]);
+            if let Some(m) = model {
+                args.push(format!("--model={m}"));
             }
             let flag = match mode {
                 PermissionMode::Default => None,
@@ -417,30 +434,33 @@ pub(crate) fn start_spec(
                 PermissionMode::BypassPermissions => Some("bypassPermissions"),
             };
             if let Some(f) = flag {
-                push(&["--permission-mode", f]);
+                args.push(format!("--permission-mode={f}"));
             }
             if let Some(b) = launch.brief {
-                push(&["--", b]);
+                args.extend(["--".to_owned(), b.to_owned()]);
             }
             "claude"
         }
         Engine::Codex => {
-            if let Some(id) = launch.resume {
-                push(&["resume", id]);
+            if resume.is_some() {
+                args.push("resume".to_owned());
             }
-            if let Some(m) = launch.model {
-                push(&["--model", m]);
+            if let Some(m) = model {
+                args.push(format!("--model={m}"));
             }
             match mode {
                 PermissionMode::Default => {}
-                PermissionMode::AcceptEdits => push(&["--full-auto"]),
+                PermissionMode::AcceptEdits => args.push("--full-auto".to_owned()),
                 PermissionMode::Plan => return Err("Codex has no plan mode.".into()),
                 PermissionMode::BypassPermissions => {
-                    push(&["--dangerously-bypass-approvals-and-sandbox"]);
+                    args.push("--dangerously-bypass-approvals-and-sandbox".to_owned());
                 }
             }
-            if let Some(b) = launch.brief {
-                push(&["--", b]);
+            // The session to resume and the brief are positional.
+            let positional: Vec<&str> = resume.into_iter().chain(launch.brief).collect();
+            if !positional.is_empty() {
+                args.push("--".to_owned());
+                args.extend(positional.into_iter().map(str::to_owned));
             }
             "codex"
         }
@@ -448,11 +468,11 @@ pub(crate) fn start_spec(
             if mode != PermissionMode::Default {
                 return Err("OpenCode takes its permissions from its own settings.".into());
             }
-            if let Some(id) = launch.resume {
-                push(&["--session", id]);
+            if let Some(id) = resume {
+                args.push(format!("--session={id}"));
             }
-            if let Some(m) = launch.model {
-                push(&["--model", m]);
+            if let Some(m) = model {
+                args.push(format!("--model={m}"));
             }
             if let Some(b) = launch.brief {
                 args.push(format!("--prompt={b}"));
@@ -470,6 +490,20 @@ pub(crate) fn start_spec(
         cols: options.cols,
         rows: options.rows,
     })
+}
+
+/// `value` if `is_plain` accepts it; otherwise why the launch is refused, logged as a warning.
+fn checked<'a>(what: &str, value: &'a str, is_plain: fn(&str) -> bool) -> Result<&'a str, String> {
+    if is_plain(value) {
+        return Ok(value);
+    }
+    let shown: String = value.chars().take(64).collect();
+    tracing::warn!(what, value = ?shown, "refused to start a session: a value is not plain and could be read as an option");
+    Err(format!(
+        "The {what} {shown:?} is not allowed: it must start with a letter or digit and hold \
+         at most {} plain characters.",
+        plain::MAX_LEN
+    ))
 }
 
 /// A random UUID (version 4), as Claude's `--session-id` wants.
@@ -527,6 +561,10 @@ mod tests {
         start_spec(l, id, Vec::new(), &CommandOptions::default()).map(|s| (s.program, s.args))
     }
 
+    fn strings<const N: usize>(a: [&str; N]) -> Vec<String> {
+        a.map(String::from).to_vec()
+    }
+
     #[test]
     fn launches_per_cli() {
         let claude = args(
@@ -537,18 +575,13 @@ mod tests {
             claude,
             Ok((
                 "claude".into(),
-                [
-                    "--session-id",
-                    "u1",
-                    "--model",
-                    "m1",
-                    "--permission-mode",
-                    "acceptEdits",
+                strings([
+                    "--session-id=u1",
+                    "--model=m1",
+                    "--permission-mode=acceptEdits",
                     "--",
                     "-v means verbose"
-                ]
-                .map(String::from)
-                .to_vec()
+                ])
             ))
         );
         let mut resume = launch(Engine::Claude, PermissionMode::Default);
@@ -557,12 +590,21 @@ mod tests {
         resume.resume = Some("old");
         assert_eq!(
             args(&resume, Some("old")).map(|a| a.1),
-            Ok(["--resume", "old"].map(String::from).to_vec())
+            Ok(strings(["--resume=old"]))
         );
         resume.engine = Engine::Codex;
         assert_eq!(
             args(&resume, None).map(|a| a.1),
-            Ok(["resume", "old"].map(String::from).to_vec())
+            Ok(strings(["resume", "--", "old"]))
+        );
+        assert_eq!(
+            args(&launch(Engine::Codex, PermissionMode::AcceptEdits), None).map(|a| a.1),
+            Ok(strings([
+                "--model=m1",
+                "--full-auto",
+                "--",
+                "-v means verbose"
+            ]))
         );
         assert!(args(&launch(Engine::Codex, PermissionMode::Plan), None).is_err());
         assert_eq!(
@@ -576,15 +618,102 @@ mod tests {
             Ok(true)
         );
         assert!(args(&launch(Engine::OpenCode, PermissionMode::AcceptEdits), None).is_err());
+        let mut opencode = launch(Engine::OpenCode, PermissionMode::Default);
+        opencode.model = Some("anthropic/claude-sonnet-4");
+        opencode.resume = Some("ses_01");
         assert_eq!(
-            args(&launch(Engine::OpenCode, PermissionMode::Default), None),
+            args(&opencode, None),
             Ok((
                 "opencode".into(),
-                ["--model", "m1", "--prompt=-v means verbose"]
-                    .map(String::from)
-                    .to_vec()
+                strings([
+                    "--session=ses_01",
+                    "--model=anthropic/claude-sonnet-4",
+                    "--prompt=-v means verbose"
+                ])
             ))
         );
+    }
+
+    const ENGINES: [Engine; 3] = [Engine::Claude, Engine::Codex, Engine::OpenCode];
+
+    /// The mode each engine accepts with no option of its own.
+    fn quiet(engine: Engine) -> Launch<'static> {
+        launch(engine, PermissionMode::Default)
+    }
+
+    #[test]
+    fn ids_and_models_that_could_be_options_are_refused() {
+        let flags = [
+            "--dangerously-skip-permissions",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "-p",
+            "-",
+            "",
+            "a b",
+            "a\n--x",
+            "a=b",
+        ];
+        for engine in ENGINES {
+            for bad in flags {
+                let mut resumed = quiet(engine);
+                resumed.resume = Some(bad);
+                assert!(args(&resumed, None).is_err(), "{engine:?} resume {bad:?}");
+                let mut model = quiet(engine);
+                model.model = Some(bad);
+                assert!(args(&model, None).is_err(), "{engine:?} model {bad:?}");
+            }
+            let mut long = quiet(engine);
+            let id = "a".repeat(plain::MAX_LEN + 1);
+            long.resume = Some(&id);
+            assert!(args(&long, None).is_err(), "{engine:?} long id");
+        }
+        // Claude's new session id is checked too.
+        assert!(args(&quiet(Engine::Claude), Some("--print")).is_err());
+    }
+
+    #[test]
+    fn before_the_end_of_options_every_argument_is_an_option_with_its_value_attached() {
+        let modes = [
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Plan,
+            PermissionMode::BypassPermissions,
+        ];
+        let mut checked = 0;
+        for engine in ENGINES {
+            for mode in modes {
+                for resume in [None, Some("2b6f1a8e-4c1d-4f5e-9a37-0c8d1e2f3a4b")] {
+                    let mut l = launch(engine, mode);
+                    l.resume = resume;
+                    l.model = Some("provider/model-1");
+                    let Ok((_, a)) = args(&l, Some("u-1")) else {
+                        continue;
+                    };
+                    let end = a.iter().position(|x| x == "--").unwrap_or(a.len());
+                    for x in &a[..end] {
+                        // A subcommand, or `--name` / `--name=value` whose value is plain, or
+                        // is the brief (OpenCode's `--prompt=`, free text in one argument).
+                        let option = x.strip_prefix("--").is_some_and(|o| {
+                            let (name, value) = o.split_once('=').unwrap_or((o, "x"));
+                            !name.is_empty()
+                                && !name.starts_with('-')
+                                && (value.starts_with(|c: char| c.is_ascii_alphanumeric())
+                                    || (name == "prompt" && Some(value) == l.brief))
+                        });
+                        assert!(option || x == "resume", "{engine:?} {mode:?}: {a:?}");
+                    }
+                    // After `--`, only the resumed id and the brief.
+                    let rest: Vec<&str> = a.iter().skip(end + 1).map(String::as_str).collect();
+                    let allowed: Vec<&str> = resume.into_iter().chain(l.brief).collect();
+                    assert!(
+                        rest.iter().all(|r| allowed.contains(r)),
+                        "{engine:?} {mode:?}: {a:?}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 10, "{checked}");
     }
 
     #[test]

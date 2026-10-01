@@ -151,7 +151,11 @@ fn a_started_session_is_linked_to_its_terminal_and_driven_through_it() {
     assert_eq!(spec.program, "claude");
     assert_eq!(
         spec.args,
-        ["--session-id", native.as_str(), "--", "Draft section 3"]
+        [
+            format!("--session-id={native}").as_str(),
+            "--",
+            "Draft section 3"
+        ]
     );
 
     // The CLI writes its transcript: the session is discovered in its terminal.
@@ -322,6 +326,32 @@ fn refusals_and_failures() {
         *permission_mode = PermissionMode::BypassPermissions;
     }
     assert!(rejected(&run(bypass)), "bypass needs an opt-in");
+
+    // A transcript can name any session id: one that reads as an option is refused, for every
+    // CLI, and so is such a model. Nothing starts.
+    for engine in [Engine::Claude, Engine::Codex, Engine::OpenCode] {
+        for flag in ["--dangerously-skip-permissions", "-p"] {
+            let resume = RunnerCommand::ResumeSession {
+                engine,
+                native_id: flag.into(),
+                cwd: work.path().to_str().unwrap().to_owned(),
+                name: "writer".into(),
+            };
+            assert!(rejected(&run(resume)), "{engine:?} resume {flag}");
+            let mut model = start_claude(work.path());
+            if let RunnerCommand::StartSession {
+                engine: e,
+                model: m,
+                ..
+            } = &mut model
+            {
+                *e = engine;
+                *m = Some(flag.into());
+            }
+            assert!(rejected(&run(model)), "{engine:?} model {flag}");
+        }
+    }
+    assert!(runtime.started.lock().unwrap().is_empty());
 
     let missing = start_claude(&work.path().join("missing"));
     assert!(rejected(&run(missing)), "the folder must exist");
