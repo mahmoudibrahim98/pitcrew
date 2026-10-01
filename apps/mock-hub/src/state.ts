@@ -29,6 +29,38 @@ import type {
 import { ulid } from './ulid.ts';
 import { isRecord } from './validate.ts';
 
+/**
+ * The mock's two tokens' bound member ids (`dev-device-token`, `dev-agent-token`; see
+ * `routes.ts`'s `TOKENS`). Fixed so a fresh workspace can give the device token's identity before
+ * any `Member` exists for it: "the dev device token acts as a member id nothing knows" until
+ * `POST /v1/setup` adds the person.
+ */
+export const DEV_DEVICE_MEMBER: MemberId = '01JB000000000000000MEM0001';
+export const DEV_AGENT_MEMBER: MemberId = '01JB000000000000000MEM0002';
+
+/**
+ * An empty workspace, as a fresh hub starts: no members, machines or work (projects, tasks,
+ * sessions, asks, events). `PITCREW_MOCK_FRESH=1` serves this instead of the demo fixture, so
+ * `POST /v1/setup` can be exercised.
+ */
+export function freshWorkspace(): DemoWorkspace {
+  return {
+    workspace: { id: ulid(), name: '' },
+    machines: [],
+    members: [],
+    personas: [],
+    teams: [],
+    projects: [],
+    workstreams: [],
+    tasks: [],
+    sessions: [],
+    dispatches: [],
+    asks: [],
+    briefs: [],
+    events: [],
+  };
+}
+
 /** How long simulated sessions take, in milliseconds. */
 export interface Delays {
   /** From `starting` to `working` after a dispatch or a start. */
@@ -180,11 +212,9 @@ export class Hub {
     this.recaps = recaps;
     this.delays = delays;
     this.scanWindow = scanWindow;
-    const person = data.members.find((m) => m.kind === 'human');
-    if (person === undefined) {
-      throw new Error('the fixture has no person');
-    }
-    this.person = person.id;
+    // Before setup a fresh workspace has no person yet; the device token's own id is who it will
+    // be (api-v1.md, "The first run").
+    this.person = data.members.find((m) => m.kind === 'human')?.id ?? DEV_DEVICE_MEMBER;
     this.#log = [...data.events];
     this.#lastAt = this.#log.at(-1)?.at ?? 0;
   }
@@ -194,6 +224,11 @@ export class Hub {
   /** The current revision: the number of events in the log. */
   get rev(): number {
     return this.#log.length;
+  }
+
+  /** `GET /v1/workspace`'s `setup_needed`: true while the workspace has no person. */
+  get setupNeeded(): boolean {
+    return !this.members.some((m) => m.kind === 'human');
   }
 
   /** The event at revision `rev` (1-based). */
