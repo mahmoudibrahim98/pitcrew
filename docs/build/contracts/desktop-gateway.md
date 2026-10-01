@@ -149,6 +149,9 @@ interface NavigateTarget {
   form. Anything else from a deep link is dropped and logged (shortened), never forwarded.
 - **The UI checks the target again,** maps it to its own route (`paths.task(ws, id)`, and so on),
   and navigates. An unknown workspace goes to `/` with a notice.
+- **A link that launched the app** is held by the gateway until the page first calls
+  `gateway_workspaces`. The UI must start listening to `gateway://navigate` before that first
+  call. A held target expires after 60 seconds.
 - **Deep links arrive from any web page,** so they never act: they only navigate. No deep link
   answers an ask, moves a task, or sends input.
 
