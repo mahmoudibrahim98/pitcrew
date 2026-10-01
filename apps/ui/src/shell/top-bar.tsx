@@ -187,6 +187,8 @@ function StreamState() {
   let pill = null;
   if (gateway === 'needs_pairing' || problem === 'needs_pairing') pill = <StatusPill tone="risk">Needs pairing</StatusPill>;
   else if (gateway === 'unreachable') pill = <StatusPill tone="risk">Unreachable</StatusPill>;
+  // The gateway is still connecting (an SSH tunnel, say): the stream's failures are expected.
+  else if (gateway === 'connecting' && status !== 'live') pill = <StatusPill tone="accent">Connecting</StatusPill>;
   else if (problem === 'unauthorized') pill = <StatusPill tone="risk">Token rejected</StatusPill>;
   else if (problem === 'unreachable') pill = <StatusPill tone="risk">Hub unreachable</StatusPill>;
   else if (status === 'connecting') pill = <StatusPill tone="accent">Connecting</StatusPill>;

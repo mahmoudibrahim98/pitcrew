@@ -10,14 +10,14 @@ import {
   useWorkspace,
   useWorkstreams,
   type GatewayWorkspace,
-  type WorkspaceList,
+  type WorkspacesView,
 } from '../../data/index.ts';
 import { LAYOUTS, useWorkspaceId } from '../layout.ts';
 import { paths } from '../paths.ts';
 import { lastPath, storedLayout, useShell } from '../store.ts';
 import { NotFoundPage } from './not-found.tsx';
 import { LOADING, Page } from './page.tsx';
-import { StatusScreen } from './unavailable.tsx';
+import { StatusScreen, WorkspacesFailed } from './unavailable.tsx';
 
 /** Replaces the location with `href` (a path with its search). */
 function Redirect({ href }: { href: string }) {
@@ -50,13 +50,13 @@ export function pickWorkspace(list: readonly GatewayWorkspace[], last: string | 
   return list.find((w) => w.id === last) ?? list.find((w) => w.state === 'ready') ?? list[0];
 }
 
-function OpenDesktopWorkspace({ workspaces }: { workspaces: WorkspaceList }) {
+function OpenDesktopWorkspace({ workspaces }: { workspaces: WorkspacesView }) {
   const last = useShell((s) => s.lastWorkspace);
-  const { list, error } = workspaces;
+  const { list, error, retry } = workspaces;
   const pick = list === undefined ? undefined : pickWorkspace(list, last);
   if (pick !== undefined) return <Redirect href={paths.workspace(pick.id)} />;
   if (list !== undefined) return <StatusScreen>No workspaces yet.</StatusScreen>;
-  if (error !== undefined) return <StatusScreen>Could not list the workspaces: {error}</StatusScreen>;
+  if (error !== undefined) return <WorkspacesFailed message={error} onRetry={retry} />;
   return <StatusScreen>Loading workspaces…</StatusScreen>;
 }
 

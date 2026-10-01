@@ -4,14 +4,27 @@
 
 import type { ReactNode } from 'react';
 import type { GatewayWorkspace } from '../../data/index.ts';
+import { Button } from '../../design/index.ts';
 
-export function StatusScreen({ children }: { children: ReactNode }) {
+export function StatusScreen({ children, onRetry }: { children: ReactNode; onRetry?: () => void }) {
   return (
     <main className="grid min-h-dvh place-items-center bg-bg px-6 text-ink">
-      <p role="status" className="text-sm text-ink-2">
-        {children}
-      </p>
+      <div className="flex flex-col items-center gap-3">
+        <p role="status" className="text-sm text-ink-2">
+          {children}
+        </p>
+        {onRetry !== undefined && <Button onClick={onRetry}>Retry</Button>}
+      </div>
     </main>
+  );
+}
+
+/** The desktop app could not list its workspaces. It keeps trying; Retry tries now. */
+export function WorkspacesFailed({ message, onRetry }: { message: string; onRetry: () => void }) {
+  return (
+    <StatusScreen onRetry={onRetry}>
+      Could not list the workspaces ({message}). PitCrew keeps trying.
+    </StatusScreen>
   );
 }
 

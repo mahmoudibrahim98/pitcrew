@@ -3,13 +3,19 @@
 
 import { Outlet, useRouter } from '@tanstack/react-router';
 import { lazy, Suspense, useEffect, type MouseEvent } from 'react';
-import { useGatewayWorkspace, useWorkspace, WorkspaceScope, type ScopeFallback } from '../data/index.ts';
+import {
+  useGatewayWorkspace,
+  useGatewayWorkspaces,
+  useWorkspace,
+  WorkspaceScope,
+  type ScopeFallback,
+} from '../data/index.ts';
 import { TooltipProvider } from '../design/index.ts';
 import { CreateDialog } from './create.tsx';
 import { LayoutMemory, useLayout, useWorkspaceId } from './layout.ts';
 import { OrchestratorPanel } from './orchestrator.tsx';
 import { NotFoundPage } from './pages/not-found.tsx';
-import { StatusScreen, WorkspaceUnavailable } from './pages/unavailable.tsx';
+import { StatusScreen, WorkspacesFailed, WorkspaceUnavailable } from './pages/unavailable.tsx';
 import { useShellShortcuts } from './shortcuts.ts';
 import { Sidebar } from './sidebar.tsx';
 import { useShell } from './store.ts';
@@ -34,8 +40,11 @@ function skipToMain(event: MouseEvent<HTMLAnchorElement>) {
 }
 
 function ScopeMissing({ reason }: { reason: ScopeFallback }) {
+  const workspaces = useGatewayWorkspaces();
   if (reason.kind === 'loading') return <StatusScreen>Loading workspaces…</StatusScreen>;
-  if (reason.kind === 'failed') return <StatusScreen>Could not list the workspaces: {reason.message}</StatusScreen>;
+  if (reason.kind === 'failed') {
+    return <WorkspacesFailed message={reason.message} onRetry={() => workspaces?.retry()} />;
+  }
   return (
     <main className="min-h-dvh bg-bg text-ink">
       <NotFoundPage />

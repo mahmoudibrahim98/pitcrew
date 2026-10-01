@@ -7,7 +7,7 @@ import { cleanup, fireEvent, render, screen, within } from '@testing-library/rea
 import { createMemoryHistory, RouterProvider } from '@tanstack/react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { FakeGateway, helloOnStream, tinyDaemon, type Daemon } from '../../../tests/fake-gateway.ts';
-import { WorkspacesProvider } from '../../data/desktop.tsx';
+import { WorkspacesProvider, type WorkspacesOptions } from '../../data/desktop.tsx';
 import { createGateway } from '../../data/gateway.ts';
 import type { GatewayWorkspace } from '../../data/workspaces.tsx';
 import { createAppRouter } from '../routes.tsx';
@@ -38,10 +38,10 @@ afterEach(() => {
   useShell.setState(initialShellState);
 });
 
-function renderDesktop(path = '/') {
+function renderDesktop(path = '/', options?: WorkspacesOptions) {
   const router = createAppRouter([], { history: createMemoryHistory({ initialEntries: [path] }) });
   render(
-    <WorkspacesProvider gateway={createGateway()}>
+    <WorkspacesProvider gateway={createGateway()} {...(options === undefined ? {} : { options })}>
       <RouterProvider router={router} />
     </WorkspacesProvider>,
   );
@@ -161,6 +161,25 @@ describe('the shell in the desktop app', () => {
     await router.navigate({ href: '/w/01JB000000000000000WSPNONE/home' });
     await screen.findByRole('heading', { level: 1, name: 'Page not found' });
   });
+
+  it.each(['/', `/w/${ALPHA}/home`])(
+    'at %s, says when the workspaces cannot be listed, and Retry lists them now',
+    async (path) => {
+      gateway.refuseList = { code: 'internal', message: 'The gateway is still starting' };
+      // A long back-off: only the button can bring the list in time.
+      const router = renderDesktop(path, { listBackoff: { initialMs: 60_000, maxMs: 60_000 } });
+      await screen.findByText(
+        'Could not list the workspaces (The gateway is still starting). PitCrew keeps trying.',
+        undefined,
+        PATIENCE,
+      );
+      gateway.refuseList = undefined;
+      fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+      await screen.findByRole('link', { name: 'Alpha project' }, PATIENCE);
+      expect(router.state.location.pathname).toBe(`/w/${ALPHA}/home`);
+      expect(gateway.calls.filter((c) => c.cmd === 'gateway_workspaces')).toHaveLength(2);
+    },
+  );
 
   it('says so when there are no workspaces yet', async () => {
     gateway.workspaces = [];
