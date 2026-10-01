@@ -9,13 +9,15 @@
 //!
 //! **Unsafe code.** This is the only module of the crate that uses it: the workspace denies
 //! `unsafe_code`, and this module alone allows it, because the four Win32 calls below have no
-//! safe binding in the dependency tree. Each call has a `SAFETY` comment. The job handle lives
-//! in an `OwnedHandle`, so it is closed exactly once.
+//! safe binding in the dependency tree, and tokio's `Child` hands out only a raw handle. Each
+//! unsafe block has a `SAFETY` comment; every function here is safe to call. The job handle
+//! lives in an `OwnedHandle`, so it is closed exactly once, and process handles come in as
+//! `BorrowedHandle`s.
 
 #![allow(unsafe_code)]
 
 use std::io;
-use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle, RawHandle};
+use std::os::windows::io::{AsRawHandle as _, BorrowedHandle, FromRawHandle as _, OwnedHandle};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -58,13 +60,10 @@ impl Job {
     }
 
     /// Puts a process in the job. Its later children join it too.
-    ///
-    /// `process` must be the handle of a live child process that the caller owns (tokio's
-    /// `Child::raw_handle`, which is `None` once the child is reaped).
-    pub(crate) fn assign(&self, process: RawHandle) -> io::Result<()> {
-        // SAFETY: the job handle is live; `process` is a live process handle by this
-        // function's contract. The call only reads both.
-        let ok = unsafe { AssignProcessToJobObject(self.raw(), process) };
+    pub(crate) fn assign(&self, process: BorrowedHandle<'_>) -> io::Result<()> {
+        // SAFETY: the job handle is live, and `BorrowedHandle` guarantees `process` is an open
+        // handle for the duration of the call. The call only reads both.
+        let ok = unsafe { AssignProcessToJobObject(self.raw(), process.as_raw_handle()) };
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -82,4 +81,14 @@ impl Job {
     fn raw(&self) -> windows_sys::Win32::Foundation::HANDLE {
         self.0.as_raw_handle()
     }
+}
+
+/// The process handle of a running child, borrowed for as long as the child is, or `None` once
+/// it has been reaped. (tokio's `Child` does not implement `AsHandle`.)
+pub(crate) fn handle_of(child: &tokio::process::Child) -> Option<BorrowedHandle<'_>> {
+    let raw = child.raw_handle()?;
+    // SAFETY: tokio owns this handle and closes it only when the child is reaped (`wait` or
+    // `try_wait`, which need `&mut Child`) or dropped. Neither can happen while `child` is
+    // borrowed, so the handle stays open for the returned lifetime.
+    Some(unsafe { BorrowedHandle::borrow_raw(raw) })
 }

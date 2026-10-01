@@ -546,8 +546,7 @@ impl Running {
         // a cancel could not then stop a ProxyJump hop.
         let job = crate::job::Job::new().map_err(SshError::Setup)?;
         let mut child = command.spawn().map_err(SshError::Spawn)?;
-        let assigned = child
-            .raw_handle()
+        let assigned = crate::job::handle_of(&child)
             .ok_or_else(|| io::Error::other("ssh exited at once"))
             .and_then(|handle| job.assign(handle));
         if let Err(e) = assigned {
