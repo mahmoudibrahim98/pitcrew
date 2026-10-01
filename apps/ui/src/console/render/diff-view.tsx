@@ -10,8 +10,8 @@ const LINE: Record<DiffLineType, string> = {
   del: 'bg-risk-soft',
   ctx: '',
   hunk: 'bg-sunken text-accent-text',
-  file: 'text-muted',
-  note: 'text-muted italic',
+  file: 'text-ink-2',
+  note: 'text-ink-2 italic',
 };
 
 const SIGN: Record<DiffLineType, string> = { add: '+', del: '-', ctx: ' ', hunk: '', file: '', note: '' };
@@ -53,9 +53,9 @@ export function DiffView({ diff, label }: { diff: string; label?: string }) {
             </div>
           ) : (
             <div key={i} className={cx('col-span-4 grid grid-cols-subgrid', LINE[line.type])} data-line={line.type}>
-              <span className="px-2 text-right text-muted select-none">{line.old ?? ''}</span>
-              <span className="px-2 text-right text-muted select-none">{line.new ?? ''}</span>
-              <span className="pl-1 text-muted select-none" aria-hidden>
+              <span className="px-2 text-right text-ink-2 select-none">{line.old ?? ''}</span>
+              <span className="px-2 text-right text-ink-2 select-none">{line.new ?? ''}</span>
+              <span className="pl-1 text-ink-2 select-none" aria-hidden>
                 {SIGN[line.type]}
               </span>
               <span className="pr-3 whitespace-pre">

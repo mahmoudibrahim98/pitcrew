@@ -3,11 +3,12 @@
 // has ended or cannot be reached.
 
 import { useId, useState, type KeyboardEvent } from 'react';
-import { ApiError, useSession } from '../data/index.ts';
+import { ApiError, useMachines, useSession } from '../data/index.ts';
 import { Button } from '../design/index.ts';
 import { cx } from '../lib/cx.ts';
-import { useInterrupt, useMachines, useSendKeys, useSendText } from './data.ts';
+import { useInterrupt, useSendKeys, useSendText } from './data.ts';
 import { inputBlocked } from './format.ts';
+import { isComposing } from './ime.ts';
 
 export interface ComposerProps {
   sessionId: string;
@@ -52,7 +53,7 @@ export function Composer({ sessionId, className }: ComposerProps) {
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+    if (event.key === 'Enter' && !event.shiftKey && !isComposing(event)) {
       event.preventDefault();
       submit();
     }
@@ -63,7 +64,7 @@ export function Composer({ sessionId, className }: ComposerProps) {
   return (
     <div className={cx('border-t border-line bg-card px-3 py-2', className)}>
       {blocked !== undefined && (
-        <p id={reasonId} role="status" className="mb-1.5 text-xs text-muted">
+        <p id={reasonId} role="status" className="mb-1.5 text-xs text-ink-2">
           {blocked}
         </p>
       )}

@@ -15,7 +15,8 @@ npm run mock-hub                          # the same, via the root package.json
 PORT=4400 node apps/mock-hub/src/server.ts
 ```
 
-PowerShell: `$env:PORT = '4400'; node apps/mock-hub/src/server.ts`.
+PowerShell: `$env:PORT = '4400'; node apps/mock-hub/src/server.ts`. `PITCREW_MOCK_SCAN_WINDOW`
+sets how many revisions a filtered `GET /v1/events` examines (default 500).
 
 It listens on `http://127.0.0.1:47317` (never on other interfaces) and prints one line per request.
 
@@ -58,9 +59,21 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
 - **Move rules** are `TaskStatus::can_move` ported exactly; a refused move is `409 conflict`.
 - **Dispatch** assigns an unassigned task to the agent (`task_assigned`), then emits
   `dispatch_started` and `session_discovered`. Done or canceled tasks answer 409.
+- **Creating projects and workstreams** (`POST /v1/projects`, `POST /v1/workstreams`) with the
+  contract's defaults; a project key already in use is 409, an unknown project for a workstream 404.
+- **Editing tasks** (`PATCH /v1/tasks/{id-or-key}`): every rule in the contract (title, labels,
+  workstream, `blocked_by` with cycles as 409, dates). `task_updated` carries only the fields that
+  changed, and a patch that changes nothing emits nothing.
+- **Briefs.** `GET /v1/briefs` shows each brief's pending proposal in `proposal` (the fixture's
+  revision 15 is one, for PAP). `PUT` stores `next`, and `brief_accepted` carries it. Accepting the
+  pending proposal unchanged copies its receipts, and the brief stays the back office's; accepting
+  it or keeping the current text clears `proposal`. No route proposes a brief: tests append
+  `brief_proposed` through `startServer()`'s `hub`.
 - **The event log.** The fixture's 15 events are revisions 1–15; every change appends an event with
   a new ULID. `GET /v1/events` pages it (`before` is exclusive, `at_start` says whether older
-  matching events exist) and filters by project, workstream, task or session.
+  matching events exist) and filters by project, workstream, task or session. A filtered request
+  examines at most 500 revisions (`PITCREW_MOCK_SCAN_WINDOW`, or `startServer({ scanWindow })`), so
+  across a long gap it answers empty pages that are not at the start, as the contract allows.
 - **`GET /v1/stream`**: `hello`, then the missed events when `since` is behind, then live events
   batched over 60 ms, and a `ping` every 20 s.
 - **Simulated sessions.** A dispatch or a new session starts in `starting`; about 1.5 s later it
@@ -83,6 +96,7 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
   on their own, workstream health never changes by itself, and mentions do not create asks.
 - A resize changes nothing, and `model`, `persona` and `permission_mode` on a new session are only
   checked, not used (the contract says they are not echoed on `Session`).
+- Terminal sockets send no WebSocket Pings, so they never close an idle client with 1013.
 
 ## Safety
 

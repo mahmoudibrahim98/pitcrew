@@ -369,21 +369,58 @@ const AUTOMAIL = /<([^\s<>@\\]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-
 /** How far a link's label may reach, so unmatched brackets stay linear. */
 const MAX_LABEL = 1000;
 
+/** What parsing one inline run keeps beside the text. */
+interface Scan {
+  /**
+   * The scanning ahead the run may still do beyond reading it once: looking for a link's end and
+   * for the opener of each emphasis closer. Real text needs a small multiple of its length;
+   * hostile text (`a* b* c* …`, `[a]([a]([a](…`) would need the square of it. Once it is spent,
+   * the rest of the run stays literal text: no more links or emphasis.
+   */
+  left: number;
+  ticks: BacktickRuns;
+}
+
+const scanOf = (src: string): Scan => ({ left: 20_000 + 8 * src.length, ticks: backtickRuns(src) });
+
 function runLength(src: string, i: number, ch: string): number {
   let n = 0;
   while (src[i + n] === ch) n += 1;
   return n;
 }
 
-/** The index of the closing backtick run of exactly `n`, or -1. */
-function backtickClose(src: string, from: number, n: number): number {
-  let i = src.indexOf('`', from);
+/** Where each backtick run of a text starts, by the run's length, in order. */
+type BacktickRuns = Map<number, number[]>;
+
+function backtickRuns(src: string): BacktickRuns {
+  const runs: BacktickRuns = new Map();
+  let i = src.indexOf('`');
   while (i !== -1) {
-    const run = runLength(src, i, '`');
-    if (run === n) return i;
-    i = src.indexOf('`', i + run);
+    const n = runLength(src, i, '`');
+    const starts = runs.get(n);
+    if (starts === undefined) runs.set(n, [i]);
+    else starts.push(i);
+    i = src.indexOf('`', i + n);
   }
-  return -1;
+  return runs;
+}
+
+/**
+ * The index of the first backtick run of exactly `n` at or after `from`, or -1. `from` is always
+ * just past a run, so the runs after it are the ones `backtickRuns` found. A lookup, not a scan:
+ * text with many unmatched runs stays linear.
+ */
+function backtickClose(runs: BacktickRuns, from: number, n: number): number {
+  const starts = runs.get(n);
+  if (starts === undefined) return -1;
+  let lo = 0;
+  let hi = starts.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if ((starts[mid] ?? Infinity) < from) lo = mid + 1;
+    else hi = mid;
+  }
+  return starts[lo] ?? -1;
 }
 
 function decodeEntity(name: string): string | undefined {
@@ -402,15 +439,17 @@ function matchAt(re: RegExp, src: string, i: number): RegExpExecArray | null {
 
 /** Drops trailing punctuation a bare URL is unlikely to end with, and unbalanced `)`. */
 function trimUrl(url: string): string {
+  // Trimming never removes a `(`, so the counts are kept as it goes rather than recounted.
+  const opens = url.match(/\(/g)?.length ?? 0;
+  let closes = url.match(/\)/g)?.length ?? 0;
   let end = url.length;
   for (;;) {
     const last = url[end - 1];
     if (last !== undefined && '?!.,:;*_~\'"'.includes(last)) {
       end -= 1;
-    } else if (last === ')') {
-      const text = url.slice(0, end);
-      if ((text.match(/\(/g)?.length ?? 0) < (text.match(/\)/g)?.length ?? 0)) end -= 1;
-      else break;
+    } else if (last === ')' && opens < closes) {
+      end -= 1;
+      closes -= 1;
     } else break;
   }
   return url.slice(0, end);
@@ -422,8 +461,12 @@ interface LinkParts {
   end: number;
 }
 
-/** `[label](dest "title")` starting at the `[` at `i`. */
-function linkAt(src: string, i: number): LinkParts | undefined {
+/**
+ * `[label](dest "title")` starting at the `[` at `i`. What it reads past the label is charged to
+ * the scan; with nothing left, nothing more is a link.
+ */
+function linkAt(src: string, i: number, scan: Scan): LinkParts | undefined {
+  if (scan.left <= 0) return undefined;
   let depth = 0;
   let k = i;
   const limit = Math.min(src.length, i + MAX_LABEL);
@@ -433,7 +476,7 @@ function linkAt(src: string, i: number): LinkParts | undefined {
       k += 1;
     } else if (ch === '`') {
       const run = runLength(src, k, '`');
-      const close = backtickClose(src, k + run, run);
+      const close = backtickClose(scan.ticks, k + run, run);
       k = close === -1 ? k + run - 1 : close + run - 1;
     } else if (ch === '[') {
       depth += 1;
@@ -444,14 +487,30 @@ function linkAt(src: string, i: number): LinkParts | undefined {
   }
   if (k >= limit || src[k] !== ']' || src[k + 1] !== '(') return undefined;
   const label = src.slice(i + 1, k);
-  let p = k + 2;
+  const from = k + 2;
+  let far = from;
+  try {
+    const tail = linkTail(src, from, (to) => {
+      far = Math.max(far, to);
+    });
+    return tail === undefined ? undefined : { label, ...tail };
+  } finally {
+    scan.left -= far - from;
+  }
+}
+
+/** The `(dest "title")` part of a link, from just after its `(`; `reached` hears how far it read. */
+function linkTail(src: string, from: number, reached: (to: number) => void): { dest: string; end: number } | undefined {
+  let p = from;
   const skipSpace = () => {
     while (p < src.length && /[ \t\n]/.test(src[p] ?? '')) p += 1;
+    reached(p);
   };
   skipSpace();
   let dest: string;
   if (src[p] === '<') {
     const close = src.indexOf('>', p);
+    reached(close === -1 ? src.length : close);
     if (close === -1 || src.slice(p, close).includes('\n')) return undefined;
     dest = src.slice(p + 1, close);
     p = close + 1;
@@ -471,18 +530,20 @@ function linkAt(src: string, i: number): LinkParts | undefined {
       } else if (/\s/.test(ch)) break;
       p += 1;
     }
+    reached(p);
     dest = src.slice(start, p).replace(/\\([!-/:-@[-`{-~])/g, '$1');
   }
   skipSpace();
   const quote = src[p];
   if (quote === '"' || quote === "'" || quote === '(') {
     const close = src.indexOf(quote === '(' ? ')' : quote, p + 1);
+    reached(close === -1 ? src.length : close);
     if (close === -1) return undefined;
     p = close + 1;
     skipSpace();
   }
   if (src[p] !== ')') return undefined;
-  return { label, dest, end: p + 1 };
+  return { dest, end: p + 1 };
 }
 
 export function plainText(inlines: readonly Inline[]): string {
@@ -505,6 +566,7 @@ export function plainText(inlines: readonly Inline[]): string {
 
 export function parseInline(src: string, depth = 0): Inline[] {
   if (depth > MAX_DEPTH) return src === '' ? [] : [{ t: 'text', v: src }];
+  const scan = scanOf(src);
   const nodes: Node[] = [];
   let text = '';
   const flush = () => {
@@ -533,7 +595,7 @@ export function parseInline(src: string, depth = 0): Inline[] {
 
     if (ch === '`') {
       const run = runLength(src, i, '`');
-      const close = backtickClose(src, i + run, run);
+      const close = backtickClose(scan.ticks, i + run, run);
       if (close === -1) {
         text += '`'.repeat(run);
         i += run;
@@ -559,7 +621,7 @@ export function parseInline(src: string, depth = 0): Inline[] {
     }
 
     if (ch === '!' && src[i + 1] === '[') {
-      const link = linkAt(src, i + 1);
+      const link = linkAt(src, i + 1, scan);
       if (link !== undefined) {
         flush();
         nodes.push({ t: 'img', src: link.dest, alt: plainText(parseInline(link.label, depth + 1)) });
@@ -569,10 +631,10 @@ export function parseInline(src: string, depth = 0): Inline[] {
     }
 
     if (ch === '[') {
-      const link = linkAt(src, i);
+      const link = linkAt(src, i, scan);
       if (link !== undefined) {
         flush();
-        nodes.push({ t: 'link', href: link.dest, c: parseInline(link.label, depth + 1) });
+        nodes.push(parent({ t: 'link', href: link.dest, c: parseInline(link.label, depth + 1) }));
         i = link.end;
         continue;
       }
@@ -637,13 +699,28 @@ export function parseInline(src: string, depth = 0): Inline[] {
     i += 1;
   }
   flush();
-  emphasis(nodes);
-  return finish(nodes);
+  return finish(emphasis(nodes, scan));
 }
 
-function findOpener(nodes: readonly Node[], closerAt: number, closer: Delim): number {
-  for (let o = closerAt - 1; o >= 0; o--) {
-    const node = nodes[o];
+/** How deep each inline with children nests, so emphasis cannot nest past `MAX_DEPTH`. */
+const nesting = new WeakMap<Inline, number>();
+
+function depthOf(nodes: readonly Inline[]): number {
+  let max = 0;
+  for (const node of nodes) max = Math.max(max, nesting.get(node) ?? 0);
+  return max;
+}
+
+function parent<T extends Inline & { c: Inline[] }>(node: T): T {
+  nesting.set(node, 1 + depthOf(node.c));
+  return node;
+}
+
+/** The nearest opener on `stack` that `closer` can close, or -1. Each node looked at costs 1. */
+function findOpener(stack: readonly Node[], closer: Delim, scan: Scan): number {
+  for (let o = stack.length - 1; o >= 0 && scan.left > 0; o--) {
+    scan.left -= 1;
+    const node = stack[o];
     if (node?.t !== 'delim' || node.ch !== closer.ch || !node.open || node.n === 0) continue;
     // CommonMark's rule of 3, so `*foo**bar*` parses as it should.
     const either = node.close || closer.open;
@@ -660,34 +737,43 @@ function findOpener(nodes: readonly Node[], closerAt: number, closer: Delim): nu
   return -1;
 }
 
-/** Pairs delimiter runs into emphasis, strong and strikethrough, innermost first. */
-function emphasis(nodes: Node[]): void {
-  let c = 0;
-  while (c < nodes.length) {
-    const closer = nodes[c];
-    if (closer?.t !== 'delim' || !closer.close || closer.n === 0) {
-      c += 1;
+/**
+ * Pairs delimiter runs into emphasis, strong and strikethrough, innermost first. What precedes the
+ * closer in hand is a stack, so a match replaces the stack's top instead of splicing the middle of
+ * an array. Looking back for openers is charged to the scan: once it runs out, the remaining
+ * delimiters stay text. So does a pair that would nest deeper than `MAX_DEPTH`.
+ */
+function emphasis(nodes: readonly Node[], scan: Scan): Node[] {
+  const stack: Node[] = [];
+  for (const node of nodes) {
+    if (node.t !== 'delim' || !node.close) {
+      stack.push(node);
       continue;
     }
-    const o = findOpener(nodes, c, closer);
-    const opener = nodes[o];
-    if (opener?.t !== 'delim' || (closer.ch === '~' && opener.n !== closer.n)) {
-      c += 1;
-      continue;
-    }
-    const use = closer.ch === '~' ? closer.n : opener.n >= 2 && closer.n >= 2 ? 2 : 1;
-    const type = closer.ch === '~' ? 'del' : use === 2 ? 'strong' : 'em';
-    const inner = finish(nodes.slice(o + 1, c));
-    opener.n -= use;
-    closer.n -= use;
-    const replacement: Node[] = [];
-    if (opener.n > 0) replacement.push(opener);
-    replacement.push({ t: type, c: inner });
-    if (closer.n > 0) replacement.push(closer);
-    nodes.splice(o, c - o + 1, ...replacement);
+    const closer = node;
     // A closer with some of its run left may close another opener further out.
-    c = closer.n > 0 ? o + replacement.length - 1 : o + replacement.length;
+    while (closer.n > 0 && scan.left > 0) {
+      const o = findOpener(stack, closer, scan);
+      const opener = stack[o];
+      if (opener?.t !== 'delim' || (closer.ch === '~' && opener.n !== closer.n)) break;
+      const use = closer.ch === '~' ? closer.n : opener.n >= 2 && closer.n >= 2 ? 2 : 1;
+      const type = closer.ch === '~' ? 'del' : use === 2 ? 'strong' : 'em';
+      const inner = finish(stack.splice(o + 1));
+      scan.left -= inner.length;
+      opener.n -= use;
+      closer.n -= use;
+      if (opener.n === 0) stack.pop();
+      if (depthOf(inner) < MAX_DEPTH) {
+        stack.push(parent({ t: type, c: inner }));
+      } else {
+        stack.push({ t: 'text', v: closer.ch.repeat(use) });
+        for (const child of inner) stack.push(child);
+        stack.push({ t: 'text', v: closer.ch.repeat(use) });
+      }
+    }
+    if (closer.n > 0) stack.push(closer);
   }
+  return stack;
 }
 
 /** Unused delimiters become text; adjacent text merges. */

@@ -132,6 +132,80 @@ describe('parseInline', () => {
   });
 });
 
+describe('parseInline on hostile input', () => {
+  // Each of these took seconds to minutes while matching was quadratic (at 50,000 units the
+  // closers about 15 s, the link openings about 3 minutes). Linear, each takes tens of
+  // milliseconds; the bound leaves room for a busy test machine.
+  const BOUND_MS = 1_500;
+  const N = 50_000;
+
+  function timed(source: string): { out: Inline[]; ms: number } {
+    const started = performance.now();
+    const out = parseInline(source);
+    return { out, ms: performance.now() - started };
+  }
+
+  function depth(nodes: readonly Inline[]): number {
+    let max = 0;
+    for (const node of nodes) {
+      if ('c' in node) max = Math.max(max, 1 + depth(node.c));
+    }
+    return max;
+  }
+
+  it('stays linear on tens of thousands of closers with no opener, which stay text', () => {
+    const source = 'a* b_ c** '.repeat(N);
+    const { out, ms } = timed(source);
+    expect(ms).toBeLessThan(BOUND_MS);
+    expect(out).toEqual([text(source)]);
+  });
+
+  it('stays linear on tens of thousands of pairs', () => {
+    const { out, ms } = timed('*a* '.repeat(N));
+    expect(ms).toBeLessThan(BOUND_MS);
+    expect(out.filter((node) => node.t === 'em')).toHaveLength(N);
+  });
+
+  it('stays linear on link openings that never close, and on trailing parentheses', () => {
+    const tails = '[a]('.repeat(N);
+    const first = timed(tails);
+    expect(first.ms).toBeLessThan(BOUND_MS);
+    expect(first.out).toEqual([text(tails)]);
+
+    const url = `see https://a.test/x${')'.repeat(N)}`;
+    const second = timed(url);
+    expect(second.ms).toBeLessThan(BOUND_MS);
+    expect(second.out[1]).toEqual({ t: 'link', href: 'https://a.test/x', c: [text('https://a.test/x')] });
+    expect(plainText(second.out)).toBe(url);
+  });
+
+  it('stays linear on many backtick runs that never close, and still pairs code spans', () => {
+    const source = Array.from({ length: 1_000 }, (_, i) => '`'.repeat(1_000 - i)).join('x');
+    const { out, ms } = timed(source);
+    expect(ms).toBeLessThan(BOUND_MS);
+    expect(out).toEqual([text(source)]);
+    expect(parseInline('`a` ``b`` ```c``` `d`')).toEqual([
+      { t: 'code', v: 'a' },
+      text(' '),
+      { t: 'code', v: 'b' },
+      text(' '),
+      { t: 'code', v: 'c' },
+      text(' '),
+      { t: 'code', v: 'd' },
+    ]);
+  });
+
+  it('keeps emphasis nested deeper than 24 levels as text, so the tree stays shallow', () => {
+    const source = `${'*a '.repeat(5_000)}${'a* '.repeat(5_000)}`.trimEnd();
+    const { out, ms } = timed(source);
+    expect(ms).toBeLessThan(BOUND_MS);
+    expect(depth(out)).toBeLessThanOrEqual(24);
+    expect(() => structuredClone(out)).not.toThrow();
+    const nested = parseInline(`${'*a '.repeat(24)}x${' a*'.repeat(24)}`);
+    expect(depth(nested)).toBe(24);
+  });
+});
+
 describe('safeHref', () => {
   it('allows http, https and mailto only', () => {
     expect(safeHref('https://example.com/x')).toBe('https://example.com/x');

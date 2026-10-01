@@ -18,7 +18,7 @@ import {
   TranscriptWindow,
   type ChatRow,
 } from '../transcript.ts';
-import type { TranscriptItem, TranscriptPage } from '../types.ts';
+import type { TranscriptItem, TranscriptPage } from '../../data/index.ts';
 
 const SES1 = '01JB000000000000000SES0001';
 const SES3 = '01JB000000000000000SES0003';

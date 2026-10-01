@@ -26,22 +26,25 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [L-skeleton-and-data](L-skeleton-and-data.md) | L · UI foundation | `s/L/skeleton-and-data` | Opus-class | **Merged** |
 | [L-shell](L-shell.md) | L · UI foundation | `s/L/shell` | Opus-class | **Merged** |
 | [M-console-components](M-console-components.md) | M · Agent console | `s/M/console-components` | Opus-class | **Merged** |
-| [N-projects-components](N-projects-components.md) | N · Projects layout | `s/N/projects-components` | Sonnet-class | In review: fixes in progress |
+| [N-projects-components](N-projects-components.md) | N · Projects layout | `s/N/projects-components` | Sonnet-class | **Merged** |
 | [F-activity-blocks](F-activity-blocks.md) | F · Recap | `s/F/activity-blocks` | Opus-class | **Merged** |
-| [P-bench-and-release](P-bench-and-release.md) | P · Packaging | `s/P/bench-and-release` | Sonnet-class | In progress |
+| [P-bench-and-release](P-bench-and-release.md) | P · Packaging | `s/P/bench-and-release` | Sonnet-class | **Merged** |
 | [Q-threat-model-and-fuzz](Q-threat-model-and-fuzz.md) | Q · Security | `s/Q/threat-model-and-fuzz` | Opus-class | **Merged** |
 
-| [0-work-edits](0-work-edits.md) | 0 · Contracts | `integrator/work-edits` | Opus-class | In progress |
+| [0-work-edits](0-work-edits.md) | 0 · Contracts | `integrator/work-edits` | Opus-class | **Merged** |
 | [C-nfs-and-maintenance](C-nfs-and-maintenance.md) | C · Store | `s/C/nfs-and-maintenance` | Sonnet-class | In progress |
 | [G-github-read](G-github-read.md) | G · Integrations | `s/G/github-read` | Sonnet-class | In progress |
 | [E-single-writer-and-sessions](E-single-writer-and-sessions.md) | E · Work model | `s/E/single-writer-and-sessions` | Opus-class | In progress |
-| [M-console-wiring](M-console-wiring.md) | M · Agent console | `s/M/console-wiring` | Opus-class | In progress |
+| [M-console-wiring](M-console-wiring.md) | M · Agent console | `s/M/console-wiring` | Opus-class | **Merged** |
+| [0-daemon-solo](0-daemon-solo.md) | 0 · Composition root | `integrator/daemon-solo` | Opus-class | In progress |
+| [N-projects-wiring](N-projects-wiring.md) | N · Projects layout | `s/N/projects-wiring` | Sonnet-class | In progress |
+| [L-shell-polish](L-shell-polish.md) | L · UI foundation | `s/L/shell-polish` | Sonnet-class | In progress |
 | [A-scan](A-scan.md) | A · Ingest | `s/A/scan` | Sonnet-class | Ready (after opencode-adapter merges) |
 | [D-hub-link](D-hub-link.md) | D · Runner | `s/D/hub-link` | Opus-class | In progress |
-| [F-briefs-and-office](F-briefs-and-office.md) | F · Recap | `s/F/briefs-and-office` | Opus-class | In progress |
+| [F-briefs-and-office](F-briefs-and-office.md) | F · Recap | `s/F/briefs-and-office` | Opus-class | **Merged** |
 | [I-hook-install](I-hook-install.md) | I · CLI and hooks | `s/I/hook-install` | Sonnet-class | In progress |
 | [J-deploy](J-deploy.md) | J · Remote and HPC | `s/J/deploy` | Opus-class | Ready (after ssh-connection merges) |
-| [O-onboarding-components](O-onboarding-components.md) | O · Onboarding | `s/O/onboarding-components` | Sonnet-class | In progress (based on L-shell) |
+| [O-onboarding-components](O-onboarding-components.md) | O · Onboarding | `s/O/onboarding-components` | Sonnet-class | **Merged** |
 The branch name matters: CI's path guard reads the stream from it (`s/<stream>/<topic>`). The
 integrator adds new briefs here as streams progress, and marks them done when merged.
 

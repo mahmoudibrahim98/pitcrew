@@ -8,8 +8,47 @@ license.workspace = true
 publish.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "pitcrew-askpass"
+path = "src/bin/pitcrew-askpass.rs"
+
+[[test]]
+# Its own `main`: the test binary doubles as the fake `ssh` it drives.
+name = "fake_ssh"
+path = "tests/fake_ssh.rs"
+harness = false
+
 [dependencies]
 pitcrew-protocol.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+# `macros` for `select!` and `try_join!`.
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
+# OS randomness for askpass keys and nonces. Already in the lockfile through `ulid`.
+getrandom = "=0.3.4"
+
+[target.'cfg(unix)'.dependencies]
+# Effective uid, process groups, parent pid and pidfds without unsafe code. The version
+# tempfile already uses.
+rustix = { version = "=1.1.5", features = ["process"] }
+
+[target.'cfg(windows)'.dependencies]
+# Job Objects for ssh (src/job.rs) and the pipe client's security flags. The version tokio
+# already uses.
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true
