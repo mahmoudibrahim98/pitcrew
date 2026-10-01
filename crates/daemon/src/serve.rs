@@ -3,9 +3,10 @@
 //! Start:
 //! 1. The token registry, which locks the state directory: a second daemon stops here.
 //! 2. The store with the work model's projections, to learn the workspace (`workspace.json` holds
-//!    its name) and, with `--demo`, to refuse a store with data. Unless the back office is off
-//!    (`--no-office`), also who it acts as, `@office` ([`crate::office::member`]); the store is then
-//!    opened again with the office's run log as well, which needs that member.
+//!    its name) and, with `--demo`, to refuse a store with data. Unless `--no-office`, also who
+//!    the back office acts as, `@office` ([`crate::office::member`]); when it can run, the store
+//!    is opened again with the office's run log as well, which needs that member. When it cannot,
+//!    `office.json` is removed.
 //! 3. The one `WorkService` for the store, with the hub's own machine (the workspace's local one).
 //!    It has no dispatcher until the runner link exists, so a dispatch answers 503 and records
 //!    nothing.

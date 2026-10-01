@@ -151,7 +151,11 @@ fn reusable(found: &Member, owner: Option<&Member>) -> Option<MemberId> {
 pub fn forget(state: &StateDir) {
     let path = state.office();
     if let Err(e) = remove(&path) {
-        tracing::warn!(path = %path.display(), error = %e, "cannot remove the back office's progress");
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "cannot remove the back office's progress"
+        );
     }
 }
 
@@ -541,10 +545,10 @@ fn report(run: &OfficeRun, revs: RevRange) {
 /// (`run_office` reports both kinds as an action's result; see the crate README for the proposal
 /// that it return the internal ones as its own error instead.)
 fn retry_later(result: &Result<(), ApplyError<WorkError>>) -> bool {
-    matches!(
-        result,
-        Err(ApplyError::Failed(e)) if matches!(e.code(), ErrorCode::Internal | ErrorCode::Unavailable)
-    )
+    let Err(ApplyError::Failed(e)) = result else {
+        return false;
+    };
+    matches!(e.code(), ErrorCode::Internal | ErrorCode::Unavailable)
 }
 
 /// Saves `done` to `office.json`, on the blocking pool; whether it was written.
