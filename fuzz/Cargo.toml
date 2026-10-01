@@ -3,7 +3,10 @@
 #
 #   python3 fuzz/seed.py                 # seed fuzz/corpus/<target>/ from crates/fixtures
 #   cargo +nightly fuzz run <target> -- -dict=fuzz/dict/<name>.dict -max_total_time=60
-#   cargo +nightly fuzz run <target> fuzz/regressions/<target>/<file>   # an open finding's input
+#   cargo +nightly fuzz run <target> fuzz/regressions/<target>/<file>   # a finding's input
+#
+# Inputs in fuzz/regressions/<target>/ named `open-*` reproduce findings not fixed yet; the others
+# are fixed findings and must pass.
 #
 # Targets and what each checks are listed in docs/security/threat-model.md ("Fuzzing").
 
@@ -30,9 +33,11 @@ pitcrew-api = { path = "../crates/api" }
 pitcrew-auth = { path = "../crates/auth" }
 pitcrew-remote = { path = "../crates/remote" }
 pitcrew-sync-github = { path = "../crates/sync-github" }
+pitcrew-sync-jira = { path = "../crates/sync-jira" }
 pitcrew-cli = { path = "../crates/cli" }
 pitcrew-store = { path = "../crates/store" }
 pitcrew-recap = { path = "../crates/recap" }
+pitcrew-hub-work = { path = "../crates/hub-work" }
 pitcrew-fixtures = { path = "../crates/fixtures" }
 serde = "1"
 # `float_roundtrip` makes parse(print(x)) == x for every f64, so the round-trip checks cannot
@@ -184,6 +189,55 @@ bench = false
 [[bin]]
 name = "recap_blocks"
 path = "fuzz_targets/recap_blocks.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "remote_slurm"
+path = "fuzz_targets/remote_slurm.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "remote_site"
+path = "fuzz_targets/remote_site.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jira_adf"
+path = "fuzz_targets/jira_adf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jira_sync"
+path = "fuzz_targets/jira_sync.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "github_links"
+path = "fuzz_targets/github_links.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "api_recaps"
+path = "fuzz_targets/api_recaps.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recap_index"
+path = "fuzz_targets/recap_index.rs"
 test = false
 doc = false
 bench = false
