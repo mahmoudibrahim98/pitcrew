@@ -1,0 +1,7 @@
+# Zig for cargo-zigbuild, from PyPI, pinned by version and wheel hash (Linux x86_64 and aarch64
+# hosts, macOS hosts). Install with: pip install --require-hashes -r packaging/zig-requirements.txt
+ziglang==0.16.0 \
+    --hash=sha256:9fcda73f62b851dd72a54b710ad40a209896db14cfb13649e62191243556342b \
+    --hash=sha256:e27d409812b11e0fb89ed0200cf2e55b6464d43f9461553104e4a4f9a94a1fd5 \
+    --hash=sha256:b61e5413c49508d9d62e5dcea543e3af491594154d74a00ff52f84ed508260cc \
+    --hash=sha256:18e14f6b25678d7b7c65708c82501ee6090fe39ed5c783477d56267af1fa5629

@@ -31,11 +31,27 @@ describe('invalidation map', () => {
     expect(variants.sort()).toEqual([...EVENT_TYPES].sort());
   });
 
-  it('matches every event type in the mock hub', () => {
+  it('knows every event type the mock hub can send', () => {
+    // The protocol is the reference; the mock may lag it (it lacked machine_added, member_added,
+    // persona_saved, team_saved and session_updated when they were added to crates/protocol).
     const source = readFileSync(new URL('../../mock-hub/src/types.ts', import.meta.url), 'utf8');
     const union = source.slice(source.indexOf('export type EventBody'), source.indexOf('export interface HostInfo'));
-    const types = [...union.matchAll(/type: '([a-z_]+)'/g)].map((m) => m[1]);
-    expect(types.sort()).toEqual([...EVENT_TYPES].sort());
+    const types = [...union.matchAll(/type: '([a-z_]+)'/g)].map((m) => m[1] ?? '');
+    expect(types.length).toBeGreaterThan(0);
+    const known: readonly string[] = EVENT_TYPES;
+    expect(types.filter((type) => !known.includes(type))).toEqual([]);
+  });
+
+  it('refreshes workspace membership and session facts', () => {
+    const member = { id: 'M2', kind: 'agent', handle: '@new', name: 'New' } as const;
+    expect(keysToInvalidate([event({ type: 'member_added', data: { member } })], noCache)).toEqual([
+      keys.events,
+      keys.members,
+      keys.me,
+    ]);
+    expect(
+      keysToInvalidate([event({ type: 'session_updated', data: { session: 'S1', title: 'Renamed' } })], noCache),
+    ).toEqual([keys.events, keys.sessions.detail('S1'), keys.sessions.lists]);
   });
 
   it('leaves events that carry whole objects to the patches, apart from the activity feed', () => {
@@ -68,6 +84,28 @@ describe('invalidation map', () => {
     ]);
   });
 
+  it('task_updated touches the task, the task lists, and its old and new workstream', () => {
+    const cache: CacheLookup = { taskWorkstream: (id) => (id === 'T1' ? 'WS1' : undefined) };
+    const edited = keysToInvalidate([event({ type: 'task_updated', data: { task: 'T1', patch: { title: 'New' } } })], cache);
+    expect(edited).toEqual([keys.events, keys.tasks.detail('T1'), keys.tasks.lists, keys.workstreams.detail('WS1')]);
+    const moved = keysToInvalidate(
+      [event({ type: 'task_updated', data: { task: 'T1', patch: { workstream: 'WS2' } } })],
+      cache,
+    );
+    expect(moved).toEqual([
+      keys.events,
+      keys.tasks.detail('T1'),
+      keys.tasks.lists,
+      keys.workstreams.detail('WS1'),
+      keys.workstreams.detail('WS2'),
+    ]);
+    const cleared = keysToInvalidate(
+      [event({ type: 'task_updated', data: { task: 'T1', patch: { workstream: null } } })],
+      cache,
+    );
+    expect(cleared).toEqual([keys.events, keys.tasks.detail('T1'), keys.tasks.lists, keys.workstreams.detail('WS1')]);
+  });
+
   it('dedupes keys across a batch', () => {
     const moved = (to: 'review' | 'done') =>
       event({ type: 'task_moved', data: { task: 'T1', from: 'todo', to, mover: { kind: 'person' } } });
@@ -77,10 +115,24 @@ describe('invalidation map', () => {
 
   it('session events touch that session and not tasks', () => {
     const touched = keysToInvalidate(
-      [event({ type: 'session_state_changed', data: { session: 'S1', from: 'working', to: 'idle' } })],
+      [event({ type: 'session_ended', data: { session: 'S1' } })],
       noCache,
     );
     expect(touched).toEqual([keys.events, keys.sessions.detail('S1'), keys.sessions.lists]);
+  });
+
+  it('a state change also touches the newest transcript page (a question or a turn may have landed)', () => {
+    const touched = keysToInvalidate(
+      [event({ type: 'session_state_changed', data: { session: 'S1', from: 'working', to: 'waiting' } })],
+      noCache,
+    );
+    expect(touched).toEqual([
+      keys.events,
+      keys.sessions.detail('S1'),
+      keys.sessions.lists,
+      keys.sessions.transcript('S1'),
+    ]);
+    expect(touched).not.toContainEqual(['sessions', 'transcript', 'S1']);
   });
 
   it('refetches everything for an event type this build does not know', () => {
