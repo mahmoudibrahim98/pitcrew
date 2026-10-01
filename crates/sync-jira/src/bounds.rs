@@ -8,7 +8,7 @@
 pub use pitcrew_sync_github::bounds::{
     MAX_BODY_CHARS, MAX_LABEL_CHARS, MAX_LABELS, MAX_PAGE_BODY_BYTES, MAX_PAGES_PER_CALL,
     MAX_TITLE_CHARS, SECONDARY_BACKOFF_BASE_SECS, SECONDARY_BACKOFF_CAP_SECS, backoff_secs,
-    cap_chars, cap_labels,
+    cap_chars, cap_labels, strip_hidden,
 };
 
 /// Stop collecting items after this many, across all pages, in one project's sync call. Jira

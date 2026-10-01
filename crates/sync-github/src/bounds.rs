@@ -1,4 +1,6 @@
-//! Bounds: caps that keep one sync call finite regardless of what the server sends.
+//! Bounds: caps that keep one sync call finite regardless of what the server sends, plus
+//! [`strip_hidden`]/[`cap_chars`]/[`cap_labels`], which also keep untrusted text honest about what
+//! it displays as.
 
 /// Stop paginating after this many pages in one call. The next sync call resumes through the
 /// `since` cursor (issues) or the stored "last seen" bound (pull requests).
@@ -60,17 +62,45 @@ impl Default for Limits {
     }
 }
 
-/// Truncates `s` to at most `max` characters (not bytes), on a char boundary.
-#[must_use]
-pub fn cap_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        s.chars().take(max).collect()
-    }
+/// Characters that change text direction or are invisible. Dropped from any upstream text this
+/// crate stores or re-emits (round 2 review item R10), so a crafted title, body, label or name
+/// cannot make a change — or anything downstream reading it, such as a summary or a UI list —
+/// display differently from what it actually says. The same character set
+/// `pitcrew_recap::text::clean`'s own `is_hidden` drops, reimplemented here rather than taken as a
+/// dependency on that crate: `pitcrew-recap` depends on sync data flowing *up* to it, not the
+/// other way around, and this check is small enough that duplicating it is cheaper than a new
+/// cross-stream dependency.
+fn is_hidden(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
 }
 
-/// Caps a list of labels: at most [`MAX_LABELS`] entries, each at most [`MAX_LABEL_CHARS`] long.
+/// Drops [`is_hidden`] characters, keeping everything else untouched. Unlike
+/// `pitcrew_recap::text::clean`, this does not also collapse whitespace/control characters to a
+/// single space or trim the ends: title/body/label text here is stored close to as-sent (beyond
+/// the length caps below), and that further normalisation is display-layer policy, not sync
+/// policy — callers that want it (e.g. a summary) already have their own `clean`.
+#[must_use]
+pub fn strip_hidden(s: &str) -> String {
+    s.chars().filter(|c| !is_hidden(*c)).collect()
+}
+
+/// Truncates `s` to at most `max` characters (not bytes), on a char boundary, after
+/// [`strip_hidden`] removes any hidden/direction-changing characters.
+#[must_use]
+pub fn cap_chars(s: &str, max: usize) -> String {
+    strip_hidden(s).chars().take(max).collect()
+}
+
+/// Caps a list of labels: at most [`MAX_LABELS`] entries, each at most [`MAX_LABEL_CHARS`] long
+/// (and, via [`cap_chars`], hidden-character-stripped).
 #[must_use]
 pub fn cap_labels(labels: &[String]) -> Vec<String> {
     labels
@@ -98,6 +128,24 @@ mod tests {
         assert_eq!(cap_chars("hello", 3), "hel");
         assert_eq!(cap_chars("héllo", 2), "hé");
         assert_eq!(cap_chars("", 0), "");
+    }
+
+    #[test]
+    fn strip_hidden_drops_bidi_overrides_and_zero_width_characters() {
+        assert_eq!(strip_hidden("ab\u{202E}cd"), "abcd");
+        assert_eq!(strip_hidden("a\u{200B}b\u{FEFF}c"), "abc");
+        // Ordinary control characters (a newline, say) and whitespace are left untouched — only
+        // the hidden/direction-changing set is removed here; any further normalisation is a
+        // display-layer concern.
+        assert_eq!(strip_hidden("a\nb\tc"), "a\nb\tc");
+    }
+
+    #[test]
+    fn cap_chars_strips_hidden_characters_before_truncating() {
+        assert_eq!(cap_chars("ab\u{202E}cd", 10), "abcd");
+        // A right-to-left override made the title *look* like "gnikcah rof loot" at a glance, but
+        // stripped it reads as what it actually says.
+        assert_eq!(cap_chars("safe\u{202E}loot rof gnikcah", 4), "safe");
     }
 
     #[test]

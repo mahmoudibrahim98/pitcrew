@@ -1,7 +1,7 @@
 //! [`UpstreamChange`]: what changed upstream since the last sync, and the diffing that produces
 //! it from a freshly read item and its last snapshot.
 
-use crate::bounds::{MAX_BODY_CHARS, MAX_TITLE_CHARS, cap_chars, cap_labels};
+use crate::bounds::{MAX_BODY_CHARS, MAX_TITLE_CHARS, cap_chars, cap_labels, strip_hidden};
 use crate::links::linked_issues;
 use crate::state::{CloseReason, IssueSnapshot, MilestoneSnapshot, PullSnapshot};
 use crate::time::GithubTimestamp;
@@ -9,39 +9,82 @@ use crate::wire::{WireIssue, WireMilestone, WirePullRequest};
 use pitcrew_protocol::model::{ExternalRef, ExternalSystem};
 use serde::{Deserialize, Serialize};
 
-fn issue_ref(owner_repo: &str, number: u64, html_url: Option<&str>) -> ExternalRef {
-    ExternalRef {
-        system: ExternalSystem::Github,
-        key: format!("{owner_repo}#{number}"),
-        url: Some(
-            html_url
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("https://github.com/{owner_repo}/issues/{number}")),
-        ),
+/// Whether `url` is safe to carry verbatim into an [`ExternalRef`]: only `https`. GitHub.com and
+/// every GitHub Enterprise Server deployment this crate has seen use TLS, so this is a deliberate
+/// decision, not an oversight — plain `http` is rejected too. Round 2 review item R10: a server
+/// could otherwise put anything in `html_url` (`javascript:...`, `data:...`, a bare path, ...) and
+/// have it stored and possibly later treated as directly clickable.
+fn has_trusted_url_scheme(url: &str) -> bool {
+    url::Url::parse(url).is_ok_and(|u| u.scheme() == "https")
+}
+
+/// Resolves `html_url` into the URL an [`ExternalRef`] should carry: the server's own value when
+/// it parses and is `https`, the crate's own constructed fallback otherwise (also used when the
+/// server sent none at all). Increments `*malformed_fields` only for the "sent but rejected" case
+/// — an absent `html_url` is normal, not malformed.
+fn resolved_url(
+    html_url: Option<&str>,
+    fallback: impl FnOnce() -> String,
+    malformed_fields: &mut u32,
+) -> String {
+    match html_url {
+        Some(u) if has_trusted_url_scheme(u) => u.to_string(),
+        Some(_) => {
+            *malformed_fields += 1;
+            fallback()
+        }
+        None => fallback(),
     }
 }
 
-fn pull_ref(owner_repo: &str, number: u64, html_url: Option<&str>) -> ExternalRef {
+fn issue_ref(
+    owner_repo: &str,
+    number: u64,
+    html_url: Option<&str>,
+    malformed_fields: &mut u32,
+) -> ExternalRef {
     ExternalRef {
         system: ExternalSystem::Github,
         key: format!("{owner_repo}#{number}"),
-        url: Some(
-            html_url
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("https://github.com/{owner_repo}/pull/{number}")),
-        ),
+        url: Some(resolved_url(
+            html_url,
+            || format!("https://github.com/{owner_repo}/issues/{number}"),
+            malformed_fields,
+        )),
     }
 }
 
-fn milestone_ref(owner_repo: &str, number: u64, html_url: Option<&str>) -> ExternalRef {
+fn pull_ref(
+    owner_repo: &str,
+    number: u64,
+    html_url: Option<&str>,
+    malformed_fields: &mut u32,
+) -> ExternalRef {
+    ExternalRef {
+        system: ExternalSystem::Github,
+        key: format!("{owner_repo}#{number}"),
+        url: Some(resolved_url(
+            html_url,
+            || format!("https://github.com/{owner_repo}/pull/{number}"),
+            malformed_fields,
+        )),
+    }
+}
+
+fn milestone_ref(
+    owner_repo: &str,
+    number: u64,
+    html_url: Option<&str>,
+    malformed_fields: &mut u32,
+) -> ExternalRef {
     ExternalRef {
         system: ExternalSystem::Github,
         key: format!("{owner_repo}#milestone:{number}"),
-        url: Some(
-            html_url
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("https://github.com/{owner_repo}/milestone/{number}")),
-        ),
+        url: Some(resolved_url(
+            html_url,
+            || format!("https://github.com/{owner_repo}/milestone/{number}"),
+            malformed_fields,
+        )),
     }
 }
 
@@ -180,7 +223,15 @@ impl UpstreamChange {
 fn snapshot_of(issue: &WireIssue) -> IssueSnapshot {
     let mut labels: Vec<String> = issue.labels.iter().map(|l| l.name.clone()).collect();
     labels.sort();
-    let mut assignees: Vec<String> = issue.assignees.iter().map(|a| a.login.clone()).collect();
+    // Logins are short, bounded by GitHub's own username rules, and never shown verbatim as a
+    // long body would be — no length cap needed — but still worth hidden-character-stripping
+    // (R10: "names"), since a login is exactly the kind of short text a bidi override could make
+    // misleading in a UI list.
+    let mut assignees: Vec<String> = issue
+        .assignees
+        .iter()
+        .map(|a| strip_hidden(&a.login))
+        .collect();
     assignees.sort();
     IssueSnapshot {
         title: cap_chars(&issue.title, MAX_TITLE_CHARS),
@@ -200,21 +251,34 @@ fn snapshot_of(issue: &WireIssue) -> IssueSnapshot {
 /// changes found and the new snapshot to store — or `None` if `issue.updated_at` is not
 /// well-formed, in which case the whole item is treated as malformed (skipped, and counted by the
 /// caller) rather than snapshotted or diffed with a timestamp that can't be trusted as a cursor.
+/// `*malformed_fields` is incremented once for each of `issue`'s and its milestone's `html_url`
+/// that was present but rejected (an untrusted scheme — R10) and silently replaced by this
+/// crate's own constructed URL; the item itself is still processed normally either way.
 pub(crate) fn diff_issue(
     owner_repo: &str,
     issue: &WireIssue,
     previous: Option<&IssueSnapshot>,
+    malformed_fields: &mut u32,
 ) -> Option<(Vec<UpstreamChange>, IssueSnapshot)> {
     if !GithubTimestamp::new(&issue.updated_at).is_well_formed() {
         return None;
     }
     let next = snapshot_of(issue);
-    let source = issue_ref(owner_repo, issue.number, issue.html_url.as_deref());
+    let source = issue_ref(
+        owner_repo,
+        issue.number,
+        issue.html_url.as_deref(),
+        malformed_fields,
+    );
     let at = next.updated_at.clone();
-    let milestone = issue
-        .milestone
-        .as_ref()
-        .map(|m| milestone_ref(owner_repo, m.number, m.html_url.as_deref()));
+    let milestone = issue.milestone.as_ref().map(|m| {
+        milestone_ref(
+            owner_repo,
+            m.number,
+            m.html_url.as_deref(),
+            malformed_fields,
+        )
+    });
     let mut changes = Vec::new();
 
     match previous {
@@ -298,17 +362,23 @@ fn pull_snapshot_of(pr: &WirePullRequest) -> PullSnapshot {
 }
 
 /// Diffs a freshly read pull request against its last snapshot — or `None` if `pr.updated_at` is
-/// not well-formed (see [`diff_issue`]).
+/// not well-formed (see [`diff_issue`]). `*malformed_fields` is incremented as in [`diff_issue`].
 pub(crate) fn diff_pull(
     owner_repo: &str,
     pr: &WirePullRequest,
     previous: Option<&PullSnapshot>,
+    malformed_fields: &mut u32,
 ) -> Option<(Vec<UpstreamChange>, PullSnapshot)> {
     if !GithubTimestamp::new(&pr.updated_at).is_well_formed() {
         return None;
     }
     let next = pull_snapshot_of(pr);
-    let source = pull_ref(owner_repo, pr.number, pr.html_url.as_deref());
+    let source = pull_ref(
+        owner_repo,
+        pr.number,
+        pr.html_url.as_deref(),
+        malformed_fields,
+    );
     let at = next.updated_at.clone();
     let mut changes = Vec::new();
 
@@ -353,15 +423,22 @@ fn milestone_snapshot_of(m: &WireMilestone) -> MilestoneSnapshot {
 }
 
 /// Diffs a freshly read milestone against its last snapshot. Milestones carry no `updated_at` in
-/// the REST payload, so the caller's read time stands in for "when".
+/// the REST payload, so the caller's read time stands in for "when". `*malformed_fields` is
+/// incremented as in [`diff_issue`].
 pub(crate) fn diff_milestone(
     owner_repo: &str,
     milestone: &WireMilestone,
     previous: Option<&MilestoneSnapshot>,
     at: &GithubTimestamp,
+    malformed_fields: &mut u32,
 ) -> (Vec<UpstreamChange>, MilestoneSnapshot) {
     let next = milestone_snapshot_of(milestone);
-    let source = milestone_ref(owner_repo, milestone.number, milestone.html_url.as_deref());
+    let source = milestone_ref(
+        owner_repo,
+        milestone.number,
+        milestone.html_url.as_deref(),
+        malformed_fields,
+    );
     let mut changes = Vec::new();
 
     match previous {
@@ -431,22 +508,35 @@ mod malformed_timestamp_tests {
 
     #[test]
     fn a_well_formed_issue_timestamp_diffs_normally() {
+        let mut malformed_fields = 0u32;
         let result = diff_issue(
             "example-org/demo-repo",
             &issue("2026-01-01T00:00:00Z"),
             None,
+            &mut malformed_fields,
         );
         assert!(result.is_some());
+        assert_eq!(malformed_fields, 0);
     }
 
     #[test]
     fn a_malformed_issue_timestamp_is_skipped_entirely() {
-        assert!(diff_issue("example-org/demo-repo", &issue("not-a-timestamp"), None).is_none());
+        let mut malformed_fields = 0u32;
+        assert!(
+            diff_issue(
+                "example-org/demo-repo",
+                &issue("not-a-timestamp"),
+                None,
+                &mut malformed_fields
+            )
+            .is_none()
+        );
         assert!(
             diff_issue(
                 "example-org/demo-repo",
                 &issue("2026-01-01T00:00:00.000Z"),
-                None
+                None,
+                &mut malformed_fields
             )
             .is_none(),
             "fractional seconds are not the shape GitHub actually sends"
@@ -455,12 +545,94 @@ mod malformed_timestamp_tests {
 
     #[test]
     fn a_well_formed_pull_timestamp_diffs_normally() {
-        let result = diff_pull("example-org/demo-repo", &pull("2026-01-01T00:00:00Z"), None);
+        let mut malformed_fields = 0u32;
+        let result = diff_pull(
+            "example-org/demo-repo",
+            &pull("2026-01-01T00:00:00Z"),
+            None,
+            &mut malformed_fields,
+        );
         assert!(result.is_some());
+        assert_eq!(malformed_fields, 0);
     }
 
     #[test]
     fn a_malformed_pull_timestamp_is_skipped_entirely() {
-        assert!(diff_pull("example-org/demo-repo", &pull(""), None).is_none());
+        let mut malformed_fields = 0u32;
+        assert!(
+            diff_pull(
+                "example-org/demo-repo",
+                &pull(""),
+                None,
+                &mut malformed_fields
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn an_untrusted_html_url_scheme_is_dropped_and_counted_as_a_malformed_field() {
+        let mut malformed_fields = 0u32;
+        let mut malicious = issue("2026-01-01T00:00:00Z");
+        malicious.html_url = Some("javascript:alert(1)".to_string());
+        let (_changes, _snapshot) = diff_issue(
+            "example-org/demo-repo",
+            &malicious,
+            None,
+            &mut malformed_fields,
+        )
+        .expect("the item itself is still processed");
+        assert_eq!(malformed_fields, 1);
+    }
+
+    #[test]
+    fn a_plain_http_html_url_is_also_untrusted() {
+        let mut malformed_fields = 0u32;
+        let mut http_issue = issue("2026-01-01T00:00:00Z");
+        http_issue.html_url = Some("http://github.com/example-org/demo-repo/issues/1".to_string());
+        diff_issue(
+            "example-org/demo-repo",
+            &http_issue,
+            None,
+            &mut malformed_fields,
+        )
+        .expect("the item itself is still processed");
+        assert_eq!(malformed_fields, 1);
+    }
+
+    #[test]
+    fn a_trusted_https_html_url_is_kept_and_not_counted() {
+        let mut malformed_fields = 0u32;
+        let mut ok_issue = issue("2026-01-01T00:00:00Z");
+        ok_issue.html_url = Some("https://github.com/example-org/demo-repo/issues/1".to_string());
+        let (changes, _snapshot) = diff_issue(
+            "example-org/demo-repo",
+            &ok_issue,
+            None,
+            &mut malformed_fields,
+        )
+        .expect("well-formed");
+        assert_eq!(malformed_fields, 0);
+        assert_eq!(
+            changes[0].source().url.as_deref(),
+            Some("https://github.com/example-org/demo-repo/issues/1")
+        );
+    }
+
+    #[test]
+    fn a_hidden_character_in_an_assignee_login_is_stripped() {
+        let mut malformed_fields = 0u32;
+        let mut spoofed = issue("2026-01-01T00:00:00Z");
+        spoofed.assignees = vec![crate::wire::WireUser {
+            login: "ab\u{202E}cd".to_string(),
+        }];
+        let (_changes, snapshot) = diff_issue(
+            "example-org/demo-repo",
+            &spoofed,
+            None,
+            &mut malformed_fields,
+        )
+        .expect("well-formed");
+        assert_eq!(snapshot.assignees, vec!["abcd".to_string()]);
     }
 }

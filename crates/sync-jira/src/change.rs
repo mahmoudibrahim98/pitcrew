@@ -3,7 +3,7 @@
 //! `pitcrew_sync_github::UpstreamChange` closely — same idea, Jira's own fields.
 
 use crate::adf::adf_to_text;
-use crate::bounds::{MAX_BODY_CHARS, MAX_TITLE_CHARS, cap_chars, cap_labels};
+use crate::bounds::{MAX_BODY_CHARS, MAX_TITLE_CHARS, cap_chars, cap_labels, strip_hidden};
 use crate::state::{EpicSnapshot, IssueSnapshot, StatusCategory};
 use crate::time::JiraTimestamp;
 use crate::wire::WireIssue;
@@ -13,12 +13,17 @@ use serde_json::Value;
 
 /// Builds a reference to one Jira item (issue or epic — both are issues at the wire level) by
 /// key, with its browsable URL. Jira's REST responses carry no browsable URL field of their own
-/// (unlike GitHub's `html_url`), so this builds one from `site_base`.
+/// (unlike GitHub's `html_url`), so this builds one from `site_base`. `key` is server-supplied
+/// (round 2 review item R10): `site_base` itself is this crate's own trusted configuration, never
+/// server data, but `key` is hidden-character-stripped before it is spliced into either the
+/// browsable URL or `ExternalRef.key` itself, so a crafted key cannot make the reference *read* as
+/// a different issue than the one it actually is.
 fn item_ref(site_base: &str, key: &str) -> ExternalRef {
+    let key = strip_hidden(key);
     ExternalRef {
         system: ExternalSystem::Jira,
-        key: key.to_string(),
         url: Some(format!("{site_base}/browse/{key}")),
+        key,
     }
 }
 
@@ -143,14 +148,21 @@ fn snapshot_of(issue: &WireIssue, epic_link_field: Option<&str>) -> IssueSnapsho
         title: cap_chars(&issue.fields.summary, MAX_TITLE_CHARS),
         body: description_text(&issue.fields.description),
         category: StatusCategory::from_key(&issue.fields.status.status_category.key),
-        resolution: issue.fields.resolution.as_ref().map(|r| r.name.clone()),
+        // Resolution and assignee names are short "names" in the sense R10 means (round 2
+        // review): never length-capped (they're already bounded by Jira's own field shapes), but
+        // still hidden-character-stripped, the same reasoning as GitHub's assignee logins.
+        resolution: issue
+            .fields
+            .resolution
+            .as_ref()
+            .map(|r| strip_hidden(&r.name)),
         labels: cap_labels(&labels),
         assignee: issue
             .fields
             .assignee
             .as_ref()
             .and_then(|a| a.identifier())
-            .map(str::to_string),
+            .map(strip_hidden),
         epic_key: issue.fields.epic_key(epic_link_field),
         updated: JiraTimestamp::new(&issue.fields.updated),
     }
@@ -335,6 +347,39 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn a_hidden_character_in_the_issue_key_is_stripped_from_both_the_ref_and_its_url() {
+        // Round 2 review item R10: the key is server-supplied, and gets spliced into both
+        // `ExternalRef.key` and the browsable URL `item_ref` builds from `site_base`.
+        let mut spoofed = issue("2026-01-01T00:00:00.000+0000", "new");
+        spoofed.key = "DEMO\u{202E}-1".to_string();
+        let (changes, _snapshot) =
+            diff_issue("https://jira.example.com", &spoofed, None, None).expect("well-formed");
+        let source = changes[0].source();
+        assert_eq!(source.key, "DEMO-1");
+        assert_eq!(
+            source.url.as_deref(),
+            Some("https://jira.example.com/browse/DEMO-1")
+        );
+    }
+
+    #[test]
+    fn hidden_characters_in_resolution_and_assignee_are_stripped() {
+        let mut issue = issue("2026-01-01T00:00:00.000+0000", "done");
+        issue.fields.resolution = Some(crate::wire::WireResolution {
+            name: "Fixed\u{200B}".to_string(),
+        });
+        issue.fields.assignee = Some(crate::wire::WireUser {
+            account_id: Some("ab\u{202E}cd".to_string()),
+            name: None,
+            display_name: None,
+        });
+        let (_changes, snapshot) =
+            diff_issue("https://jira.example.com", &issue, None, None).expect("well-formed");
+        assert_eq!(snapshot.resolution.as_deref(), Some("Fixed"));
+        assert_eq!(snapshot.assignee.as_deref(), Some("abcd"));
     }
 
     #[test]

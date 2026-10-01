@@ -106,7 +106,9 @@ pub struct SyncOutcome {
     /// Non-fatal problems (a resource whose request failed outright). A repository that hit one
     /// of these still tries its other resources.
     pub errors: Vec<SyncIssue>,
-    /// How many items across the whole call failed to parse and were skipped.
+    /// How many items across the whole call failed to parse and were skipped entirely, plus how
+    /// many individual malformed *fields* (currently: an `html_url` with an untrusted scheme —
+    /// R10) were dropped and replaced with a safe default while the rest of their item was kept.
     pub malformed_skipped: u32,
 }
 
@@ -151,7 +153,8 @@ fn encode_timestamp(s: &str) -> String {
 }
 
 enum ResourceResult {
-    /// Changes found, how many items were skipped as malformed, and — if a server-supplied
+    /// Changes found, how many items were skipped (or individual fields dropped — see
+    /// [`SyncOutcome::malformed_skipped`]) as malformed, and — if a server-supplied
     /// `Link: rel="next"` outside the API base was ignored — a message to raise as an additional
     /// `SyncIssue` alongside these (otherwise successful) changes.
     Changes(Vec<UpstreamChange>, u32, Option<String>),
@@ -191,13 +194,14 @@ async fn sync_issues<T: Transport>(
         Ok(Outcome::Ok(list)) => {
             let mut changes = Vec::new();
             let mut malformed_timestamps = 0u32;
+            let mut malformed_fields = 0u32;
             for issue in &list.items {
                 // The issues endpoint also lists pull requests; those are synced separately.
                 if issue.pull_request.is_some() {
                     continue;
                 }
                 let previous = repo_state.issue_snapshots.get(&issue.number);
-                match diff_issue(repo, issue, previous) {
+                match diff_issue(repo, issue, previous, &mut malformed_fields) {
                     Some((mut found, snapshot)) => {
                         changes.append(&mut found);
                         repo_state.issue_snapshots.insert(issue.number, snapshot);
@@ -222,7 +226,7 @@ async fn sync_issues<T: Transport>(
             let warning = list.blocked_link.as_deref().map(blocked_link_message);
             ResourceResult::Changes(
                 changes,
-                list.malformed_skipped + malformed_timestamps,
+                list.malformed_skipped + malformed_timestamps + malformed_fields,
                 warning,
             )
         }
@@ -284,9 +288,10 @@ async fn sync_pulls<T: Transport>(
         Ok(Outcome::Ok(list)) => {
             let mut changes = Vec::new();
             let mut malformed_timestamps = 0u32;
+            let mut malformed_fields = 0u32;
             for pr in &list.items {
                 let previous = repo_state.pull_snapshots.get(&pr.number);
-                match diff_pull(repo, pr, previous) {
+                match diff_pull(repo, pr, previous, &mut malformed_fields) {
                     Some((mut found, snapshot)) => {
                         changes.append(&mut found);
                         repo_state.pull_snapshots.insert(pr.number, snapshot);
@@ -327,7 +332,7 @@ async fn sync_pulls<T: Transport>(
             let warning = list.blocked_link.as_deref().map(blocked_link_message);
             ResourceResult::Changes(
                 changes,
-                list.malformed_skipped + malformed_timestamps,
+                list.malformed_skipped + malformed_timestamps + malformed_fields,
                 warning,
             )
         }
@@ -380,9 +385,11 @@ async fn sync_milestones<T: Transport>(
         }
         Ok(Outcome::Ok(list)) => {
             let mut changes = Vec::new();
+            let mut malformed_fields = 0u32;
             for milestone in &list.items {
                 let previous = repo_state.milestone_snapshots.get(&milestone.number);
-                let (mut found, snapshot) = diff_milestone(repo, milestone, previous, now);
+                let (mut found, snapshot) =
+                    diff_milestone(repo, milestone, previous, now, &mut malformed_fields);
                 changes.append(&mut found);
                 repo_state
                     .milestone_snapshots
@@ -393,7 +400,7 @@ async fn sync_milestones<T: Transport>(
                 repo_state.milestones.last_modified = list.last_modified;
             }
             let warning = list.blocked_link.as_deref().map(blocked_link_message);
-            ResourceResult::Changes(changes, list.malformed_skipped, warning)
+            ResourceResult::Changes(changes, list.malformed_skipped + malformed_fields, warning)
         }
     }
 }
