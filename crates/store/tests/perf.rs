@@ -130,3 +130,48 @@ fn append_10k_with_two_projections() {
     println!("rebuild one projection over 10,000 events: {rebuild:?}");
     assert!(append < Duration::from_secs(1), "append took {append:?}");
 }
+
+/// Measures `Store::import`'s one-transaction design (R7,
+/// `docs/build/briefs/C-import-and-reopen.md`) against what the old, per-batch-committing design
+/// cost: the same events appended in ten separately committed batches of 1,000, by hand, which is
+/// exactly what `import` itself used to do internally.
+#[test]
+#[ignore = "timing; run in release"]
+fn import_10k_compares_to_ten_committed_batches() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fixture = pitcrew_fixtures::demo_workspace().expect("fixture").events;
+    let events: Vec<Event> = fixture
+        .iter()
+        .cycle()
+        .take(10_000)
+        .map(|e| {
+            let mut e = e.clone();
+            e.id = EventId::new();
+            e
+        })
+        .collect();
+
+    let source = Store::open(dir.path().join("source.db"), StoreOptions::default()).expect("open");
+    source.append(&events).expect("append");
+    let mut buf = Vec::new();
+    source.export(&mut buf).expect("export");
+    drop(source);
+
+    let target = Store::open(dir.path().join("target.db"), StoreOptions::default()).expect("open");
+    let start = Instant::now();
+    target.import(buf.as_slice()).expect("import");
+    let import_took = start.elapsed();
+    assert_eq!(target.latest_rev().expect("rev"), 10_000);
+
+    let old_style = Store::open(dir.path().join("old.db"), StoreOptions::default()).expect("open");
+    let start = Instant::now();
+    for batch in events.chunks(1_000) {
+        old_style.append(batch).expect("append");
+    }
+    let old_style_took = start.elapsed();
+
+    println!("import 10,000 events, one transaction: {import_took:?}");
+    println!(
+        "the same 10,000 events, ten committed batches of 1,000 (the old design's cost): {old_style_took:?}"
+    );
+}

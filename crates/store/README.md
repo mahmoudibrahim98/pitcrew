@@ -41,6 +41,13 @@ a fresh file at once both succeed and each migration runs once.
 - `since(rev, limit)` pages forward; `before(rev, limit, &EventFilter)` pages back. An empty type
   filter matches everything. With types, `before` merges one `(type, rev)` index walk per type,
   so a page costs about `limit` rows per type however large the log is.
+- `contains(EventId) -> bool` is the supported way to ask whether an id is already in the log
+  (other crates no longer need their own `SELECT 1 FROM events WHERE id = ?` against a raw
+  connection). `events.id` is unique-indexed (`migrations/0001_init.sql`), so this costs one
+  indexed lookup — about the same as reading a single row of a `since`/`before` page, not a scan
+  of the log. It runs on the same connection `since` and `before` do (the separate read-only
+  connection in local mode, the write connection in network mode): do not call it inside `read`
+  (it deadlocks, for the same reason `since` and `before` do).
 - `subscribe()` is a `tokio::sync::broadcast` receiver of new revision ranges. When this `Store`
   is the only writer to the file, ranges arrive in order and contiguous; appends by another
   process are not announced. A receiver that falls behind gets `Lagged` and catches up with
@@ -82,6 +89,20 @@ Then:
 - `Store::rebuild(name)` rebuilds one on demand (and also refuses a newer stored version);
 - bump `version()` whenever `apply` changes meaning. `reset` followed by replaying the log must
   give the same tables as applying events one append at a time; test that.
+
+**Adding a projection to an already-open store.** `Store::register(Box::new(projection))` adds a
+projection without reopening: it runs the same catch-up `Store::open_with` runs for a projection
+present from the start (`reset`, or replay from its checkpoint), inside one write transaction,
+then the projection starts receiving every event appended through this `Store` from then on. It
+shares the one write lock every other writer (`append`, `rebuild`, `import`) already uses, so no
+event can be appended while the catch-up runs, and nothing can observe the projection as
+registered before its tables already reflect the log as of that transaction's commit — an append
+attempted concurrently either committed before `register` started (so the catch-up already covers
+it) or queues behind the write lock and applies to the new projection normally once it proceeds.
+In network mode this never drops or re-takes the lease, unlike closing the `Store` and opening it
+again: that is the point of it (see "Network filesystems", below, and the daemon's README, "Known
+gaps" — "The lease between the two opens"). `Error::DuplicateProjection` if the name is already
+registered; errors otherwise as `Store::open_with`.
 
 **SQL access.** `pitcrew_store::sql` re-exports the store's `rusqlite`, so domain crates use the
 workspace's one version and the same `Transaction` type without their own dependency. `apply`
@@ -215,10 +236,27 @@ decides:
   which would run migrations against a file that may be corrupt.
 - **`Store::export(writer)`** writes every event as one JSON line each (no revision: order is the
   record), oldest first. **`Store::import(reader)`** loads those lines into an empty store
-  (`Error::NotEmpty` otherwise), appending them through the normal `append` path so this store's
-  registered projections build from them. An import is a new log: `log_id` was already assigned
-  when the store was created, independently of import, so it differs from the exported store's.
-  Both are for tests and support, not sync.
+  (`Error::NotEmpty` otherwise), inserting and applying them to every registered projection
+  through the same insert-and-apply path `append` uses, in batches of 1,000 lines so memory stays
+  bounded by one batch however long the file is — but, unlike `append` called once per batch, all
+  of it inside **one** write transaction, committed only at the very end. So an import is whole or
+  nothing (R7, `docs/security/threat-model.md`): a bad line, a lost lease, or any other failure
+  rolls every batch back, not just the one in progress, and `Store::latest_rev` reads 0 afterwards
+  — never a prefix of `reader`'s lines, and never the `Error::NotEmpty` a retry used to get from a
+  store a bad batch had already partly filled. Other designs considered: a staging table (rejected
+  — would need its own schema and a second copy of every row) and a fresh file renamed into place
+  (rejected — a second copy of the whole database on disk, and import would no longer reuse
+  `append`'s own insert-and-apply-projections path). One transaction instead reuses that path
+  exactly and gets "nothing or everything" on a real crash for free, from SQLite's own rollback
+  journal. Its cost: the write lock is held for the whole import rather than 1,000 lines at a
+  time; in local (WAL) mode this does not affect reads (they use the separate read connection
+  regardless), and in network mode — where reads already share the write connection — a very
+  large import blocks reads for longer than before, a reasonable trade for a rare, offline
+  operation. Measured: importing 10,000 events in one transaction took 370 ms, against 393 ms the
+  same 10,000 events took appended in ten separately committed batches of 1,000 (what the old
+  design did internally) — see "Timings" below. An import is a new log: `log_id` was already
+  assigned when the store was created, independently of import, so it differs from the exported
+  store's. Both are for tests and support, not sync.
 
 ## Timings
 
@@ -239,3 +277,13 @@ Measured 2026-09-30 on a laptop (Intel Core Ultra 5 135U, 14 threads, 16 GB), WS
 
 With other agents building on the same machine, worst pages reached about 10–13 ms, for `main`'s
 code as well; the targets hold on an idle machine.
+
+Import (R7, `docs/build/briefs/C-import-and-reopen.md`), measured 2026-10-01, one run, on a
+machine shared with several other agents building at once (not the idle machine above, so these
+are one-off numbers, not a mean over several runs — the point is the comparison between the two,
+not either figure alone):
+
+| Operation | Took |
+|---|---|
+| `import`, 10,000 events, one transaction (the current design) | 370 ms |
+| The same 10,000 events, `append`ed in ten separately committed batches of 1,000 (the old design's cost) | 393 ms |

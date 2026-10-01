@@ -465,6 +465,22 @@ fn concurrent_appenders_notify_in_order() {
 }
 
 #[test]
+fn contains_reports_stored_and_unknown_ids() {
+    let (_dir, store) = open();
+    let events = fixture_events();
+    assert!(!store.contains(events[0].id).expect("contains"));
+    store.append(&events[..3]).expect("append");
+    for e in &events[..3] {
+        assert!(store.contains(e.id).expect("contains"), "{:?}", e.id);
+    }
+    for e in &events[3..] {
+        assert!(!store.contains(e.id).expect("contains"), "{:?}", e.id);
+    }
+    // An id nothing ever stored.
+    assert!(!store.contains(EventId::new()).expect("contains"));
+}
+
+#[test]
 fn two_stores_on_one_file_append_concurrently() {
     const BATCHES: usize = 50;
     let dir = tempfile::tempdir().expect("tempdir");

@@ -6,7 +6,7 @@ use crate::migrations::{self, Migration};
 use crate::projection::{self, Checkpoint, Projection};
 use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{EventId, MemberId, WorkspaceId};
-use rusqlite::{Connection, OpenFlags, Row, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior};
 use std::collections::BTreeSet;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -131,7 +131,13 @@ pub struct Store {
     /// The one write connection. Appends, rebuilds, `latest_rev` and the schema version go
     /// through it, and so do reads in network mode.
     conn: Mutex<Connection>,
-    projections: Vec<Box<dyn Projection>>,
+    /// A separate lock from `conn`'s, so [`Store::register`] can add a projection through `&self`
+    /// (no caller ever needs a `&mut Store`). Every method that reads or mutates this locks `conn`
+    /// first and `projections` second, never the other order, so the two locks never deadlock.
+    /// In practice `projections` is never contended: every writer (`append`, `rebuild`, `import`,
+    /// `register`) already holds `conn` first, which alone serialises them with each other: this
+    /// lock only exists to satisfy the borrow checker for mutation through a shared reference.
+    projections: Mutex<Vec<Box<dyn Projection>>>,
     log_id: String,
     revs: broadcast::Sender<RevRange>,
     /// Set only in network mode: the single-host lease and its renewal thread. Checked before
@@ -143,16 +149,14 @@ pub struct Store {
 
 impl std::fmt::Debug for Store {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let guard = self
+            .projections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let names = guard.iter().map(|p| p.name()).collect::<Vec<_>>();
         f.debug_struct("Store")
             .field("log_id", &self.log_id)
-            .field(
-                "projections",
-                &self
-                    .projections
-                    .iter()
-                    .map(|p| p.name())
-                    .collect::<Vec<_>>(),
-            )
+            .field("projections", &names)
             .finish_non_exhaustive()
     }
 }
@@ -272,7 +276,7 @@ impl Store {
         Ok(Self {
             reader,
             conn: Mutex::new(conn),
-            projections,
+            projections: Mutex::new(projections),
             log_id,
             revs,
             network: lease,
@@ -298,15 +302,20 @@ impl Store {
     /// higher version than this build's, or database errors. Nothing changes on an error.
     pub fn rebuild(&self, name: &str) -> Result<()> {
         self.check_lease()?;
-        let p = self
+        // `conn` locked first, `projections` second: the order every method follows (see the
+        // field's doc comment), so the two locks never deadlock against `register`.
+        let mut conn = self.conn();
+        let projections = self
             .projections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let p = projections
             .iter()
             .find(|p| p.name() == name)
             .ok_or_else(|| Error::UnknownProjection {
                 name: name.to_owned(),
             })?
             .as_ref();
-        let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(cp) = projection::checkpoint(&tx, name)?
             && cp.version > p.version()
@@ -316,6 +325,62 @@ impl Store {
         }
         projection::rebuild(&tx, p)?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Adds `projection` to this already-open store, without reopening it and without dropping
+    /// whatever lease (network mode) or connections it already holds: catches `projection` up
+    /// from its checkpoint — or runs a fresh rebuild, if it is new or its stored version is older
+    /// than this build's — inside one write transaction, exactly what [`Store::open_with`] does
+    /// for a projection present from the start. From the moment this returns, every
+    /// [`Store::append`] and [`Store::append_new`] applies to it too.
+    ///
+    /// Serialises with every append, rebuild, import and registration through the one write lock
+    /// this store already uses for all of those (see the `projections` field's doc comment): no
+    /// event can be appended while the catch-up runs, and `projection` starts receiving events
+    /// only once its tables already reflect everything appended before this call returns — so an
+    /// append attempted concurrently either committed before this call started (and the catch-up
+    /// already covers it) or queues behind this call's write lock and is applied to `projection`
+    /// normally once it proceeds, because by then `projection` is already registered. Either way
+    /// no event is missed.
+    ///
+    /// This is how the daemon should close the gap between its two opens (its README, "Known
+    /// gaps"): call this once the work model's projections have found or added `@office`, instead
+    /// of opening the store a second time with the office's run log added. In network mode that
+    /// reopen drops the lease for a moment between the two opens, which another host could take;
+    /// `register` never drops it, because it is still the same `Store`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::LeaseLost`] in network mode, if this store's lease has been taken over,
+    /// [`Error::DuplicateProjection`] if a projection by this name is already registered,
+    /// [`Error::Projection`] if the catch-up fails, [`Error::ProjectionVersion`] if the store
+    /// holds it at a higher version than this build's, or database errors. Nothing changes on an
+    /// error: the existing projections, the log and the lease are untouched.
+    pub fn register(&self, projection: Box<dyn Projection>) -> Result<()> {
+        self.check_lease()?;
+        let mut conn = self.conn();
+        if self
+            .projections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|p| p.name() == projection.name())
+        {
+            return Err(Error::DuplicateProjection {
+                name: projection.name().to_owned(),
+            });
+        }
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        projection::sync(&tx, projection.as_ref())?;
+        tx.commit()?;
+        // Still holding `conn`: no append can run between the catch-up above and this push, so
+        // `projection`'s tables already reflect the log exactly as of the commit above by the
+        // time anything can observe it as registered.
+        self.projections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(projection);
         Ok(())
     }
 
@@ -415,10 +480,38 @@ impl Store {
         // IMMEDIATE takes the write lock up front. A deferred transaction would read first, and
         // WAL mode fails a read-to-write upgrade with SQLITE_BUSY at once, ignoring busy_timeout.
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let before = latest_rev(&tx)?;
+        let (range, skipped) = self.append_within(&tx, events, skip_known)?;
+        tx.commit()?;
+        if !range.is_empty() {
+            // Sent while still holding the lock, so subscribers see ranges in revision order.
+            // An error only means nobody is subscribed.
+            let _ = self.revs.send(range);
+        }
+        drop(conn);
+        Ok((range, skipped))
+    }
+
+    /// The core of [`Store::append`]/[`Store::append_new`]: inserts `events` and applies them to
+    /// every projection, inside the caller's own transaction `tx`. Does not commit and does not
+    /// announce on `self.revs` — the caller does both, once, after this returns. Shared with
+    /// [`Store::import`], which calls this once per internal batch but inside **one** transaction
+    /// spanning the whole import, so a failure anywhere rolls every batch back, not just the one
+    /// in progress.
+    fn append_within(
+        &self,
+        tx: &Transaction<'_>,
+        events: &[Event],
+        skip_known: bool,
+    ) -> Result<(RevRange, Vec<EventId>)> {
+        let before = latest_rev(tx)?;
         let mut skipped = Vec::new();
         // Kept only when projections need them.
         let mut stored = Vec::new();
+        let has_projections = !self
+            .projections
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty();
         {
             let mut insert = tx.prepare_cached(if skip_known {
                 "INSERT INTO events (id, at, workspace, author, on_behalf_of, type, data)
@@ -442,7 +535,7 @@ impl Store {
                     .map_err(|e| duplicate_or(e, event.id))?;
                 if inserted == 0 {
                     skipped.push(event.id);
-                } else if !self.projections.is_empty() {
+                } else if has_projections {
                     stored.push(StoredEvent {
                         rev: u64::try_from(tx.last_insert_rowid()).unwrap_or(0),
                         event: event.clone(),
@@ -450,63 +543,41 @@ impl Store {
                 }
             }
         }
-        let after = latest_rev(&tx)?;
+        let after = latest_rev(tx)?;
         if after > before {
-            self.apply_projections(&tx, before, after, &stored)?;
+            let projections = self
+                .projections
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            apply_projections(&projections, tx, before, after, &stored)?;
         }
-        tx.commit()?;
-        let range = RevRange {
-            from_rev: before + 1,
-            to_rev: after,
-        };
-        if !range.is_empty() {
-            // Sent while still holding the lock, so subscribers see ranges in revision order.
-            // An error only means nobody is subscribed.
-            let _ = self.revs.send(range);
-        }
-        drop(conn);
-        Ok((range, skipped))
+        Ok((
+            RevRange {
+                from_rev: before + 1,
+                to_rev: after,
+            },
+            skipped,
+        ))
     }
 
-    /// Applies revisions `before+1..=after`, just inserted as `stored`, to every projection.
-    fn apply_projections(
-        &self,
-        tx: &Transaction<'_>,
-        before: u64,
-        after: u64,
-        stored: &[StoredEvent],
-    ) -> Result<()> {
-        for p in &self.projections {
-            let p = p.as_ref();
-            match projection::checkpoint(tx, p.name())? {
-                // Another process runs another version of this projection and rebuilt it after
-                // this store opened. Rebuilding it back here would replay the whole log under the
-                // write lock, and the other process would do the same on its next append.
-                Some(cp) if cp.version != p.version() => {
-                    return Err(projection::version_mismatch(p, cp.version));
-                }
-                Some(cp) if cp.rev == before => {
-                    for event in stored {
-                        p.apply(tx, event)
-                            .map_err(projection::failed(p, event.rev))?;
-                    }
-                    projection::set_checkpoint(
-                        tx,
-                        p.name(),
-                        Checkpoint {
-                            version: cp.version,
-                            rev: after,
-                        },
-                    )?;
-                }
-                // Another process appended without this projection since this store last applied
-                // it: catch up from its checkpoint, the new events included.
-                Some(cp) => projection::replay(tx, p, cp.rev)?,
-                // Nothing deletes checkpoints; one removed by hand is rebuilt, once.
-                None => projection::rebuild(tx, p)?,
-            }
-        }
-        Ok(())
+    /// Whether an event with this id is already in the log. The one supported way to ask that:
+    /// `events.id` is a unique-indexed column (see the crate README, "Event log"), so this costs
+    /// one indexed lookup — about the same as reading a single row of a [`Store::since`] page, not
+    /// a scan of the log. Runs on [`Store::reader`]: the separate read-only connection in local
+    /// mode, so it never waits on the write lock; the write connection in network mode, like
+    /// [`Store::since`] and [`Store::before`]. Do not call it inside [`Store::read`] (it
+    /// deadlocks, for the same reason `since` and `before` do).
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub fn contains(&self, id: EventId) -> Result<bool> {
+        let conn = self.reader();
+        Ok(conn
+            .prepare_cached("SELECT 1 FROM events WHERE id = ?1")?
+            .query_row(rusqlite::params![id.0.to_string()], |_| Ok(()))
+            .optional()?
+            .is_some())
     }
 
     /// The newest revision, or 0 for an empty log.
@@ -654,42 +725,138 @@ impl Store {
     }
 
     /// Loads `reader`'s JSON lines (as [`Store::export`] wrote them) into this store, applying
-    /// each batch through [`Store::append`] so this store's registered projections build from
-    /// them as usual. For tests and support, not sync.
+    /// every event through the same path [`Store::append`] does — so this store's registered
+    /// projections build from them as usual — but all inside **one** write transaction: either
+    /// every line is appended, or (a bad line, an I/O error, a lost lease) none of it is, and this
+    /// store is left exactly as it was. For tests and support, not sync.
+    ///
+    /// **Design.** Lines are read and decoded one at a time (never the whole file in memory) and
+    /// inserted in batches of 1,000, same as before; what changed is that every batch now runs
+    /// inside the *same* transaction instead of its own, committed only once, at the very end —
+    /// still in revision order, so the memory an import holds stays bounded by one batch (events
+    /// decoded but not yet inserted) however long the file is. A fresh-file-renamed-into-place
+    /// design was also considered (import into a new file, then swap it in); one transaction was
+    /// chosen instead because it reuses `append`'s own insert-and-apply-projections path exactly,
+    /// needs no second copy of the database on disk, and SQLite's own rollback journal already
+    /// gives "nothing or everything" for free on any failure, including a real process crash
+    /// mid-import (its uncommitted transaction is rolled back the next time anything opens the
+    /// file, the same durability a clean `Err` return gets here). The cost: this transaction holds
+    /// the write lock for the whole import, not 1,000 lines at a time as before. In local (WAL)
+    /// mode that cost is the same as any other long write: concurrent reads still run on the
+    /// separate read connection and are unaffected; in network mode, where reads share the write
+    /// connection, a very large import blocks reads for its entire duration rather than for 1,000
+    /// lines at a time — importing is a rare, offline operation (support and tests, not sync, per
+    /// this method's own doc), so that trade favours correctness. **Measured** (release build,
+    /// WSL2, same machine as the crate README's other timings; `tests/perf.rs`,
+    /// `import_10k_compares_to_ten_committed_batches`): importing 10,000 events in the one
+    /// transaction took 370 ms; the same 10,000 events appended in ten separately committed
+    /// batches of 1,000 — exactly what the old design did internally — took 393 ms. One long
+    /// transaction is not slower than many short ones for the same total work; if anything it is
+    /// a little faster here, since SQLite's per-transaction fixed cost (fsync at commit) is paid
+    /// once instead of ten times.
     ///
     /// The store must be empty: an import is a new log, and this store's `log_id` (assigned when
     /// it was created, independently of import) already reflects that.
     ///
     /// # Errors
     ///
-    /// [`Error::LeaseLost`] in network mode, if this store's lease has been taken over (checked
-    /// up front, and again by every batch's own [`Store::append`]), [`Error::NotEmpty`] if the
-    /// store already holds events, [`Error::Io`] reading `reader` or decoding a line, or anything
-    /// else [`Store::append`] can return. The store may hold a prefix of `reader`'s lines if a
-    /// later batch fails.
+    /// [`Error::LeaseLost`] in network mode, if this store's lease has been taken over (checked up
+    /// front, and again between batches, so a long import notices a takeover without waiting for
+    /// the whole file), [`Error::NotEmpty`] if the store already holds events, [`Error::Io`]
+    /// reading `reader`, [`Error::Corrupt`] decoding a line, or anything else the insert-and-apply
+    /// path [`Store::append`] shares can return (`DuplicateEvent`, a projection failure, a
+    /// database error). **On any error, nothing is appended**: `Store::latest_rev` reads 0
+    /// afterwards, the same as before this call, because the transaction is rolled back rather
+    /// than committed — never a prefix of `reader`'s lines.
     pub fn import(&self, reader: impl BufRead) -> Result<()> {
         self.check_lease()?;
         if self.latest_rev()? != 0 {
             return Err(Error::NotEmpty);
         }
         const BATCH: usize = 1_000;
-        let mut batch = Vec::with_capacity(BATCH);
-        for line in reader.lines() {
-            let line = line.map_err(Error::Io)?;
-            if line.is_empty() {
-                continue;
+        let total = {
+            let mut conn = self.conn();
+            // One IMMEDIATE transaction for the whole import: nothing it does is visible, even to
+            // this same `Store`, until `commit` below, so a `?` anywhere here (a bad line, a lost
+            // lease, a projection failure) drops `tx` without committing, which rolls everything
+            // back — whole-import batches before it included.
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let mut batch = Vec::with_capacity(BATCH);
+            for line in reader.lines() {
+                let line = line.map_err(Error::Io)?;
+                if line.is_empty() {
+                    continue;
+                }
+                batch.push(maintenance::decode_line(&line)?);
+                if batch.len() == BATCH {
+                    self.append_within(&tx, &batch, false)?;
+                    batch.clear();
+                    // Re-checked between batches (not just once up front): a long import on a
+                    // network filesystem notices a takeover, and rolls back, without reading the
+                    // rest of a possibly very large file first.
+                    self.check_lease()?;
+                }
             }
-            batch.push(maintenance::decode_line(&line)?);
-            if batch.len() == BATCH {
-                self.append(&batch)?;
-                batch.clear();
+            if !batch.is_empty() {
+                self.append_within(&tx, &batch, false)?;
             }
-        }
-        if !batch.is_empty() {
-            self.append(&batch)?;
+            let total = latest_rev(&tx)?;
+            tx.commit()?;
+            total
+        };
+        if total > 0 {
+            // Announced once, after the commit: a partial, not-yet-durable range must never reach
+            // a subscriber, so this cannot happen per batch the way `append` does it.
+            let _ = self.revs.send(RevRange {
+                from_rev: 1,
+                to_rev: total,
+            });
         }
         Ok(())
     }
+}
+
+/// Applies revisions `before+1..=after`, just inserted as `stored`, to every projection in
+/// `projections`. A free function (not a `Store` method) so [`Store::append_within`] can call it
+/// while already holding `self.projections`'s lock, without re-locking it.
+fn apply_projections(
+    projections: &[Box<dyn Projection>],
+    tx: &Transaction<'_>,
+    before: u64,
+    after: u64,
+    stored: &[StoredEvent],
+) -> Result<()> {
+    for p in projections {
+        let p = p.as_ref();
+        match projection::checkpoint(tx, p.name())? {
+            // Another process runs another version of this projection and rebuilt it after
+            // this store opened. Rebuilding it back here would replay the whole log under the
+            // write lock, and the other process would do the same on its next append.
+            Some(cp) if cp.version != p.version() => {
+                return Err(projection::version_mismatch(p, cp.version));
+            }
+            Some(cp) if cp.rev == before => {
+                for event in stored {
+                    p.apply(tx, event)
+                        .map_err(projection::failed(p, event.rev))?;
+                }
+                projection::set_checkpoint(
+                    tx,
+                    p.name(),
+                    Checkpoint {
+                        version: cp.version,
+                        rev: after,
+                    },
+                )?;
+            }
+            // Another process appended without this projection since this store last applied
+            // it: catch up from its checkpoint, the new events included.
+            Some(cp) => projection::replay(tx, p, cp.rev)?,
+            // Nothing deletes checkpoints; one removed by hand is rebuilt, once.
+            None => projection::rebuild(tx, p)?,
+        }
+    }
+    Ok(())
 }
 
 /// The `type` tag of an event body, e.g. `task_moved`.
