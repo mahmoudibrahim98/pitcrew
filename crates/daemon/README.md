@@ -3,7 +3,9 @@
 `pitcrewd`, the composition root. It is the hub of a solo workspace and its runner, in one process
 (ADR-0009): it opens the store, runs the work model and its back office, watches this machine's
 agent sessions (Claude Code, Codex, OpenCode) into the store, takes their hooks, and serves API v1
-with real tokens. Remote machines join later.
+with real tokens. A fresh one is set up once, while it serves (see "The first run"). On a remote
+machine, the same binary is the helper, reached over SSH (`pitcrewd connect`). Remote machines join
+later.
 
 **Owned by stream 0**: see [docs/build/streams/0.md](../../docs/build/streams/0.md).
 
@@ -18,6 +20,8 @@ with real tokens. Remote machines join later.
 | `pitcrewd serve --no-office` | Without the back office (see "The back office"). It is on by default. |
 | `pitcrewd serve --homes <dir>…` | The runner watches these agent homes instead of this user's own (see "The runner"): `<dir>` is a folder laid out like a home folder (`<dir>/.claude`, `<dir>/.codex`, `<dir>/.local/share/opencode`); `claude=<dir>`, `codex=<dir>` or `opencode=<dir>` is one engine's home itself. Several may follow one `--homes`. |
 | `pitcrewd serve --no-runner` | Without the runner: no session is watched, hooks are only logged (debug), and no session has a terminal or a transcript here (`503`). It is on by default. |
+| `pitcrewd init --workspace <name> --name <person> --handle <@handle> --machine <name> [--listen <where>]` | Sets up the fresh workspace of the daemon running on this state directory (see "The first run"). `--listen` is where that daemon listens, as given to its `serve --listen` (default `private`). |
+| `pitcrewd connect --socket <dir>/pitcrewd.sock [--framed] [--nonce <hex>]` | The stdio bridge to a daemon's socket, for a remote helper reached over SSH (see "`pitcrewd connect`"). Uses no state directory. Unix only. |
 | `pitcrewd token show-path` | Prints where the device token is kept. Never the token. Fails if there is none yet. |
 | `pitcrewd --version` | `pitcrewd 0.0.0 (protocol 1, oldest accepted 1)`: the bare version is the second word. Needs no state directory. |
 
@@ -26,14 +30,16 @@ foreground and never daemonizes, so the pid you started is the daemon. It never 
 only to stderr, and prints one ready line on stdout. Any stop signal (SIGTERM, SIGINT, SIGHUP)
 stops it gracefully: WebSockets close with 1001, the store closes, and the socket is removed.
 
-`--state-dir <dir>` goes with any command (before or after it). Without it, the state directory
-is the platform's local data folder, never a roaming or synced one: `%LOCALAPPDATA%\PitCrew\data`,
-`~/.local/share/pitcrew` (or `$XDG_DATA_HOME/pitcrew`), `~/Library/Application Support/PitCrew`.
+`--state-dir <dir>` goes with any command but `connect` (before or after it). Without it, the
+state directory is the platform's local data folder, never a roaming or synced one:
+`%LOCALAPPDATA%\PitCrew\data`, `~/.local/share/pitcrew` (or `$XDG_DATA_HOME/pitcrew`),
+`~/Library/Application Support/PitCrew`.
 
 Logs go to stderr at the level in `PITCREW_LOG` (`tracing` directives: `debug`,
 `info,pitcrew_api=debug`, …; default `info`). Tokens are never logged, at any level; tokens are
 named by their id (`tok_…`) and token files by their path. Stdout carries one line once the
-daemon is ready, `pitcrewd listening on <where>`, which supervisors and tests wait for.
+daemon is ready, `pitcrewd listening on <where>`, which supervisors and tests wait for; `init`'s
+one line; and, for `connect`, only the bridge's bytes.
 
 ## The state directory
 
@@ -44,8 +50,8 @@ daemon is ready, `pitcrewd listening on <where>`, which supervisors and tests wa
 | `tokens.lock` | Held by the running daemon. **One daemon per state directory**: a second one stops at start with "another pitcrewd is already running on …". |
 | `device.token` | The desktop's device token, `pcd_…`. Private (0600 on Unix). |
 | `demo-agent.token` | With `--demo` only: a token for the demo's first agent, `@writer`, `pca_…`. Private. |
-| `workspace.json` | The workspace's id and name (`GET /v1/workspace`), which the event log does not hold. Written by `--demo`. Private. |
-| `office.json` | Where the back office got to in the log (`{ "log", "done" }`), so a restart runs it again from there. Removed by any start with the office off (`--no-office`, or no owner for `@office`). Private. |
+| `workspace.json` | The workspace's id and name (`GET /v1/workspace`), which the event log does not hold. Written by `--demo`, and by the first run (`POST /v1/setup`, `pitcrewd init`). Atomic (a private file renamed into place). Private. |
+| `office.json` | Where the back office got to in the log (`{ "log", "done" }`), so a restart runs it again from there. Removed by any start with the office off (`--no-office`, or no owner for `@office` yet, as before setup). Private. |
 | `runner/<log id>/` | The runner's index (`pitcrew-runner`): every transcript it watches, its session id, and how far it has been read into this store. One folder per hub log (the store's `log_id`), so a new store learns every session from the start. |
 | `run/pitcrewd.sock` | The private socket (Unix). On Windows the API uses the current user's named pipe, `\\.\pipe\pitcrewd-<user SID>`. |
 
@@ -56,32 +62,36 @@ Windows it must be under the user's profile, whose ACL it inherits.
 
 1. The token registry, which takes the lock.
 2. The store, opened once, with the work model's projections (`StoreOptions::default()`, whose
-   `FsMode::Auto` picks the NFS-safe mode on a network filesystem).
-   - The workspace is the demo's with `--demo` (written to `workspace.json`), else the one the
-     store's events belong to, named by `workspace.json` when it names the same workspace and
-     called "Workspace" otherwise. With `--demo`, a store with data is refused here.
-   - The back office's member, `@office`, found or added (see "The back office"). The office's
-     run log, which needs that member, is then registered on the open store
-     (`Store::register(Box::new(back_office.run_log()))`); it catches up as any projection does at
-     an open. The store is never closed and opened again, so on a network filesystem its
-     single-host lease is held from the open until the store closes. When the office is off
-     (`--no-office`, or no member it may act as), `office.json` is removed instead.
-3. The store's one `WorkService` (hub-work's "one writer": everything shares that `Arc`).
-   - The hub's own machine (`with_hub_machine`) is the workspace's first `local` machine (the
-     demo's "This laptop"). Without one, a dispatch for a task with no folder answers 503, and
-     the runner stays off.
+   `FsMode::Auto` picks the NFS-safe mode on a network filesystem). The workspace is the demo's
+   with `--demo` (written to `workspace.json`), else the one the store's events belong to, named
+   by `workspace.json` when it names the same workspace and called "Workspace" otherwise (as
+   before setup, when the store is empty). With `--demo`, a store with data is refused here.
+3. The store's one `WorkService` (hub-work's "one writer": everything shares that `Arc`). It
+   serves the name read in step 2 (the field `set_workspace_name` sets).
+   - The hub's own machine (`set_hub_machine`) is the workspace's first `local` machine (the
+     demo's "This laptop"). Without one (before setup), a dispatch for a task with no folder
+     answers 503, and the runner stays off.
+   - The setup listener (see "The first run").
    - No dispatcher (see "Dispatch").
 4. With `--demo`: mint the tokens, then seed. Tokens come first, so a failure leaves the store
    empty and `--demo` can be retried.
 5. The device token: `device.token` is reused while it verifies as a device token; otherwise a
    new one is minted for the workspace's first person (the demo's `@sam`) and written there. If
    the store has no person yet, the token acts as a new member that nothing knows, and
-   `GET /v1/me` answers 404 until onboarding can add the person (see "Not wired yet").
-6. The stop signals' handlers, so a stop from here on takes the clean path (see "Stop").
-7. Unless `--no-runner`, the runner (see "The runner"). It reads the homes and writes into the
+   `GET /v1/me` answers 404 until the workspace is set up, which makes that member its person.
+6. Unless `--no-office`, the back office (see "The back office"): its member, `@office`, found
+   or added through the `WorkService`; then its run log, which needs that member, registered on
+   the open store (`Store::register(Box::new(back_office.run_log()))`), catching up as any
+   projection does at an open. The store is never closed and opened again, so on a network
+   filesystem its single-host lease is held from the open until the store closes. When the
+   office is off (`--no-office`, no person yet, or no member it may act as), `office.json` is
+   removed instead.
+7. The stop signals' handlers, so a stop from here on takes the clean path (see "Stop").
+8. Unless `--no-runner`, the runner (see "The runner"). It reads the homes and writes into the
    store at once: the back office's first run covers what it appended, like anything else. A
    runner that cannot start does not stop the hub (see "The runner").
-8. The recap index's warm-up (see "Recaps"), started and not waited for; the back office's loop;
+9. The recap index's warm-up (see "Recaps"), started and not waited for; the back office's loop;
+   for a workspace without a person, the task that waits for its setup (see "The first run");
    the routes; the listener; and the ready line.
 
 ### Stop
@@ -91,8 +101,10 @@ accepting and finishes in-flight requests, `pitcrew-api` closes open WebSockets 
 README) and removes its unix socket. Meanwhile, as in the same step, the back office finishes the
 run it is in and saves `office.json` (`the back office stopped`), and the runner stops: what it has
 read is handed to the store first, its threads end, and with them its hold on the store (`the
-runner stopped`). Each gets 10 seconds. Then the store closes, checkpointing its WAL so only
-`hub.db` remains, and the lock is released last. The log ends with `store closed` and `stopped`.
+runner stopped`). Each gets 10 seconds. This holds whether they started with the daemon or after
+setup; one that a setup in flight starts once the stop has begun is stopped as it starts. Then the
+store closes, checkpointing its WAL so only `hub.db` remains, and the lock is released last. The
+log ends with `store closed` and `stopped`.
 
 **A stop always ends, within about 20 seconds.** Whatever does not finish in time is left behind
 and ends with the process, and the log says so (warnings): a runner stuck in a discovery or a read
@@ -102,6 +114,85 @@ after the server stopped; and, last, work still on the blocking pool 5 seconds l
 blocking pool is still running`). The store is then closed with the process (`the store is still
 open at exit`), and its next open recovers the log from its write-ahead file. Bounds: the 10
 seconds of the stop step, 3 for the store's holders, 5 for the blocking pool.
+
+## The first run
+
+A fresh `pitcrewd serve` (no `--demo`, an empty store) has a device token but no person, no
+machine and no name: `GET /v1/workspace` answers `setup_needed: true` (and the name
+"Workspace"), `GET /v1/me` is `404`, host info has no `runner` role, and the back office is off.
+It is set up once, with `POST /v1/setup` (api-v1.md, "The first run"), from the desktop's
+onboarding or with `pitcrewd init`, and from then on works as a start with a person does, without a
+restart:
+
+1. hub-work's `set_up` appends the person (the device token's own member) and the machine, and
+   serves the name. Under its writer lock it calls the daemon's listener (`src/setup.rs`,
+   `Signal`), which only hands the result to a task over a channel: it never calls back into the
+   `WorkService`, never writes, never blocks.
+2. That task, once the lock is released, writes `workspace.json` (the id and the name; atomic,
+   private, as `--demo` writes it), so a restart keeps the name; then names the hub's machine
+   (`WorkService::set_hub_machine`), so a dispatch for a task without a folder may run here.
+3. Unless `--no-office`, it starts the back office as step 6 of "Start" does: `@office` added
+   through the writer (`ensure_office_member`), its run log registered, its loop from the end of
+   the log (there is no `office.json`: the start without a person removed it).
+4. Unless `--no-runner`, it starts the runner on the new machine, watching the homes settled at
+   start (`--homes`, else this user's own; none with `--demo`, which never needs setup), and
+   attaches it to the routes and host info.
+
+A part that cannot start is logged and stays off until the next start, which starts it as any
+start with a person does; the name is served even if `workspace.json` cannot be written (logged
+as an error: a restart would then call the workspace "Workspace"). A second setup, or a racing
+one, is a `409` and starts nothing. On every start the name comes from `workspace.json` (step 2
+of "Start").
+
+**`pitcrewd init`** (`src/init.rs`) is the same request for people without the desktop:
+`pitcrewd [--state-dir <dir>] init --workspace <name> --name <person> --handle <@handle> --machine
+<name>`. It asks the daemon running on that state directory, over its private transport (the
+socket in `run/` on Unix, the user's pipe on Windows) or the `--listen` that daemon was started
+with, with the device token from `device.token`, through the `pitcrew` CLI's client
+(`pitcrew_cli::client`: its checks of the daemon before the token is sent, its HTTP, its errors). It
+never opens the store and never prints the token. A handle may be given without its `@`
+(PowerShell reads a bare `@sam` as something else). It prints one line naming the workspace, the
+person and the machine; otherwise the reason on stderr, with the `pitcrew` CLI's exit codes:
+
+| Exit | When |
+|---|---|
+| 0 | Set up. |
+| 2 | The API's `400` (a name too long or blank once trimmed, a malformed handle, a control character), as its message. |
+| 4 | The API's `409`: already set up, or the handle taken. |
+| 5 | No daemon is running on this state directory ("no pitcrewd is running on … start it with `pitcrewd --state-dir … serve`"). |
+| 1, 3 | Anything else, as the CLI says it (a daemon that fails the identity check, a token it does not accept). |
+
+On Windows the private pipe is the user's own, not the state directory's: `init` reaches whichever
+daemon holds it, and a daemon of another state directory refuses this one's token.
+
+## `pitcrewd connect`
+
+The remote end of the tunnel's stdio transport (`crates/remote`, "The stdio bridge"): on a remote
+machine, the tunnel runs `pitcrewd connect --socket <path> [--framed] [--nonce <hex>]` over SSH for
+each connection, and the bridge checks the socket (a private directory of this user's, a socket of
+this user's, a listener running as this user) before it prints its ready mark and copies stdin to
+the socket and the socket to stdout. The daemon's CLI hands everything after `connect` to
+`pitcrew_remote::bridge::main` as it is, before anything else: no state directory is looked for or
+made, nothing is logged, stdout carries only the bridge's bytes, and its errors go to stderr. The
+exit codes are the bridge's: 2 usage (also clap's), 3 not this user's socket, 4 no daemon, 1
+otherwise (and always on Windows, which has no unix sockets for it).
+
+**What it costs.** `pitcrewd` ships as the static helper copied to remote machines, so its size
+matters. Measured 2026-10-02, release build (`lto = "thin"`, stripped) for
+`x86_64-unknown-linux-musl` with `cargo zigbuild`, as `packaging/build-release.sh --zig` builds it:
+
+| `pitcrewd` | Bytes | Crates (normal dependencies, Linux) |
+|---|---|---|
+| Before this change | 12,042,144 | 137 |
+| With `pitcrew-remote` alone (`connect`) | 12,082,576 (+40,432, +0.3%) | 144 |
+| This branch: `connect`, `init` (`pitcrew-cli`'s client) and the first run | 12,329,648 (+287,504, +2.4%) | 146 |
+
+`pitcrew-remote` brings seven crates: itself, and `toml_edit` (parsing only, for site recipes)
+with `toml_parser`, `toml_datetime`, `winnow`, `indexmap` and `equivalent`; the same seven on
+Windows. Everything else it uses (`tokio`, `rustix`, `getrandom`, `sha2`, `thiserror`, `serde`,
+`windows-sys`) the daemon had already. Only the bridge is reachable from `pitcrewd`, so link-time
+optimization leaves the rest of it (SSH, deploy, tunnels) out: 40 KB. `pitcrew-cli` adds itself and
+`toml_writer` (its `toml_edit` with default features).
 
 ## The back office
 
@@ -113,22 +204,23 @@ receipts, passes the office's "never" list (nothing outward, never done without 
 acceptance, never a person's ask), and is checked again by the hub like any caller's.
 
 **Its member, `@office`.** The office acts as an agent of the workspace, owned by the workspace's
-owner (its first person, whom the device token also acts as):
+owner (its first person, whom the device token also acts as). The daemon finds or adds it through
+the hub's one writer, hub-work's `WorkService::ensure_office_member(owner)`:
 
 - with `--demo` it is the demo's own `@office`, which the seed adds with everything else;
-- otherwise the daemon reuses the workspace's `@office` when it is an agent of that owner, and on
-  the first start without one appends a `member_added` for it (a new id, handle `@office`, name
-  "Back office"), authored by the owner. It is appended before the hub's `WorkService` exists and
-  before anything is served, so it races with no other writer;
-- the office stays off (logged) when the workspace has no person yet to own it (until the first
-  start after onboarding adds one), or when `@office` is a person, another person's agent, or an
-  agent of no one: it never acts as a person, or for someone else.
+- otherwise the workspace's `@office` when it is an agent of that owner, and when there is none,
+  a new one (handle `@office`, name "Back office") in a `member_added` authored by the owner: at
+  the first start with a person, or right after setup (see "The first run"), while the hub
+  serves, which the command lock makes safe;
+- the office stays off (logged) when the workspace has no person yet to own it (until it is set
+  up), or when `@office` is a person, another person's agent, or an agent of no one (a `409` from
+  `ensure_office_member`): it never acts as a person, or for someone else.
 
-Why an event at first start rather than seeding: the office's member is workspace data like any
-other, so it belongs in the log, where every projection (and a rebuild) sees it; and the run log
-must know the member before it is registered on the store, so the daemon finds it (or adds it)
-first. The member is created once and reused, because the run log's settings, the member included,
-must stay the same for the life of the store.
+Why an event rather than seeding: the office's member is workspace data like any other, so it
+belongs in the log, where every projection (and a rebuild) sees it; and the run log must know the
+member before it is registered on the store, so the daemon finds it (or adds it) first. The member
+is created once and reused, because the run log's settings, the member included, must stay the
+same for the life of the store.
 
 **No token.** The office acts inside this process through the hub's `WorkService`
 (`OfficeCommands`), so it has no token: none is minted, and nothing about it is written to the
@@ -153,7 +245,8 @@ again a second later), and when the loop stops. The next start runs from there a
 `run_office` is idempotent (an action already in the log is `replayed` and appends nothing), so
 what a crash left unapplied is applied then, and nothing twice. With `--demo` the office starts at
 revision 1, so it also looks at the seed. Without `office.json` (the first start with the office
-on, or after any start with it off, which removes the file) it starts at the end of the log.
+on, after setup, or after any start with it off, which removes the file) it starts at the end of
+the log.
 
 **On by default; `--no-office`.** The back office is part of what a hub does: the work moves on
 its own when the evidence is in the log, which is what the desktop shows. Its actions are bounded
@@ -177,9 +270,6 @@ after it, authored by `@office`.
   code (`Internal` or `Unavailable`: run the range again). Proposal for stream E: `run_office`
   returns `Err` at the first such failure, after the actions before it (which a re-run replays),
   so that every caller gets this right without classifying errors.
-- *Who adds `@office`.* The `member_added` is authored by the workspace's person, as the
-  bootstrap. A work-model command for adding members (stream E) would let the hub add it through
-  its one writer instead of the daemon appending to the store.
 - *A stale `office.json`.* If events were appended without the run log since `office.json` was
   written (by another process, or a build without the office), the next start runs the office
   over them, however old. A guard: before the run log is registered, and before anything is added,
@@ -212,8 +302,13 @@ so a batch sent again after a crash is stored once; the work model's projections
 the same transaction, and the stream announces them. Events of sessions without an agent are
 authored by the workspace's first person, whom the device token acts as. The runner's sessions run
 on the hub's own machine (the workspace's first local one). Without that machine, or without a
-person, it stays off (logged), as the back office does without a person. Its index is
-`runner/<log id>/`.
+person, it stays off (logged), as the back office does without a person, until the workspace is
+set up: then it starts on the new machine, watching the homes the daemon was started with,
+without a restart (see "The first run"). Its index is `runner/<log id>/`.
+
+**Reaching it.** The routes (hooks, terminals, transcripts, host info) reach the runner through
+`runner::Attached`, set once when it starts, with the daemon or after setup; until then hooks are
+only logged and terminals and transcripts answer `503`, as with `--no-runner`.
 
 **A runner that cannot start** (its index cannot be opened or is locked, one of its threads,
 its terminals' included, cannot start) does not stop the hub: the daemon warns (`the runner cannot
@@ -223,7 +318,10 @@ reaching.
 
 **`GET /v1/host/info`** answers roles `["hub", "runner"]` while the runner runs, `["hub"]` when it
 is off; capabilities `["watch"]` only while it watches at least one home (so not with `--demo`
-alone), else `[]`.
+alone), else `[]`. They are read at each request, so a runner that starts after setup shows at
+once: `pitcrew_api::router` answers the route with the value it was built with, so the daemon
+answers `GET /v1/host/info` itself in a layer over the app (`src/host.rs`) and passes every other
+request on (`HEAD` included, which gets the router's answer).
 
 **Hooks, and `SessionAgents`.** `POST /v1/hooks/{engine}/{event}` goes through the API's
 `HookIntake` to `RunnerHooks`, which applies a hook only when its sender may change the session
@@ -300,8 +398,8 @@ dispatch"); then `RunnerCommands` becomes hub-work's `Dispatcher` here.
 
 | Route | From |
 |---|---|
-| `GET /v1/host/info` (no token) | `pitcrew-api`; roles `["hub", "runner"]` while the runner runs, else `["hub"]`; capabilities `["watch"]` while it watches a home, else `[]` |
-| Work routes, agent and device, with `GET /v1/workspace` and `GET /v1/sessions[/{id}]` | `pitcrew-hub-work` (`agent_routes`, `device_routes`) |
+| `GET /v1/host/info` (no token) | `src/host.rs`, a layer over `pitcrew-api`'s app (see "The runner"); roles `["hub", "runner"]` while the runner runs, else `["hub"]`; capabilities `["watch"]` while it watches a home, else `[]`; read at each request |
+| Work routes, agent and device, with `GET /v1/workspace`, `POST /v1/setup` and `GET /v1/sessions[/{id}]` | `pitcrew-hub-work` (`agent_routes`, `device_routes`); setup's listener is the daemon's (see "The first run") |
 | `POST /v1/tasks/{id}/dispatch` | `pitcrew-hub-work` without a dispatcher: `503 unavailable`, and nothing is recorded, not even an assignment (see "Dispatch") |
 | `GET /v1/stream` | `pitcrew-api` over the store (`StoreSource`) |
 | `GET /v1/events` | `pitcrew-api`'s `Activity` over the store, with the work model's activity index (`with_refs`, through the `WorkRefs` adapter in `src/refs.rs`): `project=` and `workstream=` match events about them, their tasks and their sessions, and `task=` and `session=` also match their sessions' and dispatches' events |
@@ -460,6 +558,32 @@ start):
   (checked against the ids each event names), paged by 500 and by 1; filters combine; an unknown
   project is an empty page, a malformed id a 400, an agent a 403.
 
+`tests/setup.rs`, the first run, fresh daemons with temporary homes (`--homes`, holding the
+Claude fixture's transcript):
+
+- a fresh start: `setup_needed` is true and the name "Workspace", `GET /v1/me` is `404`, host
+  info has roles `["hub"]` and no capability, no `@office`, the office and the runner logged off,
+  no session though a transcript waits in the home, no `workspace.json`;
+- `POST /v1/setup` with padded names (stored trimmed), then without a restart: `GET /v1/workspace`
+  has the name and no `setup_needed`, `GET /v1/me` is the person, `workspace.json` holds the id
+  and the name, `@office` is an agent owned by the person and acts (a dispatch of an in-progress
+  task finishing moves it to review, authored by `@office` on behalf of the person, as in
+  `tests/office.rs`), host info shows the runner and `watch`, and the transcript is a session of
+  the new machine. A second setup is `409`; no token is in the logs. A restart keeps the name,
+  shows the runner at once, starts the office from its start, finds the same `@office` (one), and
+  keeps the session;
+- two setups racing: exactly one `200`, one `409`, one person, one `@office`, one set-up log line;
+- `pitcrewd init`: with no daemon ever started there, exit 5 saying to start `pitcrewd serve`, and
+  nothing created; against the running daemon (its private socket on Unix, development TCP
+  elsewhere, never the user's own pipe) the line it prints, a bare handle given its `@`, and no
+  token printed; again, the API's `409` (exit 4); a malformed handle, the API's `400` (exit 2);
+  its daemon stopped, exit 5 again;
+- `pitcrewd connect` without a socket, or with an unknown argument: exit 2, nothing on stdout;
+- on Unix, `pitcrewd connect --socket <dir>/pitcrewd.sock` to a daemon on `--listen unix:` carries
+  `GET /v1/host/info` (after the ready mark with the nonce) and an authenticated
+  `GET /v1/workspace` through stdin and stdout, creates nothing in its home, and with no daemon
+  exits 4.
+
 `tests/recaps.rs`, with `--demo`, checks what the contract promises of any log (the seeded demo
 is not the mock's fixture):
 
@@ -482,10 +606,10 @@ is not the mock's fixture):
 The unit tests in `src/recaps.rs` check that the adapter copies every field and variant, passes
 `Some(limit)` and `before`, and hands every error to the route, logging an `invalid` as a warning.
 The unit tests in `src/serve.rs` and `src/office.rs` cover adding `@office` once to a workspace
-that has a person (and not before); keeping the office off when `@office` is a person, another
-person's agent or no one's agent; `--no-office` removing `office.json`; the start point saved
-before the loop runs; the loop over the demo across a restart; a save that cannot write, tried
-again until it can and at stop; which of the hub's failures are tried again; and, on a store
+that has a person (and not before), through the work model's `ensure_office_member`; keeping the
+office off when `@office` is a person, another person's agent or no one's agent; `--no-office`
+removing `office.json`; the start point saved before the loop runs; the loop over the demo across
+a restart; a save that cannot write, tried again until it can and at stop; which of the hub's failures are tried again; and, on a store
 forced into network mode, its single-host lease taken once (the lease's clock is read once, at
 acquisition) and held, the same file, while the office starts and acts, then let go of when the
 store closes. (A lease let go of and taken again on a free path gets the same generation number,
@@ -496,11 +620,16 @@ sees a session gain an agent at once (and keep it through a re-statement without
 sub-agents up their chain (16 sessions resolve; 17, or 16 below a parent not stored, are
 `Unknown`), and answers `Unknown` for a chain that disagrees or loops and for an agent the hub
 does not know as one; `src/terminals.rs` answers `404`, `503` or the runner's answer by where the
-session is, with and without a runner; `src/transcripts.rs` finds each CLI's file names and no
-other engine's (no Claude id names a rollout, no Codex id a Claude file), takes the newest of
-one session in two homes, and replaces a home's list at each discovery; `src/runner.rs` and `src/cli.rs` check that `--demo` alone watches nothing (the person's
-homes are not even looked up), how `--homes` values become homes, and that `--no-runner` refuses
-`--homes`.
+session is, with and without a runner, and with one attached later; `src/host.rs` answers the
+runner's role and `watch` once one is attached; `src/transcripts.rs` finds each CLI's file names
+and no other engine's (no Claude id names a rollout, no Codex id a Claude file), takes the newest
+of one session in two homes, and replaces a home's list at each discovery; `src/runner.rs` and
+`src/cli.rs` check that `--demo` alone watches nothing (the person's homes are not even looked
+up), how `--homes` values become homes, and that `--no-runner` refuses `--homes`. `src/cli.rs`
+also checks that everything after `connect` reaches the bridge as it is, and `init`'s arguments;
+`src/init.rs` the request's body (a bare handle given its `@`) and the client pointed at the state
+directory's socket, or the `--listen` given; `src/setup.rs` that the listener hands the setup over
+once and that nothing is kept once the stop has begun.
 
 ## Not wired yet
 
@@ -510,9 +639,10 @@ homes are not even looked up), how `--homes` values become homes, and that `--no
   runner").
 - Linking sessions to workstreams by folder or branch: the runner can (`Locations`), but the daemon
   does not pass it the workstreams' locations yet, so nothing is linked by folder or branch.
-- Creating the workspace and its first person outside `--demo`: there is no work command for it
-  yet; the daemon would write `workspace.json` then. The back office's member is appended by the
-  daemon itself for now, for the same reason. Until a workspace has a person and a local machine,
-  the runner stays off.
-- `pitcrewd connect` (the tunnel's stdio bridge), once stream J's tunnel is merged.
-- Remote machines, the Tauri shell, auto-start and installers.
+- Host info from `pitcrew-api` itself: its `router` takes a fixed `HostInfo`, so the daemon answers
+  `GET /v1/host/info` in a layer of its own (see "The runner"). Proposal for stream H: `router`
+  takes a source of host info (`Arc<dyn Fn() -> HostInfo>`, or a `watch::Receiver`), and the
+  layer goes.
+- `--demo` through the setup path (the demo still seeds its own person, machine and name).
+- Remote machines (the desktop's side of the tunnel, and a supervisor of the local daemon), the
+  Tauri shell, auto-start and installers.
