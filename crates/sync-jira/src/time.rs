@@ -214,13 +214,15 @@ mod tests {
 
     #[test]
     fn account_minute_steps_back_across_a_dst_fold() {
-        // America/New_York falls back from EDT (-04) to EST (-05) at 2026-11-01T02:00:00-05:00,
-        // i.e. 2026-11-01T06:00:00Z. The hour 01:00-01:59 local time occurs twice: once as EDT
-        // (06:00Z-06:59Z) and once as EST (07:00Z-07:59Z). An instant landing in the first
-        // occurrence must not produce a cursor that a `>=` query could ever interpret as the
-        // *second* occurrence (which would skip the 06:00Z-07:00Z Z-time hour).
+        // America/New_York falls back from EDT (-04) to EST (-05) at 2026-11-01T02:00:00-04:00
+        // (2:00 AM EDT, read back to 1:00 AM EST), i.e. 2026-11-01T06:00:00Z. The hour 01:00-01:59
+        // local time occurs twice: once as EDT (05:00Z-05:59Z) and once as EST (06:00Z-06:59Z).
+        // An instant landing in either occurrence must not produce a cursor that a `>=` query
+        // could ever interpret as excluding the other (which would skip real updates in between).
         let zone = TimeZone::get("America/New_York").expect("bundled tzdb has this zone");
-        // 2026-11-01T06:30:00Z = 2026-11-01T01:30 EDT (the *first* 01:30 local).
+        // 2026-11-01T06:30:00Z = 2026-11-01T01:30 EST (the *second* occurrence of 01:30 local;
+        // the first, as EDT, was an hour earlier at 05:30Z). Either occurrence must behave the
+        // same way here: both format as the identical ambiguous civil text "01:30".
         let instant = ts("2026-11-01T06:30:00.000+0000")
             .to_instant()
             .expect("parses");
