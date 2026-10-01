@@ -270,6 +270,27 @@ impl Daemon {
         panic!("{query}: paging never reached the start");
     }
 
+    /// Waits until the back office has looked at every revision of the log, and returns the
+    /// newest. It knows from the daemon's debug log: a run that ended there, or a start with
+    /// nothing to look at. Needs the back office on, and `PITCREW_LOG=debug` (as `start` sets).
+    pub fn settle(&self, token: &str) -> u64 {
+        let deadline = Instant::now() + READY;
+        loop {
+            let latest = self.latest_rev(token);
+            let logs = self.stderr();
+            let ran = logs.contains(&format!(" to={latest} applied="))
+                || logs.contains(&format!(" from={} latest={latest}", latest + 1));
+            if ran && self.latest_rev(token) == latest {
+                return latest;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the back office did not reach revision {latest}:\n{logs}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// The newest revision, from `GET /v1/events`.
     pub fn latest_rev(&self, token: &str) -> u64 {
         let reply = self.get("/v1/events?limit=1", Some(token));

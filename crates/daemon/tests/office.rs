@@ -68,24 +68,6 @@ fn by_office(events: &[Value]) -> Vec<&Value> {
         .collect()
 }
 
-/// Waits until the back office has looked at every revision of the log, and returns the newest.
-fn settle(daemon: &Daemon, token: &str) -> u64 {
-    let deadline = Instant::now() + WAIT;
-    loop {
-        let latest = daemon.latest_rev(token);
-        let ran = daemon.stderr().contains(&format!(" to={latest} applied="));
-        if ran && daemon.latest_rev(token) == latest {
-            return latest;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the back office did not reach {latest}:\n{}",
-            daemon.stderr()
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
 #[test]
 fn with_demo_a_finished_dispatch_moves_its_task_to_review_as_office() {
     let (_tmp, state) = state_dir();
@@ -143,8 +125,9 @@ fn with_demo_a_finished_dispatch_moves_its_task_to_review_as_office() {
         .position(|e| e["author"] == id::OFFICE && e["body"]["type"] == "task_moved")
         .unwrap();
     assert!(ended < moved_at);
+    // Logged once the run that applied it returns.
+    daemon.wait_for_log("rule=dispatch_to_review", WAIT);
     let logs = daemon.stderr();
-    assert!(logs.contains("rule=dispatch_to_review"), "{logs}");
 
     // Everything the back office appended is @office's, for @sam.
     let all = daemon.all_events(&device);
@@ -188,19 +171,25 @@ fn an_action_the_hub_refuses_is_logged_and_appends_nothing() {
     };
     append_to_store(&state, id::SAM, None, vec![stale]);
     // ...so when PAP-3's dispatch reports success, the office asks for in progress → review.
-    append_to_store(&state, id::WRITER, Some(id::SAM), vec![finished(id::DSP4)]);
+    let done = append_to_store(&state, id::WRITER, Some(id::SAM), vec![finished(id::DSP4)]);
     nudge(&daemon, &device);
 
+    // The refusal of the action the office took on that revision, by the hub's move rules.
     daemon.wait_for_log("the hub refused a back-office action", WAIT);
-    settle(&daemon, &device);
+    daemon.settle(&device);
     let logs = daemon.stderr();
-    let refusal = logs
+    let at = format!(" rev={} ", done.to_rev);
+    let refusals: Vec<&str> = logs
         .lines()
-        .find(|l| l.contains("the hub refused a back-office action"))
-        .unwrap();
+        .filter(|l| l.contains("the hub refused a back-office action") && l.contains(&at))
+        .collect();
+    assert_eq!(refusals.len(), 1, "{logs}");
+    let refusal = refusals[0];
     assert!(refusal.contains("WARN"), "{refusal}");
-    assert!(refusal.contains("dispatch_to_review"), "{refusal}");
+    assert!(refusal.contains("rule=dispatch_to_review"), "{refusal}");
     assert!(refusal.contains("Conflict"), "{refusal}");
+    // A refusal by the rules is final: the range is not run again.
+    assert!(!logs.contains("runs these revisions again later"), "{logs}");
 
     // PAP-3 stays in review, and the office appended nothing about it but what it may.
     assert_eq!(status(&daemon, &device, "PAP-3"), "review");
@@ -223,7 +212,7 @@ fn a_restart_does_not_duplicate_office_actions() {
     eventually("PAP-1 moves to review", || {
         status(&daemon, &device, "PAP-1") == "review"
     });
-    let latest = settle(&daemon, &device);
+    let latest = daemon.settle(&device);
     let office_events = by_office(&daemon.all_events(&device)).len();
     // Progress is saved within a second of a run, without waiting for a stop.
     let progress = state.join("office.json");
@@ -253,7 +242,7 @@ fn a_restart_does_not_duplicate_office_actions() {
         "the back office had applied these actions before; nothing was appended again",
         WAIT,
     );
-    assert_eq!(settle(&daemon, &device), latest, "appended again");
+    assert_eq!(daemon.settle(&device), latest, "appended again");
     let all = daemon.all_events(&device);
     assert_eq!(by_office(&all).len(), office_events);
     let moves = all
@@ -262,6 +251,78 @@ fn a_restart_does_not_duplicate_office_actions() {
         .count();
     assert_eq!(moves, 1);
     assert_eq!(status(&daemon, &device, "PAP-1"), "review");
+}
+
+/// What was appended while the daemon was stopped (here: in place of the runner link, a dispatch
+/// that finished) is looked at on the next start, and acted on then.
+#[test]
+fn an_action_missed_while_stopped_is_applied_at_the_next_start() {
+    let (_tmp, state) = state_dir();
+    let mut daemon = Daemon::start(&state, &["--demo"]);
+    let device = daemon.device_token();
+    daemon.settle(&device);
+    daemon.stop();
+    drop(daemon);
+
+    let done = append_to_store(&state, id::WRITER, Some(id::SAM), vec![finished(id::DSP1)]);
+    let daemon = Daemon::start(&state, &[]);
+    eventually("PAP-1 moves to review", || {
+        status(&daemon, &device, "PAP-1") == "review"
+    });
+    daemon.wait_for_log("rule=dispatch_to_review", WAIT);
+    let after = daemon.events_matching(&format!("&task={}", id::PAP1), &device);
+    let moved: Vec<&Value> = after
+        .iter()
+        .filter(|e| e["author"] == id::OFFICE && e["body"]["type"] == "task_moved")
+        .collect();
+    assert_eq!(moved.len(), 1, "{moved:?}");
+    assert_eq!(moved[0]["body"]["data"]["to"], "review");
+    // The office looked at that revision as part of this start's first run.
+    let started = daemon
+        .stderr()
+        .lines()
+        .find(|l| l.contains("the back office acts as @office"))
+        .unwrap()
+        .to_owned();
+    let from: u64 = started
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("from="))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(from <= done.from_rev, "{started}");
+}
+
+/// Where the office starts is saved before the listener binds: a `--demo` start that seeds and
+/// then cannot listen still gets its office pass over the seed on the next start.
+#[test]
+fn a_demo_that_cannot_listen_gets_its_office_pass_on_the_next_start() {
+    let (_tmp, state) = state_dir();
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = taken.local_addr().unwrap().port();
+    let refused =
+        Daemon::try_start_on(&state, &format!("tcp:127.0.0.1:{port}"), &["--demo"]).unwrap_err();
+    assert!(!refused.status.success());
+    assert!(
+        refused.stderr.contains("cannot listen"),
+        "{}",
+        refused.stderr
+    );
+    assert!(
+        refused.stderr.contains("from=1 "),
+        "this start began at the seed:\n{}",
+        refused.stderr
+    );
+    drop(taken);
+
+    let daemon = Daemon::start(&state, &[]);
+    let device = daemon.device_token();
+    let started = daemon.stderr();
+    assert!(
+        started.contains("the back office acts as @office") && started.contains("from=1 "),
+        "{started}"
+    );
+    daemon.settle(&device);
 }
 
 /// Every id an event about `filter=scope` may name: the project or workstream, its workstreams,

@@ -213,7 +213,8 @@ fn demo_serves_the_work_model_with_real_tokens() {
     let machines = daemon.get("/v1/machines", Some(&agent));
     assert_eq!(machines.status, 403);
     assert_eq!(machines.code(), "forbidden");
-    let before_move = daemon.latest_rev(&device);
+    // After the back office's pass over the seed, nothing else appends before the move.
+    let before_move = daemon.settle(&device);
     let moved = daemon.post(
         "/v1/tasks/PAP-2/move",
         Some(&agent),
@@ -380,10 +381,13 @@ fn a_move_through_the_api_appears_on_the_stream() {
     let refused = Ws::connect(daemon.port, "/v1/stream", &daemon.agent_token()).unwrap_err();
     assert_eq!(refused.status, 403);
 
+    // After the back office's pass over the seed, nothing else appends before the move.
+    let settled = daemon.settle(&device);
     let mut stream = Ws::connect(daemon.port, "/v1/stream", &device).unwrap();
     let hello = stream.next_json(WAIT);
     assert_eq!(hello["type"], "hello");
     let rev = hello["rev"].as_u64().unwrap();
+    assert_eq!(rev, settled);
     let log = hello["log"].as_str().unwrap().to_owned();
     assert!(rev > 0);
     assert_eq!(log.len(), 26, "the log id is a ULID");
