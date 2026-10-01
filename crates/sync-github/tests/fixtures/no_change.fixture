@@ -1,0 +1,17 @@
+GET https://api.github.com/repos/example-org/demo-repo/milestones?state=all&sort=due_on&direction=asc&per_page=100 HTTP/1.1
+Accept: application/vnd.github+json
+
+HTTP/1.1 304
+
+### pitcrew-github-fixture ###
+GET https://api.github.com/repos/example-org/demo-repo/issues?state=all&sort=updated&direction=asc&per_page=100&since=2026-01-01T01%3A10%3A00Z HTTP/1.1
+Accept: application/vnd.github+json
+
+HTTP/1.1 304
+
+### pitcrew-github-fixture ###
+GET https://api.github.com/repos/example-org/demo-repo/pulls?state=all&sort=updated&direction=desc&per_page=100 HTTP/1.1
+Accept: application/vnd.github+json
+
+HTTP/1.1 304
+
