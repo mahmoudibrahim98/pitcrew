@@ -35,7 +35,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [C-nfs-and-maintenance](C-nfs-and-maintenance.md) | C · Store | `s/C/nfs-and-maintenance` | Sonnet-class | In progress |
 | [G-github-read](G-github-read.md) | G · Integrations | `s/G/github-read` | Sonnet-class | In progress |
 | [E-single-writer-and-sessions](E-single-writer-and-sessions.md) | E · Work model | `s/E/single-writer-and-sessions` | Opus-class | In progress |
-| [M-console-wiring](M-console-wiring.md) | M · Agent console | `s/M/console-wiring` | Opus-class | In progress |
+| [M-console-wiring](M-console-wiring.md) | M · Agent console | `s/M/console-wiring` | Opus-class | **Merged** |
 | [0-daemon-solo](0-daemon-solo.md) | 0 · Composition root | `integrator/daemon-solo` | Opus-class | In progress |
 | [N-projects-wiring](N-projects-wiring.md) | N · Projects layout | `s/N/projects-wiring` | Sonnet-class | In progress |
 | [A-scan](A-scan.md) | A · Ingest | `s/A/scan` | Sonnet-class | Ready (after opencode-adapter merges) |
@@ -43,7 +43,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [F-briefs-and-office](F-briefs-and-office.md) | F · Recap | `s/F/briefs-and-office` | Opus-class | In progress |
 | [I-hook-install](I-hook-install.md) | I · CLI and hooks | `s/I/hook-install` | Sonnet-class | In progress |
 | [J-deploy](J-deploy.md) | J · Remote and HPC | `s/J/deploy` | Opus-class | Ready (after ssh-connection merges) |
-| [O-onboarding-components](O-onboarding-components.md) | O · Onboarding | `s/O/onboarding-components` | Sonnet-class | In progress (based on L-shell) |
+| [O-onboarding-components](O-onboarding-components.md) | O · Onboarding | `s/O/onboarding-components` | Sonnet-class | **Merged** |
 The branch name matters: CI's path guard reads the stream from it (`s/<stream>/<topic>`). The
 integrator adds new briefs here as streams progress, and marks them done when merged.
 
