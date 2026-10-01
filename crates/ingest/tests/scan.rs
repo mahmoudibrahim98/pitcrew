@@ -243,6 +243,13 @@ fn progress_is_monotonic_and_reaches_the_total() {
     assert_eq!(ticks.last().expect("a tick").scanned, 300);
 }
 
+// Unix only: permission bits (`fs::Permissions::from_mode`) are how this crate's other tests
+// simulate "unreadable" too (see `crates/cli/tests/verbs.rs`, `crates/auth/src/store.rs`).
+// Windows has no equivalent without ACL manipulation (`icacls` or a `windows`-crate dependency,
+// both out of this brief's scope), and a read-only attribute does not block reading or listing
+// the way these tests need. `a_panicking_unit_is_caught_and_counted_unreadable_not_lost` in
+// `src/scan.rs` covers the same "counted as unreadable, not lost" contract portably, just via a
+// panic instead of a permission error.
 #[cfg(unix)]
 #[test]
 fn an_unreadable_folder_and_an_unreadable_file_are_warnings_not_failures() {
@@ -297,6 +304,11 @@ fn an_unreadable_folder_and_an_unreadable_file_are_warnings_not_failures() {
     );
 }
 
+// Unix only: creating a symlink on Windows can need elevated privileges or Developer Mode, the
+// same reason `crates/ingest/tests/claude.rs`'s own
+// `discovery_does_not_follow_links_out_of_the_projects_root` is Unix-only. Safety here comes from
+// `ClaudeAdapter::discover` itself (`fs::symlink_metadata`, never followed), already exercised
+// cross-platform by that test and by this scan reaching the same discovery code.
 #[cfg(unix)]
 #[test]
 fn a_symlink_cycle_does_not_hang_the_scan() {
