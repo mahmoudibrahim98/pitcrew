@@ -21,6 +21,7 @@ mod job;
 mod private;
 pub mod probe;
 pub mod quote;
+mod report;
 mod ssh;
 
 pub use askpass::{

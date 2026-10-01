@@ -11,7 +11,6 @@
 
 use crate::{Limits, Ssh, SshError};
 use pitcrew_protocol::model::{MachineInfo, Scheduler};
-use std::collections::HashMap;
 use std::time::Duration;
 
 /// Bounds for [`Ssh::probe`]: 1 MiB of output, and 30 seconds not counting time spent on
@@ -121,32 +120,7 @@ impl Ssh {
 /// [`SshError::UnexpectedOutput`] if a marker is missing or a key appears twice (a value with
 /// a newline in it, such as a strange `$HOME`, must not stand in for a later key).
 pub fn parse(stdout: &str, tag: &str, fallback_hostname: &str) -> Result<Probe, SshError> {
-    let begin = format!("@@pitcrew-probe-begin-{tag}");
-    let end = format!("@@pitcrew-probe-end-{tag}");
-    let unexpected = |why: &str| {
-        let head: String = stdout.chars().take(200).collect();
-        SshError::UnexpectedOutput(format!("{why}, in {head:?}"))
-    };
-    let mut lines = stdout.lines().map(|l| l.trim_end_matches('\r'));
-    if !lines.any(|l| l.trim() == begin) {
-        return Err(unexpected("no probe report"));
-    }
-    let mut values = HashMap::new();
-    let mut ended = false;
-    for line in lines {
-        if line.trim() == end {
-            ended = true;
-            break;
-        }
-        if let Some((key, value)) = line.split_once('=')
-            && values.insert(key.trim(), value.trim()).is_some()
-        {
-            return Err(unexpected(&format!("{:?} reported twice", key.trim())));
-        }
-    }
-    if !ended {
-        return Err(unexpected("the probe report was cut off"));
-    }
+    let values = crate::report::parse(stdout, "probe", tag).map_err(SshError::UnexpectedOutput)?;
     let get = |key: &str| values.get(key).copied().filter(|v| !v.is_empty());
     let flag = |key: &str| get(key) == Some("1");
 
