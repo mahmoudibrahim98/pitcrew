@@ -68,6 +68,18 @@ describe('composeFeatures', () => {
     expect(registry.create[0]?.dialog).toBe(Form);
   });
 
+  it('keeps a "+ New" item\'s disabled reason', () => {
+    const console_ = defineFeature({
+      id: 'console',
+      layout: 'console',
+      create: [{ id: 'session', label: 'Session', dialog: Empty, disabled: 'Starting a session is not available yet.' }],
+    });
+    const registry = composeFeatures(shell, [console_]);
+    const session = registry.create.find((e) => e.id === 'session');
+    expect(session?.disabled).toBe('Starting a session is not available yet.');
+    expect(registry.create.find((e) => e.id === 'task')?.disabled).toBeUndefined();
+  });
+
   it('rejects duplicate ids', () => {
     const a = defineFeature({ id: 'a', layout: 'both', nav: [{ id: 'inbox', label: 'Mine', to: 'x' }] });
     expect(() => composeFeatures(shell, [a])).toThrow('Two features register the nav entry "inbox"');
