@@ -77,6 +77,83 @@ Everything goes through the user's own **system OpenSSH** and `~/.ssh/config`.
   bcachefs, overlayfs, apfs, hfs and similar) count as local; anything else, including
   `UNKNOWN (0x…)`, every FUSE filesystem (`fuseblk`), 9p, virtiofs and vboxsf, counts as
   possibly networked.
+- `Ssh::run_with_input` streams bytes to the remote command's stdin while reading its output,
+  with progress, under the same limits.
+
+## The helper on a machine (`helper`)
+
+Deploys the static `pitcrewd` over the user's ssh and starts it. Nothing on the machine needs
+internet, root, a compiler or a package manager: only a POSIX `sh`, common tools (`dd`, `ls`,
+`awk`, `sed`, `find -mmin`, `readlink`, `date +%s`, …) and one of `sha256sum`, `shasum` or
+`openssl`.
+
+```rust
+let probe = ssh.probe(host).await?;
+let target = Target::new(ssh, host, &probe)?;           // refuses unknown platforms
+// The desktop picks `target.platform().artefact()` (e.g. pitcrewd-x86_64-unknown-linux-musl)
+// and the sha256 compiled in for it.
+let helper = Helper::new(target.platform(), VERSION, SHA256, bytes)?;
+deploy(&target, &helper, &DeployOptions::default()).await?;
+let started = DirectLauncher::default().start(&target).await?;   // or TmuxLauncher
+```
+
+- **Platforms:** Linux x86_64 and aarch64 (static musl) and macOS (universal), from the probe's
+  `uname -s`/`uname -m`. Anything else (FreeBSD, 32-bit ARM, POWER, …) is refused by name, and a
+  helper built for another platform is refused before any call. `Helper::new` checks the
+  version, the size (at most 256 MiB) and that the bytes hash to the expected sha256.
+- **Layout:** `~/.pitcrew/bin/<version>/pitcrewd`, `bin/current -> <version>` (relative),
+  `bin/previous`, `run/endpoint.json`, `run/pitcrewd.sock`, `run/pitcrewd.log`. Every directory
+  must be a real directory owned by the user with mode 0700 and no ACL; one that is not is
+  refused (`UnsafeDirectory`), never repaired.
+- **The remote side** is one script, `src/helper/helper.sh`, sent on **stdin** (the Windows
+  command-line limit leaves the shell-neutral wrapper about 7,500 bytes). The command line is a
+  fixed bootstrap that reads exactly the script's length with `dd`, so the helper bytes behind it
+  stay on stdin, and runs it only if it arrived whole. It reports between random markers, like
+  the probe.
+- **Deploy** is at most two calls, each under the `bin/.lock` lock:
+  1. `check` verifies a copy already installed under the version (sha256 computed on the
+     machine, then `--version`) and switches to it. The same deploy again stops here: it only
+     verifies. A damaged copy is removed. A missing hash tool, an unsafe directory or a busy
+     lock is found here, before anything is uploaded.
+  2. `install` streams the helper into `bin/<version>/pitcrewd.tmp.<random>` under `umask 077`
+     (so it is 0600 from the first byte, in 0700 directories), checks the byte count, the
+     sha256 (`sha256sum`, else `shasum -a 256`, else `openssl dgst -sha256`; a tool that fails
+     or prints no hash falls through) and `--version` (whose first line must have the version as
+     a word), deleting the file if any fails; then `chmod 700`, a rename into place, the switch,
+     and GC.
+  - **Switch:** a new link made with `ln -sfn` on a temporary name, renamed over `current` with
+    `mv -T` (GNU), else `mv -h` (BSD, macOS). Where `mv` has neither (busybox), `ln -sfn`
+    replaces it in place and `Deployed::atomic` is false. `previous` names the version before.
+  - **GC** removes every version directory but `current`'s and `previous`'s.
+  - **Interrupted uploads** never land in place: the file is a temporary one until verified. The
+    script removes it on any exit (and on SIGHUP, SIGPIPE, SIGTERM); if the script itself is
+    killed, the next deploy sweeps it.
+  - **Bounds:** `DeployOptions::timeout` per call (prompts excluded), `lock_wait`, and
+    `stale_lock`, which must exceed both; `progress` reports bytes handed to ssh.
+- **Locks** are `mkdir` directories with an `owner` file (host, pid, call tag). A lock is stale
+  when older than the limit, or taken on this host by a process that is gone (so a killed deploy
+  does not block the next one for long). A stale lock is moved aside atomically and removed; a
+  holder checks it still owns its lock before every change, so a lock broken by mistake stops
+  its old holder (`LockLost`) instead of letting two runs write.
+- **Launchers** implement `Launcher` (object-safe; the SLURM launcher will be another):
+  - `DirectLauncher`: `setsid nohup` (`nohup` alone where there is no `setsid`, as on macOS),
+    double-forked so the helper is nobody's child;
+  - `TmuxLauncher`: the session `pitcrew-helper` on its own tmux server (`tmux -L
+    pitcrew-helper -f /dev/null`), only with tmux 3.2 or newer (`TmuxLauncher::new` refuses
+    older, missing or unreadable versions).
+
+  Both run `bin/current/pitcrewd serve --listen unix:<root>/run/pitcrewd.sock` (or
+  `LaunchOptions::args`), append its output to `run/pitcrewd.log`, wait for the socket
+  (`ready_timeout`; a helper that exits or never binds is reported with the log's last lines,
+  and stopped), and write `run/endpoint.json` atomically:
+  `{"pid":…,"host":…,"version":…,"started":…,"launcher":…,"socket":…}`. `status` reports
+  whether it runs and which version is installed; `stop` sends SIGTERM, then SIGKILL after
+  `stop_timeout`. All are idempotent. A pid counts only while alive, not a zombie, and named
+  `pitcrewd`, so a recycled pid is never signalled. On clusters whose login nodes share `$HOME`,
+  a record from another host is reported (`OtherHost`) and never acted on, unless
+  `LaunchOptions::take_over` says so.
+- **Secrets:** none are involved; nothing here logs. Reports and errors carry paths and the
+  first line of `--version`, with control characters replaced.
 
 ## Tests
 
@@ -88,8 +165,18 @@ Everything goes through the user's own **system OpenSSH** and `~/.ssh/config`.
   goes out), and as a fake app that quits mid-prompt;
 - `tests/login_shells.rs`, which runs the wrapped command through every shell it finds, or
   those listed in `PITCREW_TEST_SHELLS` (`:`-separated paths);
+- `tests/deploy.rs` (Unix), where the test binary is a fake `ssh` that runs the real remote
+  script with the local `/bin/sh` in a temporary `HOME`, with a `PATH` holding only the tools
+  the script may use. It can cut, pause or corrupt the upload, or never read it. The binary also
+  plays `pitcrewd` and the hash tools (in the formats of `sha256sum`, `shasum`, OpenSSL 1.1 and
+  3). It covers deploy and the idempotent re-run, hash mismatch, interrupted and killed uploads,
+  concurrent and stale locks, GC, every hash tool, BSD and busybox `mv`, unknown platforms,
+  unsafe directories, the file modes during the upload, a stalled upload, and the direct and
+  tmux launchers (start, status, stop, `endpoint.json`, failures, other hosts). It runs the
+  whole flow again with each POSIX shell of `PITCREW_TEST_SHELLS` as the machine's `sh`;
 - `tests/real_sshd.rs`, only when `PITCREW_TEST_SSH_HOST` names a host reachable without
-  prompts.
+  prompts; it also deploys a stand-in helper into a throwaway directory there and removes it.
 
 The Windows code (Job Object, named pipes) is checked with clippy for
-`x86_64-pc-windows-gnu`; the test suites have not run on Windows yet.
+`x86_64-pc-windows-gnu`; the test suites have not run on Windows yet (the deploy tests need a
+Unix `sh` and skip there).
