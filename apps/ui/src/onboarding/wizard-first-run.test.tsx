@@ -114,6 +114,38 @@ describe('the first-run wizard', () => {
     await screen.findByRole('heading', { level: 1, name: 'Home' });
   }, 20_000);
 
+  it('keeps an explicitly chosen launcher on Back and Forward (review r1, item 1)', async () => {
+    renderWizard('first-run', createFakeOnboardingApi({ speed: 0 }));
+    await heading('Welcome to PitCrew');
+    fireEvent.click(screen.getByRole('button', { name: 'Get started' }));
+
+    await heading('Your first workspace');
+    fireEvent.change(screen.getByLabelText('Workspace name'), { target: { value: 'My team' } });
+    fireEvent.click(screen.getByRole('radio', { name: /This computer/ }));
+    fireEvent.click(continueButton());
+
+    await heading('Checking the machine');
+    await rowForTextAsync('OpenCode CLI');
+    fireEvent.click(continueButton());
+
+    // 'direct' is the recommended (and so default) launcher for "This computer" in the fake; pick
+    // the non-recommended 'tmux' instead.
+    await heading('Install the helper');
+    await screen.findByRole('radio', { name: /^direct/i, checked: true });
+    fireEvent.click(screen.getByRole('radio', { name: /^tmux$/ }));
+    await screen.findByRole('radio', { name: /^tmux$/, checked: true });
+
+    // Back to machine check, then Forward again: the step unmounts and remounts, so a naive
+    // "refetch options and reset to the recommended default" would silently discard the choice.
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+    await heading('Checking the machine');
+    fireEvent.click(continueButton());
+
+    await heading('Install the helper');
+    await screen.findByRole('radio', { name: /^tmux$/, checked: true });
+    expect(screen.getByRole('radio', { name: /^direct/i, checked: false })).toBeTruthy();
+  });
+
   it('the stepper only lets you jump to a step already reached', async () => {
     renderWizard('first-run', createFakeOnboardingApi({ speed: 0 }));
     await heading('Welcome to PitCrew');

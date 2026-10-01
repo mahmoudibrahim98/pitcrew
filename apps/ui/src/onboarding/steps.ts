@@ -1,6 +1,7 @@
 // Which steps make up each wizard, in order. The add-a-machine wizard reuses the same step
-// components (`step-components.tsx`) for 2-5 and 7-9 of the first-run wizard (`docs/build/streams/O.md`
-// work package 2); each component reads `useWizard().mode` where its copy or fields differ.
+// components (the map in `wizard-shell.tsx`) for 2-5 and 7-9 of the first-run wizard
+// (`docs/build/streams/O.md` work package 2); each component reads `useWizard().mode` where its
+// copy or fields differ.
 
 import type { WizardMode } from './wizard-state.ts';
 

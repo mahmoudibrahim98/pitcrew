@@ -14,6 +14,14 @@ const PERMISSION_LABEL: Record<PermissionMode, { label: string; hint: string }> 
   'bypass-permissions': { label: 'Skip permissions', hint: 'Nothing prompts. An explicit, risky opt-in.' },
 };
 
+/** Clamped to 0-100; an empty field or a non-number (mid-edit) keeps the previous value. */
+function parseCap(raw: string, previous: number): number {
+  if (raw.trim() === '') return previous;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return previous;
+  return Math.min(100, Math.max(0, Math.round(n)));
+}
+
 export function SafetyStep() {
   const { state, patch, next } = useWizard();
   const api = useOnboardingApi();
@@ -80,7 +88,9 @@ export function SafetyStep() {
                 patch({
                   safety: {
                     ...state.safety,
-                    backOfficeCaps: { maxAutoAcceptPerHour: Number(e.target.value) },
+                    backOfficeCaps: {
+                      maxAutoAcceptPerHour: parseCap(e.target.value, state.safety.backOfficeCaps.maxAutoAcceptPerHour),
+                    },
                   },
                 })
               }

@@ -5,6 +5,7 @@ import { RadioGroup } from 'radix-ui';
 import { useEffect, useRef } from 'react';
 import { cx } from '../../lib/cx.ts';
 import type { Launcher, Streamed } from '../api.ts';
+import { targetKey } from '../api.ts';
 import { useOnboardingApi } from '../api-context.tsx';
 import { StepFooter } from '../step-footer.tsx';
 import { useWizard } from '../wizard-context.tsx';
@@ -20,26 +21,33 @@ export function InstallHelperStep() {
   const { state, patch, next } = useWizard();
   const api = useOnboardingApi();
   const streamed = useRef<Streamed | null>(null);
-  const optionsFor = useRef<string | null>(null);
+  const key = targetKey(state.primaryMachine);
+  const options = state.launcherOptionsByTarget[key];
+  // Falls back to 'direct' only until the options (and so a recommended default) have loaded; once
+  // loaded, a target with no entry yet is seeded from `recommended` — see the effect below. A
+  // launcher the person already chose for this target is never overwritten by that seeding (review
+  // r1, item 1): revisiting via Back/Forward reads the same `launcherChoiceByTarget[key]` back.
+  const launcher = state.launcherChoiceByTarget[key] ?? 'direct';
 
   useEffect(() => {
-    const key = JSON.stringify(state.primaryMachine);
-    if (optionsFor.current === key) return;
-    optionsFor.current = key;
-    void api.launcherOptions(state.primaryMachine).then((options) => {
-      const recommended = options.find((o) => o.recommended);
-      patch({
-        launcherOptions: options,
-        ...(recommended === undefined ? {} : { launcher: recommended.launcher }),
-      });
+    if (options !== undefined) return;
+    void api.launcherOptions(state.primaryMachine).then((fetched) => {
+      const recommended = fetched.find((o) => o.recommended);
+      patch((s) => ({
+        launcherOptionsByTarget: { ...s.launcherOptionsByTarget, [key]: fetched },
+        launcherChoiceByTarget:
+          s.launcherChoiceByTarget[key] !== undefined || recommended === undefined
+            ? s.launcherChoiceByTarget
+            : { ...s.launcherChoiceByTarget, [key]: recommended.launcher },
+      }));
     });
-  }, [api, state.primaryMachine, patch]);
+  }, [api, state.primaryMachine, key, options, patch]);
 
   useEffect(() => () => streamed.current?.cancel(), []);
 
   function install() {
     patch({ installLog: [], installStatus: 'running', installError: undefined, slurmScript: undefined });
-    streamed.current = api.streamInstallHelper({ machine: state.primaryMachine, launcher: state.launcher }, (event) => {
+    streamed.current = api.streamInstallHelper({ machine: state.primaryMachine, launcher }, (event) => {
       if (event.type === 'log') {
         patch((s) => ({ installLog: [...s.installLog, event.line] }));
       } else if (event.type === 'script-preview') {
@@ -66,17 +74,19 @@ export function InstallHelperStep() {
       <fieldset className="flex flex-col gap-1.5" disabled={running || done}>
         <legend className="text-sm font-medium text-ink">Launcher</legend>
         <RadioGroup.Root
-          value={state.launcher}
-          onValueChange={(value) => patch({ launcher: value as Launcher })}
+          value={launcher}
+          onValueChange={(value) =>
+            patch((s) => ({ launcherChoiceByTarget: { ...s.launcherChoiceByTarget, [key]: value as Launcher } }))
+          }
           className="flex flex-col gap-1.5"
         >
-          {state.launcherOptions.map((option) => (
+          {(options ?? []).map((option) => (
             <label
               key={option.launcher}
               className={cx(
                 'flex items-center gap-2 rounded-sm border px-3 py-2 text-sm',
                 option.unavailable !== undefined && 'opacity-50',
-                state.launcher === option.launcher && option.unavailable === undefined
+                launcher === option.launcher && option.unavailable === undefined
                   ? 'border-accent bg-accent-soft text-accent-text'
                   : 'border-line',
               )}

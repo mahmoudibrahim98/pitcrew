@@ -55,28 +55,35 @@ export interface WizardState {
   // Workspace / add-machine target
   workspaceName: string;
   primaryMachine: MachineTarget;
+  /** Cached (never refetched once present), so Back/Forward doesn't re-query the host list. */
   discoveredHosts: DiscoveredHost[];
   hostsStatus: StepStatus;
 
-  // Machine check
-  machineCheck?: MachineCheckResult;
-  machineCheckStatus: StepStatus;
+  // Machine check. Keyed by `targetKey()` so revisiting after Back/Forward reuses the result
+  // instead of re-running the check (ADR-0009: fixes are server-side truth anyway, but refetching
+  // is still wasted work every time the step remounts).
+  machineCheckByTarget: Record<string, MachineCheckResult>;
 
-  // Install helper
-  launcher: Launcher;
-  launcherOptions: LauncherOption[];
+  // Install helper. Both keyed by `targetKey()`: `launcherOptionsByTarget` so the options aren't
+  // refetched, and `launcherChoiceByTarget` so a launcher the person explicitly picked for a
+  // target is never overwritten by the recommended default on a later visit to the same target
+  // (review r1, item 1) — only a target with no entry yet gets seeded from `recommended`.
+  launcherOptionsByTarget: Record<string, LauncherOption[]>;
+  launcherChoiceByTarget: Record<string, Launcher>;
   /** `| undefined` (not just optional) so a step can explicitly clear it when a new install starts. */
   slurmScript?: string | undefined;
   installLog: string[];
   installStatus: StepStatus;
   installError?: string | undefined;
 
-  // Sign in
+  // Sign in. Not per-target: the fake (and any real client) reports every engine's account
+  // regardless of which machine is current.
   accounts: AgentAccount[];
   accountsStatus: StepStatus;
 
   // Integrations
   integrations: IntegrationStatus[];
+  integrationsStatus: StepStatus;
 
   // Scan
   scanStatus: StepStatus;
@@ -112,14 +119,15 @@ export function initialWizardState(mode: WizardMode): WizardState {
     primaryMachine: { kind: 'local' },
     discoveredHosts: [],
     hostsStatus: 'idle',
-    machineCheckStatus: 'idle',
-    launcher: 'direct',
-    launcherOptions: [],
+    machineCheckByTarget: {},
+    launcherOptionsByTarget: {},
+    launcherChoiceByTarget: {},
     installLog: [],
     installStatus: 'idle',
     accounts: [],
     accountsStatus: 'idle',
     integrations: [],
+    integrationsStatus: 'idle',
     scanStatus: 'idle',
     createProjects: [],
     createWorkstreams: [],

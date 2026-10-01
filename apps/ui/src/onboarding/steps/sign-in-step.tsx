@@ -3,7 +3,7 @@
 // that terminal would open; the Agent console (stream M) is not registered in this worktree yet,
 // so the link resolves to the shell's placeholder session page for now.
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { StatusPill } from '../../design/index.ts';
 import { paths, useWorkspaceId } from '../../shell/index.ts';
 import type { Engine } from '../../data/index.ts';
@@ -23,13 +23,14 @@ export function SignInStep() {
   const ws = useWorkspaceId();
   const [starting, setStarting] = useState<Engine | null>(null);
   const [sessions, setSessions] = useState<Partial<Record<Engine, string>>>({});
-  const loaded = useRef(false);
 
+  // Cached: a sign-in already done (via `signIn` below) stays reflected in `state.accounts`
+  // without this effect running again and overwriting it on a later visit.
   useEffect(() => {
-    if (loaded.current) return;
-    loaded.current = true;
-    void api.agentAccounts().then((accounts) => patch({ accounts }));
-  }, [api, patch]);
+    if (state.accountsStatus !== 'idle') return;
+    patch({ accountsStatus: 'running' });
+    void api.agentAccounts().then((accounts) => patch({ accounts, accountsStatus: 'done' }));
+  }, [api, state.accountsStatus, patch]);
 
   async function signIn(engine: Engine) {
     setStarting(engine);

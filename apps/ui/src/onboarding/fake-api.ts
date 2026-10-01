@@ -29,16 +29,10 @@ import type {
   StartSignInResult,
   Streamed,
 } from './api.ts';
-import { machineTargetLabel } from './api.ts';
+import { machineTargetLabel, targetKey } from './api.ts';
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function targetKey(target: MachineTarget): string {
-  if (target.kind === 'local') return 'local';
-  if (target.kind === 'wsl') return `wsl:${target.distro}`;
-  return `ssh:${target.user ?? ''}@${target.host}`;
 }
 
 /** Runs `steps`, one per tick, calling `onEvent` for each; returns a `Streamed` that can cancel. */

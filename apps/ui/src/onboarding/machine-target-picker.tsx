@@ -3,10 +3,11 @@
 // first-run workspace step and the add-a-machine wizard.
 
 import { RadioGroup } from 'radix-ui';
-import { useEffect, useId, useState } from 'react';
+import { useEffect, useId } from 'react';
 import { cx } from '../lib/cx.ts';
-import type { DiscoveredHost, MachineTarget } from './api.ts';
+import type { MachineTarget } from './api.ts';
 import { useOnboardingApi } from './api-context.tsx';
+import { useWizard } from './wizard-context.tsx';
 
 export function MachineTargetPicker({
   value,
@@ -18,21 +19,22 @@ export function MachineTargetPicker({
   label?: string;
 }) {
   const api = useOnboardingApi();
-  const [hosts, setHosts] = useState<DiscoveredHost[] | null>(null);
+  const { state, patch } = useWizard();
   const groupId = useId();
 
+  // Cached in wizard state, not local state: Back/Forward remounts this component, and the host
+  // list does not change between visits, so there is nothing to gain from refetching it.
   useEffect(() => {
-    let live = true;
+    if (state.hostsStatus !== 'idle') return;
+    patch({ hostsStatus: 'running' });
     void api.discoverHosts().then((found) => {
-      if (live) setHosts(found);
+      patch({ discoveredHosts: found, hostsStatus: 'done' });
     });
-    return () => {
-      live = false;
-    };
-  }, [api]);
+  }, [api, state.hostsStatus, patch]);
 
-  const wslHosts = (hosts ?? []).filter((h) => h.kind === 'wsl');
-  const sshHosts = (hosts ?? []).filter((h) => h.kind === 'ssh');
+  const loaded = state.hostsStatus === 'done';
+  const wslHosts = state.discoveredHosts.filter((h) => h.kind === 'wsl');
+  const sshHosts = state.discoveredHosts.filter((h) => h.kind === 'ssh');
   const radioValue = value.kind === 'local' ? 'local' : value.kind === 'wsl' ? `wsl:${value.distro}` : `ssh:${value.host}`;
 
   return (
@@ -74,8 +76,8 @@ export function MachineTargetPicker({
           />
         ))}
       </RadioGroup.Root>
-      {hosts === null && <p className="text-xs text-ink-2">Looking for WSL distros and SSH hosts…</p>}
-      {hosts !== null && wslHosts.length === 0 && sshHosts.length === 0 && (
+      {!loaded && <p className="text-xs text-ink-2">Looking for WSL distros and SSH hosts…</p>}
+      {loaded && wslHosts.length === 0 && sshHosts.length === 0 && (
         <p className="text-xs text-ink-2">No other machines found yet; you can add one later.</p>
       )}
     </fieldset>

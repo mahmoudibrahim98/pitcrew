@@ -1,7 +1,7 @@
 // Step 6 (first run only): connect external trackers. Entirely skippable; stream G wires the real
 // connections later.
 
-import { useEffect, useRef } from 'react';
+import { useEffect } from 'react';
 import type { IntegrationId } from '../api.ts';
 import { useOnboardingApi } from '../api-context.tsx';
 import { StepFooter } from '../step-footer.tsx';
@@ -17,13 +17,14 @@ const LABEL: Record<IntegrationId, string> = {
 export function IntegrationsStep() {
   const { state, patch, next, skip } = useWizard();
   const api = useOnboardingApi();
-  const loaded = useRef(false);
 
+  // Cached: without this, revisiting the step after Back/Forward would refetch and silently
+  // discard any Connect/Disconnect the person had already toggled (review r1, item 1's pattern).
   useEffect(() => {
-    if (loaded.current) return;
-    loaded.current = true;
-    void api.integrationStatus().then((integrations) => patch({ integrations }));
-  }, [api, patch]);
+    if (state.integrationsStatus !== 'idle') return;
+    patch({ integrationsStatus: 'running' });
+    void api.integrationStatus().then((integrations) => patch({ integrations, integrationsStatus: 'done' }));
+  }, [api, state.integrationsStatus, patch]);
 
   return (
     <form

@@ -1,10 +1,10 @@
 // Step 3: CLI versions, tmux, git and gh, disk, SLURM — each with its own "Fix" button. Re-runs
 // automatically when the target machine changes (e.g. the user went back and picked another one).
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { StatusPill } from '../../design/index.ts';
 import type { CheckRowId, CheckRowStatus } from '../api.ts';
-import { machineTargetLabel } from '../api.ts';
+import { machineTargetLabel, targetKey } from '../api.ts';
 import { useOnboardingApi } from '../api-context.tsx';
 import { StepFooter } from '../step-footer.tsx';
 import { useWizard } from '../wizard-context.tsx';
@@ -28,34 +28,40 @@ export function MachineCheckStep() {
   const api = useOnboardingApi();
   const [fixing, setFixing] = useState<CheckRowId | null>(null);
   const target = state.primaryMachine;
-  const ranFor = useRef<string | null>(null);
+  const key = targetKey(target);
+  const cached = state.machineCheckByTarget[key];
 
+  // Cached per target: Back to a target already checked (including any row already fixed, since
+  // `fixMachineRow` writes its result back into the same cache entry) shows it again instead of
+  // re-running the check and briefly flashing "Checking the machine…".
   useEffect(() => {
-    const key = JSON.stringify(target);
-    if (ranFor.current === key) return;
-    ranFor.current = key;
-    patch({ machineCheckStatus: 'running' });
+    if (cached !== undefined) return;
     void api.checkMachine(target).then((result) => {
-      patch({ machineCheck: result, machineCheckStatus: 'done' });
+      patch((s) => ({ machineCheckByTarget: { ...s.machineCheckByTarget, [key]: result } }));
     });
-  }, [api, target, patch]);
+  }, [api, target, key, cached, patch]);
 
   async function fix(row: CheckRowId) {
     setFixing(row);
     try {
       const fixed = await api.fixMachineRow(target, row);
-      patch((s) =>
-        s.machineCheck === undefined
-          ? {}
-          : { machineCheck: { ...s.machineCheck, rows: s.machineCheck.rows.map((r) => (r.id === row ? fixed : r)) } },
-      );
+      patch((s) => {
+        const current = s.machineCheckByTarget[key];
+        if (current === undefined) return {};
+        return {
+          machineCheckByTarget: {
+            ...s.machineCheckByTarget,
+            [key]: { ...current, rows: current.rows.map((r) => (r.id === row ? fixed : r)) },
+          },
+        };
+      });
     } finally {
       setFixing(null);
     }
   }
 
-  const rows = state.machineCheck?.rows ?? [];
-  const loading = state.machineCheckStatus !== 'done';
+  const rows = cached?.rows ?? [];
+  const loading = cached === undefined;
 
   return (
     <form

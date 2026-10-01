@@ -82,7 +82,6 @@ export function CreateStep() {
               <div className="flex items-center gap-2">
                 <input
                   type="checkbox"
-                  id={`project-${project.suggestionId}`}
                   aria-label={`Include ${project.name}`}
                   checked={project.checked}
                   onChange={(e) => updateProject(project.suggestionId, { checked: e.target.checked })}
@@ -116,7 +115,6 @@ export function CreateStep() {
                     <li key={ws.suggestionId} className="flex items-center gap-2">
                       <input
                         type="checkbox"
-                        id={`workstream-${ws.suggestionId}`}
                         aria-label={`Include ${ws.name}`}
                         checked={ws.checked}
                         onChange={(e) => updateWorkstream(ws.suggestionId, { checked: e.target.checked })}

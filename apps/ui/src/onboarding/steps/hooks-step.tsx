@@ -2,7 +2,7 @@
 // (`docs/build/streams/O.md`: "hooks (diff first)"). Hooks are fire-and-forget and under 10 ms
 // (ADR-0010); installing them here only writes the CLI config that calls out to the daemon.
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useOnboardingApi } from '../api-context.tsx';
 import { StepFooter } from '../step-footer.tsx';
 import { useWizard } from '../wizard-context.tsx';
@@ -11,13 +11,13 @@ export function HooksStep() {
   const { state, patch, next, skip } = useWizard();
   const api = useOnboardingApi();
   const [installing, setInstalling] = useState(false);
-  const loaded = useRef(false);
 
+  // Cached: `state.hooksDiff` stays set once fetched, so revisiting the step after Back/Forward
+  // shows the same diff instead of re-fetching it.
   useEffect(() => {
-    if (loaded.current) return;
-    loaded.current = true;
+    if (state.hooksDiff !== undefined) return;
     void api.hooksDiff().then((diff) => patch({ hooksDiff: diff }));
-  }, [api, patch]);
+  }, [api, state.hooksDiff, patch]);
 
   async function install() {
     setInstalling(true);

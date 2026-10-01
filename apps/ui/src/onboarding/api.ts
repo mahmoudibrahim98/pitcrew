@@ -20,6 +20,17 @@ export function machineTargetLabel(target: MachineTarget): string {
   return target.user === undefined ? target.host : `${target.user}@${target.host}`;
 }
 
+/**
+ * A stable string key for caching per-machine data (a check, launcher options, …) in wizard
+ * state, keyed by target so revisiting a step after Back/Forward reuses what it already fetched
+ * instead of refetching and silently overwriting a choice the person already made.
+ */
+export function targetKey(target: MachineTarget): string {
+  if (target.kind === 'local') return 'local';
+  if (target.kind === 'wsl') return `wsl:${target.distro}`;
+  return `ssh:${target.user ?? ''}@${target.host}`;
+}
+
 /** An SSH host offered from the user's own `~/.ssh/config`, or a WSL distro from `wsl -l`. */
 export interface DiscoveredHost {
   kind: Extract<MachineKind, 'wsl' | 'ssh'>;
@@ -70,7 +81,16 @@ export type InstallProgressEvent =
   | { type: 'done' }
   | { type: 'error'; message: string };
 
-/** A cancellable streamed call: every `stream*` method on `OnboardingApi` returns one of these. */
+/**
+ * A cancellable streamed call: every `stream*` method on `OnboardingApi` returns one of these.
+ *
+ * `cancel()` must stop the **server-side** work (the scan walk, the helper deploy), not just
+ * detach the listener — a real implementation that only stops delivering events but leaves the
+ * scan or install running server-side will double the work and can double-submit a SLURM job.
+ * React StrictMode's dev-only double-mount relies on this: it cancels the first call's stream
+ * before starting the second, and the fake's `cancel()` clears its timers accordingly (see
+ * `fake-api.ts`, `streamSteps`).
+ */
 export interface Streamed {
   cancel(): void;
 }
