@@ -320,11 +320,16 @@ impl Store {
     /// Runs `f` on a read-only connection, inside one read transaction, so every query in it sees
     /// the same committed state. For domain crates querying their projection tables.
     ///
-    /// Reads use their own connection: they never take the write lock, and a long read does not
-    /// hold up appends (in WAL mode readers and the writer do not block each other). Keep reads
-    /// short anyway: [`Store::since`] and [`Store::before`] share that one connection and wait
-    /// for the closure, and a long-open read stops the WAL from being checkpointed. Writes
-    /// through it fail.
+    /// **Local (WAL) mode:** reads use their own, separate connection: they never take the write
+    /// lock, and a long read does not hold up appends (WAL readers and the writer do not block
+    /// each other). Writes through it fail. Keep reads short anyway: [`Store::since`] and
+    /// [`Store::before`] share that one connection and wait for the closure, and a long-open read
+    /// stops the WAL from being checkpointed.
+    ///
+    /// **Network mode:** there is no separate connection (`locking_mode=EXCLUSIVE` cannot support
+    /// one), so this runs on the write connection instead: it waits for a concurrent append (and
+    /// vice versa), and the closure is not physically prevented from writing, only expected not
+    /// to. See the crate README's "Network filesystems" section.
     ///
     /// The snapshot starts at the closure's first query and holds until it returns, even if
     /// events are appended meanwhile. So the revision a projection's tables reflect is its
@@ -513,8 +518,10 @@ impl Store {
     }
 
     /// Up to `limit` events after `rev`, oldest first. `since(0, n)` starts at the beginning.
-    /// Runs on the read connection, so it does not wait for an append or a rebuild, and sees
-    /// every append that has returned. Do not call it inside [`Store::read`] (it deadlocks).
+    /// Sees every append that has returned. In local (WAL) mode this runs on the separate read
+    /// connection, so it does not wait for an append or a rebuild; in network mode it shares the
+    /// write connection (see [`Store::read`]) and does wait. Do not call it inside
+    /// [`Store::read`] (it deadlocks).
     ///
     /// # Errors
     ///
@@ -524,8 +531,9 @@ impl Store {
     }
 
     /// Up to `limit` events matching `filter` just before `rev`, oldest first. For paging back
-    /// through history: pass the first returned revision as the next `rev`. Runs on the read
-    /// connection, like [`Store::since`]; do not call it inside [`Store::read`].
+    /// through history: pass the first returned revision as the next `rev`. Runs on the same
+    /// connection as [`Store::since`] (see its doc for the local/network difference); do not call
+    /// it inside [`Store::read`].
     ///
     /// # Errors
     ///
