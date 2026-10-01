@@ -177,6 +177,8 @@ export function describeEvent(event: Event, names: Names): string {
       return `created ${body.data.task.key} “${body.data.task.title}”`;
     case 'task_moved':
       return `moved ${names.task(body.data.task)} from ${TASK_STATUS[body.data.from].label} to ${TASK_STATUS[body.data.to].label}`;
+    case 'task_updated':
+      return `edited ${names.task(body.data.task)}`;
     case 'task_assigned':
       return body.data.assignee === undefined
         ? `unassigned ${names.task(body.data.task)}`
