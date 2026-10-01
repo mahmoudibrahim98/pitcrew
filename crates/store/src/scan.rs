@@ -15,10 +15,13 @@ pub struct Found {
 }
 
 /// Parses a file name. `Ok(None)` for files that are not SQL (such as a README), an error for SQL
-/// files that do not follow `NNNN_<name>.sql`.
+/// files that do not follow `NNNN_<name>.sql`. The extension is matched in any case, so a
+/// `.SQL` file is rejected rather than silently skipped.
 pub fn parse_file_name(file_name: &str) -> Result<Option<(u32, String)>, String> {
-    let Some(stem) = file_name.strip_suffix(".sql") else {
-        return Ok(None);
+    let split = file_name.len().saturating_sub(4);
+    let (stem, ext) = match (file_name.get(..split), file_name.get(split..)) {
+        (Some(stem), Some(ext)) if ext.eq_ignore_ascii_case(".sql") => (stem, ext),
+        _ => return Ok(None),
     };
     let bad = || {
         format!(
@@ -26,6 +29,9 @@ pub fn parse_file_name(file_name: &str) -> Result<Option<(u32, String)>, String>
              lowercase name of letters, digits and underscores"
         )
     };
+    if ext != ".sql" {
+        return Err(bad());
+    }
     let (number, name) = stem.split_once('_').ok_or_else(bad)?;
     if number.len() != 4 || !number.bytes().all(|b| b.is_ascii_digit()) {
         return Err(bad());
@@ -98,7 +104,12 @@ mod tests {
             Ok(Some((203, "task_links".into())))
         );
         assert_eq!(parse_file_name("README.md"), Ok(None));
+        assert_eq!(parse_file_name("sql"), Ok(None));
+        assert_eq!(parse_file_name("é.md"), Ok(None));
         for bad in [
+            "0001_init.SQL",
+            "0001_init.Sql",
+            ".sql",
             "1_init.sql",
             "00001_init.sql",
             "0001-init.sql",

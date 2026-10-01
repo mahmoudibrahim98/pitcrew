@@ -280,6 +280,23 @@ fn invalid_utf8_and_wrong_shapes_are_skipped() {
 }
 
 #[test]
+fn a_flood_of_junk_lines_reports_only_the_first() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("junk.jsonl");
+    let mut data = format!("{}\n", prompt("go", "2026-01-01T00:00:00Z"));
+    for _ in 0..1000 {
+        data.push_str("junk\n");
+    }
+    fs::write(&path, &data).expect("write");
+    let report = ClaudeAdapter
+        .read(&tref(&path), &Cursor::default())
+        .expect("read");
+    assert_eq!(report.chunk.items.len(), 1);
+    assert_eq!(report.skipped.len(), pitcrew_ingest::MAX_REPORTED_SKIPS);
+    assert_eq!(report.skipped_total, 1000);
+}
+
+#[test]
 fn meta_comes_from_records_not_folders() {
     let dir = tempfile::tempdir().expect("tempdir");
     let folder = dir.path().join("-some-encoded-folder");

@@ -1,4 +1,5 @@
-//! The daemon's API as seen by the desktop: host info, errors, token scopes, and the delta stream.
+//! The daemon's API as seen by the desktop: host info, errors, token scopes, shared request bodies,
+//! and the delta stream.
 //!
 //! - Endpoints live under [`API_PREFIX`]. The endpoint list is in `docs/build/contracts/api-v1.md`,
 //!   and `apps/mock-hub` implements it with fixture data.
@@ -6,8 +7,10 @@
 //! - Live changes arrive on one WebSocket, `GET /v1/stream?since=<rev>`, as [`StreamFrame`]s.
 
 use crate::events::Event;
-use crate::ids::MemberId;
-use crate::model::{MachineInfo, TimestampMs};
+use crate::ids::{MemberId, ProjectId, ProjectKey, WorkstreamId};
+use crate::model::{
+    Date, Location, MachineInfo, Priority, ProjectStatus, TaskStatus, TimestampMs, WorkstreamStatus,
+};
 use crate::runner::Capability;
 use serde::{Deserialize, Serialize};
 
@@ -121,6 +124,100 @@ pub struct ApiError {
     pub code: ErrorCode,
     /// A sentence for people.
     pub message: String,
+}
+
+// ─── Request bodies ──────────────────────────────────────────────────────────────────────────
+// Shared by the hub, the CLI and the mock hub. A field left out (or `null`) takes the default
+// that `docs/build/contracts/api-v1.md` gives it; the hub applies it.
+
+/// `POST /v1/tasks`: a new task. The hub assigns the id and the next key in the project.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewTask {
+    /// The project.
+    pub project: ProjectId,
+    /// The workstream; it must belong to the project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workstream: Option<WorkstreamId>,
+    /// Title.
+    pub title: String,
+    /// Description; empty if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Status; `todo` if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TaskStatus>,
+    /// Priority; `none` if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<Priority>,
+    /// Assignee.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<MemberId>,
+    /// Labels; none if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<Vec<String>>,
+    /// Due date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due: Option<Date>,
+}
+
+/// `POST /v1/projects`: a new project. The hub assigns the id.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewProject {
+    /// Key used in task keys; unique in the workspace.
+    pub key: ProjectKey,
+    /// Name.
+    pub name: String,
+    /// The lead; the caller if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead: Option<MemberId>,
+    /// Members; the lead alone if absent. The lead is always a member.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members: Option<Vec<MemberId>>,
+    /// Status; `in_progress` if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<ProjectStatus>,
+    /// Start date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<Date>,
+    /// Due date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due: Option<Date>,
+    /// The root folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<Location>,
+}
+
+/// `POST /v1/workstreams`: a new workstream in a project. The hub assigns the id; its health
+/// starts `on_track`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewWorkstream {
+    /// The project.
+    pub project: ProjectId,
+    /// Name.
+    pub name: String,
+    /// Status; `active` if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<WorkstreamStatus>,
+    /// Folders or branches whose sessions belong to it; none if absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locations: Option<Vec<Location>>,
+}
+
+/// `GET /v1/events`: a page of the activity log, oldest first within the page.
+///
+/// Page backwards by passing `from_rev` as `before`. Only `at_start` ends paging: with filters, a
+/// page may hold fewer than `limit` events (even none) while older matches still exist.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventsPage {
+    /// The events, oldest first.
+    pub events: Vec<Event>,
+    /// Revision of the first returned event; with no events, where the scan stopped (0 at the
+    /// start of the log).
+    pub from_rev: u64,
+    /// Revision of the last returned event, or 0 when the page is empty.
+    pub to_rev: u64,
+    /// True when no older matching event exists.
+    pub at_start: bool,
 }
 
 /// Frames on `GET /v1/stream?since=<rev>`. `rev` is the hub's event revision. A client that

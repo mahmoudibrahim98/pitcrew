@@ -5,37 +5,18 @@
 //! record after `end_turn` must not end the turn twice) is applied by the caller through
 //! [`ClaudeRecord::soft_turn_end`].
 
+use crate::bound::{
+    Diff, MAX_DIFF_BYTES, MAX_ID_BYTES, MAX_PATH_BYTES, MAX_PLAN_ITEMS, MAX_TARGET_CHARS,
+    MAX_TEXT_CHARS, MAX_TOOL_CHARS, SUMMARY_CHARS, SUMMARY_LINES, bounded, bounded_input, call_id,
+    plan_item, title_value,
+};
 use crate::lines::SkipReason;
-use crate::text::{first_line, summary, title, truncate_chars};
+use crate::text::{first_line, summary, truncate_chars};
 use crate::time::parse_rfc3339_ms;
-use pitcrew_interfaces::source::{PlanItem, PlanStatus, TranscriptItem};
+use pitcrew_interfaces::source::{PlanItem, TranscriptItem};
 use pitcrew_protocol::model::TimestampMs;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
-/// Longest prompt or assistant text kept, in characters.
-const MAX_TEXT_CHARS: usize = 100_000;
-/// Longest tool target, in characters.
-const MAX_TARGET_CHARS: usize = 200;
-/// Tool result summaries: this many lines, this many characters.
-const SUMMARY_LINES: usize = 3;
-const SUMMARY_CHARS: usize = 240;
-/// Tool inputs: strings are cut to this many characters...
-const MAX_INPUT_STRING_CHARS: usize = 1024;
-/// ...and an input still larger than this (as JSON) is replaced by a preview.
-const MAX_INPUT_JSON_BYTES: usize = 16 * 1024;
-/// Longest diff kept, in bytes.
-const MAX_DIFF_BYTES: usize = 64 * 1024;
-/// Ids, model and branch longer than this (in bytes) are dropped as implausible.
-const MAX_ID_BYTES: usize = 256;
-/// A cwd or file path longer than this (in bytes) is dropped or cut.
-const MAX_PATH_BYTES: usize = 4096;
-/// Longest custom title or summary, in characters.
-pub(crate) const MAX_TITLE_CHARS: usize = 120;
-/// Tool names, in characters.
-const MAX_TOOL_CHARS: usize = 100;
-/// Plan lines: at most this many, each cut to this many characters.
-const MAX_PLAN_ITEMS: usize = 200;
-const MAX_PLAN_TEXT_CHARS: usize = 1000;
 /// Questions: count per call, text, option count and option label length.
 const MAX_QUESTIONS: usize = 20;
 const MAX_QUESTION_CHARS: usize = 4000;
@@ -131,25 +112,6 @@ pub fn parse_line(line: &[u8], offset: u64) -> Result<ClaudeRecord, SkipReason> 
 
 fn str_at<'a>(obj: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     obj.get(key).and_then(Value::as_str)
-}
-
-/// A trimmed, non-empty value no longer than `max` bytes; longer values are dropped, not cut,
-/// because a cut id or path would name something else.
-fn bounded(s: Option<&str>, max: usize) -> Option<String> {
-    s.map(str::trim)
-        .filter(|s| !s.is_empty() && s.len() <= max)
-        .map(str::to_owned)
-}
-
-/// A title-like value: whitespace collapsed, cut to [`MAX_TITLE_CHARS`].
-fn title_value(s: Option<&str>) -> Option<String> {
-    s.map(|s| title(s, MAX_TITLE_CHARS))
-        .filter(|s| !s.is_empty())
-}
-
-/// A call id, cut the same way on both the call and the result so they still pair.
-fn call_id(s: &str) -> String {
-    truncate_chars(s, MAX_ID_BYTES)
 }
 
 fn facts(rec: &Map<String, Value>) -> RecordFacts {
@@ -377,32 +339,6 @@ fn target(tool: &str, input: &Value) -> String {
     first_line(found.unwrap_or(""), MAX_TARGET_CHARS)
 }
 
-/// The tool input with long strings cut; an input still too large becomes a preview.
-fn bounded_input(input: &Value) -> Value {
-    fn shorten(v: &Value, depth: usize) -> Value {
-        match v {
-            Value::String(s) => Value::String(truncate_chars(s, MAX_INPUT_STRING_CHARS)),
-            _ if depth > 16 => Value::String("…".into()),
-            Value::Array(a) => {
-                Value::Array(a.iter().take(200).map(|x| shorten(x, depth + 1)).collect())
-            }
-            Value::Object(o) => Value::Object(
-                o.iter()
-                    .map(|(k, x)| (k.clone(), shorten(x, depth + 1)))
-                    .collect(),
-            ),
-            other => other.clone(),
-        }
-    }
-    let short = shorten(input, 0);
-    let json = serde_json::to_string(&short).unwrap_or_default();
-    if json.len() <= MAX_INPUT_JSON_BYTES {
-        short
-    } else {
-        json!({ "truncated": true, "preview": truncate_chars(&json, MAX_INPUT_STRING_CHARS) })
-    }
-}
-
 fn plan(input: &Value) -> Option<Vec<PlanItem>> {
     let todos = input.get("todos")?.as_array()?;
     Some(
@@ -410,13 +346,7 @@ fn plan(input: &Value) -> Option<Vec<PlanItem>> {
             .iter()
             .filter_map(|t| {
                 let text = t.get("content").and_then(Value::as_str)?;
-                let text = truncate_chars(text, MAX_PLAN_TEXT_CHARS);
-                let status = match t.get("status").and_then(Value::as_str) {
-                    Some("in_progress") => PlanStatus::InProgress,
-                    Some("completed") => PlanStatus::Completed,
-                    _ => PlanStatus::Pending,
-                };
-                Some(PlanItem { text, status })
+                Some(plan_item(text, t.get("status").and_then(Value::as_str)))
             })
             .take(MAX_PLAN_ITEMS)
             .collect(),
@@ -462,7 +392,7 @@ fn file_edit(result: &Value, at: TimestampMs, offset: u64) -> Option<TranscriptI
         MAX_PATH_BYTES,
     );
     let hunks = result.get("structuredPatch").and_then(Value::as_array);
-    let mut diff = Diff::new(&path);
+    let mut diff = Diff::new(&path, &path, MAX_DIFF_BYTES);
     let (mut added, mut removed) = (0u32, 0u32);
 
     match hunks {
@@ -513,41 +443,13 @@ fn file_edit(result: &Value, at: TimestampMs, offset: u64) -> Option<TranscriptI
     })
 }
 
-/// A unified diff capped at [`MAX_DIFF_BYTES`].
-struct Diff {
-    text: String,
-    full: bool,
-}
-
-impl Diff {
-    fn new(path: &str) -> Self {
-        Self {
-            text: format!("--- {path}\n+++ {path}\n"),
-            full: false,
-        }
-    }
-
-    fn push(&mut self, line: &str) {
-        if self.full {
-            return;
-        }
-        if self.text.len() + line.len() + 1 > MAX_DIFF_BYTES {
-            self.text.push_str("… (diff truncated)\n");
-            self.full = true;
-            return;
-        }
-        self.text.push_str(line);
-        self.text.push('\n');
-    }
-
-    fn finish(self) -> String {
-        self.text
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bound::{
+        MAX_INPUT_JSON_BYTES, MAX_INPUT_STRING_CHARS, MAX_PLAN_TEXT_CHARS, MAX_TITLE_CHARS,
+    };
+    use serde_json::json;
 
     fn items(line: &str) -> Vec<TranscriptItem> {
         parse_line(line.as_bytes(), 7).expect("parses").items

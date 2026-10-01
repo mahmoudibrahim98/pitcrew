@@ -5,11 +5,13 @@
 
 mod parse;
 
+pub use crate::jsonl::ReadReport;
 pub use parse::{ClaudeRecord, RecordFacts, parse_line};
 
-use crate::lines::{self, Backward, Line, OwnedLine, Pending, SkipReason, SkippedLine};
-use crate::text::{from_hex, title, to_hex};
-use parse::MAX_TITLE_CHARS;
+use crate::bound::MAX_TITLE_CHARS;
+use crate::jsonl::{self, Format, Skips, read_dir_or_empty, set_first, set_latest};
+use crate::lines::{Backward, SkipReason};
+use crate::text::title;
 use pitcrew_interfaces::source::{
     Cursor, ParseChunk, SessionMeta, SourceAdapter, SourceError, TranscriptItem, TranscriptPage,
     TranscriptRef,
@@ -19,22 +21,10 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 /// Reads Claude Code transcripts. Read-only: files are only ever opened for reading.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ClaudeAdapter;
-
-/// One incremental read, with what the trait's [`ParseChunk`] leaves out.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ReadReport {
-    /// The chunk the trait returns.
-    pub chunk: ParseChunk,
-    /// Lines skipped because they were too long, not UTF-8 or not a JSON object.
-    pub skipped: Vec<SkippedLine>,
-    /// Bytes this read took from the file.
-    pub bytes_read: u64,
-}
 
 impl ClaudeAdapter {
     /// A new adapter.
@@ -49,10 +39,7 @@ impl ClaudeAdapter {
         if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
             return Some(PathBuf::from(dir));
         }
-        std::env::var_os("HOME")
-            .or_else(|| std::env::var_os("USERPROFILE"))
-            .filter(|d| !d.is_empty())
-            .map(|home| PathBuf::from(home).join(".claude"))
+        crate::user_home().map(|home| home.join(".claude"))
     }
 
     /// [`SourceAdapter::read_from`], also returning skipped lines and the bytes read.
@@ -65,77 +52,26 @@ impl ClaudeAdapter {
         transcript: &TranscriptRef,
         cursor: &Cursor,
     ) -> Result<ReadReport, SourceError> {
-        let mut file = File::open(&transcript.path)?;
-        let len = file.metadata()?.len();
-        if cursor.offset > len {
-            return Err(SourceError::Unreadable {
-                path: transcript.path.clone(),
-                reason: format!(
-                    "file is {len} bytes but the cursor is at {}; it was truncated or replaced",
-                    cursor.offset
-                ),
-            });
-        }
+        jsonl::read::<Self>(&transcript.path, cursor)
+    }
+}
 
-        let first_read = cursor.state.is_none();
-        let mut state: ReadState = cursor
-            .state
-            .clone()
-            .and_then(|s| serde_json::from_value(s).ok())
-            .unwrap_or_default();
-        // A carried line that no longer fits the file (or whose length overflows) is dropped and
-        // read again from the cursor.
-        let resume = state
-            .pending
-            .take()
-            .and_then(CarriedLine::into_pending)
-            .filter(|p| {
-                cursor
-                    .offset
-                    .checked_add(p.len)
-                    .is_some_and(|end| end <= len)
-            });
+impl Format for ClaudeAdapter {
+    type Record = ClaudeRecord;
+    type State = ReadState;
 
-        let mut items = Vec::new();
-        let mut skipped = Vec::new();
-        let mut meta_changed = first_read;
-        let fwd =
-            lines::read_forward(
-                &mut file,
-                cursor.offset,
-                resume,
-                |offset, line| match parse_framed(offset, line) {
-                    Ok(rec) => {
-                        meta_changed |= state.meta.absorb(&rec);
-                        push_record(&mut state.last, rec.items, rec.soft_turn_end, &mut items);
-                    }
-                    Err(skip) => skipped.push(skip),
-                },
-            )?;
-        let mut log = SkipLog::default();
-        for skip in &skipped {
-            log.note(&transcript.path, skip);
-        }
-        log.finish(&transcript.path);
+    fn parse(line: &[u8], offset: u64) -> Result<ClaudeRecord, SkipReason> {
+        parse_line(line, offset)
+    }
 
-        state.pending = fwd.pending.map(CarriedLine::from);
-        let meta = meta_changed.then(|| state.meta.to_meta(&transcript.path));
-        let state = serde_json::to_value(&state).map_err(|e| SourceError::Unreadable {
-            path: transcript.path.clone(),
-            reason: format!("cannot encode the cursor: {e}"),
-        })?;
-        Ok(ReadReport {
-            chunk: ParseChunk {
-                cursor: Cursor {
-                    offset: fwd.end,
-                    state: Some(state),
-                },
-                meta,
-                items,
-            },
-            skipped,
-            bytes_read: fwd.bytes_read,
-        })
+    fn absorb(state: &mut ReadState, rec: ClaudeRecord, out: &mut Vec<TranscriptItem>) -> bool {
+        let changed = state.meta.absorb(&rec);
+        push_record(&mut state.last, rec.items, rec.soft_turn_end, out);
+        changed
+    }
+
+    fn meta(state: &ReadState, path: &Path) -> SessionMeta {
+        state.meta.to_meta(path)
     }
 }
 
@@ -198,9 +134,9 @@ impl SourceAdapter for ClaudeAdapter {
         let mut kept = 0usize;
         let mut pos = end;
         let mut exhausted = false;
-        let mut log = SkipLog::default();
+        let mut skips = Skips::default();
         while kept < limit {
-            let Some(rec) = prev_record(&mut back, &mut pos, &transcript.path, &mut log)? else {
+            let Some(rec) = prev_record(&mut back, &mut pos, &transcript.path, &mut skips)? else {
                 exhausted = true;
                 break;
             };
@@ -222,9 +158,9 @@ impl SourceAdapter for ClaudeAdapter {
         let context = if exhausted {
             None
         } else {
-            prev_record(&mut back, &mut pos, &transcript.path, &mut log)?
+            prev_record(&mut back, &mut pos, &transcript.path, &mut skips)?
         };
-        log.finish(&transcript.path);
+        skips.finish(&transcript.path);
         let at_start = context.is_none();
         let mut last = context.map(|rec| rec.last_kind());
 
@@ -245,78 +181,9 @@ impl SourceAdapter for ClaudeAdapter {
     }
 }
 
-fn read_dir_or_empty(dir: &Path) -> io::Result<Option<Vec<PathBuf>>> {
-    match fs::read_dir(dir) {
-        Ok(entries) => Ok(Some(
-            entries.filter_map(|e| e.ok().map(|e| e.path())).collect(),
-        )),
-        Err(e)
-            if matches!(
-                e.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
-            ) =>
-        {
-            Ok(None)
-        }
-        Err(e) => Err(e),
-    }
-}
-
 fn transcript_ref(path: &Path) -> Option<TranscriptRef> {
-    if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-        return None;
-    }
-    let meta = fs::metadata(path).ok().filter(fs::Metadata::is_file)?;
-    let modified = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |d| {
-            TimestampMs::try_from(d.as_millis()).unwrap_or(TimestampMs::MAX)
-        });
-    Some(TranscriptRef {
-        engine: Engine::Claude,
-        path: path.to_path_buf(),
-        inner_id: None,
-        size: meta.len(),
-        modified,
-    })
-}
-
-fn parse_framed(offset: u64, line: Line<'_>) -> Result<ClaudeRecord, SkippedLine> {
-    match line {
-        Line::TooLong(len) => Err(SkippedLine {
-            offset,
-            len,
-            reason: SkipReason::TooLong,
-        }),
-        Line::Data(bytes) => parse_line(bytes, offset).map_err(|reason| SkippedLine {
-            offset,
-            len: bytes.len() as u64,
-            reason,
-        }),
-    }
-}
-
-/// Skipped lines for one call: one warning with the count, details at debug level.
-#[derive(Debug, Default)]
-struct SkipLog {
-    count: usize,
-    first: Option<u64>,
-}
-
-impl SkipLog {
-    fn note(&mut self, path: &Path, skip: &SkippedLine) {
-        self.count += 1;
-        self.first.get_or_insert(skip.offset);
-        tracing::debug!(path = %path.display(), offset = skip.offset, len = skip.len, reason = ?skip.reason, "skipped transcript line");
-    }
-
-    fn finish(&self, path: &Path) {
-        if let Some(first) = self.first {
-            tracing::warn!(path = %path.display(), count = self.count, first_offset = first, "skipped transcript lines");
-        }
-    }
+    let meta = fs::metadata(path).ok()?;
+    jsonl::transcript_ref(Engine::Claude, path, &meta)
 }
 
 /// A record held while building a page: just what the page needs.
@@ -342,24 +209,16 @@ fn prev_record<F: io::Read + io::Seek>(
     back: &mut Backward<'_, F>,
     pos: &mut u64,
     path: &Path,
-    log: &mut SkipLog,
+    skips: &mut Skips,
 ) -> io::Result<Option<PageRecord>> {
-    while let Some((start, line)) = back.prev_line(*pos)? {
-        *pos = start;
-        let parsed = match &line {
-            OwnedLine::Data(bytes) => parse_framed(start, Line::Data(bytes)),
-            OwnedLine::TooLong(len) => parse_framed(start, Line::TooLong(*len)),
-        };
-        match parsed {
-            Ok(rec) if !rec.items.is_empty() => {
-                return Ok(Some(PageRecord {
-                    offset: start,
-                    items: rec.items,
-                    soft: rec.soft_turn_end,
-                }));
-            }
-            Ok(_) => {}
-            Err(skip) => log.note(path, &skip),
+    while let Some((offset, rec)) = jsonl::prev_parsed::<ClaudeAdapter, _>(back, pos, path, skips)?
+    {
+        if !rec.items.is_empty() {
+            return Ok(Some(PageRecord {
+                offset,
+                items: rec.items,
+                soft: rec.soft_turn_end,
+            }));
         }
     }
     Ok(None)
@@ -403,49 +262,13 @@ fn push_record(
     *last = Some(kind);
 }
 
-/// What the cursor carries between reads.
+/// What the cursor carries between reads, besides a partial line.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct ReadState {
+pub(crate) struct ReadState {
     #[serde(default)]
     meta: MetaAcc,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last: Option<LastKind>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pending: Option<CarriedLine>,
-}
-
-/// An incomplete last line: its bytes (hex) when small, or a note that it is too long.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct CarriedLine {
-    len: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    hex: Option<String>,
-    #[serde(default)]
-    too_long: bool,
-}
-
-impl CarriedLine {
-    fn into_pending(self) -> Option<Pending> {
-        let bytes = match self.hex {
-            Some(hex) => Some(from_hex(&hex)?),
-            None => None,
-        };
-        Some(Pending {
-            len: self.len,
-            bytes,
-            too_long: self.too_long,
-        })
-    }
-}
-
-impl From<Pending> for CarriedLine {
-    fn from(p: Pending) -> Self {
-        Self {
-            len: p.len,
-            hex: p.bytes.as_deref().map(to_hex),
-            too_long: p.too_long,
-        }
-    }
 }
 
 /// Session facts gathered so far.
@@ -467,36 +290,16 @@ impl MetaAcc {
     /// Folds in one record; returns whether anything changed. The session id, agent id, cwd,
     /// start time and sidechain flag are the first seen; branch, model and titles the latest.
     fn absorb(&mut self, rec: &ClaudeRecord) -> bool {
-        /// Sets an empty slot; returns whether it changed.
-        fn first<T: Clone>(slot: &mut Option<T>, v: Option<&T>) -> bool {
-            match (slot.is_none(), v) {
-                (true, Some(v)) => {
-                    *slot = Some(v.clone());
-                    true
-                }
-                _ => false,
-            }
-        }
-        /// Replaces the slot with a new, different value; returns whether it changed.
-        fn latest<T: Clone + PartialEq>(slot: &mut Option<T>, v: Option<&T>) -> bool {
-            match v {
-                Some(v) if slot.as_ref() != Some(v) => {
-                    *slot = Some(v.clone());
-                    true
-                }
-                _ => false,
-            }
-        }
         let f = &rec.facts;
-        let mut changed = first(&mut self.session_id, f.session_id.as_ref());
-        changed |= first(&mut self.agent_id, f.agent_id.as_ref());
-        changed |= first(&mut self.cwd, f.cwd.as_ref());
-        changed |= first(&mut self.started, f.timestamp.as_ref());
-        changed |= first(&mut self.sidechain, f.is_sidechain.as_ref());
-        changed |= latest(&mut self.branch, f.branch.as_ref());
-        changed |= latest(&mut self.model, f.model.as_ref());
-        changed |= latest(&mut self.custom_title, f.custom_title.as_ref());
-        changed |= latest(&mut self.summary, f.summary.as_ref());
+        let mut changed = set_first(&mut self.session_id, f.session_id.as_ref());
+        changed |= set_first(&mut self.agent_id, f.agent_id.as_ref());
+        changed |= set_first(&mut self.cwd, f.cwd.as_ref());
+        changed |= set_first(&mut self.started, f.timestamp.as_ref());
+        changed |= set_first(&mut self.sidechain, f.is_sidechain.as_ref());
+        changed |= set_latest(&mut self.branch, f.branch.as_ref());
+        changed |= set_latest(&mut self.model, f.model.as_ref());
+        changed |= set_latest(&mut self.custom_title, f.custom_title.as_ref());
+        changed |= set_latest(&mut self.summary, f.summary.as_ref());
         if self.first_prompt.is_none() {
             self.first_prompt = rec.items.iter().find_map(|item| match item {
                 TranscriptItem::UserPrompt { text, .. } => Some(title(text, MAX_TITLE_CHARS)),

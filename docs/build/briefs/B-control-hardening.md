@@ -48,7 +48,7 @@ copy mode, and untrusted pane content.
    - Strip one trailing `\r` on marker and notification lines. This is safe because tmux escapes
      a real CR inside `%output` as `\015`. It covers a transport through a pty (`ssh -t`).
    - `finish()` reports an unfinished reply and a partial line at EOF.
-   - `%exit` arriving inside an open reply ends the reply and is reported.
+   - ~~`%exit` arriving inside an open reply ends the reply and is reported.~~ **Corrected after review:** inside an open reply, `%exit` is body text; otherwise pane content can forge notifications. A server that dies mid-reply is caught by EOF and `finish()`.
 5. **Pane content can forge the end of a reply.** `capture-pane -p` writes raw pane text into a
    reply, so a program can print `%end <time> <n> <flags>` and then fake notifications.
    - Compare `flags` too when closing a reply.

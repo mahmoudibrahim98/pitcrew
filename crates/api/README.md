@@ -34,13 +34,82 @@ planted by another user never receives a token:
 - Failures are `ApiError` bodies: `401 unauthorized` (none, unknown, revoked, or not `Bearer`),
   `403 forbidden` (agent on a device route), `404 not_found` (unknown route or method).
 
+## Live updates: `GET /v1/stream?since=`
+
+`stream::routes(source, StreamConfig::default())`, mounted as a **device** route.
+
+- The source is an `EventSource`: `StoreSource::new(store, log_id)` for the hub's store, or
+  `MemorySource` for tests and development. `StoreSource` takes the log id from the caller until
+  `Store::log_id()` lands (brief C-projections).
+- First frame `hello {rev, log}`; if `since < rev`, the missed events in `events` frames of at
+  most 500; then live batches, coalesced over 75 ms; `ping` every 20 s.
+- Exact resume: the pump subscribes before reading `rev`, always reads from the last revision it
+  sent, and skips announced ranges it already covered. A lagged subscription re-reads the latest
+  revision and catches up.
+- Backpressure: each client has a queue of `queue_frames` frames (default 64). A frame that
+  cannot be queued within `send_timeout` (default 10 s) disconnects the client, which resumes
+  with `since`.
+
+## Hooks: `POST /v1/hooks/{engine}/{event}`
+
+`hooks::routes(HookIntake::start(sink, capacity)?)`, mounted as an **agent** route.
+
+- `engine` must be an `Engine` (`claude`, `codex`, `opencode`); `event` must match
+  `[A-Za-z][A-Za-z0-9_-]{0,63}`; the body must be a JSON object of at most 1 MiB. Anything else
+  is `400 invalid`.
+- The route answers `202` at once and queues a `HookEvent` (with the `Caller`) for the
+  `HookSink`. When the queue is full the event is dropped and counted (`HookIntake::dropped`).
+- `LogHookSink` only logs; the runner (stream D) provides the real sink. `deliver` runs on its
+  own thread and may block (e.g. on SQLite); a panic in it is logged and the next event is
+  delivered.
+
+## Terminals: `GET /v1/sessions/{id}/terminal?cols=&rows=&from=`
+
+`terminal::routes(terminals, TerminalConfig::default())`, mounted as a **device** route.
+
+- `Terminals` finds a session's terminal; `RuntimeTerminals::new(runtime)` implements it over
+  any `Runtime`, with `link(session, terminal)` until the runner provides the mapping. Unknown
+  sessions are `404`; an unreachable runtime is `503`.
+- Output is binary frames of at most 64 KiB from `from` (default 0). If the buffer lost `from`,
+  `{"type":"truncated","from":N}` comes first. A client counts the bytes it received and
+  reconnects with `from=<that offset>`; nothing is lost or repeated.
+- Client binary frames are keystrokes; `{"type":"resize","cols","rows"}` resizes; other types
+  are ignored; malformed control JSON closes with 1007. When the program exits, the rest of the
+  output, then `{"type":"exit"}`, then close 1000.
+- A client that stops reading is closed with 1013 and resumes by offset. Several clients may
+  attach; each gets the output, and their keystrokes interleave in arrival order.
+
+## Activity: `GET /v1/events?before=&limit=&task=&session=`
+
+`activity::routes(source)`, mounted as a **device** route, on the same `EventSource` as the
+stream.
+
+- Oldest first within a page, the newest page without `before` (exclusive); `limit` defaults to
+  100, max 500.
+- `session` and `task` match events whose body names the id, found by scanning back at most
+  10,000 events per request. A page that ran out of budget may be short or empty, with
+  `at_start` false and `from_rev` where the scan stopped.
+- `project` and `workstream` answer `400 invalid` until the hub has a project index.
+
+## Features
+
+`store` (default) provides `StoreSource` and pulls in `pitcrew-store` (SQLite). Crates that
+only need `pitcrew_api::client` can use `default-features = false`.
+
 ## For the composition root
 
 ```rust
 let tokens: Arc<dyn TokenStore> = Arc::new(FileTokenStore::open(&state_dir)?);
 let info = pitcrew_api::local_host_info(env!("CARGO_PKG_VERSION"), vec![HostRole::Hub, HostRole::Runner], caps);
+let source: Arc<dyn EventSource> = Arc::new(StoreSource::new(store.clone(), log_id));
+let hooks = HookIntake::start(Arc::new(LogHookSink), 1024)?;
+let terminals = Arc::new(RuntimeTerminals::new(runtime.clone())); // the runner links sessions
 let parts = RouterParts::new()
+    .agent(pitcrew_api::hooks::routes(hooks))
     .agent(hub_work::agent_routes())    // routes marked **agent** in api-v1.md
+    .device(pitcrew_api::stream::routes(source.clone(), StreamConfig::default()))
+    .device(pitcrew_api::activity::routes(source))
+    .device(pitcrew_api::terminal::routes(terminals, TerminalConfig::default()))
     .device(hub_work::device_routes()); // everything else
 pitcrew_api::serve(&Listen::private_default(run_dir)?, info, tokens, parts, shutdown).await?;
 ```

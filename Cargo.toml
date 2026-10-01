@@ -4,7 +4,9 @@
 
 [workspace]
 resolver = "3"
-members = ["crates/*", "apps/desktop/src-tauri"]
+members = ["crates/*", "apps/desktop/src-tauri", "benches"]
+# fuzz/ is its own cargo-fuzz workspace (nightly toolchain).
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.0.0"
@@ -79,3 +81,7 @@ unwrap_used = "warn"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# Bundled SQLite compiled at -O0 makes store tests slow; optimise just that C code in dev builds.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3

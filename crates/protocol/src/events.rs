@@ -13,8 +13,9 @@ use crate::ids::{
     AskId, DispatchId, EventId, MachineId, MemberId, SessionId, TaskId, WorkspaceId, WorkstreamId,
 };
 use crate::model::{
-    Answer, Ask, Dispatch, DispatchOutcome, Health, LinkBasis, Liveness, Mover, Project, Receipt,
-    Session, SessionState, Subtask, Task, TaskStatus, TimestampMs, Workstream, WorkstreamStatus,
+    Answer, Ask, Dispatch, DispatchOutcome, Health, LinkBasis, Liveness, Machine, Member, Mover,
+    Persona, Project, Receipt, Session, SessionState, Subtask, Task, TaskPatch, TaskStatus, Team,
+    TimestampMs, Workstream, WorkstreamStatus,
 };
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +62,28 @@ impl Event {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum EventBody {
+    // Workspace membership: written by the hub.
+    /// A machine was added to the workspace, or its details changed.
+    MachineAdded {
+        /// The machine.
+        machine: Machine,
+    },
+    /// A member (a person or an agent) joined the workspace, or their details changed.
+    MemberAdded {
+        /// The member.
+        member: Member,
+    },
+    /// A persona was created or changed.
+    PersonaSaved {
+        /// The persona.
+        persona: Persona,
+    },
+    /// A team was created or changed.
+    TeamSaved {
+        /// The team.
+        team: Team,
+    },
+
     // Machines and sessions: written by runners.
     /// A machine became reachable, unreachable or stopped.
     MachineLiveness {
@@ -118,6 +141,20 @@ pub enum EventBody {
         added: u32,
         /// Lines removed.
         removed: u32,
+        /// Where the edit is in the transcript.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receipt: Option<Receipt>,
+    },
+    /// A session's facts changed after it was discovered, e.g. a custom title set later.
+    SessionUpdated {
+        /// The session.
+        session: SessionId,
+        /// New title, if it changed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        /// New git branch, if it changed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        branch: Option<String>,
     },
     /// A session was linked to a workstream or task.
     SessionLinked {
@@ -182,6 +219,14 @@ pub enum EventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         assignee: Option<MemberId>,
     },
+    /// A task's title, description, priority, labels, dates, dependencies, workstream or
+    /// acceptance policy changed (`PATCH /v1/tasks/{id-or-key}`).
+    TaskUpdated {
+        /// The task.
+        task: TaskId,
+        /// Only the fields that changed, with their new values.
+        patch: TaskPatch,
+    },
     /// A task's subtasks were replaced, for example from an agent's updated plan.
     SubtasksReplaced {
         /// The task.
@@ -242,17 +287,31 @@ pub enum EventBody {
         target: BriefTarget,
         /// Proposed text.
         text: String,
+        /// Proposed next step, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next: Option<String>,
         /// Evidence for every claim.
         receipts: Vec<Receipt>,
     },
     /// A brief was accepted, applied automatically or edited.
+    ///
+    /// When a person accepts the pending proposal unchanged (the newest `brief_proposed` for the
+    /// target, newer than the brief in force, with the same text and next step), the hub copies
+    /// the proposal's receipts here, and the brief's source is the back office, as it is when the
+    /// back office applies a brief itself. See `docs/build/contracts/api-v1.md`.
     BriefAccepted {
         /// Which brief.
         target: BriefTarget,
         /// The text now in force.
         text: String,
+        /// The next step now in force, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next: Option<String>,
         /// Whether a person pinned it. Pinned briefs only get proposals.
         pinned: bool,
+        /// Evidence, copied from the proposal it accepts; empty for a person's own text.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        receipts: Vec<Receipt>,
     },
     /// A decision was recorded.
     DecisionRecorded {
