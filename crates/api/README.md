@@ -22,9 +22,12 @@ planted by another user never receives a token:
 - Unix: `check_unix_socket(dir)` before connecting (directory ours and 0700, socket ours), and
   `check_unix_peer(&stream)` after (the server runs as us).
 - Windows: `check_pipe_server(&client)` after connecting (the pipe is owned by the current
-  user). The daemon names the user as its pipe's owner; another user cannot create a pipe owned
-  by us, and unlike a server process id, the owner cannot be recycled. Residual: an
-  administrator (or anyone with the restore privilege) can plant a pipe that passes.
+  user, or by our token's default owner). The daemon names the user as its pipe's owner; another
+  user cannot create a pipe owned by us, and unlike a server process id, the owner cannot be
+  recycled. The token's default owner is accepted so that a pipe created without naming an
+  owner (a test server) passes: unelevated it is the user itself; elevated it is typically the
+  Administrators group. Residual, unchanged by that: an elevated administrator (or anyone with
+  the restore privilege) can plant a pipe that passes.
 
 ## Auth
 

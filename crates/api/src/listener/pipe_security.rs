@@ -1,5 +1,6 @@
 //! Windows security for the named pipe: a descriptor that makes the current user the pipe's owner
-//! and its only grantee, and the client-side check that a pipe is owned by the current user.
+//! and its only grantee, and what the client-side check reads: a pipe's owner, the current user,
+//! and the owner our own token gives the objects it creates.
 //!
 //! This is the crate's only `unsafe` code. It calls Win32 functions and hands the descriptor to
 //! tokio's `create_with_security_attributes_raw`.
@@ -7,9 +8,9 @@
 //! Soundness:
 //! - Every out-pointer passed to Win32 points at a live local of the right type, and every buffer
 //!   is passed with its true length.
-//! - The `TOKEN_USER` read comes from a buffer that `GetTokenInformation` filled and that is
-//!   aligned for it (`u64` storage). The SID it points into lives inside that buffer, which
-//!   outlives its use.
+//! - The `TOKEN_USER` or `TOKEN_OWNER` read comes from a buffer that `GetTokenInformation` filled
+//!   with that very class and that is aligned for it (`u64` storage). The SID it points into lives
+//!   inside that buffer, which outlives its use.
 //! - The owner SID `GetSecurityInfo` returns points into the descriptor it allocates; that
 //!   descriptor is freed only after the SID's last use.
 //! - Memory Win32 allocates with `LocalAlloc` (strings, descriptors) is freed exactly once with
@@ -34,7 +35,7 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     GetTokenInformation, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    SECURITY_ATTRIBUTES, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -125,8 +126,14 @@ impl Drop for OwnedHandle {
 
 /// The current user's SID as a string, e.g. `S-1-5-21-…`.
 pub(crate) fn current_user_sid() -> io::Result<String> {
-    // SAFETY: `GetCurrentProcess` returns a pseudo-handle that needs no closing.
-    process_user_sid(unsafe { GetCurrentProcess() })
+    own_token_sid(TokenSid::User)
+}
+
+/// The owner our process token gives the objects it creates without naming one (`TokenOwner`),
+/// as a string. Unelevated, that is the user itself; elevated, typically the Administrators group
+/// (`S-1-5-32-544`), unless policy makes it the user.
+pub(crate) fn default_owner_sid() -> io::Result<String> {
+    own_token_sid(TokenSid::DefaultOwner)
 }
 
 /// The SID of a kernel object's owner, such as a pipe's (read through any handle to it opened
@@ -183,11 +190,25 @@ pub(crate) fn owner_sid(object: &impl AsHandle) -> io::Result<String> {
     Ok(unsafe { take_local_string(wide) })
 }
 
-/// The SID of the user a process runs as.
-fn process_user_sid(process: HANDLE) -> io::Result<String> {
+/// A SID our own process token holds.
+#[derive(Clone, Copy, Debug)]
+enum TokenSid {
+    /// The user the process runs as (`TokenUser`).
+    User,
+    /// The default owner of the objects it creates (`TokenOwner`).
+    DefaultOwner,
+}
+
+/// Reads one SID from our own process token, as a string.
+fn own_token_sid(which: TokenSid) -> io::Result<String> {
+    let class = match which {
+        TokenSid::User => TokenUser,
+        TokenSid::DefaultOwner => TokenOwner,
+    };
     let mut token: HANDLE = ptr::null_mut();
-    // SAFETY: `process` is a live process handle; `token` is a valid out-pointer.
-    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle that is always valid and needs no
+    // closing; `token` is a valid out-pointer.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(io::Error::last_os_error());
     }
     let token = OwnedHandle(token);
@@ -195,16 +216,17 @@ fn process_user_sid(process: HANDLE) -> io::Result<String> {
     let mut len = 0u32;
     // SAFETY: a size query: null buffer, zero length, valid length out-pointer. It fails with
     // ERROR_INSUFFICIENT_BUFFER and sets `len`.
-    unsafe { GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut len) };
+    unsafe { GetTokenInformation(token.0, class, ptr::null_mut(), 0, &mut len) };
     if len == 0 {
         return Err(io::Error::last_os_error());
     }
     let mut buffer = vec![0u64; (len as usize).div_ceil(size_of::<u64>())];
-    // SAFETY: `buffer` holds at least `len` bytes and is aligned for `TOKEN_USER`.
+    // SAFETY: `buffer` holds at least `len` bytes and is aligned for `TOKEN_USER` and
+    // `TOKEN_OWNER` (both hold pointers).
     let ok = unsafe {
         GetTokenInformation(
             token.0,
-            TokenUser,
+            class,
             buffer.as_mut_ptr().cast::<c_void>(),
             len,
             &mut len,
@@ -213,12 +235,22 @@ fn process_user_sid(process: HANDLE) -> io::Result<String> {
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: filled by the call above with a `TOKEN_USER`.
-    let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+    let sid: PSID = match which {
+        // SAFETY: filled by the call above with a `TokenUser` class, i.e. a `TOKEN_USER`.
+        TokenSid::User => unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid },
+        // SAFETY: filled by the call above with a `TokenOwner` class, i.e. a `TOKEN_OWNER`.
+        TokenSid::DefaultOwner => unsafe { (*buffer.as_ptr().cast::<TOKEN_OWNER>()).Owner },
+    };
+    if sid.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("the process token has no {which:?} SID"),
+        ));
+    }
 
     let mut wide: *mut u16 = ptr::null_mut();
-    // SAFETY: the SID points into `buffer`, which is alive; `wide` is a valid out-pointer.
-    if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut wide) } == 0 || wide.is_null() {
+    // SAFETY: `sid` points into `buffer`, which is alive; `wide` is a valid out-pointer.
+    if unsafe { ConvertSidToStringSidW(sid, &mut wide) } == 0 || wide.is_null() {
         return Err(io::Error::last_os_error());
     }
     // SAFETY: `wide` is a NUL-terminated string from `LocalAlloc`, freed once here.
@@ -291,4 +323,33 @@ pub(crate) fn dacl_sddl(object: &impl AsHandle) -> io::Result<String> {
     }
     // SAFETY: a NUL-terminated `LocalAlloc` string from the call above.
     Ok(unsafe { take_local_string(wide) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    /// A pipe created without a descriptor is owned by the token's default owner, which is what
+    /// `default_owner_sid` reads, and a client of the same token accepts it, elevated or not
+    /// (unelevated the owner is the user; elevated, typically Administrators). This is how a test
+    /// server that creates its pipe the plain way passes `check_pipe_server`.
+    #[tokio::test]
+    async fn a_pipe_with_default_security_has_the_token_owner_and_passes() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!(r"\\.\pipe\pitcrew-owner-{}-{nanos}", std::process::id());
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(&name)
+            .unwrap();
+        let default_owner = default_owner_sid().unwrap();
+        assert!(default_owner.starts_with("S-1-"), "{default_owner}");
+        assert_eq!(owner_sid(&server).unwrap(), default_owner);
+        let client = ClientOptions::new().open(&name).unwrap();
+        assert_eq!(owner_sid(&client).unwrap(), default_owner);
+        crate::client::check_pipe_server(&client).unwrap();
+    }
 }
