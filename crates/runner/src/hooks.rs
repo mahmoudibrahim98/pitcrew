@@ -45,7 +45,7 @@ use std::sync::Arc;
 /// [`SessionAgents`] tells it:
 /// - **an agent token** (`scope` agent): only a session whose agent is the token's member;
 /// - **a device token** (a person): only a session with no agent, or whose agent that person
-///   owns;
+///   owns (an agent without an owner: no person);
 /// - anything else, and any session whose agent is [unknown](SessionAgent::Unknown) (no
 ///   [`SessionAgents`] configured, a failed or panicking lookup), is refused: dropped and logged
 ///   at debug with the reason, never applied and never held.
@@ -92,6 +92,15 @@ impl Sender {
     pub(crate) fn member(&self) -> MemberId {
         self.0.member
     }
+
+    /// A total order on senders, for choices that must not depend on a map's order.
+    pub(crate) fn order(&self) -> (MemberId, u8, Option<MemberId>) {
+        let scope = match self.0.scope {
+            TokenScope::Device => 0,
+            TokenScope::Agent => 1,
+        };
+        (self.0.member, scope, self.0.on_behalf_of)
+    }
 }
 
 /// Why `sender` may not change a session run as `agent`; `None` if it may. The rule is on
@@ -108,9 +117,15 @@ pub(crate) fn refusal(sender: &Sender, agent: &SessionAgent) -> Option<&'static 
             Some("an agent's hook for a session without an agent")
         }
         (TokenScope::Device, SessionAgent::NoAgent) => None,
-        (TokenScope::Device, SessionAgent::Agent { owner, .. }) => {
-            (*owner != caller.member).then_some("the session's agent is another person's")
+        (TokenScope::Device, SessionAgent::Agent { owner: None, .. }) => {
+            Some("the session's agent has no owner")
         }
+        (
+            TokenScope::Device,
+            SessionAgent::Agent {
+                owner: Some(owner), ..
+            },
+        ) => (*owner != caller.member).then_some("the session's agent is another person's"),
     }
 }
 
@@ -295,11 +310,11 @@ mod tests {
         };
         let persons_agent = Agent {
             agent,
-            owner: person,
+            owner: Some(person),
         };
         let others_agent = Agent {
             agent: other_agent,
-            owner: other_person,
+            owner: Some(other_person),
         };
         let allowed = |s: Sender, a: SessionAgent| refusal(&s, &a).is_none();
 
@@ -324,12 +339,22 @@ mod tests {
             device(person),
             Agent {
                 agent: person,
-                owner: other_person
+                owner: Some(other_person)
             }
         ));
         assert_eq!(
             refusal(&device(other_person), &persons_agent),
             Some("the session's agent is another person's")
+        );
+        // An agent without an owner: its own hooks apply, nobody else's, not even a person's.
+        let ownerless = Agent { agent, owner: None };
+        assert!(allowed(agent_token(agent, person), ownerless));
+        assert!(!allowed(agent_token(other_agent, person), ownerless));
+        assert!(!allowed(device(person), ownerless));
+        assert!(!allowed(device(agent), ownerless));
+        assert_eq!(
+            refusal(&device(person), &ownerless),
+            Some("the session's agent has no owner")
         );
     }
 

@@ -17,6 +17,7 @@ reports it:
 - **Agent token** (`scope` agent): only a session whose agent is the token's member. Its
   `on_behalf_of` (the owner) widens nothing: a sibling agent of the same owner is refused.
 - **Device token** (a person): only a session with no agent, or whose agent that person owns.
+  An agent the hub records without an owner is changed by its own hooks only, never a person's.
 - **Anything else is refused**: dropped and logged at debug with the reason; never applied and
   never held. A session whose agent is `Unknown` is refused for everyone. Without
   `RunnerConfig::with_agents` every agent is unknown, so every hook is refused.
@@ -32,10 +33,15 @@ The sender travels from `HookSink::deliver` to where the session is resolved as 
 
 ### Floods
 
+- A hook whose session id is not a plain id (at most 128 bytes of letters, digits, `.`, `_` and
+  `-`, starting with a letter or digit) is dropped; a status line is cut to its first line and
+  120 characters. Each held or queued hook is therefore small.
 - Each sender (member) holds at most 32 hooks; at its quota it loses its own oldest.
-- Past 1024 held hooks in all, the sender holding the most loses its oldest.
+- Past 1024 held hooks in all, the sender holding the most loses its oldest (ties: the highest
+  member id).
 - Held hooks expire after 10 minutes.
-- A new held hook looks for its transcript at once, at most once every 5 seconds per sender.
+- A new held hook looks for its transcript at once, at most once every 5 seconds per sender, and
+  only in local homes: network homes keep their own, rarer schedule.
 - Reported states waiting for the watcher (at most 1024) are dropped the same way: the sender
   with the most waiting loses its oldest.
 
@@ -45,10 +51,16 @@ So a flood from one token costs that token, not another sender's held `SessionEn
 
 The host implements it over the hub's sessions and members. `MemoryAgents` is for tests, or for
 a host that fills it as the hub's sessions change; a session it was not told about has no agent.
+Such a host must fill it synchronously with the hub's writes: a dispatch's session must be in it
+before the dispatch's CLI starts.
 
-- `Agent { agent, owner }` for a session stored with an agent; `NoAgent` for one stored without,
-  or not stored at all; `Unknown` whenever in doubt (a failed lookup, an agent whose member or
-  owner cannot be read).
+- `Agent { agent, owner }` for a session stored with an agent (`owner` is `None` if the hub has
+  none for it); `NoAgent` for one stored without, or not stored at all; `Unknown` whenever in
+  doubt (a failed lookup, an agent whose member cannot be read).
+- A sub-agent session (one with a `parent`) runs as its parent: answer the parent's agent. The
+  runner states sub-agent sessions without an agent of their own; once it adopts dispatch ids
+  (below), a dispatched agent's sub-agents must resolve to that agent, or its hooks from them are
+  refused and any person's apply.
 - It must see the hub's **latest** session writes. A stale cache answering `NoAgent` for a
   session that has since gained an agent would let any person's hook change it.
 - It must **not call back into the runner** (its handle, hooks, terminals or commands): the
@@ -72,3 +84,5 @@ a host that fills it as the hub's sessions change; a session it was not told abo
   discovery can take the id from it instead of minting one. Its re-statements must keep naming no
   agent, which the hub reads as "keep the one you have". The rule then holds as intended: the hub
   knows the agent before the first hook.
+- **Sub-agents** keep runner-minted ids even then (the dispatch names only the main session),
+  with `parent` set to it. `SessionAgents` must resolve them to their parent's agent (see above).

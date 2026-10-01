@@ -149,21 +149,29 @@ impl Held {
         self.counts.get(&member).copied().unwrap_or(0)
     }
 
-    /// The member holding the most entries.
+    /// The member holding the most entries; of those tied, the highest member id, so the choice
+    /// never depends on the map's order.
     fn most_holding(&self) -> Option<MemberId> {
         self.counts
             .iter()
-            .max_by_key(|(_, n)| **n)
+            .max_by_key(|(member, n)| (**n, **member))
             .map(|(member, _)| *member)
     }
 
+    /// Drops `member`'s oldest entry; of those held at the same instant, the one for the lowest
+    /// session id (then engine, then token).
     fn evict_oldest_of(&mut self, member: MemberId) {
         let oldest = self
             .sessions
             .iter()
             .flat_map(|(key, s)| s.iter().map(move |(sender, e)| (key, sender, e.since)))
             .filter(|(_, sender, _)| sender.member() == member)
-            .min_by_key(|(_, _, since)| *since)
+            .min_by(|(ka, sa, ta), (kb, sb, tb)| {
+                ta.cmp(tb)
+                    .then_with(|| ka.1.cmp(&kb.1))
+                    .then_with(|| format!("{:?}", ka.0).cmp(&format!("{:?}", kb.0)))
+                    .then_with(|| sa.order().cmp(&sb.order()))
+            })
             .map(|(key, sender, _)| (key.clone(), *sender));
         if let Some((key, sender)) = oldest {
             tracing::debug!(%member, engine = ?key.0, session = %key.1, "too many held hooks; dropped this sender's oldest");
@@ -252,6 +260,48 @@ mod tests {
 
     fn states(got: &[(Sender, Reported)]) -> Vec<SessionState> {
         got.iter().map(|(_, r)| r.to).collect()
+    }
+
+    /// A person whose member id sorts by `n`.
+    fn numbered(n: u128) -> Sender {
+        Sender::new(Caller {
+            member: MemberId(ulid::Ulid::from_parts(1, n)),
+            scope: TokenScope::Device,
+            on_behalf_of: None,
+        })
+    }
+
+    #[test]
+    fn ties_are_broken_by_id_not_by_map_order() {
+        let t0 = Instant::now();
+        // Many times over, so a choice that followed the maps' order would show.
+        for _ in 0..20 {
+            let mut held = Held::new(limits(4, 4));
+            let (low, high, newcomer) = (numbered(1), numbered(2), numbered(3));
+            for (s, id) in [(low, "l0"), (high, "h0"), (low, "l1"), (high, "h1")] {
+                held.hold(
+                    Engine::Claude,
+                    id.into(),
+                    s,
+                    report(1, SessionState::Idle),
+                    t0,
+                );
+            }
+            // Full, and tied at two each: the higher member id loses its oldest. Its two were
+            // held at the same instant: the lower session id goes.
+            held.hold(
+                Engine::Claude,
+                "n".into(),
+                newcomer,
+                report(1, SessionState::Idle),
+                t0,
+            );
+            let left: Vec<&str> = ["l0", "l1", "h0", "h1", "n"]
+                .into_iter()
+                .filter(|id| !held.take(Engine::Claude, id, t0).is_empty())
+                .collect();
+            assert_eq!(left, ["l0", "l1", "h1", "n"]);
+        }
     }
 
     #[test]

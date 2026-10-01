@@ -16,8 +16,9 @@ pub enum SessionAgent {
     Agent {
         /// The agent member.
         agent: MemberId,
-        /// The person who owns it.
-        owner: MemberId,
+        /// The person who owns it; `None` if the hub records the agent without an owner. Then
+        /// only the agent's own hooks change its sessions, and no person's.
+        owner: Option<MemberId>,
     },
     /// Not known. The runner refuses every hook for the session.
     #[default]
@@ -30,13 +31,18 @@ pub enum SessionAgent {
 ///
 /// # What to answer
 ///
-/// - [`SessionAgent::Agent`] for a session the hub stored with an agent, naming the agent's owner.
+/// - [`SessionAgent::Agent`] for a session the hub stored with an agent, naming the agent's owner
+///   (or none, if the hub has none for it).
 /// - [`SessionAgent::NoAgent`] for a session the hub stored without one, **or has not stored at
 ///   all**. The runner states every session it discovers without an agent, and the hub keeps an
 ///   agent it already had when a session is stated again; a dispatch stores its session, agent
 ///   named, before its CLI starts. So a session the hub has not stored cannot have an agent yet.
-/// - [`SessionAgent::Unknown`] whenever in doubt: the lookup failed, the agent's member or its
-///   owner cannot be read, or anything else is unclear. The runner refuses the hook.
+/// - [`SessionAgent::Unknown`] whenever in doubt: the lookup failed, the agent's member cannot
+///   be read, or anything else is unclear. The runner refuses the hook.
+/// - **A sub-agent session** (one with a `parent`) runs as its parent: answer the parent's agent.
+///   The runner states sub-agent sessions without an agent of their own, so answering only the
+///   session's own field would refuse the dispatched agent's hooks from its sub-agents and let
+///   any person's through.
 ///
 /// # Rules for implementations
 ///
@@ -63,6 +69,9 @@ pub trait SessionAgents: Send + Sync + fmt::Debug {
 /// [`SessionAgents`] in memory: **for tests, or for a host that fills it** from the hub's
 /// sessions as they change. A session it was not told about has no agent (as a session the hub
 /// has not stored), so an empty one lets any person's hook change any session and no agent's.
+///
+/// A host must fill it synchronously, as part of the hub's write: a dispatch's session must be
+/// [`set`](Self::set) **before its CLI starts**, or its first hooks find no agent.
 #[derive(Debug, Default)]
 pub struct MemoryAgents {
     agents: RwLock<HashMap<SessionId, SessionAgent>>,
@@ -114,7 +123,7 @@ mod tests {
         assert_eq!(mem.agent_of(s), SessionAgent::NoAgent);
         let agent = SessionAgent::Agent {
             agent: MemberId::new(),
-            owner: MemberId::new(),
+            owner: Some(MemberId::new()),
         };
         mem.set(s, agent);
         assert_eq!(mem.agent_of(s), agent);

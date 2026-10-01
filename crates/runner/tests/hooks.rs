@@ -72,7 +72,7 @@ fn agent_of(owner: &Caller) -> Caller {
 fn runs_as(agent: &Caller) -> SessionAgent {
     SessionAgent::Agent {
         agent: agent.member,
-        owner: agent.on_behalf_of.unwrap(),
+        owner: agent.on_behalf_of,
     }
 }
 

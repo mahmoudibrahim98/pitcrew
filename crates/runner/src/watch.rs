@@ -1573,13 +1573,18 @@ fn is_not_found(e: &notify::Error) -> bool {
     }
 }
 
-/// Drops the oldest waiting signal of the sender with the most waiting.
+/// Drops the oldest waiting signal of the sender with the most waiting (of those tied, the
+/// highest member id, a hook's before the runner's).
 fn drop_one(reports: &mut VecDeque<Signal>) {
     let mut counts: HashMap<Option<MemberId>, usize> = HashMap::new();
     for s in reports.iter() {
         *counts.entry(s.origin.member()).or_default() += 1;
     }
-    let Some(most) = counts.into_iter().max_by_key(|(_, n)| *n).map(|(m, _)| m) else {
+    let Some(most) = counts
+        .into_iter()
+        .max_by_key(|(m, n)| (*n, *m))
+        .map(|(m, _)| m)
+    else {
         return;
     };
     if let Some(i) = reports.iter().position(|s| s.origin.member() == most) {
@@ -2071,6 +2076,46 @@ mod tests {
                 native_id: format!("f{}", 3 * MAX_SIGNALS - 1)
             })
         );
+    }
+
+    #[test]
+    fn a_tie_among_waiting_signals_drops_from_the_highest_member() {
+        use pitcrew_protocol::api::{Caller, TokenScope};
+        let signal = |n: u128, id: &str| Signal {
+            target: Target::Native {
+                engine: Engine::Claude,
+                native_id: id.into(),
+            },
+            report: Reported {
+                at: 1,
+                to: SessionState::Idle,
+                status_line: None,
+            },
+            origin: Origin::Hook(Sender::new(Caller {
+                member: MemberId(Ulid::from_parts(1, n)),
+                scope: TokenScope::Agent,
+                on_behalf_of: None,
+            })),
+        };
+        let left = |q: &VecDeque<Signal>| -> Vec<String> {
+            q.iter()
+                .map(|s| match &s.target {
+                    Target::Native { native_id, .. } => native_id.clone(),
+                    Target::Session(id) => id.to_string(),
+                })
+                .collect()
+        };
+        for _ in 0..20 {
+            let mut q: VecDeque<Signal> = [
+                signal(1, "a1"),
+                signal(2, "b1"),
+                signal(1, "a2"),
+                signal(2, "b2"),
+            ]
+            .into();
+            drop_one(&mut q);
+            assert_eq!(left(&q), ["a1", "a2", "b2"]);
+        }
     }
 
     #[test]
