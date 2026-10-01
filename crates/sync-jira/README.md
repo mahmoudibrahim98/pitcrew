@@ -11,4 +11,11 @@ locally. In short: the transport seam, recorded-fixture format, bounds/backoff h
 the Atlassian Document Format converter, the Cloud/Data Center `Deployment` trait and the Jira
 wire types are specific to this crate.
 
+## Known gaps
+
+- `ownership::plan` produces no hub `Intent` for an epic change yet (`EpicCreated`/`EpicRenamed`/
+  `EpicClosed`): epics map to workstreams, not tasks, and `plan`'s signature here only takes a
+  task. `pitcrew-sync-github`'s `plan` has the identical gap for milestones, for the same reason.
+  Applying either to a workstream is a later brief.
+
 **Owned by stream G** — see [docs/build/streams/G.md](../../docs/build/streams/G.md).

@@ -90,17 +90,35 @@ pub(crate) struct WireFields {
     pub(crate) extra: Map<String, Value>,
 }
 
+/// Whether `s` has the shape of a Jira issue key (`PROJECT-123`): a project-key part (an
+/// uppercase ASCII letter, then 1–9 more uppercase letters or digits) followed by `-` and one or
+/// more digits. Unlike `fields.parent` (a structured, typed reference Jira itself builds), a
+/// classic Data Center epic-link custom field is free-form configuration this crate does not
+/// otherwise validate — this is the sanity check before that value is trusted as a key and
+/// spliced into a browse URL (see [`WireFields::epic_key`]).
+fn looks_like_issue_key(s: &str) -> bool {
+    let Some((project, number)) = s.split_once('-') else {
+        return false;
+    };
+    let mut chars = project.chars();
+    let first_ok = chars.next().is_some_and(|c| c.is_ascii_uppercase());
+    let rest_ok = chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
+    let len_ok = (2..=10).contains(&project.len());
+    let number_ok = !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit());
+    first_ok && rest_ok && len_ok && number_ok
+}
+
 impl WireFields {
     /// The key of the epic this issue belongs to, if any: `fields.parent` when present (modern
     /// Jira Cloud, and sub-tasks on both deployments), otherwise the configured epic-link custom
-    /// field (classic Data Center) if it names one.
+    /// field (classic Data Center) if it names one that looks like a real issue key.
     pub(crate) fn epic_key(&self, epic_link_field: Option<&str>) -> Option<String> {
         if let Some(parent) = &self.parent {
             return Some(parent.key.clone());
         }
         let field_id = epic_link_field?;
         match self.extra.get(field_id)? {
-            Value::String(s) if !s.is_empty() => Some(s.clone()),
+            Value::String(s) if looks_like_issue_key(s) => Some(s.clone()),
             _ => None,
         }
     }
@@ -183,6 +201,25 @@ mod tests {
             Some("DEMO-9")
         );
         assert_eq!(fields.epic_key(None), None);
+    }
+
+    #[test]
+    fn epic_key_rejects_a_custom_field_value_that_does_not_look_like_an_issue_key() {
+        for bad in ["", "not an issue key", "DEMO", "-9", "demo-9", "../../evil"] {
+            let fields: WireFields = serde_json::from_value(serde_json::json!({
+                "summary": "s",
+                "status": {"name": "To Do", "statusCategory": {"key": "new"}},
+                "issuetype": {"name": "Story"},
+                "updated": "2026-01-01T00:00:00.000+0000",
+                "customfield_10008": bad,
+            }))
+            .expect("parses");
+            assert_eq!(
+                fields.epic_key(Some("customfield_10008")),
+                None,
+                "{bad:?} should not be accepted as an issue key"
+            );
+        }
     }
 
     #[test]
