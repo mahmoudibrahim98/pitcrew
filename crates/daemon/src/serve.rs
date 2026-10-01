@@ -60,6 +60,9 @@ const HOOK_QUEUE: usize = 1024;
 const DRAIN: Duration = Duration::from_secs(10);
 /// How long whatever still holds the store after the server stopped gets to let go of it.
 const RELEASE: Duration = Duration::from_secs(3);
+/// How long the async runtime then waits for work still on its blocking pool. What is still
+/// running after that is left to end with the process.
+const ABANDON: Duration = Duration::from_secs(5);
 
 /// Runs `pitcrewd serve` until a stop signal.
 ///
@@ -80,26 +83,43 @@ pub fn serve(state: &StateDir, args: &ServeArgs) -> anyhow::Result<ExitCode> {
     let store = Arc::downgrade(&hub.store);
     // The lock goes last, so no other daemon opens the store while it closes.
     let lock = Arc::clone(&hub.tokens);
-    let runner = if args.no_runner {
-        tracing::info!("the runner is off (--no-runner)");
-        None
-    } else {
-        let homes = crate::runner::homes(&args.homes, args.demo, crate::runner::default_homes);
-        crate::runner::start(state, &hub.work, &hub.store, hub.machine, homes)?
-    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("pitcrewd")
         .build()
         .context("cannot start the async runtime")?;
-    let served = runtime.block_on(run(hub, runner, state, args.listen.clone(), started));
-    // Stopping the runtime drops the tasks that still hold the store, such as streams the server
-    // did not close; the store closes with the last of them.
-    drop(runtime);
+    // Before the runner starts, so a stop signal from here on takes the clean path.
+    let stop = {
+        let _entered = runtime.enter();
+        Stop::listen().context("cannot listen for stop signals")?
+    };
+    let runner = if args.no_runner {
+        tracing::info!("the runner is off (--no-runner)");
+        None
+    } else {
+        let homes = crate::runner::homes(&args.homes, args.demo, crate::runner::default_homes);
+        match crate::runner::start(state, &hub.work, &hub.store, hub.machine, homes) {
+            Ok(runner) => runner,
+            // The hub is still worth serving (the desktop reaches its work), and a supervisor
+            // cannot pass --no-runner.
+            Err(e) => {
+                tracing::warn!(
+                    "the runner cannot start, so this hub serves without it (no session is \
+                     watched, hooks are only logged): {e:#}"
+                );
+                None
+            }
+        }
+    };
+    let served = runtime.block_on(run(hub, runner, stop, state, args.listen.clone(), started));
+    stop_runtime(runtime);
     if store.upgrade().is_none() {
         tracing::info!("store closed");
     } else {
-        tracing::warn!("the store is still open at exit");
+        tracing::warn!(
+            "the store is still open at exit, held by work left behind; it closes with the \
+             process, and its next open recovers the log from its write-ahead file"
+        );
     }
     drop(lock);
     served?;
@@ -406,6 +426,7 @@ fn first_person(work: &WorkService) -> anyhow::Result<MemberId> {
 async fn run(
     hub: Hub,
     runner: Option<Runner>,
+    mut stop: Stop,
     state: &StateDir,
     listen: ListenArg,
     started: Instant,
@@ -417,7 +438,6 @@ async fn run(
         office,
         machine: _,
     } = hub;
-    let mut stop = Stop::listen().context("cannot listen for stop signals")?;
     let office_work = Arc::clone(&work);
     warm_up_recaps(&work);
 
@@ -430,12 +450,10 @@ async fn run(
         None => Arc::new(LogHookSink),
     };
     let hooks = HookIntake::start(hook_sink, HOOK_QUEUE).context("cannot start the hook intake")?;
-    let runner_terminals = match &runner {
-        Some(runner) => Some((runner.machine(), runner.terminals()?)),
-        None => None,
-    };
-    let terminals: Arc<dyn Terminals> =
-        Arc::new(SessionTerminals::new(Arc::clone(&work), runner_terminals));
+    let terminals: Arc<dyn Terminals> = Arc::new(SessionTerminals::new(
+        Arc::clone(&work),
+        runner.as_ref().map(|r| (r.machine(), r.terminals())),
+    ));
     let transcripts = Transcripts::new(
         Arc::clone(&work),
         runner.as_ref().map(|r| (r.machine(), r.found())),
@@ -461,9 +479,13 @@ async fn run(
         .device(transcripts.routes())
         .device(pitcrew_hub_work::device_routes().layer(Extension(work)));
     let (roles, capabilities) = match &runner {
-        Some(_) => (
+        Some(runner) => (
             vec![HostRole::Hub, HostRole::Runner],
-            vec![Capability::Watch],
+            if runner.watches() {
+                vec![Capability::Watch]
+            } else {
+                Vec::new()
+            },
         ),
         None => (vec![HostRole::Hub], Vec::new()),
     };
@@ -576,6 +598,22 @@ fn warm_up_recaps(work: &Arc<WorkService>) {
             ),
         }
     }));
+}
+
+/// Stops the async runtime: its tasks are dropped at once, and work on its blocking pool gets
+/// [`ABANDON`] to finish. A call that has not returned by then (a read of a file on a filesystem
+/// that does not answer, a runner that could not stop) is left behind and ends with the process,
+/// so a stop always finishes in bounded time.
+fn stop_runtime(runtime: tokio::runtime::Runtime) {
+    let waited = Instant::now();
+    runtime.shutdown_timeout(ABANDON);
+    if waited.elapsed() >= ABANDON {
+        tracing::warn!(
+            seconds = ABANDON.as_secs(),
+            "work on the blocking pool is still running; it is left behind and ends with the \
+             process"
+        );
+    }
 }
 
 /// Waits for the server to finish, at most [`DRAIN`].

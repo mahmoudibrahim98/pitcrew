@@ -209,12 +209,18 @@ impl Daemon {
     /// Sends `signal` (`TERM`, `HUP`, …) and waits for the process to exit.
     #[cfg(unix)]
     pub fn signal(&mut self, signal: &str) -> ExitStatus {
+        self.send(signal);
+        self.wait_exit(Duration::from_secs(20))
+    }
+
+    /// Sends `signal` (`TERM`, `HUP`, …) without waiting.
+    #[cfg(unix)]
+    pub fn send(&self, signal: &str) {
         let sent = Command::new("kill")
             .args([&format!("-{signal}"), &self.child.id().to_string()])
             .status()
             .expect("run kill");
         assert!(sent.success(), "kill -{signal} failed");
-        self.wait_exit(Duration::from_secs(20))
     }
 
     /// Stops it: SIGTERM on Unix (and checks it stopped cleanly), killed elsewhere.

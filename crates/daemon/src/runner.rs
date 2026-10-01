@@ -13,6 +13,9 @@
 //!   without a person, the runner stays off (logged), as the back office does without a person.
 //! - **Its index** is `runner/<log id>/` in the state directory: one per hub log, so a new store
 //!   learns every session from the start instead of from cursors saved for another log.
+//! - **A runner that cannot start** (its index cannot be opened or is locked, a thread cannot
+//!   start) does not stop the hub: `serve` warns with the reason and the folder, and serves
+//!   without it, as with no machine or no person.
 
 use crate::agents::HubAgents;
 use crate::cli::HomeArg;
@@ -35,28 +38,30 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The runner, running.
+/// The runner, running. Stop it with [`Runner::stop`]; dropped without that (a start that
+/// fails after the runner started), it is stopped on a thread of its own, so the drop never
+/// waits for a watcher that does not answer.
 #[derive(Debug)]
 pub struct Runner {
-    handle: RunnerHandle,
+    /// `None` once stopping.
+    handle: Option<RunnerHandle>,
+    hooks: RunnerHooks,
+    terminals: RunnerTerminals,
     machine: MachineId,
     found: Arc<Found>,
+    /// Whether it watches at least one home.
+    watches: bool,
 }
 
 impl Runner {
     /// The API's hook sink.
     pub fn hooks(&self) -> RunnerHooks {
-        self.handle.hooks()
+        self.hooks.clone()
     }
 
     /// The runner's terminals, over [`NoRuntime`] until `crates/runtime` has a runtime.
-    ///
-    /// # Errors
-    /// The threads for runtime calls cannot start.
-    pub fn terminals(&self) -> anyhow::Result<RunnerTerminals> {
-        self.handle
-            .terminals(Arc::new(NoRuntime))
-            .context("cannot start the runner's terminals")
+    pub fn terminals(&self) -> RunnerTerminals {
+        self.terminals.clone()
     }
 
     /// The machine it runs on.
@@ -69,19 +74,51 @@ impl Runner {
         Arc::clone(&self.found)
     }
 
+    /// Whether it watches at least one home (`GET /v1/host/info`'s `watch` capability).
+    pub fn watches(&self) -> bool {
+        self.watches
+    }
+
     /// Stops the watcher and waits for it, at most `within`: what it already read is still handed
     /// to the store first. Then it holds the store no more.
-    pub async fn stop(self, within: Duration) {
-        let handle = self.handle;
+    ///
+    /// A watcher that does not stop in time (stuck in a discovery or a read on a filesystem that
+    /// does not answer) is left behind, still holding the store, and ends with the process: the
+    /// stop runs on the blocking pool, which `serve` waits for only so long.
+    pub async fn stop(mut self, within: Duration) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
         let stopping = tokio::task::spawn_blocking(move || handle.stop());
         match tokio::time::timeout(within, stopping).await {
             Ok(Ok(())) => tracing::info!("the runner stopped"),
             Ok(Err(e)) => tracing::warn!(error = %e, "stopping the runner failed"),
             Err(_) => tracing::warn!(
                 seconds = within.as_secs(),
-                "the runner is still stopping; going on"
+                "the runner is still stopping (a discovery or a read of a transcript has not \
+                 returned); it is left behind and ends with the process"
             ),
         }
+    }
+}
+
+impl Drop for Runner {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            stop_aside(handle);
+        }
+    }
+}
+
+/// Stops `handle` on a thread of its own, without waiting: a watcher stuck on a filesystem that
+/// does not answer then holds up nothing, and ends with the process.
+fn stop_aside(handle: RunnerHandle) {
+    let stopping = std::thread::Builder::new()
+        .name("pitcrewd-runner-stop".into())
+        .spawn(move || handle.stop());
+    if let Err(e) = stopping {
+        // The handle went with the closure, and was stopped where it was dropped.
+        tracing::warn!(error = %e, "cannot start a thread to stop the runner");
     }
 }
 
@@ -121,7 +158,8 @@ pub fn default_homes() -> Vec<(Engine, PathBuf)> {
 /// workspace. `None` when it cannot run here yet (no machine or no person; logged).
 ///
 /// # Errors
-/// The runner's index cannot be opened, or its threads cannot start.
+/// The runner's index cannot be opened (its folder is in the error), or its threads cannot
+/// start. `serve` then goes on without the runner.
 pub fn start(
     state: &StateDir,
     work: &Arc<WorkService>,
@@ -157,28 +195,38 @@ pub fn start(
 
     let mut config = RunnerConfig::new(work.workspace(), machine, owner, &dir)
         .with_agents(Arc::new(HubAgents::new(Arc::clone(work))));
+    let watched: Vec<String> = homes
+        .iter()
+        .map(|h| format!("{:?}={}", h.engine, h.path.display()))
+        .collect();
+    let watches = !homes.is_empty();
     config.homes = homes;
-    if config.homes.is_empty() {
-        tracing::info!(%machine, "the runner watches no home (--demo without --homes)");
-    } else {
-        let watched: Vec<String> = config
-            .homes
-            .iter()
-            .map(|h| format!("{:?}={}", h.engine, h.path.display()))
-            .collect();
-        tracing::info!(%machine, homes = ?watched, "the runner watches these homes");
-    }
     let sink = Arc::new(StoreSink::new(Arc::clone(store), owner));
     let handle = pitcrew_runner::start(config, adapters, sink).with_context(|| {
         format!(
-            "cannot start the runner (its index is in {})",
+            "cannot start the runner with its index in {}",
             dir.display()
         )
     })?;
+    let terminals = match handle.terminals(Arc::new(NoRuntime)) {
+        Ok(terminals) => terminals,
+        Err(e) => {
+            stop_aside(handle);
+            return Err(anyhow::Error::new(e).context("cannot start the runner's terminals"));
+        }
+    };
+    if watches {
+        tracing::info!(%machine, homes = ?watched, "the runner watches these homes");
+    } else {
+        tracing::info!(%machine, "the runner watches no home (--demo without --homes)");
+    }
     Ok(Some(Runner {
-        handle,
+        hooks: handle.hooks(),
+        handle: Some(handle),
+        terminals,
         machine,
         found,
+        watches,
     }))
 }
 

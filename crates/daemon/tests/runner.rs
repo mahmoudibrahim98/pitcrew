@@ -138,6 +138,7 @@ fn a_transcript_is_a_session_with_its_transcript_and_live_records() {
     let device = daemon.device_token();
     let info = daemon.get("/v1/host/info", None).json();
     assert_eq!(info["roles"], json!(["hub", "runner"]));
+    assert_eq!(info["capabilities"], json!(["watch"]));
     daemon.wait_for_log("the runner watches these homes", WAIT);
 
     let found = session_named(&daemon, &device, native);
@@ -336,6 +337,8 @@ fn a_demo_watches_no_home_of_its_own() {
     daemon.wait_for_log("the runner watches no home", WAIT);
     let info = daemon.get("/v1/host/info", None).json();
     assert_eq!(info["roles"], json!(["hub", "runner"]));
+    // It runs, but watches nothing.
+    assert_eq!(info["capabilities"], json!([]));
     // Its first discovery has long finished when the recap index is built and the back office has
     // looked at the seed; give the watcher a while more anyway.
     daemon.settle(&device);
@@ -465,4 +468,129 @@ fn the_runner_stops_before_the_store_closes_and_a_restart_repeats_nothing() {
         .filter(|s| s["native_id"] == native)
         .count();
     assert_eq!(named, 1, "{sessions}");
+}
+
+/// Makes `dir` as the daemon would accept it: private (0700) on Unix.
+fn private_dir(dir: &Path) {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(dir).unwrap();
+}
+
+/// A runner that cannot start (here its index cannot be made: `runner` in the state directory is
+/// a file) leaves the hub serving without it: warned with the reason and the folder, roles
+/// `["hub"]`, and the work model as ever.
+#[test]
+fn a_runner_that_cannot_start_leaves_the_hub_serving() {
+    let (tmp, state) = state_dir();
+    let homes = tmp.path().join("homes");
+    let native = "abababab-7777-4777-8777-abababababab";
+    claude_transcript(&homes.join(".claude"), native, &fixture_lines(native));
+    private_dir(&state);
+    std::fs::write(state.join("runner"), "not a folder").unwrap();
+
+    let daemon = Daemon::start(&state, &["--demo", "--homes", homes.to_str().unwrap()]);
+    let device = daemon.device_token();
+    daemon.wait_for_log("the runner cannot start", WAIT);
+    let logs = daemon.stderr();
+    let warning = logs
+        .lines()
+        .find(|l| l.contains("the runner cannot start"))
+        .unwrap();
+    assert!(warning.contains("WARN"), "{warning}");
+    assert!(
+        warning.contains(&state.join("runner").display().to_string()),
+        "the folder is named: {warning}"
+    );
+    let info = daemon.get("/v1/host/info", None).json();
+    assert_eq!(info["roles"], json!(["hub"]));
+    assert_eq!(info["capabilities"], json!([]));
+    let tasks = daemon.get("/v1/tasks", Some(&device));
+    assert_eq!(tasks.status, 200, "{}", tasks.body);
+    for route in ["terminal", "transcript"] {
+        let reply = daemon.get(&format!("/v1/sessions/{}/{route}", id::SES1), Some(&device));
+        assert_eq!(reply.status, 503, "{route}: {}", reply.body);
+    }
+    let sessions = daemon.get("/v1/sessions", Some(&device)).json();
+    assert!(
+        sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["native_id"] != native),
+        "{sessions}"
+    );
+}
+
+/// A GET that tolerates the server going away: the bytes it got, if any.
+#[cfg(unix)]
+fn get_raw(port: u16, path: &str, token: &str) -> Vec<u8> {
+    use std::io::Read as _;
+    let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+        return Vec::new();
+    };
+    let head = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let mut got = Vec::new();
+    if stream.write_all(head.as_bytes()).is_ok() {
+        let _ = stream.read_to_end(&mut got);
+    }
+    got
+}
+
+/// A stop always finishes in bounded time: here the transcript is swapped for a FIFO that no one
+/// writes, so opening it waits forever, both in the runner's watcher (it reads a changed file)
+/// and in a transcript request. The daemon still exits, cleanly, and says what it left behind.
+#[cfg(unix)]
+#[test]
+fn a_read_that_never_returns_does_not_keep_the_daemon_from_stopping() {
+    let (tmp, state) = state_dir();
+    let homes = tmp.path().join("homes");
+    let native = "cdcdcdcd-8888-4888-8888-cdcdcdcdcdcd";
+    let path = claude_transcript(&homes.join(".claude"), native, &fixture_lines(native)[..5]);
+    let mut daemon = Daemon::start(&state, &["--demo", "--homes", homes.to_str().unwrap()]);
+    let device = daemon.device_token();
+    let sid = session_named(&daemon, &device, native)["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let fifo = tmp.path().join("fifo");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    std::fs::rename(&fifo, &path).unwrap();
+    let request = {
+        let (port, token) = (daemon.port, device.clone());
+        let path = format!("/v1/sessions/{sid}/transcript");
+        std::thread::spawn(move || get_raw(port, &path, &token))
+    };
+    // The watcher notices the change within its debounce, and the request is on its way.
+    std::thread::sleep(Duration::from_secs(1));
+
+    let stopping = Instant::now();
+    daemon.send("TERM");
+    let status = daemon.wait_exit(Duration::from_secs(60));
+    let took = stopping.elapsed();
+    let logs = daemon.stderr();
+    assert!(status.success(), "{status}:\n{logs}");
+    // Drain (10 s) + the store's release (3 s) + the blocking pool (5 s), and some slack.
+    assert!(took < Duration::from_secs(30), "{took:?}:\n{logs}");
+    for said in [
+        "the runner is still stopping",
+        "work on the blocking pool is still running",
+        "the store is still open at exit",
+        "stopped",
+    ] {
+        assert!(logs.contains(said), "no {said:?} in:\n{logs}");
+    }
+    let _ = request.join();
 }
