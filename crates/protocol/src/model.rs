@@ -849,6 +849,26 @@ pub struct Brief {
     /// Evidence behind it.
     #[serde(default)]
     pub receipts: Vec<Receipt>,
+    /// The pending proposal, present exactly when there is one: the newest `brief_proposed` for
+    /// the target, newer than the `brief_accepted` that put this brief in force.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<BriefProposal>,
+}
+
+/// A new "Where it stands" the back office proposed, waiting for a person to accept it or keep
+/// the current one (see [`Brief::proposal`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BriefProposal {
+    /// Proposed text.
+    pub text: String,
+    /// Proposed next step, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+    /// Evidence for every claim.
+    #[serde(default)]
+    pub receipts: Vec<Receipt>,
+    /// When it was proposed: the time of its `brief_proposed`.
+    pub at: TimestampMs,
 }
 
 /// The kind of ask.

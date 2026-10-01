@@ -8,8 +8,8 @@ use pitcrew_protocol::ids::{
     WorkspaceId, WorkstreamId,
 };
 use pitcrew_protocol::model::{
-    Date, Engine, MachineInfo, Member, MemberKind, Mover, PermissionMode, Priority, Receipt,
-    Scheduler, Task, TaskPatch, TaskStatus,
+    Brief, BriefProposal, BriefSource, Date, Engine, MachineInfo, Member, MemberKind, Mover,
+    PermissionMode, Priority, Receipt, Scheduler, Task, TaskPatch, TaskStatus,
 };
 use pitcrew_protocol::runner::{
     Capability, CommandOutcome, HubToRunner, RunnerCommand, RunnerToHub, decode_line, encode_line,
@@ -460,6 +460,41 @@ fn old_brief_events_still_decode() {
         "target": target, "text": "Seed 3 diverged.", "next": "Rerun seed 3.", "pinned": false,
         "receipts": [job, {"kind": "event", "id": EventId::new()}]}}));
     assert!(matches!(accepted, EventBody::BriefAccepted { receipts, .. } if receipts.len() == 2));
+}
+
+#[test]
+fn a_brief_carries_its_pending_proposal() {
+    let target = json!({"kind": "workstream", "id": WorkstreamId::new()});
+    // A brief written before `proposal` existed, or with nothing pending.
+    let plain: Brief = round_trip(&json!({
+        "target": target, "text": "Seed 3 diverged.", "next": "Rerun seed 3.", "pinned": true,
+        "source": "person", "updated": 1_790_761_500_000_i64, "receipts": []
+    }));
+    assert_eq!(plain.proposal, None);
+    assert_eq!(plain.source, BriefSource::Person);
+
+    let job = Receipt::Job {
+        scheduler: Scheduler::Slurm,
+        id: "4815162".into(),
+    };
+    let pending: Brief = round_trip(&json!({
+        "target": target, "text": "Seed 3 diverged.", "pinned": true, "source": "person",
+        "updated": 1_790_761_500_000_i64, "receipts": [],
+        "proposal": {"text": "Seed 3 reran and converged.", "next": "Make figure 3.",
+                     "receipts": [job], "at": 1_790_762_100_000_i64}
+    }));
+    assert_eq!(
+        pending.proposal,
+        Some(BriefProposal {
+            text: "Seed 3 reran and converged.".into(),
+            next: Some("Make figure 3.".into()),
+            receipts: vec![job],
+            at: 1_790_762_100_000,
+        })
+    );
+    // A proposal without a next step leaves it out; its receipts are always written.
+    let bare: BriefProposal = round_trip(&json!({"text": "Nothing new.", "receipts": [], "at": 1}));
+    assert_eq!(bare.next, None);
 }
 
 #[test]
