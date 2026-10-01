@@ -96,7 +96,7 @@ function renderBlock(block: Block, key: number, tight: boolean): ReactNode {
       return (
         <div key={key} className="my-2 overflow-hidden rounded-md border border-line bg-sunken first:mt-0 last:mb-0">
           {lang !== '' && (
-            <div className="border-b border-line px-2 py-0.5 font-mono text-xs text-muted">{lang}</div>
+            <div className="border-b border-line px-2 py-0.5 font-mono text-xs text-ink-2">{lang}</div>
           )}
           <pre className="overflow-x-auto px-3 py-2 font-mono text-xs leading-5">
             <code>{block.v}</code>
