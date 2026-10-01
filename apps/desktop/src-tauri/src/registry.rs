@@ -422,6 +422,16 @@ fn read(file: &Path) -> io::Result<Vec<WorkspaceRecord>> {
 /// # Errors
 /// Creating the directory, writing or renaming fails.
 pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic(path, bytes, 0o600)
+}
+
+/// Writes `bytes` to a new file next to `path` with `mode & 0o777` on Unix (exactly, whatever the umask),
+/// flushes it, and renames it over `path`. A link at `path` is replaced, not followed: callers
+/// that must leave links alone check first.
+///
+/// # Errors
+/// Creating the directory, writing or renaming fails.
+pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     let dir = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no directory"))?;
@@ -439,11 +449,19 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
+        // Never wider than asked while it is written; exactly `mode` before it is renamed.
+        options.mode(mode & 0o600);
     }
+    #[cfg(not(unix))]
+    let _ = mode;
     let written = options.open(&tmp).and_then(|mut f| {
         f.write_all(bytes)?;
         f.sync_all()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            f.set_permissions(std::fs::Permissions::from_mode(mode & 0o777))?;
+        }
         drop(f);
         std::fs::rename(&tmp, path)
     });
