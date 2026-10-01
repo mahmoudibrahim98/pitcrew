@@ -169,7 +169,9 @@ fn ssh() -> u8 {
     let call = Call::parse(&args);
     let kind = call.kind();
     append(&machine.join("calls.log"), &format!("{kind} {}", call.host));
-    if call.host != HOST {
+    // `-O` talks to the master at the ControlPath: ssh does not resolve the host for it (a sweep
+    // of a crashed app's links names none).
+    if kind != "control" && call.host != HOST {
         call.say(&format!(
             "ssh: Could not resolve hostname {}: Name or service not known",
             call.host
