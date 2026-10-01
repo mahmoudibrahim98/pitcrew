@@ -13,16 +13,21 @@
 //! - [`keychain`]: where remote workspaces' device tokens will live.
 //! - [`app`]: the Tauri wiring: the window, its CSP and capability, single instance, cleanup.
 //! - [`navigate`]: deep links (`pitcrew://…`) and notification clicks, as `gateway://navigate`.
+//! - [`attention`]: "needs you", from the gateway's own subscription to each daemon.
+//! - [`notify`]: OS notifications for new asks, and [`preferences`] that turn them off.
 //!
 //! **Owned by stream K.**
 
 pub mod app;
+pub mod attention;
 pub mod commands;
 pub mod daemon;
 pub mod gateway;
 pub mod keychain;
 pub mod logging;
 pub mod navigate;
+pub mod notify;
+pub mod preferences;
 pub mod redact;
 pub mod registry;
 pub mod scheme;
