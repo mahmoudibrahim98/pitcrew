@@ -36,6 +36,7 @@ import {
   type Answer,
   type Ask,
   type Brief,
+  type BriefProposal,
   type BriefTarget,
   type EventBody,
   type HostInfo,
@@ -1109,7 +1110,7 @@ const putBrief: Handler = (hub, ctx) => {
   const pinned = fields.bool('pinned');
   const proposal = pendingProposal(hub, target);
   const acceptsProposal = proposal !== undefined && proposal.text === text && proposal.next === next;
-  const receipts = acceptsProposal ? structuredClone(proposal.receipts) : [];
+  const receipts = acceptsProposal ? proposal.receipts : [];
   // Serde skips a `None` next and empty receipts, so the mock leaves them out too.
   const event = hub.append(ctx.caller.member.id, {
     type: 'brief_accepted',
@@ -1136,23 +1137,39 @@ const putBrief: Handler = (hub, ctx) => {
   } else {
     hub.briefs[index] = brief;
   }
+  // The brief just accepted is newer than any proposal, so nothing is pending.
   return ok(brief);
 };
+
+/** Every brief in force, each with its pending proposal when it has one. */
+const listBriefs: Handler = (hub) =>
+  ok(
+    hub.briefs.map((brief) => {
+      const proposal = pendingProposal(hub, brief.target);
+      return proposal === undefined ? brief : { ...brief, proposal };
+    }),
+  );
 
 const sameTarget = (a: BriefTarget, b: BriefTarget): boolean => a.kind === b.kind && a.id === b.id;
 
 /**
  * The pending proposal: the newest `brief_proposed` for the target, if it is newer (a higher
- * revision) than the newest `brief_accepted`, which put the brief in force.
+ * revision) than the newest `brief_accepted`, which put the brief in force. A copy, so callers
+ * may keep it.
  */
-function pendingProposal(
-  hub: Hub,
-  target: BriefTarget,
-): { text: string; next?: string; receipts: Receipt[] } | undefined {
+function pendingProposal(hub: Hub, target: BriefTarget): BriefProposal | undefined {
   for (let rev = hub.rev; rev >= 1; rev--) {
-    const body = hub.eventAt(rev)?.body;
-    if ((body?.type === 'brief_proposed' || body?.type === 'brief_accepted') && sameTarget(body.data.target, target)) {
-      return body.type === 'brief_proposed' ? body.data : undefined;
+    const event = hub.eventAt(rev);
+    const body = event?.body;
+    if (event === undefined || body === undefined) {
+      continue;
+    }
+    if (body.type === 'brief_accepted' && sameTarget(body.data.target, target)) {
+      return undefined;
+    }
+    if (body.type === 'brief_proposed' && sameTarget(body.data.target, target)) {
+      const { text, next, receipts } = structuredClone(body.data);
+      return { text, ...(next === undefined ? {} : { next }), receipts, at: event.at };
     }
   }
   return undefined;
@@ -1374,7 +1391,7 @@ const ROUTES: Route[] = [
   route('GET', '/v1/asks', 'agent', listAsks),
   route('POST', '/v1/asks', 'agent', raiseAsk),
   route('POST', '/v1/asks/:id/answer', 'agent', answerAsk),
-  route('GET', '/v1/briefs', 'device', (hub) => ok(hub.briefs)),
+  route('GET', '/v1/briefs', 'device', listBriefs),
   route('PUT', '/v1/briefs/:kind/:id', 'device', putBrief),
   route('GET', '/v1/events', 'device', listEvents),
   route('POST', '/v1/hooks/:engine/:event', 'agent', receiveHook),

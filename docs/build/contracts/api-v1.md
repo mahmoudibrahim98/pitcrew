@@ -178,13 +178,17 @@ not start at byte 0).
 | `GET /v1/asks?to=&state=` | → `Ask[]` | The Inbox is `?to=<me>&state=open`. **agent** |
 | `POST /v1/asks` | `{ "kind", "to", "title", "body"?, "options"?, "task"?, "session"?, "receipts"? }` → `Ask` (201) | Emits `ask_raised`. **agent** |
 | `POST /v1/asks/{id}/answer` | `{ "option"?: usize, "text"?: String }` → `Ask` | See below. Emits `ask_answered`. **agent** |
-| `GET /v1/briefs` | → `Brief[]` | |
+| `GET /v1/briefs` | → `Brief[]` | The briefs in force, each with its pending proposal in `proposal` when it has one. See "Briefs". |
 | `PUT /v1/briefs/{project\|workstream}/{id}` | `{ "text", "next"?, "pinned" }` → `Brief` | A person's brief, or a proposal they accept. See "Briefs". Emits `brief_accepted`. |
 | `GET /v1/events?before=&limit=&project=&workstream=&task=&session=` | → `{ "events": Event[], "from_rev": u64, "to_rev": u64, "at_start": bool }` | See below. |
 
 **Briefs.** The brief in force for a project or workstream is the one its newest `brief_accepted`
 put there. Its **pending proposal** is the newest `brief_proposed` for that target, if it is newer
 (a higher `rev`) than that `brief_accepted`, or if the target has no `brief_accepted` yet.
+- `Brief.proposal` (a `BriefProposal`: `{ "text", "next"?, "receipts", "at" }`, where `at` is the
+  time of its `brief_proposed`) is the pending proposal, present exactly when there is one, so
+  clients need not scan events for it. Accepting it, or keeping the current brief, clears it. A
+  target with a proposal but no brief in force yet is not listed.
 - `PUT` stores `text`, `next` and `pinned`, and `brief_accepted` carries all three. Like
   `brief_proposed`, it leaves `next` out when there is none.
 - **Accepting a proposal.** When the `PUT`'s `text` and `next` both equal the pending proposal's

@@ -64,9 +64,11 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
 - **Editing tasks** (`PATCH /v1/tasks/{id-or-key}`): every rule in the contract (title, labels,
   workstream, `blocked_by` with cycles as 409, dates). `task_updated` carries only the fields that
   changed, and a patch that changes nothing emits nothing.
-- **Briefs.** `PUT` stores `next`, and `brief_accepted` carries it. Accepting the pending proposal
-  unchanged (the fixture's revision 15 for PAP is one) copies its receipts, and the brief stays the
-  back office's.
+- **Briefs.** `GET /v1/briefs` shows each brief's pending proposal in `proposal` (the fixture's
+  revision 15 is one, for PAP). `PUT` stores `next`, and `brief_accepted` carries it. Accepting the
+  pending proposal unchanged copies its receipts, and the brief stays the back office's; accepting
+  it or keeping the current text clears `proposal`. No route proposes a brief: tests append
+  `brief_proposed` through `startServer()`'s `hub`.
 - **The event log.** The fixture's 15 events are revisions 1–15; every change appends an event with
   a new ULID. `GET /v1/events` pages it (`before` is exclusive, `at_start` says whether older
   matching events exist) and filters by project, workstream, task or session. A filtered request

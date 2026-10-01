@@ -53,6 +53,8 @@ export interface RunningServer {
   port: number;
   /** This run's event-log id, as sent in the stream's `hello`. */
   logId: string;
+  /** The in-memory state, for tests that need events no route makes (such as `brief_proposed`). */
+  hub: Hub;
   close(): Promise<void>;
 }
 
@@ -83,6 +85,7 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
     url: `http://${HOST}:${port}`,
     port,
     logId: hub.logId,
+    hub,
     close: () => shutdown(server, hub, sockets),
   };
 }

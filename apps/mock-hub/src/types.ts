@@ -314,6 +314,16 @@ export interface Brief {
   source: BriefSource;
   updated: TimestampMs;
   receipts: Receipt[];
+  /** The pending proposal, present exactly when there is one. */
+  proposal?: BriefProposal;
+}
+
+/** A proposed brief waiting for a person; `at` is the time of its `brief_proposed`. */
+export interface BriefProposal {
+  text: string;
+  next?: string;
+  receipts: Receipt[];
+  at: TimestampMs;
 }
 
 export interface Answer {

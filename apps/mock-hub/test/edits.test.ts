@@ -38,6 +38,9 @@ const UNKNOWN = {
   task: '01JB000000000000000TSK0099',
 };
 const LAPTOP = '01JB000000000000000MCH0001';
+/** @office, the back office's agent. */
+const OFFICE = '01JB000000000000000MEM0006';
+const JOB = { kind: 'job', scheduler: 'slurm', id: '4815170' } as const;
 const SEEDS = '01JB000000000000000WST0002';
 const PAP2 = '01JB000000000000000TSK0002';
 const PAP4 = ID.pap4;
@@ -477,6 +480,92 @@ describe('PUT /v1/briefs: next steps and accepted proposals', () => {
       // A workstream whose brief in force (revision 12) has no newer proposal.
       const seeds = await put(server, `workstream/${SEEDS}`, { text: 'Seed 3 is rerunning.', pinned: true });
       assert.equal(seeds.body.source, 'person');
+    }));
+
+  const briefOf = async (server: RunningServer, id: string): Promise<Brief | undefined> =>
+    (await call<Brief[]>(server, 'GET', '/v1/briefs', { token: DEVICE })).body.find((b) => b.target.id === id);
+
+  /** Appends a `brief_proposed` from @office, as the back office would. */
+  const propose = (server: RunningServer, target: Brief['target'], text: string, next?: string): Event =>
+    server.hub.append(OFFICE, {
+      type: 'brief_proposed',
+      data: { target, text, ...(next === undefined ? {} : { next }), receipts: [JOB] },
+    });
+
+  it('lists each brief with its pending proposal', () =>
+    withServer(async (server) => {
+      // The fixture's revision 15 proposes for PAP, and no brief_accepted for PAP follows it.
+      const proposal = await lastEvent(server);
+      assert.equal(proposal?.body.type, 'brief_proposed');
+      const paper = await briefOf(server, ID.paper);
+      assert.deepEqual(
+        paper?.proposal,
+        proposal?.body.type === 'brief_proposed'
+          ? { text: proposal.body.data.text, receipts: proposal.body.data.receipts, at: proposal.at }
+          : undefined,
+      );
+      // The other briefs have nothing pending: the key is left out.
+      const briefs = await call<Brief[]>(server, 'GET', '/v1/briefs', { token: DEVICE });
+      for (const brief of briefs.body.filter((b) => b.target.id !== ID.paper)) {
+        assert.equal(Object.hasOwn(brief, 'proposal'), false, brief.target.id);
+      }
+      // A new proposal shows with its next step and time.
+      const event = propose(server, { kind: 'workstream', id: SEEDS }, 'Seed 3 reran and converged.', 'Make figure 3.');
+      assert.deepEqual((await briefOf(server, SEEDS))?.proposal, {
+        text: 'Seed 3 reran and converged.',
+        next: 'Make figure 3.',
+        receipts: [JOB],
+        at: event.at,
+      });
+    }));
+
+  it('"keep current" (a PUT of the current text) clears the proposal', () =>
+    withServer(async (server) => {
+      propose(server, { kind: 'workstream', id: SEEDS }, 'Seed 3 reran and converged.', 'Make figure 3.');
+      const current = await briefOf(server, SEEDS);
+      assert.ok(current?.proposal !== undefined);
+      const kept = await put(server, `workstream/${SEEDS}`, {
+        text: current.text,
+        next: current.next,
+        pinned: current.pinned,
+      });
+      assert.equal(kept.status, 200);
+      assert.equal(kept.body.source, 'person');
+      assert.equal(Object.hasOwn(kept.body, 'proposal'), false);
+      const after = await briefOf(server, SEEDS);
+      assert.equal(after?.proposal, undefined);
+      assert.equal(after?.text, current.text);
+    }));
+
+  it('accepting the proposal unchanged clears it, as the back office', () =>
+    withServer(async (server) => {
+      propose(server, { kind: 'workstream', id: SEEDS }, 'Seed 3 reran and converged.', 'Make figure 3.');
+      const accepted = await put(server, `workstream/${SEEDS}`, {
+        text: 'Seed 3 reran and converged.',
+        next: 'Make figure 3.',
+        pinned: true,
+      });
+      assert.equal(accepted.body.source, 'back_office');
+      assert.deepEqual(accepted.body.receipts, [JOB]);
+      const after = await briefOf(server, SEEDS);
+      assert.equal(after?.proposal, undefined);
+      assert.equal(after?.source, 'back_office');
+      assert.deepEqual(after?.receipts, [JOB]);
+      // The fixture's own pending proposal for PAP clears the same way.
+      const paper = await briefOf(server, ID.paper);
+      assert.ok(paper?.proposal !== undefined);
+      await put(server, `project/${ID.paper}`, { text: paper.proposal.text, pinned: false });
+      assert.equal((await briefOf(server, ID.paper))?.proposal, undefined);
+    }));
+
+  it('a newer proposal is pending again after an accepted brief', () =>
+    withServer(async (server) => {
+      await put(server, `workstream/${SEEDS}`, { text: 'Rerunning seed 3.', pinned: true });
+      assert.equal((await briefOf(server, SEEDS))?.proposal, undefined);
+      propose(server, { kind: 'workstream', id: SEEDS }, 'Seed 3 converged.');
+      assert.equal((await briefOf(server, SEEDS))?.proposal?.text, 'Seed 3 converged.');
+      // Proposing for one brief leaves the others alone.
+      assert.equal((await briefOf(server, ID.submission))?.proposal, undefined);
     }));
 
   it('keeps its old checks', () =>
