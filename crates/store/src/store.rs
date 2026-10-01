@@ -134,10 +134,10 @@ pub struct Store {
     projections: Vec<Box<dyn Projection>>,
     log_id: String,
     revs: broadcast::Sender<RevRange>,
-    /// Set only in network mode: the single-host lease and its renewal thread. Checked on every
-    /// append (`Error::LeaseLost` if the renewal thread saw someone else take over). Declared
-    /// last, so it drops after both connections close: the lease is not released until this
-    /// process is done touching the file.
+    /// Set only in network mode: the single-host lease and its renewal thread. Checked before
+    /// every write (`Error::LeaseLost` if a higher generation now exists — see
+    /// [`Store::check_lease`]). Declared last, so it drops after both connections close: the
+    /// lease is not released until this process is done touching the file.
     network: Option<LeaseGuard>,
 }
 
@@ -576,13 +576,14 @@ impl Store {
     /// projection's tables — [`Store::append`]/[`Store::append_new`] (via `append_inner`),
     /// [`Store::rebuild`] and [`Store::import`] (whose own batches also go through `append`,
     /// which checks again; checking here too means an already-lost lease is reported before
-    /// `import` does any work, not partway through) — so a lease lost mid-session is caught
-    /// before more is written under it than the one append already in flight.
+    /// `import` does any work, not partway through). `LeaseGuard::check` re-lists the lease
+    /// directory fresh on every call (a cheap `readdir`, no file content to read), so a takeover
+    /// is caught here, immediately, not up to `ttl / RENEW_FRACTION` later when the renewal
+    /// thread would next notice on its own.
     fn check_lease(&self) -> Result<()> {
-        if self.network.as_ref().is_some_and(LeaseGuard::is_lost) {
-            Err(Error::LeaseLost)
-        } else {
-            Ok(())
+        match &self.network {
+            Some(guard) => guard.check(),
+            None => Ok(()),
         }
     }
 

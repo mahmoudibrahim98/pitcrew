@@ -2,46 +2,56 @@
 //!
 //! SQLite's own locking is not trustworthy over a network filesystem (that is why network mode
 //! exists at all), so a second, independent mechanism keeps two hosts from writing one store at
-//! once: a lease file next to the database (`<db>.lease`), holding the owning host, its pid, a
-//! random owner id, and an expiry. `Store::open` in network mode takes the lease or fails with
-//! [`Error::Leased`]; the owner renews it from a small background thread that stops (and releases
-//! the lease) when the `Store` drops.
+//! once: generation-numbered lease files next to the database, `<db>.lease.<gen>` (`gen` a `u64`
+//! counter starting at 1), each holding the owning host, its pid and an expiry. The **current**
+//! lease is whichever has the highest `gen` present — found by listing the directory, never by a
+//! fixed name. `Store::open` in network mode takes it or fails with [`Error::Leased`]; the owner
+//! renews it from a small background thread that stops (and releases it) when the `Store` drops.
 //!
-//! **Acquiring is exclusive-create, not check-then-write.** Two hosts racing to take a fresh or
-//! expired lease must not both succeed. `take_exclusive` writes the candidate lease to a unique
-//! temp file, then [`std::fs::hard_link`]s it onto the lease path: `link` either creates that
-//! name or fails with `AlreadyExists`, atomically, with no window between a check and a write —
-//! including over NFS, where `link(2)` is the standard exclusive-create idiom precisely because a
-//! direct `open(O_CREAT | O_EXCL)` on the final name is not reliably atomic across clients on
-//! NFSv3.
+//! **No live lease is ever renamed or deleted by anyone but its owner.** This is the central
+//! invariant, and the whole reason for generation numbers instead of one fixed file a new owner
+//! takes over in place. An earlier design (round 1 of this brief) took over an expired lease by
+//! renaming it aside, inspecting the capture, and restoring it if that turned out to be wrong; a
+//! three-way interleaving could still leave two hosts both holding it (a straggler's now-stale
+//! decision displaces an already-confirmed winner; a third racer fills the resulting gap; the
+//! straggler's restore then fails and it deletes what it captured — the first winner's lease,
+//! gone, discovered only at its next renewal). With generation numbers, taking over means
+//! creating a *new*, higher-numbered file — [`std::fs::hard_link`], so it is exclusive: it either
+//! creates that exact name or fails with `AlreadyExists`, atomically, with no window to act on a
+//! stale decision, and nothing already on disk is ever touched. A racer whose candidate turns out
+//! not to be the final highest (see [`take_next_gen`]) only ever deletes the file it just created
+//! itself.
 //!
-//! Taking over an expired or dead-owner lease is the one place a decision (is it actually
-//! takeable?) and an action (clearing it) cannot be the same atomic step, so `clear_if_takeable`
-//! never trusts a read enough to act on it unverified: it renames the file aside first — `rename`
-//! is atomic regardless of content, so it captures *whatever is currently there*, not what an
-//! earlier read decided — and only after that checks whether the capture (now isolated under a
-//! unique name nothing else can touch) really was takeable. If a different racer's own fresh,
-//! legitimate lease had landed in the gap between the original read and the rename, this second
-//! check catches it, and the capture is put back (`hard_link`, so a third racer's lease that has
-//! since filled the path is never clobbered) instead of being treated as cleared. See
-//! `clear_if_takeable`'s own doc for the full reasoning; `lease::tests::many_racers_on_an_*`
-//! exercise it directly. Dropping a `Store` releases its lease the same way, in reverse: rename
-//! aside first, then delete it only once that capture confirms it still names us — never
-//! read-then-delete, which has the same kind of TOCTOU window. See the crate README for the
-//! residual races this still cannot close (clock skew, NFS attribute caching, a resumed suspended
-//! process).
+//! **Acquire** ([`take_next_gen`]): read the current generation (or none); if it is live, refuse
+//! with [`Error::Leased`]; if it is expired, absent, or names a dead same-host owner, exclusively
+//! create the next generation. After creating, re-list: if a *higher* generation already exists
+//! (another racer won the same race a step ahead of us), our own file was never going to be
+//! current — delete it (ours to delete; nobody else could be relying on it) and retry from a
+//! fresh read. A racer that loses the exclusive create itself (`AlreadyExists`) just retries too.
 //!
-//! **Renewal: a background thread, not a `renew()` the caller must call.** A `Store` is meant to
-//! be opened once and used; making every caller remember to renew on a timer would be easy to
-//! forget and awkward to fit into an async or sync caller alike. The thread wakes every
-//! `ttl / RENEW_FRACTION` (a third of the lease length, so a single slow or missed wakeup still
-//! leaves two more tries before the lease would actually expire), checks the file still names our
-//! `owner`, and only then writes a fresh expiry. If the owner ever does not match — another host
-//! took over because our clock stalled, we were suspended, or the file was removed — the thread
-//! sets a flag and stops; every append after that fails with [`Error::LeaseLost`] instead of
-//! silently writing past a lease we no longer hold. Renewal overwrites unconditionally
-//! (`write_lease`, a plain rename-into-place): unlike acquiring, it is refreshing a lease this
-//! process already holds (just confirmed by the owner check), not racing anyone for it.
+//! **Renew**: the owner re-lists first — a higher generation means [`Error::LeaseLost`] — then
+//! rewrites only its own `lease.<gen>` file, by temp file plus rename onto its own name (safe:
+//! nothing else ever touches it). **Checked before every write batch, not just by the renewal
+//! thread's flag**: [`LeaseGuard::check`] re-lists for a higher generation on every call, a cheap
+//! `readdir` and filename comparison, no content to read. This catches a loss immediately, not up
+//! to `ttl / RENEW_FRACTION` later when the renewal thread would next notice on its own.
+//!
+//! **Release**: the owner deletes only its own `lease.<gen>` file — no read-then-delete race to
+//! avoid, no capture-and-restore dance, because nothing else could ever have touched it.
+//!
+//! **GC**: after becoming the current owner, generations older than `gen - 1` are deleted (the
+//! current one and the one just before it are kept, for diagnosis). Nobody but the current owner
+//! deletes anything, and only generations that are not current.
+//!
+//! **Residual limits**, on top of what a file-based lease can never fully close: NFS directory and
+//! attribute caching can hide a new `lease.<gen+1>` from an old owner for up to the client's
+//! `actimeo`, and clock skew between hosts affects what "expired" means to each of them. Both are
+//! mitigated, not eliminated, by the per-batch re-list (catches a loss quickly once the directory
+//! listing *is* visible) and by choosing a `lease_ttl` with real margin over expected clock drift
+//! and cache staleness — never fully solved by cleverness in this file alone.
+//!
+//! A store whose lease file was the old, single fixed name has never shipped (round 1 was not
+//! released), so there is no migration to support.
 //!
 //! Time comes from the injectable [`Clock`] (`StoreOptions::clock`), not `SystemTime::now()`
 //! directly, so tests can make a lease look expired without sleeping.
@@ -72,12 +82,13 @@ impl Clock for SystemClock {
     }
 }
 
-/// The lease file's contents.
+/// A generation lease file's contents. No `owner` id: the generation number is already the unique
+/// identity (nobody else ever creates or touches the same `(db, gen)` pair), so there is nothing
+/// left for a separate id to distinguish.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct LeaseData {
     host: String,
     pid: u32,
-    owner: String,
     until_ms: i64,
 }
 
@@ -85,19 +96,88 @@ struct LeaseData {
 /// wakeup (a slow write, a paused process) still leaves margin before the lease actually expires.
 const RENEW_FRACTION: u32 = 3;
 
-/// The path of the lease file next to a database file.
-pub(crate) fn lease_path(db_path: &Path) -> PathBuf {
-    let mut name = db_path
-        .file_name()
-        .map_or_else(|| "store.db".into(), |n| n.to_owned());
-    name.push(".lease");
-    db_path.with_file_name(name)
+/// The directory a database's lease files live in: its parent, or `.` if it has none.
+fn lease_dir(db_path: &Path) -> &Path {
+    db_path.parent().unwrap_or_else(|| Path::new("."))
+}
+
+/// The shared prefix of a database's lease file names (before `.<gen>`): `<db file name>.lease`.
+fn lease_prefix(db_path: &Path) -> String {
+    let base = db_path.file_name().map_or_else(
+        || "store.db".to_owned(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    format!("{base}.lease")
+}
+
+/// Generation `generation`'s lease file path.
+pub(crate) fn gen_path(db_path: &Path, generation: u64) -> PathBuf {
+    lease_dir(db_path).join(format!("{}.{generation}", lease_prefix(db_path)))
+}
+
+/// Parses `name` as `<prefix>.<gen>` and returns the generation, or `None` if it does not match:
+/// wrong prefix, no digits, anything but ASCII digits after the prefix, or a leading zero on more
+/// than one digit (`.0` alone is accepted for completeness, even though nothing here ever creates
+/// it; `.01` is not — a generation file name is a canonical `u64`, not an arbitrary digit string).
+/// Never panics and never treats a name it cannot parse as an error: an unrelated file (a stray
+/// temp candidate, a file a person left there) is simply not a generation.
+fn parse_gen(name: &str, prefix: &str) -> Option<u64> {
+    let suffix = name.strip_prefix(prefix)?.strip_prefix('.')?;
+    if suffix.is_empty() || (suffix.len() > 1 && suffix.starts_with('0')) {
+        return None;
+    }
+    if !suffix.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse().ok()
+}
+
+/// The current lease: the highest generation present, by listing the directory and parsing names
+/// strictly (see [`parse_gen`]) — never a fixed name, and never an error for a directory that
+/// does not exist yet or a name that does not parse (both just mean "not a generation here").
+pub(crate) fn current_gen(db_path: &Path) -> Option<(u64, PathBuf)> {
+    let dir = lease_dir(db_path);
+    let prefix = lease_prefix(db_path);
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut best: Option<(u64, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(generation) = parse_gen(&name.to_string_lossy(), &prefix) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(g, _)| generation > *g) {
+            best = Some((generation, entry.path()));
+        }
+    }
+    best
+}
+
+/// Deletes generation files older than `keep_gen - 1`: the current owner's own `keep_gen`, and
+/// the generation just before it, are kept (for diagnosis); anything older is removed. Best
+/// effort — a deletion failing (already gone, a permissions hiccup) is not an error — and never
+/// touches a name [`parse_gen`] does not recognise as a generation of this database's lease.
+fn gc_old_generations(db_path: &Path, keep_gen: u64) {
+    let dir = lease_dir(db_path);
+    let prefix = lease_prefix(db_path);
+    let floor = keep_gen.saturating_sub(1);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(generation) = parse_gen(&name.to_string_lossy(), &prefix) else {
+            continue;
+        };
+        if generation < floor {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// A held lease: releases on drop, and stops its renewal thread first.
 pub(crate) struct LeaseGuard {
-    path: PathBuf,
-    owner: String,
+    db_path: PathBuf,
+    generation: u64,
     lost: Arc<AtomicBool>,
     stop: Option<mpsc::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -106,61 +186,29 @@ pub(crate) struct LeaseGuard {
 impl std::fmt::Debug for LeaseGuard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LeaseGuard")
-            .field("path", &self.path)
-            .field("owner", &self.owner)
+            .field("db_path", &self.db_path)
+            .field("generation", &self.generation)
             .field("lost", &self.lost.load(Ordering::SeqCst))
             .finish_non_exhaustive()
     }
 }
 
 impl LeaseGuard {
-    /// Takes the lease at `lease_path(db_path)`, or fails with [`Error::Leased`]. Spawns the
-    /// renewal thread on success.
+    /// Takes the next generation of the lease next to `db_path`, or fails with
+    /// [`Error::Leased`]. Spawns the renewal thread and garbage-collects old generations on
+    /// success.
     ///
     /// # Errors
     ///
     /// [`Error::Leased`] if another, live owner holds it; [`Error::LeaseIo`] for filesystem
     /// errors acquiring it or starting the renewal thread.
     pub(crate) fn acquire(db_path: &Path, clock: Arc<dyn Clock>, ttl: Duration) -> Result<Self> {
-        let path = lease_path(db_path);
         let host = hostname();
         let pid = std::process::id();
-        let owner = ulid::Ulid::new().to_string();
         let ttl_ms = i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
 
-        // `take_exclusive` already confirms its own win before returning (narrowing the window a
-        // straggler acting on a stale read could exploit to two adjacent syscalls — see its doc),
-        // but under enough contention a displacement can still land in that narrow gap. Confirm
-        // once more here, from a completely separate read, and retry the whole acquisition — not
-        // just fail — if it did: from this caller's point of view that is still contention to
-        // resolve, same as any other `AlreadyExists`, not a reason to give up.
-        //
-        // A `Leased` from `take_exclusive` is ordinarily reported immediately: it means a live
-        // owner holds it, full stop, and the caller can act on `until`. But once *this* call has
-        // already seen itself displaced at least once, it is itself part of an active shuffle —
-        // whoever displaced it may not be stable either — so a `Leased` seen right after is only
-        // a snapshot mid-shuffle, not necessarily the final word; keep retrying within the bound
-        // instead of taking that snapshot as definitive.
-        const MAX_DISPLACEMENT_RETRIES: u32 = 32;
-        let mut verified = false;
-        let mut displaced_at_least_once = false;
-        for attempt in 0..MAX_DISPLACEMENT_RETRIES {
-            match take_exclusive(&path, &host, pid, &owner, clock.as_ref(), ttl_ms) {
-                Ok(()) if read_lease(&path).is_some_and(|l| l.owner == owner) => {
-                    verified = true;
-                    break;
-                }
-                Ok(()) => displaced_at_least_once = true,
-                Err(_) if displaced_at_least_once => {}
-                Err(e) => return Err(e),
-            }
-            backoff(attempt);
-        }
-        if !verified {
-            return Err(Error::LeaseIo(std::io::Error::other(
-                "lease verification kept failing after acquiring it",
-            )));
-        }
+        let generation = take_next_gen(db_path, &host, pid, clock.as_ref(), ttl_ms)?;
+        gc_old_generations(db_path, generation);
 
         let lost = Arc::new(AtomicBool::new(false));
         let (stop, rx) = mpsc::channel();
@@ -171,8 +219,7 @@ impl LeaseGuard {
                 .max(1),
         );
         let thread = {
-            let path = path.clone();
-            let owner = owner.clone();
+            let db_path = db_path.to_path_buf();
             let lost = Arc::clone(&lost);
             std::thread::Builder::new()
                 .name("pitcrew-store-lease".to_owned())
@@ -180,10 +227,10 @@ impl LeaseGuard {
                     renew_loop(
                         &rx,
                         renew_every,
-                        &path,
+                        &db_path,
+                        generation,
                         &host,
                         pid,
-                        &owner,
                         &clock,
                         ttl_ms,
                         &lost,
@@ -193,17 +240,34 @@ impl LeaseGuard {
         };
 
         Ok(Self {
-            path,
-            owner,
+            db_path: db_path.to_path_buf(),
+            generation,
             lost,
             stop: Some(stop),
             thread: Some(thread),
         })
     }
 
-    /// Whether the renewal thread has seen someone else take the lease.
-    pub(crate) fn is_lost(&self) -> bool {
-        self.lost.load(Ordering::SeqCst)
+    /// `Err(Error::LeaseLost)` if a higher generation now exists (we have been taken over), else
+    /// `Ok(())`. Checks the renewal thread's cached flag first (free), then — the check that
+    /// matters — re-lists the lease directory fresh: a cheap `readdir` and filename comparison,
+    /// no file content to read, so a loss is caught before the write that calls this, not up to
+    /// `ttl / RENEW_FRACTION` later when the renewal thread would next notice on its own.
+    pub(crate) fn check(&self) -> Result<()> {
+        if self.lost.load(Ordering::SeqCst) {
+            return Err(Error::LeaseLost);
+        }
+        if current_gen(&self.db_path).is_some_and(|(g, _)| g > self.generation) {
+            self.lost.store(true, Ordering::SeqCst);
+            return Err(Error::LeaseLost);
+        }
+        Ok(())
+    }
+
+    /// This lease's generation number, for diagnosis and tests.
+    #[cfg(test)]
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -215,45 +279,26 @@ impl Drop for LeaseGuard {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-        release(&self.path, &self.owner);
+        // Always safe: nothing but us ever creates, renews or deletes
+        // `gen_path(db_path, generation)`, so there is no read-then-delete race to avoid here,
+        // unlike a fixed shared name. Best effort — if it is already gone (a later owner's GC, or
+        // we were never fully set up), there is nothing to release.
+        let _ = std::fs::remove_file(gen_path(&self.db_path, self.generation));
     }
 }
 
-/// Releases the lease at `path` if it still names `owner`, without a read-then-delete race: a
-/// plain `read_lease` followed by `remove_file` could delete another host's lease if it took over
-/// between the two calls. Instead, rename the file aside first (atomic, and does not care what it
-/// names — there is no window to race in) and only then look at what was captured:
-/// - names `owner`: it is ours; delete the aside copy. The lease is released.
-/// - names someone else, or does not parse: another host already took over since our last check.
-///   Put it back, best effort, so their lease is not lost; if that now fails too (a third host
-///   has since done the same to them), there is nothing more we can safely do.
-/// - nothing to rename (already gone): nothing to release.
-fn release(path: &Path, owner: &str) {
-    let aside = path.with_file_name(format!("{}.drop.{}", file_name(path), ulid::Ulid::new()));
-    if std::fs::rename(path, &aside).is_err() {
-        return;
-    }
-    match read_lease(&aside) {
-        Some(l) if l.owner == owner => {
-            let _ = std::fs::remove_file(&aside);
-        }
-        _ => {
-            let _ = std::fs::rename(&aside, path);
-        }
-    }
-}
-
-/// The renewal thread body: wakes every `renew_every` (or at once if `rx` gets a stop signal),
-/// and renews as long as the file still names `owner`. Stops (setting `lost`) the moment it does
-/// not.
+/// The renewal thread body: wakes every `renew_every` (or at once if `rx` gets a stop signal).
+/// Each wakeup re-lists first — a higher generation than ours means we have been taken over, so
+/// it sets `lost` and stops, never writing past a lease it no longer holds — and only then
+/// rewrites its own generation file with a fresh expiry.
 #[allow(clippy::too_many_arguments)]
 fn renew_loop(
     rx: &mpsc::Receiver<()>,
     renew_every: Duration,
-    path: &Path,
+    db_path: &Path,
+    generation: u64,
     host: &str,
     pid: u32,
-    owner: &str,
     clock: &Arc<dyn Clock>,
     ttl_ms: i64,
     lost: &Arc<AtomicBool>,
@@ -263,40 +308,31 @@ fn renew_loop(
             Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {}
         }
-        match read_lease(path) {
-            Some(existing) if existing.owner == owner => {
-                let now_ms = clock.now_ms();
-                let fresh = LeaseData {
-                    host: host.to_owned(),
-                    pid,
-                    owner: owner.to_owned(),
-                    until_ms: now_ms + ttl_ms,
-                };
-                // A transient write failure is retried next wakeup; only a changed owner means
-                // someone else took over.
-                let _ = write_lease(path, &fresh);
-            }
-            _ => {
-                lost.store(true, Ordering::SeqCst);
-                return;
-            }
+        if current_gen(db_path).is_some_and(|(g, _)| g > generation) {
+            lost.store(true, Ordering::SeqCst);
+            return;
         }
+        let now_ms = clock.now_ms();
+        let fresh = LeaseData {
+            host: host.to_owned(),
+            pid,
+            until_ms: now_ms + ttl_ms,
+        };
+        // A transient write failure is retried next wakeup; the re-list above is what detects a
+        // real takeover, not this write succeeding or not.
+        let _ = write_lease(&gen_path(db_path, generation), &fresh);
     }
 }
 
-/// How many times [`take_exclusive`] retries after losing a benign race (another racer cleared
-/// the same stale file, won a fresh create first, or this attempt had to undo a clear that turned
-/// out to have captured something live — see [`clear_if_takeable`]). Each case resolves in a few
-/// iterations at most, so this is generous headroom, not a tuning knob.
-const MAX_ACQUIRE_ATTEMPTS: u32 = 64;
+/// How many times [`take_next_gen`] retries after losing a benign race (another racer created the
+/// same next generation first, or turned out to have created a higher one by the time we
+/// re-listed). Each case resolves in one or two iterations in practice; this is headroom, not a
+/// tuning knob.
+const MAX_ACQUIRE_ATTEMPTS: u32 = 32;
 
-/// A short, jittered pause before [`take_exclusive`] retries. Same idea as `set_journal_mode`'s
-/// retry jitter in `store.rs`: several racers retrying in perfect lockstep (every thread reacting
-/// to the same event at the same instant) can keep re-displacing whichever one wins next,
-/// indefinitely, when they are busy-looping with no delay between attempts at all; a random
-/// pause, growing with the attempt number up to a few milliseconds, spreads retries out so one of
-/// them lands in a quiet moment instead. Milliseconds, not microseconds, because the point is to
-/// outrun ordinary OS scheduling delays under load, which are themselves millisecond-scale.
+/// A short, jittered pause before [`take_next_gen`] retries, so several racers retrying in
+/// lockstep do not all collide on the same next generation number every single time. Same idea as
+/// `store.rs`'s `set_journal_mode` retry jitter.
 fn backoff(attempt: u32) {
     let jitter_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -305,59 +341,57 @@ fn backoff(attempt: u32) {
     std::thread::sleep(Duration::from_micros(micros));
 }
 
-/// Exclusively creates the lease file at `path`, naming `(host, pid, owner)`, taking over an
-/// expired or (same-host) dead-owner lease first if one is in the way. See the module docs for
-/// why this is `hard_link`-based exclusive-create plus rename-aside, not check-then-write.
+/// Takes the next generation of the lease next to `db_path`: reads the current one (if any),
+/// refuses if it is live, and otherwise exclusively creates `current + 1` — then re-lists once
+/// more to confirm that generation is still the highest, since another racer's own exclusive
+/// create for the same next number could have won in the meantime. If a higher generation turns
+/// up, our own file was never going to be current: delete it (ours alone to delete) and retry
+/// from a fresh read. Returns the generation number taken.
 ///
-/// `create_exclusive` returning `Ok` means *this call* momentarily created the name — not that it
-/// still does. [`clear_if_takeable`] closes the gap between deciding a stale entry is takeable and
-/// acting on that decision for the racer clearing it, but a straggler that read the *old* content
-/// before we won, and only reaches its own clear-and-verify sequence afterward, can still displace
-/// what we just created in the instant before we confirm it (that straggler's own verification
-/// then fails and it retries, so this self-corrects — but only after the damage). So treat
-/// `create_exclusive`'s `Ok` as provisional and read the name straight back before trusting it:
-/// this narrows the window from "a whole read-decide-rename sequence" to two adjacent syscalls,
-/// as tight as POSIX's primitives allow without a true compare-and-swap rename.
+/// This is the one place a decision ("is the current lease takeable?") and the action that
+/// follows it cannot be fully atomic together — but unlike round 1's move-aside design, the
+/// action here is always *creating a brand-new name*, never touching whatever is already on disk,
+/// so there is nothing to accidentally clobber: a racer that loses only ever deletes a file it
+/// created itself.
 ///
 /// # Errors
 ///
 /// [`Error::Leased`] if a live owner holds it; [`Error::LeaseIo`] for filesystem errors, or if
-/// contention never lets this resolve within [`MAX_ACQUIRE_ATTEMPTS`] (a sign something is
-/// pathological, e.g. a filesystem where renames never succeed, not an expected outcome).
-fn take_exclusive(
-    path: &Path,
-    host: &str,
-    pid: u32,
-    owner: &str,
-    clock: &dyn Clock,
-    ttl_ms: i64,
-) -> Result<()> {
+/// contention never lets this resolve within [`MAX_ACQUIRE_ATTEMPTS`].
+fn take_next_gen(path: &Path, host: &str, pid: u32, clock: &dyn Clock, ttl_ms: i64) -> Result<u64> {
     for attempt in 0..MAX_ACQUIRE_ATTEMPTS {
         let now_ms = clock.now_ms();
-        let data = LeaseData {
-            host: host.to_owned(),
-            pid,
-            owner: owner.to_owned(),
-            until_ms: now_ms + ttl_ms,
+        let current = current_gen(path);
+        let decision = match &current {
+            None => ReadDecision::Gone,
+            Some((_, gen_file)) => read_decision(gen_file, host, now_ms, ttl_ms)?,
         };
-        match create_exclusive(path, &data) {
-            Ok(()) if read_lease(path).is_some_and(|l| l.owner == owner) => return Ok(()),
-            // Won the create, but lost the name again before this very next read: a straggler
-            // displaced it (see this function's doc). Loop back and compete for it afresh rather
-            // than believing a win that is already gone. Jittered backoff first: without it,
-            // several racers retrying in lockstep can keep re-displacing whoever wins next,
-            // instead of one attempt finally landing in a quiet moment.
-            Ok(()) => backoff(attempt),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                match clear_if_takeable(path, host, owner, now_ms, ttl_ms)? {
-                    // Cleared it ourselves, or someone else changed it first (cleared it, took
-                    // over, or removed it): either way, retry the create and re-read current
-                    // state then.
-                    Clear::Cleared | Clear::Retry => backoff(attempt),
-                    Clear::Refused(e) => return Err(e),
+        match decision {
+            ReadDecision::Live(err) => return Err(err),
+            ReadDecision::Gone | ReadDecision::Takeable => {
+                let base = current.as_ref().map_or(0, |(g, _)| *g);
+                let candidate = base + 1;
+                let data = LeaseData {
+                    host: host.to_owned(),
+                    pid,
+                    until_ms: now_ms + ttl_ms,
+                };
+                let target = gen_path(path, candidate);
+                match create_exclusive(&target, &data) {
+                    Ok(()) => {
+                        if current_gen(path).is_some_and(|(g, _)| g > candidate) {
+                            // Someone else is already further ahead: our file was never going to
+                            // be current. It is ours alone, so deleting it is always safe.
+                            let _ = std::fs::remove_file(&target);
+                            backoff(attempt);
+                        } else {
+                            return Ok(candidate);
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => backoff(attempt),
+                    Err(e) => return Err(Error::LeaseIo(e)),
                 }
             }
-            Err(e) => return Err(Error::LeaseIo(e)),
         }
     }
     Err(Error::LeaseIo(std::io::Error::new(
@@ -366,30 +400,19 @@ fn take_exclusive(
     )))
 }
 
-/// What [`clear_if_takeable`] found.
-enum Clear {
-    /// The stale lease was renamed aside; the path should now be free for a retried create.
-    Cleared,
-    /// State changed under us (the file was cleared or removed by someone else, or is already
-    /// gone); retry the create and re-evaluate, rather than treating this as a refusal.
-    Retry,
-    /// A live, unexpired lease: not ours to take.
-    Refused(Error),
-}
-
-/// What reading the lease file says about whether it may be taken over right now.
+/// What reading the current lease generation says about whether the next one may be created.
 enum ReadDecision {
-    /// Nothing is there.
+    /// Nothing is there (no generation exists yet).
     Gone,
-    /// Expired, or (same host) a dead pid: free to take.
+    /// Expired, or (same host) a dead pid: the next generation may be created.
     Takeable,
     /// A live owner holds it.
     Live(Error),
 }
 
-/// Reads `path` and runs the pure [`decide`] rules against it. Content and mtime come from one
-/// open handle, so they describe the same moment: two separate calls (`read` then `metadata`, or
-/// the reverse) could straddle another write to this path.
+/// Reads `path` (one gen file) and runs the pure [`decide`] rules against it. Content and mtime
+/// come from one open handle, so they describe the same moment: two separate calls (`read` then
+/// `metadata`, or the reverse) could straddle another write to this path.
 fn read_decision(path: &Path, host: &str, now_ms: i64, ttl_ms: i64) -> Result<ReadDecision> {
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
@@ -408,72 +431,17 @@ fn read_decision(path: &Path, host: &str, now_ms: i64, ttl_ms: i64) -> Result<Re
             let same_host_dead = existing.host == host && !pid_alive(existing.pid);
             decide(Some(existing), None, now_ms, ttl_ms, same_host_dead)
         }
-        // Torn or garbage: not a lease we can name an owner for, so only mtime says whether it
-        // might still be live.
+        // Torn or garbage content (the name parsed as a generation, but what is inside did not):
+        // not a lease we can name an owner for, so only mtime says whether it might still be
+        // live. A generation file is written to a temp name and hard-linked or renamed into
+        // place only once fully synced, so this should only happen to genuine corruption, not an
+        // in-flight write.
         None => decide(None, Some(mtime_ms), now_ms, ttl_ms, false),
     };
     Ok(match decision {
         Ok(()) => ReadDecision::Takeable,
         Err((host, pid, until)) => ReadDecision::Live(Error::Leased { host, pid, until }),
     })
-}
-
-/// Called after `create_exclusive` found `path` already occupied: decides whether the lease there
-/// may be taken over, and if so, clears it.
-///
-/// **Never decide-then-rename on the read alone**: `path` can change between that read and a
-/// later rename, including to another racer's own fresh, legitimate lease landing in the gap (its
-/// `create_exclusive` succeeding right after we read the old, expired content) — renaming *then*
-/// would steal that racer's lease, not clear a stale one, and both racers would end up thinking
-/// they hold it. So a first, read-only check answers the common case cheaply and refuses at once
-/// without touching the file; only when it says "takeable" do we act, and even then the rename
-/// captures *whatever is currently there* (not what we decided about), and a second read —
-/// against the now-isolated capture, which nothing else can touch — confirms it is still what we
-/// thought before treating it as cleared. If that second read disagrees, we put it back with the
-/// same exclusive-create primitive acquiring uses (`hard_link`, not `rename`), so a third racer's
-/// own fresh lease that has since filled `path` is never clobbered — only a `path` that is still
-/// empty accepts the restore — and retry from scratch rather than act on a decision already known
-/// to be stale.
-fn clear_if_takeable(
-    path: &Path,
-    host: &str,
-    owner: &str,
-    now_ms: i64,
-    ttl_ms: i64,
-) -> Result<Clear> {
-    match read_decision(path, host, now_ms, ttl_ms)? {
-        ReadDecision::Gone => return Ok(Clear::Retry),
-        ReadDecision::Live(err) => return Ok(Clear::Refused(err)),
-        ReadDecision::Takeable => {}
-    }
-
-    let aside = path.with_file_name(format!(
-        "{}.stale.{owner}.{}",
-        file_name(path),
-        ulid::Ulid::new()
-    ));
-    match std::fs::rename(path, &aside) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Clear::Retry),
-        Err(e) => return Err(Error::LeaseIo(e)),
-    }
-
-    match read_decision(&aside, host, now_ms, ttl_ms)? {
-        // Confirmed against the isolated capture: genuinely takeable (or, impossibly, already
-        // gone — we just created this name). Either way, nothing left to protect.
-        ReadDecision::Takeable | ReadDecision::Gone => {
-            let _ = std::fs::remove_file(&aside);
-            Ok(Clear::Cleared)
-        }
-        // Our first read was stale: this is actually live now (another racer's create landed in
-        // the gap). Put it back if `path` is still empty; if a third racer has since filled it,
-        // leave our capture to be dropped — their lease, not ours to touch.
-        ReadDecision::Live(_) => {
-            let _ = std::fs::hard_link(&aside, path);
-            let _ = std::fs::remove_file(&aside);
-            Ok(Clear::Retry)
-        }
-    }
 }
 
 /// A file's mtime in milliseconds since the Unix epoch, or 0 if it cannot be read.
@@ -484,10 +452,10 @@ fn mtime_ms(meta: &std::fs::Metadata) -> i64 {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
-/// The pure decision `clear_if_takeable` and the renewal thread's takeover checks are built on:
+/// The pure decision [`read_decision`] and the renewal thread's takeover checks are built on:
 /// given what the lease file says (or, for a garbage file, its mtime) and the current time,
-/// whether a new owner may take it. Kept separate from any I/O so it is exhaustively unit-tested
-/// without a filesystem.
+/// whether a new owner may take over. Kept separate from any I/O so it is exhaustively
+/// unit-tested without a filesystem.
 ///
 /// - `existing`: the parsed lease, if the file parsed.
 /// - `garbage_mtime_ms`: the file's mtime, only when `existing` is `None` but the file exists.
@@ -526,11 +494,6 @@ fn decide(
     }
 }
 
-fn read_lease(path: &Path) -> Option<LeaseData> {
-    let bytes = std::fs::read(path).ok()?;
-    serde_json::from_slice(&bytes).ok()
-}
-
 /// Writes `data` as JSON to a fresh, uniquely-named temp file next to `path` (so a later link or
 /// rename lands on the same filesystem) and returns its path. Mode 0600 on Unix; on Windows the
 /// file inherits its directory's ACL (as `pitcrew-auth`'s private files do), so callers should
@@ -557,10 +520,8 @@ fn write_candidate(path: &Path, data: &LeaseData) -> std::io::Result<PathBuf> {
 }
 
 /// Overwrites the lease at `path` unconditionally (a rename lands on whatever is there, or
-/// creates it if nothing is). Only for the renewal thread refreshing a lease it has just
-/// confirmed (by the owner check in `renew_loop`) it already holds — **never** for acquiring one:
-/// here, unlike [`create_exclusive`], a rename onto a fresh lease someone else just took would
-/// silently steal it.
+/// creates it if nothing is). Only for the renewal thread refreshing its own generation file —
+/// nothing else ever touches it, so there is no one else's lease a rename here could steal.
 fn write_lease(path: &Path, data: &LeaseData) -> std::io::Result<()> {
     let tmp = write_candidate(path, data)?;
     std::fs::rename(&tmp, path)
@@ -642,9 +603,16 @@ mod tests {
         LeaseData {
             host: host.to_owned(),
             pid,
-            owner: "owner".to_owned(),
             until_ms,
         }
+    }
+
+    fn write_gen(db_path: &Path, generation: u64, data: &LeaseData) {
+        std::fs::write(
+            gen_path(db_path, generation),
+            serde_json::to_vec(data).expect("encode"),
+        )
+        .expect("write gen file");
     }
 
     #[test]
@@ -718,16 +686,114 @@ mod tests {
     }
 
     #[test]
-    fn lease_path_adds_the_suffix() {
+    fn hostname_is_never_empty() {
+        assert!(!hostname().is_empty());
+    }
+
+    // --- Generation path and directory-listing helpers ---
+
+    #[test]
+    fn gen_path_names_the_generation() {
         assert_eq!(
-            lease_path(Path::new("/a/b/store.db")),
-            Path::new("/a/b/store.db.lease")
+            gen_path(Path::new("/a/b/store.db"), 7),
+            Path::new("/a/b/store.db.lease.7")
         );
     }
 
     #[test]
-    fn hostname_is_never_empty() {
-        assert!(!hostname().is_empty());
+    fn parse_gen_accepts_only_canonical_digit_suffixes() {
+        let prefix = "store.db.lease";
+        assert_eq!(parse_gen("store.db.lease.1", prefix), Some(1));
+        assert_eq!(parse_gen("store.db.lease.42", prefix), Some(42));
+        assert_eq!(parse_gen("store.db.lease.0", prefix), Some(0));
+        assert_eq!(
+            parse_gen("store.db.lease.007", prefix),
+            None,
+            "leading zero"
+        );
+        assert_eq!(parse_gen("store.db.lease.", prefix), None, "empty suffix");
+        assert_eq!(
+            parse_gen("store.db.lease", prefix),
+            None,
+            "no suffix at all"
+        );
+        assert_eq!(parse_gen("store.db.lease.abc", prefix), None, "not digits");
+        assert_eq!(
+            parse_gen("store.db.lease.1x", prefix),
+            None,
+            "trailing junk"
+        );
+        assert_eq!(
+            parse_gen("store.db.lease.-1", prefix),
+            None,
+            "no sign allowed"
+        );
+        assert_eq!(
+            parse_gen("other.lease.1", prefix),
+            None,
+            "wrong prefix entirely"
+        );
+        assert_eq!(
+            parse_gen(".store.db.lease.1.tmp-x", prefix),
+            None,
+            "a stray temp candidate is not a generation"
+        );
+    }
+
+    #[test]
+    fn current_gen_is_none_on_an_empty_or_missing_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("store.db");
+        assert!(current_gen(&db_path).is_none());
+        assert!(current_gen(&dir.path().join("missing/store.db")).is_none());
+    }
+
+    #[test]
+    fn current_gen_is_the_highest_present_and_ignores_garbage_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("store.db");
+        write_gen(&db_path, 1, &lease("h", 1, 1_000));
+        write_gen(&db_path, 3, &lease("h", 1, 1_000));
+        write_gen(&db_path, 2, &lease("h", 1, 1_000));
+        std::fs::write(dir.path().join("store.db.lease.not-a-number"), b"x").expect("garbage");
+        std::fs::write(dir.path().join("store.db.lease.007"), b"x").expect("leading zero");
+        std::fs::write(dir.path().join("unrelated-file"), b"x").expect("unrelated");
+
+        let (generation, path) = current_gen(&db_path).expect("a current generation");
+        assert_eq!(generation, 3);
+        assert_eq!(path, gen_path(&db_path, 3));
+    }
+
+    #[test]
+    fn gc_keeps_the_current_and_previous_generations_and_ignores_garbage_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("store.db");
+        for generation in 1..=5 {
+            write_gen(&db_path, generation, &lease("h", 1, 1_000));
+        }
+        let garbage = dir.path().join("store.db.lease.not-a-number");
+        std::fs::write(&garbage, b"x").expect("garbage");
+
+        gc_old_generations(&db_path, 5);
+
+        for generation in 1..=3 {
+            assert!(
+                !gen_path(&db_path, generation).exists(),
+                "generation {generation} should have been collected"
+            );
+        }
+        assert!(gen_path(&db_path, 4).exists(), "gen 4 (current - 1) stays");
+        assert!(gen_path(&db_path, 5).exists(), "gen 5 (current) stays");
+        assert!(garbage.exists(), "a garbage name is never touched by gc");
+    }
+
+    #[test]
+    fn gc_on_a_fresh_lease_is_a_no_op() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("store.db");
+        write_gen(&db_path, 1, &lease("h", 1, 1_000));
+        gc_old_generations(&db_path, 1); // keep_gen - 1 saturates to 0; nothing is older than 0
+        assert!(gen_path(&db_path, 1).exists());
     }
 
     /// A clock that never advances, for the exclusive-create and race tests below: they do not
@@ -742,39 +808,52 @@ mod tests {
     }
 
     #[test]
-    fn take_exclusive_succeeds_on_a_free_path_and_refuses_a_live_one() {
+    fn take_next_gen_succeeds_on_a_free_path_and_refuses_a_live_one() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("store.db.lease");
+        let db_path = dir.path().join("store.db");
         let clock = FixedClock(1_000);
-        take_exclusive(&path, "host-a", 1, "owner-a", &clock, 60_000).expect("free path");
-        assert_eq!(read_lease(&path).expect("parses").owner, "owner-a");
+        let generation = take_next_gen(&db_path, "host-a", 1, &clock, 60_000).expect("free path");
+        assert_eq!(generation, 1);
+        assert_eq!(current_gen(&db_path).expect("current").0, 1);
 
-        let err = take_exclusive(&path, "host-b", 2, "owner-b", &clock, 60_000)
+        let err = take_next_gen(&db_path, "host-b", 2, &clock, 60_000)
             .expect_err("a live lease must refuse");
         assert!(matches!(err, Error::Leased { .. }), "{err:?}");
-        // The refused attempt must not have touched the held lease.
-        assert_eq!(read_lease(&path).expect("still parses").owner, "owner-a");
+        // The refused attempt must not have touched the held lease or created anything new.
+        assert_eq!(current_gen(&db_path).expect("still current").0, 1);
+    }
+
+    #[test]
+    fn take_next_gen_takes_over_an_expired_lease_at_the_next_generation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("store.db");
+        write_gen(&db_path, 5, &lease("stale-host", 999_999, 500));
+        let clock = FixedClock(1_000_000);
+        let generation = take_next_gen(&db_path, "host-a", 1, &clock, 60_000).expect("expired");
+        assert_eq!(
+            generation, 6,
+            "takeover creates the next generation, not a fresh 1"
+        );
+        assert!(gen_path(&db_path, 5).exists(), "the old file is untouched");
     }
 
     #[test]
     fn many_racers_on_a_fresh_path_exactly_one_wins() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("store.db.lease");
+        let db_path = dir.path().join("store.db");
         let clock = FixedClock(1_000);
         const N: usize = 8;
         let wins: usize = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..N)
                 .map(|i| {
-                    let path = path.clone();
+                    let db_path = db_path.clone();
                     let clock = &clock;
                     scope.spawn(move || {
                         let host = format!("host-{i}");
-                        let owner = format!("owner-{i}");
-                        take_exclusive(
-                            &path,
+                        take_next_gen(
+                            &db_path,
                             &host,
                             1000 + u32::try_from(i).unwrap(),
-                            &owner,
                             clock,
                             60_000,
                         )
@@ -791,142 +870,132 @@ mod tests {
         assert_eq!(wins, 1, "exactly one racer should win a fresh path");
     }
 
-    /// One round of `N` threads racing `LeaseGuard::acquire` on the same (already-seeded) path.
-    /// Returns how many won (`Ok`) and the full set of results.
-    fn race_acquire(db_path: &Path, clock: &Arc<dyn Clock>, n: usize) -> Vec<Result<LeaseGuard>> {
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..n)
-                .map(|_| {
-                    let db_path = db_path.to_path_buf();
-                    let clock = Arc::clone(clock);
-                    scope.spawn(move || {
-                        LeaseGuard::acquire(&db_path, clock, Duration::from_secs(60))
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("thread"))
-                .collect()
-        })
-    }
-
     #[test]
     fn many_racers_on_an_expired_lease_exactly_one_wins() {
-        // Through `LeaseGuard::acquire`, not bare `take_exclusive`: taking over an expired lease
-        // is the one case where a straggler, acting on a read that was correct when it made the
-        // read but stale by the time it acts, can momentarily displace an already-confirmed
-        // winner (see `take_exclusive`'s doc) — `acquire` is what actually guards against that
-        // (its own re-check-and-retry, layered on `take_exclusive`'s own narrowed window), and it
-        // is what `Store::open` really calls, so this is the guarantee that matters end to end.
-        //
-        // Two different properties, checked differently: **safety** — never more than one
-        // racer wins — is non-negotiable and asserted on every single attempt, no retries. Two
-        // winners would mean two hosts believe they hold one database's lease at once, which is
-        // exactly what this whole mechanism exists to prevent. **Liveness** — at least one racer
-        // *does* win — is checked too, but a single attempt failing it is not treated as a bug by
-        // itself: `N` racers with zero network latency between them, all reacting to the exact
-        // same seeded file at once, synchronize far more tightly than real, separate hosts ever
-        // would (real ones have actual latency between their syscalls, which is what settles a
-        // real race quickly). So a round with zero winners is retried with a fresh seed, up to a
-        // bound, before treating it as a genuine problem — the retried rounds still each assert
-        // the safety property in full.
         let dir = tempfile::tempdir().expect("tempdir");
         let db_path = dir.path().join("store.db");
-        let path = lease_path(&db_path);
-        let clock: Arc<dyn Clock> = Arc::new(FixedClock(1_000_000));
-        const N: usize = 4;
-        const ROUNDS: u32 = 5;
-        const LIVENESS_RETRIES_PER_ROUND: u32 = 5;
-        for round in 0..ROUNDS {
-            let mut wins = 0;
-            let mut results = Vec::new();
-            for liveness_attempt in 0..LIVENESS_RETRIES_PER_ROUND {
-                std::fs::write(
-                    &path,
-                    serde_json::to_vec(&lease("stale-host", 999_999, 500)).expect("encode"),
-                )
-                .expect("seed stale lease");
-                results = race_acquire(&db_path, &clock, N);
-                wins = results.iter().filter(|r| r.is_ok()).count();
-                // Safety: checked on every attempt, not just the one that ends the loop.
-                assert!(
-                    wins <= 1,
-                    "round {round} attempt {liveness_attempt}: at most one racer may ever win, \
-                     got {wins}"
-                );
-                for r in &results {
-                    if let Err(e) = r {
-                        // Ordinarily `Error::Leased`; `Error::LeaseIo` only if a racer exhausted
-                        // its own retries against repeated displacement. Either way: this racer
-                        // did not win — never a database error reaching past the lease.
-                        assert!(
-                            matches!(e, Error::Leased { .. } | Error::LeaseIo(_)),
-                            "round {round} attempt {liveness_attempt}: {e:?}"
-                        );
-                    }
-                }
-                if wins == 1 {
-                    break;
-                }
-                // `wins == 0`: nothing held to clean up. The next iteration's `results = ...`
-                // reassignment (or the loop ending) drops this attempt's (all-`Err`) results.
+        let clock = FixedClock(1_000_000);
+        const N: usize = 8;
+        for round in 0..5u64 {
+            write_gen(&db_path, round + 1, &lease("stale-host", 999_999, 500));
+            let wins: usize = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..N)
+                    .map(|i| {
+                        let db_path = db_path.clone();
+                        let clock = &clock;
+                        scope.spawn(move || {
+                            let host = format!("host-{round}-{i}");
+                            take_next_gen(
+                                &db_path,
+                                &host,
+                                2000 + u32::try_from(i).unwrap(),
+                                clock,
+                                60_000,
+                            )
+                            .is_ok()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("thread"))
+                    .filter(|&ok| ok)
+                    .count()
+            });
+            assert_eq!(wins, 1, "round {round}: exactly one racer should win");
+            // Clean the whole lease directory before the next round seeds a fresh expired gen 1
+            // (the next round's `write_gen(db_path, round + 1, ...)` only adds, so each round
+            // must start from a clean slate of exactly one, known-expired file).
+            let (highest, _) = current_gen(&db_path).expect("a winner exists");
+            for generation in 1..=highest {
+                let _ = std::fs::remove_file(gen_path(&db_path, generation));
             }
-            assert_eq!(
-                wins, 1,
-                "round {round}: no racer won an expired lease within \
-                 {LIVENESS_RETRIES_PER_ROUND} attempts"
+        }
+    }
+
+    /// A direct regression test for review round 2's finding: in the old move-aside design, a
+    /// three-way interleaving (a straggler's now-stale decision displacing an already-confirmed
+    /// winner, with a third racer filling the resulting gap) could leave two hosts both believing
+    /// they held the lease. The generation-numbered design removes the mechanism that made that
+    /// possible — nobody ever renames or deletes another racer's file, only ever creates a new,
+    /// higher-numbered one — so this is a safety check with zero tolerance, checked on every
+    /// single attempt, not a liveness check with retries.
+    #[test]
+    fn three_racers_on_an_expired_lease_never_give_two_holders() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("store.db");
+        let clock = FixedClock(1_000_000);
+        const N: usize = 3;
+        const ROUNDS: u64 = 20;
+        for round in 0..ROUNDS {
+            write_gen(&db_path, round + 1, &lease("stale-host", 999_999, 500));
+            let wins: usize = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..N)
+                    .map(|i| {
+                        let db_path = db_path.clone();
+                        let clock = &clock;
+                        scope.spawn(move || {
+                            let host = format!("r{round}-h{i}");
+                            take_next_gen(
+                                &db_path,
+                                &host,
+                                3000 + u32::try_from(i).unwrap(),
+                                clock,
+                                60_000,
+                            )
+                            .is_ok()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("thread"))
+                    .filter(|&ok| ok)
+                    .count()
+            });
+            assert!(
+                wins <= 1,
+                "round {round}: at most one racer may ever hold the lease, got {wins}"
             );
-            // Dropping the winner here (end of the round) stops its renewal thread and releases
-            // the lease before the next round reseeds it.
-            drop(results);
-            // Every racer that cleared the stale file aside removes its own unique aside name
-            // right after (see `clear_if_takeable`), and a racer that had to put a capture back
-            // removes it too: none should be left behind.
-            let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-                .expect("read_dir")
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .filter(|name| name.contains(".stale."))
-                .collect();
-            assert!(leftovers.is_empty(), "round {round}: {leftovers:?}");
+            let (highest, _) = current_gen(&db_path).expect("a winner exists");
+            for generation in 1..=highest {
+                let _ = std::fs::remove_file(gen_path(&db_path, generation));
+            }
         }
     }
 
     #[test]
-    fn release_deletes_a_lease_that_still_names_us() {
+    fn release_removes_only_our_own_generation_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("store.db.lease");
-        let clock = FixedClock(1_000);
-        take_exclusive(&path, "host-a", 1, "owner-a", &clock, 60_000).expect("acquire");
-        release(&path, "owner-a");
-        assert!(
-            !path.exists(),
-            "release must remove a lease that is still ours"
-        );
-    }
-
-    #[test]
-    fn release_restores_a_lease_that_now_names_someone_else() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("store.db.lease");
-        // As if another host took over between our last check and this `release` call.
-        std::fs::write(
-            &path,
-            serde_json::to_vec(&lease("other-host", 2, 999_999)).expect("encode"),
+        let db_path = dir.path().join("store.db");
+        let guard = LeaseGuard::acquire(
+            &db_path,
+            Arc::new(FixedClock(1_000)),
+            Duration::from_secs(60),
         )
-        .expect("seed");
-        release(&path, "owner-a"); // not the owner named in the file
-        let remaining =
-            read_lease(&path).expect("release must not delete a lease naming someone else");
-        assert_eq!(remaining.host, "other-host");
-    }
+        .expect("acquire on a fresh path");
+        let my_generation = guard.generation();
+        assert_eq!(my_generation, 1);
 
-    #[test]
-    fn release_of_an_already_gone_lease_is_a_no_op() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("store.db.lease");
-        release(&path, "owner-a"); // nothing there at all
-        assert!(!path.exists());
+        // Other generation files already present (as if left over from a predecessor, not yet
+        // garbage-collected, or a stray number nothing created through the normal path) must
+        // never be touched by this guard's own drop.
+        write_gen(&db_path, 0, &lease("ghost-a", 10, 1));
+        write_gen(&db_path, 99, &lease("ghost-b", 11, 999_999));
+
+        drop(guard);
+
+        assert!(
+            !gen_path(&db_path, my_generation).exists(),
+            "our own generation is released"
+        );
+        assert!(
+            gen_path(&db_path, 0).exists(),
+            "an unrelated generation file must never be touched"
+        );
+        assert!(
+            gen_path(&db_path, 99).exists(),
+            "an unrelated generation file must never be touched"
+        );
     }
 }

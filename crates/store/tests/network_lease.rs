@@ -1,21 +1,22 @@
-//! The single-host lease (network mode). The lease file sits next to the database as
-//! `<db>.lease` (here `store.db.lease`) and holds JSON `{host, pid, owner, until_ms}`; these
-//! tests read and write that file directly to play the part of another host or a crashed run.
-//! The pure takeover/expiry decision logic has its own exhaustive unit tests in `src/lease.rs`.
+//! The single-host lease (network mode). Lease files sit next to the database as
+//! `<db>.lease.<gen>` (here `store.db.lease.<gen>`), a `u64` generation counter; the current
+//! lease is whichever generation is highest. These tests write generation files directly to play
+//! the part of another host, a crashed run, or a takeover in progress. The pure takeover/expiry
+//! decision logic, and the generation bookkeeping (listing, parsing, GC) has its own exhaustive
+//! unit tests in `src/lease.rs`.
 
 mod common;
 
 use common::FakeClock;
 use pitcrew_store::{Error, FsMode, Store, StoreOptions};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Several `Store::open` calls on the same path, each on its own thread. Returns how many
-/// succeeded and the errors the rest failed with, so a caller can assert exactly one opener won
-/// and every loser's error is [`Error::Leased`] — never a database error, which would mean a
-/// loser reached SQLite before the lease refused it.
+/// Several `Store::open` calls on the same path, each on its own thread. Returns every result, so
+/// a caller can assert exactly one opener won and every loser's error is [`Error::Leased`] —
+/// never a database error, which would mean a loser reached SQLite before the lease refused it.
 fn race_to_open(
-    path: &std::path::Path,
+    path: &Path,
     n: usize,
     options: impl Fn() -> StoreOptions,
 ) -> Vec<Result<Store, Error>> {
@@ -34,11 +35,23 @@ fn race_to_open(
     })
 }
 
-fn paths(dir: &tempfile::TempDir) -> (PathBuf, PathBuf) {
-    (
-        dir.path().join("store.db"),
-        dir.path().join("store.db.lease"),
+fn db_path(dir: &tempfile::TempDir) -> PathBuf {
+    dir.path().join("store.db")
+}
+
+/// Generation `generation`'s lease file path, mirroring `pitcrew_store`'s own (private) naming so
+/// these tests can seed, inspect and simulate takeovers directly.
+fn gen_file(dir: &tempfile::TempDir, generation: u64) -> PathBuf {
+    dir.path().join(format!("store.db.lease.{generation}"))
+}
+
+fn write_gen(dir: &tempfile::TempDir, generation: u64, host: &str, pid: u32, until_ms: i64) {
+    let value = serde_json::json!({ "host": host, "pid": pid, "until_ms": until_ms });
+    std::fs::write(
+        gen_file(dir, generation),
+        serde_json::to_vec(&value).expect("encode"),
     )
+    .expect("write gen file");
 }
 
 // `StoreOptions` is `#[non_exhaustive]`, so outside its own crate it can only be built by
@@ -53,7 +66,7 @@ fn network_options(ttl: Duration) -> StoreOptions {
 #[test]
 fn a_second_open_in_network_mode_fails_with_leased() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (path, _lease) = paths(&dir);
+    let path = db_path(&dir);
     let first = Store::open(&path, network_options(Duration::from_secs(30))).expect("first open");
     let err =
         Store::open(&path, network_options(Duration::from_secs(30))).expect_err("must refuse");
@@ -64,32 +77,23 @@ fn a_second_open_in_network_mode_fails_with_leased() {
 #[test]
 fn dropping_the_store_releases_the_lease() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (path, lease) = paths(&dir);
+    let path = db_path(&dir);
     let store = Store::open(&path, network_options(Duration::from_secs(30))).expect("open");
-    assert!(lease.exists(), "open must write the lease file");
+    let gen1 = gen_file(&dir, 1);
+    assert!(gen1.exists(), "open must write generation 1's lease file");
     drop(store);
-    assert!(!lease.exists(), "drop must release the lease file");
+    assert!(!gen1.exists(), "drop must release the lease file");
 }
 
 #[test]
-fn an_expired_lease_is_taken_over_using_the_injected_clock() {
+fn an_expired_lease_is_taken_over_at_the_next_generation() {
     // A lease a crashed process left behind: a real crash would also close its SQLite connection
     // (releasing the OS-level lock network mode's `locking_mode=EXCLUSIVE` takes), which a
     // `mem::forget` of a live `Store` in this same process would not simulate correctly — so the
     // file is written directly, as the real file would look once that connection is gone.
     let dir = tempfile::tempdir().expect("tempdir");
-    let (path, lease) = paths(&dir);
-    std::fs::write(
-        &lease,
-        serde_json::to_vec(&serde_json::json!({
-            "host": "another-host",
-            "pid": 123_456,
-            "owner": "01STALEOWNERULIDXXXXXXXXXX",
-            "until_ms": 500,
-        }))
-        .expect("encode"),
-    )
-    .expect("write stale lease");
+    let path = db_path(&dir);
+    write_gen(&dir, 1, "another-host", 123_456, 500);
 
     // The clock `Store::open` is given already reads past `until_ms`, with no real time passed.
     let mut options = StoreOptions::default();
@@ -97,24 +101,31 @@ fn an_expired_lease_is_taken_over_using_the_injected_clock() {
     options.lease_ttl = Duration::from_secs(60);
     options.clock = FakeClock::new(1_000);
     let store = Store::open(&path, options).expect("takes over the expired lease");
+    assert!(
+        gen_file(&dir, 1).exists(),
+        "the old generation's file is left untouched by a takeover"
+    );
+    assert!(
+        gen_file(&dir, 2).exists(),
+        "the takeover creates the next generation, not a fresh generation 1"
+    );
     drop(store);
 }
 
 #[test]
 fn renewal_keeps_extending_the_lease() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (path, lease) = paths(&dir);
+    let path = db_path(&dir);
+    let gen1 = gen_file(&dir, 1);
     let ttl = Duration::from_millis(300);
     let store = Store::open(&path, network_options(ttl)).expect("open");
-    let initial_until = read_until_ms(&lease);
+    let initial_until = read_until_ms(&gen1);
 
     // The renewal thread wakes roughly every ttl/3 (~100ms here); give it generous room on a
-    // machine shared with other agents and this same file's own thread-heavy race tests. Same
-    // bound as `a_taken_over_lease_fails_rebuild_too`, empirically the margin this file needs
-    // under heavy concurrent load.
+    // machine shared with other agents and this same file's own thread-heavy race tests.
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
     loop {
-        if read_until_ms(&lease) > initial_until {
+        if read_until_ms(&gen1) > initial_until {
             break;
         }
         assert!(
@@ -127,43 +138,52 @@ fn renewal_keeps_extending_the_lease() {
 }
 
 #[test]
-fn a_taken_over_lease_fails_the_next_append() {
+fn a_taken_over_lease_fails_the_next_append_immediately() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (path, lease) = paths(&dir);
-    let ttl = Duration::from_millis(300);
-    let store = Store::open(&path, network_options(ttl)).expect("open");
+    let path = db_path(&dir);
+    let store = Store::open(&path, network_options(Duration::from_secs(60))).expect("open");
+    assert!(gen_file(&dir, 1).exists());
 
-    // Someone else takes the lease: same shape, a different owner. Contents otherwise do not
-    // matter, since the renewal thread only checks the owner before it writes.
-    let mut value = read_json(&lease);
-    value["owner"] = serde_json::json!("someone-else");
-    std::fs::write(&lease, serde_json::to_vec(&value).expect("encode")).expect("overwrite");
+    // Someone else takes over: a higher generation appears. `check_lease` re-lists on every
+    // write, so this is caught on the very next call — no sleep loop, no deadline, unlike the
+    // old single-fixed-file design where only the renewal thread's own periodic wakeup (up to
+    // `ttl / RENEW_FRACTION` later) could notice.
+    write_gen(&dir, 2, "someone-else", 999_999, 999_999_999);
 
     let fixture = pitcrew_fixtures::demo_workspace().expect("fixture").events;
-    // Same generous deadline as `renewal_keeps_extending_the_lease`, for the same reason.
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    loop {
-        let mut event = fixture[0].clone();
-        event.id = pitcrew_protocol::ids::EventId::new();
-        match store.append(std::slice::from_ref(&event)) {
-            Err(Error::LeaseLost) => break,
-            Ok(_) => {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "LeaseLost was never observed"
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(e) => panic!("unexpected error: {e:?}"),
-        }
-    }
+    let event = fixture[0].clone();
+    let err = store
+        .append(std::slice::from_ref(&event))
+        .expect_err("a displaced owner's next write must fail at once");
+    assert!(matches!(err, Error::LeaseLost), "{err:?}");
+}
+
+#[test]
+fn a_taken_over_lease_fails_rebuild_immediately() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = db_path(&dir);
+    let store = Store::open_with_migrations(
+        &path,
+        network_options(Duration::from_secs(60)),
+        &common::toy_migrations(),
+        vec![Box::new(common::CountBy::types())],
+    )
+    .expect("open");
+
+    write_gen(&dir, 2, "someone-else", 999_999, 999_999_999);
+
+    let err = store
+        .rebuild("toy.by_type")
+        .expect_err("a displaced owner's rebuild must fail at once");
+    assert!(matches!(err, Error::LeaseLost), "{err:?}");
 }
 
 #[test]
 fn a_fresh_garbage_lease_file_refuses_but_a_stale_one_is_taken_over() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (path, lease) = paths(&dir);
-    std::fs::write(&lease, b"not json at all").expect("write garbage");
+    let path = db_path(&dir);
+    let gen1 = gen_file(&dir, 1);
+    std::fs::write(&gen1, b"not json at all").expect("write garbage");
 
     // Generous ttl: the point is that a *fresh* garbage file refuses regardless of how long the
     // open itself takes.
@@ -176,20 +196,21 @@ fn a_fresh_garbage_lease_file_refuses_but_a_stale_one_is_taken_over() {
     let old = std::time::SystemTime::now() - ttl - Duration::from_secs(1);
     let file = std::fs::File::options()
         .write(true)
-        .open(&lease)
+        .open(&gen1)
         .expect("open for mtime");
     file.set_modified(old).expect("set_modified");
     drop(file);
 
     let store =
         Store::open(&path, network_options(ttl)).expect("a stale garbage file is taken over");
+    assert!(gen_file(&dir, 2).exists(), "takeover creates generation 2");
     drop(store);
 }
 
 #[test]
 fn many_threads_racing_a_fresh_path_exactly_one_opens_and_losers_never_touch_sqlite() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (path, _lease) = paths(&dir);
+    let path = db_path(&dir);
     const N: usize = 4;
     let results = race_to_open(&path, N, || network_options(Duration::from_secs(30)));
 
@@ -207,7 +228,7 @@ fn many_threads_racing_a_fresh_path_exactly_one_opens_and_losers_never_touch_sql
 #[test]
 fn many_threads_racing_an_expired_lease_exactly_one_opens() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (path, lease) = paths(&dir);
+    let path = db_path(&dir);
 
     // One shared clock, well past `until_ms`, for every racer: all must agree the lease is
     // already expired, with no real time passing during the race.
@@ -219,23 +240,11 @@ fn many_threads_racing_an_expired_lease_exactly_one_opens() {
     // `Error::Leased` rather than it having reached SQLite — are checked too, but `N` in-process
     // threads with zero network latency between them synchronize far more tightly than real,
     // separate hosts racing over an actual network ever would, so a single attempt not reaching
-    // that ideal outcome is retried with a fresh seed, up to a bound, rather than failed outright
-    // (see `lease::tests::many_racers_on_an_expired_lease_exactly_one_wins` for the same
-    // reasoning in more detail).
+    // that ideal outcome is retried with a fresh seed, up to a bound, rather than failed outright.
     const ROUND_RETRIES: u32 = 5;
     let mut results = Vec::new();
     for attempt in 0..ROUND_RETRIES {
-        std::fs::write(
-            &lease,
-            serde_json::to_vec(&serde_json::json!({
-                "host": "stale-host",
-                "pid": 999_999,
-                "owner": "01STALEOWNERULIDXXXXXXXXXX",
-                "until_ms": 500,
-            }))
-            .expect("encode"),
-        )
-        .expect("seed stale lease");
+        write_gen(&dir, 1, "stale-host", 999_999, 500);
         results = race_to_open(&path, N, || {
             let mut options = StoreOptions::default();
             options.fs = FsMode::Network;
@@ -255,6 +264,8 @@ fn many_threads_racing_an_expired_lease_exactly_one_opens() {
         if oks == 1 && all_losers_clean {
             return;
         }
+        drop(std::mem::take(&mut results)); // release the winner, if any, before reseeding
+        clean_lease_dir(&dir);
     }
     let oks = results.iter().filter(|r| r.is_ok()).count();
     assert_eq!(
@@ -268,48 +279,78 @@ fn many_threads_racing_an_expired_lease_exactly_one_opens() {
     }
 }
 
+/// A direct regression test for review round 2's finding, through the full `Store::open` path
+/// (not just `LeaseGuard::acquire` directly, which `lease::tests::three_racers_on_an_expired_lease_never_give_two_holders`
+/// already covers): with three racers contending for one expired lease, at most one `Store` may
+/// ever successfully open. Safety, checked on every attempt, no retries or exceptions — this is
+/// exactly the three-way interleaving (a straggler's stale decision displacing an already-won
+/// lease, a third racer filling the gap) that broke the old move-aside design.
 #[test]
-fn a_taken_over_lease_fails_rebuild_too() {
+fn three_threads_racing_an_expired_lease_never_give_two_holders() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let (path, lease) = paths(&dir);
-    let ttl = Duration::from_millis(300);
-    let store = Store::open_with_migrations(
-        &path,
-        network_options(ttl),
-        &common::toy_migrations(),
-        vec![Box::new(common::CountBy::types())],
-    )
-    .expect("open");
+    let path = db_path(&dir);
+    let clock = FakeClock::new(1_000_000);
+    const N: usize = 3;
+    const ROUNDS: u32 = 10;
+    for round in 0..ROUNDS {
+        write_gen(&dir, 1, "stale-host", 999_999, 500);
+        let results = race_to_open(&path, N, || {
+            let mut options = StoreOptions::default();
+            options.fs = FsMode::Network;
+            options.lease_ttl = Duration::from_secs(30);
+            options.clock = clock.clone();
+            options
+        });
+        let oks = results.iter().filter(|r| r.is_ok()).count();
+        assert!(
+            oks <= 1,
+            "round {round}: at most one opener may ever hold the lease, got {oks}"
+        );
+        drop(results);
+        clean_lease_dir(&dir);
+    }
+}
 
-    // Someone else takes the lease, exactly as in `a_taken_over_lease_fails_the_next_append`.
-    let mut value = read_json(&lease);
-    value["owner"] = serde_json::json!("someone-else");
-    std::fs::write(&lease, serde_json::to_vec(&value).expect("encode")).expect("overwrite");
+#[test]
+fn opening_over_several_stale_generations_gcs_down_to_the_current_and_previous() {
+    // `pitcrew_store::lease`'s own unit tests already exercise `gc_old_generations` directly
+    // (seeding generations and asserting exactly which survive); this is the same guarantee seen
+    // through `Store::open`, simulating generations 1-3 as prior, now-expired holders (crashed or
+    // long gone, never released — a real release would delete its own file, leaving nothing for
+    // GC to find, which is why this seeds them directly rather than cycling real `Store::open`
+    // and `drop` calls) so that one open's takeover has real history to collect.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = db_path(&dir);
+    for generation in 1..=3 {
+        write_gen(&dir, generation, "stale-host", 999_999, 500);
+    }
 
-    // A generous deadline: the renewal thread's wakeup is real wall-clock time, and this suite
-    // runs many other threads (including the races below) on a machine shared with other agents,
-    // so a 100ms-ish wakeup can occasionally take much longer under scheduling pressure.
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    loop {
-        match store.rebuild("toy.by_type") {
-            Err(Error::LeaseLost) => break,
-            Ok(()) => {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "LeaseLost was never observed"
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(e) => panic!("unexpected error: {e:?}"),
+    let mut options = StoreOptions::default();
+    options.fs = FsMode::Network;
+    options.lease_ttl = Duration::from_secs(60);
+    options.clock = FakeClock::new(1_000_000);
+    let store = Store::open(&path, options).expect("takes over at generation 4");
+
+    assert!(gen_file(&dir, 4).exists(), "the new current generation");
+    assert!(gen_file(&dir, 3).exists(), "kept: current - 1");
+    assert!(!gen_file(&dir, 2).exists(), "gc'd: older than current - 1");
+    assert!(!gen_file(&dir, 1).exists(), "gc'd: older than current - 1");
+    drop(store);
+}
+
+/// Removes every generation file in `dir`'s lease family, for tests that run several independent
+/// rounds of the same race and need each round to start from a clean slate.
+fn clean_lease_dir(dir: &tempfile::TempDir) {
+    for entry in std::fs::read_dir(dir.path()).expect("read_dir").flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with("store.db.lease.") {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
 }
 
-fn read_json(path: &std::path::Path) -> serde_json::Value {
+fn read_until_ms(path: &Path) -> i64 {
     let bytes = std::fs::read(path).expect("read lease");
-    serde_json::from_slice(&bytes).expect("parse lease")
-}
-
-fn read_until_ms(path: &std::path::Path) -> i64 {
-    read_json(path)["until_ms"].as_i64().expect("until_ms")
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("parse lease");
+    value["until_ms"].as_i64().expect("until_ms")
 }
