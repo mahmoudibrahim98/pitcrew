@@ -16,8 +16,12 @@ import { evidenceFor } from './recap-evidence.ts';
 import { Receipts } from './receipts.tsx';
 import { MaybeLink } from './ui.tsx';
 
-/** `preview`: shown on hover or focus, not interactive. `open`: activated, focus inside. */
-type Mode = 'closed' | 'preview' | 'open';
+/**
+ * `hover`: previewed under the pointer, which may move in to follow a receipt. `focus`: previewed
+ * while the clause has keyboard focus, inert so that Tab goes on to the next clause. `open`:
+ * activated, focus inside.
+ */
+type Mode = 'closed' | 'hover' | 'focus' | 'open';
 
 const HOVER_OPEN_MS = 300;
 const HOVER_CLOSE_MS = 200;
@@ -99,9 +103,10 @@ function Clause({
     if (mode === 'open') content.current?.focus();
   }, [mode]);
 
-  const preview = () => {
+  const preview = (by: 'hover' | 'focus') => {
     clearTimer();
-    setMode((m) => (m === 'closed' ? 'preview' : m));
+    // Keyboard focus wins over the pointer; neither changes evidence already open.
+    setMode((m) => (m === 'closed' || (m === 'hover' && by === 'focus') ? by : m));
     onEvidence?.();
   };
   const toggle = () => {
@@ -111,14 +116,12 @@ function Clause({
   };
   const closeSoon = () => {
     clearTimer();
-    timer.current = setTimeout(() => {
-      setMode((m) => (m === 'preview' && document.activeElement !== anchor.current ? 'closed' : m));
-    }, HOVER_CLOSE_MS);
+    timer.current = setTimeout(() => setMode((m) => (m === 'hover' ? 'closed' : m)), HOVER_CLOSE_MS);
   };
   const onPointerEnter = (e: PointerEvent) => {
     if (e.pointerType === 'touch') return;
     clearTimer();
-    timer.current = setTimeout(preview, HOVER_OPEN_MS);
+    if (mode === 'closed') timer.current = setTimeout(() => preview('hover'), HOVER_OPEN_MS);
   };
   const onPointerLeave = (e: PointerEvent) => {
     if (e.pointerType !== 'touch') closeSoon();
@@ -146,9 +149,9 @@ function Clause({
           className={cx(CLAUSE, mode !== 'closed' && 'bg-accent-soft')}
           onClick={toggle}
           onKeyDown={onKeyDown}
-          onFocus={() => !restoring.current && preview()}
+          onFocus={() => !restoring.current && preview('focus')}
           onBlur={(e) => {
-            if (mode === 'preview' && !(content.current?.contains(e.relatedTarget as Node | null) ?? false)) {
+            if (mode === 'focus' && !(content.current?.contains(e.relatedTarget as Node | null) ?? false)) {
               clearTimer();
               setMode('closed');
             }
@@ -167,7 +170,7 @@ function Clause({
         align="start"
         sideOffset={6}
         collisionPadding={12}
-        inert={mode === 'preview'}
+        inert={mode === 'focus'}
         onOpenAutoFocus={(e) => {
           e.preventDefault();
           if (mode === 'open') content.current?.focus();

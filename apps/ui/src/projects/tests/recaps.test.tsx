@@ -205,17 +205,29 @@ describe('recaps', () => {
     await eventually(() => expect(screen.queryByRole('dialog')).toBeNull());
   });
 
-  it('previews a clause’s receipts on hover', async () => {
-    renderWithHub(<RecapSummary scope={{ workstream: demo.seedRuns }} />, hub);
+  it('previews a clause’s receipts on hover, and the pointer can move in to follow one', async () => {
+    const openSession = vi.fn();
+    renderWithHub(<RecapSummary scope={{ workstream: demo.seedRuns }} />, hub, { nav: { openSession } });
     const clause = await screen.findByRole('button', { name: /^@runner ran a tool, with evidence \(2 receipts\)/ });
     fireEvent.pointerEnter(clause);
     const preview = await screen.findByRole('dialog', { name: 'Evidence for “@runner ran a tool”' });
+    expect(preview.hasAttribute('inert')).toBe(false);
+    expect(clause.getAttribute('aria-expanded')).toBe('false');
     const receipts = within(preview).getByRole('list', { name: 'Receipts' });
     expect(within(receipts).getAllByRole('listitem').map((li) => li.textContent)).toEqual([
       'Event …0009',
       'Transcript @118220',
     ]);
+
+    // Moving from the clause into the preview keeps it; a transcript receipt opens its session.
     fireEvent.pointerLeave(clause);
+    fireEvent.pointerEnter(preview);
+    await new Promise((done) => setTimeout(done, 400));
+    expect(screen.getByRole('dialog')).toBe(preview);
+    fireEvent.click(within(receipts).getByRole('button', { name: 'Transcript @118220' }));
+    expect(openSession).toHaveBeenCalledWith(ses2, 'chat');
+
+    fireEvent.pointerLeave(preview);
     await eventually(() => expect(screen.queryByRole('dialog')).toBeNull());
   });
 

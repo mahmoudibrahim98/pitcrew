@@ -102,8 +102,9 @@ reads the data layer's `useRecapDays` and `useRecapBlocks` (`src/data/recaps.ts`
 - **Clauses** (`recap-text.tsx`). Text goes through `clauses()` (spans are UTF-8 byte ranges) and is
   rendered as text only, never HTML or markdown. Each clause with receipts is an inline
   `role="button"` (a real `<button>` cannot wrap across lines inside a paragraph) named "*clause*,
-  with evidence (*n* receipts)". Hovering or focusing it previews its evidence (inert, focus stays);
-  Enter, Space or a click opens it: a non-modal Radix popover, rendered next to the clause, that
+  with evidence (*n* receipts)". Hovering it previews its evidence, and the pointer may move into
+  the preview to follow a receipt; focusing it previews it too, inert, so Tab goes on to the next
+  clause. Enter, Space or a click opens it: a non-modal Radix popover, rendered next to the clause, that
   takes focus and holds the clause's receipts (the existing chips) and the sessions, tasks and
   files they lead to (`recap-evidence.ts`), as links where the layout can go. Tab moves within it;
   Escape closes it and returns to the clause; activating the clause again, or clicking outside,
