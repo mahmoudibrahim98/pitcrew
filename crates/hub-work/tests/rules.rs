@@ -429,6 +429,37 @@ async fn a_forbidden_agent_hears_403_before_any_400() {
     }
 }
 
+/// What the path names is looked up before the body is read: an unknown task, workstream or
+/// project is `404` whatever the body; a known one with a bad body is `400`.
+#[tokio::test]
+async fn an_unknown_path_is_404_before_a_bad_body_is_400() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let work = seeded(dir.path());
+    let app = app(&work);
+    let sam = Some(person(SAM));
+    let unknown_ws = "01JB000000000000000WST0099";
+    let unknown_project = "01JB000000000000000PRJ0099";
+    let bad = json!("not an object");
+    for (method, path, status) in [
+        ("POST", "/v1/tasks/PAP-99/dispatch".to_owned(), 404),
+        ("POST", "/v1/tasks/PAP-99/assign".to_owned(), 404),
+        ("PATCH", format!("/v1/workstreams/{unknown_ws}"), 404),
+        ("PUT", format!("/v1/briefs/workstream/{unknown_ws}"), 404),
+        ("PUT", format!("/v1/briefs/project/{unknown_project}"), 404),
+        ("POST", "/v1/tasks/PAP-5/dispatch".to_owned(), 400),
+        ("POST", "/v1/tasks/PAP-5/assign".to_owned(), 400),
+        (
+            "PATCH",
+            format!("/v1/workstreams/{}", demo().workstreams[0].id.0),
+            400,
+        ),
+        ("PUT", format!("/v1/briefs/project/{PAPER}"), 400),
+    ] {
+        let res = call(&app, sam, method, &path, Some(bad.clone())).await;
+        assert_eq!(res.0, status, "{method} {path}: {}", res.1);
+    }
+}
+
 #[tokio::test]
 async fn an_answer_needs_an_option_or_some_text() {
     let dir = tempfile::tempdir().expect("tempdir");

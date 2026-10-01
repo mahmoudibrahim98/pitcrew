@@ -52,8 +52,9 @@ pub struct WorkspaceAt {
 /// the same key, two moves never both start from the same status. A second service (or process)
 /// writing to the same store would break that. The projections stay deterministic even then (a
 /// `task_created` whose key is taken is recorded as a clash and not applied; a `task_moved` whose
-/// `from` is stale is ignored), and the losing command answers `409 conflict`, but the rule is what
-/// keeps commands from losing.
+/// `from` is stale is ignored), and the losing command answers `409 conflict`: `create_task` when
+/// its key was taken, `move_task` and `dispatch_working` when the task ended up somewhere other
+/// than where they moved it. The rule is what keeps commands from losing.
 ///
 /// Every event a command appends is stamped from the [`Caller`]: `author` is the caller's member
 /// and, for an agent, `on_behalf_of` is its owner; never anything from a request body.
@@ -107,8 +108,9 @@ impl WorkService {
         self
     }
 
-    /// The machine the hub runs on, where a dispatch runs when the task has no folder. Without
-    /// it, the first `local` machine is used.
+    /// The machine the hub runs on, where a dispatch runs when the task has no folder. The daemon
+    /// must set it: without it, such a dispatch answers `503 unavailable` (the hub does not guess
+    /// one of the workspace's machines).
     #[must_use]
     pub fn with_hub_machine(mut self, machine: MachineId) -> Self {
         self.hub_machine = Some(machine);

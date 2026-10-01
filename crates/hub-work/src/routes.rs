@@ -12,8 +12,9 @@
 //! failure is an `ApiError` body with its code's status. Database work runs on tokio's blocking
 //! pool.
 //!
-//! Writes check who may make them before they read the body: an agent writing to a task that is
-//! not its own gets `403`, even with a malformed or oversized body.
+//! Writes check what the path names and who may make them before they read the body: an unknown
+//! task, workstream, project or ask is `404`, and an agent writing to a task that is not its own
+//! gets `403`, even with a malformed or oversized body.
 
 use crate::commands::{AnswerAsk, BriefEdit, NewAsk, NewComment, WorkstreamPatch};
 use crate::dispatch::NewDispatch;
@@ -223,8 +224,8 @@ async fn json<T: DeserializeOwned>(body: RawBody) -> Result<T, WorkError> {
     serde_json::from_slice(&bytes).map_err(|e| WorkError::invalid(format!("Malformed body: {e}.")))
 }
 
-/// A JSON body, read as soon as the handler runs. For routes whose caller is already known to be
-/// allowed (device routes, where [`Person`] comes first). See [`json`].
+/// A JSON body, read as soon as the handler runs. For routes whose path names nothing to look up
+/// and whose caller is already known to be allowed. See [`json`].
 struct Body<T>(T);
 
 impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Body<T> {
@@ -259,6 +260,15 @@ fn path_id<T: FromStr>(id: &str, what: &str) -> Result<T, WorkError> {
 async fn may_write(w: &Arc<WorkService>, caller: Caller, task: &TaskRef) -> Result<(), WorkError> {
     let task = task.clone();
     blocking(Arc::clone(w), move |w| w.check_task_write(&caller, &task)).await
+}
+
+/// Checks that what the path names exists (`404`, from `find`), before the body is read.
+async fn exists<T, F>(w: &Arc<WorkService>, find: F) -> Result<(), WorkError>
+where
+    T: Send + 'static,
+    F: FnOnce(&WorkService) -> Result<T, WorkError> + Send + 'static,
+{
+    blocking(Arc::clone(w), find).await.map(|_| ())
 }
 
 // ─── Workspace, members, machines, personas, teams ───────────────────────────────────────────────
@@ -326,9 +336,11 @@ async fn patch_workstream(
     Work(w): Work,
     Person(caller): Person,
     Segments(id): Segments<String>,
-    Body(patch): Body<WorkstreamPatch>,
+    body: RawBody,
 ) -> Reply<Workstream> {
     let id: WorkstreamId = path_id(&id, "workstream")?;
+    exists(&w, move |w| w.workstream(&id)).await?;
+    let patch: WorkstreamPatch = json(body).await?;
     Ok(Json(
         blocking(w, move |w| w.patch_workstream(&caller, &id, patch)).await?,
     ))
@@ -390,9 +402,11 @@ async fn assign_task(
     Work(w): Work,
     Person(caller): Person,
     Segments(id): Segments<String>,
-    Body(body): Body<serde_json::Map<String, serde_json::Value>>,
+    body: RawBody,
 ) -> Reply<Task> {
     let task = task_ref(&id)?;
+    may_write(&w, caller, &task).await?;
+    let body: serde_json::Map<String, serde_json::Value> = json(body).await?;
     let assignee: Option<MemberId> = match body.get("assignee") {
         None => {
             return Err(WorkError::invalid(
@@ -439,9 +453,11 @@ async fn dispatch_task(
     Work(w): Work,
     Person(caller): Person,
     Segments(id): Segments<String>,
-    Body(new): Body<NewDispatch>,
+    body: RawBody,
 ) -> Result<(StatusCode, Json<Dispatch>), WorkError> {
     let task = task_ref(&id)?;
+    may_write(&w, caller, &task).await?;
+    let new: NewDispatch = json(body).await?;
     let dispatch = blocking(w, move |w| w.dispatch_task(&caller, &task, new)).await?;
     Ok((StatusCode::ACCEPTED, Json(dispatch)))
 }
@@ -504,7 +520,7 @@ async fn put_brief(
     Work(w): Work,
     Person(caller): Person,
     Segments((kind, id)): Segments<(String, String)>,
-    Body(edit): Body<BriefEdit>,
+    body: RawBody,
 ) -> Reply<Brief> {
     let target = match kind.as_str() {
         "project" => BriefTarget::Project(path_id(&id, "project")?),
@@ -515,6 +531,11 @@ async fn put_brief(
             )));
         }
     };
+    match target {
+        BriefTarget::Project(id) => exists(&w, move |w| w.project(&id)).await?,
+        BriefTarget::Workstream(id) => exists(&w, move |w| w.workstream(&id)).await?,
+    }
+    let edit: BriefEdit = json(body).await?;
     Ok(Json(
         blocking(w, move |w| w.put_brief(&caller, target, edit)).await?,
     ))

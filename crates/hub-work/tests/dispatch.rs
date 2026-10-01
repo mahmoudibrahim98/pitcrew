@@ -8,8 +8,9 @@ use common::{
     PAPER, RUNNER, SAM, SEED_RUNS, WRITER, agent, app, call, demo, expect, member, open, person,
 };
 use pitcrew_hub_work::{
-    DispatchError, DispatchRequest, Dispatcher, INTERNAL_MESSAGE, TaskRef, WorkService,
+    DispatchError, DispatchRequest, Dispatcher, INTERNAL_MESSAGE, NewDispatch, TaskRef, WorkService,
 };
+use pitcrew_protocol::api::ErrorCode;
 use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{EventId, ProjectId, ProjectKey};
 use pitcrew_protocol::model::{
@@ -362,7 +363,8 @@ async fn without_any_folder_a_dispatch_runs_on_the_hubs_machine() {
         (CLUSTER.parse().expect("m"), "~")
     );
 
-    // Without a configured machine, the first local one.
+    // Without a configured machine, nowhere: the daemon must name the hub's machine, and the hub
+    // does not guess one among the workspace's.
     let second = tempfile::tempdir().expect("tempdir");
     let runner = Recorder::new(Answer::Start);
     let other = service(second.path(), Some(Arc::clone(&runner)));
@@ -393,11 +395,133 @@ async fn without_any_folder_a_dispatch_runs_on_the_hubs_machine() {
             },
         )
         .expect("create");
+    let rev = other.store().latest_rev().expect("rev");
+    let res = dispatch(&other, "BARE-1", json!({ "agent": RUNNER })).await;
+    expect(&res, 503);
+    assert!(
+        res.1["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("Name a machine")),
+        "{}",
+        res.1
+    );
+    assert_eq!(other.store().latest_rev().expect("rev"), rev);
+    assert!(runner.calls().is_empty());
+    // Naming one still works.
     expect(
-        &dispatch(&other, "BARE-1", json!({ "agent": RUNNER })).await,
+        &dispatch(
+            &other,
+            "BARE-1",
+            json!({ "agent": RUNNER, "machine": LAPTOP }),
+        )
+        .await,
         202,
     );
     assert_eq!(runner.calls()[0].machine, LAPTOP.parse().expect("m"));
+}
+
+#[tokio::test]
+async fn an_agent_is_dispatched_on_a_task_once_at_a_time() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner = Recorder::new(Answer::Start);
+    let work = service(dir.path(), Some(Arc::clone(&runner)));
+    expect(
+        &dispatch(&work, "PAP-5", json!({ "agent": RUNNER })).await,
+        202,
+    );
+    // A second click: the same agent on the same task, while the first dispatch is active.
+    let rev = work.store().latest_rev().expect("rev");
+    let again = dispatch(&work, "PAP-5", json!({ "agent": RUNNER })).await;
+    expect(&again, 409);
+    assert_eq!(
+        work.store().latest_rev().expect("rev"),
+        rev,
+        "nothing appended"
+    );
+    assert_eq!(runner.calls().len(), 1, "the runner link was asked once");
+    // Another agent may work on it alongside, and the agent may work on another task.
+    expect(
+        &dispatch(&work, "PAP-5", json!({ "agent": REVIEWER })).await,
+        202,
+    );
+    expect(
+        &dispatch(
+            &work,
+            "PAP-6",
+            json!({ "agent": RUNNER, "machine": LAPTOP }),
+        )
+        .await,
+        202,
+    );
+    // Once the dispatch has finished, the agent may be dispatched on the task again.
+    let first = runner.calls()[0].dispatch;
+    work.store()
+        .append(&[Event {
+            id: EventId::new(),
+            at: 1_790_800_000_000,
+            workspace: demo().workspace.id,
+            author: member(RUNNER),
+            on_behalf_of: Some(member(SAM)),
+            body: EventBody::DispatchFinished {
+                dispatch: first,
+                outcome: DispatchOutcome::Succeeded,
+                summary: None,
+            },
+        }])
+        .expect("append");
+    expect(
+        &dispatch(&work, "PAP-5", json!({ "agent": RUNNER })).await,
+        202,
+    );
+}
+
+#[test]
+fn concurrent_dispatches_of_one_agent_start_one_session() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner = Recorder::new(Answer::Start);
+    let work = service(dir.path(), Some(Arc::clone(&runner)));
+    let task = TaskRef::parse("PAP-5").expect("key");
+    let results: Vec<Result<_, _>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let work = Arc::clone(&work);
+                let task = task.clone();
+                s.spawn(move || {
+                    work.dispatch_task(
+                        &person(SAM),
+                        &task,
+                        NewDispatch {
+                            agent: member(RUNNER),
+                            brief: None,
+                            machine: None,
+                        },
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("thread"))
+            .collect()
+    });
+    let started = results.iter().filter(|r| r.is_ok()).count();
+    assert_eq!(started, 1, "{results:?}");
+    assert!(
+        results
+            .iter()
+            .filter_map(|r| r.as_ref().err())
+            .all(|e| e.code() == ErrorCode::Conflict),
+        "{results:?}"
+    );
+    assert_eq!(runner.calls().len(), 1);
+    let pap5 = work.task(&task).expect("task").id;
+    let active = work
+        .dispatches()
+        .expect("dispatches")
+        .into_iter()
+        .filter(|d| d.task == pap5 && d.agent == member(RUNNER) && d.ended.is_none())
+        .count();
+    assert_eq!(active, 1);
 }
 
 #[tokio::test]
@@ -407,9 +531,10 @@ async fn refused_dispatches_record_nothing() {
     let work = service(dir.path(), Some(Arc::clone(&runner)));
     let rev = work.store().latest_rev().expect("rev");
     for (key, body, status) in [
-        // Unknown task.
+        // Unknown task, whatever the body.
         ("PAP-99", json!({ "agent": RUNNER }), 404),
         ("garbage", json!({ "agent": RUNNER }), 404),
+        ("PAP-99", json!("not an object"), 404),
         // Unknown agent, a person as the agent, an unknown machine, a malformed body.
         (
             "PAP-5",
@@ -535,5 +660,9 @@ async fn a_failed_start_finishes_the_dispatch_and_ends_the_session() {
             .expect("task");
         assert_eq!(pap5.assignee, Some(member(RUNNER)));
         assert_eq!(pap5.status, TaskStatus::Todo);
+        // The failed dispatch is over, so the agent can be dispatched on the task again.
+        let again = dispatch(&work, "PAP-5", json!({ "agent": RUNNER })).await;
+        assert_eq!(again.0, status, "{answer:?}: {}", again.1);
+        assert_eq!(runner.calls().len(), 2);
     }
 }

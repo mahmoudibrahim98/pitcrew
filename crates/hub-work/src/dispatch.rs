@@ -4,25 +4,33 @@
 //! the session:
 //!
 //! 1. Under the command lock, it checks the request (`404` unknown task; `400` unknown agent or
-//!    machine, or a person named as the agent; `409` a done or canceled task; `503` no live
-//!    machine to run on) and appends, in one transaction:
+//!    machine, or a person named as the agent; `409` a done or canceled task, or an agent that
+//!    already holds an active dispatch on the task, such as a second click; `503` no live machine
+//!    to run on) and appends, in one transaction:
 //!    - `task_assigned` to the agent, if the task has no assignee;
 //!    - `dispatch_started`, naming the session it will run in (a new id);
 //!    - `session_discovered` for that session: state `starting`, linked to the task and its
 //!      workstream with `link_basis: dispatch`.
 //! 2. Without the lock (a runner may take a while), it calls [`Dispatcher::start`].
-//! 3. If that fails, it appends `dispatch_finished` (outcome `failed`, the reason as the summary)
-//!    and `session_ended`, so no dispatch or session is left dangling, and answers `503` (the
-//!    machine is unreachable), `409` (the runner refused) or `500` (it failed).
+//! 3. If that fails, it logs why, appends `dispatch_finished` (outcome `failed`, the reason as the
+//!    summary) and `session_ended`, so no dispatch or session is left dangling, and answers `503`
+//!    (the machine is unreachable), `409` (the runner refused) or `500` (it failed).
 //!
 //! When the session starts working, the runner link calls [`WorkService::dispatch_working`], which
 //! moves the task to in progress.
 //!
+//! **A crash between steps 1 and 3** (the hub stops after the first append, before the start
+//! returns or its failure is recorded) leaves a `starting` session and an open dispatch. The
+//! runner link (stream D) must reconcile them: on start-up, and when a start has not been
+//! confirmed within its timeout, it ends the session and finishes the dispatch as `failed` (or
+//! reports the session it did start under [`DispatchRequest::session`]).
+//!
 //! **Where it runs.** The machine is the request's `machine`, else the machine of the task's
-//! workstream's first location, else the project's root, else the hub's own machine
-//! ([`WorkService::with_hub_machine`], or the first `local` machine). The folder is the first of
-//! those locations on that machine, or `~` when none is. The engine, model and permission mode come
-//! from the agent's persona (Claude Code by default).
+//! workstream's first location, else the project's root, else the hub's own machine. The daemon
+//! must name that one with [`WorkService::with_hub_machine`]: without it, a dispatch with nowhere
+//! else to run answers `503` rather than guessing among the workspace's machines. The folder is
+//! the first of those locations on that machine, or `~` when none is. The engine, model and
+//! permission mode come from the agent's persona (Claude Code by default).
 
 use crate::error::{Result, WorkError};
 use crate::query::{self, TaskRef};
@@ -33,8 +41,8 @@ use pitcrew_protocol::ids::{
     DispatchId, MachineId, MemberId, PersonaId, SessionId, TaskId, TaskKey, WorkstreamId,
 };
 use pitcrew_protocol::model::{
-    Dispatch, DispatchOutcome, Engine, LinkBasis, Liveness, Location, Machine, MachineKind,
-    MemberKind, PermissionMode, Session, SessionState, Task, TaskStatus,
+    Dispatch, DispatchOutcome, Engine, LinkBasis, Liveness, Location, Machine, MemberKind,
+    PermissionMode, Session, SessionState, Task, TaskStatus,
 };
 use pitcrew_protocol::runner::RunnerCommand;
 use pitcrew_store::sql::Connection;
@@ -196,6 +204,12 @@ impl WorkService {
                 task.key
             )));
         }
+        if query::has_active_dispatch(conn, &task.id, &agent.id)? {
+            return Err(WorkError::conflict(format!(
+                "{} is already working on {}; let that dispatch finish first.",
+                agent.handle, task.key
+            )));
+        }
         let locations = locations(conn, &task)?;
         let machine = match requested {
             Some(machine) => machine,
@@ -233,7 +247,8 @@ impl WorkService {
         })
     }
 
-    /// The machine of the first location, else the hub's own machine.
+    /// The machine of the first location, else the hub's own machine
+    /// ([`WorkService::with_hub_machine`]); `unavailable` when there is neither.
     fn default_machine(&self, conn: &Connection, locations: &[Location]) -> Result<Machine> {
         if let Some(location) = locations.first() {
             return query::machine(conn, &location.machine)?.ok_or_else(|| {
@@ -243,17 +258,14 @@ impl WorkService {
                 ))
             });
         }
-        let own = match self.hub_machine() {
-            Some(id) => query::machine(conn, &id)?,
-            None => query::machines(conn)?
-                .into_iter()
-                .find(|m| m.kind == MachineKind::Local),
-        };
-        own.ok_or_else(|| {
+        let unavailable = || {
             WorkError::unavailable(
-                "No machine can run this dispatch: the hub knows none of its own.",
+                "No machine can run this dispatch: the task has no folder and this hub has no \
+                 machine of its own. Name a machine.",
             )
-        })
+        };
+        let id = self.hub_machine().ok_or_else(unavailable)?;
+        query::machine(conn, &id)?.ok_or_else(unavailable)
     }
 
     /// Dispatches `task` to an agent: records the dispatch and its session, then starts the
@@ -264,9 +276,9 @@ impl WorkService {
     /// # Errors
     ///
     /// `forbidden` for an agent; `not_found` for an unknown task; `invalid` for an unknown agent
-    /// or machine, or a person as the agent; `conflict` for a done or canceled task, or a runner
-    /// that refused; `unavailable` with no dispatcher, no live machine, or an unreachable runner;
-    /// `internal` when the start failed.
+    /// or machine, or a person as the agent; `conflict` for a done or canceled task, an agent
+    /// already dispatched on it, or a runner that refused; `unavailable` with no dispatcher, no
+    /// live machine, or an unreachable runner; `internal` when the start failed.
     pub fn dispatch_task(
         &self,
         caller: &Caller,
@@ -352,6 +364,14 @@ impl WorkService {
         let started = catch_unwind(AssertUnwindSafe(|| dispatcher.start(&request)))
             .unwrap_or_else(|_| Err(DispatchError::Failed("the runner link panicked".into())));
         if let Err(error) = started {
+            // Logged first, so the reason survives even if recording the failure fails.
+            tracing::warn!(
+                dispatch = %request.dispatch,
+                session = %request.session,
+                machine = %request.machine,
+                error = %error,
+                "a dispatched session could not start"
+            );
             let _guard = self.lock();
             self.append(&[
                 self.by(
