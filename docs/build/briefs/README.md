@@ -20,9 +20,9 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [H-listener-and-tokens](H-listener-and-tokens.md) | H · API and auth | `s/H/listener-and-tokens` | Opus-class | **Merged** |
 | [H-delta-stream](H-delta-stream.md) | H · API and auth | `s/H/delta-stream` | Opus-class | **Merged** |
 | [H-terminal-and-activity](H-terminal-and-activity.md) | H · API and auth | `s/H/terminal-and-activity` | Opus-class | **Merged** |
-| [H-terminal-hardening](H-terminal-hardening.md) | H · API and auth | `s/H/terminal-hardening` | Opus-class | In review |
+| [H-terminal-hardening](H-terminal-hardening.md) | H · API and auth | `s/H/terminal-hardening` | Opus-class | **Merged** |
 | [I-cli-and-hooks](I-cli-and-hooks.md) | I · CLI and hooks | `s/I/cli-and-hooks` | Sonnet-class | **Merged** |
-| [J-ssh-connection](J-ssh-connection.md) | J · Remote and HPC | `s/J/ssh-connection` | Opus-class | In review: fixes in progress |
+| [J-ssh-connection](J-ssh-connection.md) | J · Remote and HPC | `s/J/ssh-connection` | Opus-class | **Merged** |
 | [L-skeleton-and-data](L-skeleton-and-data.md) | L · UI foundation | `s/L/skeleton-and-data` | Opus-class | **Merged** |
 | [L-shell](L-shell.md) | L · UI foundation | `s/L/shell` | Opus-class | **Merged** |
 | [M-console-components](M-console-components.md) | M · Agent console | `s/M/console-components` | Opus-class | **Merged** |
