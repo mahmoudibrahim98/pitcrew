@@ -18,14 +18,18 @@
 //! a stream frame always gets the event the frame carried. [`WorkService::sync_recaps`] does the
 //! same reading eagerly, e.g. to build the index at start rather than on the first request.
 //!
-//! What the engine knows about the workspace (its [`Directory`]: sessions, tasks, workstreams,
-//! dispatches, asks) comes from the same events, read from the start: the log holds everything the
-//! projections were built from, so the directory is the projections' state as of each event, the
-//! links "as they were when the events happened" that the contract asks for. Seeding it with the
-//! projections as they are now would put today's links in front of yesterday's events, and an
-//! index built yesterday and kept current would then differ from one rebuilt today. Members, which
-//! the engine's directory does not follow, are learned from `member_added` for the names in lines
-//! and paragraphs, so they are always the current names.
+//! What the engine knows about the workspace (its [`Directory`]: members, sessions, tasks,
+//! workstreams, dispatches, asks) comes from the same events, read from the start: the log holds
+//! everything the projections were built from, so the directory is the projections' state as of
+//! each event, the links "as they were when the events happened" that the contract asks for.
+//! Seeding it with the projections as they are now would put today's links in front of
+//! yesterday's events, and an index built yesterday and kept current would then differ from one
+//! rebuilt today.
+//!
+//! One directory serves both roles (grouping events into blocks, and naming things in lines and
+//! paragraphs): [`Recaps`] keeps no second copy. [`Directory::names_version`] says when a name a
+//! paragraph may show has changed, including past the directory's bound (see "Day paragraphs are
+//! cached" below).
 //!
 //! A `task_created` that the tasks projection refused (its key was taken, see "One writer") is not
 //! activity here either: it is left out, so a task the hub never had never shows in a recap. So
@@ -47,8 +51,8 @@ use crate::error::{Result, WorkError};
 use crate::projection::Tasks;
 use crate::service::WorkService;
 use pitcrew_protocol::events::{BriefTarget, Event, EventBody};
-use pitcrew_protocol::ids::{AskId, EventId, MemberId, ProjectId, SessionId, TaskId, WorkstreamId};
-use pitcrew_protocol::model::{AskKind, Date, TimestampMs};
+use pitcrew_protocol::ids::{EventId, MemberId, ProjectId, SessionId, TaskId, WorkstreamId};
+use pitcrew_protocol::model::{Date, TimestampMs};
 use pitcrew_protocol::recap::{
     BLOCKS_DEFAULT_LIMIT, BLOCKS_MAX_LIMIT, Block, BlocksPage, DAYS_DEFAULT_LIMIT, DAYS_MAX_LIMIT,
     DayRecap, DaysPage, FactKind, MAX_TZ_MINUTES, RecapBlock,
@@ -259,7 +263,7 @@ impl Unnamed {
     }
 
     /// Notes everything `block` names, in its facts or links, that `names` does not know.
-    fn note(&mut self, names: &Directory, asks: &HashMap<AskId, AskName>, block: &Block) {
+    fn note(&mut self, names: &Directory, block: &Block) {
         for m in block.agent.iter().chain(&block.actors) {
             self.member(names, *m);
         }
@@ -307,8 +311,8 @@ impl Unnamed {
                 }
                 FactKind::AskRaised { to, .. } => self.member(names, *to),
                 FactKind::AskAnswered { ask } => {
-                    if let Some((_, from)) = asks.get(ask) {
-                        self.member(names, *from);
+                    if let Some((_, from)) = names.ask(*ask) {
+                        self.member(names, from);
                     }
                 }
                 FactKind::Commented {
@@ -339,9 +343,6 @@ impl Unnamed {
         }
     }
 }
-
-/// What describes an answer to an ask: its kind and who asked.
-type AskName = (AskKind, MemberId);
 
 /// Runs a call into the recap engine. The engine is not meant to panic on any input; if it does,
 /// that is an internal error for this request, not a poisoned index that every request rebuilds.
@@ -448,19 +449,17 @@ impl DayCache {
 /// Pure and in memory: it reads no store and no clock. [`WorkService`] keeps one current from its
 /// store; build one directly to recap a slice of a log, e.g. the demo fixture's.
 pub struct Recaps {
+    /// The one directory, for both grouping events into blocks and naming things in lines and
+    /// paragraphs: `builder.directory()`.
     builder: BlockBuilder,
-    /// Names for lines and paragraphs: the directory as events keep it, plus members.
-    names: Directory,
     /// Changes whenever a name a paragraph may show changes, so cached paragraphs are written
     /// again: a member, task or workstream renamed, an ask re-stated as another kind or by
-    /// another asker, or a name learned for something a block already named.
+    /// another asker, a name dropped for the directory's bound, or a name learned for something a
+    /// block already named. Driven by [`Directory::names_version`], which moves on past the
+    /// bound too, plus the "named while unknown" check below, which it does not cover.
     names_gen: u64,
-    /// What blocks name that `names` does not know yet.
+    /// What blocks name that the directory does not know yet.
     unnamed: Unnamed,
-    /// Each ask raised, as its answers describe it.
-    asks: HashMap<AskId, AskName>,
-    /// Whether a seed directory came first: it may know asks this index has not seen raised.
-    seeded: bool,
     /// Events the engine panicked on, left out.
     failed: u64,
     blocks: BTreeMap<EventId, Block>,
@@ -492,15 +491,10 @@ impl Recaps {
     /// Recaps with other engine settings.
     #[must_use]
     pub fn with_config(config: Config, seed: Option<Directory>) -> Self {
-        let seeded = seed.is_some();
-        let seed = seed.unwrap_or_default();
         Self {
-            builder: BlockBuilder::new(config, seed.clone()),
-            names: seed,
+            builder: BlockBuilder::new(config, seed.unwrap_or_default()),
             names_gen: 0,
             unnamed: Unnamed::default(),
-            asks: HashMap::new(),
-            seeded,
             failed: 0,
             blocks: BTreeMap::new(),
             sessions: HashMap::new(),
@@ -526,22 +520,74 @@ impl Recaps {
     pub fn push(&mut self, events: &[Event]) {
         for event in events {
             let taken = catch_unwind(AssertUnwindSafe(|| {
-                self.learn_names(event);
+                let was_named = self.named_before(event);
+                let names_before = self.builder.directory().names_version();
                 #[cfg(test)]
                 tests::fail_here(event.id);
                 self.builder.push(event);
+                self.builder.directory().names_version() != names_before
+                    || self.newly_named(event, was_named)
             }));
-            if taken.is_err() {
-                self.failed = self.failed.saturating_add(1);
-                tracing::error!(
-                    event = %event.id,
-                    "the recap engine failed on an event: recaps leave it out"
-                );
+            match taken {
+                Ok(changed) => {
+                    if changed {
+                        self.names_gen = self.names_gen.wrapping_add(1);
+                    }
+                }
+                Err(_) => {
+                    self.failed = self.failed.saturating_add(1);
+                    tracing::error!(
+                        event = %event.id,
+                        "the recap engine failed on an event: recaps leave it out"
+                    );
+                }
             }
         }
         let changes = self.builder.take_changes();
         for block in changes.closed.into_iter().chain(changes.open) {
             self.put(block);
+        }
+    }
+
+    /// Whether the member, task or workstream `event` names was already known, before the event
+    /// is applied: for events of no other kind, there is nothing to check (`true`, so
+    /// [`Recaps::newly_named`] is skipped for them).
+    fn named_before(&self, event: &Event) -> bool {
+        let names = self.builder.directory();
+        match &event.body {
+            EventBody::MemberAdded { member } => names.handle(member.id).is_some(),
+            EventBody::TaskCreated { task } => names.task_key(task.id).is_some(),
+            EventBody::WorkstreamCreated { workstream } => {
+                names.workstream_name(workstream.id).is_some()
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether `event` just made a member, task or workstream known for the first time, and a
+    /// block already named it while it was unknown: if so, every cached paragraph that may have
+    /// said "someone", "a task" or "a workstream" for it is written again. A name becoming known
+    /// does not by itself move [`Directory::names_version`] (see its docs), so this is tracked
+    /// here from what blocks have named (`Recaps::unnamed`).
+    fn newly_named(&mut self, event: &Event, was_named: bool) -> bool {
+        if was_named {
+            return false;
+        }
+        let names = self.builder.directory();
+        match &event.body {
+            EventBody::MemberAdded { member } => {
+                names.handle(member.id).is_some()
+                    && (self.unnamed.overflow || self.unnamed.members.remove(&member.id))
+            }
+            EventBody::TaskCreated { task } => {
+                names.task_key(task.id).is_some()
+                    && (self.unnamed.overflow || self.unnamed.tasks.remove(&task.id))
+            }
+            EventBody::WorkstreamCreated { workstream } => {
+                names.workstream_name(workstream.id).is_some()
+                    && (self.unnamed.overflow || self.unnamed.workstreams.remove(&workstream.id))
+            }
+            _ => false,
         }
     }
 
@@ -578,7 +624,7 @@ impl Recaps {
     /// The names lines and paragraphs use: what the seed and the events pushed so far say.
     #[must_use]
     pub fn names(&self) -> &Directory {
-        &self.names
+        self.builder.directory()
     }
 
     /// `GET /v1/recaps/blocks`; see [`RecapIndex::recap_blocks`].
@@ -641,7 +687,9 @@ impl Recaps {
             }
             blocks.push(RecapBlock {
                 block: block.clone(),
-                line: guarded("writing a block's line", || block_line(block, &self.names))?,
+                line: guarded("writing a block's line", || {
+                    block_line(block, self.builder.directory())
+                })?,
             });
         }
         Ok(BlocksPage {
@@ -735,84 +783,20 @@ impl Recaps {
                     date: date.clone(),
                     workstream,
                 };
-                days.extend(
-                    self.cache
-                        .get_or_make(key, &group, &self.names, self.names_gen)?,
-                );
+                days.extend(self.cache.get_or_make(
+                    key,
+                    &group,
+                    self.builder.directory(),
+                    self.names_gen,
+                )?);
             }
         }
         Ok(DaysPage { days, at_start })
     }
 
-    /// Keeps the names current. When a name a written paragraph may show changes, every
-    /// paragraph is written again: a rename, or a name learned for something a block named while
-    /// it was unknown. A new member, task or workstream that nothing named yet changes nothing.
-    fn learn_names(&mut self, event: &Event) {
-        let changed = match &event.body {
-            EventBody::MemberAdded { member } => {
-                let before = self.names.handle(member.id).map(str::to_owned);
-                self.names.add_member(member);
-                let after = self.names.handle(member.id);
-                match before {
-                    Some(before) => after != Some(before.as_str()),
-                    None => {
-                        after.is_some()
-                            && (self.unnamed.overflow || self.unnamed.members.remove(&member.id))
-                    }
-                }
-            }
-            EventBody::TaskCreated { task } => {
-                let before = self.names.task_key(task.id).map(str::to_owned);
-                self.names.observe(event);
-                let after = self.names.task_key(task.id);
-                match before {
-                    Some(before) => after != Some(before.as_str()),
-                    None => {
-                        after.is_some()
-                            && (self.unnamed.overflow || self.unnamed.tasks.remove(&task.id))
-                    }
-                }
-            }
-            EventBody::WorkstreamCreated { workstream } => {
-                let id = workstream.id;
-                let before = self.names.workstream_name(id).map(str::to_owned);
-                self.names.observe(event);
-                let after = self.names.workstream_name(id);
-                match before {
-                    Some(before) => after != Some(before.as_str()),
-                    None => {
-                        after.is_some()
-                            && (self.unnamed.overflow || self.unnamed.workstreams.remove(&id))
-                    }
-                }
-            }
-            EventBody::AskRaised { ask } => {
-                self.names.observe(event);
-                let now = (ask.kind, ask.from);
-                if let Some(was) = self.asks.get_mut(&ask.id) {
-                    std::mem::replace(was, now) != now
-                } else if self.asks.len() < MAX_NAMED {
-                    // An answer can only be placed once its ask is known, so a new ask is in no
-                    // paragraph yet; unless the seed knew it, perhaps differently.
-                    self.asks.insert(ask.id, now);
-                    self.seeded
-                } else {
-                    true
-                }
-            }
-            _ => {
-                self.names.observe(event);
-                false
-            }
-        };
-        if changed {
-            self.names_gen = self.names_gen.wrapping_add(1);
-        }
-    }
-
     /// Stores a block that began or changed, and re-indexes it if its links or start moved.
     fn put(&mut self, block: Block) {
-        self.unnamed.note(&self.names, &self.asks, &block);
+        self.unnamed.note(self.builder.directory(), &block);
         let links = Links::of(&block);
         match self.blocks.get(&block.id).map(Links::of) {
             Some(old) if old == links => {}
@@ -951,6 +935,10 @@ impl Default for RecapSync {
 }
 
 impl RecapSync {
+    fn with_recaps(recaps: Recaps) -> Self {
+        Self { recaps, rev: 0 }
+    }
+
     /// Reads the log after `rev`, a page at a time, into the index. A page is applied whole or
     /// not at all, so an error leaves the index where it was, ready to read the same page again.
     ///
@@ -1005,6 +993,20 @@ impl WorkService {
     /// read before the error, and the next call goes on from there.
     pub fn sync_recaps(&self) -> Result<u64> {
         Ok(self.recap_state()?.rev)
+    }
+
+    /// Rebuilds the recap index with a directory bounded to `limit` entries of each kind
+    /// ([`Directory::with_limit`]), instead of the default 100,000. For tests that exercise the
+    /// bound through the store; call it before the first query.
+    #[must_use]
+    pub fn with_recap_directory_limit(self, limit: usize) -> Self {
+        let mut state = self
+            .recap_lock()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *state = RecapSync::with_recaps(Recaps::new(Some(Directory::with_limit(limit))));
+        drop(state);
+        self
     }
 
     /// The recap index, caught up with the log.
