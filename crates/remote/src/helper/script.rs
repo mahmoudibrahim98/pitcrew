@@ -8,13 +8,26 @@ use std::time::Duration;
 /// The script, sent on stdin for every call.
 pub(crate) const SCRIPT: &str = include_str!("helper.sh");
 
-/// The command line: reads exactly `$1` bytes of stdin (one byte per read, so nothing behind
-/// the script is consumed), and evaluates them only if they end with the sentinel. A cut-off
-/// script must not run halfway.
+/// The interpreter: `/bin/sh` by its path, whatever `sh` the user's `PATH` finds first.
+pub(crate) const SHELL: &str = "/bin/sh";
+
+/// The command line, run as `/bin/sh -c BOOTSTRAP sh <bytes> <length> <tool path> …`:
+/// - drops a `dd` or `echo` function imported from the environment, and the variables a shell
+///   reads code or directories from (`ENV`, `BASH_ENV`, `CDPATH`);
+/// - puts the tool path in front of `PATH`;
+/// - reads exactly `<bytes>` of stdin (one byte per read, so nothing behind the script is
+///   consumed);
+/// - runs them only when they start with the script's first line, end with its last, and are
+///   `<length>` long (`$(…)` drops the final newline). A shell start-up file that ate the start
+///   of stdin must not make the rest run.
 pub(crate) const BOOTSTRAP: &str = concat!(
+    r#"unset -f dd echo 2>/dev/null; unset ENV BASH_ENV CDPATH; "#,
+    r#"PATH=$3${PATH:+:$PATH}; export PATH; "#,
     r#"s=$(dd bs=1 count="$1" 2>/dev/null) || { echo 'pitcrew: dd failed' >&2; exit 97; }; "#,
-    r#"shift; case $s in *'# pitcrew-helper-script-end') eval "$s" ;; "#,
-    r#"*) echo 'pitcrew: the script did not arrive whole' >&2; exit 97 ;; esac"#,
+    r#"case $s in '# pitcrew-helper-script-begin'*'# pitcrew-helper-script-end') ;; "#,
+    r#"*) echo 'pitcrew: the script did not arrive whole' >&2; exit 97 ;; esac; "#,
+    r#"[ "${#s}" = "$2" ] || { echo 'pitcrew: the script did not arrive whole' >&2; exit 97; }; "#,
+    r#"shift 3; eval "$s""#,
 );
 
 /// Reports are small; this bounds a misbehaving machine.
@@ -106,13 +119,16 @@ pub(crate) fn clean(text: &str) -> String {
 pub(crate) async fn run(target: &Target, call: Call<'_>) -> Result<Report, HelperError> {
     let tag = crate::askpass::random::<8>().map_err(crate::SshError::Setup)?;
     let tag = crate::askpass::to_hex(&tag);
-    let length = SCRIPT.len().to_string();
+    let bytes = SCRIPT.len().to_string();
+    let length = SCRIPT.trim_end_matches('\n').len().to_string();
     let mut argv: Vec<&str> = vec![
-        "sh",
+        SHELL,
         "-c",
         BOOTSTRAP,
         "sh",
+        &bytes,
         &length,
+        target.tool_path(),
         call.command,
         &tag,
         target.layout().root(),
@@ -164,31 +180,36 @@ pub(crate) async fn run(target: &Target, call: Call<'_>) -> Result<Report, Helpe
 mod tests {
     use super::*;
 
-    /// The script's last line. The bootstrap runs nothing that does not end with it.
+    /// The script's first and last lines. The bootstrap runs nothing without both.
+    const BEGIN: &str = "# pitcrew-helper-script-begin";
     const SENTINEL: &str = "# pitcrew-helper-script-end";
 
     #[test]
     fn the_script_is_whole_and_plain() {
-        assert!(SCRIPT.trim_end().ends_with(SENTINEL));
+        assert!(SCRIPT.starts_with(&format!("{BEGIN}\n")));
+        assert_eq!(SCRIPT.matches(BEGIN).count(), 1);
+        assert!(SCRIPT.ends_with(&format!("\n{SENTINEL}\n")));
         assert_eq!(SCRIPT.matches(SENTINEL).count(), 1);
-        assert!(BOOTSTRAP.contains(SENTINEL));
+        assert!(BOOTSTRAP.contains(&format!("'{BEGIN}'*'{SENTINEL}'")));
         // A checkout with CRLF line ends would break every line of it.
         assert!(!SCRIPT.contains('\r'));
         assert!(SCRIPT.is_ascii());
-        // The command line stays small, well under the 7,500-byte command line the wrapper
-        // allows on Windows.
+        // The command line stays small: about 3 KB once wrapped, well under the 30,000
+        // characters the wrapper allows on Windows.
         let argv = [
-            "sh",
+            SHELL,
             "-c",
             BOOTSTRAP,
             "sh",
             "99999",
+            "99998",
+            super::super::DEFAULT_TOOL_PATH,
             "install",
             "0123456789abcdef",
             &format!("/{}", "h".repeat(200)),
         ];
         let wrapped = crate::quote::remote_command(&argv).unwrap();
-        assert!(wrapped.len() < 2_000, "{}", wrapped.len());
+        assert!(wrapped.len() < 4_000, "{}", wrapped.len());
     }
 
     #[test]

@@ -1,9 +1,11 @@
 //! Starting, checking and stopping the deployed helper: the [`Launcher`] trait, with the
 //! `direct` and `tmux` launchers.
 //!
-//! A launcher runs `bin/current/pitcrewd <args>` (by default `serve --listen
-//! unix:<root>/run/pitcrewd.sock`) with its output appended to `run/pitcrewd.log`, waits for the
-//! socket, and writes `run/endpoint.json` atomically (a temporary file renamed over it):
+//! A launcher runs `bin/<version>/pitcrewd <args>`, the version `bin/current` points to (by
+//! default `serve --listen unix:<root>/run/pitcrewd.sock`), from inside the root, with its
+//! output appended to `run/pitcrewd.log` and the user's own umask (the script's 077 is for its
+//! own files). It waits for the socket, and writes `run/endpoint.json` atomically (a temporary
+//! file renamed over it):
 //!
 //! ```json
 //! {"pid":4242,"host":"login01","version":"1.4.0","started":1790850391000,"launcher":"direct","socket":"/home/someone/.pitcrew/run/pitcrewd.sock"}
@@ -15,8 +17,9 @@
 //!
 //! Every operation is idempotent: starting a running helper returns its endpoint; stopping a
 //! stopped one does nothing. Start and stop take the launch lock (`run/.lock`); status takes
-//! none and changes nothing. A process counts as the helper only while it is alive and named
-//! `pitcrewd`, so a recycled pid is never signalled.
+//! none and changes nothing. A process counts as the helper only while it is alive (not a
+//! zombie) and named `pitcrewd`, and `stop` signals it only while its start time is the one it
+//! had, so a recycled pid is never signalled.
 //!
 //! The SLURM launcher (a later brief) implements the same trait: its `status` will ask the
 //! scheduler, and its endpoint will name the compute node.
@@ -31,11 +34,15 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-/// The tmux launcher's server socket name (`tmux -L`), apart from the user's own tmux.
-pub const TMUX_SOCKET: &str = "pitcrew-helper";
-
-/// The tmux launcher's session.
-pub const TMUX_SESSION: &str = "pitcrew-helper";
+/// The tmux launcher's server socket (`tmux -L`) and session name for a layout:
+/// `pitcrew-helper-` and 8 hex digits of the root's sha256. Apart from the user's own tmux, and
+/// from another root's helper on the same host.
+#[must_use]
+pub fn tmux_name(layout: &super::Layout) -> String {
+    use sha2::{Digest as _, Sha256};
+    let hash = Sha256::digest(layout.root().as_bytes());
+    format!("pitcrew-helper-{}", crate::askpass::to_hex(&hash[..4]))
+}
 
 /// The oldest tmux the tmux launcher accepts, as stream B's runtime requires.
 pub const MIN_TMUX: (u32, u32) = (3, 2);
@@ -230,9 +237,9 @@ impl Launcher for DirectLauncher {
     }
 }
 
-/// The helper as the only window of a dedicated tmux session, [`TMUX_SESSION`], on its own
-/// tmux server ([`TMUX_SOCKET`], started without the user's config), so the user's tmux never
-/// touches it.
+/// The helper as the only window of a dedicated tmux session on its own tmux server, both
+/// named [`tmux_name`] (started without the user's config), so neither the user's tmux nor
+/// another root's helper touches it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TmuxLauncher {
     options: LaunchOptions,
@@ -321,6 +328,7 @@ async fn start(
         flag(options.take_over),
         socket.clone(),
         socket_json,
+        tmux_name(target.layout()),
     ];
     match &options.args {
         Some(custom) => args.extend(custom.iter().cloned()),
@@ -359,7 +367,11 @@ async fn status(
         target,
         Call {
             command: "status",
-            args: vec![launcher.to_owned(), target.layout().socket()],
+            args: vec![
+                launcher.to_owned(),
+                target.layout().socket(),
+                tmux_name(target.layout()),
+            ],
             payload: None,
             progress: None,
             timeout: options.call_timeout(Duration::ZERO),
@@ -408,6 +420,7 @@ async fn stop(
                 flag(options.take_over),
                 seconds(options.stop_timeout).to_string(),
                 target.layout().socket(),
+                tmux_name(target.layout()),
             ],
             payload: None,
             progress: None,
@@ -444,6 +457,17 @@ fn endpoint(report: &Report) -> Result<Option<Endpoint>, HelperError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tmux_names_follow_the_root() {
+        let a = super::super::Layout::in_home("/home/someone").unwrap();
+        let b = super::super::Layout::at("/project/group/someone/.pitcrew").unwrap();
+        let name = tmux_name(&a);
+        assert!(name.starts_with("pitcrew-helper-"), "{name}");
+        assert_eq!(name.len(), "pitcrew-helper-".len() + 8);
+        assert_eq!(name, tmux_name(&a));
+        assert_ne!(name, tmux_name(&b));
+    }
 
     #[test]
     fn tmux_versions() {

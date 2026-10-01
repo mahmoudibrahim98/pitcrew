@@ -18,23 +18,34 @@
 //!
 //! ```text
 //! bin/<version>/pitcrewd     verified helpers, 0700
-//! bin/current -> <version>   the one launchers run (relative, so it works wherever $HOME is
-//!                            mounted); bin/previous names the one before
-//! bin/.lock/                 deploy lock (mkdir), with an `owner` file: host, pid, call tag
+//! bin/current -> <version>   the version launchers start (relative, so it works wherever
+//!                            $HOME is mounted); bin/previous names the one before
+//! bin/.lock/                 deploy lock (mkdir), with an `owner` file: host, pid, call tag, time
 //! run/endpoint.json          the running helper: pid, host, version, started, launcher, socket
 //! run/pitcrewd.sock          its socket; run/pitcrewd.log its output; run/.lock the launch lock
 //! ```
 //!
+//! **The way there** is checked first, as sshd checks the way to `authorized_keys`: every
+//! directory from `/` down to the root's parent (following symbolic links, and checking where
+//! they lead) must belong to root or the user, and be writable by no one else unless sticky, as
+//! `/tmp`. Otherwise someone else could rename the tree after the checks and have their own
+//! `pitcrewd` run. The script then works from inside the root (`cd -P`) with relative paths, and
+//! a launched helper checks the directory it starts in.
+//!
 //! **The script** travels on ssh's stdin, not on the command line: Windows limits a whole
 //! command line to 32,767 characters, and the script is larger than the quarter of that the
-//! shell-neutral wrapper leaves. The command line only carries a fixed bootstrap that reads
-//! the script's exact length with `dd` (so the helper bytes behind it stay on stdin for the
-//! upload) and runs it only if it arrived whole. Each call prints a report between markers
-//! carrying a random tag, as the probe does.
+//! shell-neutral wrapper leaves. The command line only carries a fixed bootstrap, run by
+//! `/bin/sh`, that puts the tool path ([`DEFAULT_TOOL_PATH`]) in front of `PATH` and reads the
+//! script's exact length with `dd` (so the helper bytes behind it stay on stdin for the upload).
+//! It runs the script only with its first and last lines and its length intact. Each call prints
+//! a report between markers carrying a random tag, as the probe does.
 //!
-//! **Locks** are `mkdir` directories. A lock is stale when it is older than a limit, or was
-//! taken on the same host by a process that is gone; a stale lock is moved aside atomically and
-//! removed, and a holder checks that it still owns its lock before each change.
+//! **Locks** are `mkdir` directories with an owner line: host, pid, call tag, and time. One
+//! taken on this host is stale when its process is gone or it is older than the limit by this
+//! host's clock; one taken on another host (a login node sharing the home) only when its
+//! directory is older than the limit plus 10 minutes, the clock skew tolerated between hosts and
+//! the file server. A stale lock is moved aside atomically; a holder checks that it still owns
+//! its lock before every change, and stops ([`HelperError::LockLost`]) if not.
 
 mod deploy;
 mod launch;
@@ -46,11 +57,15 @@ pub use deploy::{
 };
 pub use launch::{
     DirectLauncher, Endpoint, HelperFuture, HelperState, LaunchOptions, Launcher, MIN_TMUX,
-    Started, Status, Stopped, TMUX_SESSION, TMUX_SOCKET, TmuxLauncher, parse_tmux_version,
+    Started, Status, Stopped, TmuxLauncher, parse_tmux_version, tmux_name,
 };
 
 use crate::probe::Probe;
 use crate::{Ssh, SshError};
+
+/// Where the script looks for tools first, before the user's `PATH`: the system's own, not a
+/// look-alike from a conda environment or a module.
+pub const DEFAULT_TOOL_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// Why a deploy, start, status or stop failed.
 #[derive(Debug, thiserror::Error)]
@@ -264,6 +279,7 @@ pub struct Target {
     host: String,
     layout: Layout,
     platform: Platform,
+    tool_path: String,
 }
 
 impl Target {
@@ -295,7 +311,34 @@ impl Target {
             host,
             layout,
             platform,
+            tool_path: DEFAULT_TOOL_PATH.to_owned(),
         })
+    }
+
+    /// Looks for tools in `path` (`:`-separated absolute directories) before the user's `PATH`,
+    /// instead of [`DEFAULT_TOOL_PATH`]: for a site whose tools live elsewhere.
+    ///
+    /// # Errors
+    /// [`HelperError::InvalidArgument`] for an empty path, a relative directory, or a control
+    /// character.
+    pub fn with_tool_path(mut self, path: &str) -> Result<Self, HelperError> {
+        let ok = !path.is_empty()
+            && !path.chars().any(char::is_control)
+            && path.split(':').all(|dir| dir.starts_with('/'));
+        if !ok {
+            return Err(HelperError::InvalidArgument(format!(
+                "the tool path {:?} must be absolute directories separated by ':'",
+                script::clean(path)
+            )));
+        }
+        self.tool_path = path.to_owned();
+        Ok(self)
+    }
+
+    /// Where the script looks for tools first.
+    #[must_use]
+    pub fn tool_path(&self) -> &str {
+        &self.tool_path
     }
 
     /// How the machine is reached.
@@ -351,5 +394,29 @@ mod tests {
             assert!(Layout::at(bad).is_err(), "{bad:?}");
         }
         assert!(Layout::in_home("~").is_err());
+    }
+
+    #[test]
+    fn tool_paths() {
+        let target = Target::with_layout(
+            Ssh::new("ssh"),
+            "box",
+            Layout::in_home("/home/someone").unwrap(),
+            Platform::LinuxX86_64,
+        )
+        .unwrap();
+        assert_eq!(target.tool_path(), DEFAULT_TOOL_PATH);
+        let target = target.with_tool_path("/opt/tools/bin:/usr/bin").unwrap();
+        assert_eq!(target.tool_path(), "/opt/tools/bin:/usr/bin");
+        for bad in [
+            "",
+            "bin",
+            "/usr/bin:",
+            "/usr/bin::/bin",
+            "/usr/bin:.",
+            "/a\nb",
+        ] {
+            assert!(target.clone().with_tool_path(bad).is_err(), "{bad:?}");
+        }
     }
 }
