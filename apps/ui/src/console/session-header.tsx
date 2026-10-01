@@ -23,6 +23,8 @@ export interface SessionHeaderProps {
   onHandOff?: () => void;
   onFork?: () => void;
   onReview?: () => void;
+  /** Only the title row: for a narrow pane given over to the terminal. */
+  compact?: boolean;
   className?: string;
 }
 
@@ -87,41 +89,43 @@ export function SessionHeader(props: SessionHeaderProps) {
         </DropdownMenu.Root>
       </div>
 
-      <dl className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-ink-2">
-        <div className="flex gap-1">
-          <dt className="text-ink-2">Engine</dt>
-          <dd>{ENGINE_LABEL[s.engine]}</dd>
-        </div>
-        {agent !== undefined && (
+      {!props.compact && (
+        <dl className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-ink-2">
           <div className="flex gap-1">
-            <dt className="text-ink-2">Agent</dt>
-            <dd>{agent.handle}</dd>
+            <dt className="text-ink-2">Engine</dt>
+            <dd>{ENGINE_LABEL[s.engine]}</dd>
           </div>
-        )}
-        <div className="flex gap-1">
-          <dt className="text-ink-2">Machine</dt>
-          <dd>
-            {machine?.name ?? '…'}
-            {machine !== undefined && machine.liveness !== 'live' && (
-              <span className="ml-1 text-risk">({LIVENESS[machine.liveness].label.toLowerCase()})</span>
-            )}
-          </dd>
-        </div>
-        {s.branch !== undefined && (
+          {agent !== undefined && (
+            <div className="flex gap-1">
+              <dt className="text-ink-2">Agent</dt>
+              <dd>{agent.handle}</dd>
+            </div>
+          )}
           <div className="flex gap-1">
-            <dt className="text-ink-2">Branch</dt>
-            <dd className="font-mono">{s.branch}</dd>
+            <dt className="text-ink-2">Machine</dt>
+            <dd>
+              {machine?.name ?? '…'}
+              {machine !== undefined && machine.liveness !== 'live' && (
+                <span className="ml-1 text-risk">({LIVENESS[machine.liveness].label.toLowerCase()})</span>
+              )}
+            </dd>
           </div>
-        )}
-        <div className="flex min-w-0 gap-1">
-          <dt className="text-ink-2">Folder</dt>
-          <dd className="truncate font-mono" title={s.cwd}>
-            {s.cwd}
-          </dd>
-        </div>
-      </dl>
+          {s.branch !== undefined && (
+            <div className="flex gap-1">
+              <dt className="text-ink-2">Branch</dt>
+              <dd className="font-mono">{s.branch}</dd>
+            </div>
+          )}
+          <div className="flex min-w-0 gap-1">
+            <dt className="text-ink-2">Folder</dt>
+            <dd className="truncate font-mono" title={s.cwd}>
+              {s.cwd}
+            </dd>
+          </div>
+        </dl>
+      )}
 
-      {(s.task !== undefined || s.workstream !== undefined) && (
+      {!props.compact && (s.task !== undefined || s.workstream !== undefined) && (
         <nav aria-label="Linked work" className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
           {linkedTask !== undefined && (
             <LinkedWork
