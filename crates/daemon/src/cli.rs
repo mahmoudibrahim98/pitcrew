@@ -1,12 +1,13 @@
 //! The command line.
 
 use clap::{ArgAction, Args, Parser, Subcommand};
+use pitcrew_protocol::model::Engine;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-/// The PitCrew daemon. For now it is the hub of a solo workspace: the store, the work model and
-/// API v1 in one process. The runner, terminals and remote machines join later.
+/// The PitCrew daemon of a solo workspace: the store, the work model, the runner that watches
+/// this machine's agent sessions, and API v1 in one process. Remote machines join later.
 #[derive(Debug, Parser)]
 #[command(name = "pitcrewd", disable_version_flag = true)]
 pub struct Cli {
@@ -52,6 +53,67 @@ pub struct ServeArgs {
     /// and what is appended meanwhile is never acted on later either.
     #[arg(long)]
     pub no_office: bool,
+
+    /// Watch these agent homes instead of this user's own: `<dir>` is a folder laid out like a
+    /// home folder (`<dir>/.claude`, `<dir>/.codex`, `<dir>/.local/share/opencode`);
+    /// `<engine>=<dir>` is one engine's home itself (`claude=`, `codex=` or `opencode=`, like a
+    /// `CLAUDE_CONFIG_DIR` or `CODEX_HOME`). With `--demo`, no home is watched unless given here.
+    #[arg(long, value_name = "DIR", num_args = 1.., conflicts_with = "no_runner")]
+    pub homes: Vec<HomeArg>,
+
+    /// Do not run the runner: no agent sessions are watched, hooks are only logged, and no
+    /// session has a terminal here.
+    #[arg(long)]
+    pub no_runner: bool,
+}
+
+/// One `--homes` value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HomeArg {
+    /// `<dir>`: a folder laid out like a person's home folder.
+    Root(PathBuf),
+    /// `<engine>=<dir>`: that engine's home itself.
+    Engine(Engine, PathBuf),
+}
+
+impl HomeArg {
+    /// The engine homes this value names.
+    #[must_use]
+    pub fn homes(&self) -> Vec<(Engine, PathBuf)> {
+        match self {
+            Self::Root(dir) => vec![
+                (Engine::Claude, dir.join(".claude")),
+                (Engine::Codex, dir.join(".codex")),
+                (
+                    Engine::OpenCode,
+                    dir.join(".local").join("share").join("opencode"),
+                ),
+            ],
+            Self::Engine(engine, dir) => vec![(*engine, dir.clone())],
+        }
+    }
+}
+
+impl FromStr for HomeArg {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        if let Some((name, dir)) = s.split_once('=')
+            && let Ok(engine) =
+                serde_json::from_value::<Engine>(serde_json::Value::String(name.to_owned()))
+        {
+            if dir.is_empty() {
+                return Err(format!(
+                    "{name}= needs the folder of its home after the `=`"
+                ));
+            }
+            return Ok(Self::Engine(engine, PathBuf::from(dir)));
+        }
+        if s.is_empty() {
+            return Err("expected a folder, or <engine>=<folder>".to_owned());
+        }
+        Ok(Self::Root(PathBuf::from(s)))
+    }
 }
 
 /// `pitcrewd token`.
@@ -186,6 +248,60 @@ mod tests {
         assert_eq!(args.listen, ListenArg::Private);
         assert!(!args.demo);
         assert!(!args.no_office, "the back office is on by default");
+        assert!(!args.no_runner, "the runner is on by default");
+        assert!(args.homes.is_empty());
+    }
+
+    #[test]
+    fn homes_are_folders_or_one_engines_home() {
+        let cli = Cli::try_parse_from([
+            "pitcrewd",
+            "serve",
+            "--homes",
+            "/tmp/home",
+            "claude=/data/claude",
+            "codex=C:\\Users\\x\\.codex",
+            "--demo",
+        ])
+        .unwrap();
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("not serve");
+        };
+        assert!(args.demo);
+        assert_eq!(
+            args.homes,
+            [
+                HomeArg::Root(PathBuf::from("/tmp/home")),
+                HomeArg::Engine(Engine::Claude, PathBuf::from("/data/claude")),
+                HomeArg::Engine(Engine::Codex, PathBuf::from("C:\\Users\\x\\.codex")),
+            ]
+        );
+        let root = PathBuf::from("/tmp/home");
+        assert_eq!(
+            args.homes[0].homes(),
+            [
+                (Engine::Claude, root.join(".claude")),
+                (Engine::Codex, root.join(".codex")),
+                (Engine::OpenCode, root.join(".local/share/opencode")),
+            ]
+        );
+        assert_eq!(
+            "opencode=/x".parse(),
+            Ok(HomeArg::Engine(Engine::OpenCode, PathBuf::from("/x")))
+        );
+        // Only an engine's name before `=` makes it an engine's home.
+        assert_eq!("a=b".parse(), Ok(HomeArg::Root(PathBuf::from("a=b"))));
+        for bad in ["", "claude="] {
+            assert!(bad.parse::<HomeArg>().is_err(), "{bad}");
+        }
+        // Without a runner there is nothing to watch.
+        let both = Cli::try_parse_from(["pitcrewd", "serve", "--no-runner", "--homes", "/x"]);
+        assert!(both.is_err());
+        let off = Cli::try_parse_from(["pitcrewd", "serve", "--no-runner"]).unwrap();
+        let Some(Command::Serve(args)) = off.command else {
+            panic!("not serve");
+        };
+        assert!(args.no_runner);
     }
 
     #[test]

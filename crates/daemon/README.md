@@ -1,8 +1,9 @@
 # pitcrew-daemon
 
-`pitcrewd`, the composition root. For now it is the hub of a solo workspace: it opens the store,
-runs the work model and its back office, and serves API v1 with real tokens. The runner,
-terminals and remote machines join later (ADR-0009).
+`pitcrewd`, the composition root. It is the hub of a solo workspace and its runner, in one process
+(ADR-0009): it opens the store, runs the work model and its back office, watches this machine's
+agent sessions (Claude Code, Codex, OpenCode) into the store, takes their hooks, and serves API v1
+with real tokens. Remote machines join later.
 
 **Owned by stream 0**: see [docs/build/streams/0.md](../../docs/build/streams/0.md).
 
@@ -13,8 +14,10 @@ terminals and remote machines join later (ADR-0009).
 | `pitcrewd serve` | Serves API v1 on the private transport until a stop signal: Ctrl+C; SIGTERM or SIGHUP on Unix; Ctrl+Break or closing the console on Windows. |
 | `pitcrewd serve --listen unix:<dir>/pitcrewd.sock` | Unix only: exactly that socket. The file name must be `pitcrewd.sock`; the directory is created 0700, or must already be ours and 0700. |
 | `pitcrewd serve --listen tcp:127.0.0.1:<port>` | Loopback TCP, **for development only**: tokens are then the only protection. Non-loopback addresses are refused. |
-| `pitcrewd serve --demo` | Seeds the demo workspace (`crates/fixtures`) first. Only into an empty store; a store with data is refused. |
+| `pitcrewd serve --demo` | Seeds the demo workspace (`crates/fixtures`) first. Only into an empty store; a store with data is refused. **Watches no agent home** unless `--homes` is given. |
 | `pitcrewd serve --no-office` | Without the back office (see "The back office"). It is on by default. |
+| `pitcrewd serve --homes <dir>…` | The runner watches these agent homes instead of this user's own (see "The runner"): `<dir>` is a folder laid out like a home folder (`<dir>/.claude`, `<dir>/.codex`, `<dir>/.local/share/opencode`); `claude=<dir>`, `codex=<dir>` or `opencode=<dir>` is one engine's home itself. Several may follow one `--homes`. |
+| `pitcrewd serve --no-runner` | Without the runner: no session is watched, hooks are only logged (debug), and no session has a terminal or a transcript here (`503`). It is on by default. |
 | `pitcrewd token show-path` | Prints where the device token is kept. Never the token. Fails if there is none yet. |
 | `pitcrewd --version` | `pitcrewd 0.0.0 (protocol 1, oldest accepted 1)`: the bare version is the second word. Needs no state directory. |
 
@@ -43,6 +46,7 @@ daemon is ready, `pitcrewd listening on <where>`, which supervisors and tests wa
 | `demo-agent.token` | With `--demo` only: a token for the demo's first agent, `@writer`, `pca_…`. Private. |
 | `workspace.json` | The workspace's id and name (`GET /v1/workspace`), which the event log does not hold. Written by `--demo`. Private. |
 | `office.json` | Where the back office got to in the log (`{ "log", "done" }`), so a restart runs it again from there. Removed by any start with the office off (`--no-office`, or no owner for `@office`). Private. |
+| `runner/<log id>/` | The runner's index (`pitcrew-runner`): every transcript it watches, its session id, and how far it has been read into this store. One folder per hub log (the store's `log_id`), so a new store learns every session from the start. |
 | `run/pitcrewd.sock` | The private socket (Unix). On Windows the API uses the current user's named pipe, `\\.\pipe\pitcrewd-<user SID>`. |
 
 On Unix the directory is created 0700, and an existing one must already be ours and private; on
@@ -64,25 +68,40 @@ Windows it must be under the user's profile, whose ACL it inherits.
      (`--no-office`, or no member it may act as), `office.json` is removed instead.
 3. The store's one `WorkService` (hub-work's "one writer": everything shares that `Arc`).
    - The hub's own machine (`with_hub_machine`) is the workspace's first `local` machine (the
-     demo's "This laptop"). Without one, a dispatch for a task with no folder answers 503.
-   - No dispatcher until the runner link exists (see Routes).
+     demo's "This laptop"). Without one, a dispatch for a task with no folder answers 503, and
+     the runner stays off.
+   - No dispatcher (see "Dispatch").
 4. With `--demo`: mint the tokens, then seed. Tokens come first, so a failure leaves the store
    empty and `--demo` can be retried.
 5. The device token: `device.token` is reused while it verifies as a device token; otherwise a
    new one is minted for the workspace's first person (the demo's `@sam`) and written there. If
    the store has no person yet, the token acts as a new member that nothing knows, and
    `GET /v1/me` answers 404 until onboarding can add the person (see "Not wired yet").
-6. The recap index's warm-up (see "Recaps"), started and not waited for; the back office's loop;
+6. The stop signals' handlers, so a stop from here on takes the clean path (see "Stop").
+7. Unless `--no-runner`, the runner (see "The runner"). It reads the homes and writes into the
+   store at once: the back office's first run covers what it appended, like anything else. A
+   runner that cannot start does not stop the hub (see "The runner").
+8. The recap index's warm-up (see "Recaps"), started and not waited for; the back office's loop;
    the routes; the listener; and the ready line.
 
 ### Stop
 
 Ctrl+C, Ctrl+Break, closing the console (Windows), or SIGTERM or SIGHUP (Unix): the server stops
 accepting and finishes in-flight requests, `pitcrew-api` closes open WebSockets with 1001 (see its
-README) and removes its unix socket, and meanwhile the back office finishes the run it is in and
-saves `office.json` (`the back office stopped`). Then the store closes, checkpointing its WAL so
-only `hub.db` remains, and the lock is released last. The log ends with `store closed` and
-`stopped`.
+README) and removes its unix socket. Meanwhile, as in the same step, the back office finishes the
+run it is in and saves `office.json` (`the back office stopped`), and the runner stops: what it has
+read is handed to the store first, its threads end, and with them its hold on the store (`the
+runner stopped`). Each gets 10 seconds. Then the store closes, checkpointing its WAL so only
+`hub.db` remains, and the lock is released last. The log ends with `store closed` and `stopped`.
+
+**A stop always ends, within about 20 seconds.** Whatever does not finish in time is left behind
+and ends with the process, and the log says so (warnings): a runner stuck in a discovery or a read
+on a filesystem that does not answer (`the runner is still stopping`); a transcript read past its
+10 seconds (`a transcript read has not returned`); anything that still holds the store 3 seconds
+after the server stopped; and, last, work still on the blocking pool 5 seconds later (`work on the
+blocking pool is still running`). The store is then closed with the process (`the store is still
+open at exit`), and its next open recovers the log from its write-ahead file. Bounds: the 10
+seconds of the stop step, 3 for the store's holders, 5 for the blocking pool.
 
 ## The back office
 
@@ -169,18 +188,127 @@ after it, authored by `@office`.
   as after `--no-office`. The tests that stand in for the runner link by appending from another
   process would then need the runner link itself.
 
+## The runner
+
+Stream D's runner (`crates/runner`), joined to the hub in this process by its in-process link
+(its README: `StoreSink`, `RunnerHooks`, `RunnerTerminals`, `SessionAgents`, the hook ownership
+rule). `src/runner.rs` starts it; `--no-runner` leaves it off.
+
+**Homes, and privacy.** Agent homes hold a person's private transcripts, so which are watched is
+explicit:
+
+- with `--homes`, exactly those;
+- with `--demo` and no `--homes`, **none**: a demo never shows the person's real sessions. The log
+  says `the runner watches no home (--demo without --homes)`;
+- otherwise this user's own, as each adapter finds them (`pitcrew_ingest::scan::default_homes`):
+  `CLAUDE_CONFIG_DIR` or `~/.claude`, `CODEX_HOME` or `~/.codex`, and `$XDG_DATA_HOME/opencode` or
+  `~/.local/share/opencode` (on Windows too). The log lists them (`the runner watches these
+  homes`). A home that does not exist yet is picked up when it appears.
+
+Tests never watch a real home (see "Tests").
+
+**Into the store.** The runner's `StoreSink` appends its batches to the store with `append_new`,
+so a batch sent again after a crash is stored once; the work model's projections apply them in
+the same transaction, and the stream announces them. Events of sessions without an agent are
+authored by the workspace's first person, whom the device token acts as. The runner's sessions run
+on the hub's own machine (the workspace's first local one). Without that machine, or without a
+person, it stays off (logged), as the back office does without a person. Its index is
+`runner/<log id>/`.
+
+**A runner that cannot start** (its index cannot be opened or is locked, one of its threads,
+its terminals' included, cannot start) does not stop the hub: the daemon warns (`the runner cannot
+start, so this hub serves without it`, with the reason and the index's folder) and serves as with
+`--no-runner`. A desktop supervisor cannot pass `--no-runner`, and the hub's work is still worth
+reaching.
+
+**`GET /v1/host/info`** answers roles `["hub", "runner"]` while the runner runs, `["hub"]` when it
+is off; capabilities `["watch"]` only while it watches at least one home (so not with `--demo`
+alone), else `[]`.
+
+**Hooks, and `SessionAgents`.** `POST /v1/hooks/{engine}/{event}` goes through the API's
+`HookIntake` to `RunnerHooks`, which applies a hook only when its sender may change the session
+(the runner README's rule: an agent token, its own sessions; a person, sessions without an agent
+or of an agent they own; anything else, and an unknown agent, refused). Who runs a session comes
+from `HubAgents` (`src/agents.rs`), the runner's `SessionAgents` over hub-work's sessions and
+members:
+
+- **Current by construction.** Each answer is one `Store::read` (a fresh read transaction) of the
+  hub's `work_sessions` and `work_members`, with no cache. It sees every write committed before
+  the question: the hub's commands, the runner's `StoreSink`, another process. Nothing has to tell
+  it that a session gained an agent, so it can never answer "no agent" from a stale copy.
+- A session stored with an agent answers that agent and its owner; one stored without, or not
+  stored at all, "no agent" (the runner states every session without one, and a dispatch stores
+  its agent before its CLI starts).
+- **A sub-agent runs as its parent:** the answer is the agent found up the chain of `parent`s,
+  for at most 16 sessions, the session itself included. Two sessions of a chain naming different
+  agents, a chain going on past 16 sessions (to a 17th, stored or not: erring safe) or one that
+  loops, an agent the hub does not know as an agent member, or a read that fails (warned once,
+  then logged at debug): **`Unknown`**, and the runner refuses the hook.
+- It reads the store only, never the runner, so it cannot wait for the watcher thread that asks.
+- **A window at discovery.** The runner decides the hooks it held for a new session when it
+  discovers it, before the hub has stored the session. Its `parent` cannot be seen then, so a
+  sub-agent answers "no agent" even when its parent has one. Harmless today (every parent is the
+  runner's own session, without an agent); once dispatch ids are adopted, a dispatched agent's
+  held hooks for its sub-agents would be refused and a person's applied. The fix is the runner's:
+  ask about the parent (`agent_of(parent)` when the sub-agent answers "no agent"), or pass it in.
+- **Consequence today** (the runner README, "Session ids today"): the runner's sessions have no
+  agent in the hub, so the person's hooks (device token) change them and an agent token's do not.
+  How a real agent's hooks authenticate is a separate design.
+
+**Terminals.** `GET /v1/sessions/{id}/terminal` is answered by `SessionTerminals`
+(`src/terminals.rs`): a session the hub does not know is `404`; one on another machine `503` (no
+remote runners yet); one on this machine is `RunnerTerminals`' to find, `404` while it has no
+terminal. **The runtime:** `crates/runtime` has tmux control mode's building blocks but no
+`Runtime` yet (`TmuxRuntime` and the PTY runtime are stream B's later briefs), so the runner's
+terminals run over `NoRuntime`, which owns no terminal and starts none. Every session of this
+machine is therefore `404` today. When stream B's runtime lands, `Runner::terminals` takes tmux
+where `has_tmux`, else the PTY runtime.
+
+**Transcripts** (a stand-in). `GET /v1/sessions/{id}/transcript?before=&limit=` (api-v1,
+"Transcript paging") is served by `src/transcripts.rs`, because neither the runner nor
+`pitcrew-api` serves transcript pages yet:
+
+- the daemon hands the runner its three adapters wrapped in `Recorded`, which keeps what each
+  home's latest discovery found; the route only reads those, so only watched homes;
+- a session's transcript is found by its engine and native id, by each CLI's own file names only:
+  Claude's `<id>.jsonl` and its sub-agents' `agent-<id>.jsonl`, Codex's
+  `rollout-<time>-<id>.jsonl` (or the whole name, when the rollout's records name no id), and
+  OpenCode's inner id; so an id cannot match another kind of file. The newest, if one session is
+  in two homes;
+- it is paged by the adapter's own `read_page` on the blocking pool, given 10 seconds: a read that
+  does not return by then answers `503` and is logged as left running (see "Stop");
+- unknown session `404`; another machine's, or any without a runner, `503`; a session of this
+  machine whose transcript is not found (the demo's, a deleted file) an empty page at the start,
+  as the mock answers for a session without one; `limit` 200 by default, 1000 at most, and a
+  `limit=0` or a `before` or `limit` that is not a whole number `400`.
+
+The runner's index already knows each session's transcript exactly. Proposal for stream D: a
+`RunnerHandle::transcript_page(session, before, limit)`; and for stream H, a `Transcripts` seam
+and route in `pitcrew-api` like `Terminals`. Then this module goes.
+
+## Dispatch
+
+`POST /v1/tasks/{id}/dispatch` keeps answering `503 unavailable`, recording nothing: the daemon
+gives hub-work no `Dispatcher`. A dispatch stores its session, agent named, before its CLI starts;
+the runner, which mints its own session ids, would then discover that CLI's transcript as a second
+session without the agent. The dispatched agent's hooks would resolve to the runner's session and
+be refused (and any person's applied), and the dispatch's own session would never move. The runner
+must first adopt the dispatch's session id (the runner README, "Session ids today, and
+dispatch"); then `RunnerCommands` becomes hub-work's `Dispatcher` here.
+
 ## Routes
 
 | Route | From |
 |---|---|
-| `GET /v1/host/info` (no token) | `pitcrew-api`; roles `["hub"]` until the runner is wired in |
+| `GET /v1/host/info` (no token) | `pitcrew-api`; roles `["hub", "runner"]` while the runner runs, else `["hub"]`; capabilities `["watch"]` while it watches a home, else `[]` |
 | Work routes, agent and device, with `GET /v1/workspace` and `GET /v1/sessions[/{id}]` | `pitcrew-hub-work` (`agent_routes`, `device_routes`) |
-| `POST /v1/tasks/{id}/dispatch` | `pitcrew-hub-work` without a dispatcher: `503 unavailable`, and nothing is recorded, not even an assignment |
+| `POST /v1/tasks/{id}/dispatch` | `pitcrew-hub-work` without a dispatcher: `503 unavailable`, and nothing is recorded, not even an assignment (see "Dispatch") |
 | `GET /v1/stream` | `pitcrew-api` over the store (`StoreSource`) |
 | `GET /v1/events` | `pitcrew-api`'s `Activity` over the store, with the work model's activity index (`with_refs`, through the `WorkRefs` adapter in `src/refs.rs`): `project=` and `workstream=` match events about them, their tasks and their sessions, and `task=` and `session=` also match their sessions' and dispatches' events |
 | `GET /v1/recaps/blocks`, `GET /v1/recaps/days` | `pitcrew-api`'s `Recaps` over the hub's recap index (hub-work's `RecapIndex`, implemented by its `WorkService`), through the `WorkRecaps` adapter in `src/recaps.rs`; see "Recaps" |
-| `POST /v1/hooks/{engine}/{event}` | `pitcrew-api`; logged at debug (engine, event, member; never the body) until the runner's sink exists |
-| `GET /v1/sessions/{id}/terminal` | `pitcrew-api`; no runner yet, so `503 unavailable` for a known session, `404` for an unknown one |
+| `POST /v1/hooks/{engine}/{event}` | `pitcrew-api` into the runner's `RunnerHooks` (see "The runner"); with `--no-runner`, logged at debug (engine, event, member; never the body) |
+| `GET /v1/sessions/{id}/terminal` | `pitcrew-api` over `SessionTerminals` (see "The runner") |
+| `GET /v1/sessions/{id}/transcript` | `src/transcripts.rs`, a device route (see "The runner") |
 
 On development TCP only, the daemon answers CORS as the mock hub does: preflights from
 `http://localhost:<port>`, `http://127.0.0.1:<port>` and the Tauri app's origins get `204` and
@@ -207,7 +335,8 @@ held in memory, never stored, so a restart builds them again.
   does not wait for it: a request meanwhile waits for the index, and finds it built. It logs
   `built the recap index rev=<the revision it reflects> ms=<how long>`, or a warning if it failed
   (then the first request goes on from where it stopped). With `--demo` it is a few milliseconds
-  (67 revisions); a stop during a long warm-up waits for it before the store closes.
+  (67 revisions); a stop during a long warm-up waits for it before the store closes, within the
+  stop's bounds (see "Stop").
 - **Any `tz`.** The daemon computes days at any offset from −840 to 840; the mock serves only
   `tz=0` from its fixture.
 - **Not the mock's fixture.** The seeded demo's log is not the fixture's slice (the seed's own
@@ -238,7 +367,9 @@ VITE_PITCREW_TOKEN="$(cat "$(cargo run -q -p pitcrew-daemon -- --state-dir /tmp/
 ```
 
 `--demo` works once per state directory; restart without it to keep the data, or use a new
-directory for a fresh demo. The CLI takes the same token from the file:
+directory for a fresh demo. With `--demo` the runner watches no agent home; `--homes <dir>` points
+it at one (a folder with a copy of `crates/fixtures/data/transcripts/claude/demo-session.jsonl`
+under `<dir>/.claude/projects/<any>/`, say), and a restart without `--demo` watches your own. The CLI takes the same token from the file:
 `PITCREW_URL=http://127.0.0.1:47460 PITCREW_TOKEN_FILE=<that path> pitcrew …`.
 
 ## Parity with the mock hub
@@ -268,16 +399,50 @@ event right after a write may see `@office`'s reminders instead, depending on ti
 
 ## Tests
 
+**No test watches a real agent home.** Every daemon the tests start (`tests/common`) gets a home
+folder of its own, `<state dir>-home` in the test's temporary folder, as `HOME` and `USERPROFILE`,
+with `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `XDG_DATA_HOME` removed: a start without `--demo` and
+without `--homes` watches that folder, never the machine's own. Transcripts come from
+`crates/fixtures`, under synthetic session ids.
+
 `tests/serve.rs` starts the real binary on a temporary state directory and a free port, and
 covers `--version`, `token show-path`, tokens and scopes, the work routes (with the workspace,
 sessions, and a dispatch that answers 503 and records nothing), the stream (a move
-appears on it; a reconnect with `since` gets what it missed), hooks, terminals, CORS and the
-`Host` guard, the single-daemon lock, and on Unix a SIGTERM stop: a clean store, the back office
-stopped before it, `--demo` refused afterwards, a stream closed with 1001, and a restart that
-keeps the token, the log and the data. Also on Unix: `--listen unix:<path>` binds exactly that
-socket in a 0700 directory, and SIGTERM and SIGHUP both remove it (the back office stopping
-first); `--version` creates nothing. Nothing it logs, at debug, holds a token. Its checks allow
-for the back office appending after a write (the demo's asks are old by the wall clock).
+appears on it; a reconnect with `since` gets what it missed), hooks, terminals (`404` for this
+machine's session, `503` for another machine's), transcripts (an empty page for a demo session),
+CORS and the `Host` guard, the single-daemon lock, and on Unix a SIGTERM stop: a clean store, the
+back office stopped before it, `--demo` refused afterwards, a stream closed with 1001, and a
+restart that keeps the token, the log and the data. Also on Unix: `--listen unix:<path>` binds
+exactly that socket in a 0700 directory, and SIGTERM and SIGHUP both remove it (the back office
+stopping first); `--version` creates nothing. Nothing it logs, at debug, holds a token. Its checks
+allow for the back office appending after a write (the demo's asks are old by the wall clock).
+
+`tests/runner.rs`, with temporary homes (`--homes`) filled from the Claude fixture:
+
+- the transcript is a session of the hub's machine through the API (`GET /v1/sessions`), with its
+  transcript (`GET /v1/sessions/{id}/transcript`, paged by one item and from `before`; bad
+  queries `400`); lines appended to the file reach `GET /v1/stream` live (tool runs, the edit, the
+  turn's end), the session goes idle, the transcript grows, and each record is in the log once;
+- hooks through the real route and real tokens: `@writer`'s hook changes its own session; its
+  hooks on `@reviewer`'s session and on a session without an agent change nothing; the person's
+  change `@reviewer`'s (an agent they own) and the agentless one. Each refused hook would leave a
+  state no allowed one does (idle, or another status line), and is sent before an allowed one, so
+  timing cannot pass it. Agents are given as a dispatch would, by a `session_discovered` naming
+  them, appended from the test with the work model's projections;
+- `--demo` without `--homes` watches no home, not even the daemon's own (it holds a transcript
+  that never appears): the runner runs but `capabilities` is `[]`, and the log says so; started
+  again without `--demo`, the same home is watched by default and the session appears;
+- `--no-runner`: roles `["hub"]`, hooks only logged, terminal and transcript `503`, and `--homes`
+  refused with it;
+- a runner that cannot start (`runner` in the state directory is a file): the daemon starts, warns
+  with the folder, and serves as a hub only (roles `["hub"]`, terminal and transcript `503`, the
+  work routes as ever);
+- on Unix, SIGTERM: `the runner stopped` and `the back office stopped` before `store closed`; a
+  restart with lines written meanwhile keeps the session's id, adds the rest, and stores nothing
+  twice;
+- on Unix, a stop with a read that never returns (the transcript swapped for a FIFO no one writes,
+  which both the watcher and a transcript request then open): the daemon still exits cleanly, in
+  about 18 seconds, logging the runner, the read and the store it left behind.
 
 `tests/office.rs`, with `--demo`, appends what the runner link will report straight to the store
 (the daemon looks at it with its next append, here a comment through the API, or at its next
@@ -326,12 +491,28 @@ acquisition) and held, the same file, while the office starts and acts, then let
 store closes. (A lease let go of and taken again on a free path gets the same generation number,
 so the number alone could not show it.)
 
+The unit tests of the runner's wiring: `src/agents.rs` answers each session's agent and owner,
+sees a session gain an agent at once (and keep it through a re-statement without one), resolves
+sub-agents up their chain (16 sessions resolve; 17, or 16 below a parent not stored, are
+`Unknown`), and answers `Unknown` for a chain that disagrees or loops and for an agent the hub
+does not know as one; `src/terminals.rs` answers `404`, `503` or the runner's answer by where the
+session is, with and without a runner; `src/transcripts.rs` finds each CLI's file names and no
+other engine's (no Claude id names a rollout, no Codex id a Claude file), takes the newest of
+one session in two homes, and replaces a home's list at each discovery; `src/runner.rs` and `src/cli.rs` check that `--demo` alone watches nothing (the person's
+homes are not even looked up), how `--homes` values become homes, and that `--no-runner` refuses
+`--homes`.
+
 ## Not wired yet
 
-- The runner (stream D's hub link): its event sink, the hook sink, terminals, the dispatcher,
-  agent tokens for real sessions, and the `SessionAgents` trait over hub-work's sessions and
-  members; then `roles` gains `runner`.
+- The dispatcher (see "Dispatch"), and agent tokens for real sessions: how a real agent's hooks
+  authenticate is a separate design.
+- A real terminal runtime (stream B), and transcript pages from the runner itself (see "The
+  runner").
+- Linking sessions to workstreams by folder or branch: the runner can (`Locations`), but the daemon
+  does not pass it the workstreams' locations yet, so nothing is linked by folder or branch.
 - Creating the workspace and its first person outside `--demo`: there is no work command for it
   yet; the daemon would write `workspace.json` then. The back office's member is appended by the
-  daemon itself for now, for the same reason.
+  daemon itself for now, for the same reason. Until a workspace has a person and a local machine,
+  the runner stays off.
+- `pitcrewd connect` (the tunnel's stdio bridge), once stream J's tunnel is merged.
 - Remote machines, the Tauri shell, auto-start and installers.

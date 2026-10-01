@@ -8,6 +8,7 @@
 //! | `demo-agent.token` | With `--demo`: a token for the demo's first agent. Private (0600). |
 //! | `workspace.json` | The workspace's id and name, which the event log does not hold. Private (0600). |
 //! | `office.json` | Where the back office got to in the log, so a restart runs it again from there. Private (0600). |
+//! | `runner/<log id>/` | The runner's index of the transcripts it watches (`pitcrew-runner`), one per hub log. |
 //! | `run/pitcrewd.sock` | The private socket (Unix). |
 
 use anyhow::Context as _;
@@ -84,6 +85,12 @@ impl StateDir {
     #[must_use]
     pub fn run_dir(&self) -> PathBuf {
         self.root.join("run")
+    }
+
+    /// The runner's indexes, one folder per hub log.
+    #[must_use]
+    pub fn runner(&self) -> PathBuf {
+        self.root.join("runner")
     }
 }
 
@@ -321,6 +328,7 @@ mod tests {
             state.workspace(),
             state.office(),
             state.run_dir(),
+            state.runner(),
         ] {
             assert_eq!(path.parent(), Some(state.root()));
         }

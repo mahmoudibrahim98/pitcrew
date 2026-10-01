@@ -9,37 +9,43 @@
 //!    (`Store::register`), so a network filesystem's lease is never let go of in between. When it
 //!    cannot, `office.json` is removed.
 //! 3. The one `WorkService` for the store, with the hub's own machine (the workspace's local one).
-//!    It has no dispatcher until the runner link exists, so a dispatch answers 503 and records
-//!    nothing.
+//!    It has no dispatcher, so a dispatch answers 503 and records nothing (see the README,
+//!    "Dispatch").
 //! 4. With `--demo`: mint the tokens, seed the demo workspace.
 //! 5. The device token: reused from `device.token` while it still verifies, else minted.
-//! 6. The recap index's warm-up on the blocking pool, not waited for; the back office's loop; the
-//!    routes (`RouterParts`, with the activity index and the recaps); the listener; and one line
-//!    on stdout: `pitcrewd listening on <where>`.
+//! 6. Unless `--no-runner`, the runner ([`crate::runner`]): it watches the homes and writes into
+//!    the store at once.
+//! 7. The recap index's warm-up on the blocking pool, not waited for; the back office's loop; the
+//!    routes (`RouterParts`, with the activity index, the recaps, the runner's hooks, terminals
+//!    and transcripts); the listener; and one line on stdout: `pitcrewd listening on <where>`.
 //!
 //! Stop (Ctrl+C or Ctrl+Break, or SIGTERM or SIGHUP on Unix): the server stops accepting and
 //! finishes in-flight requests (`pitcrew-api` closes open WebSockets with 1001) while the back
-//! office finishes its run in progress and saves where it got to; then the store closes,
-//! checkpointing its WAL, and the lock is released last.
+//! office finishes its run in progress and saves where it got to, and the runner hands what it
+//! read to the store and stops; then the store closes, checkpointing its WAL, and the lock is
+//! released last.
 
 use crate::cli::{ListenArg, ServeArgs};
-use crate::no_runner::NoRunner;
 use crate::office::Office;
 use crate::recaps::WorkRecaps;
 use crate::refs::WorkRefs;
+use crate::runner::Runner;
 use crate::state::{StateDir, read_token, read_workspace, write_token, write_workspace};
+use crate::terminals::SessionTerminals;
+use crate::transcripts::Transcripts;
 use anyhow::{Context as _, bail};
 use axum::Extension;
 use pitcrew_api::{
-    Activity, Bound, EventRefs, EventSource, HookIntake, Listen, LogHookSink, RecapSource, Recaps,
-    RouterParts, StoreSource, StreamConfig, TerminalConfig, Terminals,
+    Activity, Bound, EventRefs, EventSource, HookIntake, HookSink, Listen, LogHookSink,
+    RecapSource, Recaps, RouterParts, StoreSource, StreamConfig, TerminalConfig, Terminals,
 };
 use pitcrew_auth::{FileTokenStore, TokenError, TokenStore};
 use pitcrew_fixtures::DemoWorkspace;
 use pitcrew_hub_work::{BackOffice, WorkService};
 use pitcrew_protocol::api::{Caller, HostRole, TokenScope};
-use pitcrew_protocol::ids::{MemberId, WorkspaceId};
+use pitcrew_protocol::ids::{MachineId, MemberId, WorkspaceId};
 use pitcrew_protocol::model::{MachineKind, MemberKind, Workspace};
+use pitcrew_protocol::runner::Capability;
 use pitcrew_store::{Projection, Store, StoreOptions};
 use std::io::Write as _;
 use std::path::Path;
@@ -54,6 +60,9 @@ const HOOK_QUEUE: usize = 1024;
 const DRAIN: Duration = Duration::from_secs(10);
 /// How long whatever still holds the store after the server stopped gets to let go of it.
 const RELEASE: Duration = Duration::from_secs(3);
+/// How long the async runtime then waits for work still on its blocking pool. What is still
+/// running after that is left to end with the process.
+const ABANDON: Duration = Duration::from_secs(5);
 
 /// Runs `pitcrewd serve` until a stop signal.
 ///
@@ -79,14 +88,38 @@ pub fn serve(state: &StateDir, args: &ServeArgs) -> anyhow::Result<ExitCode> {
         .thread_name("pitcrewd")
         .build()
         .context("cannot start the async runtime")?;
-    let served = runtime.block_on(run(hub, state, args.listen.clone(), started));
-    // Stopping the runtime drops the tasks that still hold the store, such as streams the server
-    // did not close; the store closes with the last of them.
-    drop(runtime);
+    // Before the runner starts, so a stop signal from here on takes the clean path.
+    let stop = {
+        let _entered = runtime.enter();
+        Stop::listen().context("cannot listen for stop signals")?
+    };
+    let runner = if args.no_runner {
+        tracing::info!("the runner is off (--no-runner)");
+        None
+    } else {
+        let homes = crate::runner::homes(&args.homes, args.demo, crate::runner::default_homes);
+        match crate::runner::start(state, &hub.work, &hub.store, hub.machine, homes) {
+            Ok(runner) => runner,
+            // The hub is still worth serving (the desktop reaches its work), and a supervisor
+            // cannot pass --no-runner.
+            Err(e) => {
+                tracing::warn!(
+                    "the runner cannot start, so this hub serves without it (no session is \
+                     watched, hooks are only logged): {e:#}"
+                );
+                None
+            }
+        }
+    };
+    let served = runtime.block_on(run(hub, runner, stop, state, args.listen.clone(), started));
+    stop_runtime(runtime);
     if store.upgrade().is_none() {
         tracing::info!("store closed");
     } else {
-        tracing::warn!("the store is still open at exit");
+        tracing::warn!(
+            "the store is still open at exit, held by work left behind; it closes with the \
+             process, and its next open recovers the log from its write-ahead file"
+        );
     }
     drop(lock);
     served?;
@@ -102,6 +135,8 @@ struct Hub {
     work: Arc<WorkService>,
     /// The back office, unless it is off.
     office: Option<Office>,
+    /// The hub's own machine, the workspace's first local one, if it has one.
+    machine: Option<MachineId>,
 }
 
 /// Steps 1–5: the token registry, the store, the workspace and its service, the back office's
@@ -177,28 +212,31 @@ fn open_with(
     let store = Arc::new(store);
 
     // The one writer of this store (hub-work's "One writer"): everything shares this `Arc`.
-    // No dispatcher until the runner link exists: a dispatch then answers 503 and records
-    // nothing, rather than appending a dispatch that can only fail.
+    // No dispatcher (see the README, "Dispatch"): a dispatch answers 503 and records nothing,
+    // rather than appending a dispatch that can only fail.
     let work = WorkService::new(Arc::clone(&store), workspace);
     let machines = match &demo {
         Some(demo) => demo.machines.clone(),
         None => work.machines().context("cannot list the machines")?,
     };
-    let work = Arc::new(
-        match machines.iter().find(|m| m.kind == MachineKind::Local) {
-            Some(machine) => {
-                tracing::info!(machine = %machine.id, name = %machine.name, "the hub's own machine");
-                work.with_hub_machine(machine.id)
-            }
-            None => {
-                tracing::warn!(
-                    "the workspace has no local machine, so a dispatch for a task without a \
-                     folder answers 503 until the runner adds this one"
-                );
-                work
-            }
-        },
-    );
+    let machine = machines
+        .iter()
+        .find(|m| m.kind == MachineKind::Local)
+        .map(|m| (m.id, m.name.clone()));
+    let work = Arc::new(match &machine {
+        Some((id, name)) => {
+            tracing::info!(machine = %id, %name, "the hub's own machine");
+            work.with_hub_machine(*id)
+        }
+        None => {
+            tracing::warn!(
+                "the workspace has no local machine, so a dispatch for a task without a folder \
+                 answers 503, and the runner stays off, until one is added"
+            );
+            work
+        }
+    });
+    let machine = machine.map(|(id, _)| id);
 
     // Tokens before seeding: if minting fails, the store stays empty and `--demo` can be retried.
     match &demo {
@@ -225,6 +263,7 @@ fn open_with(
         store,
         work,
         office,
+        machine,
     })
 }
 
@@ -383,9 +422,11 @@ fn first_person(work: &WorkService) -> anyhow::Result<MemberId> {
     })
 }
 
-/// Step 5 onwards: serve until a stop signal, then shut down in order.
+/// Step 7 onwards: serve until a stop signal, then shut down in order.
 async fn run(
     hub: Hub,
+    runner: Option<Runner>,
+    mut stop: Stop,
     state: &StateDir,
     listen: ListenArg,
     started: Instant,
@@ -395,16 +436,28 @@ async fn run(
         store,
         work,
         office,
+        machine: _,
     } = hub;
-    let mut stop = Stop::listen().context("cannot listen for stop signals")?;
     let office_work = Arc::clone(&work);
     warm_up_recaps(&work);
 
     let events: Arc<dyn EventSource> =
         Arc::new(StoreSource::new(Arc::clone(&store), store.log_id()));
-    let hooks = HookIntake::start(Arc::new(LogHookSink), HOOK_QUEUE)
-        .context("cannot start the hook intake")?;
-    let terminals: Arc<dyn Terminals> = Arc::new(NoRunner::new(Arc::clone(&work)));
+    // Hooks change sessions' state through the runner, for the senders that may (its README,
+    // "Who may change a session through a hook"); without it they are only logged.
+    let hook_sink: Arc<dyn HookSink> = match &runner {
+        Some(runner) => Arc::new(runner.hooks()),
+        None => Arc::new(LogHookSink),
+    };
+    let hooks = HookIntake::start(hook_sink, HOOK_QUEUE).context("cannot start the hook intake")?;
+    let terminals: Arc<dyn Terminals> = Arc::new(SessionTerminals::new(
+        Arc::clone(&work),
+        runner.as_ref().map(|r| (r.machine(), r.terminals())),
+    ));
+    let transcripts = Transcripts::new(
+        Arc::clone(&work),
+        runner.as_ref().map(|r| (r.machine(), r.found())),
+    );
     // The activity index (`project=`, `workstream=`, and wider `task=` and `session=` matches).
     let refs: Arc<dyn EventRefs> = Arc::new(WorkRefs(Arc::clone(&work)));
     // The recap index (`GET /v1/recaps/blocks` and `/days`), kept current on every query.
@@ -423,8 +476,20 @@ async fn run(
             terminals,
             TerminalConfig::default(),
         ))
+        .device(transcripts.routes())
         .device(pitcrew_hub_work::device_routes().layer(Extension(work)));
-    let info = pitcrew_api::local_host_info(env!("CARGO_PKG_VERSION"), vec![HostRole::Hub], vec![]);
+    let (roles, capabilities) = match &runner {
+        Some(runner) => (
+            vec![HostRole::Hub, HostRole::Runner],
+            if runner.watches() {
+                vec![Capability::Watch]
+            } else {
+                Vec::new()
+            },
+        ),
+        None => (vec![HostRole::Hub], Vec::new()),
+    };
+    let info = pitcrew_api::local_host_info(env!("CARGO_PKG_VERSION"), roles, capabilities);
 
     let (listen, dev) = match listen {
         ListenArg::Private => (
@@ -487,17 +552,23 @@ async fn run(
     };
 
     // The server stops accepting, finishes in-flight requests and closes its WebSockets, while the
-    // back office finishes its run in progress; both let go of the store before it closes.
+    // back office finishes its run in progress and the runner hands the store what it read; all
+    // three let go of the store before it closes.
     let _ = draining.send(());
     let office_stopped = async {
         if let Some(office) = office {
             office.stop(DRAIN).await;
         }
     };
+    let runner_stopped = async {
+        if let Some(runner) = runner {
+            runner.stop(DRAIN).await;
+        }
+    };
     if failed.is_some() {
-        office_stopped.await;
+        tokio::join!(office_stopped, runner_stopped);
     } else {
-        tokio::join!(office_stopped, finish(&mut serving));
+        tokio::join!(office_stopped, runner_stopped, finish(&mut serving));
     }
     drop(tokens);
     close_store(store).await;
@@ -527,6 +598,22 @@ fn warm_up_recaps(work: &Arc<WorkService>) {
             ),
         }
     }));
+}
+
+/// Stops the async runtime: its tasks are dropped at once, and work on its blocking pool gets
+/// [`ABANDON`] to finish. A call that has not returned by then (a read of a file on a filesystem
+/// that does not answer, a runner that could not stop) is left behind and ends with the process,
+/// so a stop always finishes in bounded time.
+fn stop_runtime(runtime: tokio::runtime::Runtime) {
+    let waited = Instant::now();
+    runtime.shutdown_timeout(ABANDON);
+    if waited.elapsed() >= ABANDON {
+        tracing::warn!(
+            seconds = ABANDON.as_secs(),
+            "work on the blocking pool is still running; it is left behind and ends with the \
+             process"
+        );
+    }
 }
 
 /// Waits for the server to finish, at most [`DRAIN`].
@@ -770,6 +857,7 @@ mod tests {
             listen,
             demo,
             no_office,
+            ..
         })) = cli.command
         else {
             panic!("not serve");
@@ -899,6 +987,7 @@ mod tests {
             store,
             work,
             office: back_office,
+            ..
         } = open(&state, true, true).unwrap();
         let finished = runtime.block_on(async {
             let running = back_office.unwrap().spawn(Arc::clone(&work));
@@ -962,6 +1051,7 @@ mod tests {
             store: _store,
             work,
             office: back_office,
+            ..
         } = open(&state, false, true).unwrap();
         let back_office = back_office.unwrap();
         assert_eq!(back_office.last(), finished.from_rev - 1);
@@ -1030,6 +1120,7 @@ mod tests {
             store,
             work,
             office,
+            ..
         } = open_with(&state, true, true, options).unwrap();
         assert_eq!(acquired(), 1, "the lease was taken more than once");
         let held = leases();
@@ -1171,6 +1262,7 @@ mod tests {
             store: _store,
             work,
             office: back_office,
+            ..
         } = open(&state, true, true).unwrap();
         // A directory where office.json goes: every save fails while it is there.
         let block = || {
