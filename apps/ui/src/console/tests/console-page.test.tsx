@@ -7,7 +7,6 @@
 
 import { act, fireEvent, screen, within } from '@testing-library/react';
 import { createMemoryHistory, RouterProvider } from '@tanstack/react-router';
-import { StrictMode } from 'react';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // happy-dom cannot draw a terminal; terminal-view.test.tsx and the Playwright specs test xterm.
@@ -87,13 +86,9 @@ afterEach(async () => {
 
 function renderConsole(path: string) {
   const router = createAppRouter([feature], { history: createMemoryHistory({ initialEntries: [path] }) });
-  // In Strict Mode, as src/main.tsx mounts the app: effects run, are undone, and run again.
-  renderWithHub(
-    hub,
-    <StrictMode>
-      <RouterProvider router={router} />
-    </StrictMode>,
-  );
+  // In Strict Mode at the root, as src/main.tsx mounts the app: effects run, are undone, and run
+  // again.
+  renderWithHub(hub, <RouterProvider router={router} />, { strict: true });
   /** A palette command's context, as the shell's palette builds it. */
   const context: CommandContext = {
     workspace: WS,

@@ -11,6 +11,7 @@
 
 import { defaultStringifySearch, useParams, useRouter, useSearch } from '@tanstack/react-router';
 import {
+  createElement,
   lazy,
   Suspense,
   useEffect,
@@ -18,7 +19,9 @@ import {
   useLayoutEffect,
   useRef,
   useState,
+  type ComponentType,
   type KeyboardEvent,
+  type LazyExoticComponent,
   type ReactNode,
   type RefObject,
 } from 'react';
@@ -42,10 +45,18 @@ import {
 import { SessionFilters } from './session-filters.tsx';
 import { SessionHeader } from './session-header.tsx';
 import { SessionList, type SelectVia } from './session-list.tsx';
+import { TerminalBoundary } from './terminal-boundary.tsx';
+import type { TerminalViewProps } from './terminal/terminal-view.tsx';
 import { ViewSwitch } from './view-switch.tsx';
 
-// Its own chunk, with xterm: nothing of it loads until a terminal is shown.
-const TerminalView = lazy(() => import('./terminal/terminal-view.tsx').then((m) => ({ default: m.TerminalView })));
+// Its own chunk, with xterm: nothing of it loads until a terminal is shown. One lazy component per
+// attempt: React keeps a failed import's error, so trying again needs a new one.
+const loadTerminalView = () => import('./terminal/terminal-view.tsx').then((m) => ({ default: m.TerminalView }));
+const terminalViews: LazyExoticComponent<ComponentType<TerminalViewProps>>[] = [];
+function terminalView(attempt: number): LazyExoticComponent<ComponentType<TerminalViewProps>> {
+  terminalViews[attempt] ??= lazy(loadTerminalView);
+  return terminalViews[attempt];
+}
 
 /** How long the arrow keys must rest on a session before the session pane follows. */
 const FOLLOW_MS = 150;
@@ -372,7 +383,8 @@ function SessionPane({ ws, sessionId, view, onView, narrow }: SessionPaneProps) 
   const loaded = session.data !== undefined;
   const hasTerminal = session.data?.terminal !== undefined;
   // Until the session is here, a link to its terminal waits for it rather than flashing the chat.
-  const shown: SessionView | 'loading' = view === 'terminal' && !loaded ? 'loading' : view === 'terminal' && hasTerminal ? 'terminal' : 'chat';
+  let shown: SessionView | 'loading' | 'failed' = view === 'terminal' && hasTerminal ? 'terminal' : 'chat';
+  if (view === 'terminal' && !loaded) shown = session.error === null ? 'loading' : 'failed';
   return (
     <>
       <SessionHeader
@@ -389,11 +401,20 @@ function SessionPane({ ws, sessionId, view, onView, narrow }: SessionPaneProps) 
         terminalUnavailable={loaded && !hasTerminal ? 'This session has no terminal.' : undefined}
       />
       {shown === 'loading' && <p className="p-4 text-sm text-ink-2">Loading the session…</p>}
+      {shown === 'failed' && (
+        <p role="alert" className="p-4 text-sm text-ink-2">
+          Could not load the session{session.error instanceof ApiError ? `: ${session.error.message}` : '.'}
+        </p>
+      )}
       {shown === 'terminal' && (
         <div data-pane="terminal" className="flex min-h-0 flex-1 flex-col">
-          <Suspense fallback={<p className="p-4 text-sm text-ink-2">Loading the terminal…</p>}>
-            <TerminalView sessionId={sessionId} />
-          </Suspense>
+          <TerminalBoundary>
+            {(attempt) => (
+              <Suspense fallback={<p className="p-4 text-sm text-ink-2">Loading the terminal…</p>}>
+                {createElement(terminalView(attempt), { sessionId })}
+              </Suspense>
+            )}
+          </TerminalBoundary>
         </div>
       )}
       {shown === 'chat' && (
