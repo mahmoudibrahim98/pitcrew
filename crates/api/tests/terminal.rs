@@ -28,13 +28,16 @@ use tungstenite::protocol::frame::coding::CloseCode;
 use tungstenite::{Message, WebSocket};
 
 /// `FakeRuntime`, plus a replay buffer that has lost its first `dropped` bytes, a record of
-/// resizes, and a switch that makes the terminal disappear.
+/// resizes, a switch that makes the terminal disappear, and one that stalls writes (at most 3 s;
+/// `stalled` counts the writes that began stalling).
 #[derive(Debug, Default)]
 struct TestRuntime {
     inner: FakeRuntime,
     dropped: AtomicU64,
     resizes: Mutex<Vec<(u16, u16)>>,
     gone: AtomicBool,
+    stall_writes: AtomicBool,
+    stalled: AtomicU64,
 }
 
 impl TestRuntime {
@@ -55,6 +58,10 @@ impl Runtime for TestRuntime {
     }
     fn write(&self, id: TerminalId, bytes: &[u8]) -> Result<(), RuntimeError> {
         self.check(id)?;
+        if self.stall_writes.load(Ordering::SeqCst) {
+            self.stalled.fetch_add(1, Ordering::SeqCst);
+            Stalling::hang(&self.stall_writes);
+        }
         self.inner.write(id, bytes)
     }
     fn send_keys(&self, id: TerminalId, keys: &[Key]) -> Result<(), RuntimeError> {
@@ -471,9 +478,13 @@ async fn a_client_that_stops_reading_is_closed_with_1013() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn keepalive_pings_and_closes_a_client_that_stops_answering() {
+    // Wide margins, so a loaded machine cannot make the answering client look silent: it reads
+    // every 50 ms and has a whole second for each Pong.
+    const PING_EVERY: Duration = Duration::from_millis(100);
+    const PONG_TIMEOUT: Duration = Duration::from_secs(1);
     let s = setup_with(TerminalConfig {
-        ping_every: Duration::from_millis(50),
-        pong_timeout: Duration::from_millis(150),
+        ping_every: PING_EVERY,
+        pong_timeout: PONG_TIMEOUT,
         ..quick()
     });
     let addr = serve(s.app.clone()).await;
@@ -482,14 +493,24 @@ async fn keepalive_pings_and_closes_a_client_that_stops_answering() {
     tokio::task::spawn_blocking(move || {
         let path = format!("/v1/sessions/{session}/terminal");
 
+        // A client that reads nothing sends no pongs. It stays silent well past the first
+        // Ping's deadline (about 1.1 s), so it cannot answer late by accident.
+        let silent = {
+            let mut silent = connect(addr, &token, &path);
+            std::thread::spawn(move || {
+                std::thread::sleep(PING_EVERY + PONG_TIMEOUT + Duration::from_millis(1500));
+                read_close(&mut silent)
+            })
+        };
+
         // A client that keeps reading answers the pings (tungstenite sends the pongs) and stays.
         let mut answering = connect(addr, &token, &path);
         answering
             .get_mut()
-            .set_read_timeout(Some(Duration::from_millis(20)))
+            .set_read_timeout(Some(Duration::from_millis(50)))
             .unwrap();
         let mut pings = 0;
-        let until = Instant::now() + Duration::from_millis(600);
+        let until = Instant::now() + PONG_TIMEOUT + Duration::from_millis(500);
         while Instant::now() < until {
             match answering.read() {
                 Ok(Message::Ping(_)) => pings += 1,
@@ -502,7 +523,7 @@ async fn keepalive_pings_and_closes_a_client_that_stops_answering() {
                 Err(e) => panic!("the answering client was dropped: {e}"),
             }
         }
-        assert!(pings >= 3, "{pings} pings in 600 ms");
+        assert!(pings >= 3, "{pings} pings in 1.5 s");
         answering
             .get_mut()
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -510,10 +531,84 @@ async fn keepalive_pings_and_closes_a_client_that_stops_answering() {
         runtime.write(terminal, b"alive").unwrap();
         assert_eq!(read_bytes(&mut answering, 5), b"alive");
 
-        // A client that reads nothing sends no pongs, and is closed.
-        let mut silent = connect(addr, &token, &path);
-        std::thread::sleep(Duration::from_millis(600));
-        assert_eq!(read_close(&mut silent), CloseCode::Again);
+        assert_eq!(silent.join().unwrap(), CloseCode::Again);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_write_holds_up_neither_output_nor_pings() {
+    // The pump would give up on a full queue after 300 ms (1013); the stalled write is given
+    // up after 1.5 s (1011). Output must keep flowing in between.
+    let s = setup_with(TerminalConfig {
+        queue_frames: 2,
+        send_timeout: Duration::from_millis(300),
+        call_timeout: Duration::from_millis(1500),
+        ..quick()
+    });
+    let addr = serve(s.app.clone()).await;
+    let token = s.fixture.device_token.clone();
+    let (runtime, terminal, session) = (s.runtime.clone(), s.terminal, s.session);
+    tokio::task::spawn_blocking(move || {
+        let mut socket = connect(addr, &token, &format!("/v1/sessions/{session}/terminal"));
+        runtime.stall_writes.store(true, Ordering::SeqCst);
+        socket.send(Message::Binary(b"k".to_vec().into())).unwrap();
+        wait_for("the stalled write", || {
+            runtime.stalled.load(Ordering::SeqCst) == 1
+        });
+
+        // Output while the write hangs: more than the queue holds, for longer than the pump
+        // would wait on a full queue. Before, nothing drained the queue during a stall.
+        let started = Instant::now();
+        let mut rounds = 0;
+        while started.elapsed() < Duration::from_millis(700) {
+            runtime.inner.write(terminal, b"0123456789").unwrap();
+            assert_eq!(read_bytes(&mut socket, 10), b"0123456789");
+            rounds += 1;
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(rounds >= 5, "{rounds} rounds of output during the stall");
+
+        // The stalled runtime, not the reader, is what ends the stream.
+        assert_eq!(read_close(&mut socket), CloseCode::Error);
+        runtime.stall_writes.store(false, Ordering::SeqCst);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_over_max_inbound_closes_with_1009() {
+    assert_eq!(TerminalConfig::default().max_inbound, 1 << 20);
+    const LIMIT: usize = 1024;
+    let s = setup_with(TerminalConfig {
+        max_inbound: LIMIT,
+        max_frame: 4096,
+        ..quick()
+    });
+    let addr = serve(s.app.clone()).await;
+    let token = s.fixture.device_token.clone();
+    let (runtime, terminal, session) = (s.runtime.clone(), s.terminal, s.session);
+    tokio::task::spawn_blocking(move || {
+        let path = format!("/v1/sessions/{session}/terminal");
+        let mut socket = connect(addr, &token, &path);
+        // At the limit: written (and echoed by the fake).
+        socket
+            .send(Message::Binary(vec![b'a'; LIMIT].into()))
+            .unwrap();
+        assert_eq!(read_bytes(&mut socket, LIMIT), vec![b'a'; LIMIT]);
+        // One byte over: 1009, and nothing written.
+        socket
+            .send(Message::Binary(vec![b'b'; LIMIT + 1].into()))
+            .unwrap();
+        assert_eq!(read_close(&mut socket), CloseCode::Size);
+        assert_eq!(output(&runtime, terminal), vec![b'a'; LIMIT]);
+
+        // The server is fine: a new client resumes where the first stopped.
+        let mut again = connect(addr, &token, &format!("{path}?from={LIMIT}"));
+        runtime.write(terminal, b"next").unwrap();
+        assert_eq!(read_bytes(&mut again, 4), b"next");
     })
     .await
     .unwrap();
@@ -633,8 +728,18 @@ async fn a_stalled_runtime_answers_503_or_closes_with_1011() {
     stalling.read.store(false, Ordering::SeqCst);
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn hub_shutdown_closes_terminals_and_the_stream_with_1001() {
+/// Hub shutdown closes terminals and the stream with 1001, and `serve` returns only once those
+/// closing handshakes are done. So a daemon whose `main` drops the runtime as soon as `serve`
+/// returns (as this test does) still closes every client cleanly.
+#[test]
+fn hub_shutdown_closes_sockets_with_1001_before_serve_returns() {
+    // Each client answers the server's Close this long after reading it.
+    const REPLY_AFTER: Duration = Duration::from_millis(300);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
     let s = setup();
     let source: Arc<dyn EventSource> = Arc::new(MemorySource::new("log", 16));
     let terminals = Arc::new(RuntimeTerminals::new(s.runtime.clone()));
@@ -645,38 +750,59 @@ async fn hub_shutdown_closes_terminals_and_the_stream_with_1001() {
             .device(terminal::routes(terminals, quick()))
             .device(stream::routes(source, StreamConfig::default())),
     );
-    let bound = Bound::bind(&Listen::DevTcp {
-        addr: "127.0.0.1:0".parse().unwrap(),
-    })
-    .await
-    .unwrap();
-    let addr = bound.tcp_addr().unwrap();
     let (stop, stopped) = oneshot::channel::<()>();
-    let server = tokio::spawn(bound.serve(app, async {
-        let _ = stopped.await;
-    }));
-
-    let token = s.fixture.device_token.clone();
-    let session = s.session;
-    let (opened, ready) = oneshot::channel();
-    let clients = tokio::task::spawn_blocking(move || {
-        let mut terminal = connect(addr, &token, &format!("/v1/sessions/{session}/terminal"));
-        let mut stream = connect(addr, &token, "/v1/stream");
-        // The stream's hello: the session is running.
-        assert!(matches!(stream.read().unwrap(), Message::Text(_)));
-        opened.send(()).unwrap();
-        (read_close(&mut terminal), read_close(&mut stream))
-    });
-    ready.await.unwrap();
-    stop.send(()).unwrap();
-    let (terminal, stream) = clients.await.unwrap();
-    assert_eq!(terminal, CloseCode::Away);
-    assert_eq!(stream, CloseCode::Away);
-    tokio::time::timeout(Duration::from_secs(5), server)
+    let (addr, server) = runtime.block_on(async {
+        let bound = Bound::bind(&Listen::DevTcp {
+            addr: "127.0.0.1:0".parse().unwrap(),
+        })
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
+        let addr = bound.tcp_addr().unwrap();
+        let server = tokio::spawn(bound.serve(app, async {
+            let _ = stopped.await;
+        }));
+        (addr, server)
+    });
+
+    let (ready, opened) = std::sync::mpsc::channel();
+    let paths = [
+        format!("/v1/sessions/{}/terminal", s.session),
+        "/v1/stream".to_owned(),
+    ];
+    let clients: Vec<_> = paths
+        .into_iter()
+        .map(|path| {
+            let (token, ready) = (s.fixture.device_token.clone(), ready.clone());
+            std::thread::spawn(move || {
+                let mut socket = connect(addr, &token, &path);
+                if path == "/v1/stream" {
+                    // The hello: the stream's session is running.
+                    assert!(matches!(socket.read().unwrap(), Message::Text(_)));
+                }
+                ready.send(()).unwrap();
+                let code = read_close(&mut socket);
+                std::thread::sleep(REPLY_AFTER);
+                // Sends the Close reply tungstenite queued when it read the server's Close.
+                let _ = socket.flush();
+                code
+            })
+        })
+        .collect();
+    for _ in &clients {
+        opened.recv().unwrap();
+    }
+
+    let stopping = Instant::now();
+    stop.send(()).unwrap();
+    runtime.block_on(server).unwrap().unwrap();
+    let took = stopping.elapsed();
+    // As a daemon's `main` would: nothing more runs once `serve` has returned.
+    drop(runtime);
+    for client in clients {
+        assert_eq!(client.join().unwrap(), CloseCode::Away);
+    }
+    // `serve` waited for the clients' replies, not only for the shutdown signal.
+    assert!(took >= REPLY_AFTER, "serve returned after {took:?}");
 }
 
 #[tokio::test]

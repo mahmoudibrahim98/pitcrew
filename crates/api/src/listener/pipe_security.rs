@@ -1,5 +1,5 @@
-//! Windows security for the named pipe: a descriptor granting only the current user, and the
-//! client-side check that a pipe's server runs as the current user.
+//! Windows security for the named pipe: a descriptor that makes the current user the pipe's owner
+//! and its only grantee, and the client-side check that a pipe is owned by the current user.
 //!
 //! This is the crate's only `unsafe` code. It calls Win32 functions and hands the descriptor to
 //! tokio's `create_with_security_attributes_raw`.
@@ -10,10 +10,13 @@
 //! - The `TOKEN_USER` read comes from a buffer that `GetTokenInformation` filled and that is
 //!   aligned for it (`u64` storage). The SID it points into lives inside that buffer, which
 //!   outlives its use.
+//! - The owner SID `GetSecurityInfo` returns points into the descriptor it allocates; that
+//!   descriptor is freed only after the SID's last use.
 //! - Memory Win32 allocates with `LocalAlloc` (strings, descriptors) is freed exactly once with
-//!   `LocalFree`: strings right after copying them, the pipe's descriptor on `Drop`.
-//! - Handles we open (process, token) are closed exactly once by `OwnedHandle`. A pipe handle we
-//!   are given is borrowed (`AsHandle`), so it stays open for the duration of the call.
+//!   `LocalFree`: strings right after copying them, queried descriptors after their last use, the
+//!   pipe's own descriptor on `Drop`.
+//! - The token handle we open is closed exactly once by `OwnedHandle`. A pipe handle we are given
+//!   is borrowed (`AsHandle`), so it stays open for the duration of the call.
 //! - The descriptor is never mutated after creation, and Win32 only reads it, so sharing it
 //!   across threads (`Send`, `Sync`) is sound.
 //!
@@ -26,18 +29,17 @@ use std::ptr;
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SDDL_REVISION_1, SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
-    TokenUser,
+    GetTokenInformation, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
-use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
-use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
-};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-/// An owned security descriptor granting `GENERIC_ALL` to the current user only.
+/// An owned security descriptor: the current user owns the pipe and is the only one granted
+/// access (`GENERIC_ALL`).
 #[derive(Debug)]
 pub(super) struct PipeSecurity {
     descriptor: PSECURITY_DESCRIPTOR,
@@ -49,10 +51,15 @@ unsafe impl Send for PipeSecurity {}
 unsafe impl Sync for PipeSecurity {}
 
 impl PipeSecurity {
-    /// A protected DACL (`P`, so nothing is inherited) with one entry: the current user.
+    /// The current user as owner (`O:`), and a protected DACL (`P`, so nothing is inherited)
+    /// with one entry: the current user.
+    ///
+    /// The owner is named explicitly because clients check it ([`owner_sid`]), and without it an
+    /// elevated daemon's pipe would default to being owned by the Administrators group. Any
+    /// process may name its own user as owner.
     pub(super) fn current_user_only() -> io::Result<Self> {
         let sid = current_user_sid()?;
-        let sddl: Vec<u16> = format!("D:P(A;;GA;;;{sid})")
+        let sddl: Vec<u16> = format!("O:{sid}D:P(A;;GA;;;{sid})")
             .encode_utf16()
             .chain(Some(0))
             .collect();
@@ -109,7 +116,7 @@ struct OwnedHandle(HANDLE);
 
 impl Drop for OwnedHandle {
     fn drop(&mut self) {
-        // SAFETY: the handle came from `OpenProcess` or `OpenProcessToken` and is closed once.
+        // SAFETY: the handle came from `OpenProcessToken` and is closed once.
         unsafe {
             CloseHandle(self.0);
         }
@@ -122,22 +129,58 @@ pub(crate) fn current_user_sid() -> io::Result<String> {
     process_user_sid(unsafe { GetCurrentProcess() })
 }
 
-/// The SID of the user running the server end of a connected pipe client.
-pub(crate) fn pipe_server_sid(pipe: &impl AsHandle) -> io::Result<String> {
-    let handle: HANDLE = pipe.as_handle().as_raw_handle();
-    let mut pid = 0u32;
-    // SAFETY: `handle` is borrowed from a live object; `pid` is a valid out-pointer. A handle
-    // that is not a pipe makes the call fail, which we report.
-    if unsafe { GetNamedPipeServerProcessId(handle, &mut pid) } == 0 {
-        return Err(io::Error::last_os_error());
+/// The SID of a kernel object's owner, such as a pipe's (read through any handle to it opened
+/// with `READ_CONTROL`, which a handle opened for reading has).
+///
+/// A pipe's owner is its creator's user, or whoever its descriptor names; naming another user
+/// takes the restore privilege. So another user's pipe cannot claim the current user as owner,
+/// and unlike the server's process id, the owner cannot be recycled.
+pub(crate) fn owner_sid(object: &impl AsHandle) -> io::Result<String> {
+    let handle: HANDLE = object.as_handle().as_raw_handle();
+    let mut owner: PSID = ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: `handle` is borrowed from a live object; `owner` and `descriptor` are valid
+    // out-pointers and the unused ones are null, as allowed. `owner` points into `descriptor`, a
+    // `LocalAlloc` block freed below after the last use of `owner`.
+    let status = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(
+            i32::try_from(status).unwrap_or(-1),
+        ));
     }
-    // SAFETY: plain call; a null result is checked.
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if process.is_null() {
-        return Err(io::Error::last_os_error());
+    let mut wide: *mut u16 = ptr::null_mut();
+    let failed = if owner.is_null() {
+        Some(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the object has no owner",
+        ))
+    } else {
+        // SAFETY: `owner` points into `descriptor`, which is still alive; `wide` is a valid
+        // out-pointer.
+        let ok = unsafe { ConvertSidToStringSidW(owner, &mut wide) };
+        // Read the error before `LocalFree` can overwrite it.
+        (ok == 0 || wide.is_null()).then(io::Error::last_os_error)
+    };
+    // SAFETY: allocated by `GetSecurityInfo`, freed once, after the last use of `owner`.
+    unsafe {
+        LocalFree(descriptor);
     }
-    let process = OwnedHandle(process);
-    process_user_sid(process.0)
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    // SAFETY: a NUL-terminated `LocalAlloc` string from `ConvertSidToStringSidW`, used once.
+    Ok(unsafe { take_local_string(wide) })
 }
 
 /// The SID of the user a process runs as.
@@ -202,9 +245,7 @@ unsafe fn take_local_string(wide: *mut u16) -> String {
 /// The DACL of a kernel object (such as a pipe), in SDDL. For tests.
 #[cfg(test)]
 pub(crate) fn dacl_sddl(object: &impl AsHandle) -> io::Result<String> {
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SE_KERNEL_OBJECT,
-    };
+    use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
     use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
 
     let handle: HANDLE = object.as_handle().as_raw_handle();
@@ -239,12 +280,14 @@ pub(crate) fn dacl_sddl(object: &impl AsHandle) -> io::Result<String> {
             ptr::null_mut(),
         )
     };
+    // Read the error before `LocalFree` can overwrite it.
+    let failed = (ok == 0 || wide.is_null()).then(io::Error::last_os_error);
     // SAFETY: allocated by `GetSecurityInfo`, freed once.
     unsafe {
         LocalFree(descriptor);
     }
-    if ok == 0 || wide.is_null() {
-        return Err(io::Error::last_os_error());
+    if let Some(e) = failed {
+        return Err(e);
     }
     // SAFETY: a NUL-terminated `LocalAlloc` string from the call above.
     Ok(unsafe { take_local_string(wide) })

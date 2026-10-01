@@ -22,6 +22,8 @@ pub(crate) mod close_code {
     pub(crate) const GOING_AWAY: u16 = 1001;
     /// A message the server cannot accept (malformed control JSON).
     pub(crate) const INVALID_DATA: u16 = 1007;
+    /// A message over the socket's size limit.
+    pub(crate) const TOO_BIG: u16 = 1009;
     /// An unexpected server-side failure.
     pub(crate) const INTERNAL: u16 = 1011;
     /// The client fell behind; it should reconnect and resume.
@@ -57,8 +59,19 @@ async fn drain(socket: &mut WebSocket) {
     while let Some(Ok(_)) = socket.recv().await {}
 }
 
+/// Whether a receive error is the socket's size limit (`max_message_size`/`max_frame_size`).
+/// The socket cannot be read after it, but a Close (1009) can still be sent.
+pub(crate) fn too_big(error: &axum::Error) -> bool {
+    std::error::Error::source(error)
+        .and_then(|inner| inner.downcast_ref::<tungstenite::Error>())
+        .is_some_and(|e| matches!(e, tungstenite::Error::Capacity(_)))
+}
+
 /// Tells WebSocket routes that the hub is shutting down, so they close with 1001.
 /// [`crate::Bound::serve`] adds it to every request as an extension.
+///
+/// It is also how `serve` counts open sockets: each one **holds its receiver for its whole life,
+/// through its closing handshake**, and `serve` waits until every receiver is gone.
 #[derive(Clone, Debug)]
 pub(crate) struct HubShutdown(watch::Receiver<bool>);
 
@@ -71,9 +84,10 @@ impl HubShutdown {
     }
 
     /// Completes when the hub starts shutting down, or never without a signal (a router served
-    /// some other way, e.g. in tests).
-    pub(crate) async fn wait(signal: Option<Self>) {
-        let Some(Self(mut receiver)) = signal else {
+    /// some other way, e.g. in tests). It only borrows the signal: the caller keeps it alive
+    /// until the socket is closed.
+    pub(crate) async fn wait(signal: &mut Option<Self>) {
+        let Some(Self(receiver)) = signal else {
             return std::future::pending().await;
         };
         // An error means the server is gone, which is a shutdown too.

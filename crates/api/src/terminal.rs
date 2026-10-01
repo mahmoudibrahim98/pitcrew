@@ -16,7 +16,11 @@
 //!   [`TerminalConfig::poll_max`]) and starting over on any input or output.
 //! - Client binary frames are keystrokes, written as-is. Client text frames are control messages:
 //!   `{"type":"resize","cols":…,"rows":…}`; other `type`s are ignored; malformed JSON, or a resize
-//!   outside [`SIZES`], closes the socket with 1007.
+//!   outside [`SIZES`], closes the socket with 1007. A message over
+//!   [`TerminalConfig::max_inbound`] closes it with 1009.
+//! - Input is written in arrival order by its own loop, through a queue of 16 messages, so a
+//!   terminal that is slow to take input never holds up output or pings. While the queue is full
+//!   the socket is not read; a write that times out ends the stream with 1011.
 //! - When the program exits (or its terminal disappears), the remaining output is sent, then
 //!   `{"type":"exit"}`, then a normal close (1000).
 //! - **Backpressure:** each client has a bounded queue. A client that stops reading is closed
@@ -26,14 +30,16 @@
 //! - **Bounded calls:** every call into the seam runs on the blocking pool, at most
 //!   [`TerminalConfig::max_calls`] at once across all clients, and is given up after
 //!   [`TerminalConfig::call_timeout`] (503 before the upgrade, 1011 after it). A stalled runtime
-//!   therefore ties up at most `max_calls` blocking threads.
+//!   therefore ties up at most `max_calls` blocking threads. The limit is shared by every
+//!   terminal of the route **on purpose**: once `max_calls` calls hang on one runtime, calls for
+//!   other terminals wait for a permit too (and time out), rather than tying up more threads.
 //! - 1001 when the hub shuts down; 1011 when the runtime fails. A client's Close is answered
 //!   before the socket is dropped.
 //! - **Several clients** may attach to one terminal. Each gets the output independently. All may
 //!   type; their input is written in the order each message arrives, so keystrokes from two
 //!   people can interleave. A single-writer rule, if wanted, belongs to the runner.
 
-use crate::util::{HubShutdown, close, close_code, finish};
+use crate::util::{HubShutdown, close, close_code, finish, too_big};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
@@ -315,6 +321,8 @@ pub enum TerminalEnd {
     Exited,
     /// The client sent malformed control JSON, or a size outside [`SIZES`].
     Malformed,
+    /// The client sent a message over [`TerminalConfig::max_inbound`].
+    TooBig,
     /// The hub is shutting down.
     ShuttingDown,
     /// The runtime failed, or did not answer in time.
@@ -428,27 +436,51 @@ fn control(text: &str) -> Control {
     }
 }
 
+/// Input from the client, waiting to be written to the terminal in arrival order.
+#[derive(Debug)]
+enum Input {
+    Keys(axum::body::Bytes),
+    Resize(u16, u16),
+}
+
+/// Input messages that may wait for a slow terminal before the socket stops being read. With
+/// `max_inbound`, this bounds a client's queued input (16 MiB at the defaults).
+const INPUT_QUEUE: usize = 16;
+
+/// Runs one client: the pump's frames out, pings, and input in, until either side ends.
+///
+/// Nothing here waits on the terminal: input goes through a bounded queue to [`write_input`], so
+/// a stalled write or resize never holds up output, pings or the shutdown signal. While the queue
+/// is full the socket is not read, which pushes back on the client.
+///
+/// `shutdown` lives until this returns, after the closing handshake: `Bound::serve` counts open
+/// sockets by it.
 async fn session_loop(
     mut socket: WebSocket,
     attachment: Arc<dyn Attachment>,
     from: u64,
     config: TerminalConfig,
     calls: Calls,
-    shutdown: Option<HubShutdown>,
+    mut shutdown: Option<HubShutdown>,
 ) {
     let (frames, mut queue) = mpsc::channel(config.queue_frames.max(1));
-    let input = Arc::new(Notify::new());
+    let nudge = Arc::new(Notify::new());
     let pump = pump(
         Arc::clone(&attachment),
         from,
         config,
         calls.clone(),
-        Arc::clone(&input),
+        Arc::clone(&nudge),
         frames,
     );
     tokio::pin!(pump);
-    let shutdown = HubShutdown::wait(shutdown);
-    tokio::pin!(shutdown);
+    let (input, inputs) = mpsc::channel(INPUT_QUEUE);
+    let writer = write_input(attachment, calls, inputs, nudge);
+    tokio::pin!(writer);
+    // Input read from the socket while the queue was full.
+    let mut waiting: Option<Input> = None;
+    let hub_down = HubShutdown::wait(&mut shutdown);
+    tokio::pin!(hub_down);
     // `interval` panics on a zero period.
     let ping_every = config.ping_every.max(Duration::from_millis(1));
     let mut ping = tokio::time::interval_at(Instant::now() + ping_every, ping_every);
@@ -457,12 +489,18 @@ async fn session_loop(
     let end = loop {
         tokio::select! {
             end = &mut pump => break end,
-            () = &mut shutdown => break TerminalEnd::ShuttingDown,
+            end = &mut writer => break end,
+            () = &mut hub_down => break TerminalEnd::ShuttingDown,
             Some(frame) = queue.recv() => {
                 if let Err(end) = send(&mut socket, frame, config.send_timeout).await {
                     break end;
                 }
             }
+            room = input.reserve(), if waiting.is_some() => match (room, waiting.take()) {
+                (Ok(room), Some(next)) => room.send(next),
+                // The writer only stops by returning, which the branch above catches first.
+                _ => break TerminalEnd::Failed(TerminalError::Failed("input stopped".to_owned())),
+            },
             _ = ping.tick() => {
                 // One Ping at a time: its Pong is what the deadline waits for.
                 if pong_due.is_none() {
@@ -474,36 +512,32 @@ async fn session_loop(
                 }
             }
             () = sleep_until(pong_due), if pong_due.is_some() => break TerminalEnd::Unresponsive,
-            incoming = socket.recv() => match incoming {
-                None | Some(Err(_)) => break TerminalEnd::ClientGone,
-                Some(Ok(Message::Close(_))) => {
-                    finish(&mut socket).await;
-                    break TerminalEnd::ClientGone;
-                }
-                Some(Ok(Message::Pong(_))) => pong_due = None,
-                Some(Ok(Message::Binary(bytes))) => {
-                    let attached = Arc::clone(&attachment);
-                    if let Err(end) = settle(calls.run(move || attached.write(&bytes)).await) {
-                        break end;
+            incoming = socket.recv(), if waiting.is_none() => {
+                let next = match incoming {
+                    None => break TerminalEnd::ClientGone,
+                    Some(Err(e)) if too_big(&e) => break TerminalEnd::TooBig,
+                    Some(Err(_)) => break TerminalEnd::ClientGone,
+                    Some(Ok(Message::Close(_))) => {
+                        finish(&mut socket).await;
+                        break TerminalEnd::ClientGone;
                     }
-                    input.notify_one();
-                }
-                Some(Ok(Message::Text(text))) => match control(&text) {
-                    Control::Resize(cols, rows) => {
-                        let attached = Arc::clone(&attachment);
-                        if let Err(end) =
-                            settle(calls.run(move || attached.resize(cols, rows)).await)
-                        {
-                            break end;
-                        }
-                        input.notify_one();
+                    Some(Ok(Message::Pong(_))) => {
+                        pong_due = None;
+                        continue;
                     }
-                    Control::Ignore => {}
-                    Control::Malformed => break TerminalEnd::Malformed,
-                },
-                // Pings are answered by the socket itself.
-                Some(Ok(Message::Ping(_))) => {}
-            },
+                    Some(Ok(Message::Binary(bytes))) => Input::Keys(bytes),
+                    Some(Ok(Message::Text(text))) => match control(&text) {
+                        Control::Resize(cols, rows) => Input::Resize(cols, rows),
+                        Control::Ignore => continue,
+                        Control::Malformed => break TerminalEnd::Malformed,
+                    },
+                    // Pings are answered by the socket itself.
+                    Some(Ok(Message::Ping(_))) => continue,
+                };
+                if let Err(mpsc::error::TrySendError::Full(next)) = input.try_send(next) {
+                    waiting = Some(next);
+                }
+            }
         }
     };
     tracing::debug!(?end, "terminal stream closed");
@@ -527,10 +561,35 @@ async fn session_loop(
             "no pong; resume from your offset",
         ),
         TerminalEnd::Malformed => (close_code::INVALID_DATA, "malformed control message"),
+        TerminalEnd::TooBig => (close_code::TOO_BIG, "message too big"),
         TerminalEnd::ShuttingDown => (close_code::GOING_AWAY, "the hub is shutting down"),
         TerminalEnd::Failed(_) => (close_code::INTERNAL, "the terminal failed"),
     };
     close(&mut socket, code, reason).await;
+}
+
+/// Writes queued input to the terminal, one call at a time and in order, nudging the pump after
+/// each so it looks for the echo. Returns only when a call fails (a stalled runtime times out
+/// here, giving 1011); otherwise it runs until the session drops it.
+async fn write_input(
+    attachment: Arc<dyn Attachment>,
+    calls: Calls,
+    mut inputs: mpsc::Receiver<Input>,
+    nudge: Arc<Notify>,
+) -> TerminalEnd {
+    while let Some(input) = inputs.recv().await {
+        let attached = Arc::clone(&attachment);
+        let written = match input {
+            Input::Keys(bytes) => calls.run(move || attached.write(&bytes)).await,
+            Input::Resize(cols, rows) => calls.run(move || attached.resize(cols, rows)).await,
+        };
+        if let Err(end) = settle(written) {
+            return end;
+        }
+        nudge.notify_one();
+    }
+    // The session dropped its sender, so it is ending and will drop this too.
+    std::future::pending().await
 }
 
 /// The outcome of writing input or resizing. A terminal that is gone is not an error here: the

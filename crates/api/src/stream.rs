@@ -14,11 +14,11 @@
 //!    [`StreamConfig::send_timeout`], the client is disconnected. It resumes with `since`.
 //!
 //! Close codes: 1013 too slow (resume with `since`), 1001 the event source closed or the hub is
-//! shutting down, 1011 the event source failed. A client's Close is answered before the socket
-//! is dropped.
+//! shutting down, 1011 the event source failed, 1009 a client message over 4 KiB. A client's
+//! Close is answered before the socket is dropped.
 
 use crate::source::{EventSource, SourceError};
-use crate::util::{HubShutdown, close, close_code, finish, now_ms};
+use crate::util::{HubShutdown, close, close_code, finish, now_ms, too_big};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
@@ -80,6 +80,8 @@ pub enum StreamEnd {
     SourceFailed,
     /// The hub is shutting down.
     ShuttingDown,
+    /// The client sent a message over the size limit (4 KiB).
+    TooBig,
 }
 
 /// The routes of the delta stream. Mount them as **device** routes (`RouterParts::device`).
@@ -125,21 +127,24 @@ fn invalid(message: &str) -> Response {
 }
 
 /// Runs the pump and writes its frames to the socket until either side ends.
+///
+/// `shutdown` lives until this returns, after the closing handshake: `Bound::serve` counts open
+/// sockets by it.
 async fn session(
     mut socket: WebSocket,
     state: StreamState,
     since: Option<u64>,
-    shutdown: Option<HubShutdown>,
+    mut shutdown: Option<HubShutdown>,
 ) {
     let (frames, mut queue) = mpsc::channel(state.config.queue_frames.max(1));
     let pump = pump(state.source, since, state.config, frames);
     tokio::pin!(pump);
-    let shutdown = HubShutdown::wait(shutdown);
-    tokio::pin!(shutdown);
+    let hub_down = HubShutdown::wait(&mut shutdown);
+    tokio::pin!(hub_down);
     let end = loop {
         tokio::select! {
             end = &mut pump => break Some(end),
-            () = &mut shutdown => break Some(StreamEnd::ShuttingDown),
+            () = &mut hub_down => break Some(StreamEnd::ShuttingDown),
             frame = queue.recv() => {
                 let Some(frame) = frame else { break None };
                 let text = match serde_json::to_string(&frame) {
@@ -159,7 +164,9 @@ async fn session(
                 }
             }
             incoming = socket.recv() => match incoming {
-                None | Some(Err(_)) => break Some(StreamEnd::ClientGone),
+                None => break Some(StreamEnd::ClientGone),
+                Some(Err(e)) if too_big(&e) => break Some(StreamEnd::TooBig),
+                Some(Err(_)) => break Some(StreamEnd::ClientGone),
                 Some(Ok(Message::Close(_))) => {
                     finish(&mut socket).await;
                     break Some(StreamEnd::ClientGone);
@@ -174,6 +181,7 @@ async fn session(
         Some(StreamEnd::SlowClient) => (close_code::TRY_AGAIN_LATER, "too slow; resume with since"),
         Some(StreamEnd::SourceClosed) => (close_code::GOING_AWAY, "the event log closed"),
         Some(StreamEnd::ShuttingDown) => (close_code::GOING_AWAY, "the hub is shutting down"),
+        Some(StreamEnd::TooBig) => (close_code::TOO_BIG, "message too big"),
         Some(StreamEnd::SourceFailed) | None => (close_code::INTERNAL, "the event log failed"),
         Some(StreamEnd::ClientGone) => return,
     };
@@ -698,8 +706,14 @@ mod tests {
         let (frames, mut queue) = mpsc::channel(config.queue_frames);
         let dyn_source: Arc<dyn EventSource> = source.clone();
         let _task = tokio::spawn(pump(dyn_source, Some(0), config, frames));
-        let mut sizes = Vec::new();
-        while let Ok(Some(frame)) = timeout(Duration::from_millis(200), queue.recv()).await {
+        let mut sizes: Vec<usize> = Vec::new();
+        // Until all 1,200 arrived, however slow the machine: a gap between frames is not the end.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while sizes.iter().sum::<usize>() < 1200 {
+            let frame = tokio::time::timeout_at(deadline, queue.recv())
+                .await
+                .expect("all 1,200 events within 10 s")
+                .expect("the pump is still running");
             if let StreamFrame::Events { events, .. } = frame {
                 sizes.push(events.len());
             }

@@ -21,8 +21,10 @@ planted by another user never receives a token:
 
 - Unix: `check_unix_socket(dir)` before connecting (directory ours and 0700, socket ours), and
   `check_unix_peer(&stream)` after (the server runs as us).
-- Windows: `check_pipe_server(&client)` after connecting (the process serving the pipe runs as
-  the current user).
+- Windows: `check_pipe_server(&client)` after connecting (the pipe is owned by the current
+  user). The daemon names the user as its pipe's owner; another user cannot create a pipe owned
+  by us, and unlike a server process id, the owner cannot be recycled. Residual: an
+  administrator (or anyone with the restore privilege) can plant a pipe that passes.
 
 ## Auth
 
@@ -50,8 +52,8 @@ planted by another user never receives a token:
   cannot be queued within `send_timeout` (default 10 s) disconnects the client, which resumes
   with `since`.
 - Close codes: **1013** too slow (resume with `since`), **1001** the event source closed or the
-  hub is shutting down, **1011** the event source failed. A client's Close is answered before
-  the socket is dropped.
+  hub is shutting down, **1011** the event source failed, **1009** a client message over 4 KiB.
+  A client's Close is answered before the socket is dropped.
 
 ## Hooks: `POST /v1/hooks/{engine}/{event}`
 
@@ -88,22 +90,31 @@ planted by another user never receives a token:
   (one `read` and one `exited()` per round) and starts over on any input or output.
 - Every call into the seam runs on the blocking pool, at most `max_calls` (64) at once across
   all clients, and is given up after `call_timeout` (5 s): `503` before the upgrade, 1011 after.
-  A stalled runtime ties up at most `max_calls` threads.
+  A stalled runtime ties up at most `max_calls` threads. **The limit is global to the route, by
+  design:** once `max_calls` calls hang on one runtime, calls for every other terminal of the
+  route wait for a permit too (and time out with 503 or 1011) until the hung calls return. A
+  limit per terminal would let a stalled runtime tie up threads without bound.
 - Client binary frames are keystrokes; `{"type":"resize","cols","rows"}` resizes; other types
-  are ignored; malformed control JSON closes with 1007. When the program exits, or its terminal
-  disappears, the rest of the output, then `{"type":"exit"}`, then close 1000.
+  are ignored; malformed control JSON closes with 1007, and a message over `max_inbound` (1 MiB)
+  with 1009. When the program exits, or its terminal disappears, the rest of the output, then
+  `{"type":"exit"}`, then close 1000.
+- Input is written in order by its own loop, through a queue of 16 messages, so a terminal that
+  is slow to take input holds up neither output nor pings. While the queue is full the socket is
+  not read (back-pressure on the client); a write that times out closes with 1011.
 - A client that stops reading is closed with 1013 and resumes by offset. So is one that does
   not answer the Ping sent every 20 s within 20 s. Several clients may attach; each gets the
   output, and their keystrokes interleave in arrival order.
-- Close codes: **1000** after `exit`, **1007** malformed control, **1013** too slow or no Pong
-  (reconnect with `from`), **1011** runtime failure, **1001** hub shutting down. A client's
-  Close is answered before the socket is dropped.
+- Close codes: **1000** after `exit`, **1007** malformed control, **1009** message too big,
+  **1013** too slow or no Pong (reconnect with `from`), **1011** runtime failure, **1001** hub
+  shutting down. A client's Close is answered before the socket is dropped.
 
 ## Shutdown
 
 `Bound::serve` (and `serve`) tell every open WebSocket when `shutdown` completes; they close
-with 1001, and `serve` waits up to 2 s for them before returning. Hyper's graceful shutdown alone
-does not wait for upgraded connections.
+with 1001, and `serve` waits up to 2 s for their closing handshakes to finish before returning.
+Each socket holds its shutdown receiver until it has closed, which is how `serve` counts them.
+So a `main` that returns as soon as `serve` does still closes its clients cleanly. Hyper's
+graceful shutdown alone does not wait for upgraded connections.
 
 ## Activity: `GET /v1/events?before=&limit=&task=&session=`
 
