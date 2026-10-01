@@ -31,7 +31,15 @@ function isWorkspace(value: unknown): value is GatewayWorkspace {
 }
 
 function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  if (error instanceof Error) return error.message;
+  const message = typeof error === 'object' && error !== null ? (error as { message?: unknown }).message : undefined;
+  return typeof message === 'string' ? message : String(error);
+}
+
+export interface WorkspacesOptions {
+  createQueryClient?: () => QueryClient;
+  /** While the list is unknown, a failed read is retried after `min(maxMs, initialMs * 2^n)`. */
+  listBackoff?: { initialMs: number; maxMs: number };
 }
 
 /** The workspaces and their data scopes. No React here. */
@@ -46,16 +54,26 @@ export class Workspaces implements WorkspaceRegistry {
   /** Bumped by `stop()`, so late answers from before it are ignored. */
   #generation = 0;
   #unlisten: (() => void) | undefined;
+  /** A `gateway://workspaces` event arrived in this generation: it is newer than any answer. */
+  #heard = false;
+  readonly #listBackoff: { initialMs: number; maxMs: number };
+  #listAttempt = 0;
+  #listTimer: ReturnType<typeof setTimeout> | undefined;
+  /** The generation whose read is out, if any. */
+  #reading: number | undefined;
 
-  constructor(gateway: Gateway, options: { createQueryClient?: () => QueryClient } = {}) {
+  constructor(gateway: Gateway, options: WorkspacesOptions = {}) {
     this.#gateway = gateway;
     this.#createQueryClient = options.createQueryClient ?? createQueryClient;
+    this.#listBackoff = options.listBackoff ?? { initialMs: 1_000, maxMs: 30_000 };
   }
 
   start(): void {
     if (this.#running) return;
     this.#running = true;
     this.#generation += 1;
+    this.#heard = false;
+    this.#listAttempt = 0;
     void this.#follow(this.#generation);
     for (const id of this.#open) this.#data.get(id)?.live.start();
   }
@@ -66,13 +84,25 @@ export class Workspaces implements WorkspaceRegistry {
     this.#generation += 1;
     this.#unlisten?.();
     this.#unlisten = undefined;
+    if (this.#listTimer !== undefined) clearTimeout(this.#listTimer);
+    this.#listTimer = undefined;
     for (const data of this.#data.values()) data.live.stop();
+  }
+
+  retry(): void {
+    if (!this.#running || this.store.getState().list !== undefined) return;
+    if (this.#listTimer !== undefined) clearTimeout(this.#listTimer);
+    this.#listTimer = undefined;
+    void this.#read(this.#generation);
   }
 
   data(workspace: GatewayWorkspace): WorkspaceData {
     let data = this.#data.get(workspace.id);
     if (data === undefined) {
-      const transport = this.#gateway.transport(workspace);
+      const { id } = workspace;
+      // The name in messages follows a rename.
+      const name = () => this.store.getState().list?.find((w) => w.id === id)?.name ?? workspace.name;
+      const transport = this.#gateway.transport(id, name);
       const api = createApi({ transport });
       const queryClient = this.#createQueryClient();
       const live = createLive({ queryClient, transport, probe: () => api.me() });
@@ -90,11 +120,10 @@ export class Workspaces implements WorkspaceRegistry {
   /** Subscribes first, then reads the list, so no change falls between the two. */
   async #follow(generation: number): Promise<void> {
     const current = () => generation === this.#generation;
-    let heard = false;
     try {
       const unlisten = await this.#gateway.onWorkspaces((list) => {
         if (!current()) return;
-        heard = true;
+        this.#heard = true;
         this.#update(list);
       });
       if (current()) this.#unlisten = unlisten;
@@ -102,15 +131,32 @@ export class Workspaces implements WorkspaceRegistry {
     } catch (error) {
       if (current()) console.warn('pitcrew: cannot follow the gateway’s workspaces', error);
     }
-    if (!current()) return;
+    if (current()) await this.#read(generation);
+  }
+
+  /**
+   * Reads the list. The gateway emits only on changes, so while the list is unknown a failed read
+   * is tried again, with back-off (or at once with `retry()`).
+   */
+  async #read(generation: number): Promise<void> {
+    const current = () => generation === this.#generation;
+    // One read at a time (the Retry button may be pressed while one is out).
+    if (this.#reading === generation) return;
+    this.#reading = generation;
+    this.#listTimer = undefined;
     try {
       const list = await this.#gateway.workspaces();
       // An event heard meanwhile is at least as new as this answer.
-      if (current() && !heard) this.#update(list);
+      if (current() && !this.#heard) this.#update(list);
     } catch (error) {
-      if (current() && this.store.getState().list === undefined) {
-        this.store.setState({ error: messageOf(error) });
-      }
+      if (!current() || this.store.getState().list !== undefined) return;
+      this.store.setState({ error: messageOf(error) });
+      const { initialMs, maxMs } = this.#listBackoff;
+      const delay = Math.min(maxMs, initialMs * 2 ** this.#listAttempt);
+      this.#listAttempt += 1;
+      this.#listTimer = setTimeout(() => void this.#read(generation), delay);
+    } finally {
+      if (this.#reading === generation) this.#reading = undefined;
     }
   }
 
@@ -118,6 +164,8 @@ export class Workspaces implements WorkspaceRegistry {
     const list = Array.isArray(received) ? received.filter(isWorkspace) : [];
     const before = this.store.getState().list;
     this.store.setState({ list, error: undefined });
+    if (this.#listTimer !== undefined) clearTimeout(this.#listTimer);
+    this.#listTimer = undefined;
     for (const [id, data] of this.#data) {
       const workspace = list.find((w) => w.id === id);
       if (workspace === undefined) {
@@ -135,8 +183,17 @@ export class Workspaces implements WorkspaceRegistry {
 }
 
 /** The desktop app's data: the gateway's workspaces, each with its own data scope. */
-export function WorkspacesProvider({ gateway, children }: { gateway: Gateway; children: ReactNode }) {
-  const [workspaces] = useState(() => new Workspaces(gateway));
+export function WorkspacesProvider({
+  gateway,
+  options,
+  children,
+}: {
+  gateway: Gateway;
+  /** For tests. */
+  options?: WorkspacesOptions;
+  children: ReactNode;
+}) {
+  const [workspaces] = useState(() => new Workspaces(gateway, options));
   useEffect(() => {
     workspaces.start();
     return () => workspaces.stop();

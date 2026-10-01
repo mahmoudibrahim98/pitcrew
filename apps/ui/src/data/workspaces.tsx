@@ -29,14 +29,20 @@ export interface Gateway {
   workspaces(): Promise<GatewayWorkspace[]>;
   /** Follows `gateway://workspaces`; `listener` gets the whole list. Resolves to an unsubscribe. */
   onWorkspaces(listener: (workspaces: GatewayWorkspace[]) => void): Promise<() => void>;
-  transport(workspace: GatewayWorkspace): Transport;
+  /** The transport for a workspace; `name` gives its current name, for messages. */
+  transport(id: string, name: () => string): Transport;
 }
 
 export interface WorkspaceList {
   /** Undefined until the gateway has answered. */
   list?: GatewayWorkspace[] | undefined;
-  /** Why the list could not be read. */
+  /** Why the list could not be read (it is retried, with back-off, until it is known). */
   error?: string | undefined;
+}
+
+/** The list, and a way to read it again now while it is unknown (a Retry button). */
+export interface WorkspacesView extends WorkspaceList {
+  retry(): void;
 }
 
 /** One workspace's data: what `DataProvider` gives a browser's one hub. */
@@ -53,17 +59,19 @@ export interface WorkspaceRegistry {
   data(workspace: GatewayWorkspace): WorkspaceData;
   /** Starts the workspace's stream. It keeps its cache fresh from then on, also in the background. */
   open(id: string): void;
+  /** Reads the list again now, if it is still unknown. */
+  retry(): void;
 }
 
 export const WorkspacesContext = createContext<WorkspaceRegistry | null>(null);
 const NONE: StoreApi<WorkspaceList> = createStore<WorkspaceList>(() => ({}));
 
 /** The gateway's workspaces in the desktop app; `null` in a browser, where the hub has one. */
-export function useGatewayWorkspaces(): WorkspaceList | null {
+export function useGatewayWorkspaces(): WorkspacesView | null {
   const workspaces = use(WorkspacesContext);
   const list = useStore(workspaces?.store ?? NONE, (s) => s.list);
   const error = useStore(workspaces?.store ?? NONE, (s) => s.error);
-  return workspaces === null ? null : { list, error };
+  return workspaces === null ? null : { list, error, retry: () => workspaces.retry() };
 }
 
 /** What `WorkspaceScope` shows when it has no workspace to give. */
@@ -110,7 +118,8 @@ function OpenScope({
 }) {
   const data = workspaces.data(workspace);
   const { id } = workspace;
-  useEffect(() => workspaces.open(id), [workspaces, id]);
+  // With `data`: a workspace removed and listed again has new data, whose stream must start.
+  useEffect(() => workspaces.open(id), [workspaces, id, data]);
   return (
     <DataScope api={data.api} queryClient={data.queryClient} live={data.live} workspace={workspace}>
       {children}

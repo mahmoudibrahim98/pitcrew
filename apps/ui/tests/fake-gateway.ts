@@ -54,6 +54,11 @@ export class FakeGatewaySocket {
   /** What the webview sent, in order. */
   readonly sent: Sent[] = [];
   closed: { code: number; reason: string; by: 'webview' | 'daemon' } | undefined;
+  /** Sends being applied now; the webview should never have more than one out. */
+  inFlight = 0;
+  maxInFlight = 0;
+  /** With `holdOpens`: resolves `gateway_socket_open`. */
+  resolveOpen: () => void = () => {};
   readonly #channel: number;
   #index = 0;
 
@@ -102,6 +107,14 @@ export class FakeGateway {
   readonly sockets: FakeGatewaySocket[] = [];
   /** Called for each socket opened, e.g. to say hello on the stream. */
   onSocket: ((socket: FakeGatewaySocket) => void) | undefined;
+  /** `gateway_socket_open` waits for the socket's `resolveOpen()`; frames may come before. */
+  holdOpens = false;
+  /** Set to answer `gateway_socket_open` with this instead of `{ socket }`. */
+  openAnswer: unknown;
+  /** Set to make these commands fail. */
+  refuseList: { code: GatewayErrorCode; message: string } | undefined;
+  refuseSends: { code: GatewayErrorCode; message: string } | undefined;
+  refuseClose: { code: GatewayErrorCode; message: string } | undefined;
   #next = 1;
 
   constructor(workspaces: GatewayWorkspace[] = []) {
@@ -133,6 +146,7 @@ export class FakeGateway {
     this.calls.push({ cmd, args });
     switch (cmd) {
       case 'gateway_workspaces':
+        if (this.refuseList !== undefined) return failure(this.refuseList.code, this.refuseList.message);
         return structuredClone(this.workspaces);
       case 'gateway_request':
         return this.#request(args.req as GatewayRequest);
@@ -180,19 +194,28 @@ export class FakeGateway {
     this.sockets.push(socket);
     // The command resolves once the upgrade succeeded; frames may follow at once.
     queueMicrotask(() => this.onSocket?.(socket));
-    return Promise.resolve({ socket: socket.id });
+    if (this.openAnswer !== undefined) return Promise.resolve(this.openAnswer as { socket: number });
+    if (!this.holdOpens) return Promise.resolve({ socket: socket.id });
+    return new Promise((resolve) => (socket.resolveOpen = () => resolve({ socket: socket.id })));
   }
 
-  #send(args: Record<string, unknown>): Promise<null> {
+  /** Each send takes a tick to apply, so a webview that does not wait would have several out. */
+  async #send(args: Record<string, unknown>): Promise<null> {
     const socket = this.sockets.find((s) => s.id === args.socket);
     if (socket === undefined || socket.closed !== undefined) return failure('invalid', 'The socket is closed.');
     const { text, binary } = args;
     if ((text === undefined) === (binary === undefined)) return failure('invalid', 'Exactly one of text and binary.');
+    socket.inFlight += 1;
+    socket.maxInFlight = Math.max(socket.maxInFlight, socket.inFlight);
+    await new Promise((done) => setTimeout(done, 0));
+    socket.inFlight -= 1;
+    if (this.refuseSends !== undefined) return failure(this.refuseSends.code, this.refuseSends.message);
     socket.sent.push(text === undefined ? { binary: Array.from(binary as Uint8Array | number[]) } : { text: String(text) });
-    return Promise.resolve(null);
+    return null;
   }
 
   #close(args: Record<string, unknown>): Promise<null> {
+    if (this.refuseClose !== undefined) return failure(this.refuseClose.code, this.refuseClose.message);
     const socket = this.sockets.find((s) => s.id === args.socket);
     if (socket !== undefined && socket.closed === undefined) {
       const code = typeof args.code === 'number' ? args.code : 1000;

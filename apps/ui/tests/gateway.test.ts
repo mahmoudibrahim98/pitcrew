@@ -226,6 +226,120 @@ describe('sockets through the gateway', () => {
     expect(gateway.calls.filter((c) => c.cmd === 'gateway_socket_close')).toEqual([
       { cmd: 'gateway_socket_close', args: { socket: fake?.id, code: 1000, reason: 'done' } },
     ]);
+    // The fake holds each send for a tick: the socket never had two out at once.
+    expect(fake?.maxInFlight).toBe(1);
+  });
+
+  it('ends the socket with 1011 when a send is refused, and says why once', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const socket = gatewayTransport(WS).openSocket('/v1/sessions/S1/terminal?cols=80&rows=24');
+    const closes: (SocketClose | undefined)[] = [];
+    socket.onclose = (close) => closes.push(close);
+    let opened = false;
+    socket.onopen = () => (opened = true);
+    await vi.waitFor(() => expect(opened).toBe(true));
+
+    gateway.refuseSends = { code: 'internal', message: 'The pipe broke.' };
+    socket.send('{"type":"resize","cols":100,"rows":30}');
+    socket.send(new Uint8Array([108, 115]));
+    socket.send('{"type":"resize","cols":120,"rows":40}');
+    await vi.waitFor(() => expect(closes).toEqual([{ code: 1011, reason: 'send failed' }]));
+    socket.send('after the close');
+
+    const [fake] = gateway.sockets;
+    // The frames after the refused one are dropped, not sent with a hole before them.
+    expect(gateway.calls.filter((c) => c.cmd === 'gateway_socket_send')).toHaveLength(1);
+    expect(fake?.sent).toEqual([]);
+    expect(gateway.calls.filter((c) => c.cmd === 'gateway_socket_close')).toEqual([
+      { cmd: 'gateway_socket_close', args: { socket: fake?.id, code: 1011, reason: 'send failed' } },
+    ]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toContain('The pipe broke.');
+    warn.mockRestore();
+  });
+
+  it('ends the socket here with 1006 when the gateway cannot close it', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    gateway.refuseClose = { code: 'internal', message: 'The gateway is shutting down.' };
+    const plain = gatewayTransport(WS).openSocket('/v1/stream');
+    const plainCloses: (SocketClose | undefined)[] = [];
+    plain.onclose = (close) => plainCloses.push(close);
+    plain.close();
+    await vi.waitFor(() => expect(plainCloses).toHaveLength(1));
+    expect(plainCloses[0]).toMatchObject({ code: 1006, reason: 'The gateway is shutting down.' });
+    expect(plainCloses[0]?.error).toMatchObject({ gateway: 'internal' });
+
+    // A refused send, and then a refused close: it still ends, once.
+    gateway.refuseSends = { code: 'internal', message: 'The pipe broke.' };
+    const broken = gatewayTransport(WS).openSocket('/v1/sessions/S1/terminal?cols=80&rows=24');
+    const brokenCloses: (SocketClose | undefined)[] = [];
+    broken.onclose = (close) => brokenCloses.push(close);
+    broken.send('x');
+    await vi.waitFor(() => expect(brokenCloses).toHaveLength(1));
+    expect(brokenCloses[0]).toMatchObject({ code: 1006, reason: 'The gateway is shutting down.' });
+    broken.close();
+    await new Promise((done) => setTimeout(done, 20));
+    expect(brokenCloses).toHaveLength(1);
+    warn.mockRestore();
+  });
+
+  it('delivers frames that arrive before the open command resolves', async () => {
+    gateway.holdOpens = true;
+    const socket = gatewayTransport(WS).openSocket('/v1/sessions/S1/terminal?cols=80&rows=24');
+    const got: unknown[] = [];
+    const events: string[] = [];
+    socket.onmessage = (message) => got.push(message.data);
+    socket.onopen = () => events.push('open');
+    const [fake] = gateway.sockets;
+    if (fake === undefined) throw new Error('no socket');
+    fake.json({ type: 'truncated', from: 0 });
+    fake.binary([1, 2]);
+    expect(got).toHaveLength(2);
+    expect(got[1]).toBeInstanceOf(ArrayBuffer);
+    expect(events).toEqual([]);
+
+    socket.send('{"type":"resize","cols":90,"rows":20}');
+    fake.resolveOpen();
+    await vi.waitFor(() => expect(fake.sent).toEqual([{ text: '{"type":"resize","cols":90,"rows":20}' }]));
+    expect(events).toEqual(['open']);
+  });
+
+  it('ends at a close that arrives before the open command resolves, and never opens', async () => {
+    gateway.holdOpens = true;
+    const socket = gatewayTransport(WS).openSocket('/v1/stream');
+    const events: string[] = [];
+    socket.onopen = () => events.push('open');
+    socket.onclose = (close) => events.push(`close ${close?.code}`);
+    const [fake] = gateway.sockets;
+    fake?.close(1001, 'shutting down');
+    expect(events).toEqual(['close 1001']);
+    socket.send('dropped');
+    fake?.resolveOpen();
+    await new Promise((done) => setTimeout(done, 20));
+    expect(events).toEqual(['close 1001']);
+    expect(gateway.calls.filter((c) => c.cmd === 'gateway_socket_send' || c.cmd === 'gateway_socket_close')).toEqual([]);
+  });
+
+  it('ends with 1006 when the open answer has no socket id', async () => {
+    gateway.openAnswer = { socket: 'seven' };
+    const socket = gatewayTransport(WS).openSocket('/v1/stream');
+    let close: SocketClose | undefined;
+    socket.onclose = (c) => (close = c);
+    await vi.waitFor(() => expect(close).toMatchObject({ code: 1006, error: { gateway: 'internal' } }));
+  });
+
+  it('ignores a message of an unknown shape, and says so once', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const socket = gatewayTransport(WS).openSocket('/v1/sessions/S1/terminal?cols=80&rows=24');
+    const got: unknown[] = [];
+    socket.onmessage = (message) => got.push(message.data);
+    const [fake] = gateway.sockets;
+    fake?.deliver([104, 105]);
+    fake?.deliver({ type: 'text', data: 42 });
+    fake?.text('still fine');
+    expect(got).toEqual(['still fine']);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
   });
 
   it('closed before it opened: sends nothing, and closes once open', async () => {
@@ -286,10 +400,10 @@ describe('the stream through the gateway', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const lives: Live[] = [];
     const probe = vi.fn(async () => undefined);
-    const live = (workspace: string) => {
+    const live = (workspace: string, name: string) => {
       const one = createLive({
         queryClient: new QueryClient(),
-        transport: gatewayTransport(workspace),
+        transport: gatewayTransport(workspace, () => name),
         backoff: { initialMs: 1, maxMs: 2 },
         probeAfter: 2,
         probe,
@@ -302,11 +416,19 @@ describe('the stream through the gateway', () => {
       { ...LAB, state: 'needs_pairing' },
       { id: 'W-DOWN', name: 'hpc-login', kind: 'remote', state: 'unreachable' },
     ];
-    const pairing = live(WS);
-    const down = live('W-DOWN');
+    const pairing = live(WS, 'Demo Lab');
+    const down = live('W-DOWN', 'hpc-login');
     await vi.waitFor(() => expect(pairing.store.getState().problem).toBe('needs_pairing'));
     await vi.waitFor(() => expect(down.store.getState().problem).toBe('unreachable'));
     expect(probe).not.toHaveBeenCalled();
+    // The warnings carry the gateway's own words.
+    const warnings = warn.mock.calls.map((call) => String(call[0]));
+    expect(warnings).toContain(
+      'pitcrew: the workspace “Demo Lab” needs pairing (Pair this workspace again.); the stream keeps retrying.',
+    );
+    expect(warnings).toContain(
+      'pitcrew: cannot reach the workspace “hpc-login” (The daemon does not answer.); the stream keeps retrying.',
+    );
 
     // Paired again: back to live, and the problem is gone.
     gateway.workspaces = [LAB];

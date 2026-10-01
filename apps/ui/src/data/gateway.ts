@@ -7,7 +7,7 @@
 
 import { Channel, invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { toGatewayError, type GatewayError } from './errors.ts';
+import { GatewayError, toGatewayError } from './errors.ts';
 import type { Method, SocketClose, Transport, TransportResponse, TransportSocket } from './transport.ts';
 import type { Gateway, GatewayWorkspace } from './workspaces.tsx';
 
@@ -42,7 +42,7 @@ export function createGateway(): Gateway {
   return {
     workspaces: () => call<GatewayWorkspace[]>('gateway_workspaces', {}),
     onWorkspaces: (listener) => listen<GatewayWorkspace[]>(WORKSPACES_EVENT, (event) => listener(event.payload)),
-    transport: (workspace) => gatewayTransport(workspace.id, workspace.name),
+    transport: (id, name) => gatewayTransport(id, name),
   };
 }
 
@@ -75,8 +75,10 @@ function isResponse(value: unknown): value is Omit<GatewayResponse, 'body'> & { 
   return typeof status === 'number' && (typeof body === 'string' || body === null || body === undefined);
 }
 
-/** The transport for one workspace (its id, as in `/w/$ws`). */
-export function gatewayTransport(workspace: string, name: string = workspace): Transport {
+/** The transport for one workspace (its id, as in `/w/$ws`); `name` names it in messages. */
+export function gatewayTransport(workspace: string, name: string | (() => string) = workspace): Transport {
+  const currentName = typeof name === 'function' ? name : () => name;
+
   async function request(
     method: Method,
     path: string,
@@ -93,10 +95,18 @@ export function gatewayTransport(workspace: string, name: string = workspace): T
 
   return {
     kind: 'desktop',
-    label: `the workspace “${name}”`,
+    get label() {
+      return `the workspace “${currentName()}”`;
+    },
     request,
     openSocket: (path) => new GatewaySocket(workspace, path),
   };
+}
+
+function openedId(answer: unknown): number | undefined {
+  if (typeof answer !== 'object' || answer === null) return undefined;
+  const { socket } = answer as { socket?: unknown };
+  return typeof socket === 'number' && Number.isInteger(socket) ? socket : undefined;
 }
 
 /** Consecutive binary frames are sent as one, up to this size. */
@@ -121,6 +131,8 @@ function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
 /**
  * A gateway socket as a `TransportSocket`. Messages arrive on a channel, in order, `close` last.
  * Sends go one at a time, in order (the gateway's commands may otherwise run concurrently).
+ * A frame the gateway refuses ends the socket with 1011, so the caller reconnects rather than
+ * carry on with a hole in what it sent.
  */
 class GatewaySocket implements TransportSocket {
   onopen: (() => void) | null = null;
@@ -135,11 +147,17 @@ class GatewaySocket implements TransportSocket {
   #sending = false;
   /** Set by `close()` until the close command goes out. */
   #closeWith: { code?: number | undefined; reason?: string | undefined } | undefined;
+  /** Each warning once per socket. */
+  readonly #warned = new Set<string>();
 
   constructor(workspace: string, path: string) {
     const events = new Channel<unknown>((message) => this.#receive(message));
-    call<{ socket: number }>('gateway_socket_open', { workspace, path, events }).then(
-      (opened) => this.#opened(opened.socket),
+    call<unknown>('gateway_socket_open', { workspace, path, events }).then(
+      (answer) => {
+        const id = openedId(answer);
+        if (id === undefined) this.#failed(new GatewayError('internal', 'The gateway opened a socket without an id.'));
+        else this.#opened(id);
+      },
       (error: unknown) => this.#failed(toGatewayError(error)),
     );
   }
@@ -170,12 +188,19 @@ class GatewaySocket implements TransportSocket {
     this.#flush();
   }
 
+  /** Ends the socket here, with 1006: it never opened, or the gateway could not close it. */
   #failed(error: GatewayError): void {
     if (this.#state === 'closed') return;
     this.#state = 'closed';
     this.#outbox.length = 0;
     this.onerror?.();
     this.onclose?.({ code: 1006, reason: error.message, error });
+  }
+
+  #warn(message: string): void {
+    if (this.#warned.has(message)) return;
+    this.#warned.add(message);
+    console.warn(`pitcrew: ${message}`);
   }
 
   #receive(message: unknown): void {
@@ -185,8 +210,12 @@ class GatewaySocket implements TransportSocket {
       if (this.#state !== 'closing') this.onmessage?.({ data: binary });
       return;
     }
-    if (typeof message !== 'object' || message === null) return;
-    const frame = message as { type?: unknown; data?: unknown; code?: unknown; reason?: unknown };
+    const frame = (typeof message === 'object' && message !== null ? message : {}) as {
+      type?: unknown;
+      data?: unknown;
+      code?: unknown;
+      reason?: unknown;
+    };
     if (frame.type === 'text' && typeof frame.data === 'string') {
       if (this.#state !== 'closing') this.onmessage?.({ data: frame.data });
     } else if (frame.type === 'close') {
@@ -196,6 +225,9 @@ class GatewaySocket implements TransportSocket {
         code: typeof frame.code === 'number' ? frame.code : 1006,
         reason: typeof frame.reason === 'string' ? frame.reason : '',
       });
+    } else {
+      // A binary frame as a number array, say: the contract says ArrayBuffer.
+      this.#warn('ignored a gateway socket message that is not text, an ArrayBuffer or close.');
     }
   }
 
@@ -212,8 +244,8 @@ class GatewaySocket implements TransportSocket {
       const args: Record<string, unknown> = { socket };
       if (closeWith.code !== undefined) args.code = closeWith.code;
       if (closeWith.reason !== undefined) args.reason = closeWith.reason;
-      // The `close` message on the channel ends it; a failure means it is already closed.
-      call('gateway_socket_close', args).catch(() => {});
+      // The `close` message on the channel ends it. If the gateway cannot close it, end it here.
+      call('gateway_socket_close', args).catch((error: unknown) => this.#failed(toGatewayError(error)));
       return;
     }
     let args: Record<string, unknown>;
@@ -229,11 +261,23 @@ class GatewaySocket implements TransportSocket {
       args = { socket, binary: bytes };
     }
     this.#sending = true;
-    // A refused send means the socket closed; its `close` message follows.
-    const done = () => {
+    const sent = () => {
       this.#sending = false;
       this.#flush();
     };
-    call('gateway_socket_send', args).then(done, done);
+    const refused = (error: unknown) => {
+      this.#sending = false;
+      if (this.#state === 'closed') return;
+      // The frame is lost, and so are the ones after it: end the socket, so the caller
+      // reconnects (from where its data says) instead of carrying on with a hole.
+      this.#warn(`a gateway socket send failed (${toGatewayError(error).message}); closing it with 1011.`);
+      this.#outbox.length = 0;
+      if (this.#state === 'open') {
+        this.#state = 'closing';
+        this.#closeWith = { code: 1011, reason: 'send failed' };
+      }
+      this.#flush();
+    };
+    call('gateway_socket_send', args).then(sent, refused);
   }
 }

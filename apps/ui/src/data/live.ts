@@ -232,6 +232,7 @@ export function createLive(options: LiveOptions): Live {
     probing = true;
     // Without a probe, all we know is that the stream cannot connect.
     let problem: LiveProblem | undefined = 'unreachable';
+    let cause: unknown = known;
     try {
       if (known !== undefined) {
         problem = problemOf(known);
@@ -241,19 +242,22 @@ export function createLive(options: LiveOptions): Live {
         problem = undefined;
       }
     } catch (error) {
+      cause = error;
       problem = problemOf(error);
     } finally {
       probing = false;
     }
     if (store.getState().status !== 'reconnecting') return;
     store.setState({ problem });
+    // The desktop gateway says why, for people to read.
+    const why = cause instanceof GatewayError && cause.message !== '' ? ` (${cause.message})` : '';
     const warning =
       problem === 'unauthorized'
-        ? `pitcrew: ${transport.label} rejected the token; the stream keeps retrying.`
+        ? `pitcrew: ${transport.label} rejected the token${why}; the stream keeps retrying.`
         : problem === 'needs_pairing'
-          ? `pitcrew: ${transport.label} needs pairing; the stream keeps retrying.`
+          ? `pitcrew: ${transport.label} needs pairing${why}; the stream keeps retrying.`
           : problem === 'unreachable'
-            ? `pitcrew: cannot reach ${transport.label}; the stream keeps retrying.`
+            ? `pitcrew: cannot reach ${transport.label}${why}; the stream keeps retrying.`
             : `pitcrew: ${transport.label} answers, but its stream keeps failing; retrying.`;
     if (warning !== warned) {
       warned = warning;
