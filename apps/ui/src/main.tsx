@@ -1,7 +1,7 @@
 import { RouterProvider } from '@tanstack/react-router';
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { apiBaseUrl, apiToken, createApi, createQueryClient, DataProvider } from './data/index.ts';
+import { AppData } from './data/index.ts';
 import { applyTheme, useTheme } from './design/index.ts';
 import './index.css';
 import { router } from './router.tsx';
@@ -10,16 +10,14 @@ import { router } from './router.tsx';
 // synchronously).
 applyTheme(useTheme.getState().theme);
 
-const api = createApi({ baseUrl: apiBaseUrl, token: apiToken });
-const queryClient = createQueryClient();
-
 const root = document.getElementById('root');
 if (root === null) throw new Error('index.html has no #root');
 
+// The data layer picks its transport once: the desktop gateway in the app, HTTP in a browser.
 createRoot(root).render(
   <StrictMode>
-    <DataProvider api={api} queryClient={queryClient} token={apiToken}>
+    <AppData>
       <RouterProvider router={router} />
-    </DataProvider>
+    </AppData>
   </StrictMode>,
 );

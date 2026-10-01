@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createApi } from '../src/data/api.ts';
 import { StreamClient, streamUrl, type StreamStatus } from '../src/data/stream.ts';
+import { browserTransport } from '../src/data/transport.ts';
 import type { Event, Task, TaskStatus } from '../src/data/types.ts';
 import { DEVICE_TOKEN, fakeSockets, recordingSocket, startServer, type RunningServer } from './helpers.ts';
 
@@ -41,10 +42,8 @@ describe('stream client against the mock hub', () => {
     const statuses: StreamStatus[] = [];
     const socket = recordingSocket();
     const stream = new StreamClient({
-      baseUrl: hub.url,
-      token: DEVICE_TOKEN,
+      transport: browserTransport({ baseUrl: hub.url, token: DEVICE_TOKEN, socket: socket.factory }),
       since: options.since,
-      socket: socket.factory,
       onEvents: (events) => received.push(...events),
       onReset: options.onReset ?? (() => {}),
       onStatus: (status) => statuses.push(status),
@@ -133,10 +132,8 @@ describe('stream client timing', () => {
     const { factory, sockets } = fakeSockets();
     const received: Event[] = [];
     const stream = new StreamClient({
-      baseUrl: 'http://127.0.0.1:47317',
-      token: DEVICE_TOKEN,
+      transport: browserTransport({ baseUrl: 'http://127.0.0.1:47317', token: DEVICE_TOKEN, socket: factory }),
       since,
-      socket: factory,
       onEvents: (events) => received.push(...events),
       onReset: () => {},
       backoff: { initialMs: 100, maxMs: 1000 },
@@ -165,9 +162,8 @@ describe('stream client timing', () => {
     const { factory, sockets } = fakeSockets();
     const received: Event[] = [];
     const stream = new StreamClient({
-      baseUrl: 'http://127.0.0.1:47317',
+      transport: browserTransport({ baseUrl: 'http://127.0.0.1:47317', socket: factory }),
       since: 5,
-      socket: factory,
       onEvents: (events) => received.push(...events),
       onReset: (rev) => resets.push(rev),
     });
@@ -187,8 +183,7 @@ describe('stream client timing', () => {
     const { factory, sockets } = fakeSockets();
     const received: Event[] = [];
     const stream = new StreamClient({
-      baseUrl: 'http://127.0.0.1:47317',
-      socket: factory,
+      transport: browserTransport({ baseUrl: 'http://127.0.0.1:47317', socket: factory }),
       onEvents: (events) => received.push(...events),
       onReset: (rev) => resets.push(rev),
       backoff: { initialMs: 100, maxMs: 100 },

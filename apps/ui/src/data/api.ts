@@ -1,5 +1,8 @@
-// The HTTP client for API v1. Everything the UI asks the daemon goes through here.
+// The client for API v1. Everything the UI asks the daemon goes through here, over a transport:
+// HTTP in a browser, the desktop gateway in the app (`transport.ts`).
 
+import { ApiError } from './errors.ts';
+import { browserTransport, type BrowserOptions, type Method, type Transport, type TransportResponse } from './transport.ts';
 import type {
   ApiErrorBody,
   Ask,
@@ -59,18 +62,7 @@ const CODE_BY_STATUS: Partial<Record<number, ErrorCode>> = {
   503: 'unavailable',
 };
 
-/** A failed request. `status` is 0 when the hub could not be reached at all. */
-export class ApiError extends Error {
-  readonly code: ErrorCode;
-  readonly status: number;
-
-  constructor(code: ErrorCode, message: string, status: number) {
-    super(message);
-    this.name = 'ApiError';
-    this.code = code;
-    this.status = status;
-  }
-}
+export { ApiError, GatewayError, type GatewayErrorCode } from './errors.ts';
 
 function isErrorBody(value: unknown): value is ApiErrorBody {
   if (typeof value !== 'object' || value === null) {
@@ -80,11 +72,11 @@ function isErrorBody(value: unknown): value is ApiErrorBody {
   return typeof message === 'string' && ERROR_CODES.includes(code as ErrorCode);
 }
 
-/** Turns a non-2xx response into an `ApiError`, trusting the body only if it has the contract's shape. */
-export async function errorFromResponse(res: Response): Promise<ApiError> {
+/** Turns a non-2xx answer into an `ApiError`, trusting the body only if it has the contract's shape. */
+export function errorFromResponse(res: TransportResponse): ApiError {
   let body: unknown;
   try {
-    body = await res.json();
+    body = JSON.parse(res.body);
   } catch {
     body = undefined;
   }
@@ -92,16 +84,14 @@ export async function errorFromResponse(res: Response): Promise<ApiError> {
     return new ApiError(body.code, body.message, res.status);
   }
   const code = CODE_BY_STATUS[res.status] ?? 'internal';
-  return new ApiError(code, `HTTP ${res.status} ${res.statusText}`.trim(), res.status);
+  return new ApiError(code, `HTTP ${res.status}`, res.status);
 }
 
-export interface ApiOptions {
-  /** For example `http://127.0.0.1:47317`, without a trailing slash. */
-  baseUrl: string;
-  /** Sent as `Authorization: Bearer`. Absent in the desktop app, whose gateway adds it. */
-  token?: string | undefined;
-  fetch?: typeof fetch;
-}
+/**
+ * A transport (`browserTransport()`, or the desktop gateway's), or the browser's options, which
+ * make a browser transport.
+ */
+export type ApiOptions = { transport: Transport } | BrowserOptions;
 
 type Query = Record<string, string | readonly string[] | undefined>;
 
@@ -121,43 +111,31 @@ function queryString(query: Query | undefined): string {
 }
 
 export function createApi(options: ApiOptions) {
-  const baseUrl = options.baseUrl.replace(/\/+$/, '');
-  const doFetch = options.fetch ?? globalThis.fetch.bind(globalThis);
+  const transport = 'transport' in options ? options.transport : browserTransport(options);
 
+  /**
+   * Rejects with an `ApiError` for every failure: the daemon's own (its status), or none at all
+   * (status 0: unreachable, or the desktop gateway's `GatewayError`).
+   */
   async function request<T>(
-    method: string,
+    method: Method,
     path: string,
     init: { query?: Query; body?: unknown; signal?: AbortSignal | undefined } = {},
   ): Promise<T> {
-    const headers: Record<string, string> = { Accept: 'application/json' };
-    if (options.token !== undefined) {
-      headers.Authorization = `Bearer ${options.token}`;
-    }
-    if (init.body !== undefined) {
-      headers['Content-Type'] = 'application/json';
-    }
-    let res: Response;
-    try {
-      res = await doFetch(`${baseUrl}${path}${queryString(init.query)}`, {
-        method,
-        headers,
-        body: init.body === undefined ? null : JSON.stringify(init.body),
-        signal: init.signal ?? null,
-      });
-    } catch (cause) {
-      if (cause instanceof DOMException && cause.name === 'AbortError') {
-        throw cause;
-      }
-      throw new ApiError('unavailable', `Cannot reach ${baseUrl}`, 0);
-    }
-    if (!res.ok) {
-      throw await errorFromResponse(res);
+    const res = await transport.request(
+      method,
+      `${path}${queryString(init.query)}`,
+      init.body === undefined ? undefined : JSON.stringify(init.body),
+      init.signal,
+    );
+    if (res.status < 200 || res.status > 299) {
+      throw errorFromResponse(res);
     }
     if (res.status === 204) {
       return undefined as T;
     }
     try {
-      return (await res.json()) as T;
+      return JSON.parse(res.body) as T;
     } catch {
       throw new ApiError('internal', `${method} ${path} answered ${res.status} without JSON`, res.status);
     }
@@ -174,7 +152,8 @@ export function createApi(options: ApiOptions) {
     request<Brief>('PUT', `/v1/briefs/${target.kind}/${id(target.id)}`, { body: edit });
 
   return {
-    baseUrl,
+    /** How this client reaches its daemon. */
+    transport,
     request,
     me: (signal?: AbortSignal) => get<Member>('/v1/me', undefined, signal),
     workspace: (signal?: AbortSignal) =>
