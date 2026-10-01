@@ -64,16 +64,35 @@ fn effective_port(scheme: &str, port: Option<&str>) -> String {
     }
 }
 
-/// Whether `path` is `base`, or a path segment under it. `/api/v3` is under itself and under
-/// `/api/v3/repos/x`'s base `/api/v3`, but `/api/v3evil` is not under `/api/v3`: the comparison is
-/// segment-aware, not a bare string prefix, so a path can't be smuggled past the check by
-/// appending characters right after the base.
-fn path_is_under(path: &str, base: &str) -> bool {
-    let base = base.trim_end_matches('/');
-    if base.is_empty() {
-        return true;
+/// Splits `path` on `/` and resolves `.` (dropped) and `..` (pops the previous segment)
+/// segments, the way a browser or an HTTP server would before routing a request. Returns `None`
+/// if a `..` has no segment left to pop — escaping past the root — which this treats as never
+/// trusted rather than silently clamping it to the root.
+fn normalize_segments(path: &str) -> Option<Vec<&str>> {
+    let mut out: Vec<&str> = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                out.pop()?;
+            }
+            s => out.push(s),
+        }
     }
-    path == base || path.starts_with(&format!("{base}/"))
+    Some(out)
+}
+
+/// Whether `path` is `base`, or a path segment under it, **after** resolving `.`/`..` segments in
+/// both: `/api/v3` is under itself and under `/api/v3/repos/x`'s base `/api/v3`, but `/api/v3evil`
+/// is not under `/api/v3`, and neither is `/api/v3/repos/../../evil` (it normalises to `/evil`).
+/// The comparison is segment-aware, not a bare string prefix, so a path can't be smuggled past the
+/// check by appending characters right after the base or by walking back out of it with `..`.
+fn path_is_under(path: &str, base: &str) -> bool {
+    let (Some(path_segs), Some(base_segs)) = (normalize_segments(path), normalize_segments(base))
+    else {
+        return false;
+    };
+    path_segs.len() >= base_segs.len() && path_segs[..base_segs.len()] == base_segs[..]
 }
 
 /// Whether `next` names the same scheme, host and port as `api_base`, with a path under
@@ -162,6 +181,41 @@ mod tests {
     fn a_sibling_path_outside_the_api_base_is_untrusted() {
         assert!(!is_trusted_next_url(
             "https://ghe.example.com/other",
+            ENTERPRISE_BASE
+        ));
+    }
+
+    #[test]
+    fn dot_dot_segments_cannot_escape_the_api_base_path() {
+        // String-prefix matching alone would accept this (it starts with "/api/v3/"), but it
+        // normalises to "/api/evil" — a sibling of the base, not something under it.
+        assert!(!is_trusted_next_url(
+            "https://ghe.example.com/api/v3/repos/../../evil",
+            ENTERPRISE_BASE
+        ));
+    }
+
+    #[test]
+    fn dot_dot_escaping_past_the_root_is_untrusted() {
+        assert!(!is_trusted_next_url(
+            "https://ghe.example.com/../evil",
+            ENTERPRISE_BASE
+        ));
+    }
+
+    #[test]
+    fn dot_segments_normalise_away_without_affecting_trust() {
+        assert!(is_trusted_next_url(
+            "https://ghe.example.com/api/v3/./repos/o/r/issues?page=2",
+            ENTERPRISE_BASE
+        ));
+    }
+
+    #[test]
+    fn a_dot_dot_that_stays_under_the_base_is_still_trusted() {
+        // Resolves to "/api/v3/repos/o/r/issues", genuinely under the base.
+        assert!(is_trusted_next_url(
+            "https://ghe.example.com/api/v3/repos/o/x/../r/issues",
             ENTERPRISE_BASE
         ));
     }

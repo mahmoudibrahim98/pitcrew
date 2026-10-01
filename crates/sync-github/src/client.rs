@@ -426,11 +426,19 @@ impl<'t, T: Transport> GithubClient<'t, T> {
 }
 
 /// GitHub's abuse/secondary-rate-limit responses carry a `message` naming it explicitly (e.g. "You
-/// have exceeded a secondary rate limit..."); this is a substring check on the raw body so it
-/// still recognises one even if the body isn't valid JSON.
+/// have exceeded a secondary rate limit..."). This looks only at that JSON field, never the raw
+/// body: scanning the whole body would also match the string appearing incidentally elsewhere
+/// (a `documentation_url`, an issue title echoed back in a validation error, …), wrongly treating
+/// an unrelated error as a rate limit that will clear on its own.
 fn body_mentions_rate_limit(body: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
-    text.contains("rate limit") || text.contains("abuse")
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(message) = value.get("message").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let lower = message.to_ascii_lowercase();
+    lower.contains("rate limit") || lower.contains("abuse")
 }
 
 #[cfg(test)]
@@ -758,6 +766,29 @@ mod tests {
             panic!("expected RateLimited");
         };
         assert!(secondary);
+    }
+
+    #[test]
+    fn body_mentions_rate_limit_only_checks_the_message_field() {
+        // A rate-limit-shaped word elsewhere in the body (not the `message` field) must not count:
+        // otherwise an unrelated error whose other fields happen to echo back user-supplied text
+        // containing "rate limit" would be mistaken for a secondary limit that will clear on its
+        // own, rather than surfaced as the real error it is.
+        let body = br#"{"message":"Bad credentials","documentation_url":"https://docs.github.com/rate-limit-troubleshooting"}"#;
+        assert!(!body_mentions_rate_limit(body));
+    }
+
+    #[test]
+    fn body_mentions_rate_limit_recognises_the_real_shape() {
+        let body = br#"{"message":"You have exceeded a secondary rate limit. Please wait."}"#;
+        assert!(body_mentions_rate_limit(body));
+    }
+
+    #[test]
+    fn body_mentions_rate_limit_rejects_non_json() {
+        assert!(!body_mentions_rate_limit(
+            b"plain text mentioning a rate limit"
+        ));
     }
 
     #[tokio::test]
