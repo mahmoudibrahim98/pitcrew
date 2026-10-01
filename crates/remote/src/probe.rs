@@ -4,6 +4,10 @@
 //! login banner nor a value the machine reports can fake them. A report counts only when both
 //! markers are there, every key appears once, and the script exits 0. The call is bounded by
 //! [`PROBE_LIMITS`], so a hung `stat` on a dead NFS mount cannot block it forever.
+//!
+//! The probe also reads the login shell (`$SHELL`) and refuses hosts whose shell cannot carry
+//! PitCrew's commands safely (xonsh; see [`crate::quote`]). Its own command is fixed text, so
+//! running it through such a shell to find out is harmless.
 
 use crate::{Limits, Ssh, SshError};
 use pitcrew_protocol::model::{MachineInfo, Scheduler};
@@ -24,6 +28,7 @@ pub const SCRIPT: &str = concat!(
     r#"printf 'arch=%s\n' "$(uname -m 2>/dev/null)"; "#,
     r#"printf 'hostname=%s\n' "$(uname -n 2>/dev/null)"; "#,
     r#"printf 'home=%s\n' "$HOME"; "#,
+    r#"printf 'shell=%s\n' "$SHELL"; "#,
     r#"if command -v tmux >/dev/null 2>&1; then echo tmux_found=1; printf 'tmux=%s\n' "$(tmux -V 2>/dev/null)"; else echo tmux_found=0; fi; "#,
     "if command -v sbatch >/dev/null 2>&1; then echo sbatch=1; else echo sbatch=0; fi; ",
     "if command -v squeue >/dev/null 2>&1; then echo squeue=1; else echo squeue=0; fi; ",
@@ -54,6 +59,22 @@ pub struct Probe {
     /// The filesystem type of `$HOME`, e.g. `ext2/ext3`, `nfs`, `lustre`, `apfs`; `None` when
     /// the machine could not tell.
     pub home_fs: Option<String>,
+    /// The login shell (`$SHELL`), when set.
+    pub login_shell: Option<String>,
+}
+
+/// Login shells that may not keep single-quoted text literal, so PitCrew's commands could be
+/// changed on the way to `/bin/sh` (see [`crate::quote`]).
+const UNSAFE_SHELLS: [&str; 1] = ["xonsh"];
+
+/// Whether `shell` (a path or a name) is one PitCrew refuses.
+#[must_use]
+pub fn is_unsafe_shell(shell: &str) -> bool {
+    let name = shell.rsplit(['/', '\\']).next().unwrap_or(shell);
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    UNSAFE_SHELLS
+        .iter()
+        .any(|bad| name == *bad || name.starts_with(&format!("{bad}-")))
 }
 
 impl Ssh {
@@ -61,8 +82,9 @@ impl Ssh {
     /// machine reports none.
     ///
     /// # Errors
-    /// The ssh call fails or breaks the limits, the script exits non-zero, or the report is
-    /// missing, cut off or malformed.
+    /// The ssh call fails or breaks the limits, the script exits non-zero, the report is
+    /// missing, cut off or malformed, or the login shell is one PitCrew cannot use safely
+    /// ([`SshError::UnsupportedShell`]).
     pub async fn probe(&self, host: &str) -> Result<Probe, SshError> {
         self.probe_with(host, PROBE_LIMITS).await
     }
@@ -84,7 +106,11 @@ impl Ssh {
                 crate::ssh::last_line(&String::from_utf8_lossy(&output.stderr))
             )));
         }
-        parse(&output.stdout_text(), &tag, host)
+        let probe = parse(&output.stdout_text(), &tag, host)?;
+        if let Some(shell) = probe.login_shell.as_deref().filter(|s| is_unsafe_shell(s)) {
+            return Err(SshError::UnsupportedShell(shell.to_owned()));
+        }
+        Ok(probe)
     }
 }
 
@@ -133,7 +159,7 @@ pub fn parse(stdout: &str, tag: &str, fallback_hostname: &str) -> Result<Probe, 
         arch: normalize_arch(get("arch")),
         has_tmux: flag("tmux_found"),
         scheduler: (has_sbatch && has_squeue).then_some(Scheduler::Slurm),
-        home_on_network_fs: home_fs.as_deref().is_none_or(is_network_fs),
+        home_on_network_fs: !home_fs.as_deref().is_some_and(is_local_fs),
     };
     Ok(Probe {
         info,
@@ -144,6 +170,7 @@ pub fn parse(stdout: &str, tag: &str, fallback_hostname: &str) -> Result<Probe, 
         has_sbatch,
         has_squeue,
         home_fs,
+        login_shell: get("shell").map(str::to_owned),
     })
 }
 
@@ -171,35 +198,51 @@ fn normalize_arch(uname: Option<&str>) -> String {
     }
 }
 
-/// Filesystems where files live on another machine: shared, slower, and not safe for SQLite
-/// locking (ADR-0004).
+/// Filesystems known to keep files on this machine's own disks (or memory), as `stat -f -c
+/// %T`, `df -T` or `mount` name them. It is an allowlist: everything else counts as possibly
+/// networked (shared, slower, and not safe for SQLite locking; ADR-0004), including what `stat`
+/// cannot name (`UNKNOWN (0x…)`), every FUSE filesystem (`fuseblk` covers sshfs, glusterfs,
+/// DAOS dfuse and s3fs alike), and VM or cluster filesystems such as `9p`, `virtiofs`,
+/// `vboxsf`, `gfs2` and `ocfs2`.
+const LOCAL_FS: [&str; 29] = [
+    "ext2/ext3", // GNU stat, for ext2, ext3 and ext4.
+    "ext2",
+    "ext3",
+    "ext4",
+    "xfs",
+    "btrfs",
+    "zfs",
+    "tmpfs",
+    "ramfs",
+    "f2fs",
+    "bcachefs",
+    "overlay",
+    "overlayfs",
+    "apfs",
+    "hfs",
+    "hfsplus",
+    "ufs",
+    "ffs",
+    "jfs",
+    "reiserfs",
+    "nilfs2",
+    "hammer",
+    "hammer2",
+    "exfat",
+    "vfat",
+    "msdos",
+    "ntfs3",
+    "squashfs",
+    "erofs",
+];
+
+/// Whether `fs` is on the allowlist of filesystems known to be local (ext2/3/4, xfs, btrfs,
+/// zfs, tmpfs, f2fs, bcachefs, overlayfs, apfs, hfs and similar). Anything else may be
+/// networked: unknown types, FUSE, 9p, virtiofs, vboxsf, cluster filesystems.
 #[must_use]
-pub fn is_network_fs(fs: &str) -> bool {
-    let fs = fs.to_ascii_lowercase();
-    let fs = fs.strip_prefix("fuse.").unwrap_or(&fs);
-    matches!(
-        fs,
-        "nfs"
-            | "nfs4"
-            | "smbfs"
-            | "smb"
-            | "smb2"
-            | "smb3"
-            | "cifs"
-            | "afs"
-            | "lustre"
-            | "gpfs"
-            | "beegfs"
-            | "ceph"
-            | "cephfs"
-            | "glusterfs"
-            | "sshfs"
-            | "panfs"
-            | "wekafs"
-            | "webdav"
-            | "davfs"
-    ) || fs.contains("0x19830326") // BeeGFS, as older coreutils print it.
-        || fs.contains("0x47504653") // GPFS.
+pub fn is_local_fs(fs: &str) -> bool {
+    let fs = fs.trim().to_ascii_lowercase();
+    LOCAL_FS.contains(&fs.as_str())
 }
 
 #[cfg(test)]
@@ -261,20 +304,83 @@ mod tests {
     }
 
     #[test]
-    fn network_filesystems() {
+    fn known_local_filesystems() {
+        for fs in [
+            "ext2/ext3",
+            "ext4",
+            "EXT4",
+            "xfs",
+            "btrfs",
+            "zfs",
+            "tmpfs",
+            "f2fs",
+            "bcachefs",
+            "overlayfs",
+            "overlay",
+            "apfs",
+            "hfs",
+            " xfs ",
+        ] {
+            assert!(is_local_fs(fs), "{fs:?}");
+        }
+    }
+
+    /// Everything not on the allowlist may be networked, named or not.
+    #[test]
+    fn everything_else_may_be_networked() {
         for fs in [
             "nfs",
             "NFS4",
             "lustre",
             "gpfs",
-            "fuse.sshfs",
+            "cifs",
             "UNKNOWN (0x19830326)",
+            "UNKNOWN (0x5346414f)",
+            "fuseblk",
+            "fuse",
+            "fuse.sshfs",
+            "fuse.glusterfs",
+            "fuse.dfuse",
+            "fuse.s3fs",
+            "9p",
+            "v9fs",
+            "virtiofs",
+            "gfs2",
+            "ocfs2",
+            "vboxsf",
+            "",
+            "ext4 nfs",
         ] {
-            assert!(is_network_fs(fs), "{fs}");
+            assert!(!is_local_fs(fs), "{fs:?}");
+            let p = parse(&report(&format!("fs={fs}\n")), TAG, "h").unwrap();
+            assert!(p.info.home_on_network_fs, "{fs:?}");
         }
-        for fs in ["ext2/ext3", "xfs", "apfs", "btrfs", "tmpfs", "zfs"] {
-            assert!(!is_network_fs(fs), "{fs}");
+        let p = parse(&report("fs=xfs\n"), TAG, "h").unwrap();
+        assert!(!p.info.home_on_network_fs);
+    }
+
+    #[test]
+    fn unsafe_login_shells() {
+        for shell in [
+            "xonsh",
+            "/usr/bin/xonsh",
+            "/opt/bin/xonsh-0.14",
+            "xonsh.exe",
+        ] {
+            assert!(is_unsafe_shell(shell), "{shell}");
         }
+        for shell in [
+            "/bin/bash",
+            "/usr/bin/fish",
+            "/bin/tcsh",
+            "/bin/zsh",
+            "",
+            "xonshy",
+        ] {
+            assert!(!is_unsafe_shell(shell), "{shell}");
+        }
+        let p = parse(&report("shell=/usr/bin/xonsh\n"), TAG, "h").unwrap();
+        assert_eq!(p.login_shell.as_deref(), Some("/usr/bin/xonsh"));
     }
 
     #[test]

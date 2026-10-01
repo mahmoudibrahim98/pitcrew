@@ -1148,6 +1148,18 @@ fn probe_failures_are_errors() {
         stdout: "@@pitcrew-probe-begin-0000\nos=Linux\n@@pitcrew-probe-end-0000\n".into(),
         ..Scenario::default()
     });
+    // A login shell that could change PitCrew's commands on their way to /bin/sh.
+    let err = probe_scenario(Scenario {
+        stdout: "@@pitcrew-probe-begin-{TAG}\nos=Linux\nshell=/usr/bin/xonsh\nfs=xfs\n\
+                 @@pitcrew-probe-end-{TAG}\n"
+            .into(),
+        ..Scenario::default()
+    })
+    .unwrap_err();
+    assert!(
+        matches!(&err, SshError::UnsupportedShell(shell) if shell == "/usr/bin/xonsh"),
+        "{err:?}"
+    );
 }
 
 fn probe_is_bounded() {
