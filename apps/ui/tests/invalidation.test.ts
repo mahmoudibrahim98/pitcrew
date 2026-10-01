@@ -84,6 +84,28 @@ describe('invalidation map', () => {
     ]);
   });
 
+  it('task_updated touches the task, the task lists, and its old and new workstream', () => {
+    const cache: CacheLookup = { taskWorkstream: (id) => (id === 'T1' ? 'WS1' : undefined) };
+    const edited = keysToInvalidate([event({ type: 'task_updated', data: { task: 'T1', patch: { title: 'New' } } })], cache);
+    expect(edited).toEqual([keys.events, keys.tasks.detail('T1'), keys.tasks.lists, keys.workstreams.detail('WS1')]);
+    const moved = keysToInvalidate(
+      [event({ type: 'task_updated', data: { task: 'T1', patch: { workstream: 'WS2' } } })],
+      cache,
+    );
+    expect(moved).toEqual([
+      keys.events,
+      keys.tasks.detail('T1'),
+      keys.tasks.lists,
+      keys.workstreams.detail('WS1'),
+      keys.workstreams.detail('WS2'),
+    ]);
+    const cleared = keysToInvalidate(
+      [event({ type: 'task_updated', data: { task: 'T1', patch: { workstream: null } } })],
+      cache,
+    );
+    expect(cleared).toEqual([keys.events, keys.tasks.detail('T1'), keys.tasks.lists, keys.workstreams.detail('WS1')]);
+  });
+
   it('dedupes keys across a batch', () => {
     const moved = (to: 'review' | 'done') =>
       event({ type: 'task_moved', data: { task: 'T1', from: 'todo', to, mover: { kind: 'person' } } });

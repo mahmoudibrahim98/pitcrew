@@ -31,7 +31,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [P-bench-and-release](P-bench-and-release.md) | P · Packaging | `s/P/bench-and-release` | Sonnet-class | **Merged** |
 | [Q-threat-model-and-fuzz](Q-threat-model-and-fuzz.md) | Q · Security | `s/Q/threat-model-and-fuzz` | Opus-class | **Merged** |
 
-| [0-work-edits](0-work-edits.md) | 0 · Contracts | `integrator/work-edits` | Opus-class | In progress |
+| [0-work-edits](0-work-edits.md) | 0 · Contracts | `integrator/work-edits` | Opus-class | **Merged** |
 | [C-nfs-and-maintenance](C-nfs-and-maintenance.md) | C · Store | `s/C/nfs-and-maintenance` | Sonnet-class | In progress |
 | [G-github-read](G-github-read.md) | G · Integrations | `s/G/github-read` | Sonnet-class | In progress |
 | [E-single-writer-and-sessions](E-single-writer-and-sessions.md) | E · Work model | `s/E/single-writer-and-sessions` | Opus-class | In progress |

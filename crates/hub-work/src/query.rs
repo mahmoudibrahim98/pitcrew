@@ -641,6 +641,7 @@ fn brief_row(r: &Row<'_>) -> sql::Result<Brief> {
         source: enum_col(r, 5)?,
         updated: r.get(6)?,
         receipts: json_col(r, 7)?,
+        proposal: None,
     })
 }
 

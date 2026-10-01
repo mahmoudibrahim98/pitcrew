@@ -159,6 +159,22 @@ export interface Task {
   subtasks: Subtask[];
 }
 
+/**
+ * A partial update of a task (`TaskPatch`). A field left out is unchanged; `null` clears
+ * `workstream`, `start` and `due`. In `task_updated` it holds only the fields that changed.
+ */
+export interface TaskPatch {
+  workstream?: WorkstreamId | null;
+  title?: string;
+  description?: string;
+  priority?: Priority;
+  labels?: string[];
+  start?: CalendarDate | null;
+  due?: CalendarDate | null;
+  blocked_by?: TaskId[];
+  accept_auto?: boolean;
+}
+
 export interface Session {
   id: SessionId;
   engine: Engine;
@@ -360,6 +376,7 @@ export type EventBody =
   | { type: 'task_created'; data: { task: Task } }
   | { type: 'task_moved'; data: { task: TaskId; from: TaskStatus; to: TaskStatus; mover: Mover } }
   | { type: 'task_assigned'; data: { task: TaskId; assignee?: MemberId } }
+  | { type: 'task_updated'; data: { task: TaskId; patch: TaskPatch } }
   | { type: 'subtasks_replaced'; data: { task: TaskId; subtasks: Subtask[] } }
   | { type: 'dispatch_started'; data: { dispatch: Dispatch } }
   | {
@@ -402,6 +419,7 @@ export const EVENT_TYPES = [
   'task_created',
   'task_moved',
   'task_assigned',
+  'task_updated',
   'subtasks_replaced',
   'dispatch_started',
   'dispatch_finished',
