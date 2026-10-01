@@ -235,6 +235,72 @@ fn gives_up_on_a_daemon_that_never_answers() {
     assert_eq!(server.wait_for_requests(1).len(), 1);
 }
 
+// The chain mechanism (`crate::hook::run_chained`) is a single, OS-independent code path —
+// `std::process::Command::new(program).args(rest)`, no shell, no `cmd.exe` on either platform —
+// so there is no separate Windows branch to exercise. This integration test, run for real on
+// Unix (where this suite runs), is the whole exercise; it is gated `cfg(unix)` only because
+// building the fake original as an executable shell script needs `chmod`, not because the
+// `--chain` logic itself differs on Windows.
+#[cfg(unix)]
+#[test]
+fn chain_runs_the_recorded_original_with_the_exact_payload_codex_passed() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let server = accepting();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let codex_home = tmp.path();
+    let captured = codex_home.join("captured.txt");
+
+    // Stands in for whatever `notify` named before `install --chain` recorded it.
+    let fake_original = codex_home.join("fake-original.sh");
+    std::fs::write(
+        &fake_original,
+        format!("#!/bin/sh\nprintf '%s' \"$1\" > '{}'\n", captured.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_original, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // What `install --chain` would have written to the sidecar.
+    let record = json!({
+        "values": [fake_original.to_str().unwrap()],
+        "toml": "[\"terminal-notifier\"]",
+    });
+    std::fs::write(
+        codex_home.join("pitcrew-notify-original.json"),
+        record.to_string(),
+    )
+    .unwrap();
+
+    let notify_payload = r#"{"type":"agent-turn-complete","turn-id":"1"}"#;
+    let env = [
+        ("PITCREW_URL", server.url.as_str()),
+        ("PITCREW_TOKEN", TOKEN),
+        ("CODEX_HOME", codex_home.to_str().unwrap()),
+    ];
+    let (output, _) = hook(&["codex", "notify", "--chain", notify_payload], &env, None);
+    assert_silent_success(&output);
+
+    // Our own hook still got delivered.
+    let requests = server.wait_for_requests(1);
+    assert_eq!(requests[0].route(), "POST /v1/hooks/codex/notify");
+    assert_eq!(requests[0].body, notify_payload.as_bytes());
+
+    // The original received the exact same payload, as its one argument. Polled: the original is
+    // spawned detached and never waited on, by design (so a slow one can't hold up the hook).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut seen = String::new();
+    while Instant::now() < deadline {
+        if let Ok(s) = std::fs::read_to_string(&captured)
+            && !s.is_empty()
+        {
+            seen = s;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(seen, notify_payload);
+}
+
 #[cfg(unix)]
 #[test]
 fn over_a_socket_only_a_private_one_gets_the_token() {

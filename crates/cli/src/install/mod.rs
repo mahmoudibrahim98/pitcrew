@@ -100,10 +100,12 @@ pub(crate) struct Change {
     before: Option<Vec<u8>>,
     /// Its content after the change; meaningless when `delete` is set.
     after: Vec<u8>,
-    /// Remove the file instead of writing `after` (OpenCode uninstall; the Codex chain wrapper
-    /// and its sidecar).
+    /// Remove the file instead of writing `after` (OpenCode uninstall; the Codex chain's
+    /// sidecar, on uninstall).
     delete: bool,
-    /// Set the file's permissions so it can be run directly (the Unix chain wrapper).
+    /// Set the file's permissions so it can be run directly. Unused today (nothing this module
+    /// writes needs to be executable since the Codex chain stopped using a wrapper script), kept
+    /// so `apply_change` already does the right thing if that ever changes again.
     executable: bool,
 }
 
@@ -170,10 +172,38 @@ fn exe_path(env: Env<'_>) -> Result<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Whether `word` safely names a single program and nothing else: either wrapped start-to-end in
+/// one matching pair of quotes (`'…'` or `"…"`), or free of whitespace and of the characters a
+/// shell gives a second meaning to (`; & | < > ( ) $` and a backtick). Without this check,
+/// `quoted_word_file_name`'s "take the last path segment" would read the program name out of
+/// something like `afplay ding.aiff; ~/bin/pitcrew` — a multi-word foreign command that merely
+/// ends by mentioning `pitcrew` — and wrongly call it ours.
+#[must_use]
+pub(crate) fn is_single_shell_word(word: &str) -> bool {
+    if word.len() >= 2 {
+        let bytes = word.as_bytes();
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'\'' && last == b'\'') || (first == b'"' && last == b'"') {
+            return true;
+        }
+    }
+    !word.is_empty()
+        && !word.bytes().any(|b| {
+            b.is_ascii_whitespace()
+                || matches!(
+                    b,
+                    b';' | b'&' | b'|' | b'<' | b'>' | b'(' | b')' | b'$' | b'`'
+                )
+        })
+}
+
 /// The file name of the program a (possibly quoted) command-line word names, case-insensitively
 /// comparable: used to check that a hook's program is actually `pitcrew`/`pitcrew.exe`, not just
 /// some other command that happens to end the same way. Understands the two quoting styles this
 /// module itself writes (`'…'` with `'\''`, `"…"` with `""`); an unquoted word is taken as-is.
+/// Callers that have not already checked [`is_single_shell_word`] should: this function alone
+/// does not protect against a multi-word command that merely ends by mentioning a path.
 #[must_use]
 pub(crate) fn quoted_word_file_name(word: &str) -> String {
     let inner = if word.len() >= 2 && word.starts_with('\'') && word.ends_with('\'') {
@@ -212,36 +242,6 @@ pub(crate) fn shell_quote_unix(s: &str) -> String {
         s.to_owned()
     } else {
         format!("'{}'", s.replace('\'', r"'\''"))
-    }
-}
-
-/// Characters that are special to `cmd.exe` outside of quotes, and still special to it even
-/// *inside* double quotes (`cmd.exe`'s quoting only ever protects whitespace from the argument
-/// parser that hands words to the program being run; its own line parser reads `& | < > ^ ( )`
-/// first, before any program ever sees the line). `%` is deliberately not here: it is handled by
-/// doubling, below, not by quoting — quoting alone never protects a literal `%`, and checking for
-/// it *after* already doubling it would see the just-added second `%` and (wrongly) decide
-/// quoting was still needed.
-fn is_cmd_metacharacter(b: u8) -> bool {
-    matches!(b, b'&' | b'|' | b'<' | b'>' | b'^' | b'(' | b')')
-}
-
-/// Quotes one argument for a `cmd.exe` batch file: `%` is doubled first (the only way to produce
-/// a literal `%` — quoting alone does not protect it), then the whole thing is wrapped in double
-/// quotes if it contains whitespace, a quote, or any of `cmd.exe`'s other metacharacters
-/// (`& | < > ^ ( )`), none of which quoting alone makes safe either, but `cmd.exe` does at least
-/// leave them alone once it is inside a quoted string (unlike `%`).
-#[must_use]
-pub(crate) fn cmd_quote_windows(s: &str) -> String {
-    let escaped = s.replace('%', "%%");
-    if !escaped.is_empty()
-        && !escaped
-            .bytes()
-            .any(|b| matches!(b, b' ' | b'\t' | b'"') || is_cmd_metacharacter(b))
-    {
-        escaped
-    } else {
-        format!("\"{}\"", escaped.replace('"', "\"\""))
     }
 }
 
@@ -370,6 +370,15 @@ fn plan_uninstall(target: Target, env: Env<'_>) -> Plan {
         Target::OpenCode => opencode::plan_uninstall(env),
     };
     unwrap_or_conflict(target, result)
+}
+
+/// The original `notify` command recorded when Codex's `notify` was chained (`install --chain`),
+/// for `pitcrew hook codex notify --chain` to run after delivering our own hook. `None` if there
+/// is no chain, or its record cannot be read — silently: a hook must never fail loudly just
+/// because the thing it forwards to is briefly unavailable.
+#[must_use]
+pub(crate) fn codex_chained_original(env: Env<'_>) -> Option<Vec<String>> {
+    codex::chained_original(env)
 }
 
 fn write_err(e: std::io::Error) -> Error {
@@ -653,15 +662,25 @@ fn unpredictable_suffix() -> u64 {
     nanos ^ (u64::from(std::process::id())).rotate_left(32) ^ addr
 }
 
-fn sync_file(path: &Path) -> Result<()> {
-    std::fs::File::open(path)
-        .and_then(|f| f.sync_all())
+/// Syncs a handle data was just written through. Not `std::fs::File::open(path)` followed by
+/// `sync_all` on *that* new handle: on Windows, `FlushFileBuffers` (what `sync_all` calls there)
+/// needs a handle opened for writing, and `File::open` opens read-only — every sync would
+/// silently do nothing, or fail, there, unlike POSIX `fsync`, which does not care which mode the
+/// fd was opened with.
+fn sync_handle(f: &std::fs::File, path: &Path) -> Result<()> {
+    f.sync_all()
         .map_err(|e| Error::internal(format!("cannot sync {}: {e}", path.display())))
 }
 
+/// Syncs a directory by opening it (read-only is correct and the only option here: a directory
+/// itself cannot be opened for writing) and flushing that handle. POSIX-only: `sync_handle`'s
+/// Windows caveat does not apply to a plain directory sync the way it does to a file we wrote
+/// through, and Windows has no equivalent operation to perform here anyway.
 #[cfg(unix)]
 fn sync_dir(dir: &Path) -> Result<()> {
-    sync_file(dir)
+    std::fs::File::open(dir)
+        .map_err(|e| Error::internal(format!("cannot open {}: {e}", dir.display())))
+        .and_then(|f| sync_handle(&f, dir))
 }
 #[cfg(not(unix))]
 fn sync_dir(_dir: &Path) -> Result<()> {
@@ -686,7 +705,12 @@ fn our_backups(path: &Path) -> Vec<PathBuf> {
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(&prefix))
+                .and_then(|n| n.strip_prefix(&prefix))
+                // Only our own timestamp suffix (all digits) — never anything a person or
+                // another tool happened to name starting the same way.
+                .is_some_and(|suffix| {
+                    !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit())
+                })
         })
         .collect();
     found.sort(); // the millis suffix sorts chronologically as text; newest last
@@ -704,15 +728,20 @@ fn prune_backups(path: &Path) {
     }
 }
 
-/// Re-reads `path` and backs it up (if it exists), syncing the backup to disk, before any write
-/// is attempted — the caller still must confirm this matches what the plan was built from.
+/// Re-reads `path` and backs it up (if it exists) — privately (0600 on Unix: `settings.json` can
+/// hold API keys under `env`, same as the file it is a copy of) — syncing the backup to disk,
+/// before any write is attempted. The caller still must confirm this matches what the plan was
+/// built from.
 fn read_and_back_up(path: &Path, target: &Path) -> Result<Option<Vec<u8>>> {
     let now = read_optional(target)?;
     if let Some(bytes) = &now {
         let backup = sibling(path, &format!(".pitcrew-backup-{}", now_millis()));
-        std::fs::write(&backup, bytes)
+        let mut f = create_private(&backup)?;
+        use std::io::Write as _;
+        f.write_all(bytes)
             .map_err(|e| Error::internal(format!("cannot back up to {}: {e}", backup.display())))?;
-        sync_file(&backup)?;
+        sync_handle(&f, &backup)?;
+        drop(f);
         prune_backups(path);
     }
     Ok(now)
@@ -753,21 +782,23 @@ fn apply_change(c: &Change) -> Result<()> {
         &target,
         &format!(".pitcrew-tmp-{:016x}", unpredictable_suffix()),
     );
-    let result = create_private(&tmp)
-        .and_then(|mut f| {
-            use std::io::Write as _;
-            f.write_all(&c.after)
-                .map_err(|e| Error::internal(format!("cannot write {}: {e}", tmp.display())))
-        })
-        .and_then(|()| copy_permissions(&target, &tmp))
-        .and_then(|()| {
-            if c.executable {
-                make_executable(&tmp)
-            } else {
-                Ok(())
-            }
-        })
-        .and_then(|()| sync_file(&tmp))
+    // Written, permissioned and synced through one handle — synced before it is closed, and
+    // closed (dropped) before the rename: Windows cannot replace a file through a still-open
+    // handle to it the way Unix can.
+    let write_then_close: Result<()> = (|| {
+        let mut f = create_private(&tmp)?;
+        use std::io::Write as _;
+        f.write_all(&c.after)
+            .map_err(|e| Error::internal(format!("cannot write {}: {e}", tmp.display())))?;
+        copy_permissions(&target, &tmp)?;
+        if c.executable {
+            make_executable(&tmp)?;
+        }
+        sync_handle(&f, &tmp)?;
+        drop(f);
+        Ok(())
+    })();
+    let result = write_then_close
         .and_then(|()| {
             std::fs::rename(&tmp, &target)
                 .map_err(|e| Error::internal(format!("cannot replace {}: {e}", target.display())))
@@ -794,29 +825,20 @@ mod tests {
     }
 
     #[test]
-    fn windows_quoting_handles_spaces_and_quotes() {
-        assert_eq!(
-            cmd_quote_windows(r"C:\Users\sam\pitcrew.exe"),
-            r"C:\Users\sam\pitcrew.exe"
-        );
-        assert_eq!(
-            cmd_quote_windows(r"C:\Program Files\PitCrew\pitcrew.exe"),
+    fn is_single_shell_word_rejects_a_multi_word_command() {
+        assert!(is_single_shell_word("/usr/bin/pitcrew"));
+        assert!(is_single_shell_word("'/home/sam/my apps/pitcrew'"));
+        assert!(is_single_shell_word(
             "\"C:\\Program Files\\PitCrew\\pitcrew.exe\""
-        );
-        assert_eq!(cmd_quote_windows("a\"b"), "\"a\"\"b\"");
-    }
-
-    #[test]
-    fn windows_quoting_doubles_percent_and_quotes_metacharacters() {
-        assert_eq!(cmd_quote_windows("100%"), "100%%");
-        assert_eq!(cmd_quote_windows("a&b"), "\"a&b\"");
-        assert_eq!(cmd_quote_windows("a|b"), "\"a|b\"");
-        assert_eq!(cmd_quote_windows("a^b"), "\"a^b\"");
-        assert_eq!(cmd_quote_windows("a(b)"), "\"a(b)\"");
-        assert_eq!(cmd_quote_windows("a<b>c"), "\"a<b>c\"");
-        // A literal `%` still needs doubling even once the whole thing is quoted for a different
-        // reason (cmd.exe expands `%...%` inside a quoted string too).
-        assert_eq!(cmd_quote_windows("50% off"), "\"50%% off\"");
+        ));
+        // The injection this guards against: a foreign, multi-word command that merely ends by
+        // mentioning a path.
+        assert!(!is_single_shell_word("afplay ding.aiff; ~/bin/pitcrew"));
+        assert!(!is_single_shell_word("echo hi && /bin/pitcrew"));
+        assert!(!is_single_shell_word("/bin/pitcrew | tee log"));
+        assert!(!is_single_shell_word("$(echo /bin/pitcrew)"));
+        assert!(!is_single_shell_word("`echo /bin/pitcrew`"));
+        assert!(!is_single_shell_word(""));
     }
 
     #[test]
@@ -911,6 +933,15 @@ mod tests {
         let backups = our_backups(&path);
         assert_eq!(backups.len(), 1);
         assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), "old");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&backups[0]).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "settings.json may hold secrets under env; the backup must too"
+            );
+        }
         // No leftover temp file.
         let leftover: Vec<_> = std::fs::read_dir(tmp.path())
             .unwrap()
@@ -940,6 +971,34 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         assert_eq!(our_backups(&path).len(), MAX_BACKUPS);
+    }
+
+    #[test]
+    fn a_file_merely_starting_like_a_backup_is_never_counted_or_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, b"v0").unwrap();
+        // Not ours: the suffix is not our all-digits timestamp.
+        let foreign = tmp
+            .path()
+            .join("settings.json.pitcrew-backup-from-someone-else");
+        std::fs::write(&foreign, b"not ours").unwrap();
+        for i in 1..=(MAX_BACKUPS + 3) {
+            let change = Change {
+                path: path.clone(),
+                before: Some(format!("v{}", i - 1).into_bytes()),
+                after: format!("v{i}").into_bytes(),
+                delete: false,
+                executable: false,
+            };
+            apply_change(&change).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(our_backups(&path).len(), MAX_BACKUPS);
+        assert!(
+            foreign.exists(),
+            "pruning must never touch a file that is not ours"
+        );
     }
 
     #[cfg(unix)]

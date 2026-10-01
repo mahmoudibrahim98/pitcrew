@@ -1,9 +1,15 @@
-//! `pitcrew hook <engine> <event> [payload]`: runs on every agent turn, so it must cost almost
-//! nothing and never get in the agent's way.
+//! `pitcrew hook <engine> <event> [--chain] [payload]`: runs on every agent turn, so it must cost
+//! almost nothing and never get in the agent's way.
 //!
 //! - The payload is the CLI's hook JSON: from stdin (Claude Code), or the argument after the
 //!   event (Codex's `notify` passes it that way). At most 1 MiB; a larger one is dropped.
 //! - It is `POST`ed to `/v1/hooks/{engine}/{event}` with short timeouts.
+//! - `--chain` (only ever written by `pitcrew hooks install --chain` into Codex's `notify`, as
+//!   `["<exe>", "hook", "codex", "notify", "--chain"]`) also runs whatever program `--chain`
+//!   recorded as the original `notify`, directly via [`std::process::Command`] — no shell, no
+//!   `cmd.exe` — with its own recorded arguments and the same payload Codex gave us, appended
+//!   exactly as Codex itself appends it. It is spawned, not waited on, so a slow or hanging
+//!   original notifier can never make a hook run over [`DEADLINE`] or block the agent.
 //! - The caller (`main`) always exits 0 and prints nothing, whatever happens here, and stops the
 //!   process after [`DEADLINE`] even if the daemon hangs.
 
@@ -35,12 +41,12 @@ pub fn run(
     stdin: &mut dyn Read,
     stdin_is_terminal: bool,
 ) -> Result<()> {
-    let (engine, event, payload) = parse_args(args)?;
+    let (engine, event, chain, payload) = parse_args(args)?;
     // Nothing to do without a token or a daemon; check before touching stdin.
     let token = token_from_env(env)?;
     let endpoint = Endpoint::from_env(env)?;
-    let body = match payload {
-        Some(payload) => payload.into_bytes(),
+    let body = match &payload {
+        Some(payload) => payload.clone().into_bytes(),
         None if stdin_is_terminal => Vec::new(),
         None => read_capped(stdin)?,
     };
@@ -55,17 +61,49 @@ pub fn run(
         token: Some(&token),
         body: Some(&body),
     };
-    let response = http::exchange(&mut conn, &request, 64 * 1024)
-        .map_err(|e| Error::internal(format!("POST {target}: {e}")))?;
-    if response.is_success() {
-        Ok(())
-    } else {
-        Err(Error::from_response(response.status, &response.body))
+    let result = http::exchange(&mut conn, &request, 64 * 1024)
+        .map_err(|e| Error::internal(format!("POST {target}: {e}")));
+
+    if chain {
+        run_chained(env, payload.as_deref());
+    }
+
+    match result? {
+        response if response.is_success() => Ok(()),
+        response => Err(Error::from_response(response.status, &response.body)),
     }
 }
 
-/// `<engine> <event> [payload]`, checked as the API checks them.
-fn parse_args(args: &[OsString]) -> Result<(String, String, Option<String>)> {
+/// Runs whatever `install --chain` recorded as the original `notify`, if any: spawned, never
+/// waited on, so a slow or hanging original notifier can never make this hook run over
+/// [`DEADLINE`]. Silent by design, like every other way this hook can fail to deliver — the
+/// caller only ever sees `--chain`'s effect on `notify` itself, never a reason it didn't run.
+fn run_chained(env: Env<'_>, payload: Option<&str>) {
+    let Some(original) = crate::install::codex_chained_original(env) else {
+        return;
+    };
+    let Some((program, rest)) = original.split_first() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(rest);
+    if let Some(payload) = payload {
+        cmd.arg(payload);
+    }
+    // Not inherited: a spawned child keeps an inherited stdout/stderr pipe open for as long as
+    // it runs, which would make whoever is reading *our* output (Codex, a test harness) wait for
+    // the original notifier to exit too, defeating "the hook always exits quickly".
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let _ = cmd.spawn();
+}
+
+/// `<engine> <event> [--chain] [payload]`, checked as the API checks them. `--chain` (only ever
+/// written by us, right after `<event>`) is accepted for any engine/event — it only *does*
+/// anything for `codex notify`, where a recorded original exists; elsewhere `run_chained` finds
+/// none and is a no-op.
+fn parse_args(args: &[OsString]) -> Result<(String, String, bool, Option<String>)> {
     let text = |i: usize, what: &str| -> Result<Option<String>> {
         args.get(i)
             .map(|a| {
@@ -75,11 +113,13 @@ fn parse_args(args: &[OsString]) -> Result<(String, String, Option<String>)> {
             })
             .transpose()
     };
-    let usage = || Error::invalid("usage: pitcrew hook <engine> <event> [payload]");
+    let usage = || Error::invalid("usage: pitcrew hook <engine> <event> [--chain] [payload]");
     let engine = text(0, "engine")?.ok_or_else(usage)?.to_ascii_lowercase();
     let event = text(1, "event")?.ok_or_else(usage)?;
-    let payload = text(2, "payload")?;
-    if args.len() > 3 {
+    let chain = args.get(2).and_then(|a| a.to_str()) == Some("--chain");
+    let payload_index = if chain { 3 } else { 2 };
+    let payload = text(payload_index, "payload")?;
+    if args.len() > payload_index + 1 {
         return Err(usage());
     }
     serde_json::from_value::<Engine>(serde_json::Value::String(engine.clone()))
@@ -87,7 +127,7 @@ fn parse_args(args: &[OsString]) -> Result<(String, String, Option<String>)> {
     if !is_event_name(&event) {
         return Err(Error::invalid(format!("malformed event name {event:?}")));
     }
-    Ok((engine, event, payload))
+    Ok((engine, event, chain, payload))
 }
 
 /// `[A-Za-z][A-Za-z0-9_-]{0,63}`.
@@ -132,13 +172,15 @@ mod tests {
 
     #[test]
     fn arguments_are_checked_like_the_api_does() {
-        let (engine, event, payload) = parse_args(&args(&["Claude", "SessionStart"])).unwrap();
+        let (engine, event, chain, payload) =
+            parse_args(&args(&["Claude", "SessionStart"])).unwrap();
         assert_eq!(
-            (engine.as_str(), event.as_str()),
-            ("claude", "SessionStart")
+            (engine.as_str(), event.as_str(), chain),
+            ("claude", "SessionStart", false)
         );
         assert!(payload.is_none());
-        let (_, _, payload) = parse_args(&args(&["codex", "notify", "{\"a\":1}"])).unwrap();
+        let (_, _, chain, payload) = parse_args(&args(&["codex", "notify", "{\"a\":1}"])).unwrap();
+        assert!(!chain);
         assert_eq!(payload.as_deref(), Some("{\"a\":1}"));
 
         for bad in [
@@ -149,11 +191,32 @@ mod tests {
             &["claude"],
             &[],
             &["claude", "Stop", "{}", "extra"],
+            &["codex", "notify", "--chain", "{}", "extra"],
         ] {
             assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
         }
         assert!(is_event_name(&"a".repeat(64)));
         assert!(!is_event_name(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn chain_flag_is_recognised_right_after_the_event_and_only_there() {
+        let (_, _, chain, payload) =
+            parse_args(&args(&["codex", "notify", "--chain", "{\"a\":1}"])).unwrap();
+        assert!(chain);
+        assert_eq!(payload.as_deref(), Some("{\"a\":1}"));
+
+        // No payload at all, just --chain.
+        let (_, _, chain, payload) = parse_args(&args(&["codex", "notify", "--chain"])).unwrap();
+        assert!(chain);
+        assert!(payload.is_none());
+
+        // --chain is recognised positionally for any engine/event, not just codex/notify (it
+        // only ever *does* anything when a chain is actually recorded for codex); harmless
+        // elsewhere, since `run_chained` then simply finds nothing to run.
+        let (_, _, chain, payload) = parse_args(&args(&["claude", "Stop", "--chain"])).unwrap();
+        assert!(chain);
+        assert!(payload.is_none());
     }
 
     #[test]

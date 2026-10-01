@@ -8,24 +8,24 @@
 //! these five specifically, so this is the conservative, documented-elsewhere default.
 //!
 //! **Ownership is decided per inner hook, by its `command`**, never by the raw text of a whole
-//! matcher group: a hook is ours exactly when its `command` ends in the literal text
-//! ` hook claude <Event>` *and* the program named before that (unquoted, and stripped to its file
-//! name) is exactly `pitcrew` or `pitcrew.exe` — not merely "any command that happens to end the
-//! same way", which a person's own hook could coincidentally do. `uninstall` deletes a whole
-//! matcher group only when it is *exactly* our shape (`matcher: ""`, and that one hook is our
-//! only hook); otherwise it removes just our one hook from inside the group, leaving every other
-//! hook, and the group itself, untouched.
+//! matcher group, and never by a single trailing path segment of a multi-word command: a hook is
+//! ours exactly when its `command` ends in the literal text ` hook claude <Event>`, the text
+//! before that names a single program — fully quoted, or free of whitespace and of the characters
+//! a shell gives a second meaning to (so `afplay ding.aiff; ~/bin/pitcrew hook claude Stop`
+//! cannot be read as naming `pitcrew`) — and that program's file name is exactly `pitcrew` or
+//! `pitcrew.exe`. `uninstall` deletes a whole matcher group only when it is *exactly* our shape
+//! (`matcher: ""`, and that one hook is our only hook); otherwise it removes just our one hook
+//! from inside the group, leaving every other hook, and the group itself, untouched.
 //!
-//! **A container is only ever removed if we are the one who created it.** Whether `"hooks"`
-//! itself, and each of the five event keys, existed before our most recent `install` is recorded
-//! in a small sidecar (`pitcrew-claude-provenance.json`, next to `settings.json`): `install`
-//! writes it whenever it creates a key from nothing, and `uninstall` consults it before cascading
-//! a now-empty array or object away, so a container the file already had — even an empty one — is
-//! never guessed at and never removed, while one we built from scratch is fully reversed, down to
-//! the key itself. Without this, uninstalling our own content could not tell "this array is empty
-//! because we just removed our only entry from it" apart from "this array was already empty
-//! before we ever touched the file" — and the first is safe to clean up, the second is not ours
-//! to remove.
+//! `uninstall` also removes an event's array, or `"hooks"` itself, once removing our content
+//! leaves it empty — the same way an empty array/object is treated everywhere else in this
+//! module. **The one known case this is not byte-identical for**: if an event's array, or
+//! `"hooks"`, already existed and was already empty before we ever touched the file, it is
+//! removed along with our content rather than left behind empty. There is no way to tell that
+//! case apart from one where removing our own last entry is what emptied it, since both look
+//! identical by the time `uninstall` runs; an empty container and an absent key mean exactly the
+//! same thing to Claude Code either way, so nothing is actually lost, only the file's own
+//! formatting there.
 //!
 //! Re-running `install` after the executable moved updates just the stale hooks' `command` text
 //! in place (`Status::Stale` until then); it never duplicates them.
@@ -38,7 +38,6 @@ use super::jsontext::{self, Entry, Member};
 use super::{Change, Plan, Status, Target};
 use crate::config::Env;
 use crate::error::{Error, Result};
-use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
@@ -54,27 +53,6 @@ const FILE_NAME: &str = "settings.json";
 
 pub(crate) fn path(env: Env<'_>) -> Result<PathBuf> {
     Ok(super::config_dir(env, "CLAUDE_CONFIG_DIR", ".claude")?.join(FILE_NAME))
-}
-
-fn provenance_path(settings_path: &std::path::Path) -> PathBuf {
-    settings_path.with_file_name("pitcrew-claude-provenance.json")
-}
-
-/// Which of `"hooks"` and our five events did not exist in `settings.json` before our most
-/// recent `install` — accumulated across repeated installs, so installing two events today and
-/// three more next week still remembers all five as ours to clean up later.
-#[derive(Serialize, Deserialize, Default)]
-struct Provenance {
-    hooks_created: bool,
-    events_created: Vec<String>,
-}
-
-fn provenance_json(p: &Provenance) -> String {
-    serde_json::to_string_pretty(p).unwrap_or_default()
-}
-
-fn parse_provenance(bytes: &[u8]) -> Option<Provenance> {
-    serde_json::from_slice(bytes).ok()
 }
 
 /// Quotes the executable's path for Claude Code's `command` field: **always** wrapped in quotes
@@ -103,15 +81,16 @@ fn matcher_object(exe: &str, event: &str) -> String {
 }
 
 /// Whether one inner hook's already-unescaped `command` text is ours: it ends in the literal
-/// marker ` hook claude <Event>`, and the program named just before that — unquoted, and reduced
-/// to its file name — is exactly `pitcrew` or `pitcrew.exe`. The program-name check is what keeps
-/// a person's own hook, that happens to end with the same words, from being claimed as ours.
+/// marker ` hook claude <Event>`, the text before that is a single program reference (not a
+/// multi-word shell command that merely ends by mentioning one), and that program's file name —
+/// unquoted, reduced to its last path segment — is exactly `pitcrew` or `pitcrew.exe`.
 fn command_is_ours(command: &str, event: &str) -> bool {
     let suffix = format!(" hook claude {event}");
     let Some(exe_part) = command.strip_suffix(&suffix) else {
         return false;
     };
-    super::is_our_exe_name(&super::quoted_word_file_name(exe_part))
+    super::is_single_shell_word(exe_part)
+        && super::is_our_exe_name(&super::quoted_word_file_name(exe_part))
 }
 
 fn braces(indent: &str, inner: &str) -> String {
@@ -382,40 +361,21 @@ enum EventState {
     Stale,
 }
 
-struct EventInfo {
-    state: EventState,
-    /// Whether this event's key already existed (with any array, even empty) before this call.
-    key_existed: bool,
-}
-
-/// Checks the existing structure without changing anything: whether `"hooks"` already existed,
-/// and for each event, whether its key already existed and whether it already has one of our
-/// hooks — and if so, whether it names the current executable or an old path.
-fn inspect(doc: &str, exe: &str) -> Result<(bool, Vec<EventInfo>)> {
+/// Checks the existing structure without changing anything: which events already have one of our
+/// hooks, and whether it names the current executable or an old path.
+fn inspect(doc: &str, exe: &str) -> Result<Vec<EventState>> {
     let bytes = doc.as_bytes();
-    let hooks_obj = parse_checked(doc)?;
-    let hooks_existed = hooks_obj.is_some();
-    let Some(hooks_obj) = hooks_obj else {
-        let infos = EVENTS
-            .iter()
-            .map(|_| EventInfo {
-                state: EventState::Missing,
-                key_existed: false,
-            })
-            .collect();
-        return Ok((false, infos));
+    let Some(hooks_obj) = parse_checked(doc)? else {
+        return Ok(EVENTS.iter().map(|_| EventState::Missing).collect());
     };
-    let mut infos = Vec::with_capacity(EVENTS.len());
+    let mut states = Vec::with_capacity(EVENTS.len());
     for event in EVENTS {
         let Some(m) = hooks_obj.members.iter().find(|m| m.key == event) else {
-            infos.push(EventInfo {
-                state: EventState::Missing,
-                key_existed: false,
-            });
+            states.push(EventState::Missing);
             continue;
         };
         let arr = jsontext::array(bytes, m.entry.value_start);
-        let state = match find_ours(bytes, &arr, event) {
+        states.push(match find_ours(bytes, &arr, event) {
             None => EventState::Missing,
             Some(found)
                 if command_matches_current(bytes, found.command_value.value_start, exe, event) =>
@@ -423,13 +383,9 @@ fn inspect(doc: &str, exe: &str) -> Result<(bool, Vec<EventInfo>)> {
                 EventState::Fresh
             }
             Some(_) => EventState::Stale,
-        };
-        infos.push(EventInfo {
-            state,
-            key_existed: true,
         });
     }
-    Ok((hooks_existed, infos))
+    Ok(states)
 }
 
 fn read_text(path: &std::path::Path) -> Result<(Option<Vec<u8>>, String, bool)> {
@@ -452,59 +408,22 @@ fn conflicting(detail: String) -> Plan {
     }
 }
 
-/// Records `hooks_created`/`newly_created` into whatever provenance was already on disk (so two
-/// separate installs accumulate rather than overwrite each other), as a `Change` to add to the
-/// plan — `None` when there is nothing new to record.
-fn provenance_change(
-    settings_path: &std::path::Path,
-    hooks_created: bool,
-    newly_created: &[&str],
-) -> Result<Option<Change>> {
-    if !hooks_created && newly_created.is_empty() {
-        return Ok(None);
-    }
-    let provenance_path = provenance_path(settings_path);
-    let before = super::read_optional(&provenance_path)?;
-    let mut provenance = before
-        .as_deref()
-        .and_then(parse_provenance)
-        .unwrap_or_default();
-    provenance.hooks_created = provenance.hooks_created || hooks_created;
-    for event in newly_created {
-        if !provenance.events_created.iter().any(|e| e == event) {
-            provenance.events_created.push((*event).to_owned());
-        }
-    }
-    Ok(Some(Change {
-        path: provenance_path,
-        before,
-        after: provenance_json(&provenance).into_bytes(),
-        delete: false,
-        executable: false,
-    }))
-}
-
 pub(crate) fn plan_install(env: Env<'_>, exe: &str) -> Result<Plan> {
     let path = path(env)?;
     let (before, original, had_bom) = read_text(&path)?;
 
     if original.trim().is_empty() {
-        let all: Vec<&str> = EVENTS.to_vec();
-        let mut changes = vec![Change {
-            path: path.clone(),
-            before,
-            after: super::with_bom(had_bom, fresh_document(exe)).into_bytes(),
-            delete: false,
-            executable: false,
-        }];
-        if let Some(c) = provenance_change(&path, true, &all)? {
-            changes.push(c);
-        }
         return Ok(Plan {
             target: Target::Claude,
             status: Status::Missing,
             detail: format!("{} (none of the 5 events are set up)", path.display()),
-            changes,
+            changes: vec![Change {
+                path,
+                before,
+                after: super::with_bom(had_bom, fresh_document(exe)).into_bytes(),
+                delete: false,
+                executable: false,
+            }],
         });
     }
 
@@ -524,7 +443,7 @@ pub(crate) fn plan_install(env: Env<'_>, exe: &str) -> Result<Plan> {
         }
     }
 
-    let (hooks_existed, infos) = match inspect(&original, exe) {
+    let states = match inspect(&original, exe) {
         Ok(v) => v,
         Err(e) => return Ok(conflicting(format!("{}: {}", path.display(), e.message))),
     };
@@ -532,22 +451,15 @@ pub(crate) fn plan_install(env: Env<'_>, exe: &str) -> Result<Plan> {
     let missing: Vec<&str> = EVENTS
         .iter()
         .copied()
-        .zip(&infos)
-        .filter(|(_, i)| matches!(i.state, EventState::Missing))
+        .zip(&states)
+        .filter(|(_, s)| matches!(s, EventState::Missing))
         .map(|(e, _)| e)
         .collect();
     let stale: Vec<&str> = EVENTS
         .iter()
         .copied()
-        .zip(&infos)
-        .filter(|(_, i)| matches!(i.state, EventState::Stale))
-        .map(|(e, _)| e)
-        .collect();
-    let newly_created: Vec<&str> = EVENTS
-        .iter()
-        .copied()
-        .zip(&infos)
-        .filter(|(_, i)| matches!(i.state, EventState::Missing) && !i.key_existed)
+        .zip(&states)
+        .filter(|(_, s)| matches!(s, EventState::Stale))
         .map(|(e, _)| e)
         .collect();
 
@@ -591,32 +503,26 @@ pub(crate) fn plan_install(env: Env<'_>, exe: &str) -> Result<Plan> {
         ));
     }
 
-    let mut changes = vec![Change {
-        path: path.clone(),
-        before,
-        after: super::with_bom(had_bom, doc).into_bytes(),
-        delete: false,
-        executable: false,
-    }];
-    if let Some(c) = provenance_change(&path, !hooks_existed, &newly_created)? {
-        changes.push(c);
-    }
-
     Ok(Plan {
         target: Target::Claude,
         status,
         detail: format!("{} ({})", path.display(), parts.join("; ")),
-        changes,
+        changes: vec![Change {
+            path,
+            before,
+            after: super::with_bom(had_bom, doc).into_bytes(),
+            delete: false,
+            executable: false,
+        }],
     })
 }
 
 /// Removes `event`'s hook, exactly: the whole matcher group is deleted only when it is exactly
 /// our shape (`matcher: ""`, our one hook and nothing else); otherwise only our one hook is
-/// removed from inside the group's `"hooks"` array, and the group itself is left in place. If the
-/// group was removed entirely *and* `created_by_us` says this event's key did not exist before
-/// our first install, the now-empty key is removed too — fully reversing our own creation, never
-/// a container the file already had. Returns whether anything changed.
-fn remove_event(doc: &str, event: &str, created_by_us: bool) -> (String, bool) {
+/// removed from inside the group's `"hooks"` array, leaving every other hook, and the group
+/// itself, untouched. The event's whole key is then removed too if that leaves its array empty
+/// (`remove_event_key_if_empty`). Returns whether anything changed.
+fn remove_event(doc: &str, event: &str) -> (String, bool) {
     let bytes = doc.as_bytes();
     let root = jsontext::object(bytes, jsontext::skip_ws(bytes, 0));
     let Some(hooks_member) = root.members.iter().find(|m| m.key == "hooks") else {
@@ -642,25 +548,23 @@ fn remove_event(doc: &str, event: &str, created_by_us: bool) -> (String, bool) {
     } else {
         let group_el = arr.elements[found.group_index];
         let group = jsontext::object(bytes, group_el.value_start);
-        let hooks_inner_member = group
-            .members
-            .iter()
-            .find(|m| m.key == "hooks")
-            .expect("find_ours only matches inside a group that has a \"hooks\" array");
+        let Some(hooks_inner_member) = group.members.iter().find(|m| m.key == "hooks") else {
+            // Cannot happen: `find_ours` only ever matches inside a group it found a "hooks"
+            // array in. Still handled, not panicked on — this edits a person's own file.
+            return (doc.to_owned(), false);
+        };
         let inner = jsontext::array(bytes, hooks_inner_member.entry.value_start);
         jsontext::remove(doc, &inner.elements, found.hook_index)
     };
 
-    let new_doc = if created_by_us && found.exactly_ours {
-        remove_whole_event_key(&new_doc, event)
-    } else {
-        new_doc
-    };
-    (new_doc, true)
+    (remove_event_key_if_empty(&new_doc, event), true)
 }
 
-/// Removes the whole `event` member (key and array) from `"hooks"`, re-scanning fresh.
-fn remove_whole_event_key(doc: &str, event: &str) -> String {
+/// Removes the whole `event` member from `"hooks"`, but only if its array is now empty,
+/// re-scanning fresh. See the module docs for the one case this cannot tell apart from a
+/// container we created ourselves (an array that was already empty before we ever touched the
+/// file).
+fn remove_event_key_if_empty(doc: &str, event: &str) -> String {
     let bytes = doc.as_bytes();
     let root = jsontext::object(bytes, jsontext::skip_ws(bytes, 0));
     let Some(hooks_member) = root.members.iter().find(|m| m.key == "hooks") else {
@@ -670,14 +574,27 @@ fn remove_whole_event_key(doc: &str, event: &str) -> String {
         return doc.to_owned();
     }
     let hooks_obj = jsontext::object(bytes, hooks_member.entry.value_start);
+    let Some(event_member) = hooks_obj.members.iter().find(|m| m.key == event) else {
+        return doc.to_owned();
+    };
+    if bytes.get(event_member.entry.value_start) != Some(&b'[') {
+        return doc.to_owned();
+    }
+    if !jsontext::array(bytes, event_member.entry.value_start)
+        .elements
+        .is_empty()
+    {
+        return doc.to_owned();
+    }
+    let entries: Vec<Entry> = hooks_obj.members.iter().map(|m| m.entry).collect();
     let Some(idx) = hooks_obj.members.iter().position(|m| m.key == event) else {
         return doc.to_owned();
     };
-    let entries: Vec<Entry> = hooks_obj.members.iter().map(|m| m.entry).collect();
     jsontext::remove(doc, &entries, idx)
 }
 
-/// Removes `"hooks"` itself from the root, but only if it is now empty, re-scanning fresh.
+/// Removes `"hooks"` itself from the root, but only if it is now empty, re-scanning fresh. See
+/// the module docs for the one case this cannot tell apart from a container we created ourselves.
 fn remove_hooks_key_if_empty(doc: &str) -> String {
     let bytes = doc.as_bytes();
     let root = jsontext::object(bytes, jsontext::skip_ws(bytes, 0));
@@ -694,11 +611,9 @@ fn remove_hooks_key_if_empty(doc: &str) -> String {
         return doc.to_owned();
     }
     let entries: Vec<Entry> = root.members.iter().map(|m| m.entry).collect();
-    let idx = root
-        .members
-        .iter()
-        .position(|m| m.key == "hooks")
-        .expect("just found it above");
+    let Some(idx) = root.members.iter().position(|m| m.key == "hooks") else {
+        return doc.to_owned();
+    };
     jsontext::remove(doc, &entries, idx)
 }
 
@@ -721,26 +636,16 @@ pub(crate) fn plan_uninstall(env: Env<'_>) -> Result<Plan> {
         return Ok(conflicting(format!("{}: {}", path.display(), e.message)));
     }
 
-    let provenance_path = provenance_path(&path);
-    let provenance_before = super::read_optional(&provenance_path)?;
-    let provenance = provenance_before
-        .as_deref()
-        .and_then(parse_provenance)
-        .unwrap_or_default();
-
     let mut doc = original.clone();
     let mut removed = 0usize;
     for event in EVENTS {
-        let created_by_us = provenance.events_created.iter().any(|e| e == event);
-        let (new_doc, did) = remove_event(&doc, event, created_by_us);
+        let (new_doc, did) = remove_event(&doc, event);
         doc = new_doc;
         if did {
             removed += 1;
         }
     }
-    if provenance.hooks_created {
-        doc = remove_hooks_key_if_empty(&doc);
-    }
+    doc = remove_hooks_key_if_empty(&doc);
 
     if removed == 0 {
         return Ok(missing_plan(path));
@@ -750,27 +655,17 @@ pub(crate) fn plan_uninstall(env: Env<'_>) -> Result<Plan> {
     } else {
         Status::Partial
     };
-    let mut changes = vec![Change {
-        path: path.clone(),
-        before,
-        after: super::with_bom(had_bom, doc).into_bytes(),
-        delete: false,
-        executable: false,
-    }];
-    if provenance_before.is_some() {
-        changes.push(Change {
-            path: provenance_path,
-            before: provenance_before,
-            after: Vec::new(),
-            delete: true,
-            executable: false,
-        });
-    }
     Ok(Plan {
         target: Target::Claude,
         status,
         detail: format!("{} (removing {removed} of 5 events)", path.display()),
-        changes,
+        changes: vec![Change {
+            path,
+            before,
+            after: super::with_bom(had_bom, doc).into_bytes(),
+            delete: false,
+            executable: false,
+        }],
     })
 }
 
@@ -818,6 +713,7 @@ mod tests {
         let env = env_of(&[("CLAUDE_CONFIG_DIR", tmp.path().to_str().unwrap())]);
         let plan = plan_install(&env, EXE).unwrap();
         assert!(plan.status == Status::Missing);
+        assert_eq!(plan.changes.len(), 1);
         let after = String::from_utf8(plan.changes[0].after.clone()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&after).unwrap();
         assert_eq!(
@@ -849,8 +745,8 @@ mod tests {
         assert_eq!(value["hooks"]["SessionStart"][0]["matcher"], "");
         apply(&plan);
 
-        // Uninstalling restores the original file exactly: "hooks" and "PreToolUse" pre-existed,
-        // so they stay; the five event keys we created from nothing are fully removed again.
+        // Uninstalling restores the original file exactly: "hooks" and "PreToolUse" survive
+        // (they are not empty — PreToolUse is still there), so nothing about them is touched.
         let plan = plan_uninstall(&env).unwrap();
         let restored = String::from_utf8(plan.changes[0].after.clone()).unwrap();
         assert_eq!(restored, original);
@@ -860,22 +756,19 @@ mod tests {
     fn round_trip_removes_everything_it_added_from_scratch() {
         let tmp = tempfile::tempdir().unwrap();
         let env = env_of(&[("CLAUDE_CONFIG_DIR", tmp.path().to_str().unwrap())]);
+        let path = path(&env).unwrap();
 
         let plan = plan_install(&env, EXE).unwrap();
-        assert_eq!(plan.changes.len(), 2, "config + provenance");
+        assert_eq!(plan.changes.len(), 1, "no sidecar file, ever");
         apply(&plan);
 
         let plan = plan_uninstall(&env).unwrap();
+        assert_eq!(plan.changes.len(), 1);
         let restored = String::from_utf8(plan.changes[0].after.clone()).unwrap();
-        // Nothing existed before install, so a full uninstall leaves nothing meaningful: "hooks"
-        // was entirely our own creation, so it is fully removed again, down to the key.
+        // Nothing existed before install, so a full uninstall leaves nothing meaningful.
         let value: serde_json::Value = serde_json::from_str(&restored).unwrap();
         assert!(value.as_object().unwrap().is_empty(), "{restored}");
-        apply(&plan);
-        assert!(
-            !provenance_path(&path(&env).unwrap()).exists(),
-            "the sidecar must be cleaned up too"
-        );
+        let _ = path;
     }
 
     #[test]
@@ -933,8 +826,79 @@ mod tests {
         let stop_hooks = after["hooks"]["Stop"][0]["hooks"].as_array().unwrap();
         assert_eq!(stop_hooks.len(), 1, "{restored}");
         assert_eq!(stop_hooks[0]["command"], "echo also-run-this");
-        // Every other event, untouched by hand, is removed entirely (we created all of them).
+        // Every other event, untouched by hand, is removed entirely (we created all of them, and
+        // removing our only hook left them empty).
         assert!(after["hooks"]["SessionStart"].is_null(), "{restored}");
+    }
+
+    #[test]
+    fn a_users_separate_matcher_group_in_the_same_event_survives_uninstall() {
+        // A fresh install, then a *second*, separate matcher group added to the same event — not
+        // merged into ours (the previous test), a whole extra group alongside it. This is exactly
+        // the blocker the provenance sidecar introduced: deleting the user's own group because
+        // the event key was "ours to clean up" according to a sidecar that did not know about the
+        // group itself.
+        let tmp = tempfile::tempdir().unwrap();
+        let env = env_of(&[("CLAUDE_CONFIG_DIR", tmp.path().to_str().unwrap())]);
+        let path = path(&env).unwrap();
+
+        let plan = plan_install(&env, EXE).unwrap();
+        apply(&plan);
+        let installed = std::fs::read_to_string(&path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&installed).unwrap();
+        value["hooks"]["Stop"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "matcher": "",
+                "hooks": [{"type": "command", "command": "echo user-own-group"}]
+            }));
+        std::fs::write(&path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+
+        let plan = plan_uninstall(&env).unwrap();
+        let restored = String::from_utf8(plan.changes[0].after.clone()).unwrap();
+        let after: serde_json::Value = serde_json::from_str(&restored).unwrap();
+        let stop = after["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1, "{restored}");
+        assert_eq!(stop[0]["hooks"][0]["command"], "echo user-own-group");
+    }
+
+    #[test]
+    fn user_edits_made_after_install_are_never_lost_by_uninstall() {
+        // The file is installed, then a person edits *other* parts of it by hand before
+        // uninstalling — a new unrelated top-level key, and a changed value in content that
+        // pre-existed install. None of that may be lost.
+        let original =
+            "{\n  \"approvals\": \"never\",\n  \"hooks\": {\n    \"PreToolUse\": []\n  }\n}\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, original).unwrap();
+        let env = env_of(&[("CLAUDE_CONFIG_DIR", tmp.path().to_str().unwrap())]);
+
+        let plan = plan_install(&env, EXE).unwrap();
+        apply(&plan);
+        let installed = std::fs::read_to_string(&path).unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&installed).unwrap();
+        value["approvals"] = serde_json::json!("always");
+        value["a_new_key_the_user_added"] = serde_json::json!(["x", "y"]);
+        let edited = serde_json::to_string_pretty(&value).unwrap();
+        std::fs::write(&path, &edited).unwrap();
+
+        let plan = plan_uninstall(&env).unwrap();
+        let restored = String::from_utf8(plan.changes[0].after.clone()).unwrap();
+        let after: serde_json::Value = serde_json::from_str(&restored).unwrap();
+        assert_eq!(after["approvals"], "always", "{restored}");
+        assert_eq!(
+            after["a_new_key_the_user_added"],
+            serde_json::json!(["x", "y"]),
+            "{restored}"
+        );
+        // "PreToolUse" (pre-existing, empty) is left exactly as it was too.
+        assert_eq!(
+            after["hooks"]["PreToolUse"],
+            serde_json::json!([]),
+            "{restored}"
+        );
     }
 
     #[test]
@@ -965,7 +929,27 @@ mod tests {
     }
 
     #[test]
-    fn a_pre_existing_empty_hooks_object_survives_uninstall() {
+    fn a_multi_word_command_ending_in_our_path_is_never_claimed_as_ours() {
+        // `afplay ding.aiff; ~/bin/pitcrew hook claude Stop` must not count as ours: the program
+        // part is not a single word.
+        assert!(!command_is_ours(
+            "afplay ding.aiff; ~/bin/pitcrew hook claude Stop",
+            "Stop"
+        ));
+        assert!(!command_is_ours(
+            "echo pwned && /bin/pitcrew hook claude Stop",
+            "Stop"
+        ));
+        // But a genuinely single, quoted path with the same ending is still recognised.
+        assert!(command_is_ours("'/bin/pitcrew' hook claude Stop", "Stop"));
+        assert!(command_is_ours("/bin/pitcrew hook claude Stop", "Stop"));
+    }
+
+    #[test]
+    fn a_pre_existing_empty_hooks_object_is_removed_same_as_absent() {
+        // Documented, accepted trade-off of dropping the provenance sidecar: an already-empty
+        // "hooks" cannot be told apart from one install's own entries emptied out, so it is
+        // removed too — an empty object and an absent key mean the same thing to Claude Code.
         let original = r#"{"hooks": {}}"#;
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
@@ -978,13 +962,13 @@ mod tests {
         let plan = plan_uninstall(&env).unwrap();
         let restored = String::from_utf8(plan.changes[0].after.clone()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&restored).unwrap();
-        // "hooks" must still be present (it pre-existed us), just empty of our events again.
-        assert!(value.get("hooks").is_some(), "{restored}");
-        assert_eq!(value["hooks"].as_object().unwrap().len(), 0, "{restored}");
+        assert!(value.as_object().unwrap().is_empty(), "{restored}");
     }
 
     #[test]
-    fn a_pre_existing_empty_event_array_survives_uninstall() {
+    fn a_pre_existing_empty_event_array_is_removed_same_as_absent() {
+        // Same documented trade-off, one level down: a pre-existing empty event array is removed
+        // too, when every other event we created from nothing is also gone.
         let original = r#"{"hooks": {"Stop": []}}"#;
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
@@ -999,17 +983,28 @@ mod tests {
         let plan = plan_uninstall(&env).unwrap();
         let restored = String::from_utf8(plan.changes[0].after.clone()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&restored).unwrap();
-        assert!(
-            value["hooks"].as_object().unwrap().contains_key("Stop"),
-            "{restored}"
-        );
-        assert_eq!(
-            value["hooks"]["Stop"].as_array().unwrap().len(),
-            0,
-            "{restored}"
-        );
-        // The four events that really were created fresh are gone entirely.
-        assert!(value["hooks"].get("SessionStart").is_none(), "{restored}");
+        assert!(value.as_object().unwrap().is_empty(), "{restored}");
+    }
+
+    #[test]
+    fn a_pre_existing_empty_event_array_among_real_content_is_also_removed() {
+        // Unaffected by whether other events around it have real content: an event array that
+        // was *already empty* is indistinguishable from one we emptied, so it goes too, even
+        // though "hooks" itself survives (PreToolUse keeps it non-empty).
+        let original = r#"{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo hi"}]}], "Stop": []}}"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, original).unwrap();
+        let env = env_of(&[("CLAUDE_CONFIG_DIR", tmp.path().to_str().unwrap())]);
+
+        let plan = plan_install(&env, EXE).unwrap();
+        apply(&plan);
+
+        let plan = plan_uninstall(&env).unwrap();
+        let restored = String::from_utf8(plan.changes[0].after.clone()).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&restored).unwrap();
+        assert!(value["hooks"].get("Stop").is_none(), "{restored}");
+        assert!(value["hooks"].get("PreToolUse").is_some(), "{restored}");
     }
 
     #[test]

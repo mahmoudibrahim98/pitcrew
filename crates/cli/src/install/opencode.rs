@@ -13,15 +13,21 @@
 //! and reported as a conflict — pick a different plugin file name is the only other auto-wired-in
 //! option OpenCode gives us, so we leave the choice to the person.
 //!
-//! The plugin forwards OpenCode's **session-level** bus events (`session.*` — idle, error, title
-//! updates and the like) to `pitcrew hook opencode <event>`, fire-and-forget; it does not forward
-//! every bus event, since some (`message.part.updated`, notably) fire once per streamed token and
-//! would otherwise spawn a process per token. Its own runtime behaviour beyond making that one
-//! call is out of scope here (see `docs/build/briefs/I-hook-install.md`); the event name is
-//! rewritten from OpenCode's dotted form (`session.idle`) to the daemon's allowed charset
-//! (`session_idle`). The spawned child's `error` event, and its stdin's own `error` event, are
-//! both handled (as no-ops): a missing or unusable `pitcrew` executable must never throw inside
-//! OpenCode's own process.
+//! The plugin forwards an explicit list of OpenCode's session-*lifecycle* bus events — not a
+//! `session.*` prefix match, and not every bus event — to `pitcrew hook opencode <event>`,
+//! fire-and-forget. Confirmed (read-only, the same way as the plugin folder and API shape) against
+//! the installed `opencode` binary's own bundled client code, which dispatches on these same
+//! literal event-type strings: `session.created`, `session.idle`, `session.status`,
+//! `session.error`, `session.deleted`. Two more real `session.*` events exist —
+//! `session.updated` and `session.diff` — but are deliberately left out: both can fire on every
+//! small change to a session (a title edit, a streamed diff), which would be chatty for a daemon
+//! only meant to track session lifecycle; `message.part.updated` (not session-prefixed at all)
+//! fires once per streamed token and is the clearest example of why this is an explicit list, not
+//! a prefix match. Its own runtime behaviour beyond making that one call is out of scope here (see
+//! `docs/build/briefs/I-hook-install.md`); the event name is rewritten from OpenCode's dotted form
+//! (`session.idle`) to the daemon's allowed charset (`session_idle`). The spawned child's `error`
+//! event, and its stdin's own `error` event, are both handled (as no-ops): a missing or unusable
+//! `pitcrew` executable must never throw inside OpenCode's own process.
 
 use super::{Change, Plan, Status, Target};
 use crate::config::Env;
@@ -53,11 +59,20 @@ import {{ spawn }} from "node:child_process";
 
 const PITCREW = {};
 
+// Explicit, not a "session." prefix match: session.updated and session.diff are real OpenCode
+// events but fire on every small change (chatty); anything not session-prefixed at all, like
+// message.part.updated, fires once per streamed token.
+const SESSION_EVENTS = new Set([
+  "session.created",
+  "session.idle",
+  "session.status",
+  "session.error",
+  "session.deleted",
+]);
+
 function fire(eventType, payload) {{
   const type = String(eventType ?? "");
-  // Only session-level events: everything else, especially per-token streaming events like
-  // "message.part.updated", would spawn a process per token.
-  if (!type.startsWith("session.")) return;
+  if (!SESSION_EVENTS.has(type)) return;
   // The daemon only accepts event names matching [A-Za-z][A-Za-z0-9_-]{{0,63}}; OpenCode's bus
   // event names use dots (e.g. "session.idle"), so dots become underscores.
   const event = type.replace(/[^A-Za-z0-9_-]/g, "_");
@@ -235,9 +250,25 @@ mod tests {
     }
 
     #[test]
-    fn the_plugin_only_forwards_session_level_events_and_handles_both_errors() {
+    fn the_plugin_forwards_an_explicit_session_event_list_and_handles_both_errors() {
         let js = content(EXE);
-        assert!(js.contains(r#"type.startsWith("session.")"#), "{js}");
+        for event in [
+            "session.created",
+            "session.idle",
+            "session.status",
+            "session.error",
+            "session.deleted",
+        ] {
+            assert!(
+                js.contains(&format!("\"{event}\"")),
+                "{event} missing from {js}"
+            );
+        }
+        // Deliberately excluded (chatty) as actual *code*, not just mentioned in a comment
+        // explaining why — and never a bare prefix match.
+        assert!(!js.contains("\"session.updated\""), "{js}");
+        assert!(!js.contains("\"session.diff\""), "{js}");
+        assert!(!js.contains("startsWith"), "{js}");
         assert!(js.contains(r#"child.on("error""#), "{js}");
         assert!(js.contains(r#"child.stdin.on("error""#), "{js}");
         assert!(js.contains("if (child.stdin)"), "{js}");

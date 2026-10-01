@@ -2,32 +2,29 @@
 //!
 //! `notify` is a plain array of strings: the program and its fixed arguments; Codex appends the
 //! JSON event as one more argument when it runs it. We want `notify = ["<exe>", "hook", "codex",
-//! "notify"]`. Codex only honours `notify` in the user-level file, never a project's
-//! `.codex/config.toml`, which is exactly the file this module edits.
-//!
-//! `toml_edit` keeps every comment and formatting choice in the rest of the file; we only ever
-//! read or write the one `notify` key.
+//! "notify"]`.
 //!
 //! If a *foreign* `notify` is already there, we never replace it: `install` reports the conflict
-//! and makes no change, unless `--chain` is given, in which case we write a small wrapper script
-//! that runs the existing command and then ours, and point `notify` at that instead.
+//! and makes no change, unless `--chain`, in which case `notify` becomes `["<exe>", "hook",
+//! "codex", "notify", "--chain"]` — **no wrapper script, ever**. `pitcrew hook codex notify
+//! --chain` (`crate::hook`) delivers our own hook and then runs the original program directly via
+//! `std::process::Command` — argv exactly as recorded, the payload Codex passed appended exactly
+//! as Codex passed it — with no shell and no `cmd.exe` involved at any point.
 //!
 //! The original `notify` value's **exact source text** (comments, layout and all — not a value
-//! reconstructed from parsed strings, which would lose them) is recorded in a sidecar JSON file
-//! next to the wrapper, together with the plain values needed to build the wrapper's own
-//! invocation line. Re-running `install` (with or without `--chain`) while already chained is
-//! recognised and treated as idempotent — it refreshes the wrapper's embedded executable path if
-//! that moved, never re-wraps an already-chained `notify` (which would otherwise have it call
-//! itself forever) and never records a wrapper as "the original". `uninstall` restores the
-//! recorded text byte-for-byte, writing the config change before deleting the wrapper and its
-//! sidecar, so a failure partway through never leaves `notify` pointing at a file that is gone.
-//! An unreadable record is reported as a conflict, never silently dropped.
+//! reconstructed from parsed strings, which would lose them) is recorded in a private sidecar
+//! JSON file next to `config.toml`, together with the plain argv needed to run it.
+//! `uninstall` restores that text byte-for-byte, writing the config change before deleting the
+//! sidecar, so a failure partway through never leaves `notify` pointing at a chain whose record
+//! is gone. An unreadable sidecar is reported as a conflict, never silently dropped. Installing a
+//! new chain refuses to overwrite a sidecar that records a *different* original (stale from an
+//! earlier, different chain), and refuses outright if the foreign `notify` already names
+//! `pitcrew` itself — wrapping ourselves must stay impossible.
 
 use super::{Change, Plan, Status, Target};
 use crate::config::Env;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use toml_edit::{Array, DocumentMut, Item};
 
@@ -37,9 +34,11 @@ pub(crate) fn path(env: Env<'_>) -> Result<PathBuf> {
     Ok(super::config_dir(env, "CODEX_HOME", ".codex")?.join(FILE_NAME))
 }
 
-/// `notify`'s last three elements once we have written it; present regardless of the executable's
-/// own (possibly stale) path, so a moved binary is still recognised.
+/// `notify`'s last three elements once we have written it, direct or chained — present
+/// regardless of the executable's own (possibly stale) path, so a moved binary is still
+/// recognised.
 const MARKER_TAIL: [&str; 3] = ["hook", "codex", "notify"];
+const CHAIN_FLAG: &str = "--chain";
 
 fn target_notify(exe: &str) -> Vec<String> {
     vec![
@@ -50,9 +49,26 @@ fn target_notify(exe: &str) -> Vec<String> {
     ]
 }
 
-/// Whether `values` is a direct (non-chained) install of ours.
+fn target_notify_chained(exe: &str) -> Vec<String> {
+    let mut values = target_notify(exe);
+    values.push(CHAIN_FLAG.to_owned());
+    values
+}
+
+/// Whether `values` ends with our marker (`hook codex notify`), with or without a trailing
+/// `--chain` — so a moved executable is recognised whether or not it is chained.
 fn is_ours(values: &[String]) -> bool {
-    values.len() >= MARKER_TAIL.len() && values[values.len() - MARKER_TAIL.len()..] == MARKER_TAIL
+    let core = if values.last().map(String::as_str) == Some(CHAIN_FLAG) {
+        &values[..values.len() - 1]
+    } else {
+        values
+    };
+    core.len() >= MARKER_TAIL.len() && core[core.len() - MARKER_TAIL.len()..] == MARKER_TAIL
+}
+
+/// Whether `values` is specifically our *chained* form.
+fn is_chained(values: &[String]) -> bool {
+    values.last().map(String::as_str) == Some(CHAIN_FLAG) && is_ours(values)
 }
 
 fn as_strings(item: &Item) -> Option<Vec<String>> {
@@ -70,28 +86,14 @@ fn set_notify(doc: &mut DocumentMut, values: &[String]) {
     doc["notify"] = toml_edit::value(array);
 }
 
-const CHAIN_MARKER: &str = "Generated by `pitcrew hooks install --chain`";
-
-fn wrapper_file_name() -> &'static str {
-    if cfg!(windows) {
-        "pitcrew-notify-wrapper.cmd"
-    } else {
-        "pitcrew-notify-wrapper.sh"
-    }
-}
-
-fn wrapper_path(config_path: &Path) -> PathBuf {
-    config_path.with_file_name(wrapper_file_name())
-}
-
 fn sidecar_path(config_path: &Path) -> PathBuf {
     config_path.with_file_name("pitcrew-notify-original.json")
 }
 
-/// The chain's recorded state: `values`, the original `notify`'s plain string values (used to
-/// build the wrapper's invocation line, since that cannot embed TOML syntax or comments), and
-/// `toml`, the original `notify` value's **exact source text** — comments, multi-line layout and
-/// all — restored verbatim on `uninstall` rather than ever being reconstructed from `values`.
+/// The chain's recorded state: `values`, the original `notify`'s plain argv (what `pitcrew hook
+/// codex notify --chain` actually runs), and `toml`, the original `notify` value's **exact
+/// source text** — comments, multi-line layout and all — restored verbatim on `uninstall` rather
+/// than ever being reconstructed from `values`.
 #[derive(Serialize, Deserialize)]
 struct OriginalRecord {
     values: Vec<String>,
@@ -110,70 +112,16 @@ fn parse_sidecar(bytes: &[u8]) -> Option<OriginalRecord> {
     serde_json::from_slice(bytes).ok()
 }
 
-/// Whether `program`'s file extension means it must be invoked with `call` from a batch file —
-/// otherwise control never returns to run our own notify afterward (a plain batch-to-batch
-/// invocation is a `goto`, not a call).
-fn needs_call_prefix(program: &str) -> bool {
-    let lower = program.to_ascii_lowercase();
-    lower.ends_with(".bat") || lower.ends_with(".cmd")
-}
-
-/// A POSIX `sh` wrapper: the original command, then ours, both given the same arguments Codex
-/// passed to the wrapper (just the JSON payload, as far as `notify` ever gives it any).
-fn wrapper_script_unix(original: &[String], exe: &str) -> String {
-    let mut out = String::from("#!/bin/sh\n");
-    let _ = writeln!(
-        out,
-        "# {CHAIN_MARKER}. Safe to remove, or run: pitcrew hooks uninstall"
-    );
-    for part in original {
-        let _ = write!(out, "{} ", super::shell_quote_unix(part));
-    }
-    out.push_str("\"$@\" >/dev/null 2>&1\n");
-    let _ = writeln!(
-        out,
-        "{} hook codex notify \"$@\" >/dev/null 2>&1",
-        super::shell_quote_unix(exe)
-    );
-    out.push_str("exit 0\n");
-    out
-}
-
-/// The same, as a `cmd.exe` batch file (a plain `%*` forward of all arguments Codex passed is
-/// enough; `notify` only ever gives it the one JSON argument). `cmd_quote_windows` already
-/// doubles any literal `%` and quotes `cmd.exe`'s other metacharacters.
-fn wrapper_script_windows(original: &[String], exe: &str) -> String {
-    let mut out = String::from("@echo off\n");
-    let _ = writeln!(
-        out,
-        "rem {CHAIN_MARKER}. Safe to remove, or run: pitcrew hooks uninstall"
-    );
-    if original.first().is_some_and(|p| needs_call_prefix(p)) {
-        out.push_str("call ");
-    }
-    for part in original {
-        let _ = write!(out, "{} ", super::cmd_quote_windows(part));
-    }
-    out.push_str("%*\n");
-    let _ = writeln!(
-        out,
-        "{} hook codex notify %*",
-        super::cmd_quote_windows(exe)
-    );
-    out.push_str("exit /b 0\n");
-    out
-}
-
-fn wrapper_script(original: &[String], exe: &str) -> String {
-    if cfg!(windows) {
-        wrapper_script_windows(original, exe)
-    } else {
-        wrapper_script_unix(original, exe)
-    }
-}
-
-fn is_our_wrapper(text: &[u8]) -> bool {
-    String::from_utf8_lossy(text).contains(CHAIN_MARKER)
+/// The original `notify` command recorded for a chain, as plain argv, for `pitcrew hook codex
+/// notify --chain` (`crate::hook`) to run after delivering our own hook. `None` if there is no
+/// chain, or its sidecar cannot be read — silently: a hook must never fail loudly just because
+/// what it forwards to is briefly unavailable.
+#[must_use]
+pub(crate) fn chained_original(env: Env<'_>) -> Option<Vec<String>> {
+    let path = path(env).ok()?;
+    let sidecar = sidecar_path(&path);
+    let bytes = super::read_optional(&sidecar).ok().flatten()?;
+    parse_sidecar(&bytes).map(|record| record.values)
 }
 
 fn parse(path: &Path, bytes: &[u8]) -> Result<DocumentMut> {
@@ -200,10 +148,31 @@ fn parse_notify_value(value_text: &str) -> Result<Item> {
         .ok_or_else(|| Error::internal("cannot restore the original notify (internal error)"))
 }
 
+/// Whether `text` mixes CRLF and bare-LF line endings: if so, there is no single answer for what
+/// a rewrite's *other* lines should use, so the safe choice is to refuse rather than silently
+/// converting everything to one style.
+fn has_mixed_line_endings(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut saw_crlf = false;
+    let mut saw_bare_lf = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b'\n' {
+            continue;
+        }
+        if i > 0 && bytes[i - 1] == b'\r' {
+            saw_crlf = true;
+        } else {
+            saw_bare_lf = true;
+        }
+    }
+    saw_crlf && saw_bare_lf
+}
+
 /// `toml_edit`'s printer does not reliably keep a document's original line-ending style or a
 /// missing final newline once anything in it is re-serialised (observed directly: CRLF comes
 /// back as LF, and a file with no trailing newline gets one) — so both are restored here to match
-/// `before`, after asking `toml_edit` to print the rest.
+/// `before`, after asking `toml_edit` to print the rest. Callers check `has_mixed_line_endings`
+/// first and refuse rather than reach here with a file this cannot represent faithfully.
 fn match_line_endings(generated: String, before: Option<&[u8]>) -> String {
     let Some(before) = before else {
         return generated;
@@ -247,90 +216,29 @@ fn conflicting(path: &Path, detail: impl std::fmt::Display) -> Plan {
     }
 }
 
-/// Whether `notify` currently names exactly our wrapper's own path (regardless of whether the
-/// wrapper file itself still backs that up — callers check that separately).
-fn points_at_our_wrapper(values: &[String], wrapper_path: &Path) -> bool {
-    values.len() == 1 && values[0] == wrapper_path.to_string_lossy()
-}
-
 pub(crate) fn plan_install(env: Env<'_>, exe: &str, chain: bool) -> Result<Plan> {
     let path = path(env)?;
     let before = super::read_optional(&path)?;
+    if let Some(bytes) = &before {
+        let text = String::from_utf8_lossy(bytes);
+        if has_mixed_line_endings(&text) {
+            return Ok(conflicting(
+                &path,
+                "has mixed line endings (both CRLF and plain LF); fix it by hand first so a \
+                 rewrite does not have to guess which one the rest of the file should use",
+            ));
+        }
+    }
     let mut doc = match &before {
         Some(bytes) => parse(&path, bytes)?,
         None => DocumentMut::new(),
     };
-    let target = target_notify(exe);
     let existing_item = doc.get("notify").cloned();
     let existing = existing_item.as_ref().and_then(as_strings);
-    let wrapper_path = wrapper_path(&path);
-
-    // Already chained: refresh the wrapper's embedded executable path if it moved, never
-    // re-wrap it (that would make `notify` call itself forever), and never require `--chain`
-    // again just to keep an existing chain in good repair.
-    if let Some(values) = &existing
-        && points_at_our_wrapper(values, &wrapper_path)
-    {
-        let wrapper_before = super::read_optional(&wrapper_path)?;
-        let Some(wrapper_bytes) = &wrapper_before else {
-            return Ok(conflicting(
-                &path,
-                format!(
-                    "notify points at {}, which does not exist; fix it by hand first",
-                    wrapper_path.display()
-                ),
-            ));
-        };
-        if !is_our_wrapper(wrapper_bytes) {
-            return Ok(conflicting(
-                &path,
-                format!(
-                    "notify points at {}, which was not written by pitcrew; fix it by hand first",
-                    wrapper_path.display()
-                ),
-            ));
-        }
-        let sidecar_path = sidecar_path(&path);
-        let sidecar_before = super::read_optional(&sidecar_path)?;
-        let Some(record) = sidecar_before.as_deref().and_then(parse_sidecar) else {
-            return Ok(conflicting(
-                &path,
-                format!(
-                    "the chain's recorded original notify ({}) is missing or unreadable; fix it \
-                     by hand first",
-                    sidecar_path.display()
-                ),
-            ));
-        };
-        let new_script = wrapper_script(&record.values, exe);
-        if new_script.as_bytes() == wrapper_bytes.as_slice() {
-            return Ok(Plan {
-                target: Target::Codex,
-                status: Status::Installed,
-                detail: format!("{} (already chained)", path.display()),
-                changes: vec![],
-            });
-        }
-        return Ok(Plan {
-            target: Target::Codex,
-            status: Status::Installed,
-            detail: format!(
-                "{} (chained; updating the executable's path in the wrapper)",
-                path.display()
-            ),
-            changes: vec![Change {
-                path: wrapper_path,
-                before: wrapper_before,
-                after: new_script.into_bytes(),
-                delete: false,
-                executable: true,
-            }],
-        });
-    }
 
     match existing_item {
         None => {
-            set_notify(&mut doc, &target);
+            set_notify(&mut doc, &target_notify(exe));
             Ok(Plan {
                 target: Target::Codex,
                 status: Status::Missing,
@@ -344,15 +252,36 @@ pub(crate) fn plan_install(env: Env<'_>, exe: &str, chain: bool) -> Result<Plan>
         )),
         Some(ref item) => {
             let existing = existing.unwrap_or_default();
-            if existing == target {
+            let direct_target = target_notify(exe);
+            let chained_target = target_notify_chained(exe);
+
+            if existing == direct_target {
                 Ok(Plan {
                     target: Target::Codex,
                     status: Status::Installed,
                     detail: format!("{} (already set)", path.display()),
                     changes: vec![],
                 })
+            } else if existing == chained_target {
+                Ok(Plan {
+                    target: Target::Codex,
+                    status: Status::Installed,
+                    detail: format!("{} (already chained)", path.display()),
+                    changes: vec![],
+                })
+            } else if is_chained(&existing) {
+                set_notify(&mut doc, &chained_target);
+                Ok(Plan {
+                    target: Target::Codex,
+                    status: Status::Installed,
+                    detail: format!(
+                        "{} (chained; updating the executable's path)",
+                        path.display()
+                    ),
+                    changes: vec![file_change(path, before, doc)],
+                })
             } else if is_ours(&existing) {
-                set_notify(&mut doc, &target);
+                set_notify(&mut doc, &direct_target);
                 Ok(Plan {
                     target: Target::Codex,
                     status: Status::Installed,
@@ -368,41 +297,58 @@ pub(crate) fn plan_install(env: Env<'_>, exe: &str, chain: bool) -> Result<Plan>
                     ),
                 ))
             } else {
-                let wrapper_before = super::read_optional(&wrapper_path)?;
-                if let Some(bytes) = &wrapper_before
-                    && !is_our_wrapper(bytes)
-                {
+                // A new chain. `notify`'s own program must not already name us — wrapping
+                // ourselves (running `pitcrew ... --chain` as "the original") must stay
+                // impossible, not just unlikely.
+                if existing.first().is_some_and(|first| {
+                    super::is_our_exe_name(&super::quoted_word_file_name(first))
+                }) {
                     return Ok(conflicting(
                         &path,
                         format!(
-                            "{} already exists and was not written by pitcrew; move it aside \
-                             first",
-                            wrapper_path.display()
+                            "notify's program ({:?}) already names pitcrew, but this is not a \
+                             chain pitcrew recognises; fix it by hand first",
+                            existing[0]
                         ),
                     ));
                 }
-                let original_text = item.to_string();
-                let script = wrapper_script(&existing, exe);
                 let sidecar_path = sidecar_path(&path);
                 let sidecar_before = super::read_optional(&sidecar_path)?;
+                if let Some(bytes) = &sidecar_before {
+                    match parse_sidecar(bytes) {
+                        Some(record) if record.values == existing => {
+                            // Already recorded, identical: harmless to refresh.
+                        }
+                        Some(_) => {
+                            return Ok(conflicting(
+                                &path,
+                                format!(
+                                    "{} already records a different original notify; fix it by \
+                                     hand first",
+                                    sidecar_path.display()
+                                ),
+                            ));
+                        }
+                        None => {
+                            return Ok(conflicting(
+                                &path,
+                                format!(
+                                    "{} already exists and is not a chain record pitcrew wrote; \
+                                     move it aside first",
+                                    sidecar_path.display()
+                                ),
+                            ));
+                        }
+                    }
+                }
+                let original_text = item.to_string();
                 let sidecar = sidecar_json(&existing, &original_text);
-                set_notify(&mut doc, &[wrapper_path.to_string_lossy().into_owned()]);
+                set_notify(&mut doc, &chained_target);
                 Ok(Plan {
                     target: Target::Codex,
                     status: Status::Installed,
-                    detail: format!(
-                        "{} chained after the existing notify (wrapper at {})",
-                        path.display(),
-                        wrapper_path.display()
-                    ),
+                    detail: format!("{} chained after the existing notify", path.display()),
                     changes: vec![
-                        Change {
-                            path: wrapper_path,
-                            before: wrapper_before,
-                            after: script.into_bytes(),
-                            delete: false,
-                            executable: true,
-                        },
                         Change {
                             path: sidecar_path,
                             before: sidecar_before,
@@ -424,41 +370,27 @@ pub(crate) fn plan_uninstall(env: Env<'_>) -> Result<Plan> {
     let Some(before_bytes) = &before else {
         return Ok(missing_plan(path));
     };
+    if has_mixed_line_endings(&String::from_utf8_lossy(before_bytes)) {
+        return Ok(conflicting(
+            &path,
+            "has mixed line endings (both CRLF and plain LF); fix it by hand first so a rewrite \
+             does not have to guess which one the rest of the file should use",
+        ));
+    }
     let mut doc = parse(&path, before_bytes)?;
     let Some(existing) = doc.get("notify").and_then(as_strings) else {
         return Ok(missing_plan(path));
     };
 
-    let wrapper_path = wrapper_path(&path);
-    if points_at_our_wrapper(&existing, &wrapper_path) {
-        let wrapper_before = super::read_optional(&wrapper_path)?;
-        let Some(wrapper_bytes) = &wrapper_before else {
-            return Ok(conflicting(
-                &path,
-                format!(
-                    "notify points at {}, which does not exist; fix it by hand first",
-                    wrapper_path.display()
-                ),
-            ));
-        };
-        if !is_our_wrapper(wrapper_bytes) {
-            return Ok(conflicting(
-                &path,
-                format!(
-                    "notify points at {}, which was not written by pitcrew; fix it by hand first",
-                    wrapper_path.display()
-                ),
-            ));
-        }
+    if is_chained(&existing) {
         let sidecar_path = sidecar_path(&path);
         let sidecar_before = super::read_optional(&sidecar_path)?;
         let Some(record) = sidecar_before.as_deref().and_then(parse_sidecar) else {
             return Ok(conflicting(
                 &path,
                 format!(
-                    "the chain's recorded original notify ({}) is missing or unreadable; \
-                     notify was left pointing at the wrapper so nothing is lost — fix it by \
-                     hand first",
+                    "the chain's recorded original notify ({}) is missing or unreadable; fix it \
+                     by hand first",
                     sidecar_path.display()
                 ),
             ));
@@ -468,18 +400,11 @@ pub(crate) fn plan_uninstall(env: Env<'_>) -> Result<Plan> {
             Err(e) => return Ok(conflicting(&path, e.message)),
         };
         doc["notify"] = restored;
-        // The config is restored *first*: if anything fails before the wrapper and sidecar are
-        // deleted, `notify` already points at the real original again, never at a file we are
-        // about to remove.
+        // The config is restored *first*: if anything fails before the sidecar is deleted,
+        // `notify` already points at the real original again, never at a chain whose record is
+        // about to be removed.
         let changes = vec![
             file_change(path.clone(), before, doc),
-            Change {
-                path: wrapper_path,
-                before: wrapper_before,
-                after: Vec::new(),
-                delete: true,
-                executable: false,
-            },
             Change {
                 path: sidecar_path,
                 before: sidecar_before,
@@ -533,6 +458,18 @@ mod tests {
     }
 
     const EXE: &str = "/home/sam/.local/bin/pitcrew";
+
+    /// Applies every change in `plan` (test helper, mirroring `install::apply_change` closely
+    /// enough for these tests, without pulling in the re-check-before-write machinery).
+    fn apply(plan: &Plan) {
+        for c in &plan.changes {
+            if c.delete {
+                let _ = std::fs::remove_file(&c.path);
+            } else {
+                std::fs::write(&c.path, &c.after).unwrap();
+            }
+        }
+    }
 
     #[test]
     fn installs_then_is_a_no_op_then_uninstalls_cleanly() {
@@ -588,20 +525,8 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original);
     }
 
-    /// Applies every change in `plan` (test helper, mirroring `install::apply_change` closely
-    /// enough for these tests, without pulling in the re-check-before-write machinery).
-    fn apply(plan: &Plan) {
-        for c in &plan.changes {
-            if c.delete {
-                let _ = std::fs::remove_file(&c.path);
-            } else {
-                std::fs::write(&c.path, &c.after).unwrap();
-            }
-        }
-    }
-
     #[test]
-    fn chain_wraps_the_foreign_notify_and_uninstall_restores_it_byte_exact() {
+    fn chain_sets_notify_directly_with_no_wrapper_file_and_uninstall_restores_it_byte_exact() {
         let original = "notify = [\"terminal-notifier\", \"-title\", \"Codex\"] # a comment\n";
         let tmp = tempfile::tempdir().unwrap();
         let config_path = tmp.path().join("config.toml");
@@ -610,20 +535,28 @@ mod tests {
 
         let plan = plan_install(&env, EXE, true).unwrap();
         assert!(plan.status == Status::Installed);
-        assert_eq!(plan.changes.len(), 3);
-        for c in &plan.changes {
-            if c.path != config_path {
-                assert!(c.path.to_string_lossy().contains("pitcrew-notify"));
-            }
-        }
+        assert_eq!(plan.changes.len(), 2, "sidecar + config, no wrapper file");
         apply(&plan);
-        let now = std::fs::read_to_string(&config_path).unwrap();
-        assert!(now.contains("pitcrew-notify-wrapper"));
+
+        let now = std::fs::read(&config_path).unwrap();
+        let parsed = parse(&config_path, &now).unwrap();
+        let notify = as_strings(parsed.get("notify").unwrap()).unwrap();
+        assert_eq!(notify, vec![EXE, "hook", "codex", "notify", "--chain"]);
+        // No wrapper script of any kind is ever written.
+        let entries: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            entries.iter().all(|n| !n.contains("wrapper")),
+            "{entries:?}"
+        );
 
         let plan = plan_uninstall(&env).unwrap();
-        assert_eq!(plan.changes.len(), 3);
-        // The config change comes first: restoring it never depends on the wrapper or sidecar
-        // still existing.
+        assert_eq!(plan.changes.len(), 2);
+        // The config change comes first: restoring it never depends on the sidecar still
+        // existing.
         assert_eq!(plan.changes[0].path, config_path);
         assert!(!plan.changes[0].delete);
         let restored = String::from_utf8(plan.changes[0].after.clone()).unwrap();
@@ -631,13 +564,11 @@ mod tests {
             restored, original,
             "must be byte-exact, including the trailing comment"
         );
-        for c in &plan.changes[1..] {
-            assert!(c.delete);
-        }
+        assert!(plan.changes[1].delete);
     }
 
     #[test]
-    fn chain_twice_is_idempotent_and_never_wraps_the_wrapper() {
+    fn chain_twice_is_idempotent() {
         let original = r#"notify = ["terminal-notifier", "-title", "Codex"]"#;
         let tmp = tempfile::tempdir().unwrap();
         let config_path = tmp.path().join("config.toml");
@@ -653,7 +584,7 @@ mod tests {
         assert!(plan.status == Status::Installed, "{}", plan.detail);
         assert!(
             plan.changes.is_empty(),
-            "must not re-wrap an already-chained notify"
+            "must not re-chain an already-chained notify"
         );
         assert_eq!(std::fs::read_to_string(&config_path).unwrap(), after_first);
 
@@ -663,14 +594,14 @@ mod tests {
         assert!(plan.status == Status::Installed, "{}", plan.detail);
         assert!(plan.changes.is_empty());
 
-        // And uninstall still restores the one true original, not the wrapper.
+        // And uninstall still restores the one true original, not a chain link.
         let plan = plan_uninstall(&env).unwrap();
         let restored = String::from_utf8(plan.changes[0].after.clone()).unwrap();
         assert_eq!(restored.trim(), original);
     }
 
     #[test]
-    fn chain_then_moved_executable_updates_the_wrapper_only() {
+    fn chain_then_moved_executable_updates_notify_in_place() {
         let original = r#"notify = ["terminal-notifier"]"#;
         let tmp = tempfile::tempdir().unwrap();
         let config_path = tmp.path().join("config.toml");
@@ -679,26 +610,18 @@ mod tests {
 
         let plan = plan_install(&env, "/old/place/pitcrew", true).unwrap();
         apply(&plan);
-        let config_after_chain = std::fs::read_to_string(&config_path).unwrap();
 
         let plan = plan_install(&env, "/new/place/pitcrew", true).unwrap();
         assert!(plan.status == Status::Installed);
-        assert_eq!(plan.changes.len(), 1, "only the wrapper needs to change");
-        let wrapper_path = &plan.changes[0].path;
-        assert!(
-            wrapper_path
-                .to_string_lossy()
-                .contains("pitcrew-notify-wrapper")
-        );
-        let new_script = String::from_utf8(plan.changes[0].after.clone()).unwrap();
-        assert!(new_script.contains("/new/place/pitcrew"));
-        assert!(!new_script.contains("/old/place/pitcrew"));
-        apply(&plan);
-        // The config itself (notify still pointing at the wrapper) never changed.
         assert_eq!(
-            std::fs::read_to_string(&config_path).unwrap(),
-            config_after_chain
+            plan.changes.len(),
+            1,
+            "only the config's notify needs to change"
         );
+        let after = String::from_utf8(plan.changes[0].after.clone()).unwrap();
+        assert!(after.contains("/new/place/pitcrew"));
+        assert!(!after.contains("/old/place/pitcrew"));
+        apply(&plan);
 
         let plan = plan_uninstall(&env).unwrap();
         let restored = String::from_utf8(plan.changes[0].after.clone()).unwrap();
@@ -706,25 +629,39 @@ mod tests {
     }
 
     #[test]
-    fn install_refuses_to_overwrite_an_unrelated_wrapper_file() {
+    fn install_refuses_to_chain_when_notify_already_names_pitcrew() {
+        let original = r#"notify = ["pitcrew", "something", "unrecognised"]"#;
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, original).unwrap();
+        let env = env_of(&[("CODEX_HOME", tmp.path().to_str().unwrap())]);
+
+        let plan = plan_install(&env, EXE, true).unwrap();
+        assert!(plan.status == Status::Conflicting, "{}", plan.detail);
+        assert!(plan.changes.is_empty());
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original);
+    }
+
+    #[test]
+    fn install_refuses_to_overwrite_a_sidecar_recording_a_different_original() {
         let original = r#"notify = ["terminal-notifier"]"#;
         let tmp = tempfile::tempdir().unwrap();
         let config_path = tmp.path().join("config.toml");
         std::fs::write(&config_path, original).unwrap();
+        // A sidecar left behind recording a *different* original (as if a previous, different
+        // chain's uninstall never finished, or someone hand-edited things).
+        let sidecar = tmp.path().join("pitcrew-notify-original.json");
         std::fs::write(
-            tmp.path().join("pitcrew-notify-wrapper.sh"),
-            "#!/bin/sh\necho mine\n",
+            &sidecar,
+            sidecar_json(&["something-else".to_owned()], "[\"something-else\"]"),
         )
         .unwrap();
         let env = env_of(&[("CODEX_HOME", tmp.path().to_str().unwrap())]);
 
         let plan = plan_install(&env, EXE, true).unwrap();
-        assert!(plan.status == Status::Conflicting);
+        assert!(plan.status == Status::Conflicting, "{}", plan.detail);
         assert!(plan.changes.is_empty());
-        assert_eq!(
-            std::fs::read_to_string(tmp.path().join("pitcrew-notify-wrapper.sh")).unwrap(),
-            "#!/bin/sh\necho mine\n"
-        );
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original);
     }
 
     #[test]
@@ -737,20 +674,18 @@ mod tests {
 
         let plan = plan_install(&env, EXE, true).unwrap();
         apply(&plan);
-        // Someone deletes the sidecar by hand, but leaves the wrapper and the config pointing at
-        // it.
+        // Someone deletes the sidecar by hand, but leaves the chained notify in place.
         let sidecar = tmp.path().join("pitcrew-notify-original.json");
         std::fs::remove_file(&sidecar).unwrap();
 
         let plan = plan_uninstall(&env).unwrap();
         assert!(plan.status == Status::Conflicting, "{}", plan.detail);
         assert!(plan.changes.is_empty());
-        // notify is left exactly as it was — still pointing at the wrapper, not silently
-        // cleared.
+        // notify is left exactly as it was — still chained, not silently cleared.
         assert!(
             std::fs::read_to_string(&config_path)
                 .unwrap()
-                .contains("pitcrew-notify-wrapper")
+                .contains("--chain")
         );
     }
 
@@ -770,25 +705,6 @@ mod tests {
     }
 
     #[test]
-    fn windows_wrapper_doubles_percent_and_calls_a_bat_original() {
-        let original = vec!["C:\\tools\\notify.bat".to_owned(), "50% done".to_owned()];
-        let script = wrapper_script_windows(&original, "C:\\pitcrew\\pitcrew.exe");
-        assert!(script.contains("call "), "{script}");
-        assert!(script.contains("50%% done"), "{script}");
-        assert!(
-            !script.contains("notify.bat\" \"50% done"),
-            "unescaped %: {script}"
-        );
-    }
-
-    #[test]
-    fn windows_wrapper_quotes_cmd_metacharacters_in_arguments() {
-        let original = vec!["C:\\tools\\notify.exe".to_owned(), "a&b".to_owned()];
-        let script = wrapper_script_windows(&original, "C:\\pitcrew\\pitcrew.exe");
-        assert!(script.contains("\"a&b\""), "{script}");
-    }
-
-    #[test]
     fn crlf_and_a_missing_final_newline_round_trip() {
         let original = "notify = [\"terminal-notifier\"]\r\napproval_policy = \"never\"";
         let tmp = tempfile::tempdir().unwrap();
@@ -804,5 +720,32 @@ mod tests {
             restored, original,
             "CRLF and the missing final newline must survive"
         );
+    }
+
+    #[test]
+    fn mixed_line_endings_are_refused_not_silently_converted() {
+        let original = "notify = [\"terminal-notifier\"]\r\napproval_policy = \"never\"\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, original).unwrap();
+        let env = env_of(&[("CODEX_HOME", tmp.path().to_str().unwrap())]);
+
+        let plan = plan_install(&env, EXE, false).unwrap();
+        assert!(plan.status == Status::Conflicting, "{}", plan.detail);
+        assert!(
+            plan.detail.contains("mixed line endings"),
+            "{}",
+            plan.detail
+        );
+        assert!(plan.changes.is_empty());
+    }
+
+    #[test]
+    fn is_ours_and_is_chained_recognise_both_forms() {
+        let direct = target_notify(EXE);
+        let chained = target_notify_chained(EXE);
+        assert!(is_ours(&direct) && !is_chained(&direct));
+        assert!(is_ours(&chained) && is_chained(&chained));
+        assert!(!is_ours(&["terminal-notifier".to_owned()]));
     }
 }
