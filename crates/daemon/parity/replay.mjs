@@ -132,6 +132,10 @@ class Run {
 
 const keys = (tasks) => (Array.isArray(tasks) ? tasks.map((t) => t.key) : tasks);
 
+// The demo's own slice of the log (`EVT00NN` ids). The mock's log is only that; the daemon's starts
+// with the demo's lists as events (`task_created`, `session_discovered`, …), which the seed adds.
+const slice = (events) => (Array.isArray(events) ? events.filter((e) => /EVT\d{4}$/.test(e.id)) : events);
+
 // ─── The mock's HTTP tests, as soft checks ──────────────────────────────────────────────────────
 
 const TESTS = {
@@ -404,11 +408,14 @@ const TESTS = {
     r.check('task=pap1: status', res.status, 200);
     r.check('task=pap1: types', res.body?.events?.map((e) => e.body.type), ['dispatch_started', 'task_moved', 'subtasks_replaced', 'file_edited']);
     r.check('task=pap1: [from, to, at_start]', [res.body?.from_rev, res.body?.to_rev, res.body?.at_start], [4, 7, true]);
+    r.check('extra: task=pap1, the demo slice\'s', slice(res.body?.events)?.map((e) => e.body.type), ['dispatch_started', 'task_moved', 'subtasks_replaced', 'file_edited']);
     const newestTwo = await r.call('GET', `/v1/events?task=${ID.pap1}&limit=2`, { token: 'device' });
     r.check('task=pap1&limit=2: [from, to, at_start]', [newestTwo.body?.from_rev, newestTwo.body?.to_rev, newestTwo.body?.at_start], [6, 7, false]);
+    r.check('extra: task=pap1&limit=2, the 2 newest', newestTwo.body?.events?.map((e) => e.id.slice(-4)), ['0006', '0007']);
     const tooling = await r.call('GET', `/v1/events?project=${ID.tooling}`, { token: 'device' });
     r.check('project=tooling: status', tooling.status, 200);
     r.check('project=tooling: id suffixes', tooling.body?.events?.map((e) => e.id.slice(-4)), ['0008', '0013', '0014']);
+    r.check('extra: project=tooling, the demo slice\'s', slice(tooling.body?.events)?.map((e) => e.id.slice(-4)), ['0008', '0013', '0014']);
   },
 
   // The mock's test runs with `scanWindow: 5`, an option of the mock only; this is its part that
@@ -424,6 +431,8 @@ const TESTS = {
     }
     for (const p of pages) seen.unshift(...(p?.events ?? []).map((e) => e.id.slice(-4)));
     r.check('every match', seen, ['0004', '0005', '0006', '0007']);
+    const sliceSeen = pages.flatMap((p) => slice(p?.events ?? [])).map((e) => e.id.slice(-4)).sort();
+    r.check('extra: every match of the demo slice', sliceSeen, ['0004', '0005', '0006', '0007']);
     r.check('only the last page is at_start', pages.map((p) => p?.at_start), [...pages.slice(1).map(() => false), true]);
     r.check('no match', await get('?task=01JB000000000000000TSK0099'), { events: [], from_rev: 0, to_rev: 0, at_start: true });
   },
