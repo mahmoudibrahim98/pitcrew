@@ -109,6 +109,36 @@ pub enum Error {
         /// What is wrong.
         reason: String,
     },
+    /// Network mode: another, live owner holds the lease. `until` is a best guess (host and pid
+    /// are `"unknown"`/`0`) when the file was unreadable and only its age said it was not yet
+    /// stale.
+    #[error("the store is leased by {host} (pid {pid}) until {until}")]
+    Leased {
+        /// The current owner's host name.
+        host: String,
+        /// The current owner's process id.
+        pid: u32,
+        /// When the lease expires, in milliseconds since the Unix epoch.
+        until: i64,
+    },
+    /// Network mode: this store's lease was taken over by another host or process (its clock
+    /// stalled, or it was suspended past the lease length). Every append fails with this from
+    /// here on; nothing further is written.
+    #[error("the network-mode lease was taken over by another host or process")]
+    LeaseLost,
+    /// Network mode: a filesystem error acquiring, renewing or releasing the lease (not a SQLite
+    /// error).
+    #[error("network-mode lease: {0}")]
+    LeaseIo(#[source] std::io::Error),
+    /// An I/O error from [`Store::export`](crate::Store::export) or
+    /// [`Store::import`](crate::Store::import) (not the lease, and not SQLite).
+    #[error("store export/import: {0}")]
+    Io(#[source] std::io::Error),
+    /// [`Store::import`](crate::Store::import) was called on a store that already holds events.
+    /// Import seeds a fresh store; appending into one that already has history would mix two
+    /// logs' revisions.
+    #[error("the store must be empty to import into")]
+    NotEmpty,
 }
 
 /// A SQLite error. It wraps the store's `rusqlite` error, re-exported as

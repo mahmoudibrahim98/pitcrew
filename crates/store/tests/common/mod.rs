@@ -1,4 +1,5 @@
 //! A toy projection shared by the tests: events counted by a key, with the last revision seen.
+//! Also [`FakeClock`], for tests that expire a network-mode lease without sleeping.
 
 #![allow(dead_code)]
 
@@ -6,6 +7,8 @@ use pitcrew_store::migrations::{self, Migration};
 use pitcrew_store::sql::{self, Transaction};
 use pitcrew_store::{BoxError, Projection, StoredEvent, event_type};
 use std::borrow::Cow;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 /// Counts events per key, and the last revision seen per key.
 pub struct CountBy {
@@ -92,4 +95,25 @@ pub fn toy_migrations() -> Vec<Migration> {
 
 pub fn both() -> Vec<Box<dyn Projection>> {
     vec![Box::new(CountBy::types()), Box::new(CountBy::authors())]
+}
+
+/// A clock the test controls, so a network-mode lease can be made to look expired without
+/// sleeping. `now_ms` starts at the value passed to [`FakeClock::new`].
+#[derive(Debug)]
+pub struct FakeClock(AtomicI64);
+
+impl FakeClock {
+    pub fn new(now_ms: i64) -> Arc<Self> {
+        Arc::new(Self(AtomicI64::new(now_ms)))
+    }
+
+    pub fn advance(&self, delta_ms: i64) {
+        self.0.fetch_add(delta_ms, Ordering::SeqCst);
+    }
+}
+
+impl pitcrew_store::Clock for FakeClock {
+    fn now_ms(&self) -> i64 {
+        self.0.load(Ordering::SeqCst)
+    }
 }

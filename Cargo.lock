@@ -892,6 +892,7 @@ dependencies = [
  "pitcrew-fixtures",
  "pitcrew-protocol",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

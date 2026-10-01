@@ -122,8 +122,72 @@ For every domain crate (E, F, G) that writes one:
 - **Inside `read`, the revision the data reflects is `projection_state.rev`** for that
   projection, queried in the same closure. Not `MAX(events.rev)` (another process may have
   appended events not yet applied) and not `Store::latest_rev()` (outside the snapshot).
-- **A future NFS mode** (`journal_mode=DELETE` plus EXCLUSIVE locking) has no concurrent
-  readers: it must route `read` (and `since`, `before`) through the write connection.
+- **Network mode** (`journal_mode=DELETE` plus EXCLUSIVE locking) has no concurrent readers:
+  `read`, `since` and `before` route through the write connection instead. See the next section.
+
+## Network filesystems and the single-host lease
+
+HPC home directories are often NFS, Lustre or GPFS. SQLite's WAL mode needs shared memory, which a
+network filesystem does not provide safely, and SQLite's own file locking is not trustworthy over
+one either (that is the whole reason this mode exists). `StoreOptions.fs` chooses how `Store::open`
+decides:
+
+- **`FsMode::Auto`** (the default) calls `pitcrew_store::detect` on the database's directory.
+  **Linux** reads `statfs`'s `f_type` magic number; **macOS** reads its `f_fstypename`; **Windows**
+  treats a UNC path (`\\server\share`, `\\?\UNC\...`) as network and a drive letter as local (a
+  mapped network drive looks local to `std`; force `FsMode::Network` for those). An unrecognised
+  type (`FsKind::Unknown`) is treated the same as `FsKind::Network`: guessing "local" wrongly is
+  the unsafe direction, so anything not on the allowlist (`ext2`/`3`/`4`, `xfs`, `btrfs`, `zfs`,
+  `tmpfs`, `f2fs`, `bcachefs`, `overlay(fs)`, `apfs`, `hfs` and similar) takes the slower, safe
+  path.
+- **`FsMode::Local`** and **`FsMode::Network`** force the choice, for callers who know better and
+  for tests.
+
+**Local mode** is unchanged: WAL, no lease. **Network mode**:
+
+- `journal_mode=DELETE`, `locking_mode=EXCLUSIVE`, the same `synchronous=NORMAL`.
+- No separate read-only connection: `locking_mode=EXCLUSIVE` means a second connection to the file
+  cannot be relied on, so `Store::read`, `Store::since` and `Store::before` run on the write
+  connection. They therefore wait for a concurrent append (and vice versa); this is the documented
+  cost of network mode, not a bug.
+- **The lease.** A lease file next to the database, `<db>.lease` (e.g. `store.db.lease`), holds
+  JSON:
+  `{"host": "...", "pid": ..., "owner": "<ulid>", "until_ms": <epoch ms>}`. `Store::open` takes it
+  atomically (temp file plus rename in the same directory; mode 0600 on Unix, directory ACL on
+  Windows) or fails with `Error::Leased { host, pid, until }`. It is taken over once `until_ms` has
+  passed, or — same host only — once the pid it names is no longer running (checked with
+  `kill(pid, 0)` through `rustix`, no `unsafe`; not possible on Windows, so there it is expiry
+  only). A torn or garbage file (one that does not parse as that JSON) is treated as expired only
+  once its mtime is older than `lease_ttl`: a lease mid-write is not mistaken for a free one.
+  - **Renewal is automatic**, from a small thread `Store::open` starts, not a method callers must
+    remember to call: it wakes every `lease_ttl / 3` (so one slow or missed wakeup still leaves
+    two tries before the lease would actually expire), checks the file still names this `Store`'s
+    `owner`, and only then writes a fresh `until_ms`. If the owner ever does not match — another
+    host took over because this process's clock stalled or it was suspended — the thread stops and
+    every later `append` fails with `Error::LeaseLost`, never silently past a lease this store no
+    longer holds.
+  - **`StoreOptions.clock`** (a `Clock`, defaulting to `SystemClock`) is where the lease gets the
+    time; inject one in tests to expire a lease without sleeping.
+  - Dropping the `Store` stops the thread and releases the lease (deletes the file), but only if
+    it still names this store's `owner` — if someone else already took over, there is nothing of
+    ours left to release.
+
+## Maintenance
+
+- **`Store::snapshot(dest)`** copies the store with `VACUUM INTO`: a consistent copy as of the
+  moment it starts, safe to call while the store is in use (appends through this `Store` wait for
+  the duration; nothing is corrupted either way). `dest` must not already exist.
+- **`Store::integrity_check(full)`** runs `PRAGMA quick_check` (or, if `full`,
+  `PRAGMA integrity_check`) and returns `IntegrityReport::Ok` or `Failed(messages)` — never an
+  `Err` for corruption itself. The free function `pitcrew_store::integrity_check(conn, full)`
+  checks any plain connection (e.g. to a snapshot or a raw copy) without opening it as a `Store`,
+  which would run migrations against a file that may be corrupt.
+- **`Store::export(writer)`** writes every event as one JSON line each (no revision: order is the
+  record), oldest first. **`Store::import(reader)`** loads those lines into an empty store
+  (`Error::NotEmpty` otherwise), appending them through the normal `append` path so this store's
+  registered projections build from them. An import is a new log: `log_id` was already assigned
+  when the store was created, independently of import, so it differs from the exported store's.
+  Both are for tests and support, not sync.
 
 ## Timings
 
