@@ -8,7 +8,9 @@
 //!   down, so this check, not the name, is what makes the pipe trustworthy.
 
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// A byte stream to a daemon.
