@@ -1,7 +1,8 @@
 //! No token reaches the webview: every command, socket message, event, error and log line (at
 //! trace level, Tauri's and tungstenite's included) is searched for a known token, against a fake
 //! daemon that even puts the token in its response headers, and fake `pitcrewd`s that print it
-//! on stderr.
+//! on stderr. The gateway's own subscription ("needs you") is covered too: its log lines, the
+//! notifications and tray lines it leads to, and the navigation a click or a deep link emits.
 //!
 //! Its own test binary, because it installs the process-wide log subscriber.
 
@@ -10,16 +11,20 @@
 
 mod common;
 
-use common::{FakeDaemon, WORKSPACE_ID, WORKSPACE_NAME};
+use common::{FakeDaemon, SAM, WORKSPACE_ID, WORKSPACE_NAME, WRITER, ask};
 use pitcrew_desktop::app::{self, MAIN, WORKSPACES_EVENT};
+use pitcrew_desktop::attention::{Attention, AttentionSink, Count, Limits, NewAsk};
 use pitcrew_desktop::daemon::endpoint::Endpoint;
 use pitcrew_desktop::daemon::supervisor::{DaemonState, Options, Supervisor};
 use pitcrew_desktop::daemon::{LocalConnector, follow};
 use pitcrew_desktop::gateway::Gateway;
 use pitcrew_desktop::logging;
+use pitcrew_desktop::navigate::{self, NAVIGATE_EVENT, Navigator};
+use pitcrew_desktop::notify::notice_for;
 use pitcrew_desktop::registry::{
     Connection, Registry, WorkspaceKind, WorkspaceRecord, WorkspaceState,
 };
+use pitcrew_desktop::tray::{tooltip, workspace_line};
 use serde_json::{Value, json};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt as _;
@@ -52,6 +57,24 @@ impl<'a> MakeWriter<'a> for Capture {
     type Writer = Capture;
     fn make_writer(&'a self) -> Self::Writer {
         self.clone()
+    }
+}
+
+/// What "needs you" hands on, as text: the notification for each new ask.
+#[derive(Default)]
+struct Texts(Mutex<Vec<String>>);
+
+impl AttentionSink for Texts {
+    fn counts_changed(&self) {}
+
+    fn new_ask(&self, workspace: &str, ask: NewAsk) {
+        let notice = notice_for(workspace, &ask);
+        self.0.lock().unwrap().push(format!(
+            "{} | {} | {}",
+            notice.title,
+            notice.body,
+            serde_json::to_string(&notice.target).unwrap()
+        ));
     }
 }
 
@@ -130,15 +153,18 @@ fn no_token_reaches_the_webview_or_the_logs() {
     });
     let app = app::configure(builder)
         .manage(Gateway::new(Arc::clone(&registry)))
+        .manage(Navigator::default())
         .build(pitcrew_desktop::context())
         .unwrap();
     let handle = app.handle().clone();
     registry.on_change(move |list| app::emit_workspaces(&handle, list));
     let events: Arc<Mutex<Vec<String>>> = Arc::default();
-    let seen = Arc::clone(&events);
-    app.listen_any(WORKSPACES_EVENT, move |e| {
-        seen.lock().unwrap().push(e.payload().to_owned());
-    });
+    for event in [WORKSPACES_EVENT, NAVIGATE_EVENT] {
+        let seen = Arc::clone(&events);
+        app.listen_any(event, move |e| {
+            seen.lock().unwrap().push(e.payload().to_owned());
+        });
+    }
     let main = WebviewWindowBuilder::new(&app, MAIN, Default::default())
         .build()
         .unwrap();
@@ -241,14 +267,69 @@ fn no_token_reaches_the_webview_or_the_logs() {
     ));
     results.push(invoke(&main, "gateway_workspaces", json!({})));
 
-    // The local daemon's supervisor, with fake `pitcrewd`s that print the token on stderr (and in
-    // the ready line): what it puts in the workspace's detail (the UI sees it, in the list and the
-    // event) and what it logs must not hold it.
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
+
+    // "Needs you": the gateway's own subscription, with the token, through a snapshot, a live
+    // ask and a reconnect with `since`. What it leads to (notifications, tray lines, the
+    // navigation a click or a deep link emits) is searched below, with its log lines.
+    let sink = Arc::new(Texts::default());
+    let attention = Attention::with_limits(
+        Arc::clone(&registry),
+        Arc::clone(&sink) as Arc<dyn AttentionSink>,
+        rt.handle().clone(),
+        Limits {
+            first_backoff: Duration::from_millis(50),
+            ..Limits::default()
+        },
+    );
+    daemon.raise(ask(1, WRITER, SAM));
+    attention.sync(&registry.list());
+    let counted = |n: usize| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while attention.counts().get(WORKSPACE_ID).copied()
+            != Some(Count {
+                open: n,
+                more: false,
+            })
+        {
+            assert!(Instant::now() < deadline, "waited for {n} asks");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    counted(1);
+    daemon.raise(ask(2, WRITER, SAM));
+    counted(2);
+    daemon.drop_streams();
+    daemon.raise(ask(3, WRITER, SAM));
+    counted(3);
+    assert!(daemon.streams().len() >= 2, "it reconnected");
+    let mut shown = sink.0.lock().unwrap().clone();
+    assert_eq!(shown.len(), 2, "{shown:?}");
+    for workspace in registry.list() {
+        let count = attention.counts().get(&workspace.id).copied();
+        shown.push(workspace_line(&workspace.name, workspace.state, count));
+    }
+    shown.push(tooltip(Count {
+        open: 3,
+        more: false,
+    }));
+    attention.stop();
+    invoke(&main, "gateway_workspaces", json!({}));
+    navigate::open_links(
+        app.handle(),
+        [
+            format!("pitcrew://w/{WORKSPACE_ID}/inbox"),
+            format!("pitcrew://w/{WORKSPACE_ID}/inbox?{TOKEN}"),
+        ],
+    );
+
+    // The local daemon's supervisor, with fake `pitcrewd`s that print the token on stderr (and in
+    // the ready line): what it puts in the workspace's detail (the UI sees it, in the list and the
+    // event) and what it logs must not hold it.
     let says = format!("bad token {TOKEN}; Authorization: Bearer {TOKEN}; pitcrew.bearer.{TOKEN}");
     let mut details = Vec::new();
     for (name, serve, show_path) in [
@@ -370,12 +451,25 @@ fn no_token_reaches_the_webview_or_the_logs() {
         logs.contains("pcd_…"),
         "the daemon's stderr was logged, redacted"
     );
+    assert!(
+        logs.contains("attention snapshot") && logs.contains("resuming the attention stream"),
+        "the subscription's lines are captured"
+    );
+    assert!(
+        logs.contains("dropped a deep link") && logs.contains("inbox?pcd_…"),
+        "a dropped deep link is logged, redacted"
+    );
+    assert!(
+        events.iter().any(|e| e.contains(r#""kind":"inbox""#)),
+        "the navigation is captured: {events:?}"
+    );
 
     let secret_core = &TOKEN["pcd_".len()..];
     for (what, texts) in [
         ("command result or error", &results),
         ("channel message", &channels),
         ("event", &events),
+        ("notification or tray text", &shown),
     ] {
         for text in texts {
             assert!(

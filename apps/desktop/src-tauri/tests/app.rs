@@ -9,6 +9,7 @@ mod common;
 use common::{FakeDaemon, WORKSPACE_ID, WORKSPACE_NAME};
 use pitcrew_desktop::app::{self, MAIN, WORKSPACES_EVENT};
 use pitcrew_desktop::gateway::Gateway;
+use pitcrew_desktop::navigate::{self, NAVIGATE_EVENT, NavigateTarget, Navigator};
 use pitcrew_desktop::registry::{
     Connection, Registry, WorkspaceKind, WorkspaceRecord, WorkspaceState,
 };
@@ -57,6 +58,7 @@ fn world() -> World {
     });
     let app = app::configure(builder)
         .manage(Gateway::new(Arc::clone(&registry)))
+        .manage(Navigator::default())
         .build(pitcrew_desktop::context())
         .unwrap();
     let handle = app.handle().clone();
@@ -334,6 +336,83 @@ fn the_workspace_list_is_emitted_when_it_changes() {
         json!([{ "id": WORKSPACE_ID, "name": WORKSPACE_NAME, "kind": "local", "state": "unreachable", "detail": "pitcrewd stopped" }])
     );
     assert_eq!(events[1][0]["state"], "ready");
+}
+
+#[test]
+fn deep_links_navigate_the_main_window_once_its_page_listens() {
+    const TASK: &str = "01JB000000000000000TASK001";
+    let w = world();
+    let events: Arc<Mutex<Vec<Value>>> = Arc::default();
+    let seen = Arc::clone(&events);
+    w.app.listen_any(NAVIGATE_EVENT, move |event| {
+        seen.lock()
+            .unwrap()
+            .push(serde_json::from_str(event.payload()).unwrap());
+    });
+    let main = w.window(MAIN);
+    let other = w.window("other");
+    let handle = w.app.handle().clone();
+    let navigator = tauri::Manager::state::<Navigator>(&w.app);
+    let settle = || std::thread::sleep(Duration::from_millis(100));
+
+    // A link that launched the app: held until the page asks for the workspaces.
+    navigate::open_links(
+        &handle,
+        [format!("pitcrew://w/{WORKSPACE_ID}/task/tsk_{TASK}")],
+    );
+    settle();
+    assert!(events.lock().unwrap().is_empty());
+    assert_eq!(
+        navigator.pending(),
+        Some(NavigateTarget::task(WORKSPACE_ID, TASK))
+    );
+    // Another window cannot release it (it has no capability at all).
+    assert!(invoke(&other, "gateway_workspaces", json!({})).is_err());
+    assert!(navigator.pending().is_some());
+    invoke(&main, "gateway_workspaces", json!({})).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while events.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "no navigation");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The payload is the contract's NavigateTarget.
+    assert_eq!(
+        events.lock().unwrap()[0],
+        json!({ "workspace": WORKSPACE_ID, "kind": "task", "id": TASK })
+    );
+
+    // Now the page listens: links go at once. Anything else is dropped.
+    navigate::open_links(
+        &handle,
+        [
+            "--some-flag".to_owned(),
+            format!("pitcrew://w/{WORKSPACE_ID}/inbox?answer=0"),
+            format!("pitcrew://w/{WORKSPACE_ID}/task/{TASK}/answer"),
+            "pitcrew://w/../etc/passwd".to_owned(),
+            format!("pitcrew://w/{WORKSPACE_ID}/inbox"),
+        ],
+    );
+    navigate::open_links(&handle, ["https://example.com/".to_owned()]);
+    navigate::open_links(&handle, [format!("pitcrew://w/{WORKSPACE_ID}/inbox/")]);
+    settle();
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            json!({ "workspace": WORKSPACE_ID, "kind": "task", "id": TASK }),
+            json!({ "workspace": WORKSPACE_ID, "kind": "inbox" }),
+        ]
+    );
+
+    // A reload (what `on_page_load` does when the main page starts loading): held again until
+    // the new page asks.
+    navigator.page_started();
+    navigator.navigate(&handle, NavigateTarget::inbox(WORKSPACE_ID));
+    settle();
+    assert_eq!(events.lock().unwrap().len(), 2);
+    invoke(&main, "gateway_workspaces", json!({})).unwrap();
+    settle();
+    assert_eq!(events.lock().unwrap().len(), 3);
+    assert_eq!(navigator.pending(), None);
 }
 
 #[test]
