@@ -1,9 +1,7 @@
 import AxeBuilder from '@axe-core/playwright';
 import { expect, test, type Page } from '@playwright/test';
+import { HUB_AUTH, HUB_URL } from './helpers';
 
-// The same hub the config starts (see playwright.config.ts).
-const HUB = `http://127.0.0.1:${process.env.E2E_HUB_PORT ?? 47399}`;
-const AUTH = { Authorization: 'Bearer dev-device-token' };
 const PAPER = '01JB000000000000000PRJ0001';
 
 const sidebar = (page: Page) => page.getByRole('complementary', { name: 'Sidebar' });
@@ -181,10 +179,12 @@ test('a task moved through the API updates the sidebar counts without a reload',
 
   // PAP-7 is assigned to the workspace's person. Reopening it adds an open task to My tasks and to
   // its project; closing it again takes one away.
-  const task = (await (await request.get(`${HUB}/v1/tasks/PAP-7`, { headers: AUTH })).json()) as { status: string };
+  const task = (await (await request.get(`${HUB_URL}/v1/tasks/PAP-7`, { headers: HUB_AUTH })).json()) as {
+    status: string;
+  };
   const reopen = task.status === 'done';
-  const moved = await request.post(`${HUB}/v1/tasks/PAP-7/move`, {
-    headers: AUTH,
+  const moved = await request.post(`${HUB_URL}/v1/tasks/PAP-7/move`, {
+    headers: HUB_AUTH,
     data: { to: reopen ? 'todo' : 'done' },
   });
   expect(moved.ok()).toBe(true);
