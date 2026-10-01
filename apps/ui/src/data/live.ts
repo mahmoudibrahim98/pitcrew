@@ -16,9 +16,10 @@ import { ApiError, GatewayError } from './errors.ts';
 import { keysToInvalidate, type CacheLookup, type QueryKey } from './invalidation.ts';
 import { keys } from './keys.ts';
 import { applyPatches } from './patches.ts';
+import { recapScopeForEvents, type RecapCacheLookup, type RecapScope } from './recaps.ts';
 import { StreamClient, type StreamStatus } from './stream.ts';
 import type { Transport } from './transport.ts';
-import type { Task } from './types.ts';
+import type { Ask, Dispatch, RecapBlockFilters, RecapDayScope, Session, Task, Workstream } from './types.ts';
 
 export function cacheLookup(queryClient: QueryClient): CacheLookup {
   return {
@@ -32,6 +33,105 @@ export function cacheLookup(queryClient: QueryClient): CacheLookup {
       return undefined;
     },
   };
+}
+
+/** Finds `id` in a cached detail, else in any cached list under `prefix`. */
+function findCached<T extends { id: string }>(queryClient: QueryClient, detail: QueryKey, prefix: QueryKey, id: string): T | undefined {
+  const found = queryClient.getQueryData<T>(detail);
+  if (found !== undefined) return found;
+  for (const [, list] of queryClient.getQueriesData<T[]>({ queryKey: prefix })) {
+    const item = Array.isArray(list) ? list.find((x) => x.id === id) : undefined;
+    if (item !== undefined) return item;
+  }
+  return undefined;
+}
+
+/**
+ * `RecapCacheLookup` from the query cache: `undefined` when the entity itself is not cached (its
+ * parents are then unknown), an object when it is — even if some of its own fields are absent.
+ * There is no cached list of dispatches today (nothing in `src/data` fetches one), so
+ * `dispatch_started`/`dispatch_finished` usually fall back to invalidating every recap key; that
+ * is the contract's documented, always-correct fallback.
+ */
+export function recapCacheLookup(queryClient: QueryClient): RecapCacheLookup {
+  return {
+    session(id) {
+      const found = findCached<Session>(queryClient, keys.sessions.detail(id), keys.sessions.lists, id);
+      return found && { task: found.task, workstream: found.workstream };
+    },
+    task(id) {
+      const found = findCached<Task>(queryClient, keys.tasks.detail(id), keys.tasks.lists, id);
+      return found && { workstream: found.workstream, project: found.project };
+    },
+    workstream(id) {
+      const found = findCached<Workstream>(queryClient, keys.workstreams.detail(id), keys.workstreams.lists, id);
+      return found && { project: found.project };
+    },
+    dispatch(id) {
+      for (const [, dispatches] of queryClient.getQueriesData<Dispatch[]>({ queryKey: keys.dispatches })) {
+        const found = Array.isArray(dispatches) ? dispatches.find((d) => d.id === id) : undefined;
+        if (found !== undefined) return { task: found.task, session: found.session };
+      }
+      return undefined;
+    },
+    ask(id) {
+      for (const [, asks] of queryClient.getQueriesData<Ask[]>({ queryKey: keys.asks.lists })) {
+        const found = Array.isArray(asks) ? asks.find((a) => a.id === id) : undefined;
+        if (found !== undefined) return { task: found.task, session: found.session };
+      }
+      return undefined;
+    },
+  };
+}
+
+function matchesBlockFilters(filters: RecapBlockFilters, scope: RecapScope): boolean {
+  return (
+    (filters.session !== undefined && scope.session.includes(filters.session)) ||
+    (filters.task !== undefined && scope.task.includes(filters.task)) ||
+    (filters.workstream !== undefined && scope.workstream.includes(filters.workstream)) ||
+    (filters.project !== undefined && scope.project.includes(filters.project))
+  );
+}
+
+function matchesDayScope(dayScope: RecapDayScope, scope: RecapScope): boolean {
+  return 'workstream' in dayScope ? scope.workstream.includes(dayScope.workstream) : scope.project.includes(dayScope.project);
+}
+
+/** Recap keys to invalidate, split by how: see `recapKeysForScope`. */
+export interface RecapKeys {
+  /** Invalidated as prefixes (`Invalidator.add`): each is itself a specific, non-empty filter or
+   * scope, so matching its own longer (e.g. `{limit}`-suffixed) variants too is what we want. */
+  prefix: QueryKey[];
+  /** Invalidated by their own exact key only (`Invalidator.addExact`): queries actually mounted
+   * with empty blocks filters (`{}`), found by scanning the cache rather than guessing a key,
+   * because TanStack matches `{}` against *any* object — "prefix" matching it would invalidate
+   * every blocks query, filtered or not (see `Invalidator.#flush`'s own note on this). */
+  exact: QueryKey[];
+}
+
+/**
+ * The recap keys a batch's scope touches (API v1, "Recaps", "Live updates"): nothing for
+ * `undefined` (no event in the batch was activity), every `['recaps']` key for `'everything'`
+ * (an unresolved link, `member_added`, or an unknown event type), else the unfiltered blocks key
+ * plus every mounted recap query (blocks or days, whatever `filters`/`limit` it was given) whose
+ * own filter value is in scope.
+ */
+export function recapKeysForScope(scope: RecapScope | 'everything' | undefined, queryClient: QueryClient): RecapKeys {
+  if (scope === undefined) return { prefix: [], exact: [] };
+  if (scope === 'everything') return { prefix: [keys.recaps.all], exact: [] };
+  const prefix: QueryKey[] = [];
+  const exact: QueryKey[] = [];
+  for (const query of queryClient.getQueryCache().findAll({ queryKey: keys.recaps.all })) {
+    const [, kind, filtersOrScope] = query.queryKey as [string, string, unknown];
+    if (kind === 'blocks' && Object.keys((filtersOrScope as object | undefined) ?? {}).length === 0) {
+      exact.push(query.queryKey as QueryKey);
+    } else if (kind === 'blocks' && matchesBlockFilters((filtersOrScope ?? {}) as RecapBlockFilters, scope)) {
+      prefix.push(query.queryKey as QueryKey);
+    } else if (kind === 'days' && matchesDayScope(filtersOrScope as RecapDayScope, scope)) {
+      prefix.push(query.queryKey as QueryKey);
+    }
+  }
+  return { prefix, exact };
 }
 
 /**
@@ -54,6 +154,8 @@ export class Invalidator {
   readonly #waiting = new Set<string>();
   /** Exact keys of queries whose racing fetch has settled, to invalidate at the next flush. */
   readonly #settled = new Map<string, QueryKey>();
+  /** Keys to invalidate by their exact key only, never as a prefix (see `addExact`). */
+  readonly #pendingExact = new Map<string, QueryKey>();
   /** Bumped by `stop()`, so fetches that settle afterwards are ignored. */
   #generation = 0;
   #timer: ReturnType<typeof setTimeout> | undefined;
@@ -82,6 +184,20 @@ export class Invalidator {
   }
 
   /**
+   * Invalidates each of `keys` by its own exact key only, never as a prefix: for a key whose last
+   * segment is `{}` (e.g. a blocks query with no filters), TanStack matches that against *any*
+   * object, so invalidating it as a prefix would reach every differently-filtered query too.
+   * Coalesced like `add()`, but flushed with `exact: true`.
+   */
+  addExact(keys: readonly QueryKey[]): void {
+    for (const key of keys) {
+      this.#awaitFetches(key);
+      this.#pendingExact.set(JSON.stringify(key), key);
+    }
+    this.#schedule();
+  }
+
+  /**
    * For keys the cache was just written under: refetches the queries among them whose fetch is
    * in flight, after it settles, since its older answer will overwrite the write.
    */
@@ -95,6 +211,7 @@ export class Invalidator {
     this.#timer = undefined;
     this.#everythingTimer = undefined;
     this.#pending.clear();
+    this.#pendingExact.clear();
     this.#waiting.clear();
     this.#settled.clear();
     this.#everythingPending = false;
@@ -124,7 +241,10 @@ export class Invalidator {
   }
 
   #schedule(): void {
-    if (this.#timer === undefined && (this.#pending.size > 0 || this.#settled.size > 0)) {
+    if (
+      this.#timer === undefined &&
+      (this.#pending.size > 0 || this.#settled.size > 0 || this.#pendingExact.size > 0)
+    ) {
       this.#timer = setTimeout(() => this.#flush(), this.#windowMs);
     }
   }
@@ -145,11 +265,14 @@ export class Invalidator {
     this.#timer = undefined;
     const pending = [...this.#pending.values()];
     const settled = [...this.#settled.values()];
+    const pendingExact = [...this.#pendingExact.values()];
     this.#pending.clear();
     this.#settled.clear();
+    this.#pendingExact.clear();
     for (const queryKey of pending) this.#invalidate({ queryKey });
     // Exact: `['tasks', 'list', {}]` is also a prefix of every filtered task list.
     for (const queryKey of settled) this.#invalidate({ queryKey, exact: true });
+    for (const queryKey of pendingExact) this.#invalidate({ queryKey, exact: true });
   }
 
   /** Invalidates without cancelling, and spares queries still waiting for a racing fetch. */
@@ -215,6 +338,7 @@ function problemOf(error: unknown): LiveProblem {
 export function createLive(options: LiveOptions): Live {
   const { queryClient, transport } = options;
   const cache = cacheLookup(queryClient);
+  const recapCache = recapCacheLookup(queryClient);
   const store = createStore<LiveState>(() => ({ status: 'stopped', synced: false }));
   const invalidator = new Invalidator(
     queryClient,
@@ -272,7 +396,9 @@ export function createLive(options: LiveOptions): Live {
       try {
         const { touched, failed } = applyPatches(queryClient, events);
         invalidator.afterFetches(touched);
-        invalidator.add([...keysToInvalidate(events, cache), ...failed]);
+        const recapKeys = recapKeysForScope(recapScopeForEvents(events, recapCache), queryClient);
+        invalidator.add([...keysToInvalidate(events, cache), ...recapKeys.prefix, ...failed]);
+        invalidator.addExact(recapKeys.exact);
       } catch (error) {
         // A malformed event. `rev` has moved past the batch, so refetch rather than lose it.
         console.warn('pitcrew: could not apply an event batch; refetching everything', error);

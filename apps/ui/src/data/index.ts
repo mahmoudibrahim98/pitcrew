@@ -9,9 +9,11 @@ export {
   useApi,
   useConnection,
   useGatewayWorkspace,
+  useLiveInfiniteQuery,
   useLiveQuery,
   useOpenSocket,
 } from './provider.tsx';
+export { clauses, useRecapBlocks, useRecapDays, type Clause, type RecapBlocksOptions, type RecapDaysOptions } from './recaps.ts';
 export { AppData } from './root.tsx';
 export { streamPath, terminalPath, type StreamStatus } from './stream.ts';
 export {
@@ -23,7 +25,7 @@ export {
   type TransportSocket,
 } from './transport.ts';
 export type * from './types.ts';
-export { TRANSCRIPT_KINDS } from './types.ts';
+export { CHECKS, TRANSCRIPT_KINDS } from './types.ts';
 export {
   useGatewayWorkspaces,
   WorkspaceScope,

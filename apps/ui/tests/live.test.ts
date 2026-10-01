@@ -280,6 +280,39 @@ describe('invalidator', () => {
     invalidator.stop();
     unsubscribe();
   });
+
+  it('addExact invalidates only the exact key, never as a prefix (unlike add)', () => {
+    vi.useFakeTimers();
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(['recaps', 'blocks', {}], 1);
+    queryClient.setQueryData(['recaps', 'blocks', { task: 'T1' }], 1);
+    const invalidator = new Invalidator(queryClient, { windowMs: 250 });
+    invalidator.addExact([['recaps', 'blocks', {}]]);
+    vi.advanceTimersByTime(250);
+    expect(queryClient.getQueryState(['recaps', 'blocks', {}])?.isInvalidated).toBe(true);
+    // `add` would also reach this one: TanStack matches `{}` against any object. `addExact` does not.
+    expect(queryClient.getQueryState(['recaps', 'blocks', { task: 'T1' }])?.isInvalidated).toBe(false);
+    invalidator.stop();
+  });
+
+  it('addExact still waits for a racing fetch, like add', async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity, retry: false } } });
+    const resolvers: ((value: number) => void)[] = [];
+    const queryFn = vi.fn(() => new Promise<number>((resolve) => resolvers.push(resolve)));
+    const observer = new QueryObserver(queryClient, { queryKey: ['thing'], queryFn });
+    const unsubscribe = observer.subscribe(() => {});
+    await vi.waitFor(() => expect(queryFn).toHaveBeenCalledTimes(1));
+
+    const invalidator = new Invalidator(queryClient, { windowMs: 10 });
+    invalidator.addExact([['thing']]);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(queryFn).toHaveBeenCalledTimes(1); // not cancelled and restarted
+
+    resolvers[0]?.(1); // this answer may predate the event
+    await vi.waitFor(() => expect(queryFn).toHaveBeenCalledTimes(2));
+    invalidator.stop();
+    unsubscribe();
+  });
 });
 
 describe('live cache with a scripted stream', () => {

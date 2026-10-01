@@ -5,8 +5,11 @@
 import {
   QueryClient,
   QueryClientProvider,
+  useInfiniteQuery,
   useQuery,
+  type InfiniteData,
   type QueryKey,
+  type UseInfiniteQueryOptions,
   type UseQueryOptions,
 } from '@tanstack/react-query';
 import { createContext, use, useEffect, useState, type ReactNode } from 'react';
@@ -70,6 +73,26 @@ export function useLiveQuery<TData, TKey extends QueryKey = QueryKey>(
   const synced = useLive((s) => s.synced);
   const { enabled } = options;
   return useQuery({
+    ...options,
+    enabled:
+      typeof enabled === 'function'
+        ? (query) => synced && enabled(query)
+        : synced && enabled !== false,
+  });
+}
+
+/**
+ * `useInfiniteQuery` for server state paged backwards (recaps so far; see `src/data/recaps.ts`).
+ * Idle until the stream is synced, on `useLiveQuery`'s conventions: a fetch before the first
+ * `hello` could miss an event. Every loaded page refetches together when the query is
+ * invalidated, so older pages stay consistent with the newest one.
+ */
+export function useLiveInfiniteQuery<TQueryFnData, TKey extends QueryKey = QueryKey, TPageParam = unknown>(
+  options: UseInfiniteQueryOptions<TQueryFnData, Error, InfiniteData<TQueryFnData, TPageParam>, TKey, TPageParam>,
+) {
+  const synced = useLive((s) => s.synced);
+  const { enabled } = options;
+  return useInfiniteQuery({
     ...options,
     enabled:
       typeof enabled === 'function'
