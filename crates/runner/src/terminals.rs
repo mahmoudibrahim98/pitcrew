@@ -402,44 +402,55 @@ impl Calls {
 mod tests {
     use super::*;
 
+    /// Waits for the pool's thread to reach a point, however loaded the machine is.
+    const REACHED: Duration = Duration::from_secs(60);
+
+    /// Unavailable because the call did not answer in time.
+    fn timed_out<T>(r: &Result<T, TerminalError>) -> bool {
+        matches!(r, Err(TerminalError::Unavailable(m)) if m.contains("did not answer"))
+    }
+
+    /// Unavailable because the queue was full: refused without waiting for an answer.
+    fn refused<T>(r: &Result<T, TerminalError>) -> bool {
+        matches!(r, Err(TerminalError::Unavailable(m)) if m.contains("busy"))
+    }
+
+    /// Each step waits for the pool's thread to get where it must be (channels), not for a
+    /// margin of time, so a loaded machine makes it slower, never wrong.
     #[test]
     fn a_hung_call_times_out_and_a_full_pool_answers_at_once() {
         let calls = Calls::start(1, 1).expect("pool");
+        let (entered, in_stuck) = mpsc::channel::<()>();
         let (release, hold) = mpsc::channel::<()>();
-        let hold = Arc::new(Mutex::new(hold));
-        let stuck = {
-            let hold = Arc::clone(&hold);
-            move || {
-                let _ = hold.lock().map(|h| h.recv());
-                Ok(())
-            }
+        let stuck = move || {
+            let _ = entered.send(());
+            let _ = hold.recv();
+            Ok(())
         };
-        let started = Instant::now();
         let first = calls.run(Duration::from_millis(50), stuck);
-        assert!(
-            matches!(first, Err(TerminalError::Unavailable(_))),
-            "{first:?}"
-        );
-        // The only thread is still stuck: the next call waits in the queue and times out...
-        let second = calls.run(Duration::from_millis(50), || Ok(1));
-        assert!(matches!(second, Err(TerminalError::Unavailable(_))));
-        // ...and with the queue full, another is refused without waiting.
-        let before = Instant::now();
-        let third = calls.run(Duration::from_secs(10), || Ok(2));
-        assert!(matches!(third, Err(TerminalError::Unavailable(_))));
-        assert!(before.elapsed() < Duration::from_secs(1));
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(timed_out(&first), "{first:?}");
+        // The only thread is now in the stuck call: the queue is empty.
+        in_stuck
+            .recv_timeout(REACHED)
+            .expect("the thread took the stuck call");
 
-        // Unstuck, the pool works again.
-        let _ = release.send(());
-        let mut answered = None;
-        for _ in 0..100 {
-            if let Ok(v) = calls.run(Duration::from_millis(100), || Ok(7)) {
-                answered = Some(v);
-                break;
-            }
-        }
-        assert_eq!(answered, Some(7));
+        // The next call waits in the queue and times out...
+        let (ran, queued_ran) = mpsc::channel::<()>();
+        let second = calls.run(Duration::from_millis(50), move || {
+            let _ = ran.send(());
+            Ok(1)
+        });
+        assert!(timed_out(&second), "{second:?}");
+        // ...and with the queue full, another is refused at once, not after its timeout.
+        let third = calls.run(Duration::from_secs(10), || Ok(2));
+        assert!(refused(&third), "{third:?}");
+
+        // Unstuck, the thread runs the queued call, and the pool works again.
+        release.send(()).expect("the stuck call is waiting");
+        queued_ran
+            .recv_timeout(REACHED)
+            .expect("the queued call ran");
+        assert_eq!(calls.run(REACHED, || Ok(7)).ok(), Some(7));
     }
 
     #[test]
