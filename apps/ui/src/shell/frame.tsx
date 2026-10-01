@@ -2,7 +2,7 @@
 // inside the workspace's data scope (in the desktop app, each workspace has its own).
 
 import { Outlet, useRouter, useRouterState } from '@tanstack/react-router';
-import { lazy, Suspense, useEffect, type MouseEvent } from 'react';
+import { lazy, Suspense, useEffect, useRef, type MouseEvent } from 'react';
 import {
   useGatewayWorkspace,
   useGatewayWorkspaces,
@@ -55,9 +55,32 @@ function ScopeMissing({ reason }: { reason: ScopeFallback }) {
   );
 }
 
+/**
+ * In the desktop app: when the workspace on screen leaves the gateway's list (removed, from this
+ * window or elsewhere), go to the next ready workspace, or `/`, rather than stay on a page that is
+ * no longer there. A workspace never listed while on screen stays a not-found page.
+ */
+function useLeaveWhenDropped(ws: string): void {
+  const router = useRouter();
+  const list = useGatewayWorkspaces()?.list;
+  const seen = useRef<string | null>(null);
+  useEffect(() => {
+    if (list === undefined) return;
+    if (list.some((w) => w.id === ws)) {
+      seen.current = ws;
+      return;
+    }
+    if (seen.current !== ws) return;
+    seen.current = null;
+    const next = list.find((w) => w.state === 'ready') ?? list[0];
+    void router.navigate({ href: next === undefined ? '/' : paths.workspace(next.id), replace: true });
+  }, [list, ws, router]);
+}
+
 /** `/w/$ws`: the frame, in the workspace's data scope. Another workspace remounts everything. */
 export function WorkspaceFrame() {
   const ws = useWorkspaceId();
+  useLeaveWhenDropped(ws);
   return (
     <WorkspaceScope key={ws} ws={ws} fallback={(reason) => <ScopeMissing reason={reason} />}>
       <Frame />

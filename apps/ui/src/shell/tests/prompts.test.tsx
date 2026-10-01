@@ -204,4 +204,44 @@ describe('the prompt dialog', () => {
     await screen.findByRole('dialog', { name: "Check build-box's host key" });
     expect((within(dialog()).getByRole('button', { name: 'Accept' }) as HTMLButtonElement).disabled).toBe(true);
   });
+
+  it("answers ssh's other yes/no questions with Accept or Reject", async () => {
+    await renderApp();
+    await desktop.prompt({ id: 'c1', host: 'hpc-login', kind: 'confirm', text: 'Accept updated host keys? (yes/no)' });
+    await screen.findByRole('dialog', { name: 'hpc-login asks you to confirm' }, PATIENCE);
+    expect(within(dialog()).getByTestId('prompt-text').textContent).toBe('Accept updated host keys? (yes/no)');
+    expect(within(dialog()).queryByRole('textbox')).toBeNull();
+    let reply = desktop.nextReply();
+    fireEvent.click(within(dialog()).getByRole('button', { name: 'Reject' }));
+    expect(await reply).toEqual({ id: 'c1', accept: false });
+
+    await desktop.prompt({ id: 'c2', host: 'hpc-login', kind: 'confirm', text: 'Continue? (yes/no)' });
+    await screen.findByRole('dialog', { name: 'hpc-login asks you to confirm' });
+    reply = desktop.nextReply();
+    fireEvent.click(within(dialog()).getByRole('button', { name: 'Accept' }));
+    expect(await reply).toEqual({ id: 'c2', accept: true });
+  });
+
+  it('shows a notice until it is withdrawn, and Stop replies with neither', async () => {
+    await renderApp();
+    await desktop.prompt({ id: 'n1', host: 'hpc-login', kind: 'notice', text: 'Confirm user presence for key ED25519-SK' });
+    await screen.findByRole('dialog', { name: 'hpc-login is waiting for you' }, PATIENCE);
+    expect(within(dialog()).getByTestId('prompt-text').textContent).toBe('Confirm user presence for key ED25519-SK');
+    expect(within(dialog()).queryByRole('textbox')).toBeNull();
+    expect(within(dialog()).queryByRole('button', { name: 'Accept' })).toBeNull();
+    // ssh moved on: the gateway withdraws it, and nothing is sent.
+    await desktop.closePrompt('n1');
+    await vi.waitFor(() => expect(screen.queryByTestId('gateway-prompt')).toBeNull());
+    expect(desktop.commands('gateway_prompt_reply')).toEqual([]);
+
+    // The same id again (after a reload, say) shows once, not twice.
+    await desktop.prompt({ id: 'n2', host: 'hpc-login', kind: 'notice', text: 'Touch your security key' });
+    await desktop.prompt({ id: 'n2', host: 'hpc-login', kind: 'notice', text: 'Touch your security key' });
+    await screen.findByRole('dialog', { name: 'hpc-login is waiting for you' });
+    expect(within(dialog()).queryByText(/more prompt/)).toBeNull();
+    const reply = desktop.nextReply();
+    fireEvent.click(within(dialog()).getByRole('button', { name: 'Stop' }));
+    expect(await reply).toEqual({ id: 'n2' });
+    await vi.waitFor(() => expect(screen.queryByTestId('gateway-prompt')).toBeNull());
+  });
 });

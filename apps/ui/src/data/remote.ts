@@ -17,6 +17,8 @@ export interface RemoteProbe {
   /** PitCrew's helper (`pitcrewd`), if it is there. */
   helper?: { version: string; running: boolean } | undefined;
   slurm?: { version: string; defaultPartition?: string | undefined; srunOverlap: boolean } | undefined;
+  /** tmux, if it is there: the tmux launcher needs 3.2 or newer. Absent means not known. */
+  tmux?: { version: string } | undefined;
 }
 
 /** How the remote's helper runs. */
@@ -51,16 +53,26 @@ export interface RemotePlan {
   jobScript?: string | undefined;
 }
 
-/** One message on `gateway_remote_add`'s channel. The last is `done` or `failed` for the whole add. */
+/**
+ * One message on `gateway_remote_add`'s channel. `step` is one of the plan's `steps` (a `running`
+ * message may come again with a `detail`: "40% sent", "job 4242 pending"); the last message is
+ * `{ step: 'add', state: 'done' | 'failed', detail? }`, for the whole add. A SLURM add can take
+ * minutes: there is no time limit here.
+ */
 export interface RemoteProgress {
   step: string;
   state: 'running' | 'done' | 'failed';
   detail?: string | undefined;
 }
 
-export type PromptKind = 'password' | 'passphrase' | 'otp' | 'host_key';
+/**
+ * `password`, `passphrase` and `otp` take an `answer`; `host_key` and `confirm` (ssh's other yes/no
+ * questions) take `accept`; a `notice` ("touch your security key") takes nothing, and is closed when
+ * ssh moves on.
+ */
+export type PromptKind = 'password' | 'passphrase' | 'otp' | 'host_key' | 'confirm' | 'notice';
 
-export const PROMPT_KINDS: readonly PromptKind[] = ['password', 'passphrase', 'otp', 'host_key'];
+export const PROMPT_KINDS: readonly PromptKind[] = ['password', 'passphrase', 'otp', 'host_key', 'confirm', 'notice'];
 
 /** `gateway://prompt`: SSH asks something. `text` is untrusted: show it as text, never markup. */
 export interface GatewayPrompt {
@@ -72,7 +84,7 @@ export interface GatewayPrompt {
   fingerprint?: string | undefined;
 }
 
-/** `answer` for a password, passphrase or code; `accept` for a host key; neither cancels. */
+/** `answer` for a password, passphrase or code; `accept` for a host key or a confirm; neither cancels (and stops ssh). */
 export type PromptReply = { answer: string } | { accept: boolean } | Record<string, never>;
 
 /**
@@ -89,6 +101,11 @@ export interface RemoteGateway {
   remoteAdd(plan: string, onProgress: (progress: RemoteProgress) => void): Promise<GatewayWorkspace>;
   /** Forgets a workspace and its token; with `stopHelper`, first stops the remote helper (and its SLURM job). */
   workspaceRemove(workspace: string, stopHelper: boolean): Promise<void>;
+  /**
+   * Tries an `unreachable` remote workspace's connection again at once (after a cancelled sign-in,
+   * say). Resolves once the attempt has started; its state follows on `gateway://workspaces`.
+   */
+  workspaceRetry(workspace: string): Promise<void>;
   /** Follows `gateway://prompt`; malformed prompts are dropped. Resolves to an unsubscribe. */
   onPrompt(listener: (prompt: GatewayPrompt) => void): Promise<() => void>;
   /** Follows `gateway://prompt-closed`: the prompt `id` is no longer wanted. */
@@ -178,6 +195,11 @@ export function parseRemoteProbe(value: unknown): RemoteProbe | undefined {
       srunOverlap: slurm.srunOverlap,
       ...(partition === undefined ? {} : { defaultPartition: cleanLine(partition) }),
     };
+  }
+  if (v.tmux !== undefined && v.tmux !== null) {
+    const tmux = record(v.tmux);
+    if (tmux === undefined || typeof tmux.version !== 'string') return undefined;
+    probe.tmux = { version: cleanLine(tmux.version) };
   }
   return probe;
 }

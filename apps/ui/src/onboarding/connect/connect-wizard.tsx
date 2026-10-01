@@ -57,15 +57,35 @@ interface JobDraft {
 }
 
 const JOB_FIELDS: { key: keyof JobDraft; label: string; hint?: string }[] = [
-  { key: 'site', label: 'Site recipe', hint: 'A site recipe’s name, if your site has one.' },
+  { key: 'site', label: 'Site recipe', hint: 'Your site’s recipe, if it has one; generic otherwise.' },
   { key: 'partition', label: 'Partition' },
   { key: 'account', label: 'Account' },
   { key: 'qos', label: 'QoS' },
-  { key: 'time', label: 'Time limit', hint: 'For example 7-00:00:00.' },
+  { key: 'time', label: 'Time limit', hint: 'For example 08:00:00, or 2-00:00:00.' },
   { key: 'cpus', label: 'CPUs' },
-  { key: 'memory', label: 'Memory', hint: 'For example 4G.' },
-  { key: 'gpus', label: 'GPUs', hint: 'For example 1, or a100:1.' },
+  { key: 'memory', label: 'Memory', hint: 'For example 16G.' },
+  { key: 'gpus', label: 'GPUs', hint: 'For example 2, or a100:2.' },
 ];
+
+/**
+ * Whether the probe found a tmux the tmux launcher can use (3.2 or newer): `false` for an older
+ * one, `undefined` when it is not known (the gateway did not say).
+ */
+export function tmuxUsable(probe: RemoteProbe | undefined): boolean | undefined {
+  const version = probe?.tmux?.version;
+  const match = version === undefined ? null : /(\d+)\.(\d+)/.exec(version);
+  if (match === null) return undefined;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  return major > 3 || (major === 3 && minor >= 2);
+}
+
+/** The launcher to start from, given what the probe found. */
+function usableLauncher(current: RemoteLauncher, probe: RemoteProbe): RemoteLauncher {
+  if (current === 'slurm' && probe.slurm === undefined) return tmuxUsable(probe) === false ? 'direct' : 'tmux';
+  if (current === 'tmux' && tmuxUsable(probe) === false) return 'direct';
+  return current;
+}
 
 const EMPTY_JOB: JobDraft = { site: '', partition: '', account: '', qos: '', time: '', cpus: '', memory: '', gpus: '' };
 
@@ -140,6 +160,9 @@ export function planRequest(host: string, launcher: RemoteLauncher, job: JobDraf
   };
 }
 
+/** The step of the last progress message: the whole add's outcome, not one of the plan's steps. */
+const ADD = 'add';
+
 /** Progress by step, in the order steps first appeared, each with its latest state. */
 function merge(progress: readonly RemoteProgress[], next: RemoteProgress): RemoteProgress[] {
   const index = progress.findIndex((p) => p.step === next.step);
@@ -181,8 +204,8 @@ export function ConnectWizard({
       setState((s) => ({
         ...s,
         probe: found,
-        // SLURM only where there is one; the site's default partition to start from.
-        launcher: s.launcher === 'slurm' && found.slurm === undefined ? 'tmux' : s.launcher,
+        // SLURM and tmux only where they can run; the site's default partition to start from.
+        launcher: usableLauncher(s.launcher, found),
         job: s.job.partition === '' ? { ...s.job, partition: found.slurm?.defaultPartition ?? '' } : s.job,
       }));
     } catch (error) {
@@ -225,8 +248,10 @@ export function ConnectWizard({
         return;
       }
       setState((s) => {
-        const failed = [...s.progress].reverse().find((p) => p.state === 'failed');
-        return { ...s, failure: { step: failed?.step, detail: failed?.detail ?? messageOf(error) } };
+        // The step that failed, with its detail, else the whole add's ("add"), else the error's.
+        const failed = [...s.progress].reverse().find((p) => p.state === 'failed' && p.step !== ADD);
+        const whole = s.progress.find((p) => p.step === ADD);
+        return { ...s, failure: { step: failed?.step, detail: failed?.detail ?? whole?.detail ?? messageOf(error) } };
       });
     }
   }
@@ -244,7 +269,8 @@ export function ConnectWizard({
               aria-current={i === index ? 'step' : undefined}
               className={cx(
                 'flex items-center gap-2 rounded-sm px-2.5 py-1.5 text-sm',
-                i === index ? 'bg-accent-soft font-medium text-accent-text' : i < index ? 'text-ink-2' : 'text-muted',
+                // Steps ahead are plain text, not controls: they keep a readable contrast.
+                i === index ? 'bg-accent-soft font-medium text-accent-text' : 'text-ink-2',
               )}
             >
               <span
@@ -525,6 +551,8 @@ function ProbeStep({
               ? 'Not found'
               : `${probe.slurm.version}${probe.slurm.defaultPartition === undefined ? '' : `, default partition ${probe.slurm.defaultPartition}`}`}
           </dd>
+          <dt className="text-ink-2">tmux</dt>
+          <dd>{probe.tmux === undefined ? 'Not known' : probe.tmux.version}</dd>
         </dl>
       )}
       <Footer>
@@ -565,7 +593,19 @@ function LauncherStep({
   onContinue(): void;
 }) {
   const slurm = state.probe?.slurm !== undefined;
+  const tmux = tmuxUsable(state.probe);
   const reasonId = useId();
+  // Why a launcher is off, or what to know before picking it.
+  const notes: Record<RemoteLauncher, { disabled: boolean; note?: string | undefined }> = {
+    direct: { disabled: false },
+    tmux:
+      tmux === false
+        ? { disabled: true, note: `tmux ${state.probe?.tmux?.version ?? ''} is too old here: PitCrew needs 3.2 or newer.` }
+        : tmux === undefined
+          ? { disabled: false, note: `Whether ${state.host} has tmux 3.2 or newer is not known: the plan says so if not.` }
+          : { disabled: false },
+    slurm: slurm ? { disabled: false } : { disabled: true, note: `SLURM was not found on ${state.host}.` },
+  };
   return (
     <form
       onSubmit={(event) => {
@@ -586,7 +626,8 @@ function LauncherStep({
       <fieldset className="mt-4 flex flex-col gap-1.5">
         <legend className="mb-1.5 text-sm font-medium text-ink">Launcher</legend>
         {LAUNCHER_ORDER.map((launcher) => {
-          const disabled = launcher === 'slurm' && !slurm;
+          const { disabled, note } = notes[launcher];
+          const noteId = `${reasonId}-${launcher}`;
           return (
             <label
               key={launcher}
@@ -601,7 +642,7 @@ function LauncherStep({
                 name="launcher"
                 value={launcher}
                 disabled={disabled}
-                aria-describedby={disabled ? reasonId : undefined}
+                aria-describedby={note === undefined ? undefined : noteId}
                 checked={state.launcher === launcher}
                 onChange={() => patch({ launcher })}
                 className="mt-0.5"
@@ -609,9 +650,9 @@ function LauncherStep({
               <span>
                 <span className="block font-medium">{LAUNCHERS[launcher].label}</span>
                 <span className="block text-xs text-ink-2">{LAUNCHERS[launcher].hint}</span>
-                {disabled && (
-                  <span id={reasonId} className="block text-xs text-ink-2">
-                    SLURM was not found on {state.host}.
+                {note !== undefined && (
+                  <span id={noteId} className="block text-xs text-ink-2">
+                    {note}
                   </span>
                 )}
               </span>
@@ -780,7 +821,8 @@ function ReviewStep({
 
 // ─── 5. Connect ────────────────────────────────────────────────────────────────────────────────
 
-const PROGRESS_LABEL: Record<RemoteProgress['state'], string> = {
+const PROGRESS_LABEL: Record<RemoteProgress['state'] | 'waiting', string> = {
+  waiting: 'Waiting',
   running: 'Running…',
   done: 'Done',
   failed: 'Failed',
@@ -798,14 +840,23 @@ function ConnectStep({
   onCancel(): void;
 }) {
   const { progress, failure } = state;
+  // The plan's steps, in its order, each with its latest message; then any step it did not name.
+  const planned = state.plan?.steps ?? [];
+  const extra = progress.filter((p) => p.step !== ADD && !planned.includes(p.step)).map((p) => p.step);
+  const rows = [...planned, ...extra].map(
+    (step) => progress.find((p) => p.step === step) ?? { step, state: 'waiting' as const, detail: undefined },
+  );
   return (
     <div>
       <Heading heading={heading}>Connecting {state.host}</Heading>
       {failure === undefined && (
-        <Status>Working. If SSH asks for a password, a code or a host key, answer in the dialog.</Status>
+        <Status>
+          Working. If SSH asks for a password, a code or a host key, answer in the dialog.
+          {state.launcher === 'slurm' && ' A SLURM job may wait in the queue for several minutes; PitCrew waits with it.'}
+        </Status>
       )}
       <ol className="mt-4 flex flex-col gap-1.5 text-sm" aria-label="Progress" data-testid="progress">
-        {progress.map((p) => (
+        {rows.map((p) => (
           <li key={p.step} className="flex flex-col rounded-sm border border-line px-3 py-2">
             <span className="flex items-center justify-between gap-3">
               <span className="text-ink">{p.step}</span>

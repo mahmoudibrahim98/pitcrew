@@ -57,9 +57,22 @@ function OpenDesktopWorkspace({ workspaces }: { workspaces: WorkspacesView }) {
   const { list, error, retry } = workspaces;
   const pick = list === undefined ? undefined : pickWorkspace(list, last);
   if (pick !== undefined) return <Redirect href={paths.workspace(pick.id)} />;
-  if (list !== undefined) return <StatusScreen action={<ConnectButton />}>No workspaces yet.</StatusScreen>;
+  if (list !== undefined) return <NoWorkspaces />;
   if (error !== undefined) return <WorkspacesFailed message={error} onRetry={retry} />;
   return <StatusScreen>Loading workspaces…</StatusScreen>;
+}
+
+/** The desktop app with no workspace at all: say so, and offer to connect one. */
+function NoWorkspaces() {
+  return (
+    <main className="grid min-h-dvh place-items-center bg-bg px-6 text-ink">
+      <div className="flex max-w-md flex-col items-center gap-3 text-center">
+        <h1 className="text-lg font-semibold">No workspaces yet.</h1>
+        <p className="text-sm text-ink-2">A workspace is a PitCrew hub: on this machine, or on a remote one over SSH.</p>
+        <ConnectButton />
+      </div>
+    </main>
+  );
 }
 
 /** Opens the "connect a remote machine" wizard; none where the gateway has no remote commands. */

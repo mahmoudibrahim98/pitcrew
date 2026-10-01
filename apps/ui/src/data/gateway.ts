@@ -113,6 +113,10 @@ export function createRemoteGateway(): RemoteGateway {
       await call<unknown>('gateway_workspace_remove', { workspace, stopHelper });
     },
 
+    async workspaceRetry(workspace) {
+      await call<unknown>('gateway_workspace_retry', { workspace });
+    },
+
     onPrompt: (listener) =>
       listen<unknown>(PROMPT_EVENT, (event) => {
         const prompt = parsePrompt(event.payload);

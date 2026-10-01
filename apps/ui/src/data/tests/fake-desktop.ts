@@ -61,6 +61,7 @@ export class FakeDesktop {
   /** `gateway_remote_add`: progress goes on `channel`; resolve with the workspace, or `refuse`. */
   add: (plan: string, channel: FakeChannel) => Promise<unknown> = () => refuse('invalid', 'No add set up.');
   remove: (workspace: string, stopHelper: boolean) => Promise<unknown> = () => Promise.resolve(null);
+  retry: (workspace: string) => Promise<unknown> = () => Promise.resolve(null);
   /** Called with each `gateway_prompt_reply`'s arguments. */
   onReply: ((args: Record<string, unknown>) => void) | undefined;
 
@@ -131,6 +132,8 @@ export class FakeDesktop {
         return this.add(String(args.plan), channelOf(args.events));
       case 'gateway_workspace_remove':
         return this.remove(String(args.workspace), args.stopHelper === true);
+      case 'gateway_workspace_retry':
+        return this.retry(String(args.workspace));
       case 'gateway_prompt_reply':
         this.onReply?.(args);
         return null;

@@ -1,7 +1,9 @@
 // One SSH prompt (desktop-gateway.md, "Prompts"). It says which host is asking and shows ssh's own
 // question as plain text (it is untrusted: never markup). A password, passphrase or code goes in a
 // password field with autocomplete off; a new host key shows its fingerprint, with Accept and
-// Reject. Closing it (Cancel, Esc, the close button) replies with neither, which cancels.
+// Reject; ssh's other yes/no questions (`confirm`) have Accept and Reject; a `notice` ("touch your
+// security key") has nothing to answer and stays until the gateway withdraws it. Closing it
+// (Cancel, Stop, Esc, the close button) replies with neither, which cancels and stops ssh.
 //
 // The answer lives in this component's state and nowhere else: not in a store, a query cache, the
 // URL, storage or a log. It is cleared as it is sent.
@@ -16,9 +18,11 @@ const TITLE: Record<PromptKind, (host: string) => string> = {
   passphrase: (host) => `${host} asks for a key passphrase`,
   otp: (host) => `${host} asks for a one-time code`,
   host_key: (host) => `Check ${host}'s host key`,
+  confirm: (host) => `${host} asks you to confirm`,
+  notice: (host) => `${host} is waiting for you`,
 };
 
-const FIELD: Record<Exclude<PromptKind, 'host_key'>, string> = {
+const FIELD: Record<'password' | 'passphrase' | 'otp', string> = {
   password: 'Password',
   passphrase: 'Passphrase',
   otp: 'One-time code',
@@ -54,9 +58,25 @@ export function PromptDialog({
             </p>
           )}
         </div>
-        {prompt.kind === 'host_key' ? (
-          <HostKey prompt={prompt} reply={reply} />
-        ) : (
+        {prompt.kind === 'host_key' && <HostKey prompt={prompt} reply={reply} />}
+        {prompt.kind === 'confirm' && (
+          <DialogFooter>
+            <Button onClick={() => reply({ accept: false })}>Reject</Button>
+            <Button variant="primary" onClick={() => reply({ accept: true })}>
+              Accept
+            </Button>
+          </DialogFooter>
+        )}
+        {prompt.kind === 'notice' && (
+          <>
+            <p className="px-4 pb-4 text-sm text-ink-2">This closes by itself once ssh moves on.</p>
+            <DialogFooter>
+              {/* Nothing to answer; replying with neither field stops ssh. */}
+              <Button onClick={() => reply({})}>Stop</Button>
+            </DialogFooter>
+          </>
+        )}
+        {(prompt.kind === 'password' || prompt.kind === 'passphrase' || prompt.kind === 'otp') && (
           <Answer label={FIELD[prompt.kind]} reply={reply} />
         )}
       </DialogContent>

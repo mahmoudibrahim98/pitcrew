@@ -33,7 +33,11 @@ the desktop app"):
 - each workspace has its own data scope: switching remounts the frame, and never shows another
   workspace's data;
 - a workspace that is `unreachable` or `needs_pairing` keeps the frame (so another is one click
-  away) and shows why in the main area, with the gateway's `detail`; the top bar's pill says so;
+  away) and shows why in the main area, with the gateway's `detail`; the top bar's pill says so.
+  A remote one that is `unreachable` (a sign-in cancelled while reconnecting, say) offers Retry
+  (`gateway_workspace_retry`);
+- a workspace the gateway drops while it is on screen (removed, here or elsewhere) is left for the
+  next ready one, or `/`; one never listed while on screen stays a not-found page;
 - `/` opens the workspace last opened, or the first ready one; an id the gateway does not list
   is not found;
 - a workspace out of view for 10 minutes has its stream closed, resumed with `since` when it is
@@ -71,7 +75,9 @@ the oldest one; the rest wait, and the dialog says how many.
   rendered as markup.
 - A password, passphrase or code goes in a password field with autocomplete off; Send stays off
   while it is empty. A host key shows its fingerprint, with Accept and Reject (Accept stays off
-  when the gateway gave no fingerprint to compare).
+  when the gateway gave no fingerprint to compare). ssh's other yes/no questions (`confirm`) have
+  Accept and Reject. A `notice` ("touch your security key") has nothing to answer: it stays until
+  the gateway withdraws it, and Stop replies with neither, which stops ssh.
 - Cancel, Esc and the close button reply with neither field, which cancels. A
   `gateway://prompt-closed` withdraws the prompt without a reply.
 - **The answer lives only in the dialog's own state** (one per prompt, keyed by its id). It is

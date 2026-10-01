@@ -48,7 +48,7 @@ beforeEach(() => {
     plans += 1;
     return {
       plan: `plan-${plans}`,
-      steps: [`Plan ${plans}: copy pitcrewd 0.4.0 to ~/.pitcrew`, 'Submit the job below'],
+      steps: stepsOf(`plan-${plans}`),
       jobScript: SCRIPT,
     };
   };
@@ -96,22 +96,35 @@ async function toReview() {
   await heading('Review: connect hpc-login');
 }
 
-/** An add that asks for a password half-way, then registers the workspace (or fails if cancelled). */
+/** A plan's steps, as the gateway names them; the plan's id shows in the first. */
+function stepsOf(plan: string): string[] {
+  return [`Copy pitcrewd 0.4.0 to ~/.pitcrew (${plan})`, 'Submit the job below', 'Connect and pair'];
+}
+
+/**
+ * An add that asks for a password half-way, then registers the workspace (or fails if cancelled).
+ * Each message's step is one of the plan's steps; the last is the whole add's, `add`.
+ */
 function addAsking(): (plan: string, channel: FakeChannel) => Promise<unknown> {
-  return async (_plan, channel) => {
-    channel.send({ step: 'Copy pitcrewd 0.4.0', state: 'running' });
+  return async (plan, channel) => {
+    const [copy = '', submit = '', connect = ''] = stepsOf(plan);
+    channel.send({ step: copy, state: 'running' });
+    channel.send({ step: copy, state: 'running', detail: '40% sent' });
     const reply = desktop.nextReply();
     await desktop.prompt({ id: 'pw-1', host: 'hpc-login', kind: 'password', text: "sam@hpc-login's password: " });
     const answer = await reply;
     if (typeof answer.answer !== 'string') {
-      channel.send({ step: 'Copy pitcrewd 0.4.0', state: 'failed', detail: 'Authentication cancelled.' });
+      channel.send({ step: copy, state: 'failed', detail: 'Authentication cancelled.' });
+      channel.send({ step: 'add', state: 'failed', detail: 'ssh: authentication cancelled' });
       return refuse('unreachable', 'ssh: authentication cancelled');
     }
-    channel.send({ step: 'Copy pitcrewd 0.4.0', state: 'done' });
-    channel.send({ step: 'Submit the job', state: 'done', detail: 'Submitted batch job 4242' });
+    channel.send({ step: copy, state: 'done' });
+    channel.send({ step: submit, state: 'running', detail: 'job 4242 pending (Priority)' });
+    channel.send({ step: submit, state: 'done', detail: 'Submitted batch job 4242' });
     desktop.daemons.set(NEW.id, fresh.daemon);
     await desktop.setWorkspaces([NEW]);
-    channel.send({ step: 'Connect and pair', state: 'done' });
+    channel.send({ step: connect, state: 'done' });
+    channel.send({ step: 'add', state: 'done' });
     return NEW;
   };
 }
@@ -131,7 +144,7 @@ describe('connecting a remote machine', () => {
     expect(desktop.commands('gateway_remote_plan')).toEqual([
       { req: { host: 'hpc-login', launcher: 'slurm', job: { partition: 'gpu', time: '7-00:00:00', cpus: 2 } } },
     ]);
-    expect(screen.getByTestId('plan-steps').textContent).toContain('Plan 1: copy pitcrewd 0.4.0 to ~/.pitcrew');
+    expect(screen.getByTestId('plan-steps').textContent).toContain('Copy pitcrewd 0.4.0 to ~/.pitcrew (plan-1)');
     // Verbatim: tabs, trailing spaces and blank lines included.
     expect(screen.getByTestId('job-script').textContent).toBe(SCRIPT);
     expect(screen.getByText('Nothing changes on the remote until you press Connect.')).toBeTruthy();
@@ -141,10 +154,20 @@ describe('connecting a remote machine', () => {
     await heading('Connecting hpc-login');
     // SSH asks; the shell's dialog answers.
     const dialog = await screen.findByRole('dialog', { name: 'hpc-login asks for a password' }, PATIENCE);
+    // Meanwhile (behind the dialog, so hidden from the accessibility tree for now): every step of
+    // the plan, each with its latest state and detail.
+    const rows = within(screen.getByTestId('progress')).getAllByRole('listitem', { hidden: true });
+    expect(rows.map((r) => r.textContent)).toEqual([
+      'Copy pitcrewd 0.4.0 to ~/.pitcrew (plan-1)Running…40% sent',
+      'Submit the job belowWaiting',
+      'Connect and pairWaiting',
+    ]);
+    expect(screen.getByText(/A SLURM job may wait in the queue for several minutes/)).toBeTruthy();
     fireEvent.change(within(dialog).getByLabelText('Password'), { target: { value: SECRET } });
     fireEvent.click(within(dialog).getByRole('button', { name: 'Send' }));
 
     await heading('Set up hpc-login');
+    expect(within(screen.queryByTestId('progress') ?? document.body).queryByText('add')).toBeNull();
     expect(desktop.commands('gateway_remote_add').map((a) => a.plan)).toEqual(['plan-1']);
     expect(desktop.commands('gateway_prompt_reply')).toEqual([{ id: 'pw-1', answer: SECRET }]);
 
@@ -185,14 +208,14 @@ describe('connecting a remote machine', () => {
     };
     renderApp();
     await toReview();
-    expect(screen.getByTestId('plan-steps').textContent).toContain('Plan 1');
+    expect(screen.getByTestId('plan-steps').textContent).toContain('(plan-1)');
     fireEvent.click(button('Connect'));
 
     await heading('Review: connect hpc-login');
     const notice = await screen.findByText(/The gateway refused that plan \(The plan has expired\.\)/);
     expect(notice.getAttribute('role')).toBe('status');
     // A fresh plan, shown before it can be submitted.
-    await vi.waitFor(() => expect(screen.getByTestId('plan-steps').textContent).toContain('Plan 2'));
+    await vi.waitFor(() => expect(screen.getByTestId('plan-steps').textContent).toContain('(plan-2)'));
     expect(screen.getByTestId('job-script').textContent).toBe(SCRIPT);
     expect(desktop.commands('gateway_remote_add').map((a) => a.plan)).toEqual(['plan-1']);
 
@@ -211,7 +234,7 @@ describe('connecting a remote machine', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
 
     const alert = await screen.findByRole('alert', undefined, PATIENCE);
-    expect(alert.textContent).toBe('Connecting failed at “Copy pitcrewd 0.4.0”: Authentication cancelled.');
+    expect(alert.textContent).toBe('Connecting failed at “Copy pitcrewd 0.4.0 to ~/.pitcrew (plan-1)”: Authentication cancelled.');
     expect(desktop.commands('gateway_prompt_reply')).toEqual([{ id: 'pw-1' }]);
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(screen.queryByText(/^Working\./)).toBeNull();
@@ -220,7 +243,53 @@ describe('connecting a remote machine', () => {
     // The plan was used: back to Review means a fresh one.
     fireEvent.click(button('Back to review'));
     await heading('Review: connect hpc-login');
-    await vi.waitFor(() => expect(screen.getByTestId('plan-steps').textContent).toContain('Plan 2'));
+    await vi.waitFor(() => expect(screen.getByTestId('plan-steps').textContent).toContain('(plan-2)'));
+  });
+
+  it("falls back on the whole add's detail when no step says why", async () => {
+    desktop.add = async (plan, channel) => {
+      const [copy = ''] = stepsOf(plan);
+      channel.send({ step: copy, state: 'done' });
+      channel.send({ step: 'add', state: 'failed', detail: 'The helper did not start: no space left on device.' });
+      return refuse('unreachable', 'add failed');
+    };
+    renderApp();
+    await toReview();
+    fireEvent.click(button('Connect'));
+    expect((await screen.findByRole('alert', undefined, PATIENCE)).textContent).toBe(
+      'Connecting failed: The helper did not start: no space left on device.',
+    );
+  });
+
+  it('offers tmux only from 3.2, and says when it is not known', async () => {
+    desktop.probe = (host) => ({ host, os: 'linux', arch: 'x86_64', tmux: { version: '3.1c' } });
+    renderApp();
+    await heading('Connect a remote machine');
+    fireEvent.click(await screen.findByRole('radio', { name: 'hpc-login' }));
+    fireEvent.click(button('Continue'));
+    await heading('Checking hpc-login');
+    expect((await screen.findByTestId('probe')).textContent).toContain('tmux3.1c');
+    fireEvent.click(button('Continue'));
+    await heading('How PitCrew runs on hpc-login');
+    const tmux = screen.getByRole('radio', { name: /In tmux/ }) as HTMLInputElement;
+    expect(tmux.disabled).toBe(true);
+    expect(screen.getByText('tmux 3.1c is too old here: PitCrew needs 3.2 or newer.')).toBeTruthy();
+    // Not tmux, then: the launcher starts on one that can run.
+    expect((screen.getByRole('radio', { name: /Directly/ }) as HTMLInputElement).checked).toBe(true);
+
+    // Unknown: offered, with a note.
+    fireEvent.click(button('Back'));
+    desktop.probe = (host) => ({ host, os: 'linux', arch: 'x86_64' });
+    await heading('Checking hpc-login');
+    fireEvent.click(button('Back'));
+    await heading('Connect a remote machine');
+    fireEvent.click(button('Continue'));
+    await heading('Checking hpc-login');
+    expect((await screen.findByTestId('probe')).textContent).toContain('tmuxNot known');
+    fireEvent.click(button('Continue'));
+    await heading('How PitCrew runs on hpc-login');
+    expect((screen.getByRole('radio', { name: /In tmux/ }) as HTMLInputElement).disabled).toBe(false);
+    expect(screen.getByText('Whether hpc-login has tmux 3.2 or newer is not known: the plan says so if not.')).toBeTruthy();
   });
 
   it('refuses a typed host starting with "-", and probes one typed well', async () => {

@@ -132,6 +132,31 @@ describe('in the desktop app', () => {
     expect(router.state.location.pathname).toBe(paths.home(BETA));
   });
 
+  it('offers Retry on an unreachable remote workspace', async () => {
+    desktop.workspaces = [alpha, { ...beta, state: 'unreachable', detail: 'The sign-in was cancelled.' }];
+    desktop.retry = async () => {
+      await desktop.setWorkspaces([alpha, beta]);
+      return null;
+    };
+    renderDesktop(paths.home(BETA));
+    await screen.findByRole('heading', { level: 1, name: 'Cannot reach hpc-login' }, PATIENCE);
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await screen.findByRole('link', { name: 'Beta project' }, PATIENCE);
+    expect(desktop.commands('gateway_workspace_retry')).toEqual([{ workspace: BETA }]);
+  });
+
+  it('leaves a workspace the gateway drops while it is on screen: for the next one, or `/`', async () => {
+    const router = renderDesktop(paths.home(BETA));
+    await screen.findByRole('link', { name: 'Beta project' }, PATIENCE);
+    await desktop.setWorkspaces([alpha]);
+    await vi.waitFor(() => expect(router.state.location.pathname).toBe(paths.home(ALPHA)), PATIENCE);
+    await screen.findByRole('link', { name: 'Alpha project' }, PATIENCE);
+
+    await desktop.setWorkspaces([]);
+    await screen.findByRole('heading', { level: 1, name: 'No workspaces yet.' }, PATIENCE);
+    expect(router.state.location.pathname).toBe('/');
+  });
+
   it('offers to connect a machine when there are no workspaces yet', async () => {
     desktop.workspaces = [];
     const router = renderDesktop('/');

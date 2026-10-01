@@ -2,8 +2,8 @@
 // line (opening, listing workspaces), or, in the desktop app, why the gateway cannot reach a
 // workspace. Never a spinner: a workspace that is unreachable or needs pairing says so.
 
-import type { ReactNode } from 'react';
-import type { GatewayWorkspace } from '../../data/index.ts';
+import { useState, type ReactNode } from 'react';
+import { useRemoteGateway, type GatewayWorkspace } from '../../data/index.ts';
 import { Button } from '../../design/index.ts';
 
 export function StatusScreen({
@@ -67,6 +67,41 @@ export function WorkspaceUnavailable({ workspace }: { workspace: GatewayWorkspac
       {workspace.detail !== undefined && workspace.detail !== '' && (
         <p className="text-sm text-ink-2" data-testid="workspace-detail">
           {workspace.detail}
+        </p>
+      )}
+      {workspace.kind === 'remote' && workspace.state === 'unreachable' && <RetryConnection workspace={workspace.id} />}
+    </div>
+  );
+}
+
+/**
+ * A remote workspace left `unreachable` (a sign-in cancelled while reconnecting, say) is tried again
+ * at once (`gateway_workspace_retry`); its state then follows on `gateway://workspaces`.
+ */
+function RetryConnection({ workspace }: { workspace: string }) {
+  const remote = useRemoteGateway();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  if (remote === null) return null;
+  const retry = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await remote.workspaceRetry(workspace);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : 'The gateway could not try again.');
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="mt-2 flex flex-col items-start gap-2">
+      <Button onClick={() => void retry()} disabled={busy}>
+        {busy ? 'Trying…' : 'Retry'}
+      </Button>
+      {error !== null && (
+        <p role="alert" className="text-sm text-risk">
+          {error}
         </p>
       )}
     </div>

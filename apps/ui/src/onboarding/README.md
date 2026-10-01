@@ -65,15 +65,22 @@ before any workspace exists. It drives the gateway's remote commands:
 1. **Host**: one from your ssh config (`discoverHosts`, the gateway's `sshHosts`), or typed. A host
    is checked first: no leading `-` (ssh would read it as an option), no whitespace or control
    characters.
-2. **Probe** (`remoteProbe`): the OS and architecture, whether PitCrew is there and running, and
-   SLURM's version and default partition.
-3. **Launcher**: `direct`, `tmux` or `slurm` (only where the probe found SLURM). For SLURM: the site
-   recipe, partition (the default to start from), account, QoS, time, CPUs, memory and GPUs.
+2. **Probe** (`remoteProbe`): the OS and architecture, whether PitCrew is there and running,
+   SLURM's version and default partition, and tmux's version when the gateway gives it.
+3. **Launcher**: `direct`, `tmux` or `slurm`. SLURM only where the probe found it; tmux only from
+   3.2 (an older one is off, with the reason; an unknown one is offered, with a note that the plan
+   says so if not). For SLURM: the site recipe (generic by default), partition (the default to
+   start from), account, QoS, time (`08:00:00`, `2-00:00:00`), CPUs, memory (`16G`) and GPUs
+   (`2`, `a100:2`).
 4. **Review** (`remotePlan`): the plan's steps and, for SLURM, the exact `jobScript`, verbatim, in a
-   monospace block. "Nothing changes on the remote until you press Connect."
-5. **Connect** (`remoteAdd`): progress, step by step. A failure shows its step and detail, and
-   "Back to review" gets a fresh plan (a plan is used once). SSH's questions arrive meanwhile
-   through the shell's prompt dialog.
+   monospace block. "Nothing changes on the remote until you press Connect." A plan the gateway
+   refuses shows its message.
+5. **Connect** (`remoteAdd`): every step of the plan, each with its latest state and detail ("40%
+   sent", "job 4242 pending (Priority)"); the last message, `add`, is the whole add's outcome. A
+   SLURM job can wait in the queue for minutes: the wizard waits too, with no time limit of its
+   own. A failure shows its step and detail (else the whole add's), and "Back to review" gets a
+   fresh plan (a plan is used once). SSH's questions arrive meanwhile through the shell's prompt
+   dialog.
 6. **Setup**: if the new workspace has `setup_needed`, the same setup form, against that workspace
    through its own gateway transport (in its data scope).
 7. **Done**: opens the new workspace.

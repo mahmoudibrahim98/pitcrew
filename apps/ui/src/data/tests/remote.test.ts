@@ -67,6 +67,16 @@ describe('the remote commands', () => {
     expect(await failure(remote.remoteProbe('h'))).toBeInstanceOf(GatewayError);
   });
 
+  it("reads tmux's version when the gateway gives it, and refuses a malformed one", async () => {
+    const remote = createRemoteGateway();
+    desktop.probe = (host) => ({ host, os: 'linux', arch: 'x86_64', tmux: { version: '3.4' } });
+    expect((await remote.remoteProbe('h')).tmux).toEqual({ version: '3.4' });
+    desktop.probe = (host) => ({ host, os: 'linux', arch: 'x86_64' });
+    expect((await remote.remoteProbe('h')).tmux).toBeUndefined();
+    desktop.probe = (host) => ({ host, os: 'linux', arch: 'x86_64', tmux: '3.4' });
+    expect(await failure(remote.remoteProbe('h'))).toBeInstanceOf(GatewayError);
+  });
+
   it('passes the gateway refusal on as a GatewayError', async () => {
     desktop.probe = () => refuse('unreachable', 'ssh: connect to host hpc-login port 22: timed out');
     const error = await failure(createRemoteGateway().remoteProbe('hpc-login'));
@@ -126,6 +136,13 @@ describe('the remote commands', () => {
       { workspace: '01JB000000000000000WSPNEW1', stopHelper: false },
     ]);
   });
+
+  it('retries a workspace, by its id alone', async () => {
+    await createRemoteGateway().workspaceRetry('01JB000000000000000WSPNEW1');
+    expect(desktop.commands('gateway_workspace_retry')).toEqual([{ workspace: '01JB000000000000000WSPNEW1' }]);
+    desktop.retry = () => refuse('unknown_workspace', 'No such workspace.');
+    expect(await failure(createRemoteGateway().workspaceRetry('x'))).toMatchObject({ gateway: 'unknown_workspace' });
+  });
 });
 
 describe('prompts', () => {
@@ -143,19 +160,23 @@ describe('prompts', () => {
     await desktop.prompt({ id: '', host: 'hpc-login', kind: 'otp', text: 'Code:' });
     await desktop.prompt('p4');
     await desktop.prompt({ id: 'p5', host: 'hpc-login', kind: 'host_key', text: 'Accept?\u001b[31m', fingerprint: 'SHA256:abc' });
+    await desktop.prompt({ id: 'p7', host: 'hpc-login', kind: 'confirm', text: 'Accept updated host keys? (yes/no)' });
+    await desktop.prompt({ id: 'p8', host: 'hpc-login', kind: 'notice', text: 'Confirm user presence for key ED25519-SK' });
     await desktop.closePrompt('p1');
     await desktop.closePrompt(7);
 
     expect(prompts).toEqual([
       { id: 'p1', host: 'hpc-login', kind: 'password', text: "sam@hpc-login's password: " },
       { id: 'p5', host: 'hpc-login', kind: 'host_key', text: 'Accept?[31m', fingerprint: 'SHA256:abc' },
+      { id: 'p7', host: 'hpc-login', kind: 'confirm', text: 'Accept updated host keys? (yes/no)' },
+      { id: 'p8', host: 'hpc-login', kind: 'notice', text: 'Confirm user presence for key ED25519-SK' },
     ]);
     expect(closed).toEqual(['p1']);
     expect(warn).toHaveBeenCalledTimes(4);
     unlisten();
     unlistenClosed();
     await desktop.prompt({ id: 'p6', host: 'hpc-login', kind: 'password', text: 'Again?' });
-    expect(prompts).toHaveLength(2);
+    expect(prompts).toHaveLength(4);
   });
 
   it('replies with exactly the answer, the acceptance, or neither', async () => {

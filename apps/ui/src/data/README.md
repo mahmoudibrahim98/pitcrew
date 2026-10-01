@@ -99,18 +99,21 @@ just added, say), through that workspace's gateway transport.
 ## Remote workspaces and prompts (desktop only)
 
 `Gateway.remote` (`remote.ts`, implemented in `gateway.ts`) carries the gateway's remote commands,
-exactly as desktop-gateway.md says: `sshHosts()`, `remoteProbe(host)`, `remotePlan(req)` (sent as
-one argument, `req`, like `gateway_request`), `remoteAdd(plan, onProgress)` (progress on a
-`Channel`), `workspaceRemove(workspace, stopHelper)`, `onPrompt`, `onPromptClosed` and
-`replyPrompt(id, { answer } | { accept } | {})`.
+exactly as desktop-gateway.md says: `sshHosts()`, `remoteProbe(host)` (with `tmux?.version` when
+the gateway gives it), `remotePlan(req)` (sent as one argument, `req`, like `gateway_request`),
+`remoteAdd(plan, onProgress)` (progress on a `Channel`: each `step` one of the plan's, the last
+`{ step: 'add', … }` for the whole add), `workspaceRemove(workspace, stopHelper)`,
+`workspaceRetry(workspace)`, `onPrompt`, `onPromptClosed` and
+`replyPrompt(id, { answer } | { accept } | {})`. Prompt kinds are `password`, `passphrase` and
+`otp` (an `answer`), `host_key` and `confirm` (`accept`), and `notice` (nothing to answer).
 
 - **Every payload is checked.** A malformed answer to a command rejects with a `GatewayError`
   (`internal`); a malformed progress message, prompt or `prompt-closed` is dropped (with one
   warning that never quotes it). Text for people (a prompt's `text`, a progress `detail`) loses its
   control characters, except new lines and tabs, and a job script is kept verbatim.
-- **Prompts** queue in the registry (`Workspaces.prompts`, oldest first; the same `id` again keeps
-  its place), from the moment the registry starts, since a reconnect at launch can ask for a
-  password. `gateway://prompt-closed` withdraws one; `replyPrompt` takes one off and sends the reply
+- **Prompts** queue in the registry (`Workspaces.prompts`, oldest first; the same `id` again, as
+  the gateway sends after a page reload, keeps its place instead of queueing twice), from the
+  moment the registry starts, since a reconnect at launch can ask for a password. `gateway://prompt-closed` withdraws one; `replyPrompt` takes one off and sends the reply
   once. **The queue never holds an answer**, and a refused reply is not logged (its message could
   quote what was sent): the answer lives only in the dialog's own state (`shell/prompt-dialog.tsx`).
 - **In a browser** there is no registry: `useRemoteGateway()` and `useGatewayPrompts()` are `null`,
