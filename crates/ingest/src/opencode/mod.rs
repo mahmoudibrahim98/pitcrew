@@ -509,31 +509,86 @@ pub(crate) struct LightMeta {
     pub is_subagent: bool,
 }
 
-/// [`LightMeta`] for several sessions of one store, opening it once. Sessions the store no
-/// longer has (deleted between discovery and this call) are left out, not an error.
+/// Bounded retries for a batch that hits `WouldBlock` (the store changed, or a writer holds it,
+/// most likely because OpenCode is writing while a "scan again" runs) before giving up on the
+/// sessions not yet read. The scan counts those as unreadable rather than losing the whole batch.
+const LIGHT_META_RETRIES: u32 = 2;
+
+/// [`LightMeta`] for several sessions of one store, opening it once per attempt. A session whose
+/// own row cannot be read is simply left out of the result -- not an error for the batch, so one
+/// bad row never costs the rest of it. A `WouldBlock` stops probing further sessions in that
+/// attempt (so a held lock costs one `BUSY_TIMEOUT`, not one per remaining session) and retries
+/// only the sessions still unresolved, up to [`LIGHT_META_RETRIES`] times; sessions still blocked
+/// after that are simply absent from the result, same as one that was deleted.
 pub(crate) fn light_meta(
     path: &Path,
     ids: &[&str],
 ) -> Result<HashMap<String, LightMeta>, SourceError> {
-    let store = Store::open(path)?;
-    if !store.has_sessions() {
-        return Ok(HashMap::new());
-    }
     let mut out = HashMap::with_capacity(ids.len());
-    for &id in ids {
-        if let Some(row) = store.session(id)? {
-            out.insert(
-                id.to_owned(),
-                LightMeta {
-                    cwd: bounded(row.directory.as_deref(), MAX_PATH_BYTES),
-                    started: (row.created > 0).then_some(row.created),
-                    is_subagent: row.parent_id.as_deref().is_some_and(|p| !p.is_empty()),
-                },
-            );
+    let mut remaining: Vec<&str> = ids.to_vec();
+
+    for attempt in 0..=LIGHT_META_RETRIES {
+        if remaining.is_empty() {
+            break;
+        }
+        let attempt_ids = std::mem::take(&mut remaining);
+        let store = match Store::open(path) {
+            Ok(store) => store,
+            Err(e) if is_retry_later(&e) => {
+                if attempt < LIGHT_META_RETRIES {
+                    remaining = attempt_ids;
+                    continue;
+                }
+                break; // retries exhausted on a transient condition: give up, not an error.
+            }
+            Err(e) => return Err(e), // not retriable: nothing in this batch can be read.
+        };
+        if !store.has_sessions() {
+            break;
+        }
+
+        let mut attempt_out = HashMap::with_capacity(attempt_ids.len());
+        let mut blocked_ids = Vec::new();
+        let mut blocked = false;
+        for &id in &attempt_ids {
+            if blocked {
+                blocked_ids.push(id);
+                continue;
+            }
+            match store.session(id) {
+                Ok(Some(row)) => {
+                    attempt_out.insert(
+                        id.to_owned(),
+                        LightMeta {
+                            cwd: bounded(row.directory.as_deref(), MAX_PATH_BYTES),
+                            started: (row.created > 0).then_some(row.created),
+                            is_subagent: row.parent_id.as_deref().is_some_and(|p| !p.is_empty()),
+                        },
+                    );
+                }
+                Ok(None) => {} // the session is gone: not an error, just absent.
+                Err(e) if is_retry_later(&e) => {
+                    blocked = true;
+                    blocked_ids.push(id);
+                }
+                Err(_) => {} // this one row is unreadable; the rest of the batch still counts.
+            }
+        }
+
+        if store.finish().is_ok() {
+            out.extend(attempt_out);
+            remaining = blocked_ids;
+        } else {
+            // An unlocked read that changed mid-way may have mixed old and new pages: nothing
+            // from this attempt is trusted, so every id given to it is retried.
+            remaining = attempt_ids;
         }
     }
-    store.finish()?;
     Ok(out)
+}
+
+fn is_retry_later(e: &SourceError) -> bool {
+    matches!(e, SourceError::Io(inner) if inner.kind() == io::ErrorKind::WouldBlock)
 }
 
 fn session_id(transcript: &TranscriptRef) -> Result<&str, SourceError> {
@@ -1125,8 +1180,70 @@ fn session_meta(session: &store::SessionRow, state: &ReadState) -> SessionMeta {
 
 #[cfg(test)]
 mod tests {
-    use super::{ID_SPAN, MAX_ID_LEAD, MAX_POSITION, midpoint, note_unreadable, position};
+    use super::{
+        ID_SPAN, MAX_ID_LEAD, MAX_POSITION, light_meta, midpoint, note_unreadable, position,
+    };
+    use rusqlite::Connection;
     use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    /// A store that changes mid-scan (a writer holding the whole database locked throughout)
+    /// must not turn `light_meta` into an error that loses the batch: it comes back empty, in
+    /// bounded time, and the very same sessions read fine once the writer lets go.
+    #[test]
+    fn light_meta_retries_a_locked_store_instead_of_losing_the_batch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("opencode.db");
+        let conn = Connection::open(&path).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT,
+                time_created INTEGER, time_updated INTEGER);
+             INSERT INTO session VALUES ('s1', NULL, '/w/a', 1000, 1000);
+             INSERT INTO session VALUES ('s2', NULL, '/w/b', 2000, 2000);",
+        )
+        .expect("schema");
+        drop(conn);
+        let ids = ["s1", "s2"];
+
+        let writer = Connection::open(&path).expect("writer open");
+        writer.execute_batch("BEGIN EXCLUSIVE").expect("lock");
+        let start = Instant::now();
+        let blocked = light_meta(&path, &ids).expect("not an error even while locked");
+        assert!(blocked.is_empty(), "{blocked:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        writer.execute_batch("COMMIT").expect("unlock");
+
+        let unblocked = light_meta(&path, &ids).expect("read");
+        assert_eq!(unblocked.len(), 2);
+        assert_eq!(unblocked["s1"].cwd.as_deref(), Some("/w/a"));
+        assert_eq!(unblocked["s2"].cwd.as_deref(), Some("/w/b"));
+    }
+
+    /// One session that is simply gone (deleted between discovery and the read) does not cost
+    /// the rest of the batch.
+    #[test]
+    fn a_missing_session_in_the_batch_does_not_fail_the_others() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("opencode.db");
+        let conn = Connection::open(&path).expect("open");
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT,
+                time_created INTEGER, time_updated INTEGER);
+             INSERT INTO session VALUES ('s1', NULL, '/w/a', 1000, 1000);",
+        )
+        .expect("schema");
+        drop(conn);
+
+        let out = light_meta(&path, &["s1", "gone"]).expect("read");
+        assert_eq!(out.len(), 1);
+        assert!(out.contains_key("s1"));
+    }
 
     #[test]
     fn positions_come_from_ids_and_survive_the_48_bit_wrap() {
