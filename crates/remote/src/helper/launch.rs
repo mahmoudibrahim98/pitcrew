@@ -21,8 +21,8 @@
 //! zombie) and named `pitcrewd`, and `stop` signals it only while its start time is the one it
 //! had, so a recycled pid is never signalled.
 //!
-//! The SLURM launcher (a later brief) implements the same trait: its `status` will ask the
-//! scheduler, and its endpoint will name the compute node.
+//! The SLURM launcher ([`super::slurm`]) implements the same trait: its `status` asks the
+//! scheduler, and its endpoint names the compute node and the job.
 
 use super::script::{self, Call, Report};
 use super::{HelperError, Target};
@@ -48,7 +48,7 @@ pub fn tmux_name(layout: &super::Layout) -> String {
 pub const MIN_TMUX: (u32, u32) = (3, 2);
 
 /// Longest socket path: `sun_path` holds 104 bytes on macOS and 108 on Linux.
-const MAX_SOCKET_PATH: usize = 100;
+pub(crate) const MAX_SOCKET_PATH: usize = 100;
 
 /// What a [`Launcher`] call returns.
 pub type HelperFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, HelperError>> + Send + 'a>>;
@@ -105,7 +105,7 @@ impl Default for LaunchOptions {
 }
 
 impl LaunchOptions {
-    fn check(&self) -> Result<(), HelperError> {
+    pub(crate) fn check(&self) -> Result<(), HelperError> {
         let longest = seconds(self.lock_wait)
             + seconds(self.ready_timeout).max(seconds(self.stop_timeout) + 5);
         if minutes(self.stale_lock) * 60 <= longest {
@@ -118,7 +118,7 @@ impl LaunchOptions {
     }
 
     /// The call's own bound: waiting for the lock, the work, and some slack for ssh.
-    fn call_timeout(&self, work: Duration) -> Duration {
+    pub(crate) fn call_timeout(&self, work: Duration) -> Duration {
         self.lock_wait
             .saturating_add(work)
             .saturating_add(Duration::from_secs(30))
@@ -140,6 +140,9 @@ pub struct Endpoint {
     pub launcher: String,
     /// Its socket.
     pub socket: String,
+    /// For the SLURM launcher, the batch job it runs in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<u64>,
 }
 
 /// What [`Launcher::start`] did.
@@ -161,6 +164,8 @@ pub enum HelperState {
     NotRunning,
     /// It was recorded on another host sharing this home, and cannot be checked from here.
     OtherHost(String),
+    /// Its batch job is queued, or runs while the helper starts: not reachable yet.
+    Pending,
 }
 
 /// What [`Launcher::status`] found.
@@ -172,10 +177,13 @@ pub struct Status {
     pub endpoint: Option<Endpoint>,
     /// The version `bin/current` points to, if any.
     pub installed: Option<String>,
-    /// Whether the layout's socket exists.
+    /// Whether the layout's socket exists. For the SLURM launcher, whether the job has
+    /// written its endpoint, which it does once its socket (on the node) is there.
     pub socket_ready: bool,
     /// For the tmux launcher: whether its session exists.
     pub tmux_session: Option<bool>,
+    /// For the SLURM launcher: the job, as the scheduler sees it.
+    pub slurm: Option<super::slurm::SlurmStatus>,
 }
 
 impl Status {
@@ -400,6 +408,7 @@ async fn status(
         installed: report.get("installed").map(str::to_owned),
         socket_ready: report.get("socket") == Some("1"),
         tmux_session: report.get("session").map(|s| s == "1"),
+        slurm: None,
     })
 }
 
@@ -511,6 +520,12 @@ mod tests {
         let endpoint: Endpoint = serde_json::from_str(line).unwrap();
         assert_eq!(endpoint.pid, 4242);
         assert_eq!(endpoint.socket, "/home/a \"b\"/.pitcrew/run/pitcrewd.sock");
+        assert_eq!(endpoint.job, None);
+        assert_eq!(serde_json::to_string(&endpoint).unwrap(), line);
+        // The SLURM launcher's, with the job.
+        let line = r#"{"pid":77,"host":"node017","version":"1.4.0","started":1790850391000,"launcher":"slurm","socket":"/tmp/pitcrew-4242.9/pitcrewd.sock","job":4242}"#;
+        let endpoint: Endpoint = serde_json::from_str(line).unwrap();
+        assert_eq!(endpoint.job, Some(4242));
         assert_eq!(serde_json::to_string(&endpoint).unwrap(), line);
     }
 
@@ -532,6 +547,7 @@ mod tests {
         let launchers: Vec<Box<dyn Launcher>> = vec![
             Box::new(DirectLauncher::default()),
             Box::new(TmuxLauncher::new(Some("3.3a"), LaunchOptions::default()).unwrap()),
+            Box::new(super::super::SlurmLauncher::default()),
         ];
         let target = Target::with_layout(
             crate::Ssh::new("ssh"),
@@ -542,10 +558,12 @@ mod tests {
         .unwrap();
         for launcher in &launchers {
             spawnable(&launcher.status(&target));
+            spawnable(&launcher.start(&target));
+            spawnable(&launcher.stop(&target));
         }
         assert_eq!(
             launchers.iter().map(|l| l.name()).collect::<Vec<_>>(),
-            ["direct", "tmux"]
+            ["direct", "tmux", "slurm"]
         );
     }
 }

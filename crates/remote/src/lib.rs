@@ -13,7 +13,8 @@
 //!   desktop without storing them;
 //! - [`Ssh::probe`] reports what the machine is;
 //! - [`helper`] deploys the static helper there ([`deploy`]) and starts, checks and stops it
-//!   ([`Launcher`]).
+//!   ([`Launcher`]): directly, in tmux, or as a SLURM batch job on a compute node
+//!   ([`helper::slurm`], with site recipes).
 
 pub mod askpass;
 mod config;
@@ -32,12 +33,15 @@ pub use askpass::{
     Secret,
 };
 pub use config::{HostList, home_dir, list_hosts, list_hosts_in};
+pub use helper::slurm::{
+    JobOptions, JobScript, JobSpec, JobState, LastHop, Site, SiteRecipe, SlurmStatus, SocketPlace,
+};
 pub use helper::{
     DeployOptions, Deployed, DirectLauncher, Endpoint, Helper, HelperError, HelperState,
-    LaunchOptions, Launcher, Layout, Platform, Started, Status, Stopped, Target, TmuxLauncher,
-    deploy,
+    LaunchOptions, Launcher, Layout, Platform, SlurmLauncher, Started, Status, Stopped, Target,
+    TmuxLauncher, deploy,
 };
-pub use probe::{PROBE_LIMITS, Probe};
+pub use probe::{PROBE_LIMITS, Probe, SlurmTools};
 pub use ssh::{
     DEFAULT_CONNECT_TIMEOUT, Input, Limits, Output, RESOLVE_LIMITS, ResolvedHost, Ssh, SshError,
 };

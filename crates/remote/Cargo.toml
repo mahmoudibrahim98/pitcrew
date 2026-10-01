@@ -34,6 +34,9 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 # OS randomness for askpass keys and nonces. Already in the lockfile through `ulid`.
 getrandom = "=0.3.4"
+# Reading users' site recipes (~/.pitcrew/sites/*.toml) strictly, key by key. The version
+# stream I's pitcrew-cli already uses (MIT OR Apache-2.0); parsing only.
+toml_edit = { version = "=0.25.15", default-features = false, features = ["parse"] }
 
 [target.'cfg(unix)'.dependencies]
 # Effective uid, process groups, parent pid and pidfds without unsafe code. The version

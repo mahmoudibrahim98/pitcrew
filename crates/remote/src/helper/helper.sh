@@ -20,14 +20,14 @@
 # Needs a POSIX sh and dd, cat, ls, awk, sed, tr, cut, head, tail, wc, mkdir, rm, mv, ln, chmod,
 # id, uname, date (+%s), find (-mmin), readlink, cksum and sleep; one of sha256sum, shasum or
 # openssl to deploy; setsid or nohup (where they exist), or tmux, to start the helper; ps where
-# there is no /proc.
+# there is no /proc; env, sbatch, squeue and scancel (sacct where there is one) for SLURM.
 #
 # Character sets are spelled out rather than written as ranges, which depend on the locale.
 
 # Functions imported from the environment (bash exports them) must not stand in for tools.
-unset -f awk cat cd chmod cksum command cut date dd echo find head hostid id kill ln ls mkdir \
-  mv nohup openssl printf ps pwd readlink rm sed setsid sha256sum shasum sleep sysctl tail \
-  test tmux tr umask uname wc 2>/dev/null
+unset -f awk cat cd chmod cksum command cut date dd echo env find head hostid id kill ln ls \
+  mkdir mv nohup openssl printf ps pwd readlink rm sacct sbatch scancel sed setsid sha256sum \
+  shasum sleep squeue sysctl tail test tmux tr umask uname wc 2>/dev/null
 unset IFS TMUX ENV BASH_ENV CDPATH
 
 pc_cmd=$1 pc_tag=$2 pc_root=$3
@@ -727,11 +727,334 @@ pc_stop() {
   pc_end
 }
 
+# --- SLURM -------------------------------------------------------------------------------
+#
+# The helper as a batch job on a compute node (see slurm/mod.rs). run/slurm.json records the
+# job PitCrew submitted, as one line:
+#   {"job":<id>,"name":"<job name>","submitted":<ms>,"host":"<host it was submitted from>"}
+# A job is acted on only while squeue shows it under that id, with that name and this user's
+# uid. An id that names any other job (reused after a cluster restart, say) is never touched.
+
+pc_rec=run/slurm.json
+
+# Reads run/slurm.json into pc_rjob, pc_rname and pc_rsub. Fails when there is none, or it is
+# not in the form pc_slurm_submit writes.
+pc_job_recorded() {
+  pc_rjob= pc_rname= pc_rsub=
+  if [ ! -f "$pc_rec" ] || [ -L "$pc_rec" ]; then return 1; fi
+  pc_fields=$(head -n 1 "$pc_rec" 2>/dev/null | sed -n 's/^{"job":\([0123456789][0123456789]*\),"name":"\([0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._+-]*\)","submitted":\([0123456789]*\),.*$/\1 \2 \3/p')
+  if [ -z "$pc_fields" ]; then return 1; fi
+  pc_rjob=${pc_fields%% *}
+  pc_fields=${pc_fields#* }
+  pc_rname=${pc_fields%% *}
+  pc_rsub=${pc_fields#* }
+  [ -n "$pc_rname" ]
+}
+
+# pc_terminal STATE: whether a job in STATE has finished for good.
+pc_terminal() {
+  case $1 in
+    BOOT_FAIL|CANCELLED|COMPLETED|DEADLINE|FAILED|NODE_FAIL) return 0 ;;
+    OUT_OF_MEMORY|PREEMPTED|REVOKED|SPECIAL_EXIT|TIMEOUT) return 0 ;;
+  esac
+  return 1
+}
+
+# pc_queue ID: what squeue says about job ID, in pc_q:
+#   ours     it is listed under the recorded name and this user's uid; pc_qstate, pc_qreason,
+#            pc_qleft, pc_qlimit and pc_qnode say how it is;
+#   foreign  the id names another job: pc_qowner and pc_qname say whose;
+#   gone     squeue no longer knows it;
+#   error    squeue failed (pc_qerr): the scheduler may be unreachable, so nothing is concluded.
+pc_queue() {
+  pc_qout=$(squeue -h -j "$1" -o '%i|%U|%T|%r|%L|%l|%N|%j' 2>&1)
+  pc_qrc=$?
+  pc_qerr= pc_qowner= pc_qstate= pc_qreason= pc_qleft= pc_qlimit= pc_qnode= pc_qname=
+  # The job's own line. Its name comes last, since it may hold anything.
+  pc_qline=$(printf '%s\n' "$pc_qout" | awk -F '|' -v id="$1" '$1 == id')
+  if [ -z "$pc_qline" ]; then
+    # squeue ran but does not list it, or says the id is unknown (purged after it ended).
+    if [ "$pc_qrc" -eq 0 ]; then pc_q=gone; return; fi
+    case $pc_qout in *'Invalid job id'*) pc_q=gone; return ;; esac
+    pc_q=error
+    pc_qerr=$(pc_flat "squeue exited with $pc_qrc: $pc_qout")
+    return
+  fi
+  pc_q=error
+  # Every | in a pattern is quoted: a bare one separates case patterns, ksh93 reads one in
+  # ${...} as alternation, and mksh mishandles [|] there.
+  case $pc_qline in
+    *'
+'*) pc_qerr="squeue listed job $1 more than once"; return ;;
+    *'|'*'|'*'|'*'|'*'|'*'|'*'|'*) ;;
+    *) pc_qerr=$(pc_flat "squeue printed: $pc_qline"); return ;;
+  esac
+  pc_rest=${pc_qline#*"|"}
+  pc_qowner=${pc_rest%%"|"*}
+  pc_rest=${pc_rest#*"|"}
+  pc_qstate=${pc_rest%%"|"*}
+  pc_rest=${pc_rest#*"|"}
+  pc_qreason=${pc_rest%%"|"*}
+  pc_rest=${pc_rest#*"|"}
+  pc_qleft=${pc_rest%%"|"*}
+  pc_rest=${pc_rest#*"|"}
+  pc_qlimit=${pc_rest%%"|"*}
+  pc_rest=${pc_rest#*"|"}
+  pc_qnode=${pc_rest%%"|"*}
+  pc_qname=${pc_rest#*"|"}
+  case $pc_qowner in
+    ''|*[!0123456789]*) pc_qerr=$(pc_flat "squeue printed: $pc_qline"); return ;;
+  esac
+  case $pc_qstate in
+    ''|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZ_]*) pc_qerr=$(pc_flat "squeue printed: $pc_qline"); return ;;
+  esac
+  if [ "$pc_qowner" = "$pc_me" ] && [ "$pc_qname" = "$pc_rname" ]; then
+    pc_q=ours
+  else
+    pc_q=foreign
+  fi
+}
+
+# pc_acct ID: how the recorded job ID ended, from sacct where there is one: pc_astate (e.g.
+# FAILED, CANCELLED by 1000) and pc_aexit (code:signal). Only a record with the recorded name
+# and this user's uid counts; with several (an id reused), the last one.
+pc_acct() {
+  pc_astate= pc_aexit=
+  command -v sacct >/dev/null 2>&1 || return 1
+  pc_aout=$(sacct -n -X -P -j "$1" -o JobID,UID,State,ExitCode,JobName 2>/dev/null) || return 1
+  pc_aline=$(printf '%s\n' "$pc_aout" | awk -F '|' -v id="$1" -v uid="$pc_me" -v name="$pc_rname" '
+    $1 == id && $2 == uid {
+      n = $0
+      for (i = 1; i <= 4; i++) sub(/^[^|]*[|]/, "", n)
+      if (n == name) last = $0
+    }
+    END { print last }')
+  if [ -z "$pc_aline" ]; then return 1; fi
+  pc_astate=$(printf '%s\n' "$pc_aline" | cut -d '|' -f 3)
+  pc_aexit=$(printf '%s\n' "$pc_aline" | cut -d '|' -f 4)
+}
+
+# pc_endpoint_of JOB: whether endpoint.json was written by job JOB (see pc_recorded).
+pc_endpoint_of() {
+  pc_recorded || return 1
+  [ "$pc_elauncher" = slurm ] || return 1
+  case $pc_line in *',"job":'"$1"'}') return 0 ;; esac
+  return 1
+}
+
+# Reports the recorded job: what squeue says (pc_queue must have run), and once it has ended,
+# what sacct says and the end of its output.
+pc_job_report() {
+  pc_say job "$pc_rjob"
+  pc_say name "$pc_rname"
+  pc_say submitted "$pc_rsub"
+  pc_say queue "$pc_q"
+  case $pc_q in
+    ours)
+      pc_say state "$pc_qstate"
+      pc_say reason "$(pc_flat "$pc_qreason")"
+      pc_say left "$(pc_flat "$pc_qleft")"
+      pc_say limit "$(pc_flat "$pc_qlimit")"
+      pc_say node "$(pc_flat "$pc_qnode")"
+      ;;
+    foreign)
+      pc_say owner "$pc_qowner"
+      pc_say other_name "$(pc_flat "$pc_qname")"
+      ;;
+    error) pc_say squeue_error "$pc_qerr" ;;
+  esac
+  if [ "$pc_q" = gone ] || { [ "$pc_q" = ours ] && pc_terminal "$pc_qstate"; }; then
+    if pc_acct "$pc_rjob"; then
+      pc_say acct_state "$(pc_flat "$pc_astate")"
+      pc_say acct_exit "$(pc_flat "$pc_aexit")"
+    fi
+    if [ -f "run/slurm-$pc_rjob.out" ]; then
+      pc_say output "$(tail -n 5 "run/slurm-$pc_rjob.out" 2>/dev/null | tail -c 400 | tr '\r\n\t' '   ')"
+    fi
+  fi
+  if pc_endpoint_of "$pc_rjob"; then pc_say endpoint "$pc_line"; fi
+}
+
+# pc_forget JOB: removes the record of job JOB, and its endpoint and socket in the root.
+pc_forget() {
+  pc_still_locked
+  if pc_endpoint_of "$1"; then
+    rm -f "$pc_ep"
+    case $pc_line in
+      *'"socket":"'"$pc_root"'/run/pitcrewd.sock",'*)
+        if [ -S run/pitcrewd.sock ]; then rm -f run/pitcrewd.sock; fi ;;
+    esac
+  fi
+  rm -f "$pc_rec"
+}
+
+pc_need() {
+  for pc_t in "$@"; do
+    command -v "$pc_t" >/dev/null 2>&1 || pc_fail no_slurm "$pc_t is not on the PATH"
+  done
+}
+
+# pc_slurm_wait SECONDS: waits up to SECONDS for the recorded job to run and write its
+# endpoint, or to end, polling squeue every 2 seconds; then reports it.
+pc_slurm_wait() {
+  pc_deadline=$(($(date +%s) + $1))
+  while :; do
+    pc_queue "$pc_rjob"
+    if [ "$pc_q" != ours ] || pc_terminal "$pc_qstate"; then break; fi
+    if [ "$pc_qstate" = RUNNING ] && pc_endpoint_of "$pc_rjob"; then break; fi
+    if [ "$(date +%s)" -ge "$pc_deadline" ]; then break; fi
+    sleep 2
+  done
+  pc_job_report
+  pc_end
+}
+
+# pc_slurm_submit WAIT MINUTES SIZE SHA256 NAME READY: submits the job script that follows on
+# stdin (SIZE bytes with that sha256: exactly the one the user saw) as job NAME, unless the
+# recorded job is still queued; then waits up to READY seconds for it to run, and reports it.
+pc_slurm_submit() {
+  pc_size=$3 pc_want=$4 pc_name=$5 pc_ready=$6
+  case $pc_name in
+    ''|-*|*[!0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._+-]*)
+      pc_fail usage "the job name must be plain characters" ;;
+  esac
+  pc_enter 1
+  pc_private run
+  pc_lock run/.lock "$1" "$2"
+  pc_sweep_aside run/.lock
+  # The job script comes first, whatever happens next: it is used whole or not at all.
+  pc_still_locked
+  pc_tmp=run/job.$pc_tag.sh
+  if pc_err=$( (set -C; cat > "$pc_tmp") 2>&1 ); then :; else
+    pc_fail io "cannot write $(pc_where "$pc_tmp"): $pc_err"
+  fi
+  pc_got=$(wc -c < "$pc_tmp" | tr -d ' ')
+  if [ "$pc_got" != "$pc_size" ] \
+    || [ "$(head -n 2 "$pc_tmp")" != "#!/bin/sh
+# pitcrew-job-script-begin" ] \
+    || [ "$(tail -n 1 "$pc_tmp")" != '# pitcrew-job-script-end' ]; then
+    pc_fail job_script "the job script did not arrive whole ($pc_got of $pc_size bytes)"
+  fi
+  pc_sha256 "$pc_tmp" || pc_no_hash_tool
+  if [ "$pc_sum" != "$pc_want" ]; then
+    pc_fail job_script "the job script did not arrive as sent (its sha256 is $pc_sum)"
+  fi
+  pc_need sbatch squeue
+  pc_say installed "$(readlink bin/current 2>/dev/null)"
+  if pc_job_recorded; then
+    pc_queue "$pc_rjob"
+    case $pc_q in
+      error) pc_fail slurm "$pc_qerr" ;;
+      ours) if ! pc_terminal "$pc_qstate"; then pc_say started 0; pc_slurm_wait "$pc_ready"; fi ;;
+    esac
+    # Gone, ended, or someone else's job now: forgotten, never touched.
+    pc_forget "$pc_rjob"
+  fi
+  pc_ver=$(readlink bin/current 2>/dev/null)
+  case $pc_ver in
+    [0123456789]*) ;;
+    *) pc_fail not_deployed "$(pc_where bin/current)" ;;
+  esac
+  case $pc_ver in
+    *[!0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._+-]*)
+      pc_fail not_deployed "$(pc_where bin/current)" ;;
+  esac
+  if [ ! -f "bin/$pc_ver/pitcrewd" ] || [ ! -x "bin/$pc_ver/pitcrewd" ]; then
+    pc_fail not_deployed "$(pc_where "bin/$pc_ver/pitcrewd")"
+  fi
+  # SBATCH_* variables would override the script's directives: what the user saw is what runs.
+  for pc_v in $(env | sed -n 's/^\(SBATCH_[ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_]*\)=.*$/\1/p'); do
+    unset "$pc_v"
+  done
+  # The name, directory and output again on the command line, where nothing overrides them.
+  # Under umask 077, so the job's output file is private; the job gets the user's umask as
+  # its argument, for the helper.
+  pc_still_locked
+  pc_out=$(sbatch --parsable --job-name="$pc_name" --chdir="$pc_root" \
+    --output="$pc_root/run/slurm-%j.out" "$pc_tmp" "$pc_umask" 2>&1)
+  pc_rc=$?
+  # `<id>` or `<id>;<cluster>`, after any warnings.
+  pc_jid=$(printf '%s\n' "$pc_out" | sed -n 's/;.*$//; /^[0123456789][0123456789]*$/p' | tail -n 1)
+  if [ "$pc_rc" -ne 0 ] || [ -z "$pc_jid" ]; then
+    pc_fail submit_failed "$(printf '%s\n' "$pc_out" | tail -n 3)"
+  fi
+  # Recorded at once: the job waits for this record and ends on its own without it.
+  pc_rsub=$(date +%s)000
+  pc_line=$(printf '{"job":%s,"name":"%s","submitted":%s,"host":"%s"}' \
+    "$pc_jid" "$pc_name" "$pc_rsub" "$pc_host")
+  pc_still_locked
+  if printf '%s\n' "$pc_line" > "$pc_rec.tmp.$pc_tag" && mv -f "$pc_rec.tmp.$pc_tag" "$pc_rec"; then :; else
+    rm -f "$pc_rec.tmp.$pc_tag"
+    pc_fail io "cannot write $(pc_where "$pc_rec")"
+  fi
+  rm -f "$pc_tmp"
+  pc_tmp=
+  pc_rjob=$pc_jid pc_rname=$pc_name
+  pc_say started 1
+  pc_slurm_wait "$pc_ready"
+}
+
+# pc_slurm_status: what is installed, and what the recorded job is doing. Takes no lock and
+# changes nothing.
+pc_slurm_status() {
+  if pc_enter 0; then
+    if [ -e run ] || [ -L run ]; then pc_private run; fi
+    pc_say installed "$(readlink bin/current 2>/dev/null)"
+    if pc_job_recorded; then
+      pc_need squeue
+      pc_queue "$pc_rjob"
+      pc_job_report
+    fi
+  else
+    pc_say installed ''
+  fi
+  pc_end
+}
+
+# pc_slurm_stop WAIT MINUTES STOP: cancels the recorded job if it is ours and still queued,
+# waits up to STOP seconds for it to leave the queue, reports how it ended and forgets it.
+pc_slurm_stop() {
+  if ! pc_enter 0; then pc_end; fi
+  pc_private run
+  pc_lock run/.lock "$1" "$2"
+  pc_sweep_aside run/.lock
+  if ! pc_job_recorded; then pc_end; fi
+  pc_need squeue scancel
+  pc_queue "$pc_rjob"
+  if [ "$pc_q" = error ]; then pc_fail slurm "$pc_qerr"; fi
+  if [ "$pc_q" = ours ] && ! pc_terminal "$pc_qstate"; then
+    if pc_endpoint_of "$pc_rjob"; then pc_say pid "$pc_epid"; fi
+    pc_still_locked
+    pc_cout=$(scancel "$pc_rjob" 2>&1)
+    pc_crc=$?
+    pc_say cancelled 1
+    pc_deadline=$(($(date +%s) + $3))
+    while :; do
+      pc_queue "$pc_rjob"
+      if [ "$pc_q" = error ]; then pc_fail slurm "$pc_qerr"; fi
+      if [ "$pc_q" != ours ] || pc_terminal "$pc_qstate"; then break; fi
+      if [ "$(date +%s)" -ge "$pc_deadline" ]; then
+        if [ "$pc_crc" -ne 0 ]; then
+          pc_fail slurm "scancel $pc_rjob failed: $(pc_flat "$pc_cout")"
+        fi
+        pc_fail stop_failed "job $pc_rjob is still $pc_qstate after ${3}s"
+      fi
+      sleep 1
+    done
+  fi
+  pc_job_report
+  pc_forget "$pc_rjob"
+  pc_end
+}
+
 case $pc_cmd in
   check|install) pc_deploy "$@" ;;
   start) pc_start "$@" ;;
   status) pc_status "$@" ;;
   stop) pc_stop "$@" ;;
+  slurm-submit) pc_slurm_submit "$@" ;;
+  slurm-status) pc_slurm_status "$@" ;;
+  slurm-stop) pc_slurm_stop "$@" ;;
 esac
 pc_fail usage "unknown command: $pc_cmd"
 # pitcrew-helper-script-end

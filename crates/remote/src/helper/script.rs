@@ -38,7 +38,8 @@ const MAX_DETAIL: usize = 400;
 
 /// One run of the script.
 pub(crate) struct Call<'a> {
-    /// `check`, `install`, `start`, `status` or `stop`.
+    /// `check`, `install`, `start`, `status`, `stop`, or `slurm-submit`, `slurm-status`,
+    /// `slurm-stop`.
     pub command: &'static str,
     pub args: Vec<String>,
     /// Bytes sent after the script (the helper, for `install`).
@@ -96,8 +97,22 @@ impl Report {
             "other_host" => HelperError::OtherHost(text("host")),
             "start_failed" => HelperError::StartFailed(detail),
             "stop_failed" => HelperError::StopFailed(detail),
+            "slurm" | "no_slurm" => HelperError::Slurm(detail),
+            "submit_failed" => HelperError::SubmitFailed(detail),
+            "job_script" => HelperError::UnexpectedOutput(detail),
             other => HelperError::Remote(format!("{other}: {detail}")),
         }
+    }
+
+    /// A report from `key`, `value` pairs, for tests.
+    #[cfg(test)]
+    pub(crate) fn from_pairs(pairs: &[(&str, &str)]) -> Self {
+        Self(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        )
     }
 }
 
@@ -246,6 +261,10 @@ mod tests {
         assert!(matches!(r.error("other_host"), HelperError::OtherHost(h) if h == "login02"));
         let r = report(&[("detail", "x")]);
         assert!(matches!(r.error("busy"), HelperError::Busy(d) if d == "x"));
+        assert!(matches!(r.error("slurm"), HelperError::Slurm(d) if d == "x"));
+        assert!(matches!(r.error("no_slurm"), HelperError::Slurm(d) if d == "x"));
+        assert!(matches!(r.error("submit_failed"), HelperError::SubmitFailed(d) if d == "x"));
+        assert!(matches!(r.error("job_script"), HelperError::UnexpectedOutput(d) if d == "x"));
         assert!(matches!(r.error("io"), HelperError::Remote(d) if d == "io: x"));
         assert!(matches!(r.error("no_hash_tool"), HelperError::NoHashTool));
     }
