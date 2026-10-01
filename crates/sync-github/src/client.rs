@@ -3,7 +3,7 @@
 
 use crate::bounds::{Limits, MAX_PAGE_BODY_BYTES, backoff_secs};
 use crate::link_header::next_link;
-use crate::origin::is_trusted_next_url;
+use crate::origin::trusted_next_url;
 use crate::state::ListCache;
 use crate::time::GithubTimestamp;
 use crate::transport::{AuthToken, Method, Request, Response, Transport, TransportError};
@@ -75,7 +75,9 @@ pub(crate) struct ListResult<Item> {
     /// Set when a `Link: rel="next"` outside the configured API base was ignored. The caller
     /// raises this as a [`crate::sync::SyncIssue`]: a server (or a proxy in front of it) handing
     /// back a pagination link to an unexpected host is worth a person's attention, not just a
-    /// debug log, even though the items already collected are still returned normally.
+    /// debug log, even though the items already collected are still returned normally. This is
+    /// the raw, untrusted link text; the caller sanitises and caps it before putting it in a
+    /// message (see `crate::sync::blocked_link_message`).
     pub blocked_link: Option<String>,
 }
 
@@ -367,28 +369,33 @@ impl<'t, T: Transport> GithubClient<'t, T> {
                 break;
             }
             match raw.link.as_deref().and_then(next_link) {
-                // Compared against `url` — the exact request that just answered, not merely
-                // `self.api_base` — so `next` must share its scheme, host, port *and path*,
-                // differing only in its query. See `origin::is_trusted_next_url`'s doc for why.
-                Some(next) if is_trusted_next_url(&next, &url) => url = next,
-                Some(untrusted) => {
-                    // Never follow an untrusted `Link: rel="next"`: it would send the
-                    // `Authorization` header (attached in `get`, above) to whatever host answered,
-                    // or walk the request to an unexpected path. This is left `completed = false`
-                    // with no resume pointer: resuming from the current (already fully processed)
-                    // page would just hit the same untrusted link again, so the next call restarts
-                    // from the top instead. It is also reported back as `blocked_link`, for the
-                    // caller to raise as a visible `SyncIssue` rather than just a log line.
-                    tracing::warn!(
-                        url = %untrusted,
-                        previous_url = %url,
-                        "ignored a Link: rel=\"next\" that was not the same origin and path as the \
-                         request that returned it"
-                    );
-                    blocked_link = Some(untrusted);
-                    blocked_from_resuming = true;
-                    break;
-                }
+                // Compared against `self.api_base` (round 3 review item B-1: GitHub rewrites the
+                // path in several endpoints' first `next` link — see `origin::trusted_next_url`'s
+                // doc) — `next` must share its scheme, host and effective port, with a path under
+                // the API base's own. On a match, the *parsed* URL is what gets requested next
+                // (round 3 item S-2), not the original `next` text, so the request actually sent
+                // can never diverge from what this check approved.
+                Some(next) => match trusted_next_url(&next, &self.api_base) {
+                    Some(parsed) => url = parsed.as_str().to_string(),
+                    None => {
+                        // Never follow an untrusted `Link: rel="next"`: it would send the
+                        // `Authorization` header (attached in `get`, above) to whatever host
+                        // answered, or walk the request to an unexpected path. This is left
+                        // `completed = false` with no resume pointer: resuming from the current
+                        // (already fully processed) page would just hit the same untrusted link
+                        // again, so the next call restarts from the top instead. It is also
+                        // reported back as `blocked_link`, for the caller to raise as a visible
+                        // `SyncIssue` rather than just a log line.
+                        tracing::warn!(
+                            url = %next,
+                            api_base = %self.api_base,
+                            "ignored a Link: rel=\"next\" outside the configured API base"
+                        );
+                        blocked_link = Some(next);
+                        blocked_from_resuming = true;
+                        break;
+                    }
+                },
                 None => {
                     completed = true;
                     break;
