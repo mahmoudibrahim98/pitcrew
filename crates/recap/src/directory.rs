@@ -13,7 +13,9 @@
 //!   one (`folder`, `branch`, `imported`), and not by a re-stated `session_discovered` that has
 //!   none. Anything replaces an inferred link or none. A link is replaced whole (workstream, task
 //!   and basis). A dispatch links its session firmly to the dispatch's task only when the session
-//!   has no firm link yet (the hub links it through the `session_discovered` that follows).
+//!   has no firm link yet (the hub links it through the `session_discovered` that follows). A
+//!   `session_linked` for a session not discovered yet makes its entry with that link, so a firm
+//!   one there holds against what follows, including the session's own discovery.
 //! - **Agents stay.** A re-stated session that names no agent keeps the agent it had.
 //! - **Moves name where they start** (`work.tasks`). A `task_moved` whose `from` is not the task's
 //!   status lost a race with another writer's move, and the hub ignores it. A task's status is
@@ -22,7 +24,8 @@
 //!   states tasks as they are now and then replays older moves, as the hub's seed writes, says
 //!   nothing false by it). Before any of that, nothing is known and every move counts: a status
 //!   from a seed (`add_task`) is the projections' as they are now, which may be ahead of the
-//!   events that follow.
+//!   events that follow. A move on a task the directory does not know (never stated, or dropped
+//!   for the limit) also counts, where the hub ignores a move on a task it does not have.
 //!
 //! Events the hub ignores (a stale move, a link that would replace a firm one) are not activity:
 //! the block builder leaves them out, like events it cannot place.
@@ -36,11 +39,12 @@
 //! (members, sessions, tasks, task-to-session links, workstreams, dispatches and asks), 100,000 by
 //! default ([`Directory::with_limit`]). Past it, the entry of that kind used longest ago goes. An
 //! entry is used by every `add_*` that states it and every event that states or names it (a
-//! session by its own activity, a task by its moves and comments, a dispatch by its end, an ask
-//! by its answer, a member by the events it authors). So a log of any length keeps being learned
-//! from: what goes is what nothing has mentioned for longest, in practice sessions that ended long
-//! ago, with their dispatches and asks. Use depends only on the order of events and `add_*` calls,
-//! so the same events give the same directory however they are batched.
+//! session by its own activity, a task and its link to a session by the task's events and
+//! comments, a dispatch by its end, an ask by its answer, a member by the events it authors). So
+//! a log of any length keeps being learned from: what goes is what nothing has mentioned for
+//! longest, in practice sessions that ended long ago, with their dispatches and asks. Use depends
+//! only on the order of events and `add_*` calls, so the same events give the same directory
+//! however they are batched.
 //!
 //! What a dropped entry costs: later events about a dropped session, task or dispatch are placed
 //! as if it were new (or not at all), and prose that needs a dropped name says "someone", "a task",
@@ -303,9 +307,12 @@ impl Directory {
             | EventBody::FileEdited { session, .. }
             | EventBody::SessionUpdated { session, .. }
             | EventBody::SessionEnded { session } => self.sessions.touch(*session),
-            EventBody::TaskCreated { task } => self.put_task(task, Some(task.status)),
+            EventBody::TaskCreated { task } => {
+                self.put_task(task, Some(task.status));
+                self.task_sessions.touch(task.id);
+            }
             EventBody::TaskUpdated { task, patch } => {
-                self.tasks.touch(*task);
+                self.touch_task(*task);
                 if let (Some(workstream), Some(info)) = (patch.workstream, self.tasks.get_mut(task))
                 {
                     info.workstream = workstream;
@@ -315,13 +322,13 @@ impl Directory {
                 return self.take_move(*task, *from, *to);
             }
             EventBody::TaskAssigned { task, .. } | EventBody::SubtasksReplaced { task, .. } => {
-                self.tasks.touch(*task);
+                self.touch_task(*task);
             }
             EventBody::CommentPosted {
                 task, workstream, ..
             } => {
                 if let Some(task) = task {
-                    self.tasks.touch(*task);
+                    self.touch_task(*task);
                 }
                 if let Some(workstream) = workstream {
                     self.workstreams.touch(*workstream);
@@ -371,9 +378,16 @@ impl Directory {
         true
     }
 
+    /// An event names a task: the task, and its link to a session (which places the task's
+    /// events), are used.
+    fn touch_task(&mut self, task: TaskId) {
+        self.tasks.touch(task);
+        self.task_sessions.touch(task);
+    }
+
     /// A `task_moved`: whether it counts (see the [module docs](self)).
     fn take_move(&mut self, task: TaskId, from: TaskStatus, to: TaskStatus) -> bool {
-        self.tasks.touch(task);
+        self.touch_task(task);
         let Some(info) = self.tasks.get_mut(&task) else {
             return true;
         };

@@ -546,6 +546,38 @@ fn an_active_session_outlives_idle_ones() {
     assert!(last[1].tasks.is_empty());
 }
 
+/// The link from a task to its session is used by the task's events, so it outlives one nothing
+/// mentions.
+#[test]
+fn a_tasks_events_keep_its_link_to_a_session() {
+    let w = World::new(1, 4, 1);
+    let ws = w.workstreams[0];
+    let (s0, s1, s2) = (new_session(0), new_session(1), new_session(2));
+    let (t0, t1, t2) = (w.tasks[0], w.tasks[1], w.tasks[2]);
+    let comment = |task: TaskId| EventBody::CommentPosted {
+        task: Some(task),
+        workstream: None,
+        text: "Looks right.".into(),
+        mentions: vec![],
+    };
+    let mut log = Log::new();
+    log.add(&w, 0, w.person, linked(s0, ws, t0, LinkBasis::Manual))
+        .add(&w, 1, w.person, linked(s1, ws, t1, LinkBasis::Manual))
+        .add(&w, 1, w.person, comment(t0))
+        // A third link drops the task link used longest ago: task 1's, not task 0's.
+        .add(&w, 1, w.person, linked(s2, ws, t2, LinkBasis::Manual))
+        .add(&w, 1, w.person, comment(t1))
+        .add(&w, 1, w.person, comment(t0));
+    // No tasks are known, so a task's event can only be placed through its session.
+    let (all, skipped) = log.build(&Directory::with_limit(2));
+    assert_eq!(skipped, 1, "task 1's comment has nowhere to go");
+    let s0_block = all
+        .iter()
+        .find(|b| b.session == Some(s0))
+        .expect("session 0's block");
+    assert_eq!(s0_block.counts.comments, 2);
+}
+
 fn member(n: u128, handle: &str) -> Member {
     Member {
         id: MemberId(Ulid::from((40u128 << 96) | n)),

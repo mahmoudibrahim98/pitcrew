@@ -20,21 +20,26 @@ Recap engine: activity blocks, summaries with receipts, and Where-it-stands prop
   - *Firm links stay.* A link made by a dispatch, a person or the agent itself (`dispatch`,
     `manual`, `claimed`) is replaced only by another firm one, never by an inferred one (`folder`,
     `branch`, `imported`) or by a re-stated `session_discovered` without a link. A link is replaced
-    whole. A re-stated session that names no agent keeps the one it had.
+    whole. A re-stated session that names no agent keeps the one it had. A dispatch links its
+    session only when it has no firm link yet (the hub never links from `dispatch_started`; the
+    `session_discovered` after it does). A `session_linked` for a session not discovered yet makes
+    its entry with that link, so a firm one holds against the discovery that follows.
   - *Stale moves are not moves.* A `task_moved` whose `from` is not the task's status (only a
     second writer appends one) is ignored by the hub's tasks projection. The status is known from
     the task's `task_created` and the moves counted since; a move that ends where a `task_created`
     put the task still counts (a log that states tasks as they are now and then replays older
     moves, as the hub's seed writes). A seed's status is not checked: it may be ahead of the
-    events that follow.
+    events that follow. A move on a task the directory does not know (never stated, or dropped
+    for the limit) counts too, where the hub ignores a move on a task it does not have.
   - Events the hub ignores (a stale move, a link that would replace a firm one) are not activity:
     no block holds them, and `BlockBuilder::skipped` counts them.
   - *Bounded, without a first-come cap.* At most 100,000 entries of each kind
     (`Directory::with_limit` sets another limit). Past that, the entry used longest ago goes: an
     entry is used by every `add_*` and every event that states or names it (a session's activity,
-    a task's moves, a dispatch's end, an ask's answer, a member's own events). So a log of any
-    length keeps being learned from, and what goes is what nothing mentioned for longest, in
-    practice sessions that ended long ago with their dispatches and asks. Use depends only on the
+    a task's events for the task and its link to a session, a dispatch's end, an ask's answer, a
+    member's own events). So a log of any length keeps being learned from, and what goes is what
+    nothing mentioned for longest, in practice sessions that ended long ago with their dispatches
+    and asks. Use depends only on the
     order of events, so batching never changes the directory. A dropped session or task is placed
     as if new; a dropped name reads "someone", "a task", "a workstream" or "an ask". Every kind
     full (100,000 each, which only a flood of made-up ids reaches) measured about 125 MB, and
