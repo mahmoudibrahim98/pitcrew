@@ -2,7 +2,11 @@
 // Parity check: replays the requests and assertions of apps/mock-hub/test/http.test.ts (and the
 // first test of each route in edits.test.ts) against the mock hub and against a real pitcrewd,
 // each test on a fresh server (as the mock's `withServer` does), and prints every check that
-// fails on either side.
+// fails on either side. For the recap routes (recaps.test.ts) it checks properties rather than
+// values: the mock serves its fixture, and the daemon what its recap index makes of the seeded
+// demo's log, which is not the fixture's (crates/hub-work's README, "The seeded demo is not the
+// fixture"). Two recap rows are expected to differ: `tz=60` (the mock serves tz=0 only) and the
+// quiet workstream WST0004 (the daemon's seed creates it, which is activity).
 //
 //   node crates/daemon/parity/replay.mjs --pitcrewd <path to pitcrewd> [--no-office] [--json <report.json>]
 //
@@ -37,6 +41,9 @@ const ID = {
   parsers: '01JB000000000000000WST0003',
   pap1: '01JB000000000000000TSK0001',
   pap4: '01JB000000000000000TSK0004',
+  seedRuns: '01JB000000000000000WST0002',
+  ablation: '01JB000000000000000WST0004',
+  ses2: '01JB000000000000000SES0002',
 };
 
 // ─── Servers ────────────────────────────────────────────────────────────────────────────────────
@@ -99,7 +106,11 @@ class Run {
     this.calls = [];
   }
 
-  /** As the mock tests' `call`; `token` is 'device', 'agent', or a literal token. */
+  /**
+   * As the mock tests' `call`; `token` is 'device', 'agent', or a literal token. `record: false`
+   * leaves the request out of the status comparison, for loops whose length depends on the
+   * server's data (paging), so that the requests after them still line up.
+   */
   async call(method, path, options = {}) {
     const headers = { ...options.headers };
     const token = options.token === 'device' ? this.server.device : options.token === 'agent' ? this.server.agent : options.token;
@@ -117,7 +128,9 @@ class Run {
     } catch {
       parsed = text;
     }
-    this.calls.push({ request: `${method} ${path}${options.token ? ` (${options.token === 'device' || options.token === 'agent' ? options.token : 'other'} token)` : ''}`, status: res.status, code: parsed?.code });
+    if (options.record !== false) {
+      this.calls.push({ request: `${method} ${path}${options.token ? ` (${options.token === 'device' || options.token === 'agent' ? options.token : 'other'} token)` : ''}`, status: res.status, code: parsed?.code });
+    }
     return { status: res.status, headers: res.headers, body: parsed };
   }
 
@@ -135,6 +148,55 @@ const keys = (tasks) => (Array.isArray(tasks) ? tasks.map((t) => t.key) : tasks)
 // The demo's own slice of the log (`EVT00NN` ids). The mock's log is only that; the daemon's starts
 // with the demo's lists as events (`task_created`, `session_discovered`, …), which the seed adds.
 const slice = (events) => (Array.isArray(events) ? events.filter((e) => /EVT\d{4}$/.test(e.id)) : events);
+
+// ─── Recap helpers ──────────────────────────────────────────────────────────────────────────────
+
+/** The last four characters of an id, for reports. */
+const short = (id) => (typeof id === 'string' ? id.slice(-4) : id);
+
+/** A span's clause: spans are UTF-8 byte ranges, not string indices. */
+const clause = (summary, span) => Buffer.from(summary.text, 'utf8').subarray(span.range.start, span.range.end).toString('utf8');
+
+/** Summaries whose spans are not non-empty clauses in order, each with a receipt (their texts). */
+const badSummaries = (summaries) =>
+  summaries
+    .filter((s) => {
+      if (!Array.isArray(s?.spans) || s.spans.length === 0) return true;
+      let end = 0;
+      for (const span of s.spans) {
+        const { start, end: stop } = span.range;
+        if (start < end || start >= stop || stop > Buffer.byteLength(s.text, 'utf8')) return true;
+        if (clause(s, span).trim() === '' || span.receipts.length === 0) return true;
+        end = stop;
+      }
+      return false;
+    })
+    .map((s) => s?.text);
+
+/** Newest date first; within a date, the entry without a workstream first, then by workstream id. */
+const daysInOrder = (days) =>
+  days.every((d, i) => {
+    if (i === 0) return true;
+    const p = days[i - 1];
+    if (p.date !== d.date) return p.date > d.date;
+    if (p.workstream === undefined) return d.workstream !== undefined;
+    return d.workstream !== undefined && p.workstream < d.workstream;
+  });
+
+/** Pages back through `path` (`?limit=…` and filters), unrecorded, until `at_start`. */
+async function pageAll(r, path, list, cursor) {
+  const pages = [];
+  let before = '';
+  for (let i = 0; i < 100; i++) {
+    const res = await r.call('GET', `${path}${before}`, { token: 'device', record: false });
+    pages.push({ status: res.status, at_start: res.body?.at_start, items: res.body?.[list] ?? [] });
+    if (res.status !== 200 || res.body?.at_start !== false) break;
+    const last = res.body?.[list]?.at(-1);
+    if (last === undefined) break;
+    before = `&before=${cursor(last)}`;
+  }
+  return pages;
+}
 
 // ─── The mock's HTTP tests, as soft checks ──────────────────────────────────────────────────────
 
@@ -520,6 +582,92 @@ const TESTS = {
       req.end();
     });
     r.check('status', status, 403);
+  },
+
+  // The recap routes (apps/mock-hub/test/recaps.test.ts), as properties: see the top of this file.
+  'recaps: blocks newest first, each line with spans, paged to the start': async (r) => {
+    const all = await r.call('GET', '/v1/recaps/blocks?limit=200', { token: 'device' });
+    r.check('limit=200: status', all.status, 200);
+    r.check('limit=200: at_start', all.body?.at_start, true);
+    const blocks = all.body?.blocks ?? [];
+    const ids = blocks.map((b) => b.block.id);
+    r.ok('limit=200: some blocks', ids.length > 0, ids.length);
+    r.ok('ids strictly descending', ids.every((id, i) => i === 0 || ids[i - 1] > id), ids.map(short));
+    r.check('every line has spans, each a non-empty UTF-8 clause with a receipt', badSummaries(blocks.map((b) => b.line)), []);
+    r.check('before=<the oldest id>: an empty page at the start', (await r.call('GET', `/v1/recaps/blocks?before=${ids.at(-1)}`, { token: 'device' })).body, { blocks: [], at_start: true });
+    const pages = await pageAll(r, '/v1/recaps/blocks?limit=4', 'blocks', (b) => b.block.id);
+    r.check('paging by 4: every page 200', pages.map((p) => p.status).filter((s) => s !== 200), []);
+    r.check('paging by 4: no empty page before the start', pages.filter((p) => !p.at_start && p.items.length === 0).length, 0);
+    r.check('paging by 4: concatenates to the same list', pages.flatMap((p) => p.items.map((b) => b.block.id)).map(short), ids.map(short));
+  },
+
+  'recaps: block filters, combined, unknown and malformed': async (r) => {
+    const get = (query, token = 'device') => r.call('GET', `/v1/recaps/blocks${query}`, { token });
+    for (const [filter, value, carries] of [
+      ['session', ID.ses2, (b) => b.session === ID.ses2],
+      ['task', ID.pap1, (b) => b.tasks.includes(ID.pap1)],
+      ['workstream', ID.seedRuns, (b) => b.workstream === ID.seedRuns],
+      ['project', ID.tooling, (b) => b.project === ID.tooling],
+    ]) {
+      const res = await get(`?${filter}=${value}&limit=200`);
+      r.check(`${filter}=${short(value)}: status`, res.status, 200);
+      const found = res.body?.blocks ?? [];
+      r.ok(`${filter}=${short(value)}: some blocks`, found.length > 0, found.length);
+      r.check(`${filter}=${short(value)}: every block carries the link`, found.filter((b) => !carries(b.block)).map((b) => short(b.block.id)), []);
+    }
+    r.check('project=PRJ0002&session=SES0002: an empty page at the start', (await get(`?project=${ID.tooling}&session=${ID.ses2}`)).body, { blocks: [], at_start: true });
+    r.check('an unknown task: an empty page at the start', (await get('?task=01JB000000000000000TSK0099')).body, { blocks: [], at_start: true });
+    const bare = (await get(`?session=${ID.ses2}`)).body;
+    r.check('the prefixed lower-case session id equals the bare one', (await get(`?session=ses_${ID.ses2.toLowerCase()}`)).body, bare);
+    for (const query of ['?session=nope', '?task=PAP-1', '?before=1790761920000', '?limit=0']) {
+      const res = await get(query);
+      r.check(`${query}: status`, res.status, 400);
+      r.check(`${query}: code`, res.body?.code, 'invalid');
+    }
+    r.check('agent token: status', (await get('', 'agent')).status, 403);
+    r.check('no token: status', (await r.call('GET', '/v1/recaps/blocks')).status, 401);
+  },
+
+  'recaps: days by project and workstream, paged by date': async (r) => {
+    const get = (query, token = 'device') => r.call('GET', `/v1/recaps/days${query}`, { token });
+    const paper = await get(`?project=${ID.paper}&limit=30`);
+    r.check('project=PRJ0001: status', paper.status, 200);
+    r.check('project=PRJ0001: at_start', paper.body?.at_start, true);
+    const days = paper.body?.days ?? [];
+    r.ok('project=PRJ0001: some entries', days.length > 0, days.length);
+    r.ok('dates descending; the entry without a workstream first, then by workstream id', daysInOrder(days), days.map((d) => `${d.date} ${short(d.workstream) ?? '-'}`));
+    r.check('every paragraph has spans, each a non-empty UTF-8 clause with a receipt', badSummaries(days.map((d) => d.summary)), []);
+    for (const workstream of [ID.submission, ID.seedRuns]) {
+      const own = await get(`?workstream=${workstream}&limit=30`);
+      r.check(`workstream=${short(workstream)}: deep-equals the project's entries for it`, own.body, { days: days.filter((d) => d.workstream === workstream), at_start: true });
+    }
+    const blocks = (await r.call('GET', `/v1/recaps/blocks?project=${ID.paper}&limit=200`, { token: 'device' })).body?.blocks ?? [];
+    const byId = new Map(blocks.map((b) => [b.block.id, b.block]));
+    const strays = days.flatMap((d) => d.blocks.filter((id) => byId.get(id)?.workstream !== d.workstream || !byId.has(id)).map((id) => `${d.date} ${short(d.workstream) ?? '-'}: ${short(id)}`));
+    r.check("each day's blocks are in the blocks list, with the same workstream", strays, []);
+    // Expected to differ: Ablation is quiet in the mock's fixture, but the daemon's seed creates
+    // it with a `workstream_created`, which is activity (a block) like any other event.
+    r.check('workstream=WST0004: an empty page at the start', (await get(`?workstream=${ID.ablation}`)).body, { days: [], at_start: true });
+    r.check('an unknown workstream: an empty page at the start', (await get('?workstream=wst_01JB000000000000000WST0099')).body, { days: [], at_start: true });
+    r.check('tz=0 equals no tz', (await get(`?project=${ID.paper}&tz=0`)).body, (await get(`?project=${ID.paper}`)).body);
+    // Known difference: the mock serves its fixture's tz=0 only; the daemon computes any offset.
+    const shifted = await get(`?project=${ID.paper}&tz=60`);
+    r.check('tz=60: status (the contract allows -840..840; the mock serves tz=0 only)', shifted.status, 200);
+    for (const tz of ['841', '1.5', 'UTC']) {
+      const res = await get(`?project=${ID.paper}&tz=${tz}`);
+      r.check(`tz=${tz}: status`, res.status, 400);
+      r.check(`tz=${tz}: code`, res.body?.code, 'invalid');
+    }
+    for (const query of ['', `?workstream=${ID.submission}&project=${ID.paper}`, `?project=${ID.paper}&before=2026-13-01`, `?project=${ID.paper}&before=2026-9-30`, `?project=${ID.paper}&limit=0`]) {
+      const res = await get(query);
+      r.check(`${query || '(no scope)'}: status`, res.status, 400);
+      r.check(`${query || '(no scope)'}: code`, res.body?.code, 'invalid');
+    }
+    r.check('agent token: status', (await get(`?project=${ID.paper}`, 'agent')).status, 403);
+    const pages = await pageAll(r, `/v1/recaps/days?project=${ID.paper}&limit=1`, 'days', (d) => d.date);
+    r.check('paging by limit=1: every page 200', pages.map((p) => p.status).filter((s) => s !== 200), []);
+    r.check('paging by limit=1: one date a page', pages.map((p) => new Set(p.items.map((d) => d.date)).size).filter((n) => n !== 1), []);
+    r.check('paging by limit=1: concatenates to the whole', pages.flatMap((p) => p.items), days);
   },
 };
 

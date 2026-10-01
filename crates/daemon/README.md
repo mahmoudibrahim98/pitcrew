@@ -255,7 +255,13 @@ node crates/daemon/parity/replay.mjs --pitcrewd target/debug/pitcrewd [--no-offi
 ```
 
 It is a report, not a test: some differences are expected (see the latest report in the pull
-request that changed this crate). The mock hub has no back office; with the daemon's on (the
+request that changed this crate). The recap routes are compared by property, not by value, since
+the seeded demo is not the mock's fixture (see "Recaps"): order, paging, filters, spans, days
+against blocks, and the `400`, `403` and `401` answers. Two recap rows differ by design: `tz=60`
+(`400` on the mock, which serves `tz=0` only; `200` here) and the quiet workstream `WST0004`, whose
+`workstream_created` the daemon's seed appends, so it has a day here and none in the fixture.
+Paging loops are left out of the per-request status comparison (`record: false`), so the requests
+after them still line up although the two servers hold different numbers of blocks. The mock hub has no back office; with the daemon's on (the
 default), a check that reads the newest event right after a write may see `@office`'s reminders
 instead, depending on timing. `--no-office` runs the daemon without it, to compare the hub alone.
 
