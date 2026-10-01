@@ -8,9 +8,11 @@ import type {
   Ask,
   AskAnswer,
   AskFilters,
+  BlocksPage,
   Brief,
   BriefEdit,
   BriefTarget,
+  DaysPage,
   Dispatch,
   DispatchRequest,
   EndMode,
@@ -28,6 +30,8 @@ import type {
   NewWorkstream,
   Persona,
   Project,
+  RecapBlockFilters,
+  RecapDayScope,
   Session,
   SessionFilters,
   Subtask,
@@ -202,6 +206,19 @@ export function createApi(options: ApiOptions) {
       request<undefined>('POST', `/v1/sessions/${id(session)}/end`, { body: { mode } }),
     asks: (filters: AskFilters = {}, signal?: AbortSignal) =>
       get<Ask[]>('/v1/asks', { ...filters }, signal),
+
+    // ─── Recaps ─────────────────────────────────────────────────────────────────────────────────
+
+    /** Blocks, newest first by id. `before` is the last block's id (exclusive); `at_start` ends paging. */
+    recapBlocks: (filters: RecapBlockFilters = {}, before?: string, limit?: number, signal?: AbortSignal) =>
+      get<BlocksPage>('/v1/recaps/blocks', { ...filters, before, limit: number(limit) }, signal),
+    /**
+     * Day paragraphs for a workstream or a project, newest date first. `before` is the last
+     * entry's date (exclusive); `at_start` ends paging. `tz` is whole minutes east of UTC; the
+     * mock hub answers `400 invalid` for anything but `tz=0`.
+     */
+    recapDays: (scope: RecapDayScope, tz: number, before?: string, limit?: number, signal?: AbortSignal) =>
+      get<DaysPage>('/v1/recaps/days', { ...scope, tz: String(tz), before, limit: number(limit) }, signal),
 
     // ─── Writes. They do not touch the cache: the event each one emits does. ───────────────────
 
