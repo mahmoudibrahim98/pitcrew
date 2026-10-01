@@ -6,6 +6,10 @@
 //! - a move is checked with `TaskStatus::can_move`; a refused move is a `conflict`;
 //! - decisions, approvals and reviews are answered only by people, and an ask only by its
 //!   addressee or the addressee's owner.
+//!
+//! **Authorization comes before validation**: a caller who may not make a change at all is told
+//! `403 forbidden`, never `400 invalid` about the details of a change it could not make anyway.
+//! The order is: `404` for what the path names, then `403`, then `400` for the body, then `409`.
 
 use crate::error::{Result, WorkError};
 use crate::query::{self, TaskRef};
@@ -124,7 +128,7 @@ pub struct NewComment {
     pub mentions: Vec<MemberId>,
 }
 
-fn require_person(caller: &Caller, what: &str) -> Result<()> {
+pub(crate) fn require_person(caller: &Caller, what: &str) -> Result<()> {
     if caller.is_person() {
         Ok(())
     } else {
@@ -229,12 +233,50 @@ fn plan_lines(existing: &[Subtask], agent: MemberId, items: &[PlanItem]) -> Vec<
 }
 
 impl WorkService {
-    /// Creates a task with the next key in its project. People only.
+    /// Whether `caller` may write to `task` at all: `not_found` for an unknown task, `forbidden`
+    /// for an agent on a task not its own. The routes ask this before reading a request's body, so
+    /// a forbidden caller hears `403` whatever it sent; each command checks again under its lock.
+    ///
+    /// # Errors
+    ///
+    /// `not_found`, `forbidden`, or database errors.
+    pub fn check_task_write(&self, caller: &Caller, task: &TaskRef) -> Result<()> {
+        self.read(|c| {
+            let task = query::task(c, task)?.ok_or_else(|| no_task(task))?;
+            require_own_task(c, caller, &task)
+        })
+    }
+
+    /// Whether `caller` may answer the ask `id`: `not_found` for an unknown ask, `forbidden` when
+    /// it is not the caller's to answer. Like [`WorkService::check_task_write`], for routes.
+    ///
+    /// # Errors
+    ///
+    /// `not_found`, `forbidden`, or database errors.
+    pub fn check_answer(&self, caller: &Caller, id: &AskId) -> Result<()> {
+        self.read(|c| self.answerable(c, caller, id).map(|_| ()))
+    }
+
+    /// The ask `id`, if `caller` may answer it.
+    fn answerable(&self, conn: &Connection, caller: &Caller, id: &AskId) -> Result<Ask> {
+        let ask =
+            query::ask(conn, id)?.ok_or_else(|| WorkError::not_found(format!("No ask {id}.")))?;
+        if let Some(refusal) = answer_refusal(conn, caller, &ask)? {
+            return Err(WorkError::forbidden(refusal));
+        }
+        Ok(ask)
+    }
+
+    /// Creates a task with the next key for its project's key prefix. People only.
+    ///
+    /// The number is allocated by key prefix (`PAP` in `PAP-4`), not by project, because keys are
+    /// unique by prefix whatever project holds them.
     ///
     /// # Errors
     ///
     /// `forbidden` for an agent; `invalid` for an empty title, an unknown project, workstream or
-    /// assignee, a workstream of another project, or a malformed date.
+    /// assignee, a workstream of another project, or a malformed date; `conflict` when another
+    /// writer took the key first (see "One writer" on [`WorkService`]).
     pub fn create_task(&self, caller: &Caller, new: NewTask) -> Result<Task> {
         require_person(caller, "Creating a task")?;
         not_empty(&new.title, "title")?;
@@ -262,7 +304,8 @@ impl WorkService {
             if let Some(id) = &new.assignee {
                 known_member(c, id, "assignee")?;
             }
-            Ok((project, query::highest_task_number(c, &new.project)?))
+            let highest = query::highest_task_number(c, &project.key)?;
+            Ok((project, highest))
         })?;
         let number = number.checked_add(1).ok_or_else(|| {
             WorkError::conflict(format!("{} has no task numbers left.", project.key))
@@ -287,9 +330,23 @@ impl WorkService {
             accept_auto: false,
             subtasks: Vec::new(),
         };
-        let id = task.id;
+        let (id, key) = (task.id, task.key.clone());
         self.append(&[self.by(caller, EventBody::TaskCreated { task })])?;
-        self.reload_task(id)
+        match self.read(|c| {
+            Ok((
+                query::task(c, &TaskRef::Id(id))?,
+                query::key_clashed(c, &id)?,
+            ))
+        })? {
+            (Some(task), _) => Ok(task),
+            // Only a second writer can take the key between the check and the append.
+            (None, true) => Err(WorkError::conflict(format!(
+                "{key} was taken by another change at the same moment. Try again."
+            ))),
+            (None, false) => Err(WorkError::internal(format!(
+                "task {id} is missing after it was created"
+            ))),
+        }
     }
 
     /// Moves a task. The mover comes from the caller: a person, or an agent on its own task.
@@ -378,6 +435,15 @@ impl WorkService {
         let task = self.read(|c| {
             let task = query::task(c, task)?.ok_or_else(|| no_task(task))?;
             require_own_task(c, caller, &task)?;
+            if caller.scope == TokenScope::Agent
+                && !incoming.iter().all(|s| is_plan_of(s, caller.member))
+            {
+                return Err(WorkError::forbidden(format!(
+                    "An agent may only write its own plan: every subtask needs source \
+                     {{\"kind\":\"agent_plan\",\"agent\":\"{}\"}}.",
+                    caller.member.0
+                )));
+            }
             for (i, s) in incoming.iter().enumerate() {
                 not_empty(&s.text, &format!("[{i}].text"))?;
                 if let SubtaskSource::AgentPlan { agent } = &s.source {
@@ -396,15 +462,7 @@ impl WorkService {
         let subtasks = if caller.is_person() {
             incoming
         } else {
-            let me = caller.member;
-            if !incoming.iter().all(|s| is_plan_of(s, me)) {
-                return Err(WorkError::forbidden(format!(
-                    "An agent may only write its own plan: every subtask needs source \
-                     {{\"kind\":\"agent_plan\",\"agent\":\"{}\"}}.",
-                    me.0
-                )));
-            }
-            splice_plan(&task.subtasks, me, incoming)
+            splice_plan(&task.subtasks, caller.member, incoming)
         };
         let mut seen = HashSet::new();
         if !subtasks.iter().all(|s| seen.insert(s.id)) {
@@ -432,11 +490,11 @@ impl WorkService {
         task: &TaskRef,
         comment: NewComment,
     ) -> Result<Event> {
-        not_empty(&comment.text, "text")?;
         let _guard = self.lock();
         let task = self.read(|c| {
             let task = query::task(c, task)?.ok_or_else(|| no_task(task))?;
             require_own_task(c, caller, &task)?;
+            not_empty(&comment.text, "text")?;
             for (i, id) in comment.mentions.iter().enumerate() {
                 known_member(c, id, &format!("mentions[{i}]"))?;
             }
@@ -462,10 +520,10 @@ impl WorkService {
     /// `invalid` for an empty title or an unknown addressee, task or session; `forbidden` for an
     /// agent naming a task or session that is not its own.
     pub fn raise_ask(&self, caller: &Caller, new: NewAsk) -> Result<Ask> {
-        not_empty(&new.title, "title")?;
         let _guard = self.lock();
         self.read(|c| {
-            known_member(c, &new.to, "to")?;
+            // The task and session decide whether an agent may raise it at all, so they come
+            // first; the rest of the body is checked after.
             let task = match &new.task {
                 Some(id) => Some(
                     query::task(c, &TaskRef::Id(*id))?
@@ -491,6 +549,8 @@ impl WorkService {
                     "An agent may only act on its own sessions.",
                 ));
             }
+            not_empty(&new.title, "title")?;
+            known_member(c, &new.to, "to")?;
             Ok(())
         })?;
         let ask = Ask {
@@ -519,18 +579,22 @@ impl WorkService {
     /// answers only questions and mentions addressed to itself. Decisions, approvals and reviews
     /// always need a person.
     ///
+    /// A blank text counts as no text: with an option it is dropped, and alone it is refused.
+    ///
     /// # Errors
     ///
-    /// `not_found` for an unknown ask; `invalid` without an option or a text, or with an option
-    /// out of range; `forbidden` when the caller may not answer it; `conflict` when it is no
-    /// longer open.
+    /// `not_found` for an unknown ask; `forbidden` when the caller may not answer it; `invalid`
+    /// without an option or a non-blank text, or with an option out of range; `conflict` when it
+    /// is no longer open.
     pub fn answer_ask(&self, caller: &Caller, id: &AskId, answer: AnswerAsk) -> Result<Ask> {
+        let text = answer.text.filter(|t| !t.trim().is_empty());
         let _guard = self.lock();
         let ask = self.read(|c| {
-            let ask =
-                query::ask(c, id)?.ok_or_else(|| WorkError::not_found(format!("No ask {id}.")))?;
-            if answer.option.is_none() && answer.text.is_none() {
-                return Err(WorkError::invalid("Give an option, a text, or both."));
+            let ask = self.answerable(c, caller, id)?;
+            if answer.option.is_none() && text.is_none() {
+                return Err(WorkError::invalid(
+                    "Give an option, a text that is not empty, or both.",
+                ));
             }
             if let Some(option) = answer.option
                 && option >= ask.options.len()
@@ -541,9 +605,6 @@ impl WorkService {
                     format!("option must be below {}.", ask.options.len())
                 }));
             }
-            if let Some(refusal) = answer_refusal(c, caller, &ask)? {
-                return Err(WorkError::forbidden(refusal));
-            }
             Ok(ask)
         })?;
         if ask.state != AskState::Open {
@@ -553,7 +614,7 @@ impl WorkService {
         let answer = Answer {
             by: caller.member,
             option: answer.option,
-            text: answer.text,
+            text,
             at: self.now(),
         };
         self.append(&[self.by(
