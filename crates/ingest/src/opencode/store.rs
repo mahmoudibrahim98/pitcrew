@@ -19,13 +19,22 @@
 //! Columns are looked up first: a store from an older or newer OpenCode version with missing
 //! optional columns still reads, and one missing a required table or column is reported as
 //! unreadable rather than panicking.
+//!
+//! The store must be a regular file, not a link to one (see `crate::open`). That is checked on a
+//! handle of this crate's own before SQLite opens the store by its path, and kept true until it
+//! has: on Unix, SQLite is given the path with its folders already resolved, and
+//! `SQLITE_OPEN_NOFOLLOW`, so a link put in its place after the check is refused (and SQLite opens
+//! every file with `O_NOFOLLOW`); on Windows, the checked handle is held without delete sharing
+//! until SQLite has its own, so the file cannot be renamed, deleted or replaced in between.
 
 use crate::bound::{MAX_ID_BYTES, bounded};
 use crate::lines::MAX_LINE_BYTES;
+use crate::open::{FileKind, hold_transcript, refusal_in, refused};
 use pitcrew_interfaces::source::SourceError;
 use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Row, params};
 use std::collections::HashSet;
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -137,19 +146,24 @@ pub(crate) struct Store {
 }
 
 impl Store {
-    /// Opens `path` read-only.
+    /// Opens `path` read-only, if it is a regular file (see the module docs).
     pub(crate) fn open(path: &Path) -> Result<Self, SourceError> {
-        let quiet = quiet_wal_uri(path)?;
+        let held = hold_store(path)?;
+        let target = sqlite_path(path)?;
+        let quiet = quiet_wal_uri(path, &target, &held)?;
         let unlocked = quiet.as_ref().map(|(_, before)| before.clone());
         let err = |e| sql_error(path, e, unlocked.as_ref());
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_URI;
+            | OpenFlags::SQLITE_OPEN_URI
+            | NOFOLLOW;
         let conn = match &quiet {
             Some((uri, _)) => Connection::open_with_flags(uri, flags),
-            None => Connection::open_with_flags(path, flags),
+            None => Connection::open_with_flags(&target, flags),
         }
-        .map_err(err)?;
+        .map_err(|e| open_error(path, e, unlocked.as_ref()))?;
+        // SQLite has its own handle on the store now.
+        drop(held);
         conn.busy_timeout(BUSY_TIMEOUT).map_err(err)?;
         conn.pragma_update(None, "query_only", true).map_err(err)?;
         conn.execute_batch("BEGIN").map_err(err)?;
@@ -678,6 +692,64 @@ fn part_row(
     }
 }
 
+/// SQLite refuses a path with a link in it (Unix only: SQLite's Windows build ignores the flag).
+#[cfg(unix)]
+const NOFOLLOW: OpenFlags = OpenFlags::SQLITE_OPEN_NOFOLLOW;
+#[cfg(not(unix))]
+const NOFOLLOW: OpenFlags = OpenFlags::empty();
+
+/// The store, opened and checked (see `crate::open`). A link, a named pipe or anything else that
+/// is not a regular file is refused; a store that cannot be opened at all is unreadable, as when
+/// SQLite reported it.
+fn hold_store(path: &Path) -> Result<File, SourceError> {
+    hold_transcript(path).map_err(|e| {
+        if refusal_in(&e).is_some() {
+            SourceError::Io(e)
+        } else {
+            SourceError::Unreadable {
+                path: path.to_path_buf(),
+                reason: format!("cannot open the store: {e}"),
+            }
+        }
+    })
+}
+
+/// The path SQLite opens. On Unix, the store's folder resolved, so the only link
+/// `SQLITE_OPEN_NOFOLLOW` could meet is one put in place of the store itself (folders above the
+/// store may be links, as discovery allows). Elsewhere the path as it is.
+#[cfg(unix)]
+fn sqlite_path(path: &Path) -> Result<PathBuf, SourceError> {
+    let unreadable = |reason: String| SourceError::Unreadable {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let name = path
+        .file_name()
+        .ok_or_else(|| unreadable("the store's path has no file name".into()))?;
+    let folder = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let folder = std::fs::canonicalize(folder)
+        .map_err(|e| unreadable(format!("cannot resolve the store's folder: {e}")))?;
+    Ok(folder.join(name))
+}
+
+#[cfg(not(unix))]
+fn sqlite_path(path: &Path) -> Result<PathBuf, SourceError> {
+    Ok(path.to_path_buf())
+}
+
+/// [`sql_error`], except that SQLite meeting a link (`SQLITE_CANTOPEN_SYMLINK`) is a refusal.
+fn open_error(path: &Path, e: rusqlite::Error, unlocked: Option<&FileState>) -> SourceError {
+    if let rusqlite::Error::SqliteFailure(f, _) = &e
+        && f.extended_code == rusqlite::ffi::SQLITE_CANTOPEN_SYMLINK
+    {
+        return SourceError::Io(refused(path, FileKind::Link));
+    }
+    sql_error(path, e, unlocked)
+}
+
 fn side_file(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);
@@ -694,7 +766,13 @@ fn side_file(path: &Path, suffix: &str) -> PathBuf {
 /// seen as a change of the store's state, by [`Store::finish`] or when a "malformed" error is
 /// met, and the read is retried. A `-wal` left
 /// without its `-shm` by a crash is not read until OpenCode recovers it.
-fn quiet_wal_uri(path: &Path) -> Result<Option<(String, FileState)>, SourceError> {
+///
+/// `held` is the store, already checked and open; `target` the path SQLite is given.
+fn quiet_wal_uri(
+    path: &Path,
+    target: &Path,
+    held: &File,
+) -> Result<Option<(String, FileState)>, SourceError> {
     use std::io::Read;
     // Noted first, so any change from here on is seen.
     let Some(before) = FileState::of(path) else {
@@ -702,7 +780,8 @@ fn quiet_wal_uri(path: &Path) -> Result<Option<(String, FileState)>, SourceError
         return Ok(None);
     };
     let mut header = [0u8; 20];
-    let n = match std::fs::File::open(path).and_then(|mut f| f.read(&mut header)) {
+    let mut file = held;
+    let n = match file.read(&mut header) {
         Ok(n) => n,
         Err(_) => return Ok(None),
     };
@@ -710,7 +789,7 @@ fn quiet_wal_uri(path: &Path) -> Result<Option<(String, FileState)>, SourceError
     if !wal_mode || (before.wal && before.shm) {
         return Ok(None);
     }
-    let Some(text) = path.to_str() else {
+    let Some(text) = target.to_str() else {
         return Err(SourceError::Unreadable {
             path: path.to_path_buf(),
             reason: "the store's path is not UTF-8".into(),
@@ -820,6 +899,38 @@ mod tests {
         drop(conn);
         assert!(!side_file(&path, "-wal").exists(), "closed cleanly");
         path
+    }
+
+    /// What happens if the store becomes a link after this crate's own check and before SQLite
+    /// opens it: SQLite refuses it (its folders are resolved, so only the store itself could be
+    /// the link), and that is a refusal like the check's own. A linked folder above it is fine.
+    #[cfg(unix)]
+    #[test]
+    fn sqlite_refuses_a_store_that_became_a_link_but_not_a_linked_folder() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = wal_store(dir.path());
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | NOFOLLOW;
+
+        let link = dir.path().join("opencode-link.db");
+        symlink(&real, &link).expect("link");
+        let target = sqlite_path(&link).expect("resolve");
+        let e = Connection::open_with_flags(&target, flags).expect_err("a link");
+        let err = open_error(&link, e, None);
+        let refused = crate::open::refusal(&err).expect("a refusal");
+        assert_eq!(
+            (refused.kind, refused.path.as_path()),
+            (FileKind::Link, link.as_path())
+        );
+
+        let folder = dir.path().join("linked-home");
+        symlink(dir.path(), &folder).expect("link");
+        let target = sqlite_path(&folder.join("opencode.db")).expect("resolve");
+        assert!(!target.starts_with(&folder), "{}", target.display());
+        let conn = Connection::open_with_flags(&target, flags).expect("a linked folder opens");
+        drop(conn);
+        let store = Store::open(&folder.join("opencode.db")).expect("open");
+        assert_eq!(store.sessions().expect("sessions").len(), 1);
     }
 
     #[test]
