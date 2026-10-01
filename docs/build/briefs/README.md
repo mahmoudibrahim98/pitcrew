@@ -49,7 +49,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [N-recap-views](N-recap-views.md) | N · Projects layout | `s/N/recap-views` | Opus-class | **Merged** |
 | [K-tray-notifications-links](K-tray-notifications-links.md) | K · Desktop shell | `s/K/tray-notifications-links` | Opus-class | In progress |
 | [J-tunnel](J-tunnel.md) | J · Remote and HPC | `s/J/tunnel` | Opus-class | In progress |
-| [0-daemon-recaps](0-daemon-recaps.md) | 0 · Composition root | `integrator/daemon-recaps` | Opus-class | In progress |
+| [0-daemon-recaps](0-daemon-recaps.md) | 0 · Composition root | `integrator/daemon-recaps` | Opus-class | **Merged** |
 | [F-recap-hardening](F-recap-hardening.md) | F · Recap | `s/F/recap-hardening` | Opus-class | In progress |
 | [L-desktop-polish](L-desktop-polish.md) | L · UI foundation | `s/L/desktop-polish` | Sonnet-class | In progress |
 | [M-session-work](M-session-work.md) | M · Agent console | `s/M/session-work` | Sonnet-class | In progress |
