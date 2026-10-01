@@ -72,7 +72,8 @@ Windows it must be under the user's profile, whose ACL it inherits.
    new one is minted for the workspace's first person (the demo's `@sam`) and written there. If
    the store has no person yet, the token acts as a new member that nothing knows, and
    `GET /v1/me` answers 404 until onboarding can add the person (see "Not wired yet").
-6. The back office's loop, the routes, the listener, and the ready line.
+6. The recap index's warm-up (see "Recaps"), started and not waited for; the back office's loop;
+   the routes; the listener; and the ready line.
 
 ### Stop
 
@@ -178,12 +179,41 @@ after it, authored by `@office`.
 | `POST /v1/tasks/{id}/dispatch` | `pitcrew-hub-work` without a dispatcher: `503 unavailable`, and nothing is recorded, not even an assignment |
 | `GET /v1/stream` | `pitcrew-api` over the store (`StoreSource`) |
 | `GET /v1/events` | `pitcrew-api`'s `Activity` over the store, with the work model's activity index (`with_refs`, through the `WorkRefs` adapter in `src/refs.rs`): `project=` and `workstream=` match events about them, their tasks and their sessions, and `task=` and `session=` also match their sessions' and dispatches' events |
+| `GET /v1/recaps/blocks`, `GET /v1/recaps/days` | `pitcrew-api`'s `Recaps` over the hub's recap index (hub-work's `RecapIndex`, implemented by its `WorkService`), through the `WorkRecaps` adapter in `src/recaps.rs`; see "Recaps" |
 | `POST /v1/hooks/{engine}/{event}` | `pitcrew-api`; logged at debug (engine, event, member; never the body) until the runner's sink exists |
 | `GET /v1/sessions/{id}/terminal` | `pitcrew-api`; no runner yet, so `503 unavailable` for a known session, `404` for an unknown one |
 
 On development TCP only, the daemon answers CORS as the mock hub does: preflights from
 `http://localhost:<port>`, `http://127.0.0.1:<port>` and the Tauri app's origins get `204` and
 `Access-Control-Allow-*`; other origins get `403`, and so do WebSocket upgrades from them.
+
+## Recaps
+
+`GET /v1/recaps/blocks` and `GET /v1/recaps/days` (api-v1, "Recaps"; device tokens only) are
+answered by the hub's recap index: hub-work's `RecapIndex`, which its one `WorkService`
+implements (hub-work's README, "Recaps"). Blocks and day paragraphs are derived from the log and
+held in memory, never stored, so a restart builds them again.
+
+- **The adapter** (`src/recaps.rs`, like `src/refs.rs` for the activity index): `pitcrew-api`
+  does not depend on the work model, so `WorkRecaps` copies the route's `BlockFilter` field for
+  field and its `DaysScope` variant for variant into hub-work's, passes `Some(limit)` (the route
+  has applied the default and the cap) and `before.as_ref()`, and hands the index's error to the
+  route, which answers `500`. The route validates everything the contract calls `400` first, so
+  an `invalid` from the index means the two disagree about the contract: it is also logged as a
+  warning (`the recap index refused a query the route had validated`).
+- **Kept current on read.** Every query first reads the log from where the index got to, so the
+  next query after a write (any writer's, the back office's included) shows it.
+- **The warm-up.** After seeding (`--demo`) and before serving, `WorkService::sync_recaps()` runs
+  once on the blocking pool, so the first request does not read the whole log itself. Start-up
+  does not wait for it: a request meanwhile waits for the index, and finds it built. It logs
+  `built the recap index rev=<the revision it reflects> ms=<how long>`, or a warning if it failed
+  (then the first request goes on from where it stopped). With `--demo` it is a few milliseconds
+  (67 revisions); a stop during a long warm-up waits for it before the store closes.
+- **Any `tz`.** The daemon computes days at any offset from −840 to 840; the mock serves only
+  `tz=0` from its fixture.
+- **Not the mock's fixture.** The seeded demo's log is not the fixture's slice (the seed's own
+  events are activity too), so the blocks and days differ from `demo-recaps.json`; hub-work's
+  README, "The seeded demo is not the fixture", says how. The parity replay compares properties.
 
 ## Development: the UI against the daemon
 
@@ -258,6 +288,27 @@ start):
   (checked against the ids each event names), paged by 500 and by 1; filters combine; an unknown
   project is an empty page, a malformed id a 400, an agent a 403.
 
+`tests/recaps.rs`, with `--demo`, checks what the contract promises of any log (the seeded demo
+is not the mock's fixture):
+
+- the warm-up logs the revision it built the index to, and how long it took;
+- `GET /v1/recaps/blocks`: well-formed pages, newest first by id; every span of every line a
+  non-empty slice of the text's UTF-8 bytes, on character boundaries, in order, with a receipt;
+  paging by 1, 3 and 4 to `at_start` gives the whole list, never an empty page before the start;
+  `before` the oldest block is an empty page; each filter (session, task, workstream, project)
+  gives exactly the blocks carrying that link, and filters combine; an unknown id is an empty page,
+  a prefixed lower-case id the same id; malformed ids and limits are `400`;
+- `GET /v1/recaps/days`: newest date first, the entry without a workstream first within a date,
+  then by workstream id; each entry covers blocks of its own workstream, and every block of the
+  project is in exactly one entry; a workstream's days are its entries among its project's; paging
+  by one date gives the whole; `tz=0` is the default, and at `tz` 60, −300, 840 and −840 the same
+  blocks fall into days; malformed scopes, dates, `tz` and limits are `400`;
+- an agent token gets `403` and no token `401`, on both routes;
+- after a comment through the API, the very next blocks query has the block it begins, and today's
+  entry of the task's workstream covers it.
+
+The unit tests in `src/recaps.rs` check that the adapter copies every field and variant, passes
+`Some(limit)` and `before`, and hands every error to the route, logging an `invalid` as a warning.
 The unit tests in `src/serve.rs` and `src/office.rs` cover adding `@office` once to a workspace
 that has a person (and not before); keeping the office off when `@office` is a person, another
 person's agent or no one's agent; `--no-office` removing `office.json`; the start point saved

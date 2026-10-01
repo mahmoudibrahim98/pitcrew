@@ -13,8 +13,9 @@
 //!    nothing.
 //! 4. With `--demo`: mint the tokens, seed the demo workspace.
 //! 5. The device token: reused from `device.token` while it still verifies, else minted.
-//! 6. The back office's loop, the routes (`RouterParts`, with the activity index), the listener,
-//!    and one line on stdout: `pitcrewd listening on <where>`.
+//! 6. The recap index's warm-up on the blocking pool, not waited for; the back office's loop; the
+//!    routes (`RouterParts`, with the activity index and the recaps); the listener; and one line
+//!    on stdout: `pitcrewd listening on <where>`.
 //!
 //! Stop (Ctrl+C or Ctrl+Break, or SIGTERM or SIGHUP on Unix): the server stops accepting and
 //! finishes in-flight requests (`pitcrew-api` closes open WebSockets with 1001) while the back
@@ -24,13 +25,14 @@
 use crate::cli::{ListenArg, ServeArgs};
 use crate::no_runner::NoRunner;
 use crate::office::Office;
+use crate::recaps::WorkRecaps;
 use crate::refs::WorkRefs;
 use crate::state::{StateDir, read_token, read_workspace, write_token, write_workspace};
 use anyhow::{Context as _, bail};
 use axum::Extension;
 use pitcrew_api::{
-    Activity, Bound, EventRefs, EventSource, HookIntake, Listen, LogHookSink, RouterParts,
-    StoreSource, StreamConfig, TerminalConfig, Terminals,
+    Activity, Bound, EventRefs, EventSource, HookIntake, Listen, LogHookSink, RecapSource, Recaps,
+    RouterParts, StoreSource, StreamConfig, TerminalConfig, Terminals,
 };
 use pitcrew_auth::{FileTokenStore, TokenError, TokenStore};
 use pitcrew_fixtures::DemoWorkspace;
@@ -396,6 +398,7 @@ async fn run(
     } = hub;
     let mut stop = Stop::listen().context("cannot listen for stop signals")?;
     let office_work = Arc::clone(&work);
+    warm_up_recaps(&work);
 
     let events: Arc<dyn EventSource> =
         Arc::new(StoreSource::new(Arc::clone(&store), store.log_id()));
@@ -404,6 +407,9 @@ async fn run(
     let terminals: Arc<dyn Terminals> = Arc::new(NoRunner::new(Arc::clone(&work)));
     // The activity index (`project=`, `workstream=`, and wider `task=` and `session=` matches).
     let refs: Arc<dyn EventRefs> = Arc::new(WorkRefs(Arc::clone(&work)));
+    // The recap index (`GET /v1/recaps/blocks` and `/days`), kept current on every query.
+    let index: Arc<WorkService> = Arc::clone(&work);
+    let recaps: Arc<dyn RecapSource> = Arc::new(WorkRecaps(index));
     let parts = RouterParts::new()
         .agent(pitcrew_api::hooks::routes(hooks))
         .agent(pitcrew_hub_work::agent_routes().layer(Extension(Arc::clone(&work))))
@@ -412,6 +418,7 @@ async fn run(
             StreamConfig::default(),
         ))
         .device(Activity::new(events).with_refs(refs).routes())
+        .device(Recaps::new(recaps).routes())
         .device(pitcrew_api::terminal::routes(
             terminals,
             TerminalConfig::default(),
@@ -495,6 +502,31 @@ async fn run(
     drop(tokens);
     close_store(store).await;
     failed.map_or(Ok(()), Err)
+}
+
+/// Builds the recap index once, on the blocking pool, so the first recap request does not read the
+/// whole log itself (hub-work's "Wiring"). Not waited for: a recap request meanwhile waits for the
+/// index and finds it built, and if building fails (logged), the next request goes on from where it
+/// stopped, as every query catches the index up with the log anyway.
+fn warm_up_recaps(work: &Arc<WorkService>) {
+    let work = Arc::clone(work);
+    // Detached: the index is the service's, and it is done when it is done.
+    drop(tokio::task::spawn_blocking(move || {
+        let started = Instant::now();
+        match work.sync_recaps() {
+            Ok(rev) => tracing::info!(
+                rev,
+                ms = started.elapsed().as_millis(),
+                "built the recap index"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e,
+                ms = started.elapsed().as_millis(),
+                "building the recap index failed; the first recap request goes on from where it \
+                 stopped"
+            ),
+        }
+    }));
 }
 
 /// Waits for the server to finish, at most [`DRAIN`].
