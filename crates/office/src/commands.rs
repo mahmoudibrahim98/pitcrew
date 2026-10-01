@@ -48,8 +48,14 @@ pub enum ApplyError<E> {
 }
 
 /// Applies the emitted entries, in order, and returns each one's result. Capped and refused
-/// entries are skipped: they are only logged. Each action's shape is checked again before it is
-/// applied, so a hand-made entry cannot get past the "never" list either.
+/// entries are skipped: they are only logged.
+///
+/// Only each action's *shape* is checked again here, because that needs no state: it carries
+/// receipts, appends only the kinds of event an office may append, and raises no approval ask.
+/// The checks that need the current state are not repeated: the mover and `from` status with
+/// `TaskStatus::can_move`, the task's `accept_auto` before a move to done, and whom an answered
+/// ask was addressed to. A [`Commands`] implementation must re-validate every action against the
+/// hub's state, as it would for any caller.
 pub fn apply<C: Commands>(
     entries: &[Entry],
     commands: &mut C,

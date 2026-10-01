@@ -334,6 +334,8 @@ impl World {
                 );
             }
             EventBody::TaskCreated { task } => {
+                // A repeated TaskCreated is an upsert, except that it cannot change the status
+                // (only TaskMoved does) or turn `accept_auto` back on (facts only tighten).
                 let accept_auto =
                     task.accept_auto && self.tasks.get(&task.id).is_none_or(|t| t.accept_auto);
                 let status = self.tasks.get(&task.id).map_or(task.status, |t| t.status);

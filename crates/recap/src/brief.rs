@@ -585,15 +585,21 @@ fn waiting_points(c: &Collected, dir: &Directory) -> Vec<Clause> {
 }
 
 /// The most pressing next step: an open decision, then a question, failing checks or a diverged
-/// job, a task in review, a failed dispatch, and last a task with steps left.
+/// job, a task in review, a failed dispatch, and last a task with steps left. Only candidates with
+/// receipts count: one without cannot be stated, so the next evidenced one is taken instead (an
+/// unevidenced decision must not hide a failing build).
 fn next_step(c: &Collected, dir: &Directory) -> Option<NextStep> {
-    let step = |urgency, text: String, receipts: &Vec<Receipt>| {
-        (!receipts.is_empty()).then(|| NextStep {
+    let step = |urgency, text: String, receipts: &[Receipt]| {
+        Some(NextStep {
             urgency,
-            clause: clause(text, receipts.clone()),
+            clause: clause(text, receipts.to_vec()),
         })
     };
-    let ask = |kinds: &[AskKind]| c.asks.iter().find(|a| kinds.contains(&a.kind));
+    let ask = |kinds: &[AskKind]| {
+        c.asks
+            .iter()
+            .find(|a| kinds.contains(&a.kind) && !a.receipts.is_empty())
+    };
     if let Some(a) = ask(&[AskKind::Decision, AskKind::Approval]) {
         let verb = if a.kind == AskKind::Approval {
             "approve"
@@ -619,7 +625,10 @@ fn next_step(c: &Collected, dir: &Directory) -> Option<NextStep> {
         .into_iter()
         .zip(&c.checks)
     {
-        if let Some(view) = view.as_ref().filter(|v| v.last_failed) {
+        if let Some(view) = view
+            .as_ref()
+            .filter(|v| v.last_failed && !v.receipts.is_empty())
+        {
             let what = match check {
                 Check::Tests => "fix the failing tests",
                 Check::Lint => "fix the lint errors",
@@ -628,7 +637,7 @@ fn next_step(c: &Collected, dir: &Directory) -> Option<NextStep> {
             return step(Urgency::Fix, what.to_owned(), &view.receipts);
         }
     }
-    if let Some((jobs, receipts)) = &c.diverged {
+    if let Some((jobs, receipts)) = c.diverged.as_ref().filter(|(_, r)| !r.is_empty()) {
         let text = match jobs.as_slice() {
             [one] => format!("decide whether to rerun job {one}"),
             _ => "decide whether to rerun the diverged jobs".to_owned(),
@@ -643,21 +652,19 @@ fn next_step(c: &Collected, dir: &Directory) -> Option<NextStep> {
             &a.receipts,
         );
     }
-    let in_status = |want: TaskStatus| {
-        c.tasks
-            .iter()
-            .find(|(_, v)| matches!(&v.status, Some((s, _)) if *s == want))
-    };
-    if let Some((task, v)) = in_status(TaskStatus::Review) {
-        let receipts = v.status.as_ref().map(|s| s.1.clone()).unwrap_or_default();
+    let in_review = c.tasks.iter().find_map(|(t, v)| match &v.status {
+        Some((TaskStatus::Review, r)) if !r.is_empty() => Some((t, r)),
+        _ => None,
+    });
+    if let Some((task, receipts)) = in_review {
         return step(
             Urgency::Review,
             format!("review {}", task_key(dir, *task)),
-            &receipts,
+            receipts,
         );
     }
     let failed = c.tasks.iter().find_map(|(t, v)| match &v.finished {
-        Some((DispatchOutcome::Failed, r)) => Some((t, r)),
+        Some((DispatchOutcome::Failed, r)) if !r.is_empty() => Some((t, r)),
         _ => None,
     });
     if let Some((task, receipts)) = failed {
@@ -671,7 +678,9 @@ fn next_step(c: &Collected, dir: &Directory) -> Option<NextStep> {
         let in_progress =
             matches!(&v.status, Some((TaskStatus::InProgress, _))) || v.status.is_none();
         match &v.plan {
-            Some((done, total, r)) if in_progress && done < total => Some((t, total - done, r)),
+            Some((done, total, r)) if in_progress && done < total && !r.is_empty() => {
+                Some((t, total - done, r))
+            }
             _ => None,
         }
     });
@@ -905,4 +914,64 @@ pub fn propose_paused(
         Some(RuleSummarizer.render(&line(&next))),
         Disposition::Propose,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(n: u128) -> Receipt {
+        Receipt::Event {
+            id: EventId(ulid::Ulid::from(n)),
+        }
+    }
+
+    fn decision(n: u128, title: &str, receipts: Vec<Receipt>) -> OpenAsk {
+        OpenAsk {
+            ask: AskId(ulid::Ulid::from(n)),
+            kind: AskKind::Decision,
+            to: MemberId(ulid::Ulid::from(n)),
+            title: title.into(),
+            receipts,
+        }
+    }
+
+    fn failing_tests(receipts: Vec<Receipt>) -> Option<CheckView> {
+        Some(CheckView {
+            failures: 1,
+            last_failed: true,
+            receipts,
+        })
+    }
+
+    #[test]
+    fn an_unevidenced_candidate_gives_way_to_the_next_evidenced_one() {
+        let dir = Directory::default();
+        let mut c = Collected {
+            asks: vec![decision(1, "which dataset", vec![])],
+            ..Collected::default()
+        };
+        c.checks[0] = failing_tests(vec![ev(2)]);
+        let next = next_step(&c, &dir).expect("the failing tests are evidenced");
+        assert_eq!(next.urgency, Urgency::Fix);
+        assert_eq!(next.clause.text, "fix the failing tests");
+        assert_eq!(next.clause.receipts, vec![ev(2)]);
+
+        c.asks.push(decision(3, "which seed", vec![ev(3)]));
+        let next = next_step(&c, &dir).expect("the second decision is evidenced");
+        assert_eq!(next.urgency, Urgency::Decide);
+        assert_eq!(next.clause.text, "someone to decide \"which seed\"");
+        assert_eq!(next.clause.receipts, vec![ev(3)]);
+    }
+
+    #[test]
+    fn no_next_step_without_evidence() {
+        let mut c = Collected {
+            asks: vec![decision(1, "which dataset", vec![])],
+            diverged: Some((vec!["42".into()], vec![])),
+            ..Collected::default()
+        };
+        c.checks[0] = failing_tests(vec![]);
+        assert_eq!(next_step(&c, &Directory::default()), None);
+    }
 }
