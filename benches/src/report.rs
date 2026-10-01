@@ -1,20 +1,21 @@
-//! Turns criterion's results into the budget summary and compares it with the baseline.
+//! Turns criterion's results and the other crates' timing tests into the budget summary, and
+//! compares it with the baseline.
 //!
 //! Criterion writes `<dir>/<group>/<function>/new/{benchmark,estimates,sample}.json` for every
-//! benchmark it ran. Each metric has two numbers:
+//! benchmark it ran; [`crate::external`] reads the tests' output. Each metric has two numbers
+//! (a [`Reading`]):
 //!
-//! - `value`, criterion's **median** time per iteration (or the byte rate at that median): the
-//!   typical cost, which is what a budget limits.
-//! - `best`, the fastest sample's time per iteration: what the code costs when nothing else
-//!   competes for the CPU. Other work on the machine (other builds, a slower core) only ever
-//!   adds time, so `best` moves far less between runs than the median, and the regression check
-//!   compares `best` with the baseline's.
+//! - `value`, the typical cost, which is what a budget limits: criterion's **median** time per
+//!   iteration (or the byte rate at that median).
+//! - `best`, the steadiest number: criterion's fastest sample per iteration. Other work on the
+//!   machine (other builds, a slower core) only ever adds time, so `best` moves far less between
+//!   runs than the median, and the regression check compares `best` with the baseline's.
 
 use crate::Mode;
-use crate::metrics::{METRICS, Metric, Unit};
+use crate::metrics::{METRICS, Metric, Source, TestId, Unit, by_name};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
@@ -37,6 +38,26 @@ pub struct Measured {
     pub bytes: Option<u64>,
 }
 
+/// A metric's two numbers, in its unit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Reading {
+    /// The typical value, checked against the budget.
+    pub value: f64,
+    /// The steadiest value, checked against the baseline.
+    pub best: f64,
+}
+
+impl Reading {
+    /// A reading whose source gives one number.
+    #[must_use]
+    pub fn same(value: f64) -> Self {
+        Self { value, best: value }
+    }
+}
+
+/// Readings by metric name.
+pub type Readings = BTreeMap<String, Reading>;
+
 /// Reads every benchmark result under `dir`, keyed by criterion id (`group/function`).
 ///
 /// # Errors
@@ -48,32 +69,43 @@ pub fn collect(dir: &Path) -> io::Result<BTreeMap<String, Measured>> {
     Ok(out)
 }
 
-/// Folds a retry's results into `into`, keeping each benchmark's lower median and lower best:
-/// a metric passes when any attempt at it passes.
-pub fn merge(into: &mut BTreeMap<String, Measured>, retry: BTreeMap<String, Measured>) {
-    for (id, m) in retry {
-        into.entry(id)
-            .and_modify(|old| {
-                old.median_ns = old.median_ns.min(m.median_ns);
-                old.best_ns = old.best_ns.min(m.best_ns);
-            })
-            .or_insert(m);
-    }
+/// The criterion metrics' readings from `measured`.
+#[must_use]
+pub fn bench_readings(measured: &BTreeMap<String, Measured>) -> Readings {
+    METRICS
+        .iter()
+        .filter_map(|metric| {
+            let Source::Bench(id) = metric.source else {
+                return None;
+            };
+            let m = measured.get(id)?;
+            let value = convert(metric, m.median_ns, m.bytes)?;
+            let best = convert(metric, m.best_ns, m.bytes)?;
+            Some((metric.name.to_owned(), Reading { value, best }))
+        })
+        .collect()
 }
 
-/// A criterion filter (a regex over benchmark ids) selecting the benchmarks of metrics that
-/// regressed or went over budget, which a retry may clear if the cause was noise. `None` when
-/// there is nothing to retry.
-#[must_use]
-pub fn retry_filter(summary: &Summary) -> Option<String> {
-    let benches: Vec<&str> = summary
-        .metrics
-        .iter()
-        .filter(|l| matches!(l.status, Status::Regressed | Status::OverBudget))
-        .filter_map(|l| METRICS.iter().find(|m| m.name == l.name))
-        .map(|m| m.bench)
-        .collect();
-    (!benches.is_empty()).then(|| format!("^({})$", benches.join("|")))
+/// Adds a reading of metric `name`, keeping the better of each number if there already is one:
+/// a first attempt and its retries are folded together, and a metric passes when any attempt at
+/// it passes. Unknown names are ignored.
+pub fn add(into: &mut Readings, name: &str, reading: Reading) {
+    let Some(metric) = by_name(name) else {
+        return;
+    };
+    let better = |a: f64, b: f64| {
+        if metric.unit.higher_is_better() {
+            a.max(b)
+        } else {
+            a.min(b)
+        }
+    };
+    into.entry(name.to_owned())
+        .and_modify(|old| {
+            old.value = better(old.value, reading.value);
+            old.best = better(old.best, reading.best);
+        })
+        .or_insert(reading);
 }
 
 fn visit(dir: &Path, out: &mut BTreeMap<String, Measured>) -> io::Result<()> {
@@ -148,18 +180,7 @@ fn read_json(path: &Path) -> io::Result<Value> {
     })
 }
 
-/// The metric's typical value (from the median), in its unit.
-#[must_use]
-pub fn value(metric: &Metric, measured: &Measured) -> Option<f64> {
-    convert(metric, measured.median_ns, measured.bytes)
-}
-
-/// The metric's best value (from the fastest sample), in its unit.
-#[must_use]
-pub fn best(metric: &Metric, measured: &Measured) -> Option<f64> {
-    convert(metric, measured.best_ns, measured.bytes)
-}
-
+/// Nanoseconds per iteration in the metric's unit.
 fn convert(metric: &Metric, ns: f64, bytes: Option<u64>) -> Option<f64> {
     if ns <= 0.0 || !ns.is_finite() {
         return None;
@@ -167,7 +188,17 @@ fn convert(metric: &Metric, ns: f64, bytes: Option<u64>) -> Option<f64> {
     match metric.unit {
         Unit::Ms => Some(ns / 1e6),
         Unit::MibPerS => bytes.map(|b| b as f64 / crate::inputs::MIB as f64 / (ns / 1e9)),
+        Unit::PercentCpu => None,
     }
+}
+
+/// What a run covered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Scope {
+    /// Quick or full.
+    pub mode: Mode,
+    /// Whether the other crates' timing tests ran.
+    pub tests: bool,
 }
 
 /// The recorded values a run is compared with.
@@ -192,9 +223,9 @@ pub struct Baseline {
 /// One recorded metric.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BaselineValue {
-    /// The typical value (median), for reference.
+    /// The typical value, for reference.
     pub value: f64,
-    /// The best value, which runs are compared with.
+    /// The steadiest value, which runs are compared with.
     pub best: f64,
     /// Their unit; a metric whose unit changed has no baseline.
     pub unit: String,
@@ -214,9 +245,10 @@ pub enum Status {
     OverBudget,
     /// Measured, but the baseline has no value for it.
     New,
-    /// Not run in this mode (the 200 MiB inputs in quick mode).
+    /// Not run: the 200 MiB inputs in quick mode, a platform that cannot measure it, or the
+    /// timing tests left out (`--no-tests`).
     Skipped,
-    /// Expected in this mode but not found in criterion's results. Fails the run.
+    /// Expected but not measured. Fails the run.
     Missing,
 }
 
@@ -247,17 +279,17 @@ impl Status {
 pub struct Line {
     /// The metric's name.
     pub name: String,
-    /// The typical (median) value, if it ran. Checked against the budget.
+    /// The typical value, if it ran. Checked against the budget.
     pub value: Option<f64>,
-    /// The best value, if it ran. Checked against the baseline.
+    /// The steadiest value, if it ran. Checked against the baseline.
     pub best: Option<f64>,
     /// Their unit.
     pub unit: String,
-    /// The budget, if one applies: a maximum for times, a minimum for rates.
+    /// The budget, if one applies: a maximum for times and CPU, a minimum for rates.
     pub budget: Option<f64>,
     /// Where the budget comes from.
     pub budget_name: Option<String>,
-    /// The baseline's best value, if any.
+    /// The baseline's best value, if this metric is compared with one.
     pub baseline: Option<f64>,
     /// How much worse `best` is than `baseline`, as a fraction (negative is better).
     pub change: Option<f64>,
@@ -272,6 +304,9 @@ pub struct Summary {
     pub schema: u32,
     /// The mode this run used.
     pub mode: Mode,
+    /// Whether the other crates' timing tests ran.
+    #[serde(default)]
+    pub tests: bool,
     /// This machine's class.
     pub machine: String,
     /// The baseline's machine class, if a baseline was used.
@@ -284,24 +319,25 @@ pub struct Summary {
     pub metrics: Vec<Line>,
 }
 
-/// Compares measurements with the budgets and, if given, the baseline.
+/// Compares readings with the budgets and, if given, the baseline.
 #[must_use]
 pub fn compare(
-    mode: Mode,
+    scope: Scope,
     machine: &str,
-    measured: &BTreeMap<String, Measured>,
+    readings: &Readings,
     baseline: Option<&Baseline>,
     threshold: f64,
 ) -> Summary {
     let metrics: Vec<Line> = METRICS
         .iter()
-        .map(|metric| line(metric, mode, measured, baseline, threshold))
+        .map(|metric| line(metric, scope, readings, baseline, threshold))
         .collect();
     let passed =
         !metrics.iter().any(|l| l.status.fails()) && metrics.iter().any(|l| l.value.is_some());
     Summary {
         schema: SCHEMA,
-        mode,
+        mode: scope.mode,
+        tests: scope.tests,
         machine: machine.to_owned(),
         baseline_machine: baseline.map(|b| b.machine.clone()),
         threshold,
@@ -310,18 +346,26 @@ pub fn compare(
     }
 }
 
+/// Whether `metric` is expected in a run covering `scope` on this platform.
+fn expected(metric: &Metric, scope: Scope) -> bool {
+    let mode_ok = !(metric.full_only && scope.mode == Mode::Quick);
+    let tests_ok = scope.tests || !matches!(metric.source, Source::Test(_));
+    mode_ok && tests_ok && metric.needs.here()
+}
+
 fn line(
     metric: &Metric,
-    mode: Mode,
-    measured: &BTreeMap<String, Measured>,
+    scope: Scope,
+    readings: &Readings,
     baseline: Option<&Baseline>,
     threshold: f64,
 ) -> Line {
     let unit = metric.unit.as_str();
-    let got = measured.get(metric.bench);
-    let value = got.and_then(|m| value(metric, m));
-    let best = got.and_then(|m| best(metric, m));
+    let reading = readings.get(metric.name);
+    let value = reading.map(|r| r.value);
+    let best = reading.map(|r| r.best);
     let base = baseline
+        .filter(|_| metric.compare)
         .and_then(|b| b.metrics.get(metric.name))
         .filter(|b| b.unit == unit && b.best > 0.0)
         .map(|b| b.best);
@@ -338,12 +382,13 @@ fn line(
         }
     });
     let status = match (value, change) {
-        (None, _) if metric.full_only && mode == Mode::Quick => Status::Skipped,
+        (None, _) if !expected(metric, scope) => Status::Skipped,
         (None, _) => Status::Missing,
         _ if over_budget => Status::OverBudget,
         (Some(_), Some(c)) if c > threshold => Status::Regressed,
         (Some(_), Some(c)) if c < -threshold => Status::Improved,
         (Some(_), Some(_)) => Status::Ok,
+        (Some(_), None) if !metric.compare => Status::Ok,
         (Some(_), None) => Status::New,
     };
     Line {
@@ -359,6 +404,69 @@ fn line(
     }
 }
 
+/// What to run again before failing: the metrics that regressed, went over budget or are
+/// missing. A benchmark that did not report under load is as likely noise as a slow one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Retry {
+    /// Criterion benchmark ids.
+    pub benches: Vec<&'static str>,
+    /// Timing tests.
+    pub tests: BTreeSet<TestId>,
+}
+
+impl Retry {
+    /// Whether there is nothing to run again.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.benches.is_empty() && self.tests.is_empty()
+    }
+
+    /// The plan `benches/run.sh` reads, one item per line: `filter <criterion regex>`, then
+    /// `bench <target>` for each criterion target to run, and `test <name>` for each test.
+    /// Empty when there is nothing to retry.
+    #[must_use]
+    pub fn plan(&self) -> String {
+        let mut out = String::new();
+        if !self.benches.is_empty() {
+            let _ = writeln!(out, "filter ^({})$", self.benches.join("|"));
+            let targets: BTreeSet<&str> = self
+                .benches
+                .iter()
+                .filter_map(|id| id.split('/').next())
+                .collect();
+            for target in targets {
+                let _ = writeln!(out, "bench {target}");
+            }
+        }
+        for test in &self.tests {
+            let _ = writeln!(out, "test {}", test.name());
+        }
+        out
+    }
+}
+
+/// What to retry after `summary`.
+#[must_use]
+pub fn retry(summary: &Summary) -> Retry {
+    let mut out = Retry::default();
+    for l in &summary.metrics {
+        if !matches!(
+            l.status,
+            Status::Regressed | Status::OverBudget | Status::Missing
+        ) {
+            continue;
+        }
+        match by_name(&l.name).map(|m| m.source) {
+            Some(Source::Bench(id)) => out.benches.push(id),
+            Some(Source::Test(test)) => {
+                out.tests.insert(test);
+            }
+            None => {}
+        }
+    }
+    out
+}
+
 /// A baseline holding this summary's measured values.
 #[must_use]
 pub fn to_baseline(summary: &Summary, recorded: Option<String>, note: Option<String>) -> Baseline {
@@ -371,20 +479,36 @@ pub fn to_baseline(summary: &Summary, recorded: Option<String>, note: Option<Str
         metrics: summary
             .metrics
             .iter()
-            .filter_map(|l| {
-                l.value.zip(l.best).map(|(value, best)| {
-                    (
-                        l.name.clone(),
-                        BaselineValue {
-                            value: round(value),
-                            best: round(best),
-                            unit: l.unit.clone(),
-                        },
-                    )
-                })
-            })
+            .filter_map(|l| Some((l.name.clone(), baseline_value(l)?)))
             .collect(),
     }
+}
+
+/// Adds the summary's metrics that `baseline` has no value for, leaving the others as they are.
+/// Only passing metrics are added: `run.sh` extends after every attempt, and a number over its
+/// budget on a busy first attempt must not become what its retries are compared with. Returns
+/// the names added.
+pub fn extend_baseline(baseline: &mut Baseline, summary: &Summary) -> Vec<String> {
+    let mut added = Vec::new();
+    for l in &summary.metrics {
+        if baseline.metrics.contains_key(&l.name) || l.status.fails() {
+            continue;
+        }
+        if let Some(v) = baseline_value(l) {
+            baseline.metrics.insert(l.name.clone(), v);
+            added.push(l.name.clone());
+        }
+    }
+    added
+}
+
+fn baseline_value(l: &Line) -> Option<BaselineValue> {
+    let (value, best) = l.value.zip(l.best)?;
+    Some(BaselineValue {
+        value: round(value),
+        best: round(best),
+        unit: l.unit.clone(),
+    })
 }
 
 /// Four significant digits: enough for a 10% threshold, short enough to review.
@@ -427,8 +551,9 @@ pub fn render(summary: &Summary) -> String {
     }
     let _ = writeln!(
         out,
-        "{} (mode {}; value is the median, checked against the budget; best is the fastest \
-         sample, checked against the baseline; threshold {:.0}%, positive change is worse)",
+        "{} (mode {}; value is the typical cost, checked against the budget; best is the \
+         steadiest number, checked against the baseline; threshold {:.0}%, positive change is \
+         worse)",
         if summary.passed { "PASSED" } else { "FAILED" },
         summary.mode.as_str(),
         summary.threshold * 100.0
@@ -471,29 +596,45 @@ pub fn machine() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::by_bench;
 
-    /// Every quick-mode metric measured: a median of 1.2 ms and a best of 1 ms (times scaled by
-    /// `median` and `best`), over 100 MiB for rates.
-    fn run(median: f64, best: f64) -> BTreeMap<String, Measured> {
-        let mib = crate::inputs::MIB;
+    const QUICK: Scope = Scope {
+        mode: Mode::Quick,
+        tests: true,
+    };
+
+    /// Every metric expected in a quick run here, measured: times with a typical value of 1.2
+    /// and a best of 1 (scaled by `typical` and `best`), rates as 100 MiB in that time.
+    fn run(typical: f64, best: f64) -> Readings {
         METRICS
             .iter()
-            .filter(|m| !m.full_only)
+            .filter(|m| expected(m, QUICK))
             .map(|m| {
-                let bytes = matches!(m.unit, Unit::MibPerS).then_some(100 * mib);
-                (
-                    m.bench.to_owned(),
-                    Measured {
-                        median_ns: 1.2e6 * median,
-                        best_ns: 1e6 * best,
-                        bytes,
-                    },
-                )
+                // 12 / 10 rather than 1.2, so 1.5 times it is exactly 1.8.
+                let (value, b) = (12.0 * typical / 10.0, best);
+                let reading = if m.unit.higher_is_better() {
+                    Reading {
+                        value: 100.0 / value,
+                        best: 100.0 / b,
+                    }
+                } else {
+                    Reading { value, best: b }
+                };
+                // The idle CPU budget is 0.5%: keep it within.
+                let reading = if m.unit == Unit::PercentCpu {
+                    Reading {
+                        value: reading.value / 10.0,
+                        best: reading.best / 10.0,
+                    }
+                } else {
+                    reading
+                };
+                (m.name.to_owned(), reading)
             })
             .collect()
     }
 
-    fn all_quick(scale: f64) -> BTreeMap<String, Measured> {
+    fn all_quick(scale: f64) -> Readings {
         run(scale, scale)
     }
 
@@ -501,88 +642,199 @@ mod tests {
         s.metrics.iter().find(|l| l.name == name).unwrap()
     }
 
+    fn base_from(readings: &Readings) -> Baseline {
+        to_baseline(
+            &compare(QUICK, "m", readings, None, DEFAULT_THRESHOLD),
+            None,
+            None,
+        )
+    }
+
     #[test]
     fn converts_times_and_rates() {
-        let page = crate::metrics::by_bench("transcripts/claude_read_page_20mib").unwrap();
-        let rate = crate::metrics::by_bench("control/parse_8mib").unwrap();
-        let m = Measured {
-            median_ns: 2.5e6,
-            best_ns: 2e6,
-            bytes: Some(8 * crate::inputs::MIB),
-        };
-        assert_eq!(value(page, &m), Some(2.5));
-        assert_eq!(best(page, &m), Some(2.0));
-        let r = value(rate, &m).unwrap();
-        assert!((r - 3200.0).abs() < 1e-6, "{r}");
-        let r = best(rate, &m).unwrap();
-        assert!((r - 4000.0).abs() < 1e-6, "{r}");
-        let no_bytes = Measured {
-            median_ns: 1.0,
-            best_ns: 1.0,
-            bytes: None,
-        };
-        assert_eq!(value(rate, &no_bytes), None);
+        let measured: BTreeMap<String, Measured> = [
+            (
+                "transcripts/claude_read_page_20mib".to_owned(),
+                Measured {
+                    median_ns: 2.5e6,
+                    best_ns: 2e6,
+                    bytes: None,
+                },
+            ),
+            (
+                "control/parse_8mib".to_owned(),
+                Measured {
+                    median_ns: 2.5e6,
+                    best_ns: 2e6,
+                    bytes: Some(8 * crate::inputs::MIB),
+                },
+            ),
+            // Not a metric.
+            (
+                "other/thing".to_owned(),
+                Measured {
+                    median_ns: 1.0,
+                    best_ns: 1.0,
+                    bytes: None,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let r = bench_readings(&measured);
+        assert_eq!(r.len(), 2);
+        let page = r["transcript.claude.read_page.20mib"];
+        assert_eq!((page.value, page.best), (2.5, 2.0));
+        let rate = r["control.parse"];
+        assert!((rate.value - 3200.0).abs() < 1e-6, "{rate:?}");
+        assert!((rate.best - 4000.0).abs() < 1e-6, "{rate:?}");
+        // A rate without bytes has no reading.
+        let no_bytes = [(
+            "control/parse_8mib".to_owned(),
+            Measured {
+                median_ns: 1.0,
+                best_ns: 1.0,
+                bytes: None,
+            },
+        )]
+        .into_iter()
+        .collect();
+        assert!(bench_readings(&no_bytes).is_empty());
+        assert!(by_bench("control/parse_8mib").is_some());
+    }
+
+    #[test]
+    fn add_keeps_the_better_number_in_each_direction() {
+        let mut r = Readings::new();
+        add(
+            &mut r,
+            "store.since.page_100",
+            Reading {
+                value: 2.0,
+                best: 1.0,
+            },
+        );
+        add(
+            &mut r,
+            "store.since.page_100",
+            Reading {
+                value: 1.5,
+                best: 1.2,
+            },
+        );
+        assert_eq!(
+            r["store.since.page_100"],
+            Reading {
+                value: 1.5,
+                best: 1.0
+            }
+        );
+        add(
+            &mut r,
+            "control.parse",
+            Reading {
+                value: 100.0,
+                best: 150.0,
+            },
+        );
+        add(
+            &mut r,
+            "control.parse",
+            Reading {
+                value: 120.0,
+                best: 140.0,
+            },
+        );
+        assert_eq!(
+            r["control.parse"],
+            Reading {
+                value: 120.0,
+                best: 150.0
+            }
+        );
+        add(&mut r, "not.a.metric", Reading::same(1.0));
+        assert_eq!(r.len(), 2);
     }
 
     #[test]
     fn a_retry_can_clear_noise_but_not_a_real_regression() {
-        let base = to_baseline(
-            &compare(Mode::Quick, "m", &all_quick(1.0), None, DEFAULT_THRESHOLD),
-            None,
-            None,
-        );
+        let base = base_from(&all_quick(1.0));
         let mut first = all_quick(1.0);
         first.insert(
-            "store/since_100".to_owned(),
-            Measured {
-                median_ns: 1.8e6,
-                best_ns: 1.5e6,
-                bytes: None,
+            "store.since.page_100".to_owned(),
+            Reading {
+                value: 1.8,
+                best: 1.5,
             },
         );
-        let s = compare(Mode::Quick, "m", &first, Some(&base), DEFAULT_THRESHOLD);
+        let s = compare(QUICK, "m", &first, Some(&base), DEFAULT_THRESHOLD);
         assert!(!s.passed);
+        let plan = retry(&s);
         assert_eq!(
-            retry_filter(&s).as_deref(),
-            Some("^(store/since_100)$"),
-            "only the failing benchmark is retried"
+            plan.benches,
+            vec!["store/since_100"],
+            "only the failing one"
         );
+        assert!(plan.tests.is_empty());
+        assert_eq!(plan.plan(), "filter ^(store/since_100)$\nbench store\n");
 
-        // The retry measures it at the baseline's speed: the lower values win, and it passes.
+        // The retry measures it at the baseline's speed: the better values win, and it passes.
         let mut merged = first.clone();
-        let retry = run(1.0, 1.0)
-            .into_iter()
-            .filter(|(id, _)| id == "store/since_100")
-            .collect();
-        merge(&mut merged, retry);
-        assert_eq!(merged["store/since_100"].best_ns, 1e6);
-        assert_eq!(merged["store/since_100"].median_ns, 1.2e6);
-        let s = compare(Mode::Quick, "m", &merged, Some(&base), DEFAULT_THRESHOLD);
+        add(
+            &mut merged,
+            "store.since.page_100",
+            Reading {
+                value: 1.2,
+                best: 1.0,
+            },
+        );
+        let s = compare(QUICK, "m", &merged, Some(&base), DEFAULT_THRESHOLD);
         assert!(s.passed, "{}", render(&s));
-        assert_eq!(retry_filter(&s), None);
+        assert!(retry(&s).is_empty());
+        assert_eq!(retry(&s).plan(), "");
 
-        // A retry that is as slow as the first attempt keeps the regression.
+        // A retry as slow as the first attempt keeps the regression.
         let mut still = first.clone();
-        merge(&mut still, first);
-        let s = compare(Mode::Quick, "m", &still, Some(&base), DEFAULT_THRESHOLD);
-        assert!(!s.passed);
+        add(
+            &mut still,
+            "store.since.page_100",
+            Reading {
+                value: 1.8,
+                best: 1.5,
+            },
+        );
+        assert!(!compare(QUICK, "m", &still, Some(&base), DEFAULT_THRESHOLD).passed);
     }
 
     #[test]
-    fn a_noisy_median_alone_is_not_a_regression() {
-        let base = to_baseline(
-            &compare(Mode::Quick, "m", &all_quick(1.0), None, DEFAULT_THRESHOLD),
-            None,
-            None,
+    fn missing_metrics_are_retried_too() {
+        let mut run = all_quick(1.0);
+        run.remove("transcript.codex.read_page.20mib");
+        run.remove("control.parse");
+        run.remove("hub.tasks.route.status");
+        let s = compare(QUICK, "m", &run, None, DEFAULT_THRESHOLD);
+        assert!(!s.passed);
+        let plan = retry(&s);
+        assert_eq!(
+            plan.benches,
+            vec!["transcripts/codex_read_page_20mib", "control/parse_8mib"]
         );
+        assert_eq!(
+            plan.tests,
+            [TestId::HubTaskList].into_iter().collect::<BTreeSet<_>>()
+        );
+        assert_eq!(
+            plan.plan(),
+            "filter ^(transcripts/codex_read_page_20mib|control/parse_8mib)$\n\
+             bench control\nbench transcripts\ntest hub-work-perf\n"
+        );
+    }
+
+    #[test]
+    fn a_noisy_typical_value_alone_is_not_a_regression() {
+        let base = base_from(&all_quick(1.0));
         // The machine was busy: medians 50% slower, but the best samples unchanged.
-        let busy = compare(
-            Mode::Quick,
-            "m",
-            &run(1.5, 1.02),
-            Some(&base),
-            DEFAULT_THRESHOLD,
-        );
+        let busy = compare(QUICK, "m", &run(1.5, 1.02), Some(&base), DEFAULT_THRESHOLD);
         assert!(busy.passed, "{}", render(&busy));
         let since = get(&busy, "store.since.page_100");
         assert_eq!(since.status, Status::Ok);
@@ -593,10 +845,10 @@ mod tests {
     #[test]
     fn quick_mode_skips_large_inputs_and_passes_against_itself() {
         let run = all_quick(1.0);
-        let first = compare(Mode::Quick, "m", &run, None, DEFAULT_THRESHOLD);
+        let first = compare(QUICK, "m", &run, None, DEFAULT_THRESHOLD);
         assert!(first.passed, "{}", render(&first));
         let base = to_baseline(&first, None, None);
-        let again = compare(Mode::Quick, "m", &run, Some(&base), DEFAULT_THRESHOLD);
+        let again = compare(QUICK, "m", &run, Some(&base), DEFAULT_THRESHOLD);
         assert!(again.passed);
         assert_eq!(
             get(&again, "transcript.claude.read_page.200mib").status,
@@ -606,97 +858,157 @@ mod tests {
     }
 
     #[test]
+    fn tests_left_out_are_skipped_not_missing() {
+        let benches_only: Readings = all_quick(1.0)
+            .into_iter()
+            .filter(|(name, _)| by_name(name).is_some_and(|m| m.source.bench_target().is_some()))
+            .collect();
+        let without = Scope {
+            mode: Mode::Quick,
+            tests: false,
+        };
+        let s = compare(without, "m", &benches_only, None, DEFAULT_THRESHOLD);
+        assert!(s.passed, "{}", render(&s));
+        assert_eq!(get(&s, "cli.hook.up.tcp").status, Status::Skipped);
+        // With the tests expected, their absence fails.
+        let s = compare(QUICK, "m", &benches_only, None, DEFAULT_THRESHOLD);
+        assert_eq!(get(&s, "cli.hook.up.tcp").status, Status::Missing);
+    }
+
+    #[test]
+    fn a_metric_this_platform_cannot_measure_is_skipped() {
+        let s = compare(QUICK, "m", &all_quick(1.0), None, DEFAULT_THRESHOLD);
+        let idle = get(&s, "runner.idle_cpu.notify");
+        if cfg!(target_os = "linux") {
+            assert_eq!(idle.status, Status::Ok, "checked against its budget only");
+        } else {
+            assert_eq!(idle.status, Status::Skipped);
+        }
+    }
+
+    #[test]
+    fn idle_cpu_is_checked_against_its_budget_not_the_baseline() {
+        let mut readings = all_quick(1.0);
+        readings.insert("runner.idle_cpu.notify".to_owned(), Reading::same(0.05));
+        let base = base_from(&readings);
+        // Three times the baseline (one tick against three) is within budget.
+        readings.insert("runner.idle_cpu.notify".to_owned(), Reading::same(0.15));
+        let s = compare(QUICK, "m", &readings, Some(&base), DEFAULT_THRESHOLD);
+        let idle = get(&s, "runner.idle_cpu.notify");
+        assert_eq!(idle.baseline, None);
+        assert_eq!(idle.change, None);
+        if cfg!(target_os = "linux") {
+            assert_eq!(idle.status, Status::Ok);
+        }
+        readings.insert("runner.idle_cpu.notify".to_owned(), Reading::same(0.6));
+        let s = compare(QUICK, "m", &readings, Some(&base), DEFAULT_THRESHOLD);
+        assert_eq!(get(&s, "runner.idle_cpu.notify").status, Status::OverBudget);
+    }
+
+    #[test]
     fn a_missing_benchmark_fails() {
         let mut run = all_quick(1.0);
-        run.remove("store/since_100");
-        let s = compare(Mode::Quick, "m", &run, None, DEFAULT_THRESHOLD);
+        run.remove("store.since.page_100");
+        let s = compare(QUICK, "m", &run, None, DEFAULT_THRESHOLD);
         assert_eq!(get(&s, "store.since.page_100").status, Status::Missing);
         assert!(!s.passed);
         // In full mode the 200 MiB benchmarks are expected too.
-        let full = compare(Mode::Full, "m", &all_quick(1.0), None, DEFAULT_THRESHOLD);
+        let full = Scope {
+            mode: Mode::Full,
+            tests: true,
+        };
+        let s = compare(full, "m", &all_quick(1.0), None, DEFAULT_THRESHOLD);
         assert_eq!(
-            get(&full, "transcript.codex.read_from.200mib").status,
+            get(&s, "transcript.codex.read_from.200mib").status,
             Status::Missing
         );
     }
 
     #[test]
     fn slower_times_and_lower_rates_regress() {
-        let base = to_baseline(
-            &compare(Mode::Quick, "m", &all_quick(1.0), None, DEFAULT_THRESHOLD),
-            None,
-            None,
-        );
+        let base = base_from(&all_quick(1.0));
         // 5% slower: within the threshold.
-        let ok = compare(
-            Mode::Quick,
-            "m",
-            &all_quick(1.05),
-            Some(&base),
-            DEFAULT_THRESHOLD,
-        );
+        let ok = compare(QUICK, "m", &all_quick(1.05), Some(&base), DEFAULT_THRESHOLD);
         assert!(ok.passed, "{}", render(&ok));
         // 20% slower: times regress, and rates (the same bytes in more time) drop too.
-        let slow = compare(
-            Mode::Quick,
-            "m",
-            &all_quick(1.2),
-            Some(&base),
-            DEFAULT_THRESHOLD,
-        );
+        let slow = compare(QUICK, "m", &all_quick(1.2), Some(&base), DEFAULT_THRESHOLD);
         assert!(!slow.passed);
         assert_eq!(get(&slow, "store.since.page_100").status, Status::Regressed);
         assert_eq!(get(&slow, "control.parse").status, Status::Regressed);
+        assert_eq!(get(&slow, "cli.hook.up.tcp").status, Status::Regressed);
         let c = get(&slow, "store.since.page_100").change.unwrap();
         assert!((c - 0.2).abs() < 1e-9, "{c}");
         // 20% faster: improved, and still passing.
-        let fast = compare(
-            Mode::Quick,
-            "m",
-            &all_quick(0.8),
-            Some(&base),
-            DEFAULT_THRESHOLD,
-        );
+        let fast = compare(QUICK, "m", &all_quick(0.8), Some(&base), DEFAULT_THRESHOLD);
         assert!(fast.passed);
         assert_eq!(get(&fast, "store.since.page_100").status, Status::Improved);
         assert_eq!(get(&fast, "control.parse").status, Status::Improved);
     }
 
     #[test]
-    fn a_median_over_budget_fails_without_a_baseline() {
+    fn a_typical_value_over_budget_fails_without_a_baseline() {
         let mut run = all_quick(1.0);
-        // The best sample is within the 5 ms budget, the median is not.
+        // The best is within the 5 ms budget, the typical value is not.
         run.insert(
-            "store/since_100".to_owned(),
-            Measured {
-                median_ns: 6e6,
-                best_ns: 1e6,
-                bytes: None,
+            "store.since.page_100".to_owned(),
+            Reading {
+                value: 6.0,
+                best: 1.0,
             },
         );
-        let s = compare(Mode::Quick, "m", &run, None, DEFAULT_THRESHOLD);
+        let s = compare(QUICK, "m", &run, None, DEFAULT_THRESHOLD);
         assert_eq!(get(&s, "store.since.page_100").status, Status::OverBudget);
         assert!(!s.passed);
+        assert_eq!(retry(&s).benches, vec!["store/since_100"]);
     }
 
     #[test]
     fn a_unit_change_drops_the_baseline() {
         let run = all_quick(1.0);
-        let mut base = to_baseline(
-            &compare(Mode::Quick, "m", &run, None, DEFAULT_THRESHOLD),
-            None,
-            None,
-        );
+        let mut base = base_from(&run);
         if let Some(v) = base.metrics.get_mut("store.since.page_100") {
             v.unit = "s".to_owned();
         }
-        let s = compare(Mode::Quick, "m", &run, Some(&base), DEFAULT_THRESHOLD);
+        let s = compare(QUICK, "m", &run, Some(&base), DEFAULT_THRESHOLD);
         assert_eq!(get(&s, "store.since.page_100").status, Status::New);
     }
 
     #[test]
+    fn extending_a_baseline_adds_only_what_it_lacks() {
+        let run = all_quick(1.0);
+        let mut base = base_from(&run);
+        base.metrics.remove("cli.hook.up.tcp");
+        let kept = base.metrics["store.since.page_100"].clone();
+        let faster = compare(QUICK, "m", &all_quick(0.5), Some(&base), DEFAULT_THRESHOLD);
+        let added = extend_baseline(&mut base, &faster);
+        assert_eq!(added, vec!["cli.hook.up.tcp"]);
+        assert_eq!(base.metrics["store.since.page_100"], kept);
+        assert_eq!(base.metrics["cli.hook.up.tcp"].best, 0.5);
+    }
+
+    #[test]
+    fn extending_a_baseline_skips_a_metric_over_its_budget() {
+        let mut run = all_quick(1.0);
+        let mut base = base_from(&run);
+        base.metrics.remove("cli.hook.up.tcp");
+        base.metrics.remove("cli.hook.down.tcp");
+        // A busy first attempt: p99 over the 10 ms budget, though the p50 looks fine.
+        run.insert(
+            "cli.hook.up.tcp".to_owned(),
+            Reading {
+                value: 19.0,
+                best: 2.7,
+            },
+        );
+        let s = compare(QUICK, "m", &run, Some(&base), DEFAULT_THRESHOLD);
+        assert_eq!(get(&s, "cli.hook.up.tcp").status, Status::OverBudget);
+        assert_eq!(extend_baseline(&mut base, &s), vec!["cli.hook.down.tcp"]);
+        assert!(!base.metrics.contains_key("cli.hook.up.tcp"));
+    }
+
+    #[test]
     fn nothing_measured_fails() {
-        let s = compare(Mode::Quick, "m", &BTreeMap::new(), None, DEFAULT_THRESHOLD);
+        let s = compare(QUICK, "m", &Readings::new(), None, DEFAULT_THRESHOLD);
         assert!(!s.passed);
     }
 

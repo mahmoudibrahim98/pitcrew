@@ -80,13 +80,15 @@ impl SourceAdapter for ClaudeAdapter {
         Engine::Claude
     }
 
+    /// Symbolic links below `projects/` (folders or files) are not followed, so discovery stays
+    /// inside the projects root.
     fn discover(&self, home: &Path) -> Result<Vec<TranscriptRef>, SourceError> {
         let mut out = Vec::new();
         let Some(projects) = read_dir_or_empty(&home.join("projects"))? else {
             return Ok(out);
         };
         for project in projects {
-            if !project.is_dir() {
+            if !is_real_dir(&project) {
                 continue;
             }
             // A project folder that vanished or cannot be listed is skipped, not fatal.
@@ -94,8 +96,12 @@ impl SourceAdapter for ClaudeAdapter {
                 continue;
             };
             for entry in entries {
-                if entry.is_dir() {
-                    let Ok(Some(subs)) = read_dir_or_empty(&entry.join("subagents")) else {
+                if is_real_dir(&entry) {
+                    let subagents = entry.join("subagents");
+                    if !is_real_dir(&subagents) {
+                        continue;
+                    }
+                    let Ok(Some(subs)) = read_dir_or_empty(&subagents) else {
                         continue;
                     };
                     out.extend(subs.iter().filter_map(|p| transcript_ref(p)));
@@ -181,8 +187,14 @@ impl SourceAdapter for ClaudeAdapter {
     }
 }
 
+/// A folder that is not a symbolic link (or a Windows junction).
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
+/// A transcript file; a link to a file elsewhere is not one.
 fn transcript_ref(path: &Path) -> Option<TranscriptRef> {
-    let meta = fs::metadata(path).ok()?;
+    let meta = fs::symlink_metadata(path).ok()?;
     jsonl::transcript_ref(Engine::Claude, path, &meta)
 }
 

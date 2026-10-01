@@ -23,6 +23,7 @@
     "skipLibCheck": true
   },
   "include": ["src"],
-  // Tests next to the code run in Node (they may use the mock hub): tsconfig.node.json checks them.
-  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/**/tests/**"]
+  // Tests and e2e specs next to the code run in Node (they may use the mock hub, Playwright and
+  // its config needs Node's types): tsconfig.node.json checks them instead.
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/**/tests/**", "src/**/e2e/**"]
 }

@@ -106,6 +106,22 @@ describe('invalidation map', () => {
     expect(cleared).toEqual([keys.events, keys.tasks.detail('T1'), keys.tasks.lists, keys.workstreams.detail('WS1')]);
   });
 
+  it('project_created touches the project lists and its own detail', () => {
+    const project = { id: 'P1', key: 'PAP' } as never;
+    expect(keysToInvalidate([event({ type: 'project_created', data: { project } })], noCache)).toEqual([
+      keys.events,
+      keys.projects.lists,
+      keys.projects.detail('P1'),
+    ]);
+  });
+
+  it('workstream_created touches the workstream lists and its own detail', () => {
+    const workstream = { id: 'W1', project: 'P1' } as never;
+    expect(
+      keysToInvalidate([event({ type: 'workstream_created', data: { workstream } })], noCache),
+    ).toEqual([keys.events, keys.workstreams.lists, keys.workstreams.detail('W1')]);
+  });
+
   it('dedupes keys across a batch', () => {
     const moved = (to: 'review' | 'done') =>
       event({ type: 'task_moved', data: { task: 'T1', from: 'todo', to, mover: { kind: 'person' } } });

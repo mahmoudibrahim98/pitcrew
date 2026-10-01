@@ -70,10 +70,13 @@ export function TaskDetail({
   taskId,
   Title = 'h2',
   close,
+  combineHeading = false,
 }: {
   taskId: TaskId;
   Title?: TitleComponent;
   close?: ReactNode;
+  /** One heading reading "KEY · Title" instead of the key on its own line above it (a page of its own, not a drawer). */
+  combineHeading?: boolean;
 }) {
   const task = useTask(taskId);
   const me = useMe();
@@ -95,33 +98,55 @@ export function TaskDetail({
     );
   }
   const data = task.data;
+  // A dialog's title reads as roughly an h2 (Radix's Dialog.Title), so its sections are h3; a
+  // page's own `<h1>` (combineHeading) needs h2 sections instead, to keep the order unbroken.
+  const level: SectionLevel = combineHeading ? 2 : 3;
   return (
     <article className="flex flex-col gap-5">
       <header className="flex items-start gap-2">
-        <div className="flex flex-col gap-1">
-          <span className="font-mono text-xs text-ink-2">{data.key}</span>
-          <Title className="text-xl leading-tight font-semibold">{data.title}</Title>
-        </div>
+        {combineHeading ? (
+          <Title className="text-xl leading-tight font-semibold">{`${data.key} · ${data.title}`}</Title>
+        ) : (
+          <div className="flex flex-col gap-1">
+            <span className="font-mono text-xs text-ink-2">{data.key}</span>
+            <Title className="text-xl leading-tight font-semibold">{data.title}</Title>
+          </div>
+        )}
         <span className="ml-auto">{close}</span>
       </header>
       <Fields task={data} person={person} />
       {data.description !== '' && <p className="text-md leading-relaxed whitespace-pre-wrap">{data.description}</p>}
-      <Subtasks task={data} person={person} />
-      <AgentRun task={data} person={person} />
-      <Dependencies task={data} />
-      <Comments task={data} />
-      <History task={data} />
+      <Subtasks task={data} person={person} level={level} />
+      <AgentRun task={data} person={person} level={level} />
+      <Dependencies task={data} level={level} />
+      <Comments task={data} level={level} />
+      <History task={data} level={level} />
     </article>
   );
 }
 
-function Section({ title, children, className }: { title: string; children: ReactNode; className?: string }) {
+/** A dialog's title (`Dialog.Title`, ~h2) is followed by h3 sections; a page's own `<h1>` needs h2
+ * sections instead, so nothing skips a level. */
+type SectionLevel = 2 | 3;
+
+function Section({
+  title,
+  level = 3,
+  children,
+  className,
+}: {
+  title: string;
+  level?: SectionLevel;
+  children: ReactNode;
+  className?: string;
+}) {
   const id = useId();
+  const Heading = level === 2 ? 'h2' : 'h3';
   return (
     <section aria-labelledby={id} className={cx('flex flex-col gap-2', className)}>
-      <h3 id={id} className="text-md font-semibold">
+      <Heading id={id} className="text-md font-semibold">
         {title}
-      </h3>
+      </Heading>
       {children}
     </section>
   );
@@ -238,7 +263,7 @@ function Fields({ task, person }: { task: Task; person: boolean }) {
   );
 }
 
-function Subtasks({ task, person }: { task: Task; person: boolean }) {
+function Subtasks({ task, person, level }: { task: Task; person: boolean; level: SectionLevel }) {
   const noteId = useId();
   const members = useMemberMap();
   const replace = useReplaceSubtasks();
@@ -256,7 +281,7 @@ function Subtasks({ task, person }: { task: Task; person: boolean }) {
   };
 
   return (
-    <Section title="Subtasks">
+    <Section title="Subtasks" level={level}>
       {hasPlan && (
         <p id={noteId} className="text-xs text-ink-2">
           Lines marked “Agent plan” mirror the agent’s own plan; only the agent changes them.
@@ -310,7 +335,7 @@ function Subtasks({ task, person }: { task: Task; person: boolean }) {
   );
 }
 
-function AgentRun({ task, person }: { task: Task; person: boolean }) {
+function AgentRun({ task, person, level }: { task: Task; person: boolean; level: SectionLevel }) {
   const sessions = useSessions({ task: task.id });
   const members = useMemberMap();
   const all = [...(sessions.data ?? [])].sort(
@@ -319,7 +344,7 @@ function AgentRun({ task, person }: { task: Task; person: boolean }) {
   const running = all.filter((s) => s.state !== 'ended');
   const ended = all.filter((s) => s.state === 'ended');
   return (
-    <Section title="Agent run" className="rounded-md border border-line bg-card p-3">
+    <Section title="Agent run" level={level} className="rounded-md border border-line bg-card p-3">
       {sessions.error !== null && <ErrorNote error={sessions.error} what="load the sessions" />}
       {running.length === 0 && sessions.data !== undefined && (
         <p className="text-sm text-ink-2">No agent is working on this task.</p>
@@ -426,14 +451,16 @@ function DispatchForm({ task }: { task: Task }) {
   );
 }
 
-function Dependencies({ task }: { task: Task }) {
+function Dependencies({ task, level }: { task: Task; level: SectionLevel }) {
   const tasks = useTaskMap();
   const nav = useProjectsNav();
   const blockedBy = task.blocked_by.map((id) => tasks.get(id) ?? id);
   const blocks = [...tasks.values()].filter((t) => t.blocked_by.includes(task.id));
+  // One below the section's own heading, so nothing skips a level in either mode.
+  const SubHeading = level === 2 ? 'h3' : 'h4';
   if (blockedBy.length === 0 && blocks.length === 0) {
     return (
-      <Section title="Dependencies">
+      <Section title="Dependencies" level={level}>
         <p className="text-sm text-ink-2">No dependencies.</p>
       </Section>
     );
@@ -454,10 +481,10 @@ function Dependencies({ task }: { task: Task }) {
       </li>
     );
   return (
-    <Section title="Dependencies">
+    <Section title="Dependencies" level={level}>
       {blockedBy.length > 0 && (
         <>
-          <h4 className="text-xs font-medium text-ink-2">Blocked by</h4>
+          <SubHeading className="text-xs font-medium text-ink-2">Blocked by</SubHeading>
           <ul aria-label="Blocked by" className="flex flex-col gap-1">
             {blockedBy.map(row)}
           </ul>
@@ -465,7 +492,7 @@ function Dependencies({ task }: { task: Task }) {
       )}
       {blocks.length > 0 && (
         <>
-          <h4 className="text-xs font-medium text-ink-2">Blocks</h4>
+          <SubHeading className="text-xs font-medium text-ink-2">Blocks</SubHeading>
           <ul aria-label="Blocks" className="flex flex-col gap-1">
             {blocks.map(row)}
           </ul>
@@ -504,7 +531,7 @@ function CommentText({ text, members }: { text: string; members: readonly Member
   );
 }
 
-function Comments({ task }: { task: Task }) {
+function Comments({ task, level }: { task: Task; level: SectionLevel }) {
   const activity = useActivity({ task: task.id });
   const members = useMembers();
   const memberMap = useMemberMap();
@@ -526,7 +553,7 @@ function Comments({ task }: { task: Task }) {
   };
 
   return (
-    <Section title="Comments">
+    <Section title="Comments" level={level}>
       {comments.length === 0 ? (
         <p className="text-sm text-ink-2">No comments yet.</p>
       ) : (
@@ -577,13 +604,13 @@ function Comments({ task }: { task: Task }) {
   );
 }
 
-function History({ task }: { task: Task }) {
+function History({ task, level }: { task: Task; level: SectionLevel }) {
   const activity = useActivity({ task: task.id });
   const members = useMemberMap();
   const names = useNames();
   const events = (activity.data?.events ?? []).filter((e) => e.body.type !== 'comment_posted').reverse();
   return (
-    <Section title="History">
+    <Section title="History" level={level}>
       {activity.error !== null && <ErrorNote error={activity.error} what="load the history" />}
       {events.length === 0 && activity.data !== undefined && <p className="text-sm text-ink-2">Nothing yet.</p>}
       {events.length > 0 && <EventList events={events} members={members} names={names} label="History" />}

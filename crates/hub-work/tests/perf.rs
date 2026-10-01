@@ -5,7 +5,7 @@
 mod common;
 
 use common::{PAPER, SAM, TOOLING, WRITER, app, call, member, person, seeded};
-use pitcrew_hub_work::{TaskFilter, WorkService};
+use pitcrew_hub_work::{EventRefs, RefFilter, TaskFilter, WorkService};
 use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{EventId, ProjectKey, SubtaskId, TaskId, TaskKey};
 use pitcrew_protocol::model::{Priority, Subtask, SubtaskSource, Task, TaskStatus};
@@ -201,4 +201,34 @@ async fn listing_10k_tasks_with_a_filter() {
     for (path, _, timing) in [&routes[0], &routes[2]] {
         assert!(timing.1 < Duration::from_millis(20), "{path}: {timing:?}");
     }
+
+    // The activity reference index over the same log: the newest page of 100 by project, and
+    // every page of 500 back to the start (each one indexed walk). Reported; the store's own pages
+    // aim at under 5 ms each.
+    let by_project = RefFilter {
+        project: Some(PAPER.parse().expect("project")),
+        ..RefFilter::default()
+    };
+    let (page, revs) = time(|| {
+        work.revs_matching(&by_project, u64::MAX, 100)
+            .expect("revs")
+    });
+    report("refs: project=PAP, newest 100", revs.0.len(), page);
+    let (pages, n) = time(|| {
+        let mut before = u64::MAX;
+        let mut n = 0;
+        loop {
+            let (revs, scanned_to) = work.revs_matching(&by_project, before, 500).expect("revs");
+            n += revs.len();
+            if scanned_to == 0 {
+                return n;
+            }
+            before = scanned_to;
+        }
+    });
+    report("refs: project=PAP, every page of 500 (events)", n, pages);
+    assert!(
+        n > 5_000,
+        "every generated PAP task's event, and the demo's"
+    );
 }

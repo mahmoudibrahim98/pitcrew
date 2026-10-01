@@ -8,8 +8,10 @@ The desktop bundle (Tauri) is added once stream K lands.
 |---|---|
 | [`build-release.sh`](build-release.sh) | Builds both binaries for one or more targets into `dist/` and writes `SHA256SUMS`. |
 | [`sha256sums.sh`](sha256sums.sh) | Writes `DIR/SHA256SUMS` over every file in `DIR`. |
+| [`verify.sh`](verify.sh) | Checks `DIR` against its `SHA256SUMS`: every hash matches, and no file is unlisted. |
 | [`sbom.sh`](sbom.sh) | Writes CycloneDX SBOMs, `pitcrewd.cdx.json` and `pitcrew.cdx.json`. |
-| [`sign.sh`](sign.sh) | Signing placeholders: skipped when their secrets are absent. |
+| [`sign.sh`](sign.sh) | Signing placeholders: skipped when none of a kind's secrets is set, failing when any is. |
+| [`test.sh`](test.sh) | Tests `sha256sums.sh`, `verify.sh` and `sign.sh` (bash only, no Rust). |
 | [`zig-requirements.txt`](zig-requirements.txt) | Zig from PyPI for `cargo-zigbuild`, pinned by version and wheel hash. |
 | [`../.github/workflows/release.yml`](../.github/workflows/release.yml) | Runs all of the above on a `v*` tag. |
 
@@ -82,13 +84,15 @@ On a `v*` tag, [`release.yml`](../.github/workflows/release.yml):
 | Job | Runs on | Permissions | Does |
 |---|---|---|---|
 | `build` | Ubuntu (musl x86_64 and aarch64, via Zig), macOS (universal), Windows (x86_64) | `contents: read` | Builds, checks the Linux binaries are static, runs the x86_64 helper in `centos:7` (glibc 2.17) with no network, signs (placeholder), uploads the binaries. |
-| `manifest` | Ubuntu | `contents: read` | SBOMs, `SHA256SUMS` over everything, signs `SHA256SUMS` (placeholder). |
-| `attest` | Ubuntu | `id-token: write`, `attestations: write` | One build-provenance attestation whose subjects are every file in `SHA256SUMS`. |
-| `release` | Ubuntu | `contents: write` | A **draft** release with every file; a tag with a `-` is a pre-release. |
+| `manifest` | Ubuntu | `contents: read` | Runs `test.sh`, writes SBOMs and `SHA256SUMS` over everything, signs `SHA256SUMS` (placeholder), verifies the directory. |
+| `attest` | Ubuntu | `id-token: write`, `attestations: write` | Verifies the downloaded files against `SHA256SUMS`, then one build-provenance attestation whose subjects are every file in it. |
+| `release` | Ubuntu | `contents: write` | Verifies again, then a **draft** release with every file; a tag with a `-` is a pre-release. |
 
 The workflow has no default permissions. Actions are pinned by commit SHA, tools by version
-(`cargo install --locked --version`) or by hash (Zig), and there is no build cache. A manual run (`workflow_dispatch`) stops after `manifest`, so the
-pipeline can be tried without a tag; its artefacts are on the run's page for a week.
+(`cargo install --locked --version`) or by hash (Zig), and there is no build cache. The Rust
+channel comes from `rust-toolchain.toml`. A manual run (`workflow_dispatch`) stops after
+`manifest`, so the pipeline can be tried without a tag; its artefacts are on the run's page for
+a week.
 
 Check an attestation with the GitHub CLI:
 
@@ -98,9 +102,10 @@ gh attestation verify pitcrewd-x86_64-unknown-linux-musl --repo <owner>/<repo>
 
 ### Signing secrets
 
-The signing steps are placeholders. Each reads its secrets by name and is **skipped** when they
-are absent. If they are set, the step **fails**, because nothing signs yet and an unsigned file
-must not look signed.
+The signing steps are placeholders. Each reads its kind's secrets by name and is **skipped**
+when none of them is set. If **any** is set, the step **fails**: nothing signs yet, an unsigned
+file must not look signed, and a partly configured kind is a mistake to fix, not to skip. Only
+secret names are ever printed. `bash packaging/test.sh` checks these rules.
 
 | Step | Secrets |
 |---|---|
