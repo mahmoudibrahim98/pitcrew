@@ -1139,6 +1139,7 @@ dependencies = [
  "pitcrew-protocol",
  "pitcrew-recap",
  "pitcrew-store",
+ "proptest",
  "serde",
  "serde_json",
  "sha2",

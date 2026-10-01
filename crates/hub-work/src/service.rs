@@ -3,6 +3,7 @@
 use crate::dispatch::Dispatcher;
 use crate::error::{Result, WorkError};
 use crate::query::{self, AskFilter, SessionFilter, TaskFilter, TaskRef};
+use crate::recap::RecapSync;
 use pitcrew_protocol::api::{Caller, TokenScope};
 use pitcrew_protocol::events::{BriefTarget, Event, EventBody};
 use pitcrew_protocol::ids::{
@@ -65,6 +66,8 @@ pub struct WorkService {
     writes: Mutex<()>,
     dispatcher: Option<Arc<dyn Dispatcher>>,
     hub_machine: Option<MachineId>,
+    /// The recap index, built from the log on first use (see [`crate::RecapIndex`]).
+    recaps: Mutex<RecapSync>,
 }
 
 impl std::fmt::Debug for WorkService {
@@ -90,6 +93,7 @@ impl WorkService {
             writes: Mutex::new(()),
             dispatcher: None,
             hub_machine: None,
+            recaps: Mutex::new(RecapSync::default()),
         }
     }
 
@@ -148,6 +152,10 @@ impl WorkService {
 
     pub(crate) fn hub_machine(&self) -> Option<MachineId> {
         self.hub_machine
+    }
+
+    pub(crate) fn recap_lock(&self) -> &Mutex<RecapSync> {
+        &self.recaps
     }
 
     pub(crate) fn now(&self) -> TimestampMs {
