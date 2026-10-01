@@ -4,6 +4,8 @@
 //! with the receipts behind it. A [`Summarizer`] then turns the draft into prose. The rule-based
 //! [`RuleSummarizer`] joins the clauses as they are; a model-backed one may reword them, but every
 //! span of its output must still cite receipts from the draft, which [`verify`] checks.
+//!
+//! [`Summary`] and [`Span`] are wire types, so they live in `pitcrew_protocol::recap`.
 
 use pitcrew_protocol::model::Receipt;
 use serde::{Deserialize, Serialize};
@@ -11,37 +13,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Text whose every clause is a span with receipts.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Summary {
-    /// The prose.
-    pub text: String,
-    /// Clauses of `text`, in order and not overlapping. Text outside spans is only punctuation
-    /// and spaces joining them.
-    pub spans: Vec<Span>,
-}
-
-/// One clause of a summary and the evidence for it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Span {
-    /// Byte range in the summary text, on character boundaries.
-    pub range: Range<usize>,
-    /// Evidence. Never empty.
-    pub receipts: Vec<Receipt>,
-}
-
-impl Summary {
-    /// The text of a span.
-    #[must_use]
-    pub fn clause(&self, span: &Span) -> &str {
-        self.text.get(span.range.clone()).unwrap_or_default()
-    }
-
-    /// Every receipt cited.
-    pub fn receipts(&self) -> impl Iterator<Item = &Receipt> {
-        self.spans.iter().flat_map(|s| s.receipts.iter())
-    }
-}
+pub use pitcrew_protocol::recap::{Span, Summary};
 
 /// What a draft is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

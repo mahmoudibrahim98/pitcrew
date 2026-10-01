@@ -30,6 +30,9 @@ importers:
       '@tanstack/react-virtual':
         specifier: 3.14.13
         version: 3.14.13(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
+      '@tauri-apps/api':
+        specifier: 2.12.0
+        version: 2.12.0
       '@xterm/addon-fit':
         specifier: 0.11.0
         version: 0.11.0
@@ -1318,6 +1321,9 @@ packages:
 
   '@tanstack/virtual-core@3.17.11':
     resolution: {integrity: sha512-+ILjvtHup6Y2hzQ6YzwMgX1Q+oQpxEGOXCEsCNaPoIP0VxMbizIBTmYTDtkerkIQS8/CbP1BRuyt8V/8BCsy1g==}
+
+  '@tauri-apps/api@2.12.0':
+    resolution: {integrity: sha512-fUSxFX8VABYe9W9K5ROdEaKVkNUFRcMSRofjruvaxztXA+I0XnQHcYHF8m/a6iExRUxsUf0HsFWhPBuH9IgzJw==}
 
   '@testing-library/dom@10.4.2':
     resolution: {integrity: sha512-yzr2S9HyAIdhz2/6qHgbs665Q7PKVcDF05vsOlHPxG1mo36gKVesdYVeDLnXgfjJ03CrKRk08knc6+E/9m8v2Q==}
@@ -3608,6 +3614,8 @@ snapshots:
   '@tanstack/store@0.11.2': {}
 
   '@tanstack/virtual-core@3.17.11': {}
+
+  '@tauri-apps/api@2.12.0': {}
 
   '@testing-library/dom@10.4.2':
     dependencies:

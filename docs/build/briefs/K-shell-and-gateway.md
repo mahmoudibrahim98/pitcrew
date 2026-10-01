@@ -85,7 +85,7 @@ its own `Cargo.lock`. Build it with
 - Measure cold start to the first painted UI, and idle memory. Report both; the 1.5 s and 300 MB
   goals are not enforced yet.
 - fmt, clippy (Linux), tests, and `cargo deny check` on this manifest all pass.
-- **Windows target:** try `cargo zigbuild clippy --target x86_64-pc-windows-gnu` on this
+- **Windows target:** try `cargo-zigbuild clippy --target x86_64-pc-windows-gnu` on this
   manifest. Report what happens; it may not be possible without a Windows toolchain.
 
 ## Out of scope

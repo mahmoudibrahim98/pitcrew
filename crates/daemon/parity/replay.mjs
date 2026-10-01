@@ -4,13 +4,18 @@
 // each test on a fresh server (as the mock's `withServer` does), and prints every check that
 // fails on either side.
 //
-//   node crates/daemon/parity/replay.mjs --pitcrewd <path to pitcrewd> [--json <report.json>]
+//   node crates/daemon/parity/replay.mjs --pitcrewd <path to pitcrewd> [--no-office] [--json <report.json>]
 //
 // The daemon runs `serve --demo --listen tcp:127.0.0.1:0` on a new temporary state directory per
 // test, and its tokens come from `device.token` (the demo's @sam) and `demo-agent.token`
 // (@writer), standing in for the mock's `dev-device-token` and `dev-agent-token`. Checks marked
 // "extra" are not in the mock's tests: they restate a revision-dependent check relative to the
 // server's own log, so the two servers can be compared although their logs differ in length.
+//
+// The mock hub has no back office. The daemon runs one by default, and after a write it may
+// append its own events (the demo's asks are days old by the wall clock, so it reminds @sam of
+// them), racing a check that reads the newest event. `--no-office` passes `--no-office` to the
+// daemon, to compare the hub alone with the mock.
 //
 // Needs Node 24 (it imports the mock hub's TypeScript directly). Exits 0 when it ran, whatever
 // the differences; it is a report, not a test.
@@ -41,11 +46,11 @@ async function startMock() {
   return { url: server.url, device: 'dev-device-token', agent: 'dev-agent-token', close: () => server.close() };
 }
 
-function startDaemon(binary) {
+function startDaemon(binary, { office }) {
   return async () => {
     const state = mkdtempSync(join(tmpdir(), 'pitcrew-parity-'));
     const dir = join(state, 'state');
-    const args = ['--state-dir', dir, 'serve', '--demo', '--listen', 'tcp:127.0.0.1:0'];
+    const args = ['--state-dir', dir, 'serve', '--demo', '--listen', 'tcp:127.0.0.1:0', ...(office ? [] : ['--no-office'])];
     // A script stands in for the binary when checking this file itself.
     const [command, argv] = /\.m?js$/.test(binary) ? [process.execPath, [binary, ...args]] : [binary, args];
     const child = spawn(command, argv, {
@@ -126,6 +131,10 @@ class Run {
 }
 
 const keys = (tasks) => (Array.isArray(tasks) ? tasks.map((t) => t.key) : tasks);
+
+// The demo's own slice of the log (`EVT00NN` ids). The mock's log is only that; the daemon's starts
+// with the demo's lists as events (`task_created`, `session_discovered`, …), which the seed adds.
+const slice = (events) => (Array.isArray(events) ? events.filter((e) => /EVT\d{4}$/.test(e.id)) : events);
 
 // ─── The mock's HTTP tests, as soft checks ──────────────────────────────────────────────────────
 
@@ -399,11 +408,14 @@ const TESTS = {
     r.check('task=pap1: status', res.status, 200);
     r.check('task=pap1: types', res.body?.events?.map((e) => e.body.type), ['dispatch_started', 'task_moved', 'subtasks_replaced', 'file_edited']);
     r.check('task=pap1: [from, to, at_start]', [res.body?.from_rev, res.body?.to_rev, res.body?.at_start], [4, 7, true]);
+    r.check('extra: task=pap1, the demo slice\'s', slice(res.body?.events)?.map((e) => e.body.type), ['dispatch_started', 'task_moved', 'subtasks_replaced', 'file_edited']);
     const newestTwo = await r.call('GET', `/v1/events?task=${ID.pap1}&limit=2`, { token: 'device' });
     r.check('task=pap1&limit=2: [from, to, at_start]', [newestTwo.body?.from_rev, newestTwo.body?.to_rev, newestTwo.body?.at_start], [6, 7, false]);
+    r.check('extra: task=pap1&limit=2, the 2 newest', newestTwo.body?.events?.map((e) => e.id.slice(-4)), ['0006', '0007']);
     const tooling = await r.call('GET', `/v1/events?project=${ID.tooling}`, { token: 'device' });
     r.check('project=tooling: status', tooling.status, 200);
     r.check('project=tooling: id suffixes', tooling.body?.events?.map((e) => e.id.slice(-4)), ['0008', '0013', '0014']);
+    r.check('extra: project=tooling, the demo slice\'s', slice(tooling.body?.events)?.map((e) => e.id.slice(-4)), ['0008', '0013', '0014']);
   },
 
   // The mock's test runs with `scanWindow: 5`, an option of the mock only; this is its part that
@@ -419,6 +431,8 @@ const TESTS = {
     }
     for (const p of pages) seen.unshift(...(p?.events ?? []).map((e) => e.id.slice(-4)));
     r.check('every match', seen, ['0004', '0005', '0006', '0007']);
+    const sliceSeen = pages.flatMap((p) => slice(p?.events ?? [])).map((e) => e.id.slice(-4)).sort();
+    r.check('extra: every match of the demo slice', sliceSeen, ['0004', '0005', '0006', '0007']);
     r.check('only the last page is at_start', pages.map((p) => p?.at_start), [...pages.slice(1).map(() => false), true]);
     r.check('no match', await get('?task=01JB000000000000000TSK0099'), { events: [], from_rev: 0, to_rev: 0, at_start: true });
   },
@@ -531,13 +545,16 @@ async function runAll(start) {
 const show = (value) => (value === undefined ? 'undefined' : JSON.stringify(value)).slice(0, 160);
 
 async function main() {
-  const { values } = parseArgs({ options: { pitcrewd: { type: 'string' }, json: { type: 'string' } } });
+  const { values } = parseArgs({
+    options: { pitcrewd: { type: 'string' }, 'no-office': { type: 'boolean' }, json: { type: 'string' } },
+  });
   if (!values.pitcrewd) {
-    console.error('usage: node crates/daemon/parity/replay.mjs --pitcrewd <path> [--json <file>]');
+    console.error('usage: node crates/daemon/parity/replay.mjs --pitcrewd <path> [--no-office] [--json <file>]');
     process.exit(2);
   }
+  const office = !values['no-office'];
   const mock = await runAll(startMock);
-  const daemon = await runAll(startDaemon(values.pitcrewd));
+  const daemon = await runAll(startDaemon(values.pitcrewd, { office }));
 
   const rows = [];
   let checks = 0;
@@ -573,7 +590,7 @@ async function main() {
       }
     }
   }
-  console.log(`# Parity: mock hub vs pitcrewd\n`);
+  console.log(`# Parity: mock hub vs pitcrewd (back office ${office ? 'on' : 'off'})\n`);
   console.log(`${Object.keys(TESTS).length} tests, ${checks} checks; ${rows.length} rows differ or fail.\n`);
   console.log('| Test | Check | Expected | Mock hub | pitcrewd |');
   console.log('|---|---|---|---|---|');

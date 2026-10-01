@@ -1,5 +1,10 @@
 # Owned by stream 0 (proposed by stream Q). Runs every fuzz target for 5 minutes each night.
 # Actions are pinned by commit SHA; Dependabot keeps them current.
+#
+# One job builds every target once and shares the binaries with the fuzzing jobs through a cache
+# entry for this run only, so the targets don't each need a 1.5 GB build cache. The fuzzing matrix
+# comes from `cargo fuzz list`, so a new target is picked up without editing this file. Add its
+# dictionary to the `case` below.
 name: Fuzz
 
 on:
@@ -17,24 +22,16 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # Only the target binaries go here, not the build's intermediate files.
+  BIN_DIR: fuzz-bin
 
 jobs:
-  fuzz:
-    name: Fuzz (${{ matrix.target }})
+  build:
+    name: Build the fuzz targets
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { target: claude_parse_line, dict: claude }
-          - { target: codex_parse_line, dict: codex }
-          - { target: adapter_read, dict: claude }
-          - { target: adapter_cursor, dict: claude }
-          - { target: tmux_control, dict: tmux }
-          - { target: runner_decode_line, dict: protocol }
-          - { target: api_json, dict: protocol }
-          - { target: api_request, dict: http }
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -45,9 +42,63 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: fuzz -> target
-          key: ${{ matrix.target }}
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked --version 0.13.2
+      - name: Build every target
+        run: cargo +nightly fuzz build
+      - name: List the targets and their dictionaries
+        id: list
+        run: |
+          entries=""
+          for t in $(cargo +nightly fuzz list); do
+            case "$t" in
+              claude_*|adapter_*) d=claude ;;
+              codex_*) d=codex ;;
+              tmux_*) d=tmux ;;
+              api_request) d=http ;;
+              api_terminal|api_activity) d=api ;;
+              remote_*) d=remote ;;
+              opencode_*) d=opencode ;;
+              github_*) d=github ;;
+              cli_*) d=cli ;;
+              *) d=protocol ;;
+            esac
+            if [ ! -f "fuzz/dict/$d.dict" ]; then echo "no dictionary fuzz/dict/$d.dict for $t" >&2; exit 1; fi
+            entries="$entries{\"target\":\"$t\",\"dict\":\"$d\"},"
+            mkdir -p "$BIN_DIR"
+            cp "fuzz/target/x86_64-unknown-linux-gnu/release/$t" "$BIN_DIR/$t"
+          done
+          echo "matrix={\"include\":[${entries%,}]}" >> "$GITHUB_OUTPUT"
+      - name: Share the binaries with this run's fuzzing jobs
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.BIN_DIR }}
+          key: fuzz-bin-${{ github.run_id }}
+
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.build.outputs.matrix) }}
+    env:
+      TARGET: ${{ matrix.target }}
+      DICT: ${{ matrix.dict }}
+      # Known findings, each with an input in fuzz/regressions/, are skipped so a run can look past
+      # them (see docs/security/threat-model.md, §8). The step below reports them separately.
+      PITCREW_FUZZ_SKIP_KNOWN: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Restore the binaries
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.BIN_DIR }}
+          key: fuzz-bin-${{ github.run_id }}
+          fail-on-cache-miss: true
       - name: Restore the corpus
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -57,24 +108,36 @@ jobs:
       - name: Seed from the fixtures
         run: python3 fuzz/seed.py
       - name: Fuzz for 5 minutes
-        env:
-          TARGET: ${{ matrix.target }}
-          DICT: ${{ matrix.dict }}
         run: >-
-          cargo +nightly fuzz run "$TARGET" --
+          mkdir -p "fuzz/artifacts/$TARGET" &&
+          "$BIN_DIR/$TARGET" "fuzz/corpus/$TARGET"
+          -artifact_prefix="fuzz/artifacts/$TARGET/"
           -max_total_time=300 -timeout=10 -rss_limit_mb=2048
           -dict="fuzz/dict/$DICT.dict" -print_final_stats=1
       - name: Minimise the corpus
         if: success()
-        env:
-          TARGET: ${{ matrix.target }}
-        run: cargo +nightly fuzz cmin "$TARGET"
+        run: |
+          mkdir -p "fuzz/corpus-min/$TARGET"
+          "$BIN_DIR/$TARGET" -merge=1 "fuzz/corpus-min/$TARGET" "fuzz/corpus/$TARGET"
+          rm -rf "fuzz/corpus/$TARGET"
+          mv "fuzz/corpus-min/$TARGET" "fuzz/corpus/$TARGET"
       - name: Save the corpus
         if: success()
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+      - name: Known findings still reproduce (report only)
+        if: always()
+        continue-on-error: true
+        env:
+          PITCREW_FUZZ_SKIP_KNOWN: ""
+        run: |
+          dir="fuzz/regressions/$TARGET"
+          if [ ! -d "$dir" ]; then echo "no known findings for $TARGET"; exit 0; fi
+          for f in "$dir"/*; do
+            if "$BIN_DIR/$TARGET" "$f" >/dev/null 2>&1; then echo "fixed? $f no longer fails"; else echo "still open: $f"; fi
+          done
       - name: Upload the crashing input
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

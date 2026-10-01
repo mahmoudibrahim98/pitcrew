@@ -12,11 +12,12 @@
 
 import type { QueryClient } from '@tanstack/react-query';
 import { createStore, type StoreApi } from 'zustand/vanilla';
-import { ApiError } from './api.ts';
+import { ApiError, GatewayError } from './errors.ts';
 import { keysToInvalidate, type CacheLookup, type QueryKey } from './invalidation.ts';
 import { keys } from './keys.ts';
 import { applyPatches } from './patches.ts';
-import { StreamClient, type SocketFactory, type StreamStatus } from './stream.ts';
+import { StreamClient, type StreamStatus } from './stream.ts';
+import type { Transport } from './transport.ts';
 import type { Task } from './types.ts';
 
 export function cacheLookup(queryClient: QueryClient): CacheLookup {
@@ -160,8 +161,11 @@ export class Invalidator {
   }
 }
 
-/** Why the stream keeps failing, once we know. */
-export type LiveProblem = 'unauthorized' | 'unreachable';
+/**
+ * Why the stream keeps failing, once we know. `needs_pairing` is the desktop gateway's: it has no
+ * valid token for the workspace.
+ */
+export type LiveProblem = 'unauthorized' | 'unreachable' | 'needs_pairing';
 
 export interface LiveState {
   status: StreamStatus;
@@ -172,15 +176,15 @@ export interface LiveState {
 
 export interface LiveOptions {
   queryClient: QueryClient;
-  baseUrl: string;
-  token?: string | undefined;
-  socket?: SocketFactory;
+  /** Where the stream's socket comes from. */
+  transport: Transport;
   /** The coalescing window for invalidations. */
   windowMs?: number;
   backoff?: { initialMs: number; maxMs: number };
   /**
-   * An authenticated HTTP request (e.g. `GET /v1/me`), tried after repeated connection failures
-   * to tell a rejected token from an unreachable hub; a WebSocket failure does not say which.
+   * An authenticated request (e.g. `GET /v1/me`), tried after repeated connection failures to
+   * tell a rejected token from an unreachable hub; a browser WebSocket failure does not say
+   * which. Not needed when the socket says why it failed (the desktop gateway does).
    */
   probe?: () => Promise<unknown>;
   /** Failures before the first probe. */
@@ -192,12 +196,24 @@ export interface LiveOptions {
 export interface Live {
   store: StoreApi<LiveState>;
   stream: StreamClient;
+  /** The stream's transport; terminals open their sockets through it too. */
+  transport: Transport;
   start(): void;
   stop(): void;
+  /** Reconnects now if the stream is waiting to (the hub is known to be back). */
+  retryNow(): void;
+}
+
+function problemOf(error: unknown): LiveProblem {
+  if (error instanceof GatewayError && error.gateway === 'needs_pairing') return 'needs_pairing';
+  if (error instanceof ApiError && (error.code === 'unauthorized' || error.code === 'forbidden')) {
+    return 'unauthorized';
+  }
+  return 'unreachable';
 }
 
 export function createLive(options: LiveOptions): Live {
-  const { queryClient } = options;
+  const { queryClient, transport } = options;
   const cache = cacheLookup(queryClient);
   const store = createStore<LiveState>(() => ({ status: 'stopped', synced: false }));
   const invalidator = new Invalidator(
@@ -210,33 +226,39 @@ export function createLive(options: LiveOptions): Live {
   /** The last warning logged in this outage; each reason is logged once. */
   let warned: string | undefined;
 
-  async function diagnose(): Promise<void> {
+  /** Finds out why the stream fails: from `known` (what the socket said), or by probing. */
+  async function diagnose(known: ApiError | undefined): Promise<void> {
     if (probing) return;
     probing = true;
     // Without a probe, all we know is that the stream cannot connect.
     let problem: LiveProblem | undefined = 'unreachable';
+    let cause: unknown = known;
     try {
-      if (options.probe !== undefined) {
+      if (known !== undefined) {
+        problem = problemOf(known);
+      } else if (options.probe !== undefined) {
         await options.probe();
         // The hub answers and accepts the token; only the stream fails.
         problem = undefined;
       }
     } catch (error) {
-      problem =
-        error instanceof ApiError && (error.code === 'unauthorized' || error.code === 'forbidden')
-          ? 'unauthorized'
-          : 'unreachable';
+      cause = error;
+      problem = problemOf(error);
     } finally {
       probing = false;
     }
     if (store.getState().status !== 'reconnecting') return;
     store.setState({ problem });
+    // The desktop gateway says why, for people to read.
+    const why = cause instanceof GatewayError && cause.message !== '' ? ` (${cause.message})` : '';
     const warning =
       problem === 'unauthorized'
-        ? `pitcrew: ${options.baseUrl} rejected the token; the stream keeps retrying.`
-        : problem === 'unreachable'
-          ? `pitcrew: cannot reach ${options.baseUrl}; the stream keeps retrying.`
-          : `pitcrew: ${options.baseUrl} answers, but its stream keeps failing; retrying.`;
+        ? `pitcrew: ${transport.label} rejected the token${why}; the stream keeps retrying.`
+        : problem === 'needs_pairing'
+          ? `pitcrew: ${transport.label} needs pairing${why}; the stream keeps retrying.`
+          : problem === 'unreachable'
+            ? `pitcrew: cannot reach ${transport.label}${why}; the stream keeps retrying.`
+            : `pitcrew: ${transport.label} answers, but its stream keeps failing; retrying.`;
     if (warning !== warned) {
       warned = warning;
       console.warn(warning);
@@ -244,9 +266,7 @@ export function createLive(options: LiveOptions): Live {
   }
 
   const stream = new StreamClient({
-    baseUrl: options.baseUrl,
-    token: options.token,
-    ...(options.socket === undefined ? {} : { socket: options.socket }),
+    transport,
     ...(options.backoff === undefined ? {} : { backoff: options.backoff }),
     onEvents(events) {
       try {
@@ -278,20 +298,22 @@ export function createLive(options: LiveOptions): Live {
         });
       }
     },
-    onFailure(attempts) {
+    onFailure(attempts, close) {
       // `attempts` starts over only after a stable connection, so this counts within an outage.
       const since = attempts - probeAfter;
-      if (since === 0 || (since > 0 && since % probeEvery === 0)) void diagnose();
+      if (since === 0 || (since > 0 && since % probeEvery === 0)) void diagnose(close?.error);
     },
   });
 
   return {
     store,
     stream,
+    transport,
     start: () => stream.start(),
     stop() {
       stream.stop();
       invalidator.stop();
     },
+    retryNow: () => stream.retryNow(),
   };
 }

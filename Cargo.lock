@@ -1108,8 +1108,10 @@ dependencies = [
  "pitcrew-auth",
  "pitcrew-fixtures",
  "pitcrew-hub-work",
+ "pitcrew-office",
  "pitcrew-protocol",
  "pitcrew-store",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1122,6 +1124,7 @@ name = "pitcrew-fixtures"
 version = "0.0.0"
 dependencies = [
  "pitcrew-protocol",
+ "pitcrew-recap",
  "serde",
  "serde_json",
 ]

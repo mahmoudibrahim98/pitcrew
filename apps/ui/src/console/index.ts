@@ -106,6 +106,10 @@ export const QuestionCard = lazy(() => import('./question-card.tsx').then((m) =>
 export const SessionHeader = lazy(() =>
   import('./session-header.tsx').then((m) => ({ default: m.SessionHeader })),
 );
+/** A session's live terminal; xterm.js is in this chunk alone. */
+export const TerminalView = lazy(() =>
+  import('./terminal/terminal-view.tsx').then((m) => ({ default: m.TerminalView })),
+);
 
 export { hasFacets, NO_FACETS, UNSORTED, type SessionFacets } from './facets.ts';
 export { OpenExternalProvider } from './render/links.tsx';
@@ -115,3 +119,5 @@ export type { QuestionCardProps } from './question-card.tsx';
 export type { SessionFiltersProps } from './session-filters.tsx';
 export type { SessionHeaderProps } from './session-header.tsx';
 export type { SelectVia, SessionListProps, SessionListViewProps } from './session-list.tsx';
+export type { TerminalViewProps } from './terminal/terminal-view.tsx';
+export type { TerminalSocketFactory } from './terminal/socket.ts';

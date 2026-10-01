@@ -13,6 +13,18 @@ How the UI, running in the desktop app's webview, reaches each workspace's daemo
 - **Changes** go through a contract change, like the API's. A new optional field or command is not
   breaking.
 
+## Conventions
+
+- **Arguments:** Tauri passes arguments by their names. `gateway_request` takes one argument,
+  `req`: the UI calls `invoke('gateway_request', { req: {...} })`. The socket commands take flat
+  arguments, as written below.
+- **Field names** are camelCase on the wire, as written here (`contentType`). On the Rust side,
+  use `#[serde(rename_all = "camelCase")]`.
+- **Versions:** the `tauri` crate and `@tauri-apps/api` share major.minor (2.12 today); the Tauri
+  CLI refuses a mismatch.
+- **`connecting`:** a workspace that is `connecting` may answer `unreachable` until it is
+  `ready`. The UI retries, and reconnects at once on `ready`.
+
 ## Knowing where the UI runs
 
 The UI is in the desktop app when `window.__TAURI_INTERNALS__` exists. There it uses the gateway
@@ -51,7 +63,7 @@ interface GatewayRequest {
 interface GatewayResponse {
   status: number;
   contentType?: string;
-  body: string;      // the response body as text (API v1 bodies are JSON)
+  body: string;      // the response body as text (API v1 bodies are JSON); "" when there is none
 }
 ```
 
@@ -93,8 +105,9 @@ sockets, which carry the same frames as API v1's WebSockets.
 - **Messages on the `events` channel,** in order:
   - `{ "type": "text", "data": string }` is a text frame;
   - an `ArrayBuffer` is a binary frame (a raw IPC body, not JSON);
-  - `{ "type": "close", "code": number, "reason": string }` is always the last message. When the
-    connection to the daemon breaks without a close frame, the code is 1006.
+  - `{ "type": "close", "code": number, "reason": string }` is always the last message, also
+    after the webview's own `gateway_socket_close`. When the connection to the daemon breaks
+    without a close frame, the code is 1006.
 - **The gateway answers the daemon's Pings itself.** The webview never sees Ping or Pong.
 
 `gateway_socket_send({ socket, text?: string, binary?: number[] | Uint8Array })`
@@ -102,6 +115,9 @@ sockets, which carry the same frames as API v1's WebSockets.
 - Exactly one of `text` and `binary`. The size limits are API v1's: 1 MiB on terminals, 4 KiB
   on the stream. Over a limit, the gateway closes the socket with 1009, as the daemon would.
 - Sending on a closed socket rejects with `invalid`.
+- **Order.** Tauri may run commands concurrently, so the UI keeps at most one
+  `gateway_socket_send` in flight per socket. The command resolves once the gateway has queued the
+  frame to the daemon, in that order.
 
 `gateway_socket_close({ socket, code?: number, reason?: string })` closes the socket (1000 by
 default). It is idempotent.
