@@ -11,6 +11,7 @@ use common::{CountBy, Gate, Gated, by_type, toy_migrations};
 use pitcrew_protocol::events::Event;
 use pitcrew_protocol::ids::EventId;
 use pitcrew_store::{Error, FsMode, Store, StoreOptions};
+use rusqlite::OptionalExtension;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -212,4 +213,56 @@ fn an_append_queued_behind_registers_catch_up_is_still_seen() {
         expected_by_type(&all),
         "the projection must reflect the log before register and the append queued during its catch-up"
     );
+}
+
+fn checkpoint(store: &Store, name: &str) -> Option<(u32, i64)> {
+    store
+        .read(|c| -> pitcrew_store::Result<Option<(u32, i64)>> {
+            Ok(c.query_row(
+                "SELECT version, rev FROM projection_state WHERE name = ?1",
+                [name],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+        })
+        .expect("read")
+}
+
+/// A catch-up that fails partway (here, on the third of several events, the same way
+/// `tests/projections.rs`'s `a_failing_apply_rolls_back_the_append` fails an append) registers
+/// nothing: no checkpoint row at all for the name, so it is free to register again, and a working
+/// projection registered under the same name afterwards catches up normally.
+#[test]
+fn a_failing_catch_up_registers_nothing_and_the_name_can_be_retried() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("store.db");
+    let store = open(&path);
+    let events = fixture_events();
+    store.append(&events).expect("append before register");
+
+    // events[2] is a task_moved (as tests/projections.rs's own picky-projection tests rely on).
+    let picky = CountBy {
+        fail_on: Some("task_moved"),
+        ..CountBy::types()
+    };
+    let err = store
+        .register(Box::new(picky))
+        .expect_err("the catch-up must fail on the picky event");
+    assert!(
+        matches!(&err, Error::Projection { name, .. } if name == "toy.by_type"),
+        "{err:?}"
+    );
+
+    // Nothing was registered: no checkpoint row at all (there was none before this attempt, and
+    // the failed sync's own transaction rolled back), so the name is free to register again.
+    assert_eq!(
+        checkpoint(&store, "toy.by_type"),
+        None,
+        "a failed register must leave no checkpoint behind"
+    );
+
+    store
+        .register(Box::new(CountBy::types()))
+        .expect("re-registering the same name now succeeds");
+    assert_eq!(toy_by_type_table(&store), expected_by_type(&events));
 }
