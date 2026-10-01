@@ -13,6 +13,10 @@ pitcrew-protocol.workspace = true
 pitcrew-store.workspace = true
 # The seed command imports a `DemoWorkspace`.
 pitcrew-fixtures.workspace = true
+# The back office acts on the hub through `pitcrew_office::Commands`; its brief proposals are
+# recap's `BriefProposal`.
+pitcrew-office.workspace = true
+pitcrew-recap.workspace = true
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true

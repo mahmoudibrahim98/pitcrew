@@ -1066,7 +1066,9 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "pitcrew-fixtures",
+ "pitcrew-office",
  "pitcrew-protocol",
+ "pitcrew-recap",
  "pitcrew-store",
  "serde",
  "serde_json",
