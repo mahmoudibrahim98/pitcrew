@@ -35,8 +35,12 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     GetTokenInformation, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    SECURITY_ATTRIBUTES, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenOwner, TokenUser,
+    SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
+// `TokenOwner`/`TOKEN_OWNER` back `default_owner_sid`, read only by tests: production code
+// requires exactly the current user (see `default_owner_sid`'s doc comment).
+#[cfg(test)]
+use windows_sys::Win32::Security::{TOKEN_OWNER, TokenOwner};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// An owned security descriptor: the current user owns the pipe and is the only one granted
@@ -55,9 +59,10 @@ impl PipeSecurity {
     /// The current user as owner (`O:`), and a protected DACL (`P`, so nothing is inherited)
     /// with one entry: the current user.
     ///
-    /// The owner is named explicitly because clients check it ([`owner_sid`]), and without it an
-    /// elevated daemon's pipe would default to being owned by the Administrators group. Any
-    /// process may name its own user as owner.
+    /// The owner is named explicitly because clients now require exactly it
+    /// (`client::check_pipe_server`), and without it an elevated daemon's pipe would default to
+    /// being owned by the Administrators group instead. Any process may name its own user as
+    /// owner.
     pub(super) fn current_user_only() -> io::Result<Self> {
         let sid = current_user_sid()?;
         let sddl: Vec<u16> = format!("O:{sid}D:P(A;;GA;;;{sid})")
@@ -132,6 +137,13 @@ pub(crate) fn current_user_sid() -> io::Result<String> {
 /// The owner our process token gives the objects it creates without naming one (`TokenOwner`),
 /// as a string. Unelevated, that is the user itself; elevated, typically the Administrators group
 /// (`S-1-5-32-544`), unless policy makes it the user.
+///
+/// Test-only: a real pipe always names the current user explicitly
+/// (`PipeSecurity::current_user_only`), and `client::check_pipe_server` now requires exactly
+/// that, so nothing outside tests reads the default owner. Kept to exercise that a pipe with only
+/// this (no explicit owner) passes `check_pipe_server` just when it happens to equal the current
+/// user, and is rejected otherwise.
+#[cfg(test)]
 pub(crate) fn default_owner_sid() -> io::Result<String> {
     own_token_sid(TokenSid::DefaultOwner)
 }
@@ -195,7 +207,9 @@ pub(crate) fn owner_sid(object: &impl AsHandle) -> io::Result<String> {
 enum TokenSid {
     /// The user the process runs as (`TokenUser`).
     User,
-    /// The default owner of the objects it creates (`TokenOwner`).
+    /// The default owner of the objects it creates (`TokenOwner`). Test-only: see
+    /// `default_owner_sid`'s doc comment.
+    #[cfg(test)]
     DefaultOwner,
 }
 
@@ -203,6 +217,7 @@ enum TokenSid {
 fn own_token_sid(which: TokenSid) -> io::Result<String> {
     let class = match which {
         TokenSid::User => TokenUser,
+        #[cfg(test)]
         TokenSid::DefaultOwner => TokenOwner,
     };
     let mut token: HANDLE = ptr::null_mut();
@@ -239,6 +254,7 @@ fn own_token_sid(which: TokenSid) -> io::Result<String> {
         // SAFETY: filled by the call above with a `TokenUser` class, i.e. a `TOKEN_USER`.
         TokenSid::User => unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid },
         // SAFETY: filled by the call above with a `TokenOwner` class, i.e. a `TOKEN_OWNER`.
+        #[cfg(test)]
         TokenSid::DefaultOwner => unsafe { (*buffer.as_ptr().cast::<TOKEN_OWNER>()).Owner },
     };
     if sid.is_null() {
@@ -331,11 +347,12 @@ mod tests {
     use tokio::net::windows::named_pipe::ClientOptions;
 
     /// A pipe created without a descriptor is owned by the token's default owner, which is what
-    /// `default_owner_sid` reads, and a client of the same token accepts it, elevated or not
-    /// (unelevated the owner is the user; elevated, typically Administrators). This is how a test
-    /// server that creates its pipe the plain way passes `check_pipe_server`.
+    /// `default_owner_sid` reads: the user itself unelevated, typically the Administrators group
+    /// elevated. `check_pipe_server` requires exactly the current user, so such a pipe passes
+    /// only when that default happens to be the same SID (unelevated); run elevated, it is
+    /// correctly rejected, the same as any pipe that never named us as its owner.
     #[tokio::test]
-    async fn a_pipe_with_default_security_has_the_token_owner_and_passes() {
+    async fn a_pipe_with_default_security_passes_check_pipe_server_only_as_the_current_user() {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -350,6 +367,11 @@ mod tests {
         assert_eq!(owner_sid(&server).unwrap(), default_owner);
         let client = ClientOptions::new().open(&name).unwrap();
         assert_eq!(owner_sid(&client).unwrap(), default_owner);
-        crate::client::check_pipe_server(&client).unwrap();
+        let result = crate::client::check_pipe_server(&client);
+        if default_owner == current_user_sid().unwrap() {
+            result.unwrap();
+        } else {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        }
     }
 }

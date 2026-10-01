@@ -3,8 +3,8 @@
 //!
 //! - Unix: [`check_unix_socket`] before connecting (the directory is ours and 0700, the socket
 //!   is ours), and [`check_unix_peer`] after (the server runs as us).
-//! - Windows: [`check_pipe_server`] after connecting: the pipe is owned by the current user (or
-//!   by our token's default owner, which is the user unless we run elevated). A pipe name can be
+//! - Windows: [`check_pipe_server`] after connecting: the pipe must be owned by exactly the
+//!   current user (the daemon always names it explicitly, elevated or not). A pipe name can be
 //!   created by anyone while the daemon is down, so this check, not the name, is what makes the
 //!   pipe trustworthy.
 
@@ -53,19 +53,16 @@ pub fn check_unix_peer(stream: &tokio::net::UnixStream) -> io::Result<()> {
     }
 }
 
-/// Checks that a connected pipe is owned by the current user, or by the owner our own token
-/// gives the objects it creates, so it was created by our daemon (or by us).
+/// Checks that a connected pipe is owned by exactly the current user, so it was created by our
+/// daemon (or by us).
 ///
-/// The daemon names the current user as its pipe's owner. Another user cannot create a pipe
-/// owned by us (that takes the restore privilege), and the owner, unlike the server's process
-/// id (which an earlier version checked), cannot be recycled by a process that exits.
-///
-/// The token's default owner (`TokenOwner`) is also accepted, so a pipe created without naming
-/// an owner (as a test server does) passes too. Unelevated, that owner is the user itself, so
-/// nothing changes. Elevated, it is typically the Administrators group, so a pipe any elevated
-/// administrator created passes. That is the residual, and it is unchanged: an administrator, or
-/// a process holding the restore privilege, could already plant a pipe that names us as its
-/// owner, and can already read our files.
+/// The daemon always names the current user as its pipe's owner, elevated or not
+/// (`PipeSecurity::current_user_only`), so this never falls back to the token's default owner
+/// (`TokenOwner`): elevated, that default is typically the Administrators group
+/// (`S-1-5-32-544`), and accepting it would let in a pipe any other elevated process created
+/// without naming us as its owner. Another user cannot create a pipe owned by us (that takes the
+/// restore privilege), and the owner, unlike the server's process id (which an earlier version
+/// checked), cannot be recycled by a process that exits.
 ///
 /// The handle needs `READ_CONTROL`, which a client opened for reading (tokio's default) has.
 ///
@@ -73,9 +70,9 @@ pub fn check_unix_peer(stream: &tokio::net::UnixStream) -> io::Result<()> {
 /// `PermissionDenied` if anyone else owns it; the check cannot be made.
 #[cfg(windows)]
 pub fn check_pipe_server(pipe: &impl std::os::windows::io::AsHandle) -> io::Result<()> {
-    use crate::listener::pipe_security::{current_user_sid, default_owner_sid, owner_sid};
+    use crate::listener::pipe_security::{current_user_sid, owner_sid};
     let owner = owner_sid(pipe)?;
-    if owner == current_user_sid()? || owner == default_owner_sid()? {
+    if owner == current_user_sid()? {
         Ok(())
     } else {
         Err(io::Error::new(
