@@ -12,7 +12,8 @@
 //!   (`dispatch`, `manual`, `claimed`) is replaced only by another firm link: not by an inferred
 //!   one (`folder`, `branch`, `imported`), and not by a re-stated `session_discovered` that has
 //!   none. Anything replaces an inferred link or none. A link is replaced whole (workstream, task
-//!   and basis), and a dispatch with a session links it firmly to the dispatch's task.
+//!   and basis). A dispatch links its session firmly to the dispatch's task only when the session
+//!   has no firm link yet (the hub links it through the `session_discovered` that follows).
 //! - **Agents stay.** A re-stated session that names no agent keeps the agent it had.
 //! - **Moves name where they start** (`work.tasks`). A `task_moved` whose `from` is not the task's
 //!   status lost a race with another writer's move, and the hub ignores it. A task's status is
@@ -229,9 +230,11 @@ impl Directory {
         }
     }
 
-    /// Adds a dispatch. A dispatch with a session also links that session firmly to its task (in
-    /// the task's workstream, unless the session was already linked to that task in one), and
-    /// gives it the dispatch's agent if it had none.
+    /// Adds a dispatch, and gives its session the dispatch's agent if it had none. A session with
+    /// no firm link is also linked to the dispatch's task (in the task's workstream, unless it was
+    /// already linked to that task in one), with basis `dispatch`, as the `session_discovered`
+    /// that follows a dispatch in the hub links it. A firm link stays: the hub itself never links
+    /// a session from `dispatch_started`.
     pub fn add_dispatch(&mut self, dispatch: &Dispatch) {
         self.dispatches.insert(
             dispatch.id,
@@ -243,11 +246,14 @@ impl Directory {
         if let Some(session) = dispatch.session {
             let task_workstream = self.tasks.get(&dispatch.task).and_then(|t| t.workstream);
             let (info, _) = self.sessions.entry(session, SessionInfo::default);
+            info.agent = info.agent.or(Some(dispatch.agent));
+            if is_firm(info.basis) {
+                return;
+            }
             if info.task != Some(dispatch.task) || info.workstream.is_none() {
                 info.workstream = task_workstream;
             }
             info.task = Some(dispatch.task);
-            info.agent = info.agent.or(Some(dispatch.agent));
             info.basis = Some(LinkBasis::Dispatch);
             self.task_sessions.insert(dispatch.task, session);
         }

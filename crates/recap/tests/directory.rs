@@ -146,21 +146,28 @@ fn a_restated_session_keeps_its_dispatch_link() {
     }
 }
 
+fn dispatch_of(w: &World, s: SessionId, task: TaskId, agent: MemberId) -> EventBody {
+    EventBody::DispatchStarted {
+        dispatch: Dispatch {
+            id: w.dispatches[1],
+            task,
+            agent,
+            session: Some(s),
+            brief: "Rerun seed 3.".into(),
+            started: T0,
+            ended: None,
+            outcome: None,
+            summary: None,
+        },
+    }
+}
+
+/// The hub never links a session from `dispatch_started`: a person's link stays, and a later one
+/// is taken.
 #[test]
-fn a_dispatch_links_its_session_whole() {
+fn a_dispatch_never_replaces_a_firm_link() {
     let w = World::new(3, 5, 2);
     let (s, agent) = (w.sessions[2], w.agents[2]);
-    let dispatch = Dispatch {
-        id: w.dispatches[1],
-        task: w.tasks[1],
-        agent,
-        session: Some(s),
-        brief: "Rerun seed 3.".into(),
-        started: T0,
-        ended: None,
-        outcome: None,
-        summary: None,
-    };
     let mut log = Log::new();
     log.add(
         &w,
@@ -168,15 +175,57 @@ fn a_dispatch_links_its_session_whole() {
         w.person,
         linked(s, w.workstreams[0], w.tasks[0], LinkBasis::Manual),
     )
-    .add(&w, 3600, w.person, EventBody::DispatchStarted { dispatch })
-    // A folder link after the dispatch changes nothing.
+    .add(&w, 3600, w.person, dispatch_of(&w, s, w.tasks[1], agent))
+    .add(&w, 3600, agent, tool(s, 1));
+    let (all, skipped) = log.build(&w.dir);
+    assert_eq!(skipped, 0);
+    let last = all.last().expect("blocks");
+    assert_eq!(last.tasks, vec![w.tasks[0]]);
+    assert_eq!(last.workstream, Some(w.workstreams[0]));
+
+    // A person's later link is taken.
+    log.add(
+        &w,
+        60,
+        w.person,
+        linked(s, w.workstreams[1], w.tasks[2], LinkBasis::Manual),
+    )
+    .add(&w, 3600, agent, tool(s, 2));
+    let (all, skipped) = log.build(&w.dir);
+    assert_eq!(skipped, 0);
+    let last = all.last().expect("blocks");
+    assert_eq!(last.tasks, vec![w.tasks[2]]);
+    assert_eq!(last.workstream, Some(w.workstreams[1]));
+}
+
+/// A session with only an inferred link, or none, takes the dispatch's link (the hub takes it from
+/// the `session_discovered` that follows the dispatch), and the dispatch's agent if it had none.
+#[test]
+fn a_dispatch_links_a_session_without_a_firm_link() {
+    let w = World::new(3, 5, 2);
+    let (s, agent) = (new_session(9), w.agents[1]);
+    let waiting = EventBody::SessionStateChanged {
+        session: s,
+        from: SessionState::Working,
+        to: SessionState::Waiting,
+        status_line: None,
+    };
+    let mut log = Log::new();
+    log.add(
+        &w,
+        0,
+        agent,
+        linked(s, w.workstreams[0], w.tasks[0], LinkBasis::Folder),
+    )
+    .add(&w, 3600, w.person, dispatch_of(&w, s, w.tasks[1], agent))
+    // Now the folder link changes nothing.
     .add(
         &w,
         60,
         agent,
         linked(s, w.workstreams[0], w.tasks[0], LinkBasis::Folder),
     )
-    .add(&w, 3600, agent, tool(s, 1));
+    .add(&w, 3600, w.person, waiting);
     let (all, skipped) = log.build(&w.dir);
     assert_eq!(skipped, 1);
     let last = all.last().expect("blocks");
