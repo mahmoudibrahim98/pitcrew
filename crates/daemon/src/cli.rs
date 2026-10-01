@@ -38,8 +38,9 @@ pub enum Command {
 #[derive(Debug, Args)]
 pub struct ServeArgs {
     /// `private` (the default): a unix socket in `<state dir>/run`, or on Windows the current
-    /// user's named pipe. `tcp:127.0.0.1:<port>` is for development only; tokens are then the
-    /// only protection.
+    /// user's named pipe. `unix:<dir>/pitcrewd.sock` (Unix): exactly that socket, in a private
+    /// directory, e.g. for a launcher on a remote machine. `tcp:127.0.0.1:<port>` is for
+    /// development only; tokens are then the only protection.
     #[arg(long, value_name = "WHERE", default_value = "private")]
     pub listen: ListenArg,
 
@@ -55,11 +56,17 @@ pub enum TokenCommand {
     ShowPath,
 }
 
+/// The file name `unix:<path>` must end in: `pitcrew-api` binds this name in a directory it
+/// makes (or checks is) private.
+pub const SOCKET_FILE: &str = "pitcrewd.sock";
+
 /// Where to listen, as given on the command line.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ListenArg {
     /// The platform's private transport.
     Private,
+    /// Exactly this unix socket, whose file name is [`SOCKET_FILE`]. Unix only.
+    Unix(PathBuf),
     /// Loopback TCP, for development.
     Tcp(SocketAddr),
 }
@@ -71,9 +78,22 @@ impl FromStr for ListenArg {
         if s == "private" {
             return Ok(Self::Private);
         }
+        if let Some(path) = s.strip_prefix("unix:") {
+            let path = PathBuf::from(path);
+            if path.file_name().and_then(|n| n.to_str()) != Some(SOCKET_FILE)
+                || path.parent().is_none_or(|dir| dir.as_os_str().is_empty())
+            {
+                return Err(format!(
+                    "unix:<path> must be <dir>/{SOCKET_FILE}, not {path:?}; the directory is \
+                     made private (0700), or must already be"
+                ));
+            }
+            return Ok(Self::Unix(path));
+        }
         let Some(addr) = s.strip_prefix("tcp:") else {
             return Err(format!(
-                "expected `private` or `tcp:127.0.0.1:<port>`, not {s:?}"
+                "expected `private`, `unix:<dir>/{SOCKET_FILE}` or `tcp:127.0.0.1:<port>`, not \
+                 {s:?}"
             ));
         };
         let addr: SocketAddr = addr
@@ -120,6 +140,12 @@ mod tests {
             "tcp:[::1]:0".parse(),
             Ok(ListenArg::Tcp("[::1]:0".parse().unwrap()))
         );
+        assert_eq!(
+            "unix:/home/me/.pitcrew/run/pitcrewd.sock".parse(),
+            Ok(ListenArg::Unix(PathBuf::from(
+                "/home/me/.pitcrew/run/pitcrewd.sock"
+            )))
+        );
         for bad in [
             "",
             "public",
@@ -128,9 +154,19 @@ mod tests {
             "tcp:0.0.0.0:47460",
             "tcp:192.0.2.1:80",
             "127.0.0.1:47460",
+            "unix:",
+            "unix:pitcrewd.sock",
+            "unix:/run/other.sock",
+            "unix:/run/",
         ] {
             assert!(bad.parse::<ListenArg>().is_err(), "{bad}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_socket_file_is_the_one_pitcrew_api_binds() {
+        assert_eq!(SOCKET_FILE, pitcrew_api::SOCKET_NAME);
     }
 
     #[test]

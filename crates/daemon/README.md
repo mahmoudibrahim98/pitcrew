@@ -10,11 +10,17 @@ machines join later (ADR-0009).
 
 | Command | What |
 |---|---|
-| `pitcrewd serve` | Serves API v1 on the private transport until Ctrl+C (or Ctrl+Break, or SIGTERM on Unix). |
+| `pitcrewd serve` | Serves API v1 on the private transport until a stop signal: Ctrl+C; SIGTERM or SIGHUP on Unix; Ctrl+Break or closing the console on Windows. |
+| `pitcrewd serve --listen unix:<dir>/pitcrewd.sock` | Unix only: exactly that socket. The file name must be `pitcrewd.sock`; the directory is created 0700, or must already be ours and 0700. |
 | `pitcrewd serve --listen tcp:127.0.0.1:<port>` | Loopback TCP, **for development only**: tokens are then the only protection. Non-loopback addresses are refused. |
 | `pitcrewd serve --demo` | Seeds the demo workspace (`crates/fixtures`) first. Only into an empty store; a store with data is refused. |
 | `pitcrewd token show-path` | Prints where the device token is kept. Never the token. Fails if there is none yet. |
-| `pitcrewd --version` | `pitcrewd 0.0.0 (protocol 1, oldest accepted 1)`. |
+| `pitcrewd --version` | `pitcrewd 0.0.0 (protocol 1, oldest accepted 1)`: the bare version is the second word. Needs no state directory. |
+
+**For launchers** (e.g. on a remote machine under tmux), `pitcrewd serve` runs in the
+foreground and never daemonizes, so the pid you started is the daemon. It never reads stdin, logs
+only to stderr, and prints one ready line on stdout. Any stop signal (SIGTERM, SIGINT, SIGHUP)
+stops it gracefully: WebSockets close with 1001, the store closes, and the socket is removed.
 
 `--state-dir <dir>` goes with any command (before or after it). Without it, the state directory
 is the platform's local data folder, never a roaming or synced one: `%LOCALAPPDATA%\PitCrew\data`,
@@ -63,10 +69,10 @@ Windows it must be under the user's profile, whose ACL it inherits.
 
 ### Stop
 
-Ctrl+C, Ctrl+Break, closing the console (Windows) or SIGTERM (Unix): the server stops accepting
-and finishes in-flight requests; `pitcrew-api` closes open WebSockets with 1001 (see its README);
-then the store closes, checkpointing its WAL so only `hub.db` remains, and the lock is released
-last. The log ends with `store closed` and `stopped`.
+Ctrl+C, Ctrl+Break, closing the console (Windows), or SIGTERM or SIGHUP (Unix): the server stops
+accepting and finishes in-flight requests; `pitcrew-api` closes open WebSockets with 1001 (see its
+README) and removes its unix socket; then the store closes, checkpointing its WAL so only `hub.db`
+remains, and the lock is released last. The log ends with `store closed` and `stopped`.
 
 ## Routes
 
@@ -133,7 +139,9 @@ sessions, and a dispatch that is recorded and fails with 503), the stream (a mov
 appears on it; a reconnect with `since` gets what it missed), hooks, terminals, CORS and the
 `Host` guard, the single-daemon lock, and on Unix a SIGTERM stop: a clean store, `--demo`
 refused afterwards, a stream closed with 1001, and a restart that keeps the token, the log and
-the data. Nothing it logs, at debug, holds a token.
+the data. Also on Unix: `--listen unix:<path>` binds exactly that socket in a 0700 directory, and
+SIGTERM and SIGHUP both remove it; `--version` creates nothing. Nothing it logs, at debug, holds a
+token.
 
 ## Not wired yet
 

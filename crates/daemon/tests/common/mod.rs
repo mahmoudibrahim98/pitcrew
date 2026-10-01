@@ -33,7 +33,10 @@ pub mod id {
 #[derive(Debug)]
 pub struct Daemon {
     child: Child,
+    /// The TCP port; 0 when it listens on a unix socket.
     pub port: u16,
+    /// Where it listens, from its ready line: `http://…` or a socket path.
+    pub at: String,
     pub state: PathBuf,
     /// How long it took to print its ready line.
     pub ready_in: Duration,
@@ -62,11 +65,26 @@ impl Daemon {
 
     /// As [`Daemon::start`], but returns how it failed.
     pub fn try_start(state: &Path, extra: &[&str]) -> Result<Self, Refused> {
+        Self::try_start_on(state, "tcp:127.0.0.1:0", extra)
+    }
+
+    /// As [`Daemon::start`], listening on `listen` (a `--listen` value).
+    pub fn start_on(state: &Path, listen: &str, extra: &[&str]) -> Self {
+        Self::try_start_on(state, listen, extra).unwrap_or_else(|refused| {
+            panic!(
+                "pitcrewd did not start ({}):\n{}",
+                refused.status, refused.stderr
+            )
+        })
+    }
+
+    /// As [`Daemon::start_on`], but returns how it failed.
+    pub fn try_start_on(state: &Path, listen: &str, extra: &[&str]) -> Result<Self, Refused> {
         let started = Instant::now();
         let mut child = Command::new(PITCREWD)
             .arg("--state-dir")
             .arg(state)
-            .args(["serve", "--listen", "tcp:127.0.0.1:0"])
+            .args(["serve", "--listen", listen])
             .args(extra)
             .env("PITCREW_LOG", "debug")
             .stdin(Stdio::null())
@@ -104,13 +122,17 @@ impl Daemon {
         // The ready line is the first thing on stdout.
         match ready.recv_timeout(READY) {
             Ok(line) => {
-                let Some(at) = line.strip_prefix("pitcrewd listening on http://") else {
+                let Some(at) = line.strip_prefix("pitcrewd listening on ") else {
                     panic!("unexpected stdout line: {line}");
                 };
-                let port = at.rsplit(':').next().unwrap().parse().unwrap();
+                let port = match at.strip_prefix("http://") {
+                    Some(host) => host.rsplit(':').next().unwrap().parse().unwrap(),
+                    None => 0,
+                };
                 Ok(Self {
                     child,
                     port,
+                    at: at.to_owned(),
                     state: state.to_path_buf(),
                     ready_in: started.elapsed(),
                     stderr,
@@ -160,11 +182,17 @@ impl Daemon {
     /// Sends SIGTERM and waits for the process to exit.
     #[cfg(unix)]
     pub fn terminate(&mut self) -> ExitStatus {
+        self.signal("TERM")
+    }
+
+    /// Sends `signal` (`TERM`, `HUP`, …) and waits for the process to exit.
+    #[cfg(unix)]
+    pub fn signal(&mut self, signal: &str) -> ExitStatus {
         let sent = Command::new("kill")
-            .args(["-TERM", &self.child.id().to_string()])
+            .args([&format!("-{signal}"), &self.child.id().to_string()])
             .status()
             .expect("run kill");
-        assert!(sent.success(), "kill -TERM failed");
+        assert!(sent.success(), "kill -{signal} failed");
         self.wait_exit(Duration::from_secs(20))
     }
 

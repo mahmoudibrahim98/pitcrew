@@ -39,6 +39,11 @@ fn version_names_the_protocol_range() {
         line.starts_with(&format!("pitcrewd {} ", env!("CARGO_PKG_VERSION"))),
         "{line}"
     );
+    // Launchers find the bare version as a word of the first line.
+    assert_eq!(
+        line.lines().next().unwrap().split_whitespace().nth(1),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
     assert!(
         line.contains(&format!(
             "protocol {}, oldest accepted {}",
@@ -47,6 +52,76 @@ fn version_names_the_protocol_range() {
         )),
         "{line}"
     );
+}
+
+/// `--version` needs no state directory and creates nothing.
+#[cfg(unix)]
+#[test]
+fn version_touches_no_state() {
+    let home = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new(common::PITCREWD)
+        .arg("--version")
+        .env("HOME", home.path())
+        .env_remove("XDG_DATA_HOME")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+}
+
+/// `--listen unix:<path>` binds exactly that socket, in a private directory, and every stop
+/// signal (SIGTERM, and SIGHUP from a closed tmux pane or SSH session) removes it.
+#[cfg(unix)]
+#[test]
+fn unix_listen_binds_exactly_that_socket_and_a_stop_removes_it() {
+    use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
+    for signal in ["TERM", "HUP"] {
+        let (tmp, state) = state_dir();
+        let socket = tmp.path().join("home/.pitcrew/run/pitcrewd.sock");
+        let listen = format!("unix:{}", socket.display());
+        let mut daemon = Daemon::start_on(&state, &listen, &["--demo"]);
+        assert_eq!(Path::new(&daemon.at), socket);
+        let kind = std::fs::symlink_metadata(&socket).unwrap().file_type();
+        assert!(kind.is_socket());
+        let dir = std::fs::metadata(socket.parent().unwrap()).unwrap();
+        assert_eq!(dir.permissions().mode() & 0o777, 0o700);
+        assert_eq!(unix_get(&socket, "/v1/host/info"), 200);
+
+        let status = daemon.signal(signal);
+        assert!(
+            status.success(),
+            "SIG{signal}: {status}\n{}",
+            daemon.stderr()
+        );
+        assert!(!socket.exists(), "SIG{signal} left the socket behind");
+        assert!(daemon.stderr().contains("stopped"), "{}", daemon.stderr());
+    }
+
+    // Only `<dir>/pitcrewd.sock`, the name pitcrew-api binds.
+    let (tmp, state) = state_dir();
+    let other = format!("unix:{}", tmp.path().join("other.sock").display());
+    let refused = Daemon::try_start_on(&state, &other, &[]).unwrap_err();
+    assert!(
+        refused.stderr.contains("pitcrewd.sock"),
+        "{}",
+        refused.stderr
+    );
+}
+
+/// A GET over a unix socket; returns the status.
+#[cfg(unix)]
+fn unix_get(socket: &Path, path: &str) -> u16 {
+    use std::io::{Read as _, Write as _};
+    let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
+    stream.set_read_timeout(Some(WAIT)).unwrap();
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).unwrap();
+    raw.split(' ').nth(1).unwrap().parse().unwrap()
 }
 
 #[test]

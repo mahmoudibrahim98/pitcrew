@@ -52,6 +52,14 @@ const RELEASE: Duration = Duration::from_secs(3);
 /// cannot be opened, `--demo` on a store with data, the listener cannot bind.
 pub fn serve(state: &StateDir, args: &ServeArgs) -> anyhow::Result<ExitCode> {
     let started = Instant::now();
+    #[cfg(not(unix))]
+    if let ListenArg::Unix(path) = &args.listen {
+        bail!(
+            "--listen unix:{} is for Unix; here use `private` (the named pipe) or \
+             `tcp:127.0.0.1:<port>`",
+            path.display()
+        );
+    }
     let hub = open(state, args.demo)?;
     let store = Arc::downgrade(&hub.store);
     // The lock goes last, so no other daemon opens the store while it closes.
@@ -61,7 +69,7 @@ pub fn serve(state: &StateDir, args: &ServeArgs) -> anyhow::Result<ExitCode> {
         .thread_name("pitcrewd")
         .build()
         .context("cannot start the async runtime")?;
-    let served = runtime.block_on(run(hub, state, args.listen, started));
+    let served = runtime.block_on(run(hub, state, args.listen.clone(), started));
     // Stopping the runtime drops the tasks that still hold the store, such as streams the server
     // did not close; the store closes with the last of them.
     drop(runtime);
@@ -358,6 +366,17 @@ async fn run(
                 .context("cannot pick the private transport")?,
             false,
         ),
+        // `pitcrew-api` binds `pitcrewd.sock` (the file name `unix:` requires) in this directory,
+        // which it makes private, and removes it when the server stops.
+        ListenArg::Unix(path) => {
+            let path = std::path::absolute(&path)
+                .with_context(|| format!("cannot resolve the socket path {}", path.display()))?;
+            let dir = path
+                .parent()
+                .with_context(|| format!("{} has no directory", path.display()))?
+                .to_path_buf();
+            (Listen::Unix { dir }, false)
+        }
         ListenArg::Tcp(addr) => (Listen::DevTcp { addr }, true),
     };
     let bound = Bound::bind(&listen)
@@ -453,13 +472,17 @@ fn describe(listen: &Listen) -> String {
     }
 }
 
-/// The stop signals: Ctrl+C everywhere, SIGTERM on Unix, and Ctrl+Break and closing the console
-/// on Windows. Registered at start, so a signal right after the ready line is not missed.
+/// The stop signals: Ctrl+C everywhere; SIGTERM and SIGHUP on Unix (closing a tmux pane or an
+/// SSH session hangs up, which would otherwise end the process without removing its socket); and
+/// Ctrl+Break and closing the console on Windows. Registered at start, so a signal right after
+/// the ready line is not missed.
 struct Stop {
     #[cfg(unix)]
     interrupt: tokio::signal::unix::Signal,
     #[cfg(unix)]
     terminate: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    hangup: tokio::signal::unix::Signal,
     #[cfg(windows)]
     ctrl_c: tokio::signal::windows::CtrlC,
     #[cfg(windows)]
@@ -476,6 +499,7 @@ impl Stop {
             Ok(Self {
                 interrupt: signal(SignalKind::interrupt())?,
                 terminate: signal(SignalKind::terminate())?,
+                hangup: signal(SignalKind::hangup())?,
             })
         }
         #[cfg(windows)]
@@ -496,6 +520,7 @@ impl Stop {
             tokio::select! {
                 _ = self.interrupt.recv() => "SIGINT",
                 _ = self.terminate.recv() => "SIGTERM",
+                _ = self.hangup.recv() => "SIGHUP",
             }
         }
         #[cfg(windows)]
