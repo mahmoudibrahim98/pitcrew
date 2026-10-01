@@ -122,8 +122,103 @@ For every domain crate (E, F, G) that writes one:
 - **Inside `read`, the revision the data reflects is `projection_state.rev`** for that
   projection, queried in the same closure. Not `MAX(events.rev)` (another process may have
   appended events not yet applied) and not `Store::latest_rev()` (outside the snapshot).
-- **A future NFS mode** (`journal_mode=DELETE` plus EXCLUSIVE locking) has no concurrent
-  readers: it must route `read` (and `since`, `before`) through the write connection.
+- **Network mode** (`journal_mode=DELETE` plus EXCLUSIVE locking) has no concurrent readers:
+  `read`, `since` and `before` route through the write connection instead. See the next section.
+
+## Network filesystems and the single-host lease
+
+HPC home directories are often NFS, Lustre or GPFS. SQLite's WAL mode needs shared memory, which a
+network filesystem does not provide safely, and SQLite's own file locking is not trustworthy over
+one either (that is the whole reason this mode exists). `StoreOptions.fs` chooses how `Store::open`
+decides:
+
+- **`FsMode::Auto`** (the default) calls `pitcrew_store::detect` on the database's directory.
+  **Linux** reads `statfs`'s `f_type` magic number; **macOS** reads its `f_fstypename`; **Windows**
+  treats a UNC path (`\\server\share`, `\\?\UNC\...`) as network and a drive letter as local (a
+  mapped network drive looks local to `std`; force `FsMode::Network` for those). An unrecognised
+  type (`FsKind::Unknown`) is treated the same as `FsKind::Network`: guessing "local" wrongly is
+  the unsafe direction, so anything not on the allowlist (`ext2`/`3`/`4`, `xfs`, `btrfs`, `zfs`,
+  `tmpfs`, `f2fs`, `bcachefs`, `overlay(fs)`, `apfs`, `hfs` and similar) takes the slower, safe
+  path.
+- **`FsMode::Local`** and **`FsMode::Network`** force the choice, for callers who know better and
+  for tests.
+
+**Local mode** is unchanged: WAL, no lease. **Network mode**:
+
+- `journal_mode=DELETE`, `locking_mode=EXCLUSIVE`, the same `synchronous=NORMAL`.
+- No separate read-only connection: `locking_mode=EXCLUSIVE` means a second connection to the file
+  cannot be relied on, so `Store::read`, `Store::since` and `Store::before` run on the write
+  connection. They therefore wait for a concurrent append (and vice versa); this is the documented
+  cost of network mode, not a bug.
+- **The lease.** Generation-numbered files next to the database, `<db>.lease.<gen>` (e.g.
+  `store.db.lease.1`, `store.db.lease.2`, ...; `gen` a `u64` counter starting at 1), each holding
+  JSON `{"host": "...", "pid": ..., "until_ms": <epoch ms>}`. The **current** lease is whichever
+  generation is highest — found by listing the directory and parsing names strictly, never a
+  fixed name. **No live lease is ever renamed or deleted by anyone but its owner**: taking over
+  means creating a *new*, higher-numbered file, never touching whatever is already there. (An
+  earlier design took over an expired lease in place, renaming it aside and restoring it if that
+  turned out to be wrong; a three-way interleaving — a straggler's now-stale decision displacing
+  an already-confirmed winner, a third racer filling the resulting gap — could still leave two
+  hosts both holding it. Generation numbers remove the mechanism that made that possible.)
+  - **Acquire**: read the current generation (or none); if it is live, fail with
+    `Error::Leased { host, pid, until }`, without ever touching SQLite; if it is expired, absent,
+    or names a dead same-host owner (checked with `kill(pid, 0)` through `rustix`, no `unsafe`;
+    not possible on Windows, so there it is expiry only), exclusively create the next generation —
+    `std::fs::hard_link`, so it either creates that exact name or fails with `AlreadyExists`,
+    atomically, including over NFS (where this, not `open(O_CREAT | O_EXCL)` on the final name
+    directly, is the standard exclusive-create idiom: the latter is not reliably atomic across
+    NFSv3 clients). After creating, re-list: if a *higher* generation already exists (another
+    racer's own exclusive create for the same next number won a step ahead of ours), our file was
+    never going to be current — delete it (ours alone to delete) and retry from a fresh read. A
+    torn or garbage file (one that does not parse as that JSON) is treated as expired only once
+    its mtime is older than `lease_ttl`: a lease mid-write is not mistaken for a free one.
+  - **Renewal is automatic**, from a small thread `Store::open` starts, not a method callers must
+    remember to call: it wakes every `lease_ttl / 3` (so one slow or missed wakeup still leaves
+    two tries before the lease would actually expire), re-lists for a higher generation — if one
+    exists, it stops, having been taken over — and only then rewrites its own generation file with
+    a fresh `until_ms` (a plain temp-file-plus-rename onto its own name: safe, since nothing else
+    ever touches it).
+  - **Checked before every write, not just by the renewal thread's flag**: `Store`'s internal
+    `check_lease()` re-lists the lease directory fresh on every `append`, `rebuild` and `import` —
+    a cheap `readdir` and filename comparison, no file content to read — so a takeover is caught
+    immediately, not up to `lease_ttl / 3` later when the renewal thread would next notice on its
+    own. A displaced owner's very next write fails with `Error::LeaseLost`.
+  - **`StoreOptions.clock`** (a `Clock`, defaulting to `SystemClock`) is where the lease gets the
+    time; inject one in tests to expire a lease without sleeping.
+  - **Release**: dropping the `Store` stops the renewal thread and deletes only its own generation
+    file. No read-then-delete race to avoid, no capture-and-restore dance — nothing else could
+    ever have touched it.
+  - **Garbage collection**: after becoming the current owner, generations older than `gen - 1` are
+    deleted (the current one and the one just before it are kept, for diagnosis). Only the current
+    owner ever deletes anything, and only generations that are not current.
+  - **Residual limits.** A file-based lease on a filesystem this crate does not control cannot
+    close every race: NFS directory and attribute caching (`actimeo` and friends) can hide a new
+    `lease.<gen+1>` from an old owner for a while, and clock skew between hosts means "expired" is
+    each host's own opinion, not a global fact. Both are mitigated, not eliminated, by the
+    per-write re-list (catches a loss quickly once the directory listing *is* visible) and by
+    choosing a `lease_ttl` with real margin over expected clock drift, cache staleness and routine
+    scheduling delays — never fully solved by cleverness in this file alone. A filesystem that
+    cannot hard-link at all (rare: some FAT-formatted shares) fails lease acquisition outright
+    rather than silently falling back to an unsafe check-then-write.
+  - A store whose lease used the old, single fixed `<db>.lease` name has never shipped, so there
+    is no migration to support.
+
+## Maintenance
+
+- **`Store::snapshot(dest)`** copies the store with `VACUUM INTO`: a consistent copy as of the
+  moment it starts, safe to call while the store is in use (appends through this `Store` wait for
+  the duration; nothing is corrupted either way). `dest` must not already exist.
+- **`Store::integrity_check(full)`** runs `PRAGMA quick_check` (or, if `full`,
+  `PRAGMA integrity_check`) and returns `IntegrityReport::Ok` or `Failed(messages)` — never an
+  `Err` for corruption itself. The free function `pitcrew_store::integrity_check(conn, full)`
+  checks any plain connection (e.g. to a snapshot or a raw copy) without opening it as a `Store`,
+  which would run migrations against a file that may be corrupt.
+- **`Store::export(writer)`** writes every event as one JSON line each (no revision: order is the
+  record), oldest first. **`Store::import(reader)`** loads those lines into an empty store
+  (`Error::NotEmpty` otherwise), appending them through the normal `append` path so this store's
+  registered projections build from them. An import is a new log: `log_id` was already assigned
+  when the store was created, independently of import, so it differs from the exported store's.
+  Both are for tests and support, not sync.
 
 ## Timings
 

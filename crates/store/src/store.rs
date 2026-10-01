@@ -1,12 +1,16 @@
 use crate::error::{Error, Result};
+use crate::fs_kind::{self, FsMode};
+use crate::lease::{Clock, LeaseGuard, SystemClock};
+use crate::maintenance::{self, IntegrityReport};
 use crate::migrations::{self, Migration};
 use crate::projection::{self, Checkpoint, Projection};
 use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{EventId, MemberId, WorkspaceId};
 use rusqlite::{Connection, OpenFlags, Row, Transaction, TransactionBehavior};
 use std::collections::BTreeSet;
-use std::path::Path;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 use tokio::sync::broadcast;
 
@@ -19,6 +23,18 @@ pub struct StoreOptions {
     /// How many revision ranges a slow subscriber may fall behind before it lags. Clamped to
     /// `1..=MAX_SUBSCRIBER_CAPACITY`.
     pub subscriber_capacity: usize,
+    /// How to choose between WAL (local disks) and the NFS-safe journal mode plus a single-host
+    /// lease (network filesystems). The default, `FsMode::Auto`, detects the filesystem of the
+    /// database's directory; still picks WAL for a local disk, unchanged from before this option
+    /// existed.
+    pub fs: FsMode,
+    /// How long the network-mode lease lasts before it may be taken over if nobody renews it.
+    /// The owner renews it automatically, well before it would expire (see the crate's `lease`
+    /// module). Ignored in local (WAL) mode.
+    pub lease_ttl: Duration,
+    /// Where the network-mode lease gets the time. The default is the system clock; tests inject
+    /// one they control, so a lease can be made to look expired without sleeping.
+    pub clock: Arc<dyn Clock>,
 }
 
 /// The largest `subscriber_capacity`; the channel allocates this many slots up front.
@@ -29,6 +45,9 @@ impl Default for StoreOptions {
         Self {
             busy_timeout: Duration::from_secs(5),
             subscriber_capacity: 1024,
+            fs: FsMode::Auto,
+            lease_ttl: Duration::from_secs(60),
+            clock: Arc::new(SystemClock),
         }
     }
 }
@@ -101,18 +120,25 @@ const STATEMENT_CACHE: usize = 128;
 pub struct Store {
     /// A read-only connection for [`Store::read`], [`Store::since`] and [`Store::before`], so
     /// they never wait on the write lock (WAL readers and the writer do not block each other).
+    /// `None` in network mode: `locking_mode=EXCLUSIVE` there means a second connection to the
+    /// same file cannot be relied on, so reads go through `conn` instead (see [`Store::reader`]).
     ///
     /// Declared before `conn` so it closes first: fields drop in order, and only the last
     /// connection to close checkpoints the WAL and deletes `-wal` and `-shm`. A read-only
     /// connection cannot, so if it closed last the files would stay and the `.db` alone would
     /// miss recent commits.
-    reader: Mutex<Connection>,
+    reader: Option<Mutex<Connection>>,
     /// The one write connection. Appends, rebuilds, `latest_rev` and the schema version go
-    /// through it.
+    /// through it, and so do reads in network mode.
     conn: Mutex<Connection>,
     projections: Vec<Box<dyn Projection>>,
     log_id: String,
     revs: broadcast::Sender<RevRange>,
+    /// Set only in network mode: the single-host lease and its renewal thread. Checked before
+    /// every write (`Error::LeaseLost` if a higher generation now exists — see
+    /// [`Store::check_lease`]). Declared last, so it drops after both connections close: the
+    /// lease is not released until this process is done touching the file.
+    network: Option<LeaseGuard>,
 }
 
 impl std::fmt::Debug for Store {
@@ -179,6 +205,23 @@ impl Store {
             }
         }
         let path = path.as_ref();
+        let network = match options.fs {
+            FsMode::Local => false,
+            FsMode::Network => true,
+            FsMode::Auto => {
+                let dir = path
+                    .parent()
+                    .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+                fs_kind::detect(&dir).is_network()
+            }
+        };
+
+        // Network mode: take the single-host lease before touching the database at all, so two
+        // hosts never both reach SQLite's own (unreliable, over a network filesystem) locking.
+        let lease = network
+            .then(|| LeaseGuard::acquire(path, Arc::clone(&options.clock), options.lease_ttl))
+            .transpose()?;
+
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
@@ -186,13 +229,16 @@ impl Store {
         let mut conn = Connection::open_with_flags(path, flags)?;
         conn.busy_timeout(options.busy_timeout)?;
         conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
-        // Local disks only for now; NFS mode (journal_mode=DELETE plus a lease) comes later.
-        let mode = set_wal(&conn, options.busy_timeout)?;
-        if !mode.eq_ignore_ascii_case("wal") {
-            return Err(Error::JournalMode {
-                wanted: "wal",
-                got: mode,
-            });
+        let wanted: &'static str = if network { "delete" } else { "wal" };
+        let mode = set_journal_mode(&conn, wanted, options.busy_timeout)?;
+        if !mode.eq_ignore_ascii_case(wanted) {
+            return Err(Error::JournalMode { wanted, got: mode });
+        }
+        if network {
+            // SQLite's own locking is not trustworthy over a network filesystem; the lease above
+            // is the real protection. This pragma is defence in depth, and the reason a second
+            // connection to this file (the separate reader, below) is not opened in this mode.
+            conn.pragma_update(None, "locking_mode", "EXCLUSIVE")?;
         }
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -205,25 +251,31 @@ impl Store {
             tx.commit()?;
         }
 
-        let reader = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_URI,
-        )?;
-        reader.busy_timeout(options.busy_timeout)?;
-        reader.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
+        let reader = if network {
+            None
+        } else {
+            let reader = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | OpenFlags::SQLITE_OPEN_URI,
+            )?;
+            reader.busy_timeout(options.busy_timeout)?;
+            reader.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
+            Some(Mutex::new(reader))
+        };
 
         let capacity = options
             .subscriber_capacity
             .clamp(1, MAX_SUBSCRIBER_CAPACITY);
         let (revs, _) = broadcast::channel(capacity);
         Ok(Self {
-            reader: Mutex::new(reader),
+            reader,
             conn: Mutex::new(conn),
             projections,
             log_id,
             revs,
+            network: lease,
         })
     }
 
@@ -240,10 +292,12 @@ impl Store {
     ///
     /// # Errors
     ///
+    /// [`Error::LeaseLost`] in network mode, if this store's lease has been taken over,
     /// [`Error::UnknownProjection`] if no projection by that name was registered,
     /// [`Error::Projection`] if it fails, [`Error::ProjectionVersion`] if the store holds it at a
     /// higher version than this build's, or database errors. Nothing changes on an error.
     pub fn rebuild(&self, name: &str) -> Result<()> {
+        self.check_lease()?;
         let p = self
             .projections
             .iter()
@@ -268,11 +322,16 @@ impl Store {
     /// Runs `f` on a read-only connection, inside one read transaction, so every query in it sees
     /// the same committed state. For domain crates querying their projection tables.
     ///
-    /// Reads use their own connection: they never take the write lock, and a long read does not
-    /// hold up appends (in WAL mode readers and the writer do not block each other). Keep reads
-    /// short anyway: [`Store::since`] and [`Store::before`] share that one connection and wait
-    /// for the closure, and a long-open read stops the WAL from being checkpointed. Writes
-    /// through it fail.
+    /// **Local (WAL) mode:** reads use their own, separate connection: they never take the write
+    /// lock, and a long read does not hold up appends (WAL readers and the writer do not block
+    /// each other). Writes through it fail. Keep reads short anyway: [`Store::since`] and
+    /// [`Store::before`] share that one connection and wait for the closure, and a long-open read
+    /// stops the WAL from being checkpointed.
+    ///
+    /// **Network mode:** there is no separate connection (`locking_mode=EXCLUSIVE` cannot support
+    /// one), so this runs on the write connection instead: it waits for a concurrent append (and
+    /// vice versa), and the closure is not physically prevented from writing, only expected not
+    /// to. See the crate README's "Network filesystems" section.
     ///
     /// The snapshot starts at the closure's first query and holds until it returns, even if
     /// events are appended meanwhile. So the revision a projection's tables reflect is its
@@ -320,6 +379,7 @@ impl Store {
     ///
     /// # Errors
     ///
+    /// [`Error::LeaseLost`] in network mode, if this store's lease has been taken over,
     /// [`Error::DuplicateEvent`] if an event id is already stored or repeated in `events`,
     /// [`Error::Projection`] if a projection fails, [`Error::ProjectionVersion`] if another
     /// process rebuilt a projection at another version since this store opened, otherwise
@@ -341,6 +401,7 @@ impl Store {
     }
 
     fn append_inner(&self, events: &[Event], skip_known: bool) -> Result<(RevRange, Vec<EventId>)> {
+        self.check_lease()?;
         if events.is_empty() {
             return Ok((
                 RevRange {
@@ -458,8 +519,10 @@ impl Store {
     }
 
     /// Up to `limit` events after `rev`, oldest first. `since(0, n)` starts at the beginning.
-    /// Runs on the read connection, so it does not wait for an append or a rebuild, and sees
-    /// every append that has returned. Do not call it inside [`Store::read`] (it deadlocks).
+    /// Sees every append that has returned. In local (WAL) mode this runs on the separate read
+    /// connection, so it does not wait for an append or a rebuild; in network mode it shares the
+    /// write connection (see [`Store::read`]) and does wait. Do not call it inside
+    /// [`Store::read`] (it deadlocks).
     ///
     /// # Errors
     ///
@@ -469,8 +532,9 @@ impl Store {
     }
 
     /// Up to `limit` events matching `filter` just before `rev`, oldest first. For paging back
-    /// through history: pass the first returned revision as the next `rev`. Runs on the read
-    /// connection, like [`Store::since`]; do not call it inside [`Store::read`].
+    /// through history: pass the first returned revision as the next `rev`. Runs on the same
+    /// connection as [`Store::since`] (see its doc for the local/network difference); do not call
+    /// it inside [`Store::read`].
     ///
     /// # Errors
     ///
@@ -507,8 +571,124 @@ impl Store {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// `Err(Error::LeaseLost)` if network mode's lease has been taken over since this `Store`
+    /// opened (local mode: always `Ok`). Called first by every method that writes the log or a
+    /// projection's tables — [`Store::append`]/[`Store::append_new`] (via `append_inner`),
+    /// [`Store::rebuild`] and [`Store::import`] (whose own batches also go through `append`,
+    /// which checks again; checking here too means an already-lost lease is reported before
+    /// `import` does any work, not partway through). `LeaseGuard::check` re-lists the lease
+    /// directory fresh on every call (a cheap `readdir`, no file content to read), so a takeover
+    /// is caught here, immediately, not up to `ttl / RENEW_FRACTION` later when the renewal
+    /// thread would next notice on its own.
+    fn check_lease(&self) -> Result<()> {
+        match &self.network {
+            Some(guard) => guard.check(),
+            None => Ok(()),
+        }
+    }
+
+    /// The connection [`Store::read`], [`Store::since`] and [`Store::before`] use: the dedicated
+    /// read-only connection in local mode, or (network mode has none) the write connection.
     fn reader(&self) -> MutexGuard<'_, Connection> {
-        self.reader.lock().unwrap_or_else(PoisonError::into_inner)
+        match &self.reader {
+            Some(reader) => reader.lock().unwrap_or_else(PoisonError::into_inner),
+            None => self.conn(),
+        }
+    }
+
+    /// Copies the store to `dest` with `VACUUM INTO`: a consistent snapshot as of the moment it
+    /// starts, safe to run while the store is in use elsewhere. Holds the write connection for
+    /// the duration (concurrent appends through this `Store` wait; nothing is corrupted either
+    /// way).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NonUtf8Path`] if `dest` is not valid UTF-8 (`VACUUM INTO` takes it as a SQL
+    /// string, so a lossy conversion could silently write to the wrong path), or database
+    /// errors, including SQLite refusing to overwrite a `dest` that already exists.
+    pub fn snapshot(&self, dest: impl AsRef<Path>) -> Result<()> {
+        let dest = dest.as_ref();
+        let dest_str = dest.to_str().ok_or_else(|| Error::NonUtf8Path {
+            path: dest.to_path_buf(),
+        })?;
+        let conn = self.conn();
+        conn.execute("VACUUM INTO ?1", rusqlite::params![dest_str])?;
+        Ok(())
+    }
+
+    /// Runs `PRAGMA quick_check` (or, if `full`, the slower `PRAGMA integrity_check`) on the live
+    /// store. To check a file that is not open as a `Store` (for example, a snapshot), open a
+    /// plain connection and call the free function [`crate::integrity_check`] directly; opening
+    /// it as a `Store` would run migrations against a file that may be corrupt.
+    ///
+    /// # Errors
+    ///
+    /// Never for corruption, which [`IntegrityReport::Failed`] reports instead; a database error
+    /// starting the check.
+    pub fn integrity_check(&self, full: bool) -> Result<IntegrityReport> {
+        maintenance::integrity_check(&self.conn(), full)
+    }
+
+    /// Writes every event in the log as JSON lines, oldest first. For tests and support, not
+    /// sync: revisions are not included, since [`Store::import`] assigns fresh ones in the same
+    /// order.
+    ///
+    /// # Errors
+    ///
+    /// Database errors, or [`Error::Io`] writing to `writer`.
+    pub fn export(&self, mut writer: impl Write) -> Result<()> {
+        const BATCH: usize = 1_000;
+        let mut rev = 0;
+        loop {
+            let page = self.since(rev, BATCH)?;
+            let got = page.len();
+            for stored in page {
+                let line = maintenance::encode_line(&stored.event)?;
+                writeln!(writer, "{line}").map_err(Error::Io)?;
+                rev = stored.rev;
+            }
+            if got < BATCH {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Loads `reader`'s JSON lines (as [`Store::export`] wrote them) into this store, applying
+    /// each batch through [`Store::append`] so this store's registered projections build from
+    /// them as usual. For tests and support, not sync.
+    ///
+    /// The store must be empty: an import is a new log, and this store's `log_id` (assigned when
+    /// it was created, independently of import) already reflects that.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::LeaseLost`] in network mode, if this store's lease has been taken over (checked
+    /// up front, and again by every batch's own [`Store::append`]), [`Error::NotEmpty`] if the
+    /// store already holds events, [`Error::Io`] reading `reader` or decoding a line, or anything
+    /// else [`Store::append`] can return. The store may hold a prefix of `reader`'s lines if a
+    /// later batch fails.
+    pub fn import(&self, reader: impl BufRead) -> Result<()> {
+        self.check_lease()?;
+        if self.latest_rev()? != 0 {
+            return Err(Error::NotEmpty);
+        }
+        const BATCH: usize = 1_000;
+        let mut batch = Vec::with_capacity(BATCH);
+        for line in reader.lines() {
+            let line = line.map_err(Error::Io)?;
+            if line.is_empty() {
+                continue;
+            }
+            batch.push(maintenance::decode_line(&line)?);
+            if batch.len() == BATCH {
+                self.append(&batch)?;
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            self.append(&batch)?;
+        }
+        Ok(())
     }
 }
 
@@ -559,14 +739,15 @@ fn latest_rev(conn: &Connection) -> Result<u64> {
     Ok(u64::try_from(rev).unwrap_or(0))
 }
 
-/// Switches to WAL and returns the mode SQLite reports. Switching needs an exclusive lock, and
-/// when several connections open a fresh file at once SQLite fails the switch with SQLITE_BUSY
-/// at once instead of calling the busy handler, so retry until `timeout`. The mode is stored in
-/// the file, so later opens find it already set.
-fn set_wal(conn: &Connection, timeout: Duration) -> Result<String> {
+/// Switches the journal mode (`WAL` for local disks, `DELETE` for network mode) and returns what
+/// SQLite reports. Switching needs an exclusive lock, and when several connections open a fresh
+/// file at once SQLite fails the switch with SQLITE_BUSY at once instead of calling the busy
+/// handler, so retry until `timeout`. The mode is stored in the file, so later opens find it
+/// already set.
+fn set_journal_mode(conn: &Connection, wanted: &str, timeout: Duration) -> Result<String> {
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        match conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0)) {
+        match conn.pragma_update_and_check(None, "journal_mode", wanted, |row| row.get(0)) {
             Err(e)
                 if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy)
                     && std::time::Instant::now() < deadline =>
