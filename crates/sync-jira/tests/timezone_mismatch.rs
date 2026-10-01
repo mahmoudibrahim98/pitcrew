@@ -167,10 +167,12 @@ async fn the_account_zone_moving_east_between_syncs_skips_nothing() {
 
     // The account's profile zone is now Asia/Tokyo (UTC+9) — moved 8 hours east. A new issue
     // lands 30 minutes (real time) after DEMO-1.
-    let jql2 = jql_for(
-        "DEMO",
-        query_cursor_text(project.cursor.as_deref(), "Asia/Tokyo").as_deref(),
-    );
+    //
+    // Pinned literal, not computed via `query_cursor_text` (production's own `account_minute`,
+    // round 3 review nit: a test built from the very function it is meant to check could not
+    // catch a bug in that function itself). By hand: cursor 09:00:00Z minus the 1-hour margin is
+    // 08:00:00Z; Asia/Tokyo is UTC+9 (no DST), so 08:00:00Z renders as 17:00 local, same day.
+    let jql2 = jql_for("DEMO", Some("2026-01-01 17:00"));
     let url2 = cloud_search_url(&jql2, &page);
     let transport2 = ReplayTransport::from_exchanges(vec![
         myself_exchange(CLOUD_API_BASE, "Asia/Tokyo"),
@@ -231,10 +233,10 @@ async fn the_account_zone_moving_west_between_syncs_skips_nothing() {
     let project = outcome1.state.projects.get("DEMO").expect("project state");
     assert_eq!(project.cursor.as_deref(), Some("2026-01-01T10:00:00Z"));
 
-    let jql2 = jql_for(
-        "DEMO",
-        query_cursor_text(project.cursor.as_deref(), "Europe/Brussels").as_deref(),
-    );
+    // Pinned literal (see the east-moving test above for why): cursor 10:00:00Z minus the 1-hour
+    // margin is 09:00:00Z; Europe/Brussels is UTC+1 in January (no DST), so 09:00:00Z renders as
+    // 10:00 local, same day.
+    let jql2 = jql_for("DEMO", Some("2026-01-01 10:00"));
     let url2 = cloud_search_url(&jql2, &page);
     let transport2 = ReplayTransport::from_exchanges(vec![
         myself_exchange(CLOUD_API_BASE, "Europe/Brussels"),
