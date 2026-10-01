@@ -13,8 +13,8 @@
 //! - [`keychain`]: where remote workspaces' device tokens will live.
 //! - [`app`]: the Tauri wiring: the window, its CSP and capability, single instance, cleanup.
 //! - [`navigate`]: deep links (`pitcrew://…`) and notification clicks, as `gateway://navigate`.
-//! - [`attention`]: "needs you", from the gateway's own subscription to each daemon.
-//! - [`notify`]: OS notifications for new asks, and [`preferences`] that turn them off.
+//! - [`shell`]: the app in the background: "needs you" ([`attention`]), notifications
+//!   ([`notify`]), the tray ([`tray`]) and the [`preferences`] behind them.
 //!
 //! **Owned by stream K.**
 
@@ -32,7 +32,9 @@ pub mod redact;
 pub mod registry;
 pub mod scheme;
 pub mod settings;
+pub mod shell;
 pub mod token;
+pub mod tray;
 
 pub use app::run;
 
