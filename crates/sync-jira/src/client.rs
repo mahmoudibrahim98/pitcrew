@@ -96,9 +96,13 @@ pub(crate) struct SearchResult {
     /// `true` if the item cap's bypass (see [`JiraClient::search`]'s doc) was still engaged —
     /// every item collected so far was still at or before the cursor instant plus the safety
     /// margin — when `limits.max_pages` ran out. More updates share that window than one call's
-    /// page budget can read, so this project is not making progress past it yet; the caller
-    /// surfaces this as a `SyncIssue` rather than failing silently. No continuation is persisted
-    /// to resume mid-window on the next call — see this crate's README for that known gap.
+    /// page budget can read, so this project did not make progress past it *this* call; the
+    /// caller surfaces this as a `SyncIssue` rather than failing silently, and sets
+    /// `ProjectState::resume_without_margin` so the *next* call resumes from exactly this call's
+    /// cursor with no margin re-subtracted, guaranteeing it is not the same already-exhausted
+    /// window again (round 3 review item S-3 — this used to be a genuine permanent-stall bug, not
+    /// merely a slow one). No *mid-window page-walk* continuation (persisting `startAt`/
+    /// `nextPageToken` itself) is implemented — see this crate's README for that narrower gap.
     pub stuck_window_exhausted: bool,
 }
 
@@ -202,10 +206,6 @@ impl<'t, T: Transport> JiraClient<'t, T> {
         // diffing against the stored snapshot (see `crate::sync`), which is naturally a no-op when
         // nothing actually changed; this only guards one call's own page walk.
         let mut seen_this_call: HashSet<(String, String)> = HashSet::new();
-        // Whether the item cap's bypass was engaged (still at-or-before `threshold`) the last time
-        // it was checked. Combined with `ran_out_of_pages` after the loop, this is exactly "the
-        // walk never got a chance to find out whether it had moved past the stuck window".
-        let mut still_stuck = false;
         // Cleared by every path that ends the walk for a reason *other* than exhausting
         // `limits.max_pages` (a clean natural completion, a non-stuck cap hit, a malformed or
         // oversized page). Only staying `true` all the way to the end of the `for` loop means the
@@ -261,11 +261,23 @@ impl<'t, T: Transport> JiraClient<'t, T> {
                     // past the cursor-plus-margin threshold. `max_instant` reflects the most
                     // recently processed item (items arrive in ascending `updated` order), so
                     // this is exactly "has every item so far stayed within the stuck window".
-                    still_stuck = match (max_instant, threshold) {
+                    //
+                    // Scoped to just this check, not also reused to decide
+                    // `SearchResult::stuck_window_exhausted` (see `still_stuck_at_end`, computed
+                    // fresh after the whole loop): doing that had two bugs (round 3 review item
+                    // S-3 and a related nit). First, a silent false negative — this only ever runs
+                    // *inside* this branch, so a call whose page budget runs out without the item
+                    // cap ever being reached (e.g. the server returns fewer than
+                    // `limits.max_items` items across all of `limits.max_pages`) would never
+                    // compute it at all, under-reporting a genuinely stuck window. Second, a false
+                    // positive — a value computed here can go stale: if the very item that would
+                    // finally cross the threshold turns out to be the last item this call ever
+                    // reads, nothing re-runs this check afterward to notice the crossing.
+                    let cap_bypass_engaged = match (max_instant, threshold) {
                         (Some(seen), Some(t)) => seen <= t,
                         _ => false,
                     };
-                    if !still_stuck {
+                    if !cap_bypass_engaged {
                         cap_hit = true;
                         ran_out_of_pages = false;
                         break;
@@ -306,11 +318,22 @@ impl<'t, T: Transport> JiraClient<'t, T> {
             }
         }
 
+        // Computed fresh here from the *final* `max_instant`, not from `cap_bypass_engaged`'s
+        // last in-loop value — see that variable's doc for the two bugs reusing it caused (round
+        // 3 review item S-3 and a related nit). `max_instant` reflects every item this call
+        // actually processed (items arrive in ascending `updated` order, so the max is always the
+        // most recent one read, regardless of which branch last updated it), so this is correct
+        // regardless of whether the item cap ever actually triggered mid-loop.
+        let still_stuck_at_end = match (max_instant, threshold) {
+            (Some(seen), Some(t)) => seen <= t,
+            _ => false,
+        };
+
         Ok(Outcome::Ok(SearchResult {
             items,
             malformed_skipped: malformed,
             max_instant,
-            stuck_window_exhausted: ran_out_of_pages && still_stuck,
+            stuck_window_exhausted: ran_out_of_pages && still_stuck_at_end,
         }))
     }
 }
@@ -619,6 +642,136 @@ mod tests {
             transport.remaining(),
             0,
             "a third page was never requested — the page cap, not more data, stopped the walk"
+        );
+    }
+
+    #[tokio::test]
+    async fn stuck_is_reported_even_when_the_item_cap_never_fires_mid_loop() {
+        // Round 3 review item S-3's silent false negative: the old in-loop `still_stuck` was only
+        // ever assigned inside the `items.len() >= limits.max_items` branch. With a generous item
+        // cap that branch never fires at all — here, 2 pages of 2 items each (4 total), every one
+        // within the cursor's margin, `max_items: 100` (never reached), `max_pages: 2` (reached,
+        // with a third page still pending). The old code left `still_stuck` at its initial `false`
+        // and silently failed to report this as stuck.
+        let url1 = "https://jira.example.com/rest/api/3/search/jql?jql=project%20in%20%28%22DEMO%22%29%20AND%20updated%20%3E%3D%20%222026-01-01%2000%3A05%22&maxResults=100&fields=summary";
+        let url2 = format!("{url1}&nextPageToken=page2");
+        let page1 = serde_json::json!({
+            "issues": [
+                {"id":"1","key":"DEMO-1","fields":{"summary":"a","status":{"name":"To Do","statusCategory":{"key":"new"}},"issuetype":{"name":"Story"},"updated":"2026-01-01T00:05:00.000+0000"}},
+                {"id":"2","key":"DEMO-2","fields":{"summary":"b","status":{"name":"To Do","statusCategory":{"key":"new"}},"issuetype":{"name":"Story"},"updated":"2026-01-01T00:05:10.000+0000"}},
+            ],
+            "nextPageToken": "page2",
+        });
+        let page2 = serde_json::json!({
+            "issues": [
+                {"id":"3","key":"DEMO-3","fields":{"summary":"c","status":{"name":"To Do","statusCategory":{"key":"new"}},"issuetype":{"name":"Story"},"updated":"2026-01-01T00:05:20.000+0000"}},
+                {"id":"4","key":"DEMO-4","fields":{"summary":"d","status":{"name":"To Do","statusCategory":{"key":"new"}},"issuetype":{"name":"Story"},"updated":"2026-01-01T00:05:30.000+0000"}},
+            ],
+            // A third page genuinely exists server-side; the page budget, not the data, stops us.
+            "nextPageToken": "page3",
+        });
+        let transport = ReplayTransport::from_exchanges(vec![
+            exchange(url1, 200, vec![], &page1.to_string()),
+            exchange(&url2, 200, vec![], &page2.to_string()),
+        ]);
+        let c = client(&transport);
+        let mut attempts = 0u32;
+        let limits = Limits {
+            max_pages: 2,
+            max_items: 100,
+        };
+        let cursor = instant("2026-01-01T00:05:00Z");
+        let Outcome::Ok(result) = c
+            .search(
+                &JiraCloud,
+                &query(
+                    "project in (\"DEMO\") AND updated >= \"2026-01-01 00:05\"",
+                    &["summary"],
+                    Some(cursor),
+                ),
+                0,
+                &mut attempts,
+                limits,
+            )
+            .await
+            .expect("search")
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(result.items.len(), 4);
+        assert!(
+            result.stuck_window_exhausted,
+            "the item cap never fired, but the page budget still ran out while every item \
+             stayed within the cursor's margin — this must not be silently dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn stuck_window_exhausted_is_not_a_false_positive_when_the_last_item_crosses_the_threshold()
+     {
+        // The related nit: the old in-loop `still_stuck` could hold a *stale* `true`, set just
+        // before the one item that actually escaped the margin was processed, if that item turned
+        // out to be the very last one this call ever read (no later item re-ran the check to
+        // notice the crossing). Page 1 (3 items, filling the item cap exactly, with no item left
+        // over in that page to trigger the cap check) all sit within the margin; page 2 is a
+        // single item two hours later — past the margin, i.e. a genuine crossing — and itself
+        // claims a further page exists, so the page budget (not the data) ends the walk right
+        // after processing it.
+        let url1 = "https://jira.example.com/rest/api/3/search/jql?jql=project%20in%20%28%22DEMO%22%29%20AND%20updated%20%3E%3D%20%222026-01-01%2000%3A05%22&maxResults=100&fields=summary";
+        let url2 = format!("{url1}&nextPageToken=page2");
+        let page1 = serde_json::json!({
+            "issues": [
+                {"id":"1","key":"DEMO-1","fields":{"summary":"a","status":{"name":"To Do","statusCategory":{"key":"new"}},"issuetype":{"name":"Story"},"updated":"2026-01-01T00:05:00.000+0000"}},
+                {"id":"2","key":"DEMO-2","fields":{"summary":"b","status":{"name":"To Do","statusCategory":{"key":"new"}},"issuetype":{"name":"Story"},"updated":"2026-01-01T00:05:10.000+0000"}},
+                {"id":"3","key":"DEMO-3","fields":{"summary":"c","status":{"name":"To Do","statusCategory":{"key":"new"}},"issuetype":{"name":"Story"},"updated":"2026-01-01T00:05:20.000+0000"}},
+            ],
+            "nextPageToken": "page2",
+        });
+        let page2 = serde_json::json!({
+            "issues": [
+                {"id":"4","key":"DEMO-4","fields":{"summary":"d","status":{"name":"To Do","statusCategory":{"key":"new"}},"issuetype":{"name":"Story"},"updated":"2026-01-01T02:00:00.000+0000"}},
+            ],
+            // Claims a third page too, so the page budget (not natural completion) ends the walk.
+            "nextPageToken": "page3",
+        });
+        let transport = ReplayTransport::from_exchanges(vec![
+            exchange(url1, 200, vec![], &page1.to_string()),
+            exchange(&url2, 200, vec![], &page2.to_string()),
+        ]);
+        let c = client(&transport);
+        let mut attempts = 0u32;
+        let limits = Limits {
+            max_pages: 2,
+            max_items: 3,
+        };
+        let cursor = instant("2026-01-01T00:05:00Z");
+        let Outcome::Ok(result) = c
+            .search(
+                &JiraCloud,
+                &query(
+                    "project in (\"DEMO\") AND updated >= \"2026-01-01 00:05\"",
+                    &["summary"],
+                    Some(cursor),
+                ),
+                0,
+                &mut attempts,
+                limits,
+            )
+            .await
+            .expect("search")
+        else {
+            panic!("expected Ok");
+        };
+        assert_eq!(
+            result.items.len(),
+            4,
+            "the crossing item (DEMO-4) was still read"
+        );
+        assert_eq!(result.max_instant, Some(instant("2026-01-01T02:00:00Z")));
+        assert!(
+            !result.stuck_window_exhausted,
+            "DEMO-4 crossed the margin — real progress was made, even though it was also the \
+             last item this call read before the page budget ran out"
         );
     }
 

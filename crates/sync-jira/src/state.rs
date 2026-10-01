@@ -84,6 +84,16 @@ pub struct ProjectState {
     /// backoff. Reset to zero on any request that is not rate-limited.
     #[serde(default)]
     pub secondary_backoff_attempts: u32,
+    /// Set when the previous sync call reported `stuck_window_exhausted` (see
+    /// `crate::client::SearchResult`'s doc): `cursor` already advanced to the newest instant that
+    /// call actually processed, but ordinarily the *next* call would subtract
+    /// `CURSOR_SAFETY_MARGIN_HOURS` again when rendering it into a query, re-including everything
+    /// in that same already-exhausted window and making the stall permanent (round 3 review item
+    /// S-3). While this is `true`, `crate::sync` renders the next query from `cursor` itself, with
+    /// no margin subtracted, guaranteeing it starts no earlier than where the stuck call left off.
+    /// Cleared as soon as a call completes without reporting stuck again.
+    #[serde(default)]
+    pub resume_without_margin: bool,
 }
 
 /// Cursors and snapshots for every tracked project, plus the account time zone most recently read

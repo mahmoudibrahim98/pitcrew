@@ -134,20 +134,31 @@ async fn sync_with_limits<T: Transport, D: Deployment>(
     let client = JiraClient::new(transport, config.auth.clone(), config.api_base.clone());
 
     // Read fresh on every call, not cached: see `SyncState::timezone`'s doc for why a stale zone
-    // is unsafe here. On a transient failure, `state.timezone` just keeps its previous value.
-    match client.myself().await {
-        Ok(tz) => state.timezone = tz,
-        Err(e) => errors.push(SyncIssue {
-            project: String::new(),
-            resource: Resource::Myself,
-            message: e.to_string(),
-        }),
-    }
+    // is unsafe here.
+    let resolved_zone = match client.myself().await {
+        Ok(tz) => {
+            state.timezone = tz;
+            resolve_account_zone(state.timezone.as_deref())
+        }
+        Err(e) => {
+            errors.push(SyncIssue {
+                project: String::new(),
+                resource: Resource::Myself,
+                message: e.to_string(),
+            });
+            // Round 3 review item S-1: do NOT fall back to using `state.timezone`'s cached value
+            // to render *this* call's queries. The account's real zone can have moved since the
+            // last successful read (e.g. Tokyo to New York); rendering at a stale cached zone
+            // that is now *behind* the true one narrows or inverts the cursor's safety margin and
+            // can skip real updates. UTC-12 is behind every real zone, so rendering at it can only
+            // widen the window (more overlap re-read, never a skip). `state.timezone` itself is
+            // left untouched, so a later call is unaffected by this one's failure once `/myself`
+            // succeeds again.
+            resolve_account_zone(None)
+        }
+    };
 
     let fields = fields_for(config);
-    // Resolved once per call (not per project): there is one account, hence one zone, for the
-    // whole token. See `resolve_account_zone` for the unknown-zone fallback.
-    let resolved_zone = resolve_account_zone(state.timezone.as_deref());
     if resolved_zone.fell_back {
         errors.push(SyncIssue {
             project: String::new(),
@@ -173,7 +184,15 @@ async fn sync_with_limits<T: Transport, D: Deployment>(
             project_state.cursor.as_deref().and_then(|s| s.parse().ok());
         // Rendered `margin` earlier than the real cursor: covers tzdata drift between this
         // crate's bundled database and Jira's own, and any residual zone-resolution imprecision.
-        let query_instant = cursor_instant.and_then(|c| c.checked_sub(margin).ok());
+        // Skipped entirely when `resume_without_margin` is set (round 3 review item S-3): the
+        // previous call reported `stuck_window_exhausted`, and re-subtracting the margin here
+        // would just pull the query back into the same already-exhausted window, making the stall
+        // permanent — see `ProjectState::resume_without_margin`'s doc.
+        let query_instant = if project_state.resume_without_margin {
+            cursor_instant
+        } else {
+            cursor_instant.and_then(|c| c.checked_sub(margin).ok())
+        };
         let cursor_text = query_instant.map(|i| account_minute(i, &zone));
         let jql = incremental_query(project, cursor_text.as_deref());
         let query = SearchQuery {
@@ -230,13 +249,14 @@ async fn sync_with_limits<T: Transport, D: Deployment>(
                         }
                     }
                 }
+                project_state.resume_without_margin = search_result.stuck_window_exhausted;
                 if search_result.stuck_window_exhausted {
                     errors.push(SyncIssue {
                         project: key.clone(),
                         resource: Resource::Search,
                         message: "more updates share the sync cursor's window than one call's \
-                                   page budget can read; this project is not making progress \
-                                   past it yet and will keep retrying on the next sync"
+                                   page budget can read; the next sync resumes from exactly where \
+                                   this one stopped (no added safety margin) to guarantee progress"
                             .to_string(),
                     });
                 }
@@ -246,8 +266,13 @@ async fn sync_with_limits<T: Transport, D: Deployment>(
                 // because the walk is ascending with a server-side `updated >=` filter — anything
                 // older than what this call saw is guaranteed either already synced, or still
                 // `>=` the *old* cursor and so still matched by this same JQL next time. A cap
-                // cutting the walk short just means next call repeats the same query from the
-                // (now slightly advanced) cursor instead of resuming mid-walk; nothing is skipped.
+                // cutting the walk short is *not* automatically "next call repeats the same query
+                // and makes a little more progress" the way that sentence implies: the margin
+                // subtracted when rendering a query (above) would normally pull the next call's
+                // query right back into this same already-exhausted window, making the stall
+                // permanent rather than merely slow — that is exactly what
+                // `project_state.resume_without_margin`, just set above, exists to prevent (round
+                // 3 review item S-3; this comment itself was the "misleading" one review flagged).
                 if let Some(candidate) = search_result.max_instant
                     && cursor_instant.is_none_or(|c| candidate > c)
                 {
@@ -355,13 +380,169 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_myself_fetch_failure_falls_back_to_the_last_known_zone_not_utc_minus_twelve() {
+    async fn a_stuck_window_resumes_with_no_margin_and_makes_progress_next_call() {
+        // Round 3 review item S-3: without `resume_without_margin`, a call reporting
+        // `stuck_window_exhausted` would advance its cursor only to the newest instant it
+        // actually read (still inside the old margin window), and the *next* call would then
+        // subtract the safety margin again when rendering its query — pulling the window's start
+        // right back to (or before) where it already was, making the stall permanent rather than
+        // merely slow. This proves the second call instead queries from exactly where the first
+        // stopped, with no margin re-subtracted, and that real progress follows.
+        let zone = jiff::tz::TimeZone::UTC;
+        let project_ref = ProjectRef::new("DEMO").expect("valid");
+        let limits = Limits {
+            max_pages: 1,
+            max_items: 10,
+        };
+
+        // --- Call 1: a project with a cursor from a prior sync gets stuck — two items, both
+        // within the 1-hour margin, and a `nextPageToken` showing a real further page exists,
+        // which the 1-page budget never reaches. ---
+        let old_cursor: Timestamp = "2026-01-01T00:05:00Z".parse().expect("valid instant");
+        let margin = SignedDuration::from_hours(CURSOR_SAFETY_MARGIN_HOURS);
+        let query1_instant = old_cursor.checked_sub(margin).expect("no underflow");
+        let cursor1_text = account_minute(query1_instant, &zone);
+        let jql1 = incremental_query(&project_ref, Some(cursor1_text.as_str()));
+        let search_url1 = JiraCloud
+            .build_search_request(
+                "https://jira.example.com/rest/api/3",
+                &config(vec!["DEMO"]).auth,
+                &jql1,
+                BASE_FIELDS,
+                &crate::deployment::PageState::Cloud {
+                    next_page_token: None,
+                },
+            )
+            .url;
+        let page1 = serde_json::json!({
+            "issues": [
+                {"id":"1","key":"DEMO-1","fields":{"summary":"a","status":{"name":"To Do","statusCategory":{"key":"new"}},"issuetype":{"name":"Story"},"updated":"2026-01-01T00:10:00.000+0000"}},
+                {"id":"2","key":"DEMO-2","fields":{"summary":"b","status":{"name":"To Do","statusCategory":{"key":"new"}},"issuetype":{"name":"Story"},"updated":"2026-01-01T00:20:00.000+0000"}},
+            ],
+            "nextPageToken": "page2",
+        });
+        let transport1 = ReplayTransport::from_exchanges(vec![
+            myself_exchange(),
+            RecordedExchange {
+                method: "GET".to_string(),
+                url: search_url1,
+                request_headers: vec![],
+                status: 200,
+                response_headers: vec![],
+                body: page1.to_string().into_bytes(),
+            },
+        ]);
+
+        let mut state = SyncState::new();
+        state.projects.insert(
+            "DEMO".to_string(),
+            crate::state::ProjectState {
+                cursor: Some(old_cursor.to_string()),
+                ..Default::default()
+            },
+        );
+
+        let outcome1 = sync_with_limits(
+            state,
+            &transport1,
+            &JiraCloud,
+            &config(vec!["DEMO"]),
+            limits,
+        )
+        .await;
+        assert!(
+            outcome1
+                .errors
+                .iter()
+                .any(|e| e.resource == Resource::Search),
+            "the stuck window must be surfaced: {:?}",
+            outcome1.errors
+        );
+        let project1 = outcome1.state.projects.get("DEMO").expect("project state");
+        assert!(
+            project1.resume_without_margin,
+            "the next call must resume without the margin"
+        );
+        assert_eq!(project1.cursor.as_deref(), Some("2026-01-01T00:20:00Z"));
+
+        // --- Call 2: must query from the cursor itself, not cursor-minus-margin. If it used the
+        // margin again (the bug this fixes), it would query from "2025-12-31 23:20" instead,
+        // which the fixture below provides no response for — the call would error on an
+        // unmatched request, which is exactly what would catch a regression here. ---
+        let cursor2: Timestamp = "2026-01-01T00:20:00Z".parse().expect("valid instant");
+        let cursor2_text = account_minute(cursor2, &zone);
+        let jql2 = incremental_query(&project_ref, Some(cursor2_text.as_str()));
+        let search_url2 = JiraCloud
+            .build_search_request(
+                "https://jira.example.com/rest/api/3",
+                &config(vec!["DEMO"]).auth,
+                &jql2,
+                BASE_FIELDS,
+                &crate::deployment::PageState::Cloud {
+                    next_page_token: None,
+                },
+            )
+            .url;
+        let page2 = serde_json::json!({
+            "issues": [
+                {"id":"3","key":"DEMO-3","fields":{"summary":"c","status":{"name":"To Do","statusCategory":{"key":"new"}},"issuetype":{"name":"Story"},"updated":"2026-01-01T03:00:00.000+0000"}},
+            ],
+        });
+        let transport2 = ReplayTransport::from_exchanges(vec![
+            myself_exchange(),
+            RecordedExchange {
+                method: "GET".to_string(),
+                url: search_url2,
+                request_headers: vec![],
+                status: 200,
+                response_headers: vec![],
+                body: page2.to_string().into_bytes(),
+            },
+        ]);
+        let outcome2 = sync_with_limits(
+            outcome1.state,
+            &transport2,
+            &JiraCloud,
+            &config(vec!["DEMO"]),
+            limits,
+        )
+        .await;
+        assert!(outcome2.errors.is_empty(), "{:?}", outcome2.errors);
+        assert_eq!(
+            transport2.remaining(),
+            0,
+            "the no-margin query must have matched the fixture"
+        );
+        let created: Vec<&str> = outcome2
+            .changes
+            .iter()
+            .filter_map(|c| match c {
+                UpstreamChange::IssueCreated { source, .. } => Some(source.key.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(created, vec!["DEMO-3"], "{:#?}", outcome2.changes);
+        let project2 = outcome2.state.projects.get("DEMO").expect("project state");
+        assert!(
+            !project2.resume_without_margin,
+            "progress was made; the next call no longer needs to skip the margin"
+        );
+        assert_eq!(project2.cursor.as_deref(), Some("2026-01-01T03:00:00Z"));
+    }
+
+    #[tokio::test]
+    async fn a_myself_fetch_failure_renders_this_calls_query_at_utc_minus_twelve_not_the_cached_zone()
+     {
+        // Round 3 review item S-1: a `/myself` failure must NOT fall back to the last known-good
+        // *cached* zone to render that call's own query. The account's real zone can have moved
+        // since the last successful read (e.g. Tokyo to New York); rendering at a stale cached
+        // zone that is now behind the true one narrows (or inverts) the cursor's safety margin and
+        // can skip real updates. This renders the failed call's query at the conservative UTC-12
+        // fallback instead — always behind every real zone, so it can only widen the window, never
+        // skip — while still keeping the cached zone itself in `state.timezone` untouched, for the
+        // *next* call to use once `/myself` succeeds again (asserted below).
+        //
         // The first call resolves and caches "UTC", and sees one issue, establishing a cursor.
-        // The second call's `/myself` fails outright (not just an unresolvable name): the cursor
-        // rendering must still use the last known-good zone ("UTC") to build its query, not
-        // immediately degrade to the UTC-12 fallback over one transient error — UTC and UTC-12
-        // render the same instant 12 hours apart, so if the wrong zone were used here, the query
-        // URL would not match the one fixture this test provides, and the call would error.
         let search_url = "https://jira.example.com/rest/api/3/search/jql?jql=project%20in%20%28%22DEMO%22%29%20ORDER%20BY%20updated%20ASC%2C%20key%20ASC&maxResults=100&fields=summary%2Cdescription%2Cstatus%2Cresolution%2Clabels%2Cassignee%2Cparent%2Cissuetype%2Cupdated";
         let first_page = serde_json::json!({
             "issues": [{
@@ -397,12 +578,13 @@ mod tests {
         let project = outcome.state.projects.get("DEMO").expect("project state");
         assert_eq!(project.cursor.as_deref(), Some("2026-01-01T00:05:00Z"));
 
-        // Second call: /myself fails. The margin-adjusted cursor (1 hour earlier), rendered in
-        // the *cached* "UTC" zone, is "2025-12-31 23:05" — rendered in UTC-12 instead, it would
-        // be "2025-12-31 11:05", a different query this test provides no fixture for.
+        // Second call: /myself fails. The margin-adjusted cursor (1 hour earlier) is
+        // "2025-12-31T23:05:00Z"; rendered at UTC-12 (not the cached "UTC"), that is
+        // "2025-12-31 11:05" — had this used the stale cached "UTC" zone instead, it would have
+        // queried from "2025-12-31 23:05", a different query this test provides no fixture for.
         let query = incremental_query(
             &ProjectRef::new("DEMO").expect("valid"),
-            Some("2025-12-31 23:05"),
+            Some("2025-12-31 11:05"),
         );
         let second_url = JiraCloud
             .build_search_request(
@@ -433,22 +615,25 @@ mod tests {
             &config(vec!["DEMO"]),
         )
         .await;
+        // Two distinct issues this call: the /myself fetch itself failing, and (as a consequence)
+        // this call rendering at the conservative UTC-12 fallback.
         assert_eq!(
             outcome2
                 .errors
                 .iter()
                 .filter(|e| e.resource == Resource::Myself)
                 .count(),
-            1,
+            2,
             "{:?}",
             outcome2.errors
         );
-        // The stale-but-still-valid "UTC" is kept, not wiped out.
+        // The stale-but-still-valid "UTC" is kept in state, not wiped out — it is only this one
+        // call's own *query* that must not use it.
         assert_eq!(outcome2.state.timezone.as_deref(), Some("UTC"));
         assert_eq!(
             transport2.remaining(),
             0,
-            "the search must have used the cached UTC zone, not the UTC-12 fallback"
+            "the search must have used the UTC-12 fallback for this call, not the cached UTC zone"
         );
     }
 
