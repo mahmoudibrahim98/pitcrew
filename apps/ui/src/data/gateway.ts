@@ -68,10 +68,11 @@ function abortable<T>(answer: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
-function isResponse(value: unknown): value is GatewayResponse {
+/** A response; an empty body (a 204) may come as `null`. */
+function isResponse(value: unknown): value is Omit<GatewayResponse, 'body'> & { body?: string | null } {
   if (typeof value !== 'object' || value === null) return false;
   const { status, body } = value as Record<string, unknown>;
-  return typeof status === 'number' && typeof body === 'string';
+  return typeof status === 'number' && (typeof body === 'string' || body === null || body === undefined);
 }
 
 /** The transport for one workspace (its id, as in `/w/$ws`). */
@@ -84,10 +85,10 @@ export function gatewayTransport(workspace: string, name: string = workspace): T
   ): Promise<TransportResponse> {
     if (signal?.aborted) throw abortError(signal);
     const req: GatewayRequest = body === undefined ? { workspace, method, path } : { workspace, method, path, body };
-    const answer = call<GatewayResponse>('gateway_request', { req });
+    const answer = call<unknown>('gateway_request', { req });
     const res = signal === undefined ? await answer : await abortable(answer, signal);
     if (!isResponse(res)) throw toGatewayError({ code: 'internal', message: `The gateway gave no answer for ${method} ${path}.` });
-    return { status: res.status, contentType: res.contentType ?? undefined, body: res.body };
+    return { status: res.status, contentType: res.contentType ?? undefined, body: res.body ?? '' };
   }
 
   return {

@@ -5,7 +5,7 @@ import { QueryClient } from '@tanstack/react-query';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError, createApi } from '../src/data/api.ts';
 import { GatewayError, type GatewayErrorCode } from '../src/data/errors.ts';
-import { gatewayTransport, type GatewayRequest } from '../src/data/gateway.ts';
+import { gatewayTransport, type GatewayRequest, type GatewayResponse } from '../src/data/gateway.ts';
 import { createLive, type Live } from '../src/data/live.ts';
 import { StreamClient } from '../src/data/stream.ts';
 import type { SocketClose } from '../src/data/transport.ts';
@@ -60,9 +60,11 @@ describe('requests through the gateway', () => {
     }
   });
 
-  it('returns nothing for 204', async () => {
+  it('returns nothing for 204, with an empty body or none', async () => {
     gateway.daemons.set(WS, () => ({ status: 204, body: '' }));
     const api = createApi({ transport: gatewayTransport(WS) });
+    await expect(api.interrupt('S1')).resolves.toBeUndefined();
+    gateway.daemons.set(WS, () => ({ status: 204, body: null }) as unknown as GatewayResponse);
     await expect(api.interrupt('S1')).resolves.toBeUndefined();
   });
 
