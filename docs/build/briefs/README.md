@@ -39,6 +39,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [M-terminal](M-terminal.md) | M · Agent console | `s/M/terminal` | Opus-class | In progress |
 | [K-shell-and-gateway](K-shell-and-gateway.md) | K · Desktop shell | `s/K/shell-and-gateway` | Opus-class | In progress |
 | [L-desktop-transport](L-desktop-transport.md) | L · UI foundation | `s/L/desktop-transport` | Opus-class | In progress |
+| [G-jira-read](G-jira-read.md) | G · Integrations | `s/G/jira-read` | Sonnet-class | In progress |
 | [0-daemon-solo](0-daemon-solo.md) | 0 · Composition root | `integrator/daemon-solo` | Opus-class | **Merged** |
 | [N-projects-wiring](N-projects-wiring.md) | N · Projects layout | `s/N/projects-wiring` | Sonnet-class | **Merged** |
 | [L-shell-polish](L-shell-polish.md) | L · UI foundation | `s/L/shell-polish` | Sonnet-class | **Merged** |
