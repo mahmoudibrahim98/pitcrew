@@ -39,7 +39,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [M-terminal](M-terminal.md) | M · Agent console | `s/M/terminal` | Opus-class | **Merged** |
 | [K-shell-and-gateway](K-shell-and-gateway.md) | K · Desktop shell | `s/K/shell-and-gateway` | Opus-class | **Merged** |
 | [L-desktop-transport](L-desktop-transport.md) | L · UI foundation | `s/L/desktop-transport` | Opus-class | **Merged** |
-| [G-jira-read](G-jira-read.md) | G · Integrations | `s/G/jira-read` | Sonnet-class | In progress |
+| [G-jira-read](G-jira-read.md) | G · Integrations | `s/G/jira-read` | Sonnet-class | **Merged** |
 | [Q-fuzz-and-model-refresh](Q-fuzz-and-model-refresh.md) | Q · Security | `s/Q/fuzz-and-model-refresh` | Opus-class | **Merged** |
 | [0-recap-contract](0-recap-contract.md) | 0 · Contracts | `integrator/recap-contract` | Opus-class | **Merged** |
 | [E-recap-index](E-recap-index.md) | E · Work model | `s/E/recap-index` | Opus-class | **Merged** |
