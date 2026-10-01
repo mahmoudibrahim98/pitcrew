@@ -11,7 +11,7 @@ none of this folder lands in the initial bundle until a projects route is visite
 |---|---|
 | `index.ts` | The feature registration, and the public surface: lazy components, `ProjectsNavProvider`, `useInbox` (for the sidebar badge). |
 | `layout.tsx` | `ProjectsLayout`: the pathless route every projects route nests under, wiring `ProjectsNavProvider` to the router once (`paths` + `router.navigate`). |
-| `data.ts` | Hooks on `useLiveQuery`: inbox (`to=me&state=open`), briefs, activity (`GET /v1/events`), machines, names; mutations: move, assign, create task, subtasks, comment, dispatch, answer ask, edit/pin brief. |
+| `data.ts` | Hooks on `useLiveQuery`: inbox (`to=me&state=open`), briefs, activity (`GET /v1/events`), machines, names; mutations: move, assign, create task, subtasks, comment, dispatch, answer ask, edit/pin/keep-current brief, accept a brief proposal. |
 | `nav.tsx` | `ProjectsNavProvider`: where "open task / project / workstream / session / receipt / Inbox" go. Without a handler, targets render as plain text. |
 | `board.tsx` | `Board` (data, notes; `assignee` for "My tasks") and `BoardView` (columns by status, lanes by workstream, pointer drag, keyboard moves). |
 | `moves.ts` | `useOptimisticMoves`: where a moved card shows until the hub and the task list agree. |
@@ -23,7 +23,7 @@ none of this folder lands in the initial bundle until a projects route is visite
 | `my-tasks.tsx`, `projects-list.tsx`, `members.tsx` | My tasks (the board filtered to me), the projects list, and members (people and agents, owners shown). |
 | `new-task.tsx` | `NewTaskDialog`: the "+ New" → "Task" item, replacing the shell's placeholder. |
 | `inbox.tsx` | `Inbox`: open asks to me by kind, answered in place with stream M's `QuestionCard` (`src/console`); receipts and the task link are the Inbox's own, shown alongside it. |
-| `where-it-stands.tsx` | `WhereItStands`: the brief with receipts; edit and pin for people; the back office's pending proposal (still read by scanning events — see "Pending proposals" below). |
+| `where-it-stands.tsx` | `WhereItStands`: the brief with receipts; edit and pin for people; the back office's pending proposal (`brief.proposal`), accepted or kept aside — see "Pending proposals" below. |
 | `receipts.tsx` | Receipt chips: web links for pull requests, `openReceipt` buttons or plain chips otherwise. |
 | `activity.tsx` | `ActivityFeed` (Summary placeholder / All events, "Load older") and `EventList`. A `project` or `workstream` filter that comes back `400 invalid` (the real hub, until its index lands) shows "Activity isn't available here yet." instead of an error. |
 | `agents.tsx` | `AgentsNow`: running sessions and their live status lines. |
@@ -43,14 +43,20 @@ reasoning.
 
 ## Pending proposals
 
-`WhereItStands` still finds a back-office proposal by scanning activity (`pendingProposal` in
-`where-it-stands.tsx`). `integrator/work-edits` has merged into `main` (the contract and the mock
-hub both now carry `Brief.proposal`, a `BriefProposal`: `{ text, next?, receipts, at }`), **but**
-`apps/ui/src/data/types.ts`'s hand-written `Brief` has no `proposal` field yet and there is no
-`BriefProposal` type (that file is stream L's). Until it does, reading `brief.proposal` is not
-type-safe without a local duplicate of the type, which the data README asks features not to keep
-("ask stream L for the key... or note the gap in your report" — see this brief's report). Once it
-lands, switch to reading it directly and make "Keep current" a `PUT` of the current text.
+`WhereItStands` reads the back office's pending proposal straight off `brief.proposal` (a
+`BriefProposal`: `{ text, next?, receipts, at }`, from `apps/ui/src/data/types.ts`) — it no longer
+scans activity for it. `useBrief`'s `brief` only carries a `proposal` when there is one in force to
+attach it to (api-v1.md: "A target with a proposal but no brief in force yet is not listed").
+
+Accept and "Keep current" are both a `PUT /v1/briefs/{kind}/{id}` (`useAcceptBrief`/`useSaveBrief`
+in `data.ts`, wrapping stream L's `api.acceptBrief`/`api.editBrief`):
+- **Accept** sends the proposal's own `text` and `next`. The hub recognizes a `PUT` that matches the
+  pending proposal exactly (a missing `next` only matches a missing `next`), copies its `receipts`,
+  and keeps `source: 'back_office'`.
+- **Keep current** sends the brief's own `text` and `next` unchanged. Even when the text happens to
+  match the proposal's (as in the mock's PAP fixture) but the `next` doesn't, the hub treats it as
+  the person's own edit: `source: 'person'`, no receipts. Either way the brief accepted is newer
+  than the proposal, so nothing is pending afterward — no local "set aside" state needed.
 
 ## How moves work
 
@@ -93,4 +99,7 @@ hub does not have yet. `tests/routes.test.tsx` wires `feature` into the real she
 workstream → task with the paths `src/shell/paths.ts` promises, and that a task page reproduces
 from its URL alone. `tests/activity.test.tsx` fakes the real hub's `400 invalid` on a
 project/workstream-filtered `GET /v1/events` (the mock accepts them) and checks `ActivityFeed`
-shows a note instead of an error, with task/session activity unaffected.
+shows a note instead of an error, with task/session activity unaffected. `tests/where-it-stands.
+test.tsx`'s proposal tests use the mock's demo data (the PAP project brief has a pending proposal)
+for Accept and Keep current; a `next` step on the proposal itself is injected at the `fetch` layer
+(`withProposedNext`) since that fixture's own proposal has none.
