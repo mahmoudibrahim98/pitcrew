@@ -1,5 +1,6 @@
 {
-  // Config files, Vitest tests and Playwright specs. Tests import the mock hub's sources directly.
+  // Config files, Vitest tests (in tests/ and next to the code) and Playwright specs. Tests import
+  // the mock hub's sources and tests/hub-process.ts, which need Node's types.
   "compilerOptions": {
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
     "target": "es2023",
@@ -22,5 +23,15 @@
     "moduleDetection": "force",
     "skipLibCheck": true
   },
-  "include": ["vite.config.ts", "vitest.config.ts", "playwright.config.ts", "tests", "e2e"]
+  "include": [
+    "vite.config.ts",
+    "vitest.config.ts",
+    "playwright.config.ts",
+    "tests",
+    "e2e",
+    "src/**/*.test.ts",
+    "src/**/*.test.tsx",
+    "src/**/tests/**/*.ts",
+    "src/**/tests/**/*.tsx"
+  ]
 }
