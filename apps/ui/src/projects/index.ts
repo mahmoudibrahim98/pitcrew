@@ -1,8 +1,13 @@
-// Stream N's public surface: the projects layout's components. They are lazy, so the projects code
-// loads only when one is shown; render them inside <Suspense>. Routes come with the next brief,
-// once the shell's feature registration exists (see README.md).
+// Stream N's public surface: the Projects layout feature, and its components. The components are
+// lazy, so the projects code loads only when one is shown; render them inside <Suspense>.
+//
+// `feature` is still stream L's stub (the shell's registration interface is in
+// src/shell/README.md); the routes that use these components come with the next N brief.
 
 import { lazy } from 'react';
+import { defineFeature } from '../shell/index.ts';
+
+export const feature = defineFeature({ id: 'projects', layout: 'projects' });
 
 export const Home = lazy(() => import('./home.tsx').then((m) => ({ default: m.Home })));
 export const Inbox = lazy(() => import('./inbox.tsx').then((m) => ({ default: m.Inbox })));

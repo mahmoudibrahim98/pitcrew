@@ -8,6 +8,8 @@ export const keys = {
   workspace: ['workspace'] as const,
   machines: ['machines'] as const,
   members: ['members'] as const,
+  personas: ['personas'] as const,
+  teams: ['teams'] as const,
   events: ['events'] as const,
   briefs: ['briefs'] as const,
   dispatches: ['dispatches'] as const,

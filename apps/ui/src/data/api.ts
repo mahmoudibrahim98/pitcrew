@@ -3,16 +3,35 @@
 import type {
   ApiErrorBody,
   Ask,
+  AskAnswer,
   AskFilters,
+  Brief,
+  BriefEdit,
+  BriefTarget,
+  Dispatch,
+  DispatchRequest,
+  EndMode,
   ErrorCode,
+  Event,
+  EventsPage,
+  EventsQuery,
+  Key,
   Machine,
   Member,
+  MemberId,
+  NewComment,
+  NewTask,
+  Persona,
   Project,
   Session,
   SessionFilters,
+  Subtask,
   Task,
   TaskFilters,
   TaskStatus,
+  Team,
+  TranscriptPage,
+  TranscriptQuery,
   Workspace,
   Workstream,
 } from './types.ts';
@@ -144,6 +163,12 @@ export function createApi(options: ApiOptions) {
   const get = <T>(path: string, query?: Query, signal?: AbortSignal) =>
     request<T>('GET', path, query === undefined ? { signal } : { query, signal });
   const id = encodeURIComponent;
+  const number = (value: number | undefined) => (value === undefined ? undefined : String(value));
+
+  const briefs = (signal?: AbortSignal) => get<Brief[]>('/v1/briefs', undefined, signal);
+  /** Also accepts a back-office proposal, and pins or unpins: every person's change is an edit. */
+  const editBrief = (target: BriefTarget, edit: BriefEdit) =>
+    request<Brief>('PUT', `/v1/briefs/${target.kind}/${id(target.id)}`, { body: edit });
 
   return {
     baseUrl,
@@ -153,6 +178,8 @@ export function createApi(options: ApiOptions) {
       get<{ workspace: Workspace; rev: number }>('/v1/workspace', undefined, signal),
     machines: (signal?: AbortSignal) => get<Machine[]>('/v1/machines', undefined, signal),
     members: (signal?: AbortSignal) => get<Member[]>('/v1/members', undefined, signal),
+    personas: (signal?: AbortSignal) => get<Persona[]>('/v1/personas', undefined, signal),
+    teams: (signal?: AbortSignal) => get<Team[]>('/v1/teams', undefined, signal),
     projects: (signal?: AbortSignal) => get<Project[]>('/v1/projects', undefined, signal),
     project: (project: string, signal?: AbortSignal) =>
       get<Project>(`/v1/projects/${id(project)}`, undefined, signal),
@@ -170,8 +197,77 @@ export function createApi(options: ApiOptions) {
       get<Session[]>('/v1/sessions', { ...filters }, signal),
     session: (session: string, signal?: AbortSignal) =>
       get<Session>(`/v1/sessions/${id(session)}`, undefined, signal),
+    /** The newest page without `before`; with it, the page ending before that byte offset. */
+    transcript: (session: string, page: TranscriptQuery = {}, signal?: AbortSignal) =>
+      get<TranscriptPage>(
+        `/v1/sessions/${id(session)}/transcript`,
+        { before: number(page.before), limit: number(page.limit) },
+        signal,
+      ),
+    /** Types the text and presses Enter. 503 when the machine is unreachable. */
+    send: (session: string, text: string) =>
+      request<undefined>('POST', `/v1/sessions/${id(session)}/send`, { body: { text } }),
+    keys: (session: string, keys: readonly Key[]) =>
+      request<undefined>('POST', `/v1/sessions/${id(session)}/keys`, { body: { keys } }),
+    interrupt: (session: string) => request<undefined>('POST', `/v1/sessions/${id(session)}/interrupt`),
+    /** `session_ended` follows once it has ended. */
+    end: (session: string, mode: EndMode) =>
+      request<undefined>('POST', `/v1/sessions/${id(session)}/end`, { body: { mode } }),
     asks: (filters: AskFilters = {}, signal?: AbortSignal) =>
       get<Ask[]>('/v1/asks', { ...filters }, signal),
+
+    // ─── Writes. They do not touch the cache: the event each one emits does. ───────────────────
+
+    createTask: (task: NewTask) => request<Task>('POST', '/v1/tasks', { body: task }),
+    /** `null` unassigns. */
+    assignTask: (task: string, assignee: MemberId | null) =>
+      request<Task>('POST', `/v1/tasks/${id(task)}/assign`, { body: { assignee } }),
+    /** A device token replaces the whole list; an agent's replaces only its own plan lines. */
+    replaceSubtasks: (task: string, subtasks: Subtask[]) =>
+      request<Task>('PUT', `/v1/tasks/${id(task)}/subtasks`, { body: subtasks }),
+    /** Answers 201 with the `comment_posted` event. */
+    comment: (task: string, comment: NewComment) =>
+      request<Event>('POST', `/v1/tasks/${id(task)}/comments`, { body: comment }),
+    /** 409 for a done or canceled task. Assigns an unassigned task to the agent. */
+    dispatchTask: (task: string, dispatch: DispatchRequest) =>
+      request<Dispatch>('POST', `/v1/tasks/${id(task)}/dispatch`, { body: dispatch }),
+    answerAsk: (ask: string, answer: AskAnswer) =>
+      request<Ask>('POST', `/v1/asks/${id(ask)}/answer`, { body: answer }),
+
+    // ─── Briefs ("Where it stands") ─────────────────────────────────────────────────────────────
+
+    briefs,
+    /** The brief in force for a project or workstream, if any. There is no single-brief route. */
+    brief: async (target: BriefTarget, signal?: AbortSignal) =>
+      (await briefs(signal)).find((b) => b.target.kind === target.kind && b.target.id === target.id),
+    editBrief,
+    /** Pins or unpins, keeping the text. */
+    pinBrief: (brief: Brief, pinned: boolean) =>
+      editBrief(brief.target, {
+        text: brief.text,
+        pinned,
+        ...(brief.next === undefined ? {} : { next: brief.next }),
+      }),
+    /** Makes a back-office proposal (`brief_proposed`) the brief in force. */
+    acceptBrief: (target: BriefTarget, proposal: { text: string; next?: string }, pinned: boolean) =>
+      editBrief(target, { ...proposal, pinned }),
+
+    // ─── Activity ───────────────────────────────────────────────────────────────────────────────
+
+    /** One page of `GET /v1/events` (see `EventsPage` for how to page). */
+    events: (query: EventsQuery = {}, signal?: AbortSignal) =>
+      get<EventsPage>(
+        '/v1/events',
+        {
+          project: query.project,
+          workstream: query.workstream,
+          task: query.task,
+          session: query.session,
+          before: number(query.before),
+          limit: number(query.limit),
+        },
+        signal,
+      ),
   };
 }
 
