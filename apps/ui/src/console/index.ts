@@ -1,8 +1,12 @@
 // The Agent console's public surface. Importing this file loads no console code: each component
 // is a lazy chunk fetched on first render (render them inside a <Suspense>), and markdown and
-// diff parsing run in their own worker chunk. Stream L's shell adds this folder's `feature` here.
+// diff parsing run in their own worker chunk. `feature` registers the console with the shell (its
+// interface is in src/shell/README.md); stream M's wiring brief fills it in.
 
 import { lazy } from 'react';
+import { defineFeature } from '../shell/index.ts';
+
+export const feature = defineFeature({ id: 'console', layout: 'console' });
 
 export const SessionList = lazy(() => import('./session-list.tsx').then((m) => ({ default: m.SessionList })));
 export const SessionListView = lazy(() =>

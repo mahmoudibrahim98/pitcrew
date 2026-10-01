@@ -6,3 +6,4 @@ export { keys } from './keys.ts';
 export { createQueryClient, DataProvider, useApi, useConnection, useLiveQuery } from './provider.tsx';
 export type { StreamStatus } from './stream.ts';
 export type * from './types.ts';
+export { TRANSCRIPT_KINDS } from './types.ts';
