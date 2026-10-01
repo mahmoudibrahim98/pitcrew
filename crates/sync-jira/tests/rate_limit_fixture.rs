@@ -4,9 +4,9 @@
 
 mod support;
 
+use pitcrew_sync_github::fixture::ReplayTransport;
 use pitcrew_sync_jira::deployment::JiraCloud;
 use pitcrew_sync_jira::{SyncConfig, SyncState};
-use pitcrew_sync_github::fixture::ReplayTransport;
 use support::*;
 
 fn config(projects: Vec<&str>) -> SyncConfig {
@@ -33,15 +33,30 @@ async fn a_429_with_retry_after_stops_the_sync_without_sleeping() {
 
     let transport = ReplayTransport::from_exchanges(vec![
         myself_exchange(CLOUD_API_BASE, "UTC"),
-        exchange(&url, 429, vec![("Retry-After", "45")], serde_json::json!({})),
+        exchange(
+            &url,
+            429,
+            vec![("Retry-After", "45")],
+            serde_json::json!({}),
+        ),
     ]);
 
-    let outcome = pitcrew_sync_jira::sync::sync(SyncState::new(), &transport, &JiraCloud, &config(vec!["DEMO", "OTHER"])).await;
+    let outcome = pitcrew_sync_jira::sync::sync(
+        SyncState::new(),
+        &transport,
+        &JiraCloud,
+        &config(vec!["DEMO", "OTHER"]),
+    )
+    .await;
 
     let rl = outcome.rate_limited.expect("rate limited");
     assert_eq!(rl.until, 2_000_000_045);
     assert!(outcome.changes.is_empty());
-    assert!(outcome.errors.is_empty(), "a rate limit is not an error: {:?}", outcome.errors);
+    assert!(
+        outcome.errors.is_empty(),
+        "a rate limit is not an error: {:?}",
+        outcome.errors
+    );
     assert_eq!(
         transport.remaining(),
         0,

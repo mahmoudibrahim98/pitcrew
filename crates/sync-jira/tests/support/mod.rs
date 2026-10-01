@@ -74,7 +74,12 @@ pub fn ok(url: &str, body: Value) -> RecordedExchange {
     exchange(url, 200, vec![], body)
 }
 
-pub fn exchange(url: &str, status: u16, headers: Vec<(&str, &str)>, body: Value) -> RecordedExchange {
+pub fn exchange(
+    url: &str,
+    status: u16,
+    headers: Vec<(&str, &str)>,
+    body: Value,
+) -> RecordedExchange {
     RecordedExchange {
         method: "GET".to_string(),
         url: url.to_string(),
@@ -116,7 +121,13 @@ pub fn issue_json(key: &str, summary: &str, category: &str, updated: &str) -> Va
 
 /// An issue with a description (plain text, as Data Center — and a hand-built ADF object —
 /// Cloud — both send it).
-pub fn issue_with_description(key: &str, summary: &str, category: &str, updated: &str, description: Value) -> Value {
+pub fn issue_with_description(
+    key: &str,
+    summary: &str,
+    category: &str,
+    updated: &str,
+    description: Value,
+) -> Value {
     let mut v = issue_json(key, summary, category, updated);
     v["fields"]["description"] = description;
     v

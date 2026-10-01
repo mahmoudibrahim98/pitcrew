@@ -53,9 +53,9 @@ impl fmt::Display for ProjectRef {
 #[must_use]
 pub fn incremental_query(project: &ProjectRef, cursor: Option<&str>) -> String {
     match cursor {
-        Some(cursor) => format!(
-            "project in (\"{project}\") AND updated >= \"{cursor}\" ORDER BY updated ASC"
-        ),
+        Some(cursor) => {
+            format!("project in (\"{project}\") AND updated >= \"{cursor}\" ORDER BY updated ASC")
+        }
         None => format!("project in (\"{project}\") ORDER BY updated ASC"),
     }
 }

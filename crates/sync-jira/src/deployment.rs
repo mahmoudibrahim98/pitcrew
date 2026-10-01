@@ -57,7 +57,10 @@ pub trait Deployment {
     /// this was the last page). `Err` means the page itself did not parse as this deployment's
     /// search-response shape at all (not an individual malformed issue within it, which
     /// `crate::client::JiraClient::search` handles item-by-item).
-    fn parse_search_page(&self, body: &[u8]) -> Result<(Vec<Value>, Option<PageState>), serde_json::Error>;
+    fn parse_search_page(
+        &self,
+        body: &[u8],
+    ) -> Result<(Vec<Value>, Option<PageState>), serde_json::Error>;
 }
 
 fn percent_encode(s: &str) -> String {
@@ -126,7 +129,10 @@ impl Deployment for JiraCloud {
         get_request(api_base, "/search/jql", auth, &params)
     }
 
-    fn parse_search_page(&self, body: &[u8]) -> Result<(Vec<Value>, Option<PageState>), serde_json::Error> {
+    fn parse_search_page(
+        &self,
+        body: &[u8],
+    ) -> Result<(Vec<Value>, Option<PageState>), serde_json::Error> {
         let page: crate::wire::CloudSearchPage = serde_json::from_slice(body)?;
         let next = page.next_page_token.map(|token| PageState::Cloud {
             next_page_token: Some(token),
@@ -166,7 +172,10 @@ impl Deployment for JiraDataCenter {
         get_request(api_base, "/search", auth, &params)
     }
 
-    fn parse_search_page(&self, body: &[u8]) -> Result<(Vec<Value>, Option<PageState>), serde_json::Error> {
+    fn parse_search_page(
+        &self,
+        body: &[u8],
+    ) -> Result<(Vec<Value>, Option<PageState>), serde_json::Error> {
         let page: crate::wire::DataCenterSearchPage = serde_json::from_slice(body)?;
         let fetched_so_far = page.start_at + page.issues.len() as u64;
         let next = (fetched_so_far < page.total).then_some(PageState::DataCenter {
@@ -206,7 +215,11 @@ mod tests {
             &JiraCloud.first_page(),
         );
         assert!(!request.url.contains("nextPageToken"));
-        assert!(request.url.starts_with("https://jira.example.com/rest/api/3/search/jql?"));
+        assert!(
+            request
+                .url
+                .starts_with("https://jira.example.com/rest/api/3/search/jql?")
+        );
     }
 
     #[test]
@@ -290,11 +303,8 @@ mod tests {
             &JiraCloud.first_page(),
         );
         assert!(!request.url.contains("pat-test-not-real"));
-        assert!(
-            request
-                .headers
-                .iter()
-                .any(|(k, v)| k.eq_ignore_ascii_case("authorization") && v.contains("pat-test-not-real"))
-        );
+        assert!(request.headers.iter().any(
+            |(k, v)| k.eq_ignore_ascii_case("authorization") && v.contains("pat-test-not-real")
+        ));
     }
 }

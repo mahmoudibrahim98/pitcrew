@@ -162,7 +162,10 @@ mod tests {
             "customfield_10008": "DEMO-9",
         }))
         .expect("parses");
-        assert_eq!(fields.epic_key(Some("customfield_10008")).as_deref(), Some("DEMO-1"));
+        assert_eq!(
+            fields.epic_key(Some("customfield_10008")).as_deref(),
+            Some("DEMO-1")
+        );
     }
 
     #[test]
@@ -175,7 +178,10 @@ mod tests {
             "customfield_10008": "DEMO-9",
         }))
         .expect("parses");
-        assert_eq!(fields.epic_key(Some("customfield_10008")).as_deref(), Some("DEMO-9"));
+        assert_eq!(
+            fields.epic_key(Some("customfield_10008")).as_deref(),
+            Some("DEMO-9")
+        );
         assert_eq!(fields.epic_key(None), None);
     }
 

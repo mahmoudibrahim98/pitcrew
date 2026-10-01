@@ -310,7 +310,15 @@ mod tests {
 
     #[test]
     fn a_malformed_issue_timestamp_is_skipped_entirely() {
-        assert!(diff_issue("https://jira.example.com", &issue("not-a-timestamp", "new"), None, None).is_none());
+        assert!(
+            diff_issue(
+                "https://jira.example.com",
+                &issue("not-a-timestamp", "new"),
+                None,
+                None
+            )
+            .is_none()
+        );
     }
 
     #[test]

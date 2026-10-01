@@ -32,7 +32,12 @@ const BASE_FIELDS: &[&str] = &[
 /// clock itself.
 #[derive(Debug)]
 pub struct SyncConfig {
-    /// Projects to sync, in order.
+    /// Projects to sync, in order. Each gets its own JQL query (`project in ("<key>") AND
+    /// updated >= …`, the shape the brief asks for — a one-element `in (...)`) and its own
+    /// cursor/snapshots in [`SyncState`], rather than one query spanning every project: a project
+    /// added later starts its own first full sync without disturbing the others' cursors, and the
+    /// per-project resource/error reporting (see [`SyncIssue::project`]) stays precise. This
+    /// mirrors `pitcrew_sync_github::SyncConfig::repos`'s per-repository shape.
     pub projects: Vec<ProjectRef>,
     /// Credentials: `JiraAuth::Basic` for Cloud, `JiraAuth::Bearer` for Data Center.
     pub auth: JiraAuth,
@@ -150,7 +155,14 @@ async fn sync_with_limits<T: Transport, D: Deployment>(
         let jql = incremental_query(project, cursor);
 
         let result = client
-            .search(deployment, &jql, &fields, config.now_unix, &mut attempts, limits)
+            .search(
+                deployment,
+                &jql,
+                &fields,
+                config.now_unix,
+                &mut attempts,
+                limits,
+            )
             .await;
         project_state.secondary_backoff_attempts = attempts;
 
@@ -173,16 +185,25 @@ async fn sync_with_limits<T: Transport, D: Deployment>(
                         match diff_epic(&config.site_base, issue, previous) {
                             Some((mut found, snapshot)) => {
                                 changes.append(&mut found);
-                                project_state.epic_snapshots.insert(issue.key.clone(), snapshot);
+                                project_state
+                                    .epic_snapshots
+                                    .insert(issue.key.clone(), snapshot);
                             }
                             None => malformed_skipped += 1,
                         }
                     } else {
                         let previous = project_state.issue_snapshots.get(&issue.key);
-                        match diff_issue(&config.site_base, issue, previous, config.epic_link_field.as_deref()) {
+                        match diff_issue(
+                            &config.site_base,
+                            issue,
+                            previous,
+                            config.epic_link_field.as_deref(),
+                        ) {
                             Some((mut found, snapshot)) => {
                                 changes.append(&mut found);
-                                project_state.issue_snapshots.insert(issue.key.clone(), snapshot);
+                                project_state
+                                    .issue_snapshots
+                                    .insert(issue.key.clone(), snapshot);
                             }
                             None => malformed_skipped += 1,
                         }
@@ -196,7 +217,11 @@ async fn sync_with_limits<T: Transport, D: Deployment>(
                 // `>=` the *old* cursor and so still matched by this same JQL next time. A cap
                 // cutting the walk short just means next call repeats the same query from the
                 // (now slightly advanced) cursor instead of resuming mid-walk; nothing is skipped.
-                if let Some(minute) = search_result.max_updated.as_ref().and_then(JiraTimestamp::to_jql_minute) {
+                if let Some(minute) = search_result
+                    .max_updated
+                    .as_ref()
+                    .and_then(JiraTimestamp::to_jql_minute)
+                {
                     let candidate = JiraTimestamp::new(minute);
                     if project_state.cursor.as_ref().is_none_or(|c| candidate > *c) {
                         project_state.cursor = Some(candidate);
@@ -219,7 +244,9 @@ async fn sync_with_limits<T: Transport, D: Deployment>(
 /// Validates a batch of raw project keys, for callers building a [`SyncConfig`] from
 /// configuration. Not used by `sync` itself (which only ever sees already-valid [`ProjectRef`]s);
 /// a convenience for callers.
-pub fn validate_projects(keys: impl IntoIterator<Item = impl Into<String>>) -> Result<Vec<ProjectRef>, InvalidProjectRef> {
+pub fn validate_projects(
+    keys: impl IntoIterator<Item = impl Into<String>>,
+) -> Result<Vec<ProjectRef>, InvalidProjectRef> {
     keys.into_iter().map(ProjectRef::new).collect()
 }
 
@@ -270,8 +297,15 @@ mod tests {
     #[tokio::test]
     async fn myself_is_read_once_and_then_cached() {
         let search_url = "https://jira.example.com/rest/api/3/search/jql?jql=project%20in%20%28%22DEMO%22%29%20ORDER%20BY%20updated%20ASC&maxResults=100&fields=summary%2Cdescription%2Cstatus%2Cresolution%2Clabels%2Cassignee%2Cparent%2Cissuetype%2Cupdated";
-        let transport = ReplayTransport::from_exchanges(vec![myself_exchange(), empty_search(search_url)]);
-        let outcome = sync(SyncState::new(), &transport, &JiraCloud, &config(vec!["DEMO"])).await;
+        let transport =
+            ReplayTransport::from_exchanges(vec![myself_exchange(), empty_search(search_url)]);
+        let outcome = sync(
+            SyncState::new(),
+            &transport,
+            &JiraCloud,
+            &config(vec!["DEMO"]),
+        )
+        .await;
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert_eq!(outcome.state.timezone.as_deref(), Some("UTC"));
         assert_eq!(transport.remaining(), 0);
@@ -279,7 +313,13 @@ mod tests {
         // Second call: no /myself fixture provided, so if the client tried to re-read it, the
         // transport would error on an unmatched request.
         let transport2 = ReplayTransport::from_exchanges(vec![empty_search(search_url)]);
-        let outcome2 = sync(outcome.state, &transport2, &JiraCloud, &config(vec!["DEMO"])).await;
+        let outcome2 = sync(
+            outcome.state,
+            &transport2,
+            &JiraCloud,
+            &config(vec!["DEMO"]),
+        )
+        .await;
         assert!(outcome2.errors.is_empty(), "{:?}", outcome2.errors);
         assert_eq!(transport2.remaining(), 0);
     }

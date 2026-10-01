@@ -28,7 +28,10 @@ pub fn adf_to_text(node: &Value) -> String {
 }
 
 fn walk(node: &Value, depth: usize, nodes_visited: &mut usize, out: &mut String) {
-    if depth > MAX_ADF_DEPTH || *nodes_visited >= MAX_ADF_NODES || out.chars().count() >= MAX_BODY_CHARS {
+    if depth > MAX_ADF_DEPTH
+        || *nodes_visited >= MAX_ADF_NODES
+        || out.chars().count() >= MAX_BODY_CHARS
+    {
         return;
     }
     *nodes_visited += 1;
@@ -65,7 +68,11 @@ fn walk(node: &Value, depth: usize, nodes_visited: &mut usize, out: &mut String)
         "inlineCard" | "blockCard" | "embedCard" => {
             // A link card with no visible text of its own: show the bare URL as literal text, not
             // as something to open or follow.
-            if let Some(url) = obj.get("attrs").and_then(|a| a.get("url")).and_then(Value::as_str) {
+            if let Some(url) = obj
+                .get("attrs")
+                .and_then(|a| a.get("url"))
+                .and_then(Value::as_str)
+            {
                 out.push_str(url);
             }
         }

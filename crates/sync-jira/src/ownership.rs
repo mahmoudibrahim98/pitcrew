@@ -45,8 +45,9 @@ pub const ISSUE_FIELD_OWNERSHIP: &[FieldOwnership] = &[
         owner: FieldOwner::Mirrored,
         note: "Moved only through TaskStatus::can_move(.., Mover::Sync): an upstream move into \
                the `done` status category proposes `done`; a move back out of `done` proposes \
-               `todo` only for a task sync had previously moved to `done`. In-progress work is \
-               never touched. A disallowed move raises a conflict ask instead of being dropped.",
+               `todo`, but only when the task's current status on the hub is already `done` \
+               (nothing to reopen otherwise). In-progress work is never touched. A disallowed \
+               move raises a conflict ask instead of being dropped.",
     },
     FieldOwnership {
         field: "assignee",
@@ -146,45 +147,53 @@ pub fn plan(change: &UpstreamChange, current: Option<&Task>) -> Vec<Intent> {
             }],
         },
 
-        IssueRetitled { source, title, .. } => update_or_conflict(current, source, "retitled an issue", |task| {
-            Intent::UpdateOwnedFields {
-                task,
-                title: Some(title.clone()),
-                body: None,
-                labels: None,
-                milestone: None,
-            }
-        }),
+        IssueRetitled { source, title, .. } => {
+            update_or_conflict(current, source, "retitled an issue", |task| {
+                Intent::UpdateOwnedFields {
+                    task,
+                    title: Some(title.clone()),
+                    body: None,
+                    labels: None,
+                    milestone: None,
+                }
+            })
+        }
 
-        IssueBodyEdited { source, body, .. } => update_or_conflict(current, source, "edited an issue's description", |task| {
-            Intent::UpdateOwnedFields {
-                task,
-                title: None,
-                body: Some(body.clone()),
-                labels: None,
-                milestone: None,
-            }
-        }),
+        IssueBodyEdited { source, body, .. } => {
+            update_or_conflict(current, source, "edited an issue's description", |task| {
+                Intent::UpdateOwnedFields {
+                    task,
+                    title: None,
+                    body: Some(body.clone()),
+                    labels: None,
+                    milestone: None,
+                }
+            })
+        }
 
-        IssueRelabelled { source, labels, .. } => update_or_conflict(current, source, "relabelled an issue", |task| {
-            Intent::UpdateOwnedFields {
-                task,
-                title: None,
-                body: None,
-                labels: Some(labels.clone()),
-                milestone: None,
-            }
-        }),
+        IssueRelabelled { source, labels, .. } => {
+            update_or_conflict(current, source, "relabelled an issue", |task| {
+                Intent::UpdateOwnedFields {
+                    task,
+                    title: None,
+                    body: None,
+                    labels: Some(labels.clone()),
+                    milestone: None,
+                }
+            })
+        }
 
-        IssueReparented { source, epic, .. } => update_or_conflict(current, source, "changed an issue's epic", |task| {
-            Intent::UpdateOwnedFields {
-                task,
-                title: None,
-                body: None,
-                labels: None,
-                milestone: Some(epic.clone()),
-            }
-        }),
+        IssueReparented { source, epic, .. } => {
+            update_or_conflict(current, source, "changed an issue's epic", |task| {
+                Intent::UpdateOwnedFields {
+                    task,
+                    title: None,
+                    body: None,
+                    labels: None,
+                    milestone: Some(epic.clone()),
+                }
+            })
+        }
 
         // The hub owns the assignee (see ISSUE_FIELD_OWNERSHIP): this is recorded upstream for
         // visibility only, and intentionally produces no intent.
@@ -213,9 +222,12 @@ pub fn plan(change: &UpstreamChange, current: Option<&Task>) -> Vec<Intent> {
             // is not something sync mirrors at all — see ISSUE_FIELD_OWNERSHIP.
             crate::state::StatusCategory::New | crate::state::StatusCategory::Indeterminate => {
                 match current {
-                    Some(t) if t.status == TaskStatus::Done => {
-                        propose_move_or_conflict(current, source, TaskStatus::Todo, "moved out of a done status")
-                    }
+                    Some(t) if t.status == TaskStatus::Done => propose_move_or_conflict(
+                        current,
+                        source,
+                        TaskStatus::Todo,
+                        "moved out of a done status",
+                    ),
                     _ => vec![],
                 }
             }
@@ -278,8 +290,14 @@ mod tests {
             resolution: Some("Done".into()),
         };
         let intents = plan(&change, Some(&t));
-        assert!(!intents.iter().any(|i| matches!(i, Intent::ProposeMove { .. })));
-        assert!(matches!(intents.as_slice(), [Intent::ConflictAsk { task: Some(id), .. }] if *id == t.id));
+        assert!(
+            !intents
+                .iter()
+                .any(|i| matches!(i, Intent::ProposeMove { .. }))
+        );
+        assert!(
+            matches!(intents.as_slice(), [Intent::ConflictAsk { task: Some(id), .. }] if *id == t.id)
+        );
     }
 
     #[test]

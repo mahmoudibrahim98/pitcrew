@@ -68,16 +68,29 @@ struct Parts<'a> {
 /// here, and the zone is a signed numeric offset rather than a fixed literal.
 fn parse(s: &str) -> Option<Parts<'_>> {
     let b = s.as_bytes();
-    let digits = |from: usize, n: usize| b.get(from..from + n).is_some_and(|d| d.iter().all(u8::is_ascii_digit));
+    let digits = |from: usize, n: usize| {
+        b.get(from..from + n)
+            .is_some_and(|d| d.iter().all(u8::is_ascii_digit))
+    };
     // "YYYY-MM-DD"
-    if !(digits(0, 4) && b.get(4) == Some(&b'-') && digits(5, 2) && b.get(7) == Some(&b'-') && digits(8, 2)) {
+    if !(digits(0, 4)
+        && b.get(4) == Some(&b'-')
+        && digits(5, 2)
+        && b.get(7) == Some(&b'-')
+        && digits(8, 2))
+    {
         return None;
     }
     if b.get(10) != Some(&b'T') {
         return None;
     }
     // "HH:MM:SS"
-    if !(digits(11, 2) && b.get(13) == Some(&b':') && digits(14, 2) && b.get(16) == Some(&b':') && digits(17, 2)) {
+    if !(digits(11, 2)
+        && b.get(13) == Some(&b':')
+        && digits(14, 2)
+        && b.get(16) == Some(&b':')
+        && digits(17, 2))
+    {
         return None;
     }
     let mut i = 19;

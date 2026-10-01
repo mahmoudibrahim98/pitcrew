@@ -4,9 +4,9 @@
 
 mod support;
 
+use pitcrew_sync_github::fixture::ReplayTransport;
 use pitcrew_sync_jira::deployment::JiraCloud;
 use pitcrew_sync_jira::{SyncConfig, SyncState, UpstreamChange};
-use pitcrew_sync_github::fixture::ReplayTransport;
 use support::*;
 
 fn config() -> SyncConfig {
@@ -46,10 +46,14 @@ async fn a_malformed_issue_is_skipped_and_a_huge_adf_description_is_capped() {
 
     let transport = ReplayTransport::from_exchanges(vec![
         myself_exchange(CLOUD_API_BASE, "UTC"),
-        ok(&url, cloud_page(issues.as_array().expect("array").clone(), None)),
+        ok(
+            &url,
+            cloud_page(issues.as_array().expect("array").clone(), None),
+        ),
     ]);
 
-    let outcome = pitcrew_sync_jira::sync::sync(SyncState::new(), &transport, &JiraCloud, &config()).await;
+    let outcome =
+        pitcrew_sync_jira::sync::sync(SyncState::new(), &transport, &JiraCloud, &config()).await;
 
     assert!(outcome.rate_limited.is_none());
     assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
@@ -62,16 +66,28 @@ async fn a_malformed_issue_is_skipped_and_a_huge_adf_description_is_capped() {
         .changes
         .iter()
         .filter_map(|c| match c {
-            UpstreamChange::IssueCreated { source, body, .. } => Some((source.key.as_str(), body.as_str())),
+            UpstreamChange::IssueCreated { source, body, .. } => {
+                Some((source.key.as_str(), body.as_str()))
+            }
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(created.len(), 2, "the two malformed elements must not stop the valid ones");
+    assert_eq!(
+        created.len(),
+        2,
+        "the two malformed elements must not stop the valid ones"
+    );
 
-    let (_, normal_body) = created.iter().find(|(k, _)| *k == "DEMO-1").expect("DEMO-1");
+    let (_, normal_body) = created
+        .iter()
+        .find(|(k, _)| *k == "DEMO-1")
+        .expect("DEMO-1");
     assert_eq!(*normal_body, "");
 
-    let (_, huge_body) = created.iter().find(|(k, _)| *k == "DEMO-3").expect("DEMO-3");
+    let (_, huge_body) = created
+        .iter()
+        .find(|(k, _)| *k == "DEMO-3")
+        .expect("DEMO-3");
     assert_eq!(
         huge_body.chars().count(),
         pitcrew_sync_jira::bounds::MAX_BODY_CHARS,

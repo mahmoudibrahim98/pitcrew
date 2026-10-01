@@ -124,8 +124,8 @@ impl<'t, T: Transport> JiraClient<'t, T> {
                 status: response.status,
             });
         }
-        let myself: crate::wire::WireMyself =
-            serde_json::from_slice(&response.body).unwrap_or(crate::wire::WireMyself { time_zone: None });
+        let myself: crate::wire::WireMyself = serde_json::from_slice(&response.body)
+            .unwrap_or(crate::wire::WireMyself { time_zone: None });
         Ok(myself.time_zone)
     }
 
@@ -152,7 +152,8 @@ impl<'t, T: Transport> JiraClient<'t, T> {
         let mut seen_this_call: HashSet<(String, String)> = HashSet::new();
 
         for _ in 0..limits.max_pages {
-            let request = deployment.build_search_request(&self.api_base, &self.auth, jql, fields, &page);
+            let request =
+                deployment.build_search_request(&self.api_base, &self.auth, jql, fields, &page);
             let url = request.url.clone();
             let response = self.transport.send(request).await?;
 
@@ -201,7 +202,8 @@ impl<'t, T: Transport> JiraClient<'t, T> {
                         // Dedupe by issue id plus `updated`, as the brief asks: offset-based
                         // pagination (Data Center) can repeat a row when an item is updated
                         // concurrently with the walk shifting it across a page boundary.
-                        if !seen_this_call.insert((issue.id.clone(), issue.fields.updated.clone())) {
+                        if !seen_this_call.insert((issue.id.clone(), issue.fields.updated.clone()))
+                        {
                             continue;
                         }
                         let ts = JiraTimestamp::new(&issue.fields.updated);
@@ -239,7 +241,12 @@ mod tests {
     use crate::deployment::JiraCloud;
     use pitcrew_sync_github::fixture::{RecordedExchange, ReplayTransport};
 
-    fn exchange(url: &str, status: u16, headers: Vec<(&str, &str)>, body: &str) -> RecordedExchange {
+    fn exchange(
+        url: &str,
+        status: u16,
+        headers: Vec<(&str, &str)>,
+        body: &str,
+    ) -> RecordedExchange {
         RecordedExchange {
             method: "GET".to_string(),
             url: url.to_string(),
@@ -366,12 +373,8 @@ mod tests {
             ],
             "nextPageToken": "page2",
         });
-        let transport = ReplayTransport::from_exchanges(vec![exchange(
-            url,
-            200,
-            vec![],
-            &body.to_string(),
-        )]);
+        let transport =
+            ReplayTransport::from_exchanges(vec![exchange(url, 200, vec![], &body.to_string())]);
         let c = client(&transport);
         let mut attempts = 0u32;
         let limits = Limits {
@@ -393,6 +396,10 @@ mod tests {
             panic!("expected Ok");
         };
         assert_eq!(result.items.len(), 1, "stopped right at the item cap");
-        assert_eq!(transport.remaining(), 0, "the second page was never requested");
+        assert_eq!(
+            transport.remaining(),
+            0,
+            "the second page was never requested"
+        );
     }
 }
