@@ -8,9 +8,13 @@
 //!   `gateway://workspaces` in the app.
 //! - On first start the list is empty until the local daemon answers `GET /v1/workspace`; then
 //!   the local workspace is registered with its id and name.
-//! - Remote workspaces come with pairing: `kind` and [`Connection`] leave room for them.
+//! - A remote workspace ([`Connection::Remote`]) keeps how to reach its machine: the host, the
+//!   launcher, the helper's root and platform, for SLURM the site recipe, the job options and the
+//!   last hop, and the transport the tunnel found worth remembering. No secret: its device token
+//!   is in the OS keychain ([`crate::keychain`]).
 
 use crate::gateway::{Connector, GatewayError};
+use pitcrew_remote::Transport;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io::{self, Write as _};
@@ -30,7 +34,7 @@ const MAX_FILE: u64 = 4 * 1024 * 1024;
 pub enum WorkspaceKind {
     /// On this machine.
     Local,
-    /// Elsewhere, through an SSH tunnel (later).
+    /// On another machine, through an SSH tunnel.
     Remote,
 }
 
@@ -41,8 +45,97 @@ pub enum Connection {
     /// The person's own `pitcrewd` on this machine, over its private socket or pipe, with the
     /// token from the file `pitcrewd token show-path` names.
     Local,
-    // Remote workspaces (an SSH tunnel to the daemon's socket, a token in the keychain) are added
-    // here with pairing.
+    /// A helper on another machine, through the tunnel of `pitcrew-remote`, with the token kept
+    /// in the OS keychain.
+    Remote(RemoteConnection),
+}
+
+/// How a remote workspace's helper was started, and so how it is found, checked and stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LauncherKind {
+    /// In the background (`setsid nohup`).
+    Direct,
+    /// In its own tmux session.
+    Tmux,
+    /// As a SLURM batch job on a compute node.
+    Slurm,
+}
+
+impl LauncherKind {
+    /// Its name, as the contract and `endpoint.json` write it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Tmux => "tmux",
+            Self::Slurm => "slurm",
+        }
+    }
+}
+
+/// How the login node reaches a SLURM job's compute node (a site recipe's `last_hop`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HopKind {
+    /// `ssh <node>` from the login node.
+    #[default]
+    Ssh,
+    /// `srun --jobid <id> --overlap` from the login node.
+    Srun,
+}
+
+/// The job options the person asked for (the contract's `RemotePlanRequest.job`), as asked.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobRequest {
+    /// `--partition`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<String>,
+    /// `--account`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// `--qos`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qos: Option<String>,
+    /// `--time`, as SLURM writes it (`08:00:00`, `2-00:00:00`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<String>,
+    /// `--cpus-per-task`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<u32>,
+    /// `--mem`, e.g. `8G`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
+    /// GPUs for `--gres`: a count (`2`), or a type and count (`a100:2`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpus: Option<String>,
+}
+
+/// How to reach a remote workspace's helper. Nothing here is a secret.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteConnection {
+    /// The host, as given to ssh (a `Host` of the person's ssh config, or a name they typed).
+    pub host: String,
+    /// How the helper was started.
+    pub launcher: LauncherKind,
+    /// Where PitCrew lives on the machine (`~/.pitcrew`, absolute).
+    pub root: String,
+    /// The machine's platform, as `pitcrew_remote::Platform::target` names it.
+    pub platform: String,
+    /// The SLURM site recipe the job was made from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
+    /// The SLURM job options the person asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobRequest>,
+    /// How the login node reaches the job's node (SLURM).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_hop: Option<HopKind>,
+    /// The transport worth remembering for this machine (`pitcrew_remote::Connector::transport`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<Transport>,
 }
 
 /// A workspace as saved.
@@ -342,6 +435,73 @@ impl Registry {
             entry.detail = detail;
         }
         self.changed(inner, &before);
+    }
+
+    /// Workspace `id` as saved.
+    #[must_use]
+    pub fn record(&self, id: &str) -> Option<WorkspaceRecord> {
+        self.lock()
+            .entries
+            .iter()
+            .find(|e| e.record.id == id)
+            .map(|e| e.record.clone())
+    }
+
+    /// Every workspace as saved, in order.
+    #[must_use]
+    pub fn records(&self) -> Vec<WorkspaceRecord> {
+        self.lock()
+            .entries
+            .iter()
+            .map(|e| e.record.clone())
+            .collect()
+    }
+
+    /// Gives workspace `id` its connector (a remote workspace loaded from the file).
+    pub fn attach(&self, id: &str, connector: Arc<dyn Connector>) {
+        if let Some(entry) = self.lock().entries.iter_mut().find(|e| e.record.id == id) {
+            entry.connector = Some(connector);
+        }
+    }
+
+    /// Forgets workspace `id`, and returns what was saved for it.
+    ///
+    /// # Errors
+    /// The registry file cannot be written. The workspace is gone from memory anyway.
+    pub fn remove(&self, id: &str) -> io::Result<Option<WorkspaceRecord>> {
+        let mut inner = self.lock();
+        let before = list_of(&inner.entries);
+        let Some(at) = inner.entries.iter().position(|e| e.record.id == id) else {
+            return Ok(None);
+        };
+        let entry = inner.entries.remove(at);
+        let saved = self.save(&inner.entries);
+        self.changed(inner, &before);
+        saved.map(|()| Some(entry.record))
+    }
+
+    /// Remembers the transport the tunnel found for remote workspace `id`, if it changed.
+    ///
+    /// # Errors
+    /// The registry file cannot be written.
+    pub fn set_transport(&self, id: &str, transport: Transport) -> io::Result<()> {
+        let mut inner = self.lock();
+        let changed = inner
+            .entries
+            .iter_mut()
+            .find(|e| e.record.id == id)
+            .is_some_and(|entry| match &mut entry.record.connection {
+                Connection::Remote(remote) if remote.transport != Some(transport) => {
+                    remote.transport = Some(transport);
+                    true
+                }
+                _ => false,
+            });
+        if changed {
+            self.save(&inner.entries)
+        } else {
+            Ok(())
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {

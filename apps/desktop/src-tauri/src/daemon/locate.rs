@@ -65,6 +65,21 @@ pub fn locate(
     beside: Option<&Path>,
     path_var: Option<&OsStr>,
 ) -> Result<PathBuf, LocateError> {
+    locate_named(PITCREWD, configured, beside, path_var)
+}
+
+/// Finds the program `name` as [`locate`] finds `pitcrewd`, with the same checks: the configured
+/// path, then `name` next to the app, then (debug builds only, and only when `path_var` is given)
+/// `PATH`.
+///
+/// # Errors
+/// See [`LocateError`].
+pub fn locate_named(
+    name: &str,
+    configured: Option<&Path>,
+    beside: Option<&Path>,
+    path_var: Option<&OsStr>,
+) -> Result<PathBuf, LocateError> {
     if let Some(path) = configured {
         return if is_program(path) {
             trusted(path)
@@ -73,7 +88,7 @@ pub fn locate(
         };
     }
     if let Some(dir) = beside {
-        let path = dir.join(PITCREWD);
+        let path = dir.join(name);
         if is_program(&path) {
             return trusted(&path);
         }
@@ -82,13 +97,23 @@ pub fn locate(
         && let Some(var) = path_var
     {
         for dir in std::env::split_paths(var).filter(|d| d.is_absolute()) {
-            let path = dir.join(PITCREWD);
+            let path = dir.join(name);
             if is_program(&path) {
                 return trusted(&path);
             }
         }
     }
     Err(LocateError::NotFound)
+}
+
+/// Whether `path` (a file the app reads or runs) passes the checks in the module's docs: on Unix
+/// it, the file it resolves to and their directories belong to root or us and only we can write
+/// them.
+///
+/// # Errors
+/// Why it does not, for people.
+pub fn check_trusted(path: &Path) -> Result<(), String> {
+    check(path)
 }
 
 /// `path`, if it passes the checks in the module's docs.

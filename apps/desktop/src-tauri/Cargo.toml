@@ -25,6 +25,13 @@ path = "src/lib.rs"
 name = "pitcrew-desktop"
 path = "src/main.rs"
 
+[[test]]
+# Its own `main`: the test binary doubles as the fake `ssh` (with its machine, a ControlMaster
+# and forwards) and as `pitcrew-askpass`, which the remote-workspace cases drive.
+name = "remote"
+path = "tests/remote.rs"
+harness = false
+
 [features]
 # Serve the built UI (`apps/ui/dist`) from inside the app instead of the Vite dev server. Release
 # builds must turn it on (`--features custom-protocol`, as the Tauri CLI does); `src/app.rs`
@@ -66,6 +73,11 @@ tracing-log = { version = "0.2", default-features = false, features = ["log-trac
 directories = "6"
 # The OS keychain: Keychain Services, Windows Credential Manager, the Secret Service over zbus.
 keyring = "4.2"
+# Remote workspaces: probe, deploy, launchers, SLURM job scripts, the askpass bridge and the
+# tunnel's `Connector` (stream J), over the person's own OpenSSH.
+pitcrew-remote = { path = "../../../crates/remote" }
+# Random plan and prompt ids. The version pitcrew-remote already uses.
+getrandom = "0.3"
 
 [target.'cfg(unix)'.dependencies]
 # SIGTERM to the daemon, and O_NOFOLLOW for the token file, without unsafe code. The version
@@ -91,6 +103,8 @@ mac-notification-sys = "0.6"
 axum = { version = "0.8", features = ["ws"] }
 # A canary record through the log bridge (no_token.rs). Already in the lockfile through Tauri.
 log = "0.4"
+# The helpers' sha256 in the remote cases' manifests. The version the root workspace uses.
+sha2 = "0.11"
 tempfile = "3"
 tauri = { version = "~2.12", default-features = false, features = ["test"] }
 tokio = { version = "1.53", features = ["macros", "net", "process", "rt", "rt-multi-thread", "sync", "time", "io-util"] }
