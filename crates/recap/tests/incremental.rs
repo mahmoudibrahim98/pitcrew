@@ -254,6 +254,33 @@ proptest! {
     }
 }
 
+/// Like the demo's check, over a larger generated log with many sessions open at once and a small
+/// `max_open`, so closing and evicting order matter: two independent runs (each with fresh
+/// random hash seeds) give byte-identical JSON, whole or in batches.
+#[test]
+fn output_never_depends_on_the_hash_seed() {
+    let specs = common::SplitMix(7).specs(3_000, 120_000);
+    let cfg = Config {
+        max_open: 5,
+        ..Config::default()
+    };
+    let run = || {
+        let world = World::new(40, 60, 8);
+        let events = gen_events(&specs, &world, T0, 1);
+        let all = blocks(&events, &world.dir, &cfg);
+        let mut builder = BlockBuilder::new(cfg.clone(), world.dir.clone());
+        let mut changes = Vec::new();
+        for batch in events.chunks(97) {
+            let c = builder.push_batch(batch);
+            changes.push((c.closed, c.open));
+        }
+        let recaps = day_recaps(&all, &world.dir, 0, &RuleSummarizer).expect("rules never fail");
+        serde_json::to_string(&(all, changes, builder.open_blocks(), recaps))
+            .expect("output serializes")
+    };
+    assert_eq!(run(), run());
+}
+
 #[test]
 fn close_idle_closes_quiet_blocks_and_late_events_start_new_ones() {
     let world = World::new(2, 2, 1);
