@@ -1,7 +1,7 @@
 //! # pitcrew-hub-work
 //!
 //! The hub's model of the work, built from the event log (ADR-0004, ADR-0007):
-//! - [`projections`]: the tables (migrations `0200`–`0208` in `crates/store/migrations`) kept in
+//! - [`projections`]: the tables (migrations `0200`–`0210` in `crates/store/migrations`) kept in
 //!   step with the log. Pass them to `Store::open_with`;
 //! - [`WorkService`]: reads of those tables, and **commands** that validate a change against them
 //!   and append its events, stamped from the [`Caller`](pitcrew_protocol::api::Caller);
@@ -44,6 +44,7 @@ mod activity;
 mod codec;
 mod commands;
 mod dispatch;
+mod edits;
 mod error;
 pub mod projection;
 pub mod query;
@@ -54,8 +55,10 @@ mod service;
 pub use activity::EventRefs;
 pub use commands::{AnswerAsk, BriefEdit, NewAsk, NewComment, WorkstreamPatch};
 pub use dispatch::{DispatchError, DispatchRequest, Dispatcher, NewDispatch};
+pub use edits::{LABEL_CHARS, MAX_LABELS, TITLE_CHARS};
 pub use error::{INTERNAL_MESSAGE, Result, WorkError};
-pub use pitcrew_protocol::api::NewTask;
+pub use pitcrew_protocol::api::{NewProject, NewTask, NewWorkstream};
+pub use pitcrew_protocol::model::TaskPatch;
 pub use projection::projections;
 pub use query::{AskFilter, REF_SCAN_BUDGET, RefFilter, SessionFilter, TaskFilter, TaskRef};
 pub use routes::{agent_routes, device_routes, routes};

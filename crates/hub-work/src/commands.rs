@@ -65,12 +65,12 @@ pub struct AnswerAsk {
     pub text: Option<String>,
 }
 
-/// `PUT /v1/briefs/{kind}/{id}`: a person's brief.
+/// `PUT /v1/briefs/{kind}/{id}`: a person's brief, or the pending proposal they accept.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct BriefEdit {
     /// The text.
     pub text: String,
-    /// The next step. **Not stored yet**: `brief_accepted` has no field for it (a contract gap).
+    /// The next step, if any.
     #[serde(default)]
     pub next: Option<String>,
     /// Whether it is pinned.
@@ -118,7 +118,7 @@ fn require_own_task(conn: &Connection, caller: &Caller, task: &Task) -> Result<(
     Ok(())
 }
 
-fn not_empty(text: &str, field: &str) -> Result<()> {
+pub(crate) fn not_empty(text: &str, field: &str) -> Result<()> {
     if text.trim().is_empty() {
         Err(WorkError::invalid(format!("{field} must not be empty.")))
     } else {
@@ -126,7 +126,7 @@ fn not_empty(text: &str, field: &str) -> Result<()> {
     }
 }
 
-fn known_member(
+pub(crate) fn known_member(
     conn: &Connection,
     id: &MemberId,
     field: &str,
@@ -355,7 +355,7 @@ impl WorkService {
     /// Reads a task back after a move to `to`. Under one writer it is always there; if another
     /// writer moved it first, the projection ignored this move as stale and the task is elsewhere,
     /// so the command lost the race: `conflict`.
-    fn reload_moved(&self, id: TaskId, to: TaskStatus) -> Result<Task> {
+    pub(crate) fn reload_moved(&self, id: TaskId, to: TaskStatus) -> Result<Task> {
         let task = self.reload_task(id)?;
         if task.status == to {
             return Ok(task);
@@ -616,9 +616,13 @@ impl WorkService {
         self.ask(&ask.id)
     }
 
-    /// Puts a person's brief ("Where it stands") in force. People only.
+    /// Puts a person's brief ("Where it stands") in force, with its text, next step and pin.
+    /// People only.
     ///
-    /// `edit.next` goes into `brief_accepted`, but the briefs projection does not read it yet.
+    /// When the text and next step both equal the pending proposal's (a missing `next` equals only
+    /// a missing `next`), the person accepts the proposal: `brief_accepted` carries its receipts and
+    /// the brief's source is `back_office`. Any other brief is the person's own, with no receipts.
+    /// Either way nothing is pending afterwards ("keep current" is a `PUT` of the current text).
     ///
     /// # Errors
     ///
@@ -631,20 +635,14 @@ impl WorkService {
     ) -> Result<Brief> {
         require_person(caller, "Editing a brief")?;
         let _guard = self.lock();
-        self.read(|c| {
-            let found = match &target {
-                BriefTarget::Project(id) => query::project(c, id)?.is_some(),
-                BriefTarget::Workstream(id) => query::workstream(c, id)?.is_some(),
-            };
-            if found {
-                Ok(())
-            } else {
-                Err(WorkError::not_found(match &target {
-                    BriefTarget::Project(id) => format!("No project {id}."),
-                    BriefTarget::Workstream(id) => format!("No workstream {id}."),
-                }))
-            }
+        let pending = self.read(|c| {
+            brief_target_exists(c, &target)?;
+            query::pending_proposal(c, &target)
         })?;
+        let receipts = pending
+            .filter(|p| p.text == edit.text && p.next == edit.next)
+            .map(|p| p.receipts)
+            .unwrap_or_default();
         self.append(&[self.by(
             caller,
             EventBody::BriefAccepted {
@@ -652,7 +650,7 @@ impl WorkService {
                 text: edit.text,
                 next: edit.next,
                 pinned: edit.pinned,
-                receipts: Vec::new(),
+                receipts,
             },
         )])?;
         self.brief(&target)?
@@ -775,6 +773,22 @@ impl WorkService {
         };
         self.append(&[self.event(agent, owner, body)])?;
         self.reload_task(task.id).map(Some)
+    }
+}
+
+/// `not_found` unless the brief's project or workstream exists.
+pub(crate) fn brief_target_exists(conn: &Connection, target: &BriefTarget) -> Result<()> {
+    let found = match target {
+        BriefTarget::Project(id) => query::project(conn, id)?.is_some(),
+        BriefTarget::Workstream(id) => query::workstream(conn, id)?.is_some(),
+    };
+    if found {
+        Ok(())
+    } else {
+        Err(WorkError::not_found(match target {
+            BriefTarget::Project(id) => format!("No project {id}."),
+            BriefTarget::Workstream(id) => format!("No workstream {id}."),
+        }))
     }
 }
 

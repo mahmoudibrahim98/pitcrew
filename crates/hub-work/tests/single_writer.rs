@@ -505,7 +505,7 @@ async fn a_key_taken_by_a_racing_writer_is_a_409_not_a_500() {
 fn keys_are_allocated_by_key_prefix_not_by_project() {
     let dir = tempfile::tempdir().expect("tempdir");
     let work = seeded(dir.path());
-    // A second project that shares the key PAP with the paper (nothing stops that yet).
+    // A second project with the paper's key PAP is not applied: project keys are unique.
     let twin = Project {
         id: ProjectId::new(),
         key: ProjectKey::new("PAP").expect("key"),
@@ -523,21 +523,42 @@ fn keys_are_allocated_by_key_prefix_not_by_project() {
             project: twin.clone(),
         })])
         .expect("append");
-    let in_twin = work
-        .create_task(
+    assert!(work.project(&twin.id).is_err(), "the twin is not applied");
+    // But a key can still come back to a new project: tooling, re-stated with another key,
+    // frees TL, which its tasks TL-1 to TL-3 still hold.
+    let tooling: ProjectId = "01JB000000000000000PRJ0002".parse().expect("id");
+    let mut rekeyed = work.project(&tooling).expect("tooling");
+    rekeyed.key = ProjectKey::new("TLX").expect("key");
+    work.store()
+        .append(&[event(EventBody::ProjectCreated { project: rekeyed })])
+        .expect("append");
+    let again = work
+        .create_project(
             &person(SAM),
-            new_task(&twin.id.0.to_string(), "In the twin"),
+            pitcrew_hub_work::NewProject {
+                key: ProjectKey::new("TL").expect("key"),
+                name: "Tooling, again".into(),
+                lead: None,
+                members: None,
+                status: None,
+                start: None,
+                due: None,
+                root: None,
+            },
         )
+        .expect("TL is free");
+    let in_again = work
+        .create_task(&person(SAM), new_task(&again.id.0.to_string(), "New TL"))
         .expect("create");
     assert_eq!(
-        in_twin.key.to_string(),
-        "PAP-8",
-        "not PAP-1, which the paper holds"
+        in_again.key.to_string(),
+        "TL-4",
+        "not TL-1, which the first tooling's task holds"
     );
-    let in_paper = work
-        .create_task(&person(SAM), new_task(PAPER, "In the paper"))
+    let in_tooling = work
+        .create_task(&person(SAM), new_task(&tooling.0.to_string(), "Old TL"))
         .expect("create");
-    assert_eq!(in_paper.key.to_string(), "PAP-9");
+    assert_eq!(in_tooling.key.to_string(), "TLX-1");
 }
 
 #[test]

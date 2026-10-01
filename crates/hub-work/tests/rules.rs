@@ -271,8 +271,18 @@ fn device_requests() -> Vec<(&'static str, String, Option<Value>)> {
         ("GET", "/v1/teams".into(), None),
         ("GET", "/v1/projects".into(), None),
         ("GET", format!("/v1/projects/{PAPER}"), None),
+        (
+            "POST",
+            "/v1/projects".into(),
+            Some(json!({ "key": "SNK", "name": "Sneaky" })),
+        ),
         ("GET", "/v1/workstreams".into(), None),
         ("GET", format!("/v1/workstreams/{ws}"), None),
+        (
+            "POST",
+            "/v1/workstreams".into(),
+            Some(json!({ "project": PAPER, "name": "Sneaky" })),
+        ),
         (
             "PATCH",
             format!("/v1/workstreams/{ws}"),
@@ -282,6 +292,11 @@ fn device_requests() -> Vec<(&'static str, String, Option<Value>)> {
             "POST",
             "/v1/tasks".into(),
             Some(json!({ "project": PAPER, "title": "Sneaky" })),
+        ),
+        (
+            "PATCH",
+            "/v1/tasks/PAP-1".into(),
+            Some(json!({ "title": "Sneaky" })),
         ),
         (
             "POST",
@@ -313,7 +328,7 @@ async fn device_handlers_refuse_agents_even_when_mounted_without_the_guard() {
     let requests = device_requests();
     assert_eq!(
         requests.len(),
-        16,
+        19,
         "every device route in api-v1 that this crate serves"
     );
     let rev = work.store().latest_rev().expect("rev");
