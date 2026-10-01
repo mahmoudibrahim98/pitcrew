@@ -27,13 +27,40 @@ corepack pnpm --filter @pitcrew/ui dev    # the UI on http://127.0.0.1:5173
 | `preview` | Serve `dist/` on 127.0.0.1:4173 |
 | `test` | Vitest: the data layer, the shell and the design components, against the real mock hub on a free port |
 | `e2e` | Playwright: the shell against its own mock hub (ports 47399 and 5199; `E2E_HUB_PORT` and `E2E_UI_PORT` move them), with axe checks. `PLAYWRIGHT_CHANNEL=msedge` or `chrome` uses an installed browser. |
-| `size` | After `build`: fails if the initial JS is over 250 kB gzipped |
+| `size` | After `build`: fails if the initial JS is over 250 kB gzipped, or holds the desktop gateway or `@tauri-apps/api` (the desktop app loads them on demand) |
 | `typecheck` | `tsc -b` |
 | `lint` | ESLint |
 
 The dev server also serves the data layer's proof page at `/dev/proof`; production builds leave it out.
 
+### Running the e2e suite against a real `pitcrewd`
+
+By default `corepack pnpm --filter @pitcrew/ui e2e` starts its own mock hub (`apps/mock-hub`) and
+talks to that. To run the same suite against a real daemon instead:
+
+```sh
+pitcrewd serve --demo --listen tcp:127.0.0.1:47317   # a separate shell; --demo seeds the demo workspace
+pitcrewd token show-path                             # prints where the device token file is kept
+```
+
+Then, with that file's contents as the token:
+
+```sh
+E2E_HUB_URL=http://127.0.0.1:47317 E2E_HUB_TOKEN=<token from the file above> \
+  corepack pnpm --filter @pitcrew/ui e2e
+```
+
+`E2E_HUB_URL` points the suite at that hub and stops `playwright.config.ts` from starting the mock
+hub; `E2E_HUB_TOKEN` is the bearer token both the UI (`VITE_PITCREW_TOKEN`) and the specs' own
+direct hub calls use — the mock hub's fixed `dev-device-token` (the default when `E2E_HUB_TOKEN` is
+unset) is not a token `pitcrewd` recognizes. `tcp:127.0.0.1:<port>` is for development only:
+`pitcrewd serve` without `--listen` uses the platform's private transport, which this suite cannot
+reach. See `apps/ui/e2e/helpers.ts`.
+
 ## Environment (development only)
+
+In a browser. The desktop app reads none of these: it reaches each workspace through its gateway,
+which adds the token (`src/data/README.md`).
 
 | Variable | Default | What |
 |---|---|---|
@@ -45,3 +72,13 @@ The dev server also serves the data layer's proof page at `/dev/proof`; producti
 Geist and Geist Mono (SIL OFL 1.1) are bundled: the Latin subsets and Geist Mono's box-drawing
 subset from `@fontsource-variable`, plus the full variable fonts in `src/assets/fonts` for arrows,
 which no Fontsource subset has (loaded only when an arrow is on screen). No font CDN.
+
+## Terminal (xterm.js)
+
+`@xterm/xterm`, `@xterm/addon-webgl` and `@xterm/addon-fit` (MIT, pure JS, no install scripts) are
+dependencies of `@pitcrew/ui` so stream M's terminal pane (`src/console`, work package 4) can use
+them, but nothing imports them yet — they are pulled in lazily when a terminal pane first mounts,
+so they stay out of the initial bundle and `pnpm size` is unaffected. xterm.js 6.0 removed the
+canvas renderer addon (`@xterm/addon-canvas`, which has no release compatible with `@xterm/xterm`
+^6 — its last stable, 0.7.0, still peers on `^5.0.0`); the fallback for WebGL is xterm's built-in
+DOM renderer, not a separate addon.

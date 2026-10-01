@@ -1,0 +1,135 @@
+---
+source: crates/ingest/tests/scan.rs
+expression: v
+---
+{
+  "counts": {
+    "by_engine": [
+      {
+        "count": 4,
+        "engine": "claude"
+      },
+      {
+        "count": 1,
+        "engine": "codex"
+      },
+      {
+        "count": 1,
+        "engine": "opencode"
+      }
+    ],
+    "by_folder": [
+      {
+        "count": 2,
+        "path": "<ROOT>/work/proj-a"
+      },
+      {
+        "count": 1,
+        "path": "<ROOT>/work/notes/x"
+      },
+      {
+        "count": 1,
+        "path": "<ROOT>/work/notes/y"
+      },
+      {
+        "count": 1,
+        "path": "<ROOT>/work/proj-a/apps/web"
+      },
+      {
+        "count": 1,
+        "path": "<ROOT>/work/proj-b"
+      }
+    ],
+    "by_home": [
+      {
+        "count": 4,
+        "engine": "claude",
+        "home": "<ROOT>/claude-home"
+      },
+      {
+        "count": 1,
+        "engine": "codex",
+        "home": "<ROOT>/codex-home"
+      },
+      {
+        "count": 1,
+        "engine": "opencode",
+        "home": "<ROOT>/opencode-home"
+      }
+    ],
+    "by_month": [
+      {
+        "count": 6,
+        "month": "2026-01"
+      }
+    ],
+    "first_activity": 1767225600000,
+    "last_activity": 1767657700000,
+    "sessions": 6,
+    "subagent_sessions": 2
+  },
+  "suggestions": [
+    {
+      "id": "<ROOT>/work/proj-a",
+      "is_git": true,
+      "name": "proj-a",
+      "path": "<ROOT>/work/proj-a",
+      "recent_30d": 3,
+      "recent_90d": 3,
+      "session_count": 3,
+      "workstreams": [
+        {
+          "id": "<ROOT>/work/proj-a/apps",
+          "name": "apps",
+          "recent_30d": 1,
+          "recent_90d": 1,
+          "session_count": 1
+        },
+        {
+          "branch": "feat/x",
+          "id": "<ROOT>/work/proj-a#feat/x",
+          "name": "feat/x",
+          "recent_30d": 1,
+          "recent_90d": 1,
+          "session_count": 1
+        }
+      ]
+    },
+    {
+      "id": "<ROOT>/work/notes",
+      "is_git": false,
+      "name": "notes",
+      "path": "<ROOT>/work/notes",
+      "recent_30d": 1,
+      "recent_90d": 1,
+      "session_count": 2,
+      "workstreams": [
+        {
+          "id": "<ROOT>/work/notes/y",
+          "name": "y",
+          "recent_30d": 1,
+          "recent_90d": 1,
+          "session_count": 1
+        },
+        {
+          "id": "<ROOT>/work/notes/x",
+          "name": "x",
+          "recent_30d": 0,
+          "recent_90d": 0,
+          "session_count": 1
+        }
+      ]
+    },
+    {
+      "id": "<ROOT>/work/proj-b",
+      "is_git": true,
+      "name": "proj-b",
+      "path": "<ROOT>/work/proj-b",
+      "recent_30d": 1,
+      "recent_90d": 1,
+      "session_count": 1,
+      "workstreams": []
+    }
+  ],
+  "unreadable": 0
+}

@@ -33,6 +33,7 @@ fn pitcrew(args: &[&str], env: &[(&str, &str)], stdin: Option<&[u8]>) -> (Output
         "PITCREW_TOKEN_FILE",
         "PITCREW_HOOK_DEBUG",
         "PITCREW_HOOK_TEST_PANIC",
+        "PITCREW_CHAINED",
     ] {
         cmd.env_remove(var);
     }
@@ -77,7 +78,7 @@ fn delivers_the_stdin_payload() {
     ];
     let (output, _) = hook(&["claude", "Stop"], &env, Some(PAYLOAD.as_bytes()));
     assert_silent_success(&output);
-    let requests = server.requests();
+    let requests = server.wait_for_requests(1);
     assert_eq!(requests.len(), 1, "no version check, one request");
     let request = &requests[0];
     assert_eq!(request.route(), "POST /v1/hooks/claude/Stop");
@@ -99,7 +100,8 @@ fn takes_the_payload_as_an_argument_for_codex_notify() {
     let notify = r#"{"type":"agent-turn-complete","turn-id":"1"}"#;
     let (output, _) = hook(&["codex", "notify", notify], &env, None);
     assert_silent_success(&output);
-    let request = &server.requests()[0];
+    let requests = server.wait_for_requests(1);
+    let request = &requests[0];
     assert_eq!(request.route(), "POST /v1/hooks/codex/notify");
     assert_eq!(request.body, notify.as_bytes());
 }
@@ -113,7 +115,7 @@ fn an_empty_payload_is_an_empty_object() {
     ];
     let (output, _) = hook(&["claude", "SessionEnd"], &env, None);
     assert_silent_success(&output);
-    assert_eq!(server.requests()[0].body, b"{}");
+    assert_eq!(server.wait_for_requests(1)[0].body, b"{}");
 }
 
 #[test]
@@ -203,7 +205,10 @@ fn a_global_flag_before_hook_keeps_the_fast_path() {
         Some(PAYLOAD.as_bytes()),
     );
     assert_silent_success(&output);
-    assert_eq!(server.requests()[0].route(), "POST /v1/hooks/claude/Stop");
+    assert_eq!(
+        server.wait_for_requests(1)[0].route(),
+        "POST /v1/hooks/claude/Stop"
+    );
 
     // Only the fast path has the test panic and its debug message.
     let debug = [
@@ -228,7 +233,201 @@ fn gives_up_on_a_daemon_that_never_answers() {
     let (output, took) = hook(&["claude", "Stop"], &env, Some(PAYLOAD.as_bytes()));
     assert_silent_success(&output);
     assert!(took < Duration::from_secs(2), "{took:?}");
-    assert_eq!(server.requests().len(), 1);
+    assert_eq!(server.wait_for_requests(1).len(), 1);
+}
+
+// The chain mechanism (`crate::hook::run_chained`) is a single, OS-independent code path —
+// `std::process::Command::new(program).args(rest)`, no shell, no `cmd.exe` on either platform —
+// so there is no separate Windows branch to exercise. These integration tests, run for real on
+// Unix (where this suite runs), are the whole exercise; they are gated `cfg(unix)` only because
+// building the fake original as an executable shell script needs `chmod`, not because the
+// `--chain` logic itself differs on Windows.
+#[cfg(unix)]
+mod chain {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// A fake original notifier (an executable shell script that records what it was given) plus
+    /// the sidecar `install --chain` would have recorded for it — a `CODEX_HOME`'s worth of
+    /// `--chain` state, built once per test.
+    struct FakeChain {
+        codex_home: tempfile::TempDir,
+        captured: std::path::PathBuf,
+    }
+
+    impl FakeChain {
+        fn new() -> Self {
+            let codex_home = tempfile::TempDir::new().unwrap();
+            let captured = codex_home.path().join("captured.txt");
+            let fake_original = codex_home.path().join("fake-original.sh");
+            std::fs::write(
+                &fake_original,
+                format!("#!/bin/sh\nprintf '%s' \"$1\" > '{}'\n", captured.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&fake_original, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            let record = json!({
+                "values": [fake_original.to_str().unwrap()],
+                "toml": "[\"terminal-notifier\"]",
+            });
+            std::fs::write(
+                codex_home.path().join("pitcrew-notify-original.json"),
+                record.to_string(),
+            )
+            .unwrap();
+            Self {
+                codex_home,
+                captured,
+            }
+        }
+
+        fn codex_home(&self) -> &str {
+            self.codex_home.path().to_str().unwrap()
+        }
+
+        /// Polls for the original to have run (it is spawned detached, never waited on, by
+        /// design), returning what it captured, or `None` if it never did within the deadline.
+        fn wait_for_capture(&self) -> Option<String> {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if let Ok(s) = std::fs::read_to_string(&self.captured)
+                    && !s.is_empty()
+                {
+                    return Some(s);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            None
+        }
+    }
+
+    #[test]
+    fn runs_the_recorded_original_with_the_exact_payload_codex_passed() {
+        let server = accepting();
+        let chain = FakeChain::new();
+        let notify_payload = r#"{"type":"agent-turn-complete","turn-id":"1"}"#;
+        let env = [
+            ("PITCREW_URL", server.url.as_str()),
+            ("PITCREW_TOKEN", TOKEN),
+            ("CODEX_HOME", chain.codex_home()),
+        ];
+        let (output, _) = hook(&["codex", "notify", "--chain", notify_payload], &env, None);
+        assert_silent_success(&output);
+
+        // Our own hook still got delivered.
+        let requests = server.wait_for_requests(1);
+        assert_eq!(requests[0].route(), "POST /v1/hooks/codex/notify");
+        assert_eq!(requests[0].body, notify_payload.as_bytes());
+
+        assert_eq!(chain.wait_for_capture().as_deref(), Some(notify_payload));
+    }
+
+    /// The blocking fix: the original must run even when *our own* delivery cannot even start —
+    /// no token configured at all, exactly as `codex` run from a plain terminal would have it.
+    #[test]
+    fn runs_the_original_even_with_no_token_and_no_daemon_configured() {
+        let chain = FakeChain::new();
+        let notify_payload = r#"{"type":"agent-turn-complete","turn-id":"2"}"#;
+        // No PITCREW_URL/PITCREW_SOCKET/PITCREW_TOKEN at all.
+        let env = [("CODEX_HOME", chain.codex_home())];
+        let (output, _) = hook(&["codex", "notify", "--chain", notify_payload], &env, None);
+        assert_silent_success(&output);
+
+        assert_eq!(chain.wait_for_capture().as_deref(), Some(notify_payload));
+    }
+
+    /// Same, but the daemon is configured and simply unreachable instead of unconfigured.
+    #[test]
+    fn runs_the_original_even_when_the_daemon_is_down() {
+        let chain = FakeChain::new();
+        let notify_payload = r#"{"type":"agent-turn-complete","turn-id":"3"}"#;
+        let url = dead_url();
+        let env = [
+            ("PITCREW_URL", url.as_str()),
+            ("PITCREW_TOKEN", TOKEN),
+            ("CODEX_HOME", chain.codex_home()),
+        ];
+        let (output, took) = hook(&["codex", "notify", "--chain", notify_payload], &env, None);
+        assert_silent_success(&output);
+        assert!(took < Duration::from_secs(2), "{took:?}");
+
+        assert_eq!(chain.wait_for_capture().as_deref(), Some(notify_payload));
+    }
+
+    /// The recursion guard: if we are, ourselves, something a chain already spawned
+    /// (`PITCREW_CHAINED` set), `--chain` must not run the original again.
+    #[test]
+    fn does_not_chain_again_when_already_inside_a_chain() {
+        let server = accepting();
+        let chain = FakeChain::new();
+        let notify_payload = r#"{"type":"agent-turn-complete","turn-id":"4"}"#;
+        let env = [
+            ("PITCREW_URL", server.url.as_str()),
+            ("PITCREW_TOKEN", TOKEN),
+            ("CODEX_HOME", chain.codex_home()),
+            ("PITCREW_CHAINED", "1"),
+        ];
+        let (output, _) = hook(&["codex", "notify", "--chain", notify_payload], &env, None);
+        assert_silent_success(&output);
+
+        // Our own hook is still delivered: only the recursive re-chain is skipped.
+        let requests = server.wait_for_requests(1);
+        assert_eq!(requests[0].route(), "POST /v1/hooks/codex/notify");
+
+        // Give a wrongly-spawned original a real chance to have written before asserting absence.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            std::fs::read_to_string(&chain.captured)
+                .unwrap_or_default()
+                .is_empty(),
+            "must not have run the original again"
+        );
+    }
+
+    /// `--chain` is set on the spawned original's own environment, so a chain that (directly, or
+    /// through a shell) calls `pitcrew hook codex notify --chain` again cannot recurse.
+    #[test]
+    fn sets_pitcrew_chained_on_the_spawned_original() {
+        let server = accepting();
+        let codex_home = tempfile::TempDir::new().unwrap();
+        let captured = codex_home.path().join("captured.txt");
+        let fake_original = codex_home.path().join("fake-original.sh");
+        std::fs::write(
+            &fake_original,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$PITCREW_CHAINED\" > '{}'\n",
+                captured.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_original, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let record = json!({"values": [fake_original.to_str().unwrap()], "toml": "[\"x\"]"});
+        std::fs::write(
+            codex_home.path().join("pitcrew-notify-original.json"),
+            record.to_string(),
+        )
+        .unwrap();
+
+        let env = [
+            ("PITCREW_URL", server.url.as_str()),
+            ("PITCREW_TOKEN", TOKEN),
+            ("CODEX_HOME", codex_home.path().to_str().unwrap()),
+        ];
+        let (output, _) = hook(&["codex", "notify", "--chain", "{}"], &env, None);
+        assert_silent_success(&output);
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut seen = String::new();
+        while Instant::now() < deadline {
+            seen = std::fs::read_to_string(&captured).unwrap_or_default();
+            if !seen.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(seen, "1");
+    }
 }
 
 #[cfg(unix)]
@@ -242,7 +441,10 @@ fn over_a_socket_only_a_private_one_gets_the_token() {
     ];
     let (output, _) = hook(&["claude", "Stop"], &env, Some(PAYLOAD.as_bytes()));
     assert_silent_success(&output);
-    assert_eq!(private.requests()[0].route(), "POST /v1/hooks/claude/Stop");
+    assert_eq!(
+        private.wait_for_requests(1)[0].route(),
+        "POST /v1/hooks/claude/Stop"
+    );
 
     let (open, socket) = FakeServer::unix(handler, 0o755);
     let env = [

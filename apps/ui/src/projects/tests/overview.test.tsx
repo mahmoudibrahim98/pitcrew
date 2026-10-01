@@ -24,7 +24,10 @@ describe('ProjectOverview and WorkstreamOverview', () => {
       nav: { openWorkstream: (w) => opened.push(w) },
     });
     await screen.findByRole('heading', { level: 1, name: 'Paper · Diffusion study' });
-    await screen.findByText(/The method section is about half drafted/);
+    const stands = await screen.findByRole('region', { name: 'Where the project stands' });
+    // The PAP project's pending proposal repeats its own text, so it shows up twice (its own
+    // "Proposed update" box, below the brief in force) — see where-it-stands.test.tsx.
+    expect(within(stands).getAllByText(/The method section is about half drafted/)).toHaveLength(2);
 
     const table = await screen.findByRole('table', { name: 'Workstreams' });
     await within(table).findByText('Rerun or drop seed 3.');
@@ -54,8 +57,10 @@ describe('ProjectOverview and WorkstreamOverview', () => {
     const events = await within(activity).findByRole('list', { name: 'Events' });
     expect(within(events).getByText('moved PAP-3 from In progress to Review')).toBeTruthy();
     expect(within(events).queryByText(/Parse Codex/)).toBeNull();
+    // Summary: the project's day paragraphs (see recaps.test.tsx).
     fireEvent.click(within(activity).getByRole('radio', { name: 'Summary' }));
-    expect(within(activity).getByText(/Summaries of what happened will appear here/)).toBeTruthy();
+    await within(activity).findByRole('list', { name: 'Days' });
+    expect(within(activity).queryByRole('list', { name: 'Events' })).toBeNull();
   });
 
   it('shows a workstream with its tasks and activity, live', async () => {

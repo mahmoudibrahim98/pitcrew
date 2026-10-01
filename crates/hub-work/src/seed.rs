@@ -4,9 +4,9 @@ use crate::error::{Result, WorkError};
 use crate::query;
 use crate::service::WorkService;
 use pitcrew_fixtures::DemoWorkspace;
-use pitcrew_protocol::events::{Event, EventBody};
+use pitcrew_protocol::events::{BriefTarget, Event, EventBody};
 use pitcrew_protocol::ids::{EventId, MemberId};
-use pitcrew_protocol::model::{BriefSource, MemberKind, TimestampMs};
+use pitcrew_protocol::model::{Brief, BriefSource, MemberKind, TimestampMs};
 use pitcrew_store::RevRange;
 
 /// The events that rebuild `demo`: one event per thing it lists, then its own slice of the log.
@@ -14,13 +14,14 @@ use pitcrew_store::RevRange;
 /// - Everything is authored by `author` (the importing person), without `on_behalf_of`.
 /// - Machines, personas, members, teams, projects, workstreams and tasks are stamped with the
 ///   demo's earliest time; sessions, dispatches, asks and briefs with their own times.
-/// - A brief the back office wrote becomes a `brief_proposed` with its receipts, then a
-///   `brief_accepted` of the same text (a person accepting the proposal). A person's brief is a
-///   `brief_accepted` alone.
+/// - A brief the back office wrote becomes a `brief_proposed` with its text, next step and
+///   receipts, then a `brief_accepted` of the same (a person accepting the proposal unchanged, so
+///   it carries the receipts). A person's brief is a `brief_accepted` alone.
 /// - The demo's slice of events comes last. It re-states things already listed (the demo's lists
-///   are the state after it), so applying it changes nothing but the activity it records.
-///
-/// Brief `next` steps are not carried: `brief_accepted` has no field for them yet.
+///   are the state after it), so applying it changes nothing but the activity it records, with
+///   one exception: a brief the slice accepts again (its last brief event for that target is a
+///   `brief_accepted`) is put in force again after the slice, as listed, because the slice's event
+///   may say less (no next step). A proposal the slice leaves pending stays pending.
 #[must_use]
 pub fn demo_events(demo: &DemoWorkspace, author: MemberId) -> Vec<Event> {
     let start = earliest(demo);
@@ -78,30 +79,61 @@ pub fn demo_events(demo: &DemoWorkspace, author: MemberId) -> Vec<Event> {
         out.push(event(at, EventBody::AskRaised { ask }));
     }
     for brief in &demo.briefs {
-        if brief.source == BriefSource::BackOffice {
-            out.push(event(
-                brief.updated,
-                EventBody::BriefProposed {
-                    target: brief.target,
-                    text: brief.text.clone(),
-                    next: None,
-                    receipts: brief.receipts.clone(),
-                },
-            ));
-        }
-        out.push(event(
-            brief.updated,
-            EventBody::BriefAccepted {
-                target: brief.target,
-                text: brief.text.clone(),
-                next: None,
-                pinned: brief.pinned,
-                receipts: Vec::new(),
-            },
-        ));
+        out.extend(
+            brief_bodies(brief)
+                .into_iter()
+                .map(|body| event(brief.updated, body)),
+        );
     }
     out.extend(demo.events.iter().cloned());
+    for brief in demo
+        .briefs
+        .iter()
+        .filter(|b| accepted_again(&demo.events, b.target))
+    {
+        out.extend(
+            brief_bodies(brief)
+                .into_iter()
+                .map(|body| event(brief.updated, body)),
+        );
+    }
     out
+}
+
+/// The events that put `brief` in force as listed: for the back office's, its proposal and a
+/// person accepting it unchanged; for a person's, the `brief_accepted` alone.
+fn brief_bodies(brief: &Brief) -> Vec<EventBody> {
+    let accepted = EventBody::BriefAccepted {
+        target: brief.target,
+        text: brief.text.clone(),
+        next: brief.next.clone(),
+        pinned: brief.pinned,
+        receipts: brief.receipts.clone(),
+    };
+    if brief.source == BriefSource::BackOffice {
+        let proposed = EventBody::BriefProposed {
+            target: brief.target,
+            text: brief.text.clone(),
+            next: brief.next.clone(),
+            receipts: brief.receipts.clone(),
+        };
+        vec![proposed, accepted]
+    } else {
+        vec![accepted]
+    }
+}
+
+/// Whether the last brief event for `target` in `events` is a `brief_accepted`.
+fn accepted_again(events: &[Event], target: BriefTarget) -> bool {
+    events
+        .iter()
+        .rev()
+        .find_map(|e| match &e.body {
+            EventBody::BriefAccepted { target: t, .. } if *t == target => Some(true),
+            EventBody::BriefProposed { target: t, .. } if *t == target => Some(false),
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 /// The earliest time anywhere in the demo, so the listed things exist before anything happens to

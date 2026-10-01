@@ -7,6 +7,10 @@
 //!
 //! - [`claude::ClaudeAdapter`]: Claude Code transcripts (`~/.claude/projects/*/*.jsonl`).
 //! - [`codex::CodexAdapter`]: Codex CLI rollouts (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`).
+//! - [`opencode::OpenCodeAdapter`]: OpenCode sessions in its SQLite store
+//!   (`~/.local/share/opencode/opencode.db`).
+//! - [`scan::scan`]: a read-only, parallel scan of a machine's agent history for onboarding and
+//!   "scan again": counts, plus suggested projects and workstreams.
 //!
 //! Transcripts are attacker-controllable text: every parser bounds its allocations, skips lines it
 //! cannot use, and exposes a `parse_line` function so it can be fuzzed on its own.
@@ -18,6 +22,9 @@ pub mod claude;
 pub mod codex;
 mod jsonl;
 mod lines;
+pub mod opencode;
+mod patch;
+pub mod scan;
 mod text;
 mod time;
 

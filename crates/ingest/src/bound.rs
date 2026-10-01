@@ -86,6 +86,26 @@ pub(crate) fn bounded_input(input: &Value) -> Value {
     }
 }
 
+/// A diff that is already text, cut at a line boundary to [`MAX_DIFF_BYTES`].
+pub(crate) fn capped_diff(diff: &str) -> String {
+    if diff.len() <= MAX_DIFF_BYTES {
+        return diff.to_owned();
+    }
+    let mut end = 0;
+    for line in diff.split_inclusive('\n') {
+        if end + line.len() > MAX_DIFF_BYTES {
+            break;
+        }
+        end += line.len();
+    }
+    let mut out = diff[..end].to_owned();
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("… (diff truncated)\n");
+    out
+}
+
 /// A unified diff capped at `cap` bytes of body.
 #[derive(Debug)]
 pub(crate) struct Diff {

@@ -80,6 +80,11 @@ export interface CreateEntry {
   dialog: ComponentType<{ close(): void }>;
   /** Lower comes first. The shell's own items use 10 to 40. Default 100. */
   order?: number;
+  /**
+   * Shows the item disabled, with this as its reason. The item stays focusable (so the reason is
+   * reachable from the keyboard) but selecting it does nothing; the palette hides it.
+   */
+  disabled?: string;
 }
 
 export interface Feature {

@@ -6,6 +6,7 @@
 // whole request before changing anything, and every event they append is authored by the token's
 // member, never by the request body.
 
+import { blocksPage, daysPage } from './recaps.ts';
 import { canMove } from './rules.ts';
 import {
   announceSession,
@@ -1394,6 +1395,9 @@ const ROUTES: Route[] = [
   route('GET', '/v1/briefs', 'device', listBriefs),
   route('PUT', '/v1/briefs/:kind/:id', 'device', putBrief),
   route('GET', '/v1/events', 'device', listEvents),
+  // Recaps: from the fixture the recap engine wrote (recaps.ts).
+  route('GET', '/v1/recaps/blocks', 'device', (hub, ctx) => ok(blocksPage(hub.recaps, ctx.query))),
+  route('GET', '/v1/recaps/days', 'device', (hub, ctx) => ok(daysPage(hub.recaps, ctx.query))),
   route('POST', '/v1/hooks/:engine/:event', 'agent', receiveHook),
   route('GET', '/v1/stream', 'device', needsWebSocket),
 ];

@@ -260,25 +260,240 @@ async fn agents_write_only_to_their_own_tasks() {
     }
 }
 
+/// Every device route, with a request that a person could make.
+fn device_requests() -> Vec<(&'static str, String, Option<Value>)> {
+    let ws = "01JB000000000000000WST0001";
+    let session = "01JB000000000000000SES0001";
+    vec![
+        ("GET", "/v1/workspace".into(), None),
+        ("GET", "/v1/machines".into(), None),
+        ("GET", "/v1/personas".into(), None),
+        ("GET", "/v1/teams".into(), None),
+        ("GET", "/v1/projects".into(), None),
+        ("GET", format!("/v1/projects/{PAPER}"), None),
+        (
+            "POST",
+            "/v1/projects".into(),
+            Some(json!({ "key": "SNK", "name": "Sneaky" })),
+        ),
+        ("GET", "/v1/workstreams".into(), None),
+        ("GET", format!("/v1/workstreams/{ws}"), None),
+        (
+            "POST",
+            "/v1/workstreams".into(),
+            Some(json!({ "project": PAPER, "name": "Sneaky" })),
+        ),
+        (
+            "PATCH",
+            format!("/v1/workstreams/{ws}"),
+            Some(json!({ "health": "blocked" })),
+        ),
+        (
+            "POST",
+            "/v1/tasks".into(),
+            Some(json!({ "project": PAPER, "title": "Sneaky" })),
+        ),
+        (
+            "PATCH",
+            "/v1/tasks/PAP-1".into(),
+            Some(json!({ "title": "Sneaky" })),
+        ),
+        (
+            "POST",
+            "/v1/tasks/PAP-1/assign".into(),
+            Some(json!({ "assignee": WRITER })),
+        ),
+        (
+            "POST",
+            "/v1/tasks/PAP-5/dispatch".into(),
+            Some(json!({ "agent": WRITER })),
+        ),
+        ("GET", "/v1/sessions".into(), None),
+        ("GET", format!("/v1/sessions/{session}"), None),
+        ("GET", "/v1/briefs".into(), None),
+        (
+            "PUT",
+            format!("/v1/briefs/workstream/{ws}"),
+            Some(json!({ "text": "Sneaky", "pinned": false })),
+        ),
+    ]
+}
+
 #[tokio::test]
 async fn device_handlers_refuse_agents_even_when_mounted_without_the_guard() {
     let dir = tempfile::tempdir().expect("tempdir");
     let work = seeded(dir.path());
     let bare = pitcrew_hub_work::routes().layer(axum::Extension(Arc::clone(&work)));
-    let got = call(
-        &bare,
-        Some(agent(WRITER)),
-        "POST",
-        "/v1/tasks",
-        Some(json!({ "project": PAPER, "title": "Sneaky" })),
-    )
-    .await;
-    expect(&got, 403);
-    expect(
-        &call(&bare, Some(agent(WRITER)), "GET", "/v1/machines", None).await,
-        403,
+    let guarded = app(&work);
+    let requests = device_requests();
+    assert_eq!(
+        requests.len(),
+        19,
+        "every device route in api-v1 that this crate serves"
     );
+    let rev = work.store().latest_rev().expect("rev");
+    for (method, path, body) in requests {
+        for app in [&bare, &guarded] {
+            expect(
+                &call(app, Some(agent(WRITER)), method, &path, body.clone()).await,
+                403,
+            );
+        }
+        // A person reaches the handler (a 503 for the dispatch: there is no runner link here).
+        let person_gets = call(&bare, Some(person(SAM)), method, &path, body).await;
+        assert!(
+            matches!(person_gets.0, 200 | 201 | 503),
+            "{method} {path}: {}",
+            person_gets.1
+        );
+    }
     expect(&call(&bare, None, "GET", "/v1/tasks", None).await, 401);
+    // Nothing the agent sent was applied.
+    let after: Vec<_> = work
+        .store()
+        .since(rev, usize::MAX)
+        .expect("log")
+        .into_iter()
+        .filter(|e| e.event.author == member(WRITER))
+        .collect();
+    assert!(after.is_empty(), "{after:?}");
+}
+
+/// Authorization comes before validation: an agent that may not make a change hears `403`,
+/// whatever is wrong with what it sent.
+#[tokio::test]
+async fn a_forbidden_agent_hears_403_before_any_400() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let work = seeded(dir.path());
+    let app = app(&work);
+    let writer = Some(agent(WRITER));
+    let huge = "x".repeat(2 * 1024 * 1024);
+    // PAP-4 is @runner's.
+    for (method, path, body) in [
+        ("POST", "/v1/tasks/PAP-4/move", json!({ "to": "finished" })),
+        ("POST", "/v1/tasks/PAP-4/move", json!("not an object")),
+        ("POST", "/v1/tasks/PAP-4/comments", json!({ "text": "" })),
+        (
+            "POST",
+            "/v1/tasks/PAP-4/comments",
+            json!({ "text": "Hi", "mentions": ["01JB000000000000000MEM0099"] }),
+        ),
+        (
+            "POST",
+            "/v1/tasks/PAP-4/comments",
+            json!({ "text": huge.clone() }),
+        ),
+        (
+            "PUT",
+            "/v1/tasks/PAP-4/subtasks",
+            json!([{ "id": "01JB000000000000000SBT1001", "text": " ", "done": false,
+                     "source": { "kind": "human" } }]),
+        ),
+        (
+            "PUT",
+            "/v1/tasks/PAP-4/subtasks",
+            json!({ "not": "a list" }),
+        ),
+        // An ask about another's task, with an empty title and an unknown addressee.
+        (
+            "POST",
+            "/v1/asks",
+            json!({ "kind": "question", "to": "01JB000000000000000MEM0099", "title": " ",
+                    "task": "01JB000000000000000TSK0004" }),
+        ),
+        // The demo's decision for @sam: an option out of range, an empty answer.
+        (
+            "POST",
+            "/v1/asks/01JB000000000000000ASK0002/answer",
+            json!({ "option": 99 }),
+        ),
+        (
+            "POST",
+            "/v1/asks/01JB000000000000000ASK0002/answer",
+            json!({}),
+        ),
+    ] {
+        expect(&call(&app, writer, method, path, Some(body)).await, 403);
+    }
+    // On its own task, the same mistakes are 400s.
+    for (method, path, body) in [
+        ("POST", "/v1/tasks/PAP-1/move", json!({ "to": "finished" })),
+        ("POST", "/v1/tasks/PAP-1/comments", json!({ "text": "" })),
+        (
+            "PUT",
+            "/v1/tasks/PAP-1/subtasks",
+            json!([{ "id": "01JB000000000000000SBT1001", "text": " ", "done": false,
+                     "source": { "kind": "agent_plan", "agent": WRITER } }]),
+        ),
+    ] {
+        expect(&call(&app, writer, method, path, Some(body)).await, 400);
+    }
+    // And an unknown task is still a 404, for agents and people.
+    for caller in [agent(WRITER), person(SAM)] {
+        expect(
+            &call(
+                &app,
+                Some(caller),
+                "POST",
+                "/v1/tasks/PAP-99/move",
+                Some(json!({ "to": "nowhere" })),
+            )
+            .await,
+            404,
+        );
+    }
+}
+
+/// What the path names is looked up before the body is read: an unknown task, workstream or
+/// project is `404` whatever the body; a known one with a bad body is `400`.
+#[tokio::test]
+async fn an_unknown_path_is_404_before_a_bad_body_is_400() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let work = seeded(dir.path());
+    let app = app(&work);
+    let sam = Some(person(SAM));
+    let unknown_ws = "01JB000000000000000WST0099";
+    let unknown_project = "01JB000000000000000PRJ0099";
+    let bad = json!("not an object");
+    for (method, path, status) in [
+        ("POST", "/v1/tasks/PAP-99/dispatch".to_owned(), 404),
+        ("POST", "/v1/tasks/PAP-99/assign".to_owned(), 404),
+        ("PATCH", format!("/v1/workstreams/{unknown_ws}"), 404),
+        ("PUT", format!("/v1/briefs/workstream/{unknown_ws}"), 404),
+        ("PUT", format!("/v1/briefs/project/{unknown_project}"), 404),
+        ("POST", "/v1/tasks/PAP-5/dispatch".to_owned(), 400),
+        ("POST", "/v1/tasks/PAP-5/assign".to_owned(), 400),
+        (
+            "PATCH",
+            format!("/v1/workstreams/{}", demo().workstreams[0].id.0),
+            400,
+        ),
+        ("PUT", format!("/v1/briefs/project/{PAPER}"), 400),
+    ] {
+        let res = call(&app, sam, method, &path, Some(bad.clone())).await;
+        assert_eq!(res.0, status, "{method} {path}: {}", res.1);
+    }
+}
+
+#[tokio::test]
+async fn an_answer_needs_an_option_or_some_text() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let work = seeded(dir.path());
+    let app = app(&work);
+    let sam = person(SAM);
+    let ask = "01JB000000000000000ASK0002";
+    for body in [
+        json!({ "text": "" }),
+        json!({ "text": "   " }),
+        json!({ "text": null }),
+    ] {
+        expect(&answer(&app, sam, ask, body).await, 400);
+    }
+    // With an option, a blank text is left out.
+    let res = answer(&app, sam, ask, json!({ "option": 0, "text": " " })).await;
+    expect(&res, 200);
+    assert_eq!(res.1["answer"]["option"], 0);
+    assert!(res.1["answer"].get("text").is_none(), "{}", res.1);
 }
 
 async fn raise(app: &axum::Router, kind: &str, to: &str) -> String {

@@ -41,6 +41,15 @@ a fresh file at once both succeed and each migration runs once.
 - `since(rev, limit)` pages forward; `before(rev, limit, &EventFilter)` pages back. An empty type
   filter matches everything. With types, `before` merges one `(type, rev)` index walk per type,
   so a page costs about `limit` rows per type however large the log is.
+- `contains(EventId) -> bool` is the supported way to ask whether an id is already in the log
+  (other crates no longer need their own `SELECT 1 FROM events WHERE id = ?` against a raw
+  connection). `events.id` is unique-indexed (`migrations/0001_init.sql`), so this costs one
+  indexed lookup — about the same as reading a single row of a `since`/`before` page, not a scan
+  of the log. It runs on the same connection `since` and `before` do (the separate read-only
+  connection in local mode, the write connection in network mode): do not call it inside `read`
+  (it deadlocks, for the same reason `since` and `before` do). The free function
+  `pitcrew_store::contains(conn, id)` is the same query taking a connection directly, for a caller
+  already inside `read`'s closure: `store.read(|c| contains(c, id))`.
 - `subscribe()` is a `tokio::sync::broadcast` receiver of new revision ranges. When this `Store`
   is the only writer to the file, ranges arrive in order and contiguous; appends by another
   process are not announced. A receiver that falls behind gets `Lagged` and catches up with
@@ -83,6 +92,20 @@ Then:
 - bump `version()` whenever `apply` changes meaning. `reset` followed by replaying the log must
   give the same tables as applying events one append at a time; test that.
 
+**Adding a projection to an already-open store.** `Store::register(Box::new(projection))` adds a
+projection without reopening: it runs the same catch-up `Store::open_with` runs for a projection
+present from the start (`reset`, or replay from its checkpoint), inside one write transaction,
+then the projection starts receiving every event appended through this `Store` from then on. It
+shares the one write lock every other writer (`append`, `rebuild`, `import`) already uses, so no
+event can be appended while the catch-up runs, and nothing can observe the projection as
+registered before its tables already reflect the log as of that transaction's commit — an append
+attempted concurrently either committed before `register` started (so the catch-up already covers
+it) or queues behind the write lock and applies to the new projection normally once it proceeds.
+In network mode this never drops or re-takes the lease, unlike closing the `Store` and opening it
+again: that is the point of it (see "Network filesystems", below, and the daemon's README, "Known
+gaps" — "The lease between the two opens"). `Error::DuplicateProjection` if the name is already
+registered; errors otherwise as `Store::open_with`.
+
 **SQL access.** `pitcrew_store::sql` re-exports the store's `rusqlite`, so domain crates use the
 workspace's one version and the same `Transaction` type without their own dependency. `apply`
 and `reset` get the write transaction: do not commit, and touch only your own tables. A
@@ -98,7 +121,12 @@ being checkpointed. The closure's error type is anything a store `Error` convert
 `pitcrew_store::Result<T>`, where `?` on a `sql::Error` works.
 
 **Do not call `read`, `since` or `before` inside a `read` closure: it deadlocks** (they wait for
-the connection the closure holds). Appending inside one is fine.
+the connection the closure holds). **Appending (or calling `rebuild` or `register`) inside one is
+fine in local (WAL) mode** — `read` holds the separate reader connection's lock there, a different
+one from the write connection those take — **but deadlocks in network mode**, where there is no
+separate reader and `read` already holds the *write* connection's lock for the closure's whole
+duration: a write from the same thread waits for a lock it already holds, forever.
+`std::sync::Mutex` is not reentrant, and nothing here turns that into a clean error instead.
 
 **Closing.** The read connection closes before the write connection, so the writer is the last
 to close and checkpoints the WAL: no `-wal` or `-shm` file is left, and the `.db` alone holds
@@ -122,8 +150,156 @@ For every domain crate (E, F, G) that writes one:
 - **Inside `read`, the revision the data reflects is `projection_state.rev`** for that
   projection, queried in the same closure. Not `MAX(events.rev)` (another process may have
   appended events not yet applied) and not `Store::latest_rev()` (outside the snapshot).
-- **A future NFS mode** (`journal_mode=DELETE` plus EXCLUSIVE locking) has no concurrent
-  readers: it must route `read` (and `since`, `before`) through the write connection.
+- **Network mode** (`journal_mode=DELETE` plus EXCLUSIVE locking) has no concurrent readers:
+  `read`, `since` and `before` route through the write connection instead. See the next section.
+
+## Network filesystems and the single-host lease
+
+HPC home directories are often NFS, Lustre or GPFS. SQLite's WAL mode needs shared memory, which a
+network filesystem does not provide safely, and SQLite's own file locking is not trustworthy over
+one either (that is the whole reason this mode exists). `StoreOptions.fs` chooses how `Store::open`
+decides:
+
+- **`FsMode::Auto`** (the default) calls `pitcrew_store::detect` on the database's directory.
+  **Linux** reads `statfs`'s `f_type` magic number; **macOS** reads its `f_fstypename`; **Windows**
+  treats a UNC path (`\\server\share`, `\\?\UNC\...`) as network and a drive letter as local (a
+  mapped network drive looks local to `std`; force `FsMode::Network` for those). An unrecognised
+  type (`FsKind::Unknown`) is treated the same as `FsKind::Network`: guessing "local" wrongly is
+  the unsafe direction, so anything not on the allowlist (`ext2`/`3`/`4`, `xfs`, `btrfs`, `zfs`,
+  `tmpfs`, `f2fs`, `bcachefs`, `overlay(fs)`, `apfs`, `hfs` and similar) takes the slower, safe
+  path.
+- **`FsMode::Local`** and **`FsMode::Network`** force the choice, for callers who know better and
+  for tests.
+
+**Local mode** is unchanged: WAL, no lease. **Network mode**:
+
+- `journal_mode=DELETE`, `locking_mode=EXCLUSIVE`, the same `synchronous=NORMAL`.
+- No separate read-only connection: `locking_mode=EXCLUSIVE` means a second connection to the file
+  cannot be relied on, so `Store::read`, `Store::since` and `Store::before` run on the write
+  connection. They therefore wait for a concurrent append (and vice versa); this is the documented
+  cost of network mode, not a bug.
+- **The lease.** Generation-numbered files next to the database, `<db>.lease.<gen>` (e.g.
+  `store.db.lease.1`, `store.db.lease.2`, ...; `gen` a `u64` counter starting at 1), each holding
+  JSON `{"host": "...", "pid": ..., "until_ms": <epoch ms>}`. The **current** lease is whichever
+  generation is highest — found by listing the directory and parsing names strictly, never a
+  fixed name. **No live lease is ever renamed or deleted by anyone but its owner**: taking over
+  means creating a *new*, higher-numbered file, never touching whatever is already there. (An
+  earlier design took over an expired lease in place, renaming it aside and restoring it if that
+  turned out to be wrong; a three-way interleaving — a straggler's now-stale decision displacing
+  an already-confirmed winner, a third racer filling the resulting gap — could still leave two
+  hosts both holding it. Generation numbers remove the mechanism that made that possible.)
+  - **Acquire**: read the current generation (or none); if it is live, fail with
+    `Error::Leased { host, pid, until }`, without ever touching SQLite; if it is expired, absent,
+    or names a dead same-host owner (checked with `kill(pid, 0)` through `rustix`, no `unsafe`;
+    not possible on Windows, so there it is expiry only), exclusively create the next generation —
+    `std::fs::hard_link`, so it either creates that exact name or fails with `AlreadyExists`,
+    atomically, including over NFS (where this, not `open(O_CREAT | O_EXCL)` on the final name
+    directly, is the standard exclusive-create idiom: the latter is not reliably atomic across
+    NFSv3 clients). After creating, re-list: if a *higher* generation already exists (another
+    racer's own exclusive create for the same next number won a step ahead of ours), our file was
+    never going to be current — delete it (ours alone to delete) and retry from a fresh read. A
+    torn or garbage file (one that does not parse as that JSON) is treated as expired only once
+    its mtime is older than `lease_ttl`: a lease mid-write is not mistaken for a free one.
+  - **Renewal is automatic**, from a small thread `Store::open` starts, not a method callers must
+    remember to call: it wakes every `lease_ttl / 3` (so one slow or missed wakeup still leaves
+    two tries before the lease would actually expire), re-lists for a higher generation — if one
+    exists, it stops, having been taken over — and only then rewrites its own generation file with
+    a fresh `until_ms` (a plain temp-file-plus-rename onto its own name: safe, since nothing else
+    ever touches it).
+  - **Checked before every write, not just by the renewal thread's flag**: `Store`'s internal
+    `check_lease()` re-lists the lease directory fresh on every `append`, `rebuild`, `register` and
+    `import` (`import` checks again before every batch's insert and once more right before its
+    final `COMMIT`, not only up front) — a cheap `readdir` and filename comparison, no file content
+    to read — so a takeover is caught immediately, not up to `lease_ttl / 3` later when the renewal
+    thread would next notice on its own. Checked only *after* the write connection's own lock is
+    taken, not before: another writer can hold that lock for a while (a long `import`, say), and a
+    check made before waiting for it would describe a lease that may no longer be current by the
+    time the wait ends. A displaced owner's very next write fails with `Error::LeaseLost`.
+  - **`StoreOptions.clock`** (a `Clock`, defaulting to `SystemClock`) is where the lease gets the
+    time; inject one in tests to expire a lease without sleeping.
+  - **Release**: dropping the `Store` stops the renewal thread and deletes only its own generation
+    file. No read-then-delete race to avoid, no capture-and-restore dance — nothing else could
+    ever have touched it.
+  - **Garbage collection**: after becoming the current owner, generations older than `gen - 1` are
+    deleted (the current one and the one just before it are kept, for diagnosis). Only the current
+    owner ever deletes anything, and only generations that are not current.
+  - **Residual limits.** A file-based lease on a filesystem this crate does not control cannot
+    close every race: NFS directory and attribute caching (`actimeo` and friends) can hide a new
+    `lease.<gen+1>` from an old owner for a while, and clock skew between hosts means "expired" is
+    each host's own opinion, not a global fact. Both are mitigated, not eliminated, by the
+    per-write re-list (catches a loss quickly once the directory listing *is* visible) and by
+    choosing a `lease_ttl` with real margin over expected clock drift, cache staleness and routine
+    scheduling delays — never fully solved by cleverness in this file alone. A filesystem that
+    cannot hard-link at all (rare: some FAT-formatted shares) fails lease acquisition outright
+    rather than silently falling back to an unsafe check-then-write. Also: `check_lease` failing
+    with `Error::LeaseLost` inside a transaction (mid-`import`, say) still has to unwind out of it,
+    and in network mode (`journal_mode=DELETE`, a rollback journal) rolling back is not a no-op —
+    SQLite writes the journal's saved page contents back into the main database file to undo what
+    the transaction already wrote. So this process still touches the file once more *after* it has
+    already learned another host may now own the lease; if that host's own writes land in the same
+    window, the two sets of writes to the same file are not ordered by anything this crate
+    controls. The per-write re-list narrows the window before this can happen (a loss is caught at
+    the start of the very next write, not just at its commit), but cannot close it: by the time
+    `Error::LeaseLost` is known, the rollback's own writes are still ahead of it, not behind it.
+  - A store whose lease used the old, single fixed `<db>.lease` name has never shipped, so there
+    is no migration to support.
+
+## Maintenance
+
+- **`Store::snapshot(dest)`** copies the store with `VACUUM INTO`: a consistent copy as of the
+  moment it starts, safe to call while the store is in use (appends through this `Store` wait for
+  the duration; nothing is corrupted either way). `dest` must not already exist.
+- **`Store::integrity_check(full)`** runs `PRAGMA quick_check` (or, if `full`,
+  `PRAGMA integrity_check`) and returns `IntegrityReport::Ok` or `Failed(messages)` — never an
+  `Err` for corruption itself. The free function `pitcrew_store::integrity_check(conn, full)`
+  checks any plain connection (e.g. to a snapshot or a raw copy) without opening it as a `Store`,
+  which would run migrations against a file that may be corrupt.
+- **`Store::export(writer)`** writes every event as one JSON line each (no revision: order is the
+  record), oldest first. **`Store::import(reader)`** loads those lines into an empty store,
+  inserting and applying them to every registered projection through the same insert-and-apply
+  path `append` uses, one line at a time (a single line over 16 MiB is refused outright, so
+  neither a huge file nor one huge line forces unbounded memory) and in batches of 1,000 for the
+  inserts themselves — but, unlike `append` called once per batch, all of it inside **one** write
+  transaction, committed only at the very end. So an import is whole or nothing (R7,
+  `docs/security/threat-model.md`): a bad line, a lost lease, or any other failure rolls every
+  batch back, not just the one in progress, and `Store::latest_rev` reads 0 afterwards — never a
+  prefix of `reader`'s lines, and never the `Error::NotEmpty` a retry used to get from a store a
+  bad batch had already partly filled. The store-is-empty check itself runs from *inside* that
+  same transaction (not a separate `latest_rev()` call before it starts), so a concurrent writer
+  that commits in between cannot slip past it: nothing else can write while this transaction holds
+  the lock, so by the time the check runs, it is already seeing the true state the insert that
+  follows it will build on. The lease (network mode) is checked the same way: after the write
+  connection's lock is actually held (not before — a check made before waiting for a lock another
+  writer holds could describe a lease that is no longer current by the time the wait ends), again
+  before every batch's insert, and once more right before the final `COMMIT`, so a takeover during
+  the read of a large file, or during a short, single-batch import, is still caught before
+  anything commits. Other designs considered: a staging table (rejected — would need its own
+  schema and a second copy of every row) and a fresh file renamed into place (rejected — a second
+  copy of the whole database on disk, and import would no longer reuse `append`'s own
+  insert-and-apply-projections path). One transaction instead reuses that path exactly and gets
+  "nothing or everything" on a real crash for free, from SQLite's own rollback journal.
+
+  **Costs.** The write lock is held for the whole import, not 1,000 lines at a time. `since`,
+  `before` and `Store::read` are unaffected in local (WAL) mode (they use the separate read
+  connection regardless) but share the write connection, and so wait, in network mode, same as
+  always. **`Store::latest_rev` always uses the write connection, in *both* modes**, so it blocks
+  for the whole import even in local mode — the one place "local mode is unaffected" does not
+  hold. WAL mode writes every changed page to `-wal` before it is ever folded back into the main
+  file, so a large import's peak disk use is roughly double the data it imports, and `-wal` is left
+  that size afterwards (there is no `journal_size_limit` set): `import` runs
+  `PRAGMA wal_checkpoint(TRUNCATE)` itself, right after a successful commit, local mode only, so
+  this does not linger past the call that caused it (best effort: its own failure does not fail
+  the import, which has already committed by then). (`synchronous=NORMAL` does not mean "no
+  fsync" the way it might for a single short transaction in rollback-journal mode: in WAL mode its
+  fsyncs happen at *checkpoint* time, not at every commit, so one long transaction is not simply
+  saving several commits' worth of fsyncs — see "Timings" for what a long import actually measured
+  against many short ones, about the same either way, not a reliable win from this.) Importing is
+  a rare, offline operation (support and tests, not sync, per its own doc), so these trade-offs
+  favour correctness. An import is a new log: `log_id` was already assigned when the store was
+  created, independently of import, so it differs from the exported store's. Both are for tests
+  and support, not sync. A successful import sends subscribers one announcement for the whole
+  range, not one per internal batch — a partial, not-yet-durable range must never reach a
+  subscriber, which ruled out announcing per batch the way `append` does.
 
 ## Timings
 
@@ -144,3 +320,17 @@ Measured 2026-09-30 on a laptop (Intel Core Ultra 5 135U, 14 threads, 16 GB), WS
 
 With other agents building on the same machine, worst pages reached about 10–13 ms, for `main`'s
 code as well; the targets hold on an idle machine.
+
+**Import (R7, `docs/build/briefs/C-import-and-reopen.md`): about the same as the old per-batch
+design, not reliably faster or slower.** Measured 2026-10-01, one run each (not six, and not the
+idle machine above: a machine shared with several other agents building at once, same laptop
+model), `tests/perf.rs`'s `import_10k_compares_to_ten_committed_batches`:
+
+| Operation | Took |
+|---|---|
+| `import`, 10,000 events, one transaction (the current design) | 370 ms |
+| The same 10,000 events, `append`ed in ten separately committed batches of 1,000 (the old design's cost) | 393 ms |
+
+One run under shared load is not a controlled measurement — these numbers say "the same order of
+magnitude," not "370 ms beats 393 ms." Re-run on an idle machine before relying on a specific
+figure.

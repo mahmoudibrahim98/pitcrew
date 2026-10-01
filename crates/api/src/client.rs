@@ -3,9 +3,10 @@
 //!
 //! - Unix: [`check_unix_socket`] before connecting (the directory is ours and 0700, the socket
 //!   is ours), and [`check_unix_peer`] after (the server runs as us).
-//! - Windows: [`check_pipe_server`] after connecting: the process serving the pipe runs as the
-//!   current user. A pipe name can be created by anyone while the daemon is down, so this check,
-//!   not the name, is what makes the pipe trustworthy.
+//! - Windows: [`check_pipe_server`] after connecting: the pipe must be owned by exactly the
+//!   current user (the daemon always names it explicitly, elevated or not). A pipe name can be
+//!   created by anyone while the daemon is down, so this check, not the name, is what makes the
+//!   pipe trustworthy.
 
 use std::io;
 
@@ -52,20 +53,31 @@ pub fn check_unix_peer(stream: &tokio::net::UnixStream) -> io::Result<()> {
     }
 }
 
-/// Checks that the server end of a connected pipe runs as the current user.
+/// Checks that a connected pipe is owned by exactly the current user, so it was created by our
+/// daemon (or by us).
+///
+/// The daemon always names the current user as its pipe's owner, elevated or not
+/// (`PipeSecurity::current_user_only`), so this never falls back to the token's default owner
+/// (`TokenOwner`): elevated, that default is typically the Administrators group
+/// (`S-1-5-32-544`), and accepting it would let in a pipe any other elevated process created
+/// without naming us as its owner. Another user cannot create a pipe owned by us (that takes the
+/// restore privilege), and the owner, unlike the server's process id (which an earlier version
+/// checked), cannot be recycled by a process that exits.
+///
+/// The handle needs `READ_CONTROL`, which a client opened for reading (tokio's default) has.
 ///
 /// # Errors
-/// `PermissionDenied` if it runs as another user; the check cannot be made.
+/// `PermissionDenied` if anyone else owns it; the check cannot be made.
 #[cfg(windows)]
 pub fn check_pipe_server(pipe: &impl std::os::windows::io::AsHandle) -> io::Result<()> {
-    use crate::listener::pipe_security::{current_user_sid, pipe_server_sid};
-    let server = pipe_server_sid(pipe)?;
-    if server == current_user_sid()? {
+    use crate::listener::pipe_security::{current_user_sid, owner_sid};
+    let owner = owner_sid(pipe)?;
+    if owner == current_user_sid()? {
         Ok(())
     } else {
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!("the pipe's server runs as another user ({server})"),
+            format!("the pipe is owned by another user ({owner})"),
         ))
     }
 }

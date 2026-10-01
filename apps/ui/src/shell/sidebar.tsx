@@ -4,10 +4,11 @@
 
 import { Link, useRouter } from '@tanstack/react-router';
 import { Suspense, useId, type ReactNode } from 'react';
-import { useMe, useWorkspace } from '../data/index.ts';
+import { useGatewayWorkspaces, useMe, useWorkspace, type WorkspaceState } from '../data/index.ts';
 import {
   Avatar,
   ChevronsUpDownIcon,
+  FOCUS_RING,
   Menu,
   MenuContent,
   MenuItem,
@@ -24,6 +25,7 @@ import { cx } from '../lib/cx.ts';
 import { useRegistry } from './context.ts';
 import { inLayout } from './feature.ts';
 import { useLayout, useWorkspaceId } from './layout.ts';
+import { WORKSPACE_STATE_LABEL } from './pages/unavailable.tsx';
 import { paths } from './paths.ts';
 import { ProjectsTree } from './projects-tree.tsx';
 import type { ResolvedNav } from './registry.ts';
@@ -32,7 +34,7 @@ import { useShell } from './store.ts';
 
 const ITEM =
   'flex h-7 min-w-0 items-center gap-2 rounded-sm px-2 text-sm text-ink-2 outline-none ' +
-  'hover:bg-hover hover:text-ink focus-visible:outline-2 focus-visible:outline-accent ' +
+  `hover:bg-hover hover:text-ink ${FOCUS_RING} ` +
   'aria-[current=page]:bg-card aria-[current=page]:font-medium aria-[current=page]:text-ink ' +
   'aria-[current=page]:shadow-[0_0_0_1px_var(--pc-line)]';
 
@@ -40,16 +42,22 @@ function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
   const router = useRouter();
   const ws = useWorkspaceId();
   const workspace = useWorkspace().data?.workspace;
-  // One workspace for now; the menu lists however many the hub reports.
-  const workspaces = workspace === undefined ? [] : [workspace];
-  const name = workspace?.name ?? 'Workspace';
+  // The desktop app lists the gateway's workspaces, and follows its changes; a browser has the
+  // hub's one workspace.
+  const desktop = useGatewayWorkspaces();
+  const workspaces: { id: string; name: string; state?: WorkspaceState }[] =
+    desktop !== null ? (desktop.list ?? []) : workspace === undefined ? [] : [workspace];
+  const name = workspaces.find((w) => w.id === ws)?.name ?? workspace?.name ?? 'Workspace';
   return (
     <Menu>
       <MenuTrigger asChild>
         <button
           type="button"
           aria-label={`Workspace: ${name}`}
-          className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-md px-1.5 text-left outline-none hover:bg-hover focus-visible:outline-2 focus-visible:outline-accent"
+          className={cx(
+            'flex h-9 min-w-0 flex-1 items-center gap-2 rounded-md px-1.5 text-left outline-none hover:bg-hover',
+            FOCUS_RING,
+          )}
         >
           <span
             aria-hidden
@@ -73,7 +81,7 @@ function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
         >
           {workspaces.map((w) => (
             <MenuRadioItem key={w.id} value={w.id}>
-              {w.name}
+              {w.state === undefined || w.state === 'ready' ? w.name : `${w.name} · ${WORKSPACE_STATE_LABEL[w.state]}`}
             </MenuRadioItem>
           ))}
         </MenuRadioGroup>
@@ -163,7 +171,10 @@ export function Sidebar() {
         type="button"
         aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
         onClick={() => setCollapsed(!collapsed)}
-        className="inline-flex size-7 shrink-0 items-center justify-center rounded-sm text-ink-2 outline-none hover:bg-hover hover:text-ink focus-visible:outline-2 focus-visible:outline-accent"
+        className={cx(
+          'inline-flex size-7 shrink-0 items-center justify-center rounded-sm text-ink-2 outline-none hover:bg-hover hover:text-ink',
+          FOCUS_RING,
+        )}
       >
         <SidebarIcon />
       </button>

@@ -15,6 +15,8 @@ export const ORCHESTRATOR_WIDTH = { min: 280, max: 640, initial: 360 } as const;
 
 interface Persisted {
   workspaces: Record<string, WorkspacePrefs>;
+  /** The workspace last opened: `/` opens it again in the desktop app, which has several. */
+  lastWorkspace: string | null;
   sidebarCollapsed: boolean;
   /** Projects open in the sidebar tree, by id. */
   expanded: Record<string, boolean>;
@@ -33,6 +35,7 @@ interface Transient {
 interface Actions {
   setLayout(ws: string, layout: LayoutId): void;
   remember(ws: string, layout: LayoutId, path: string): void;
+  setLastWorkspace(ws: string): void;
   setSidebarCollapsed(collapsed: boolean): void;
   setExpanded(id: string, open: boolean): void;
   setOrchestratorOpen(open: boolean): void;
@@ -46,6 +49,7 @@ export type ShellState = Persisted & Transient & Actions;
 
 export const initialShellState: Persisted & Transient = {
   workspaces: {},
+  lastWorkspace: null,
   sidebarCollapsed: false,
   expanded: {},
   orchestratorOpen: false,
@@ -73,6 +77,8 @@ export const useShell = create<ShellState>()(
             workspaces: { ...s.workspaces, [ws]: { layout, last: { ...current.last, [layout]: path } } },
           };
         }),
+      setLastWorkspace: (lastWorkspace) =>
+        set((s) => (s.lastWorkspace === lastWorkspace ? s : { lastWorkspace })),
       setSidebarCollapsed: (sidebarCollapsed) => set({ sidebarCollapsed }),
       setExpanded: (id, open) => set((s) => ({ expanded: { ...s.expanded, [id]: open } })),
       setOrchestratorOpen: (orchestratorOpen) => set({ orchestratorOpen }),
@@ -87,6 +93,7 @@ export const useShell = create<ShellState>()(
       version: 1,
       partialize: (s): Persisted => ({
         workspaces: s.workspaces,
+        lastWorkspace: s.lastWorkspace,
         sidebarCollapsed: s.sidebarCollapsed,
         expanded: s.expanded,
         orchestratorOpen: s.orchestratorOpen,

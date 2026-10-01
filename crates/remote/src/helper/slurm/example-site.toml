@@ -1,0 +1,39 @@
+# A site recipe: what one SLURM cluster needs for PitCrew's helper job.
+#
+# Copy it to ~/.pitcrew/sites/<name>.toml on your laptop; <name> (a-z 0-9 _ -) is the recipe's
+# name. Every key is optional. An unknown key is an error, and every value is checked before it
+# goes into the job script, which PitCrew shows you before it submits anything.
+
+description = "Example cluster: GPU nodes, home on NFS, no ssh to compute nodes"
+
+# Job defaults. What you choose in PitCrew overrides them.
+partition = "gpu"
+account = "proj0001"
+qos = "normal"
+time = "08:00:00"          # minutes, h:mm:ss, or days-hh:mm:ss
+cpus = 2                   # --cpus-per-task
+memory = "8G"              # --mem
+gres = "gpu:1"             # --gres
+
+# More #SBATCH options, as long options with their values (--name=value). Only options that
+# cannot change which job PitCrew tracks, where its files go, or the helper's environment are
+# accepted (see ALLOWED_SBATCH in the crate's docs).
+sbatch = ["--constraint=a100", "--nodes=1"]
+
+# Environment modules the job loads before it starts the helper. If /bin/sh on the compute
+# nodes has no `module` command, name the script that sets it up: the job sources it, so it,
+# any link to it and the directories on the way must belong to root or you and be writable by
+# no one else. A recipe is trusted like a shell script you run.
+modules_init = "/etc/profile.d/modules.sh"
+modules = ["example-toolchain/1.0", "nodejs/22"]
+
+# How the laptop's connection reaches the compute node from the login node:
+#   "ssh"   ssh <node>, where the site lets you log in to nodes running your jobs;
+#   "srun"  srun --jobid <job> --overlap, inside the job (SLURM 20.11 or newer).
+last_hop = "srun"
+
+# Where the helper's socket goes:
+#   "root"        ~/.pitcrew/run/pitcrewd.sock, in your home;
+#   "node-local"  $TMPDIR (else /tmp) on the compute node, when the home is a network
+#                 filesystem where sockets are a problem.
+socket = "node-local"

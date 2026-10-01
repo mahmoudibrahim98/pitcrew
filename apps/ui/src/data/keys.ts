@@ -1,7 +1,7 @@
 // Query keys. Lists and details sit under separate prefixes so an event can invalidate every list
 // of a kind (`['tasks', 'list']`) without touching unrelated details, and one detail by id.
 
-import type { AskFilters, SessionFilters, TaskFilters } from './types.ts';
+import type { AskFilters, RecapBlockFilters, RecapDayScope, SessionFilters, TaskFilters } from './types.ts';
 
 export const keys = {
   me: ['me'] as const,
@@ -41,5 +41,15 @@ export const keys = {
   asks: {
     lists: ['asks', 'list'] as const,
     list: (filters: AskFilters = {}) => ['asks', 'list', filters] as const,
+  },
+  /**
+   * `all` is every recap key, for "invalidate every recap" (API v1, "Recaps", "Live updates").
+   * Each infinite query keeps every page it has loaded under one key (`recaps.ts`'s
+   * `useLiveInfiniteQuery`); invalidating it refetches all of them.
+   */
+  recaps: {
+    all: ['recaps'] as const,
+    blocks: (filters: RecapBlockFilters = {}) => ['recaps', 'blocks', filters] as const,
+    days: (scope: RecapDayScope, tz: number) => ['recaps', 'days', scope, tz] as const,
   },
 };

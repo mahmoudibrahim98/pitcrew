@@ -6,6 +6,12 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+  # Unmaintained, not a vulnerability. Reaches only the desktop shell (its own workspace), via
+  # glib-macros 0.18 (gtk-rs GTK3), which Tauri 2 needs on Linux. A build-time proc macro with no
+  # upgrade path until Tauri moves to GTK4. Revisit when Tauri does.
+  { id = "RUSTSEC-2024-0370", reason = "proc-macro-error via glib-macros 0.18 (Tauri 2 on Linux), build-time only, no upgrade" },
+]
 
 [licenses]
 version = 2

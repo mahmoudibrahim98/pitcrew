@@ -1,24 +1,18 @@
 // The `/v1/stream` connection: resume by `since`, reset when the hub's history is behind us,
-// reconnect with back-off, and reconnect after 60 s without a frame. No React here.
+// reconnect with back-off, and reconnect after 60 s without a frame. No React here. The socket
+// comes from a transport, so the same client runs in a browser and through the desktop gateway.
 
+import { socketUrl, type SocketClose, type SocketLike, type Transport } from './transport.ts';
 import type { Event, StreamFrame } from './types.ts';
+
+export { SUBPROTOCOL } from './transport.ts';
+export type { SocketClose, SocketFactory, SocketLike } from './transport.ts';
 
 export type StreamStatus = 'connecting' | 'live' | 'reconnecting' | 'stopped';
 
-/** The part of the browser `WebSocket` the client uses; tests pass a fake. */
-export interface SocketLike {
-  onmessage: ((message: { data: unknown }) => void) | null;
-  onclose: (() => void) | null;
-  onerror: (() => void) | null;
-  close(): void;
-}
-export type SocketFactory = (url: string, protocols: string[]) => SocketLike;
-
 export interface StreamOptions {
-  /** The API base, for example `http://127.0.0.1:47317`; the scheme becomes `ws:` or `wss:`. */
-  baseUrl: string;
-  /** Sent as the `pitcrew.bearer.<token>` subprotocol. Absent in the desktop app. */
-  token?: string | undefined;
+  /** Where the socket comes from: the browser's WebSockets, or the desktop gateway. */
+  transport: Transport;
   /** The revision the caller's data is at. Without it, the stream starts from the hub's `hello`. */
   since?: number | undefined;
   /** Events not seen before, in order. */
@@ -26,9 +20,11 @@ export interface StreamOptions {
   /** The hub's history is behind `since` (it was reset): drop cached state and refetch. */
   onReset(rev: number): void;
   onStatus?(status: StreamStatus): void;
-  /** A connection failed; `attempts` counts failures since the last stable connection. */
-  onFailure?(attempts: number): void;
-  socket?: SocketFactory;
+  /**
+   * A connection failed; `attempts` counts failures since the last stable connection. `close`
+   * says how, when the socket said (the desktop gateway says why it could not open one).
+   */
+  onFailure?(attempts: number, close?: SocketClose): void;
   /** Delay before reconnect attempt n is `min(maxMs, initialMs * 2^n)`, with jitter. */
   backoff?: { initialMs: number; maxMs: number };
   /** Reconnect when nothing arrives for this long. The hub pings every 20 s. */
@@ -38,18 +34,24 @@ export interface StreamOptions {
   random?: () => number;
 }
 
-export const SUBPROTOCOL = 'pitcrew.v1';
-const BEARER_PREFIX = 'pitcrew.bearer.';
+/** The stream's path, resuming after `since` when given. */
+export function streamPath(since: number | undefined): string {
+  return since === undefined ? '/v1/stream' : `/v1/stream?since=${since}`;
+}
 
-const browserSocket: SocketFactory = (url, protocols) =>
-  new WebSocket(url, protocols) as unknown as SocketLike;
+/**
+ * A terminal's socket path (API v1): `cols` and `rows` are 1..=1000; `from` is the number of
+ * output bytes already received, when reconnecting.
+ */
+export function terminalPath(session: string, size: { cols: number; rows: number; from?: number }): string {
+  const query = new URLSearchParams({ cols: String(size.cols), rows: String(size.rows) });
+  if (size.from !== undefined) query.set('from', String(size.from));
+  return `/v1/sessions/${encodeURIComponent(session)}/terminal?${query.toString()}`;
+}
 
-/** Relative to the API base, so a path prefix (`https://host/hub/`) is kept. */
+/** The browser's URL for the stream under an API base. */
 export function streamUrl(baseUrl: string, since: number | undefined): string {
-  const url = new URL('v1/stream', baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
-  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-  if (since !== undefined) url.searchParams.set('since', String(since));
-  return url.toString();
+  return socketUrl(baseUrl, streamPath(since));
 }
 
 function parseFrame(data: unknown): StreamFrame | undefined {
@@ -66,7 +68,6 @@ function parseFrame(data: unknown): StreamFrame | undefined {
 
 export class StreamClient {
   readonly #options: StreamOptions;
-  readonly #socketFactory: SocketFactory;
   #rev: number | undefined;
   /** The hub's event log (`hello.log`); revisions only compare within one log. */
   #log: string | undefined;
@@ -76,10 +77,11 @@ export class StreamClient {
   #silenceTimer: ReturnType<typeof setTimeout> | undefined;
   #stableTimer: ReturnType<typeof setTimeout> | undefined;
   #status: StreamStatus = 'stopped';
+  /** `retryNow()` came while a connection was being opened: if it fails, retry without waiting. */
+  #retrySoon = false;
 
   constructor(options: StreamOptions) {
     this.#options = options;
-    this.#socketFactory = options.socket ?? browserSocket;
     this.#rev = options.since;
   }
 
@@ -99,20 +101,33 @@ export class StreamClient {
 
   stop(): void {
     this.#clearTimers();
+    this.#retrySoon = false;
     this.#detach()?.close();
     this.#setStatus('stopped');
+  }
+
+  /**
+   * The hub is known to be back: reconnects now if waiting to, or, if a connection is being
+   * opened, retries at once should that one fail.
+   */
+  retryNow(): void {
+    if (this.#status === 'stopped' || this.#status === 'live') return;
+    if (this.#retryTimer === undefined) {
+      this.#retrySoon = true;
+      return;
+    }
+    clearTimeout(this.#retryTimer);
+    this.#connect();
   }
 
   #connect(): void {
     this.#retryTimer = undefined;
     const since = this.#rev;
-    const protocols = [SUBPROTOCOL];
-    if (this.#options.token !== undefined) protocols.push(BEARER_PREFIX + this.#options.token);
     if (this.#status !== 'reconnecting') this.#setStatus('connecting');
 
     let socket: SocketLike;
     try {
-      socket = this.#socketFactory(streamUrl(this.#options.baseUrl, since), protocols);
+      socket = this.#options.transport.openSocket(streamPath(since));
     } catch {
       this.#retry();
       return;
@@ -124,10 +139,10 @@ export class StreamClient {
       const frame = parseFrame(message.data);
       if (frame !== undefined) this.#handle(frame, since);
     };
-    socket.onclose = () => {
+    socket.onclose = (close) => {
       if (socket !== this.#socket) return;
       this.#detach();
-      this.#retry();
+      this.#retry(close);
     };
     // A close always follows an error.
     socket.onerror = () => {};
@@ -137,6 +152,7 @@ export class StreamClient {
   #handle(frame: StreamFrame, since: number | undefined): void {
     switch (frame.type) {
       case 'hello': {
+        this.#retrySoon = false;
         // A server that accepts and then drops us must not reset the back-off.
         this.#stableTimer = setTimeout(() => {
           this.#stableTimer = undefined;
@@ -188,15 +204,17 @@ export class StreamClient {
     }, this.#options.silenceMs ?? 60_000);
   }
 
-  #retry(): void {
+  #retry(close?: SocketClose): void {
     this.#clearTimers();
     this.#setStatus('reconnecting');
     const { initialMs, maxMs } = this.#options.backoff ?? { initialMs: 500, maxMs: 30_000 };
     const ceiling = Math.min(maxMs, initialMs * 2 ** this.#attempt);
     const jitter = 0.5 + (this.#options.random ?? Math.random)() * 0.5;
+    const delay = this.#retrySoon ? 0 : ceiling * jitter;
+    this.#retrySoon = false;
     this.#attempt += 1;
-    this.#retryTimer = setTimeout(() => this.#connect(), ceiling * jitter);
-    this.#options.onFailure?.(this.#attempt);
+    this.#retryTimer = setTimeout(() => this.#connect(), delay);
+    this.#options.onFailure?.(this.#attempt, close);
   }
 
   /** Forgets the current socket so its late callbacks are ignored, and returns it. */

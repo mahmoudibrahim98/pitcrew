@@ -14,9 +14,23 @@ See `docs/build/streams/L.md` and ADR-0008.
 | `core.tsx` | The shell's own feature: Home, Inbox, My tasks, Agent console, its commands, placeholder routes and "+ New" dialogs. |
 | `layout.ts` | Which layout is on, switching (`switchLayout`), and remembering where each layout was left. |
 | `store.ts` | UI state (zustand, persisted as `pitcrew.shell`). |
-| `frame.tsx`, `sidebar.tsx`, `projects-tree.tsx`, `top-bar.tsx`, `orchestrator.tsx`, `create.tsx` | The frame's parts. |
+| `frame.tsx`, `sidebar.tsx`, `projects-tree.tsx`, `top-bar.tsx`, `orchestrator.tsx`, `create.tsx` | The frame's parts. The frame sits in the workspace's data scope (`WorkspaceScope`, keyed by `$ws`). |
 | `palette.tsx`, `fuzzy.ts` | The palette (a lazy chunk) and its fuzzy matching. |
-| `pages/` | Placeholders at the well-known paths, the not-found page, and the redirects from `/` and `/w/$ws`. |
+| `pages/` | Placeholders at the well-known paths, the not-found page, the redirects from `/` and `/w/$ws`, and `unavailable.tsx` (a workspace the desktop gateway cannot reach, or that needs pairing). |
+
+## Workspaces in the desktop app
+
+In a browser the hub has one workspace. In the desktop app (`src/data/README.md`, "Workspaces in
+the desktop app"):
+
+- the switcher lists the gateway's workspaces, with their state when it is not `ready`
+  ("Beta Lab · Unreachable"), and follows `gateway://workspaces`;
+- each workspace has its own data scope: switching remounts the frame, and never shows another
+  workspace's data;
+- a workspace that is `unreachable` or `needs_pairing` keeps the frame (so another is one click
+  away) and shows why in the main area, with the gateway's `detail`; the top bar's pill says so;
+- `/` opens the workspace last opened, or the first ready one; an id the gateway does not list
+  is not found.
 | `proof-page.tsx` | The data layer's proof page, a dev-only route at `/dev/proof`. |
 
 ## Registering a feature
@@ -130,7 +144,7 @@ rely on these paths; build them with `paths` from `index.ts`.
   feature's `layout` when they do not set one, and children inherit it. On a route of one layout,
   that layout is on; on a `both` route (the Inbox) the workspace's stored layout stays.
 - **`staticData.title`** names the page in the breadcrumb when no param does ("Board").
-- `/` redirects to the hub's workspace; `/w/$ws` redirects to the stored layout's last page (or its
+- `/` redirects to the hub's workspace (in the desktop app, see above); `/w/$ws` redirects to the stored layout's last page (or its
   home: `home` for Projects, `console` for the Agent console). Unknown paths show a not-found page
   inside the frame.
 - In components, `useWorkspaceId()` gives `$ws`, `useLayout()` the layout on screen, and
@@ -169,6 +183,14 @@ The shell has placeholder dialogs for `task`, `agent`, `project` and `team`. A f
 `CreateEntry` with the same `id` replaces the placeholder; other ids add items. `dialog` is the
 body (it gets `close()`); the shell supplies the modal, its title (`title`, default "New
 <label>"), focus handling and a Suspense boundary. The palette lists every item as "New …".
+
+An entry with `disabled` (a reason) shows in the menu disabled, with that reason as an accessible
+description; it stays focusable, so the reason is reachable from the keyboard, but selecting it
+does nothing, and the palette leaves it out entirely:
+
+```ts
+{ id: 'session', label: 'Session', dialog: NewSession, disabled: 'Starting a session is not available yet.' }
+```
 
 ## Wiring components that already exist
 

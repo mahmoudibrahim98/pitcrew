@@ -1,13 +1,16 @@
 //! Projections: the work model's tables, derived from the event log.
 //!
-//! Each projection owns its tables (migrations `0200`–`0206`) and follows the store's rules, so
+//! Each projection owns its tables (migrations `0200`–`0210`) and follows the store's rules, so
 //! applying events one append at a time and rebuilding from the log give identical tables:
 //! - `apply` has no side effects: it never appends events and never reads the clock; times come
 //!   from the event (`at`), and authorship from `author` and `on_behalf_of`;
 //! - `apply` reads and writes only its own tables, never another projection's, and there are no
 //!   foreign keys between projections;
-//! - an event about something the projection does not know (a move of an unknown task) changes
-//!   nothing, so one odd event from a runner never blocks the log;
+//! - `apply` never fails on what an event says, only on a database error: an event about
+//!   something the projection does not know (a move of an unknown task) changes nothing, and an
+//!   event that contradicts the tables (a task key already taken, a move from a status the task
+//!   has left) is resolved deterministically (see [`Tasks`]). One odd event, or a second writer,
+//!   never stalls the log;
 //! - a list is returned in the order its rows were first created (`rev`), and a later event that
 //!   re-states a row (a second `task_created`, `ask_raised` or `session_discovered` with the same
 //!   id) updates it in place and keeps that order.
@@ -20,6 +23,7 @@ mod briefs;
 mod comments;
 mod directory;
 mod projects;
+mod refs;
 mod sessions;
 mod tasks;
 
@@ -29,6 +33,7 @@ pub(crate) use briefs::target_columns;
 pub use comments::Comments;
 pub use directory::Directory;
 pub use projects::Projects;
+pub use refs::Refs;
 pub use sessions::Sessions;
 pub use tasks::Tasks;
 
@@ -46,11 +51,12 @@ pub fn projections() -> Vec<Box<dyn Projection>> {
         Box::new(Asks),
         Box::new(Comments),
         Box::new(Briefs),
+        Box::new(Refs),
     ]
 }
 
 /// The names of [`projections`], e.g. for `Store::rebuild`.
-pub const NAMES: [&str; 7] = [
+pub const NAMES: [&str; 8] = [
     Directory::NAME,
     Projects::NAME,
     Tasks::NAME,
@@ -58,10 +64,11 @@ pub const NAMES: [&str; 7] = [
     Asks::NAME,
     Comments::NAME,
     Briefs::NAME,
+    Refs::NAME,
 ];
 
 /// Every table the work model owns, children before parents (the order `reset` clears them in).
-pub const TABLES: [&str; 20] = [
+pub const TABLES: [&str; 23] = [
     "work_team_members",
     "work_teams",
     "work_personas",
@@ -75,6 +82,7 @@ pub const TABLES: [&str; 20] = [
     "work_task_deps",
     "work_task_labels",
     "work_tasks",
+    "work_task_clashes",
     "work_dispatches",
     "work_sessions",
     "work_asks",
@@ -82,6 +90,8 @@ pub const TABLES: [&str; 20] = [
     "work_comments",
     "work_brief_proposals",
     "work_briefs",
+    "work_event_refs",
+    "work_ref_parents",
 ];
 
 type Applied = Result<(), BoxError>;

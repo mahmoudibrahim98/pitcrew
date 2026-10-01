@@ -16,6 +16,9 @@
 #![forbid(unsafe_code)]
 
 mod error;
+mod fs_kind;
+mod lease;
+mod maintenance;
 pub mod migrations;
 pub mod projection;
 mod scan;
@@ -27,9 +30,13 @@ mod store;
 pub use rusqlite as sql;
 
 pub use error::{DbError, Error, Result};
+pub use fs_kind::{FsKind, FsMode, detect};
+pub use lease::{Clock, SystemClock};
+pub use maintenance::{IntegrityReport, integrity_check};
 pub use projection::{BoxError, Projection};
 pub use store::{
-    EventFilter, MAX_SUBSCRIBER_CAPACITY, RevRange, Store, StoreOptions, StoredEvent, event_type,
+    EventFilter, MAX_SUBSCRIBER_CAPACITY, RevRange, Store, StoreOptions, StoredEvent, contains,
+    event_type,
 };
 
 /// The protocol version this crate was built against.

@@ -3,32 +3,11 @@
 
 import { useId, useState, type FormEvent } from 'react';
 import { Button, StatusPill } from '../design/index.ts';
-import type { BriefTarget, Event, Receipt, TimestampMs } from '../data/index.ts';
-import { useActivity, useBrief, useMe, useNames, useSaveBrief, sameTarget, type Brief } from './data.ts';
+import type { BriefTarget } from '../data/index.ts';
+import { useAcceptBrief, useBrief, useMe, useNames, useSaveBrief, sameTarget } from './data.ts';
 import { formatWhen } from './format.ts';
 import { Receipts } from './receipts.tsx';
 import { ErrorNote, Field, inputClass } from './ui.tsx';
-
-export interface Proposal {
-  text: string;
-  receipts: Receipt[];
-  at: TimestampMs;
-}
-
-/**
- * The back office's newest proposal for the target, if it is newer than the brief in force and
- * says something else. `events` are oldest first.
- */
-export function pendingProposal(brief: Brief | undefined, events: readonly Event[], target: BriefTarget): Proposal | undefined {
-  for (let i = events.length - 1; i >= 0; i--) {
-    const event = events[i];
-    if (event?.body.type !== 'brief_proposed' || !sameTarget(event.body.data.target, target)) continue;
-    const { text, receipts } = event.body.data;
-    if (brief !== undefined && (event.at <= brief.updated || text === brief.text)) return undefined;
-    return { text, receipts, at: event.at };
-  }
-  return undefined;
-}
 
 interface Draft {
   text: string;
@@ -41,17 +20,24 @@ export function WhereItStands({ target, title = 'Where it stands' }: { target: B
   const { brief: cached, isPending, error } = useBrief(target);
   const me = useMe();
   const names = useNames();
-  const activity = useActivity(target.kind === 'project' ? { project: target.id } : { workstream: target.id });
   const save = useSaveBrief();
+  const accept = useAcceptBrief();
   const [draft, setDraft] = useState<Draft | null>(null);
-  const [setAside, setSetAside] = useState<TimestampMs>(0);
 
-  // The hub's answer to my own save is newer than the cache until `brief_accepted` refreshes it.
-  const saved = save.data !== undefined && sameTarget(save.data.target, target) ? save.data : undefined;
+  // The hub's answer to my own save or accept is newer than the cache until it refreshes it;
+  // between the two, whichever happened more recently.
+  const forTarget = (data: typeof save.data) => (data !== undefined && sameTarget(data.target, target) ? data : undefined);
+  const savedBySave = forTarget(save.data);
+  const savedByAccept = forTarget(accept.data);
+  const saved =
+    savedBySave === undefined
+      ? savedByAccept
+      : savedByAccept === undefined || savedBySave.updated >= savedByAccept.updated
+        ? savedBySave
+        : savedByAccept;
   const brief = saved !== undefined && (cached === undefined || saved.updated > cached.updated) ? saved : cached;
   const person = me.data?.kind === 'human';
-  const found = pendingProposal(brief, activity.data?.events ?? [], target);
-  const proposal = found !== undefined && found.at > setAside ? found : undefined;
+  const proposal = brief?.proposal;
 
   const write = (next: { text: string; next?: string | undefined; pinned: boolean }, done?: () => void) => {
     const body =
@@ -74,7 +60,6 @@ export function WhereItStands({ target, title = 'Where it stands' }: { target: B
           {title}
         </h2>
         {brief?.pinned === true && <StatusPill tone="accent">Pinned</StatusPill>}
-        {brief === undefined && proposal !== undefined && <StatusPill tone="warn">Proposed</StatusPill>}
         {person && brief !== undefined && draft === null && (
           <span className="ml-auto flex gap-1.5">
             <Button
@@ -156,7 +141,7 @@ export function WhereItStands({ target, title = 'Where it stands' }: { target: B
         )
       )}
 
-      {!isPending && error === null && brief === undefined && proposal === undefined && draft === null && (
+      {!isPending && error === null && brief === undefined && draft === null && (
         <div className="flex items-center gap-2 text-sm text-ink-2">
           <p>Nothing written yet.</p>
           {person && (
@@ -167,30 +152,45 @@ export function WhereItStands({ target, title = 'Where it stands' }: { target: B
         </div>
       )}
 
-      {proposal !== undefined && draft === null && (
+      {brief !== undefined && proposal !== undefined && draft === null && (
         <div role="group" aria-label="Proposed update" className="mt-3 rounded-sm border border-dashed border-line-2 bg-sunken p-3">
-          <p className="mb-1 text-xs font-medium text-ink-2">
-            {brief === undefined ? 'The back office proposes' : 'The back office proposes an update'} ·{' '}
-            {formatWhen(proposal.at)}
-          </p>
+          <p className="mb-1 text-xs font-medium text-ink-2">The back office proposes an update · {formatWhen(proposal.at)}</p>
           <p className="mb-2 text-sm">{proposal.text}</p>
+          {proposal.next !== undefined && (
+            <p className="mb-2 text-sm">
+              <span className="font-medium">Next: </span>
+              {proposal.next}
+            </p>
+          )}
           <Receipts receipts={proposal.receipts} names={names} label="Proposal receipts" className="mb-2" />
           {person && (
             <div className="flex gap-2">
               <Button
                 variant="primary"
-                disabled={save.isPending}
-                onClick={() => write({ text: proposal.text, next: brief?.next, pinned: brief?.pinned ?? false })}
+                disabled={save.isPending || accept.isPending}
+                onClick={() =>
+                  accept.mutate({
+                    target,
+                    proposal: { text: proposal.text, ...(proposal.next === undefined ? {} : { next: proposal.next }) },
+                    pinned: brief.pinned,
+                  })
+                }
               >
                 Accept
               </Button>
-              <Button onClick={() => setSetAside(proposal.at)}>Keep current</Button>
+              <Button
+                disabled={save.isPending || accept.isPending}
+                onClick={() => write({ text: brief.text, next: brief.next, pinned: brief.pinned })}
+              >
+                Keep current
+              </Button>
             </div>
           )}
         </div>
       )}
 
       {save.error !== null && <ErrorNote error={save.error} what="save" />}
+      {accept.error !== null && <ErrorNote error={accept.error} what="accept the proposal" />}
     </section>
   );
 }

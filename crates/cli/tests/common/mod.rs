@@ -213,6 +213,25 @@ impl FakeServer {
             .filter(|r| r.target != "/v1/host/info" && r.target != "/v1/me")
             .collect()
     }
+
+    /// `requests()`, but waits (up to a few seconds) for at least `at_least` of them first: a
+    /// client process can exit — and `Command::wait_with_output` return — the instant it has
+    /// handed its request to the kernel's socket buffer, before this server's own background
+    /// thread has run far enough to `read_request` and record it. That gap is normally
+    /// microseconds, but under heavy load (many tests, or many other processes, competing for
+    /// the scheduler) it can outlast an immediate, unretried check. Returns whatever is recorded
+    /// once either the count is met or the deadline passes, so a genuine shortfall still fails
+    /// the caller's own assertion with a useful message, rather than hanging.
+    pub fn wait_for_requests(&self, at_least: usize) -> Vec<Recorded> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let requests = self.requests();
+            if requests.len() >= at_least || std::time::Instant::now() >= deadline {
+                return requests;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 }
 
 fn serve<S: Read + Write>(mut stream: S, handler: &Handler, log: &Mutex<Vec<Recorded>>) {

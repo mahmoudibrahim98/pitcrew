@@ -1,4 +1,5 @@
 //! A toy projection shared by the tests: events counted by a key, with the last revision seen.
+//! Also [`FakeClock`], for tests that expire a network-mode lease without sleeping.
 
 #![allow(dead_code)]
 
@@ -6,6 +7,8 @@ use pitcrew_store::migrations::{self, Migration};
 use pitcrew_store::sql::{self, Transaction};
 use pitcrew_store::{BoxError, Projection, StoredEvent, event_type};
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Barrier};
 
 /// Counts events per key, and the last revision seen per key.
 pub struct CountBy {
@@ -92,4 +95,71 @@ pub fn toy_migrations() -> Vec<Migration> {
 
 pub fn both() -> Vec<Box<dyn Projection>> {
     vec![Box::new(CountBy::types()), Box::new(CountBy::authors())]
+}
+
+/// A clock the test controls, so a network-mode lease can be made to look expired without
+/// sleeping. `now_ms` starts at the value passed to [`FakeClock::new`].
+#[derive(Debug)]
+pub struct FakeClock(AtomicI64);
+
+impl FakeClock {
+    pub fn new(now_ms: i64) -> Arc<Self> {
+        Arc::new(Self(AtomicI64::new(now_ms)))
+    }
+
+    pub fn advance(&self, delta_ms: i64) {
+        self.0.fetch_add(delta_ms, Ordering::SeqCst);
+    }
+}
+
+impl pitcrew_store::Clock for FakeClock {
+    fn now_ms(&self) -> i64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// Parks a wrapped projection's first `reset` call on a barrier, once armed, so a test can pause
+/// a rebuild or a `Store::register` catch-up mid-flight and prove what did or did not run
+/// concurrently with it.
+pub struct Gate {
+    pub armed: AtomicBool,
+    pub barrier: Barrier,
+}
+
+impl Gate {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            armed: AtomicBool::new(false),
+            barrier: Barrier::new(2),
+        })
+    }
+}
+
+/// Wraps a projection so its first `reset` blocks on `gate` (once armed) before delegating to
+/// `inner`; `apply` always delegates straight through.
+pub struct Gated<P> {
+    pub inner: P,
+    pub gate: Arc<Gate>,
+}
+
+impl<P: Projection> Projection for Gated<P> {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn version(&self) -> u32 {
+        self.inner.version()
+    }
+
+    fn reset(&self, tx: &Transaction<'_>) -> Result<(), BoxError> {
+        if self.gate.armed.load(Ordering::SeqCst) {
+            self.gate.barrier.wait();
+            self.gate.barrier.wait();
+        }
+        self.inner.reset(tx)
+    }
+
+    fn apply(&self, tx: &Transaction<'_>, event: &StoredEvent) -> Result<(), BoxError> {
+        self.inner.apply(tx, event)
+    }
 }

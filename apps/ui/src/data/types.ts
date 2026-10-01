@@ -289,6 +289,17 @@ export type BriefTarget = { kind: 'project'; id: ProjectId } | { kind: 'workstre
 
 export type BriefSource = 'person' | 'back_office';
 
+/**
+ * A new "Where it stands" the back office proposed, waiting for a person to accept it or keep the
+ * current one (see `Brief.proposal`). `at` is the time of its `brief_proposed`.
+ */
+export interface BriefProposal {
+  text: string;
+  next?: string;
+  receipts: Receipt[];
+  at: TimestampMs;
+}
+
 /** "Where it stands" for a project or workstream, as in force. */
 export interface Brief {
   target: BriefTarget;
@@ -299,6 +310,12 @@ export interface Brief {
   source: BriefSource;
   updated: TimestampMs;
   receipts: Receipt[];
+  /**
+   * The pending proposal, present exactly when there is one: the newest `brief_proposed` for the
+   * target, newer than the `brief_accepted` that put this brief in force. Accepting it, or keeping
+   * the current brief, clears it.
+   */
+  proposal?: BriefProposal;
 }
 
 export interface Answer {
@@ -323,6 +340,149 @@ export interface Ask {
   answer?: Answer;
   created: TimestampMs;
 }
+
+// ─── Recaps (`crates/protocol/src/recap.rs`) ───────────────────────────────────────────────────
+//
+// `GET /v1/recaps/blocks` and `GET /v1/recaps/days` (API v1, "Recaps"). Derived from the event
+// log, never stored; see `src/data/recaps.ts` for `clauses()` and the hooks.
+
+export const CHECKS = ['tests', 'lint', 'build'] as const;
+export type Check = (typeof CHECKS)[number];
+
+/** What a block groups. Serde's adjacently tagged `{"kind": "session", "id": …}`. */
+export type BlockKey =
+  | { kind: 'session'; id: SessionId }
+  | { kind: 'workstream'; id: WorkstreamId }
+  | { kind: 'project'; id: ProjectId };
+
+/** Counts over all of a block's events. Never capped. */
+export interface Counts {
+  events: number;
+  tools_run: number;
+  tools_failed: number;
+  file_edits: number;
+  lines_added: number;
+  lines_removed: number;
+  turns: number;
+  asks_raised: number;
+  asks_answered: number;
+  task_moves: number;
+  comments: number;
+}
+
+/** One file edited in a block. */
+export interface FileTouch {
+  path: string;
+  edits: number;
+  added: number;
+  removed: number;
+  receipts: Receipt[];
+}
+
+/** What a fact says, tagged by `type` (internally, so the fields sit beside it). */
+export type FactKind =
+  | { type: 'session_started'; title?: string }
+  | { type: 'session_linked'; workstream?: WorkstreamId; task?: TaskId }
+  | { type: 'session_waiting'; status_line?: string }
+  | { type: 'session_ended' }
+  | { type: 'dispatch_started'; task: TaskId; agent: MemberId }
+  | { type: 'dispatch_finished'; task?: TaskId; outcome: DispatchOutcome; summary?: string }
+  | { type: 'task_created'; task: TaskId }
+  | { type: 'task_moved'; task: TaskId; from: TaskStatus; to: TaskStatus }
+  | { type: 'task_assigned'; task: TaskId; assignee?: MemberId }
+  | { type: 'plan_updated'; task: TaskId; done: number; total: number }
+  | { type: 'checks'; check: Check; runs: number; failures: number; last_failed: boolean }
+  | { type: 'job_diverged'; jobs: string[] }
+  | { type: 'ask_raised'; ask: AskId; ask_kind: AskKind; to: MemberId; title: string }
+  | { type: 'ask_answered'; ask: AskId }
+  | { type: 'commented'; task?: TaskId; workstream?: WorkstreamId; mentions: MemberId[] }
+  | { type: 'decision_recorded'; text: string }
+  | { type: 'workstream_created'; workstream: WorkstreamId }
+  | { type: 'workstream_changed'; workstream: WorkstreamId; status: WorkstreamStatus; health: Health }
+  | { type: 'brief_accepted'; target: BriefTarget; pinned: boolean };
+
+/** A notable fact, with the evidence for it. */
+export interface Fact {
+  by: MemberId;
+  at: TimestampMs;
+  kind: FactKind;
+  receipts: Receipt[];
+}
+
+/** A burst of one session's (or workstream's/project's) work. `id` is its first event's id, `last` its last's. */
+export interface Block {
+  id: EventId;
+  last: EventId;
+  key: BlockKey;
+  start: TimestampMs;
+  end: TimestampMs;
+  session?: SessionId;
+  workstream?: WorkstreamId;
+  project?: ProjectId;
+  tasks: TaskId[];
+  agent?: MemberId;
+  actors: MemberId[];
+  counts: Counts;
+  files: FileTouch[];
+  files_omitted: number;
+  facts: Fact[];
+  facts_omitted: number;
+  tool_receipts: Receipt[];
+  turn_receipts: Receipt[];
+}
+
+/**
+ * One clause of a summary and its evidence. `range` is a **UTF-8 byte range** of the summary's
+ * `text`, on character boundaries — not a JavaScript string index. Use `clauses()` in
+ * `src/data/recaps.ts` rather than slicing `text` with it directly.
+ */
+export interface Span {
+  range: { start: number; end: number };
+  receipts: Receipt[];
+}
+
+/** Text whose every clause is a span with receipts; the text between spans is only punctuation. */
+export interface Summary {
+  text: string;
+  spans: Span[];
+}
+
+/** A block with its one-line summary, e.g. "@writer edited method.tex (+84 −12)". */
+export interface RecapBlock {
+  block: Block;
+  line: Summary;
+}
+
+/** `GET /v1/recaps/blocks`: a page of blocks, newest first by block id. Only `at_start` ends paging. */
+export interface BlocksPage {
+  blocks: RecapBlock[];
+  at_start: boolean;
+}
+
+/** One workstream's day; `workstream` is absent for a project's work outside any workstream. */
+export interface DayRecap {
+  workstream?: WorkstreamId;
+  date: CalendarDate;
+  blocks: EventId[];
+  summary: Summary;
+}
+
+/** `GET /v1/recaps/days`: a page of day paragraphs, newest date first. Only `at_start` ends paging. */
+export interface DaysPage {
+  days: DayRecap[];
+  at_start: boolean;
+}
+
+/** `GET /v1/recaps/blocks` filters: a block must match every one given. */
+export interface RecapBlockFilters {
+  session?: SessionId;
+  task?: TaskId;
+  workstream?: WorkstreamId;
+  project?: ProjectId;
+}
+
+/** `GET /v1/recaps/days`: exactly one of `workstream` or `project`. */
+export type RecapDayScope = { workstream: WorkstreamId } | { project: ProjectId };
 
 export interface Event {
   id: EventId;
@@ -389,8 +549,11 @@ export type EventBody =
       type: 'comment_posted';
       data: { task?: TaskId; workstream?: WorkstreamId; text: string; mentions: MemberId[] };
     }
-  | { type: 'brief_proposed'; data: { target: BriefTarget; text: string; receipts: Receipt[] } }
-  | { type: 'brief_accepted'; data: { target: BriefTarget; text: string; pinned: boolean } }
+  | { type: 'brief_proposed'; data: { target: BriefTarget; text: string; next?: string; receipts: Receipt[] } }
+  | {
+      type: 'brief_accepted';
+      data: { target: BriefTarget; text: string; next?: string; pinned: boolean; receipts?: Receipt[] };
+    }
   | {
       type: 'decision_recorded';
       data: { workstream?: WorkstreamId; text: string; why?: string; receipts: Receipt[] };
@@ -498,6 +661,32 @@ export interface EventsQuery extends EventFilters {
   before?: number;
   /** Default 100, at most 500. */
   limit?: number;
+}
+
+/** `POST /v1/projects`. The hub assigns `id`; `external` starts empty. */
+export interface NewProject {
+  /** `ProjectKey`: 2 to 10 characters, an uppercase letter, then uppercase letters or digits. */
+  key: string;
+  name: string;
+  /** Defaults to the caller; always a member (put first when `members` leaves it out). */
+  lead?: MemberId;
+  /** Defaults to the lead alone. Duplicates are dropped. */
+  members?: MemberId[];
+  /** Defaults to `in_progress`. */
+  status?: ProjectStatus;
+  /** `start` must not be after `due` when both are set. */
+  start?: CalendarDate;
+  due?: CalendarDate;
+  root?: Location;
+}
+
+/** `POST /v1/workstreams`. The hub assigns `id`; `health` starts `on_track`, `external` empty. */
+export interface NewWorkstream {
+  project: ProjectId;
+  name: string;
+  /** Defaults to `active`. */
+  status?: WorkstreamStatus;
+  locations?: Location[];
 }
 
 /** `POST /v1/tasks`. The hub assigns the id and the next key in the project. */

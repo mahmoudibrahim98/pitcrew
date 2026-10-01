@@ -1,0 +1,8 @@
+GET https://api.github.com/repos/example-org/demo-repo/milestones?state=all&sort=due_on&direction=asc&per_page=100 HTTP/1.1
+Accept: application/vnd.github+json
+
+HTTP/1.1 403
+X-RateLimit-Remaining: 0
+X-RateLimit-Reset: 2000003600
+
+{"message":"API rate limit exceeded for token."}

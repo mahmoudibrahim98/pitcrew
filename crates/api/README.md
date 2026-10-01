@@ -21,8 +21,13 @@ planted by another user never receives a token:
 
 - Unix: `check_unix_socket(dir)` before connecting (directory ours and 0700, socket ours), and
   `check_unix_peer(&stream)` after (the server runs as us).
-- Windows: `check_pipe_server(&client)` after connecting (the process serving the pipe runs as
-  the current user).
+- Windows: `check_pipe_server(&client)` after connecting (the pipe's owner must be exactly the
+  current user). The daemon always names the user as its pipe's owner, elevated or not, so the
+  check never falls back to the token's default owner (elevated, typically the Administrators
+  group) — that would let in a pipe any other elevated process created without naming us as its
+  owner. Another user cannot create a pipe owned by us, and unlike a server process id, the owner
+  cannot be recycled. Residual: an elevated administrator (or anyone with the restore privilege)
+  can plant a pipe that names us as its owner, and can already read our files.
 
 ## Auth
 
@@ -49,6 +54,9 @@ planted by another user never receives a token:
 - Backpressure: each client has a queue of `queue_frames` frames (default 64). A frame that
   cannot be queued within `send_timeout` (default 10 s) disconnects the client, which resumes
   with `since`.
+- Close codes: **1013** too slow (resume with `since`), **1001** the event source closed or the
+  hub is shutting down, **1011** the event source failed, **1009** a client message over 4 KiB.
+  A client's Close is answered before the socket is dropped.
 
 ## Hooks: `POST /v1/hooks/{engine}/{event}`
 
@@ -60,8 +68,8 @@ planted by another user never receives a token:
 - The route answers `202` at once and queues a `HookEvent` (with the `Caller`) for the
   `HookSink`. When the queue is full the event is dropped and counted (`HookIntake::dropped`).
 - `LogHookSink` only logs; the runner (stream D) provides the real sink. `deliver` runs on its
-  own thread and may block (e.g. on SQLite); a panic in it is logged and the next event is
-  delivered.
+  own thread and may block (e.g. on SQLite). A panic in it loses that one event: it is logged
+  with the panic's message, and **the sink keeps receiving** the next events.
 
 ## Terminals: `GET /v1/sessions/{id}/terminal?cols=&rows=&from=`
 
@@ -70,26 +78,99 @@ planted by another user never receives a token:
 - `Terminals` finds a session's terminal; `RuntimeTerminals::new(runtime)` implements it over
   any `Runtime`, with `link(session, terminal)` until the runner provides the mapping. Unknown
   sessions are `404`; an unreachable runtime is `503`.
+- **The `Attachment` contract** (for whoever implements `Terminals`): every method may block but
+  must return within bounded time, answering `Unavailable` rather than hanging; `exited()` may
+  say `true` only once all output is readable; `NotFound` from `read` or `exited` during a
+  stream means the program ended. `changes()` is an optional push hint (a `watch::Receiver`
+  that changes on new output and on exit); without it the route polls.
+- `cols` and `rows` are `terminal::SIZES` (1..=1000); outside it the query is `400` and a
+  `resize` closes with 1007. The upgrade is checked (after the `404`) before anything touches
+  the terminal, so a plain GET never resizes it.
 - Output is binary frames of at most 64 KiB from `from` (default 0). If the buffer lost `from`,
   `{"type":"truncated","from":N}` comes first. A client counts the bytes it received and
   reconnects with `from=<that offset>`; nothing is lost or repeated.
+- Idle cost: without `changes()`, polling backs off from 20 ms to 250 ms while nothing happens
+  (one `read` and one `exited()` per round) and starts over on any input or output.
+- Every call into the seam runs on the blocking pool, at most `max_calls` (64) at once across
+  all clients, and is given up after `call_timeout` (5 s): `503` before the upgrade, 1011 after.
+  A stalled runtime ties up at most `max_calls` threads. **The limit is global to the route, by
+  design:** once `max_calls` calls hang on one runtime, calls for every other terminal of the
+  route wait for a permit too (and time out with 503 or 1011) until the hung calls return. A
+  limit per terminal would let a stalled runtime tie up threads without bound.
 - Client binary frames are keystrokes; `{"type":"resize","cols","rows"}` resizes; other types
-  are ignored; malformed control JSON closes with 1007. When the program exits, the rest of the
-  output, then `{"type":"exit"}`, then close 1000.
-- A client that stops reading is closed with 1013 and resumes by offset. Several clients may
-  attach; each gets the output, and their keystrokes interleave in arrival order.
+  are ignored; malformed control JSON closes with 1007, and a message over `max_inbound` (1 MiB)
+  with 1009. When the program exits, or its terminal disappears, the rest of the output, then
+  `{"type":"exit"}`, then close 1000.
+- Input is written in order by its own loop, through a queue of 16 messages, so a terminal that
+  is slow to take input holds up neither output nor pings. While the queue is full the socket is
+  not read (back-pressure on the client); a write that times out closes with 1011.
+- A client that stops reading is closed with 1013 and resumes by offset. So is one that does
+  not answer the Ping sent every 20 s within 20 s. That time only counts while the socket is
+  read: while input backs up, a Pong the client sent waits behind keystrokes not read yet (a
+  WebSocket's frames arrive in order), so the deadline waits too. Several clients may attach;
+  each gets the output, and their keystrokes interleave in arrival order.
+- Close codes: **1000** after `exit`, **1007** malformed control, **1009** message too big,
+  **1013** too slow or no Pong (reconnect with `from`), **1011** runtime failure, **1001** hub
+  shutting down. A client's Close is answered before the socket is dropped.
 
-## Activity: `GET /v1/events?before=&limit=&task=&session=`
+## Shutdown
 
-`activity::routes(source)`, mounted as a **device** route, on the same `EventSource` as the
-stream.
+`Bound::serve` (and `serve`) tell every open WebSocket when `shutdown` completes; they close
+with 1001, and `serve` waits up to 2 s for their closing handshakes to finish before returning.
+Each socket holds its shutdown receiver until it has closed, which is how `serve` counts them.
+So a `main` that returns as soon as `serve` does still closes its clients cleanly. Hyper's
+graceful shutdown alone does not wait for upgraded connections.
+
+## Activity: `GET /v1/events?before=&limit=&project=&workstream=&task=&session=`
+
+`Activity::new(source).with_refs(refs).routes()`, mounted as a **device** route, on the same
+`EventSource` as the stream. `refs` is the work model's activity index as an
+`activity::EventRefs` (see "For the composition root"). `activity::routes(source)` is the same
+route without an index.
 
 - Oldest first within a page, the newest page without `before` (exclusive); `limit` defaults to
   100, max 500.
-- `session` and `task` match events whose body names the id, found by scanning back at most
-  10,000 events per request. A page that ran out of budget may be short or empty, with
-  `at_start` false and `from_rev` where the scan stopped.
-- `project` and `workstream` answer `400 invalid` until the hub has a project index.
+- The page is `pitcrew_protocol::api::EventsPage`. **Only `at_start` ends paging.**
+- Filters combine: an event must match every one given.
+- `session` and `task` match events with a `session` (or `task`) field, at any depth, holding
+  the id or an object with that `id`; the id under another key (a `parent`, `blocked_by`, free
+  text) does not match.
+- With the index they also match what the index says an event is about, following the links in
+  force when it happened: `task` adds the turns, tool runs and file edits of sessions linked to
+  the task, and `dispatch_finished` and `ask_answered` of its dispatches and asks; `session` adds
+  `dispatch_finished` and `ask_answered` of its dispatches and asks. **Without the index those
+  are missed.**
+- `project` and `workstream` match only through the index (events about the project or
+  workstream, its tasks' and their sessions'), and answer `400 invalid` without one.
+- Bounded work per request: `project` and `workstream` alone are answered by the index, which
+  bounds its own search; a filter with `session` or `task` scans back at most 10,000 events and
+  asks the index about each 500 it reads. Either way a page may be short or empty, with
+  `at_start` false, `to_rev` 0 and `from_rev` where the search stopped.
+- The route checks the index's answers (ascending, below `before`, at most `limit`, progress,
+  revisions the log has) and answers `500` rather than a page that could make a client loop.
+
+## Recaps: `GET /v1/recaps/blocks` and `GET /v1/recaps/days`
+
+`Recaps::new(source).routes()`, mounted as **device** routes. Without a source, simply do not
+mount them.
+
+- `source` is a `recap::RecapSource`: `blocks(filter, before, limit)` and
+  `days(scope, tz_minutes, before, limit)`. The recap engine (`crates/recap`, stream F) computes
+  blocks and day paragraphs from the event log; this crate does not depend on it, so the daemon
+  adapts its (cached, paged) recap index to `RecapSource`, the way it adapts the work model's
+  activity index to `EventRefs` above. For development and the mock, a source fed from
+  `crates/fixtures/data/demo-recaps.json` stands in.
+- Recaps are **derived, never stored**: no validation here depends on the store. All of the
+  following are `400 invalid`: a malformed id (bare or prefixed), a malformed date (`YYYY-MM-DD`
+  only), `tz` outside `-840..=840` or not a whole number (minutes east of UTC), a `limit` of 0 or
+  not a number, and `days` given neither or both of `workstream`/`project`. A `limit` above the
+  route's cap (`BLOCKS_MAX_LIMIT` 200, `DAYS_MAX_LIMIT` 30) counts as the cap.
+- An id nothing matches is **not** an error: `RecapSource` simply answers an empty page with
+  `at_start: true`, as the activity route does for an unknown session or task.
+- Blocks are filtered by `BlockFilter` (`session`, `task`, `workstream`, `project`, all combined);
+  `task` matches any of the block's `tasks`. Days take a `DaysScope`, exactly one of a workstream's
+  own entries or a project's (its workstreams' and its own, for tasks without one).
+- Both calls run on the blocking pool, like the activity route's reads.
 
 ## Features
 
@@ -103,16 +184,87 @@ let tokens: Arc<dyn TokenStore> = Arc::new(FileTokenStore::open(&state_dir)?);
 let info = pitcrew_api::local_host_info(env!("CARGO_PKG_VERSION"), vec![HostRole::Hub, HostRole::Runner], caps);
 let source: Arc<dyn EventSource> = Arc::new(StoreSource::new(store.clone(), log_id));
 let hooks = HookIntake::start(Arc::new(LogHookSink), 1024)?;
-let terminals = Arc::new(RuntimeTerminals::new(runtime.clone())); // the runner links sessions
+let terminals = Arc::new(RuntimeTerminals::new(runtime.clone())); // the runner keeps it to link sessions
+// `work` is the hub's one `Arc<WorkService>`; `WorkRefs` is below.
+let refs: Arc<dyn pitcrew_api::EventRefs> = Arc::new(WorkRefs(Arc::clone(&work)));
+// `recaps` is the hub's recap index (stream E, over `pitcrew-recap`); `RecapIndexSource` is below.
+let recap_source: Arc<dyn pitcrew_api::RecapSource> = Arc::new(RecapIndexSource(Arc::clone(&recaps)));
 let parts = RouterParts::new()
     .agent(pitcrew_api::hooks::routes(hooks))
     .agent(hub_work::agent_routes())    // routes marked **agent** in api-v1.md
     .device(pitcrew_api::stream::routes(source.clone(), StreamConfig::default()))
-    .device(pitcrew_api::activity::routes(source))
-    .device(pitcrew_api::terminal::routes(terminals, TerminalConfig::default()))
+    .device(pitcrew_api::Activity::new(source).with_refs(refs).routes())
+    .device(pitcrew_api::Recaps::new(recap_source).routes())
+    .device(pitcrew_api::terminal::routes(terminals.clone(), TerminalConfig::default()))
     .device(hub_work::device_routes()); // everything else
 pitcrew_api::serve(&Listen::private_default(run_dir)?, info, tokens, parts, shutdown).await?;
 ```
+
+This crate does not depend on the work model, so the daemon adapts its index. The trait and the
+filter mirror `pitcrew_hub_work`'s field for field:
+
+```rust
+/// The work model's activity index, as `pitcrew-api` takes it.
+#[derive(Debug)]
+struct WorkRefs(Arc<pitcrew_hub_work::WorkService>);
+
+impl pitcrew_api::EventRefs for WorkRefs {
+    fn revs_matching(
+        &self,
+        f: &pitcrew_api::RefFilter,
+        before_rev: u64,
+        limit: usize,
+    ) -> Result<(Vec<u64>, u64), pitcrew_api::source::SourceError> {
+        let filter = pitcrew_hub_work::RefFilter {
+            project: f.project,
+            workstream: f.workstream,
+            task: f.task,
+            session: f.session,
+        };
+        pitcrew_hub_work::EventRefs::revs_matching(&*self.0, &filter, before_rev, limit)
+            .map_err(Into::into)
+    }
+}
+```
+
+Likewise, this crate does not depend on the recap engine (`pitcrew-recap`, stream F) or on
+whatever keeps its blocks and days current and queryable (a recap index, stream E, the way
+`WorkService` keeps the activity index current). The daemon's adapter translates `BlockFilter` and
+`DaysScope` to that index's own types and calls into it, something like:
+
+```rust
+/// The hub's recap index, as `pitcrew-api` takes it.
+#[derive(Debug)]
+struct RecapIndexSource(Arc<hub_work::RecapIndex>);
+
+impl pitcrew_api::RecapSource for RecapIndexSource {
+    fn blocks(
+        &self,
+        filter: &pitcrew_api::BlockFilter,
+        before: Option<pitcrew_protocol::EventId>,
+        limit: usize,
+    ) -> Result<pitcrew_protocol::recap::BlocksPage, pitcrew_api::source::SourceError> {
+        self.0.blocks_page(filter.session, filter.task, filter.workstream, filter.project, before, limit)
+            .map_err(Into::into)
+    }
+
+    fn days(
+        &self,
+        scope: pitcrew_api::DaysScope,
+        tz_minutes: i32,
+        before: Option<pitcrew_protocol::model::Date>,
+        limit: usize,
+    ) -> Result<pitcrew_protocol::recap::DaysPage, pitcrew_api::source::SourceError> {
+        match scope {
+            pitcrew_api::DaysScope::Workstream(w) => self.0.days_for_workstream(w, tz_minutes, before, limit),
+            pitcrew_api::DaysScope::Project(p) => self.0.days_for_project(p, tz_minutes, before, limit),
+        }
+        .map_err(Into::into)
+    }
+}
+```
+
+(`blocks_page`/`days_for_*` are illustrative; stream E's recap index names its own methods.)
 
 Do not merge more routes into the router this builds: they would be unauthenticated. Put every
 route in `RouterParts`.

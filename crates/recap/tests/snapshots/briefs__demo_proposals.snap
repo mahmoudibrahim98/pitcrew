@@ -1,0 +1,40 @@
+---
+source: crates/recap/tests/briefs.rs
+expression: out
+---
+== Submission · AutoAccept
+PAP-3 is in review, PAP-1 is in progress (2 of 4 steps done).
+  - "PAP-3 is in review" <- evt:EVT0003, evt:EVT0002
+  - "PAP-1 is in progress (2 of 4 steps done)" <- evt:EVT0005, evt:EVT0006, evt:EVT0004
+next: Review PAP-3.
+  - "Review PAP-3" <- evt:EVT0003
+
+== Seed runs · Propose
+Seed runs is at risk, @runner is working on PAP-4. Job 4815164 diverged. Waiting on @sam to decide "Seed 3 diverged at epoch 9. Rerun or drop it?".
+  - "Seed runs is at risk" <- evt:EVT0011
+  - "@runner is working on PAP-4" <- evt:EVT0001
+  - "Job 4815164 diverged" <- evt:EVT0010, job:4815164, transcript:SES0002@120544
+  - "Waiting on @sam to decide \"Seed 3 diverged at epoch 9. Rerun or drop it?\"" <- evt:EVT0010, job:4815164, transcript:SES0002@120544
+next: @sam to decide "Seed 3 diverged at epoch 9. Rerun or drop it?".
+  - "@sam to decide \"Seed 3 diverged at epoch 9. Rerun or drop it?\"" <- evt:EVT0010, job:4815164, transcript:SES0002@120544
+
+== Parsers · AutoAccept
+@reviewer is working on TL-3.
+  - "@reviewer is working on TL-3" <- evt:EVT0008
+
+== Ablation: noise schedule · nothing to propose
+
+== Paper · Diffusion study · AutoAccept
+Submission: PAP-3 is in review, PAP-1 is in progress (2 of 4 steps done). Seed runs is at risk, @runner is working on PAP-4, job 4815164 diverged, waiting on @sam to decide "Seed 3 diverged at epoch 9. Rerun or drop it?".
+  - "Submission: PAP-3 is in review" <- evt:EVT0003, evt:EVT0002
+  - "PAP-1 is in progress (2 of 4 steps done)" <- evt:EVT0005, evt:EVT0006, evt:EVT0004
+  - "Seed runs is at risk" <- evt:EVT0011
+  - "@runner is working on PAP-4" <- evt:EVT0001
+  - "job 4815164 diverged" <- evt:EVT0010, job:4815164, transcript:SES0002@120544
+  - "waiting on @sam to decide \"Seed 3 diverged at epoch 9. Rerun or drop it?\"" <- evt:EVT0010, job:4815164, transcript:SES0002@120544
+next: @sam to decide "Seed 3 diverged at epoch 9. Rerun or drop it?".
+  - "@sam to decide \"Seed 3 diverged at epoch 9. Rerun or drop it?\"" <- evt:EVT0010, job:4815164, transcript:SES0002@120544
+
+== Tooling · AutoAccept
+Parsers: @reviewer is working on TL-3.
+  - "Parsers: @reviewer is working on TL-3" <- evt:EVT0008

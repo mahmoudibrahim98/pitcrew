@@ -1,0 +1,1316 @@
+{
+  "tz": 0,
+  "blocks": [
+    {
+      "block": {
+        "id": "01JB000000000000000EVT0001",
+        "last": "01JB000000000000000EVT0001",
+        "key": {
+          "kind": "session",
+          "id": "01JB000000000000000SES0002"
+        },
+        "start": 1790668800000,
+        "end": 1790668800000,
+        "session": "01JB000000000000000SES0002",
+        "workstream": "01JB000000000000000WST0002",
+        "project": "01JB000000000000000PRJ0001",
+        "tasks": [
+          "01JB000000000000000TSK0004"
+        ],
+        "agent": "01JB000000000000000MEM0003",
+        "actors": [
+          "01JB000000000000000MEM0001"
+        ],
+        "counts": {
+          "events": 1,
+          "tools_run": 0,
+          "tools_failed": 0,
+          "file_edits": 0,
+          "lines_added": 0,
+          "lines_removed": 0,
+          "turns": 0,
+          "asks_raised": 0,
+          "asks_answered": 0,
+          "task_moves": 0,
+          "comments": 0
+        },
+        "files": [],
+        "files_omitted": 0,
+        "facts": [
+          {
+            "by": "01JB000000000000000MEM0001",
+            "at": 1790668800000,
+            "kind": {
+              "type": "dispatch_started",
+              "task": "01JB000000000000000TSK0004",
+              "agent": "01JB000000000000000MEM0003"
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0001"
+              }
+            ]
+          }
+        ],
+        "facts_omitted": 0,
+        "tool_receipts": [],
+        "turn_receipts": []
+      },
+      "line": {
+        "text": "@sam dispatched @runner to PAP-4",
+        "spans": [
+          {
+            "range": {
+              "start": 0,
+              "end": 32
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0001"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "block": {
+        "id": "01JB000000000000000EVT0002",
+        "last": "01JB000000000000000EVT0003",
+        "key": {
+          "kind": "session",
+          "id": "01JB000000000000000SES0006"
+        },
+        "start": 1790677200000,
+        "end": 1790677200000,
+        "session": "01JB000000000000000SES0006",
+        "workstream": "01JB000000000000000WST0001",
+        "project": "01JB000000000000000PRJ0001",
+        "tasks": [
+          "01JB000000000000000TSK0003"
+        ],
+        "agent": "01JB000000000000000MEM0002",
+        "actors": [
+          "01JB000000000000000MEM0002"
+        ],
+        "counts": {
+          "events": 2,
+          "tools_run": 0,
+          "tools_failed": 0,
+          "file_edits": 0,
+          "lines_added": 0,
+          "lines_removed": 0,
+          "turns": 0,
+          "asks_raised": 0,
+          "asks_answered": 0,
+          "task_moves": 1,
+          "comments": 0
+        },
+        "files": [],
+        "files_omitted": 0,
+        "facts": [
+          {
+            "by": "01JB000000000000000MEM0002",
+            "at": 1790677200000,
+            "kind": {
+              "type": "dispatch_finished",
+              "task": "01JB000000000000000TSK0003",
+              "outcome": "succeeded",
+              "summary": "Drafted answers to all 14 comments; 2 need your call."
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0002"
+              }
+            ]
+          },
+          {
+            "by": "01JB000000000000000MEM0002",
+            "at": 1790677200000,
+            "kind": {
+              "type": "task_moved",
+              "task": "01JB000000000000000TSK0003",
+              "from": "in_progress",
+              "to": "review"
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0003"
+              }
+            ]
+          }
+        ],
+        "facts_omitted": 0,
+        "tool_receipts": [],
+        "turn_receipts": []
+      },
+      "line": {
+        "text": "@writer finished PAP-3, moved PAP-3 to review",
+        "spans": [
+          {
+            "range": {
+              "start": 0,
+              "end": 22
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0002"
+              }
+            ]
+          },
+          {
+            "range": {
+              "start": 24,
+              "end": 45
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0003"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "block": {
+        "id": "01JB000000000000000EVT0004",
+        "last": "01JB000000000000000EVT0006",
+        "key": {
+          "kind": "session",
+          "id": "01JB000000000000000SES0001"
+        },
+        "start": 1790755200000,
+        "end": 1790756100000,
+        "session": "01JB000000000000000SES0001",
+        "workstream": "01JB000000000000000WST0001",
+        "project": "01JB000000000000000PRJ0001",
+        "tasks": [
+          "01JB000000000000000TSK0001"
+        ],
+        "agent": "01JB000000000000000MEM0002",
+        "actors": [
+          "01JB000000000000000MEM0001",
+          "01JB000000000000000MEM0002"
+        ],
+        "counts": {
+          "events": 3,
+          "tools_run": 0,
+          "tools_failed": 0,
+          "file_edits": 0,
+          "lines_added": 0,
+          "lines_removed": 0,
+          "turns": 0,
+          "asks_raised": 0,
+          "asks_answered": 0,
+          "task_moves": 1,
+          "comments": 0
+        },
+        "files": [],
+        "files_omitted": 0,
+        "facts": [
+          {
+            "by": "01JB000000000000000MEM0001",
+            "at": 1790755200000,
+            "kind": {
+              "type": "dispatch_started",
+              "task": "01JB000000000000000TSK0001",
+              "agent": "01JB000000000000000MEM0002"
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0004"
+              }
+            ]
+          },
+          {
+            "by": "01JB000000000000000MEM0002",
+            "at": 1790755260000,
+            "kind": {
+              "type": "task_moved",
+              "task": "01JB000000000000000TSK0001",
+              "from": "todo",
+              "to": "in_progress"
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0005"
+              }
+            ]
+          },
+          {
+            "by": "01JB000000000000000MEM0002",
+            "at": 1790756100000,
+            "kind": {
+              "type": "plan_updated",
+              "task": "01JB000000000000000TSK0001",
+              "done": 2,
+              "total": 4
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0006"
+              }
+            ]
+          }
+        ],
+        "facts_omitted": 0,
+        "tool_receipts": [],
+        "turn_receipts": []
+      },
+      "line": {
+        "text": "@sam dispatched @writer to PAP-1, @writer moved PAP-1 to in progress, updated the plan for PAP-1 (2 of 4 done)",
+        "spans": [
+          {
+            "range": {
+              "start": 0,
+              "end": 32
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0004"
+              }
+            ]
+          },
+          {
+            "range": {
+              "start": 34,
+              "end": 68
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0005"
+              }
+            ]
+          },
+          {
+            "range": {
+              "start": 70,
+              "end": 110
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0006"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "block": {
+        "id": "01JB000000000000000EVT0007",
+        "last": "01JB000000000000000EVT0007",
+        "key": {
+          "kind": "session",
+          "id": "01JB000000000000000SES0001"
+        },
+        "start": 1790757900000,
+        "end": 1790757900000,
+        "session": "01JB000000000000000SES0001",
+        "workstream": "01JB000000000000000WST0001",
+        "project": "01JB000000000000000PRJ0001",
+        "tasks": [
+          "01JB000000000000000TSK0001"
+        ],
+        "agent": "01JB000000000000000MEM0002",
+        "actors": [
+          "01JB000000000000000MEM0002"
+        ],
+        "counts": {
+          "events": 1,
+          "tools_run": 0,
+          "tools_failed": 0,
+          "file_edits": 1,
+          "lines_added": 84,
+          "lines_removed": 12,
+          "turns": 0,
+          "asks_raised": 0,
+          "asks_answered": 0,
+          "task_moves": 0,
+          "comments": 0
+        },
+        "files": [
+          {
+            "path": "method.tex",
+            "edits": 1,
+            "added": 84,
+            "removed": 12,
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0007"
+              }
+            ]
+          }
+        ],
+        "files_omitted": 0,
+        "facts": [],
+        "facts_omitted": 0,
+        "tool_receipts": [],
+        "turn_receipts": []
+      },
+      "line": {
+        "text": "@writer edited method.tex (+84 −12)",
+        "spans": [
+          {
+            "range": {
+              "start": 0,
+              "end": 37
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0007"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "block": {
+        "id": "01JB000000000000000EVT0008",
+        "last": "01JB000000000000000EVT0008",
+        "key": {
+          "kind": "session",
+          "id": "01JB000000000000000SES0003"
+        },
+        "start": 1790758800000,
+        "end": 1790758800000,
+        "session": "01JB000000000000000SES0003",
+        "workstream": "01JB000000000000000WST0003",
+        "project": "01JB000000000000000PRJ0002",
+        "tasks": [
+          "01JB000000000000000TSK0010"
+        ],
+        "agent": "01JB000000000000000MEM0004",
+        "actors": [
+          "01JB000000000000000MEM0001"
+        ],
+        "counts": {
+          "events": 1,
+          "tools_run": 0,
+          "tools_failed": 0,
+          "file_edits": 0,
+          "lines_added": 0,
+          "lines_removed": 0,
+          "turns": 0,
+          "asks_raised": 0,
+          "asks_answered": 0,
+          "task_moves": 0,
+          "comments": 0
+        },
+        "files": [],
+        "files_omitted": 0,
+        "facts": [
+          {
+            "by": "01JB000000000000000MEM0001",
+            "at": 1790758800000,
+            "kind": {
+              "type": "dispatch_started",
+              "task": "01JB000000000000000TSK0010",
+              "agent": "01JB000000000000000MEM0004"
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0008"
+              }
+            ]
+          }
+        ],
+        "facts_omitted": 0,
+        "tool_receipts": [],
+        "turn_receipts": []
+      },
+      "line": {
+        "text": "@sam dispatched @reviewer to TL-3",
+        "spans": [
+          {
+            "range": {
+              "start": 0,
+              "end": 33
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0008"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "block": {
+        "id": "01JB000000000000000EVT0009",
+        "last": "01JB000000000000000EVT0009",
+        "key": {
+          "kind": "session",
+          "id": "01JB000000000000000SES0002"
+        },
+        "start": 1790759700000,
+        "end": 1790759700000,
+        "session": "01JB000000000000000SES0002",
+        "workstream": "01JB000000000000000WST0002",
+        "project": "01JB000000000000000PRJ0001",
+        "tasks": [
+          "01JB000000000000000TSK0004"
+        ],
+        "agent": "01JB000000000000000MEM0003",
+        "actors": [
+          "01JB000000000000000MEM0003"
+        ],
+        "counts": {
+          "events": 1,
+          "tools_run": 1,
+          "tools_failed": 0,
+          "file_edits": 0,
+          "lines_added": 0,
+          "lines_removed": 0,
+          "turns": 0,
+          "asks_raised": 0,
+          "asks_answered": 0,
+          "task_moves": 0,
+          "comments": 0
+        },
+        "files": [],
+        "files_omitted": 0,
+        "facts": [],
+        "facts_omitted": 0,
+        "tool_receipts": [
+          {
+            "kind": "event",
+            "id": "01JB000000000000000EVT0009"
+          },
+          {
+            "kind": "transcript",
+            "session": "01JB000000000000000SES0002",
+            "offset": 118220
+          }
+        ],
+        "turn_receipts": []
+      },
+      "line": {
+        "text": "@runner ran a tool",
+        "spans": [
+          {
+            "range": {
+              "start": 0,
+              "end": 18
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0009"
+              },
+              {
+                "kind": "transcript",
+                "session": "01JB000000000000000SES0002",
+                "offset": 118220
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "block": {
+        "id": "01JB000000000000000EVT0010",
+        "last": "01JB000000000000000EVT0010",
+        "key": {
+          "kind": "session",
+          "id": "01JB000000000000000SES0002"
+        },
+        "start": 1790761200000,
+        "end": 1790761200000,
+        "session": "01JB000000000000000SES0002",
+        "workstream": "01JB000000000000000WST0002",
+        "project": "01JB000000000000000PRJ0001",
+        "tasks": [
+          "01JB000000000000000TSK0004",
+          "01JB000000000000000TSK0005"
+        ],
+        "agent": "01JB000000000000000MEM0003",
+        "actors": [
+          "01JB000000000000000MEM0006"
+        ],
+        "counts": {
+          "events": 1,
+          "tools_run": 0,
+          "tools_failed": 0,
+          "file_edits": 0,
+          "lines_added": 0,
+          "lines_removed": 0,
+          "turns": 0,
+          "asks_raised": 1,
+          "asks_answered": 0,
+          "task_moves": 0,
+          "comments": 0
+        },
+        "files": [],
+        "files_omitted": 0,
+        "facts": [
+          {
+            "by": "01JB000000000000000MEM0006",
+            "at": 1790761200000,
+            "kind": {
+              "type": "job_diverged",
+              "jobs": [
+                "4815164"
+              ]
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0010"
+              },
+              {
+                "kind": "job",
+                "scheduler": "slurm",
+                "id": "4815164"
+              },
+              {
+                "kind": "transcript",
+                "session": "01JB000000000000000SES0002",
+                "offset": 120544
+              }
+            ]
+          },
+          {
+            "by": "01JB000000000000000MEM0006",
+            "at": 1790761200000,
+            "kind": {
+              "type": "ask_raised",
+              "ask": "01JB000000000000000ASK0002",
+              "ask_kind": "decision",
+              "to": "01JB000000000000000MEM0001",
+              "title": "Seed 3 diverged at epoch 9. Rerun or drop it?"
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0010"
+              },
+              {
+                "kind": "job",
+                "scheduler": "slurm",
+                "id": "4815164"
+              },
+              {
+                "kind": "transcript",
+                "session": "01JB000000000000000SES0002",
+                "offset": 120544
+              }
+            ]
+          }
+        ],
+        "facts_omitted": 0,
+        "tool_receipts": [],
+        "turn_receipts": []
+      },
+      "line": {
+        "text": "job 4815164 diverged, @office asked @sam for a decision",
+        "spans": [
+          {
+            "range": {
+              "start": 0,
+              "end": 20
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0010"
+              },
+              {
+                "kind": "job",
+                "scheduler": "slurm",
+                "id": "4815164"
+              },
+              {
+                "kind": "transcript",
+                "session": "01JB000000000000000SES0002",
+                "offset": 120544
+              }
+            ]
+          },
+          {
+            "range": {
+              "start": 22,
+              "end": 55
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0010"
+              },
+              {
+                "kind": "job",
+                "scheduler": "slurm",
+                "id": "4815164"
+              },
+              {
+                "kind": "transcript",
+                "session": "01JB000000000000000SES0002",
+                "offset": 120544
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "block": {
+        "id": "01JB000000000000000EVT0011",
+        "last": "01JB000000000000000EVT0012",
+        "key": {
+          "kind": "workstream",
+          "id": "01JB000000000000000WST0002"
+        },
+        "start": 1790761260000,
+        "end": 1790761500000,
+        "workstream": "01JB000000000000000WST0002",
+        "project": "01JB000000000000000PRJ0001",
+        "tasks": [],
+        "actors": [
+          "01JB000000000000000MEM0006",
+          "01JB000000000000000MEM0001"
+        ],
+        "counts": {
+          "events": 2,
+          "tools_run": 0,
+          "tools_failed": 0,
+          "file_edits": 0,
+          "lines_added": 0,
+          "lines_removed": 0,
+          "turns": 0,
+          "asks_raised": 0,
+          "asks_answered": 0,
+          "task_moves": 0,
+          "comments": 0
+        },
+        "files": [],
+        "files_omitted": 0,
+        "facts": [
+          {
+            "by": "01JB000000000000000MEM0006",
+            "at": 1790761260000,
+            "kind": {
+              "type": "workstream_changed",
+              "workstream": "01JB000000000000000WST0002",
+              "status": "active",
+              "health": "at_risk"
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0011"
+              }
+            ]
+          },
+          {
+            "by": "01JB000000000000000MEM0001",
+            "at": 1790761500000,
+            "kind": {
+              "type": "brief_accepted",
+              "target": {
+                "kind": "workstream",
+                "id": "01JB000000000000000WST0002"
+              },
+              "pinned": true
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0012"
+              }
+            ]
+          }
+        ],
+        "facts_omitted": 0,
+        "tool_receipts": [],
+        "turn_receipts": []
+      },
+      "line": {
+        "text": "@office marked Seed runs at risk, @sam pinned the brief for Seed runs",
+        "spans": [
+          {
+            "range": {
+              "start": 0,
+              "end": 32
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0011"
+              }
+            ]
+          },
+          {
+            "range": {
+              "start": 34,
+              "end": 69
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0012"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "block": {
+        "id": "01JB000000000000000EVT0013",
+        "last": "01JB000000000000000EVT0013",
+        "key": {
+          "kind": "session",
+          "id": "01JB000000000000000SES0003"
+        },
+        "start": 1790761800000,
+        "end": 1790761800000,
+        "session": "01JB000000000000000SES0003",
+        "workstream": "01JB000000000000000WST0003",
+        "project": "01JB000000000000000PRJ0002",
+        "tasks": [
+          "01JB000000000000000TSK0010"
+        ],
+        "agent": "01JB000000000000000MEM0004",
+        "actors": [
+          "01JB000000000000000MEM0004"
+        ],
+        "counts": {
+          "events": 1,
+          "tools_run": 0,
+          "tools_failed": 0,
+          "file_edits": 0,
+          "lines_added": 0,
+          "lines_removed": 0,
+          "turns": 0,
+          "asks_raised": 0,
+          "asks_answered": 0,
+          "task_moves": 0,
+          "comments": 0
+        },
+        "files": [],
+        "files_omitted": 0,
+        "facts": [
+          {
+            "by": "01JB000000000000000MEM0004",
+            "at": 1790761800000,
+            "kind": {
+              "type": "session_waiting",
+              "status_line": "Asks: merge the benchmark change?"
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0013"
+              }
+            ]
+          }
+        ],
+        "facts_omitted": 0,
+        "tool_receipts": [],
+        "turn_receipts": []
+      },
+      "line": {
+        "text": "@reviewer stopped to wait for an answer",
+        "spans": [
+          {
+            "range": {
+              "start": 0,
+              "end": 39
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0013"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "block": {
+        "id": "01JB000000000000000EVT0014",
+        "last": "01JB000000000000000EVT0014",
+        "key": {
+          "kind": "workstream",
+          "id": "01JB000000000000000WST0003"
+        },
+        "start": 1790761920000,
+        "end": 1790761920000,
+        "workstream": "01JB000000000000000WST0003",
+        "project": "01JB000000000000000PRJ0002",
+        "tasks": [
+          "01JB000000000000000TSK0008"
+        ],
+        "actors": [
+          "01JB000000000000000MEM0005"
+        ],
+        "counts": {
+          "events": 1,
+          "tools_run": 0,
+          "tools_failed": 0,
+          "file_edits": 0,
+          "lines_added": 0,
+          "lines_removed": 0,
+          "turns": 0,
+          "asks_raised": 0,
+          "asks_answered": 0,
+          "task_moves": 0,
+          "comments": 1
+        },
+        "files": [],
+        "files_omitted": 0,
+        "facts": [
+          {
+            "by": "01JB000000000000000MEM0005",
+            "at": 1790761920000,
+            "kind": {
+              "type": "commented",
+              "task": "01JB000000000000000TSK0008",
+              "mentions": [
+                "01JB000000000000000MEM0004"
+              ]
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0014"
+              }
+            ]
+          }
+        ],
+        "facts_omitted": 0,
+        "tool_receipts": [],
+        "turn_receipts": []
+      },
+      "line": {
+        "text": "@builder commented on TL-1 and mentioned @reviewer",
+        "spans": [
+          {
+            "range": {
+              "start": 0,
+              "end": 50
+            },
+            "receipts": [
+              {
+                "kind": "event",
+                "id": "01JB000000000000000EVT0014"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "projects": [
+    {
+      "project": "01JB000000000000000PRJ0001",
+      "days": [
+        {
+          "workstream": "01JB000000000000000WST0001",
+          "date": "2026-09-29",
+          "blocks": [
+            "01JB000000000000000EVT0002"
+          ],
+          "summary": {
+            "text": "@writer finished PAP-3 (\"Drafted answers to all 14 comments; 2 need your call.\"), moved PAP-3 to review.",
+            "spans": [
+              {
+                "range": {
+                  "start": 0,
+                  "end": 80
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0002"
+                  }
+                ]
+              },
+              {
+                "range": {
+                  "start": 82,
+                  "end": 103
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0003"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "workstream": "01JB000000000000000WST0002",
+          "date": "2026-09-29",
+          "blocks": [
+            "01JB000000000000000EVT0001"
+          ],
+          "summary": {
+            "text": "@sam dispatched @runner to PAP-4.",
+            "spans": [
+              {
+                "range": {
+                  "start": 0,
+                  "end": 32
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0001"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "workstream": "01JB000000000000000WST0001",
+          "date": "2026-09-30",
+          "blocks": [
+            "01JB000000000000000EVT0004",
+            "01JB000000000000000EVT0007"
+          ],
+          "summary": {
+            "text": "2 bursts of work, 1 file edit (+84 −12), 1 task move. @sam dispatched @writer to PAP-1, @writer moved PAP-1 to in progress, updated the plan for PAP-1 (2 of 4 done). @writer edited method.tex (+84 −12).",
+            "spans": [
+              {
+                "range": {
+                  "start": 0,
+                  "end": 16
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0004"
+                  },
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0007"
+                  }
+                ]
+              },
+              {
+                "range": {
+                  "start": 18,
+                  "end": 41
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0007"
+                  }
+                ]
+              },
+              {
+                "range": {
+                  "start": 43,
+                  "end": 54
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0005"
+                  }
+                ]
+              },
+              {
+                "range": {
+                  "start": 56,
+                  "end": 88
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0004"
+                  }
+                ]
+              },
+              {
+                "range": {
+                  "start": 90,
+                  "end": 124
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0005"
+                  }
+                ]
+              },
+              {
+                "range": {
+                  "start": 126,
+                  "end": 166
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0006"
+                  }
+                ]
+              },
+              {
+                "range": {
+                  "start": 168,
+                  "end": 205
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0007"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "workstream": "01JB000000000000000WST0002",
+          "date": "2026-09-30",
+          "blocks": [
+            "01JB000000000000000EVT0009",
+            "01JB000000000000000EVT0010",
+            "01JB000000000000000EVT0011"
+          ],
+          "summary": {
+            "text": "3 bursts of work, 1 tool run, 1 ask raised. @runner ran a tool. Job 4815164 diverged, @office asked @sam for a decision (\"Seed 3 diverged at epoch 9. Rerun or drop it?\"). @office marked Seed runs at risk, @sam pinned the brief for Seed runs.",
+            "spans": [
+              {
+                "range": {
+                  "start": 0,
+                  "end": 16
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0009"
+                  },
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0010"
+                  },
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0011"
+                  }
+                ]
+              },
+              {
+                "range": {
+                  "start": 18,
+                  "end": 28
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0009"
+                  },
+                  {
+                    "kind": "transcript",
+                    "session": "01JB000000000000000SES0002",
+                    "offset": 118220
+                  }
+                ]
+              },
+              {
+                "range": {
+                  "start": 30,
+                  "end": 42
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0010"
+                  }
+                ]
+              },
+              {
+                "range": {
+                  "start": 44,
+                  "end": 62
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0009"
+                  },
+                  {
+                    "kind": "transcript",
+                    "session": "01JB000000000000000SES0002",
+                    "offset": 118220
+                  }
+                ]
+              },
+              {
+                "range": {
+                  "start": 64,
+                  "end": 84
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0010"
+                  },
+                  {
+                    "kind": "job",
+                    "scheduler": "slurm",
+                    "id": "4815164"
+                  },
+                  {
+                    "kind": "transcript",
+                    "session": "01JB000000000000000SES0002",
+                    "offset": 120544
+                  }
+                ]
+              },
+              {
+                "range": {
+                  "start": 86,
+                  "end": 169
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0010"
+                  },
+                  {
+                    "kind": "job",
+                    "scheduler": "slurm",
+                    "id": "4815164"
+                  },
+                  {
+                    "kind": "transcript",
+                    "session": "01JB000000000000000SES0002",
+                    "offset": 120544
+                  }
+                ]
+              },
+              {
+                "range": {
+                  "start": 171,
+                  "end": 203
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0011"
+                  }
+                ]
+              },
+              {
+                "range": {
+                  "start": 205,
+                  "end": 240
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0012"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "project": "01JB000000000000000PRJ0002",
+      "days": [
+        {
+          "workstream": "01JB000000000000000WST0003",
+          "date": "2026-09-30",
+          "blocks": [
+            "01JB000000000000000EVT0008",
+            "01JB000000000000000EVT0013",
+            "01JB000000000000000EVT0014"
+          ],
+          "summary": {
+            "text": "3 bursts of work. @sam dispatched @reviewer to TL-3. @reviewer stopped to wait for an answer (\"Asks: merge the benchmark change?\"). @builder commented on TL-1 and mentioned @reviewer.",
+            "spans": [
+              {
+                "range": {
+                  "start": 0,
+                  "end": 16
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0008"
+                  },
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0013"
+                  },
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0014"
+                  }
+                ]
+              },
+              {
+                "range": {
+                  "start": 18,
+                  "end": 51
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0008"
+                  }
+                ]
+              },
+              {
+                "range": {
+                  "start": 53,
+                  "end": 130
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0013"
+                  }
+                ]
+              },
+              {
+                "range": {
+                  "start": 132,
+                  "end": 182
+                },
+                "receipts": [
+                  {
+                    "kind": "event",
+                    "id": "01JB000000000000000EVT0014"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}

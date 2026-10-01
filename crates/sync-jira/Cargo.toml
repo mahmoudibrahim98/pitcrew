@@ -10,6 +10,26 @@ authors.workspace = true
 
 [dependencies]
 pitcrew-protocol.workspace = true
+# The transport seam, the recorded-fixture format, the shared bounds/backoff helpers and the
+# Intent/field-ownership shape are reused from sync-github rather than forked; see its README and
+# this crate's README for why.
+pitcrew-sync-github.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+base64.workspace = true
+# Approved by the integrator (review round 1, item 1): needed to convert `updated` (site-zone
+# offset) into the searching account's IANA zone for the JQL cursor. `tzdb-bundle-always` embeds
+# the IANA database in the binary on every platform: `tzdb-bundle-platform` only does this for
+# platforms jiff thinks need it (Windows, wasm) and otherwise expects the host's own zoneinfo,
+# which is not guaranteed to be present (it wasn't in this crate's own Linux build environment)
+# and would make a desktop end user's sync depend on their OS having tzdata installed at all.
+jiff = { version = "0.2", default-features = false, features = ["std", "tzdb-bundle-always"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+proptest.workspace = true
 
 [lints]
 workspace = true

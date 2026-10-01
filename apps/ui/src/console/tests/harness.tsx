@@ -4,7 +4,7 @@
 // a log of every request, and a stand-in layout so virtualised lists have a size in happy-dom.
 
 import { cleanup, configure, render } from '@testing-library/react';
-import type { ReactNode } from 'react';
+import { StrictMode, type ReactNode } from 'react';
 import { vi } from 'vitest';
 import { transcriptPage, type TranscriptRecord } from '../../../../mock-hub/src/transcripts.ts';
 import { freePort, spawnHub, type HubProcess } from '../../../tests/hub-process.ts';
@@ -47,6 +47,8 @@ export interface Logged {
   path: string;
   query: URLSearchParams;
   body: unknown;
+  /** The response status, once it arrives (`null` until then, `-1` if the request fails). */
+  status: number | null;
 }
 
 const inFlight = new Set<Promise<unknown>>();
@@ -62,32 +64,50 @@ export async function unmountAndSettle(): Promise<void> {
   await new Promise((done) => setTimeout(done, 20));
 }
 
-export function renderWithHub(hub: { url: string }, ui: ReactNode, options: { fetch?: typeof fetch } = {}) {
+/**
+ * Renders `ui` in a `DataProvider` on the hub. `strict` puts Strict Mode at the root, as
+ * src/main.tsx does: only there does React run effects, undo them and run them again on mount (a
+ * `<StrictMode>` lower in the tree, under this provider, does not).
+ */
+export function renderWithHub(
+  hub: { url: string },
+  ui: ReactNode,
+  options: { fetch?: typeof fetch; strict?: boolean } = {},
+) {
   const requests: Logged[] = [];
   const inner = options.fetch ?? ((input: RequestInfo | URL, init?: RequestInit) => fetch(input, init));
   const fetcher: typeof fetch = (input, init) => {
     const url = new URL(String(input));
-    requests.push({
+    const entry: Logged = {
       method: init?.method ?? 'GET',
       path: url.pathname,
       query: url.searchParams,
       body: typeof init?.body === 'string' ? JSON.parse(init.body) : undefined,
-    });
+      status: null,
+    };
+    requests.push(entry);
     const response = inner(input, init);
     inFlight.add(response);
     void response.then(
-      () => inFlight.delete(response),
-      () => inFlight.delete(response),
+      (res) => {
+        entry.status = res.status;
+        inFlight.delete(response);
+      },
+      () => {
+        entry.status = -1;
+        inFlight.delete(response);
+      },
     );
     return response;
   };
   const api = createApi({ baseUrl: hub.url, token: DEVICE_TOKEN, fetch: fetcher });
   const queryClient = createQueryClient();
-  const result = render(
+  const tree = (
     <DataProvider api={api} queryClient={queryClient} token={DEVICE_TOKEN}>
       {ui}
-    </DataProvider>,
+    </DataProvider>
   );
+  const result = render(options.strict === true ? <StrictMode>{tree}</StrictMode> : tree);
   return { ...result, api, queryClient, requests };
 }
 

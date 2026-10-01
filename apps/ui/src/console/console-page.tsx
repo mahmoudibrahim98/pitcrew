@@ -3,45 +3,78 @@
 // at a time with a way back. The chosen session is in the path and the filters in the search
 // (`/w/$ws/console/$session?state=waiting`), so a link or a reload reproduces the view.
 //
-// Keys: F6 and Shift+F6 move between the panes (filters, list, transcript, composer). In the list,
-// the arrow keys choose the session shown beside it; Enter opens it and goes to the composer.
+// Keys: F6 and Shift+F6 move between the panes (filters, list, transcript, composer, or the
+// terminal or work view in their place). In the list, the arrow keys choose the session shown
+// beside it; Enter opens it and goes to the composer. A terminal in control mode keeps F6 for its
+// program.
+//
+// The session pane shows the chat, its terminal when the session has one (`?view=terminal`), or
+// its work (`?view=work`, src/projects' `SessionWork`, lazy).
 
 import { defaultStringifySearch, useParams, useRouter, useSearch } from '@tanstack/react-router';
 import {
+  createElement,
+  lazy,
+  Suspense,
   useEffect,
   useEffectEvent,
   useLayoutEffect,
   useRef,
   useState,
+  type ComponentType,
   type KeyboardEvent,
+  type LazyExoticComponent,
   type ReactNode,
   type RefObject,
 } from 'react';
 import { ApiError, useSession, type Session } from '../data/index.ts';
 import { Badge, Button, ChevronRightIcon, ConsoleIcon, Kbd, ResizablePanel } from '../design/index.ts';
-import { paths, useWorkspaceId } from '../shell/index.ts';
+import { SessionWork } from '../projects/index.ts';
+import { paths, SHELL_KEYS_ATTRIBUTE, useWorkspaceId } from '../shell/index.ts';
 import { ChatView } from './chat-view.tsx';
 import { Composer } from './composer.tsx';
 import { useConsoleSessions } from './data.ts';
 import { NO_FACETS, type SessionFacets } from './facets.ts';
 import { onIntent, takeIntent, type ConsoleIntent } from './intent.ts';
 import { NARROW_BELOW, PANE_WIDTH, usePanes } from './panes.ts';
-import { facetCount, facetsFromSearch, searchWithFacets } from './search.ts';
+import {
+  facetCount,
+  facetsFromSearch,
+  searchWithFacets,
+  searchWithView,
+  viewFromSearch,
+  type SessionView,
+} from './search.ts';
 import { SessionFilters } from './session-filters.tsx';
 import { SessionHeader } from './session-header.tsx';
 import { SessionList, type SelectVia } from './session-list.tsx';
+import { TerminalBoundary } from './terminal-boundary.tsx';
+import type { TerminalViewProps } from './terminal/terminal-view.tsx';
+import { ViewSwitch } from './view-switch.tsx';
+import { WorkBoundary } from './work-boundary.tsx';
+
+// Its own chunk, with xterm: nothing of it loads until a terminal is shown. One lazy component per
+// attempt: React keeps a failed import's error, so trying again needs a new one.
+const loadTerminalView = () => import('./terminal/terminal-view.tsx').then((m) => ({ default: m.TerminalView }));
+const terminalViews: LazyExoticComponent<ComponentType<TerminalViewProps>>[] = [];
+function terminalView(attempt: number): LazyExoticComponent<ComponentType<TerminalViewProps>> {
+  terminalViews[attempt] ??= lazy(loadTerminalView);
+  return terminalViews[attempt];
+}
 
 /** How long the arrow keys must rest on a session before the session pane follows. */
 const FOLLOW_MS = 150;
 
-type Pane = 'filters' | 'list' | 'chat' | 'composer';
+type Pane = 'filters' | 'list' | 'terminal' | 'work' | 'chat' | 'composer';
 
-const PANE_ORDER: readonly Pane[] = ['filters', 'list', 'chat', 'composer'];
+const PANE_ORDER: readonly Pane[] = ['filters', 'list', 'terminal', 'work', 'chat', 'composer'];
 
 /** What F6 focuses in each pane, if the pane is on screen and has it. */
 const PANE_FOCUS: Record<Pane, string> = {
   filters: '[data-pane="filters"] input:not(:disabled)',
   list: '[data-pane="list"] [role="listbox"]',
+  terminal: '[data-pane="terminal"] [data-terminal-focus]',
+  work: '[data-pane="work"] [data-work-focus]',
   chat: '[data-pane="chat"] [data-chat-scroller]',
   composer: '[data-pane="composer"] textarea:not(:disabled)',
 };
@@ -126,6 +159,12 @@ export function ConsolePage() {
     void router.navigate({ href: path + stringify(next), replace });
   };
   const setFacets = (next: SessionFacets) => go({ facets: next }, true);
+  const view = viewFromSearch(search);
+  /** Chat or terminal, in the URL; a switch, not a step, so it replaces the history entry. */
+  const setView = (next: SessionView) => {
+    if (sessionId === undefined) return;
+    void router.navigate({ href: paths.session(ws, sessionId) + stringify(searchWithView(search, next)), replace: true });
+  };
 
   // The arrow keys choose the session beside the list, once they rest on one.
   const followTimer = useRef<number | undefined>(undefined);
@@ -182,6 +221,8 @@ export function ConsolePage() {
 
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key !== 'F6' || event.ctrlKey || event.metaKey || event.altKey) return;
+    // A surface that owns the keys (a terminal in control mode) keeps F6 for its program.
+    if (event.target instanceof Element && event.target.closest(`[${SHELL_KEYS_ATTRIBUTE}="none"]`) !== null) return;
     const available = PANE_ORDER.filter((pane) => find(root.current, PANE_FOCUS[pane]) !== null);
     if (available.length === 0) return;
     event.preventDefault();
@@ -231,7 +272,7 @@ export function ConsolePage() {
         Pick one from the list to read its chat and talk to its agent. <Kbd keys={['F6']} /> moves between panes.
       </Placeholder>
     ) : (
-      <SessionPane key={sessionId} ws={ws} sessionId={sessionId} />
+      <SessionPane key={sessionId} ws={ws} sessionId={sessionId} view={view} onView={setView} narrow={narrow} />
     );
 
   if (narrow) {
@@ -318,8 +359,20 @@ function Placeholder({ title, children }: { title: string; children: ReactNode }
   );
 }
 
-/** One session: its header (with links to its task and workstream), chat and composer. */
-function SessionPane({ ws, sessionId }: { ws: string; sessionId: string }) {
+interface SessionPaneProps {
+  ws: string;
+  sessionId: string;
+  view: SessionView;
+  onView(view: SessionView): void;
+  narrow: boolean;
+}
+
+/**
+ * One session: its header (with links to its task and workstream), the Chat | Terminal | Work
+ * switch, then the chat and composer, the terminal, or its work. In a narrow console the terminal
+ * and work views take the pane, with only the header's title row above them.
+ */
+function SessionPane({ ws, sessionId, view, onView, narrow }: SessionPaneProps) {
   const router = useRouter();
   const session = useSession(sessionId);
   if (session.error instanceof ApiError && session.error.code === 'not_found') {
@@ -332,6 +385,15 @@ function SessionPane({ ws, sessionId }: { ws: string; sessionId: string }) {
   const open = (href: string) => void router.navigate({ href });
   const taskHref = (task: { key: string }) => paths.task(ws, task.key);
   const workstreamHref = (w: { id: string; project: string }) => paths.workstream(ws, w.project, w.id);
+  const loaded = session.data !== undefined;
+  const hasTerminal = session.data?.terminal !== undefined;
+  // Until the session is here, a link to its terminal waits for it rather than flashing the chat.
+  // Work needs nothing from the session itself (its own query fetches the blocks), so it shows at
+  // once, like the chat.
+  let shown: SessionView | 'loading' | 'failed' =
+    view === 'terminal' && hasTerminal ? 'terminal' : view === 'work' ? 'work' : 'chat';
+  if (view === 'terminal' && !loaded) shown = session.error === null ? 'loading' : 'failed';
+  const switchValue: SessionView = shown === 'chat' ? 'chat' : shown === 'work' ? 'work' : 'terminal';
   return (
     <>
       <SessionHeader
@@ -340,13 +402,61 @@ function SessionPane({ ws, sessionId }: { ws: string; sessionId: string }) {
         onOpenTask={(task) => open(taskHref(task))}
         workstreamHref={workstreamHref}
         onOpenWorkstream={(w) => open(workstreamHref(w))}
+        compact={narrow && (shown === 'terminal' || shown === 'work')}
       />
-      <div data-pane="chat" className="min-h-0 flex-1">
-        <ChatView sessionId={sessionId} />
-      </div>
-      <div data-pane="composer" className="shrink-0">
-        <Composer sessionId={sessionId} />
-      </div>
+      <ViewSwitch
+        value={switchValue}
+        onChange={onView}
+        terminalUnavailable={loaded && !hasTerminal ? 'This session has no terminal.' : undefined}
+      />
+      {shown === 'loading' && <p className="p-4 text-sm text-ink-2">Loading the session…</p>}
+      {shown === 'failed' && (
+        <p role="alert" className="p-4 text-sm text-ink-2">
+          Could not load the session{session.error instanceof ApiError ? `: ${session.error.message}` : '.'}
+        </p>
+      )}
+      {shown === 'terminal' && (
+        <div data-pane="terminal" className="flex min-h-0 flex-1 flex-col">
+          <TerminalBoundary>
+            {(attempt) => (
+              <Suspense fallback={<p className="p-4 text-sm text-ink-2">Loading the terminal…</p>}>
+                {createElement(terminalView(attempt), { sessionId })}
+              </Suspense>
+            )}
+          </TerminalBoundary>
+        </div>
+      )}
+      {shown === 'work' && (
+        <div data-pane="work" className="min-h-0 flex-1 overflow-y-auto">
+          {/* Focusable but not a tab stop, like the chat scroller: F6 lands here. Unlabelled,
+              since SessionWork's own section (role="region", named "Work" by its heading) is the
+              pane's landmark. */}
+          <div
+            tabIndex={-1}
+            data-work-focus=""
+            className="p-4 outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent focus-visible:outline-solid"
+          >
+            <WorkBoundary>
+              {(attempt) => (
+                <Suspense fallback={<p className="text-sm text-ink-2">Loading the session's work…</p>}>
+                  {/* The session title above is already an h2; Work nests under it as an h3. */}
+                  <SessionWork key={attempt} session={sessionId} level={3} />
+                </Suspense>
+              )}
+            </WorkBoundary>
+          </div>
+        </div>
+      )}
+      {shown === 'chat' && (
+        <>
+          <div data-pane="chat" className="min-h-0 flex-1">
+            <ChatView sessionId={sessionId} />
+          </div>
+          <div data-pane="composer" className="shrink-0">
+            <Composer sessionId={sessionId} />
+          </div>
+        </>
+      )}
     </>
   );
 }

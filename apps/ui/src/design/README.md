@@ -19,6 +19,13 @@ honours reduced motion through the tokens' durations. See `docs/build/streams/L.
 | `ThemeToggle`, `useTheme`, `applyTheme` | Light, system or dark, persisted. |
 | icons | A small stroke icon set (`HomeIcon`, `InboxIcon`, …), decorative (`aria-hidden`). |
 
+## Focus rings
+
+Tailwind v4 computes `outline-style: none` for the `outline-none` utility, so pairing it with
+`focus-visible:outline-2` alone draws no ring: there is a width but no style to render it with.
+Anything that sets `outline-none` for its resting state and wants a visible keyboard-focus ring
+appends `FOCUS_RING` (`focus.ts`): `className={cx('... outline-none ...', FOCUS_RING)}`.
+
 ## Contrast
 
 Text meets WCAG AA (4.5:1) on every surface in both themes. The `muted` token is for icons and

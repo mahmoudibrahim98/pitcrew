@@ -1,20 +1,27 @@
 // Gives the tree the API client and the query cache, and keeps the cache live through the stream.
+// In a browser `<DataProvider>` does it for the one hub; in the desktop app every workspace has a
+// scope of its own (`workspaces.tsx`), with its own cache.
 
 import {
   QueryClient,
   QueryClientProvider,
+  useInfiniteQuery,
   useQuery,
+  type InfiniteData,
   type QueryKey,
+  type UseInfiniteQueryOptions,
   type UseQueryOptions,
 } from '@tanstack/react-query';
 import { createContext, use, useEffect, useState, type ReactNode } from 'react';
 import { useStore } from 'zustand';
 import { ApiError, type Api } from './api.ts';
 import { createLive, type Live, type LiveState } from './live.ts';
-import type { SocketFactory } from './stream.ts';
+import type { BrowserTransport, SocketFactory, Transport, TransportSocket } from './transport.ts';
+import type { GatewayWorkspace } from './workspaces.tsx';
 
 const ApiContext = createContext<Api | null>(null);
 const LiveContext = createContext<Live | null>(null);
+const GatewayWorkspaceContext = createContext<GatewayWorkspace | null>(null);
 
 export function useApi(): Api {
   const api = use(ApiContext);
@@ -22,9 +29,14 @@ export function useApi(): Api {
   return api;
 }
 
-function useLive<T>(select: (state: LiveState) => T): T {
+function useLiveContext(): Live {
   const live = use(LiveContext);
   if (live === null) throw new Error('useLive must be used inside <DataProvider>');
+  return live;
+}
+
+function useLive<T>(select: (state: LiveState) => T): T {
+  const live = useLiveContext();
   return useStore(live.store, select);
 }
 
@@ -34,6 +46,21 @@ export function useConnection(): LiveState {
   const synced = useLive((s) => s.synced);
   const problem = useLive((s) => s.problem);
   return { status, synced, problem };
+}
+
+/** In the desktop app, the gateway's entry for this workspace (name, state); none in a browser. */
+export function useGatewayWorkspace(): GatewayWorkspace | undefined {
+  return use(GatewayWorkspaceContext) ?? undefined;
+}
+
+/**
+ * Opens a socket on one of API v1's WebSocket routes through the stream's transport: a browser
+ * WebSocket in development, the desktop gateway in the app. For the console's terminal:
+ * `const open = useOpenSocket(); const socket = open(terminalPath(id, { cols, rows, from }));`
+ */
+export function useOpenSocket(): (path: string) => TransportSocket {
+  const live = useLiveContext();
+  return live.transport.openSocket;
 }
 
 /**
@@ -46,6 +73,26 @@ export function useLiveQuery<TData, TKey extends QueryKey = QueryKey>(
   const synced = useLive((s) => s.synced);
   const { enabled } = options;
   return useQuery({
+    ...options,
+    enabled:
+      typeof enabled === 'function'
+        ? (query) => synced && enabled(query)
+        : synced && enabled !== false,
+  });
+}
+
+/**
+ * `useInfiniteQuery` for server state paged backwards (recaps so far; see `src/data/recaps.ts`).
+ * Idle until the stream is synced, on `useLiveQuery`'s conventions: a fetch before the first
+ * `hello` could miss an event. Every loaded page refetches together when the query is
+ * invalidated, so older pages stay consistent with the newest one.
+ */
+export function useLiveInfiniteQuery<TQueryFnData, TKey extends QueryKey = QueryKey, TPageParam = unknown>(
+  options: UseInfiniteQueryOptions<TQueryFnData, Error, InfiniteData<TQueryFnData, TPageParam>, TKey, TPageParam>,
+) {
+  const synced = useLive((s) => s.synced);
+  const { enabled } = options;
+  return useInfiniteQuery({
     ...options,
     enabled:
       typeof enabled === 'function'
@@ -70,21 +117,54 @@ export function createQueryClient(): QueryClient {
   });
 }
 
+/** One hub's or workspace's data, for the tree under it. */
+export function DataScope(props: {
+  api: Api;
+  queryClient: QueryClient;
+  live: Live;
+  /** The gateway's entry, in the desktop app. */
+  workspace?: GatewayWorkspace | undefined;
+  children: ReactNode;
+}) {
+  return (
+    <QueryClientProvider client={props.queryClient}>
+      <ApiContext value={props.api}>
+        <LiveContext value={props.live}>
+          <GatewayWorkspaceContext value={props.workspace ?? null}>{props.children}</GatewayWorkspaceContext>
+        </LiveContext>
+      </ApiContext>
+    </QueryClientProvider>
+  );
+}
+
+function isBrowserTransport(transport: Transport): transport is BrowserTransport {
+  return transport.kind === 'browser' && 'with' in transport;
+}
+
+/** The stream's transport: the API's, unless a test gives the stream its own token or sockets. */
+function streamTransport(transport: Transport, token: string | undefined, socket: SocketFactory | undefined): Transport {
+  if (!isBrowserTransport(transport) || (token === undefined && socket === undefined)) return transport;
+  return transport.with({ ...(token === undefined ? {} : { token }), ...(socket === undefined ? {} : { socket }) });
+}
+
+/** The browser's data layer: one hub, one cache, one stream. */
 export function DataProvider(props: {
   api: Api;
   queryClient: QueryClient;
-  token: string | undefined;
-  /** For tests. */
+  /**
+   * Browser only: the stream's token when it is not the API's (a test acting as an agent, whose
+   * token cannot open the stream). Never given in the desktop app, whose gateway adds tokens.
+   */
+  token?: string | undefined;
+  /** For tests: the stream's WebSockets. */
   socket?: SocketFactory;
   children: ReactNode;
 }) {
   const [live] = useState(() =>
     createLive({
       queryClient: props.queryClient,
-      baseUrl: props.api.baseUrl,
-      token: props.token,
+      transport: streamTransport(props.api.transport, props.token, props.socket),
       probe: () => props.api.me(),
-      ...(props.socket === undefined ? {} : { socket: props.socket }),
     }),
   );
 
@@ -94,10 +174,8 @@ export function DataProvider(props: {
   }, [live]);
 
   return (
-    <QueryClientProvider client={props.queryClient}>
-      <ApiContext value={props.api}>
-        <LiveContext value={live}>{props.children}</LiveContext>
-      </ApiContext>
-    </QueryClientProvider>
+    <DataScope api={props.api} queryClient={props.queryClient} live={live}>
+      {props.children}
+    </DataScope>
   );
 }

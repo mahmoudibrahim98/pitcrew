@@ -5,15 +5,16 @@
 // (inside <main>, under the page's <h1>). happy-dom has no layout, so colour contrast is left to the
 // shell's Playwright axe run in a real browser.
 
-import { fireEvent, screen, within } from '@testing-library/react';
+import { act, fireEvent, screen, within } from '@testing-library/react';
 import axe from 'axe-core';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { ActivityFeed } from '../activity.tsx';
 import { Board } from '../board.tsx';
 import { Home } from '../home.tsx';
 import { Inbox } from '../inbox.tsx';
 import { ProjectOverview, WorkstreamOverview } from '../overview.tsx';
-import { TaskDrawer } from '../task-drawer.tsx';
+import { TaskDetail, TaskDrawer } from '../task-drawer.tsx';
 import { demo, renderWithHub, startHub, stopHub, type Hub } from './harness.tsx';
 
 /**
@@ -86,15 +87,50 @@ describe('accessibility (axe)', () => {
     expect(await violations({ modal: true })).toEqual([]);
   });
 
-  it('Inbox', async () => {
-    renderWithHub(
-      <main>
-        <Inbox />
-      </main>,
-      hub,
-    );
-    await screen.findByText('Merge the benchmark change into parsers?');
-    await screen.findByText('PAP-5');
+  it(
+    'Inbox',
+    async () => {
+      renderWithHub(
+        <main>
+          <Inbox />
+        </main>,
+        hub,
+      );
+      // The question card is a lazy chunk (stream M's); the first load in this file can be slow.
+      await screen.findByText('Merge the benchmark change into parsers?', {}, { timeout: 15_000 });
+      await screen.findByText('PAP-5');
+      expect(await violations()).toEqual([]);
+    },
+    20_000,
+  );
+
+  it('Activity Summary, with a day’s bursts of work and a clause’s evidence open', async () => {
+    renderWithHub(page('Paper', <ActivityFeed filters={{ project: demo.paper }} title="Activity" />), hub);
+    fireEvent.click(screen.getByRole('radio', { name: 'Summary' }));
+    await screen.findAllByRole('heading', { level: 4, name: 'Seed runs' });
+    expect(await violations()).toEqual([]);
+
+    const [disclosure] = screen.getAllByRole('button', { name: /bursts? of work$/ });
+    if (disclosure === undefined) throw new Error('no disclosure');
+    fireEvent.click(disclosure);
+    await screen.findByRole('list', { name: /^Bursts of work, / });
+    expect(await violations()).toEqual([]);
+
+    // The paragraph's clause (the open burst of work below it has one like it).
+    const [clause] = screen.getAllByRole('button', { name: /^@writer moved PAP-1 to in progress, with evidence/ });
+    if (clause === undefined) throw new Error('no clause');
+    act(() => clause.focus());
+    fireEvent.keyDown(clause, { key: 'Enter' });
+    const dialog = await screen.findByRole('dialog', { name: /^Evidence for/ });
+    await within(dialog).findByRole('list', { name: 'Where it happened' });
+    expect(await violations()).toEqual([]);
+  });
+
+  it('A task’s Work section', async () => {
+    renderWithHub(page('PAP-1', <TaskDetail taskId={demo.pap1} />), hub);
+    const work = await screen.findByRole('region', { name: 'Work' });
+    await within(work).findByRole('list', { name: 'Bursts of work' });
+    await within(work).findAllByText('Draft method section');
     expect(await violations()).toEqual([]);
   });
 

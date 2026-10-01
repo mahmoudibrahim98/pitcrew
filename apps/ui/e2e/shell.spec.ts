@@ -1,9 +1,7 @@
 import AxeBuilder from '@axe-core/playwright';
 import { expect, test, type Page } from '@playwright/test';
+import { HUB_AUTH, HUB_URL } from './helpers';
 
-// The same hub the config starts (see playwright.config.ts).
-const HUB = `http://127.0.0.1:${process.env.E2E_HUB_PORT ?? 47399}`;
-const AUTH = { Authorization: 'Bearer dev-device-token' };
 const PAPER = '01JB000000000000000PRJ0001';
 
 const sidebar = (page: Page) => page.getByRole('complementary', { name: 'Sidebar' });
@@ -181,10 +179,12 @@ test('a task moved through the API updates the sidebar counts without a reload',
 
   // PAP-7 is assigned to the workspace's person. Reopening it adds an open task to My tasks and to
   // its project; closing it again takes one away.
-  const task = (await (await request.get(`${HUB}/v1/tasks/PAP-7`, { headers: AUTH })).json()) as { status: string };
+  const task = (await (await request.get(`${HUB_URL}/v1/tasks/PAP-7`, { headers: HUB_AUTH })).json()) as {
+    status: string;
+  };
   const reopen = task.status === 'done';
-  const moved = await request.post(`${HUB}/v1/tasks/PAP-7/move`, {
-    headers: AUTH,
+  const moved = await request.post(`${HUB_URL}/v1/tasks/PAP-7/move`, {
+    headers: HUB_AUTH,
     data: { to: reopen ? 'todo' : 'done' },
   });
   expect(moved.ok()).toBe(true);
@@ -237,6 +237,62 @@ test('Ctrl B collapses the sidebar to a rail of labelled icons', async ({ page }
   await expect(heading(page, 'Inbox')).toBeVisible();
   await page.keyboard.press('Control+KeyB');
   await expect(sidebar(page)).toHaveAttribute('data-collapsed', 'false');
+});
+
+test('tabbing to a control shows a visible focus ring', async ({ page }) => {
+  await openShell(page);
+  const outline = () =>
+    page.evaluate(() => {
+      const el = document.activeElement;
+      if (!(el instanceof HTMLElement)) return null;
+      const style = getComputedStyle(el);
+      return { style: style.outlineStyle, width: style.outlineWidth };
+    });
+
+  // Tailwind v4: `outline-none` computes `outline-style: none`, so `focus-visible:outline-2`
+  // alone draws nothing. These are the controls the bug was seen on (see design/focus.ts).
+  const controls = [
+    page.getByRole('button', { name: 'Collapse sidebar' }),
+    page.getByRole('button', { name: /^Workspace:/ }),
+    sidebar(page).getByRole('link', { name: 'Home', exact: true }),
+    page.getByRole('radio', { name: 'Agent console' }),
+  ];
+  for (const control of controls) {
+    await control.focus();
+    await expect(control).toBeFocused();
+    expect(await outline()).toMatchObject({ style: 'solid' });
+  }
+
+  await page.keyboard.press('Control+KeyJ');
+  const closeOrchestrator = page.getByRole('button', { name: 'Close the Orchestrator' });
+  await closeOrchestrator.focus();
+  expect(await outline()).toMatchObject({ style: 'solid' });
+
+  await tree(page).getByRole('treeitem', { name: /^Paper · Diffusion study/ }).focus();
+  expect(await outline()).toMatchObject({ style: 'solid' });
+});
+
+test('the breadcrumb collapses its middle segments at a narrow window, keeping the full path reachable', async ({
+  page,
+}) => {
+  await openShell(page);
+  await tree(page).getByRole('treeitem', { name: /^Paper · Diffusion study/ }).click();
+  await tree(page).getByRole('treeitem', { name: /Seed runs/ }).click();
+  await expect(heading(page, 'Seed runs')).toBeVisible();
+
+  await page.setViewportSize({ width: 700, height: 800 });
+  const nav = page.getByRole('navigation', { name: 'Breadcrumb' });
+  const list = nav.locator('ol');
+  // The current page's own crumb stays fully readable, not crushed into an ellipsis.
+  await expect(list.getByText('Seed runs', { exact: true })).toBeVisible();
+  // The collapsed middle segment is a reachable control, not just gone.
+  const collapsed = list.getByRole('button', { name: /^Collapsed:/ });
+  await expect(collapsed).toBeVisible();
+  await expect(collapsed).toHaveAccessibleName(/Paper · Diffusion study/);
+  // Assistive tech can still get the whole path, even though it is visually collapsed.
+  await expect(list).toHaveAttribute('aria-label', /Paper · Diffusion study.*Seed runs/);
+
+  await page.setViewportSize({ width: 1280, height: 800 });
 });
 
 for (const theme of ['light', 'dark'] as const) {

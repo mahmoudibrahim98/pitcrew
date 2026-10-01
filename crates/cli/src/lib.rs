@@ -19,11 +19,12 @@ pub mod display;
 pub mod error;
 pub mod hook;
 pub mod http;
+mod install;
 pub mod plan;
 pub mod transport;
 mod verbs;
 
-use clap::{ArgGroup, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use config::Env;
 use error::Result;
 use std::ffi::OsString;
@@ -43,6 +44,20 @@ pub fn hook_args(args: &[OsString]) -> Option<&[OsString]> {
         .position(|a| a != "--json")
         .map(|i| i + 1)?;
     (args[first] == "hook").then(|| &args[first + 1..])
+}
+
+/// Whether `args` (after the program name and any global `--json` flags) start with `hooks`:
+/// `main` skips the 60-second daemon watchdog for it, since `pitcrew hooks …` never talks to the
+/// daemon (it only edits files on disk) and `install`/`uninstall` may be waiting on a person
+/// answering a confirmation prompt instead.
+#[must_use]
+pub fn is_hooks_command(args: &[OsString]) -> bool {
+    let first = args
+        .iter()
+        .skip(1)
+        .position(|a| a != "--json")
+        .map(|i| i + 1);
+    first.is_some_and(|i| args[i] == "hooks")
 }
 
 /// Checks a task argument before anything is sent (see `verbs::task_ref`).
@@ -173,6 +188,61 @@ enum Command {
         /// The event's JSON, when the CLI passes it as an argument instead of on stdin.
         payload: Option<String>,
     },
+    /// Install, inspect or remove the `pitcrew hook` wiring in each agent CLI's own config.
+    /// Never talks to the daemon.
+    #[command(subcommand)]
+    Hooks(HooksAction),
+}
+
+/// Restricts a `hooks` command to one agent CLI; the default is all three.
+#[derive(Debug, Args)]
+struct EngineFilter {
+    /// Only this agent CLI: claude, codex or opencode. Default: all three.
+    #[arg(long, value_parser = engine_arg)]
+    engine: Option<String>,
+}
+
+fn engine_arg(s: &str) -> std::result::Result<String, String> {
+    install::Target::parse(s)
+        .map(|_| s.to_ascii_lowercase())
+        .map_err(|e| e.message)
+}
+
+#[derive(Debug, Subcommand)]
+enum HooksAction {
+    /// Show whether each agent CLI's hook is installed, missing, partial or conflicting.
+    Status {
+        #[command(flatten)]
+        engine: EngineFilter,
+    },
+    /// Show exactly what `install` would change, without changing anything.
+    Diff {
+        #[command(flatten)]
+        engine: EngineFilter,
+        /// Preview chaining a foreign Codex `notify` instead of reporting a conflict.
+        #[arg(long)]
+        chain: bool,
+    },
+    /// Wire `pitcrew hook` into each agent CLI, after showing the diff and asking to confirm.
+    Install {
+        #[command(flatten)]
+        engine: EngineFilter,
+        /// Don't ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+        /// If Codex already has a `notify`, run it and ours both, instead of reporting a
+        /// conflict.
+        #[arg(long)]
+        chain: bool,
+    },
+    /// Remove exactly what `install` wrote, after showing the diff and asking to confirm.
+    Uninstall {
+        #[command(flatten)]
+        engine: EngineFilter,
+        /// Don't ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -237,6 +307,20 @@ pub fn run(args: Vec<OsString>, env: Env<'_>, io: &mut Io<'_>) -> i32 {
         let _ = hook::run(&args, env, io.stdin, io.stdin_is_terminal);
         return 0;
     }
+    if let Command::Hooks(action) = cli.command {
+        return match install::dispatch(action, env, io, cli.json) {
+            Ok(()) => 0,
+            Err(e) => {
+                let text = if cli.json {
+                    format!("{}\n", e.to_json())
+                } else {
+                    format!("pitcrew: {}\n", display::line(&e.message))
+                };
+                let _ = io.stderr.write_all(text.as_bytes());
+                e.exit_code()
+            }
+        };
+    }
     match execute(cli.command, env, io, cli.json) {
         Ok(()) => 0,
         Err(e) => {
@@ -286,8 +370,8 @@ fn execute(command: Command, env: Env<'_>, io: &mut Io<'_>, json: bool) -> Resul
         }),
         Command::Reply { ask, text, option } => verb.reply(&ask, &text, option),
         Command::Check => verb.check(),
-        // Handled in `run`.
-        Command::Hook { .. } => Ok(()),
+        // Handled in `run`, before the client ever connects.
+        Command::Hook { .. } | Command::Hooks(_) => Ok(()),
     }
 }
 

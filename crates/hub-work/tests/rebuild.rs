@@ -7,13 +7,16 @@ mod common;
 use common::{RUNNER, SAM, WRITER, agent, demo, member, person, seeded};
 use pitcrew_hub_work::projection::{NAMES, TABLES};
 use pitcrew_hub_work::{
-    AnswerAsk, BriefEdit, NewAsk, NewComment, NewTask, TaskRef, WorkService, WorkstreamPatch,
+    AnswerAsk, BriefEdit, NewAsk, NewComment, NewProject, NewTask, NewWorkstream, TaskPatch,
+    TaskRef, WorkService, WorkstreamPatch,
 };
 use pitcrew_protocol::events::{Event, EventBody};
-use pitcrew_protocol::ids::{DispatchId, EventId, MemberId, SubtaskId, TaskId};
+use pitcrew_protocol::ids::{
+    DispatchId, EventId, MemberId, ProjectId, ProjectKey, SubtaskId, TaskId,
+};
 use pitcrew_protocol::model::{
-    AskKind, BriefTarget, Dispatch, DispatchOutcome, Health, LinkBasis, Liveness, Priority,
-    SessionState, Subtask, SubtaskSource, TaskStatus, Team,
+    AskKind, BriefSource, BriefTarget, Date, Dispatch, DispatchOutcome, Health, LinkBasis,
+    Liveness, Location, Priority, Receipt, SessionState, Subtask, SubtaskSource, TaskStatus, Team,
 };
 use pitcrew_protocol::transcript::{PlanItem, PlanStatus};
 use pitcrew_store::sql::types::Value;
@@ -281,6 +284,247 @@ fn workload(work: &WorkService) {
             subtasks: Vec::new(),
         },
     );
+
+    // What a second writer could append: a task taking a key already held (recorded as a clash),
+    // and a move from a status the task has left (ignored).
+    let mut clash = work
+        .task(&TaskRef::parse("PAP-2").expect("key"))
+        .expect("task");
+    clash.id = TaskId::new();
+    clash.title = "Same key, other task".into();
+    raw(
+        work,
+        member(SAM),
+        None,
+        EventBody::TaskCreated { task: clash },
+    );
+    raw(
+        work,
+        member(SAM),
+        None,
+        EventBody::TaskMoved {
+            task: "01JB000000000000000TSK0002".parse().expect("task"),
+            from: TaskStatus::Review,
+            to: TaskStatus::Done,
+            mover: pitcrew_protocol::model::Mover::Person,
+        },
+    );
+    // A runner re-stating a dispatched session without its link keeps the link.
+    let mut ses1 = work
+        .session(&"01JB000000000000000SES0001".parse().expect("session"))
+        .expect("session");
+    ses1.workstream = None;
+    ses1.task = None;
+    ses1.link_basis = None;
+    ses1.title = Some("Re-stated".into());
+    raw(
+        work,
+        member(WRITER),
+        Some(member(SAM)),
+        EventBody::SessionDiscovered { session: ses1 },
+    );
+    // A comment on a workstream, and a decision.
+    raw(
+        work,
+        member(SAM),
+        None,
+        EventBody::CommentPosted {
+            task: None,
+            workstream: Some("01JB000000000000000WST0003".parse().expect("ws")),
+            text: "Parsers look good.".into(),
+            mentions: Vec::new(),
+        },
+    );
+    raw(
+        work,
+        member(SAM),
+        None,
+        EventBody::DecisionRecorded {
+            workstream: Some("01JB000000000000000WST0002".parse().expect("ws")),
+            text: "Keep lr 1e-4.".into(),
+            why: None,
+            receipts: Vec::new(),
+        },
+    );
+    edits(work, task.id);
+}
+
+/// Task edits, new projects and workstreams, and brief proposals.
+fn edits(work: &WorkService, rerun: TaskId) {
+    let sam = person(SAM);
+    let thesis = work
+        .create_project(
+            &sam,
+            NewProject {
+                key: ProjectKey::new("THS").expect("key"),
+                name: "Thesis".into(),
+                lead: None,
+                members: Some(vec![member(WRITER)]),
+                status: None,
+                start: Some(Date("2026-10-01".into())),
+                due: Some(Date("2027-06-30".into())),
+                root: Some(Location {
+                    machine: "01JB000000000000000MCH0001".parse().expect("machine"),
+                    path: "/work/thesis".into(),
+                    branch: None,
+                }),
+            },
+        )
+        .expect("project");
+    let chapter = work
+        .create_workstream(
+            &sam,
+            NewWorkstream {
+                project: thesis.id,
+                name: "Chapter 1".into(),
+                status: None,
+                locations: Some(vec![Location {
+                    machine: "01JB000000000000000MCH0001".parse().expect("machine"),
+                    path: "/work/thesis/ch1".into(),
+                    branch: Some("ch1".into()),
+                }]),
+            },
+        )
+        .expect("workstream");
+    let outline = work
+        .create_task(
+            &sam,
+            NewTask {
+                project: thesis.id,
+                workstream: None,
+                title: "Outline".into(),
+                description: None,
+                status: None,
+                priority: None,
+                assignee: None,
+                labels: None,
+                due: None,
+            },
+        )
+        .expect("task");
+    work.patch_task(
+        &sam,
+        &TaskRef::Id(outline.id),
+        TaskPatch {
+            workstream: Some(Some(chapter.id)),
+            title: Some("  Outline chapter 1 ".into()),
+            labels: Some(vec!["outline".into(), " writing ".into(), "outline".into()]),
+            start: Some(Some(Date("2026-10-02".into()))),
+            due: Some(Some(Date("2026-10-20".into()))),
+            ..TaskPatch::default()
+        },
+    )
+    .expect("patch");
+    work.patch_task(
+        &sam,
+        &TaskRef::parse("PAP-2").expect("key"),
+        TaskPatch {
+            workstream: Some(Some("01JB000000000000000WST0002".parse().expect("ws"))),
+            description: Some("Mean and spread.".into()),
+            priority: Some(Priority::High),
+            blocked_by: Some(vec![
+                rerun,
+                "01JB000000000000000TSK0001".parse().expect("task"),
+            ]),
+            accept_auto: Some(true),
+            ..TaskPatch::default()
+        },
+    )
+    .expect("patch");
+    work.patch_task(
+        &sam,
+        &TaskRef::parse("PAP-1").expect("key"),
+        TaskPatch {
+            workstream: Some(None),
+            due: Some(None),
+            labels: Some(Vec::new()),
+            ..TaskPatch::default()
+        },
+    )
+    .expect("clear");
+    // A task_updated for a task nobody knows changes nothing.
+    raw(
+        work,
+        member(SAM),
+        None,
+        EventBody::TaskUpdated {
+            task: TaskId::new(),
+            patch: TaskPatch {
+                title: Some("Ghost".into()),
+                ..TaskPatch::default()
+            },
+        },
+    );
+    // A racing writer's project with a key already held is not applied.
+    let mut clash = thesis.clone();
+    clash.id = ProjectId::new();
+    clash.name = "Same key".into();
+    raw(
+        work,
+        member(SAM),
+        None,
+        EventBody::ProjectCreated { project: clash },
+    );
+    // Briefs: a pending proposal; one accepted unchanged; one for a target without a brief; one
+    // the back office applies itself.
+    let office = member("01JB000000000000000MEM0006");
+    let receipts = vec![Receipt::Event { id: EventId::new() }];
+    let seeds = BriefTarget::Workstream("01JB000000000000000WST0002".parse().expect("ws"));
+    raw(
+        work,
+        office,
+        Some(member(SAM)),
+        EventBody::BriefProposed {
+            target: seeds,
+            text: "Seed 3 converged.".into(),
+            next: Some("Make figure 3.".into()),
+            receipts: receipts.clone(),
+        },
+    );
+    work.put_brief(
+        &sam,
+        seeds,
+        BriefEdit {
+            text: "Seed 3 converged.".into(),
+            next: Some("Make figure 3.".into()),
+            pinned: true,
+        },
+    )
+    .expect("accept");
+    raw(
+        work,
+        office,
+        Some(member(SAM)),
+        EventBody::BriefProposed {
+            target: seeds,
+            text: "Figure 3 is drafted.".into(),
+            next: None,
+            receipts: receipts.clone(),
+        },
+    );
+    raw(
+        work,
+        office,
+        Some(member(SAM)),
+        EventBody::BriefProposed {
+            target: BriefTarget::Workstream(chapter.id),
+            text: "Not started.".into(),
+            next: None,
+            receipts: receipts.clone(),
+        },
+    );
+    raw(
+        work,
+        office,
+        Some(member(SAM)),
+        EventBody::BriefAccepted {
+            target: BriefTarget::Project(thesis.id),
+            text: "Planned.".into(),
+            next: Some("Outline chapter 1.".into()),
+            pinned: false,
+            receipts,
+        },
+    );
 }
 
 fn all_events(store: &Store) -> Vec<Event> {
@@ -301,42 +545,93 @@ fn fresh(path: &Path, projections: bool) -> Store {
     Store::open_with(path, StoreOptions::default(), list).expect("open")
 }
 
-/// Every task's document matches its filter columns and its child rows.
+/// One `work_tasks` row with its child rows, as text.
+struct TaskRow {
+    id: String,
+    project: String,
+    key_prefix: String,
+    number: i64,
+    workstream: Option<String>,
+    status: String,
+    assignee: Option<String>,
+    doc: String,
+    lines: Vec<String>,
+    deps: Vec<String>,
+    labels: Vec<String>,
+}
+
+/// Every task's document matches its filter columns and its child rows: project, workstream,
+/// key, status, assignee, subtasks, dependencies and labels.
 fn task_documents_agree_with_their_columns(work: &WorkService) {
-    type Row = (String, String, Option<String>, String, Vec<String>);
-    let rows: Vec<Row> = work
+    let rows: Vec<TaskRow> = work
         .read(|c| {
             let mut stmt = c.prepare(
-                "SELECT t.id, t.status, t.assignee, t.doc,
+                "SELECT t.id, t.project, t.key_prefix, t.number, t.workstream, t.status,
+                   t.assignee, t.doc,
                    (SELECT json_group_array(s.id || ':' || s.text || ':' || s.done || ':' ||
                       COALESCE(s.agent, '-')) FROM (SELECT * FROM work_subtasks s
-                      WHERE s.task = t.id ORDER BY s.position) s)
+                      WHERE s.task = t.id ORDER BY s.position) s),
+                   (SELECT json_group_array(d.blocked_by) FROM (SELECT * FROM work_task_deps d
+                      WHERE d.task = t.id ORDER BY d.position) d),
+                   (SELECT json_group_array(l.label) FROM (SELECT * FROM work_task_labels l
+                      WHERE l.task = t.id ORDER BY l.position) l)
                  FROM work_tasks t",
             )?;
+            let list = |r: &pitcrew_store::sql::Row<'_>, i: usize| -> Vec<String> {
+                let text: String = r.get(i).expect("list");
+                serde_json::from_str(&text).expect("JSON list")
+            };
             let rows = stmt
                 .query_map([], |r| {
-                    let lines: String = r.get(4)?;
-                    Ok((
-                        r.get(0)?,
-                        r.get(1)?,
-                        r.get(2)?,
-                        r.get(3)?,
-                        serde_json::from_str(&lines).expect("lines"),
-                    ))
+                    Ok(TaskRow {
+                        id: r.get(0)?,
+                        project: r.get(1)?,
+                        key_prefix: r.get(2)?,
+                        number: r.get(3)?,
+                        workstream: r.get(4)?,
+                        status: r.get(5)?,
+                        assignee: r.get(6)?,
+                        doc: r.get(7)?,
+                        lines: list(r, 8),
+                        deps: list(r, 9),
+                        labels: list(r, 10),
+                    })
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(rows)
         })
         .expect("read");
     assert!(rows.len() > 10);
-    for (id, status, assignee, doc, lines) in rows {
-        let task: pitcrew_protocol::model::Task = serde_json::from_str(&doc).expect("doc");
-        assert_eq!(task.id.0.to_string(), id);
+    assert!(rows.iter().any(|r| !r.labels.is_empty()), "some labels");
+    for row in rows {
+        let TaskRow {
+            id,
+            status,
+            assignee,
+            doc,
+            lines,
+            ..
+        } = &row;
+        let task: pitcrew_protocol::model::Task = serde_json::from_str(doc).expect("doc");
+        assert_eq!(&task.id.0.to_string(), id);
+        assert_eq!(task.project.0.to_string(), row.project);
+        assert_eq!(task.workstream.map(|w| w.0.to_string()), row.workstream);
+        assert_eq!(task.key.project.as_str(), row.key_prefix);
+        assert_eq!(i64::from(task.key.number), row.number);
+        assert_eq!(
+            task.blocked_by
+                .iter()
+                .map(|t| t.0.to_string())
+                .collect::<Vec<_>>(),
+            row.deps
+        );
+        assert_eq!(task.labels, row.labels);
         assert_eq!(
             serde_json::to_value(task.status).expect("status"),
             status.as_str()
         );
-        assert_eq!(task.assignee.map(|a| a.0.to_string()), assignee);
+        assert_eq!(&task.assignee.map(|a| a.0.to_string()), assignee);
+        let lines = lines.clone();
         let expected: Vec<String> = task
             .subtasks
             .iter()
@@ -407,11 +702,29 @@ fn the_seed_alone_rebuilds_identically() {
 
 fn demo_event_count() -> usize {
     let demo = demo();
-    let back_office = demo
+    // A back-office brief is a proposal and its acceptance; a person's is one acceptance.
+    let per_brief = |b: &pitcrew_protocol::model::Brief| {
+        if b.source == BriefSource::BackOffice {
+            2
+        } else {
+            1
+        }
+    };
+    let briefs: usize = demo.briefs.iter().map(per_brief).sum();
+    // Briefs the demo's slice accepts again are put in force again after it.
+    let restated: usize = demo
         .briefs
         .iter()
-        .filter(|b| b.source == pitcrew_protocol::model::BriefSource::BackOffice)
-        .count();
+        .filter(|b| {
+            demo.events.iter().rev().find_map(|e| match &e.body {
+                EventBody::BriefAccepted { target, .. } if *target == b.target => Some(true),
+                EventBody::BriefProposed { target, .. } if *target == b.target => Some(false),
+                _ => None,
+            }) == Some(true)
+        })
+        .map(per_brief)
+        .sum();
+    assert_eq!(restated, 1, "the seed-runs brief");
     demo.machines.len()
         + demo.personas.len()
         + demo.members.len()
@@ -422,7 +735,7 @@ fn demo_event_count() -> usize {
         + demo.sessions.len()
         + demo.dispatches.len()
         + demo.asks.len()
-        + demo.briefs.len()
-        + back_office
+        + briefs
         + demo.events.len()
+        + restated
 }

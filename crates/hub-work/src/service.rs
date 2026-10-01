@@ -1,18 +1,21 @@
 //! [`WorkService`]: the work model's reads and commands over one store.
 
+use crate::dispatch::Dispatcher;
 use crate::error::{Result, WorkError};
 use crate::query::{self, AskFilter, SessionFilter, TaskFilter, TaskRef};
-use pitcrew_protocol::api::Caller;
+use crate::recap::RecapSync;
+use pitcrew_protocol::api::{Caller, TokenScope};
 use pitcrew_protocol::events::{BriefTarget, Event, EventBody};
 use pitcrew_protocol::ids::{
-    AskId, DispatchId, MemberId, ProjectId, SessionId, TaskId, WorkspaceId, WorkstreamId,
+    AskId, DispatchId, MachineId, MemberId, ProjectId, SessionId, TaskId, WorkspaceId, WorkstreamId,
 };
 use pitcrew_protocol::model::{
     Ask, Brief, Dispatch, Machine, Member, Persona, Project, Session, Task, Team, TimestampMs,
-    Workstream,
+    Workspace, Workstream,
 };
 use pitcrew_store::sql::Connection;
 use pitcrew_store::{RevRange, Store};
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// Where commands get the time from. The default is the system clock.
@@ -24,20 +27,47 @@ fn system_clock() -> TimestampMs {
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }
 
+/// `GET /v1/workspace`: the workspace, and the event revision the work model reflects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceAt {
+    /// The workspace.
+    pub workspace: Workspace,
+    /// The revision every work table reflects. A client that loads the work model and then
+    /// opens the stream with `since=rev` misses nothing.
+    pub rev: u64,
+}
+
 /// The work model of one workspace: reads of its projections, and commands that validate a
 /// change against them and append the events that make it.
 ///
-/// The store must have been opened with [`crate::projections`]. Commands run one at a time (a
-/// lock covers validating and appending), so two commands cannot both pass a check that only one
-/// of them should (such as allocating the same task key). Reads never wait for commands.
+/// The store must have been opened with [`crate::projections`]. Reads never wait for commands.
+///
+/// # One writer
+///
+/// **Exactly one `Arc<WorkService>` per store appends work events.** Build it once, share it (the
+/// routes take it as an extension, the runner link and the back office get clones of the same
+/// `Arc`), and do not append work events to the store any other way.
+///
+/// The service's command lock covers validating a command and appending its events, so two
+/// commands cannot both pass a check that only one of them should: two `create_task`s never get
+/// the same key, two moves never both start from the same status. A second service (or process)
+/// writing to the same store would break that. The projections stay deterministic even then (a
+/// `task_created` whose key is taken is recorded as a clash and not applied; a `task_moved` whose
+/// `from` is stale is ignored), and the losing command answers `409 conflict`: `create_task` when
+/// its key was taken, `move_task` and `dispatch_working` when the task ended up somewhere other
+/// than where they moved it. The rule is what keeps commands from losing.
 ///
 /// Every event a command appends is stamped from the [`Caller`]: `author` is the caller's member
-/// and `on_behalf_of` its owner, never anything from a request body.
+/// and, for an agent, `on_behalf_of` is its owner; never anything from a request body.
 pub struct WorkService {
     store: Arc<Store>,
-    workspace: WorkspaceId,
+    workspace: Workspace,
     clock: Clock,
     writes: Mutex<()>,
+    dispatcher: Option<Arc<dyn Dispatcher>>,
+    hub_machine: Option<MachineId>,
+    /// The recap index, built from the log on first use (see [`crate::RecapIndex`]).
+    recaps: Mutex<RecapSync>,
 }
 
 impl std::fmt::Debug for WorkService {
@@ -45,19 +75,25 @@ impl std::fmt::Debug for WorkService {
         f.debug_struct("WorkService")
             .field("workspace", &self.workspace)
             .field("store", &self.store)
+            .field("dispatcher", &self.dispatcher)
+            .field("hub_machine", &self.hub_machine)
             .finish_non_exhaustive()
     }
 }
 
 impl WorkService {
-    /// A service over `store` (opened with [`crate::projections`]) for `workspace`.
+    /// A service over `store` (opened with [`crate::projections`]) for `workspace`. See "One
+    /// writer" above: make one per store.
     #[must_use]
-    pub fn new(store: Arc<Store>, workspace: WorkspaceId) -> Self {
+    pub fn new(store: Arc<Store>, workspace: Workspace) -> Self {
         Self {
             store,
             workspace,
             clock: Arc::new(system_clock),
             writes: Mutex::new(()),
+            dispatcher: None,
+            hub_machine: None,
+            recaps: Mutex::new(RecapSync::default()),
         }
     }
 
@@ -68,16 +104,58 @@ impl WorkService {
         self
     }
 
+    /// Starts dispatched sessions through `dispatcher` (the runner link). Without one,
+    /// `POST /v1/tasks/{id}/dispatch` answers `503 unavailable`.
+    #[must_use]
+    pub fn with_dispatcher(mut self, dispatcher: Arc<dyn Dispatcher>) -> Self {
+        self.dispatcher = Some(dispatcher);
+        self
+    }
+
+    /// The machine the hub runs on, where a dispatch runs when the task has no folder. The daemon
+    /// must set it: without it, such a dispatch answers `503 unavailable` (the hub does not guess
+    /// one of the workspace's machines).
+    #[must_use]
+    pub fn with_hub_machine(mut self, machine: MachineId) -> Self {
+        self.hub_machine = Some(machine);
+        self
+    }
+
     /// The store.
     #[must_use]
     pub fn store(&self) -> &Arc<Store> {
         &self.store
     }
 
-    /// The workspace.
+    /// The workspace's id.
     #[must_use]
     pub fn workspace(&self) -> WorkspaceId {
-        self.workspace
+        self.workspace.id
+    }
+
+    /// The workspace and the revision the work model reflects (`GET /v1/workspace`).
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub fn workspace_at(&self) -> Result<WorkspaceAt> {
+        let rev = self.read(query::work_rev)?;
+        Ok(WorkspaceAt {
+            workspace: self.workspace.clone(),
+            rev,
+        })
+    }
+
+    pub(crate) fn dispatcher(&self) -> Option<Arc<dyn Dispatcher>> {
+        self.dispatcher.clone()
+    }
+
+    pub(crate) fn hub_machine(&self) -> Option<MachineId> {
+        self.hub_machine
+    }
+
+    pub(crate) fn recap_lock(&self) -> &Mutex<RecapSync> {
+        &self.recaps
     }
 
     pub(crate) fn now(&self) -> TimestampMs {
@@ -109,20 +187,30 @@ impl WorkService {
         Event {
             id: pitcrew_protocol::ids::EventId::new(),
             at: self.now(),
-            workspace: self.workspace,
+            workspace: self.workspace.id,
             author,
             on_behalf_of,
             body,
         }
     }
 
-    /// An event by `caller`: `author` is its member, `on_behalf_of` its owner.
+    /// An event by `caller`: `author` is its member and, only for an agent, `on_behalf_of` its
+    /// owner. A person acts for nobody, whatever the caller says.
     pub(crate) fn by(&self, caller: &Caller, body: EventBody) -> Event {
-        self.event(caller.member, caller.on_behalf_of, body)
+        let on_behalf_of = match caller.scope {
+            TokenScope::Agent => caller.on_behalf_of,
+            TokenScope::Device => None,
+        };
+        self.event(caller.member, on_behalf_of, body)
     }
 
     pub(crate) fn append(&self, events: &[Event]) -> Result<RevRange> {
         Ok(self.store.append(events)?)
+    }
+
+    /// Appends the events whose ids the log does not hold yet, in one transaction.
+    pub(crate) fn append_new(&self, events: &[Event]) -> Result<RevRange> {
+        Ok(self.store.append_new(events)?.0)
     }
 
     // ─── Reads ───────────────────────────────────────────────────────────────────────────────

@@ -61,15 +61,17 @@ jobs:
         with:
           persist-credentials: false
 
-      # rustup is on every hosted runner. The channel matches rust-toolchain.toml.
+      # rustup is on every hosted runner; the channel comes from rust-toolchain.toml.
       - name: Rust
         shell: bash
         env:
           RUST_TARGETS: ${{ matrix.rust-targets }}
         run: |
+          channel=$(sed -nE 's/^channel *= *"([^"]+)".*/\1/p' rust-toolchain.toml)
+          if [ -z "$channel" ]; then echo "::error::no channel in rust-toolchain.toml"; exit 1; fi
           read -r -a targets <<<"$RUST_TARGETS"
-          rustup toolchain install stable --profile minimal
-          rustup target add --toolchain stable "${targets[@]}"
+          rustup toolchain install "$channel" --profile minimal
+          rustup target add --toolchain "$channel" "${targets[@]}"
           rustc --version
 
       # Zig from PyPI in a venv, pinned by hash; cargo-zigbuild runs `python3 -m ziglang`.
@@ -146,6 +148,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: The packaging scripts pass their tests
+        run: bash packaging/test.sh
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: bin-*
@@ -162,6 +166,8 @@ jobs:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
         run: bash packaging/sign.sh checksums dist
+      - name: Verify against SHA256SUMS
+        run: bash packaging/verify.sh dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release
@@ -180,10 +186,17 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      # Before the download: checkout cleans the workspace.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: packaging
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release
           path: dist
+      - name: Verify against SHA256SUMS
+        run: bash packaging/verify.sh dist
       # One attestation whose subjects are every file listed in SHA256SUMS.
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
@@ -198,10 +211,16 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: packaging
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release
           path: dist
+      - name: Verify against SHA256SUMS
+        run: bash packaging/verify.sh dist
       - name: Create the draft
         env:
           GH_TOKEN: ${{ github.token }}

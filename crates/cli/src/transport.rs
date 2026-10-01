@@ -5,8 +5,8 @@
 //!   systems other than Linux the peer check is skipped: the directory and owner checks already
 //!   mean only our user could have bound that socket.
 //! - Named pipe: opened at identification-level impersonation (the server can learn who we are
-//!   but cannot act as us), then `pitcrew_api::client::check_pipe_server`: the process serving
-//!   the pipe runs as the current user.
+//!   but cannot act as us), then `pitcrew_api::client::check_pipe_server`: the pipe's owner SID
+//!   matches the current user (or our token's default owner, if elevated).
 //! - Loopback TCP: no identity check is possible, which is why it is for development only.
 
 use crate::config::Endpoint;

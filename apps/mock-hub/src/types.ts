@@ -2,9 +2,9 @@
 //
 // Field names are exactly the serde names. Enums are `snake_case` strings; each enum has a value
 // list (`TASK_STATUSES`, …) so request bodies can be checked against it. Tagged unions keep their
-// serde tags: `EventBody` is `{type, data}`; `Mover`, `Receipt`, `SubtaskSource`, `BriefTarget` and
-// `TranscriptItem` are tagged by `kind`; `StreamFrame` by `type`. Optional fields (`?`) are the
-// Rust `Option`s that serde skips when empty.
+// serde tags: `EventBody` is `{type, data}`; `Mover`, `Receipt`, `SubtaskSource`, `BriefTarget`,
+// `BlockKey` and `TranscriptItem` are tagged by `kind`; `StreamFrame` and `FactKind` by `type`.
+// Optional fields (`?`) are the Rust `Option`s that serde skips when empty.
 
 // ─── Ids and scalars (ids.rs, model.rs) ─────────────────────────────────────────────────────────
 
@@ -497,6 +497,127 @@ export interface TranscriptPage {
   at_start: boolean;
 }
 
+// ─── Recaps (recap.rs) ──────────────────────────────────────────────────────────────────────────
+
+export const CHECKS = ['tests', 'lint', 'build'] as const;
+export type Check = (typeof CHECKS)[number];
+
+/** What a block groups. Serde's adjacently tagged `{"kind": "session", "id": …}`. */
+export type BlockKey =
+  | { kind: 'session'; id: SessionId }
+  | { kind: 'workstream'; id: WorkstreamId }
+  | { kind: 'project'; id: ProjectId };
+
+export interface Counts {
+  events: number;
+  tools_run: number;
+  tools_failed: number;
+  file_edits: number;
+  lines_added: number;
+  lines_removed: number;
+  turns: number;
+  asks_raised: number;
+  asks_answered: number;
+  task_moves: number;
+  comments: number;
+}
+
+export interface FileTouch {
+  path: string;
+  edits: number;
+  added: number;
+  removed: number;
+  receipts: Receipt[];
+}
+
+/** What a fact says, tagged by `type` (internally, so the fields sit beside it). */
+export type FactKind =
+  | { type: 'session_started'; title?: string }
+  | { type: 'session_linked'; workstream?: WorkstreamId; task?: TaskId }
+  | { type: 'session_waiting'; status_line?: string }
+  | { type: 'session_ended' }
+  | { type: 'dispatch_started'; task: TaskId; agent: MemberId }
+  | { type: 'dispatch_finished'; task?: TaskId; outcome: DispatchOutcome; summary?: string }
+  | { type: 'task_created'; task: TaskId }
+  | { type: 'task_moved'; task: TaskId; from: TaskStatus; to: TaskStatus }
+  | { type: 'task_assigned'; task: TaskId; assignee?: MemberId }
+  | { type: 'plan_updated'; task: TaskId; done: number; total: number }
+  | { type: 'checks'; check: Check; runs: number; failures: number; last_failed: boolean }
+  | { type: 'job_diverged'; jobs: string[] }
+  | { type: 'ask_raised'; ask: AskId; ask_kind: AskKind; to: MemberId; title: string }
+  | { type: 'ask_answered'; ask: AskId }
+  | { type: 'commented'; task?: TaskId; workstream?: WorkstreamId; mentions: MemberId[] }
+  | { type: 'decision_recorded'; text: string }
+  | { type: 'workstream_created'; workstream: WorkstreamId }
+  | { type: 'workstream_changed'; workstream: WorkstreamId; status: WorkstreamStatus; health: Health }
+  | { type: 'brief_accepted'; target: BriefTarget; pinned: boolean };
+
+export interface Fact {
+  by: MemberId;
+  at: TimestampMs;
+  kind: FactKind;
+  receipts: Receipt[];
+}
+
+/** A burst of work. `id` is its first event's id, `last` its last's. */
+export interface Block {
+  id: EventId;
+  last: EventId;
+  key: BlockKey;
+  start: TimestampMs;
+  end: TimestampMs;
+  session?: SessionId;
+  workstream?: WorkstreamId;
+  project?: ProjectId;
+  tasks: TaskId[];
+  agent?: MemberId;
+  actors: MemberId[];
+  counts: Counts;
+  files: FileTouch[];
+  files_omitted: number;
+  facts: Fact[];
+  facts_omitted: number;
+  tool_receipts: Receipt[];
+  turn_receipts: Receipt[];
+}
+
+/**
+ * One clause and its evidence. `range` is a UTF-8 byte range of the summary's `text`, not a
+ * JavaScript string index: convert before slicing.
+ */
+export interface Span {
+  range: { start: number; end: number };
+  receipts: Receipt[];
+}
+
+export interface Summary {
+  text: string;
+  spans: Span[];
+}
+
+export interface RecapBlock {
+  block: Block;
+  line: Summary;
+}
+
+export interface BlocksPage {
+  blocks: RecapBlock[];
+  at_start: boolean;
+}
+
+/** One workstream's day; `workstream` is absent for a project's work outside any workstream. */
+export interface DayRecap {
+  workstream?: WorkstreamId;
+  date: CalendarDate;
+  blocks: EventId[];
+  summary: Summary;
+}
+
+export interface DaysPage {
+  days: DayRecap[];
+  at_start: boolean;
+}
+
 // ─── The fixture (crates/fixtures `DemoWorkspace`) ──────────────────────────────────────────────
 
 export interface DemoWorkspace {
@@ -513,4 +634,14 @@ export interface DemoWorkspace {
   asks: Ask[];
   briefs: Brief[];
   events: Event[];
+}
+
+/** crates/fixtures `DemoRecaps`: the demo's recaps, as the recap engine writes them. */
+export interface DemoRecaps {
+  /** Where its days begin, in minutes east of UTC. */
+  tz: number;
+  /** Every block with its line, by start then id. */
+  blocks: RecapBlock[];
+  /** Each project's days, by date; within a date, the one without a workstream first. */
+  projects: { project: ProjectId; days: DayRecap[] }[];
 }

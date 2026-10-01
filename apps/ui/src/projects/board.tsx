@@ -80,6 +80,8 @@ export function sessionsByTask(sessions: readonly Session[]): Map<TaskId, Sessio
 export interface BoardProps {
   project?: ProjectId;
   workstream?: WorkstreamId;
+  /** "My tasks": every task assigned to this member, across projects. */
+  assignee?: MemberId;
   /** Initial grouping; people can switch it. */
   groupBy?: BoardGrouping;
   title?: string;
@@ -87,10 +89,11 @@ export interface BoardProps {
   onOpenTask?: (task: TaskId) => void;
 }
 
-export function Board({ project, workstream, groupBy = 'status', title = 'Board', onOpenTask }: BoardProps) {
+export function Board({ project, workstream, assignee, groupBy = 'status', title = 'Board', onOpenTask }: BoardProps) {
   const filters: TaskFilters = {};
   if (project !== undefined) filters.project = project;
   if (workstream !== undefined) filters.workstream = workstream;
+  if (assignee !== undefined) filters.assignee = assignee;
 
   const headingId = useId();
   const nav = useProjectsNav();

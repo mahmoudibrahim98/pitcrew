@@ -4,6 +4,8 @@
 //! with the receipts behind it. A [`Summarizer`] then turns the draft into prose. The rule-based
 //! [`RuleSummarizer`] joins the clauses as they are; a model-backed one may reword them, but every
 //! span of its output must still cite receipts from the draft, which [`verify`] checks.
+//!
+//! [`Summary`] and [`Span`] are wire types, so they live in `pitcrew_protocol::recap`.
 
 use pitcrew_protocol::model::Receipt;
 use serde::{Deserialize, Serialize};
@@ -11,37 +13,7 @@ use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Text whose every clause is a span with receipts.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Summary {
-    /// The prose.
-    pub text: String,
-    /// Clauses of `text`, in order and not overlapping. Text outside spans is only punctuation
-    /// and spaces joining them.
-    pub spans: Vec<Span>,
-}
-
-/// One clause of a summary and the evidence for it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Span {
-    /// Byte range in the summary text, on character boundaries.
-    pub range: Range<usize>,
-    /// Evidence. Never empty.
-    pub receipts: Vec<Receipt>,
-}
-
-impl Summary {
-    /// The text of a span.
-    #[must_use]
-    pub fn clause(&self, span: &Span) -> &str {
-        self.text.get(span.range.clone()).unwrap_or_default()
-    }
-
-    /// Every receipt cited.
-    pub fn receipts(&self) -> impl Iterator<Item = &Receipt> {
-        self.spans.iter().flat_map(|s| s.receipts.iter())
-    }
-}
+pub use pitcrew_protocol::recap::{Span, Summary};
 
 /// What a draft is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -189,7 +161,8 @@ impl Writer {
 }
 
 /// The default summarizer: joins clauses with commas; a paragraph's sentences start with a
-/// capital and end with a full stop. Deterministic and free.
+/// capital and end with a full stop (unless they already end in `.`, `?` or `!`). Deterministic
+/// and free.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RuleSummarizer;
 
@@ -215,7 +188,8 @@ impl RuleSummarizer {
                 let capitalize = draft.kind == DraftKind::Paragraph && i == 0;
                 w.clause(&clause.text, &clause.receipts, capitalize);
             }
-            if draft.kind == DraftKind::Paragraph {
+            // A sentence that already ends in a question ("…, paused?") keeps its own mark.
+            if draft.kind == DraftKind::Paragraph && !w.summary.text.ends_with(['.', '?', '!']) {
                 w.sep(".");
             }
         }
@@ -346,6 +320,22 @@ mod tests {
                 "Évidence first"
             ]
         );
+        assert_eq!(verify(&s, &draft), Ok(()));
+    }
+
+    #[test]
+    fn a_question_keeps_its_mark() {
+        let draft = Draft {
+            kind: DraftKind::Paragraph,
+            sentences: vec![Sentence {
+                clauses: vec![
+                    clause("quiet for 4 days", vec![ev(1)]),
+                    clause("paused?", vec![ev(1)]),
+                ],
+            }],
+        };
+        let s = RuleSummarizer.render(&draft);
+        assert_eq!(s.text, "Quiet for 4 days, paused?");
         assert_eq!(verify(&s, &draft), Ok(()));
     }
 

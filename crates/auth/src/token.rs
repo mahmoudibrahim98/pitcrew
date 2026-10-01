@@ -111,7 +111,8 @@ impl TokenHash {
     }
 
     pub(crate) fn from_hex(s: &str) -> Option<Self> {
-        if s.len() != 64 || !s.is_ascii() {
+        // Hex digits only: `from_str_radix` alone would also take a leading `+` ("+f" is 15).
+        if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
         let mut out = [0u8; 32];
@@ -208,6 +209,26 @@ mod tests {
         assert!(a.ct_eq(&a));
         assert!(!a.ct_eq(&b));
         assert_eq!(TokenHash::from_hex("zz"), None);
+    }
+
+    #[test]
+    fn hex_hashes_are_hex_digits_only() {
+        let hex = TokenHash::of("pcd_a").to_hex();
+        assert_eq!(
+            TokenHash::from_hex(&hex.to_uppercase()),
+            TokenHash::from_hex(&hex)
+        );
+        for bad in [
+            "+f".repeat(32),
+            "-f".repeat(32),
+            format!("+{}", &hex[1..]),
+            format!("{} ", &hex[..63]),
+            "é".repeat(32),
+            hex[..62].to_owned(),
+            format!("{hex}00"),
+        ] {
+            assert_eq!(TokenHash::from_hex(&bad), None, "{bad}");
+        }
     }
 
     #[test]

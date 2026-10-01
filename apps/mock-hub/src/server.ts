@@ -16,6 +16,7 @@ import {
   terminalTarget,
   type TerminalTarget,
 } from './live.ts';
+import { loadRecaps } from './recaps.ts';
 import { MOCK_VERSION, authenticate, handleApi, type Reply } from './routes.ts';
 import { DEFAULT_DELAYS, DEFAULT_SCAN_WINDOW, Hub, loadFixture, type Delays } from './state.ts';
 import { ApiFailure, forbidden, invalid, notFound } from './validate.ts';
@@ -29,6 +30,8 @@ import {
 
 /** The demo workspace, resolved from this file so the server runs from any directory. */
 const FIXTURE = new URL('../../../crates/fixtures/data/demo-workspace.json', import.meta.url);
+/** The demo workspace's recaps, as the recap engine writes them. */
+const RECAPS = new URL('../../../crates/fixtures/data/demo-recaps.json', import.meta.url);
 
 export const DEFAULT_PORT = 47317;
 const HOST = '127.0.0.1';
@@ -64,6 +67,7 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
     loadFixture(FIXTURE),
     { ...DEFAULT_DELAYS, ...options.delays },
     options.scanWindow ?? DEFAULT_SCAN_WINDOW,
+    loadRecaps(RECAPS),
   );
   const log = options.log ?? ((): void => {});
   const sockets = new Set<WebSocketConnection>();

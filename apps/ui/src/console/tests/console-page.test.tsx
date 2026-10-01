@@ -3,12 +3,53 @@
 
 // The console as the app mounts it: the shell's router with the console feature, against the mock
 // hub. Routes, the filters in the URL, the palette's commands, the keys between panes, the narrow
-// layout and the remembered pane sizes.
+// layout, the remembered pane sizes, and the Chat | Terminal switch.
 
 import { act, fireEvent, screen, within } from '@testing-library/react';
 import { createMemoryHistory, RouterProvider } from '@tanstack/react-router';
-import { StrictMode } from 'react';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+// happy-dom cannot draw a terminal; terminal-view.test.tsx and the Playwright specs test xterm.
+vi.mock('@xterm/xterm', () => ({
+  Terminal: class {
+    options: Record<string, unknown> = {};
+    cols = 80;
+    rows = 24;
+    textarea: HTMLTextAreaElement | undefined;
+    parser = { registerOscHandler: () => ({ dispose() {} }) };
+    attachCustomKeyEventHandler() {}
+    onData = () => ({ dispose() {} });
+    onBinary = () => ({ dispose() {} });
+    onResize = () => ({ dispose() {} });
+    loadAddon() {}
+    open(parent: HTMLElement) {
+      this.textarea = document.createElement('textarea');
+      parent.append(this.textarea);
+    }
+    write() {}
+    focus() {}
+    dispose() {
+      this.textarea?.remove();
+    }
+  },
+}));
+vi.mock('@xterm/addon-fit', () => ({
+  FitAddon: class {
+    activate() {}
+    dispose() {}
+    fit() {}
+  },
+}));
+vi.mock('@xterm/addon-webgl', () => ({
+  WebglAddon: class {
+    constructor() {
+      throw new Error('WebGL2 not supported');
+    }
+    activate() {}
+    dispose() {}
+  },
+}));
+vi.mock('@xterm/xterm/css/xterm.css', () => ({}));
 import { paths, type CommandContext } from '../../shell/index.ts';
 import { createAppRouter } from '../../shell/routes.tsx';
 import { initialShellState, useShell } from '../../shell/store.ts';
@@ -45,13 +86,9 @@ afterEach(async () => {
 
 function renderConsole(path: string) {
   const router = createAppRouter([feature], { history: createMemoryHistory({ initialEntries: [path] }) });
-  // In Strict Mode, as src/main.tsx mounts the app: effects run, are undone, and run again.
-  renderWithHub(
-    hub,
-    <StrictMode>
-      <RouterProvider router={router} />
-    </StrictMode>,
-  );
+  // In Strict Mode at the root, as src/main.tsx mounts the app: effects run, are undone, and run
+  // again.
+  const { requests } = renderWithHub(hub, <RouterProvider router={router} />, { strict: true });
   /** A palette command's context, as the shell's palette builds it. */
   const context: CommandContext = {
     workspace: WS,
@@ -65,7 +102,7 @@ function renderConsole(path: string) {
     act(() => command.run(context));
   };
   const location = () => router.state.location;
-  return { router, run, location };
+  return { router, run, location, requests };
 }
 
 const rowOf = (id: string) => document.querySelector<HTMLElement>(`[data-session="${id}"]`);
@@ -94,7 +131,8 @@ describe('the Agent console', () => {
 
     const task = await screen.findByRole('link', { name: /^PAP-1 · / });
     expect(task.getAttribute('href')).toBe(paths.task(WS, 'PAP-1'));
-    const workstream = screen.getByRole('link', { name: 'Submission' });
+    // The workstream comes from a query of its own, which may land after the task's.
+    const workstream = await screen.findByRole('link', { name: 'Submission' });
     expect(workstream.getAttribute('href')).toMatch(/\/projects\/[^/]+\/workstreams\/[^/]+$/);
     fireEvent.click(task);
     await eventually(() => expect(location().pathname).toBe(paths.task(WS, 'PAP-1')));
@@ -250,8 +288,97 @@ describe('the Agent console', () => {
     });
   }, 20_000);
 
+  it('keeps Chat or Terminal in the URL; F6 reaches the terminal; without one the switch says why', async () => {
+    const { location, router } = renderConsole(`${paths.session(WS, ID.ses6)}?view=terminal`);
+    await screen.findByRole('heading', { level: 2, name: 'Co-author responses' }, { timeout: 8_000 });
+    const option = await screen.findByRole('radio', { name: 'Terminal' });
+    await eventually(() => expect(option.getAttribute('aria-disabled')).toBe('true'));
+    expect(screen.getByTestId('terminal-unavailable').textContent).toBe('This session has no terminal.');
+    expect(option.getAttribute('aria-describedby')).toBe(screen.getByTestId('terminal-unavailable').id);
+    // The link asked for the terminal; there is none, so the chat shows, and choosing it does nothing.
+    await screen.findByRole('group', { name: 'Transcript' });
+    fireEvent.click(option);
+    expect(location().search).toEqual({ view: 'terminal' });
+    expect(screen.queryByRole('group', { name: 'Terminal' })).toBeNull();
+
+    // Another session keeps the view; SES0001 has a terminal, so it shows.
+    await eventually(() => expect(rowOf(ID.ses1)).not.toBeNull());
+    fireEvent.click(rowOf(ID.ses1) as HTMLElement);
+    await eventually(() => expect(location().pathname).toBe(paths.session(WS, ID.ses1)));
+    expect(location().search).toEqual({ view: 'terminal' });
+    const terminal = await screen.findByRole('group', { name: 'Terminal' });
+    expect(pane('composer')).toBeNull();
+    expect(screen.getByRole('radio', { name: 'Terminal' }).getAttribute('aria-checked')).toBe('true');
+
+    // F6 goes from the list to the terminal.
+    const listbox = screen.getByRole('listbox', { name: 'Sessions' });
+    listbox.focus();
+    fireEvent.keyDown(listbox, { key: 'F6' });
+    expect(document.activeElement).toBe(terminal);
+    expect(focusedPane()).toBe('terminal');
+    // A terminal in control mode keeps F6 for its program.
+    terminal.setAttribute('data-shell-keys', 'none');
+    fireEvent.keyDown(terminal, { key: 'F6' });
+    expect(document.activeElement).toBe(terminal);
+    terminal.removeAttribute('data-shell-keys');
+
+    // Chat is no parameter at all, and replaces the history entry rather than adding one.
+    const entries = router.history.length;
+    fireEvent.click(screen.getByRole('radio', { name: 'Chat' }));
+    await eventually(() => expect(location().search).toEqual({}));
+    expect(router.history.length).toBe(entries);
+    await screen.findByRole('group', { name: 'Transcript' });
+    expect(screen.queryByRole('group', { name: 'Terminal' })).toBeNull();
+    fireEvent.click(screen.getByRole('radio', { name: 'Terminal' }));
+    await eventually(() => expect(location().search).toEqual({ view: 'terminal' }));
+    await screen.findByRole('group', { name: 'Terminal' });
+  }, 20_000);
+
+  it("shows the session's work as a third view, kept in the URL", async () => {
+    const { location } = renderConsole(`${paths.session(WS, ID.ses1)}?view=work`);
+    await screen.findByRole('heading', { level: 2, name: 'Draft method section' }, { timeout: 8_000 });
+    const option = await screen.findByRole('radio', { name: 'Work' });
+    await eventually(() => expect(option.getAttribute('aria-checked')).toBe('true'));
+    // The chat and composer are gone while Work shows, as they are for the terminal.
+    expect(screen.queryByRole('group', { name: 'Transcript' })).toBeNull();
+    expect(pane('composer')).toBeNull();
+
+    const work = await screen.findByRole('region', { name: 'Work' });
+    await eventually(() =>
+      expect([...work.querySelectorAll('[data-summary]')].map((node) => node.textContent)).toEqual([
+        '@writer edited method.tex (+84 −12)',
+        '@sam dispatched @writer to PAP-1, @writer moved PAP-1 to in progress, updated the plan for PAP-1 (2 of 4 done)',
+      ]),
+    );
+    expect(within(work).getByText('1 file touched (+84 −12)')).toBeTruthy();
+
+    // F6 from the list reaches it, as it does the terminal.
+    const listbox = screen.getByRole('listbox', { name: 'Sessions' });
+    listbox.focus();
+    fireEvent.keyDown(listbox, { key: 'F6' });
+    expect(focusedPane()).toBe('work');
+
+    // Chat is the default again; the work view keeps no parameter once left.
+    fireEvent.click(screen.getByRole('radio', { name: 'Chat' }));
+    await eventually(() => expect(location().search).toEqual({}));
+    await screen.findByRole('group', { name: 'Transcript' });
+    expect(screen.queryByRole('region', { name: 'Work' })).toBeNull();
+
+    // Choosing Work again puts it back in the URL.
+    fireEvent.click(screen.getByRole('radio', { name: 'Work' }));
+    await eventually(() => expect(location().search).toEqual({ view: 'work' }));
+    await screen.findByRole('region', { name: 'Work' });
+  }, 20_000);
+
   it('says so when the session does not exist', async () => {
-    renderConsole(paths.session(WS, UNKNOWN));
+    const { requests } = renderConsole(paths.session(WS, UNKNOWN));
+    // Wait for the 404 itself first (the stream's `hello` can be slow on a busy machine, and that
+    // wait would otherwise be folded into, and indistinguishable from, the text's own timeout
+    // below).
+    await eventually(
+      () => expect(requests.some((r) => r.path === `/v1/sessions/${UNKNOWN}` && r.status === 404)).toBe(true),
+      { timeout: 8_000 },
+    );
     await screen.findByText('No such session', undefined, { timeout: 8_000 });
     expect(screen.getByRole('listbox', { name: 'Sessions' })).toBeTruthy();
   }, 20_000);
