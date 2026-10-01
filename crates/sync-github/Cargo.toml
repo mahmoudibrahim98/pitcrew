@@ -14,6 +14,14 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# WHATWG URL parsing for the pagination same-origin/same-path check in `origin.rs`: that check
+# must agree with how a real HTTP transport (reqwest, ureq — both built on this same crate) would
+# actually resolve a server-supplied `Link: rel="next"` URL, including its `\`-as-separator and
+# percent-encoded-dot-segment quirks for "special" schemes. A hand-rolled parser could not be
+# trusted to match those quirks exactly (round 2 review items R8/R9). Pinned to a minor version,
+# not a bare major, since this crate's one use of it depends on exact WHATWG normalisation
+# behaviour that a later minor could in principle refine.
+url = "~2.5"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

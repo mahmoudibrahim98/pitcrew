@@ -367,19 +367,23 @@ impl<'t, T: Transport> GithubClient<'t, T> {
                 break;
             }
             match raw.link.as_deref().and_then(next_link) {
-                Some(next) if is_trusted_next_url(&next, &self.api_base) => url = next,
+                // Compared against `url` — the exact request that just answered, not merely
+                // `self.api_base` — so `next` must share its scheme, host, port *and path*,
+                // differing only in its query. See `origin::is_trusted_next_url`'s doc for why.
+                Some(next) if is_trusted_next_url(&next, &url) => url = next,
                 Some(untrusted) => {
-                    // Never follow a `Link: rel="next"` outside the configured API base: it would
-                    // send the `Authorization` header (attached in `get`, above) to whatever host
-                    // answered. This is left `completed = false` with no resume pointer: resuming
-                    // from the current (already fully processed) page would just hit the same
-                    // untrusted link again, so the next call restarts from the top instead. It is
-                    // also reported back as `blocked_link`, for the caller to raise as a visible
-                    // `SyncIssue` rather than just a log line.
+                    // Never follow an untrusted `Link: rel="next"`: it would send the
+                    // `Authorization` header (attached in `get`, above) to whatever host answered,
+                    // or walk the request to an unexpected path. This is left `completed = false`
+                    // with no resume pointer: resuming from the current (already fully processed)
+                    // page would just hit the same untrusted link again, so the next call restarts
+                    // from the top instead. It is also reported back as `blocked_link`, for the
+                    // caller to raise as a visible `SyncIssue` rather than just a log line.
                     tracing::warn!(
                         url = %untrusted,
-                        api_base = %self.api_base,
-                        "ignored a Link: rel=\"next\" outside the API base"
+                        previous_url = %url,
+                        "ignored a Link: rel=\"next\" that was not the same origin and path as the \
+                         request that returned it"
                     );
                     blocked_link = Some(untrusted);
                     blocked_from_resuming = true;
