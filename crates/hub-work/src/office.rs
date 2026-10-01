@@ -15,6 +15,14 @@
 //! appended revisions and hands the emitted ones to `pitcrew_office::apply`, which re-checks each
 //! action's shape and calls [`OfficeCommands`]. Capped and refused entries are only logged.
 //!
+//! # Running a range again is safe
+//!
+//! The events an action appends get ids derived from the store's log id, the run-log entry's
+//! revision and place (`seq`), and the event's place within the action, and are appended with
+//! `Store::append_new`. An action whose first event is already in the log was applied before: it
+//! is reported as replayed and nothing is appended. So the daemon may re-run a range after a
+//! restart, e.g. the last one it is not sure it finished.
+//!
 //! # The hub re-validates every action
 //!
 //! `apply` checks only an action's shape. [`OfficeCommands`] checks every action against the hub's
@@ -24,11 +32,11 @@
 //! - **task moves** pass `TaskStatus::can_move` with `Mover::BackOffice` carrying the task's own
 //!   `accept_auto` (whatever the action claimed), from the status the task is in now; a move to
 //!   done needs `accept_auto`. Any other mover is refused;
-//! - **answers** go only to open questions and mentions addressed to an agent: the back office
-//!   itself or another agent of its owner. Never to a person, and never a decision, approval or
-//!   review;
+//! - **answers**, as for any agent: only open questions and mentions addressed to the back office
+//!   itself. Never a person's ask, and never a decision, approval or review;
 //! - **asks** name a known addressee, task and session, and are never approvals;
-//! - **comments** name a known task or workstream and known mentions;
+//! - **comments** name a known task or workstream (a task in that workstream, when both) and known
+//!   mentions;
 //! - **brief proposals** name a known project or workstream. `brief_proposed` is appended, and with
 //!   it `brief_accepted` when the proposal says to accept it automatically (its policy), unless the
 //!   brief in force is pinned: a pinned brief only ever gets proposals.
@@ -45,14 +53,16 @@ use pitcrew_office::{
     ApplyError, AskDraft, Commands, Config, Entry, MAX_ACTIONS_PER_EVENT, Outcome, RUN_LOG, Rule,
     RunLog, apply, default_rules, read_runs,
 };
-use pitcrew_protocol::events::EventBody;
-use pitcrew_protocol::ids::{AskId, MemberId, TaskId, WorkstreamId};
+use pitcrew_protocol::events::{Event, EventBody};
+use pitcrew_protocol::ids::{AskId, EventId, MemberId, TaskId, WorkstreamId};
 use pitcrew_protocol::model::{
-    Answer, Ask, AskKind, AskState, MemberKind, Mover, Receipt, Task, TaskStatus,
+    Answer, Ask, AskKind, AskState, MemberKind, Mover, Receipt, Task, TaskStatus, TimestampMs,
 };
 use pitcrew_recap::BriefProposal;
-use pitcrew_store::sql::{Connection, OptionalExtension};
+use pitcrew_store::sql::{Connection, OptionalExtension, params};
 use pitcrew_store::{Projection, RevRange};
+use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::sync::Arc;
 
 type RuleSet = Arc<dyn Fn() -> Vec<Box<dyn Rule>> + Send + Sync>;
@@ -64,8 +74,8 @@ pub struct BackOffice {
     member: MemberId,
     config: Config,
     rules: RuleSet,
-    /// How many run-log entries to read at once: more than one revision can hold, so a full page
-    /// always ends with whole revisions before its last one.
+    /// How many run-log entries to read at once: more than one revision can hold with these rules,
+    /// so a full page always ends with whole revisions before its last one.
     page: usize,
 }
 
@@ -145,8 +155,12 @@ pub fn projections_with_office(office: &BackOffice) -> Vec<Box<dyn Projection>> 
 pub struct Applied {
     /// The run-log entry (its outcome is `emitted`).
     pub entry: Entry,
-    /// `Ok` when the hub applied it; else why not: a shape `apply` refused, or the hub's refusal.
+    /// `Ok` when the hub applied it, now or before; else why not: a shape `apply` refused, or the
+    /// hub's refusal.
     pub result: std::result::Result<(), ApplyError<WorkError>>,
+    /// Whether it had been applied before (a range run again): its events were already in the log,
+    /// so nothing was appended.
+    pub replayed: bool,
 }
 
 /// What [`WorkService::run_office`] did.
@@ -157,14 +171,62 @@ pub struct OfficeRun {
 }
 
 impl OfficeRun {
-    /// The actions the hub applied.
+    /// The actions the hub applied in this run.
     pub fn applied(&self) -> impl Iterator<Item = &Applied> {
-        self.actions.iter().filter(|a| a.result.is_ok())
+        self.actions
+            .iter()
+            .filter(|a| a.result.is_ok() && !a.replayed)
+    }
+
+    /// The actions an earlier run had applied already.
+    pub fn replayed(&self) -> impl Iterator<Item = &Applied> {
+        self.actions.iter().filter(|a| a.replayed)
     }
 
     /// The actions the hub did not apply.
     pub fn refused(&self) -> impl Iterator<Item = &Applied> {
         self.actions.iter().filter(|a| a.result.is_err())
+    }
+}
+
+/// The run-log entry an action came from, so its events' ids can be derived from it.
+#[derive(Debug)]
+struct Origin {
+    log: String,
+    rev: u64,
+    seq: u32,
+    at: TimestampMs,
+    /// The place of the action's next event.
+    next: Cell<u32>,
+}
+
+impl Origin {
+    fn new(log: &str, entry: &Entry) -> Self {
+        Self {
+            log: log.to_owned(),
+            rev: entry.rev,
+            seq: entry.seq,
+            at: entry.at,
+            next: Cell::new(0),
+        }
+    }
+
+    /// The id of the action's `n`th event: a ULID with the entry's time, and 80 bits of the
+    /// SHA-256 of the log id, the revision, the entry's place and `n`. The same run-log entry in
+    /// the same log always gives the same ids.
+    fn id(&self, n: u32) -> EventId {
+        let mut hash = Sha256::new();
+        hash.update(b"pitcrew.office.action.v1\0");
+        hash.update(self.log.as_bytes());
+        hash.update([0]);
+        hash.update(self.rev.to_be_bytes());
+        hash.update(self.seq.to_be_bytes());
+        hash.update(n.to_be_bytes());
+        let digest = hash.finalize();
+        let mut random = [0u8; 16];
+        random[6..].copy_from_slice(&digest[..10]);
+        let ms = u64::try_from(self.at).unwrap_or(0);
+        EventId(ulid::Ulid::from_parts(ms, u128::from_be_bytes(random)))
     }
 }
 
@@ -176,6 +238,8 @@ pub struct OfficeCommands<'a> {
     work: &'a WorkService,
     member: MemberId,
     owner: Option<MemberId>,
+    /// While [`WorkService::run_office`] applies a run-log entry: where its event ids come from.
+    origin: Option<Origin>,
 }
 
 fn evidence(receipts: &[Receipt]) -> Result<()> {
@@ -208,6 +272,15 @@ fn run_log_reached(conn: &Connection, to_rev: u64) -> Result<()> {
     }
 }
 
+/// Whether the log holds an event with this id (the log's `events.id` is unique).
+fn in_log(conn: &Connection, id: &EventId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached("SELECT 1 FROM events WHERE id = ?1")?
+        .query_row(params![id.0.to_string()], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
 impl WorkService {
     /// The back office's [`Commands`] over this service, acting as `office`'s member.
     ///
@@ -221,6 +294,7 @@ impl WorkService {
                 work: self,
                 member: m.id,
                 owner: m.owner,
+                origin: None,
             }),
             Some(m) => Err(WorkError::invalid(format!(
                 "The back office's member must be an agent; {} is a person.",
@@ -241,13 +315,18 @@ impl WorkService {
     /// and refused entries are skipped: they are only logged. An action the hub refuses appends
     /// nothing and is logged as a warning. What the office appends is itself an append batch: pass
     /// its revisions here too (the rules ignore the office's own events, but the time-based ones
-    /// may act on any event). A receiver that lagged can pass the whole range it missed.
+    /// may act on any event).
+    ///
+    /// **Running a range again is safe**: an action already applied is reported as
+    /// [`Applied::replayed`] and appends nothing (see the [module docs](self)). After a restart,
+    /// the daemon may re-run the range it is not sure it finished.
     ///
     /// # Errors
     ///
     /// When the back office's member is not an agent of the workspace (nothing is applied), when
-    /// the run log has not reached `revs.to_rev` (it is not registered with the store), or on
-    /// database errors. Refused actions are not errors: see [`OfficeRun::refused`].
+    /// the run log has not reached `revs.to_rev` (it is not registered with the store), when a
+    /// revision has more entries than this office's rules can make (the store's run log has other
+    /// rules), or on database errors. Refused actions are not errors: see [`OfficeRun::refused`].
     pub fn run_office(&self, office: &BackOffice, revs: RevRange) -> Result<OfficeRun> {
         let mut run = OfficeRun::default();
         if revs.is_empty() {
@@ -255,6 +334,7 @@ impl WorkService {
         }
         self.read(|c| run_log_reached(c, revs.to_rev))?;
         let mut commands = self.office_commands(office)?;
+        let log = self.store().log_id().to_owned();
         let mut after = revs.from_rev.saturating_sub(1);
         loop {
             let page = self.read(|c| {
@@ -272,29 +352,47 @@ impl WorkService {
                 // and read that one again from its start.
                 let last = batch.last().map_or(after, |e| e.rev);
                 let whole = batch.iter().take_while(|e| e.rev < last).count();
-                if whole > 0 {
-                    batch.truncate(whole);
-                } else {
-                    tracing::warn!(rev = last, "one revision filled a page of the run log");
+                if whole == 0 {
+                    return Err(WorkError::internal(format!(
+                        "revision {last} has more run-log entries than the back office's {} \
+                         rules can make: the store's run log was registered with other rules",
+                        office.page.saturating_sub(1) / MAX_ACTIONS_PER_EVENT
+                    )));
                 }
+                batch.truncate(whole);
                 after = batch.last().map_or(last, |e| e.rev);
             }
-            let emitted = batch.iter().filter(|e| e.outcome == Outcome::Emitted);
-            let results = apply(&batch, &mut commands);
-            for (entry, result) in emitted.zip(results) {
-                if let Err(error) = &result {
-                    tracing::warn!(
-                        rule = %entry.rule,
-                        rev = entry.rev,
-                        seq = entry.seq,
-                        error = ?error,
-                        "the hub refused a back-office action"
-                    );
-                }
-                run.actions.push(Applied {
-                    entry: entry.clone(),
-                    result,
-                });
+            for entry in batch.iter().filter(|e| e.outcome == Outcome::Emitted) {
+                let origin = Origin::new(&log, entry);
+                let first = origin.id(0);
+                let applied = if self.read(|c| in_log(c, &first))? {
+                    Applied {
+                        entry: entry.clone(),
+                        result: Ok(()),
+                        replayed: true,
+                    }
+                } else {
+                    commands.origin = Some(origin);
+                    let result = apply(std::slice::from_ref(entry), &mut commands)
+                        .pop()
+                        .unwrap_or(Ok(()));
+                    commands.origin = None;
+                    if let Err(error) = &result {
+                        tracing::warn!(
+                            rule = %entry.rule,
+                            rev = entry.rev,
+                            seq = entry.seq,
+                            error = ?error,
+                            "the hub refused a back-office action"
+                        );
+                    }
+                    Applied {
+                        entry: entry.clone(),
+                        result,
+                        replayed: false,
+                    }
+                };
+                run.actions.push(applied);
             }
             if done {
                 return Ok(run);
@@ -310,8 +408,20 @@ impl OfficeCommands<'_> {
         self.member
     }
 
-    fn event(&self, body: EventBody) -> pitcrew_protocol::events::Event {
-        self.work.event(self.member, self.owner, body)
+    /// An event of the office's, now. Its id comes from the run-log entry being applied, if any.
+    fn event(&self, body: EventBody) -> Event {
+        let mut event = self.work.event(self.member, self.owner, body);
+        if let Some(origin) = &self.origin {
+            let n = origin.next.get();
+            origin.next.set(n.saturating_add(1));
+            event.id = origin.id(n);
+        }
+        event
+    }
+
+    /// Appends the office's events in one transaction; any already in the log are skipped.
+    fn append_events(&self, events: &[Event]) -> Result<()> {
+        self.work.append_new(events).map(drop)
     }
 
     /// A move as the back office, with `can_move` and the task's own `accept_auto`.
@@ -364,51 +474,43 @@ impl OfficeCommands<'_> {
             to,
             mover: ours,
         };
-        w.append(&[self.event(body)])?;
+        self.append_events(&[self.event(body)])?;
         w.reload_moved(id, to)
     }
 
-    /// An answer to an open question or mention of an agent of the office's owner.
+    /// An answer to an open question or mention addressed to the back office itself, as any
+    /// agent may answer (api-v1, "Who may answer an ask").
     fn answer(&self, id: AskId, answer: &Answer) -> Result<Ask> {
         let w = self.work;
         let text = answer.text.clone().filter(|t| !t.trim().is_empty());
         let _guard = w.lock();
-        let ask = w.read(|c| {
-            let ask =
-                query::ask(c, &id)?.ok_or_else(|| WorkError::not_found(format!("No ask {id}.")))?;
-            let to = query::member(c, &ask.to)?.filter(|m| m.kind == MemberKind::Agent);
-            let Some(to) = to else {
-                return Err(WorkError::forbidden(
-                    "The back office never answers an ask addressed to a person.",
-                ));
-            };
-            if !matches!(ask.kind, AskKind::Question | AskKind::Mention) {
-                let kind = crate::codec::enum_text(&ask.kind).unwrap_or_default();
-                return Err(WorkError::forbidden(format!(
-                    "A {kind} is answered only by a person."
-                )));
-            }
-            if to.id != self.member && (self.owner.is_none() || to.owner != self.owner) {
-                return Err(WorkError::forbidden(
-                    "The back office answers only asks addressed to itself or to its owner's \
-                     agents.",
-                ));
-            }
-            if answer.option.is_none() && text.is_none() {
-                return Err(WorkError::invalid(
-                    "Give an option, a text that is not empty, or both.",
-                ));
-            }
-            if let Some(option) = answer.option
-                && option >= ask.options.len()
-            {
-                return Err(WorkError::invalid(format!(
-                    "option must be below {}.",
-                    ask.options.len()
-                )));
-            }
-            Ok(ask)
-        })?;
+        let ask = w
+            .read(|c| query::ask(c, &id))?
+            .ok_or_else(|| WorkError::not_found(format!("No ask {id}.")))?;
+        if ask.to != self.member {
+            return Err(WorkError::forbidden(
+                "The back office answers only asks addressed to itself.",
+            ));
+        }
+        if !matches!(ask.kind, AskKind::Question | AskKind::Mention) {
+            let kind = crate::codec::enum_text(&ask.kind).unwrap_or_default();
+            return Err(WorkError::forbidden(format!(
+                "A {kind} is answered only by a person."
+            )));
+        }
+        if answer.option.is_none() && text.is_none() {
+            return Err(WorkError::invalid(
+                "Give an option, a text that is not empty, or both.",
+            ));
+        }
+        if let Some(option) = answer.option
+            && option >= ask.options.len()
+        {
+            return Err(WorkError::invalid(format!(
+                "option must be below {}.",
+                ask.options.len()
+            )));
+        }
         if ask.state != AskState::Open {
             let state = crate::codec::enum_text(&ask.state).unwrap_or_default();
             return Err(WorkError::conflict(format!("This ask is already {state}.")));
@@ -419,11 +521,11 @@ impl OfficeCommands<'_> {
             text,
             at: w.now(),
         };
-        w.append(&[self.event(EventBody::AskAnswered { ask: id, answer })])?;
+        self.append_events(&[self.event(EventBody::AskAnswered { ask: id, answer })])?;
         w.ask(&id)
     }
 
-    /// A comment on a known task or workstream.
+    /// A comment on a known task or workstream; naming both, the task must be in that workstream.
     fn comment(
         &self,
         task: Option<TaskId>,
@@ -440,28 +542,38 @@ impl OfficeCommands<'_> {
         let w = self.work;
         let _guard = w.lock();
         w.read(|c| {
-            if let Some(id) = &task
-                && query::task(c, &TaskRef::Id(*id))?.is_none()
-            {
-                return Err(no_task(&TaskRef::Id(*id)));
-            }
+            let found = match &task {
+                Some(id) => Some(
+                    query::task(c, &TaskRef::Id(*id))?.ok_or_else(|| no_task(&TaskRef::Id(*id)))?,
+                ),
+                None => None,
+            };
             if let Some(id) = &workstream
                 && query::workstream(c, id)?.is_none()
             {
                 return Err(WorkError::not_found(format!("No workstream {id}.")));
             }
-            for (i, id) in mentions.iter().enumerate() {
-                known_member(c, id, &format!("mentions[{i}]"))?;
+            if let (Some(found), Some(id)) = (&found, &workstream)
+                && found.workstream != Some(*id)
+            {
+                return Err(WorkError::invalid(format!(
+                    "{} is not in workstream {id}.",
+                    found.key
+                )));
+            }
+            if let Some((i, id)) = query::first_unknown_member(c, mentions)? {
+                return Err(WorkError::invalid(format!(
+                    "mentions[{i}]: no member {id}."
+                )));
             }
             Ok(())
         })?;
-        w.append(&[self.event(EventBody::CommentPosted {
+        self.append_events(&[self.event(EventBody::CommentPosted {
             task,
             workstream,
             text: text.to_owned(),
             mentions: mentions.to_vec(),
-        })])?;
-        Ok(())
+        })])
     }
 }
 
@@ -485,7 +597,7 @@ impl Commands for OfficeCommands<'_> {
                 mentions,
             } => self.comment(*task, *workstream, text, mentions),
             _ => Err(WorkError::forbidden(
-                "The back office appends only task moves, answers to agents and comments.",
+                "The back office appends only task moves, answers to its own asks and comments.",
             )),
         }
     }
@@ -530,8 +642,7 @@ impl Commands for OfficeCommands<'_> {
             answer: None,
             created: w.now(),
         };
-        w.append(&[self.event(EventBody::AskRaised { ask })])?;
-        Ok(())
+        self.append_events(&[self.event(EventBody::AskRaised { ask })])
     }
 
     fn propose_brief(&mut self, proposal: &BriefProposal) -> Result<()> {
@@ -552,7 +663,6 @@ impl Commands for OfficeCommands<'_> {
             ),
             None => {}
         }
-        w.append(&events)?;
-        Ok(())
+        self.append_events(&events)
     }
 }

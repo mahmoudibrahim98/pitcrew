@@ -16,7 +16,7 @@ use pitcrew_office::{
     Action, ApplyError, AskDraft, Commands, Config, Context, Entry, Outcome, RUN_LOG, Refusal,
     Rule, read_runs,
 };
-use pitcrew_protocol::api::ErrorCode;
+use pitcrew_protocol::api::{Caller, ErrorCode};
 use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{AskId, DispatchId, EventId, MemberId, TaskId, WorkstreamId};
 use pitcrew_protocol::model::{
@@ -198,13 +198,14 @@ fn a_finished_dispatch_moves_its_task_to_review() {
             .all(|a| a.entry.rule != "dispatch_to_review"),
         "{again:?}"
     );
+    // Running the same range again (as after a restart) appends nothing: the move is replayed.
+    let rev = work.store().latest_rev().expect("rev");
     let replay = work.run_office(&office, finished).expect("replay");
-    assert!(
-        replay
-            .applied()
-            .all(|a| a.entry.rule != "dispatch_to_review"),
-        "a replayed move is refused, not applied twice: {replay:?}"
-    );
+    let replayed: Vec<&str> = replay.replayed().map(|a| a.entry.rule.as_str()).collect();
+    assert_eq!(replayed, ["dispatch_to_review"], "{replay:?}");
+    assert_eq!(replay.applied().count(), 0);
+    assert_eq!(replay.refused().count(), 0);
+    assert_eq!(work.store().latest_rev().expect("rev"), rev);
     assert_eq!(status(&work, "PAP-1"), TaskStatus::Review);
 }
 
@@ -589,8 +590,28 @@ fn nothing_bypasses_can_move() {
     );
 }
 
+/// An ask raised by `by` to `to`.
+fn ask_to(work: &WorkService, by: Caller, kind: AskKind, to: MemberId) -> String {
+    work.raise_ask(
+        &by,
+        NewAsk {
+            kind,
+            to,
+            title: "Which seed first?".into(),
+            body: None,
+            options: Some(vec!["Seed 3".into(), "Seed 5".into()]),
+            task: None,
+            session: None,
+            receipts: None,
+        },
+    )
+    .expect("ask")
+    .id
+    .to_string()
+}
+
 #[test]
-fn answers_go_only_to_its_owners_agents() {
+fn the_office_answers_only_its_own_questions_and_mentions() {
     let dir = tempfile::tempdir().expect("tempdir");
     let office = office();
     let work = hub_with(dir.path(), &office);
@@ -611,23 +632,20 @@ fn answers_go_only_to_its_owners_agents() {
             ErrorCode::Forbidden
         );
     }
-    // A question from @writer to @runner, an agent of @sam's like the office.
-    let question = work
-        .raise_ask(
-            &agent(WRITER),
-            NewAsk {
-                kind: AskKind::Question,
-                to: member("01JB000000000000000MEM0003"),
-                title: "Which seed first?".into(),
-                body: None,
-                options: Some(vec!["Seed 3".into(), "Seed 5".into()]),
-                task: None,
-                session: None,
-                receipts: None,
-            },
-        )
-        .expect("question");
-    let id = question.id.to_string();
+    // Nor another agent's, even one of @sam's like the office.
+    let to_runner = ask_to(
+        &work,
+        agent(WRITER),
+        AskKind::Question,
+        member("01JB000000000000000MEM0003"),
+    );
+    assert_eq!(
+        code(commands.append(&answer(&to_runner, Some(0), None), &evidence())),
+        ErrorCode::Forbidden
+    );
+    // A question from @writer to the office itself.
+    let id = ask_to(&work, agent(WRITER), AskKind::Question, member(OFFICE));
+    let question: AskId = id.parse().expect("ask");
     assert_eq!(
         code(commands.append(&answer(&id, Some(2), None), &evidence())),
         ErrorCode::Invalid,
@@ -644,7 +662,7 @@ fn answers_go_only_to_its_owners_agents() {
             &evidence(),
         )
         .expect("answered");
-    let answered = work.ask(&question.id).expect("ask");
+    let answered = work.ask(&question).expect("ask");
     assert_eq!(answered.state, AskState::Answered);
     let given = answered.answer.expect("answer");
     assert_eq!(given.by, member(OFFICE), "the office answers as itself");
@@ -654,29 +672,20 @@ fn answers_go_only_to_its_owners_agents() {
         ErrorCode::Conflict,
         "already answered"
     );
-    // Not a review, even one addressed to an agent.
-    let review = work
-        .raise_ask(
-            &person(SAM),
-            NewAsk {
-                kind: AskKind::Review,
-                to: member(WRITER),
-                title: "Check §3".into(),
-                body: None,
-                options: None,
-                task: None,
-                session: None,
-                receipts: None,
-            },
-        )
-        .expect("review");
-    assert_eq!(
-        code(commands.append(
-            &answer(&review.id.to_string(), None, Some("ok")),
-            &evidence()
-        )),
-        ErrorCode::Forbidden
-    );
+    // A mention of the office, answered with text.
+    let mention = ask_to(&work, person(SAM), AskKind::Mention, member(OFFICE));
+    commands
+        .append(&answer(&mention, None, Some("Seen.")), &evidence())
+        .expect("answered");
+    // Never a decision or a review, even one addressed to the office.
+    for kind in [AskKind::Decision, AskKind::Review] {
+        let ask = ask_to(&work, person(SAM), kind, member(OFFICE));
+        assert_eq!(
+            code(commands.append(&answer(&ask, Some(0), None), &evidence())),
+            ErrorCode::Forbidden,
+            "{kind:?}"
+        );
+    }
     // Nor the agent of another person.
     let alex = MemberId::new();
     let helper = MemberId::new();
@@ -819,6 +828,16 @@ fn asks_comments_and_other_events_are_checked() {
             comment(Some(pap1), None, "Who?", vec![MemberId::new()]),
             ErrorCode::Invalid,
         ),
+        // PAP-1 is in the submission workstream, not seed runs.
+        (
+            comment(
+                Some(pap1),
+                Some(SEED_RUNS.parse().expect("ws")),
+                "Elsewhere",
+                Vec::new(),
+            ),
+            ErrorCode::Invalid,
+        ),
         // Only moves, answers and comments; nothing else, however harmless it looks.
         (
             EventBody::TaskAssigned {
@@ -860,6 +879,17 @@ fn asks_comments_and_other_events_are_checked() {
             &evidence(),
         )
         .expect("comment on a workstream");
+    commands
+        .append(
+            &comment(
+                Some(pap1),
+                Some(SUBMISSION.parse().expect("ws")),
+                "On PAP-1, in its workstream.",
+                Vec::new(),
+            ),
+            &evidence(),
+        )
+        .expect("comment on a task and its workstream");
 }
 
 fn paused(workstream: &str) -> BriefProposal {
@@ -980,13 +1010,13 @@ fn the_office_runs_only_as_an_agent_with_its_run_log() {
     assert_eq!(code(work.run_office(&office, range)), ErrorCode::Internal);
 }
 
-/// A rule that answers each "chatty N" comment with 64 comments of its own, the most one rule may
-/// take per event.
-struct Chatty;
+/// A rule (named by its field) that answers each "chatty N" comment with 64 comments of its own,
+/// the most one rule may take per event.
+struct Chatty(&'static str);
 
 impl Rule for Chatty {
     fn name(&self) -> &'static str {
-        "chatty"
+        self.0
     }
 
     fn on_event(&mut self, ctx: &mut Context<'_>, event: &Event) -> Vec<Action> {
@@ -1010,20 +1040,25 @@ impl Rule for Chatty {
     }
 }
 
-/// One append batch whose run log is several pages long is applied whole, once, in log order.
-#[test]
-fn a_long_run_log_is_applied_whole_and_in_order() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let config = Config {
+fn uncapped() -> Config {
+    Config {
         per_rule_per_hour: 10_000,
         global_per_hour: 10_000,
         ..Config::default()
-    };
-    let office = BackOffice::with_rules(member(OFFICE), config, || {
-        vec![Box::new(Chatty) as Box<dyn Rule>]
-    });
-    let work = hub_with(dir.path(), &office);
-    let triggers: Vec<Event> = (0..3)
+    }
+}
+
+fn chatty_office(rules: &'static [&'static str]) -> BackOffice {
+    BackOffice::with_rules(member(OFFICE), uncapped(), move || {
+        rules
+            .iter()
+            .map(|&name| Box::new(Chatty(name)) as Box<dyn Rule>)
+            .collect()
+    })
+}
+
+fn chatty_triggers(work: &WorkService, n: i64) -> Vec<Event> {
+    (0..n)
         .map(|n| Event {
             id: EventId::new(),
             at: 1_790_800_000_000 + n,
@@ -1037,8 +1072,19 @@ fn a_long_run_log_is_applied_whole_and_in_order() {
                 mentions: Vec::new(),
             },
         })
-        .collect();
-    let batch = work.store().append(&triggers).expect("append");
+        .collect()
+}
+
+/// One append batch whose run log is several pages long is applied whole, once, in log order.
+#[test]
+fn a_long_run_log_is_applied_whole_and_in_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let office = chatty_office(&["chatty"]);
+    let work = hub_with(dir.path(), &office);
+    let batch = work
+        .store()
+        .append(&chatty_triggers(&work, 3))
+        .expect("append");
     let run = work.run_office(&office, batch).expect("run");
     let per_event = pitcrew_office::MAX_ACTIONS_PER_EVENT;
     assert_eq!(run.actions.len(), 3 * per_event);
@@ -1054,8 +1100,9 @@ fn a_long_run_log_is_applied_whole_and_in_order() {
         .flat_map(|n| (0..per_event).map(move |i| format!("chatty {n}/{i}")))
         .collect();
     assert_eq!(texts, expected);
-    // Only the batch's revisions: a range covering just the last trigger applies its 64 again
-    // (the hub accepts repeated comments), and nothing of the others.
+    // Running a range again appends nothing: a range covering just the last trigger finds its 64
+    // already applied, and nothing of the others.
+    let rev = work.store().latest_rev().expect("rev");
     let last = RevRange {
         from_rev: batch.to_rev,
         to_rev: batch.to_rev,
@@ -1063,6 +1110,66 @@ fn a_long_run_log_is_applied_whole_and_in_order() {
     let again = work.run_office(&office, last).expect("run");
     assert_eq!(again.actions.len(), per_event);
     assert!(again.actions.iter().all(|a| a.entry.rev == batch.to_rev));
+    assert_eq!(again.replayed().count(), per_event);
+    assert_eq!(work.store().latest_rev().expect("rev"), rev);
+    let whole = work.run_office(&office, batch).expect("run");
+    assert_eq!(whole.replayed().count(), 3 * per_event);
+    assert_eq!(work.store().latest_rev().expect("rev"), rev);
+}
+
+/// After a crash part-way through a batch, re-running the batch applies only what was missing:
+/// each action once in all.
+#[test]
+fn re_running_a_range_after_a_crash_applies_each_action_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let office = chatty_office(&["chatty"]);
+    let work = hub_with(dir.path(), &office);
+    let batch = work
+        .store()
+        .append(&chatty_triggers(&work, 3))
+        .expect("append");
+    // The daemon got through the first trigger's actions only.
+    let first = RevRange {
+        from_rev: batch.from_rev,
+        to_rev: batch.from_rev,
+    };
+    let per_event = pitcrew_office::MAX_ACTIONS_PER_EVENT;
+    assert_eq!(
+        work.run_office(&office, first)
+            .expect("run")
+            .applied()
+            .count(),
+        per_event
+    );
+    // After the restart it runs the whole batch again.
+    let run = work.run_office(&office, batch).expect("run");
+    assert_eq!(run.replayed().count(), per_event);
+    assert_eq!(run.applied().count(), 2 * per_event);
+    let comments = events_since(&work, batch.to_rev);
+    assert_eq!(comments.len(), 3 * per_event, "each action once");
+    // The office's events carry ids derived from the run log, so they are the same every time.
+    assert!(comments.iter().all(|e| e.author == member(OFFICE)));
+}
+
+/// A store whose run log has more rules than the `BackOffice` that applies it is a wiring error:
+/// a revision may have more entries than this office can account for.
+#[test]
+fn a_run_log_with_other_rules_is_an_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let registered = chatty_office(&["chatty", "echo"]);
+    let work = hub_with(dir.path(), &registered);
+    let batch = work
+        .store()
+        .append(&chatty_triggers(&work, 2))
+        .expect("append");
+    let fewer = chatty_office(&["chatty"]);
+    assert_eq!(code(work.run_office(&fewer, batch)), ErrorCode::Internal);
+    // The office it was registered with applies it.
+    let run = work.run_office(&registered, batch).expect("run");
+    assert_eq!(
+        run.applied().count(),
+        2 * 2 * pitcrew_office::MAX_ACTIONS_PER_EVENT
+    );
 }
 
 /// The demo fixture has what the tests above assume.

@@ -17,6 +17,10 @@ pitcrew-fixtures.workspace = true
 # recap's `BriefProposal`.
 pitcrew-office.workspace = true
 pitcrew-recap.workspace = true
+# The back office's event ids are derived from its run log (a SHA-256 of the log, the revision and
+# the action's place), so re-running a range appends nothing twice.
+sha2.workspace = true
+ulid.workspace = true
 axum.workspace = true
 serde.workspace = true
 serde_json.workspace = true
