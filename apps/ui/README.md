@@ -33,6 +33,30 @@ corepack pnpm --filter @pitcrew/ui dev    # the UI on http://127.0.0.1:5173
 
 The dev server also serves the data layer's proof page at `/dev/proof`; production builds leave it out.
 
+### Running the e2e suite against a real `pitcrewd`
+
+By default `corepack pnpm --filter @pitcrew/ui e2e` starts its own mock hub (`apps/mock-hub`) and
+talks to that. To run the same suite against a real daemon instead:
+
+```sh
+pitcrewd serve --demo --listen tcp:127.0.0.1:47317   # a separate shell; --demo seeds the demo workspace
+pitcrewd token show-path                             # prints where the device token file is kept
+```
+
+Then, with that file's contents as the token:
+
+```sh
+E2E_HUB_URL=http://127.0.0.1:47317 E2E_HUB_TOKEN=<token from the file above> \
+  corepack pnpm --filter @pitcrew/ui e2e
+```
+
+`E2E_HUB_URL` points the suite at that hub and stops `playwright.config.ts` from starting the mock
+hub; `E2E_HUB_TOKEN` is the bearer token both the UI (`VITE_PITCREW_TOKEN`) and the specs' own
+direct hub calls use — the mock hub's fixed `dev-device-token` (the default when `E2E_HUB_TOKEN` is
+unset) is not a token `pitcrewd` recognizes. `tcp:127.0.0.1:<port>` is for development only:
+`pitcrewd serve` without `--listen` uses the platform's private transport, which this suite cannot
+reach. See `apps/ui/e2e/helpers.ts`.
+
 ## Environment (development only)
 
 | Variable | Default | What |
