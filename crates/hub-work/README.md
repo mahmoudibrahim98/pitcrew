@@ -282,10 +282,11 @@ block holds seed events.
 
 The machine is the request's, else the machine of the task's workstream's first location, else the
 project's root's, else the hub's own. **The daemon must name the hub's machine** with
-`with_hub_machine`; without it, a dispatch with nowhere else to run answers `503` (the hub does
-not guess one of the workspace's machines). The folder is the first of those locations on that
-machine, else `~`. The engine, model and permission mode come from the agent's persona (Claude
-Code by default). Without a dispatcher the route answers `503`.
+`with_hub_machine`, or with `set_hub_machine(&self, MachineId)` on the shared service once a
+fresh hub is set up (its machine exists only then); without it, a dispatch with nowhere else to
+run answers `503` (the hub does not guess one of the workspace's machines). The folder is the
+first of those locations on that machine, else `~`. The engine, model and permission mode come
+from the agent's persona (Claude Code by default). Without a dispatcher the route answers `503`.
 
 **For the runner link (stream D):** if the hub stops between step 1 and step 3, a `starting`
 session and an open dispatch are left behind. The runner link must reconcile them: on start-up,
@@ -321,6 +322,7 @@ whatever it sent.
 | `dispatch_working` | the runner link | moves the dispatched task to in progress as the agent, when the rules allow; 409 for an ended dispatch, or a racing writer that moved the task first |
 | `mirror_plan` | the runner link | replaces the agent's `agent_plan` lines of its own task from a `PlanUpdated` |
 | `seed` | the daemon | imports a `DemoWorkspace` into an empty work model |
+| `ensure_office_member(owner)` | the daemon | finds or adds the back office's member (see "The back office"); 400 `owner` is not a person; 409 `@office` held by a person, another person's agent or no one's agent |
 | `run_office`, `OfficeCommands` | the back office | see "The back office" |
 
 "Own task" means the agent is the assignee or holds an active (not ended) dispatch on it.
@@ -371,6 +373,14 @@ authored by the office's member, on behalf of its owner:
 
 Every action must cite receipts (400 without). The office's member must be an agent; a person
 cannot be the back office.
+
+**Its member** (`ensure_office_member(owner) -> Member`): the member holding `@office`
+(`OFFICE_HANDLE`) when it is an agent owned by `owner`, the workspace's person; when no member
+holds the handle, a new agent ("Back office", owned by `owner`) appended in one `member_added`
+authored by `owner`, under the command lock like any command, so the daemon may call it while the
+hub serves (right after `set_up`) as well as at start. `@office` held by a person, another
+person's agent or no one's agent is a `409`: the back office never acts as a person, nor for
+someone else. Found or added once and reused, since the run log's settings name the member.
 
 **Running a range again is safe.** The events an action appends get ids derived from the store's
 `log_id`, the run-log entry's revision and `seq`, and the event's place in the action (a ULID with
@@ -471,7 +481,8 @@ query `400`; bodies over 1 MiB are `400`. A `500` is logged in full and its body
   `can_move`; answers (only the office's own asks), asks, comments and brief proposals (pinned
   and not); a run log several pages long applied whole, once, in order; a range run twice
   appends once, and a re-run after a crash applies only what was missing; a run log with other
-  rules than the `BackOffice` is an error.
+  rules than the `BackOffice` is an error; `ensure_office_member` adds `@office` once, by the
+  person, finds it afterwards (and the demo's), and is a `409` when someone else holds the handle.
 - `tests/rebuild.rs`: rebuilding every projection, building them on open, and applying one event
   per append all give identical tables, over every table, with task edits, key clashes, new
   projects and workstreams, and pending and accepted proposals in the log.

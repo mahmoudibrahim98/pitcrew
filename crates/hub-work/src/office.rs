@@ -56,7 +56,8 @@ use pitcrew_office::{
 use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{AskId, EventId, MemberId, TaskId, WorkstreamId};
 use pitcrew_protocol::model::{
-    Answer, Ask, AskKind, AskState, MemberKind, Mover, Receipt, Task, TaskStatus, TimestampMs,
+    Answer, Ask, AskKind, AskState, Member, MemberKind, Mover, Receipt, Task, TaskStatus,
+    TimestampMs,
 };
 use pitcrew_recap::BriefProposal;
 use pitcrew_store::sql::{Connection, OptionalExtension, params};
@@ -281,7 +282,71 @@ fn in_log(conn: &Connection, id: &EventId) -> Result<bool> {
         .is_some())
 }
 
+/// The handle of the back office's member, `@office`.
+pub const OFFICE_HANDLE: &str = "@office";
+/// The display name [`WorkService::ensure_office_member`] gives a member it adds.
+pub const OFFICE_NAME: &str = "Back office";
+
 impl WorkService {
+    /// The back office's member for a workspace whose person is `owner`, found or added: the
+    /// member holding [`OFFICE_HANDLE`] when it is an agent of `owner`, else, when no member holds
+    /// the handle, a new one (agent, [`OFFICE_NAME`], owned by `owner`) appended in a
+    /// `member_added` authored by `owner`. Through the one writer, so it may run while the hub
+    /// serves, e.g. right after `set_up`.
+    ///
+    /// Found or added once, and reused for the life of the store: the run log's settings name the
+    /// member, and must stay the same.
+    ///
+    /// # Errors
+    ///
+    /// `invalid` when `owner` is not a person of this workspace; `conflict` when `@office` is
+    /// held by a person, by another person's agent, or by an agent of no one (the back office never
+    /// acts as a person, nor for someone else); database errors.
+    pub fn ensure_office_member(&self, owner: MemberId) -> Result<Member> {
+        let _guard = self.lock();
+        let (person, found) = self.read(|c| {
+            Ok((
+                query::member(c, &owner)?,
+                query::member_with_handle(c, OFFICE_HANDLE)?,
+            ))
+        })?;
+        if !person.is_some_and(|p| p.kind == MemberKind::Human) {
+            return Err(WorkError::invalid(format!(
+                "{owner} is not a person of this workspace; only a person owns the back office."
+            )));
+        }
+        if let Some(found) = found {
+            return match (found.kind, found.owner) {
+                (MemberKind::Agent, Some(of)) if of == owner => Ok(found),
+                (MemberKind::Agent, Some(of)) => Err(WorkError::conflict(format!(
+                    "{OFFICE_HANDLE} is an agent of {of}, not of the workspace's person {owner}."
+                ))),
+                (MemberKind::Agent, None) => Err(WorkError::conflict(format!(
+                    "{OFFICE_HANDLE} is an agent of no one."
+                ))),
+                (MemberKind::Human, _) => Err(WorkError::conflict(format!(
+                    "{OFFICE_HANDLE} is a person in this workspace."
+                ))),
+            };
+        }
+        let office = Member {
+            id: MemberId::new(),
+            kind: MemberKind::Agent,
+            handle: OFFICE_HANDLE.to_owned(),
+            name: OFFICE_NAME.to_owned(),
+            owner: Some(owner),
+            persona: None,
+        };
+        self.append(&[self.event(
+            owner,
+            None,
+            EventBody::MemberAdded {
+                member: office.clone(),
+            },
+        )])?;
+        Ok(office)
+    }
+
     /// The back office's [`Commands`] over this service, acting as `office`'s member.
     ///
     /// # Errors
