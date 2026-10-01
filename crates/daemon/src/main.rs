@@ -1,11 +1,11 @@
 //! # pitcrewd
 //!
-//! The composition root: it opens the store, runs the work model and its back office, and serves
-//! API v1 with real tokens. In the solo case the hub and (later) the runner share this one process
-//! (ADR-0009).
+//! The composition root: it opens the store, runs the work model and its back office, runs the
+//! runner over this machine's agent sessions, and serves API v1 with real tokens. In the solo case
+//! the hub and the runner share this one process (ADR-0009).
 //!
-//! - `pitcrewd serve [--listen private|tcp:127.0.0.1:<port>] [--demo] [--no-office]`: see
-//!   [`serve`] and [`office`].
+//! - `pitcrewd serve [--listen private|tcp:127.0.0.1:<port>] [--demo] [--no-office]
+//!   [--homes <dir>…] [--no-runner]`: see [`serve`], [`office`] and [`runner`].
 //! - `pitcrewd token show-path`: where the device token is kept, never the token.
 //! - `pitcrewd --version`: the version and the protocol range.
 //!
@@ -15,14 +15,17 @@
 //!
 //! **Owned by stream 0.**
 
+mod agents;
 mod cli;
 mod cors;
-mod no_runner;
 mod office;
 mod recaps;
 mod refs;
+mod runner;
 mod serve;
 mod state;
+mod terminals;
+mod transcripts;
 
 use clap::{CommandFactory as _, Parser as _};
 use cli::{Cli, Command, TokenCommand};

@@ -35,6 +35,11 @@ pub mod id {
     pub const PAP7: &str = "01JB000000000000000TSK0007";
     pub const TL1: &str = "01JB000000000000000TSK0008";
     pub const SES1: &str = "01JB000000000000000SES0001";
+    /// On the demo's `cluster`, a machine this hub cannot reach.
+    pub const SES2: &str = "01JB000000000000000SES0002";
+    /// The demo's own machine, "This laptop": the runner's.
+    pub const LAPTOP: &str = "01JB000000000000000MCH0001";
+    pub const REVIEWER: &str = "01JB000000000000000MEM0004";
     pub const SES_UNKNOWN: &str = "01JB000000000000000SES0099";
     /// PAP-1's active dispatch (@writer, session 1).
     pub const DSP1: &str = "01JB000000000000000DSP0001";
@@ -95,12 +100,14 @@ impl Daemon {
     /// As [`Daemon::start_on`], but returns how it failed.
     pub fn try_start_on(state: &Path, listen: &str, extra: &[&str]) -> Result<Self, Refused> {
         let started = Instant::now();
-        let mut child = Command::new(PITCREWD)
+        let mut command = Command::new(PITCREWD);
+        command
             .arg("--state-dir")
             .arg(state)
             .args(["serve", "--listen", listen])
             .args(extra)
-            .env("PITCREW_LOG", "debug")
+            .env("PITCREW_LOG", "debug");
+        let mut child = private_homes(&mut command, state)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -361,10 +368,35 @@ pub fn read_token(path: &Path) -> String {
         .to_owned()
 }
 
-/// Runs `pitcrewd <args>` to completion.
+/// The home folder a daemon on `state` takes for this user's: `<state>-home`, next to it in the
+/// test's temporary folder. A test may lay out agent homes in it (`.claude/projects/…`) to stand
+/// for the person's own.
+pub fn home_of(state: &Path) -> PathBuf {
+    let mut home = state.as_os_str().to_owned();
+    home.push("-home");
+    PathBuf::from(home)
+}
+
+/// **Never the real homes.** A daemon started without `--homes` (and without `--demo`) watches
+/// this user's agent homes, which hold the person's private transcripts. Every daemon a test
+/// starts therefore gets [`home_of`] as its home folder, and none of the variables that point
+/// the adapters elsewhere.
+fn private_homes<'a>(command: &'a mut Command, state: &Path) -> &'a mut Command {
+    let home = home_of(state);
+    command
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("XDG_DATA_HOME")
+}
+
+/// Runs `pitcrewd <args>` to completion, with a home folder of its own (see [`private_homes`]).
 pub fn run(args: &[&std::ffi::OsStr]) -> std::process::Output {
-    Command::new(PITCREWD)
-        .args(args)
+    let home = tempfile::tempdir().expect("a temporary home");
+    let mut command = Command::new(PITCREWD);
+    command.args(args);
+    private_homes(&mut command, &home.path().join("state"))
         .stdin(Stdio::null())
         .output()
         .expect("run pitcrewd")

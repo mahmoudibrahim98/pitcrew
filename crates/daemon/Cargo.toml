@@ -22,6 +22,11 @@ pitcrew-hub-work.workspace = true
 # (tried again): `run_office` reports both as `pitcrew_office::ApplyError`.
 pitcrew-office.workspace = true
 pitcrew-fixtures.workspace = true
+# The runner in this process (ADR-0009's solo case), the transcript adapters it watches with, and
+# the runtime and source traits it takes.
+pitcrew-runner.workspace = true
+pitcrew-ingest.workspace = true
+pitcrew-interfaces.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true

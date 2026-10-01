@@ -171,7 +171,8 @@ fn demo_serves_the_work_model_with_real_tokens() {
     assert_eq!(info["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(info["protocol"], pitcrew_protocol::PROTOCOL_VERSION);
     assert_eq!(info["protocol_min"], pitcrew_protocol::PROTOCOL_MIN);
-    assert_eq!(info["roles"], json!(["hub"]));
+    assert_eq!(info["roles"], json!(["hub", "runner"]));
+    assert_eq!(info["capabilities"], json!(["watch"]));
 
     // No token, a malformed one, and the mock hub's dev token are all refused.
     for token in [None, Some("nope"), Some("dev-device-token")] {
@@ -246,13 +247,20 @@ fn demo_serves_the_work_model_with_real_tokens() {
     let bad = daemon.post("/v1/hooks/emacs/Stop", Some(&agent), &json!({}));
     assert_eq!(bad.status, 400);
 
-    // Terminals: no runner yet, so a known session is unavailable and an unknown one not found.
-    let known = daemon.get(
+    // Terminals: a session of this machine has none (no runtime yet), one on another machine is
+    // out of reach, and an unknown one is not found.
+    let local = daemon.get(
         &format!("/v1/sessions/{}/terminal", id::SES1),
         Some(&device),
     );
-    assert_eq!(known.status, 503);
-    assert_eq!(known.code(), "unavailable");
+    assert_eq!(local.status, 404, "{}", local.body);
+    assert_eq!(local.code(), "not_found");
+    let remote = daemon.get(
+        &format!("/v1/sessions/{}/terminal", id::SES2),
+        Some(&device),
+    );
+    assert_eq!(remote.status, 503, "{}", remote.body);
+    assert_eq!(remote.code(), "unavailable");
     let unknown = daemon.get(
         &format!("/v1/sessions/{}/terminal", id::SES_UNKNOWN),
         Some(&device),
@@ -261,6 +269,26 @@ fn demo_serves_the_work_model_with_real_tokens() {
     assert_eq!(unknown.code(), "not_found");
     let agent_terminal = daemon.get(&format!("/v1/sessions/{}/terminal", id::SES1), Some(&agent));
     assert_eq!(agent_terminal.status, 403);
+
+    // Transcripts: the demo watches no home, so this machine's sessions have an empty one.
+    let transcript = daemon.get(
+        &format!("/v1/sessions/{}/transcript", id::SES1),
+        Some(&device),
+    );
+    assert_eq!(transcript.status, 200, "{}", transcript.body);
+    assert_eq!(
+        transcript.json(),
+        json!({ "items": [], "from": 0, "to": 0, "at_start": true })
+    );
+    for (session, status) in [(id::SES2, 503), (id::SES_UNKNOWN, 404)] {
+        let reply = daemon.get(&format!("/v1/sessions/{session}/transcript"), Some(&device));
+        assert_eq!(reply.status, status, "{session}: {}", reply.body);
+    }
+    let agent_transcript = daemon.get(
+        &format!("/v1/sessions/{}/transcript", id::SES1),
+        Some(&agent),
+    );
+    assert_eq!(agent_transcript.status, 403);
 
     // The workspace, named, and the revision the work model reflects.
     let workspace = daemon.get("/v1/workspace", Some(&device));
@@ -277,9 +305,9 @@ fn demo_serves_the_work_model_with_real_tokens() {
     assert_eq!(session.status, 200, "{}", session.body);
     assert_eq!(session.json()["id"], id::SES1);
 
-    // No runner is attached yet, so a dispatch is unavailable and records nothing: no dispatch,
-    // no session, and no assignment of the unassigned PAP-5. (Only the back office may still be
-    // appending what it makes of the move above.)
+    // The runner does not start dispatches yet, so a dispatch is unavailable and records nothing:
+    // no dispatch, no session, and no assignment of the unassigned PAP-5. (Only the back office
+    // may still be appending what it makes of the move above.)
     let before = daemon.latest_rev(&device);
     let dispatch = daemon.post(
         "/v1/tasks/PAP-5/dispatch",
