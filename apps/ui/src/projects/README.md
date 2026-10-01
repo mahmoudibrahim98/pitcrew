@@ -59,9 +59,9 @@ the feed. One call spends at most 8 requests past what is shown and returns wher
 
 ```sh
 cd apps/ui
-corepack pnpm exec vitest run --dir src/projects
+corepack pnpm exec vitest run --dir src/projects   # or the package's `test` script, which runs these too
 ```
 
-The package's `test` script only includes `apps/ui/tests/**` (stream L's); it should also pick up
-`src/**/*.test.{ts,tsx}`. The axe suite (`tests/a11y.test.tsx`) needs `axe-core`, which is not a
-dependency yet; until it is, the suite is skipped and reported as a todo.
+`tests/a11y.test.tsx` runs axe on the Board, the task drawer, the Inbox, the overviews and Home.
+`tests/fake-events.ts` is a `GET /v1/events` feed with the contract's bounded scan, which the mock
+hub does not have yet.

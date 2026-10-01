@@ -4,11 +4,9 @@
 // axe on the projects components, rendered against the mock hub the way the shell will show them
 // (inside <main>, under the page's <h1>). happy-dom has no layout, so colour contrast is left to the
 // shell's Playwright axe run in a real browser.
-//
-// `axe-core` is not a dependency of @pitcrew/ui yet (apps/ui/package.json belongs to stream L), so
-// it is loaded by name at run time; until it is installed the suite is skipped and a todo says why.
 
 import { fireEvent, screen, within } from '@testing-library/react';
+import axe from 'axe-core';
 import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { Board } from '../board.tsx';
@@ -18,23 +16,6 @@ import { ProjectOverview, WorkstreamOverview } from '../overview.tsx';
 import { TaskDrawer } from '../task-drawer.tsx';
 import { demo, renderWithHub, startHub, stopHub, type Hub } from './harness.tsx';
 
-interface AxeResult {
-  violations: { id: string; impact?: string | null; help: string; nodes: { target: unknown[] }[] }[];
-}
-interface Axe {
-  run(
-    context: { exclude: string[][] },
-    options: { rules: Record<string, { enabled: boolean }> },
-  ): Promise<AxeResult>;
-}
-
-const AXE = 'axe-core';
-const axe = await import(/* @vite-ignore */ AXE).then(
-  (m: { default?: Axe } & Axe) => m.default ?? m,
-  () => undefined,
-);
-if (axe === undefined) it.todo('accessibility (axe): add axe-core to @pitcrew/ui to run these checks');
-
 /**
  * The whole document, as axe sees it. Radix's focus guards are left out: they are invisible,
  * focusable spans that exist only to send focus back into an open dialog, and `aria-hidden` marks
@@ -42,7 +23,6 @@ if (axe === undefined) it.todo('accessibility (axe): add axe-core to @pitcrew/ui
  * `h1` rules, since a modal dialog hides the page (and its `main` and `h1`) by design.
  */
 async function violations({ modal = false }: { modal?: boolean } = {}): Promise<string[]> {
-  if (axe === undefined) throw new Error('unreachable');
   const rules: Record<string, { enabled: boolean }> = { 'color-contrast': { enabled: false } };
   if (modal) {
     rules['landmark-one-main'] = { enabled: false };
@@ -61,7 +41,7 @@ const page = (title: string, content: ReactNode) => (
   </main>
 );
 
-describe.skipIf(axe === undefined)('accessibility (axe)', () => {
+describe('accessibility (axe)', () => {
   let hub: Hub;
 
   beforeEach(async () => {
