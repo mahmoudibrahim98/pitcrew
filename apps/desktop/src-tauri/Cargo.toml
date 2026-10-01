@@ -1,14 +1,15 @@
 # Owned by stream K. The desktop shell is its own Cargo workspace: the root workspace excludes it,
 # so Tauri's dependencies never reach the other crates' builds. Check it with
 # `cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --locked`.
-# Keep the package fields and lints below in step with the root Cargo.toml.
+# Keep the package fields and lints below in step with the root Cargo.toml, except rust-version:
+# Tauri 2.12 (the version the UI's @tauri-apps/api pins) needs Rust 1.90.
 
 [package]
 name = "pitcrew-desktop"
-description = "The Tauri desktop shell (Rust side). Stream K replaces this stub with the Tauri app. Owned by stream K."
+description = "The PitCrew desktop app: the Tauri shell, the gateway to each workspace's daemon, and the local daemon's supervisor. Owned by stream K."
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.90"
 license = "Apache-2.0"
 publish = false
 authors = ["The PitCrew Authors"]
@@ -16,12 +17,67 @@ authors = ["The PitCrew Authors"]
 [workspace]
 members = ["."]
 
+[lib]
+name = "pitcrew_desktop"
+path = "src/lib.rs"
+
 [[bin]]
 name = "pitcrew-desktop"
 path = "src/main.rs"
 
+[features]
+# Serve the built UI (`apps/ui/dist`) from inside the app instead of the Vite dev server. Release
+# builds must turn it on (`--features custom-protocol`, as the Tauri CLI does); `src/app.rs`
+# refuses to compile a release build without it, so a release can never load the dev server.
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+# The tauri-build that goes with tauri 2.12.
+tauri-build = { version = "~2.7", features = [] }
+
 [dependencies]
 pitcrew-protocol = { path = "../../../crates/protocol" }
+# Only `pitcrew_api::client`: the checks a client makes before trusting a local daemon with a
+# token (the socket and its directory are ours; the pipe's owner is us). No store, no server.
+pitcrew-api = { path = "../../../crates/api", default-features = false }
+# 2.12.x exactly: the Tauri CLI refuses a major.minor that differs from the UI's @tauri-apps/api
+# (docs/build/contracts/desktop-gateway.md, "Versions"). Default features minus `dbus` and
+# `dynamic-acl`: no capability can be added at run time.
+tauri = { version = "~2.12", default-features = false, features = ["wry", "compression", "common-controls-v6", "x11"] }
+tauri-plugin-single-instance = "2.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1.53", features = ["macros", "net", "process", "rt", "sync", "time", "io-util"] }
+http = "1"
+hyper = { version = "1.11", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+# The version axum's `ws` feature (and so pitcrew-api) already uses.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+bytes = "1"
+tracing = "0.1"
+# No `tracing-log` feature: `logging.rs` installs the log bridge itself, so it can drop the crates
+# that log raw frames and handshakes at trace level.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "std"] }
+tracing-log = { version = "0.2", default-features = false, features = ["log-tracer", "std"] }
+directories = "6"
+# The OS keychain: Keychain Services, Windows Credential Manager, the Secret Service over zbus.
+keyring = "4.2"
+
+[target.'cfg(unix)'.dependencies]
+# SIGTERM to the daemon, and O_NOFOLLOW for the token file, without unsafe code. The version
+# pitcrew-auth already uses.
+rustix = { version = "1.1", features = ["fs", "process"] }
+
+[dev-dependencies]
+axum = { version = "0.8", features = ["ws"] }
+# A canary record through the log bridge (no_token.rs). Already in the lockfile through Tauri.
+log = "0.4"
+tempfile = "3"
+tauri = { version = "~2.12", default-features = false, features = ["test"] }
+tokio = { version = "1.53", features = ["macros", "net", "process", "rt", "rt-multi-thread", "sync", "time", "io-util"] }
 
 [lints.rust]
 unsafe_code = "deny"
