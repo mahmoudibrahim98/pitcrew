@@ -21,13 +21,13 @@ planted by another user never receives a token:
 
 - Unix: `check_unix_socket(dir)` before connecting (directory ours and 0700, socket ours), and
   `check_unix_peer(&stream)` after (the server runs as us).
-- Windows: `check_pipe_server(&client)` after connecting (the pipe is owned by the current
-  user, or by our token's default owner). The daemon names the user as its pipe's owner; another
-  user cannot create a pipe owned by us, and unlike a server process id, the owner cannot be
-  recycled. The token's default owner is accepted so that a pipe created without naming an
-  owner (a test server) passes: unelevated it is the user itself; elevated it is typically the
-  Administrators group. Residual, unchanged by that: an elevated administrator (or anyone with
-  the restore privilege) can plant a pipe that passes.
+- Windows: `check_pipe_server(&client)` after connecting (the pipe's owner must be exactly the
+  current user). The daemon always names the user as its pipe's owner, elevated or not, so the
+  check never falls back to the token's default owner (elevated, typically the Administrators
+  group) — that would let in a pipe any other elevated process created without naming us as its
+  owner. Another user cannot create a pipe owned by us, and unlike a server process id, the owner
+  cannot be recycled. Residual: an elevated administrator (or anyone with the restore privilege)
+  can plant a pipe that names us as its owner, and can already read our files.
 
 ## Auth
 
@@ -149,6 +149,29 @@ route without an index.
 - The route checks the index's answers (ascending, below `before`, at most `limit`, progress,
   revisions the log has) and answers `500` rather than a page that could make a client loop.
 
+## Recaps: `GET /v1/recaps/blocks` and `GET /v1/recaps/days`
+
+`Recaps::new(source).routes()`, mounted as **device** routes. Without a source, simply do not
+mount them.
+
+- `source` is a `recap::RecapSource`: `blocks(filter, before, limit)` and
+  `days(scope, tz_minutes, before, limit)`. The recap engine (`crates/recap`, stream F) computes
+  blocks and day paragraphs from the event log; this crate does not depend on it, so the daemon
+  adapts its (cached, paged) recap index to `RecapSource`, the way it adapts the work model's
+  activity index to `EventRefs` above. For development and the mock, a source fed from
+  `crates/fixtures/data/demo-recaps.json` stands in.
+- Recaps are **derived, never stored**: no validation here depends on the store. All of the
+  following are `400 invalid`: a malformed id (bare or prefixed), a malformed date (`YYYY-MM-DD`
+  only), `tz` outside `-840..=840` or not a whole number (minutes east of UTC), a `limit` of 0 or
+  not a number, and `days` given neither or both of `workstream`/`project`. A `limit` above the
+  route's cap (`BLOCKS_MAX_LIMIT` 200, `DAYS_MAX_LIMIT` 30) counts as the cap.
+- An id nothing matches is **not** an error: `RecapSource` simply answers an empty page with
+  `at_start: true`, as the activity route does for an unknown session or task.
+- Blocks are filtered by `BlockFilter` (`session`, `task`, `workstream`, `project`, all combined);
+  `task` matches any of the block's `tasks`. Days take a `DaysScope`, exactly one of a workstream's
+  own entries or a project's (its workstreams' and its own, for tasks without one).
+- Both calls run on the blocking pool, like the activity route's reads.
+
 ## Features
 
 `store` (default) provides `StoreSource` and pulls in `pitcrew-store` (SQLite). Crates that
@@ -164,11 +187,14 @@ let hooks = HookIntake::start(Arc::new(LogHookSink), 1024)?;
 let terminals = Arc::new(RuntimeTerminals::new(runtime.clone())); // the runner keeps it to link sessions
 // `work` is the hub's one `Arc<WorkService>`; `WorkRefs` is below.
 let refs: Arc<dyn pitcrew_api::EventRefs> = Arc::new(WorkRefs(Arc::clone(&work)));
+// `recaps` is the hub's recap index (stream E, over `pitcrew-recap`); `RecapIndexSource` is below.
+let recap_source: Arc<dyn pitcrew_api::RecapSource> = Arc::new(RecapIndexSource(Arc::clone(&recaps)));
 let parts = RouterParts::new()
     .agent(pitcrew_api::hooks::routes(hooks))
     .agent(hub_work::agent_routes())    // routes marked **agent** in api-v1.md
     .device(pitcrew_api::stream::routes(source.clone(), StreamConfig::default()))
     .device(pitcrew_api::Activity::new(source).with_refs(refs).routes())
+    .device(pitcrew_api::Recaps::new(recap_source).routes())
     .device(pitcrew_api::terminal::routes(terminals.clone(), TerminalConfig::default()))
     .device(hub_work::device_routes()); // everything else
 pitcrew_api::serve(&Listen::private_default(run_dir)?, info, tokens, parts, shutdown).await?;
@@ -200,6 +226,45 @@ impl pitcrew_api::EventRefs for WorkRefs {
     }
 }
 ```
+
+Likewise, this crate does not depend on the recap engine (`pitcrew-recap`, stream F) or on
+whatever keeps its blocks and days current and queryable (a recap index, stream E, the way
+`WorkService` keeps the activity index current). The daemon's adapter translates `BlockFilter` and
+`DaysScope` to that index's own types and calls into it, something like:
+
+```rust
+/// The hub's recap index, as `pitcrew-api` takes it.
+#[derive(Debug)]
+struct RecapIndexSource(Arc<hub_work::RecapIndex>);
+
+impl pitcrew_api::RecapSource for RecapIndexSource {
+    fn blocks(
+        &self,
+        filter: &pitcrew_api::BlockFilter,
+        before: Option<pitcrew_protocol::EventId>,
+        limit: usize,
+    ) -> Result<pitcrew_protocol::recap::BlocksPage, pitcrew_api::source::SourceError> {
+        self.0.blocks_page(filter.session, filter.task, filter.workstream, filter.project, before, limit)
+            .map_err(Into::into)
+    }
+
+    fn days(
+        &self,
+        scope: pitcrew_api::DaysScope,
+        tz_minutes: i32,
+        before: Option<pitcrew_protocol::model::Date>,
+        limit: usize,
+    ) -> Result<pitcrew_protocol::recap::DaysPage, pitcrew_api::source::SourceError> {
+        match scope {
+            pitcrew_api::DaysScope::Workstream(w) => self.0.days_for_workstream(w, tz_minutes, before, limit),
+            pitcrew_api::DaysScope::Project(p) => self.0.days_for_project(p, tz_minutes, before, limit),
+        }
+        .map_err(Into::into)
+    }
+}
+```
+
+(`blocks_page`/`days_for_*` are illustrative; stream E's recap index names its own methods.)
 
 Do not merge more routes into the router this builds: they would be unauthenticated. Put every
 route in `RouterParts`.
