@@ -36,7 +36,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [G-github-read](G-github-read.md) | G · Integrations | `s/G/github-read` | Sonnet-class | **Merged** |
 | [E-single-writer-and-sessions](E-single-writer-and-sessions.md) | E · Work model | `s/E/single-writer-and-sessions` | Opus-class | **Merged** |
 | [M-console-wiring](M-console-wiring.md) | M · Agent console | `s/M/console-wiring` | Opus-class | **Merged** |
-| [0-daemon-solo](0-daemon-solo.md) | 0 · Composition root | `integrator/daemon-solo` | Opus-class | In progress |
+| [0-daemon-solo](0-daemon-solo.md) | 0 · Composition root | `integrator/daemon-solo` | Opus-class | **Merged** |
 | [N-projects-wiring](N-projects-wiring.md) | N · Projects layout | `s/N/projects-wiring` | Sonnet-class | **Merged** |
 | [L-shell-polish](L-shell-polish.md) | L · UI foundation | `s/L/shell-polish` | Sonnet-class | **Merged** |
 | [E-edits-and-office](E-edits-and-office.md) | E · Work model | `s/E/edits-and-office` | Opus-class | In progress |
