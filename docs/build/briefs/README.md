@@ -53,7 +53,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [F-recap-hardening](F-recap-hardening.md) | F · Recap | `s/F/recap-hardening` | Opus-class | **Merged** |
 | [L-desktop-polish](L-desktop-polish.md) | L · UI foundation | `s/L/desktop-polish` | Sonnet-class | **Merged** |
 | [M-session-work](M-session-work.md) | M · Agent console | `s/M/session-work` | Sonnet-class | **Merged** |
-| [Q-round-3](Q-round-3.md) | Q · Security | `s/Q/round-3` | Opus-class | In progress |
+| [Q-round-3](Q-round-3.md) | Q · Security | `s/Q/round-3` | Opus-class | **Merged** |
 | [D-hub-link-2](D-hub-link-2.md) | D · Runner | `s/D/hub-link-2` | Opus-class | In progress |
 | [E-recap-names](E-recap-names.md) | E · Work model | `s/E/recap-names` | Sonnet-class | In progress |
 | [I-hygiene](I-hygiene.md) | I · CLI and hooks | `s/I/hygiene` | Sonnet-class | In progress |
