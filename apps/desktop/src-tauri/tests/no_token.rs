@@ -1,6 +1,7 @@
 //! No token reaches the webview: every command, socket message, event, error and log line (at
 //! trace level, Tauri's and tungstenite's included) is searched for a known token, against a fake
-//! daemon that even puts the token in its response headers.
+//! daemon that even puts the token in its response headers, and fake `pitcrewd`s that print it
+//! on stderr.
 //!
 //! Its own test binary, because it installs the process-wide log subscriber.
 
@@ -11,8 +12,9 @@ mod common;
 
 use common::{FakeDaemon, WORKSPACE_ID, WORKSPACE_NAME};
 use pitcrew_desktop::app::{self, MAIN, WORKSPACES_EVENT};
-use pitcrew_desktop::daemon::LocalConnector;
 use pitcrew_desktop::daemon::endpoint::Endpoint;
+use pitcrew_desktop::daemon::supervisor::{DaemonState, Options, Supervisor};
+use pitcrew_desktop::daemon::{LocalConnector, follow};
 use pitcrew_desktop::gateway::Gateway;
 use pitcrew_desktop::logging;
 use pitcrew_desktop::registry::{
@@ -20,6 +22,7 @@ use pitcrew_desktop::registry::{
 };
 use serde_json::{Value, json};
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::ipc::{CallbackFn, InvokeBody, InvokeResponseBody};
@@ -238,6 +241,86 @@ fn no_token_reaches_the_webview_or_the_logs() {
     ));
     results.push(invoke(&main, "gateway_workspaces", json!({})));
 
+    // The local daemon's supervisor, with fake `pitcrewd`s that print the token on stderr (and in
+    // the ready line): what it puts in the workspace's detail (the UI sees it, in the list and the
+    // event) and what it logs must not hold it.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let says = format!("bad token {TOKEN}; Authorization: Bearer {TOKEN}; pitcrew.bearer.{TOKEN}");
+    let mut details = Vec::new();
+    for (name, serve, show_path) in [
+        (
+            "dies-before-ready",
+            format!("echo '{says}' >&2; exit 1"),
+            "echo \"$DIR/device.token\"".to_owned(),
+        ),
+        (
+            "crashes-after-ready",
+            format!("echo 'pitcrewd listening on {TOKEN}'; echo '{says}' >&2; sleep 0.1; exit 3"),
+            "echo \"$DIR/device.token\"".to_owned(),
+        ),
+        (
+            "show-path-fails",
+            "trap 'exit 0' TERM; echo 'pitcrewd listening on x'; while true; do sleep 0.05; done"
+                .to_owned(),
+            format!("echo '{says}' >&2; exit 2"),
+        ),
+    ] {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("pitcrewd");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nDIR='{}'\ncase \"$*\" in\n  *\"token show-path\"*) {show_path} ;;\n  *serve*) {serve} ;;\nesac\n",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let endpoint = Endpoint::Unix {
+            dir: dir.join("state").join("run"),
+        };
+        let mut options = Options::new(Ok(program), Some(dir.join("state")), endpoint.clone());
+        options.first_backoff = Duration::from_millis(50);
+        options.max_failures = 2;
+        let detail = rt.block_on(async {
+            let supervisor = Supervisor::start(options, &tokio::runtime::Handle::current());
+            let following = tokio::spawn(follow(
+                supervisor.state(),
+                Arc::new(LocalConnector::new(endpoint)),
+                Arc::clone(&registry),
+            ));
+            let mut state = supervisor.state();
+            let detail = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    if let DaemonState::Unreachable { detail } = state.borrow_and_update().clone() {
+                        return detail;
+                    }
+                    state.changed().await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            supervisor.shutdown().await;
+            following.abort();
+            detail
+        });
+        details.push(detail);
+    }
+    assert!(details[0].contains("exit status: 1"), "{details:?}");
+    assert!(details[1].contains("exit status: 3"), "{details:?}");
+    assert!(details[2].contains("exit status: 2"), "{details:?}");
+    results.extend(details.iter().cloned());
+    results.push(invoke(&main, "gateway_workspaces", json!({})));
+
+    // A record from an unsilenced target goes through the log bridge, so the absence of the
+    // silenced crates' lines below is the silencing, not a broken bridge.
+    log::trace!(target: "pitcrew_canary", "canary {}", 42);
+
     // Let the sockets finish and the last log lines land.
     let gateway = tauri::Manager::state::<Gateway>(&app);
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -278,6 +361,15 @@ fn no_token_reaches_the_webview_or_the_logs() {
         "the gateway's log lines are captured: {}",
         logs.chars().take(3000).collect::<String>()
     );
+    assert!(logs.contains("canary 42"), "the log bridge works");
+    assert!(
+        logs.contains("pitcrewd stopped before it was ready"),
+        "the supervisor's lines are captured"
+    );
+    assert!(
+        logs.contains("pcd_…"),
+        "the daemon's stderr was logged, redacted"
+    );
 
     let secret_core = &TOKEN["pcd_".len()..];
     for (what, texts) in [
@@ -301,8 +393,10 @@ fn no_token_reaches_the_webview_or_the_logs() {
             !line.contains(secret_core),
             "a log line holds the token: {line}"
         );
+        // The daemon's own lines are logged redacted: `pitcrew.bearer.…`, never a value.
         assert!(
-            !line.contains("pitcrew.bearer."),
+            line.match_indices("pitcrew.bearer.")
+                .all(|(i, m)| line[i + m.len()..].starts_with('…')),
             "a log line holds the subprotocol: {line}"
         );
         assert!(

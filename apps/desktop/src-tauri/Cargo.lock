@@ -2827,6 +2827,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "keyring",
+ "log",
  "pitcrew-api",
  "pitcrew-protocol",
  "rustix",

@@ -73,6 +73,8 @@ rustix = { version = "1.1", features = ["fs", "process"] }
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["ws"] }
+# A canary record through the log bridge (no_token.rs). Already in the lockfile through Tauri.
+log = "0.4"
 tempfile = "3"
 tauri = { version = "~2.12", default-features = false, features = ["test"] }
 tokio = { version = "1.53", features = ["macros", "net", "process", "rt", "rt-multi-thread", "sync", "time", "io-util"] }

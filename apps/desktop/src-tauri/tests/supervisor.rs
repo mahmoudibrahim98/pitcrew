@@ -21,13 +21,18 @@ use tokio::sync::watch;
 /// A fake `pitcrewd`: `token show-path` prints `<dir>/device.token`; `serve` logs `start <pid>`
 /// to `<dir>/log`, then does `serve`.
 fn fake_pitcrewd(dir: &Path, serve: &str) -> PathBuf {
+    fake_pitcrewd_with(dir, serve, r#"echo "$DIR/device.token"; exit 0"#)
+}
+
+/// A fake `pitcrewd` whose `token show-path` does `show_path`.
+fn fake_pitcrewd_with(dir: &Path, serve: &str, show_path: &str) -> PathBuf {
     std::fs::create_dir_all(dir).unwrap();
     let path = dir.join("pitcrewd");
     let script = format!(
         r#"#!/bin/sh
 DIR='{dir}'
 case "$*" in
-  *"token show-path"*) echo "$DIR/device.token"; exit 0 ;;
+  *"token show-path"*) {show_path} ;;
   *"serve --listen private"*)
     echo "start $$" >> "$DIR/log"
     {serve}
@@ -56,6 +61,19 @@ const CRASHES: &str = r#"echo "pitcrewd listening on $DIR/state/run/pitcrewd.soc
 /// Never gets ready.
 const FAILS_AT_START: &str = r#"echo "pitcrewd: another pitcrewd is already running" >&2
     exit 1"#;
+
+/// Starts, but never prints its ready line; logs SIGTERM.
+const NEVER_READY: &str = r#"trap 'echo "term $$" >> "$DIR/log"; exit 0' TERM
+    while true; do sleep 0.05; done"#;
+
+/// Waits until the log has a line starting with `prefix`.
+async fn logged(dir: &Path, prefix: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !log(dir).iter().any(|l| l.starts_with(prefix)) {
+        assert!(Instant::now() < deadline, "no {prefix:?} in {:?}", log(dir));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
 
 fn log(dir: &Path) -> Vec<String> {
     std::fs::read_to_string(dir.join("log"))
@@ -174,7 +192,9 @@ fn it_restarts_with_a_growing_backoff_then_gives_up() {
             "the backoff grows: {gaps:?}"
         );
         assert!(given_up.contains("4 times in a row"), "{given_up}");
-        assert!(given_up.contains("the store is corrupt"), "{given_up}");
+        assert!(given_up.contains("exit status: 3"), "{given_up}");
+        // What the daemon printed stays in the log; the detail (shown in the UI) is the app's.
+        assert!(!given_up.contains("corrupt"), "{given_up}");
 
         // Given up: nothing starts any more.
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -198,10 +218,9 @@ fn a_daemon_that_never_gets_ready_counts_as_a_failure() {
         let DaemonState::Unreachable { detail } = state else {
             unreachable!()
         };
-        assert!(
-            detail.contains("another pitcrewd is already running"),
-            "{detail}"
-        );
+        assert!(detail.contains("before it was ready"), "{detail}");
+        assert!(detail.contains("exit status: 1"), "{detail}");
+        assert!(!detail.contains("already running"), "{detail}");
         assert_eq!(starts(tmp.path()), 4);
         supervisor.shutdown().await;
     });
@@ -329,4 +348,61 @@ fn when_the_running_daemon_goes_away_it_starts_its_own() {
         supervisor.shutdown().await;
     });
     assert!(log(tmp.path()).iter().any(|l| l.starts_with("term ")));
+}
+
+#[test]
+fn quitting_while_the_daemon_starts_stops_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let program = fake_pitcrewd(tmp.path(), NEVER_READY);
+    let rt = runtime();
+    rt.block_on(async {
+        let mut options = options(Ok(program), tmp.path());
+        options.ready_timeout = Duration::from_secs(60);
+        let supervisor = Supervisor::start(options, &rt.handle().clone());
+        logged(tmp.path(), "start ").await;
+        let quit = Instant::now();
+        supervisor.shutdown().await;
+        assert!(
+            quit.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            quit.elapsed()
+        );
+    });
+    let log = log(tmp.path());
+    assert_eq!(log.len(), 2, "{log:?}");
+    assert_eq!(
+        log[0].replace("start", "term"),
+        log[1],
+        "stopped with SIGTERM"
+    );
+}
+
+#[test]
+fn quitting_while_asking_for_the_token_path_stops_the_daemon() {
+    let tmp = tempfile::tempdir().unwrap();
+    // `token show-path` hangs: the daemon it started is up but not yet Ready.
+    let program = fake_pitcrewd_with(
+        tmp.path(),
+        HEALTHY,
+        r#"echo "show-path $$" >> "$DIR/log"; sleep 60"#,
+    );
+    let rt = runtime();
+    rt.block_on(async {
+        let supervisor = Supervisor::start(options(Ok(program), tmp.path()), &rt.handle().clone());
+        logged(tmp.path(), "show-path ").await;
+        assert_eq!(*supervisor.state().borrow(), DaemonState::Connecting);
+        let quit = Instant::now();
+        supervisor.shutdown().await;
+        assert!(
+            quit.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            quit.elapsed()
+        );
+    });
+    let log = log(tmp.path());
+    let start = log.iter().find(|l| l.starts_with("start ")).unwrap();
+    assert!(
+        log.contains(&start.replace("start", "term")),
+        "the daemon it started was stopped: {log:?}"
+    );
 }

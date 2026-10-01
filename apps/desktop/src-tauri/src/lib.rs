@@ -21,6 +21,7 @@ pub mod daemon;
 pub mod gateway;
 pub mod keychain;
 pub mod logging;
+pub mod redact;
 pub mod registry;
 pub mod settings;
 pub mod token;
