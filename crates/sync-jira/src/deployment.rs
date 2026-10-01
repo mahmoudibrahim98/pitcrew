@@ -143,6 +143,19 @@ impl Deployment for JiraCloud {
 
 /// Jira Data Center: REST v2, a Bearer personal access token, `GET .../search` with `startAt`
 /// pagination.
+///
+/// **Known limitation:** `startAt` is a raw numeric offset into a query re-executed fresh on
+/// every page request, not a cursor over a fixed snapshot. If the underlying result set changes
+/// between two page fetches *within one paginated walk* — an issue's `updated` moves it across
+/// the page boundary, or it enters or leaves the filtered set entirely — an item can in rare
+/// cases be skipped or repeated in that one call. [`crate::jql::incremental_query`]'s `key ASC`
+/// tie-break removes the most common source of such reordering (two issues tied on the exact same
+/// `updated` instant sorting differently between requests), but it cannot remove reordering caused
+/// by a genuine concurrent write landing mid-walk — there is no `startAt`-based fix for that
+/// within the REST v2 search API itself. In practice this self-heals: a skipped item's `updated`
+/// is at or after the old cursor, so it is still `>= cursor` and gets picked up again by the very
+/// next sync call (see `crate::sync`'s "self-healing cursor" reasoning). [`JiraCloud`]'s
+/// `nextPageToken` is not a raw offset and does not share this limitation.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JiraDataCenter;
 

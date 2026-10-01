@@ -46,17 +46,30 @@ impl fmt::Display for ProjectRef {
     }
 }
 
-/// Builds `project in ("<key>") AND updated >= "<cursor>" ORDER BY updated ASC` (or, with no
-/// cursor, a first full sync: `project in ("<key>") ORDER BY updated ASC`). `cursor` is JQL's own
-/// `"YYYY-MM-DD HH:MM"` shape (see [`crate::time::JiraTimestamp::to_jql_minute`]), built by this
-/// crate from a timestamp it already validated — never from unvalidated text.
+/// Builds `project in ("<key>") AND updated >= "<cursor>" ORDER BY updated ASC, key ASC` (or,
+/// with no cursor, a first full sync: `project in ("<key>") ORDER BY updated ASC, key ASC`).
+/// `cursor` is JQL's own `"YYYY-MM-DD HH:MM"` shape (see [`crate::time::account_minute`]), built
+/// by this crate from a timestamp it already validated — never from unvalidated text.
+///
+/// `key ASC` is a tie-breaker, not just tidiness: several issues can share the exact same
+/// `updated` minute (two edits in the same minute, or many issues bulk-updated together), and
+/// without a secondary sort key JQL does not promise a stable order among them. An unstable order
+/// is a real problem for Data Center's `startAt` (offset) pagination in particular — each page is
+/// a fresh query re-executed at a numeric offset into the *current* result set, so if ties are
+/// ordered differently between two page fetches within the same call, an item can be skipped or
+/// repeated even though nothing it owns actually changed. `key ASC` removes the most common cause
+/// of that (ties at the same instant); it does **not** fully remove the risk, because an issue's
+/// `updated` can itself change (entering or leaving the filtered set, or moving past the current
+/// page) between one page fetch and the next within a single paginated walk, which no sort clause
+/// can protect against. [`crate::deployment::JiraDataCenter`]'s own doc comment has more on this.
+/// Jira Cloud's `nextPageToken` pagination is not affected: it is not a raw numeric offset.
 #[must_use]
 pub fn incremental_query(project: &ProjectRef, cursor: Option<&str>) -> String {
     match cursor {
-        Some(cursor) => {
-            format!("project in (\"{project}\") AND updated >= \"{cursor}\" ORDER BY updated ASC")
-        }
-        None => format!("project in (\"{project}\") ORDER BY updated ASC"),
+        Some(cursor) => format!(
+            "project in (\"{project}\") AND updated >= \"{cursor}\" ORDER BY updated ASC, key ASC"
+        ),
+        None => format!("project in (\"{project}\") ORDER BY updated ASC, key ASC"),
     }
 }
 
@@ -104,11 +117,11 @@ mod tests {
         let project = ProjectRef::new("DEMO").expect("valid");
         assert_eq!(
             incremental_query(&project, Some("2026-01-02 03:04")),
-            "project in (\"DEMO\") AND updated >= \"2026-01-02 03:04\" ORDER BY updated ASC"
+            "project in (\"DEMO\") AND updated >= \"2026-01-02 03:04\" ORDER BY updated ASC, key ASC"
         );
         assert_eq!(
             incremental_query(&project, None),
-            "project in (\"DEMO\") ORDER BY updated ASC"
+            "project in (\"DEMO\") ORDER BY updated ASC, key ASC"
         );
     }
 
