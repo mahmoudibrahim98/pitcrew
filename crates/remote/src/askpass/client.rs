@@ -81,12 +81,18 @@ pub struct Parent {
 
 impl Parent {
     /// Records the parent process. Call it first thing in `main`.
+    ///
+    /// On Unix the parent counts only if it shares this process's group: ssh runs in a group
+    /// of its own and its askpass inherits it. A parent elsewhere means ssh was already gone
+    /// and a reaper (init, or a subreaper such as `systemd --user`) adopted us; it is never
+    /// recorded, so never killed.
     #[must_use]
     pub fn at_start() -> Self {
         #[cfg(unix)]
         {
-            // Parent 1 means ssh is already gone and init adopted us: nothing to stop.
-            let pid = rustix::process::getppid().filter(|p| !p.is_init());
+            use rustix::process::{getpgid, getpgrp, getppid};
+            let pid = getppid()
+                .and_then(|parent| usable_parent(parent, getpgid(Some(parent)).ok(), getpgrp()));
             Self { pid }
         }
         #[cfg(not(unix))]
@@ -113,6 +119,16 @@ impl Parent {
         #[cfg(not(any(unix, windows)))]
         false
     }
+}
+
+/// `parent`, when it may be the ssh that started us: not init, and in our own process group.
+#[cfg(unix)]
+fn usable_parent(
+    parent: rustix::process::Pid,
+    parent_group: Option<rustix::process::Pid>,
+    own_group: rustix::process::Pid,
+) -> Option<rustix::process::Pid> {
+    (!parent.is_init() && parent_group == Some(own_group)).then_some(parent)
 }
 
 #[cfg(unix)]
@@ -247,10 +263,36 @@ fn connect(_addr: &str) -> io::Result<std::fs::File> {
 mod tests {
     use super::*;
 
+    use rustix::process::{Pid, getpgid, getpgrp, getppid};
+
+    fn pid(raw: i32) -> Pid {
+        Pid::from_raw(raw).expect("a positive pid")
+    }
+
+    /// The test runner's parent (cargo) is in our group when run from a shell, like ssh is for
+    /// its askpass.
     #[test]
-    fn the_parent_is_recorded() {
-        let parent = Parent::at_start();
-        assert_eq!(parent.pid, rustix::process::getppid());
+    fn the_parent_is_recorded_when_it_shares_our_group() {
+        let parent = getppid().unwrap();
+        let same_group = getpgid(Some(parent)).ok() == Some(getpgrp());
+        let recorded = Parent::at_start().pid;
+        assert_eq!(recorded, same_group.then_some(parent));
+    }
+
+    /// A reaper that adopted us after ssh died is in another group (or is init): never ours.
+    #[test]
+    fn a_parent_in_another_group_is_not_recorded() {
+        // ssh (group 4300, its own) started us: same group.
+        assert_eq!(
+            usable_parent(pid(4300), Some(pid(4300)), pid(4300)),
+            Some(pid(4300))
+        );
+        // A subreaper in its own group 4000 adopted us; we are still in ssh's group 4300.
+        assert_eq!(usable_parent(pid(4242), Some(pid(4000)), pid(4300)), None);
+        // Its group cannot be read (it is gone, or in another session).
+        assert_eq!(usable_parent(pid(4242), None, pid(4300)), None);
+        // Init, even in our group.
+        assert_eq!(usable_parent(Pid::INIT, Some(pid(4300)), pid(4300)), None);
     }
 
     /// A process that is not (or no longer) our parent is never signalled: here, ourselves.
