@@ -209,15 +209,16 @@ async fn listing_10k_tasks_with_a_filter() {
         project: Some(PAPER.parse().expect("project")),
         ..RefFilter::default()
     };
-    let (page, revs) = time(|| work.revs_matching(&by_project, u64::MAX, 100).expect("revs"));
+    let (page, revs) = time(|| {
+        work.revs_matching(&by_project, u64::MAX, 100)
+            .expect("revs")
+    });
     report("refs: project=PAP, newest 100", revs.0.len(), page);
     let (pages, n) = time(|| {
         let mut before = u64::MAX;
         let mut n = 0;
         loop {
-            let (revs, scanned_to) = work
-                .revs_matching(&by_project, before, 500)
-                .expect("revs");
+            let (revs, scanned_to) = work.revs_matching(&by_project, before, 500).expect("revs");
             n += revs.len();
             if scanned_to == 0 {
                 return n;
@@ -226,5 +227,8 @@ async fn listing_10k_tasks_with_a_filter() {
         }
     });
     report("refs: project=PAP, every page of 500 (events)", n, pages);
-    assert!(n > 5_000, "every generated PAP task's event, and the demo's");
+    assert!(
+        n > 5_000,
+        "every generated PAP task's event, and the demo's"
+    );
 }

@@ -92,13 +92,7 @@ fn created(tx: &Transaction<'_>, rev: i64, task: &Task) -> Applied {
             tx,
             "INSERT INTO work_task_clashes (rev, task, key_prefix, number, holder)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                rev,
-                id,
-                task.key.project.as_str(),
-                task.key.number,
-                holder
-            ],
+            params![rev, id, task.key.project.as_str(), task.key.number, holder],
         )?;
         return Ok(());
     }

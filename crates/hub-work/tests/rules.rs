@@ -311,7 +311,11 @@ async fn device_handlers_refuse_agents_even_when_mounted_without_the_guard() {
     let bare = pitcrew_hub_work::routes().layer(axum::Extension(Arc::clone(&work)));
     let guarded = app(&work);
     let requests = device_requests();
-    assert_eq!(requests.len(), 16, "every device route in api-v1 that this crate serves");
+    assert_eq!(
+        requests.len(),
+        16,
+        "every device route in api-v1 that this crate serves"
+    );
     let rev = work.store().latest_rev().expect("rev");
     for (method, path, body) in requests {
         for app in [&bare, &guarded] {
@@ -370,7 +374,11 @@ async fn a_forbidden_agent_hears_403_before_any_400() {
             json!([{ "id": "01JB000000000000000SBT1001", "text": " ", "done": false,
                      "source": { "kind": "human" } }]),
         ),
-        ("PUT", "/v1/tasks/PAP-4/subtasks", json!({ "not": "a list" })),
+        (
+            "PUT",
+            "/v1/tasks/PAP-4/subtasks",
+            json!({ "not": "a list" }),
+        ),
         // An ask about another's task, with an empty title and an unknown addressee.
         (
             "POST",

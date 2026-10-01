@@ -762,7 +762,11 @@ pub fn revs_matching(
     let fields: Vec<(&str, usize, String)> = [
         ("session", 4, filter.session.as_ref().map(IdText::text)),
         ("task", 3, filter.task.as_ref().map(IdText::text)),
-        ("workstream", 2, filter.workstream.as_ref().map(IdText::text)),
+        (
+            "workstream",
+            2,
+            filter.workstream.as_ref().map(IdText::text),
+        ),
         ("project", 1, filter.project.as_ref().map(IdText::text)),
     ]
     .into_iter()

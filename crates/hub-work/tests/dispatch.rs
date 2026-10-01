@@ -113,10 +113,16 @@ async fn a_dispatch_records_the_assignment_the_dispatch_and_its_session() {
     // PAP-5 (Seed runs, no assignee) to @runner, whose persona runs Codex.
     let res = dispatch(&work, "PAP-5", json!({ "agent": RUNNER })).await;
     expect(&res, 202);
-    let pap5 = work.task(&TaskRef::parse("PAP-5").expect("key")).expect("task");
+    let pap5 = work
+        .task(&TaskRef::parse("PAP-5").expect("key"))
+        .expect("task");
     assert_eq!(res.1["task"], json!(pap5.id.0.to_string()));
     assert_eq!(res.1["agent"], RUNNER);
-    assert_eq!(res.1["brief"], json!(pap5.description), "the description by default");
+    assert_eq!(
+        res.1["brief"],
+        json!(pap5.description),
+        "the description by default"
+    );
     assert!(res.1.get("ended").is_none());
     let session_id = res.1["session"].as_str().expect("session").to_owned();
 
@@ -127,11 +133,17 @@ async fn a_dispatch_records_the_assignment_the_dispatch_and_its_session() {
         types(&events),
         ["task_assigned", "dispatch_started", "session_discovered"]
     );
-    assert!(events.iter().all(|e| e.author == member(SAM) && e.on_behalf_of.is_none()));
+    assert!(
+        events
+            .iter()
+            .all(|e| e.author == member(SAM) && e.on_behalf_of.is_none())
+    );
     assert_eq!(pap5.assignee, Some(member(RUNNER)));
 
     // The session is recorded as starting, linked by the dispatch.
-    let session = work.session(&session_id.parse().expect("id")).expect("session");
+    let session = work
+        .session(&session_id.parse().expect("id"))
+        .expect("session");
     assert_eq!(session.state, SessionState::Starting);
     assert_eq!(session.link_basis, Some(LinkBasis::Dispatch));
     assert_eq!(session.task, Some(pap5.id));
@@ -146,7 +158,10 @@ async fn a_dispatch_records_the_assignment_the_dispatch_and_its_session() {
     assert_eq!(calls.len(), 1);
     let request = &calls[0];
     assert_eq!(request.session, session.id);
-    assert_eq!(request.dispatch.0.to_string(), res.1["id"].as_str().expect("id"));
+    assert_eq!(
+        request.dispatch.0.to_string(),
+        res.1["id"].as_str().expect("id")
+    );
     assert_eq!(request.task, pap5.id);
     assert_eq!(request.key.to_string(), "PAP-5");
     assert_eq!(request.agent, member(RUNNER));
@@ -193,7 +208,9 @@ async fn an_assigned_task_keeps_its_assignee_and_the_brief_can_be_given() {
         types(&events_after(&work, rev)),
         ["dispatch_started", "session_discovered"]
     );
-    let pap2 = work.task(&TaskRef::parse("PAP-2").expect("key")).expect("task");
+    let pap2 = work
+        .task(&TaskRef::parse("PAP-2").expect("key"))
+        .expect("task");
     assert_eq!(pap2.assignee, Some(member(WRITER)));
     let calls = runner.calls();
     let request = &calls[0];
@@ -228,7 +245,12 @@ async fn where_a_dispatch_runs() {
     );
     // A named machine with the project's root but not the workstream's folder: the root.
     expect(
-        &dispatch(&work, "PAP-6", json!({ "agent": RUNNER, "machine": LAPTOP })).await,
+        &dispatch(
+            &work,
+            "PAP-6",
+            json!({ "agent": RUNNER, "machine": LAPTOP }),
+        )
+        .await,
         202,
     );
     assert_eq!(
@@ -237,7 +259,12 @@ async fn where_a_dispatch_runs() {
     );
     // A named machine with neither: its home.
     expect(
-        &dispatch(&work, "PAP-2", json!({ "agent": RUNNER, "machine": CLUSTER })).await,
+        &dispatch(
+            &work,
+            "PAP-2",
+            json!({ "agent": RUNNER, "machine": CLUSTER }),
+        )
+        .await,
         202,
     );
     assert_eq!(place(2), (CLUSTER.into(), "~".into(), None));
@@ -260,7 +287,10 @@ async fn where_a_dispatch_runs() {
         .expect("create");
     let res = dispatch(&work, &ablation.key.to_string(), json!({ "agent": WRITER })).await;
     expect(&res, 202);
-    assert_eq!(res.1["brief"], "Try a cosine schedule", "the title without a description");
+    assert_eq!(
+        res.1["brief"], "Try a cosine schedule",
+        "the title without a description"
+    );
     assert_eq!(
         place(3),
         (LAPTOP.into(), "/home/sam/work/diffusion-paper".into(), None)
@@ -320,11 +350,17 @@ async fn without_any_folder_a_dispatch_runs_on_the_hubs_machine() {
             },
         )
         .expect("create");
-    expect(&dispatch(&work, "BARE-1", json!({ "agent": RUNNER })).await, 202);
+    expect(
+        &dispatch(&work, "BARE-1", json!({ "agent": RUNNER })).await,
+        202,
+    );
     let calls = runner.calls();
     let r = &calls[0];
     assert_eq!(r.task, task.id);
-    assert_eq!((r.machine, r.cwd.as_str()), (CLUSTER.parse().expect("m"), "~"));
+    assert_eq!(
+        (r.machine, r.cwd.as_str()),
+        (CLUSTER.parse().expect("m"), "~")
+    );
 
     // Without a configured machine, the first local one.
     let second = tempfile::tempdir().expect("tempdir");
@@ -357,7 +393,10 @@ async fn without_any_folder_a_dispatch_runs_on_the_hubs_machine() {
             },
         )
         .expect("create");
-    expect(&dispatch(&other, "BARE-1", json!({ "agent": RUNNER })).await, 202);
+    expect(
+        &dispatch(&other, "BARE-1", json!({ "agent": RUNNER })).await,
+        202,
+    );
     assert_eq!(runner.calls()[0].machine, LAPTOP.parse().expect("m"));
 }
 
@@ -372,7 +411,11 @@ async fn refused_dispatches_record_nothing() {
         ("PAP-99", json!({ "agent": RUNNER }), 404),
         ("garbage", json!({ "agent": RUNNER }), 404),
         // Unknown agent, a person as the agent, an unknown machine, a malformed body.
-        ("PAP-5", json!({ "agent": "01JB000000000000000MEM0099" }), 400),
+        (
+            "PAP-5",
+            json!({ "agent": "01JB000000000000000MEM0099" }),
+            400,
+        ),
         ("PAP-5", json!({ "agent": SAM }), 400),
         (
             "PAP-5",
@@ -400,7 +443,10 @@ async fn refused_dispatches_record_nothing() {
     )
     .expect("cancel");
     let rev = work.store().latest_rev().expect("rev");
-    expect(&dispatch(&work, "PAP-6", json!({ "agent": RUNNER })).await, 409);
+    expect(
+        &dispatch(&work, "PAP-6", json!({ "agent": RUNNER })).await,
+        409,
+    );
     assert_eq!(work.store().latest_rev().expect("rev"), rev);
     assert!(runner.calls().is_empty(), "the runner link was never asked");
 
@@ -424,7 +470,10 @@ async fn without_a_runner_link_dispatching_is_unavailable() {
     let dir = tempfile::tempdir().expect("tempdir");
     let work = service(dir.path(), None);
     let rev = work.store().latest_rev().expect("rev");
-    expect(&dispatch(&work, "PAP-5", json!({ "agent": RUNNER })).await, 503);
+    expect(
+        &dispatch(&work, "PAP-5", json!({ "agent": RUNNER })).await,
+        503,
+    );
     assert_eq!(work.store().latest_rev().expect("rev"), rev);
 }
 
@@ -481,7 +530,9 @@ async fn a_failed_start_finishes_the_dispatch_and_ends_the_session() {
             .expect("session");
         assert_eq!(session.state, SessionState::Ended);
         // The task is no longer the agent's through the dispatch, but stays assigned.
-        let pap5 = work.task(&TaskRef::parse("PAP-5").expect("key")).expect("task");
+        let pap5 = work
+            .task(&TaskRef::parse("PAP-5").expect("key"))
+            .expect("task");
         assert_eq!(pap5.assignee, Some(member(RUNNER)));
         assert_eq!(pap5.status, TaskStatus::Todo);
     }

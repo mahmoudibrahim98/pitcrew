@@ -250,7 +250,9 @@ impl WorkService {
                 .find(|m| m.kind == MachineKind::Local),
         };
         own.ok_or_else(|| {
-            WorkError::unavailable("No machine can run this dispatch: the hub knows none of its own.")
+            WorkError::unavailable(
+                "No machine can run this dispatch: the hub knows none of its own.",
+            )
         })
     }
 

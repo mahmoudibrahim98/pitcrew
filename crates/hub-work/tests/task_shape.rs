@@ -16,11 +16,13 @@ const PINNED_VERSION: u32 = 2;
 const PINNED_SHAPE: &[&str] = &[
     "accept_auto",
     "assignee",
+    "blocked_by",
     "blocked_by[]",
     "description",
     "due",
     "id",
     "key",
+    "labels",
     "labels[]",
     "priority",
     "project",
@@ -30,6 +32,7 @@ const PINNED_SHAPE: &[&str] = &[
     "source.url",
     "start",
     "status",
+    "subtasks",
     "subtasks[]",
     "subtasks[].done",
     "subtasks[].id",
@@ -41,7 +44,7 @@ const PINNED_SHAPE: &[&str] = &[
     "workstream",
 ];
 
-/// Every field path in `value`: `a`, `a.b`, and `a[]` for array items.
+/// Every field path in `value`: `a`, `a.b`, and `a[]` for an array's items (as well as `a`).
 fn paths(prefix: &str, value: &Value, out: &mut BTreeSet<String>) {
     match value {
         Value::Object(map) => {
@@ -115,7 +118,11 @@ fn full_external() -> ExternalRef {
 #[test]
 fn the_stored_task_shape_is_pinned_to_the_projection_version() {
     let mut shape = BTreeSet::new();
-    paths("", &serde_json::to_value(full_task()).expect("json"), &mut shape);
+    paths(
+        "",
+        &serde_json::to_value(full_task()).expect("json"),
+        &mut shape,
+    );
     let pinned: BTreeSet<String> = PINNED_SHAPE.iter().map(|s| (*s).to_owned()).collect();
     assert_eq!(
         (Tasks::VERSION, shape),

@@ -54,8 +54,7 @@ fn task_with_key(key: &str, title: &str) -> Task {
 }
 
 fn task(work: &WorkService, key: &str) -> Task {
-    work.task(&TaskRef::parse(key).expect("key"))
-        .expect("task")
+    work.task(&TaskRef::parse(key).expect("key")).expect("task")
 }
 
 fn count(work: &WorkService, sql: &str) -> i64 {
@@ -169,7 +168,11 @@ fn a_clash_appended_without_the_projections_is_caught_up_on_open() {
     let work = WorkService::new(store, demo().workspace);
     let now = task(&work, "PAP-2");
     assert_eq!(now.id, pap2.id);
-    assert_eq!(now.status, TaskStatus::InProgress, "the move after it applied");
+    assert_eq!(
+        now.status,
+        TaskStatus::InProgress,
+        "the move after it applied"
+    );
     assert!(work.task(&TaskRef::Id(intruder.id)).is_err());
     assert_eq!(count(&work, "SELECT COUNT(*) FROM work_task_clashes"), 1);
 }
@@ -251,7 +254,8 @@ fn many_tasks_created_at_once_get_unique_keys() {
             .map(|n| n.parse().expect("number"))
             .collect();
         numbers.sort_unstable();
-        let expected: Vec<u32> = (first..first + u32::try_from(numbers.len()).expect("n")).collect();
+        let expected: Vec<u32> =
+            (first..first + u32::try_from(numbers.len()).expect("n")).collect();
         assert_eq!(numbers, expected, "{prefix}");
     }
     assert_eq!(count(&work, "SELECT COUNT(*) FROM work_task_clashes"), 0);
@@ -330,9 +334,16 @@ fn keys_are_allocated_by_key_prefix_not_by_project() {
         })])
         .expect("append");
     let in_twin = work
-        .create_task(&person(SAM), new_task(&twin.id.0.to_string(), "In the twin"))
+        .create_task(
+            &person(SAM),
+            new_task(&twin.id.0.to_string(), "In the twin"),
+        )
         .expect("create");
-    assert_eq!(in_twin.key.to_string(), "PAP-8", "not PAP-1, which the paper holds");
+    assert_eq!(
+        in_twin.key.to_string(),
+        "PAP-8",
+        "not PAP-1, which the paper holds"
+    );
     let in_paper = work
         .create_task(&person(SAM), new_task(PAPER, "In the paper"))
         .expect("create");
