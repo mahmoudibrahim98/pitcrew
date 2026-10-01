@@ -129,4 +129,10 @@ describe('describeEvent', () => {
       ),
     ).toBe('moved …0001 from Todo to Done');
   });
+
+  it('describes a task edit', () => {
+    expect(
+      describeEvent({ ...event(1), body: { type: 'task_updated', data: { task: 'TASK0001', patch: { title: 'New' } } } }, plainNames),
+    ).toBe('edited …0001');
+  });
 });

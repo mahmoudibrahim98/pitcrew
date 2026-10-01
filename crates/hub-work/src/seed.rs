@@ -84,6 +84,7 @@ pub fn demo_events(demo: &DemoWorkspace, author: MemberId) -> Vec<Event> {
                 EventBody::BriefProposed {
                     target: brief.target,
                     text: brief.text.clone(),
+                    next: None,
                     receipts: brief.receipts.clone(),
                 },
             ));
@@ -93,7 +94,9 @@ pub fn demo_events(demo: &DemoWorkspace, author: MemberId) -> Vec<Event> {
             EventBody::BriefAccepted {
                 target: brief.target,
                 text: brief.text.clone(),
+                next: None,
                 pinned: brief.pinned,
+                receipts: Vec::new(),
             },
         ));
     }
