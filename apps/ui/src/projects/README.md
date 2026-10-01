@@ -12,9 +12,10 @@ none of this folder lands in the initial bundle.
 | `index.ts` | Public surface: lazy components, `ProjectsNavProvider`, `useInbox` (for the sidebar badge). |
 | `data.ts` | Hooks on `useLiveQuery`: inbox (`to=me&state=open`), briefs, activity (`GET /v1/events`), machines, names; mutations: move, assign, create task, subtasks, comment, dispatch, answer ask, edit/pin brief. |
 | `nav.tsx` | `ProjectsNavProvider`: where "open task / project / workstream / session / receipt / Inbox" go. Without a handler, targets render as plain text. |
-| `board.tsx` | `Board` (data, moves, notices) and `BoardView` (columns by status, lanes by workstream, pointer drag, keyboard moves). |
+| `board.tsx` | `Board` (data, notes) and `BoardView` (columns by status, lanes by workstream, pointer drag, keyboard moves). |
+| `moves.ts` | `useOptimisticMoves`: where a moved card shows until the hub and the task list agree. |
 | `task-card.tsx` | A card: key, title, assignee (person or agent), priority, due, live status line, **Needs you**. |
-| `virtual-list.tsx` | Lists over 60 items render through TanStack Virtual. |
+| `virtual-list.tsx` | Lists over 60 items render through TanStack Virtual, and scroll to an item on request. |
 | `task-drawer.tsx` | `TaskDrawer` (Radix dialog) and `TaskDetail`: fields, subtasks (agent-plan lines read-only), agent run, dependencies, comments with @mentions, history. |
 | `inbox.tsx` | `Inbox`: open asks to me by kind, answered in place. |
 | `question-card.tsx` | A **local** `QuestionCard` (stream M's is not merged yet). |
@@ -31,13 +32,26 @@ none of this folder lands in the initial bundle.
 
 A drop or a keyboard move shows the card in its new column at once and calls
 `POST /v1/tasks/{id}/move`. The cache is not touched: the `task_moved` event refreshes the lists.
-If the hub refuses (409 `can_move`, 403), the card goes back and the board shows the hub's message
-in an alert. Dragging uses pointer events, not HTML5 drag and drop, which Tauri's webview on
-Windows intercepts for file drops.
+- If the hub refuses (409 `can_move`, 403), the card goes back and the board shows the hub's
+  message, one note per task.
+- If it accepts, the card stays put until the task list shows the task anywhere but where it
+  started (a slow refresh from before the move does not send it back), or for at most 60 s, the
+  stream's reconnect window; then the list wins.
+
+Dragging uses pointer events, not HTML5 drag and drop, which Tauri's webview on Windows intercepts
+for file drops.
 
 Keyboard: each card's move button picks the card up (Enter or Space), the left and right arrows
-choose a column, Enter or Space drops it, Escape cancels; a live region announces each step and
-focus stays on the moved card.
+choose a column, Enter or Space drops it, Escape cancels; a live region announces each step. The
+moved card takes focus where it shows next (a virtualised column scrolls to it), and again if the
+hub sends it back.
+
+## Activity
+
+`useActivity` keeps one live window of `GET /v1/events`. With filters the hub scans a bounded
+window per request, so pages can be short or empty without being the end; only `at_start` ends
+the feed. One call spends at most 8 requests past what is shown and returns where it stopped;
+"Load older" resumes from there.
 
 ## Tests
 
