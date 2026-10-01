@@ -11,8 +11,8 @@ use pitcrew_protocol::ids::{
     TaskKey, TeamId, WorkstreamId,
 };
 use pitcrew_protocol::model::{
-    Ask, AskState, Brief, BriefTarget, Date, Dispatch, Location, Machine, Member, Persona, Project,
-    Session, SessionState, Task, TaskStatus, Team, Workstream,
+    Ask, AskState, Brief, BriefProposal, BriefTarget, Date, Dispatch, Location, Machine, Member,
+    Persona, Project, Session, SessionState, Task, TaskStatus, Team, Workstream,
 };
 use pitcrew_store::sql::types::{Type, Value};
 use pitcrew_store::sql::{self, Connection, OptionalExtension, Row, params, params_from_iter};
@@ -343,6 +343,95 @@ pub fn project(conn: &Connection, id: &ProjectId) -> Result<Option<Project>> {
     Ok(load_projects(conn, &filter)?.pop())
 }
 
+/// The project that holds `key`, if any. Keys are unique (see [`crate::projection::Projects`]).
+pub fn project_with_key(conn: &Connection, key: &ProjectKey) -> Result<Option<Project>> {
+    let mut filter = Where::default();
+    filter.eq("p.key", Some(key.as_str().to_owned()));
+    Ok(load_projects(conn, &filter)?.pop())
+}
+
+/// `ids` as one JSON array of bare ULIDs, for `json_each(?)`: a list of any length is one
+/// parameter and one query.
+fn id_array<T: IdText>(ids: &[T]) -> Result<String> {
+    Ok(serde_json::to_string(
+        &ids.iter().map(IdText::text).collect::<Vec<_>>(),
+    )?)
+}
+
+/// The first of `ids` (its index and id) that `table` has no row for, in one query.
+fn first_unknown<T: IdText + Copy>(
+    conn: &Connection,
+    table: &str,
+    ids: &[T],
+) -> Result<Option<(usize, T)>> {
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    let index: Option<i64> = conn
+        .prepare_cached(&format!(
+            "SELECT j.key FROM json_each(?1) j
+             WHERE NOT EXISTS (SELECT 1 FROM {table} t WHERE t.id = j.value)
+             ORDER BY j.key LIMIT 1"
+        ))?
+        .query_row(params![id_array(ids)?], |r| r.get(0))
+        .optional()?;
+    Ok(index
+        .and_then(|i| usize::try_from(i).ok())
+        .and_then(|i| ids.get(i).map(|id| (i, *id))))
+}
+
+/// The first of `ids` that is no task, with its index.
+pub fn first_unknown_task(conn: &Connection, ids: &[TaskId]) -> Result<Option<(usize, TaskId)>> {
+    first_unknown(conn, "work_tasks", ids)
+}
+
+/// The first of `ids` that is no member, with its index.
+pub fn first_unknown_member(
+    conn: &Connection,
+    ids: &[MemberId],
+) -> Result<Option<(usize, MemberId)>> {
+    first_unknown(conn, "work_members", ids)
+}
+
+/// The first of `ids` that is no machine, with its index.
+pub fn first_unknown_machine(
+    conn: &Connection,
+    ids: &[MachineId],
+) -> Result<Option<(usize, MachineId)>> {
+    first_unknown(conn, "work_machines", ids)
+}
+
+/// The first of `blockers` that already waits on `task`, directly or through other tasks: `task`
+/// waiting on it would close a cycle. One query, however many blockers: it gathers every task
+/// that waits on `task` (following `work_task_deps` backwards, through its index on `blocked_by`)
+/// and looks for the blockers among them. Existing cycles (from a log imported from elsewhere) do
+/// not loop.
+pub fn first_waiting_on(
+    conn: &Connection,
+    task: &TaskId,
+    blockers: &[TaskId],
+) -> Result<Option<TaskId>> {
+    if blockers.is_empty() {
+        return Ok(None);
+    }
+    let index: Option<i64> = conn
+        .prepare_cached(
+            "WITH RECURSIVE waiters(id) AS (
+               SELECT d.task FROM work_task_deps d WHERE d.blocked_by = ?2
+               UNION
+               SELECT d.task FROM work_task_deps d JOIN waiters w ON d.blocked_by = w.id
+             )
+             SELECT j.key FROM json_each(?1) j
+             WHERE j.value IN (SELECT id FROM waiters)
+             ORDER BY j.key LIMIT 1",
+        )?
+        .query_row(params![id_array(blockers)?, task.text()], |r| r.get(0))
+        .optional()?;
+    Ok(index
+        .and_then(|i| usize::try_from(i).ok())
+        .and_then(|i| blockers.get(i).copied()))
+}
+
 const WORKSTREAM_COLS: &str = "w.id, w.project, w.name, w.status, w.health, w.external";
 
 fn load_workstreams(conn: &Connection, filter: &Where) -> Result<Vec<Workstream>> {
@@ -647,6 +736,7 @@ pub fn ask(conn: &Connection, id: &AskId) -> Result<Option<Ask>> {
 
 // ─── Briefs ──────────────────────────────────────────────────────────────────────────────────────
 
+/// A brief in force with its pending proposal, if any (the `LEFT JOIN` in [`BRIEFS`]).
 fn brief_row(r: &Row<'_>) -> sql::Result<Brief> {
     let kind: String = r.get(0)?;
     let target = match kind.as_str() {
@@ -659,6 +749,15 @@ fn brief_row(r: &Row<'_>) -> sql::Result<Brief> {
             ));
         }
     };
+    let proposal = match r.get::<_, Option<String>>(8)? {
+        Some(text) => Some(BriefProposal {
+            text,
+            next: r.get(9)?,
+            receipts: json_col(r, 10)?,
+            at: r.get(11)?,
+        }),
+        None => None,
+    };
     Ok(Brief {
         target,
         text: r.get(2)?,
@@ -667,29 +766,55 @@ fn brief_row(r: &Row<'_>) -> sql::Result<Brief> {
         source: enum_col(r, 5)?,
         updated: r.get(6)?,
         receipts: json_col(r, 7)?,
-        proposal: None,
+        proposal,
     })
 }
 
-const BRIEF_COLS: &str = "target_kind, target_id, text, next, pinned, source, updated, receipts";
+/// Briefs in force, each with its pending proposal: a proposal is pending exactly while its row
+/// exists (see [`crate::projection::Briefs`]).
+const BRIEFS: &str = "SELECT b.target_kind, b.target_id, b.text, b.next, b.pinned, b.source,
+       b.updated, b.receipts, p.text, p.next, p.receipts, p.at
+     FROM work_briefs b
+     LEFT JOIN work_brief_proposals p
+       ON p.target_kind = b.target_kind AND p.target_id = b.target_id";
 
-/// Every brief in force, in the order they were first written.
+/// Every brief in force, in the order they were first written, each with its pending proposal.
+/// A target with a proposal but no brief in force is not listed.
 pub fn briefs(conn: &Connection) -> Result<Vec<Brief>> {
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {BRIEF_COLS} FROM work_briefs ORDER BY rev, target_kind, target_id"
+        "{BRIEFS} ORDER BY b.rev, b.target_kind, b.target_id"
     ))?;
     let rows = stmt.query_map([], brief_row)?;
     Ok(rows.collect::<sql::Result<_>>()?)
 }
 
-/// The brief in force for `target`, if any.
+/// The brief in force for `target`, if any, with its pending proposal.
 pub fn brief(conn: &Connection, target: &BriefTarget) -> Result<Option<Brief>> {
     let (kind, id) = target_columns(target);
     Ok(conn
         .prepare_cached(&format!(
-            "SELECT {BRIEF_COLS} FROM work_briefs WHERE target_kind = ?1 AND target_id = ?2"
+            "{BRIEFS} WHERE b.target_kind = ?1 AND b.target_id = ?2"
         ))?
         .query_row(params![kind, id], brief_row)
+        .optional()?)
+}
+
+/// The pending proposal for `target`, whether or not a brief is in force for it yet.
+pub fn pending_proposal(conn: &Connection, target: &BriefTarget) -> Result<Option<BriefProposal>> {
+    let (kind, id) = target_columns(target);
+    Ok(conn
+        .prepare_cached(
+            "SELECT text, next, receipts, at FROM work_brief_proposals
+             WHERE target_kind = ?1 AND target_id = ?2",
+        )?
+        .query_row(params![kind, id], |r| {
+            Ok(BriefProposal {
+                text: r.get(0)?,
+                next: r.get(1)?,
+                receipts: json_col(r, 2)?,
+                at: r.get(3)?,
+            })
+        })
         .optional()?)
 }
 

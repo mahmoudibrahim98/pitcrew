@@ -1,10 +1,16 @@
 //! `work.projects`: projects and workstreams, with workstream locations.
+//!
+//! **Project keys are never shared** (migration `0209`). A `project_created` whose key another
+//! project already holds is not applied: the first project keeps the key. The same goes for a
+//! re-stated project that would take another's key. Only a writer racing the hub's one
+//! `WorkService` (see "One writer" in the crate docs), or a log imported from elsewhere, appends
+//! one; `POST /v1/projects` answers `409 conflict` when it lost such a race.
 
 use super::{Applied, clear, exec};
 use crate::codec::{IdText, enum_text, json, opt_json, sql_rev};
 use pitcrew_protocol::events::EventBody;
 use pitcrew_protocol::model::{Project, Workstream};
-use pitcrew_store::sql::{Transaction, params};
+use pitcrew_store::sql::{OptionalExtension, Transaction, params};
 use pitcrew_store::{BoxError, Projection, StoredEvent};
 
 /// Projects and workstreams.
@@ -14,7 +20,8 @@ pub struct Projects;
 impl Projects {
     /// The projection's name.
     pub const NAME: &'static str = "work.projects";
-    const VERSION: u32 = 1;
+    /// 2: project keys are unique; a `project_created` whose key is taken is not applied.
+    const VERSION: u32 = 2;
 }
 
 impl Projection for Projects {
@@ -60,8 +67,17 @@ impl Projection for Projects {
     }
 }
 
+/// A new project, or a re-stated one; not applied if another project holds its key.
 fn project_created(tx: &Transaction<'_>, rev: i64, p: &Project) -> Applied {
     let id = p.id.text();
+    let taken = tx
+        .prepare_cached("SELECT 1 FROM work_projects WHERE key = ?1 AND id <> ?2")?
+        .query_row(params![p.key.as_str(), id], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if taken {
+        return Ok(());
+    }
     exec(
         tx,
         "INSERT INTO work_projects (id, rev, key, name, status, lead, start, due, root, external)

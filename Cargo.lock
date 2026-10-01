@@ -1139,15 +1139,19 @@ version = "0.0.0"
 dependencies = [
  "axum",
  "pitcrew-fixtures",
+ "pitcrew-office",
  "pitcrew-protocol",
+ "pitcrew-recap",
  "pitcrew-store",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
  "tower",
  "tracing",
+ "ulid",
 ]
 
 [[package]]

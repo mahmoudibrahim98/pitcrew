@@ -28,13 +28,13 @@ use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request};
 use axum::http::StatusCode;
 use axum::http::header::{CONTENT_TYPE, HeaderName};
 use axum::http::request::Parts;
-use axum::routing::{get, post, put};
-use pitcrew_protocol::api::{Caller, NewTask};
+use axum::routing::{get, patch, post, put};
+use pitcrew_protocol::api::{Caller, NewProject, NewTask, NewWorkstream};
 use pitcrew_protocol::events::{BriefTarget, Event};
 use pitcrew_protocol::ids::{AskId, MemberId, ProjectId, SessionId, WorkstreamId};
 use pitcrew_protocol::model::{
-    Ask, Brief, Dispatch, Machine, Member, Persona, Project, Session, Subtask, Task, TaskStatus,
-    Team, Workstream,
+    Ask, Brief, Dispatch, Machine, Member, Persona, Project, Session, Subtask, Task, TaskPatch,
+    TaskStatus, Team, Workstream,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -74,14 +74,18 @@ where
         .route("/v1/machines", get(list_machines))
         .route("/v1/personas", get(list_personas))
         .route("/v1/teams", get(list_teams))
-        .route("/v1/projects", get(list_projects))
+        .route("/v1/projects", get(list_projects).post(create_project))
         .route("/v1/projects/{id}", get(get_project))
-        .route("/v1/workstreams", get(list_workstreams))
+        .route(
+            "/v1/workstreams",
+            get(list_workstreams).post(create_workstream),
+        )
         .route(
             "/v1/workstreams/{id}",
             get(get_workstream).patch(patch_workstream),
         )
         .route("/v1/tasks", post(create_task))
+        .route("/v1/tasks/{id}", patch(patch_task))
         .route("/v1/tasks/{id}/assign", post(assign_task))
         .route("/v1/tasks/{id}/dispatch", post(dispatch_task))
         .route("/v1/sessions", get(list_sessions))
@@ -215,17 +219,39 @@ impl Params {
     }
 }
 
-/// Reads a JSON body of at most [`MAX_BODY`] bytes. Anything malformed is `400 invalid`; unknown
-/// fields are ignored.
-async fn json<T: DeserializeOwned>(body: RawBody) -> Result<T, WorkError> {
+/// Reads a JSON body of at most [`MAX_BODY`] bytes. Anything malformed is `400 invalid`.
+async fn json_value(body: RawBody) -> Result<serde_json::Value, WorkError> {
     let bytes = axum::body::to_bytes(body, MAX_BODY)
         .await
         .map_err(|_| WorkError::invalid("The body is larger than 1 MiB, or could not be read."))?;
     serde_json::from_slice(&bytes).map_err(|e| WorkError::invalid(format!("Malformed body: {e}.")))
 }
 
-/// A JSON body, read as soon as the handler runs. For routes whose path names nothing to look up
-/// and whose caller is already known to be allowed. See [`json`].
+fn decode<T: DeserializeOwned>(value: serde_json::Value) -> Result<T, WorkError> {
+    T::deserialize(value).map_err(|e| WorkError::invalid(format!("Malformed body: {e}.")))
+}
+
+/// A JSON object body (see [`json_value`]); unknown fields are ignored. Anything but an object is
+/// `400`: serde would otherwise read an array as a struct's fields by position.
+async fn json<T: DeserializeOwned>(body: RawBody) -> Result<T, WorkError> {
+    let value = json_value(body).await?;
+    if !value.is_object() {
+        return Err(WorkError::invalid("The body must be a JSON object."));
+    }
+    decode(value)
+}
+
+/// A JSON array body (see [`json_value`]).
+async fn json_list<T: DeserializeOwned>(body: RawBody) -> Result<Vec<T>, WorkError> {
+    let value = json_value(body).await?;
+    if !value.is_array() {
+        return Err(WorkError::invalid("The body must be a JSON array."));
+    }
+    decode(value)
+}
+
+/// A JSON object body, read as soon as the handler runs. For routes whose path names nothing to
+/// look up and whose caller is already known to be allowed. See [`json`].
 struct Body<T>(T);
 
 impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Body<T> {
@@ -312,6 +338,24 @@ async fn get_project(
     Ok(Json(blocking(w, move |w| w.project(&id)).await?))
 }
 
+async fn create_project(
+    Work(w): Work,
+    Person(caller): Person,
+    Body(new): Body<NewProject>,
+) -> Created<Project> {
+    let project = blocking(w, move |w| w.create_project(&caller, new)).await?;
+    Ok((StatusCode::CREATED, Json(project)))
+}
+
+async fn create_workstream(
+    Work(w): Work,
+    Person(caller): Person,
+    Body(new): Body<NewWorkstream>,
+) -> Created<Workstream> {
+    let workstream = blocking(w, move |w| w.create_workstream(&caller, new)).await?;
+    Ok((StatusCode::CREATED, Json(workstream)))
+}
+
 async fn list_workstreams(
     Work(w): Work,
     Person(_): Person,
@@ -379,6 +423,20 @@ async fn create_task(
     Ok((StatusCode::CREATED, Json(task)))
 }
 
+async fn patch_task(
+    Work(w): Work,
+    Person(caller): Person,
+    Segments(id): Segments<String>,
+    body: RawBody,
+) -> Reply<Task> {
+    let task = task_ref(&id)?;
+    may_write(&w, caller, &task).await?;
+    let patch: TaskPatch = json(body).await?;
+    Ok(Json(
+        blocking(w, move |w| w.patch_task(&caller, &task, patch)).await?,
+    ))
+}
+
 #[derive(Deserialize)]
 struct MoveTask {
     to: TaskStatus,
@@ -429,7 +487,7 @@ async fn replace_subtasks(
 ) -> Reply<Task> {
     let task = task_ref(&id)?;
     may_write(&w, caller, &task).await?;
-    let subtasks: Vec<Subtask> = json(body).await?;
+    let subtasks: Vec<Subtask> = json_list(body).await?;
     Ok(Json(
         blocking(w, move |w| w.replace_subtasks(&caller, &task, subtasks)).await?,
     ))

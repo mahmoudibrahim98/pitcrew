@@ -11,6 +11,9 @@
 //!   `work_task_clashes`. The same goes for a re-stated task that would take another's key.
 //! - **Moves name where they start.** A `task_moved` whose `from` is not the task's status now
 //!   lost a race with another move, and is ignored.
+//!
+//! A `task_updated` writes its patch into the task as it is (`TaskPatch::apply`): the command that
+//! appended it checked the rules, and `apply` never second-guesses an event.
 
 use super::{Applied, clear, exec};
 use crate::codec::{IdText, enum_text, json, opt_text, sql_rev};
@@ -31,7 +34,8 @@ impl Tasks {
     /// are serialized protocol values; `tests/task_shape.rs` pins the shape to this number).
     ///
     /// 2: key clashes are recorded instead of failing, and stale moves are ignored.
-    pub const VERSION: u32 = 2;
+    /// 3: `task_updated` is applied.
+    pub const VERSION: u32 = 3;
 }
 
 impl Projection for Tasks {
@@ -67,6 +71,7 @@ impl Projection for Tasks {
             EventBody::TaskAssigned { task, assignee } => {
                 change(tx, task, |t| t.assignee = *assignee)
             }
+            EventBody::TaskUpdated { task, patch } => change(tx, task, |t| patch.apply(t)),
             EventBody::SubtasksReplaced { task, subtasks } => {
                 change(tx, task, |t| t.subtasks.clone_from(subtasks))
             }

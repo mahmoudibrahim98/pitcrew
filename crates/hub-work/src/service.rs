@@ -200,6 +200,11 @@ impl WorkService {
         Ok(self.store.append(events)?)
     }
 
+    /// Appends the events whose ids the log does not hold yet, in one transaction.
+    pub(crate) fn append_new(&self, events: &[Event]) -> Result<RevRange> {
+        Ok(self.store.append_new(events)?.0)
+    }
+
     // ─── Reads ───────────────────────────────────────────────────────────────────────────────
 
     /// Every machine.

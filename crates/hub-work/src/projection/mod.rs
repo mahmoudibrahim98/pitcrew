@@ -1,6 +1,6 @@
 //! Projections: the work model's tables, derived from the event log.
 //!
-//! Each projection owns its tables (migrations `0200`–`0208`) and follows the store's rules, so
+//! Each projection owns its tables (migrations `0200`–`0210`) and follows the store's rules, so
 //! applying events one append at a time and rebuilding from the log give identical tables:
 //! - `apply` has no side effects: it never appends events and never reads the clock; times come
 //!   from the event (`at`), and authorship from `author` and `on_behalf_of`;
