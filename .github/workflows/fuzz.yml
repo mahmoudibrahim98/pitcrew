@@ -56,7 +56,8 @@ jobs:
               codex_*) d=codex ;;
               tmux_*) d=tmux ;;
               api_request) d=http ;;
-              api_terminal|api_activity) d=api ;;
+              api_terminal|api_activity|api_recaps) d=api ;;
+              jira_*) d=jira ;;
               remote_*) d=remote ;;
               opencode_*) d=opencode ;;
               github_*) d=github ;;
@@ -127,16 +128,33 @@ jobs:
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
-      - name: Known findings still reproduce (report only)
+      # fuzz/regressions/<target>/ holds one input per finding. `open-*` inputs are findings not
+      # fixed yet: they are reported, never fatal. Every other input is a fixed finding and must
+      # keep passing.
+      - name: Fixed findings stay fixed
+        if: always()
+        env:
+          PITCREW_FUZZ_SKIP_KNOWN: ""
+        run: |
+          dir="fuzz/regressions/$TARGET"
+          if [ ! -d "$dir" ]; then echo "no regressions for $TARGET"; exit 0; fi
+          failed=0
+          for f in "$dir"/*; do
+            case "$(basename "$f")" in open-*) continue ;; esac
+            if "$BIN_DIR/$TARGET" "$f" >/dev/null 2>&1; then echo "ok: $f"; else echo "REGRESSED: $f"; failed=1; fi
+          done
+          exit "$failed"
+      - name: Open findings (report only)
         if: always()
         continue-on-error: true
         env:
           PITCREW_FUZZ_SKIP_KNOWN: ""
         run: |
           dir="fuzz/regressions/$TARGET"
-          if [ ! -d "$dir" ]; then echo "no known findings for $TARGET"; exit 0; fi
-          for f in "$dir"/*; do
-            if "$BIN_DIR/$TARGET" "$f" >/dev/null 2>&1; then echo "fixed? $f no longer fails"; else echo "still open: $f"; fi
+          [ -d "$dir" ] || exit 0
+          for f in "$dir"/open-*; do
+            [ -e "$f" ] || continue
+            if "$BIN_DIR/$TARGET" "$f" >/dev/null 2>&1; then echo "fixed? $f no longer fails (rename it without open-)"; else echo "still open: $f"; fi
           done
       - name: Upload the crashing input
         if: failure()
