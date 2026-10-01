@@ -6,7 +6,6 @@ import { ToggleGroup } from 'radix-ui';
 import {
   useEffect,
   useId,
-  useRef,
   useState,
   type FormEvent,
   type KeyboardEvent,
@@ -253,11 +252,12 @@ export function BoardView({
   onCreate,
 }: BoardViewProps) {
   const instructionsId = useId();
-  const root = useRef<HTMLDivElement>(null);
   const [drag, setDrag] = useState<Drag | null>(null);
   const [over, setOver] = useState<string | null>(null);
   const [picked, setPicked] = useState<{ task: TaskId; target: TaskStatus } | null>(null);
-  const [focusTask, setFocusTask] = useState<TaskId | null>(null);
+  // A card moved with the keyboard keeps focus: wherever it shows next (its new column, or back
+  // where it was if the hub says no), it takes focus once per column.
+  const [keepFocus, setKeepFocus] = useState<{ task: TaskId; tookIn?: TaskStatus } | null>(null);
   const [announcement, setAnnouncement] = useState('');
   const [adding, setAdding] = useState<string | null>(null);
 
@@ -272,17 +272,11 @@ export function BoardView({
   for (const cell of cells.values()) cell.sort(byPriorityThenKey);
   const find = (id: TaskId) => tasks.find((t) => t.id === id);
 
-  // Keep keyboard focus on a card that moved to another column (its old element is gone).
-  const focusStatus = focusTask === null ? undefined : (() => {
-    const task = find(focusTask);
-    return task === undefined ? undefined : statusOf(task);
-  })();
-  useEffect(() => {
-    if (focusTask === null) return;
-    const active = document.activeElement;
-    if (active !== null && active !== document.body) return;
-    root.current?.querySelector<HTMLElement>(`[data-move-handle="${focusTask}"]`)?.focus();
-  }, [focusTask, focusStatus]);
+  // The card that should take focus when it next renders, if any. A virtualised column scrolls to
+  // it (`reveal`), since it may be far below what is rendered.
+  const focusCard = keepFocus === null ? undefined : find(keepFocus.task);
+  const pendingFocus =
+    focusCard !== undefined && keepFocus?.tookIn !== statusOf(focusCard) ? focusCard.id : undefined;
 
   // A drag ends wherever the pointer is released; outside a column, or on Escape, nothing moves.
   const dragging = drag !== null;
@@ -308,6 +302,7 @@ export function BoardView({
   const startDrag = (task: Task, lane: string) => (e: PointerEvent<HTMLElement>) => {
     if (e.button !== 0 || picked !== null) return;
     if (e.target instanceof Element && e.target.closest('input, textarea, select, a') !== null) return;
+    setKeepFocus(null);
     setDrag({ task: task.id, lane, x: e.clientX, y: e.clientY, active: false });
   };
 
@@ -331,6 +326,7 @@ export function BoardView({
   const handleClick = (task: Task) => () => {
     const status = statusOf(task);
     if (picked?.task !== task.id) {
+      setKeepFocus(null);
       setPicked({ task: task.id, target: status });
       setAnnouncement(
         `Picked up ${task.key} in ${TASK_STATUS[status].label}. Left and right arrows choose a column; Enter or Space drops it; Escape cancels.`,
@@ -343,7 +339,7 @@ export function BoardView({
       setAnnouncement(`${task.key} stays in ${TASK_STATUS[status].label}.`);
       return;
     }
-    setFocusTask(task.id);
+    setKeepFocus({ task: task.id });
     setAnnouncement(`Moving ${task.key} to ${TASK_STATUS[to].label}.`);
     onMove(task, to);
   };
@@ -389,6 +385,8 @@ export function BoardView({
         pending={pending.has(task.id)}
         instructionsId={instructionsId}
         headingLevel={laneHeading ? 5 : 4}
+        takeFocus={pendingFocus === task.id}
+        onFocusTaken={() => setKeepFocus({ task: task.id, tookIn: statusOf(task) })}
         onOpen={() => onOpen(task)}
         onHandleClick={handleClick(task)}
         onHandleKeyDown={handleKeyDown(task)}
@@ -400,7 +398,6 @@ export function BoardView({
 
   return (
     <div
-      ref={root}
       onPointerMove={onPointerMove}
       className={cx('flex flex-col gap-4', drag?.active === true && 'cursor-grabbing select-none')}
     >
@@ -442,7 +439,12 @@ export function BoardView({
                       : (title) => onCreate(status, lane.id, title, () => setAdding(null))
                   }
                 >
-                  <CardList items={cards} itemKey={(t) => t.id} renderItem={renderCard(lane.id)} />
+                  <CardList
+                    items={cards}
+                    itemKey={(t) => t.id}
+                    renderItem={renderCard(lane.id)}
+                    {...(pendingFocus === undefined ? {} : { reveal: pendingFocus })}
+                  />
                 </Column>
               );
             })}

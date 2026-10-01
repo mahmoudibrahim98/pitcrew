@@ -2,6 +2,7 @@
 // @vitest-environment-options {"url": "http://localhost:5173/"}
 
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { useState } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { keys, type Member, type Task, type TaskStatus } from '../../data/index.ts';
 import { Board, BoardView } from '../board.tsx';
@@ -165,6 +166,21 @@ describe('Board', () => {
     );
   });
 
+  it('keeps focus on a card the hub sends back after a keyboard move', async () => {
+    renderWithHub(<Board project={demo.paper} />, hub, { token: AGENT_TOKEN });
+    await screen.findByText('Respond to co-author comments');
+    const handle = screen.getByRole('button', { name: 'Move PAP-3, now Review' });
+    handle.focus();
+    fireEvent.click(handle);
+    fireEvent.keyDown(handle, { key: 'ArrowRight' });
+    fireEvent.click(handle);
+    await screen.findByRole('alert');
+    expect(cardsIn('Review')).toEqual(['PAP-3']);
+    await eventually(() =>
+      expect(document.activeElement?.getAttribute('aria-label')).toBe('Move PAP-3, now Review'),
+    );
+  });
+
   it('cancels a keyboard move with Escape', async () => {
     const { api } = renderWithHub(<Board project={demo.paper} />, hub);
     await screen.findByText('Aggregate the results table');
@@ -234,13 +250,42 @@ describe('Board', () => {
   });
 });
 
-describe('BoardView', () => {
-  afterEach(() => {
-    cleanup();
-    vi.restoreAllMocks();
-  });
+/** A synthetic task; `n` makes the key `BIG-n`. */
+const bigTask = (n: number, status: TaskStatus): Task => ({
+  id: `T${String(n).padStart(25, '0')}`,
+  key: `BIG-${n}`,
+  project: 'P',
+  title: `Task ${n}`,
+  description: '',
+  status,
+  priority: 'none',
+  labels: [],
+  blocked_by: [],
+  accept_auto: false,
+  subtasks: [],
+});
 
-  it('keeps the DOM small with 10,000 tasks (virtualised columns)', () => {
+/** BoardView with moves applied at once, as a hub that accepts everything would. */
+function LocalBoard({ tasks }: { tasks: readonly Task[] }) {
+  const [moved, setMoved] = useState<ReadonlyMap<string, TaskStatus>>(new Map());
+  return (
+    <BoardView
+      tasks={tasks}
+      statusOf={(t) => moved.get(t.id) ?? t.status}
+      pending={new Set()}
+      sessions={new Map()}
+      needsYou={new Set()}
+      members={new Map<string, Member>()}
+      lanes={[{ id: 'all' }]}
+      laneOf={() => 'all'}
+      onMove={(t, to) => setMoved(new Map(moved).set(t.id, to))}
+      onOpen={() => {}}
+    />
+  );
+}
+
+describe('BoardView', () => {
+  beforeEach(() => {
     // happy-dom has no layout; give every box a size so the virtualiser has a viewport.
     vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(600);
     vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(300);
@@ -255,20 +300,52 @@ describe('BoardView', () => {
       bottom: 600,
       toJSON: () => ({}),
     } as DOMRect);
+  });
+
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it('keeps keyboard focus on a card moved into a long, virtualised column', async () => {
+    // happy-dom does not scroll: do what a browser does with `scrollTo`, a scroll position and,
+    // a moment later, a `scroll` event.
+    const scrolled = new WeakMap<Element, number>();
+    vi.spyOn(Element.prototype, 'scrollTop', 'get').mockImplementation(function (this: Element) {
+      return scrolled.get(this) ?? 0;
+    });
+    vi.spyOn(Element.prototype, 'scrollHeight', 'get').mockReturnValue(1_000_000);
+    vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(600);
+    const scrollTo = vi.spyOn(Element.prototype, 'scrollTo').mockImplementation(function (
+      this: Element,
+      options?: ScrollToOptions | number,
+    ) {
+      scrolled.set(this, typeof options === 'object' ? (options.top ?? 0) : 0);
+      setTimeout(() => this.dispatchEvent(new Event('scroll')), 0);
+    });
+    // 120 cards in Todo; BIG-999 sorts last there, far below what is rendered.
+    const tasks = [...Array.from({ length: 120 }, (_, i) => bigTask(i + 1, 'todo')), bigTask(999, 'backlog')];
+    render(<LocalBoard tasks={tasks} />);
+    const todo = screen.getByRole('group', { name: 'Todo' });
+    expect(todo.querySelectorAll('[data-task]').length).toBeLessThan(30);
+    const handle = screen.getByRole('button', { name: 'Move BIG-999, now Backlog' });
+    handle.focus();
+    fireEvent.click(handle);
+    fireEvent.keyDown(handle, { key: 'ArrowRight' });
+    fireEvent.click(handle);
+    await eventually(() =>
+      expect(document.activeElement?.getAttribute('aria-label')).toBe('Move BIG-999, now Todo'),
+    );
+    expect(todo.querySelector('[data-task="BIG-999"]')).not.toBeNull();
+    expect(todo.querySelectorAll('[data-task]').length).toBeLessThan(30);
+    // The column scrolled down to the card.
+    expect(scrollTo).toHaveBeenCalled();
+    expect(scrolled.get(todo.querySelector('.overflow-y-auto') as Element)).toBeGreaterThan(10_000);
+  });
+
+  it('keeps the DOM small with 10,000 tasks (virtualised columns)', () => {
     const statuses: TaskStatus[] = ['backlog', 'todo', 'in_progress', 'review', 'done'];
-    const tasks: Task[] = Array.from({ length: 10_000 }, (_, i) => ({
-      id: `T${String(i).padStart(25, '0')}`,
-      key: `BIG-${i + 1}`,
-      project: 'P',
-      title: `Task ${i + 1}`,
-      description: '',
-      status: statuses[i % statuses.length] ?? 'todo',
-      priority: 'none',
-      labels: [],
-      blocked_by: [],
-      accept_auto: false,
-      subtasks: [],
-    }));
+    const tasks = Array.from({ length: 10_000 }, (_, i) => bigTask(i + 1, statuses[i % statuses.length] ?? 'todo'));
     const started = performance.now();
     render(
       <BoardView

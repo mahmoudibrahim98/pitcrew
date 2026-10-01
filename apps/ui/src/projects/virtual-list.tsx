@@ -2,27 +2,25 @@
 // behave the same everywhere (including tests without layout).
 
 import { useVirtualizer } from '@tanstack/react-virtual';
-import { useRef, type ReactNode } from 'react';
+import { useEffect, useRef, type ReactNode } from 'react';
 import { cx } from '../lib/cx.ts';
 
 /** Lists longer than this are virtualised. */
 export const VIRTUALIZE_AFTER = 60;
 
-export function CardList<T>({
-  items,
-  itemKey,
-  renderItem,
-  estimateSize = 112,
-  label,
-  className,
-}: {
+interface ListProps<T> {
   items: readonly T[];
   itemKey: (item: T) => string;
   renderItem: (item: T) => ReactNode;
   estimateSize?: number;
   label?: string;
   className?: string;
-}) {
+  /** An item to bring on screen (rendered, and scrolled to), such as a card about to take focus. */
+  reveal?: string;
+}
+
+export function CardList<T>(props: ListProps<T>) {
+  const { items, itemKey, renderItem, label, className } = props;
   if (items.length <= VIRTUALIZE_AFTER) {
     return (
       <ul aria-label={label} className={cx('flex flex-col gap-2', className)}>
@@ -32,33 +30,10 @@ export function CardList<T>({
       </ul>
     );
   }
-  return (
-    <VirtualCardList
-      items={items}
-      itemKey={itemKey}
-      renderItem={renderItem}
-      estimateSize={estimateSize}
-      label={label}
-      className={className}
-    />
-  );
+  return <VirtualCardList {...props} />;
 }
 
-function VirtualCardList<T>({
-  items,
-  itemKey,
-  renderItem,
-  estimateSize,
-  label,
-  className,
-}: {
-  items: readonly T[];
-  itemKey: (item: T) => string;
-  renderItem: (item: T) => ReactNode;
-  estimateSize: number;
-  label: string | undefined;
-  className: string | undefined;
-}) {
+function VirtualCardList<T>({ items, itemKey, renderItem, estimateSize = 112, label, className, reveal }: ListProps<T>) {
   const scroller = useRef<HTMLDivElement>(null);
   // TanStack Virtual returns functions the React Compiler must not memoise, so the compiler skips
   // this component; that is intended, and nothing here is passed to memoised children.
@@ -74,6 +49,12 @@ function VirtualCardList<T>({
     overscan: 6,
     gap: 8,
   });
+
+  const revealAt = reveal === undefined ? -1 : items.findIndex((item) => itemKey(item) === reveal);
+  useEffect(() => {
+    if (revealAt >= 0) virtualizer.scrollToIndex(revealAt, { align: 'auto' });
+  }, [revealAt, virtualizer]);
+
   return (
     <div ref={scroller} className={cx('max-h-[70vh] overflow-y-auto', className)}>
       <ul aria-label={label} className="relative" style={{ height: virtualizer.getTotalSize() }}>

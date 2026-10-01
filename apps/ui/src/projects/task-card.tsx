@@ -1,7 +1,7 @@
 // A task on the board: key, title, assignee, priority, due date, the agent's live status line, and
 // "Needs you" when an open ask to me is about it.
 
-import { useId, type KeyboardEvent, type PointerEvent } from 'react';
+import { useEffect, useId, useRef, type KeyboardEvent, type PointerEvent } from 'react';
 import { StatusPill } from '../design/index.ts';
 import type { Member, Session, Task, TaskStatus } from '../data/index.ts';
 import { cx } from '../lib/cx.ts';
@@ -26,6 +26,10 @@ export interface TaskCardProps {
   instructionsId: string;
   /** One below the column's heading. */
   headingLevel: 4 | 5;
+  /** Put keyboard focus on the move button, unless the person has put it somewhere else. */
+  takeFocus: boolean;
+  /** Focus was placed, or left where the person put it. */
+  onFocusTaken: () => void;
   onOpen: () => void;
   onHandleClick: () => void;
   onHandleKeyDown: (e: KeyboardEvent<HTMLButtonElement>) => void;
@@ -45,6 +49,8 @@ export function TaskCard({
   pending,
   instructionsId,
   headingLevel,
+  takeFocus,
+  onFocusTaken,
   onOpen,
   onHandleClick,
   onHandleKeyDown,
@@ -52,6 +58,17 @@ export function TaskCard({
   onPointerDown,
 }: TaskCardProps) {
   const titleId = useId();
+  const handle = useRef<HTMLButtonElement>(null);
+
+  // A card moved with the keyboard is a new element in its new column (possibly rendered only
+  // once a virtualised column scrolled to it); the focus its old element had went to the body.
+  useEffect(() => {
+    if (!takeFocus) return;
+    const active = document.activeElement;
+    if (active === null || active === document.body) handle.current?.focus();
+    onFocusTaken();
+  }, [takeFocus, onFocusTaken]);
+
   const priority = PRIORITY[task.priority];
   const Heading = headingLevel === 4 ? 'h4' : 'h5';
   return (
@@ -106,6 +123,7 @@ export function TaskCard({
         )}
         <button
           type="button"
+          ref={handle}
           data-move-handle={task.id}
           aria-label={`Move ${task.key}, now ${TASK_STATUS[status].label}`}
           aria-describedby={instructionsId}
