@@ -3,7 +3,6 @@
   "description": "The main window: the gateway's commands and listening to gateway://workspaces. No shell, fs, http or opener access, and no events the webview can emit.",
   "local": true,
   "windows": ["main"],
-  "webviews": ["main"],
   "permissions": [
     "allow-gateway-workspaces",
     "allow-gateway-request",

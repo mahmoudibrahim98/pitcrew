@@ -266,7 +266,7 @@ async fn supervise(
                                 return;
                             }
                             status = daemon.child.wait() => {
-                                let said = daemon.last_words(&status);
+                                let said = daemon.last_words(&status).await;
                                 tracing::warn!(detail = %said, "pitcrewd stopped");
                                 failures = if started.elapsed() >= options.healthy_after {
                                     1
@@ -391,14 +391,19 @@ async fn show_path(options: &Options) -> Result<PathBuf, String> {
 struct Running {
     child: Child,
     stderr: Arc<Mutex<VecDeque<String>>>,
+    stderr_reader: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Lines of the daemon's stderr kept to explain why it stopped.
 const KEEP_LINES: usize = 5;
 
 impl Running {
-    /// What to say about how it ended.
-    fn last_words(&self, status: &std::io::Result<std::process::ExitStatus>) -> String {
+    /// What to say about how it ended, once its last stderr lines are in.
+    async fn last_words(&mut self, status: &std::io::Result<std::process::ExitStatus>) -> String {
+        if let Some(reader) = self.stderr_reader.take() {
+            // The pipe closes when the daemon exits; don't wait on a child it left behind.
+            let _ = tokio::time::timeout(Duration::from_secs(1), reader).await;
+        }
         let status = match status {
             Ok(status) => status.to_string(),
             Err(e) => format!("unknown status ({e})"),
@@ -446,7 +451,7 @@ async fn start(program: &Path, options: &Options) -> Result<Running, String> {
     tracing::info!(pid = child.id(), program = %program.display(), "starting pitcrewd");
 
     let stderr = Arc::new(Mutex::new(VecDeque::with_capacity(KEEP_LINES)));
-    if let Some(pipe) = child.stderr.take() {
+    let stderr_reader = child.stderr.take().map(|pipe| {
         let kept = Arc::clone(&stderr);
         tokio::spawn(async move {
             let mut lines = BufReader::new(pipe).lines();
@@ -461,8 +466,8 @@ async fn start(program: &Path, options: &Options) -> Result<Running, String> {
                     kept.push_back(line);
                 }
             }
-        });
-    }
+        })
+    });
     let Some(stdout) = child.stdout.take() else {
         return Err("pitcrewd has no stdout".into());
     };
@@ -476,7 +481,11 @@ async fn start(program: &Path, options: &Options) -> Result<Running, String> {
         None
     })
     .await;
-    let mut running = Running { child, stderr };
+    let mut running = Running {
+        child,
+        stderr,
+        stderr_reader,
+    };
     match ready {
         Ok(Some(at)) => {
             if at != options.endpoint.describe() {
@@ -488,11 +497,9 @@ async fn start(program: &Path, options: &Options) -> Result<Running, String> {
         }
         Ok(None) => {
             let status = running.child.wait().await;
-            // Let the stderr reader catch the last lines.
-            tokio::time::sleep(Duration::from_millis(50)).await;
             Err(format!(
                 "pitcrewd stopped before it was ready ({})",
-                running.last_words(&status)
+                running.last_words(&status).await
             ))
         }
         Err(_) => {

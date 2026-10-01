@@ -1,14 +1,15 @@
 # Owned by stream K. The desktop shell is its own Cargo workspace: the root workspace excludes it,
 # so Tauri's dependencies never reach the other crates' builds. Check it with
 # `cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --locked`.
-# Keep the package fields and lints below in step with the root Cargo.toml.
+# Keep the package fields and lints below in step with the root Cargo.toml, except rust-version:
+# Tauri 2.12 (the version the UI's @tauri-apps/api pins) needs Rust 1.90.
 
 [package]
 name = "pitcrew-desktop"
 description = "The PitCrew desktop app: the Tauri shell, the gateway to each workspace's daemon, and the local daemon's supervisor. Owned by stream K."
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.90"
 license = "Apache-2.0"
 publish = false
 authors = ["The PitCrew Authors"]
@@ -31,16 +32,19 @@ path = "src/main.rs"
 custom-protocol = ["tauri/custom-protocol"]
 
 [build-dependencies]
-tauri-build = { version = "2.6", features = [] }
+# The tauri-build that goes with tauri 2.12.
+tauri-build = { version = "~2.7", features = [] }
 
 [dependencies]
 pitcrew-protocol = { path = "../../../crates/protocol" }
 # Only `pitcrew_api::client`: the checks a client makes before trusting a local daemon with a
 # token (the socket and its directory are ours; the pipe's owner is us). No store, no server.
 pitcrew-api = { path = "../../../crates/api", default-features = false }
-# Default features minus `dbus` and `dynamic-acl`: no capability can be added at run time.
-tauri = { version = "2.11", default-features = false, features = ["wry", "compression", "common-controls-v6", "x11"] }
-tauri-plugin-single-instance = "2.4"
+# 2.12.x exactly: the Tauri CLI refuses a major.minor that differs from the UI's @tauri-apps/api
+# (docs/build/contracts/desktop-gateway.md, "Versions"). Default features minus `dbus` and
+# `dynamic-acl`: no capability can be added at run time.
+tauri = { version = "~2.12", default-features = false, features = ["wry", "compression", "common-controls-v6", "x11"] }
+tauri-plugin-single-instance = "2.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -70,7 +74,7 @@ rustix = { version = "1.1", features = ["fs", "process"] }
 [dev-dependencies]
 axum = { version = "0.8", features = ["ws"] }
 tempfile = "3"
-tauri = { version = "2.11", default-features = false, features = ["test"] }
+tauri = { version = "~2.12", default-features = false, features = ["test"] }
 tokio = { version = "1.53", features = ["macros", "net", "process", "rt", "rt-multi-thread", "sync", "time", "io-util"] }
 
 [lints.rust]

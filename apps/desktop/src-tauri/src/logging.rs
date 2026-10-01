@@ -3,13 +3,15 @@
 //!
 //! **Tokens never reach a log line, at any level.** The gateway logs ids, paths without their
 //! query, statuses and timings. The crates that would print a handshake or a frame at trace level
-//! (tungstenite prints the upgrade request, subprotocol and token included) are cut off at the
-//! bridge from the `log` crate and again by target, whatever the directives ask for.
+//! (tungstenite prints the upgrade request, subprotocol and token included) are cut off twice,
+//! whatever the directives ask for: at the bridge from the `log` crate, and by [`Silence`], which
+//! also looks through bridged records to their real target.
 
-use tracing::Subscriber;
-use tracing_subscriber::filter::{EnvFilter, FilterFn};
+use tracing::{Event, Metadata, Subscriber};
+use tracing_log::NormalizeEvent as _;
+use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
-use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt as _};
 use tracing_subscriber::util::SubscriberInitExt as _;
 
 /// The environment variable that sets the level.
@@ -34,7 +36,7 @@ where
     W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
 {
     tracing_subscriber::registry()
-        .with(FilterFn::new(|meta| !is_silenced(meta.target())))
+        .with(Silence)
         .with(filter)
         .with(
             tracing_subscriber::fmt::layer()
@@ -50,6 +52,23 @@ pub fn bridge_log() {
     let _ = tracing_log::LogTracer::builder()
         .ignore_all(SILENCED.iter().copied())
         .init();
+}
+
+/// Drops everything from the [`SILENCED`] crates, including records bridged from `log` (whose
+/// own target is just `log`).
+#[derive(Clone, Copy, Debug)]
+pub struct Silence;
+
+impl<S: Subscriber> Layer<S> for Silence {
+    fn enabled(&self, metadata: &Metadata<'_>, _ctx: Context<'_, S>) -> bool {
+        !is_silenced(metadata.target())
+    }
+
+    fn event_enabled(&self, event: &Event<'_>, _ctx: Context<'_, S>) -> bool {
+        event
+            .normalized_metadata()
+            .is_none_or(|real| !is_silenced(real.target()))
+    }
 }
 
 fn is_silenced(target: &str) -> bool {
