@@ -58,7 +58,7 @@ Windows it must be under the user's profile, whose ACL it inherits.
      called "Workspace" otherwise.
    - The hub's own machine (`with_hub_machine`) is the workspace's first `local` machine (the
      demo's "This laptop"). Without one, a dispatch for a task with no folder answers 503.
-   - The dispatcher is `NoDispatcher` until the runner link exists (see Routes).
+   - No dispatcher until the runner link exists (see Routes).
 4. With `--demo`: refuse a store with data, then mint the tokens, then seed. Tokens come first,
    so a failure leaves the store empty and `--demo` can be retried.
 5. The device token: `device.token` is reused while it verifies as a device token; otherwise a
@@ -80,7 +80,7 @@ remains, and the lock is released last. The log ends with `store closed` and `st
 |---|---|
 | `GET /v1/host/info` (no token) | `pitcrew-api`; roles `["hub"]` until the runner is wired in |
 | Work routes, agent and device, with `GET /v1/workspace` and `GET /v1/sessions[/{id}]` | `pitcrew-hub-work` (`agent_routes`, `device_routes`) |
-| `POST /v1/tasks/{id}/dispatch` | `pitcrew-hub-work` with `NoDispatcher`: the dispatch is recorded (`task_assigned` if the task had no assignee, `dispatch_started`, `session_discovered`), then finished as `failed` with its session ended, and the route answers `503 unavailable`. The assignment stays. |
+| `POST /v1/tasks/{id}/dispatch` | `pitcrew-hub-work` without a dispatcher: `503 unavailable`, and nothing is recorded, not even an assignment |
 | `GET /v1/stream`, `GET /v1/events` | `pitcrew-api` over the store (`StoreSource`). The `project=` and `workstream=` activity filters answer 400 until `pitcrew-api` takes hub-work's `EventRefs` |
 | `POST /v1/hooks/{engine}/{event}` | `pitcrew-api`; logged at debug (engine, event, member; never the body) until the runner's sink exists |
 | `GET /v1/sessions/{id}/terminal` | `pitcrew-api`; no runner yet, so `503 unavailable` for a known session, `404` for an unknown one |
@@ -121,7 +121,7 @@ directory for a fresh demo. The CLI takes the same token from the file:
 `parity/replay.mjs` replays the requests and assertions of `apps/mock-hub/test/http.test.ts`, and
 the first test of each route in `edits.test.ts`, against the mock hub and against a real daemon
 (fresh per test, `serve --demo`), and prints every check that differs. It needs Node 24, which
-imports the mock's TypeScript; a Windows `pitcrewd.exe` works as well as a Linux binary:
+imports the mock's TypeScript:
 
 ```bash
 cargo build -p pitcrew-daemon
@@ -135,7 +135,7 @@ request that changed this crate).
 
 `tests/serve.rs` starts the real binary on a temporary state directory and a free port, and
 covers `--version`, `token show-path`, tokens and scopes, the work routes (with the workspace,
-sessions, and a dispatch that is recorded and fails with 503), the stream (a move
+sessions, and a dispatch that answers 503 and records nothing), the stream (a move
 appears on it; a reconnect with `since` gets what it missed), hooks, terminals, CORS and the
 `Host` guard, the single-daemon lock, and on Unix a SIGTERM stop: a clean store, `--demo`
 refused afterwards, a stream closed with 1001, and a restart that keeps the token, the log and

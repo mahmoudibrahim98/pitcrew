@@ -4,8 +4,8 @@
 //! 1. The token registry, which locks the state directory: a second daemon stops here.
 //! 2. The store, with the work model's projections.
 //! 3. The workspace (`workspace.json` holds its name) and the one `WorkService` for the store,
-//!    with the hub's own machine (the workspace's local one) and a dispatcher that cannot reach
-//!    a runner yet.
+//!    with the hub's own machine (the workspace's local one). It has no dispatcher until the
+//!    runner link exists, so a dispatch answers 503 and records nothing.
 //! 4. With `--demo`: refuse a store with data, mint the tokens, seed the demo workspace.
 //! 5. The device token: reused from `device.token` while it still verifies, else minted.
 //! 6. The routes (`RouterParts`), the listener, and one line on stdout:
@@ -16,7 +16,7 @@
 //! checkpointing its WAL, and the lock is released last.
 
 use crate::cli::{ListenArg, ServeArgs};
-use crate::no_runner::{NoDispatcher, NoRunner};
+use crate::no_runner::NoRunner;
 use crate::state::{StateDir, read_token, read_workspace, write_token, write_workspace};
 use anyhow::{Context as _, bail};
 use axum::Extension;
@@ -135,8 +135,9 @@ fn open(state: &StateDir, demo: bool) -> anyhow::Result<Hub> {
 
     let workspace = hosted_workspace(state, &store, demo.as_ref())?;
     // The one writer of this store (hub-work's "One writer"): everything shares this `Arc`.
-    let work =
-        WorkService::new(Arc::clone(&store), workspace).with_dispatcher(Arc::new(NoDispatcher));
+    // No dispatcher until the runner link exists: a dispatch then answers 503 and records
+    // nothing, rather than appending a dispatch that can only fail.
+    let work = WorkService::new(Arc::clone(&store), workspace);
     let machines = match &demo {
         Some(demo) => demo.machines.clone(),
         None => work.machines().context("cannot list the machines")?,

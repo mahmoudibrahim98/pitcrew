@@ -263,7 +263,14 @@ fn demo_serves_the_work_model_with_real_tokens() {
     assert_eq!(session.status, 200, "{}", session.body);
     assert_eq!(session.json()["id"], id::SES1);
 
-    // A dispatch is recorded, then fails: no runner is attached yet.
+    // No runner is attached yet, so a dispatch is unavailable and records nothing: no dispatch,
+    // no session, and no assignment of the unassigned PAP-5.
+    let latest = |daemon: &Daemon| {
+        daemon.get("/v1/events?limit=1", Some(&device)).json()["to_rev"]
+            .as_u64()
+            .unwrap()
+    };
+    let before = latest(&daemon);
     let dispatch = daemon.post(
         "/v1/tasks/PAP-5/dispatch",
         Some(&device),
@@ -271,15 +278,9 @@ fn demo_serves_the_work_model_with_real_tokens() {
     );
     assert_eq!(dispatch.status, 503, "{}", dispatch.body);
     assert_eq!(dispatch.code(), "unavailable");
-    let page = daemon.get("/v1/events?limit=2", Some(&device)).json();
-    let types: Vec<_> = page["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| e["body"]["type"].as_str().unwrap().to_owned())
-        .collect();
-    assert_eq!(types, ["dispatch_finished", "session_ended"]);
-    assert_eq!(page["events"][0]["body"]["data"]["outcome"], "failed");
+    assert_eq!(latest(&daemon), before, "a dispatch appended events");
+    let pap5 = daemon.get("/v1/tasks/PAP-5", Some(&device)).json();
+    assert!(pap5["assignee"].is_null(), "{pap5}");
     let by_agent = daemon.post(
         "/v1/tasks/PAP-5/dispatch",
         Some(&agent),
