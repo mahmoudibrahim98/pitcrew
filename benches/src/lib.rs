@@ -5,12 +5,14 @@
 //! - `benches/*.rs`: criterion benchmarks, run with `cargo bench -p pitcrew-benches`.
 //! - [`inputs`]: synthetic transcripts, control-mode output and events. Nothing real.
 //! - [`probe`]: measures the delta stream from an append to the frame that carries it.
-//! - [`metrics`]: which benchmark measures which budget.
-//! - [`report`]: reads criterion's results, writes the JSON summary and compares it with
-//!   `benches/baseline.json`. The `pitcrew-bench-report` binary and `benches/run.sh` drive it.
+//! - [`metrics`]: which benchmark or timing test measures which budget.
+//! - [`external`]: reads the numbers other crates' timing tests print.
+//! - [`report`]: turns both into the JSON summary and compares it with `benches/baseline.json`.
+//!   The `pitcrew-bench-report` binary and `benches/run.sh` drive it.
 
 #![forbid(unsafe_code)]
 
+pub mod external;
 pub mod inputs;
 pub mod metrics;
 pub mod probe;
