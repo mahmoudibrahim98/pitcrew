@@ -327,8 +327,9 @@ pub(crate) mod unix {
     /// runtime or not (a runtime cannot be dropped inside another's context).
     fn peer_uid(stream: UnixStream) -> io::Result<(u32, UnixStream)> {
         std::thread::scope(|scope| {
-            scope
-                .spawn(move || {
+            std::thread::Builder::new()
+                .name("bridge-peer".to_owned())
+                .spawn_scoped(scope, move || {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_io()
                         .build()?;
@@ -339,7 +340,7 @@ pub(crate) mod unix {
                     let stream = stream.into_std()?;
                     stream.set_nonblocking(false)?;
                     Ok((uid, stream))
-                })
+                })?
                 .join()
                 .unwrap_or_else(|_| Err(io::Error::other("the peer check failed")))
         })
@@ -438,7 +439,10 @@ pub(crate) mod unix {
     }
 
     /// Waits up to 200 ms for the daemon to close its side of `socket` completely (both
-    /// directions: `POLLHUP`), and says whether it has.
+    /// directions: `POLLHUP`), and says whether it has. macOS's `poll` may never say so for a
+    /// unix socket: there the bridge ends when the client stops sending (or a write to the
+    /// daemon fails), not as soon as the daemon has closed. The client has read end of file by
+    /// then; one that closes (as an HTTP client does) ends it.
     fn hung_up(socket: &UnixStream) -> bool {
         use rustix::event::{PollFd, PollFlags, Timespec, poll};
         let mut fds = [PollFd::new(socket, PollFlags::empty())];
