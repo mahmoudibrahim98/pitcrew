@@ -114,6 +114,7 @@ export function SessionFilters({ value, onChange, className }: SessionFiltersPro
       {sections.map((section) => (
         <FacetSection
           key={section.name}
+          name={section.name}
           title={section.title}
           options={section.options}
           selected={value[section.name]}
@@ -127,6 +128,7 @@ export function SessionFilters({ value, onChange, className }: SessionFiltersPro
 }
 
 function FacetSection(props: {
+  name: FacetName;
   title: string;
   options: Option[];
   selected: readonly string[];
@@ -135,8 +137,8 @@ function FacetSection(props: {
   const id = useId();
   if (props.options.length === 0) return null;
   return (
-    <fieldset aria-labelledby={id} className="flex flex-col gap-0.5">
-      <legend id={id} className="mb-1 text-xs text-muted">
+    <fieldset aria-labelledby={id} data-facet={props.name} className="flex flex-col gap-0.5">
+      <legend id={id} className="mb-1 text-xs text-ink-2">
         {props.title}
       </legend>
       {props.options.map((option) => (
@@ -151,7 +153,7 @@ function FacetSection(props: {
             className="accent-(--pc-accent)"
           />
           <span className="min-w-0 flex-1 truncate">{option.label}</span>
-          <span className="text-xs text-muted tabular-nums">{option.count}</span>
+          <span className="text-xs text-ink-2 tabular-nums">{option.count}</span>
         </label>
       ))}
     </fieldset>

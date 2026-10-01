@@ -13,6 +13,12 @@ export interface SessionHeaderProps {
   sessionId: string;
   onOpenTask?: (task: Task) => void;
   onOpenWorkstream?: (workstream: Workstream) => void;
+  /**
+   * Where the task and workstream links point. With them the links are real links (they open in
+   * a new tab, and show their target); a plain click still calls `onOpenTask` or `onOpenWorkstream`.
+   */
+  taskHref?: (task: Task) => string;
+  workstreamHref?: (workstream: Workstream) => string;
   /** Placeholders until their flows exist: the menu shows them disabled without a handler. */
   onHandOff?: () => void;
   onFork?: () => void;
@@ -121,6 +127,7 @@ export function SessionHeader(props: SessionHeaderProps) {
             <LinkedWork
               label="Task"
               text={`${linkedTask.key} · ${linkedTask.title}`}
+              href={props.taskHref?.(linkedTask)}
               onOpen={onOpenTask === undefined ? undefined : () => onOpenTask(linkedTask)}
             />
           )}
@@ -128,6 +135,7 @@ export function SessionHeader(props: SessionHeaderProps) {
             <LinkedWork
               label="Workstream"
               text={linkedWorkstream.name}
+              href={props.workstreamHref?.(linkedWorkstream)}
               onOpen={onOpenWorkstream === undefined ? undefined : () => onOpenWorkstream(linkedWorkstream)}
             />
           )}
@@ -166,17 +174,48 @@ function PlaceholderItem({ label, onSelect }: { label: string; onSelect: (() => 
   );
 }
 
-function LinkedWork({ label, text, onOpen }: { label: string; text: string; onOpen: (() => void) | undefined }) {
+const LINK = 'truncate text-accent-text underline-offset-2 hover:underline';
+
+function LinkedWork({
+  label,
+  text,
+  href,
+  onOpen,
+}: {
+  label: string;
+  text: string;
+  href: string | undefined;
+  onOpen: (() => void) | undefined;
+}) {
+  let target = <span className="truncate">{text}</span>;
+  if (href !== undefined) {
+    target = (
+      <a
+        href={href}
+        className={LINK}
+        onClick={(event) => {
+          // A modified or middle click opens the link the browser's way (a new tab, a window).
+          if (onOpen === undefined || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+            return;
+          }
+          event.preventDefault();
+          onOpen();
+        }}
+      >
+        {text}
+      </a>
+    );
+  } else if (onOpen !== undefined) {
+    target = (
+      <button type="button" onClick={onOpen} className={LINK}>
+        {text}
+      </button>
+    );
+  }
   return (
     <span className="flex min-w-0 items-center gap-1">
-      <span className="text-muted">{label}</span>
-      {onOpen === undefined ? (
-        <span className="truncate">{text}</span>
-      ) : (
-        <button type="button" onClick={onOpen} className="truncate text-accent-text underline-offset-2 hover:underline">
-          {text}
-        </button>
-      )}
+      <span className="text-ink-2">{label}</span>
+      {target}
     </span>
   );
 }

@@ -136,7 +136,18 @@ function ChatViewBody({ sessionId, pageSize, className }: ChatViewProps) {
     >
       {plan !== undefined && <PlanBar plan={plan} />}
       <div className="relative min-h-0 flex-1">
-        <div ref={scrollRef} data-virtual-scroller="" onScroll={onScroll} className="h-full overflow-y-auto">
+        {/* Focusable but not a tab stop: the key that moves between panes lands here, and the
+            arrow and Page keys then scroll the transcript. */}
+        <div
+          ref={scrollRef}
+          data-virtual-scroller=""
+          data-chat-scroller=""
+          role="group"
+          aria-label="Transcript"
+          tabIndex={-1}
+          onScroll={onScroll}
+          className="h-full overflow-y-auto outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent"
+        >
           <div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
             {virtualizer.getVirtualItems().map((item) => {
               const row = rows[item.index];

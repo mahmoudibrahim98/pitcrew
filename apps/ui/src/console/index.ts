@@ -1,12 +1,105 @@
-// The Agent console's public surface. Importing this file loads no console code: each component
-// is a lazy chunk fetched on first render (render them inside a <Suspense>), and markdown and
-// diff parsing run in their own worker chunk. `feature` registers the console with the shell (its
-// interface is in src/shell/README.md); stream M's wiring brief fills it in.
+// The Agent console's public surface. `feature` registers it with the shell (src/shell/README.md):
+// the routes `console` and `console/$session`, palette commands and a "+ New" item. The app loads
+// this file at start, so it stays small: the page and every component are lazy chunks (render the
+// components inside a <Suspense>), and markdown and diff parsing run in their own worker chunk.
 
+import { createRoute, lazyRouteComponent, type AnyRoute } from '@tanstack/react-router';
 import { lazy } from 'react';
-import { defineFeature } from '../shell/index.ts';
+import { defineFeature, type Command, type WorkspaceRoute } from '../shell/index.ts';
+import { requestConsole, type ConsoleIntent } from './intent.ts';
 
-export const feature = defineFeature({ id: 'console', layout: 'console' });
+function routes(parent: WorkspaceRoute): AnyRoute[] {
+  // One page for both paths: the list stays put while the chosen session changes.
+  const consoleRoute = createRoute({
+    getParentRoute: () => parent,
+    path: 'console',
+    staticData: { layout: 'console', title: 'Agent console' },
+    component: lazyRouteComponent(() => import('./console-page.tsx'), 'ConsolePage'),
+  });
+  return [
+    consoleRoute.addChildren([
+      createRoute({ getParentRoute: () => consoleRoute, path: '/' }),
+      createRoute({ getParentRoute: () => consoleRoute, path: '$session' }),
+    ]),
+  ];
+}
+
+const ask =
+  (intent: ConsoleIntent): Command['run'] =>
+  (context) =>
+    requestConsole(context, intent);
+
+const GROUP = 'Agent console';
+
+const commands: Command[] = [
+  {
+    id: 'console-open',
+    label: 'Go to the Agent console',
+    group: 'Go to',
+    keywords: ['open', 'console', 'sessions', 'agents'],
+    run: (context) => context.go('console'),
+  },
+  {
+    id: 'console-jump',
+    label: 'Jump to a session…',
+    group: GROUP,
+    keywords: ['switch', 'pick', 'session list', 'agents'],
+    run: ask({ kind: 'list' }),
+  },
+  {
+    id: 'console-filter-machine',
+    label: 'Filter sessions by machine…',
+    group: GROUP,
+    keywords: ['host', 'computer', 'cluster'],
+    run: ask({ kind: 'facet', facet: 'machine' }),
+  },
+  {
+    id: 'console-filter-state',
+    label: 'Filter sessions by state…',
+    group: GROUP,
+    keywords: ['status', 'working', 'waiting', 'idle', 'ended'],
+    run: ask({ kind: 'facet', facet: 'state' }),
+  },
+  {
+    id: 'console-waiting',
+    label: 'Show sessions waiting for input',
+    group: GROUP,
+    keywords: ['needs me', 'blocked', 'question', 'filter'],
+    run: ask({ kind: 'state', state: 'waiting' }),
+  },
+  {
+    id: 'console-working',
+    label: 'Show working sessions',
+    group: GROUP,
+    keywords: ['running', 'busy', 'filter'],
+    run: ask({ kind: 'state', state: 'working' }),
+  },
+  {
+    id: 'console-clear-filters',
+    label: 'Clear the session filters',
+    group: GROUP,
+    keywords: ['reset', 'all sessions'],
+    run: ask({ kind: 'clear' }),
+  },
+];
+
+export const feature = defineFeature({
+  id: 'console',
+  layout: 'console',
+  routes,
+  // The shell's own "Agent console" entry (with its working and waiting counts) is the console's
+  // place in the sidebar; the console adds none of its own.
+  commands: commands.map((command) => ({ ...command, layout: 'both' })),
+  create: [
+    {
+      id: 'session',
+      label: 'Session',
+      title: 'New session',
+      order: 25,
+      dialog: lazy(() => import('./new-session.tsx')),
+    },
+  ],
+});
 
 export const SessionList = lazy(() => import('./session-list.tsx').then((m) => ({ default: m.SessionList })));
 export const SessionListView = lazy(() =>
@@ -29,4 +122,4 @@ export type { ComposerProps } from './composer.tsx';
 export type { QuestionCardProps } from './question-card.tsx';
 export type { SessionFiltersProps } from './session-filters.tsx';
 export type { SessionHeaderProps } from './session-header.tsx';
-export type { SessionListProps, SessionListViewProps } from './session-list.tsx';
+export type { SelectVia, SessionListProps, SessionListViewProps } from './session-list.tsx';
