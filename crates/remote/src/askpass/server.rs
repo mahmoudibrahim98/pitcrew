@@ -151,35 +151,32 @@ fn listen(_dir: &Path, name: &str, shared: Arc<Shared>) -> io::Result<(String, J
             .reject_remote_clients(true)
             .create(addr)
     };
-    // `first_pipe_instance` fails if the name exists, so nobody can have squatted it.
+    // `first_pipe_instance` fails if the name exists, so nobody can have squatted it. From then
+    // on an instance of ours always exists: the replacement is created before the previous one
+    // is handed off or dropped, so the name never lapses for another user to take.
     let first = create(&addr, true)?;
     let task = {
         let addr = addr.clone();
         tokio::spawn(async move {
             let mut conns = JoinSet::new();
-            let mut next = Some(first);
-            let mut delay = Duration::from_millis(50);
+            let mut server = first;
             loop {
-                // A new instance can fail for a moment (e.g. under load); retry rather than
-                // leave ssh with nobody to ask.
-                let server = match next.take() {
-                    Some(server) => server,
-                    None => match create(&addr, false) {
-                        Ok(server) => {
-                            delay = Duration::from_millis(50);
-                            server
-                        }
+                let connected = server.connect().await.is_ok();
+                // Creating can fail for a moment (e.g. under load): retry with back-off,
+                // holding on to the current instance meanwhile.
+                let mut delay = Duration::from_millis(50);
+                let next = loop {
+                    match create(&addr, false) {
+                        Ok(next) => break next,
                         Err(_) => {
                             tokio::time::sleep(delay).await;
                             delay = (delay * 2).min(Duration::from_secs(2));
-                            continue;
                         }
-                    },
+                    }
                 };
-                if server.connect().await.is_ok() {
-                    // The next instance first, so a client never finds the name missing.
-                    next = create(&addr, false).ok();
-                    track(&mut conns, server, &shared);
+                let current = std::mem::replace(&mut server, next);
+                if connected {
+                    track(&mut conns, current, &shared);
                 }
             }
         })
@@ -427,18 +424,29 @@ mod tests {
         .await
         .unwrap();
         assert_eq!((code, out.as_str()), (client::EXIT_ANSWERED, "yes\n"));
+        // "No" to a yes/no question is answered, and the call goes on.
+        let (code, out) = spawn_client(&env, "Accept updated hostkeys? (yes/no): ")
+            .await
+            .unwrap();
+        assert_eq!((code, out.as_str()), (client::EXIT_ANSWERED, "no\n"));
         assert!(!server.refused());
 
+        // A listener without the key: no answer, which the program turns into stopping ssh.
         let mut wrong = env.clone();
         wrong[1].1 = to_hex(&[7u8; KEY_LEN]);
         let (code, out) = spawn_client(&wrong, "Password: ").await.unwrap();
-        assert_eq!((code, out.as_str()), (client::EXIT_FAILED, ""));
+        assert_eq!((code, out.as_str()), (client::EXIT_NO_ANSWER, ""));
+        let mut broken = env.clone();
+        broken[1].1 = "not hex".to_owned();
+        let (code, _) = spawn_client(&broken, "Password: ").await.unwrap();
+        assert_eq!(code, client::EXIT_NO_ANSWER);
 
         assert_eq!(
             handler.kinds(),
             [
                 ("cluster".to_owned(), PromptKind::Password),
                 ("cluster".to_owned(), PromptKind::HostKey),
+                ("cluster".to_owned(), PromptKind::Confirm),
             ]
         );
     }
@@ -473,8 +481,14 @@ mod tests {
         );
 
         drop(server);
-        assert_eq!(first.await.unwrap(), (client::EXIT_FAILED, String::new()));
-        assert_eq!(second.await.unwrap(), (client::EXIT_FAILED, String::new()));
+        assert_eq!(
+            first.await.unwrap(),
+            (client::EXIT_NO_ANSWER, String::new())
+        );
+        assert_eq!(
+            second.await.unwrap(),
+            (client::EXIT_NO_ANSWER, String::new())
+        );
     }
 
     /// ssh closes a notice by killing askpass: the handler's token fires, and the prompt no
@@ -527,7 +541,10 @@ mod tests {
             .await
             .unwrap();
         assert!(password.is_cancelled());
-        assert_eq!(pending.await.unwrap(), (client::EXIT_FAILED, String::new()));
+        assert_eq!(
+            pending.await.unwrap(),
+            (client::EXIT_NO_ANSWER, String::new())
+        );
     }
 
     #[test]

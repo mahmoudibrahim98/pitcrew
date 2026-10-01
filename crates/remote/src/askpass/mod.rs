@@ -18,13 +18,17 @@
 //! 2. server → `{"nonce":Ns,"proof":HMAC(K,"server",Nc,Ns)}`; the client checks it.
 //! 3. client → `{"proof":HMAC(K,"client",Nc,Ns,kind,prompt),"kind":…,"prompt":…}`; the server
 //!    checks it, asks the handler, and answers:
-//! 4. server → `{"reply":"text","text":…}` or `{"reply":"accept"}`.
+//! 4. server → `{"reply":"text","text":…}`, `{"reply":"accept"}` (prints `yes`) or, for a
+//!    yes/no question only, `{"reply":"decline"}` (prints `no`).
 //!
-//! **A cancel is never answered.** When askpass fails, OpenSSH sends an empty password (a
-//! failed login that faillock or fail2ban count) and asks again. So on a cancel the server
-//! tells [`crate::Ssh::run`], which kills ssh and everything it started (its process group, on
-//! Unix) before the connection closes. Later prompts in the same call are held, unanswered and
-//! unseen by the user, until then.
+//! **ssh never sees askpass fail.** When askpass fails, OpenSSH sends an empty password (a
+//! failed login that faillock or fail2ban count) and asks again. So:
+//! - on a cancel the server never answers; it tells [`crate::Ssh::run`], which kills ssh and
+//!   everything it started (its process group on Unix, its Job Object on Windows) before the
+//!   connection closes. Later prompts in the same call are held, unanswered and unseen;
+//! - when the bridge goes away without an answer (the app quit or crashed, or the handshake
+//!   failed), `pitcrew-askpass` stops the ssh that asked instead of failing: on Unix it kills
+//!   it, on Windows it waits until the Job Object ends them both. See [`client::Parent`].
 
 pub mod client;
 pub(crate) mod server;
@@ -55,7 +59,8 @@ pub enum PromptKind {
     Otp,
     /// Whether to trust an unknown host key. Show it as a trust dialog with the fingerprint.
     HostKey,
-    /// A yes/no confirmation, e.g. before using an agent key.
+    /// A yes/no confirmation, e.g. before using an agent key, or `UpdateHostKeys=ask`'s "Accept
+    /// updated hostkeys?" (keys the server signed with the key already trusted).
     Confirm,
     /// Information only (e.g. "touch your security key"); ssh closes it when done.
     Notice,
@@ -105,8 +110,9 @@ pub enum Reply {
     /// Yes: trust the host key, or confirm. Refused (as a cancel) for a password, passphrase or
     /// one-time code.
     Accept,
-    /// No, or the dialog was closed. ssh is stopped at once; the call fails with
-    /// [`crate::SshError::Cancelled`].
+    /// No, or the dialog was closed. For a [`PromptKind::Confirm`] this answers "no" and the
+    /// call goes on, as ssh expects. For anything else ssh is stopped at once and the call fails
+    /// with [`crate::SshError::Cancelled`].
     Cancel,
 }
 
@@ -219,6 +225,11 @@ pub fn classify(prompt: &str, hint: Option<&str>) -> PromptKind {
         && (text.contains("continue connecting") || text.contains("authenticity of host"))
     {
         PromptKind::HostKey
+    } else if !from_server && text.starts_with("accept updated hostkeys?") {
+        // `UpdateHostKeys=ask` in the user's config. A yes/no question, so a Confirm: Accept
+        // answers "yes". Kept rather than overridden with `UpdateHostKeys=no`, so PitCrew's
+        // calls learn rotated keys as the user chose.
+        PromptKind::Confirm
     } else if !from_server && text.contains("passphrase") {
         PromptKind::Passphrase
     } else if text.contains("verification code")
@@ -264,20 +275,26 @@ pub(crate) struct Ask {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "reply", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum WireReply {
-    Text { text: String },
+    Text {
+        text: String,
+    },
+    /// Printed as `yes`.
     Accept,
+    /// Printed as `no`; only for a yes/no question, where no credential is involved.
+    Decline,
 }
 
 impl WireReply {
-    /// What may be sent for `kind`: an answer of the wrong type is refused, like a cancel, so a
-    /// mislabelled prompt cannot turn a click into "yes" for a password or a typed secret into
-    /// an answer to a yes/no question.
+    /// What may be sent for `kind`, or `None` to stop ssh without answering. An answer of the
+    /// wrong type is refused, like a cancel, so a mislabelled prompt cannot turn a click into
+    /// "yes" for a password or a typed secret into an answer to a yes/no question.
     pub(crate) fn for_prompt(kind: PromptKind, reply: Reply) -> Option<Self> {
         match reply {
             Reply::Text(secret) if kind != PromptKind::Confirm => Some(Self::Text {
                 text: secret.expose().to_owned(),
             }),
             Reply::Accept if !kind.is_secret() => Some(Self::Accept),
+            Reply::Cancel if kind == PromptKind::Confirm => Some(Self::Decline),
             Reply::Text(_) | Reply::Accept | Reply::Cancel => None,
         }
     }
@@ -288,6 +305,7 @@ impl fmt::Debug for WireReply {
         match self {
             Self::Text { .. } => f.write_str("Text(<redacted>)"),
             Self::Accept => f.write_str("Accept"),
+            Self::Decline => f.write_str("Decline"),
         }
     }
 }
@@ -421,6 +439,16 @@ mod tests {
             ),
             ("Allow use of key?", Some("confirm"), PromptKind::Confirm),
             (
+                "Accept updated hostkeys? (yes/no): ",
+                None,
+                PromptKind::Confirm,
+            ),
+            (
+                "(u@cluster) Accept updated hostkeys? (yes/no): ",
+                None,
+                PromptKind::Password,
+            ),
+            (
                 "Confirm user presence for key",
                 Some("none"),
                 PromptKind::Notice,
@@ -463,12 +491,17 @@ mod tests {
         assert!(WireReply::for_prompt(HostKey, Reply::Accept).is_some());
         // A host key may be answered with its fingerprint.
         assert!(WireReply::for_prompt(HostKey, text()).is_some());
-        for kind in [Password, Passphrase, Otp, HostKey, Confirm, Notice] {
+        for kind in [Password, Passphrase, Otp, HostKey, Notice] {
             assert!(
                 WireReply::for_prompt(kind, Reply::Cancel).is_none(),
                 "{kind:?}"
             );
         }
+        // "No" to a yes/no question is an answer, not a reason to stop ssh.
+        assert!(matches!(
+            WireReply::for_prompt(Confirm, Reply::Cancel),
+            Some(WireReply::Decline)
+        ));
     }
 
     #[tokio::test]

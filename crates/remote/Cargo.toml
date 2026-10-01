@@ -30,8 +30,20 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "
 getrandom = "=0.3.4"
 
 [target.'cfg(unix)'.dependencies]
-# Effective uid without unsafe code. The version tempfile already uses.
+# Effective uid, process groups, parent pid and pidfds without unsafe code. The version
+# tempfile already uses.
 rustix = { version = "=1.1.5", features = ["process"] }
+
+[target.'cfg(windows)'.dependencies]
+# Job Objects for ssh (src/job.rs) and the pipe client's security flags. The version tokio
+# already uses.
+windows-sys = { version = "=0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 proptest.workspace = true
