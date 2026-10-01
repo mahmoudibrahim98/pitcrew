@@ -6,7 +6,7 @@ The daemon's HTTP and WebSocket API, as the desktop UI and the `pitcrew` CLI use
   enums are `snake_case` strings; ids are bare 26-character ULIDs; times are UTC milliseconds.
 - **The real server** is stream H (`crates/api`). **The mock** is `apps/mock-hub`, which serves
   `crates/fixtures/data/demo-workspace.json` and implements every route below with in-memory
-  state. The UI streams build against the mock. If the two disagree, this document wins, and the
+  state (recaps come from `demo-recaps.json` beside it). The UI streams build against the mock. If the two disagree, this document wins, and the
   one that is wrong gets fixed.
 - **Changes** go through a contract change (`s/0/contract-…`). Adding an optional field or a new
   route is not breaking. Removing or renaming anything is, and bumps `PROTOCOL_VERSION`.
@@ -227,6 +227,124 @@ be contiguous. Pass `from_rev` as `before` for the previous page. Default limit 
 - **Without the index**, `project` and `workstream` answer `400 invalid`, and `task` and
   `session` match only events that name them.
 
+### Recaps
+
+| Method and path | Body → response | Notes |
+|---|---|---|
+| `GET /v1/recaps/blocks?session=&task=&workstream=&project=&before=&limit=` | → `BlocksPage` | Activity blocks, newest first, each with its line. See "Recap blocks". |
+| `GET /v1/recaps/days?workstream=\|project=&tz=&before=&limit=` | → `DaysPage` | Day paragraphs, newest day first. See "Recap days". |
+
+Both need a device token, like the activity log they summarise. The types are in
+`crates/protocol/src/recap.rs`; the recap engine (`crates/recap`, stream F) computes them.
+
+**Recap types.**
+- `BlocksPage`: `{ "blocks": RecapBlock[], "at_start": bool }`, where `RecapBlock` is
+  `{ "block": Block, "line": Summary }`.
+- `DaysPage`: `{ "days": DayRecap[], "at_start": bool }`, where `DayRecap` is
+  `{ "workstream"?: WorkstreamId, "date": Date, "blocks": EventId[], "summary": Summary }` and
+  `blocks` are the ids of the blocks the paragraph covers, by start.
+- `Block` is a burst of one session's work, or of one workstream's (or project's) work outside any
+  session, with no pause longer than the engine's gap (20 minutes):
+  `{ "id": EventId, "last": EventId, "key": BlockKey, "start", "end", "session"?, "workstream"?,
+  "project"?, "tasks": TaskId[], "agent"?: MemberId, "actors": MemberId[], "counts": Counts,
+  "files": FileTouch[], "files_omitted", "facts": Fact[], "facts_omitted",
+  "tool_receipts": Receipt[], "turn_receipts": Receipt[] }`.
+  - `id` is its first event's id and `last` its last's; `start` and `end` are their times.
+  - `BlockKey` is `{ "kind": "session" | "workstream" | "project", "id" }`.
+  - Lists are capped (8 tasks, 8 actors, 20 files, 24 facts, with `files_omitted` and
+    `facts_omitted` counting the rest); `counts` never are.
+- `Fact`: `{ "by": MemberId, "at", "kind": FactKind, "receipts": Receipt[] }`. `FactKind` is
+  tagged by `type`, with its fields beside the tag: `session_started`, `session_linked`,
+  `session_waiting`, `session_ended`, `dispatch_started`, `dispatch_finished`, `task_created`,
+  `task_moved`, `task_assigned`, `plan_updated`, `checks` (`check` is `tests`, `lint` or `build`),
+  `job_diverged`, `ask_raised`, `ask_answered`, `commented`, `decision_recorded`,
+  `workstream_created`, `workstream_changed`, `brief_accepted`.
+- `Summary`: `{ "text": String, "spans": Span[] }`, where `Span` is
+  `{ "range": { "start": usize, "end": usize }, "receipts": Receipt[] }`.
+
+**Spans are UTF-8 byte ranges.** `range.start` and `range.end` are byte offsets into the UTF-8
+encoding of `text`, on character boundaries, with `start < end`. Spans come in order and never
+overlap; the text between them is only the punctuation and spaces that join clauses. Every span
+has at least one receipt. JavaScript strings are UTF-16, so the UI converts before slicing:
+`text.slice(start, end)` is wrong as soon as the text holds a character outside ASCII (`−`, `é`, an
+emoji). Slice the bytes (`new TextEncoder().encode(text).subarray(start, end)`, then decode), or
+map byte offsets to string indices once per summary.
+
+**Recap blocks** (`GET /v1/recaps/blocks`):
+- Newest first, by block id (a ULID, so in the order the blocks began). `before` is a block id,
+  exclusive: pass the last block's `id` for the previous page. Any well-formed event id works as
+  `before`.
+- `limit` defaults to 50; more than 200 counts as 200; `limit=0` is 400.
+- **Only `at_start` ends paging.** A page may hold fewer than `limit` blocks, but a page that is
+  not at the start holds at least one.
+- **Filters combine** (a block must match every one given) and match the block's links: `session`
+  its `session`, `task` one of its `tasks`, `workstream` its `workstream`, `project` its `project`.
+  - The engine sets those links by following them as they were when the block's events happened,
+    as the activity index does. A session's block carries the session's task, workstream and
+    project, so `task` matches the turns, tool runs and edits of a session linked to the task, and
+    the `dispatch_finished` and `ask_answered` the engine places in that session's blocks.
+  - A block's links are those after its latest event. `tasks` lists the first 8 tasks touched, and
+    `task` matches only those. `task` takes the task's id, not its key.
+- Without filters: every block in the workspace, those of unlinked sessions included.
+
+**Recap days** (`GET /v1/recaps/days`):
+- Exactly one of `workstream` or `project`; neither or both is 400.
+  - `workstream`: one entry per day with activity, the paragraph over the blocks whose
+    `workstream` it is.
+  - `project`: from the blocks whose `project` it is, one entry per workstream per day, plus one
+    per day, without `workstream`, for the project's work outside any workstream (its tasks
+    without one, and their sessions).
+- `tz` is where days begin, in whole minutes east of UTC (`120` for UTC+2, `-300` for UTC−5), from
+  −840 to 840; default 0. A block belongs to the day its `start` falls on at that offset. It is a
+  fixed offset, not a time zone: send the offset in force for the days shown.
+- Newest date first; within a date, the entry without a workstream first, then by workstream id.
+- `before` is a date (`YYYY-MM-DD`), exclusive: pass the last entry's `date` for the previous page.
+  `limit` counts dates, not entries: default 7, more than 30 counts as 30, `limit=0` is 400. A
+  page holds every entry of its dates; a day without activity has no entry.
+- `at_start` is true when no older day has an entry. A page that is not at the start holds at
+  least one date.
+
+**Recap errors.** `400 invalid` for a malformed id (neither a bare ULID nor its prefixed form),
+date, `tz` or `limit`. An unknown id gives an empty page with `at_start: true`, as in the activity
+route.
+
+**What recaps are:**
+- **Derived, never stored.** The hub computes recaps from the event log with the recap engine; no
+  event records them. A block covers the log from `id` to `last`, and a day its blocks, so the hub
+  may cache them by the range of events they cover and recompute when that range grows.
+- **Open blocks grow.** While a block's last event is within the gap (20 minutes) of the newest
+  activity, it may still grow: the same `id` comes back with a later `last`, more counts and
+  facts, and a new line, and its day's paragraph changes with it. Older blocks no longer change.
+- **Receipts are readable.** Every receipt in a block or a span points at an event
+  (`GET /v1/events`), a transcript record (`GET /v1/sessions/{id}/transcript`), a job, a file or a
+  commit that the caller can read.
+- **Text is untrusted.** Lines and paragraphs are the engine's cleaned text (control and
+  direction-changing characters removed, lengths capped), but they quote titles, paths and
+  summaries that agents and people wrote. Render them as text, never as HTML or markdown.
+- Today the hub writes lines and paragraphs with the engine's rules (`RuleSummarizer`). A model
+  may write them later; the shape and the span rules stay the same.
+
+**Live updates.** Recaps have no event or stream frame of their own: they change only when events
+arrive, so the data layer refetches them when the activity they cover changes:
+- Keys: `['recaps', 'blocks', filters]` and `['recaps', 'days', { workstream } | { project }, tz]`.
+- On each `events` frame, for each event:
+  - `machine_added`, `machine_liveness`, `persona_saved`, `team_saved`, `project_created` and
+    `brief_proposed` are not activity: they change no recap.
+  - `member_added` may rename someone a line names: invalidate every `['recaps']` key.
+  - Any other event: find its scope as the activity route's filters would. That is the session,
+    task, workstream and project it names, plus their parents from the cache (a session's task and
+    workstream, a task's workstream and project, a workstream's project); `dispatch_finished` and
+    `ask_answered` resolve through their dispatch or ask. For `session_linked`, and `task_updated`
+    with a `workstream`, take both the old links and the new.
+  - Invalidate the unfiltered blocks key, and every recap key whose `session`, `task`,
+    `workstream` or `project` is in that scope.
+- When the cache cannot resolve a link, invalidate every `['recaps']` key: always correct, only
+  slower.
+
+**The mock** serves both routes from `crates/fixtures/data/demo-recaps.json`, the engine's recaps
+of the demo's events. They do not change with what you do through the mock, and it has days for
+`tz=0` only: any other `tz` is `400 invalid`.
+
 ### Hooks
 
 | Method and path | Body → response | Notes |
@@ -248,7 +366,8 @@ be contiguous. Pass `from_rev` as `before` for the previous page. Default limit 
 - Agents and hooks use HTTP; the stream is for `device` tokens in v1.
 - **Client rule:** keep server state in TanStack Query, and on each event invalidate exactly the
   keys it touches (e.g. `task_moved` → that task, its lists and its workstream; `task_updated` →
-  that task, its lists, and its old and new workstream).
+  that task, its lists, and its old and new workstream). Recaps have a rule of their own (see
+  "Recaps", "Live updates").
 
 ## Terminals: `GET /v1/sessions/{id}/terminal?cols=&rows=&from=` (WebSocket, device tokens)
 
