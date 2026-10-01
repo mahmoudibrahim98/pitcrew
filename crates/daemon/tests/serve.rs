@@ -4,7 +4,9 @@
 
 mod common;
 
-use common::{Daemon, Frame, Ws, id, request, run};
+#[cfg(unix)]
+use common::Frame;
+use common::{Daemon, Ws, id, request, run};
 use serde_json::{Value, json};
 use std::ffi::OsStr;
 use std::path::Path;
