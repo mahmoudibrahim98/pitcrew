@@ -3,6 +3,7 @@
 use std::collections::{VecDeque, hash_map::RandomState};
 use std::hash::BuildHasher;
 use std::io::{self, Read, Write};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command as ProcessCommand, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -16,20 +17,33 @@ use pitcrew_runtime::detect::{DetectError, detect_tmux};
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 struct PrivateServer {
-    socket: String,
-    directory: std::path::PathBuf,
-    sentinel: std::path::PathBuf,
+    socket: PathBuf,
+    directory: PathBuf,
+    sentinel: PathBuf,
 }
 
 impl PrivateServer {
-    fn new(socket: String) -> Self {
-        let directory = std::env::temp_dir().join(&socket);
+    fn new(name: &str) -> Self {
+        // A socket path is limited to 104 bytes on macOS (108 on Linux), and
+        // macOS's temp_dir() alone is about 50, so use /tmp/<name>/s on Unix.
+        #[cfg(unix)]
+        let base = PathBuf::from("/tmp");
+        #[cfg(not(unix))]
+        let base = std::env::temp_dir();
+        let directory = base.join(name);
+        let socket = directory.join("s");
+        assert!(
+            socket.as_os_str().len() < 100,
+            "socket path too long: {}",
+            socket.display()
+        );
         let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
             builder.mode(0o700);
         }
+        // Not create_all: the directory must be new, and so ours, even in a shared /tmp.
         builder
             .create(&directory)
             .expect("private socket directory");
@@ -42,7 +56,10 @@ impl PrivateServer {
 
     fn command(&self) -> ProcessCommand {
         let mut command = ProcessCommand::new("tmux");
-        command.args(["-L", &self.socket, "-f", "/dev/null", "-u"]);
+        command
+            .arg("-S")
+            .arg(&self.socket)
+            .args(["-f", "/dev/null", "-u"]);
         command
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")
@@ -72,16 +89,9 @@ impl Drop for PrivateServer {
             .stderr(Stdio::null())
             .status();
         let _ = std::fs::remove_file(&self.sentinel);
-        // tmux puts -L sockets in TMUX_TMPDIR/tmux-<uid>. Only this test owns
-        // the parent directory; remove its socket even if the server died.
-        if let Ok(entries) = std::fs::read_dir(&self.directory) {
-            for entry in entries.flatten() {
-                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                    let _ = std::fs::remove_file(entry.path().join(&self.socket));
-                    let _ = std::fs::remove_dir(entry.path());
-                }
-            }
-        }
+        // Remove the socket even if the server died. Anything else left in the
+        // directory makes remove_dir fail, which the test's last check reports.
+        let _ = std::fs::remove_file(&self.socket);
         let _ = std::fs::remove_dir(&self.directory);
     }
 }
@@ -215,8 +225,8 @@ fn real_tmux_replies_output_and_literal_injection_attempts() {
         Ok(version) => eprintln!("testing tmux {version}"),
     }
     let random = RandomState::new().hash_one((std::process::id(), SystemTime::now()));
-    let name = format!("pitcrew-test-{random:016x}");
-    let server = PrivateServer::new(name.clone());
+    let name = format!("pc-{:012x}", random & 0xffff_ffff_ffff);
+    let server = PrivateServer::new(&name);
     assert!(!server.sentinel.exists());
     // -d creates a detached session. Then attach a persistent control client to
     // receive pane output; detached control clients exit after the initial reply.

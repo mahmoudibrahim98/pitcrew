@@ -71,9 +71,10 @@ startup of its own fixed, trusted test program.
 Run `cargo test -p pitcrew-runtime`. Table tests cover every supported notification and key;
 property tests exercise arbitrary stream boundaries, Unicode quoting through an independent
 double-quote lexer model, and replay reads against an unbounded `Vec<u8>` model.
-The real-tmux test uses a random private socket,
-skips with a diagnostic when tmux is absent, and cleans up its clients and server on failure.
-Unknown and unsupported versions also skip. The private socket file and directory are removed.
+The real-tmux test uses a random private socket (`-S /tmp/pc-<12 hex>/s` on Unix, short enough
+for macOS's 104-byte limit), skips with a diagnostic when tmux is absent, and cleans up its
+clients and server on failure. Unknown and unsupported versions also skip. The private socket
+file and directory are removed.
 It verifies successful and failed replies, literal window names without format side effects,
 delivery after cancelling copy mode, binary input, and literal text containing quotes,
 semicolons, backslashes, variables, shell-looking text, newlines, formats, and Unicode.
