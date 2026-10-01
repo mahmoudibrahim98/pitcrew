@@ -15,7 +15,8 @@
 //! - while a transcript is hot, its folder and that folder's parent (sub-agent and day folders).
 //!
 //! A slow sweep re-checks every transcript by size and mtime. Homes on network filesystems are
-//! polled instead, and swept and rediscovered [`NETWORK_SLOWDOWN`] times less often.
+//! polled instead, and swept and rediscovered [`NETWORK_SLOWDOWN`] times less often; a hook for
+//! an unknown session never makes them look sooner.
 //!
 //! The same thread applies states reported by hooks and the runtime ([`Signal`]s), so they and
 //! the transcripts agree (see `derive::report`), and links sessions to workstreams. It also
@@ -117,7 +118,11 @@ struct Signals {
     dirty: HashMap<PathBuf, Dirty>,
     /// Too many dirty paths, or lost events: check every transcript instead.
     overflow: bool,
+    /// When to run discovery in every home (asked for, or events were lost).
     rediscover_at: Option<Instant>,
+    /// When to look for new transcripts in the homes that are not slow (network homes keep their
+    /// own, rarer schedule): a new file appeared, or a hook named an unknown session.
+    look_at: Option<Instant>,
     stop: bool,
     notify_warned_at: Option<Instant>,
     /// Reported states, in arrival order.
@@ -154,7 +159,7 @@ impl Shared {
             if s.dirty.len() >= MAX_DIRTY_PATHS {
                 s.overflow = true;
                 if created {
-                    s.rediscover_at = Some(s.rediscover_at.map_or(due, |r| r.min(due)));
+                    s.look_at = Some(s.look_at.map_or(due, |r| r.min(due)));
                 }
                 continue;
             }
@@ -543,7 +548,7 @@ impl Watcher {
             }
             let now = Instant::now();
             let mut next = deadline;
-            if let Some(r) = s.rediscover_at {
+            for r in [s.rediscover_at, s.look_at].into_iter().flatten() {
                 next = next.min(r);
             }
             if let Some(d) = s.dirty.values().map(|d| d.due).min() {
@@ -563,11 +568,16 @@ impl Watcher {
                 if rediscover {
                     s.rediscover_at = None;
                 }
+                let look = s.look_at.is_some_and(|r| r <= now);
+                if look {
+                    s.look_at = None;
+                }
                 let overflow = std::mem::take(&mut s.overflow);
                 return Some(Wake {
                     due,
                     overflow,
                     rediscover,
+                    look,
                     reports: s.reports.drain(..).collect(),
                     relink: std::mem::take(&mut s.relink),
                 });
@@ -600,15 +610,13 @@ impl Watcher {
         }
         if maybe_new {
             // A new file or folder in a watched folder: maybe a new session.
-            let at = self
-                .last_rediscover
-                .map_or(now, |l| after(l, REDISCOVER_GAP))
-                .max(after(now, self.timing.debounce));
-            let mut s = self.shared.lock();
-            s.rediscover_at = Some(s.rediscover_at.map_or(at, |r| r.min(at)));
+            self.look_soon(now);
         }
         let due: Vec<usize> = (0..self.homes.len())
-            .filter(|&h| wake.rediscover || self.homes[h].next_rediscover <= now)
+            .filter(|&h| {
+                let home = &self.homes[h];
+                wake.rediscover || (wake.look && !home.slow) || home.next_rediscover <= now
+            })
             .collect();
         if !due.is_empty() {
             self.rediscover(&due)?;
@@ -1364,13 +1372,19 @@ impl Watcher {
         let now = Instant::now();
         if self.held.hold(engine, native_id, sender, report, now) {
             // Its transcript may have just appeared.
-            let at = self
-                .last_rediscover
-                .map_or(now, |l| after(l, REDISCOVER_GAP))
-                .max(after(now, self.timing.debounce));
-            let mut s = self.shared.lock();
-            s.rediscover_at = Some(s.rediscover_at.map_or(at, |r| r.min(at)));
+            self.look_soon(now);
         }
+    }
+
+    /// Looks for new transcripts soon in the homes that are not slow, at most once per
+    /// [`REDISCOVER_GAP`]. Slow (network) homes keep their own schedule.
+    fn look_soon(&self, now: Instant) {
+        let at = self
+            .last_rediscover
+            .map_or(now, |l| after(l, REDISCOVER_GAP))
+            .max(after(now, self.timing.debounce));
+        let mut s = self.shared.lock();
+        s.look_at = Some(s.look_at.map_or(at, |r| r.min(at)));
     }
 
     /// Workstream locations and the session's standing link, when linking is on.
@@ -1485,7 +1499,10 @@ struct Wake {
     /// Due paths, each with whether it may be a new file.
     due: Vec<(PathBuf, bool)>,
     overflow: bool,
+    /// Discover in every home.
     rediscover: bool,
+    /// Discover in the homes that are not slow.
+    look: bool,
     reports: Vec<Signal>,
     relink: bool,
 }

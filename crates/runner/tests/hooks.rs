@@ -27,7 +27,7 @@ use pitcrew_protocol::api::{Caller, TokenScope};
 use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{MachineId, MemberId, SessionId, WorkspaceId};
 use pitcrew_protocol::model::{Engine, TimestampMs};
-use pitcrew_runner::{MemoryAgents, RunnerConfig, SessionAgent, SessionAgents, Timing};
+use pitcrew_runner::{MemoryAgents, PollMode, RunnerConfig, SessionAgent, SessionAgents, Timing};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -304,17 +304,22 @@ fn through_the_api_route_only_the_sessions_own_agent_changes_it() {
     sink.wait_for(3, WAIT).expect("discovery");
 
     // The session runs as `writer`. Its sibling (same owner) and another person's agent hold
-    // valid agent tokens too.
+    // valid agent tokens too, and another person a device token.
     let owner = person();
     let writer = agent_of(&owner);
     let sibling = agent_of(&owner);
-    let stranger = agent_of(&person());
+    let other_person = person();
+    let stranger = agent_of(&other_person);
     agents.set(discovered(&sink.events()).id, runs_as(&writer));
 
     let tokens = Arc::new(FileTokenStore::in_memory());
     let token = |caller| tokens.mint(caller).unwrap().1.into_string();
-    let (writer_token, sibling_token, stranger_token) =
-        (token(writer), token(sibling), token(stranger));
+    let (writer_token, sibling_token, stranger_token, other_person_token) = (
+        token(writer),
+        token(sibling),
+        token(stranger),
+        token(other_person),
+    );
     let intake = HookIntake::start(Arc::new(runner.hooks()), 8).unwrap();
     let store: Arc<dyn TokenStore> = tokens;
     let app = pitcrew_api::router(
@@ -338,7 +343,8 @@ fn through_the_api_route_only_the_sessions_own_agent_changes_it() {
         assert_eq!(response.status(), 202);
     };
 
-    // Refused: the sibling's stop and the stranger's end, each a different state.
+    // Refused: the sibling's stop, the stranger's end, and the other person's prompt, whose
+    // status line differs from the allowed one's.
     post(
         &sibling_token,
         "Stop",
@@ -348,6 +354,15 @@ fn through_the_api_route_only_the_sessions_own_agent_changes_it() {
         &stranger_token,
         "SessionEnd",
         serde_json::json!({"session_id": FIXTURE_ID}),
+    );
+    post(
+        &other_person_token,
+        "Notification",
+        serde_json::json!({
+            "session_id": FIXTURE_ID,
+            "notification_type": "permission_prompt",
+            "message": "Another person answers for this agent",
+        }),
     );
     // Allowed: the session's own agent waits for a permission.
     post(
@@ -692,6 +707,40 @@ fn a_flood_from_one_sender_leaves_another_senders_held_hook_intact() {
         labels(&sink.events()),
         ["discovered:Ended", "ended", "tool:TodoWrite", "tool:Read"]
     );
+}
+
+#[test]
+fn a_hook_for_an_unknown_session_looks_in_local_homes_but_not_network_ones() {
+    // A polled home is treated as a network home: swept and rediscovered on its own, rarer
+    // schedule.
+    for (poll, looks) in [(PollMode::Never, 1), (PollMode::Always, 0)] {
+        let home = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let adapter = Arc::new(CountingDiscovery::default());
+        let mut config =
+            config(home.path(), state.path()).with_agents(Arc::new(MemoryAgents::new()));
+        config.poll = poll;
+        let sink = Arc::new(CollectSink::default());
+        let runner = pitcrew_runner::start(config, vec![adapter.clone()], sink).unwrap();
+        // The first discovery, and the gap after it.
+        assert!(common::eventually(WAIT, || adapter
+            .discoveries
+            .load(Ordering::SeqCst)
+            >= 1));
+        std::thread::sleep(Duration::from_millis(1200));
+        let before = adapter.discoveries.load(Ordering::SeqCst);
+
+        runner.hooks().deliver(hook(
+            &person(),
+            "SessionEnd",
+            "cccccccc-0000-4000-8000-000000000001",
+            now_ms(),
+        ));
+        std::thread::sleep(Duration::from_millis(1500));
+        let after = adapter.discoveries.load(Ordering::SeqCst);
+        runner.stop();
+        assert_eq!(after - before, looks, "{poll:?}");
+    }
 }
 
 #[test]
