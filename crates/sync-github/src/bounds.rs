@@ -40,6 +40,26 @@ pub fn backoff_secs(attempts: u32) -> i64 {
     secs.min(SECONDARY_BACKOFF_CAP_SECS)
 }
 
+/// Caps on one `list` call: how many pages to follow, and how many items to collect, before
+/// treating the walk as truncated rather than complete. Production code always uses
+/// [`Limits::default`] (this module's [`MAX_PAGES_PER_CALL`]/[`MAX_ITEMS_PER_SYNC`]); tests
+/// override it to exercise cap-triggered truncation and resume behaviour without multi-thousand-
+/// item fixtures.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Limits {
+    pub max_pages: usize,
+    pub max_items: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_pages: MAX_PAGES_PER_CALL,
+            max_items: MAX_ITEMS_PER_SYNC,
+        }
+    }
+}
+
 /// Truncates `s` to at most `max` characters (not bytes), on a char boundary.
 #[must_use]
 pub fn cap_chars(s: &str, max: usize) -> String {

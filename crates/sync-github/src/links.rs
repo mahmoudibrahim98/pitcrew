@@ -29,6 +29,26 @@ fn is_closing_keyword(token: &str) -> bool {
     CLOSING_KEYWORDS.contains(&word.as_str())
 }
 
+/// Blanks out fenced code blocks (```` ```...``` ```` or `~~~...~~~`) and blockquoted lines
+/// (starting with `>`, after optional leading whitespace), replacing each with an equal number of
+/// blank lines so byte offsets in error messages elsewhere stay meaningful. A keyword GitHub
+/// itself would not treat as a closing reference — because it only appears in quoted or code text
+/// — must not be treated as one here either.
+fn strip_quoted_and_code(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut in_fence = false;
+    for line in body.lines() {
+        let trimmed_start = line.trim_start();
+        if trimmed_start.starts_with("```") || trimmed_start.starts_with("~~~") {
+            in_fence = !in_fence;
+        } else if !in_fence && !trimmed_start.starts_with('>') {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
+}
+
 /// Parses `#n` (using `default_repo`) or `owner/repo#n` from one trimmed token.
 fn parse_ref(token: &str, default_repo: &str) -> Option<ExternalRef> {
     let token = trim_punct(token);
@@ -57,7 +77,8 @@ fn issue_ref(owner_repo: &str, number: u64) -> ExternalRef {
 /// `#n` references. Order is the order keywords appear in the body; duplicates are removed.
 #[must_use]
 pub fn linked_issues(body: &str, default_repo: &str) -> Vec<ExternalRef> {
-    let tokens: Vec<&str> = body.split_whitespace().collect();
+    let prose = strip_quoted_and_code(body);
+    let tokens: Vec<&str> = prose.split_whitespace().collect();
     let mut refs = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for (i, token) in tokens.iter().enumerate() {
@@ -132,6 +153,38 @@ mod tests {
     #[test]
     fn a_keyword_with_no_following_reference_is_ignored() {
         assert!(linked_issues("This is closed.", REPO).is_empty());
+    }
+
+    #[test]
+    fn a_keyword_inside_a_fenced_code_block_is_ignored() {
+        let body = "Here is an example:\n```\nCloses #99\n```\nFixes #1";
+        let refs = linked_issues(body, REPO);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].key, "example-org/demo-repo#1");
+    }
+
+    #[test]
+    fn a_keyword_inside_a_tilde_fenced_code_block_is_ignored() {
+        let body = "~~~\nCloses #99\n~~~\nFixes #1";
+        let refs = linked_issues(body, REPO);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].key, "example-org/demo-repo#1");
+    }
+
+    #[test]
+    fn a_keyword_inside_a_blockquote_is_ignored() {
+        let body = "> Someone once said: Closes #99\nFixes #1";
+        let refs = linked_issues(body, REPO);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].key, "example-org/demo-repo#1");
+    }
+
+    #[test]
+    fn an_unclosed_fence_blanks_out_the_rest_of_the_body() {
+        // Malformed markdown (a fence never closed) is treated conservatively: once inside a
+        // fence, nothing after it is scanned, rather than guessing where it "should" have ended.
+        let body = "```\nCloses #1";
+        assert!(linked_issues(body, REPO).is_empty());
     }
 
     proptest! {

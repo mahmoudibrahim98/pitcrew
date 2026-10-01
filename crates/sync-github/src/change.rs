@@ -197,12 +197,17 @@ fn snapshot_of(issue: &WireIssue) -> IssueSnapshot {
 }
 
 /// Diffs a freshly read issue against its last snapshot (`None` on a first sight), returning the
-/// changes found and the new snapshot to store.
+/// changes found and the new snapshot to store — or `None` if `issue.updated_at` is not
+/// well-formed, in which case the whole item is treated as malformed (skipped, and counted by the
+/// caller) rather than snapshotted or diffed with a timestamp that can't be trusted as a cursor.
 pub(crate) fn diff_issue(
     owner_repo: &str,
     issue: &WireIssue,
     previous: Option<&IssueSnapshot>,
-) -> (Vec<UpstreamChange>, IssueSnapshot) {
+) -> Option<(Vec<UpstreamChange>, IssueSnapshot)> {
+    if !GithubTimestamp::new(&issue.updated_at).is_well_formed() {
+        return None;
+    }
     let next = snapshot_of(issue);
     let source = issue_ref(owner_repo, issue.number, issue.html_url.as_deref());
     let at = next.updated_at.clone();
@@ -280,7 +285,7 @@ pub(crate) fn diff_issue(
             }
         }
     }
-    (changes, next)
+    Some((changes, next))
 }
 
 fn pull_snapshot_of(pr: &WirePullRequest) -> PullSnapshot {
@@ -292,12 +297,16 @@ fn pull_snapshot_of(pr: &WirePullRequest) -> PullSnapshot {
     }
 }
 
-/// Diffs a freshly read pull request against its last snapshot.
+/// Diffs a freshly read pull request against its last snapshot — or `None` if `pr.updated_at` is
+/// not well-formed (see [`diff_issue`]).
 pub(crate) fn diff_pull(
     owner_repo: &str,
     pr: &WirePullRequest,
     previous: Option<&PullSnapshot>,
-) -> (Vec<UpstreamChange>, PullSnapshot) {
+) -> Option<(Vec<UpstreamChange>, PullSnapshot)> {
+    if !GithubTimestamp::new(&pr.updated_at).is_well_formed() {
+        return None;
+    }
     let next = pull_snapshot_of(pr);
     let source = pull_ref(owner_repo, pr.number, pr.html_url.as_deref());
     let at = next.updated_at.clone();
@@ -333,7 +342,7 @@ pub(crate) fn diff_pull(
             }
         }
     }
-    (changes, next)
+    Some((changes, next))
 }
 
 fn milestone_snapshot_of(m: &WireMilestone) -> MilestoneSnapshot {
@@ -386,4 +395,72 @@ pub(crate) fn diff_milestone(
         }
     }
     (changes, next)
+}
+
+#[cfg(test)]
+mod malformed_timestamp_tests {
+    use super::*;
+
+    fn issue(updated_at: &str) -> WireIssue {
+        WireIssue {
+            number: 1,
+            title: "Title".to_string(),
+            body: None,
+            state: "open".to_string(),
+            state_reason: None,
+            labels: Vec::new(),
+            assignees: Vec::new(),
+            milestone: None,
+            updated_at: updated_at.to_string(),
+            html_url: None,
+            pull_request: None,
+        }
+    }
+
+    fn pull(updated_at: &str) -> WirePullRequest {
+        WirePullRequest {
+            number: 1,
+            title: "Title".to_string(),
+            body: None,
+            state: "open".to_string(),
+            merged_at: None,
+            updated_at: updated_at.to_string(),
+            html_url: None,
+        }
+    }
+
+    #[test]
+    fn a_well_formed_issue_timestamp_diffs_normally() {
+        let result = diff_issue(
+            "example-org/demo-repo",
+            &issue("2026-01-01T00:00:00Z"),
+            None,
+        );
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn a_malformed_issue_timestamp_is_skipped_entirely() {
+        assert!(diff_issue("example-org/demo-repo", &issue("not-a-timestamp"), None).is_none());
+        assert!(
+            diff_issue(
+                "example-org/demo-repo",
+                &issue("2026-01-01T00:00:00.000Z"),
+                None
+            )
+            .is_none(),
+            "fractional seconds are not the shape GitHub actually sends"
+        );
+    }
+
+    #[test]
+    fn a_well_formed_pull_timestamp_diffs_normally() {
+        let result = diff_pull("example-org/demo-repo", &pull("2026-01-01T00:00:00Z"), None);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn a_malformed_pull_timestamp_is_skipped_entirely() {
+        assert!(diff_pull("example-org/demo-repo", &pull(""), None).is_none());
+    }
 }

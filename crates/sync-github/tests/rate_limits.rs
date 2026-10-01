@@ -3,7 +3,7 @@
 //! return a `RateLimited` outcome instead, and no other resource is called afterwards.
 
 use pitcrew_sync_github::fixture::ReplayTransport;
-use pitcrew_sync_github::{AuthToken, GithubTimestamp, RepoRef, SyncConfig, SyncState};
+use pitcrew_sync_github::{AuthToken, GithubTimestamp, RepoRef, Resource, SyncConfig, SyncState};
 
 fn fixture_path(name: &str) -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -56,10 +56,14 @@ async fn secondary_rate_limit_honours_retry_after() {
 async fn secondary_backoff_without_retry_after_grows_and_persists_in_state() {
     // Three consecutive secondary-limited responses, none with `retry-after`: the client must
     // back off exponentially and remember the attempt count in `SyncState` between calls, never
-    // sleeping itself.
+    // sleeping itself. The body names the secondary limit explicitly (as GitHub's own abuse-
+    // detection responses do): without that signal (or a `retry-after`), a 403 is no longer
+    // treated as a rate limit at all (review item 4) — see
+    // `a_plain_403_with_no_rate_limit_signal_is_a_sync_issue`, below.
     let url = "https://api.github.com/repos/example-org/demo-repo/milestones?state=all&sort=due_on&direction=asc&per_page=100";
+    let body = r#"{"message":"You have exceeded a secondary rate limit. Please wait a few minutes before you try again."}"#;
     let fixture_text =
-        format!("GET {url} HTTP/1.1\n\nHTTP/1.1 403\nX-RateLimit-Remaining: 5\n\n{{}}\n");
+        format!("GET {url} HTTP/1.1\n\nHTTP/1.1 403\nX-RateLimit-Remaining: 5\n\n{body}\n");
 
     let mut state = SyncState::new();
     let mut deadlines = Vec::new();
@@ -84,5 +88,61 @@ async fn secondary_backoff_without_retry_after_grows_and_persists_in_state() {
             .expect("repo")
             .secondary_backoff_attempts,
         3
+    );
+}
+
+#[tokio::test]
+async fn a_plain_403_with_no_rate_limit_signal_is_a_sync_issue_not_a_rate_limit() {
+    // No `X-RateLimit-Remaining: 0` + reset, no `Retry-After`, and a body that names neither a
+    // rate limit nor abuse detection: a revoked token or a missing scope looks exactly like this,
+    // and must be visible to the caller rather than retried forever as if it would ever clear.
+    // Unlike a rate limit (which stops the whole sync), a plain resource error does not: issues
+    // and pull requests are still attempted, so both get a normal empty response here too.
+    use pitcrew_sync_github::fixture::RecordedExchange;
+
+    let milestones_url = "https://api.github.com/repos/example-org/demo-repo/milestones?state=all&sort=due_on&direction=asc&per_page=100";
+    let issues_url = "https://api.github.com/repos/example-org/demo-repo/issues?state=all&sort=updated&direction=asc&per_page=100";
+    let pulls_url = "https://api.github.com/repos/example-org/demo-repo/pulls?state=all&sort=updated&direction=desc&per_page=100";
+
+    fn empty_list(url: &str) -> RecordedExchange {
+        RecordedExchange {
+            method: "GET".to_string(),
+            url: url.to_string(),
+            request_headers: vec![],
+            status: 200,
+            response_headers: vec![],
+            body: b"[]".to_vec(),
+        }
+    }
+
+    let milestones_403 = RecordedExchange {
+        method: "GET".to_string(),
+        url: milestones_url.to_string(),
+        request_headers: vec![],
+        status: 403,
+        response_headers: vec![],
+        body: br#"{"message":"Bad credentials"}"#.to_vec(),
+    };
+
+    let transport = ReplayTransport::from_exchanges(vec![
+        milestones_403,
+        empty_list(issues_url),
+        empty_list(pulls_url),
+    ]);
+
+    let outcome =
+        pitcrew_sync_github::sync::sync(SyncState::new(), &transport, &config(2_000_000_000)).await;
+
+    assert!(
+        outcome.rate_limited.is_none(),
+        "a bare 403 with no rate-limit signal must not be treated as a rate limit: {:?}",
+        outcome.rate_limited
+    );
+    assert_eq!(outcome.errors.len(), 1, "{:#?}", outcome.errors);
+    assert_eq!(outcome.errors[0].resource, Resource::Milestones);
+    assert!(
+        outcome.errors[0].message.contains("403"),
+        "{}",
+        outcome.errors[0].message
     );
 }

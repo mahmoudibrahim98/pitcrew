@@ -3,9 +3,10 @@
 //! the returned state and decides what to do with the changes; this function does no I/O beyond
 //! the `Transport` it is given, and never touches the event log.
 
+use crate::bounds::Limits;
 use crate::change::{UpstreamChange, diff_issue, diff_milestone, diff_pull};
 use crate::client::{GithubClient, Outcome};
-use crate::state::{RepoState, SyncState};
+use crate::state::{ListCache, RepoState, ResumeCursor, SyncState};
 use crate::time::GithubTimestamp;
 use crate::transport::{AuthToken, Transport};
 use crate::wire::{WireIssue, WireMilestone, WirePullRequest};
@@ -127,15 +128,39 @@ fn milestones_url(api_base: &str, repo: &str) -> String {
     format!("{api_base}/repos/{repo}/milestones?state=all&sort=due_on&direction=asc&per_page=100")
 }
 
-/// The only character RFC 3339 timestamps need encoded in a query string.
+/// Percent-encodes `s` for use as one query-string value (RFC 3986 "unreserved" characters pass
+/// through unescaped; everything else — including `:`, the only character GitHub's own normal
+/// `YYYY-MM-DDTHH:MM:SSZ` timestamp shape needs it for — becomes `%XX` from its UTF-8 bytes). This
+/// is general-purpose rather than special-cased to `:` alone so a `since` cursor stays correctly
+/// encoded even if it is ever something other than GitHub's own well-formed shape (see
+/// `GithubTimestamp::is_well_formed`).
 fn encode_timestamp(s: &str) -> String {
-    s.replace(':', "%3A")
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => {
+                out.push('%');
+                out.push_str(&format!("{byte:02X}"));
+            }
+        }
+    }
+    out
 }
 
 enum ResourceResult {
-    Changes(Vec<UpstreamChange>, u32),
+    /// Changes found, how many items were skipped as malformed, and — if a server-supplied
+    /// `Link: rel="next"` outside the API base was ignored — a message to raise as an additional
+    /// `SyncIssue` alongside these (otherwise successful) changes.
+    Changes(Vec<UpstreamChange>, u32, Option<String>),
     RateLimited(RateLimited),
     Error(String),
+}
+
+fn blocked_link_message(url: &str) -> String {
+    format!("ignored a paginated \"next\" link outside the configured API base: {url}")
 }
 
 async fn sync_issues<T: Transport>(
@@ -143,11 +168,19 @@ async fn sync_issues<T: Transport>(
     repo: &str,
     repo_state: &mut RepoState,
     now_unix: i64,
+    limits: Limits,
 ) -> ResourceResult {
     let mut attempts = repo_state.secondary_backoff_attempts;
     let url = issues_url(client.api_base(), repo, repo_state.issues.since.as_ref());
     let result = client
-        .list::<WireIssue>(url, &repo_state.issues, false, now_unix, &mut attempts)
+        .list::<WireIssue>(
+            url,
+            &repo_state.issues,
+            false,
+            now_unix,
+            &mut attempts,
+            limits,
+        )
         .await;
     repo_state.secondary_backoff_attempts = attempts;
     match result {
@@ -157,16 +190,26 @@ async fn sync_issues<T: Transport>(
         }
         Ok(Outcome::Ok(list)) => {
             let mut changes = Vec::new();
+            let mut malformed_timestamps = 0u32;
             for issue in &list.items {
                 // The issues endpoint also lists pull requests; those are synced separately.
                 if issue.pull_request.is_some() {
                     continue;
                 }
                 let previous = repo_state.issue_snapshots.get(&issue.number);
-                let (mut found, snapshot) = diff_issue(repo, issue, previous);
-                changes.append(&mut found);
-                repo_state.issue_snapshots.insert(issue.number, snapshot);
+                match diff_issue(repo, issue, previous) {
+                    Some((mut found, snapshot)) => {
+                        changes.append(&mut found);
+                        repo_state.issue_snapshots.insert(issue.number, snapshot);
+                    }
+                    None => malformed_timestamps += 1,
+                }
             }
+            // Issues are read ascending with a server-side `since` filter, so a walk a cap cuts
+            // short is self-healing: the next call's `since` is the last item this call actually
+            // processed, and GitHub includes items at that same timestamp again rather than
+            // skipping them. This is unlike pull requests (see `sync_pulls`), which have no
+            // server-side filter to re-anchor on.
             if !list.not_modified {
                 repo_state.issues.etag = list.etag;
                 repo_state.issues.last_modified = list.last_modified;
@@ -176,7 +219,12 @@ async fn sync_issues<T: Transport>(
                     repo_state.issues.since = Some(max);
                 }
             }
-            ResourceResult::Changes(changes, list.malformed_skipped)
+            let warning = list.blocked_link.as_deref().map(blocked_link_message);
+            ResourceResult::Changes(
+                changes,
+                list.malformed_skipped + malformed_timestamps,
+                warning,
+            )
         }
     }
 }
@@ -186,11 +234,46 @@ async fn sync_pulls<T: Transport>(
     repo: &str,
     repo_state: &mut RepoState,
     now_unix: i64,
+    limits: Limits,
 ) -> ResourceResult {
     let mut attempts = repo_state.secondary_backoff_attempts;
-    let url = pulls_url(client.api_base(), repo);
+    // Pull requests are listed newest-first with no server-side filter to resume through: a walk
+    // a previous call's cap cut short must continue from exactly where it left off, not restart
+    // from page 1 (which would just re-walk the same newest items and, if `since` had been
+    // advanced to them, silently skip everything older that was never actually reached — see
+    // brief review item 2). When resuming, conditional headers are dropped too: they were
+    // captured against page 1, not this later page, and a stray 304 here would wrongly be read as
+    // "nothing changed" for the whole resource.
+    //
+    // `list`'s own `max_updated_at`/`oldest_seen` are scoped to the one call (one page, or a few,
+    // but never the whole walk once it spans several resumed calls): carry the running bounds
+    // across calls here, so that once the walk does complete, the cursor it advances to reflects
+    // the newest item across the *entire* walk, not just whichever page happened to be fetched by
+    // the final call.
+    let carried_newest = repo_state
+        .pulls
+        .resume
+        .as_ref()
+        .and_then(|r| r.newest_seen.clone());
+    let carried_oldest = repo_state
+        .pulls
+        .resume
+        .as_ref()
+        .and_then(|r| r.oldest_seen.clone());
+    let (url, cache) = match &repo_state.pulls.resume {
+        Some(resume) => (
+            resume.next_url.clone(),
+            ListCache {
+                etag: None,
+                last_modified: None,
+                since: repo_state.pulls.since.clone(),
+                resume: None,
+            },
+        ),
+        None => (pulls_url(client.api_base(), repo), repo_state.pulls.clone()),
+    };
     let result = client
-        .list::<WirePullRequest>(url, &repo_state.pulls, true, now_unix, &mut attempts)
+        .list::<WirePullRequest>(url, &cache, true, now_unix, &mut attempts, limits)
         .await;
     repo_state.secondary_backoff_attempts = attempts;
     match result {
@@ -200,23 +283,72 @@ async fn sync_pulls<T: Transport>(
         }
         Ok(Outcome::Ok(list)) => {
             let mut changes = Vec::new();
+            let mut malformed_timestamps = 0u32;
             for pr in &list.items {
                 let previous = repo_state.pull_snapshots.get(&pr.number);
-                let (mut found, snapshot) = diff_pull(repo, pr, previous);
-                changes.append(&mut found);
-                repo_state.pull_snapshots.insert(pr.number, snapshot);
+                match diff_pull(repo, pr, previous) {
+                    Some((mut found, snapshot)) => {
+                        changes.append(&mut found);
+                        repo_state.pull_snapshots.insert(pr.number, snapshot);
+                    }
+                    None => malformed_timestamps += 1,
+                }
             }
             if !list.not_modified {
                 repo_state.pulls.etag = list.etag;
                 repo_state.pulls.last_modified = list.last_modified;
-                if let Some(max) = list.max_updated_at
-                    && repo_state.pulls.since.as_ref().is_none_or(|s| max > *s)
-                {
-                    repo_state.pulls.since = Some(max);
+                let newest_seen = newer(carried_newest, list.max_updated_at.clone());
+                let oldest_seen = older(carried_oldest, list.oldest_seen.clone());
+                if list.completed {
+                    // The walk reached the old cursor (or ran out of pages): everything newer
+                    // than the new cursor has now actually been seen, so it is safe to advance —
+                    // using the bounds carried across the *whole* walk, not just this last call.
+                    if let Some(max) = newest_seen
+                        && repo_state.pulls.since.as_ref().is_none_or(|s| &max > s)
+                    {
+                        repo_state.pulls.since = Some(max);
+                    }
+                    repo_state.pulls.resume = None;
+                } else if let Some(next_url) = list.resume_from.clone() {
+                    // Cut short by a cap: keep the old cursor untouched and remember where to
+                    // continue, rather than advancing `since` to "the newest seen", which would
+                    // make the next call stop immediately and leave everything older unfetched.
+                    repo_state.pulls.resume = Some(ResumeCursor {
+                        next_url,
+                        oldest_seen,
+                        newest_seen,
+                    });
+                } else {
+                    // Cut short by something that gets no resume pointer (a malformed page, or an
+                    // untrusted `Link`): restart from the top next call.
+                    repo_state.pulls.resume = None;
                 }
             }
-            ResourceResult::Changes(changes, list.malformed_skipped)
+            let warning = list.blocked_link.as_deref().map(blocked_link_message);
+            ResourceResult::Changes(
+                changes,
+                list.malformed_skipped + malformed_timestamps,
+                warning,
+            )
         }
+    }
+}
+
+/// The later of two optional timestamps (`None` loses to anything).
+fn newer(a: Option<GithubTimestamp>, b: Option<GithubTimestamp>) -> Option<GithubTimestamp> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if a > b { a } else { b }),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+/// The earlier of two optional timestamps (`None` loses to anything).
+fn older(a: Option<GithubTimestamp>, b: Option<GithubTimestamp>) -> Option<GithubTimestamp> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if a < b { a } else { b }),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
     }
 }
 
@@ -226,11 +358,19 @@ async fn sync_milestones<T: Transport>(
     repo_state: &mut RepoState,
     now_unix: i64,
     now: &GithubTimestamp,
+    limits: Limits,
 ) -> ResourceResult {
     let mut attempts = repo_state.secondary_backoff_attempts;
     let url = milestones_url(client.api_base(), repo);
     let result = client
-        .list::<WireMilestone>(url, &repo_state.milestones, false, now_unix, &mut attempts)
+        .list::<WireMilestone>(
+            url,
+            &repo_state.milestones,
+            false,
+            now_unix,
+            &mut attempts,
+            limits,
+        )
         .await;
     repo_state.secondary_backoff_attempts = attempts;
     match result {
@@ -252,7 +392,8 @@ async fn sync_milestones<T: Transport>(
                 repo_state.milestones.etag = list.etag;
                 repo_state.milestones.last_modified = list.last_modified;
             }
-            ResourceResult::Changes(changes, list.malformed_skipped)
+            let warning = list.blocked_link.as_deref().map(blocked_link_message);
+            ResourceResult::Changes(changes, list.malformed_skipped, warning)
         }
     }
 }
@@ -264,6 +405,19 @@ pub async fn sync<T: Transport>(
     state: SyncState,
     transport: &T,
     config: &SyncConfig,
+) -> SyncOutcome {
+    sync_with_limits(state, transport, config, Limits::default()).await
+}
+
+/// `sync`'s actual implementation, parameterised over the page/item caps. Production code only
+/// ever reaches this through `sync` (always [`Limits::default`], the real [`crate::bounds`]
+/// constants); this crate's own tests call it directly with a tiny [`Limits`] to exercise
+/// cap-triggered truncation and resume behaviour without multi-thousand-item fixtures.
+async fn sync_with_limits<T: Transport>(
+    state: SyncState,
+    transport: &T,
+    config: &SyncConfig,
+    limits: Limits,
 ) -> SyncOutcome {
     let mut state = state;
     let mut changes = Vec::new();
@@ -289,6 +443,7 @@ pub async fn sync<T: Transport>(
             &mut repo_state,
             config.now_unix,
             &config.now,
+            limits,
         )
         .await;
         let results: Vec<(Resource, ResourceResult)> = match milestones {
@@ -298,8 +453,14 @@ pub async fn sync<T: Transport>(
             }
             other => {
                 let mut results = vec![(Resource::Milestones, other)];
-                let issues =
-                    sync_issues(&client, owner_repo, &mut repo_state, config.now_unix).await;
+                let issues = sync_issues(
+                    &client,
+                    owner_repo,
+                    &mut repo_state,
+                    config.now_unix,
+                    limits,
+                )
+                .await;
                 match issues {
                     ResourceResult::RateLimited(rl) => {
                         hit_limit = Some(rl);
@@ -307,8 +468,14 @@ pub async fn sync<T: Transport>(
                     }
                     other => {
                         results.push((Resource::Issues, other));
-                        let pulls =
-                            sync_pulls(&client, owner_repo, &mut repo_state, config.now_unix).await;
+                        let pulls = sync_pulls(
+                            &client,
+                            owner_repo,
+                            &mut repo_state,
+                            config.now_unix,
+                            limits,
+                        )
+                        .await;
                         if let ResourceResult::RateLimited(rl) = &pulls {
                             hit_limit = Some(*rl);
                         }
@@ -321,9 +488,16 @@ pub async fn sync<T: Transport>(
 
         for (resource, result) in results {
             match result {
-                ResourceResult::Changes(mut found, skipped) => {
+                ResourceResult::Changes(mut found, skipped, warning) => {
                     changes.append(&mut found);
                     malformed_skipped += skipped;
+                    if let Some(message) = warning {
+                        errors.push(SyncIssue {
+                            repo: owner_repo.to_string(),
+                            resource,
+                            message,
+                        });
+                    }
                 }
                 ResourceResult::Error(message) => {
                     errors.push(SyncIssue {
@@ -349,5 +523,196 @@ pub async fn sync<T: Transport>(
         rate_limited,
         errors,
         malformed_skipped,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixture::{RecordedExchange, ReplayTransport};
+
+    #[test]
+    fn encode_timestamp_escapes_colons() {
+        assert_eq!(
+            encode_timestamp("2026-01-02T03:04:05Z"),
+            "2026-01-02T03%3A04%3A05Z"
+        );
+    }
+
+    #[test]
+    fn encode_timestamp_passes_unreserved_characters_through_untouched() {
+        assert_eq!(encode_timestamp("safe-._~Chars09"), "safe-._~Chars09");
+    }
+
+    #[test]
+    fn encode_timestamp_escapes_arbitrary_non_unreserved_bytes() {
+        // Not a shape `GithubTimestamp` actually sends, but this is deliberately a general
+        // percent-encoder, not one special-cased to `:` alone (review item 3).
+        assert_eq!(encode_timestamp("a b+c"), "a%20b%2Bc");
+    }
+
+    const MILESTONES_URL: &str = "https://api.github.com/repos/example-org/demo-repo/milestones?state=all&sort=due_on&direction=asc&per_page=100";
+    const ISSUES_URL: &str = "https://api.github.com/repos/example-org/demo-repo/issues?state=all&sort=updated&direction=asc&per_page=100";
+    const PULLS_URL: &str = "https://api.github.com/repos/example-org/demo-repo/pulls?state=all&sort=updated&direction=desc&per_page=100";
+
+    fn empty_list(url: &str) -> RecordedExchange {
+        RecordedExchange {
+            method: "GET".to_string(),
+            url: url.to_string(),
+            request_headers: vec![],
+            status: 200,
+            response_headers: vec![],
+            body: b"[]".to_vec(),
+        }
+    }
+
+    fn pr_json(number: u64, updated_at: &str) -> String {
+        format!(
+            r#"{{"number":{number},"title":"PR {number}","state":"open","updated_at":"{updated_at}"}}"#
+        )
+    }
+
+    fn page(url: &str, next: Option<&str>, body: String) -> RecordedExchange {
+        let response_headers = match next {
+            Some(n) => vec![("Link".to_string(), format!("<{n}>; rel=\"next\""))],
+            None => vec![],
+        };
+        RecordedExchange {
+            method: "GET".to_string(),
+            url: url.to_string(),
+            request_headers: vec![],
+            status: 200,
+            response_headers,
+            body: body.into_bytes(),
+        }
+    }
+
+    fn config() -> SyncConfig {
+        SyncConfig {
+            repos: vec![RepoRef::new("example-org/demo-repo").expect("valid repo")],
+            token: AuthToken::new("ghp_test_token_not_real"),
+            now_unix: 2_000_000_000,
+            now: GithubTimestamp::new("2026-01-01T00:00:00Z"),
+            api_base: None,
+        }
+    }
+
+    /// Reproduces brief review item 2 end to end: a pull request listing spread across more pages
+    /// than one call is allowed to fetch (`Limits::max_pages = 1`), newest page first. Three
+    /// `sync_with_limits` calls, each handed the previous call's returned state, must together see
+    /// every PR exactly once and must only ever advance `since` on the call that actually
+    /// completes the walk — and even then, to the newest PR across the *whole* walk (PR 6), not
+    /// just whichever page the final call happened to fetch (PRs 1 and 2).
+    #[tokio::test]
+    async fn pull_requests_eventually_all_appear_exactly_once_and_the_cursor_never_skips() {
+        let page2_url = format!("{PULLS_URL}&page=2");
+        let page3_url = format!("{PULLS_URL}&page=3");
+
+        let page1 = page(
+            PULLS_URL,
+            Some(&page2_url),
+            format!(
+                "[{},{}]",
+                pr_json(6, "2026-01-01T00:06:00Z"),
+                pr_json(5, "2026-01-01T00:05:00Z")
+            ),
+        );
+        let page2 = page(
+            &page2_url,
+            Some(&page3_url),
+            format!(
+                "[{},{}]",
+                pr_json(4, "2026-01-01T00:04:00Z"),
+                pr_json(3, "2026-01-01T00:03:00Z")
+            ),
+        );
+        let page3 = page(
+            &page3_url,
+            None,
+            format!(
+                "[{},{}]",
+                pr_json(2, "2026-01-01T00:02:00Z"),
+                pr_json(1, "2026-01-01T00:01:00Z")
+            ),
+        );
+
+        let exchanges = vec![
+            empty_list(MILESTONES_URL),
+            empty_list(ISSUES_URL),
+            page1,
+            empty_list(MILESTONES_URL),
+            empty_list(ISSUES_URL),
+            page2,
+            empty_list(MILESTONES_URL),
+            empty_list(ISSUES_URL),
+            page3,
+        ];
+        let transport = ReplayTransport::from_exchanges(exchanges);
+        let limits = Limits {
+            max_pages: 1,
+            max_items: 100,
+        };
+
+        let mut state = SyncState::new();
+        let mut all_opened: Vec<String> = Vec::new();
+
+        for call in 0..3 {
+            let outcome = sync_with_limits(state, &transport, &config(), limits).await;
+            assert!(
+                outcome.errors.is_empty(),
+                "call {call}: {:?}",
+                outcome.errors
+            );
+            assert!(outcome.rate_limited.is_none(), "call {call}");
+            for change in &outcome.changes {
+                if let UpstreamChange::PullRequestOpened { source, .. } = change {
+                    all_opened.push(source.key.clone());
+                }
+            }
+            let repo = outcome
+                .state
+                .repos
+                .get("example-org/demo-repo")
+                .expect("repo state");
+            match call {
+                0 | 1 => {
+                    assert!(
+                        repo.pulls.since.is_none(),
+                        "call {call}: the cursor must not advance mid-walk"
+                    );
+                    assert!(
+                        repo.pulls.resume.is_some(),
+                        "call {call}: a resume pointer must be set"
+                    );
+                }
+                2 => {
+                    assert!(repo.pulls.resume.is_none(), "the walk is now complete");
+                    assert_eq!(
+                        repo.pulls.since.as_ref().map(GithubTimestamp::as_str),
+                        Some("2026-01-01T00:06:00Z"),
+                        "the cursor must reflect the newest PR across the whole walk, not just \
+                         the last page this call happened to fetch"
+                    );
+                }
+                _ => unreachable!(),
+            }
+            state = outcome.state;
+        }
+
+        assert_eq!(all_opened.len(), 6, "{all_opened:?}");
+        let mut sorted = all_opened.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            6,
+            "every PR must be reported opened exactly once: {all_opened:?}"
+        );
+        for n in 1..=6 {
+            assert!(
+                all_opened.contains(&format!("example-org/demo-repo#{n}")),
+                "PR {n} was never seen: {all_opened:?}"
+            );
+        }
     }
 }
