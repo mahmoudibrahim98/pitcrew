@@ -129,6 +129,92 @@ it already does.
 **Cleanup.** When the webview reloads or the window closes, the gateway closes every socket that
 window opened.
 
+## Remote workspaces
+
+A workspace whose hub runs on another machine is reached over SSH: a login node, a server, or a
+SLURM compute node through its login node. The gateway uses stream J's `pitcrew-remote` (probe,
+deploy, launchers, the tunnel's `Connector`). Adding one takes two steps, so that **nothing changes
+on the remote until the person has seen what will happen**. For SLURM, that includes the exact job
+script.
+
+`gateway_ssh_hosts() → { hosts: string[] }`: the concrete `Host` names in the person's ssh config,
+for a picker. The person may also type a host.
+
+`gateway_remote_probe({ host }) → RemoteProbe`:
+
+```ts
+interface RemoteProbe {
+  host: string;
+  os: string; arch: string;                 // e.g. "linux", "x86_64"
+  helper?: { version: string; running: boolean };
+  slurm?: { version: string; defaultPartition?: string; srunOverlap: boolean };
+}
+```
+
+`gateway_remote_plan(req) → RemotePlan` says what adding would do, without doing it:
+
+```ts
+interface RemotePlanRequest {
+  host: string;
+  launcher: 'direct' | 'tmux' | 'slurm';
+  site?: string;                            // a site recipe's name, for slurm
+  job?: { partition?: string; account?: string; qos?: string; time?: string;
+          cpus?: number; memory?: string; gpus?: string };
+}
+interface RemotePlan {
+  plan: string;                             // an opaque id, valid for 10 minutes
+  steps: string[];                          // e.g. "Copy pitcrewd 0.4.0 to ~/.pitcrew", "Submit the job below"
+  jobScript?: string;                       // slurm: exactly the text that will be submitted
+}
+```
+
+`gateway_remote_add({ plan, events: Channel }) → GatewayWorkspace` carries out a plan:
+- deploy the helper;
+- launch it, submitting exactly the shown script for SLURM;
+- wait for its endpoint, connect, and pair;
+- register the workspace.
+
+Progress arrives on `events` as `{ step: string, state: 'running' | 'done' | 'failed', detail?:
+string }`, ending with one `done` or `failed` for the whole add. A plan is used once. Errors are
+`GatewayError`s; a refused plan or launch is `invalid`, and a lost connection is `unreachable`.
+
+- **Pairing:** the gateway reads the remote hub's device token over the same SSH connection, from
+  the file `pitcrewd token show-path` names, and keeps it in the OS keychain (`TokenStore`). The
+  token never reaches the webview, a log, or a file of ours.
+- **A fresh remote hub** is set up like a local one: the UI calls `POST /v1/setup` through
+  `gateway_request` for that workspace.
+- `gateway_workspace_remove({ workspace, stopHelper: boolean })` forgets a workspace and deletes
+  its keychain token. With `stopHelper`, it first stops the remote helper (cancelling its job for
+  SLURM).
+- **States:** a remote workspace's state follows its connection: `ready` when connected,
+  `connecting` while connecting or unverifiable (with the reason in `detail`), and `unreachable`
+  with the reason.
+
+### Prompts: passwords, one-time codes and host keys
+
+SSH may ask for a password, a key's passphrase, a one-time code, or a confirmation of a new host
+key. Any command that talks to a remote can cause one, and so can the connection reconnecting. The
+gateway emits `gateway://prompt`:
+
+```ts
+interface GatewayPrompt {
+  id: string;
+  host: string;
+  kind: 'password' | 'passphrase' | 'otp' | 'host_key';
+  text: string;                    // ssh's question, cleaned of control characters; untrusted
+  fingerprint?: string;            // host_key: the key's fingerprint, to compare
+}
+```
+
+and the UI answers with `gateway_prompt_reply({ id, answer?: string, accept?: boolean })`: `answer`
+for the first three kinds, and `accept` for a host key. A reply with neither cancels. A prompt that
+is no longer wanted is withdrawn with the event `gateway://prompt-closed` `{ id }`.
+
+- An answer is passed to ssh once, and is never stored or logged. It is in memory only as long as
+  the reply takes.
+- A host key the person accepts goes into their own `known_hosts`, by ssh itself.
+- The UI shows `text` as text, and says which host is asking.
+
 ## Navigation from outside the window
 
 Deep links (`pitcrew://w/<ws>/inbox`, `pitcrew://w/<ws>/task/<id>`,
