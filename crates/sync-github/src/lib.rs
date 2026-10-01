@@ -42,6 +42,10 @@ pub use change::UpstreamChange;
 pub use client::{ClientError, GithubClient, Outcome};
 pub use ownership::{FieldOwner, FieldOwnership, ISSUE_FIELD_OWNERSHIP, Intent, plan};
 pub use state::{CloseReason, RepoState, SyncState};
+// Not public API: exposed only so stream Q's fuzz harness can call `trusted_next_url` directly,
+// rather than only reaching it indirectly through `sync::sync` — see its own doc.
+#[doc(hidden)]
+pub use origin::trusted_next_url;
 // `sync::sync` (the function) is not re-exported at the crate root to avoid shadowing the
 // `sync` module itself; call it as `pitcrew_sync_github::sync::sync(..)`.
 pub use sync::{
