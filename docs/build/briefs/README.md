@@ -56,6 +56,8 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [Q-round-3](Q-round-3.md) | Q · Security | `s/Q/round-3` | Opus-class | In progress |
 | [D-hub-link-2](D-hub-link-2.md) | D · Runner | `s/D/hub-link-2` | Opus-class | In progress |
 | [E-recap-names](E-recap-names.md) | E · Work model | `s/E/recap-names` | Sonnet-class | In progress |
+| [I-hygiene](I-hygiene.md) | I · CLI and hooks | `s/I/hygiene` | Sonnet-class | In progress |
+| [A-test-robustness](A-test-robustness.md) | A · Ingest | `s/A/test-robustness` | Sonnet-class | In progress |
 | [0-daemon-solo](0-daemon-solo.md) | 0 · Composition root | `integrator/daemon-solo` | Opus-class | **Merged** |
 | [N-projects-wiring](N-projects-wiring.md) | N · Projects layout | `s/N/projects-wiring` | Sonnet-class | **Merged** |
 | [L-shell-polish](L-shell-polish.md) | L · UI foundation | `s/L/shell-polish` | Sonnet-class | **Merged** |
