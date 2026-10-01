@@ -47,6 +47,8 @@ pub struct Seen {
 struct Fake {
     token: String,
     seen: Arc<Mutex<Seen>>,
+    /// Becomes true when the fake daemon stops; handlers that hang end then.
+    stopping: tokio::sync::watch::Receiver<bool>,
 }
 
 /// A fake daemon serving on its own thread and runtime.
@@ -54,7 +56,7 @@ pub struct FakeDaemon {
     pub state_dir: PathBuf,
     pub token: String,
     pub seen: Arc<Mutex<Seen>>,
-    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    stop: Option<tokio::sync::watch::Sender<bool>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -75,11 +77,12 @@ impl FakeDaemon {
         listener.set_nonblocking(true).unwrap();
 
         let seen = Arc::new(Mutex::new(Seen::default()));
+        let (stop, stopping) = tokio::sync::watch::channel(false);
         let fake = Fake {
             token: token.to_owned(),
             seen: Arc::clone(&seen),
+            stopping: stopping.clone(),
         };
-        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -88,9 +91,10 @@ impl FakeDaemon {
                 .unwrap();
             runtime.block_on(async move {
                 let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+                let mut stopping = stopping;
                 axum::serve(listener, router(fake))
                     .with_graceful_shutdown(async move {
-                        let _ = stopped.await;
+                        let _ = stopping.wait_for(|s| *s).await;
                     })
                     .await
                     .unwrap();
@@ -152,7 +156,7 @@ impl FakeDaemon {
 impl Drop for FakeDaemon {
     fn drop(&mut self) {
         if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
+            let _ = stop.send(true);
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -320,6 +324,12 @@ async fn terminal(
             "the session's machine is unreachable",
         ),
         "nope" => api_error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        // Takes the upgrade request and does not answer it until the fake daemon stops.
+        "hang" => {
+            let mut stopping = fake.stopping.clone();
+            let _ = stopping.wait_for(|s| *s).await;
+            api_error(StatusCode::SERVICE_UNAVAILABLE, "unavailable", "stopping")
+        }
         _ => {
             let script = q.get("script").cloned().unwrap_or_else(|| "echo".into());
             ws.protocols(["pitcrew.v1"])

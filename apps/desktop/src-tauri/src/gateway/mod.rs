@@ -71,10 +71,14 @@ pub struct Limits {
     /// Incoming frames the webview has not taken yet, per socket: 8 MiB. Also the largest frame
     /// the daemon may send.
     pub backlog: usize,
-    /// How long a request may take.
+    /// How long a request may take, connecting included.
     pub request_timeout: Duration,
+    /// How long opening a socket may take: connecting and the upgrade.
+    pub open_timeout: Duration,
     /// How long a closing socket waits for the daemon's end of the close handshake.
     pub close_grace: Duration,
+    /// How long sending one frame to the daemon may take before the socket is given up.
+    pub send_timeout: Duration,
 }
 
 impl Default for Limits {
@@ -84,7 +88,9 @@ impl Default for Limits {
             response_body: 32 * 1024 * 1024,
             backlog: 8 * 1024 * 1024,
             request_timeout: Duration::from_secs(120),
+            open_timeout: Duration::from_secs(20),
             close_grace: Duration::from_secs(2),
+            send_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -215,10 +221,16 @@ impl Gateway {
             }
             other => other.map(Bytes::from),
         };
+        // Webview-supplied: logged only through `shorten`.
+        let workspace = error::shorten(&req.workspace);
         let connector = self.registry.connector(&req.workspace)?;
-        let connected = connector.connect().await.inspect_err(|e| {
-            tracing::info!(workspace = %req.workspace, route = path::route_of(path), error = %e, "request not sent");
-        })?;
+        let timeout = self.limits.request_timeout;
+        let connected = tokio::time::timeout(timeout, connector.connect())
+            .await
+            .unwrap_or_else(|_| Err(not_in_time("connect to the daemon", timeout)))
+            .inspect_err(|e| {
+                tracing::info!(%workspace, route = path::route_of(path), error = %e, "request not sent");
+            })?;
         let reply = http::send(
             connected.io,
             Some(&connected.token),
@@ -226,14 +238,14 @@ impl Gateway {
             path,
             body,
             self.limits.response_body,
-            self.limits.request_timeout,
+            timeout.saturating_sub(started.elapsed()),
         )
         .await;
         drop(connected.token);
         let reply = match reply {
             Ok(reply) => reply,
             Err(e) => {
-                tracing::info!(workspace = %req.workspace, %method, route = path::route_of(path), error = %e, "request failed");
+                tracing::info!(%workspace, %method, route = path::route_of(path), error = %e, "request failed");
                 return Err(match e {
                     http::HttpError::TooLarge(_) => GatewayError::too_large(e.to_string()),
                     http::HttpError::Bad(_) => GatewayError::internal(e.to_string()),
@@ -244,7 +256,7 @@ impl Gateway {
             }
         };
         tracing::debug!(
-            workspace = %req.workspace,
+            %workspace,
             %method,
             route = path::route_of(path),
             status = reply.status,
@@ -278,16 +290,24 @@ impl Gateway {
         let kind = path::check_socket_path(path)?;
         let generation = self.lock().generations.get(owner).copied().unwrap_or(0);
         let connector = self.registry.connector(workspace)?;
-        let connected = connector.connect().await?;
-        let opened = socket::open(connected.io, &connected.token, path, self.limits.backlog).await;
-        drop(connected.token);
-        let ws = opened.inspect_err(|e| {
-            tracing::info!(%workspace, route = path::route_of(path), error = %e, "socket not opened");
-        })?;
+        // Webview-supplied: logged only through `shorten`.
+        let workspace = error::shorten(workspace);
+        let limits = self.limits;
+        let opening = async {
+            let connected = connector.connect().await?;
+            let opened = socket::open(connected.io, &connected.token, path, limits.backlog).await;
+            drop(connected.token);
+            opened
+        };
+        let ws = tokio::time::timeout(limits.open_timeout, opening)
+            .await
+            .unwrap_or_else(|_| Err(not_in_time("open the socket", limits.open_timeout)))
+            .inspect_err(|e| {
+                tracing::info!(%workspace, route = path::route_of(path), error = %e, "socket not opened");
+            })?;
 
         let (messages, message_rx) = mpsc::channel(64);
         let (control, control_rx) = mpsc::unbounded_channel();
-        let limits = self.limits;
         let registered = {
             let mut sockets = self.lock();
             if sockets.generations.get(owner).copied().unwrap_or(0) == generation {
@@ -312,14 +332,7 @@ impl Gateway {
         let Some((id, serial)) = registered else {
             // The page reloaded while this socket opened: nobody is listening any more.
             let _ = control.send(Control::Abandon);
-            tokio::spawn(socket::pump(
-                ws,
-                message_rx,
-                control_rx,
-                sink,
-                limits.backlog,
-                limits.close_grace,
-            ));
+            tokio::spawn(socket::pump(ws, message_rx, control_rx, sink, limits));
             return Err(GatewayError::invalid(
                 "the page reloaded while the socket opened",
             ));
@@ -328,17 +341,8 @@ impl Gateway {
         tracing::debug!(%workspace, socket = id, kind = kind.name(), route = path::route_of(path), ms = started.elapsed().as_millis(), "socket open");
 
         let sockets = Arc::clone(&self.sockets);
-        let workspace = workspace.to_owned();
         tokio::spawn(async move {
-            let ended = socket::pump(
-                ws,
-                message_rx,
-                control_rx,
-                sink,
-                limits.backlog,
-                limits.close_grace,
-            )
-            .await;
+            let ended = socket::pump(ws, message_rx, control_rx, sink, limits).await;
             if let Ok(mut sockets) = sockets.lock()
                 && sockets.open.get(&id).is_some_and(|h| h.serial == serial)
             {
@@ -482,6 +486,11 @@ fn parse_method(method: &str) -> Result<::http::Method, GatewayError> {
             "the method must be GET, POST, PATCH, PUT or DELETE",
         )),
     }
+}
+
+/// `unreachable`: the daemon did not do `what` within `limit`.
+fn not_in_time(what: &str, limit: Duration) -> GatewayError {
+    GatewayError::unreachable(format!("could not {what} within {} s", limit.as_secs_f32()))
 }
 
 fn closed(socket: u32) -> GatewayError {

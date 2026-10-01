@@ -6,13 +6,17 @@
 //!   neither ever reaches the webview.
 //! - **Back-pressure.** Every frame handed to the webview counts against an 8 MiB budget until the
 //!   webview has taken it. The pump knows that by a probe: a no-op script evaluated in the webview
-//!   after the frames, whose completion means the webview's JavaScript ran everything before it.
-//!   One probe is in flight at a time. Past the budget the socket closes with 1013, and the UI
-//!   reconnects with `since` or `from`, as it does for a slow client today.
+//!   after the frames, whose completion means the webview's JavaScript ran every script before it.
+//!   Small frames are delivered by those scripts themselves, so they have reached the page's
+//!   handler. A large frame (JSON of 8 KiB or more, binary of 1 KiB or more) is only *fetched* by
+//!   its script, so the probe releases it once that fetch has started, not once the page has
+//!   handled it. One probe is in flight at a time. Past the budget the socket closes with 1013,
+//!   and the UI reconnects with `since` or `from`, as it does for a slow client today.
 
 use super::error::GatewayError;
 use super::sink::{Delivery, Sink};
 use crate::daemon::endpoint::BoxIo;
+use crate::redact::redact;
 use crate::token::DeviceToken;
 use futures_util::{SinkExt as _, StreamExt as _};
 use http::HeaderValue;
@@ -108,7 +112,7 @@ fn upgrade_error(e: WsError) -> GatewayError {
                 .as_deref()
                 .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
                 .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_owned))
-                .map(|m| format!(": {}", m.chars().take(300).collect::<String>()))
+                .map(|m| format!(": {}", redact(&m.chars().take(300).collect::<String>())))
                 .unwrap_or_default();
             let message = format!("the daemon refused the socket: HTTP {status}{said}");
             match status {
@@ -174,12 +178,12 @@ pub(crate) async fn pump(
     mut messages: mpsc::Receiver<Message>,
     mut control: mpsc::UnboundedReceiver<Control>,
     sink: Arc<dyn Sink>,
-    backlog: usize,
-    grace: Duration,
+    limits: super::Limits,
 ) -> Ended {
+    let grace = limits.close_grace;
     let (ack_tx, mut acks) = mpsc::unbounded_channel::<u64>();
     let mut budget = Budget {
-        limit: backlog as u64,
+        limit: limits.backlog as u64,
         sent: 0,
         taken: 0,
         probing: false,
@@ -220,7 +224,9 @@ pub(crate) async fn pump(
                 }
             }
             Some(message) = messages.recv(), if closing.is_none() => {
-                if ws.send(message).await.is_err() {
+                // A daemon that stops reading must not hold the pump (and so Close and Abandon).
+                let sent = tokio::time::timeout(limits.send_timeout, ws.send(message)).await;
+                if !matches!(sent, Ok(Ok(()))) {
                     outcome.get_or_insert((codes::ABNORMAL, String::new()));
                     break;
                 }
@@ -305,7 +311,10 @@ async fn deliver(
     }
     budget.sent += weight as u64;
     if budget.wants_probe() && !probe(sink, ack_tx, budget) {
+        // The webview is gone: close as the acknowledgement path does.
         *report = false;
+        outcome.get_or_insert((codes::GOING_AWAY, String::new()));
+        *closing = Some(start_close(ws, codes::GOING_AWAY, "the page went away", grace).await);
     }
 }
 
@@ -320,16 +329,16 @@ fn probe(sink: &dyn Sink, ack_tx: &mpsc::UnboundedSender<u64>, budget: &mut Budg
     .is_ok()
 }
 
-/// Sends a close frame. Returns until when to wait for the daemon's end of the handshake: `grace`
-/// from now, or now when the frame could not be sent (the connection is already gone).
+/// Sends a close frame, waiting at most `grace` for it to go out. Returns until when to wait for
+/// the daemon's end of the handshake: `grace` from now, or now when the frame could not be sent.
 async fn start_close(ws: &mut Ws, code: u16, reason: &str, grace: Duration) -> Instant {
     let frame = CloseFrame {
         code: CloseCode::from(code),
         reason: reason.to_owned().into(),
     };
-    match ws.send(Message::Close(Some(frame))).await {
-        Ok(()) => Instant::now() + grace,
-        Err(_) => Instant::now(),
+    match tokio::time::timeout(grace, ws.send(Message::Close(Some(frame)))).await {
+        Ok(Ok(())) => Instant::now() + grace,
+        _ => Instant::now(),
     }
 }
 

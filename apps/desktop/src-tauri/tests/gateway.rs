@@ -10,7 +10,7 @@ use common::{FakeDaemon, Recorder, WORKSPACE_ID, WORKSPACE_NAME, close_of, close
 use pitcrew_desktop::daemon::LocalConnector;
 use pitcrew_desktop::daemon::endpoint::Endpoint;
 use pitcrew_desktop::gateway::{
-    Delivery, ErrorCode, Gateway, GatewayError, GatewayRequest, GatewayResponse, Payload,
+    Delivery, ErrorCode, Gateway, GatewayError, GatewayRequest, GatewayResponse, Limits, Payload,
 };
 use pitcrew_desktop::registry::{
     Connection, Registry, WorkspaceKind, WorkspaceRecord, WorkspaceState,
@@ -33,6 +33,10 @@ struct World {
 }
 
 fn world() -> World {
+    world_with(Limits::default())
+}
+
+fn world_with(limits: Limits) -> World {
     let tmp = tempfile::tempdir().unwrap();
     let daemon = FakeDaemon::start(&tmp.path().join("state"), TOKEN);
     let registry = Arc::new(Registry::in_memory());
@@ -63,7 +67,7 @@ fn world() -> World {
         .build()
         .unwrap();
     World {
-        gateway: Gateway::new(Arc::clone(&registry)),
+        gateway: Gateway::with_limits(Arc::clone(&registry), limits),
         rt,
         daemon,
         registry,
@@ -323,6 +327,28 @@ fn socket_messages_arrive_in_order_and_close_comes_last() {
         .send("main", socket, Payload::Text("late".into()))
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::Invalid);
+}
+
+#[test]
+fn opening_a_socket_gives_up_when_the_daemon_never_answers_the_upgrade() {
+    let w = world_with(Limits {
+        open_timeout: Duration::from_millis(500),
+        ..Limits::default()
+    });
+    let started = Instant::now();
+    let e = w
+        .open("main", "/v1/sessions/hang/terminal", Recorder::keeping_up())
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Unreachable, "{e:?}");
+    assert!(e.message.contains("within"), "{}", e.message);
+    let took = started.elapsed();
+    assert!(
+        took >= Duration::from_millis(500) && took < Duration::from_secs(5),
+        "{took:?}"
+    );
+    assert_eq!(w.gateway.open_sockets(), 0);
+    // The default is 20 s.
+    assert_eq!(Limits::default().open_timeout, Duration::from_secs(20));
 }
 
 #[test]
