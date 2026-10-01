@@ -930,4 +930,178 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(state.office()).unwrap()).unwrap();
         assert_eq!(saved["done"], latest);
     }
+
+    /// `office.json` as JSON, if it is a file.
+    fn progress(state: &StateDir) -> Option<serde_json::Value> {
+        let text = std::fs::read_to_string(state.office()).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// Where the office starts is saved before the loop runs: a `--demo` start that fails after
+    /// seeding (say its listener cannot bind) still gets its pass over the seed next time.
+    #[test]
+    fn the_start_point_is_saved_before_the_loop_runs() {
+        let (_tmp, state) = state();
+        let hub = open(&state, true, true).unwrap();
+        let log = hub.store.log_id().to_owned();
+        assert_eq!(
+            progress(&state),
+            Some(serde_json::json!({ "log": log, "done": 0 }))
+        );
+        // The loop never ran.
+        drop(hub);
+        let hub = open(&state, false, true).unwrap();
+        assert_eq!(hub.office.as_ref().unwrap().last(), 0);
+    }
+
+    /// A workspace whose `@office` is not an agent of its person keeps the office off: the members
+    /// are `members`, added by the first.
+    fn office_stays_off_with(members: &[pitcrew_protocol::model::Member]) {
+        let (_tmp, state) = state();
+        let hub = open(&state, false, true).unwrap();
+        let workspace = hub.work.workspace();
+        let bodies = members
+            .iter()
+            .map(|m| EventBody::MemberAdded { member: m.clone() })
+            .collect();
+        let added = append(&hub.store, workspace, members[0].id, None, bodies);
+        drop(hub);
+        crate::state::write_json(
+            &state.office(),
+            &serde_json::json!({ "log": "x", "done": 1 }),
+        )
+        .unwrap();
+
+        let hub = open(&state, false, true).unwrap();
+        assert!(hub.office.is_none(), "{members:?}");
+        assert_eq!(
+            hub.store.latest_rev().unwrap(),
+            added.to_rev,
+            "no member was added"
+        );
+        assert_eq!(members_called(&hub.work, crate::office::HANDLE).len(), 1);
+        assert!(!state.office().exists(), "the office is off: no progress");
+    }
+
+    #[test]
+    fn an_office_that_is_a_person_or_not_the_persons_agent_stays_off() {
+        use pitcrew_protocol::model::Member;
+        let person = |handle: &str| Member {
+            id: MemberId::new(),
+            kind: MemberKind::Human,
+            handle: handle.to_owned(),
+            name: handle.trim_start_matches('@').to_owned(),
+            owner: None,
+            persona: None,
+        };
+        let agent = |owner: Option<MemberId>| Member {
+            kind: MemberKind::Agent,
+            owner,
+            ..person(crate::office::HANDLE)
+        };
+        let (lee, kim) = (person("@lee"), person("@kim"));
+        // A person holds the handle.
+        office_stays_off_with(&[lee.clone(), person(crate::office::HANDLE)]);
+        // Another person's agent.
+        office_stays_off_with(&[lee.clone(), kim.clone(), agent(Some(kim.id))]);
+        // No one's agent.
+        office_stays_off_with(&[lee.clone(), agent(None)]);
+    }
+
+    /// A save that fails does not count: it is tried again a second later, and when the loop
+    /// stops, until it is written.
+    #[test]
+    fn a_failed_save_is_tried_again() {
+        use pitcrew_hub_work::TaskRef;
+        use pitcrew_protocol::model::{DispatchOutcome, TaskStatus};
+        let (_tmp, state) = state();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let demo = pitcrew_fixtures::demo_workspace().unwrap();
+        let sam = demo_person(&demo).unwrap();
+        let writer: MemberId = "01JB000000000000000MEM0002".parse().unwrap();
+        let Hub {
+            tokens: _tokens,
+            store: _store,
+            work,
+            office: back_office,
+        } = open(&state, true, true).unwrap();
+        // A directory where office.json goes: every save fails while it is there.
+        let block = || {
+            let _ = std::fs::remove_file(state.office());
+            std::fs::create_dir(state.office()).unwrap();
+        };
+        let unblock = || std::fs::remove_dir(state.office()).unwrap();
+        let saved = |rev: u64| progress(&state).is_some_and(|p| p["done"] == rev);
+        let latest = || work.store().latest_rev().unwrap();
+        let wait_for = |what: &str, holds: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !holds() {
+                assert!(Instant::now() < deadline, "never: {what}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        // The log stays as it is for a second: the office has looked at all of it, its own
+        // appends included.
+        let settle = || {
+            let mut seen = latest();
+            let mut since = Instant::now();
+            while since.elapsed() < Duration::from_secs(1) {
+                std::thread::sleep(Duration::from_millis(50));
+                let now = latest();
+                if now != seen {
+                    (seen, since) = (now, Instant::now());
+                }
+            }
+            seen
+        };
+        let pap1 = TaskRef::parse("PAP-1").unwrap();
+        block();
+        runtime.block_on(async {
+            let running = back_office.unwrap().spawn(Arc::clone(&work));
+            append(
+                work.store(),
+                work.workspace(),
+                writer,
+                Some(sam),
+                vec![EventBody::DispatchFinished {
+                    dispatch: "01JB000000000000000DSP0001".parse().unwrap(),
+                    outcome: DispatchOutcome::Succeeded,
+                    summary: None,
+                }],
+            );
+            wait_for("PAP-1 moves to review", &|| {
+                work.task(&pap1).unwrap().status == TaskStatus::Review
+            });
+            let now = settle();
+            // Saves failed meanwhile, at least once a second.
+            assert!(state.office().is_dir());
+
+            // Once it can be written, it is, without another run.
+            unblock();
+            wait_for("a save after the failures", &|| saved(now));
+
+            // And the stop saves what failed saves could not.
+            block();
+            append(
+                work.store(),
+                work.workspace(),
+                sam,
+                None,
+                vec![EventBody::CommentPosted {
+                    task: Some(work.task(&pap1).unwrap().id),
+                    workstream: None,
+                    text: "Looks good.".into(),
+                    mentions: Vec::new(),
+                }],
+            );
+            settle();
+            assert!(state.office().is_dir());
+            unblock();
+            running.stop(Duration::from_secs(20)).await;
+        });
+        assert!(saved(latest()), "{:?}", progress(&state));
+    }
 }

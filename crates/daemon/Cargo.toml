@@ -18,6 +18,9 @@ pitcrew-api.workspace = true
 pitcrew-auth.workspace = true
 pitcrew-store.workspace = true
 pitcrew-hub-work.workspace = true
+# Only to tell the hub's refusals of the back office's actions (final) from its internal failures
+# (tried again): `run_office` reports both as `pitcrew_office::ApplyError`.
+pitcrew-office.workspace = true
 pitcrew-fixtures.workspace = true
 anyhow.workspace = true
 axum.workspace = true
