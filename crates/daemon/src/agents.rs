@@ -8,30 +8,48 @@
 //! - **Sub-agents run as their parent.** A session with a `parent` answers the agent found up its
 //!   chain of parents: the runner states sub-agent sessions without an agent of their own.
 //! - **`Unknown` when in doubt:** the read failed, the agent is not a member the hub knows as an
-//!   agent, two sessions of the chain name different agents, or the chain is too long or loops.
-//!   The runner refuses every hook for such a session.
+//!   agent, two sessions of the chain name different agents, or the chain is longer than
+//!   [`MAX_CHAIN`] sessions or loops. The runner refuses every hook for such a session.
 //! - It never calls back into the runner: it reads the store only.
+//!
+//! **A window at discovery.** The runner decides the hooks it held for a new session when it
+//! discovers it, before the hub has stored that session (the `session_discovered` is on its way
+//! to the store). The session is then not in the tables, so its `parent` cannot be seen either,
+//! and the answer is `NoAgent`, even for a sub-agent whose parent has an agent. Harmless today:
+//! every parent is the runner's own session, which has no agent. Once the runner adopts dispatch
+//! ids, a dispatched agent's sub-agents would answer `NoAgent` in that window, so a person's held
+//! hooks for them would apply and the agent's own would not. The fix belongs to the runner: when
+//! it holds a sub-agent's hooks, ask about its parent too (`agent_of(parent)` when the sub-agent
+//! answers `NoAgent`), or pass the parent in.
 
 use pitcrew_hub_work::{WorkService, query};
 use pitcrew_protocol::ids::{MemberId, SessionId};
 use pitcrew_protocol::model::MemberKind;
 use pitcrew_runner::{SessionAgent, SessionAgents};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Most sessions followed up a chain of parents. Claude's sub-agents are one level deep.
-const MAX_CHAIN: usize = 16;
+/// Most sessions read up a chain of parents, the session itself included (Claude's sub-agents
+/// are one level deep). A chain that goes on past them, to a 17th session whether the hub has
+/// stored it or not, is `Unknown`: safe, as an unknown agent refuses the hook.
+pub const MAX_CHAIN: usize = 16;
 
 /// The runner's `SessionAgents` over the hub's sessions and members.
 #[derive(Debug)]
 pub struct HubAgents {
     work: Arc<WorkService>,
+    /// A read failed; warned once, then logged at debug.
+    failed: AtomicBool,
 }
 
 impl HubAgents {
     /// Reads `work`'s tables.
     #[must_use]
     pub fn new(work: Arc<WorkService>) -> Self {
-        Self { work }
+        Self {
+            work,
+            failed: AtomicBool::new(false),
+        }
     }
 }
 
@@ -40,7 +58,11 @@ impl SessionAgents for HubAgents {
         match self.work.read(|conn| agent_in(conn, session)) {
             Ok(agent) => agent,
             Err(e) => {
-                tracing::warn!(error = %e, %session, "cannot read who runs a session; its hooks are refused");
+                if self.failed.swap(true, Ordering::Relaxed) {
+                    tracing::debug!(error = %e, %session, "cannot read who runs a session; its hooks are refused");
+                } else {
+                    tracing::warn!(error = %e, %session, "cannot read who runs a session; its hooks are refused (later failures are logged at debug)");
+                }
                 SessionAgent::Unknown
             }
         }
@@ -53,19 +75,12 @@ fn agent_in(
     session: SessionId,
 ) -> pitcrew_hub_work::Result<SessionAgent> {
     let mut named: Option<MemberId> = None;
-    let mut next = Some(session);
+    let mut id = session;
     for _ in 0..MAX_CHAIN {
-        let Some(id) = next else {
-            return match named {
-                Some(agent) => agent_member(conn, agent),
-                None => Ok(SessionAgent::NoAgent),
-            };
-        };
         // A session the hub has not stored has no agent yet (see `SessionAgents`), and neither
         // does a sub-agent whose parent it has not stored.
         let Some(s) = query::session(conn, &id)? else {
-            next = None;
-            continue;
+            return answer(conn, named);
         };
         match (named, s.agent) {
             (Some(a), Some(b)) if a != b => {
@@ -75,10 +90,24 @@ fn agent_in(
             (None, Some(agent)) => named = Some(agent),
             _ => {}
         }
-        next = s.parent;
+        match s.parent {
+            Some(parent) => id = parent,
+            None => return answer(conn, named),
+        }
     }
     tracing::debug!(%session, "a chain of parent sessions is too long or loops");
     Ok(SessionAgent::Unknown)
+}
+
+/// The answer for a chain that named `named` (or no agent).
+fn answer(
+    conn: &pitcrew_store::sql::Connection,
+    named: Option<MemberId>,
+) -> pitcrew_hub_work::Result<SessionAgent> {
+    match named {
+        Some(agent) => agent_member(conn, agent),
+        None => Ok(SessionAgent::NoAgent),
+    }
 }
 
 /// `agent` as the session's agent: it must be an agent member the hub knows.
@@ -291,6 +320,50 @@ mod tests {
         hub.state(a, None, Some(b));
         hub.state(b, None, Some(a));
         assert_eq!(agents.agent_of(a), SessionAgent::Unknown);
+    }
+
+    /// A chain of `MAX_CHAIN` sessions is followed to its root; one going on past it, to a parent
+    /// stored or not, is in doubt.
+    #[test]
+    fn chains_are_followed_for_max_chain_sessions() {
+        let hub = Hub::new();
+        let agents = hub.agents();
+        let writer = MemberId::new();
+        hub.add_member(writer, MemberKind::Agent, Some(hub.person));
+        // A root with the agent, and below it a chain of sub-agents: chain[k] has k ancestors.
+        let root = SessionId::new();
+        hub.state(root, Some(writer), None);
+        let mut chain = vec![root];
+        for _ in 1..=MAX_CHAIN {
+            let next = SessionId::new();
+            hub.state(next, None, chain.last().copied());
+            chain.push(next);
+        }
+        let as_writer = SessionAgent::Agent {
+            agent: writer,
+            owner: Some(hub.person),
+        };
+        // `MAX_CHAIN` sessions, the root included.
+        assert_eq!(agents.agent_of(chain[MAX_CHAIN - 1]), as_writer);
+        // One more.
+        assert_eq!(agents.agent_of(chain[MAX_CHAIN]), SessionAgent::Unknown);
+        // `MAX_CHAIN` sessions whose root names a parent the hub has not stored: the 17th is not
+        // read, so in doubt, although it would have had no agent.
+        let mut unrooted = vec![SessionId::new()];
+        hub.state(unrooted[0], None, Some(SessionId::new()));
+        for _ in 1..MAX_CHAIN {
+            let next = SessionId::new();
+            hub.state(next, None, unrooted.last().copied());
+            unrooted.push(next);
+        }
+        assert_eq!(
+            agents.agent_of(unrooted[MAX_CHAIN - 1]),
+            SessionAgent::Unknown
+        );
+        assert_eq!(
+            agents.agent_of(unrooted[MAX_CHAIN - 2]),
+            SessionAgent::NoAgent
+        );
     }
 
     #[test]
