@@ -198,7 +198,19 @@ impl Deployment for JiraDataCenter {
         body: &[u8],
     ) -> Result<(Vec<Value>, Option<PageState>), serde_json::Error> {
         let page: crate::wire::DataCenterSearchPage = serde_json::from_slice(body)?;
-        let fetched_so_far = page.start_at + page.issues.len() as u64;
+        // R30: `startAt` is a server-supplied offset, not bounded by this page's own item count —
+        // a hostile or malfunctioning Data Center near `u64::MAX` must not overflow `start_at +
+        // issues.len()` (a panic with overflow checks, or a wrapped, small offset in release that
+        // would re-read the result from the start). Treated the same as any other page this crate
+        // cannot make sense of: malformed, not parsed.
+        let fetched_so_far = page
+            .start_at
+            .checked_add(page.issues.len() as u64)
+            .ok_or_else(|| {
+                <serde_json::Error as serde::de::Error>::custom(
+                    "startAt overflows with this page's item count",
+                )
+            })?;
         let next = (fetched_so_far < page.total).then_some(PageState::DataCenter {
             start_at: fetched_so_far,
         });
@@ -292,6 +304,15 @@ mod tests {
         let (issues, next) = JiraDataCenter.parse_search_page(body).expect("parses");
         assert_eq!(issues.len(), 2);
         assert_eq!(next, Some(PageState::DataCenter { start_at: 2 }));
+    }
+
+    #[test]
+    fn r30_a_start_at_near_u64_max_is_a_malformed_page_not_an_overflow() {
+        // Stream Q's open-r30-start-at-overflow regression: `start_at + issues.len()` used to
+        // overflow (a panic with overflow checks, a wrapped small offset in release that would
+        // re-read the result from the start).
+        let body = br#"{"startAt":18446744073709551615,"total":0,"issues":[1]}"#;
+        assert!(JiraDataCenter.parse_search_page(body).is_err());
     }
 
     #[test]
