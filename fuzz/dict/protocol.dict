@@ -90,3 +90,15 @@
 "\"question\""
 "\"at_start\":true"
 "\"input\":"
+# Hidden characters in event text (recap_index): RLO, a tag character, soft hyphen, U+2028,
+# U+180E, zero-width space.
+"\xe2\x80\xae"
+"\xf3\xa0\x81\x81"
+"\xc2\xad"
+"\xe2\x80\xa8"
+"\xe1\xa0\x8e"
+"\xe2\x80\x8b"
+"\"path\":\""
+"\"target\":\""
+"\"text\":\""
+"\"title\":\""

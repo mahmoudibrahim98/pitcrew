@@ -2,6 +2,8 @@
 //! crash together with the input that caused it.
 
 pub mod shell;
+pub mod slurm;
+pub mod url_model;
 
 use pitcrew_protocol::transcript::TranscriptItem;
 use serde::Serialize;
@@ -17,6 +19,88 @@ use std::sync::OnceLock;
 pub fn skip_known() -> bool {
     static SKIP: OnceLock<bool> = OnceLock::new();
     *SKIP.get_or_init(|| std::env::var_os("PITCREW_FUZZ_SKIP_KNOWN").is_some_and(|v| v == "1"))
+}
+
+/// Characters that are invisible or change the direction of text: the set untrusted text must
+/// lose before people or agents read it (bidi controls and isolates, zero-width characters, the
+/// byte-order mark, the soft hyphen, the Mongolian vowel separator, the line and paragraph
+/// separators, and the Unicode tag characters that can smuggle text to a model). Written here from
+/// the threat model, not copied from a crate under test.
+#[must_use]
+pub fn is_hidden_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+            | '\u{E0000}'..='\u{E007F}'
+    )
+}
+
+/// A scripted HTTP response, `STATUS\nName: value\n…\n\nBODY`: a status that does not parse is
+/// 200. With [`skip_known`], a `Retry-After` of more than 10 characters is cut to 10, past the
+/// known overflow in both tracker clients (R28).
+#[must_use]
+pub fn scripted_response(bytes: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    let text = String::from_utf8_lossy(bytes);
+    let (head, body) = text.split_once("\n\n").unwrap_or((&text, ""));
+    let mut lines = head.lines();
+    let status = lines
+        .next()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .unwrap_or(200);
+    let headers = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| {
+            let (k, mut v) = (k.trim().to_owned(), v.trim().to_owned());
+            if skip_known() && k.eq_ignore_ascii_case("retry-after") && v.len() > 10 {
+                v = v.chars().take(10).collect();
+            }
+            (k, v)
+        })
+        .collect();
+    (status, headers, body.as_bytes().to_vec())
+}
+
+/// Percent-decodes `s` the way a form or query decoder does, without `+` for space.
+#[must_use]
+pub fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        if b[i] == b'%'
+            && let (Some(&h), Some(&l)) = (b.get(i + 1), b.get(i + 2))
+            && let (Some(h), Some(l)) = (hex(h), hex(l))
+        {
+            out.push(u8::try_from(h * 16 + l).unwrap_or(0));
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Percent-encodes everything but unreserved characters.
+#[must_use]
+pub fn percent_encode(value: &str) -> String {
+    let mut out = String::new();
+    for b in value.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// An empty folder `name` in this process's scratch folder (see [`scratch_path`]), emptied first

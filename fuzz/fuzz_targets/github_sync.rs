@@ -12,16 +12,21 @@
 //! Checks, besides "no panic":
 //! - **no request leaves the API base**: every request URL, resolved the way a WHATWG URL parser
 //!   (the `url` crate, which reqwest and ureq use) resolves it, has the base's scheme, host and
-//!   port, and a path under the base's path after `.`/`..` segments are resolved;
+//!   port, and a path under the base's path after `.`/`..` segments are resolved. R8 and R9 are
+//!   fixed; their inputs in `fuzz/regressions/github_sync/` must pass;
+//! - **links kept from upstream are pinned** (R10, fixed): every `ExternalRef` URL is `https` on
+//!   the expected web host (`github.com`, or the Enterprise server's own host);
 //! - the `Link` header parser returns a URL that appears in the header;
 //! - a call makes a bounded number of requests;
 //! - errors, issues and the outcome's `Debug` never contain the token;
 //! - titles, bodies and labels are within their caps, and the state and changes survive a JSON
-//!   round trip.
+//!   round trip;
+//! - no arithmetic overflows on server numbers (R28: a `retry-after` near `i64::MAX`).
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use pitcrew_fuzz::{roundtrip, skip_known};
+use pitcrew_fuzz::{is_hidden_char, roundtrip, scripted_response};
+use pitcrew_protocol::model::ExternalRef;
 use pitcrew_sync_github::bounds::{
     MAX_BODY_CHARS, MAX_LABEL_CHARS, MAX_LABELS, MAX_PAGES_PER_CALL, MAX_TITLE_CHARS,
 };
@@ -99,6 +104,11 @@ fuzz_target!(|input: &[u8]| {
         api_base: base.map(str::to_owned),
     };
     let base_url = url::Url::parse(base.unwrap_or("https://api.github.com")).expect("a base");
+    let web_host = base_url
+        .host_str()
+        .filter(|_| base.is_some())
+        .unwrap_or("github.com")
+        .to_owned();
 
     let mut state = SyncState::default();
     for _ in 0..2 {
@@ -127,6 +137,9 @@ fuzz_target!(|input: &[u8]| {
         }
         for change in &outcome.changes {
             check_change(change);
+            for link in refs(change) {
+                check_pinned(link, &web_host);
+            }
             roundtrip(change);
         }
         roundtrip(&outcome.state);
@@ -146,22 +159,51 @@ fn check_destination(url: &str, base: &url::Url) {
     let base_path = base.path().trim_end_matches('/');
     let path = target.path();
     let under = path == base_path || path.starts_with(&format!("{base_path}/"));
-    if skip_known() && !same_origin {
-        // Known finding: `origin::parse` and a WHATWG parser disagree about `\` before `@`.
-        return;
-    }
     assert!(
         same_origin,
         "a request with the token left the API base's origin: {url:?} goes to {:?}",
         target.host_str()
     );
-    if skip_known() {
-        // Known finding: `%2e%2e` and `\` segments resolve outside the base path.
-        return;
-    }
     assert!(
         under,
         "a request with the token left the API base's path: {url:?} resolves to {path:?}"
+    );
+}
+
+/// Every reference a change carries.
+fn refs(change: &UpstreamChange) -> Vec<&ExternalRef> {
+    let mut out = vec![change.source()];
+    match change {
+        UpstreamChange::IssueOpened {
+            milestone: Some(m), ..
+        }
+        | UpstreamChange::IssueMilestoned {
+            milestone: Some(m), ..
+        } => out.push(m),
+        UpstreamChange::PullRequestMerged { closes, .. } => out.extend(closes),
+        _ => {}
+    }
+    out
+}
+
+/// An upstream link is kept only as `https` on the expected web host, with nothing hidden in it.
+/// (Closing references always point at `github.com`, which the crate builds itself.)
+fn check_pinned(link: &ExternalRef, web_host: &str) {
+    let Some(url) = &link.url else { return };
+    let parsed = url::Url::parse(url).unwrap_or_else(|e| panic!("a kept link {url:?}: {e}"));
+    assert_eq!(
+        parsed.scheme(),
+        "https",
+        "a kept link that is not https: {url:?}"
+    );
+    let host = parsed.host_str().unwrap_or("");
+    assert!(
+        host == web_host || host == "github.com",
+        "a kept link on another host: {url:?}"
+    );
+    assert!(
+        !url.chars().any(is_hidden_char),
+        "a hidden character in {url:?}"
     );
 }
 
@@ -204,20 +246,10 @@ fn check_labels(labels: &[String]) {
 
 /// `STATUS\nName: value\n…\n\nBODY`.
 fn response(bytes: &[u8]) -> Response {
-    let text = String::from_utf8_lossy(bytes);
-    let (head, body) = text.split_once("\n\n").unwrap_or((&text, ""));
-    let mut lines = head.lines();
-    let status = lines
-        .next()
-        .and_then(|s| s.trim().parse::<u16>().ok())
-        .unwrap_or(200);
-    let headers = lines
-        .filter_map(|l| l.split_once(':'))
-        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
-        .collect();
+    let (status, headers, body) = scripted_response(bytes);
     Response {
         status,
         headers,
-        body: body.as_bytes().to_vec(),
+        body,
     }
 }

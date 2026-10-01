@@ -181,6 +181,9 @@ seed("api_json", "page", line({"items": [
 seed("api_json", "host-info", line({"name": "pitcrewd", "version": "0.0.0", "protocol": 1, "protocol_min": 1,
                                    "roles": ["hub", "runner"], "machine": machine, "capabilities": ["pty"]}))
 seed("api_json", "api-error", line({"code": "forbidden", "message": "no"}))
+recaps = json.loads((FIXTURES / "demo-recaps.json").read_text("utf-8"))
+seed("api_json", "recap-blocks", line({"blocks": recaps["blocks"][:3], "at_start": True}))
+seed("api_json", "recap-days", line({"days": recaps["projects"][0]["days"][:3], "at_start": False}))
 
 # API requests: [method] + path, headers, empty line, body. $D and $A are the minted tokens.
 requests = [
@@ -482,6 +485,210 @@ for i, window in enumerate(windows("\n".join(event_lines).encode() + b"\n", size
     seed("recap_blocks", f"events-{i:02}", bytes([2 * i, 3, 1, 4, 2]) + window)
 seed("recap_blocks", "all", bytes([0, 0]) + "\n".join(event_lines).encode())
 seed("recap_blocks", "all-small", bytes([1 | (2 << 1), 2, 7, 1]) + "\n".join(event_lines).encode())
+
+# --- crates/remote SLURM -----------------------------------------------------------------------
+
+# [mode] + text: 0 a wall time, 1 a duration (u64 seconds, u32 nanoseconds, little-endian),
+# 2 an exit code, 3 #SBATCH options, one per line.
+for i, text in enumerate([
+    "30", "59:58", "1:59:58", "08:00:00", "2-0", "2-03:04", "1-02:03:04", " 12:00 ",
+    "UNLIMITED", "INFINITE", "NOT_SET", "", "1:2:3:4", "-1", "1-", "1-2:3:4:5", "a:b", "+5",
+    "999999999-23:59:59", "1234567890", "0-0:0:0", "000000001:000000001",
+]):
+    seed("remote_slurm", f"time-{i:02}", bytes([0]) + text.encode())
+for i, (secs, nanos) in enumerate([
+    (0, 0), (60, 0), (60, 500_000_000), (86_400 + 3_661, 0), (3 * 86_400, 1),
+    (999_999_999 * 86_400 + 86_399, 0), (1_000_000_000 * 86_400, 0), (2**64 - 1, 0),
+]):
+    seed("remote_slurm", f"duration-{i:02}", bytes([1]) + struct.pack("<QI", secs, nanos))
+for i, text in enumerate([
+    "1:0", " 0:9 ", "0:15", "", "1", "a:b", "1:", "-1:0", "+1:0", "4294967295:4294967295",
+    "4294967296:0", "1:2:3", "\t2:0\n",
+]):
+    seed("remote_slurm", f"exit-{i:02}", bytes([2]) + text.encode())
+for i, lines in enumerate([
+    ["--constraint=a100&ib", "--exclusive", "--mail-type=END", "--signal=B:TERM@60"],
+    ["--comment=x", "--nodes=1", "--constraint=[a*2&b*4]"],
+    ["--job-name=x", "--wrap=id", "--uid=0", "--chdir=/tmp", "--output=/tmp/x"],
+    ["--exclusive=user", "--nice=10", "--nice", "--comment"],
+    ["--constraint=a\r", "--Constraint=a", "-p gpu", "--comment=a#b", "--comment='a'"],
+    ["--comment=a-hetjob-b", "--dependency=afterok:1", "--export=ALL"],
+]):
+    seed("remote_slurm", f"sbatch-{i:02}", bytes([3]) + "\n".join(lines).encode())
+
+# Recipes: [flags] + TOML. Flags bits 0-2 pick the name (1 is example-cluster), bits 3-4 pad.
+example_site = (HERE.parent / "crates" / "remote" / "src" / "helper" / "slurm"
+                / "example-site.toml").read_text("utf-8")
+for i, (flags, text) in enumerate([
+    (1, example_site),
+    (2, 'partition = "gpu"\n'),
+    (2, 'partitoin = "gpu"\n'),
+    (3, '[slurm]\npartition = "gpu"\n'),
+    (2, 'partition.name = "gpu"\n'),
+    (0, 'cpus = 2\nmemory = "8G"\ngres = "gpu:a100:2"\n'),
+    (0, 'sbatch = ["--constraint=a100", "--nodes=1", "--exclusive"]\n'),
+    (0, 'modules = ["python/3.12", "tool/1.0@abc"]\nmodules_init = "/etc/profile.d/modules.sh"\n'),
+    (0, 'time = "08:00:00"\nlast_hop = "srun"\nsocket = "node-local"\naccount = "proj0001"\n'),
+    (0, 'description = "a\\nb"\n'),
+    (0, 'cpus = -1\nqos = "normal"\n'),
+    (0, '# nothing\n'),
+    (4, 'partition = "gpu"\n'),
+    (2 | (1 << 3), 'partition = "gpu"\n'),
+    (2 | (2 << 3), 'partition = "gpu"\n'),
+    (2 | (3 << 3), 'partition = "gpu"\n'),
+]):
+    seed("remote_site", f"recipe-{i:02}", bytes([flags]) + text.encode())
+
+# --- crates/sync-jira --------------------------------------------------------------------------
+
+# ADF: [0] + a JSON document, or [1] + a program (see jira_adf.rs: op = b % 8, arg = b / 8).
+def adf(*content):
+    return {"type": "doc", "version": 1, "content": list(content)}
+
+
+def para(*content):
+    return {"type": "paragraph", "content": list(content)}
+
+
+def text(t):
+    return {"type": "text", "text": t}
+
+
+nested = text("center")
+for _ in range(40):
+    nested = {"type": "blockquote", "content": [nested]}
+for i, doc in enumerate([
+    adf(para(text("Hello, "), text("world.")), para(text("Second paragraph."))),
+    adf(para(text("cc "), {"type": "mention", "attrs": {"id": "abc123", "text": "@Alice"}},
+             {"type": "emoji", "attrs": {"shortName": ":tada:"}})),
+    adf(para({"type": "inlineCard", "attrs": {"url": "https://jira.example.com/browse/DEMO-1"}}),
+        {"type": "rule"}, para(text("a"), {"type": "hardBreak"}, text("b"))),
+    adf({"type": "codeBlock", "content": [text("fn main() {}")]},
+        {"type": "bulletList", "content": [{"type": "listItem", "content": [para(text("one"))]}]},
+        {"type": "table", "content": [{"type": "tableRow", "content": [
+            {"type": "tableCell", "content": [para(text("cell"))]}]}]}),
+    adf(nested),
+    adf(para(text("safe‮loot rof"), text("a​b﻿c"), text("tag\U000E0041\U000E0042"),
+             text("soft­hyphen᠎  "))),
+    adf(para(1, "x", None, [text("in a list")], {"content": "no type"}, {"type": "text"})),
+    {"type": "text", "text": "a bare text node"},
+    "not a node",
+]):
+    seed("jira_adf", f"json-{i:02}", b"\x00" + line(doc).encode())
+for i, program in enumerate([
+    [0, 2, 10, 1],                 # a paragraph of ten 'a'
+    [2, 1, 6 + 8 * 15],            # one 'a', repeated 32,768 times (to the build cap)
+    [2, 5, 7 + 8 * 31],            # five 'a' in 128 quotes
+    [2 + 8 * 3, 15, 1],            # 61,440 'é'
+    [0, 3, 3 + 8 * 5, 4, 4 + 8 * 1, 4 + 8 * 2, 5, 5 + 8, 1],
+    [0 + 8 * 1, 2, 3, 6 + 8 * 4, 1, 7 + 8 * 7, 6 + 8 * 8],
+]):
+    seed("jira_adf", f"program-{i:02}", bytes([1] + program))
+
+JIRA_AT = "2026-09-30T10:00:00.000+0200"
+
+
+def jira_issue(key, summary, *, kind="Story", category="indeterminate", description=None,
+               labels=(), parent=None, extra=None, updated=JIRA_AT, ident=None):
+    fields = {"summary": summary, "status": {"statusCategory": {"key": category}},
+              "issuetype": {"name": kind}, "updated": updated, "labels": list(labels),
+              "assignee": {"accountId": "acc-1", "displayName": "Demo‮User"},
+              "resolution": {"name": "Fixed"} if category == "done" else None}
+    if description is not None:
+        fields["description"] = description
+    if parent:
+        fields["parent"] = {"key": parent}
+    fields.update(extra or {})
+    return {"id": ident or key.split("-")[-1], "key": key, "fields": fields}
+
+
+def jira_seed(flags, key, cursor, myself, *pages):
+    parts = [key.encode(), cursor.encode(), myself.encode()] + [p.encode() for p in pages]
+    return bytes([flags]) + b"\xff".join(parts)
+
+
+ok_tz = '200\n\n{"timeZone":"Europe/Brussels"}'
+cloud_pages = [
+    "200\n\n" + line({"issues": [
+        jira_issue("DEMO-1", "Seed runs diverge", description=adf(para(text("See the log."))),
+                   labels=["bug", "x​y"], parent="DEMO-9"),
+        jira_issue("DEMO-9", "The epic", kind="Epic"),
+    ], "nextPageToken": "page-2"}),
+    "200\n\n" + line({"issues": [
+        jira_issue("DEMO-2", "Done one", category="done", description="plain v2 text"),
+        jira_issue("DEMO-01", "leading zero"), jira_issue("demo-3", "lower case"),
+        jira_issue("DEMO-1/../../secure/Logout.jspa", "path"),
+        jira_issue("DEMO-1​2", "hidden"), {"id": "x"}, 5,
+    ]}),
+]
+dc_page = "200\n\n" + line({"startAt": 0, "total": 3, "issues": [
+    jira_issue("DEMO-4", "From Data Center", description="text", extra={"customfield_10008": "DEMO-9"}),
+    jira_issue("DEMO-5", "Bad updated", updated="yesterday"),
+]})
+for i, data in enumerate([
+    jira_seed(0, "DEMO", "2026-09-29T08:00:00Z", ok_tz, *cloud_pages),
+    jira_seed(1 | 2, "DEMO", "", '200\n\n{"timeZone":"America/New_York"}', dc_page,
+              "200\n\n" + line({"startAt": 2, "total": 3, "issues": []})),
+    jira_seed(0, "AB1", "2026-01-02 03:04", ok_tz, '429\nRetry-After: 30\n\n'),
+    jira_seed(1, "DEMO", "not a time", "500\n\n", "429\n\n"),
+    jira_seed(0, "DEMO\" OR 1=1 --", "\" OR updated > \"0", '200\n\n{"timeZone":"../../etc/x"}',
+              cloud_pages[0]),
+    jira_seed(8, "ABCDEFGHIJ", "-009999-01-01T00:00:00Z", '200\n\n{"timeZone":"Mars/Olympus"}',
+              "200\n\n" + line({"issues": [], "nextPageToken": "t"}), "200\n\nnot json"),
+    jira_seed(1 | 4, "DEMO", "9999-12-31T23:59:59Z", ok_tz,
+              "200\n\n" + line({"startAt": 0, "total": 1000, "issues": [jira_issue("DEMO-6", "x")]})),
+]):
+    seed("jira_sync", f"responses-{i:02}", data)
+
+# --- crates/sync-github links ------------------------------------------------------------------
+
+# [base] + next link, 0xFF, html_url, 0xFF, pull request body.
+GHE = "https://ghe.example.com"
+for i, (base, link, html, body) in enumerate([
+    (0, "https://api.github.com/repositories/724712/milestones?page=2",
+     "https://github.com/example-org/demo-repo/issues/7", "Fixes #12 and other-org/other-repo#45."),
+    (1, f"{GHE}/api/v3/repos/o/r/milestones?page=2", f"{GHE}/example-org/demo-repo/issues/7",
+     "Resolves: #5, #6"),
+    (2, f"{GHE}:8443/api/v3/x?page=2", f"{GHE}/o/r/pull/9", "This closed #1, #2 and #3 for good."),
+    (1, f"{GHE}/api/v3/../../admin", "javascript:alert(1)", "Closes ../evil#1"),
+    (1, f"{GHE}/api/v3/%2e%2e/%2e%2e/admin", "http://github.com/x", "```\nCloses #99\n```\nFixes #1"),
+    (0, "https://attacker.example\\@api.github.com/x", "https://github.com.attacker.example/x",
+     "> Fixes #2\nFixes ow@ner/repo#1"),
+    (1, f"{GHE}/api/v3evil/x", "https://github.com/x‮", "fixes evil/..#3"),
+    (2, f"{GHE}:8443/api/v3/./repos/x/../o/r?page=2", f"{GHE}:8443/o/r", "Fixed: a.b/c-d#4"),
+    (0, "/relative?page=2", "data:text/html,x", "closes #-1 #+2 #18446744073709551616"),
+]):
+    data = bytes([base]) + b"\xff".join(s.encode() for s in (link, html, body))
+    seed("github_links", f"links-{i:02}", data)
+
+# --- crates/api recaps -------------------------------------------------------------------------
+
+ws_ids = [w["id"] for w in workspace["workstreams"]]
+pr_ids = [p["id"] for p in workspace["projects"]]
+se_ids = [s["id"] for s in workspace["sessions"]]
+for i, (flags, query) in enumerate([
+    (0, ""), (0, "limit=0"), (0, "limit=1&before=x"), (0, f"session={se_ids[0]}&limit=500"),
+    (0, f"workstream={ws_ids[0]}&project={pr_ids[0]}&task=tsk_x"), (0, "limit=1&limit=2"),
+    (1, f"workstream={ws_ids[0]}"), (1, f"project={pr_ids[0]}&tz=-840&before=2026-09-30"),
+    (1, f"workstream={ws_ids[1]}&tz=841"), (1, f"project={pr_ids[1]}&before=2026-02-31&limit=31"),
+    (1, f"workstream={ws_ids[0]}&project={pr_ids[0]}"), (1, "tz=60"),
+    (1, f"workstream={ws_ids[2]}&tz=%2B60"), (1, f"workstream={ws_ids[2]}&limit=99999999999999999999"),
+]):
+    seed("api_recaps", f"raw-{i:02}", bytes([0x80 | flags]) + query.encode())
+for i, (flags, choices) in enumerate([
+    (0, [0, 0, 0, 0, 0, 0]), (0, [2, 3, 2 | 8, 3, 2, 2 | (5 << 2)]), (0, [4, 5, 6, 7, 2, 2]),
+    (1, [2, 0, 2 | (9 << 2), 2, 2 | (1 << 2), 0]), (1, [0, 2, 2 | (10 << 2), 2 | (1 << 2), 2, 0]),
+    (1, [2, 2, 0, 0, 0, 0]), (1, [3, 0, 3, 3, 3, 0]), (0, [7, 7, 7, 7, 7, 3]),
+]):
+    seed("api_recaps", f"structured-{i:02}", bytes([flags] + choices) + b"2026-09-30")
+
+# --- crates/hub-work recap index ---------------------------------------------------------------
+
+# [config, k, cache, queries] + k % 8 batch sizes + events.
+for i, window in enumerate(windows("\n".join(event_lines).encode() + b"\n", size=6, step=3)):
+    seed("recap_index", f"events-{i:02}", bytes([2 * i, 3, i, 8 * i + 1, 1, 4, 2]) + window)
+seed("recap_index", "all", bytes([0, 0, 3, 2]) + "\n".join(event_lines).encode())
+seed("recap_index", "all-small", bytes([1 | (2 << 1), 2, 1, 3, 7, 1]) + "\n".join(event_lines).encode())
 
 for target, n in sorted(counts.items()):
     print(f"{target}: {n} seeds")
