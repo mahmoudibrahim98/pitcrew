@@ -30,6 +30,18 @@ const HANDLE_CHARS: usize = 32;
 /// append that creates the person and the machine commits, with the command lock still held (see
 /// "One writer" on [`WorkService`]): nothing else can write to the work model between the commit
 /// and the listener seeing it. Register one with [`WorkService::with_setup_listener`].
+///
+/// **Reads only, never a write, and never panic.** The lock still held is `WorkService`'s own
+/// command lock (a plain, non-reentrant `std::sync::Mutex`): `set_up` is still on the stack
+/// waiting for `set_up` to return. [`WorkService::read`] and the other read methods (`tasks`,
+/// `members`, ...) take a separate connection and are safe to call from here; any command method
+/// (`create_task`, `move_task`, a second `set_up`, ...) tries to take the same lock again and
+/// **deadlocks** the thread running `set_up`. A panic here unwinds through `set_up` itself: its
+/// caller (the route) sees it as a task failure (`500`), not as "setup did not happen" — the
+/// append already committed, so a retry then answers `409`, not a second attempt. If the daemon's
+/// own work (writing `workspace.json`, starting the back office and the runner) can fail or needs
+/// to write to the work model, it must catch its own errors here and hand `done` to its own task
+/// (a channel, `tokio::spawn`, ...) to do that work off this call stack, not do it inline.
 pub trait SetupListener: Send + Sync {
     /// `done` is exactly what `set_up` is about to return to its own caller.
     fn set_up(&self, done: &SetupDone);
