@@ -1310,7 +1310,15 @@ dependencies = [
 name = "pitcrew-sync-jira"
 version = "0.0.0"
 dependencies = [
+ "base64 0.23.1",
  "pitcrew-protocol",
+ "pitcrew-sync-github",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
