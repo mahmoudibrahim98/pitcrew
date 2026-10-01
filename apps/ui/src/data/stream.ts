@@ -77,6 +77,8 @@ export class StreamClient {
   #silenceTimer: ReturnType<typeof setTimeout> | undefined;
   #stableTimer: ReturnType<typeof setTimeout> | undefined;
   #status: StreamStatus = 'stopped';
+  /** `retryNow()` came while a connection was being opened: if it fails, retry without waiting. */
+  #retrySoon = false;
 
   constructor(options: StreamOptions) {
     this.#options = options;
@@ -99,13 +101,21 @@ export class StreamClient {
 
   stop(): void {
     this.#clearTimers();
+    this.#retrySoon = false;
     this.#detach()?.close();
     this.#setStatus('stopped');
   }
 
-  /** While waiting to reconnect, reconnects now (the hub is known to be back). */
+  /**
+   * The hub is known to be back: reconnects now if waiting to, or, if a connection is being
+   * opened, retries at once should that one fail.
+   */
   retryNow(): void {
-    if (this.#status !== 'reconnecting' || this.#retryTimer === undefined) return;
+    if (this.#status === 'stopped' || this.#status === 'live') return;
+    if (this.#retryTimer === undefined) {
+      this.#retrySoon = true;
+      return;
+    }
     clearTimeout(this.#retryTimer);
     this.#connect();
   }
@@ -142,6 +152,7 @@ export class StreamClient {
   #handle(frame: StreamFrame, since: number | undefined): void {
     switch (frame.type) {
       case 'hello': {
+        this.#retrySoon = false;
         // A server that accepts and then drops us must not reset the back-off.
         this.#stableTimer = setTimeout(() => {
           this.#stableTimer = undefined;
@@ -199,8 +210,10 @@ export class StreamClient {
     const { initialMs, maxMs } = this.#options.backoff ?? { initialMs: 500, maxMs: 30_000 };
     const ceiling = Math.min(maxMs, initialMs * 2 ** this.#attempt);
     const jitter = 0.5 + (this.#options.random ?? Math.random)() * 0.5;
+    const delay = this.#retrySoon ? 0 : ceiling * jitter;
+    this.#retrySoon = false;
     this.#attempt += 1;
-    this.#retryTimer = setTimeout(() => this.#connect(), ceiling * jitter);
+    this.#retryTimer = setTimeout(() => this.#connect(), delay);
     this.#options.onFailure?.(this.#attempt, close);
   }
 

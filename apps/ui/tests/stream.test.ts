@@ -276,6 +276,37 @@ describe('stream client timing', () => {
     stream.stop();
   });
 
+  it('retryNow() reconnects at once: now while waiting, or as soon as an open in flight fails', () => {
+    const { stream, sockets } = setup();
+    stream.start();
+    // Waiting to reconnect: now.
+    sockets[0]?.drop();
+    expect(sockets).toHaveLength(1);
+    stream.retryNow();
+    expect(sockets).toHaveLength(2);
+
+    // The hub is back while that connection is still being opened, and it then fails anyway.
+    stream.retryNow();
+    sockets[1]?.drop();
+    vi.advanceTimersByTime(0);
+    expect(sockets).toHaveLength(3);
+
+    // Only once: the next failure waits for the back-off again (the third: 400 ms).
+    sockets[2]?.drop();
+    vi.advanceTimersByTime(399);
+    expect(sockets).toHaveLength(3);
+    vi.advanceTimersByTime(1);
+    expect(sockets).toHaveLength(4);
+
+    // Live, or stopped: nothing to do.
+    sockets[3]?.send({ type: 'hello', rev: 1 });
+    stream.retryNow();
+    expect(sockets).toHaveLength(4);
+    stream.stop();
+    stream.retryNow();
+    expect(sockets).toHaveLength(4);
+  });
+
   it('skips events it has already seen', () => {
     const { stream, sockets, received } = setup(5);
     stream.start();
