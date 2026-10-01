@@ -148,6 +148,7 @@ interface RemoteProbe {
   os: string; arch: string;                 // e.g. "linux", "x86_64"
   helper?: { version: string; running: boolean };
   slurm?: { version: string; defaultPartition?: string; srunOverlap: boolean };
+  tmux?: { version: string };              // offer the tmux launcher only from 3.2 on
 }
 ```
 
@@ -183,6 +184,9 @@ string }`, ending with one `done` or `failed` for the whole add. A plan is used 
   token never reaches the webview, a log, or a file of ours.
 - **A fresh remote hub** is set up like a local one: the UI calls `POST /v1/setup` through
   `gateway_request` for that workspace.
+- `gateway_workspace_retry({ workspace })` tries a remote workspace's connection again at once, for
+  example after a sign-in was cancelled while reconnecting (which leaves it `unreachable` until
+  then). It returns when the attempt has started; the state follows on `gateway://workspaces`.
 - `gateway_workspace_remove({ workspace, stopHelper: boolean })` forgets a workspace and deletes
   its keychain token. With `stopHelper`, it first stops the remote helper (cancelling its job for
   SLURM).
@@ -200,14 +204,17 @@ gateway emits `gateway://prompt`:
 interface GatewayPrompt {
   id: string;
   host: string;
-  kind: 'password' | 'passphrase' | 'otp' | 'host_key';
+  kind: 'password' | 'passphrase' | 'otp' | 'host_key' | 'confirm' | 'notice';
   text: string;                    // ssh's question, cleaned of control characters; untrusted
   fingerprint?: string;            // host_key: the key's fingerprint, to compare
 }
 ```
 
 and the UI answers with `gateway_prompt_reply({ id, answer?: string, accept?: boolean })`: `answer`
-for the first three kinds, and `accept` for a host key. A reply with neither cancels. A prompt that
+for the first three kinds, and `accept` for a host key or a `confirm` (ssh's other yes/no
+ questions, such as accepting updated host keys). A `notice` (such as `touch your security key`)
+ needs no answer: it is closed when ssh moves on, and a reply with neither stops ssh. A reply with
+ neither cancels. A prompt that
 is no longer wanted is withdrawn with the event `gateway://prompt-closed` `{ id }`.
 
 - An answer is passed to ssh once, and is never stored or logged. It is in memory only as long as
