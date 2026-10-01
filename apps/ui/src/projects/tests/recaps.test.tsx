@@ -196,6 +196,8 @@ describe('recaps', () => {
     const clause = await screen.findByRole('button', { name: /^1 file edit \(\+84 −12\), with evidence/ });
     fireEvent.click(clause);
     const dialog = await screen.findByRole('dialog', { name: 'Evidence for “1 file edit (+84 −12)”' });
+    // Opened straight away (no preview first), focus still moves in.
+    await eventually(() => expect(document.activeElement).toBe(dialog));
     const files = await within(dialog).findByRole('list', { name: 'Files' });
     expect(visibleText(files)).toBe('method.tex +84 −12');
     // A second click on the clause closes it.

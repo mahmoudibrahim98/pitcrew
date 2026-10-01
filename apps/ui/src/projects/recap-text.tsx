@@ -92,7 +92,9 @@ function Clause({
     return () => clearTimeout(pending.current);
   }, []);
 
-  // Activated: focus goes into the evidence, where Tab moves between its links and receipts.
+  // Activated: focus goes into the evidence, where Tab moves between its links and receipts. This
+  // covers a preview being activated; `onOpenAutoFocus` below, evidence opened straight away (its
+  // content mounts a render later than `mode` changes).
   useEffect(() => {
     if (mode === 'open') content.current?.focus();
   }, [mode]);
@@ -166,7 +168,10 @@ function Clause({
         sideOffset={6}
         collisionPadding={12}
         inert={mode === 'preview'}
-        onOpenAutoFocus={(e) => e.preventDefault()}
+        onOpenAutoFocus={(e) => {
+          e.preventDefault();
+          if (mode === 'open') content.current?.focus();
+        }}
         onCloseAutoFocus={(e) => e.preventDefault()}
         onEscapeKeyDown={() => {
           if (mode !== 'open') return;
