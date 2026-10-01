@@ -72,17 +72,22 @@ fn hostile() -> Vec<String> {
     words
 }
 
-fn run(shell: &Path, script: &str) -> std::process::Output {
+fn run(shell: &Path, script: &str, env: &[(&str, &str)]) -> std::process::Output {
     Command::new(shell)
         .arg("-c")
         .arg(script)
         .env("HOME", "/nonexistent-home")
+        .envs(env.iter().copied())
         .output()
         .unwrap()
 }
 
 fn check(shell: &Path, script: &str, want: &[String], what: &str) {
-    let out = run(shell, script);
+    check_with(shell, script, &[], want, what);
+}
+
+fn check_with(shell: &Path, script: &str, env: &[(&str, &str)], want: &[String], what: &str) {
+    let out = run(shell, script, env);
     assert!(
         out.status.success(),
         "{what} under {}: {:?}\nstderr: {}",
@@ -138,6 +143,14 @@ fn the_inner_script_runs_under_every_posix_sh() {
             continue;
         }
         check(&shell, inner, &words, "the inner script");
+        // bash imports exported functions: a `printf` one must not do the decoding.
+        check_with(
+            &shell,
+            inner,
+            &[("BASH_FUNC_printf%%", "() { echo 'echo hijacked'; }")],
+            &words,
+            "the inner script with an exported printf function",
+        );
         checked.push(name);
     }
     println!("POSIX shells checked as /bin/sh: {checked:?}");

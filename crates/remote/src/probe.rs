@@ -8,6 +8,10 @@
 //! The probe also reads the login shell (`$SHELL`) and refuses hosts whose shell cannot carry
 //! PitCrew's commands safely (xonsh; see [`crate::quote`]). Its own command is fixed text, so
 //! running it through such a shell to find out is harmless.
+//!
+//! On a SLURM login node it also finds `sbatch`, `squeue`, `scancel`, `sacct` and `srun` with
+//! their versions, whether `srun` has `--overlap`, and the default partition (`sinfo`, which
+//! asks the scheduler, under `timeout 10` where there is `timeout`): see [`SlurmTools`].
 
 use crate::{Limits, Ssh, SshError};
 use pitcrew_protocol::model::{MachineInfo, Scheduler};
@@ -29,8 +33,13 @@ pub const SCRIPT: &str = concat!(
     r#"printf 'home=%s\n' "$HOME"; "#,
     r#"printf 'shell=%s\n' "$SHELL"; "#,
     r#"if command -v tmux >/dev/null 2>&1; then echo tmux_found=1; printf 'tmux=%s\n' "$(tmux -V 2>/dev/null)"; else echo tmux_found=0; fi; "#,
-    "if command -v sbatch >/dev/null 2>&1; then echo sbatch=1; else echo sbatch=0; fi; ",
-    "if command -v squeue >/dev/null 2>&1; then echo squeue=1; else echo squeue=0; fi; ",
+    r#"for t in sbatch squeue scancel sacct srun; do if command -v "$t" >/dev/null 2>&1; then "#,
+    r#"printf '%s=1\n%s_version=%s\n' "$t" "$t" "$("$t" --version 2>/dev/null | head -n 1)"; "#,
+    r#"else printf '%s=0\n' "$t"; fi; done; "#,
+    r#"if command -v srun >/dev/null 2>&1 && srun --help 2>&1 | awk '/--overlap/ {f = 1} END {exit !f}'; "#,
+    r#"then echo srun_overlap=1; else echo srun_overlap=0; fi; "#,
+    r#"if command -v sinfo >/dev/null 2>&1; then to=; if command -v timeout >/dev/null 2>&1; then to='timeout 10'; fi; "#,
+    r#"printf 'partition=%s\n' "$($to sinfo -h -o %P 2>/dev/null | sed -n 's/\*$//p' | head -n 1)"; fi; "#,
     // GNU stat, then GNU df, then the BSD/macOS route: the device from df, its type from mount.
     r#"fs=$(stat -f -c %T "$HOME" 2>/dev/null); "#,
     r#"if [ -z "$fs" ]; then fs=$(df -PT "$HOME" 2>/dev/null | awk 'NR==2 {print $2}'); fi; "#,
@@ -55,11 +64,34 @@ pub struct Probe {
     pub has_sbatch: bool,
     /// Whether `squeue` is on `PATH`.
     pub has_squeue: bool,
+    /// The SLURM tools, their versions, and the default partition.
+    pub slurm: SlurmTools,
     /// The filesystem type of `$HOME`, e.g. `ext2/ext3`, `nfs`, `lustre`, `apfs`; `None` when
     /// the machine could not tell.
     pub home_fs: Option<String>,
     /// The login shell (`$SHELL`), when set.
     pub login_shell: Option<String>,
+}
+
+/// The SLURM tools on a machine. Each tool is `None` when it is not on `PATH`, else the first
+/// line of its `--version` (`slurm 23.02.7`; empty when it printed none).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SlurmTools {
+    /// `sbatch`.
+    pub sbatch: Option<String>,
+    /// `squeue`.
+    pub squeue: Option<String>,
+    /// `scancel`.
+    pub scancel: Option<String>,
+    /// `sacct`, which says how a finished job ended (where accounting is on).
+    pub sacct: Option<String>,
+    /// `srun`.
+    pub srun: Option<String>,
+    /// Whether `srun --help` lists `--overlap` (SLURM 20.11 and newer), which a site recipe's
+    /// `srun` last hop needs.
+    pub srun_overlap: bool,
+    /// The partition `sinfo` marks as the default, if any (and if it is plain characters).
+    pub default_partition: Option<String>,
 }
 
 /// Login shells that may not keep single-quoted text literal, so PitCrew's commands could be
@@ -126,6 +158,25 @@ pub fn parse(stdout: &str, tag: &str, fallback_hostname: &str) -> Result<Probe, 
 
     let has_sbatch = flag("sbatch");
     let has_squeue = flag("squeue");
+    let tool = |name: &str| {
+        flag(name)
+            .then(|| crate::helper::script::clean(get(&format!("{name}_version")).unwrap_or("")))
+    };
+    let slurm = SlurmTools {
+        sbatch: tool("sbatch"),
+        squeue: tool("squeue"),
+        scancel: tool("scancel"),
+        sacct: tool("sacct"),
+        srun: tool("srun"),
+        srun_overlap: flag("srun_overlap"),
+        default_partition: get("partition")
+            .filter(|p| {
+                p.len() <= 128
+                    && p.chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+            })
+            .map(str::to_owned),
+    };
     let home_fs = get("fs").map(str::to_owned);
     let info = MachineInfo {
         hostname: get("hostname").unwrap_or(fallback_hostname).to_owned(),
@@ -143,6 +194,7 @@ pub fn parse(stdout: &str, tag: &str, fallback_hostname: &str) -> Result<Probe, 
             .filter(|_| flag("tmux_found")),
         has_sbatch,
         has_squeue,
+        slurm,
         home_fs,
         login_shell: get("shell").map(str::to_owned),
     })
@@ -361,5 +413,36 @@ mod tests {
     fn the_script_brackets_its_report() {
         assert!(SCRIPT.starts_with(r#"printf '@@pitcrew-probe-begin-%s\n' "$1";"#));
         assert!(SCRIPT.ends_with(r#"printf '@@pitcrew-probe-end-%s\n' "$1""#));
+        // It travels on the command line: well within Windows' limit once wrapped.
+        let wrapped = crate::quote::remote_command(&["sh", "-c", SCRIPT, "sh", TAG]).unwrap();
+        assert!(wrapped.len() < 20_000, "{}", wrapped.len());
+    }
+
+    #[test]
+    fn slurm_tools_are_read() {
+        let p = parse(
+            &report(
+                "sbatch=1\nsbatch_version=slurm 23.02.7\nsqueue=1\nsqueue_version=slurm 23.02.7\n\
+                 scancel=1\nscancel_version=\nsacct=0\nsrun=1\nsrun_version=slurm\x1b[31m 23\n\
+                 srun_overlap=1\npartition=batch\n",
+            ),
+            TAG,
+            "h",
+        )
+        .unwrap();
+        let s = &p.slurm;
+        assert_eq!(s.sbatch.as_deref(), Some("slurm 23.02.7"));
+        assert_eq!(s.squeue.as_deref(), Some("slurm 23.02.7"));
+        // There, but it printed no version.
+        assert_eq!(s.scancel.as_deref(), Some(""));
+        assert_eq!(s.sacct, None);
+        assert_eq!(s.srun.as_deref(), Some("slurm?[31m 23"));
+        assert!(s.srun_overlap);
+        assert_eq!(s.default_partition.as_deref(), Some("batch"));
+        assert!(p.has_sbatch && p.has_squeue);
+        assert_eq!(p.info.scheduler, Some(Scheduler::Slurm));
+
+        let p = parse(&report("srun_overlap=0\npartition=a b\n"), TAG, "h").unwrap();
+        assert_eq!(p.slurm, SlurmTools::default());
     }
 }

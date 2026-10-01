@@ -14,6 +14,13 @@
 //!
 //! `PITCREW_TEST_SHELLS` (`:`-separated paths, as for `login_shells.rs`) adds a run of the whole
 //! flow with each POSIX shell among them as the machine's `sh`.
+//!
+//! The SLURM launcher's cases are in `deploy/slurm.rs`, where the binary also plays SLURM.
+//!
+//! Nothing a case starts outlives it: everything started on a fake machine carries this run's
+//! mark in its environment, and after each case (passed or panicked) the runner waits a little,
+//! kills what still carries it, and fails the case if there was any. At the end it checks that
+//! nothing is left. (Linux only: it reads `/proc`.)
 
 // Test code; clippy's allow-unwrap-in-tests only sees `#[test]` functions.
 #![allow(clippy::unwrap_used)]
@@ -32,7 +39,12 @@ fn main() -> ExitCode {
 }
 
 #[cfg(unix)]
+#[path = "deploy/slurm.rs"]
+mod slurm;
+
+#[cfg(unix)]
 mod unix {
+    use crate::slurm;
     use pitcrew_remote::helper::{HashTool, MIN_TMUX, Progress, parse_tmux_version, tmux_name};
     use pitcrew_remote::{
         DeployOptions, DirectLauncher, Endpoint, Helper, HelperError, HelperState, Input,
@@ -67,11 +79,15 @@ mod unix {
         "dd", "cat", "ls", "awk", "sed", "tr", "cut", "head", "tail", "wc", "mkdir", "rm", "mv",
         "ln", "chmod", "id", "uname", "date", "find", "readlink", "sleep", "setsid", "nohup",
         "tmux", "ps", "printf", "kill", "[", "test", "stat", "df", "mount", "cksum", "hostid",
+        "env", "rmdir", "hostname", "timeout",
     ];
 
     pub fn main() -> ExitCode {
         if let Ok(tool) = std::env::var(TOOL_ENV) {
             return act_as_tool(&tool);
+        }
+        if let Ok(tool) = std::env::var(slurm::SLURM_ENV) {
+            return slurm::act_as_slurm(&tool);
         }
         if let Ok(mode) = std::env::var(DAEMON_ENV) {
             return act_as_daemon(&mode);
@@ -86,53 +102,53 @@ mod unix {
 
     /// How the fake `ssh` behaves, from `remote.json` beside it.
     #[derive(Clone, Default, Serialize, Deserialize)]
-    struct Remote {
+    pub(crate) struct Remote {
         #[serde(default)]
-        home: PathBuf,
+        pub(crate) home: PathBuf,
         #[serde(default)]
-        path: String,
+        pub(crate) path: String,
         #[serde(default)]
-        env: Vec<(String, String)>,
+        pub(crate) env: Vec<(String, String)>,
         /// Drop the connection after this many bytes of stdin.
         #[serde(default)]
-        cut_after: Option<u64>,
+        pub(crate) cut_after: Option<u64>,
         /// ...and kill the remote command outright, rather than leave it to see end of file.
         #[serde(default)]
-        kill: bool,
+        pub(crate) kill: bool,
         /// Stop relaying stdin for `pause_ms` after this many bytes (once).
         #[serde(default)]
-        pause_after: Option<u64>,
+        pub(crate) pause_after: Option<u64>,
         #[serde(default)]
-        pause_ms: u64,
+        pub(crate) pause_ms: u64,
         /// Flip the byte at this offset of stdin.
         #[serde(default)]
-        corrupt_at: Option<u64>,
+        pub(crate) corrupt_at: Option<u64>,
         /// For a call running this script command, read nothing and hang.
         #[serde(default)]
-        hang_on: Option<String>,
+        pub(crate) hang_on: Option<String>,
         /// Swallow this many bytes of stdin before the command sees any, as a shell start-up
         /// file that reads stdin would...
         #[serde(default)]
-        eat: Option<u64>,
+        pub(crate) eat: Option<u64>,
         /// ...only in calls running this script command.
         #[serde(default)]
-        eat_on: Option<String>,
+        pub(crate) eat_on: Option<String>,
         /// Run the command's interpreter (`/bin/sh` in the command line) as this shell instead,
         /// and the whole command line with it. Without the wrapper, which `login_shells.rs`
         /// covers.
         #[serde(default)]
-        interpreter: Option<String>,
+        pub(crate) interpreter: Option<String>,
         /// The umask the remote command starts with.
         #[serde(default)]
-        umask: Option<String>,
+        pub(crate) umask: Option<String>,
     }
 
     #[derive(Debug, Serialize, Deserialize)]
-    struct CallLog {
+    pub(crate) struct CallLog {
         /// The command line, unwrapped.
-        line: String,
+        pub(crate) line: String,
         /// Bytes of stdin relayed.
-        stdin: u64,
+        pub(crate) stdin: u64,
     }
 
     fn act_as_ssh() -> Option<u8> {
@@ -303,10 +319,11 @@ mod unix {
         writeln!(file, "{}", serde_json::to_string(&entry).unwrap()).unwrap();
     }
 
-    /// Undoes the shell-neutral wrapper: `/bin/sh -c 'eval "$(printf "\ooo…")"'`.
+    /// Undoes the shell-neutral wrapper:
+    /// `/bin/sh -c 'unset -f printf 2>/dev/null; eval "$(printf "\ooo…")"'`.
     fn decode(wrapped: &str) -> Option<String> {
         let escapes = wrapped
-            .strip_prefix("/bin/sh -c 'eval \"$(printf \"")?
+            .strip_prefix("/bin/sh -c 'unset -f printf 2>/dev/null; eval \"$(printf \"")?
             .strip_suffix("\")\"'")?;
         let bytes = escapes
             .as_bytes()
@@ -379,13 +396,13 @@ mod unix {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    fn me() -> PathBuf {
+    pub(crate) fn me() -> PathBuf {
         let me = std::env::current_exe().unwrap();
         assert!(!me.to_str().unwrap().contains('\''));
         me
     }
 
-    fn which(name: &str) -> Option<PathBuf> {
+    pub(crate) fn which(name: &str) -> Option<PathBuf> {
         let path = std::env::var_os("PATH")?;
         std::env::split_paths(&path)
             .map(|dir| dir.join(name))
@@ -393,7 +410,7 @@ mod unix {
     }
 
     /// A script named `name` in `bin`.
-    fn shim(bin: &Path, name: &str, body: &str) {
+    pub(crate) fn shim(bin: &Path, name: &str, body: &str) {
         let path = bin.join(name);
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -449,7 +466,7 @@ mod unix {
     /// A stand-in helper: a script that answers `--version` and runs the fake daemon for
     /// `serve`. `mode` is the daemon's (`serve`, `exit`, `nosocket`), or `stubborn` for one
     /// that ignores SIGTERM. `padding` bytes of comment make it bigger.
-    fn helper_script(version: &str, mode: &str, padding: usize) -> Vec<u8> {
+    pub(crate) fn helper_script(version: &str, mode: &str, padding: usize) -> Vec<u8> {
         let (trap, mode) = match mode {
             "stubborn" => ("trap '' TERM; ", "serve"),
             other => ("", other),
@@ -469,12 +486,12 @@ mod unix {
         script.into_bytes()
     }
 
-    fn helper_from(version: &str, bytes: Vec<u8>) -> Helper {
+    pub(crate) fn helper_from(version: &str, bytes: Vec<u8>) -> Helper {
         let hash = hex(&Sha256::digest(&bytes));
         Helper::new(Platform::LinuxX86_64, version, &hash, bytes).unwrap()
     }
 
-    fn helper(version: &str) -> Helper {
+    pub(crate) fn helper(version: &str) -> Helper {
         helper_from(version, helper_script(version, "serve", 0))
     }
 
@@ -482,7 +499,7 @@ mod unix {
         helper_from(version, helper_script(version, "serve", padding))
     }
 
-    fn quick() -> DeployOptions {
+    pub(crate) fn quick() -> DeployOptions {
         DeployOptions {
             timeout: Duration::from_secs(60),
             lock_wait: Duration::from_secs(5),
@@ -491,7 +508,7 @@ mod unix {
         }
     }
 
-    fn launch_options() -> LaunchOptions {
+    pub(crate) fn launch_options() -> LaunchOptions {
         LaunchOptions {
             ready_timeout: Duration::from_secs(10),
             stop_timeout: Duration::from_secs(5),
@@ -502,24 +519,24 @@ mod unix {
     }
 
     /// One "remote machine": a home, and a sandbox `PATH`.
-    struct Machine {
-        dir: tempfile::TempDir,
-        home: PathBuf,
-        bin: PathBuf,
-        env: Vec<(String, String)>,
+    pub(crate) struct Machine {
+        pub(crate) dir: tempfile::TempDir,
+        pub(crate) home: PathBuf,
+        pub(crate) bin: PathBuf,
+        pub(crate) env: Vec<(String, String)>,
         /// The shell standing in for `/bin/sh` in the command line, if not `/bin/sh`.
-        interpreter: Option<String>,
-        fakes: AtomicU32,
+        pub(crate) interpreter: Option<String>,
+        pub(crate) fakes: AtomicU32,
     }
 
     /// A fake `ssh` for one machine.
-    struct Fake {
-        dir: PathBuf,
-        ssh: Ssh,
+    pub(crate) struct Fake {
+        pub(crate) dir: PathBuf,
+        pub(crate) ssh: Ssh,
     }
 
     impl Fake {
-        fn calls(&self) -> Vec<CallLog> {
+        pub(crate) fn calls(&self) -> Vec<CallLog> {
             std::fs::read_to_string(self.dir.join(CALLS))
                 .unwrap_or_default()
                 .lines()
@@ -527,29 +544,29 @@ mod unix {
                 .collect()
         }
 
-        fn paused(&self) -> bool {
+        pub(crate) fn paused(&self) -> bool {
             self.dir.join(PAUSED).exists()
         }
     }
 
     impl Machine {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self::build(Path::new("/bin/sh"), |_| {})
         }
 
-        fn with_tools(customize: impl FnOnce(&Path)) -> Self {
+        pub(crate) fn with_tools(customize: impl FnOnce(&Path)) -> Self {
             Self::build(Path::new("/bin/sh"), customize)
         }
 
         /// A machine whose `/bin/sh` is `sh`, run by a link named `sh` (as `/bin/sh` is), so
         /// shells that look at their name (bash, zsh) behave as they would there.
-        fn with_shell(sh: &Path) -> Self {
+        pub(crate) fn with_shell(sh: &Path) -> Self {
             let mut m = Self::build(sh, |_| {});
             m.interpreter = Some(m.bin.join("sh").to_str().unwrap().to_owned());
             m
         }
 
-        fn build(sh: &Path, customize: impl FnOnce(&Path)) -> Self {
+        pub(crate) fn build(sh: &Path, customize: impl FnOnce(&Path)) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let home = dir.path().join("home");
             std::fs::create_dir(&home).unwrap();
@@ -567,7 +584,7 @@ mod unix {
             }
         }
 
-        fn fake(&self, remote: Remote) -> Fake {
+        pub(crate) fn fake(&self, remote: Remote) -> Fake {
             let n = self.fakes.fetch_add(1, Ordering::SeqCst);
             let dir = self.dir.path().join(format!("f{n}"));
             std::fs::create_dir(&dir).unwrap();
@@ -575,7 +592,9 @@ mod unix {
             if std::fs::hard_link(me(), &ssh).is_err() {
                 std::fs::copy(me(), &ssh).unwrap();
             }
-            let mut env = self.env.clone();
+            // Everything the remote command starts carries the run's mark (see `sweep`).
+            let mut env = vec![(RUN_ENV.to_owned(), run_mark().to_owned())];
+            env.extend(self.env.iter().cloned());
             env.extend(remote.env.iter().cloned());
             let path = if remote.path.is_empty() {
                 self.bin.to_str().unwrap().to_owned()
@@ -597,16 +616,16 @@ mod unix {
             Fake { dir, ssh }
         }
 
-        fn layout(&self) -> Layout {
+        pub(crate) fn layout(&self) -> Layout {
             Layout::in_home(self.home.to_str().unwrap()).unwrap()
         }
 
-        fn target(&self, fake: &Fake) -> Target {
+        pub(crate) fn target(&self, fake: &Fake) -> Target {
             self.target_at(fake, self.layout())
         }
 
         /// A target with another root; the tool path is the sandbox.
-        fn target_at(&self, fake: &Fake, layout: Layout) -> Target {
+        pub(crate) fn target_at(&self, fake: &Fake, layout: Layout) -> Target {
             Target::with_layout(fake.ssh.clone(), "cluster", layout, Platform::LinuxX86_64)
                 .unwrap()
                 .with_tool_path(self.bin.to_str().unwrap())
@@ -614,34 +633,34 @@ mod unix {
         }
 
         /// A target through a fake that just relays.
-        fn plain(&self) -> Target {
+        pub(crate) fn plain(&self) -> Target {
             self.target(&self.fake(Remote::default()))
         }
 
-        fn root(&self) -> PathBuf {
+        pub(crate) fn root(&self) -> PathBuf {
             self.home.join(".pitcrew")
         }
 
-        fn bin_dir(&self) -> PathBuf {
+        pub(crate) fn bin_dir(&self) -> PathBuf {
             self.root().join("bin")
         }
 
-        fn run_dir(&self) -> PathBuf {
+        pub(crate) fn run_dir(&self) -> PathBuf {
             self.root().join("run")
         }
 
-        fn lock(&self) -> PathBuf {
+        pub(crate) fn lock(&self) -> PathBuf {
             self.bin_dir().join(".lock")
         }
 
-        fn link(&self, name: &str) -> Option<String> {
+        pub(crate) fn link(&self, name: &str) -> Option<String> {
             std::fs::read_link(self.bin_dir().join(name))
                 .ok()
                 .map(|p| p.to_str().unwrap().to_owned())
         }
 
         /// The version directories, sorted.
-        fn versions(&self) -> Vec<String> {
+        pub(crate) fn versions(&self) -> Vec<String> {
             let mut names: Vec<String> = std::fs::read_dir(self.bin_dir())
                 .unwrap()
                 .map(|e| e.unwrap())
@@ -654,7 +673,7 @@ mod unix {
         }
 
         /// Upload temporaries anywhere under `bin/`.
-        fn temporaries(&self) -> Vec<PathBuf> {
+        pub(crate) fn temporaries(&self) -> Vec<PathBuf> {
             let Ok(dirs) = std::fs::read_dir(self.bin_dir()) else {
                 return Vec::new();
             };
@@ -672,7 +691,7 @@ mod unix {
         }
     }
 
-    fn mode(path: &Path) -> u32 {
+    pub(crate) fn mode(path: &Path) -> u32 {
         std::fs::symlink_metadata(path)
             .unwrap()
             .permissions()
@@ -682,7 +701,7 @@ mod unix {
 
     /// Nothing under `root` is open to the group or others (links aside). The helper's socket
     /// is its own, made with the user's umask; the 0700 directory it is in keeps others out.
-    fn assert_private(root: &Path) {
+    pub(crate) fn assert_private(root: &Path) {
         let mut stack = vec![root.to_path_buf()];
         while let Some(path) = stack.pop() {
             let meta = std::fs::symlink_metadata(&path).unwrap();
@@ -702,7 +721,7 @@ mod unix {
         }
     }
 
-    fn private_dir(path: &Path) {
+    pub(crate) fn private_dir(path: &Path) {
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -710,7 +729,7 @@ mod unix {
             .unwrap();
     }
 
-    fn runtime() -> tokio::runtime::Runtime {
+    pub(crate) fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -718,11 +737,11 @@ mod unix {
             .unwrap()
     }
 
-    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    pub(crate) fn block_on<F: std::future::Future>(future: F) -> F::Output {
         runtime().block_on(future)
     }
 
-    fn eventually(what: &str, check: impl Fn() -> bool) {
+    pub(crate) fn eventually(what: &str, check: impl Fn() -> bool) {
         let start = Instant::now();
         while !check() {
             assert!(
@@ -733,7 +752,7 @@ mod unix {
         }
     }
 
-    fn alive(pid: u32) -> bool {
+    pub(crate) fn alive(pid: u32) -> bool {
         i32::try_from(pid)
             .ok()
             .and_then(rustix::process::Pid::from_raw)
@@ -745,7 +764,7 @@ mod unix {
             })
     }
 
-    fn comm(pid: u32) -> String {
+    pub(crate) fn comm(pid: u32) -> String {
         std::fs::read_to_string(format!("/proc/{pid}/comm"))
             .unwrap_or_default()
             .trim()
@@ -753,7 +772,7 @@ mod unix {
     }
 
     /// The umask of a process (`self`, or a pid), as /proc prints it: `0022`.
-    fn umask_of(pid: &str) -> String {
+    pub(crate) fn umask_of(pid: &str) -> String {
         std::fs::read_to_string(format!("/proc/{pid}/status"))
             .unwrap()
             .lines()
@@ -766,6 +785,50 @@ mod unix {
         String::from_utf8(out.stdout).unwrap().trim().to_owned()
     }
 
+    fn plain(c: char) -> char {
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+            c
+        } else {
+            '_'
+        }
+    }
+
+    /// This host's name as the script has it: `uname -n`, other characters made `_`, at most 40.
+    pub(crate) fn this_name() -> String {
+        let name: String = uname_n().chars().map(plain).take(40).collect();
+        if name.is_empty() {
+            "host".to_owned()
+        } else {
+            name
+        }
+    }
+
+    /// This host as the script names it: its name, `+` and the first boot-stable id there is:
+    /// `hostid` (unless all zeros), else the first 12 characters of `/etc/machine-id` or
+    /// `/var/lib/dbus/machine-id`; the name alone when there is none.
+    pub(crate) fn this_host() -> String {
+        let hostid = Command::new("hostid")
+            .output()
+            .ok()
+            .map(|out| String::from_utf8(out.stdout).unwrap().trim().to_owned())
+            .filter(|id| id.chars().any(|c| c != '0'));
+        let id = hostid.or_else(|| {
+            ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+                .iter()
+                .filter_map(|file| std::fs::read_to_string(file).ok())
+                .map(|text| text.lines().next().unwrap_or("").chars().take(12).collect())
+                .find(|id: &String| !id.is_empty())
+        });
+        match id {
+            Some(id) => format!(
+                "{}+{}",
+                this_name(),
+                id.chars().map(plain).collect::<String>()
+            ),
+            None => this_name(),
+        }
+    }
+
     fn now_ms() -> i64 {
         let since = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -774,14 +837,14 @@ mod unix {
     }
 
     /// The pid of a process that has exited.
-    fn dead_pid() -> u32 {
+    pub(crate) fn dead_pid() -> u32 {
         let mut child = Command::new("true").spawn().unwrap();
         let pid = child.id();
         child.wait().unwrap();
         pid
     }
 
-    fn script_len() -> u64 {
+    pub(crate) fn script_len() -> u64 {
         SCRIPT.len() as u64
     }
 
@@ -1076,7 +1139,7 @@ mod unix {
         private_dir(&lock);
         std::fs::write(
             lock.join("owner"),
-            format!("{} {} 00ff {now}\n", uname_n(), dead_pid()),
+            format!("{} {} 00ff {now}\n", this_host(), dead_pid()),
         )
         .unwrap();
         block_on(deploy(&m.plain(), &helper("2.0.0"), &impatient)).unwrap();
@@ -1090,7 +1153,7 @@ mod unix {
 
         // A live process of this host keeps its lock...
         private_dir(&lock);
-        let live = format!("{} {} 00ff {now}\n", uname_n(), std::process::id());
+        let live = format!("{} {} 00ff {now}\n", this_host(), std::process::id());
         std::fs::write(lock.join("owner"), &live).unwrap();
         let err = block_on(deploy(&m.plain(), &helper("3.0.0"), &impatient)).unwrap_err();
         assert!(matches!(err, HelperError::Busy(_)), "{err:?}");
@@ -1100,12 +1163,54 @@ mod unix {
         // the directory's time says.
         std::fs::write(
             lock.join("owner"),
-            format!("{} {} 00ff {}\n", uname_n(), std::process::id(), now - 600),
+            format!(
+                "{} {} 00ff {}\n",
+                this_host(),
+                std::process::id(),
+                now - 600
+            ),
         )
         .unwrap();
         touch("now");
         block_on(deploy(&m.plain(), &helper("3.0.0"), &impatient)).unwrap();
         assert!(!lock.exists());
+
+        // This host's name with another id (a stateless node makes a new machine id at every
+        // boot), or with none, is this host: a lock whose process is gone is broken at once.
+        for host in [format!("{}+0123456789ab", this_name()), this_name()] {
+            private_dir(&lock);
+            let owner = format!("{host} {} 00ff {now}\n", dead_pid());
+            std::fs::write(lock.join("owner"), &owner).unwrap();
+            block_on(deploy(&m.plain(), &helper("4.0.0"), &impatient)).unwrap();
+            assert!(!lock.exists(), "{owner}");
+        }
+        // Another name, even with this host's id, is another host: judged by the directory's
+        // age, though the pid it names is gone here.
+        private_dir(&lock);
+        let id = this_host()
+            .split_once('+')
+            .map(|(_, id)| format!("+{id}"))
+            .unwrap_or_default();
+        let other = format!("another-{}{id} {} 00ff {now}\n", this_name(), dead_pid());
+        std::fs::write(lock.join("owner"), &other).unwrap();
+        let err = block_on(deploy(&m.plain(), &helper("4.0.0"), &impatient)).unwrap_err();
+        assert!(matches!(err, HelperError::Busy(_)), "{err:?}");
+        std::fs::remove_dir_all(&lock).unwrap();
+
+        // This host's lock whose pid or time cannot be read: judged by the directory's age too,
+        // waited for while fresh and broken once old.
+        for owner in [
+            format!("{} {} 00ff not-a-time\n", this_host(), std::process::id()),
+            format!("{} not-a-pid 00ff {now}\n", this_host()),
+        ] {
+            private_dir(&lock);
+            std::fs::write(lock.join("owner"), &owner).unwrap();
+            let err = block_on(deploy(&m.plain(), &helper("4.0.0"), &impatient)).unwrap_err();
+            assert!(matches!(err, HelperError::Busy(_)), "{owner}: {err:?}");
+            touch("16 minutes ago");
+            block_on(deploy(&m.plain(), &helper("4.0.0"), &impatient)).unwrap();
+            assert!(!lock.exists(), "{owner}");
+        }
     }
 
     fn gc_keeps_exactly_two_versions() {
@@ -1542,23 +1647,33 @@ mod unix {
             assert!(matches!(err, HelperError::UnsafeDirectory(_)), "{err:?}");
         }
 
-        // A directory on the way that belongs to another user (an `ls` that says so).
+        // A directory on the way that belongs to another user, and a symbolic link on the way
+        // that does (an `ls` that says so): in a sticky directory, its owner could swap it.
         dir(&base.join("theirs/u"), 0o755);
         let theirs = base.join("theirs");
+        dir(&base.join("real3/u"), 0o755);
+        let their_link = base.join("their-link");
+        std::os::unix::fs::symlink(base.join("real3"), &their_link).unwrap();
         let real = which("ls").unwrap();
         shim(
             &m.bin,
             "ls",
             &format!(
                 "last=\nfor a in \"$@\"; do last=$a; done\n\
-                 if [ \"$last\" = '{}' ]; then '{}' \"$@\" | awk '{{ $3 = 4242; print }}'; \
-                 else exec '{}' \"$@\"; fi",
+                 case $last in '{}'|'{}') '{}' \"$@\" | awk '{{ $3 = 4242; print }}' ;; \
+                 *) exec '{}' \"$@\" ;; esac",
                 theirs.display(),
+                their_link.display(),
                 real.display(),
                 real.display()
             ),
         );
         unsafe_way(&theirs.join("u/.pitcrew"), "belongs to uid 4242");
+        unsafe_way(
+            &their_link.join("u/.pitcrew"),
+            &format!("the link {}", their_link.display()),
+        );
+        assert!(!base.join("real3/u/.pitcrew").exists());
     }
 
     /// A shell start-up file that reads stdin eats the start of the script: what is left must
@@ -1746,8 +1861,8 @@ mod unix {
         assert!(block_on(launcher.stop(&m.plain())).unwrap().pid.is_some());
     }
 
-    /// A host name with other characters is kept readable and made unique with the machine's
-    /// id, rather than all such hosts being `unknown`.
+    /// A host name with other characters is kept readable (`odd_host_`), with the machine's
+    /// id after a `+`, rather than all such hosts being `unknown`.
     fn odd_host_names_get_a_machine_id() {
         let real = which("uname").unwrap();
         let m = Machine::with_tools(|bin| {
@@ -1764,11 +1879,11 @@ mod unix {
         block_on(deploy(&target, &helper("1.0.0"), &quick())).unwrap();
         let launcher = DirectLauncher::new(launch_options());
         let host = block_on(launcher.start(&target)).unwrap().endpoint.host;
-        assert!(host.starts_with("odd_host_-"), "{host}");
-        assert!(host.len() > "odd_host_-".len(), "{host}");
+        assert!(host.starts_with("odd_host_"), "{host}");
+        assert_eq!(host.split('+').next(), Some("odd_host_"), "{host}");
         assert!(
             host.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                .all(|b| b.is_ascii_alphanumeric() || b"._-+".contains(&b))
         );
         // The same name on every call: the helper it started is recognised as running here.
         let status = block_on(launcher.status(&target)).unwrap();
@@ -1835,7 +1950,7 @@ mod unix {
         let e = &started.endpoint;
         assert_eq!(e.version, "1.0.0");
         assert_eq!(e.launcher, launcher.name());
-        assert_eq!(e.host, uname_n());
+        assert_eq!(e.host, this_host());
         assert_eq!(e.socket, m.layout().socket());
         assert!(e.started >= before - 2000 && e.started <= now_ms() + 1000);
         assert!(alive(e.pid));
@@ -1959,6 +2074,20 @@ mod unix {
         assert_eq!(status.state, HelperState::Running);
         assert_eq!(status.tmux_session, Some(true));
         block_on(launcher.stop(&there)).unwrap();
+
+        // A root whose path holds a #: tmux reads one in -c as the start of a format (here
+        // #{pane_id}), so the helper would start elsewhere, and refuse to.
+        let parent = m.dir.path().join("x#{pane_id}#y");
+        std::fs::create_dir(&parent).unwrap();
+        let hashed = Layout::at(parent.join(".pitcrew").to_str().unwrap()).unwrap();
+        let target = m.target_at(&m.fake(Remote::default()), hashed.clone());
+        block_on(deploy(&target, &helper("1.0.0"), &quick())).unwrap();
+        let e = block_on(launcher.start(&target)).unwrap().endpoint;
+        assert_eq!(e.socket, hashed.socket());
+        assert!(alive(e.pid));
+        let status = block_on(launcher.status(&target)).unwrap();
+        assert_eq!(status.state, HelperState::Running);
+        block_on(launcher.stop(&target)).unwrap();
         println!("tmux checked: {version}");
     }
 
@@ -2034,6 +2163,7 @@ mod unix {
             started: 1_790_000_000_000,
             launcher: "direct".to_owned(),
             socket: m.layout().socket(),
+            job: None,
         };
         write_endpoint(&m, &foreign);
         let status = block_on(launcher.status(&m.plain())).unwrap();
@@ -2041,11 +2171,11 @@ mod unix {
         assert_eq!(status.endpoint.as_ref(), Some(&foreign));
         let err = block_on(launcher.start(&m.plain())).unwrap_err();
         assert!(
-            matches!(&err, HelperError::OtherHost(h) if h == "elsewhere"),
+            matches!(&err, HelperError::OtherHost { host, launcher } if host == "elsewhere" && launcher == "direct"),
             "{err:?}"
         );
         let err = block_on(launcher.stop(&m.plain())).unwrap_err();
-        assert!(matches!(err, HelperError::OtherHost(_)), "{err:?}");
+        assert!(matches!(err, HelperError::OtherHost { .. }), "{err:?}");
         assert!(m.run_dir().join("endpoint.json").exists());
 
         // ...unless the user says to take over.
@@ -2055,7 +2185,7 @@ mod unix {
         });
         let started = block_on(taking.start(&m.plain())).unwrap();
         assert!(started.started_now);
-        assert_eq!(started.endpoint.host, uname_n());
+        assert_eq!(started.endpoint.host, this_host());
         block_on(taking.stop(&m.plain())).unwrap();
 
         // A record of a process of this host that is gone is stale.
@@ -2063,7 +2193,7 @@ mod unix {
             &m,
             &Endpoint {
                 pid: dead_pid(),
-                host: uname_n(),
+                host: this_host(),
                 ..foreign.clone()
             },
         );
@@ -2074,13 +2204,44 @@ mod unix {
         assert!(started.started_now);
         block_on(launcher.stop(&m.plain())).unwrap();
 
+        // This host's records made before its id changed (a stateless node makes a new
+        // machine id at every boot) are still this host's, judged by their pid: a dead one is
+        // stale, a live helper is running here and is stopped.
+        let reborn = format!("{}+0123456789ab", this_name());
+        write_endpoint(
+            &m,
+            &Endpoint {
+                pid: dead_pid(),
+                host: reborn.clone(),
+                ..foreign.clone()
+            },
+        );
+        let status = block_on(launcher.status(&m.plain())).unwrap();
+        assert_eq!(status.state, HelperState::NotRunning);
+        let started = block_on(launcher.start(&m.plain())).unwrap();
+        assert!(started.started_now);
+        let mut record = started.endpoint.clone();
+        record.host.clone_from(&reborn);
+        write_endpoint(&m, &record);
+        let status = block_on(launcher.status(&m.plain())).unwrap();
+        assert_eq!(status.state, HelperState::Running);
+        let again = block_on(launcher.start(&m.plain())).unwrap();
+        assert!(!again.started_now);
+        let stopped = block_on(launcher.stop(&m.plain())).unwrap();
+        assert_eq!(stopped.pid, Some(record.pid));
+        eventually("the helper to be gone", || !alive(record.pid));
+
         // A recycled pid that is not pitcrewd is never signalled.
-        let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
+        let mut sleeper = Command::new("sleep")
+            .arg("30")
+            .env(RUN_ENV, run_mark())
+            .spawn()
+            .unwrap();
         write_endpoint(
             &m,
             &Endpoint {
                 pid: sleeper.id(),
-                host: uname_n(),
+                host: this_host(),
                 ..foreign
             },
         );
@@ -2113,7 +2274,7 @@ mod unix {
 
     // ─── Every sh ──────────────────────────────────────────────────────────────────────────
 
-    fn posix_shells() -> Vec<PathBuf> {
+    pub(crate) fn posix_shells() -> Vec<PathBuf> {
         let listed = std::env::var_os("PITCREW_TEST_SHELLS").filter(|v| !v.is_empty());
         let shells: Vec<PathBuf> = match listed {
             Some(list) => std::env::split_paths(&list).collect(),
@@ -2149,6 +2310,76 @@ mod unix {
             checked.push(shell.display().to_string());
         }
         println!("deployed and launched with sh = {checked:?}");
+    }
+
+    // ─── Leftover processes ────────────────────────────────────────────────────────────────
+
+    /// Every process a case starts on a fake machine carries this variable, set to
+    /// [`run_mark`]: the fake `ssh` puts it in the remote command's environment, and helpers,
+    /// tmux servers and fake SLURM jobs inherit it. Commands a case starts itself get it too.
+    pub(crate) const RUN_ENV: &str = "PITCREW_TEST_RUN";
+
+    /// This run's mark: unique to this test process.
+    pub(crate) fn run_mark() -> &'static str {
+        static MARK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        MARK.get_or_init(|| {
+            let nanos = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            format!("deploy-{}-{nanos}", std::process::id())
+        })
+    }
+
+    /// The live processes carrying this run's mark, with their command lines. Linux only (it
+    /// reads `/proc`); empty elsewhere. A zombie has no environment, so it does not count.
+    fn marked() -> Vec<(u32, String)> {
+        let want = format!("{RUN_ENV}={}", run_mark());
+        let Ok(entries) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(|entry| {
+                let pid: u32 = entry.ok()?.file_name().to_str()?.parse().ok()?;
+                let env = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+                if !env.split(|b| *b == 0).any(|v| v == want.as_bytes()) {
+                    return None;
+                }
+                let cmd = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+                let cmd = String::from_utf8_lossy(&cmd).replace('\0', " ");
+                Some((pid, cmd.trim().to_owned()))
+            })
+            .collect()
+    }
+
+    /// Waits up to `grace` for this run's processes to end, then kills those left (SIGKILL)
+    /// and returns them.
+    fn sweep(grace: Duration) -> Vec<(u32, String)> {
+        let start = Instant::now();
+        loop {
+            let left = marked();
+            if left.is_empty() || start.elapsed() >= grace {
+                for (pid, _) in &left {
+                    if let Some(pid) = i32::try_from(*pid)
+                        .ok()
+                        .and_then(rustix::process::Pid::from_raw)
+                    {
+                        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                    }
+                }
+                return left;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Kills this run's processes when dropped: at the end of the run, or if it unwinds.
+    struct Sweeper;
+
+    impl Drop for Sweeper {
+        fn drop(&mut self) {
+            sweep(Duration::ZERO);
+        }
     }
 
     // ─── Runner ────────────────────────────────────────────────────────────────────────────
@@ -2247,6 +2478,7 @@ mod unix {
                 everything_under_every_posix_sh,
             ),
         ];
+        let cases: Vec<(&str, fn())> = cases.iter().chain(slurm::CASES).copied().collect();
         let filters: Vec<String> = std::env::args()
             .skip(1)
             .filter(|a| !a.starts_with('-'))
@@ -2254,7 +2486,9 @@ mod unix {
         let list_only = std::env::args().any(|a| a == "--list");
         let mut failed = Vec::new();
         let mut ran = 0;
-        for (name, case) in cases {
+        // Kills whatever this run started, however the run ends.
+        let sweeper = Sweeper;
+        for (name, case) in &cases {
             if !filters.is_empty() && !filters.iter().any(|f| name.contains(f.as_str())) {
                 continue;
             }
@@ -2264,7 +2498,13 @@ mod unix {
             }
             ran += 1;
             let start = Instant::now();
-            let ok = std::panic::catch_unwind(case).is_ok();
+            let mut ok = std::panic::catch_unwind(case).is_ok();
+            // A case passes only if it leaves nothing running, and leaves nothing either way.
+            let left = sweep(Duration::from_secs(5));
+            if !left.is_empty() {
+                println!("{name} left these running (now killed): {left:?}");
+                ok = false;
+            }
             println!(
                 "test {name} ... {} ({:.1}s)",
                 if ok { "ok" } else { "FAILED" },
@@ -2274,9 +2514,19 @@ mod unix {
                 failed.push(*name);
             }
         }
+        drop(sweeper);
         drop_daemon();
         if list_only {
             return ExitCode::SUCCESS;
+        }
+        // Nothing this run started may still run.
+        std::thread::sleep(Duration::from_millis(200));
+        let left = marked();
+        if cfg!(target_os = "linux") {
+            println!("processes this run left behind: {left:?}");
+        }
+        if !left.is_empty() {
+            failed.push("(processes left behind)");
         }
         println!(
             "\ntest result: {}. {} passed; {} failed",

@@ -282,10 +282,11 @@ fn ask(text: &str, hint: Option<&str>, key: Option<&str>) -> Option<String> {
     })
 }
 
-/// Undoes the shell-neutral wrapper: `/bin/sh -c 'eval "$(printf "\ooo…")"'`.
+/// Undoes the shell-neutral wrapper:
+/// `/bin/sh -c 'unset -f printf 2>/dev/null; eval "$(printf "\ooo…")"'`.
 fn decode(wrapped: &str) -> Option<String> {
     let escapes = wrapped
-        .strip_prefix("/bin/sh -c 'eval \"$(printf \"")?
+        .strip_prefix("/bin/sh -c 'unset -f printf 2>/dev/null; eval \"$(printf \"")?
         .strip_suffix("\")\"'")?;
     let bytes = escapes
         .as_bytes()
@@ -525,7 +526,7 @@ fn exact_argument_list() {
     }
     want.extend(["--".to_owned(), "cluster".to_owned()]);
     want.push(
-        r#"/bin/sh -c 'eval "$(printf "\047\145\143\150\157\047\040\047\150\151\040\164\150\145\162\145\047")"'"#
+        r#"/bin/sh -c 'unset -f printf 2>/dev/null; eval "$(printf "\047\145\143\150\157\047\040\047\150\151\040\164\150\145\162\145\047")"'"#
             .to_owned(),
     );
     assert_eq!(log.args, want);

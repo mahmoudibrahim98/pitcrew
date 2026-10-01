@@ -14,7 +14,8 @@ Everything goes through the user's own **system OpenSSH** and `~/.ssh/config`.
   bounded (`RESOLVE_LIMITS`: 10 s, 1 MiB).
 - `Ssh::run(host, argv)` runs `ssh [options] -- <host> <command>`.
   - **Any login shell.** The command is sent as
-    `/bin/sh -c 'eval "$(printf "\ooo…")"'`, every byte of the POSIX-quoted command line an
+    `/bin/sh -c 'unset -f printf 2>/dev/null; eval "$(printf "\ooo…")"'` (an exported `printf`
+    function, which bash would import, is dropped first), every byte of the POSIX-quoted command line an
     octal escape. What the login shell sees has no `\\`, `\'`, `!`, newline or stray `$`, so
     sh, bash, dash, zsh, ksh, fish, csh and tcsh all hand the same script to `/bin/sh`.
   - **xonsh is unsupported and unsafe** as a login shell: it may decode `\ooo` itself, and the
@@ -71,8 +72,12 @@ Everything goes through the user's own **system OpenSSH** and `~/.ssh/config`.
     UI must show the raw prompt, escaped. `UpdateHostKeys=ask`'s "Accept updated hostkeys?" is
     a yes/no question (Confirm), so the user's choice of key rotation is kept.
 - `Ssh::probe(host)` runs one POSIX-sh script and returns `MachineInfo` plus `$HOME`, the tmux
-  version, `sbatch`/`squeue`, the login shell, and the filesystem type of `$HOME`. The report
-  needs this call's random markers and exit 0; output is capped at 1 MiB and the call at 30 s.
+  version, the login shell, the filesystem type of `$HOME`, and the SLURM tools
+  (`SlurmTools`): `sbatch`, `squeue`, `scancel`, `sacct` and `srun` with the first line of
+  their `--version`, whether `srun --help` lists `--overlap`, and the partition `sinfo` marks
+  as the default (`sinfo` asks the scheduler, so it runs under `timeout 10` where there is
+  one). The report needs this call's random markers and exit 0; output is capped at 1 MiB and
+  the call at 30 s.
   Only filesystems on an allowlist of local types (ext2/3/4, xfs, btrfs, zfs, tmpfs, f2fs,
   bcachefs, overlayfs, apfs, hfs and similar) count as local; anything else, including
   `UNKNOWN (0x…)`, every FUSE filesystem (`fuseblk`), 9p, virtiofs and vboxsf, counts as
@@ -109,11 +114,16 @@ let started = DirectLauncher::default().start(&target).await?;   // or TmuxLaunc
 - **The way there** is checked first, as sshd checks the way to `authorized_keys`: every
   directory from `/` down to the root's parent must belong to root or the user, and be writable
   by no one else unless sticky (as `/tmp`). The walk resolves the path one component at a time,
-  following symbolic links (absolute, relative, through `..`) and checking where they lead, so a
+  following symbolic links (absolute, relative, through `..`; each must belong to root or the
+  user, since in a sticky directory its owner could swap it) and checking where they lead, so a
   group-writable project directory on the way is refused: a member could otherwise swap the tree
   after the checks and have their own `pitcrewd` run. The script then `cd -P`s into the root and
-  uses relative paths only; a launched helper checks the directory it starts in (tmux enters it
-  by name) before it runs.
+  uses relative paths only; a launched helper checks that the directory it starts in is that
+  root, by its physical path, and private (tmux enters it by name; every `#` in it is doubled,
+  since tmux reads formats there) before it runs. Directories above the root, and a SLURM
+  recipe's `modules_init` script and the way to it, are judged by their owner and mode bits
+  only: an ACL on one of them is not refused (on Linux a POSIX ACL shows only as a `+`, NFSv4
+  and GPFS ACLs do not show at all, and on macOS `ls` hides one behind `@`).
 - **The remote side** is one script, `src/helper/helper.sh`, sent on **stdin** (the Windows
   command-line limit leaves the shell-neutral wrapper about 7,500 bytes). The command line is a
   fixed bootstrap run by `/bin/sh` (by path, whatever `sh` the user's `PATH` finds). It drops
@@ -145,18 +155,19 @@ let started = DirectLauncher::default().start(&target).await?;   // or TmuxLaunc
   - **Bounds:** `DeployOptions::timeout` per call (prompts excluded), `lock_wait`, and
     `stale_lock`, which must exceed both; `progress` reports bytes handed to ssh.
 - **Locks** are `mkdir` directories with an `owner` line: host, pid, call tag and time. A lock
-  taken on this host is stale when its process is gone (so a killed deploy does not block the
-  next one for long) or when it is older than the limit by this host's own clock. Another
-  host's clock cannot be compared with this one, so a lock from another host (a login node
-  sharing the home), or without an owner line yet, is stale only when its directory is older
-  than the limit plus 10 minutes: hosts sharing a home, and the file server, must agree on the
-  time within 10 minutes. A stale lock is moved aside atomically and removed; if what was moved
-  is not the lock judged stale, it is put back while the name is free. Every step that changes
+  taken on this host (by its name; see `host` below) is stale when its process is gone (so a
+  killed deploy does not block the next one for long) or when it is older than the limit by
+  this host's own clock. Another host's clock cannot be compared with this one, so a lock from
+  another host (a login node sharing the home), without an owner line yet, or whose pid or
+  time cannot be read, is stale only when its directory is older than the limit plus 10
+  minutes: hosts sharing a home, and the file server, must agree on the time within 10
+  minutes. A stale lock is moved aside atomically and removed; if what was moved is not the
+  lock judged stale, it is put back while the name is free. Every step that changes
   something (sweeping, `chmod`, removing a damaged copy, the rename, the switch, GC; in the
   launchers removing old records, launching, writing `endpoint.json`, signalling, removing
   records) first checks the run still owns its lock; one that lost it stops (`LockLost`), and
   leaves the lock to its new holder.
-- **Launchers** implement `Launcher` (object-safe; the SLURM launcher will be another):
+- **Launchers** implement `Launcher` (object-safe; for SLURM see the next section):
   - `DirectLauncher`: `setsid nohup` (`nohup` alone where there is no `setsid`, as on macOS),
     double-forked so the helper is nobody's child;
   - `TmuxLauncher`: its own tmux server and session, both named `tmux_name(layout)`
@@ -174,12 +185,145 @@ let started = DirectLauncher::default().start(&target).await?;   // or TmuxLaunc
   whether it runs and which version is installed; `stop` sends SIGTERM, then SIGKILL after
   `stop_timeout`, each only while the process still has the start time it had. All are
   idempotent. A pid counts only while alive, not a zombie, and named `pitcrewd`, so a recycled
-  pid is never signalled. `host` is `uname -n`; a name with other characters is kept readable
-  and made unique with the machine id (`odd_host_-<id>`). On clusters whose login nodes share
-  `$HOME`, a record from another host is reported (`OtherHost`) and never acted on, unless
-  `LaunchOptions::take_over` says so.
-- **Secrets:** none are involved; nothing here logs. Reports and errors carry paths and the
-  first line of `--version`, with control characters replaced.
+  pid is never signalled. `host`, as in lock owners, is `<name>+<id>`: `uname -n` (other
+  characters made `_`, at most 40) and, for people to tell hosts apart, the first id there is
+  that survives a reboot (`hostid` unless all zeros, else the machine id, else the hardware
+  UUID; none, and no `+`, without any), e.g. `login01+007f0101`. Whether a record is this
+  host's goes by the name alone: a stateless node makes a new machine id at every boot, and its
+  records from before must stay its own (judged by their pid, and locks by their age). On
+  clusters whose login nodes share `$HOME`, a record from a host of another name is reported
+  (`OtherHost`, with the launcher that made it) and never acted on, unless
+  `LaunchOptions::take_over` says so. **Recovery:** when that host is gone for good (renamed or
+  retired), a direct launcher's `stop` with `take_over` forgets its record, and the next start
+  or submit goes ahead.
+- **SLURM jobs of the same root:** they share `run/` and its socket, so while `run/slurm.json`
+  records a job that squeue says is still queued or running, or squeue cannot be asked, the
+  direct and tmux launchers neither start a helper nor remove records (`InUse`), with
+  `take_over` or without (under the launch lock, so a submit and a start never interleave).
+  Stop the job with the SLURM launcher first.
+- **Secrets:** none are involved; nothing here logs. Reports and errors carry paths, the
+  first line of `--version` and, for a SLURM job that ended, the last lines of its output, with
+  control characters replaced.
+
+## The helper as a SLURM job (`helper::slurm`)
+
+On a cluster, the helper runs inside an allocation on a compute node, and the laptop reaches it
+through the login node. Nothing on the cluster needs root, internet or a compiler.
+
+```rust
+let site = slurm::generic();                        // or one of slurm::load_sites(dir)
+let options = JobOptions { partition: Some("gpu".into()), account: Some("proj0001".into()),
+                           time: Some(Duration::from_secs(8 * 3600)), ..Default::default() };
+let script = JobSpec::new(&site, &options)?.render(&target)?;
+// Show script.text() to the user. Only after they confirm:
+let launcher = SlurmLauncher::default().with_script(script);
+launcher.submit(&target).await?;                    // returns at once
+launcher.job_status(&target).await?;                // pending (Priority), running on node017, …
+launcher.cancel(&target).await?;
+```
+
+- **Nothing is submitted unseen.** Submitting takes a `JobScript`, which only `JobSpec::render`
+  makes, and PitCrew sends exactly its `text()`; the machine checks its length, its first and
+  last lines and its sha256 before using it. The script is the fixed text of
+  `src/helper/slurm/job.sh` behind `#SBATCH` lines and shell assignments made only of checked
+  values (snapshots of two scripts are in `src/helper/slurm/snapshots/`). `#SBATCH` values are
+  limited to characters that need no quoting; shell values are quoted besides.
+- **Options:** partition, account, QOS, wall time, CPUs (`--cpus-per-task`), memory (`--mem`),
+  GPUs (`--gres`), job name, and extra `#SBATCH` options. Extra options must be long options
+  from `ALLOWED_SBATCH`, written `--name=value` (only true flags such as `--exclusive` may stand
+  alone: sbatch reads all directives as one command line, so an option missing its value would
+  take the next directive as one). Refused: options that would change which job status and
+  stop look at, where its files go, or which cluster (`--job-name`, `--chdir`, `--output`,
+  `--error`, `--array`, `--clusters`, `--wrap`, `--wait`, `--uid`, and abbreviations), and ones
+  that change the helper's environment or where mail goes (`--export`, `--get-user-env`,
+  `--propagate`, `--mail-user`). No `#SBATCH` line may hold `hetjob` or `packjob` in any case,
+  the root's included: SLURM up to 20.11 splits a job there.
+- **Submitting** (`helper.sh slurm-submit`, under the launch lock, after the usual checks of
+  the way to the root): the script goes to a private temporary file; leftovers of a killed
+  submit are swept. It is refused while `endpoint.json` records a helper of the direct or tmux
+  launcher that runs here (`InUse`: stop it with that launcher) or was recorded on a host of
+  another name (`OtherHost`: stop it there, or see the recovery above), since they share
+  `run/` and its socket; a record of one that is gone is removed. The `SBATCH_*`, `SQUEUE_*`,
+  `SCANCEL_*` and `SACCT_*` variables, and `SLURM_CLUSTERS`, are unset: they would override the
+  script's directives, hide a job from `squeue -j` (`SQUEUE_STATES`), make scancel ask or skip
+  (`SCANCEL_INTERACTIVE`, `SCANCEL_STATE`), or send the commands to another cluster.
+  `sbatch --parsable` runs under `umask 077` with the job name, the root (`--chdir`) and
+  `run/slurm-<id>.out` (`--output`) on its command line too, and the user's umask as the
+  script's argument. The id is read from sbatch's standard output only. The job is recorded at
+  once in `run/slurm.json` (id, name, submit time, host, and the cluster when sbatch answers
+  `<id>;<cluster>` with a plain name that does not start with `-` or `.`: squeue, scancel and
+  sacct are then run with `-M <cluster>`). A recorded job still queued or running is not
+  submitted again.
+- **The job, on the node**, checks the way to the root and the root as the launchers do (the
+  same shell text as `helper.sh`; a test compares them), makes its output file private, waits
+  for its record (so a job whose submission was cut off before it was recorded ends on its own,
+  and one whose record names another job does not start), and ends without touching anything
+  while `endpoint.json` records another launcher's helper (the direct and tmux launchers do not
+  start one while the job is queued or running; this check is for when squeue was wrong). It
+  checks the recipe's `modules_init` script as it checks the root (the file, any link to it,
+  and every directory on the way belong to root or the user and are writable by no one else),
+  sources it, resets the shell's settings and traps and drops the functions and aliases it may
+  have made for the tools the job uses, loads the modules, checks it is still in the root, and
+  starts `bin/<current>/pitcrewd serve --listen unix:<socket>` with the user's umask. Once the
+  socket is there it writes `run/endpoint.json` with `host` the node (`SLURMD_NODENAME`, else
+  `hostname -f`, else `uname -n`; at most 64 plain characters) and `job` its id. On SIGTERM
+  (scancel, the time limit) it passes the signal on, and removes the endpoint while it names the
+  job, and the socket it started: in its own node-local directory, or in `run/` only while the
+  endpoint still names the job (never another helper's socket there). SIGUSR1 and SIGUSR2
+  (`--signal`) do not end it.
+- **Status** (`job_status`, no lock) reads `squeue -h -j <id> -o '%i|%U|%T|%r|%L|%l|%N|%j'`:
+  pending with SLURM's reason, running on a node, the time left (`%L`) and the limit, or
+  another state. Once squeue no longer lists the job, `sacct` says how it ended (state and exit
+  code) where accounting is on, with the last lines of its output; sacct is asked only for
+  records with the job's name and the user's uid, and prints no names, so a name holding a
+  line break cannot forge a record. If squeue fails (the scheduler unreachable), that is an
+  error and nothing is concluded. `Launcher::status` maps these to `HelperState::Running`
+  (endpoint written), `Pending`, or `NotRunning`.
+- **Stop** (`cancel`) runs `scancel --user=<uid> --name=<name> <id>`, waits up to
+  `stop_timeout` (checking once a second) for the job to leave the queue, then forgets it: the
+  record, its endpoint and its socket in the root. A job still queued after the wait is
+  `StopFailed` (or `Slurm`, with scancel's message, if scancel failed), and the record is kept,
+  so stopping again finishes it. Idempotent.
+- **Whose job:** a job id is acted on only while squeue lists it with the recorded name and
+  this user's uid (`%j`, `%U`; the name is the last field, since it may hold anything; a job
+  listed twice, as a name with a line break would make it, is an error). An id that now names
+  another job (a cluster that lost its state numbers jobs again) is reported as
+  `JobState::NotOurs` and never cancelled; PitCrew only forgets its own record. The name alone
+  is easy to guess: the uid is what tells jobs apart.
+- **Start** (`Launcher::start`) submits if needed and waits up to `ready_timeout` (squeue every
+  2 seconds) for the job to run and its helper to listen. A job still pending is
+  `HelperError::Queued`: it stays queued, and starting again waits for the same job.
+- **Socket:** `<root>/run/pitcrewd.sock`, or on the node's own disk
+  (`$TMPDIR/pitcrew-<job>.<pid>/pitcrewd.sock`, `/tmp` when `$TMPDIR` is unset or not a plain
+  path), in a private directory whose way is checked like the root's. Reaching it (the tunnel,
+  the relay on the node, the stdio bridge) is the next brief's.
+- **Roots** for this launcher must be plain characters (`A-Z a-z 0-9 _ . / + -`), since the
+  root goes into `#SBATCH` lines, which do not quote, and into `--output`, where `%` is a
+  pattern.
+
+### Site recipes
+
+A recipe says what one cluster needs: job defaults and extra `#SBATCH` options, modules to load
+(and, where `/bin/sh` on the nodes has no `module` command, the script that sets it up), the
+last hop to a compute node (`ssh <node>` from the login node, or `srun --jobid <id> --overlap`
+on sites that forbid ssh to nodes; recorded for the tunnel), and the socket's place.
+
+- `SiteRecipe` is a small trait; `generic()` is the one built in: SLURM's defaults, no modules,
+  the socket under the root, `ssh` to the node. Every value a recipe gives is checked when a
+  `JobSpec` is made from it, whoever wrote the recipe.
+- **A recipe is trusted like a shell script the user runs.** Its `modules_init` script is
+  sourced in the job and its modules loaded there, so it runs code as the user on the cluster.
+  The checks keep its values from breaking the job script or changing which job PitCrew acts
+  on; they do not make someone else's recipe safe to use unread.
+- **Adding one:** copy `src/helper/slurm/example-site.toml` to `~/.pitcrew/sites/<name>.toml` on
+  the laptop (`sites_dir()`; `<name>` is `a-z 0-9 _ -`) and edit it. `load_sites(dir)` reads every
+  `*.toml` there, each failure reported on its own. Files are read strictly: an unknown key, a
+  table, or a value of the wrong type is an error naming the key; files over 64 KiB are refused.
+  The keys are `description`, `partition`, `account`, `qos`, `time`, `cpus`, `memory`, `gres`,
+  `sbatch`, `modules_init`, `modules`, `last_hop` (`"ssh"` or `"srun"`) and `socket`
+  (`"root"` or `"node-local"`).
+- `check_tools(&probe.slurm, last_hop)` says whether a machine can run the launcher: `sbatch`,
+  `squeue` and `scancel`, and `srun --overlap` for the `srun` last hop.
 
 ## Tests
 
@@ -206,6 +350,29 @@ let started = DirectLauncher::default().start(&target).await?;   // or TmuxLaunc
   (start, status, stop, `endpoint.json`, failures, other hosts, two roots on one host). It runs
   the whole flow again with each POSIX shell of `PITCREW_TEST_SHELLS` as the machine's
   `/bin/sh`;
+- the SLURM cases in `tests/deploy/slurm.rs` (a `#[path]` module of `deploy.rs`), where the
+  binary also plays `sbatch`, `squeue`, `scancel`, `sacct`, `srun` and `sinfo` with their state
+  in files (honouring `SQUEUE_STATES`, `SCANCEL_STATE`, `SCANCEL_INTERACTIVE`, scancel's and
+  sacct's name and user filters, and `-M` or `SLURM_CLUSTERS` for a named cluster): a job runs
+  its script with the machine's `sh` in its own process group, and scancel sends SIGTERM, then
+  SIGKILL after a wait. They cover submit, pending with a reason, running on a node with the
+  time left, and stop; jobs refused by sbatch, failing at once, losing their node, or slow to
+  leave the queue; squeue unreachable, scancel failing, and scancel missing the job; jobs that
+  find another job (or none) recorded, or an open root; reused ids (another user's job with
+  the same name, or a name forging a line), never cancelled; the direct launcher's helper on
+  the same root, never overlapped (a submit and a direct start or stop while the job is
+  queued, starting or running, with squeue failing or missing, and a direct helper that got in
+  anyway); a named cluster, and one that would read as an option; a user recipe's extra lines
+  and modules (and one with an unknown key, and a set-up script whose functions and aliases
+  would stand in for tools), with unsafe set-up scripts refused; a node-local socket, and an
+  open `$TMPDIR` refused; job scripts
+  eaten, cut or changed on the way; the probe; and a job under each POSIX shell, which also
+  shrugs off SIGUSR1 and SIGUSR2. The scripts' snapshots are unit tests
+  (`PITCREW_UPDATE_SNAPSHOTS=1` rewrites them);
+- `deploy.rs` checks that nothing a case starts outlives it: everything started on a fake
+  machine carries the run's mark (`PITCREW_TEST_RUN`) in its environment; after each case,
+  passed or not, what still carries it is killed and the case fails, and the end of the run
+  checks that nothing is left (Linux, through `/proc`);
 - `tests/real_sshd.rs`, only when `PITCREW_TEST_SSH_HOST` names a host reachable without
   prompts; it also deploys a stand-in helper into a throwaway directory there and removes it.
 

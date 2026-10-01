@@ -22,7 +22,10 @@
 //!                            $HOME is mounted); bin/previous names the one before
 //! bin/.lock/                 deploy lock (mkdir), with an `owner` file: host, pid, call tag, time
 //! run/endpoint.json          the running helper: pid, host, version, started, launcher, socket
+//!                            (and job, for the SLURM launcher)
 //! run/pitcrewd.sock          its socket; run/pitcrewd.log its output; run/.lock the launch lock
+//! run/slurm.json             the batch job the SLURM launcher submitted; run/slurm-<id>.out
+//!                            its output
 //! ```
 //!
 //! **The way there** is checked first, as sshd checks the way to `authorized_keys`: every
@@ -49,7 +52,8 @@
 
 mod deploy;
 mod launch;
-mod script;
+pub(crate) mod script;
+pub mod slurm;
 
 pub use deploy::{
     DeployOptions, Deployed, HashTool, Helper, MAX_HELPER_SIZE, Platform, Progress, deploy,
@@ -59,6 +63,7 @@ pub use launch::{
     DirectLauncher, Endpoint, HelperFuture, HelperState, LaunchOptions, Launcher, MIN_TMUX,
     Started, Status, Stopped, TmuxLauncher, parse_tmux_version, tmux_name,
 };
+pub use slurm::SlurmLauncher;
 
 use crate::probe::Probe;
 use crate::{Ssh, SshError};
@@ -162,17 +167,47 @@ pub enum HelperError {
     /// Nothing is deployed to start.
     #[error("the helper is not deployed ({0})")]
     NotDeployed(String),
-    /// The helper is recorded as running on another host sharing this home directory (another
-    /// login node, say). It cannot be checked or stopped from here; see
-    /// [`LaunchOptions::take_over`].
-    #[error("the helper is recorded on {0}, another host sharing this home")]
-    OtherHost(String),
+    /// The helper is recorded as running on another host sharing this home directory: another
+    /// login node, say, or a compute node for a SLURM job. It cannot be checked or stopped from
+    /// here: stop it there (a SLURM job with the SLURM launcher), or, once that host is known to
+    /// be gone, forget the record with a direct launcher's stop under
+    /// [`LaunchOptions::take_over`]. A host is told apart by its name: a record of this host
+    /// made before its id changed (as at a reboot of a stateless node) is this host's.
+    #[error(
+        "the {launcher} launcher's helper is recorded on {host}, another host sharing this home"
+    )]
+    OtherHost {
+        /// The host it is recorded on.
+        host: String,
+        /// The launcher that started it: `direct`, `tmux` or `slurm`.
+        launcher: String,
+    },
     /// The helper exited at once, or did not open its socket in time (it was then stopped).
     #[error("the helper did not start: {0}")]
     StartFailed(String),
-    /// The helper outlived SIGKILL.
+    /// The helper outlived SIGKILL, or its batch job did not leave the queue in time.
     #[error("the helper did not stop: {0}")]
     StopFailed(String),
+    /// Another launcher's helper uses this root (and its socket), here or on another host: stop
+    /// it first.
+    #[error("in use: {0}")]
+    InUse(String),
+    /// A SLURM command is missing, or failed: squeue could not say what the job is doing
+    /// (the scheduler may be unreachable), so nothing was concluded or changed.
+    #[error("SLURM: {0}")]
+    Slurm(String),
+    /// sbatch refused the job; its message says why (an unknown account, say).
+    #[error("sbatch refused the job: {0}")]
+    SubmitFailed(String),
+    /// The helper's batch job is queued but has not started within the wait. It stays
+    /// queued; starting again waits for the same job.
+    #[error("the helper's job {job} has not started yet: {state}")]
+    Queued {
+        /// The job's id.
+        job: u64,
+        /// What the scheduler says, e.g. `job 4242 pending (Priority)`.
+        state: String,
+    },
     /// Another failure the script reported, as `<code>: <detail>`.
     #[error("{0}")]
     Remote(String),

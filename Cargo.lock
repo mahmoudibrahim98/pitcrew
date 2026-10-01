@@ -1245,6 +1245,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "toml_edit",
  "windows-sys 0.61.2",
 ]
 
