@@ -140,11 +140,19 @@ not start at byte 0).
 - An `agent` token: only asks addressed to itself, and only of kind `question` or `mention`.
 - `decision`, `approval` and `review` always need a `device` token.
 
-**Activity paging** (`GET /v1/events`): events oldest first within the page, the newest page
-when `before` is absent. `before` is an exclusive revision. `from_rev` and `to_rev` are the
-revisions of the first and last returned events (both 0 for an empty page); with filters they
-need not be contiguous. `at_start` is true when no older matching event exists. Pass `from_rev`
-as `before` for the previous page. Default limit 100, max 500.
+**Activity paging** (`GET /v1/events`, response type `EventsPage`): events oldest first within
+the page, the newest page when `before` is absent. `before` is an exclusive revision. `from_rev`
+and `to_rev` are the revisions of the first and last returned events; with filters they need not
+be contiguous. Pass `from_rev` as `before` for the previous page. Default limit 100, max 500;
+`limit=0` is 400.
+- **Only `at_start` ends paging.** With filters the hub scans a bounded window per request, so a
+  page may hold fewer than `limit` events, even none. An empty page that is not at the start has
+  `to_rev = 0` and `from_rev` = where the scan stopped; keep paging from it.
+- **Filters match events that name the entity directly:** `session` matches events carrying that
+  session id, and `task` those carrying that task id. Events that reach it only through a link
+  (a turn in a session linked to the task; `dispatch_finished`, which names the dispatch) are not
+  included until the hub has an index for them. `project` and `workstream` answer `400 invalid`
+  until then.
 
 ### Hooks
 
@@ -168,15 +176,22 @@ as `before` for the previous page. Default limit 100, max 500.
 - **Client rule:** keep server state in TanStack Query, and on each event invalidate exactly the
   keys it touches (e.g. `task_moved` → that task, its lists and its workstream).
 
-## Terminals: `GET /v1/sessions/{id}/terminal?cols=&rows=` (WebSocket, device tokens)
+## Terminals: `GET /v1/sessions/{id}/terminal?cols=&rows=&from=` (WebSocket, device tokens)
 
-- Server → client **binary** frames are terminal output. The first frames replay the runtime's
-  buffer, then output is live.
+- `cols` and `rows` are 1..=1000 (400 outside). `from` (default 0) is the byte offset to start
+  from: a reconnecting client passes the number of output bytes it has received.
+- Server → client **binary** frames are terminal output: first what the runtime's buffer holds
+  from `from`, then live output.
 - Server → client **text** frames:
-  - `{"type":"truncated","from":<offset>}`, sent **before** the replay when the buffer no longer
-    held the start;
-  - `{"type":"exit"}` when the program ends.
+  - `{"type":"truncated","from":<offset>}`: the next binary byte is at `offset`, because the
+    buffer no longer held the requested bytes (or `from` was past the end). It usually comes
+    before the replay, but **may arrive at any time**;
+  - `{"type":"exit"}` when the program ends, after its last output; a terminal that disappears
+    counts as ended.
 - Client → server **binary** frames are keystrokes, written as-is.
-- Client → server **text** frames are control messages: `{"type":"resize","cols":120,"rows":40}`.
-  Unknown `type`s are ignored; malformed JSON closes the socket with code 1007.
+- Client → server **text** frames are control messages: `{"type":"resize","cols":120,"rows":40}`
+  (1..=1000). Unknown `type`s are ignored; malformed JSON or an invalid size closes with 1007.
+- **Close codes:** 1000 after `exit`; 1007 malformed control; 1013 client too slow (reconnect
+  with `from`); 1011 runtime failure; 1001 hub shutting down. The stream uses 1013 too slow
+  (reconnect with `since`), 1001 source closed or hub shutting down, and 1011 failure.
 - The mock echoes input back and replays a short canned screen.

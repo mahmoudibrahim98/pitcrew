@@ -1,0 +1,327 @@
+//! # pitcrew-cli
+//!
+//! `pitcrew`, the command agents run to see and report on their work, and `pitcrew hook`, which
+//! runs on every agent turn.
+//!
+//! - [`config`]: where the daemon is and which token to send (`PITCREW_*`).
+//! - [`transport`]: blocking connections, checked before any token is sent.
+//! - [`http`]: just enough HTTP/1.1.
+//! - [`client`]: API calls; [`hook`]: the hook; [`plan`]: plans for `task plan`.
+//! - [`error`]: errors and exit codes.
+//!
+//! There is no async runtime: a verb is a few blocking requests, and the hook one.
+//!
+//! **Owned by stream I.** The work packages are in `docs/build/streams/I.md`.
+
+pub mod client;
+pub mod config;
+pub mod display;
+pub mod error;
+pub mod hook;
+pub mod http;
+pub mod plan;
+pub mod transport;
+mod verbs;
+
+use clap::{ArgGroup, Parser, Subcommand};
+use config::Env;
+use error::Result;
+use std::ffi::OsString;
+use std::io::{Read, Write};
+use transport::Timeouts;
+
+/// Largest text read from stdin (plans, `-` texts).
+pub const MAX_STDIN: usize = 1 << 20;
+
+/// The arguments after `hook` when this run is the hook: `hook` is the first argument after the
+/// program name and any global `--json` flags. `main` then takes the fast, silent path.
+#[must_use]
+pub fn hook_args(args: &[OsString]) -> Option<&[OsString]> {
+    let first = args
+        .iter()
+        .skip(1)
+        .position(|a| a != "--json")
+        .map(|i| i + 1)?;
+    (args[first] == "hook").then(|| &args[first + 1..])
+}
+
+/// Checks a task argument before anything is sent (see `verbs::task_ref`).
+fn task_arg(value: &str) -> std::result::Result<String, String> {
+    verbs::task_ref(value).map_err(|e| e.message)
+}
+
+/// Where a run reads and writes. `main` passes the process's own streams; tests pass buffers.
+pub struct Io<'a> {
+    /// Standard input.
+    pub stdin: &'a mut dyn Read,
+    /// Whether stdin is a terminal (then nothing is piped in).
+    pub stdin_is_terminal: bool,
+    /// Standard output.
+    pub stdout: &'a mut dyn Write,
+    /// Standard error.
+    pub stderr: &'a mut dyn Write,
+}
+
+impl std::fmt::Debug for Io<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Io")
+            .field("stdin_is_terminal", &self.stdin_is_terminal)
+            .finish_non_exhaustive()
+    }
+}
+
+const AFTER_HELP: &str = "\
+Environment:
+  PITCREW_SOCKET      the daemon's unix socket (or its directory)
+  PITCREW_PIPE        the daemon's named pipe on Windows (default: \\\\.\\pipe\\pitcrewd-<your SID>)
+  PITCREW_URL         loopback TCP for development only, e.g. http://127.0.0.1:47317
+  PITCREW_TOKEN       the agent token, or
+  PITCREW_TOKEN_FILE  a private file holding it (mode 0600 on Unix)
+
+Exit codes: 0 ok, 1 other error, 2 invalid, 3 forbidden or unauthorized, 4 conflict,
+5 daemon unavailable, 6 not found.";
+
+/// `pitcrew`: see and report on your work in PitCrew.
+#[derive(Debug, Parser)]
+#[command(name = "pitcrew", version, after_help = AFTER_HELP)]
+struct Cli {
+    /// Print JSON instead of text.
+    #[arg(long, global = true)]
+    json: bool,
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Who this token belongs to.
+    Whoami,
+    /// List, show, move and plan tasks.
+    #[command(subcommand)]
+    Task(TaskCommand),
+    /// Start work on a task: move it to in_progress.
+    Claim {
+        /// Task key (PAP-4) or id.
+        #[arg(value_parser = task_arg)]
+        task: String,
+    },
+    /// Report progress: comment on a task, and move it to review when asked.
+    #[command(group(ArgGroup::new("what").required(true).multiple(true).args(["note", "review"])))]
+    Report {
+        /// Task key or id.
+        #[arg(value_parser = task_arg)]
+        task: String,
+        /// A note to post as a comment (`-` reads it from stdin).
+        #[arg(long)]
+        note: Option<String>,
+        /// Move the task to review.
+        #[arg(long)]
+        review: bool,
+    },
+    /// Comment on a task.
+    Comment {
+        /// Task key or id.
+        #[arg(value_parser = task_arg)]
+        task: String,
+        /// The comment (`-` reads it from stdin).
+        #[arg(required = true)]
+        text: Vec<String>,
+        /// Mention a member, e.g. --mention @sam (repeatable).
+        #[arg(long = "mention", value_name = "@MEMBER")]
+        mentions: Vec<String>,
+    },
+    /// Ask a member something; it shows in their Inbox.
+    Ask {
+        /// Who should answer, e.g. @sam.
+        #[arg(value_name = "@MEMBER")]
+        to: String,
+        /// The question, one line (`-` reads it from stdin).
+        #[arg(required = true)]
+        title: Vec<String>,
+        /// An answer to offer (repeatable, in order).
+        #[arg(long = "option", value_name = "TEXT")]
+        options: Vec<String>,
+        /// More context.
+        #[arg(long)]
+        body: Option<String>,
+        /// The task it is about.
+        #[arg(long, value_parser = task_arg)]
+        task: Option<String>,
+        /// question, decision, review, approval or mention.
+        #[arg(long, default_value = "question")]
+        kind: String,
+    },
+    /// Answer an ask addressed to you.
+    #[command(group(ArgGroup::new("answer").required(true).multiple(true).args(["text", "option"])))]
+    Reply {
+        /// The ask's id (ask_…), as `check` shows it.
+        ask: String,
+        /// The answer (`-` reads it from stdin).
+        text: Vec<String>,
+        /// Choose an offered option, numbered from 1 as `check` shows them.
+        #[arg(long)]
+        option: Option<usize>,
+    },
+    /// What needs you: open asks for you, recent mentions, and your own asks.
+    Check,
+    /// Send an agent CLI's hook event to the daemon. Always silent; always exits 0.
+    Hook {
+        /// claude, codex or opencode.
+        engine: String,
+        /// The CLI's event name, e.g. SessionStart or Stop.
+        event: String,
+        /// The event's JSON, when the CLI passes it as an argument instead of on stdin.
+        payload: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TaskCommand {
+    /// List tasks.
+    List {
+        /// Only tasks assigned to you.
+        #[arg(long)]
+        mine: bool,
+        /// Only these statuses (repeatable or comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        status: Vec<String>,
+    },
+    /// Show a task: its brief, status and subtasks.
+    Show {
+        /// Task key or id.
+        #[arg(value_parser = task_arg)]
+        task: String,
+    },
+    /// Move a task to another status.
+    Move {
+        /// Task key or id.
+        #[arg(value_parser = task_arg)]
+        task: String,
+        /// backlog, todo, in_progress, review, done or canceled.
+        status: String,
+    },
+    /// Replace your own plan on a task with the one on stdin (one step per line; `[x]` done).
+    Plan {
+        /// Task key or id.
+        #[arg(value_parser = task_arg)]
+        task: String,
+    },
+}
+
+/// Runs `pitcrew` with `args` (including the program name) and returns the exit code.
+pub fn run(args: Vec<OsString>, env: Env<'_>, io: &mut Io<'_>) -> i32 {
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(e) => {
+            let text = e.render().to_string();
+            let out: &mut dyn Write = if e.use_stderr() {
+                &mut *io.stderr
+            } else {
+                &mut *io.stdout
+            };
+            let _ = out.write_all(text.as_bytes());
+            return e.exit_code();
+        }
+    };
+    if let Command::Hook {
+        engine,
+        event,
+        payload,
+    } = cli.command
+    {
+        let args: Vec<OsString> = [Some(engine), Some(event), payload]
+            .into_iter()
+            .flatten()
+            .map(OsString::from)
+            .collect();
+        let _ = hook::run(&args, env, io.stdin, io.stdin_is_terminal);
+        return 0;
+    }
+    match execute(cli.command, env, io, cli.json) {
+        Ok(()) => 0,
+        Err(e) => {
+            // Messages can quote the daemon, so text mode makes them safe to print.
+            let text = if cli.json {
+                format!("{}\n", e.to_json())
+            } else {
+                format!("pitcrew: {}\n", display::line(&e.message))
+            };
+            let _ = io.stderr.write_all(text.as_bytes());
+            e.exit_code()
+        }
+    }
+}
+
+fn execute(command: Command, env: Env<'_>, io: &mut Io<'_>, json: bool) -> Result<()> {
+    let client = client::Client::from_env(env, Timeouts::VERB)?;
+    client.check_version()?;
+    let mut verb = verbs::Verb::connect(client, io, json)?;
+    match command {
+        Command::Whoami => verb.whoami(),
+        Command::Task(TaskCommand::List { mine, status }) => verb.task_list(mine, &status),
+        Command::Task(TaskCommand::Show { task }) => verb.task_show(&task),
+        Command::Task(TaskCommand::Move { task, status }) => verb.task_move(&task, &status),
+        Command::Task(TaskCommand::Plan { task }) => verb.task_plan(&task),
+        Command::Claim { task } => verb.claim(&task),
+        Command::Report { task, note, review } => verb.report(&task, note.as_deref(), review),
+        Command::Comment {
+            task,
+            text,
+            mentions,
+        } => verb.comment(&task, &text, &mentions),
+        Command::Ask {
+            to,
+            title,
+            options,
+            body,
+            task,
+            kind,
+        } => verb.ask(&verbs::AskArgs {
+            to,
+            title,
+            options,
+            body,
+            task,
+            kind,
+        }),
+        Command::Reply { ask, text, option } => verb.reply(&ask, &text, option),
+        Command::Check => verb.check(),
+        // Handled in `run`.
+        Command::Hook { .. } => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<OsString> {
+        list.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn the_hook_is_found_after_global_flags() {
+        let hook = |list: &[&str]| {
+            let all = args(list);
+            hook_args(&all).map(<[OsString]>::to_vec)
+        };
+        assert_eq!(
+            hook(&["pitcrew", "hook", "claude", "Stop"]),
+            Some(args(&["claude", "Stop"]))
+        );
+        assert_eq!(
+            hook(&["pitcrew", "--json", "--json", "hook", "codex"]),
+            Some(args(&["codex"]))
+        );
+        assert_eq!(hook(&["pitcrew", "hook"]), Some(Vec::new()));
+        for other in [
+            &["pitcrew"][..],
+            &["pitcrew", "--json"],
+            &["pitcrew", "task", "hook"],
+            &["pitcrew", "--help", "hook"],
+            &["pitcrew", "whoami"],
+        ] {
+            assert_eq!(hook(other), None, "{other:?}");
+        }
+    }
+}

@@ -17,11 +17,20 @@
 
 mod error;
 pub mod migrations;
+pub mod projection;
 mod scan;
 mod store;
 
+/// The store's `rusqlite`. Projections and [`Store::read`] use it, so every crate writes SQL
+/// against the workspace's one version and the store's own transaction type. Domain crates do not
+/// need their own `rusqlite` dependency.
+pub use rusqlite as sql;
+
 pub use error::{DbError, Error, Result};
-pub use store::{EventFilter, RevRange, Store, StoreOptions, StoredEvent, event_type};
+pub use projection::{BoxError, Projection};
+pub use store::{
+    EventFilter, MAX_SUBSCRIBER_CAPACITY, RevRange, Store, StoreOptions, StoredEvent, event_type,
+};
 
 /// The protocol version this crate was built against.
 pub const PROTOCOL_VERSION: u32 = pitcrew_protocol::PROTOCOL_VERSION;
