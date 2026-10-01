@@ -12,7 +12,8 @@
 //! touched and notable [`Fact`]s, and every fact carries receipts. [`BlockBuilder`] does the same
 //! incrementally and reports which blocks changed or closed; fed in any batches it gives the same
 //! blocks as [`blocks`]. A [`Directory`] seeds what is known before the first event (sessions,
-//! tasks, names) and is kept current from the events.
+//! tasks, names) and is kept current from the events, by the hub's rules (firm links stay, stale
+//! moves are not moves) and within a bound that drops what was used longest ago.
 //!
 //! ## Summaries
 //!
@@ -31,8 +32,9 @@
 //!
 //! Everything here is pure and deterministic: no clock, no I/O, no model calls. Internal maps hash
 //! with a random seed each, but no output follows their order, so the same input always gives
-//! byte-identical output. All event text is untrusted: it is cleaned and capped before it is kept,
-//! and nothing panics on any input.
+//! byte-identical output. All event text is untrusted: it is cleaned (control, direction-changing
+//! and invisible characters and Unicode tag characters dropped, see [`clean`]) and capped before it
+//! is kept, and nothing panics on any input.
 
 #![forbid(unsafe_code)]
 
@@ -44,6 +46,7 @@ mod day;
 mod directory;
 mod draft;
 mod hash;
+mod lru;
 mod summary;
 mod text;
 mod time;
