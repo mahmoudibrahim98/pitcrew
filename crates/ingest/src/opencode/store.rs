@@ -10,8 +10,11 @@
 //!
 //! An `immutable` read takes no lock, so a writer that starts meanwhile could change pages under
 //! it. Such a read is checked: the store's length and mtime and which side files exist are noted
-//! before opening and compared again by [`Store::finish`] after the last query; any change, or a
-//! "malformed" error during the read, discards the result as [`io::ErrorKind::WouldBlock`].
+//! before opening and compared again by [`Store::finish`] after the last query; any change
+//! discards the result as [`io::ErrorKind::WouldBlock`]. A "malformed" error during such a read
+//! is the same retry only if the store changed since opening; otherwise the store itself is
+//! damaged (say, a sync-conflict copy) and is reported unreadable, so it is skipped rather than
+//! retried forever.
 //!
 //! Columns are looked up first: a store from an older or newer OpenCode version with missing
 //! optional columns still reads, and one missing a required table or column is reported as
@@ -138,7 +141,7 @@ impl Store {
     pub(crate) fn open(path: &Path) -> Result<Self, SourceError> {
         let quiet = quiet_wal_uri(path)?;
         let unlocked = quiet.as_ref().map(|(_, before)| before.clone());
-        let err = |e| sql_error(path, e, unlocked.is_some());
+        let err = |e| sql_error(path, e, unlocked.as_ref());
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_NO_MUTEX
             | OpenFlags::SQLITE_OPEN_URI;
@@ -187,7 +190,7 @@ impl Store {
     }
 
     fn err(&self, e: rusqlite::Error) -> SourceError {
-        sql_error(&self.path, e, self.unlocked.is_some())
+        sql_error(&self.path, e, self.unlocked.as_ref())
     }
 
     fn unreadable(&self, reason: String) -> SourceError {
@@ -688,7 +691,8 @@ fn side_file(path: &Path, suffix: &str) -> PathBuf {
 ///
 /// `immutable` skips locking, which is safe while nothing writes. If OpenCode starts during the
 /// read, its writes go to a new `-wal`, and only a checkpoint rewrites the main file; either is
-/// caught by [`Store::finish`] or as a "malformed" error, and the read is retried. A `-wal` left
+/// seen as a change of the store's state, by [`Store::finish`] or when a "malformed" error is
+/// met, and the read is retried. A `-wal` left
 /// without its `-shm` by a crash is not read until OpenCode recovers it.
 fn quiet_wal_uri(path: &Path) -> Result<Option<(String, FileState)>, SourceError> {
     use std::io::Read;
@@ -772,14 +776,18 @@ fn retry_later(path: &Path, why: &str) -> SourceError {
     ))
 }
 
-/// A busy or locked store is a retry-later I/O error, and so is a "malformed" page met by an
-/// `unlocked` read (a writer may have been checkpointing); anything else makes it unreadable.
-pub(crate) fn sql_error(path: &Path, e: rusqlite::Error, unlocked: bool) -> SourceError {
+/// A busy or locked store is a retry-later I/O error. So is a "malformed" page met by an
+/// unlocked read (`unlocked` holds the store's state before opening) of a store that has changed
+/// since: a writer may have been checkpointing. A store that has not changed is damaged, and
+/// that, like anything else, makes it unreadable.
+fn sql_error(path: &Path, e: rusqlite::Error, unlocked: Option<&FileState>) -> SourceError {
     match e.sqlite_error_code() {
         Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked) => {
             retry_later(path, "locked by a writer")
         }
-        Some(ErrorCode::DatabaseCorrupt) if unlocked => {
+        Some(ErrorCode::DatabaseCorrupt)
+            if unlocked.is_some_and(|before| FileState::of(path).as_ref() != Some(before)) =>
+        {
             retry_later(path, "changed during an unlocked read")
         }
         _ => SourceError::Unreadable {
@@ -860,28 +868,66 @@ mod tests {
         store.finish().expect("locked reads need no check");
     }
 
+    fn is_retry(err: &SourceError) -> bool {
+        matches!(err, SourceError::Io(e) if e.kind() == io::ErrorKind::WouldBlock)
+    }
+
+    /// A malformed page met by an unlocked read means retry only if the store changed since it
+    /// was opened; a damaged store that stays the same is unreadable, not retried forever.
     #[test]
-    fn malformed_pages_mean_retry_only_for_unlocked_reads() {
-        let corrupt = || {
-            rusqlite::Error::SqliteFailure(
-                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
-                None,
-            )
-        };
+    fn malformed_pages_mean_retry_only_if_an_unlocked_store_changed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = wal_store(dir.path());
+        // Junk after the first page: the schema still reads, the tables do not.
+        let mut bytes = std::fs::read(&path).expect("read");
+        assert!(bytes.len() > 8192);
+        bytes[4096..].fill(0x5a);
+        std::fs::write(&path, bytes).expect("write");
+
+        // Damaged and unchanged: unreadable, every time.
+        for _ in 0..2 {
+            let store = Store::open(&path).expect("open");
+            assert!(store.unlocked.is_some(), "no side files: read unlocked");
+            let err = store.sessions().expect_err("malformed");
+            assert!(matches!(&err, SourceError::Unreadable { .. }), "{err}");
+        }
+
+        // Changed between opening and the malformed page: retry.
+        let store = Store::open(&path).expect("open");
+        let later = SystemTime::now() + Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|f| f.set_modified(later))
+            .expect("touch");
+        let err = store.sessions().expect_err("malformed");
+        assert!(is_retry(&err), "{err}");
+
+        // A side file appearing (a writer starting) counts as a change too.
+        let store = Store::open(&path).expect("open");
+        std::fs::write(side_file(&path, "-wal"), b"").expect("wal");
+        let err = store.sessions().expect_err("malformed");
+        assert!(is_retry(&err), "{err}");
+    }
+
+    #[test]
+    fn malformed_pages_in_a_locked_read_are_unreadable_and_busy_means_retry() {
+        let failure = |code| rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
         let p = Path::new("x.db");
         assert!(matches!(
-            sql_error(p, corrupt(), true),
-            SourceError::Io(e) if e.kind() == io::ErrorKind::WouldBlock
-        ));
-        assert!(matches!(
-            sql_error(p, corrupt(), false),
+            sql_error(p, failure(rusqlite::ffi::SQLITE_CORRUPT), None),
             SourceError::Unreadable { .. }
         ));
-        let busy = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
-            None,
-        );
-        assert!(matches!(sql_error(p, busy, false), SourceError::Io(_)));
+        assert!(is_retry(&sql_error(
+            p,
+            failure(rusqlite::ffi::SQLITE_BUSY),
+            None
+        )));
+        assert!(is_retry(&sql_error(
+            p,
+            failure(rusqlite::ffi::SQLITE_LOCKED),
+            None
+        )));
     }
 
     /// Listing sessions does not read parts: its work is the same for 10 parts as for 5000.

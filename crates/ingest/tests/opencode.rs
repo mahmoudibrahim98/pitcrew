@@ -1269,29 +1269,33 @@ fn corrupt_pages(db: &Path) {
     fs::write(db, bytes).expect("write");
 }
 
-/// An unlocked read (a WAL-mode store with no `-wal` or `-shm`) that meets a malformed page may
-/// have raced a checkpoint: it is retried, not reported unreadable. A locked read is reported.
+/// A WAL-mode store with no `-wal` or `-shm` is read unlocked. A malformed page in one that did
+/// not change during the read means the store itself is damaged (here a sync-conflict copy): it
+/// is unreadable and discovery skips it, rather than answering "retry later" forever. (A
+/// malformed page in a store that changed mid-read is retried: see the store's unit tests, which
+/// can change it between opening and reading.) A locked read of a damaged store is unreadable.
 #[test]
-fn malformed_pages_in_an_unlocked_read_mean_retry() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let db = full_store(dir.path());
-    let conn = Connection::open(&db).expect("open");
+fn a_damaged_store_read_unlocked_is_unreadable_and_skipped() {
+    let home = tempfile::tempdir().expect("tempdir");
+    let good = full_store(home.path());
+    let copy = home.path().join("opencode-LAPTOP.db");
+    fs::copy(&good, &copy).expect("copy");
+    let conn = Connection::open(&copy).expect("open");
     conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get::<_, String>(0))
         .expect("wal");
     drop(conn);
-    corrupt_pages(&db);
+    assert!(!PathBuf::from(format!("{}-wal", copy.display())).exists());
+    corrupt_pages(&copy);
     let (main, _) = session_ids();
-    let err = OpenCodeAdapter
-        .read(&tref(&db, &main), &Cursor::default())
-        .expect_err("malformed");
-    assert!(
-        matches!(&err, SourceError::Io(e) if e.kind() == io::ErrorKind::WouldBlock),
-        "{err}"
-    );
-    assert!(matches!(
-        OpenCodeAdapter.discover(dir.path()),
-        Err(SourceError::Io(e)) if e.kind() == io::ErrorKind::WouldBlock
-    ));
+    for _ in 0..2 {
+        let err = OpenCodeAdapter
+            .read(&tref(&copy, &main), &Cursor::default())
+            .expect_err("malformed");
+        assert!(matches!(&err, SourceError::Unreadable { .. }), "{err}");
+        let found = OpenCodeAdapter.discover(home.path()).expect("discover");
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().all(|t| t.path == good));
+    }
 
     let other = tempfile::tempdir().expect("tempdir");
     let db = full_store(other.path());
