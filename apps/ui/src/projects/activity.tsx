@@ -4,7 +4,7 @@
 import { ToggleGroup } from 'radix-ui';
 import { useState } from 'react';
 import { Button } from '../design/index.ts';
-import type { Event, Member, MemberId } from '../data/index.ts';
+import { ApiError, type Event, type Member, type MemberId } from '../data/index.ts';
 import { useActivity, useMemberMap, useNames, type EventFilters } from './data.ts';
 import { describeEvent, formatWhen, type Names } from './format.ts';
 import { Avatar } from './people.tsx';
@@ -70,6 +70,10 @@ export function ActivityFeed({
   const members = useMemberMap();
   const names = useNames();
   const events = [...(activity.data?.events ?? [])].reverse();
+  // The real hub answers 400 to a `project` or `workstream` filter until its index lands (the
+  // mock accepts them); that is not an error to show, just activity this view cannot offer yet.
+  const scoped = filters.project !== undefined || filters.workstream !== undefined;
+  const unavailable = scoped && activity.error instanceof ApiError && activity.error.code === 'invalid';
   return (
     <Panel
       title={title}
@@ -92,6 +96,8 @@ export function ActivityFeed({
     >
       {view === 'summary' ? (
         <p className="text-sm text-ink-2">Summaries of what happened will appear here. Switch to All events for the full feed.</p>
+      ) : unavailable ? (
+        <p className="text-sm text-ink-2">Activity isn’t available here yet.</p>
       ) : (
         <div className="flex flex-col gap-2">
           {activity.error !== null && <ErrorNote error={activity.error} what="load the activity" />}
