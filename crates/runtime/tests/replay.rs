@@ -90,26 +90,65 @@ proptest! {
     })]
     #[test]
     fn matches_unbounded_vec_model(
+        origin in any::<u64>(),
         capacity in 0usize..128,
         operations in prop::collection::vec((prop::collection::vec(any::<u8>(), 0..256), any::<u64>(), 0usize..300), 0..150),
     ) {
-        let mut buffer = ReplayBuffer::new(capacity);
+        let mut buffer = ReplayBuffer::with_capacity_at(capacity, origin);
         let mut model = Vec::new();
         for (bytes, request, max) in operations {
-            model.extend(&bytes);
+            let accepted = (u64::MAX - origin - model.len() as u64).min(bytes.len() as u64) as usize;
+            model.extend(&bytes[..accepted]);
             buffer.append(&bytes);
-            let end = model.len() as u64;
-            let start = model.len().saturating_sub(capacity) as u64;
+            let end = origin + model.len() as u64;
+            let start = origin + model.len().saturating_sub(capacity) as u64;
             // Exercise evicted, retained, end and future positions after every append.
-            for from in [0, start.saturating_sub(1), start, end, u64::MAX, request % (end + 2)] {
+            for from in [0, start.saturating_sub(1), start, end, u64::MAX, origin.saturating_add(request % (model.len() as u64 + 2))] {
                 let offset = from.clamp(start, end);
-                let stop = model.len().min(offset as usize + max);
+                let index = (offset - origin) as usize;
+                let stop = model.len().min(index + max);
                 let expected = OutputChunk {
-                    offset, data: model[offset as usize..stop].to_vec(), end, truncated: from < start,
+                    offset, data: model[index..stop].to_vec(), end, truncated: from < start,
                 };
                 prop_assert_eq!(buffer.read(from, max), expected);
                 prop_assert_eq!(buffer.end(), end);
             }
         }
     }
+}
+
+#[test]
+fn resumed_offsets_saturate_without_renumbering_retained_data() {
+    let mut resumed = ReplayBuffer::starting_at(500);
+    assert_eq!(resumed.end(), 500);
+    assert!(resumed.read(0, 5).truncated);
+    resumed.append(b"abc");
+    assert_eq!(
+        resumed.read(500, 5),
+        OutputChunk {
+            offset: 500,
+            data: b"abc".to_vec(),
+            end: 503,
+            truncated: false
+        }
+    );
+    let mut buffer = ReplayBuffer::with_capacity_at(4, u64::MAX - 3);
+    buffer.append(b"ab");
+    buffer.append(b"cdef");
+    assert_eq!(buffer.end(), u64::MAX);
+    assert_eq!(buffer.read(u64::MAX - 3, 10).data, b"abc");
+    buffer.append(b"xyz");
+    assert_eq!(
+        buffer.read(0, 10),
+        OutputChunk {
+            offset: u64::MAX - 3,
+            data: b"abc".to_vec(),
+            end: u64::MAX,
+            truncated: true
+        }
+    );
+    assert_eq!(
+        ReplayBuffer::starting_at(u64::MAX).read(u64::MAX, 1).data,
+        b""
+    );
 }
