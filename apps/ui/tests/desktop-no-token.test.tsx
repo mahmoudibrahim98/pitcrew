@@ -72,6 +72,9 @@ const webSocketSpy = vi.fn(() => {
 });
 
 beforeEach(() => {
+  config.reads = 0;
+  fetchSpy.mockClear();
+  webSocketSpy.mockClear();
   vi.stubEnv('VITE_PITCREW_TOKEN', SECRET);
   vi.stubEnv('VITE_PITCREW_API', 'http://127.0.0.1:1');
   vi.stubGlobal('fetch', fetchSpy);
@@ -93,6 +96,35 @@ afterEach(() => {
   vi.unstubAllGlobals();
   localStorage.clear();
   useShell.setState(initialShellState);
+});
+
+describe('outside the desktop app', () => {
+  it('fails closed in a production build: an error screen, no config read, no request', async () => {
+    gateway.uninstall();
+    vi.stubEnv('DEV', false);
+    render(
+      <AppData>
+        <p>the app</p>
+      </AppData>,
+    );
+    expect(screen.getByRole('alert').textContent).toContain('PitCrew runs in its desktop app.');
+    await new Promise((done) => setTimeout(done, 50));
+    expect(screen.queryByText('the app')).toBeNull();
+    expect(config.reads).toBe(0);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(webSocketSpy).not.toHaveBeenCalled();
+  });
+
+  it('loads the browser data layer, and its config, in development only', async () => {
+    gateway.uninstall();
+    render(
+      <AppData>
+        <p>the app</p>
+      </AppData>,
+    );
+    await screen.findByText('the app');
+    expect(config.reads).toBeGreaterThan(0);
+  });
 });
 
 describe('the desktop app holds no token', () => {

@@ -13,6 +13,23 @@ export default tseslint.config(
   },
   // The app runs in a webview: browser globals only.
   { files: ['src/**/*.{ts,tsx}'], languageOptions: { globals: globals.browser } },
+  // Environment values (the API's URL, the dev token) are read in src/data/config.ts only, which
+  // the desktop app never loads. `import.meta.env.DEV`, a build flag, may be read anywhere: its
+  // literal lets the bundler drop development code from builds.
+  {
+    files: ['src/**/*.{ts,tsx}'],
+    ignores: ['src/data/config.ts'],
+    rules: {
+      'no-restricted-syntax': [
+        'error',
+        {
+          selector:
+            "MemberExpression[object.type='MetaProperty'][property.name='env']:not(MemberExpression[property.name='DEV'] > MemberExpression.object)",
+          message: 'Read import.meta.env in src/data/config.ts only (import.meta.env.DEV is allowed anywhere).',
+        },
+      ],
+    },
+  },
   // Server state goes through src/data, whose useLiveQuery waits for the stream to sync.
   {
     files: ['src/**/*.{ts,tsx}'],
