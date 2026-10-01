@@ -14,9 +14,13 @@
 //! - [`Ssh::probe`] reports what the machine is;
 //! - [`helper`] deploys the static helper there ([`deploy`]) and starts, checks and stops it
 //!   ([`Launcher`]): directly, in tmux, or as a SLURM batch job on a compute node
-//!   ([`helper::slurm`], with site recipes).
+//!   ([`helper::slurm`], with site recipes);
+//! - [`tunnel`] keeps a way to the helper's daemon open ([`Connector`]): a forwarded socket or
+//!   the stdio bridge ([`bridge`], the remote end), to a login node or a job's compute node,
+//!   noticing a lost connection within ten seconds and recovering by itself.
 
 pub mod askpass;
+pub mod bridge;
 mod config;
 pub mod helper;
 // The crate's only unsafe code: a Job Object for ssh on Windows.
@@ -27,6 +31,7 @@ pub mod probe;
 pub mod quote;
 mod report;
 mod ssh;
+pub mod tunnel;
 
 pub use askpass::{
     CancelTrigger, PromptCancel, PromptFuture, PromptHandler, PromptKind, PromptRequest, Reply,
@@ -43,7 +48,12 @@ pub use helper::{
 };
 pub use probe::{PROBE_LIMITS, Probe, SlurmTools};
 pub use ssh::{
-    DEFAULT_CONNECT_TIMEOUT, Input, Limits, Output, RESOLVE_LIMITS, ResolvedHost, Ssh, SshError,
+    DEFAULT_CONNECT_TIMEOUT, Input, Limits, MINIMAL_ENV, Output, RESOLVE_LIMITS, ResolvedHost, Ssh,
+    SshError,
+};
+pub use tunnel::{
+    Connector, ConnectorOptions, Daemon, LinkState, Transport, TunnelError, TunnelStream,
+    Unreachable, WallClock,
 };
 
 /// The protocol version this crate was built against.

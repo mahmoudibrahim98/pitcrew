@@ -458,6 +458,32 @@ mod tests {
         );
     }
 
+    /// Fuzz finding R26 (`fuzz/regressions/remote_site`: the name its flags byte picks, and its
+    /// text): a recipe loaded that no job script could be made from.
+    #[test]
+    fn recipes_with_hetjob_words_do_not_load() {
+        let err = Site::from_toml("x", "partition = \"hetjobs\"\n").unwrap_err();
+        assert!(err.why.contains("\"hetjob\""), "{err}");
+        assert!(!err.to_string().contains('\n'), "{err}");
+        for text in [
+            "account = \"PackJob\"\n",
+            "qos = \"a-hetjob\"\n",
+            "gres = \"packjob:1\"\n",
+            "sbatch = [\"--comment=HETJOB\"]\n",
+        ] {
+            assert!(Site::from_toml("x", text).is_err(), "{text:?}");
+        }
+        let site = Site {
+            name: "x".into(),
+            defaults: JobOptions {
+                partition: Some("hetjobs".into()),
+                ..JobOptions::default()
+            },
+            ..Site::default()
+        };
+        assert!(site.check().is_err());
+    }
+
     #[test]
     fn recipe_files_are_found_and_reported() {
         let dir = tempfile::tempdir().unwrap();

@@ -153,10 +153,15 @@ pub fn parse_wall_time(text: &str) -> Option<WallTime> {
     Some(WallTime::Limited(Duration::from_secs(secs)))
 }
 
-/// A wall time as `--time` takes it: `D-HH:MM:SS`, or `HH:MM:SS` under a day.
+/// A wall time as `--time` takes it: `D-HH:MM:SS`, or `HH:MM:SS` under a day; a part of a
+/// second counts as a whole one. Any duration prints (it may be shown in an error): one beyond
+/// `u64::MAX` seconds prints as that many, which [`parse_wall_time`] refuses (more than 9 digits
+/// of days). A job asks for at most a year ([`JobOptions::check`]).
 #[must_use]
 pub fn format_wall_time(time: Duration) -> String {
-    let secs = time.as_secs() + u64::from(time.subsec_nanos() > 0);
+    let secs = time
+        .as_secs()
+        .saturating_add(u64::from(time.subsec_nanos() > 0));
     let (days, rest) = (secs / 86_400, secs % 86_400);
     let (h, m, s) = (rest / 3600, rest % 3600 / 60, rest % 60);
     if days > 0 {
@@ -257,7 +262,7 @@ fn check_plain_path(what: &str, path: &str, max: usize) -> Result<(), HelperErro
 
 /// Checks one extra `#SBATCH` option: `--name=value`, or `--name` alone for [`SBATCH_FLAGS`];
 /// the name on [`ALLOWED_SBATCH`], the value 1 to 256 characters of `A-Z a-z 0-9 _ . , : = + / @
-/// % & | [ ] ( ) * -`.
+/// % & | [ ] ( ) * -`, not starting with `-` (`--comment=--uid=0` could read as an option).
 ///
 /// # Errors
 /// [`HelperError::InvalidArgument`] naming the problem.
@@ -284,6 +289,7 @@ pub fn check_sbatch_option(option: &str) -> Result<(), HelperError> {
     match value {
         Some(value) => {
             let ok = (1..=256).contains(&value.len())
+                && !value.starts_with('-')
                 && value
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || "_.,:=+/@%&|[]()*-".contains(c));
@@ -292,7 +298,7 @@ pub fn check_sbatch_option(option: &str) -> Result<(), HelperError> {
                     "#SBATCH option",
                     option,
                     "its value must be 1 to 256 characters of A-Z a-z 0-9 _ . , : = + / @ % & | \
-                     [ ] ( ) * -",
+                     [ ] ( ) * -, not starting with -",
                 ));
             }
         }
@@ -436,6 +442,19 @@ impl JobOptions {
         }
         for line in &self.sbatch {
             check_sbatch_option(line)?;
+        }
+        // Each value is an `#SBATCH` line of its own: refused here already, so that what a
+        // recipe loads with also renders (the script checks each line again).
+        let values = [
+            &self.partition,
+            &self.account,
+            &self.qos,
+            &self.memory,
+            &self.gres,
+            &self.job_name,
+        ];
+        for value in values.into_iter().flatten().chain(&self.sbatch) {
+            check_no_hetjob(value)?;
         }
         Ok(())
     }
@@ -720,6 +739,28 @@ mod tests {
         assert_eq!(format_wall_time(Duration::from_millis(60_500)), "00:01:01");
     }
 
+    /// Fuzz finding R27 (`fuzz/regressions/remote_slurm`, the input's duration): rounding up
+    /// `u64::MAX` seconds and a nanosecond overflowed.
+    #[test]
+    fn the_longest_wall_times_print() {
+        let longest = Duration::new(u64::MAX, 1);
+        let printed = format_wall_time(longest);
+        assert_eq!(printed, "213503982334601-07:00:15");
+        assert_eq!(printed, format_wall_time(Duration::from_secs(u64::MAX)));
+        assert_eq!(parse_wall_time(&printed), None);
+        assert_eq!(
+            format_wall_time(Duration::new(u64::MAX - 1, 1)),
+            format_wall_time(Duration::from_secs(u64::MAX))
+        );
+        // Too long for a job: refused, with the time in the message.
+        let options = JobOptions {
+            time: Some(longest),
+            ..JobOptions::default()
+        };
+        let err = options.check().unwrap_err();
+        assert!(err.to_string().contains(&printed), "{err}");
+    }
+
     #[test]
     fn options_are_checked() {
         JobOptions::default().check().unwrap();
@@ -810,6 +851,7 @@ mod tests {
         }
         check_sbatch_option("--exclusive=user").unwrap();
         check_sbatch_option("--nice=10").unwrap();
+        check_sbatch_option("--comment=a-b").unwrap();
         for module in ["python/3.12", "tool/1.0@abc", "compiler:2", "cuda"] {
             check_module(module).unwrap();
         }
@@ -824,6 +866,28 @@ mod tests {
         for name in ["", "Example", "-x", "a.b", "a/b", &"x".repeat(65)] {
             assert!(check_site_name(name).is_err(), "{name:?}");
         }
+    }
+
+    /// Fuzz finding R25 (`fuzz/regressions/remote_slurm`, the input's text): a value that starts
+    /// with `-` was accepted.
+    #[test]
+    fn values_that_start_with_a_dash_are_refused() {
+        let err = check_sbatch_option("--comment=--uid=0").unwrap_err();
+        assert!(err.to_string().contains("not starting with -"), "{err}");
+        for line in [
+            "--comment=-x",
+            "--constraint=-a100",
+            "--nice=-5",
+            "--exclusive=-",
+        ] {
+            assert!(check_sbatch_option(line).is_err(), "{line:?}");
+        }
+        let options = JobOptions {
+            sbatch: vec!["--comment=--uid=0".into()],
+            ..JobOptions::default()
+        };
+        assert!(options.check().is_err());
+        assert!(JobSpec::new(&generic(), &options).is_err());
     }
 
     #[test]
@@ -1016,46 +1080,45 @@ mod tests {
         );
     }
 
-    /// SLURM up to 20.11 splits a job at `hetjob` or `packjob` anywhere in an `#SBATCH` line.
+    /// SLURM up to 20.11 splits a job at `hetjob` or `packjob` anywhere in an `#SBATCH` line:
+    /// options holding one are refused when checked (so before any script), a root when the
+    /// script is made.
     #[test]
     fn hetjob_words_are_refused_anywhere() {
-        let refused = |options: JobOptions, root: &str| {
-            let spec = JobSpec::new(&generic(), &options).unwrap();
-            let err = spec.render(&target(root)).unwrap_err();
+        let refused = |options: JobOptions| {
+            let err = options.check().unwrap_err();
+            assert!(err.to_string().contains("job\""), "{err}");
+            let err = JobSpec::new(&generic(), &options).unwrap_err();
             assert!(err.to_string().contains("job\""), "{err}");
         };
-        let root = "/home/someone/.pitcrew";
-        refused(
-            JobOptions {
-                partition: Some("hetjobs".into()),
-                ..JobOptions::default()
-            },
-            root,
-        );
-        refused(
-            JobOptions {
-                account: Some("PackJob".into()),
-                ..JobOptions::default()
-            },
-            root,
-        );
-        refused(
-            JobOptions {
-                job_name: Some("my-HETJOB".into()),
-                ..JobOptions::default()
-            },
-            root,
-        );
-        refused(
-            JobOptions {
-                sbatch: vec!["--comment=a-packjob-b".into()],
-                ..JobOptions::default()
-            },
-            root,
-        );
-        refused(JobOptions::default(), "/home/packjob/.pitcrew");
+        refused(JobOptions {
+            partition: Some("hetjobs".into()),
+            ..JobOptions::default()
+        });
+        refused(JobOptions {
+            account: Some("PackJob".into()),
+            ..JobOptions::default()
+        });
+        refused(JobOptions {
+            qos: Some("HetJob".into()),
+            ..JobOptions::default()
+        });
+        refused(JobOptions {
+            gres: Some("packjob:1".into()),
+            ..JobOptions::default()
+        });
+        refused(JobOptions {
+            job_name: Some("my-HETJOB".into()),
+            ..JobOptions::default()
+        });
+        refused(JobOptions {
+            sbatch: vec!["--comment=a-packjob-b".into()],
+            ..JobOptions::default()
+        });
         let fine = JobSpec::new(&generic(), &JobOptions::default()).unwrap();
-        fine.render(&target(root)).unwrap();
+        let err = fine.render(&target("/home/packjob/.pitcrew")).unwrap_err();
+        assert!(err.to_string().contains("job\""), "{err}");
+        fine.render(&target("/home/someone/.pitcrew")).unwrap();
     }
 
     #[test]
