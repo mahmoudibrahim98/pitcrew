@@ -201,23 +201,27 @@ query `400`; bodies over 1 MiB are `400`. A `500` is logged in full and its body
 ## Timings
 
 `cargo test -p pitcrew-hub-work --release --test perf -- --ignored --nocapture` lists 10,000
-tasks (each with two subtasks, a label and a dependency) with filters. Target: `GET /v1/tasks` with
-a filter under 20 ms (median of 30 runs).
+tasks (each with two subtasks, a label and a dependency) with filters, and pages the activity
+index over the same log. Target: `GET /v1/tasks` with a filter under 20 ms (median of 30 runs);
+the test asserts it for the status and assignee filters, and reports the rest.
 
 Measured 2026-10-01 on a laptop (Intel Core Ultra 5 135U, 16 GB), WSL2 Ubuntu 22.04, release
-build, with other agents compiling on the same machine (so worst cases are noisy):
+build, with other agents compiling on the same machine (so the numbers are noisy):
 
-| List (10,010 tasks in the store) | Tasks | Median | Best | Worst |
+| List (10,010 tasks in the store) | Rows | Median | Best | Worst |
 |---|---|---|---|---|
-| `GET /v1/tasks?status=in_progress` (whole response) | 1,671 | 4.8 ms | 3.8 ms | 9.5 ms |
-| `GET /v1/tasks?assignee=…&status=todo&status=in_progress` | 835 | 7.7 ms | 5.9 ms | 10.8 ms |
-| `GET /v1/tasks?project=…` | 5,007 | 13.3 ms | 10.1 ms | 26.8 ms |
-| `GET /v1/tasks` (no filter) | 10,010 | 8.7 ms | 6.6 ms | 16.6 ms |
-| `WorkService::tasks`, `status=in_progress` (decoded `Vec<Task>`) | 1,671 | 16.8 ms | 8.1 ms | 27.0 ms |
-| `WorkService::tasks`, no filter (decoded) | 10,010 | 37.6 ms | 26.0 ms | 53.6 ms |
+| `GET /v1/tasks?status=in_progress` (whole response) | 1,671 | 8.2 ms | 5.9 ms | 16.4 ms |
+| `GET /v1/tasks?assignee=…&status=todo&status=in_progress` | 835 | 8.4 ms | 6.3 ms | 10.1 ms |
+| `GET /v1/tasks?project=…` (half the workspace) | 5,007 | 24.1 ms | 16.0 ms | 51.0 ms |
+| `GET /v1/tasks` (no filter) | 10,010 | 9.4 ms | 7.6 ms | 19.5 ms |
+| `WorkService::tasks`, `status=in_progress` (decoded `Vec<Task>`) | 1,671 | 25.4 ms | 10.7 ms | 36.2 ms |
+| `WorkService::tasks`, no filter (decoded) | 10,010 | 41.8 ms | 27.1 ms | 145.5 ms |
+| `EventRefs::revs_matching`, project, newest 100 | 100 events | 0.23 ms | 0.19 ms | 0.40 ms |
+| `EventRefs::revs_matching`, project, every page of 500 | 5,036 events | 9.8 ms | 5.9 ms | 15.6 ms |
 
 The route sends the stored documents as they are; decoding them into `Task`s is what the service
-lists cost on top.
+lists cost on top. An earlier run on a quieter machine measured about half these medians for the
+task lists.
 
 ## Contract gaps
 
