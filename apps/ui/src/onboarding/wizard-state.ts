@@ -1,4 +1,4 @@
-// The wizards' shared, in-memory state: one object per run, held in `WizardProvider`
+// The first-run wizard's shared, in-memory state: one object per run, held in `WizardProvider`
 // (`wizard-context.tsx`) and read or patched by step components. Never persisted: reloading the
 // page starts the wizard over, same as abandoning it.
 
@@ -6,7 +6,6 @@ import type { Engine } from '../data/index.ts';
 import type {
   AgentAccount,
   CreateFromScanResult,
-  DiscoveredHost,
   HooksDiff,
   ImportDryRunResult,
   ImportMode,
@@ -19,9 +18,9 @@ import type {
   ProjectTemplate,
   SafetySettings,
   ScanResult,
+  SetupWorkspaceResult,
 } from './api.ts';
-
-export type WizardMode = 'first-run' | 'add-machine';
+import type { SetupValues } from './validation.ts';
 
 export type Density = 'comfortable' | 'compact';
 export type WizardTheme = 'light' | 'dark' | 'system';
@@ -46,18 +45,18 @@ export interface CreateWorkstreamDraft {
 export type StepStatus = 'idle' | 'running' | 'done' | 'error';
 
 export interface WizardState {
-  mode: WizardMode;
-
   // Welcome
   theme: WizardTheme;
   density: Density;
 
-  // Workspace / add-machine target
-  workspaceName: string;
+  // Workspace: the setup form (`POST /v1/setup`). The handle follows the name until the person
+  // edits it.
+  setup: SetupValues;
+  handleEdited: boolean;
+  /** Once the hub has taken it: the step then only shows it, and never sends it again. */
+  setupResult?: SetupWorkspaceResult | undefined;
+  /** The machine the later (fake-only, for now) steps check, install on and scan: the hub's own. */
   primaryMachine: MachineTarget;
-  /** Cached (never refetched once present), so Back/Forward doesn't re-query the host list. */
-  discoveredHosts: DiscoveredHost[];
-  hostsStatus: StepStatus;
 
   // Machine check. Keyed by `targetKey()` so revisiting after Back/Forward reuses the result
   // instead of re-running the check (ADR-0009: fixes are server-side truth anyway, but refetching
@@ -110,15 +109,16 @@ export interface WizardState {
   safety: SafetySettings;
 }
 
-export function initialWizardState(mode: WizardMode): WizardState {
+/** This machine's name until the person gives another: the webview cannot read the host name. */
+export const DEFAULT_MACHINE_NAME = 'This computer';
+
+export function initialWizardState(): WizardState {
   return {
-    mode,
     theme: 'system',
     density: 'comfortable',
-    workspaceName: '',
+    setup: { workspaceName: '', personName: '', handle: '', machineName: DEFAULT_MACHINE_NAME },
+    handleEdited: false,
     primaryMachine: { kind: 'local' },
-    discoveredHosts: [],
-    hostsStatus: 'idle',
     machineCheckByTarget: {},
     launcherOptionsByTarget: {},
     launcherChoiceByTarget: {},

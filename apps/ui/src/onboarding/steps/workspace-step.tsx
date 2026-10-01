@@ -1,79 +1,49 @@
-// Step 2 (first run: name the workspace and its primary machine) and the add-a-machine wizard's
-// own first step (just the machine: it already has a workspace and a name). `setupWorkspace` is
-// the only call this step makes; the real hub has no such route yet (see README.md).
+// Step 2: set the hub up (`POST /v1/setup`): the workspace's name, your name and handle, and this
+// machine's name. Once the hub has taken it, the step only shows what was set: going Back to it
+// never sends it again. A `409` because the workspace was set up meanwhile goes Home.
 
-import { useId, useState } from 'react';
+import { useRouter } from '@tanstack/react-router';
+import { paths, useWorkspaceId } from '../../shell/index.ts';
 import { useOnboardingApi } from '../api-context.tsx';
-import { MachineTargetPicker } from '../machine-target-picker.tsx';
+import { SetupForm } from '../setup-form.tsx';
 import { StepFooter } from '../step-footer.tsx';
 import { useWizard } from '../wizard-context.tsx';
 
 export function WorkspaceStep() {
-  const { mode, state, patch, next } = useWizard();
+  const { state, patch, next } = useWizard();
   const api = useOnboardingApi();
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const nameId = useId();
-  const firstRun = mode === 'first-run';
+  const router = useRouter();
+  const ws = useWorkspaceId();
+  const done = state.setupResult;
 
-  async function submit() {
-    setError(null);
-    if (firstRun && state.workspaceName.trim() === '') {
-      setError('Give the workspace a name.');
-      return;
-    }
-    setBusy(true);
-    try {
-      if (firstRun) {
-        await api.setupWorkspace({ name: state.workspaceName, primaryMachine: state.primaryMachine });
-      }
-      next();
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Could not save the workspace.');
-    } finally {
-      setBusy(false);
-    }
+  if (done !== undefined) {
+    return (
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          next();
+        }}
+      >
+        <p className="text-sm text-ink-2">
+          “{done.workspace.name}” is set up, with you as {done.me.name} ({done.me.handle}).
+        </p>
+        <StepFooter />
+      </form>
+    );
   }
 
   return (
-    <form
-      onSubmit={(e) => {
-        e.preventDefault();
-        void submit();
+    <SetupForm
+      values={state.setup}
+      handleEdited={state.handleEdited}
+      onChange={(setup, handleEdited) => patch({ setup, handleEdited })}
+      submit={(input) => api.setupWorkspace(input)}
+      onDone={(setupResult) => {
+        patch({ setupResult });
+        next();
       }}
-    >
-      {firstRun && (
-        <div className="flex flex-col gap-1.5">
-          <label htmlFor={nameId} className="text-sm font-medium text-ink">
-            Workspace name
-          </label>
-          <input
-            id={nameId}
-            type="text"
-            aria-invalid={error !== null}
-            value={state.workspaceName}
-            onChange={(e) => patch({ workspaceName: e.target.value })}
-            placeholder="My team"
-            className="h-8 rounded-sm border border-line-2 bg-card px-2.5 text-sm text-ink outline-none focus-visible:border-accent"
-          />
-        </div>
-      )}
-
-      <div className={firstRun ? 'mt-4' : undefined}>
-        <MachineTargetPicker
-          value={state.primaryMachine}
-          onChange={(primaryMachine) => patch({ primaryMachine })}
-          label={firstRun ? 'Primary machine' : 'Machine to add'}
-        />
-      </div>
-
-      {error !== null && (
-        <p role="alert" className="mt-3 text-sm text-risk">
-          {error}
-        </p>
-      )}
-
-      <StepFooter nextLabel="Continue" busy={busy} />
-    </form>
+      onAlreadySetUp={() => void router.navigate({ href: paths.home(ws) })}
+      footer={(busy) => <StepFooter nextLabel="Continue" busy={busy} />}
+    />
   );
 }

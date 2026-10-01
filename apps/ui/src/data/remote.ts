@@ -22,8 +22,6 @@ export interface RemoteProbe {
 /** How the remote's helper runs. */
 export type RemoteLauncher = 'direct' | 'tmux' | 'slurm';
 
-export const REMOTE_LAUNCHERS: readonly RemoteLauncher[] = ['direct', 'tmux', 'slurm'];
-
 /** SLURM job options; each left out takes the site's default. */
 export interface JobOptions {
   partition?: string;

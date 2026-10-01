@@ -1,95 +1,133 @@
 # onboarding (stream O)
 
-The first-run wizard and the add-a-machine wizard. See `docs/build/streams/O.md`.
+The first-run wizard, and connecting a remote machine in the desktop app. See
+`docs/build/streams/O.md`, `docs/build/contracts/api-v1.md` ("The first run: `POST /v1/setup`") and
+`docs/build/contracts/desktop-gateway.md` ("Remote workspaces", "Prompts").
 
 | File | What |
 |---|---|
-| `api.ts` | The proposed `OnboardingApi` contract (below): every call the wizards make, typed, none of it real yet. |
-| `fake-api.ts` | `createFakeOnboardingApi()`: an in-memory implementation that behaves plausibly (streamed progress, a fixable row, synthetic scan suggestions). Built against `OnboardingApi`, so a real client drops in without touching a step. |
-| `api-context.tsx` | `OnboardingApiProvider`, `useOnboardingApi()`. Defaults to a fresh fake; tests pass their own instance. |
+| `api.ts` | The `OnboardingApi` contract (below): every call the first-run wizard makes, typed, with `unavailable` (the calls with no backend yet) and `SetupRefused` (why setup was refused, by field). |
+| `hub-api.ts` | `createHubOnboardingApi({ setUp, remote })`: the real one. `setupWorkspace` is `POST /v1/setup` (the data layer's `setUp`, through the workspace's own transport); `discoverHosts` is the gateway's `sshHosts`; every other call is unavailable. |
+| `fake-api.ts` | `createFakeOnboardingApi()`: an in-memory implementation of every call that behaves plausibly (streamed progress, a fixable row, synthetic scan suggestions), refusing a bad setup as the hub would. For tests and a development flag only (below). |
+| `validation.ts` | The forms' checks, mirroring the contracts: setup (trimmed names counted in code points, the handle's shape, no control characters), `suggestHandle`, `fieldOfMessage` (which field a hub `400` names), a typed SSH host, SLURM job options. |
+| `setup-form.tsx` | `SetupForm`: the workspace's name, your name and handle (suggested from your name until you edit it), and the machine's name. Used by the first run and by the connect wizard. |
+| `api-context.tsx` | `OnboardingApiProvider`, `useOnboardingApi()`. No default: nothing falls back to the fake. |
 | `wizard-state.ts` | `WizardState`: one plain object per run, never persisted (a reload starts over). |
-| `wizard-context.tsx` | `WizardProvider`, `useWizard()`: the state, the current step, and `next`/`back`/`skip`/`goTo`. `patch` is stable (`useCallback`, no deps) — see the comment there for why that matters to any step whose effect both starts a stream and calls `patch`. |
-| `steps.ts` | Which steps make up each wizard, in order (`stepsFor(mode)`). |
+| `wizard-context.tsx` | `WizardProvider`, `useWizard()`: the state, the steps (`stepsFor(api)`), the current step, and `next`/`back`/`skip`/`goTo`. `patch` is stable (`useCallback`, no deps) — see the comment there for why that matters to any step whose effect both starts a stream and calls `patch`. |
+| `steps.ts` | The first-run steps, in order, and the calls each needs: `stepsFor(api)` leaves out a step whose calls are unavailable. |
 | `wizard-shell.tsx` | The stepper (a vertical Radix `Tabs.Root`, so arrow keys move between reached steps) and the current step's content. |
 | `step-footer.tsx` | The Back / Skip / primary-action row every step ends with, inside a `<form onSubmit>` so Enter submits it. |
-| `machine-target-picker.tsx` | This computer, a WSL distro, or an SSH host from `discoverHosts()` — never a free-typed host. |
-| `steps/*.tsx` | One component per step. The add-a-machine wizard reuses `workspace-step.tsx`, `machine-check-step.tsx`, `install-helper-step.tsx`, `sign-in-step.tsx`, `scan-step.tsx`, `create-step.tsx` and `import-step.tsx`; each reads `useWizard().mode` where its copy or fields differ. |
-| `first-run-page.tsx`, `add-machine-page.tsx` | The two routes' components (`routes.tsx`), lazy-loaded. |
-| `*.test.ts(x)` | Vitest and Testing Library, against the fake. Picked up by the root `apps/ui/vitest.config.ts`'s `src/**/*.test.{ts,tsx}` — just `corepack pnpm --filter @pitcrew/ui test`. |
+| `steps/*.tsx` | One component per step. `workspace-step.tsx` is the setup form; once the hub has taken it, going Back only shows what was set, and never sends it again. |
+| `first-run-page.tsx`, `fake-first-run.tsx` | The first-run route's component (lazy): the real API, or in a development build with `?onboarding=fake`, the fake. |
+| `connect/connect-page.tsx`, `connect/connect-wizard.tsx` | `/connect`: connecting a remote machine (desktop only; a browser is told it cannot). |
+| `routes.tsx` | `/w/$ws/onboarding` (`paths.setup`, `staticData.setup`) and the root route `/connect` (`Feature.rootRoutes`). Both lazy. |
+| `*.test.ts(x)`, `connect/*.test.tsx` | Vitest and Testing Library: the fake wizard, the real first run against a stand-in `setUp`, the checks, and the connect wizard in the whole app against a mocked gateway (`src/data/tests/fake-desktop.ts`). |
 
-## The `OnboardingApi` contract (proposed)
+## The first run
 
-None of this exists on the hub yet (`docs/build/contracts/api-v1.md` has no onboarding routes: no
-machine check, no helper install, no scan, no CLI sign-in, and no way to create a project or
-workstream from the UI at all — `POST /v1/projects` doesn't exist either). Every method below is
-this stream's proposal for what the real routes should look like; `fake-api.ts` is the only
-implementation. Types are in `api.ts`, reusing `Engine`, `Project`, `Workstream` etc. from
-`src/data` rather than redeclaring them, since the real routes would return the same objects.
+A fresh hub answers `GET /v1/workspace` with `setup_needed: true`, and the shell sends the
+workspace to `paths.setup(ws)`, this feature's first-run wizard, from any page (see
+`src/shell/README.md`, "The first run"). Against the real hub the wizard is **Welcome, Workspace,
+Done**, then Home:
+
+- **Workspace** is `POST /v1/setup`: the workspace's name, your name, your handle (suggested from
+  the first word of your name, `Sam Rivera` → `@sam`, until you type one), and this machine's name
+  (`This computer` until you give another: the webview cannot read the host name).
+- **Validation mirrors the contract** before anything is sent: names are trimmed and counted in
+  Unicode code points (1–80, 1–80, 1–60), the handle is `@` and 1–32 of `a-z 0-9 _ -` (not
+  trimmed), and nothing may hold a control character. Each problem shows by its field, which gets
+  focus.
+- **The hub's refusals** show by the right field too: a `400` by the field its message names
+  (otherwise above the buttons), a `409` for a taken handle by the handle. A `409` because the
+  workspace was set up meanwhile goes Home: the data layer has already read the workspace again,
+  so the shell does not send it back.
+- **Done** goes Home. The data layer turned `setup_needed` off in the cache when setup succeeded,
+  so there is no loop.
+
+The other steps (machine check, helper install, sign-in, integrations, scan, create, import, hooks,
+safety) need routes that do not exist yet, so `createHubOnboardingApi` lists their calls in
+`unavailable` and `stepsFor` leaves them out. They come back, unchanged, as their routes land.
+
+### The fake: tests, and a development flag
+
+The fake implements every call. Tests use it directly. In a **development build**,
+`/w/$ws/onboarding?onboarding=fake` runs the whole twelve-step wizard against it (its setup reaches
+no hub, so a fresh hub stays fresh). A **production build never uses it**: `first-run-page.tsx`
+loads it only behind `import.meta.env.DEV`, which the bundler folds to `false`, dropping the branch
+and the fake's chunk.
+
+## Connecting a remote machine (desktop only)
+
+`/connect` (`paths.connect()`), opened from the switcher's "Connect a remote machine…" or the empty
+desktop's "No workspaces yet" screen. It is a root route (`Feature.rootRoutes`), since it also runs
+before any workspace exists. It drives the gateway's remote commands:
+
+1. **Host**: one from your ssh config (`discoverHosts`, the gateway's `sshHosts`), or typed. A host
+   is checked first: no leading `-` (ssh would read it as an option), no whitespace or control
+   characters.
+2. **Probe** (`remoteProbe`): the OS and architecture, whether PitCrew is there and running, and
+   SLURM's version and default partition.
+3. **Launcher**: `direct`, `tmux` or `slurm` (only where the probe found SLURM). For SLURM: the site
+   recipe, partition (the default to start from), account, QoS, time, CPUs, memory and GPUs.
+4. **Review** (`remotePlan`): the plan's steps and, for SLURM, the exact `jobScript`, verbatim, in a
+   monospace block. "Nothing changes on the remote until you press Connect."
+5. **Connect** (`remoteAdd`): progress, step by step. A failure shows its step and detail, and
+   "Back to review" gets a fresh plan (a plan is used once). SSH's questions arrive meanwhile
+   through the shell's prompt dialog.
+6. **Setup**: if the new workspace has `setup_needed`, the same setup form, against that workspace
+   through its own gateway transport (in its data scope).
+7. **Done**: opens the new workspace.
+
+**A plan is never submitted without being shown.** Connect sends the plan on screen. When the
+gateway refuses it as `invalid` (expired after 10 minutes, already used, or a launch it refused),
+the wizard goes back to Review with a fresh plan and says why, and only another Connect sends it.
+
+Every remote call starts from a button press, never from an effect, so React's development
+double-mount cannot make one twice (two password prompts, or one plan submitted twice). A late
+answer for a step already left is dropped.
+
+## The `OnboardingApi` contract
+
+`setupWorkspace` and `discoverHosts` are real. Everything else is this stream's proposal for what
+the real routes should look like (`api-v1.md` has no machine check, helper install, scan, CLI
+sign-in, hooks or safety routes yet); `fake-api.ts` is their only implementation. Types are in
+`api.ts`, reusing `Engine`, `Project`, `Workstream` etc. from `src/data`.
 
 | Method | Shape | Notes |
 |---|---|---|
-| `discoverHosts()` | `() → DiscoveredHost[]` | WSL distros (`wsl -l`) and SSH hosts (the user's own `~/.ssh/config`). Never a free-typed host (ADR-0009: deploy is over the user's own SSH connection). |
-| `setupWorkspace(input)` | `{ name, primaryMachine } → { workspace: { id, name } }` | Names the workspace and its primary machine. Idempotent. **Not in the brief's list** — added because work package 1's "first workspace" step needs somewhere to land; see "Open question" below. |
-| `checkMachine(target)` | `MachineTarget → MachineCheckResult` | CLI versions, tmux, git, gh, disk, and SLURM (SSH targets only). Each row: `status`, `detail`, `fixable`. |
-| `fixMachineRow(target, row)` | `(MachineTarget, CheckRowId) → MachineCheckRow` | Rejects if the row is not `fixable`. |
-| `launcherOptions(target)` | `MachineTarget → LauncherOption[]` | Which of `direct` / `tmux` / `systemd-user` / `slurm` this machine supports, and which is recommended (ADR-0009's "default detected"). |
-| `streamInstallHelper(options, onEvent)` | `(InstallHelperOptions, cb) → Streamed` | Streams `log` lines; `slurm` first sends `script-preview` with the **exact** script, before anything is submitted. Ends with `done` or `error`. `Streamed.cancel()` stops it (a step unmounting mid-install) — a real implementation must stop the **server-side** deploy, not just detach the listener, or React StrictMode's dev-only double-mount (cancel, then start again) ends up running it twice. |
-| `agentAccounts()` | `() → AgentAccount[]` | One row per engine: `signedIn`, and the account label if so. |
-| `startSignIn(engine, machine)` | `(Engine, MachineTarget) → { terminalSessionId }` | Opens the CLI's own login **in a terminal on that machine** (ADR-0010: PitCrew never reads or copies its OAuth tokens). The id is meant to open in the Agent console (stream M); until that's registered, the wizard links to the shell's placeholder session page. |
-| `integrationStatus()` | `() → IntegrationStatus[]` | GitHub, Jira, Linear, GitLab. Stream G owns the real connections. |
-| `streamScan(target, onEvent)` | `(ScanTarget, cb) → Streamed` | Streams `progress`, ends with `done` carrying counts (by engine, folder, month) and suggested projects/workstreams. Same `Streamed.cancel()` contract as `streamInstallHelper`: stop the server-side walk, not just the listener. |
-| `createFromScan(selection)` | `ProjectSelection[] → { projects: Project[], workstreams: Workstream[] }` | What the "Create" step submits after the user ticks, renames and regroups. **Not in `api-v1.md` at all**: there is no `POST /v1/projects` or `POST /v1/workstreams` today. |
-| `importSessions(filter)` | `ImportFilter → { count }` | A dry run: counts what the filter would import without importing anything. |
-| `commitImport(filter)` | `ImportFilter → { imported }` | Commits it. Sessions are read in place and never moved (ADR-0010); reversible (`link_basis: "imported"` can be unlinked later — that unlink route doesn't exist yet either). |
-| `hooksDiff()` | `() → HooksDiff` | Every file the hooks would touch, before or after. Shown before `installHooks()` runs (never without the user seeing the diff first, per the stream's "Do not" rule). |
-| `installHooks()` | `() → void` | Hooks themselves stay fire-and-forget and under 10 ms (ADR-0010); this only writes the CLI config that calls out to the daemon. |
-| `saveSafety(settings)` | `SafetySettings → void` | `PermissionMode` is this stream's proposed enum for `StartSession.permission_mode`, which `api-v1.md` currently types as an untyped string. Suggest promoting it to `crates/protocol` so the real contract and the UI share one type. |
+| `unavailable` | `ReadonlySet<OnboardingCall>` | The calls with no backend: they reject, and their steps are left out. Empty in the fake. |
+| `discoverHosts()` | `() → DiscoveredHost[]` | **Real** in the desktop: the gateway's `sshHosts`, as `{ kind: 'ssh', id }`. The fake adds WSL distros. |
+| `setupWorkspace(input)` | `{ workspaceName, person: { name, handle }, machineName } → { workspace, me }` | **Real**: `POST /v1/setup`. Rejects with `SetupRefused` (`field`, or `alreadySetUp`). |
+| `checkMachine(target)` | `MachineTarget → MachineCheckResult` | Proposed. CLI versions, tmux, git, gh, disk, and SLURM (SSH targets only). Each row: `status`, `detail`, `fixable`. |
+| `fixMachineRow(target, row)` | `(MachineTarget, CheckRowId) → MachineCheckRow` | Proposed. Rejects if the row is not `fixable`. |
+| `launcherOptions(target)` | `MachineTarget → LauncherOption[]` | Proposed. Which of `direct` / `tmux` / `systemd-user` / `slurm` this machine supports, and which is recommended. |
+| `streamInstallHelper(options, onEvent)` | `(InstallHelperOptions, cb) → Streamed` | Proposed. Streams `log` lines; `slurm` first sends `script-preview` with the **exact** script. Ends with `done` or `error`. `Streamed.cancel()` must stop the **server-side** deploy. |
+| `agentAccounts()` | `() → AgentAccount[]` | Proposed. One row per engine. |
+| `startSignIn(engine, machine)` | `(Engine, MachineTarget) → { terminalSessionId }` | Proposed. Opens the CLI's own login in a terminal on that machine (ADR-0010: PitCrew never reads its tokens). |
+| `integrationStatus()` | `() → IntegrationStatus[]` | Proposed. Stream G owns the real connections. |
+| `streamScan(target, onEvent)` | `(ScanTarget, cb) → Streamed` | Proposed. Streams `progress`, ends with `done` carrying counts and suggested projects/workstreams. |
+| `createFromScan(selection)` | `ProjectSelection[] → { projects, workstreams }` | Proposed. Could now be built on `POST /v1/projects` and `POST /v1/workstreams`. |
+| `importSessions(filter)` / `commitImport(filter)` | `ImportFilter → { count }` / `{ imported }` | Proposed. A dry run, then the import (sessions read in place, never moved). |
+| `hooksDiff()` / `installHooks()` | `() → HooksDiff` / `() → void` | Proposed. The diff is always shown before installing. |
+| `saveSafety(settings)` | `SafetySettings → void` | Proposed. `PermissionMode` should be promoted to `crates/protocol`. |
 
-### Open question for the integrator: is there a workspace to create at all?
-
-`GET /v1/workspace` (singular, existing contract) always returns exactly one `Workspace` — there is
-no list and no creation route. That reads as: installing `pitcrewd` **is** creating the hub's one
-workspace, and "first workspace" in the wizard is really just **naming** it and picking its primary
-machine, not creating one from nothing. `setupWorkspace` above is written on that assumption. If
-that's wrong — if a desktop can ever face more than one workspace, or none yet — the contract
-needs an explicit create route and this wizard's step 2 needs to call it instead.
-
-### Why the first-run wizard is not at a pre-workspace `/onboarding`
-
-The brief asks for routes "`/w/$ws/onboarding/...` and `/onboarding` (first run, before a
-workspace exists)". The shell's `Feature.routes(parent)` (`src/shell/feature.ts`) only ever
-receives the **workspace** route as `parent` — there is no hook for a route outside `/w/$ws`, and
-`OpenWorkspace` (`src/shell/pages/open.tsx`) waits on `GET /v1/workspace` with no "no workspace
-yet" branch to redirect from. Given the point above (a workspace always exists once the hub is up),
-a pre-workspace route may not even be needed in practice. Both wizards are registered at
-`/w/$ws/onboarding` and `/w/$ws/onboarding/add-machine` instead. If product intent still wants a
-true pre-workspace `/onboarding` (e.g. for a future multi-workspace desktop), the shell needs either:
-- an optional `Feature.rootRoutes?: (root: RootRoute) => AnyRoute[]`, composed in `routes.tsx`
-  alongside the workspace-scoped ones; or
-- a "no workspace" branch in `OpenWorkspace` that redirects there instead of showing "Connecting…"
-  forever.
-
-That's a change to `src/shell/**`, outside this stream's paths — flagged here rather than made.
+**Still proposed, for the integrator:** the machine check, the scan, CLI sign-in and the hooks
+APIs (and the helper install, integrations, import and safety calls with them). The old
+"Add a machine" wizard and its palette command are retired: its machine-picker-led flow ran only
+against the fake, and connecting a remote hub is now the connect wizard above. Adding a machine to
+an existing hub (a runner reporting to it) comes back when those routes land.
 
 ## Running this stream's tests
-
-`apps/ui/vitest.config.ts`'s `include` now covers `src/**/*.test.{ts,tsx}`, so this stream's tests
-run with everyone else's:
 
 ```
 corepack pnpm --filter @pitcrew/ui test
 ```
 
-Playwright is a different story: `apps/ui/playwright.config.ts` (L's) has `testDir: 'e2e'`,
-and `apps/ui/e2e/**` is L's path too. The onboarding end-to-end spec lives at
-`src/onboarding/e2e/onboarding.e2e.spec.ts`, with its own `src/onboarding/e2e/playwright.config.ts`
-(same ports and webServer shape as the root one, so it is a drop-in once moved). Run it with:
+End to end, from `apps/ui`: the demo-mode suite (`corepack pnpm --filter @pitcrew/ui e2e`)
+includes `e2e/onboarding-fake.spec.ts`, the whole fake wizard with axe, light and dark. The first
+run against a fresh hub, and the connect wizard and the prompt dialog in a simulated desktop, need
+fresh mock hubs (`PITCREW_MOCK_FRESH=1`) and run with their own config:
 
 ```
-corepack pnpm --filter @pitcrew/ui exec playwright test --config src/onboarding/e2e/playwright.config.ts
+corepack pnpm --filter @pitcrew/ui exec playwright test --config e2e/fresh.config.ts
 ```
-
-## Registering the feature
-
-`index.ts` registers `onboarding`'s routes (`routes.tsx`) and the "Add a machine" palette command.
-No nav entries: the wizards are flows you're dropped into, not pages you navigate to and from.
