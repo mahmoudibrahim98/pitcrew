@@ -59,7 +59,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [I-hygiene](I-hygiene.md) | I · CLI and hooks | `s/I/hygiene` | Sonnet-class | **Merged** |
 | [A-test-robustness](A-test-robustness.md) | A · Ingest | `s/A/test-robustness` | Sonnet-class | **Merged** |
 | [G-fuzz-findings](G-fuzz-findings.md) | G · Integrations | `s/G/fuzz-findings` | Sonnet-class | **Merged** |
-| [0-daemon-runner](0-daemon-runner.md) | 0 · Composition root | `integrator/daemon-runner` | Opus-class | In progress |
+| [0-daemon-runner](0-daemon-runner.md) | 0 · Composition root | `integrator/daemon-runner` | Opus-class | **Merged** |
 | [0-daemon-solo](0-daemon-solo.md) | 0 · Composition root | `integrator/daemon-solo` | Opus-class | **Merged** |
 | [N-projects-wiring](N-projects-wiring.md) | N · Projects layout | `s/N/projects-wiring` | Sonnet-class | **Merged** |
 | [L-shell-polish](L-shell-polish.md) | L · UI foundation | `s/L/shell-polish` | Sonnet-class | **Merged** |
