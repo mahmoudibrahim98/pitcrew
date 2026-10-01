@@ -918,6 +918,11 @@ pc_slurm_submit() {
     ''|-*|*[!0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._+-]*)
       pc_fail usage "the job name must be plain characters" ;;
   esac
+  # The root goes into sbatch options, where % is a pattern: plain characters only.
+  case $pc_root in
+    *[!0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._/+-]*)
+      pc_fail usage "the root must be plain characters for the SLURM launcher" ;;
+  esac
   pc_enter 1
   pc_private run
   pc_lock run/.lock "$1" "$2"

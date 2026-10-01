@@ -25,8 +25,8 @@ pc_modules=''
 #    endpoint and the socket on the way out.
 
 # Functions imported from the environment (bash exports them) must not stand in for tools.
-unset -f awk cat cd chmod command date head hostname id kill ls mkdir mv printf ps readlink \
-  rm rmdir sed sleep test tr umask uname wc 2>/dev/null
+unset -f awk cat cd chmod command date head hostname id kill ls mkdir mv printf ps pwd \
+  readlink rm rmdir sed sleep test tr umask uname wc 2>/dev/null
 unset IFS ENV BASH_ENV CDPATH
 PATH=$pc_tool_path${PATH:+:$PATH}
 export PATH
@@ -163,6 +163,7 @@ if [ ! -d "$pc_root" ]; then pc_fail not_deployed "$pc_root does not exist"; fi
 pc_private "$pc_root"
 cd -P "$pc_root" 2>/dev/null || pc_fail io "cannot enter $pc_root"
 pc_private .
+pc_phys=$(pwd -P)
 pc_private run
 chmod 600 "run/slurm-$pc_job.out" 2>/dev/null
 trap pc_cleanup EXIT
@@ -244,6 +245,10 @@ if [ -n "$pc_modules" ]; then
     module load "$pc_m" || pc_fail modules "module load $pc_m failed"
   done
   set +f
+fi
+# Paths from here on are relative to the root, entered once above (never again by name).
+if [ "$(pwd -P)" != "$pc_phys" ]; then
+  pc_fail modules "setting up the modules changed the working directory"
 fi
 # The helper gets the PATH the modules made; this script keeps its tools first.
 pc_env_path=$PATH

@@ -1236,6 +1236,24 @@ fn slurm_recipes_add_lines_and_modules() {
         matches!(&err, HelperError::StartFailed(d) if d.contains("there is no module command")),
         "{err:?}"
     );
+    // A set-up script that moves elsewhere: the job's relative paths would no longer be the
+    // root's, so it stops.
+    let wandering = m.dir.path().join("wandering-init.sh");
+    std::fs::write(
+        &wandering,
+        format!(". '{}'\ncd /tmp\n", site.modules_init.as_deref().unwrap()),
+    )
+    .unwrap();
+    let moved = Site {
+        modules_init: Some(wandering.to_str().unwrap().to_owned()),
+        ..site.clone()
+    };
+    let script = render(&target, &moved, &JobOptions::default());
+    let err = block_on(launcher(&script).start(&target)).unwrap_err();
+    assert!(
+        matches!(&err, HelperError::StartFailed(d) if d.contains("changed the working directory")),
+        "{err:?}"
+    );
     block_on(launcher(&script).cancel(&target)).unwrap();
 }
 
