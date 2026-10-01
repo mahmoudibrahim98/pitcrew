@@ -254,7 +254,10 @@ be contiguous. Pass `from_rev` as `before` for the previous page. Default limit 
 - Client → server **binary** frames are keystrokes, written as-is.
 - Client → server **text** frames are control messages: `{"type":"resize","cols":120,"rows":40}`
   (1..=1000). Unknown `type`s are ignored; malformed JSON or an invalid size closes with 1007.
+- The server sends a WebSocket Ping every 20 s; a client that doesn't answer within 20 s is closed
+  with 1013 (reconnect with `from`).
 - **Close codes:** 1000 after `exit`; 1007 malformed control; 1013 client too slow (reconnect
   with `from`); 1011 runtime failure; 1001 hub shutting down. The stream uses 1013 too slow
   (reconnect with `since`), 1001 source closed or hub shutting down, and 1011 failure.
-- The mock echoes input back and replays a short canned screen.
+- The mock echoes input back and replays a short canned screen. It does not send WebSocket Pings
+  yet.

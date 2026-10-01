@@ -94,6 +94,8 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
   on their own, workstream health never changes by itself, and mentions do not create asks.
 - A resize changes nothing, and `model`, `persona` and `permission_mode` on a new session are only
   checked, not used (the contract says they are not echoed on `Session`).
+- Terminal sockets send no WebSocket Pings, so they never close an idle client with 1013.
+
 ## Safety
 
 It binds 127.0.0.1 only, and answers only requests addressed to `localhost`, `127.0.0.1` or
