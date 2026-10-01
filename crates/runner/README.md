@@ -25,6 +25,13 @@ reports it:
   transcript only at the first prompt) is held with its sender, and decided when the session is
   discovered. One refused then is dropped; the allowed ones are folded into the session's first
   state, oldest first.
+- **Sub-agents run as their parent.** When `SessionAgents` answers `NoAgent` for a session whose
+  transcript names a parent (a Claude sub-agent in `<session>/subagents/`), the runner asks for
+  the parent's agent and judges by that. The hub has not stored a sub-agent yet when its held
+  hooks are decided (its `session_discovered` is on its way to the store), nor until the sink's
+  write lands, so only its parent's agent is known then. Any other answer for the sub-agent
+  itself (an agent, or `Unknown`) stands. The parent is found by the transcript's path at
+  discovery, or at the sub-agent's first hook after a restart.
 - Codex's `notify` follows the same rule.
 
 The sender travels from `HookSink::deliver` to where the session is resolved as an explicit
@@ -60,7 +67,8 @@ before the dispatch's CLI starts.
 - A sub-agent session (one with a `parent`) runs as its parent: answer the parent's agent. The
   runner states sub-agent sessions without an agent of their own; once it adopts dispatch ids
   (below), a dispatched agent's sub-agents must resolve to that agent, or its hooks from them are
-  refused and any person's apply.
+  refused and any person's apply. For a sub-agent the hub has not stored, `NoAgent` is the right
+  answer: the runner then asks about the parent itself (above).
 - It must see the hub's **latest** session writes. A stale cache answering `NoAgent` for a
   session that has since gained an agent would let any person's hook change it.
 - It must **not call back into the runner** (its handle, hooks, terminals or commands): the

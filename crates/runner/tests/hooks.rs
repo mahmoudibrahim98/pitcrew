@@ -36,6 +36,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower::ServiceExt as _;
 
 const WAIT: Duration = Duration::from_secs(5);
+/// Longest wait in the tests that wait only for events (never for a margin of time): generous,
+/// so a loaded machine is slow, not a failure.
+const CEILING: Duration = Duration::from_secs(60);
 
 fn now_ms() -> TimestampMs {
     i64::try_from(
@@ -741,6 +744,143 @@ fn a_hook_for_an_unknown_session_looks_in_local_homes_but_not_network_ones() {
         runner.stop();
         assert_eq!(after - before, looks, "{poll:?}");
     }
+}
+
+/// Writes the transcript of Claude sub-agent `agent_id`, started by the fixture's session in
+/// `home`, whole (see `common::place`).
+fn place_sub_agent(home: &Path, agent_id: &str) {
+    let dir = claude_file(home, FIXTURE_ID)
+        .with_extension("")
+        .join("subagents");
+    std::fs::create_dir_all(&dir).unwrap();
+    let lines = String::from_utf8(fixture_lines()[..3].concat())
+        .unwrap()
+        .replace(
+            r#""isSidechain":false"#,
+            &format!(r#""isSidechain":true,"agentId":"{agent_id}""#),
+        );
+    common::place(&dir.join(format!("{agent_id}.jsonl")), lines.as_bytes());
+}
+
+/// Delivers a hook that applies, and waits for its event: every hook delivered before it has
+/// then been decided (the watcher decides hooks in order).
+fn settle(hooks: &dyn HookSink, sink: &CollectSink, hook: HookEvent) {
+    let before = sink.len();
+    hooks.deliver(hook);
+    sink.wait_for(before + 1, CEILING)
+        .expect("the settling hook's event");
+}
+
+/// The discovered session whose CLI id is `native`.
+fn discovered_as(events: &[Event], native: &str) -> pitcrew_protocol::model::Session {
+    events
+        .iter()
+        .find_map(|e| match &e.body {
+            EventBody::SessionDiscovered { session } if session.native_id == native => {
+                Some(session.clone())
+            }
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// A sub-agent runs as its parent. At its discovery the hub has not stored it yet (its
+/// `session_discovered` is on its way), so its own lookup says "no agent": its held hooks are
+/// judged by its parent's agent instead, as are its live ones until the hub knows it.
+#[test]
+fn a_sub_agents_hooks_are_judged_by_its_parents_agent() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    std::fs::write(
+        claude_file(home.path(), FIXTURE_ID),
+        fixture_lines()[..5].concat(),
+    )
+    .unwrap();
+    let agents = Arc::new(MemoryAgents::new());
+    let (runner, sink) = start(home.path(), state.path(), Some(agents.clone()));
+    sink.wait_for(3, CEILING).expect("the parent's discovery");
+    let main = discovered(&sink.events()).id;
+    // The parent runs as `writer`; the hub knows nothing of its sub-agents.
+    let owner = person();
+    let writer = agent_of(&owner);
+    agents.set(main, runs_as(&writer));
+
+    let hooks = runner.hooks();
+    let now = now_ms();
+    // Held for `agent-a1`: the writer's own permission prompt, then newer hooks that are
+    // refused: a sibling agent of the same owner ends it, another person's agent stops it.
+    hooks.deliver(asks(
+        &writer,
+        "agent-a1",
+        "Allow the writer's helper to run make?",
+        now,
+    ));
+    hooks.deliver(hook(&agent_of(&owner), "SessionEnd", "agent-a1", now + 1));
+    hooks.deliver(hook(&agent_of(&person()), "Stop", "agent-a1", now + 2));
+    // Held for `agent-a2`, by the device rule: the writer's owner answers for it; another
+    // person's newer end is refused.
+    hooks.deliver(asks(
+        &owner,
+        "agent-a2",
+        "The owner answers for the helper",
+        now,
+    ));
+    hooks.deliver(hook(&person(), "SessionEnd", "agent-a2", now + 1));
+    // The owner stops the parent: once that is in, every hook above is held.
+    settle(&hooks, &sink, hook(&owner, "Stop", FIXTURE_ID, now + 3));
+
+    place_sub_agent(home.path(), "agent-a1");
+    place_sub_agent(home.path(), "agent-a2");
+    runner.rescan();
+    sink.wait_for(4 + 2 * 2, CEILING)
+        .expect("both sub-agents' discoveries");
+    let events = sink.events();
+    let (a1, a2) = (
+        discovered_as(&events, "agent-a1"),
+        discovered_as(&events, "agent-a2"),
+    );
+    assert_eq!((a1.parent, a2.parent), (Some(main), Some(main)));
+    assert_eq!(
+        labels_of(&events, a1.id),
+        ["discovered:Waiting", "tool:TodoWrite"]
+    );
+    assert_eq!(
+        a1.status_line.as_deref(),
+        Some("Allow the writer's helper to run make?")
+    );
+    assert_eq!(
+        labels_of(&events, a2.id),
+        ["discovered:Waiting", "tool:TodoWrite"]
+    );
+    assert_eq!(
+        a2.status_line.as_deref(),
+        Some("The owner answers for the helper")
+    );
+
+    // Live, while the hub still knows nothing of `agent-a1`: another agent's end is refused,
+    // the writer's stop applies.
+    let n = sink.len();
+    let at = now_ms() + 10;
+    hooks.deliver(hook(&agent_of(&person()), "SessionEnd", "agent-a1", at));
+    settle(&hooks, &sink, hook(&writer, "Stop", "agent-a1", at + 1));
+    runner.stop();
+    let events = sink.events();
+    assert_eq!(labels(&events[n..]), ["state:Idle"]);
+    assert_eq!(session_of(&events[n]), Some(a1.id));
+
+    // After a restart the parent is looked up again, at the first hook: `agent-a2` is still
+    // the writer's, and only the writer (or its owner) changes it.
+    let agents = Arc::new(MemoryAgents::new());
+    agents.set(main, runs_as(&writer));
+    let (runner, sink) = start(home.path(), state.path(), Some(agents));
+    let hooks = runner.hooks();
+    let at = now_ms() + 20;
+    hooks.deliver(hook(&agent_of(&owner), "SessionEnd", "agent-a2", at));
+    settle(&hooks, &sink, hook(&writer, "Stop", "agent-a2", at + 1));
+    runner.stop();
+    let events = sink.events();
+    assert_eq!(labels(&events), ["state:Idle"]);
+    assert_eq!(session_of(&events[0]), Some(a2.id));
 }
 
 #[test]

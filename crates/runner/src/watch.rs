@@ -296,6 +296,9 @@ struct Tracked {
     row: Row,
     tref: TranscriptRef,
     home: usize,
+    /// For a sub-agent, its parent's session (`Some(None)`: it names none); `None` until looked
+    /// up, at its discovery or its first hook.
+    parent: Option<Option<SessionId>>,
     hot: bool,
     /// Folders this transcript holds a watch on.
     watched: Vec<PathBuf>,
@@ -853,6 +856,7 @@ impl Watcher {
                 row,
                 tref,
                 home,
+                parent: None,
                 hot: false,
                 watched: Vec::new(),
                 poll_every: self.timing.poll_min,
@@ -1167,7 +1171,7 @@ impl Watcher {
             } else {
                 self.claim_terminal(session, engine, &native, cwd.as_deref(), started)
             };
-            let held = self.allowed_held(session, engine, &native);
+            let held = self.allowed_held(session, parent, engine, &native);
             (parent, terminal, held)
         } else {
             (None, None, Vec::new())
@@ -1177,6 +1181,9 @@ impl Watcher {
         let Some(t) = self.tracked.get_mut(&id) else {
             return Ok(());
         };
+        if first && t.row.meta.is_some() {
+            t.parent = Some(parent);
+        }
         let event = |id, at, body| Event {
             id,
             at,
@@ -1273,7 +1280,8 @@ impl Watcher {
             match (indexed, s.origin) {
                 (Some((id, _)), Origin::Runner) => self.apply_report(id, &s.report)?,
                 (Some((id, session)), Origin::Hook(sender)) => {
-                    match hooks::refusal(&sender, &self.agent_of(session)) {
+                    let parent = self.parent_for(id);
+                    match hooks::refusal(&sender, &self.runs_as(session, parent)) {
                         None => self.apply_report(id, &s.report)?,
                         Some(reason) => {
                             tracing::debug!(%session, target = ?s.target, member = %sender.member(), reason, "hook refused; dropped");
@@ -1317,14 +1325,50 @@ impl Watcher {
         }
     }
 
+    /// Who a session runs as, for its hooks: its own agent as the [`SessionAgents`] tell, or, for
+    /// a sub-agent they say has none, its parent's. A sub-agent runs as its parent, and the hub
+    /// may not have stored it yet: at its discovery, and until the sink's write lands, only its
+    /// parent's agent is known. Any other answer (an agent, or unknown) stands.
+    fn runs_as(&mut self, session: SessionId, parent: Option<SessionId>) -> SessionAgent {
+        match (self.agent_of(session), parent) {
+            (SessionAgent::NoAgent, Some(parent)) => self.agent_of(parent),
+            (own, _) => own,
+        }
+    }
+
+    /// The parent session of a tracked sub-agent, looked up once its transcript says it is one.
+    fn parent_for(&mut self, id: u64) -> Option<SessionId> {
+        let t = self.tracked.get(&id)?;
+        if let Some(parent) = t.parent {
+            return parent;
+        }
+        let meta = t.row.meta.as_ref()?;
+        let parent = if meta.is_subagent {
+            let (engine, path) = (t.row.engine, t.row.path.clone());
+            self.parent_of(engine, &path)
+        } else {
+            None
+        };
+        if let Some(t) = self.tracked.get_mut(&id) {
+            t.parent = Some(parent);
+        }
+        parent
+    }
+
     /// The hooks held for a newly discovered session whose senders may apply them, oldest
-    /// first. The others are dropped.
-    fn allowed_held(&mut self, session: SessionId, engine: Engine, native: &str) -> Vec<Reported> {
+    /// first. The others are dropped. A sub-agent's are judged as its parent's (see `runs_as`).
+    fn allowed_held(
+        &mut self,
+        session: SessionId,
+        parent: Option<SessionId>,
+        engine: Engine,
+        native: &str,
+    ) -> Vec<Reported> {
         let held = self.held.take(engine, native, Instant::now());
         if held.is_empty() {
             return Vec::new();
         }
-        let agent = self.agent_of(session);
+        let agent = self.runs_as(session, parent);
         held.into_iter()
             .filter_map(|(sender, report)| match hooks::refusal(&sender, &agent) {
                 None => Some(report),
