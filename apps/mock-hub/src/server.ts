@@ -18,7 +18,14 @@ import {
 } from './live.ts';
 import { loadRecaps } from './recaps.ts';
 import { MOCK_VERSION, authenticate, handleApi, type Reply } from './routes.ts';
-import { DEFAULT_DELAYS, DEFAULT_SCAN_WINDOW, Hub, loadFixture, type Delays } from './state.ts';
+import {
+  DEFAULT_DELAYS,
+  DEFAULT_SCAN_WINDOW,
+  Hub,
+  freshWorkspace,
+  loadFixture,
+  type Delays,
+} from './state.ts';
 import { ApiFailure, forbidden, invalid, notFound } from './validate.ts';
 import {
   acceptUpgrade,
@@ -46,6 +53,11 @@ export interface ServerOptions {
   delays?: Partial<Delays>;
   /** How many revisions one filtered `GET /v1/events` examines at most. Default 500. */
   scanWindow?: number;
+  /**
+   * Serves an empty workspace (no members, machines or work) instead of the demo fixture, so
+   * `POST /v1/setup` can be exercised. `PITCREW_MOCK_FRESH=1` sets this from the command line.
+   */
+  fresh?: boolean;
   /** Receives one line per request. Silent by default. */
   log?: (line: string) => void;
 }
@@ -64,10 +76,10 @@ export interface RunningServer {
 /** Starts a mock hub on 127.0.0.1. */
 export async function startServer(options: ServerOptions = {}): Promise<RunningServer> {
   const hub = new Hub(
-    loadFixture(FIXTURE),
+    options.fresh === true ? freshWorkspace() : loadFixture(FIXTURE),
     { ...DEFAULT_DELAYS, ...options.delays },
     options.scanWindow ?? DEFAULT_SCAN_WINDOW,
-    loadRecaps(RECAPS),
+    options.fresh === true ? undefined : loadRecaps(RECAPS),
   );
   const log = options.log ?? ((): void => {});
   const sockets = new Set<WebSocketConnection>();
@@ -396,15 +408,27 @@ function parseScanWindow(value: string | undefined): number {
   return window;
 }
 
+/** `PITCREW_MOCK_FRESH=1` serves an empty workspace instead of the demo. */
+function parseFresh(value: string | undefined): boolean {
+  return value === '1';
+}
+
 async function main(): Promise<void> {
+  const fresh = parseFresh(process.env['PITCREW_MOCK_FRESH']);
   const server = await startServer({
     port: parsePort(process.env['PORT']),
     scanWindow: parseScanWindow(process.env['PITCREW_MOCK_SCAN_WINDOW']),
+    fresh,
     log: (line) => console.log(line),
   });
   console.log(`PitCrew mock hub on ${server.url}`);
-  console.log('  device token: dev-device-token  (@sam)');
-  console.log('  agent token:  dev-agent-token   (@writer)');
+  if (fresh) {
+    console.log('  fresh mode: no workspace yet; POST /v1/setup with the device token to create one.');
+    console.log('  device token: dev-device-token  (a member nothing knows until setup)');
+  } else {
+    console.log('  device token: dev-device-token  (@sam)');
+    console.log('  agent token:  dev-agent-token   (@writer)');
+  }
   const stop = (): void => {
     void server.close().then(() => process.exit(0));
   };
