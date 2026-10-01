@@ -11,7 +11,8 @@
 
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
-import { Terminal, type IDisposable } from '@xterm/xterm';
+import { Terminal, type IDisposable, type ITheme } from '@xterm/xterm';
+import { dimTextStyles } from './contrast.ts';
 import { isReleaseChord } from './keys.ts';
 import { linkHandler, SWALLOWED_OSC, terminalOptions } from './options.ts';
 import {
@@ -32,6 +33,8 @@ export const HIGH_WATER = 4 * 1024 * 1024;
 export const LOW_WATER = 512 * 1024;
 /** How long to wait for the terminal font before measuring cells with whatever is there. */
 const FONT_WAIT_MS = 1_500;
+/** Where the dim-text rules apply: the view's frame (see contrast.ts). */
+const DIM_SCOPE = '[data-terminal-focus]';
 
 export interface ControllerOptions {
   /** The element xterm fills. */
@@ -72,6 +75,8 @@ export class TerminalController {
   readonly #socket: TerminalSocket;
   readonly #disposables: IDisposable[] = [];
   readonly #cleanups: (() => void)[] = [];
+  #theme: ITheme;
+  #dimStyle: HTMLStyleElement | undefined;
   #webgl: WebglAddon | undefined;
   #mode: TerminalMode = 'view';
   /** Bytes written to xterm and not yet parsed. */
@@ -88,9 +93,8 @@ export class TerminalController {
       (url) => options.openLink(url),
       (url) => options.onLinkHint(url),
     );
-    this.#term = new Terminal(
-      terminalOptions({ theme: terminalTheme(this.#read), font, screenReader: options.screenReader, links }),
-    );
+    this.#theme = terminalTheme(this.#read);
+    this.#term = new Terminal(terminalOptions({ theme: this.#theme, font, screenReader: options.screenReader, links }));
     for (const code of SWALLOWED_OSC) {
       this.#disposables.push(this.#term.parser.registerOscHandler(code, () => true));
     }
@@ -171,11 +175,15 @@ export class TerminalController {
     this.#webgl?.dispose();
     this.#webgl = undefined;
     this.#term.dispose();
+    this.#dimStyle?.remove();
   }
 
   #open(): void {
     if (this.#disposed) return;
     const { host } = this.#options;
+    this.#dimStyle = document.createElement('style');
+    this.#dimStyle.textContent = dimTextStyles(this.#theme, DIM_SCOPE);
+    host.append(this.#dimStyle);
     this.#term.open(host);
     // The view's frame is the tab stop; xterm's input is focused only in control mode.
     if (this.#term.textarea !== undefined) this.#term.textarea.tabIndex = -1;
@@ -220,7 +228,10 @@ export class TerminalController {
       this.#cleanups.push(() => observer.disconnect());
     }
     const retheme = () => {
-      if (!this.#disposed) this.#term.options.theme = terminalTheme(this.#read);
+      if (this.#disposed) return;
+      this.#theme = terminalTheme(this.#read);
+      this.#term.options.theme = this.#theme;
+      if (this.#dimStyle !== undefined) this.#dimStyle.textContent = dimTextStyles(this.#theme, DIM_SCOPE);
     };
     // The theme is `data-theme` on the root, or the system's when it has none.
     const mutations = new MutationObserver(retheme);
