@@ -292,10 +292,12 @@ impl Store {
     ///
     /// # Errors
     ///
+    /// [`Error::LeaseLost`] in network mode, if this store's lease has been taken over,
     /// [`Error::UnknownProjection`] if no projection by that name was registered,
     /// [`Error::Projection`] if it fails, [`Error::ProjectionVersion`] if the store holds it at a
     /// higher version than this build's, or database errors. Nothing changes on an error.
     pub fn rebuild(&self, name: &str) -> Result<()> {
+        self.check_lease()?;
         let p = self
             .projections
             .iter()
@@ -377,6 +379,7 @@ impl Store {
     ///
     /// # Errors
     ///
+    /// [`Error::LeaseLost`] in network mode, if this store's lease has been taken over,
     /// [`Error::DuplicateEvent`] if an event id is already stored or repeated in `events`,
     /// [`Error::Projection`] if a projection fails, [`Error::ProjectionVersion`] if another
     /// process rebuilt a projection at another version since this store opened, otherwise
@@ -398,9 +401,7 @@ impl Store {
     }
 
     fn append_inner(&self, events: &[Event], skip_known: bool) -> Result<(RevRange, Vec<EventId>)> {
-        if self.network.as_ref().is_some_and(LeaseGuard::is_lost) {
-            return Err(Error::LeaseLost);
-        }
+        self.check_lease()?;
         if events.is_empty() {
             return Ok((
                 RevRange {
@@ -570,6 +571,21 @@ impl Store {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// `Err(Error::LeaseLost)` if network mode's lease has been taken over since this `Store`
+    /// opened (local mode: always `Ok`). Called first by every method that writes the log or a
+    /// projection's tables — [`Store::append`]/[`Store::append_new`] (via `append_inner`),
+    /// [`Store::rebuild`] and [`Store::import`] (whose own batches also go through `append`,
+    /// which checks again; checking here too means an already-lost lease is reported before
+    /// `import` does any work, not partway through) — so a lease lost mid-session is caught
+    /// before more is written under it than the one append already in flight.
+    fn check_lease(&self) -> Result<()> {
+        if self.network.as_ref().is_some_and(LeaseGuard::is_lost) {
+            Err(Error::LeaseLost)
+        } else {
+            Ok(())
+        }
+    }
+
     /// The connection [`Store::read`], [`Store::since`] and [`Store::before`] use: the dedicated
     /// read-only connection in local mode, or (network mode has none) the write connection.
     fn reader(&self) -> MutexGuard<'_, Connection> {
@@ -586,13 +602,16 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// Database errors, including SQLite refusing to overwrite a `dest` that already exists.
+    /// [`Error::NonUtf8Path`] if `dest` is not valid UTF-8 (`VACUUM INTO` takes it as a SQL
+    /// string, so a lossy conversion could silently write to the wrong path), or database
+    /// errors, including SQLite refusing to overwrite a `dest` that already exists.
     pub fn snapshot(&self, dest: impl AsRef<Path>) -> Result<()> {
+        let dest = dest.as_ref();
+        let dest_str = dest.to_str().ok_or_else(|| Error::NonUtf8Path {
+            path: dest.to_path_buf(),
+        })?;
         let conn = self.conn();
-        conn.execute(
-            "VACUUM INTO ?1",
-            rusqlite::params![dest.as_ref().to_string_lossy().into_owned()],
-        )?;
+        conn.execute("VACUUM INTO ?1", rusqlite::params![dest_str])?;
         Ok(())
     }
 
@@ -642,10 +661,13 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`Error::NotEmpty`] if the store already holds events, [`Error::Io`] reading `reader` or
-    /// decoding a line, or anything [`Store::append`] can return. The store may hold a prefix of
-    /// `reader`'s lines if a later batch fails.
+    /// [`Error::LeaseLost`] in network mode, if this store's lease has been taken over (checked
+    /// up front, and again by every batch's own [`Store::append`]), [`Error::NotEmpty`] if the
+    /// store already holds events, [`Error::Io`] reading `reader` or decoding a line, or anything
+    /// else [`Store::append`] can return. The store may hold a prefix of `reader`'s lines if a
+    /// later batch fails.
     pub fn import(&self, reader: impl BufRead) -> Result<()> {
+        self.check_lease()?;
         if self.latest_rev()? != 0 {
             return Err(Error::NotEmpty);
         }

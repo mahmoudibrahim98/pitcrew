@@ -9,6 +9,7 @@ use pitcrew_protocol::events::Event;
 
 /// The result of `PRAGMA quick_check` or `PRAGMA integrity_check`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IntegrityReport {
     /// No problems found.
     Ok,

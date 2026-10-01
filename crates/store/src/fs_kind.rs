@@ -19,6 +19,7 @@ use std::path::Path;
 
 /// What kind of filesystem holds a directory, from [`detect`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FsKind {
     /// A local disk: WAL is safe.
     Local,
@@ -47,6 +48,7 @@ impl FsKind {
 
 /// How a [`Store`](crate::Store) decides between WAL and the NFS-safe mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FsMode {
     /// Detect the directory's filesystem with [`detect`] and choose accordingly (the default).
     #[default]

@@ -139,6 +139,14 @@ pub enum Error {
     /// logs' revisions.
     #[error("the store must be empty to import into")]
     NotEmpty,
+    /// [`Store::snapshot`](crate::Store::snapshot)'s destination path is not valid UTF-8.
+    /// `VACUUM INTO` takes it as a SQL string literal, so a lossy conversion could silently write
+    /// to the wrong path; refusing it is safer than guessing.
+    #[error("snapshot destination path is not valid UTF-8: {path:?}")]
+    NonUtf8Path {
+        /// The path that was given.
+        path: std::path::PathBuf,
+    },
 }
 
 /// A SQLite error. It wraps the store's `rusqlite` error, re-exported as
