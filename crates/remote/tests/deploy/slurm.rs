@@ -731,6 +731,30 @@ fn job_scripts_left(m: &Machine) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// SIGUSR1 and SIGUSR2 as bits of `/proc/<pid>/status`'s signal masks (signal n is bit n - 1).
+const USR_SIGNALS: u64 = (1 << 9) | (1 << 11);
+
+/// The signals `pid` ignores, from `/proc/<pid>/status` (`SigIgn`).
+fn ignored_signals(pid: u32) -> u64 {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let mask = status
+        .lines()
+        .find_map(|l| l.strip_prefix("SigIgn:"))
+        .unwrap()
+        .trim();
+    u64::from_str_radix(mask, 16).unwrap()
+}
+
+/// Sends SIGUSR1 and SIGUSR2 to `pid`, as `sbatch --signal=B:…` would to the batch shell, and
+/// gives it a moment to act on them.
+fn send_usr_signals(pid: u32) {
+    let pid = rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap();
+    for signal in [rustix::process::Signal::USR1, rustix::process::Signal::USR2] {
+        rustix::process::kill_process(pid, signal).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(500));
+}
+
 /// A site whose `module` command comes from a set-up script in the machine's directory, which
 /// logs what it loads to `loaded.log` and fails for `broken/…`. The script also changes `IFS`
 /// and the shell's traps, as a careless one might.
@@ -913,6 +937,11 @@ fn slurm_submit_pending_running_stop() {
         "{text}"
     );
     assert_private(&m.root());
+    // SIGUSR1 and SIGUSR2 (sbatch --signal) to the batch shell do not end the job.
+    send_usr_signals(sim.job(id).pgid.unwrap());
+    assert!(alive(sim.job(id).pgid.unwrap()));
+    assert!(alive(e.pid));
+    assert_eq!(sim.job(id).state, "RUNNING");
 
     // Stop: scancel; the job leaves the queue; its records go.
     let cancelled = block_on(launcher.cancel(&target)).unwrap();
@@ -1236,6 +1265,24 @@ fn slurm_never_touches_other_jobs() {
     assert_eq!(sim.job(id).state, "RUNNING");
     assert!(!m.run_dir().join("slurm.json").exists());
 
+    // Gone from the queue, with sacct's only record of the id another user's: it does not say
+    // how PitCrew's job ended.
+    let id = block_on(launcher.submit(&target)).unwrap().job;
+    let mut theirs = sim.job(id);
+    theirs.uid += 1;
+    theirs.state = "COMPLETED".to_owned();
+    theirs.exit = Some((0, 0));
+    sim.save(&theirs);
+    let status = block_on(launcher.job_status(&target)).unwrap();
+    assert_eq!(
+        status.state,
+        JobState::Ended {
+            state: None,
+            exit: None
+        }
+    );
+    block_on(launcher.cancel(&target)).unwrap();
+
     // Another user's job, under another name too.
     let id = block_on(launcher.submit(&target)).unwrap().job;
     let mut theirs = sim.job(id);
@@ -1543,6 +1590,23 @@ fn slurm_scripts_arrive_whole_or_not_at_all() {
     eventually("the remote script to clean up", || {
         job_scripts_left(&m).is_empty() && !m.run_dir().join(".lock").exists()
     });
+    // The same, but the remote script is killed while it copies the job script (the fake waits
+    // there first, so the remote side gets that far): its copy and its lock stay behind, until
+    // the next submit breaks the dead run's lock and sweeps them.
+    let err = submit(Remote {
+        pause_after: Some(script_len() + 200),
+        pause_ms: 1500,
+        cut_after: Some(script_len() + 200),
+        kill: true,
+        ..Remote::default()
+    })
+    .unwrap_err();
+    assert!(
+        matches!(err, HelperError::Ssh(SshError::Ssh { code: 255, .. })),
+        "{err:?}"
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(job_scripts_left(&m).len(), 1);
     // A byte changed on the way, where neither the length nor the markers show it.
     let middle = script_len() + u64::try_from(script.text().len() / 2).unwrap();
     let err = submit(Remote {
@@ -1738,15 +1802,17 @@ fn slurm_under_every_posix_sh() {
         );
         let status = block_on(launcher.job_status(&target)).unwrap();
         assert!(status.ready(), "{}: {status:?}", shell.display());
-        // SIGUSR1 and SIGUSR2 (sbatch --signal) do not end the job, though the set-up script
-        // tried to make the shell ignore them, and the helper does not get them.
+        // The set-up script made the shell ignore SIGUSR1 and SIGUSR2: the job catches them
+        // again, so they do not end it and the helper does not inherit them ignored.
         let id = started.endpoint.job.unwrap();
         let job_shell = sim.job(id).pgid.unwrap();
-        for signal in [rustix::process::Signal::USR1, rustix::process::Signal::USR2] {
-            let pid = rustix::process::Pid::from_raw(i32::try_from(job_shell).unwrap()).unwrap();
-            rustix::process::kill_process(pid, signal).unwrap();
-        }
-        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            ignored_signals(started.endpoint.pid) & USR_SIGNALS,
+            0,
+            "{}",
+            shell.display()
+        );
+        send_usr_signals(job_shell);
         assert!(alive(job_shell), "{}", shell.display());
         assert!(alive(started.endpoint.pid), "{}", shell.display());
         assert_eq!(sim.job(id).state, "RUNNING", "{}", shell.display());
