@@ -149,15 +149,27 @@ pub struct Store {
 
 impl std::fmt::Debug for Store {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let guard = self
-            .projections
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let names = guard.iter().map(|p| p.name()).collect::<Vec<_>>();
-        f.debug_struct("Store")
-            .field("log_id", &self.log_id)
-            .field("projections", &names)
-            .finish_non_exhaustive()
+        let mut debug = f.debug_struct("Store");
+        debug.field("log_id", &self.log_id);
+        // `try_lock`, not `lock`: `Debug` is used from panic messages and assertions, which can
+        // fire while this very thread already holds `projections` (inside `append_within`, say);
+        // blocking here would deadlock instead of printing. A lock someone else holds just prints
+        // as unavailable, same as any other value `Debug` cannot reach safely.
+        match self.projections.try_lock() {
+            Ok(guard) => {
+                let names = guard.iter().map(|p| p.name()).collect::<Vec<_>>();
+                debug.field("projections", &names);
+            }
+            Err(std::sync::TryLockError::Poisoned(e)) => {
+                let guard = e.into_inner();
+                let names = guard.iter().map(|p| p.name()).collect::<Vec<_>>();
+                debug.field("projections", &names);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                debug.field("projections", &"<locked>");
+            }
+        }
+        debug.finish_non_exhaustive()
     }
 }
 
@@ -301,10 +313,13 @@ impl Store {
     /// [`Error::Projection`] if it fails, [`Error::ProjectionVersion`] if the store holds it at a
     /// higher version than this build's, or database errors. Nothing changes on an error.
     pub fn rebuild(&self, name: &str) -> Result<()> {
-        self.check_lease()?;
         // `conn` locked first, `projections` second: the order every method follows (see the
-        // field's doc comment), so the two locks never deadlock against `register`.
+        // field's doc comment), so the two locks never deadlock against `register`. The lease is
+        // checked only after `conn` is actually held, not before: another writer may hold it for
+        // a while (`import` can now hold it for a long import), and a check made before waiting
+        // would describe a lease that may no longer be current by the time the wait ends.
         let mut conn = self.conn();
+        self.check_lease()?;
         let projections = self
             .projections
             .lock()
@@ -350,6 +365,10 @@ impl Store {
     /// reopen drops the lease for a moment between the two opens, which another host could take;
     /// `register` never drops it, because it is still the same `Store`.
     ///
+    /// **Do not call this inside [`Store::read`]'s closure in network mode**: `read` runs on the
+    /// write connection there (there is no separate reader), so `register`'s own attempt to take
+    /// that same connection's lock deadlocks, the same as appending would (see `read`'s doc).
+    ///
     /// # Errors
     ///
     /// [`Error::LeaseLost`] in network mode, if this store's lease has been taken over,
@@ -358,8 +377,10 @@ impl Store {
     /// holds it at a higher version than this build's, or database errors. Nothing changes on an
     /// error: the existing projections, the log and the lease are untouched.
     pub fn register(&self, projection: Box<dyn Projection>) -> Result<()> {
-        self.check_lease()?;
+        // `conn` first, lease second, same reordering and the same reason as `rebuild` and
+        // `append_inner`: checked only once this call actually holds the write lock.
         let mut conn = self.conn();
+        self.check_lease()?;
         if self
             .projections
             .lock()
@@ -405,7 +426,14 @@ impl Store {
     /// appended without this projection.
     ///
     /// **Do not call `read`, [`Store::since`] or [`Store::before`] inside the closure**: they
-    /// wait for the connection the closure holds, which deadlocks. Appending inside it is fine.
+    /// wait for the connection the closure holds, which deadlocks. **In local (WAL) mode,
+    /// appending inside the closure is fine**: `read` holds the separate reader connection's
+    /// lock, a different one from the write connection `append` takes. **In network mode it
+    /// deadlocks**: there is no separate reader there, so `read` already holds the *write*
+    /// connection's lock for the closure's duration, and `append` (or [`Store::rebuild`] or
+    /// [`Store::register`]) trying to take that same lock from the same thread waits for itself
+    /// forever. `std::sync::Mutex` is not reentrant, and nothing here detects same-thread
+    /// re-entry to turn it into a clean error instead.
     ///
     /// `E` is any error that a store [`Error`] converts into, including [`Error`] itself, which
     /// `?` on a [`sql::Error`](crate::sql::Error) produces.
@@ -466,7 +494,6 @@ impl Store {
     }
 
     fn append_inner(&self, events: &[Event], skip_known: bool) -> Result<(RevRange, Vec<EventId>)> {
-        self.check_lease()?;
         if events.is_empty() {
             return Ok((
                 RevRange {
@@ -477,6 +504,10 @@ impl Store {
             ));
         }
         let mut conn = self.conn();
+        // Checked only once `conn` is actually held, not before: another writer may hold it for a
+        // while (a long `import`, say), and a check made before waiting for it would describe a
+        // lease that may no longer be current by the time the wait ends.
+        self.check_lease()?;
         // IMMEDIATE takes the write lock up front. A deferred transaction would read first, and
         // WAL mode fails a read-to-write upgrade with SQLITE_BUSY at once, ignoring busy_timeout.
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -507,11 +538,15 @@ impl Store {
         let mut skipped = Vec::new();
         // Kept only when projections need them.
         let mut stored = Vec::new();
-        let has_projections = !self
+        // Locked once for the whole call (the is-empty check below and the apply at the end),
+        // not twice: nothing else ever contends for it while this holds `tx`'s connection lock
+        // (see the field's doc comment), so there is no cost to holding it a little longer, and
+        // one lock is simpler than two.
+        let projections = self
             .projections
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_empty();
+            .unwrap_or_else(PoisonError::into_inner);
+        let has_projections = !projections.is_empty();
         {
             let mut insert = tx.prepare_cached(if skip_known {
                 "INSERT INTO events (id, at, workspace, author, on_behalf_of, type, data)
@@ -545,10 +580,6 @@ impl Store {
         }
         let after = latest_rev(tx)?;
         if after > before {
-            let projections = self
-                .projections
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
             apply_projections(&projections, tx, before, after, &stored)?;
         }
         Ok((
@@ -566,18 +597,14 @@ impl Store {
     /// a scan of the log. Runs on [`Store::reader`]: the separate read-only connection in local
     /// mode, so it never waits on the write lock; the write connection in network mode, like
     /// [`Store::since`] and [`Store::before`]. Do not call it inside [`Store::read`] (it
-    /// deadlocks, for the same reason `since` and `before` do).
+    /// deadlocks, for the same reason `since` and `before` do) — the free function [`contains`]
+    /// takes a connection directly, for that case: `store.read(|c| contains(c, id))`.
     ///
     /// # Errors
     ///
     /// Database errors.
     pub fn contains(&self, id: EventId) -> Result<bool> {
-        let conn = self.reader();
-        Ok(conn
-            .prepare_cached("SELECT 1 FROM events WHERE id = ?1")?
-            .query_row(rusqlite::params![id.0.to_string()], |_| Ok(()))
-            .optional()?
-            .is_some())
+        contains(&self.reader(), id)
     }
 
     /// The newest revision, or 0 for an empty log.
@@ -643,14 +670,16 @@ impl Store {
     }
 
     /// `Err(Error::LeaseLost)` if network mode's lease has been taken over since this `Store`
-    /// opened (local mode: always `Ok`). Called first by every method that writes the log or a
+    /// opened (local mode: always `Ok`). Called by every method that writes the log or a
     /// projection's tables — [`Store::append`]/[`Store::append_new`] (via `append_inner`),
-    /// [`Store::rebuild`] and [`Store::import`] (whose own batches also go through `append`,
-    /// which checks again; checking here too means an already-lost lease is reported before
-    /// `import` does any work, not partway through). `LeaseGuard::check` re-lists the lease
-    /// directory fresh on every call (a cheap `readdir`, no file content to read), so a takeover
-    /// is caught here, immediately, not up to `ttl / RENEW_FRACTION` later when the renewal
-    /// thread would next notice on its own.
+    /// [`Store::rebuild`], [`Store::register`] and [`Store::import`] (whose own batches go
+    /// through `append_within` directly, each still checked, plus once more right before its
+    /// final `COMMIT`) — and always *after* the write connection's lock is actually held, not
+    /// before: another writer can hold that lock for a while (a long `import`, say), and a check
+    /// made before waiting for it would describe a lease that may no longer be current by the
+    /// time the wait ends. `LeaseGuard::check` re-lists the lease directory fresh on every call (a
+    /// cheap `readdir`, no file content to read), so a takeover is caught here, immediately, not
+    /// up to `ttl / RENEW_FRACTION` later when the renewal thread would next notice on its own.
     fn check_lease(&self) -> Result<()> {
         match &self.network {
             Some(guard) => guard.check(),
@@ -730,85 +759,98 @@ impl Store {
     /// every line is appended, or (a bad line, an I/O error, a lost lease) none of it is, and this
     /// store is left exactly as it was. For tests and support, not sync.
     ///
-    /// **Design.** Lines are read and decoded one at a time (never the whole file in memory) and
-    /// inserted in batches of 1,000, same as before; what changed is that every batch now runs
-    /// inside the *same* transaction instead of its own, committed only once, at the very end —
-    /// still in revision order, so the memory an import holds stays bounded by one batch (events
-    /// decoded but not yet inserted) however long the file is. A fresh-file-renamed-into-place
-    /// design was also considered (import into a new file, then swap it in); one transaction was
-    /// chosen instead because it reuses `append`'s own insert-and-apply-projections path exactly,
-    /// needs no second copy of the database on disk, and SQLite's own rollback journal already
-    /// gives "nothing or everything" for free on any failure, including a real process crash
-    /// mid-import (its uncommitted transaction is rolled back the next time anything opens the
-    /// file, the same durability a clean `Err` return gets here). The cost: this transaction holds
-    /// the write lock for the whole import, not 1,000 lines at a time as before. In local (WAL)
-    /// mode that cost is the same as any other long write: concurrent reads still run on the
-    /// separate read connection and are unaffected; in network mode, where reads share the write
-    /// connection, a very large import blocks reads for its entire duration rather than for 1,000
-    /// lines at a time — importing is a rare, offline operation (support and tests, not sync, per
-    /// this method's own doc), so that trade favours correctness. **Measured** (release build,
-    /// WSL2, same machine as the crate README's other timings; `tests/perf.rs`,
-    /// `import_10k_compares_to_ten_committed_batches`): importing 10,000 events in the one
-    /// transaction took 370 ms; the same 10,000 events appended in ten separately committed
-    /// batches of 1,000 — exactly what the old design did internally — took 393 ms. One long
-    /// transaction is not slower than many short ones for the same total work; if anything it is
-    /// a little faster here, since SQLite's per-transaction fixed cost (fsync at commit) is paid
-    /// once instead of ten times.
+    /// **Design.** Lines are read and decoded one at a time, each capped so one hostile or
+    /// corrupt line cannot force unbounded memory, and inserted in batches of 1,000, same as
+    /// before; what changed is that every batch now runs inside the *same* transaction instead of
+    /// its own, committed only once, at the very end — still in revision order, so the memory an
+    /// import holds stays bounded by one batch (events decoded but not yet inserted) however long
+    /// the file is. A fresh-file-renamed-into-place design was also considered (import into a new
+    /// file, then swap it in); one transaction was chosen instead because it reuses `append`'s own
+    /// insert-and-apply-projections path exactly, needs no second copy of the database on disk,
+    /// and SQLite's own rollback journal already gives "nothing or everything" for free on any
+    /// failure, including a real process crash mid-import (its uncommitted transaction is rolled
+    /// back the next time anything opens the file, the same durability a clean `Err` return gets
+    /// here). The cost, and a measurement against the old per-batch design, are in the crate
+    /// README ("Maintenance" and "Timings").
     ///
-    /// The store must be empty: an import is a new log, and this store's `log_id` (assigned when
-    /// it was created, independently of import) already reflects that.
+    /// The store must be empty, checked from *inside* this transaction (a `latest_rev()` read
+    /// before starting it could see an empty store that a concurrent writer fills a moment later,
+    /// which this cannot miss: nothing else can write while this transaction holds the lock). An
+    /// import is a new log, and this store's `log_id` (assigned when it was created, independently
+    /// of import) already reflects that.
+    ///
+    /// The network-mode lease is checked after the write connection is actually held (not before:
+    /// see [`Store::check_lease`]), again before every batch's insert, and once more right before
+    /// the final `COMMIT` — not only between batches — so a takeover during the read of a large
+    /// file, or during the last, partial batch, is still caught before anything commits.
     ///
     /// # Errors
     ///
-    /// [`Error::LeaseLost`] in network mode, if this store's lease has been taken over (checked up
-    /// front, and again between batches, so a long import notices a takeover without waiting for
-    /// the whole file), [`Error::NotEmpty`] if the store already holds events, [`Error::Io`]
-    /// reading `reader`, [`Error::Corrupt`] decoding a line, or anything else the insert-and-apply
-    /// path [`Store::append`] shares can return (`DuplicateEvent`, a projection failure, a
-    /// database error). **On any error, nothing is appended**: `Store::latest_rev` reads 0
-    /// afterwards, the same as before this call, because the transaction is rolled back rather
-    /// than committed — never a prefix of `reader`'s lines.
-    pub fn import(&self, reader: impl BufRead) -> Result<()> {
-        self.check_lease()?;
-        if self.latest_rev()? != 0 {
-            return Err(Error::NotEmpty);
-        }
+    /// [`Error::LeaseLost`] in network mode, if this store's lease has been taken over,
+    /// [`Error::NotEmpty`] if the store already holds events, [`Error::Io`] reading `reader`,
+    /// [`Error::Corrupt`] decoding a line or finding one over 16 MiB, or anything else the
+    /// insert-and-apply path [`Store::append`] shares can return (`DuplicateEvent`, a projection
+    /// failure, a database error). **On any error, nothing is appended**: `Store::latest_rev`
+    /// reads 0 afterwards, the same as before this call, because the transaction is rolled back
+    /// rather than committed — never a prefix of `reader`'s lines.
+    pub fn import(&self, mut reader: impl BufRead) -> Result<()> {
         const BATCH: usize = 1_000;
-        let total = {
+        let (from_rev, total) = {
             let mut conn = self.conn();
+            // Checked here, once this call actually holds the write lock, not before: see
+            // `check_lease`'s doc.
+            self.check_lease()?;
             // One IMMEDIATE transaction for the whole import: nothing it does is visible, even to
             // this same `Store`, until `commit` below, so a `?` anywhere here (a bad line, a lost
             // lease, a projection failure) drops `tx` without committing, which rolls everything
-            // back — whole-import batches before it included.
+            // back — every batch before it included.
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // Read from inside `tx`, not before it starts: see this method's own doc.
+            let from_rev = latest_rev(&tx)?;
+            if from_rev != 0 {
+                return Err(Error::NotEmpty);
+            }
             let mut batch = Vec::with_capacity(BATCH);
-            for line in reader.lines() {
-                let line = line.map_err(Error::Io)?;
+            let mut line_no: u64 = 0;
+            while let Some(line) = maintenance::read_bounded_line(&mut reader)? {
+                line_no += 1;
                 if line.is_empty() {
                     continue;
                 }
-                batch.push(maintenance::decode_line(&line)?);
+                batch.push(maintenance::decode_line(&line, line_no)?);
                 if batch.len() == BATCH {
+                    self.check_lease()?;
                     self.append_within(&tx, &batch, false)?;
                     batch.clear();
-                    // Re-checked between batches (not just once up front): a long import on a
-                    // network filesystem notices a takeover, and rolls back, without reading the
-                    // rest of a possibly very large file first.
-                    self.check_lease()?;
                 }
             }
             if !batch.is_empty() {
+                self.check_lease()?;
                 self.append_within(&tx, &batch, false)?;
             }
+            // Once more right before the commit: a takeover while reading a slow or very large
+            // `reader` (after the last batch flush, or within a batch smaller than 1,000 lines
+            // entirely) must not still land as a commit.
+            self.check_lease()?;
             let total = latest_rev(&tx)?;
             tx.commit()?;
-            total
+            if self.reader.is_some() {
+                // Local (WAL) mode: a commit appends new frames to `-wal` but does not shrink it,
+                // so a large import leaves `-wal` roughly the size of what it just wrote until
+                // something else happens to checkpoint it. Fold those frames back into the main
+                // file and truncate `-wal` now, before releasing the lock, rather than leaving
+                // that for whatever operation next happens to trigger a checkpoint.
+                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            }
+            (from_rev, total)
         };
-        if total > 0 {
+        if total > from_rev {
             // Announced once, after the commit: a partial, not-yet-durable range must never reach
-            // a subscriber, so this cannot happen per batch the way `append` does it.
+            // a subscriber, so this cannot happen per batch the way `append` does it. `from_rev`
+            // is always 0 here today (import refuses a non-empty store above), kept rather than a
+            // literal `1` so this stays correct if that restriction is ever relaxed.
             let _ = self.revs.send(RevRange {
-                from_rev: 1,
+                from_rev: from_rev + 1,
                 to_rev: total,
             });
         }
@@ -866,6 +908,22 @@ fn apply_projections(
 /// JSON errors, which the protocol types rule out.
 pub fn event_type(body: &EventBody) -> Result<String> {
     Ok(encode_body(body)?.0)
+}
+
+/// Whether an event with this id is already stored, queried on `conn` directly: the free-function
+/// form of [`Store::contains`], for a caller already inside [`Store::read`]'s closure (calling
+/// `Store::contains` there deadlocks, the same as `since` and `before` would — see `read`'s doc).
+/// [`Store::contains`] is this plus locking [`Store::reader`], for callers outside `read`.
+///
+/// # Errors
+///
+/// Database errors.
+pub fn contains(conn: &Connection, id: EventId) -> Result<bool> {
+    Ok(conn
+        .prepare_cached("SELECT 1 FROM events WHERE id = ?1")?
+        .query_row(rusqlite::params![id.0.to_string()], |_| Ok(()))
+        .optional()?
+        .is_some())
 }
 
 /// Up to `limit` events after `rev`, oldest first.

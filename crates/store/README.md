@@ -47,7 +47,9 @@ a fresh file at once both succeed and each migration runs once.
   indexed lookup — about the same as reading a single row of a `since`/`before` page, not a scan
   of the log. It runs on the same connection `since` and `before` do (the separate read-only
   connection in local mode, the write connection in network mode): do not call it inside `read`
-  (it deadlocks, for the same reason `since` and `before` do).
+  (it deadlocks, for the same reason `since` and `before` do). The free function
+  `pitcrew_store::contains(conn, id)` is the same query taking a connection directly, for a caller
+  already inside `read`'s closure: `store.read(|c| contains(c, id))`.
 - `subscribe()` is a `tokio::sync::broadcast` receiver of new revision ranges. When this `Store`
   is the only writer to the file, ranges arrive in order and contiguous; appends by another
   process are not announced. A receiver that falls behind gets `Lagged` and catches up with
@@ -119,7 +121,12 @@ being checkpointed. The closure's error type is anything a store `Error` convert
 `pitcrew_store::Result<T>`, where `?` on a `sql::Error` works.
 
 **Do not call `read`, `since` or `before` inside a `read` closure: it deadlocks** (they wait for
-the connection the closure holds). Appending inside one is fine.
+the connection the closure holds). **Appending (or calling `rebuild` or `register`) inside one is
+fine in local (WAL) mode** — `read` holds the separate reader connection's lock there, a different
+one from the write connection those take — **but deadlocks in network mode**, where there is no
+separate reader and `read` already holds the *write* connection's lock for the closure's whole
+duration: a write from the same thread waits for a lock it already holds, forever.
+`std::sync::Mutex` is not reentrant, and nothing here turns that into a clean error instead.
 
 **Closing.** The read connection closes before the write connection, so the writer is the last
 to close and checkpoints the WAL: no `-wal` or `-shm` file is left, and the `.db` alone holds
@@ -200,10 +207,14 @@ decides:
     a fresh `until_ms` (a plain temp-file-plus-rename onto its own name: safe, since nothing else
     ever touches it).
   - **Checked before every write, not just by the renewal thread's flag**: `Store`'s internal
-    `check_lease()` re-lists the lease directory fresh on every `append`, `rebuild` and `import` —
-    a cheap `readdir` and filename comparison, no file content to read — so a takeover is caught
-    immediately, not up to `lease_ttl / 3` later when the renewal thread would next notice on its
-    own. A displaced owner's very next write fails with `Error::LeaseLost`.
+    `check_lease()` re-lists the lease directory fresh on every `append`, `rebuild`, `register` and
+    `import` (`import` checks again before every batch's insert and once more right before its
+    final `COMMIT`, not only up front) — a cheap `readdir` and filename comparison, no file content
+    to read — so a takeover is caught immediately, not up to `lease_ttl / 3` later when the renewal
+    thread would next notice on its own. Checked only *after* the write connection's own lock is
+    taken, not before: another writer can hold that lock for a while (a long `import`, say), and a
+    check made before waiting for it would describe a lease that may no longer be current by the
+    time the wait ends. A displaced owner's very next write fails with `Error::LeaseLost`.
   - **`StoreOptions.clock`** (a `Clock`, defaulting to `SystemClock`) is where the lease gets the
     time; inject one in tests to expire a lease without sleeping.
   - **Release**: dropping the `Store` stops the renewal thread and deletes only its own generation
@@ -220,7 +231,16 @@ decides:
     choosing a `lease_ttl` with real margin over expected clock drift, cache staleness and routine
     scheduling delays — never fully solved by cleverness in this file alone. A filesystem that
     cannot hard-link at all (rare: some FAT-formatted shares) fails lease acquisition outright
-    rather than silently falling back to an unsafe check-then-write.
+    rather than silently falling back to an unsafe check-then-write. Also: `check_lease` failing
+    with `Error::LeaseLost` inside a transaction (mid-`import`, say) still has to unwind out of it,
+    and in network mode (`journal_mode=DELETE`, a rollback journal) rolling back is not a no-op —
+    SQLite writes the journal's saved page contents back into the main database file to undo what
+    the transaction already wrote. So this process still touches the file once more *after* it has
+    already learned another host may now own the lease; if that host's own writes land in the same
+    window, the two sets of writes to the same file are not ordered by anything this crate
+    controls. The per-write re-list narrows the window before this can happen (a loss is caught at
+    the start of the very next write, not just at its commit), but cannot close it: by the time
+    `Error::LeaseLost` is known, the rollback's own writes are still ahead of it, not behind it.
   - A store whose lease used the old, single fixed `<db>.lease` name has never shipped, so there
     is no migration to support.
 
@@ -235,28 +255,50 @@ decides:
   checks any plain connection (e.g. to a snapshot or a raw copy) without opening it as a `Store`,
   which would run migrations against a file that may be corrupt.
 - **`Store::export(writer)`** writes every event as one JSON line each (no revision: order is the
-  record), oldest first. **`Store::import(reader)`** loads those lines into an empty store
-  (`Error::NotEmpty` otherwise), inserting and applying them to every registered projection
-  through the same insert-and-apply path `append` uses, in batches of 1,000 lines so memory stays
-  bounded by one batch however long the file is — but, unlike `append` called once per batch, all
-  of it inside **one** write transaction, committed only at the very end. So an import is whole or
-  nothing (R7, `docs/security/threat-model.md`): a bad line, a lost lease, or any other failure
-  rolls every batch back, not just the one in progress, and `Store::latest_rev` reads 0 afterwards
-  — never a prefix of `reader`'s lines, and never the `Error::NotEmpty` a retry used to get from a
-  store a bad batch had already partly filled. Other designs considered: a staging table (rejected
-  — would need its own schema and a second copy of every row) and a fresh file renamed into place
-  (rejected — a second copy of the whole database on disk, and import would no longer reuse
-  `append`'s own insert-and-apply-projections path). One transaction instead reuses that path
-  exactly and gets "nothing or everything" on a real crash for free, from SQLite's own rollback
-  journal. Its cost: the write lock is held for the whole import rather than 1,000 lines at a
-  time; in local (WAL) mode this does not affect reads (they use the separate read connection
-  regardless), and in network mode — where reads already share the write connection — a very
-  large import blocks reads for longer than before, a reasonable trade for a rare, offline
-  operation. Measured: importing 10,000 events in one transaction took 370 ms, against 393 ms the
-  same 10,000 events took appended in ten separately committed batches of 1,000 (what the old
-  design did internally) — see "Timings" below. An import is a new log: `log_id` was already
-  assigned when the store was created, independently of import, so it differs from the exported
-  store's. Both are for tests and support, not sync.
+  record), oldest first. **`Store::import(reader)`** loads those lines into an empty store,
+  inserting and applying them to every registered projection through the same insert-and-apply
+  path `append` uses, one line at a time (a single line over 16 MiB is refused outright, so
+  neither a huge file nor one huge line forces unbounded memory) and in batches of 1,000 for the
+  inserts themselves — but, unlike `append` called once per batch, all of it inside **one** write
+  transaction, committed only at the very end. So an import is whole or nothing (R7,
+  `docs/security/threat-model.md`): a bad line, a lost lease, or any other failure rolls every
+  batch back, not just the one in progress, and `Store::latest_rev` reads 0 afterwards — never a
+  prefix of `reader`'s lines, and never the `Error::NotEmpty` a retry used to get from a store a
+  bad batch had already partly filled. The store-is-empty check itself runs from *inside* that
+  same transaction (not a separate `latest_rev()` call before it starts), so a concurrent writer
+  that commits in between cannot slip past it: nothing else can write while this transaction holds
+  the lock, so by the time the check runs, it is already seeing the true state the insert that
+  follows it will build on. The lease (network mode) is checked the same way: after the write
+  connection's lock is actually held (not before — a check made before waiting for a lock another
+  writer holds could describe a lease that is no longer current by the time the wait ends), again
+  before every batch's insert, and once more right before the final `COMMIT`, so a takeover during
+  the read of a large file, or during a short, single-batch import, is still caught before
+  anything commits. Other designs considered: a staging table (rejected — would need its own
+  schema and a second copy of every row) and a fresh file renamed into place (rejected — a second
+  copy of the whole database on disk, and import would no longer reuse `append`'s own
+  insert-and-apply-projections path). One transaction instead reuses that path exactly and gets
+  "nothing or everything" on a real crash for free, from SQLite's own rollback journal.
+
+  **Costs.** The write lock is held for the whole import, not 1,000 lines at a time. `since`,
+  `before` and `Store::read` are unaffected in local (WAL) mode (they use the separate read
+  connection regardless) but share the write connection, and so wait, in network mode, same as
+  always. **`Store::latest_rev` always uses the write connection, in *both* modes**, so it blocks
+  for the whole import even in local mode — the one place "local mode is unaffected" does not
+  hold. WAL mode writes every changed page to `-wal` before it is ever folded back into the main
+  file, so a large import's peak disk use is roughly double the data it imports, and `-wal` is left
+  that size afterwards (there is no `journal_size_limit` set): `import` runs
+  `PRAGMA wal_checkpoint(TRUNCATE)` itself, right after a successful commit, local mode only, so
+  this does not linger past the call that caused it. (`synchronous=NORMAL` does not mean "no
+  fsync" the way it might for a single short transaction in rollback-journal mode: in WAL mode its
+  fsyncs happen at *checkpoint* time, not at every commit, so one long transaction is not simply
+  saving several commits' worth of fsyncs — see "Timings" for what a long import actually measured
+  against many short ones, about the same either way, not a reliable win from this.) Importing is
+  a rare, offline operation (support and tests, not sync, per its own doc), so these trade-offs
+  favour correctness. An import is a new log: `log_id` was already assigned when the store was
+  created, independently of import, so it differs from the exported store's. Both are for tests
+  and support, not sync. A successful import sends subscribers one announcement for the whole
+  range, not one per internal batch — a partial, not-yet-durable range must never reach a
+  subscriber, which ruled out announcing per batch the way `append` does.
 
 ## Timings
 
@@ -278,12 +320,16 @@ Measured 2026-09-30 on a laptop (Intel Core Ultra 5 135U, 14 threads, 16 GB), WS
 With other agents building on the same machine, worst pages reached about 10–13 ms, for `main`'s
 code as well; the targets hold on an idle machine.
 
-Import (R7, `docs/build/briefs/C-import-and-reopen.md`), measured 2026-10-01, one run, on a
-machine shared with several other agents building at once (not the idle machine above, so these
-are one-off numbers, not a mean over several runs — the point is the comparison between the two,
-not either figure alone):
+**Import (R7, `docs/build/briefs/C-import-and-reopen.md`): about the same as the old per-batch
+design, not reliably faster or slower.** Measured 2026-10-01, one run each (not six, and not the
+idle machine above: a machine shared with several other agents building at once, same laptop
+model), `tests/perf.rs`'s `import_10k_compares_to_ten_committed_batches`:
 
 | Operation | Took |
 |---|---|
 | `import`, 10,000 events, one transaction (the current design) | 370 ms |
 | The same 10,000 events, `append`ed in ten separately committed batches of 1,000 (the old design's cost) | 393 ms |
+
+One run under shared load is not a controlled measurement — these numbers say "the same order of
+magnitude," not "370 ms beats 393 ms." Re-run on an idle machine before relying on a specific
+figure.
