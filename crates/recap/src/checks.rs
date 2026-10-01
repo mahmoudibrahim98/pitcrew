@@ -1,21 +1,12 @@
 //! Rules that read tool runs and text: which commands are checks (tests, builds, lint), and which
 //! texts report a diverged job. They are plain keyword rules over untrusted text, so they only
 //! ever look at a bounded prefix, never allocate and never fail.
+//!
+//! [`Check`] is a wire type (facts carry it), so it lives in `pitcrew_protocol::recap`.
 
 use crate::text::{TARGET_CHARS, basename, prefix};
-use serde::{Deserialize, Serialize};
 
-/// A kind of check a command runs. The order is the strength used for command chains.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Check {
-    /// A test suite, e.g. `cargo test` or `pytest`.
-    Tests,
-    /// A linter or type checker, e.g. `cargo clippy` or `ruff`.
-    Lint,
-    /// A build or compile, e.g. `cargo build` or `latexmk`.
-    Build,
-}
+pub use pitcrew_protocol::recap::Check;
 
 /// Programs that are test runners on their own.
 const TEST_PROGRAMS: &[&str] = &[
