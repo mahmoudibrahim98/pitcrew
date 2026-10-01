@@ -70,7 +70,7 @@ lazily, for the workbench).
 
 | File | What |
 |---|---|
-| `terminal/socket.ts` | `TerminalSocket`, no React: the connection, reconnects by offset, keystrokes and resizes (below). `browserSocketFactory` opens browser WebSockets. |
+| `terminal/socket.ts` | `TerminalSocket`, no React: the connection, reconnects by offset, keystrokes and resizes (below), on sockets from the data layer's `useOpenSocket()`. |
 | `terminal/diagnose.ts` | Why the hub refused a terminal, asked over HTTP (below). |
 | `terminal/controller.ts` | `TerminalController`, no React: xterm, its addons, fit, theme and font, input by mode, flow control, and disposal. |
 | `terminal/terminal-view.tsx` | `TerminalView`: the mode, Take control and Release, the status and Try again, the screen reader setting, the truncated marker, and the frame xterm draws in. |
@@ -82,14 +82,15 @@ lazily, for the workbench).
 
 ### The connection
 
-- **Sockets by path.** `TerminalSocket` asks a factory for an API path
-  (`/v1/sessions/{id}/terminal?cols=&rows=&from=`), never a URL. `browserSocketFactory` puts it on
-  the hub's base (`ws:` or `wss:`, a path prefix kept) and offers the subprotocols `pitcrew.v1` and
-  `pitcrew.bearer.<token>`. **The token never goes in the URL.** The desktop app will pass its
-  gateway's opener instead (`docs/build/contracts/desktop-gateway.md`), through `TerminalView`'s
-  `socket` prop. A factory's sockets must deliver binary frames as `ArrayBuffer`s (or typed
-  arrays): a `Blob` is not read, so a browser WebSocket needs `binaryType = 'arraybuffer'`, as
-  `browserSocketFactory` sets.
+- **Sockets by path, through the data layer.** `TerminalSocket` asks an opener for an API path
+  (the data layer's `terminalPath(session, { cols, rows, from })`), never a URL, and the opener is
+  `useOpenSocket()` (`src/data/README.md`, "Sockets for features"): a browser WebSocket in
+  development, with the token only as the `pitcrew.bearer.` subprotocol and never in the URL; the
+  desktop gateway in the app, which adds the token itself, so the console reads no token at all.
+  Tests pass a fake through `TerminalView`'s `socket` prop. An opener's sockets deliver text as
+  strings and binary frames as `ArrayBuffer`s (typed arrays are read too; a `Blob` is not), and
+  report every close, the one asked for included, so the terminal detaches its handlers before it
+  closes a socket.
 - **No byte lost or repeated.** It counts the output bytes received and reconnects with
   `from=<count>`. `{"type":"truncated","from":N}` moves the count to N (the hub no longer has the
   bytes between), and the view shows "Earlier output is no longer available." as a line at the top
@@ -97,8 +98,9 @@ lazily, for the workbench).
   screen is left as it drew it, and a clear-screen cannot erase the marker. Only a CAN (0x18) goes
   to xterm there, uncounted, so an escape sequence the gap cut cannot swallow the output after it.
 - **The end.** `{"type":"exit"}` or a 1000 close: "The program ended." It never reconnects.
-- **Close codes.** 1007, 1009 and 1011 (and 1002, 1003, 1008) stop with the reason, the hub's
-  close reason after it. 1001, 1013, 1006 and anything else reconnect.
+- **Close codes.** 1007, 1009 and 1011 (and 1002, 1003, 1008) stop with the reason, the close's
+  own reason after it. 1011 is the hub's runtime failing, or the desktop gateway failing to send a
+  frame ("The terminal failed (send failed).") 1001, 1013, 1006 and anything else reconnect.
 - **A refused upgrade.** A browser shows every refused upgrade as a 1006 close before `open`; the
   HTTP status is hidden. So after one, `terminalDiagnosis` asks the hub as it decides: the session
   (404: "This session no longer exists."), its machine (503: "gpu-box cannot be reached right now,
@@ -110,8 +112,8 @@ lazily, for the workbench).
     is found, and it reconnects.
   - If the hub answers and nothing explains the refusal, it reconnects, but after 5 such refusals
     in a row it stops: "The hub refused the terminal."
-  - A transport that knows the status (the desktop gateway) passes it in the close event, and 400,
-    401, 403, 404 and 503 stop without asking.
+  - In the desktop app the gateway already says why (the close carries its `GatewayError`), so
+    the terminal stops with that reason and asks the hub nothing.
 - **An attempt that hangs.** One that has not opened after 10 s (a stuck hub, a half-open tunnel)
   is closed and treated as refused, so "Connecting…" never lasts.
 - **Back-off.** Attempt n waits `min(15 s, 500 ms × 2ⁿ)` times 0.5–1 (jitter), and starts over
@@ -119,8 +121,8 @@ lazily, for the workbench).
   not reconnect at all; it reconnects at once when the page is visible and online again.
 - **Trying again.** A stopped terminal has a "Try again" button, which reconnects from the bytes
   received with the back-off starting over. It also tries again by itself when the session's
-  machine comes back (its liveness returns to `live`). Nothing else restarts it, so a stop is
-  never a loop.
+  machine comes back (its liveness returns to `live`) or, in the desktop app, when the gateway's
+  workspace is `ready` again. Nothing else restarts it, so a stop is never a loop.
 - **Keystrokes** are binary frames of at most 64 KiB (UTF-8 from `TextEncoder`; X10 mouse reports
   byte for byte). While connected, up to 1 MiB at once (a paste) is sent, in 64 KiB frames, unless
   as much is still waiting to go out on a slow connection. While disconnected they wait, 64 KiB at

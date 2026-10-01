@@ -463,7 +463,7 @@ describe('TerminalView', () => {
     const { sockets } = await live();
     act(() => sockets.last().output('abc'));
     act(() => sockets.last().drop(1011, 'input write timed out'));
-    expect(status()).toBe('The terminal failed on its machine. (input write timed out)');
+    expect(status()).toBe('The terminal failed (input write timed out).');
     expect(sockets.sockets).toHaveLength(1);
     fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
     expect(sockets.sockets).toHaveLength(2);

@@ -3,10 +3,9 @@
 // keystroke cap, resizes, and the token kept out of the URL.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, type Machine, type Session } from '../../data/index.ts';
+import { ApiError, createApi, GatewayError, type Machine, type Session } from '../../data/index.ts';
 import { terminalDiagnosis } from '../terminal/diagnose.ts';
 import {
-  browserSocketFactory,
   INPUT_LIMIT,
   SEND_LIMIT,
   TerminalSocket,
@@ -64,48 +63,32 @@ afterEach(() => {
 });
 
 describe('the terminal path and the token', () => {
-  it('puts the token only in the subprotocols, never in the URL', () => {
+  it("through the data layer's browser transport, the token is only a subprotocol", () => {
     const opened: { url: string; protocols: string[] }[] = [];
-    const factory = browserSocketFactory({
-      baseUrl: 'http://127.0.0.1:47317',
+    const api = createApi({
+      baseUrl: 'https://hub.example.test/pitcrew',
       token: 'secret-device-token',
-      create: (url, protocols) => {
+      socket: (url, protocols) => {
         opened.push({ url, protocols });
         return new FakeSocket(url);
       },
     });
-    factory(terminalPath('01JB000000000000000SES0001', { cols: 120, rows: 40 }, 4096));
+    api.transport.openSocket(terminalPath('01JB000000000000000SES0001', { cols: 120, rows: 40 }, 4096));
     expect(opened).toEqual([
       {
-        url: 'ws://127.0.0.1:47317/v1/sessions/01JB000000000000000SES0001/terminal?cols=120&rows=40&from=4096',
+        url: 'wss://hub.example.test/pitcrew/v1/sessions/01JB000000000000000SES0001/terminal?cols=120&rows=40&from=4096',
         protocols: ['pitcrew.v1', 'pitcrew.bearer.secret-device-token'],
       },
     ]);
     expect(opened[0]?.url).not.toContain('secret');
   });
 
-  it('keeps a path prefix, uses wss for https, and offers no bearer without a token', () => {
-    const opened: { url: string; protocols: string[] }[] = [];
-    const factory = browserSocketFactory({
-      baseUrl: 'https://hub.example.test/pitcrew/',
-      create: (url, protocols) => {
-        opened.push({ url, protocols });
-        return new FakeSocket(url);
-      },
-    });
-    factory(terminalPath('a/b', { cols: 80, rows: 24 }, 0));
-    expect(opened).toEqual([
-      { url: 'wss://hub.example.test/pitcrew/v1/sessions/a%2Fb/terminal?cols=80&rows=24&from=0', protocols: ['pitcrew.v1'] },
-    ]);
-  });
-
-  it('asks the factory for a path with the size and the offset, never a URL or a token', () => {
-    const { terminal, last } = setup();
+  it('asks the opener for a path with the clamped size and the offset, never a URL or a token', () => {
+    const { terminal, last } = setup({ size: { cols: 5_000, rows: 0 } });
     terminal.start();
-    expect(last().path).toBe('/v1/sessions/01JB000000000000000SES0001/terminal?cols=80&rows=24&from=0');
+    expect(last().path).toBe('/v1/sessions/01JB000000000000000SES0001/terminal?cols=1000&rows=1&from=0');
   });
 });
-
 describe('output', () => {
   it('is counted across reconnects, with no byte lost or repeated', async () => {
     // A hub whose terminal has produced `produced`; each connection replays from its `from`.
@@ -209,7 +192,7 @@ describe('close codes', () => {
   it.each([
     [1007, 'malformed control message'],
     [1009, 'too large'],
-    [1011, 'failed on its machine'],
+    [1011, 'The terminal failed'],
   ])('%i stops, says why, and never loops', async (code, words) => {
     const { terminal, sockets, statuses, last } = setup();
     terminal.start();
@@ -274,17 +257,32 @@ describe('close codes', () => {
     expect(sockets).toHaveLength(2);
   });
 
-  it('a transport that knows the HTTP status (503, 404) stops without asking', async () => {
-    for (const code of [503, 404]) {
-      const diagnose = vi.fn(async () => undefined);
+  it("a close that carries the desktop gateway's reason stops with it, without asking the hub", async () => {
+    for (const error of [
+      new GatewayError('unreachable', 'hpc-login cannot be reached: the daemon answered 503.'),
+      new GatewayError('needs_pairing', 'Pair this workspace again.'),
+    ]) {
+      const diagnose = vi.fn(async (): Promise<Diagnosis> => undefined);
       const { terminal, sockets, statuses, last } = setup({ diagnose });
       terminal.start();
-      last().drop(1006, '', code);
-      expect(status(statuses)).toMatchObject({ kind: 'stopped', status: code });
+      last().drop(1006, '', error);
+      expect(status(statuses)).toEqual({ kind: 'stopped', reason: error.message, code: 1006 });
       await vi.advanceTimersByTimeAsync(60_000);
       expect(sockets).toHaveLength(1);
       expect(diagnose).not.toHaveBeenCalled();
     }
+  });
+
+  it("a 1011 from the gateway (a frame it could not send) stops, and Try again reconnects", async () => {
+    const { terminal, sockets, statuses, last } = setup();
+    terminal.start();
+    last().open();
+    last().output('abc');
+    last().drop(1011, 'send failed');
+    expect(status(statuses)).toEqual({ kind: 'stopped', reason: 'The terminal failed (send failed).', code: 1011 });
+    terminal.retry();
+    expect(sockets).toHaveLength(2);
+    expect(last().from).toBe(3);
   });
 
   it('a diagnosis that lands after stop() is ignored', async () => {

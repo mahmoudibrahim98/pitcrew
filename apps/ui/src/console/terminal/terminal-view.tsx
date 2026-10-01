@@ -10,13 +10,12 @@ import {
   useEffect,
   useEffectEvent,
   useId,
-  useMemo,
   useRef,
   useState,
   type FocusEvent,
   type KeyboardEvent,
 } from 'react';
-import { apiToken, useApi, useMachines, useSession } from '../../data/index.ts';
+import { useApi, useGatewayWorkspace, useMachines, useOpenSocket, useSession } from '../../data/index.ts';
 import { Button, Kbd } from '../../design/index.ts';
 import { cx } from '../../lib/cx.ts';
 import { isMac } from '../../lib/platform.ts';
@@ -27,7 +26,6 @@ import { terminalDiagnosis } from './diagnose.ts';
 import { RELEASE_KEYS, RELEASE_LABEL, RELEASE_SHORTCUT, viewModeKey } from './keys.ts';
 import { useTerminalPrefs } from './prefs.ts';
 import {
-  browserSocketFactory,
   INPUT_LIMIT,
   SEND_LIMIT,
   type SendResult,
@@ -39,8 +37,8 @@ import {
 export interface TerminalViewProps {
   sessionId: string;
   /**
-   * Opens the terminal socket for an API path. By default a browser WebSocket on the hub, with
-   * the token as a subprotocol; the desktop app passes its gateway's.
+   * Opens the terminal socket for an API path. By default the data layer's `useOpenSocket()`: a
+   * browser WebSocket in development, the desktop gateway in the app. Tests pass a fake.
    */
   socket?: TerminalSocketFactory | undefined;
   /** For tests: the socket's back-off, environment and timings. */
@@ -111,20 +109,22 @@ export function TerminalView({ sessionId, socket, socketOptions, className }: Te
   const [linkHint, setLinkHint] = useState<string | undefined>();
   const hintId = useId();
 
-  const browserSockets = useMemo(() => browserSocketFactory({ baseUrl: api.baseUrl, token: apiToken }), [api]);
+  const openTransportSocket = useOpenSocket();
   const canControl = canTakeInput(status);
   const effective: TerminalMode = canControl ? mode : 'view';
   const control = effective === 'control';
 
-  // Whether the session's machine can be reached, once both are known.
+  // Whether the session's machine can be reached, once both are known (and, in the desktop app,
+  // whether the gateway can reach the workspace's daemon).
   const session = useSession(sessionId);
   const machines = useMachines();
+  const workspace = useGatewayWorkspace();
   const machineId = session.data?.machine;
   const liveness = machines.data?.find((m) => m.id === machineId)?.liveness;
   const reachable =
     session.data === undefined || liveness === undefined
       ? undefined
-      : liveness === 'live' && session.data.state !== 'unreachable';
+      : liveness === 'live' && session.data.state !== 'unreachable' && (workspace?.state ?? 'ready') === 'ready';
 
   const takeControl = () => {
     const c = controller.current;
@@ -145,7 +145,7 @@ export function TerminalView({ sessionId, socket, socketOptions, className }: Te
   };
 
   // Callbacks for the controller: always the latest state, without recreating it.
-  const openSocket = useEffectEvent((path: string) => (socket ?? browserSockets)(path));
+  const openSocket = useEffectEvent((path: string) => (socket ?? openTransportSocket)(path));
   const openLink = useEffectEvent((url: string) => openExternal(url));
   const machineOf = useEffectEvent(() => machineId);
   const onRelease = useEffectEvent(() => release());
@@ -173,7 +173,8 @@ export function TerminalView({ sessionId, socket, socketOptions, className }: Te
     controller.current?.setScreenReader(screenReader);
   }, [screenReader]);
 
-  // The machine came back: a terminal that stopped while it was away tries again.
+  // The machine (or the workspace) came back: a terminal that stopped while it was away tries
+  // again.
   const wasReachable = useRef<boolean | undefined>(undefined);
   useEffect(() => {
     const was = wasReachable.current;

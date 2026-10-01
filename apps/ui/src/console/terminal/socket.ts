@@ -4,12 +4,11 @@
 // disconnected; and sends debounced, clamped resizes only when the size changed. A stopped
 // terminal tries again only when asked (`retry()`).
 //
-// It opens sockets through a factory that takes an API path, never a URL: the browser factory
-// (`browserSocketFactory`) puts the path on the hub's base URL and the token in a subprotocol, and
-// the desktop app's gateway will take the path as it is.
+// It opens sockets through an opener that takes an API path, never a URL: the data layer's
+// `useOpenSocket()`, which goes through the browser's WebSocket (with the token as a subprotocol)
+// or the desktop app's gateway (which adds the token itself). Tests pass a fake.
 
-export const SUBPROTOCOL = 'pitcrew.v1';
-const BEARER_PREFIX = 'pitcrew.bearer.';
+import { terminalPath as dataTerminalPath, type SocketClose, type TransportSocket } from '../../data/index.ts';
 
 /** The most keystroke bytes held while disconnected, and the largest frame sent. */
 export const INPUT_LIMIT = 64 * 1024;
@@ -26,40 +25,18 @@ export interface TerminalSize {
   rows: number;
 }
 
-/** How a socket closed. */
-export interface CloseInfo {
-  code: number;
-  reason?: string | undefined;
-  /** The HTTP status of a refused upgrade, when the transport knows it (a browser never does). */
-  status?: number | undefined;
-}
-
-/** The part of a WebSocket the terminal uses; tests and the desktop gateway pass their own. */
-export interface TerminalSocketLike {
-  onopen: (() => void) | null;
-  /**
-   * Text frames as strings; binary frames as an `ArrayBuffer` (or a typed array). A `Blob` is not
-   * read, so a browser WebSocket needs `binaryType = 'arraybuffer'`, as `browserSocketFactory` sets.
-   */
-  onmessage: ((message: { data: unknown }) => void) | null;
-  onclose: ((event: CloseInfo) => void) | null;
-  onerror: (() => void) | null;
-  /** Bytes given to `send` and not yet on the wire. */
-  readonly bufferedAmount?: number;
-  send(data: string | Uint8Array): void;
-  close(code?: number, reason?: string): void;
-}
-
 /**
- * Opens a socket for an API path such as `/v1/sessions/{id}/terminal?cols=80&rows=24&from=0`. The
- * socket must deliver binary frames as `ArrayBuffer`s (see `TerminalSocketLike.onmessage`).
+ * Opens a socket for an API path such as `/v1/sessions/{id}/terminal?cols=80&rows=24&from=0`: the
+ * data layer's `useOpenSocket()`. Its sockets deliver text frames as strings and binary frames as
+ * `ArrayBuffer`s (typed arrays are read too; a `Blob` is not), and report every close, the one
+ * asked for included, so the terminal detaches its handlers before closing one.
  */
-export type TerminalSocketFactory = (path: string) => TerminalSocketLike;
+export type TerminalSocketFactory = (path: string) => TransportSocket;
 
 /** Why the hub will not serve this terminal; reconnecting cannot help. */
 export interface TerminalProblem {
-  /** The HTTP status it stands for (404, 503, …). */
-  status: number;
+  /** The HTTP status it stands for (404, 503, …), when there is one. */
+  status?: number | undefined;
   message: string;
 }
 
@@ -114,14 +91,13 @@ export const browserEnvironment: Environment = {
   },
 };
 
-/** The API path of a terminal; the size is clamped as the hub requires. */
+/** The data layer's terminal path, with the size clamped as the hub requires. */
 export function terminalPath(sessionId: string, size: TerminalSize, from: number): string {
-  const query = new URLSearchParams({
-    cols: String(clampSize(size.cols) ?? 80),
-    rows: String(clampSize(size.rows) ?? 24),
-    from: String(Math.max(0, Math.floor(from))),
+  return dataTerminalPath(sessionId, {
+    cols: clampSize(size.cols) ?? 80,
+    rows: clampSize(size.rows) ?? 24,
+    from: Math.max(0, Math.floor(from)),
   });
-  return `/v1/sessions/${encodeURIComponent(sessionId)}/terminal?${query.toString()}`;
 }
 
 /** A whole number of cells within 1..=1000, or undefined for something that is not a number. */
@@ -130,51 +106,16 @@ export function clampSize(value: number): number | undefined {
   return Math.min(MAX_SIZE, Math.max(MIN_SIZE, Math.round(value)));
 }
 
-export interface BrowserSocketOptions {
-  /** The API base, for example `http://127.0.0.1:47317`; the scheme becomes `ws:` or `wss:`. */
-  baseUrl: string;
-  /** Sent only as the `pitcrew.bearer.<token>` subprotocol, never in the URL. */
-  token?: string | undefined;
-  /** What `new WebSocket(url, protocols)` does; tests pass their own. */
-  create?: (url: string, protocols: string[]) => TerminalSocketLike;
-}
-
-function openWebSocket(url: string, protocols: string[]): TerminalSocketLike {
-  const socket = new WebSocket(url, protocols);
-  socket.binaryType = 'arraybuffer';
-  return socket as unknown as TerminalSocketLike;
-}
-
-/** Opens browser WebSockets on the hub, relative to its base (so a path prefix is kept). */
-export function browserSocketFactory(options: BrowserSocketOptions): TerminalSocketFactory {
-  const base = options.baseUrl.endsWith('/') ? options.baseUrl : `${options.baseUrl}/`;
-  const create = options.create ?? openWebSocket;
-  return (path) => {
-    const url = new URL(path.replace(/^\/+/, ''), base);
-    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
-    const protocols = [SUBPROTOCOL];
-    if (options.token !== undefined) protocols.push(BEARER_PREFIX + options.token);
-    return create(url.toString(), protocols);
-  };
-}
-
 /** Close codes after which reconnecting cannot help, and what they mean to a person. */
 const FATAL_CLOSE: Readonly<Record<number, string>> = {
-  1002: 'The hub reported a protocol error.',
-  1003: 'The hub refused a message it cannot read.',
-  1007: 'The hub refused a malformed control message.',
-  1008: 'The hub refused the connection.',
-  1009: 'A message was too large for the hub.',
-  1011: 'The terminal failed on its machine.',
-};
-
-/** Statuses of a refused upgrade that reconnecting cannot fix. */
-const FATAL_STATUS: Readonly<Record<number, string>> = {
-  400: 'The hub refused the request for the terminal.',
-  401: 'The hub refused this token, so the terminal cannot be shown.',
-  403: 'The hub refused this token, so the terminal cannot be shown.',
-  404: 'This session has no terminal.',
-  503: 'Its machine cannot be reached right now, so the terminal cannot be shown.',
+  1002: 'The hub reported a protocol error',
+  1003: 'The hub refused a message it cannot read',
+  1007: 'The hub refused a malformed control message',
+  1008: 'The hub refused the connection',
+  1009: 'A message was too large for the hub',
+  // The hub's runtime failing (an input write or a runtime call timing out), or the desktop
+  // gateway failing to send a frame.
+  1011: 'The terminal failed',
 };
 
 export interface TerminalSocketOptions {
@@ -226,7 +167,7 @@ export class TerminalSocket {
   #done = false;
   /** `stop()` was called: nothing ever starts again. */
   #closedByOwner = false;
-  #socket: TerminalSocketLike | undefined;
+  #socket: TransportSocket | undefined;
   #open = false;
   #everOpened = false;
   /** Output bytes received: the offset of the next one, and the next connection's `from`. */
@@ -311,8 +252,10 @@ export class TerminalSocket {
     if (bytes.byteLength === 0) return 'sent';
     const socket = this.#socket;
     if (socket !== undefined && this.#open && this.#queue.length === 0) {
-      // A connection that is not draining what it was given is not handed more.
-      if ((socket.bufferedAmount ?? 0) + bytes.byteLength > SEND_LIMIT) return 'refused';
+      // A connection that is not draining what it was given is not handed more (when the socket
+      // says how much it holds: a browser WebSocket does; the transports do not, yet).
+      const buffered = (socket as { bufferedAmount?: unknown }).bufferedAmount;
+      if ((typeof buffered === 'number' ? buffered : 0) + bytes.byteLength > SEND_LIMIT) return 'refused';
       for (let at = 0; at < bytes.byteLength; at += INPUT_LIMIT) socket.send(bytes.subarray(at, at + INPUT_LIMIT));
       return 'sent';
     }
@@ -364,7 +307,7 @@ export class TerminalSocket {
       return;
     }
     const size = this.#size;
-    let socket: TerminalSocketLike;
+    let socket: TransportSocket;
     try {
       socket = this.#options.socket(terminalPath(this.#options.sessionId, size, this.#received));
     } catch {
@@ -406,11 +349,11 @@ export class TerminalSocket {
     socket.onmessage = (message) => {
       if (socket === this.#socket) this.#receive(message.data);
     };
-    socket.onclose = (event) => {
+    socket.onclose = (close) => {
       if (socket !== this.#socket) return;
       const wasOpen = this.#open;
       this.#detach();
-      this.#closed(event, wasOpen);
+      this.#closed(close ?? { code: 1006, reason: '' }, wasOpen);
     };
     // A close always follows an error.
     socket.onerror = () => {};
@@ -446,7 +389,7 @@ export class TerminalSocket {
     // Other types are for newer clients.
   }
 
-  #closed(event: CloseInfo, wasOpen: boolean): void {
+  #closed(event: SocketClose, wasOpen: boolean): void {
     if (this.#done) return;
     this.#clearStable();
     if (event.code === 1000) {
@@ -455,18 +398,19 @@ export class TerminalSocket {
     }
     const fatal = FATAL_CLOSE[event.code];
     if (fatal !== undefined) {
-      const reason = event.reason === undefined || event.reason === '' ? fatal : `${fatal} (${event.reason})`;
+      const reason = event.reason === '' ? `${fatal}.` : `${fatal} (${event.reason}).`;
       this.#finish({ kind: 'stopped', reason, code: event.code });
       return;
     }
     if (!wasOpen) {
-      // The upgrade failed. A transport that knows the HTTP status says so; a browser does not.
-      const known = event.status === undefined ? undefined : FATAL_STATUS[event.status];
-      if (known !== undefined && event.status !== undefined) {
-        this.#finish({ kind: 'stopped', reason: known, code: event.code, status: event.status });
+      // It never opened. The desktop gateway says why (its `GatewayError`); a browser does not, so
+      // then the hub is asked.
+      if (event.error !== undefined) {
+        const reason = event.error.message.trim() === '' ? 'The terminal could not be opened.' : event.error.message;
+        this.#finish({ kind: 'stopped', reason, code: event.code });
         return;
       }
-      if (event.status === undefined && this.#options.diagnose !== undefined) {
+      if (this.#options.diagnose !== undefined) {
         this.#diagnose(this.#options.diagnose);
         return;
       }
@@ -487,7 +431,11 @@ export class TerminalSocket {
         if (this.#unexplained >= MAX_UNEXPLAINED) this.#finish({ kind: 'stopped', reason: 'The hub refused the terminal.' });
         else this.#retry();
       } else {
-        this.#finish({ kind: 'stopped', reason: found.message, status: found.status });
+        this.#finish({
+          kind: 'stopped',
+          reason: found.message,
+          ...(found.status === undefined ? {} : { status: found.status }),
+        });
       }
     };
     diagnose().then(settle, () => settle(undefined));
@@ -512,7 +460,7 @@ export class TerminalSocket {
     else if (blocked !== this.#status.why) this.#setStatus({ kind: 'waiting', why: blocked });
   }
 
-  #flush(socket: TerminalSocketLike): void {
+  #flush(socket: TransportSocket): void {
     const queue = this.#queue;
     this.#queue = [];
     this.#queued = 0;
@@ -548,7 +496,7 @@ export class TerminalSocket {
   }
 
   /** Forgets the current socket so its late callbacks are ignored, and returns it. */
-  #detach(): TerminalSocketLike | undefined {
+  #detach(): TransportSocket | undefined {
     const socket = this.#socket;
     this.#socket = undefined;
     this.#open = false;

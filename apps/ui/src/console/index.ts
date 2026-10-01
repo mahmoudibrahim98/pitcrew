@@ -120,4 +120,4 @@ export type { SessionFiltersProps } from './session-filters.tsx';
 export type { SessionHeaderProps } from './session-header.tsx';
 export type { SelectVia, SessionListProps, SessionListViewProps } from './session-list.tsx';
 export type { TerminalViewProps } from './terminal/terminal-view.tsx';
-export type { TerminalSocketFactory, TerminalSocketLike } from './terminal/socket.ts';
+export type { TerminalSocketFactory } from './terminal/socket.ts';

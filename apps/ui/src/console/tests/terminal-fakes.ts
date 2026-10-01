@@ -1,17 +1,19 @@
 // Fakes for the terminal's tests: a socket the test drives from the hub's side, and the page's
 // visibility and network state.
 
-import type { CloseInfo, Environment, TerminalSocketLike } from '../terminal/socket.ts';
+import type { ApiError, SocketClose, TransportSocket } from '../../data/index.ts';
+import type { Environment } from '../terminal/socket.ts';
 
 const encoder = new TextEncoder();
 
-export class FakeSocket implements TerminalSocketLike {
+/** A transport socket (what `useOpenSocket()` opens), driven from the hub's side by the test. */
+export class FakeSocket implements TransportSocket {
   onopen: (() => void) | null = null;
   onmessage: ((message: { data: unknown }) => void) | null = null;
-  onclose: ((event: CloseInfo) => void) | null = null;
+  onclose: ((close?: SocketClose) => void) | null = null;
   onerror: (() => void) | null = null;
   bufferedAmount = 0;
-  readonly sent: (string | Uint8Array)[] = [];
+  readonly sent: (string | ArrayBuffer | Uint8Array)[] = [];
   closedWith: { code: number | undefined; reason: string | undefined } | undefined;
   readonly path: string;
 
@@ -19,7 +21,7 @@ export class FakeSocket implements TerminalSocketLike {
     this.path = path;
   }
 
-  send(data: string | Uint8Array): void {
+  send(data: string | ArrayBuffer | Uint8Array): void {
     this.sent.push(data);
   }
 
@@ -50,8 +52,9 @@ export class FakeSocket implements TerminalSocketLike {
     this.onmessage?.({ data: JSON.stringify(frame) });
   }
 
-  drop(code = 1006, reason = '', status?: number): void {
-    this.onclose?.({ code, reason, ...(status === undefined ? {} : { status }) });
+  /** Ends it, as the transport reports it: `error` is why it never opened, when known. */
+  drop(code = 1006, reason = '', error?: ApiError): void {
+    this.onclose?.({ code, reason, ...(error === undefined ? {} : { error }) });
   }
 
   /** Text frames sent (control messages), parsed. */
@@ -61,7 +64,7 @@ export class FakeSocket implements TerminalSocketLike {
 
   /** Binary frames sent (keystrokes), as one byte array. */
   get keys(): number[] {
-    return this.sent.filter((d): d is Uint8Array => typeof d !== 'string').flatMap((d) => [...d]);
+    return this.sent.filter((d) => typeof d !== 'string').flatMap((d) => [...new Uint8Array(d)]);
   }
 }
 
