@@ -384,7 +384,10 @@ mod tests {
         let old = at("/h/p/old-s1.jsonl", None, 9);
         let exact = at("/h/p/s1.jsonl", None, 1);
         let first = Recorded::new(Arc::new(Lists(vec![old.clone()])), Arc::clone(&found));
-        assert_eq!(first.discover(FsPath::new("/h")).unwrap(), vec![old.clone()]);
+        assert_eq!(
+            first.discover(FsPath::new("/h")).unwrap(),
+            vec![old.clone()]
+        );
         assert_eq!(
             found.find(Engine::Claude, "s1").map(|f| f.1),
             Some(old.clone())
