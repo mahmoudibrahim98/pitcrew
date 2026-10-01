@@ -8,12 +8,13 @@
 //! file renamed over it):
 //!
 //! ```json
-//! {"pid":4242,"host":"login01","version":"1.4.0","started":1790850391000,"launcher":"direct","socket":"/home/someone/.pitcrew/run/pitcrewd.sock"}
+//! {"pid":4242,"host":"login01-0123456789ab","version":"1.4.0","started":1790850391000,"launcher":"direct","socket":"/home/someone/.pitcrew/run/pitcrewd.sock"}
 //! ```
 //!
-//! `host` is `uname -n`: on clusters whose login nodes share `$HOME`, a pid means something
-//! only on the host that recorded it. A record from another host is never acted on from here
-//! ([`HelperError::OtherHost`]) unless [`LaunchOptions::take_over`] says so.
+//! `host` is `uname -n` and the machine's id: on clusters whose login nodes share `$HOME`, a pid
+//! means something only on the host that recorded it, and two sites may have hosts of one name.
+//! A record from another host is never acted on from here ([`HelperError::OtherHost`]) unless
+//! [`LaunchOptions::take_over`] says so.
 //!
 //! Every operation is idempotent: starting a running helper returns its endpoint; stopping a
 //! stopped one does nothing. Start and stop take the launch lock (`run/.lock`); status takes
@@ -130,7 +131,9 @@ impl LaunchOptions {
 pub struct Endpoint {
     /// Its process id, on `host`.
     pub pid: u32,
-    /// The host it runs on (`uname -n`).
+    /// The host it runs on: for the direct and tmux launchers, `uname -n` (other characters
+    /// made `_`) and the machine's id, e.g. `login01-0123456789ab`; for the SLURM launcher, the
+    /// compute node's name as the login node reaches it.
     pub host: String,
     /// The version started (what `bin/current` pointed to).
     pub version: String,

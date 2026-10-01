@@ -57,7 +57,7 @@ pub use site::{
     generic, load_site, load_sites, sites_dir,
 };
 pub use spec::{
-    ALLOWED_SBATCH, DEFAULT_JOB_WAIT, JobOptions, JobScript, JobSpec, WallTime,
+    ALLOWED_SBATCH, DEFAULT_JOB_WAIT, JobOptions, JobScript, JobSpec, SBATCH_FLAGS, WallTime,
     check_sbatch_option, default_job_name, format_wall_time, parse_wall_time,
 };
 

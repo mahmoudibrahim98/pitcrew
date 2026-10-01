@@ -14,7 +14,8 @@ Everything goes through the user's own **system OpenSSH** and `~/.ssh/config`.
   bounded (`RESOLVE_LIMITS`: 10 s, 1 MiB).
 - `Ssh::run(host, argv)` runs `ssh [options] -- <host> <command>`.
   - **Any login shell.** The command is sent as
-    `/bin/sh -c 'eval "$(printf "\ooo…")"'`, every byte of the POSIX-quoted command line an
+    `/bin/sh -c 'unset -f printf 2>/dev/null; eval "$(printf "\ooo…")"'` (an exported `printf`
+    function, which bash would import, is dropped first), every byte of the POSIX-quoted command line an
     octal escape. What the login shell sees has no `\\`, `\'`, `!`, newline or stray `$`, so
     sh, bash, dash, zsh, ksh, fish, csh and tcsh all hand the same script to `/bin/sh`.
   - **xonsh is unsupported and unsafe** as a login shell: it may decode `\ooo` itself, and the
@@ -113,11 +114,15 @@ let started = DirectLauncher::default().start(&target).await?;   // or TmuxLaunc
 - **The way there** is checked first, as sshd checks the way to `authorized_keys`: every
   directory from `/` down to the root's parent must belong to root or the user, and be writable
   by no one else unless sticky (as `/tmp`). The walk resolves the path one component at a time,
-  following symbolic links (absolute, relative, through `..`) and checking where they lead, so a
+  following symbolic links (absolute, relative, through `..`; each must belong to root or the
+  user, since in a sticky directory its owner could swap it) and checking where they lead, so a
   group-writable project directory on the way is refused: a member could otherwise swap the tree
   after the checks and have their own `pitcrewd` run. The script then `cd -P`s into the root and
-  uses relative paths only; a launched helper checks the directory it starts in (tmux enters it
-  by name) before it runs.
+  uses relative paths only; a launched helper checks that the directory it starts in is that
+  root, by its physical path, and private (tmux enters it by name; every `#` in it is doubled,
+  since tmux reads formats there) before it runs. Directories above the root are judged by
+  their owner and mode bits only: an ACL on one of them is not refused (on Linux it shows only as
+  a `+`, and on macOS `ls` hides it behind `@`).
 - **The remote side** is one script, `src/helper/helper.sh`, sent on **stdin** (the Windows
   command-line limit leaves the shell-neutral wrapper about 7,500 bytes). The command line is a
   fixed bootstrap run by `/bin/sh` (by path, whatever `sh` the user's `PATH` finds). It drops
@@ -152,9 +157,9 @@ let started = DirectLauncher::default().start(&target).await?;   // or TmuxLaunc
   taken on this host is stale when its process is gone (so a killed deploy does not block the
   next one for long) or when it is older than the limit by this host's own clock. Another
   host's clock cannot be compared with this one, so a lock from another host (a login node
-  sharing the home), or without an owner line yet, is stale only when its directory is older
-  than the limit plus 10 minutes: hosts sharing a home, and the file server, must agree on the
-  time within 10 minutes. A stale lock is moved aside atomically and removed; if what was moved
+  sharing the home), without an owner line yet, or whose pid or time cannot be read, is stale
+  only when its directory is older than the limit plus 10 minutes: hosts sharing a home, and
+  the file server, must agree on the time within 10 minutes. A stale lock is moved aside atomically and removed; if what was moved
   is not the lock judged stale, it is put back while the name is free. Every step that changes
   something (sweeping, `chmod`, removing a damaged copy, the rename, the switch, GC; in the
   launchers removing old records, launching, writing `endpoint.json`, signalling, removing
@@ -178,8 +183,10 @@ let started = DirectLauncher::default().start(&target).await?;   // or TmuxLaunc
   whether it runs and which version is installed; `stop` sends SIGTERM, then SIGKILL after
   `stop_timeout`, each only while the process still has the start time it had. All are
   idempotent. A pid counts only while alive, not a zombie, and named `pitcrewd`, so a recycled
-  pid is never signalled. `host` is `uname -n`; a name with other characters is kept readable
-  and made unique with the machine id (`odd_host_-<id>`). On clusters whose login nodes share
+  pid is never signalled. `host`, as in lock owners, is `uname -n` (other characters made `_`,
+  at most 40) and the machine's id (`login01-0123456789ab`: from `/etc/machine-id`, else
+  `hostid`, …), so two hosts of one name, such as login nodes of federated sites sharing a
+  home, never pass for one. On clusters whose login nodes share
   `$HOME`, a record from another host is reported (`OtherHost`) and never acted on, unless
   `LaunchOptions::take_over` says so.
 - **Secrets:** none are involved; nothing here logs. Reports and errors carry paths, the

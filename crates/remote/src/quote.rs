@@ -7,7 +7,7 @@
 //! wrapper:
 //!
 //! ```text
-//! /bin/sh -c 'eval "$(printf "\ooo\ooo…")"'
+//! /bin/sh -c 'unset -f printf 2>/dev/null; eval "$(printf "\ooo\ooo…")"'
 //! ```
 //!
 //! Each `\ooo` is one byte of the POSIX command line, as three octal digits. The string the
@@ -15,7 +15,9 @@
 //! followed by a digit. It has no `\\`, no `\'`, no `!`, no newline, no quote inside the single
 //! quotes, and its only `$` is the wrapper's. Every shell named above hands the single-quoted
 //! part to `/bin/sh` unchanged. There `printf` turns the escapes back into the command line, and
-//! `eval` runs it with POSIX semantics.
+//! `eval` runs it with POSIX semantics. A `printf` function imported from the environment (bash
+//! imports exported ones) is dropped first, so it cannot stand in for the decoding; `unset` and
+//! `eval` are special built-ins, which a POSIX shell does not let a function replace.
 //!
 //! The command line quotes each argument with POSIX single quotes (a literal `'` is written
 //! `'\''`). The command name is always quoted, so it is never a reserved word, an assignment or
@@ -30,7 +32,7 @@
 use crate::SshError;
 
 /// The wrapper, before and after the escapes.
-const HEAD: &str = "/bin/sh -c 'eval \"$(printf \"";
+const HEAD: &str = "/bin/sh -c 'unset -f printf 2>/dev/null; eval \"$(printf \"";
 const TAIL: &str = "\")\"'";
 
 /// The longest command [`remote_command`] builds. Each byte of the POSIX command line takes four.
@@ -367,7 +369,7 @@ mod tests {
     fn the_wrapper_looks_like_this() {
         assert_eq!(
             remote_command(&["echo", "a'b"]).unwrap(),
-            r#"/bin/sh -c 'eval "$(printf "\047\145\143\150\157\047\040\047\141\047\134\047\047\142\047")"'"#
+            r#"/bin/sh -c 'unset -f printf 2>/dev/null; eval "$(printf "\047\145\143\150\157\047\040\047\141\047\134\047\047\142\047")"'"#
         );
     }
 

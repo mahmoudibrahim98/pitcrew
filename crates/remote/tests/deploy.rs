@@ -319,10 +319,11 @@ mod unix {
         writeln!(file, "{}", serde_json::to_string(&entry).unwrap()).unwrap();
     }
 
-    /// Undoes the shell-neutral wrapper: `/bin/sh -c 'eval "$(printf "\ooo…")"'`.
+    /// Undoes the shell-neutral wrapper:
+    /// `/bin/sh -c 'unset -f printf 2>/dev/null; eval "$(printf "\ooo…")"'`.
     fn decode(wrapped: &str) -> Option<String> {
         let escapes = wrapped
-            .strip_prefix("/bin/sh -c 'eval \"$(printf \"")?
+            .strip_prefix("/bin/sh -c 'unset -f printf 2>/dev/null; eval \"$(printf \"")?
             .strip_suffix("\")\"'")?;
         let bytes = escapes
             .as_bytes()
@@ -784,6 +785,31 @@ mod unix {
         String::from_utf8(out.stdout).unwrap().trim().to_owned()
     }
 
+    /// This host as the script names it: `uname -n` (other characters made `_`, at most 40),
+    /// a dash, and the machine's id (the first 12 characters of `/etc/machine-id`, else of
+    /// `/var/lib/dbus/machine-id`, else `hostid`).
+    fn this_host() -> String {
+        let plain = |c: char| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        };
+        let name: String = uname_n().chars().map(plain).take(40).collect();
+        let id = ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+            .iter()
+            .filter_map(|file| std::fs::read_to_string(file).ok())
+            .map(|text| text.lines().next().unwrap_or("").chars().take(12).collect())
+            .find(|id: &String| !id.is_empty())
+            .unwrap_or_else(|| {
+                let out = Command::new("hostid").output().unwrap();
+                String::from_utf8(out.stdout).unwrap().trim().to_owned()
+            });
+        let id: String = id.chars().map(plain).collect();
+        format!("{}-{id}", if name.is_empty() { "host" } else { &name })
+    }
+
     fn now_ms() -> i64 {
         let since = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1094,7 +1120,7 @@ mod unix {
         private_dir(&lock);
         std::fs::write(
             lock.join("owner"),
-            format!("{} {} 00ff {now}\n", uname_n(), dead_pid()),
+            format!("{} {} 00ff {now}\n", this_host(), dead_pid()),
         )
         .unwrap();
         block_on(deploy(&m.plain(), &helper("2.0.0"), &impatient)).unwrap();
@@ -1108,7 +1134,7 @@ mod unix {
 
         // A live process of this host keeps its lock...
         private_dir(&lock);
-        let live = format!("{} {} 00ff {now}\n", uname_n(), std::process::id());
+        let live = format!("{} {} 00ff {now}\n", this_host(), std::process::id());
         std::fs::write(lock.join("owner"), &live).unwrap();
         let err = block_on(deploy(&m.plain(), &helper("3.0.0"), &impatient)).unwrap_err();
         assert!(matches!(err, HelperError::Busy(_)), "{err:?}");
@@ -1118,12 +1144,42 @@ mod unix {
         // the directory's time says.
         std::fs::write(
             lock.join("owner"),
-            format!("{} {} 00ff {}\n", uname_n(), std::process::id(), now - 600),
+            format!(
+                "{} {} 00ff {}\n",
+                this_host(),
+                std::process::id(),
+                now - 600
+            ),
         )
         .unwrap();
         touch("now");
         block_on(deploy(&m.plain(), &helper("3.0.0"), &impatient)).unwrap();
         assert!(!lock.exists());
+
+        // A host of the same name but not this machine's id (a federated site sharing the
+        // home) is another host: its lock is judged by the directory's age, even though the
+        // pid it names is gone here.
+        private_dir(&lock);
+        let twin = format!("{} {} 00ff {now}\n", uname_n(), dead_pid());
+        std::fs::write(lock.join("owner"), &twin).unwrap();
+        let err = block_on(deploy(&m.plain(), &helper("4.0.0"), &impatient)).unwrap_err();
+        assert!(matches!(err, HelperError::Busy(_)), "{err:?}");
+        std::fs::remove_dir_all(&lock).unwrap();
+
+        // This host's lock whose pid or time cannot be read: judged by the directory's age too,
+        // waited for while fresh and broken once old.
+        for owner in [
+            format!("{} {} 00ff not-a-time\n", this_host(), std::process::id()),
+            format!("{} not-a-pid 00ff {now}\n", this_host()),
+        ] {
+            private_dir(&lock);
+            std::fs::write(lock.join("owner"), &owner).unwrap();
+            let err = block_on(deploy(&m.plain(), &helper("4.0.0"), &impatient)).unwrap_err();
+            assert!(matches!(err, HelperError::Busy(_)), "{owner}: {err:?}");
+            touch("16 minutes ago");
+            block_on(deploy(&m.plain(), &helper("4.0.0"), &impatient)).unwrap();
+            assert!(!lock.exists(), "{owner}");
+        }
     }
 
     fn gc_keeps_exactly_two_versions() {
@@ -1560,23 +1616,33 @@ mod unix {
             assert!(matches!(err, HelperError::UnsafeDirectory(_)), "{err:?}");
         }
 
-        // A directory on the way that belongs to another user (an `ls` that says so).
+        // A directory on the way that belongs to another user, and a symbolic link on the way
+        // that does (an `ls` that says so): in a sticky directory, its owner could swap it.
         dir(&base.join("theirs/u"), 0o755);
         let theirs = base.join("theirs");
+        dir(&base.join("real3/u"), 0o755);
+        let their_link = base.join("their-link");
+        std::os::unix::fs::symlink(base.join("real3"), &their_link).unwrap();
         let real = which("ls").unwrap();
         shim(
             &m.bin,
             "ls",
             &format!(
                 "last=\nfor a in \"$@\"; do last=$a; done\n\
-                 if [ \"$last\" = '{}' ]; then '{}' \"$@\" | awk '{{ $3 = 4242; print }}'; \
-                 else exec '{}' \"$@\"; fi",
+                 case $last in '{}'|'{}') '{}' \"$@\" | awk '{{ $3 = 4242; print }}' ;; \
+                 *) exec '{}' \"$@\" ;; esac",
                 theirs.display(),
+                their_link.display(),
                 real.display(),
                 real.display()
             ),
         );
         unsafe_way(&theirs.join("u/.pitcrew"), "belongs to uid 4242");
+        unsafe_way(
+            &their_link.join("u/.pitcrew"),
+            &format!("the link {}", their_link.display()),
+        );
+        assert!(!base.join("real3/u/.pitcrew").exists());
     }
 
     /// A shell start-up file that reads stdin eats the start of the script: what is left must
@@ -1853,7 +1919,7 @@ mod unix {
         let e = &started.endpoint;
         assert_eq!(e.version, "1.0.0");
         assert_eq!(e.launcher, launcher.name());
-        assert_eq!(e.host, uname_n());
+        assert_eq!(e.host, this_host());
         assert_eq!(e.socket, m.layout().socket());
         assert!(e.started >= before - 2000 && e.started <= now_ms() + 1000);
         assert!(alive(e.pid));
@@ -1977,6 +2043,20 @@ mod unix {
         assert_eq!(status.state, HelperState::Running);
         assert_eq!(status.tmux_session, Some(true));
         block_on(launcher.stop(&there)).unwrap();
+
+        // A root whose path holds a #: tmux reads one in -c as the start of a format (here
+        // #{pane_id}), so the helper would start elsewhere, and refuse to.
+        let parent = m.dir.path().join("x#{pane_id}#y");
+        std::fs::create_dir(&parent).unwrap();
+        let hashed = Layout::at(parent.join(".pitcrew").to_str().unwrap()).unwrap();
+        let target = m.target_at(&m.fake(Remote::default()), hashed.clone());
+        block_on(deploy(&target, &helper("1.0.0"), &quick())).unwrap();
+        let e = block_on(launcher.start(&target)).unwrap().endpoint;
+        assert_eq!(e.socket, hashed.socket());
+        assert!(alive(e.pid));
+        let status = block_on(launcher.status(&target)).unwrap();
+        assert_eq!(status.state, HelperState::Running);
+        block_on(launcher.stop(&target)).unwrap();
         println!("tmux checked: {version}");
     }
 
@@ -2074,7 +2154,7 @@ mod unix {
         });
         let started = block_on(taking.start(&m.plain())).unwrap();
         assert!(started.started_now);
-        assert_eq!(started.endpoint.host, uname_n());
+        assert_eq!(started.endpoint.host, this_host());
         block_on(taking.stop(&m.plain())).unwrap();
 
         // A record of a process of this host that is gone is stale.
@@ -2082,7 +2162,7 @@ mod unix {
             &m,
             &Endpoint {
                 pid: dead_pid(),
-                host: uname_n(),
+                host: this_host(),
                 ..foreign.clone()
             },
         );
@@ -2103,7 +2183,7 @@ mod unix {
             &m,
             &Endpoint {
                 pid: sleeper.id(),
-                host: uname_n(),
+                host: this_host(),
                 ..foreign
             },
         );

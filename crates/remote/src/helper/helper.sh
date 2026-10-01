@@ -109,24 +109,21 @@ pc_me=$(id -u 2>/dev/null)
 case $pc_me in ''|*[!0123456789]*) pc_fail io "id -u failed" ;; esac
 case $pc_root in /?*) ;; *) pc_fail usage "the root must be an absolute path" ;; esac
 
-# This host, for lock owners and endpoint.json. A name with other characters is kept readable
-# and made unique with the machine's id, so two such hosts never pass for one.
+# This host, for lock owners and endpoint.json: its name (other characters made `_`, at most
+# 40) and its machine's id. With the id, two hosts of one name (login nodes of federated sites
+# sharing a home, or names made plain alike) never pass for one.
+pc_names=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._-
+pc_id=
+for pc_f in /etc/machine-id /var/lib/dbus/machine-id; do
+  if [ -z "$pc_id" ] && [ -r "$pc_f" ]; then pc_id=$(cut -c 1-12 "$pc_f" 2>/dev/null); fi
+done
+if [ -z "$pc_id" ]; then pc_id=$(hostid 2>/dev/null); fi
+if [ -z "$pc_id" ]; then pc_id=$(sysctl -n kern.uuid 2>/dev/null | cut -c 1-12); fi
+if [ -z "$pc_id" ]; then pc_id=$(uname -a 2>/dev/null | cksum | cut -d ' ' -f 1); fi
 pc_host=$(uname -n 2>/dev/null)
-case $pc_host in
-  ''|*[!0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._-]*)
-    pc_names=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._-
-    pc_id=
-    for pc_f in /etc/machine-id /var/lib/dbus/machine-id; do
-      if [ -z "$pc_id" ] && [ -r "$pc_f" ]; then pc_id=$(cut -c 1-12 "$pc_f" 2>/dev/null); fi
-    done
-    if [ -z "$pc_id" ]; then pc_id=$(hostid 2>/dev/null); fi
-    if [ -z "$pc_id" ]; then pc_id=$(sysctl -n kern.uuid 2>/dev/null | cut -c 1-12); fi
-    if [ -z "$pc_id" ]; then pc_id=$(uname -a 2>/dev/null | cksum | cut -d ' ' -f 1); fi
-    pc_host=$(printf '%s' "$pc_host" | tr -c "$pc_names" '_' | cut -c 1-40)
-    pc_id=$(printf '%s' "$pc_id" | tr -c "$pc_names" '_')
-    pc_host=${pc_host:-host}-$pc_id
-    ;;
-esac
+pc_host=$(printf '%s' "$pc_host" | tr -c "$pc_names" '_' | cut -c 1-40)
+pc_id=$(printf '%s' "$pc_id" | tr -c "$pc_names" '_')
+pc_host=${pc_host:-host}-$pc_id
 
 # --- The way to the root ------------------------------------------------------------------
 
@@ -229,9 +226,10 @@ pc_enter() {
 # pc_stale DIR MINUTES: whether the lock DIR may be broken; its owner line goes to pc_judged.
 # - Taken on this host: when its process is gone, or it is older than MINUTES by this host's
 #   clock (the owner line records when it was taken).
-# - Taken elsewhere, or with no owner line yet: another host's clock cannot be compared with
-#   this one, so only when the directory is older than MINUTES plus 10. Hosts sharing a home
-#   must keep their clocks, and the file server's, within 10 minutes of each other.
+# - Taken elsewhere, with no owner line yet, or with a pid or time that cannot be read: another
+#   host's clock cannot be compared with this one, so only when the directory is older than
+#   MINUTES plus 10. Hosts sharing a home must keep their clocks, and the file server's, within
+#   10 minutes of each other.
 pc_stale() {
   pc_judged=$(cat "$1/owner" 2>/dev/null)
   case $pc_judged in
@@ -240,11 +238,19 @@ pc_stale() {
       pc_opid=${pc_rest%% *}
       pc_rest=${pc_rest#* }
       pc_oat=${pc_rest#* }
-      case $pc_opid in ''|*[!0123456789]*) return 1 ;; esac
-      if ! pc_alive "$pc_opid"; then return 0; fi
-      case $pc_oat in ''|*[!0123456789]*) return 1 ;; esac
-      [ $(($(date +%s) - pc_oat)) -gt $(($2 * 60)) ]
-      return
+      case $pc_opid in
+        ''|*[!0123456789]*) ;;
+        *)
+          if ! pc_alive "$pc_opid"; then return 0; fi
+          case $pc_oat in
+            ''|*[!0123456789]*) ;;
+            *)
+              [ $(($(date +%s) - pc_oat)) -gt $(($2 * 60)) ]
+              return
+              ;;
+          esac
+          ;;
+      esac
       ;;
   esac
   [ -n "$(find "$1" -prune -mmin +$(($2 + 10)) 2>/dev/null)" ]
@@ -494,13 +500,15 @@ pc_deploy() {
 pc_tmux() { tmux -L "$pc_tmux_name" -f /dev/null "$@"; }
 
 # Run by the /bin/sh a launcher starts, inside the root, as
-# `sh -c "$PC_EXEC" sh UMASK UID PIDFILE LOG HELPER ARGS...`. It checks that its directory is
-# still the private one (tmux enters it by name), records its pid, sends its output to the log
-# (opened while the umask is still 077), restores the user's umask, and becomes the helper. Its
-# stdin is the launcher's: /dev/null, or under tmux the pane's terminal, since tmux takes a pane
-# whose terminal nobody holds open for dead.
-PC_EXEC='m=$1 u=$2 p=$3 l=$4
-shift 4
+# `sh -c "$PC_EXEC" sh UMASK UID ROOT PIDFILE LOG HELPER ARGS...`. It checks that its directory
+# is still the root the script entered (ROOT, its physical path: tmux enters it by name) and
+# still private, records its pid, sends its output to the log (opened while the umask is still
+# 077), restores the user's umask, and becomes the helper. Its stdin is the launcher's:
+# /dev/null, or under tmux the pane's terminal, since tmux takes a pane whose terminal nobody
+# holds open for dead.
+PC_EXEC='m=$1 u=$2 w=$3 p=$4 l=$5
+shift 5
+[ "$(pwd -P)" = "$w" ] || exit 98
 d=$(ls -ldn . 2>/dev/null | awk "{print \$1, \$3}")
 case $d in
 "drwx------ $u"|"drwx------. $u"|"drwx------@ $u"|"drwx--S--- $u"|"drwx--S---. $u"|"drwx--S---@ $u") ;;
@@ -600,9 +608,11 @@ pc_start() {
     tmux)
       command -v tmux >/dev/null 2>&1 || pc_fail start_failed "tmux is not installed"
       pc_tmux kill-session -t "=$pc_tmux_name" >/dev/null 2>&1
-      pc_tmux new-session -d -s "$pc_tmux_name" -c "$pc_phys" -- /bin/sh -c "$PC_EXEC" sh \
-        "$pc_umask" "$pc_me" "$pc_pidf" "$pc_log" "$pc_exe" "$@" </dev/null >/dev/null 2>&1 \
-        || pc_fail start_failed "tmux new-session failed"
+      # tmux expands formats (#{...}, #(...)) in -c: every # is doubled to stay a #.
+      pc_tdir=$(printf '%s' "$pc_phys" | sed 's/#/##/g')
+      pc_tmux new-session -d -s "$pc_tmux_name" -c "$pc_tdir" -- /bin/sh -c "$PC_EXEC" sh \
+        "$pc_umask" "$pc_me" "$pc_phys" "$pc_pidf" "$pc_log" "$pc_exe" "$@" \
+        </dev/null >/dev/null 2>&1 || pc_fail start_failed "tmux new-session failed"
       ;;
     *)
       pc_detach=
@@ -612,8 +622,8 @@ pc_start() {
       # inherits the working directory: the root itself, not its name.
       (
         trap - EXIT HUP INT PIPE TERM
-        $pc_detach /bin/sh -c "$PC_EXEC" sh "$pc_umask" "$pc_me" "$pc_pidf" "$pc_log" \
-          "$pc_exe" "$@" </dev/null >/dev/null 2>&1 &
+        $pc_detach /bin/sh -c "$PC_EXEC" sh "$pc_umask" "$pc_me" "$pc_phys" "$pc_pidf" \
+          "$pc_log" "$pc_exe" "$@" </dev/null >/dev/null 2>&1 &
       )
       ;;
   esac
