@@ -1,7 +1,7 @@
 //! The client core: REST v3 over a [`Transport`], with pagination, conditional requests and
 //! rate-limit handling.
 
-use crate::bounds::{Limits, MAX_PAGE_BODY_BYTES, backoff_secs};
+use crate::bounds::{Limits, MAX_PAGE_BODY_BYTES, SECONDARY_BACKOFF_CAP_SECS, backoff_secs};
 use crate::link_header::next_link;
 use crate::origin::trusted_next_url;
 use crate::state::ListCache;
@@ -256,7 +256,12 @@ impl<'t, T: Transport> GithubClient<'t, T> {
                     });
                 }
                 let until = if let Some(retry_after) = raw.retry_after {
-                    now_unix + retry_after
+                    // R28: a server's `retry-after` is an untrusted `i64` — a hostile value near
+                    // `i64::MAX` must not overflow `now_unix + retry_after` (a panic with overflow
+                    // checks, a deadline wrapped into the past in release), and an enormous but
+                    // in-range value must not be trusted outright either. Clamp to the same
+                    // range this crate ever itself backs off for, then add with saturation.
+                    now_unix.saturating_add(retry_after.clamp(0, SECONDARY_BACKOFF_CAP_SECS))
                 } else {
                     *attempts = attempts.saturating_add(1);
                     now_unix + backoff_secs(*attempts)
@@ -749,6 +754,47 @@ mod tests {
             .await
             .expect_err("a bare 403 with no rate-limit signal must not be a rate limit");
         assert!(matches!(err, ClientError::Status { status: 403, .. }));
+    }
+
+    #[tokio::test]
+    async fn r28_a_hostile_retry_after_is_capped_not_overflowed() {
+        // Stream Q's open-r28-retry-after-overflow regression: `retry-after: 9223372036854775807`
+        // (i64::MAX) used to overflow `now_unix + retry_after` — a panic with overflow checks, a
+        // deadline wrapped into the past in release, so the very next call would retry at once
+        // instead of actually backing off.
+        let transport = ReplayTransport::from_exchanges(vec![exchange(
+            URL,
+            429,
+            vec![("Retry-After", "9223372036854775807")],
+            "",
+        )]);
+        let client = client_for(&transport);
+        let cache = ListCache::default();
+        let mut attempts = 0u32;
+        let now_unix = 1_790_755_200;
+        let Outcome::RateLimited { until, secondary } = client
+            .list::<TestItem>(
+                URL.to_string(),
+                &cache,
+                true,
+                now_unix,
+                &mut attempts,
+                Limits::default(),
+            )
+            .await
+            .expect("list")
+        else {
+            panic!("expected RateLimited");
+        };
+        assert!(secondary);
+        assert!(
+            until <= now_unix + SECONDARY_BACKOFF_CAP_SECS,
+            "a hostile retry-after must be capped, not trusted outright: {until}"
+        );
+        assert!(
+            until > now_unix,
+            "a hostile retry-after must not wrap into a deadline already in the past: {until}"
+        );
     }
 
     #[tokio::test]
