@@ -287,6 +287,74 @@ struct Prompts {
     handler: Arc<dyn PromptHandler>,
 }
 
+/// The environment variables ssh needs, which [`Ssh::with_env_passthrough`] (and every tunnel
+/// call) keeps; everything else is left out. The user's own config can still send variables to
+/// the server (`SendEnv`), so the rest of the app's environment never reaches ssh.
+/// - Unix: the home, user and path; locale and time zone; the agent's socket; Kerberos'
+///   credentials cache and config; a security-key provider; and the temporary and runtime
+///   directories some agents and `ProxyCommand`s keep their sockets in.
+/// - Windows: what any program needs to start and find the user's profile, and the agent's
+///   pipe.
+#[cfg(not(windows))]
+pub const MINIMAL_ENV: &[&str] = &[
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "TZ",
+    "TMPDIR",
+    "XDG_RUNTIME_DIR",
+    "SSH_AUTH_SOCK",
+    "SSH_SK_PROVIDER",
+    "KRB5CCNAME",
+    "KRB5_CONFIG",
+];
+
+/// See the Unix version.
+#[cfg(windows)]
+pub const MINIMAL_ENV: &[&str] = &[
+    "SystemRoot",
+    "SystemDrive",
+    "windir",
+    "ComSpec",
+    "PATH",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "USERNAME",
+    "USERDOMAIN",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramData",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "CommonProgramFiles",
+    "ALLUSERSPROFILE",
+    "COMPUTERNAME",
+    "PROCESSOR_ARCHITECTURE",
+    "NUMBER_OF_PROCESSORS",
+    "OS",
+    "SSH_AUTH_SOCK",
+];
+
+/// Which environment ssh gets.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum EnvPolicy {
+    /// The app's whole environment (the default of [`Ssh::new`]).
+    #[default]
+    Inherit,
+    /// [`MINIMAL_ENV`] and these names.
+    Minimal(Vec<String>),
+}
+
 /// The ssh program and how to call it. Cheap to clone.
 #[derive(Clone)]
 pub struct Ssh {
@@ -296,6 +364,9 @@ pub struct Ssh {
     runtime_dir: Option<PathBuf>,
     connect_timeout: Duration,
     multiplex: bool,
+    env: EnvPolicy,
+    /// Only as a client of the ControlMaster listening here: no login of its own, ever.
+    through: Option<PathBuf>,
 }
 
 impl fmt::Debug for Ssh {
@@ -306,6 +377,8 @@ impl fmt::Debug for Ssh {
             .field("runtime_dir", &self.runtime_dir)
             .field("connect_timeout", &self.connect_timeout)
             .field("multiplex", &self.multiplex)
+            .field("env", &self.env)
+            .field("through", &self.through)
             .finish()
     }
 }
@@ -326,7 +399,60 @@ impl Ssh {
             runtime_dir: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             multiplex: cfg!(unix),
+            env: EnvPolicy::Inherit,
+            through: None,
         }
+    }
+
+    /// Gives ssh only [`MINIMAL_ENV`] and the variables named here (for a `ProxyCommand` or a
+    /// `Match exec` in the user's config that needs one, such as a cloud CLI's profile),
+    /// instead of the app's whole environment. The tunnel ([`crate::tunnel`]) always does
+    /// this, keeping these names.
+    #[must_use]
+    pub fn with_env_passthrough<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.env = EnvPolicy::Minimal(names.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// This, giving ssh only [`MINIMAL_ENV`] and any names already passed through.
+    pub(crate) fn minimal_env(&self) -> Self {
+        let mut ssh = self.clone();
+        if ssh.env == EnvPolicy::Inherit {
+            ssh.env = EnvPolicy::Minimal(Vec::new());
+        }
+        ssh
+    }
+
+    /// This, as a client of the ControlMaster listening at `control` only: every call becomes
+    /// a channel of that connection. With no master there, a call fails at once rather than
+    /// logging in (`ProxyCommand=false`), and it never prompts (`BatchMode`). Reads no ssh
+    /// config (`-F none`): the master already has the user's settings.
+    pub(crate) fn through_master(&self, control: &Path) -> Self {
+        let mut ssh = self.minimal_env();
+        ssh.prompts = None;
+        ssh.through = Some(control.to_path_buf());
+        ssh
+    }
+
+    /// The ssh program.
+    pub(crate) fn program(&self) -> &Path {
+        &self.program
+    }
+
+    /// Whether prompts go to a handler (else ssh runs in `BatchMode`).
+    pub(crate) fn has_prompts(&self) -> bool {
+        self.prompts.is_some()
+    }
+
+    /// `ConnectTimeout`, in whole seconds (at least 1).
+    pub(crate) fn connect_timeout_secs(&self) -> u64 {
+        let secs =
+            self.connect_timeout.as_secs() + u64::from(self.connect_timeout.subsec_nanos() > 0);
+        secs.max(1)
     }
 
     /// Sends prompts to `handler` through the askpass program at `askpass`, the
@@ -371,28 +497,36 @@ impl Ssh {
         self
     }
 
-    /// The runtime directory for this call, created if needed.
-    fn runtime_dir(&self) -> Result<PathBuf, SshError> {
+    /// The runtime directory for this call, created if needed. With `multiplex`, its name must
+    /// suit a control socket (see `private::check_dir_name`).
+    pub(crate) fn runtime_dir_for(&self, multiplex: bool) -> Result<PathBuf, SshError> {
         let candidates = match &self.runtime_dir {
             Some(dir) => vec![dir.clone()],
             None => crate::private::default_runtime_dirs(),
         };
-        crate::private::pick_runtime_dir(&candidates, self.multiplex).map_err(SshError::Setup)
+        crate::private::pick_runtime_dir(&candidates, multiplex).map_err(SshError::Setup)
     }
 
-    /// The full argument list, without the program itself.
-    fn args(
+    /// The runtime directory for this call, created if needed.
+    fn runtime_dir(&self) -> Result<PathBuf, SshError> {
+        self.runtime_dir_for(self.multiplex)
+    }
+
+    /// The full argument list, without the program itself. `extra` goes just before `--`.
+    pub(crate) fn args(
         &self,
         dir: &Path,
         log: &Path,
         host: &str,
         command: String,
+        extra: &[String],
     ) -> Result<Vec<String>, SshError> {
         let log = log.to_str().ok_or_else(|| {
             SshError::InvalidArgument("the runtime directory is not valid UTF-8".to_owned())
         })?;
-        let secs =
-            self.connect_timeout.as_secs() + u64::from(self.connect_timeout.subsec_nanos() > 0);
+        if let Some(control) = &self.through {
+            return through_args(log, control, host, command, extra);
+        }
         let mut args: Vec<String> = vec!["-T".into(), "-E".into(), log.into()];
         for option in [
             // Only ssh's own errors in the log: no server text, no informational lines.
@@ -410,7 +544,7 @@ impl Ssh {
             args.push(option.into());
         }
         args.push("-o".into());
-        args.push(format!("ConnectTimeout={}", secs.max(1)));
+        args.push(format!("ConnectTimeout={}", self.connect_timeout_secs()));
         if self.prompts.is_none() {
             args.push("-o".into());
             args.push("BatchMode=yes".into());
@@ -423,10 +557,84 @@ impl Ssh {
             args.push("-o".into());
             args.push("ControlPersist=10m".into());
         }
+        args.extend(extra.iter().cloned());
         args.push("--".into());
         args.push(host.to_owned());
         args.push(command);
         Ok(args)
+    }
+
+    /// Starts ssh with `args` (built for `host`), its stdin piped when `stdin` is set, with the
+    /// prompt bridge in its environment when there is a handler. The caller owns what comes
+    /// back: dropping the [`Running`] kills ssh and everything it started, dropping the server
+    /// ends its prompts.
+    pub(crate) fn spawn(
+        &self,
+        dir: &Path,
+        host: &str,
+        args: Vec<String>,
+        stdin: bool,
+    ) -> Result<(Running, Option<AskpassServer>), SshError> {
+        self.check_askpass()?;
+        let mut command = self.command();
+        command.args(args).env_remove("SSH_ASKPASS_PROMPT");
+        if stdin {
+            command.stdin(Stdio::piped());
+        }
+        let server = self.prompt_env(&mut command, dir, host)?;
+        Ok((Running::spawn(command)?, server))
+    }
+
+    /// Refuses an askpass program that ssh could not run as given.
+    fn check_askpass(&self) -> Result<(), SshError> {
+        let Some(prompts) = &self.prompts else {
+            return Ok(());
+        };
+        // ssh would look a relative name up on PATH. And a missing program means askpass fails
+        // at every prompt, so ssh would send empty passwords: refuse both up front.
+        let problem = if !prompts.program.is_absolute() {
+            Some("is not an absolute path")
+        } else if !prompts.program.is_file() {
+            Some("does not exist")
+        } else {
+            None
+        };
+        match problem {
+            Some(problem) => Err(SshError::InvalidArgument(format!(
+                "the askpass program {} {problem}",
+                prompts.program.display()
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Puts the prompt bridge (a new server, returned) in `command`'s environment, or keeps
+    /// any `SSH_ASKPASS` of ours out of it when there is no handler.
+    fn prompt_env(
+        &self,
+        command: &mut tokio::process::Command,
+        dir: &Path,
+        host: &str,
+    ) -> Result<Option<AskpassServer>, SshError> {
+        match &self.prompts {
+            Some(prompts) => {
+                let server = AskpassServer::start(dir, host, prompts.handler.clone())
+                    .map_err(SshError::Setup)?;
+                command
+                    .env("SSH_ASKPASS", &prompts.program)
+                    .env("SSH_ASKPASS_REQUIRE", "force");
+                for (name, value) in server.env() {
+                    command.env(name, value);
+                }
+                Ok(Some(server))
+            }
+            None => {
+                command
+                    .env_remove("SSH_ASKPASS")
+                    .env_remove("SSH_ASKPASS_REQUIRE");
+                Ok(None)
+            }
+        }
     }
 
     /// Runs `argv` on `host`: `ssh [options] -- <host> <wrapped argv>`. Stdin is empty.
@@ -482,51 +690,17 @@ impl Ssh {
     ) -> Result<Output, SshError> {
         validate_host(host)?;
         let remote = remote_command(argv)?;
-        if let Some(prompts) = &self.prompts {
-            // ssh would look a relative name up on PATH. And a missing program means askpass
-            // fails at every prompt, so ssh would send empty passwords: refuse both up front.
-            let problem = if !prompts.program.is_absolute() {
-                Some("is not an absolute path")
-            } else if !prompts.program.is_file() {
-                Some("does not exist")
-            } else {
-                None
-            };
-            if let Some(problem) = problem {
-                return Err(SshError::InvalidArgument(format!(
-                    "the askpass program {} {problem}",
-                    prompts.program.display()
-                )));
-            }
-        }
+        self.check_askpass()?;
         let dir = self.runtime_dir()?;
         let log = SshLog::new(&dir)?;
         let mut command = self.command();
         command
-            .args(self.args(&dir, &log.0, host, remote)?)
+            .args(self.args(&dir, &log.0, host, remote, &[])?)
             .env_remove("SSH_ASKPASS_PROMPT");
         if input.is_some() {
             command.stdin(Stdio::piped());
         }
-        let server = match &self.prompts {
-            Some(prompts) => {
-                let server = AskpassServer::start(&dir, host, prompts.handler.clone())
-                    .map_err(SshError::Setup)?;
-                command
-                    .env("SSH_ASKPASS", &prompts.program)
-                    .env("SSH_ASKPASS_REQUIRE", "force");
-                for (name, value) in server.env() {
-                    command.env(name, value);
-                }
-                Some(server)
-            }
-            None => {
-                command
-                    .env_remove("SSH_ASKPASS")
-                    .env_remove("SSH_ASKPASS_REQUIRE");
-                None
-            }
-        };
+        let server = self.prompt_env(&mut command, &dir, host)?;
         let (status, stdout, stderr) = drive(command, server.as_ref(), limits, input).await?;
         let stopped = server.as_ref().and_then(AskpassServer::stopped);
         let prompted = server.is_some();
@@ -585,8 +759,11 @@ impl Ssh {
         parse_resolved(&String::from_utf8_lossy(&stdout))
     }
 
-    fn command(&self) -> tokio::process::Command {
+    pub(crate) fn command(&self) -> tokio::process::Command {
         let mut command = tokio::process::Command::new(&self.program);
+        if let EnvPolicy::Minimal(extra) = &self.env {
+            command.env_clear().envs(minimal_env(extra));
+        }
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -601,10 +778,82 @@ impl Ssh {
     }
 }
 
+/// The app's variables named in [`MINIMAL_ENV`] or `extra` (case-insensitively on Windows,
+/// where names are).
+fn minimal_env(extra: &[String]) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let wanted = |name: &str| {
+        MINIMAL_ENV
+            .iter()
+            .copied()
+            .chain(extra.iter().map(String::as_str))
+            .any(|w| {
+                if cfg!(windows) {
+                    w.eq_ignore_ascii_case(name)
+                } else {
+                    w == name
+                }
+            })
+    };
+    std::env::vars_os()
+        .filter(|(name, _)| name.to_str().is_some_and(wanted))
+        .collect()
+}
+
+/// The arguments of a call through a ControlMaster (see [`Ssh::through_master`]).
+fn through_args(
+    log: &str,
+    control: &Path,
+    host: &str,
+    command: String,
+    extra: &[String],
+) -> Result<Vec<String>, SshError> {
+    let mut args: Vec<String> = ["-F", "none", "-T", "-E", log].map(str::to_owned).to_vec();
+    for option in [
+        "LogLevel=ERROR",
+        "ForwardAgent=no",
+        "ForwardX11=no",
+        "PermitLocalCommand=no",
+        "ClearAllForwardings=yes",
+        "RemoteCommand=none",
+        "BatchMode=yes",
+        "ControlMaster=no",
+        // Without the master, ssh would log in itself: make that fail at once instead.
+        "ProxyCommand=false",
+    ] {
+        args.push("-o".into());
+        args.push(option.into());
+    }
+    args.push("-o".into());
+    args.push(control_socket(control)?);
+    args.extend(extra.iter().cloned());
+    args.push("--".into());
+    args.push(host.to_owned());
+    args.push(command);
+    Ok(args)
+}
+
+/// `ControlPath=<path>` for a socket of ours, whose directory was picked with the checks of
+/// `private::check_dir_name`; refused if anything in it would be expanded by ssh.
+pub(crate) fn control_socket(path: &Path) -> Result<String, SshError> {
+    let text = path.to_str().ok_or_else(|| {
+        SshError::InvalidArgument("the control socket's path is not valid UTF-8".to_owned())
+    })?;
+    if !path.is_absolute()
+        || text
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '%' | '$' | '"' | '\''))
+    {
+        return Err(SshError::InvalidArgument(format!(
+            "the control socket's path {text:?} cannot be passed to ssh"
+        )));
+    }
+    Ok(format!("ControlPath={text}"))
+}
+
 /// Runs `command` to the end, feeding it `input`: its exit status, stdout and stderr. Stops it,
 /// with everything it started, when `server` stops the call (the user cancelled a prompt, or a
 /// client failed the handshake) or the call breaks `limits`.
-async fn drive(
+pub(crate) async fn drive(
     command: tokio::process::Command,
     server: Option<&AskpassServer>,
     limits: Limits,
@@ -657,10 +906,18 @@ async fn drive(
 
 /// A running ssh. Dropping it kills ssh (tokio's `kill_on_drop`) and first everything it
 /// started: its process group on Unix, its Job Object on Windows.
-struct Running {
-    child: tokio::process::Child,
+pub(crate) struct Running {
+    pub(crate) child: tokio::process::Child,
     #[cfg(windows)]
     job: crate::job::Job,
+}
+
+impl fmt::Debug for Running {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Running")
+            .field("pid", &self.child.id())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Running {
@@ -713,7 +970,8 @@ impl Running {
         self.job.terminate();
     }
 
-    async fn kill(&mut self) {
+    /// Kills everything ssh started, and ssh, and reaps it.
+    pub(crate) async fn kill(&mut self) {
         self.kill_all();
         let _ = self.child.kill().await;
     }
@@ -794,7 +1052,7 @@ async fn feed(mut pipe: tokio::process::ChildStdin, input: Input<'_>) -> Result<
 
 /// Completes once `after` has passed with no prompt open. A prompt stops the clock; when the
 /// last one closes, the clock starts again from zero.
-async fn expire(after: Duration, open: Option<watch::Receiver<usize>>) {
+pub(crate) async fn expire(after: Duration, open: Option<watch::Receiver<usize>>) {
     if let Some(mut open) = open {
         loop {
             if open.wait_for(|n| *n == 0).await.is_err() {
@@ -811,22 +1069,46 @@ async fn expire(after: Duration, open: Option<watch::Receiver<usize>>) {
 }
 
 /// ssh's log file for one call (`-E`), removed when dropped.
-struct SshLog(PathBuf);
+#[derive(Debug)]
+pub(crate) struct SshLog(pub(crate) PathBuf);
 
 impl SshLog {
-    fn new(dir: &Path) -> Result<Self, SshError> {
+    pub(crate) fn new(dir: &Path) -> Result<Self, SshError> {
         let tag = crate::askpass::random::<8>().map_err(SshError::Setup)?;
         Ok(Self(
             dir.join(format!("log-{}", crate::askpass::to_hex(&tag))),
         ))
     }
 
-    fn read(&self) -> String {
+    /// The path, for `-E`.
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+
+    /// The first 64 KiB of what ssh logged.
+    pub(crate) fn read(&self) -> String {
         let mut text = Vec::new();
         if let Ok(file) = std::fs::File::open(&self.0) {
             let _ = file.take(MAX_LOG).read_to_end(&mut text);
         }
         String::from_utf8_lossy(&text).into_owned()
+    }
+
+    /// What ssh logged from byte `from` on, at most 64 KiB of it (a long-lived ssh's log grows).
+    pub(crate) fn read_from(&self, from: u64) -> String {
+        use std::io::Seek as _;
+        let mut text = Vec::new();
+        if let Ok(mut file) = std::fs::File::open(&self.0)
+            && file.seek(io::SeekFrom::Start(from)).is_ok()
+        {
+            let _ = file.take(MAX_LOG).read_to_end(&mut text);
+        }
+        String::from_utf8_lossy(&text).into_owned()
+    }
+
+    /// How many bytes ssh has logged so far.
+    pub(crate) fn len(&self) -> u64 {
+        std::fs::metadata(&self.0).map_or(0, |m| m.len())
     }
 }
 

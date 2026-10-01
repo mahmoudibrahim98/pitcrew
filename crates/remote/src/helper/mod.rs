@@ -382,6 +382,14 @@ impl Target {
         &self.ssh
     }
 
+    /// The same machine, reached with `ssh` (the tunnel's calls through its own connection).
+    pub(crate) fn with_ssh(&self, ssh: Ssh) -> Self {
+        Self {
+            ssh,
+            ..self.clone()
+        }
+    }
+
     /// The host name given to ssh.
     #[must_use]
     pub fn host(&self) -> &str {
