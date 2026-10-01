@@ -58,6 +58,8 @@ const TUNNEL_LOG: &str = "tunnel.log";
 const ASKED: &str = "asked.log";
 const NET: &str = "net";
 const NO_FORWARDING: &str = "no-forwarding";
+/// One line per forwarded channel the machine refused.
+const REFUSED: &str = "refused.log";
 const PASSWORD: &str = "password";
 /// What the fake daemon reads to half-close first.
 const CLOSE_WRITE: &[u8] = b"close-write\n";
@@ -563,6 +565,14 @@ fn listen_forward(
             std::thread::spawn(move || {
                 if machine.join(NO_FORWARDING).exists() {
                     say("channel 3: open failed: administratively prohibited: open failed");
+                    // Counted, for the cases.
+                    if let Ok(mut refused) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(machine.join(REFUSED))
+                    {
+                        let _ = writeln!(refused, "refused");
+                    }
                     drop(client);
                     return;
                 }
@@ -1078,6 +1088,70 @@ fn tunnel_forwarding_refused_then_the_stdio_bridge() {
         connected(Transport::Stdio),
     );
     assert_eq!(forwards(&tunnel_calls(&m)), 1);
+    rt.block_on(connector.close());
+    stop_helper(&m);
+}
+
+/// Forwarding refused while the bridge fails too (a helper whose `connect` finds no daemon): the
+/// attempts that follow use the bridge alone, never the refused forward again.
+fn tunnel_a_refused_forward_is_not_tried_again() {
+    let m = Machine::new();
+    std::fs::write(m.dir.path().join(NO_FORWARDING), "").unwrap();
+    let script = String::from_utf8(crate::unix::helper_script("1.0.0", "serve", 0)).unwrap();
+    let mut broken: String = script
+        .lines()
+        .map(|line| {
+            if line.starts_with("connect)") {
+                "connect) echo 'pitcrewd connect: no daemon listens on the socket: x' >&2; exit 4 ;;"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    broken.push('\n');
+    let plain = m.plain();
+    crate::unix::block_on(deploy(
+        &plain,
+        &crate::unix::helper_from("1.0.0", broken.into_bytes()),
+        &quick(),
+    ))
+    .unwrap();
+    crate::unix::block_on(DirectLauncher::new(launch_options()).start(&plain)).unwrap();
+    let rt = runtime();
+    let launcher = Arc::new(DirectLauncher::new(launch_options()));
+    let connector = start(&rt, Daemon::new(target(&m), launcher), options());
+    let state = wait_for(
+        &rt,
+        &connector,
+        "not running",
+        Duration::from_secs(30),
+        |s| {
+            matches!(
+                s,
+                LinkState::Unreachable {
+                    why: Unreachable::NotRunning,
+                    ..
+                }
+            )
+        },
+    );
+    assert!(state.to_string().contains("no daemon"), "{state}");
+    // It tries again every `retry_every`, with the bridge alone.
+    let bridges = |m: &Machine| {
+        tunnel_calls(m)
+            .iter()
+            .filter(|c| {
+                c.kind == "session" && c.line.as_deref().is_some_and(|l| l.contains(" connect "))
+            })
+            .count()
+    };
+    crate::unix::eventually("three tries of the bridge", || bridges(&m) >= 3);
+    let refused = std::fs::read_to_string(m.dir.path().join(REFUSED))
+        .unwrap_or_default()
+        .lines()
+        .count();
+    assert_eq!(refused, 1, "the refused forward was tried again");
     rt.block_on(connector.close());
     stop_helper(&m);
 }
@@ -1826,6 +1900,10 @@ pub(crate) const CASES: &[(&str, fn())] = &[
     (
         "tunnel_forwarding_refused_then_the_stdio_bridge",
         tunnel_forwarding_refused_then_the_stdio_bridge,
+    ),
+    (
+        "tunnel_a_refused_forward_is_not_tried_again",
+        tunnel_a_refused_forward_is_not_tried_again,
     ),
     (
         "tunnel_bridge_through_srun_to_a_node_local_socket",

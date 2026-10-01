@@ -467,12 +467,14 @@ Messages name what is wrong, never the path.
   must pass. The machine's network can be up, down or frozen (a laptop asleep), and it can
   forbid forwarding unix sockets. `srun` runs job steps, and the fake daemon echoes, answers
   `GET` and half-closes. They cover a forwarded socket shared by many connections, forwarding
-  refused then the stdio bridge (remembered), the bridge through `srun --overlap` to a node-local
-  socket, a node reached through the login link, nodes that fail the re-check (nothing started
-  towards them), a dropped network noticed within ten seconds then recovered, a wall-clock
-  jump, a job that ended then moved to another node, and askpass during a reconnect (and a
-  cancel stopping the attempts). The bridge alone: byte-exact both ways, a large transfer,
-  half-closes both ways, and sockets that are not the user's refused;
+  refused then the stdio bridge (remembered, and not tried again while the bridge fails too),
+  the bridge through `srun --overlap` to a node-local socket, a node reached through the login
+  link, nodes that fail the re-check (nothing started towards them), a dropped network noticed
+  within ten seconds then recovered, a wall-clock jump, a job that ended then moved to another
+  node, askpass during a reconnect (and a cancel stopping the attempts), and both transports
+  with each POSIX shell of `PITCREW_TEST_SHELLS` as the machine's `sh`. The bridge alone:
+  byte-exact both ways, a large transfer, half-closes both ways, and sockets that are not the
+  user's refused (not one served by another user, which needs root to set up);
 - `deploy.rs` checks that nothing a case starts outlives it: everything started on a fake
   machine (the fake `ssh` too) carries the run's mark (`PITCREW_TEST_RUN`) in its environment;
   after each case, passed or not, what still carries it is killed and the case fails, and the
