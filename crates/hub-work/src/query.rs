@@ -738,14 +738,16 @@ pub const REF_SCAN_BUDGET: usize = 10_000;
 /// The newest revisions below `before` (exclusive) of events matching `filter`: at most `limit`
 /// of them, oldest first, and where the search stopped, `scanned_to`.
 ///
-/// - Pass `scanned_to` as the next call's `before` to page back. **`scanned_to` is 0 exactly when
-///   no older event matches** (the start of the log was reached).
+/// - Pass `scanned_to` as the next call's `before` to page back. **`scanned_to` is 0 only when
+///   the search reached the start of the log**, so nothing older matches. A non-zero
+///   `scanned_to` says where the search stopped, not that something older matches.
 /// - With more than `limit` matches below `before`, `scanned_to` is the oldest returned revision.
 /// - The search walks the index of the filter's most specific field (session, then task, then
 ///   workstream, then project) and checks the other fields row by row. It examines at most
 ///   `budget` rows; when the budget runs out first, fewer than `limit` revisions come back (even
-///   none) and `scanned_to` is the last revision examined. With one field given, every row
-///   examined matches, so the budget never cuts a page short.
+///   none) and `scanned_to` is the last revision examined, whether or not anything older
+///   matches. With one field given, every row examined matches, so the budget never cuts a page
+///   short.
 ///
 /// # Errors
 ///

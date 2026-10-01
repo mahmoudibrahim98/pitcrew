@@ -30,16 +30,24 @@ use crate::service::WorkService;
 /// "About" follows the links in force when each event happened: a turn in a session linked to a
 /// task is about that task, its workstream and its project; `dispatch_finished` is about its
 /// dispatch's task and session. See [`crate::projection::Refs`] for every event type.
+///
+/// **Use it for the `project=` and `workstream=` filters.** Those need the roll-up (session →
+/// task → workstream → project) that only the work model can do. The index keeps **one** task and
+/// one session per event, the event's own; ids named elsewhere in an event's body (another task in
+/// a decision, a session in a comment's receipts) are not indexed. So the `task=` and `session=`
+/// filters keep matching ids anywhere in the event body, as the API layer does, which catches
+/// those too.
 pub trait EventRefs: Send + Sync + std::fmt::Debug {
     /// The newest revisions below `before_rev` (exclusive) of events about **all** of `filter`'s
     /// fields: at most `limit`, oldest first, with `scanned_to`, where to continue.
     ///
-    /// - Pass `scanned_to` as the next `before_rev` to page back; it is **0 exactly when no older
-    ///   event matches**.
+    /// - Pass `scanned_to` as the next `before_rev` to page back. It is **0 only when the search
+    ///   reached the start of the log**, so nothing older matches; a non-zero `scanned_to` says
+    ///   where the search stopped, not that anything older matches.
     /// - When more than `limit` events match, `scanned_to` is the oldest revision returned.
     /// - One call examines at most [`REF_SCAN_BUDGET`] index rows. That only bounds a filter of
     ///   two or more fields (with one field every row examined matches); when it runs out, fewer
-    ///   than `limit` revisions come back, maybe none, and `scanned_to` says where it stopped.
+    ///   than `limit` revisions come back, maybe none, and `scanned_to` is where it stopped.
     ///
     /// # Errors
     ///

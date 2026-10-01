@@ -37,11 +37,14 @@ never both start from the same status). A second writer breaks that, so the proj
 deterministic under one (tested in `tests/single_writer.rs`):
 
 - a `task_created` whose key another task already holds is **not applied**: the first task keeps
-  the key and the refused event is recorded in `work_task_clashes`. The command that lost answers
-  `409 conflict`;
+  the key and the refused event is recorded in `work_task_clashes` (and `work.refs` ignores it
+  too). The command that lost answers `409 conflict`;
 - a `task_moved` whose `from` is not the task's status now **is ignored**: it lost a race with
-  another move;
-- any uniqueness violation that still reaches a command is a `409 conflict`, never a `500`.
+  another move. `move_task` and `dispatch_working` check where the task ended up after their
+  append, and answer `409 conflict` when it is not where they moved it;
+- a `UNIQUE` or `PRIMARY KEY` violation that still reaches a command is a `409 conflict`, never a
+  `500`. Any other constraint violation (`NOT NULL`, `CHECK`, a foreign key) is a bug in a
+  projection: a `500`, logged as an error.
 
 ## Projections
 
@@ -82,7 +85,7 @@ change.
 **Sessions: firm links stay.** A link made by a dispatch, a person or the agent itself
 (`dispatch`, `manual`, `claimed`) is never replaced by an inferred one (`folder`, `branch`,
 `imported`), nor by a re-stated `session_discovered` without a link. A firm link replaces any
-link.
+link. Agents stay the same way: a re-stated session without an `agent` keeps the one it had.
 
 **Briefs.** The projection reads only `text` and `pinned` from `brief_accepted`, and derives the
 rest: `updated` is the event's time; the source is `back_office` when the back office applied it
@@ -103,33 +106,46 @@ as they were **when the event happened**:
 - `dispatch_finished` and `ask_answered` are about their dispatch's or ask's task and session.
 
 The projection keeps what it needs for that in its own `work_ref_parents`, because a projection
-never reads another's tables. Events about none of them (machines, members, personas, teams) get
-no row.
+never reads another's tables, including which task holds each key, so that a `task_created`
+refused for a key clash changes no task's parents here either. Events about none of them
+(machines, members, personas, teams) get no row.
 
-`EventRefs::revs_matching(filter, before_rev, limit) -> (revs, scanned_to)` answers from it, for
-`GET /v1/events?project=&workstream=&task=&session=` (stream H wires it; see `src/activity.rs`
-for how the route maps it onto the page). It walks the index of the filter's most specific field
-and checks the others row by row, examining at most `REF_SCAN_BUDGET` (10,000) rows per call;
-`scanned_to` is where to continue, and is 0 exactly when nothing older matches.
+`EventRefs::revs_matching(filter, before_rev, limit) -> (revs, scanned_to)` answers from it. It
+is for the `project=` and `workstream=` filters of `GET /v1/events`, which need the roll-up
+(stream H wires it; see `src/activity.rs` for how the route maps it onto the page). The index
+keeps one task and one session per event, the event's own, so `task=` and `session=` keep
+stream H's matching of ids anywhere in the event body, which also catches ids an event names
+elsewhere. It walks the index of the filter's most specific field and checks the others row by
+row, examining at most `REF_SCAN_BUDGET` (10,000) rows per call. `scanned_to` is where to
+continue; it is 0 only when the search reached the start of the log (nothing older matches), and
+a non-zero one does not promise older matches.
 
 ## Dispatch
 
 `POST /v1/tasks/{id}/dispatch` (`WorkService::dispatch_task`, `src/dispatch.rs`):
 
-1. checks the request (`404` task; `400` agent, machine, or a person as the agent; `409` done or
-   canceled; `503` no live machine) and appends, in one transaction: `task_assigned` to the agent
-   if the task has none, `dispatch_started` (naming a new session id), and `session_discovered`
-   for that session (state `starting`, `link_basis: dispatch`);
+1. checks the request (`404` task, before the body is read; `400` agent, machine, or a person as
+   the agent; `409` done or canceled, or the agent already holds an active dispatch on the task,
+   such as a second click; `503` no live machine) and appends, in one transaction:
+   `task_assigned` to the agent if the task has none, `dispatch_started` (naming a new session
+   id), and `session_discovered` for that session (state `starting`, `link_basis: dispatch`);
 2. calls `Dispatcher::start` with a `DispatchRequest` (everything decided: machine, folder, engine,
    persona, model, permission mode, brief, the session id), without the command lock;
-3. if that fails, appends `dispatch_finished` (outcome `failed`, the reason as the summary) and
-   `session_ended`, and answers `503`, `409` or `500`. A panicking dispatcher counts as failed.
+3. if that fails, logs why, appends `dispatch_finished` (outcome `failed`, the reason as the
+   summary) and `session_ended`, and answers `503`, `409` or `500`. A panicking dispatcher counts
+   as failed.
 
 The machine is the request's, else the machine of the task's workstream's first location, else the
-project's root's, else the hub's own (`with_hub_machine`, or the first `local` machine). The folder
-is the first of those locations on that machine, else `~`. The engine, model and permission mode
-come from the agent's persona (Claude Code by default). Without a dispatcher the route answers
-`503`.
+project's root's, else the hub's own. **The daemon must name the hub's machine** with
+`with_hub_machine`; without it, a dispatch with nowhere else to run answers `503` (the hub does
+not guess one of the workspace's machines). The folder is the first of those locations on that
+machine, else `~`. The engine, model and permission mode come from the agent's persona (Claude
+Code by default). Without a dispatcher the route answers `503`.
+
+**For the runner link (stream D):** if the hub stops between step 1 and step 3, a `starting`
+session and an open dispatch are left behind. The runner link must reconcile them: on start-up,
+and when a start is not confirmed within its timeout, end the session and finish the dispatch as
+`failed`, or report the session it did start under the `DispatchRequest`'s session id.
 
 ## Commands
 
@@ -138,13 +154,14 @@ transaction, stamped from the `Caller` (`author` = the caller; `on_behalf_of` = 
 agents only). Commands run one at a time; reads never wait for them.
 
 Authorization comes before validation: the order is `404` for what the path names, `403`, `400`
-for the body, then `409`. The agent routes check who may write before they read the body, so a
-forbidden agent hears `403` whatever it sent.
+for the body, then `409`. Routes with a path and a body look up what the path names and check who
+may write before they read the body, so an unknown task is `404` and a forbidden agent hears `403`
+whatever it sent.
 
 | Command | Who | Refusals |
 |---|---|---|
 | `create_task` | person | 400 empty title, unknown project/workstream/assignee, workstream of another project, bad date; 409 key taken by a racing writer |
-| `move_task` | person; agent on its own task | 404; 403 agent on another's task; 409 when `can_move` says no |
+| `move_task` | person; agent on its own task | 404; 403 agent on another's task; 409 when `can_move` says no, or a racing writer moved the task first |
 | `assign_task` | person | 404; 400 unknown member |
 | `replace_subtasks` | person (whole list); agent on its own task (only its own `agent_plan` lines, in place) | 404; 403; 400 empty text, repeated ids, `agent_plan` naming a non-agent |
 | `post_comment` | person; agent on its own task | 404; 403; 400 empty text, unknown mention |
@@ -153,7 +170,7 @@ forbidden agent hears `403` whatever it sent.
 | `put_brief` | person | 404 unknown target |
 | `patch_workstream` | person | 404; 400 empty patch |
 | `dispatch_task` | person | see "Dispatch" |
-| `dispatch_working` | the runner link | moves the dispatched task to in progress as the agent, when the rules allow |
+| `dispatch_working` | the runner link | moves the dispatched task to in progress as the agent, when the rules allow; 409 for an ended dispatch, or a racing writer that moved the task first |
 | `mirror_plan` | the runner link | replaces the agent's `agent_plan` lines of its own task from a `PlanUpdated` |
 | `seed` | the daemon | imports a `DemoWorkspace` into an empty work model |
 
