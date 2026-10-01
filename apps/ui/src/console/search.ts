@@ -59,16 +59,17 @@ export function facetCount(facets: SessionFacets): number {
   return FACET_NAMES.reduce((sum, name) => sum + facets[name].length, 0);
 }
 
-/** What the session pane shows: the chat (the default) or the terminal (`?view=terminal`). */
-export type SessionView = 'chat' | 'terminal';
+/** What the session pane shows: the chat (the default), the terminal (`?view=terminal`) or its
+ * work (`?view=work`). */
+export type SessionView = 'chat' | 'terminal' | 'work';
 
 export function viewFromSearch(search: Readonly<Record<string, unknown>>): SessionView {
-  return search.view === 'terminal' ? 'terminal' : 'chat';
+  return search.view === 'terminal' ? 'terminal' : search.view === 'work' ? 'work' : 'chat';
 }
 
 /** `search` showing `view`; the chat, being the default, is no parameter at all. */
 export function searchWithView(search: Readonly<Record<string, unknown>>, view: SessionView): Record<string, unknown> {
   const next = Object.fromEntries(Object.entries(search).filter(([name]) => name !== 'view'));
-  if (view === 'terminal') next.view = 'terminal';
+  if (view !== 'chat') next.view = view;
   return next;
 }

@@ -8,9 +8,10 @@ every component are lazy chunks (render the components inside a `<Suspense>`).
 |---|---|
 | `index.ts` | `feature`: the routes `console` and `console/$session` (one lazy page for both) and the palette commands. The lazy component exports. |
 | `console-page.tsx` | `ConsolePage`: filters, list and session side by side, or one at a time when narrow. See [The page](#the-page). |
-| `search.ts` | The facets in the URL's search (`?machine=A,B&state=waiting`), and the session pane's view (`?view=terminal`). No React. |
-| `view-switch.tsx` | `ViewSwitch`: the session pane's Chat \| Terminal switch; without a terminal, Terminal stays focusable but does nothing, and the reason shows beside it. |
+| `search.ts` | The facets in the URL's search (`?machine=A,B&state=waiting`), and the session pane's view (`?view=terminal`, `?view=work`). No React. |
+| `view-switch.tsx` | `ViewSwitch`: the session pane's Chat \| Terminal \| Work switch; without a terminal, Terminal stays focusable but does nothing, and the reason shows beside it. Work is always available. |
 | `terminal/` | The terminal, a lazy chunk with xterm.js in it. See [The terminal](#the-terminal). |
+| `work-boundary.tsx` | `WorkBoundary`: the error boundary around `SessionWork`'s lazy chunk (`src/projects`), with "Try again" — the same shape as `TerminalBoundary`. |
 | `panes.ts` | The pane widths and whether the filters show, persisted in this browser as `pitcrew.console`. |
 | `intent.ts` | Hands a palette command's request (show the list, open a filter, filter by state) to the page, at once or as it mounts. No React. |
 | `session-list.tsx` | `SessionList` (live from the hub) and `SessionListView` (from data it is given): virtualised, grouped by project → workstream plus *Unsorted*, a "Starting…" row, listbox keyboard navigation. `onSelect(session, via)` says whether a click or the keyboard chose; `onActiveChange` reports the arrows' moves. It follows (and scrolls to) a selection made elsewhere. |
@@ -33,17 +34,26 @@ every component are lazy chunks (render the components inside a `<Suspense>`).
   `ResizablePanel`s beside the session; "Filters" in the list's header shows or hides the filters.
   Narrower, one pane shows at a time: the list, the filters or the session, each with a way back
   to the list.
-- **Chat or terminal.** Under the header, a Chat | Terminal switch. The terminal is in the URL's
-  search (`?view=terminal`, replacing the history entry), so a link or a reload shows it again;
-  choosing another session keeps it. A session without a `terminal` shows the chat, and the
-  switch's Terminal option is disabled with the reason ("This session has no terminal."). In a
-  narrow console the terminal takes the session pane: the header keeps only its title row.
+- **Chat, terminal or work.** Under the header, a Chat | Terminal | Work switch. The terminal and
+  work views are in the URL's search (`?view=terminal`, `?view=work`, replacing the history entry),
+  so a link or a reload shows them again; choosing another session keeps the choice. A session
+  without a `terminal` shows the chat, and the switch's Terminal option is disabled with the reason
+  ("This session has no terminal."); Work is always available, even for a session with no bursts of
+  work yet. In a narrow console the terminal and work views take the session pane: the header keeps
+  only its title row. Work mounts `SessionWork` (`src/projects`, lazy, under a `<Suspense>` and
+  `WorkBoundary`) as a third view rather than a collapsible section under the header, because it is
+  an alternative way to read the session — like the chat and the terminal, not a supplement to one
+  of them — and reuses the pane-switching machinery (the URL, F6, the narrow layout's rules) the
+  other two already have, instead of adding a second, different kind of toggle. The console gives
+  it no `ProjectsNavProvider` (that is `ProjectsLayout`'s, `src/projects`), so a block's task shows
+  as plain text, not a link, there; the session itself never shows (the console already is that
+  session's page).
 - **Keys.** F6 and Shift+F6 move between the panes: the filters, the list, then the transcript and
-  the composer, or the terminal in their place (those on screen). In the list, the arrows, Page
-  keys, Home and End choose the session beside it once they rest on one (150 ms); Enter or Space
-  opens it and goes to the composer. Only a terminal in control mode claims the shell's keys
-  (`ownsShellKeys`), and it keeps F6 too. In the composer, Ctrl B, Ctrl J and Ctrl . stay with the
-  text field, and Ctrl K opens the palette as everywhere.
+  the composer, or the terminal or work view in their place (those on screen). In the list, the
+  arrows, Page keys, Home and End choose the session beside it once they rest on one (150 ms); Enter
+  or Space opens it and goes to the composer. Only a terminal in control mode claims the shell's
+  keys (`ownsShellKeys`), and it keeps F6 too. In the composer, Ctrl B, Ctrl J and Ctrl . stay with
+  the text field, and Ctrl K opens the palette as everywhere.
 - **Palette.** "Go to the Agent console", "Jump to a session…", "Filter sessions by machine…" and
   "… by state…", "Show sessions waiting for input", "Show working sessions" and "Clear the session
   filters", in both layouts. A command goes to the console if needed and hands its request over
@@ -240,14 +250,19 @@ coloured dot beside `ink-2` text.
   `terminal-view.test.tsx` and `console-page.test.tsx` replace xterm with a fake, since happy-dom
   cannot draw one (the view's fake can hold back its write callbacks, for the flow control);
   `terminal-options.test.ts` covers keys, links, the theme and dim text;
-  `terminal-boundary.test.tsx` the error boundary.
+  `terminal-boundary.test.tsx` and `work-boundary.test.tsx` their error boundaries. The Work view
+  needs no `tz`: it shows `SessionWork`'s blocks (`useRecapBlocks`), not day paragraphs, and the
+  mock hub's blocks endpoint takes no `tz` at all (only `GET /v1/recaps/days` does).
 - **Playwright** (`src/console/tests/e2e`): the acceptance run in the real app against the mock
   hub, axe included (both themes, both layouts), on ports 47450 (hub) and 47451 (UI), which
   `E2E_HUB_PORT` and `E2E_UI_PORT` move. Traces are kept only for failures, in
   `apps/ui/test-results/console`. `terminal.spec.ts` reads the screen through xterm's screen reader
   rows (WebGL draws on a canvas), and forces the DOM renderer once per theme. The demo workspace
   has no session with a terminal on the unreachable machine, so the 503 spec tells the browser
-  that SES0005 has one (`page.route`); the hub still refuses its socket with a 503.
+  that SES0005 has one (`page.route`); the hub still refuses its socket with a 503. For the same
+  reason as the Vitest suite, this config's browser is not pinned to UTC (compare
+  `src/projects/tests/e2e/playwright.config.ts`, whose Summary days need `tz=0`): the Work view's
+  blocks need no `tz`.
 
   ```sh
   cd apps/ui

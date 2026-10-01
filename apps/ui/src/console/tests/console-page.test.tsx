@@ -88,7 +88,7 @@ function renderConsole(path: string) {
   const router = createAppRouter([feature], { history: createMemoryHistory({ initialEntries: [path] }) });
   // In Strict Mode at the root, as src/main.tsx mounts the app: effects run, are undone, and run
   // again.
-  renderWithHub(hub, <RouterProvider router={router} />, { strict: true });
+  const { requests } = renderWithHub(hub, <RouterProvider router={router} />, { strict: true });
   /** A palette command's context, as the shell's palette builds it. */
   const context: CommandContext = {
     workspace: WS,
@@ -102,7 +102,7 @@ function renderConsole(path: string) {
     act(() => command.run(context));
   };
   const location = () => router.state.location;
-  return { router, run, location };
+  return { router, run, location, requests };
 }
 
 const rowOf = (id: string) => document.querySelector<HTMLElement>(`[data-session="${id}"]`);
@@ -334,8 +334,51 @@ describe('the Agent console', () => {
     await screen.findByRole('group', { name: 'Terminal' });
   }, 20_000);
 
+  it("shows the session's work as a third view, kept in the URL", async () => {
+    const { location } = renderConsole(`${paths.session(WS, ID.ses1)}?view=work`);
+    await screen.findByRole('heading', { level: 2, name: 'Draft method section' }, { timeout: 8_000 });
+    const option = await screen.findByRole('radio', { name: 'Work' });
+    await eventually(() => expect(option.getAttribute('aria-checked')).toBe('true'));
+    // The chat and composer are gone while Work shows, as they are for the terminal.
+    expect(screen.queryByRole('group', { name: 'Transcript' })).toBeNull();
+    expect(pane('composer')).toBeNull();
+
+    const work = await screen.findByRole('region', { name: 'Work' });
+    await eventually(() =>
+      expect([...work.querySelectorAll('[data-summary]')].map((node) => node.textContent)).toEqual([
+        '@writer edited method.tex (+84 −12)',
+        '@sam dispatched @writer to PAP-1, @writer moved PAP-1 to in progress, updated the plan for PAP-1 (2 of 4 done)',
+      ]),
+    );
+    expect(within(work).getByText('1 file touched (+84 −12)')).toBeTruthy();
+
+    // F6 from the list reaches it, as it does the terminal.
+    const listbox = screen.getByRole('listbox', { name: 'Sessions' });
+    listbox.focus();
+    fireEvent.keyDown(listbox, { key: 'F6' });
+    expect(focusedPane()).toBe('work');
+
+    // Chat is the default again; the work view keeps no parameter once left.
+    fireEvent.click(screen.getByRole('radio', { name: 'Chat' }));
+    await eventually(() => expect(location().search).toEqual({}));
+    await screen.findByRole('group', { name: 'Transcript' });
+    expect(screen.queryByRole('region', { name: 'Work' })).toBeNull();
+
+    // Choosing Work again puts it back in the URL.
+    fireEvent.click(screen.getByRole('radio', { name: 'Work' }));
+    await eventually(() => expect(location().search).toEqual({ view: 'work' }));
+    await screen.findByRole('region', { name: 'Work' });
+  }, 20_000);
+
   it('says so when the session does not exist', async () => {
-    renderConsole(paths.session(WS, UNKNOWN));
+    const { requests } = renderConsole(paths.session(WS, UNKNOWN));
+    // Wait for the 404 itself first (the stream's `hello` can be slow on a busy machine, and that
+    // wait would otherwise be folded into, and indistinguishable from, the text's own timeout
+    // below).
+    await eventually(
+      () => expect(requests.some((r) => r.path === `/v1/sessions/${UNKNOWN}` && r.status === 404)).toBe(true),
+      { timeout: 8_000 },
+    );
     await screen.findByText('No such session', undefined, { timeout: 8_000 });
     expect(screen.getByRole('listbox', { name: 'Sessions' })).toBeTruthy();
   }, 20_000);

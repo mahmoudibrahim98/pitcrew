@@ -24,6 +24,7 @@ const filters = (page: Page) => page.getByRole('group', { name: 'Session filters
 const transcript = (page: Page) => page.getByRole('group', { name: 'Transcript' });
 const composer = (page: Page) => page.getByRole('textbox', { name: 'Message to the agent' });
 const row = (page: Page, id: string) => page.locator(`[data-session="${id}"]`);
+const work = (page: Page) => page.getByRole('region', { name: 'Work' });
 
 // The dev server compiles the app on its first page load, which can take longer than a test.
 test.beforeAll(async ({ browser }) => {
@@ -180,6 +181,29 @@ test('follows the task link into Projects', async ({ page }) => {
   await expect(sessionTitle(page, 'Draft method section')).toBeVisible();
 });
 
+test("shows SES0001's work, newest first, as a third view kept in the URL", async ({ page }, info) => {
+  await page.goto(consolePath(ID.ses1));
+  await expect(sessionTitle(page, 'Draft method section')).toBeVisible();
+  await page.getByRole('radio', { name: 'Work' }).click();
+  await expect(page).toHaveURL(atPath(`${consolePath(ID.ses1)}?view=work`));
+  await expect(transcript(page)).toHaveCount(0);
+  await expect(composer(page)).toHaveCount(0);
+  await expect(work(page).locator('[data-summary]')).toHaveText([
+    '@writer edited method.tex (+84 −12)',
+    '@sam dispatched @writer to PAP-1, @writer moved PAP-1 to in progress, updated the plan for PAP-1 (2 of 4 done)',
+  ]);
+  await expect(work(page).getByText('1 file touched (+84 −12)')).toBeVisible();
+  await page.screenshot({ path: info.outputPath('work-light.png') });
+
+  // A reload shows it again; Chat is the default once more, no parameter at all.
+  await page.reload();
+  await expect(work(page)).toBeVisible();
+  await page.getByRole('radio', { name: 'Chat' }).click();
+  await expect(page).toHaveURL(atPath(consolePath(ID.ses1)));
+  await expect(transcript(page)).toBeVisible();
+  await expect(work(page)).toHaveCount(0);
+});
+
 test('a narrow window shows one pane at a time, with a way back', async ({ page }, info) => {
   await page.setViewportSize({ width: 700, height: 800 });
   await page.goto(consolePath());
@@ -234,6 +258,19 @@ for (const theme of ['light', 'dark'] as const) {
         await expect(filters(page)).toBeVisible();
       }
       await page.screenshot({ path: info.outputPath(`list-${layout}-${theme}.png`) });
+      expect(await axeViolations(page)).toEqual([]);
+    });
+
+    test(`axe finds no violations with the session's work open: ${layout}, ${theme}`, async ({ page }, info) => {
+      await page.emulateMedia({ colorScheme: theme, reducedMotion: 'reduce' });
+      if (layout === 'narrow') await page.setViewportSize({ width: 700, height: 800 });
+      await page.goto(`${consolePath(ID.ses1)}?view=work`);
+      await page.getByRole('radio', { name: theme === 'light' ? 'Light' : 'Dark' }).click();
+      await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
+      await expect(page.locator('[data-console-layout]')).toHaveAttribute('data-console-layout', layout);
+
+      await expect(work(page).locator('[data-summary]')).toHaveCount(2);
+      await page.screenshot({ path: info.outputPath(`work-${layout}-${theme}.png`) });
       expect(await axeViolations(page)).toEqual([]);
     });
   }

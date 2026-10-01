@@ -1,6 +1,7 @@
-// The session pane's Chat | Terminal switch. The choice lives in the URL (`?view=terminal`, see
-// search.ts). Without a terminal the Terminal option stays focusable, so its reason is reachable
-// from the keyboard, but choosing it does nothing, and the reason shows beside it.
+// The session pane's Chat | Terminal | Work switch. The choice lives in the URL (`?view=terminal`
+// or `?view=work`, see search.ts). Without a terminal the Terminal option stays focusable, so its
+// reason is reachable from the keyboard, but choosing it does nothing, and the reason shows beside
+// it. Work is always available: every session, even one with no bursts of work yet, can show it.
 
 import { ToggleGroup } from 'radix-ui';
 import { useId } from 'react';
@@ -26,7 +27,7 @@ export function ViewSwitch({ value, onChange, terminalUnavailable }: ViewSwitchP
         type="single"
         value={value}
         onValueChange={(next) => {
-          if (next === 'chat' || (next === 'terminal' && !unavailable)) onChange(next);
+          if (next === 'chat' || next === 'work' || (next === 'terminal' && !unavailable)) onChange(next);
         }}
         aria-label="Session view"
         className="inline-flex rounded-sm border border-line bg-sunken p-0.5"
@@ -41,6 +42,9 @@ export function ViewSwitch({ value, onChange, terminalUnavailable }: ViewSwitchP
           className={cx(ITEM, unavailable && 'cursor-not-allowed opacity-50')}
         >
           Terminal
+        </ToggleGroup.Item>
+        <ToggleGroup.Item value="work" className={ITEM}>
+          Work
         </ToggleGroup.Item>
       </ToggleGroup.Root>
       {unavailable && (
