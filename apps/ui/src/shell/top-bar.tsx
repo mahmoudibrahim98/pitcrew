@@ -11,7 +11,7 @@ import {
   useWorkspace,
   useWorkstreams,
 } from '../data/index.ts';
-import { Button, Kbd, SearchIcon, SparkleIcon, StatusPill, Tooltip } from '../design/index.ts';
+import { Button, FOCUS_RING, Kbd, SearchIcon, SparkleIcon, StatusPill, Tooltip } from '../design/index.ts';
 import { cx } from '../lib/cx.ts';
 import { ariaShortcut } from '../lib/platform.ts';
 import { NewMenu } from './create.tsx';
@@ -41,7 +41,10 @@ function LayoutSwitcher() {
           <ToggleGroup.Item
             key={id}
             value={id}
-            className="h-6 rounded-sm px-2.5 text-sm text-ink-2 outline-none hover:text-ink focus-visible:outline-2 focus-visible:outline-accent data-[state=on]:bg-card data-[state=on]:font-medium data-[state=on]:text-ink data-[state=on]:shadow-[0_0_0_1px_var(--pc-line)]"
+            className={cx(
+              'h-6 rounded-sm px-2.5 text-sm text-ink-2 outline-none hover:text-ink data-[state=on]:bg-card data-[state=on]:font-medium data-[state=on]:text-ink data-[state=on]:shadow-[0_0_0_1px_var(--pc-line)]',
+              FOCUS_RING,
+            )}
           >
             {LAYOUTS[id].label}
           </ToggleGroup.Item>
@@ -90,42 +93,85 @@ function useCrumbs(): Crumb[] {
   return crumbs;
 }
 
+/** A separator between two crumbs. */
+function Sep() {
+  return (
+    <span aria-hidden className="shrink-0 text-line-2">
+      /
+    </span>
+  );
+}
+
+function CrumbLink({ crumb, last }: { crumb: Crumb; last: boolean }) {
+  if (last || crumb.to === undefined) {
+    return (
+      <span aria-current={last ? 'page' : undefined} className={cx('truncate', last ? 'font-medium text-ink' : 'text-ink-2')}>
+        {crumb.label}
+      </span>
+    );
+  }
+  return (
+    <Link to={crumb.to} activeOptions={{ exact: true }} className="truncate text-ink-2 hover:text-ink hover:underline">
+      {crumb.label}
+    </Link>
+  );
+}
+
+/**
+ * Everything before the current page, once there is no room to show it: a single marker that
+ * keeps those segments reachable by name (hover, or keyboard focus) instead of truncating one of
+ * them into something unreadable.
+ */
+function CollapsedCrumbs({ labels }: { labels: readonly string[] }) {
+  const text = labels.join(' / ');
+  return (
+    <Tooltip content={text} side="bottom">
+      <button
+        type="button"
+        aria-label={`Collapsed: ${text}`}
+        // The "…" is drawn with CSS, not as text: a display:none element's text still counts
+        // toward its ancestors' textContent, which would otherwise leak into it even while hidden.
+        className={cx(
+          "flex size-5 shrink-0 items-center justify-center rounded-sm text-ink-2 outline-none before:content-['…'] hover:bg-hover hover:text-ink @4xl:hidden",
+          FOCUS_RING,
+        )}
+      />
+    </Tooltip>
+  );
+}
+
 function Breadcrumb() {
   const crumbs = useCrumbs();
+  const last = crumbs[crumbs.length - 1];
+  // Collapsed first, not truncated: everything before the current page gives way before it does,
+  // so the page on screen stays readable instead of being crushed to a sliver alongside it.
+  const rest = crumbs.slice(0, -1);
+  const fullPath = crumbs.map((c) => c.label).join(' / ');
+  if (last === undefined) return <nav aria-label="Breadcrumb" className="min-w-0 flex-1" />;
+
   return (
     <nav aria-label="Breadcrumb" className="min-w-0 flex-1">
-      <ol className="flex min-w-0 items-center gap-1.5 text-sm">
-        {crumbs.map((crumb, i) => {
-          const last = i === crumbs.length - 1;
-          // On a narrow bar only the last two crumbs show; when space runs out, the earlier give
-          // way first.
-          const early = i < crumbs.length - 2;
-          return (
-            <li
-              key={`${i}-${crumb.label}`}
-              className={cx(
-                'min-w-0 items-center gap-1.5',
-                early ? 'hidden @4xl:flex' : 'flex',
-                last ? 'shrink' : 'max-w-48 shrink-[8]',
-              )}
-            >
-              {i > 0 && (
-                <span aria-hidden className={cx('text-line-2', i === crumbs.length - 2 && '@max-4xl:hidden')}>
-                  /
+      {/* The full path stays available to assistive tech even once the lead-up collapses visually. */}
+      <ol className="flex min-w-0 items-center gap-1.5 text-sm" aria-label={rest.length > 0 ? fullPath : undefined}>
+        {rest.length > 0 && (
+          <li className="flex min-w-0 shrink items-center gap-1.5">
+            {/* The full trail once there is room. */}
+            <span className="hidden min-w-0 items-center gap-1.5 @4xl:flex">
+              {rest.map((crumb, i) => (
+                <span key={`${i}-${crumb.label}`} className="flex min-w-0 max-w-48 items-center gap-1.5">
+                  {i > 0 && <Sep />}
+                  <CrumbLink crumb={crumb} last={false} />
                 </span>
-              )}
-              {last || crumb.to === undefined ? (
-                <span aria-current={last ? 'page' : undefined} className={cx('truncate', last ? 'font-medium text-ink' : 'text-ink-2')}>
-                  {crumb.label}
-                </span>
-              ) : (
-                <Link to={crumb.to} activeOptions={{ exact: true }} className="truncate text-ink-2 hover:text-ink hover:underline">
-                  {crumb.label}
-                </Link>
-              )}
-            </li>
-          );
-        })}
+              ))}
+            </span>
+            {/* Collapsed below that: still reachable by name, not gone. */}
+            <CollapsedCrumbs labels={rest.map((c) => c.label)} />
+          </li>
+        )}
+        <li className="flex min-w-0 shrink items-center gap-1.5">
+          {rest.length > 0 && <Sep />}
+          <CrumbLink crumb={last} last />
+        </li>
       </ol>
     </nav>
   );

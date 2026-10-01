@@ -1,7 +1,8 @@
 // The Orchestrator panel frame (Ctrl J): resizable, with its open state and width persisted. Its
 // conversation comes later; for now it shows an empty state.
 
-import { CloseIcon, ResizablePanel, SparkleIcon, Tooltip } from '../design/index.ts';
+import { CloseIcon, FOCUS_RING, ResizablePanel, SparkleIcon, Tooltip } from '../design/index.ts';
+import { cx } from '../lib/cx.ts';
 import { SHORTCUTS } from './shortcuts.ts';
 import { ORCHESTRATOR_WIDTH, useShell } from './store.ts';
 
@@ -26,7 +27,10 @@ export function OrchestratorPanel() {
             type="button"
             aria-label="Close the Orchestrator"
             onClick={() => setOpen(false)}
-            className="ml-auto inline-flex size-7 items-center justify-center rounded-sm text-ink-2 outline-none hover:bg-hover hover:text-ink focus-visible:outline-2 focus-visible:outline-accent"
+            className={cx(
+              'ml-auto inline-flex size-7 items-center justify-center rounded-sm text-ink-2 outline-none hover:bg-hover hover:text-ink',
+              FOCUS_RING,
+            )}
           >
             <CloseIcon />
           </button>

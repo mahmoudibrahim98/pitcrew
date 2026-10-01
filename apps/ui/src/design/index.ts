@@ -2,6 +2,7 @@ export { Avatar, avatarLabel, initials, type AvatarMember } from './avatar.tsx';
 export { Badge, type BadgeTone } from './badge.tsx';
 export { Button } from './button.tsx';
 export { Dialog, DialogClose, DialogContent, DialogFooter, DialogTrigger } from './dialog.tsx';
+export { FOCUS_RING } from './focus.ts';
 export * from './icons.tsx';
 export { Kbd } from './kbd.tsx';
 export {
