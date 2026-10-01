@@ -324,7 +324,8 @@ impl WorkService {
     /// # Errors
     ///
     /// `not_found` for an unknown task; `forbidden` for an agent on a task not its own;
-    /// `conflict` when `TaskStatus::can_move` refuses the move.
+    /// `conflict` when `TaskStatus::can_move` refuses the move, or when another writer moved the
+    /// task first (see "One writer" on [`WorkService`]).
     pub fn move_task(&self, caller: &Caller, task: &TaskRef, to: TaskStatus) -> Result<Task> {
         let _guard = self.lock();
         let task = self.read(|c| {
@@ -348,7 +349,25 @@ impl WorkService {
             mover,
         };
         self.append(&[self.by(caller, body)])?;
-        self.reload_task(task.id)
+        self.reload_moved(task.id, to)
+    }
+
+    /// Reads a task back after a move to `to`. Under one writer it is always there; if another
+    /// writer moved it first, the projection ignored this move as stale and the task is elsewhere,
+    /// so the command lost the race: `conflict`.
+    fn reload_moved(&self, id: TaskId, to: TaskStatus) -> Result<Task> {
+        let task = self.reload_task(id)?;
+        if task.status == to {
+            return Ok(task);
+        }
+        let name = |s: TaskStatus| crate::codec::enum_text(&s).unwrap_or_default();
+        Err(WorkError::conflict(format!(
+            "{} was moved to {} by another change at the same moment, so it was not moved to {}. \
+             Reload and try again.",
+            task.key,
+            name(task.status),
+            name(to)
+        )))
     }
 
     /// Assigns a task, or unassigns it with `None`. People only. Nothing is appended when the
@@ -684,7 +703,8 @@ impl WorkService {
     ///
     /// # Errors
     ///
-    /// `not_found` for an unknown dispatch or task; `conflict` when the dispatch has ended.
+    /// `not_found` for an unknown dispatch or task; `conflict` when the dispatch has ended, or
+    /// when another writer moved the task first.
     pub fn dispatch_working(&self, id: &DispatchId) -> Result<Task> {
         let _guard = self.lock();
         let (dispatch, task, owner) = self.read(|c| {
@@ -710,7 +730,7 @@ impl WorkService {
             mover,
         };
         self.append(&[self.event(dispatch.agent, owner, body)])?;
-        self.reload_task(task.id)
+        self.reload_moved(task.id, TaskStatus::InProgress)
     }
 
     /// Mirrors an agent's live plan (a `PlanUpdated` from its session) as the subtasks of the

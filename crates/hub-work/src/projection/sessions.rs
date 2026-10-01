@@ -4,6 +4,9 @@
 //! `manual`, `claimed`) is never replaced by an inferred one (`folder`, `branch`, `imported`) or
 //! by a re-stated `session_discovered` that carries no link. The runner re-states sessions as it
 //! learns more about them, and must not undo a dispatch's link by doing so.
+//!
+//! **Agents stay too.** A re-stated session without an `agent` keeps the agent it had (the one a
+//! dispatch named, say); one that names an agent takes it.
 
 use super::{Applied, clear, exec};
 use crate::codec::{IdText, enum_text, opt_enum_col, opt_text, sql_rev};
@@ -20,7 +23,7 @@ pub struct Sessions;
 impl Sessions {
     /// The projection's name.
     pub const NAME: &'static str = "work.sessions";
-    /// 2: firm links are kept.
+    /// 2: firm links, and agents, are kept.
     const VERSION: u32 = 2;
 }
 
@@ -158,7 +161,7 @@ fn touch(tx: &Transaction<'_>, session: &SessionId, at: TimestampMs) -> Applied 
 }
 
 fn session_discovered(tx: &Transaction<'_>, rev: i64, s: &Session) -> Applied {
-    // A re-statement keeps a firm link it would otherwise lose.
+    // A re-statement keeps a firm link it would otherwise lose, and an agent it does not name.
     let keep_link = !replaces_link(link_basis(tx, &s.id)?, s.link_basis);
     exec(
         tx,
@@ -168,7 +171,7 @@ fn session_discovered(tx: &Transaction<'_>, rev: i64, s: &Session) -> Applied {
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
          ON CONFLICT (id) DO UPDATE SET engine = excluded.engine, native_id = excluded.native_id,
            machine = excluded.machine, cwd = excluded.cwd, branch = excluded.branch,
-           title = excluded.title, agent = excluded.agent,
+           title = excluded.title, agent = COALESCE(excluded.agent, agent),
            workstream = CASE WHEN ?19 THEN workstream ELSE excluded.workstream END,
            task = CASE WHEN ?19 THEN task ELSE excluded.task END,
            link_basis = CASE WHEN ?19 THEN link_basis ELSE excluded.link_basis END,

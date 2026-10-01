@@ -14,7 +14,9 @@
 //!
 //! The parents come from this projection's own `work_ref_parents`, never from the other work
 //! tables (a projection reads only its own), and follow the same rules: a session keeps a firm
-//! link (see [`super::Sessions`]). Events about none of them (machines, members, personas,
+//! link (see [`super::Sessions`]), and a `task_created` refused for a key clash (see
+//! [`super::Tasks`]) changes no task's parents; to tell, the index also keeps which task holds
+//! each key (rows of kind `task_key`). Events about none of them (machines, members, personas,
 //! teams) get no row.
 
 use super::sessions::replaces_link;
@@ -65,6 +67,9 @@ struct Parents {
 
 const WORKSTREAM: &str = "workstream";
 const TASK: &str = "task";
+/// Which task holds a key: `id` is the key (`PAP-4`), `task` the task. Kept to refuse clashing
+/// `task_created` events as `work.tasks` does, without reading its tables.
+const TASK_KEY: &str = "task_key";
 const SESSION: &str = "session";
 const DISPATCH: &str = "dispatch";
 const ASK: &str = "ask";
@@ -179,12 +184,32 @@ fn direct(tx: &Transaction<'_>, body: &EventBody) -> Result<About, BoxError> {
         }
         EventBody::TaskCreated { task } => {
             let id = task.id.text();
-            let p = Parents {
-                project: Some(task.project.text()),
-                workstream: task.workstream.as_ref().map(IdText::text),
-                ..Parents::default()
-            };
-            remember(tx, TASK, &id, &p)?;
+            let key = task.key.to_string();
+            // `work.tasks` refuses a `task_created` whose key another task holds (a clash); so
+            // does the index. The refused event is still about the task it names, but changes
+            // no task's parents.
+            let holder = parents(tx, TASK_KEY, &key)?.task;
+            if holder.as_ref().is_none_or(|h| *h == id) {
+                if parents(tx, TASK, &id)?.project.is_some() {
+                    // A re-stated task may come with another key, freeing its old one.
+                    exec(
+                        tx,
+                        "DELETE FROM work_ref_parents WHERE kind = ?1 AND task = ?2 AND id <> ?3",
+                        params![TASK_KEY, id, key],
+                    )?;
+                }
+                let p = Parents {
+                    project: Some(task.project.text()),
+                    workstream: task.workstream.as_ref().map(IdText::text),
+                    ..Parents::default()
+                };
+                remember(tx, TASK, &id, &p)?;
+                let holds = Parents {
+                    task: Some(id.clone()),
+                    ..Parents::default()
+                };
+                remember(tx, TASK_KEY, &key, &holds)?;
+            }
             about.task = Some(id);
         }
         EventBody::TaskUpdated { task, patch } => {

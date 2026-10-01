@@ -13,7 +13,8 @@
 //!
 //! **One writer.** Exactly one `Arc<WorkService>` per store appends work events; everything that
 //! changes the work model goes through it (see [`WorkService`], "One writer"). The projections
-//! stay deterministic if that rule is broken, but commands then lose races with `409 conflict`.
+//! stay deterministic if that rule is broken, but commands then lose races: a task created with a
+//! key another writer took, or moved after another writer moved it, answers `409 conflict`.
 //!
 //! ```no_run
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {

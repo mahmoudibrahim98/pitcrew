@@ -5,18 +5,22 @@
 
 mod common;
 
-use common::{PAPER, SAM, TOOLING, WRITER, agent, app, call, demo, expect, member, person, seeded};
+use common::{
+    PAPER, RUNNER, SAM, TOOLING, WRITER, agent, app, call, demo, expect, member, person, seeded,
+};
 use pitcrew_hub_work::projection::NAMES;
-use pitcrew_hub_work::{NewTask, TaskRef, WorkService, projections};
+use pitcrew_hub_work::{EventRefs, NewTask, RefFilter, TaskRef, WorkService, projections};
 use pitcrew_protocol::api::{Caller, ErrorCode, TokenScope};
 use pitcrew_protocol::events::{Event, EventBody};
-use pitcrew_protocol::ids::{EventId, ProjectId, ProjectKey, TaskId, TaskKey};
-use pitcrew_protocol::model::{Mover, Project, ProjectStatus, Task, TaskStatus};
+use pitcrew_protocol::ids::{
+    DispatchId, EventId, ProjectId, ProjectKey, TaskId, TaskKey, WorkstreamId,
+};
+use pitcrew_protocol::model::{Dispatch, Mover, Project, ProjectStatus, Task, TaskStatus};
 use pitcrew_store::{Store, StoreOptions};
 use serde_json::json;
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 fn event(body: EventBody) -> Event {
     Event {
@@ -138,6 +142,86 @@ fn a_task_created_with_a_taken_key_is_recorded_not_applied() {
 }
 
 #[test]
+fn a_refused_task_created_moves_nothing_in_the_activity_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let work = seeded(dir.path());
+    let demo = demo();
+    let sibling = |t: &Task| {
+        demo.workstreams
+            .iter()
+            .find(|w| w.project == t.project && Some(w.id) != t.workstream)
+            .map(|w| w.id)
+    };
+    let victim = demo
+        .tasks
+        .iter()
+        .find(|t| t.workstream.is_some() && sibling(t).is_some())
+        .expect("a task whose project has another workstream")
+        .clone();
+    let holder = demo
+        .tasks
+        .iter()
+        .find(|t| t.project == victim.project && t.id != victim.id)
+        .expect("another task in the project");
+    let (home, elsewhere) = (
+        victim.workstream.expect("workstream"),
+        sibling(&victim).expect("sibling"),
+    );
+    let append = |body: EventBody| work.store().append(&[event(body)]).expect("append").to_rev;
+    let revs = |workstream: WorkstreamId| {
+        let filter = RefFilter {
+            workstream: Some(workstream),
+            ..RefFilter::default()
+        };
+        work.revs_matching(&filter, u64::MAX, 500).expect("revs").0
+    };
+
+    // A re-statement of the victim that would take the holder's key and another workstream, and
+    // a new task with the holder's key there: both refused by the task tables.
+    let mut restated = victim.clone();
+    restated.key = holder.key.clone();
+    restated.workstream = Some(elsewhere);
+    append(EventBody::TaskCreated { task: restated });
+    let mut intruder = task_with_key(&holder.key.to_string(), "Intruder");
+    intruder.project = victim.project;
+    intruder.workstream = Some(elsewhere);
+    append(EventBody::TaskCreated {
+        task: intruder.clone(),
+    });
+    // Later events about them are indexed as the task tables see the tasks.
+    let about_victim = append(EventBody::TaskAssigned {
+        task: victim.id,
+        assignee: Some(member(WRITER)),
+    });
+    let about_intruder = append(EventBody::TaskAssigned {
+        task: intruder.id,
+        assignee: Some(member(WRITER)),
+    });
+    assert_eq!(task(&work, &victim.key.to_string()).workstream, Some(home));
+    assert!(revs(home).contains(&about_victim));
+    let there = revs(elsewhere);
+    assert!(!there.contains(&about_victim), "the victim did not move");
+    assert!(
+        !there.contains(&about_intruder),
+        "the intruder has no parents"
+    );
+
+    // A re-statement with the victim's own key does apply, in both.
+    let mut moved = victim.clone();
+    moved.workstream = Some(elsewhere);
+    append(EventBody::TaskCreated { task: moved });
+    let after = append(EventBody::TaskAssigned {
+        task: victim.id,
+        assignee: None,
+    });
+    assert_eq!(
+        task(&work, &victim.key.to_string()).workstream,
+        Some(elsewhere)
+    );
+    assert!(revs(elsewhere).contains(&after));
+}
+
+#[test]
 fn a_clash_appended_without_the_projections_is_caught_up_on_open() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("hub.db");
@@ -213,6 +297,112 @@ fn a_move_from_a_status_the_task_has_left_is_ignored() {
     assert_eq!(task(&work, "PAP-2").status, TaskStatus::Review);
     work.store().rebuild("work.tasks").expect("rebuild");
     assert_eq!(task(&work, "PAP-2").status, TaskStatus::Review);
+}
+
+/// The pending event a racing writer appends: the service's clock appends it the next time it
+/// runs, which is between a command's checks and its append.
+type Race = Arc<Mutex<Option<EventBody>>>;
+
+/// A second service on `seeded`'s store whose clock stands in for a racing writer.
+fn with_a_racing_writer(seeded: &WorkService) -> (Arc<WorkService>, Race) {
+    let store = Arc::clone(seeded.store());
+    let race: Race = Arc::default();
+    let pending = Arc::clone(&race);
+    let clock_store = Arc::clone(&store);
+    let work = WorkService::new(store, demo().workspace).with_clock(Arc::new(move || {
+        let body = pending.lock().expect("race").take();
+        if let Some(body) = body {
+            clock_store.append(&[event(body)]).expect("racing append");
+        }
+        1_790_800_000_000
+    }));
+    (Arc::new(work), race)
+}
+
+#[tokio::test]
+async fn a_move_that_loses_a_race_is_a_409() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (work, race) = with_a_racing_writer(&seeded(dir.path()));
+    let app = app(&work);
+    let pap2 = task(&work, "PAP-2");
+    assert_eq!(pap2.status, TaskStatus::Todo);
+    let move_to = |to: &str| {
+        let app = app.clone();
+        let body = json!({ "to": to });
+        async move {
+            call(
+                &app,
+                Some(person(SAM)),
+                "POST",
+                "/v1/tasks/PAP-2/move",
+                Some(body),
+            )
+            .await
+        }
+    };
+    let race_to = |to: TaskStatus| {
+        let from = task(&work, "PAP-2").status;
+        *race.lock().expect("race") = Some(EventBody::TaskMoved {
+            task: pap2.id,
+            from,
+            to,
+            mover: Mover::Person,
+        });
+    };
+
+    // The other writer moves PAP-2 to in progress while this move to canceled is being made: the
+    // projection ignores this one as stale, and the command says so.
+    race_to(TaskStatus::InProgress);
+    let res = move_to("canceled").await;
+    expect(&res, 409);
+    let message = res.1["message"].as_str().expect("message");
+    assert!(message.contains("in_progress"), "{message}");
+    assert_eq!(task(&work, "PAP-2").status, TaskStatus::InProgress);
+
+    // Losing to a move to the same place leaves the task where it was asked to go: 200.
+    race_to(TaskStatus::Review);
+    let res = move_to("review").await;
+    expect(&res, 200);
+    assert_eq!(res.1["status"], "review");
+
+    // Without a race, a move goes through.
+    expect(&move_to("done").await, 200);
+    assert_eq!(task(&work, "PAP-2").status, TaskStatus::Done);
+}
+
+#[test]
+fn a_dispatch_working_that_loses_a_race_is_a_409() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (work, race) = with_a_racing_writer(&seeded(dir.path()));
+    let pap2 = task(&work, "PAP-2");
+    let dispatch = Dispatch {
+        id: DispatchId::new(),
+        task: pap2.id,
+        agent: member(RUNNER),
+        session: None,
+        brief: "Go".into(),
+        started: 1_790_800_000_000,
+        ended: None,
+        outcome: None,
+        summary: None,
+    };
+    work.store()
+        .append(&[event(EventBody::DispatchStarted {
+            dispatch: dispatch.clone(),
+        })])
+        .expect("append");
+    // A person cancels PAP-2 just as its dispatched session starts working.
+    *race.lock().expect("race") = Some(EventBody::TaskMoved {
+        task: pap2.id,
+        from: TaskStatus::Todo,
+        to: TaskStatus::Canceled,
+        mover: Mover::Person,
+    });
+    let err = work
+        .dispatch_working(&dispatch.id)
+        .expect_err("the move lost");
+    assert_eq!(err.code(), ErrorCode::Conflict, "{err}");
+    assert_eq!(task(&work, "PAP-2").status, TaskStatus::Canceled);
 }
 
 #[test]

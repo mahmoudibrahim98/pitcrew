@@ -3,8 +3,9 @@
 //!
 //! **Internal failures stay internal.** A `500 internal` is logged in full when it is made, with
 //! its whole cause chain, but the client only ever sees [`INTERNAL_MESSAGE`]: no SQLite text, no
-//! table, column or constraint names. A uniqueness violation from the store is a `409 conflict`
-//! (a racing change took the slot), with a generic message too.
+//! table, column or constraint names. A `UNIQUE` or `PRIMARY KEY` violation from the store is a
+//! `409 conflict` (a racing change took the slot), with a generic message too; any other
+//! constraint violation is a bug, so a `500`.
 
 use axum::Json;
 use axum::http::StatusCode;
@@ -113,7 +114,7 @@ impl WorkError {
             let _ = write!(detail, ": {cause}");
             source = cause.source();
         }
-        if is_constraint_violation(error) {
+        if is_duplicate(error) {
             tracing::warn!(detail = %detail, "work change refused by a uniqueness rule");
             return Self::conflict(CONFLICT_MESSAGE);
         }
@@ -121,17 +122,22 @@ impl WorkError {
     }
 }
 
-/// Whether SQLite refused a write because of a constraint (a unique key, most of all), anywhere in
-/// the cause chain.
-fn is_constraint_violation(error: &(dyn std::error::Error + 'static)) -> bool {
+/// Whether SQLite refused a write as a duplicate (a `UNIQUE` or `PRIMARY KEY` constraint),
+/// anywhere in the cause chain. Other constraints (`NOT NULL`, `CHECK`, foreign keys) are never
+/// a racing change, only a bug in a projection, so they stay internal errors.
+fn is_duplicate(error: &(dyn std::error::Error + 'static)) -> bool {
+    use pitcrew_store::sql::{Error as SqlError, ffi};
     let mut next = Some(error);
     while let Some(e) = next {
         let sql = e
             .downcast_ref::<pitcrew_store::DbError>()
             .map(pitcrew_store::DbError::as_sql)
-            .or_else(|| e.downcast_ref::<pitcrew_store::sql::Error>());
-        if sql.and_then(pitcrew_store::sql::Error::sqlite_error_code)
-            == Some(pitcrew_store::sql::ErrorCode::ConstraintViolation)
+            .or_else(|| e.downcast_ref::<SqlError>());
+        if let Some(SqlError::SqliteFailure(failure, _)) = sql
+            && matches!(
+                failure.extended_code,
+                ffi::SQLITE_CONSTRAINT_UNIQUE | ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+            )
         {
             return true;
         }
@@ -174,14 +180,46 @@ mod tests {
     use super::*;
     use pitcrew_store::sql::{Connection, ffi};
 
-    fn unique_violation() -> pitcrew_store::sql::Error {
+    /// The error SQLite gives for `insert` into a table made by `schema`.
+    fn violation(schema: &str, insert: &str) -> pitcrew_store::sql::Error {
         let conn = Connection::open_in_memory().expect("memory db");
-        conn.execute_batch(
+        conn.execute_batch(schema).expect("setup");
+        conn.execute(insert, []).expect_err("violation")
+    }
+
+    fn unique_violation() -> pitcrew_store::sql::Error {
+        violation(
             "CREATE TABLE secret_table (k TEXT PRIMARY KEY); INSERT INTO secret_table VALUES ('a');",
+            "INSERT INTO secret_table VALUES ('a')",
         )
-        .expect("setup");
-        conn.execute("INSERT INTO secret_table VALUES ('a')", [])
-            .expect_err("duplicate key")
+    }
+
+    #[test]
+    fn only_duplicates_are_conflicts() {
+        let unique = violation(
+            "CREATE TABLE t (k TEXT UNIQUE); INSERT INTO t VALUES ('a');",
+            "INSERT INTO t VALUES ('a')",
+        );
+        assert_eq!(WorkError::from(unique).code(), ErrorCode::Conflict);
+        for (schema, insert) in [
+            (
+                "CREATE TABLE t (k TEXT NOT NULL);",
+                "INSERT INTO t VALUES (NULL)",
+            ),
+            (
+                "CREATE TABLE t (k INTEGER CHECK (k > 0));",
+                "INSERT INTO t VALUES (0)",
+            ),
+            (
+                "PRAGMA foreign_keys = ON; CREATE TABLE p (k TEXT PRIMARY KEY);
+                 CREATE TABLE t (k TEXT REFERENCES p (k));",
+                "INSERT INTO t VALUES ('missing')",
+            ),
+        ] {
+            let error = WorkError::from(violation(schema, insert));
+            assert_eq!(error.code(), ErrorCode::Internal, "{insert}");
+            assert_eq!(error.to_api().message, INTERNAL_MESSAGE);
+        }
     }
 
     #[test]

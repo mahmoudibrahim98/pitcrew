@@ -147,12 +147,17 @@ async fn a_firm_link_survives_a_restatement_and_an_inferred_link() {
             }])
             .expect("append");
     };
-    // The runner re-states the session without its link, then infers one from the folder.
+    let dispatched_agent = ses1.agent.expect("the dispatched agent");
+    // The runner re-states the session without its link or its agent, then infers a link from
+    // the folder.
     ses1.workstream = None;
     ses1.task = None;
     ses1.link_basis = None;
+    ses1.agent = None;
     ses1.title = Some("Re-stated".into());
-    append(EventBody::SessionDiscovered { session: ses1 });
+    append(EventBody::SessionDiscovered {
+        session: ses1.clone(),
+    });
     append(EventBody::SessionLinked {
         session: SES1.parse().expect("id"),
         workstream: Some(PARSERS.parse().expect("ws")),
@@ -164,6 +169,16 @@ async fn a_firm_link_survives_a_restatement_and_an_inferred_link() {
     assert_eq!(got.1["task"], PAP1);
     assert_eq!(got.1["workstream"], SUBMISSION);
     assert_eq!(got.1["link_basis"], "dispatch");
+    assert_eq!(
+        got.1["agent"],
+        json!(dispatched_agent),
+        "the agent stays too"
+    );
+    // A re-statement that names an agent takes it.
+    ses1.agent = Some(member(SAM));
+    append(EventBody::SessionDiscovered { session: ses1 });
+    let got = get(&app, sam, &format!("/v1/sessions/{SES1}")).await;
+    assert_eq!(got.1["agent"], SAM);
     // A person's link replaces it.
     append(EventBody::SessionLinked {
         session: SES1.parse().expect("id"),
