@@ -11,7 +11,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [A-codex-adapter](A-codex-adapter.md) | A · Ingest | `s/A/codex-adapter` | Opus-class | **Merged** |
 | [A-opencode-adapter](A-opencode-adapter.md) | A · Ingest | `s/A/opencode-adapter` | Opus-class | **Merged** |
 | [B-control-mode-and-buffer](B-control-mode-and-buffer.md) | B · Runtime | `s/B/control-mode-and-buffer` | Opus-class | **Merged** |
-| [B-control-hardening](B-control-hardening.md) | B · Runtime | `s/B/control-hardening` | Opus-class | Merging (integrator/b-control) |
+| [B-control-hardening](B-control-hardening.md) | B · Runtime | `s/B/control-hardening` | Opus-class | **Merged** |
 | [C-open-and-log](C-open-and-log.md) | C · Store | `s/C/open-and-log` | Sonnet-class | **Merged** |
 | [C-store-hardening](C-store-hardening.md) | C · Store | `s/C/store-hardening` | Sonnet-class | **Merged** |
 | [C-projections](C-projections.md) | C · Store | `s/C/projections` | Sonnet-class | **Merged** |
@@ -63,7 +63,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [E-setup](E-setup.md) | E · Work model | `s/E/setup` | Sonnet-class | **Merged** |
 | [0-mock-setup](0-mock-setup.md) | 0 · Contracts | `integrator/mock-setup` | Sonnet-class | **Merged** |
 | [K-remote-workspaces](K-remote-workspaces.md) | K · Desktop shell | `s/K/remote-workspaces` | Opus-class | In progress |
-| [B-tmux-runtime](B-tmux-runtime.md) | B · Runtime | `s/B/tmux-runtime` | Opus-class | Next |
+| [B-tmux-runtime](B-tmux-runtime.md) | B · Runtime | `s/B/tmux-runtime` | Opus-class | In progress |
 | [0-daemon-setup](0-daemon-setup.md) | 0 · Composition root | `integrator/daemon-setup` | Opus-class | In progress |
 | [0-onboarding-wiring](0-onboarding-wiring.md) | 0 · Contracts | `integrator/onboarding-wiring` | Opus-class | In progress |
 | [0-hardening-sweep](0-hardening-sweep.md) | 0 · Contracts | `integrator/hardening-sweep` | Opus-class | In progress |
