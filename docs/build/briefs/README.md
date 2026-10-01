@@ -67,6 +67,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [0-daemon-setup](0-daemon-setup.md) | 0 · Composition root | `integrator/daemon-setup` | Opus-class | In progress |
 | [0-onboarding-wiring](0-onboarding-wiring.md) | 0 · Contracts | `integrator/onboarding-wiring` | Opus-class | In progress |
 | [0-hardening-sweep](0-hardening-sweep.md) | 0 · Contracts | `integrator/hardening-sweep` | Opus-class | In progress |
+| [D-runner-followups](D-runner-followups.md) | D · Runner | `s/D/runner-followups` | Opus-class | In progress |
 | [0-daemon-solo](0-daemon-solo.md) | 0 · Composition root | `integrator/daemon-solo` | Opus-class | **Merged** |
 | [N-projects-wiring](N-projects-wiring.md) | N · Projects layout | `s/N/projects-wiring` | Sonnet-class | **Merged** |
 | [L-shell-polish](L-shell-polish.md) | L · UI foundation | `s/L/shell-polish` | Sonnet-class | **Merged** |
