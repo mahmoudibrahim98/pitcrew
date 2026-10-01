@@ -17,7 +17,7 @@ import {
   sendText,
   waitOnAsk,
 } from './simulate.ts';
-import type { Hub } from './state.ts';
+import { DEV_AGENT_MEMBER, DEV_DEVICE_MEMBER, type Hub } from './state.ts';
 import { transcriptPage } from './transcripts.ts';
 import {
   ASK_KINDS,
@@ -83,27 +83,31 @@ export const PROTOCOL_MIN = 1;
 
 /** The mock's tokens. A `Map`, so no inherited object property can pass for a token. */
 const TOKENS = new Map<string, { member: MemberId; scope: TokenScope }>([
-  ['dev-device-token', { member: '01JB000000000000000MEM0001', scope: 'device' }],
-  ['dev-agent-token', { member: '01JB000000000000000MEM0002', scope: 'agent' }],
+  ['dev-device-token', { member: DEV_DEVICE_MEMBER, scope: 'device' }],
+  ['dev-agent-token', { member: DEV_AGENT_MEMBER, scope: 'agent' }],
 ]);
 
-/** Who is calling: the token's member and scope. */
+/**
+ * Who is calling: the token's scope and bound member id, always known, and the `Member` record,
+ * once one exists. Before `POST /v1/setup`, a fresh workspace knows no member yet, so `member` is
+ * `undefined` even though the token authenticates fine (api-v1.md, "The first run").
+ */
 export interface Caller {
-  member: Member;
+  memberId: MemberId;
+  member: Member | undefined;
   scope: TokenScope;
 }
 
-/** The caller for a token, or a 401. */
+/** The caller for a token, or a 401 for one the mock does not know at all. */
 export function authenticate(hub: Hub, token: string | undefined): Caller {
   if (token === undefined) {
     throw new ApiFailure('unauthorized', 'No token: send it in an "Authorization: Bearer" header.');
   }
   const grant = TOKENS.get(token);
-  const member = grant === undefined ? undefined : hub.findMember(grant.member);
-  if (grant === undefined || member === undefined) {
+  if (grant === undefined) {
     throw new ApiFailure('unauthorized', 'Unknown token.');
   }
-  return { member, scope: grant.scope };
+  return { memberId: grant.member, member: hub.findMember(grant.member), scope: grant.scope };
 }
 
 /** The token in an `Authorization: Bearer <token>` header. */
@@ -242,15 +246,20 @@ function agentRef(hub: Hub, id: string, field: string): Member {
 // ─── Scope rules ────────────────────────────────────────────────────────────────────────────────
 // Agents read everything on their routes; they write only to their own tasks and sessions.
 
+/** A readable name for error messages, even before the caller's member exists (fresh mode). */
+function callerHandle(caller: Caller): string {
+  return caller.member?.handle ?? caller.memberId;
+}
+
 function requireOwnTask(hub: Hub, caller: Caller, task: Task): void {
-  if (caller.scope === 'agent' && !hub.isOwnTask(task, caller.member.id)) {
-    throw forbidden(`${caller.member.handle} may only change its own tasks; ${task.key} is not one.`);
+  if (caller.scope === 'agent' && !hub.isOwnTask(task, caller.memberId)) {
+    throw forbidden(`${callerHandle(caller)} may only change its own tasks; ${task.key} is not one.`);
   }
 }
 
 function requireOwnSession(caller: Caller, session: Session): void {
-  if (caller.scope === 'agent' && session.agent !== caller.member.id) {
-    throw forbidden(`${caller.member.handle} may only act on its own sessions.`);
+  if (caller.scope === 'agent' && session.agent !== caller.memberId) {
+    throw forbidden(`${callerHandle(caller)} may only act on its own sessions.`);
   }
 }
 
@@ -259,18 +268,17 @@ function requireOwnSession(caller: Caller, session: Session): void {
  * answers only questions and mentions addressed to itself. Returns why not, or `undefined`.
  */
 function answerRefusal(hub: Hub, caller: Caller, ask: Ask): string | undefined {
-  const me = caller.member;
   if (caller.scope === 'agent') {
-    if (ask.to !== me.id) {
-      return `${me.handle} may only answer asks addressed to itself.`;
+    if (ask.to !== caller.memberId) {
+      return `${callerHandle(caller)} may only answer asks addressed to itself.`;
     }
     if (ask.kind !== 'question' && ask.kind !== 'mention') {
       return `A ${ask.kind} must be answered with a device token.`;
     }
     return undefined;
   }
-  if (ask.to !== me.id && hub.findMember(ask.to)?.owner !== me.id) {
-    return `${me.handle} may only answer asks addressed to them or to their agents.`;
+  if (ask.to !== caller.memberId && hub.findMember(ask.to)?.owner !== caller.memberId) {
+    return `${callerHandle(caller)} may only answer asks addressed to them or to their agents.`;
   }
   return undefined;
 }
@@ -317,6 +325,59 @@ function hostInfo(hub: Hub): HostInfo {
   };
 }
 
+/** `@` followed by 1 to 32 of lower-case letters, digits, `_` or `-` (api-v1.md, "The first run"). */
+const SETUP_HANDLE = /^@[a-z0-9_-]{1,32}$/;
+/** C0 and C1 control characters, disallowed in every `Setup` string. */
+const CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F]/;
+
+function requireSetupText(value: string, field: string, max: number): void {
+  if (charCount(value) < 1 || charCount(value) > max) {
+    throw invalid(`${field} must be 1 to ${max} characters.`);
+  }
+  if (CONTROL_CHARS.test(value)) {
+    throw invalid(`${field} must not contain control characters.`);
+  }
+}
+
+/**
+ * `POST /v1/setup`: the first run of a fresh hub. Device tokens only (an agent token never
+ * reaches the handler; `handleApi` answers 403 first, since the route is `device`-only).
+ *
+ * In demo mode the workspace already has a person, so this always answers 409, whatever the body
+ * holds (api-v1.md, "The mock starts with the demo's person").
+ */
+const setupHub: Handler = (hub, ctx) => {
+  if (!hub.setupNeeded) {
+    throw conflict('This workspace is already set up.');
+  }
+  const fields = new Fields(ctx.body);
+  const workspaceName = fields.text('workspace_name');
+  requireSetupText(workspaceName, 'workspace_name', 80);
+  const person = new Fields(fields.raw('person'), fields.name('person'));
+  const name = person.text('name');
+  requireSetupText(name, 'person.name', 80);
+  const handle = person.string('handle');
+  if (!SETUP_HANDLE.test(handle)) {
+    throw invalid('person.handle must be "@" followed by 1 to 32 of a-z, 0-9, "_" or "-".');
+  }
+  const machineName = fields.text('machine_name');
+  requireSetupText(machineName, 'machine_name', 60);
+  if (hub.members.some((m) => m.handle === handle)) {
+    throw conflict(`The handle ${handle} is already taken.`);
+  }
+  // The person is the device token's own member id, which nothing knew until now.
+  const me = ctx.caller.memberId;
+  const member: Member = { id: me, kind: 'human', handle, name };
+  const machine: Machine = { id: ulid(), name: machineName, kind: 'local', liveness: 'live' };
+  hub.members.push(member);
+  hub.machines.push(machine);
+  hub.workspace.name = workspaceName;
+  // One append: both events reach a connected stream in the same batch.
+  hub.append(me, { type: 'member_added', data: { member } });
+  hub.append(me, { type: 'machine_added', data: { machine } });
+  return ok({ workspace: hub.workspace, me: member, machine });
+};
+
 // ─── Projects and workstreams ───────────────────────────────────────────────────────────────────
 
 /** `ProjectKey` in ids.rs: 2–10 characters, an uppercase letter, then uppercase letters or digits. */
@@ -334,7 +395,7 @@ const createProject: Handler = (hub, ctx) => {
   }
   const name = fields.text('name');
   const leadId = fields.optString('lead');
-  const lead = leadId === undefined ? ctx.caller.member.id : memberRef(hub, leadId, 'lead').id;
+  const lead = leadId === undefined ? ctx.caller.memberId : memberRef(hub, leadId, 'lead').id;
   const members: MemberId[] = [];
   for (const [i, id] of (fields.optStringArray('members') ?? []).entries()) {
     const member = memberRef(hub, id, `members[${i}]`).id;
@@ -368,7 +429,7 @@ const createProject: Handler = (hub, ctx) => {
     external: [],
   };
   hub.projects.push(project);
-  hub.append(ctx.caller.member.id, { type: 'project_created', data: { project } });
+  hub.append(ctx.caller.memberId, { type: 'project_created', data: { project } });
   return created(project);
 };
 
@@ -393,7 +454,7 @@ const createWorkstream: Handler = (hub, ctx) => {
     external: [],
   };
   hub.workstreams.push(workstream);
-  hub.append(ctx.caller.member.id, { type: 'workstream_created', data: { workstream } });
+  hub.append(ctx.caller.memberId, { type: 'workstream_created', data: { workstream } });
   return created(workstream);
 };
 
@@ -429,7 +490,7 @@ const patchWorkstream: Handler = (hub, ctx) => {
   if (next.status !== workstream.status || next.health !== workstream.health) {
     workstream.status = next.status;
     workstream.health = next.health;
-    hub.append(ctx.caller.member.id, {
+    hub.append(ctx.caller.memberId, {
       type: 'workstream_changed',
       data: { workstream: workstream.id, ...next },
     });
@@ -481,7 +542,7 @@ const createTask: Handler = (hub, ctx) => {
     subtasks: [],
   };
   hub.tasks.push(task);
-  hub.append(ctx.caller.member.id, { type: 'task_created', data: { task } });
+  hub.append(ctx.caller.memberId, { type: 'task_created', data: { task } });
   return created(task);
 };
 
@@ -512,7 +573,7 @@ const moveTask: Handler = (hub, ctx) => {
   }
   const from = task.status;
   task.status = to;
-  hub.append(me.member.id, { type: 'task_moved', data: { task: task.id, from, to, mover } });
+  hub.append(me.memberId, { type: 'task_moved', data: { task: task.id, from, to, mover } });
   return ok(task);
 };
 
@@ -530,7 +591,7 @@ const assignTask: Handler = (hub, ctx) => {
     throw invalid('assignee is required; send null to unassign.');
   }
   const id = fields.optString('assignee');
-  assign(hub, ctx.caller.member.id, task, id === undefined ? undefined : memberRef(hub, id, 'assignee').id);
+  assign(hub, ctx.caller.memberId, task, id === undefined ? undefined : memberRef(hub, id, 'assignee').id);
   return ok(task);
 };
 
@@ -559,7 +620,7 @@ const patchTask: Handler = (hub, ctx) => {
   const patch = changedFields(task, readTaskPatch(hub, task, new Fields(ctx.body)));
   if (Object.keys(patch).length > 0) {
     applyPatch(task, patch);
-    hub.append(ctx.caller.member.id, { type: 'task_updated', data: { task: task.id, patch } });
+    hub.append(ctx.caller.memberId, { type: 'task_updated', data: { task: task.id, patch } });
   }
   return ok(task);
 };
@@ -744,7 +805,7 @@ const replaceSubtasks: Handler = (hub, ctx) => {
     throw invalid('The body must be an array of subtasks.');
   }
   const incoming = ctx.body.map((value, i) => readSubtask(hub, value, `[${i}]`));
-  const me = ctx.caller.member.id;
+  const me = ctx.caller.memberId;
   let subtasks = incoming;
   if (ctx.caller.scope === 'agent') {
     const ownPlan = (s: Subtask): boolean => s.source.kind === 'agent_plan' && s.source.agent === me;
@@ -788,7 +849,7 @@ const postComment: Handler = (hub, ctx) => {
     (id, i) => memberRef(hub, id, `mentions[${i}]`).id,
   );
   return created(
-    hub.append(ctx.caller.member.id, {
+    hub.append(ctx.caller.memberId, {
       type: 'comment_posted',
       data: { task: task.id, text, mentions },
     }),
@@ -810,7 +871,7 @@ const dispatchTask: Handler = (hub, ctx) => {
     throw conflict(`${task.key} is ${task.status}; reopen it before dispatching.`);
   }
   requireLive(place.machine);
-  const me = ctx.caller.member.id;
+  const me = ctx.caller.memberId;
   if (task.assignee === undefined) {
     assign(hub, me, task, agent.id);
   }
@@ -982,7 +1043,7 @@ const linkSession: Handler = (hub, ctx) => {
   session.workstream = workstream?.id;
   session.task = task?.id;
   session.link_basis = 'manual';
-  hub.append(ctx.caller.member.id, {
+  hub.append(ctx.caller.memberId, {
     type: 'session_linked',
     data: { session: session.id, workstream: workstream?.id, task: task?.id, basis: 'manual' },
   });
@@ -1012,7 +1073,7 @@ const raiseAsk: Handler = (hub, ctx) => {
   const ask: Ask = {
     id: ulid(),
     kind: fields.enumOf('kind', ASK_KINDS),
-    from: me.member.id,
+    from: me.memberId,
     to: memberRef(hub, fields.string('to'), 'to').id,
     task: task?.id,
     session: session?.id,
@@ -1030,8 +1091,8 @@ const raiseAsk: Handler = (hub, ctx) => {
     requireOwnSession(me, session);
   }
   hub.asks.push(ask);
-  hub.append(me.member.id, { type: 'ask_raised', data: { ask } });
-  if (session !== undefined && session.agent === me.member.id) {
+  hub.append(me.memberId, { type: 'ask_raised', data: { ask } });
+  if (session !== undefined && session.agent === me.memberId) {
     waitOnAsk(hub, session, ask);
   }
   return created(ask);
@@ -1081,14 +1142,14 @@ const answerAsk: Handler = (hub, ctx) => {
   if (refusal !== undefined) {
     throw forbidden(refusal);
   }
-  const me = ctx.caller.member;
+  const me = ctx.caller.memberId;
   if (ask.state !== 'open') {
     throw conflict(`This ask is already ${ask.state}.`);
   }
-  const answer: Answer = { by: me.id, option, text, at: Date.now() };
+  const answer: Answer = { by: me, option, text, at: Date.now() };
   ask.state = 'answered';
   ask.answer = answer;
-  hub.append(me.id, { type: 'ask_answered', data: { ask: ask.id, answer } });
+  hub.append(me, { type: 'ask_answered', data: { ask: ask.id, answer } });
   const session = ask.session === undefined ? undefined : hub.findSession(ask.session);
   if (session !== undefined) {
     resumeAfterAnswer(hub, session);
@@ -1113,7 +1174,7 @@ const putBrief: Handler = (hub, ctx) => {
   const acceptsProposal = proposal !== undefined && proposal.text === text && proposal.next === next;
   const receipts = acceptsProposal ? proposal.receipts : [];
   // Serde skips a `None` next and empty receipts, so the mock leaves them out too.
-  const event = hub.append(ctx.caller.member.id, {
+  const event = hub.append(ctx.caller.memberId, {
     type: 'brief_accepted',
     data: {
       target,
@@ -1349,8 +1410,13 @@ const route = (method: string, pattern: string, access: Route['access'], handler
 
 const ROUTES: Route[] = [
   // Host and workspace (`GET /v1/host/info` is handled before auth, in `handleApi`).
-  route('GET', '/v1/me', 'agent', (_hub, ctx) => ok(ctx.caller.member)),
-  route('GET', '/v1/workspace', 'device', (hub) => ok({ workspace: hub.workspace, rev: hub.rev })),
+  route('GET', '/v1/me', 'agent', (_hub, ctx) =>
+    ok(found(ctx.caller.member, 'No member yet; set up the workspace first.')),
+  ),
+  route('GET', '/v1/workspace', 'device', (hub) =>
+    ok({ workspace: hub.workspace, rev: hub.rev, ...(hub.setupNeeded ? { setup_needed: true } : {}) }),
+  ),
+  route('POST', '/v1/setup', 'device', setupHub),
   route('GET', '/v1/machines', 'device', (hub) => ok(hub.machines)),
   route('GET', '/v1/members', 'agent', (hub) => ok(hub.members)),
   route('GET', '/v1/personas', 'device', (hub) => ok(hub.personas)),
