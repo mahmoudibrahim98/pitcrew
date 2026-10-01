@@ -185,3 +185,88 @@ proptest! {
         check_receipts(&got, &allowed_receipts(&log));
     }
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 24, ..ProptestConfig::default() })]
+
+    /// With the directory bounded well under the world's own entities, evictions start from the
+    /// first events on (not just past 100,000). A live index kept current through them, through
+    /// the store, still equals a fresh service's rebuild with the same bound, and the engine over
+    /// the whole log with it.
+    #[test]
+    fn eviction_through_the_store_equals_a_rebuild(
+        specs in vec(spec(), 0..300),
+        sizes in vec(1usize..40, 1..20),
+        queries in vec(any::<u8>(), 1..20),
+        dir_limit in 1usize..6,
+        limit in 1usize..60,
+        names_change in any::<bool>(),
+    ) {
+        let world = World::new(2, 4, 8, 6);
+        let mut ids = Ids::default();
+        let setup = world.setup(&mut ids, T0 - 86_400_000);
+        let events = gen_events(&quiet(&specs, !names_change), &world, &mut ids, T0);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let work = WorkService::new(open_store(dir.path()), world.workspace.clone())
+            .with_recap_directory_limit(dir_limit);
+        work.store().append(&setup).expect("append");
+        let mut question = queries.iter().cycle();
+        for batch in batches(&events, &sizes) {
+            work.store().append(batch).expect("append");
+            ask(&work, &world, question.next().copied().unwrap_or(0), limit);
+        }
+        let incremental = dump(&work, &world, limit);
+        let rebuilt = WorkService::new(Arc::clone(work.store()), world.workspace.clone())
+            .with_recap_directory_limit(dir_limit);
+        prop_assert_eq!(&dump(&rebuilt, &world, limit), &incremental);
+        let log = log_events(&work);
+        let oracle = Oracle::with_config(&log, Directory::with_limit(dir_limit), &Config::default());
+        prop_assert_eq!(&oracle_dump(&oracle, &world), &incremental);
+        check_receipts(&incremental, &allowed_receipts(&log));
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 128, ..ProptestConfig::default() })]
+
+    /// The same in memory, with other engine settings and caches as small as nothing too: any
+    /// batching, with queries in between, gives what one push of everything gives, and what the
+    /// engine makes of the whole log, with the directory's bound as tiny as one entry of each
+    /// kind.
+    #[test]
+    fn eviction_in_memory_equals_a_rebuild(
+        specs in vec(spec(), 0..250),
+        sizes in vec(1usize..25, 1..40),
+        queries in vec(any::<u8>(), 1..40),
+        cfg in config(),
+        cache in prop_oneof![1 => Just(0usize), 2 => 1usize..6, 3 => Just(DAY_CACHE_ENTRIES)],
+        dir_limit in 1usize..6,
+        limit in 1usize..40,
+        names_change in any::<bool>(),
+    ) {
+        let world = World::new(2, 3, 6, 5);
+        let mut ids = Ids::default();
+        let mut log = world.setup(&mut ids, T0 - 86_400_000);
+        log.extend(gen_events(&quiet(&specs, !names_change), &world, &mut ids, T0));
+
+        let mut whole = Recaps::with_config(cfg.clone(), Some(Directory::with_limit(dir_limit)));
+        whole.push(&log);
+        let whole = Core(Mutex::new(whole));
+
+        let batched = Core(Mutex::new(
+            Recaps::with_config(cfg.clone(), Some(Directory::with_limit(dir_limit)))
+                .with_day_cache(cache),
+        ));
+        let mut question = queries.iter().cycle();
+        for batch in batches(&log, &sizes) {
+            batched.0.lock().expect("lock").push(batch);
+            ask(&batched, &world, question.next().copied().unwrap_or(0), limit);
+        }
+        let got = dump(&batched, &world, limit);
+        prop_assert!(batched.0.lock().expect("lock").cached_days() <= cache);
+        prop_assert_eq!(&dump(&whole, &world, limit), &got);
+        let oracle = Oracle::with_config(&log, Directory::with_limit(dir_limit), &cfg);
+        prop_assert_eq!(&oracle_dump(&oracle, &world), &got);
+        check_receipts(&got, &allowed_receipts(&log));
+    }
+}

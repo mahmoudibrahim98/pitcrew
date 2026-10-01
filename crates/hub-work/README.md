@@ -222,11 +222,11 @@ fn recap_days(&self, scope: DaysScope, tz_minutes: i32, before: Option<&Date>,
   frame's event. The first query builds the index from the whole log;
   `WorkService::sync_recaps()` does it eagerly (see "Wiring") and returns the revision it reflects.
 - **From the log, not from the projections.** The engine's `Directory` (which session works on
-  which task, which task is in which workstream) starts empty and learns from the events from
-  revision 1, so a block's links are those in force when its events happened, and an index kept
-  current for months equals one rebuilt today. Seeding it with today's projections would put
-  today's links ahead of yesterday's events. Names in lines and paragraphs are the current ones:
-  the directory plus `member_added` (which the engine's directory does not follow).
+  which task, which task is in which workstream, and members for names) starts empty and learns
+  from the events from revision 1, so a block's links are those in force when its events happened,
+  and an index kept current for months equals one rebuilt today. Seeding it with today's
+  projections would put today's links ahead of yesterday's events. One directory serves both
+  grouping and names; `Recaps` keeps no second copy.
 - **A refused `task_created`** (in `work_task_clashes`, see "One writer") is not activity: it is
   left out, so a task the hub never had is in no recap. Whether one was refused is known only once
   the tasks projection has applied it, so the index reads no further than that projection's
@@ -241,26 +241,16 @@ fn recap_days(&self, scope: DaysScope, tz_minutes: i32, before: Option<&Date>,
   block each covers. A query writes a paragraph again only when its blocks changed (one grew, began,
   or moved to another day or workstream), so a growing block rewrites only its own day; or when a
   name it may show changed: a member, task or workstream renamed, an ask re-stated as another kind
-  or by another asker, or a name learned for something a block already named while it was unknown
-  ("a task" becomes "PAP-9"). Then every paragraph is written again. A new member, task or ask that
-  nothing named yet changes no paragraph. At most `DAY_CACHE_ENTRIES` (2,048) are kept, least
-  recently used out first.
+  or by another asker, a name dropped for the directory's bound (`Directory::names_version`,
+  past the 100,000 of each kind it keeps), or a name learned for something a block already named
+  while it was unknown ("a task" becomes "PAP-9"). Then every paragraph is written again. A new
+  member, task or ask that nothing named yet changes no paragraph. At most `DAY_CACHE_ENTRIES`
+  (2,048) are kept, least recently used out first.
 - **Memory.** Every block stays in memory (they are derived, never stored): one to six kilobytes
-  each as JSON, depending on how much it holds (see "Timings"). A hub restart rebuilds them.
-
-**Known differences from the activity index** (both are the engine's rules; the fixes belong to
-stream F):
-- **Recaps can unlink a session the hub keeps linked.** The engine's directory replaces a session's
-  task, workstream and agent with whatever each `session_discovered` says
-  (`Directory::add_session`), and takes every `session_linked`. The hub keeps a firm link (a
-  dispatch's, a person's) over an inferred one or none, and keeps a session's agent when a
-  re-stated session has none (see "Sessions: firm links stay"). So when a dispatched session is
-  re-stated with no links, as the runner does when it discovers a session again, recaps unlink it:
-  its blocks from then on have no task, workstream or project and drop out of those recaps, while
-  `work.sessions` and `work.refs` keep the dispatch's link. A later inferred `session_linked`
-  (folder, branch) moves it in recaps the same way.
-- A stale `task_moved` (one the tasks projection ignores, which only a second writer makes) still
-  counts as a move.
+  each as JSON, depending on how much it holds (see "Timings"). One directory (not a second copy
+  for names) keeps the recap index's own memory to about the engine's own figure for one
+  (125–170 MB at the bound; see the `crates/recap` README), half what two would cost. A hub
+  restart rebuilds the index.
 
 **The seeded demo is not the fixture.** `crates/fixtures/data/demo-recaps.json` is the engine over
 the demo's slice of events, with the demo's lists known beforehand; fed exactly that, the index
@@ -459,12 +449,15 @@ query `400`; bodies over 1 MiB are `400`. A `500` is logged in full and its body
   `before`, defaults and caps; odd and hostile input; a growing open block; the day cache (a
   repeated query writes nothing, a growing block rewrites only its day, a rename rewrites all, a
   new task or ask nothing named rewrites none, a name learned late rewrites the paragraph that
-  named it as a rebuild does, the bound); refused task creations, and a tasks projection lagging
+  named it as a rebuild does, the bound); an eviction for the directory's own bound rewrites the
+  days that named the entry it dropped; refused task creations, and a tasks projection lagging
   behind another process's appends; appends from another connection; receipts; shared use from
-  several threads. A unit test in `src/recap.rs` covers an event the engine panics on. `tests/recap_props.rs`: property tests that an index kept current through
-  random batches, with queries in between, equals a rebuild and the engine over the whole log,
-  through a store and in memory (with small engine caps and caches); and every receipt points
-  into the log. `tests/recap_common/` holds the generator and the oracle.
+  several threads. A unit test in `src/recap.rs` covers an event the engine panics on.
+  `tests/recap_props.rs`: property tests that an index kept current through random batches, with
+  queries in between, equals a rebuild and the engine over the whole log, through a store and in
+  memory (with small engine caps and caches, and with the directory's own bound tiny, so eviction
+  starts from the first events on); and every receipt points into the log. `tests/recap_common/`
+  holds the generator and the oracle.
 - `tests/sessions.rs`, `tests/dispatch.rs`, `tests/routes.rs`, `tests/self_moving.rs`: the other
   routes and commands. `tests/task_shape.rs`: the `Task` shape pin.
 

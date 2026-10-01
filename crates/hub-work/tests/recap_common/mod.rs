@@ -642,12 +642,11 @@ impl Oracle {
 
     pub fn with_config(events: &[Event], seed: Directory, config: &Config) -> Self {
         let blocks = pitcrew_recap::blocks(events, &seed, config);
+        // The same directory, observing every event the same way `Recaps` does (one directory,
+        // fed through `observe`, not a mix of it and the `add_*` methods).
         let mut names = seed;
         for e in events {
-            match &e.body {
-                EventBody::MemberAdded { member } => names.add_member(member),
-                _ => names.observe(e),
-            }
+            names.observe(e);
         }
         Self { blocks, names }
     }
