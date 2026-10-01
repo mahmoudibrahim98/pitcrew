@@ -17,6 +17,7 @@ import {
 import { Button } from '../design/index.ts';
 import { cx } from '../lib/cx.ts';
 import { useAnswerAsk, useSendKeys, useSendText } from './data.ts';
+import { isComposing } from './ime.ts';
 
 const KIND_LABEL: Record<AskKind, string> = {
   question: 'Question',
@@ -158,6 +159,10 @@ export function QuestionCard(props: QuestionCardProps) {
             id={inputId}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              // The Enter that accepts an IME candidate must not submit the answer.
+              if (e.key === 'Enter' && isComposing(e)) e.preventDefault();
+            }}
             placeholder={options.length > 0 ? 'Or answer in your own words…' : 'Your answer…'}
             className="h-7 min-w-0 flex-1 rounded-sm border border-line-2 bg-bg px-2 text-sm"
           />

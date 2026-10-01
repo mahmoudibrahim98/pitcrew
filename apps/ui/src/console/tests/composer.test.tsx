@@ -108,6 +108,24 @@ describe('Composer against the mock hub', () => {
     }
   });
 
+  it('does not send the Enter that accepts an IME candidate', async () => {
+    hub = await startHub();
+    const { requests } = renderWithHub(hub, <Composer sessionId={ID.ses4} />);
+    const input = screen.getByRole('textbox', { name: 'Message to the agent' });
+    await eventually(() => expect(input).toHaveProperty('disabled', false));
+    fireEvent.change(input, { target: { value: 'konnichiwa' } });
+    fireEvent.keyDown(input, { key: 'Enter', isComposing: true });
+    // Safari ends a composition with an Enter whose isComposing is false, but whose keyCode is 229.
+    fireEvent.keyDown(input, { key: 'Enter', keyCode: 229 });
+    expect(posts(requests, `/v1/sessions/${ID.ses4}/send`)).toHaveLength(0);
+    expect(input).toHaveProperty('value', 'konnichiwa');
+
+    fireEvent.keyDown(input, { key: 'Enter', keyCode: 13 });
+    await eventually(() =>
+      expect(posts(requests, `/v1/sessions/${ID.ses4}/send`).map((r) => r.body)).toEqual([{ text: 'konnichiwa' }]),
+    );
+  });
+
   it('turns disabled when the hub answers 503, keeping the text', async () => {
     hub = await startHub();
     const unavailable: typeof fetch = (input, init) => {

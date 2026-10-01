@@ -8,6 +8,7 @@ import { Button } from '../design/index.ts';
 import { cx } from '../lib/cx.ts';
 import { useInterrupt, useSendKeys, useSendText } from './data.ts';
 import { inputBlocked } from './format.ts';
+import { isComposing } from './ime.ts';
 
 export interface ComposerProps {
   sessionId: string;
@@ -52,7 +53,7 @@ export function Composer({ sessionId, className }: ComposerProps) {
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
+    if (event.key === 'Enter' && !event.shiftKey && !isComposing(event)) {
       event.preventDefault();
       submit();
     }
