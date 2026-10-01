@@ -19,8 +19,8 @@ The token is sent only after the server passes an identity check (`pitcrew_api::
 
 - **Unix socket:** the directory is ours and 0700 and the socket is ours (before connecting),
   and on Linux the peer runs as us (`SO_PEERCRED`, after).
-- **Named pipe:** opened at identification-level impersonation, and the process serving it runs
-  as the current user.
+- **Named pipe:** opened at identification-level impersonation, and the pipe's owner SID matches
+  the current user (or our token's default owner, if elevated).
 - **Loopback TCP:** no check is possible, which is why it is for development only.
 
 Verbs check `GET /v1/host/info` (without the token) first and refuse a daemon whose protocol
