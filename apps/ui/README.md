@@ -27,7 +27,7 @@ corepack pnpm --filter @pitcrew/ui dev    # the UI on http://127.0.0.1:5173
 | `preview` | Serve `dist/` on 127.0.0.1:4173 |
 | `test` | Vitest: the data layer, the shell and the design components, against the real mock hub on a free port |
 | `e2e` | Playwright: the shell against its own mock hub (ports 47399 and 5199; `E2E_HUB_PORT` and `E2E_UI_PORT` move them), with axe checks. `PLAYWRIGHT_CHANNEL=msedge` or `chrome` uses an installed browser. |
-| `size` | After `build`: fails if the initial JS is over 250 kB gzipped |
+| `size` | After `build`: fails if the initial JS is over 250 kB gzipped, or holds the desktop gateway or `@tauri-apps/api` (the desktop app loads them on demand) |
 | `typecheck` | `tsc -b` |
 | `lint` | ESLint |
 
@@ -58,6 +58,9 @@ unset) is not a token `pitcrewd` recognizes. `tcp:127.0.0.1:<port>` is for devel
 reach. See `apps/ui/e2e/helpers.ts`.
 
 ## Environment (development only)
+
+In a browser. The desktop app reads none of these: it reaches each workspace through its gateway,
+which adds the token (`src/data/README.md`).
 
 | Variable | Default | What |
 |---|---|---|
