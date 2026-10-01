@@ -37,7 +37,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [E-single-writer-and-sessions](E-single-writer-and-sessions.md) | E · Work model | `s/E/single-writer-and-sessions` | Opus-class | **Merged** |
 | [M-console-wiring](M-console-wiring.md) | M · Agent console | `s/M/console-wiring` | Opus-class | **Merged** |
 | [M-terminal](M-terminal.md) | M · Agent console | `s/M/terminal` | Opus-class | **Merged** |
-| [K-shell-and-gateway](K-shell-and-gateway.md) | K · Desktop shell | `s/K/shell-and-gateway` | Opus-class | In progress |
+| [K-shell-and-gateway](K-shell-and-gateway.md) | K · Desktop shell | `s/K/shell-and-gateway` | Opus-class | **Merged** |
 | [L-desktop-transport](L-desktop-transport.md) | L · UI foundation | `s/L/desktop-transport` | Opus-class | **Merged** |
 | [G-jira-read](G-jira-read.md) | G · Integrations | `s/G/jira-read` | Sonnet-class | In progress |
 | [Q-fuzz-and-model-refresh](Q-fuzz-and-model-refresh.md) | Q · Security | `s/Q/fuzz-and-model-refresh` | Opus-class | **Merged** |
