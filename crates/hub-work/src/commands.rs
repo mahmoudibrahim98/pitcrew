@@ -629,7 +629,7 @@ impl WorkService {
 
     /// Puts a person's brief ("Where it stands") in force. People only.
     ///
-    /// `edit.next` is accepted but **not stored**: `brief_accepted` has no field for it yet.
+    /// `edit.next` goes into `brief_accepted`, but the briefs projection does not read it yet.
     ///
     /// # Errors
     ///
@@ -661,7 +661,9 @@ impl WorkService {
             EventBody::BriefAccepted {
                 target,
                 text: edit.text,
+                next: edit.next,
                 pinned: edit.pinned,
+                receipts: Vec::new(),
             },
         )])?;
         self.brief(&target)?

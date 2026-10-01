@@ -535,6 +535,111 @@ pub struct Task {
     pub subtasks: Vec<Subtask>,
 }
 
+/// A partial update of a [`Task`]: the body of `PATCH /v1/tasks/{id-or-key}`, and what a
+/// `task_updated` event carries (there, only the fields that changed).
+///
+/// A field left out is unchanged. `start`, `due` and `workstream` can also be cleared: JSON `null`
+/// clears them, which is `Some(None)` here. On the other fields `null` counts as left out. Status,
+/// assignee and subtasks change through their own routes and events.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskPatch {
+    /// New workstream; `Some(None)` takes the task out of its workstream.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "nullable")]
+    pub workstream: Option<Option<WorkstreamId>>,
+    /// New title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// New description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// New priority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<Priority>,
+    /// New labels: the whole list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<Vec<String>>,
+    /// New start date; `Some(None)` clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "nullable")]
+    pub start: Option<Option<Date>>,
+    /// New due date; `Some(None)` clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "nullable")]
+    pub due: Option<Option<Date>>,
+    /// New list of tasks that must finish first: the whole list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_by: Option<Vec<TaskId>>,
+    /// New acceptance policy (see [`Mover::BackOffice`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accept_auto: Option<bool>,
+}
+
+impl TaskPatch {
+    /// Whether the patch changes nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Writes the patch's fields into `task`. It does not validate: the hub checks the rules in
+    /// `docs/build/contracts/api-v1.md` before it accepts a patch.
+    pub fn apply(&self, task: &mut Task) {
+        if let Some(workstream) = self.workstream {
+            task.workstream = workstream;
+        }
+        if let Some(title) = &self.title {
+            task.title.clone_from(title);
+        }
+        if let Some(description) = &self.description {
+            task.description.clone_from(description);
+        }
+        if let Some(priority) = self.priority {
+            task.priority = priority;
+        }
+        if let Some(labels) = &self.labels {
+            task.labels.clone_from(labels);
+        }
+        if let Some(start) = &self.start {
+            task.start.clone_from(start);
+        }
+        if let Some(due) = &self.due {
+            task.due.clone_from(due);
+        }
+        if let Some(blocked_by) = &self.blocked_by {
+            task.blocked_by.clone_from(blocked_by);
+        }
+        if let Some(accept_auto) = self.accept_auto {
+            task.accept_auto = accept_auto;
+        }
+    }
+}
+
+/// Serde for a field that can be left out, `null`, or a value: `Option<Option<T>>`, where the outer
+/// `None` (left out) comes from `#[serde(default)]` and is skipped when serializing.
+mod nullable {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(super) fn serialize<T, S>(
+        value: &Option<Option<T>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        T: Serialize,
+        S: Serializer,
+    {
+        match value {
+            Some(inner) => inner.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub(super) fn deserialize<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+    where
+        T: Deserialize<'de>,
+        D: Deserializer<'de>,
+    {
+        Option::<T>::deserialize(deserializer).map(Some)
+    }
+}
+
 // ─── Sessions and dispatches ─────────────────────────────────────────────────────────────────
 
 /// State of a session, derived from hooks, transcripts and the terminal.
@@ -744,6 +849,26 @@ pub struct Brief {
     /// Evidence behind it.
     #[serde(default)]
     pub receipts: Vec<Receipt>,
+    /// The pending proposal, present exactly when there is one: the newest `brief_proposed` for
+    /// the target, newer than the `brief_accepted` that put this brief in force.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal: Option<BriefProposal>,
+}
+
+/// A new "Where it stands" the back office proposed, waiting for a person to accept it or keep
+/// the current one (see [`Brief::proposal`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BriefProposal {
+    /// Proposed text.
+    pub text: String,
+    /// Proposed next step, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+    /// Evidence for every claim.
+    #[serde(default)]
+    pub receipts: Vec<Receipt>,
+    /// When it was proposed: the time of its `brief_proposed`.
+    pub at: TimestampMs,
 }
 
 /// The kind of ask.
