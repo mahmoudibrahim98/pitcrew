@@ -2,12 +2,14 @@
 # Runs the budget benchmarks and the other crates' timing tests, writes a JSON summary and checks
 # it against benches/baseline.json.
 #
-#   benches/run.sh [--quick | --full] [--no-tests] [--out FILE] [--threshold FRACTION]
-#                  [--retries N] [--write-baseline | --extend-baseline] [--note TEXT]
+#   benches/run.sh [--quick | --full] [--no-tests] [--baseline FILE] [--out FILE]
+#                  [--threshold FRACTION] [--retries N] [--write-baseline | --extend-baseline]
+#                  [--note TEXT]
 #
 #   --quick            CI mode: 20 MiB transcripts only, few short samples.
 #   --full             Local mode (the default): 20 and 200 MiB transcripts, more samples.
 #   --no-tests         Leave out the timing tests of the runner, hub-work and CLI crates.
+#   --baseline FILE    The baseline for this machine class (default: benches/baseline.json).
 #   --out FILE         Where to write the summary (default: <target>/pitcrew-bench/summary.json).
 #   --threshold F      Fail when a metric is worse than the baseline by more than F (default 0.10).
 #   --retries N        Run what failed up to N more times before failing (default 2).
@@ -23,6 +25,7 @@ set -euo pipefail
 mode=full
 report=()
 out=""
+baseline=""
 retries=2
 write=0
 tests=1
@@ -32,18 +35,21 @@ while [ $# -gt 0 ]; do
     --full) mode=full; shift ;;
     --no-tests) tests=0; shift ;;
     --out) out=$2; shift 2 ;;
+    --baseline) baseline=$2; shift 2 ;;
     --threshold) report+=(--threshold "$2"); shift 2 ;;
     --retries) retries=$2; shift 2 ;;
     --write-baseline) write=1; report+=(--write-baseline --recorded "$(date -u +%Y-%m-%d)"); shift ;;
     --extend-baseline) report+=(--extend-baseline); shift ;;
     --note) report+=(--note "$2"); shift 2 ;;
-    -h | --help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,22p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
 
+case "$baseline" in "" | /*) ;; *) baseline=$PWD/$baseline ;; esac
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
+baseline=${baseline:-$root/benches/baseline.json}
 target=${CARGO_TARGET_DIR:-$root/target}
 work="$target/pitcrew-bench"
 out=${out:-$work/summary.json}
@@ -97,7 +103,7 @@ while :; do
   # The bench profile, so the report reuses the dependencies the benchmarks just built.
   cargo run --locked --profile bench -q -p pitcrew-benches --bin pitcrew-bench-report -- \
     "${inputs[@]}" \
-    --baseline "$root/benches/baseline.json" \
+    --baseline "$baseline" \
     --mode "$mode" \
     --out "$out" \
     --retry-plan "$work/retry-plan" \
