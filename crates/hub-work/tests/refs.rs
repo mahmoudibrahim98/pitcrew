@@ -9,9 +9,7 @@ use pitcrew_hub_work::{EventRefs, REF_SCAN_BUDGET, RefFilter, TaskRef, WorkServi
 use pitcrew_protocol::api::ErrorCode;
 use pitcrew_protocol::events::{BriefTarget, Event, EventBody};
 use pitcrew_protocol::ids::{EventId, ProjectId, SessionId, TaskId, WorkstreamId};
-use pitcrew_protocol::model::{
-    Engine, LinkBasis, Receipt, Session, SessionState,
-};
+use pitcrew_protocol::model::{Engine, LinkBasis, Receipt, Session, SessionState, TaskPatch};
 use std::sync::Arc;
 
 type About = (
@@ -32,6 +30,7 @@ fn oracle(work: &WorkService, body: &EventBody) -> About {
         EventBody::TaskCreated { task } => (None, None, Some(task.id), None),
         EventBody::TaskMoved { task, .. }
         | EventBody::TaskAssigned { task, .. }
+        | EventBody::TaskUpdated { task, .. }
         | EventBody::SubtasksReplaced { task, .. } => (None, None, Some(*task), None),
         EventBody::SessionDiscovered { session } => {
             (None, session.workstream, session.task, Some(session.id))
@@ -174,7 +173,7 @@ fn the_demo_is_indexed_through_its_links() {
             ..RefFilter::default()
         });
     }
-    let mut nonempty = 0;
+    let mut two_fields_nonempty = 0;
     for filter in &filters {
         let expected: Vec<u64> = about
             .iter()
@@ -187,9 +186,23 @@ fn the_demo_is_indexed_through_its_links() {
         // Paging one or two at a time gives the same.
         assert_eq!(all_pages(refs.as_ref(), filter, 1), expected, "{filter:?}");
         assert_eq!(all_pages(refs.as_ref(), filter, 2), expected, "{filter:?}");
-        nonempty += usize::from(!expected.is_empty());
+        // Every project, workstream, task and session has at least the event that made it.
+        let fields = [
+            filter.project.is_some(),
+            filter.workstream.is_some(),
+            filter.task.is_some(),
+            filter.session.is_some(),
+        ];
+        if fields.iter().filter(|f| **f).count() == 1 {
+            assert!(!expected.is_empty(), "{filter:?}");
+        } else {
+            two_fields_nonempty += usize::from(!expected.is_empty());
+        }
     }
-    assert!(nonempty > 30, "the demo exercises most filters: {nonempty}");
+    assert!(
+        two_fields_nonempty > 0,
+        "some two-field filters match something"
+    );
 
     // The cases the contract says need an index: a turn in a session linked to a task, and
     // `dispatch_finished`, which names only the dispatch.
@@ -205,14 +218,24 @@ fn the_demo_is_indexed_through_its_links() {
         task: Some(pap1),
         ..RefFilter::default()
     };
-    assert!(refs.revs_matching(&task, u64::MAX, 500).expect("revs").0.contains(&edit));
+    assert!(
+        refs.revs_matching(&task, u64::MAX, 500)
+            .expect("revs")
+            .0
+            .contains(&edit)
+    );
     let finished = rev_of(&|b| matches!(b, EventBody::DispatchFinished { .. }));
     let pap3 = RefFilter {
         task: Some(demo.tasks[2].id),
         project: Some(demo.projects[0].id),
         ..RefFilter::default()
     };
-    assert!(refs.revs_matching(&pap3, u64::MAX, 500).expect("revs").0.contains(&finished));
+    assert!(
+        refs.revs_matching(&pap3, u64::MAX, 500)
+            .expect("revs")
+            .0
+            .contains(&finished)
+    );
 }
 
 fn append(work: &WorkService, body: EventBody) -> u64 {
@@ -291,7 +314,11 @@ fn links_count_from_when_they_are_made_and_firm_links_stay() {
     let late = append(&work, turn(session.id));
     let mut expected = before;
     expected.extend([linked, late]);
-    assert_eq!(revs(&work, &by_task), expected, "the link does not reach back");
+    assert_eq!(
+        revs(&work, &by_task),
+        expected,
+        "the link does not reach back"
+    );
     // ...and the task's workstream and project come with it.
     let by_project = RefFilter {
         project: Some(demo.projects[0].id),
@@ -330,6 +357,103 @@ fn links_count_from_when_they_are_made_and_firm_links_stay() {
 }
 
 #[test]
+fn a_task_moved_to_another_workstream_counts_there_from_then_on() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let work = seeded(dir.path());
+    let demo = demo();
+    let sibling = |t: &pitcrew_protocol::model::Task| {
+        demo.workstreams
+            .iter()
+            .find(|w| w.project == t.project && Some(w.id) != t.workstream)
+            .map(|w| w.id)
+    };
+    let task = demo
+        .tasks
+        .iter()
+        .find(|t| t.workstream.is_some() && sibling(t).is_some())
+        .expect("a task whose project has another workstream");
+    let (from, to) = (
+        task.workstream.expect("workstream"),
+        sibling(task).expect("sibling"),
+    );
+    let in_workstream = |w: WorkstreamId| RefFilter {
+        workstream: Some(w),
+        ..RefFilter::default()
+    };
+    let before_from = revs(&work, &in_workstream(from));
+    let mut expected = revs(&work, &in_workstream(to));
+    let update = |patch: TaskPatch| EventBody::TaskUpdated {
+        task: task.id,
+        patch,
+    };
+
+    let moved = append(
+        &work,
+        update(TaskPatch {
+            workstream: Some(Some(to)),
+            ..TaskPatch::default()
+        }),
+    );
+    let later = append(
+        &work,
+        EventBody::TaskAssigned {
+            task: task.id,
+            assignee: Some(member(SAM)),
+        },
+    );
+    expected.extend([moved, later]);
+    assert_eq!(revs(&work, &in_workstream(to)), expected);
+    assert_eq!(
+        revs(&work, &in_workstream(from)),
+        before_from,
+        "earlier events stay where they were"
+    );
+
+    // Out of any workstream: still about the task and its project; a patch that does not move it
+    // changes nothing about where it is.
+    let by_task_in_project = RefFilter {
+        project: Some(task.project),
+        task: Some(task.id),
+        ..RefFilter::default()
+    };
+    let out = append(
+        &work,
+        update(TaskPatch {
+            workstream: Some(None),
+            ..TaskPatch::default()
+        }),
+    );
+    let renamed = append(
+        &work,
+        update(TaskPatch {
+            title: Some("Renamed".into()),
+            ..TaskPatch::default()
+        }),
+    );
+    assert_eq!(revs(&work, &in_workstream(to)), expected);
+    assert!(revs(&work, &by_task_in_project).ends_with(&[out, renamed]));
+
+    // A task nobody knows gets no parents from a patch.
+    let stranger = TaskId::new();
+    let unknown = append(
+        &work,
+        EventBody::TaskUpdated {
+            task: stranger,
+            patch: TaskPatch {
+                workstream: Some(Some(to)),
+                ..TaskPatch::default()
+            },
+        },
+    );
+    let by_stranger = RefFilter {
+        task: Some(stranger),
+        ..RefFilter::default()
+    };
+    assert_eq!(revs(&work, &by_stranger), [unknown]);
+    assert_eq!(revs(&work, &in_workstream(to)), expected);
+}
+
+#[test]
 fn a_filtered_scan_is_bounded_and_says_where_it_stopped() {
     let dir = tempfile::tempdir().expect("tempdir");
     let work = seeded(dir.path());
@@ -341,11 +465,12 @@ fn a_filtered_scan_is_bounded_and_says_where_it_stopped() {
         session: Some(demo.sessions[1].id),
         ..RefFilter::default()
     };
-    let everything = work
-        .revs_matching(&filter, u64::MAX, 500)
-        .expect("revs")
-        .0;
-    assert_eq!(everything.len(), 2, "the ask, raised in the snapshot and again in the slice");
+    let everything = work.revs_matching(&filter, u64::MAX, 500).expect("revs").0;
+    assert_eq!(
+        everything.len(),
+        2,
+        "the ask, raised in the snapshot and again in the slice"
+    );
     // One row per call: each call returns at most one revision, and paging from `scanned_to`
     // still finds them all.
     let mut found = Vec::new();
@@ -378,7 +503,11 @@ fn a_filtered_scan_is_bounded_and_says_where_it_stopped() {
         .expect("revs")
         .0
         .len();
-    assert_eq!(calls, session_rows + 1, "one row per call, then one to find the start");
+    assert_eq!(
+        calls,
+        session_rows + 1,
+        "one row per call, then one to find the start"
+    );
 
     // More matches than the limit: `scanned_to` is the oldest returned.
     let by_session = RefFilter {

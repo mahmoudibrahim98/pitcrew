@@ -84,11 +84,12 @@ change.
 `imported`), nor by a re-stated `session_discovered` without a link. A firm link replaces any
 link.
 
-**Briefs.** `brief_accepted` carries only `text` and `pinned`. The projection derives the rest:
-`updated` is the event's time; the source is `back_office` when the back office applied it (an
-agent's event) or when the text is exactly the target's latest proposal (a person accepted it
+**Briefs.** The projection reads only `text` and `pinned` from `brief_accepted`, and derives the
+rest: `updated` is the event's time; the source is `back_office` when the back office applied it
+(an agent's event) or when the text is exactly the target's latest proposal (a person accepted it
 unchanged), and then the proposal's receipts carry over; otherwise it is `person`, with no
-receipts. `next` is always empty until the event carries it (see "Contract gaps").
+receipts. The events now also carry `next` (and `brief_accepted` its receipts), but the projection
+does not read them yet, so `next` is always empty and `proposal` absent (see "Contract gaps").
 
 ## Activity references (`work.refs`, `EventRefs`)
 
@@ -220,10 +221,15 @@ lists cost on top.
 
 ## Contract gaps
 
-- `brief_accepted` (and `brief_proposed`) have no `next`, so `PUT /v1/briefs` cannot store the
-  next step and seeded briefs lose theirs.
-- There is no event for creating or editing a task's other fields (title, description, priority,
-  labels, dates, dependencies), nor routes to create projects and workstreams (the contract change
-  `integrator/work-edits` is adding them).
-- Nothing makes project keys unique. Task keys are allocated by key prefix, so two projects that
-  share a key still never share a task key.
+The contract change `integrator/work-edits` (merged) added these; this crate does not implement
+them yet:
+
+- `next` on `brief_proposed` and `brief_accepted`, receipts on `brief_accepted`, and
+  `Brief.proposal`: `PUT /v1/briefs` writes `next` into the event, but the briefs projection does
+  not read it, so briefs answer without `next` or `proposal`, and seeded briefs lose their next
+  step.
+- `task_updated` and `PATCH /v1/tasks/{id-or-key}`: the tasks projection ignores the event. Only
+  `work.refs` follows it (a task moved to another workstream counts there from then on).
+- `POST /v1/projects` and `POST /v1/workstreams`. Until they land, nothing makes project keys
+  unique; task keys are allocated by key prefix, so two projects that share a key still never
+  share a task key.

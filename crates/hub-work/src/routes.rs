@@ -15,7 +15,7 @@
 //! Writes check who may make them before they read the body: an agent writing to a task that is
 //! not its own gets `403`, even with a malformed or oversized body.
 
-use crate::commands::{AnswerAsk, BriefEdit, NewAsk, NewComment, NewTask, WorkstreamPatch};
+use crate::commands::{AnswerAsk, BriefEdit, NewAsk, NewComment, WorkstreamPatch};
 use crate::dispatch::NewDispatch;
 use crate::error::WorkError;
 use crate::query::{AskFilter, SessionFilter, TaskFilter, TaskRef};
@@ -28,7 +28,7 @@ use axum::http::StatusCode;
 use axum::http::header::{CONTENT_TYPE, HeaderName};
 use axum::http::request::Parts;
 use axum::routing::{get, post, put};
-use pitcrew_protocol::api::Caller;
+use pitcrew_protocol::api::{Caller, NewTask};
 use pitcrew_protocol::events::{BriefTarget, Event};
 use pitcrew_protocol::ids::{AskId, MemberId, ProjectId, SessionId, WorkstreamId};
 use pitcrew_protocol::model::{

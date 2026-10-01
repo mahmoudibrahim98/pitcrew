@@ -51,9 +51,10 @@ mod seed;
 mod service;
 
 pub use activity::EventRefs;
-pub use commands::{AnswerAsk, BriefEdit, NewAsk, NewComment, NewTask, WorkstreamPatch};
+pub use commands::{AnswerAsk, BriefEdit, NewAsk, NewComment, WorkstreamPatch};
 pub use dispatch::{DispatchError, DispatchRequest, Dispatcher, NewDispatch};
 pub use error::{INTERNAL_MESSAGE, Result, WorkError};
+pub use pitcrew_protocol::api::NewTask;
 pub use projection::projections;
 pub use query::{AskFilter, REF_SCAN_BUDGET, RefFilter, SessionFilter, TaskFilter, TaskRef};
 pub use routes::{agent_routes, device_routes, routes};

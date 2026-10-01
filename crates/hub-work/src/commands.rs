@@ -14,49 +14,19 @@
 use crate::error::{Result, WorkError};
 use crate::query::{self, TaskRef};
 use crate::service::{WorkService, no_task};
-use pitcrew_protocol::api::{Caller, TokenScope};
+use pitcrew_protocol::api::{Caller, NewTask, TokenScope};
 use pitcrew_protocol::events::{BriefTarget, Event, EventBody};
 use pitcrew_protocol::ids::{
-    AskId, DispatchId, MemberId, ProjectId, SessionId, SubtaskId, TaskId, TaskKey, WorkstreamId,
+    AskId, DispatchId, MemberId, SessionId, SubtaskId, TaskId, TaskKey, WorkstreamId,
 };
 use pitcrew_protocol::model::{
-    Answer, Ask, AskKind, AskState, Brief, Date, Health, MemberKind, Mover, Priority, Receipt,
-    Subtask, SubtaskSource, Task, TaskStatus, Workstream, WorkstreamStatus,
+    Answer, Ask, AskKind, AskState, Brief, Health, MemberKind, Mover, Receipt, Subtask,
+    SubtaskSource, Task, TaskStatus, Workstream, WorkstreamStatus,
 };
 use pitcrew_protocol::transcript::{PlanItem, PlanStatus};
 use pitcrew_store::sql::Connection;
 use serde::Deserialize;
 use std::collections::HashSet;
-
-/// `POST /v1/tasks`: a new task. The hub assigns the id and the next key in the project.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct NewTask {
-    /// The project.
-    pub project: ProjectId,
-    /// The workstream, which must belong to the project.
-    #[serde(default)]
-    pub workstream: Option<WorkstreamId>,
-    /// Title; not empty.
-    pub title: String,
-    /// Description.
-    #[serde(default)]
-    pub description: Option<String>,
-    /// Status; `todo` if absent.
-    #[serde(default)]
-    pub status: Option<TaskStatus>,
-    /// Priority; `none` if absent.
-    #[serde(default)]
-    pub priority: Option<Priority>,
-    /// Assignee.
-    #[serde(default)]
-    pub assignee: Option<MemberId>,
-    /// Labels.
-    #[serde(default)]
-    pub labels: Option<Vec<String>>,
-    /// Due date, `YYYY-MM-DD`.
-    #[serde(default)]
-    pub due: Option<Date>,
-}
 
 /// `POST /v1/asks`: a new ask, from the caller.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

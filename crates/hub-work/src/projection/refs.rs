@@ -7,7 +7,8 @@
 //! - a session event is about the session's task and workstream as linked **then** (a link made
 //!   later does not reach back);
 //! - a task event is about the task's workstream and project, a workstream event about its
-//!   project;
+//!   project; a `task_updated` that moves the task to another workstream is about the new one, and
+//!   so is every later event about the task;
 //! - `dispatch_finished` and `ask_answered` are about the task and session of their dispatch or
 //!   ask.
 //!
@@ -110,7 +111,11 @@ fn remember(tx: &Transaction<'_>, kind: &str, id: &str, p: &Parents) -> Applied 
 
 /// Records a session's link, unless it would replace a firm link with a weaker one. Returns the
 /// link the session has afterwards.
-fn link_session(tx: &Transaction<'_>, session: &str, incoming: Parents) -> Result<Parents, BoxError> {
+fn link_session(
+    tx: &Transaction<'_>,
+    session: &str,
+    incoming: Parents,
+) -> Result<Parents, BoxError> {
     let existing = parents(tx, SESSION, session)?;
     if replaces_link(existing.link_basis, incoming.link_basis) {
         remember(tx, SESSION, session, &incoming)?;
@@ -180,6 +185,18 @@ fn direct(tx: &Transaction<'_>, body: &EventBody) -> Result<About, BoxError> {
                 ..Parents::default()
             };
             remember(tx, TASK, &id, &p)?;
+            about.task = Some(id);
+        }
+        EventBody::TaskUpdated { task, patch } => {
+            let id = task.text();
+            if let Some(workstream) = &patch.workstream {
+                let mut p = parents(tx, TASK, &id)?;
+                // Every task the index knows has a project; an unknown task gets no parents.
+                if p.project.is_some() {
+                    p.workstream = workstream.as_ref().map(IdText::text);
+                    remember(tx, TASK, &id, &p)?;
+                }
+            }
             about.task = Some(id);
         }
         EventBody::TaskMoved { task, .. }
