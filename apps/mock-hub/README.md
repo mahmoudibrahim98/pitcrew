@@ -15,7 +15,8 @@ npm run mock-hub                          # the same, via the root package.json
 PORT=4400 node apps/mock-hub/src/server.ts
 ```
 
-PowerShell: `$env:PORT = '4400'; node apps/mock-hub/src/server.ts`.
+PowerShell: `$env:PORT = '4400'; node apps/mock-hub/src/server.ts`. `PITCREW_MOCK_SCAN_WINDOW`
+sets how many revisions a filtered `GET /v1/events` examines (default 500).
 
 It listens on `http://127.0.0.1:47317` (never on other interfaces) and prints one line per request.
 
@@ -68,7 +69,9 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
   back office's.
 - **The event log.** The fixture's 15 events are revisions 1–15; every change appends an event with
   a new ULID. `GET /v1/events` pages it (`before` is exclusive, `at_start` says whether older
-  matching events exist) and filters by project, workstream, task or session.
+  matching events exist) and filters by project, workstream, task or session. A filtered request
+  examines at most 500 revisions (`PITCREW_MOCK_SCAN_WINDOW`, or `startServer({ scanWindow })`), so
+  across a long gap it answers empty pages that are not at the start, as the contract allows.
 - **`GET /v1/stream`**: `hello`, then the missed events when `since` is behind, then live events
   batched over 60 ms, and a `ping` every 20 s.
 - **Simulated sessions.** A dispatch or a new session starts in `starting`; about 1.5 s later it

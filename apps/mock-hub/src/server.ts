@@ -17,7 +17,7 @@ import {
   type TerminalTarget,
 } from './live.ts';
 import { MOCK_VERSION, authenticate, handleApi, type Reply } from './routes.ts';
-import { DEFAULT_DELAYS, Hub, loadFixture, type Delays } from './state.ts';
+import { DEFAULT_DELAYS, DEFAULT_SCAN_WINDOW, Hub, loadFixture, type Delays } from './state.ts';
 import { ApiFailure, forbidden, invalid, notFound } from './validate.ts';
 import {
   acceptUpgrade,
@@ -41,6 +41,8 @@ export interface ServerOptions {
   port?: number;
   /** Shorter delays make tests of simulated sessions quick. */
   delays?: Partial<Delays>;
+  /** How many revisions one filtered `GET /v1/events` examines at most. Default 500. */
+  scanWindow?: number;
   /** Receives one line per request. Silent by default. */
   log?: (line: string) => void;
 }
@@ -56,7 +58,11 @@ export interface RunningServer {
 
 /** Starts a mock hub on 127.0.0.1. */
 export async function startServer(options: ServerOptions = {}): Promise<RunningServer> {
-  const hub = new Hub(loadFixture(FIXTURE), { ...DEFAULT_DELAYS, ...options.delays });
+  const hub = new Hub(
+    loadFixture(FIXTURE),
+    { ...DEFAULT_DELAYS, ...options.delays },
+    options.scanWindow ?? DEFAULT_SCAN_WINDOW,
+  );
   const log = options.log ?? ((): void => {});
   const sockets = new Set<WebSocketConnection>();
   const server = createServer((req, res) => {
@@ -372,9 +378,21 @@ function parsePort(value: string | undefined): number {
   return port;
 }
 
+function parseScanWindow(value: string | undefined): number {
+  if (value === undefined || value === '') {
+    return DEFAULT_SCAN_WINDOW;
+  }
+  const window = /^\d{1,9}$/.test(value) ? Number(value) : Number.NaN;
+  if (!(window >= 1)) {
+    throw new Error(`PITCREW_MOCK_SCAN_WINDOW must be a whole number of at least 1, not "${value}".`);
+  }
+  return window;
+}
+
 async function main(): Promise<void> {
   const server = await startServer({
     port: parsePort(process.env['PORT']),
+    scanWindow: parseScanWindow(process.env['PITCREW_MOCK_SCAN_WINDOW']),
     log: (line) => console.log(line),
   });
   console.log(`PitCrew mock hub on ${server.url}`);

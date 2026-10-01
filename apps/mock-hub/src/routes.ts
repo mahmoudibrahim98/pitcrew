@@ -1180,6 +1180,11 @@ interface EventFilter {
 /**
  * Activity: the newest `limit` matching events below revision `before` (exclusive), oldest first.
  * One extra match is looked for to tell whether older ones exist (`at_start`).
+ *
+ * With filters, one request examines at most `hub.scanWindow` revisions, as the contract allows, so
+ * a page may hold fewer than `limit` events, even none. An empty page that is not at the start has
+ * `to_rev` 0 and `from_rev` = the oldest revision examined, where the next request continues.
+ * `at_start` is true only when the scan reached revision 1 without finding an older match.
  */
 const listEvents: Handler = (hub, ctx) => {
   const limit = queryLimit(ctx.query, 100, 500);
@@ -1190,18 +1195,22 @@ const listEvents: Handler = (hub, ctx) => {
     task: queryValue(ctx.query, 'task'),
     session: queryValue(ctx.query, 'session'),
   };
+  const filtered = Object.values(filter).some((v) => v !== undefined);
+  let rev = Math.min(before ?? Infinity, hub.rev + 1) - 1;
+  const floor = filtered ? Math.max(1, rev - hub.scanWindow + 1) : 1;
   const revs: number[] = [];
-  for (let rev = Math.min(before ?? Infinity, hub.rev + 1) - 1; rev >= 1 && revs.length <= limit; rev--) {
+  for (; rev >= floor && revs.length <= limit; rev--) {
     const event = hub.eventAt(rev);
     if (event !== undefined && touches(hub, event.body, filter)) {
       revs.push(rev);
     }
   }
-  const atStart = revs.length <= limit;
+  // `rev` is now the newest revision not examined.
+  const atStart = revs.length <= limit && rev < 1;
   const page = revs.slice(0, limit).reverse();
   return ok({
-    events: page.map((rev) => hub.eventAt(rev)),
-    from_rev: page[0] ?? 0,
+    events: page.map((r) => hub.eventAt(r)),
+    from_rev: page[0] ?? (atStart ? 0 : rev + 1),
     to_rev: page.at(-1) ?? 0,
     at_start: atStart,
   });

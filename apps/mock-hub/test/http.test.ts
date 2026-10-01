@@ -386,6 +386,50 @@ describe('activity', () => {
         ['0008', '0013', '0014'],
       );
     }));
+
+  it('scans a bounded window per filtered request, and pages on across a gap', () =>
+    withServer(
+      async (server) => {
+        const get = async (query: string): Promise<Activity> =>
+          (await call<Activity>(server, 'GET', `/v1/events${query}`, { token: DEVICE })).body;
+        // PAP-1's events are revisions 4–7; revisions 8–15 are a gap wider than the window of 5.
+        const first = await get(`?task=${ID.pap1}`);
+        assert.deepEqual(first, { events: [], from_rev: 11, to_rev: 0, at_start: false });
+        const second = await get(`?task=${ID.pap1}&before=${first.from_rev}`);
+        assert.deepEqual([second.from_rev, second.to_rev, second.at_start], [6, 7, false]);
+        const third = await get(`?task=${ID.pap1}&before=${second.from_rev}`);
+        assert.deepEqual([third.from_rev, third.to_rev, third.at_start], [4, 5, true]);
+
+        // Paging until at_start finds every match, and only the page that reached revision 1 is
+        // at the start.
+        const seen: string[] = [];
+        let page = await get(`?task=${ID.pap1}&limit=1`);
+        const pages = [page];
+        while (!page.at_start) {
+          page = await get(`?task=${ID.pap1}&limit=1&before=${page.from_rev}`);
+          pages.push(page);
+        }
+        for (const p of pages) {
+          seen.unshift(...p.events.map((e) => e.id.slice(-4)));
+        }
+        assert.deepEqual(seen, ['0004', '0005', '0006', '0007']);
+        assert.deepEqual(
+          pages.map((p) => p.at_start),
+          [...pages.slice(1).map(() => false), true],
+        );
+
+        // A filter that matches nothing: empty pages until the scan reaches revision 1.
+        const none = '01JB000000000000000TSK0099';
+        assert.deepEqual(await get(`?task=${none}`), { events: [], from_rev: 11, to_rev: 0, at_start: false });
+        assert.deepEqual(await get(`?task=${none}&before=11`), { events: [], from_rev: 6, to_rev: 0, at_start: false });
+        assert.deepEqual(await get(`?task=${none}&before=6`), { events: [], from_rev: 0, to_rev: 0, at_start: true });
+
+        // Without filters the window does not apply.
+        const all = await get('?limit=10');
+        assert.deepEqual([all.events.length, all.from_rev, all.to_rev, all.at_start], [10, 6, 15, false]);
+      },
+      { scanWindow: 5 },
+    ));
 });
 
 describe('http plumbing', () => {
