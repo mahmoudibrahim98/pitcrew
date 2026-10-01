@@ -135,6 +135,9 @@ impl std::error::Error for DetectError {
 /// errors so the caller can select the PTY runtime. This does not establish a
 /// connection or verify a separately running server's version.
 /// The probe times out after two seconds and captures at most 4 KiB per stream.
+///
+/// This blocks the calling thread for up to [`VERSION_PROBE_TIMEOUT`] (two seconds).
+/// From async code, run it on a blocking thread, e.g. `tokio::task::spawn_blocking`.
 pub fn detect_tmux(path: impl AsRef<Path>) -> Result<TmuxVersion, DetectError> {
     let deadline = Instant::now() + VERSION_PROBE_TIMEOUT;
     let mut child = ProbeChild(

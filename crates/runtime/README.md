@@ -7,7 +7,8 @@ Terminal runtimes: tmux control mode and the PTY supervisor, behind pitcrew-inte
 The current implementation provides the building blocks for the runtimes. **tmux 3.2 is the
 minimum supported portable release.** `detect_tmux(path)` executes `path -V` directly and
 returns a parsed `TmuxVersion` or a fallback error. The probe is limited to two seconds and
-4 KiB per output stream; a timed-out process is killed and reaped. Version parsing recognizes
+4 KiB per output stream; a timed-out process is killed and reaped. It blocks the calling thread
+for up to those two seconds, so call it from async code through `spawn_blocking`. Version parsing recognizes
 letter suffixes (`3.3a`), development releases (`next-3.4`), and OpenBSD's separate OS numbering
 (`openbsd-7.4`).
 OpenBSD 6.9 is the minimum base-system version: its
@@ -33,7 +34,9 @@ the executable; the runtime must also verify any already-running server it conne
   pane, window, and session IDs. `Flag` identifies trusted flags, `Format` holds deliberately
   authored static format expressions, and `FormatLiteral` doubles every `#` before quoting.
   Use `Name` for user names (`-n`, `rename-window`): it also doubles `#` and rejects all C0
-  controls and DEL, which tmux can otherwise emit verbatim. Use `FormatLiteral` for other user
+  controls and DEL, which tmux can otherwise emit verbatim. Where the name is positional
+  (`rename-window`), put `Flag("--")` before it, or a name starting with `-` is parsed as
+  options. Use `FormatLiteral` for other user
   values in format-expanding options, such as working directories (`-c`). For displayed text
   (`display-message`), first escape `%` as `%%` as well: tmux also runs strftime (`%d` becomes
   the day), so `FormatLiteral` alone is insufficient. These protect one format-expansion pass;

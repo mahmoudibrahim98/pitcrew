@@ -19,6 +19,8 @@ pub enum Argument<'a> {
     /// Text for an argument which does NOT expand tmux formats, such as `send-keys -l`.
     Text(&'a str),
     /// A user name (`-n`, `rename-window`): rejects C0 controls and DEL, doubles `#`.
+    /// As a positional argument (`rename-window`), put `Flag("--")` before it, or a
+    /// name starting with `-` is parsed as options.
     Name(&'a str),
     /// User text for one format-expansion pass (such as `-c`).
     /// Doubles every `#` before quoting. Not shell quoting or recursive expansion protection.
@@ -42,6 +44,7 @@ pub enum Argument<'a> {
 
 /// A value that cannot be represented safely as a tmux command argument.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FormatError {
     InvalidCommandName,
     /// tmux strings are NUL-terminated; silently truncating input would be incorrect.

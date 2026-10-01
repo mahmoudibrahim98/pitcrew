@@ -465,7 +465,8 @@ fn real_tmux_replies_output_and_literal_injection_attempts() {
     );
     assert_eq!(actual_name.lines, vec![window_name.as_bytes().to_vec()]);
     server.assert_no_format_job();
-    let renamed = format!("{window_name} #{{pane_id}} ##");
+    // A positional name needs "--", or one starting with '-' is parsed as options.
+    let renamed = format!("-n {window_name} #{{pane_id}} ##");
     assert!(
         !client
             .run(
@@ -475,13 +476,15 @@ fn real_tmux_replies_output_and_literal_injection_attempts() {
                     .expect("target")
                     .arg(Argument::Window(window))
                     .expect("window")
+                    .arg(Argument::Flag("--"))
+                    .expect("options end")
                     .arg(Argument::Name(&renamed))
                     .expect("literal name")
             )
             .failed
     );
-    // Reject unsafe names before they reach the live server. The valid name
-    // below must still read back unchanged after every attempted rename.
+    // The builder rejects these names, so no command carrying one is ever sent;
+    // the window keeps the name set above, which is read back next.
     let bad_names = (0..=0x1f)
         .chain([0x7f])
         .map(|byte| format!("name{}suffix", char::from(byte)))
@@ -514,6 +517,8 @@ fn real_tmux_replies_output_and_literal_injection_attempts() {
             .expect("command")
             .arg(Argument::Flag("-p"))
             .expect("print")
+            .arg(Argument::Flag("--"))
+            .expect("options end")
             .arg(Argument::FormatLiteral(&renamed))
             .expect("literal display"),
     );
