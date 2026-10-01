@@ -28,14 +28,18 @@ Everything goes through the user's own **system OpenSSH** and `~/.ssh/config`.
     before or after `@`.
   - **Options:** agent and X11 forwarding, local commands, config forwardings and
     `RemoteCommand` are off; host keys are confirmed (`StrictHostKeyChecking=ask`).
-    `ClearAllForwardings=yes` also clears `-L`/`-R`/`-D`, so tunnels will need their own option
-    set. `-o` options do not reach `ProxyJump` hops, which read only the user's config.
+    `ClearAllForwardings=yes` also clears `-L`/`-R`/`-D`, so the tunnel adds its forward to its
+    own master afterwards (`ssh -O forward`). `-o` options do not reach `ProxyJump` hops, which
+    read only the user's config.
   - **Unix:** connections are reused (`ControlMaster=auto`, `ControlPersist=10m`) through
     sockets in a private 0700 directory: `$XDG_RUNTIME_DIR/pitcrew-ssh`, else
     `/tmp/pitcrew-ssh-<uid>`, else `~/.pitcrew/s`. A candidate that is squatted, too long for a
     socket path, or has characters `ControlPath` would expand is skipped.
   - **Windows:** its OpenSSH has no ControlMaster, so every call connects and authenticates
-    anew. A persistent channel comes with the tunnel work.
+    anew (the tunnel too; see below).
+  - **Environment:** `Ssh::with_env_passthrough(names)` gives ssh only `MINIMAL_ENV` (home,
+    user, path, locale, the agent's socket, Kerberos' cache, …) and those names, instead of the
+    app's whole environment. The tunnel always does so.
   - **Stopping:** a cancel, a timeout or a dropped call stops ssh and everything it started
     (askpass, `ProxyJump` hops, `Match exec`): its process group on Unix, its **Job Object** on
     Windows (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so the OS also ends it if PitCrew dies). The
@@ -325,6 +329,92 @@ on sites that forbid ssh to nodes; recorded for the tunnel), and the socket's pl
 - `check_tools(&probe.slurm, last_hop)` says whether a machine can run the launcher: `sbatch`,
   `squeue` and `scancel`, and `srun --overlap` for the `srun` last hop.
 
+## The tunnel (`tunnel`)
+
+Byte streams from the laptop to the helper's daemon, over the user's OpenSSH: to a login node,
+or to a compute node inside the helper's SLURM job.
+
+```rust
+let daemon = Daemon::new(target, Arc::new(launcher)).with_last_hop(site.last_hop());
+let connector = Connector::start(daemon, ConnectorOptions::default())?;  // in a tokio runtime
+let mut state = connector.watch();     // Connecting, Connected { transport }, Unverifiable, …
+let stream = connector.connect().await?;   // AsyncRead + AsyncWrite: one HTTP or WS connection
+connector.close().await;
+```
+
+- **The link.** A connector keeps its own `ssh -N` to the machine, with keepalives
+  (`ServerAliveInterval=2`, `ServerAliveCountMax=2`) that end it within six seconds of silence.
+  On Unix it is a ControlMaster whose socket is in the connector's own 0700 directory
+  (`<runtime dir>/t<hex>`, removed on close): the machine is logged in to once per
+  (re)connection, and every connection, check and endpoint query is a channel of it. Those
+  channels read no config (`-F none`), never prompt (`BatchMode`), and with no master there fail
+  at once instead of logging in (`ProxyCommand=false`). Its log is at `INFO`, for its reasons
+  ("Timeout, server … not responding."). On Windows (no ControlMaster) it is a heartbeat, ready
+  once ssh logs that it authenticated.
+- **Where the daemon is** comes from the launcher's `status`, asked through the link before
+  every (re)connection, and checked before anything of it reaches ssh's command line: the
+  socket path (absolute, `<dir>/pitcrewd.sock`, at most 100 bytes, only `A-Z a-z 0-9 . _ + - /`,
+  no empty, `.` or `..` component), the version (for the bridge's path
+  `<root>/bin/<version>/pitcrewd`), and for a job: still ours and running (squeue's name and
+  uid), its endpoint naming it, and the node squeue names being the one the endpoint records,
+  1 to 64 characters of `A-Z a-z 0-9 . _ -` starting with a letter or digit. A record that fails
+  is never used (`Unreachable { Refused }`, asked again every `retry_every`).
+- **A job's node** is reached as the site recipe's `last_hop` says:
+  - `ssh`: a link to the node whose `ProxyCommand` is `ssh -W '[%h]:%p'` as a client of the
+    login link's master (on Windows, `-J <login>`): like `ssh -J`, but the login node is not
+    logged in to a second time (one one-time code per reconnection, not two), and the hop gets
+    PitCrew's options;
+  - `srun`: `ssh <login> exec srun --jobid=<id> --overlap --nodes=1 --ntasks=1
+    --nodelist=<node> --quiet <pitcrewd> connect --socket <path>`, which also reaches a socket on
+    the node's own disk. A job on another cluster of a federation is refused there.
+- **Transports** (`Transport`):
+  - `Forwarded` (Unix): `ssh -O forward -L <dir>/f<n>:<socket>` adds a forward to the master
+    (`StreamLocalBindMask=0177`, `StreamLocalBindUnlink=yes`); connections share it, each a
+    channel. It is checked with one `GET /v1/host/info` (the API's route without a token). A site
+    with `AllowStreamLocalForwarding no` makes ssh close the channel and log "open failed:
+    administratively prohibited": that is read (as ssh's own line format), remembered, and the
+    stdio bridge used from then on.
+  - `Stdio`: each connection runs `pitcrewd connect` (below) on the host, as a channel of the
+    link (Unix) or a login of its own (Windows). The connection starts after the bridge's ready
+    mark, so a start-up file's chatter is skipped. Always used on Windows: its OpenSSH forwards
+    no unix sockets, neither std nor tokio has them there, and a TCP port instead would be open
+    to every local user. Always used through `srun`.
+
+  The choice is in `LinkState::Connected` and `Connector::transport()`; pass it back as
+  `ConnectorOptions::transport` to remember it across runs.
+- **The ladder.** Connected, the connector watches the link's exit, runs `ssh -O check` every
+  `check_every` (5 s), and probes through the transport every `probe_every` (30 s; Unix only),
+  at once after a failed `connect()`, on `wake()`, and when the wall clock jumps against the
+  monotonic one (the laptop slept). A failure makes it `Unverifiable` (a lost network within ten
+  seconds), stops the links, and tries again: at once if the connection had held for
+  `backoff_max`, else after a back-off; then with back-off and jitter (`backoff_min` 1 s to
+  `backoff_max` 30 s), until `give_up_after` (2 minutes) makes it `Unreachable { Network }`; it
+  then keeps trying every `retry_every` (1 minute). A helper not running or a job that ended is
+  `Unreachable { NotRunning }` at once, asked about again every `retry_every` through the login
+  link (a new job, on another node, is picked up). A failed sign-in or a cancelled prompt is
+  `Unreachable { SignIn }` and waits for `retry()`. Prompts while reconnecting go through the
+  askpass bridge; nothing is stored. Resuming the API stream (`since=`) is the caller's.
+- **Security:** agent and X11 forwarding, local commands and configured forwardings are off on
+  every call; every `-o` is PitCrew's; ssh gets only `MINIMAL_ENV` (and passed-through names);
+  local sockets live in the 0700 directory; reasons in states and errors carry no socket paths
+  and no secrets.
+- **Windows** works with fewer comforts: each connection logs in, and a password or one-time
+  code is asked each time (use keys); no periodic probe (it would be a login). Its tests have
+  not run on Windows.
+
+## The stdio bridge (`bridge`)
+
+`pitcrewd connect --socket <path>` is the remote end of the stdio transport. The daemon's CLI
+calls `bridge::run(path)` (or `connect_stdio`). Before a byte passes it checks, as a client of the
+daemon does, that the socket's directory is a real directory of this user's with no access for
+others, that the socket is a socket (not a link) of this user's, and that the process listening
+runs as this user (`SO_PEERCRED`/`getpeereid`); then it prints `READY` (`\0pitcrew-bridge 1
+ready\n`) and copies stdin to the socket and the socket to stdout. Half-closes pass both ways (end
+of file on stdin shuts down the socket's write side; the daemon's end of file closes stdout), and
+it ends once both sides are done, or as soon as the daemon has closed its side altogether. Exit
+codes: 2 usage, 3 not this user's (`EXIT_UNSAFE`), 4 no daemon (`EXIT_NO_DAEMON`), 1 other.
+Messages name what is wrong, never the path.
+
 ## Tests
 
 `cargo test -p pitcrew-remote` runs:
@@ -369,12 +459,28 @@ on sites that forbid ssh to nodes; recorded for the tunnel), and the socket's pl
   eaten, cut or changed on the way; the probe; and a job under each POSIX shell, which also
   shrugs off SIGUSR1 and SIGUSR2. The scripts' snapshots are unit tests
   (`PITCREW_UPDATE_SNAPSHOTS=1` rewrites them);
+- the tunnel cases in `tests/deploy/tunnel.rs`, where the fake `ssh` also plays the tunnel's
+  calls as OpenSSH does them: a link (`-N`, a ControlMaster listening on its `ControlPath`, its
+  keepalives timing out after `(CountMax + 1) × Interval` seconds of a down network, a
+  `ProxyCommand` run first and ending it when it ends, a password asked through askpass), `-O`
+  requests, `-W`, and channels running commands; it refuses a call without the options PitCrew
+  must pass. The machine's network can be up, down or frozen (a laptop asleep), and it can
+  forbid forwarding unix sockets. `srun` runs job steps, and the fake daemon echoes, answers
+  `GET` and half-closes. They cover a forwarded socket shared by many connections, forwarding
+  refused then the stdio bridge (remembered), the bridge through `srun --overlap` to a node-local
+  socket, a node reached through the login link, nodes that fail the re-check (nothing started
+  towards them), a dropped network noticed within ten seconds then recovered, a wall-clock
+  jump, a job that ended then moved to another node, and askpass during a reconnect (and a
+  cancel stopping the attempts). The bridge alone: byte-exact both ways, a large transfer,
+  half-closes both ways, and sockets that are not the user's refused;
 - `deploy.rs` checks that nothing a case starts outlives it: everything started on a fake
-  machine carries the run's mark (`PITCREW_TEST_RUN`) in its environment; after each case,
-  passed or not, what still carries it is killed and the case fails, and the end of the run
-  checks that nothing is left (Linux, through `/proc`);
+  machine (the fake `ssh` too) carries the run's mark (`PITCREW_TEST_RUN`) in its environment;
+  after each case, passed or not, what still carries it is killed and the case fails, and the
+  end of the run checks that nothing is left (Linux, through `/proc`);
 - `tests/real_sshd.rs`, only when `PITCREW_TEST_SSH_HOST` names a host reachable without
-  prompts; it also deploys a stand-in helper into a throwaway directory there and removes it.
+  prompts; it also deploys a stand-in helper into a throwaway directory there and removes it,
+  and, on a host sharing this machine's files (`localhost`), tunnels to a stand-in daemon the
+  test serves.
 
 The Windows code (Job Object, named pipes) is checked with clippy for
 `x86_64-pc-windows-gnu`; the test suites have not run on Windows yet (the deploy tests need a
