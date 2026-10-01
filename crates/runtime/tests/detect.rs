@@ -1,4 +1,16 @@
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
 use pitcrew_runtime::detect::{DetectError, TmuxVersion, VersionKind, detect_tmux};
+
+/// A child spawned while another test still holds a script open for writing
+/// inherits that handle until it execs, and executing the script then fails
+/// with ETXTBSY. Tests here that spawn processes take this lock.
+static SPAWN: Mutex<()> = Mutex::new(());
+
+fn serialize_spawns() -> MutexGuard<'static, ()> {
+    // A failed test must not fail the others through poisoning.
+    SPAWN.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 #[test]
 fn version_flavors_and_compatibility_floor() {
@@ -63,6 +75,7 @@ fn version_flavors_and_compatibility_floor() {
 
 #[test]
 fn missing_executable_is_a_fallback_error() {
+    let _spawns = serialize_spawns();
     let missing = std::env::temp_dir().join(format!("pitcrew-missing-{}/tmux", std::process::id()));
     assert!(
         matches!(detect_tmux(missing), Err(DetectError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound)
@@ -106,6 +119,7 @@ mod probe {
 
     #[test]
     fn hanging_probe_times_out_and_is_reaped() {
+        let _spawns = serialize_spawns();
         let probe = Probe::new("#!/bin/sh\nprintf '%s' \"$$\" > \"$0.pid\"\nexec sleep 10\n");
         let started = std::time::Instant::now();
         assert!(matches!(detect_tmux(&probe.0), Err(DetectError::TimedOut)));
@@ -122,6 +136,7 @@ mod probe {
 
     #[test]
     fn executes_version_probe_and_rejects_old_or_invalid_results() {
+        let _spawns = serialize_spawns();
         for output in [
             "tmux 2.7",
             "tmux 3.1c",
