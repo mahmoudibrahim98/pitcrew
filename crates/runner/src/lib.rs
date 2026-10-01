@@ -20,7 +20,8 @@
 //!
 //! Connected to a hub in the same process (the solo case in ADR-0009):
 //! - [`StoreSink`] writes the events into the hub's store, once each;
-//! - [`RunnerHandle::hooks`] turns agent hooks into session state ([`RunnerHooks`]);
+//! - [`RunnerHandle::hooks`] turns agent hooks into session state ([`RunnerHooks`]), for the
+//!   senders that may change each session, as [`SessionAgents`] tells;
 //! - [`RunnerHandle::terminals`] serves the API's terminals from a runtime ([`RunnerTerminals`]);
 //! - [`RunnerHandle::commands`] runs hub commands ([`RunnerCommands`]);
 //! - with [`Locations`], sessions are linked to workstreams by folder or branch.
@@ -31,9 +32,11 @@
 //! #     config: pitcrew_runner::RunnerConfig,
 //! #     adapters: Vec<Arc<dyn pitcrew_interfaces::source::SourceAdapter>>,
 //! #     store: Arc<pitcrew_store::Store>,
+//! #     agents: Arc<dyn pitcrew_runner::SessionAgents>,
 //! #     runtime: Arc<dyn pitcrew_interfaces::runtime::Runtime>,
 //! # ) -> Result<(), Box<dyn std::error::Error>> {
 //! let sink = Arc::new(pitcrew_runner::StoreSink::new(store, config.owner));
+//! let config = config.with_agents(agents); // over the hub's sessions and members
 //! let runner = pitcrew_runner::start(config, adapters, sink)?;
 //! let hooks = runner.hooks(); // a pitcrew_api::HookSink
 //! let terminals = runner.terminals(runtime)?; // a pitcrew_api::Terminals
@@ -45,10 +48,12 @@
 
 #![forbid(unsafe_code)]
 
+mod agents;
 mod commands;
 mod config;
 mod derive;
 mod fsinfo;
+mod held;
 mod hooks;
 mod link;
 mod sink;
@@ -57,6 +62,7 @@ mod store_sink;
 mod terminals;
 mod watch;
 
+pub use agents::{MemoryAgents, SessionAgent, SessionAgents};
 pub use commands::{CommandOptions, RunnerCommands};
 pub use config::{EngineHome, PollMode, RunnerConfig, Timing};
 pub use hooks::RunnerHooks;
@@ -114,7 +120,8 @@ impl RunnerHandle {
         self.shared.relink();
     }
 
-    /// The API's hook sink for this runner.
+    /// The API's hook sink for this runner. A hook applies only if its sender may change the
+    /// session (see [`RunnerHooks`]); without [`RunnerConfig::with_agents`], none does.
     #[must_use]
     pub fn hooks(&self) -> RunnerHooks {
         RunnerHooks::new(Arc::clone(&self.shared))
@@ -228,6 +235,7 @@ pub fn start(
         tx,
         shared: Arc::clone(&shared),
         locations: config.locations,
+        agents: config.agents,
     });
 
     let dispatcher = {

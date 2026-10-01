@@ -1,5 +1,6 @@
 //! Runner configuration.
 
+use crate::agents::SessionAgents;
 use crate::link::Locations;
 use pitcrew_protocol::ids::{MachineId, MemberId, WorkspaceId};
 use pitcrew_protocol::model::Engine;
@@ -86,6 +87,9 @@ pub struct RunnerConfig {
     pub max_batch_events: usize,
     /// Workstream locations to link sessions to. Without them, nothing is linked.
     pub locations: Option<Arc<dyn Locations>>,
+    /// Who runs each session, to decide whose hooks may change it (see
+    /// [`RunnerHooks`](crate::RunnerHooks)). Without it, every hook is refused.
+    pub agents: Option<Arc<dyn SessionAgents>>,
 }
 
 impl RunnerConfig {
@@ -108,6 +112,7 @@ impl RunnerConfig {
             channel_capacity: 64,
             max_batch_events: 256,
             locations: None,
+            agents: None,
         }
     }
 
@@ -125,6 +130,13 @@ impl RunnerConfig {
     #[must_use]
     pub fn with_locations(mut self, locations: Arc<dyn Locations>) -> Self {
         self.locations = Some(locations);
+        self
+    }
+
+    /// Decides whose hooks may change a session by its agent, as `agents` tells it.
+    #[must_use]
+    pub fn with_agents(mut self, agents: Arc<dyn SessionAgents>) -> Self {
+        self.agents = Some(agents);
         self
     }
 }

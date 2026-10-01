@@ -14,7 +14,7 @@ use crate::config::EngineHome;
 use crate::derive::Reported;
 use crate::store::TerminalRow;
 use crate::terminals::RunnerTerminals;
-use crate::watch::{Shared, Signal, Target};
+use crate::watch::{Origin, Shared, Signal, Target};
 use pitcrew_api::terminal::TerminalError;
 use pitcrew_interfaces::runtime::StartSpec;
 use pitcrew_protocol::ids::{CommandId, SessionId, TerminalId};
@@ -328,6 +328,8 @@ impl RunnerCommands {
                         to: SessionState::Ended,
                         status_line: None,
                     },
+                    // Not a hook: the runner itself ended the session.
+                    origin: Origin::Runner,
                 });
                 CommandOutcome::Ok { detail: None }
             }

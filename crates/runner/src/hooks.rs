@@ -8,14 +8,21 @@
 //!   never moves a session back (see `derive::report`).
 //!
 //! Hooks name the CLI's own session id; the runner's index maps it to the [`SessionId`]. A hook
-//! for a session not indexed yet (its transcript has no first line yet) waits a while and
-//! applies when the session is discovered.
+//! for a session not indexed yet (its transcript has no first line yet) is held a while and
+//! applies when the session is discovered (see `held`).
+//!
+//! Every hook carries its sender (the token's caller) to where its session is resolved, as
+//! [`Origin::Hook`]; only there is the session's agent known, and the ownership rule
+//! ([`refusal`]) decides. A held hook keeps its sender and is decided at discovery.
 //!
 //! [`SessionId`]: pitcrew_protocol::ids::SessionId
 
+use crate::agents::SessionAgent;
 use crate::derive::Reported;
-use crate::watch::{Shared, Signal, Target};
+use crate::watch::{Origin, Shared, Signal, Target};
 use pitcrew_api::hooks::{HookEvent, HookSink};
+use pitcrew_protocol::api::{Caller, TokenScope};
+use pitcrew_protocol::ids::MemberId;
 use pitcrew_protocol::model::{Engine, SessionState};
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -31,7 +38,24 @@ use std::sync::Arc;
 ///
 /// Every other hook is ignored.
 ///
+/// # Who may change a session
+///
+/// A hook changes a session only if its sender may, by the session's agent as
+/// [`SessionAgents`] tells it:
+/// - **an agent token** (`scope` agent): only a session whose agent is the token's member;
+/// - **a device token** (a person): only a session with no agent, or whose agent that person
+///   owns;
+/// - anything else, and any session whose agent is [unknown](SessionAgent::Unknown) (no
+///   [`SessionAgents`] configured, a failed or panicking lookup), is refused: dropped and logged
+///   at debug with the reason, never applied and never held.
+///
+/// The token's `on_behalf_of` never widens what an agent may change. A hook for a session not
+/// indexed yet is held with its sender and decided when the session is discovered; one refused
+/// then is dropped. Codex's `notify` follows the same rule. Each sender holds at most 32 hooks:
+/// a flood from one sender drops its own oldest, not another's.
+///
 /// [`RunnerHandle::hooks`]: crate::RunnerHandle::hooks
+/// [`SessionAgents`]: crate::SessionAgents
 #[derive(Clone, Debug)]
 pub struct RunnerHooks {
     shared: Arc<Shared>,
@@ -48,6 +72,43 @@ impl HookSink for RunnerHooks {
         match signal(&event) {
             Some(s) => self.shared.signal(s),
             None => tracing::trace!(engine = ?event.engine, event = %event.event, "hook ignored"),
+        }
+    }
+}
+
+/// Who sent a hook: the caller its token names. Built only from a delivered hook, so a
+/// [`Signal`] from a hook always says who sent it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Sender(Caller);
+
+impl Sender {
+    #[cfg(test)]
+    pub(crate) fn new(caller: Caller) -> Self {
+        Self(caller)
+    }
+
+    /// The member the token belongs to.
+    pub(crate) fn member(&self) -> MemberId {
+        self.0.member
+    }
+}
+
+/// Why `sender` may not change a session run as `agent`; `None` if it may. The rule is on
+/// [`RunnerHooks`].
+pub(crate) fn refusal(sender: &Sender, agent: &SessionAgent) -> Option<&'static str> {
+    let caller = &sender.0;
+    // Every scope and every answer is matched explicitly: a new one must be decided here.
+    match (caller.scope, agent) {
+        (_, SessionAgent::Unknown) => Some("the session's agent is unknown"),
+        (TokenScope::Agent, SessionAgent::Agent { agent: runs_as, .. }) => {
+            (*runs_as != caller.member).then_some("the session is another agent's")
+        }
+        (TokenScope::Agent, SessionAgent::NoAgent) => {
+            Some("an agent's hook for a session without an agent")
+        }
+        (TokenScope::Device, SessionAgent::NoAgent) => None,
+        (TokenScope::Device, SessionAgent::Agent { owner, .. }) => {
+            (*owner != caller.member).then_some("the session's agent is another person's")
         }
     }
 }
@@ -81,6 +142,7 @@ pub(crate) fn signal(event: &HookEvent) -> Option<Signal> {
             to,
             status_line,
         },
+        origin: Origin::Hook(Sender(event.caller)),
     })
 }
 
@@ -116,8 +178,18 @@ fn text<'a>(p: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pitcrew_protocol::api::{Caller, TokenScope};
-    use pitcrew_protocol::ids::MemberId;
+
+    fn member(n: u128) -> MemberId {
+        MemberId(ulid::Ulid::from_parts(1, n))
+    }
+
+    fn caller() -> Caller {
+        Caller {
+            member: member(1),
+            scope: TokenScope::Agent,
+            on_behalf_of: Some(member(2)),
+        }
+    }
 
     fn hook(engine: Engine, event: &str, payload: Value) -> HookEvent {
         let Value::Object(payload) = payload else {
@@ -126,14 +198,86 @@ mod tests {
         HookEvent {
             engine,
             event: event.into(),
-            caller: Caller {
-                member: MemberId::new(),
-                scope: TokenScope::Agent,
-                on_behalf_of: None,
-            },
+            caller: caller(),
             payload,
             received_at: 42,
         }
+    }
+
+    #[test]
+    fn hooks_carry_their_sender() {
+        let claude = serde_json::json!({"session_id": "s1", "hook_event_name": "Stop"});
+        let codex = serde_json::json!({"type": "agent-turn-complete", "thread-id": "t1"});
+        for (engine, event, payload) in [
+            (Engine::Claude, "Stop", claude),
+            (Engine::Codex, "notify", codex),
+        ] {
+            let s = signal(&hook(engine, event, payload));
+            assert_eq!(
+                s.map(|s| s.origin),
+                Some(Origin::Hook(Sender(caller()))),
+                "{engine:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ownership_rule() {
+        use SessionAgent::{Agent, NoAgent, Unknown};
+        let (person, other_person) = (member(10), member(11));
+        let (agent, other_agent) = (member(20), member(21));
+        let device = |m| {
+            Sender(Caller {
+                member: m,
+                scope: TokenScope::Device,
+                on_behalf_of: None,
+            })
+        };
+        let agent_token = |m, owner| {
+            Sender(Caller {
+                member: m,
+                scope: TokenScope::Agent,
+                on_behalf_of: Some(owner),
+            })
+        };
+        let persons_agent = Agent {
+            agent,
+            owner: person,
+        };
+        let others_agent = Agent {
+            agent: other_agent,
+            owner: other_person,
+        };
+        let allowed = |s: Sender, a: SessionAgent| refusal(&s, &a).is_none();
+
+        // An agent: only its own sessions; its owner (on_behalf_of) widens nothing.
+        assert!(allowed(agent_token(agent, person), persons_agent));
+        assert!(!allowed(
+            agent_token(other_agent, other_person),
+            persons_agent
+        ));
+        assert!(!allowed(agent_token(other_agent, person), persons_agent));
+        assert!(!allowed(agent_token(agent, person), NoAgent));
+        assert!(!allowed(agent_token(agent, person), Unknown));
+        // Nor does naming the session's owner as its member.
+        assert!(!allowed(agent_token(person, person), persons_agent));
+        // A person: sessions without an agent, and their own agents' sessions.
+        assert!(allowed(device(person), NoAgent));
+        assert!(allowed(device(person), persons_agent));
+        assert!(!allowed(device(person), others_agent));
+        assert!(!allowed(device(person), Unknown));
+        // A person's member as the session's agent is not ownership.
+        assert!(!allowed(
+            device(person),
+            Agent {
+                agent: person,
+                owner: other_person
+            }
+        ));
+        assert_eq!(
+            refusal(&device(other_person), &persons_agent),
+            Some("the session's agent is another person's")
+        );
     }
 
     fn state(engine: Engine, event: &str, payload: Value) -> Option<(String, SessionState)> {

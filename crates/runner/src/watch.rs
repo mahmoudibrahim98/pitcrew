@@ -18,11 +18,16 @@
 //! polled instead, and swept and rediscovered [`NETWORK_SLOWDOWN`] times less often.
 //!
 //! The same thread applies states reported by hooks and the runtime ([`Signal`]s), so they and
-//! the transcripts agree (see `derive::report`), and links sessions to workstreams.
+//! the transcripts agree (see `derive::report`), and links sessions to workstreams. It also
+//! decides, by the session's agent, whether a hook's sender may change the session (the rule is
+//! on [`RunnerHooks`](crate::RunnerHooks)).
 
+use crate::agents::{SessionAgent, SessionAgents};
 use crate::config::{EngineHome, PollMode, Timing};
 use crate::derive::{self, Derived, Facts, Reported};
 use crate::fsinfo::{self, FileStat};
+use crate::held::Held;
+use crate::hooks::{self, Sender};
 use crate::link::{self, Locations, WorkstreamLocation};
 use crate::sink::Batch;
 use crate::store::{Commit, Row, Store, path_text};
@@ -57,18 +62,37 @@ const NOTIFY_WARN_GAP: Duration = Duration::from_secs(60);
 /// The identity saved for a transcript whose file was deleted. It matches no real file, so a file
 /// that appears at the path later is read from the start, even if it reuses the old inode.
 const GONE: &str = "gone";
-/// Reported states waiting for the watcher; past this the oldest is dropped.
+/// Reported states waiting for the watcher; past this the sender with the most waiting loses
+/// its oldest.
 const MAX_SIGNALS: usize = 1024;
-/// Reports for sessions not indexed yet, kept until their transcript appears.
-const MAX_HELD: usize = 1024;
-/// How long such a report is kept.
-const HELD_FOR: Duration = Duration::from_secs(10 * 60);
+/// Least time between two "too many reported states" warnings.
+const SIGNALS_WARN_GAP: Duration = Duration::from_secs(60);
 
 /// A state reported outside the transcripts, for one session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Signal {
     pub target: Target,
     pub report: Reported,
+    pub origin: Origin,
+}
+
+/// Who reported a [`Signal`], and so whether it is checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// The runner itself (a command it ran): applied as is.
+    Runner,
+    /// An agent hook: applied only if its sender may change the session.
+    Hook(Sender),
+}
+
+impl Origin {
+    /// Who to count it against when signals pile up: the hook's member, or the runner.
+    fn member(self) -> Option<MemberId> {
+        match self {
+            Self::Runner => None,
+            Self::Hook(sender) => Some(sender.member()),
+        }
+    }
 }
 
 /// Which session a [`Signal`] is about.
@@ -98,6 +122,7 @@ struct Signals {
     notify_warned_at: Option<Instant>,
     /// Reported states, in arrival order.
     reports: VecDeque<Signal>,
+    signals_warned_at: Option<Instant>,
     /// Workstream locations changed: link every session again.
     relink: bool,
 }
@@ -166,12 +191,22 @@ impl Shared {
         self.cv.notify_one();
     }
 
-    /// Hands a reported state to the watcher. It never blocks: a hook must not wait.
+    /// Hands a reported state to the watcher. It never blocks: a hook must not wait. When too
+    /// many wait, the sender with the most waiting loses its oldest, so a flood from one sender
+    /// costs only that sender.
     pub fn signal(&self, signal: Signal) {
         let mut s = self.lock();
         if s.reports.len() >= MAX_SIGNALS {
-            s.reports.pop_front();
-            tracing::warn!("too many reported states waiting; dropped the oldest");
+            drop_one(&mut s.reports);
+            let now = Instant::now();
+            if s.signals_warned_at
+                .is_none_or(|t| now.duration_since(t) >= SIGNALS_WARN_GAP)
+            {
+                s.signals_warned_at = Some(now);
+                tracing::warn!(
+                    "too many reported states waiting; dropping the oldest of the sender with the most"
+                );
+            }
         }
         s.reports.push_back(signal);
         drop(s);
@@ -309,8 +344,12 @@ pub(crate) struct Watcher {
     /// The CLI's session id → tracked transcript.
     by_native: HashMap<(Engine, String), u64>,
     by_session: HashMap<SessionId, u64>,
-    /// Reports for sessions not indexed yet, with when they came.
-    held: HashMap<(Engine, String), (Instant, Reported)>,
+    /// Hooks for sessions not indexed yet.
+    held: Held,
+    /// Who runs each session; without it every hook is refused.
+    agents: Option<Arc<dyn SessionAgents>>,
+    /// The agent lookup panicked; warned once.
+    lookup_panicked: bool,
 }
 
 pub(crate) struct Setup {
@@ -327,6 +366,7 @@ pub(crate) struct Setup {
     pub tx: SyncSender<Batch>,
     pub shared: Arc<Shared>,
     pub locations: Option<Arc<dyn Locations>>,
+    pub agents: Option<Arc<dyn SessionAgents>>,
 }
 
 impl Watcher {
@@ -345,6 +385,9 @@ impl Watcher {
                 }
             }
         };
+        if s.agents.is_none() {
+            tracing::info!("no session agents configured: every hook will be refused");
+        }
         let now = Instant::now();
         let mut homes = Vec::new();
         for h in s.homes {
@@ -399,7 +442,9 @@ impl Watcher {
             locations: s.locations,
             by_native: HashMap::new(),
             by_session: HashMap::new(),
-            held: HashMap::new(),
+            held: Held::default(),
+            agents: s.agents,
+            lookup_panicked: false,
         }
     }
 
@@ -1106,7 +1151,7 @@ impl Watcher {
         }
 
         // Facts from elsewhere: the parent of a sub-agent, the terminal the runner started the
-        // session in, a hook that came before the transcript, and workstream locations.
+        // session in, hooks that came before the transcript, and workstream locations.
         let (parent, terminal, held) = if first {
             let parent = subagent.then(|| self.parent_of(engine, &path)).flatten();
             let terminal = if subagent {
@@ -1114,10 +1159,10 @@ impl Watcher {
             } else {
                 self.claim_terminal(session, engine, &native, cwd.as_deref(), started)
             };
-            let held = self.held.remove(&(engine, native)).map(|(_, r)| r);
+            let held = self.allowed_held(session, engine, &native);
             (parent, terminal, held)
         } else {
-            (None, None, None)
+            (None, None, Vec::new())
         };
         let places = (first || moved).then(|| self.places(session)).flatten();
 
@@ -1134,17 +1179,18 @@ impl Watcher {
         };
         let mut events: Vec<(Option<u64>, Event)> = Vec::new();
         if first {
-            // A hook that came first is folded in, unless the transcript is newer.
-            let ended = held.is_some_and(|r| {
-                derive::report(&mut t.row.facts, &r).is_some()
-                    && t.row.facts.state == SessionState::Ended
-            });
+            // Hooks that came first are folded in, oldest first, unless the transcript is newer.
+            let mut changed = false;
+            for r in &held {
+                changed |= derive::report(&mut t.row.facts, r).is_some();
+            }
+            let ended = changed && t.row.facts.state == SessionState::Ended;
             let s = session_of(&t.row, &t.tref, machine, parent, terminal);
             let at = discovered_id_time(&t.row);
             events.push((
                 None,
                 event(
-                    event_id(session, 0, Origin::Discovered, 0, at),
+                    event_id(session, 0, Cause::Discovered, 0, at),
                     s.started,
                     EventBody::SessionDiscovered { session: s },
                 ),
@@ -1156,7 +1202,7 @@ impl Watcher {
                 events.push((
                     None,
                     event(
-                        event_id(session, t.row.generation, Origin::Report(n), 0, at),
+                        event_id(session, t.row.generation, Cause::Report(n), 0, at),
                         at,
                         EventBody::SessionEnded { session },
                     ),
@@ -1179,7 +1225,7 @@ impl Watcher {
         for d in derived {
             seq = if last == Some(d.key) { seq + 1 } else { 0 };
             last = Some(d.key);
-            let id = event_id(session, t.row.generation, Origin::Item(d.key), seq, d.at);
+            let id = event_id(session, t.row.generation, Cause::Item(d.key), seq, d.at);
             events.push((Some(d.key), event(id, d.at, d.body)));
         }
         t.row.cursor = chunk.cursor;
@@ -1199,8 +1245,8 @@ impl Watcher {
         Ok(())
     }
 
-    /// Applies reported states: at once for indexed sessions, or held until the session's
-    /// transcript is found.
+    /// Applies reported states: at once for indexed sessions or, for a hook, held until the
+    /// session's transcript is found. A hook applies only if its sender may change the session.
     fn apply_reports(&mut self, reports: Vec<Signal>) -> Result<(), Hangup> {
         for s in reports {
             let id = match &s.target {
@@ -1209,18 +1255,77 @@ impl Watcher {
                 }
                 Target::Session(session) => self.by_session.get(session).copied(),
             };
-            tracing::debug!(target = ?s.target, report = ?s.report, tracked = ?id, "reported state");
-            match id.filter(|id| self.tracked.get(id).is_some_and(|t| t.row.discovered)) {
-                Some(id) => self.apply_report(id, &s.report)?,
-                None => match s.target {
-                    Target::Native { engine, native_id } => self.hold(engine, native_id, s.report),
+            let indexed = id.and_then(|id| {
+                self.tracked
+                    .get(&id)
+                    .filter(|t| t.row.discovered)
+                    .map(|t| (id, t.row.session))
+            });
+            tracing::debug!(target = ?s.target, report = ?s.report, origin = ?s.origin, tracked = ?id, "reported state");
+            match (indexed, s.origin) {
+                (Some((id, _)), Origin::Runner) => self.apply_report(id, &s.report)?,
+                (Some((id, session)), Origin::Hook(sender)) => {
+                    match hooks::refusal(&sender, &self.agent_of(session)) {
+                        None => self.apply_report(id, &s.report)?,
+                        Some(reason) => {
+                            tracing::debug!(%session, target = ?s.target, member = %sender.member(), reason, "hook refused; dropped");
+                        }
+                    }
+                }
+                (None, Origin::Hook(sender)) => match s.target {
+                    Target::Native { engine, native_id } => {
+                        self.hold(engine, native_id, sender, s.report);
+                    }
                     Target::Session(session) => {
-                        tracing::debug!(%session, "a reported state for a session not indexed; ignored");
+                        tracing::debug!(%session, "a hook for a session not indexed; ignored");
                     }
                 },
+                (None, Origin::Runner) => {
+                    tracing::debug!(target = ?s.target, "a reported state for a session not indexed; ignored");
+                }
             }
         }
         Ok(())
+    }
+
+    /// The session's agent, from the [`SessionAgents`]: unknown without them, or if they panic.
+    /// Called on this thread, which is why it must never call back into the runner.
+    fn agent_of(&mut self, session: SessionId) -> SessionAgent {
+        let Some(agents) = self.agents.clone() else {
+            return SessionAgent::Unknown;
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| agents.agent_of(session))) {
+            Ok(agent) => agent,
+            Err(panic) => {
+                let message = panic_text(&*panic);
+                if self.lookup_panicked {
+                    tracing::debug!(%session, panic = message, "the session agent lookup panicked; the agent is unknown");
+                } else {
+                    tracing::warn!(%session, panic = message, "the session agent lookup panicked; the agent is unknown, and the hook refused");
+                    self.lookup_panicked = true;
+                }
+                SessionAgent::Unknown
+            }
+        }
+    }
+
+    /// The hooks held for a newly discovered session whose senders may apply them, oldest
+    /// first. The others are dropped.
+    fn allowed_held(&mut self, session: SessionId, engine: Engine, native: &str) -> Vec<Reported> {
+        let held = self.held.take(engine, native, Instant::now());
+        if held.is_empty() {
+            return Vec::new();
+        }
+        let agent = self.agent_of(session);
+        held.into_iter()
+            .filter_map(|(sender, report)| match hooks::refusal(&sender, &agent) {
+                None => Some(report),
+                Some(reason) => {
+                    tracing::debug!(%session, member = %sender.member(), reason, "a held hook refused at discovery; dropped");
+                    None
+                }
+            })
+            .collect()
     }
 
     fn apply_report(&mut self, id: u64, r: &Reported) -> Result<(), Hangup> {
@@ -1237,7 +1342,7 @@ impl Watcher {
             .into_iter()
             .zip(0u32..)
             .map(|(body, seq)| Event {
-                id: event_id(session, generation, Origin::Report(n), seq, r.at),
+                id: event_id(session, generation, Cause::Report(n), seq, r.at),
                 at: r.at,
                 workspace,
                 author: owner,
@@ -1253,31 +1358,11 @@ impl Watcher {
             .map_err(|_| Hangup)
     }
 
-    /// Keeps the newest report for a session whose transcript is not indexed yet, and looks for
-    /// it soon.
-    fn hold(&mut self, engine: Engine, native_id: String, report: Reported) {
+    /// Holds a hook for a session whose transcript is not indexed yet (see `held`), and looks
+    /// for it soon, unless its sender asked for a look just now.
+    fn hold(&mut self, engine: Engine, native_id: String, sender: Sender, report: Reported) {
         let now = Instant::now();
-        self.held
-            .retain(|_, (since, _)| now.duration_since(*since) < HELD_FOR);
-        let key = (engine, native_id);
-        let new = !self.held.contains_key(&key);
-        if new && self.held.len() >= MAX_HELD {
-            let oldest = self
-                .held
-                .iter()
-                .min_by_key(|(_, (since, _))| *since)
-                .map(|(k, _)| k.clone());
-            if let Some(k) = oldest {
-                self.held.remove(&k);
-            }
-        }
-        match self.held.get(&key) {
-            Some((_, old)) if old.at > report.at => {}
-            _ => {
-                self.held.insert(key, (now, report));
-            }
-        }
-        if new {
+        if self.held.hold(engine, native_id, sender, report, now) {
             // Its transcript may have just appeared.
             let at = self
                 .last_rediscover
@@ -1471,6 +1556,20 @@ fn is_not_found(e: &notify::Error) -> bool {
     }
 }
 
+/// Drops the oldest waiting signal of the sender with the most waiting.
+fn drop_one(reports: &mut VecDeque<Signal>) {
+    let mut counts: HashMap<Option<MemberId>, usize> = HashMap::new();
+    for s in reports.iter() {
+        *counts.entry(s.origin.member()).or_default() += 1;
+    }
+    let Some(most) = counts.into_iter().max_by_key(|(_, n)| *n).map(|(m, _)| m) else {
+        return;
+    };
+    if let Some(i) = reports.iter().position(|s| s.origin.member() == most) {
+        reports.remove(i);
+    }
+}
+
 /// `now + d`, without overflowing on absurd durations (a year stands in).
 fn after(now: Instant, d: Duration) -> Instant {
     now.checked_add(d)
@@ -1492,14 +1591,17 @@ enum AdapterError {
 fn guard<T>(call: impl FnOnce() -> Result<T, SourceError>) -> Result<T, AdapterError> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
         Ok(result) => result.map_err(AdapterError::Source),
-        Err(panic) => Err(AdapterError::Panic(
-            panic
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_owned())
-                .or_else(|| panic.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "no message".to_owned()),
-        )),
+        Err(panic) => Err(AdapterError::Panic(panic_text(&*panic).to_owned())),
     }
+}
+
+/// The message of a caught panic (`panic!` gives a `&str` or a `String`).
+fn panic_text(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
 }
 
 fn new_row(tref: &TranscriptRef) -> Row {
@@ -1579,9 +1681,9 @@ fn split(events: Vec<(Option<u64>, Event)>, max: usize, row: &Row) -> Vec<Batch>
     out
 }
 
-/// Where an event came from.
+/// What caused an event, for its id.
 #[derive(Clone, Copy, Debug)]
-enum Origin {
+enum Cause {
     /// The session's discovery.
     Discovered,
     /// A transcript item, by its key.
@@ -1592,29 +1694,29 @@ enum Origin {
     Link(u32),
 }
 
-/// A ULID whose time is the event's and whose random part is a hash of where it came from, so an
+/// A ULID whose time is the event's and whose random part is a hash of what caused it, so an
 /// event sent again after a crash has the same id.
 fn event_id(
     session: SessionId,
     generation: u32,
-    origin: Origin,
+    cause: Cause,
     seq: u32,
     at: TimestampMs,
 ) -> EventId {
     let mut h = Sha256::new();
     h.update(session.0.to_bytes());
     h.update(generation.to_le_bytes());
-    match origin {
-        Origin::Discovered => h.update([0]),
-        Origin::Item(k) => {
+    match cause {
+        Cause::Discovered => h.update([0]),
+        Cause::Item(k) => {
             h.update([1]);
             h.update(k.to_le_bytes());
         }
-        Origin::Report(n) => {
+        Cause::Report(n) => {
             h.update([2]);
             h.update(n.to_le_bytes());
         }
-        Origin::Link(n) => {
+        Cause::Link(n) => {
             h.update([3]);
             h.update(n.to_le_bytes());
         }
@@ -1725,7 +1827,7 @@ fn link_event(
     let id = event_id(
         row.session,
         0,
-        Origin::Link(row.facts.links),
+        Cause::Link(row.facts.links),
         0,
         discovered_id_time(row),
     );
@@ -1813,15 +1915,15 @@ mod tests {
     #[test]
     fn event_ids_repeat_for_the_same_origin() {
         let s = SessionId::new();
-        let a = event_id(s, 0, Origin::Item(10), 0, 1000);
-        assert_eq!(a, event_id(s, 0, Origin::Item(10), 0, 1000));
-        assert_ne!(a, event_id(s, 0, Origin::Item(10), 1, 1000));
-        assert_ne!(a, event_id(s, 1, Origin::Item(10), 0, 1000));
-        assert_ne!(a, event_id(s, 0, Origin::Discovered, 0, 1000));
-        assert_ne!(a, event_id(s, 0, Origin::Report(10), 0, 1000));
+        let a = event_id(s, 0, Cause::Item(10), 0, 1000);
+        assert_eq!(a, event_id(s, 0, Cause::Item(10), 0, 1000));
+        assert_ne!(a, event_id(s, 0, Cause::Item(10), 1, 1000));
+        assert_ne!(a, event_id(s, 1, Cause::Item(10), 0, 1000));
+        assert_ne!(a, event_id(s, 0, Cause::Discovered, 0, 1000));
+        assert_ne!(a, event_id(s, 0, Cause::Report(10), 0, 1000));
         assert_ne!(
-            event_id(s, 0, Origin::Report(1), 0, 1000),
-            event_id(s, 0, Origin::Link(1), 0, 1000)
+            event_id(s, 0, Cause::Report(1), 0, 1000),
+            event_id(s, 0, Cause::Link(1), 0, 1000)
         );
         assert_eq!(a.0.timestamp_ms(), 1000);
     }
@@ -1907,6 +2009,51 @@ mod tests {
         let out = Path::new("/scratch/p/s.jsonl");
         assert!(wanted_dirs(out, home, false).is_empty());
         assert_eq!(wanted_dirs(out, home, true), [p("/scratch/p")]);
+    }
+
+    #[test]
+    fn a_flood_of_signals_costs_only_its_sender() {
+        use pitcrew_protocol::api::{Caller, TokenScope};
+        let sender = || {
+            Sender::new(Caller {
+                member: MemberId::new(),
+                scope: TokenScope::Agent,
+                on_behalf_of: Some(MemberId::new()),
+            })
+        };
+        let signal = |native_id: &str, origin| Signal {
+            target: Target::Native {
+                engine: Engine::Claude,
+                native_id: native_id.into(),
+            },
+            report: Reported {
+                at: 1,
+                to: SessionState::Ended,
+                status_line: None,
+            },
+            origin,
+        };
+        let (person, flood) = (sender(), sender());
+        let shared = Shared::default();
+        shared.signal(signal("mine", Origin::Hook(person)));
+        shared.signal(signal("ended", Origin::Runner));
+        for i in 0..3 * MAX_SIGNALS {
+            shared.signal(signal(&format!("f{i}"), Origin::Hook(flood)));
+        }
+        let s = shared.lock();
+        assert_eq!(s.reports.len(), MAX_SIGNALS);
+        let kept = |origin| s.reports.iter().filter(|r| r.origin == origin).count();
+        assert_eq!(kept(Origin::Hook(person)), 1);
+        assert_eq!(kept(Origin::Runner), 1);
+        assert_eq!(kept(Origin::Hook(flood)), MAX_SIGNALS - 2);
+        // The flood kept its newest.
+        assert_eq!(
+            s.reports.back().map(|r| r.target.clone()),
+            Some(Target::Native {
+                engine: Engine::Claude,
+                native_id: format!("f{}", 3 * MAX_SIGNALS - 1)
+            })
+        );
     }
 
     #[test]
