@@ -99,8 +99,12 @@ fn open(state: &StateDir, demo: bool) -> anyhow::Result<Hub> {
     };
 
     let path = state.store();
-    let store = Store::open_with(&path, StoreOptions::default(), pitcrew_hub_work::projections())
-        .with_context(|| format!("cannot open the store {}", path.display()))?;
+    let store = Store::open_with(
+        &path,
+        StoreOptions::default(),
+        pitcrew_hub_work::projections(),
+    )
+    .with_context(|| format!("cannot open the store {}", path.display()))?;
     let store = Arc::new(store);
     let latest = store.latest_rev().context("cannot read the store")?;
 
@@ -117,7 +121,10 @@ fn open(state: &StateDir, demo: bool) -> anyhow::Result<Hub> {
         None
     };
 
-    let workspace = match (&demo, store.since(0, 1).context("cannot read the store")?.first()) {
+    let workspace = match (
+        &demo,
+        store.since(0, 1).context("cannot read the store")?.first(),
+    ) {
         (Some(demo), _) => demo.workspace.id,
         (None, Some(first)) => first.event.workspace,
         (None, None) => {
@@ -283,7 +290,8 @@ async fn run(
 
     let (listen, dev) = match listen {
         ListenArg::Private => (
-            Listen::private_default(state.run_dir()).context("cannot pick the private transport")?,
+            Listen::private_default(state.run_dir())
+                .context("cannot pick the private transport")?,
             false,
         ),
         ListenArg::Tcp(addr) => (Listen::DevTcp { addr }, true),
@@ -332,7 +340,10 @@ async fn run(
         Ok(Ok(Err(e))) => tracing::warn!(error = %e, "the server failed while stopping"),
         Ok(Err(e)) => tracing::warn!(error = %e, "the server task failed while stopping"),
         Err(_) => {
-            tracing::warn!(seconds = DRAIN.as_secs(), "requests still running; stopping anyway");
+            tracing::warn!(
+                seconds = DRAIN.as_secs(),
+                "requests still running; stopping anyway"
+            );
             serving.abort();
         }
     }
@@ -469,7 +480,10 @@ mod tests {
         assert_eq!(writer.handle, "@writer");
 
         assert_eq!(hub.work.workspace(), demo.workspace.id);
-        assert_eq!(hub.work.tasks(&Default::default()).unwrap().len(), demo.tasks.len());
+        assert_eq!(
+            hub.work.tasks(&Default::default()).unwrap().len(),
+            demo.tasks.len()
+        );
     }
 
     #[test]
@@ -494,7 +508,10 @@ mod tests {
         let (_tmp, state) = state();
         drop(open(&state, true).unwrap());
         let err = open(&state, true).err().unwrap();
-        assert!(format!("{err:#}").contains("only an empty store"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("only an empty store"),
+            "{err:#}"
+        );
     }
 
     #[test]

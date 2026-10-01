@@ -1,7 +1,7 @@
 //! Test support: the real `pitcrewd` binary on a temp state directory and a free port, and a
 //! small HTTP and WebSocket client over plain TCP.
 
-#![allow(dead_code)]
+#![allow(dead_code, clippy::unwrap_used)]
 
 use serde_json::Value;
 use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
@@ -101,37 +101,35 @@ impl Daemon {
             }
         });
 
-        let deadline = Instant::now() + READY;
-        loop {
-            match ready.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                Ok(line) => {
-                    if let Some(at) = line.strip_prefix("pitcrewd listening on http://") {
-                        let port = at.rsplit(':').next().unwrap().parse().unwrap();
-                        return Ok(Self {
-                            child,
-                            port,
-                            state: state.to_path_buf(),
-                            ready_in: started.elapsed(),
-                            stderr,
-                        });
-                    }
+        // The ready line is the first thing on stdout.
+        match ready.recv_timeout(READY) {
+            Ok(line) => {
+                let Some(at) = line.strip_prefix("pitcrewd listening on http://") else {
                     panic!("unexpected stdout line: {line}");
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    let status = child.wait().expect("wait");
-                    // Let the stderr reader finish.
-                    thread::sleep(Duration::from_millis(100));
-                    let stderr = stderr.lock().unwrap().clone();
-                    return Err(Refused { status, stderr });
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!(
-                        "pitcrewd was not ready within {READY:?}:\n{}",
-                        stderr.lock().unwrap()
-                    );
-                }
+                };
+                let port = at.rsplit(':').next().unwrap().parse().unwrap();
+                Ok(Self {
+                    child,
+                    port,
+                    state: state.to_path_buf(),
+                    ready_in: started.elapsed(),
+                    stderr,
+                })
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let status = child.wait().expect("wait");
+                // Let the stderr reader finish.
+                thread::sleep(Duration::from_millis(100));
+                let stderr = stderr.lock().unwrap().clone();
+                Err(Refused { status, stderr })
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "pitcrewd was not ready within {READY:?}:\n{}",
+                    stderr.lock().unwrap()
+                );
             }
         }
     }
@@ -256,9 +254,8 @@ pub fn request(
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
         .unwrap();
-    let mut head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n"
-    );
+    let mut head =
+        format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n");
     if let Some(token) = token {
         head.push_str(&format!("Authorization: Bearer {token}\r\n"));
     }
@@ -471,8 +468,10 @@ impl Ws {
             1 => Frame::Text(String::from_utf8(payload).expect("UTF-8 text")),
             2 => Frame::Binary(payload),
             8 => {
-                let code = (payload.len() >= 2).then(|| u16::from_be_bytes([payload[0], payload[1]]));
-                let reason = String::from_utf8_lossy(payload.get(2..).unwrap_or_default()).into_owned();
+                let code =
+                    (payload.len() >= 2).then(|| u16::from_be_bytes([payload[0], payload[1]]));
+                let reason =
+                    String::from_utf8_lossy(payload.get(2..).unwrap_or_default()).into_owned();
                 Frame::Close(code, reason)
             }
             9 => Frame::Ping,

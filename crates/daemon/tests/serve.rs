@@ -1,5 +1,7 @@
 //! `pitcrewd serve` end to end: the real binary on a temp state directory and a free port.
 
+#![allow(clippy::unwrap_used)]
+
 mod common;
 
 use common::{Daemon, Frame, Ws, id, request, run};
@@ -154,7 +156,10 @@ fn demo_serves_the_work_model_with_real_tokens() {
     assert_eq!(bad.status, 400);
 
     // Terminals: no runner yet, so a known session is unavailable and an unknown one not found.
-    let known = daemon.get(&format!("/v1/sessions/{}/terminal", id::SES1), Some(&device));
+    let known = daemon.get(
+        &format!("/v1/sessions/{}/terminal", id::SES1),
+        Some(&device),
+    );
     assert_eq!(known.status, 503);
     assert_eq!(known.code(), "unavailable");
     let unknown = daemon.get(
@@ -294,7 +299,11 @@ fn sigterm_stops_cleanly_and_a_restart_keeps_everything() {
     let (_tmp, state) = state_dir();
     let mut daemon = Daemon::start(&state, &["--demo"]);
     let device = daemon.device_token();
-    let reopened = daemon.post("/v1/tasks/PAP-7/move", Some(&device), &json!({ "to": "todo" }));
+    let reopened = daemon.post(
+        "/v1/tasks/PAP-7/move",
+        Some(&device),
+        &json!({ "to": "todo" }),
+    );
     assert_eq!(reopened.status, 200, "{}", reopened.body);
     // A stream is open while it stops.
     let mut stream = Ws::connect(daemon.port, "/v1/stream", &device).unwrap();
@@ -336,12 +345,9 @@ fn sigterm_stops_cleanly_and_a_restart_keeps_everything() {
     assert!(daemon.terminate().success());
 }
 
-/// Needs `pitcrew-api` to close open WebSockets with 1001 when the server shuts down; that is
-/// `s/H/terminal-hardening`, not merged yet. Until then the daemon closes the store when its
-/// streams are cut.
+/// `pitcrew-api`'s `Bound::serve` tells open WebSockets that the hub is shutting down.
 #[cfg(unix)]
 #[test]
-#[ignore = "needs pitcrew-api's WebSocket shutdown (s/H/terminal-hardening)"]
 fn sigterm_closes_streams_with_1001() {
     let (_tmp, state) = state_dir();
     let mut daemon = Daemon::start(&state, &["--demo"]);

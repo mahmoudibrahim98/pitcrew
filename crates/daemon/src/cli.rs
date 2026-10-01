@@ -150,9 +150,6 @@ mod tests {
     fn the_version_line_names_the_protocol_range() {
         let line = version_line();
         assert!(line.starts_with(&format!("pitcrewd {} ", env!("CARGO_PKG_VERSION"))));
-        assert!(line.contains(&format!(
-            "protocol {}",
-            pitcrew_protocol::PROTOCOL_VERSION
-        )));
+        assert!(line.contains(&format!("protocol {}", pitcrew_protocol::PROTOCOL_VERSION)));
     }
 }
