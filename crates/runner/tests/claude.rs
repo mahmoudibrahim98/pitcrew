@@ -219,6 +219,52 @@ fn label_is(e: &pitcrew_protocol::events::Event, l: &str) -> bool {
     common::label(e) == l
 }
 
+/// A sub-agent's transcript (`<session>/subagents/agent-*.jsonl`) is a session of its own whose
+/// parent is the session that started it, whichever of the two is found first.
+#[test]
+fn a_sub_agent_session_names_its_parent() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let path = session_file(home.path());
+    let lines = fixture_lines();
+    std::fs::write(&path, lines[..3].concat()).unwrap();
+    let sub_dir = path.with_extension("").join("subagents");
+    std::fs::create_dir_all(&sub_dir).unwrap();
+    let sub = String::from_utf8(lines[..3].concat()).unwrap().replace(
+        r#""isSidechain":false"#,
+        r#""isSidechain":true,"agentId":"agent-a1""#,
+    );
+    // The sub-agent is the newest, so it is indexed first.
+    std::fs::write(sub_dir.join("agent-a1.jsonl"), sub).unwrap();
+    common::age(&path, Duration::from_secs(60));
+
+    let sink = Arc::new(CollectSink::default());
+    let runner = pitcrew_runner::start(
+        config(home.path(), state.path()),
+        vec![Arc::new(ClaudeAdapter::new())],
+        sink.clone(),
+    )
+    .unwrap();
+    sink.wait_for(4, WAIT).expect("both sessions");
+    runner.stop();
+    let sessions: Vec<pitcrew_protocol::model::Session> = sink
+        .events()
+        .into_iter()
+        .filter_map(|e| match e.body {
+            EventBody::SessionDiscovered { session } => Some(session),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sessions.len(), 2, "{:?}", labels(&sink.events()));
+    let parent = sessions
+        .iter()
+        .find(|s| s.native_id == "2b6f1a8e-4c1d-4f5e-9a37-0c8d1e2f3a4b")
+        .unwrap();
+    let child = sessions.iter().find(|s| s.native_id == "agent-a1").unwrap();
+    assert_eq!(child.parent, Some(parent.id));
+    assert_eq!(parent.parent, None);
+}
+
 #[test]
 fn truncation_and_replacement_are_reindexed_from_the_start() {
     let _ = logs();
