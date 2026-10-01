@@ -44,9 +44,13 @@ reasoning.
 ## Pending proposals
 
 `WhereItStands` still finds a back-office proposal by scanning activity (`pendingProposal` in
-`where-it-stands.tsx`): `integrator/work-edits`, which adds `Brief.proposal` to `GET /v1/briefs`,
-had not merged into `main` as of this brief. Once it has, switch to reading it directly and make
-"Keep current" a `PUT` of the current text (see the brief).
+`where-it-stands.tsx`). `integrator/work-edits` has merged into `main` (the contract and the mock
+hub both now carry `Brief.proposal`, a `BriefProposal`: `{ text, next?, receipts, at }`), **but**
+`apps/ui/src/data/types.ts`'s hand-written `Brief` has no `proposal` field yet and there is no
+`BriefProposal` type (that file is stream L's). Until it does, reading `brief.proposal` is not
+type-safe without a local duplicate of the type, which the data README asks features not to keep
+("ask stream L for the key... or note the gap in your report" — see this brief's report). Once it
+lands, switch to reading it directly and make "Keep current" a `PUT` of the current text.
 
 ## How moves work
 
