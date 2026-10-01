@@ -103,13 +103,27 @@ let started = DirectLauncher::default().start(&target).await?;   // or TmuxLaunc
   version, the size (at most 256 MiB) and that the bytes hash to the expected sha256.
 - **Layout:** `~/.pitcrew/bin/<version>/pitcrewd`, `bin/current -> <version>` (relative),
   `bin/previous`, `run/endpoint.json`, `run/pitcrewd.sock`, `run/pitcrewd.log`. Every directory
-  must be a real directory owned by the user with mode 0700 and no ACL; one that is not is
-  refused (`UnsafeDirectory`), never repaired.
+  must be a real directory owned by the user with mode 0700 (`drwx--S---` under a set-group-ID
+  parent) and no ACL (on macOS, where `@` hides the `+`, `ls -le` is asked); one that is not is
+  refused (`UnsafeDirectory`), never repaired. `Layout::at` puts the root elsewhere.
+- **The way there** is checked first, as sshd checks the way to `authorized_keys`: every
+  directory from `/` down to the root's parent must belong to root or the user, and be writable
+  by no one else unless sticky (as `/tmp`). The walk resolves the path one component at a time,
+  following symbolic links (absolute, relative, through `..`) and checking where they lead, so a
+  group-writable project directory on the way is refused: a member could otherwise swap the tree
+  after the checks and have their own `pitcrewd` run. The script then `cd -P`s into the root and
+  uses relative paths only; a launched helper checks the directory it starts in (tmux enters it
+  by name) before it runs.
 - **The remote side** is one script, `src/helper/helper.sh`, sent on **stdin** (the Windows
   command-line limit leaves the shell-neutral wrapper about 7,500 bytes). The command line is a
-  fixed bootstrap that reads exactly the script's length with `dd`, so the helper bytes behind it
-  stay on stdin, and runs it only if it arrived whole. It reports between random markers, like
-  the probe.
+  fixed bootstrap run by `/bin/sh` (by path, whatever `sh` the user's `PATH` finds). It drops
+  `dd`/`echo` functions imported from the environment and `ENV`, `BASH_ENV` and `CDPATH`, puts
+  the tool path (`DEFAULT_TOOL_PATH`, `/usr/bin:/bin:/usr/sbin:/sbin`, or
+  `Target::with_tool_path`) in front of `PATH`, and reads exactly the script's length with `dd`,
+  so the helper bytes behind it stay on stdin. It runs the script only if it has its first line,
+  its last line and its length: a `.bashrc` that eats stdin cannot make a tail of it run. The
+  script then drops every function standing in for a tool it uses (bash imports exported ones).
+  It reports between random markers, like the probe.
 - **Deploy** is at most two calls, each under the `bin/.lock` lock:
   1. `check` verifies a copy already installed under the version (sha256 computed on the
      machine, then `--version`) and switches to it. The same deploy again stops here: it only
@@ -130,27 +144,39 @@ let started = DirectLauncher::default().start(&target).await?;   // or TmuxLaunc
     killed, the next deploy sweeps it.
   - **Bounds:** `DeployOptions::timeout` per call (prompts excluded), `lock_wait`, and
     `stale_lock`, which must exceed both; `progress` reports bytes handed to ssh.
-- **Locks** are `mkdir` directories with an `owner` file (host, pid, call tag). A lock is stale
-  when older than the limit, or taken on this host by a process that is gone (so a killed deploy
-  does not block the next one for long). A stale lock is moved aside atomically and removed; a
-  holder checks it still owns its lock before every change, so a lock broken by mistake stops
-  its old holder (`LockLost`) instead of letting two runs write.
+- **Locks** are `mkdir` directories with an `owner` line: host, pid, call tag and time. A lock
+  taken on this host is stale when its process is gone (so a killed deploy does not block the
+  next one for long) or when it is older than the limit by this host's own clock. Another
+  host's clock cannot be compared with this one, so a lock from another host (a login node
+  sharing the home), or without an owner line yet, is stale only when its directory is older
+  than the limit plus 10 minutes: hosts sharing a home, and the file server, must agree on the
+  time within 10 minutes. A stale lock is moved aside atomically and removed; if what was moved
+  is not the lock judged stale, it is put back while the name is free. Every step that changes
+  something (sweeping, `chmod`, removing a damaged copy, the rename, the switch, GC; in the
+  launchers removing old records, launching, writing `endpoint.json`, signalling, removing
+  records) first checks the run still owns its lock; one that lost it stops (`LockLost`), and
+  leaves the lock to its new holder.
 - **Launchers** implement `Launcher` (object-safe; the SLURM launcher will be another):
   - `DirectLauncher`: `setsid nohup` (`nohup` alone where there is no `setsid`, as on macOS),
     double-forked so the helper is nobody's child;
-  - `TmuxLauncher`: the session `pitcrew-helper` on its own tmux server (`tmux -L
-    pitcrew-helper -f /dev/null`), only with tmux 3.2 or newer (`TmuxLauncher::new` refuses
+  - `TmuxLauncher`: its own tmux server and session, both named `tmux_name(layout)`
+    (`pitcrew-helper-` and 8 hex digits of the root's sha256, so two roots on one host never
+    meet), started with `-f /dev/null`; only with tmux 3.2 or newer (`TmuxLauncher::new` refuses
     older, missing or unreadable versions).
 
-  Both run `bin/current/pitcrewd serve --listen unix:<root>/run/pitcrewd.sock` (or
-  `LaunchOptions::args`), append its output to `run/pitcrewd.log`, wait for the socket
-  (`ready_timeout`; a helper that exits or never binds is reported with the log's last lines,
-  and stopped), and write `run/endpoint.json` atomically:
+  Both run `bin/<version>/pitcrewd serve --listen unix:<root>/run/pitcrewd.sock` (or
+  `LaunchOptions::args`) for the version `current` points to, from inside the root, with the
+  umask of the user's session (the script's own files are made under 077; the helper's are
+  the user's to share). They append its output to `run/pitcrewd.log` (kept 0600), wait for the
+  socket (`ready_timeout`; a helper that exits or never binds is reported with the log's last
+  lines, and stopped), and write `run/endpoint.json` atomically:
   `{"pid":…,"host":…,"version":…,"started":…,"launcher":…,"socket":…}`. `status` reports
   whether it runs and which version is installed; `stop` sends SIGTERM, then SIGKILL after
-  `stop_timeout`. All are idempotent. A pid counts only while alive, not a zombie, and named
-  `pitcrewd`, so a recycled pid is never signalled. On clusters whose login nodes share `$HOME`,
-  a record from another host is reported (`OtherHost`) and never acted on, unless
+  `stop_timeout`, each only while the process still has the start time it had. All are
+  idempotent. A pid counts only while alive, not a zombie, and named `pitcrewd`, so a recycled
+  pid is never signalled. `host` is `uname -n`; a name with other characters is kept readable
+  and made unique with the machine id (`odd_host_-<id>`). On clusters whose login nodes share
+  `$HOME`, a record from another host is reported (`OtherHost`) and never acted on, unless
   `LaunchOptions::take_over` says so.
 - **Secrets:** none are involved; nothing here logs. Reports and errors carry paths and the
   first line of `--version`, with control characters replaced.
@@ -167,13 +193,19 @@ let started = DirectLauncher::default().start(&target).await?;   // or TmuxLaunc
   those listed in `PITCREW_TEST_SHELLS` (`:`-separated paths);
 - `tests/deploy.rs` (Unix), where the test binary is a fake `ssh` that runs the real remote
   script with the local `/bin/sh` in a temporary `HOME`, with a `PATH` holding only the tools
-  the script may use. It can cut, pause or corrupt the upload, or never read it. The binary also
-  plays `pitcrewd` and the hash tools (in the formats of `sha256sum`, `shasum`, OpenSSL 1.1 and
-  3). It covers deploy and the idempotent re-run, hash mismatch, interrupted and killed uploads,
-  concurrent and stale locks, GC, every hash tool, BSD and busybox `mv`, unknown platforms,
-  unsafe directories, the file modes during the upload, a stalled upload, and the direct and
-  tmux launchers (start, status, stop, `endpoint.json`, failures, other hosts). It runs the
-  whole flow again with each POSIX shell of `PITCREW_TEST_SHELLS` as the machine's `sh`;
+  the script may use. It can cut, pause or corrupt the upload, never read it, swallow the start
+  of stdin (as a start-up file would), set the remote umask, or run another shell as
+  `/bin/sh`. The binary also plays `pitcrewd` and the hash tools (in the formats of
+  `sha256sum`, `shasum`, OpenSSL 1.1 and 3). It covers deploy and the idempotent re-run, hash
+  mismatch, interrupted and killed uploads, concurrent, stale (by pid, by age on either clock)
+  and lost locks, GC, every hash tool, BSD and busybox `mv`, unknown platforms, unsafe
+  directories and unsafe ways to the root (group-writable, someone else's, through symbolic
+  links; sticky ones allowed), a partly eaten script, look-alike tools in `PATH` and exported
+  bash functions, ACLs behind macOS's `@`, set-group-ID parents, odd host names, the file modes
+  during the upload, a stalled upload, the helper's umask, and the direct and tmux launchers
+  (start, status, stop, `endpoint.json`, failures, other hosts, two roots on one host). It runs
+  the whole flow again with each POSIX shell of `PITCREW_TEST_SHELLS` as the machine's
+  `/bin/sh`;
 - `tests/real_sshd.rs`, only when `PITCREW_TEST_SSH_HOST` names a host reachable without
   prompts; it also deploys a stand-in helper into a throwaway directory there and removes it.
 
