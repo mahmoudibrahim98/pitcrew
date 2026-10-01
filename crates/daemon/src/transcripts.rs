@@ -7,10 +7,12 @@
 //! - hands the runner its adapters wrapped in [`Recorded`], which keeps what each home's last
 //!   discovery found ([`Found`]); the route reads only those transcripts, so only the homes the
 //!   runner watches;
-//! - finds a session's transcript by its engine and native id, as the CLIs name their files: the
-//!   store's inner id (OpenCode), the file's name (`<id>.jsonl`, Claude), or a name ending in
-//!   `-<id>` (Codex's `rollout-<time>-<id>.jsonl`, Claude's sub-agents' `agent-<id>.jsonl`);
-//! - pages it with the adapter's own `read_page`.
+//! - finds a session's transcript by its engine and native id, by the names each CLI gives its
+//!   files: Claude's `<id>.jsonl` and its sub-agents' `agent-<id>.jsonl`, Codex's
+//!   `rollout-<time>-<id>.jsonl`, OpenCode's inner id in its store ([`names`]);
+//! - pages it with the adapter's own `read_page`. A read that does not return within 10 seconds
+//!   (a file on a filesystem that does not answer) answers `503` and is left running; a stop
+//!   waits for it only so long (`serve`).
 //!
 //! Answers: an unknown session is `404`; one on another machine, or any without a runner, is
 //! `503 unavailable`; one on this machine whose transcript is not found (a demo session, a
@@ -78,8 +80,8 @@ impl Found {
             );
     }
 
-    /// The transcript the CLI `engine` names `native`, with the adapter that reads it: one named
-    /// exactly so before one whose name ends in `-<native>`, then the newest.
+    /// The transcript the CLI `engine` names `native` (see [`names`]), with the adapter that
+    /// reads it; the newest if several are (one session in two homes).
     fn find(
         &self,
         engine: Engine,
@@ -93,25 +95,33 @@ impl Found {
             .iter()
             .filter(|((e, _), _)| *e == engine)
             .flat_map(|(_, d)| d.transcripts.iter().map(move |t| (&d.adapter, t)))
-            .filter_map(|(adapter, t)| names(t, native).map(|rank| (rank, adapter, t)))
-            .min_by(|(ra, _, a), (rb, _, b)| ra.cmp(rb).then(b.modified.cmp(&a.modified)))
-            .map(|(_, adapter, t)| (Arc::clone(adapter), t.clone()))
+            .filter(|(_, t)| names(engine, t, native))
+            .max_by_key(|(_, t)| t.modified)
+            .map(|(adapter, t)| (Arc::clone(adapter), t.clone()))
     }
 }
 
-/// Whether `t` is the transcript of the session the CLI calls `native`: `Some(0)` by its exact
-/// name, `Some(1)` by a name ending in `-<native>`.
-fn names(t: &TranscriptRef, native: &str) -> Option<u8> {
-    if let Some(inner) = &t.inner_id {
-        return (inner == native).then_some(0);
-    }
-    let stem = t.path.file_stem()?.to_str()?;
-    if stem == native {
-        Some(0)
-    } else {
-        stem.strip_suffix(native)
-            .is_some_and(|head| head.ends_with('-'))
-            .then_some(1)
+/// Whether `t` is the transcript `engine` writes for the session it calls `native`, by the names
+/// that CLI gives its files, so an id never matches another kind of file's name:
+/// - Claude: `<native>.jsonl`, or `agent-<native>.jsonl` for a sub-agent;
+/// - Codex: `rollout-<time>-<native>.jsonl`, or the whole name when its records name no id;
+/// - OpenCode: the store's inner id.
+fn names(engine: Engine, t: &TranscriptRef, native: &str) -> bool {
+    let stem = || t.path.file_stem().and_then(|s| s.to_str());
+    match engine {
+        Engine::OpenCode => t.inner_id.as_deref() == Some(native),
+        Engine::Claude => {
+            stem().is_some_and(|stem| stem == native || stem.strip_prefix("agent-") == Some(native))
+        }
+        Engine::Codex => stem().is_some_and(|stem| {
+            stem.strip_prefix("rollout-").is_some_and(|rest| {
+                stem == native
+                    || rest
+                        .strip_suffix(native)
+                        .is_some_and(|time| time.ends_with('-'))
+            })
+        }),
+        _ => false,
     }
 }
 
@@ -306,10 +316,17 @@ async fn page(
                 "The transcript could not be read.",
             ))
         }
-        Err(_) => Err(ErrorResponse::new(
-            ErrorCode::Unavailable,
-            "The transcript took too long to read.",
-        )),
+        Err(_) => {
+            tracing::warn!(
+                %session,
+                seconds = READ_TIMEOUT.as_secs(),
+                "a transcript read has not returned; it is left running"
+            );
+            Err(ErrorResponse::new(
+                ErrorCode::Unavailable,
+                "The transcript took too long to read.",
+            ))
+        }
     }
 }
 
@@ -329,31 +346,48 @@ mod tests {
 
     #[test]
     fn transcripts_are_found_by_the_name_their_cli_gives_them() {
+        use Engine::{Claude, Codex, OpenCode};
         let uuid = "2b6f1a8e-4c1d-4f5e-9a37-0c8d1e2f3a4b";
+        let main = at(&format!("/h/p/{uuid}.jsonl"), None, 0);
+        let sub = at("/h/p/s/subagents/agent-a1b2c3.jsonl", None, 0);
+        let rollout = at(
+            &format!("/h/sessions/2026/09/30/rollout-2026-09-30T08-00-00-{uuid}.jsonl"),
+            None,
+            0,
+        );
+        let store = at("/h/opencode.db", Some("ses_1"), 0);
         // Claude: `<id>.jsonl`, sub-agents `agent-<id>.jsonl`.
-        assert_eq!(
-            names(&at(&format!("/h/p/{uuid}.jsonl"), None, 0), uuid),
-            Some(0)
-        );
-        assert_eq!(
-            names(
-                &at("/h/p/s/subagents/agent-a1b2c3.jsonl", None, 0),
-                "a1b2c3"
-            ),
-            Some(1)
-        );
-        // Codex: `rollout-<time>-<id>.jsonl`.
-        let rollout = format!("/h/sessions/2026/09/30/rollout-2026-09-30T08-00-00-{uuid}.jsonl");
-        assert_eq!(names(&at(&rollout, None, 0), uuid), Some(1));
+        assert!(names(Claude, &main, uuid));
+        assert!(names(Claude, &sub, "a1b2c3"));
+        // Codex: `rollout-<time>-<id>.jsonl`, or the whole name.
+        assert!(names(Codex, &rollout, uuid));
+        let stem = format!("rollout-2026-09-30T08-00-00-{uuid}");
+        assert!(names(Codex, &rollout, &stem));
         // OpenCode: the inner id, whatever the store's file is called.
-        assert_eq!(
-            names(&at("/h/opencode.db", Some("ses_1"), 0), "ses_1"),
-            Some(0)
-        );
-        assert_eq!(names(&at("/h/ses_1.db", Some("ses_2"), 0), "ses_1"), None);
-        // Not a part of another id.
-        assert_eq!(names(&at("/h/p/xa1b2c3.jsonl", None, 0), "a1b2c3"), None);
-        assert_eq!(names(&at("/h/p/a1b2c3-x.jsonl", None, 0), "a1b2c3"), None);
+        assert!(names(OpenCode, &store, "ses_1"));
+        assert!(!names(
+            OpenCode,
+            &at("/h/ses_1.db", Some("ses_2"), 0),
+            "ses_1"
+        ));
+
+        // Each engine's rule only: a Claude id never names a rollout, nor a Codex id a Claude
+        // file or a sub-agent, nor a file name an OpenCode session.
+        assert!(!names(Claude, &rollout, uuid));
+        assert!(!names(Codex, &main, uuid));
+        assert!(!names(Codex, &sub, "a1b2c3"));
+        assert!(!names(OpenCode, &main, uuid));
+        // Not a part of another name.
+        for other in [
+            "/h/p/xa1b2c3.jsonl",
+            "/h/p/a1b2c3-x.jsonl",
+            "/h/p/old-a1b2c3.jsonl",
+            "/h/p/agent-xa1b2c3.jsonl",
+        ] {
+            assert!(!names(Claude, &at(other, None, 0), "a1b2c3"), "{other}");
+        }
+        let other_rollout = at(&format!("/h/x-2026-{uuid}.jsonl"), None, 0);
+        assert!(!names(Codex, &other_rollout, uuid));
     }
 
     #[derive(Debug)]
@@ -379,15 +413,15 @@ mod tests {
     }
 
     #[test]
-    fn a_discovery_replaces_what_the_home_had_and_exact_names_win() {
+    fn a_discovery_replaces_what_the_home_had_and_the_newest_wins() {
         let found = Arc::new(Found::default());
-        let old = at("/h/p/old-s1.jsonl", None, 9);
-        let exact = at("/h/p/s1.jsonl", None, 1);
-        let first = Recorded::new(Arc::new(Lists(vec![old.clone()])), Arc::clone(&found));
-        assert_eq!(
-            first.discover(FsPath::new("/h")).unwrap(),
-            vec![old.clone()]
+        let old = at("/h/p/s1.jsonl", None, 9);
+        let other = at("/h/p/old-s1.jsonl", None, 99);
+        let first = Recorded::new(
+            Arc::new(Lists(vec![old.clone(), other])),
+            Arc::clone(&found),
         );
+        assert_eq!(first.discover(FsPath::new("/h")).unwrap().len(), 2);
         assert_eq!(
             found.find(Engine::Claude, "s1").map(|f| f.1),
             Some(old.clone())
@@ -395,21 +429,13 @@ mod tests {
         assert!(found.find(Engine::Codex, "s1").is_none());
         assert!(found.find(Engine::Claude, "").is_none());
 
-        // The exact name wins over a newer suffix match.
-        let both = Recorded::new(
-            Arc::new(Lists(vec![old.clone(), exact.clone()])),
-            Arc::clone(&found),
-        );
-        both.discover(FsPath::new("/h")).unwrap();
-        assert_eq!(found.find(Engine::Claude, "s1").map(|f| f.1), Some(exact));
-
         // A home's next discovery replaces what it had.
         let none = Recorded::new(Arc::new(Lists(Vec::new())), Arc::clone(&found));
         none.discover(FsPath::new("/h")).unwrap();
         assert!(found.find(Engine::Claude, "s1").is_none());
 
-        // Among equals, the newest.
-        let newer = at("/h2/p/new-s1.jsonl", None, 10);
+        // The same session in two homes: the newest.
+        let newer = at("/h2/p/s1.jsonl", None, 10);
         Recorded::new(Arc::new(Lists(vec![old.clone()])), Arc::clone(&found))
             .discover(FsPath::new("/h"))
             .unwrap();
