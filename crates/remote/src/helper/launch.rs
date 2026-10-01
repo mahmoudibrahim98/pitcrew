@@ -8,13 +8,15 @@
 //! file renamed over it):
 //!
 //! ```json
-//! {"pid":4242,"host":"login01-0123456789ab","version":"1.4.0","started":1790850391000,"launcher":"direct","socket":"/home/someone/.pitcrew/run/pitcrewd.sock"}
+//! {"pid":4242,"host":"login01+007f0101","version":"1.4.0","started":1790850391000,"launcher":"direct","socket":"/home/someone/.pitcrew/run/pitcrewd.sock"}
 //! ```
 //!
-//! `host` is `uname -n` and the machine's id: on clusters whose login nodes share `$HOME`, a pid
-//! means something only on the host that recorded it, and two sites may have hosts of one name.
-//! A record from another host is never acted on from here ([`HelperError::OtherHost`]) unless
-//! [`LaunchOptions::take_over`] says so.
+//! `host` is `<name>+<id>`: `uname -n` and a boot-stable id (`hostid`, else the machine id),
+//! for people to tell hosts apart. On clusters whose login nodes share `$HOME`, a pid means
+//! something only on the host that recorded it: a record whose host has another name is never
+//! acted on from here ([`HelperError::OtherHost`]) unless [`LaunchOptions::take_over`] says so.
+//! The name alone decides, so a record made before this host's id changed (a stateless node
+//! makes a new machine id at every boot) is still this host's, judged by its pid.
 //!
 //! Every operation is idempotent: starting a running helper returns its endpoint; stopping a
 //! stopped one does nothing. Start and stop take the launch lock (`run/.lock`); status takes
@@ -132,8 +134,8 @@ pub struct Endpoint {
     /// Its process id, on `host`.
     pub pid: u32,
     /// The host it runs on: for the direct and tmux launchers, `uname -n` (other characters
-    /// made `_`) and the machine's id, e.g. `login01-0123456789ab`; for the SLURM launcher, the
-    /// compute node's name as the login node reaches it.
+    /// made `_`), `+` and a boot-stable id when there is one, e.g. `login01+007f0101`; for the
+    /// SLURM launcher, the compute node's name as the login node reaches it.
     pub host: String,
     /// The version started (what `bin/current` pointed to).
     pub version: String,

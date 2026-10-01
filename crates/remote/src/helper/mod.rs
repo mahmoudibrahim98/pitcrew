@@ -167,11 +167,21 @@ pub enum HelperError {
     /// Nothing is deployed to start.
     #[error("the helper is not deployed ({0})")]
     NotDeployed(String),
-    /// The helper is recorded as running on another host sharing this home directory (another
-    /// login node, say). It cannot be checked or stopped from here; see
-    /// [`LaunchOptions::take_over`].
-    #[error("the helper is recorded on {0}, another host sharing this home")]
-    OtherHost(String),
+    /// The helper is recorded as running on another host sharing this home directory: another
+    /// login node, say, or a compute node for a SLURM job. It cannot be checked or stopped from
+    /// here: stop it there (a SLURM job with the SLURM launcher), or, once that host is known to
+    /// be gone, forget the record with a direct launcher's stop under
+    /// [`LaunchOptions::take_over`]. A host is told apart by its name: a record of this host
+    /// made before its id changed (as at a reboot of a stateless node) is this host's.
+    #[error(
+        "the {launcher} launcher's helper is recorded on {host}, another host sharing this home"
+    )]
+    OtherHost {
+        /// The host it is recorded on.
+        host: String,
+        /// The launcher that started it: `direct`, `tmux` or `slurm`.
+        launcher: String,
+    },
     /// The helper exited at once, or did not open its socket in time (it was then stopped).
     #[error("the helper did not start: {0}")]
     StartFailed(String),

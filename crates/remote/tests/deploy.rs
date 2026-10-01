@@ -785,29 +785,48 @@ mod unix {
         String::from_utf8(out.stdout).unwrap().trim().to_owned()
     }
 
-    /// This host as the script names it: `uname -n` (other characters made `_`, at most 40),
-    /// a dash, and the machine's id (the first 12 characters of `/etc/machine-id`, else of
-    /// `/var/lib/dbus/machine-id`, else `hostid`).
-    fn this_host() -> String {
-        let plain = |c: char| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                c
-            } else {
-                '_'
-            }
-        };
+    fn plain(c: char) -> char {
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+            c
+        } else {
+            '_'
+        }
+    }
+
+    /// This host's name as the script has it: `uname -n`, other characters made `_`, at most 40.
+    pub(crate) fn this_name() -> String {
         let name: String = uname_n().chars().map(plain).take(40).collect();
-        let id = ["/etc/machine-id", "/var/lib/dbus/machine-id"]
-            .iter()
-            .filter_map(|file| std::fs::read_to_string(file).ok())
-            .map(|text| text.lines().next().unwrap_or("").chars().take(12).collect())
-            .find(|id: &String| !id.is_empty())
-            .unwrap_or_else(|| {
-                let out = Command::new("hostid").output().unwrap();
-                String::from_utf8(out.stdout).unwrap().trim().to_owned()
-            });
-        let id: String = id.chars().map(plain).collect();
-        format!("{}-{id}", if name.is_empty() { "host" } else { &name })
+        if name.is_empty() {
+            "host".to_owned()
+        } else {
+            name
+        }
+    }
+
+    /// This host as the script names it: its name, `+` and the first boot-stable id there is:
+    /// `hostid` (unless all zeros), else the first 12 characters of `/etc/machine-id` or
+    /// `/var/lib/dbus/machine-id`; the name alone when there is none.
+    pub(crate) fn this_host() -> String {
+        let hostid = Command::new("hostid")
+            .output()
+            .ok()
+            .map(|out| String::from_utf8(out.stdout).unwrap().trim().to_owned())
+            .filter(|id| id.chars().any(|c| c != '0'));
+        let id = hostid.or_else(|| {
+            ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+                .iter()
+                .filter_map(|file| std::fs::read_to_string(file).ok())
+                .map(|text| text.lines().next().unwrap_or("").chars().take(12).collect())
+                .find(|id: &String| !id.is_empty())
+        });
+        match id {
+            Some(id) => format!(
+                "{}+{}",
+                this_name(),
+                id.chars().map(plain).collect::<String>()
+            ),
+            None => this_name(),
+        }
     }
 
     fn now_ms() -> i64 {
@@ -1156,12 +1175,24 @@ mod unix {
         block_on(deploy(&m.plain(), &helper("3.0.0"), &impatient)).unwrap();
         assert!(!lock.exists());
 
-        // A host of the same name but not this machine's id (a federated site sharing the
-        // home) is another host: its lock is judged by the directory's age, even though the
-        // pid it names is gone here.
+        // This host's name with another id (a stateless node makes a new machine id at every
+        // boot), or with none, is this host: a lock whose process is gone is broken at once.
+        for host in [format!("{}+0123456789ab", this_name()), this_name()] {
+            private_dir(&lock);
+            let owner = format!("{host} {} 00ff {now}\n", dead_pid());
+            std::fs::write(lock.join("owner"), &owner).unwrap();
+            block_on(deploy(&m.plain(), &helper("4.0.0"), &impatient)).unwrap();
+            assert!(!lock.exists(), "{owner}");
+        }
+        // Another name, even with this host's id, is another host: judged by the directory's
+        // age, though the pid it names is gone here.
         private_dir(&lock);
-        let twin = format!("{} {} 00ff {now}\n", uname_n(), dead_pid());
-        std::fs::write(lock.join("owner"), &twin).unwrap();
+        let id = this_host()
+            .split_once('+')
+            .map(|(_, id)| format!("+{id}"))
+            .unwrap_or_default();
+        let other = format!("another-{}{id} {} 00ff {now}\n", this_name(), dead_pid());
+        std::fs::write(lock.join("owner"), &other).unwrap();
         let err = block_on(deploy(&m.plain(), &helper("4.0.0"), &impatient)).unwrap_err();
         assert!(matches!(err, HelperError::Busy(_)), "{err:?}");
         std::fs::remove_dir_all(&lock).unwrap();
@@ -1830,8 +1861,8 @@ mod unix {
         assert!(block_on(launcher.stop(&m.plain())).unwrap().pid.is_some());
     }
 
-    /// A host name with other characters is kept readable and made unique with the machine's
-    /// id, rather than all such hosts being `unknown`.
+    /// A host name with other characters is kept readable (`odd_host_`), with the machine's
+    /// id after a `+`, rather than all such hosts being `unknown`.
     fn odd_host_names_get_a_machine_id() {
         let real = which("uname").unwrap();
         let m = Machine::with_tools(|bin| {
@@ -1848,11 +1879,11 @@ mod unix {
         block_on(deploy(&target, &helper("1.0.0"), &quick())).unwrap();
         let launcher = DirectLauncher::new(launch_options());
         let host = block_on(launcher.start(&target)).unwrap().endpoint.host;
-        assert!(host.starts_with("odd_host_-"), "{host}");
-        assert!(host.len() > "odd_host_-".len(), "{host}");
+        assert!(host.starts_with("odd_host_"), "{host}");
+        assert_eq!(host.split('+').next(), Some("odd_host_"), "{host}");
         assert!(
             host.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                .all(|b| b.is_ascii_alphanumeric() || b"._-+".contains(&b))
         );
         // The same name on every call: the helper it started is recognised as running here.
         let status = block_on(launcher.status(&target)).unwrap();
@@ -2140,11 +2171,11 @@ mod unix {
         assert_eq!(status.endpoint.as_ref(), Some(&foreign));
         let err = block_on(launcher.start(&m.plain())).unwrap_err();
         assert!(
-            matches!(&err, HelperError::OtherHost(h) if h == "elsewhere"),
+            matches!(&err, HelperError::OtherHost { host, launcher } if host == "elsewhere" && launcher == "direct"),
             "{err:?}"
         );
         let err = block_on(launcher.stop(&m.plain())).unwrap_err();
-        assert!(matches!(err, HelperError::OtherHost(_)), "{err:?}");
+        assert!(matches!(err, HelperError::OtherHost { .. }), "{err:?}");
         assert!(m.run_dir().join("endpoint.json").exists());
 
         // ...unless the user says to take over.
@@ -2172,6 +2203,33 @@ mod unix {
         let started = block_on(launcher.start(&m.plain())).unwrap();
         assert!(started.started_now);
         block_on(launcher.stop(&m.plain())).unwrap();
+
+        // This host's records made before its id changed (a stateless node makes a new
+        // machine id at every boot) are still this host's, judged by their pid: a dead one is
+        // stale, a live helper is running here and is stopped.
+        let reborn = format!("{}+0123456789ab", this_name());
+        write_endpoint(
+            &m,
+            &Endpoint {
+                pid: dead_pid(),
+                host: reborn.clone(),
+                ..foreign.clone()
+            },
+        );
+        let status = block_on(launcher.status(&m.plain())).unwrap();
+        assert_eq!(status.state, HelperState::NotRunning);
+        let started = block_on(launcher.start(&m.plain())).unwrap();
+        assert!(started.started_now);
+        let mut record = started.endpoint.clone();
+        record.host.clone_from(&reborn);
+        write_endpoint(&m, &record);
+        let status = block_on(launcher.status(&m.plain())).unwrap();
+        assert_eq!(status.state, HelperState::Running);
+        let again = block_on(launcher.start(&m.plain())).unwrap();
+        assert!(!again.started_now);
+        let stopped = block_on(launcher.stop(&m.plain())).unwrap();
+        assert_eq!(stopped.pid, Some(record.pid));
+        eventually("the helper to be gone", || !alive(record.pid));
 
         // A recycled pid that is not pitcrewd is never signalled.
         let mut sleeper = Command::new("sleep")

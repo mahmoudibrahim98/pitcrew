@@ -154,13 +154,14 @@ let started = DirectLauncher::default().start(&target).await?;   // or TmuxLaunc
   - **Bounds:** `DeployOptions::timeout` per call (prompts excluded), `lock_wait`, and
     `stale_lock`, which must exceed both; `progress` reports bytes handed to ssh.
 - **Locks** are `mkdir` directories with an `owner` line: host, pid, call tag and time. A lock
-  taken on this host is stale when its process is gone (so a killed deploy does not block the
-  next one for long) or when it is older than the limit by this host's own clock. Another
-  host's clock cannot be compared with this one, so a lock from another host (a login node
-  sharing the home), without an owner line yet, or whose pid or time cannot be read, is stale
-  only when its directory is older than the limit plus 10 minutes: hosts sharing a home, and
-  the file server, must agree on the time within 10 minutes. A stale lock is moved aside atomically and removed; if what was moved
-  is not the lock judged stale, it is put back while the name is free. Every step that changes
+  taken on this host (by its name; see `host` below) is stale when its process is gone (so a
+  killed deploy does not block the next one for long) or when it is older than the limit by
+  this host's own clock. Another host's clock cannot be compared with this one, so a lock from
+  another host (a login node sharing the home), without an owner line yet, or whose pid or
+  time cannot be read, is stale only when its directory is older than the limit plus 10
+  minutes: hosts sharing a home, and the file server, must agree on the time within 10
+  minutes. A stale lock is moved aside atomically and removed; if what was moved is not the
+  lock judged stale, it is put back while the name is free. Every step that changes
   something (sweeping, `chmod`, removing a damaged copy, the rename, the switch, GC; in the
   launchers removing old records, launching, writing `endpoint.json`, signalling, removing
   records) first checks the run still owns its lock; one that lost it stops (`LockLost`), and
@@ -183,12 +184,17 @@ let started = DirectLauncher::default().start(&target).await?;   // or TmuxLaunc
   whether it runs and which version is installed; `stop` sends SIGTERM, then SIGKILL after
   `stop_timeout`, each only while the process still has the start time it had. All are
   idempotent. A pid counts only while alive, not a zombie, and named `pitcrewd`, so a recycled
-  pid is never signalled. `host`, as in lock owners, is `uname -n` (other characters made `_`,
-  at most 40) and the machine's id (`login01-0123456789ab`: from `/etc/machine-id`, else
-  `hostid`, …), so two hosts of one name, such as login nodes of federated sites sharing a
-  home, never pass for one. On clusters whose login nodes share
-  `$HOME`, a record from another host is reported (`OtherHost`) and never acted on, unless
-  `LaunchOptions::take_over` says so.
+  pid is never signalled. `host`, as in lock owners, is `<name>+<id>`: `uname -n` (other
+  characters made `_`, at most 40) and, for people to tell hosts apart, the first id there is
+  that survives a reboot (`hostid` unless all zeros, else the machine id, else the hardware
+  UUID; none, and no `+`, without any), e.g. `login01+007f0101`. Whether a record is this
+  host's goes by the name alone: a stateless node makes a new machine id at every boot, and its
+  records from before must stay its own (judged by their pid, and locks by their age). On
+  clusters whose login nodes share `$HOME`, a record from a host of another name is reported
+  (`OtherHost`, with the launcher that made it) and never acted on, unless
+  `LaunchOptions::take_over` says so. **Recovery:** when that host is gone for good (renamed or
+  retired), a direct launcher's `stop` with `take_over` forgets its record, and the next start
+  or submit goes ahead.
 - **Secrets:** none are involved; nothing here logs. Reports and errors carry paths, the
   first line of `--version` and, for a SLURM job that ended, the last lines of its output, with
   control characters replaced.

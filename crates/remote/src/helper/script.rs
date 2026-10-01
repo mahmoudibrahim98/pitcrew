@@ -94,7 +94,10 @@ impl Report {
             },
             "switch_failed" => HelperError::SwitchFailed(detail),
             "not_deployed" => HelperError::NotDeployed(detail),
-            "other_host" => HelperError::OtherHost(text("host")),
+            "other_host" => HelperError::OtherHost {
+                host: text("host"),
+                launcher: text("launcher"),
+            },
             "start_failed" => HelperError::StartFailed(detail),
             "stop_failed" => HelperError::StopFailed(detail),
             "slurm" | "no_slurm" => HelperError::Slurm(detail),
@@ -258,8 +261,16 @@ mod tests {
                 ..
             }
         ));
-        let r = report(&[("host", "login02")]);
-        assert!(matches!(r.error("other_host"), HelperError::OtherHost(h) if h == "login02"));
+        let r = report(&[("host", "login02"), ("launcher", "tmux")]);
+        let err = r.error("other_host");
+        assert!(
+            matches!(&err, HelperError::OtherHost { host, launcher } if host == "login02" && launcher == "tmux"),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string()
+                .contains("tmux launcher's helper is recorded on login02")
+        );
         let r = report(&[("detail", "x")]);
         assert!(matches!(r.error("busy"), HelperError::Busy(d) if d == "x"));
         assert!(matches!(r.error("slurm"), HelperError::Slurm(d) if d == "x"));

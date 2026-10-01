@@ -279,10 +279,15 @@ impl SlurmLauncher {
     /// at once.
     ///
     /// # Errors
-    /// [`HelperError::InvalidArgument`] without a script or with one made for another target;
-    /// [`HelperError::SubmitFailed`] when sbatch refuses it; [`HelperError::NotDeployed`];
-    /// [`HelperError::Slurm`] when the scheduler cannot be asked; and the errors of the other
-    /// launchers (unsafe directories, a busy lock, …).
+    /// - [`HelperError::InvalidArgument`] without a script or with one made for another target;
+    /// - [`HelperError::SubmitFailed`] when sbatch refuses it; [`HelperError::NotDeployed`];
+    /// - [`HelperError::Slurm`] when the scheduler cannot be asked;
+    /// - [`HelperError::InUse`] while a helper of the direct or tmux launcher runs from this
+    ///   root on this host: stop it with that launcher first;
+    /// - [`HelperError::OtherHost`] while one is recorded on another host sharing the home:
+    ///   stop it there, or, once that host is known to be gone, forget the record with a
+    ///   [`super::DirectLauncher`] stop under [`LaunchOptions::take_over`];
+    /// - and the errors of the other launchers (unsafe directories, a busy lock, …).
     pub async fn submit(&self, target: &Target) -> Result<Submitted, HelperError> {
         self.submit_and_wait(target, Duration::ZERO).await
     }

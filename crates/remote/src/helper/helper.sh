@@ -109,21 +109,27 @@ pc_me=$(id -u 2>/dev/null)
 case $pc_me in ''|*[!0123456789]*) pc_fail io "id -u failed" ;; esac
 case $pc_root in /?*) ;; *) pc_fail usage "the root must be an absolute path" ;; esac
 
-# This host, for lock owners and endpoint.json: its name (other characters made `_`, at most
-# 40) and its machine's id. With the id, two hosts of one name (login nodes of federated sites
-# sharing a home, or names made plain alike) never pass for one.
+# This host, for lock owners and endpoint.json: `<name>+<id>`. The name is `uname -n` (other
+# characters made `_`, at most 40); the id, for people to tell hosts apart, is the first that
+# survives a reboot of `hostid` (not all zeros), the machine id, or the hardware UUID, and is
+# left out when there is none. Whether a record is this host's goes by the name alone: on
+# stateless nodes the machine id changes at every boot, and a record of this host must not look
+# like another host's for ever after.
 pc_names=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._-
-pc_id=
+pc_id=$(hostid 2>/dev/null)
+case $pc_id in *[!0]*) ;; *) pc_id= ;; esac
 for pc_f in /etc/machine-id /var/lib/dbus/machine-id; do
   if [ -z "$pc_id" ] && [ -r "$pc_f" ]; then pc_id=$(cut -c 1-12 "$pc_f" 2>/dev/null); fi
 done
-if [ -z "$pc_id" ]; then pc_id=$(hostid 2>/dev/null); fi
 if [ -z "$pc_id" ]; then pc_id=$(sysctl -n kern.uuid 2>/dev/null | cut -c 1-12); fi
-if [ -z "$pc_id" ]; then pc_id=$(uname -a 2>/dev/null | cksum | cut -d ' ' -f 1); fi
-pc_host=$(uname -n 2>/dev/null)
-pc_host=$(printf '%s' "$pc_host" | tr -c "$pc_names" '_' | cut -c 1-40)
+pc_hname=$(uname -n 2>/dev/null)
+pc_hname=$(printf '%s' "$pc_hname" | tr -c "$pc_names" '_' | cut -c 1-40)
+pc_hname=${pc_hname:-host}
 pc_id=$(printf '%s' "$pc_id" | tr -c "$pc_names" '_')
-pc_host=${pc_host:-host}-$pc_id
+pc_host=$pc_hname${pc_id:++$pc_id}
+
+# pc_this_host HOST: whether a recorded HOST is this one: the same name, whatever the id.
+pc_this_host() { [ "${1%%+*}" = "$pc_hname" ]; }
 
 # --- The way to the root ------------------------------------------------------------------
 
@@ -224,17 +230,22 @@ pc_enter() {
 # --- Locks -------------------------------------------------------------------------------
 
 # pc_stale DIR MINUTES: whether the lock DIR may be broken; its owner line goes to pc_judged.
-# - Taken on this host: when its process is gone, or it is older than MINUTES by this host's
-#   clock (the owner line records when it was taken).
+# - Taken on this host (its name, whatever the id: see pc_host): when its process is gone, or
+#   it is older than MINUTES by this host's clock (the owner line records when it was taken).
 # - Taken elsewhere, with no owner line yet, or with a pid or time that cannot be read: another
 #   host's clock cannot be compared with this one, so only when the directory is older than
 #   MINUTES plus 10. Hosts sharing a home must keep their clocks, and the file server's, within
 #   10 minutes of each other.
 pc_stale() {
   pc_judged=$(cat "$1/owner" 2>/dev/null)
+  pc_ohost=${pc_judged%% *}
   case $pc_judged in
-    "$pc_host "*)
-      pc_rest=${pc_judged#"$pc_host "}
+    *' '*) if pc_this_host "$pc_ohost"; then pc_judged_here=1; else pc_judged_here=0; fi ;;
+    *) pc_judged_here=0 ;;
+  esac
+  case $pc_judged_here in
+    1)
+      pc_rest=${pc_judged#* }
       pc_opid=${pc_rest%% *}
       pc_rest=${pc_rest#* }
       pc_oat=${pc_rest#* }
@@ -549,11 +560,18 @@ pc_is_helper() {
 # from another host counts as gone.
 pc_state() {
   pc_recorded || return 1
-  if [ "$pc_ehost" != "$pc_host" ]; then
+  if ! pc_this_host "$pc_ehost"; then
     if [ "$pc_takeover" = 1 ]; then return 1; fi
     return 2
   fi
   pc_is_helper "$pc_epid"
+}
+
+# Fails: the recorded helper is on another host (pc_state said so), named with its launcher.
+pc_other_host() {
+  pc_say host "$pc_ehost"
+  pc_say launcher "$pc_elauncher"
+  pc_fail other_host "the $pc_elauncher launcher's helper is recorded on $pc_ehost"
 }
 
 # pc_socket_here SOCKET: the socket as a path relative to the root, when it is inside it.
@@ -578,7 +596,7 @@ pc_start() {
   pc_state
   case $? in
     0) pc_say started 0; pc_say endpoint "$pc_line"; pc_end ;;
-    2) pc_say host "$pc_ehost"; pc_fail other_host "the helper is recorded on $pc_ehost" ;;
+    2) pc_other_host ;;
   esac
   pc_ver=$(readlink bin/current 2>/dev/null)
   case $pc_ver in
@@ -713,10 +731,7 @@ pc_stop() {
   pc_sweep_aside run/.lock
   pc_state
   pc_st=$?
-  if [ "$pc_st" -eq 2 ]; then
-    pc_say host "$pc_ehost"
-    pc_fail other_host "the helper is recorded on $pc_ehost"
-  fi
+  if [ "$pc_st" -eq 2 ]; then pc_other_host; fi
   if [ "$pc_st" -eq 0 ]; then
     pc_since=$(pc_started_at "$pc_epid")
     pc_still_locked
@@ -1006,10 +1021,7 @@ pc_slurm_submit() {
     pc_state
     case $? in
       0) pc_fail in_use "the $pc_elauncher launcher's helper runs here (pid $pc_epid); stop it first" ;;
-      2)
-        pc_say host "$pc_ehost"
-        pc_fail other_host "the $pc_elauncher launcher's helper is recorded on $pc_ehost"
-        ;;
+      2) pc_other_host ;;
     esac
     pc_still_locked
     rm -f "$pc_ep" "$pc_pidf"

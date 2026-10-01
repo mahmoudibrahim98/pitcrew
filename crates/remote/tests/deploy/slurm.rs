@@ -1703,7 +1703,7 @@ fn slurm_never_overlaps_another_launcher() {
     .unwrap();
     let err = block_on(launcher.submit(&target)).unwrap_err();
     assert!(
-        matches!(&err, HelperError::OtherHost(h) if h == "hpc-login2"),
+        matches!(&err, HelperError::OtherHost { host, launcher } if host == "hpc-login2" && launcher == "direct"),
         "{err:?}"
     );
     assert!(sim.calls("sbatch").is_empty());
