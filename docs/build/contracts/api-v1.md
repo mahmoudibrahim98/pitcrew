@@ -249,8 +249,12 @@ Both need a device token, like the activity log they summarise. The types are in
   "project"?, "tasks": TaskId[], "agent"?: MemberId, "actors": MemberId[], "counts": Counts,
   "files": FileTouch[], "files_omitted", "facts": Fact[], "facts_omitted",
   "tool_receipts": Receipt[], "turn_receipts": Receipt[] }`.
-  - `id` is its first event's id and `last` its last's; `start` and `end` are their times.
+  - `id` is its first event's id and `last` its last's; `start` and `end` are the times of its
+    earliest and latest events.
   - `BlockKey` is `{ "kind": "session" | "workstream" | "project", "id" }`.
+  - `Counts` has `events`, `tools_run`, `tools_failed`, `file_edits`, `lines_added`,
+    `lines_removed`, `turns`, `asks_raised`, `asks_answered`, `task_moves` and `comments`.
+    `FileTouch` is `{ "path", "edits", "added", "removed", "receipts" }`.
   - Lists are capped (8 tasks, 8 actors, 20 files, 24 facts, with `files_omitted` and
     `facts_omitted` counting the rest); `counts` never are.
 - `Fact`: `{ "by": MemberId, "at", "kind": FactKind, "receipts": Receipt[] }`. `FactKind` is
