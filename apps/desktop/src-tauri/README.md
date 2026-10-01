@@ -24,6 +24,12 @@ corepack pnpm --filter @pitcrew/ui dev        # serves http://127.0.0.1:5173 (de
 cargo run --manifest-path apps/desktop/src-tauri/Cargo.toml
 ```
 
+> **A debug build trusts whatever answers on `127.0.0.1:5173`.** It loads the dev server with no
+> CSP (Tauri applies the CSP only to the bundled UI) and with devtools, and that page gets the
+> gateway, and so the person's daemon. Run debug builds only on a machine where nobody else can
+> listen on that port, with the Vite server started first (it must refuse another port:
+> `strictPort`). Release builds never load it.
+
 **Release** (the built UI inside the app):
 
 ```bash
@@ -47,8 +53,12 @@ hand. Logs go to stderr at `PITCREW_DESKTOP_LOG` (default `info`).
 
 ## The local daemon (`src/daemon`)
 
-- **Finding it:** the configured path, then `pitcrewd` next to the app's executable, then `PATH`
-  (absolute entries only). A configured path that is not a program is an error.
+- **Finding it:** the configured path, then `pitcrewd` next to the app's executable, then (debug
+  builds only) `PATH`, absolute entries only. A configured path that is not a program is an error.
+- **Not a planted binary:** on Unix the program, its directory, and the directory of the path as
+  given must be owned by root or us and not writable by group or others. On Windows a program
+  downloaded from the web (with a `Zone.Identifier` stream) is refused; its owner is not checked
+  yet (that needs the Win32 security API, which needs `unsafe`).
 - **Find or start:** if a daemon already answers `GET /v1/host/info` on this user's private
   socket or pipe, the app uses it and never stops it. Otherwise it starts
   `pitcrewd [--state-dir <dir>] serve --listen private` and waits up to 20 s for
@@ -60,13 +70,18 @@ hand. Logs go to stderr at `PITCREW_DESKTOP_LOG` (default `info`).
   token **on every connection**. It never copies, logs or returns it.
 - **Supervision:** a daemon the app started that stops is restarted after a wait that doubles
   from 0.5 s (at most 15 s). Five failures in a row (runs shorter than a minute, or starts that
-  never got ready) give up: the workspace is `unreachable` with the daemon's last words, until the
-  app restarts. A run of a minute or more starts the count and the wait afresh.
+  never got ready) give up: the workspace is `unreachable` until the app restarts. A run of a
+  minute or more starts the count and the wait afresh.
+- **What the daemon says stays in the log.** A workspace's `detail` is the app's own sentence and
+  the exit status. The daemon's stderr and ready line are logged only, in lines of at most 1 KiB,
+  with anything token-shaped (`pcd_…`, `pca_…`, `pitcrew.bearer.…`, `Bearer …`, 40+ base64url
+  characters) removed.
 - **Someone else's daemon** is checked every 5 s (or at once when a request fails); if it goes
   away, the app starts its own.
-- **Quitting:** the app stops the daemon only if it started it: SIGTERM and up to 8 s on Unix,
-  then a kill. Windows has no signal one process can send another without a shared console, so
-  there the daemon is terminated (SQLite's WAL keeps the store consistent).
+- **Quitting:** the app stops the daemon only if it started it, also while it is still starting:
+  SIGTERM and up to 8 s on Unix, then a kill. Windows has no signal one process can send another
+  without a shared console, so there the daemon is terminated (SQLite's WAL keeps the store
+  consistent).
 
 ## The gateway (`src/gateway`, `src/commands.rs`)
 
@@ -84,7 +99,9 @@ invoke('gateway_socket_close', { socket, code, reason })
   or `..` segment (also percent-encoded), no `//`, `\`, `#`, control characters or raw non-ASCII;
   the query goes on as it is. Sockets: `/v1/stream` and `/v1/sessions/{id}/terminal` only.
 - Limits: 1 MiB request bodies, 32 MiB response bodies, 1 MiB (terminal) and 4 KiB (stream)
-  client messages, 8 MiB incoming frames per message.
+  client messages, 8 MiB incoming frames per message. Time: 120 s per request, 20 s to open a
+  socket (connect and upgrade), 10 s per frame sent to the daemon; past those, `unreachable` or a
+  close with 1006.
 - The gateway sends `Host`, `Content-Type` and `Authorization` (marked sensitive); the WebSocket
   carries `Sec-WebSocket-Protocol: pitcrew.v1, pitcrew.bearer.<token>`. Only the status, the
   `Content-Type` and the body come back.
@@ -93,10 +110,15 @@ invoke('gateway_socket_close', { socket, code, reason })
   dropped, which ends it on the webview's side.
 - **Back-pressure.** Each frame counts against an 8 MiB budget until the webview has taken it.
   Tauri's channels give no acknowledgement, so the gateway sends a probe (`eval_with_callback`
-  of a no-op) after the frames: the webview runs scripts in order, so when the probe comes back,
-  everything before it has been handed to the page. One probe is in flight at a time. Past the
-  budget the socket closes with 1013. Large frames go through Tauri's fetch path; a probe can
-  count them as taken just before the page has fetched them, which is the only slack.
+  of a no-op) after the frames; the webview runs those scripts in order. What a returned probe
+  proves depends on the frame's size:
+  - a small frame (JSON under 8 KiB, binary under 1 KiB) is delivered by its own script, so it
+    has reached the page's handler;
+  - a large frame's script only starts Tauri's fetch for it, so its bytes are released from the
+    budget **when that fetch starts, not when the page has handled the frame**.
+
+  One probe is in flight at a time. Past the budget the socket closes with 1013. An exact count
+  needs the UI to acknowledge frames, a later contract change.
 - **Pings** are answered by tungstenite as it reads; neither Ping nor Pong reaches the webview.
 - **Cleanup.** A socket belongs to the webview that opened it. When that page starts loading again
   (a reload) or its window is destroyed, its sockets close with 1001 and nothing more is sent to
@@ -153,9 +175,9 @@ invoke('gateway_socket_close', { socket, code, reason })
 
 | File | What |
 |---|---|
-| `gateway.rs` | Requests whatever their status; the 1 MiB and 32 MiB limits; bad paths and methods refused before anything is sent; the error mapping (unknown workspace, daemon down, 503 and 404 on upgrade, `needs_pairing`); socket order with `close` last and the sink released; 1006; 1009 both ways; 1013 with exactly 8 MiB delivered; a webview that keeps up gets all 16 MiB; Pings; closing; cleanup per page. |
+| `gateway.rs` | Requests whatever their status; the 1 MiB and 32 MiB limits; bad paths and methods refused before anything is sent; the error mapping (unknown workspace, daemon down, 503 and 404 on upgrade, `needs_pairing`, an upgrade that never answers); socket order with `close` last and the sink released; 1006; 1009 both ways; 1013 with exactly 8 MiB delivered; a webview that keeps up gets all 16 MiB; Pings; closing; cleanup per page. |
 | `app.rs` | The commands through Tauri's IPC on the mock runtime with the real ACL: another window and other core commands are denied; `gateway://workspaces` on changes; closing the window closes its sockets. |
-| `no_token.rs` | Every command, channel message, event, error and log line (at trace, Tauri's and tungstenite's records included) is searched for a known token; the fake daemon even echoes it in response headers. |
-| `supervisor.rs` | Fake `pitcrewd` scripts: start and SIGTERM on quit; a growing backoff; giving up; never ready; no `pitcrewd`; a running daemon used, its workspace registered, and never stopped; starting our own when that one goes away. |
+| `no_token.rs` | Every command, channel message, event, error and log line (at trace, Tauri's and tungstenite's records included) is searched for a known token; the fake daemon even echoes it in response headers, and fake `pitcrewd`s print it on stderr and in the ready line; a canary record proves the log bridge works. |
+| `supervisor.rs` | Fake `pitcrewd` scripts: start and SIGTERM on quit; quitting while it starts and while `token show-path` runs; a growing backoff; giving up; never ready; no `pitcrewd`; a running daemon used, its workspace registered, and never stopped; starting our own when that one goes away. |
 
 The OS keychain test is `#[ignore]`d: it needs an unlocked keychain (`cargo test -- --ignored`).
