@@ -3,7 +3,8 @@
 A fixture server that speaks PitCrew's API v1 ([`docs/build/contracts/api-v1.md`](../../docs/build/contracts/api-v1.md)),
 so the UI can be built without the Rust daemon. It serves the demo workspace in
 [`crates/fixtures/data/demo-workspace.json`](../../crates/fixtures/data/demo-workspace.json) from
-memory, and every change you make lasts until the server stops.
+memory, and every change you make lasts until the server stops. Its recaps come from
+[`demo-recaps.json`](../../crates/fixtures/data/demo-recaps.json) beside it.
 
 No dependencies: only Node's built-in modules. Node 22.18 or newer runs the TypeScript directly.
 
@@ -74,6 +75,10 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
   matching events exist) and filters by project, workstream, task or session. A filtered request
   examines at most 500 revisions (`PITCREW_MOCK_SCAN_WINDOW`, or `startServer({ scanWindow })`), so
   across a long gap it answers empty pages that are not at the start, as the contract allows.
+- **Recaps.** `GET /v1/recaps/blocks` and `GET /v1/recaps/days` serve the recap engine's output
+  for the demo's 15 events (`crates/fixtures/data/demo-recaps.json`: 10 blocks with their lines,
+  and each project's day paragraphs at UTC), with the contract's filters, paging and errors.
+  `cargo test -p pitcrew-fixtures --test recaps` fails when that file no longer matches the engine.
 - **`GET /v1/stream`**: `hello`, then the missed events when `since` is behind, then live events
   batched over 60 ms, and a `ping` every 20 s.
 - **Simulated sessions.** A dispatch or a new session starts in `starting`; about 1.5 s later it
@@ -96,6 +101,8 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
   on their own, workstream health never changes by itself, and mentions do not create asks.
 - A resize changes nothing, and `model`, `persona` and `permission_mode` on a new session are only
   checked, not used (the contract says they are not echoed on `Session`).
+- It computes no recaps: they stay the fixture's whatever you change, and days exist for `tz=0`
+  only. Any other `tz` is `400 invalid`, although the contract allows −840 to 840.
 - Terminal sockets send no WebSocket Pings, so they never close an idle client with 1013.
 
 ## Safety
@@ -128,6 +135,7 @@ a single entry point.
 | `src/state.ts` | In-memory state, the event log and its revisions. |
 | `src/simulate.ts` | Simulated session liveness. |
 | `src/transcripts.ts` | Canned transcripts and paging. |
+| `src/recaps.ts` | The recap routes, paged from the recaps fixture. |
 | `src/ws.ts` | A minimal WebSocket server (RFC 6455). |
 | `src/types.ts` | Wire types mirroring `crates/protocol`. |
 | `src/rules.ts` | `can_move` and date checks ported from `model.rs`. |

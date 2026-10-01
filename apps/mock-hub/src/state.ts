@@ -9,6 +9,7 @@ import { cannedTranscripts, type TranscriptRecord } from './transcripts.ts';
 import type {
   Ask,
   Brief,
+  DemoRecaps,
   DemoWorkspace,
   Dispatch,
   Event,
@@ -138,6 +139,8 @@ export class Hub {
   readonly asks: Ask[];
   readonly briefs: Brief[];
   readonly transcripts: Map<SessionId, TranscriptRecord[]>;
+  /** The demo's recaps, as the recap engine wrote them; nothing the mock does changes them. */
+  readonly recaps: DemoRecaps;
   readonly delays: Delays;
   /** How many revisions one filtered activity request examines at most. */
   readonly scanWindow: number;
@@ -155,7 +158,12 @@ export class Hub {
   #lastAt: number;
   #disposed = false;
 
-  constructor(data: DemoWorkspace, delays: Delays, scanWindow = DEFAULT_SCAN_WINDOW) {
+  constructor(
+    data: DemoWorkspace,
+    delays: Delays,
+    scanWindow = DEFAULT_SCAN_WINDOW,
+    recaps: DemoRecaps = { tz: 0, blocks: [], projects: [] },
+  ) {
     this.workspace = data.workspace;
     this.machines = data.machines;
     this.members = data.members;
@@ -169,6 +177,7 @@ export class Hub {
     this.asks = data.asks;
     this.briefs = data.briefs;
     this.transcripts = cannedTranscripts();
+    this.recaps = recaps;
     this.delays = delays;
     this.scanWindow = scanWindow;
     const person = data.members.find((m) => m.kind === 'human');

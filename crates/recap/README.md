@@ -34,6 +34,10 @@ Recap engine: activity blocks, summaries with receipts, and Where-it-stands prop
   the brief in force, or its pending proposal, already says (text and next step) is not made.
   `propose_paused` is the back office's "paused?" question for a quiet workstream.
 
+The types the API serves (`Block` and its parts, `Check`, `Summary`, `Span`, `DayRecap`) live in
+`pitcrew_protocol::recap`, and this crate re-exports them; `docs/build/contracts/api-v1.md`
+("Recaps") says how they are served.
+
 Everything is pure and deterministic. Event text is untrusted: it is cleaned (control and
 direction-changing characters removed) and capped before it is kept, and counts, files, facts,
 tasks and receipts per block are capped by `Config`.

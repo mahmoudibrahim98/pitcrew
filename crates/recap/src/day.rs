@@ -1,14 +1,17 @@
 //! Days: blocks grouped per workstream per calendar day, and a paragraph for each.
+//!
+//! [`DayRecap`] is a wire type, so it lives in `pitcrew_protocol::recap`.
 
 use crate::block::Block;
 use crate::directory::Directory;
 use crate::draft::{draft_line, draft_paragraph};
 use crate::summary::{RuleSummarizer, Summarizer, Summary, SummaryError, verify};
 use crate::time::date_of;
-use pitcrew_protocol::ids::{EventId, WorkstreamId};
+use pitcrew_protocol::ids::WorkstreamId;
 use pitcrew_protocol::model::Date;
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+pub use pitcrew_protocol::recap::DayRecap;
 
 /// One workstream's blocks on one day.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,20 +46,6 @@ pub fn days(blocks: &[Block], utc_offset_minutes: i32) -> Vec<Day<'_>> {
             }
         })
         .collect()
-}
-
-/// The paragraph for one workstream's day, with the blocks it covers.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DayRecap {
-    /// The workstream; `None` for blocks not linked to one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workstream: Option<WorkstreamId>,
-    /// The day.
-    pub date: Date,
-    /// Ids of the blocks covered, in order.
-    pub blocks: Vec<EventId>,
-    /// The paragraph.
-    pub summary: Summary,
 }
 
 /// A paragraph per workstream per day, written by `summarizer` and checked with [`verify`].
