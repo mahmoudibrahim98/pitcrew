@@ -61,6 +61,7 @@ use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::watch;
@@ -295,6 +296,23 @@ struct Prompts {
     handler: Arc<dyn PromptHandler>,
 }
 
+/// A handler that counts the prompts it passes on (see [`Ssh::counting_prompts`]).
+struct Counted {
+    inner: Arc<dyn PromptHandler>,
+    count: Arc<AtomicU64>,
+}
+
+impl PromptHandler for Counted {
+    fn prompt(
+        &self,
+        request: crate::askpass::PromptRequest,
+        cancel: crate::askpass::PromptCancel,
+    ) -> crate::askpass::PromptFuture<'_> {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.inner.prompt(request, cancel)
+    }
+}
+
 /// The environment variables ssh needs, which [`Ssh::with_env_passthrough`] (and every tunnel
 /// call) keeps; everything else is left out. The user's own config can still send variables to
 /// the server (`SendEnv`), so the rest of the app's environment never reaches ssh.
@@ -455,6 +473,19 @@ impl Ssh {
     /// Whether prompts go to a handler (else ssh runs in `BatchMode`).
     pub(crate) fn has_prompts(&self) -> bool {
         self.prompts.is_some()
+    }
+
+    /// This, with every prompt it shows counted into `count` (the tunnel's: whether its
+    /// attempts ask the person).
+    pub(crate) fn counting_prompts(&self, count: Arc<AtomicU64>) -> Self {
+        let mut ssh = self.clone();
+        if let Some(prompts) = &mut ssh.prompts {
+            prompts.handler = Arc::new(Counted {
+                inner: prompts.handler.clone(),
+                count,
+            });
+        }
+        ssh
     }
 
     /// Whether connections are reused (a ControlMaster; Unix).

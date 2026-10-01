@@ -16,7 +16,10 @@
 //! ControlMaster), or with [`crate::Ssh::with_multiplex`]`(false)`, a heartbeat. On Unix the
 //! endpoint check and the stdio bridges read no ssh config of their own (`-F none`): the master
 //! has the user's. A connector that crashed leaves its master running; the next one to start
-//! stops it (`ssh -O exit`) and removes its directory, once that directory's lock is free.
+//! stops it (`ssh -O exit`) and removes its directory, once that directory's lock is free. On
+//! Unix without connection reuse its directory is removed too, but its heartbeat runs on until
+//! its connection ends; on Windows the Job Object ends a dead app's ssh, and its directory (logs)
+//! stays.
 //!
 //! **Where the daemon is** comes from the endpoint record, asked through the link with the
 //! launcher's `status` before every (re)connection, and checked: the socket must be where its
@@ -25,23 +28,30 @@
 //! the one recorded and have a plain name. A record that fails is never used. A job's node is
 //! reached as the site recipe says ([`crate::LastHop`]): with ssh through the login link (Unix:
 //! a `ProxyCommand` that is a channel of the login link, so the login node is not logged in to
-//! again; Windows: `-J`), refusing a node named like one of the user's own `Host`s; or with
+//! again; Windows: `-J`), refusing a node named like one of the user's own `Host`s (those of
+//! the user's config and its `Include`s; not `/etc/ssh/ssh_config`'s, and `Host` patterns and
+//! `Match` blocks still apply, as for any host), with `CanonicalizeHostname=no`; or with
 //! `srun --jobid <id> --overlap` on the login node, which also reaches a socket on the node's own
-//! disk.
+//! disk. A node link's `ProxyCommand` runs with `SHELL=/bin/sh` (it is written for sh); ssh runs
+//! the user's `Match exec` commands for that link with it too.
 //!
 //! **Two transports** ([`Transport`]), chosen per machine:
 //! - **Forwarded** (Unix): the link's master listens on a socket in the connector's 0700
 //!   directory and forwards each connection to the daemon's socket. Connections share it; a
 //!   forwarded channel is not a session, so sshd's `MaxSessions` does not limit them. A site that
 //!   forbids it (`AllowStreamLocalForwarding no`: ssh logs "administratively prohibited") is
-//!   remembered, and the connector falls back.
+//!   remembered, and the connector falls back. Only the root's socket (`run/pitcrewd.sock`) is
+//!   forwarded: a node-local one's directory goes with its job, and someone else on the node
+//!   could make it again, which a forward would not see (it checks nothing on the far side);
+//!   the bridge checks who listens.
 //! - **Stdio**: each connection runs `pitcrewd connect` ([`crate::bridge`]) on the machine. Each
 //!   is a session of the link (Unix), and sshd allows `MaxSessions` of them at once (10 by
 //!   default, 1 or 2 on some sites): one more is refused as that connection's error
 //!   ([`crate::SshError::SessionRefused`]), and the link stays. Always used on Windows (OpenSSH
 //!   there forwards no unix sockets, neither std nor tokio has them, and a TCP port instead would
 //!   be open to every local user), and through `srun`, where each connection is also a job step
-//!   (the scheduler's load, and `MaxStepCount`), framed against srun's line buffering.
+//!   (the scheduler's load, and `MaxStepCount`), framed against srun's line buffering, with the
+//!   `SLURM_*` variables that would label or redirect srun's stdio unset.
 //!
 //! [`Connector::transport`] is the choice worth remembering (forwarded once it worked; stdio
 //! once the site refused forwarding); pass it back as [`ConnectorOptions::transport`]. What is
@@ -50,32 +60,40 @@
 //! **Watching.** Connected, the connector watches the link's exit (keepalives), and asks the
 //! master whether it lives (`ssh -O check`, Unix) every [`ConnectorOptions::check_every`]. With
 //! a forwarded socket it also sends a request through it every
-//! [`ConnectorOptions::probe_every`]: a request unanswered makes the state
-//! [`LinkState::Unverifiable`] (within ten seconds with the defaults), and one goes every second
-//! until one is answered (connected again) or 30 s pass (the way is lost); the link, patient,
-//! waits as long before it gives up, so a short outage costs no new login. Nothing
-//! watches through a session: it would count against `MaxSessions` (or be an srun step), so a
-//! stdio link's own keepalives, which give up after 8 s, are its watch. A failed connection
-//! makes the connector check at once (the master, or where the daemon is), at most every few
-//! seconds however many fail; so do [`Connector::wake`] and a jump of the wall clock against the
+//! [`ConnectorOptions::probe_every`]: a request unanswered within
+//! [`ConnectorOptions::probe_timeout`] makes the state [`LinkState::Unverifiable`] (within ten
+//! seconds with the defaults), and then one goes a second after the last gave up (about every
+//! 5 s) until one is answered (connected again) or 30 s pass (the way is lost). Such a link is
+//! patient, waiting as long before it gives up, so a short outage costs no new login; a link is
+//! patient only while a forward is in use (an attempt that ends up on the bridge starts it again
+//! impatient). Nothing watches through a session: it would count against `MaxSessions` (or be
+//! an srun step), so a stdio link's own keepalives, which give up after 8 s, are its watch.
+//! Through srun nothing watches the job either: its end shows when a connection fails. A failed
+//! connection makes the connector check at once (the master, or where the daemon is, which is a
+//! session), at most every 2 s (10 s for where the daemon is) however many fail; those that come
+//! within that gap get one more check after it. The check of where the daemon is runs beside
+//! the rest of the watching. So do [`Connector::wake`] and a jump of the wall clock against the
 //! monotonic one (the laptop slept; on Windows, where the monotonic clock runs during sleep, the
 //! desktop should call `wake()` on resume).
 //!
 //! **The ladder.** A lost way makes the state `Unverifiable` and starts again: at once if the
 //! connection had held for [`ConnectorOptions::give_up_after`], else after a back-off with
 //! jitter from [`ConnectorOptions::backoff_min`] to `backoff_max`, the endpoint asked afresh
-//! each time (a job that moved is followed). Failing (or connecting and dropping again) for
-//! `give_up_after` makes it [`LinkState::Unreachable`]: a network that never answered is still
-//! tried every [`ConnectorOptions::retry_every`]; a connection that keeps dropping waits for a
-//! wake or [`Connector::retry`], so it does not ask for a one-time code every minute. A helper
-//! that is not running (or a job that ended) is unreachable at once and asked about again every
+//! each time (a job that moved is followed). The login link stays while it still answers (a
+//! failing squeue costs no new sign-in). Failing (or connecting and dropping again) for
+//! `give_up_after` makes it [`LinkState::Unreachable`]: then it tries again every
+//! [`ConnectorOptions::retry_every`], unless the way kept dropping and each reconnection asked
+//! the person (a one-time code): that waits for a wake or [`Connector::retry`]. A helper that is
+//! not running (or a job that ended) is unreachable at once and asked about again every
 //! `retry_every` through the login link; a failed sign-in or a cancelled prompt (also for a
 //! connection, on Windows) waits for `retry()`. Prompts while reconnecting go through the
 //! askpass bridge as for any call; nothing is stored. Resuming the API stream (`since=`) is the
 //! caller's.
 //!
 //! **Windows** works, with fewer comforts: no ControlMaster, so each connection logs in, and a
-//! password or one-time code is asked each time; keys are the way there. `close()` ends its open
+//! password or one-time code is asked each time; keys are the way there. Each endpoint check is
+//! a login too: once one has asked the person, they come no more often than `retry_every` (a
+//! queued job is asked about every minute, not at every back-off step). `close()` ends its open
 //! connections too. Its tests ran on Linux, without connection reuse; not on Windows itself.
 //!
 //! **Security**, as for every call: agent and X11 forwarding, local commands and the user's
@@ -417,24 +435,28 @@ enum Event {
     Close,
 }
 
-/// The event a failed connection sends, if any. A refused session is that connection's own
-/// failure: the link is fine.
-fn event_for(error: &TunnelError) -> Option<Event> {
+/// The events a failed connection sends. A refused session is that connection's own failure:
+/// the link is fine. Through srun (`srun`), any other failure may be the job's end ("Invalid
+/// job id"), which no check of the link would see: where the daemon is is asked too.
+fn events_for(error: &TunnelError, srun: bool) -> Vec<Event> {
     match error {
         TunnelError::Ssh(SshError::SessionRefused { .. })
         | TunnelError::NotConnected(_)
-        | TunnelError::Unsupported(_) => None,
+        | TunnelError::Unsupported(_) => Vec::new(),
         TunnelError::Ssh(
             e @ (SshError::AuthFailed { .. }
             | SshError::HostKeyRejected { .. }
             | SshError::HostKeyChanged { .. }
             | SshError::Cancelled
             | SshError::Bridge(_)),
-        ) => Some(Event::SignIn(format!("signing in for a connection: {e}"))),
-        TunnelError::Ssh(_) | TunnelError::Bridge(_) | TunnelError::Io(_) => {
-            Some(Event::LinkSuspect)
+        ) => vec![Event::SignIn(format!("signing in for a connection: {e}"))],
+        TunnelError::Ssh(_) | TunnelError::Bridge(_) | TunnelError::Io(_) if srun => {
+            vec![Event::LinkSuspect, Event::RouteSuspect]
         }
-        TunnelError::NoDaemon(_) | TunnelError::Refused(_) => Some(Event::RouteSuspect),
+        TunnelError::Ssh(_) | TunnelError::Bridge(_) | TunnelError::Io(_) => {
+            vec![Event::LinkSuspect]
+        }
+        TunnelError::NoDaemon(_) | TunnelError::Refused(_) => vec![Event::RouteSuspect],
     }
 }
 
@@ -609,10 +631,11 @@ impl Connector {
     pub async fn connect(&self) -> Result<TunnelStream, TunnelError> {
         let active = self.wait_active().await?;
         let opened = active.open().await;
-        if let Err(error) = &opened
-            && let Some(event) = event_for(error)
-        {
-            let _ = self.inner.events.send(event);
+        if let Err(error) = &opened {
+            // Framed means through srun.
+            for event in events_for(error, active.framed) {
+                let _ = self.inner.events.send(event);
+            }
         }
         opened
     }
@@ -746,33 +769,43 @@ fn jitter() -> u32 {
     crate::askpass::random::<4>().map_or(u32::MAX / 2, u32::from_le_bytes)
 }
 
-/// `text` with every path in it (a `/` starting a word, to the word's end) replaced by `…`:
-/// reasons and errors end up on screens and in logs, and paths carry user names.
+/// `text` with every path in it (a word starting with `/`, a drive's `C:\` or `C:/`, or `\\`,
+/// to the word's end) replaced by `…`: reasons and errors end up on screens and in logs, and
+/// paths carry user names.
 pub(crate) fn scrub(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
+    let mut rest = text;
     let mut prev: Option<char> = None;
-    while let Some(c) = chars.next() {
+    while let Some(c) = rest.chars().next() {
         let starts_word = prev.is_none_or(|p| {
             p.is_whitespace() || matches!(p, '(' | '"' | '\'' | '=' | ':' | '[' | '<' | ',')
         });
-        if c == '/' && starts_word {
-            while chars
-                .next_if(|&n| {
-                    !n.is_whitespace()
-                        && !matches!(n, '"' | '\'' | ')' | ',' | ']' | '>')
-                        && n != ':'
-                })
-                .is_some()
-            {}
+        if starts_word && let Some(len) = path_len(rest) {
             out.push('…');
             prev = Some('…');
+            rest = rest.get(len..).unwrap_or_default();
             continue;
         }
         out.push(c);
         prev = Some(c);
+        rest = rest.get(c.len_utf8()..).unwrap_or_default();
     }
     out
+}
+
+/// The length of the path `text` starts with, if it starts with one (see [`scrub`]).
+fn path_len(text: &str) -> Option<usize> {
+    let start = match text.as_bytes() {
+        [b'/', ..] => 1,
+        [b'\\', b'\\', ..] => 2,
+        [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic() => 3,
+        _ => return None,
+    };
+    let tail = text.get(start..).unwrap_or_default();
+    let end = tail
+        .find(|n: char| n.is_whitespace() || matches!(n, '"' | '\'' | ')' | ',' | ']' | '>' | ':'))
+        .unwrap_or(tail.len());
+    Some(start + end)
 }
 
 #[cfg(test)]
@@ -818,24 +851,35 @@ mod tests {
         let refused = TunnelError::Ssh(SshError::SessionRefused {
             stderr: String::new(),
         });
-        assert_eq!(event_for(&refused), None);
-        assert!(matches!(
-            event_for(&TunnelError::Ssh(SshError::Cancelled)),
-            Some(Event::SignIn(_))
-        ));
+        for srun in [false, true] {
+            assert_eq!(events_for(&refused, srun), []);
+            assert!(matches!(
+                events_for(&TunnelError::Ssh(SshError::Cancelled), srun).as_slice(),
+                [Event::SignIn(_)]
+            ));
+            assert_eq!(
+                events_for(&TunnelError::NoDaemon("x".into()), srun),
+                [Event::RouteSuspect]
+            );
+            assert_eq!(
+                events_for(&TunnelError::NotConnected(LinkState::Closed), srun),
+                []
+            );
+        }
+        let unreachable = TunnelError::Ssh(SshError::Unreachable {
+            stderr: String::new(),
+        });
+        assert_eq!(events_for(&unreachable, false), [Event::LinkSuspect]);
+        // Through srun, the job may have ended (srun: "Invalid job id", exit 1).
+        let ended = TunnelError::Bridge("srun: error: Invalid job id specified".into());
+        assert_eq!(events_for(&ended, false), [Event::LinkSuspect]);
         assert_eq!(
-            event_for(&TunnelError::Ssh(SshError::Unreachable {
-                stderr: String::new()
-            })),
-            Some(Event::LinkSuspect)
+            events_for(&ended, true),
+            [Event::LinkSuspect, Event::RouteSuspect]
         );
         assert_eq!(
-            event_for(&TunnelError::NoDaemon("x".into())),
-            Some(Event::RouteSuspect)
-        );
-        assert_eq!(
-            event_for(&TunnelError::NotConnected(LinkState::Closed)),
-            None
+            events_for(&unreachable, true),
+            [Event::LinkSuspect, Event::RouteSuspect]
         );
     }
 
@@ -876,6 +920,18 @@ mod tests {
             "Timeout, server hpc-login not responding."
         );
         assert_eq!(scrub("N/A and a/b"), "N/A and a/b");
+        // Windows paths: a drive's, either slash, and a share's.
+        assert_eq!(
+            scrub(r"Control socket connect(C:\Users\sam\AppData\Local\Temp\x): no"),
+            "Control socket connect(…): no"
+        );
+        assert_eq!(scrub(r"log at d:/Users/sam/log, then"), "log at …, then");
+        assert_eq!(
+            scrub(r"open \\fileserver\home\sam\x failed"),
+            "open … failed"
+        );
+        assert_eq!(scrub(r"a C: drive and x:\y"), r"a C: drive and …");
+        assert_eq!(scrub("é/x and ü"), "é/x and ü");
     }
 
     /// The desktop keeps a connector in shared state and spawns its connections.

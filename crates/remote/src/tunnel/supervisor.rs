@@ -12,9 +12,12 @@ use super::{
 use crate::helper::HelperError;
 use crate::helper::slurm::LastHop;
 use crate::{Ssh, SshError};
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -87,15 +90,26 @@ fn create_exclusive(path: &Path) -> io::Result<()> {
 /// Makes and locks `<dir>/lock`.
 #[cfg(unix)]
 fn lock(dir: &Path) -> io::Result<Option<std::fs::File>> {
+    lock_with(dir, || {})
+}
+
+/// [`lock`], calling `between` after the file is made and before it is locked. The file is
+/// made as `lock.new` and renamed `lock` only once locked: another connector's sweep never sees
+/// a `lock` that is free while this one lives (without one, a young directory is not stale).
+#[cfg(unix)]
+fn lock_with(dir: &Path, between: impl FnOnce()) -> io::Result<Option<std::fs::File>> {
     use std::os::unix::fs::OpenOptionsExt as _;
+    let new = dir.join("lock.new");
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(dir.join("lock"))?;
+        .open(&new)?;
+    between();
     rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
         .map_err(io::Error::from)?;
+    std::fs::rename(&new, dir.join("lock"))?;
     Ok(Some(file))
 }
 
@@ -149,10 +163,11 @@ impl Failure {
 
     fn tunnel(error: &TunnelError, doing: &str) -> Self {
         match error {
-            // At the first connection nothing else holds a session: the server allows none.
+            // At the first connection: the endpoint check's session may not be over yet (a
+            // site with `MaxSessions 1`), or another app's are open. Soon, then.
             TunnelError::Ssh(SshError::SessionRefused { .. }) => Self::new(
-                Kind::Refused,
-                format!("{doing}: the server allows no session for the bridge (its MaxSessions)"),
+                Kind::Transient,
+                format!("{doing}: the server allows no more sessions now (its MaxSessions)"),
             ),
             TunnelError::Ssh(e) => Self::ssh(e, doing),
             TunnelError::Refused(why) => Self::new(Kind::Refused, format!("{doing}: {why}")),
@@ -193,6 +208,9 @@ struct Asked {
     link_suspect: bool,
 }
 
+/// An endpoint check under way (see [`Supervisor::resolving`]).
+type Resolving = Pin<Box<dyn Future<Output = Result<Route, Failure>> + Send>>;
+
 /// A forward on one of the links.
 #[cfg(unix)]
 #[derive(Debug)]
@@ -226,6 +244,11 @@ pub(super) struct Supervisor {
     forward_known: bool,
     /// The caller remembered stdio.
     prefer_stdio: bool,
+    /// How many prompts the person has seen from this connector.
+    prompts: Arc<AtomicU64>,
+    /// An endpoint check has needed a prompt (without a master each one logs in): checks then
+    /// come at most every `retry_every`.
+    status_prompts: bool,
     clock: Clock,
 }
 
@@ -238,14 +261,17 @@ impl Supervisor {
         dir: PrivateDir,
     ) -> Self {
         let clock = Clock::new(&options.wall_clock);
+        let prompts = Arc::new(AtomicU64::new(0));
         Self {
             master: cfg!(unix) && ssh.multiplexes(),
             prefer_stdio: options.transport == Some(Transport::Stdio),
             forward_known: options.transport == Some(Transport::Forwarded),
+            ssh: ssh.counting_prompts(prompts.clone()),
+            prompts,
+            status_prompts: false,
             daemon,
             options,
             shared,
-            ssh,
             dir,
             login: None,
             node: None,
@@ -258,10 +284,16 @@ impl Supervisor {
         }
     }
 
+    /// Prompts shown so far.
+    fn prompted(&self) -> u64 {
+        self.prompts.load(Ordering::Relaxed)
+    }
+
     pub(super) async fn run(mut self, mut events: mpsc::UnboundedReceiver<Event>) {
         self.sweep_stale().await;
         let mut attempt: u32 = 0;
-        let mut failing_since: Option<Instant> = None;
+        // Since when attempts fail, and the prompts shown by then.
+        let mut failing_since: Option<(Instant, u64)> = None;
         // A connection that held only briefly since the failing began.
         let mut flapped = false;
         loop {
@@ -316,14 +348,20 @@ impl Supervisor {
                             // that keeps dropping ends up unreachable, not asking for a code
                             // forever.
                             flapped = true;
-                            let since = *failing_since.get_or_insert_with(Instant::now);
+                            let now = self.prompted();
+                            let (since, prompts) =
+                                *failing_since.get_or_insert_with(|| (Instant::now(), now));
                             if since.elapsed() >= self.options.give_up_after {
                                 self.shared.set(LinkState::Unreachable {
                                     why: Unreachable::Network,
                                     reason: format!("{reason} (the connection keeps dropping)"),
                                 });
                                 self.stop_links().await;
-                                self.pause(None, &mut events, false).await
+                                // Reconnecting asked the person: wait for a wake or a retry.
+                                // Else try again now and then.
+                                let wait = (self.prompted() == prompts)
+                                    .then_some(self.options.retry_every);
+                                self.pause(wait, &mut events, false).await
                             } else {
                                 let wait = backoff(
                                     attempt,
@@ -338,8 +376,12 @@ impl Supervisor {
                     }
                 }
                 Err(failure) => {
-                    let since = *failing_since.get_or_insert_with(Instant::now);
-                    self.after(failure, since, flapped, &mut attempt, &mut events)
+                    let now = self.prompted();
+                    let (since, prompts) =
+                        *failing_since.get_or_insert_with(|| (Instant::now(), now));
+                    // A way that kept dropping, and asked the person each time.
+                    let costly = flapped && self.prompted() > prompts;
+                    self.after(failure, since, costly, &mut attempt, &mut events)
                         .await
                 }
             };
@@ -360,12 +402,13 @@ impl Supervisor {
         self.shared.set(LinkState::Closed);
     }
 
-    /// Sets the state for a failed attempt and waits for the next one.
+    /// Sets the state for a failed attempt and waits for the next one. `costly`: the way kept
+    /// dropping, and reconnecting asked the person.
     async fn after(
         &mut self,
         failure: Failure,
         since: Instant,
-        flapped: bool,
+        costly: bool,
         attempt: &mut u32,
         events: &mut mpsc::UnboundedReceiver<Event>,
     ) -> Resume {
@@ -399,17 +442,53 @@ impl Supervisor {
             // A queued job: keep asking, as often as the back-off allows.
             Kind::Waiting if given_up => (unreachable(Unreachable::NotRunning), Some(next), true),
             Kind::Waiting => (LinkState::Unverifiable { reason }, Some(next), true),
-            // A way that kept dropping waits for a wake: each try may ask for a code.
+            // A way that kept dropping, asking for a code each time, waits for a wake. The
+            // login stays while it answers (squeue down, say: no new sign-in for that).
             Kind::Transient if given_up => (
                 unreachable(Unreachable::Network),
-                (!flapped).then_some(self.options.retry_every),
-                false,
+                (!costly).then_some(self.options.retry_every),
+                self.login_answers().await,
             ),
-            Kind::Transient => (LinkState::Unverifiable { reason }, Some(next), false),
+            Kind::Transient => (
+                LinkState::Unverifiable { reason },
+                Some(next),
+                self.login_answers().await,
+            ),
+        };
+        // Without a master each endpoint check logs in: one that asked the person is not
+        // repeated more often than `retry_every`.
+        let wait = if !self.master && self.status_prompts {
+            wait.map(|w| w.max(self.options.retry_every))
+        } else {
+            wait
         };
         self.shared.set(state);
         self.stop(keep_login).await;
         self.pause(wait, events, kind == Kind::SignIn).await
+    }
+
+    /// Whether the login link still runs and (with a master) answers its check.
+    async fn login_answers(&mut self) -> bool {
+        let Some(link) = self.login.as_mut() else {
+            return false;
+        };
+        if !link.alive() {
+            return false;
+        }
+        #[cfg(unix)]
+        if let Some(control) = link.control() {
+            return super::link::control(
+                &self.ssh,
+                &self.dir.path,
+                control,
+                link.host(),
+                "check",
+                &[],
+            )
+            .await
+            .is_ok();
+        }
+        true
     }
 
     /// Waits `wait` (or for ever), until a retry, a wake (unless `retry_only`) or a clock jump
@@ -447,39 +526,71 @@ impl Supervisor {
         }
     }
 
-    /// Whether a new link can be patient: a forward will be probed through it.
+    /// Whether a new link can be patient: a forward will be probed through it. Not where a job
+    /// is reached through srun (never forwarded).
     fn patient(&self) -> bool {
-        self.master && self.forward_known && !self.forbidden && !self.prefer_stdio
+        self.master
+            && self.forward_known
+            && !self.forbidden
+            && !self.prefer_stdio
+            && self.daemon.last_hop != LastHop::SrunOverlap
+    }
+
+    /// Starts the login link (stopping any links left).
+    async fn start_login(&mut self) -> Result<(), Failure> {
+        self.stop_links().await;
+        let host = self.daemon.host().to_owned();
+        let link = Link::start(
+            LinkSpec {
+                ssh: &self.ssh,
+                dir: &self.dir.path,
+                name: "login",
+                host: &host,
+                via: None,
+                master: self.master,
+                patient: self.patient(),
+            },
+            self.options.link_wait,
+        )
+        .await
+        .map_err(|e| Failure::ssh(&e, &format!("connecting to {host}")))?;
+        self.login = Some(link);
+        Ok(())
     }
 
     /// One attempt: the login link, the endpoint, the node's link, the transport.
     async fn establish(&mut self) -> Result<Arc<Active>, Failure> {
-        let host = self.daemon.host().to_owned();
         // The login link, kept if it still runs.
         if !self.login.as_mut().is_some_and(Link::alive) {
-            self.stop_links().await;
-            let link = Link::start(
-                LinkSpec {
-                    ssh: &self.ssh,
-                    dir: &self.dir.path,
-                    name: "login",
-                    host: &host,
-                    via: None,
-                    master: self.master,
-                    patient: self.patient(),
-                },
-                self.options.link_wait,
-            )
-            .await
-            .map_err(|e| Failure::ssh(&e, &format!("connecting to {host}")))?;
-            self.login = Some(link);
+            self.start_login().await?;
         }
-        let route = self.resolve().await?;
+        let prompts = self.prompted();
+        let route = self.resolve().await;
+        if self.prompted() > prompts {
+            self.status_prompts = true;
+        }
+        let route = route?;
         let srun = route
             .node
             .as_ref()
             .is_some_and(|n| n.last_hop == LastHop::SrunOverlap);
-        if srun {
+        // Only the root's socket is forwarded. A node-local one is in a directory that its job
+        // removes when it ends, and that someone else on the node could make again: a forward
+        // checks nothing on the far side, where the bridge checks who listens.
+        #[cfg(unix)]
+        let forwardable = self.master
+            && !srun
+            && !self.forbidden
+            && !self.prefer_stdio
+            && route.socket == self.daemon.target.layout().socket()
+            && forward::fits(&route.socket);
+        #[cfg(not(unix))]
+        let forwardable = {
+            let _ = srun;
+            false
+        };
+        if !forwardable {
+            // A node's link is not made patient for a forward that will not be.
             self.forward_known = false;
         }
         // A job's node, reached with ssh: a link of its own, through the login link.
@@ -497,12 +608,7 @@ impl Supervisor {
             None => self.stop_node().await,
         }
         #[cfg(unix)]
-        if self.master
-            && !srun
-            && !self.forbidden
-            && !self.prefer_stdio
-            && forward::fits(&route.socket)
-        {
+        if forwardable {
             match self.try_forward(&route).await {
                 Ok(active) => {
                     self.forward_known = true;
@@ -526,6 +632,18 @@ impl Supervisor {
                 }
             }
         }
+        // The bridge it is. A patient link would notice a lost network only after 30 s, and
+        // nothing else watches a stdio transport: start the daemon's link again, impatient.
+        self.forward_known = false;
+        if self.daemon_link().is_some_and(Link::patient) {
+            match &node_ssh {
+                Some(name) => {
+                    self.stop_node().await;
+                    self.node_link(name).await?;
+                }
+                None => self.start_login().await?,
+            }
+        }
         let active = Arc::new(self.stdio(&route, node_ssh.as_deref()));
         // The first connection proves the way (within `bridge_wait`, prompts excluded).
         match active.open().await {
@@ -540,46 +658,36 @@ impl Supervisor {
 
     /// Where the daemon is, asked through the login link.
     async fn resolve(&mut self) -> Result<Route, Failure> {
+        self.resolving().await
+    }
+
+    /// [`Self::resolve`] as a future of its own, which borrows nothing: watching runs it beside
+    /// the rest.
+    fn resolving(&self) -> Resolving {
+        let daemon = self.daemon.clone();
         let target = self.status_target();
-        let asking = route::resolve(&self.daemon, &target);
-        let host = self.daemon.host().to_owned();
-        let asked = if self.master {
-            match tokio::time::timeout(STATUS_WAIT, asking).await {
-                Ok(asked) => asked,
-                Err(_) => {
-                    return Err(Failure::new(
-                        Kind::Transient,
-                        format!(
-                            "asking {host} where the helper is: no answer within {STATUS_WAIT:?}"
-                        ),
-                    ));
+        let master = self.master;
+        Box::pin(async move {
+            let host = daemon.host().to_owned();
+            let asking = route::resolve(&daemon, &target);
+            let asked = if master {
+                match tokio::time::timeout(STATUS_WAIT, asking).await {
+                    Ok(asked) => asked,
+                    Err(_) => {
+                        return Err(Failure::new(
+                            Kind::Transient,
+                            format!(
+                                "asking {host} where the helper is: no answer within \
+                                 {STATUS_WAIT:?}"
+                            ),
+                        ));
+                    }
                 }
-            }
-        } else {
-            asking.await
-        };
-        match asked {
-            Ok(route) => Ok(route),
-            Err(NoRoute::Waiting(why)) => Err(Failure::new(Kind::Waiting, why)),
-            Err(NoRoute::NotRunning(why)) => Err(Failure::new(Kind::NotRunning, why)),
-            Err(NoRoute::Invalid(why)) => Err(Failure::new(
-                Kind::Refused,
-                format!("the helper's record on {host} failed a check: {why}"),
-            )),
-            Err(NoRoute::Failed(error)) => Err(match &error {
-                HelperError::Ssh(e) => {
-                    Failure::ssh(e, &format!("asking {host} where the helper is"))
-                }
-                HelperError::UnsafeDirectory(_) | HelperError::InvalidArgument(_) => Failure::new(
-                    Kind::Refused,
-                    format!("asking {host} where the helper is: {error}"),
-                ),
-                _ => Failure::new(
-                    Kind::Transient,
-                    format!("asking {host} where the helper is: {error}"),
-                ),
-            }),
-        }
+            } else {
+                asking.await
+            };
+            asked.map_err(|no| no_route(no, &host))
+        })
     }
 
     /// The target, reached through the login link's master (Unix), or as given (Windows).
@@ -716,9 +824,20 @@ impl Supervisor {
         let (host, argv) = match (srun, &route.node) {
             (Some(node), _) => {
                 // A job step on the node; the bridge's output framed against srun's line
-                // buffering.
+                // buffering. srun takes options from the login node's environment too: labels
+                // before each line (`SLURM_LABELIO`), or stdio sent elsewhere, would break the
+                // frames.
                 let mut argv: Vec<String> = vec![
                     "exec".to_owned(),
+                    "env".to_owned(),
+                    "-u".to_owned(),
+                    "SLURM_LABELIO".to_owned(),
+                    "-u".to_owned(),
+                    "SLURM_STDINMODE".to_owned(),
+                    "-u".to_owned(),
+                    "SLURM_STDOUTMODE".to_owned(),
+                    "-u".to_owned(),
+                    "SLURM_STDERRMODE".to_owned(),
                     "srun".to_owned(),
                     format!("--jobid={}", node.job),
                     "--overlap".to_owned(),
@@ -782,6 +901,12 @@ impl Supervisor {
         let mut last_probe = Instant::now();
         let mut last_suspect: Option<Instant> = None;
         let mut last_route: Option<Instant> = None;
+        // Asked for within their gaps: done once the gap is over, not dropped.
+        let mut suspect_due = false;
+        let mut route_due = false;
+        // The endpoint check under way. It runs beside the rest (it may take a while), so the
+        // links and the probes are still watched meanwhile.
+        let mut routing: Option<Resolving> = None;
         // Since when the forwarded socket has been silent.
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut silent_since: Option<Instant> = None;
@@ -790,6 +915,7 @@ impl Supervisor {
         let probing = active.transport == Transport::Forwarded;
         loop {
             let mut asked = Asked::default();
+            let mut routed = None;
             {
                 let login_host = self.daemon.host().to_owned();
                 let Self { login, node, .. } = &mut *self;
@@ -805,7 +931,14 @@ impl Supervisor {
                         None => std::future::pending().await,
                     }
                 };
+                let route_checked = async {
+                    match routing.as_mut() {
+                        Some(check) => check.as_mut().await,
+                        None => std::future::pending().await,
+                    }
+                };
                 tokio::select! {
+                    result = route_checked => routed = Some(result),
                     reason = login_exit => {
                         return End::Lost {
                             reason: format!("lost the connection to {login_host}: {reason}"),
@@ -835,6 +968,26 @@ impl Supervisor {
                     }
                 }
             }
+            if let Some(result) = routed {
+                routing = None;
+                match result {
+                    Ok(route) if route == active.route => {}
+                    Ok(_) => {
+                        return End::Lost {
+                            reason: "the helper moved".to_owned(),
+                            keep_login: true,
+                        };
+                    }
+                    // Busy (no session free now) or slow: the connections say more later.
+                    Err(failure) if failure.kind == Kind::Transient => {}
+                    Err(failure) => {
+                        return End::Lost {
+                            reason: failure.reason,
+                            keep_login: true,
+                        };
+                    }
+                }
+            }
             // Whatever else is queued is part of the same burst.
             while let Ok(event) = events.try_recv() {
                 if let Some(end) = take(Some(event), &mut asked) {
@@ -845,7 +998,9 @@ impl Supervisor {
                 asked.check = true;
                 asked.probe = probing;
             }
-            if asked.link_suspect && last_suspect.is_none_or(|t| t.elapsed() >= SUSPECT_GAP) {
+            suspect_due |= asked.link_suspect;
+            if suspect_due && last_suspect.is_none_or(|t| t.elapsed() >= SUSPECT_GAP) {
+                suspect_due = false;
                 last_suspect = Some(Instant::now());
                 asked.check = true;
                 asked.probe = probing;
@@ -919,25 +1074,12 @@ impl Supervisor {
                     }
                 }
             }
-            if asked.route && last_route.is_none_or(|t| t.elapsed() >= ROUTE_GAP) {
+            route_due |= asked.route;
+            if route_due && routing.is_none() && last_route.is_none_or(|t| t.elapsed() >= ROUTE_GAP)
+            {
+                route_due = false;
                 last_route = Some(Instant::now());
-                match self.resolve().await {
-                    Ok(route) if route == active.route => {}
-                    Ok(_) => {
-                        return End::Lost {
-                            reason: "the helper moved".to_owned(),
-                            keep_login: true,
-                        };
-                    }
-                    // Busy (no session free now) or slow: the connections say more later.
-                    Err(failure) if failure.kind == Kind::Transient => {}
-                    Err(failure) => {
-                        return End::Lost {
-                            reason: failure.reason,
-                            keep_login: true,
-                        };
-                    }
-                }
+                routing = Some(self.resolving());
             }
         }
     }
@@ -1025,10 +1167,11 @@ impl Supervisor {
     }
 
     /// Stops the masters of connectors that died (their directory's lock is free) and removes
-    /// their directories. Unix, with connection reuse.
+    /// their directories (Unix; on Windows the Job Object ends a dead app's ssh, and its
+    /// directory, logs only, stays).
     async fn sweep_stale(&self) {
         #[cfg(unix)]
-        if self.master {
+        {
             let Some(base) = self.dir.path.parent() else {
                 return;
             };
@@ -1063,6 +1206,29 @@ impl Supervisor {
                 let _ = std::fs::remove_dir_all(&path);
             }
         }
+    }
+}
+
+/// The failure for an endpoint check of `host` that found no route.
+fn no_route(no: NoRoute, host: &str) -> Failure {
+    match no {
+        NoRoute::Waiting(why) => Failure::new(Kind::Waiting, why),
+        NoRoute::NotRunning(why) => Failure::new(Kind::NotRunning, why),
+        NoRoute::Invalid(why) => Failure::new(
+            Kind::Refused,
+            format!("the helper's record on {host} failed a check: {why}"),
+        ),
+        NoRoute::Failed(error) => match &error {
+            HelperError::Ssh(e) => Failure::ssh(e, &format!("asking {host} where the helper is")),
+            HelperError::UnsafeDirectory(_) | HelperError::InvalidArgument(_) => Failure::new(
+                Kind::Refused,
+                format!("asking {host} where the helper is: {error}"),
+            ),
+            _ => Failure::new(
+                Kind::Transient,
+                format!("asking {host} where the helper is: {error}"),
+            ),
+        },
     }
 }
 
@@ -1144,6 +1310,12 @@ mod tests {
             Failure::tunnel(&TunnelError::NoDaemon("x".into()), "y").kind,
             Kind::NotRunning
         );
+        let refused = TunnelError::Ssh(SshError::SessionRefused {
+            stderr: String::new(),
+        });
+        let failure = Failure::tunnel(&refused, "y");
+        assert_eq!(failure.kind, Kind::Transient);
+        assert!(failure.reason.contains("MaxSessions"), "{}", failure.reason);
     }
 
     #[cfg(unix)]
@@ -1170,5 +1342,24 @@ mod tests {
         std::fs::create_dir(&young).unwrap();
         assert!(!is_stale(&young));
         drop(b);
+    }
+
+    /// A sweep that comes while a connector is taking its lock (the file made, not locked yet)
+    /// finds no free `lock` to take.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_being_taken_is_never_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t0123456789abcdef");
+        std::fs::create_dir(&dir).unwrap();
+        let file = lock_with(&dir, || {
+            assert!(!is_stale(&dir), "stale while being locked")
+        })
+        .unwrap()
+        .unwrap();
+        assert!(!is_stale(&dir));
+        assert!(!dir.join("lock.new").exists());
+        drop(file);
+        assert!(is_stale(&dir));
     }
 }

@@ -12,7 +12,9 @@
 //! depends on what else watches the network:
 //! - a *patient* link, whose forwarded socket the connector probes ([`KEEPALIVE_COUNT_PATIENT`]):
 //!   the probe reports a silence within ten seconds, and the link waits 30 s before giving up,
-//!   so a short outage costs no new login (no new one-time code);
+//!   so a short outage costs no new login (no new one-time code). A link starts patient only
+//!   where a forward worked before, and not for srun; one that ends up carrying the bridge is
+//!   started again impatient;
 //! - otherwise ([`KEEPALIVE_COUNT`]): the keepalives are the only sign of a silent network (a
 //!   probe of its own would cost a session, which sshd's `MaxSessions` limits, or a refused
 //!   forward, which sshd logs), so the link gives up after 8 s.
@@ -91,6 +93,7 @@ pub(crate) struct Link {
     askpass: Option<AskpassServer>,
     control: Option<PathBuf>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    patient: bool,
 }
 
 impl Link {
@@ -122,9 +125,15 @@ impl Link {
             askpass,
             control,
             stderr,
+            patient: spec.patient,
         };
         link.ready(wait).await?;
         Ok(link)
+    }
+
+    /// Whether it waits 30 s of silence before giving up (see the module docs).
+    pub(crate) fn patient(&self) -> bool {
+        self.patient
     }
 
     async fn ready(&mut self, wait: Duration) -> Result<(), SshError> {
@@ -379,6 +388,11 @@ pub(crate) fn link_args(
     }
     if let Some(Via::Master { control, login }) = spec.via {
         options.push(proxy_through(spec.ssh.program(), control, login)?);
+    }
+    if spec.via.is_some() {
+        // The node's name as the cluster gave it: not completed into another host's (a
+        // `CanonicalDomains` of the user's would make it one of their own `Host`s).
+        options.push("CanonicalizeHostname=no".to_owned());
     }
     for option in options {
         args.push("-o".to_owned());
