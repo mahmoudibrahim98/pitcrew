@@ -29,6 +29,7 @@ async fn seeded_lists_equal_the_demo() {
         ("/v1/workstreams", value(&demo.workstreams)),
         ("/v1/tasks", value(&demo.tasks)),
         ("/v1/asks", value(&demo.asks)),
+        ("/v1/sessions", value(&demo.sessions)),
     ];
     for (path, expected) in lists {
         let got = get(&app, sam, path).await;
@@ -171,9 +172,16 @@ async fn seeding_twice_is_refused() {
 }
 
 /// Parity with the real mock hub, not just the fixture it serves. Dump the mock's answers with
-/// a script that fetches each GET route in an `index.json` (`{ "name": "/v1/..." }`) into
-/// `<name>.json`, then run with `PITCREW_MOCK_DUMP=<that folder> cargo test -p pitcrew-hub-work
-/// --test seed -- --ignored`. Every answer must match, except briefs' `next` (a contract gap).
+/// `tests/dump-mock-hub.mjs` (it starts the mock in-process and writes each GET route's answer to
+/// `<name>.json`, plus an `index.json` of `{ "name": "/v1/..." }`):
+///
+/// ```text
+/// node crates/hub-work/tests/dump-mock-hub.mjs <folder>
+/// PITCREW_MOCK_DUMP=<folder> cargo test -p pitcrew-hub-work --test seed -- --ignored
+/// ```
+///
+/// Every answer must match, except briefs' `next` (a contract gap) and the workspace's `rev`
+/// (the two logs hold different events: the mock's is the demo's slice, ours the whole import).
 #[tokio::test]
 #[ignore = "needs a dump of the mock hub's answers in PITCREW_MOCK_DUMP"]
 async fn seeded_routes_answer_like_the_running_mock_hub() {
@@ -190,11 +198,17 @@ async fn seeded_routes_answer_like_the_running_mock_hub() {
     let app = app(&work);
     for (name, path) in &index {
         let mut mock = read(&format!("{name}.json"));
-        let got = get(&app, person(SAM), path).await;
+        let mut got = get(&app, person(SAM), path).await;
         expect(&got, 200);
         if name == "briefs" {
             for brief in mock.as_array_mut().expect("array") {
                 brief.as_object_mut().expect("object").remove("next");
+            }
+        }
+        if name == "workspace" {
+            assert!(got.1["rev"].as_u64().is_some_and(|rev| rev > 0));
+            for answer in [&mut got.1, &mut mock] {
+                answer.as_object_mut().expect("object").remove("rev");
             }
         }
         assert_eq!(got.1, mock, "{path}");

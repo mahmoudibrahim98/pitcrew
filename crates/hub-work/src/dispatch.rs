@@ -1,0 +1,385 @@
+//! Dispatching: `POST /v1/tasks/{id}/dispatch` starts a session for an agent on a task.
+//!
+//! The hub records the dispatch, then asks a [`Dispatcher`] (the runner link, stream D) to start
+//! the session:
+//!
+//! 1. Under the command lock, it checks the request (`404` unknown task; `400` unknown agent or
+//!    machine, or a person named as the agent; `409` a done or canceled task; `503` no live
+//!    machine to run on) and appends, in one transaction:
+//!    - `task_assigned` to the agent, if the task has no assignee;
+//!    - `dispatch_started`, naming the session it will run in (a new id);
+//!    - `session_discovered` for that session: state `starting`, linked to the task and its
+//!      workstream with `link_basis: dispatch`.
+//! 2. Without the lock (a runner may take a while), it calls [`Dispatcher::start`].
+//! 3. If that fails, it appends `dispatch_finished` (outcome `failed`, the reason as the summary)
+//!    and `session_ended`, so no dispatch or session is left dangling, and answers `503` (the
+//!    machine is unreachable), `409` (the runner refused) or `500` (it failed).
+//!
+//! When the session starts working, the runner link calls [`WorkService::dispatch_working`], which
+//! moves the task to in progress.
+//!
+//! **Where it runs.** The machine is the request's `machine`, else the machine of the task's
+//! workstream's first location, else the project's root, else the hub's own machine
+//! ([`WorkService::with_hub_machine`], or the first `local` machine). The folder is the first of
+//! those locations on that machine, or `~` when none is. The engine, model and permission mode come
+//! from the agent's persona (Claude Code by default).
+
+use crate::error::{Result, WorkError};
+use crate::query::{self, TaskRef};
+use crate::service::{WorkService, no_task};
+use pitcrew_protocol::api::Caller;
+use pitcrew_protocol::events::EventBody;
+use pitcrew_protocol::ids::{
+    DispatchId, MachineId, MemberId, PersonaId, SessionId, TaskId, TaskKey, WorkstreamId,
+};
+use pitcrew_protocol::model::{
+    Dispatch, DispatchOutcome, Engine, LinkBasis, Liveness, Location, Machine, MachineKind,
+    MemberKind, PermissionMode, Session, SessionState, Task, TaskStatus,
+};
+use pitcrew_protocol::runner::RunnerCommand;
+use pitcrew_store::sql::Connection;
+use serde::Deserialize;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
+/// `POST /v1/tasks/{id}/dispatch`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct NewDispatch {
+    /// The agent to run.
+    pub agent: MemberId,
+    /// What to tell it first. Defaults to the task's description, or its title.
+    #[serde(default)]
+    pub brief: Option<String>,
+    /// Where to run it. See the [module docs](self) for the default.
+    #[serde(default)]
+    pub machine: Option<MachineId>,
+}
+
+/// What the hub asks the runner link to start for a dispatch. Everything is decided: the runner
+/// starts exactly this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchRequest {
+    /// The dispatch, already recorded (`dispatch_started`).
+    pub dispatch: DispatchId,
+    /// The id the session **must** have. The hub has recorded it (`session_discovered`, state
+    /// `starting`, linked by `dispatch`); the runner reports on it under this id and does not
+    /// discover it again under another.
+    pub session: SessionId,
+    /// The task.
+    pub task: TaskId,
+    /// The task's key, e.g. `PAP-5`.
+    pub key: TaskKey,
+    /// The task's workstream.
+    pub workstream: Option<WorkstreamId>,
+    /// The agent.
+    pub agent: MemberId,
+    /// The agent's owner, whom its events act for.
+    pub owner: Option<MemberId>,
+    /// The machine.
+    pub machine: MachineId,
+    /// The working directory on that machine (`~` for the home directory).
+    pub cwd: String,
+    /// The git branch of the location, when it names one.
+    pub branch: Option<String>,
+    /// The CLI.
+    pub engine: Engine,
+    /// The agent's persona.
+    pub persona: Option<PersonaId>,
+    /// The persona's model.
+    pub model: Option<String>,
+    /// The persona's permission mode.
+    pub permission_mode: PermissionMode,
+    /// The session's name: the task's key and title.
+    pub name: String,
+    /// The first prompt.
+    pub brief: String,
+}
+
+impl DispatchRequest {
+    /// The runner command that starts it.
+    #[must_use]
+    pub fn start_command(&self) -> RunnerCommand {
+        RunnerCommand::StartSession {
+            engine: self.engine,
+            cwd: self.cwd.clone(),
+            name: self.name.clone(),
+            brief: Some(self.brief.clone()),
+            persona: self.persona,
+            model: self.model.clone(),
+            account: None,
+            permission_mode: self.permission_mode,
+        }
+    }
+}
+
+/// Why a dispatched session could not be started.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DispatchError {
+    /// The machine's runner cannot be reached. The route answers `503 unavailable`.
+    #[error("the machine cannot be reached: {0}")]
+    Unavailable(String),
+    /// The runner refused, e.g. a permission mode it does not allow. `409 conflict`.
+    #[error("the runner refused: {0}")]
+    Rejected(String),
+    /// It tried and failed. `500 internal`; the reason is logged and kept as the dispatch's
+    /// summary.
+    #[error("the session failed to start: {0}")]
+    Failed(String),
+}
+
+/// Starts the sessions that dispatches ask for. Stream D's runner link implements it; give it to
+/// the service with [`WorkService::with_dispatcher`].
+///
+/// [`Dispatcher::start`] is called on a blocking thread, after `dispatch_started` and
+/// `session_discovered` are stored and without the service's command lock. It returns once the
+/// runner has **accepted** the start (the program is launching), not when the agent is working;
+/// the runner reports the session's progress as events for [`DispatchRequest::session`], and calls
+/// [`WorkService::dispatch_working`] when it starts working. An error is recorded as a failed
+/// dispatch.
+pub trait Dispatcher: Send + Sync + std::fmt::Debug {
+    /// Starts the session `request` describes.
+    ///
+    /// # Errors
+    ///
+    /// [`DispatchError`]: the machine is unreachable, the runner refused, or the start failed.
+    fn start(&self, request: &DispatchRequest) -> std::result::Result<(), DispatchError>;
+}
+
+/// Everything decided under the lock.
+struct Plan {
+    task: Task,
+    owner: Option<MemberId>,
+    machine: Machine,
+    cwd: String,
+    branch: Option<String>,
+    engine: Engine,
+    persona: Option<PersonaId>,
+    model: Option<String>,
+    permission_mode: PermissionMode,
+    brief: String,
+}
+
+/// Where a task runs by default: its workstream's locations, then its project's root.
+fn locations(conn: &Connection, task: &Task) -> Result<Vec<Location>> {
+    let mut out = match &task.workstream {
+        Some(id) => query::workstream(conn, id)?.map_or_else(Vec::new, |w| w.locations),
+        None => Vec::new(),
+    };
+    if let Some(root) = query::project(conn, &task.project)?.and_then(|p| p.root) {
+        out.push(root);
+    }
+    Ok(out)
+}
+
+impl WorkService {
+    /// Checks a dispatch and decides where it runs. See the [module docs](self).
+    fn plan_dispatch(&self, conn: &Connection, task: &TaskRef, new: &NewDispatch) -> Result<Plan> {
+        let task = query::task(conn, task)?.ok_or_else(|| no_task(task))?;
+        let agent = query::member(conn, &new.agent)?
+            .ok_or_else(|| WorkError::invalid(format!("agent: no member {}.", new.agent)))?;
+        if agent.kind != MemberKind::Agent {
+            return Err(WorkError::invalid(format!(
+                "agent must be an agent; {} is a person.",
+                agent.handle
+            )));
+        }
+        let requested = match &new.machine {
+            Some(id) => Some(
+                query::machine(conn, id)?
+                    .ok_or_else(|| WorkError::invalid(format!("machine: no machine {id}.")))?,
+            ),
+            None => None,
+        };
+        if matches!(task.status, TaskStatus::Done | TaskStatus::Canceled) {
+            let status = crate::codec::enum_text(&task.status).unwrap_or_default();
+            return Err(WorkError::conflict(format!(
+                "{} is {status}; reopen it before dispatching.",
+                task.key
+            )));
+        }
+        let locations = locations(conn, &task)?;
+        let machine = match requested {
+            Some(machine) => machine,
+            None => self.default_machine(conn, &locations)?,
+        };
+        if machine.liveness != Liveness::Live {
+            let liveness = crate::codec::enum_text(&machine.liveness).unwrap_or_default();
+            return Err(WorkError::unavailable(format!(
+                "{} is {liveness}; its runner cannot be reached.",
+                machine.name
+            )));
+        }
+        let place = locations.iter().find(|l| l.machine == machine.id);
+        let persona = match &agent.persona {
+            Some(id) => query::persona(conn, id)?,
+            None => None,
+        };
+        let brief = new
+            .brief
+            .clone()
+            .filter(|b| !b.trim().is_empty())
+            .or_else(|| Some(task.description.clone()).filter(|d| !d.trim().is_empty()))
+            .unwrap_or_else(|| task.title.clone());
+        Ok(Plan {
+            owner: agent.owner,
+            cwd: place.map_or_else(|| "~".to_owned(), |l| l.path.clone()),
+            branch: place.and_then(|l| l.branch.clone()),
+            engine: persona.as_ref().map_or(Engine::Claude, |p| p.engine),
+            persona: persona.as_ref().map(|p| p.id),
+            model: persona.as_ref().and_then(|p| p.model.clone()),
+            permission_mode: persona.map(|p| p.permission_mode).unwrap_or_default(),
+            machine,
+            task,
+            brief,
+        })
+    }
+
+    /// The machine of the first location, else the hub's own machine.
+    fn default_machine(&self, conn: &Connection, locations: &[Location]) -> Result<Machine> {
+        if let Some(location) = locations.first() {
+            return query::machine(conn, &location.machine)?.ok_or_else(|| {
+                WorkError::unavailable(format!(
+                    "The task's folder is on machine {}, which this hub does not know.",
+                    location.machine
+                ))
+            });
+        }
+        let own = match self.hub_machine() {
+            Some(id) => query::machine(conn, &id)?,
+            None => query::machines(conn)?
+                .into_iter()
+                .find(|m| m.kind == MachineKind::Local),
+        };
+        own.ok_or_else(|| {
+            WorkError::unavailable("No machine can run this dispatch: the hub knows none of its own.")
+        })
+    }
+
+    /// Dispatches `task` to an agent: records the dispatch and its session, then starts the
+    /// session through the [`Dispatcher`]. People only. Returns the dispatch as stored.
+    ///
+    /// See the [module docs](self) for the steps and the refusals.
+    ///
+    /// # Errors
+    ///
+    /// `forbidden` for an agent; `not_found` for an unknown task; `invalid` for an unknown agent
+    /// or machine, or a person as the agent; `conflict` for a done or canceled task, or a runner
+    /// that refused; `unavailable` with no dispatcher, no live machine, or an unreachable runner;
+    /// `internal` when the start failed.
+    pub fn dispatch_task(
+        &self,
+        caller: &Caller,
+        task: &TaskRef,
+        new: NewDispatch,
+    ) -> Result<Dispatch> {
+        crate::commands::require_person(caller, "Dispatching a task")?;
+        let dispatcher = self.dispatcher().ok_or_else(|| {
+            WorkError::unavailable("This hub cannot start sessions: it has no runner link.")
+        })?;
+        let request = {
+            let _guard = self.lock();
+            let plan = self.read(|c| self.plan_dispatch(c, task, &new))?;
+            let now = self.now();
+            let task = &plan.task;
+            let session_id = SessionId::new();
+            let dispatch = Dispatch {
+                id: DispatchId::new(),
+                task: task.id,
+                agent: new.agent,
+                session: Some(session_id),
+                brief: plan.brief.clone(),
+                started: now,
+                ended: None,
+                outcome: None,
+                summary: None,
+            };
+            let request = DispatchRequest {
+                dispatch: dispatch.id,
+                session: session_id,
+                task: task.id,
+                key: task.key.clone(),
+                workstream: task.workstream,
+                agent: new.agent,
+                owner: plan.owner,
+                machine: plan.machine.id,
+                cwd: plan.cwd,
+                branch: plan.branch,
+                engine: plan.engine,
+                persona: plan.persona,
+                model: plan.model,
+                permission_mode: plan.permission_mode,
+                name: format!("{} {}", task.key, task.title),
+                brief: plan.brief,
+            };
+            let session = Session {
+                id: request.session,
+                engine: request.engine,
+                // The CLI's own id is the runner's to report, once it knows it.
+                native_id: String::new(),
+                machine: request.machine,
+                cwd: request.cwd.clone(),
+                branch: request.branch.clone(),
+                title: Some(task.title.clone()),
+                agent: Some(request.agent),
+                workstream: task.workstream,
+                task: Some(task.id),
+                link_basis: Some(LinkBasis::Dispatch),
+                state: SessionState::Starting,
+                status_line: None,
+                started: now,
+                last_activity: now,
+                terminal: None,
+                parent: None,
+            };
+            let mut events = Vec::with_capacity(3);
+            if task.assignee.is_none() {
+                events.push(self.by(
+                    caller,
+                    EventBody::TaskAssigned {
+                        task: task.id,
+                        assignee: Some(new.agent),
+                    },
+                ));
+            }
+            events.push(self.by(caller, EventBody::DispatchStarted { dispatch }));
+            events.push(self.by(caller, EventBody::SessionDiscovered { session }));
+            self.append(&events)?;
+            request
+        };
+
+        // A panicking runner link must not leave the dispatch open either.
+        let started = catch_unwind(AssertUnwindSafe(|| dispatcher.start(&request)))
+            .unwrap_or_else(|_| Err(DispatchError::Failed("the runner link panicked".into())));
+        if let Err(error) = started {
+            let _guard = self.lock();
+            self.append(&[
+                self.by(
+                    caller,
+                    EventBody::DispatchFinished {
+                        dispatch: request.dispatch,
+                        outcome: DispatchOutcome::Failed,
+                        summary: Some(format!("The session could not start: {error}.")),
+                    },
+                ),
+                self.by(
+                    caller,
+                    EventBody::SessionEnded {
+                        session: request.session,
+                    },
+                ),
+            ])?;
+            return Err(match error {
+                DispatchError::Unavailable(why) => WorkError::unavailable(format!(
+                    "The session could not start: the machine cannot be reached ({why})."
+                )),
+                DispatchError::Rejected(why) => {
+                    WorkError::conflict(format!("The runner refused to start the session: {why}"))
+                }
+                DispatchError::Failed(why) => WorkError::internal(format!(
+                    "dispatch {} failed to start its session: {why}",
+                    request.dispatch
+                )),
+            });
+        }
+        self.dispatch(&request.dispatch)
+    }
+}

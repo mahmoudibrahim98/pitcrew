@@ -11,13 +11,18 @@
 //! authentication) and the service from `Extension<Arc<WorkService>>` (added by the daemon). Every
 //! failure is an `ApiError` body with its code's status. Database work runs on tokio's blocking
 //! pool.
+//!
+//! Writes check who may make them before they read the body: an agent writing to a task that is
+//! not its own gets `403`, even with a malformed or oversized body.
 
 use crate::commands::{AnswerAsk, BriefEdit, NewAsk, NewComment, NewTask, WorkstreamPatch};
+use crate::dispatch::NewDispatch;
 use crate::error::WorkError;
-use crate::query::{AskFilter, TaskFilter, TaskRef};
-use crate::service::WorkService;
+use crate::query::{AskFilter, SessionFilter, TaskFilter, TaskRef};
+use crate::service::{WorkService, WorkspaceAt};
 use axum::Json;
 use axum::Router;
+use axum::body::Body as RawBody;
 use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request};
 use axum::http::StatusCode;
 use axum::http::header::{CONTENT_TYPE, HeaderName};
@@ -25,9 +30,10 @@ use axum::http::request::Parts;
 use axum::routing::{get, post, put};
 use pitcrew_protocol::api::Caller;
 use pitcrew_protocol::events::{BriefTarget, Event};
-use pitcrew_protocol::ids::{AskId, MemberId, ProjectId, WorkstreamId};
+use pitcrew_protocol::ids::{AskId, MemberId, ProjectId, SessionId, WorkstreamId};
 use pitcrew_protocol::model::{
-    Ask, Brief, Machine, Member, Persona, Project, Subtask, Task, TaskStatus, Team, Workstream,
+    Ask, Brief, Dispatch, Machine, Member, Persona, Project, Session, Subtask, Task, TaskStatus,
+    Team, Workstream,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -63,6 +69,7 @@ where
     S: Clone + Send + Sync + 'static,
 {
     Router::new()
+        .route("/v1/workspace", get(get_workspace))
         .route("/v1/machines", get(list_machines))
         .route("/v1/personas", get(list_personas))
         .route("/v1/teams", get(list_teams))
@@ -75,6 +82,9 @@ where
         )
         .route("/v1/tasks", post(create_task))
         .route("/v1/tasks/{id}/assign", post(assign_task))
+        .route("/v1/tasks/{id}/dispatch", post(dispatch_task))
+        .route("/v1/sessions", get(list_sessions))
+        .route("/v1/sessions/{id}", get(get_session))
         .route("/v1/briefs", get(list_briefs))
         .route("/v1/briefs/{kind}/{id}", put(put_brief))
 }
@@ -204,22 +214,24 @@ impl Params {
     }
 }
 
-/// A JSON body of at most [`MAX_BODY`] bytes. Anything malformed is `400 invalid`; unknown fields
-/// are ignored.
+/// Reads a JSON body of at most [`MAX_BODY`] bytes. Anything malformed is `400 invalid`; unknown
+/// fields are ignored.
+async fn json<T: DeserializeOwned>(body: RawBody) -> Result<T, WorkError> {
+    let bytes = axum::body::to_bytes(body, MAX_BODY)
+        .await
+        .map_err(|_| WorkError::invalid("The body is larger than 1 MiB, or could not be read."))?;
+    serde_json::from_slice(&bytes).map_err(|e| WorkError::invalid(format!("Malformed body: {e}.")))
+}
+
+/// A JSON body, read as soon as the handler runs. For routes whose caller is already known to be
+/// allowed (device routes, where [`Person`] comes first). See [`json`].
 struct Body<T>(T);
 
 impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Body<T> {
     type Rejection = WorkError;
 
     async fn from_request(request: Request, _: &S) -> Result<Self, WorkError> {
-        let bytes = axum::body::to_bytes(request.into_body(), MAX_BODY)
-            .await
-            .map_err(|_| {
-                WorkError::invalid("The body is larger than 1 MiB, or could not be read.")
-            })?;
-        serde_json::from_slice(&bytes)
-            .map(Self)
-            .map_err(|e| WorkError::invalid(format!("Malformed body: {e}.")))
+        json(request.into_body()).await.map(Self)
     }
 }
 
@@ -243,7 +255,17 @@ fn path_id<T: FromStr>(id: &str, what: &str) -> Result<T, WorkError> {
         .map_err(|_| WorkError::not_found(format!("No {what} {id}.")))
 }
 
-// ─── Members, machines, personas, teams ──────────────────────────────────────────────────────────
+/// Checks that `caller` may write to `task` (`404`, then `403`), before the body is read.
+async fn may_write(w: &Arc<WorkService>, caller: Caller, task: &TaskRef) -> Result<(), WorkError> {
+    let task = task.clone();
+    blocking(Arc::clone(w), move |w| w.check_task_write(&caller, &task)).await
+}
+
+// ─── Workspace, members, machines, personas, teams ───────────────────────────────────────────────
+
+async fn get_workspace(Work(w): Work, Person(_): Person) -> Reply<WorkspaceAt> {
+    Ok(Json(blocking(w, WorkService::workspace_at).await?))
+}
 
 async fn me(Work(w): Work, Who(caller): Who) -> Reply<Member> {
     Ok(Json(blocking(w, move |w| w.member(&caller.member)).await?))
@@ -354,9 +376,11 @@ async fn move_task(
     Work(w): Work,
     Who(caller): Who,
     Segments(id): Segments<String>,
-    Body(body): Body<MoveTask>,
+    body: RawBody,
 ) -> Reply<Task> {
     let task = task_ref(&id)?;
+    may_write(&w, caller, &task).await?;
+    let body: MoveTask = json(body).await?;
     Ok(Json(
         blocking(w, move |w| w.move_task(&caller, &task, body.to)).await?,
     ))
@@ -387,9 +411,11 @@ async fn replace_subtasks(
     Work(w): Work,
     Who(caller): Who,
     Segments(id): Segments<String>,
-    Body(subtasks): Body<Vec<Subtask>>,
+    body: RawBody,
 ) -> Reply<Task> {
     let task = task_ref(&id)?;
+    may_write(&w, caller, &task).await?;
+    let subtasks: Vec<Subtask> = json(body).await?;
     Ok(Json(
         blocking(w, move |w| w.replace_subtasks(&caller, &task, subtasks)).await?,
     ))
@@ -399,11 +425,46 @@ async fn post_comment(
     Work(w): Work,
     Who(caller): Who,
     Segments(id): Segments<String>,
-    Body(comment): Body<NewComment>,
+    body: RawBody,
 ) -> Created<Event> {
     let task = task_ref(&id)?;
+    may_write(&w, caller, &task).await?;
+    let comment: NewComment = json(body).await?;
     let event = blocking(w, move |w| w.post_comment(&caller, &task, comment)).await?;
     Ok((StatusCode::CREATED, Json(event)))
+}
+
+/// `202 Accepted`: the dispatch is recorded and its session is starting.
+async fn dispatch_task(
+    Work(w): Work,
+    Person(caller): Person,
+    Segments(id): Segments<String>,
+    Body(new): Body<NewDispatch>,
+) -> Result<(StatusCode, Json<Dispatch>), WorkError> {
+    let task = task_ref(&id)?;
+    let dispatch = blocking(w, move |w| w.dispatch_task(&caller, &task, new)).await?;
+    Ok((StatusCode::ACCEPTED, Json(dispatch)))
+}
+
+// ─── Sessions ────────────────────────────────────────────────────────────────────────────────────
+
+async fn list_sessions(Work(w): Work, Person(_): Person, params: Params) -> Reply<Vec<Session>> {
+    let filter = SessionFilter {
+        machine: params.one("machine")?,
+        workstream: params.one("workstream")?,
+        task: params.one("task")?,
+        states: params.all("state")?,
+    };
+    Ok(Json(blocking(w, move |w| w.sessions(&filter)).await?))
+}
+
+async fn get_session(
+    Work(w): Work,
+    Person(_): Person,
+    Segments(id): Segments<String>,
+) -> Reply<Session> {
+    let id: SessionId = path_id(&id, "session")?;
+    Ok(Json(blocking(w, move |w| w.session(&id)).await?))
 }
 
 // ─── Asks and briefs ─────────────────────────────────────────────────────────────────────────────
@@ -425,9 +486,11 @@ async fn answer_ask(
     Work(w): Work,
     Who(caller): Who,
     Segments(id): Segments<String>,
-    Body(answer): Body<AnswerAsk>,
+    body: RawBody,
 ) -> Reply<Ask> {
     let id: AskId = path_id(&id, "ask")?;
+    blocking(Arc::clone(&w), move |w| w.check_answer(&caller, &id)).await?;
+    let answer: AnswerAsk = json(body).await?;
     Ok(Json(
         blocking(w, move |w| w.answer_ask(&caller, &id, answer)).await?,
     ))
