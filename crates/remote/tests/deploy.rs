@@ -507,7 +507,7 @@ mod unix {
         }
     }
 
-    fn launch_options() -> LaunchOptions {
+    pub(crate) fn launch_options() -> LaunchOptions {
         LaunchOptions {
             ready_timeout: Duration::from_secs(10),
             stop_timeout: Duration::from_secs(5),
@@ -792,7 +792,7 @@ mod unix {
     }
 
     /// The pid of a process that has exited.
-    fn dead_pid() -> u32 {
+    pub(crate) fn dead_pid() -> u32 {
         let mut child = Command::new("true").spawn().unwrap();
         let pid = child.id();
         child.wait().unwrap();

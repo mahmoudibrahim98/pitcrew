@@ -19,14 +19,16 @@ pc_modules=''
 # 1. checks the way to the root and the root itself, as the other launchers do, and moves in;
 # 2. waits until run/slurm.json records this job (PitCrew writes it as soon as sbatch answers),
 #    and ends otherwise, so a job whose submission was cut off does not linger;
-# 3. loads the recipe's modules, starts bin/<current version>/pitcrewd on its socket, waits for
-#    the socket, and writes run/endpoint.json with this node's name and the job id;
-# 4. waits for the helper, passes SIGTERM on to it (scancel, the time limit), and removes the
-#    endpoint and the socket on the way out.
+# 3. refuses while run/endpoint.json records another launcher's helper; loads the recipe's
+#    modules (after checking the set-up script as it checks the root); starts
+#    bin/<current version>/pitcrewd on its socket, waits for the socket, and writes
+#    run/endpoint.json with this node's name and the job id;
+# 4. waits for the helper, passes SIGTERM on to it (scancel, the time limit), and removes what
+#    it made on the way out: the endpoint while it names this job, and the socket it started.
 
 # Functions imported from the environment (bash exports them) must not stand in for tools.
 unset -f awk cat cd chmod command date head hostname id kill ls mkdir mv printf ps pwd \
-  readlink rm rmdir sed sleep test tr umask uname wc 2>/dev/null
+  readlink rm rmdir sed sleep test tr umask uname wait wc 2>/dev/null
 unset IFS ENV BASH_ENV CDPATH
 PATH=$pc_tool_path${PATH:+:$PATH}
 export PATH
@@ -34,7 +36,7 @@ export PATH
 pc_umask=$1
 case $pc_umask in ''|*[!01234567]*) pc_umask=077 ;; esac
 umask 077
-pc_pid= pc_sock= pc_sdir=
+pc_pid= pc_sock= pc_sdir= pc_goal=
 
 pc_fail() {
   printf 'pitcrew: %s: %s\n' "$1" "$2" >&2
@@ -65,7 +67,7 @@ pc_alive() {
   case $pc_pstate in Z*|X*) return 1 ;; esac
 }
 
-# pc_dir_ok DIR: DIR, on the way to the root, is a directory owned by root or this user, and
+# pc_dir_ok DIR: DIR, on the way to $pc_goal, is a directory owned by root or this user, and
 # writable by the group or others only if sticky (as /tmp). Anyone else could rename what is
 # under it after the checks.
 pc_dir_ok() {
@@ -73,27 +75,28 @@ pc_dir_ok() {
   pc_m=${pc_ls%% *} pc_u=${pc_ls#* }
   case $pc_m in
     d*) ;;
-    *) pc_fail unsafe_dir "$1, on the way to $pc_root, is not a directory" ;;
+    *) pc_fail unsafe_dir "$1, on the way to $pc_goal, is not a directory" ;;
   esac
   case $pc_u in
     0|"$pc_me") ;;
-    *) pc_fail unsafe_dir "$1, on the way to $pc_root, belongs to uid $pc_u, who could replace what is under it" ;;
+    *) pc_fail unsafe_dir "$1, on the way to $pc_goal, belongs to uid $pc_u, who could replace what is under it" ;;
   esac
   case $pc_m in
     ?????w*|????????w*)
       case $pc_m in
         ?????????[tT]*) ;;
-        *) pc_fail unsafe_dir "$1, on the way to $pc_root, is writable by others ($pc_m)" ;;
+        *) pc_fail unsafe_dir "$1, on the way to $pc_goal, is writable by others ($pc_m)" ;;
       esac
       ;;
   esac
 }
 
 # pc_safe_way PATH: resolves PATH's parent one component at a time, as the kernel does, and
-# checks every directory it goes through, from / down. A symbolic link is followed, and the way
-# to where it points is checked the same way; the directory holding the link already was.
+# checks every directory it goes through, from / down. A symbolic link must belong to root or
+# this user (in a sticky directory its owner could swap it); it is followed, and the way to
+# where it points is checked the same way. The directory holding the link already was.
 pc_safe_way() {
-  pc_rest=${1%/*} pc_at= pc_hops=0
+  pc_goal=$1 pc_rest=${1%/*} pc_at= pc_hops=0
   pc_dir_ok /
   while [ -n "$pc_rest" ]; do
     pc_rest=${pc_rest#/}
@@ -107,8 +110,13 @@ pc_safe_way() {
     if [ -L "$pc_next" ]; then
       pc_hops=$((pc_hops + 1))
       if [ "$pc_hops" -gt 40 ]; then
-        pc_fail unsafe_dir "too many symbolic links on the way to $pc_root"
+        pc_fail unsafe_dir "too many symbolic links on the way to $pc_goal"
       fi
+      pc_u=$(ls -ldn "$pc_next" 2>/dev/null | awk '{print $3}')
+      case $pc_u in
+        0|"$pc_me") ;;
+        *) pc_fail unsafe_dir "the link $pc_next, on the way to $pc_goal, belongs to uid $pc_u" ;;
+      esac
       pc_target=$(readlink "$pc_next") || pc_fail unsafe_dir "cannot read the link $pc_next"
       case $pc_target in /*) pc_at= ;; esac
       pc_rest=/$pc_target$pc_rest
@@ -142,14 +150,50 @@ pc_private() {
   esac
 }
 
-# Only what this job made: the endpoint while it names this job, the socket, its directory.
+# pc_safe_file FILE: FILE (a script this job sources), and the way to it, belong to root or this
+# user and are writable by no one else, as the way to the root; a symbolic link is followed, and
+# must be theirs too.
+pc_safe_file() {
+  pc_file=$1 pc_fhops=0
+  while :; do
+    pc_safe_way "$pc_file"
+    pc_ls=$(ls -ldn "$pc_file" 2>/dev/null | awk '{print $1, $3}')
+    pc_m=${pc_ls%% *} pc_u=${pc_ls#* }
+    case $pc_u in
+      0|"$pc_me") ;;
+      *) pc_fail unsafe_file "$pc_file belongs to uid $pc_u, who could change what this job runs" ;;
+    esac
+    case $pc_m in
+      l*)
+        pc_fhops=$((pc_fhops + 1))
+        if [ "$pc_fhops" -gt 40 ]; then pc_fail unsafe_file "too many symbolic links to $1"; fi
+        pc_target=$(readlink "$pc_file") || pc_fail unsafe_file "cannot read the link $pc_file"
+        case $pc_target in /*) pc_file=$pc_target ;; *) pc_file=${pc_file%/*}/$pc_target ;; esac
+        ;;
+      -????w*|-???????w*) pc_fail unsafe_file "$pc_file is writable by others ($pc_m)" ;;
+      -*) return 0 ;;
+      *) pc_fail unsafe_file "$pc_file is not a regular file" ;;
+    esac
+  done
+}
+
+# Only what this job made: the endpoint while it names this job, the socket of the helper it
+# started, and the socket's directory.
 pc_cleanup() {
   if [ -n "$pc_pid" ] && pc_alive "$pc_pid"; then kill -TERM "$pc_pid" 2>/dev/null; fi
   case $(head -n 1 run/endpoint.json 2>/dev/null) in
     *',"job":'"$pc_job"'}') rm -f run/endpoint.json ;;
   esac
-  if [ -n "$pc_sock" ] && [ -S "$pc_sock" ]; then rm -f "$pc_sock"; fi
+  if [ -n "$pc_pid" ] && [ -n "$pc_sock" ] && [ -S "$pc_sock" ]; then rm -f "$pc_sock"; fi
   if [ -n "$pc_sdir" ]; then rmdir "$pc_sdir" 2>/dev/null; fi
+}
+# Exits on these run the cleanup; SIGUSR1 and SIGUSR2 (--signal) do not end the job.
+pc_traps() {
+  trap pc_cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap : USR1 USR2
 }
 
 pc_job=${SLURM_JOB_ID:-}
@@ -166,7 +210,7 @@ pc_private .
 pc_phys=$(pwd -P)
 pc_private run
 chmod 600 "run/slurm-$pc_job.out" 2>/dev/null
-trap pc_cleanup EXIT
+pc_traps
 pc_private bin
 pc_ver=$(readlink bin/current 2>/dev/null)
 case $pc_ver in
@@ -196,16 +240,25 @@ while :; do
   sleep 1
 done
 
-# 3. This node's name as the login node reaches it: SLURM's name for it, else its own.
+# 3. Not while another launcher's helper is recorded: it shares run/ and its socket, and may run
+# on another host, where it cannot be checked from here.
+case $(head -n 1 run/endpoint.json 2>/dev/null) in
+  *'"launcher":"slurm",'*) ;;
+  *'"launcher":"'*)
+    pc_fail in_use "run/endpoint.json records a helper another launcher started; stop it first" ;;
+esac
+
+# This node's name as the login node reaches it: SLURM's name for it, else its own.
 pc_name_ok() {
   case $1 in
     ''|-*|*[!0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._-]*) return 1 ;;
   esac
+  [ "${#1}" -le 64 ]
 }
 pc_node=${SLURMD_NODENAME:-}
 pc_name_ok "$pc_node" || pc_node=$(hostname -f 2>/dev/null)
 pc_name_ok "$pc_node" || pc_node=$(uname -n 2>/dev/null)
-pc_name_ok "$pc_node" || pc_fail host "this node has no name of plain characters to be reached by"
+pc_name_ok "$pc_node" || pc_fail host "this node has no name of at most 64 plain characters to be reached by"
 
 # The socket: in run/, or on the node's own disk ($TMPDIR, else /tmp).
 case $pc_socket in
@@ -218,24 +271,31 @@ case $pc_socket in
     case $pc_tmp in
       *[!0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._/+-]*) pc_tmp=/tmp ;;
     esac
-    pc_sdir=${pc_tmp%/}/pitcrew-$pc_job.$$
-    pc_safe_way "$pc_sdir"
-    pc_private "$pc_sdir"
+    pc_dir=${pc_tmp%/}/pitcrew-$pc_job.$$
+    pc_safe_way "$pc_dir"
+    pc_private "$pc_dir"
+    pc_sdir=$pc_dir
     pc_sock=$pc_sdir/pitcrewd.sock
     ;;
-  *) pc_sock=$pc_root/run/pitcrewd.sock ;;
+  *)
+    pc_sock=$pc_root/run/pitcrewd.sock
+    # No other launcher's helper is recorded (above): a socket here is an earlier job's.
+    if [ -S "$pc_sock" ]; then rm -f "$pc_sock"; fi
+    ;;
 esac
 if [ "${#pc_sock}" -gt 100 ]; then
   pc_fail usage "the socket path $pc_sock is longer than 100 bytes"
 fi
-if [ -S "$pc_sock" ]; then rm -f "$pc_sock"; fi
 
-# The recipe's modules. A set-up script may change the shell's settings: they are reset after.
+# The recipe's modules. The set-up script is checked as the way to the root is; it may change
+# the shell's settings and traps, which are reset after.
 if [ -n "$pc_modules_init" ]; then
   if [ ! -f "$pc_modules_init" ]; then pc_fail modules "there is no $pc_modules_init"; fi
+  pc_safe_file "$pc_modules_init"
   . "$pc_modules_init"
   set +eu
   unset IFS
+  pc_traps
 fi
 if [ -n "$pc_modules" ]; then
   command -v module >/dev/null 2>&1 \

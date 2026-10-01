@@ -19,22 +19,31 @@
 //!
 //! **On the login node**, `helper.sh` (the script of the other launchers, under the same launch
 //! lock, after the same checks of the way to the root) takes the job script from stdin, checks
-//! that it arrived whole (its length, first lines and last line), unsets `SBATCH_*` variables
-//! (which would override its directives), and runs `sbatch --parsable` under `umask 077`, with
+//! that it arrived whole and unchanged (its length, first lines, last line and sha256), and
+//! refuses while another launcher's helper uses the root. It unsets the `SBATCH_*`, `SQUEUE_*`,
+//! `SCANCEL_*` and `SACCT_*` variables (which would override the directives, hide a job from
+//! `squeue -j`, or make scancel ask or skip), and runs `sbatch --parsable` under `umask 077`, with
 //! the job name, working directory (the root) and output (`run/slurm-<id>.out`) on the command
-//! line too. It records the job in `run/slurm.json` at once.
+//! line too. It reads the job id from sbatch's standard output only, keeps the cluster sbatch
+//! names (`<id>;<cluster>`, then asked about with `-M`), and records the job in `run/slurm.json`
+//! at once.
 //!
 //! **On the compute node** the job checks the way to the root and the root as the launchers do,
-//! waits for that record (so a job whose submission was cut off ends on its own), loads the
-//! recipe's modules, and starts `bin/<current>/pitcrewd serve --listen unix:<socket>` with the
-//! user's umask. Once the socket is there it writes `run/endpoint.json`, with `host` the node
-//! (`SLURMD_NODENAME`, else `hostname -f`) and `job` its id. On SIGTERM (`scancel`, or the time
-//! limit) it stops the helper, and removes the endpoint and the socket.
+//! waits for that record (so a job whose submission was cut off ends on its own), and ends
+//! without touching anything while `endpoint.json` records another launcher's helper. It checks
+//! the recipe's module set-up script as it checks the root (the file and the way to it belong
+//! to root or the user, and no one else can write them), loads the modules, and starts
+//! `bin/<current>/pitcrewd serve --listen unix:<socket>` with the user's umask. Once the socket
+//! is there it writes `run/endpoint.json`, with `host` the node (`SLURMD_NODENAME`, else
+//! `hostname -f`) and `job` its id. On SIGTERM (`scancel`, or the time limit) it stops the
+//! helper, and removes the endpoint and the socket it started; SIGUSR1 and SIGUSR2 do not end
+//! it.
 //!
 //! **Whose job:** a job id is acted on only while `squeue` lists it with the recorded name and
-//! this user's uid (`%j`, `%U`). An id that names any other job (reused after the cluster's
-//! state was lost, say) is reported as [`JobState::NotOurs`] and never cancelled; PitCrew only
-//! forgets its own record of it.
+//! this user's uid (`%j`, `%U`), and scancel is given that name and uid too. An id that names any
+//! other job (reused after the cluster's state was lost, say) is reported as
+//! [`JobState::NotOurs`] and never cancelled; PitCrew only forgets its own record of it. sacct
+//! is asked only for records with that name and uid, and prints no names.
 //!
 //! **Bounds:** squeue is asked at most every 2 seconds while waiting for a start, every second
 //! while waiting for a cancelled job to leave the queue, and each call is bounded by the
@@ -137,6 +146,9 @@ pub struct SlurmStatus {
     pub job_name: Option<String>,
     /// When it was submitted (by the login node's clock).
     pub submitted: Option<TimestampMs>,
+    /// The cluster sbatch named in its answer (`<id>;<cluster>`), which squeue, scancel and
+    /// sacct are then asked about with `-M`; `None` for the default cluster.
+    pub cluster: Option<String>,
     /// What the scheduler says.
     pub state: JobState,
     /// Time left before the time limit (`squeue %L`); for a pending job, the whole limit.
@@ -521,6 +533,7 @@ fn parse_status(report: &Report) -> Result<SlurmStatus, HelperError> {
             job: None,
             job_name: None,
             submitted: None,
+            cluster: None,
             state: JobState::NoJob,
             time_left: None,
             time_limit: None,
@@ -580,6 +593,7 @@ fn parse_status(report: &Report) -> Result<SlurmStatus, HelperError> {
         job: Some(job),
         job_name: report.get("name").map(str::to_owned),
         submitted: report.get("submitted").and_then(|s| s.parse().ok()),
+        cluster: report.get("cluster").map(str::to_owned),
         state,
         time_left: report
             .get("left")

@@ -43,6 +43,7 @@ pc_log=run/pitcrewd.log
 pc_held=
 pc_mine=
 pc_tmp=
+pc_tmp2=
 
 pc_say() { printf '%s=%s\n' "$1" "$2"; }
 # One line of at most 400 bytes, for details that quote command output.
@@ -93,6 +94,7 @@ pc_started_at() {
 
 pc_cleanup() {
   if [ -n "$pc_tmp" ]; then rm -f "$pc_tmp"; fi
+  if [ -n "$pc_tmp2" ]; then rm -f "$pc_tmp2"; fi
   # Never a lock this run lost: the owner is checked right before removing it.
   if [ -n "$pc_held" ] && pc_owns "$pc_held"; then rm -rf "$pc_held"; fi
 }
@@ -128,7 +130,7 @@ esac
 
 # --- The way to the root ------------------------------------------------------------------
 
-# pc_dir_ok DIR: DIR, on the way to the root, is a directory owned by root or this user, and
+# pc_dir_ok DIR: DIR, on the way to $pc_goal, is a directory owned by root or this user, and
 # writable by the group or others only if sticky (as /tmp). Anyone else could rename what is
 # under it after the checks.
 pc_dir_ok() {
@@ -136,27 +138,28 @@ pc_dir_ok() {
   pc_m=${pc_ls%% *} pc_u=${pc_ls#* }
   case $pc_m in
     d*) ;;
-    *) pc_fail unsafe_dir "$1, on the way to $pc_root, is not a directory" ;;
+    *) pc_fail unsafe_dir "$1, on the way to $pc_goal, is not a directory" ;;
   esac
   case $pc_u in
     0|"$pc_me") ;;
-    *) pc_fail unsafe_dir "$1, on the way to $pc_root, belongs to uid $pc_u, who could replace what is under it" ;;
+    *) pc_fail unsafe_dir "$1, on the way to $pc_goal, belongs to uid $pc_u, who could replace what is under it" ;;
   esac
   case $pc_m in
     ?????w*|????????w*)
       case $pc_m in
         ?????????[tT]*) ;;
-        *) pc_fail unsafe_dir "$1, on the way to $pc_root, is writable by others ($pc_m)" ;;
+        *) pc_fail unsafe_dir "$1, on the way to $pc_goal, is writable by others ($pc_m)" ;;
       esac
       ;;
   esac
 }
 
 # pc_safe_way PATH: resolves PATH's parent one component at a time, as the kernel does, and
-# checks every directory it goes through, from / down. A symbolic link is followed, and the way
-# to where it points is checked the same way; the directory holding the link already was.
+# checks every directory it goes through, from / down. A symbolic link must belong to root or
+# this user (in a sticky directory its owner could swap it); it is followed, and the way to
+# where it points is checked the same way. The directory holding the link already was.
 pc_safe_way() {
-  pc_rest=${1%/*} pc_at= pc_hops=0
+  pc_goal=$1 pc_rest=${1%/*} pc_at= pc_hops=0
   pc_dir_ok /
   while [ -n "$pc_rest" ]; do
     pc_rest=${pc_rest#/}
@@ -170,8 +173,13 @@ pc_safe_way() {
     if [ -L "$pc_next" ]; then
       pc_hops=$((pc_hops + 1))
       if [ "$pc_hops" -gt 40 ]; then
-        pc_fail unsafe_dir "too many symbolic links on the way to $pc_root"
+        pc_fail unsafe_dir "too many symbolic links on the way to $pc_goal"
       fi
+      pc_u=$(ls -ldn "$pc_next" 2>/dev/null | awk '{print $3}')
+      case $pc_u in
+        0|"$pc_me") ;;
+        *) pc_fail unsafe_dir "the link $pc_next, on the way to $pc_goal, belongs to uid $pc_u" ;;
+      esac
       pc_target=$(readlink "$pc_next") || pc_fail unsafe_dir "cannot read the link $pc_next"
       case $pc_target in /*) pc_at= ;; esac
       pc_rest=/$pc_target$pc_rest
@@ -731,23 +739,47 @@ pc_stop() {
 #
 # The helper as a batch job on a compute node (see slurm/mod.rs). run/slurm.json records the
 # job PitCrew submitted, as one line:
-#   {"job":<id>,"name":"<job name>","submitted":<ms>,"host":"<host it was submitted from>"}
-# A job is acted on only while squeue shows it under that id, with that name and this user's
-# uid. An id that names any other job (reused after a cluster restart, say) is never touched.
+#   {"job":<id>,"name":"<job name>","submitted":<ms>,"host":"<submitted from>","cluster":"<c>"}
+# (the cluster only when sbatch named one: the job is then asked about with -M <c>). A job is
+# acted on only while squeue shows it under that id, with that name and this user's uid. An id
+# that names any other job (reused after a cluster restart, say) is never touched.
 
 pc_rec=run/slurm.json
 
-# Reads run/slurm.json into pc_rjob, pc_rname and pc_rsub. Fails when there is none, or it is
-# not in the form pc_slurm_submit writes.
+# Variables that change what sbatch, squeue, scancel and sacct do: SBATCH_* override the job
+# script's directives, SQUEUE_STATES and its kin filter even `squeue -j`, SCANCEL_* can make
+# scancel ask or skip, SACCT_* change sacct's output. Unset, so each does what its command line
+# says.
+pc_slurm_env() {
+  for pc_v in $(env | sed -n \
+    -e 's/^\(SBATCH_[ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_]*\)=.*$/\1/p' \
+    -e 's/^\(SQUEUE_[ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_]*\)=.*$/\1/p' \
+    -e 's/^\(SCANCEL_[ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_]*\)=.*$/\1/p' \
+    -e 's/^\(SACCT_[ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_]*\)=.*$/\1/p'); do
+    unset "$pc_v"
+  done
+}
+
+# pc_on TOOL ARGS...: runs a SLURM tool on the recorded job's cluster, if sbatch named one.
+pc_on() {
+  pc_t=$1
+  shift
+  if [ -n "$pc_rcl" ]; then "$pc_t" -M "$pc_rcl" "$@"; else "$pc_t" "$@"; fi
+}
+
+# Reads run/slurm.json into pc_rjob, pc_rname, pc_rsub and pc_rcl. Fails when there is none, or
+# it is not in the form pc_slurm_submit writes.
 pc_job_recorded() {
-  pc_rjob= pc_rname= pc_rsub=
+  pc_rjob= pc_rname= pc_rsub= pc_rcl=
   if [ ! -f "$pc_rec" ] || [ -L "$pc_rec" ]; then return 1; fi
-  pc_fields=$(head -n 1 "$pc_rec" 2>/dev/null | sed -n 's/^{"job":\([0123456789][0123456789]*\),"name":"\([0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._+-]*\)","submitted":\([0123456789]*\),.*$/\1 \2 \3/p')
+  pc_rline=$(head -n 1 "$pc_rec" 2>/dev/null)
+  pc_fields=$(printf '%s\n' "$pc_rline" | sed -n 's/^{"job":\([0123456789][0123456789]*\),"name":"\([0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._+-]*\)","submitted":\([0123456789]*\),.*$/\1 \2 \3/p')
   if [ -z "$pc_fields" ]; then return 1; fi
   pc_rjob=${pc_fields%% *}
   pc_fields=${pc_fields#* }
   pc_rname=${pc_fields%% *}
   pc_rsub=${pc_fields#* }
+  pc_rcl=$(printf '%s\n' "$pc_rline" | sed -n 's/^.*,"cluster":"\([0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._-]*\)"}$/\1/p')
   [ -n "$pc_rname" ]
 }
 
@@ -767,7 +799,7 @@ pc_terminal() {
 #   gone     squeue no longer knows it;
 #   error    squeue failed (pc_qerr): the scheduler may be unreachable, so nothing is concluded.
 pc_queue() {
-  pc_qout=$(squeue -h -j "$1" -o '%i|%U|%T|%r|%L|%l|%N|%j' 2>&1)
+  pc_qout=$(pc_on squeue -h -j "$1" -o '%i|%U|%T|%r|%L|%l|%N|%j' 2>&1)
   pc_qrc=$?
   pc_qerr= pc_qowner= pc_qstate= pc_qreason= pc_qleft= pc_qlimit= pc_qnode= pc_qname=
   # The job's own line. Its name comes last, since it may hold anything.
@@ -816,22 +848,18 @@ pc_queue() {
 }
 
 # pc_acct ID: how the recorded job ID ended, from sacct where there is one: pc_astate (e.g.
-# FAILED, CANCELLED by 1000) and pc_aexit (code:signal). Only a record with the recorded name
-# and this user's uid counts; with several (an id reused), the last one.
+# FAILED, CANCELLED by 1000) and pc_aexit (code:signal). sacct itself keeps only records with
+# the recorded name and this user's uid, and prints no names, which could carry a forged line;
+# with several (an id reused), the last one counts.
 pc_acct() {
   pc_astate= pc_aexit=
   command -v sacct >/dev/null 2>&1 || return 1
-  pc_aout=$(sacct -n -X -P -j "$1" -o JobID,UID,State,ExitCode,JobName 2>/dev/null) || return 1
-  pc_aline=$(printf '%s\n' "$pc_aout" | awk -F '|' -v id="$1" -v uid="$pc_me" -v name="$pc_rname" '
-    $1 == id && $2 == uid {
-      n = $0
-      for (i = 1; i <= 4; i++) sub(/^[^|]*[|]/, "", n)
-      if (n == name) last = $0
-    }
-    END { print last }')
+  pc_aout=$(pc_on sacct -n -X -P -j "$1" --name="$pc_rname" -u "$pc_me" \
+    -o JobID,State,ExitCode 2>/dev/null) || return 1
+  pc_aline=$(printf '%s\n' "$pc_aout" | awk -F '|' -v id="$1" 'NF == 3 && $1 == id { last = $0 } END { print last }')
   if [ -z "$pc_aline" ]; then return 1; fi
-  pc_astate=$(printf '%s\n' "$pc_aline" | cut -d '|' -f 3)
-  pc_aexit=$(printf '%s\n' "$pc_aline" | cut -d '|' -f 4)
+  pc_astate=$(printf '%s\n' "$pc_aline" | cut -d '|' -f 2)
+  pc_aexit=$(printf '%s\n' "$pc_aline" | cut -d '|' -f 3)
 }
 
 # pc_endpoint_of JOB: whether endpoint.json was written by job JOB (see pc_recorded).
@@ -848,6 +876,7 @@ pc_job_report() {
   pc_say job "$pc_rjob"
   pc_say name "$pc_rname"
   pc_say submitted "$pc_rsub"
+  pc_say cluster "$pc_rcl"
   pc_say queue "$pc_q"
   case $pc_q in
     ours)
@@ -927,8 +956,13 @@ pc_slurm_submit() {
   pc_private run
   pc_lock run/.lock "$1" "$2"
   pc_sweep_aside run/.lock
-  # The job script comes first, whatever happens next: it is used whole or not at all.
+  pc_slurm_env
+  # What a submit that was killed left behind: nothing else writes these but under the lock.
   pc_still_locked
+  for pc_f in run/job.*.sh run/sbatch.err.* "$pc_rec".tmp.*; do
+    if [ -e "$pc_f" ] || [ -L "$pc_f" ]; then rm -f "$pc_f"; fi
+  done
+  # The job script comes first, whatever happens next: it is used whole or not at all.
   pc_tmp=run/job.$pc_tag.sh
   if pc_err=$( (set -C; cat > "$pc_tmp") 2>&1 ); then :; else
     pc_fail io "cannot write $(pc_where "$pc_tmp"): $pc_err"
@@ -955,6 +989,22 @@ pc_slurm_submit() {
     # Gone, ended, or someone else's job now: forgotten, never touched.
     pc_forget "$pc_rjob"
   fi
+  # The other launchers share run/ and its socket: not while one of their helpers runs, here
+  # or on another host sharing this home. A record of one that is gone is left over.
+  if pc_recorded && [ "$pc_elauncher" != slurm ]; then
+    pc_takeover=0
+    pc_state
+    case $? in
+      0) pc_fail in_use "the $pc_elauncher launcher's helper runs here (pid $pc_epid); stop it first" ;;
+      2)
+        pc_say host "$pc_ehost"
+        pc_fail other_host "the $pc_elauncher launcher's helper is recorded on $pc_ehost"
+        ;;
+    esac
+    pc_still_locked
+    rm -f "$pc_ep" "$pc_pidf"
+    if [ -S run/pitcrewd.sock ]; then rm -f run/pitcrewd.sock; fi
+  fi
   pc_ver=$(readlink bin/current 2>/dev/null)
   case $pc_ver in
     [0123456789]*) ;;
@@ -967,33 +1017,44 @@ pc_slurm_submit() {
   if [ ! -f "bin/$pc_ver/pitcrewd" ] || [ ! -x "bin/$pc_ver/pitcrewd" ]; then
     pc_fail not_deployed "$(pc_where "bin/$pc_ver/pitcrewd")"
   fi
-  # SBATCH_* variables would override the script's directives: what the user saw is what runs.
-  for pc_v in $(env | sed -n 's/^\(SBATCH_[ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_]*\)=.*$/\1/p'); do
-    unset "$pc_v"
-  done
   # The name, directory and output again on the command line, where nothing overrides them.
   # Under umask 077, so the job's output file is private; the job gets the user's umask as
   # its argument, for the helper.
   pc_still_locked
+  pc_tmp2=run/sbatch.err.$pc_tag
   pc_out=$(sbatch --parsable --job-name="$pc_name" --chdir="$pc_root" \
-    --output="$pc_root/run/slurm-%j.out" "$pc_tmp" "$pc_umask" 2>&1)
+    --output="$pc_root/run/slurm-%j.out" "$pc_tmp" "$pc_umask" 2>"$pc_tmp2")
   pc_rc=$?
-  # `<id>` or `<id>;<cluster>`, after any warnings.
-  pc_jid=$(printf '%s\n' "$pc_out" | sed -n 's/;.*$//; /^[0123456789][0123456789]*$/p' | tail -n 1)
+  # On stdout, `<id>` or `<id>;<cluster>`; warnings go to stderr.
+  pc_jid=$(printf '%s\n' "$pc_out" | sed -n \
+    -e '/^[0123456789][0123456789]*$/p' \
+    -e '/^[0123456789][0123456789]*;[0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._-][0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._-]*$/p' \
+    | tail -n 1)
   if [ "$pc_rc" -ne 0 ] || [ -z "$pc_jid" ]; then
-    pc_fail submit_failed "$(printf '%s\n' "$pc_out" | tail -n 3)"
+    pc_fail submit_failed "$(tail -n 3 "$pc_tmp2" 2>/dev/null) $(printf '%s\n' "$pc_out" | tail -n 1)"
   fi
+  pc_rcl=
+  case $pc_jid in
+    *';'*)
+      pc_rcl=${pc_jid#*";"}
+      pc_jid=${pc_jid%%";"*}
+      ;;
+  esac
   # Recorded at once: the job waits for this record and ends on its own without it.
-  pc_rsub=$(date +%s)000
-  pc_line=$(printf '{"job":%s,"name":"%s","submitted":%s,"host":"%s"}' \
+  pc_now=$(date +%s)
+  case $pc_now in ''|*[!0123456789]*) pc_fail io "date +%s printed '$pc_now'" ;; esac
+  pc_rsub=${pc_now}000
+  pc_line=$(printf '{"job":%s,"name":"%s","submitted":%s,"host":"%s"' \
     "$pc_jid" "$pc_name" "$pc_rsub" "$pc_host")
+  if [ -n "$pc_rcl" ]; then pc_line=$pc_line$(printf ',"cluster":"%s"' "$pc_rcl"); fi
+  pc_line=$pc_line'}'
   pc_still_locked
   if printf '%s\n' "$pc_line" > "$pc_rec.tmp.$pc_tag" && mv -f "$pc_rec.tmp.$pc_tag" "$pc_rec"; then :; else
     rm -f "$pc_rec.tmp.$pc_tag"
     pc_fail io "cannot write $(pc_where "$pc_rec")"
   fi
-  rm -f "$pc_tmp"
-  pc_tmp=
+  rm -f "$pc_tmp" "$pc_tmp2"
+  pc_tmp= pc_tmp2=
   pc_rjob=$pc_jid pc_rname=$pc_name
   pc_say started 1
   pc_slurm_wait "$pc_ready"
@@ -1002,6 +1063,7 @@ pc_slurm_submit() {
 # pc_slurm_status: what is installed, and what the recorded job is doing. Takes no lock and
 # changes nothing.
 pc_slurm_status() {
+  pc_slurm_env
   if pc_enter 0; then
     if [ -e run ] || [ -L run ]; then pc_private run; fi
     pc_say installed "$(readlink bin/current 2>/dev/null)"
@@ -1024,15 +1086,17 @@ pc_slurm_stop() {
   pc_lock run/.lock "$1" "$2"
   pc_sweep_aside run/.lock
   if ! pc_job_recorded; then pc_end; fi
+  pc_slurm_env
   pc_need squeue scancel
   pc_queue "$pc_rjob"
   if [ "$pc_q" = error ]; then pc_fail slurm "$pc_qerr"; fi
   if [ "$pc_q" = ours ] && ! pc_terminal "$pc_qstate"; then
     if pc_endpoint_of "$pc_rjob"; then pc_say pid "$pc_epid"; fi
     pc_still_locked
-    pc_cout=$(scancel "$pc_rjob" 2>&1)
+    # The name and owner again, for scancel itself to check.
+    pc_cout=$(pc_on scancel --user="$pc_me" --name="$pc_rname" "$pc_rjob" 2>&1)
     pc_crc=$?
-    pc_say cancelled 1
+    if [ "$pc_crc" -eq 0 ]; then pc_say cancelled 1; else pc_say scancel_error "$(pc_flat "$pc_cout")"; fi
     pc_deadline=$(($(date +%s) + $3))
     while :; do
       pc_queue "$pc_rjob"

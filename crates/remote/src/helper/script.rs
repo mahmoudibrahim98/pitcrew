@@ -98,6 +98,7 @@ impl Report {
             "start_failed" => HelperError::StartFailed(detail),
             "stop_failed" => HelperError::StopFailed(detail),
             "slurm" | "no_slurm" => HelperError::Slurm(detail),
+            "in_use" => HelperError::InUse(detail),
             "submit_failed" => HelperError::SubmitFailed(detail),
             "job_script" => HelperError::UnexpectedOutput(detail),
             other => HelperError::Remote(format!("{other}: {detail}")),
@@ -263,6 +264,7 @@ mod tests {
         assert!(matches!(r.error("busy"), HelperError::Busy(d) if d == "x"));
         assert!(matches!(r.error("slurm"), HelperError::Slurm(d) if d == "x"));
         assert!(matches!(r.error("no_slurm"), HelperError::Slurm(d) if d == "x"));
+        assert!(matches!(r.error("in_use"), HelperError::InUse(d) if d == "x"));
         assert!(matches!(r.error("submit_failed"), HelperError::SubmitFailed(d) if d == "x"));
         assert!(matches!(r.error("job_script"), HelperError::UnexpectedOutput(d) if d == "x"));
         assert!(matches!(r.error("io"), HelperError::Remote(d) if d == "io: x"));

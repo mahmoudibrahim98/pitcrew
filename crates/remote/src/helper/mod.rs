@@ -178,6 +178,10 @@ pub enum HelperError {
     /// The helper outlived SIGKILL, or its batch job did not leave the queue in time.
     #[error("the helper did not stop: {0}")]
     StopFailed(String),
+    /// Another launcher's helper uses this root (and its socket), here or on another host: stop
+    /// it first.
+    #[error("in use: {0}")]
+    InUse(String),
     /// A SLURM command is missing, or failed: squeue could not say what the job is doing
     /// (the scheduler may be unreachable), so nothing was concluded or changed.
     #[error("SLURM: {0}")]

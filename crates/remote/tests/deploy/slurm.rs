@@ -13,8 +13,8 @@ use crate::unix::{
 use pitcrew_protocol::model::Scheduler;
 use pitcrew_remote::helper::slurm::{self, Cancelled, JobExit, LastHop, Site, SocketPlace};
 use pitcrew_remote::{
-    HelperError, HelperState, JobOptions, JobScript, JobSpec, JobState, LaunchOptions, Launcher,
-    SlurmLauncher, SshError, Stopped, Target, deploy,
+    DirectLauncher, Endpoint, HelperError, HelperState, JobOptions, JobScript, JobSpec, JobState,
+    LaunchOptions, Launcher, SlurmLauncher, SshError, Stopped, Target, deploy,
 };
 use serde::{Deserialize, Serialize};
 use std::io::Write as _;
@@ -62,6 +62,11 @@ struct Config {
     overlap: bool,
     /// What `sinfo -h -o %P` prints.
     partitions: Vec<String>,
+    /// Jobs go to this cluster (sbatch answers `<id>;<cluster>`), and squeue, scancel and
+    /// sacct see them only when asked with `-M <cluster>`.
+    cluster: Option<String>,
+    /// scancel fails with this message.
+    scancel_error: Option<String>,
 }
 
 impl Default for Config {
@@ -79,6 +84,8 @@ impl Default for Config {
             kill_wait: 3,
             overlap: true,
             partitions: vec!["batch*".to_owned(), "gpu".to_owned()],
+            cluster: None,
+            scancel_error: None,
         }
     }
 }
@@ -109,6 +116,14 @@ struct FakeJob {
     env: Vec<(String, String)>,
     /// Its `#SBATCH` lines, as sbatch read them.
     directives: Vec<String>,
+    /// The cluster it went to, if not the default one.
+    #[serde(default)]
+    cluster: Option<String>,
+}
+
+/// Whether a tool asked with `args` (`-M <cluster>` or not) sees `job`.
+fn on_its_cluster(job: &FakeJob, args: &[String]) -> bool {
+    value(args, "-M") == job.cluster.as_deref()
 }
 
 fn now() -> u64 {
@@ -320,18 +335,22 @@ fn sbatch(dir: &Path, config: &Config, args: &[String]) -> ExitCode {
             .filter(|(k, _)| k != SLURM_ENV && k != DIR_ENV)
             .collect(),
         directives,
+        cluster: config.cluster.clone(),
     };
     save(dir, &job);
     if config.start {
         start_job(dir, config, id);
     }
-    // A warning first, as real sites often print: the id must still be found.
+    // A warning first, as real sites often print, then the id; then a number on stderr that
+    // only a reader of both streams would take for the id.
     eprintln!("sbatch: warning: this is a fake SLURM");
-    if parsable {
-        println!("{id}");
-    } else {
-        println!("Submitted batch job {id}");
+    match (parsable, &config.cluster) {
+        (true, Some(cluster)) => println!("{id};{cluster}"),
+        (true, None) => println!("{id}"),
+        (false, _) => println!("Submitted batch job {id}"),
     }
+    std::io::stdout().flush().unwrap();
+    eprintln!("{}", id + 1000);
     ExitCode::SUCCESS
 }
 
@@ -439,10 +458,21 @@ fn squeue(dir: &Path, config: &Config, args: &[String]) -> ExitCode {
     }
     let id: u64 = value(args, "-j").unwrap().parse().unwrap();
     let format = value(args, "-o").unwrap();
-    let Some(job) = try_load(dir, id).filter(|j| config.keep_ended || !terminal(&j.state)) else {
+    let Some(job) = try_load(dir, id)
+        .filter(|j| config.keep_ended || !terminal(&j.state))
+        .filter(|j| on_its_cluster(j, args))
+    else {
         eprintln!("slurm_load_jobs error: Invalid job id specified");
         return ExitCode::from(1);
     };
+    // As real squeue: SQUEUE_STATES filters even jobs asked for by id.
+    if let Ok(states) = std::env::var("SQUEUE_STATES")
+        && !states
+            .split(',')
+            .any(|s| s.eq_ignore_ascii_case(&job.state))
+    {
+        return ExitCode::SUCCESS;
+    }
     let limit = job.limit.map_or_else(|| "UNLIMITED".to_owned(), slurm_time);
     let left = match (job.limit, job.started) {
         (None, _) => "UNLIMITED".to_owned(),
@@ -473,12 +503,29 @@ fn squeue(dir: &Path, config: &Config, args: &[String]) -> ExitCode {
 }
 
 #[allow(clippy::zombie_processes)]
-fn scancel(dir: &Path, _config: &Config, args: &[String]) -> ExitCode {
+fn scancel(dir: &Path, config: &Config, args: &[String]) -> ExitCode {
     let id: u64 = args.last().unwrap().parse().unwrap();
-    let Some(mut job) = try_load(dir, id) else {
+    let Some(mut job) = try_load(dir, id).filter(|j| on_its_cluster(j, args)) else {
         eprintln!("scancel: error: Kill job error on job id {id}: Invalid job id specified");
         return ExitCode::from(1);
     };
+    if let Some(error) = &config.scancel_error {
+        eprintln!("{error}");
+        return ExitCode::from(1);
+    }
+    // As real scancel: the filters given, and those in the environment, restrict what it
+    // cancels; with SCANCEL_INTERACTIVE it asks first (and reads no answer here).
+    let filter = |name: &str| {
+        args.iter()
+            .find_map(|a| a.strip_prefix(&format!("--{name}=")))
+    };
+    let skip = filter("user").is_some_and(|u| u != job.uid.to_string())
+        || filter("name").is_some_and(|n| n != job.name)
+        || std::env::var("SCANCEL_STATE").is_ok_and(|s| !s.eq_ignore_ascii_case(&job.state))
+        || std::env::var_os("SCANCEL_INTERACTIVE").is_some();
+    if skip {
+        return ExitCode::SUCCESS;
+    }
     match job.state.as_str() {
         "PENDING" => {
             job.state = "CANCELLED".to_owned();
@@ -519,7 +566,13 @@ fn sacct(dir: &Path, config: &Config, args: &[String]) -> ExitCode {
     }
     let id: u64 = value(args, "-j").unwrap().parse().unwrap();
     let fields = value(args, "-o").unwrap();
-    if let Some(job) = try_load(dir, id) {
+    let name = args.iter().find_map(|a| a.strip_prefix("--name="));
+    let user = value(args, "-u");
+    let job = try_load(dir, id)
+        .filter(|j| on_its_cluster(j, args))
+        .filter(|j| name.is_none_or(|n| n == j.name))
+        .filter(|j| user.is_none_or(|u| u == j.uid.to_string()));
+    if let Some(job) = job {
         let (code, signal) = job.exit.unwrap_or((0, 0));
         let line: Vec<String> = fields
             .split(',')
@@ -679,8 +732,8 @@ fn job_scripts_left(m: &Machine) -> Vec<String> {
 }
 
 /// A site whose `module` command comes from a set-up script in the machine's directory, which
-/// logs what it loads to `loaded.log` and fails for `broken/…`. The script also changes `IFS`,
-/// as a careless one might.
+/// logs what it loads to `loaded.log` and fails for `broken/…`. The script also changes `IFS`
+/// and the shell's traps, as a careless one might.
 fn module_site(m: &Machine, socket: SocketPlace) -> Site {
     let init = m.dir.path().join("modules-init.sh");
     let log = m.dir.path().join("loaded.log");
@@ -691,7 +744,9 @@ fn module_site(m: &Machine, socket: SocketPlace) -> Site {
              \x20 case $2 in broken/*) echo \"module: $2 not found\" >&2; return 1 ;; esac\n\
              \x20 printf '%s\\n' \"$*\" >> '{}'\n\
              }}\n\
-             IFS=:\n",
+             IFS=:\n\
+             trap - EXIT HUP INT TERM\n\
+             trap '' USR1 USR2\n",
             log.display()
         ),
     )
@@ -713,11 +768,16 @@ fn slurm_submit_pending_running_stop() {
         start: false,
         ..Config::default()
     });
-    // Variables a user's profile may set, which would override the script's directives.
+    // Variables a user's profile may set: they would override the script's directives, hide
+    // the pending job from squeue -j, or make scancel ask, or skip the running job.
     for (name, value) in [
         ("SBATCH_PARTITION", "debug"),
         ("SBATCH_JOB_NAME", "impostor"),
         ("SBATCH_EXPORT", "NONE"),
+        ("SQUEUE_STATES", "RUNNING"),
+        ("SCANCEL_STATE", "PENDING"),
+        ("SCANCEL_INTERACTIVE", "1"),
+        ("SACCT_FORMAT", "JobName"),
     ] {
         m.env.push((name.to_owned(), value.to_owned()));
     }
@@ -767,7 +827,15 @@ fn slurm_submit_pending_running_stop() {
             fake.directives
         );
     }
-    assert!(fake.env.iter().all(|(k, _)| !k.starts_with("SBATCH_")));
+    for family in ["SBATCH_", "SQUEUE_", "SCANCEL_", "SACCT_"] {
+        assert!(
+            fake.env.iter().all(|(k, _)| !k.starts_with(family)),
+            "{family}"
+        );
+    }
+    // sim.job(id) found the job: the id came from sbatch's stdout, not the number it printed
+    // on stderr after it. No cluster was named.
+    assert_eq!(status.cluster, None);
     // Its record, private like everything else; no copy of the script is left.
     let record = read(&m.run_dir().join("slurm.json"));
     assert!(
@@ -861,7 +929,14 @@ fn slurm_submit_pending_running_stop() {
             })
         }
     );
-    assert_eq!(sim.calls("scancel"), [[id.to_string()]]);
+    assert_eq!(
+        sim.calls("scancel"),
+        [[
+            format!("--user={}", fake.uid),
+            format!("--name={}", script.job_name()),
+            id.to_string()
+        ]]
+    );
     eventually("the helper to be gone", || !alive(e.pid));
     for gone in ["slurm.json", "endpoint.json", "pitcrewd.sock"] {
         assert!(!m.run_dir().join(gone).exists(), "{gone}");
@@ -1019,6 +1094,24 @@ fn slurm_failures_are_clear() {
     assert!(m.run_dir().join("slurm.json").exists());
     assert!(alive(again.endpoint.pid));
     sim.set(|c| c.squeue_error = None);
+
+    // scancel fails and the job stays: stop says why, and keeps the record.
+    sim.set(|c| {
+        c.scancel_error =
+            Some("scancel: error: Kill job error on job id 1: Access/permission denied".to_owned());
+    });
+    let hasty = SlurmLauncher::new(LaunchOptions {
+        stop_timeout: Duration::from_secs(1),
+        ..options()
+    });
+    let err = block_on(hasty.cancel(&target)).unwrap_err();
+    assert!(
+        matches!(&err, HelperError::Slurm(d) if d.contains("Access/permission denied")),
+        "{err:?}"
+    );
+    assert!(m.run_dir().join("slurm.json").exists());
+    assert!(alive(again.endpoint.pid));
+    sim.set(|c| c.scancel_error = None);
     assert!(block_on(launcher.cancel(&target)).unwrap().cancelled);
 
     // A job that does not leave the queue in time: stop says so, and keeps the record, so
@@ -1027,10 +1120,6 @@ fn slurm_failures_are_clear() {
     block_on(deploy(&target, &stubborn, &quick())).unwrap();
     sim.set(|c| c.kill_wait = 4);
     let started = block_on(launcher.start(&target)).unwrap();
-    let hasty = SlurmLauncher::new(LaunchOptions {
-        stop_timeout: Duration::from_secs(1),
-        ..options()
-    });
     let err = block_on(hasty.cancel(&target)).unwrap_err();
     assert!(
         matches!(&err, HelperError::StopFailed(d) if d.contains("still COMPLETING")),
@@ -1113,18 +1202,19 @@ fn slurm_never_touches_other_jobs() {
     let launcher = launcher(&render(&target, &slurm::generic(), &JobOptions::default()));
 
     // The recorded id now names another user's running job (the cluster lost its state and
-    // numbered jobs again, say).
+    // numbered jobs again, say), with the same name: the name is easy to guess, the uid is
+    // what tells them apart.
     let id = block_on(launcher.submit(&target)).unwrap().job;
+    let name = sim.job(id).name;
     let mut theirs = sim.job(id);
     theirs.uid += 1;
-    theirs.name = "someone-elses-job".to_owned();
     theirs.state = "RUNNING".to_owned();
     theirs.node = "node018".to_owned();
     sim.save(&theirs);
     let status = block_on(launcher.job_status(&target)).unwrap();
     let not_ours = JobState::NotOurs {
         uid: theirs.uid,
-        name: "someone-elses-job".to_owned(),
+        name: name.clone(),
     };
     assert_eq!(status.state, not_ours);
     assert_eq!(
@@ -1146,6 +1236,43 @@ fn slurm_never_touches_other_jobs() {
     assert_eq!(sim.job(id).state, "RUNNING");
     assert!(!m.run_dir().join("slurm.json").exists());
 
+    // Another user's job, under another name too.
+    let id = block_on(launcher.submit(&target)).unwrap().job;
+    let mut theirs = sim.job(id);
+    theirs.uid += 1;
+    theirs.name = "someone-elses-job".to_owned();
+    sim.save(&theirs);
+    let cancelled = block_on(launcher.cancel(&target)).unwrap();
+    assert!(
+        matches!(&cancelled.state, JobState::NotOurs { name, .. } if name == "someone-elses-job")
+    );
+    assert!(!cancelled.cancelled);
+    assert!(sim.calls("scancel").is_empty());
+
+    // Another user's job whose name carries a line that looks like PitCrew's own job: squeue
+    // then lists the id twice, and nothing is concluded or done.
+    let id = block_on(launcher.submit(&target)).unwrap().job;
+    let mut forged = sim.job(id);
+    forged.uid += 1;
+    forged.state = "RUNNING".to_owned();
+    forged.name = format!(
+        "x\n{id}|{}|RUNNING|None|1:00:00|1:00:00|node017|{name}",
+        forged.uid - 1
+    );
+    sim.save(&forged);
+    for err in [
+        block_on(launcher.job_status(&target)).unwrap_err(),
+        block_on(launcher.cancel(&target)).unwrap_err(),
+    ] {
+        assert!(
+            matches!(&err, HelperError::Slurm(d) if d.contains("more than once")),
+            "{err:?}"
+        );
+    }
+    assert!(sim.calls("scancel").is_empty());
+    assert!(m.run_dir().join("slurm.json").exists());
+    std::fs::remove_file(m.run_dir().join("slurm.json")).unwrap();
+
     // The user's own job under that id, but with another name, is not ours either; starting
     // submits a new job and leaves it be.
     let id = block_on(launcher.submit(&target)).unwrap().job;
@@ -1160,9 +1287,16 @@ fn slurm_never_touches_other_jobs() {
     assert!(fresh.submitted_now);
     assert_ne!(fresh.job, id);
     assert_eq!(sim.job(id).state, "PENDING");
-    // Only the new job, PitCrew's own, is cancelled.
+    // Only the new job, PitCrew's own, is cancelled, scancel told its name and owner too.
     assert!(block_on(launcher.cancel(&target)).unwrap().cancelled);
-    assert_eq!(sim.calls("scancel"), [[fresh.job.to_string()]]);
+    assert_eq!(
+        sim.calls("scancel"),
+        [[
+            format!("--user={}", mine.uid),
+            format!("--name={name}"),
+            fresh.job.to_string()
+        ]]
+    );
     assert_eq!(sim.job(id).state, "PENDING");
 }
 
@@ -1263,6 +1397,48 @@ fn slurm_recipes_add_lines_and_modules() {
         matches!(&err, HelperError::StartFailed(d) if d.contains("changed the working directory")),
         "{err:?}"
     );
+
+    // The set-up script is checked as the way to the root is: one others can change is never
+    // sourced, nor one in a directory they can write; a link of the user's is followed.
+    let good = site.modules_init.clone().unwrap();
+    let writable = m.dir.path().join("writable-init.sh");
+    std::fs::copy(&good, &writable).unwrap();
+    std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o664)).unwrap();
+    let open = m.dir.path().join("open");
+    std::fs::create_dir(&open).unwrap();
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let in_open = open.join("init.sh");
+    std::fs::copy(&good, &in_open).unwrap();
+    std::fs::set_permissions(&in_open, std::fs::Permissions::from_mode(0o644)).unwrap();
+    for (init, why) in [
+        (&writable, "is writable by others (-rw-rw-r--"),
+        (&in_open, "on the way to"),
+    ] {
+        let unsafe_init = Site {
+            modules_init: Some(init.to_str().unwrap().to_owned()),
+            ..site.clone()
+        };
+        let script = render(&target, &unsafe_init, &JobOptions::default());
+        let err = block_on(launcher(&script).start(&target)).unwrap_err();
+        assert!(
+            matches!(&err, HelperError::StartFailed(d) if d.contains("unsafe_") && d.contains(why)),
+            "{}: {err:?}",
+            init.display()
+        );
+    }
+    std::fs::remove_file(m.dir.path().join("loaded.log")).unwrap();
+    let link = m.dir.path().join("link-init.sh");
+    std::os::unix::fs::symlink(&good, &link).unwrap();
+    let linked = Site {
+        modules_init: Some(link.to_str().unwrap().to_owned()),
+        ..site.clone()
+    };
+    let script = render(&target, &linked, &JobOptions::default());
+    block_on(launcher(&script).start(&target)).unwrap();
+    assert_eq!(
+        read(&m.dir.path().join("loaded.log")),
+        "load example-toolchain/1.0\nload nodejs/22\n"
+    );
     block_on(launcher(&script).cancel(&target)).unwrap();
 }
 
@@ -1315,6 +1491,21 @@ fn slurm_socket_on_node_local_tmpdir() {
         // The job removes what it made on the node.
         eventually("the socket's directory to go", || !dir.exists());
     }
+
+    // A $TMPDIR others can write to (not sticky): refused, and said so about the right path;
+    // nothing is made or removed there.
+    let open = m.dir.path().join("open-tmp");
+    std::fs::create_dir(&open).unwrap();
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+    sim.set(|c| c.tmpdir = Some(open.clone()));
+    let err = block_on(launcher.start(&target)).unwrap_err();
+    let want = format!("on the way to {}/pitcrew-", open.display());
+    assert!(
+        matches!(&err, HelperError::StartFailed(d) if d.contains(&want) && d.contains("writable by others")),
+        "{err:?}"
+    );
+    assert_eq!(std::fs::read_dir(&open).unwrap().count(), 0);
+    block_on(launcher.cancel(&target)).unwrap();
 }
 
 /// A start-up file that eats stdin, or a connection that drops or garbles the job script: the
@@ -1408,6 +1599,117 @@ fn slurm_probe_finds_the_tools() {
     assert!(slurm::check_tools(tools, LastHop::SrunOverlap).is_err());
 }
 
+/// The other launchers share the root's `run/` and its socket: a SLURM job never starts over
+/// one of their helpers, and never touches its socket or records.
+fn slurm_never_overlaps_another_launcher() {
+    let (m, sim) = machine(Config {
+        start: false,
+        ..Config::default()
+    });
+    let target = m.plain();
+    block_on(deploy(&target, &helper("1.0.0"), &quick())).unwrap();
+    let launcher = launcher(&render(&target, &slurm::generic(), &JobOptions::default()));
+    let direct = DirectLauncher::new(crate::unix::launch_options());
+    let socket = PathBuf::from(m.layout().socket());
+    let endpoint = m.run_dir().join("endpoint.json");
+
+    // The direct launcher's helper runs here: no job is submitted.
+    let running = block_on(direct.start(&target)).unwrap().endpoint;
+    let record = read(&endpoint);
+    let err = block_on(launcher.submit(&target)).unwrap_err();
+    assert!(
+        matches!(&err, HelperError::InUse(d) if d.contains("direct launcher's helper runs here")),
+        "{err:?}"
+    );
+    assert!(sim.calls("sbatch").is_empty());
+    assert!(alive(running.pid));
+    assert!(socket.exists());
+    assert_eq!(read(&endpoint), record);
+    block_on(direct.stop(&target)).unwrap();
+
+    // Recorded on another host sharing the home: not either.
+    let elsewhere = Endpoint {
+        host: "hpc-login2".to_owned(),
+        ..running.clone()
+    };
+    std::fs::write(
+        &endpoint,
+        format!("{}\n", serde_json::to_string(&elsewhere).unwrap()),
+    )
+    .unwrap();
+    let err = block_on(launcher.submit(&target)).unwrap_err();
+    assert!(
+        matches!(&err, HelperError::OtherHost(h) if h == "hpc-login2"),
+        "{err:?}"
+    );
+    assert!(sim.calls("sbatch").is_empty());
+
+    // A record of one that is gone is left over: the job is submitted, and the record goes.
+    let gone = Endpoint {
+        pid: crate::unix::dead_pid(),
+        host: running.host.clone(),
+        ..running.clone()
+    };
+    std::fs::write(
+        &endpoint,
+        format!("{}\n", serde_json::to_string(&gone).unwrap()),
+    )
+    .unwrap();
+    let id = block_on(launcher.submit(&target)).unwrap().job;
+    assert!(!endpoint.exists());
+
+    // The direct launcher starts while the job waits in the queue: when the job then runs, it
+    // finds that helper recorded and ends without touching it, its socket or its record.
+    let running = block_on(direct.start(&target)).unwrap().endpoint;
+    let record = read(&endpoint);
+    sim.release(id);
+    eventually("the job to fail", || sim.job(id).state == "FAILED");
+    let out = read(&m.run_dir().join(format!("slurm-{id}.out")));
+    assert!(
+        out.contains("records a helper another launcher started"),
+        "{out}"
+    );
+    assert!(alive(running.pid));
+    assert!(
+        std::fs::symlink_metadata(&socket)
+            .unwrap()
+            .file_type()
+            .is_socket()
+    );
+    assert_eq!(read(&endpoint), record);
+    let stopped = block_on(direct.stop(&target)).unwrap();
+    assert_eq!(stopped.pid, Some(running.pid));
+    eventually("the direct helper to be gone", || !alive(running.pid));
+    block_on(launcher.cancel(&target)).unwrap();
+}
+
+/// A job sbatch puts on a named cluster (`<id>;<cluster>`) is asked about there (`-M`).
+fn slurm_jobs_on_a_named_cluster() {
+    let (m, sim) = machine(Config {
+        cluster: Some("example-cluster".to_owned()),
+        ..Config::default()
+    });
+    let target = m.plain();
+    block_on(deploy(&target, &helper("1.0.0"), &quick())).unwrap();
+    let launcher = launcher(&render(&target, &slurm::generic(), &JobOptions::default()));
+    let started = block_on(launcher.start(&target)).unwrap();
+    let id = started.endpoint.job.unwrap();
+    let status = block_on(launcher.job_status(&target)).unwrap();
+    assert!(status.ready(), "{status:?}");
+    assert_eq!(status.cluster.as_deref(), Some("example-cluster"));
+    assert!(read(&m.run_dir().join("slurm.json")).ends_with(",\"cluster\":\"example-cluster\"}\n"));
+    // Submitting again finds the same job there, rather than submitting another.
+    assert!(!block_on(launcher.submit(&target)).unwrap().submitted_now);
+    let cancelled = block_on(launcher.cancel(&target)).unwrap();
+    assert!(cancelled.cancelled);
+    assert!(matches!(&cancelled.state, JobState::Ended { state: Some(s), .. } if s == "CANCELLED"));
+    for call in sim.calls("squeue").iter().chain(&sim.calls("scancel")) {
+        assert_eq!(&call[..2], ["-M", "example-cluster"], "{call:?}");
+    }
+    assert_eq!(sim.calls("sbatch").len(), 1);
+    assert_eq!(sim.job(id).state, "CANCELLED");
+}
+
 /// A job with modules and a node-local socket, run by each POSIX shell as the machine's `sh`.
 fn slurm_under_every_posix_sh() {
     let mut checked = Vec::new();
@@ -1436,6 +1738,18 @@ fn slurm_under_every_posix_sh() {
         );
         let status = block_on(launcher.job_status(&target)).unwrap();
         assert!(status.ready(), "{}: {status:?}", shell.display());
+        // SIGUSR1 and SIGUSR2 (sbatch --signal) do not end the job, though the set-up script
+        // tried to make the shell ignore them, and the helper does not get them.
+        let id = started.endpoint.job.unwrap();
+        let job_shell = sim.job(id).pgid.unwrap();
+        for signal in [rustix::process::Signal::USR1, rustix::process::Signal::USR2] {
+            let pid = rustix::process::Pid::from_raw(i32::try_from(job_shell).unwrap()).unwrap();
+            rustix::process::kill_process(pid, signal).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(alive(job_shell), "{}", shell.display());
+        assert!(alive(started.endpoint.pid), "{}", shell.display());
+        assert_eq!(sim.job(id).state, "RUNNING", "{}", shell.display());
         let cancelled = block_on(launcher.cancel(&target)).unwrap();
         assert!(cancelled.cancelled, "{}", shell.display());
         eventually("the helper to be gone", || !alive(started.endpoint.pid));
@@ -1475,5 +1789,13 @@ pub(crate) const CASES: &[(&str, fn())] = &[
         slurm_scripts_arrive_whole_or_not_at_all,
     ),
     ("slurm_probe_finds_the_tools", slurm_probe_finds_the_tools),
+    (
+        "slurm_never_overlaps_another_launcher",
+        slurm_never_overlaps_another_launcher,
+    ),
+    (
+        "slurm_jobs_on_a_named_cluster",
+        slurm_jobs_on_a_named_cluster,
+    ),
     ("slurm_under_every_posix_sh", slurm_under_every_posix_sh),
 ];
