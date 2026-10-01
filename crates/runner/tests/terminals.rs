@@ -175,7 +175,8 @@ fn setup() -> Setup {
     let terminals = runner.terminals_with(runtime.clone(), options()).unwrap();
     terminals.link(session, terminal).unwrap();
     let config = TerminalConfig {
-        poll_every: Duration::from_millis(2),
+        poll_min: Duration::from_millis(2),
+        poll_max: Duration::from_millis(20),
         max_frame: 8,
         ..TerminalConfig::default()
     };
@@ -383,6 +384,48 @@ async fn exit_is_sent_after_the_last_output() {
         assert_eq!(read_bytes(&mut socket, 3), b"bye");
         assert_eq!(read_text(&mut socket), serde_json::json!({"type": "exit"}));
         assert_eq!(read_close(&mut socket), CloseCode::Normal);
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_clients_share_one_terminal_and_each_sees_the_exit() {
+    let s = setup();
+    let addr = serve(s.app.clone()).await;
+    let token = s.tokens.device.clone();
+    let (runtime, terminal, session) = (s.runtime.clone(), s.terminal, s.session);
+    tokio::task::spawn_blocking(move || {
+        let path = format!("/v1/sessions/{session}/terminal");
+        let mut first = connect(addr, &token, &path);
+        let mut second = connect(addr, &token, &path);
+        runtime.write(terminal, b"shared ").unwrap();
+        let mut seen = [read_bytes(&mut first, 7), read_bytes(&mut second, 7)];
+
+        // Both type; their keystrokes are written in arrival order, and both see both.
+        first
+            .send(Message::Binary(b"one ".to_vec().into()))
+            .unwrap();
+        wait_for("the first input", || {
+            output(&runtime, terminal).ends_with(b"one ")
+        });
+        second
+            .send(Message::Binary(b"two".to_vec().into()))
+            .unwrap();
+        seen[0].extend(read_bytes(&mut first, 7));
+        seen[1].extend(read_bytes(&mut second, 7));
+        assert_eq!(output(&runtime, terminal), b"shared one two");
+        assert_eq!(seen[0], b"shared one two");
+        assert_eq!(seen[1], b"shared one two");
+
+        // Each attachment settles the exit on its own, after the last output.
+        runtime.write(terminal, b"!").unwrap();
+        runtime.kill(terminal).unwrap();
+        for socket in [&mut first, &mut second] {
+            assert_eq!(read_bytes(socket, 1), b"!");
+            assert_eq!(read_text(socket), serde_json::json!({"type": "exit"}));
+            assert_eq!(read_close(socket), CloseCode::Normal);
+        }
     })
     .await
     .unwrap();

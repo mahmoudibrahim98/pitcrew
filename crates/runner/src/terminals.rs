@@ -11,7 +11,9 @@
 //!   pool that is full, gives `Unavailable` instead of a hang;
 //! - **`exited()` is true only once all output is readable:** the program has ended and the end
 //!   of its output stayed where it was for [`TerminalOptions::exit_settle`] (a runtime may still
-//!   be draining the last bytes when it notices the exit);
+//!   be draining the last bytes when it notices the exit). Each `attach()` gets its own settle
+//!   state: two attachments to one session's terminal each wait out the settle time themselves,
+//!   and neither's calls move the other's;
 //! - a terminal that disappears counts as ended: `exited()` is true and reads return nothing.
 //!
 //! The optional `changes()` push hint is not provided: the `Runtime` trait has no change

@@ -7,8 +7,9 @@
 //!   matches;
 //! - two workstreams tied for the best match link neither: the runner does not guess.
 //!
-//! Links made by a dispatch, by the agent claiming its task, by a person, or at import are never
-//! overridden; the runner only replaces its own `folder` and `branch` links.
+//! Links made by a dispatch, by the agent claiming its task, by a person, or at import
+//! (`dispatch`, `claimed`, `manual` and `imported`) are never overridden; the runner only
+//! replaces its own `folder` and `branch` links.
 
 use crate::derive::Linked;
 use pitcrew_protocol::ids::{MachineId, SessionId, WorkstreamId};
