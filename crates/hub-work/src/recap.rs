@@ -28,7 +28,10 @@
 //! and paragraphs, so they are always the current names.
 //!
 //! A `task_created` that the tasks projection refused (its key was taken, see "One writer") is not
-//! activity here either: it is left out, so a task the hub never had never shows in a recap.
+//! activity here either: it is left out, so a task the hub never had never shows in a recap. So
+//! the index reads no further than the tasks projection has applied; when another process appended
+//! without the work model's projections, the rest waits until this store's next append catches
+//! them up.
 //!
 //! # Day paragraphs are cached
 //!
@@ -41,6 +44,7 @@
 
 use crate::codec::sql_rev;
 use crate::error::{Result, WorkError};
+use crate::projection::Tasks;
 use crate::service::WorkService;
 use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{EventId, ProjectId, SessionId, TaskId, WorkstreamId};
@@ -52,7 +56,7 @@ use pitcrew_protocol::recap::{
 use pitcrew_recap::{
     BlockBuilder, Config, Directory, RuleSummarizer, block_line, date_of, day_recaps,
 };
-use pitcrew_store::sql::{Connection, params};
+use pitcrew_store::sql::{Connection, OptionalExtension, params};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::Hash;
 use std::ops::Bound;
@@ -699,19 +703,27 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
-/// The `task_created` events between `from` and `to` (inclusive) that the tasks projection
-/// refused because another task held their key.
-fn refused_task_creations(conn: &Connection, from: u64, to: u64) -> Result<HashSet<u64>> {
+/// What the tasks projection says about revisions `from..=to`, in one snapshot: the revision it
+/// has applied up to, and the `task_created` events up to there that it refused because another
+/// task held their key. Past that revision it has not decided yet.
+fn task_clashes(conn: &Connection, from: u64, to: u64) -> Result<(u64, HashSet<u64>)> {
+    let reached: Option<i64> = conn
+        .prepare_cached("SELECT rev FROM projection_state WHERE name = ?1")?
+        .query_row([Tasks::NAME], |r| r.get(0))
+        .optional()?;
+    let reached = reached.and_then(|r| u64::try_from(r).ok()).unwrap_or(0);
     let mut stmt =
         conn.prepare_cached("SELECT rev FROM work_task_clashes WHERE rev BETWEEN ?1 AND ?2")?;
-    let rows = stmt.query_map(params![sql_rev(from), sql_rev(to)], |r| r.get::<_, i64>(0))?;
-    let mut out = HashSet::new();
+    let rows = stmt.query_map(params![sql_rev(from), sql_rev(to.min(reached))], |r| {
+        r.get::<_, i64>(0)
+    })?;
+    let mut refused = HashSet::new();
     for rev in rows {
         if let Ok(rev) = u64::try_from(rev?) {
-            out.insert(rev);
+            refused.insert(rev);
         }
     }
-    Ok(out)
+    Ok((reached, refused))
 }
 
 /// A service's recap index and the last revision it has read.
@@ -733,6 +745,11 @@ impl Default for RecapSync {
 impl RecapSync {
     /// Reads the log after `rev`, a page at a time, into the index. A page is applied whole or
     /// not at all, so an error leaves the index where it was, ready to read the same page again.
+    ///
+    /// Only up to the revision the tasks projection has applied: before that, whether a
+    /// `task_created` was refused is not known (another process may append without the work
+    /// model's projections; this store's next append catches them up). The rest waits for a later
+    /// query, so the index never takes in an event a rebuild would leave out.
     fn catch_up(&mut self, work: &WorkService) -> Result<()> {
         loop {
             let page = work.store().since(self.rev, SYNC_PAGE)?;
@@ -740,16 +757,26 @@ impl RecapSync {
                 return Ok(());
             };
             let (first, last) = (first.rev, last.rev);
-            let refused = work.read(|c| refused_task_creations(c, first, last))?;
-            let full = page.len() >= SYNC_PAGE;
+            let (reached, refused) = work.read(|c| task_clashes(c, first, last))?;
+            let upto = last.min(reached);
+            if upto < first {
+                tracing::debug!(
+                    rev = self.rev,
+                    tasks = reached,
+                    "the tasks projection is behind the log; recaps wait for it"
+                );
+                return Ok(());
+            }
+            let more = page.len() >= SYNC_PAGE && upto == last;
             let events: Vec<Event> = page
                 .into_iter()
+                .take_while(|e| e.rev <= upto)
                 .filter(|e| !refused.contains(&e.rev))
                 .map(|e| e.event)
                 .collect();
             self.recaps.push(&events);
-            self.rev = last;
-            if !full {
+            self.rev = upto;
+            if !more {
                 return Ok(());
             }
         }
@@ -757,8 +784,9 @@ impl RecapSync {
 }
 
 impl WorkService {
-    /// Brings the recap index up to date with the log and returns the last revision it reflects.
-    /// The first call builds it from the whole log.
+    /// Brings the recap index up to date with the log and returns the last revision it reflects:
+    /// the log's newest, or the tasks projection's when that lags (see the
+    /// [module docs](crate::recap)). The first call builds it from the whole log.
     ///
     /// Queries do this themselves (see the [module docs](crate::recap)); call it on the blocking
     /// pool at start to build the index before the first request, rather than during it.

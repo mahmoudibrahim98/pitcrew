@@ -718,6 +718,63 @@ fn refused_task_creations_are_left_out() {
     assert!(page.blocks.is_empty() && page.at_start);
 }
 
+/// Whether a `task_created` was refused is known only once the tasks projection has applied it. A
+/// process without the work model's projections appends work and a refused task creation: the
+/// index waits at the projection's revision rather than take the creation in, and once this
+/// store's next append catches the projections up, it leaves the creation out, as a rebuild does.
+#[test]
+fn a_lagging_tasks_projection_holds_the_index_back() {
+    let world = World::new(1, 2, 4, 2);
+    let mut ids = Ids::default();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let work = WorkService::new(open_store(dir.path()), world.workspace.clone());
+    let setup = world.setup(&mut ids, T0 - 86_400_000);
+    work.store().append(&setup).expect("append");
+    // A tool run, a new task with task 0's key (kind 17 with the flag), another tool run.
+    let theirs = gen_events(
+        &[
+            (0, 0, 0, false, 0),
+            (17, 0, 0, true, 60_000),
+            (0, 0, 1, false, 60_000),
+        ],
+        &world,
+        &mut ids,
+        T0,
+    );
+    let EventBody::TaskCreated { task } = &theirs[1].body else {
+        panic!("a task creation");
+    };
+    let refused_id = task.id;
+    {
+        let bare = Store::open(dir.path().join("hub.db"), StoreOptions::default())
+            .expect("open without projections");
+        bare.append(&theirs).expect("append");
+    }
+    let setup_rev = setup.len() as u64;
+    assert_eq!(work.store().latest_rev().expect("rev"), setup_rev + 3);
+    assert!(refused(&work).is_empty(), "the projection has not seen it");
+    assert_eq!(work.sync_recaps().expect("sync"), setup_rev);
+    let waiting = all_blocks(&work, &BlockFilter::default(), 50);
+    let theirs_ids: HashSet<EventId> = theirs.iter().map(|e| e.id).collect();
+    assert!(waiting.iter().all(|b| !theirs_ids.contains(&b.block.last)));
+
+    // This store's next append catches the projections up: the creation is refused, and left out.
+    let ours = gen_events(&[(4, 1, 0, false, 0)], &world, &mut ids, T0 + 180_000);
+    work.store().append(&ours).expect("append");
+    assert_eq!(refused(&work).len(), 1);
+    let latest = work.store().latest_rev().expect("rev");
+    assert_eq!(work.sync_recaps().expect("sync"), latest);
+    let got = all_blocks(&work, &BlockFilter::default(), 50);
+    assert!(got.iter().all(|b| !b.block.tasks.contains(&refused_id)));
+    assert!(got.iter().any(|b| theirs_ids.contains(&b.block.last)));
+    assert_eq!(
+        got,
+        Oracle::new(&log_events(&work)).blocks(&BlockFilter::default())
+    );
+    let rebuilt = WorkService::new(Arc::clone(work.store()), world.workspace.clone());
+    assert_eq!(all_blocks(&rebuilt, &BlockFilter::default(), 50), got);
+}
+
 /// Each query reads the log from where the index left off: appends by this store, by another
 /// connection to the same file (another process), and between two queries all show up, once.
 #[test]
