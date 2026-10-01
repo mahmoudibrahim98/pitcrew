@@ -153,24 +153,49 @@ decides:
 - **The lease.** A lease file next to the database, `<db>.lease` (e.g. `store.db.lease`), holds
   JSON:
   `{"host": "...", "pid": ..., "owner": "<ulid>", "until_ms": <epoch ms>}`. `Store::open` takes it
-  atomically (temp file plus rename in the same directory; mode 0600 on Unix, directory ACL on
-  Windows) or fails with `Error::Leased { host, pid, until }`. It is taken over once `until_ms` has
-  passed, or — same host only — once the pid it names is no longer running (checked with
-  `kill(pid, 0)` through `rustix`, no `unsafe`; not possible on Windows, so there it is expiry
-  only). A torn or garbage file (one that does not parse as that JSON) is treated as expired only
-  once its mtime is older than `lease_ttl`: a lease mid-write is not mistaken for a free one.
+  with an **exclusive create**, not a check then a write: the candidate is written to a unique
+  temp file, then hard-linked (`std::fs::hard_link`) onto the lease path. `hard_link` either
+  creates that name or fails with `AlreadyExists`, atomically — including over NFS, where this (not
+  `open(O_CREAT | O_EXCL)` on the final name directly, unreliable across clients on NFSv3) is the
+  standard exclusive-create idiom. Taking over an expired or dead-owner lease renames it aside to
+  a unique name first — `rename` is atomic regardless of content, so it captures whatever is
+  currently there, not what an earlier read decided — and only treats it as cleared once a second
+  read, against that now-isolated capture, confirms it really was takeable; if a different racer's
+  own fresh lease had landed in the gap, the capture is put back (with the same exclusive-create
+  primitive, so a third racer's lease is never clobbered) and this racer retries instead of
+  believing it cleared something it did not. A racer that is refused at any point gets
+  `Error::Leased { host, pid, until }` without ever touching SQLite. It is taken over once
+  `until_ms` has passed, or — same host only — once the pid it names is no longer running (checked
+  with `kill(pid, 0)` through `rustix`, no `unsafe`; not possible on Windows, so there it is
+  expiry only). A torn or garbage file (one that does not parse as that JSON) is treated as
+  expired only once its mtime is older than `lease_ttl`: a lease mid-write is not mistaken for a
+  free one.
   - **Renewal is automatic**, from a small thread `Store::open` starts, not a method callers must
     remember to call: it wakes every `lease_ttl / 3` (so one slow or missed wakeup still leaves
     two tries before the lease would actually expire), checks the file still names this `Store`'s
-    `owner`, and only then writes a fresh `until_ms`. If the owner ever does not match — another
-    host took over because this process's clock stalled or it was suspended — the thread stops and
-    every later `append` fails with `Error::LeaseLost`, never silently past a lease this store no
+    `owner`, and only then writes a fresh `until_ms` (a plain rename-into-place: renewal is
+    refreshing a lease already held, not racing anyone for it, so it does not need the exclusive
+    create). If the owner ever does not match — another host took over because this process's
+    clock stalled or it was suspended — the thread stops and every later write (`append`,
+    `rebuild`, `import`) fails with `Error::LeaseLost`, never silently past a lease this store no
     longer holds.
   - **`StoreOptions.clock`** (a `Clock`, defaulting to `SystemClock`) is where the lease gets the
     time; inject one in tests to expire a lease without sleeping.
-  - Dropping the `Store` stops the thread and releases the lease (deletes the file), but only if
-    it still names this store's `owner` — if someone else already took over, there is nothing of
-    ours left to release.
+  - Dropping the `Store` stops the thread and releases the lease, the same way acquiring takes
+    over one: rename it aside first (atomic, regardless of content), then delete the aside copy
+    only once it still names this store's `owner`. If it now names someone else — they took over
+    between our last check and this drop — put it back instead of deleting it out from under
+    them. Never a plain read-then-delete, which has its own race: another host's takeover landing
+    between the read and the delete would otherwise lose their lease, not ours.
+  - **Residual limits.** A file-based lease on a filesystem this crate does not control cannot
+    close every race: clock skew between hosts means "expired" is each host's own opinion, not a
+    global fact; NFS client-side attribute caching (`actimeo` and friends) can delay how soon one
+    host sees another's write; and a process that is suspended (not crashed) past its lease length
+    and later resumes could, in principle, still complete a renewal write just as another host
+    finishes taking over — mitigated, not eliminated, by the owner check before every write batch
+    (`Error::LeaseLost`), and by `lease_ttl` being long enough that routine scheduling delays never
+    look like a crash. A filesystem that cannot hard-link at all (rare: some FAT-formatted shares)
+    fails lease acquisition outright rather than silently falling back to an unsafe check-then-write.
 
 ## Maintenance
 
