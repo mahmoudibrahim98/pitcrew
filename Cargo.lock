@@ -1224,7 +1224,15 @@ dependencies = [
 name = "pitcrew-sync-github"
 version = "0.0.0"
 dependencies = [
+ "insta",
  "pitcrew-protocol",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
