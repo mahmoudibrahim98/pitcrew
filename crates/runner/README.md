@@ -94,3 +94,51 @@ before the dispatch's CLI starts.
   knows the agent before the first hook.
 - **Sub-agents** keep runner-minted ids even then (the dispatch names only the main session),
   with `parent` set to it. `SessionAgents` must resolve them to their parent's agent (see above).
+
+## Transcript pages
+
+`RunnerHandle::transcripts()` hands out a `RunnerTranscripts` (cheap to clone, `Send + Sync`);
+`RunnerHandle::transcript_page` is the same call on the handle. `transcript_page(session, before,
+limit)` serves api-v1's "Transcript paging":
+
+- **Which transcript.** The session is found by the runner's own `SessionId` among the transcripts
+  the watcher tracks: only the configured homes, and never a file it stopped watching (deleted).
+  The page is read with the adapter's own `read_page`, so the adapter's safe open applies.
+- **The page.** Tail-first: `before: None` is the newest page; a page's `from` as `before` is the
+  one before it. Pages hold whole records (a page may exceed `limit`), a partial last line is left
+  out, and `at_start` says nothing older exists. `limit: None` is 200 (`DEFAULT_PAGE_LIMIT`), more
+  than 1000 counts as 1000 (`MAX_PAGE_LIMIT`), and `0` as `1`.
+- **Errors.** `PageError::UnknownSession`: the runner's index has never had the session.
+  `PageError::Unavailable { reason }`: it has, but the transcript is deleted, no longer watched,
+  or cannot be read (an I/O error, an adapter that fails or panics). `reason` names no path.
+- **Blocking.** It reads the file on the caller's thread: run it on the blocking pool, with a
+  timeout (a network filesystem that stops answering may not return).
+- Like the hooks, it keeps reading after the runner stops, and keeps its index open.
+
+### For stream 0: replacing the daemon's stand-in
+
+`crates/daemon/src/transcripts.rs` finds a transcript by matching the native id against the file
+names each CLI uses, among what its `Recorded` adapters saw at discovery. The runner now does it by
+session id, from its index. To switch:
+
+1. In `daemon/src/runner.rs`, hand `pitcrew_runner::start` the plain adapters (no `Recorded`, no
+   `Found`), and keep `handle.transcripts()` in `Runner` next to `hooks` and `terminals`, with an
+   accessor.
+2. Keep the route's own checks: the query (`400` for a `before` or `limit` that is not a whole
+   number, and for `limit=0`), the hub's lookup (`404` for a session the hub does not have), the
+   machine (`503` for another machine, or without a runner), and the 10-second timeout around a
+   `spawn_blocking` read.
+3. Replace `Found::find` and `adapter.read_page` with
+   `transcripts.transcript_page(session, before, Some(limit))` (or pass the query's `Option` and
+   let the runner apply the default and the cap), and map:
+   - `Ok(page)` → `200`;
+   - `PageError::UnknownSession` → `404`;
+   - `PageError::Unavailable` → `503 unavailable`.
+4. Delete `Found`, `Recorded`, `names` and their tests.
+
+Three answers change. A deleted transcript was an empty page and is now `503`; a read error was
+`500` and is now `503`; and a session the hub has on this machine that the runner never indexed
+(a demo session, or a dispatched session under the dispatch's id until the runner adopts it) was
+an empty page and is now `404`. If the UI should keep showing such sessions with an empty transcript,
+as the mock hub does, the daemon can answer an empty page for `UnknownSession` instead; that is
+its call.

@@ -219,6 +219,16 @@ impl Store {
         Ok(keys)
     }
 
+    /// Whether the index has a row for `session`, whether or not its transcript is still there.
+    pub fn has_session(&self, session: SessionId) -> Result<bool, StoreError> {
+        let found: Option<i64> = self
+            .conn
+            .prepare_cached("SELECT 1 FROM transcripts WHERE session_id = ?1")?
+            .query_row([session.0.to_string()], |r| r.get(0))
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     /// Moves a row to the transcript's new canonical path (a folder above it became a symlink).
     pub fn set_path(&self, session: SessionId, path: &Path) -> Result<(), StoreError> {
         self.conn.execute(

@@ -30,6 +30,7 @@ use crate::fsinfo::{self, FileStat};
 use crate::held::Held;
 use crate::hooks::{self, Sender};
 use crate::link::{self, Locations, WorkstreamLocation};
+use crate::pages::Watched;
 use crate::sink::Batch;
 use crate::store::{Commit, Row, Store, path_text};
 use notify::event::{EventKind, MetadataKind, ModifyKind};
@@ -358,6 +359,8 @@ pub(crate) struct Watcher {
     agents: Option<Arc<dyn SessionAgents>>,
     /// The agent lookup panicked; warned once.
     lookup_panicked: bool,
+    /// The tracked transcripts by session, for transcript pages.
+    watched: Arc<Watched>,
 }
 
 pub(crate) struct Setup {
@@ -375,6 +378,7 @@ pub(crate) struct Setup {
     pub shared: Arc<Shared>,
     pub locations: Option<Arc<dyn Locations>>,
     pub agents: Option<Arc<dyn SessionAgents>>,
+    pub watched: Arc<Watched>,
 }
 
 impl Watcher {
@@ -453,6 +457,7 @@ impl Watcher {
             held: Held::default(),
             agents: s.agents,
             lookup_panicked: false,
+            watched: s.watched,
         }
     }
 
@@ -849,6 +854,11 @@ impl Watcher {
         if row.meta.is_some() {
             self.by_native.insert((row.engine, native_id(&row)), id);
         }
+        self.watched.insert(
+            row.session,
+            Arc::clone(&self.homes[home].adapter),
+            tref.clone(),
+        );
         self.note_outside(&row.path, home);
         self.tracked.insert(
             id,
@@ -890,6 +900,7 @@ impl Watcher {
         self.by_raw.retain(|_, i| *i != id);
         self.by_native.retain(|_, i| *i != id);
         self.by_session.remove(&row.session);
+        self.watched.remove(row.session);
         for d in &t.watched {
             self.unwatch_dir(d);
         }
@@ -1645,7 +1656,7 @@ fn after(now: Instant, d: Duration) -> Instant {
 
 /// An adapter call that failed or panicked.
 #[derive(Debug, thiserror::Error)]
-enum AdapterError {
+pub(crate) enum AdapterError {
     #[error(transparent)]
     Source(#[from] SourceError),
     #[error("the source adapter panicked: {0}")]
@@ -1654,7 +1665,7 @@ enum AdapterError {
 
 /// Runs an adapter call, turning a panic into an error: one bad transcript must not stop the
 /// watcher.
-fn guard<T>(call: impl FnOnce() -> Result<T, SourceError>) -> Result<T, AdapterError> {
+pub(crate) fn guard<T>(call: impl FnOnce() -> Result<T, SourceError>) -> Result<T, AdapterError> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
         Ok(result) => result.map_err(AdapterError::Source),
         Err(panic) => Err(AdapterError::Panic(panic_text(&*panic).to_owned())),
