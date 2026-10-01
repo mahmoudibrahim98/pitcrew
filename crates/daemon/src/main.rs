@@ -15,9 +15,9 @@
 
 mod cli;
 mod cors;
+mod no_runner;
 mod serve;
 mod state;
-mod terminals;
 
 use clap::{CommandFactory as _, Parser as _};
 use cli::{Cli, Command, TokenCommand};

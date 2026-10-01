@@ -3,9 +3,12 @@
 //! Start:
 //! 1. The token registry, which locks the state directory: a second daemon stops here.
 //! 2. The store, with the work model's projections.
-//! 3. With `--demo`: refuse a store with data, mint the tokens, seed the demo workspace.
-//! 4. The device token: reused from `device.token` while it still verifies, else minted.
-//! 5. The routes (`RouterParts`), the listener, and one line on stdout:
+//! 3. The workspace (`workspace.json` holds its name) and the one `WorkService` for the store,
+//!    with the hub's own machine (the workspace's local one) and a dispatcher that cannot reach
+//!    a runner yet.
+//! 4. With `--demo`: refuse a store with data, mint the tokens, seed the demo workspace.
+//! 5. The device token: reused from `device.token` while it still verifies, else minted.
+//! 6. The routes (`RouterParts`), the listener, and one line on stdout:
 //!    `pitcrewd listening on <where>`.
 //!
 //! Stop (Ctrl+C or Ctrl+Break, or SIGTERM on Unix): the server stops accepting and finishes
@@ -13,8 +16,8 @@
 //! checkpointing its WAL, and the lock is released last.
 
 use crate::cli::{ListenArg, ServeArgs};
-use crate::state::{StateDir, read_token, write_token};
-use crate::terminals::NoRunner;
+use crate::no_runner::{NoDispatcher, NoRunner};
+use crate::state::{StateDir, read_token, read_workspace, write_token, write_workspace};
 use anyhow::{Context as _, bail};
 use axum::Extension;
 use pitcrew_api::{
@@ -26,7 +29,7 @@ use pitcrew_fixtures::DemoWorkspace;
 use pitcrew_hub_work::WorkService;
 use pitcrew_protocol::api::{Caller, HostRole, TokenScope};
 use pitcrew_protocol::ids::{MemberId, WorkspaceId};
-use pitcrew_protocol::model::MemberKind;
+use pitcrew_protocol::model::{MachineKind, MemberKind, Workspace};
 use pitcrew_store::{Store, StoreOptions};
 use std::io::Write as _;
 use std::path::Path;
@@ -81,7 +84,8 @@ struct Hub {
     work: Arc<WorkService>,
 }
 
-/// Steps 1–4: the token registry, the store, the demo, the device token.
+/// Steps 1–5: the token registry, the store, the workspace and its service, the demo, the device
+/// token.
 fn open(state: &StateDir, demo: bool) -> anyhow::Result<Hub> {
     let tokens = match FileTokenStore::open(state.root()) {
         Ok(tokens) => Arc::new(tokens),
@@ -121,21 +125,29 @@ fn open(state: &StateDir, demo: bool) -> anyhow::Result<Hub> {
         None
     };
 
-    let workspace = match (
-        &demo,
-        store.since(0, 1).context("cannot read the store")?.first(),
-    ) {
-        (Some(demo), _) => demo.workspace.id,
-        (None, Some(first)) => first.event.workspace,
-        (None, None) => {
-            tracing::warn!(
-                "the store is empty and there is no way to create a workspace yet; start with \
-                 --demo to try the demo workspace"
-            );
-            WorkspaceId::new()
-        }
+    let workspace = hosted_workspace(state, &store, demo.as_ref())?;
+    // The one writer of this store (hub-work's "One writer"): everything shares this `Arc`.
+    let work =
+        WorkService::new(Arc::clone(&store), workspace).with_dispatcher(Arc::new(NoDispatcher));
+    let machines = match &demo {
+        Some(demo) => demo.machines.clone(),
+        None => work.machines().context("cannot list the machines")?,
     };
-    let work = Arc::new(WorkService::new(Arc::clone(&store), workspace));
+    let work = Arc::new(
+        match machines.iter().find(|m| m.kind == MachineKind::Local) {
+            Some(machine) => {
+                tracing::info!(machine = %machine.id, name = %machine.name, "the hub's own machine");
+                work.with_hub_machine(machine.id)
+            }
+            None => {
+                tracing::warn!(
+                    "the workspace has no local machine, so a dispatch for a task without a \
+                     folder answers 503 until the runner adds this one"
+                );
+                work
+            }
+        },
+    );
 
     // Tokens before seeding: if minting fails, the store stays empty and `--demo` can be retried.
     match &demo {
@@ -158,6 +170,58 @@ fn open(state: &StateDir, demo: bool) -> anyhow::Result<Hub> {
         tokens,
         store,
         work,
+    })
+}
+
+/// What a workspace is called when its name is not known.
+const UNNAMED: &str = "Workspace";
+
+/// The workspace this hub hosts. With `--demo`, the demo's, written to `workspace.json` (before
+/// seeding, so a retried `--demo` writes it again). Otherwise the one the store's events belong
+/// to, named by `workspace.json` when that file names the same workspace; the event log does not
+/// hold names.
+fn hosted_workspace(
+    state: &StateDir,
+    store: &Store,
+    demo: Option<&DemoWorkspace>,
+) -> anyhow::Result<Workspace> {
+    let path = state.workspace();
+    if let Some(demo) = demo {
+        write_workspace(&path, &demo.workspace)
+            .with_context(|| format!("cannot write {}", path.display()))?;
+        return Ok(demo.workspace.clone());
+    }
+    let saved = read_workspace(&path).with_context(|| format!("cannot read {}", path.display()))?;
+    let logged = store
+        .since(0, 1)
+        .context("cannot read the store")?
+        .first()
+        .map(|first| first.event.workspace);
+    Ok(match (logged, saved) {
+        (Some(id), Some(saved)) if saved.id == id => saved,
+        (Some(id), saved) => {
+            tracing::warn!(
+                workspace = %id,
+                file = %path.display(),
+                names_another = saved.is_some(),
+                "the workspace's name is not known; calling it {UNNAMED:?}"
+            );
+            Workspace {
+                id,
+                name: UNNAMED.to_owned(),
+            }
+        }
+        (None, Some(saved)) => saved,
+        (None, None) => {
+            tracing::warn!(
+                "the store is empty and there is no way to create a workspace yet; start with \
+                 --demo to try the demo workspace"
+            );
+            Workspace {
+                id: WorkspaceId::new(),
+                name: UNNAMED.to_owned(),
+            }
+        }
     })
 }
 
@@ -498,9 +562,23 @@ mod tests {
         };
         let hub = open(&state, false).unwrap();
         assert_eq!(hub.work.workspace(), workspace);
+        let demo = pitcrew_fixtures::demo_workspace().unwrap();
+        assert_eq!(
+            hub.work.workspace_at().unwrap().workspace,
+            demo.workspace,
+            "the name survives a restart"
+        );
         assert_eq!(read_token(&state.device_token()).unwrap(), raw);
         let raw = raw.unwrap();
         assert_eq!(hub.tokens.verify(&raw).unwrap().scope, TokenScope::Device);
+        drop(hub);
+
+        // Without the file, the workspace is still the store's, unnamed.
+        std::fs::remove_file(state.workspace()).unwrap();
+        let hub = open(&state, false).unwrap();
+        let named = hub.work.workspace_at().unwrap().workspace;
+        assert_eq!(named.id, workspace);
+        assert_eq!(named.name, UNNAMED);
     }
 
     #[test]

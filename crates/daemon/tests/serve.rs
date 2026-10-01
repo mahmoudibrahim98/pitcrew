@@ -171,6 +171,45 @@ fn demo_serves_the_work_model_with_real_tokens() {
     let agent_terminal = daemon.get(&format!("/v1/sessions/{}/terminal", id::SES1), Some(&agent));
     assert_eq!(agent_terminal.status, 403);
 
+    // The workspace, named, and the revision the work model reflects.
+    let workspace = daemon.get("/v1/workspace", Some(&device));
+    assert_eq!(workspace.status, 200, "{}", workspace.body);
+    let workspace = workspace.json();
+    assert_eq!(workspace["workspace"]["name"], "Demo Lab");
+    assert!(workspace["rev"].as_u64().unwrap() > 0);
+
+    // Sessions, and one of them.
+    let sessions = daemon.get("/v1/sessions", Some(&device));
+    assert_eq!(sessions.status, 200, "{}", sessions.body);
+    assert!(!sessions.json().as_array().unwrap().is_empty());
+    let session = daemon.get(&format!("/v1/sessions/{}", id::SES1), Some(&device));
+    assert_eq!(session.status, 200, "{}", session.body);
+    assert_eq!(session.json()["id"], id::SES1);
+
+    // A dispatch is recorded, then fails: no runner is attached yet.
+    let dispatch = daemon.post(
+        "/v1/tasks/PAP-5/dispatch",
+        Some(&device),
+        &json!({ "agent": id::WRITER }),
+    );
+    assert_eq!(dispatch.status, 503, "{}", dispatch.body);
+    assert_eq!(dispatch.code(), "unavailable");
+    let page = daemon.get("/v1/events?limit=2", Some(&device)).json();
+    let types: Vec<_> = page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["body"]["type"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(types, ["dispatch_finished", "session_ended"]);
+    assert_eq!(page["events"][0]["body"]["data"]["outcome"], "failed");
+    let by_agent = daemon.post(
+        "/v1/tasks/PAP-5/dispatch",
+        Some(&agent),
+        &json!({ "agent": id::WRITER }),
+    );
+    assert_eq!(by_agent.status, 403);
+
     // Unknown routes are JSON 404s.
     let nowhere = daemon.get("/v1/nowhere", Some(&device));
     assert_eq!(nowhere.status, 404);
@@ -342,6 +381,8 @@ fn sigterm_stops_cleanly_and_a_restart_keeps_everything() {
     assert_eq!(task.status, 200, "{}", task.body);
     assert_eq!(task.json()["status"], "todo");
     assert_eq!(task.json()["id"], id::PAP7);
+    let workspace = daemon.get("/v1/workspace", Some(&device)).json();
+    assert_eq!(workspace["workspace"]["name"], "Demo Lab");
     assert!(daemon.terminate().success());
 }
 

@@ -34,6 +34,7 @@ daemon is ready, `pitcrewd listening on <where>`, which supervisors and tests wa
 | `tokens.lock` | Held by the running daemon. **One daemon per state directory**: a second one stops at start with "another pitcrewd is already running on …". |
 | `device.token` | The desktop's device token, `pcd_…`. Private (0600 on Unix). |
 | `demo-agent.token` | With `--demo` only: a token for the demo's first agent, `@writer`, `pca_…`. Private. |
+| `workspace.json` | The workspace's id and name (`GET /v1/workspace`), which the event log does not hold. Written by `--demo`. Private. |
 | `run/pitcrewd.sock` | The private socket (Unix). On Windows the API uses the current user's named pipe, `\\.\pipe\pitcrewd-<user SID>`. |
 
 On Unix the directory is created 0700, and an existing one must already be ours and private; on
@@ -44,15 +45,21 @@ Windows it must be under the user's profile, whose ACL it inherits.
 1. The token registry, which takes the lock.
 2. The store, with the work model's projections (`StoreOptions::default()`; `FsMode::Auto` once
    stream C's NFS work lands).
-3. With `--demo`: refuse a store with data, then mint the tokens, then seed. Tokens come first,
+3. The workspace and the store's one `WorkService` (hub-work's "one writer": everything shares
+   that `Arc`).
+   - The workspace is the demo's with `--demo` (written to `workspace.json`), else the one the
+     store's events belong to, named by `workspace.json` when it names the same workspace and
+     called "Workspace" otherwise.
+   - The hub's own machine (`with_hub_machine`) is the workspace's first `local` machine (the
+     demo's "This laptop"). Without one, a dispatch for a task with no folder answers 503.
+   - The dispatcher is `NoDispatcher` until the runner link exists (see Routes).
+4. With `--demo`: refuse a store with data, then mint the tokens, then seed. Tokens come first,
    so a failure leaves the store empty and `--demo` can be retried.
-4. The device token: `device.token` is reused while it verifies as a device token; otherwise a
+5. The device token: `device.token` is reused while it verifies as a device token; otherwise a
    new one is minted for the workspace's first person (the demo's `@sam`) and written there. If
    the store has no person yet, the token acts as a new member that nothing knows, and
    `GET /v1/me` answers 404 until onboarding can add the person (see "Not wired yet").
-5. The routes, the listener, and the ready line.
-
-The workspace is the one the store's events belong to (or the demo's).
+6. The routes, the listener, and the ready line.
 
 ### Stop
 
@@ -66,8 +73,9 @@ last. The log ends with `store closed` and `stopped`.
 | Route | From |
 |---|---|
 | `GET /v1/host/info` (no token) | `pitcrew-api`; roles `["hub"]` until the runner is wired in |
-| Work routes, agent and device | `pitcrew-hub-work` (`agent_routes`, `device_routes`) |
-| `GET /v1/stream`, `GET /v1/events` | `pitcrew-api` over the store (`StoreSource`) |
+| Work routes, agent and device, with `GET /v1/workspace` and `GET /v1/sessions[/{id}]` | `pitcrew-hub-work` (`agent_routes`, `device_routes`) |
+| `POST /v1/tasks/{id}/dispatch` | `pitcrew-hub-work` with `NoDispatcher`: the dispatch is recorded (`task_assigned` if the task had no assignee, `dispatch_started`, `session_discovered`), then finished as `failed` with its session ended, and the route answers `503 unavailable`. The assignment stays. |
+| `GET /v1/stream`, `GET /v1/events` | `pitcrew-api` over the store (`StoreSource`). The `project=` and `workstream=` activity filters answer 400 until `pitcrew-api` takes hub-work's `EventRefs` |
 | `POST /v1/hooks/{engine}/{event}` | `pitcrew-api`; logged at debug (engine, event, member; never the body) until the runner's sink exists |
 | `GET /v1/sessions/{id}/terminal` | `pitcrew-api`; no runner yet, so `503 unavailable` for a known session, `404` for an unknown one |
 
@@ -120,7 +128,8 @@ request that changed this crate).
 ## Tests
 
 `tests/serve.rs` starts the real binary on a temporary state directory and a free port, and
-covers `--version`, `token show-path`, tokens and scopes, the work routes, the stream (a move
+covers `--version`, `token show-path`, tokens and scopes, the work routes (with the workspace,
+sessions, and a dispatch that is recorded and fails with 503), the stream (a move
 appears on it; a reconnect with `since` gets what it missed), hooks, terminals, CORS and the
 `Host` guard, the single-daemon lock, and on Unix a SIGTERM stop: a clean store, `--demo`
 refused afterwards, a stream closed with 1001, and a restart that keeps the token, the log and
@@ -128,9 +137,11 @@ the data. Nothing it logs, at debug, holds a token.
 
 ## Not wired yet
 
-- The runner (stream D's hub link): its event sink, the hook sink, terminals, agent tokens for
-  real sessions; then `roles` gains `runner`.
-- `GET /v1/workspace`, `GET /v1/sessions` and `GET /v1/sessions/{id}`: stream E's next brief.
+- The runner (stream D's hub link): its event sink, the hook sink, terminals, the dispatcher,
+  agent tokens for real sessions, and the `SessionAgents` trait over hub-work's sessions and
+  members; then `roles` gains `runner`.
+- Activity filtered by `project=` or `workstream=`: `pitcrew-api`'s activity route does not take
+  hub-work's `EventRefs` yet.
 - Creating the workspace and its first person outside `--demo`: there is no work command for it
-  yet.
+  yet; the daemon would write `workspace.json` then.
 - Remote machines, the Tauri shell, auto-start and installers.

@@ -6,16 +6,20 @@
 //! | `tokens.json`, `tokens.lock` | The token registry (hashes only), owned by `pitcrew-auth`. While a daemon runs it holds `tokens.lock`, so a second daemon on the same directory is refused. |
 //! | `device.token` | The desktop's device token, for the UI in development. Private (0600). |
 //! | `demo-agent.token` | With `--demo`: a token for the demo's first agent. Private (0600). |
+//! | `workspace.json` | The workspace's id and name, which the event log does not hold. Private (0600). |
 //! | `run/pitcrewd.sock` | The private socket (Unix). |
 
 use anyhow::Context as _;
 use pitcrew_auth::SecretToken;
+use pitcrew_protocol::model::Workspace;
 use std::fs;
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 /// The longest token file read, in bytes. Tokens are about 50.
 const MAX_TOKEN_FILE: u64 = 4096;
+/// The longest workspace file read, in bytes.
+const MAX_WORKSPACE_FILE: u64 = 64 * 1024;
 
 /// A daemon's state directory and the paths in it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -61,6 +65,12 @@ impl StateDir {
         self.root.join("demo-agent.token")
     }
 
+    /// The workspace's id and name.
+    #[must_use]
+    pub fn workspace(&self) -> PathBuf {
+        self.root.join("workspace.json")
+    }
+
     /// The private socket's directory (Unix).
     #[must_use]
     pub fn run_dir(&self) -> PathBuf {
@@ -81,7 +91,39 @@ fn default_dir() -> anyhow::Result<PathBuf> {
 /// # Errors
 /// Creating, writing or renaming fails.
 pub fn write_token(path: &Path, token: &SecretToken) -> io::Result<()> {
-    let tmp = path.with_extension("token.tmp");
+    write_private(path, token.expose().as_bytes())
+}
+
+/// Writes the workspace's id and name to `path`, as [`write_token`] writes a token.
+///
+/// # Errors
+/// Creating, writing or renaming fails.
+pub fn write_workspace(path: &Path, workspace: &Workspace) -> io::Result<()> {
+    let json = serde_json::to_string_pretty(workspace).map_err(io::Error::other)?;
+    write_private(path, json.as_bytes())
+}
+
+/// Reads a workspace file written by [`write_workspace`]: `Ok(None)` if there is none.
+///
+/// # Errors
+/// It is not a regular file, cannot be read, or does not hold a workspace.
+pub fn read_workspace(path: &Path) -> io::Result<Option<Workspace>> {
+    let Some(text) = read_regular(path, MAX_WORKSPACE_FILE)? else {
+        return Ok(None);
+    };
+    serde_json::from_str(&text).map(Some).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} does not hold a workspace: {e}", path.display()),
+        )
+    })
+}
+
+/// Writes `bytes` and a newline to a new private file next to `path`, then renames it over `path`.
+fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
     // Only this daemon writes here (it holds the state directory's lock), so a leftover is stale.
     let _ = fs::remove_file(&tmp);
     let mut options = fs::OpenOptions::new();
@@ -92,7 +134,7 @@ pub fn write_token(path: &Path, token: &SecretToken) -> io::Result<()> {
         options.mode(0o600);
     }
     let written = options.open(&tmp).and_then(|mut file| {
-        file.write_all(token.expose().as_bytes())?;
+        file.write_all(bytes)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
         drop(file);
@@ -104,14 +146,8 @@ pub fn write_token(path: &Path, token: &SecretToken) -> io::Result<()> {
     written
 }
 
-/// Reads a token file written by [`write_token`]: `Ok(None)` if there is none. On Unix it must be
-/// a regular file of ours that nobody else can read or write.
-///
-/// The text is a secret: never log it.
-///
-/// # Errors
-/// It is not a private regular file, or cannot be read.
-pub fn read_token(path: &Path) -> io::Result<Option<String>> {
+/// The text of the regular file at `path`, at most `max` bytes: `Ok(None)` if there is none.
+fn read_regular(path: &Path, max: u64) -> io::Result<Option<String>> {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -123,25 +159,40 @@ pub fn read_token(path: &Path) -> io::Result<Option<String>> {
             format!("{} is not a regular file", path.display()),
         ));
     }
+    let mut text = String::new();
+    fs::File::open(path)?.take(max).read_to_string(&mut text)?;
+    Ok(Some(text))
+}
+
+/// Reads a token file written by [`write_token`]: `Ok(None)` if there is none. On Unix it must be
+/// a regular file of ours that nobody else can read or write.
+///
+/// The text is a secret: never log it.
+///
+/// # Errors
+/// It is not a private regular file, or cannot be read.
+pub fn read_token(path: &Path) -> io::Result<Option<String>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        if meta.uid() != pitcrew_auth::euid() || meta.mode() & 0o077 != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "{} must be ours and private (mode 600), but has mode {:o}",
-                    path.display(),
-                    meta.mode() & 0o777
-                ),
-            ));
+        match fs::symlink_metadata(path) {
+            // `read_regular` refuses anything but a regular file.
+            Ok(meta) if meta.is_file() => {
+                if meta.uid() != pitcrew_auth::euid() || meta.mode() & 0o077 != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "{} must be ours and private (mode 600), but has mode {:o}",
+                            path.display(),
+                            meta.mode() & 0o777
+                        ),
+                    ));
+                }
+            }
+            _ => {}
         }
     }
-    let mut text = String::new();
-    fs::File::open(path)?
-        .take(MAX_TOKEN_FILE)
-        .read_to_string(&mut text)?;
-    Ok(Some(text.trim().to_owned()))
+    Ok(read_regular(path, MAX_TOKEN_FILE)?.map(|text| text.trim().to_owned()))
 }
 
 #[cfg(test)]
@@ -204,6 +255,24 @@ mod tests {
     }
 
     #[test]
+    fn the_workspace_round_trips_and_a_bad_file_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("workspace.json");
+        assert_eq!(read_workspace(&path).unwrap(), None);
+        let workspace = Workspace {
+            id: pitcrew_protocol::ids::WorkspaceId::new(),
+            name: "Thesis".to_owned(),
+        };
+        write_workspace(&path, &workspace).unwrap();
+        assert_eq!(read_workspace(&path).unwrap(), Some(workspace));
+        fs::write(&path, "{\"id\":").unwrap();
+        assert_eq!(
+            read_workspace(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
     fn paths_live_in_the_state_dir() {
         let state = StateDir::resolve(Some(PathBuf::from("some/state"))).unwrap();
         assert!(state.root().is_absolute());
@@ -212,6 +281,7 @@ mod tests {
             state.store(),
             state.device_token(),
             state.demo_agent_token(),
+            state.workspace(),
             state.run_dir(),
         ] {
             assert_eq!(path.parent(), Some(state.root()));
