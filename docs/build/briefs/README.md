@@ -54,6 +54,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [L-desktop-polish](L-desktop-polish.md) | L · UI foundation | `s/L/desktop-polish` | Sonnet-class | In progress |
 | [M-session-work](M-session-work.md) | M · Agent console | `s/M/session-work` | Sonnet-class | **Merged** |
 | [Q-round-3](Q-round-3.md) | Q · Security | `s/Q/round-3` | Opus-class | In progress |
+| [D-hub-link-2](D-hub-link-2.md) | D · Runner | `s/D/hub-link-2` | Opus-class | In progress |
 | [0-daemon-solo](0-daemon-solo.md) | 0 · Composition root | `integrator/daemon-solo` | Opus-class | **Merged** |
 | [N-projects-wiring](N-projects-wiring.md) | N · Projects layout | `s/N/projects-wiring` | Sonnet-class | **Merged** |
 | [L-shell-polish](L-shell-polish.md) | L · UI foundation | `s/L/shell-polish` | Sonnet-class | **Merged** |
