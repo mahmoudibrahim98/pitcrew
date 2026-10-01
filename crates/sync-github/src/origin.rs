@@ -64,19 +64,50 @@ fn effective_port(scheme: &str, port: Option<&str>) -> String {
     }
 }
 
+/// Decodes a `%2e`/`%2E` percent-escape to a literal `.`, case-insensitively, leaving every other
+/// byte — encoded or not — untouched. **Not** a general percent-decoder: decoding `%2f` to `/`
+/// here, for instance, would let an attacker smuggle an extra path separator past the segment
+/// splitter below. This closes only the one encoding `.`/`..` could be smuggled through, so
+/// `%2e%2e` (or a mix like `.%2e`) normalises exactly like a literal `..` would.
+///
+/// Safe to slice `segment` at the byte offsets this finds: `%2e`/`%2E` are three ASCII bytes, so
+/// both ends of a match always fall on a UTF-8 character boundary, whatever non-ASCII bytes
+/// surround them.
+fn decode_dot_escapes(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut out = String::with_capacity(segment.len());
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i + 3 <= bytes.len() {
+        if bytes[i] == b'%' && bytes[i + 1] == b'2' && bytes[i + 2].eq_ignore_ascii_case(&b'e') {
+            out.push_str(&segment[start..i]);
+            out.push('.');
+            i += 3;
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&segment[start..]);
+    out
+}
+
 /// Splits `path` on `/` and resolves `.` (dropped) and `..` (pops the previous segment)
-/// segments, the way a browser or an HTTP server would before routing a request. Returns `None`
-/// if a `..` has no segment left to pop — escaping past the root — which this treats as never
-/// trusted rather than silently clamping it to the root.
-fn normalize_segments(path: &str) -> Option<Vec<&str>> {
-    let mut out: Vec<&str> = Vec::new();
-    for segment in path.split('/') {
-        match segment {
+/// segments, the way a browser or an HTTP server would before routing a request — after
+/// [`decode_dot_escapes`] folds a percent-encoded `.` back to a literal one, so `%2e%2e` can't
+/// walk past this check un-normalised. Returns `None` if a `..` has no segment left to pop —
+/// escaping past the root — which this treats as never trusted rather than silently clamping it
+/// to the root.
+fn normalize_segments(path: &str) -> Option<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for raw_segment in path.split('/') {
+        let segment = decode_dot_escapes(raw_segment);
+        match segment.as_str() {
             "" | "." => {}
             ".." => {
                 out.pop()?;
             }
-            s => out.push(s),
+            _ => out.push(segment),
         }
     }
     Some(out)
@@ -216,6 +247,45 @@ mod tests {
         // Resolves to "/api/v3/repos/o/r/issues", genuinely under the base.
         assert!(is_trusted_next_url(
             "https://ghe.example.com/api/v3/repos/o/x/../r/issues",
+            ENTERPRISE_BASE
+        ));
+    }
+
+    #[test]
+    fn percent_encoded_dot_dot_cannot_escape_the_api_base_path() {
+        // Lowercase %2e.
+        assert!(!is_trusted_next_url(
+            "https://ghe.example.com/api/v3/repos/%2e%2e/%2e%2e/evil",
+            ENTERPRISE_BASE
+        ));
+    }
+
+    #[test]
+    fn mixed_case_percent_encoded_dot_dot_cannot_escape_the_api_base_path() {
+        assert!(!is_trusted_next_url(
+            "https://ghe.example.com/api/v3/repos/%2E%2e/%2E%2e/evil",
+            ENTERPRISE_BASE
+        ));
+    }
+
+    #[test]
+    fn a_literal_dot_plus_an_encoded_dot_is_still_dot_dot() {
+        assert!(!is_trusted_next_url(
+            "https://ghe.example.com/api/v3/repos/.%2e/.%2e/evil",
+            ENTERPRISE_BASE
+        ));
+    }
+
+    #[test]
+    fn a_double_slash_collapses_to_an_empty_segment_without_affecting_trust() {
+        // "//" produces an empty segment between the slashes, which normalises away (like a
+        // single "/") rather than being smuggled through as something else.
+        assert!(is_trusted_next_url(
+            "https://ghe.example.com/api/v3//repos/o/r/issues?page=2",
+            ENTERPRISE_BASE
+        ));
+        assert!(!is_trusted_next_url(
+            "https://ghe.example.com//other",
             ENTERPRISE_BASE
         ));
     }
