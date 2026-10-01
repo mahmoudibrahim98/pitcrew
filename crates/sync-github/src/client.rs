@@ -3,7 +3,7 @@
 
 use crate::bounds::{Limits, MAX_PAGE_BODY_BYTES, backoff_secs};
 use crate::link_header::next_link;
-use crate::origin::is_trusted_next_url;
+use crate::origin::trusted_next_url;
 use crate::state::ListCache;
 use crate::time::GithubTimestamp;
 use crate::transport::{AuthToken, Method, Request, Response, Transport, TransportError};
@@ -75,7 +75,9 @@ pub(crate) struct ListResult<Item> {
     /// Set when a `Link: rel="next"` outside the configured API base was ignored. The caller
     /// raises this as a [`crate::sync::SyncIssue`]: a server (or a proxy in front of it) handing
     /// back a pagination link to an unexpected host is worth a person's attention, not just a
-    /// debug log, even though the items already collected are still returned normally.
+    /// debug log, even though the items already collected are still returned normally. This is
+    /// the raw, untrusted link text; the caller sanitises and caps it before putting it in a
+    /// message (see `crate::sync::blocked_link_message`).
     pub blocked_link: Option<String>,
 }
 
@@ -367,24 +369,33 @@ impl<'t, T: Transport> GithubClient<'t, T> {
                 break;
             }
             match raw.link.as_deref().and_then(next_link) {
-                Some(next) if is_trusted_next_url(&next, &self.api_base) => url = next,
-                Some(untrusted) => {
-                    // Never follow a `Link: rel="next"` outside the configured API base: it would
-                    // send the `Authorization` header (attached in `get`, above) to whatever host
-                    // answered. This is left `completed = false` with no resume pointer: resuming
-                    // from the current (already fully processed) page would just hit the same
-                    // untrusted link again, so the next call restarts from the top instead. It is
-                    // also reported back as `blocked_link`, for the caller to raise as a visible
-                    // `SyncIssue` rather than just a log line.
-                    tracing::warn!(
-                        url = %untrusted,
-                        api_base = %self.api_base,
-                        "ignored a Link: rel=\"next\" outside the API base"
-                    );
-                    blocked_link = Some(untrusted);
-                    blocked_from_resuming = true;
-                    break;
-                }
+                // Compared against `self.api_base` (round 3 review item B-1: GitHub rewrites the
+                // path in several endpoints' first `next` link — see `origin::trusted_next_url`'s
+                // doc) — `next` must share its scheme, host and effective port, with a path under
+                // the API base's own. On a match, the *parsed* URL is what gets requested next
+                // (round 3 item S-2), not the original `next` text, so the request actually sent
+                // can never diverge from what this check approved.
+                Some(next) => match trusted_next_url(&next, &self.api_base) {
+                    Some(parsed) => url = parsed.as_str().to_string(),
+                    None => {
+                        // Never follow an untrusted `Link: rel="next"`: it would send the
+                        // `Authorization` header (attached in `get`, above) to whatever host
+                        // answered, or walk the request to an unexpected path. This is left
+                        // `completed = false` with no resume pointer: resuming from the current
+                        // (already fully processed) page would just hit the same untrusted link
+                        // again, so the next call restarts from the top instead. It is also
+                        // reported back as `blocked_link`, for the caller to raise as a visible
+                        // `SyncIssue` rather than just a log line.
+                        tracing::warn!(
+                            url = %next,
+                            api_base = %self.api_base,
+                            "ignored a Link: rel=\"next\" outside the configured API base"
+                        );
+                        blocked_link = Some(next);
+                        blocked_from_resuming = true;
+                        break;
+                    }
+                },
                 None => {
                     completed = true;
                     break;
@@ -426,11 +437,19 @@ impl<'t, T: Transport> GithubClient<'t, T> {
 }
 
 /// GitHub's abuse/secondary-rate-limit responses carry a `message` naming it explicitly (e.g. "You
-/// have exceeded a secondary rate limit..."); this is a substring check on the raw body so it
-/// still recognises one even if the body isn't valid JSON.
+/// have exceeded a secondary rate limit..."). This looks only at that JSON field, never the raw
+/// body: scanning the whole body would also match the string appearing incidentally elsewhere
+/// (a `documentation_url`, an issue title echoed back in a validation error, …), wrongly treating
+/// an unrelated error as a rate limit that will clear on its own.
 fn body_mentions_rate_limit(body: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
-    text.contains("rate limit") || text.contains("abuse")
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(message) = value.get("message").and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    let lower = message.to_ascii_lowercase();
+    lower.contains("rate limit") || lower.contains("abuse")
 }
 
 #[cfg(test)]
@@ -758,6 +777,29 @@ mod tests {
             panic!("expected RateLimited");
         };
         assert!(secondary);
+    }
+
+    #[test]
+    fn body_mentions_rate_limit_only_checks_the_message_field() {
+        // A rate-limit-shaped word elsewhere in the body (not the `message` field) must not count:
+        // otherwise an unrelated error whose other fields happen to echo back user-supplied text
+        // containing "rate limit" would be mistaken for a secondary limit that will clear on its
+        // own, rather than surfaced as the real error it is.
+        let body = br#"{"message":"Bad credentials","documentation_url":"https://docs.github.com/rate-limit-troubleshooting"}"#;
+        assert!(!body_mentions_rate_limit(body));
+    }
+
+    #[test]
+    fn body_mentions_rate_limit_recognises_the_real_shape() {
+        let body = br#"{"message":"You have exceeded a secondary rate limit. Please wait."}"#;
+        assert!(body_mentions_rate_limit(body));
+    }
+
+    #[test]
+    fn body_mentions_rate_limit_rejects_non_json() {
+        assert!(!body_mentions_rate_limit(
+            b"plain text mentioning a rate limit"
+        ));
     }
 
     #[tokio::test]

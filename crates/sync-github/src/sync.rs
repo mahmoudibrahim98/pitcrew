@@ -3,8 +3,8 @@
 //! the returned state and decides what to do with the changes; this function does no I/O beyond
 //! the `Transport` it is given, and never touches the event log.
 
-use crate::bounds::Limits;
-use crate::change::{UpstreamChange, diff_issue, diff_milestone, diff_pull};
+use crate::bounds::{Limits, MAX_REPORTED_URL_CHARS, cap_chars};
+use crate::change::{UpstreamChange, diff_issue, diff_milestone, diff_pull, expected_web_host};
 use crate::client::{GithubClient, Outcome};
 use crate::state::{ListCache, RepoState, ResumeCursor, SyncState};
 use crate::time::GithubTimestamp;
@@ -106,7 +106,9 @@ pub struct SyncOutcome {
     /// Non-fatal problems (a resource whose request failed outright). A repository that hit one
     /// of these still tries its other resources.
     pub errors: Vec<SyncIssue>,
-    /// How many items across the whole call failed to parse and were skipped.
+    /// How many items across the whole call failed to parse and were skipped entirely, plus how
+    /// many individual malformed *fields* (currently: an `html_url` with an untrusted scheme —
+    /// R10) were dropped and replaced with a safe default while the rest of their item was kept.
     pub malformed_skipped: u32,
 }
 
@@ -151,7 +153,8 @@ fn encode_timestamp(s: &str) -> String {
 }
 
 enum ResourceResult {
-    /// Changes found, how many items were skipped as malformed, and — if a server-supplied
+    /// Changes found, how many items were skipped (or individual fields dropped — see
+    /// [`SyncOutcome::malformed_skipped`]) as malformed, and — if a server-supplied
     /// `Link: rel="next"` outside the API base was ignored — a message to raise as an additional
     /// `SyncIssue` alongside these (otherwise successful) changes.
     Changes(Vec<UpstreamChange>, u32, Option<String>),
@@ -159,8 +162,12 @@ enum ResourceResult {
     Error(String),
 }
 
+/// Builds the `SyncIssue` message for a rejected `Link: rel="next"`. `url` is untrusted — it is
+/// exactly what a server (or a proxy in front of it) sent — so it is hidden-character-stripped and
+/// length-capped before going into a message a person reads (round 3 review nit).
 fn blocked_link_message(url: &str) -> String {
-    format!("ignored a paginated \"next\" link outside the configured API base: {url}")
+    let safe = cap_chars(url, MAX_REPORTED_URL_CHARS);
+    format!("ignored a paginated \"next\" link outside the configured API base: {safe}")
 }
 
 async fn sync_issues<T: Transport>(
@@ -168,6 +175,7 @@ async fn sync_issues<T: Transport>(
     repo: &str,
     repo_state: &mut RepoState,
     now_unix: i64,
+    web_host: &str,
     limits: Limits,
 ) -> ResourceResult {
     let mut attempts = repo_state.secondary_backoff_attempts;
@@ -191,13 +199,14 @@ async fn sync_issues<T: Transport>(
         Ok(Outcome::Ok(list)) => {
             let mut changes = Vec::new();
             let mut malformed_timestamps = 0u32;
+            let mut malformed_fields = 0u32;
             for issue in &list.items {
                 // The issues endpoint also lists pull requests; those are synced separately.
                 if issue.pull_request.is_some() {
                     continue;
                 }
                 let previous = repo_state.issue_snapshots.get(&issue.number);
-                match diff_issue(repo, issue, previous) {
+                match diff_issue(repo, issue, previous, web_host, &mut malformed_fields) {
                     Some((mut found, snapshot)) => {
                         changes.append(&mut found);
                         repo_state.issue_snapshots.insert(issue.number, snapshot);
@@ -222,7 +231,7 @@ async fn sync_issues<T: Transport>(
             let warning = list.blocked_link.as_deref().map(blocked_link_message);
             ResourceResult::Changes(
                 changes,
-                list.malformed_skipped + malformed_timestamps,
+                list.malformed_skipped + malformed_timestamps + malformed_fields,
                 warning,
             )
         }
@@ -234,6 +243,7 @@ async fn sync_pulls<T: Transport>(
     repo: &str,
     repo_state: &mut RepoState,
     now_unix: i64,
+    web_host: &str,
     limits: Limits,
 ) -> ResourceResult {
     let mut attempts = repo_state.secondary_backoff_attempts;
@@ -284,9 +294,10 @@ async fn sync_pulls<T: Transport>(
         Ok(Outcome::Ok(list)) => {
             let mut changes = Vec::new();
             let mut malformed_timestamps = 0u32;
+            let mut malformed_fields = 0u32;
             for pr in &list.items {
                 let previous = repo_state.pull_snapshots.get(&pr.number);
-                match diff_pull(repo, pr, previous) {
+                match diff_pull(repo, pr, previous, web_host, &mut malformed_fields) {
                     Some((mut found, snapshot)) => {
                         changes.append(&mut found);
                         repo_state.pull_snapshots.insert(pr.number, snapshot);
@@ -327,7 +338,7 @@ async fn sync_pulls<T: Transport>(
             let warning = list.blocked_link.as_deref().map(blocked_link_message);
             ResourceResult::Changes(
                 changes,
-                list.malformed_skipped + malformed_timestamps,
+                list.malformed_skipped + malformed_timestamps + malformed_fields,
                 warning,
             )
         }
@@ -358,6 +369,7 @@ async fn sync_milestones<T: Transport>(
     repo_state: &mut RepoState,
     now_unix: i64,
     now: &GithubTimestamp,
+    web_host: &str,
     limits: Limits,
 ) -> ResourceResult {
     let mut attempts = repo_state.secondary_backoff_attempts;
@@ -380,9 +392,17 @@ async fn sync_milestones<T: Transport>(
         }
         Ok(Outcome::Ok(list)) => {
             let mut changes = Vec::new();
+            let mut malformed_fields = 0u32;
             for milestone in &list.items {
                 let previous = repo_state.milestone_snapshots.get(&milestone.number);
-                let (mut found, snapshot) = diff_milestone(repo, milestone, previous, now);
+                let (mut found, snapshot) = diff_milestone(
+                    repo,
+                    milestone,
+                    previous,
+                    now,
+                    web_host,
+                    &mut malformed_fields,
+                );
                 changes.append(&mut found);
                 repo_state
                     .milestone_snapshots
@@ -393,7 +413,7 @@ async fn sync_milestones<T: Transport>(
                 repo_state.milestones.last_modified = list.last_modified;
             }
             let warning = list.blocked_link.as_deref().map(blocked_link_message);
-            ResourceResult::Changes(changes, list.malformed_skipped, warning)
+            ResourceResult::Changes(changes, list.malformed_skipped + malformed_fields, warning)
         }
     }
 }
@@ -429,6 +449,10 @@ async fn sync_with_limits<T: Transport>(
     if let Some(base) = &config.api_base {
         client = client.with_api_base(base.clone());
     }
+    // Derived once for the whole call (round 3 review item S-5): the web host every `html_url`
+    // must match to be trusted. See `expected_web_host`'s doc for why this is not simply
+    // `config.api_base` itself.
+    let web_host = expected_web_host(config.api_base.as_deref());
 
     for repo in &config.repos {
         let owner_repo = repo.as_str();
@@ -443,6 +467,7 @@ async fn sync_with_limits<T: Transport>(
             &mut repo_state,
             config.now_unix,
             &config.now,
+            &web_host,
             limits,
         )
         .await;
@@ -458,6 +483,7 @@ async fn sync_with_limits<T: Transport>(
                     owner_repo,
                     &mut repo_state,
                     config.now_unix,
+                    &web_host,
                     limits,
                 )
                 .await;
@@ -473,6 +499,7 @@ async fn sync_with_limits<T: Transport>(
                             owner_repo,
                             &mut repo_state,
                             config.now_unix,
+                            &web_host,
                             limits,
                         )
                         .await;
