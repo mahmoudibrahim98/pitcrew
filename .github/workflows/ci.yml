@@ -79,6 +79,29 @@ jobs:
           node-version: "22"
       - run: node --test "apps/mock-hub/test/*.test.ts" "scripts/ci/test/*.test.mjs"
 
+  ui:
+    name: UI (typecheck, lint, test, build, e2e)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+      # pnpm comes from the root package.json's packageManager field, through corepack.
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @pitcrew/ui typecheck
+      - run: pnpm --filter @pitcrew/ui lint
+      - run: pnpm --filter @pitcrew/ui test
+      - run: pnpm --filter @pitcrew/ui build
+      - name: End-to-end (Chromium)
+        run: |
+          pnpm --filter @pitcrew/ui exec playwright install --with-deps chromium
+          pnpm --filter @pitcrew/ui e2e
+
   rust:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -103,6 +126,9 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
+      - name: The API crate builds without the store
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy -p pitcrew-api --no-default-features --all-targets --locked -- -D warnings
 
   deny:
     name: Licences and advisories

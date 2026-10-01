@@ -6,7 +6,7 @@ test('shows the demo workspace and a move arrives through the stream', async ({ 
     if (request.method() === 'POST' && request.url().includes('/move')) moves.push(request.url());
   });
 
-  await page.goto('/');
+  await page.goto('/dev/proof');
   await expect(page.getByTestId('stream-status')).toHaveText('Live');
   await expect(page.getByRole('heading', { level: 2 }).first()).toBeVisible();
   await expect(page.getByRole('list', { name: 'Live sessions' }).first()).toBeVisible();
