@@ -170,6 +170,14 @@ The shell has placeholder dialogs for `task`, `agent`, `project` and `team`. A f
 body (it gets `close()`); the shell supplies the modal, its title (`title`, default "New
 <label>"), focus handling and a Suspense boundary. The palette lists every item as "New …".
 
+An entry with `disabled` (a reason) shows in the menu disabled, with that reason as an accessible
+description; it stays focusable, so the reason is reachable from the keyboard, but selecting it
+does nothing, and the palette leaves it out entirely:
+
+```ts
+{ id: 'session', label: 'Session', dialog: NewSession, disabled: 'Starting a session is not available yet.' }
+```
+
 ## Wiring components that already exist
 
 - **Merging:** keep your `index.ts` exports and add `export const feature = defineFeature({ … })`

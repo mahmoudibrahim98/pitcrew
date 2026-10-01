@@ -1,4 +1,3 @@
-/// <reference types="node" />
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defineConfig } from '@playwright/test';

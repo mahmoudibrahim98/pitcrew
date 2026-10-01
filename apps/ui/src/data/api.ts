@@ -20,7 +20,9 @@ import type {
   Member,
   MemberId,
   NewComment,
+  NewProject,
   NewTask,
+  NewWorkstream,
   Persona,
   Project,
   Session,
@@ -28,6 +30,7 @@ import type {
   Subtask,
   Task,
   TaskFilters,
+  TaskPatch,
   TaskStatus,
   Team,
   TranscriptPage,
@@ -193,6 +196,9 @@ export function createApi(options: ApiOptions) {
       get<Task>(`/v1/tasks/${id(idOrKey)}`, undefined, signal),
     moveTask: (task: string, to: TaskStatus) =>
       request<Task>('POST', `/v1/tasks/${id(task)}/move`, { body: { to } }),
+    /** A field left out is unchanged; `null` clears `workstream`, `start` or `due`. */
+    patchTask: (task: string, patch: TaskPatch) =>
+      request<Task>('PATCH', `/v1/tasks/${id(task)}`, { body: patch }),
     sessions: (filters: SessionFilters = {}, signal?: AbortSignal) =>
       get<Session[]>('/v1/sessions', { ...filters }, signal),
     session: (session: string, signal?: AbortSignal) =>
@@ -218,6 +224,11 @@ export function createApi(options: ApiOptions) {
 
     // ─── Writes. They do not touch the cache: the event each one emits does. ───────────────────
 
+    /** `409 conflict` if the key is already used. */
+    createProject: (project: NewProject) => request<Project>('POST', '/v1/projects', { body: project }),
+    /** `404 not_found` for an unknown project, although it is in the body. */
+    createWorkstream: (workstream: NewWorkstream) =>
+      request<Workstream>('POST', '/v1/workstreams', { body: workstream }),
     createTask: (task: NewTask) => request<Task>('POST', '/v1/tasks', { body: task }),
     /** `null` unassigns. */
     assignTask: (task: string, assignee: MemberId | null) =>

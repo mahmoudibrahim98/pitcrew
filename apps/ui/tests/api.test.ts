@@ -142,6 +142,38 @@ describe('api client writes, briefs and activity against the mock hub', () => {
     expect((await api().task(task.id)).assignee).toBe(RUNNER);
   });
 
+  it('patches a task, with a 400 for a bad field and the 409 cycle for blocked_by', async () => {
+    const a = await api().createTask({ project: PAPER.id, title: 'Task A' });
+    const b = await api().createTask({ project: PAPER.id, title: 'Task B' });
+
+    const patched = await api().patchTask(a.id, { title: 'Task A, revised', priority: 'high' });
+    expect(patched).toMatchObject({ title: 'Task A, revised', priority: 'high' });
+    // A field left out is unchanged, and a patch that changes nothing emits no event but still
+    // answers with the task.
+    expect(await failure(api().patchTask(a.id, { title: '   ' }))).toMatchObject({ code: 'invalid' });
+
+    // A waits on B; B waiting on A in turn would close the cycle.
+    expect((await api().patchTask(a.id, { blocked_by: [b.id] })).blocked_by).toEqual([b.id]);
+    expect(await failure(api().patchTask(b.id, { blocked_by: [a.id] }))).toMatchObject({ code: 'conflict' });
+  });
+
+  it('creates a project, with a 409 for a key already in use', async () => {
+    const project = await api().createProject({ key: 'ZZZ', name: 'A fresh project' });
+    expect(project).toMatchObject({ key: 'ZZZ', name: 'A fresh project', status: 'in_progress' });
+    expect(project.lead).toBe(SAM);
+    expect(await failure(api().createProject({ key: 'ZZZ', name: 'Another one' }))).toMatchObject({
+      code: 'conflict',
+    });
+  });
+
+  it('creates a workstream, with a 404 for an unknown project', async () => {
+    const workstream = await api().createWorkstream({ project: PAPER.id, name: 'A fresh workstream' });
+    expect(workstream).toMatchObject({ project: PAPER.id, name: 'A fresh workstream', status: 'active', health: 'on_track' });
+    expect(await failure(api().createWorkstream({ project: '01JB000000000000000PRJ9999', name: 'Nope' }))).toMatchObject(
+      { code: 'not_found' },
+    );
+  });
+
   it('pages a transcript tail-first and drives a session', async () => {
     const newest = await api().transcript('01JB000000000000000SES0001', { limit: 5 });
     expect(newest.items.length).toBeGreaterThan(0);

@@ -5,7 +5,7 @@ See `docs/build/streams/L.md` and `docs/build/contracts/api-v1.md`. Import from 
 
 | File | What |
 |---|---|
-| `api.ts` | `createApi()`: fetch with `Authorization: Bearer`; every failure is an `ApiError { code, status }` (status 0 when unreachable, `internal` for a 2xx without JSON). Reads for every list in the contract, one `events` page, transcript pages; writes for tasks (create, move, assign, subtasks, comment, dispatch), asks (answer), briefs (edit, pin, accept) and sessions (send, keys, interrupt, end). |
+| `api.ts` | `createApi()`: fetch with `Authorization: Bearer`; every failure is an `ApiError { code, status }` (status 0 when unreachable, `internal` for a 2xx without JSON). Reads for every list in the contract, one `events` page, transcript pages; writes for projects and workstreams (create), tasks (create, patch, move, assign, subtasks, comment, dispatch), asks (answer), briefs (edit, pin, accept) and sessions (send, keys, interrupt, end). |
 | `config.ts` | `VITE_PITCREW_API` (default `http://127.0.0.1:47317`) and `VITE_PITCREW_TOKEN` (default `dev-device-token`), dev server only; any build fails while the token is set. |
 | `types.ts` | Hand-written wire types mirroring the serde names, until generated types exist: the model, `Brief`, `EventsPage` (alias `ActivityPage`), transcripts (`TranscriptItem`, `TranscriptPage`, `PlanItem`), `Key`, `EndMode`, and request bodies. `EVENT_TYPES` lists every `EventBody` type, `TRANSCRIPT_KINDS` every transcript item kind. |
 | `keys.ts` | Query keys. Lists and details sit under separate prefixes (`['tasks', 'list', filters]`, `['tasks', 'detail', id]`). |

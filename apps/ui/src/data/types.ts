@@ -289,6 +289,17 @@ export type BriefTarget = { kind: 'project'; id: ProjectId } | { kind: 'workstre
 
 export type BriefSource = 'person' | 'back_office';
 
+/**
+ * A new "Where it stands" the back office proposed, waiting for a person to accept it or keep the
+ * current one (see `Brief.proposal`). `at` is the time of its `brief_proposed`.
+ */
+export interface BriefProposal {
+  text: string;
+  next?: string;
+  receipts: Receipt[];
+  at: TimestampMs;
+}
+
 /** "Where it stands" for a project or workstream, as in force. */
 export interface Brief {
   target: BriefTarget;
@@ -299,6 +310,12 @@ export interface Brief {
   source: BriefSource;
   updated: TimestampMs;
   receipts: Receipt[];
+  /**
+   * The pending proposal, present exactly when there is one: the newest `brief_proposed` for the
+   * target, newer than the `brief_accepted` that put this brief in force. Accepting it, or keeping
+   * the current brief, clears it.
+   */
+  proposal?: BriefProposal;
 }
 
 export interface Answer {
@@ -389,8 +406,11 @@ export type EventBody =
       type: 'comment_posted';
       data: { task?: TaskId; workstream?: WorkstreamId; text: string; mentions: MemberId[] };
     }
-  | { type: 'brief_proposed'; data: { target: BriefTarget; text: string; receipts: Receipt[] } }
-  | { type: 'brief_accepted'; data: { target: BriefTarget; text: string; pinned: boolean } }
+  | { type: 'brief_proposed'; data: { target: BriefTarget; text: string; next?: string; receipts: Receipt[] } }
+  | {
+      type: 'brief_accepted';
+      data: { target: BriefTarget; text: string; next?: string; pinned: boolean; receipts?: Receipt[] };
+    }
   | {
       type: 'decision_recorded';
       data: { workstream?: WorkstreamId; text: string; why?: string; receipts: Receipt[] };
@@ -498,6 +518,32 @@ export interface EventsQuery extends EventFilters {
   before?: number;
   /** Default 100, at most 500. */
   limit?: number;
+}
+
+/** `POST /v1/projects`. The hub assigns `id`; `external` starts empty. */
+export interface NewProject {
+  /** `ProjectKey`: 2 to 10 characters, an uppercase letter, then uppercase letters or digits. */
+  key: string;
+  name: string;
+  /** Defaults to the caller; always a member (put first when `members` leaves it out). */
+  lead?: MemberId;
+  /** Defaults to the lead alone. Duplicates are dropped. */
+  members?: MemberId[];
+  /** Defaults to `in_progress`. */
+  status?: ProjectStatus;
+  /** `start` must not be after `due` when both are set. */
+  start?: CalendarDate;
+  due?: CalendarDate;
+  root?: Location;
+}
+
+/** `POST /v1/workstreams`. The hub assigns `id`; `health` starts `on_track`, `external` empty. */
+export interface NewWorkstream {
+  project: ProjectId;
+  name: string;
+  /** Defaults to `active`. */
+  status?: WorkstreamStatus;
+  locations?: Location[];
 }
 
 /** `POST /v1/tasks`. The hub assigns the id and the next key in the project. */
