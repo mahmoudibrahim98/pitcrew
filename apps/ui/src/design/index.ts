@@ -16,6 +16,7 @@ export {
   MenuSeparator,
   MenuTrigger,
 } from './menu.tsx';
+export { Popover, type PopoverMode, type PopoverProps } from './popover.tsx';
 export { ResizablePanel } from './resizable-panel.tsx';
 export { StatusPill, type Tone } from './status-pill.tsx';
 export { applyTheme, ThemeToggle, useApplyTheme, useTheme, type ThemeChoice } from './theme.tsx';

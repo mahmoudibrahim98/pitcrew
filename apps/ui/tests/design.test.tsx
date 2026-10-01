@@ -1,13 +1,25 @@
 // @vitest-environment happy-dom
 
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
+import axe from 'axe-core';
 import { useState } from 'react';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Avatar, avatarLabel, initials } from '../src/design/avatar.tsx';
+import { Popover } from '../src/design/popover.tsx';
 import { ResizablePanel } from '../src/design/resizable-panel.tsx';
 import { Tree, TreeItem } from '../src/design/tree.tsx';
 
 afterEach(cleanup);
+
+async function violations(): Promise<string[]> {
+  const result = await axe.run(
+    { exclude: [['[data-radix-focus-guard]']] },
+    { rules: { 'color-contrast': { enabled: false } } },
+  );
+  return result.violations.map(
+    (v) => `${v.id} (${v.impact ?? '?'}): ${v.help} at ${v.nodes.map((n) => JSON.stringify(n.target)).join(', ')}`,
+  );
+}
 
 function Projects() {
   const [open, setOpen] = useState<Record<string, boolean>>({});
@@ -127,5 +139,90 @@ describe('Avatar', () => {
     expect(avatarLabel(writer)).toBe('Writer (agent)');
     render(<Avatar member={writer} owner={sam} />);
     expect(screen.getByRole('img', { name: 'Writer (agent of Sam Rivera)' }).textContent).toBe('WS');
+  });
+});
+
+function Evidence({ label }: { label: string }) {
+  return (
+    <Popover label={`${label}, with evidence`} content={<p>Evidence for {label}</p>} contentLabel={`Evidence for “${label}”`}>
+      {label}
+    </Popover>
+  );
+}
+
+describe('Popover', () => {
+  beforeEach(() => {
+    // What index.html gives the real page; axe flags their absence otherwise.
+    document.title = 'PitCrew';
+    document.documentElement.lang = 'en';
+  });
+
+  it('has no axe violations closed or open', async () => {
+    render(
+      <main>
+        <h1>Notes</h1>
+        <p>
+          <Evidence label="moved PAP-1" /> happened.
+        </p>
+      </main>,
+    );
+    expect(await violations()).toEqual([]);
+    fireEvent.click(screen.getByRole('button', { name: 'moved PAP-1, with evidence' }));
+    await screen.findByRole('dialog', { name: 'Evidence for “moved PAP-1”' });
+    expect(await violations()).toEqual([]);
+  });
+
+  it('previews on focus (inert) without moving focus, opens with focus moved in, and Escape returns it', async () => {
+    render(<Evidence label="moved PAP-1" />);
+    const trigger = screen.getByRole('button', { name: 'moved PAP-1, with evidence' });
+    expect(trigger.getAttribute('aria-expanded')).toBe('false');
+
+    // Focus previews it, inert, without moving focus off the trigger.
+    act(() => trigger.focus());
+    const preview = await screen.findByRole('dialog', { name: 'Evidence for “moved PAP-1”' });
+    expect(preview.hasAttribute('inert')).toBe(true);
+    expect(document.activeElement).toBe(trigger);
+
+    // Enter opens it: focus moves in.
+    fireEvent.keyDown(trigger, { key: 'Enter' });
+    expect(trigger.getAttribute('aria-expanded')).toBe('true');
+    const dialog = screen.getByRole('dialog', { name: 'Evidence for “moved PAP-1”' });
+    await vi.waitFor(() => expect(document.activeElement).toBe(dialog));
+    expect(dialog.hasAttribute('inert')).toBe(false);
+    expect(trigger.getAttribute('aria-controls')).toBe(dialog.id);
+
+    // Escape closes it and returns focus to the trigger, without previewing it again.
+    act(() => dialog.focus());
+    fireEvent.keyDown(dialog, { key: 'Escape' });
+    await vi.waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(document.activeElement).toBe(trigger);
+    expect(trigger.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('previews on hover, and the pointer can move in to follow something in the content', async () => {
+    render(<Evidence label="ran a tool" />);
+    const trigger = screen.getByRole('button', { name: 'ran a tool, with evidence' });
+    fireEvent.pointerEnter(trigger);
+    const preview = await screen.findByRole('dialog', { name: 'Evidence for “ran a tool”' });
+    expect(preview.hasAttribute('inert')).toBe(false);
+    expect(trigger.getAttribute('aria-expanded')).toBe('false');
+
+    // Moving from the trigger into the content keeps it open.
+    fireEvent.pointerLeave(trigger);
+    fireEvent.pointerEnter(preview);
+    await new Promise((done) => setTimeout(done, 400));
+    expect(screen.getByRole('dialog')).toBe(preview);
+
+    fireEvent.pointerLeave(preview);
+    await vi.waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  });
+
+  it('a second click toggles it closed', async () => {
+    render(<Evidence label="moved PAP-1" />);
+    const trigger = screen.getByRole('button', { name: 'moved PAP-1, with evidence' });
+    fireEvent.click(trigger);
+    await screen.findByRole('dialog');
+    fireEvent.click(trigger);
+    await vi.waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
   });
 });
