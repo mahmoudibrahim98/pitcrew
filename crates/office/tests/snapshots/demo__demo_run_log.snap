@@ -1,0 +1,18 @@
+---
+source: crates/office/tests/demo.rs
+expression: "out.join(\"\\n\")"
+---
+rev 32 #0 · dispatch_to_review · emitted · move PAP-3 InProgress -> Review as BackOffice { accept_auto: false }
+    <- evt:EVT0002
+rev 49 #0 · remind_stale_asks · emitted · ask Mention to @sam: "Reminder: Co-author responses are ready for review" / "Open for 4 days, since 2026-09-29."
+    <- evt:000000Z, file:/home/sam/work/diffusion-paper/paper/responses.md
+rev 49 #1 · remind_stale_asks · emitted · ask Mention to @sam: "Reminder: Seed 3 diverged at epoch 9. Rerun or drop it?" / "Open for 4 days, since 2026-09-30."
+    <- evt:EVT0010, job:4815164, transcript@120544
+rev 49 #2 · remind_stale_asks · emitted · ask Mention to @sam: "Reminder: Merge the benchmark change into parsers?" / "Open for 4 days, since 2026-09-30."
+    <- evt:000000Y, transcript@48213
+rev 49 #3 · quiet_workstream · emitted · propose brief for Submission (Propose): "No activity for 4 days (since 2026-09-30), paused? Next: mark it paused, or give it a next step."
+    <- evt:EVT0007
+rev 49 #4 · quiet_workstream · emitted · propose brief for Seed runs (Propose): "No activity for 4 days (since 2026-09-30), paused? Next: mark it paused, or give it a next step."
+    <- evt:EVT0012
+rev 49 #5 · quiet_workstream · emitted · propose brief for Parsers (Propose): "No activity for 4 days (since 2026-09-30), paused? Next: mark it paused, or give it a next step."
+    <- evt:EVT0014
