@@ -12,6 +12,7 @@
 //! - [`registry`]: the workspaces, saved in the app's local data directory.
 //! - [`keychain`]: where remote workspaces' device tokens will live.
 //! - [`app`]: the Tauri wiring: the window, its CSP and capability, single instance, cleanup.
+//! - [`navigate`]: deep links (`pitcrew://…`) and notification clicks, as `gateway://navigate`.
 //!
 //! **Owned by stream K.**
 
@@ -21,8 +22,10 @@ pub mod daemon;
 pub mod gateway;
 pub mod keychain;
 pub mod logging;
+pub mod navigate;
 pub mod redact;
 pub mod registry;
+pub mod scheme;
 pub mod settings;
 pub mod token;
 
