@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// Parity check: replays the requests and assertions of apps/mock-hub/test/http.test.ts against
-// the mock hub and against a real pitcrewd, each test on a fresh server (as the mock's
-// `withServer` does), and prints every check that fails on either side.
+// Parity check: replays the requests and assertions of apps/mock-hub/test/http.test.ts (and the
+// first test of each route in edits.test.ts) against the mock hub and against a real pitcrewd,
+// each test on a fresh server (as the mock's `withServer` does), and prints every check that
+// fails on either side.
 //
 //   node crates/daemon/parity/replay.mjs --pitcrewd <path to pitcrewd> [--json <report.json>]
 //
@@ -403,6 +404,72 @@ const TESTS = {
     const tooling = await r.call('GET', `/v1/events?project=${ID.tooling}`, { token: 'device' });
     r.check('project=tooling: status', tooling.status, 200);
     r.check('project=tooling: id suffixes', tooling.body?.events?.map((e) => e.id.slice(-4)), ['0008', '0013', '0014']);
+  },
+
+  // The mock's test runs with `scanWindow: 5`, an option of the mock only; this is its part that
+  // holds at the default window.
+  'filtered paging until at_start finds every match (default scan window)': async (r) => {
+    const get = async (query) => (await r.call('GET', `/v1/events${query}`, { token: 'device' })).body;
+    const seen = [];
+    let page = await get(`?task=${ID.pap1}&limit=1`);
+    const pages = [page];
+    while (page && !page.at_start && pages.length < 20) {
+      page = await get(`?task=${ID.pap1}&limit=1&before=${page.from_rev}`);
+      pages.push(page);
+    }
+    for (const p of pages) seen.unshift(...(p?.events ?? []).map((e) => e.id.slice(-4)));
+    r.check('every match', seen, ['0004', '0005', '0006', '0007']);
+    r.check('only the last page is at_start', pages.map((p) => p?.at_start), [...pages.slice(1).map(() => false), true]);
+    r.check('no match', await get('?task=01JB000000000000000TSK0099'), { events: [], from_rev: 0, to_rev: 0, at_start: true });
+  },
+
+  // The work-edits contract (apps/mock-hub/test/edits.test.ts): the first test of each route.
+  'edits: POST /v1/projects creates a project with the defaults': async (r) => {
+    const res = await r.call('POST', '/v1/projects', { token: 'device', json: { key: 'THS', name: 'Thesis' } });
+    r.check('status', res.status, 201);
+    r.check('body', res.body, { id: res.body?.id, key: 'THS', name: 'Thesis', status: 'in_progress', lead: ID.sam, members: [ID.sam], external: [] });
+    const activity = await r.call('GET', '/v1/events?limit=1', { token: 'device' });
+    r.check('event', activity.body?.events?.[0]?.body, { type: 'project_created', data: { project: res.body } });
+    const task = await r.call('POST', '/v1/tasks', { token: 'device', json: { project: res.body?.id, title: 'Outline chapter 1' } });
+    r.check('first task key', task.body?.key, 'THS-1');
+  },
+
+  'edits: POST /v1/workstreams creates an active, on-track workstream': async (r) => {
+    const res = await r.call('POST', '/v1/workstreams', { token: 'device', json: { project: ID.paper, name: 'Figures' } });
+    r.check('status', res.status, 201);
+    r.check('body', res.body, { id: res.body?.id, project: ID.paper, name: 'Figures', status: 'active', health: 'on_track', locations: [], external: [] });
+    const activity = await r.call('GET', '/v1/events?limit=1', { token: 'device' });
+    r.check('event', activity.body?.events?.[0]?.body, { type: 'workstream_created', data: { workstream: res.body } });
+  },
+
+  'edits: PATCH /v1/tasks emits task_updated with only what changed': async (r) => {
+    const res = await r.call('PATCH', '/v1/tasks/PAP-2', {
+      token: 'device',
+      json: { title: '  Make figure 3  ', priority: 'medium', labels: [' figures ', 'paper', 'figures'], accept_auto: false },
+    });
+    r.check('status', res.status, 200);
+    r.check('title', res.body?.title, 'Make figure 3');
+    r.check('labels', res.body?.labels, ['figures', 'paper']);
+    const activity = await r.call('GET', '/v1/events?limit=1', { token: 'device' });
+    r.check('event', activity.body?.events?.[0]?.body, {
+      type: 'task_updated',
+      data: { task: '01JB000000000000000TSK0002', patch: { title: 'Make figure 3', labels: ['figures', 'paper'] } },
+    });
+  },
+
+  'edits: PUT /v1/briefs stores next, and brief_accepted carries it': async (r) => {
+    const res = await r.call('PUT', `/v1/briefs/workstream/${ID.submission}`, {
+      token: 'device',
+      json: { text: '§3.2 is drafted.', next: 'Send it to the co-authors.', pinned: false },
+    });
+    r.check('status', res.status, 200);
+    r.check('next', res.body?.next, 'Send it to the co-authors.');
+    r.check('source', res.body?.source, 'person');
+    const activity = await r.call('GET', '/v1/events?limit=1', { token: 'device' });
+    r.check('event', activity.body?.events?.[0]?.body, {
+      type: 'brief_accepted',
+      data: { target: { kind: 'workstream', id: ID.submission }, text: '§3.2 is drafted.', next: 'Send it to the co-authors.', pinned: false },
+    });
   },
 
   'CORS preflights for local origins only': async (r) => {

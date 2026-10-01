@@ -104,9 +104,10 @@ directory for a fresh demo. The CLI takes the same token from the file:
 
 ## Parity with the mock hub
 
-`parity/replay.mjs` replays the requests and assertions of `apps/mock-hub/test/http.test.ts`
-against the mock hub and against a real daemon (fresh per test, `serve --demo`), and prints every
-check that differs:
+`parity/replay.mjs` replays the requests and assertions of `apps/mock-hub/test/http.test.ts`, and
+the first test of each route in `edits.test.ts`, against the mock hub and against a real daemon
+(fresh per test, `serve --demo`), and prints every check that differs. It needs Node 24, which
+imports the mock's TypeScript; a Windows `pitcrewd.exe` works as well as a Linux binary:
 
 ```bash
 cargo build -p pitcrew-daemon
@@ -122,9 +123,8 @@ request that changed this crate).
 covers `--version`, `token show-path`, tokens and scopes, the work routes, the stream (a move
 appears on it; a reconnect with `since` gets what it missed), hooks, terminals, CORS and the
 `Host` guard, the single-daemon lock, and on Unix a SIGTERM stop: a clean store, `--demo`
-refused afterwards, and a restart that keeps the token, the log and the data. Nothing it logs, at
-debug, holds a token. `sigterm_closes_streams_with_1001` is ignored until `pitcrew-api` closes
-WebSockets on shutdown (`s/H/terminal-hardening`).
+refused afterwards, a stream closed with 1001, and a restart that keeps the token, the log and
+the data. Nothing it logs, at debug, holds a token.
 
 ## Not wired yet
 
