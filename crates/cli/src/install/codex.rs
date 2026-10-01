@@ -20,6 +20,10 @@
 //! new chain refuses to overwrite a sidecar that records a *different* original (stale from an
 //! earlier, different chain), and refuses outright if the foreign `notify` already names
 //! `pitcrew` itself — wrapping ourselves must stay impossible.
+//!
+//! A leading UTF-8 BOM, if the file has one, is preserved (`toml_edit` does not accept one as
+//! part of a valid document, so it is split off before parsing and put back before writing, the
+//! same as `claude.rs` does for `settings.json`).
 
 use super::{Change, Plan, Status, Target};
 use crate::config::Env;
@@ -131,11 +135,16 @@ pub(crate) fn chained_original(env: Env<'_>) -> Option<Vec<String>> {
     parse_sidecar(&bytes).map(|record| record.values)
 }
 
-fn parse(path: &Path, bytes: &[u8]) -> Result<DocumentMut> {
+/// Parses `bytes` as TOML, returning whether it started with a BOM (split off first: `toml_edit`
+/// does not accept one as part of a valid document) alongside the document.
+fn parse(path: &Path, bytes: &[u8]) -> Result<(bool, DocumentMut)> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| Error::invalid(format!("{} is not UTF-8 text", path.display())))?;
-    text.parse::<DocumentMut>()
-        .map_err(|e| Error::invalid(format!("{} is not valid TOML: {e}", path.display())))
+    let (had_bom, rest) = super::split_bom(text);
+    let doc = rest
+        .parse::<DocumentMut>()
+        .map_err(|e| Error::invalid(format!("{} is not valid TOML: {e}", path.display())))?;
+    Ok((had_bom, doc))
 }
 
 /// Parses `value_text` (the exact source text of a `notify` value, as recorded) back into an
@@ -203,8 +212,11 @@ fn match_line_endings(generated: String, before: Option<&[u8]>) -> String {
     out
 }
 
-fn file_change(path: PathBuf, before: Option<Vec<u8>>, doc: DocumentMut) -> Change {
-    let after = match_line_endings(doc.to_string(), before.as_deref());
+fn file_change(path: PathBuf, before: Option<Vec<u8>>, doc: DocumentMut, had_bom: bool) -> Change {
+    let after = super::with_bom(
+        had_bom,
+        match_line_endings(doc.to_string(), before.as_deref()),
+    );
     Change {
         path,
         before,
@@ -236,9 +248,9 @@ pub(crate) fn plan_install(env: Env<'_>, exe: &str, chain: bool) -> Result<Plan>
             ));
         }
     }
-    let mut doc = match &before {
+    let (had_bom, mut doc) = match &before {
         Some(bytes) => parse(&path, bytes)?,
-        None => DocumentMut::new(),
+        None => (false, DocumentMut::new()),
     };
     let existing_item = doc.get("notify").cloned();
     let existing = existing_item.as_ref().and_then(as_strings);
@@ -250,7 +262,7 @@ pub(crate) fn plan_install(env: Env<'_>, exe: &str, chain: bool) -> Result<Plan>
                 target: Target::Codex,
                 status: Status::Missing,
                 detail: format!("{} (notify is not set)", path.display()),
-                changes: vec![file_change(path, before, doc)],
+                changes: vec![file_change(path, before, doc, had_bom)],
             })
         }
         Some(_) if existing.is_none() => Ok(conflicting(
@@ -285,7 +297,7 @@ pub(crate) fn plan_install(env: Env<'_>, exe: &str, chain: bool) -> Result<Plan>
                         "{} (chained; updating the executable's path)",
                         path.display()
                     ),
-                    changes: vec![file_change(path, before, doc)],
+                    changes: vec![file_change(path, before, doc, had_bom)],
                 })
             } else if is_ours(&existing) {
                 set_notify(&mut doc, &direct_target);
@@ -293,7 +305,7 @@ pub(crate) fn plan_install(env: Env<'_>, exe: &str, chain: bool) -> Result<Plan>
                     target: Target::Codex,
                     status: Status::Installed,
                     detail: format!("{} (updating the executable's path)", path.display()),
-                    changes: vec![file_change(path, before, doc)],
+                    changes: vec![file_change(path, before, doc, had_bom)],
                 })
             } else if !chain {
                 Ok(conflicting(
@@ -363,7 +375,7 @@ pub(crate) fn plan_install(env: Env<'_>, exe: &str, chain: bool) -> Result<Plan>
                             delete: false,
                             executable: false,
                         },
-                        file_change(path, before, doc),
+                        file_change(path, before, doc, had_bom),
                     ],
                 })
             }
@@ -384,7 +396,7 @@ pub(crate) fn plan_uninstall(env: Env<'_>) -> Result<Plan> {
              does not have to guess which one the rest of the file should use",
         ));
     }
-    let mut doc = parse(&path, before_bytes)?;
+    let (had_bom, mut doc) = parse(&path, before_bytes)?;
     let Some(existing) = doc.get("notify").and_then(as_strings) else {
         return Ok(missing_plan(path));
     };
@@ -411,7 +423,7 @@ pub(crate) fn plan_uninstall(env: Env<'_>) -> Result<Plan> {
         // `notify` already points at the real original again, never at a chain whose record is
         // about to be removed.
         let changes = vec![
-            file_change(path.clone(), before, doc),
+            file_change(path.clone(), before, doc, had_bom),
             Change {
                 path: sidecar_path,
                 before: sidecar_before,
@@ -439,7 +451,7 @@ pub(crate) fn plan_uninstall(env: Env<'_>) -> Result<Plan> {
         target: Target::Codex,
         status: Status::Installed,
         detail: format!("{} (removing our notify hook)", path.display()),
-        changes: vec![file_change(path, before, doc)],
+        changes: vec![file_change(path, before, doc, had_bom)],
     })
 }
 
@@ -546,7 +558,7 @@ mod tests {
         apply(&plan);
 
         let now = std::fs::read(&config_path).unwrap();
-        let parsed = parse(&config_path, &now).unwrap();
+        let (_, parsed) = parse(&config_path, &now).unwrap();
         let notify = as_strings(parsed.get("notify").unwrap()).unwrap();
         assert_eq!(notify, vec![EXE, "hook", "codex", "notify", "--chain"]);
         // No wrapper script of any kind is ever written.
@@ -727,6 +739,52 @@ mod tests {
             restored, original,
             "CRLF and the missing final newline must survive"
         );
+    }
+
+    #[test]
+    fn a_bom_and_crlf_round_trip_through_install_and_uninstall() {
+        // R24: a Codex config.toml that starts with a UTF-8 BOM used to come back without one
+        // after install, and uninstall never put it back.
+        let original = "\u{feff}model = \"bom\"\r\napproval_policy = \"never\"\r\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, original).unwrap();
+        let env = env_of(&[("CODEX_HOME", tmp.path().to_str().unwrap())]);
+
+        let plan = plan_install(&env, EXE, false).unwrap();
+        assert!(plan.status == Status::Missing, "{}", plan.detail);
+        let after = String::from_utf8(plan.changes[0].after.clone()).unwrap();
+        assert!(after.starts_with('\u{feff}'), "BOM must survive install");
+        assert!(after.contains("\r\n"), "CRLF must survive install");
+        std::fs::write(&config_path, &after).unwrap();
+
+        let plan = plan_uninstall(&env).unwrap();
+        let restored = String::from_utf8(plan.changes[0].after.clone()).unwrap();
+        assert_eq!(
+            restored, original,
+            "install then uninstall must give a byte-identical file back"
+        );
+    }
+
+    #[test]
+    fn a_bom_survives_a_chained_install_and_uninstall_too() {
+        let original = "\u{feff}notify = [\"terminal-notifier\"]\r\n";
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, original).unwrap();
+        let env = env_of(&[("CODEX_HOME", tmp.path().to_str().unwrap())]);
+
+        let plan = plan_install(&env, EXE, true).unwrap();
+        apply(&plan);
+        let installed = std::fs::read(&config_path).unwrap();
+        assert!(
+            String::from_utf8_lossy(&installed).starts_with('\u{feff}'),
+            "BOM must survive a chained install"
+        );
+
+        let plan = plan_uninstall(&env).unwrap();
+        let restored = String::from_utf8(plan.changes[0].after.clone()).unwrap();
+        assert_eq!(restored, original, "uninstall must restore the BOM too");
     }
 
     #[test]
