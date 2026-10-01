@@ -453,9 +453,9 @@ fn fact_text(fact: &Fact, n: &Names<'_>, detail: Detail) -> String {
             quoted(base, Some(title), detail)
         }
         FactKind::AskAnswered { ask } => match n.0.ask(*ask) {
-            Some(info) => {
-                let from = n.member(info.from);
-                match info.kind {
+            Some((kind, from)) => {
+                let from = n.member(from);
+                match kind {
                     AskKind::Question => format!("answered a question from {from}"),
                     AskKind::Decision => format!("decided on a question from {from}"),
                     AskKind::Review => format!("reviewed work from {from}"),

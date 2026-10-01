@@ -51,8 +51,25 @@ fn config() -> impl Strategy<Value = Config> {
     })
 }
 
+/// The directory's limit: the default, or small enough that entries are dropped all the time.
+fn limit() -> impl Strategy<Value = Option<usize>> {
+    prop_oneof![3 => Just(None), 2 => (1usize..8).prop_map(Some)]
+}
+
 fn is_hidden(c: char) -> bool {
-    c.is_control() || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+                | '\u{E0000}'..='\u{E007F}'
+        )
 }
 
 fn sorted(mut blocks: Vec<Block>) -> Vec<Block> {
@@ -64,14 +81,16 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
 
     /// Feeding events in random batches, and replaying the changes each batch reports, gives the
-    /// same blocks as building from all the events at once.
+    /// same blocks as building from all the events at once, and the same directory, also when the
+    /// directory is small enough to drop entries all the time.
     #[test]
     fn batches_give_the_same_blocks(
         specs in vec(spec(), 0..250),
         sizes in vec(1usize..25, 1..40),
         cfg in config(),
+        limit in limit(),
     ) {
-        let world = World::new(5, 7, 3);
+        let world = World::with_limit(5, 7, 3, limit);
         let events = gen_events(&specs, &world, T0, 1);
         let all = blocks(&events, &world.dir, &cfg);
 
@@ -104,6 +123,12 @@ proptest! {
             prop_assert_eq!(replayed.get(&b.id), Some(b));
         }
         prop_assert_eq!(sorted(replayed.into_values().collect()), all.clone());
+        let mut observed = world.dir.clone();
+        for e in &events {
+            observed.observe(e);
+        }
+        prop_assert_eq!(builder.directory(), &observed);
+        prop_assert_eq!(plain.directory(), &observed);
         prop_assert_eq!(plain.finish(), all.clone());
 
         // Every event lands in exactly one block, or is skipped.
@@ -256,16 +281,23 @@ proptest! {
 
 /// Like the demo's check, over a larger generated log with many sessions open at once and a small
 /// `max_open`, so closing and evicting order matter: two independent runs (each with fresh
-/// random hash seeds) give byte-identical JSON, whole or in batches.
+/// random hash seeds) give byte-identical JSON, whole or in batches. Also with a directory that
+/// drops entries.
 #[test]
 fn output_never_depends_on_the_hash_seed() {
+    for limit in [None, Some(16)] {
+        output_is_deterministic(limit);
+    }
+}
+
+fn output_is_deterministic(limit: Option<usize>) {
     let specs = common::SplitMix(7).specs(3_000, 120_000);
     let cfg = Config {
         max_open: 5,
         ..Config::default()
     };
     let run = || {
-        let world = World::new(40, 60, 8);
+        let world = World::with_limit(40, 60, 8, limit);
         let events = gen_events(&specs, &world, T0, 1);
         let all = blocks(&events, &world.dir, &cfg);
         let mut builder = BlockBuilder::new(cfg.clone(), world.dir.clone());

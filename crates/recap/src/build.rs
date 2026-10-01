@@ -6,7 +6,9 @@
 //! - events that name a task (moves, plans, assignments, comments) go to the task's session while
 //!   that session has an open block, and otherwise to the task's workstream (or project);
 //! - workstream events (health, briefs, decisions) go to the workstream;
-//! - machine liveness, project creation and brief proposals are not activity and are skipped.
+//! - machine liveness, project creation and brief proposals are not activity and are skipped, and
+//!   so are events the hub ignores: a stale move, or a link that would replace a firm one (see
+//!   [`Directory`]).
 //!
 //! **Closing.** Before each event is placed, every open block whose last event is more than the
 //! gap older than it is closed. The next event for that key then starts a new block. Closing
@@ -97,7 +99,9 @@ impl BlockBuilder {
         &self.directory
     }
 
-    /// Events that belonged to no block (no session, task or workstream could be found).
+    /// Events that belonged to no block: no session, task or workstream could be found, or the
+    /// hub ignores them (a stale move, or a link that would replace a firm one; see
+    /// [`Directory`]).
     #[must_use]
     pub fn skipped(&self) -> u64 {
         self.skipped
@@ -105,9 +109,10 @@ impl BlockBuilder {
 
     /// Adds one event.
     pub fn push(&mut self, event: &Event) {
-        self.directory.observe(event);
+        let activity = self.directory.learn(event);
         self.close_before(event.at);
-        let Some(route) = self.route(event) else {
+        let route = if activity { self.route(event) } else { None };
+        let Some(route) = route else {
             self.skipped = self.skipped.saturating_add(1);
             return;
         };
@@ -223,7 +228,7 @@ impl BlockBuilder {
                 (None, None) => None,
             },
             EventBody::AskAnswered { ask, .. } => {
-                let info = self.directory.ask(*ask)?;
+                let info = self.directory.ask_info(*ask)?;
                 match (info.session, info.task) {
                     (Some(s), task) if self.open.contains_key(&Session(s)) => {
                         Some(Route::new(Session(s), task))

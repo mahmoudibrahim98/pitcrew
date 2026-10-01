@@ -9,9 +9,9 @@ use pitcrew_protocol::ids::{
     TaskId, TaskKey, WorkspaceId, WorkstreamId,
 };
 use pitcrew_protocol::model::{
-    Answer, Ask, AskKind, AskState, Dispatch, DispatchOutcome, Engine, Health, Liveness, Member,
-    MemberKind, Priority, Receipt, Scheduler, Session, SessionState, Subtask, SubtaskSource, Task,
-    TaskStatus, Workstream, WorkstreamStatus,
+    Answer, Ask, AskKind, AskState, Dispatch, DispatchOutcome, Engine, Health, LinkBasis, Liveness,
+    Member, MemberKind, Priority, Receipt, Scheduler, Session, SessionState, Subtask,
+    SubtaskSource, Task, TaskStatus, Workstream, WorkstreamStatus,
 };
 use pitcrew_recap::{Block, Directory, Summary};
 use std::collections::HashSet;
@@ -49,6 +49,8 @@ pub struct World {
     pub agents: Vec<MemberId>,
     pub sessions: Vec<SessionId>,
     pub tasks: Vec<TaskId>,
+    /// The tasks as the directory was seeded with them.
+    pub task_docs: Vec<Task>,
     pub workstreams: Vec<WorkstreamId>,
     pub asks: Vec<AskId>,
     pub dispatches: Vec<DispatchId>,
@@ -56,7 +58,17 @@ pub struct World {
 
 impl World {
     pub fn new(sessions: usize, tasks: usize, workstreams: usize) -> Self {
-        let mut dir = Directory::new();
+        Self::with_limit(sessions, tasks, workstreams, None)
+    }
+
+    /// A world whose directory keeps at most `limit` entries of each kind (`None`: the default).
+    pub fn with_limit(
+        sessions: usize,
+        tasks: usize,
+        workstreams: usize,
+        limit: Option<usize>,
+    ) -> Self {
+        let mut dir = limit.map_or_else(Directory::new, Directory::with_limit);
         let workspace = WorkspaceId(id(2, 1));
         let project = ProjectId(id(3, 1));
         let person = MemberId(id(4, 0));
@@ -97,10 +109,11 @@ impl World {
         let tasks: Vec<TaskId> = (0..tasks.max(1))
             .map(|n| TaskId(id(6, n as u128)))
             .collect();
+        let mut task_docs = Vec::with_capacity(tasks.len());
         for (i, t) in tasks.iter().enumerate() {
             // Every fifth task has no workstream and lives directly under the project.
             let workstream = (i % 5 != 4).then(|| workstreams[i % workstreams.len()]);
-            dir.add_task(&Task {
+            let task = Task {
                 id: *t,
                 key: TaskKey::new(key.clone(), i as u32 + 1).expect("valid key"),
                 project,
@@ -117,7 +130,9 @@ impl World {
                 source: None,
                 accept_auto: false,
                 subtasks: vec![],
-            });
+            };
+            dir.add_task(&task);
+            task_docs.push(task);
         }
         let sessions: Vec<SessionId> = (0..sessions.max(1))
             .map(|n| SessionId(id(7, n as u128)))
@@ -136,6 +151,7 @@ impl World {
             agents,
             sessions,
             tasks,
+            task_docs,
             workstreams,
             asks,
             dispatches,
@@ -380,20 +396,25 @@ pub fn gen_events(specs: &[Spec], w: &World, start: i64, first_id: u64) -> Vec<E
                     )
                 }
             }
-            _ => match b % 4 {
-                0 => (
-                    agent,
-                    EventBody::SessionDiscovered {
-                        session: session(s, agent, Some(t), Some("New session".into())),
-                    },
-                ),
+            _ => match b % 6 {
+                // Discovered, linked by a dispatch or with no basis.
+                0 => {
+                    let mut found = session(s, agent, Some(t), Some("New session".into()));
+                    found.link_basis = flag.then_some(LinkBasis::Dispatch);
+                    (agent, EventBody::SessionDiscovered { session: found })
+                }
+                // Linked by a person, or inferred from the folder.
                 1 => (
                     w.person,
                     EventBody::SessionLinked {
                         session: s,
                         workstream: Some(w.workstreams[a % w.workstreams.len()]),
                         task: flag.then_some(t),
-                        basis: pitcrew_protocol::model::LinkBasis::Manual,
+                        basis: if a % 2 == 0 {
+                            LinkBasis::Manual
+                        } else {
+                            LinkBasis::Folder
+                        },
                     },
                 ),
                 2 => (
@@ -403,7 +424,19 @@ pub fn gen_events(specs: &[Spec], w: &World, start: i64, first_id: u64) -> Vec<E
                         liveness: Liveness::Live,
                     },
                 ),
-                _ => (w.person, EventBody::SessionEnded { session: s }),
+                3 => (w.person, EventBody::SessionEnded { session: s }),
+                // Re-stated by the runner, with no link and no agent.
+                4 => {
+                    let mut again = session(s, agent, None, None);
+                    again.agent = None;
+                    (agent, EventBody::SessionDiscovered { session: again })
+                }
+                // A task re-stated at some status.
+                _ => {
+                    let mut task = w.task_docs[b % w.task_docs.len()].clone();
+                    task.status = STATUSES[a % STATUSES.len()];
+                    (w.person, EventBody::TaskCreated { task })
+                }
             },
         };
         out.push(Event {
