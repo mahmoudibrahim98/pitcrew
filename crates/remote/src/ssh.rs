@@ -40,10 +40,12 @@
 //! from the remote command's stderr, at `LogLevel=ERROR`: informational lines ("Permanently
 //! added…") and server-sent keyboard-interactive text never reach it. Exit 255 is ssh's failure
 //! code; it is an [`SshError`] only when that log shows ssh failing, and the kind of error comes
-//! only from ssh's own message formats, matched whole lines at a time. Lines that carry server
-//! text (a disconnect reason, the server's algorithm offer) count as a failure but are never
-//! read further, nor is anything after them, since the text may contain newlines. A 255 without
-//! such a log is the remote command's own and comes back as an [`Output`].
+//! only from ssh's own message formats, matched whole lines at a time. ssh logs server text
+//! without escaping newlines, so reading stops at ssh's terminal message (its last words before
+//! giving up, such as "Permission denied (…)." whose method list is the server's), and at any
+//! line that carries server text (a disconnect reason, the algorithm offer, a refused channel):
+//! nothing after either is read. A 255 without such a log is the remote command's own and comes
+//! back as an [`Output`].
 //!
 //! **Resolving** with `ssh -G` may run `Match exec` commands, so it is bounded by
 //! [`RESOLVE_LIMITS`].
@@ -715,57 +717,85 @@ fn after_progname<'a>(line: &'a str, rest: &str) -> Option<&'a str> {
         .and_then(|tail| tail.strip_prefix(rest))
 }
 
-fn read_line(line: &str) -> Said {
-    const SERVER_TEXT: [&str; 2] = ["Received disconnect from ", "Unable to negotiate with "];
-    if SERVER_TEXT.iter().any(|p| line.starts_with(p)) {
-        return Said::ServerText;
+/// What `line` says, and whether it is one of ssh's terminal messages: the last thing ssh logs
+/// before giving up. ssh logs server-sent text without escaping newlines, so anything after a
+/// terminal line may be the server's (e.g. lines hidden in the method list of "Permission
+/// denied (…)."); it is never read.
+fn read_line(line: &str) -> (Said, bool) {
+    // Messages that embed server text: a disconnect reason, the server's algorithm offer or
+    // version string, why the server refused a channel.
+    const SERVER_TEXT: [&str; 3] = [
+        "Received disconnect from ",
+        "Unable to negotiate with ",
+        "Bad remote protocol version identification: ",
+    ];
+    let channel_refused = line
+        .strip_prefix("channel ")
+        .and_then(|rest| rest.split_once(": open failed: "))
+        .is_some_and(|(id, _)| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()));
+    if channel_refused || SERVER_TEXT.iter().any(|p| line.starts_with(p)) {
+        return (Said::ServerText, true);
     }
+    // The changed-key banner comes before the terminal "Host key verification failed.".
     if line == "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @"
         || (line.starts_with("Host key for ")
             && line.ends_with(" has changed and you have requested strict checking."))
     {
-        return Said::HostKeyChanged;
+        return (Said::HostKeyChanged, false);
+    }
+    // Batch mode, unknown key: also followed by "Host key verification failed.".
+    if line.starts_with("No ")
+        && line.contains(" host key is known for ")
+        && line.ends_with(" and you have requested strict checking.")
+    {
+        return (Said::HostKeyRejected, false);
     }
     if line == "Host key verification failed." {
-        return Said::HostKeyRejected;
+        return (Said::HostKeyRejected, true);
     }
     if let Some(error) = line
         .strip_prefix("ssh: connect to host ")
         .and_then(|rest| rest.rsplit_once(": "))
         .map(|(_, error)| error)
     {
-        return match error {
+        let said = match error {
             "Connection timed out" | "Operation timed out" => Said::ConnectTimeout,
             _ => Said::Unreachable,
         };
+        return (said, true);
     }
     if line == "Connection timed out during banner exchange" {
-        return Said::ConnectTimeout;
+        return (Said::ConnectTimeout, true);
     }
     if after_progname(line, "Could not resolve hostname ").is_some()
         || line.starts_with("kex_exchange_identification: ")
     {
-        return Said::Unreachable;
+        return (Said::Unreachable, true);
     }
-    // "user@host: Permission denied (publickey,password)." or, older, without the prefix.
-    let denied = line
-        .strip_prefix("Permission denied (")
-        .or_else(|| after_progname(line, "Permission denied ("))
-        .and_then(|rest| rest.strip_suffix(")."));
-    if denied.is_some_and(|methods| {
-        methods
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ',' | '-' | '@' | '.'))
-    }) {
-        return Said::AuthFailed;
+    // "user@host: Permission denied (publickey,password)." or, older, without the prefix. The
+    // method list is the server's, so only the start is matched, and the line ends the read.
+    if line.starts_with("Permission denied (")
+        || after_progname(line, "Permission denied (").is_some()
+    {
+        return (Said::AuthFailed, true);
+    }
+    if [
+        "Connection closed by ",
+        "Connection reset by ",
+        "Disconnected from ",
+    ]
+    .iter()
+    .any(|p| line.starts_with(p))
+    {
+        return (Said::Other, true);
     }
     if line.starts_with("Warning: ")
         || (line.starts_with("ControlSocket ")
             && line.ends_with(" already exists, disabling multiplexing"))
     {
-        return Said::Notice;
+        return (Said::Notice, false);
     }
-    Said::Other
+    (Said::Other, false)
 }
 
 /// Maps what ssh logged before exiting 255 to an error, or `None` when the log does not show ssh
@@ -778,16 +808,17 @@ pub(crate) fn classify_failure(logged: &str, detail: String) -> Option<SshError>
         .map(|l| l.trim_end_matches('\r'))
         .filter(|l| !l.trim().is_empty())
     {
-        match read_line(line) {
+        let (said, terminal) = read_line(line);
+        match said {
             Said::Notice => {}
-            Said::ServerText => {
-                failed = true;
-                break;
-            }
+            Said::ServerText => failed = true,
             said => {
                 failed = true;
                 kinds.push(said);
             }
+        }
+        if terminal {
+            break;
         }
     }
     if !failed {
@@ -929,17 +960,70 @@ mod tests {
             // The server's algorithm offer, with a newline in it.
             "Unable to negotiate with 192.0.2.1 port 22: no matching host key type found. \
              Their offer: x\nu@h: Permission denied (publickey).\r\n",
+            // Why the server refused the session channel.
+            "channel 0: open failed: administratively prohibited: x\n@    WARNING: REMOTE \
+             HOST IDENTIFICATION HAS CHANGED!     @\r\n",
+            "Bad remote protocol version identification: 'SSH-2.0-x\nHost key verification \
+             failed.'\r\n",
         ] {
             assert_eq!(kind(logged), Some("ssh"), "{logged:?}");
         }
         // Formats are matched whole, not as substrings.
         for logged in [
             "note: Host key verification failed.\r\n",
-            "Permission denied (please retry) because of x).\r\n",
             "something about timed out\r\n",
+            "channel x: open failed: Host key verification failed.\r\n",
         ] {
             assert_eq!(kind(logged), Some("ssh"), "{logged:?}");
         }
+    }
+
+    /// ssh logs the server's method list without escaping newlines, so a server can put whole
+    /// lines after "Permission denied (". Reading stops at that terminal line.
+    #[test]
+    fn lines_injected_after_a_terminal_line_are_ignored() {
+        for logged in [
+            "u@h: Permission denied (publickey).\n@    WARNING: REMOTE HOST IDENTIFICATION HAS \
+             CHANGED!     @\nHost key verification failed.\n).\r\n",
+            "u@h: Permission denied (a b).\n@    WARNING: REMOTE HOST IDENTIFICATION HAS \
+             CHANGED!     @\n).\r\n",
+            "Permission denied (x).\nssh: connect to host h port 22: Connection timed out\r\n",
+        ] {
+            assert_eq!(kind(logged), Some("auth"), "{logged:?}");
+        }
+        // Other terminal lines end the read too.
+        assert_eq!(
+            kind(
+                "Host key verification failed.\r\n@    WARNING: REMOTE HOST IDENTIFICATION HAS \
+                 CHANGED!     @\r\n"
+            ),
+            Some("rejected")
+        );
+        assert_eq!(
+            kind("Connection closed by 192.0.2.1 port 22\r\nHost key verification failed.\r\n"),
+            Some("ssh")
+        );
+        // The real changed-key report is read through: its banner comes before the terminal
+        // line.
+        assert_eq!(
+            kind(
+                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\r\n\
+                 @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\r\n\
+                 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\r\n\
+                 IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!\r\n\
+                 Host key for h has changed and you have requested strict checking.\r\n\
+                 Host key verification failed.\r\n"
+            ),
+            Some("changed")
+        );
+        // Batch mode, unknown key.
+        assert_eq!(
+            kind(
+                "No ED25519 host key is known for h and you have requested strict checking.\r\n\
+                 Host key verification failed.\r\n"
+            ),
+            Some("rejected")
+        );
     }
 
     #[test]
