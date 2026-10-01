@@ -85,9 +85,9 @@ measured this far apart within a few hours (best per iteration):
 | `stream.append_to_frame.memory` | 76.3 ms | 76.2 ms | 76.4 ms | 76.3, 76.3, 76.2 ms |
 
 Only the stream latency, which a timer dominates, holds still. Without retries, one of four quick
-runs against this baseline passed. With the default two retries, three of four did, each after
-re-running one to four benchmarks; the fourth ran while other builds held the load average near
-10, and the slowdown outlasted both retries. So the laptop gives a local check when it is quiet,
+runs against this baseline passed. With the default two retries, three of five did (load
+average 2-4), each after re-running one to four benchmarks; the other two ran while other builds
+held the load average near 10, and the slowdown outlasted both retries. So the laptop gives a local check when it is quiet,
 but a real regression under about 2x could hide in this noise: use the laptop baseline to see
 orders of magnitude and the budgets' headroom, and gate on a quiet, dedicated runner with its own
 baseline.
