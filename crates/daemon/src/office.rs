@@ -254,10 +254,11 @@ pub struct Office {
 }
 
 impl Office {
-    /// The back office over `store`, which must be open with its run log
-    /// (`projections_with_office`). A `fresh` store (just seeded with `--demo`) is looked at from
-    /// its first revision, so the office sees the seed. Otherwise from where `office.json` says
-    /// it got to, which a restart runs again; without it, from the end of the log.
+    /// The back office over `store`, which must have its run log registered
+    /// (`Store::register(Box::new(office.run_log()))`, or `projections_with_office` at an open). A
+    /// `fresh` store (just seeded with `--demo`) is looked at from its first revision, so the
+    /// office sees the seed. Otherwise from where `office.json` says it got to, which a restart
+    /// runs again; without it, from the end of the log.
     ///
     /// Where it starts is written to `office.json` now, so a start that fails before the loop
     /// runs (say the listener cannot bind) still runs from there next time.

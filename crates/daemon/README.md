@@ -51,14 +51,16 @@ Windows it must be under the user's profile, whose ACL it inherits.
 ### Start
 
 1. The token registry, which takes the lock.
-2. The store, with the work model's projections (`StoreOptions::default()`, whose `FsMode::Auto`
-   picks the NFS-safe mode on a network filesystem).
+2. The store, opened once, with the work model's projections (`StoreOptions::default()`, whose
+   `FsMode::Auto` picks the NFS-safe mode on a network filesystem).
    - The workspace is the demo's with `--demo` (written to `workspace.json`), else the one the
      store's events belong to, named by `workspace.json` when it names the same workspace and
      called "Workspace" otherwise. With `--demo`, a store with data is refused here.
-   - The back office's member, `@office`, found or added (see "The back office"). The store is
-     then opened again with the office's run log as well (`projections_with_office`), which
-     needs that member; it catches up on open like any projection. When the office is off
+   - The back office's member, `@office`, found or added (see "The back office"). The office's
+     run log, which needs that member, is then registered on the open store
+     (`Store::register(Box::new(back_office.run_log()))`); it catches up as any projection does at
+     an open. The store is never closed and opened again, so on a network filesystem its
+     single-host lease is held from the open until the store closes. When the office is off
      (`--no-office`, or no member it may act as), `office.json` is removed instead.
 3. The store's one `WorkService` (hub-work's "one writer": everything shares that `Arc`).
    - The hub's own machine (`with_hub_machine`) is the workspace's first `local` machine (the
@@ -104,7 +106,8 @@ owner (its first person, whom the device token also acts as):
 
 Why an event at first start rather than seeding: the office's member is workspace data like any
 other, so it belongs in the log, where every projection (and a rebuild) sees it; and the run log
-must know the member before the store opens with it, so the daemon finds it (or adds it) first.
+must know the member before it is registered on the store, so the daemon finds it (or adds it)
+first.
 The member is created once and reused, because the run log's settings, the member included, must
 stay the same for the life of the store.
 
@@ -158,19 +161,13 @@ after it, authored by `@office`.
 - *Who adds `@office`.* The `member_added` is authored by the workspace's person, as the
   bootstrap. A work-model command for adding members (stream E) would let the hub add it through
   its one writer instead of the daemon appending to the store.
-- *The lease between the two opens.* On a network filesystem the store holds a single-host lease
-  (`pitcrew-store`, "Network filesystems"). The daemon opens the store twice at start (once without
-  the run log, to find `@office`; once with it), and the lease is released for a moment between
-  the two. Another host's daemon could take it then; this one would then stop with the store's
-  `Leased` error rather than both writing. Opening once (a store API to register a projection
-  after open, or to keep the lease across the reopen, stream C) would close the gap.
 - *A stale `office.json`.* If events were appended without the run log since `office.json` was
   written (by another process, or a build without the office), the next start runs the office
-  over them, however old. A guard: in the first open, before anything is added, read the run log's
-  checkpoint (`projection_state` for `office.runs`); when it is behind the log, the revisions
-  after it were appended while no office was watching, so start from the end of the log, as after
-  `--no-office`. The tests that stand in for the runner link by appending from another process
-  would then need the runner link itself.
+  over them, however old. A guard: before the run log is registered, and before anything is added,
+  read its checkpoint (`projection_state` for `office.runs`); when it is behind the log, the
+  revisions after it were appended while no office was watching, so start from the end of the log,
+  as after `--no-office`. The tests that stand in for the runner link by appending from another
+  process would then need the runner link itself.
 
 ## Routes
 
@@ -265,7 +262,11 @@ The unit tests in `src/serve.rs` and `src/office.rs` cover adding `@office` once
 that has a person (and not before); keeping the office off when `@office` is a person, another
 person's agent or no one's agent; `--no-office` removing `office.json`; the start point saved
 before the loop runs; the loop over the demo across a restart; a save that cannot write, tried
-again until it can and at stop; and which of the hub's failures are tried again.
+again until it can and at stop; which of the hub's failures are tried again; and, on a store
+forced into network mode, its single-host lease taken once (the lease's clock is read once, at
+acquisition) and held, the same file, while the office starts and acts, then let go of when the
+store closes. (A lease let go of and taken again on a free path gets the same generation number,
+so the number alone could not show it.)
 
 ## Not wired yet
 
