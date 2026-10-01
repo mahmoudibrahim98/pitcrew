@@ -8,9 +8,16 @@
 //! - [`opencode`]: a small auto-discovered plugin file; nothing to merge, so install/uninstall is
 //!   just writing or removing one file we marked as ours.
 //!
-//! Every entry we write is marked so it is unambiguously ours (an exact suffix of the command we
-//! run, or a marker comment), so `install` is idempotent, `uninstall` removes only what we wrote,
-//! and nothing a person or another tool wrote is ever touched.
+//! Every entry we write is marked so it is unambiguously ours — by the identity of the program in
+//! its command (not just a text suffix a foreign command could coincidentally share) or by a
+//! marker comment — so `install` is idempotent, `uninstall` removes only what we wrote, and
+//! nothing a person or another tool wrote is ever touched. **This tool edits a person's own
+//! configuration files: when anything is not certain, it refuses and reports instead of
+//! guessing**, including refusing to proceed if a file changed on disk since it was last read.
+//!
+//! One engine failing to plan (a malformed file, say) never blocks the others: each engine's plan
+//! is computed independently, and a failure becomes that one engine's `Conflicting` status rather
+//! than aborting the whole command (`unwrap_or_conflict`).
 
 mod claude;
 mod codex;
@@ -63,9 +70,13 @@ pub(crate) enum Status {
     Missing,
     /// Claude only: some but not all of the five events are wired up.
     Partial,
-    /// Fully installed (chained after a foreign Codex `notify`, for Codex).
+    /// Fully installed.
     Installed,
-    /// Something of ours would collide with content we did not write; nothing was changed.
+    /// Installed, but one or more entries still name an old path of the executable (it moved
+    /// since they were written); `install` refreshes them.
+    Stale,
+    /// Something of ours would collide with content we did not write, or the file could not be
+    /// read/parsed/trusted; nothing was changed. The detail says why.
     Conflicting,
 }
 
@@ -75,6 +86,7 @@ impl Status {
             Self::Missing => "missing",
             Self::Partial => "partial",
             Self::Installed => "installed",
+            Self::Stale => "stale",
             Self::Conflicting => "conflicting",
         }
     }
@@ -83,11 +95,13 @@ impl Status {
 /// One file a plan would change.
 pub(crate) struct Change {
     path: PathBuf,
-    /// The file's current bytes, or `None` if it does not exist yet.
+    /// The file's current bytes, or `None` if it does not exist yet. Checked again, immediately
+    /// before writing, against what is actually on disk.
     before: Option<Vec<u8>>,
     /// Its content after the change; meaningless when `delete` is set.
     after: Vec<u8>,
-    /// Remove the file instead of writing `after` (OpenCode uninstall; the Codex chain wrapper).
+    /// Remove the file instead of writing `after` (OpenCode uninstall; the Codex chain wrapper
+    /// and its sidecar).
     delete: bool,
     /// Set the file's permissions so it can be run directly (the Unix chain wrapper).
     executable: bool,
@@ -112,10 +126,16 @@ fn env_str(env: Env<'_>, name: &str) -> Option<String> {
         .map(|v| v.to_string_lossy().into_owned())
 }
 
-/// The user's home folder: `HOME`, else `USERPROFILE`.
+/// The user's home folder: on Windows, `USERPROFILE` (what every native tool there uses), else
+/// `HOME`; falling back to the other if the preferred one is unset.
 fn user_home(env: Env<'_>) -> Option<PathBuf> {
-    env_str(env, "HOME")
-        .or_else(|| env_str(env, "USERPROFILE"))
+    let (first, second) = if cfg!(windows) {
+        ("USERPROFILE", "HOME")
+    } else {
+        ("HOME", "USERPROFILE")
+    };
+    env_str(env, first)
+        .or_else(|| env_str(env, second))
         .map(PathBuf::from)
 }
 
@@ -150,6 +170,37 @@ fn exe_path(env: Env<'_>) -> Result<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
+/// The file name of the program a (possibly quoted) command-line word names, case-insensitively
+/// comparable: used to check that a hook's program is actually `pitcrew`/`pitcrew.exe`, not just
+/// some other command that happens to end the same way. Understands the two quoting styles this
+/// module itself writes (`'…'` with `'\''`, `"…"` with `""`); an unquoted word is taken as-is.
+#[must_use]
+pub(crate) fn quoted_word_file_name(word: &str) -> String {
+    let inner = if word.len() >= 2 && word.starts_with('\'') && word.ends_with('\'') {
+        word[1..word.len() - 1].replace("'\\''", "'")
+    } else if word.len() >= 2 && word.starts_with('"') && word.ends_with('"') {
+        word[1..word.len() - 1].replace("\"\"", "\"")
+    } else {
+        word.to_owned()
+    };
+    // Deliberately not `std::path::Path`: its separator rules follow the *compiled* target, not
+    // whichever platform's path this text happens to be — a Windows path quoted into a Claude
+    // Code command can be inspected by code built for either platform. Accepting either
+    // separator, on either platform, gets the file name right regardless.
+    inner
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(&inner)
+        .to_owned()
+}
+
+/// Whether a file name is ours: `pitcrew`, optionally with a `.exe`/`.EXE` suffix, nothing else.
+/// Case-insensitive so it still matches a Windows path however it was typed.
+#[must_use]
+pub(crate) fn is_our_exe_name(file_name: &str) -> bool {
+    file_name.eq_ignore_ascii_case("pitcrew") || file_name.eq_ignore_ascii_case("pitcrew.exe")
+}
+
 /// Quotes one argument for POSIX `sh`: wrapped in single quotes, with embedded single quotes
 /// escaped as `'\''`. Safe for any text, including spaces and double quotes.
 #[must_use]
@@ -164,26 +215,56 @@ pub(crate) fn shell_quote_unix(s: &str) -> String {
     }
 }
 
-/// Quotes one argument for `cmd.exe`: wrapped in double quotes when it contains whitespace or a
-/// quote (Windows paths cannot contain a `"`, so this is mainly defensive).
+/// Characters that are special to `cmd.exe` outside of quotes, and still special to it even
+/// *inside* double quotes (`cmd.exe`'s quoting only ever protects whitespace from the argument
+/// parser that hands words to the program being run; its own line parser reads `& | < > ^ ( )`
+/// first, before any program ever sees the line). `%` is deliberately not here: it is handled by
+/// doubling, below, not by quoting — quoting alone never protects a literal `%`, and checking for
+/// it *after* already doubling it would see the just-added second `%` and (wrongly) decide
+/// quoting was still needed.
+fn is_cmd_metacharacter(b: u8) -> bool {
+    matches!(b, b'&' | b'|' | b'<' | b'>' | b'^' | b'(' | b')')
+}
+
+/// Quotes one argument for a `cmd.exe` batch file: `%` is doubled first (the only way to produce
+/// a literal `%` — quoting alone does not protect it), then the whole thing is wrapped in double
+/// quotes if it contains whitespace, a quote, or any of `cmd.exe`'s other metacharacters
+/// (`& | < > ^ ( )`), none of which quoting alone makes safe either, but `cmd.exe` does at least
+/// leave them alone once it is inside a quoted string (unlike `%`).
 #[must_use]
 pub(crate) fn cmd_quote_windows(s: &str) -> String {
-    if !s.is_empty() && !s.bytes().any(|b| matches!(b, b' ' | b'\t' | b'"')) {
-        s.to_owned()
+    let escaped = s.replace('%', "%%");
+    if !escaped.is_empty()
+        && !escaped
+            .bytes()
+            .any(|b| matches!(b, b' ' | b'\t' | b'"') || is_cmd_metacharacter(b))
+    {
+        escaped
     } else {
-        format!("\"{}\"", s.replace('"', "\"\""))
+        format!("\"{}\"", escaped.replace('"', "\"\""))
     }
 }
 
-/// Quotes the pitcrew executable's path as one shell word, for the platform this `install` runs
-/// on (the platform the config will be read on).
+/// A leading UTF-8 byte-order mark, which neither `serde_json` nor `toml_edit` accepts as part of
+/// a valid document.
+pub(crate) const BOM: char = '\u{feff}';
+
+/// Splits a leading BOM off `text`, if there is one, so it can be handed to a parser that does
+/// not accept one; pair with [`with_bom`] to put it back before writing.
 #[must_use]
-pub(crate) fn quote_exe_path(path: &str) -> String {
-    if cfg!(windows) {
-        cmd_quote_windows(path)
-    } else {
-        shell_quote_unix(path)
+pub(crate) fn split_bom(text: &str) -> (bool, &str) {
+    text.strip_prefix(BOM)
+        .map_or((false, text), |rest| (true, rest))
+}
+
+/// Puts a BOM back on the front of `text` if `had_bom` says there was one and it is not there
+/// already.
+#[must_use]
+pub(crate) fn with_bom(had_bom: bool, mut text: String) -> String {
+    if had_bom && !text.starts_with(BOM) {
+        text.insert(0, BOM);
     }
+    text
 }
 
 fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -234,17 +315,22 @@ fn run(
     yes: bool,
     chain: bool,
 ) -> Result<()> {
-    let plans = if action == Action::Uninstall {
-        targets
-            .iter()
-            .map(|&t| plan_uninstall(t, env))
-            .collect::<Result<Vec<_>>>()?
+    let changing = action == Action::Install || action == Action::Uninstall;
+    if changing && json && !yes {
+        return Err(Error::invalid(
+            "--json needs --yes with install/uninstall: a confirmation prompt cannot be mixed \
+             into JSON output",
+        ));
+    }
+
+    let plans: Vec<Plan> = if action == Action::Uninstall {
+        targets.iter().map(|&t| plan_uninstall(t, env)).collect()
     } else {
         let exe = exe_path(env)?;
         targets
             .iter()
             .map(|&t| plan_install(t, env, &exe, chain))
-            .collect::<Result<Vec<_>>>()?
+            .collect()
     };
 
     match action {
@@ -256,20 +342,34 @@ fn run(
     }
 }
 
-fn plan_install(target: Target, env: Env<'_>, exe: &str, chain: bool) -> Result<Plan> {
-    match target {
+/// Turns a planning failure into that one engine's `Conflicting` status instead of letting it
+/// abort the whole command: a malformed Claude `settings.json`, say, must never hide whatever
+/// Codex's and OpenCode's own status is.
+fn unwrap_or_conflict(target: Target, result: Result<Plan>) -> Plan {
+    result.unwrap_or_else(|e| Plan {
+        target,
+        status: Status::Conflicting,
+        detail: e.message,
+        changes: vec![],
+    })
+}
+
+fn plan_install(target: Target, env: Env<'_>, exe: &str, chain: bool) -> Plan {
+    let result = match target {
         Target::Claude => claude::plan_install(env, exe),
         Target::Codex => codex::plan_install(env, exe, chain),
         Target::OpenCode => opencode::plan_install(env, exe),
-    }
+    };
+    unwrap_or_conflict(target, result)
 }
 
-fn plan_uninstall(target: Target, env: Env<'_>) -> Result<Plan> {
-    match target {
+fn plan_uninstall(target: Target, env: Env<'_>) -> Plan {
+    let result = match target {
         Target::Claude => claude::plan_uninstall(env),
         Target::Codex => codex::plan_uninstall(env),
         Target::OpenCode => opencode::plan_uninstall(env),
-    }
+    };
+    unwrap_or_conflict(target, result)
 }
 
 fn write_err(e: std::io::Error) -> Error {
@@ -481,6 +581,23 @@ fn now_millis() -> u128 {
         .unwrap_or(0)
 }
 
+/// If `path` is a symlink, the file it resolves to (so a write lands on the real file and the
+/// link itself is left alone — `rename`-ing something new onto the link's own path would replace
+/// the link with a plain file instead); otherwise `path` unchanged. Refuses a link that cannot be
+/// resolved (broken, or a loop) rather than guessing what to do with it.
+fn resolve_write_target(path: &Path) -> Result<PathBuf> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => std::fs::canonicalize(path).map_err(|e| {
+            Error::invalid(format!(
+                "{} is a symlink that cannot be resolved ({e}); point it at a real file \
+                     first",
+                path.display()
+            ))
+        }),
+        _ => Ok(path.to_owned()),
+    }
+}
+
 #[cfg(unix)]
 fn copy_permissions(original: &Path, tmp: &Path) -> Result<()> {
     if let Ok(meta) = std::fs::metadata(original) {
@@ -506,36 +623,143 @@ fn make_executable(_tmp: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Backs up the existing file (if any), then writes atomically: a temp file in the same
-/// directory, with the original's permissions copied over, renamed into place.
+/// Opens `path` for writing, failing if it already exists (so a concurrent/predicted name never
+/// clobbers someone else's file), private from the moment it is created (0600 on Unix — there is
+/// no window where the temp file is readable by anyone else before permissions are tightened).
+fn create_private(path: &Path) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .map_err(|e| Error::internal(format!("cannot create {}: {e}", path.display())))
+}
+
+/// An unpredictable sibling file name: a monotonic clock reading, the process id, and the
+/// address of a fresh heap allocation (randomised by ASLR) mixed together. Not a cryptographic
+/// requirement — these files live in the user's own config directory, not a shared one — but a
+/// predictable name is an unforced TOCTOU risk `create_new` alone does not fully remove.
+fn unpredictable_suffix() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let marker = Box::new(0u8);
+    let addr = std::ptr::from_ref(marker.as_ref()) as u64;
+    nanos ^ (u64::from(std::process::id())).rotate_left(32) ^ addr
+}
+
+fn sync_file(path: &Path) -> Result<()> {
+    std::fs::File::open(path)
+        .and_then(|f| f.sync_all())
+        .map_err(|e| Error::internal(format!("cannot sync {}: {e}", path.display())))
+}
+
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> Result<()> {
+    sync_file(dir)
+}
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Backups made by us (`<name>.pitcrew-backup-<millis>`) for one file, newest first.
+fn our_backups(path: &Path) -> Vec<PathBuf> {
+    let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) else {
+        return Vec::new();
+    };
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return Vec::new();
+    };
+    let prefix = format!("{name}.pitcrew-backup-");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&prefix))
+        })
+        .collect();
+    found.sort(); // the millis suffix sorts chronologically as text; newest last
+    found.reverse();
+    found
+}
+
+/// Keeps at most this many of our own backups per file; older ones are deleted (best-effort — a
+/// failure here never fails the write that prompted it).
+const MAX_BACKUPS: usize = 5;
+
+fn prune_backups(path: &Path) {
+    for old in our_backups(path).into_iter().skip(MAX_BACKUPS) {
+        let _ = std::fs::remove_file(old);
+    }
+}
+
+/// Re-reads `path` and backs it up (if it exists), syncing the backup to disk, before any write
+/// is attempted — the caller still must confirm this matches what the plan was built from.
+fn read_and_back_up(path: &Path, target: &Path) -> Result<Option<Vec<u8>>> {
+    let now = read_optional(target)?;
+    if let Some(bytes) = &now {
+        let backup = sibling(path, &format!(".pitcrew-backup-{}", now_millis()));
+        std::fs::write(&backup, bytes)
+            .map_err(|e| Error::internal(format!("cannot back up to {}: {e}", backup.display())))?;
+        sync_file(&backup)?;
+        prune_backups(path);
+    }
+    Ok(now)
+}
+
+/// Re-checks the file against what the plan was built from, backs it up, then writes atomically:
+/// a private temp file in the resolved target's own directory (following a symlink at `c.path`,
+/// so the link itself survives — the backup is still named after `c.path`, where the person
+/// would look for it), fsynced, renamed into place, with the directory fsynced too (Unix) so the
+/// rename itself survives a crash.
 fn apply_change(c: &Change) -> Result<()> {
-    let dir = c
-        .path
+    let target = resolve_write_target(&c.path)?;
+    let dir = target
         .parent()
         .ok_or_else(|| Error::internal("the path has no parent directory"))?;
     std::fs::create_dir_all(dir)
         .map_err(|e| Error::internal(format!("cannot create {}: {e}", dir.display())))?;
 
-    if c.before.is_some() {
-        let backup = sibling(&c.path, &format!(".pitcrew-backup-{}", now_millis()));
-        std::fs::copy(&c.path, &backup).map_err(|e| {
-            Error::internal(format!(
-                "cannot back up {} to {}: {e}",
-                c.path.display(),
-                backup.display()
-            ))
-        })?;
+    let now = read_and_back_up(&c.path, &target)?;
+    if now != c.before {
+        return Err(Error::new(
+            Kind::Conflict,
+            format!(
+                "{} changed on disk since it was read (a confirmed install/uninstall always \
+                 acts on what it just showed you); rerun to see the current diff",
+                c.path.display()
+            ),
+        ));
     }
 
     if c.delete {
-        return std::fs::remove_file(&c.path)
-            .map_err(|e| Error::internal(format!("cannot remove {}: {e}", c.path.display())));
+        return std::fs::remove_file(&target)
+            .map_err(|e| Error::internal(format!("cannot remove {}: {e}", target.display())))
+            .and_then(|()| sync_dir(dir));
     }
 
-    let tmp = sibling(&c.path, &format!(".pitcrew-tmp-{}", std::process::id()));
-    let result = std::fs::write(&tmp, &c.after)
-        .map_err(|e| Error::internal(format!("cannot write {}: {e}", tmp.display())))
-        .and_then(|()| copy_permissions(&c.path, &tmp))
+    let tmp = sibling(
+        &target,
+        &format!(".pitcrew-tmp-{:016x}", unpredictable_suffix()),
+    );
+    let result = create_private(&tmp)
+        .and_then(|mut f| {
+            use std::io::Write as _;
+            f.write_all(&c.after)
+                .map_err(|e| Error::internal(format!("cannot write {}: {e}", tmp.display())))
+        })
+        .and_then(|()| copy_permissions(&target, &tmp))
         .and_then(|()| {
             if c.executable {
                 make_executable(&tmp)
@@ -543,10 +767,12 @@ fn apply_change(c: &Change) -> Result<()> {
                 Ok(())
             }
         })
+        .and_then(|()| sync_file(&tmp))
         .and_then(|()| {
-            std::fs::rename(&tmp, &c.path)
-                .map_err(|e| Error::internal(format!("cannot replace {}: {e}", c.path.display())))
-        });
+            std::fs::rename(&tmp, &target)
+                .map_err(|e| Error::internal(format!("cannot replace {}: {e}", target.display())))
+        })
+        .and_then(|()| sync_dir(dir));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -581,10 +807,210 @@ mod tests {
     }
 
     #[test]
+    fn windows_quoting_doubles_percent_and_quotes_metacharacters() {
+        assert_eq!(cmd_quote_windows("100%"), "100%%");
+        assert_eq!(cmd_quote_windows("a&b"), "\"a&b\"");
+        assert_eq!(cmd_quote_windows("a|b"), "\"a|b\"");
+        assert_eq!(cmd_quote_windows("a^b"), "\"a^b\"");
+        assert_eq!(cmd_quote_windows("a(b)"), "\"a(b)\"");
+        assert_eq!(cmd_quote_windows("a<b>c"), "\"a<b>c\"");
+        // A literal `%` still needs doubling even once the whole thing is quoted for a different
+        // reason (cmd.exe expands `%...%` inside a quoted string too).
+        assert_eq!(cmd_quote_windows("50% off"), "\"50%% off\"");
+    }
+
+    #[test]
+    fn quoted_word_file_name_strips_either_quoting_style() {
+        assert_eq!(quoted_word_file_name("/usr/bin/pitcrew"), "pitcrew");
+        assert_eq!(
+            quoted_word_file_name("'/home/sam/my apps/pitcrew'"),
+            "pitcrew"
+        );
+        assert_eq!(quoted_word_file_name("'it'\\''s/pitcrew'"), "pitcrew");
+        assert_eq!(
+            quoted_word_file_name("\"C:\\Program Files\\PitCrew\\pitcrew.exe\""),
+            "pitcrew.exe"
+        );
+    }
+
+    #[test]
+    fn only_pitcrew_by_name_counts_as_ours() {
+        assert!(is_our_exe_name("pitcrew"));
+        assert!(is_our_exe_name("pitcrew.exe"));
+        assert!(is_our_exe_name("PITCREW.EXE"));
+        assert!(!is_our_exe_name("not-pitcrew"));
+        assert!(!is_our_exe_name("pitcrew-notify-wrapper.sh"));
+    }
+
+    #[test]
     fn target_names_parse_case_insensitively() {
         assert!(Target::parse("Claude").is_ok());
         assert!(Target::parse("CODEX").is_ok());
         assert!(Target::parse("opencode").is_ok());
         assert!(Target::parse("gemini").is_err());
+    }
+
+    #[test]
+    fn apply_change_refuses_a_file_that_changed_since_it_was_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, b"{\"a\": 1}").unwrap();
+        let before = Some(std::fs::read(&path).unwrap());
+        // Someone else edits the file after we planned, before we apply.
+        std::fs::write(&path, b"{\"a\": 2}").unwrap();
+
+        let change = Change {
+            path: path.clone(),
+            before,
+            after: b"{\"a\": 3}".to_vec(),
+            delete: false,
+            executable: false,
+        };
+        let err = apply_change(&change).unwrap_err();
+        assert!(err.message.contains("changed on disk"), "{}", err.message);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"a\": 2}");
+    }
+
+    #[test]
+    fn apply_change_refuses_a_file_that_appeared_since_it_was_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        // The plan was built when the file did not exist...
+        let change = Change {
+            path: path.clone(),
+            before: None,
+            after: b"{}".to_vec(),
+            delete: false,
+            executable: false,
+        };
+        // ...but something else created it in the meantime.
+        std::fs::write(&path, b"{\"from\": \"someone else\"}").unwrap();
+
+        let err = apply_change(&change).unwrap_err();
+        assert!(err.message.contains("changed on disk"), "{}", err.message);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\"from\": \"someone else\"}"
+        );
+    }
+
+    #[test]
+    fn apply_change_backs_up_and_writes_atomically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, b"old").unwrap();
+        let change = Change {
+            path: path.clone(),
+            before: Some(b"old".to_vec()),
+            after: b"new".to_vec(),
+            delete: false,
+            executable: false,
+        };
+        apply_change(&change).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        let backups = our_backups(&path);
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), "old");
+        // No leftover temp file.
+        let leftover: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("pitcrew-tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "{leftover:?}");
+    }
+
+    #[test]
+    fn old_backups_beyond_the_cap_are_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        std::fs::write(&path, b"v0").unwrap();
+        for i in 1..=(MAX_BACKUPS + 3) {
+            let change = Change {
+                path: path.clone(),
+                before: Some(format!("v{}", i - 1).into_bytes()),
+                after: format!("v{i}").into_bytes(),
+                delete: false,
+                executable: false,
+            };
+            apply_change(&change).unwrap();
+            // Backups are named by millisecond; without a tiny sleep, a fast loop could produce
+            // duplicate names and undercount.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(our_backups(&path).len(), MAX_BACKUPS);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_is_written_through_keeping_the_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-settings.json");
+        let link = tmp.path().join("settings.json");
+        std::fs::write(&real, b"old").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let change = Change {
+            path: link.clone(),
+            before: Some(b"old".to_vec()),
+            after: b"new".to_vec(),
+            delete: false,
+            executable: false,
+        };
+        apply_change(&change).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "new");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link itself must survive the write"
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), real);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_broken_symlink_is_refused_not_guessed_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("settings.json");
+        std::os::unix::fs::symlink(tmp.path().join("nowhere"), &link).unwrap();
+
+        let change = Change {
+            path: link.clone(),
+            before: None,
+            after: b"new".to_vec(),
+            delete: false,
+            executable: false,
+        };
+        let err = apply_change(&change).unwrap_err();
+        assert!(err.message.contains("symlink"), "{}", err.message);
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "must not have replaced the link"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_temp_file_is_private_from_creation() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("settings.json");
+        let change = Change {
+            path: path.clone(),
+            before: None,
+            after: b"{}".to_vec(),
+            delete: false,
+            executable: false,
+        };
+        apply_change(&change).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

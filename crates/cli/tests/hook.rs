@@ -77,7 +77,7 @@ fn delivers_the_stdin_payload() {
     ];
     let (output, _) = hook(&["claude", "Stop"], &env, Some(PAYLOAD.as_bytes()));
     assert_silent_success(&output);
-    let requests = server.requests();
+    let requests = server.wait_for_requests(1);
     assert_eq!(requests.len(), 1, "no version check, one request");
     let request = &requests[0];
     assert_eq!(request.route(), "POST /v1/hooks/claude/Stop");
@@ -99,7 +99,8 @@ fn takes_the_payload_as_an_argument_for_codex_notify() {
     let notify = r#"{"type":"agent-turn-complete","turn-id":"1"}"#;
     let (output, _) = hook(&["codex", "notify", notify], &env, None);
     assert_silent_success(&output);
-    let request = &server.requests()[0];
+    let requests = server.wait_for_requests(1);
+    let request = &requests[0];
     assert_eq!(request.route(), "POST /v1/hooks/codex/notify");
     assert_eq!(request.body, notify.as_bytes());
 }
@@ -113,7 +114,7 @@ fn an_empty_payload_is_an_empty_object() {
     ];
     let (output, _) = hook(&["claude", "SessionEnd"], &env, None);
     assert_silent_success(&output);
-    assert_eq!(server.requests()[0].body, b"{}");
+    assert_eq!(server.wait_for_requests(1)[0].body, b"{}");
 }
 
 #[test]
@@ -203,7 +204,10 @@ fn a_global_flag_before_hook_keeps_the_fast_path() {
         Some(PAYLOAD.as_bytes()),
     );
     assert_silent_success(&output);
-    assert_eq!(server.requests()[0].route(), "POST /v1/hooks/claude/Stop");
+    assert_eq!(
+        server.wait_for_requests(1)[0].route(),
+        "POST /v1/hooks/claude/Stop"
+    );
 
     // Only the fast path has the test panic and its debug message.
     let debug = [
@@ -228,7 +232,7 @@ fn gives_up_on_a_daemon_that_never_answers() {
     let (output, took) = hook(&["claude", "Stop"], &env, Some(PAYLOAD.as_bytes()));
     assert_silent_success(&output);
     assert!(took < Duration::from_secs(2), "{took:?}");
-    assert_eq!(server.requests().len(), 1);
+    assert_eq!(server.wait_for_requests(1).len(), 1);
 }
 
 #[cfg(unix)]
@@ -242,7 +246,10 @@ fn over_a_socket_only_a_private_one_gets_the_token() {
     ];
     let (output, _) = hook(&["claude", "Stop"], &env, Some(PAYLOAD.as_bytes()));
     assert_silent_success(&output);
-    assert_eq!(private.requests()[0].route(), "POST /v1/hooks/claude/Stop");
+    assert_eq!(
+        private.wait_for_requests(1)[0].route(),
+        "POST /v1/hooks/claude/Stop"
+    );
 
     let (open, socket) = FakeServer::unix(handler, 0o755);
     let env = [

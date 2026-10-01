@@ -63,7 +63,7 @@ pub(crate) fn indent_before(b: &[u8], pos: usize) -> &str {
 /// Parses a JSON string starting at `b[i]` (`"`), returning the unescaped text and the index
 /// right after the closing `"`. The input is assumed well-formed (checked by `serde_json`
 /// first).
-fn parse_string(b: &[u8], i: usize) -> (String, usize) {
+pub(crate) fn parse_string(b: &[u8], i: usize) -> (String, usize) {
     let mut out = String::new();
     let mut i = i + 1; // past the opening quote
     while i < b.len() {

@@ -106,7 +106,7 @@ fn hook_wall_time() {
             ("PITCREW_SOCKET", &socket),
             ("PITCREW_TOKEN", TOKEN),
         ]));
-        assert_eq!(server.requests().len(), RUNS);
+        assert_eq!(server.wait_for_requests(RUNS).len(), RUNS);
         failures.extend(report("up (unix socket)", &up, UP));
 
         // A socket file with nothing listening, as a crashed daemon leaves behind.
@@ -126,7 +126,7 @@ fn hook_wall_time() {
         ("PITCREW_URL", &server.url),
         ("PITCREW_TOKEN", TOKEN),
     ]));
-    assert_eq!(server.requests().len(), RUNS);
+    assert_eq!(server.wait_for_requests(RUNS).len(), RUNS);
     failures.extend(report("up (loopback TCP)", &up, UP));
 
     let dead = dead_url();

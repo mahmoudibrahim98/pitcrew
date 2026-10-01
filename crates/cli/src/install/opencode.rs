@@ -13,10 +13,15 @@
 //! and reported as a conflict — pick a different plugin file name is the only other auto-wired-in
 //! option OpenCode gives us, so we leave the choice to the person.
 //!
-//! The plugin itself just forwards every OpenCode bus event to `pitcrew hook opencode <event>`,
-//! fire-and-forget. Its own runtime behaviour beyond making that one call is out of scope here
-//! (see `docs/build/briefs/I-hook-install.md`); the event name is rewritten from OpenCode's
-//! dotted form (`session.idle`) to the daemon's allowed charset (`session_idle`).
+//! The plugin forwards OpenCode's **session-level** bus events (`session.*` — idle, error, title
+//! updates and the like) to `pitcrew hook opencode <event>`, fire-and-forget; it does not forward
+//! every bus event, since some (`message.part.updated`, notably) fire once per streamed token and
+//! would otherwise spawn a process per token. Its own runtime behaviour beyond making that one
+//! call is out of scope here (see `docs/build/briefs/I-hook-install.md`); the event name is
+//! rewritten from OpenCode's dotted form (`session.idle`) to the daemon's allowed charset
+//! (`session_idle`). The spawned child's `error` event, and its stdin's own `error` event, are
+//! both handled (as no-ops): a missing or unusable `pitcrew` executable must never throw inside
+//! OpenCode's own process.
 
 use super::{Change, Plan, Status, Target};
 use crate::config::Env;
@@ -49,17 +54,25 @@ import {{ spawn }} from "node:child_process";
 const PITCREW = {};
 
 function fire(eventType, payload) {{
+  const type = String(eventType ?? "");
+  // Only session-level events: everything else, especially per-token streaming events like
+  // "message.part.updated", would spawn a process per token.
+  if (!type.startsWith("session.")) return;
   // The daemon only accepts event names matching [A-Za-z][A-Za-z0-9_-]{{0,63}}; OpenCode's bus
   // event names use dots (e.g. "session.idle"), so dots become underscores.
-  const event = String(eventType ?? "event").replace(/[^A-Za-z0-9_-]/g, "_");
+  const event = type.replace(/[^A-Za-z0-9_-]/g, "_");
   try {{
     const child = spawn(PITCREW, ["hook", "opencode", event], {{
       stdio: ["pipe", "ignore", "ignore"],
       detached: true,
       windowsHide: true,
     }});
+    // Neither a bad exe nor a broken pipe to it may ever throw inside OpenCode's own process.
     child.on("error", () => {{}});
-    child.stdin.end(JSON.stringify(payload ?? {{}}));
+    if (child.stdin) {{
+      child.stdin.on("error", () => {{}});
+      child.stdin.end(JSON.stringify(payload ?? {{}}));
+    }}
     child.unref();
   }} catch {{
     // Fire-and-forget: a notification failure must never affect the agent.
@@ -219,6 +232,15 @@ mod tests {
 
         let plan = plan_uninstall(&env).unwrap();
         assert!(plan.changes[0].delete);
+    }
+
+    #[test]
+    fn the_plugin_only_forwards_session_level_events_and_handles_both_errors() {
+        let js = content(EXE);
+        assert!(js.contains(r#"type.startsWith("session.")"#), "{js}");
+        assert!(js.contains(r#"child.on("error""#), "{js}");
+        assert!(js.contains(r#"child.stdin.on("error""#), "{js}");
+        assert!(js.contains("if (child.stdin)"), "{js}");
     }
 
     #[test]
