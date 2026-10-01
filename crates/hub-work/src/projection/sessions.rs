@@ -1,11 +1,16 @@
 //! `work.sessions`: sessions as the hub sees them, and dispatches.
+//!
+//! **Firm links stay.** A link made by a dispatch, a person or the agent itself (`dispatch`,
+//! `manual`, `claimed`) is never replaced by an inferred one (`folder`, `branch`, `imported`) or
+//! by a re-stated `session_discovered` that carries no link. The runner re-states sessions as it
+//! learns more about them, and must not undo a dispatch's link by doing so.
 
 use super::{Applied, clear, exec};
-use crate::codec::{IdText, enum_text, opt_text, sql_rev};
+use crate::codec::{IdText, enum_text, opt_enum_col, opt_text, sql_rev};
 use pitcrew_protocol::events::EventBody;
 use pitcrew_protocol::ids::SessionId;
-use pitcrew_protocol::model::{Dispatch, Session, SessionState, TimestampMs};
-use pitcrew_store::sql::{Transaction, params};
+use pitcrew_protocol::model::{Dispatch, LinkBasis, Session, SessionState, TimestampMs};
+use pitcrew_store::sql::{OptionalExtension, Transaction, params};
 use pitcrew_store::{BoxError, Projection, StoredEvent};
 
 /// Sessions and dispatches.
@@ -15,7 +20,22 @@ pub struct Sessions;
 impl Sessions {
     /// The projection's name.
     pub const NAME: &'static str = "work.sessions";
-    const VERSION: u32 = 1;
+    /// 2: firm links are kept.
+    const VERSION: u32 = 2;
+}
+
+/// Whether a link made by a dispatch, a person or the agent itself.
+fn is_firm(basis: Option<LinkBasis>) -> bool {
+    matches!(
+        basis,
+        Some(LinkBasis::Dispatch | LinkBasis::Manual | LinkBasis::Claimed)
+    )
+}
+
+/// Whether a link with basis `incoming` may replace one with basis `existing`: anything replaces
+/// an inferred link or none, and only a firm link replaces a firm one.
+pub(crate) fn replaces_link(existing: Option<LinkBasis>, incoming: Option<LinkBasis>) -> bool {
+    !is_firm(existing) || is_firm(incoming)
 }
 
 impl Projection for Sessions {
@@ -74,6 +94,9 @@ impl Projection for Sessions {
                 task,
                 basis,
             } => {
+                if !replaces_link(link_basis(tx, session)?, Some(*basis)) {
+                    return Ok(());
+                }
                 exec(
                     tx,
                     "UPDATE work_sessions SET workstream = ?2, task = ?3, link_basis = ?4
@@ -115,6 +138,15 @@ impl Projection for Sessions {
     }
 }
 
+/// The basis of a known session's link; `None` for an unlinked or unknown session.
+fn link_basis(tx: &Transaction<'_>, session: &SessionId) -> Result<Option<LinkBasis>, BoxError> {
+    let basis = tx
+        .prepare_cached("SELECT link_basis FROM work_sessions WHERE id = ?1")?
+        .query_row(params![session.text()], |r| opt_enum_col(r, 0))
+        .optional()?;
+    Ok(basis.flatten())
+}
+
 /// Activity in a session moves its `last_activity` forward, never back.
 fn touch(tx: &Transaction<'_>, session: &SessionId, at: TimestampMs) -> Applied {
     exec(
@@ -126,6 +158,8 @@ fn touch(tx: &Transaction<'_>, session: &SessionId, at: TimestampMs) -> Applied 
 }
 
 fn session_discovered(tx: &Transaction<'_>, rev: i64, s: &Session) -> Applied {
+    // A re-statement keeps a firm link it would otherwise lose.
+    let keep_link = !replaces_link(link_basis(tx, &s.id)?, s.link_basis);
     exec(
         tx,
         "INSERT INTO work_sessions (id, rev, engine, native_id, machine, cwd, branch, title, agent,
@@ -134,11 +168,13 @@ fn session_discovered(tx: &Transaction<'_>, rev: i64, s: &Session) -> Applied {
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
          ON CONFLICT (id) DO UPDATE SET engine = excluded.engine, native_id = excluded.native_id,
            machine = excluded.machine, cwd = excluded.cwd, branch = excluded.branch,
-           title = excluded.title, agent = excluded.agent, workstream = excluded.workstream,
-           task = excluded.task, link_basis = excluded.link_basis, state = excluded.state,
-           status_line = excluded.status_line, started = excluded.started,
-           last_activity = excluded.last_activity, terminal = excluded.terminal,
-           parent = excluded.parent",
+           title = excluded.title, agent = excluded.agent,
+           workstream = CASE WHEN ?19 THEN workstream ELSE excluded.workstream END,
+           task = CASE WHEN ?19 THEN task ELSE excluded.task END,
+           link_basis = CASE WHEN ?19 THEN link_basis ELSE excluded.link_basis END,
+           state = excluded.state, status_line = excluded.status_line,
+           started = excluded.started, last_activity = excluded.last_activity,
+           terminal = excluded.terminal, parent = excluded.parent",
         params![
             s.id.text(),
             rev,
@@ -158,6 +194,7 @@ fn session_discovered(tx: &Transaction<'_>, rev: i64, s: &Session) -> Applied {
             s.last_activity,
             opt_text(s.terminal.as_ref()),
             opt_text(s.parent.as_ref()),
+            keep_link,
         ],
     )?;
     Ok(())
@@ -186,4 +223,30 @@ fn dispatch_started(tx: &Transaction<'_>, rev: i64, d: &Dispatch) -> Applied {
         ],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn firm_links_are_replaced_only_by_firm_links() {
+        use LinkBasis::{Branch, Claimed, Dispatch, Folder, Imported, Manual};
+        let firm = [Dispatch, Manual, Claimed];
+        let inferred = [Folder, Branch, Imported];
+        for existing in firm {
+            for incoming in firm {
+                assert!(replaces_link(Some(existing), Some(incoming)));
+            }
+            for incoming in inferred {
+                assert!(!replaces_link(Some(existing), Some(incoming)));
+            }
+            assert!(!replaces_link(Some(existing), None));
+        }
+        for existing in inferred.map(Some).into_iter().chain([None]) {
+            for incoming in firm.into_iter().chain(inferred).map(Some).chain([None]) {
+                assert!(replaces_link(existing, incoming));
+            }
+        }
+    }
 }
