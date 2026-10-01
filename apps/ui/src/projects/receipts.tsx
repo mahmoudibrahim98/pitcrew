@@ -1,5 +1,6 @@
 // Receipts: the evidence behind a claim. Pull requests are web links; the rest open through the
-// shell's `openReceipt` when it has one, and are plain chips until then.
+// shell's `openReceipt` when it has one, a transcript otherwise opens its session (`openSession`),
+// and the others are plain chips until then.
 
 import type { Receipt } from '../data/index.ts';
 import { cx } from '../lib/cx.ts';
@@ -36,6 +37,20 @@ export function ReceiptChip({ receipt, names }: { receipt: Receipt; names: Names
         type="button"
         title={title}
         onClick={() => open(receipt)}
+        className={cx(CHIP, 'hover:bg-hover hover:text-ink')}
+      >
+        {label}
+      </button>
+    );
+  }
+  if (receipt.kind === 'transcript' && nav.openSession !== undefined) {
+    const open = nav.openSession;
+    const session = receipt.session;
+    return (
+      <button
+        type="button"
+        title={title}
+        onClick={() => open(session, 'chat')}
         className={cx(CHIP, 'hover:bg-hover hover:text-ink')}
       >
         {label}
