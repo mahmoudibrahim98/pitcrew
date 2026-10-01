@@ -201,6 +201,61 @@ async fn a_handle_clash_gives_409_even_without_a_person_yet() {
 }
 
 #[tokio::test]
+async fn a_workspace_with_only_an_agent_still_needs_setup_and_accepts_a_different_handle() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let work = fresh(dir.path());
+    let app = app(&work);
+    // Only an agent member exists (e.g. the back office's bootstrap before any person), never a
+    // human. `has_person` (and so `setup_needed`) must key on kind `human`, not on "any member at
+    // all": a mutation that dropped that filter would make this workspace look already set up.
+    let office = Member {
+        id: MemberId::new(),
+        kind: MemberKind::Agent,
+        handle: "@office".to_owned(),
+        name: "Back office".to_owned(),
+        owner: Some(MemberId::new()),
+        persona: None,
+    };
+    let event = Event {
+        id: EventId::new(),
+        at: 1_790_800_000_000,
+        workspace: work.workspace(),
+        author: office.id,
+        on_behalf_of: None,
+        body: EventBody::MemberAdded {
+            member: office.clone(),
+        },
+    };
+    work.store().append(&[event]).expect("append");
+
+    let caller = device(MemberId::new());
+    let before = call(&app, Some(caller), "GET", "/v1/workspace", None).await;
+    expect(&before, 200);
+    assert_eq!(
+        before.1["setup_needed"],
+        json!(true),
+        "an agent alone is not a person: {}",
+        before.1
+    );
+
+    let (ws, name, handle, machine) = GOOD; // handle "@sam", distinct from the agent's "@office"
+    let result = call(
+        &app,
+        Some(caller),
+        "POST",
+        "/v1/setup",
+        Some(body(ws, name, handle, machine)),
+    )
+    .await;
+    expect(&result, 200);
+    assert_eq!(result.1["me"]["handle"], json!(handle));
+    assert_eq!(result.1["me"]["kind"], json!("human"));
+
+    // Both members now: the pre-existing agent, and the new person.
+    assert_eq!(work.members().expect("members").len(), 2);
+}
+
+#[tokio::test]
 async fn after_setup_me_answers_the_person_and_workspace_setup_needed_is_false() {
     let dir = tempfile::tempdir().expect("tempdir");
     let work = fresh(dir.path());
@@ -286,4 +341,66 @@ async fn the_listener_is_called_exactly_once_after_the_commit() {
     let retried = call(&app, Some(caller), "POST", "/v1/setup", Some(setup)).await;
     expect(&retried, 409);
     assert_eq!(collector.0.lock().expect("lock").len(), 1);
+}
+
+/// Reads through the service from inside the listener call itself, to pin that the listener runs
+/// after the append commits, not before: were `set_up` to call it before `self.append`, this
+/// would see no members yet (the service's read is a separate connection from the same store, so
+/// it reads whatever has actually been committed, not what the listener was merely handed) and
+/// `saw_the_member` would stay `false`.
+#[derive(Default)]
+struct ReadsThroughTheServiceAtCallTime {
+    /// Set right after the service is built, before the request that triggers setup.
+    work: Mutex<Option<Arc<WorkService>>>,
+    saw_the_member: Mutex<bool>,
+}
+
+impl SetupListener for ReadsThroughTheServiceAtCallTime {
+    fn set_up(&self, done: &SetupDone) {
+        let work = self
+            .work
+            .lock()
+            .expect("lock")
+            .clone()
+            .expect("work is set before the request that triggers this");
+        let seen = work
+            .members()
+            .expect("members")
+            .iter()
+            .any(|m| m.id == done.me.id);
+        *self.saw_the_member.lock().expect("lock") = seen;
+    }
+}
+
+#[tokio::test]
+async fn the_listener_sees_the_commit_not_a_state_from_before_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = common::open(&dir.path().join("hub.db"));
+    let workspace = Workspace {
+        id: WorkspaceId::new(),
+        name: String::new(),
+    };
+    let checker = Arc::new(ReadsThroughTheServiceAtCallTime::default());
+    let work = Arc::new(
+        WorkService::new(store, workspace)
+            .with_setup_listener(Arc::clone(&checker) as Arc<dyn SetupListener>),
+    );
+    *checker.work.lock().expect("lock") = Some(Arc::clone(&work));
+    let app = app(&work);
+    let caller = device(MemberId::new());
+    let (ws, name, handle, machine) = GOOD;
+
+    let result = call(
+        &app,
+        Some(caller),
+        "POST",
+        "/v1/setup",
+        Some(body(ws, name, handle, machine)),
+    )
+    .await;
+    expect(&result, 200);
+    assert!(
+        *checker.saw_the_member.lock().expect("lock"),
+        "the listener ran before the append committed: it read no member yet"
+    );
 }

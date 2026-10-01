@@ -455,6 +455,13 @@ a person (the back office, and the runner on this machine; api-v1.md, "The first
   between the commit and the listener seeing it). The daemon's listener is where `workspace.json`
   gets written and the back office and runner get started; this crate does neither (out of scope;
   see the brief).
+  - **Reads only, never a write, and never panic.** The lock still held is a plain, non-reentrant
+    `std::sync::Mutex` (`set_up` itself is still on the stack): reads (`WorkService::read`,
+    `members`, `tasks`, ...) are fine, but calling any command (`create_task`, a second `set_up`,
+    ...) from the listener deadlocks the thread. A panic here unwinds through `set_up`: the route
+    answers `500`, but the append already committed, so a retry then answers `409`, never a second
+    person. If the daemon's own work can fail or needs to write to the work model, hand `done` to
+    its own task (a channel, `tokio::spawn`, ...) and do that work off this call stack.
 
 Errors are `ApiError` bodies: a malformed id or unknown thing in the path is `404`, in the body or
 query `400`; bodies over 1 MiB are `400`. A `500` is logged in full and its body always says

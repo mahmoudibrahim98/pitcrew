@@ -196,8 +196,10 @@ impl WorkService {
     ///
     /// Database errors.
     pub fn workspace_at(&self) -> Result<WorkspaceAt> {
-        let rev = self.read(query::work_rev)?;
-        let setup_needed = !self.read(query::has_person)?;
+        // One snapshot for both: a `set_up` committing between two separate reads could otherwise
+        // give a stale `rev` alongside a fresh `setup_needed`, or the other way round.
+        let (rev, setup_needed) =
+            self.read(|c| Ok((query::work_rev(c)?, !query::has_person(c)?)))?;
         Ok(WorkspaceAt {
             workspace: Workspace {
                 id: self.workspace_id,
