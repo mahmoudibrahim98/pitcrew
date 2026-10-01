@@ -261,6 +261,7 @@ impl Watcher {
             }
             let after = self.tracker.count();
             if after != before {
+                tracing::debug!(workspace = %self.id, open = after.open, more = after.more, rev = to_rev, "attention count");
                 self.report.count(&self.id, after);
             }
         }

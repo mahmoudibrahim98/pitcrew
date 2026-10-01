@@ -301,6 +301,10 @@ impl Notifications {
     /// A new ask for the person in `workspace`.
     pub fn new_ask(&self, workspace: &str, ask: NewAsk) {
         if !(self.inner.allowed)() {
+            tracing::debug!(
+                workspace,
+                "no notification: the window is in front, or notifications are off"
+            );
             return;
         }
         self.inner.limiter().offer(workspace, ask, Instant::now());

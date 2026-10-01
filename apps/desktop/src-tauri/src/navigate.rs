@@ -357,12 +357,19 @@ fn emit<R: Runtime>(app: &AppHandle<R>, target: &NavigateTarget) {
     }
 }
 
-/// Shows, un-minimises and focuses the main window.
+/// Shows, un-minimises and focuses the main window. The desktop may still keep another window in
+/// front (focus-stealing prevention); then the window is shown without the focus.
 pub fn focus_main<R: Runtime>(app: &AppHandle<R>) {
     if let Some(window) = app.get_webview_window(MAIN) {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
+        for (what, done) in [
+            ("unminimize", window.unminimize()),
+            ("show", window.show()),
+            ("focus", window.set_focus()),
+        ] {
+            if let Err(e) = done {
+                tracing::debug!(error = %e, what, "cannot bring the window forward");
+            }
+        }
     }
 }
 

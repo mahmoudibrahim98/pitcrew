@@ -73,6 +73,18 @@ impl Shell {
             runtime,
         ));
         attention.sync(&registry.list());
+        Self::from_parts(registry, attention, notifications, preferences)
+    }
+
+    /// A shell from its parts, without a tray yet ([`Shell::start`] builds the parts for the
+    /// app; tests build their own).
+    #[must_use]
+    pub fn from_parts(
+        registry: Arc<Registry>,
+        attention: Arc<Attention>,
+        notifications: Notifications,
+        preferences: PreferenceStore,
+    ) -> Self {
         Self {
             registry,
             attention,
@@ -159,5 +171,86 @@ impl<R: Runtime> AttentionSink for Sink<R> {
         if let Some(shell) = self.0.try_state::<Shell>() {
             shell.notifications.new_ask(workspace, ask);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::notify::Notifier;
+    use crate::preferences::Preferences;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct Shown(Mutex<Vec<Notice>>);
+
+    impl Notifier for Shown {
+        fn show(&self, notice: Notice) {
+            self.0.lock().unwrap().push(notice);
+        }
+    }
+
+    struct Nowhere;
+
+    impl AttentionSink for Nowhere {
+        fn counts_changed(&self) {}
+        fn new_ask(&self, _workspace: &str, _ask: NewAsk) {}
+    }
+
+    fn shell(preferences: Preferences, shown: &Arc<Shown>) -> Shell {
+        let runtime = tokio::runtime::Handle::current();
+        let registry = Arc::new(Registry::in_memory());
+        Shell::from_parts(
+            Arc::clone(&registry),
+            Arc::new(Attention::new(registry, Arc::new(Nowhere), runtime.clone())),
+            Notifications::new(
+                Arc::clone(shown) as Arc<dyn Notifier>,
+                RateLimiter::new(Duration::ZERO, Duration::ZERO),
+                || true,
+                &runtime,
+            ),
+            PreferenceStore::in_memory(preferences),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn closing_keeps_the_app_in_the_tray_and_says_so_once() {
+        let shown = Arc::new(Shown::default());
+        let s = shell(Preferences::default(), &shown);
+        assert!(!s.keeps_running_on_close(), "no tray: closing quits");
+        s.tray.store(true, Ordering::SeqCst);
+        assert!(s.keeps_running_on_close());
+
+        s.closed_to_tray();
+        s.closed_to_tray();
+        let notices = shown.0.lock().unwrap().clone();
+        assert_eq!(notices.len(), 1, "said once: {notices:?}");
+        assert_eq!(notices[0].title, "PitCrew is still running");
+        assert_eq!(notices[0].target, None, "a click only shows the window");
+        assert!(notices[0].body.chars().count() <= crate::notify::MAX_BODY);
+        assert!(s.preferences.get().tray_hint_shown);
+
+        s.preferences.update(|p| p.quit_on_close = true).unwrap();
+        assert!(
+            !s.keeps_running_on_close(),
+            "the person chose to quit on close"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_notifications_off_the_hint_is_not_shown() {
+        let shown = Arc::new(Shown::default());
+        let s = shell(
+            Preferences {
+                notifications: false,
+                ..Preferences::default()
+            },
+            &shown,
+        );
+        s.tray.store(true, Ordering::SeqCst);
+        s.closed_to_tray();
+        assert!(shown.0.lock().unwrap().is_empty());
+        assert!(s.preferences.get().tray_hint_shown, "and not later either");
     }
 }
