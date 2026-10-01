@@ -1,12 +1,36 @@
 //! Checks the fuzz targets share. A failed check panics, and libFuzzer reports the panic as a
 //! crash together with the input that caused it.
 
+pub mod shell;
+
 use pitcrew_protocol::transcript::TranscriptItem;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+/// Whether to relax the checks for findings already reported and listed in
+/// `docs/security/threat-model.md` §8 (`PITCREW_FUZZ_SKIP_KNOWN=1`), so a run can look past them.
+/// Off by default: a known finding still fails the target until it is fixed.
+#[must_use]
+pub fn skip_known() -> bool {
+    static SKIP: OnceLock<bool> = OnceLock::new();
+    *SKIP.get_or_init(|| std::env::var_os("PITCREW_FUZZ_SKIP_KNOWN").is_some_and(|v| v == "1"))
+}
+
+/// An empty folder `name` in this process's scratch folder (see [`scratch_path`]), emptied first
+/// if it exists.
+pub fn fresh_dir(name: &str) -> PathBuf {
+    let dir = scratch_path(name);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("cannot empty {}: {e}", dir.display()),
+    }
+    std::fs::create_dir_all(&dir).expect("create a scratch folder");
+    dir
+}
 
 // Caps copied from `crates/ingest/src/bound.rs`, where they are crate-private. `truncate_chars`
 // keeps `max` characters and adds one `…`, hence the `+ 1`s.
