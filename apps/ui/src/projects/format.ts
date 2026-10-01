@@ -3,6 +3,7 @@
 import type { Tone } from '../design/index.ts';
 import type {
   AskKind,
+  Block,
   CalendarDate,
   Event,
   Health,
@@ -92,8 +93,55 @@ export function formatDay(date: CalendarDate): string {
   return Number.isNaN(parsed) ? date : DAY.format(parsed);
 }
 
+const LONG_DAY = new Intl.DateTimeFormat(undefined, {
+  weekday: 'long',
+  day: 'numeric',
+  month: 'long',
+  year: 'numeric',
+  timeZone: 'UTC',
+});
+
+/** `2026-09-30` → `Wednesday, 30 September 2026` (in the viewer's locale), read as UTC like `formatDay`. */
+export function formatLongDay(date: CalendarDate): string {
+  const parsed = Date.parse(`${date}T00:00:00Z`);
+  return Number.isNaN(parsed) ? date : LONG_DAY.format(parsed);
+}
+
 export function formatWhen(at: TimestampMs): string {
   return WHEN.format(at);
+}
+
+const TIME = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit' });
+const DATE_KEY = new Intl.DateTimeFormat('en-CA', { year: 'numeric', month: '2-digit', day: '2-digit' });
+
+/** A stretch of time: `30 Sep, 08:00–08:15`; one time when it starts and ends in the same minute. */
+export function formatSpan(start: TimestampMs, end: TimestampMs): string {
+  const from = formatWhen(start);
+  if (Math.floor(start / 60_000) === Math.floor(end / 60_000)) return from;
+  return DATE_KEY.format(start) === DATE_KEY.format(end) ? `${from}–${TIME.format(end)}` : `${from} – ${formatWhen(end)}`;
+}
+
+const plural = (n: number, one: string, many: string): string => `${n} ${n === 1 ? one : many}`;
+
+/**
+ * What a block of work counted, as short phrases: files touched (with the lines added and
+ * removed), tools run and failed, turns. Zero counts are left out; a block with none of these says
+ * how many events it covers instead.
+ */
+export function describeCounts(block: Block): string[] {
+  const { counts } = block;
+  const files = block.files.length + block.files_omitted;
+  const out: string[] = [];
+  if (files > 0) {
+    out.push(`${plural(files, 'file', 'files')} touched (+${counts.lines_added} −${counts.lines_removed})`);
+  }
+  if (counts.tools_run > 0) {
+    const run = plural(counts.tools_run, 'tool run', 'tools run');
+    out.push(counts.tools_failed > 0 ? `${run}, ${counts.tools_failed} failed` : run);
+  }
+  if (counts.turns > 0) out.push(plural(counts.turns, 'turn', 'turns'));
+  if (out.length === 0) out.push(plural(counts.events, 'event', 'events'));
+  return out;
 }
 
 export function initials(name: string): string {
