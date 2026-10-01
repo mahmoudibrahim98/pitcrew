@@ -142,3 +142,41 @@ Three answers change. A deleted transcript was an empty page and is now `503`; a
 an empty page and is now `404`. If the UI should keep showing such sessions with an empty transcript,
 as the mock hub does, the daemon can answer an empty page for `UnknownSession` instead; that is
 its call.
+
+## Proposal: who caused a hook's state change
+
+Today every event the runner emits is authored by its configured owner with no `on_behalf_of`, and
+`StoreSink` stamps such events with that owner. A `session_state_changed` (and `session_ended`)
+caused by an agent's hook, say the writer agent's `Stop`, is therefore authored as the session's
+person, not as the agent whose hook caused it. The runner knows the sender where it applies the
+hook (`Origin::Hook(sender)`), so either option below is small on the runner's side. No code yet.
+
+**Option A: a `StoreSink` rule.** The runner hands the sink, with each batch, the sender of the hook
+that caused it; `StoreSink` authors those events as that caller (`author` the member,
+`on_behalf_of` its owner for an agent token), and everything else as the owner, as today.
+
+- For: no protocol change; stream D alone; the hub's rule "author comes from the token" still
+  holds in the solo case, since the hook's token was checked by the hub's own hook intake.
+- Against: `EventSink::accept` takes only events, so the sender needs a new parameter or a side
+  channel. It works in process only: a remote runner sends its batches with its own token, and the
+  hub stamps that, so `author` would mean the hook's sender in the solo case and the runner on a
+  cluster. It also makes authorship depend on a race: a hook that beats the transcript authors the
+  change as its agent, while the same change read from the transcript a moment earlier is the
+  person's. And held hooks folded into one `session_discovered` can have several senders.
+
+**Option B: a protocol field.** `author` keeps meaning who reported the event (the hub stamps it, as
+now), and an optional field says what caused a state change, e.g. on `session_state_changed` and
+`session_ended`: `"cause": {"kind": "hook", "member": "<MemberId>"}`, or `"transcript"`, or
+`"runner"` (a command it ran). The runner fills it from `Origin`; a missing field reads as unknown.
+
+- For: one meaning everywhere, in process and remote; authority stays with the hub's stamping,
+  and the cause is information the recap and audit views can show ("the writer's Stop hook");
+  older events and clients are unaffected (an optional field). It also records the transcript and
+  command cases, which A cannot tell apart from each other.
+- Against: a contract change (stream 0: protocol, `api-v1.md`, the mock hub and UI types), and a
+  remote runner's `cause` is its claim, which the hub cannot check unless hooks reach it directly.
+
+**Recommendation: B.** Authorship should keep one meaning, stamped by the hub from the token that
+delivered the events, and the cause is better recorded as what it is. A also cannot cover the
+remote runner, which is where hooks from many agents on a cluster will come from. Until B lands,
+hook-caused state stays authored as the session's person.
