@@ -14,6 +14,22 @@ path = "src/main.rs"
 
 [dependencies]
 pitcrew-protocol.workspace = true
+pitcrew-api.workspace = true
+pitcrew-auth.workspace = true
+pitcrew-store.workspace = true
+pitcrew-hub-work.workspace = true
+pitcrew-fixtures.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+directories.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "sync", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true
