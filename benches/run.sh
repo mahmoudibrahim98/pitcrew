@@ -14,7 +14,7 @@
 #   --threshold F      Fail when a metric is worse than the baseline by more than F (default 0.10).
 #   --retries N        Run what failed up to N more times before failing (default 2).
 #   --write-baseline   Record this run as benches/baseline.json instead of comparing.
-#   --extend-baseline  Compare, and add the metrics the baseline has no value for.
+#   --extend-baseline  Compare, and add the passing metrics the baseline has no value for.
 #   --note TEXT        With --write-baseline: what to record about the machine and conditions.
 #
 # Exits non-zero when a metric regressed by more than the threshold, is over its budget, or did

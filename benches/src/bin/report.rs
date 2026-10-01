@@ -14,8 +14,8 @@
 //! again ([`report::Retry::plan`]); it is empty when nothing did. `--no-tests` says the timing
 //! tests were left out, so their metrics are skipped rather than missing.
 //!
-//! `--write-baseline` replaces the baseline with this run; `--extend-baseline` adds only the
-//! metrics the baseline has no value for.
+//! `--write-baseline` replaces the baseline with this run; `--extend-baseline` adds the metrics
+//! the baseline has no value for, if they pass (not over budget).
 //!
 //! Exit status: 0 when every metric passes, 1 when one regressed, is over budget or is missing,
 //! 2 on a usage or I/O error.

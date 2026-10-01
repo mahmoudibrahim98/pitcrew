@@ -3,12 +3,47 @@
   "machine": "Intel(R) Core(TM) Ultra 5 135U, 14 threads, 15 GiB RAM, linux x86_64 (WSL2)",
   "recorded": "2026-09-30",
   "mode": "full",
-  "note": "Laptop class: Intel Core Ultra 5 135U (2 performance, 8 efficiency and 2 low-power cores), 16 GB, WSL2 Ubuntu 22.04, Rust 1.94.0, mains power, Windows Balanced plan. Recorded with benches/run.sh --full --write-baseline while other agents' builds ran (load average 4-6 on 14 threads). On this machine the same code measured up to 2-6x apart in runs an hour apart (see benches/README.md): compare with run.sh's retries, and treat these numbers as indicative rather than as a strict gate.",
+  "note": "Laptop class: Intel Core Ultra 5 135U (2 performance, 8 efficiency and 2 low-power cores), 16 GB, WSL2 Ubuntu 22.04, Rust 1.94.0, mains power, Windows Balanced plan. Recorded with benches/run.sh --full --write-baseline while other agents' builds ran (load average 4-6 on 14 threads). On this machine the same code measured up to 2-6x apart in runs an hour apart (see benches/README.md): compare with run.sh's retries, and treat these numbers as indicative rather than as a strict gate. The timing-test metrics (runner.*, hub.*, cli.*) were added on 2026-10-01 with run.sh --quick --extend-baseline, load average 5-7 with about six other builds; cli.hook.down.tcp is absent because its p99 was over the 5 ms budget in all three attempts.",
   "metrics": {
+    "cli.hook.down.unix": {
+      "value": 2.15,
+      "best": 1.13,
+      "unit": "ms"
+    },
+    "cli.hook.up.tcp": {
+      "value": 6.68,
+      "best": 3.87,
+      "unit": "ms"
+    },
+    "cli.hook.up.unix": {
+      "value": 2.31,
+      "best": 1.43,
+      "unit": "ms"
+    },
     "control.parse": {
       "value": 198.1,
       "best": 255.4,
       "unit": "MiB/s"
+    },
+    "hub.tasks.route.assignee_status": {
+      "value": 7.86,
+      "best": 6.4,
+      "unit": "ms"
+    },
+    "hub.tasks.route.status": {
+      "value": 8.14,
+      "best": 6.03,
+      "unit": "ms"
+    },
+    "runner.idle_cpu.notify": {
+      "value": 0.25,
+      "best": 0.25,
+      "unit": "%cpu"
+    },
+    "runner.idle_cpu.polling": {
+      "value": 0.0,
+      "best": 0.0,
+      "unit": "%cpu"
     },
     "store.append.batch_100": {
       "value": 9.002,

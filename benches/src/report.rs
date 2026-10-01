@@ -485,11 +485,13 @@ pub fn to_baseline(summary: &Summary, recorded: Option<String>, note: Option<Str
 }
 
 /// Adds the summary's metrics that `baseline` has no value for, leaving the others as they are.
-/// Returns the names added.
+/// Only passing metrics are added: `run.sh` extends after every attempt, and a number over its
+/// budget on a busy first attempt must not become what its retries are compared with. Returns
+/// the names added.
 pub fn extend_baseline(baseline: &mut Baseline, summary: &Summary) -> Vec<String> {
     let mut added = Vec::new();
     for l in &summary.metrics {
-        if baseline.metrics.contains_key(&l.name) {
+        if baseline.metrics.contains_key(&l.name) || l.status.fails() {
             continue;
         }
         if let Some(v) = baseline_value(l) {
@@ -982,6 +984,26 @@ mod tests {
         assert_eq!(added, vec!["cli.hook.up.tcp"]);
         assert_eq!(base.metrics["store.since.page_100"], kept);
         assert_eq!(base.metrics["cli.hook.up.tcp"].best, 0.5);
+    }
+
+    #[test]
+    fn extending_a_baseline_skips_a_metric_over_its_budget() {
+        let mut run = all_quick(1.0);
+        let mut base = base_from(&run);
+        base.metrics.remove("cli.hook.up.tcp");
+        base.metrics.remove("cli.hook.down.tcp");
+        // A busy first attempt: p99 over the 10 ms budget, though the p50 looks fine.
+        run.insert(
+            "cli.hook.up.tcp".to_owned(),
+            Reading {
+                value: 19.0,
+                best: 2.7,
+            },
+        );
+        let s = compare(QUICK, "m", &run, Some(&base), DEFAULT_THRESHOLD);
+        assert_eq!(get(&s, "cli.hook.up.tcp").status, Status::OverBudget);
+        assert_eq!(extend_baseline(&mut base, &s), vec!["cli.hook.down.tcp"]);
+        assert!(!base.metrics.contains_key("cli.hook.up.tcp"));
     }
 
     #[test]

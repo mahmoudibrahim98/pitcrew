@@ -10,7 +10,7 @@ benches/run.sh                    # full: 20 and 200 MiB transcripts, then compa
 benches/run.sh --quick            # CI: 20 MiB only, fewer samples
 benches/run.sh --no-tests         # leave out the other crates' timing tests (about a minute less)
 benches/run.sh --write-baseline   # record this machine's numbers in benches/baseline.json
-benches/run.sh --extend-baseline  # compare, and add the metrics the baseline lacks
+benches/run.sh --extend-baseline  # compare, and add the passing metrics the baseline lacks
 cargo bench -p pitcrew-benches    # criterion alone (full mode; PITCREW_BENCH_MODE=quick for quick)
 ```
 
