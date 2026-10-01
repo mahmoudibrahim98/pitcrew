@@ -60,10 +60,12 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [A-test-robustness](A-test-robustness.md) | A · Ingest | `s/A/test-robustness` | Sonnet-class | **Merged** |
 | [G-fuzz-findings](G-fuzz-findings.md) | G · Integrations | `s/G/fuzz-findings` | Sonnet-class | **Merged** |
 | [0-daemon-runner](0-daemon-runner.md) | 0 · Composition root | `integrator/daemon-runner` | Opus-class | **Merged** |
-| [E-setup](E-setup.md) | E · Work model | `s/E/setup` | Sonnet-class | In progress |
+| [E-setup](E-setup.md) | E · Work model | `s/E/setup` | Sonnet-class | In review |
 | [0-mock-setup](0-mock-setup.md) | 0 · Contracts | `integrator/mock-setup` | Sonnet-class | **Merged** |
 | [K-remote-workspaces](K-remote-workspaces.md) | K · Desktop shell | `s/K/remote-workspaces` | Opus-class | In progress |
 | [B-tmux-runtime](B-tmux-runtime.md) | B · Runtime | `s/B/tmux-runtime` | Opus-class | Next |
+| [0-daemon-setup](0-daemon-setup.md) | 0 · Composition root | `integrator/daemon-setup` | Opus-class | Next |
+| [0-onboarding-wiring](0-onboarding-wiring.md) | 0 · Contracts | `integrator/onboarding-wiring` | Opus-class | Next |
 | [0-daemon-solo](0-daemon-solo.md) | 0 · Composition root | `integrator/daemon-solo` | Opus-class | **Merged** |
 | [N-projects-wiring](N-projects-wiring.md) | N · Projects layout | `s/N/projects-wiring` | Sonnet-class | **Merged** |
 | [L-shell-polish](L-shell-polish.md) | L · UI foundation | `s/L/shell-polish` | Sonnet-class | **Merged** |
