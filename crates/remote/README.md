@@ -236,12 +236,14 @@ launcher.cancel(&target).await?;
   GPUs (`--gres`), job name, and extra `#SBATCH` options. Extra options must be long options
   from `ALLOWED_SBATCH`, written `--name=value` (only true flags such as `--exclusive` may stand
   alone: sbatch reads all directives as one command line, so an option missing its value would
-  take the next directive as one). Refused: options that would change which job status and
+  take the next directive as one), with a value that does not start with `-` (sbatch could read
+  `--comment=--uid=0` as an option). Refused: options that would change which job status and
   stop look at, where its files go, or which cluster (`--job-name`, `--chdir`, `--output`,
   `--error`, `--array`, `--clusters`, `--wrap`, `--wait`, `--uid`, and abbreviations), and ones
   that change the helper's environment or where mail goes (`--export`, `--get-user-env`,
   `--propagate`, `--mail-user`). No `#SBATCH` line may hold `hetjob` or `packjob` in any case,
-  the root's included: SLURM up to 20.11 splits a job there.
+  the root's included: SLURM up to 20.11 splits a job there. Options are checked for them with
+  the rest (so a site recipe holding one does not load); the root, when the script is made.
 - **Submitting** (`helper.sh slurm-submit`, under the launch lock, after the usual checks of
   the way to the root): the script goes to a private temporary file; leftovers of a killed
   submit are swept. It is refused while `endpoint.json` records a helper of the direct or tmux
