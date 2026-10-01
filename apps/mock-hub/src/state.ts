@@ -40,6 +40,9 @@ export interface Delays {
 
 export const DEFAULT_DELAYS: Delays = { start: 1500, reply: 800, end: 300 };
 
+/** How many revisions one filtered `GET /v1/events` request examines at most. */
+export const DEFAULT_SCAN_WINDOW = 500;
+
 /** Events appended within this window reach stream subscribers as one batch. */
 const BATCH_MS = 60;
 
@@ -136,6 +139,8 @@ export class Hub {
   readonly briefs: Brief[];
   readonly transcripts: Map<SessionId, TranscriptRecord[]>;
   readonly delays: Delays;
+  /** How many revisions one filtered activity request examines at most. */
+  readonly scanWindow: number;
   /** The workspace's person, who authors what no agent did. */
   readonly person: MemberId;
   /** A counter per session; a delayed reply lands only if its turn is still the current one. */
@@ -150,7 +155,7 @@ export class Hub {
   #lastAt: number;
   #disposed = false;
 
-  constructor(data: DemoWorkspace, delays: Delays) {
+  constructor(data: DemoWorkspace, delays: Delays, scanWindow = DEFAULT_SCAN_WINDOW) {
     this.workspace = data.workspace;
     this.machines = data.machines;
     this.members = data.members;
@@ -165,6 +170,7 @@ export class Hub {
     this.briefs = data.briefs;
     this.transcripts = cannedTranscripts();
     this.delays = delays;
+    this.scanWindow = scanWindow;
     const person = data.members.find((m) => m.kind === 'human');
     if (person === undefined) {
       throw new Error('the fixture has no person');

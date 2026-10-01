@@ -15,7 +15,10 @@ export interface CacheLookup {
 
 type DataOf<T extends EventType> = Extract<EventBody, { type: T }>['data'];
 
-/** One entry per event type; the mapped type makes a missing entry a compile error. */
+/**
+ * One entry per event type; the mapped type makes a missing entry a compile error. Features do not
+ * extend it at run time: they ask stream L for entries (see README.md, "Rules for features").
+ */
 export type InvalidationMap = {
   [T in EventType]: (data: DataOf<T>, cache: CacheLookup) => QueryKey[];
 };
@@ -30,12 +33,19 @@ const taskAndWorkstream = (id: string, cache: CacheLookup): QueryKey[] => {
 };
 
 export const invalidationMap: InvalidationMap = {
+  machine_added: () => [keys.machines],
+  // The member may be the signed-in one, whose details changed.
+  member_added: () => [keys.members, keys.me],
+  persona_saved: () => [keys.personas],
+  team_saved: () => [keys.teams],
   machine_liveness: () => [keys.machines],
   session_discovered: () => [],
-  session_state_changed: (d) => session(d.session),
+  // Going to `waiting` usually means a question just landed in the transcript.
+  session_state_changed: (d) => [...session(d.session), keys.sessions.transcript(d.session)],
   turn_ended: (d) => [...session(d.session), keys.sessions.transcript(d.session)],
   tool_ran: (d) => [keys.sessions.detail(d.session), keys.sessions.transcript(d.session)],
   file_edited: (d) => [keys.sessions.detail(d.session), keys.sessions.transcript(d.session)],
+  session_updated: (d) => session(d.session),
   session_linked: (d) => session(d.session),
   session_ended: (d) => session(d.session),
   project_created: (d) => [keys.projects.lists, keys.projects.detail(d.project.id)],
@@ -44,6 +54,11 @@ export const invalidationMap: InvalidationMap = {
   task_created: () => [],
   task_moved: (d, cache) => taskAndWorkstream(d.task, cache),
   task_assigned: (d) => task(d.task),
+  // A workstream change touches the old workstream (from the cache) and the new one.
+  task_updated: (d, cache) =>
+    typeof d.patch.workstream === 'string'
+      ? [...taskAndWorkstream(d.task, cache), keys.workstreams.detail(d.patch.workstream)]
+      : taskAndWorkstream(d.task, cache),
   subtasks_replaced: () => [],
   dispatch_started: (d) => [keys.dispatches, keys.tasks.detail(d.dispatch.task)],
   dispatch_finished: () => [keys.dispatches],
