@@ -11,6 +11,7 @@
 //! - [`terminal`] serves `GET /v1/sessions/{id}/terminal` from [`Terminals`].
 //! - [`activity`] serves `GET /v1/events` from the same [`EventSource`], filtered by project or
 //!   workstream through the work model's activity index ([`EventRefs`]) when it has one.
+//! - [`recap`] serves `GET /v1/recaps/blocks` and `GET /v1/recaps/days` from a [`RecapSource`].
 //! - [`hooks`] serves `POST /v1/hooks/{engine}/{event}` into a [`HookSink`].
 //!
 //! Authentication inserts an `axum::Extension<Caller>` (from `pitcrew-protocol`) into every
@@ -26,6 +27,7 @@ pub mod client;
 pub mod hooks;
 mod host;
 mod listener;
+pub mod recap;
 pub mod source;
 pub mod stream;
 pub mod terminal;
@@ -39,6 +41,7 @@ pub use listener::{Bound, Listen};
 pub use listener::{NamedPipe, PipeAddr, default_pipe_name};
 #[cfg(unix)]
 pub use listener::{SOCKET_NAME, UnixSocket};
+pub use recap::{BlockFilter, DaysScope, RecapSource, Recaps};
 #[cfg(feature = "store")]
 pub use source::StoreSource;
 pub use source::{EventSource, MemorySource};
