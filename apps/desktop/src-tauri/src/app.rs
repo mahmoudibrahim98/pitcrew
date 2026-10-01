@@ -213,16 +213,15 @@ fn origin_of(url: &Url) -> Origin {
     )
 }
 
-/// The app's own origins: the dev server in debug builds, the bundled UI's otherwise.
+/// The app's own origins: the dev server in debug builds, the bundled UI's otherwise. On Windows
+/// the bundled UI is served from `http://tauri.localhost`: the window does not set
+/// `use_https_scheme`, so `https://tauri.localhost` is not the app.
 #[must_use]
 pub fn app_origins(config: &tauri::Config) -> Vec<(String, String, Option<u16>)> {
     if tauri::is_dev() {
         config.build.dev_url.iter().map(origin_of).collect()
     } else if cfg!(windows) {
-        vec![
-            ("http".into(), "tauri.localhost".into(), Some(80)),
-            ("https".into(), "tauri.localhost".into(), Some(443)),
-        ]
+        vec![("http".into(), "tauri.localhost".into(), Some(80))]
     } else {
         vec![("tauri".into(), "localhost".into(), None)]
     }
