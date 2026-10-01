@@ -9,7 +9,8 @@
 use crate::events::Event;
 use crate::ids::{MemberId, ProjectId, ProjectKey, WorkstreamId};
 use crate::model::{
-    Date, Location, MachineInfo, Priority, ProjectStatus, TaskStatus, TimestampMs, WorkstreamStatus,
+    Date, Location, Machine, MachineInfo, Member, Priority, ProjectStatus, TaskStatus, TimestampMs,
+    Workspace, WorkstreamStatus,
 };
 use crate::runner::Capability;
 use serde::{Deserialize, Serialize};
@@ -201,6 +202,38 @@ pub struct NewWorkstream {
     /// Folders or branches whose sessions belong to it; none if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locations: Option<Vec<Location>>,
+}
+
+/// `POST /v1/setup`: the first run of a fresh hub (api-v1.md, "The first run"). The person is the
+/// device token's own member; the machine is the hub's own, local one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Setup {
+    /// The workspace's name, 1–80 characters.
+    pub workspace_name: String,
+    /// The person setting the workspace up.
+    pub person: SetupPerson,
+    /// This machine's display name, 1–60 characters.
+    pub machine_name: String,
+}
+
+/// The person in a [`Setup`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupPerson {
+    /// Display name, 1–80 characters.
+    pub name: String,
+    /// `@` followed by 1–32 of `a-z 0-9 _ -`.
+    pub handle: String,
+}
+
+/// The answer to `POST /v1/setup`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupDone {
+    /// The workspace, with its new name.
+    pub workspace: Workspace,
+    /// The person, as `GET /v1/me` answers from now on.
+    pub me: Member,
+    /// The hub's own machine.
+    pub machine: Machine,
 }
 
 /// `GET /v1/events`: a page of the activity log, oldest first within the page.

@@ -1,7 +1,9 @@
 //! Contract tests: wire shapes and rules that every stream relies on. A failure here means a
 //! breaking change to the protocol. Bump `PROTOCOL_VERSION` and tell the affected streams.
 
-use pitcrew_protocol::api::{HostInfo, HostRole, NewProject, NewTask, NewWorkstream, StreamFrame};
+use pitcrew_protocol::api::{
+    HostInfo, HostRole, NewProject, NewTask, NewWorkstream, Setup, SetupPerson, StreamFrame,
+};
 use pitcrew_protocol::events::{BriefTarget, Event, EventBody};
 use pitcrew_protocol::ids::{
     CommandId, EventId, MachineId, MemberId, ProjectId, ProjectKey, SessionId, TaskId, TaskKey,
@@ -577,4 +579,26 @@ fn new_workstream_round_trips_with_defaults() {
         "locations": [{"machine": MachineId::new(), "path": "/scratch/seeds"}]
     }));
     assert_eq!(every.locations.map(|l| l.len()), Some(1));
+}
+
+#[test]
+fn setup_has_the_documented_shape() {
+    let setup: Setup = round_trip(&json!({
+        "workspace_name": "Demo Lab",
+        "person": {"name": "Sam Rivera", "handle": "@sam"},
+        "machine_name": "This laptop"
+    }));
+    assert_eq!(
+        setup,
+        Setup {
+            workspace_name: "Demo Lab".into(),
+            person: SetupPerson {
+                name: "Sam Rivera".into(),
+                handle: "@sam".into(),
+            },
+            machine_name: "This laptop".into(),
+        }
+    );
+    // Every field is required.
+    assert!(serde_json::from_value::<Setup>(json!({"workspace_name": "Demo Lab"})).is_err());
 }
