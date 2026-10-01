@@ -7,18 +7,20 @@
 // - Theme and font: the design tokens, read again when the theme changes.
 // - Input: only in control mode, and the release chord never reaches the program.
 // - Flow: output not yet parsed is bounded; past 4 MiB the socket holds (closes) until xterm has
-//   caught up, then resumes from the bytes received, so a flood costs neither memory nor output.
+//   caught up, then resumes from the bytes received, so a flood neither grows xterm's write queue
+//   without bound nor loses output. (What xterm keeps once parsed is bounded by the scrollback and
+//   the link length; see options.ts.)
 
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { Terminal, type IDisposable, type ITheme } from '@xterm/xterm';
 import { dimTextStyles } from './contrast.ts';
 import { isReleaseChord } from './keys.ts';
-import { linkHandler, SWALLOWED_OSC, terminalOptions } from './options.ts';
+import { isOversizedLink, linkHandler, SWALLOWED_OSC, terminalOptions } from './options.ts';
 import {
   TerminalSocket,
+  type Diagnosis,
   type SendResult,
-  type TerminalProblem,
   type TerminalSocketFactory,
   type TerminalSocketOptions,
   type TerminalStatus,
@@ -35,13 +37,15 @@ export const LOW_WATER = 512 * 1024;
 const FONT_WAIT_MS = 1_500;
 /** Where the dim-text rules apply: the view's frame (see contrast.ts). */
 const DIM_SCOPE = '[data-terminal-focus]';
+/** CAN (0x18), written where output was lost. */
+const CANCEL = Uint8Array.of(0x18);
 
 export interface ControllerOptions {
   /** The element xterm fills. */
   host: HTMLElement;
   sessionId: string;
   socket: TerminalSocketFactory;
-  diagnose?: (() => Promise<TerminalProblem | undefined>) | undefined;
+  diagnose?: (() => Promise<Diagnosis>) | undefined;
   screenReader: boolean;
   openLink(url: string): void;
   onLinkHint(url: string | undefined): void;
@@ -50,11 +54,14 @@ export interface ControllerOptions {
   onRenderer(renderer: Renderer): void;
   /** The release chord, pressed in control mode. */
   onRelease(): void;
-  /** Keystrokes that were not sent at once: queued, refused, or after the end. */
-  onInput(result: Exclude<SendResult, 'sent'>): void;
+  /** What became of each keystroke or paste: sent, queued, refused, or after the end. */
+  onInput(result: SendResult): void;
   tokens?: TokenReader;
   /** For tests: the socket's back-off, environment and timings. */
-  socketOptions?: Pick<TerminalSocketOptions, 'backoff' | 'environment' | 'random' | 'resizeMs' | 'stableMs'>;
+  socketOptions?: Pick<
+    TerminalSocketOptions,
+    'backoff' | 'connectTimeoutMs' | 'environment' | 'random' | 'resizeMs' | 'stableMs'
+  >;
 }
 
 function waitForFont(font: TerminalFont): Promise<void> {
@@ -98,6 +105,8 @@ export class TerminalController {
     for (const code of SWALLOWED_OSC) {
       this.#disposables.push(this.#term.parser.registerOscHandler(code, () => true));
     }
+    // A link target past 2 KiB is dropped (true: handled), so xterm never keeps it.
+    this.#disposables.push(this.#term.parser.registerOscHandler(8, (data) => isOversizedLink(data)));
     this.#term.attachCustomKeyEventHandler((event) => this.#key(event));
     this.#socket = new TerminalSocket({
       ...options.socketOptions,
@@ -105,7 +114,12 @@ export class TerminalController {
       socket: options.socket,
       size: { cols: this.#term.cols, rows: this.#term.rows },
       onOutput: (bytes) => this.#write(bytes),
-      onTruncated: () => options.onTruncated(),
+      onTruncated: () => {
+        // CAN ends an escape sequence the gap may have cut, so it cannot swallow what follows. It
+        // goes to xterm only: it is not output, so the count and the flow control leave it out.
+        this.#term.write(CANCEL);
+        options.onTruncated();
+      },
       onStatus: (status) => options.onStatus(status),
       ...(options.diagnose === undefined ? {} : { diagnose: options.diagnose }),
     });
@@ -117,6 +131,11 @@ export class TerminalController {
     );
     this.#term.loadAddon(this.#fit);
     void waitForFont(font).then(() => this.#open());
+  }
+
+  /** After a stop, tries again (see `TerminalSocket.retry`). */
+  retry(): void {
+    if (!this.#disposed) this.#socket.retry();
   }
 
   get mode(): TerminalMode {
@@ -279,8 +298,7 @@ export class TerminalController {
 
   #input(data: string | Uint8Array): void {
     if (this.#mode !== 'control' || this.#disposed) return;
-    const result = this.#socket.send(data);
-    if (result !== 'sent') this.#options.onInput(result);
+    this.#options.onInput(this.#socket.send(data));
   }
 
   /** xterm asks before acting on a key: false leaves the key alone. */

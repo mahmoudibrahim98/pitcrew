@@ -1,7 +1,8 @@
 // A session's terminal socket (`GET /v1/sessions/{id}/terminal`, api-v1.md "Terminals"), with no
 // React. It counts the output bytes it has received and reconnects from there, so a dropped
 // connection neither loses nor repeats output; holds at most 64 KiB of keystrokes while
-// disconnected; and sends debounced, clamped resizes only when the size changed.
+// disconnected; and sends debounced, clamped resizes only when the size changed. A stopped
+// terminal tries again only when asked (`retry()`).
 //
 // It opens sockets through a factory that takes an API path, never a URL: the browser factory
 // (`browserSocketFactory`) puts the path on the hub's base URL and the token in a subprotocol, and
@@ -10,8 +11,12 @@
 export const SUBPROTOCOL = 'pitcrew.v1';
 const BEARER_PREFIX = 'pitcrew.bearer.';
 
-/** The most keystroke bytes held while disconnected, and the most sent at once. */
+/** The most keystroke bytes held while disconnected, and the largest frame sent. */
 export const INPUT_LIMIT = 64 * 1024;
+/** The most sent at once (a paste) while connected, in frames of `INPUT_LIMIT`: the hub's limit. */
+export const SEND_LIMIT = 1024 * 1024;
+/** Upgrades the hub refused with nothing to explain them, in a row, before giving up. */
+export const MAX_UNEXPLAINED = 5;
 /** Terminal sizes the hub accepts, in cells. */
 export const MIN_SIZE = 1;
 export const MAX_SIZE = 1000;
@@ -32,6 +37,10 @@ export interface CloseInfo {
 /** The part of a WebSocket the terminal uses; tests and the desktop gateway pass their own. */
 export interface TerminalSocketLike {
   onopen: (() => void) | null;
+  /**
+   * Text frames as strings; binary frames as an `ArrayBuffer` (or a typed array). A `Blob` is not
+   * read, so a browser WebSocket needs `binaryType = 'arraybuffer'`, as `browserSocketFactory` sets.
+   */
   onmessage: ((message: { data: unknown }) => void) | null;
   onclose: ((event: CloseInfo) => void) | null;
   onerror: (() => void) | null;
@@ -41,7 +50,10 @@ export interface TerminalSocketLike {
   close(code?: number, reason?: string): void;
 }
 
-/** Opens a socket for an API path such as `/v1/sessions/{id}/terminal?cols=80&rows=24&from=0`. */
+/**
+ * Opens a socket for an API path such as `/v1/sessions/{id}/terminal?cols=80&rows=24&from=0`. The
+ * socket must deliver binary frames as `ArrayBuffer`s (see `TerminalSocketLike.onmessage`).
+ */
 export type TerminalSocketFactory = (path: string) => TerminalSocketLike;
 
 /** Why the hub will not serve this terminal; reconnecting cannot help. */
@@ -50,6 +62,13 @@ export interface TerminalProblem {
   status: number;
   message: string;
 }
+
+/**
+ * What a diagnosis found: a problem (stop), `'unexplained'` (the hub answered and nothing explains
+ * the refusal: reconnect, at most `MAX_UNEXPLAINED` times in a row), or undefined (it could not
+ * find out: the hub could not be asked, or did not answer in time; reconnect).
+ */
+export type Diagnosis = TerminalProblem | 'unexplained' | undefined;
 
 export type WaitReason = 'hidden' | 'offline' | 'busy';
 
@@ -170,14 +189,16 @@ export interface TerminalSocketOptions {
   onStatus?(status: TerminalStatus): void;
   /**
    * Called when a connection failed before it opened. A browser cannot see the HTTP status of a
-   * refused upgrade, so this finds out why (a 404 or a 503); undefined means the network failed,
-   * and reconnecting may help.
+   * refused upgrade, so this finds out why (see `Diagnosis`). It should give up on its own after a
+   * while (`terminalDiagnosis` waits 10 s).
    */
-  diagnose?: () => Promise<TerminalProblem | undefined>;
+  diagnose?: () => Promise<Diagnosis>;
   /** Delay before reconnect attempt n is `min(maxMs, initialMs * 2^n)`, times 0.5–1 (jitter). */
   backoff?: { initialMs: number; maxMs: number };
   /** The back-off starts over once a connection has stayed open this long. */
   stableMs?: number;
+  /** An attempt that has not opened after this long is given up, as a refused one (10 s). */
+  connectTimeoutMs?: number;
   /** Resizes wait this long for the size to settle. */
   resizeMs?: number;
   random?: () => number;
@@ -201,8 +222,10 @@ export class TerminalSocket {
   readonly #environment: Environment;
   #status: TerminalStatus = { kind: 'connecting' };
   #started = false;
-  /** Ended, stopped or closed: nothing reconnects or sends any more. */
+  /** Ended, stopped or closed: nothing reconnects or sends any more (until `retry()`). */
   #done = false;
+  /** `stop()` was called: nothing ever starts again. */
+  #closedByOwner = false;
   #socket: TerminalSocketLike | undefined;
   #open = false;
   #everOpened = false;
@@ -213,6 +236,8 @@ export class TerminalSocket {
   #generation = 0;
   /** The view asked to stop reading until it catches up (`hold()`). */
   #held = false;
+  /** Refused upgrades in a row that the diagnosis could not explain. */
+  #unexplained = 0;
   #queue: Uint8Array[] = [];
   #queued = 0;
   /** The size wanted, and the size the hub was last told on this connection. */
@@ -221,6 +246,7 @@ export class TerminalSocket {
   #retryTimer: ReturnType<typeof setTimeout> | undefined;
   #stableTimer: ReturnType<typeof setTimeout> | undefined;
   #resizeTimer: ReturnType<typeof setTimeout> | undefined;
+  #openTimer: ReturnType<typeof setTimeout> | undefined;
   #unsubscribe: (() => void) | undefined;
 
   constructor(options: TerminalSocketOptions) {
@@ -256,24 +282,38 @@ export class TerminalSocket {
   /** Closes for good, as the view goes away. */
   stop(): void {
     const wasDone = this.#done;
+    this.#closedByOwner = true;
     this.#shutDown();
     if (!wasDone) this.#setStatus({ kind: 'closed' });
   }
 
   /**
-   * Keystrokes (text is sent as UTF-8), as one binary message. While disconnected they wait, up to
-   * 64 KiB in all; past that, or more than 64 KiB at once, they are refused.
+   * After a stop, tries again from the bytes received, with the back-off starting over. Only a
+   * stopped terminal, and only when asked (a person, or its machine coming back), so never a loop.
+   */
+  retry(): void {
+    if (!this.#started || this.#closedByOwner || this.#status.kind !== 'stopped') return;
+    this.#done = false;
+    this.#attempt = 0;
+    this.#unexplained = 0;
+    this.#unsubscribe = this.#environment.subscribe(() => this.#onEnvironment());
+    this.#connect();
+  }
+
+  /**
+   * Keystrokes (text is sent as UTF-8), in binary frames of at most 64 KiB. While connected up to
+   * 1 MiB at once (a paste) is sent, unless as much is still waiting to go out; while disconnected
+   * they wait, up to 64 KiB in all. Anything past that is refused.
    */
   send(data: string | Uint8Array): SendResult {
     if (this.#done) return 'closed';
     const bytes = typeof data === 'string' ? encoder.encode(data) : data.slice();
     if (bytes.byteLength === 0) return 'sent';
-    if (bytes.byteLength > INPUT_LIMIT) return 'refused';
     const socket = this.#socket;
     if (socket !== undefined && this.#open && this.#queue.length === 0) {
       // A connection that is not draining what it was given is not handed more.
-      if ((socket.bufferedAmount ?? 0) + bytes.byteLength > INPUT_LIMIT) return 'refused';
-      socket.send(bytes);
+      if ((socket.bufferedAmount ?? 0) + bytes.byteLength > SEND_LIMIT) return 'refused';
+      for (let at = 0; at < bytes.byteLength; at += INPUT_LIMIT) socket.send(bytes.subarray(at, at + INPUT_LIMIT));
       return 'sent';
     }
     if (this.#queued + bytes.byteLength > INPUT_LIMIT) return 'refused';
@@ -334,13 +374,26 @@ export class TerminalSocket {
     this.#socket = socket;
     this.#open = false;
     this.#sentSize = size;
-    if (this.#status.kind !== 'reconnecting') {
-      this.#setStatus(this.#everOpened ? { kind: 'reconnecting', attempt: this.#attempt, delayMs: 0 } : { kind: 'connecting' });
+    const now = this.#status;
+    if (now.kind === 'stopped' || (now.kind === 'waiting' && now.why !== 'busy' && !this.#everOpened)) {
+      this.#setStatus({ kind: 'connecting' });
+    } else if (now.kind === 'waiting' && now.why !== 'busy') {
+      this.#setStatus({ kind: 'reconnecting', attempt: this.#attempt, delayMs: 0 });
     }
+    // Otherwise it stays: "connecting", "reconnecting", or catching up after `hold()`.
+    // A stuck hub or a half-open tunnel must not leave it connecting for ever.
+    this.#openTimer = setTimeout(() => {
+      this.#openTimer = undefined;
+      if (socket !== this.#socket || this.#open) return;
+      this.#detach()?.close();
+      this.#closed({ code: 1006, reason: 'timed out' }, false);
+    }, this.#options.connectTimeoutMs ?? 10_000);
     socket.onopen = () => {
       if (socket !== this.#socket) return;
+      this.#clearOpenTimer();
       this.#open = true;
       this.#everOpened = true;
+      this.#unexplained = 0;
       this.#clearStable();
       this.#stableTimer = setTimeout(() => {
         this.#stableTimer = undefined;
@@ -422,12 +475,20 @@ export class TerminalSocket {
     this.#retry();
   }
 
-  #diagnose(diagnose: () => Promise<TerminalProblem | undefined>): void {
+  #diagnose(diagnose: () => Promise<Diagnosis>): void {
     const generation = ++this.#generation;
-    const settle = (problem: TerminalProblem | undefined) => {
+    const settle = (found: Diagnosis) => {
       if (generation !== this.#generation || this.#done || this.#held) return;
-      if (problem === undefined) this.#retry();
-      else this.#finish({ kind: 'stopped', reason: problem.message, status: problem.status });
+      if (found === undefined) {
+        this.#retry();
+      } else if (found === 'unexplained') {
+        // The hub answers, finds nothing wrong, and still refuses: not for ever.
+        this.#unexplained += 1;
+        if (this.#unexplained >= MAX_UNEXPLAINED) this.#finish({ kind: 'stopped', reason: 'The hub refused the terminal.' });
+        else this.#retry();
+      } else {
+        this.#finish({ kind: 'stopped', reason: found.message, status: found.status });
+      }
     };
     diagnose().then(settle, () => settle(undefined));
   }
@@ -491,6 +552,7 @@ export class TerminalSocket {
     const socket = this.#socket;
     this.#socket = undefined;
     this.#open = false;
+    this.#clearOpenTimer();
     if (socket !== undefined) {
       socket.onopen = null;
       socket.onmessage = null;
@@ -508,6 +570,11 @@ export class TerminalSocket {
   #clearStable(): void {
     if (this.#stableTimer !== undefined) clearTimeout(this.#stableTimer);
     this.#stableTimer = undefined;
+  }
+
+  #clearOpenTimer(): void {
+    if (this.#openTimer !== undefined) clearTimeout(this.#openTimer);
+    this.#openTimer = undefined;
   }
 
   #setStatus(status: TerminalStatus): void {

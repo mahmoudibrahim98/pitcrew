@@ -8,8 +8,10 @@ import { terminalDiagnosis } from '../terminal/diagnose.ts';
 import {
   browserSocketFactory,
   INPUT_LIMIT,
+  SEND_LIMIT,
   TerminalSocket,
   terminalPath,
+  type Diagnosis,
   type TerminalProblem,
   type TerminalSocketOptions,
   type TerminalStatus,
@@ -411,6 +413,136 @@ describe('pausing', () => {
     terminal.resume();
     expect(sockets).toHaveLength(2);
     expect(last().from).toBe(10);
+    // A hold is not a dropped connection, and is not announced as one.
+    expect(status(statuses)).toEqual({ kind: 'waiting', why: 'busy' });
+    expect(statuses.some((s) => s.kind === 'reconnecting')).toBe(false);
+    last().open();
+    expect(status(statuses)).toEqual({ kind: 'live' });
+  });
+});
+
+describe('trying again after a stop', () => {
+  it('reconnects from the bytes received, with the back-off starting over', async () => {
+    const { terminal, sockets, statuses, last } = setup();
+    terminal.start();
+    for (let i = 0; i < 3; i += 1) {
+      last().drop(1006);
+      await vi.advanceTimersByTimeAsync(2_000);
+    }
+    last().open();
+    last().output('abc');
+    last().drop(1011, 'input write timed out');
+    expect(status(statuses)?.kind).toBe('stopped');
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(sockets).toHaveLength(4);
+
+    terminal.retry();
+    expect(sockets).toHaveLength(5);
+    expect(last().from).toBe(3);
+    expect(status(statuses)).toEqual({ kind: 'connecting' });
+    last().drop(1006);
+    expect(status(statuses)).toEqual({ kind: 'reconnecting', attempt: 1, delayMs: 75 });
+    await vi.advanceTimersByTimeAsync(1_000);
+    last().open();
+    expect(status(statuses)).toEqual({ kind: 'live' });
+  });
+
+  it('does nothing unless stopped, and never after stop()', () => {
+    const { terminal, sockets, last } = setup();
+    terminal.retry();
+    expect(sockets).toHaveLength(0);
+    terminal.start();
+    last().open();
+    terminal.retry();
+    expect(sockets).toHaveLength(1);
+    last().text({ type: 'exit' });
+    terminal.retry();
+    expect(sockets).toHaveLength(1);
+
+    const other = setup();
+    other.terminal.start();
+    other.last().drop(1011);
+    other.terminal.stop();
+    other.terminal.retry();
+    expect(other.sockets).toHaveLength(1);
+  });
+
+  it('listens to the page again', () => {
+    const { terminal, environment, last } = setup();
+    terminal.start();
+    last().drop(1011);
+    expect(environment.listeners).toBe(0);
+    terminal.retry();
+    expect(environment.listeners).toBe(1);
+  });
+});
+
+describe('timeouts', () => {
+  it('gives up an attempt that does not open in 10 s, and asks why', async () => {
+    const diagnose = vi.fn(async (): Promise<Diagnosis> => undefined);
+    const { terminal, sockets, statuses, last } = setup({ diagnose });
+    terminal.start();
+    const stuck = last();
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(stuck.closedWith).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(stuck.closedWith).toBeDefined();
+    await flush();
+    expect(diagnose).toHaveBeenCalledTimes(1);
+    expect(status(statuses)?.kind).toBe('reconnecting');
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(sockets).toHaveLength(2);
+    // A late open of the abandoned socket is ignored.
+    stuck.open();
+    expect(status(statuses)?.kind).not.toBe('live');
+  });
+
+  it('a socket that opens in time is not given up', async () => {
+    const { terminal, last } = setup({ connectTimeoutMs: 100 });
+    terminal.start();
+    last().open();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(last().closedWith).toBeUndefined();
+  });
+});
+
+describe('unexplained refusals', () => {
+  it('stop after five in a row', async () => {
+    const diagnose = vi.fn(async (): Promise<Diagnosis> => 'unexplained');
+    const { terminal, sockets, statuses, last } = setup({ diagnose });
+    terminal.start();
+    for (let i = 1; i <= 4; i += 1) {
+      last().drop(1006);
+      await flush();
+      expect(status(statuses)?.kind).toBe('reconnecting');
+      await vi.advanceTimersByTimeAsync(2_000);
+    }
+    last().drop(1006);
+    await flush();
+    expect(status(statuses)).toEqual({ kind: 'stopped', reason: 'The hub refused the terminal.' });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(sockets).toHaveLength(5);
+  });
+
+  it('count again after a connection opens', async () => {
+    const diagnose = vi.fn(async (): Promise<Diagnosis> => 'unexplained');
+    const { terminal, statuses, last } = setup({ diagnose });
+    terminal.start();
+    for (let i = 0; i < 4; i += 1) {
+      last().drop(1006);
+      await flush();
+      await vi.advanceTimersByTimeAsync(2_000);
+    }
+    last().open();
+    last().drop(1006);
+    await vi.advanceTimersByTimeAsync(2_000);
+    for (let i = 0; i < 4; i += 1) {
+      last().drop(1006);
+      await flush();
+      expect(status(statuses)?.kind).toBe('reconnecting');
+      // Under the 10 s an attempt is given to open, which would count as another refusal.
+      await vi.advanceTimersByTimeAsync(2_000);
+    }
   });
 });
 
@@ -446,20 +578,39 @@ describe('keystrokes', () => {
     expect(terminal.send('after')).toBe('sent');
   });
 
-  it('refuses more than 64 KiB at once, even when connected', () => {
+  it('while connected, a paste of up to 1 MiB goes in frames of at most 64 KiB', () => {
     const { terminal, last } = setup();
     terminal.start();
     last().open();
-    expect(terminal.send('p'.repeat(INPUT_LIMIT + 1))).toBe('refused');
-    expect(last().sent).toHaveLength(0);
-    expect(terminal.send('p'.repeat(INPUT_LIMIT))).toBe('sent');
+    const paste = Uint8Array.from({ length: SEND_LIMIT }, (_, i) => 32 + (i % 90));
+    expect(terminal.send(paste)).toBe('sent');
+    const frames = last().sent as Uint8Array[];
+    expect(frames).toHaveLength(SEND_LIMIT / INPUT_LIMIT);
+    expect(Math.max(...frames.map((f) => f.byteLength))).toBe(INPUT_LIMIT);
+    expect(last().keys).toEqual([...paste]);
+    // Past the hub's limit: refused whole, nothing sent.
+    expect(terminal.send('p'.repeat(SEND_LIMIT + 1))).toBe('refused');
+    expect(last().sent).toHaveLength(SEND_LIMIT / INPUT_LIMIT);
+    // An odd size ends with a short frame.
+    expect(terminal.send('q'.repeat(INPUT_LIMIT + 5))).toBe('sent');
+    expect(last().sent.slice(-2).map((f) => (f as Uint8Array).byteLength)).toEqual([INPUT_LIMIT, 5]);
   });
 
-  it('refuses keystrokes a backed-up connection has not sent', () => {
+  it('while disconnected, refuses more than 64 KiB at once', async () => {
     const { terminal, last } = setup();
     terminal.start();
     last().open();
-    last().bufferedAmount = INPUT_LIMIT - 2;
+    last().drop(1006);
+    expect(terminal.send('p'.repeat(INPUT_LIMIT + 1))).toBe('refused');
+    expect(terminal.queued).toBe(0);
+    expect(terminal.send('p'.repeat(INPUT_LIMIT))).toBe('queued');
+  });
+
+  it('refuses keystrokes while a backed-up connection has not sent 1 MiB', () => {
+    const { terminal, last } = setup();
+    terminal.start();
+    last().open();
+    last().bufferedAmount = SEND_LIMIT - 2;
     expect(terminal.send('ab')).toBe('sent');
     expect(terminal.send('abc')).toBe('refused');
   });
@@ -575,51 +726,80 @@ describe('the diagnosis of a refused upgrade', () => {
     ...patch,
   });
   const machine = (liveness: Machine['liveness']) => ({ id: 'M1', name: 'hpc-login', liveness }) as Machine;
-  const api = (answer: () => Promise<Session>, machines: () => Promise<Machine[]> = async () => [machine('live')]) => ({
-    session: answer,
+  type Answer<T> = (signal?: AbortSignal) => Promise<T>;
+  const api = (answer: Answer<Session>, machines: Answer<Machine[]> = async () => [machine('live')]) => ({
+    session: (_id: string, signal?: AbortSignal) => answer(signal),
     machines,
   });
+  const fails = (code: ConstructorParameters<typeof ApiError>[0], status: number) => async (): Promise<never> => {
+    throw new ApiError(code, `failed with ${status}`, status);
+  };
 
   it('asks as the hub decides: the session, its machine, then its terminal', async () => {
-    const gone = api(async () => {
-      throw new ApiError('not_found', 'No session S1.', 404);
+    expect(await terminalDiagnosis(api(fails('not_found', 404)), 'S1')()).toEqual({
+      status: 404,
+      message: 'This session no longer exists.',
     });
-    expect(await terminalDiagnosis(gone, 'S1')()).toEqual({ status: 404, message: 'This session no longer exists.' });
-
     const away = api(async () => session({ terminal: undefined }), async () => [machine('unverifiable')]);
     expect(await terminalDiagnosis(away, 'S1')()).toEqual({
       status: 503,
       message: 'hpc-login cannot be reached right now, so its terminal cannot be shown.',
     });
-    const unreachable = api(async () => session({ state: 'unreachable' }));
-    expect((await terminalDiagnosis(unreachable, 'S1')())?.status).toBe(503);
-    const refused = api(async () => {
-      throw new ApiError('unavailable', 'hpc-login cannot be reached right now.', 503);
+    expect(await terminalDiagnosis(api(async () => session({ state: 'unreachable' })), 'S1')()).toMatchObject({ status: 503 });
+    expect(await terminalDiagnosis(api(async () => session({ terminal: undefined })), 'S1')()).toEqual({
+      status: 404,
+      message: 'This session has no terminal.',
     });
-    expect(await terminalDiagnosis(refused, 'S1')()).toEqual({ status: 503, message: 'hpc-login cannot be reached right now.' });
-
-    const none = api(async () => session({ terminal: undefined }));
-    expect(await terminalDiagnosis(none, 'S1')()).toEqual({ status: 404, message: 'This session has no terminal.' });
-
-    const token = api(async () => {
-      throw new ApiError('unauthorized', 'No token.', 401);
-    });
-    expect((await terminalDiagnosis(token, 'S1')())?.status).toBe(401);
+    expect(await terminalDiagnosis(api(fails('unauthorized', 401)), 'S1')()).toMatchObject({ status: 401 });
   });
 
-  it('finds nothing to blame when the session is fine or the hub cannot be reached', async () => {
-    expect(await terminalDiagnosis(api(async () => session()), 'S1')()).toBeUndefined();
-    const offline = api(async () => {
-      throw new ApiError('unavailable', 'Cannot reach the hub', 0);
+  it("takes the hub's own 503 as the machine's reason only while the machine is not live", async () => {
+    const machineOf = () => 'M1';
+    const down = api(fails('unavailable', 503), async () => [machine('stopped')]);
+    expect(await terminalDiagnosis(down, 'S1', { machineOf })()).toEqual({
+      status: 503,
+      message: 'hpc-login cannot be reached right now, so its terminal cannot be shown.',
     });
-    expect(await terminalDiagnosis(offline, 'S1')()).toBeUndefined();
+    // The machine is live (a hub restarting, say): nothing to blame, so it reconnects.
+    const up = api(fails('unavailable', 503), async () => [machine('live')]);
+    expect(await terminalDiagnosis(up, 'S1', { machineOf })()).toBeUndefined();
+    // Nothing known about the machine: the same.
+    expect(await terminalDiagnosis(down, 'S1')()).toBeUndefined();
+  });
+
+  it('says "unexplained" when the hub answers and nothing is wrong', async () => {
+    expect(await terminalDiagnosis(api(async () => session()), 'S1')()).toBe('unexplained');
     // Without the machines, the session's own state still counts.
-    const noMachines = api(
-      async () => session(),
-      async () => {
-        throw new ApiError('internal', 'boom', 500);
-      },
+    expect(await terminalDiagnosis(api(async () => session(), fails('internal', 500)), 'S1')()).toBe('unexplained');
+  });
+
+  it('finds nothing when the hub cannot be reached', async () => {
+    expect(await terminalDiagnosis(api(fails('unavailable', 0)), 'S1')()).toBeUndefined();
+    expect(await terminalDiagnosis(api(fails('internal', 500)), 'S1')()).toBeUndefined();
+  });
+
+  it('gives up after 10 s, aborting its requests, and finds nothing', async () => {
+    let aborted = false;
+    const hang: Answer<Session> = (signal) =>
+      new Promise<Session>((_, reject) => {
+        signal?.addEventListener('abort', () => {
+          aborted = true;
+          reject(new DOMException('aborted', 'AbortError'));
+        });
+      });
+    let found: Diagnosis | 'pending' = 'pending';
+    void terminalDiagnosis(api(hang), 'S1')().then((result) => (found = result));
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(found).toBe('pending');
+    await vi.advanceTimersByTimeAsync(1);
+    expect(found).toBeUndefined();
+    expect(aborted).toBe(true);
+    // Even a hub that ignores the abort cannot hold it up.
+    let ignored: Diagnosis | 'pending' = 'pending';
+    void terminalDiagnosis(api(() => new Promise<Session>(() => {})), 'S1', { timeoutMs: 50 })().then(
+      (result) => (ignored = result),
     );
-    expect(await terminalDiagnosis(noMachines, 'S1')()).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(50);
+    expect(ignored).toBeUndefined();
   });
 });

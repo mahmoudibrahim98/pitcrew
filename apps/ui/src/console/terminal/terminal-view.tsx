@@ -16,9 +16,10 @@ import {
   type FocusEvent,
   type KeyboardEvent,
 } from 'react';
-import { apiToken, useApi } from '../../data/index.ts';
+import { apiToken, useApi, useMachines, useSession } from '../../data/index.ts';
 import { Button, Kbd } from '../../design/index.ts';
 import { cx } from '../../lib/cx.ts';
+import { isMac } from '../../lib/platform.ts';
 import { ownsShellKeys } from '../../shell/index.ts';
 import { useOpenExternal } from '../render/links.tsx';
 import { TerminalController, type Renderer, type TerminalMode } from './controller.ts';
@@ -28,6 +29,7 @@ import { useTerminalPrefs } from './prefs.ts';
 import {
   browserSocketFactory,
   INPUT_LIMIT,
+  SEND_LIMIT,
   type SendResult,
   type TerminalSocketFactory,
   type TerminalSocketOptions,
@@ -42,11 +44,18 @@ export interface TerminalViewProps {
    */
   socket?: TerminalSocketFactory | undefined;
   /** For tests: the socket's back-off, environment and timings. */
-  socketOptions?: Pick<TerminalSocketOptions, 'backoff' | 'environment' | 'random' | 'resizeMs' | 'stableMs'>;
+  socketOptions?: Pick<
+    TerminalSocketOptions,
+    'backoff' | 'connectTimeoutMs' | 'environment' | 'random' | 'resizeMs' | 'stableMs'
+  >;
   className?: string | undefined;
 }
 
 const KIB = Math.round(INPUT_LIMIT / 1024);
+const MIB = Math.round(SEND_LIMIT / 1024 / 1024);
+const LINK_CLICK = isMac ? 'Cmd+click' : 'Ctrl+click';
+/** Ctrl+V is the program's (^V), so pasting takes Shift as well, as in terminal emulators. */
+const PASTE_KEYS = isMac ? 'Cmd+V' : 'Ctrl+Shift+V';
 
 export function statusText(status: TerminalStatus): string {
   switch (status.kind) {
@@ -72,12 +81,14 @@ export function statusText(status: TerminalStatus): string {
 const canTakeInput = (status: TerminalStatus) =>
   status.kind === 'live' || status.kind === 'connecting' || status.kind === 'reconnecting' || status.kind === 'waiting';
 
-function inputMessage(result: Exclude<SendResult, 'sent'>): string {
+function inputMessage(result: SendResult): string | undefined {
   switch (result) {
+    case 'sent':
+      return undefined;
     case 'queued':
       return `Not connected: what you type is sent when the connection is back (up to ${KIB} KiB).`;
     case 'refused':
-      return `Not sent: the terminal takes at most ${KIB} KiB at once, and holds at most ${KIB} KiB while disconnected.`;
+      return `Not sent: at most ${MIB} MiB goes at once, and at most ${KIB} KiB waits while disconnected.`;
     case 'closed':
       return 'Not sent: the terminal has closed.';
   }
@@ -105,6 +116,16 @@ export function TerminalView({ sessionId, socket, socketOptions, className }: Te
   const effective: TerminalMode = canControl ? mode : 'view';
   const control = effective === 'control';
 
+  // Whether the session's machine can be reached, once both are known.
+  const session = useSession(sessionId);
+  const machines = useMachines();
+  const machineId = session.data?.machine;
+  const liveness = machines.data?.find((m) => m.id === machineId)?.liveness;
+  const reachable =
+    session.data === undefined || liveness === undefined
+      ? undefined
+      : liveness === 'live' && session.data.state !== 'unreachable';
+
   const takeControl = () => {
     const c = controller.current;
     if (c === null || !canControl) return;
@@ -117,16 +138,30 @@ export function TerminalView({ sessionId, socket, socketOptions, className }: Te
     setMode('view');
     frame.current?.focus();
   };
+  const tryAgain = () => {
+    controller.current?.retry();
+    // The button goes as it connects; focus stays on the terminal rather than falling to the page.
+    frame.current?.focus();
+  };
 
   // Callbacks for the controller: always the latest state, without recreating it.
   const openSocket = useEffectEvent((path: string) => (socket ?? browserSockets)(path));
   const openLink = useEffectEvent((url: string) => openExternal(url));
+  const machineOf = useEffectEvent(() => machineId);
   const onRelease = useEffectEvent(() => release());
   const onStatus = useEffectEvent((next: TerminalStatus) => {
     setStatus(next);
     if (next.kind === 'live') setNotice(undefined);
+    const c = controller.current;
+    if ((next.kind === 'ended' || next.kind === 'stopped') && c?.mode === 'control') {
+      // Control ends with the program; focus in the terminal goes to its frame, not the page.
+      const inside = frame.current?.contains(document.activeElement) ?? false;
+      c.setMode('view');
+      setMode('view');
+      if (inside) frame.current?.focus();
+    }
   });
-  const onInput = useEffectEvent((result: Exclude<SendResult, 'sent'>) => setNotice(inputMessage(result)));
+  const onInput = useEffectEvent((result: SendResult) => setNotice(inputMessage(result)));
   const options = useEffectEvent(() => socketOptions);
 
   useEffect(() => {
@@ -138,28 +173,51 @@ export function TerminalView({ sessionId, socket, socketOptions, className }: Te
     controller.current?.setScreenReader(screenReader);
   }, [screenReader]);
 
+  // The machine came back: a terminal that stopped while it was away tries again.
+  const wasReachable = useRef<boolean | undefined>(undefined);
+  useEffect(() => {
+    const was = wasReachable.current;
+    wasReachable.current = reachable;
+    if (reachable === true && was === false) controller.current?.retry();
+  }, [reachable]);
+
   useEffect(() => {
     const element = host.current;
     if (element === null) return;
     const extra = options();
+    // A controller that has been replaced (Strict Mode mounts twice) is not heard from again.
+    let current = true;
     const c = new TerminalController({
       host: element,
       sessionId,
       socket: (path) => openSocket(path),
-      diagnose: terminalDiagnosis(api, sessionId),
+      diagnose: terminalDiagnosis(api, sessionId, { machineOf: () => machineOf() }),
       screenReader: useTerminalPrefs.getState().screenReader,
       openLink: (url) => openLink(url),
-      onLinkHint: (url) => setLinkHint(url),
-      onStatus: (next) => onStatus(next),
-      onTruncated: () => setTruncated(true),
-      onRenderer: (next) => setRenderer(next),
-      onRelease: () => onRelease(),
-      onInput: (result) => onInput(result),
+      onLinkHint: (url) => {
+        if (current) setLinkHint(url);
+      },
+      onStatus: (next) => {
+        if (current) onStatus(next);
+      },
+      onTruncated: () => {
+        if (current) setTruncated(true);
+      },
+      onRenderer: (next) => {
+        if (current) setRenderer(next);
+      },
+      onRelease: () => {
+        if (current) onRelease();
+      },
+      onInput: (result) => {
+        if (current) onInput(result);
+      },
       ...(extra === undefined ? {} : { socketOptions: extra }),
     });
     c.setMode(modeRef.current);
     controller.current = c;
     return () => {
+      current = false;
       controller.current = null;
       c.dispose();
     };
@@ -240,6 +298,7 @@ export function TerminalView({ sessionId, socket, socketOptions, className }: Te
             Take control
           </Button>
         )}
+        {status.kind === 'stopped' && <Button onClick={tryAgain}>Try again</Button>}
         <span className="inline-flex items-center gap-1 text-xs text-ink-2">
           {control ? (
             <>
@@ -253,7 +312,8 @@ export function TerminalView({ sessionId, socket, socketOptions, className }: Te
             )
           )}
         </span>
-        <span role="status" data-testid="terminal-status" className="min-w-0 truncate text-xs text-ink-2">
+        {/* Wraps rather than truncates: a stop's reason is the one thing to read here. */}
+        <span role="status" data-testid="terminal-status" className="min-w-0 text-xs break-words text-ink-2">
           {statusText(status)}
         </span>
         <label className="ml-auto inline-flex items-center gap-1.5 text-xs text-ink-2">
@@ -283,7 +343,7 @@ export function TerminalView({ sessionId, socket, socketOptions, className }: Te
         data-terminal-focus=""
         data-terminal-mode={effective}
         data-renderer={renderer}
-        title={linkHint === undefined ? undefined : `Ctrl+click to open ${linkHint}`}
+        title={linkHint === undefined ? undefined : `${LINK_CLICK} to open ${linkHint}`}
         onFocus={onFocus}
         onKeyDown={onKeyDown}
         {...(control ? ownsShellKeys : {})}
@@ -304,7 +364,7 @@ export function TerminalView({ sessionId, socket, socketOptions, className }: Te
       </div>
       <p id={hintId} className="sr-only">
         {control
-          ? `Keys go to the program, Escape and Tab included. ${RELEASE_LABEL} releases control.`
+          ? `Keys go to the program, Escape and Tab included. Paste with ${PASTE_KEYS} or the context menu. ${RELEASE_LABEL} releases control.`
           : 'Input is off. Press Enter to take control. The arrow keys, Page Up, Page Down, Home and End scroll.'}
       </p>
     </div>

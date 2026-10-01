@@ -7,11 +7,14 @@
 // links, and that unmounting releases everything. The real xterm runs in the Playwright specs.
 
 import { act, fireEvent, screen } from '@testing-library/react';
+import type { ReactNode } from 'react';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { keys, type Machine } from '../../data/index.ts';
 import { OpenExternalProvider } from '../render/links.tsx';
-import { SCROLLBACK } from '../terminal/options.ts';
+import { HIGH_WATER, LOW_WATER } from '../terminal/controller.ts';
+import { MAX_LINK_LENGTH, SCROLLBACK } from '../terminal/options.ts';
 import { useTerminalPrefs } from '../terminal/prefs.ts';
-import { INPUT_LIMIT } from '../terminal/socket.ts';
+import { INPUT_LIMIT, SEND_LIMIT } from '../terminal/socket.ts';
 import { TerminalView } from '../terminal/terminal-view.tsx';
 import { eventually, ID, renderWithHub, startHub, unmountAndSettle, type HubProcess } from './harness.tsx';
 import { FakeEnvironment, fakeSockets } from './terminal-fakes.ts';
@@ -41,7 +44,7 @@ const fakes = vi.hoisted(() => {
     element: HTMLElement | undefined;
     textarea: HTMLTextAreaElement | undefined;
     written: Uint8Array[] = [];
-    readonly osc = new Map<number, () => boolean>();
+    readonly osc = new Map<number, (data: string) => boolean>();
     keyHandler: ((event: KeyboardEvent) => boolean) | undefined;
     readonly data = new Emitter<string>();
     readonly binary = new Emitter<string>();
@@ -49,7 +52,7 @@ const fakes = vi.hoisted(() => {
     readonly addons: Addon[] = [];
     disposed = false;
     readonly parser = {
-      registerOscHandler: (code: number, handler: () => boolean) => {
+      registerOscHandler: (code: number, handler: (data: string) => boolean) => {
         this.osc.set(code, handler);
         return { dispose: () => this.osc.delete(code) };
       },
@@ -80,9 +83,19 @@ const fakes = vi.hoisted(() => {
       this.keyHandler = handler;
     }
 
+    /** With `deferWrites`, xterm parses only when the test says so (`parse(n)`). */
+    static deferWrites = false;
+    readonly parsing: (() => void)[] = [];
+
     write(data: Uint8Array, callback?: () => void) {
       this.written.push(data);
-      callback?.();
+      if (!FakeTerminal.deferWrites) callback?.();
+      else if (callback !== undefined) this.parsing.push(callback);
+    }
+
+    /** Finishes parsing the next `count` writes, in order. */
+    parse(count: number) {
+      for (const done of this.parsing.splice(0, count)) done();
     }
 
     focus() {
@@ -171,6 +184,7 @@ afterAll(async () => {
 
 beforeEach(() => {
   fakes.FakeTerminal.instances = [];
+  fakes.FakeTerminal.deferWrites = false;
   fakes.FakeWebgl.instances = [];
   fakes.FakeWebgl.fail = false;
 });
@@ -187,20 +201,23 @@ const mode = () => screen.getByTestId('terminal-mode').textContent;
 const status = () => screen.getByTestId('terminal-status').textContent;
 
 /** Renders the view with fake sockets, waits for xterm to open and the socket to connect. */
-async function renderTerminal(options: { open?: (url: string) => void } = {}) {
+async function renderTerminal(
+  options: { open?: (url: string) => void; fetch?: typeof fetch; strict?: boolean } = {},
+) {
   const sockets = fakeSockets();
   const environment = new FakeEnvironment();
-  const view = (
+  let view: ReactNode = (
     <TerminalView
       sessionId={ID.ses1}
       socket={sockets.factory}
       socketOptions={{ environment, random: () => 0.5, backoff: { initialMs: 10, maxMs: 20 }, resizeMs: 10 }}
     />
   );
-  const result = renderWithHub(
-    hub,
-    options.open === undefined ? view : <OpenExternalProvider open={options.open}>{view}</OpenExternalProvider>,
-  );
+  if (options.open !== undefined) view = <OpenExternalProvider open={options.open}>{view}</OpenExternalProvider>;
+  const result = renderWithHub(hub, view, {
+    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+    strict: options.strict === true,
+  });
   const term = await eventually(() => {
     const found = fakes.FakeTerminal.instances.at(-1);
     expect(found?.element).toBeDefined();
@@ -232,9 +249,9 @@ describe('TerminalView', () => {
     });
     expect(SCROLLBACK).toBe(5_000);
     expect((term.options.linkHandler as { allowNonHttpProtocols?: boolean }).allowNonHttpProtocols).toBe(false);
-    // Titles and the clipboard: swallowed before xterm sees them.
-    expect([...term.osc.keys()].sort((a, b) => a - b)).toEqual([0, 1, 2, 52]);
-    for (const handler of term.osc.values()) expect(handler()).toBe(true);
+    // Titles and the clipboard: swallowed before xterm sees them (8 is the links' length check).
+    expect([...term.osc.keys()].sort((a, b) => a - b)).toEqual([0, 1, 2, 8, 52]);
+    for (const code of [0, 1, 2, 52]) expect(term.osc.get(code)?.('x;y')).toBe(true);
     // Only the fit and WebGL addons: no clipboard, links or image addon.
     expect(term.addons.map((addon) => addon.constructor.name).sort()).toEqual(['FakeFit', 'FakeWebgl']);
     expect(frame().dataset.renderer).toBe('webgl');
@@ -409,6 +426,124 @@ describe('TerminalView', () => {
     expect(frame().getAttribute('title')).toBe('Ctrl+click to open https://example.test/docs');
     act(() => links.leave?.(click(), 'https://example.test/docs'));
     expect(frame().hasAttribute('title')).toBe(false);
+  });
+
+  it('holds the socket past 4 MiB not yet parsed, and resumes at 512 KiB from the bytes received', async () => {
+    fakes.FakeTerminal.deferWrites = true;
+    const { term, sockets } = await live();
+    const half = new Uint8Array(512 * 1024);
+    // 4 MiB waiting to be parsed is not over the mark…
+    for (let i = 0; i < HIGH_WATER / half.byteLength; i += 1) act(() => sockets.last().output(half));
+    expect(sockets.last().closedWith).toBeUndefined();
+    // …one more chunk is: the socket closes, and the hub keeps the rest.
+    act(() => sockets.last().output(half));
+    const first = sockets.sockets[0];
+    expect(first?.closedWith?.code).toBe(1000);
+    expect(status()).toBe('Catching up with the output…');
+    // Output that was already on its way is not taken.
+    act(() => first?.output('late'));
+    expect(term.written).toHaveLength(9);
+
+    // Parsed down to 1 MiB: still held.
+    act(() => term.parse(7));
+    expect(sockets.sockets).toHaveLength(1);
+    // Down to 512 KiB: it resumes from the bytes received.
+    act(() => term.parse(1));
+    expect(term.parsing).toHaveLength(1);
+    expect(9 * half.byteLength - 8 * half.byteLength).toBe(LOW_WATER);
+    expect(sockets.sockets).toHaveLength(2);
+    expect(sockets.last().from).toBe(9 * half.byteLength);
+    // Catching up is not a dropped connection.
+    expect(status()).toBe('Catching up with the output…');
+    act(() => sockets.last().open());
+    expect(status()).toBe('Live');
+  });
+
+  it('a stopped terminal offers Try again, which reconnects from the bytes received', async () => {
+    const { sockets } = await live();
+    act(() => sockets.last().output('abc'));
+    act(() => sockets.last().drop(1011, 'input write timed out'));
+    expect(status()).toBe('The terminal failed on its machine. (input write timed out)');
+    expect(sockets.sockets).toHaveLength(1);
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    expect(sockets.sockets).toHaveLength(2);
+    expect(sockets.last().from).toBe(3);
+    expect(status()).toBe('Connecting…');
+    expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull();
+    expect(document.activeElement).toBe(frame());
+    act(() => sockets.last().open());
+    expect(status()).toBe('Live');
+  });
+
+  it('tries again by itself when the machine comes back', async () => {
+    let liveness: Machine['liveness'] = 'unverifiable';
+    // The hub's machines, with this laptop's liveness as the test says.
+    const machines: typeof fetch = async (input, init) => {
+      const response = await fetch(input, init);
+      if (new URL(String(input)).pathname !== '/v1/machines') return response;
+      const list = ((await response.json()) as Machine[]).map((m) => (m.id === ID.laptop ? { ...m, liveness } : m));
+      return new Response(JSON.stringify(list), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    };
+    const { sockets, queryClient } = await renderTerminal({ fetch: machines });
+    // The upgrade is refused; the hub says the machine is away.
+    act(() => sockets.last().drop(1006));
+    await eventually(() =>
+      expect(status()).toBe('This laptop cannot be reached right now, so its terminal cannot be shown.'),
+    );
+    await new Promise((done) => setTimeout(done, 100));
+    expect(sockets.sockets).toHaveLength(1);
+
+    liveness = 'live';
+    await act(() => queryClient.invalidateQueries({ queryKey: keys.machines }));
+    await eventually(() => expect(sockets.sockets).toHaveLength(2));
+    expect(status()).toBe('Connecting…');
+  });
+
+  it('when the program ends in control mode, focus goes from xterm to the frame', async () => {
+    const { term, sockets } = await live();
+    fireEvent.click(screen.getByRole('button', { name: 'Take control' }));
+    expect(document.activeElement).toBe(term.textarea);
+    act(() => sockets.last().text({ type: 'exit' }));
+    expect(mode()).toBe('Viewing');
+    expect(document.activeElement).toBe(frame());
+  });
+
+  it('clears a refused notice once keystrokes go through again', async () => {
+    const { term } = await live();
+    fireEvent.click(screen.getByRole('button', { name: 'Take control' }));
+    act(() => term.type('x'.repeat(SEND_LIMIT + 1)));
+    expect(screen.getByRole('alert').textContent).toMatch(/at most 1 MiB goes at once/);
+    act(() => term.type('a'));
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('on truncation, cancels a cut escape sequence without counting it as output', async () => {
+    const { term, sockets } = await live();
+    act(() => sockets.last().output('\x1b]0;half a tit'));
+    act(() => sockets.last().text({ type: 'truncated', from: 1_000 }));
+    expect([...(term.written.at(-1) ?? [])]).toEqual([0x18]);
+    act(() => sockets.last().drop(1006));
+    await eventually(() => expect(sockets.sockets).toHaveLength(2));
+    expect(sockets.last().from).toBe(1_000);
+  });
+
+  it('drops OSC 8 links whose target is longer than 2 KiB', async () => {
+    const { term } = await renderTerminal();
+    const link = term.osc.get(8);
+    expect(link?.('id=a;https://example.test/' + 'x'.repeat(MAX_LINK_LENGTH))).toBe(true);
+    expect(link?.(';' + 'h'.repeat(MAX_LINK_LENGTH + 1))).toBe(true);
+    // Up to 2 KiB, and the closing `8;;`, are xterm's to handle.
+    expect(link?.(';' + 'h'.repeat(MAX_LINK_LENGTH))).toBe(false);
+    expect(link?.(';https://example.test/')).toBe(false);
+    expect(link?.(';')).toBe(false);
+  });
+
+  it('does not hear from a controller Strict Mode replaced: no "Closed." flash', async () => {
+    const { sockets } = await renderTerminal({ strict: true });
+    expect(fakes.FakeTerminal.instances).toHaveLength(2);
+    expect(fakes.FakeTerminal.instances[0]?.disposed).toBe(true);
+    expect(sockets.sockets).toHaveLength(1);
+    expect(status()).toBe('Connecting…');
   });
 
   it('releases everything on unmount: xterm, WebGL, the socket and the observers', async () => {
