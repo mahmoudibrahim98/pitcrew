@@ -268,11 +268,13 @@ async fn supervise(
                             status = daemon.child.wait() => {
                                 let said = daemon.last_words(&status).await;
                                 tracing::warn!(detail = %said, "pitcrewd stopped");
-                                failures = if started.elapsed() >= options.healthy_after {
-                                    1
+                                if started.elapsed() >= options.healthy_after {
+                                    // A long run: this is a new run of failures.
+                                    failures = 1;
+                                    backoff = options.first_backoff;
                                 } else {
-                                    failures + 1
-                                };
+                                    failures += 1;
+                                }
                                 said
                             }
                         }

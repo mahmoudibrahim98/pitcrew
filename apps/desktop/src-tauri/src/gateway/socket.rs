@@ -196,27 +196,27 @@ pub(crate) async fn pump(
             biased;
             command = control.recv(), if closing.is_none() => match command {
                 Some(Control::Close(code, reason)) => {
-                    closing = start_close(&mut ws, code, &reason, grace).await;
+                    closing = Some(start_close(&mut ws, code, &reason, grace).await);
                     outcome.get_or_insert((code, reason));
                 }
                 Some(Control::Abandon) => {
                     report = false;
                     outcome.get_or_insert((codes::GOING_AWAY, String::new()));
-                    closing = start_close(&mut ws, codes::GOING_AWAY, "the page went away", grace).await;
+                    closing = Some(start_close(&mut ws, codes::GOING_AWAY, "the page went away", grace).await);
                 }
                 // The gateway is gone: the app is quitting.
                 None => {
                     outcome.get_or_insert((codes::GOING_AWAY, String::new()));
-                    closing = start_close(&mut ws, codes::GOING_AWAY, "the app is closing", grace).await;
+                    closing = Some(start_close(&mut ws, codes::GOING_AWAY, "the app is closing", grace).await);
                 }
             },
             Some(upto) = acks.recv() => {
                 budget.taken = budget.taken.max(upto);
                 budget.probing = false;
-                if budget.wants_probe() && !probe(&*sink, &ack_tx, &mut budget) {
+                if budget.wants_probe() && !probe(&*sink, &ack_tx, &mut budget) && closing.is_none() {
                     report = false;
                     outcome.get_or_insert((codes::GOING_AWAY, String::new()));
-                    closing = start_close(&mut ws, codes::GOING_AWAY, "the page went away", grace).await;
+                    closing = Some(start_close(&mut ws, codes::GOING_AWAY, "the page went away", grace).await);
                 }
             }
             Some(message) = messages.recv(), if closing.is_none() => {
@@ -294,19 +294,13 @@ async fn deliver(
     if !budget.fits(weight) {
         let reason = "the app is not keeping up; reconnect";
         outcome.get_or_insert((codes::TRY_AGAIN_LATER, reason.into()));
-        *closing = start_close(ws, codes::TRY_AGAIN_LATER, reason, grace).await;
-        if closing.is_none() {
-            *closing = Some(Instant::now());
-        }
+        *closing = Some(start_close(ws, codes::TRY_AGAIN_LATER, reason, grace).await);
         return;
     }
     if sink.deliver(message).is_err() {
         *report = false;
         outcome.get_or_insert((codes::GOING_AWAY, String::new()));
-        *closing = start_close(ws, codes::GOING_AWAY, "the page went away", grace).await;
-        if closing.is_none() {
-            *closing = Some(Instant::now());
-        }
+        *closing = Some(start_close(ws, codes::GOING_AWAY, "the page went away", grace).await);
         return;
     }
     budget.sent += weight as u64;
@@ -326,16 +320,16 @@ fn probe(sink: &dyn Sink, ack_tx: &mpsc::UnboundedSender<u64>, budget: &mut Budg
     .is_ok()
 }
 
-/// Sends a close frame. Returns how long to wait for the daemon's end of the handshake, or
-/// `None` when the frame could not be sent (the connection is already gone).
-async fn start_close(ws: &mut Ws, code: u16, reason: &str, grace: Duration) -> Option<Instant> {
+/// Sends a close frame. Returns until when to wait for the daemon's end of the handshake: `grace`
+/// from now, or now when the frame could not be sent (the connection is already gone).
+async fn start_close(ws: &mut Ws, code: u16, reason: &str, grace: Duration) -> Instant {
     let frame = CloseFrame {
         code: CloseCode::from(code),
         reason: reason.to_owned().into(),
     };
     match ws.send(Message::Close(Some(frame))).await {
-        Ok(()) => Some(Instant::now() + grace),
-        Err(_) => None,
+        Ok(()) => Instant::now() + grace,
+        Err(_) => Instant::now(),
     }
 }
 

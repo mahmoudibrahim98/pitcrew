@@ -145,7 +145,8 @@ pub async fn hosted_workspace(connector: &dyn Connector) -> Result<(String, Stri
 
 /// Keeps the registry's local workspace in step with the supervisor: `connecting` while it looks
 /// for or starts the daemon; once the daemon is ready, its workspace is registered (first start)
-/// or refreshed, and `ready`; `unreachable` with the reason when it gave up. Runs until the
+/// or refreshed, and `ready` (if `GET /v1/workspace` fails, `unreachable`, and asked again after
+/// a wait that doubles up to 10 s); `unreachable` with the reason when it gave up. Runs until the
 /// supervisor stops.
 pub async fn follow(
     mut state: watch::Receiver<DaemonState>,
@@ -154,29 +155,47 @@ pub async fn follow(
 ) {
     loop {
         let current = state.borrow_and_update().clone();
+        // Set when the state changed while this one was handled: handle the new one at once.
+        let mut changed_meanwhile = false;
         match current {
             DaemonState::Connecting => {
                 registry.set_local_state(WorkspaceState::Connecting, None);
             }
             DaemonState::Ready { token, .. } => {
                 connector.set_token_path(Some(token));
-                match hosted_workspace(&*connector).await {
-                    Ok((id, name)) => {
-                        if let Err(e) = registry.set_local(&id, &name) {
-                            tracing::warn!(error = %e, "the local workspace is registered but not saved");
+                let mut wait = Duration::from_millis(500);
+                loop {
+                    match hosted_workspace(&*connector).await {
+                        Ok((id, name)) => {
+                            if let Err(e) = registry.set_local(&id, &name) {
+                                tracing::warn!(error = %e, "the local workspace is registered but not saved");
+                            }
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "the local daemon is up but did not say which workspace it hosts");
+                            registry.set_local_state(WorkspaceState::Unreachable, Some(e.message));
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "the local daemon is up but did not say which workspace it hosts");
-                        registry.set_local_state(WorkspaceState::Unreachable, Some(e.message));
+                    // Ask again, until it answers or the daemon's state changes.
+                    tokio::select! {
+                        changed = state.changed() => {
+                            if changed.is_err() {
+                                return;
+                            }
+                            changed_meanwhile = true;
+                            break;
+                        }
+                        () = tokio::time::sleep(wait) => {}
                     }
+                    wait = (wait * 2).min(Duration::from_secs(10));
                 }
             }
             DaemonState::Unreachable { detail } => {
                 registry.set_local_state(WorkspaceState::Unreachable, Some(detail));
             }
         }
-        if state.changed().await.is_err() {
+        if !changed_meanwhile && state.changed().await.is_err() {
             return;
         }
     }

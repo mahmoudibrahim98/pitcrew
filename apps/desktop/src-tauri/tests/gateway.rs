@@ -303,6 +303,16 @@ fn socket_messages_arrive_in_order_and_close_comes_last() {
         ]
     );
     w.wait_until_closed();
+    // After the close, the gateway lets go of the sink: in the app that drops the Channel, so
+    // Tauri ends it on the webview's side.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Arc::strong_count(&sink) > 1 {
+        assert!(
+            Instant::now() < deadline,
+            "the gateway still holds the sink"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     // The token went as a subprotocol, after pitcrew.v1.
     assert_eq!(
         w.daemon.seen.lock().unwrap().subprotocols,
