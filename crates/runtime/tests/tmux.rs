@@ -37,12 +37,15 @@ impl PrivateServer {
             "socket path too long: {}",
             socket.display()
         );
-        let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
             builder.mode(0o700);
-        }
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
         // Not create_all: the directory must be new, and so ours, even in a shared /tmp.
         builder
             .create(&directory)
