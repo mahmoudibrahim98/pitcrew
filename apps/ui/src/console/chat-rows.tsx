@@ -1,18 +1,17 @@
 // One chat row per kind: prompts, assistant markdown, tool calls with their results, file edits
 // with their diffs, plans, questions and turn ends. Everything from the transcript is text.
 
-import type { Ask, Session } from '../data/index.ts';
+import type { Ask, PlanItem, Session, TranscriptItemOf } from '../data/index.ts';
 import { cx } from '../lib/cx.ts';
 import { clockTime, fullTime } from './format.ts';
 import { QuestionCard } from './question-card.tsx';
 import { DiffView } from './render/diff-view.tsx';
 import { Markdown } from './render/markdown.tsx';
 import type { ChatRow } from './transcript.ts';
-import type { ItemOf, PlanItem } from './types.ts';
 
 export interface RowContext {
   session: Session | undefined;
-  askFor: (question: ItemOf<'question'>) => Ask | undefined;
+  askFor: (question: TranscriptItemOf<'question'>) => Ask | undefined;
   /**
    * The asks have loaded. Until then a question is not answerable here: it may have been raised
    * as an ask, and answering it with keys instead would bypass the ask.

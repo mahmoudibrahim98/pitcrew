@@ -7,8 +7,13 @@
 // do not meet it reports a gap, which the next fetch (`before` = the start of the range above it)
 // fills.
 
-import type { Ask } from '../data/index.ts';
-import { TRANSCRIPT_KINDS, type ItemOf, type TranscriptItem, type TranscriptPage } from './types.ts';
+import {
+  TRANSCRIPT_KINDS,
+  type Ask,
+  type TranscriptItem,
+  type TranscriptItemOf,
+  type TranscriptPage,
+} from '../data/index.ts';
 
 const KNOWN = new Set<string>(TRANSCRIPT_KINDS);
 
@@ -170,27 +175,27 @@ export interface PendingPrompt {
 export type ChatRow =
   | { type: 'start'; key: string }
   | { type: 'gap'; key: string; before: number }
-  | { type: 'prompt'; key: string; item: ItemOf<'user_prompt'> }
+  | { type: 'prompt'; key: string; item: TranscriptItemOf<'user_prompt'> }
   | { type: 'pending'; key: string; prompt: PendingPrompt }
-  | { type: 'text'; key: string; item: ItemOf<'assistant_text'> }
+  | { type: 'text'; key: string; item: TranscriptItemOf<'assistant_text'> }
   | {
       type: 'tool';
       key: string;
-      use: ItemOf<'tool_use'> | undefined;
-      result: ItemOf<'tool_result'> | undefined;
+      use: TranscriptItemOf<'tool_use'> | undefined;
+      result: TranscriptItemOf<'tool_result'> | undefined;
     }
-  | { type: 'edit'; key: string; item: ItemOf<'file_edit'> }
-  | { type: 'plan'; key: string; item: ItemOf<'plan_updated'> }
+  | { type: 'edit'; key: string; item: TranscriptItemOf<'file_edit'> }
+  | { type: 'plan'; key: string; item: TranscriptItemOf<'plan_updated'> }
   | {
       type: 'question';
       key: string;
-      item: ItemOf<'question'>;
+      item: TranscriptItemOf<'question'>;
       /** The answer the transcript records, if any. */
       answer: string | undefined;
       /** The last thing in the transcript and not answered yet. */
       open: boolean;
     }
-  | { type: 'turn'; key: string; item: ItemOf<'turn_ended'> };
+  | { type: 'turn'; key: string; item: TranscriptItemOf<'turn_ended'> };
 
 export type ChatRowType = ChatRow['type'];
 
@@ -203,7 +208,7 @@ export function buildRows(
   pending: readonly PendingPrompt[] = [],
 ): ChatRow[] {
   const { items } = view;
-  const results = new Map<string, ItemOf<'tool_result'>>();
+  const results = new Map<string, TranscriptItemOf<'tool_result'>>();
   const uses = new Set<string>();
   const questionOffsets = new Set<number>();
   for (const item of items) {
@@ -277,7 +282,7 @@ export function buildRows(
 export function askForQuestion(
   asks: readonly Ask[] | undefined,
   sessionId: string,
-  question: ItemOf<'question'>,
+  question: TranscriptItemOf<'question'>,
 ): Ask | undefined {
   return asks?.find(
     (ask) =>
@@ -289,7 +294,7 @@ export function askForQuestion(
 }
 
 /** The newest plan in the loaded items. */
-export function latestPlan(items: readonly TranscriptItem[]): ItemOf<'plan_updated'> | undefined {
+export function latestPlan(items: readonly TranscriptItem[]): TranscriptItemOf<'plan_updated'> | undefined {
   for (let i = items.length - 1; i >= 0; i--) {
     const item = items[i];
     if (item?.kind === 'plan_updated') return item;

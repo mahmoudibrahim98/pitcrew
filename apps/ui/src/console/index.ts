@@ -30,4 +30,3 @@ export type { QuestionCardProps } from './question-card.tsx';
 export type { SessionFiltersProps } from './session-filters.tsx';
 export type { SessionHeaderProps } from './session-header.tsx';
 export type { SessionListProps, SessionListViewProps } from './session-list.tsx';
-export type { TranscriptItem, TranscriptPage } from './types.ts';

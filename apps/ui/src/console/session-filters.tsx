@@ -2,9 +2,9 @@
 // the caller keeps the value and passes it to `SessionList`.
 
 import { useId, type ReactNode } from 'react';
-import type { Engine, SessionState } from '../data/index.ts';
+import { useMachines, type Engine, type SessionState } from '../data/index.ts';
 import { cx } from '../lib/cx.ts';
-import { useConsoleSessions, useMachines } from './data.ts';
+import { useConsoleSessions } from './data.ts';
 import { hasFacets, NO_FACETS, placeOf, UNSORTED, type SessionFacets } from './facets.ts';
 import { ENGINE_LABEL, ENGINES, LIVENESS, SESSION_STATES, STATE } from './format.ts';
 

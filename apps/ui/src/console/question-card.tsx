@@ -5,11 +5,18 @@
 //   is sent as a prompt.
 
 import { useId, useState, type FormEvent } from 'react';
-import { ApiError, useMembers, type Ask, type AskKind, type Session } from '../data/index.ts';
+import {
+  ApiError,
+  useMembers,
+  type Ask,
+  type AskKind,
+  type Key,
+  type Session,
+  type TranscriptItemOf,
+} from '../data/index.ts';
 import { Button } from '../design/index.ts';
 import { cx } from '../lib/cx.ts';
 import { useAnswerAsk, useSendKeys, useSendText } from './data.ts';
-import type { ItemOf, Key } from './types.ts';
 
 const KIND_LABEL: Record<AskKind, string> = {
   question: 'Question',
@@ -30,7 +37,7 @@ export type QuestionCardProps =
     }
   | {
       session: Session;
-      question: ItemOf<'question'>;
+      question: TranscriptItemOf<'question'>;
       /** The ask the question was raised as, if any: answers then go to it. */
       ask?: Ask | undefined;
       /** The answer the transcript already records. */

@@ -3,10 +3,10 @@
 // has ended or cannot be reached.
 
 import { useId, useState, type KeyboardEvent } from 'react';
-import { ApiError, useSession } from '../data/index.ts';
+import { ApiError, useMachines, useSession } from '../data/index.ts';
 import { Button } from '../design/index.ts';
 import { cx } from '../lib/cx.ts';
-import { useInterrupt, useMachines, useSendKeys, useSendText } from './data.ts';
+import { useInterrupt, useSendKeys, useSendText } from './data.ts';
 import { inputBlocked } from './format.ts';
 
 export interface ComposerProps {

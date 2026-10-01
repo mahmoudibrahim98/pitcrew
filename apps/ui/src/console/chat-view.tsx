@@ -4,12 +4,11 @@
 
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ApiError, useAsks, useSession } from '../data/index.ts';
+import { ApiError, useAsks, useSession, type TranscriptItemOf } from '../data/index.ts';
 import { cx } from '../lib/cx.ts';
 import { ChatRowView, PlanChecklist, type RowContext } from './chat-rows.tsx';
 import { usePending, useTranscript } from './data.ts';
 import { askForQuestion, buildRows, latestPlan, type ChatRowType } from './transcript.ts';
-import type { ItemOf } from './types.ts';
 
 /** First guesses at row heights; rows are measured once drawn. */
 const ESTIMATE: Record<ChatRowType, number> = {
@@ -61,7 +60,7 @@ function ChatViewBody({ sessionId, pageSize, className }: ChatViewProps) {
     });
   }, []);
   const askFor = useCallback(
-    (question: ItemOf<'question'>) => askForQuestion(asks.data, sessionId, question),
+    (question: TranscriptItemOf<'question'>) => askForQuestion(asks.data, sessionId, question),
     [asks.data, sessionId],
   );
   const ctx: RowContext = {
@@ -191,7 +190,7 @@ function ChatViewBody({ sessionId, pageSize, className }: ChatViewProps) {
   );
 }
 
-function PlanBar({ plan }: { plan: ItemOf<'plan_updated'> }) {
+function PlanBar({ plan }: { plan: TranscriptItemOf<'plan_updated'> }) {
   const [open, setOpen] = useState(false);
   const done = plan.items.filter((i) => i.status === 'completed').length;
   const current = plan.items.find((i) => i.status === 'in_progress');

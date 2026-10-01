@@ -2,8 +2,8 @@
 // Lists and details reuse the shared keys, so the stream's patches and invalidations reach them.
 // Mutations never touch the cache: the events they cause do.
 
-import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useMutation } from '@tanstack/react-query';
+import { useEffect, useLayoutEffect, useState } from 'react';
 import { create, useStore } from 'zustand';
 import { createStore } from 'zustand/vanilla';
 import {
@@ -11,27 +11,18 @@ import {
   useApi,
   useLiveQuery,
   useProjects,
-  useSession,
   useSessions,
   useTasks,
   useWorkstreams,
+  type EndMode,
+  type Key,
+  type TranscriptPage,
 } from '../data/index.ts';
-import { consoleApiFor, type ConsoleApi } from './api.ts';
 import { matchesFacets, NO_FACETS, type SessionFacets, type SessionPlaces } from './facets.ts';
 import { useNow } from './format.ts';
 import { deliveredPrompts, EMPTY_VIEW, TranscriptWindow, type PendingPrompt, type WindowView } from './transcript.ts';
-import type { EndMode, Key, TranscriptPage } from './types.ts';
-
-export function useConsoleApi(): ConsoleApi {
-  return consoleApiFor(useApi());
-}
 
 // ─── Reads ──────────────────────────────────────────────────────────────────────────────────────
-
-export function useMachines() {
-  const api = useApi();
-  return useLiveQuery({ queryKey: keys.machines, queryFn: ({ signal }) => api.machines(signal) });
-}
 
 /** One task by id; idle while there is none. */
 export function useTaskById(id: string | undefined) {
@@ -134,8 +125,7 @@ function pageKey(sessionId: string, before: number, limit: number | undefined) {
  * Key the caller by session id: the window belongs to one session.
  */
 export function useTranscript(sessionId: string, options: TranscriptOptions = {}) {
-  const api = useConsoleApi();
-  const queryClient = useQueryClient();
+  const api = useApi();
   const limit = options.pageSize;
   const [slot] = useState(createWindowStore);
   const tail = useLiveQuery({
@@ -164,19 +154,6 @@ export function useTranscript(sessionId: string, options: TranscriptOptions = {}
   useEffect(() => {
     if (view.hasGap && !olderBusy) slot.want(view.nextBefore);
   }, [view, olderBusy, slot]);
-
-  // The stream refetches the tail when a turn ends or a tool runs. A state change (a prompt was
-  // sent, the agent started working) means the transcript moved too, so the tail follows it.
-  const session = useSession(sessionId);
-  const activity = session.data === undefined ? undefined : `${session.data.state}:${session.data.last_activity}`;
-  const seen = useRef(activity);
-  useEffect(() => {
-    const previous = seen.current;
-    seen.current = activity;
-    if (previous !== undefined && activity !== undefined && previous !== activity) {
-      void queryClient.invalidateQueries({ queryKey: tailKey(sessionId, limit), exact: true }, { cancelRefetch: false });
-    }
-  }, [activity, queryClient, sessionId, limit]);
 
   const loadingOlder = wanted !== undefined && older.isFetching;
   return {
@@ -247,7 +224,7 @@ export function usePending(sessionId: string, view: WindowView): PendingPrompt[]
 
 /** Types text into the session and presses Enter. The chat shows it until the transcript does. */
 export function useSendText(sessionId: string) {
-  const api = useConsoleApi();
+  const api = useApi();
   const add = usePendingPrompts((s) => s.add);
   const remove = usePendingPrompts((s) => s.remove);
   return useMutation({
@@ -260,23 +237,23 @@ export function useSendText(sessionId: string) {
 }
 
 export function useSendKeys(sessionId: string) {
-  const api = useConsoleApi();
+  const api = useApi();
   return useMutation({ mutationFn: (keys: readonly Key[]) => api.keys(sessionId, keys) });
 }
 
 export function useInterrupt(sessionId: string) {
-  const api = useConsoleApi();
+  const api = useApi();
   return useMutation({ mutationFn: () => api.interrupt(sessionId) });
 }
 
 export function useEndSession(sessionId: string) {
-  const api = useConsoleApi();
+  const api = useApi();
   return useMutation({ mutationFn: (mode: EndMode) => api.end(sessionId, mode) });
 }
 
 /** Answers an ask with an option, a text, or both. `ask_answered` then refreshes the asks. */
 export function useAnswerAsk() {
-  const api = useConsoleApi();
+  const api = useApi();
   return useMutation({
     mutationFn: ({ ask, option, text }: { ask: string; option?: number | undefined; text?: string | undefined }) =>
       api.answerAsk(ask, {

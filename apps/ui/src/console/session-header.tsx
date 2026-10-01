@@ -3,10 +3,10 @@
 
 import { DropdownMenu } from 'radix-ui';
 import { useState } from 'react';
-import { ApiError, useMembers, useSession, type Task, type Workstream } from '../data/index.ts';
+import { ApiError, useMachines, useMembers, useSession, type Task, type Workstream } from '../data/index.ts';
 import { Button, StatusPill } from '../design/index.ts';
 import { cx } from '../lib/cx.ts';
-import { useEndSession, useMachines, useTaskById, useWorkstreamById } from './data.ts';
+import { useEndSession, useTaskById, useWorkstreamById } from './data.ts';
 import { ENGINE_LABEL, inputBlocked, LIVENESS, sessionTitle, STATE } from './format.ts';
 
 export interface SessionHeaderProps {
