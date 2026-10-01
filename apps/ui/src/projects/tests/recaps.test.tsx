@@ -299,6 +299,46 @@ describe('recaps', () => {
     await eventually(() => expect(screen.queryByRole('button', { name: /^Load older/ })).toBeNull());
   });
 
+  it('says so when nothing has happened yet, and shows an error it cannot load past', async () => {
+    const ablation = '01JB000000000000000WST0004';
+    const quiet = '01JB000000000000000SES0005';
+    const { unmount } = renderWithHub(
+      <>
+        <RecapSummary scope={{ workstream: ablation }} />
+        <WorkBlocks filters={{ session: quiet }} />
+      </>,
+      hub,
+    );
+    await screen.findByText('Nothing has happened here yet.');
+    await screen.findByText('No work recorded yet.');
+    unmount();
+
+    // A refusal, which the data layer does not retry.
+    const refused: typeof fetch = async (input, init) => {
+      const href = typeof input === 'string' ? input : input instanceof Request ? input.url : input.toString();
+      if (new URL(href).pathname.startsWith('/v1/recaps/')) {
+        return new Response(JSON.stringify({ code: 'forbidden', message: 'not for this token' }), {
+          status: 403,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      return fetch(input, init);
+    };
+    renderWithHub(
+      <>
+        <RecapSummary scope={{ workstream: demo.submission }} />
+        <WorkBlocks filters={{ task: demo.pap1 }} />
+      </>,
+      hub,
+      { fetch: refused },
+    );
+    await eventually(() => expect(screen.getAllByRole('alert').map((a) => a.textContent)).toHaveLength(2));
+    expect(screen.getAllByRole('alert').map((a) => a.textContent?.split(':')[0])).toEqual([
+      'Couldn’t load the summary',
+      'Couldn’t load the bursts of work',
+    ]);
+  });
+
   it("shows a task's blocks of work in its Work section", async () => {
     renderWithHub(<TaskDetail taskId={demo.pap1} />, hub);
     const work = await screen.findByRole('region', { name: 'Work' });
