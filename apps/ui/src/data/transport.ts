@@ -15,6 +15,8 @@ export interface TransportResponse {
   contentType?: string | undefined;
   /** The body as text (API v1 bodies are JSON). */
   body: string;
+  /** HTTP's reason phrase, when the transport has one (the browser's does; the gateway's not). */
+  statusText?: string | undefined;
 }
 
 /** How a socket ended. `error` says why it never opened, when the transport knows. */
@@ -116,7 +118,12 @@ export function browserTransport(options: BrowserOptions): BrowserTransport {
     if (body !== undefined) headers['Content-Type'] = 'application/json';
     try {
       const res = await doFetch(`${baseUrl}${path}`, { method, headers, body: body ?? null, signal: signal ?? null });
-      return { status: res.status, contentType: res.headers.get('content-type') ?? undefined, body: await res.text() };
+      return {
+        status: res.status,
+        statusText: res.statusText === '' ? undefined : res.statusText,
+        contentType: res.headers.get('content-type') ?? undefined,
+        body: await res.text(),
+      };
     } catch (cause) {
       if (cause instanceof DOMException && cause.name === 'AbortError') throw cause;
       throw new ApiError('unavailable', `Cannot reach ${baseUrl}`, 0);

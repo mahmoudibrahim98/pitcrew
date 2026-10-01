@@ -15,9 +15,7 @@ export {
 export { AppData } from './root.tsx';
 export { streamPath, terminalPath, type StreamStatus } from './stream.ts';
 export {
-  browserTransport,
   isDesktop,
-  type BrowserOptions,
   type Method,
   type SocketClose,
   type Transport,
@@ -32,5 +30,6 @@ export {
   type GatewayWorkspace,
   type ScopeFallback,
   type WorkspaceList,
+  type WorkspacesView,
   type WorkspaceState,
 } from './workspaces.tsx';

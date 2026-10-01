@@ -84,14 +84,16 @@ export function errorFromResponse(res: TransportResponse): ApiError {
     return new ApiError(body.code, body.message, res.status);
   }
   const code = CODE_BY_STATUS[res.status] ?? 'internal';
-  return new ApiError(code, `HTTP ${res.status}`, res.status);
+  return new ApiError(code, `HTTP ${res.status} ${res.statusText ?? ''}`.trim(), res.status);
 }
 
 /**
  * A transport (`browserTransport()`, or the desktop gateway's), or the browser's options, which
- * make a browser transport.
+ * make a browser transport. Never both: a token next to a transport would be ignored.
  */
-export type ApiOptions = { transport: Transport } | BrowserOptions;
+export type ApiOptions =
+  | { transport: Transport; baseUrl?: never; token?: never; fetch?: never; socket?: never }
+  | (BrowserOptions & { transport?: never });
 
 type Query = Record<string, string | readonly string[] | undefined>;
 
@@ -111,7 +113,7 @@ function queryString(query: Query | undefined): string {
 }
 
 export function createApi(options: ApiOptions) {
-  const transport = 'transport' in options ? options.transport : browserTransport(options);
+  const transport = options.transport !== undefined ? options.transport : browserTransport(options);
 
   /**
    * Rejects with an `ApiError` for every failure: the daemon's own (its status), or none at all

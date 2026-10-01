@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ApiError, createApi } from '../src/data/api.ts';
+import { browserTransport } from '../src/data/transport.ts';
 import type { Subtask } from '../src/data/types.ts';
 import { AGENT_TOKEN, DEVICE_TOKEN, startServer, type RunningServer } from './helpers.ts';
 
@@ -215,9 +216,20 @@ describe('api client error mapping', () => {
     expect(error).toMatchObject({ code: 'unavailable', status: 503, message: 'The GPU box is unreachable.' });
   });
 
+  it('takes a transport or the browser options, never both', () => {
+    const transport = browserTransport({ baseUrl: 'http://hub.localhost' });
+    // @ts-expect-error A token next to a transport would be ignored: it does not compile.
+    const api = createApi({ transport, token: 'a-token' });
+    expect(api.transport).toBe(transport);
+  });
+
   it('falls back to the status for a body that is not an ApiError', async () => {
     const html = new Response('<h1>Bad gateway</h1>', { status: 502, statusText: 'Bad Gateway' });
-    expect(await failure(respond(html).projects())).toMatchObject({ code: 'internal', status: 502 });
+    expect(await failure(respond(html).projects())).toMatchObject({
+      code: 'internal',
+      status: 502,
+      message: 'HTTP 502 Bad Gateway',
+    });
     const odd = new Response(JSON.stringify({ code: 'teapot', message: 'no' }), { status: 404 });
     expect(await failure(respond(odd).projects())).toMatchObject({ code: 'not_found', status: 404 });
   });
