@@ -241,7 +241,8 @@ else, because its log is different: the seed's own events (`task_created`, `sess
 they are grouped by kind, each at its own time, before a slice that is partly older, so
 out-of-order times split and join blocks (the engine closes a block on seeing an event more than
 20 minutes later); and their ids are new ULIDs, so the blocks they begin sort first, in no stable
-order among themselves. Of the fixture's 10 blocks, 3 come back unchanged; the seeded hub has 24.
+order among themselves. With today's engine and demo, 3 of the fixture's 10 blocks come back
+unchanged, and the seeded hub has 24.
 
 ## Dispatch
 
