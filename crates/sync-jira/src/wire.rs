@@ -90,22 +90,33 @@ pub(crate) struct WireFields {
     pub(crate) extra: Map<String, Value>,
 }
 
-/// Whether `s` has the shape of a Jira issue key (`PROJECT-123`): a project-key part (an
-/// uppercase ASCII letter, then 1–9 more uppercase letters or digits) followed by `-` and one or
-/// more digits. Unlike `fields.parent` (a structured, typed reference Jira itself builds), a
-/// classic Data Center epic-link custom field is free-form configuration this crate does not
-/// otherwise validate — this is the sanity check before that value is trusted as a key and
-/// spliced into a browse URL (see [`WireFields::epic_key`]).
-fn looks_like_issue_key(s: &str) -> bool {
+/// Whether `s` has the shape of a Jira issue key: `^[A-Z][A-Z0-9_]*-[1-9][0-9]*$` (round 3 review
+/// item S-4's exact rule) — a project-key part starting with an uppercase ASCII letter, followed
+/// by uppercase letters, digits or underscores, then `-`, then a number with no leading zero.
+///
+/// This is not just a sanity check on *free-form* configuration (the classic Data Center
+/// epic-link custom field — see [`WireFields::epic_key`]) any more: [`crate::change::item_ref`]
+/// validates every key this crate ever splices into a browse URL or an `ExternalRef.key` with it,
+/// including an issue's or epic's own `key`, which is server-supplied and must be treated as
+/// untrusted. A key is *validated*, not sanitised: `crate::change` treats a non-matching key as a
+/// malformed item (skipped, and counted), never silently strips characters out of it and carries
+/// on — stripping a zero-width character out of `DEMO-1\u{200B}2` would silently turn it into the
+/// unrelated, real issue `DEMO-12`, and a key is also never free-form enough to need escaping (an
+/// un-stripped `DEMO-1/../../secure/Logout.jspa` spliced into a URL would hand an attacker a
+/// chosen path).
+pub(crate) fn looks_like_issue_key(s: &str) -> bool {
     let Some((project, number)) = s.split_once('-') else {
         return false;
     };
     let mut chars = project.chars();
     let first_ok = chars.next().is_some_and(|c| c.is_ascii_uppercase());
-    let rest_ok = chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit());
-    let len_ok = (2..=10).contains(&project.len());
-    let number_ok = !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit());
-    first_ok && rest_ok && len_ok && number_ok
+    let rest_ok = chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+    let mut number_chars = number.chars();
+    let first_digit_ok = number_chars
+        .next()
+        .is_some_and(|c| c.is_ascii_digit() && c != '0');
+    let rest_digits_ok = number_chars.all(|c| c.is_ascii_digit());
+    first_ok && rest_ok && first_digit_ok && rest_digits_ok
 }
 
 impl WireFields {
@@ -170,6 +181,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn looks_like_issue_key_accepts_underscores_in_the_project_part() {
+        // Round 3 review item S-4's exact rule, `^[A-Z][A-Z0-9_]*-[1-9][0-9]*$`, allows an
+        // underscore in the project part (some Jira configurations use one).
+        assert!(looks_like_issue_key("MY_PROJECT-1"));
+        assert!(looks_like_issue_key("A-1"));
+        assert!(looks_like_issue_key("DEMO-123"));
+    }
+
+    #[test]
+    fn looks_like_issue_key_rejects_a_leading_zero_in_the_number() {
+        assert!(!looks_like_issue_key("DEMO-0"));
+        assert!(!looks_like_issue_key("DEMO-01"));
+    }
+
+    #[test]
+    fn looks_like_issue_key_rejects_round_3s_named_attacks() {
+        // S-4: a hidden character smuggled into what looks like "DEMO-12" must not validate.
+        assert!(!looks_like_issue_key("DEMO-1\u{200B}2"));
+        // S-4: a path-traversal payload riding in the numeric part must not validate.
+        assert!(!looks_like_issue_key("DEMO-1/../../secure/Logout.jspa"));
+    }
+
+    #[test]
     fn epic_key_prefers_parent_over_the_custom_field() {
         let fields: WireFields = serde_json::from_value(serde_json::json!({
             "summary": "s",
@@ -205,7 +239,19 @@ mod tests {
 
     #[test]
     fn epic_key_rejects_a_custom_field_value_that_does_not_look_like_an_issue_key() {
-        for bad in ["", "not an issue key", "DEMO", "-9", "demo-9", "../../evil"] {
+        for bad in [
+            "",
+            "not an issue key",
+            "DEMO",
+            "-9",
+            "demo-9",
+            "../../evil",
+            // Round 3 review item S-4's two named attacks.
+            "DEMO-1\u{200B}2",
+            "DEMO-1/../../secure/Logout.jspa",
+            // A leading zero is not a real Jira issue number.
+            "DEMO-01",
+        ] {
             let fields: WireFields = serde_json::from_value(serde_json::json!({
                 "summary": "s",
                 "status": {"name": "To Do", "statusCategory": {"key": "new"}},

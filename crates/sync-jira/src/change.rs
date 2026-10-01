@@ -6,25 +6,34 @@ use crate::adf::adf_to_text;
 use crate::bounds::{MAX_BODY_CHARS, MAX_TITLE_CHARS, cap_chars, cap_labels, strip_hidden};
 use crate::state::{EpicSnapshot, IssueSnapshot, StatusCategory};
 use crate::time::JiraTimestamp;
-use crate::wire::WireIssue;
+use crate::wire::{WireIssue, looks_like_issue_key};
 use pitcrew_protocol::model::{ExternalRef, ExternalSystem};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Builds a reference to one Jira item (issue or epic — both are issues at the wire level) by
 /// key, with its browsable URL. Jira's REST responses carry no browsable URL field of their own
-/// (unlike GitHub's `html_url`), so this builds one from `site_base`. `key` is server-supplied
-/// (round 2 review item R10): `site_base` itself is this crate's own trusted configuration, never
-/// server data, but `key` is hidden-character-stripped before it is spliced into either the
-/// browsable URL or `ExternalRef.key` itself, so a crafted key cannot make the reference *read* as
-/// a different issue than the one it actually is.
-fn item_ref(site_base: &str, key: &str) -> ExternalRef {
-    let key = strip_hidden(key);
-    ExternalRef {
+/// (unlike GitHub's `html_url`), so this builds one from `site_base`. `key` is server-supplied —
+/// `site_base` itself is this crate's own trusted configuration, never server data.
+///
+/// `key` is *validated* against [`looks_like_issue_key`], not sanitised (round 3 review item S-4,
+/// correcting round 2's R10 fix, which stripped hidden characters out of the key instead): a
+/// zero-width character stripped out of `DEMO-1\u{200B}2` would silently turn it into the
+/// unrelated, real issue `DEMO-12`, and a key is never free-form enough to need escaping rather
+/// than rejecting outright — an un-stripped `DEMO-1/../../secure/Logout.jspa` spliced into
+/// `{site_base}/browse/{key}` would hand an attacker a chosen path under the site's own origin.
+/// Returns `None` for a key that does not validate; the caller treats that as this reference being
+/// unsafe to build — see each call site for whether that fails the whole item or just drops this
+/// one reference.
+fn item_ref(site_base: &str, key: &str) -> Option<ExternalRef> {
+    if !looks_like_issue_key(key) {
+        return None;
+    }
+    Some(ExternalRef {
         system: ExternalSystem::Jira,
         url: Some(format!("{site_base}/browse/{key}")),
-        key,
-    }
+        key: key.to_string(),
+    })
 }
 
 /// What changed upstream, discovered by one sync call. Each change carries the [`ExternalRef`] it
@@ -170,8 +179,12 @@ fn snapshot_of(issue: &WireIssue, epic_link_field: Option<&str>) -> IssueSnapsho
 
 /// Diffs a freshly read issue against its last snapshot (`None` on a first sight), returning the
 /// changes found and the new snapshot to store — or `None` if `issue.fields.updated` is not
-/// well-formed, in which case the whole item is treated as malformed (skipped, and counted by the
-/// caller) rather than snapshotted or diffed with a timestamp that can't be trusted as a cursor.
+/// well-formed, or `issue.key` does not validate as a real Jira issue key (round 3 review item
+/// S-4), in which case the whole item is treated as malformed (skipped, and counted by the
+/// caller) rather than snapshotted or diffed with a source reference that can't be trusted. A
+/// referenced epic/parent key that fails to validate only drops that one reference (`epic: None`)
+/// rather than failing the whole issue — the issue's own identity is still sound even if a field
+/// pointing elsewhere is not.
 pub(crate) fn diff_issue(
     site_base: &str,
     issue: &WireIssue,
@@ -182,9 +195,12 @@ pub(crate) fn diff_issue(
         return None;
     }
     let next = snapshot_of(issue, epic_link_field);
-    let source = item_ref(site_base, &issue.key);
+    let source = item_ref(site_base, &issue.key)?;
     let at = next.updated.clone();
-    let epic = next.epic_key.as_deref().map(|k| item_ref(site_base, k));
+    let epic = next
+        .epic_key
+        .as_deref()
+        .and_then(|k| item_ref(site_base, k));
     let mut changes = Vec::new();
 
     match previous {
@@ -275,7 +291,7 @@ pub(crate) fn diff_epic(
         return None;
     }
     let next = epic_snapshot_of(issue);
-    let source = item_ref(site_base, &issue.key);
+    let source = item_ref(site_base, &issue.key)?;
     let at = JiraTimestamp::new(&issue.fields.updated);
     let mut changes = Vec::new();
 
@@ -350,19 +366,63 @@ mod tests {
     }
 
     #[test]
-    fn a_hidden_character_in_the_issue_key_is_stripped_from_both_the_ref_and_its_url() {
-        // Round 2 review item R10: the key is server-supplied, and gets spliced into both
-        // `ExternalRef.key` and the browsable URL `item_ref` builds from `site_base`.
-        let mut spoofed = issue("2026-01-01T00:00:00.000+0000", "new");
-        spoofed.key = "DEMO\u{202E}-1".to_string();
+    fn an_invalid_issue_key_is_malformed_not_silently_fixed_up() {
+        // Round 3 review item S-4, correcting round 2's R10 fix: a key is *validated*, never
+        // stripped and carried on with — stripping a hidden character out of a key could silently
+        // turn it into a different, real issue's key, and a path-traversal payload in the numeric
+        // part must never reach the browse URL `item_ref` builds.
+        for bad_key in [
+            "DEMO\u{202E}-1",
+            "DEMO-1\u{200B}2",
+            "DEMO-1/../../secure/Logout.jspa",
+        ] {
+            let mut spoofed = issue("2026-01-01T00:00:00.000+0000", "new");
+            spoofed.key = bad_key.to_string();
+            assert!(
+                diff_issue("https://jira.example.com", &spoofed, None, None).is_none(),
+                "{bad_key:?} must not diff as a well-formed item"
+            );
+        }
+    }
+
+    #[test]
+    fn a_well_formed_issue_key_builds_the_expected_ref_and_browse_url() {
+        let ok = issue("2026-01-01T00:00:00.000+0000", "new");
         let (changes, _snapshot) =
-            diff_issue("https://jira.example.com", &spoofed, None, None).expect("well-formed");
+            diff_issue("https://jira.example.com", &ok, None, None).expect("well-formed");
         let source = changes[0].source();
         assert_eq!(source.key, "DEMO-1");
         assert_eq!(
             source.url.as_deref(),
             Some("https://jira.example.com/browse/DEMO-1")
         );
+    }
+
+    #[test]
+    fn an_invalid_epic_reference_key_drops_only_that_reference() {
+        // A sub-task's/issue's own key is sound, but its `fields.parent.key` (the epic reference)
+        // does not validate: the issue itself is still processed, just with no epic reference.
+        let mut issue_with_bad_parent = issue("2026-01-01T00:00:00.000+0000", "new");
+        issue_with_bad_parent.fields.parent = Some(crate::wire::WireParentRef {
+            key: "../../evil".to_string(),
+        });
+        let (changes, snapshot) = diff_issue(
+            "https://jira.example.com",
+            &issue_with_bad_parent,
+            None,
+            None,
+        )
+        .expect("the issue's own key is still well-formed");
+        assert_eq!(snapshot.epic_key.as_deref(), Some("../../evil"));
+        match &changes[0] {
+            UpstreamChange::IssueCreated { epic, .. } => {
+                assert!(
+                    epic.is_none(),
+                    "an invalid epic reference must not be built"
+                );
+            }
+            other => panic!("expected IssueCreated: {other:?}"),
+        }
     }
 
     #[test]
