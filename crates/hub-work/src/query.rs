@@ -12,7 +12,7 @@ use pitcrew_protocol::ids::{
 };
 use pitcrew_protocol::model::{
     Ask, AskState, Brief, BriefProposal, BriefTarget, Date, Dispatch, Location, Machine, Member,
-    Persona, Project, Session, SessionState, Task, TaskStatus, Team, Workstream,
+    MemberKind, Persona, Project, Session, SessionState, Task, TaskStatus, Team, Workstream,
 };
 use pitcrew_store::sql::types::{Type, Value};
 use pitcrew_store::sql::{self, Connection, OptionalExtension, Row, params, params_from_iter};
@@ -221,6 +221,26 @@ pub fn member(conn: &Connection, id: &MemberId) -> Result<Option<Member>> {
         ))?
         .query_row(params![id.text()], member_row)
         .optional()?)
+}
+
+/// The member holding `handle`, if any. Handles have no uniqueness constraint in the tables (only
+/// `id` is a key); it is `set_up`'s own check, under the one writer's lock, that keeps a second
+/// member from taking a handle already in use (api-v1.md, "The first run").
+pub fn member_with_handle(conn: &Connection, handle: &str) -> Result<Option<Member>> {
+    Ok(conn
+        .prepare_cached(&format!(
+            "SELECT {MEMBER_COLS} FROM work_members WHERE handle = ?1"
+        ))?
+        .query_row(params![handle], member_row)
+        .optional()?)
+}
+
+/// Whether the workspace has a person (a member of kind `human`) yet. `false` for a fresh hub,
+/// before `POST /v1/setup` (api-v1.md, "The first run").
+pub fn has_person(conn: &Connection) -> Result<bool> {
+    Ok(conn
+        .prepare_cached("SELECT EXISTS (SELECT 1 FROM work_members WHERE kind = ?1)")?
+        .query_row(params![enum_text(&MemberKind::Human)?], |r| r.get(0))?)
 }
 
 const PERSONA_COLS: &str = "id, name, engine, model, instructions, permission_mode";

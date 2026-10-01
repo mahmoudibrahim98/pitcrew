@@ -24,7 +24,8 @@ let mut last = store.latest_rev()?;
 let work = Arc::new(
     WorkService::new(Arc::clone(&store), workspace)      // a protocol `Workspace` (id and name)
         .with_dispatcher(runner_link)                     // Arc<dyn Dispatcher>, stream D
-        .with_hub_machine(this_machine),                  // where folderless dispatches run
+        .with_hub_machine(this_machine)                   // where folderless dispatches run
+        .with_setup_listener(setup_listener),              // starts the office and runner on setup
 );
 let parts = RouterParts::new()
     .agent(pitcrew_hub_work::agent_routes().layer(Extension(Arc::clone(&work))))
@@ -397,15 +398,58 @@ Agent and device tokens (`agent_routes`): `GET /v1/me`, `GET /v1/members`,
 `POST /v1/tasks/{id}/move`, `PUT /v1/tasks/{id}/subtasks`, `POST /v1/tasks/{id}/comments`,
 `GET /v1/asks?to=&state=`, `POST /v1/asks`, `POST /v1/asks/{id}/answer`.
 
-Device tokens only (`device_routes`): `GET /v1/workspace`, `GET /v1/machines`,
+Device tokens only (`device_routes`): `GET /v1/workspace`, `POST /v1/setup`, `GET /v1/machines`,
 `GET /v1/personas`, `GET /v1/teams`, `GET|POST /v1/projects`, `GET /v1/projects/{id}`,
 `GET /v1/workstreams?project=`, `POST /v1/workstreams`, `GET|PATCH /v1/workstreams/{id}`,
 `POST /v1/tasks`, `PATCH /v1/tasks/{id-or-key}`, `POST /v1/tasks/{id}/assign`,
 `POST /v1/tasks/{id}/dispatch`, `GET /v1/sessions?machine=&workstream=&task=&state=`,
 `GET /v1/sessions/{id}`, `GET /v1/briefs`, `PUT /v1/briefs/{project|workstream}/{id}`.
 
-`GET /v1/workspace` answers `{ workspace, rev }`; `rev` is the lowest checkpoint of the work
-projections (`projection_state.rev`), the revision every work table reflects.
+`GET /v1/workspace` answers `{ workspace, rev, setup_needed }`; `rev` is the lowest checkpoint of
+the work projections (`projection_state.rev`), the revision every work table reflects, and
+`setup_needed` is `true` while the workspace has no person yet, omitted (never `false` on the
+wire) once it does. See "The first run" for `POST /v1/setup` and the daemon's seam.
+
+## The first run (`POST /v1/setup`)
+
+A fresh hub has a device token but no person, no machine and no name (api-v1.md, "The first
+run"). `WorkService::set_up(caller, Setup) -> Result<SetupDone>` (`src/setup.rs`) runs it once,
+through the one writer:
+
+- device tokens only (`forbidden` for an agent, checked before the body);
+- every field checked exactly as the contract says (lengths, the handle's shape, no control
+  characters), `400` before the `409`s;
+- `409 conflict` once the workspace already has a person, or if the handle is taken (by another
+  member the hub already knows, e.g. a back office added before a person existed) — so a retried
+  request never makes a second person: the first call to commit wins, every other sees the
+  conflict;
+- appends, in one append, `member_added` for the caller's own member id (kind `human`, no owner)
+  and `machine_added` (kind `local`, liveness `live`, a new id), both authored by the caller;
+- returns the new member and machine alongside the workspace (its id, and the name just set).
+
+**Two seams for the daemon**, since the workspace's name is kept outside the event log (in
+`workspace.json`, which the daemon owns) and setup is also when the daemon must start what needed
+a person (the back office, and the runner on this machine; api-v1.md, "The first run"):
+
+- `WorkService::set_workspace_name(&self, name: String)`: sets the name `GET /v1/workspace` (and
+  `set_up`'s own `SetupDone.workspace.name`) serves from then on. `set_up` calls it itself once its
+  append commits, with the name the request gave; the daemon also calls it on every start, with
+  the name it read from `workspace.json`, so the two never disagree. Without a call, the service
+  serves the name it was constructed with (`WorkService::new`'s `workspace.name`).
+- `SetupListener` (`pub trait { fn set_up(&self, done: &SetupDone); }`), registered with
+  `WorkService::with_setup_listener(Arc<dyn SetupListener>)` before the service is shared. Called
+  **once**, synchronously, right after `set_up`'s append commits (so it never sees a setup that
+  did not take) and with the command lock still held (so nothing else can write to the work model
+  between the commit and the listener seeing it). The daemon's listener is where `workspace.json`
+  gets written and the back office and runner get started; this crate does neither (out of scope;
+  see the brief).
+  - **Reads only, never a write, and never panic.** The lock still held is a plain, non-reentrant
+    `std::sync::Mutex` (`set_up` itself is still on the stack): reads (`WorkService::read`,
+    `members`, `tasks`, ...) are fine, but calling any command (`create_task`, a second `set_up`,
+    ...) from the listener deadlocks the thread. A panic here unwinds through `set_up`: the route
+    answers `500`, but the append already committed, so a retry then answers `409`, never a second
+    person. If the daemon's own work can fail or needs to write to the work model, hand `done` to
+    its own task (a channel, `tokio::spawn`, ...) and do that work off this call stack.
 
 Errors are `ApiError` bodies: a malformed id or unknown thing in the path is `404`, in the body or
 query `400`; bodies over 1 MiB are `400`. A `500` is logged in full and its body always says

@@ -4,6 +4,7 @@ use crate::dispatch::Dispatcher;
 use crate::error::{Result, WorkError};
 use crate::query::{self, AskFilter, SessionFilter, TaskFilter, TaskRef};
 use crate::recap::RecapSync;
+use crate::setup::SetupListener;
 use pitcrew_protocol::api::{Caller, TokenScope};
 use pitcrew_protocol::events::{BriefTarget, Event, EventBody};
 use pitcrew_protocol::ids::{
@@ -35,6 +36,14 @@ pub struct WorkspaceAt {
     /// The revision every work table reflects. A client that loads the work model and then
     /// opens the stream with `since=rev` misses nothing.
     pub rev: u64,
+    /// `true` while the workspace has no person yet (a fresh hub): `POST /v1/setup` has not run.
+    /// Omitted, never `false` on the wire, once it has (api-v1.md, "Host and workspace").
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub setup_needed: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// The work model of one workspace: reads of its projections, and commands that validate a
@@ -61,19 +70,25 @@ pub struct WorkspaceAt {
 /// and, for an agent, `on_behalf_of` is its owner; never anything from a request body.
 pub struct WorkService {
     store: Arc<Store>,
-    workspace: Workspace,
+    workspace_id: WorkspaceId,
+    /// The workspace's name. Kept here, not in the event log (`POST /v1/setup`, api-v1.md "The
+    /// first run"): a fresh hub has none yet, and the daemon keeps it in `workspace.json` across
+    /// restarts. See [`WorkService::set_workspace_name`].
+    workspace_name: Mutex<String>,
     clock: Clock,
     writes: Mutex<()>,
     dispatcher: Option<Arc<dyn Dispatcher>>,
     hub_machine: Option<MachineId>,
     /// The recap index, built from the log on first use (see [`crate::RecapIndex`]).
     recaps: Mutex<RecapSync>,
+    /// Called once, after `set_up` commits (see [`SetupListener`]).
+    setup_listener: Option<Arc<dyn SetupListener>>,
 }
 
 impl std::fmt::Debug for WorkService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkService")
-            .field("workspace", &self.workspace)
+            .field("workspace_id", &self.workspace_id)
             .field("store", &self.store)
             .field("dispatcher", &self.dispatcher)
             .field("hub_machine", &self.hub_machine)
@@ -88,12 +103,14 @@ impl WorkService {
     pub fn new(store: Arc<Store>, workspace: Workspace) -> Self {
         Self {
             store,
-            workspace,
+            workspace_id: workspace.id,
+            workspace_name: Mutex::new(workspace.name),
             clock: Arc::new(system_clock),
             writes: Mutex::new(()),
             dispatcher: None,
             hub_machine: None,
             recaps: Mutex::new(RecapSync::default()),
+            setup_listener: None,
         }
     }
 
@@ -121,6 +138,15 @@ impl WorkService {
         self
     }
 
+    /// Calls `listener` once, after each successful `set_up` commits (see [`SetupListener`]): the
+    /// daemon's seam for starting what needed a person (the back office, and the runner on this
+    /// machine) once a fresh hub is set up.
+    #[must_use]
+    pub fn with_setup_listener(mut self, listener: Arc<dyn SetupListener>) -> Self {
+        self.setup_listener = Some(listener);
+        self
+    }
+
     /// The store.
     #[must_use]
     pub fn store(&self) -> &Arc<Store> {
@@ -130,7 +156,26 @@ impl WorkService {
     /// The workspace's id.
     #[must_use]
     pub fn workspace(&self) -> WorkspaceId {
-        self.workspace.id
+        self.workspace_id
+    }
+
+    /// The workspace's name right now (see [`WorkService::set_workspace_name`]).
+    fn current_name(&self) -> String {
+        self.workspace_name
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Sets the workspace's name, kept outside the event log (see the field's doc comment). The
+    /// daemon calls this once `set_up` has run (its [`SetupListener`] gets the name too) and again
+    /// on every start, from `workspace.json`, so `GET /v1/workspace` always answers the name the
+    /// daemon has on disk.
+    pub fn set_workspace_name(&self, name: String) {
+        *self
+            .workspace_name
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = name;
     }
 
     /// The workspace and the revision the work model reflects (`GET /v1/workspace`).
@@ -139,10 +184,17 @@ impl WorkService {
     ///
     /// Database errors.
     pub fn workspace_at(&self) -> Result<WorkspaceAt> {
-        let rev = self.read(query::work_rev)?;
+        // One snapshot for both: a `set_up` committing between two separate reads could otherwise
+        // give a stale `rev` alongside a fresh `setup_needed`, or the other way round.
+        let (rev, setup_needed) =
+            self.read(|c| Ok((query::work_rev(c)?, !query::has_person(c)?)))?;
         Ok(WorkspaceAt {
-            workspace: self.workspace.clone(),
+            workspace: Workspace {
+                id: self.workspace_id,
+                name: self.current_name(),
+            },
             rev,
+            setup_needed,
         })
     }
 
@@ -152,6 +204,10 @@ impl WorkService {
 
     pub(crate) fn hub_machine(&self) -> Option<MachineId> {
         self.hub_machine
+    }
+
+    pub(crate) fn setup_listener(&self) -> Option<Arc<dyn SetupListener>> {
+        self.setup_listener.clone()
     }
 
     pub(crate) fn recap_lock(&self) -> &Mutex<RecapSync> {
@@ -187,7 +243,7 @@ impl WorkService {
         Event {
             id: pitcrew_protocol::ids::EventId::new(),
             at: self.now(),
-            workspace: self.workspace.id,
+            workspace: self.workspace_id,
             author,
             on_behalf_of,
             body,
