@@ -20,6 +20,18 @@ use ulid::Ulid;
 /// A time in the fixture's week: 2026-09-30 08:00 UTC.
 pub const T0: i64 = 1_790_755_200_000;
 
+/// What the hub's projections would know before the demo workspace's event slice.
+pub fn demo_directory(ws: &pitcrew_fixtures::DemoWorkspace) -> Directory {
+    let mut dir = Directory::new();
+    ws.members.iter().for_each(|m| dir.add_member(m));
+    ws.workstreams.iter().for_each(|w| dir.add_workstream(w));
+    ws.tasks.iter().for_each(|t| dir.add_task(t));
+    ws.sessions.iter().for_each(|s| dir.add_session(s));
+    ws.dispatches.iter().for_each(|d| dir.add_dispatch(d));
+    ws.asks.iter().for_each(|a| dir.add_ask(a));
+    dir
+}
+
 fn id(kind: u128, n: u128) -> Ulid {
     Ulid::from((kind << 96) | n)
 }

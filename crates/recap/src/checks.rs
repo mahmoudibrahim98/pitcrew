@@ -224,9 +224,10 @@ pub fn mentions_divergence(text: &str) -> bool {
     let mut all = words(text).peekable();
     while let Some((start, w)) = all.next() {
         let next = all.peek().map(|(_, n)| *n);
-        let found = if w.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("diverg")) {
-            true
-        } else if w == "NaN" || w == "NAN" {
+        let found = if w.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("diverg"))
+            || w == "NaN"
+            || w == "NAN"
+        {
             true
         } else if w == "nan" {
             let before = text.get(..start).unwrap_or_default().trim_end();
