@@ -33,7 +33,7 @@ fn main() -> ExitCode {
 
 #[cfg(unix)]
 mod unix {
-    use pitcrew_remote::helper::{HashTool, MIN_TMUX, Progress, TMUX_SOCKET, parse_tmux_version};
+    use pitcrew_remote::helper::{HashTool, MIN_TMUX, Progress, parse_tmux_version, tmux_name};
     use pitcrew_remote::{
         DeployOptions, DirectLauncher, Endpoint, Helper, HelperError, HelperState, Input,
         LaunchOptions, Launcher, Layout, Limits, Platform, Ssh, SshError, Stopped, Target,
@@ -60,12 +60,13 @@ mod unix {
     /// Makes the binary play a hash tool (see [`act_as_tool`]).
     const TOOL_ENV: &str = "PITCREW_FAKE_TOOL";
 
-    /// The tools the script and the probe may run, linked into each machine's `PATH`. A tool
-    /// the script starts using without being listed here fails the tests.
-    const TOOLS: [&str; 32] = [
+    /// The tools the script and the probe may run, linked into each machine's `PATH`, which is
+    /// also its tool path. A tool the script starts using without being listed here fails the
+    /// tests.
+    const TOOLS: &[&str] = &[
         "dd", "cat", "ls", "awk", "sed", "tr", "cut", "head", "tail", "wc", "mkdir", "rm", "mv",
         "ln", "chmod", "id", "uname", "date", "find", "readlink", "sleep", "setsid", "nohup",
-        "tmux", "ps", "printf", "kill", "[", "test", "stat", "df", "mount",
+        "tmux", "ps", "printf", "kill", "[", "test", "stat", "df", "mount", "cksum", "hostid",
     ];
 
     pub fn main() -> ExitCode {
@@ -109,6 +110,21 @@ mod unix {
         /// For a call running this script command, read nothing and hang.
         #[serde(default)]
         hang_on: Option<String>,
+        /// Swallow this many bytes of stdin before the command sees any, as a shell start-up
+        /// file that reads stdin would...
+        #[serde(default)]
+        eat: Option<u64>,
+        /// ...only in calls running this script command.
+        #[serde(default)]
+        eat_on: Option<String>,
+        /// Run the command's interpreter (`/bin/sh` in the command line) as this shell instead,
+        /// and the whole command line with it. Without the wrapper, which `login_shells.rs`
+        /// covers.
+        #[serde(default)]
+        interpreter: Option<String>,
+        /// The umask the remote command starts with.
+        #[serde(default)]
+        umask: Option<String>,
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -152,9 +168,24 @@ mod unix {
             std::thread::sleep(Duration::from_secs(120));
             return 0;
         }
-        let mut child = Command::new("/bin/sh")
-            .arg("-c")
-            .arg(&command)
+        let (shell, script) = match &remote.interpreter {
+            Some(sh) => (
+                sh.clone(),
+                line.replacen("'/bin/sh' -c", &format!("'{sh}' -c"), 1),
+            ),
+            None => ("/bin/sh".to_owned(), command.clone()),
+        };
+        let mut child = Command::new(&shell);
+        match &remote.umask {
+            Some(mask) => child
+                .arg("-c")
+                .arg("umask \"$1\" && eval \"$2\"")
+                .arg("sh")
+                .arg(mask)
+                .arg(&script),
+            None => child.arg("-c").arg(&script),
+        };
+        let mut child = child
             .current_dir(&remote.home)
             .env("HOME", &remote.home)
             .env("PATH", &remote.path)
@@ -173,6 +204,18 @@ mod unix {
         let mut buf = vec![0u8; 8192];
         let mut paused = false;
         let mut cut = false;
+        let eat = remote
+            .eat
+            .filter(|_| {
+                remote
+                    .eat_on
+                    .as_deref()
+                    .is_none_or(|word| line.contains(&format!(" {word} ")))
+            })
+            .unwrap_or(0);
+        let mut eaten = std::io::Read::take(&mut from_app, eat);
+        let swallowed = std::io::copy(&mut eaten, &mut std::io::sink()).unwrap_or(0);
+        count += swallowed;
         loop {
             let mut want = buf.len() as u64;
             for mark in [remote.cut_after, remote.pause_after.filter(|_| !paused)]
@@ -292,6 +335,13 @@ mod unix {
                 ExitCode::SUCCESS
             }
             (_, Some(socket)) => {
+                // Its umask, for the test that it is the user's and not the script's.
+                let umask = std::fs::read_to_string("/proc/self/status")
+                    .unwrap_or_default()
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Umask:").map(|v| v.trim().to_owned()))
+                    .unwrap_or_default();
+                println!("fake pitcrewd umask {umask}");
                 let _ = std::fs::remove_file(&socket);
                 let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
                 println!("fake pitcrewd listening");
@@ -408,7 +458,7 @@ mod unix {
             "#!/bin/sh\n\
              case \"$1\" in\n\
              --version) echo 'pitcrewd {version} (protocol 1)' ;;\n\
-             serve) {trap}{DAEMON_ENV}={mode} exec '{}' \"$@\" ;;\n\
+             serve) echo \"pitcrewd script: $0\" >&2; {trap}{DAEMON_ENV}={mode} exec '{}' \"$@\" ;;\n\
              *) exit 2 ;;\n\
              esac\n",
             daemon().display()
@@ -457,6 +507,8 @@ mod unix {
         home: PathBuf,
         bin: PathBuf,
         env: Vec<(String, String)>,
+        /// The shell standing in for `/bin/sh` in the command line, if not `/bin/sh`.
+        interpreter: Option<String>,
         fakes: AtomicU32,
     }
 
@@ -489,8 +541,12 @@ mod unix {
             Self::build(Path::new("/bin/sh"), customize)
         }
 
+        /// A machine whose `/bin/sh` is `sh`, run by a link named `sh` (as `/bin/sh` is), so
+        /// shells that look at their name (bash, zsh) behave as they would there.
         fn with_shell(sh: &Path) -> Self {
-            Self::build(sh, |_| {})
+            let mut m = Self::build(sh, |_| {});
+            m.interpreter = Some(m.bin.join("sh").to_str().unwrap().to_owned());
+            m
         }
 
         fn build(sh: &Path, customize: impl FnOnce(&Path)) -> Self {
@@ -506,6 +562,7 @@ mod unix {
                 home,
                 bin,
                 env: Vec::new(),
+                interpreter: None,
                 fakes: AtomicU32::new(0),
             }
         }
@@ -520,10 +577,17 @@ mod unix {
             }
             let mut env = self.env.clone();
             env.extend(remote.env.iter().cloned());
+            let path = if remote.path.is_empty() {
+                self.bin.to_str().unwrap().to_owned()
+            } else {
+                remote.path.clone()
+            };
+            let interpreter = remote.interpreter.clone().or(self.interpreter.clone());
             let remote = Remote {
                 home: self.home.clone(),
-                path: self.bin.to_str().unwrap().to_owned(),
+                path,
                 env,
+                interpreter,
                 ..remote
             };
             std::fs::write(dir.join(REMOTE), serde_json::to_vec(&remote).unwrap()).unwrap();
@@ -538,13 +602,15 @@ mod unix {
         }
 
         fn target(&self, fake: &Fake) -> Target {
-            Target::with_layout(
-                fake.ssh.clone(),
-                "cluster",
-                self.layout(),
-                Platform::LinuxX86_64,
-            )
-            .unwrap()
+            self.target_at(fake, self.layout())
+        }
+
+        /// A target with another root; the tool path is the sandbox.
+        fn target_at(&self, fake: &Fake, layout: Layout) -> Target {
+            Target::with_layout(fake.ssh.clone(), "cluster", layout, Platform::LinuxX86_64)
+                .unwrap()
+                .with_tool_path(self.bin.to_str().unwrap())
+                .unwrap()
         }
 
         /// A target through a fake that just relays.
@@ -614,12 +680,13 @@ mod unix {
             & 0o7777
     }
 
-    /// Nothing under `root` is open to the group or others (links aside).
+    /// Nothing under `root` is open to the group or others (links aside). The helper's socket
+    /// is its own, made with the user's umask; the 0700 directory it is in keeps others out.
     fn assert_private(root: &Path) {
         let mut stack = vec![root.to_path_buf()];
         while let Some(path) = stack.pop() {
             let meta = std::fs::symlink_metadata(&path).unwrap();
-            if meta.file_type().is_symlink() {
+            if meta.file_type().is_symlink() || meta.file_type().is_socket() {
                 continue;
             }
             assert_eq!(meta.permissions().mode() & 0o077, 0, "{}", path.display());
@@ -685,6 +752,15 @@ mod unix {
             .to_owned()
     }
 
+    /// The umask of a process (`self`, or a pid), as /proc prints it: `0022`.
+    fn umask_of(pid: &str) -> String {
+        std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("Umask:").map(|v| v.trim().to_owned()))
+            .unwrap()
+    }
+
     fn uname_n() -> String {
         let out = Command::new("uname").arg("-n").output().unwrap();
         String::from_utf8(out.stdout).unwrap().trim().to_owned()
@@ -744,6 +820,19 @@ mod unix {
         let calls = fake.calls();
         assert_eq!(calls.len(), 2, "{calls:?}");
         assert!(calls[0].line.contains(" check "), "{}", calls[0].line);
+        // The interpreter by its path, and the tool path behind the script's length.
+        assert!(
+            calls[0].line.starts_with("'/bin/sh' -c "),
+            "{}",
+            calls[0].line
+        );
+        let lengths = format!(
+            " sh {} {} {} check ",
+            SCRIPT.len(),
+            SCRIPT.trim_end_matches('\n').len(),
+            m.bin.display()
+        );
+        assert!(calls[0].line.contains(&lengths), "{}", calls[0].line);
         assert_eq!(calls[0].stdin, script_len());
         assert!(calls[1].line.contains(" install "), "{}", calls[1].line);
         assert_eq!(calls[1].stdin, script_len() + helper.len());
@@ -948,9 +1037,23 @@ mod unix {
             ..quick()
         };
 
-        // A fresh lock from another host (a login node sharing this home): it is waited for.
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let touch = |when: &str| {
+            let touched = Command::new("touch")
+                .args(["-d", when])
+                .arg(&lock)
+                .status()
+                .unwrap();
+            assert!(touched.success());
+        };
+
+        // A fresh lock from another host (a login node sharing this home): it is waited for,
+        // even though the time it records is old, since that host's clock is not this one.
         private_dir(&lock);
-        std::fs::write(lock.join("owner"), "elsewhere 1 00ff\n").unwrap();
+        std::fs::write(lock.join("owner"), "elsewhere 1 00ff 946684800\n").unwrap();
         let err = block_on(deploy(&m.plain(), &helper("1.0.0"), &impatient)).unwrap_err();
         assert!(
             matches!(&err, HelperError::Busy(d) if d.contains("elsewhere 1")),
@@ -958,13 +1061,14 @@ mod unix {
         );
         assert!(lock.exists());
 
-        // The same lock, once older than stale_lock, is broken.
-        let touched = Command::new("touch")
-            .args(["-t", "200001010000"])
-            .arg(&lock)
-            .status()
-            .unwrap();
-        assert!(touched.success());
+        // Its directory a little older than stale_lock (5 minutes) is not enough: clocks may
+        // differ by up to 10 minutes...
+        touch("8 minutes ago");
+        let err = block_on(deploy(&m.plain(), &helper("1.0.0"), &impatient)).unwrap_err();
+        assert!(matches!(err, HelperError::Busy(_)), "{err:?}");
+
+        // ...beyond that it is broken.
+        touch("16 minutes ago");
         block_on(deploy(&m.plain(), &helper("1.0.0"), &impatient)).unwrap();
         assert!(!lock.exists());
 
@@ -972,7 +1076,7 @@ mod unix {
         private_dir(&lock);
         std::fs::write(
             lock.join("owner"),
-            format!("{} {} 00ff\n", uname_n(), dead_pid()),
+            format!("{} {} 00ff {now}\n", uname_n(), dead_pid()),
         )
         .unwrap();
         block_on(deploy(&m.plain(), &helper("2.0.0"), &impatient)).unwrap();
@@ -984,15 +1088,24 @@ mod unix {
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
 
-        // A live process of this host keeps its lock.
+        // A live process of this host keeps its lock...
         private_dir(&lock);
-        std::fs::write(
-            lock.join("owner"),
-            format!("{} {} 00ff\n", uname_n(), std::process::id()),
-        )
-        .unwrap();
+        let live = format!("{} {} 00ff {now}\n", uname_n(), std::process::id());
+        std::fs::write(lock.join("owner"), &live).unwrap();
         let err = block_on(deploy(&m.plain(), &helper("3.0.0"), &impatient)).unwrap_err();
         assert!(matches!(err, HelperError::Busy(_)), "{err:?}");
+        assert_eq!(std::fs::read_to_string(lock.join("owner")).unwrap(), live);
+
+        // ...until it has held it longer than stale_lock by this host's own clock, whatever
+        // the directory's time says.
+        std::fs::write(
+            lock.join("owner"),
+            format!("{} {} 00ff {}\n", uname_n(), std::process::id(), now - 600),
+        )
+        .unwrap();
+        touch("now");
+        block_on(deploy(&m.plain(), &helper("3.0.0"), &impatient)).unwrap();
+        assert!(!lock.exists());
     }
 
     fn gc_keeps_exactly_two_versions() {
@@ -1357,6 +1470,313 @@ mod unix {
         assert!(!m.bin_dir().join("1.0.0/pitcrewd").exists());
     }
 
+    /// Every directory on the way to the root must belong to root or the user, and be
+    /// writable by no one else unless sticky; symbolic links on the way are followed.
+    fn the_way_to_the_root_is_checked() {
+        let m = Machine::new();
+        let base = m.dir.path().to_path_buf();
+        let at = |root: &Path| {
+            m.target_at(
+                &m.fake(Remote::default()),
+                Layout::at(root.to_str().unwrap()).unwrap(),
+            )
+        };
+        let dir = |path: &Path, mode: u32| {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let unsafe_way = |root: &Path, why: &str| {
+            let err = block_on(deploy(&at(root), &helper("1.0.0"), &quick())).unwrap_err();
+            assert!(
+                matches!(&err, HelperError::UnsafeDirectory(d) if d.contains(why)),
+                "{}: {err:?}",
+                root.display()
+            );
+            assert!(!root.exists(), "{}", root.display());
+        };
+
+        // Writable by the group (a shared project directory, set-group-ID or not) or by
+        // everyone, without the sticky bit: anyone there could swap the tree after the checks.
+        for (name, mode) in [("group", 0o775), ("project", 0o2770), ("open", 0o777)] {
+            dir(&base.join(name), mode);
+            dir(&base.join(name).join("u"), 0o755);
+            unsafe_way(&base.join(name).join("u/.pitcrew"), "writable by others");
+        }
+        // Sticky and world-writable, as /tmp: no one can rename what is not theirs. (Every
+        // test machine's home is under /tmp too.)
+        dir(&base.join("sticky"), 0o1777);
+        dir(&base.join("sticky/u"), 0o755);
+        let root = base.join("sticky/u/.pitcrew");
+        block_on(deploy(&at(&root), &helper("1.0.0"), &quick())).unwrap();
+        assert!(root.join("bin/1.0.0/pitcrewd").is_file());
+
+        // Symbolic links on the way are followed, absolute or relative, through `..`...
+        dir(&base.join("real/u"), 0o755);
+        dir(&base.join("sub"), 0o755);
+        std::os::unix::fs::symlink(base.join("real"), base.join("link")).unwrap();
+        std::os::unix::fs::symlink("sub/../real", base.join("rel")).unwrap();
+        for via in ["link", "rel"] {
+            let root = base.join(via).join("u/.pitcrew");
+            block_on(deploy(&at(&root), &helper("1.0.0"), &quick())).unwrap();
+            assert!(
+                base.join("real/u/.pitcrew/bin/1.0.0/pitcrewd").is_file(),
+                "{via}"
+            );
+        }
+        // ...and where they lead must be safe, and so must the directory holding them.
+        std::os::unix::fs::symlink(base.join("open"), base.join("to-open")).unwrap();
+        unsafe_way(&base.join("to-open/u/.pitcrew"), "writable by others");
+        dir(&base.join("open2"), 0o777);
+        dir(&base.join("real2/u"), 0o755);
+        std::os::unix::fs::symlink(base.join("real2"), base.join("open2/in")).unwrap();
+        unsafe_way(&base.join("open2/in/u/.pitcrew"), "writable by others");
+
+        // The launchers check the way too.
+        let launcher = DirectLauncher::new(launch_options());
+        let group = at(&base.join("group/u/.pitcrew"));
+        for err in [
+            block_on(launcher.status(&group)).unwrap_err(),
+            block_on(launcher.start(&group)).unwrap_err(),
+            block_on(launcher.stop(&group)).unwrap_err(),
+        ] {
+            assert!(matches!(err, HelperError::UnsafeDirectory(_)), "{err:?}");
+        }
+
+        // A directory on the way that belongs to another user (an `ls` that says so).
+        dir(&base.join("theirs/u"), 0o755);
+        let theirs = base.join("theirs");
+        let real = which("ls").unwrap();
+        shim(
+            &m.bin,
+            "ls",
+            &format!(
+                "last=\nfor a in \"$@\"; do last=$a; done\n\
+                 if [ \"$last\" = '{}' ]; then '{}' \"$@\" | awk '{{ $3 = 4242; print }}'; \
+                 else exec '{}' \"$@\"; fi",
+                theirs.display(),
+                real.display(),
+                real.display()
+            ),
+        );
+        unsafe_way(&theirs.join("u/.pitcrew"), "belongs to uid 4242");
+    }
+
+    /// A shell start-up file that reads stdin eats the start of the script: what is left must
+    /// not run, even a tail that would remove things.
+    fn a_partly_eaten_script_never_runs() {
+        let m = Machine::new();
+        // A tail starting at the first `rm -rf "$1"` would remove `$1`, the command name,
+        // relative to the remote's working directory, its home.
+        let decoy = m.home.join("check");
+        private_dir(&decoy);
+        let rm = SCRIPT.find("rm -rf \"$1\"").unwrap();
+        let line = SCRIPT[..rm].rfind('\n').unwrap() + 1;
+        for eat in [1, 10, line as u64] {
+            let fake = m.fake(Remote {
+                eat: Some(eat),
+                ..Remote::default()
+            });
+            let err = block_on(deploy(&m.target(&fake), &helper("1.0.0"), &quick())).unwrap_err();
+            assert!(
+                matches!(&err, HelperError::UnexpectedOutput(d) if d.contains("did not arrive whole")),
+                "{eat}: {err:?}"
+            );
+            assert!(decoy.is_dir(), "{eat}");
+            assert!(!m.root().exists(), "{eat}");
+        }
+
+        // In an upload the helper's own bytes make up the length: still refused.
+        block_on(deploy(&m.plain(), &helper("1.0.0"), &quick())).unwrap();
+        let fake = m.fake(Remote {
+            eat: Some(100),
+            eat_on: Some("install".to_owned()),
+            ..Remote::default()
+        });
+        let err = block_on(deploy(&m.target(&fake), &helper("2.0.0"), &quick())).unwrap_err();
+        assert!(
+            matches!(&err, HelperError::UnexpectedOutput(d) if d.contains("did not arrive whole")),
+            "{err:?}"
+        );
+        assert!(!m.bin_dir().join("2.0.0/pitcrewd").exists());
+        assert!(m.temporaries().is_empty());
+        assert_eq!(m.link("current").as_deref(), Some("1.0.0"));
+        assert!(decoy.is_dir());
+    }
+
+    /// A deploy whose lock was broken stops before its next change, and leaves the new
+    /// holder's lock alone.
+    fn a_lost_lock_stops_the_deploy() {
+        let m = Machine::new();
+        block_on(deploy(&m.plain(), &helper("1.0.0"), &quick())).unwrap();
+        let slow = m.fake(Remote {
+            pause_after: Some(script_len() + 1000),
+            pause_ms: 1500,
+            ..Remote::default()
+        });
+        let target = m.target(&slow);
+        let second = big_helper("2.0.0", 100 * 1024);
+        let a = std::thread::spawn(move || block_on(deploy(&target, &second, &quick())));
+        eventually("the upload to pause", || slow.paused());
+        eventually("the upload to begin", || m.temporaries().len() == 1);
+        // Another run takes the lock over, as one that misjudged it stale would.
+        let thief = "elsewhere 4242 00ff 0\n";
+        std::fs::write(m.lock().join("owner"), thief).unwrap();
+        let err = a.join().unwrap().unwrap_err();
+        assert!(matches!(&err, HelperError::LockLost(_)), "{err:?}");
+        assert_eq!(
+            std::fs::read_to_string(m.lock().join("owner")).unwrap(),
+            thief
+        );
+        assert!(m.temporaries().is_empty());
+        assert!(!m.bin_dir().join("2.0.0/pitcrewd").exists());
+        assert_eq!(m.link("current").as_deref(), Some("1.0.0"));
+    }
+
+    /// The helper runs with the umask of the user's session, not the script's 077, so files
+    /// agents make in shared project directories keep their usual permissions.
+    fn the_helper_gets_the_users_umask() {
+        let m = Machine::new();
+        let fake = m.fake(Remote {
+            umask: Some("027".to_owned()),
+            ..Remote::default()
+        });
+        let target = m.target(&fake);
+        block_on(deploy(&target, &helper("1.0.0"), &quick())).unwrap();
+        let launcher = DirectLauncher::new(launch_options());
+        let started = block_on(launcher.start(&target)).unwrap();
+        assert_eq!(umask_of(&started.endpoint.pid.to_string()), "0027");
+        // What the script made stays private all the same.
+        assert_private(&m.root());
+        block_on(launcher.stop(&target)).unwrap();
+        let log = std::fs::read_to_string(m.run_dir().join("pitcrewd.log")).unwrap();
+        assert!(log.contains("fake pitcrewd umask 0027\n"), "{log}");
+    }
+
+    /// The tool path comes before the user's `PATH`, and functions bash imports from the
+    /// environment do not stand in for tools.
+    fn look_alike_tools_are_not_used() {
+        let m = Machine::new();
+        let evil = m.dir.path().join("evil");
+        std::fs::create_dir(&evil).unwrap();
+        shim(&evil, "ls", "echo 'drwx------ 1 0 0 0 Jan 1 00:00 x'");
+        shim(&evil, "mkdir", "exit 1");
+        shim(
+            &evil,
+            "sha256sum",
+            "echo 0000000000000000000000000000000000000000000000000000000000000000",
+        );
+        let fake = m.fake(Remote {
+            path: format!("{}:{}", evil.display(), m.bin.display()),
+            ..Remote::default()
+        });
+        let done = block_on(deploy(&m.target(&fake), &helper("1.0.0"), &quick())).unwrap();
+        assert!(done.uploaded);
+
+        let Some(bash) = which("bash") else {
+            println!("note: no bash here for the exported-function case");
+            return;
+        };
+        let functions = ["dd", "mkdir", "ls", "mv", "sha256sum", "cat", "kill"].map(|f| {
+            (
+                format!("BASH_FUNC_{f}%%"),
+                "() { echo hijacked >&2; return 1; }".to_owned(),
+            )
+        });
+        let fake = m.fake(Remote {
+            interpreter: Some(bash.to_str().unwrap().to_owned()),
+            env: functions.to_vec(),
+            ..Remote::default()
+        });
+        let target = m.target(&fake);
+        let done = block_on(deploy(&target, &helper("2.0.0"), &quick())).unwrap();
+        assert!(done.uploaded);
+        let launcher = DirectLauncher::new(launch_options());
+        block_on(launcher.start(&target)).unwrap();
+        let stopped = block_on(launcher.stop(&target)).unwrap();
+        assert!(stopped.pid.is_some());
+    }
+
+    /// macOS shows `@` for extended attributes, which hides an ACL's `+`: `ls -le` is asked.
+    /// A set-group-ID parent (group project directories) makes new directories `drwx--S---`,
+    /// which are private all the same.
+    fn acls_behind_an_at_sign_and_setgid_parents() {
+        let real = which("ls").unwrap();
+        for acl in [true, false] {
+            let m = Machine::new();
+            let root = m.root();
+            let entry = if acl {
+                "echo ' 0: group:everyone allow list,add_file'"
+            } else {
+                ":"
+            };
+            shim(
+                &m.bin,
+                "ls",
+                &format!(
+                    "last=\nfor a in \"$@\"; do last=$a; done\n\
+                     case \"$1:$last\" in\n\
+                     '-ldn:{root}') '{real}' -ldn \"$last\" | awk '{{ $1 = $1 \"@\"; print }}' ;;\n\
+                     '-lde:{root}') echo \"drwx------@ 2 501 20 64 Oct  1 12:00 $last\"; {entry} ;;\n\
+                     *) exec '{real}' \"$@\" ;;\n\
+                     esac",
+                    root = root.display(),
+                    real = real.display(),
+                ),
+            );
+            let result = block_on(deploy(&m.plain(), &helper("1.0.0"), &quick()));
+            if acl {
+                let err = result.unwrap_err();
+                assert!(
+                    matches!(&err, HelperError::UnsafeDirectory(d) if d.contains("access control list")),
+                    "{err:?}"
+                );
+            } else {
+                result.unwrap();
+            }
+        }
+
+        let m = Machine::new();
+        std::fs::set_permissions(&m.home, std::fs::Permissions::from_mode(0o2755)).unwrap();
+        block_on(deploy(&m.plain(), &helper("1.0.0"), &quick())).unwrap();
+        assert_eq!(mode(&m.root()), 0o2700);
+        assert_eq!(mode(&m.bin_dir()), 0o2700);
+        let launcher = DirectLauncher::new(launch_options());
+        block_on(launcher.start(&m.plain())).unwrap();
+        assert_eq!(mode(&m.run_dir()), 0o2700);
+        assert!(block_on(launcher.stop(&m.plain())).unwrap().pid.is_some());
+    }
+
+    /// A host name with other characters is kept readable and made unique with the machine's
+    /// id, rather than all such hosts being `unknown`.
+    fn odd_host_names_get_a_machine_id() {
+        let real = which("uname").unwrap();
+        let m = Machine::with_tools(|bin| {
+            shim(
+                bin,
+                "uname",
+                &format!(
+                    "case \"$1\" in -n) echo 'odd host!' ;; *) exec '{}' \"$@\" ;; esac",
+                    real.display()
+                ),
+            );
+        });
+        let target = m.plain();
+        block_on(deploy(&target, &helper("1.0.0"), &quick())).unwrap();
+        let launcher = DirectLauncher::new(launch_options());
+        let host = block_on(launcher.start(&target)).unwrap().endpoint.host;
+        assert!(host.starts_with("odd_host_-"), "{host}");
+        assert!(host.len() > "odd_host_-".len(), "{host}");
+        assert!(
+            host.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        );
+        // The same name on every call: the helper it started is recognised as running here.
+        let status = block_on(launcher.status(&target)).unwrap();
+        assert_eq!(status.state, HelperState::Running);
+        assert_eq!(status.endpoint.unwrap().host, host);
+        assert!(block_on(launcher.stop(&target)).unwrap().pid.is_some());
+    }
+
     /// `Ssh::run_with_input` is binary-clean, reports progress, and still honours the output
     /// limit while the remote side reads nothing.
     fn input_round_trips_and_is_bounded() {
@@ -1457,7 +1877,18 @@ mod unix {
         for gone in ["endpoint.json", "pitcrewd.pid", "pitcrewd.sock"] {
             assert!(!m.run_dir().join(gone).exists(), "{gone}");
         }
-        assert!(m.run_dir().join("pitcrewd.log").exists());
+        // The log: the version's own binary was started, not `current`, with the umask the
+        // user's session had rather than the script's 077. It stays private itself.
+        let log = std::fs::read_to_string(m.run_dir().join("pitcrewd.log")).unwrap();
+        assert!(
+            log.contains("pitcrewd script: bin/1.0.0/pitcrewd\n"),
+            "{log}"
+        );
+        assert!(
+            log.contains(&format!("fake pitcrewd umask {}\n", umask_of("self"))),
+            "{log}"
+        );
+        assert_eq!(mode(&m.run_dir().join("pitcrewd.log")), 0o600);
 
         let status = block_on(launcher.status(&target)).unwrap();
         assert_eq!(status.state, HelperState::NotRunning);
@@ -1504,12 +1935,30 @@ mod unix {
         round_trip(&launcher, &m);
         // The session and its server are gone.
         let has = Command::new("tmux")
-            .args(["-L", TMUX_SOCKET, "has-session"])
+            .args(["-L", &tmux_name(&m.layout()), "has-session"])
             .env("TMUX_TMPDIR", &sockets)
             .stderr(Stdio::null())
             .status()
             .unwrap();
         assert!(!has.success());
+
+        // Two roots on one host, with one tmux socket directory, do not collide.
+        let other = Layout::at(m.dir.path().join("other").to_str().unwrap()).unwrap();
+        assert_ne!(tmux_name(&other), tmux_name(&m.layout()));
+        let here = m.plain();
+        let there = m.target_at(&m.fake(Remote::default()), other);
+        for target in [&here, &there] {
+            block_on(deploy(target, &helper("1.0.0"), &quick())).unwrap();
+        }
+        let a = block_on(launcher.start(&here)).unwrap().endpoint;
+        let b = block_on(launcher.start(&there)).unwrap().endpoint;
+        assert_ne!(a.pid, b.pid);
+        assert_ne!(a.socket, b.socket);
+        block_on(launcher.stop(&here)).unwrap();
+        let status = block_on(launcher.status(&there)).unwrap();
+        assert_eq!(status.state, HelperState::Running);
+        assert_eq!(status.tmux_session, Some(true));
+        block_on(launcher.stop(&there)).unwrap();
         println!("tmux checked: {version}");
     }
 
@@ -1755,6 +2204,31 @@ mod unix {
             ),
             ("mv_without_t_falls_back", mv_without_t_falls_back),
             ("a_stalled_upload_times_out", a_stalled_upload_times_out),
+            (
+                "the_way_to_the_root_is_checked",
+                the_way_to_the_root_is_checked,
+            ),
+            (
+                "a_partly_eaten_script_never_runs",
+                a_partly_eaten_script_never_runs,
+            ),
+            ("a_lost_lock_stops_the_deploy", a_lost_lock_stops_the_deploy),
+            (
+                "the_helper_gets_the_users_umask",
+                the_helper_gets_the_users_umask,
+            ),
+            (
+                "look_alike_tools_are_not_used",
+                look_alike_tools_are_not_used,
+            ),
+            (
+                "acls_behind_an_at_sign_and_setgid_parents",
+                acls_behind_an_at_sign_and_setgid_parents,
+            ),
+            (
+                "odd_host_names_get_a_machine_id",
+                odd_host_names_get_a_machine_id,
+            ),
             (
                 "input_round_trips_and_is_bounded",
                 input_round_trips_and_is_bounded,
