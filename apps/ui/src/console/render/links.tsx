@@ -24,6 +24,16 @@ export function OpenExternalProvider(props: { open: (url: string) => void; child
   return <OpenExternalContext value={props.open}>{props.children}</OpenExternalContext>;
 }
 
+/** A new browsing context with no way back to this one, as the anchors' `rel` gives. */
+function openInBrowser(url: string): void {
+  window.open(url, '_blank', 'noopener,noreferrer');
+}
+
+/** How to open a link outside the app from code (the terminal): the host's opener, else a new tab. */
+export function useOpenExternal(): (url: string) => void {
+  return use(OpenExternalContext) ?? openInBrowser;
+}
+
 export function ExternalLink({ href, children }: { href: string; children: ReactNode }) {
   const open = use(OpenExternalContext);
   return (
