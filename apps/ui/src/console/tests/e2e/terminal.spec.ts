@@ -185,6 +185,21 @@ test('a session on the unreachable machine shows the 503 reason, once', async ({
   // It does not retry: one attempt, however long we wait.
   await page.waitForTimeout(3_000);
   expect(terminals.sockets).toHaveLength(1);
+
+  // A person can ask again: one more attempt, the same answer, and no loop after it.
+  await page.getByRole('button', { name: 'Try again' }).click();
+  await expect.poll(() => terminals.sockets.length).toBe(2);
+  await expect(status(page)).toHaveText('gpu-box cannot be reached right now, so its terminal cannot be shown.');
+  await expect(frame(page)).toBeFocused();
+  await page.waitForTimeout(2_000);
+  expect(terminals.sockets).toHaveLength(2);
+
+  // In a narrow console the reason wraps rather than being cut off.
+  await page.setViewportSize({ width: 700, height: 800 });
+  await expect(page.locator('[data-console-layout]')).toHaveAttribute('data-console-layout', 'narrow');
+  await expect(status(page)).toBeVisible();
+  const cut = await status(page).evaluate((element) => element.scrollWidth > element.clientWidth);
+  expect(cut).toBe(false);
 });
 
 test('without a terminal the switch is disabled, with the reason', async ({ page }) => {

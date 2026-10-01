@@ -73,7 +73,8 @@ lazily, for the workbench).
 | `terminal/socket.ts` | `TerminalSocket`, no React: the connection, reconnects by offset, keystrokes and resizes (below). `browserSocketFactory` opens browser WebSockets. |
 | `terminal/diagnose.ts` | Why the hub refused a terminal, asked over HTTP (below). |
 | `terminal/controller.ts` | `TerminalController`, no React: xterm, its addons, fit, theme and font, input by mode, flow control, and disposal. |
-| `terminal/terminal-view.tsx` | `TerminalView`: the mode, Take control and Release, the status, the screen reader setting, the truncated marker, and the frame xterm draws in. |
+| `terminal/terminal-view.tsx` | `TerminalView`: the mode, Take control and Release, the status and Try again, the screen reader setting, the truncated marker, and the frame xterm draws in. |
+| `terminal-boundary.tsx` | `TerminalBoundary`: the error boundary around the terminal's lazy chunk, with Try again. |
 | `terminal/options.ts` | xterm's options for hostile output, and the link handler. |
 | `terminal/keys.ts` | The release chord and view mode's keys. |
 | `terminal/theme.ts`, `terminal/contrast.ts` | Colours and font from the design tokens; dim text that keeps 4.5:1. |
@@ -86,12 +87,15 @@ lazily, for the workbench).
   the hub's base (`ws:` or `wss:`, a path prefix kept) and offers the subprotocols `pitcrew.v1` and
   `pitcrew.bearer.<token>`. **The token never goes in the URL.** The desktop app will pass its
   gateway's opener instead (`docs/build/contracts/desktop-gateway.md`), through `TerminalView`'s
-  `socket` prop.
+  `socket` prop. A factory's sockets must deliver binary frames as `ArrayBuffer`s (or typed
+  arrays): a `Blob` is not read, so a browser WebSocket needs `binaryType = 'arraybuffer'`, as
+  `browserSocketFactory` sets.
 - **No byte lost or repeated.** It counts the output bytes received and reconnects with
   `from=<count>`. `{"type":"truncated","from":N}` moves the count to N (the hub no longer has the
   bytes between), and the view shows "Earlier output is no longer available." as a line at the top
   of the terminal. The marker is page text, not bytes written into the terminal: the program's
-  screen is left as it drew it, and a clear-screen cannot erase the marker.
+  screen is left as it drew it, and a clear-screen cannot erase the marker. Only a CAN (0x18) goes
+  to xterm there, uncounted, so an escape sequence the gap cut cannot swallow the output after it.
 - **The end.** `{"type":"exit"}` or a 1000 close: "The program ended." It never reconnects.
 - **Close codes.** 1007, 1009 and 1011 (and 1002, 1003, 1008) stop with the reason, the hub's
   close reason after it. 1001, 1013, 1006 and anything else reconnect.
@@ -99,22 +103,38 @@ lazily, for the workbench).
   HTTP status is hidden. So after one, `terminalDiagnosis` asks the hub as it decides: the session
   (404: "This session no longer exists."), its machine (503: "gpu-box cannot be reached right now,
   so its terminal cannot be shown."), its terminal (404: "This session has no terminal."). Any of
-  those stops it, with the reason; if none holds, the network failed, and it reconnects. A
-  transport that knows the status (the desktop gateway) passes it in the close event, and 400,
-  401, 403, 404 and 503 stop without asking.
+  those stops it, with the reason.
+  - The hub's own 503 on `GET /v1/sessions/{id}` is the machine's reason only while that machine
+    is not live; otherwise (a hub restarting) it reconnects.
+  - If the hub cannot be asked, or does not answer within 10 s (the requests are aborted), nothing
+    is found, and it reconnects.
+  - If the hub answers and nothing explains the refusal, it reconnects, but after 5 such refusals
+    in a row it stops: "The hub refused the terminal."
+  - A transport that knows the status (the desktop gateway) passes it in the close event, and 400,
+    401, 403, 404 and 503 stop without asking.
+- **An attempt that hangs.** One that has not opened after 10 s (a stuck hub, a half-open tunnel)
+  is closed and treated as refused, so "Connecting…" never lasts.
 - **Back-off.** Attempt n waits `min(15 s, 500 ms × 2ⁿ)` times 0.5–1 (jitter), and starts over
   once a connection has stayed up for 5 s. While the page is hidden or the browser offline it does
   not reconnect at all; it reconnects at once when the page is visible and online again.
-- **Keystrokes** are binary frames (UTF-8 from `TextEncoder`; X10 mouse reports byte for byte).
-  While disconnected they wait, 64 KiB at most in all; past that, or more than 64 KiB at once (a
-  large paste), or more than 64 KiB not yet sent on a slow connection, they are refused and the
-  view says so. Nothing is buffered without limit, and no message can reach the hub's 1 MiB limit.
+- **Trying again.** A stopped terminal has a "Try again" button, which reconnects from the bytes
+  received with the back-off starting over. It also tries again by itself when the session's
+  machine comes back (its liveness returns to `live`). Nothing else restarts it, so a stop is
+  never a loop.
+- **Keystrokes** are binary frames of at most 64 KiB (UTF-8 from `TextEncoder`; X10 mouse reports
+  byte for byte). While connected, up to 1 MiB at once (a paste) is sent, in 64 KiB frames, unless
+  as much is still waiting to go out on a slow connection. While disconnected they wait, 64 KiB at
+  most in all, and go out in order on reconnecting. Past those limits they are refused and the
+  view says so, until keystrokes go through again. Nothing is buffered without limit, and no
+  message can reach the hub's 1 MiB limit.
 - **Resize.** xterm is fitted to its element (`@xterm/addon-fit` and a `ResizeObserver`); the size
   goes to the hub 100 ms after it settles, clamped to 1..=1000, and only when it changed. The first
   connection already carries the fitted size.
 - **Flow control.** Output given to xterm and not yet parsed is counted. Past 4 MiB the socket
-  holds (closes) and reconnects from the bytes received once xterm is down to 512 KiB, so a
-  flood costs neither unbounded memory nor output.
+  holds (closes) and reconnects from the bytes received once xterm is down to 512 KiB, so a flood
+  neither grows xterm's write queue without bound nor loses output. It shows "Catching up with the
+  output…", never "The connection dropped". (What xterm keeps once parsed: see "Bounded memory"
+  below.)
 
 ### View and control
 
@@ -123,24 +143,33 @@ lazily, for the workbench).
   as anywhere else. Enter takes control; the arrows, Page Up, Page Down, Home and End scroll; Ctrl+C
   (Cmd+C on macOS) copies a selection.
 - **Control mode** is taken with "Take control" or Enter on the focused terminal. The frame then
-  spreads `ownsShellKeys`, and every key goes to the program: Esc, Tab, Ctrl K, J, B and . included.
-  It is left with "Release" or **Ctrl+Shift+X** (Ctrl, not Cmd, on every platform, as terminal keys
-  are), which never reaches the program.
+  spreads `ownsShellKeys`, and the shell's keys are no longer the shell's: Esc, Tab, Ctrl K, J and
+  B go to the program. Ctrl . is taken from the shell too, but a terminal has no code for it, so
+  nothing is sent. In a browser tab, Ctrl W, T and N stay the browser's (it closes or opens a tab)
+  and never reach the page, let alone the program. Control is left with "Release" or
+  **Ctrl+Shift+X** (Ctrl, not Cmd, on every platform, as terminal keys are), which never reaches
+  the program.
   - **Why Ctrl+Shift+X.** xterm.js sends nothing for Ctrl+Shift with a letter (a terminal cannot
     tell it from Ctrl+letter), so no program in the terminal can be waiting for it: shells, vim,
     emacs, tmux (Ctrl+B), screen (Ctrl+A) and the agent CLIs bind Ctrl+letter, Alt+letter, Esc
     sequences and F-keys. Unlike Ctrl+Shift+Esc (Windows' task manager) or Shift+Esc (the
-    browser's), no operating system or browser takes it before the page; Firefox's text-direction
-    switch on it is prevented. X reads as "leave", and it needs no F-key, which laptops hide
-    behind Fn.
+    browser's), no operating system takes it before the page. Firefox binds it to switch the
+    text direction of a text field, and releasing prevents that. X reads as "leave", and it needs
+    no F-key, which laptops hide behind Fn.
   - **F6** goes to the program in control mode: Midnight Commander, htop and others bind it, and
     a terminal that kept it back would break them. Leaving is the chord's job; once released, F6
     moves between the console's panes again, starting from the terminal.
+  - **Paste** with Ctrl+Shift+V (Cmd+V on macOS) or the context menu's Paste, as in terminal
+    emulators: xterm sends nothing for Ctrl+Shift+V, so the browser pastes, and xterm sends the
+    text (bracketed when the program asks). Ctrl+V itself goes to the program (^V).
 - **Always visible and announced.** The toolbar shows "Viewing" or "In control" with the key that
   changes it, and a polite live region says what the mode means as it changes. The program's end,
-  or a stop, gives control back.
+  or a stop, gives control back, and moves focus that was in xterm to the frame.
 - **Focus ring.** The frame shows a ring whenever focus is in it: the accent in view mode, the
   warning colour in control mode.
+- **Failures.** The terminal's chunk is under an error boundary: if it fails to load or render,
+  the pane says so with a "Try again" that loads it afresh, and the rest of the console stays.
+  A link to `?view=terminal` whose session cannot be loaded says why instead of loading for ever.
 
 ### Untrusted output
 
@@ -153,11 +182,15 @@ Output comes from an agent and from whatever it ran, so it is treated as hostile
 - **No proposed API** (`allowProposedApi: false`), and every window report and manipulation
   (`windowOptions`) stays off, so a program cannot read back a title or the window's geometry.
 - **Links** only for OSC 8 hyperlinks to absolute http and https URLs
-  (`allowNonHttpProtocols: false`, checked again on activation), and only on Ctrl+click (Cmd+click)
-  through the console's opener (`OpenExternalProvider`, else a new tab with no opener). A plain
-  click does nothing; hovering shows the target. There is no web-links addon, so plain text is
-  never a link.
-- **Bounded scrollback: 5,000 lines.**
+  (`allowNonHttpProtocols: false`, checked again on activation), and only on Ctrl+click (Cmd+click
+  on macOS) through the console's opener (`OpenExternalProvider`, else a new tab with no opener).
+  A plain click does nothing; hovering shows the target. There is no web-links addon, so plain
+  text is never a link.
+- **Bounded memory, as far as it goes.** The scrollback keeps 5,000 lines: that bounds the number
+  of rows, not every byte they hold, since a cell can carry any number of combining marks. xterm
+  accepts OSC 8 link targets of up to 10 MB and keeps every link without an `id` with its line, so
+  a target longer than 2 KiB is dropped (its text shows as plain text). What waits to be parsed is
+  bounded by the flow control above.
 - **No logging.** xterm's log level is off, so hostile sequences cannot flood the console.
 - **No input in view mode**, not even the replies xterm generates to queries (device attributes,
   cursor position): the program hears from a viewer only in control mode.
@@ -199,10 +232,13 @@ coloured dot beside `ink-2` text.
   `corepack pnpm --filter @pitcrew/ui exec vitest run src/console`). Component tests use happy-dom
   and the real mock hub as a child process on a free port; `stubLayout()` gives virtual lists a
   size. `console-page.test.tsx` mounts the shell's router with the console feature, in Strict Mode
-  as `src/main.tsx` does. The terminal: `terminal-socket.test.ts` drives `TerminalSocket` with a
-  fake socket and fake timers (`terminal-fakes.ts`); `terminal-view.test.tsx` and
-  `console-page.test.tsx` replace xterm with a fake, since happy-dom cannot draw one;
-  `terminal-options.test.ts` covers keys, links, the theme and dim text.
+  at the root as `src/main.tsx` does (`renderWithHub(…, { strict: true })`: a `<StrictMode>` under
+  the `DataProvider` would not run effects twice). The terminal: `terminal-socket.test.ts` drives
+  `TerminalSocket` and the diagnosis with a fake socket and fake timers (`terminal-fakes.ts`);
+  `terminal-view.test.tsx` and `console-page.test.tsx` replace xterm with a fake, since happy-dom
+  cannot draw one (the view's fake can hold back its write callbacks, for the flow control);
+  `terminal-options.test.ts` covers keys, links, the theme and dim text;
+  `terminal-boundary.test.tsx` the error boundary.
 - **Playwright** (`src/console/tests/e2e`): the acceptance run in the real app against the mock
   hub, axe included (both themes, both layouts), on ports 47450 (hub) and 47451 (UI), which
   `E2E_HUB_PORT` and `E2E_UI_PORT` move. Traces are kept only for failures, in
