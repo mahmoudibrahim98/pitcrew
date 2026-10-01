@@ -2,24 +2,24 @@
 //! export may come from another machine, a support bundle, or a hand edit.
 //!
 //! Input: a byte `n`, then the file. `8 * n` valid event lines (demo events with fresh ids) come
-//! first, so files longer than the import's 1,000-line batches are reached too.
+//! first, so files longer than the import's 1,000-line batches are reached too (the import
+//! appends in batches of 1,000 inside one transaction).
 //!
 //! Each input imports into a fresh, empty store (a copy of one made once, in local WAL mode).
 //!
 //! Checks, besides "no panic":
 //! - **whole or nothing**: an import that fails leaves the store empty; one that succeeds holds
-//!   exactly the file's events, in order (what `export` writes back decodes to the same events);
+//!   exactly the file's events, in order (what `export` writes back decodes to the same events).
+//!   R7 (a bad line after a full batch kept the batches before it) is fixed, and its input in
+//!   `fuzz/regressions/store_import/` must pass;
 //! - the store stays usable: its integrity check passes either way.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use pitcrew_fuzz::{scratch_path, skip_known};
+use pitcrew_fuzz::scratch_path;
 use pitcrew_protocol::events::Event;
 use pitcrew_store::{FsMode, IntegrityReport, Store, StoreOptions};
 use std::sync::OnceLock;
-
-/// Lines per batch in `Store::import` (a private constant there).
-const BATCH: usize = 1000;
 
 fn options() -> StoreOptions {
     let mut options = StoreOptions::default();
@@ -96,14 +96,7 @@ fuzz_target!(|input: &[u8]| {
             assert_eq!(got, expected, "the import is not the file's events");
             assert_eq!(held, expected.len() as u64);
         }
-        Err(_) => {
-            if held != 0 && skip_known() {
-                // Known finding: batches before a failing line stay imported.
-                assert_eq!(held % BATCH as u64, 0, "a partial batch was imported");
-            } else {
-                assert_eq!(held, 0, "a failed import left {held} events in the store");
-            }
-        }
+        Err(_) => assert_eq!(held, 0, "a failed import left {held} events in the store"),
     }
     assert_eq!(
         store.integrity_check(false).expect("a check"),
