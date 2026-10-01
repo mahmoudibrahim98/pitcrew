@@ -72,8 +72,9 @@ Everything is pure and deterministic. Event text is untrusted: it is cleaned and
 is kept. Cleaning removes control characters, direction-changing and invisible characters, and
 Unicode tag characters (U+E0000–E007F, which can carry text a person does not see but a model
 reading the recap does). The set is the same as `pitcrew_sync_github::bounds::is_hidden`; change
-both together (`text.rs` pins it in a test). Counts, files, facts, tasks and receipts per block are
-capped by `Config`.
+both together (`text.rs` pins it in a test). Of that set, the line and paragraph separators
+(U+2028, U+2029) become a space, like a line break, so the words around them stay apart. Counts,
+files, facts, tasks and receipts per block are capped by `Config`.
 
 ## Tests
 

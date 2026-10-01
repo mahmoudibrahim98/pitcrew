@@ -22,7 +22,9 @@ const RECEIPT_TEXT_BYTES: usize = 1024;
 /// `docs/security/threat-model.md`).
 ///
 /// The set is the same as `pitcrew_sync_github::bounds::is_hidden`, which cleans what the GitHub
-/// sync stores: change both together.
+/// sync stores: change both together. The line and paragraph separators in it never reach the
+/// output as themselves, but [`clean`] and [`clean_tail`] turn them into a space, like any other
+/// line break, so that the words on either side are not run together.
 fn is_hidden(c: char) -> bool {
     matches!(
         c,
@@ -39,11 +41,16 @@ fn is_hidden(c: char) -> bool {
     )
 }
 
+/// U+2028 and U+2029: hidden, but they break a line, so they stand for a space.
+fn is_line_separator(c: char) -> bool {
+    matches!(c, '\u{2028}' | '\u{2029}')
+}
+
 /// Cleans untrusted text for display: hidden and direction-changing characters are dropped (the
 /// same set `pitcrew_sync_github::bounds::is_hidden` drops, tag characters included),
-/// control characters and whitespace runs become one space, the ends are trimmed, and at most
-/// `max` characters are kept (the last one is `…` when the text was cut). Work is bounded by
-/// `max`, not by the input length.
+/// control characters, line and paragraph separators and whitespace runs become one space, the
+/// ends are trimmed, and at most `max` characters are kept (the last one is `…` when the text was
+/// cut). Work is bounded by `max`, not by the input length.
 #[must_use]
 pub fn clean(s: &str, max: usize) -> String {
     if max == 0 {
@@ -59,10 +66,10 @@ pub fn clean(s: &str, max: usize) -> String {
             cut = true;
             break;
         }
-        if is_hidden(c) {
+        if is_hidden(c) && !is_line_separator(c) {
             continue;
         }
-        if c.is_whitespace() || c.is_control() {
+        if c.is_whitespace() || c.is_control() || is_line_separator(c) {
             space = count > 0;
             continue;
         }
@@ -92,7 +99,8 @@ pub fn clean(s: &str, max: usize) -> String {
 }
 
 /// Like [`clean`], but keeps the end of the text, which is the informative part of a path:
-/// `…/paper/method.tex`.
+/// `…/paper/method.tex`. Control characters and line and paragraph separators become a space each;
+/// other whitespace is kept.
 pub(crate) fn clean_tail(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -107,8 +115,14 @@ pub(crate) fn clean_tail(s: &str, max: usize) -> String {
     let window = s.get(start..).unwrap_or_default();
     let mut chars: Vec<char> = window
         .chars()
-        .filter(|c| !is_hidden(*c))
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .filter(|&c| !is_hidden(c) || is_line_separator(c))
+        .map(|c| {
+            if c.is_control() || is_line_separator(c) {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     let cut = start > 0 || chars.len() > max;
     if cut {
@@ -270,12 +284,15 @@ mod tests {
         assert_eq!(clean_tail(&format!("a/{text}.rs"), 60), "a/hi.rs");
         assert_eq!(clean("soft\u{00AD}hyphen", 60), "softhyphen");
         assert_eq!(clean("a\u{180E}b", 60), "ab");
-        // The separators are dropped, not turned into a space as other whitespace is.
-        assert_eq!(clean("line\u{2028}one\u{2029}two", 60), "lineonetwo");
-        assert_eq!(clean_tail("x\u{2028}y", 60), "xy");
+        // The line and paragraph separators never show, but they break words like a newline.
+        assert_eq!(clean("Done.\u{2028}Next", 60), "Done. Next");
+        assert_eq!(clean("line\u{2028}one\u{2029}two", 60), "line one two");
+        assert_eq!(clean("\u{2029}a\u{2028}\u{2029} b\u{2028}", 60), "a b");
+        assert_eq!(clean_tail("x\u{2028}y", 60), "x y");
         assert!(!is_plain_path("src/\u{E0041}.rs"));
         assert!(!is_plain_path("src/a\u{2029}b.rs"));
-        // Hidden characters cost nothing against the cap.
+        // Hidden characters are not kept, so they take none of the `max` characters (they do count
+        // towards the scan limit, which bounds the work).
         assert_eq!(clean(&format!("{}abc", "\u{E0020}".repeat(10)), 3), "abc");
     }
 
