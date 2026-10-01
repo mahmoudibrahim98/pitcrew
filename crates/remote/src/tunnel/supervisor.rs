@@ -516,8 +516,14 @@ impl Supervisor {
                     self.shared.remember(Transport::Stdio);
                 }
                 // Something else (no daemon behind it, say): the bridge says what. Not
-                // remembered: the forward is tried again next time.
-                Err(_) => self.forward_known = false,
+                // remembered: the forward is tried again next time; made anew if its local
+                // socket is what failed.
+                Err(broken) => {
+                    self.forward_known = false;
+                    if matches!(broken, forward::Broken::Failed(_)) {
+                        self.drop_forward();
+                    }
+                }
             }
         }
         let active = Arc::new(self.stdio(&route, node_ssh.as_deref()));
@@ -875,10 +881,19 @@ impl Supervisor {
                             keep_login: true,
                         };
                     }
+                    // The local socket is gone: its master, if that is dead too; else the
+                    // forward alone, added again with the login kept (no new sign-in).
                     Err(forward::Broken::Failed(why)) => {
+                        if let Err(reason) = self.check_masters().await {
+                            return End::Lost {
+                                reason,
+                                keep_login: false,
+                            };
+                        }
+                        self.drop_forward();
                         return End::Lost {
                             reason: format!("the forwarded socket failed: {why}"),
-                            keep_login: false,
+                            keep_login: true,
                         };
                     }
                     Err(forward::Broken::Silent) => {

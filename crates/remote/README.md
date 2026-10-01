@@ -421,9 +421,12 @@ connector.close().await;
   `ssh -O check` every `check_every` (5 s; Unix). Through a forwarded socket it sends a request
   every `probe_every` (4 s, answered within `probe_timeout`, 4 s): one unanswered makes the state
   `Unverifiable` within ten seconds, and one goes every second until one is answered (`Connected`
-  again, same link) or 30 s pass (the way is lost). Nothing watches through a session (it would
-  count against `MaxSessions`, or be a job step): a stdio link's keepalives are its watch, and
-  notice a lost network within ten seconds too. A failed `connect()` makes the connector check
+  again, same link) or 30 s pass (the way is lost). A request the far end closes (or resets)
+  unanswered makes it ask where the daemon is (a job that ended or moved); a local socket that
+  is gone is forwarded again while the master lives. Neither logs in again. Nothing watches
+  through a session (it would count against `MaxSessions`, or be a job step): a stdio link's
+  keepalives are its watch, and notice a lost network within ten seconds too. A failed
+  `connect()` makes the connector check
   at once (the master, or where the daemon is), at most every 2 s (10 s for the endpoint)
   however many fail; so do `wake()` and a jump of the wall clock against the monotonic one (the
   laptop slept). On Windows the monotonic clock runs during sleep: the desktop should call
@@ -527,14 +530,15 @@ daemon (`EXIT_NO_DAEMON`), 1 other. Messages name what is wrong, never the path.
   the re-check or are named like one of the user's `Host`s (nothing started towards them), a
   dropped network noticed within ten seconds then recovered, a short silence that keeps a
   patient link, a link that keeps dropping (given up, until a retry), a wall-clock jump, a job
-  that ended then moved to another node, askpass during a reconnect (and a cancel stopping the
-  attempts), a session over `MaxSessions` (that connection's error only), a burst of failed
-  connections (one check), the links of a crashed app (stopped by the next connector), no
-  connection reuse (as on Windows: `close()` ends open connections, a cancelled prompt waits
-  for a retry), and both transports with each POSIX shell of `PITCREW_TEST_SHELLS` as the
-  machine's `sh`. The bridge alone: byte-exact both ways, a large transfer, half-closes both
-  ways, and sockets that are not the user's refused (not one served by another user, which
-  needs root to set up);
+  that ended then moved to another node (the login kept, the forward made anew), a forwarded
+  socket removed (forwarded again, no new login), askpass during a reconnect (and a cancel
+  stopping the attempts), a session over `MaxSessions` (that connection's error only), a burst
+  of failed connections (one check), the links of a crashed app (stopped by the next
+  connector), no connection reuse (as on Windows: `close()` ends open connections, a cancelled
+  prompt waits for a retry), and both transports with each POSIX shell of
+  `PITCREW_TEST_SHELLS` as the machine's `sh`. The bridge alone: byte-exact both ways, a large
+  transfer, half-closes both ways, and sockets that are not the user's refused (not one served
+  by another user, which needs root to set up);
 - `deploy.rs` checks that nothing a case starts outlives it: everything started on a fake
   machine (the fake `ssh` too) carries the run's mark (`PITCREW_TEST_RUN`) in its environment;
   after each case, passed or not, what still carries it is killed and the case fails, and the

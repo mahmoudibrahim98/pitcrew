@@ -26,12 +26,12 @@ pub(crate) const PROBE: &[u8] =
 pub(crate) enum Broken {
     /// The site forbids forwarding unix sockets: ssh's log says so.
     Forbidden,
-    /// The connection closed with no answer: the server answered the channel with a failure
-    /// (no daemon behind the socket, say), or the daemon closed it.
+    /// The connection closed (or was reset) with no answer: the server answered the channel
+    /// with a failure (no daemon behind the socket, say), or the daemon closed it.
     Closed,
     /// No answer in time: the network, or the daemon, is silent.
     Silent,
-    /// The local socket failed (the master's listener is gone).
+    /// The local socket could not be reached (the master's listener is gone).
     Failed(String),
 }
 
@@ -116,22 +116,42 @@ pub(crate) async fn check(
     Err(broken)
 }
 
-/// One request: `true` if an HTTP answer starts, `false` if the connection closed first.
+/// One request: `true` if an HTTP answer starts, `false` if the connection closed first. ssh
+/// closes the connection when the channel fails on the far side (nothing listens there), often
+/// before reading the request, so the close may come as a reset: that is a close too. An error
+/// is the local socket's (nothing listens on it).
 async fn ask(local: &Path) -> io::Result<bool> {
     let mut stream = tokio::net::UnixStream::connect(local).await?;
-    stream.write_all(PROBE).await?;
-    let mut head = [0u8; 5];
-    let mut got = 0;
-    while got < head.len() {
-        let Some(rest) = head.get_mut(got..) else {
-            break;
-        };
-        match stream.read(rest).await? {
-            0 => return Ok(false),
-            n => got += n,
+    let exchange = async {
+        stream.write_all(PROBE).await?;
+        let mut head = [0u8; 5];
+        let mut got = 0;
+        while got < head.len() {
+            let Some(rest) = head.get_mut(got..) else {
+                break;
+            };
+            match stream.read(rest).await? {
+                0 => return Ok(false),
+                n => got += n,
+            }
         }
+        Ok(&head == b"HTTP/")
+    };
+    match exchange.await {
+        Err(e) if is_close(&e) => Ok(false),
+        other => other,
     }
-    Ok(&head == b"HTTP/")
+}
+
+/// Whether `error`, on a connected socket, is the far end closing it.
+fn is_close(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+    )
 }
 
 /// Whether ssh logged a refused forwarding channel, read as ssh's own format: the reason text
@@ -151,6 +171,24 @@ pub(crate) fn forbidden(log: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A connection reset with the request unread (as ssh resets it when the channel failed on
+    /// the far side) is a close, not a broken socket; a socket nobody listens on is.
+    #[tokio::test]
+    async fn a_reset_is_a_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f0");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream.readable().await.unwrap();
+            drop(stream);
+        });
+        assert!(!ask(&path).await.unwrap());
+        server.await.unwrap();
+        assert!(ask(&dir.path().join("f1")).await.is_err());
+        assert!(ask(&path).await.is_err());
+    }
 
     #[test]
     fn forbidden_channels_are_read_from_ssh_alone() {

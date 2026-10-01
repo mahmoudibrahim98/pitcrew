@@ -890,6 +890,20 @@ fn tunnel_a_job_that_ended_then_moved() {
             .iter()
             .any(|c| c.kind == "link" && c.host == "node018")
     );
+    // The login link stayed (no new sign-in for a job's end), and the node's new link got a
+    // forward of its own.
+    let calls = tunnel_calls(&m);
+    let logins = calls
+        .iter()
+        .filter(|c| c.kind == "link" && c.host == "cluster")
+        .count();
+    assert_eq!(logins, 1, "the login node was logged in to again");
+    let forwards: Vec<&str> = calls
+        .iter()
+        .filter(|c| c.op.as_deref() == Some("forward"))
+        .map(|c| c.host.as_str())
+        .collect();
+    assert_eq!(forwards, ["node017", "node018"]);
 
     // Stopped with the launcher, which forgets it (the connector may see it end first).
     crate::unix::block_on(launcher.cancel(&m.plain())).unwrap();
@@ -1060,6 +1074,51 @@ fn tunnel_under_every_posix_sh() {
 }
 
 // ─── Limits and failures ───────────────────────────────────────────────────────────────────
+
+/// The forwarded socket removed under the connector (a temporary-file cleaner, say): the probe
+/// fails, the master still answers, and the forward is made again, without a new sign-in.
+fn tunnel_a_removed_forward_is_made_again() {
+    let m = Machine::new();
+    deploy_and_start(&m);
+    let fake = m.fake(Remote::default());
+    let rt = runtime();
+    let launcher = Arc::new(DirectLauncher::new(launch_options()));
+    let connector = start(&rt, Daemon::new(reuse(&m, &fake), launcher), options());
+    wait_for(
+        &rt,
+        &connector,
+        "connected",
+        Duration::from_secs(30),
+        connected(Transport::Forwarded),
+    );
+    let dirs = private_dirs(&fake);
+    let forwarded: Vec<PathBuf> = std::fs::read_dir(&dirs[0])
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with('f'))
+        .collect();
+    assert_eq!(forwarded.len(), 1);
+    std::fs::remove_file(&forwarded[0]).unwrap();
+    let forwards = |m: &Machine| {
+        tunnel_calls(m)
+            .iter()
+            .filter(|c| c.op.as_deref() == Some("forward"))
+            .count()
+    };
+    crate::unix::eventually("a new forward", || forwards(&m) == 2);
+    wait_for(
+        &rt,
+        &connector,
+        "connected again",
+        Duration::from_secs(30),
+        connected(Transport::Forwarded),
+    );
+    assert_eq!(links(&m), 1, "logged in again");
+    let data = pattern(10_000, 35);
+    assert!(echo(&rt, &connector, &data) == data);
+    rt.block_on(connector.close());
+    stop_helper(&m);
+}
 
 /// sshd's `MaxSessions` reached: one connection more is refused, as that connection's error
 /// alone. Watching opens no session, the state stays connected and the link stays; once one
@@ -1782,6 +1841,10 @@ pub(crate) const CASES: &[(&str, fn())] = &[
         tunnel_askpass_during_a_reconnect,
     ),
     ("tunnel_under_every_posix_sh", tunnel_under_every_posix_sh),
+    (
+        "tunnel_a_removed_forward_is_made_again",
+        tunnel_a_removed_forward_is_made_again,
+    ),
     (
         "tunnel_a_session_over_max_sessions_is_refused_alone",
         tunnel_a_session_over_max_sessions_is_refused_alone,
