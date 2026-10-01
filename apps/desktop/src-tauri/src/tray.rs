@@ -102,13 +102,18 @@ pub fn create<R: Runtime>(app: &AppHandle<R>) -> bool {
             return false;
         }
     };
-    let builder = TrayIconBuilder::with_id(TRAY_ID)
+    let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon)
         .tooltip("PitCrew")
         .menu(&menu)
         .show_menu_on_left_click(!cfg!(windows))
         .on_menu_event(on_menu_event)
         .on_tray_icon_event(on_icon_event);
+    // On Linux the icon is handed to the tray as a PNG file: keep it in the app's own cache, not
+    // the shared `/tmp/tray-icon` (or `$XDG_RUNTIME_DIR/tray-icon`) other apps write too.
+    if let Ok(cache) = app.path().app_cache_dir() {
+        builder = builder.temp_dir_path(cache.join("tray"));
+    }
     // libappindicator is loaded when the first icon is built, and its loader panics when the
     // library is missing: that means no tray, not no app.
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| builder.build(app))) {
