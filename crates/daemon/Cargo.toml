@@ -18,11 +18,15 @@ pitcrew-api.workspace = true
 pitcrew-auth.workspace = true
 pitcrew-store.workspace = true
 pitcrew-hub-work.workspace = true
+# Only to tell the hub's refusals of the back office's actions (final) from its internal failures
+# (tried again): `run_office` reports both as `pitcrew_office::ApplyError`.
+pitcrew-office.workspace = true
 pitcrew-fixtures.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
 directories.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "sync", "time"] }
 tracing.workspace = true

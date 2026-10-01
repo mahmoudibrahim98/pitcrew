@@ -47,6 +47,11 @@ pub struct ServeArgs {
     /// Seed the demo workspace. Only into an empty store: a store with data is refused.
     #[arg(long)]
     pub demo: bool,
+
+    /// Do not run the back office (`@office`): no rules act on the log while this daemon runs,
+    /// and what is appended meanwhile is never acted on later either.
+    #[arg(long)]
+    pub no_office: bool,
 }
 
 /// `pitcrewd token`.
@@ -180,6 +185,17 @@ mod tests {
         };
         assert_eq!(args.listen, ListenArg::Private);
         assert!(!args.demo);
+        assert!(!args.no_office, "the back office is on by default");
+    }
+
+    #[test]
+    fn no_office_turns_the_back_office_off() {
+        let cli = Cli::try_parse_from(["pitcrewd", "serve", "--demo", "--no-office"]).unwrap();
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("not serve");
+        };
+        assert!(args.demo);
+        assert!(args.no_office);
     }
 
     #[test]

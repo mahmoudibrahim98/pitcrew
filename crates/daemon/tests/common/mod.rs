@@ -23,10 +23,24 @@ const READY: Duration = Duration::from_secs(60);
 pub mod id {
     pub const SAM: &str = "01JB000000000000000MEM0001";
     pub const WRITER: &str = "01JB000000000000000MEM0002";
+    /// The back office's agent.
+    pub const OFFICE: &str = "01JB000000000000000MEM0006";
+    pub const PAPER: &str = "01JB000000000000000PRJ0001";
+    pub const TOOLING: &str = "01JB000000000000000PRJ0002";
+    pub const SUBMISSION: &str = "01JB000000000000000WST0001";
+    pub const PARSERS: &str = "01JB000000000000000WST0003";
+    pub const PAP1: &str = "01JB000000000000000TSK0001";
     pub const PAP2: &str = "01JB000000000000000TSK0002";
+    pub const PAP3: &str = "01JB000000000000000TSK0003";
     pub const PAP7: &str = "01JB000000000000000TSK0007";
+    pub const TL1: &str = "01JB000000000000000TSK0008";
     pub const SES1: &str = "01JB000000000000000SES0001";
     pub const SES_UNKNOWN: &str = "01JB000000000000000SES0099";
+    /// PAP-1's active dispatch (@writer, session 1).
+    pub const DSP1: &str = "01JB000000000000000DSP0001";
+    /// PAP-3's finished dispatch.
+    pub const DSP4: &str = "01JB000000000000000DSP0004";
+    pub const WORKSPACE: &str = "01JB000000000000000WSP0001";
 }
 
 /// A running daemon. Killed when dropped, unless it was stopped.
@@ -196,6 +210,94 @@ impl Daemon {
         self.wait_exit(Duration::from_secs(20))
     }
 
+    /// Stops it: SIGTERM on Unix (and checks it stopped cleanly), killed elsewhere.
+    pub fn stop(&mut self) {
+        #[cfg(unix)]
+        {
+            let status = self.terminate();
+            assert!(status.success(), "{status}:\n{}", self.stderr());
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    /// Waits until its stderr contains `text`, at most `within`.
+    pub fn wait_for_log(&self, text: &str, within: Duration) {
+        let deadline = Instant::now() + within;
+        while !self.stderr().contains(text) {
+            assert!(
+                Instant::now() < deadline,
+                "no {text:?} in the log within {within:?}:\n{}",
+                self.stderr()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Every event of the log, oldest first, paged back through `GET /v1/events`.
+    pub fn all_events(&self, token: &str) -> Vec<Value> {
+        self.events_matching("", token)
+    }
+
+    /// Every event `GET /v1/events?<query>` matches, oldest first, paged back until `at_start`.
+    pub fn events_matching(&self, query: &str, token: &str) -> Vec<Value> {
+        self.events_paged(query, 500, token)
+    }
+
+    /// As [`Daemon::events_matching`], `limit` events a page.
+    pub fn events_paged(&self, query: &str, limit: usize, token: &str) -> Vec<Value> {
+        let mut events = Vec::new();
+        let mut before: Option<u64> = None;
+        for _ in 0..1000 {
+            let mut path = format!("/v1/events?limit={limit}{query}");
+            if let Some(before) = before {
+                path.push_str(&format!("&before={before}"));
+            }
+            let reply = self.get(&path, Some(token));
+            assert_eq!(reply.status, 200, "{path}: {}", reply.body);
+            let page = reply.json();
+            let mut older = page["events"].as_array().unwrap().clone();
+            older.extend(events);
+            events = older;
+            if page["at_start"].as_bool().unwrap() {
+                return events;
+            }
+            before = Some(page["from_rev"].as_u64().unwrap());
+        }
+        panic!("{query}: paging never reached the start");
+    }
+
+    /// Waits until the back office has looked at every revision of the log, and returns the
+    /// newest. It knows from the daemon's debug log: a run that ended there, or a start with
+    /// nothing to look at. Needs the back office on, and `PITCREW_LOG=debug` (as `start` sets).
+    pub fn settle(&self, token: &str) -> u64 {
+        let deadline = Instant::now() + READY;
+        loop {
+            let latest = self.latest_rev(token);
+            let logs = self.stderr();
+            let ran = logs.contains(&format!(" to={latest} applied="))
+                || logs.contains(&format!(" from={} latest={latest}", latest + 1));
+            if ran && self.latest_rev(token) == latest {
+                return latest;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the back office did not reach revision {latest}:\n{logs}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The newest revision, from `GET /v1/events`.
+    pub fn latest_rev(&self, token: &str) -> u64 {
+        let reply = self.get("/v1/events?limit=1", Some(token));
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        reply.json()["to_rev"].as_u64().unwrap()
+    }
+
     /// Waits for the process to exit, at most `within`.
     pub fn wait_exit(&mut self, within: Duration) -> ExitStatus {
         let deadline = Instant::now() + within;
@@ -222,6 +324,34 @@ impl Drop for Daemon {
             let _ = self.child.wait();
         }
     }
+}
+
+/// Appends `bodies` to the demo workspace's store in `state` from this process, authored by
+/// `author` on behalf of `owner`, as another writer would (here: in place of the runner link, which
+/// is not wired in yet). A running daemon is not told: it looks at them with its next append, or at
+/// its next start. Returns their revisions.
+pub fn append_to_store(
+    state: &Path,
+    author: &str,
+    owner: Option<&str>,
+    bodies: Vec<pitcrew_protocol::events::EventBody>,
+) -> pitcrew_store::RevRange {
+    use pitcrew_protocol::events::Event;
+    let store =
+        pitcrew_store::Store::open(state.join("hub.db"), pitcrew_store::StoreOptions::default())
+            .expect("open the store");
+    let events: Vec<Event> = bodies
+        .into_iter()
+        .map(|body| Event {
+            on_behalf_of: owner.map(|o| o.parse().unwrap()),
+            ..Event::now(
+                id::WORKSPACE.parse().unwrap(),
+                author.parse().unwrap(),
+                body,
+            )
+        })
+        .collect();
+    store.append(&events).expect("append")
 }
 
 pub fn read_token(path: &Path) -> String {
