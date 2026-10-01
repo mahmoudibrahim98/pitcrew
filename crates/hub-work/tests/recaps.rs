@@ -12,7 +12,7 @@ use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{AskId, EventId, MemberId, TaskId, TaskKey};
 use pitcrew_protocol::model::{Ask, AskKind, AskState, Date, LinkBasis, Receipt};
 use pitcrew_protocol::recap::{BlockKey, DayRecap, RecapBlock};
-use pitcrew_recap::Directory;
+use pitcrew_recap::{Config, Directory};
 use pitcrew_store::{Store, StoreOptions};
 use recap_common::{
     Ids, Oracle, SplitMix, T0, World, all_blocks, all_days, allowed_receipts, check_receipts, dump,
@@ -778,6 +778,85 @@ fn the_day_cache_rewrites_only_what_changed() {
     let mut rebuilt = Recaps::new(None);
     rebuilt.push(&log);
     assert_eq!(rebuilt.days(scope, 0, None, None).expect("days"), named);
+}
+
+/// An entry evicted for the directory's bound (not just a rename) moves `names_version`, so the
+/// next query rewrites every day paragraph that may have named it: one that named the evicted
+/// agent now says "someone" instead, as a rebuild with the same bound would write it.
+#[test]
+fn an_eviction_rewrites_the_days_that_named_it() {
+    let world = World::new(1, 1, 2, 2);
+    let mut ids = Ids::default();
+    // Keeps at most 5 members: exactly the setup's person and four agents, so the next distinct
+    // one evicts the least recently used.
+    let mut recaps = Recaps::with_config(Config::default(), Some(Directory::with_limit(5)));
+    let mut log = Vec::new();
+    feed(
+        &mut recaps,
+        &mut log,
+        world.setup(&mut ids, T0 - 86_400_000),
+    );
+
+    // Agent 1 (handle `@agent1`) runs a tool in session 0: the day's paragraph names them.
+    let run = gen_events(&[(0, 0, 0, false, 0)], &world, &mut ids, T0);
+    feed(&mut recaps, &mut log, run);
+    let scope = DaysScope::Project(world.projects[0].id);
+    let agent1 = world.agents[0];
+    let handle = recaps.names().handle(agent1).expect("known").to_owned();
+    let before = recaps.days(scope, 0, None, None).expect("days");
+    assert!(
+        before.days[0].summary.text.contains(&handle),
+        "{}",
+        before.days[0].summary.text
+    );
+    let written = recaps.days_written();
+
+    // Four more distinct members, all added by the person (so agent 1 is never touched again),
+    // evict the setup's members one by one, agent 1 last.
+    for n in 0..4u128 {
+        let newcomer = recap_common::agent(
+            MemberId(Ulid::from(950 + n)),
+            world.person,
+            &format!("@new{n}"),
+        );
+        let add = vec![world.event(
+            &mut ids,
+            T0,
+            world.person,
+            EventBody::MemberAdded { member: newcomer },
+        )];
+        feed(&mut recaps, &mut log, add);
+    }
+    assert!(recaps.names().handle(agent1).is_none(), "evicted");
+
+    // The next query rewrites every cached entry (the eviction's generation bump is not scoped
+    // to one day), including the one that no longer shows the evicted handle.
+    let after = recaps.days(scope, 0, None, None).expect("days");
+    assert_eq!(
+        recaps.days_written(),
+        written + before.days.len() as u64,
+        "every entry is written again"
+    );
+    assert!(
+        !after.days[0].summary.text.contains(&handle),
+        "{}",
+        after.days[0].summary.text
+    );
+    assert!(after.days[0].summary.text.contains("Someone"));
+
+    // A fresh index with the same bound, fed the whole log, agrees: a live index kept current
+    // through evictions equals a rebuild.
+    let mut rebuilt = Recaps::with_config(Config::default(), Some(Directory::with_limit(5)));
+    rebuilt.push(&log);
+    assert_eq!(rebuilt.days(scope, 0, None, None).expect("days"), after);
+    assert_eq!(
+        rebuilt
+            .blocks(&BlockFilter::default(), None, Some(50))
+            .expect("blocks"),
+        recaps
+            .blocks(&BlockFilter::default(), None, Some(50))
+            .expect("blocks")
+    );
 }
 
 /// The cache keeps at most its capacity, the least recently used out first, and answers the same
