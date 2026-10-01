@@ -2,8 +2,8 @@
 // channels, exactly as `docs/build/contracts/desktop-gateway.md` says. The gateway adds the
 // workspace's token; nothing here reads, holds or sends one, and the webview sets no headers.
 //
-// Loaded only in the desktop app, by dynamic import, so `@tauri-apps/api` stays out of the
-// browser's first chunk. Import types from here with `import type` only.
+// Loaded only in the desktop app, with `desktop.tsx`, by dynamic import, so `@tauri-apps/api`
+// stays out of the browser's first chunk. Elsewhere, import from here with `import type` only.
 
 import { Channel, invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';

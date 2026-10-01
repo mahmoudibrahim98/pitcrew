@@ -10,8 +10,11 @@ import { join } from 'node:path';
 import { gzipSync } from 'node:zlib';
 
 const BUDGET = 250 * 1000;
-/** Strings only the gateway's code (`src/data/gateway.ts`) and `@tauri-apps/api` contain. */
-const DESKTOP_ONLY = ['gateway_socket_open', '__TAURI_TO_IPC_KEY__', 'plugin:event|listen'];
+/**
+ * Strings only the desktop data layer (`src/data/desktop.tsx`, `src/data/gateway.ts`) and
+ * `@tauri-apps/api` contain.
+ */
+const DESKTOP_ONLY = ['cannot follow the gateway', 'gateway_socket_open', '__TAURI_TO_IPC_KEY__', 'plugin:event|listen'];
 
 const dist = process.argv[2] ?? 'dist';
 const html = readFileSync(join(dist, 'index.html'), 'utf8');

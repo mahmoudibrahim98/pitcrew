@@ -7,8 +7,9 @@ import { cleanup, fireEvent, render, screen, within } from '@testing-library/rea
 import { createMemoryHistory, RouterProvider } from '@tanstack/react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { FakeGateway, helloOnStream, tinyDaemon, type Daemon } from '../../../tests/fake-gateway.ts';
+import { WorkspacesProvider } from '../../data/desktop.tsx';
 import { createGateway } from '../../data/gateway.ts';
-import { WorkspacesProvider, type GatewayWorkspace } from '../../data/workspaces.tsx';
+import type { GatewayWorkspace } from '../../data/workspaces.tsx';
 import { createAppRouter } from '../routes.tsx';
 import { initialShellState, useShell } from '../store.ts';
 

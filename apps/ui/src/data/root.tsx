@@ -1,16 +1,15 @@
 // The app's data layer, chosen once at start: the desktop gateway when the UI runs in the desktop
 // app's webview, HTTP and WebSockets to the configured hub in a browser.
 
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useState, type ComponentType, type ReactNode } from 'react';
 import { createApi } from './api.ts';
 import { browserConfig } from './config.ts';
 import { createQueryClient, DataProvider } from './provider.tsx';
 import { browserTransport, isDesktop } from './transport.ts';
-import { WorkspacesProvider, type Gateway } from './workspaces.tsx';
 
 export function AppData({ children }: { children: ReactNode }) {
   const [desktop] = useState(isDesktop);
-  return desktop ? <DesktopData>{children}</DesktopData> : <BrowserData>{children}</BrowserData>;
+  return desktop ? <LoadDesktop>{children}</LoadDesktop> : <BrowserData>{children}</BrowserData>;
 }
 
 function BrowserData({ children }: { children: ReactNode }) {
@@ -25,15 +24,17 @@ function BrowserData({ children }: { children: ReactNode }) {
   );
 }
 
-/** Loads the gateway, and `@tauri-apps/api` with it, only here: never in a browser. */
-function DesktopData({ children }: { children: ReactNode }) {
-  const [gateway, setGateway] = useState<Gateway>();
+type Root = ComponentType<{ children: ReactNode }>;
+
+/** Loads the desktop data layer, with the gateway and `@tauri-apps/api`: never in a browser. */
+function LoadDesktop({ children }: { children: ReactNode }) {
+  const [Desktop, setDesktop] = useState<{ root: Root }>();
   const [failed, setFailed] = useState<string>();
   useEffect(() => {
     let current = true;
-    import('./gateway.ts').then(
+    import('./desktop.tsx').then(
       (module) => {
-        if (current) setGateway(module.createGateway());
+        if (current) setDesktop({ root: module.DesktopData });
       },
       (error: unknown) => {
         if (current) setFailed(error instanceof Error ? error.message : String(error));
@@ -43,12 +44,12 @@ function DesktopData({ children }: { children: ReactNode }) {
       current = false;
     };
   }, []);
-  if (gateway === undefined) {
+  if (Desktop === undefined) {
     return failed === undefined ? null : (
       <p role="alert" className="p-6 text-sm">
         PitCrew could not start its connection to the desktop app: {failed}
       </p>
     );
   }
-  return <WorkspacesProvider gateway={gateway}>{children}</WorkspacesProvider>;
+  return <Desktop.root>{children}</Desktop.root>;
 }

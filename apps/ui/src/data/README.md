@@ -7,9 +7,10 @@ See `docs/build/streams/L.md`, `docs/build/contracts/api-v1.md` and
 | File | What |
 |---|---|
 | `transport.ts` | The seam every request and socket goes through: `Transport` (`request(method, path, body) → { status, contentType, body }`, `openSocket(path) → TransportSocket`). `browserTransport()`: `fetch` and `WebSocket` with the bearer token (development). `isDesktop()`: `window.__TAURI_INTERNALS__` exists. |
-| `gateway.ts` | The desktop transport: the gateway's commands and channels, exactly as the contract says. No token, header or `VITE_*` value. Loaded only in the desktop app, by dynamic import, with `@tauri-apps/api`; import its types with `import type` only. |
-| `workspaces.tsx` | The desktop app's workspaces: `gateway_workspaces()` and `gateway://workspaces`, and one data scope per workspace. `<WorkspacesProvider>`, `useGatewayWorkspaces()`, `<WorkspaceScope>`. |
-| `root.tsx` | `<AppData>`: picks the transport once, at start. In a browser, `<DataProvider>` over `browserTransport` with `config.ts`; in the desktop app, it loads `gateway.ts` and renders `<WorkspacesProvider>`. |
+| `gateway.ts` | The desktop transport: the gateway's commands and channels, exactly as the contract says. No token, header or `VITE_*` value. |
+| `desktop.tsx` | The desktop app's workspaces: `gateway_workspaces()` and `gateway://workspaces`, and one data scope per workspace (`Workspaces`, `<WorkspacesProvider>`). With `gateway.ts` and `@tauri-apps/api`, loaded only in the desktop app, by dynamic import; elsewhere import from them with `import type` only. |
+| `workspaces.tsx` | What the shell sees of them: `useGatewayWorkspaces()` (`null` in a browser), `<WorkspaceScope ws>`, and the gateway's types. |
+| `root.tsx` | `<AppData>`: picks the transport once, at start. In a browser, `<DataProvider>` over `browserTransport` with `config.ts`; in the desktop app, it loads `desktop.tsx`. |
 | `errors.ts` | `ApiError { code, status }`, and `GatewayError` (an `ApiError` with status 0 and the gateway's own `gateway` code). |
 | `api.ts` | `createApi({ transport })` (or `{ baseUrl, token, fetch }`, which makes a browser transport): every failure is an `ApiError` (status 0 when unreachable, `internal` for a 2xx without JSON). Reads for every list in the contract, one `events` page, transcript pages; writes for projects and workstreams (create), tasks (create, patch, move, assign, subtasks, comment, dispatch), asks (answer), briefs (edit, pin, accept) and sessions (send, keys, interrupt, end). |
 | `config.ts` | `browserConfig()`: `VITE_PITCREW_API` (default `http://127.0.0.1:47317`) and `VITE_PITCREW_TOKEN` (default `dev-device-token`), dev server only; any build fails while the token is set. Called only in a browser. |
