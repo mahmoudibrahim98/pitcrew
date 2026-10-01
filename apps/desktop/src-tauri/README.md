@@ -1,8 +1,9 @@
 # pitcrew-desktop
 
 The PitCrew desktop app (ADR-0003): a Tauri 2 shell around the UI in `apps/ui`, the **gateway**
-that is the webview's only way to a workspace's daemon, and the supervisor of the person's local
-`pitcrewd`. All logic stays in `pitcrewd`.
+that is the webview's only way to a workspace's daemon, the supervisor of the person's local
+`pitcrewd`, and the parts that work in the background: the tray, "needs you" notifications and
+`pitcrew://` deep links. All logic stays in `pitcrewd`.
 
 **Owned by stream K**: see [docs/build/streams/K.md](../../../docs/build/streams/K.md) and the
 [gateway contract](../../../docs/build/contracts/desktop-gateway.md).
@@ -50,6 +51,78 @@ optional; `PITCREW_PITCREWD` and `PITCREW_STATE_DIR` override them:
 
 Without `stateDir` the app uses the daemon's own default, so it finds a `pitcrewd` started by
 hand. Logs go to stderr at `PITCREW_DESKTOP_LOG` (default `info`).
+
+**Preferences.** `preferences.json` beside it is the app's own file, changed from the tray menu
+(the app never writes `settings.json`):
+
+```json
+{ "notifications": true, "quitOnClose": false, "trayHintShown": true }
+```
+
+## In the background (`src/shell.rs`, `src/attention`, `src/notify`, `src/tray.rs`)
+
+- **"Needs you"** (`attention/`). For each workspace that has been `ready`, the gateway keeps its
+  own stream from the daemon, with the token it already holds (never the webview's): `/v1/stream`,
+  then a snapshot (`GET /v1/me`, `GET /v1/asks?to=<me>&state=open`, `GET /v1/members`), then
+  `ask_raised`, `ask_answered` and `member_added`. Only open asks addressed to the person count, as
+  in their Inbox. A broken stream (a close, a broken connection, 60 s of silence) is resumed with
+  `since` after 1 s, doubling to 30 s, or at once when the workspace becomes `ready` again; a new
+  event log (`hello.log` changed, or `since` past the daemon's revision) takes a new snapshot.
+  **Bounds:** one watcher per workspace; 512 asks and 2048 names per workspace (past 512 the count
+  reads "512+", and an answer for an ask not kept asks for a snapshot, at most one a minute); 8 MiB
+  per frame, 16 MiB per snapshot body, 30 s per request.
+- **Notifications** (`notify/`), for each new ask while notifications are on and the window is not
+  in front (visible, focused and not minimised):
+  - title: the asker's name and the kind ("Writer has a question", "… needs a decision", "… asks for
+    a review", "… asks for approval", "… mentioned you"); body: the ask's title and context. Both
+    lose control, bidi and zero-width characters, have their whitespace collapsed, and are cut (the
+    body at 200 characters).
+  - **Rate limit:** asks are gathered for 2 s, and notifications are at least 30 s apart; what
+    arrives meanwhile becomes one ("3 agents need you", "Writer needs you" with "4 new asks").
+  - **A click** navigates: to the ask's task, or the workspace's Inbox (a summary goes to the
+    Inbox). Linux: `org.freedesktop.Notifications` on the session bus, with a `default` action
+    (the body is escaped when the service reads markup); Windows: WinRT toasts
+    (`tauri-winrt-notification`; a release build sends as the app's AppUserModelID, which the
+    installer's shortcut must carry, a debug build as PowerShell's); macOS: the notification centre
+    (`mac-notification-sys`; at most 4 notifications wait for a click, later ones only bring the
+    app forward). No notification service (as in WSLg): logged once, nothing shown.
+  - Nothing is asked of the webview: no notification permission is in its capability.
+- **The tray** (`tray.rs`): "Open PitCrew"; one line per workspace ("Demo Lab — 3 need you"), which
+  opens its Inbox; "Notify me when an agent needs me" and "Quit when the window closes" as check
+  items; "Quit PitCrew" (the daemon stops only if the app started it). Rebuilt at most every
+  250 ms. On Windows a left click opens the window.
+  - **Is there a tray?** Always on Windows and macOS. On Linux only when a StatusNotifierWatcher
+    with a host is on the session bus and libappindicator loads (it is loaded at run time; if it is
+    missing, its loader panics, which the app catches): otherwise no icon.
+- **Closing the window** hides it when there is a tray and "Quit when the window closes" is off;
+  the first time, a notification says so. Without a tray, closing quits, as before.
+
+## Navigation from outside the window (`src/navigate.rs`, `src/scheme.rs`)
+
+The [contract's](../../../docs/build/contracts/desktop-gateway.md) `gateway://navigate`: the app
+emits a `NavigateTarget` (`{ workspace, kind, id? }`) to the main window, then shows and focuses
+it.
+
+- **Deep links** `pitcrew://w/<ws>/inbox` and `pitcrew://w/<ws>/<task|session|project|workstream>/<id>`.
+  The raw text is parsed, never a URL library's normalised form: after the scheme (matched in any
+  case) only `A-Z a-z 0-9 / _ -` may appear, so `..`, `%`-encodings, queries, fragments, user
+  info and ports are refused rather than resolved; the shape must be exact (no empty segment,
+  no trailing `/`); the workspace and ids must round-trip as ULIDs (bare or with their own
+  prefix, any case), or a task's key (`PAP-4`) as written; at most 512 bytes. Anything else is
+  dropped and logged, shortened and redacted. A link only navigates.
+- **Where links come from:** the launch command line (Linux, Windows), the single-instance
+  hand-over from a second launch, and macOS's `Opened` event. Clicks on the app's notifications
+  use the same path.
+- **A link that launched the app** arrives before the UI listens. The latest one is held until
+  the main page calls `gateway_workspaces` (the UI listens to the gateway's events before it
+  reads the list), and held again while the page reloads.
+- **Registering the scheme:** installers do it from `plugins.deep-link.desktop.schemes` in
+  `tauri.conf.json`, which Tauri's bundler reads (the deep-link plugin itself is not used: it
+  would emit every link, unparsed, to the webview). An AppImage or a debug build on Linux
+  registers itself as `xdg-mime default` would: a hidden
+  `$XDG_DATA_HOME/applications/org.pitcrew.desktop-url-handler.desktop`, and that file as the
+  default for `x-scheme-handler/pitcrew` in `$XDG_CONFIG_HOME/mimeapps.list` (only that key).
+  A debug build on Windows is not registered (an installer registers it).
 
 ## The local daemon (`src/daemon`)
 
@@ -129,13 +202,14 @@ invoke('gateway_socket_close', { socket, code, reason })
 - One window, `main`, created in code with its guards: navigation away from the app's origin
   (`tauri://localhost`, `http://tauri.localhost` on Windows, or the dev server in debug builds) is
   refused, new windows and downloads are denied, devtools exist only in debug builds. The
-  single-instance plugin focuses it on a second launch.
+  single-instance plugin focuses it on a second launch (and hands over its deep link).
 - **The capability** (`capabilities/main.json`) gives `main` the five gateway commands and
-  `core:event:allow-listen`/`allow-unlisten`, nothing else: no `core:default`, no shell, fs, http
-  or opener plugin, no emitting events. `build.rs` declares the commands in the app's ACL
-  manifest, so no command runs without a capability naming it. The default `dynamic-acl` feature
-  is off, so none can be added at run time. Tauri 2.12 cannot scope `listen` to one event name;
-  the app emits only `gateway://workspaces`.
+  `core:event:allow-listen`/`allow-unlisten`, nothing else: no `core:default`, no shell, fs, http,
+  opener or notification plugin, no emitting events. `build.rs` declares the commands in the
+  app's ACL manifest, so no command runs without a capability naming it. The default `dynamic-acl`
+  feature is off, so none can be added at run time. Tauri 2.12 cannot scope `listen` to one event
+  name; the app emits only `gateway://workspaces` and `gateway://navigate`, and the webview
+  cannot emit either. The tray, the notifications and the preferences add no command.
 - **The CSP:**
 
   | Directive | Value | Why |
@@ -176,8 +250,15 @@ invoke('gateway_socket_close', { socket, code, reason })
 | File | What |
 |---|---|
 | `gateway.rs` | Requests whatever their status; the 1 MiB and 32 MiB limits; bad paths and methods refused before anything is sent; the error mapping (unknown workspace, daemon down, 503 and 404 on upgrade, `needs_pairing`, an upgrade that never answers); socket order with `close` last and the sink released; 1006; 1009 both ways; 1013 with exactly 8 MiB delivered; a webview that keeps up gets all 16 MiB; Pings; closing; cleanup per page. |
-| `app.rs` | The commands through Tauri's IPC on the mock runtime with the real ACL: another window and other core commands are denied; `gateway://workspaces` on changes; closing the window closes its sockets. |
-| `no_token.rs` | Every command, channel message, event, error and log line (at trace, Tauri's and tungstenite's records included) is searched for a known token; the fake daemon even echoes it in response headers, and fake `pitcrewd`s print it on stderr and in the ready line; a canary record proves the log bridge works. |
+| `app.rs` | The commands through Tauri's IPC on the mock runtime with the real ACL: another window and other core commands are denied; `gateway://workspaces` on changes; closing the window closes its sockets; a deep link held until the main page asks for the workspaces, then `gateway://navigate` with the contract's payload, hostile links dropped, held again on a reload. |
+| `attention.rs` | "Needs you" against the fake daemon's live stream: the snapshot (only the person's open asks), raised and answered, other members' asks and other events ignored, resuming with `since` without a snapshot, the bound and the snapshot it asks for, a new event log, one watcher per ready workspace, and a reconnect at once when the workspace is ready again. |
+| `no_token.rs` | Every command, channel message, event, error and log line (at trace, Tauri's and tungstenite's records included) is searched for a known token; the fake daemon even echoes it in response headers, and fake `pitcrewd`s print it on stderr and in the ready line; the "needs you" subscription (snapshot, live ask, reconnect), the notifications and tray lines it leads to, the navigation events, and a dropped deep link carrying the token are searched too; a canary record proves the log bridge works. |
+
+Unit tests cover the rest: the deep-link parser as a table of hostile links (`navigate.rs`); the
+tracker (`attention/tracker.rs`); the text, the rate limiter and the pacing (`notify/mod.rs`);
+the D-Bus notifier against a fake notification service over a private connection, clicks and
+closes included (`notify/linux.rs`); the tray's lines; closing into the tray (`shell.rs`); the
+preferences; the Linux handler and `mimeapps.list` (`scheme.rs`).
 | `supervisor.rs` | Fake `pitcrewd` scripts: start and SIGTERM on quit; quitting while it starts and while `token show-path` runs; a growing backoff; giving up; never ready; no `pitcrewd`; a running daemon used, its workspace registered, and never stopped; starting our own when that one goes away. |
 
 The OS keychain test is `#[ignore]`d: it needs an unlocked keychain (`cargo test -- --ignored`).
