@@ -51,7 +51,7 @@ pub(crate) struct Config {
     /// sbatch refuses every job with this message.
     sbatch_error: Option<String>,
     /// squeue fails with this message (the controller is down).
-    squeue_error: Option<String>,
+    pub(crate) squeue_error: Option<String>,
     /// Finished jobs stay listed by squeue, as within MinJobAge.
     keep_ended: bool,
     /// sacct fails: accounting is off.
@@ -71,7 +71,8 @@ pub(crate) struct Config {
     /// ends on its own.
     scancel_misses: bool,
     /// srun passes a step's output on a line at a time, holding back a line until it ends (as
-    /// some SLURM versions' I/O forwarding does).
+    /// some SLURM versions' I/O forwarding does), and labels each line with `0: ` where
+    /// `SLURM_LABELIO` is set.
     pub(crate) line_buffered: bool,
 }
 
@@ -528,6 +529,8 @@ fn srun_step(dir: &Path, args: &[String], line_buffered: bool) -> ExitCode {
         eprintln!("srun: error: execve(): {program}: {err}");
         return ExitCode::from(2);
     }
+    // As srun's `--label`, which `SLURM_LABELIO` in its environment turns on.
+    let label = std::env::var_os("SLURM_LABELIO").is_some();
     let mut child = step.stdout(Stdio::piped()).spawn().unwrap();
     let mut from = std::io::BufReader::new(child.stdout.take().unwrap());
     let mut out = std::io::stdout();
@@ -538,7 +541,12 @@ fn srun_step(dir: &Path, args: &[String], line_buffered: bool) -> ExitCode {
             Ok(0) | Err(_) => break,
             Ok(_) => {
                 // A line goes on once it ends (or the output does).
-                if out.write_all(&line).and_then(|()| out.flush()).is_err() {
+                let labelled = if label { &b"0: "[..] } else { b"" };
+                let sent = out
+                    .write_all(labelled)
+                    .and_then(|()| out.write_all(&line))
+                    .and_then(|()| out.flush());
+                if sent.is_err() {
                     break;
                 }
             }

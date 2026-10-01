@@ -22,13 +22,15 @@
 //!
 //! It refuses (exit 255) a tunnel call without the options PitCrew must pass: agent and X11
 //! forwarding and local commands off; for a link also the configured forwardings cleared, host
-//! keys asked about, keepalives set and `ForkAfterAuthentication=no` (and `SHELL=/bin/sh` for a
-//! `ProxyCommand`); for a session no login of its own and `EscapeChar=none`.
+//! keys asked about, keepalives set and `ForkAfterAuthentication=no` (and for a node's
+//! `ProxyCommand`, `SHELL=/bin/sh` and `CanonicalizeHostname=no`); for a session no login of its
+//! own and `EscapeChar=none`.
 //!
 //! The machine's state is in files beside it: `net` (`down`: keepalives time out and new
 //! connections fail; `frozen`: nothing answers and nothing times out, as for a laptop asleep;
 //! absent: up), `no-forwarding` (`AllowStreamLocalForwarding no`; each refusal is counted in
-//! `refused.log`), `forward-fail-once` (the next forward request fails), `max-sessions`
+//! `refused.log`), `forward-fail-once` (the next forward request fails), `forward-silent`
+//! (forwarded connections are taken and never answered), `max-sessions`
 //! (sshd's `MaxSessions`), `drop-after` (seconds a link lasts), `password` (logins to `cluster`
 //! ask for it; each ask is logged to `asked.log` as `text` or `empty`, never the answer). Each
 //! tunnel call is logged to `tunnel.log`.
@@ -59,6 +61,7 @@ pub(crate) const NO_FORWARDING: &str = "no-forwarding";
 /// One line per forwarded channel the machine refused.
 pub(crate) const REFUSED: &str = "refused.log";
 pub(crate) const FORWARD_FAIL_ONCE: &str = "forward-fail-once";
+pub(crate) const FORWARD_SILENT: &str = "forward-silent";
 pub(crate) const MAX_SESSIONS: &str = "max-sessions";
 pub(crate) const DROP_AFTER: &str = "drop-after";
 pub(crate) const PASSWORD: &str = "password";
@@ -305,10 +308,12 @@ fn check_options(call: &Call, kind: &str) -> Result<(), String> {
                 want("ControlMaster", "yes")?;
                 want("ControlPersist", "no")?;
             }
-            if call.option("ProxyCommand").is_some()
-                && std::env::var("SHELL").ok().as_deref() != Some("/bin/sh")
-            {
-                return Err("a ProxyCommand for sh, but SHELL is not /bin/sh".to_owned());
+            if call.option("ProxyCommand").is_some() {
+                if std::env::var("SHELL").ok().as_deref() != Some("/bin/sh") {
+                    return Err("a ProxyCommand for sh, but SHELL is not /bin/sh".to_owned());
+                }
+                // A node's name, as the cluster gave it.
+                want("CanonicalizeHostname", "no")?;
             }
             for keepalive in ["ServerAliveInterval", "ServerAliveCountMax"] {
                 if call
@@ -659,6 +664,12 @@ fn listen_forward(
                         let _ = writeln!(refused, "refused");
                     }
                     drop(client);
+                    return;
+                }
+                if machine.join(FORWARD_SILENT).exists() {
+                    // Taken, never answered, until the client goes.
+                    let mut client = client;
+                    let _ = std::io::copy(&mut client, &mut std::io::sink());
                     return;
                 }
                 wait_up(&machine);

@@ -4,8 +4,8 @@
 
 use crate::slurm::{self as fake_slurm, Config};
 use crate::tunnel_fake::{
-    APP_ENV, ASKED, AppSpec, CLOSE_WRITE, DROP_AFTER, FORWARD_FAIL_ONCE, MAX_SESSIONS, NET,
-    NO_FORWARDING, Net, PASSWORD, REFUSED, TUNNEL_LOG, TunnelCall,
+    APP_ENV, ASKED, AppSpec, CLOSE_WRITE, DROP_AFTER, FORWARD_FAIL_ONCE, FORWARD_SILENT,
+    MAX_SESSIONS, NET, NO_FORWARDING, Net, PASSWORD, REFUSED, TUNNEL_LOG, TunnelCall,
 };
 use crate::unix::{
     Machine, RUN_ENV, Remote, alive, daemon, deploy_and_start, launch_options, me, mode,
@@ -467,7 +467,8 @@ fn tunnel_a_refused_forward_is_not_tried_again() {
 }
 
 /// A job on a node that takes no ssh, with its socket on the node's own disk: the bridge runs
-/// in the job (`srun --jobid <id> --overlap`), started on the login node.
+/// in the job (`srun --jobid <id> --overlap`), started on the login node. A forwarded transport
+/// remembered from elsewhere does not make the login link patient: nothing would watch it.
 fn tunnel_bridge_through_srun_to_a_node_local_socket() {
     let site = Site {
         name: "node-local".to_owned(),
@@ -491,7 +492,11 @@ fn tunnel_bridge_through_srun_to_a_node_local_socket() {
     let rt = runtime();
     let daemon =
         Daemon::new(target(&m), Arc::new(launcher.clone())).with_last_hop(LastHop::SrunOverlap);
-    let connector = start(&rt, daemon, options());
+    let remembered = ConnectorOptions {
+        transport: Some(Transport::Forwarded),
+        ..options()
+    };
+    let connector = start(&rt, daemon, remembered);
     wait_for(
         &rt,
         &connector,
@@ -501,6 +506,14 @@ fn tunnel_bridge_through_srun_to_a_node_local_socket() {
     );
     let data = pattern(200_000, 3);
     assert!(echo(&rt, &connector, &data) == data);
+    let calls = tunnel_calls(&m);
+    let links: Vec<&TunnelCall> = calls.iter().filter(|c| c.kind == "link").collect();
+    assert_eq!(links.len(), 1);
+    assert!(
+        links[0].args.iter().any(|a| a == "ServerAliveCountMax=3"),
+        "{:?}",
+        links[0].args
+    );
 
     let steps = sim.calls("srun");
     let want: Vec<String> = [
@@ -1220,7 +1233,8 @@ fn tunnel_a_forward_that_failed_once_is_not_remembered() {
 }
 
 /// Through srun, which passes a job step's output on a line at a time: the bridge frames its
-/// output, so a reply without a newline still comes at once. And watching starts no job step:
+/// output, so a reply without a newline still comes at once, even where the login node's
+/// environment asks srun to label its lines (`SLURM_LABELIO`). And watching starts no job step:
 /// one proves the way, then one per connection.
 fn tunnel_srun_line_buffering_and_job_steps() {
     let site = Site {
@@ -1243,8 +1257,12 @@ fn tunnel_srun_line_buffering_and_job_steps() {
     crate::unix::block_on(launcher.start(&plain)).unwrap();
 
     let rt = runtime();
-    let daemon =
-        Daemon::new(target(&m), Arc::new(launcher.clone())).with_last_hop(LastHop::SrunOverlap);
+    let labelling = m.fake(Remote {
+        env: vec![("SLURM_LABELIO".to_owned(), "1".to_owned())],
+        ..Remote::default()
+    });
+    let daemon = Daemon::new(reuse(&m, &labelling), Arc::new(launcher.clone()))
+        .with_last_hop(LastHop::SrunOverlap);
     let connector = start(&rt, daemon, options());
     wait_for(
         &rt,
@@ -1412,6 +1430,11 @@ fn tunnel_a_burst_of_failures_makes_one_check() {
     crate::unix::eventually("a check", || checks(&m) > before);
     std::thread::sleep(Duration::from_secs(3));
     assert_eq!(checks(&m) - before, 1, "checks for a burst of 15 failures");
+    // The failures after the first asked too: one more check comes once the gap (10 s) is over,
+    // not none.
+    crate::unix::eventually("the deferred check", || checks(&m) - before == 2);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(checks(&m) - before, 2);
     assert_eq!(links(&m), 1);
     assert!(connector.state().is_connected(), "{}", connector.state());
     std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1527,46 +1550,86 @@ fn tunnel_without_connection_reuse() {
     stop_helper(&m);
 }
 
-/// A link that keeps dropping soon after it connects: each drop counts towards giving up, the
-/// connector ends unreachable, saying so, and waits for a wake or a retry.
+/// A link that keeps dropping soon after it connects: each drop counts towards giving up, and
+/// the connector ends unreachable, saying so. If reconnecting asked the person each time (a
+/// password here, a one-time code in life), it waits for a wake or a retry; if not, it tries
+/// again every `retry_every`.
 fn tunnel_a_link_that_keeps_dropping_is_given_up() {
-    let m = Machine::new();
-    deploy_and_start(&m);
-    std::fs::write(m.dir.path().join(DROP_AFTER), "2").unwrap();
-    let rt = runtime();
-    let launcher = Arc::new(DirectLauncher::new(launch_options()));
+    let keeps_dropping = |s: &LinkState| {
+        matches!(
+            s,
+            LinkState::Unreachable {
+                why: Unreachable::Network,
+                ..
+            }
+        )
+    };
     let short = ConnectorOptions {
         give_up_after: Duration::from_secs(5),
         ..options()
     };
-    let connector = start(&rt, Daemon::new(target(&m), launcher), short);
+    let rt = runtime();
+
+    // Each reconnection asks for the password.
+    let m = Machine::new();
+    deploy_and_start(&m);
+    std::fs::write(m.dir.path().join(DROP_AFTER), "2").unwrap();
+    std::fs::write(m.dir.path().join(PASSWORD), "s3cr3t").unwrap();
+    let answers = Answers::new();
+    let fake = m.fake(Remote::default());
+    let ssh = fake
+        .ssh
+        .clone()
+        .with_multiplex(true)
+        .with_prompts(askpass(), answers.clone());
+    let launcher = Arc::new(DirectLauncher::new(launch_options()));
+    let connector = start(&rt, Daemon::new(on(&m, ssh), launcher), short.clone());
     let state = wait_for(
         &rt,
         &connector,
         "unreachable",
         Duration::from_secs(40),
-        |s| {
-            matches!(
-                s,
-                LinkState::Unreachable {
-                    why: Unreachable::Network,
-                    ..
-                }
-            )
-        },
+        keeps_dropping,
     );
     assert!(state.to_string().contains("keeps dropping"), "{state}");
     let tried = links(&m);
     assert!(tried >= 2, "{tried}");
+    let asked = answers.asked();
     std::thread::sleep(Duration::from_secs(5));
     assert_eq!(links(&m), tried, "it tried again by itself");
-
+    assert_eq!(answers.asked(), asked);
     std::fs::remove_file(m.dir.path().join(DROP_AFTER)).unwrap();
     connector.retry();
     wait_for(
         &rt,
         &connector,
         "connected after the retry",
+        Duration::from_secs(30),
+        connected(Transport::Forwarded),
+    );
+    rt.block_on(connector.close());
+    stop_helper(&m);
+
+    // Reconnecting asks nothing (keys): it goes on trying, every `retry_every` (2 s here).
+    let m = Machine::new();
+    deploy_and_start(&m);
+    std::fs::write(m.dir.path().join(DROP_AFTER), "2").unwrap();
+    let launcher = Arc::new(DirectLauncher::new(launch_options()));
+    let connector = start(&rt, Daemon::new(target(&m), launcher), short);
+    wait_for(
+        &rt,
+        &connector,
+        "unreachable",
+        Duration::from_secs(40),
+        keeps_dropping,
+    );
+    let tried = links(&m);
+    crate::unix::eventually("another try", || links(&m) > tried);
+    std::fs::remove_file(m.dir.path().join(DROP_AFTER)).unwrap();
+    wait_for(
+        &rt,
+        &connector,
+        "connected by itself",
         Duration::from_secs(30),
         connected(Transport::Forwarded),
     );
@@ -1629,6 +1692,283 @@ fn tunnel_a_short_silence_keeps_a_patient_link() {
     assert!(echo(&rt, &connector, &data) == data);
     rt.block_on(connector.close());
     stop_helper(&m);
+}
+
+/// Through srun nothing watches the job (a probe would be a job step): when it ends, the next
+/// connection fails ("Invalid job id"), and that makes the connector ask where the helper is.
+/// The machine is then unreachable, not running, saying why; a new job is picked up.
+fn tunnel_an_srun_job_that_ends_is_noticed() {
+    let site = Site {
+        name: "node-local".to_owned(),
+        socket: SocketPlace::NodeLocal,
+        last_hop: LastHop::SrunOverlap,
+        ..Site::default()
+    };
+    let (m, sim) = fake_slurm::machine(Config::default());
+    let tmp = m.dir.path().join("node-tmp");
+    private_dir(&tmp);
+    sim.set(|c| c.tmpdir = Some(tmp.clone()));
+    let plain = m.plain();
+    pitcrew_remote_deploy(&plain);
+    let script = fake_slurm::render(&plain, &site, &JobOptions::default());
+    let launcher = fake_slurm::launcher(&script);
+    let started = crate::unix::block_on(launcher.start(&plain)).unwrap();
+    let id = started.endpoint.job.unwrap();
+
+    let rt = runtime();
+    let daemon =
+        Daemon::new(target(&m), Arc::new(launcher.clone())).with_last_hop(LastHop::SrunOverlap);
+    let connector = start(&rt, daemon, options());
+    wait_for(
+        &rt,
+        &connector,
+        "connected through srun",
+        Duration::from_secs(30),
+        connected(Transport::Stdio),
+    );
+    sim.fail_node(id);
+    // Nothing notices by itself.
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(connector.state().is_connected(), "{}", connector.state());
+    let err = rt.block_on(connector.connect()).unwrap_err();
+    assert!(
+        matches!(&err, TunnelError::Bridge(why) if why.contains("Invalid job id")),
+        "{err:?}"
+    );
+    let state = wait_for(
+        &rt,
+        &connector,
+        "not running",
+        Duration::from_secs(30),
+        |s| {
+            matches!(
+                s,
+                LinkState::Unreachable {
+                    why: Unreachable::NotRunning,
+                    ..
+                }
+            )
+        },
+    );
+    assert!(state.to_string().contains("ended (NODE_FAIL"), "{state}");
+
+    // A new job.
+    let again = crate::unix::block_on(launcher.start(&plain)).unwrap();
+    assert_ne!(again.endpoint.job, Some(id));
+    wait_for(
+        &rt,
+        &connector,
+        "connected to the new job",
+        Duration::from_secs(30),
+        connected(Transport::Stdio),
+    );
+    let data = pattern(20_000, 37);
+    assert!(echo(&rt, &connector, &data) == data);
+    rt.block_on(connector.close());
+    crate::unix::block_on(launcher.cancel(&plain)).unwrap();
+}
+
+/// A node-local socket is never forwarded, even where the node takes ssh and forwarding works:
+/// its directory goes with the job, and someone else on the node could make it again, which a
+/// forward would not notice. The bridge, which checks who listens, carries the connections.
+fn tunnel_a_node_local_socket_is_never_forwarded() {
+    let site = Site {
+        name: "node-local".to_owned(),
+        socket: SocketPlace::NodeLocal,
+        last_hop: LastHop::Ssh,
+        ..Site::default()
+    };
+    let (m, sim) = fake_slurm::machine(Config::default());
+    let tmp = m.dir.path().join("node-tmp");
+    private_dir(&tmp);
+    sim.set(|c| c.tmpdir = Some(tmp.clone()));
+    let plain = m.plain();
+    pitcrew_remote_deploy(&plain);
+    let script = fake_slurm::render(&plain, &site, &JobOptions::default());
+    let launcher = fake_slurm::launcher(&script);
+    crate::unix::block_on(launcher.start(&plain)).unwrap();
+
+    let rt = runtime();
+    for transport in [None, Some(Transport::Forwarded)] {
+        let chosen = ConnectorOptions {
+            transport,
+            ..options()
+        };
+        let connector = start(
+            &rt,
+            Daemon::new(target(&m), Arc::new(launcher.clone())),
+            chosen,
+        );
+        wait_for(
+            &rt,
+            &connector,
+            "connected to the node",
+            Duration::from_secs(30),
+            connected(Transport::Stdio),
+        );
+        let data = pattern(20_000, 39);
+        assert!(echo(&rt, &connector, &data) == data);
+        rt.block_on(connector.close());
+    }
+    let calls = tunnel_calls(&m);
+    assert!(
+        calls.iter().all(|c| c.op.as_deref() != Some("forward")),
+        "{calls:?}"
+    );
+    // The node's links waited no more than 8 s of silence: nothing else watches them.
+    for link in calls
+        .iter()
+        .filter(|c| c.kind == "link" && c.host == "node017")
+    {
+        assert!(link.args.iter().any(|a| a == "ServerAliveCountMax=3"));
+    }
+    crate::unix::block_on(launcher.cancel(&plain)).unwrap();
+}
+
+/// A forward that worked before (remembered) gives no answer now: the bridge carries the
+/// connections, and the link, started patient for the forward, is started again impatient, so a
+/// lost network is still noticed within ten seconds.
+fn tunnel_a_silent_forward_leaves_no_patient_link() {
+    let m = Machine::new();
+    deploy_and_start(&m);
+    std::fs::write(m.dir.path().join(FORWARD_SILENT), "").unwrap();
+    let rt = runtime();
+    let launcher = Arc::new(DirectLauncher::new(launch_options()));
+    let remembered = ConnectorOptions {
+        transport: Some(Transport::Forwarded),
+        ..options()
+    };
+    let connector = start(&rt, Daemon::new(target(&m), launcher), remembered);
+    wait_for(
+        &rt,
+        &connector,
+        "connected through the bridge",
+        Duration::from_secs(30),
+        connected(Transport::Stdio),
+    );
+    let calls = tunnel_calls(&m);
+    let counts: Vec<bool> = calls
+        .iter()
+        .filter(|c| c.kind == "link")
+        .map(|c| c.args.iter().any(|a| a == "ServerAliveCountMax=14"))
+        .collect();
+    assert_eq!(counts, [true, false], "patient, then not");
+    let lost = Instant::now();
+    net_set(&m, Net::Down);
+    wait_for(
+        &rt,
+        &connector,
+        "unverifiable",
+        Duration::from_secs(15),
+        unverifiable,
+    );
+    let noticed = lost.elapsed();
+    assert!(noticed < Duration::from_secs(10), "{noticed:?}");
+    net_set(&m, Net::Up);
+    std::fs::remove_file(m.dir.path().join(FORWARD_SILENT)).unwrap();
+    wait_for(
+        &rt,
+        &connector,
+        "connected again",
+        Duration::from_secs(30),
+        |s| s.is_connected(),
+    );
+    rt.block_on(connector.close());
+    stop_helper(&m);
+}
+
+/// squeue fails for a while (the controller restarting): each try asks again through the same
+/// login, never signing in again for it.
+fn tunnel_a_failing_endpoint_check_keeps_the_login() {
+    let (m, sim, launcher, _id) = job(&fake_slurm_generic(), Config::default());
+    sim.set(|c| {
+        c.squeue_error = Some(
+            "slurm_load_jobs error: Unable to contact slurm controller (connect failure)"
+                .to_owned(),
+        );
+    });
+    let rt = runtime();
+    let connector = start(
+        &rt,
+        Daemon::new(target(&m), Arc::new(launcher.clone())),
+        options(),
+    );
+    let state = wait_for(
+        &rt,
+        &connector,
+        "unverifiable",
+        Duration::from_secs(30),
+        unverifiable,
+    );
+    assert!(state.to_string().contains("Unable to contact"), "{state}");
+    // Several back-off steps (200 ms to 2 s).
+    let tries = || sim.calls("squeue").len();
+    crate::unix::eventually("four tries", || tries() >= 4);
+    let logins = |m: &Machine| {
+        tunnel_calls(m)
+            .iter()
+            .filter(|c| c.kind == "link" && c.host == "cluster")
+            .count()
+    };
+    assert_eq!(logins(&m), 1, "signed in again for a failing squeue");
+    sim.set(|c| c.squeue_error = None);
+    wait_for(
+        &rt,
+        &connector,
+        "connected",
+        Duration::from_secs(30),
+        connected(Transport::Forwarded),
+    );
+    assert_eq!(logins(&m), 1);
+    rt.block_on(connector.close());
+    crate::unix::block_on(launcher.cancel(&m.plain())).unwrap();
+}
+
+/// Without connection reuse (Windows) each endpoint check is a login of its own: once one asked
+/// for a password, a queued job is asked about no more often than `retry_every`, not at every
+/// back-off step.
+fn tunnel_polling_that_asks_for_a_password_is_rare() {
+    let (m, sim) = fake_slurm::machine(Config::default());
+    sim.set(|c| c.start = false);
+    let plain = m.plain();
+    pitcrew_remote_deploy(&plain);
+    let script = fake_slurm::render(&plain, &fake_slurm_generic(), &JobOptions::default());
+    let launcher = fake_slurm::launcher(&script);
+    crate::unix::block_on(launcher.submit(&plain)).unwrap();
+    std::fs::write(m.dir.path().join(PASSWORD), "s3cr3t").unwrap();
+    let answers = Answers::new();
+    let fake = m.fake(Remote::default());
+    let ssh = fake
+        .ssh
+        .clone()
+        .with_multiplex(false)
+        .with_prompts(askpass(), answers.clone());
+    let rt = runtime();
+    let polling = ConnectorOptions {
+        retry_every: Duration::from_secs(30),
+        ..options()
+    };
+    let connector = start(
+        &rt,
+        Daemon::new(on(&m, ssh), Arc::new(launcher.clone())),
+        polling,
+    );
+    let state = wait_for(
+        &rt,
+        &connector,
+        "queued",
+        Duration::from_secs(30),
+        unverifiable,
+    );
+    assert!(state.to_string().contains("pending"), "{state}");
+    let asked = answers.asked();
+    std::thread::sleep(Duration::from_secs(6));
+    assert_eq!(answers.asked(), asked, "asked again within retry_every");
+    // A retry asks now.
+    connector.retry();
+    crate::unix::eventually("asked after the retry", || answers.asked() > asked);
+    rt.block_on(connector.close());
+    crate::unix::block_on(launcher.cancel(&plain)).unwrap();
 }
 
 // ─── The bridge alone ──────────────────────────────────────────────────────────────────────
@@ -1876,6 +2216,26 @@ pub(crate) const CASES: &[(&str, fn())] = &[
     (
         "tunnel_a_short_silence_keeps_a_patient_link",
         tunnel_a_short_silence_keeps_a_patient_link,
+    ),
+    (
+        "tunnel_an_srun_job_that_ends_is_noticed",
+        tunnel_an_srun_job_that_ends_is_noticed,
+    ),
+    (
+        "tunnel_a_node_local_socket_is_never_forwarded",
+        tunnel_a_node_local_socket_is_never_forwarded,
+    ),
+    (
+        "tunnel_a_silent_forward_leaves_no_patient_link",
+        tunnel_a_silent_forward_leaves_no_patient_link,
+    ),
+    (
+        "tunnel_a_failing_endpoint_check_keeps_the_login",
+        tunnel_a_failing_endpoint_check_keeps_the_login,
+    ),
+    (
+        "tunnel_polling_that_asks_for_a_password_is_rare",
+        tunnel_polling_that_asks_for_a_password_is_rare,
     ),
     (
         "bridge_is_byte_exact_both_ways",
