@@ -6,6 +6,10 @@
 //! does (re-asking after a failure, and "sending" whatever it got, an empty string when askpass
 //! failed), writes its own failures to the `-E` log, and prints canned output. Hence
 //! `harness = false` and a small runner below.
+//!
+//! With `PITCREW_FAKE_APP` set, the binary plays the PitCrew app instead: it runs one call and
+//! quits abruptly as soon as it is asked for a password, the way a crash or a forced quit
+//! would.
 
 // Test code; clippy's allow-unwrap-in-tests only sees `#[test]` functions.
 #![allow(clippy::unwrap_used)]
@@ -27,6 +31,10 @@ const LOG: &str = "log.json";
 /// One line per credential the fake "sent" to the server: `text`, or `empty` when askpass
 /// failed.
 const SENT: &str = "sent.log";
+/// The pid of a child the fake leaves behind (see [`Scenario::linger`]).
+const LINGER: &str = "linger.pid";
+/// Makes the binary play the app, running the fake in this directory.
+const APP: &str = "PITCREW_FAKE_APP";
 
 /// The askpass binary. `PITCREW_TEST_ASKPASS` overrides it for test binaries run on another
 /// system than the one that built them (e.g. cross-built for Windows).
@@ -61,6 +69,10 @@ struct Scenario {
     /// Run the remote command with this login shell (`<shell> -c <command>`), like sshd.
     #[serde(default)]
     login_shell: Option<String>,
+    /// Leave a child behind that holds stdout and stderr open (like a wrapper-script
+    /// `ProxyCommand`), and exit at once (Unix).
+    #[serde(default)]
+    linger: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -84,6 +96,7 @@ struct Notice {
 
 #[derive(Serialize, Deserialize)]
 struct Log {
+    pid: u32,
     args: Vec<String>,
     askpass: Option<String>,
     askpass_require: Option<String>,
@@ -95,7 +108,29 @@ fn main() -> ExitCode {
     if let Some(code) = act_as_ssh() {
         return ExitCode::from(code);
     }
+    if let Some(dir) = std::env::var_os(APP) {
+        return act_as_app(Path::new(&dir));
+    }
     run_tests()
+}
+
+// ─── The fake app ───────────────────────────────────────────────────────────────────────────
+
+/// Runs one call against the fake in `dir`, and quits the whole process when asked for
+/// anything: no destructors run, so nothing kills ssh on the way out.
+fn act_as_app(dir: &Path) -> ExitCode {
+    struct Quit;
+    impl PromptHandler for Quit {
+        fn prompt(&self, _: PromptRequest, _: PromptCancel) -> PromptFuture<'_> {
+            std::process::exit(0)
+        }
+    }
+    let ssh = Ssh::new(dir.join(format!("ssh{}", std::env::consts::EXE_SUFFIX)))
+        .with_runtime_dir(dir.join("rt"))
+        .with_prompts(askpass(), Arc::new(Quit));
+    let _ = block_on(ssh.run("cluster", &["true"]));
+    // Not asked: the scenario was wrong.
+    ExitCode::from(3)
 }
 
 // ─── The fake ssh ───────────────────────────────────────────────────────────────────────────
@@ -111,6 +146,7 @@ fn act_as_ssh() -> Option<u8> {
 fn fake_ssh(scenario: &Scenario, dir: &Path) -> u8 {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let log = Log {
+        pid: std::process::id(),
         args: args.clone(),
         askpass: std::env::var("SSH_ASKPASS").ok(),
         askpass_require: std::env::var("SSH_ASKPASS_REQUIRE").ok(),
@@ -192,6 +228,17 @@ fn fake_ssh(scenario: &Scenario, dir: &Path) -> u8 {
                 .unwrap_or(1),
             Err(_) => 127,
         };
+    }
+    if scenario.linger && cfg!(unix) {
+        // A background `sleep` that keeps our stdout and stderr, and writes its pid.
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30 & echo $! > \"$1\"")
+            .arg("sh")
+            .arg(dir.join(LINGER))
+            .status()
+            .unwrap();
+        return if status.success() { 0 } else { 1 };
     }
     std::thread::sleep(Duration::from_millis(scenario.sleep_ms));
     let tag = command
@@ -432,6 +479,8 @@ fn exact_argument_list() {
         "-E",
         log.args[2].as_str(),
         "-o",
+        "LogLevel=ERROR",
+        "-o",
         "ForwardAgent=no",
         "-o",
         "ForwardX11=no",
@@ -509,6 +558,13 @@ fn exact_argument_list() {
         .ssh()
         .with_prompts("pitcrew-askpass", Handler::new(|_| None));
     let err = block_on(ssh.run("cluster", &["true"])).unwrap_err();
+    assert!(matches!(err, SshError::InvalidArgument(_)), "{err:?}");
+    assert!(!fake.ran());
+
+    // A command over the platform's limit (32,767 characters for all of ssh's command line on
+    // Windows) is refused as an argument, before spawning.
+    let big = "x".repeat(pitcrew_remote::quote::MAX_REMOTE_COMMAND / 4);
+    let err = block_on(fake.ssh().run("cluster", &["echo", &big])).unwrap_err();
     assert!(matches!(err, SshError::InvalidArgument(_)), "{err:?}");
     assert!(!fake.ran());
 }
@@ -695,6 +751,102 @@ fn host_key_prompt() {
     assert!(matches!(err, SshError::HostKeyRejected { .. }), "{err:?}");
 }
 
+/// `UpdateHostKeys=ask` in the user's config: a yes/no question. Accept says yes; Cancel says
+/// no and the call goes on, since no credential is involved.
+fn updated_host_keys_are_a_yes_no_question() {
+    let answers: [(&str, Answer); 2] = [
+        ("yes", |_| Some(Reply::Accept)),
+        ("no", |_| Some(Reply::Cancel)),
+    ];
+    for (expect, answer) in answers {
+        let fake = Fake::new(&Scenario {
+            prompts: vec![ScriptedPrompt {
+                text: "Accept updated hostkeys? (yes/no): ".to_owned(),
+                hint: None,
+                expect: expect.to_owned(),
+                tries: 1,
+                sent: false,
+                fail_log: "unexpected answer".to_owned(),
+            }],
+            stdout: "in\n".into(),
+            ..Scenario::default()
+        });
+        let handler = Handler::new(answer);
+        let ssh = fake.ssh().with_prompts(askpass(), handler.clone());
+        let out = block_on(ssh.run("cluster", &["true"])).unwrap();
+        assert_eq!(out.stdout_text(), "in\n", "{expect}");
+        assert_eq!(
+            handler.kinds(),
+            [("cluster".to_owned(), PromptKind::Confirm)]
+        );
+    }
+}
+
+/// The app quits or crashes while a password prompt is open. Nothing kills ssh on the way out,
+/// so askpass sees the bridge close without an answer. It must stop ssh rather than fail, or
+/// ssh sends an empty password and asks again, up to three times.
+fn quitting_mid_prompt_sends_nothing() {
+    if !cfg!(unix) {
+        // On Windows the Job Object ends ssh together with the app.
+        return;
+    }
+    let fake = Fake::new(&Scenario {
+        prompts: vec![password("s3cr3t")],
+        stdout: "in\n".into(),
+        ..Scenario::default()
+    });
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .env(APP, fake.dir.path())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(0), "the app was not asked");
+    let pid = fake.log().pid;
+    eventually("the fake ssh to be gone", || !alive(pid));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(fake.sent(), Vec::<String>::new());
+}
+
+/// Whether process `pid` still exists (Unix).
+fn alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        i32::try_from(pid)
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+            .is_some_and(|pid| rustix::process::test_kill_process(pid).is_ok())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// ssh exits, but a child it started (a wrapper-script `ProxyCommand`, say) holds its output
+/// open. The call times out, and the child is killed with the group: output is read to the end
+/// before ssh is reaped, so the group id is still safe to signal.
+fn a_lingering_child_is_killed_with_the_group() {
+    if !cfg!(unix) {
+        return;
+    }
+    let fake = Fake::new(&Scenario {
+        linger: true,
+        ..Scenario::default()
+    });
+    let limits = Limits {
+        max_output: None,
+        timeout: Some(Duration::from_secs(1)),
+    };
+    let err = block_on(fake.ssh().run_limited("cluster", &["true"], limits)).unwrap_err();
+    assert!(matches!(err, SshError::TimedOut(_)), "{err:?}");
+    let child: u32 = std::fs::read_to_string(fake.dir.path().join(LINGER))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    eventually("the lingering child to be killed", || !alive(child));
+}
+
 /// ssh closes a notice (e.g. after a security-key touch) by killing askpass: the handler's
 /// token fires and the call goes on.
 fn a_closed_notice_goes_stale() {
@@ -793,6 +945,21 @@ fn timeouts_and_exit_codes() {
     let out = block_on(fake.ssh().run("cluster", &["false"])).unwrap();
     assert_eq!(out.code, Some(255));
     assert_eq!(out.stderr, b"Host key verification failed.\n");
+
+    // And one where ssh logged only something informational.
+    let fake = Fake::new(&Scenario {
+        ssh_log: "Warning: Permanently added 'cluster' (ED25519) to the list of known hosts.\n"
+            .into(),
+        exit: 255,
+        ..Scenario::default()
+    });
+    let out = block_on(fake.ssh().run("cluster", &["false"])).unwrap();
+    assert_eq!(out.code, Some(255));
+
+    // A disconnect reason is the server's text: it shows a failure, but picks no error kind.
+    let err =
+        failing("Received disconnect from 192.0.2.1 port 22:2: x\nHost key verification failed.\n");
+    assert!(matches!(err, SshError::Ssh { code: 255, .. }), "{err:?}");
 }
 
 fn limits_stop_ssh() {
@@ -855,6 +1022,24 @@ fn resolve_uses_ssh_g() {
     assert_eq!(host.port, 2222);
     assert_eq!(host.proxy_jump.as_deref(), Some("gateway"));
     assert_eq!(fake.log().args, ["-G", "--", "cluster"]);
+
+    // `ssh -G` runs the config's `Match exec` commands, which may hang.
+    let fake = Fake::new(&Scenario {
+        sleep_ms: 60_000,
+        ..Scenario::default()
+    });
+    let limits = Limits {
+        timeout: Some(Duration::from_secs(1)),
+        ..pitcrew_remote::RESOLVE_LIMITS
+    };
+    let start = Instant::now();
+    let err = block_on(fake.ssh().resolve_with("cluster", limits)).unwrap_err();
+    assert!(matches!(err, SshError::TimedOut(_)), "{err:?}");
+    assert!(start.elapsed() < Duration::from_secs(10));
+    assert_eq!(
+        pitcrew_remote::RESOLVE_LIMITS.timeout,
+        Some(Duration::from_secs(10))
+    );
 }
 
 /// Runs the probe against canned output, where `{TAG}` stands for the call's tag.
@@ -1062,13 +1247,25 @@ fn run_tests() -> ExitCode {
             cancel_sends_no_empty_credential,
         ),
         ("host_key_prompt", host_key_prompt),
+        (
+            "updated_host_keys_are_a_yes_no_question",
+            updated_host_keys_are_a_yes_no_question,
+        ),
         ("a_closed_notice_goes_stale", a_closed_notice_goes_stale),
         (
             "dropping_the_call_cancels_a_pending_prompt",
             dropping_the_call_cancels_a_pending_prompt,
         ),
+        (
+            "quitting_mid_prompt_sends_nothing",
+            quitting_mid_prompt_sends_nothing,
+        ),
         ("timeouts_and_exit_codes", timeouts_and_exit_codes),
         ("limits_stop_ssh", limits_stop_ssh),
+        (
+            "a_lingering_child_is_killed_with_the_group",
+            a_lingering_child_is_killed_with_the_group,
+        ),
         ("resolve_uses_ssh_g", resolve_uses_ssh_g),
         ("probe_linux", probe_linux),
         ("probe_macos", probe_macos),

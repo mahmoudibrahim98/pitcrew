@@ -34,15 +34,15 @@ pub fn default_runtime_dirs() -> Vec<PathBuf> {
     vec![std::env::temp_dir().join("pitcrew-ssh")]
 }
 
-/// The first of `candidates` that is, or can be made, a private directory with a name ssh reads
-/// literally.
+/// The first of `candidates` whose name suits the call (see [`check_dir_name`]) and that is, or
+/// can be made, a private directory. An unsuitable candidate falls through to the next.
 ///
 /// # Errors
 /// Every candidate failed; the error is the first one's.
-pub fn pick_runtime_dir(candidates: &[PathBuf]) -> io::Result<PathBuf> {
+pub fn pick_runtime_dir(candidates: &[PathBuf], multiplex: bool) -> io::Result<PathBuf> {
     let mut first_error = None;
     for dir in candidates {
-        match check_dir_name(dir).and_then(|()| ensure_private_dir(dir)) {
+        match check_dir_name(dir, multiplex).and_then(|()| ensure_private_dir(dir)) {
             Ok(()) => return Ok(dir.clone()),
             Err(e) => {
                 first_error.get_or_insert(e);
@@ -53,12 +53,25 @@ pub fn pick_runtime_dir(candidates: &[PathBuf]) -> io::Result<PathBuf> {
         .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no runtime directory")))
 }
 
-/// The runtime directory goes into `ControlPath` and `-E`, so its name must be absolute, UTF-8,
-/// and free of what ssh would expand there (`%`, `$`, a leading `~`) or what would split it.
+/// Longest socket path used: `sun_path` holds 104 bytes on macOS and 108 on Linux.
+const MAX_SOCKET_PATH: usize = 100;
+/// What ssh adds to the directory for a control socket: `/`, the 40-character `%C`, and a
+/// 17-character suffix while it creates the socket.
+const CONTROL_SUFFIX: usize = 1 + 40 + 17;
+/// What the askpass socket adds: `/ask-` and 16 hex digits.
+const ASKPASS_SUFFIX: usize = 5 + 16;
+
+/// Whether `dir` can hold this call's files:
+/// - always: an absolute UTF-8 path without control characters (it goes into `-E`, which ssh
+///   takes literally);
+/// - Unix: short enough for the askpass socket;
+/// - with connection reuse (`multiplex`), also usable in `ControlPath`: no blanks (the option
+///   parser splits there), no quotes, `%` or `$` (ssh expands those), and short enough for the
+///   control socket.
 ///
 /// # Errors
 /// `InvalidInput` naming the problem.
-pub fn check_dir_name(dir: &Path) -> io::Result<()> {
+pub fn check_dir_name(dir: &Path, multiplex: bool) -> io::Result<()> {
     let invalid = |why: &str| {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -71,11 +84,22 @@ pub fn check_dir_name(dir: &Path) -> io::Result<()> {
     if !dir.is_absolute() {
         return invalid("not an absolute path");
     }
-    if text
-        .chars()
-        .any(|c| c.is_control() || matches!(c, '%' | '$' | '"' | '\''))
-    {
-        return invalid("contains a quote, '%', '$' or a control character");
+    if text.chars().any(char::is_control) {
+        return invalid("contains a control character");
+    }
+    if cfg!(unix) && text.len() + ASKPASS_SUFFIX > MAX_SOCKET_PATH {
+        return invalid("too long for a socket path");
+    }
+    if multiplex {
+        if text
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '%' | '$' | '"' | '\''))
+        {
+            return invalid("contains a blank, a quote, '%' or '$', which ControlPath cannot take");
+        }
+        if text.len() + CONTROL_SUFFIX > MAX_SOCKET_PATH {
+            return invalid("too long for a control socket path");
+        }
     }
     Ok(())
 }
@@ -144,20 +168,67 @@ pub fn euid() -> u32 {
 mod tests {
     use super::*;
 
+    /// An absolute path in the platform's form.
+    fn abs(unix: &str) -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(format!(r"C:{}", unix.replace('/', r"\")))
+        } else {
+            PathBuf::from(unix)
+        }
+    }
+
     #[test]
-    fn names_ssh_would_expand_are_refused() {
+    fn names_ssh_would_expand_are_refused_for_control_path() {
         for bad in [
-            "relative/dir",
             "/tmp/50%",
             "/tmp/$HOME",
             "/tmp/a'b",
-            "/tmp/a\nb",
+            "/tmp/a\"b",
+            "/tmp/a b",
         ] {
-            assert!(check_dir_name(Path::new(bad)).is_err(), "{bad:?}");
+            assert!(check_dir_name(&abs(bad), true).is_err(), "{bad:?}");
+            // Without ControlPath (e.g. on Windows) only `-E` sees it, which is literal:
+            // a user named O'Brien must not break every call.
+            check_dir_name(&abs(bad), false).unwrap();
         }
-        if cfg!(unix) {
-            check_dir_name(Path::new("/run/user/1000/pitcrew-ssh")).unwrap();
+        for bad in ["relative/dir", "/tmp/a\nb", "/tmp/a\u{7f}b"] {
+            let bad = if bad.starts_with('/') {
+                abs(bad)
+            } else {
+                PathBuf::from(bad)
+            };
+            assert!(check_dir_name(&bad, false).is_err(), "{bad:?}");
+            assert!(check_dir_name(&bad, true).is_err(), "{bad:?}");
         }
+        check_dir_name(&abs("/run/user/1000/pitcrew-ssh"), true).unwrap();
+    }
+
+    #[test]
+    fn lengths_are_checked_for_the_sockets() {
+        // Fits the askpass socket but not a control socket.
+        let medium = abs(&format!("/{}", "m".repeat(60)));
+        assert!(check_dir_name(&medium, true).is_err());
+        check_dir_name(&medium, false).unwrap();
+        let long = abs(&format!("/{}", "l".repeat(90)));
+        assert!(check_dir_name(&long, true).is_err());
+        // Windows has no socket paths to fit.
+        assert_eq!(check_dir_name(&long, false).is_ok(), cfg!(windows));
+    }
+
+    /// Candidates with unsuitable names fall through to the next, instead of failing the call.
+    #[cfg(unix)]
+    #[test]
+    fn unsuitable_names_fall_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spaced = tmp.path().join("with space");
+        let long = tmp.path().join("x".repeat(60));
+        let good = tmp.path().join("ok");
+        let picked = pick_runtime_dir(&[spaced.clone(), long.clone(), good.clone()], true);
+        assert_eq!(picked.unwrap(), good);
+        assert!(!spaced.exists() && !long.exists());
+        // Without connection reuse the spaced name is fine.
+        let picked = pick_runtime_dir(&[spaced.clone(), good], false);
+        assert_eq!(picked.unwrap(), spaced);
     }
 
     #[cfg(unix)]
@@ -195,7 +266,8 @@ mod tests {
         std::os::unix::fs::symlink(&squatted, &link).unwrap();
         let fallback = tmp.path().join("home/.pitcrew/s");
 
-        let picked = pick_runtime_dir(&[squatted.clone(), file, link, fallback.clone()]).unwrap();
+        let picked =
+            pick_runtime_dir(&[squatted.clone(), file, link, fallback.clone()], true).unwrap();
         assert_eq!(picked, fallback);
         let mode = std::fs::metadata(&fallback).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
@@ -203,7 +275,7 @@ mod tests {
         let mode = std::fs::metadata(&squatted).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o777);
 
-        let err = pick_runtime_dir(&[squatted]).unwrap_err();
+        let err = pick_runtime_dir(&[squatted], true).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 

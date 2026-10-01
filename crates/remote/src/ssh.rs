@@ -23,15 +23,30 @@
 //! from the environment, so they fail rather than prompt.
 //!
 //! **Stopping.** A cancelled prompt, a [`Limits`] breach, or dropping the call's future stops
-//! ssh. On Unix ssh runs in its own process group, and the whole group is killed: ssh, its
-//! askpass programs and any `ProxyJump` ssh, before any of them can send an empty credential.
-//! On Windows only ssh itself is killed.
+//! ssh together with everything it started (its askpass programs, `ProxyJump` hops, `Match
+//! exec` commands), before any of them can send an empty credential:
+//! - Unix: ssh runs in its own process group, and the group is killed. Output is read to the
+//!   end before ssh is reaped, so the group id stays reserved (and the kill safe) as long as a
+//!   member can still hold the call up.
+//! - Windows: ssh runs in a Job Object (see `job.rs`, the crate's only unsafe code), which is
+//!   terminated; the OS also ends it if PitCrew exits or crashes. ssh joins the job right after
+//!   it starts (std cannot create it suspended), so a child started in the first microseconds
+//!   would escape it. ssh starts none that early: it first loads and reads its config.
+//!
+//! If PitCrew quits or crashes while a prompt is open, `pitcrew-askpass` stops the ssh that
+//! asked instead of failing (see [`crate::askpass`]).
 //!
 //! **Errors.** ssh's own messages go to a log file (`-E`) in the private runtime directory, apart
-//! from the remote command's stderr. Exit 255 is ssh's failure code, and it is mapped to an
-//! [`SshError`] by what ssh logged, never by what the remote command printed. When ssh logged
-//! nothing, the 255 is the remote command's own and comes back as an [`Output`]. (With
-//! `LogLevel QUIET` in the user's config, ssh's own failures look like that too.)
+//! from the remote command's stderr, at `LogLevel=ERROR`: informational lines ("Permanently
+//! added…") and server-sent keyboard-interactive text never reach it. Exit 255 is ssh's failure
+//! code; it is an [`SshError`] only when that log shows ssh failing, and the kind of error comes
+//! only from ssh's own message formats, matched whole lines at a time. Lines that carry server
+//! text (a disconnect reason, the server's algorithm offer) count as a failure but are never
+//! read further, nor is anything after them, since the text may contain newlines. A 255 without
+//! such a log is the remote command's own and comes back as an [`Output`].
+//!
+//! **Resolving** with `ssh -G` may run `Match exec` commands, so it is bounded by
+//! [`RESOLVE_LIMITS`].
 
 use crate::askpass::PromptHandler;
 use crate::askpass::server::AskpassServer;
@@ -50,6 +65,12 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// How much of ssh's log is read to explain a failure.
 const MAX_LOG: u64 = 64 * 1024;
+
+/// Bounds for [`Ssh::resolve`]: 1 MiB of output and 10 seconds.
+pub const RESOLVE_LIMITS: Limits = Limits {
+    max_output: Some(1024 * 1024),
+    timeout: Some(Duration::from_secs(10)),
+};
 
 /// Why an ssh call failed.
 #[derive(Debug, thiserror::Error)]
@@ -124,6 +145,9 @@ pub enum SshError {
     /// The remote command ran but printed something unexpected.
     #[error("unexpected output: {0}")]
     UnexpectedOutput(String),
+    /// The host's login shell cannot carry commands safely (see [`crate::quote`]).
+    #[error("the login shell {0:?} is not supported")]
+    UnsupportedShell(String),
 }
 
 /// The last non-empty line, with control characters (e.g. terminal escapes a server sent)
@@ -255,8 +279,10 @@ impl Ssh {
 
     /// Where control sockets, askpass sockets and ssh's logs go, instead of the defaults
     /// (`$XDG_RUNTIME_DIR/pitcrew-ssh`, `/tmp/pitcrew-ssh-<uid>`, then `~/.pitcrew/s` on Unix;
-    /// `%TEMP%\pitcrew-ssh` on Windows). It is created 0700 if missing, and refused if it exists
-    /// and is not private, or if its name has `%`, `$`, quotes or control characters.
+    /// `%TEMP%\pitcrew-ssh` on Windows; the first that suits the call wins). It is created 0700
+    /// if missing, and refused if it exists and is not private, or if its name does not suit
+    /// the call: see `private::check_dir_name` (with connection reuse: no blanks, quotes, `%`
+    /// or `$`, and short enough for a socket path).
     #[must_use]
     pub fn with_runtime_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.runtime_dir = Some(dir.into());
@@ -283,7 +309,7 @@ impl Ssh {
             Some(dir) => vec![dir.clone()],
             None => crate::private::default_runtime_dirs(),
         };
-        crate::private::pick_runtime_dir(&candidates).map_err(SshError::Setup)
+        crate::private::pick_runtime_dir(&candidates, self.multiplex).map_err(SshError::Setup)
     }
 
     /// The full argument list, without the program itself.
@@ -301,6 +327,8 @@ impl Ssh {
             self.connect_timeout.as_secs() + u64::from(self.connect_timeout.subsec_nanos() > 0);
         let mut args: Vec<String> = vec!["-T".into(), "-E".into(), log.into()];
         for option in [
+            // Only ssh's own errors in the log: no server text, no informational lines.
+            "LogLevel=ERROR",
             "ForwardAgent=no",
             "ForwardX11=no",
             "PermitLocalCommand=no",
@@ -391,38 +419,7 @@ impl Ssh {
                 None
             }
         };
-        let mut child = Running::spawn(command)?;
-        let outcome = {
-            let refused = async {
-                match &server {
-                    Some(server) => server.wait_refused().await,
-                    None => std::future::pending().await,
-                }
-            };
-            let expired = async {
-                match limits.timeout {
-                    Some(after) => {
-                        expire(after, server.as_ref().map(AskpassServer::open_prompts)).await;
-                        after
-                    }
-                    None => std::future::pending().await,
-                }
-            };
-            tokio::select! {
-                done = collect(&mut child.0, limits.max_output) => done,
-                () = refused => Err(SshError::Cancelled),
-                after = expired => Err(SshError::TimedOut(after)),
-            }
-        };
-        let (status, stdout, stderr) = match outcome {
-            Ok(done) => done,
-            Err(e) => {
-                // Kill before the server goes: a cancelled prompt is answered only by its
-                // connection closing, when nothing is left to act on it.
-                child.kill().await;
-                return Err(e);
-            }
-        };
+        let (status, stdout, stderr) = drive(command, server.as_ref(), limits).await?;
         let refused = server.as_ref().is_some_and(AskpassServer::refused);
         drop(server);
         let code = status.code();
@@ -431,10 +428,10 @@ impl Ssh {
                 return Err(SshError::Cancelled);
             }
             let said = log.read();
-            if !said.trim().is_empty() {
-                let mut detail = said.clone();
-                detail.push_str(&String::from_utf8_lossy(&stderr));
-                return Err(classify_failure(&said, detail));
+            let mut detail = said.clone();
+            detail.push_str(&String::from_utf8_lossy(&stderr));
+            if let Some(failure) = classify_failure(&said, detail) {
+                return Err(failure);
             }
         }
         Ok(Output {
@@ -444,23 +441,31 @@ impl Ssh {
         })
     }
 
-    /// Asks ssh what `host` resolves to (`ssh -G`), honouring the user's config exactly. Does
-    /// not connect.
+    /// Asks ssh what `host` resolves to (`ssh -G`), honouring the user's config exactly, within
+    /// [`RESOLVE_LIMITS`]: the config's `Match exec` commands run here. Does not connect.
     ///
     /// # Errors
-    /// The host is refused, ssh fails, or its output lacks a host name.
+    /// The host is refused, ssh fails or breaks the limits, or its output lacks a host name.
     pub async fn resolve(&self, host: &str) -> Result<ResolvedHost, SshError> {
+        self.resolve_with(host, RESOLVE_LIMITS).await
+    }
+
+    /// [`Ssh::resolve`] with other limits.
+    ///
+    /// # Errors
+    /// As [`Ssh::resolve`].
+    pub async fn resolve_with(&self, host: &str, limits: Limits) -> Result<ResolvedHost, SshError> {
         validate_host(host)?;
         let mut command = self.command();
         command.args(["-G", "--", host]);
-        let out = command.output().await.map_err(SshError::Spawn)?;
-        if !out.status.success() {
+        let (status, stdout, stderr) = drive(command, None, limits).await?;
+        if !status.success() {
             return Err(SshError::Ssh {
-                code: out.status.code().unwrap_or(-1),
-                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+                code: status.code().unwrap_or(-1),
+                stderr: String::from_utf8_lossy(&stderr).into_owned(),
             });
         }
-        parse_resolved(&String::from_utf8_lossy(&out.stdout))
+        parse_resolved(&String::from_utf8_lossy(&stdout))
     }
 
     fn command(&self) -> tokio::process::Command {
@@ -479,46 +484,118 @@ impl Ssh {
     }
 }
 
-/// A running ssh. Dropping it kills ssh (tokio's `kill_on_drop`) and, on Unix, first its whole
-/// process group.
-struct Running(tokio::process::Child);
+/// Runs `command` to the end: its exit status, stdout and stderr. Stops it, with everything it
+/// started, when the user cancels a prompt of `server` or the call breaks `limits`.
+async fn drive(
+    command: tokio::process::Command,
+    server: Option<&AskpassServer>,
+    limits: Limits,
+) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), SshError> {
+    let mut child = Running::spawn(command)?;
+    let outcome = {
+        let refused = async {
+            match server {
+                Some(server) => server.wait_refused().await,
+                None => std::future::pending().await,
+            }
+        };
+        let expired = async {
+            match limits.timeout {
+                Some(after) => {
+                    expire(after, server.map(AskpassServer::open_prompts)).await;
+                    after
+                }
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            done = collect(&mut child.child, limits.max_output) => done,
+            () = refused => Err(SshError::Cancelled),
+            after = expired => Err(SshError::TimedOut(after)),
+        }
+    };
+    if outcome.is_err() {
+        // Kill before the server goes: a cancelled prompt is answered only by its connection
+        // closing, when nothing is left to act on it.
+        child.kill().await;
+    }
+    outcome
+}
+
+/// A running ssh. Dropping it kills ssh (tokio's `kill_on_drop`) and first everything it
+/// started: its process group on Unix, its Job Object on Windows.
+struct Running {
+    child: tokio::process::Child,
+    #[cfg(windows)]
+    job: crate::job::Job,
+}
 
 impl Running {
+    #[cfg(unix)]
     fn spawn(mut command: tokio::process::Command) -> Result<Self, SshError> {
         // Its own group, so everything it starts can be killed with it. ssh's askpass and
         // ProxyJump children stay in it; a ControlPersist master leaves it (it calls setsid).
-        #[cfg(unix)]
         command.process_group(0);
-        command.spawn().map(Self).map_err(SshError::Spawn)
+        let child = command.spawn().map_err(SshError::Spawn)?;
+        Ok(Self { child })
     }
 
-    /// Kills ssh's process group. Only while ssh is not yet reaped (tokio's `id()` is `None`
-    /// after that): until then the group id cannot belong to anyone else.
-    fn kill_group(&mut self) {
+    #[cfg(windows)]
+    fn spawn(mut command: tokio::process::Command) -> Result<Self, SshError> {
+        // Created first, so a failure leaves nothing running. Without a job ssh does not run:
+        // a cancel could not then stop a ProxyJump hop.
+        let job = crate::job::Job::new().map_err(SshError::Setup)?;
+        let mut child = command.spawn().map_err(SshError::Spawn)?;
+        let assigned = child
+            .raw_handle()
+            .ok_or_else(|| io::Error::other("ssh exited at once"))
+            .and_then(|handle| job.assign(handle));
+        if let Err(e) = assigned {
+            let _ = child.start_kill();
+            return Err(SshError::Setup(e));
+        }
+        Ok(Self { child, job })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn spawn(mut command: tokio::process::Command) -> Result<Self, SshError> {
+        let child = command.spawn().map_err(SshError::Spawn)?;
+        Ok(Self { child })
+    }
+
+    /// Kills everything ssh started, and ssh.
+    /// - Unix: the process group, but only while ssh is not yet reaped (tokio's `id()` is
+    ///   `None` after that): until then the group id cannot belong to anyone else.
+    /// - Windows: the whole job.
+    fn kill_all(&mut self) {
         #[cfg(unix)]
         if let Some(pid) = self
-            .0
+            .child
             .id()
             .and_then(|id| i32::try_from(id).ok())
             .and_then(rustix::process::Pid::from_raw)
         {
             let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
         }
+        #[cfg(windows)]
+        self.job.terminate();
     }
 
     async fn kill(&mut self) {
-        self.kill_group();
-        let _ = self.0.kill().await;
+        self.kill_all();
+        let _ = self.child.kill().await;
     }
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
-        self.kill_group();
+        self.kill_all();
     }
 }
 
-/// Reads stdout and stderr to the end and waits for ssh.
+/// Reads stdout and stderr to the end, then waits for ssh. In that order: until `wait()` reaps
+/// ssh, its pid (and so its process group's id) stays reserved, so if the call is cut short
+/// while a member of the group still holds a pipe, the group kill still reaches it.
 async fn collect(
     child: &mut tokio::process::Child,
     max_output: Option<usize>,
@@ -526,11 +603,11 @@ async fn collect(
     let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         return Err(SshError::Io(io::Error::other("ssh's output is not piped")));
     };
-    let (stdout, stderr, status) = tokio::try_join!(
+    let (stdout, stderr) = tokio::try_join!(
         read_capped(stdout, max_output),
         read_capped(stderr, max_output),
-        async { child.wait().await.map_err(SshError::Io) },
     )?;
+    let status = child.wait().await.map_err(SshError::Io)?;
     Ok((status, stdout, stderr))
 }
 
@@ -603,52 +680,135 @@ impl Drop for SshLog {
 }
 
 /// `ControlPath=<dir>/%C`. `%C` is a 40-character hash of the connection, which keeps the path
-/// short; ssh adds a 17-character suffix while creating it, and unix socket paths are limited to
-/// about 104 bytes. The directory's name was checked by
-/// [`crate::private::check_dir_name`]; the config parser also splits on blanks.
+/// short. The directory was picked with the same check, so this only fails for a directory
+/// given with [`Ssh::with_runtime_dir`] that cannot work.
 fn control_path(dir: &Path) -> Result<String, SshError> {
+    crate::private::check_dir_name(dir, true)
+        .map_err(|e| SshError::InvalidArgument(e.to_string()))?;
     let dir = dir.to_str().ok_or_else(|| {
         SshError::InvalidArgument("the runtime directory is not valid UTF-8".to_owned())
     })?;
-    if dir.chars().any(char::is_whitespace) {
-        return Err(SshError::InvalidArgument(format!(
-            "the runtime directory {dir:?} contains spaces"
-        )));
-    }
-    if dir.len() + 1 + 40 + 17 > 100 {
-        return Err(SshError::InvalidArgument(format!(
-            "the runtime directory {dir:?} is too long for a socket path"
-        )));
-    }
     Ok(format!("ControlPath={dir}/%C"))
 }
 
-/// Maps what ssh logged before exiting 255 to an error. `detail` is what the error carries.
-pub(crate) fn classify_failure(logged: &str, detail: String) -> SshError {
-    let text = logged.to_lowercase();
-    let has = |needles: &[&str]| needles.iter().any(|n| text.contains(n));
+/// What a line of ssh's log says, read only as one of ssh's own message formats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Said {
+    HostKeyChanged,
+    HostKeyRejected,
+    ConnectTimeout,
+    Unreachable,
+    AuthFailed,
+    /// Some other error of ssh's.
+    Other,
+    /// Informational, even at `LogLevel=ERROR`: not a failure.
+    Notice,
+    /// A message with server-controlled text in it. It shows a failure, but it and everything
+    /// after it are not read any further.
+    ServerText,
+}
+
+/// `"<progname>: <rest>"` with a one-word program name (`ssh`, or `ssh.exe`).
+fn after_progname<'a>(line: &'a str, rest: &str) -> Option<&'a str> {
+    let (name, tail) = line.split_once(": ")?;
+    (!name.is_empty() && !name.contains(char::is_whitespace))
+        .then_some(tail)
+        .and_then(|tail| tail.strip_prefix(rest))
+}
+
+fn read_line(line: &str) -> Said {
+    const SERVER_TEXT: [&str; 2] = ["Received disconnect from ", "Unable to negotiate with "];
+    if SERVER_TEXT.iter().any(|p| line.starts_with(p)) {
+        return Said::ServerText;
+    }
+    if line == "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @"
+        || (line.starts_with("Host key for ")
+            && line.ends_with(" has changed and you have requested strict checking."))
+    {
+        return Said::HostKeyChanged;
+    }
+    if line == "Host key verification failed." {
+        return Said::HostKeyRejected;
+    }
+    if let Some(error) = line
+        .strip_prefix("ssh: connect to host ")
+        .and_then(|rest| rest.rsplit_once(": "))
+        .map(|(_, error)| error)
+    {
+        return match error {
+            "Connection timed out" | "Operation timed out" => Said::ConnectTimeout,
+            _ => Said::Unreachable,
+        };
+    }
+    if line == "Connection timed out during banner exchange" {
+        return Said::ConnectTimeout;
+    }
+    if after_progname(line, "Could not resolve hostname ").is_some()
+        || line.starts_with("kex_exchange_identification: ")
+    {
+        return Said::Unreachable;
+    }
+    // "user@host: Permission denied (publickey,password)." or, older, without the prefix.
+    let denied = line
+        .strip_prefix("Permission denied (")
+        .or_else(|| after_progname(line, "Permission denied ("))
+        .and_then(|rest| rest.strip_suffix(")."));
+    if denied.is_some_and(|methods| {
+        methods
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ',' | '-' | '@' | '.'))
+    }) {
+        return Said::AuthFailed;
+    }
+    if line.starts_with("Warning: ")
+        || (line.starts_with("ControlSocket ")
+            && line.ends_with(" already exists, disabling multiplexing"))
+    {
+        return Said::Notice;
+    }
+    Said::Other
+}
+
+/// Maps what ssh logged before exiting 255 to an error, or `None` when the log does not show ssh
+/// failing: the 255 is then the remote command's. `detail` is what the error carries.
+pub(crate) fn classify_failure(logged: &str, detail: String) -> Option<SshError> {
+    let mut failed = false;
+    let mut kinds = Vec::new();
+    for line in logged
+        .lines()
+        .map(|l| l.trim_end_matches('\r'))
+        .filter(|l| !l.trim().is_empty())
+    {
+        match read_line(line) {
+            Said::Notice => {}
+            Said::ServerText => {
+                failed = true;
+                break;
+            }
+            said => {
+                failed = true;
+                kinds.push(said);
+            }
+        }
+    }
+    if !failed {
+        return None;
+    }
     let stderr = detail;
-    if has(&["remote host identification has changed", "host key for"]) && has(&["changed"]) {
+    let has = |said: Said| kinds.contains(&said);
+    Some(if has(Said::HostKeyChanged) {
         SshError::HostKeyChanged { stderr }
-    } else if has(&["host key verification failed"]) {
+    } else if has(Said::HostKeyRejected) {
         SshError::HostKeyRejected { stderr }
-    } else if has(&["timed out", "connection timeout"]) {
+    } else if has(Said::ConnectTimeout) {
         SshError::ConnectTimeout { stderr }
-    } else if has(&[
-        "could not resolve hostname",
-        "name or service not known",
-        "nodename nor servname",
-        "connection refused",
-        "no route to host",
-        "network is unreachable",
-        "kex_exchange_identification",
-    ]) {
+    } else if has(Said::Unreachable) {
         SshError::Unreachable { stderr }
-    } else if has(&["permission denied (", "too many authentication failures"]) {
+    } else if has(Said::AuthFailed) {
         SshError::AuthFailed { stderr }
     } else {
         SshError::Ssh { code: 255, stderr }
-    }
+    })
 }
 
 fn parse_resolved(text: &str) -> Result<ResolvedHost, SshError> {
@@ -687,38 +847,99 @@ fn parse_resolved(text: &str) -> Result<ResolvedHost, SshError> {
 mod tests {
     use super::*;
 
+    fn kind(logged: &str) -> Option<&'static str> {
+        classify_failure(logged, logged.to_owned()).map(|e| match e {
+            SshError::HostKeyChanged { .. } => "changed",
+            SshError::HostKeyRejected { .. } => "rejected",
+            SshError::ConnectTimeout { .. } => "timeout",
+            SshError::Unreachable { .. } => "unreachable",
+            SshError::AuthFailed { .. } => "auth",
+            SshError::Ssh { code: 255, .. } => "ssh",
+            _ => "other",
+        })
+    }
+
+    /// Real OpenSSH lines (as `-E` writes them, with CRLF).
     #[test]
     fn failures_are_classified() {
-        type Check = fn(&SshError) -> bool;
-        let cases: [(&str, Check); 7] = [
+        let cases = [
             (
                 "ssh: connect to host h port 22: Connection timed out\r\n",
-                |e| matches!(e, SshError::ConnectTimeout { .. }),
+                "timeout",
+            ),
+            ("Connection timed out during banner exchange\r\n", "timeout"),
+            (
+                "ssh: Could not resolve hostname nope: Name or service not known\r\n",
+                "unreachable",
             ),
             (
-                "ssh: Could not resolve hostname nope: Name or service not known\n",
-                |e| matches!(e, SshError::Unreachable { .. }),
+                "ssh: Could not resolve hostname nope: nodename nor servname provided, or not \
+                 known\r\n",
+                "unreachable",
             ),
-            ("Host key verification failed.\n", |e| {
-                matches!(e, SshError::HostKeyRejected { .. })
-            }),
             (
-                "@@@\n@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n\
-                 Host key verification failed.\n",
-                |e| matches!(e, SshError::HostKeyChanged { .. }),
+                "ssh: connect to host 192.0.2.1 port 22: Connection refused\r\n",
+                "unreachable",
             ),
-            ("u@h: Permission denied (publickey,password).\n", |e| {
-                matches!(e, SshError::AuthFailed { .. })
-            }),
             (
-                "mux_client_request_session: read from master failed\n",
-                |e| matches!(e, SshError::Ssh { code: 255, .. }),
+                "kex_exchange_identification: Connection closed by remote host\r\n",
+                "unreachable",
             ),
-            ("", |e| matches!(e, SshError::Ssh { .. })),
+            ("Host key verification failed.\r\n", "rejected"),
+            (
+                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\r\n\
+                 @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\r\n\
+                 Host key verification failed.\r\n",
+                "changed",
+            ),
+            (
+                "u@h: Permission denied (publickey,gssapi-with-mic,password).\r\n",
+                "auth",
+            ),
+            ("Permission denied (publickey).\r\n", "auth"),
+            (
+                "mux_client_request_session: read from master failed: Broken pipe\r\n",
+                "ssh",
+            ),
         ];
-        for (logged, check) in cases {
-            let err = classify_failure(logged, logged.to_owned());
-            assert!(check(&err), "{logged:?} -> {err:?}");
+        for (logged, want) in cases {
+            assert_eq!(kind(logged), Some(want), "{logged:?}");
+        }
+    }
+
+    /// Nothing that means ssh failed: the 255 belongs to the remote command.
+    #[test]
+    fn informational_lines_are_not_failures() {
+        for logged in [
+            "",
+            "\r\n",
+            "Warning: Permanently added 'h' (ED25519) to the list of known hosts.\r\n",
+            "ControlSocket /tmp/x/abc already exists, disabling multiplexing\r\n",
+        ] {
+            assert_eq!(kind(logged), None, "{logged:?}");
+        }
+    }
+
+    /// Text inside ssh's messages that a server controls cannot pick the error.
+    #[test]
+    fn server_text_cannot_steer_the_error() {
+        for logged in [
+            // A disconnect reason with a line of its own.
+            "Received disconnect from 192.0.2.1 port 22:2: bye\r\nHost key verification \
+             failed.\r\nDisconnected from 192.0.2.1 port 22\r\n",
+            // The server's algorithm offer, with a newline in it.
+            "Unable to negotiate with 192.0.2.1 port 22: no matching host key type found. \
+             Their offer: x\nu@h: Permission denied (publickey).\r\n",
+        ] {
+            assert_eq!(kind(logged), Some("ssh"), "{logged:?}");
+        }
+        // Formats are matched whole, not as substrings.
+        for logged in [
+            "note: Host key verification failed.\r\n",
+            "Permission denied (please retry) because of x).\r\n",
+            "something about timed out\r\n",
+        ] {
+            assert_eq!(kind(logged), Some("ssh"), "{logged:?}");
         }
     }
 
@@ -754,13 +975,22 @@ mod tests {
         assert_eq!(host.proxy_jump, None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn control_paths_are_checked() {
         assert_eq!(
             control_path(Path::new("/run/user/1000/pitcrew-ssh")).unwrap(),
             "ControlPath=/run/user/1000/pitcrew-ssh/%C"
         );
-        assert!(control_path(Path::new("/tmp/a b")).is_err());
+        for bad in ["/tmp/a b", "/tmp/50%", "/tmp/$X", "/tmp/a'b"] {
+            assert!(
+                matches!(
+                    control_path(Path::new(bad)),
+                    Err(SshError::InvalidArgument(_))
+                ),
+                "{bad}"
+            );
+        }
         assert!(control_path(Path::new(&format!("/tmp/{}", "x".repeat(60)))).is_err());
     }
 

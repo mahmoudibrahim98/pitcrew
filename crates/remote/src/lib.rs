@@ -15,6 +15,9 @@
 
 pub mod askpass;
 mod config;
+// The crate's only unsafe code: a Job Object for ssh on Windows.
+#[cfg(windows)]
+mod job;
 mod private;
 pub mod probe;
 pub mod quote;
@@ -26,7 +29,9 @@ pub use askpass::{
 };
 pub use config::{HostList, home_dir, list_hosts, list_hosts_in};
 pub use probe::{PROBE_LIMITS, Probe};
-pub use ssh::{DEFAULT_CONNECT_TIMEOUT, Limits, Output, ResolvedHost, Ssh, SshError};
+pub use ssh::{
+    DEFAULT_CONNECT_TIMEOUT, Limits, Output, RESOLVE_LIMITS, ResolvedHost, Ssh, SshError,
+};
 
 /// The protocol version this crate was built against.
 pub const PROTOCOL_VERSION: u32 = pitcrew_protocol::PROTOCOL_VERSION;
