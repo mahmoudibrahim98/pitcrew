@@ -1456,11 +1456,15 @@ dependencies = [
 name = "pitcrew-runner"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "notify",
+ "pitcrew-api",
+ "pitcrew-auth",
  "pitcrew-fixtures",
  "pitcrew-ingest",
  "pitcrew-interfaces",
  "pitcrew-protocol",
+ "pitcrew-store",
  "rusqlite",
  "rustix",
  "serde",
@@ -1468,8 +1472,11 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
+ "tungstenite",
  "ulid",
 ]
 

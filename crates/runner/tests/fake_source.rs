@@ -62,6 +62,9 @@ fn new_items_arrive_fast_and_a_restart_resumes_from_the_cursor() {
         latencies.iter().all(|l| *l < Duration::from_millis(300)),
         "{latencies:?}"
     );
+    // A second notification for one write can read the next item early; let the last write's
+    // own check finish, so the index holds the file's final size.
+    std::thread::sleep(Duration::from_millis(300));
     runner.stop();
     let first_run = sink.events();
     assert_eq!(first_run.len(), 9);
@@ -325,6 +328,123 @@ fn a_crash_between_split_batches_resends_the_same_ids() {
     let ids = |events: &[Event]| events.iter().map(|e| e.id).collect::<Vec<_>>();
     assert_eq!(labels(&resent[1..]), labels(&refused));
     assert_eq!(ids(&resent[1..]), ids(&refused));
+}
+
+fn call(offset: u64, id: &str, tool: &str) -> TranscriptItem {
+    TranscriptItem::ToolUse {
+        at: 1_790_000_000_000,
+        call_id: id.into(),
+        tool: tool.into(),
+        target: "x".into(),
+        input: None,
+        offset,
+    }
+}
+
+fn result(offset: u64, id: &str) -> TranscriptItem {
+    TranscriptItem::ToolResult {
+        at: 1_790_000_000_001,
+        call_id: id.into(),
+        is_error: false,
+        summary: "done".into(),
+        offset,
+    }
+}
+
+/// OpenCode's offsets are positions: a call and its result share one, and a result can arrive
+/// in a later read, after items with higher offsets. It must still become `tool_ran`.
+#[test]
+fn a_late_result_below_later_offsets_is_not_dropped() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let path = home.path().join("proj").join("oc.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"x").unwrap();
+    let text = TranscriptItem::AssistantText {
+        at: 1_790_000_000_002,
+        text: "meanwhile".into(),
+        offset: 200,
+    };
+    let mut items = vec![call(100, "c1", "Bash"), text];
+    let source = Arc::new(LoggedFake::new(vec![transcript_ref(&path)], items.clone()));
+    let sink = Arc::new(CollectSink::default());
+    let runner = pitcrew_runner::start(
+        config(home.path(), state.path()),
+        vec![source.clone()],
+        sink.clone(),
+    )
+    .unwrap();
+    sink.wait_for(1, Duration::from_secs(5)).expect("discovery");
+
+    items.push(result(100, "c1"));
+    source.set_items(items);
+    append(&path, b"x");
+    sink.wait_for(2, Duration::from_secs(5))
+        .expect("the late result");
+    std::thread::sleep(Duration::from_millis(200));
+    runner.stop();
+    assert_eq!(labels(&sink.events()), ["discovered:Working", "tool:Bash"]);
+    let EventBody::ToolRan { receipt, .. } = &sink.events()[1].body else {
+        panic!("not tool_ran");
+    };
+    assert!(matches!(
+        receipt,
+        pitcrew_protocol::model::Receipt::Transcript { offset: 100, .. }
+    ));
+}
+
+/// Items that share an offset are told apart when a crash is replayed: exactly the refused
+/// events come again, with their ids.
+#[test]
+fn items_sharing_an_offset_are_resent_exactly_after_a_crash() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let path = home.path().join("proj").join("shared.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"x").unwrap();
+    let items = vec![
+        call(100, "a", "Bash"),
+        result(100, "a"),
+        call(100, "b", "Edit"),
+        result(100, "b"),
+        TranscriptItem::TurnEnded {
+            at: 1_790_000_000_003,
+            offset: 100,
+        },
+    ];
+    let source = Arc::new(LoggedFake::new(vec![transcript_ref(&path)], items).per_read(usize::MAX));
+    let mut cfg = config(home.path(), state.path());
+    // One item's events per batch: the read is accepted in parts.
+    cfg.max_batch_events = 1;
+
+    let refusing = Arc::new(Refusing::new(2));
+    let runner =
+        pitcrew_runner::start(cfg.clone(), vec![source.clone()], refusing.clone()).unwrap();
+    assert!(eventually(Duration::from_secs(5), || refusing
+        .offered()
+        .len()
+        >= 3));
+    runner.stop();
+    assert_eq!(
+        labels(&refusing.inner.events()),
+        ["discovered:Idle", "tool:Bash"]
+    );
+    let refused: Vec<Event> = refusing.offered()[2].clone();
+    assert_eq!(labels(&refused), ["tool:Edit"]);
+
+    let sink = Arc::new(CollectSink::default());
+    let runner = pitcrew_runner::start(cfg, vec![source.clone()], sink.clone()).unwrap();
+    sink.wait_for(3, Duration::from_secs(5)).expect("replayed");
+    std::thread::sleep(Duration::from_millis(300));
+    runner.stop();
+    let resent = sink.events();
+    // session_discovered (accepted, but saved only with the cursor) comes again with its id.
+    assert_eq!(
+        labels(&resent),
+        ["discovered:Idle", "tool:Edit", "turn@100"]
+    );
+    assert_eq!(resent[0].id, refusing.inner.events()[0].id);
+    assert_eq!(resent[1].id, refused[0].id);
 }
 
 /// Like OpenCode: progress lives in `cursor.state` (a row id); the offset never moves.

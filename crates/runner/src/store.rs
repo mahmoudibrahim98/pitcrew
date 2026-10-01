@@ -1,4 +1,5 @@
-//! The runner's own SQLite index (not the hub store): one row per transcript, with its cursor.
+//! The runner's own SQLite index (not the hub store): one row per transcript, with its cursor;
+//! the terminals the runner started; and the outcomes of hub commands.
 //!
 //! The state directory is private to the user (0700 on Unix) and held by one runner at a time
 //! through a lock file. On a network filesystem the index uses a rollback journal, since WAL's
@@ -7,22 +8,37 @@
 use crate::derive::Facts;
 use crate::fsinfo;
 use pitcrew_interfaces::source::{Cursor, SessionMeta};
-use pitcrew_protocol::ids::SessionId;
+use pitcrew_protocol::ids::{CommandId, SessionId, TerminalId};
 use pitcrew_protocol::model::{Engine, TimestampMs};
+use pitcrew_protocol::runner::CommandOutcome;
 use rusqlite::{Connection, OptionalExtension as _, params};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Migrations, applied in order; `PRAGMA user_version` counts those applied.
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_transcripts.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_transcripts.sql"),
+    include_str!("../migrations/0002_links_and_commands.sql"),
+];
 
 const DB_FILE: &str = "runner.sqlite3";
 const LOCK_FILE: &str = "runner.lock";
 
 const COLUMNS: &str = "session_id, engine, path, inner_id, cursor, size, mtime, identity, \
-                       caught_up, generation, discovered, emitted_through, meta, facts";
+                       caught_up, generation, discovered, meta, facts";
+const TERMINAL_COLUMNS: &str =
+    "terminal_id, native_target, session_id, engine, native_id, cwd, started_at";
+
+/// A terminal started for a CLI whose session id is not known in advance is claimed by a session
+/// in its folder that starts within this long.
+const CLAIM_WINDOW_MS: TimestampMs = 15 * 60 * 1000;
+/// Clock slack when matching a session's start to its terminal's.
+const CLAIM_SLACK_MS: TimestampMs = 5_000;
+/// Command outcomes are kept this long.
+const OUTCOME_TTL_MS: TimestampMs = 7 * 24 * 60 * 60 * 1000;
 
 /// Errors from the runner store.
 #[derive(Debug, thiserror::Error)]
@@ -67,7 +83,8 @@ pub(crate) struct Row {
     pub caught_up: bool,
     pub generation: u32,
     pub discovered: bool,
-    pub emitted_through: Option<u64>,
+    /// Keys of items whose events were accepted after the cursor: a replay skips them.
+    pub accepted: HashSet<u64>,
     pub meta: Option<SessionMeta>,
     pub facts: Facts,
 }
@@ -75,15 +92,27 @@ pub(crate) struct Row {
 /// What to save once the sink has accepted a batch.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Commit {
-    /// Part of a read: the events up to `emitted_through` are accepted, the cursor not yet.
-    /// Nothing else changes, so replaying the read after a crash derives the same events (and
-    /// ids) as the first time.
-    Partial {
-        session: SessionId,
-        emitted_through: Option<u64>,
-    },
-    /// A whole read, or a re-index: the full row.
+    /// Part of a read: the events of these items are accepted, the cursor not yet. Nothing else
+    /// changes, so replaying the read after a crash derives the same events (and ids) as the
+    /// first time, and skips these items.
+    Partial { session: SessionId, keys: Vec<u64> },
+    /// A whole read, a re-index, or a reported state: the full row.
     Full(Box<Row>),
+}
+
+/// A terminal the runner started.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TerminalRow {
+    pub terminal: TerminalId,
+    pub native_target: Option<String>,
+    /// The session it runs, once known.
+    pub session: Option<SessionId>,
+    /// The CLI started in it; `None` for a terminal linked by hand.
+    pub engine: Option<Engine>,
+    /// The CLI's session id, when it was chosen (or known) at the start.
+    pub native_id: Option<String>,
+    pub cwd: String,
+    pub started_at: TimestampMs,
 }
 
 #[derive(Debug)]
@@ -134,6 +163,17 @@ impl Store {
     }
 
     pub fn load_all(&self) -> Result<Vec<Row>, StoreError> {
+        let mut accepted: HashMap<String, HashSet<u64>> = HashMap::new();
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT session_id, item_key FROM accepted_items")?;
+            let keys = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            for k in keys {
+                let (session, key) = k?;
+                accepted.entry(session).or_default().insert(from_i64(key));
+            }
+        }
         let mut stmt = self.conn.prepare(&format!(
             "SELECT {COLUMNS} FROM transcripts ORDER BY path, inner_id"
         ))?;
@@ -142,7 +182,8 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         let mut rows = Vec::with_capacity(raw.len());
         for r in raw {
-            match r.decode() {
+            let keys = accepted.remove(&r.session).unwrap_or_default();
+            match r.decode(keys) {
                 Ok(row) => rows.push(row),
                 // One bad row must not stop the runner. Its path stays taken, so that transcript is
                 // not indexed again until the row is removed.
@@ -157,10 +198,25 @@ impl Store {
         let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {COLUMNS} FROM transcripts WHERE path = ?1 AND inner_id = ?2"
         ))?;
-        stmt.query_row(params![path_text(path)?, inner_id.unwrap_or("")], raw_row)
+        let Some(raw) = stmt
+            .query_row(params![path_text(path)?, inner_id.unwrap_or("")], raw_row)
             .optional()?
-            .map(RawRow::decode)
-            .transpose()
+        else {
+            return Ok(None);
+        };
+        let keys = self.accepted_keys(&raw.session)?;
+        raw.decode(keys).map(Some)
+    }
+
+    fn accepted_keys(&self, session: &str) -> Result<HashSet<u64>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT item_key FROM accepted_items WHERE session_id = ?1")?;
+        let keys = stmt
+            .query_map([session], |r| r.get::<_, i64>(0))?
+            .map(|k| k.map(from_i64))
+            .collect::<Result<_, _>>()?;
+        Ok(keys)
     }
 
     /// Moves a row to the transcript's new canonical path (a folder above it became a symlink).
@@ -190,27 +246,27 @@ impl Store {
     }
 
     pub fn commit(&self, commit: &Commit) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
         match commit {
-            Commit::Partial {
-                session,
-                emitted_through,
-            } => {
-                self.conn.execute(
-                    "UPDATE transcripts SET emitted_through = ?2 WHERE session_id = ?1",
-                    params![
-                        session.0.to_string(),
-                        emitted_through.map(to_i64).transpose()?,
-                    ],
+            Commit::Partial { session, keys } => {
+                let mut insert = tx.prepare_cached(
+                    "INSERT OR IGNORE INTO accepted_items (session_id, item_key) VALUES (?1, ?2)",
                 )?;
+                let session = session.0.to_string();
+                for k in keys {
+                    insert.execute(params![session, to_i64_bits(*k)])?;
+                }
             }
             Commit::Full(row) => {
-                self.conn.execute(
+                let session = row.session.0.to_string();
+                // `emitted_through` (0001) is no longer used; it is cleared as rows are saved.
+                tx.execute(
                     "UPDATE transcripts SET cursor = ?2, size = ?3, mtime = ?4, identity = ?5,
-                        caught_up = ?6, generation = ?7, discovered = ?8, emitted_through = ?9,
-                        meta = ?10, facts = ?11
+                        caught_up = ?6, generation = ?7, discovered = ?8, emitted_through = NULL,
+                        meta = ?9, facts = ?10
                      WHERE session_id = ?1",
                     params![
-                        row.session.0.to_string(),
+                        session,
                         serde_json::to_string(&row.cursor)?,
                         to_i64(row.size)?,
                         row.mtime,
@@ -218,13 +274,194 @@ impl Store {
                         row.caught_up,
                         row.generation,
                         row.discovered,
-                        row.emitted_through.map(to_i64).transpose()?,
                         row.meta.as_ref().map(serde_json::to_string).transpose()?,
                         serde_json::to_string(&row.facts)?,
                     ],
                 )?;
+                // The cursor now covers every accepted item.
+                tx.execute(
+                    "DELETE FROM accepted_items WHERE session_id = ?1",
+                    [&session],
+                )?;
             }
         }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The session whose transcript names itself `native_id`, if one is indexed.
+    pub fn session_by_native(
+        &self,
+        engine: Engine,
+        native_id: &str,
+    ) -> Result<Option<SessionId>, StoreError> {
+        let id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT session_id FROM transcripts
+                 WHERE engine = ?1 AND json_extract(meta, '$.native_id') = ?2
+                 ORDER BY mtime DESC LIMIT 1",
+                params![engine_text(engine)?, native_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        id.map(|s| parse_id(&s)).transpose()
+    }
+
+    // ─── Terminals ──────────────────────────────────────────────────────────────────────────
+
+    /// Saves a terminal. A session runs in one terminal at a time: linking it here forgets any
+    /// other terminal it had.
+    pub fn put_terminal(&self, t: &TerminalRow) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        let session = t.session.map(|s| s.0.to_string());
+        let terminal = t.terminal.0.to_string();
+        if let Some(s) = &session {
+            tx.execute(
+                "DELETE FROM terminals WHERE session_id = ?1 AND terminal_id != ?2",
+                params![s, terminal],
+            )?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO terminals
+                (terminal_id, native_target, session_id, engine, native_id, cwd, started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                terminal,
+                t.native_target,
+                session,
+                t.engine.map(engine_text).transpose()?,
+                t.native_id,
+                t.cwd,
+                t.started_at,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn terminal_of(&self, session: SessionId) -> Result<Option<TerminalRow>, StoreError> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {TERMINAL_COLUMNS} FROM terminals WHERE session_id = ?1"
+        ))?;
+        stmt.query_row([session.0.to_string()], raw_terminal)
+            .optional()?
+            .map(RawTerminal::decode)
+            .transpose()
+    }
+
+    pub fn terminals(&self) -> Result<Vec<TerminalRow>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT {TERMINAL_COLUMNS} FROM terminals"))?;
+        let raw = stmt
+            .query_map([], raw_terminal)?
+            .collect::<Result<Vec<_>, _>>()?;
+        raw.into_iter().map(RawTerminal::decode).collect()
+    }
+
+    /// The runtime knows a terminal by a new id now (e.g. tmux, after a restart).
+    pub fn retarget_terminal(&self, old: TerminalId, new: TerminalId) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE terminals SET terminal_id = ?2 WHERE terminal_id = ?1",
+            params![old.0.to_string(), new.0.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn forget_terminal(&self, terminal: TerminalId) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM terminals WHERE terminal_id = ?1",
+            [terminal.0.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn unlink_session(&self, session: SessionId) -> Result<(), StoreError> {
+        self.conn.execute(
+            "DELETE FROM terminals WHERE session_id = ?1",
+            [session.0.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// The terminal a newly discovered session runs in: the one already linked to it (a replay),
+    /// else a started terminal waiting for it, matched by the CLI's session id or, for a CLI whose
+    /// id is not chosen in advance, by folder and start time.
+    pub fn claim_terminal(
+        &self,
+        session: SessionId,
+        engine: Engine,
+        native_id: &str,
+        cwd: Option<&str>,
+        started: TimestampMs,
+        now: TimestampMs,
+    ) -> Result<Option<TerminalId>, StoreError> {
+        if let Some(t) = self.terminal_of(session)? {
+            return Ok(Some(t.terminal));
+        }
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {TERMINAL_COLUMNS} FROM terminals
+             WHERE session_id IS NULL AND engine = ?1 ORDER BY started_at"
+        ))?;
+        let waiting = stmt
+            .query_map([engine_text(engine)?], raw_terminal)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(RawTerminal::decode)
+            .collect::<Result<Vec<_>, _>>()?;
+        let by_id = waiting
+            .iter()
+            .find(|t| !native_id.is_empty() && t.native_id.as_deref() == Some(native_id));
+        let by_folder = || {
+            waiting.iter().find(|t| {
+                t.native_id.is_none()
+                    && cwd.is_some_and(|c| same_dir(c, &t.cwd))
+                    && t.started_at >= now.saturating_sub(CLAIM_WINDOW_MS)
+                    && started >= t.started_at.saturating_sub(CLAIM_SLACK_MS)
+            })
+        };
+        let Some(t) = by_id.or_else(by_folder) else {
+            return Ok(None);
+        };
+        self.conn.execute(
+            "UPDATE terminals SET session_id = ?1 WHERE terminal_id = ?2",
+            params![session.0.to_string(), t.terminal.0.to_string()],
+        )?;
+        Ok(Some(t.terminal))
+    }
+
+    // ─── Commands ───────────────────────────────────────────────────────────────────────────
+
+    pub fn outcome(&self, command: CommandId) -> Result<Option<CommandOutcome>, StoreError> {
+        let text: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT outcome FROM commands WHERE command_id = ?1",
+                [command.0.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(text.map(|t| serde_json::from_str(&t)).transpose()?)
+    }
+
+    /// Saves an outcome, and forgets those older than a week.
+    pub fn save_outcome(
+        &self,
+        command: CommandId,
+        outcome: &CommandOutcome,
+        now: TimestampMs,
+    ) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO commands (command_id, outcome, at) VALUES (?1, ?2, ?3)",
+            params![command.0.to_string(), serde_json::to_string(outcome)?, now],
+        )?;
+        tx.execute(
+            "DELETE FROM commands WHERE at < ?1",
+            [now.saturating_sub(OUTCOME_TTL_MS)],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -232,6 +469,12 @@ impl Store {
     pub fn get(&self, session: SessionId) -> Result<Option<Row>, StoreError> {
         Ok(self.load_all()?.into_iter().find(|r| r.session == session))
     }
+}
+
+/// Whether two folder paths name the same folder, ignoring trailing separators.
+fn same_dir(a: &str, b: &str) -> bool {
+    let trim = |s: &str| s.trim_end_matches(['/', '\\']).to_owned();
+    trim(a) == trim(b)
 }
 
 /// Creates the state directory. On Unix it is 0700: the index holds session titles and paths.
@@ -327,9 +570,8 @@ fn raw_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
         caught_up: r.get(8)?,
         generation: r.get(9)?,
         discovered: r.get(10)?,
-        emitted_through: r.get(11)?,
-        meta: r.get(12)?,
-        facts: r.get(13)?,
+        meta: r.get(11)?,
+        facts: r.get(12)?,
     })
 }
 
@@ -345,20 +587,15 @@ struct RawRow {
     caught_up: bool,
     generation: u32,
     discovered: bool,
-    emitted_through: Option<i64>,
     meta: Option<String>,
     facts: Option<String>,
 }
 
 impl RawRow {
-    fn decode(self) -> Result<Row, StoreError> {
-        let session = self
-            .session
-            .parse()
-            .map_err(|_| StoreError::Range(format!("session id {:?}", self.session)))?;
+    fn decode(self, accepted: HashSet<u64>) -> Result<Row, StoreError> {
         Ok(Row {
-            session,
-            engine: serde_json::from_value(serde_json::Value::String(self.engine))?,
+            session: parse_id(&self.session)?,
+            engine: engine_from(self.engine)?,
             path: PathBuf::from(self.path),
             inner_id: Some(self.inner_id).filter(|s| !s.is_empty()),
             cursor: serde_json::from_str(&self.cursor)?,
@@ -368,10 +605,7 @@ impl RawRow {
             caught_up: self.caught_up,
             generation: self.generation,
             discovered: self.discovered,
-            emitted_through: self
-                .emitted_through
-                .map(|v| u64::try_from(v).map_err(|_| StoreError::Range("offset".into())))
-                .transpose()?,
+            accepted,
             meta: self.meta.as_deref().map(serde_json::from_str).transpose()?,
             facts: self
                 .facts
@@ -383,8 +617,58 @@ impl RawRow {
     }
 }
 
+fn raw_terminal(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawTerminal> {
+    Ok(RawTerminal {
+        terminal: r.get(0)?,
+        native_target: r.get(1)?,
+        session: r.get(2)?,
+        engine: r.get(3)?,
+        native_id: r.get(4)?,
+        cwd: r.get(5)?,
+        started_at: r.get(6)?,
+    })
+}
+
+struct RawTerminal {
+    terminal: String,
+    native_target: Option<String>,
+    session: Option<String>,
+    engine: Option<String>,
+    native_id: Option<String>,
+    cwd: String,
+    started_at: i64,
+}
+
+impl RawTerminal {
+    fn decode(self) -> Result<TerminalRow, StoreError> {
+        Ok(TerminalRow {
+            terminal: parse_id(&self.terminal)?,
+            native_target: self.native_target,
+            session: self.session.as_deref().map(parse_id).transpose()?,
+            engine: self.engine.map(engine_from).transpose()?,
+            native_id: self.native_id,
+            cwd: self.cwd,
+            started_at: self.started_at,
+        })
+    }
+}
+
+fn parse_id<T: std::str::FromStr>(s: &str) -> Result<T, StoreError> {
+    s.parse()
+        .map_err(|_| StoreError::Range(format!("id {s:?}")))
+}
+
 fn to_i64(v: u64) -> Result<i64, StoreError> {
     i64::try_from(v).map_err(|_| StoreError::Range(v.to_string()))
+}
+
+/// A `u64` key in an `INTEGER` column, bit for bit.
+fn to_i64_bits(v: u64) -> i64 {
+    i64::from_ne_bytes(v.to_ne_bytes())
+}
+
+fn from_i64(v: i64) -> u64 {
+    u64::from_ne_bytes(v.to_ne_bytes())
 }
 
 fn engine_text(engine: Engine) -> Result<String, StoreError> {
@@ -392,6 +676,10 @@ fn engine_text(engine: Engine) -> Result<String, StoreError> {
         serde_json::Value::String(s) => Ok(s),
         other => Err(StoreError::Range(other.to_string())),
     }
+}
+
+fn engine_from(text: String) -> Result<Engine, StoreError> {
+    Ok(serde_json::from_value(serde_json::Value::String(text))?)
 }
 
 /// Paths are stored as text; a path that is not valid Unicode is not indexed.
@@ -418,7 +706,7 @@ mod tests {
             caught_up: false,
             generation: 0,
             discovered: false,
-            emitted_through: None,
+            accepted: HashSet::new(),
             meta: None,
             facts: Facts::default(),
         }
@@ -432,16 +720,21 @@ mod tests {
         store.insert(&r).expect("insert");
         assert!(store.insert(&row("/t/a.jsonl")).is_err(), "path is unique");
 
+        // Keys have the full u64 range.
+        let keys = vec![1, u64::MAX, 1 << 63];
         store
             .commit(&Commit::Partial {
                 session: r.session,
-                emitted_through: Some(40),
+                keys: keys.clone(),
             })
             .expect("partial");
         let got = store.get(r.session).expect("get").expect("row");
-        // A partial commit changes nothing but `emitted_through`.
-        assert_eq!((got.emitted_through, got.discovered), (Some(40), false));
+        // A partial commit changes nothing but the accepted items.
+        assert_eq!(got.accepted, keys.iter().copied().collect());
+        assert!(!got.discovered);
         assert_eq!(got.cursor, Cursor::default());
+        let found = store.find(&r.path, None).expect("find").expect("row");
+        assert_eq!(found.accepted, got.accepted);
 
         let mut full = got.clone();
         full.cursor = Cursor {
@@ -460,8 +753,22 @@ mod tests {
             .expect("full");
         drop(store);
 
+        // Saving the cursor empties the accepted items.
         let reopened = Store::open(dir.path()).expect("reopen");
+        full.accepted.clear();
         assert_eq!(reopened.load_all().expect("load"), vec![full.clone()]);
+        assert_eq!(
+            reopened
+                .session_by_native(Engine::Claude, "n")
+                .expect("native"),
+            Some(full.session)
+        );
+        assert_eq!(
+            reopened
+                .session_by_native(Engine::Codex, "n")
+                .expect("native"),
+            None
+        );
 
         let found = reopened.find(&full.path, None).expect("find");
         assert_eq!(found.as_ref().map(|r| r.session), Some(full.session));
@@ -481,6 +788,98 @@ mod tests {
                 .expect("find")
                 .is_some()
         );
+    }
+
+    fn terminal(engine: Engine, native_id: Option<&str>, cwd: &str, at: i64) -> TerminalRow {
+        TerminalRow {
+            terminal: TerminalId::new(),
+            native_target: None,
+            session: None,
+            engine: Some(engine),
+            native_id: native_id.map(Into::into),
+            cwd: cwd.into(),
+            started_at: at,
+        }
+    }
+
+    #[test]
+    fn started_terminals_are_claimed_by_their_sessions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open");
+        let now = 10_000_000;
+        let by_id = terminal(Engine::Claude, Some("abc"), "/w", now);
+        let by_folder = terminal(Engine::Codex, None, "/w/p/", now - 1000);
+        for t in [&by_id, &by_folder] {
+            store.put_terminal(t).expect("put");
+        }
+
+        // A Claude session with another id does not take it; the one with its id does.
+        let (s1, s2) = (SessionId::new(), SessionId::new());
+        let claim = |s, engine, native: &str, cwd, started| {
+            store
+                .claim_terminal(s, engine, native, cwd, started, now)
+                .expect("claim")
+        };
+        assert_eq!(claim(s1, Engine::Claude, "zzz", Some("/w"), now), None);
+        assert_eq!(
+            claim(s2, Engine::Claude, "abc", Some("/other"), now),
+            Some(by_id.terminal)
+        );
+        // Claiming again (a replay) gives the same terminal.
+        assert_eq!(
+            claim(s2, Engine::Claude, "abc", Some("/other"), now),
+            Some(by_id.terminal)
+        );
+
+        // Codex: by folder, only for a session that started after the terminal.
+        let (old, new) = (SessionId::new(), SessionId::new());
+        assert_eq!(
+            claim(old, Engine::Codex, "x", Some("/w/p"), now - 60_000),
+            None
+        );
+        assert_eq!(
+            claim(new, Engine::Codex, "y", Some("/w/p"), now),
+            Some(by_folder.terminal)
+        );
+        assert_eq!(
+            store.terminal_of(new).expect("of").map(|t| t.terminal),
+            Some(by_folder.terminal)
+        );
+
+        // Linking a session to a new terminal forgets its old one.
+        let mut next = terminal(Engine::Claude, Some("abc"), "/w", now + 1);
+        next.session = Some(s2);
+        store.put_terminal(&next).expect("put");
+        assert_eq!(store.terminals().expect("all").len(), 2);
+        assert_eq!(
+            store.terminal_of(s2).expect("of").map(|t| t.terminal),
+            Some(next.terminal)
+        );
+        let moved = TerminalId::new();
+        store
+            .retarget_terminal(next.terminal, moved)
+            .expect("retarget");
+        assert_eq!(
+            store.terminal_of(s2).expect("of").map(|t| t.terminal),
+            Some(moved)
+        );
+        store.unlink_session(s2).expect("unlink");
+        assert!(store.terminal_of(s2).expect("of").is_none());
+    }
+
+    #[test]
+    fn outcomes_are_kept_for_a_week() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open");
+        let (old, new) = (CommandId::new(), CommandId::new());
+        let ok = CommandOutcome::Ok { detail: None };
+        store.save_outcome(old, &ok, 0).expect("save");
+        assert_eq!(store.outcome(old).expect("get"), Some(ok.clone()));
+        store
+            .save_outcome(new, &ok, OUTCOME_TTL_MS + 1)
+            .expect("save");
+        assert_eq!(store.outcome(old).expect("get"), None);
+        assert_eq!(store.outcome(new).expect("get"), Some(ok));
     }
 
     #[test]
@@ -508,7 +907,7 @@ mod tests {
                 err,
                 StoreError::TooNew {
                     found: 99,
-                    known: 1
+                    known: 2
                 }
             ),
             "{err}"

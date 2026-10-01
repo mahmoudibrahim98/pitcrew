@@ -244,6 +244,8 @@ pub fn label(e: &Event) -> String {
             receipt: Receipt::Transcript { offset, .. },
             ..
         } => format!("turn@{offset}"),
+        EventBody::SessionEnded { .. } => "ended".into(),
+        EventBody::SessionLinked { basis, .. } => format!("linked:{basis:?}"),
         other => format!("{other:?}"),
     }
 }
@@ -254,4 +256,61 @@ pub fn labels(events: &[Event]) -> Vec<String> {
 
 pub fn fixture_transcript() -> PathBuf {
     pitcrew_fixtures::data_dir().join("transcripts/claude/demo-session.jsonl")
+}
+
+/// The Claude fixture's session id.
+pub const FIXTURE_ID: &str = "2b6f1a8e-4c1d-4f5e-9a37-0c8d1e2f3a4b";
+
+/// The fixture's lines, each with its newline.
+pub fn fixture_lines() -> Vec<Vec<u8>> {
+    std::fs::read(fixture_transcript())
+        .unwrap()
+        .split_inclusive(|b| *b == b'\n')
+        .map(<[u8]>::to_vec)
+        .collect()
+}
+
+/// The fixture's lines, as the session `id`.
+pub fn fixture_lines_as(id: &str) -> Vec<Vec<u8>> {
+    fixture_lines()
+        .into_iter()
+        .map(|l| {
+            String::from_utf8(l)
+                .unwrap()
+                .replace(FIXTURE_ID, id)
+                .into_bytes()
+        })
+        .collect()
+}
+
+/// Where Claude keeps the transcript of session `id` in `home`; the folder is created.
+pub fn claude_file(home: &Path, id: &str) -> PathBuf {
+    let dir = home.join("projects").join("-w-paper");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join(format!("{id}.jsonl"))
+}
+
+/// The session an event is about.
+pub fn session_of(e: &Event) -> Option<pitcrew_protocol::ids::SessionId> {
+    match &e.body {
+        EventBody::SessionDiscovered { session } => Some(session.id),
+        EventBody::SessionStateChanged { session, .. }
+        | EventBody::ToolRan { session, .. }
+        | EventBody::FileEdited { session, .. }
+        | EventBody::TurnEnded { session, .. }
+        | EventBody::SessionEnded { session }
+        | EventBody::SessionLinked { session, .. } => Some(*session),
+        _ => None,
+    }
+}
+
+/// The session in the first `session_discovered` event.
+pub fn discovered(events: &[Event]) -> pitcrew_protocol::model::Session {
+    events
+        .iter()
+        .find_map(|e| match &e.body {
+            EventBody::SessionDiscovered { session } => Some(session.clone()),
+            _ => None,
+        })
+        .unwrap()
 }

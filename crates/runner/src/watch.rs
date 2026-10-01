@@ -15,21 +15,31 @@
 //! - while a transcript is hot, its folder and that folder's parent (sub-agent and day folders).
 //!
 //! A slow sweep re-checks every transcript by size and mtime. Homes on network filesystems are
-//! polled instead, and swept and rediscovered [`NETWORK_SLOWDOWN`] times less often.
+//! polled instead, and swept and rediscovered [`NETWORK_SLOWDOWN`] times less often; a hook for
+//! an unknown session never makes them look sooner.
+//!
+//! The same thread applies states reported by hooks and the runtime ([`Signal`]s), so they and
+//! the transcripts agree (see `derive::report`), and links sessions to workstreams. It also
+//! decides, by the session's agent, whether a hook's sender may change the session (the rule is
+//! on [`RunnerHooks`](crate::RunnerHooks)).
 
+use crate::agents::{SessionAgent, SessionAgents};
 use crate::config::{EngineHome, PollMode, Timing};
-use crate::derive::{self, Derived, Facts};
+use crate::derive::{self, Derived, Facts, Reported};
 use crate::fsinfo::{self, FileStat};
+use crate::held::Held;
+use crate::hooks::{self, Sender};
+use crate::link::{self, Locations, WorkstreamLocation};
 use crate::sink::Batch;
 use crate::store::{Commit, Row, Store, path_text};
 use notify::event::{EventKind, MetadataKind, ModifyKind};
 use notify::{RecursiveMode, Watcher as _};
 use pitcrew_interfaces::source::{Cursor, ParseChunk, SourceAdapter, SourceError, TranscriptRef};
 use pitcrew_protocol::events::{Event, EventBody};
-use pitcrew_protocol::ids::{EventId, MachineId, MemberId, SessionId, WorkspaceId};
-use pitcrew_protocol::model::{Engine, Session, TimestampMs};
+use pitcrew_protocol::ids::{EventId, MachineId, MemberId, SessionId, TerminalId, WorkspaceId};
+use pitcrew_protocol::model::{Engine, LinkBasis, Session, SessionState, TimestampMs};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::SyncSender;
@@ -53,8 +63,49 @@ const NOTIFY_WARN_GAP: Duration = Duration::from_secs(60);
 /// The identity saved for a transcript whose file was deleted. It matches no real file, so a file
 /// that appears at the path later is read from the start, even if it reuses the old inode.
 const GONE: &str = "gone";
+/// Reported states waiting for the watcher; past this the sender with the most waiting loses
+/// its oldest.
+const MAX_SIGNALS: usize = 1024;
+/// Least time between two "too many reported states" warnings.
+const SIGNALS_WARN_GAP: Duration = Duration::from_secs(60);
 
-/// Signals from notifications and the handle to the watcher thread.
+/// A state reported outside the transcripts, for one session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Signal {
+    pub target: Target,
+    pub report: Reported,
+    pub origin: Origin,
+}
+
+/// Who reported a [`Signal`], and so whether it is checked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// The runner itself (a command it ran): applied as is.
+    Runner,
+    /// An agent hook: applied only if its sender may change the session.
+    Hook(Sender),
+}
+
+impl Origin {
+    /// Who to count it against when signals pile up: the hook's member, or the runner.
+    fn member(self) -> Option<MemberId> {
+        match self {
+            Self::Runner => None,
+            Self::Hook(sender) => Some(sender.member()),
+        }
+    }
+}
+
+/// Which session a [`Signal`] is about.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Target {
+    /// By the CLI's own session id (hooks).
+    Native { engine: Engine, native_id: String },
+    /// By the runner's id (commands).
+    Session(SessionId),
+}
+
+/// Signals from notifications, hooks, commands and the handle to the watcher thread.
 #[derive(Debug, Default)]
 pub(crate) struct Shared {
     signals: Mutex<Signals>,
@@ -67,9 +118,18 @@ struct Signals {
     dirty: HashMap<PathBuf, Dirty>,
     /// Too many dirty paths, or lost events: check every transcript instead.
     overflow: bool,
+    /// When to run discovery in every home (asked for, or events were lost).
     rediscover_at: Option<Instant>,
+    /// When to look for new transcripts in the homes that are not slow (network homes keep their
+    /// own, rarer schedule): a new file appeared, or a hook named an unknown session.
+    look_at: Option<Instant>,
     stop: bool,
     notify_warned_at: Option<Instant>,
+    /// Reported states, in arrival order.
+    reports: VecDeque<Signal>,
+    signals_warned_at: Option<Instant>,
+    /// Workstream locations changed: link every session again.
+    relink: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -99,7 +159,7 @@ impl Shared {
             if s.dirty.len() >= MAX_DIRTY_PATHS {
                 s.overflow = true;
                 if created {
-                    s.rediscover_at = Some(s.rediscover_at.map_or(due, |r| r.min(due)));
+                    s.look_at = Some(s.look_at.map_or(due, |r| r.min(due)));
                 }
                 continue;
             }
@@ -133,6 +193,33 @@ impl Shared {
 
     pub fn rescan(&self) {
         self.lock().rediscover_at = Some(Instant::now());
+        self.cv.notify_one();
+    }
+
+    /// Hands a reported state to the watcher. It never blocks: a hook must not wait. When too
+    /// many wait, the sender with the most waiting loses its oldest, so a flood from one sender
+    /// costs only that sender.
+    pub fn signal(&self, signal: Signal) {
+        let mut s = self.lock();
+        if s.reports.len() >= MAX_SIGNALS {
+            drop_one(&mut s.reports);
+            let now = Instant::now();
+            if s.signals_warned_at
+                .is_none_or(|t| now.duration_since(t) >= SIGNALS_WARN_GAP)
+            {
+                s.signals_warned_at = Some(now);
+                tracing::warn!(
+                    "too many reported states waiting; dropping the oldest of the sender with the most"
+                );
+            }
+        }
+        s.reports.push_back(signal);
+        drop(s);
+        self.cv.notify_one();
+    }
+
+    pub fn relink(&self) {
+        self.lock().relink = true;
         self.cv.notify_one();
     }
 
@@ -257,6 +344,17 @@ pub(crate) struct Watcher {
     /// Folders outside their home that hold transcripts: warned once.
     outside: HashSet<PathBuf>,
     last_rediscover: Option<Instant>,
+    /// Workstream locations, to link sessions to.
+    locations: Option<Arc<dyn Locations>>,
+    /// The CLI's session id → tracked transcript.
+    by_native: HashMap<(Engine, String), u64>,
+    by_session: HashMap<SessionId, u64>,
+    /// Hooks for sessions not indexed yet.
+    held: Held,
+    /// Who runs each session; without it every hook is refused.
+    agents: Option<Arc<dyn SessionAgents>>,
+    /// The agent lookup panicked; warned once.
+    lookup_panicked: bool,
 }
 
 pub(crate) struct Setup {
@@ -272,6 +370,8 @@ pub(crate) struct Setup {
     pub store: Arc<Mutex<Store>>,
     pub tx: SyncSender<Batch>,
     pub shared: Arc<Shared>,
+    pub locations: Option<Arc<dyn Locations>>,
+    pub agents: Option<Arc<dyn SessionAgents>>,
 }
 
 impl Watcher {
@@ -290,6 +390,9 @@ impl Watcher {
                 }
             }
         };
+        if s.agents.is_none() {
+            tracing::info!("no session agents configured: every hook will be refused");
+        }
         let now = Instant::now();
         let mut homes = Vec::new();
         for h in s.homes {
@@ -341,6 +444,12 @@ impl Watcher {
             skipped: HashSet::new(),
             outside: HashSet::new(),
             last_rediscover: None,
+            locations: s.locations,
+            by_native: HashMap::new(),
+            by_session: HashMap::new(),
+            held: Held::default(),
+            agents: s.agents,
+            lookup_panicked: false,
         }
     }
 
@@ -439,13 +548,13 @@ impl Watcher {
             }
             let now = Instant::now();
             let mut next = deadline;
-            if let Some(r) = s.rediscover_at {
+            for r in [s.rediscover_at, s.look_at].into_iter().flatten() {
                 next = next.min(r);
             }
             if let Some(d) = s.dirty.values().map(|d| d.due).min() {
                 next = next.min(d);
             }
-            if s.overflow || next <= now {
+            if s.overflow || next <= now || !s.reports.is_empty() || s.relink {
                 let mut due = Vec::new();
                 s.dirty.retain(|p, d| {
                     if d.due <= now {
@@ -459,11 +568,18 @@ impl Watcher {
                 if rediscover {
                     s.rediscover_at = None;
                 }
+                let look = s.look_at.is_some_and(|r| r <= now);
+                if look {
+                    s.look_at = None;
+                }
                 let overflow = std::mem::take(&mut s.overflow);
                 return Some(Wake {
                     due,
                     overflow,
                     rediscover,
+                    look,
+                    reports: s.reports.drain(..).collect(),
+                    relink: std::mem::take(&mut s.relink),
                 });
             }
             s = shared
@@ -474,6 +590,11 @@ impl Watcher {
     }
 
     fn handle(&mut self, wake: Wake) -> Result<(), Hangup> {
+        // Reports first: beating the transcripts is what they are for.
+        self.apply_reports(wake.reports)?;
+        if wake.relink {
+            self.relink_all()?;
+        }
         let now = Instant::now();
         let mut maybe_new = false;
         for (path, created) in wake.due {
@@ -489,15 +610,13 @@ impl Watcher {
         }
         if maybe_new {
             // A new file or folder in a watched folder: maybe a new session.
-            let at = self
-                .last_rediscover
-                .map_or(now, |l| after(l, REDISCOVER_GAP))
-                .max(after(now, self.timing.debounce));
-            let mut s = self.shared.lock();
-            s.rediscover_at = Some(s.rediscover_at.map_or(at, |r| r.min(at)));
+            self.look_soon(now);
         }
         let due: Vec<usize> = (0..self.homes.len())
-            .filter(|&h| wake.rediscover || self.homes[h].next_rediscover <= now)
+            .filter(|&h| {
+                let home = &self.homes[h];
+                wake.rediscover || (wake.look && !home.slow) || home.next_rediscover <= now
+            })
             .collect();
         if !due.is_empty() {
             self.rediscover(&due)?;
@@ -549,7 +668,7 @@ impl Watcher {
     /// whose changes are due, so live sessions don't wait for the backfill.
     fn serve_due(&mut self) -> Result<(), Hangup> {
         let now = Instant::now();
-        let due: Vec<PathBuf> = {
+        let (due, reports): (Vec<PathBuf>, Vec<Signal>) = {
             let mut s = self.shared.lock();
             if s.stop {
                 return Err(Hangup);
@@ -563,8 +682,9 @@ impl Watcher {
                     true
                 }
             });
-            due
+            (due, s.reports.drain(..).collect())
         };
+        self.apply_reports(reports)?;
         for path in due {
             for id in self.by_path.get(&path).cloned().unwrap_or_default() {
                 self.check(id)?;
@@ -722,6 +842,10 @@ impl Watcher {
         self.by_key
             .insert((row.path.clone(), row.inner_id.clone()), id);
         self.by_path.entry(row.path.clone()).or_default().push(id);
+        self.by_session.insert(row.session, id);
+        if row.meta.is_some() {
+            self.by_native.insert((row.engine, native_id(&row)), id);
+        }
         self.note_outside(&row.path, home);
         self.tracked.insert(
             id,
@@ -760,6 +884,8 @@ impl Watcher {
             self.by_path.remove(&row.path);
         }
         self.by_raw.retain(|_, i| *i != id);
+        self.by_native.retain(|_, i| *i != id);
+        self.by_session.remove(&row.session);
         for d in &t.watched {
             self.unwatch_dir(d);
         }
@@ -993,30 +1119,64 @@ impl Watcher {
             return Ok(());
         };
         let session = t.row.session;
+        let place = |row: &Row| row.meta.as_ref().map(|m| (m.cwd.clone(), m.branch.clone()));
+        let was = place(&t.row);
         if let Some(meta) = chunk.meta {
             t.row.meta = Some(meta);
         }
+        let first = !t.row.discovered;
+        let moved = !first && place(&t.row) != was;
         let cwd = t.row.meta.as_ref().and_then(|m| m.cwd.clone());
-        let emit_states = t.row.discovered;
-        let skip_through = t.row.emitted_through;
+        let ctx = derive::Ctx {
+            session,
+            cwd: cwd.as_deref(),
+            emit_states: !first,
+        };
 
         let mut derived: Vec<Derived> = Vec::new();
+        let mut seen: HashMap<u64, u32> = HashMap::new();
         for item in &chunk.items {
             let before = derived.len();
-            derive::apply(
-                &mut t.row.facts,
-                session,
-                cwd.as_deref(),
-                item,
-                emit_states,
-                &mut derived,
-            );
-            // Already accepted before a crash: fold the item, don't send it again.
-            if skip_through.is_some_and(|s| item.offset() <= s) {
+            let mut key = derive::item_key(item);
+            let n = seen.entry(key).or_insert(0);
+            if *n > 0 {
+                key = derive::nth(key, *n);
+            }
+            *n += 1;
+            derive::apply(&mut t.row.facts, &ctx, item, key, &mut derived);
+            // Accepted before a crash: fold the item, don't send it again.
+            if t.row.accepted.contains(&key) {
                 derived.truncate(before);
             }
         }
+        let engine = t.row.engine;
+        let native = native_id(&t.row);
+        let path = t.row.path.clone();
+        let subagent = t.row.meta.as_ref().is_some_and(|m| m.is_subagent);
+        let started = t.row.meta.as_ref().and_then(|m| m.started);
+        if !native.is_empty() {
+            self.by_native.insert((engine, native.clone()), id);
+        }
 
+        // Facts from elsewhere: the parent of a sub-agent, the terminal the runner started the
+        // session in, hooks that came before the transcript, and workstream locations.
+        let (parent, terminal, held) = if first {
+            let parent = subagent.then(|| self.parent_of(engine, &path)).flatten();
+            let terminal = if subagent {
+                None
+            } else {
+                self.claim_terminal(session, engine, &native, cwd.as_deref(), started)
+            };
+            let held = self.allowed_held(session, engine, &native);
+            (parent, terminal, held)
+        } else {
+            (None, None, Vec::new())
+        };
+        let places = (first || moved).then(|| self.places(session)).flatten();
+
+        let Some(t) = self.tracked.get_mut(&id) else {
+            return Ok(());
+        };
         let event = |id, at, body| Event {
             id,
             at,
@@ -1026,19 +1186,54 @@ impl Watcher {
             body,
         };
         let mut events: Vec<(Option<u64>, Event)> = Vec::new();
-        if !t.row.discovered {
-            let s = session_of(&t.row, &t.tref, machine);
-            let id = event_id(session, 0, None, 0, discovered_id_time(&t.row));
+        if first {
+            // Hooks that came first are folded in, oldest first, unless the transcript is newer.
+            let mut changed = false;
+            for r in &held {
+                changed |= derive::report(&mut t.row.facts, r).is_some();
+            }
+            let ended = changed && t.row.facts.state == SessionState::Ended;
+            let s = session_of(&t.row, &t.tref, machine, parent, terminal);
+            let at = discovered_id_time(&t.row);
             events.push((
                 None,
-                event(id, s.started, EventBody::SessionDiscovered { session: s }),
+                event(
+                    event_id(session, 0, Cause::Discovered, 0, at),
+                    s.started,
+                    EventBody::SessionDiscovered { session: s },
+                ),
             ));
+            if ended {
+                t.row.facts.reports += 1;
+                let n = t.row.facts.reports;
+                let at = t.row.facts.reported_at.unwrap_or(at);
+                events.push((
+                    None,
+                    event(
+                        event_id(session, t.row.generation, Cause::Report(n), 0, at),
+                        at,
+                        EventBody::SessionEnded { session },
+                    ),
+                ));
+            }
             t.row.discovered = true;
         }
+        if let Some((locations, stands)) = &places {
+            let at = if first {
+                discovered_id_time(&t.row)
+            } else {
+                crate::now_ms()
+            };
+            if let Some(e) = link_event(&mut t.row, machine, locations, *stands, at) {
+                events.push((None, event(e.0, e.1, e.2)));
+            }
+        }
+        let mut last: Option<u64> = None;
+        let mut seq = 0u32;
         for d in derived {
-            let seq = next_seq(&mut t.row.facts, d.key);
-            let id = event_id(session, t.row.generation, Some(d.key), seq, d.at);
-            t.row.emitted_through = Some(t.row.emitted_through.map_or(d.key, |e| e.max(d.key)));
+            seq = if last == Some(d.key) { seq + 1 } else { 0 };
+            last = Some(d.key);
+            let id = event_id(session, t.row.generation, Cause::Item(d.key), seq, d.at);
             events.push((Some(d.key), event(id, d.at, d.body)));
         }
         t.row.cursor = chunk.cursor;
@@ -1046,12 +1241,251 @@ impl Watcher {
         t.row.mtime = st.mtime;
         t.row.identity.clone_from(&st.identity);
         t.row.caught_up = caught_up;
+        if caught_up {
+            // The replay after a crash is over.
+            t.row.accepted.clear();
+        }
 
-        let batches = split(events, self.max_batch, skip_through, &t.row);
+        let batches = split(events, self.max_batch, &t.row);
         for b in batches {
             self.tx.send(b).map_err(|_| Hangup)?;
         }
         Ok(())
+    }
+
+    /// Applies reported states: at once for indexed sessions or, for a hook, held until the
+    /// session's transcript is found. A hook applies only if its sender may change the session.
+    fn apply_reports(&mut self, reports: Vec<Signal>) -> Result<(), Hangup> {
+        for s in reports {
+            let id = match &s.target {
+                Target::Native { engine, native_id } => {
+                    self.by_native.get(&(*engine, native_id.clone())).copied()
+                }
+                Target::Session(session) => self.by_session.get(session).copied(),
+            };
+            let indexed = id.and_then(|id| {
+                self.tracked
+                    .get(&id)
+                    .filter(|t| t.row.discovered)
+                    .map(|t| (id, t.row.session))
+            });
+            tracing::debug!(target = ?s.target, report = ?s.report, origin = ?s.origin, tracked = ?id, "reported state");
+            match (indexed, s.origin) {
+                (Some((id, _)), Origin::Runner) => self.apply_report(id, &s.report)?,
+                (Some((id, session)), Origin::Hook(sender)) => {
+                    match hooks::refusal(&sender, &self.agent_of(session)) {
+                        None => self.apply_report(id, &s.report)?,
+                        Some(reason) => {
+                            tracing::debug!(%session, target = ?s.target, member = %sender.member(), reason, "hook refused; dropped");
+                        }
+                    }
+                }
+                (None, Origin::Hook(sender)) => match s.target {
+                    Target::Native { engine, native_id } => {
+                        self.hold(engine, native_id, sender, s.report);
+                    }
+                    Target::Session(session) => {
+                        tracing::debug!(%session, "a hook for a session not indexed; ignored");
+                    }
+                },
+                (None, Origin::Runner) => {
+                    tracing::debug!(target = ?s.target, "a reported state for a session not indexed; ignored");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The session's agent, from the [`SessionAgents`]: unknown without them, or if they panic.
+    /// Called on this thread, which is why it must never call back into the runner.
+    fn agent_of(&mut self, session: SessionId) -> SessionAgent {
+        let Some(agents) = self.agents.clone() else {
+            return SessionAgent::Unknown;
+        };
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| agents.agent_of(session))) {
+            Ok(agent) => agent,
+            Err(panic) => {
+                let message = panic_text(&*panic);
+                if self.lookup_panicked {
+                    tracing::debug!(%session, panic = message, "the session agent lookup panicked; the agent is unknown");
+                } else {
+                    tracing::warn!(%session, panic = message, "the session agent lookup panicked; the agent is unknown, and the hook refused");
+                    self.lookup_panicked = true;
+                }
+                SessionAgent::Unknown
+            }
+        }
+    }
+
+    /// The hooks held for a newly discovered session whose senders may apply them, oldest
+    /// first. The others are dropped.
+    fn allowed_held(&mut self, session: SessionId, engine: Engine, native: &str) -> Vec<Reported> {
+        let held = self.held.take(engine, native, Instant::now());
+        if held.is_empty() {
+            return Vec::new();
+        }
+        let agent = self.agent_of(session);
+        held.into_iter()
+            .filter_map(|(sender, report)| match hooks::refusal(&sender, &agent) {
+                None => Some(report),
+                Some(reason) => {
+                    tracing::debug!(%session, member = %sender.member(), reason, "a held hook refused at discovery; dropped");
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn apply_report(&mut self, id: u64, r: &Reported) -> Result<(), Hangup> {
+        let (workspace, owner) = (self.workspace, self.owner);
+        let Some(t) = self.tracked.get_mut(&id) else {
+            return Ok(());
+        };
+        let Some(from) = derive::report(&mut t.row.facts, r) else {
+            return Ok(());
+        };
+        t.row.facts.reports += 1;
+        let (session, generation, n) = (t.row.session, t.row.generation, t.row.facts.reports);
+        let events = derive::reported_events(session, from, &t.row.facts)
+            .into_iter()
+            .zip(0u32..)
+            .map(|(body, seq)| Event {
+                id: event_id(session, generation, Cause::Report(n), seq, r.at),
+                at: r.at,
+                workspace,
+                author: owner,
+                on_behalf_of: None,
+                body,
+            })
+            .collect();
+        self.tx
+            .send(Batch {
+                events,
+                commit: Commit::Full(Box::new(t.row.clone())),
+            })
+            .map_err(|_| Hangup)
+    }
+
+    /// Holds a hook for a session whose transcript is not indexed yet (see `held`), and looks
+    /// for it soon, unless its sender asked for a look just now.
+    fn hold(&mut self, engine: Engine, native_id: String, sender: Sender, report: Reported) {
+        let now = Instant::now();
+        if self.held.hold(engine, native_id, sender, report, now) {
+            // Its transcript may have just appeared.
+            self.look_soon(now);
+        }
+    }
+
+    /// Looks for new transcripts soon in the homes that are not slow, at most once per
+    /// [`REDISCOVER_GAP`]. Slow (network) homes keep their own schedule.
+    fn look_soon(&self, now: Instant) {
+        let at = self
+            .last_rediscover
+            .map_or(now, |l| after(l, REDISCOVER_GAP))
+            .max(after(now, self.timing.debounce));
+        let mut s = self.shared.lock();
+        s.look_at = Some(s.look_at.map_or(at, |r| r.min(at)));
+    }
+
+    /// Workstream locations and the session's standing link, when linking is on.
+    fn places(&self, session: SessionId) -> Option<(Vec<WorkstreamLocation>, Option<LinkBasis>)> {
+        let locations = self.locations.as_ref()?;
+        Some((locations.locations(), locations.link_of(session)))
+    }
+
+    /// Links every session again, after the locations changed.
+    fn relink_all(&mut self) -> Result<(), Hangup> {
+        let Some(locations) = self.locations.clone() else {
+            return Ok(());
+        };
+        let all = locations.locations();
+        let (workspace, owner, machine) = (self.workspace, self.owner, self.machine);
+        let ids: Vec<u64> = self.tracked.keys().copied().collect();
+        for id in ids {
+            self.serve_due()?;
+            let Some(t) = self.tracked.get_mut(&id) else {
+                continue;
+            };
+            if !t.row.discovered {
+                continue;
+            }
+            let stands = locations.link_of(t.row.session);
+            let Some((eid, at, body)) =
+                link_event(&mut t.row, machine, &all, stands, crate::now_ms())
+            else {
+                continue;
+            };
+            let event = Event {
+                id: eid,
+                at,
+                workspace,
+                author: owner,
+                on_behalf_of: None,
+                body,
+            };
+            self.tx
+                .send(Batch {
+                    events: vec![event],
+                    commit: Commit::Full(Box::new(t.row.clone())),
+                })
+                .map_err(|_| Hangup)?;
+        }
+        Ok(())
+    }
+
+    /// For a Claude sub-agent's transcript, its parent's session. A parent not indexed yet gets
+    /// its session id now, which its discovery then keeps.
+    fn parent_of(&self, engine: Engine, path: &Path) -> Option<SessionId> {
+        let parent = parent_transcript(path)?.canonicalize().ok()?;
+        if let Some(t) = self
+            .by_key
+            .get(&(parent.clone(), None))
+            .and_then(|id| self.tracked.get(id))
+        {
+            return Some(t.row.session);
+        }
+        let store = self.store_lock();
+        match store.find(&parent, None) {
+            Ok(Some(row)) => Some(row.session),
+            Ok(None) => {
+                let row = new_row(&TranscriptRef {
+                    engine,
+                    path: parent,
+                    inner_id: None,
+                    size: 0,
+                    modified: 0,
+                });
+                match store.insert(&row) {
+                    Ok(()) => Some(row.session),
+                    Err(e) => {
+                        tracing::warn!(path = %row.path.display(), error = %e, "cannot index a sub-agent's parent");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(path = %parent.display(), error = %e, "cannot look up a sub-agent's parent");
+                None
+            }
+        }
+    }
+
+    /// The terminal the runner started a newly discovered session in, if it did.
+    fn claim_terminal(
+        &self,
+        session: SessionId,
+        engine: Engine,
+        native: &str,
+        cwd: Option<&str>,
+        started: Option<TimestampMs>,
+    ) -> Option<TerminalId> {
+        let now = crate::now_ms();
+        self.store_lock()
+            .claim_terminal(session, engine, native, cwd, started.unwrap_or(now), now)
+            .unwrap_or_else(|e| {
+                tracing::warn!(%session, error = %e, "cannot look up the session's terminal");
+                None
+            })
     }
 
     fn store_lock(&self) -> MutexGuard<'_, Store> {
@@ -1065,7 +1499,12 @@ struct Wake {
     /// Due paths, each with whether it may be a new file.
     due: Vec<(PathBuf, bool)>,
     overflow: bool,
+    /// Discover in every home.
     rediscover: bool,
+    /// Discover in the homes that are not slow.
+    look: bool,
+    reports: Vec<Signal>,
+    relink: bool,
 }
 
 /// Whether a home is polled, and whether it is slow (a network filesystem, swept and rediscovered
@@ -1134,6 +1573,25 @@ fn is_not_found(e: &notify::Error) -> bool {
     }
 }
 
+/// Drops the oldest waiting signal of the sender with the most waiting (of those tied, the
+/// highest member id, a hook's before the runner's).
+fn drop_one(reports: &mut VecDeque<Signal>) {
+    let mut counts: HashMap<Option<MemberId>, usize> = HashMap::new();
+    for s in reports.iter() {
+        *counts.entry(s.origin.member()).or_default() += 1;
+    }
+    let Some(most) = counts
+        .into_iter()
+        .max_by_key(|(m, n)| (*n, *m))
+        .map(|(m, _)| m)
+    else {
+        return;
+    };
+    if let Some(i) = reports.iter().position(|s| s.origin.member() == most) {
+        reports.remove(i);
+    }
+}
+
 /// `now + d`, without overflowing on absurd durations (a year stands in).
 fn after(now: Instant, d: Duration) -> Instant {
     now.checked_add(d)
@@ -1155,14 +1613,17 @@ enum AdapterError {
 fn guard<T>(call: impl FnOnce() -> Result<T, SourceError>) -> Result<T, AdapterError> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
         Ok(result) => result.map_err(AdapterError::Source),
-        Err(panic) => Err(AdapterError::Panic(
-            panic
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_owned())
-                .or_else(|| panic.downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "no message".to_owned()),
-        )),
+        Err(panic) => Err(AdapterError::Panic(panic_text(&*panic).to_owned())),
     }
+}
+
+/// The message of a caught panic (`panic!` gives a `&str` or a `String`).
+fn panic_text(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("no message")
 }
 
 fn new_row(tref: &TranscriptRef) -> Row {
@@ -1178,20 +1639,22 @@ fn new_row(tref: &TranscriptRef) -> Row {
         caught_up: false,
         generation: 0,
         discovered: false,
-        emitted_through: None,
+        accepted: HashSet::new(),
         meta: None,
         facts: Facts::default(),
     }
 }
 
 /// A smaller file, or a different file (inode) at the same path, means it was truncated or
-/// replaced. Multi-session stores (`inner_id`) change size for other reasons and are not judged
-/// this way, but a file that was deleted and came back is new for everyone.
+/// replaced. Multi-session stores (`inner_id`, OpenCode's database) change size for other
+/// reasons, such as a revert deleting parts, and are not judged this way; but a file that was
+/// deleted and came back is new for everyone.
 fn needs_reindex(row: &Row, st: &FileStat) -> bool {
     let read_before = row.cursor != Cursor::default();
     let gone = row.identity.as_deref() == Some(GONE);
     let replaced = !fsinfo::same_file(row.identity.as_deref(), st.identity.as_deref());
-    read_before && (gone || (row.inner_id.is_none() && (st.size < row.size || replaced)))
+    let single = row.inner_id.is_none() && row.engine != Engine::OpenCode;
+    read_before && (gone || (single && (st.size < row.size || replaced)))
 }
 
 fn reindex(row: &mut Row, st: &FileStat) {
@@ -1204,22 +1667,16 @@ fn reindex(row: &mut Row, st: &FileStat) {
     );
     row.cursor = Cursor::default();
     row.generation += 1;
-    row.emitted_through = None;
+    row.accepted.clear();
     row.facts.open_calls.clear();
-    row.facts.last_key = None;
-    row.facts.seq = 0;
 }
 
-/// Splits events into batches of about `max`, never splitting one offset's events, so a partial
-/// commit's `emitted_through` covers whole records. The last batch saves the full row.
-fn split(
-    events: Vec<(Option<u64>, Event)>,
-    max: usize,
-    mut through: Option<u64>,
-    row: &Row,
-) -> Vec<Batch> {
+/// Splits events into batches of about `max`, never splitting one item's events, so a partial
+/// commit's accepted items are whole. The last batch saves the full row.
+fn split(events: Vec<(Option<u64>, Event)>, max: usize, row: &Row) -> Vec<Batch> {
     let mut out = Vec::new();
     let mut current: Vec<Event> = Vec::new();
+    let mut keys: Vec<u64> = Vec::new();
     let mut last_key: Option<u64> = None;
     for (key, ev) in events {
         if current.len() >= max && key.is_some() && key != last_key {
@@ -1227,12 +1684,14 @@ fn split(
                 events: std::mem::take(&mut current),
                 commit: Commit::Partial {
                     session: row.session,
-                    emitted_through: through,
+                    keys: std::mem::take(&mut keys),
                 },
             });
         }
         if let Some(k) = key {
-            through = Some(through.map_or(k, |t| t.max(k)));
+            if last_key != key {
+                keys.push(k);
+            }
             last_key = key;
         }
         current.push(ev);
@@ -1244,34 +1703,45 @@ fn split(
     out
 }
 
-fn next_seq(facts: &mut Facts, key: u64) -> u32 {
-    if facts.last_key == Some(key) {
-        facts.seq += 1;
-    } else {
-        facts.last_key = Some(key);
-        facts.seq = 0;
-    }
-    facts.seq
+/// What caused an event, for its id.
+#[derive(Clone, Copy, Debug)]
+enum Cause {
+    /// The session's discovery.
+    Discovered,
+    /// A transcript item, by its key.
+    Item(u64),
+    /// The n-th reported state.
+    Report(u32),
+    /// The n-th link.
+    Link(u32),
 }
 
-/// A ULID whose time is the event's and whose random part is a hash of where it came from, so an
+/// A ULID whose time is the event's and whose random part is a hash of what caused it, so an
 /// event sent again after a crash has the same id.
 fn event_id(
     session: SessionId,
     generation: u32,
-    key: Option<u64>,
+    cause: Cause,
     seq: u32,
     at: TimestampMs,
 ) -> EventId {
     let mut h = Sha256::new();
     h.update(session.0.to_bytes());
     h.update(generation.to_le_bytes());
-    match key {
-        Some(k) => {
+    match cause {
+        Cause::Discovered => h.update([0]),
+        Cause::Item(k) => {
             h.update([1]);
             h.update(k.to_le_bytes());
         }
-        None => h.update([0]),
+        Cause::Report(n) => {
+            h.update([2]);
+            h.update(n.to_le_bytes());
+        }
+        Cause::Link(n) => {
+            h.update([3]);
+            h.update(n.to_le_bytes());
+        }
     }
     h.update(seq.to_le_bytes());
     let digest = h.finalize();
@@ -1293,9 +1763,11 @@ fn discovered_id_time(row: &Row) -> TimestampMs {
         .unwrap_or_else(|| TimestampMs::try_from(row.session.0.timestamp_ms()).unwrap_or(0))
 }
 
-fn session_of(row: &Row, tref: &TranscriptRef, machine: MachineId) -> Session {
-    let meta = row.meta.clone().unwrap_or_default();
-    let native_id = Some(meta.native_id)
+/// The CLI's id for the session: from its records, else the store's inner id, else the file name.
+fn native_id(row: &Row) -> String {
+    row.meta
+        .as_ref()
+        .map(|m| m.native_id.clone())
         .filter(|n| !n.is_empty())
         .or_else(|| row.inner_id.clone())
         .or_else(|| {
@@ -1303,7 +1775,17 @@ fn session_of(row: &Row, tref: &TranscriptRef, machine: MachineId) -> Session {
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn session_of(
+    row: &Row,
+    tref: &TranscriptRef,
+    machine: MachineId,
+    parent: Option<SessionId>,
+    terminal: Option<TerminalId>,
+) -> Session {
+    let meta = row.meta.clone().unwrap_or_default();
     let last_activity = if row.facts.last_activity > 0 {
         row.facts.last_activity
     } else {
@@ -1312,7 +1794,7 @@ fn session_of(row: &Row, tref: &TranscriptRef, machine: MachineId) -> Session {
     Session {
         id: row.session,
         engine: row.engine,
-        native_id,
+        native_id: native_id(row),
         machine,
         cwd: meta.cwd.unwrap_or_default(),
         branch: meta.branch,
@@ -1325,9 +1807,62 @@ fn session_of(row: &Row, tref: &TranscriptRef, machine: MachineId) -> Session {
         status_line: row.facts.status_line.clone(),
         started: meta.started.unwrap_or(last_activity),
         last_activity,
-        terminal: None,
-        parent: None,
+        terminal,
+        parent,
     }
+}
+
+/// For a Claude sub-agent transcript `<project>/<session>/subagents/<agent>.jsonl`, its parent's
+/// transcript `<project>/<session>.jsonl`.
+fn parent_transcript(path: &Path) -> Option<PathBuf> {
+    let subagents = path.parent()?;
+    if subagents.file_name()? != "subagents" {
+        return None;
+    }
+    let session_dir = subagents.parent()?;
+    let mut name = session_dir.file_name()?.to_os_string();
+    name.push(".jsonl");
+    Some(session_dir.with_file_name(name))
+}
+
+/// The `session_linked` event for a new link, if the session should have one; records it in the
+/// row. Its id's time is the session's discovery time, so a replay repeats the id.
+fn link_event(
+    row: &mut Row,
+    machine: MachineId,
+    locations: &[WorkstreamLocation],
+    stands: Option<LinkBasis>,
+    at: TimestampMs,
+) -> Option<(EventId, TimestampMs, EventBody)> {
+    let meta = row.meta.as_ref()?;
+    let cwd = meta.cwd.as_deref()?;
+    let linked = link::relink(
+        machine,
+        locations,
+        stands,
+        cwd,
+        meta.branch.as_deref(),
+        row.facts.linked,
+    )?;
+    row.facts.linked = Some(linked);
+    row.facts.links += 1;
+    let id = event_id(
+        row.session,
+        0,
+        Cause::Link(row.facts.links),
+        0,
+        discovered_id_time(row),
+    );
+    Some((
+        id,
+        at,
+        EventBody::SessionLinked {
+            session: row.session,
+            workstream: Some(linked.workstream),
+            task: None,
+            basis: linked.basis,
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -1351,7 +1886,7 @@ mod tests {
             caught_up: true,
             generation: 0,
             discovered: true,
-            emitted_through: None,
+            accepted: HashSet::new(),
             meta: None,
             facts: Facts::default(),
         }
@@ -1374,6 +1909,10 @@ mod tests {
         let mut multi = row();
         multi.inner_id = Some("s".into());
         assert!(!needs_reindex(&multi, &stat(5, "1:2")));
+        // OpenCode's database shrinks when a revert deletes parts: not a truncation.
+        let mut opencode = row();
+        opencode.engine = Engine::OpenCode;
+        assert!(!needs_reindex(&opencode, &stat(5, "1:2")));
         let mut fresh = row();
         fresh.cursor = Cursor::default();
         assert!(!needs_reindex(&fresh, &stat(5, "1:2")));
@@ -1398,12 +1937,30 @@ mod tests {
     #[test]
     fn event_ids_repeat_for_the_same_origin() {
         let s = SessionId::new();
-        let a = event_id(s, 0, Some(10), 0, 1000);
-        assert_eq!(a, event_id(s, 0, Some(10), 0, 1000));
-        assert_ne!(a, event_id(s, 0, Some(10), 1, 1000));
-        assert_ne!(a, event_id(s, 1, Some(10), 0, 1000));
-        assert_ne!(a, event_id(s, 0, None, 0, 1000));
+        let a = event_id(s, 0, Cause::Item(10), 0, 1000);
+        assert_eq!(a, event_id(s, 0, Cause::Item(10), 0, 1000));
+        assert_ne!(a, event_id(s, 0, Cause::Item(10), 1, 1000));
+        assert_ne!(a, event_id(s, 1, Cause::Item(10), 0, 1000));
+        assert_ne!(a, event_id(s, 0, Cause::Discovered, 0, 1000));
+        assert_ne!(a, event_id(s, 0, Cause::Report(10), 0, 1000));
+        assert_ne!(
+            event_id(s, 0, Cause::Report(1), 0, 1000),
+            event_id(s, 0, Cause::Link(1), 0, 1000)
+        );
         assert_eq!(a.0.timestamp_ms(), 1000);
+    }
+
+    #[test]
+    fn a_sub_agent_transcript_names_its_parent() {
+        let p = Path::new("/h/projects/-w/abc/subagents/agent-1.jsonl");
+        assert_eq!(
+            parent_transcript(p),
+            Some(PathBuf::from("/h/projects/-w/abc.jsonl"))
+        );
+        assert_eq!(
+            parent_transcript(Path::new("/h/projects/-w/abc.jsonl")),
+            None
+        );
     }
 
     #[test]
@@ -1434,16 +1991,17 @@ mod tests {
                 ),
             )
         };
-        let batches = split(vec![ev(1), ev(1), ev(1), ev(2), ev(3)], 2, None, &r);
+        // Keys are item keys, not offsets: they need not grow.
+        let batches = split(vec![ev(9), ev(9), ev(9), ev(2), ev(3)], 2, &r);
         let sizes: Vec<usize> = batches.iter().map(|b| b.events.len()).collect();
         assert_eq!(sizes, [3, 2]);
-        assert!(matches!(
+        assert_eq!(
             batches[0].commit,
             Commit::Partial {
-                emitted_through: Some(1),
-                ..
+                session: r.session,
+                keys: vec![9]
             }
-        ));
+        );
         assert!(matches!(batches[1].commit, Commit::Full(_)));
     }
 
@@ -1473,6 +2031,91 @@ mod tests {
         let out = Path::new("/scratch/p/s.jsonl");
         assert!(wanted_dirs(out, home, false).is_empty());
         assert_eq!(wanted_dirs(out, home, true), [p("/scratch/p")]);
+    }
+
+    #[test]
+    fn a_flood_of_signals_costs_only_its_sender() {
+        use pitcrew_protocol::api::{Caller, TokenScope};
+        let sender = || {
+            Sender::new(Caller {
+                member: MemberId::new(),
+                scope: TokenScope::Agent,
+                on_behalf_of: Some(MemberId::new()),
+            })
+        };
+        let signal = |native_id: &str, origin| Signal {
+            target: Target::Native {
+                engine: Engine::Claude,
+                native_id: native_id.into(),
+            },
+            report: Reported {
+                at: 1,
+                to: SessionState::Ended,
+                status_line: None,
+            },
+            origin,
+        };
+        let (person, flood) = (sender(), sender());
+        let shared = Shared::default();
+        shared.signal(signal("mine", Origin::Hook(person)));
+        shared.signal(signal("ended", Origin::Runner));
+        for i in 0..3 * MAX_SIGNALS {
+            shared.signal(signal(&format!("f{i}"), Origin::Hook(flood)));
+        }
+        let s = shared.lock();
+        assert_eq!(s.reports.len(), MAX_SIGNALS);
+        let kept = |origin| s.reports.iter().filter(|r| r.origin == origin).count();
+        assert_eq!(kept(Origin::Hook(person)), 1);
+        assert_eq!(kept(Origin::Runner), 1);
+        assert_eq!(kept(Origin::Hook(flood)), MAX_SIGNALS - 2);
+        // The flood kept its newest.
+        assert_eq!(
+            s.reports.back().map(|r| r.target.clone()),
+            Some(Target::Native {
+                engine: Engine::Claude,
+                native_id: format!("f{}", 3 * MAX_SIGNALS - 1)
+            })
+        );
+    }
+
+    #[test]
+    fn a_tie_among_waiting_signals_drops_from_the_highest_member() {
+        use pitcrew_protocol::api::{Caller, TokenScope};
+        let signal = |n: u128, id: &str| Signal {
+            target: Target::Native {
+                engine: Engine::Claude,
+                native_id: id.into(),
+            },
+            report: Reported {
+                at: 1,
+                to: SessionState::Idle,
+                status_line: None,
+            },
+            origin: Origin::Hook(Sender::new(Caller {
+                member: MemberId(Ulid::from_parts(1, n)),
+                scope: TokenScope::Agent,
+                on_behalf_of: None,
+            })),
+        };
+        let left = |q: &VecDeque<Signal>| -> Vec<String> {
+            q.iter()
+                .map(|s| match &s.target {
+                    Target::Native { native_id, .. } => native_id.clone(),
+                    Target::Session(id) => id.to_string(),
+                })
+                .collect()
+        };
+        for _ in 0..20 {
+            let mut q: VecDeque<Signal> = [
+                signal(1, "a1"),
+                signal(2, "b1"),
+                signal(1, "a2"),
+                signal(2, "b2"),
+            ]
+            .into();
+            drop_one(&mut q);
+            assert_eq!(left(&q), ["a1", "a2", "b2"]);
+        }
     }
 
     #[test]

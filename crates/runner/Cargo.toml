@@ -11,6 +11,9 @@ authors.workspace = true
 [dependencies]
 pitcrew-protocol.workspace = true
 pitcrew-interfaces.workspace = true
+# The in-process hub link: the API's hook and terminal seams, and the hub's store.
+pitcrew-api.workspace = true
+pitcrew-store.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -28,8 +31,15 @@ rustix = { version = "=1.1.5", features = ["fs"] }
 [dev-dependencies]
 pitcrew-ingest.workspace = true
 pitcrew-fixtures.workspace = true
+pitcrew-auth.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true
+# The API's terminal tests, run against RunnerTerminals.
+axum.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower = { workspace = true, features = ["util"] }
+# Blocking WebSocket client, as in pitcrew-api's tests. The version axum's `ws` feature uses.
+tungstenite = "=0.29.0"
 
 [lints]
 workspace = true

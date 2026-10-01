@@ -1,8 +1,11 @@
 //! Runner configuration.
 
+use crate::agents::SessionAgents;
+use crate::link::Locations;
 use pitcrew_protocol::ids::{MachineId, MemberId, WorkspaceId};
 use pitcrew_protocol::model::Engine;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// One CLI's home on this machine, e.g. `~/.claude` or a `CLAUDE_CONFIG_DIR`.
@@ -82,6 +85,11 @@ pub struct RunnerConfig {
     pub channel_capacity: usize,
     /// Most events in one batch handed to the sink.
     pub max_batch_events: usize,
+    /// Workstream locations to link sessions to. Without them, nothing is linked.
+    pub locations: Option<Arc<dyn Locations>>,
+    /// Who runs each session, to decide whose hooks may change it (see
+    /// [`RunnerHooks`](crate::RunnerHooks)). Without it, every hook is refused.
+    pub agents: Option<Arc<dyn SessionAgents>>,
 }
 
 impl RunnerConfig {
@@ -103,6 +111,8 @@ impl RunnerConfig {
             timing: Timing::default(),
             channel_capacity: 64,
             max_batch_events: 256,
+            locations: None,
+            agents: None,
         }
     }
 
@@ -113,6 +123,20 @@ impl RunnerConfig {
             engine,
             path: path.into(),
         });
+        self
+    }
+
+    /// Links sessions to these workstream locations.
+    #[must_use]
+    pub fn with_locations(mut self, locations: Arc<dyn Locations>) -> Self {
+        self.locations = Some(locations);
+        self
+    }
+
+    /// Decides whose hooks may change a session by its agent, as `agents` tells it.
+    #[must_use]
+    pub fn with_agents(mut self, agents: Arc<dyn SessionAgents>) -> Self {
+        self.agents = Some(agents);
         self
     }
 }
