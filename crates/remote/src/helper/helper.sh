@@ -598,6 +598,8 @@ pc_start() {
     0) pc_say started 0; pc_say endpoint "$pc_line"; pc_end ;;
     2) pc_other_host ;;
   esac
+  # Nothing of ours runs here; nor may a SLURM job of this root, which shares run/.
+  pc_no_slurm_job
   pc_ver=$(readlink bin/current 2>/dev/null)
   case $pc_ver in
     [0123456789]*) ;;
@@ -732,6 +734,9 @@ pc_stop() {
   pc_state
   pc_st=$?
   if [ "$pc_st" -eq 2 ]; then pc_other_host; fi
+  # Nothing of ours runs here, so what is about to be removed may be a SLURM job's: not while
+  # one of this root may still run (with take-over set, its endpoint counts as gone above).
+  if [ "$pc_st" -ne 0 ]; then pc_no_slurm_job; fi
   if [ "$pc_st" -eq 0 ]; then
     pc_since=$(pc_started_at "$pc_epid")
     pc_still_locked
@@ -783,6 +788,29 @@ pc_slurm_env() {
     -e 's/^\(SACCT_[ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_]*\)=.*$/\1/p'); do
     unset "$pc_v"
   done
+}
+
+# For the direct and tmux launchers, under the launch lock: fails (in_use) while run/slurm.json
+# records a SLURM job of this root that is still queued or running, which shares run/ and its
+# socket. When squeue cannot say (missing, or failing), the job is taken to be there. squeue is
+# asked in a subshell, so the helper keeps the user's SLURM variables.
+pc_no_slurm_job() {
+  pc_job_recorded || return 0
+  if command -v squeue >/dev/null 2>&1; then
+    pc_qinfo=$(pc_slurm_env; pc_queue "$pc_rjob"; printf '%s:%s:%s' "$pc_q" "$pc_qstate" "$pc_qerr")
+  else
+    pc_qinfo='error::squeue is not on the PATH'
+  fi
+  pc_q=${pc_qinfo%%:*}
+  pc_rest=${pc_qinfo#*:}
+  pc_qstate=${pc_rest%%:*}
+  pc_qerr=${pc_rest#*:}
+  case $pc_q in
+    gone|foreign) return 0 ;;
+    ours) if pc_terminal "$pc_qstate"; then return 0; fi
+      pc_fail in_use "SLURM job $pc_rjob ($pc_qstate) uses this root; stop it first" ;;
+  esac
+  pc_fail in_use "run/slurm.json records SLURM job $pc_rjob, which may still run (squeue cannot say: $pc_qerr); stop it with the SLURM launcher, or remove run/slurm.json once it has ended"
 }
 
 # pc_on TOOL ARGS...: runs a SLURM tool on the recorded job's cluster, if sbatch named one.

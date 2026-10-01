@@ -1721,10 +1721,87 @@ fn slurm_never_overlaps_another_launcher() {
     .unwrap();
     let id = block_on(launcher.submit(&target)).unwrap().job;
     assert!(!endpoint.exists());
+    assert_eq!(sim.job(id).state, "PENDING");
 
-    // The direct launcher starts while the job waits in the queue: when the job then runs, it
-    // finds that helper recorded and ends without touching it, its socket or its record.
+    // While the job waits in the queue, the direct launcher neither starts a helper nor
+    // removes anything, with take-over or without; nor while squeue cannot say.
+    let taking = DirectLauncher::new(LaunchOptions {
+        take_over: true,
+        ..crate::unix::launch_options()
+    });
+    let in_use = |err: HelperError, what: &str| {
+        assert!(
+            matches!(&err, HelperError::InUse(d) if d.contains(what)),
+            "{what}: {err:?}"
+        );
+    };
+    in_use(block_on(direct.start(&target)).unwrap_err(), "(PENDING)");
+    in_use(block_on(taking.start(&target)).unwrap_err(), "(PENDING)");
+    in_use(block_on(direct.stop(&target)).unwrap_err(), "(PENDING)");
+    in_use(block_on(taking.stop(&target)).unwrap_err(), "(PENDING)");
+    sim.set(|c| {
+        c.squeue_error =
+            Some("slurm_load_jobs error: Unable to contact slurm controller".to_owned());
+    });
+    in_use(
+        block_on(direct.start(&target)).unwrap_err(),
+        "Unable to contact",
+    );
+    sim.set(|c| c.squeue_error = None);
+    let off = m.bin.join("squeue.off");
+    std::fs::rename(m.bin.join("squeue"), &off).unwrap();
+    in_use(
+        block_on(taking.stop(&target)).unwrap_err(),
+        "squeue is not on the PATH",
+    );
+    std::fs::rename(&off, m.bin.join("squeue")).unwrap();
+    assert!(!endpoint.exists());
+    assert!(!socket.exists());
+    block_on(launcher.cancel(&target)).unwrap();
+
+    // While a job starts (its modules take a few seconds to set up), before it records its
+    // endpoint: the same.
+    let init = m.dir.path().join("slow-init.sh");
+    std::fs::write(&init, "sleep 3\nmodule() { :; }\n").unwrap();
+    let slow = Site {
+        name: "slow".to_owned(),
+        modules_init: Some(init.to_str().unwrap().to_owned()),
+        modules: vec!["example-toolchain/1.0".to_owned()],
+        ..Site::default()
+    };
+    let slow =
+        SlurmLauncher::new(options()).with_script(render(&target, &slow, &JobOptions::default()));
+    let id = block_on(slow.submit(&target)).unwrap().job;
+    sim.release(id);
+    eventually("the job to run", || sim.job(id).state == "RUNNING");
+    assert!(!endpoint.exists());
+    in_use(block_on(direct.start(&target)).unwrap_err(), "(RUNNING)");
+    in_use(block_on(taking.stop(&target)).unwrap_err(), "(RUNNING)");
+    // Once it has started: its endpoint is on the node (another host), and take-over is
+    // refused too. Its socket and record are left alone.
+    let started = block_on(slow.start(&target)).unwrap().endpoint;
+    let err = block_on(direct.start(&target)).unwrap_err();
+    assert!(
+        matches!(&err, HelperError::OtherHost { host, launcher } if host == NODE && launcher == "slurm"),
+        "{err:?}"
+    );
+    in_use(block_on(taking.start(&target)).unwrap_err(), "(RUNNING)");
+    in_use(block_on(taking.stop(&target)).unwrap_err(), "(RUNNING)");
+    assert!(block_on(slow.job_status(&target)).unwrap().ready());
+    assert!(socket.exists());
+    assert!(alive(started.pid));
+    block_on(slow.cancel(&target)).unwrap();
+
+    // The job's own check, for when squeue was wrong: here the queue says the job has ended
+    // while the direct helper starts, then it runs after all. It finds that helper recorded and
+    // ends without touching it, its socket or its record.
+    let id = block_on(launcher.submit(&target)).unwrap().job;
+    let mut job = sim.job(id);
+    job.state = "COMPLETED".to_owned();
+    sim.save(&job);
     let running = block_on(direct.start(&target)).unwrap().endpoint;
+    job.state = "PENDING".to_owned();
+    sim.save(&job);
     let record = read(&endpoint);
     sim.release(id);
     eventually("the job to fail", || sim.job(id).state == "FAILED");
@@ -1745,6 +1822,44 @@ fn slurm_never_overlaps_another_launcher() {
     assert_eq!(stopped.pid, Some(running.pid));
     eventually("the direct helper to be gone", || !alive(running.pid));
     block_on(launcher.cancel(&target)).unwrap();
+
+    // Should a direct helper get in while a job's helper runs all the same (squeue wrong
+    // again), the job's way out leaves that helper's socket in run/ and its record alone: it
+    // removes them only while the record still names the job.
+    let id = block_on(launcher.submit(&target)).unwrap().job;
+    sim.release(id);
+    let started = block_on(launcher.start(&target)).unwrap().endpoint;
+    assert_eq!(Path::new(&started.socket), socket);
+    let mut theirs = Command::new("sleep").arg("60").spawn().unwrap();
+    std::fs::remove_file(&socket).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let direct_record = Endpoint {
+        pid: theirs.id(),
+        host: crate::unix::this_host(),
+        launcher: "direct".to_owned(),
+        job: None,
+        ..started.clone()
+    };
+    std::fs::write(
+        &endpoint,
+        format!("{}\n", serde_json::to_string(&direct_record).unwrap()),
+    )
+    .unwrap();
+    let record = read(&endpoint);
+    block_on(launcher.cancel(&target)).unwrap();
+    assert_eq!(sim.job(id).state, "CANCELLED");
+    assert!(!alive(started.pid));
+    assert!(
+        std::fs::symlink_metadata(&socket)
+            .unwrap()
+            .file_type()
+            .is_socket()
+    );
+    assert_eq!(read(&endpoint), record);
+    drop(listener);
+    theirs.kill().unwrap();
+    theirs.wait().unwrap();
+    std::fs::remove_file(&endpoint).unwrap();
 }
 
 /// A job sbatch puts on a named cluster (`<id>;<cluster>`) is asked about there (`-M`).

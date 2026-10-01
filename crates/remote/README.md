@@ -195,6 +195,11 @@ let started = DirectLauncher::default().start(&target).await?;   // or TmuxLaunc
   `LaunchOptions::take_over` says so. **Recovery:** when that host is gone for good (renamed or
   retired), a direct launcher's `stop` with `take_over` forgets its record, and the next start
   or submit goes ahead.
+- **SLURM jobs of the same root:** they share `run/` and its socket, so while `run/slurm.json`
+  records a job that squeue says is still queued or running, or squeue cannot be asked, the
+  direct and tmux launchers neither start a helper nor remove records (`InUse`), with
+  `take_over` or without (under the launch lock, so a submit and a start never interleave).
+  Stop the job with the SLURM launcher first.
 - **Secrets:** none are involved; nothing here logs. Reports and errors carry paths, the
   first line of `--version` and, for a SLURM job that ended, the last lines of its output, with
   control characters replaced.
@@ -249,15 +254,19 @@ launcher.cancel(&target).await?;
   same shell text as `helper.sh`; a test compares them), makes its output file private, waits
   for its record (so a job whose submission was cut off before it was recorded ends on its own,
   and one whose record names another job does not start), and ends without touching anything
-  while `endpoint.json` records another launcher's helper. It checks the recipe's
-  `modules_init` script as it checks the root (the file, any link to it, and every directory
-  on the way belong to root or the user and are writable by no one else), sources it, resets
-  the shell's settings and traps, loads the modules, checks it is still in the root, and starts
-  `bin/<current>/pitcrewd serve --listen unix:<socket>` with the user's umask. Once the socket
-  is there it writes `run/endpoint.json` with `host` the node (`SLURMD_NODENAME`, else
+  while `endpoint.json` records another launcher's helper (the direct and tmux launchers do not
+  start one while the job is queued or running; this check is for when squeue was wrong). It
+  checks the recipe's `modules_init` script as it checks the root (the file, any link to it,
+  and every directory on the way belong to root or the user and are writable by no one else),
+  sources it, resets the shell's settings and traps and drops the functions and aliases it may
+  have made for the tools the job uses, loads the modules, checks it is still in the root, and
+  starts `bin/<current>/pitcrewd serve --listen unix:<socket>` with the user's umask. Once the
+  socket is there it writes `run/endpoint.json` with `host` the node (`SLURMD_NODENAME`, else
   `hostname -f`, else `uname -n`; at most 64 plain characters) and `job` its id. On SIGTERM
-  (scancel, the time limit) it passes the signal on, and removes the endpoint and the socket it
-  started (never one it did not); SIGUSR1 and SIGUSR2 (`--signal`) do not end it.
+  (scancel, the time limit) it passes the signal on, and removes the endpoint while it names the
+  job, and the socket it started: in its own node-local directory, or in `run/` only while the
+  endpoint still names the job (never another helper's socket there). SIGUSR1 and SIGUSR2
+  (`--signal`) do not end it.
 - **Status** (`job_status`, no lock) reads `squeue -h -j <id> -o '%i|%U|%T|%r|%L|%l|%N|%j'`:
   pending with SLURM's reason, running on a node, the time left (`%L`) and the limit, or
   another state. Once squeue no longer lists the job, `sacct` says how it ended (state and exit

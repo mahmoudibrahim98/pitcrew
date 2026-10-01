@@ -36,8 +36,11 @@
 //! `bin/<current>/pitcrewd serve --listen unix:<socket>` with the user's umask. Once the socket
 //! is there it writes `run/endpoint.json`, with `host` the node (`SLURMD_NODENAME`, else
 //! `hostname -f`) and `job` its id. On SIGTERM (`scancel`, or the time limit) it stops the
-//! helper, and removes the endpoint and the socket it started; SIGUSR1 and SIGUSR2 do not end
-//! it.
+//! helper, and removes the endpoint while it names the job, and the socket it started (one in
+//! `run/` only while the endpoint still names the job); SIGUSR1 and SIGUSR2 do not end it.
+//!
+//! While the job is queued or running, the direct and tmux launchers neither start a helper on
+//! the same root nor remove its records ([`HelperError::InUse`]).
 //!
 //! **Whose job:** a job id is acted on only while `squeue` lists it with the recorded name and
 //! this user's uid (`%j`, `%U`), and scancel is given that name and uid too. An id that names any

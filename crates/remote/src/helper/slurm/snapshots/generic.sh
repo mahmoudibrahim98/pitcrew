@@ -177,14 +177,19 @@ pc_safe_file() {
   done
 }
 
-# Only what this job made: the endpoint while it names this job, the socket of the helper it
-# started, and the socket's directory.
+# Only what this job made: the endpoint while it names this job; the socket of the helper it
+# started, in its own directory, or in run/ while the endpoint still names this job (a helper
+# started there since by another launcher keeps its socket); and the socket's directory.
 pc_cleanup() {
   if [ -n "$pc_pid" ] && pc_alive "$pc_pid"; then kill -TERM "$pc_pid" 2>/dev/null; fi
+  pc_ours=0
   case $(head -n 1 run/endpoint.json 2>/dev/null) in
-    *',"job":'"$pc_job"'}') rm -f run/endpoint.json ;;
+    *',"job":'"$pc_job"'}') pc_ours=1 ;;
   esac
-  if [ -n "$pc_pid" ] && [ -n "$pc_sock" ] && [ -S "$pc_sock" ]; then rm -f "$pc_sock"; fi
+  if [ -n "$pc_pid" ] && [ -n "$pc_sock" ] && [ -S "$pc_sock" ]; then
+    if [ -n "$pc_sdir" ] || [ "$pc_ours" = 1 ]; then rm -f "$pc_sock"; fi
+  fi
+  if [ "$pc_ours" = 1 ]; then rm -f run/endpoint.json; fi
   if [ -n "$pc_sdir" ]; then rmdir "$pc_sdir" 2>/dev/null; fi
 }
 # Exits on these run the cleanup; SIGUSR1 and SIGUSR2 (--signal) do not end the job.

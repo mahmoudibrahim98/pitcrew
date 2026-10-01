@@ -25,7 +25,10 @@
 //! had, so a recycled pid is never signalled.
 //!
 //! The SLURM launcher ([`super::slurm`]) implements the same trait: its `status` asks the
-//! scheduler, and its endpoint names the compute node and the job.
+//! scheduler, and its endpoint names the compute node and the job. The two share `run/` and its
+//! socket, so while `run/slurm.json` records a SLURM job that squeue says is still queued or
+//! running (or squeue cannot say), the direct and tmux launchers neither start a helper nor
+//! remove records ([`HelperError::InUse`]).
 
 use super::script::{self, Call, Report};
 use super::{HelperError, Target};
