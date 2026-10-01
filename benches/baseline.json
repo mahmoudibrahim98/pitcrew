@@ -1,0 +1,84 @@
+{
+  "schema": 1,
+  "machine": "Intel(R) Core(TM) Ultra 5 135U, 14 threads, 15 GiB RAM, linux x86_64 (WSL2)",
+  "recorded": "2026-09-30",
+  "mode": "full",
+  "note": "Laptop class: Intel Core Ultra 5 135U (2 performance, 8 efficiency and 2 low-power cores), 16 GB, WSL2 Ubuntu 22.04, Rust 1.94.0, mains power, Windows Balanced plan. Recorded with benches/run.sh --full --write-baseline while other agents' builds ran (load average 4-6 on 14 threads). On this machine the same code measured up to 2-6x apart in runs an hour apart (see benches/README.md): compare with run.sh's retries, and treat these numbers as indicative rather than as a strict gate.",
+  "metrics": {
+    "control.parse": {
+      "value": 198.1,
+      "best": 255.4,
+      "unit": "MiB/s"
+    },
+    "store.append.batch_100": {
+      "value": 9.002,
+      "best": 2.265,
+      "unit": "ms"
+    },
+    "store.before.page_100.one_type": {
+      "value": 0.7472,
+      "best": 0.5135,
+      "unit": "ms"
+    },
+    "store.before.page_100.two_types": {
+      "value": 0.5762,
+      "best": 0.4168,
+      "unit": "ms"
+    },
+    "store.since.page_100": {
+      "value": 0.9959,
+      "best": 0.4631,
+      "unit": "ms"
+    },
+    "stream.append_to_frame.memory": {
+      "value": 76.45,
+      "best": 76.39,
+      "unit": "ms"
+    },
+    "stream.append_to_frame.store": {
+      "value": 77.03,
+      "best": 76.61,
+      "unit": "ms"
+    },
+    "transcript.claude.read_from.200mib": {
+      "value": 136.4,
+      "best": 214.0,
+      "unit": "MiB/s"
+    },
+    "transcript.claude.read_from.20mib": {
+      "value": 194.1,
+      "best": 235.3,
+      "unit": "MiB/s"
+    },
+    "transcript.claude.read_page.200mib": {
+      "value": 2.118,
+      "best": 1.513,
+      "unit": "ms"
+    },
+    "transcript.claude.read_page.20mib": {
+      "value": 2.407,
+      "best": 1.83,
+      "unit": "ms"
+    },
+    "transcript.codex.read_from.200mib": {
+      "value": 179.2,
+      "best": 239.7,
+      "unit": "MiB/s"
+    },
+    "transcript.codex.read_from.20mib": {
+      "value": 185.7,
+      "best": 249.2,
+      "unit": "MiB/s"
+    },
+    "transcript.codex.read_page.200mib": {
+      "value": 4.642,
+      "best": 1.939,
+      "unit": "ms"
+    },
+    "transcript.codex.read_page.20mib": {
+      "value": 2.469,
+      "best": 2.032,
+      "unit": "ms"
+    }
+  }
+}

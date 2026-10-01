@@ -1,0 +1,40 @@
+---
+source: crates/recap/tests/demo.rs
+expression: out
+---
+2026-09-29 · Submission · blocks evt:EVT0002
+@writer finished PAP-3 ("Drafted answers to all 14 comments; 2 need your call."), moved PAP-3 to review.
+  - "@writer finished PAP-3 (\"Drafted answers to all 14 comments; 2 need your call.\")" <- evt:EVT0002
+  - "moved PAP-3 to review" <- evt:EVT0003
+
+2026-09-29 · Seed runs · blocks evt:EVT0001
+@sam dispatched @runner to PAP-4.
+  - "@sam dispatched @runner to PAP-4" <- evt:EVT0001
+
+2026-09-30 · Submission · blocks evt:EVT0004 evt:EVT0007
+2 bursts of work, 1 file edit (+84 −12), 1 task move. @sam dispatched @writer to PAP-1, @writer moved PAP-1 to in progress, updated the plan for PAP-1 (2 of 4 done). @writer edited method.tex (+84 −12).
+  - "2 bursts of work" <- evt:EVT0004, evt:EVT0007
+  - "1 file edit (+84 −12)" <- evt:EVT0007
+  - "1 task move" <- evt:EVT0005
+  - "@sam dispatched @writer to PAP-1" <- evt:EVT0004
+  - "@writer moved PAP-1 to in progress" <- evt:EVT0005
+  - "updated the plan for PAP-1 (2 of 4 done)" <- evt:EVT0006
+  - "@writer edited method.tex (+84 −12)" <- evt:EVT0007
+
+2026-09-30 · Seed runs · blocks evt:EVT0009 evt:EVT0010 evt:EVT0011
+3 bursts of work, 1 tool run, 1 ask raised. @runner ran a tool. Job 4815164 diverged, @office asked @sam for a decision ("Seed 3 diverged at epoch 9. Rerun or drop it?"). @office marked Seed runs at risk, @sam pinned the brief for Seed runs.
+  - "3 bursts of work" <- evt:EVT0009, evt:EVT0010, evt:EVT0011
+  - "1 tool run" <- evt:EVT0009, transcript:SES0002@118220
+  - "1 ask raised" <- evt:EVT0010
+  - "@runner ran a tool" <- evt:EVT0009, transcript:SES0002@118220
+  - "Job 4815164 diverged" <- evt:EVT0010, job:4815164, transcript:SES0002@120544
+  - "@office asked @sam for a decision (\"Seed 3 diverged at epoch 9. Rerun or drop it?\")" <- evt:EVT0010, job:4815164, transcript:SES0002@120544
+  - "@office marked Seed runs at risk" <- evt:EVT0011
+  - "@sam pinned the brief for Seed runs" <- evt:EVT0012
+
+2026-09-30 · Parsers · blocks evt:EVT0008 evt:EVT0013 evt:EVT0014
+3 bursts of work. @sam dispatched @reviewer to TL-3. @reviewer stopped to wait for an answer ("Asks: merge the benchmark change?"). @builder commented on TL-1 and mentioned @reviewer.
+  - "3 bursts of work" <- evt:EVT0008, evt:EVT0013, evt:EVT0014
+  - "@sam dispatched @reviewer to TL-3" <- evt:EVT0008
+  - "@reviewer stopped to wait for an answer (\"Asks: merge the benchmark change?\")" <- evt:EVT0013
+  - "@builder commented on TL-1 and mentioned @reviewer" <- evt:EVT0014
