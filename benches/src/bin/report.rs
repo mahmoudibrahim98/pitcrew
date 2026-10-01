@@ -1,53 +1,78 @@
-//! `pitcrew-bench-report`: turns criterion's results into the budget summary and checks it
-//! against the baseline. `benches/run.sh` runs the benchmarks and then this.
+//! `pitcrew-bench-report`: turns criterion's results and the timing tests' output into the
+//! budget summary and checks it against the baseline. `benches/run.sh` runs the benchmarks and
+//! tests and then this.
 //!
 //! ```text
-//! pitcrew-bench-report --criterion DIR [--criterion DIR ...] [--baseline FILE] [--out FILE]
-//!                      [--mode quick|full] [--threshold 0.10] [--machine LABEL]
-//!                      [--retry-filter FILE]
-//!                      [--write-baseline [--recorded DATE] [--note TEXT]]
+//! pitcrew-bench-report --criterion DIR [--criterion DIR ...] [--tests FILE ...] [--no-tests]
+//!                      [--baseline FILE] [--out FILE] [--mode quick|full] [--threshold 0.10]
+//!                      [--machine LABEL] [--retry-plan FILE]
+//!                      [--write-baseline | --extend-baseline] [--recorded DATE] [--note TEXT]
 //! ```
 //!
-//! Several `--criterion` directories are a first run and its retries: each benchmark keeps its
-//! lowest median and lowest best. `--retry-filter` writes a criterion filter for the benchmarks
-//! that failed (or empties the file when none did), for `run.sh` to run again.
+//! Several `--criterion` directories and `--tests` files are a first attempt and its retries:
+//! each metric keeps its better numbers. `--retry-plan` writes what failed, for `run.sh` to run
+//! again ([`report::Retry::plan`]); it is empty when nothing did. `--no-tests` says the timing
+//! tests were left out, so their metrics are skipped rather than missing.
+//!
+//! `--write-baseline` replaces the baseline with this run; `--extend-baseline` adds the metrics
+//! the baseline has no value for, if they pass (not over budget).
 //!
 //! Exit status: 0 when every metric passes, 1 when one regressed, is over budget or is missing,
 //! 2 on a usage or I/O error.
 
 use pitcrew_benches::Mode;
-use pitcrew_benches::report::{self, Baseline, DEFAULT_THRESHOLD};
-use std::path::PathBuf;
+use pitcrew_benches::report::{self, Baseline, DEFAULT_THRESHOLD, Readings, Scope};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: pitcrew-bench-report --criterion DIR [--criterion DIR ...] \
-[--baseline FILE] [--out FILE] [--mode quick|full] [--threshold FRACTION] [--machine LABEL] \
-[--retry-filter FILE] [--write-baseline [--recorded DATE] [--note TEXT]]";
+[--tests FILE ...] [--no-tests] [--baseline FILE] [--out FILE] [--mode quick|full] \
+[--threshold FRACTION] [--machine LABEL] [--retry-plan FILE] \
+[--write-baseline | --extend-baseline] [--recorded DATE] [--note TEXT]";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BaselineAction {
+    Compare,
+    Write,
+    Extend,
+}
 
 #[derive(Debug)]
 struct Args {
     criterion: Vec<PathBuf>,
+    tests: Vec<PathBuf>,
+    no_tests: bool,
     baseline: PathBuf,
     out: Option<PathBuf>,
     mode: Mode,
     threshold: f64,
     machine: Option<String>,
-    retry_filter: Option<PathBuf>,
-    write_baseline: bool,
+    retry_plan: Option<PathBuf>,
+    action: BaselineAction,
     recorded: Option<String>,
     note: Option<String>,
+}
+
+fn set_action(out: &mut Args, action: BaselineAction) -> Result<(), String> {
+    if out.action != BaselineAction::Compare && out.action != action {
+        return Err("--write-baseline and --extend-baseline exclude each other".to_owned());
+    }
+    out.action = action;
+    Ok(())
 }
 
 fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     let mut out = Args {
         criterion: Vec::new(),
+        tests: Vec::new(),
+        no_tests: false,
         baseline: PathBuf::from("benches/baseline.json"),
         out: None,
         mode: Mode::from_env(),
         threshold: DEFAULT_THRESHOLD,
         machine: None,
-        retry_filter: None,
-        write_baseline: false,
+        retry_plan: None,
+        action: BaselineAction::Compare,
         recorded: None,
         note: None,
     };
@@ -55,6 +80,8 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
             "--criterion" => out.criterion.push(PathBuf::from(value()?)),
+            "--tests" => out.tests.push(PathBuf::from(value()?)),
+            "--no-tests" => out.no_tests = true,
             "--baseline" => out.baseline = PathBuf::from(value()?),
             "--out" => out.out = Some(PathBuf::from(value()?)),
             "--mode" => {
@@ -70,16 +97,20 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
                     .ok_or_else(|| format!("bad threshold {v:?}"))?;
             }
             "--machine" => out.machine = Some(value()?),
-            "--retry-filter" => out.retry_filter = Some(PathBuf::from(value()?)),
+            "--retry-plan" => out.retry_plan = Some(PathBuf::from(value()?)),
             "--recorded" => out.recorded = Some(value()?),
             "--note" => out.note = Some(value()?),
-            "--write-baseline" => out.write_baseline = true,
+            "--write-baseline" => set_action(&mut out, BaselineAction::Write)?,
+            "--extend-baseline" => set_action(&mut out, BaselineAction::Extend)?,
             "-h" | "--help" => return Err(USAGE.to_owned()),
             other => return Err(format!("unknown argument {other:?}\n{USAGE}")),
         }
     }
     if out.criterion.is_empty() {
         return Err(format!("--criterion is required\n{USAGE}"));
+    }
+    if out.no_tests && !out.tests.is_empty() {
+        return Err("--no-tests and --tests exclude each other".to_owned());
     }
     Ok(out)
 }
@@ -102,21 +133,53 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: &Args) -> Result<bool, String> {
-    let mut measured = std::collections::BTreeMap::new();
+fn readings(args: &Args) -> Result<Readings, String> {
+    let mut readings = Readings::new();
     for dir in &args.criterion {
         let found = report::collect(dir).map_err(|e| format!("reading {}: {e}", dir.display()))?;
-        report::merge(&mut measured, found);
-    }
-    for id in measured.keys() {
-        if pitcrew_benches::metrics::by_bench(id).is_none() {
-            eprintln!("note: benchmark {id} is not a budget metric; ignored");
+        for id in found.keys() {
+            if pitcrew_benches::metrics::by_bench(id).is_none() {
+                eprintln!("note: benchmark {id} is not a budget metric; ignored");
+            }
+        }
+        for (name, reading) in report::bench_readings(&found) {
+            report::add(&mut readings, &name, reading);
         }
     }
-    let machine = args.machine.clone().unwrap_or_else(report::machine);
+    for file in &args.tests {
+        // A test that failed to build leaves no file; its metrics are then missing.
+        let text = match std::fs::read_to_string(file) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("{}: {e}", file.display())),
+        };
+        for (name, reading) in pitcrew_benches::external::parse(&text) {
+            report::add(&mut readings, name, reading);
+        }
+    }
+    Ok(readings)
+}
 
-    if args.write_baseline {
-        let summary = report::compare(args.mode, &machine, &measured, None, args.threshold);
+fn load_baseline(path: &Path) -> Result<Option<Baseline>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => serde_json::from_str(&text)
+            .map(Some)
+            .map_err(|e| format!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+fn run(args: &Args) -> Result<bool, String> {
+    let readings = readings(args)?;
+    let machine = args.machine.clone().unwrap_or_else(report::machine);
+    let scope = Scope {
+        mode: args.mode,
+        tests: !args.no_tests,
+    };
+
+    if args.action == BaselineAction::Write {
+        let summary = report::compare(scope, &machine, &readings, None, args.threshold);
         print!("{}", report::render(&summary));
         write_json(args.out.as_ref(), &summary)?;
         if !summary.passed {
@@ -128,40 +191,44 @@ fn run(args: &Args) -> Result<bool, String> {
         return Ok(true);
     }
 
-    let baseline: Option<Baseline> = match std::fs::read_to_string(&args.baseline) {
-        Ok(text) => Some(
-            serde_json::from_str(&text).map_err(|e| format!("{}: {e}", args.baseline.display()))?,
+    let baseline = load_baseline(&args.baseline)?;
+    match &baseline {
+        None => eprintln!(
+            "note: no baseline at {}; checking budgets only",
+            args.baseline.display()
         ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!(
-                "note: no baseline at {}; checking budgets only",
-                args.baseline.display()
-            );
-            None
-        }
-        Err(e) => return Err(format!("{}: {e}", args.baseline.display())),
-    };
-    if let Some(b) = &baseline
-        && b.machine != machine
-    {
-        eprintln!(
+        Some(b) if b.machine != machine => eprintln!(
             "warning: the baseline was recorded on \"{}\", this is \"{}\"; \
              differences may be the machine, not the code",
             b.machine, machine
-        );
+        ),
+        Some(_) => {}
     }
     let summary = report::compare(
-        args.mode,
+        scope,
         &machine,
-        &measured,
+        &readings,
         baseline.as_ref(),
         args.threshold,
     );
     print!("{}", report::render(&summary));
     write_json(args.out.as_ref(), &summary)?;
-    if let Some(path) = &args.retry_filter {
-        let filter = report::retry_filter(&summary).unwrap_or_default();
-        std::fs::write(path, filter).map_err(|e| format!("{}: {e}", path.display()))?;
+    if let Some(path) = &args.retry_plan {
+        std::fs::write(path, report::retry(&summary).plan())
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+
+    if args.action == BaselineAction::Extend {
+        let Some(mut baseline) = baseline else {
+            return Err("no baseline to extend; use --write-baseline".to_owned());
+        };
+        let added = report::extend_baseline(&mut baseline, &summary);
+        if added.is_empty() {
+            println!("the baseline already has every measured metric");
+        } else {
+            write_json(Some(&args.baseline), &baseline)?;
+            println!("added to {}: {}", args.baseline.display(), added.join(", "));
+        }
     }
     Ok(summary.passed)
 }
@@ -187,17 +254,22 @@ mod tests {
     #[test]
     fn parses_flags() {
         let a = args(
-            "--criterion c --criterion r1 --mode quick --threshold 0.2 --retry-filter f \
-             --write-baseline --recorded 2026-09-30",
+            "--criterion c --criterion r1 --tests t0 --tests t1 --mode quick --threshold 0.2 \
+             --retry-plan p --write-baseline --recorded 2026-09-30",
         )
         .unwrap();
         assert_eq!(a.criterion, vec![PathBuf::from("c"), PathBuf::from("r1")]);
+        assert_eq!(a.tests, vec![PathBuf::from("t0"), PathBuf::from("t1")]);
         assert_eq!(a.mode, Mode::Quick);
         assert!((a.threshold - 0.2).abs() < f64::EPSILON);
-        assert_eq!(a.retry_filter, Some(PathBuf::from("f")));
-        assert!(a.write_baseline);
+        assert_eq!(a.retry_plan, Some(PathBuf::from("p")));
+        assert_eq!(a.action, BaselineAction::Write);
         assert_eq!(a.recorded.as_deref(), Some("2026-09-30"));
         assert_eq!(a.baseline, PathBuf::from("benches/baseline.json"));
+        assert!(!a.no_tests);
+        let a = args("--criterion c --no-tests --extend-baseline").unwrap();
+        assert!(a.no_tests);
+        assert_eq!(a.action, BaselineAction::Extend);
     }
 
     #[test]
@@ -207,5 +279,7 @@ mod tests {
         assert!(args("--criterion c --threshold -1").is_err());
         assert!(args("--criterion c --threshold").is_err());
         assert!(args("--criterion c --bogus").is_err());
+        assert!(args("--criterion c --write-baseline --extend-baseline").is_err());
+        assert!(args("--criterion c --no-tests --tests t").is_err());
     }
 }

@@ -6,20 +6,24 @@ with a baseline and a regression check. **Owned by stream P.**
 ## Run
 
 ```bash
-benches/run.sh                   # full: 20 and 200 MiB transcripts, then compare (a few minutes)
-benches/run.sh --quick           # CI: 20 MiB only, fewer samples (about a minute)
-benches/run.sh --write-baseline  # record this machine's numbers in benches/baseline.json
-cargo bench -p pitcrew-benches   # criterion alone (full mode; PITCREW_BENCH_MODE=quick for quick)
+benches/run.sh                    # full: 20 and 200 MiB transcripts, then compare (a few minutes)
+benches/run.sh --quick            # CI: 20 MiB only, fewer samples
+benches/run.sh --no-tests         # leave out the other crates' timing tests (about a minute less)
+benches/run.sh --write-baseline   # record this machine's numbers in benches/baseline.json
+benches/run.sh --extend-baseline  # compare, and add the passing metrics the baseline lacks
+cargo bench -p pitcrew-benches    # criterion alone (full mode; PITCREW_BENCH_MODE=quick for quick)
 ```
 
-`run.sh` runs the criterion benchmarks, then `pitcrew-bench-report`, which reads criterion's
-results, prints a table and writes a JSON summary (default
+`run.sh` runs the criterion benchmarks and three timing tests that other streams own (below),
+then `pitcrew-bench-report`, which reads both, prints a table and writes a JSON summary (default
 `<target>/pitcrew-bench/summary.json`). It exits non-zero when a metric is **more than 10% worse**
-than the baseline, is **over its budget**, or **did not run**. Before failing, it runs the
-failing benchmarks again, up to twice (`--retries N`), keeping each one's lowest median and
-lowest best: noise fails one attempt, a real regression fails them all. Generated inputs go in
-the system temp dir and are deleted as each benchmark finishes; at most one 200 MiB file exists
-at a time.
+than the baseline, is **over its budget**, or **did not report**. Before failing, it runs what
+failed again, up to twice (`--retries N`), keeping each metric's better numbers: noise fails one
+attempt, a real regression fails them all. A metric that did not report is retried too: under
+load a benchmark can time out or a test can be killed, which is as likely noise as a slow
+sample, and a benchmark that is really broken fails every retry. Generated inputs go in the
+system temp dir and are deleted as each benchmark finishes; at most one 200 MiB file exists at a
+time.
 
 ## What is measured
 
@@ -33,18 +37,33 @@ at a time.
 | `control.parse` | `ControlParser::feed` over 8 MiB of `tmux -C` output in 16 KiB chunks | MiB/s | none |
 | `stream.append_to_frame.{memory,store}` | Append one event → the `events` frame leaves the delta-stream pump (default config, so the 75 ms batch window is included) | ms | Hook event → UI change ≤ 300 ms local |
 
-Each metric has two numbers. `value` is criterion's **median** per iteration, the typical cost,
-and is checked against the **budget**. `best` is the fastest sample's time per iteration, and is
-checked against the **baseline**: other work on the machine (parallel builds, an fsync stall)
-only ever adds time, so `best` moves less between runs than the median. A code change that slows
-the work down still slows the fastest sample.
+From the other streams' timing tests, run in release (the bench profile) with `--ignored
+--nocapture` and read from what they print ([`src/external.rs`](src/external.rs)):
+
+| Metric | Test | Unit | Value / best | Budget |
+|---|---|---|---|---|
+| `runner.idle_cpu.{notify,polling}` | `crates/runner/tests/idle_cpu.rs`: 50 watched transcripts, 20 s idle, Linux only | %cpu | the percent | ≤ 0.5% of one core (P.md); budget only, see below |
+| `hub.tasks.route.{status,assignee_status}` | `crates/hub-work/tests/perf.rs`: `GET /v1/tasks` with a filter over 10,000 tasks | ms | median / best of 30 | median < 20 ms |
+| `cli.hook.{up,down}.{tcp,unix}` | `crates/cli/tests/hook_timing.rs`: `pitcrew hook` spawn to exit, 200 runs, daemon up or not listening (`unix` on Unix only) | ms | p99 / p50 | p99 ≤ 10 ms up, ≤ 5 ms down |
+
+Those tests assert their own budgets; a test that misses one still prints its numbers, and the
+report marks them `over_budget`. If a test's output format changes, its metrics become `missing`
+and the run fails, so the parser is updated rather than the numbers silently dropped. Idle CPU is
+counted in 0.05% ticks (one tick in the 20 s window), far coarser than a 10% threshold, so it is
+checked against its budget only, never the baseline.
+
+Each metric has two numbers. `value` is the typical cost and is checked against the **budget**:
+criterion's **median** per iteration, or what the test's budget names (the median, the p99).
+`best` is the steadiest number and is checked against the **baseline**: criterion's fastest
+sample per iteration, the test's best run or its p50. Other work on the machine (parallel builds,
+an fsync stall) only ever adds time, so `best` moves less between runs than the median. A code
+change that slows the work down still slows the fastest sample.
 
 Transcripts are synthetic, shaped like the fixtures, with one 24 KiB tool result per turn; they
 are in the page cache when measured, so `read_page` is the parse cost, not a cold disk read.
 
-Not measurable yet, because the code does not exist: `pitcrewd` idle CPU and memory, cold start,
-first scan of 10k transcripts, `pitcrew` round trip and hook wall time (streams 0, D and I), and
-the desktop numbers (stream K).
+Not measured yet: `pitcrewd` memory with 10k sessions, cold start, first scan of 10k transcripts,
+the `pitcrew` verb round trip, and the desktop numbers (stream K).
 
 ## Summary format
 
@@ -61,8 +80,8 @@ the desktop numbers (stream K).
 ```
 
 `baseline` is the baseline's `best`, and `change` is how much worse `best` is than it, as a
-fraction (negative is better). `status` is
-`ok`, `improved`, `new` (no baseline), `skipped` (200 MiB inputs in quick mode), or one of the
+fraction (negative is better). `status` is `ok`, `improved`, `new` (no baseline), `skipped`
+(200 MiB inputs in quick mode, a platform that cannot measure it, or `--no-tests`), or one of the
 failures: `regressed`, `over_budget`, `missing`.
 
 ## The baseline
