@@ -41,13 +41,19 @@ const MAX_FRAME: usize = 1024 * 1024;
 pub(crate) struct StdioStream {
     stdin: Option<ChildStdin>,
     stdout: ChildStdout,
+    read: Buffered,
+    /// Dropped with the stream: the task that owns ssh then stops it.
+    _owner: oneshot::Sender<()>,
+}
+
+/// What was read from stdout and not handed out yet, and the frames' state.
+#[derive(Debug, Default)]
+struct Buffered {
     /// Bytes read from stdout, not yet handed out (after the mark; still framed if framed).
     raw: Vec<u8>,
     pos: usize,
     /// Framed (through srun): where in the frames the reading is.
     frames: Option<Frames>,
-    /// Dropped with the stream: the task that owns ssh then stops it.
-    _owner: oneshot::Sender<()>,
 }
 
 /// Where the decoding of the bridge's frames stands.
@@ -165,9 +171,11 @@ pub(crate) async fn open(opening: Opening<'_>) -> Result<StdioStream, TunnelErro
             Ok(StdioStream {
                 stdin: Some(stdin),
                 stdout,
-                raw,
-                pos: 0,
-                frames: opening.framed.then_some(Frames::Header),
+                read: Buffered {
+                    raw,
+                    pos: 0,
+                    frames: opening.framed.then_some(Frames::Header),
+                },
                 _owner: owner,
             })
         }
@@ -278,7 +286,7 @@ enum Decoded {
     More,
 }
 
-impl StdioStream {
+impl Buffered {
     /// The bytes not yet decoded.
     fn rest(&self) -> &[u8] {
         self.raw.get(self.pos..).unwrap_or_default()
@@ -292,10 +300,29 @@ impl StdioStream {
         }
     }
 
-    /// Takes frames apart into `buf`, as far as the bytes read allow.
-    fn decode(&mut self, frames: Frames, buf: &mut ReadBuf<'_>) -> io::Result<Decoded> {
+    /// Adds bytes read, dropping what was decoded first: the buffer holds no more than what
+    /// was read last and a partial frame.
+    fn push(&mut self, bytes: &[u8]) {
+        self.raw.drain(..self.pos.min(self.raw.len()));
+        self.pos = 0;
+        self.raw.extend_from_slice(bytes);
+    }
+
+    /// Plain: hands out what came after the mark; `false` once there is none left.
+    fn plain(&mut self, buf: &mut ReadBuf<'_>) -> bool {
+        if self.rest().is_empty() {
+            return false;
+        }
+        let n = self.rest().len().min(buf.remaining());
+        buf.put_slice(self.rest().get(..n).unwrap_or_default());
+        self.consume(n);
+        true
+    }
+
+    /// Takes frames apart into `buf`, as far as the bytes read allow. `buf` must have room.
+    fn decode(&mut self, buf: &mut ReadBuf<'_>) -> io::Result<Decoded> {
         let bad = |why: &str| io::Error::new(io::ErrorKind::InvalidData, why.to_owned());
-        let mut state = frames;
+        let mut state = self.frames.unwrap_or(Frames::End);
         let decoded = loop {
             match state {
                 Frames::End => break Decoded::End,
@@ -355,18 +382,19 @@ impl AsyncRead for StdioStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        let Some(mut frames) = this.frames else {
+        if this.read.frames.is_none() {
             // Plain: what came after the mark first, then stdout as it is.
-            if !this.rest().is_empty() {
-                let n = this.rest().len().min(buf.remaining());
-                buf.put_slice(this.rest().get(..n).unwrap_or_default());
-                this.consume(n);
+            if this.read.plain(buf) {
                 return Poll::Ready(Ok(()));
             }
             return Pin::new(&mut this.stdout).poll_read(cx, buf);
-        };
+        }
+        if buf.remaining() == 0 {
+            // Nothing could be handed out: no reading ahead.
+            return Poll::Ready(Ok(()));
+        }
         loop {
-            match this.decode(frames, buf)? {
+            match this.read.decode(buf)? {
                 Decoded::Bytes | Decoded::End => return Poll::Ready(Ok(())),
                 Decoded::More => {}
             }
@@ -380,13 +408,12 @@ impl AsyncRead for StdioStream {
             if read.filled().is_empty() {
                 // The output ended without the end mark: at a frame's boundary it is still an
                 // end, else the stream was cut.
-                return Poll::Ready(match this.frames {
+                return Poll::Ready(match this.read.frames {
                     Some(Frames::Header | Frames::End) => Ok(()),
                     _ => Err(io::ErrorKind::UnexpectedEof.into()),
                 });
             }
-            this.raw.extend_from_slice(read.filled());
-            frames = this.frames.unwrap_or(Frames::End);
+            this.read.push(read.filled());
         }
     }
 }
@@ -428,6 +455,54 @@ impl AsyncWrite for StdioStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Frames come apart whatever the pieces they arrive in and the room the reader has, and
+    /// what is kept stays small.
+    #[test]
+    fn frames_are_taken_apart_in_any_pieces() {
+        let framed = b"00000003:abc\n00000001:\n\n00000000:\n";
+        for size in [1, 2, 5, 9, 100] {
+            for room in [1, 2, 64] {
+                let mut read = Buffered {
+                    frames: Some(Frames::Header),
+                    ..Buffered::default()
+                };
+                let mut pieces = framed.chunks(size);
+                let mut out = Vec::new();
+                loop {
+                    let mut space = vec![0u8; room];
+                    let mut buf = ReadBuf::new(&mut space);
+                    match read.decode(&mut buf).unwrap() {
+                        Decoded::Bytes => out.extend_from_slice(buf.filled()),
+                        Decoded::End => break,
+                        Decoded::More => read.push(pieces.next().expect("the end mark")),
+                    }
+                    assert!(read.raw.len() <= FRAME_HEADER + size, "{size} {room}");
+                }
+                assert_eq!(out, b"abc\n", "{size} {room}");
+            }
+        }
+        for bad in [
+            &b"0000000g:x\n"[..],
+            b"00000001;x\n",
+            b"00200000:",
+            b"00000001:xy",
+        ] {
+            let mut read = Buffered {
+                frames: Some(Frames::Header),
+                ..Buffered::default()
+            };
+            read.push(bad);
+            let mut space = [0u8; 8];
+            let mut buf = ReadBuf::new(&mut space);
+            let mut result = read.decode(&mut buf);
+            if matches!(result, Ok(Decoded::Bytes)) {
+                let mut more = [0u8; 8];
+                result = read.decode(&mut ReadBuf::new(&mut more));
+            }
+            assert!(result.is_err(), "{bad:?}");
+        }
+    }
 
     #[test]
     fn failures_say_why() {
