@@ -21,8 +21,11 @@
 //! `'\''`). The command name is always quoted, so it is never a reserved word, an assignment or
 //! an option to `eval`.
 //!
-//! Needs `/bin/sh` with `$(…)` on the remote side: every Linux, macOS and BSD has it. Shells
-//! whose single quotes are not literal for the characters above (e.g. xonsh) are not supported.
+//! Needs `/bin/sh` with `$(…)` on the remote side: every Linux, macOS and BSD has it.
+//!
+//! **Unsupported and unsafe:** login shells whose single quotes are not literal for the
+//! characters above. xonsh may decode `\ooo` itself; `printf` would then read a `\047` from the
+//! command as a real quote, and argv could break out. [`crate::Ssh::probe`] refuses such hosts.
 
 use crate::SshError;
 
@@ -30,10 +33,20 @@ use crate::SshError;
 const HEAD: &str = "/bin/sh -c 'eval \"$(printf \"";
 const TAIL: &str = "\")\"'";
 
-/// The longest command [`remote_command`] builds: Linux limits a single argument to 128 KiB,
-/// and the login shell receives the command as one. Each byte of the POSIX command line takes
-/// four, so the command line itself can be about 32 KiB.
-pub const MAX_REMOTE_COMMAND: usize = 128 * 1024 - 1;
+/// The longest command [`remote_command`] builds. Each byte of the POSIX command line takes four.
+/// - Unix: Linux limits a single argument to 128 KiB, and the login shell receives the command
+///   as one; the command line itself can be about 32 KiB.
+/// - Windows: `CreateProcess` limits the whole ssh command line to 32,767 characters, so the
+///   command gets 30,000 and ssh's path and options the rest; the command line itself about
+///   7,500.
+pub const MAX_REMOTE_COMMAND: usize = if cfg!(windows) {
+    30_000
+} else {
+    128 * 1024 - 1
+};
+
+// On Windows, at least 2 KiB of the 32,767 characters stay for the program path and options.
+const _: () = assert!(!cfg!(windows) || MAX_REMOTE_COMMAND + 2 * 1024 <= 32_767);
 
 /// Characters that never need quoting. `=` is left out on purpose: an unquoted `A=b` in first
 /// position is an assignment, not a command. `~`, `#`, `*`, `?`, `[`, `{` are left out too.
@@ -363,7 +376,10 @@ mod tests {
         assert!(remote_command::<&str>(&[]).is_err());
         assert!(remote_command(&["a\0b"]).is_err());
         let big = "x".repeat(MAX_REMOTE_COMMAND / 4);
-        assert!(remote_command(&["echo", &big]).is_err());
+        assert!(matches!(
+            remote_command(&["echo", &big]),
+            Err(SshError::InvalidArgument(_))
+        ));
         let fits = "x".repeat(MAX_REMOTE_COMMAND / 4 - 40);
         assert!(remote_command(&["echo", &fits]).is_ok());
     }
