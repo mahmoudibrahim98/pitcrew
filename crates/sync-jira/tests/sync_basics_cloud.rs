@@ -89,22 +89,13 @@ async fn first_sync_then_incremental_then_idempotent() {
         1
     );
     let done = find(&outcome1.changes, |c| {
-        matches!(
-            c,
-            UpstreamChange::IssueStatusCategoryChanged {
-                category: pitcrew_sync_jira::StatusCategory::Done,
-                ..
-            }
-        )
+        matches!(c, UpstreamChange::IssueDone { .. })
     });
     assert_eq!(done.len(), 1, "{:#?}", outcome1.changes);
     assert_eq!(done[0].source().key, "DEMO-2");
 
     let project = outcome1.state.projects.get("DEMO").expect("project state");
-    assert_eq!(
-        project.cursor.as_ref().map(|c| c.as_str()),
-        Some("2026-01-01 00:03")
-    );
+    assert_eq!(project.cursor.as_deref(), Some("2026-01-01 00:03"));
     assert_eq!(project.issue_snapshots.len(), 2);
     assert_eq!(project.epic_snapshots.len(), 1);
 
@@ -200,13 +191,7 @@ async fn first_sync_then_incremental_then_idempotent() {
         1
     );
     let reopened = find(&outcome2.changes, |c| {
-        matches!(
-            c,
-            UpstreamChange::IssueStatusCategoryChanged {
-                category: pitcrew_sync_jira::StatusCategory::New,
-                ..
-            }
-        )
+        matches!(c, UpstreamChange::IssueReopened { .. })
     });
     assert_eq!(reopened.len(), 1);
     assert_eq!(reopened[0].source().key, "DEMO-2");
@@ -222,10 +207,7 @@ async fn first_sync_then_incremental_then_idempotent() {
     );
 
     let project2 = outcome2.state.projects.get("DEMO").expect("project state");
-    assert_eq!(
-        project2.cursor.as_ref().map(|c| c.as_str()),
-        Some("2026-01-01 00:07")
-    );
+    assert_eq!(project2.cursor.as_deref(), Some("2026-01-01 00:07"));
 
     // --- Call 3: nothing changed upstream (just the overlap minute again). Idempotence. ---
     let jql3 = jql_for("DEMO", Some("2026-01-01 00:07"));

@@ -43,11 +43,12 @@ pub const ISSUE_FIELD_OWNERSHIP: &[FieldOwnership] = &[
     FieldOwnership {
         field: "status",
         owner: FieldOwner::Mirrored,
-        note: "Moved only through TaskStatus::can_move(.., Mover::Sync): an upstream move into \
-               the `done` status category proposes `done`; a move back out of `done` proposes \
-               `todo`, but only when the task's current status on the hub is already `done` \
-               (nothing to reopen otherwise). In-progress work is never touched. A disallowed \
-               move raises a conflict ask instead of being dropped.",
+        note: "Moved only through TaskStatus::can_move(.., Mover::Sync): IssueDone proposes \
+               `done`; IssueReopened proposes `todo`, unconditionally — not gated on the hub's \
+               own current status, the same way GitHub's IssueReopened is unconditional — so a \
+               disallowed move (the task is in progress, or has no linked task at all) still \
+               raises a conflict ask instead of being silently dropped. A move between `new` and \
+               `indeterminate` is not reported upstream at all, so it never reaches `plan`.",
     },
     FieldOwnership {
         field: "assignee",
@@ -115,8 +116,8 @@ fn update_or_conflict(
 #[must_use]
 pub fn plan(change: &UpstreamChange, current: Option<&Task>) -> Vec<Intent> {
     use UpstreamChange::{
-        EpicClosed, EpicCreated, EpicRenamed, IssueBodyEdited, IssueCreated, IssueReassigned,
-        IssueRelabelled, IssueReparented, IssueRetitled, IssueStatusCategoryChanged,
+        EpicClosed, EpicCreated, EpicRenamed, IssueBodyEdited, IssueCreated, IssueDone,
+        IssueReassigned, IssueRelabelled, IssueReopened, IssueReparented, IssueRetitled,
     };
 
     match change {
@@ -199,39 +200,28 @@ pub fn plan(change: &UpstreamChange, current: Option<&Task>) -> Vec<Intent> {
         // visibility only, and intentionally produces no intent.
         IssueReassigned { .. } => vec![],
 
-        IssueStatusCategoryChanged {
+        IssueDone {
+            source, resolution, ..
+        } => propose_move_or_conflict(
+            current,
             source,
-            category,
-            resolution,
-            ..
-        } => match category {
-            crate::state::StatusCategory::Done => propose_move_or_conflict(
-                current,
-                source,
-                TaskStatus::Done,
-                &format!(
-                    "moved to a done status{}",
-                    resolution
-                        .as_deref()
-                        .map(|r| format!(" ({r})"))
-                        .unwrap_or_default()
-                ),
+            TaskStatus::Done,
+            &format!(
+                "moved to a done status{}",
+                resolution
+                    .as_deref()
+                    .map(|r| format!(" ({r})"))
+                    .unwrap_or_default()
             ),
-            // Only a task sync had previously moved to Done is a "reopen": any other non-done
-            // category change (e.g. "new" to "indeterminate", a normal in-progress workflow move)
-            // is not something sync mirrors at all — see ISSUE_FIELD_OWNERSHIP.
-            crate::state::StatusCategory::New | crate::state::StatusCategory::Indeterminate => {
-                match current {
-                    Some(t) if t.status == TaskStatus::Done => propose_move_or_conflict(
-                        current,
-                        source,
-                        TaskStatus::Todo,
-                        "moved out of a done status",
-                    ),
-                    _ => vec![],
-                }
-            }
-        },
+        ),
+
+        // Unconditional — not gated on `current`'s own status — the same way GitHub's
+        // IssueReopened is: the change already means a genuine done-to-not-done transition (see
+        // its doc comment), so whatever the hub currently shows, `propose_move_or_conflict`
+        // decides whether that is a legal move or a conflict worth raising.
+        IssueReopened { source, .. } => {
+            propose_move_or_conflict(current, source, TaskStatus::Todo, "reopened an issue")
+        }
 
         // Epics map to workstreams, not tasks; `plan`'s signature here only takes a task, so epic
         // changes currently produce no task intent. See "What I did not do".
@@ -242,7 +232,6 @@ pub fn plan(change: &UpstreamChange, current: Option<&Task>) -> Vec<Intent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::StatusCategory;
     use crate::time::JiraTimestamp;
     use pitcrew_protocol::ids::{ProjectId, ProjectKey, TaskKey};
     use pitcrew_protocol::model::{ExternalSystem, Priority};
@@ -283,10 +272,9 @@ mod tests {
     #[test]
     fn a_move_to_done_never_moves_an_in_progress_task() {
         let t = task(TaskStatus::InProgress);
-        let change = UpstreamChange::IssueStatusCategoryChanged {
+        let change = UpstreamChange::IssueDone {
             source: external_ref(),
             at: at(),
-            category: StatusCategory::Done,
             resolution: Some("Done".into()),
         };
         let intents = plan(&change, Some(&t));
@@ -303,10 +291,9 @@ mod tests {
     #[test]
     fn a_move_to_done_moves_review_to_done() {
         let t = task(TaskStatus::Review);
-        let change = UpstreamChange::IssueStatusCategoryChanged {
+        let change = UpstreamChange::IssueDone {
             source: external_ref(),
             at: at(),
-            category: StatusCategory::Done,
             resolution: None,
         };
         assert_eq!(
@@ -319,14 +306,16 @@ mod tests {
         );
     }
 
+    /// Mirrors `pitcrew_sync_github::ownership::tests::a_reopen_moves_done_to_todo_but_not_other_statuses`
+    /// exactly: `IssueReopened` is unconditional in `plan`, so a non-`Done` task is a conflict
+    /// ask (through the disallowed-move branch of `propose_move_or_conflict`), not silently
+    /// nothing.
     #[test]
-    fn a_reopen_moves_done_to_todo_but_leaves_other_statuses_alone() {
+    fn a_reopen_moves_done_to_todo_but_not_other_statuses() {
         let done = task(TaskStatus::Done);
-        let change = UpstreamChange::IssueStatusCategoryChanged {
+        let change = UpstreamChange::IssueReopened {
             source: external_ref(),
             at: at(),
-            category: StatusCategory::New,
-            resolution: None,
         };
         assert_eq!(
             plan(&change, Some(&done)),
@@ -337,20 +326,21 @@ mod tests {
             }]
         );
 
-        let todo = task(TaskStatus::Todo);
-        assert!(plan(&change, Some(&todo)).is_empty(), "nothing to reopen");
+        let in_progress = task(TaskStatus::InProgress);
+        let intents = plan(&change, Some(&in_progress));
+        assert!(matches!(intents.as_slice(), [Intent::ConflictAsk { .. }]));
     }
 
     #[test]
-    fn a_non_done_category_change_on_a_non_done_task_is_not_mirrored() {
-        let t = task(TaskStatus::InProgress);
-        let change = UpstreamChange::IssueStatusCategoryChanged {
+    fn a_reopen_with_no_linked_task_is_a_conflict() {
+        let change = UpstreamChange::IssueReopened {
             source: external_ref(),
             at: at(),
-            category: StatusCategory::Indeterminate,
-            resolution: None,
         };
-        assert!(plan(&change, Some(&t)).is_empty());
+        assert!(matches!(
+            plan(&change, None).as_slice(),
+            [Intent::ConflictAsk { task: None, .. }]
+        ));
     }
 
     #[test]

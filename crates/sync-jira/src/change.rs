@@ -49,14 +49,23 @@ pub enum UpstreamChange {
         at: JiraTimestamp,
         body: String,
     },
-    /// An issue's status category changed. `category` is the *new* category; `resolution` is the
-    /// resolution name Jira reports alongside it (usually set once the category is `done`, but
-    /// carried through for any change since `plan` only inspects it on a move to `done`).
-    IssueStatusCategoryChanged {
+    /// An issue's status category moved to `done` (or, on a first sync, was already `done`).
+    /// Mirrors `pitcrew_sync_github::UpstreamChange::IssueClosed`: emitted only on a genuine
+    /// transition into `done`, never on a move between `new` and `indeterminate` (Jira's many
+    /// custom "in progress"-shaped statuses are not something sync needs visibility into).
+    IssueDone {
         source: ExternalRef,
         at: JiraTimestamp,
-        category: StatusCategory,
+        /// The resolution name Jira reports alongside the move, if any.
         resolution: Option<String>,
+    },
+    /// An issue's status category moved *out of* `done`, back to `new` or `indeterminate`.
+    /// Mirrors `pitcrew_sync_github::UpstreamChange::IssueReopened`: emitted only on a genuine
+    /// transition out of `done` (never derived from the hub's own task status — see
+    /// [`crate::ownership::plan`] for why that distinction matters).
+    IssueReopened {
+        source: ExternalRef,
+        at: JiraTimestamp,
     },
     /// An issue's labels changed.
     IssueRelabelled {
@@ -104,7 +113,8 @@ impl UpstreamChange {
             UpstreamChange::IssueCreated { source, .. }
             | UpstreamChange::IssueRetitled { source, .. }
             | UpstreamChange::IssueBodyEdited { source, .. }
-            | UpstreamChange::IssueStatusCategoryChanged { source, .. }
+            | UpstreamChange::IssueDone { source, .. }
+            | UpstreamChange::IssueReopened { source, .. }
             | UpstreamChange::IssueRelabelled { source, .. }
             | UpstreamChange::IssueReassigned { source, .. }
             | UpstreamChange::IssueReparented { source, .. }
@@ -176,10 +186,9 @@ pub(crate) fn diff_issue(
                 epic: epic.clone(),
             });
             if next.category == StatusCategory::Done {
-                changes.push(UpstreamChange::IssueStatusCategoryChanged {
+                changes.push(UpstreamChange::IssueDone {
                     source,
                     at,
-                    category: next.category,
                     resolution: next.resolution.clone(),
                 });
             }
@@ -199,14 +208,21 @@ pub(crate) fn diff_issue(
                     body: next.body.clone(),
                 });
             }
-            if prev.category != next.category {
-                changes.push(UpstreamChange::IssueStatusCategoryChanged {
+            if prev.category != StatusCategory::Done && next.category == StatusCategory::Done {
+                changes.push(UpstreamChange::IssueDone {
                     source: source.clone(),
                     at: at.clone(),
-                    category: next.category,
                     resolution: next.resolution.clone(),
                 });
+            } else if prev.category == StatusCategory::Done && next.category != StatusCategory::Done
+            {
+                changes.push(UpstreamChange::IssueReopened {
+                    source: source.clone(),
+                    at: at.clone(),
+                });
             }
+            // A move between `new` and `indeterminate` (neither side `done`) is not reported at
+            // all — see `UpstreamChange::IssueDone`'s doc.
             if prev.labels != next.labels {
                 changes.push(UpstreamChange::IssueRelabelled {
                     source: source.clone(),
@@ -333,7 +349,7 @@ mod tests {
     }
 
     #[test]
-    fn first_sight_already_done_emits_created_then_status_changed() {
+    fn first_sight_already_done_emits_created_then_done() {
         let (changes, snap) = diff_issue(
             "https://jira.example.com",
             &issue("2026-01-01T00:00:00.000+0000", "done"),
@@ -342,13 +358,59 @@ mod tests {
         )
         .expect("well-formed");
         assert!(matches!(changes[0], UpstreamChange::IssueCreated { .. }));
-        assert!(matches!(
-            changes[1],
-            UpstreamChange::IssueStatusCategoryChanged {
-                category: StatusCategory::Done,
-                ..
-            }
-        ));
+        assert!(matches!(changes[1], UpstreamChange::IssueDone { .. }));
         assert_eq!(snap.category, StatusCategory::Done);
+    }
+
+    fn snapshot_with_category(category: &str) -> IssueSnapshot {
+        let (_, snap) = diff_issue(
+            "https://jira.example.com",
+            &issue("2026-01-01T00:00:00.000+0000", category),
+            None,
+            None,
+        )
+        .expect("well-formed");
+        snap
+    }
+
+    #[test]
+    fn a_move_to_done_emits_issue_done() {
+        let prev = snapshot_with_category("new");
+        let (changes, _) = diff_issue(
+            "https://jira.example.com",
+            &issue("2026-01-02T00:00:00.000+0000", "done"),
+            Some(&prev),
+            None,
+        )
+        .expect("well-formed");
+        assert_eq!(changes.len(), 1, "{changes:#?}");
+        assert!(matches!(changes[0], UpstreamChange::IssueDone { .. }));
+    }
+
+    #[test]
+    fn a_move_out_of_done_emits_issue_reopened() {
+        let prev = snapshot_with_category("done");
+        let (changes, _) = diff_issue(
+            "https://jira.example.com",
+            &issue("2026-01-02T00:00:00.000+0000", "new"),
+            Some(&prev),
+            None,
+        )
+        .expect("well-formed");
+        assert_eq!(changes.len(), 1, "{changes:#?}");
+        assert!(matches!(changes[0], UpstreamChange::IssueReopened { .. }));
+    }
+
+    #[test]
+    fn a_move_between_new_and_indeterminate_emits_nothing() {
+        let prev = snapshot_with_category("new");
+        let (changes, _) = diff_issue(
+            "https://jira.example.com",
+            &issue("2026-01-02T00:00:00.000+0000", "indeterminate"),
+            Some(&prev),
+            None,
+        )
+        .expect("well-formed");
+        assert!(changes.is_empty(), "{changes:#?}");
     }
 }
