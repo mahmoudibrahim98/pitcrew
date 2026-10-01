@@ -304,15 +304,21 @@ pub(crate) fn report(facts: &mut Facts, r: &Reported) -> Option<SessionState> {
     }
     facts.reported_at = Some(r.at);
     if r.to == facts.state {
-        if r.status_line.is_some() {
-            facts.status_line.clone_from(&r.status_line);
+        if let Some(s) = r.status_line.as_deref() {
+            facts.status_line = Some(status_text(s));
         }
         return None;
     }
     let from = facts.state;
     facts.state = r.to;
-    facts.status_line = r.status_line.as_deref().map(|s| clip(first_line(s)));
+    facts.status_line = r.status_line.as_deref().map(status_text);
     Some(from)
+}
+
+/// A status line as kept: its first line, trimmed, at most [`MAX_STATUS_CHARS`] characters (and
+/// an ellipsis).
+pub(crate) fn status_text(s: &str) -> String {
+    clip(first_line(s))
 }
 
 /// The events a report that changed the state from `from` causes.
@@ -649,6 +655,25 @@ mod tests {
         );
         // A repeat of the current state is not a change.
         assert_eq!(report(&mut facts, &reported(70, SessionState::Ended)), None);
+    }
+
+    #[test]
+    fn reported_status_lines_are_clipped_whether_or_not_the_state_changes() {
+        let long = format!("{}\nsecond line", "x".repeat(10_000));
+        let clipped = format!("{}…", "x".repeat(MAX_STATUS_CHARS));
+        let with = |at, to| Reported {
+            at,
+            to,
+            status_line: Some(long.clone()),
+        };
+        let mut facts = Facts::default();
+        assert!(report(&mut facts, &with(1, SessionState::Waiting)).is_some());
+        assert_eq!(facts.status_line.as_deref(), Some(clipped.as_str()));
+        facts.status_line = None;
+        // The same state again: no change, but the line is kept, clipped too.
+        assert_eq!(report(&mut facts, &with(2, SessionState::Waiting)), None);
+        assert_eq!(facts.status_line.as_deref(), Some(clipped.as_str()));
+        assert_eq!(status_text("  ok  \nmore"), "ok");
     }
 
     #[test]

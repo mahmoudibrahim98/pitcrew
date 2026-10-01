@@ -18,7 +18,8 @@
 //! [`SessionId`]: pitcrew_protocol::ids::SessionId
 
 use crate::agents::SessionAgent;
-use crate::derive::Reported;
+use crate::derive::{self, Reported};
+use crate::plain;
 use crate::watch::{Origin, Shared, Signal, Target};
 use pitcrew_api::hooks::{HookEvent, HookSink};
 use pitcrew_protocol::api::{Caller, TokenScope};
@@ -114,6 +115,10 @@ pub(crate) fn refusal(sender: &Sender, agent: &SessionAgent) -> Option<&'static 
 }
 
 /// The state change a hook reports, if it reports one.
+///
+/// What it keeps is small whatever the payload: a session id that is not a plain id (at most 128
+/// bytes, see `plain`) drops the hook, and the status line is cut to its first line and 120
+/// characters. As a sender can queue only so many signals, this bounds their memory too.
 pub(crate) fn signal(event: &HookEvent) -> Option<Signal> {
     let p = &event.payload;
     let (native_id, to, status_line) = match event.engine {
@@ -132,6 +137,10 @@ pub(crate) fn signal(event: &HookEvent) -> Option<Signal> {
         }
         _ => return None,
     };
+    if !plain::is_id(native_id) {
+        tracing::debug!(engine = ?event.engine, event = %event.event, bytes = native_id.len(), "a hook whose session id is not a plain id; dropped");
+        return None;
+    }
     Some(Signal {
         target: Target::Native {
             engine: event.engine,
@@ -163,7 +172,7 @@ fn claude(event: &str, p: &Map<String, Value>) -> Option<(SessionState, Option<S
             waiting.then(|| {
                 (
                     SessionState::Waiting,
-                    Some(message.to_owned()).filter(|m| !m.is_empty()),
+                    Some(derive::status_text(message)).filter(|m| !m.is_empty()),
                 )
             })
         }
@@ -219,6 +228,50 @@ mod tests {
                 "{engine:?}"
             );
         }
+    }
+
+    #[test]
+    fn what_a_hook_keeps_is_bounded() {
+        let stop = |id: &str| {
+            signal(&hook(
+                Engine::Claude,
+                "Stop",
+                serde_json::json!({ "session_id": id }),
+            ))
+        };
+        let longest = "a".repeat(128);
+        assert!(stop(&longest).is_some());
+        for bad in [
+            "a".repeat(129),
+            "x".repeat(1 << 20),
+            "a b".into(),
+            "../a".into(),
+            "-a".into(),
+            "a\u{0}".into(),
+        ] {
+            assert!(stop(&bad).is_none(), "{} bytes", bad.len());
+        }
+        let notify = |id: &str| {
+            signal(&hook(
+                Engine::Codex,
+                "notify",
+                serde_json::json!({"type": "agent-turn-complete", "thread-id": id}),
+            ))
+        };
+        assert!(notify("t1").is_some());
+        assert!(notify(&"t".repeat(129)).is_none());
+        assert!(notify("t 1").is_none());
+
+        // The status line: the first line, at most 120 characters (and an ellipsis).
+        let message = format!("{}\n{}", "é".repeat(5000), "second line".repeat(1000));
+        let line = signal(&hook(
+            Engine::Claude,
+            "Notification",
+            serde_json::json!({"session_id": "s", "notification_type": "permission_prompt",
+                               "message": message}),
+        ))
+        .and_then(|s| s.report.status_line);
+        assert_eq!(line, Some(format!("{}…", "é".repeat(120))));
     }
 
     #[test]
