@@ -77,9 +77,11 @@ Windows it must be under the user's profile, whose ACL it inherits.
    new one is minted for the workspace's first person (the demo's `@sam`) and written there. If
    the store has no person yet, the token acts as a new member that nothing knows, and
    `GET /v1/me` answers 404 until onboarding can add the person (see "Not wired yet").
-6. Unless `--no-runner`, the runner (see "The runner"). It reads the homes and writes into the
-   store at once: the back office's first run covers what it appended, like anything else.
-7. The recap index's warm-up (see "Recaps"), started and not waited for; the back office's loop;
+6. The stop signals' handlers, so a stop from here on takes the clean path (see "Stop").
+7. Unless `--no-runner`, the runner (see "The runner"). It reads the homes and writes into the
+   store at once: the back office's first run covers what it appended, like anything else. A
+   runner that cannot start does not stop the hub (see "The runner").
+8. The recap index's warm-up (see "Recaps"), started and not waited for; the back office's loop;
    the routes; the listener; and the ready line.
 
 ### Stop
@@ -91,6 +93,15 @@ run it is in and saves `office.json` (`the back office stopped`), and the runner
 read is handed to the store first, its threads end, and with them its hold on the store (`the
 runner stopped`). Each gets 10 seconds. Then the store closes, checkpointing its WAL so only
 `hub.db` remains, and the lock is released last. The log ends with `store closed` and `stopped`.
+
+**A stop always ends, within about 20 seconds.** Whatever does not finish in time is left behind
+and ends with the process, and the log says so (warnings): a runner stuck in a discovery or a read
+on a filesystem that does not answer (`the runner is still stopping`); a transcript read past its
+10 seconds (`a transcript read has not returned`); anything that still holds the store 3 seconds
+after the server stopped; and, last, work still on the blocking pool 5 seconds later (`work on the
+blocking pool is still running`). The store is then closed with the process (`the store is still
+open at exit`), and its next open recovers the log from its write-ahead file. Bounds: the 10
+seconds of the stop step, 3 for the store's holders, 5 for the blocking pool.
 
 ## The back office
 
@@ -204,8 +215,15 @@ on the hub's own machine (the workspace's first local one). Without that machine
 person, it stays off (logged), as the back office does without a person. Its index is
 `runner/<log id>/`.
 
-**`GET /v1/host/info`** answers roles `["hub", "runner"]` and capabilities `["watch"]` while it
-runs; `["hub"]` and `[]` when it is off.
+**A runner that cannot start** (its index cannot be opened or is locked, one of its threads,
+its terminals' included, cannot start) does not stop the hub: the daemon warns (`the runner cannot
+start, so this hub serves without it`, with the reason and the index's folder) and serves as with
+`--no-runner`. A desktop supervisor cannot pass `--no-runner`, and the hub's work is still worth
+reaching.
+
+**`GET /v1/host/info`** answers roles `["hub", "runner"]` while the runner runs, `["hub"]` when it
+is off; capabilities `["watch"]` only while it watches at least one home (so not with `--demo`
+alone), else `[]`.
 
 **Hooks, and `SessionAgents`.** `POST /v1/hooks/{engine}/{event}` goes through the API's
 `HookIntake` to `RunnerHooks`, which applies a hook only when its sender may change the session
@@ -221,11 +239,18 @@ members:
 - A session stored with an agent answers that agent and its owner; one stored without, or not
   stored at all, "no agent" (the runner states every session without one, and a dispatch stores
   its agent before its CLI starts).
-- **A sub-agent runs as its parent:** the answer is the agent found up the chain of `parent`s.
-  Two sessions of a chain naming different agents, a chain longer than 16 or one that loops, an
-  agent the hub does not know as an agent member, or a read that fails: **`Unknown`**, and the
-  runner refuses the hook.
+- **A sub-agent runs as its parent:** the answer is the agent found up the chain of `parent`s,
+  for at most 16 sessions, the session itself included. Two sessions of a chain naming different
+  agents, a chain going on past 16 sessions (to a 17th, stored or not: erring safe) or one that
+  loops, an agent the hub does not know as an agent member, or a read that fails (warned once,
+  then logged at debug): **`Unknown`**, and the runner refuses the hook.
 - It reads the store only, never the runner, so it cannot wait for the watcher thread that asks.
+- **A window at discovery.** The runner decides the hooks it held for a new session when it
+  discovers it, before the hub has stored the session. Its `parent` cannot be seen then, so a
+  sub-agent answers "no agent" even when its parent has one. Harmless today (every parent is the
+  runner's own session, without an agent); once dispatch ids are adopted, a dispatched agent's
+  held hooks for its sub-agents would be refused and a person's applied. The fix is the runner's:
+  ask about the parent (`agent_of(parent)` when the sub-agent answers "no agent"), or pass it in.
 - **Consequence today** (the runner README, "Session ids today"): the runner's sessions have no
   agent in the hub, so the person's hooks (device token) change them and an agent token's do not.
   How a real agent's hooks authenticate is a separate design.
@@ -245,11 +270,13 @@ where `has_tmux`, else the PTY runtime.
 
 - the daemon hands the runner its three adapters wrapped in `Recorded`, which keeps what each
   home's latest discovery found; the route only reads those, so only watched homes;
-- a session's transcript is found by its engine and native id, the way the CLIs name their files:
-  OpenCode's inner id, Claude's `<id>.jsonl`, or a name ending in `-<id>` (Codex's
-  `rollout-<time>-<id>.jsonl`, Claude's sub-agents' `agent-<id>.jsonl`); an exact name before a
-  suffix, then the newest;
-- it is paged by the adapter's own `read_page` on the blocking pool, given 10 seconds;
+- a session's transcript is found by its engine and native id, by each CLI's own file names only:
+  Claude's `<id>.jsonl` and its sub-agents' `agent-<id>.jsonl`, Codex's
+  `rollout-<time>-<id>.jsonl` (or the whole name, when the rollout's records name no id), and
+  OpenCode's inner id; so an id cannot match another kind of file. The newest, if one session is
+  in two homes;
+- it is paged by the adapter's own `read_page` on the blocking pool, given 10 seconds: a read that
+  does not return by then answers `503` and is logged as left running (see "Stop");
 - unknown session `404`; another machine's, or any without a runner, `503`; a session of this
   machine whose transcript is not found (the demo's, a deleted file) an empty page at the start,
   as the mock answers for a session without one; `limit` 200 by default, 1000 at most, and a
@@ -273,7 +300,7 @@ dispatch"); then `RunnerCommands` becomes hub-work's `Dispatcher` here.
 
 | Route | From |
 |---|---|
-| `GET /v1/host/info` (no token) | `pitcrew-api`; roles `["hub", "runner"]` and capabilities `["watch"]` while the runner runs, else `["hub"]` and `[]` |
+| `GET /v1/host/info` (no token) | `pitcrew-api`; roles `["hub", "runner"]` while the runner runs, else `["hub"]`; capabilities `["watch"]` while it watches a home, else `[]` |
 | Work routes, agent and device, with `GET /v1/workspace` and `GET /v1/sessions[/{id}]` | `pitcrew-hub-work` (`agent_routes`, `device_routes`) |
 | `POST /v1/tasks/{id}/dispatch` | `pitcrew-hub-work` without a dispatcher: `503 unavailable`, and nothing is recorded, not even an assignment (see "Dispatch") |
 | `GET /v1/stream` | `pitcrew-api` over the store (`StoreSource`) |
@@ -308,7 +335,8 @@ held in memory, never stored, so a restart builds them again.
   does not wait for it: a request meanwhile waits for the index, and finds it built. It logs
   `built the recap index rev=<the revision it reflects> ms=<how long>`, or a warning if it failed
   (then the first request goes on from where it stopped). With `--demo` it is a few milliseconds
-  (67 revisions); a stop during a long warm-up waits for it before the store closes.
+  (67 revisions); a stop during a long warm-up waits for it before the store closes, within the
+  stop's bounds (see "Stop").
 - **Any `tz`.** The daemon computes days at any offset from −840 to 840; the mock serves only
   `tz=0` from its fixture.
 - **Not the mock's fixture.** The seeded demo's log is not the fixture's slice (the seed's own
@@ -402,13 +430,19 @@ allow for the back office appending after a write (the demo's asks are old by th
   timing cannot pass it. Agents are given as a dispatch would, by a `session_discovered` naming
   them, appended from the test with the work model's projections;
 - `--demo` without `--homes` watches no home, not even the daemon's own (it holds a transcript
-  that never appears), and the log says so; started again without `--demo`, the same home is
-  watched by default and the session appears;
+  that never appears): the runner runs but `capabilities` is `[]`, and the log says so; started
+  again without `--demo`, the same home is watched by default and the session appears;
 - `--no-runner`: roles `["hub"]`, hooks only logged, terminal and transcript `503`, and `--homes`
   refused with it;
+- a runner that cannot start (`runner` in the state directory is a file): the daemon starts, warns
+  with the folder, and serves as a hub only (roles `["hub"]`, terminal and transcript `503`, the
+  work routes as ever);
 - on Unix, SIGTERM: `the runner stopped` and `the back office stopped` before `store closed`; a
   restart with lines written meanwhile keeps the session's id, adds the rest, and stores nothing
-  twice.
+  twice;
+- on Unix, a stop with a read that never returns (the transcript swapped for a FIFO no one writes,
+  which both the watcher and a transcript request then open): the daemon still exits cleanly, in
+  about 18 seconds, logging the runner, the read and the store it left behind.
 
 `tests/office.rs`, with `--demo`, appends what the runner link will report straight to the store
 (the daemon looks at it with its next append, here a comment through the API, or at its next
@@ -459,11 +493,12 @@ so the number alone could not show it.)
 
 The unit tests of the runner's wiring: `src/agents.rs` answers each session's agent and owner,
 sees a session gain an agent at once (and keep it through a re-statement without one), resolves
-sub-agents up their chain, and answers `Unknown` for a chain that disagrees or loops and for an
-agent the hub does not know as one; `src/terminals.rs` answers `404`, `503` or the runner's
-answer by where the session is, with and without a runner; `src/transcripts.rs` finds each CLI's
-file names, prefers exact names and then the newest, and replaces a home's list at each
-discovery; `src/runner.rs` and `src/cli.rs` check that `--demo` alone watches nothing (the person's
+sub-agents up their chain (16 sessions resolve; 17, or 16 below a parent not stored, are
+`Unknown`), and answers `Unknown` for a chain that disagrees or loops and for an agent the hub
+does not know as one; `src/terminals.rs` answers `404`, `503` or the runner's answer by where the
+session is, with and without a runner; `src/transcripts.rs` finds each CLI's file names and no
+other engine's (no Claude id names a rollout, no Codex id a Claude file), takes the newest of
+one session in two homes, and replaces a home's list at each discovery; `src/runner.rs` and `src/cli.rs` check that `--demo` alone watches nothing (the person's
 homes are not even looked up), how `--homes` values become homes, and that `--no-runner` refuses
 `--homes`.
 
