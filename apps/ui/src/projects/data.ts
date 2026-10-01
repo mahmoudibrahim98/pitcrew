@@ -13,27 +13,24 @@ import {
   useSessions,
   useTasks,
   useWorkstreams,
+  type ActivityPage,
   type Api,
   type Ask,
   type AskFilters,
+  type Brief,
   type BriefTarget,
   type Dispatch,
   type Event,
+  type EventFilters,
   type MachineId,
   type Member,
   type MemberId,
-  type Priority,
-  type ProjectId,
-  type Receipt,
-  type SessionId,
+  type NewTask,
   type Subtask,
   type Task,
   type TaskFilters,
   type TaskId,
-  type TaskStatus,
-  type TimestampMs,
   type WorkstreamId,
-  type CalendarDate,
 } from '../data/index.ts';
 import { plainNames, type Names } from './format.ts';
 
@@ -50,45 +47,8 @@ export {
   useWorkstreams,
 } from '../data/index.ts';
 
-// ─── Wire types the data layer does not have yet (see "Contract notes" in README.md) ────────────
-
-/** `Brief` in `crates/protocol`: "Where it stands", as in force. */
-export interface Brief {
-  target: BriefTarget;
-  text: string;
-  next?: string;
-  pinned: boolean;
-  source: 'person' | 'back_office';
-  updated: TimestampMs;
-  receipts: Receipt[];
-}
-
-/** `GET /v1/events`: oldest first; `from_rev`/`to_rev` are 0 for an empty page. */
-export interface ActivityPage {
-  events: Event[];
-  from_rev: number;
-  to_rev: number;
-  at_start: boolean;
-}
-
-export interface EventFilters {
-  project?: ProjectId;
-  workstream?: WorkstreamId;
-  task?: TaskId;
-  session?: SessionId;
-}
-
-export interface NewTask {
-  project: ProjectId;
-  workstream?: WorkstreamId;
-  title: string;
-  description?: string;
-  status?: TaskStatus;
-  priority?: Priority;
-  assignee?: MemberId;
-  labels?: string[];
-  due?: CalendarDate;
-}
+// The wire types now live in the data layer; these names are what the projects code uses.
+export type { ActivityPage, Brief, EventFilters, NewTask } from '../data/index.ts';
 
 const id = encodeURIComponent;
 

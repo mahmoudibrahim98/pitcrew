@@ -129,6 +129,23 @@ export const plainNames: Names = {
 export function describeEvent(event: Event, names: Names): string {
   const { body } = event;
   switch (body.type) {
+    case 'machine_added':
+      return `added the machine ${body.data.machine.name}`;
+    case 'member_added':
+      return body.data.member.kind === 'agent'
+        ? `added the agent ${body.data.member.handle}`
+        : `added ${body.data.member.handle}`;
+    case 'persona_saved':
+      return `saved the persona ${body.data.persona.name}`;
+    case 'team_saved':
+      return `saved the team ${body.data.team.name}`;
+    case 'session_updated': {
+      const changes = [
+        body.data.title === undefined ? '' : `renamed it “${body.data.title}”`,
+        body.data.branch === undefined ? '' : `on branch ${body.data.branch}`,
+      ].filter(Boolean);
+      return `updated “${names.session(body.data.session)}”${changes.length === 0 ? '' : `: ${changes.join(', ')}`}`;
+    }
     case 'machine_liveness':
       return `saw ${names.machine(body.data.machine)} become ${body.data.liveness}`;
     case 'session_discovered':
