@@ -105,8 +105,10 @@ planted by another user never receives a token:
   is slow to take input holds up neither output nor pings. While the queue is full the socket is
   not read (back-pressure on the client); a write that times out closes with 1011.
 - A client that stops reading is closed with 1013 and resumes by offset. So is one that does
-  not answer the Ping sent every 20 s within 20 s. Several clients may attach; each gets the
-  output, and their keystrokes interleave in arrival order.
+  not answer the Ping sent every 20 s within 20 s. That time only counts while the socket is
+  read: while input backs up, a Pong the client sent waits behind keystrokes not read yet (a
+  WebSocket's frames arrive in order), so the deadline waits too. Several clients may attach;
+  each gets the output, and their keystrokes interleave in arrival order.
 - Close codes: **1000** after `exit`, **1007** malformed control, **1009** message too big,
   **1013** too slow or no Pong (reconnect with `from`), **1011** runtime failure, **1001** hub
   shutting down. A client's Close is answered before the socket is dropped.
@@ -119,20 +121,33 @@ Each socket holds its shutdown receiver until it has closed, which is how `serve
 So a `main` that returns as soon as `serve` does still closes its clients cleanly. Hyper's
 graceful shutdown alone does not wait for upgraded connections.
 
-## Activity: `GET /v1/events?before=&limit=&task=&session=`
+## Activity: `GET /v1/events?before=&limit=&project=&workstream=&task=&session=`
 
-`activity::routes(source)`, mounted as a **device** route, on the same `EventSource` as the
-stream.
+`Activity::new(source).with_refs(refs).routes()`, mounted as a **device** route, on the same
+`EventSource` as the stream. `refs` is the work model's activity index as an
+`activity::EventRefs` (see "For the composition root"). `activity::routes(source)` is the same
+route without an index.
 
 - Oldest first within a page, the newest page without `before` (exclusive); `limit` defaults to
   100, max 500.
 - The page is `pitcrew_protocol::api::EventsPage`. **Only `at_start` ends paging.**
+- Filters combine: an event must match every one given.
 - `session` and `task` match events with a `session` (or `task`) field, at any depth, holding
   the id or an object with that `id`; the id under another key (a `parent`, `blocked_by`, free
-  text) does not match. Matches are found by scanning back at most 10,000 events per request. A
-  page that ran out of budget may be short or empty, with `at_start` false, `to_rev` 0 and
-  `from_rev` where the scan stopped.
-- `project` and `workstream` answer `400 invalid` until the hub has a project index.
+  text) does not match.
+- With the index they also match what the index says an event is about, following the links in
+  force when it happened: `task` adds the turns, tool runs and file edits of sessions linked to
+  the task, and `dispatch_finished` and `ask_answered` of its dispatches and asks; `session` adds
+  `dispatch_finished` and `ask_answered` of its dispatches and asks. **Without the index those
+  are missed.**
+- `project` and `workstream` match only through the index (events about the project or
+  workstream, its tasks' and their sessions'), and answer `400 invalid` without one.
+- Bounded work per request: `project` and `workstream` alone are answered by the index, which
+  bounds its own search; a filter with `session` or `task` scans back at most 10,000 events and
+  asks the index about each 500 it reads. Either way a page may be short or empty, with
+  `at_start` false, `to_rev` 0 and `from_rev` where the search stopped.
+- The route checks the index's answers (ascending, below `before`, at most `limit`, progress,
+  revisions the log has) and answers `500` rather than a page that could make a client loop.
 
 ## Features
 
@@ -147,14 +162,43 @@ let info = pitcrew_api::local_host_info(env!("CARGO_PKG_VERSION"), vec![HostRole
 let source: Arc<dyn EventSource> = Arc::new(StoreSource::new(store.clone(), log_id));
 let hooks = HookIntake::start(Arc::new(LogHookSink), 1024)?;
 let terminals = Arc::new(RuntimeTerminals::new(runtime.clone())); // the runner keeps it to link sessions
+// `work` is the hub's one `Arc<WorkService>`; `WorkRefs` is below.
+let refs: Arc<dyn pitcrew_api::EventRefs> = Arc::new(WorkRefs(Arc::clone(&work)));
 let parts = RouterParts::new()
     .agent(pitcrew_api::hooks::routes(hooks))
     .agent(hub_work::agent_routes())    // routes marked **agent** in api-v1.md
     .device(pitcrew_api::stream::routes(source.clone(), StreamConfig::default()))
-    .device(pitcrew_api::activity::routes(source))
+    .device(pitcrew_api::Activity::new(source).with_refs(refs).routes())
     .device(pitcrew_api::terminal::routes(terminals.clone(), TerminalConfig::default()))
     .device(hub_work::device_routes()); // everything else
 pitcrew_api::serve(&Listen::private_default(run_dir)?, info, tokens, parts, shutdown).await?;
+```
+
+This crate does not depend on the work model, so the daemon adapts its index. The trait and the
+filter mirror `pitcrew_hub_work`'s field for field:
+
+```rust
+/// The work model's activity index, as `pitcrew-api` takes it.
+#[derive(Debug)]
+struct WorkRefs(Arc<pitcrew_hub_work::WorkService>);
+
+impl pitcrew_api::EventRefs for WorkRefs {
+    fn revs_matching(
+        &self,
+        f: &pitcrew_api::RefFilter,
+        before_rev: u64,
+        limit: usize,
+    ) -> Result<(Vec<u64>, u64), pitcrew_api::source::SourceError> {
+        let filter = pitcrew_hub_work::RefFilter {
+            project: f.project,
+            workstream: f.workstream,
+            task: f.task,
+            session: f.session,
+        };
+        pitcrew_hub_work::EventRefs::revs_matching(&*self.0, &filter, before_rev, limit)
+            .map_err(Into::into)
+    }
+}
 ```
 
 Do not merge more routes into the router this builds: they would be unauthenticated. Put every

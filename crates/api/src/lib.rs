@@ -9,7 +9,8 @@
 //! - [`client`] holds the checks a client makes before trusting a daemon with a token.
 //! - [`stream`] serves `GET /v1/stream` from an [`EventSource`] (the store, or memory).
 //! - [`terminal`] serves `GET /v1/sessions/{id}/terminal` from [`Terminals`].
-//! - [`activity`] serves `GET /v1/events` from the same [`EventSource`].
+//! - [`activity`] serves `GET /v1/events` from the same [`EventSource`], filtered by project or
+//!   workstream through the work model's activity index ([`EventRefs`]) when it has one.
 //! - [`hooks`] serves `POST /v1/hooks/{engine}/{event}` into a [`HookSink`].
 //!
 //! Authentication inserts an `axum::Extension<Caller>` (from `pitcrew-protocol`) into every
@@ -30,6 +31,7 @@ pub mod stream;
 pub mod terminal;
 mod util;
 
+pub use activity::{Activity, EventRefs, RefFilter};
 pub use hooks::{HookEvent, HookIntake, HookSink, LogHookSink};
 pub use host::{local_host_info, local_machine_info};
 pub use listener::{Bound, Listen};
