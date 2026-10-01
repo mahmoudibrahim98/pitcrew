@@ -48,7 +48,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [C-import-and-reopen](C-import-and-reopen.md) | C · Store | `s/C/import-and-reopen` | Sonnet-class | **Merged** |
 | [N-recap-views](N-recap-views.md) | N · Projects layout | `s/N/recap-views` | Opus-class | **Merged** |
 | [K-tray-notifications-links](K-tray-notifications-links.md) | K · Desktop shell | `s/K/tray-notifications-links` | Opus-class | **Merged** |
-| [J-tunnel](J-tunnel.md) | J · Remote and HPC | `s/J/tunnel` | Opus-class | In progress |
+| [J-tunnel](J-tunnel.md) | J · Remote and HPC | `s/J/tunnel` | Opus-class | **Merged** |
 | [0-daemon-recaps](0-daemon-recaps.md) | 0 · Composition root | `integrator/daemon-recaps` | Opus-class | **Merged** |
 | [F-recap-hardening](F-recap-hardening.md) | F · Recap | `s/F/recap-hardening` | Opus-class | **Merged** |
 | [L-desktop-polish](L-desktop-polish.md) | L · UI foundation | `s/L/desktop-polish` | Sonnet-class | **Merged** |
