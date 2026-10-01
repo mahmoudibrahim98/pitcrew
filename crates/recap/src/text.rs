@@ -17,20 +17,30 @@ pub(crate) const JOB_CHARS: usize = 32;
 const RECEIPT_TEXT_BYTES: usize = 1024;
 
 /// Characters that change text direction or are invisible. They are dropped so a crafted name
-/// cannot make a summary read differently from what it says.
+/// cannot make a summary read differently from what it says, and so tag characters cannot carry
+/// text a person does not see but a model reading the recap does (recap text reaches agents; see
+/// `docs/security/threat-model.md`).
+///
+/// The set is the same as `pitcrew_sync_github::bounds::is_hidden`, which cleans what the GitHub
+/// sync stores: change both together.
 fn is_hidden(c: char) -> bool {
     matches!(
         c,
-        '\u{061C}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{202A}'..='\u{202E}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{FEFF}'
+        '\u{00AD}' // soft hyphen
+            | '\u{061C}' // Arabic letter mark
+            | '\u{180E}' // Mongolian vowel separator
+            | '\u{200B}'..='\u{200F}' // zero-width space and joiners, direction marks
+            | '\u{2028}'..='\u{2029}' // line and paragraph separators
+            | '\u{202A}'..='\u{202E}' // direction embeddings and overrides
+            | '\u{2060}'..='\u{2064}' // word joiner, invisible operators
+            | '\u{2066}'..='\u{2069}' // direction isolates
+            | '\u{FEFF}' // byte order mark, zero-width no-break space
+            | '\u{E0000}'..='\u{E007F}' // tag characters
     )
 }
 
-/// Cleans untrusted text for display: hidden and direction-changing characters are dropped,
+/// Cleans untrusted text for display: hidden and direction-changing characters are dropped (the
+/// same set `pitcrew_sync_github::bounds::is_hidden` drops, tag characters included),
 /// control characters and whitespace runs become one space, the ends are trimmed, and at most
 /// `max` characters are kept (the last one is `…` when the text was cut). Work is bounded by
 /// `max`, not by the input length.
@@ -222,6 +232,51 @@ mod tests {
         assert_eq!(clean(&long, 5).chars().count(), 5);
         let spaces = format!("a{}b", " ".repeat(1_000_000));
         assert_eq!(clean(&spaces, 5), "a…");
+    }
+
+    /// The hidden set, written out: `pitcrew_sync_github::bounds::is_hidden` drops exactly these.
+    const HIDDEN: &[(u32, u32)] = &[
+        (0x00AD, 0x00AD),
+        (0x061C, 0x061C),
+        (0x180E, 0x180E),
+        (0x200B, 0x200F),
+        (0x2028, 0x2029),
+        (0x202A, 0x202E),
+        (0x2060, 0x2064),
+        (0x2066, 0x2069),
+        (0xFEFF, 0xFEFF),
+        (0xE0000, 0xE007F),
+    ];
+
+    #[test]
+    fn the_hidden_set_is_pinned() {
+        for c in (0..=0x10_FFFFu32).filter_map(char::from_u32) {
+            let listed = HIDDEN
+                .iter()
+                .any(|&(lo, hi)| (lo..=hi).contains(&u32::from(c)));
+            assert_eq!(is_hidden(c), listed, "U+{:04X}", u32::from(c));
+        }
+    }
+
+    #[test]
+    fn tag_characters_and_other_invisibles_are_dropped() {
+        // "hi" followed by "ignore me" spelled in tag characters, which most fonts do not show.
+        let smuggled: String = "ignore me"
+            .chars()
+            .map(|c| char::from_u32(0xE0000 + u32::from(c)).unwrap_or('?'))
+            .collect();
+        let text = format!("\u{E0001}hi{smuggled}\u{E007F}");
+        assert_eq!(clean(&text, 60), "hi");
+        assert_eq!(clean_tail(&format!("a/{text}.rs"), 60), "a/hi.rs");
+        assert_eq!(clean("soft\u{00AD}hyphen", 60), "softhyphen");
+        assert_eq!(clean("a\u{180E}b", 60), "ab");
+        // The separators are dropped, not turned into a space as other whitespace is.
+        assert_eq!(clean("line\u{2028}one\u{2029}two", 60), "lineonetwo");
+        assert_eq!(clean_tail("x\u{2028}y", 60), "xy");
+        assert!(!is_plain_path("src/\u{E0041}.rs"));
+        assert!(!is_plain_path("src/a\u{2029}b.rs"));
+        // Hidden characters cost nothing against the cap.
+        assert_eq!(clean(&format!("{}abc", "\u{E0020}".repeat(10)), 3), "abc");
     }
 
     #[test]
