@@ -25,10 +25,12 @@
 //! A position is a part's creation time on OpenCode's id scale: milliseconds × 4096 plus a
 //! counter. OpenCode ids (`prt_` + 12 hex digits + random) hold the low 48 bits of that number;
 //! the full value is recovered with the row's `time_created`. So positions are stable, unique
-//! within a session, and increase in creation order. A decoded value more than a day *after* the
-//! row's `time_created` cannot be a creation time (ids are made before their rows are written),
-//! so such ids, and ids of another shape, fall back to `time_created × 4096`. Earlier values are
-//! kept: `opencode import` writes parts with their ids but the import time as `time_created`.
+//! within a session, and increase in creation order. Ids are made before their rows are written,
+//! so of the values the 48 bits allow (2^48 apart, about 795 days), the latest that is at most a
+//! day (for clock changes) after the row's `time_created` is taken: never a future position, and
+//! the right one for a row written up to about 794 days after its id was made, as `opencode
+//! import` does (it keeps the ids but writes the import time as `time_created`). Ids of another
+//! shape fall back to `time_created × 4096`.
 //! Times a payload lacks are taken from the position too. Parts that share a position are never
 //! split across pages. Positions are capped at [`MAX_POSITION`] (2^53 − 1, exact as a JSON
 //! number), which real times reach in 2039.
@@ -747,22 +749,16 @@ pub fn position(id: &str, created: TimestampMs) -> u64 {
         .unwrap_or(0)
         .saturating_mul(4096)
         .min(MAX_POSITION);
-    let decoded = id_bits(id).map(|bits| {
-        let near = (base & !(ID_SPAN - 1)) | bits;
-        [
-            near.checked_sub(ID_SPAN),
-            Some(near),
-            near.checked_add(ID_SPAN),
-        ]
-        .into_iter()
-        .flatten()
-        .min_by_key(|c| c.abs_diff(base))
-        .unwrap_or(near)
-    });
-    let pos = match decoded {
+    let pos = match id_bits(id) {
         // Without a creation time (no `time_created` column), the id's bits are all there is.
-        Some(d) if created <= 0 || d <= base.saturating_add(MAX_ID_LEAD) => d,
-        _ => base,
+        Some(bits) if created <= 0 => bits,
+        // The latest value with these low bits that is at most `MAX_ID_LEAD` after the row.
+        Some(bits) => {
+            let top = base.saturating_add(MAX_ID_LEAD);
+            top.checked_sub(bits)
+                .map_or(base, |above| top - above % ID_SPAN)
+        }
+        None => base,
     };
     pos.min(MAX_POSITION)
 }
@@ -1121,17 +1117,35 @@ mod tests {
     }
 
     #[test]
-    fn positions_are_capped_and_ids_far_ahead_of_their_rows_are_not_trusted() {
+    fn positions_are_capped_and_never_far_ahead_of_their_rows() {
         let ms: i64 = 1_790_756_400_000;
         let base = u64::try_from(ms).expect("positive") * 4096;
         let id_at = |pos: u64| format!("prt_{:012x}Synthetic", pos % ID_SPAN);
         // An imported row: written weeks after its id was made. The id is kept.
         let weeks = 30 * 86_400_000 * 4096;
         assert_eq!(position(&id_at(base - weeks), ms), base - weeks);
-        // An id hours ahead of its row is clock drift; days ahead is not a creation time.
+        // An id hours ahead of its row is clock drift; days ahead is not a creation time, so
+        // the bits are read in the window before.
         let hours = 3 * 3_600_000 * 4096;
         assert_eq!(position(&id_at(base + hours), ms), base + hours);
-        assert_eq!(position(&id_at(base + MAX_ID_LEAD + 4096), ms), base);
+        let ahead = base + MAX_ID_LEAD + 4096;
+        assert_eq!(position(&id_at(ahead), ms), ahead - ID_SPAN);
+        // Whatever the bits, never more than a day after the row.
+        for bits in [
+            0,
+            1,
+            ID_SPAN / 2,
+            ID_SPAN - 1,
+            base % ID_SPAN,
+            ahead % ID_SPAN,
+        ] {
+            let p = position(&format!("prt_{bits:012x}x"), ms);
+            assert!(p <= base + MAX_ID_LEAD, "{bits:x}");
+            assert!(
+                p + ID_SPAN > base + MAX_ID_LEAD,
+                "{bits:x}: the latest such value"
+            );
+        }
         // Without a creation time the id's 48 bits are used as they are.
         assert_eq!(position(&id_at(base), 0), base % ID_SPAN);
         // Huge creation times are capped, so `offset + 1` never overflows.
@@ -1139,6 +1153,32 @@ mod tests {
             assert!(position(&id_at(base), created) <= MAX_POSITION);
             assert!(position("prt_x", created) <= MAX_POSITION);
         }
+    }
+
+    /// An import long after the session (here more than half the 48-bit span, about 397 days,
+    /// where the nearest value would be a year in the future) still finds the ids' real times,
+    /// up to the span less a day.
+    #[test]
+    fn imports_up_to_the_id_span_later_keep_their_ids_times() {
+        let made: i64 = 1_760_000_000_000;
+        let full = u64::try_from(made).expect("positive") * 4096 + 3;
+        let id = format!("prt_{:012x}Imported", full % ID_SPAN);
+        let day: i64 = 86_400_000;
+        let span_days = i64::try_from(ID_SPAN / 4096).expect("fits") / day;
+        assert_eq!(span_days, 795);
+        for later in [0, 1, 30, 396, 398, 600, 700, span_days - 2] {
+            assert_eq!(
+                position(&id, made + later * day),
+                full,
+                "imported {later} days later"
+            );
+        }
+        // Past the span (less a day) the bits are ambiguous: the latest value at most a day after
+        // the row is taken, which is no longer the real one but never further ahead.
+        let late = made + span_days * day;
+        let row = u64::try_from(late).expect("positive") * 4096;
+        assert_eq!(position(&id, late), full + ID_SPAN);
+        assert!(position(&id, late) <= row + MAX_ID_LEAD);
     }
 
     #[test]
