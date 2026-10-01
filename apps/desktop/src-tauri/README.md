@@ -68,20 +68,26 @@ hand. Logs go to stderr at `PITCREW_DESKTOP_LOG` (default `info`).
   in their Inbox. A broken stream (a close, a broken connection, 60 s of silence) is resumed with
   `since` after 1 s, doubling to 30 s, or at once when the workspace becomes `ready` again; a new
   event log (`hello.log` changed, or `since` past the daemon's revision) takes a new snapshot.
-  **Bounds:** one watcher per workspace; 512 asks and 2048 names per workspace (past 512 the count
-  reads "512+", and an answer for an ask not kept asks for a snapshot, at most one a minute); 8 MiB
-  per frame, 16 MiB per snapshot body, 30 s per request.
-- **Notifications** (`notify/`), for each new ask while notifications are on and the window is not
-  in front (visible, focused and not minimised):
+  The wait starts again from 1 s only after a snapshot that worked or a stream that stayed up
+  60 s, so a daemon that fails right after its `hello` is retried less and less often.
+  **Bounds:** one watcher per workspace; 512 asks and 2048 names (60 characters each) per
+  workspace (past 512 the count reads "512+", and an answer for an ask not kept asks for a
+  snapshot, at most one a minute); 8 MiB per frame (a larger one starts afresh from a snapshot),
+  16 MiB per snapshot body (a larger one reads "512+" and is tried again after 10 minutes), 30 s
+  per request.
+- **Notifications** (`notify/`), for new asks while notifications are on and the window is not in
+  front (focused, visible and not minimised; asked once per stream frame):
   - title: the asker's name and the kind ("Writer has a question", "… needs a decision", "… asks for
     a review", "… asks for approval", "… mentioned you"); body: the ask's title and context. Both
-    lose control, bidi and zero-width characters, have their whitespace collapsed, and are cut (the
-    body at 200 characters).
+    lose control and bidi characters and those that show as nothing (zero-width, the soft hyphen,
+    tag characters, variation selectors, Hangul fillers and the like), have their whitespace
+    collapsed, and are cut (the body at 200 characters); a body left empty reads "An agent needs
+    you".
   - **Rate limit:** asks are gathered for 2 s, and notifications are at least 30 s apart; what
     arrives meanwhile becomes one ("3 agents need you", "Writer needs you" with "4 new asks").
   - **A click** navigates: to the ask's task, or the workspace's Inbox (a summary goes to the
     Inbox). Linux: `org.freedesktop.Notifications` on the session bus, with a `default` action
-    (the body is escaped when the service reads markup); Windows: WinRT toasts
+    (the title and body are escaped when the service reads markup); Windows: WinRT toasts
     (`tauri-winrt-notification`; a release build sends as the app's AppUserModelID, which the
     installer's shortcut must carry, a debug build as PowerShell's); macOS: the notification centre
     (`mac-notification-sys`; at most 4 notifications wait for a click, later ones only bring the
@@ -93,7 +99,8 @@ hand. Logs go to stderr at `PITCREW_DESKTOP_LOG` (default `info`).
   250 ms. On Windows a left click opens the window.
   - **Is there a tray?** Always on Windows and macOS. On Linux only when a StatusNotifierWatcher
     with a host is on the session bus and libappindicator loads (it is loaded at run time; if it is
-    missing, its loader panics, which the app catches): otherwise no icon.
+    missing, its loader panics, which the app catches): otherwise no icon. There the icon is
+    handed over as a PNG in the app's cache directory (`tray/`), not the shared `/tmp/tray-icon`.
 - **Closing the window** hides it when there is a tray and "Quit when the window closes" is off;
   the first time, a notification says so. Without a tray, closing quits, as before.
 
@@ -113,16 +120,34 @@ it.
 - **Where links come from:** the launch command line (Linux, Windows), the single-instance
   hand-over from a second launch, and macOS's `Opened` event. Clicks on the app's notifications
   use the same path.
+  - **On macOS** Tauri hands links over already parsed, and the URL parser has resolved dot
+    segments (`..`, `%2e`) by then: the strict parser sees the result, so such a link can still
+    only open one of the allowed places.
+  - **On Windows** the single-instance plugin joins a second launch's arguments with `|` and
+    splits them again, so a link holding `|` arrives as several arguments, each parsed on its own.
 - **A link that launched the app** arrives before the UI listens. The latest one is held until
   the main page calls `gateway_workspaces` (the UI listens to the gateway's events before it
-  reads the list), and held again while the page reloads.
+  reads the list), for 60 s at most, and held again while the page reloads. The navigator exists
+  before any plugin, so a link handed over while the app starts is held too.
 - **Registering the scheme:** installers do it from `plugins.deep-link.desktop.schemes` in
   `tauri.conf.json`, which Tauri's bundler reads (the deep-link plugin itself is not used: it
-  would emit every link, unparsed, to the webview). An AppImage or a debug build on Linux
-  registers itself as `xdg-mime default` would: a hidden
-  `$XDG_DATA_HOME/applications/org.pitcrew.desktop-url-handler.desktop`, and that file as the
-  default for `x-scheme-handler/pitcrew` in `$XDG_CONFIG_HOME/mimeapps.list` (only that key).
-  A debug build on Windows is not registered (an installer registers it).
+  would emit every link, unparsed, to the webview). On Linux two kinds of run register
+  themselves, as `xdg-mime default` would:
+  - **an AppImage**, trusted only when `APPIMAGE` and `APPDIR` are set and the program runs from
+    inside `APPDIR` (both variables are inherited by everything an AppImage starts);
+  - **a debug build**, only with `PITCREW_DEV_REGISTER_SCHEME=1`:
+
+    ```bash
+    PITCREW_DEV_REGISTER_SCHEME=1 cargo run --manifest-path apps/desktop/src-tauri/Cargo.toml
+    ```
+
+  They write a hidden `$XDG_DATA_HOME/applications/org.pitcrew.desktop-url-handler.desktop`, and
+  make it the default for `x-scheme-handler/pitcrew` in `$XDG_CONFIG_HOME/mimeapps.list` only
+  when there is no default, when it is this handler already, or when the default names a handler
+  that is gone (no `.desktop` file in the data directories, or its program missing): another
+  installed PitCrew or another app is never replaced. Only that key changes and the file keeps
+  its mode; a `mimeapps.list` that is a link (home-manager, stow, chezmoi) or over 1 MiB is left
+  alone. A debug build on Windows is not registered (an installer registers it).
 
 ## The local daemon (`src/daemon`)
 
@@ -251,14 +276,16 @@ invoke('gateway_socket_close', { socket, code, reason })
 |---|---|
 | `gateway.rs` | Requests whatever their status; the 1 MiB and 32 MiB limits; bad paths and methods refused before anything is sent; the error mapping (unknown workspace, daemon down, 503 and 404 on upgrade, `needs_pairing`, an upgrade that never answers); socket order with `close` last and the sink released; 1006; 1009 both ways; 1013 with exactly 8 MiB delivered; a webview that keeps up gets all 16 MiB; Pings; closing; cleanup per page. |
 | `app.rs` | The commands through Tauri's IPC on the mock runtime with the real ACL: another window and other core commands are denied; `gateway://workspaces` on changes; closing the window closes its sockets; a deep link held until the main page asks for the workspaces, then `gateway://navigate` with the contract's payload, hostile links dropped, held again on a reload. |
-| `attention.rs` | "Needs you" against the fake daemon's live stream: the snapshot (only the person's open asks), raised and answered, other members' asks and other events ignored, resuming with `since` without a snapshot, the bound and the snapshot it asks for, a new event log, one watcher per ready workspace, and a reconnect at once when the workspace is ready again. |
+| `attention.rs` | "Needs you" against the fake daemon's live stream: the snapshot (only the person's open asks), raised and answered, other members' asks and other events ignored, resuming with `since` without a snapshot, the bound and the snapshot it asks for, a new event log, one watcher per ready workspace, a reconnect at once when the workspace is ready again, a snapshot that keeps failing retried 50, 100, 200, then 400 ms apart (the cap) and from the first wait again once it works, and too many asks read as "N+" with no hot retry. |
 | `no_token.rs` | Every command, channel message, event, error and log line (at trace, Tauri's and tungstenite's records included) is searched for a known token; the fake daemon even echoes it in response headers, and fake `pitcrewd`s print it on stderr and in the ready line; the "needs you" subscription (snapshot, live ask, reconnect), the notifications and tray lines it leads to, the navigation events, and a dropped deep link carrying the token are searched too; a canary record proves the log bridge works. |
-
-Unit tests cover the rest: the deep-link parser as a table of hostile links (`navigate.rs`); the
-tracker (`attention/tracker.rs`); the text, the rate limiter and the pacing (`notify/mod.rs`);
-the D-Bus notifier against a fake notification service over a private connection, clicks and
-closes included (`notify/linux.rs`); the tray's lines; closing into the tray (`shell.rs`); the
-preferences; the Linux handler and `mimeapps.list` (`scheme.rs`).
 | `supervisor.rs` | Fake `pitcrewd` scripts: start and SIGTERM on quit; quitting while it starts and while `token show-path` runs; a growing backoff; giving up; never ready; no `pitcrewd`; a running daemon used, its workspace registered, and never stopped; starting our own when that one goes away. |
+
+Unit tests cover the rest: the deep-link parser as a table of hostile links, and a held target's
+60 s (`navigate.rs`); the tracker (`attention/tracker.rs`); the text, the rate limiter and the
+pacing, one look at the window per frame (`notify/mod.rs`); the D-Bus notifier against a fake
+notification service over a private connection, clicks and closes included (`notify/linux.rs`);
+the tray's lines; closing into the tray (`shell.rs`); the preferences; who registers the scheme,
+the Linux handler and `mimeapps.list`: a foreign `APPIMAGE`, a debug build without the opt-in, a
+foreign and a dangling default, a linked and an oversized file, the mode kept (`scheme.rs`).
 
 The OS keychain test is `#[ignore]`d: it needs an unlocked keychain (`cargo test -- --ignored`).
