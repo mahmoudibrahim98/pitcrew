@@ -37,13 +37,18 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [E-single-writer-and-sessions](E-single-writer-and-sessions.md) | E · Work model | `s/E/single-writer-and-sessions` | Opus-class | **Merged** |
 | [M-console-wiring](M-console-wiring.md) | M · Agent console | `s/M/console-wiring` | Opus-class | **Merged** |
 | [M-terminal](M-terminal.md) | M · Agent console | `s/M/terminal` | Opus-class | In progress |
+| [K-shell-and-gateway](K-shell-and-gateway.md) | K · Desktop shell | `s/K/shell-and-gateway` | Opus-class | In progress |
+| [L-desktop-transport](L-desktop-transport.md) | L · UI foundation | `s/L/desktop-transport` | Opus-class | In progress |
+| [G-jira-read](G-jira-read.md) | G · Integrations | `s/G/jira-read` | Sonnet-class | In progress |
+| [Q-fuzz-and-model-refresh](Q-fuzz-and-model-refresh.md) | Q · Security | `s/Q/fuzz-and-model-refresh` | Opus-class | In progress |
+| [0-recap-contract](0-recap-contract.md) | 0 · Contracts | `integrator/recap-contract` | Opus-class | In progress |
 | [0-daemon-solo](0-daemon-solo.md) | 0 · Composition root | `integrator/daemon-solo` | Opus-class | **Merged** |
 | [N-projects-wiring](N-projects-wiring.md) | N · Projects layout | `s/N/projects-wiring` | Sonnet-class | **Merged** |
 | [L-shell-polish](L-shell-polish.md) | L · UI foundation | `s/L/shell-polish` | Sonnet-class | **Merged** |
 | [E-edits-and-office](E-edits-and-office.md) | E · Work model | `s/E/edits-and-office` | Opus-class | **Merged** |
 | [H-activity-index](H-activity-index.md) | H · API and auth | `s/H/activity-index` | Opus-class | **Merged** |
 | [J-slurm](J-slurm.md) | J · Remote and HPC | `s/J/slurm` | Opus-class | In progress |
-| [0-daemon-wiring](0-daemon-wiring.md) | 0 · Composition root | `integrator/daemon-wiring` | Opus-class | In progress |
+| [0-daemon-wiring](0-daemon-wiring.md) | 0 · Composition root | `integrator/daemon-wiring` | Opus-class | **Merged** |
 | [A-scan](A-scan.md) | A · Ingest | `s/A/scan` | Sonnet-class | **Merged** |
 | [D-hub-link](D-hub-link.md) | D · Runner | `s/D/hub-link` | Opus-class | In progress |
 | [F-briefs-and-office](F-briefs-and-office.md) | F · Recap | `s/F/briefs-and-office` | Opus-class | **Merged** |

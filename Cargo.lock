@@ -1108,20 +1108,15 @@ dependencies = [
  "pitcrew-auth",
  "pitcrew-fixtures",
  "pitcrew-hub-work",
+ "pitcrew-office",
  "pitcrew-protocol",
  "pitcrew-store",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "pitcrew-desktop"
-version = "0.0.0"
-dependencies = [
- "pitcrew-protocol",
 ]
 
 [[package]]

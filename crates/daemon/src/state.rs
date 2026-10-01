@@ -7,19 +7,22 @@
 //! | `device.token` | The desktop's device token, for the UI in development. Private (0600). |
 //! | `demo-agent.token` | With `--demo`: a token for the demo's first agent. Private (0600). |
 //! | `workspace.json` | The workspace's id and name, which the event log does not hold. Private (0600). |
+//! | `office.json` | Where the back office got to in the log, so a restart runs it again from there. Private (0600). |
 //! | `run/pitcrewd.sock` | The private socket (Unix). |
 
 use anyhow::Context as _;
 use pitcrew_auth::SecretToken;
 use pitcrew_protocol::model::Workspace;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::fs;
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
 /// The longest token file read, in bytes. Tokens are about 50.
 const MAX_TOKEN_FILE: u64 = 4096;
-/// The longest workspace file read, in bytes.
-const MAX_WORKSPACE_FILE: u64 = 64 * 1024;
+/// The longest JSON state file read (`workspace.json`, `office.json`), in bytes.
+const MAX_JSON_FILE: u64 = 64 * 1024;
 
 /// A daemon's state directory and the paths in it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -71,6 +74,12 @@ impl StateDir {
         self.root.join("workspace.json")
     }
 
+    /// Where the back office got to in the log.
+    #[must_use]
+    pub fn office(&self) -> PathBuf {
+        self.root.join("office.json")
+    }
+
     /// The private socket's directory (Unix).
     #[must_use]
     pub fn run_dir(&self) -> PathBuf {
@@ -99,8 +108,7 @@ pub fn write_token(path: &Path, token: &SecretToken) -> io::Result<()> {
 /// # Errors
 /// Creating, writing or renaming fails.
 pub fn write_workspace(path: &Path, workspace: &Workspace) -> io::Result<()> {
-    let json = serde_json::to_string_pretty(workspace).map_err(io::Error::other)?;
-    write_private(path, json.as_bytes())
+    write_json(path, workspace)
 }
 
 /// Reads a workspace file written by [`write_workspace`]: `Ok(None)` if there is none.
@@ -108,15 +116,44 @@ pub fn write_workspace(path: &Path, workspace: &Workspace) -> io::Result<()> {
 /// # Errors
 /// It is not a regular file, cannot be read, or does not hold a workspace.
 pub fn read_workspace(path: &Path) -> io::Result<Option<Workspace>> {
-    let Some(text) = read_regular(path, MAX_WORKSPACE_FILE)? else {
+    read_json(path, "a workspace")
+}
+
+/// Writes `value` as JSON to `path`, as [`write_token`] writes a token.
+///
+/// # Errors
+/// Creating, writing or renaming fails.
+pub fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+    let json = serde_json::to_string_pretty(value).map_err(io::Error::other)?;
+    write_private(path, json.as_bytes())
+}
+
+/// Reads a file written by [`write_json`]: `Ok(None)` if there is none. `what` names its content
+/// in the error.
+///
+/// # Errors
+/// It is not a regular file, cannot be read, or does not hold `what`.
+pub fn read_json<T: DeserializeOwned>(path: &Path, what: &str) -> io::Result<Option<T>> {
+    let Some(text) = read_regular(path, MAX_JSON_FILE)? else {
         return Ok(None);
     };
     serde_json::from_str(&text).map(Some).map_err(|e| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("{} does not hold a workspace: {e}", path.display()),
+            format!("{} does not hold {what}: {e}", path.display()),
         )
     })
+}
+
+/// Removes the file at `path`; one that is not there is fine.
+///
+/// # Errors
+/// Removing it fails.
+pub fn remove(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
 }
 
 /// Writes `bytes` and a newline to a new private file next to `path`, then renames it over `path`.
@@ -282,6 +319,7 @@ mod tests {
             state.device_token(),
             state.demo_agent_token(),
             state.workspace(),
+            state.office(),
             state.run_dir(),
         ] {
             assert_eq!(path.parent(), Some(state.root()));

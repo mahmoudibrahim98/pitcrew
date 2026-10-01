@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createApi } from '../src/data/api.ts';
 import { StreamClient, streamUrl, type StreamStatus } from '../src/data/stream.ts';
+import { browserTransport } from '../src/data/transport.ts';
 import type { Event, Task, TaskStatus } from '../src/data/types.ts';
 import { DEVICE_TOKEN, fakeSockets, recordingSocket, startServer, type RunningServer } from './helpers.ts';
 
@@ -41,10 +42,8 @@ describe('stream client against the mock hub', () => {
     const statuses: StreamStatus[] = [];
     const socket = recordingSocket();
     const stream = new StreamClient({
-      baseUrl: hub.url,
-      token: DEVICE_TOKEN,
+      transport: browserTransport({ baseUrl: hub.url, token: DEVICE_TOKEN, socket: socket.factory }),
       since: options.since,
-      socket: socket.factory,
       onEvents: (events) => received.push(...events),
       onReset: options.onReset ?? (() => {}),
       onStatus: (status) => statuses.push(status),
@@ -133,10 +132,8 @@ describe('stream client timing', () => {
     const { factory, sockets } = fakeSockets();
     const received: Event[] = [];
     const stream = new StreamClient({
-      baseUrl: 'http://127.0.0.1:47317',
-      token: DEVICE_TOKEN,
+      transport: browserTransport({ baseUrl: 'http://127.0.0.1:47317', token: DEVICE_TOKEN, socket: factory }),
       since,
-      socket: factory,
       onEvents: (events) => received.push(...events),
       onReset: () => {},
       backoff: { initialMs: 100, maxMs: 1000 },
@@ -165,9 +162,8 @@ describe('stream client timing', () => {
     const { factory, sockets } = fakeSockets();
     const received: Event[] = [];
     const stream = new StreamClient({
-      baseUrl: 'http://127.0.0.1:47317',
+      transport: browserTransport({ baseUrl: 'http://127.0.0.1:47317', socket: factory }),
       since: 5,
-      socket: factory,
       onEvents: (events) => received.push(...events),
       onReset: (rev) => resets.push(rev),
     });
@@ -187,8 +183,7 @@ describe('stream client timing', () => {
     const { factory, sockets } = fakeSockets();
     const received: Event[] = [];
     const stream = new StreamClient({
-      baseUrl: 'http://127.0.0.1:47317',
-      socket: factory,
+      transport: browserTransport({ baseUrl: 'http://127.0.0.1:47317', socket: factory }),
       onEvents: (events) => received.push(...events),
       onReset: (rev) => resets.push(rev),
       backoff: { initialMs: 100, maxMs: 100 },
@@ -279,6 +274,37 @@ describe('stream client timing', () => {
     vi.advanceTimersByTime(100);
     expect(sockets).toHaveLength(8);
     stream.stop();
+  });
+
+  it('retryNow() reconnects at once: now while waiting, or as soon as an open in flight fails', () => {
+    const { stream, sockets } = setup();
+    stream.start();
+    // Waiting to reconnect: now.
+    sockets[0]?.drop();
+    expect(sockets).toHaveLength(1);
+    stream.retryNow();
+    expect(sockets).toHaveLength(2);
+
+    // The hub is back while that connection is still being opened, and it then fails anyway.
+    stream.retryNow();
+    sockets[1]?.drop();
+    vi.advanceTimersByTime(0);
+    expect(sockets).toHaveLength(3);
+
+    // Only once: the next failure waits for the back-off again (the third: 400 ms).
+    sockets[2]?.drop();
+    vi.advanceTimersByTime(399);
+    expect(sockets).toHaveLength(3);
+    vi.advanceTimersByTime(1);
+    expect(sockets).toHaveLength(4);
+
+    // Live, or stopped: nothing to do.
+    sockets[3]?.send({ type: 'hello', rev: 1 });
+    stream.retryNow();
+    expect(sockets).toHaveLength(4);
+    stream.stop();
+    stream.retryNow();
+    expect(sockets).toHaveLength(4);
   });
 
   it('skips events it has already seen', () => {

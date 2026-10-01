@@ -4,9 +4,11 @@
 
 [workspace]
 resolver = "3"
-members = ["crates/*", "apps/desktop/src-tauri", "benches"]
-# fuzz/ is its own cargo-fuzz workspace (nightly toolchain).
-exclude = ["fuzz"]
+members = ["crates/*", "benches"]
+# fuzz/ is its own cargo-fuzz workspace (nightly toolchain). The desktop shell is its own workspace
+# too, so Tauri's large dependency tree (and the WebKitGTK packages it needs on Linux) stays out of
+# every other stream's build; CI checks it in its own job.
+exclude = ["fuzz", "apps/desktop/src-tauri"]
 
 [workspace.package]
 version = "0.0.0"
