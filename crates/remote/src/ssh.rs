@@ -47,6 +47,9 @@
 //! nothing after either is read. A 255 without such a log is the remote command's own and comes
 //! back as an [`Output`].
 //!
+//! **Input.** [`Ssh::run`] gives the command an empty stdin; [`Ssh::run_with_input`] streams
+//! bytes to it (the helper upload uses this), with progress, while the output is read.
+//!
 //! **Resolving** with `ssh -G` may run `Match exec` commands, so it is bounded by
 //! [`RESOLVE_LIMITS`].
 
@@ -59,7 +62,7 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt as _};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::sync::watch;
 
 /// Default for `ConnectTimeout`.
@@ -204,6 +207,63 @@ pub struct Limits {
     /// How long the call may run. The clock stops while a prompt waits for the user, and
     /// starts again from zero once it is answered.
     pub timeout: Option<Duration>,
+}
+
+/// Bytes for a remote command's standard input (see [`Ssh::run_with_input`]): one or more
+/// parts sent back to back, then end of file.
+pub struct Input<'a> {
+    parts: Vec<&'a [u8]>,
+    progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+}
+
+impl<'a> Input<'a> {
+    /// Sends `bytes`.
+    #[must_use]
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            parts: vec![bytes],
+            progress: None,
+        }
+    }
+
+    /// Sends `bytes` after what is already there.
+    #[must_use]
+    pub fn then(mut self, bytes: &'a [u8]) -> Self {
+        self.parts.push(bytes);
+        self
+    }
+
+    /// Calls `progress` with the number of bytes handed to ssh so far, after each chunk of up to
+    /// 64 KiB. ssh buffers a little ahead of the network.
+    #[must_use]
+    pub fn with_progress(mut self, progress: &'a (dyn Fn(u64) + Send + Sync)) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    /// The number of bytes in all parts.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.parts
+            .iter()
+            .map(|p| u64::try_from(p.len()).unwrap_or(u64::MAX))
+            .fold(0, u64::saturating_add)
+    }
+
+    /// Whether there is nothing to send.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl fmt::Debug for Input<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Input")
+            .field("len", &self.len())
+            .field("progress", &self.progress.is_some())
+            .finish()
+    }
 }
 
 /// What `ssh -G` says a host resolves to.
@@ -392,6 +452,34 @@ impl Ssh {
         argv: &[S],
         limits: Limits,
     ) -> Result<Output, SshError> {
+        self.run_inner(host, argv, None, limits).await
+    }
+
+    /// [`Ssh::run_limited`], sending `input` to the command's standard input and then closing
+    /// it. Writing and reading go on together, so a command may answer before it has read
+    /// everything. If it stops reading (it exited), the rest is dropped quietly: its exit code
+    /// and output say what happened. `limits` bound the whole call, writing included.
+    ///
+    /// # Errors
+    /// As [`Ssh::run_limited`], plus [`SshError::Io`] if writing fails other than by the
+    /// command closing its input.
+    pub async fn run_with_input<S: AsRef<str>>(
+        &self,
+        host: &str,
+        argv: &[S],
+        input: Input<'_>,
+        limits: Limits,
+    ) -> Result<Output, SshError> {
+        self.run_inner(host, argv, Some(input), limits).await
+    }
+
+    async fn run_inner<S: AsRef<str>>(
+        &self,
+        host: &str,
+        argv: &[S],
+        input: Option<Input<'_>>,
+        limits: Limits,
+    ) -> Result<Output, SshError> {
         validate_host(host)?;
         let remote = remote_command(argv)?;
         if let Some(prompts) = &self.prompts {
@@ -417,6 +505,9 @@ impl Ssh {
         command
             .args(self.args(&dir, &log.0, host, remote)?)
             .env_remove("SSH_ASKPASS_PROMPT");
+        if input.is_some() {
+            command.stdin(Stdio::piped());
+        }
         let server = match &self.prompts {
             Some(prompts) => {
                 let server = AskpassServer::start(&dir, host, prompts.handler.clone())
@@ -436,7 +527,7 @@ impl Ssh {
                 None
             }
         };
-        let (status, stdout, stderr) = drive(command, server.as_ref(), limits).await?;
+        let (status, stdout, stderr) = drive(command, server.as_ref(), limits, input).await?;
         let stopped = server.as_ref().and_then(AskpassServer::stopped);
         let prompted = server.is_some();
         drop(server);
@@ -484,7 +575,7 @@ impl Ssh {
         validate_host(host)?;
         let mut command = self.command();
         command.args(["-G", "--", host]);
-        let (status, stdout, stderr) = drive(command, None, limits).await?;
+        let (status, stdout, stderr) = drive(command, None, limits, None).await?;
         if !status.success() {
             return Err(SshError::Ssh {
                 code: status.code().unwrap_or(-1),
@@ -510,16 +601,30 @@ impl Ssh {
     }
 }
 
-/// Runs `command` to the end: its exit status, stdout and stderr. Stops it, with everything it
-/// started, when `server` stops the call (the user cancelled a prompt, or a client failed the
-/// handshake) or the call breaks `limits`.
+/// Runs `command` to the end, feeding it `input`: its exit status, stdout and stderr. Stops it,
+/// with everything it started, when `server` stops the call (the user cancelled a prompt, or a
+/// client failed the handshake) or the call breaks `limits`.
 async fn drive(
     command: tokio::process::Command,
     server: Option<&AskpassServer>,
     limits: Limits,
+    input: Option<Input<'_>>,
 ) -> Result<(ExitStatus, Vec<u8>, Vec<u8>), SshError> {
     let mut child = Running::spawn(command)?;
+    let stdin = child.child.stdin.take();
     let outcome = {
+        let work = async {
+            let fed = async {
+                match (stdin, input) {
+                    (Some(pipe), Some(input)) => feed(pipe, input).await,
+                    _ => Ok(()),
+                }
+            };
+            // The first error ends both: too much output must not wait on a blocked writer.
+            let ((), collected) =
+                tokio::try_join!(fed, collect(&mut child.child, limits.max_output))?;
+            Ok(collected)
+        };
         let stopped = async {
             match server {
                 Some(server) => server.wait_stopped().await,
@@ -536,7 +641,7 @@ async fn drive(
             }
         };
         tokio::select! {
-            done = collect(&mut child.child, limits.max_output) => done,
+            done = work => done,
             why = stopped => Err(why.error()),
             after = expired => Err(SshError::TimedOut(after)),
         }
@@ -660,6 +765,31 @@ async fn read_capped(
         }
     }
     Ok(buf)
+}
+
+/// Writes `input` to ssh's standard input in chunks, then closes it. A closed pipe means the
+/// command stopped reading; that is not an error here.
+async fn feed(mut pipe: tokio::process::ChildStdin, input: Input<'_>) -> Result<(), SshError> {
+    const CHUNK: usize = 64 * 1024;
+    let mut sent: u64 = 0;
+    for part in &input.parts {
+        for chunk in part.chunks(CHUNK) {
+            match pipe.write_all(chunk).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => return Ok(()),
+                Err(e) => return Err(SshError::Io(e)),
+            }
+            sent = sent.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+            if let Some(progress) = input.progress {
+                progress(sent);
+            }
+        }
+    }
+    // The pipe closes when dropped here, and the command sees end of file.
+    match pipe.flush().await {
+        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(SshError::Io(e)),
+        _ => Ok(()),
+    }
 }
 
 /// Completes once `after` has passed with no prompt open. A prompt stops the clock; when the

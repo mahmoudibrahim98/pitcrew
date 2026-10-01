@@ -30,7 +30,7 @@ pub use askpass::{
 pub use config::{HostList, home_dir, list_hosts, list_hosts_in};
 pub use probe::{PROBE_LIMITS, Probe};
 pub use ssh::{
-    DEFAULT_CONNECT_TIMEOUT, Limits, Output, RESOLVE_LIMITS, ResolvedHost, Ssh, SshError,
+    DEFAULT_CONNECT_TIMEOUT, Input, Limits, Output, RESOLVE_LIMITS, ResolvedHost, Ssh, SshError,
 };
 
 /// The protocol version this crate was built against.
