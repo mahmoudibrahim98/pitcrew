@@ -13,23 +13,36 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 
 fn data_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/opencode")
 }
 
+/// The schema, read from disk once per test binary (see [`history`]).
 fn schema() -> String {
-    fs::read_to_string(data_dir().join("schema.sql")).expect("schema")
+    static DATA: OnceLock<String> = OnceLock::new();
+    DATA.get_or_init(|| fs::read_to_string(data_dir().join("schema.sql")).expect("schema"))
+        .clone()
 }
 
 /// One row write: `{"table": ..., "row": {column: value}}`.
+///
+/// Read from disk once per test binary and handed out from there. Both proptest fns in this file
+/// call it (directly or through [`session_ids`] and [`check_streaming`]) on every one of their up
+/// to 32 cases; under load, WSL's reads of `/mnt/c` can glitch, and that multiplied the risk
+/// hundreds of times over a run.
 fn history() -> Vec<Value> {
-    fs::read_to_string(data_dir().join("history.jsonl"))
-        .expect("history")
-        .lines()
-        .map(|l| serde_json::from_str(l).expect("json"))
-        .collect()
+    static DATA: OnceLock<Vec<Value>> = OnceLock::new();
+    DATA.get_or_init(|| {
+        fs::read_to_string(data_dir().join("history.jsonl"))
+            .expect("history")
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("json"))
+            .collect()
+    })
+    .clone()
 }
 
 fn sql_value(v: &Value) -> rusqlite::types::Value {
@@ -141,13 +154,25 @@ impl Collected {
     }
 }
 
+/// Retries once on a transient I/O error (WSL's reads of `/mnt/c` can glitch under load), so the
+/// test fails only on a second, real error, with both in the message. A parse or logic failure
+/// (`SourceError::Unreadable`) is never retried away.
+fn read_retry<T>(mut attempt: impl FnMut() -> Result<T, SourceError>) -> T {
+    match attempt() {
+        Ok(v) => v,
+        Err(SourceError::Io(first)) => match attempt() {
+            Ok(v) => v,
+            Err(second) => panic!("read failed twice: first {first}, then {second}"),
+        },
+        Err(e) => panic!("read: {e}"),
+    }
+}
+
 fn read_all(db: &Path, session: &str) -> Collected {
     let mut c = Collected::default();
-    c.absorb(
-        OpenCodeAdapter
-            .read(&tref(db, session), &Cursor::default())
-            .expect("read"),
-    );
+    c.absorb(read_retry(|| {
+        OpenCodeAdapter.read(&tref(db, session), &Cursor::default())
+    }));
     c
 }
 
@@ -156,7 +181,7 @@ fn page_all(db: &Path, session: &str, limit: usize) -> Vec<TranscriptItem> {
     let mut pages = Vec::new();
     let mut before = None;
     for _ in 0..10_000 {
-        let page = OpenCodeAdapter.read_page(&t, before, limit).expect("page");
+        let page = read_retry(|| OpenCodeAdapter.read_page(&t, before, limit));
         assert!(page.from <= page.to);
         if let Some(b) = before {
             assert_eq!(page.to, b, "pages must join up");
@@ -228,7 +253,7 @@ fn newest_page_first_and_before_between_positions() {
     let full = read_all(&db, &main).items;
     let last = full.last().expect("items").offset() + 1;
 
-    let page = OpenCodeAdapter.read_page(&t, None, 3).expect("page");
+    let page = read_retry(|| OpenCodeAdapter.read_page(&t, None, 3));
     assert!(!page.at_start);
     assert_eq!(page.to, last);
     assert_eq!(page.items, full[full.len() - page.items.len()..]);
@@ -236,20 +261,16 @@ fn newest_page_first_and_before_between_positions() {
 
     // `before` between two positions pages from there.
     let mid = full[full.len() / 2].offset() + 1;
-    let page = OpenCodeAdapter
-        .read_page(&t, Some(mid), 10_000)
-        .expect("page");
+    let page = read_retry(|| OpenCodeAdapter.read_page(&t, Some(mid), 10_000));
     assert_eq!(page.to, mid);
     assert!(page.at_start);
     let expected: Vec<_> = full.iter().filter(|i| i.offset() < mid).cloned().collect();
     assert_eq!(page.items, expected);
 
-    let past_end = OpenCodeAdapter
-        .read_page(&t, Some(u64::MAX), 10_000)
-        .expect("page");
+    let past_end = read_retry(|| OpenCodeAdapter.read_page(&t, Some(u64::MAX), 10_000));
     assert_eq!((past_end.items, past_end.to), (full, last));
 
-    let empty = OpenCodeAdapter.read_page(&t, None, 0).expect("page");
+    let empty = read_retry(|| OpenCodeAdapter.read_page(&t, None, 0));
     assert!(empty.items.is_empty());
     assert_eq!((empty.from, empty.to, empty.at_start), (last, last, false));
 }
@@ -282,6 +303,21 @@ fn by_position(mut items: Vec<TranscriptItem>) -> Vec<TranscriptItem> {
     items
 }
 
+/// One cursor-resuming read of `session` in a database the test is writing to: `None` before the
+/// session row exists (`SourceError::Unreadable`, a legitimate, expected state while streaming),
+/// retried once on a transient I/O error before panicking.
+fn try_read(path: &Path, session: &str, cursor: &Cursor) -> Option<ReadReport> {
+    match OpenCodeAdapter.read(&tref(path, session), cursor) {
+        Ok(report) => Some(report),
+        Err(SourceError::Unreadable { .. }) => None,
+        Err(SourceError::Io(first)) => match OpenCodeAdapter.read(&tref(path, session), cursor) {
+            Ok(report) => Some(report),
+            Err(SourceError::Unreadable { .. }) => None,
+            Err(second) => panic!("read failed twice: first {first}, then {second}"),
+        },
+    }
+}
+
 /// Applies `ops` in batches cut at `cuts`, reading each session after every batch.
 fn read_while_writing(
     dir: &Path,
@@ -301,11 +337,8 @@ fn read_while_writing(
         apply_all(&writer, &ops[done..p]);
         done = p;
         for (c, session) in [(&mut a, &main), (&mut b, &child)] {
-            match OpenCodeAdapter.read(&tref(&path, session), &c.cursor) {
-                Ok(report) => c.absorb(report),
-                // Before the session row exists.
-                Err(SourceError::Unreadable { .. }) => {}
-                Err(e) => panic!("{e}"),
+            if let Some(report) = try_read(&path, session, &c.cursor) {
+                c.absorb(report);
             }
         }
     }
@@ -388,15 +421,11 @@ fn a_running_tool_shows_its_call_then_its_result() {
         &first.items[first.items.len() - 2..],
         [TranscriptItem::ToolUse { tool, .. }, TranscriptItem::Question { .. }] if tool == "question"
     ));
-    let page = OpenCodeAdapter
-        .read_page(&tref(&db, &main), None, 2)
-        .expect("page");
+    let page = read_retry(|| OpenCodeAdapter.read_page(&tref(&db, &main), None, 2));
     assert_eq!(page.items, first.items[first.items.len() - 2..]);
 
     apply_all(&writer(&db), &ops[running..]);
-    let next = OpenCodeAdapter
-        .read(&tref(&db, &main), &first.cursor)
-        .expect("read");
+    let next = read_retry(|| OpenCodeAdapter.read(&tref(&db, &main), &first.cursor));
     assert!(matches!(
         &next.chunk.items[0],
         TranscriptItem::ToolResult { summary, .. } if summary == "User answered: Yes"
@@ -438,9 +467,9 @@ fn read_in_two(ops: &[Value], cut: usize) -> (ReadReport, ReadReport, Vec<Transc
     let (main, _) = session_ids();
     let db = store_with(dir.path(), "opencode.db", &schema(), &ops[..cut]);
     let t = tref(&db, &main);
-    let first = OpenCodeAdapter.read(&t, &Cursor::default()).expect("read");
+    let first = read_retry(|| OpenCodeAdapter.read(&t, &Cursor::default()));
     apply_all(&writer(&db), &ops[cut..]);
-    let second = OpenCodeAdapter.read(&t, &first.chunk.cursor).expect("read");
+    let second = read_retry(|| OpenCodeAdapter.read(&t, &first.chunk.cursor));
     let full_dir = tempfile::tempdir().expect("tempdir");
     let full = read_all(
         &store_with(full_dir.path(), "full.db", &schema(), ops),
@@ -566,11 +595,11 @@ fn snapshot(db: &Path) -> (Vec<u8>, SystemTime, Vec<String>) {
 
 fn read_everything(db: &Path) {
     let home = db.parent().expect("dir");
-    let found = OpenCodeAdapter.discover(home).expect("discover");
+    let found = read_retry(|| OpenCodeAdapter.discover(home));
     assert!(!found.is_empty());
     for t in &found {
-        OpenCodeAdapter.read(t, &Cursor::default()).expect("read");
-        OpenCodeAdapter.read_page(t, None, 5).expect("page");
+        read_retry(|| OpenCodeAdapter.read(t, &Cursor::default()));
+        read_retry(|| OpenCodeAdapter.read_page(t, None, 5));
     }
 }
 
@@ -662,12 +691,7 @@ fn empty_and_foreign_databases() {
     let dir = tempfile::tempdir().expect("tempdir");
     let empty = dir.path().join("opencode.db");
     fs::write(&empty, b"").expect("write");
-    assert!(
-        OpenCodeAdapter
-            .discover(dir.path())
-            .expect("discover")
-            .is_empty()
-    );
+    assert!(read_retry(|| OpenCodeAdapter.discover(dir.path())).is_empty());
     assert!(matches!(
         OpenCodeAdapter.read(&tref(&empty, "ses_x"), &Cursor::default()),
         Err(SourceError::Unreadable { .. })
@@ -675,12 +699,7 @@ fn empty_and_foreign_databases() {
 
     let junk = dir.path().join("opencode-junk.db");
     fs::write(&junk, b"this is not a database at all, just text").expect("write");
-    assert!(
-        OpenCodeAdapter
-            .discover(dir.path())
-            .expect("discover")
-            .is_empty()
-    );
+    assert!(read_retry(|| OpenCodeAdapter.discover(dir.path())).is_empty());
     assert!(matches!(
         OpenCodeAdapter.read(&tref(&junk, "ses_x"), &Cursor::default()),
         Err(SourceError::Unreadable { .. })
@@ -714,7 +733,7 @@ fn missing_tables_and_columns() {
         })
         .collect();
     let db = store_with(dir.path(), "opencode.db", only_sessions, &sessions);
-    let found = OpenCodeAdapter.discover(dir.path()).expect("discover");
+    let found = read_retry(|| OpenCodeAdapter.discover(dir.path()));
     assert_eq!(found.len(), 2);
     assert!(found.iter().all(|t| t.size == 0 && t.modified > 0));
     let err = OpenCodeAdapter
@@ -771,7 +790,7 @@ fn the_stream_zero_fixture_reads() {
     conn.execute_batch(&fs::read_to_string(fixtures.join("seed.sql")).expect("seed"))
         .expect("seed");
     drop(conn);
-    let found = OpenCodeAdapter.discover(dir.path()).expect("discover");
+    let found = read_retry(|| OpenCodeAdapter.discover(dir.path()));
     assert_eq!(found.len(), 1);
     let c = read_all(&path, found[0].inner_id.as_deref().expect("id"));
     let kinds: Vec<&str> = c
@@ -878,7 +897,7 @@ fn discovery_lists_sessions_of_every_store() {
         let far = full_store(outside.path());
         std::os::unix::fs::symlink(&far, home.path().join("opencode-link.db")).expect("link");
     }
-    let found = OpenCodeAdapter.discover(home.path()).expect("discover");
+    let found = read_retry(|| OpenCodeAdapter.discover(home.path()));
     let (main, child) = session_ids();
     let names: Vec<(String, String)> = found
         .iter()
@@ -911,12 +930,7 @@ fn discovery_lists_sessions_of_every_store() {
         .find(|t| t.inner_id.as_deref() == Some(child.as_str()))
         .expect("child");
     assert!(read_all(&sub.path, &child).meta.expect("meta").is_subagent);
-    assert!(
-        OpenCodeAdapter
-            .discover(&home.path().join("missing"))
-            .expect("ok")
-            .is_empty()
-    );
+    assert!(read_retry(|| OpenCodeAdapter.discover(&home.path().join("missing"))).is_empty());
 }
 
 /// An OpenCode-style id for creation time `ms` (the low 48 bits of `ms × 4096 + n`).
@@ -988,9 +1002,7 @@ fn long_sessions_page_by_rowid_with_parts_out_of_order() {
     let t = tref(&db, &session);
     for k in (0..full.len()).step_by(97) {
         let before = full[k].offset();
-        let page = OpenCodeAdapter
-            .read_page(&t, Some(before), 50)
-            .expect("page");
+        let page = read_retry(|| OpenCodeAdapter.read_page(&t, Some(before), 50));
         let older: Vec<_> = full
             .iter()
             .filter(|i| i.offset() < before)
@@ -1014,7 +1026,7 @@ fn long_sessions_page_by_rowid_with_parts_out_of_order() {
     for p in cuts.into_iter().chain([ops.len()]) {
         apply_all(&w, &ops[done..p]);
         done = p;
-        if let Ok(report) = OpenCodeAdapter.read(&tref(&path, &session), &c.cursor) {
+        if let Some(report) = try_read(&path, &session, &c.cursor) {
             c.absorb(report);
         }
     }
@@ -1035,9 +1047,7 @@ fn a_part_table_without_rowids_is_listed_whole() {
     assert_eq!(full.len(), 30 * 14);
     assert_eq!(page_all(&db, &session, 9), full);
     let mid = full[200].offset();
-    let page = OpenCodeAdapter
-        .read_page(&tref(&db, &session), Some(mid), 10)
-        .expect("page");
+    let page = read_retry(|| OpenCodeAdapter.read_page(&tref(&db, &session), Some(mid), 10));
     assert_eq!(page.items, full[190..200]);
 }
 
@@ -1080,9 +1090,7 @@ fn imported_sessions_settle() {
     let state = c.cursor.state.clone().expect("state");
     assert!(state.get("open").is_none(), "nothing left open: {state}");
     assert_eq!(c.cursor.offset, c.items.last().expect("items").offset());
-    let again = OpenCodeAdapter
-        .read(&tref(&db, &main), &c.cursor)
-        .expect("read");
+    let again = read_retry(|| OpenCodeAdapter.read(&tref(&db, &main), &c.cursor));
     assert!(again.chunk.items.is_empty());
     assert_eq!(page_all(&db, &main, 5), c.items);
 }
@@ -1119,9 +1127,7 @@ fn extreme_rowids_are_read_and_paged() {
     let t = tref(&db, &session);
     for k in [1, full.len() / 2, full.len() - 1] {
         let before = full[k].offset();
-        let page = OpenCodeAdapter
-            .read_page(&t, Some(before), 3)
-            .expect("page");
+        let page = read_retry(|| OpenCodeAdapter.read_page(&t, Some(before), 3));
         let older: Vec<_> = full
             .iter()
             .filter(|i| i.offset() < before)
@@ -1193,9 +1199,7 @@ fn a_part_with_a_huge_creation_time_is_capped_and_paged() {
     let full = read_all(&db, &main).items;
     let last = full.last().expect("items");
     assert_eq!(last.offset(), pitcrew_ingest::opencode::MAX_POSITION);
-    let page = OpenCodeAdapter
-        .read_page(&tref(&db, &main), None, 1)
-        .expect("page");
+    let page = read_retry(|| OpenCodeAdapter.read_page(&tref(&db, &main), None, 1));
     assert_eq!(page.items, std::slice::from_ref(last));
     assert_eq!(page.to, pitcrew_ingest::opencode::MAX_POSITION + 1);
     assert_eq!(page_all(&db, &main, 4), full);
@@ -1243,9 +1247,7 @@ fn a_shown_call_whose_part_becomes_unreadable_still_gets_a_result() {
                 rusqlite::params![data, part],
             )
             .expect("update");
-        let next = OpenCodeAdapter
-            .read(&tref(&db, &main), &first.cursor)
-            .expect("read");
+        let next = read_retry(|| OpenCodeAdapter.read(&tref(&db, &main), &first.cursor));
         assert_eq!(next.skipped.len(), 1, "{reason}");
         assert!(
             next.chunk.items.iter().any(|i| matches!(
@@ -1292,7 +1294,7 @@ fn a_damaged_store_read_unlocked_is_unreadable_and_skipped() {
             .read(&tref(&copy, &main), &Cursor::default())
             .expect_err("malformed");
         assert!(matches!(&err, SourceError::Unreadable { .. }), "{err}");
-        let found = OpenCodeAdapter.discover(home.path()).expect("discover");
+        let found = read_retry(|| OpenCodeAdapter.discover(home.path()));
         assert_eq!(found.len(), 2);
         assert!(found.iter().all(|t| t.path == good));
     }
@@ -1314,14 +1316,11 @@ fn an_unreadable_store_does_not_hide_the_others() {
     let bad = home.path().join("opencode-bad.db");
     fs::copy(&good, &bad).expect("copy");
     corrupt_pages(&bad);
-    let found = OpenCodeAdapter.discover(home.path()).expect("discover");
+    let found = read_retry(|| OpenCodeAdapter.discover(home.path()));
     assert_eq!(found.len(), 2);
     assert!(found.iter().all(|t| t.path == good));
     // Again: still listed (the warning is logged once per change).
-    assert_eq!(
-        OpenCodeAdapter.discover(home.path()).expect("discover"),
-        found
-    );
+    assert_eq!(read_retry(|| OpenCodeAdapter.discover(home.path())), found);
 }
 
 /// `cargo test -p pitcrew-ingest --release --test opencode -- --ignored --nocapture large_session`
