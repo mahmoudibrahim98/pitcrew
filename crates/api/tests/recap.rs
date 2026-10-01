@@ -129,6 +129,77 @@ impl RecapSource for Recorded {
     }
 }
 
+/// A source whose `blocks`/`days` fail, naming a path that must never reach a caller.
+#[derive(Debug)]
+struct Broken;
+
+impl RecapSource for Broken {
+    fn blocks(
+        &self,
+        _: &BlockFilter,
+        _: Option<EventId>,
+        _: usize,
+    ) -> Result<BlocksPage, SourceError> {
+        Err("the recap cache at /very/secret/place is corrupt".into())
+    }
+
+    fn days(
+        &self,
+        _: DaysScope,
+        _: i32,
+        _: Option<Date>,
+        _: usize,
+    ) -> Result<DaysPage, SourceError> {
+        Err("the recap cache at /very/secret/place is corrupt".into())
+    }
+}
+
+/// A source whose `blocks`/`days` panic, naming a path that must never reach a caller.
+#[derive(Debug)]
+struct Panicking;
+
+impl RecapSource for Panicking {
+    fn blocks(
+        &self,
+        _: &BlockFilter,
+        _: Option<EventId>,
+        _: usize,
+    ) -> Result<BlocksPage, SourceError> {
+        panic!("SELECT * FROM recap_blocks failed at /very/secret/place");
+    }
+
+    fn days(
+        &self,
+        _: DaysScope,
+        _: i32,
+        _: Option<Date>,
+        _: usize,
+    ) -> Result<DaysPage, SourceError> {
+        panic!("SELECT * FROM recap_days failed at /very/secret/place");
+    }
+}
+
+/// A source that fails, or panics, is a `500 internal` with a fixed message: nothing it says
+/// (a path, a query, a panic message) reaches the caller. Mirrors
+/// `activity::tests::an_index_that_fails_or_panics_is_a_500_without_its_detail`.
+#[tokio::test]
+async fn a_source_that_fails_or_panics_is_a_500_without_its_detail() {
+    let f = Fixture::new();
+    let sources: [Arc<dyn RecapSource>; 2] = [Arc::new(Broken), Arc::new(Panicking)];
+    for source in sources {
+        let app = app(&f, source);
+        for path in [
+            "/v1/recaps/blocks",
+            &format!("/v1/recaps/days?project={PAPER}"),
+        ] {
+            let (status, body) = call(app.clone(), get_request(path, Some(&f.device_token))).await;
+            assert_eq!(status, 500, "{path}");
+            assert_eq!(body["code"], "internal", "{path}");
+            assert_eq!(body["message"], "Could not read recaps.", "{path}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn recaps_need_a_device_token() {
     let f = Fixture::new();
@@ -439,7 +510,7 @@ impl RecapSource for DemoRecapSource {
         limit: usize,
     ) -> Result<DaysPage, SourceError> {
         // The fixture, like the mock, holds days for one time zone only; the real recap engine
-        // (stream F) computes days for any `tz`. See "What differs from the mock" in the report.
+        // (stream F) computes days for any `tz`. See the "Recaps" section of this crate's README.
         if tz_minutes != self.recaps.tz {
             return Err(format!(
                 "the demo recap fixture has days for tz={} only, not tz={tz_minutes}",
@@ -786,8 +857,8 @@ async fn demo_days_needs_a_device_token() {
 
 /// Unlike the mock, which special-cases its one fixture time zone as `400 invalid` ("tz=0 only"),
 /// a `RecapSource` that cannot answer for a valid, in-range `tz` is reported like any other
-/// unreadable source: `500 internal`, without the source's detail. See "What differs from the
-/// mock" in the stream H report.
+/// unreadable source: `500 internal`, without the source's detail. See the "Recaps" section of
+/// this crate's README ("What differs from the mock").
 #[tokio::test]
 async fn demo_unsupported_tz_is_an_internal_error_unlike_the_mocks_400() {
     let f = Fixture::new();
@@ -803,6 +874,7 @@ async fn demo_unsupported_tz_is_an_internal_error_unlike_the_mocks_400() {
         .await;
         assert_eq!(status, 500, "tz={tz}");
         assert_eq!(body["code"], "internal", "tz={tz}");
+        assert_eq!(body["message"], "Could not read recaps.", "tz={tz}");
     }
 }
 
