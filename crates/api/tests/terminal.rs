@@ -509,20 +509,7 @@ async fn keepalive_pings_and_closes_a_client_that_stops_answering() {
             .get_mut()
             .set_read_timeout(Some(Duration::from_millis(50)))
             .unwrap();
-        let mut pings = 0;
-        let until = Instant::now() + PONG_TIMEOUT + Duration::from_millis(500);
-        while Instant::now() < until {
-            match answering.read() {
-                Ok(Message::Ping(_)) => pings += 1,
-                Ok(other) => panic!("unexpected {other:?}"),
-                Err(tungstenite::Error::Io(e))
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) => {}
-                Err(e) => panic!("the answering client was dropped: {e}"),
-            }
-        }
+        let pings = answer_pings(&mut answering, PONG_TIMEOUT + Duration::from_millis(500));
         assert!(pings >= 3, "{pings} pings in 1.5 s");
         answering
             .get_mut()
@@ -573,6 +560,92 @@ async fn a_stalled_write_holds_up_neither_output_nor_pings() {
         // The stalled runtime, not the reader, is what ends the stream.
         assert_eq!(read_close(&mut socket), CloseCode::Error);
         runtime.stall_writes.store(false, Ordering::SeqCst);
+    })
+    .await
+    .unwrap();
+}
+
+/// Reads for `how_long`, which answers the server's Pings (tungstenite queues each Pong and sends
+/// it with the next read or write); returns how many Pings came. Anything else fails the test.
+fn answer_pings(socket: &mut WebSocket<TcpStream>, how_long: Duration) -> usize {
+    let mut pings = 0;
+    let until = Instant::now() + how_long;
+    while Instant::now() < until {
+        match socket.read() {
+            Ok(Message::Ping(_)) => pings += 1,
+            Ok(other) => panic!("unexpected {other:?}"),
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(e) => panic!("the client was dropped: {e}"),
+        }
+    }
+    pings
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_answering_pings_stays_while_its_input_backs_up() {
+    // A Ping every 100 ms, each Pong due within 300 ms. One write stalls for 2 s (more than six
+    // Pong timeouts) while the client keeps typing and answering, so the socket stops being read
+    // with its Pongs queued behind keystrokes. The stall is shorter than `call_timeout`: nothing
+    // should close the socket.
+    const PING_EVERY: Duration = Duration::from_millis(100);
+    const PONG_TIMEOUT: Duration = Duration::from_millis(300);
+    const STALL: Duration = Duration::from_secs(2);
+    let s = setup_with(TerminalConfig {
+        ping_every: PING_EVERY,
+        pong_timeout: PONG_TIMEOUT,
+        call_timeout: Duration::from_secs(10),
+        ..quick()
+    });
+    let addr = serve(s.app.clone()).await;
+    let token = s.fixture.device_token.clone();
+    let (runtime, terminal, session) = (s.runtime.clone(), s.terminal, s.session);
+    tokio::task::spawn_blocking(move || {
+        let mut socket = connect(addr, &token, &format!("/v1/sessions/{session}/terminal"));
+        let read_timeout = |socket: &mut WebSocket<TcpStream>, wait: Duration| {
+            socket.get_mut().set_read_timeout(Some(wait)).unwrap();
+        };
+        read_timeout(&mut socket, Duration::from_millis(10));
+        runtime.stall_writes.store(true, Ordering::SeqCst);
+        let mut typed = Vec::new();
+        let mut pings = 0;
+        let started = Instant::now();
+        while started.elapsed() < STALL {
+            // A keystroke about every 10 ms: many more than the input queue holds (16).
+            let key = b"abcdefghijklmnopqrstuvwxyz"[typed.len() % 26];
+            socket.send(Message::Binary(vec![key].into())).unwrap();
+            typed.push(key);
+            pings += answer_pings(&mut socket, Duration::from_millis(10));
+        }
+        assert_eq!(
+            runtime.stalled.load(Ordering::SeqCst),
+            1,
+            "one write stalls"
+        );
+        assert!(
+            typed.len() > 40,
+            "{} keystrokes during the stall",
+            typed.len()
+        );
+        assert!(pings >= 1, "no Ping during the stall");
+        runtime.stall_writes.store(false, Ordering::SeqCst);
+
+        // Every keystroke is written, in order (the fake echoes them), and the socket is open.
+        read_timeout(&mut socket, Duration::from_secs(5));
+        assert_eq!(read_bytes(&mut socket, typed.len()), typed);
+        assert_eq!(output(&runtime, terminal), typed);
+
+        // The deadline runs again: a client that keeps answering stays...
+        read_timeout(&mut socket, Duration::from_millis(50));
+        let after = answer_pings(&mut socket, PONG_TIMEOUT * 4);
+        assert!(after >= 3, "{after} pings after the stall");
+        // ...and one that stops answering is closed with 1013.
+        std::thread::sleep(PING_EVERY + PONG_TIMEOUT + Duration::from_millis(700));
+        read_timeout(&mut socket, Duration::from_secs(5));
+        assert_eq!(read_close(&mut socket), CloseCode::Again);
     })
     .await
     .unwrap();

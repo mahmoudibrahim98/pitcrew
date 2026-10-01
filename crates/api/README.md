@@ -105,8 +105,10 @@ planted by another user never receives a token:
   is slow to take input holds up neither output nor pings. While the queue is full the socket is
   not read (back-pressure on the client); a write that times out closes with 1011.
 - A client that stops reading is closed with 1013 and resumes by offset. So is one that does
-  not answer the Ping sent every 20 s within 20 s. Several clients may attach; each gets the
-  output, and their keystrokes interleave in arrival order.
+  not answer the Ping sent every 20 s within 20 s. That time only counts while the socket is
+  read: while input backs up, a Pong the client sent waits behind keystrokes not read yet (a
+  WebSocket's frames arrive in order), so the deadline waits too. Several clients may attach;
+  each gets the output, and their keystrokes interleave in arrival order.
 - Close codes: **1000** after `exit`, **1007** malformed control, **1009** message too big,
   **1013** too slow or no Pong (reconnect with `from`), **1011** runtime failure, **1001** hub
   shutting down. A client's Close is answered before the socket is dropped.

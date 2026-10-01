@@ -26,7 +26,9 @@
 //! - **Backpressure:** each client has a bounded queue. A client that stops reading is closed
 //!   with 1013 and resumes by offset.
 //! - **Keepalive:** a WebSocket Ping every [`TerminalConfig::ping_every`]; a client that sends no
-//!   Pong within [`TerminalConfig::pong_timeout`] is closed with 1013, like a slow one.
+//!   Pong within [`TerminalConfig::pong_timeout`] is closed with 1013, like a slow one. That time
+//!   only counts while the socket is read: while input backs up, the client's Pong may be queued
+//!   behind keystrokes the route has not read yet, so the deadline waits.
 //! - **Bounded calls:** every call into the seam runs on the blocking pool, at most
 //!   [`TerminalConfig::max_calls`] at once across all clients, and is given up after
 //!   [`TerminalConfig::call_timeout`] (503 before the upgrade, 1011 after it). A stalled runtime
@@ -477,7 +479,8 @@ async fn session_loop(
     let (input, inputs) = mpsc::channel(INPUT_QUEUE);
     let writer = write_input(attachment, calls, inputs, nudge);
     tokio::pin!(writer);
-    // Input read from the socket while the queue was full.
+    // Input read from the socket while the queue was full. While it waits, the socket is not
+    // read, and the Pong deadline is paused.
     let mut waiting: Option<Input> = None;
     let hub_down = HubShutdown::wait(&mut shutdown);
     tokio::pin!(hub_down);
@@ -485,7 +488,7 @@ async fn session_loop(
     let ping_every = config.ping_every.max(Duration::from_millis(1));
     let mut ping = tokio::time::interval_at(Instant::now() + ping_every, ping_every);
     ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    let mut pong_due: Option<Instant> = None;
+    let mut pong = PongDeadline::default();
     let end = loop {
         tokio::select! {
             end = &mut pump => break end,
@@ -497,21 +500,26 @@ async fn session_loop(
                 }
             }
             room = input.reserve(), if waiting.is_some() => match (room, waiting.take()) {
-                (Ok(room), Some(next)) => room.send(next),
+                (Ok(room), Some(next)) => {
+                    room.send(next);
+                    pong.resume();
+                }
                 // The writer only stops by returning, which the branch above catches first.
                 _ => break TerminalEnd::Failed(TerminalError::Failed("input stopped".to_owned())),
             },
             _ = ping.tick() => {
                 // One Ping at a time: its Pong is what the deadline waits for.
-                if pong_due.is_none() {
-                    pong_due = Some(Instant::now() + config.pong_timeout);
+                if !pong.awaited() {
+                    pong.start(config.pong_timeout);
                     let ping = Message::Ping(axum::body::Bytes::new());
                     if let Err(end) = send(&mut socket, ping, config.send_timeout).await {
                         break end;
                     }
                 }
             }
-            () = sleep_until(pong_due), if pong_due.is_some() => break TerminalEnd::Unresponsive,
+            () = sleep_until(pong.running()), if pong.running().is_some() => {
+                break TerminalEnd::Unresponsive;
+            }
             incoming = socket.recv(), if waiting.is_none() => {
                 let next = match incoming {
                     None => break TerminalEnd::ClientGone,
@@ -522,7 +530,7 @@ async fn session_loop(
                         break TerminalEnd::ClientGone;
                     }
                     Some(Ok(Message::Pong(_))) => {
-                        pong_due = None;
+                        pong.answered();
                         continue;
                     }
                     Some(Ok(Message::Binary(bytes))) => Input::Keys(bytes),
@@ -536,6 +544,7 @@ async fn session_loop(
                 };
                 if let Err(mpsc::error::TrySendError::Full(next)) = input.try_send(next) {
                     waiting = Some(next);
+                    pong.pause();
                 }
             }
         }
@@ -606,6 +615,67 @@ async fn send(socket: &mut WebSocket, frame: Message, wait: Duration) -> Result<
         Ok(Ok(())) => Ok(()),
         Ok(Err(_)) => Err(TerminalEnd::ClientGone),
         Err(_) => Err(TerminalEnd::SlowClient),
+    }
+}
+
+/// When the Pong to the last Ping is due. The deadline **runs only while the socket is read**.
+///
+/// While input backs up, the socket is not read (back-pressure on the client), and a Pong the
+/// client did send sits unread behind its keystrokes: a WebSocket's frames arrive in order, so
+/// there is no reading the Pong without reading them. That time does not count against the
+/// client. A client that is really gone still runs out of time once reading resumes, and a write
+/// that never returns ends the stream after `call_timeout` (1011) anyway.
+#[derive(Debug, Default)]
+struct PongDeadline {
+    /// When the Pong is due, `None` when no Ping awaits one. Moved later on resuming, by the
+    /// time the deadline was paused.
+    due: Option<Instant>,
+    /// Since when the socket has not been read.
+    paused: Option<Instant>,
+}
+
+impl PongDeadline {
+    /// A Ping was sent: its Pong is due within `timeout` of reading time.
+    fn start(&mut self, timeout: Duration) {
+        let now = Instant::now();
+        self.due = Some(now + timeout);
+        if self.paused.is_some() {
+            // Only the pause from now on delays this Ping's deadline.
+            self.paused = Some(now);
+        }
+    }
+
+    /// Whether a Ping still awaits its Pong.
+    fn awaited(&self) -> bool {
+        self.due.is_some()
+    }
+
+    /// The Pong arrived.
+    fn answered(&mut self) {
+        self.due = None;
+    }
+
+    /// The socket stops being read.
+    fn pause(&mut self) {
+        if self.paused.is_none() {
+            self.paused = Some(Instant::now());
+        }
+    }
+
+    /// The socket is read again: the deadline moves on by the time it was paused.
+    fn resume(&mut self) {
+        if let (Some(since), Some(due)) = (self.paused.take(), self.due.as_mut()) {
+            *due += since.elapsed();
+        }
+    }
+
+    /// The deadline to wait for: `None` while paused or when no Ping awaits a Pong.
+    fn running(&self) -> Option<Instant> {
+        if self.paused.is_some() {
+            None
+        } else {
+            self.due
+        }
     }
 }
 
@@ -971,6 +1041,52 @@ mod tests {
         ] {
             assert_eq!(control(bad), Control::Malformed, "{bad}");
         }
+    }
+
+    #[test]
+    fn the_pong_deadline_waits_while_the_socket_is_not_read() {
+        const TIMEOUT: Duration = Duration::from_millis(50);
+        const PAUSE: Duration = Duration::from_millis(250);
+        let mut pong = PongDeadline::default();
+        assert_eq!(pong.running(), None);
+        assert!(!pong.awaited());
+
+        pong.start(TIMEOUT);
+        let due = pong.running().unwrap();
+        assert!(pong.awaited());
+        pong.pause();
+        assert_eq!(pong.running(), None, "paused");
+        std::thread::sleep(PAUSE);
+        pong.resume();
+        // Later by the pause, so the time left is what it was: still in the future.
+        let moved = pong.running().unwrap();
+        assert!(moved >= due + PAUSE, "{moved:?} vs {due:?}");
+        assert!(moved > Instant::now());
+        pong.answered();
+        assert_eq!(pong.running(), None);
+        assert!(!pong.awaited());
+
+        // A Ping sent during a pause is delayed only by the rest of that pause.
+        pong.pause();
+        std::thread::sleep(PAUSE);
+        pong.start(TIMEOUT);
+        let started = Instant::now();
+        assert_eq!(pong.running(), None);
+        pong.resume();
+        let due = pong.running().unwrap();
+        assert!(due >= started + TIMEOUT);
+        assert!(
+            due < started + TIMEOUT + PAUSE,
+            "the earlier pause counted too"
+        );
+
+        // Resuming without a pause, or without a Ping, changes nothing.
+        pong.resume();
+        assert_eq!(pong.running(), Some(due));
+        pong.answered();
+        pong.pause();
+        pong.resume();
+        assert_eq!(pong.running(), None);
     }
 
     #[test]
