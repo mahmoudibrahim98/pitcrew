@@ -19,6 +19,8 @@ export function terminalDiagnosis(
         if (error.code === 'unauthorized' || error.code === 'forbidden') {
           return { status: error.status, message: 'The hub refused this token, so the terminal cannot be shown.' };
         }
+        // The hub answered 503 itself: the session's machine is out of reach.
+        if (error.code === 'unavailable' && error.status === 503) return { status: 503, message: error.message };
       }
       // The hub itself could not be reached, or failed: the connection may come back.
       return undefined;

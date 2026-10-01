@@ -3,6 +3,8 @@
 // keystroke cap, resizes, and the token kept out of the URL.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ApiError, type Machine, type Session } from '../../data/index.ts';
+import { terminalDiagnosis } from '../terminal/diagnose.ts';
 import {
   browserSocketFactory,
   INPUT_LIMIT,
@@ -556,5 +558,68 @@ describe('stop', () => {
     });
     terminal.start();
     expect(status(statuses)?.kind).toBe('stopped');
+  });
+});
+
+describe('the diagnosis of a refused upgrade', () => {
+  const session = (patch: Partial<Session> = {}): Session => ({
+    id: 'S1',
+    engine: 'claude',
+    native_id: 'n1',
+    machine: 'M1',
+    cwd: '/home/sam/work',
+    state: 'working',
+    started: 0,
+    last_activity: 0,
+    terminal: 'T1',
+    ...patch,
+  });
+  const machine = (liveness: Machine['liveness']) => ({ id: 'M1', name: 'hpc-login', liveness }) as Machine;
+  const api = (answer: () => Promise<Session>, machines: () => Promise<Machine[]> = async () => [machine('live')]) => ({
+    session: answer,
+    machines,
+  });
+
+  it('asks as the hub decides: the session, its machine, then its terminal', async () => {
+    const gone = api(async () => {
+      throw new ApiError('not_found', 'No session S1.', 404);
+    });
+    expect(await terminalDiagnosis(gone, 'S1')()).toEqual({ status: 404, message: 'This session no longer exists.' });
+
+    const away = api(async () => session({ terminal: undefined }), async () => [machine('unverifiable')]);
+    expect(await terminalDiagnosis(away, 'S1')()).toEqual({
+      status: 503,
+      message: 'hpc-login cannot be reached right now, so its terminal cannot be shown.',
+    });
+    const unreachable = api(async () => session({ state: 'unreachable' }));
+    expect((await terminalDiagnosis(unreachable, 'S1')())?.status).toBe(503);
+    const refused = api(async () => {
+      throw new ApiError('unavailable', 'hpc-login cannot be reached right now.', 503);
+    });
+    expect(await terminalDiagnosis(refused, 'S1')()).toEqual({ status: 503, message: 'hpc-login cannot be reached right now.' });
+
+    const none = api(async () => session({ terminal: undefined }));
+    expect(await terminalDiagnosis(none, 'S1')()).toEqual({ status: 404, message: 'This session has no terminal.' });
+
+    const token = api(async () => {
+      throw new ApiError('unauthorized', 'No token.', 401);
+    });
+    expect((await terminalDiagnosis(token, 'S1')())?.status).toBe(401);
+  });
+
+  it('finds nothing to blame when the session is fine or the hub cannot be reached', async () => {
+    expect(await terminalDiagnosis(api(async () => session()), 'S1')()).toBeUndefined();
+    const offline = api(async () => {
+      throw new ApiError('unavailable', 'Cannot reach the hub', 0);
+    });
+    expect(await terminalDiagnosis(offline, 'S1')()).toBeUndefined();
+    // Without the machines, the session's own state still counts.
+    const noMachines = api(
+      async () => session(),
+      async () => {
+        throw new ApiError('internal', 'boom', 500);
+      },
+    );
+    expect(await terminalDiagnosis(noMachines, 'S1')()).toBeUndefined();
   });
 });
