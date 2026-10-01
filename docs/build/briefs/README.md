@@ -43,7 +43,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [Q-fuzz-and-model-refresh](Q-fuzz-and-model-refresh.md) | Q · Security | `s/Q/fuzz-and-model-refresh` | Opus-class | **Merged** |
 | [0-recap-contract](0-recap-contract.md) | 0 · Contracts | `integrator/recap-contract` | Opus-class | **Merged** |
 | [E-recap-index](E-recap-index.md) | E · Work model | `s/E/recap-index` | Opus-class | In progress |
-| [H-recap-routes](H-recap-routes.md) | H · API and auth | `s/H/recap-routes` | Sonnet-class | In progress |
+| [H-recap-routes](H-recap-routes.md) | H · API and auth | `s/H/recap-routes` | Sonnet-class | **Merged** |
 | [L-recap-data](L-recap-data.md) | L · UI foundation | `s/L/recap-data` | Sonnet-class | In progress |
 | [C-import-and-reopen](C-import-and-reopen.md) | C · Store | `s/C/import-and-reopen` | Sonnet-class | In progress |
 | [0-daemon-solo](0-daemon-solo.md) | 0 · Composition root | `integrator/daemon-solo` | Opus-class | **Merged** |
