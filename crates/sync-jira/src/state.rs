@@ -56,10 +56,12 @@ pub struct EpicSnapshot {
 /// Everything remembered about one project's sync.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectState {
-    /// The incremental cursor: the latest `updated` minute seen so far, in JQL's own
-    /// `"YYYY-MM-DD HH:MM"` shape. `None` means the next sync is a first full sync.
+    /// The incremental cursor: the latest `updated` minute seen so far, already converted into
+    /// the searching account's own time zone and floored to the minute (see
+    /// [`crate::time::account_minute`]) — JQL's own `"YYYY-MM-DD HH:MM"` shape, with no offset of
+    /// its own. `None` means the next sync is a first full sync.
     #[serde(default)]
-    pub cursor: Option<JiraTimestamp>,
+    pub cursor: Option<String>,
     /// Last-seen owned fields, by issue key (`DEMO-12`).
     #[serde(default)]
     pub issue_snapshots: BTreeMap<String, IssueSnapshot>,

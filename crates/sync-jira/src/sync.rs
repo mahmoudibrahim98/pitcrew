@@ -9,7 +9,7 @@ use crate::client::{JiraClient, Limits, Outcome};
 use crate::deployment::Deployment;
 use crate::jql::{InvalidProjectRef, ProjectRef, incremental_query};
 use crate::state::SyncState;
-use crate::time::JiraTimestamp;
+use crate::time::resolve_account_zone;
 use pitcrew_sync_github::transport::Transport;
 
 pub use crate::client::RateLimited;
@@ -145,24 +145,26 @@ async fn sync_with_limits<T: Transport, D: Deployment>(
     }
 
     let fields = fields_for(config);
+    // Resolved once per call (not per project): there is one account, hence one zone, for the
+    // whole token. See `resolve_account_zone` for the unknown-zone fallback.
+    let zone = resolve_account_zone(state.timezone.as_deref());
 
     for project in &config.projects {
         let key = project.as_str().to_string();
         let mut project_state = state.projects.remove(&key).unwrap_or_default();
         let mut attempts = project_state.secondary_backoff_attempts;
 
-        let cursor = project_state.cursor.as_ref().map(JiraTimestamp::as_str);
+        let cursor = project_state.cursor.as_deref();
         let jql = incremental_query(project, cursor);
+        let query = crate::client::SearchQuery {
+            jql: &jql,
+            fields: &fields,
+            zone: &zone,
+            old_cursor_minute: cursor,
+        };
 
         let result = client
-            .search(
-                deployment,
-                &jql,
-                &fields,
-                config.now_unix,
-                &mut attempts,
-                limits,
-            )
+            .search(deployment, &query, config.now_unix, &mut attempts, limits)
             .await;
         project_state.secondary_backoff_attempts = attempts;
 
@@ -217,15 +219,13 @@ async fn sync_with_limits<T: Transport, D: Deployment>(
                 // `>=` the *old* cursor and so still matched by this same JQL next time. A cap
                 // cutting the walk short just means next call repeats the same query from the
                 // (now slightly advanced) cursor instead of resuming mid-walk; nothing is skipped.
-                if let Some(minute) = search_result
-                    .max_updated
-                    .as_ref()
-                    .and_then(JiraTimestamp::to_jql_minute)
+                if let Some(candidate) = search_result.max_minute
+                    && project_state
+                        .cursor
+                        .as_deref()
+                        .is_none_or(|c| candidate.as_str() > c)
                 {
-                    let candidate = JiraTimestamp::new(minute);
-                    if project_state.cursor.as_ref().is_none_or(|c| candidate > *c) {
-                        project_state.cursor = Some(candidate);
-                    }
+                    project_state.cursor = Some(candidate);
                 }
             }
         }
@@ -296,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn myself_is_read_once_and_then_cached() {
-        let search_url = "https://jira.example.com/rest/api/3/search/jql?jql=project%20in%20%28%22DEMO%22%29%20ORDER%20BY%20updated%20ASC&maxResults=100&fields=summary%2Cdescription%2Cstatus%2Cresolution%2Clabels%2Cassignee%2Cparent%2Cissuetype%2Cupdated";
+        let search_url = "https://jira.example.com/rest/api/3/search/jql?jql=project%20in%20%28%22DEMO%22%29%20ORDER%20BY%20updated%20ASC%2C%20key%20ASC&maxResults=100&fields=summary%2Cdescription%2Cstatus%2Cresolution%2Clabels%2Cassignee%2Cparent%2Cissuetype%2Cupdated";
         let transport =
             ReplayTransport::from_exchanges(vec![myself_exchange(), empty_search(search_url)]);
         let outcome = sync(

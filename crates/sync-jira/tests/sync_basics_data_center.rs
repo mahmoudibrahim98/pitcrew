@@ -101,10 +101,7 @@ async fn first_sync_paginates_by_start_at_then_idempotent() {
     );
 
     let project = outcome1.state.projects.get("DEMO").expect("project state");
-    assert_eq!(
-        project.cursor.as_ref().map(|c| c.as_str()),
-        Some("2026-01-01 00:03")
-    );
+    assert_eq!(project.cursor.as_deref(), Some("2026-01-01 00:03"));
 
     // --- Second call: only the overlap minute's own (unchanged) item comes back. Idempotence. ---
     let jql2 = jql_for("DEMO", Some("2026-01-01 00:03"));
