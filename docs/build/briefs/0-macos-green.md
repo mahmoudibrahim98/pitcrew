@@ -14,7 +14,20 @@ tests check on Linux and Windows.
 
 ## What to fix
 
-The review of #8 read the macOS CI log (run 37045453366) and found these causes.
+The full list of macOS failures is in the comment on PR #8 (`#issuecomment-5958732266`), and the
+review of #8 read the macOS CI log (run 37045453366).
+
+0. **First, a possible security gap:** `crates/remote/tests/deploy.rs`
+   `the_way_to_the_root_is_checked` deploys on macOS where it should refuse. The helper's check of the
+   way to its root (the folders above `~/.pitcrew` must not be writable by others) may silently pass on
+   macOS, for example because BSD `stat`, `ls` or `find` flags differ from GNU's, so a check reads
+   nothing and succeeds.
+   - Find out whether the production check (the remote helper script or the deploy code), not just the
+     test, accepts a path it should refuse on macOS or BSD.
+   - If it does, fix it so it fails closed on any platform where it can't tell, and add a test.
+   - Say clearly in your report which it was.
+
+The causes found so far:
 
 1. **Long macOS temp folders.** macOS's `$TMPDIR` (`/var/folders/…/T/`) makes socket paths too long:
    - "too long for a control socket path": `crates/remote/src/private.rs` ~227 and ~270,
