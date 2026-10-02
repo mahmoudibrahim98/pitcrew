@@ -404,6 +404,20 @@ mod unix {
                 // Its umask, for the test that it is the user's and not the script's. Read
                 // before any thread starts, so setting it back at once races nothing.
                 println!("fake pitcrewd umask {}", own_umask());
+                // The signals it got ignored, of SIGUSR1 and SIGUSR2, for the SLURM tests. A
+                // shell started from here keeps them ignored, and lives on after sending one to
+                // itself only if it is (macOS has no /proc to read them from, nor a `ps` field).
+                let ignored: Vec<&str> = ["USR1", "USR2"]
+                    .into_iter()
+                    .filter(|signal| {
+                        Command::new("/bin/sh")
+                            .arg("-c")
+                            .arg(format!("kill -s {signal} $$ && echo kept"))
+                            .output()
+                            .is_ok_and(|out| out.stdout == b"kept\n")
+                    })
+                    .collect();
+                println!("fake pitcrewd ignores {ignored:?}");
                 let _ = std::fs::remove_file(&socket);
                 let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
                 println!("fake pitcrewd listening");

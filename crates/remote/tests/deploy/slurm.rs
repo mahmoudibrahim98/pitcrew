@@ -845,37 +845,6 @@ fn job_scripts_left(m: &Machine) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// SIGUSR1 and SIGUSR2 as bits of a signal mask (signal n is bit n - 1; their numbers differ
-/// between Linux and macOS).
-fn usr_signals() -> u64 {
-    [rustix::process::Signal::USR1, rustix::process::Signal::USR2]
-        .into_iter()
-        .map(|s| 1u64 << (s.as_raw() - 1))
-        .sum()
-}
-
-/// The signals `pid` ignores: `/proc/<pid>/status`'s `SigIgn` where there is a /proc (Linux),
-/// else `ps -o sigignore=` (macOS), both a hexadecimal mask (`ps` may write it with `0x`).
-fn ignored_signals(pid: u32) -> u64 {
-    let mask = match std::fs::read_to_string(format!("/proc/{pid}/status")) {
-        Ok(status) => status
-            .lines()
-            .find_map(|l| l.strip_prefix("SigIgn:"))
-            .unwrap()
-            .trim()
-            .to_owned(),
-        Err(_) => {
-            let out = Command::new("ps")
-                .args(["-o", "sigignore=", "-p", &pid.to_string()])
-                .output()
-                .unwrap();
-            String::from_utf8(out.stdout).unwrap().trim().to_owned()
-        }
-    };
-    let hex = mask.strip_prefix("0x").unwrap_or(&mask);
-    u64::from_str_radix(hex, 16).unwrap_or_else(|e| panic!("the ignored signals {mask:?}: {e}"))
-}
-
 /// Sends SIGUSR1 and SIGUSR2 to `pid`, as `sbatch --signal=B:…` would to the batch shell, and
 /// gives it a moment to act on them.
 fn send_usr_signals(pid: u32) {
@@ -2099,11 +2068,15 @@ fn slurm_under_every_posix_sh() {
         // again, so they do not end it and the helper does not inherit them ignored.
         let id = started.endpoint.job.unwrap();
         let job_shell = sim.job(id).pgid.unwrap();
-        assert_eq!(
-            ignored_signals(started.endpoint.pid) & usr_signals(),
-            0,
-            "{}",
-            shell.display()
+        let out = m.run_dir().join(format!("slurm-{id}.out"));
+        eventually("the helper's report of its signals", || {
+            read(&out).contains("fake pitcrewd ignores ")
+        });
+        assert!(
+            read(&out).contains("fake pitcrewd ignores []\n"),
+            "{}: {}",
+            shell.display(),
+            read(&out)
         );
         send_usr_signals(job_shell);
         assert!(alive(job_shell), "{}", shell.display());
