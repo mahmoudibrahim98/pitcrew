@@ -1,8 +1,8 @@
 //! Transcript pages (api-v1, "Transcript paging"): [`RunnerTranscripts::transcript_page`].
 //!
-//! - **Only watched transcripts.** A session is found by its id among the transcripts the watcher
-//!   tracks: it adds each one it tracks to [`Watched`] and removes it when its file is deleted.
-//!   A page never reads a file outside the configured homes, nor one the runner stopped watching.
+//! - **Only transcripts the watcher tracks.** A session is found by its id among them: the
+//!   watcher adds each one it tracks to [`Watched`] and removes it when its file is deleted. A
+//!   page never reads any other file, nor one the runner stopped watching.
 //! - **Through the adapter's own `read_page`**, so whatever the adapter does to open a file safely
 //!   applies here too: tail-first, up to `limit` items ending just before `before`, whole records
 //!   only (a page may hold more than `limit` items), a partial last line left out, and `from`,

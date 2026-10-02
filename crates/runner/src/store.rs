@@ -475,6 +475,17 @@ impl Store {
         Ok(())
     }
 
+    /// Hides the transcripts table (or brings it back), so lookups in it fail.
+    #[cfg(test)]
+    pub fn hide_transcripts(&self, hidden: bool) -> Result<(), StoreError> {
+        self.conn.execute_batch(if hidden {
+            "ALTER TABLE transcripts RENAME TO transcripts_hidden"
+        } else {
+            "ALTER TABLE transcripts_hidden RENAME TO transcripts"
+        })?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn get(&self, session: SessionId) -> Result<Option<Row>, StoreError> {
         Ok(self.load_all()?.into_iter().find(|r| r.session == session))
