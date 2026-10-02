@@ -123,7 +123,10 @@ tmux server that belongs to PitCrew alone.
   `@pitcrew-offset` holds where its output numbering resumes. The session and server exist while
   terminals do: a short-lived `pitcrew-start` window holds a new session until its first
   terminal exists (it ends by itself after 60 seconds if PitCrew stops first). A renamed session
-  is found again by its id, on the same server.
+  is found again by its id, on the same server. A failed attach can leave a server that exits
+  at once (it has no session); a session made just then dies with it, and the client says only
+  `%exit server exited unexpectedly` on stdout: that reason is read (with stderr) and means no
+  server, and `start` tries `new-session` again, up to three more times.
 - **One connection.** Commands go to the client's stdin through `command::Command` (never a
   process per command); a writer thread owns stdin, so a tmux that stops reading costs a bounded
   queue, not a stuck caller. Replies are matched to commands in order (tmux answers one client's
@@ -239,14 +242,28 @@ Windows above all (ConPTY there).
     unless sticky), before every connection. As with tmux, the system removes
     `$XDG_RUNTIME_DIR` when the user's last login ends; a runner that must outlive logins
     should pass its own endpoint.
-  - Windows: the pipe `\\.\pipe\pitcrew-ptyd-<the user's SID>`.
-  - `check_endpoint` is the check both sides make. Tests never use the default endpoint.
+  - Windows: the pipe `\\.\pipe\pitcrew-ptyd-<the user's SID>`, or
+    `…-<SID>-elevated` when this process is elevated, so an elevated daemon's ptyd (which runs
+    elevated, and outlives it) is never the one an ordinary process reaches.
+  - `check_endpoint` is the check both sides make: on Windows a pipe name must be
+    `\\.\pipe\` and `[A-Za-z0-9._-]`, not ending in a dot (the CLI's rule), since Win32
+    normalizes `..\` and `\\.\pipe\..\UNC\host\share` would be an SMB path that sends the
+    user's credentials to that host. Tests never use the default endpoint.
 - **Each side checks the other.** On Unix the client checks the directory, then the server's
-  uid (`SO_PEERCRED`); ptyd refuses a client of another uid. On Windows the client opens the
-  pipe asking for identification only (`SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`: the
-  server may not act as us) and requires the pipe's owner to be the current user (another user
-  cannot create a pipe owned by us); ptyd's pipe has a DACL granting the current user alone,
-  refuses remote clients, and checks the user of each client's process token.
+  uid (`SO_PEERCRED`); ptyd refuses a client of another uid before reading anything. On
+  Windows:
+  - the client opens the pipe asking for identification only (`SECURITY_SQOS_PRESENT |
+    SECURITY_IDENTIFICATION`: the server may not act as us), and requires the pipe's owner to
+    be the current user (another user cannot create a pipe owned by us) and its mandatory
+    label to be at the client's own integrity level (a pipe without a label counts as medium);
+  - ptyd's pipe has a DACL granting the current user alone, a mandatory label at ptyd's
+    integrity level refusing reads and writes from below (`S:(ML;;NWNR;;;<level>)`), and
+    refuses remote clients; ptyd checks the user of the client's process before reading
+    anything, and after the hello the client's own token (impersonating it at the
+    identification level it allows, `ImpersonateNamedPipeClient`, `OpenThreadToken`,
+    `RevertToSelf`): our user at our integrity level. So an elevated ptyd serves only
+    elevated clients, an ordinary one only ordinary ones, and an ordinary process of the user
+    can never start elevated programs through ptyd (a UAC bypass otherwise).
 - **Starting ptyd.** `start` starts ptyd when none answers: `PtyOptions::ptyd` (by default
   `pitcrew-ptyd` next to the running executable; `PATH` is never searched), detached so it
   outlives the caller. On Unix the process started only starts the real ptyd and exits (no
@@ -268,7 +285,12 @@ Windows above all (ConPTY there).
   and output goes on from the last offset (nothing is `truncated` unless more than the history
   arrived meanwhile). Reads, `screen`, `info`, `list`, `resize` and `kill` try once more on a
   new connection; input and `start` do not, since they may have taken effect. `disconnect()`
-  closes the connection by hand. Dropping the runtime closes it; terminals keep running.
+  closes the connection by hand. Dropping the runtime closes it; terminals keep running. A
+  ptyd that closes the connection before answering hello (one that is exiting, or lost the race
+  to serve) counts as none running, and is tried again while a just-started one is awaited.
+- **Tailing.** Reads that wait for output (`wait_for_output`) have their own budget in ptyd
+  (256 per connection), apart from the 16 slow requests (start, screen, kill), so a daemon can
+  tail every terminal at once.
 - **Versions.** The protocol (`pty::proto`, version 1) is ptyd's own, apart from API v1. A ptyd
   of another protocol is refused with a message saying which it speaks; its terminals keep
   running (see ptyd's README).
@@ -281,8 +303,26 @@ Windows above all (ConPTY there).
   from a blocking thread.
 
 `pty::windows` holds the only `unsafe` code of this crate and of pitcrew-ptyd (Windows only):
-SIDs, a pipe's owner and DACL, the client process of a pipe, and Job Objects. The crate denies
-`unsafe_code`; that module alone allows it, with a `SAFETY` comment on every block.
+SIDs and integrity levels, a pipe's owner, DACL and label, the client of a pipe (its process,
+and its token by impersonation), and Job Objects. The crate denies `unsafe_code` (pitcrew-ptyd
+forbids it); that module alone allows it, with a `SAFETY` comment on every block.
+`tests/unsafe_guard.rs` fails if any other source file of either crate allows it.
+
+**Residuals** (known, accepted for now):
+
+- **Job Objects on Windows.** portable-pty cannot start a program suspended, so ptyd puts it in
+  its job just after it starts: a process it starts in that instant escapes the job, and a
+  kill. The CLIs start nothing that early.
+- **The environment** of every terminal is ptyd's own (plus the request's variables, and on
+  Windows the registry's, which portable-pty adds), and ptyd's is that of the first process
+  that started it: a later daemon with a different environment does not change it, as with
+  tmux's server.
+- **Batch-file CLIs on Windows.** npm installs CLIs as `.cmd` shims, which `cmd.exe` runs and
+  parses again; ptyd refuses any argument with `" % ! ^ & | < > ( )`, so ordinary prompt text
+  (with a parenthesis, say) cannot be passed to such a CLI. A later round could resolve
+  `claude.cmd` to `node.exe` and its script, and run that instead.
+- **Huge screens.** A `screen` answer must fit one frame header (1 MiB of JSON), which a
+  1000 by 1000 screen full of wide characters can exceed; it is then refused.
 
 ## Choosing a runtime
 
