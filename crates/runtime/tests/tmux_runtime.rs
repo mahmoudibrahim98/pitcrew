@@ -2,8 +2,10 @@
 //!
 //! Every test runs its own server on a private socket (`/tmp/pc-<hex>/s`, mode 0700), never the
 //! user's. Every process a test starts carries `PITCREW_TEST_RUN=<its mark>` (the runtime passes
-//! it to tmux, whose server and panes inherit it), and each test ends by killing its server and
-//! checking through `/proc` that nothing with its mark is left.
+//! it to tmux, whose server and panes inherit it). Each test ends by checking that, with its
+//! runtime dropped, no control client and no runtime thread is left, then kills its server and
+//! checks through `/proc` that nothing with its mark is left. The tests run one at a time, so
+//! the thread check sees only its own test.
 //!
 //! The throughput measurement is ignored by default:
 //! `cargo test -p pitcrew-runtime --test tmux_runtime -- --ignored --nocapture`.
@@ -16,7 +18,7 @@ use std::hash::BuildHasher;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Wake};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -24,22 +26,30 @@ use pitcrew_interfaces::runtime::{Runtime, RuntimeError, StartSpec};
 use pitcrew_protocol::ids::TerminalId;
 use pitcrew_protocol::runner::{Capability, Key};
 use pitcrew_runtime::detect::{DetectError, detect_tmux};
-use pitcrew_runtime::tmux::{self, OFFSET_OPTION, TmuxOptions, TmuxRuntime};
+use pitcrew_runtime::tmux::{self, OFFSET_OPTION, TERMINAL_OPTION, TmuxOptions, TmuxRuntime};
 
 /// Generous: other agents build on this machine at the same time.
 const WAIT: Duration = Duration::from_secs(30);
 const MARK: &str = "PITCREW_TEST_RUN";
+
+static SERIAL: Mutex<()> = Mutex::new(());
+
+fn serial() -> MutexGuard<'static, ()> {
+    SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 struct Fixture {
     dir: PathBuf,
     options: TmuxOptions,
     mark: String,
     finished: bool,
+    _serial: MutexGuard<'static, ()>,
 }
 
 impl Fixture {
     /// A private server's setting, or `None` (the test is skipped) without a usable tmux.
     fn new(test: &str) -> Option<Self> {
+        let serial = serial();
         match detect_tmux("tmux") {
             Err(DetectError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
                 eprintln!("skipped: tmux is not installed");
@@ -69,6 +79,7 @@ impl Fixture {
             options,
             mark,
             finished: false,
+            _serial: serial,
         })
     }
 
@@ -131,9 +142,51 @@ impl Fixture {
         self.tmux(&["show-options", "-p", "-v", "-t", pane, option])
     }
 
-    /// Kills the server, then checks nothing this test started is left.
+    /// `(pane id, tag)` for every pane of the session.
+    fn tags(&self) -> Vec<(String, String)> {
+        self.tmux(&[
+            "list-panes",
+            "-s",
+            "-t",
+            "pitcrew",
+            "-F",
+            "#{pane_id} #{@pitcrew-terminal}",
+        ])
+        .lines()
+        .map(|line| {
+            let (pane, tag) = line.split_once(' ').unwrap_or((line, ""));
+            (pane.to_owned(), tag.to_owned())
+        })
+        .collect()
+    }
+
+    fn pane_of(&self, id: TerminalId) -> String {
+        let id = id.to_string();
+        self.tags()
+            .into_iter()
+            .find(|(_, tag)| *tag == id)
+            .map(|(pane, _)| pane)
+            .expect("the terminal's pane")
+    }
+
+    /// With every runtime of the test dropped: no control client or runtime thread is left
+    /// (before the server is killed); then kills the server, and checks nothing with this
+    /// test's mark is left.
     fn finish(mut self) {
         self.finished = true;
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let clients = children_marked(&self.mark);
+            let threads = runtime_threads();
+            if clients.is_empty() && threads.is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "left behind by a dropped runtime: clients {clients:?}, threads {threads:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let left = self.teardown();
         assert!(left.is_empty(), "processes left behind: {left:?}");
         assert!(!self.dir.exists(), "the private directory is left");
@@ -180,6 +233,38 @@ fn marked(mark: &str) -> Vec<(u32, String)> {
         .collect()
 }
 
+/// Marked processes this test process started itself: tmux control clients (the server and
+/// the panes are not its children).
+fn children_marked(mark: &str) -> Vec<(u32, String)> {
+    let me = std::process::id().to_string();
+    marked(mark)
+        .into_iter()
+        .filter(|(pid, _)| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    let after = stat.rsplit_once(')')?.1.to_owned();
+                    after.split_whitespace().nth(1).map(str::to_owned)
+                })
+                .is_some_and(|ppid| ppid == me)
+        })
+        .collect()
+}
+
+/// This process's threads that belong to a runtime (named `pitcrew-tmux-…`).
+fn runtime_threads() -> Vec<String> {
+    std::fs::read_dir("/proc/self/task")
+        .map(|tasks| {
+            tasks
+                .flatten()
+                .filter_map(|task| std::fs::read_to_string(task.path().join("comm")).ok())
+                .map(|comm| comm.trim().to_owned())
+                .filter(|comm| comm.starts_with("pitcrew-tmux"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Waits up to `grace` for `mark`'s processes to end, then kills the rest and returns them.
 fn sweep(mark: &str, grace: Duration) -> Vec<(u32, String)> {
     let start = Instant::now();
@@ -187,7 +272,7 @@ fn sweep(mark: &str, grace: Duration) -> Vec<(u32, String)> {
         let left = marked(mark);
         if left.is_empty() || start.elapsed() >= grace {
             for (pid, _) in &left {
-                kill(*pid);
+                signal(*pid, rustix::process::Signal::KILL);
             }
             return left;
         }
@@ -195,12 +280,12 @@ fn sweep(mark: &str, grace: Duration) -> Vec<(u32, String)> {
     }
 }
 
-fn kill(pid: u32) {
+fn signal(pid: u32, signal: rustix::process::Signal) {
     if let Some(pid) = i32::try_from(pid)
         .ok()
         .and_then(rustix::process::Pid::from_raw)
     {
-        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        let _ = rustix::process::kill_process(pid, signal);
     }
 }
 
@@ -241,6 +326,15 @@ fn wait_dead(rt: &TmuxRuntime, id: TerminalId) {
         let end = rt.read_output(id, u64::MAX, 0).expect("end").end;
         rt.wait_for_output(id, end, left.min(Duration::from_millis(200)))
             .expect("wait");
+    }
+}
+
+/// Polls `check` until it holds, for at most [`WAIT`].
+fn eventually(what: &str, mut check: impl FnMut() -> bool) {
+    let deadline = Instant::now() + WAIT;
+    while !check() {
+        assert!(Instant::now() < deadline, "never: {what}");
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -331,9 +425,9 @@ fn write_read_by_offset_resize_ctrl_c_and_kill() {
         "killing an ended terminal is a no-op"
     );
 
-    rt.kill(sized.id).expect("kill");
+    rt.kill(sized.id).expect("kill the last terminal");
     assert!(!rt.info(sized.id).expect("info").alive);
-    // With no terminal left, the runtime stops the server.
+    // Its window was the last one: the server has ended with it.
     fx.wait_for_no_server();
     let listed = rt.list().expect("list");
     assert_eq!(listed.len(), 2);
@@ -360,19 +454,7 @@ fn a_new_runtime_finds_the_terminal_and_resumes_at_the_last_offset() {
     wait_for(&rt, t.id, 0, b"ready");
     rt.write(t.id, b"one\r").expect("write");
     let (_, end) = wait_for(&rt, t.id, 0, b"one\r\none\r\n");
-    let pane = fx.tmux(&[
-        "list-panes",
-        "-s",
-        "-t",
-        "pitcrew",
-        "-F",
-        "#{pane_id} #{@pitcrew-terminal}",
-    ]);
-    let pane = pane
-        .lines()
-        .find_map(|line| line.strip_suffix(&format!(" {}", t.id)))
-        .expect("the terminal's pane")
-        .to_owned();
+    let pane = fx.pane_of(t.id);
     // While running, the stored offset stays ahead of what readers have seen.
     let stored: u64 = fx
         .pane_option(&pane, OFFSET_OPTION)
@@ -451,6 +533,52 @@ fn the_screen_shows_a_prompt_drawn_with_cursor_movement() {
 }
 
 #[test]
+fn a_flood_of_huge_counts_neither_slows_the_screen_nor_stops_others() {
+    let Some(fx) = Fixture::new("flood") else {
+        return;
+    };
+    let rt = fx.runtime();
+    // 8200 times `ESC[65535L` is 64 KiB; vt100 alone would insert 65535 lines each time.
+    let flood = rt
+        .start(&fx.spec(
+            "flood",
+            "sh",
+            &[
+                "-c",
+                r"i=0; while [ $i -lt 8200 ]; do printf '\033[65535L'; i=$((i+1)); done; printf '\033[1;1HFLOODED'; exec cat",
+            ],
+        ))
+        .expect("start flood");
+    let steady = rt
+        .start(&fx.spec("steady", "sh", &["-c", "printf ready; exec cat"]))
+        .expect("start steady");
+    let (_, flooded) = wait_for(&rt, flood.id, 0, b"FLOODED");
+    assert!(flooded >= 64 << 10, "{flooded}");
+    let (_, ready) = wait_for(&rt, steady.id, 0, b"ready");
+    let took = std::thread::scope(|scope| {
+        let screen = scope.spawn(|| {
+            let started = Instant::now();
+            let screen = rt.screen(flood.id).expect("screen");
+            (started.elapsed(), screen)
+        });
+        // Meanwhile the other terminal's output keeps flowing.
+        rt.write(steady.id, b"tick\r").expect("write");
+        wait_for(&rt, steady.id, ready, b"tick\r\ntick\r\n");
+        screen.join().expect("screen thread")
+    });
+    assert!(
+        took.0 < Duration::from_secs(1),
+        "screen() took {:?}",
+        took.0
+    );
+    assert_eq!(took.1.rows[0], "FLOODED");
+    rt.kill(flood.id).expect("kill");
+    rt.kill(steady.id).expect("kill");
+    drop(rt);
+    fx.finish();
+}
+
+#[test]
 fn two_terminals_interleave_without_mixing() {
     let Some(fx) = Fixture::new("two") else {
         return;
@@ -488,7 +616,7 @@ fn a_dead_control_client_is_replaced_and_offsets_continue() {
         .expect("start");
     let (_, end) = wait_for(&rt, t.id, 0, b"ready");
     let first = rt.control_pid().expect("attached");
-    kill(first);
+    signal(first, rustix::process::Signal::KILL);
     // The runtime notices, attaches again in the background, and input works again.
     let deadline = Instant::now() + WAIT;
     loop {
@@ -500,11 +628,264 @@ fn a_dead_control_client_is_replaced_and_offsets_continue() {
     }
     let (out, _) = wait_for(&rt, t.id, end, b"after\r\nafter\r\n");
     assert!(out.ends_with(b"after\r\nafter\r\n"));
+    // A reader at the old end learns that output may have been lost in between.
+    assert!(rt.read_output(t.id, end, 1).expect("read").truncated);
     let chunk = rt.read_output(t.id, 0, usize::MAX).expect("read");
     assert_eq!(chunk.offset, 0, "numbering did not restart");
     assert!(chunk.data.starts_with(b"ready"));
     assert!(rt.info(t.id).expect("info").alive);
     rt.kill(t.id).expect("kill");
+    drop(rt);
+    fx.finish();
+}
+
+#[test]
+fn replies_to_hooks_are_not_taken_for_ours() {
+    let Some(fx) = Fixture::new("hooks") else {
+        return;
+    };
+    let rt = fx.runtime();
+    let one = rt
+        .start(&fx.spec("one", "sh", &["-c", "printf ready; exec cat"]))
+        .expect("start");
+    let (_, ready) = wait_for(&rt, one.id, 0, b"ready");
+    // Anything on the server can add hooks; theirs reply to our client with flags 0.
+    fx.tmux(&["set-hook", "-g", "after-set-option", "display-message -p x"]);
+    fx.tmux(&["set-hook", "-g", "after-list-panes", "display-message -p y"]);
+    let two = rt
+        .start(&fx.spec("two", "sh", &["-c", "printf ready; exec cat"]))
+        .expect("start with hooks set");
+    wait_for(&rt, two.id, 0, b"ready");
+    let listed = rt.list().expect("list");
+    assert_eq!(listed.len(), 2);
+    assert!(listed.iter().all(|t| t.alive), "{listed:?}");
+    rt.write(one.id, b"still\r").expect("write");
+    wait_for(&rt, one.id, ready, b"still\r\nstill\r\n");
+    rt.kill(one.id).expect("kill");
+    rt.kill(two.id).expect("kill");
+    drop(rt);
+    fx.finish();
+}
+
+#[test]
+fn an_abandoned_start_leaves_no_window() {
+    let Some(fx) = Fixture::new("abandon") else {
+        return;
+    };
+    let mut options = fx.options.clone();
+    options.start_timeout = Duration::from_secs(4);
+    let rt = TmuxRuntime::new(options).expect("runtime");
+    let first = rt
+        .start(&fx.spec("first", "sh", &["-c", "printf ready; exec cat"]))
+        .expect("start");
+    wait_for(&rt, first.id, 0, b"ready");
+    let server: u32 = fx
+        .tmux(&["list-sessions", "-F", "#{pid}"])
+        .parse()
+        .expect("server pid");
+    // The server stops answering while a start waits for it, which gives up.
+    signal(server, rustix::process::Signal::STOP);
+    let late = rt.start(&fx.spec("late", "sh", &["-c", "printf late; exec cat"]));
+    signal(server, rustix::process::Signal::CONT);
+    assert!(
+        matches!(late, Err(RuntimeError::Unavailable(_))),
+        "{late:?}"
+    );
+    // When the server answers, the window it made for nobody is removed.
+    let first_id = first.id.to_string();
+    eventually("only the first terminal's window is left", || {
+        let tags = fx.tags();
+        tags.len() == 1 && tags[0].1 == first_id
+    });
+    rt.kill(first.id).expect("kill");
+    drop(rt);
+    fx.finish();
+}
+
+#[test]
+fn a_replaced_socket_directory_or_socket_is_refused() {
+    let Some(fx) = Fixture::new("replaced") else {
+        return;
+    };
+    let sub = fx.dir.join("sub");
+    let mut options = fx.options.clone();
+    options.socket = sub.join("s");
+    let rt = TmuxRuntime::new(options.clone()).expect("runtime");
+    // Behind the runtime's back, its directory is swapped for one open to others...
+    std::fs::rename(&sub, fx.dir.join("sub.old")).expect("move aside");
+    std::fs::create_dir(&sub).expect("open directory");
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    match rt.start(&fx.spec("x", "sh", &["-c", "exec cat"])) {
+        Err(RuntimeError::Unavailable(why)) => assert!(why.contains("0700"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    // ...or for a link to someone else's...
+    std::fs::remove_dir(&sub).expect("remove");
+    std::os::unix::fs::symlink(fx.dir.join("sub.old"), &sub).expect("symlink");
+    match rt.start(&fx.spec("x", "sh", &["-c", "exec cat"])) {
+        Err(RuntimeError::Unavailable(why)) => assert!(why.contains("not a directory"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    // ...or the socket for something that is not one.
+    std::fs::remove_file(&sub).expect("unlink");
+    std::fs::rename(fx.dir.join("sub.old"), &sub).expect("move back");
+    let _ = std::fs::remove_file(sub.join("s"));
+    std::fs::write(sub.join("s"), b"not a socket").expect("file");
+    match rt.start(&fx.spec("x", "sh", &["-c", "exec cat"])) {
+        Err(RuntimeError::Unavailable(why)) => assert!(why.contains("not a socket"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    match tmux::detect(&options) {
+        Err(RuntimeError::Unavailable(why)) => assert!(why.contains("not a socket"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    drop(rt);
+    fx.finish();
+}
+
+#[test]
+fn kill_stops_programs_that_ignore_hangup_and_their_jobs() {
+    let Some(fx) = Fixture::new("kill") else {
+        return;
+    };
+    let rt = fx.runtime();
+    let stubborn = r"trap '' HUP TERM; (trap '' HUP; exec sleep 1001) & printf ready; while :; do sleep 1; done";
+    let t = rt
+        .start(&fx.spec("stubborn", "sh", &["-c", stubborn]))
+        .expect("start");
+    wait_for(&rt, t.id, 0, b"ready");
+    let gone = || {
+        !marked(&fx.mark)
+            .iter()
+            .any(|(_, cmd)| cmd.contains("sleep 1001") || cmd.contains("trap '' HUP TERM"))
+    };
+    assert!(!gone(), "the program is not running");
+    rt.kill(t.id).expect("kill");
+    assert!(!rt.info(t.id).expect("info").alive);
+    // Before the server is killed: the program (which ignores SIGHUP and SIGTERM) and its
+    // background job (which ignores SIGHUP) are gone.
+    eventually("the stubborn program and its job end", gone);
+    drop(rt);
+    fx.finish();
+}
+
+#[test]
+fn a_copied_tag_does_not_move_a_terminal() {
+    let Some(fx) = Fixture::new("forgery") else {
+        return;
+    };
+    let rt = fx.runtime();
+    let t = rt
+        .start(&fx.spec("original", "sh", &["-c", "printf ready; exec cat"]))
+        .expect("start");
+    let (_, ready) = wait_for(&rt, t.id, 0, b"ready");
+    let original = fx.pane_of(t.id);
+    // Another window gets a copy of the tag; the original's tag is overwritten with garbage.
+    fx.tmux(&[
+        "new-window",
+        "-d",
+        "-t",
+        "pitcrew:",
+        "-n",
+        "copy",
+        "/bin/sh -c 'exec cat'",
+    ]);
+    let copy = fx
+        .tags()
+        .into_iter()
+        .map(|(pane, _)| pane)
+        .find(|pane| *pane != original)
+        .expect("the copy's pane");
+    let id = t.id.to_string();
+    fx.tmux(&["set-option", "-p", "-t", &copy, TERMINAL_OPTION, &id]);
+    fx.tmux(&[
+        "set-option",
+        "-p",
+        "-t",
+        &original,
+        TERMINAL_OPTION,
+        "garbage",
+    ]);
+    let listed = rt.list().expect("list");
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert!(listed[0].alive, "an unreadable tag is not a missing pane");
+    assert_eq!(listed[0].native_target, t.native_target);
+    // Output of the copy never lands in the terminal; its own input and output still work.
+    fx.tmux(&["send-keys", "-t", &copy, "-l", "intruder\r"]);
+    rt.write(t.id, b"mine\r").expect("write");
+    let (out, _) = wait_for(&rt, t.id, ready, b"mine\r\nmine\r\n");
+    std::thread::sleep(Duration::from_millis(300));
+    let out = [
+        out,
+        rt.read_output(t.id, ready, usize::MAX).expect("read").data,
+    ]
+    .concat();
+    assert!(!contains(&out, b"intruder"), "{}", crlf(&out));
+    // After a restart, an id on two panes is adopted on neither.
+    fx.tmux(&["set-option", "-p", "-t", &original, TERMINAL_OPTION, &id]);
+    drop(rt);
+    let rt = fx.runtime();
+    assert!(rt.list().expect("list").is_empty());
+    drop(rt);
+    fx.finish();
+}
+
+#[test]
+fn copy_mode_is_left_before_input() {
+    let Some(fx) = Fixture::new("copymode") else {
+        return;
+    };
+    let rt = fx.runtime();
+    let t = rt
+        .start(&fx.spec("copy", "sh", &["-c", "printf ready; exec cat"]))
+        .expect("start");
+    let (_, ready) = wait_for(&rt, t.id, 0, b"ready");
+    let target = t.native_target.clone().expect("target");
+    fx.tmux(&["copy-mode", "-t", &target]);
+    let in_mode = || fx.tmux(&["display-message", "-p", "-t", &target, "#{pane_in_mode}"]);
+    assert_eq!(in_mode(), "1");
+    // In copy mode, `q` would leave it and Enter would copy: the text must reach cat instead.
+    rt.write(t.id, b"q\rCOPY_MODE_TEXT\r").expect("write");
+    // The terminal echoes both lines and cat copies them, in either order.
+    let mut lines = Vec::new();
+    eventually("both lines echoed and copied", || {
+        let out = rt.read_output(t.id, ready, usize::MAX).expect("read").data;
+        lines = crlf(&out).lines().map(str::to_owned).collect();
+        lines.len() >= 4
+    });
+    lines.sort();
+    assert_eq!(lines, ["COPY_MODE_TEXT", "COPY_MODE_TEXT", "q", "q"]);
+    assert_eq!(in_mode(), "0");
+    rt.kill(t.id).expect("kill");
+    drop(rt);
+    fx.finish();
+}
+
+#[test]
+fn an_old_running_server_is_refused() {
+    let Some(fx) = Fixture::new("oldserver") else {
+        return;
+    };
+    // A stand-in tmux that attaches and then says it is 3.1c.
+    let fake = fx.dir.join("old-tmux");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nprintf '%%begin 1 0 0\\n%%end 1 0 0\\n'\nn=1\nwhile IFS= read -r line; do\n  case \"$line\" in display-message*) body='3.1c 4242 $0' ;; *) body= ;; esac\n  printf '%%begin 1 %d 1\\n' \"$n\"\n  [ -n \"$body\" ] && printf '%s\\n' \"$body\"\n  printf '%%end 1 %d 1\\n' \"$n\"\n  n=$((n+1))\ndone\n",
+    )
+    .expect("script");
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let mut options = fx.options.clone();
+    options.tmux = fake;
+    let rt = TmuxRuntime::new(options).expect("runtime");
+    match rt.list() {
+        Err(RuntimeError::Unavailable(why)) => {
+            assert!(
+                why.contains("3.1c") && why.contains("3.2 or newer"),
+                "{why}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
     drop(rt);
     fx.finish();
 }
@@ -558,16 +939,18 @@ fn hostile_programs_arguments_and_names_stay_literal() {
         .expect("start odd");
     wait_dead(&rt, t.id);
     let out = rt.read_output(t.id, 0, usize::MAX).expect("read").data;
-
     assert_eq!(out, b"HOSTILE_PROGRAM_RAN arg;x");
 
-    // A hostile name that is no program fails as a whole name, without running anything.
-    let t = rt
-        .start(&fx.spec("missing", &format!("no-such; {touch}"), &[]))
-        .expect("start missing");
-    wait_dead(&rt, t.id);
-    let out = crlf(&rt.read_output(t.id, 0, usize::MAX).expect("read").data);
-    assert!(out.contains("not found"), "{out}");
+    // A name that is no file on PATH is refused, a shell builtin included: nothing runs.
+    for missing in [format!("no-such; {touch}"), "eval".to_owned()] {
+        assert!(
+            matches!(
+                rt.start(&fx.spec("missing", &missing, &[&touch])),
+                Err(RuntimeError::Spawn { .. })
+            ),
+            "{missing}"
+        );
+    }
     assert!(matches!(
         rt.start(&fx.spec("dash", "-c", &["true"])),
         Err(RuntimeError::Spawn { .. })
@@ -579,7 +962,10 @@ fn hostile_programs_arguments_and_names_stay_literal() {
     let mut spec = fx.spec(
         "name\n%exit #{pane_id} #(x)",
         "sh",
-        &["-c", "pwd; printf '%s' \"$PC_VALUE\"; printf END; exec cat"],
+        &[
+            "-c",
+            "pwd; printf '%s' \"$PC_VALUE\"; printf '%s' \"${TMUX:-no tmux}\"; printf END; exec cat",
+        ],
     );
     spec.cwd = cwd.display().to_string();
     spec.env = vec![("PC_VALUE".into(), format!("#{{pane_id}} $({touch}) ;\n'x'"))];
@@ -587,7 +973,10 @@ fn hostile_programs_arguments_and_names_stay_literal() {
     let (out, _) = wait_for(&rt, t.id, 0, b"END");
     assert_eq!(
         crlf(&out),
-        format!("{}\n#{{pane_id}} $({touch}) ;\n'x'END", cwd.display())
+        format!(
+            "{}\n#{{pane_id}} $({touch}) ;\n'x'no tmuxEND",
+            cwd.display()
+        )
     );
     assert_eq!(t.name, "name %exit #{pane_id} #(x)");
     let target = t.native_target.clone().expect("target");
@@ -621,6 +1010,7 @@ fn detection_reports_tmux_or_why_not() {
     };
     let support = tmux::detect(&fx.options).expect("tmux is usable");
     assert!(support.version.is_supported());
+    assert!(support.tmux.is_absolute(), "{}", support.tmux.display());
     assert_eq!(support.socket, fx.options.socket);
     assert_eq!(support.capability(), Capability::Tmux);
 
@@ -689,7 +1079,6 @@ fn throughput_of_50_mb() {
     rt.write(t.id, b"\r").expect("go");
     let deadline = Instant::now() + Duration::from_secs(600);
     let mut end = ready;
-
     while end < ready + TOTAL {
         let left = deadline
             .checked_duration_since(Instant::now())
@@ -778,6 +1167,7 @@ fn block_on<F: Future>(future: F) -> F::Output {
 #[test]
 fn without_tmux_the_runtime_is_unavailable() {
     // Runs everywhere: needs no tmux.
+    let _serial = serial();
     let random = RandomState::new().hash_one((std::process::id(), SystemTime::now()));
     let dir = PathBuf::from(format!("/tmp/pc-{:012x}", random & 0xffff_ffff_ffff));
     let mut options = TmuxOptions::new(dir.join("s"));
