@@ -104,6 +104,10 @@ describe('in the desktop app', () => {
     fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
     await vi.waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
     expect(desktop.commands('gateway_workspace_remove')).toEqual([]);
+    // Focus goes back to the switcher, not to the page's body.
+    await vi.waitFor(() =>
+      expect(document.activeElement).toBe(within(sidebar()).getByRole('button', { name: 'Workspace: hpc-login' })),
+    );
 
     menu = await openSwitcher('hpc-login');
     fireEvent.click(within(menu).getByRole('menuitem', { name: 'Remove workspace…' }));

@@ -156,6 +156,10 @@ describe('in the desktop app', () => {
     expect(router.state.location.pathname).toBe(paths.setup(WS));
     await settle();
     expect(seen.filter((p) => p === paths.setup(WS))).toHaveLength(1);
+    // Not a dead end: the switcher stays, with its connect and remove actions.
+    expect(screen.getByRole('button', { name: 'Workspace: hpc-login' })).toBeTruthy();
+    // And `/` will not reopen a workspace still waiting for setup.
+    expect(useShell.getState().lastWorkspace).toBeNull();
 
     fireEvent.click(screen.getByRole('button', { name: 'Finish setup' }));
     await screen.findByRole('heading', { level: 1, name: 'Home' }, PATIENCE);
@@ -164,6 +168,7 @@ describe('in the desktop app', () => {
     expect(router.state.location.pathname).toBe(paths.home(WS));
     expect(seen.slice(after)).toEqual([]);
     expect(fresh.me?.handle).toBe('@sam');
+    expect(useShell.getState().lastWorkspace).toBe(WS);
     // The first-run route is never remembered as a place to come back to.
     expect(JSON.stringify(useShell.getState().workspaces)).not.toContain('onboarding');
   });

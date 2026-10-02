@@ -62,7 +62,10 @@ was asked for. There is no loop:
   wizard navigates to Home.
 
 A `setup` route is shown bare, without the sidebar, top bar or Orchestrator, and is never
-remembered as a layout's last page.
+remembered as a layout's last page. In the desktop app it keeps a small header with the workspace
+switcher, so another workspace, connecting a machine, or removing this one (a remote) stays one
+click away. A workspace is remembered as the last one opened only once it is set up (or when the
+gateway cannot reach it), so `/` does not keep reopening a workspace waiting for setup.
 
 ## SSH's prompts
 
@@ -71,18 +74,28 @@ password, a key's passphrase, a one-time code, or a new host key's confirmation
 (desktop-gateway.md, "Prompts"). `<GatewayPrompts>` (mounted once, in `routes.tsx`'s root) shows
 the oldest one; the rest wait, and the dialog says how many.
 
-- It says which host is asking, and shows ssh's `text` as plain text: it is untrusted, and never
-  rendered as markup.
+- It says which host is asking and where an answer goes, from `kind` (never guessed from the
+  text): "Sent to {host}" for a password or a code, "Unlocks your key on this computer; not sent to
+  {host}" for a passphrase, "Trust this host's key?" for a host key; a `confirm` is ssh's own
+  yes-or-no question, and a `notice` is information only.
+- ssh's `text` is plain text (untrusted, never rendered as markup), in a box that scrolls
+  (focusable) so the field and the buttons always show. A long text arrives with its end kept
+  (`src/data/remote.ts`).
 - A password, passphrase or code goes in a password field with autocomplete off; Send stays off
-  while it is empty. A host key shows its fingerprint, with Accept and Reject (Accept stays off
-  when the gateway gave no fingerprint to compare). ssh's other yes/no questions (`confirm`) have
-  Accept and Reject. A `notice` ("touch your security key") has nothing to answer: it stays until
-  the gateway withdraws it, and Stop replies with neither, which stops ssh.
-- Cancel, Esc and the close button reply with neither field, which cancels. A
+  while it is empty. A host key shows its fingerprint, with Reject and Accept (Accept stays off
+  when the gateway gave no fingerprint to compare); a `confirm` has Reject and Accept. A `notice`
+  ("touch your security key") has nothing to answer: it stays until the gateway withdraws it, has
+  no close button, ignores Esc, and only "Stop sign-in" stops ssh.
+- Every other kind has "Cancel sign-in", which replies with neither field; Esc does the same, and
+  the button says so (`aria-keyshortcuts`). A click outside the dialog does nothing. A
   `gateway://prompt-closed` withdraws the prompt without a reply.
-- **The answer lives only in the dialog's own state** (one per prompt, keyed by its id). It is
-  cleared as it is sent, and never logged or put in a store, a query cache, the URL or storage
-  (`tests/prompts.test.tsx` looks for it everywhere after a reply).
+- Enter does nothing for 300 ms after the dialog opens, so typing meant for another field cannot
+  send a half-typed password.
+- **The answer is never in state or in the DOM.** The field is uncontrolled (React copies a
+  controlled input's value into its `value` attribute, and so into `outerHTML`, snapshots and
+  traces); the answer is read from it once, as it is sent, and the field is cleared at that
+  moment. Each prompt gets a fresh field (keyed by its id). It is never logged or put in a store,
+  a query cache, the URL or storage (`tests/prompts.test.tsx` looks for it everywhere).
 
 ## Navigating from outside the window
 

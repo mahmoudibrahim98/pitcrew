@@ -20,7 +20,7 @@ import { Redirect } from './pages/open.tsx';
 import { StatusScreen, WorkspacesFailed, WorkspaceUnavailable } from './pages/unavailable.tsx';
 import { paths } from './paths.ts';
 import { useShellShortcuts } from './shortcuts.ts';
-import { Sidebar } from './sidebar.tsx';
+import { Sidebar, WorkspaceSwitcher } from './sidebar.tsx';
 import { useShell } from './store.ts';
 import { TopBar } from './top-bar.tsx';
 
@@ -97,7 +97,12 @@ function Frame() {
   // The first-run wizard's own routes: exempt from the redirect below, and shown bare.
   const setupRoute = useRouterState({ select: (s) => s.matches.some((m) => m.staticData?.setup === true) });
   const setLastWorkspace = useShell((s) => s.setLastWorkspace);
-  useEffect(() => setLastWorkspace(ws), [setLastWorkspace, ws]);
+  // `/` reopens the last workspace: not one still waiting for setup (it would land in the wizard
+  // every time), but one the gateway cannot reach is remembered (it comes back).
+  const remember = (info !== undefined && info.setup_needed !== true) || unavailable !== undefined;
+  useEffect(() => {
+    if (remember) setLastWorkspace(ws);
+  }, [remember, setLastWorkspace, ws]);
 
   if (info !== undefined && info.workspace.id !== ws) {
     return (
@@ -118,12 +123,34 @@ function Frame() {
   }
   if (setupRoute) {
     return (
-      <main id="main" tabIndex={-1} className="min-h-dvh bg-bg text-ink outline-none">
-        {unavailable === undefined ? <Outlet /> : <WorkspaceUnavailable workspace={unavailable} />}
-      </main>
+      <div className="flex min-h-dvh flex-col bg-bg text-ink">
+        <SetupHeader />
+        <main id="main" tabIndex={-1} className="flex-1 outline-none">
+          {unavailable === undefined ? <Outlet /> : <WorkspaceUnavailable workspace={unavailable} />}
+        </main>
+      </div>
     );
   }
   return <FullFrame unavailable={unavailable} />;
+}
+
+/**
+ * In the desktop app, the bare setup page keeps the workspace switcher: another workspace, a
+ * remote machine to connect, or this one to remove (a remote) stay one click away, so a workspace
+ * waiting for setup is never a dead end. A browser's hub has only this one workspace.
+ */
+function SetupHeader() {
+  const desktop = useGatewayWorkspaces();
+  if (desktop === null) return null;
+  return (
+    <TooltipProvider>
+      <header className="flex h-12 items-center border-b border-line bg-bg px-2">
+        <div className="flex w-(--pc-sidebar-width) min-w-0">
+          <WorkspaceSwitcher collapsed={false} />
+        </div>
+      </header>
+    </TooltipProvider>
+  );
 }
 
 function FullFrame({ unavailable }: { unavailable: GatewayWorkspace | undefined }) {

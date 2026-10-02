@@ -17,10 +17,13 @@ export function RemoveWorkspaceDialog({
   workspace,
   remote,
   onClose,
+  returnFocus,
 }: {
   workspace: GatewayWorkspace;
   remote: RemoteGateway;
   onClose(): void;
+  /** Where focus goes once the dialog has gone (it has no trigger of its own). */
+  returnFocus(): void;
 }) {
   const router = useRouter();
   const list = useGatewayWorkspaces()?.list ?? [];
@@ -52,7 +55,10 @@ export function RemoveWorkspaceDialog({
       <DialogContent
         title={`Remove ${workspace.name}?`}
         description="This app forgets the workspace and its key. Its data stays on the remote."
-        onCloseAutoFocus={(event) => event.preventDefault()}
+        onCloseAutoFocus={(event) => {
+          event.preventDefault();
+          returnFocus();
+        }}
       >
         <form
           onSubmit={(event) => {

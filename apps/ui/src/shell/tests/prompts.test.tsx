@@ -12,6 +12,7 @@ import { Workspaces } from '../../data/desktop.tsx';
 import { createGateway } from '../../data/gateway.ts';
 import { FakeDesktop } from '../../data/tests/fake-desktop.ts';
 import { WorkspacesContext, type GatewayWorkspace } from '../../data/workspaces.tsx';
+import { ENTER_GRACE_MS } from '../prompt-dialog.tsx';
 import { createAppRouter } from '../routes.tsx';
 import { initialShellState, useShell } from '../store.ts';
 
@@ -120,23 +121,126 @@ describe('the prompt dialog', () => {
     expect(dialog().querySelector('img, b, a')).toBeNull();
   });
 
-  it('cancels with neither field, by the button or by Esc', async () => {
+  it('never puts a typed answer in the DOM, even before it is sent', async () => {
+    await renderApp();
+    await desktop.prompt(prompt('p1'));
+    await screen.findByTestId('gateway-prompt', undefined, PATIENCE);
+    const field = within(dialog()).getByLabelText('Password') as HTMLInputElement;
+    fireEvent.change(field, { target: { value: SECRET } });
+    expect(field.value).toBe(SECRET);
+    expect(field.getAttribute('value')).toBeNull();
+    // What DOM snapshots and traces record.
+    expect(document.documentElement.outerHTML).not.toContain(SECRET);
+    expect((within(dialog()).getByRole('button', { name: 'Send' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('cancels with neither field, by "Cancel sign-in" or by Esc', async () => {
     await renderApp();
     await desktop.prompt(prompt('p1', 'hpc-login', 'otp', 'Verification code: '));
     await screen.findByRole('dialog', { name: 'hpc-login asks for a one-time code' }, PATIENCE);
     fireEvent.change(within(dialog()).getByLabelText('One-time code'), { target: { value: '123456' } });
     let reply = desktop.nextReply();
-    fireEvent.click(within(dialog()).getByRole('button', { name: 'Cancel' }));
+    fireEvent.click(within(dialog()).getByRole('button', { name: 'Cancel sign-in' }));
     expect(await reply).toEqual({ id: 'p1' });
     await vi.waitFor(() => expect(screen.queryByTestId('gateway-prompt')).toBeNull());
 
     await desktop.prompt(prompt('p2', 'hpc-login', 'passphrase', "Enter passphrase for key '/keys/id_ed25519': "));
-    await screen.findByRole('dialog', { name: 'hpc-login asks for a key passphrase' });
+    await screen.findByRole('dialog', { name: 'Unlock your key to reach hpc-login' });
+    expect(within(dialog()).getByRole('button', { name: 'Cancel sign-in' }).getAttribute('aria-keyshortcuts')).toBe('Escape');
     reply = desktop.nextReply();
     fireEvent.keyDown(dialog(), { key: 'Escape' });
     expect(await reply).toEqual({ id: 'p2' });
     await vi.waitFor(() => expect(screen.queryByTestId('gateway-prompt')).toBeNull());
     expect(everywhere()).not.toContain('123456');
+  });
+
+  it('ignores a click outside the dialog: a stray click never cancels', async () => {
+    await renderApp();
+    await desktop.prompt(prompt('p1'));
+    await screen.findByTestId('gateway-prompt', undefined, PATIENCE);
+    expect(within(dialog()).queryByRole('button', { name: 'Close' })).toBeNull();
+    fireEvent.pointerDown(document.body);
+    fireEvent.mouseDown(document.body);
+    fireEvent.click(document.body);
+    fireEvent.focusIn(document.body);
+    await new Promise((done) => setTimeout(done, 20));
+    expect(screen.getByTestId('gateway-prompt')).toBeTruthy();
+    expect(desktop.commands('gateway_prompt_reply')).toEqual([]);
+  });
+
+  it('says where each answer goes, from the kind, never from the text', async () => {
+    await renderApp();
+    await desktop.prompt(prompt('p1', 'hpc-login', 'password', 'Enter your passphrase: '));
+    await screen.findByRole('dialog', { name: 'hpc-login asks for a password' }, PATIENCE);
+    expect(within(dialog()).getByText('Sent to hpc-login. Not kept here.')).toBeTruthy();
+    fireEvent.click(within(dialog()).getByRole('button', { name: 'Cancel sign-in' }));
+    await vi.waitFor(() => expect(screen.queryByTestId('gateway-prompt')).toBeNull());
+
+    await desktop.prompt(prompt('p2', 'hpc-login', 'otp', 'Code: '));
+    await screen.findByRole('dialog', { name: 'hpc-login asks for a one-time code' });
+    expect(within(dialog()).getByText('Sent to hpc-login. Not kept here.')).toBeTruthy();
+    fireEvent.click(within(dialog()).getByRole('button', { name: 'Cancel sign-in' }));
+    await vi.waitFor(() => expect(screen.queryByTestId('gateway-prompt')).toBeNull());
+
+    await desktop.prompt(prompt('p3', 'hpc-login', 'passphrase', "Enter passphrase for key '/keys/id_ed25519': "));
+    await screen.findByRole('dialog', { name: 'Unlock your key to reach hpc-login' });
+    expect(within(dialog()).getByText('Unlocks your key on this computer; not sent to hpc-login.')).toBeTruthy();
+    expect(within(dialog()).getByRole('region', { name: 'ssh says, for hpc-login' })).toBeTruthy();
+  });
+
+  it('keeps a long text in a scroll box, its end shown, and the field and buttons with it', async () => {
+    await renderApp();
+    const long = `${'Warning: a very long banner from the server. '.repeat(120)}\n(sam@hpc-login) Password: `;
+    await desktop.prompt(prompt('p1', 'hpc-login', 'password', long));
+    await screen.findByTestId('gateway-prompt', undefined, PATIENCE);
+    const box = within(dialog()).getByRole('region', { name: 'hpc-login says' });
+    expect(box.className).toContain('max-h-48');
+    expect(box.className).toContain('overflow-auto');
+    expect(box.getAttribute('tabindex')).toBe('0');
+    const text = box.textContent ?? '';
+    expect(text.startsWith('…')).toBe(true);
+    expect(text.endsWith('(sam@hpc-login) Password: ')).toBe(true);
+    expect([...text].length).toBe(2000);
+    expect(within(dialog()).getByLabelText('Password')).toBeTruthy();
+    expect(within(dialog()).getByRole('button', { name: 'Send' })).toBeTruthy();
+  });
+
+  it('ignores Enter for a moment after it opens, so typing meant elsewhere cannot send', async () => {
+    await renderApp();
+    await desktop.prompt(prompt('p1'));
+    await screen.findByTestId('gateway-prompt', undefined, PATIENCE);
+    const field = within(dialog()).getByLabelText('Password');
+    fireEvent.change(field, { target: { value: 'half-typ' } });
+    // `fireEvent` answers false when the event's default action was prevented.
+    expect(fireEvent.keyDown(field, { key: 'Enter' })).toBe(false);
+    await new Promise((done) => setTimeout(done, ENTER_GRACE_MS + 50));
+    expect(fireEvent.keyDown(field, { key: 'Enter' })).toBe(true);
+  });
+
+  it('starts each prompt with an empty field (keyed by its id), even of the same kind', async () => {
+    await renderApp();
+    await desktop.prompt(prompt('p1', 'hpc-login'));
+    await desktop.prompt(prompt('p2', 'build-box'));
+    await screen.findByRole('dialog', { name: 'hpc-login asks for a password' }, PATIENCE);
+    fireEvent.change(within(dialog()).getByLabelText('Password'), { target: { value: SECRET } });
+    // Withdrawn, not sent: only the key can make the next field start empty.
+    await desktop.closePrompt('p1');
+    await screen.findByRole('dialog', { name: 'build-box asks for a password' });
+    expect((within(dialog()).getByLabelText('Password') as HTMLInputElement).value).toBe('');
+    expect(desktop.commands('gateway_prompt_reply')).toEqual([]);
+  });
+
+  it('clears the field the moment it sends', async () => {
+    await renderApp();
+    await desktop.prompt(prompt('p1'));
+    await screen.findByTestId('gateway-prompt', undefined, PATIENCE);
+    const field = within(dialog()).getByLabelText('Password') as HTMLInputElement;
+    fireEvent.change(field, { target: { value: SECRET } });
+    const reply = desktop.nextReply();
+    fireEvent.click(within(dialog()).getByRole('button', { name: 'Send' }));
+    // The element itself, even once it has left the page, holds nothing.
+    expect(field.value).toBe('');
+    expect(await reply).toEqual({ id: 'p1', answer: SECRET });
   });
 
   it('closes a prompt the gateway withdraws, without replying', async () => {
@@ -189,6 +293,7 @@ describe('the prompt dialog', () => {
     await screen.findByRole('dialog', { name: "Check hpc-login's host key" }, PATIENCE);
     expect(within(dialog()).getByTestId('prompt-fingerprint').textContent).toBe('SHA256:bWFkZS11cC1rZXktZm9yLXRlc3RzLW9ubHktMDAwMQ');
     expect(within(dialog()).queryByRole('textbox')).toBeNull();
+    expect(within(dialog()).getByText('Trust this host’s key?')).toBeTruthy();
     let reply = desktop.nextReply();
     fireEvent.click(within(dialog()).getByRole('button', { name: 'Accept' }));
     expect(await reply).toEqual({ id: 'k1', accept: true });
@@ -203,12 +308,17 @@ describe('the prompt dialog', () => {
     await desktop.prompt({ id: 'k3', host: 'build-box', kind: 'host_key', text: 'New key.' });
     await screen.findByRole('dialog', { name: "Check build-box's host key" });
     expect((within(dialog()).getByRole('button', { name: 'Accept' }) as HTMLButtonElement).disabled).toBe(true);
+
+    // Esc cancels the sign-in, as its button says: neither field.
+    reply = desktop.nextReply();
+    fireEvent.keyDown(dialog(), { key: 'Escape' });
+    expect(await reply).toEqual({ id: 'k3' });
   });
 
   it("answers ssh's other yes/no questions with Accept or Reject", async () => {
     await renderApp();
     await desktop.prompt({ id: 'c1', host: 'hpc-login', kind: 'confirm', text: 'Accept updated host keys? (yes/no)' });
-    await screen.findByRole('dialog', { name: 'hpc-login asks you to confirm' }, PATIENCE);
+    await screen.findByRole('dialog', { name: 'ssh asks about hpc-login' }, PATIENCE);
     expect(within(dialog()).getByTestId('prompt-text').textContent).toBe('Accept updated host keys? (yes/no)');
     expect(within(dialog()).queryByRole('textbox')).toBeNull();
     let reply = desktop.nextReply();
@@ -216,19 +326,27 @@ describe('the prompt dialog', () => {
     expect(await reply).toEqual({ id: 'c1', accept: false });
 
     await desktop.prompt({ id: 'c2', host: 'hpc-login', kind: 'confirm', text: 'Continue? (yes/no)' });
-    await screen.findByRole('dialog', { name: 'hpc-login asks you to confirm' });
+    await screen.findByRole('dialog', { name: 'ssh asks about hpc-login' });
     reply = desktop.nextReply();
     fireEvent.click(within(dialog()).getByRole('button', { name: 'Accept' }));
     expect(await reply).toEqual({ id: 'c2', accept: true });
   });
 
-  it('shows a notice until it is withdrawn, and Stop replies with neither', async () => {
+  it('shows a notice until it is withdrawn, and only Stop replies (Esc does nothing)', async () => {
     await renderApp();
     await desktop.prompt({ id: 'n1', host: 'hpc-login', kind: 'notice', text: 'Confirm user presence for key ED25519-SK' });
     await screen.findByRole('dialog', { name: 'hpc-login is waiting for you' }, PATIENCE);
     expect(within(dialog()).getByTestId('prompt-text').textContent).toBe('Confirm user presence for key ED25519-SK');
+    expect(within(dialog()).getByText('Information only: there is nothing to answer.')).toBeTruthy();
     expect(within(dialog()).queryByRole('textbox')).toBeNull();
     expect(within(dialog()).queryByRole('button', { name: 'Accept' })).toBeNull();
+    expect(within(dialog()).queryByRole('button', { name: 'Close' })).toBeNull();
+    expect(within(dialog()).queryByRole('button', { name: 'Cancel sign-in' })).toBeNull();
+    fireEvent.keyDown(dialog(), { key: 'Escape' });
+    fireEvent.pointerDown(document.body);
+    await new Promise((done) => setTimeout(done, 20));
+    expect(screen.getByTestId('gateway-prompt')).toBeTruthy();
+    expect(desktop.commands('gateway_prompt_reply')).toEqual([]);
     // ssh moved on: the gateway withdraws it, and nothing is sent.
     await desktop.closePrompt('n1');
     await vi.waitFor(() => expect(screen.queryByTestId('gateway-prompt')).toBeNull());
@@ -240,7 +358,7 @@ describe('the prompt dialog', () => {
     await screen.findByRole('dialog', { name: 'hpc-login is waiting for you' });
     expect(within(dialog()).queryByText(/more prompt/)).toBeNull();
     const reply = desktop.nextReply();
-    fireEvent.click(within(dialog()).getByRole('button', { name: 'Stop' }));
+    fireEvent.click(within(dialog()).getByRole('button', { name: 'Stop sign-in' }));
     expect(await reply).toEqual({ id: 'n2' });
     await vi.waitFor(() => expect(screen.queryByTestId('gateway-prompt')).toBeNull());
   });

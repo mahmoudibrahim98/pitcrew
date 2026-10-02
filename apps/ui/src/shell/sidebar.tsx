@@ -51,7 +51,8 @@ const RemoveWorkspaceDialog = lazy(() =>
 
 const SWITCHER_ID = 'shell-workspace-switcher';
 
-function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
+/** The workspace switcher: in the sidebar, and on the bare setup page in the desktop app. */
+export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
   const router = useRouter();
   const ws = useWorkspaceId();
   const workspace = useWorkspace().data?.workspace;
@@ -68,8 +69,8 @@ function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
   const current = desktop?.list?.find((w) => w.id === ws);
   const removable = remote !== null && current?.kind === 'remote' ? current : undefined;
   const closeRemove = () => {
+    removingRef.current = false;
     setRemoving(null);
-    document.getElementById(SWITCHER_ID)?.focus();
   };
   return (
     <>
@@ -137,10 +138,9 @@ function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
           <RemoveWorkspaceDialog
             workspace={removing}
             remote={remote}
-            onClose={() => {
-              removingRef.current = false;
-              closeRemove();
-            }}
+            onClose={closeRemove}
+            // The dialog has no trigger of its own (the menu item is gone by then): back to the switcher.
+            returnFocus={() => document.getElementById(SWITCHER_ID)?.focus()}
           />
         </Suspense>
       )}
