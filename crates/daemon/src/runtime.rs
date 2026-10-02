@@ -254,6 +254,8 @@ fn installed(ptyd: &Path) -> bool {
 struct Plan {
     tmux: TmuxOptions,
     /// The tmux socket is the state directory's own, so its per-user directory may be made.
+    /// Read only on Unix, where tmux runs.
+    #[cfg_attr(not(unix), allow(dead_code))]
     own_socket: bool,
     pty: PtyOptions,
     /// ptyd's endpoint is the state directory's own, so its per-user directory may be made.
