@@ -575,8 +575,8 @@ fn stop_is_prompt_during_a_long_backfill() {
             transcript_ref(&path)
         })
         .collect();
-    // 100 transcripts at 30 ms a read: a 3 s backfill.
-    let source = Arc::new(LoggedFake::new(refs, Vec::new()).delay(Duration::from_millis(30)));
+    // 100 transcripts at 100 ms a read: a 10 s backfill.
+    let source = Arc::new(LoggedFake::new(refs, Vec::new()).delay(Duration::from_millis(100)));
     let sink = Arc::new(CollectSink::default());
     let runner = pitcrew_runner::start(
         config(home.path(), state.path()),
@@ -593,7 +593,10 @@ fn stop_is_prompt_during_a_long_backfill() {
         "stop during backfill took {took:?} after {} of 100 reads",
         source.reads().len()
     );
-    assert!(took < Duration::from_millis(500), "{took:?}");
+    // A stop waits for the read in progress and the batch being saved, never the backfill. The
+    // margin is wide (on Windows CI the first save, which creates the store's WAL files, has
+    // taken a second), and still far below the backfill's 10 s.
+    assert!(took < Duration::from_secs(2), "{took:?}");
     assert!(source.reads().len() < 100);
 }
 
