@@ -347,8 +347,11 @@ pub(crate) struct Watcher {
     last_rediscover: Option<Instant>,
     /// Workstream locations, to link sessions to.
     locations: Option<Arc<dyn Locations>>,
-    /// The CLI's session id → tracked transcript.
+    /// The CLI's session id → tracked transcript, for sessions; sub-agents have their own map,
+    /// looked up after it (see `map_native`).
     by_native: HashMap<(Engine, String), u64>,
+    /// A sub-agent's CLI id → tracked transcript.
+    by_sub_native: HashMap<(Engine, String), u64>,
     by_session: HashMap<SessionId, u64>,
     /// Hooks for sessions not indexed yet.
     held: Held,
@@ -450,6 +453,7 @@ impl Watcher {
             last_rediscover: None,
             locations: s.locations,
             by_native: HashMap::new(),
+            by_sub_native: HashMap::new(),
             by_session: HashMap::new(),
             held: Held::default(),
             agents: s.agents,
@@ -848,8 +852,15 @@ impl Watcher {
             .insert((row.path.clone(), row.inner_id.clone()), id);
         self.by_path.entry(row.path.clone()).or_default().push(id);
         self.by_session.insert(row.session, id);
-        if row.meta.is_some() {
-            self.by_native.insert((row.engine, native_id(&row)), id);
+        if let Some(meta) = &row.meta {
+            self.map_native(
+                id,
+                row.session,
+                row.engine,
+                &native_id(&row),
+                meta.is_subagent,
+                true,
+            );
         }
         self.watched.insert(
             row.session,
@@ -895,6 +906,7 @@ impl Watcher {
         }
         self.by_raw.retain(|_, i| *i != id);
         self.by_native.retain(|_, i| *i != id);
+        self.by_sub_native.retain(|_, i| *i != id);
         self.by_session.remove(&row.session);
         self.watched.remove(row.session);
         for d in &t.watched {
@@ -1166,9 +1178,7 @@ impl Watcher {
         let home = t.home;
         let subagent = t.row.meta.as_ref().is_some_and(|m| m.is_subagent);
         let started = t.row.meta.as_ref().and_then(|m| m.started);
-        if !native.is_empty() {
-            self.by_native.insert((engine, native.clone()), id);
-        }
+        self.map_native(id, session, engine, &native, subagent, first);
 
         // Facts from elsewhere: the parent of a sub-agent, the terminal the runner started the
         // session in, hooks that came before the transcript, and workstream locations.
@@ -1283,9 +1293,7 @@ impl Watcher {
     fn apply_reports(&mut self, reports: Vec<Signal>) -> Result<(), Hangup> {
         for s in reports {
             let id = match &s.target {
-                Target::Native { engine, native_id } => {
-                    self.by_native.get(&(*engine, native_id.clone())).copied()
-                }
+                Target::Native { engine, native_id } => self.find_native(*engine, native_id),
                 Target::Session(session) => self.by_session.get(session).copied(),
             };
             let indexed = id.and_then(|id| {
@@ -1436,6 +1444,57 @@ impl Watcher {
                 commit: Commit::Full(Box::new(t.row.clone())),
             })
             .map_err(|_| Hangup)
+    }
+
+    /// Maps tracked transcript `id` (session `session`) by its CLI id, for the hooks that name
+    /// it. Sessions and sub-agents have separate maps, and a hook is matched to a session first:
+    /// a sub-agent whose id equals a session's (its `agentId` is whatever its transcript says)
+    /// never takes that session's hooks, whichever of the two was found first.
+    ///
+    /// Among sessions the last one found takes an id, as before (one session seen in two homes).
+    /// Among sub-agents the one indexed first keeps it, by its session id, so the same one after
+    /// a restart too (which finds the newest first); a later one is refused it (`loud`: said as
+    /// a warning).
+    fn map_native(
+        &mut self,
+        id: u64,
+        session: SessionId,
+        engine: Engine,
+        native: &str,
+        subagent: bool,
+        loud: bool,
+    ) {
+        if native.is_empty() {
+            return;
+        }
+        let key = (engine, native.to_owned());
+        if !subagent {
+            self.by_native.insert(key, id);
+            return;
+        }
+        let holder = match self.by_sub_native.get(&key) {
+            None => None,
+            Some(&held) if held == id => return,
+            Some(held) => self.tracked.get(held).map(|t| t.row.session),
+        };
+        if holder.is_some_and(|first| first < session) {
+            if loud {
+                tracing::warn!(engine = ?engine, id = native, %session, "two sub-agents name the same id; its hooks go to the one indexed first");
+            } else {
+                tracing::debug!(engine = ?engine, id = native, %session, "two sub-agents name the same id; its hooks go to the one indexed first");
+            }
+            return;
+        }
+        self.by_sub_native.insert(key, id);
+    }
+
+    /// The tracked transcript a hook's CLI id names: a session's before a sub-agent's.
+    fn find_native(&self, engine: Engine, native: &str) -> Option<u64> {
+        let key = (engine, native.to_owned());
+        self.by_native
+            .get(&key)
+            .or_else(|| self.by_sub_native.get(&key))
+            .copied()
     }
 
     /// Holds a hook for a session whose transcript is not indexed yet (see `held`), and looks

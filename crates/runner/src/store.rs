@@ -299,7 +299,8 @@ impl Store {
         Ok(())
     }
 
-    /// The session whose transcript names itself `native_id`, if one is indexed.
+    /// The session whose transcript names itself `native_id`, if one is indexed. Sub-agents are
+    /// not sessions one resumes: one named like a session is never taken for it.
     pub fn session_by_native(
         &self,
         engine: Engine,
@@ -310,6 +311,7 @@ impl Store {
             .query_row(
                 "SELECT session_id FROM transcripts
                  WHERE engine = ?1 AND json_extract(meta, '$.native_id') = ?2
+                   AND NOT COALESCE(json_extract(meta, '$.is_subagent'), 0)
                  ORDER BY mtime DESC LIMIT 1",
                 params![engine_text(engine)?, native_id],
                 |r| r.get(0),
@@ -731,6 +733,35 @@ mod tests {
             meta: None,
             facts: Facts::default(),
         }
+    }
+
+    /// A sub-agent named like a session, even a newer one, is never the session to resume.
+    #[test]
+    fn a_sub_agent_named_like_a_session_is_not_that_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open");
+        let saved = |path: &str, mtime: TimestampMs, is_subagent: bool| {
+            let mut r = row(path);
+            r.mtime = mtime;
+            r.meta = Some(SessionMeta {
+                native_id: "n".into(),
+                is_subagent,
+                ..SessionMeta::default()
+            });
+            store.insert(&r).expect("insert");
+            store
+                .commit(&Commit::Full(Box::new(r.clone())))
+                .expect("full");
+            r.session
+        };
+        let session = saved("/t/n.jsonl", 1, false);
+        saved("/t/s/subagents/n.jsonl", 2, true);
+        assert_eq!(
+            store
+                .session_by_native(Engine::Claude, "n")
+                .expect("native"),
+            Some(session)
+        );
     }
 
     #[test]

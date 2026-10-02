@@ -47,6 +47,12 @@ reports it:
 - **Codex and OpenCode sub-agents have no parent yet**: their transcripts do not name one the
   runner reads. They are judged by their own answer alone, which today is `NoAgent`: any person's
   hook can change them, and no agent's.
+- **Which session a hook names.** A hook names the CLI's own id; a sub-agent's is whatever its
+  transcript says (`agentId`). Sessions and sub-agents are looked up apart, sessions first: a
+  sub-agent named like a session never takes that session's hooks, whichever is found first.
+  Of two sub-agents with one id, the one indexed first keeps it (by its session id, so after a
+  restart too); the other is refused it, with a warning. Among sessions, the last transcript
+  found takes an id, as before. A resumed session is never matched to a sub-agent either.
 - Codex's `notify` follows the same rule.
 
 The sender travels from `HookSink::deliver` to where the session is resolved as an explicit

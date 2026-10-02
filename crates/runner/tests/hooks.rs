@@ -749,7 +749,13 @@ fn a_hook_for_an_unknown_session_looks_in_local_homes_but_not_network_ones() {
 /// Writes the transcript of Claude sub-agent `agent_id`, started by the fixture's session in
 /// `home`, whole (see `common::place`).
 fn place_sub_agent(home: &Path, agent_id: &str) {
-    let dir = claude_file(home, FIXTURE_ID)
+    place_sub_agent_of(home, FIXTURE_ID, agent_id, agent_id);
+}
+
+/// Writes `<session>/subagents/<file>.jsonl` in `home`, whole: a sub-agent whose records name it
+/// `agent_id`.
+fn place_sub_agent_of(home: &Path, session: &str, file: &str, agent_id: &str) {
+    let dir = claude_file(home, session)
         .with_extension("")
         .join("subagents");
     std::fs::create_dir_all(&dir).unwrap();
@@ -759,7 +765,7 @@ fn place_sub_agent(home: &Path, agent_id: &str) {
             r#""isSidechain":false"#,
             &format!(r#""isSidechain":true,"agentId":"{agent_id}""#),
         );
-    common::place(&dir.join(format!("{agent_id}.jsonl")), lines.as_bytes());
+    common::place(&dir.join(format!("{file}.jsonl")), lines.as_bytes());
 }
 
 /// Delivers a hook that applies, and waits for its event: every hook delivered before it has
@@ -881,6 +887,109 @@ fn a_sub_agents_hooks_are_judged_by_its_parents_agent() {
     let events = sink.events();
     assert_eq!(labels(&events), ["state:Idle"]);
     assert_eq!(session_of(&events[0]), Some(a2.id));
+}
+
+/// Every discovered session whose CLI id is `native`, in the order discovered.
+fn all_discovered_as(events: &[Event], native: &str) -> Vec<SessionId> {
+    events
+        .iter()
+        .filter_map(|e| match &e.body {
+            EventBody::SessionDiscovered { session } if session.native_id == native => {
+                Some(session.id)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A sub-agent's id is whatever its transcript says. One named like a session never takes that
+/// session's hooks, whether it is found after the session or, after a restart (newest first),
+/// before it. Of two sub-agents with one id, the one indexed first keeps it, after a restart too.
+#[test]
+fn a_sub_agent_named_like_a_session_never_takes_its_native_id() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    std::fs::write(
+        claude_file(home.path(), FIXTURE_ID),
+        fixture_lines()[..5].concat(),
+    )
+    .unwrap();
+    // Nobody runs as an agent: a person's hook applies wherever it lands.
+    let (runner, sink) = start(
+        home.path(),
+        state.path(),
+        Some(Arc::new(MemoryAgents::new())),
+    );
+    sink.wait_for(3, CEILING).expect("the session's discovery");
+    let other = |n: u8| format!("eeeeeeee-0000-4000-8000-00000000000{n}");
+    // Found after it: a sub-agent that names itself the session.
+    place_sub_agent_of(home.path(), &other(1), "agent-e1", FIXTURE_ID);
+    runner.rescan();
+    sink.wait_for(5, CEILING)
+        .expect("the look-alike's discovery");
+    // Two sub-agents with one id, found one after the other.
+    place_sub_agent_of(home.path(), &other(2), "agent-e2", "agent-dup");
+    runner.rescan();
+    sink.wait_for(7, CEILING).expect("the first sub-agent");
+    place_sub_agent_of(home.path(), &other(3), "agent-e3", "agent-dup");
+    runner.rescan();
+    sink.wait_for(9, CEILING).expect("the second sub-agent");
+    let events = sink.events();
+    let [main, look_alike] = all_discovered_as(&events, FIXTURE_ID)[..] else {
+        panic!("{:?}", labels(&events));
+    };
+    let [first, second] = all_discovered_as(&events, "agent-dup")[..] else {
+        panic!("{:?}", labels(&events));
+    };
+    assert!(first < second);
+
+    let me = person();
+    let hooks = runner.hooks();
+    let n = sink.len();
+    let at = now_ms() + 10;
+    settle(&hooks, &sink, hook(&me, "Stop", FIXTURE_ID, at));
+    settle(&hooks, &sink, hook(&me, "Stop", "agent-dup", at + 1));
+    runner.stop();
+    let events = sink.events();
+    assert_eq!(
+        events[n..].iter().map(session_of).collect::<Vec<_>>(),
+        [Some(main), Some(first)],
+        "{:?}",
+        labels(&events[n..])
+    );
+
+    // After a restart, the look-alike and the second sub-agent are found first (they are
+    // newer): the ids still go to the session and to the first sub-agent.
+    let (runner, sink) = start(
+        home.path(),
+        state.path(),
+        Some(Arc::new(MemoryAgents::new())),
+    );
+    let hooks = runner.hooks();
+    let at = now_ms() + 20;
+    settle(
+        &hooks,
+        &sink,
+        asks(&me, FIXTURE_ID, "The session waits", at),
+    );
+    settle(
+        &hooks,
+        &sink,
+        asks(&me, "agent-dup", "The first waits", at + 1),
+    );
+    runner.stop();
+    let events = sink.events();
+    assert_eq!(
+        events.iter().map(session_of).collect::<Vec<_>>(),
+        [Some(main), Some(first)],
+        "{:?}",
+        labels(&events)
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| { session_of(e) == Some(look_alike) || session_of(e) == Some(second) })
+    );
 }
 
 /// `MemoryAgents`, except that the lookup panics for the sessions in `panics`.
