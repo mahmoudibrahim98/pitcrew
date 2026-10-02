@@ -13,7 +13,8 @@ every review that finds a security issue, updates it.
 - **Updated:** 2026-10-02 by `integrator/hardening-sweep`: R10's residuals, R24 and R25 to R33
   are fixed on `main` and marked so, with every regression input renamed to must-pass; one set
   of hidden characters (`pitcrew_protocol::text::is_hidden`, T55, T66); transcripts are read only
-  as regular files, not through a link put in their place (T69); the fuzzing notes in §8.
+  as regular files, not through a link put in their place (T69); a new low finding, R34 (R26's
+  residual in `check_sbatch_option`); the fuzzing notes and a run in §8.
 - **Status:** **In place** (on `main`, with a test) · **Partial** (some of it on `main`) ·
   **Planned** (in an open branch, not on `main`) · **Open** (a gap: the owner must act; listed
   again in [Open items](#7-open-items)).
@@ -231,7 +232,7 @@ SLURM cases of `tests/deploy.rs` run against fake `sbatch`, `squeue`, `scancel` 
 
 | Id | Threat | Control | Where | Tested by | Owner | Status |
 |---|---|---|---|---|---|---|
-| T51 | **The job script changes** between the desktop and `sbatch` (another user, a race, a cut upload), or its options change which job runs | `JobSpec::render` makes the only `JobScript`; the user sees its text before it is submitted. The launcher sends its length, **sha256** (`JobScript::sha256`) and job name as arguments and the text on stdin. `pc_slurm_submit` writes it under the private root (`umask 077`, noclobber) while holding the launch lock, and checks the byte count, the first two lines, the last line and the sha256 before `sbatch` (failing with `job_script`). The job name, working directory and output are also on `sbatch`'s command line, where nothing overrides them. Extra `#SBATCH` lines must pass an allowlist (`check_sbatch_option`: long options from `ALLOWED_SBATCH`, values of 1 to 256 letters, digits and `_ . , : = + / @ % & [ ] ( ) * -` or a pipe, never starting with `-`; flags alone only from `SBATCH_FLAGS`); `render` refuses `hetjob` and `packjob` anywhere in a directive, and `JobOptions::check` refuses them in any value, so a recipe holding them does not load. On the node, `job.sh` starts only if `run/slurm.json` names its own `SLURM_JOB_ID`. | `slurm/spec.rs` (`JobSpec::render`, `JobScript::sha256`, `check_sbatch_option`, `check_no_hetjob`), `slurm/mod.rs` (`SlurmLauncher::submit_and_wait`), `helper.sh` (`pc_slurm_submit`), `slurm/job.sh` | `tests/deploy.rs` `slurm_scripts_arrive_whole_or_not_at_all`, `slurm_jobs_check_where_they_run`, `slurm_recipes_add_lines_and_modules`; `spec.rs` `options_are_checked`, `hetjob_words_are_refused_anywhere`, `values_that_start_with_a_dash_are_refused`, `the_longest_wall_times_print`, `scripts_match_their_snapshots`; `site.rs` `recipes_with_hetjob_words_do_not_load`; fuzz `remote_slurm`, `remote_site` | J | In place: findings R25 and R27 are fixed (§6). |
+| T51 | **The job script changes** between the desktop and `sbatch` (another user, a race, a cut upload), or its options change which job runs | `JobSpec::render` makes the only `JobScript`; the user sees its text before it is submitted. The launcher sends its length, **sha256** (`JobScript::sha256`) and job name as arguments and the text on stdin. `pc_slurm_submit` writes it under the private root (`umask 077`, noclobber) while holding the launch lock, and checks the byte count, the first two lines, the last line and the sha256 before `sbatch` (failing with `job_script`). The job name, working directory and output are also on `sbatch`'s command line, where nothing overrides them. Extra `#SBATCH` lines must pass an allowlist (`check_sbatch_option`: long options from `ALLOWED_SBATCH`, values of 1 to 256 letters, digits and `_ . , : = + / @ % & [ ] ( ) * -` or a pipe, never starting with `-`; flags alone only from `SBATCH_FLAGS`); `render` refuses `hetjob` and `packjob` anywhere in a directive, and `JobOptions::check` refuses them in any value, so a recipe holding them does not load. On the node, `job.sh` starts only if `run/slurm.json` names its own `SLURM_JOB_ID`. | `slurm/spec.rs` (`JobSpec::render`, `JobScript::sha256`, `check_sbatch_option`, `check_no_hetjob`), `slurm/mod.rs` (`SlurmLauncher::submit_and_wait`), `helper.sh` (`pc_slurm_submit`), `slurm/job.sh` | `tests/deploy.rs` `slurm_scripts_arrive_whole_or_not_at_all`, `slurm_jobs_check_where_they_run`, `slurm_recipes_add_lines_and_modules`; `spec.rs` `options_are_checked`, `hetjob_words_are_refused_anywhere`, `values_that_start_with_a_dash_are_refused`, `the_longest_wall_times_print`, `scripts_match_their_snapshots`; `site.rs` `recipes_with_hetjob_words_do_not_load`; fuzz `remote_slurm`, `remote_site` | J | In place: findings R25 and R27 are fixed (§6). Open: `check_sbatch_option` alone still accepts `hetjob` and `packjob` in a value (R34, fails closed). |
 | T52 | **PitCrew cancels or reads someone else's job** | A job is ours only while `squeue -j` reports this user's uid **and** the job name PitCrew recorded (`pc_queue`; a job listed twice is an error); any other is `JobState::NotOurs` and is only forgotten. `scancel` runs only for ours that has not ended, with `--user` and `--name` as well as the id (`pc_slurm_stop`), so a reused id names no one else's job. `sacct` is asked with `-j`, `--name` and `-u` (`pc_acct`). `SBATCH_*`, `SQUEUE_*`, `SCANCEL_*`, `SACCT_*` and `SLURM_CLUSTERS` are unset first; a named cluster is passed with `-M`. | `helper.sh` (`pc_queue`, `pc_slurm_stop`, `pc_acct`, `pc_slurm_env`), `slurm/mod.rs` (`JobState::NotOurs`, `parse_status`) | `tests/deploy.rs` `slurm_never_touches_other_jobs`, `slurm_jobs_on_a_named_cluster`; `mod.rs` `statuses_are_read` | J | In place |
 | T53 | Another user on the compute node reaches the helper's socket | The socket is in `<root>/run/` or, node-local, in `${TMPDIR:-/tmp}/pitcrew-<job>.<pid>/`, created 0700 (`pc_private`) after `pc_safe_way`; paths over 100 bytes are refused. The daemon still checks every peer (T1). | `slurm/job.sh` | `tests/deploy.rs` `slurm_socket_on_node_local_tmpdir` | J | In place. How the desktop reaches the node (a tunnel, `srun --overlap`) is on `s/J/tunnel`. |
 | T54 | **A site recipe runs code on the cluster** | Recipes are trusted like a script the user runs: the built-in `generic()`, or the user's own `~/.pitcrew/sites/*.toml` on the laptop, read strictly (only `SITE_KEYS`, each of its type; 64 KiB at most; every value checked as `JobSpec::new` checks it). `modules_init` is a path `job.sh` sources (after the same owner and mode checks as the root), so a recipe can run anything as the user on the cluster, by design. | `slurm/site.rs` (`Site::from_toml`, `Site::check`, `load_sites`); module docs and the crate README | `site.rs` `recipes_are_read_strictly`, `the_example_recipe_reads`, `recipe_files_are_found_and_reported`; fuzz `remote_site` | J | In place. A recipe copied from elsewhere is code: the docs say so; the UI must too (O27). Finding R26 is fixed (§6). Residual: ACLs on the way to `modules_init` are not checked, only owners and mode bits (the crate README). |
@@ -276,8 +277,7 @@ to R33 come from stream Q's fuzzing and review; R11 to R23 are the findings the 
 their review follow-ups and the crate READMEs record. Every one of R7 to R10 (its residuals
 included) and R25 to R33 has an input in `fuzz/regressions/<target>/` that must pass its target
 (the nightly workflow fails if one regresses); R24 is checked by `cli_hooks` on every input. An
-input for a finding not fixed yet would be named `open-*` there and fail until it is; there is
-none now.
+input for a finding not fixed yet is named `open-*` there and fails until it is: R34's now.
 
 | Id | Finding | Fix | Where | Tested by | Owner | Status |
 |---|---|---|---|---|---|---|
@@ -314,6 +314,7 @@ none now.
 | R31 | Low. **Empty path segments count as under the API base**: `path_is_under` drops empty segments before comparing, so for the base `/api/v3` a `next` link to `/api//v3/…` or `//api/v3/…` is followed with the token. Servers that merge slashes treat it as `/api/v3/…`; a proxy that routes by the raw prefix may not, and the request leaves the API as R9's did. | The parsed segments are compared as they are: an empty segment counts. | `crates/sync-github/src/origin.rs` (`path_is_under`, `trusted_next_url`) | `origin.rs` `r31_an_empty_segment_in_the_middle_of_the_next_links_path_is_not_under_the_api_base`, `r31_a_leading_empty_segment_in_the_next_links_path_is_not_under_the_api_base`; fuzz `github_links`, which now calls `trusted_next_url` directly (`r31-empty-segment-in-next-link`, `r31-leading-empty-segment-in-next-link` pass) | G | Fixed on `main` (`s/G/fuzz-findings`) |
 | R32 | Low. A closing reference to repository `.` (`Fixes example-org/.#1`) passes `is_valid_repo_component` (only `..` is refused), and its link `https://github.com/example-org/./issues/1` resolves to `https://github.com/example-org/issues/1`, another page than the key says. The host stays `github.com`. | `.` is refused as well as `..` (GitHub allows neither as a name). | `crates/sync-github/src/links.rs` (`is_valid_repo_component`) | `links.rs` `r32_a_dot_owner_or_repo_is_rejected`; fuzz `github_links` (`r32-dot-repo-in-closing-reference` passes) | G | Fixed on `main` (`s/G/fuzz-findings`) |
 | R33 | Medium. **Recaps keep hidden text**: the recap engine's `is_hidden` lacks the Unicode tag characters (U+E0000–E007F), U+00AD and U+180E, and `clean_tail` (file paths) keeps U+2028 and U+2029, so a task title, comment or file path from an agent can carry text a person does not see into lines, paragraphs and the recap routes, where other agents read it. sync-github's set already has them. | The engine's set was made the same as sync-github's (`s/F/recap-hardening`); since `integrator/hardening-sweep` the engine, the syncs and the CLI share one set, `pitcrew_protocol::text::is_hidden`, a superset of both (T55, T66). | `crates/recap/src/text.rs` (`clean`, `clean_tail`), `crates/protocol/src/text.rs` (`is_hidden`) | `text.rs` `tag_characters_and_other_invisibles_are_dropped`, `the_hidden_set_is_pinned`; fuzz `recap_index` (`r33-hidden-characters-in-recaps` passes; the target checks hidden characters with no exception) | F, 0 | Fixed on `main` (`s/F/recap-hardening`), closing O40 |
+| R34 | Low. R26's residual: `check_sbatch_option` still accepts an option whose value holds `hetjob` or `packjob` (`--comment=a-hetjob-b`), while `JobOptions::check`, and so `JobSpec::new` and `Site::check`, refuses it. It fails closed (no job is submitted, and a recipe holding it does not load), but a caller that checks one option alone, as the public function invites, is told it is fine. Found by `remote_slurm` on its own seed once R26's fix merged. | Call `check_no_hetjob` in `check_sbatch_option` too, as R26's fix said. | `crates/remote/src/helper/slurm/spec.rs` (`check_sbatch_option`, `check_no_hetjob`) | fuzz `remote_slurm` (`open-r34-hetjob-word-passes-the-option-check`: mode 3, `--comment=a-hetjob-b`) | J | Open (O42) |
 
 ## 7. Open items
 
@@ -360,6 +361,7 @@ none now.
 | O39 | Closed: R28 to R32 are fixed in the tracker clients and link checks. | G |
 | O40 | Closed: `s/F/recap-hardening` (R33) is merged, and `recap_index` checks hidden characters with no exception. | F, Q |
 | O41 | A seam for fuzzing the desktop gateway's path check: move `src/gateway/path.rs` (with `error.rs`, which needs only `serde`) into a small crate the gateway depends on, so `fuzz/` can depend on it without Tauri. Property: an accepted path, decoded as the daemon decodes it, stays under `/v1/` with no dot segment. | K, Q |
+| O42 | Fix R34: `check_sbatch_option` refuses `hetjob` and `packjob` in a value, as `JobOptions::check` does; then rename `fuzz/regressions/remote_slurm/open-r34-*` without `open-` and drop the target's R34 relaxation. | J, Q |
 
 ## 8. Fuzzing
 
@@ -386,10 +388,9 @@ test in the owning stream's crate.
   (about twice as fast as a disk), else the temporary folder. `remote_ssh_config` skips inputs
   whose `Include` could reach outside its scratch home, so a run never reads the machine's files.
 - Known findings fail their target until they are fixed. `PITCREW_FUZZ_SKIP_KNOWN=1` relaxes the
-  checks for findings that are reported but open, so a run can look past them; **none is open
-  now**, so it relaxes nothing (the switch, `pitcrew_fuzz::skip_known`, stays for the next one).
-  The fixed findings' inputs (R7 to R10, R10's residuals, R25 to R33) are kept in
-  `fuzz/regressions/` and must pass; an open finding's input is named `open-*` there.
+  checks for findings that are reported but open, so a run can look past them: R34 now
+  (`remote_slurm`). The fixed findings' inputs (R7 to R10, R10's residuals, R25 to R33) are kept
+  in `fuzz/regressions/` and must pass; an open finding's input is named `open-*` there.
 
 ### 8.1 Targets
 
@@ -430,7 +431,24 @@ written independently of `crates/remote`'s own test-only ones; `fuzz/src/url_mod
 WHATWG URL model; `fuzz/src/slurm.rs` the job-script checks `remote_slurm` and `remote_site`
 share.
 
-**Last local run** (2026-10-01, `main` at `65c6418`, 60 s per target, one at a time, with
+**Last local run** (2026-10-02, `integrator/hardening-sweep` on `main` at `85b091c`, 60 s per
+target, one at a time, `cargo fuzz`'s default build (optimised, with debug assertions), with
+`PITCREW_FUZZ_SKIP_KNOWN=1` as the nightly run sets it, seeded by `fuzz/seed.py` and the
+dictionaries the nightly run uses, WSL on a shared machine, so the rates are noisy). The eight
+targets whose checks changed; the other eighteen were checked (`cargo fuzz check`), not run:
+
+| Target | Executions | exec/s | Result |
+|---|---|---|---|
+| `cli_hooks` | 3,864 | 227 | An OpenCode plugin file starting with our marker and followed by bytes that are not UTF-8 was replaced by `install`, and the target called it not ours. The installer reads the file lossily and owns any file that starts with its marker, by design: a gap in the target's model, which now reads it lossily too (not a finding). Run again: 10,781 executions, 176 exec/s, no failure; the Codex BOM case is checked byte for byte. |
+| `github_links` | 50,654 | 830 | no failure (`trusted_next_url` called directly; no relaxation left) |
+| `github_sync` | 99,392 | 1,629 | no failure |
+| `jira_adf` | 1,589 | 25 | no failure, every document within 250 ms with no relaxation |
+| `jira_sync` | 70,280 | 1,152 | no failure |
+| `recap_index` | 15,856 | 259 | no failure, hidden characters checked with no exception (the shared set) |
+| `remote_site` | 167,997 | 2,754 | no failure (a recipe that loads must render) |
+| `remote_slurm` | 48 | 0 | Its own seed `--comment=a-hetjob-b` failed at once: `check_sbatch_option` accepts it, `JobSpec::new` refuses it. A residual of R26's fix: **R34** (§6), with an `open-*` input and a relaxation. Run again: 194,588 executions, 3,189 exec/s, no failure. |
+
+**Previous run** (2026-10-01, `main` at `65c6418`, 60 s per target, one at a time, with
 `PITCREW_FUZZ_SKIP_KNOWN=1` as the nightly run sets it, WSL on a shared 14-core machine with other
 agents' builds running, so the rates are low and noisy; the corpus copied to the Linux side). The
 seven new targets, and the three whose checks changed; the other sixteen were rebuilt, not run:
@@ -452,8 +470,8 @@ seven new targets, and the three whose checks changed; the other sixteen were re
 `cargo +nightly fuzz run <target> fuzz/regressions/<target>/<file>`. On 2026-10-01 the inputs for
 R25 to R33 and R10's residuals were named `open-*` and each failed with its finding; on 2026-10-02
 (`integrator/hardening-sweep`) each passed, without the relaxations, and was renamed without
-`open-`, so the nightly "Fixed findings stay fixed" step (§8.3) runs them. No `open-*` input is
-left.
+`open-`, so the nightly "Fixed findings stay fixed" step (§8.3) runs them. The one `open-*` input
+now is R34's, found by the same day's run (below).
 
 Fixed, must pass:
 
@@ -494,6 +512,11 @@ Fixed, must pass:
 
 R24 has no file there: `cli_hooks` checks the round trip on every input, and its seed `codex-08`
 is the BOM case.
+
+Open, fails until fixed (`open-*`):
+
+- R34, `remote_slurm/open-r34-hetjob-word-passes-the-option-check`: mode 3,
+  `--comment=a-hetjob-b`: `check_sbatch_option` accepts it, `JobSpec::new` refuses it.
 
 The seeds are 457 files, 342 KiB in all.
 
@@ -539,12 +562,12 @@ The seeds are 457 files, 342 KiB in all.
 `.github/workflows/fuzz.yml` (stream 0) runs every night. One job builds every target once and
 shares the binaries through a cache entry for that run; the matrix comes from `cargo fuzz list`,
 so the seven new targets run without a change to the workflow (O32 is closed). Each target is
-seeded, fuzzed for 5 minutes with `PITCREW_FUZZ_SKIP_KNOWN=1` (which relaxes nothing while no
-finding is open) and its dictionary (`jira_*` take `jira.dict`, `api_recaps` `api.dict`), and its
-corpus minimised and cached. Then `fuzz/regressions/<target>/*` runs without the relaxation in two
-groups: "Fixed findings stay fixed" runs every input not named `open-*` and fails the job if one
-fails (R7 to R10, R10's residuals and R25 to R33 now); a report-only step runs the `open-*` inputs
-(none now). Crash inputs are uploaded; `cargo deny` checks the fuzz workspace. O36 is closed.
+seeded, fuzzed for 5 minutes with `PITCREW_FUZZ_SKIP_KNOWN=1` and its dictionary (`jira_*` take
+`jira.dict`, `api_recaps` `api.dict`), and its corpus minimised and cached. Then
+`fuzz/regressions/<target>/*` runs without the relaxation in two groups: "Fixed findings stay
+fixed" runs every input not named `open-*` and fails the job if one fails (R7 to R10, R10's
+residuals and R25 to R33 now); a report-only step runs the `open-*` inputs (R34's now). Crash
+inputs are uploaded; `cargo deny` checks the fuzz workspace. O36 is closed.
 
 With 26 targets the matrix is 26 jobs of about 6 minutes each: two waves under GitHub's 20
 concurrent jobs, well inside each job's 30-minute timeout.
@@ -593,7 +616,7 @@ The plan's security table and the ADRs' security commitments (ADR-0003, ADR-0006
 | No listening TCP ports on shared machines (ADR-0006, `SECURITY.md`) | T1, T4 |
 | Authors stamped by the daemon (ADR-0006, `SECURITY.md`) | T10, T49 |
 | The remote helper needs no root and no internet, and is checksummed (ADR-0009, `SECURITY.md`) | T33 |
-| Batch jobs: the script that runs is the one sent; other users' jobs are never touched (ADR-0009) | T51–T54, T62, T63, R25–R27 |
+| Batch jobs: the script that runs is the one sent; other users' jobs are never touched (ADR-0009) | T51–T54, T62, T63, R25–R27, R34 |
 | The terminal: hostile output stays in the terminal; input is bounded | T46–T48, R13 |
 | Trackers: credentials stay with their host; upstream text is untrusted; no write without the person | T55–T58, T64, T65, R8–R10, R21, R28–R32, O8 |
 | The back office acts only within its rules, and the hub checks them | T49, T50, R17 |
