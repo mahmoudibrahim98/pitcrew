@@ -464,11 +464,14 @@ would go the same way (the runtime's README: call it from a blocking thread).
   refused by the runner (`400`), and so is a session id or model that could be read as an option.
 - **`cwd`**: absolute, at most 4096 bytes, an existing folder; resolved once by the daemon (links
   and `..`), and the CLI starts in the resolved folder. On Unix it and every folder above it must
-  belong to root or this user, and none may be writable by other users (group or world), except a
-  sticky folder above it (as `/tmp`): someone else who can write there could plant files the CLI
-  reads as its project's (settings, hooks, instructions) or swap the folder. Refused is `400`,
-  saying which folder. So a group-writable project folder is refused, and so is anything on a
-  Windows drive mounted in WSL without metadata (`/mnt/c`, mode 777).
+  belong to root or this user, and none may be writable by every user (o+w), except a sticky
+  folder above it (as `/tmp`): anyone who can write there could plant files the CLI reads as its
+  project's (settings, hooks, instructions) or swap the folder. Refused is `400`, saying which
+  folder. Anything on a Windows drive mounted in WSL without metadata (`/mnt/c`, mode 777) is
+  refused too, with no exception. **Group-writable folders are allowed** (a project shared with a
+  group, as on a cluster), the folder itself or any above it; a start in one is logged at info (`a
+  session starts in a folder that members of its group can change`), naming them, since the
+  group's members can change what the CLI reads there.
 - **Who may.** A person may command a session with no agent, or one whose agent they own; a
   session of another person's agent, or of an agent the hub does not know, is `403`. It is the
   runner's rule for hooks (its README), asked of the hub's tables (`HubAgents`).
@@ -660,9 +663,13 @@ allow for the back office appending after a write (the demo's asks are old by th
 - on Unix, SIGTERM: `the runner stopped` and `the back office stopped` before `store closed`; a
   restart with lines written meanwhile keeps the session's id, adds the rest, and stores nothing
   twice;
-- on Unix, a stop with a read that never returns (the transcript swapped for a FIFO no one writes,
-  which both the watcher and a transcript request then open): the daemon still exits cleanly, in
-  about 18 seconds, logging the runner, the read and the store it left behind.
+- on Unix, a stop with a read that does not return for minutes (the transcript grown by a
+  terabyte with no line break, a sparse file that takes no disk blocks, which both the watcher and
+  a transcript request then read to the end of its line): the daemon still exits cleanly, within
+  30 seconds, logging the runner, the work on the blocking pool and the store it left behind;
+- on Unix, a transcript swapped for a named pipe is refused as soon as it is opened (`is a named
+  pipe, not a regular file`), by the watcher and by a transcript request, which is answered within
+  5 seconds; a stop then takes under 8 seconds and leaves nothing behind.
 
 `tests/terminals.rs`, the runner's terminals:
 
@@ -671,7 +678,9 @@ allow for the back office appending after a write (the demo's asks are old by th
   terminal (`404`), `POST /v1/sessions` is `503`, a command for a session without a terminal `409`,
   for another machine's `503`, for an unknown one `404`; malformed bodies `400`; each bound one
   past its limit (`text`, `keys`, `brief`, `cwd`, a body past 1 MiB) `400 invalid`, and at its
-  limit passes; a relative or missing `cwd`, and one under a folder anyone can write to, `400`; a
+  limit passes; a relative or missing `cwd`, and one under a folder every user can write to,
+  `400`, while one under a group-writable folder goes on to the missing runtime (`503`) and the
+  log names that folder at info; a
   session of another person's agent (added through the hub's events) `403` for `send`, `keys`,
   `interrupt` and `end`, before its lack of a terminal, while one of the person's own agent gets
   to that `409`; an agent token `403` on all five routes;
@@ -689,9 +698,11 @@ allow for the back office appending after a write (the demo's asks are old by th
   gets the new output with nothing lost, one from `0` a `truncated` frame naming the offset. A
   second session, its folder given as `<work>/../work`, runs in the resolved folder and is named
   after it; ended `graceful`, it prints its goodbye, its stream ends with `exit`, and it is
-  `ended`; `kill` ends the first (`exit`, close `1000`, `ended`), and a command for it is then
-  `409`. With both ended, tmux's server exits, and once the daemon has stopped nothing with the
-  test's mark (`PITCREW_TEST_RUN`, which the daemon's tmux server and panes inherit) is left;
+  `ended`. A third, in a folder under a group-writable one (mode 2775), starts (`202`), the log
+  names that folder at info, and `kill` ends it. `kill` ends the first (`exit`, close `1000`,
+  `ended`), and a command for it is then `409`. With all ended, tmux's server exits, and once the
+  daemon has stopped nothing with the test's mark (`PITCREW_TEST_RUN`, which the daemon's tmux
+  server and panes inherit) is left;
 - two daemons on two state directories, on their default sockets (under the test's
   `TMUX_TMPDIR`): two sockets, in directories named by 8 hex digits, two servers, each holding only
   its own session's terminal; a third daemon given the first's socket finds it locked
@@ -790,10 +801,11 @@ checks the bodies and every bound at its limit and one past it, the hook rule fo
 a session (each scope against no agent, an owned agent, another's, one without an owner, and an
 unknown one), which sessions take a command (`404`, `503`, `403`, `409`), what a start needs (a
 person, an absolute folder, a machine of the workspace, no `agent` or `task`), folders resolved
-(`..` and links) and refused (relative, missing, a file, under a folder anyone can write to unless
-sticky, open themselves), and a start with no runtime `503`; `src/runtime.rs` checks that a let-go
-runtime answers `Unavailable` to every call and is dropped, that a refused socket means no tmux and
-makes nothing, that each state directory has a socket of its own (the same however spelled), that
+(`..` and links), refused (relative, missing, a file, under a folder every user can write to
+unless sticky, writable by every user themselves) and allowed when group-writable, themselves or
+above, with those folders named; and a start with no runtime `503`; `src/runtime.rs` checks that
+a let-go runtime answers `Unavailable` to every call and is dropped, that a refused socket means
+no tmux and makes nothing, that each state directory has a socket of its own (the same however spelled), that
 socket directories are made private (and an open one refused, not repaired) and locked once, and
 which sessions of a server are not PitCrew's (a stand-in `tmux` answering); `src/runner.rs` and
 `src/cli.rs` check that `--demo` alone watches nothing (the person's homes are not even looked
@@ -817,9 +829,8 @@ and handed back, not kept, once it has.
   can read it in the process list (`/proc/<pid>/cmdline`), and tmux shows it in the pane's
   `pane_start_command`. Passing it on the CLI's standard input, or through a private file, would
   keep it to the user (threat model O43).
-- Group-writable project folders, and folders on a Windows drive mounted in WSL without metadata
-  (mode 777), are refused as a session's `cwd` (see "Terminals"). Allowing a group the user alone
-  is in (a user private group) would need the group's members checked.
+- Folders on a Windows drive mounted in WSL without metadata (mode 777) are refused as a session's
+  `cwd` (see "Terminals"), by decision: there is no exception for `/mnt/<drive>`.
 - Linking sessions to workstreams by folder or branch: the runner can (`Locations`), but the daemon
   does not pass it the workstreams' locations yet, so nothing is linked by folder or branch.
 - Host info from `pitcrew-api` itself: its `router` takes a fixed `HostInfo`, so the daemon answers
