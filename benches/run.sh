@@ -2,13 +2,17 @@
 # Runs the budget benchmarks and the other crates' timing tests, writes a JSON summary and checks
 # it against benches/baseline.json.
 #
-#   benches/run.sh [--quick | --full] [--no-tests] [--baseline FILE] [--out FILE]
-#                  [--threshold FRACTION] [--retries N] [--write-baseline | --extend-baseline]
-#                  [--note TEXT]
+#   benches/run.sh [--quick | --full] [--no-tests] [--scale | --scale-only] [--baseline FILE]
+#                  [--out FILE] [--threshold FRACTION] [--retries N]
+#                  [--write-baseline | --extend-baseline] [--note TEXT]
 #
 #   --quick            CI mode: 20 MiB transcripts only, few short samples.
 #   --full             Local mode (the default): 20 and 200 MiB transcripts, more samples.
 #   --no-tests         Leave out the timing tests of the runner, hub-work and CLI crates.
+#   --scale            Also run the scale measurements: the real pitcrewd over 10,000 synthetic
+#                      transcripts (about 10 minutes, 3 GiB of disk in the temp dir, Linux only).
+#                      Not retried; see benches/README.md.
+#   --scale-only       Run only the scale measurements.
 #   --baseline FILE    The baseline for this machine class (default: benches/baseline.json).
 #   --out FILE         Where to write the summary (default: <target>/pitcrew-bench/summary.json).
 #   --threshold F      Fail when a metric is worse than the baseline by more than F (default 0.10).
@@ -29,11 +33,15 @@ baseline=""
 retries=2
 write=0
 tests=1
+scale=0
+only_scale=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --quick) mode=quick; shift ;;
     --full) mode=full; shift ;;
     --no-tests) tests=0; shift ;;
+    --scale) scale=1; shift ;;
+    --scale-only) scale=1; only_scale=1; shift ;;
     --out) out=$2; shift 2 ;;
     --baseline) baseline=$2; shift 2 ;;
     --threshold) report+=(--threshold "$2"); shift 2 ;;
@@ -41,7 +49,7 @@ while [ $# -gt 0 ]; do
     --write-baseline) write=1; report+=(--write-baseline --recorded "$(date -u +%Y-%m-%d)"); shift ;;
     --extend-baseline) report+=(--extend-baseline); shift ;;
     --note) report+=(--note "$2"); shift 2 ;;
-    -h | --help) sed -n '2,22p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,25p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -86,15 +94,33 @@ timing_test() { # NAME OUTPUT
     echo "warning: timing test $1 failed" >&2
 }
 
-bench "$work/criterion"
-inputs=(--criterion "$work/criterion")
-if [ "$tests" = 1 ]; then
-  for t in "${timing_tests[@]}"; do
-    timing_test "$t" "$work/tests/$t-0.txt"
-    inputs+=(--tests "$work/tests/$t-0.txt")
-  done
+scale_run() { # OUTPUT
+  # The daemon the benchmark runs is built beside it, in the bench profile, which is what ships
+  # (thin LTO, stripped). The scale tool finds it next to itself.
+  cargo build --locked --profile bench -p pitcrew-daemon --bin pitcrewd
+  cargo run --locked --profile bench -q -p pitcrew-benches --bin pitcrew-bench-scale -- all 2>&1 |
+    tee "$1" || echo "warning: the scale measurements failed" >&2
+}
+
+inputs=()
+if [ "$only_scale" = 1 ]; then
+  inputs+=(--only-scale)
 else
-  inputs+=(--no-tests)
+  bench "$work/criterion"
+  inputs+=(--criterion "$work/criterion")
+  if [ "$tests" = 1 ]; then
+    for t in "${timing_tests[@]}"; do
+      timing_test "$t" "$work/tests/$t-0.txt"
+      inputs+=(--tests "$work/tests/$t-0.txt")
+    done
+  else
+    inputs+=(--no-tests)
+  fi
+fi
+if [ "$scale" = 1 ]; then
+  scale_run "$work/tests/scale-0.txt"
+  inputs+=(--tests "$work/tests/scale-0.txt")
+  [ "$only_scale" = 1 ] || inputs+=(--scale)
 fi
 
 attempt=0

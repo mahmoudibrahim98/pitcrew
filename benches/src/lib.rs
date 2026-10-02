@@ -5,6 +5,8 @@
 //! - `benches/*.rs`: criterion benchmarks, run with `cargo bench -p pitcrew-benches`.
 //! - [`inputs`]: synthetic transcripts, control-mode output and events. Nothing real.
 //! - [`probe`]: measures the delta stream from an append to the frame that carries it.
+//! - [`homes`], [`scale`], [`client`], [`procfs`]: synthetic agent homes with 10,000 transcripts,
+//!   and the measurements of a real `pitcrewd` over them (`pitcrew-bench-scale`).
 //! - [`metrics`]: which benchmark or timing test measures which budget.
 //! - [`external`]: reads the numbers other crates' timing tests print.
 //! - [`report`]: turns both into the JSON summary and compares it with `benches/baseline.json`.
@@ -12,11 +14,15 @@
 
 #![forbid(unsafe_code)]
 
+pub mod client;
 pub mod external;
+pub mod homes;
 pub mod inputs;
 pub mod metrics;
 pub mod probe;
+pub mod procfs;
 pub mod report;
+pub mod scale;
 
 use serde::{Deserialize, Serialize};
 

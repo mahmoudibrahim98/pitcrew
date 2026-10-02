@@ -188,7 +188,7 @@ fn convert(metric: &Metric, ns: f64, bytes: Option<u64>) -> Option<f64> {
     match metric.unit {
         Unit::Ms => Some(ns / 1e6),
         Unit::MibPerS => bytes.map(|b| b as f64 / crate::inputs::MIB as f64 / (ns / 1e9)),
-        Unit::PercentCpu => None,
+        Unit::PercentCpu | Unit::Mib | Unit::Kib => None,
     }
 }
 
@@ -197,8 +197,12 @@ fn convert(metric: &Metric, ns: f64, bytes: Option<u64>) -> Option<f64> {
 pub struct Scope {
     /// Quick or full.
     pub mode: Mode,
+    /// Whether the criterion benchmarks ran.
+    pub benches: bool,
     /// Whether the other crates' timing tests ran.
     pub tests: bool,
+    /// Whether the scale measurements (`pitcrew-bench-scale`, 10,000 transcripts) ran.
+    pub scale: bool,
 }
 
 /// The recorded values a run is compared with.
@@ -307,6 +311,9 @@ pub struct Summary {
     /// Whether the other crates' timing tests ran.
     #[serde(default)]
     pub tests: bool,
+    /// Whether the scale measurements ran.
+    #[serde(default)]
+    pub scale: bool,
     /// This machine's class.
     pub machine: String,
     /// The baseline's machine class, if a baseline was used.
@@ -338,6 +345,7 @@ pub fn compare(
         schema: SCHEMA,
         mode: scope.mode,
         tests: scope.tests,
+        scale: scope.scale,
         machine: machine.to_owned(),
         baseline_machine: baseline.map(|b| b.machine.clone()),
         threshold,
@@ -349,8 +357,12 @@ pub fn compare(
 /// Whether `metric` is expected in a run covering `scope` on this platform.
 fn expected(metric: &Metric, scope: Scope) -> bool {
     let mode_ok = !(metric.full_only && scope.mode == Mode::Quick);
-    let tests_ok = scope.tests || !matches!(metric.source, Source::Test(_));
-    mode_ok && tests_ok && metric.needs.here()
+    let source_ok = match metric.source {
+        Source::Bench(_) => scope.benches,
+        Source::Test(TestId::Scale) => scope.scale,
+        Source::Test(_) => scope.tests,
+    };
+    mode_ok && source_ok && metric.needs.here()
 }
 
 fn line(
@@ -445,7 +457,8 @@ impl Retry {
     }
 }
 
-/// What to retry after `summary`.
+/// What to retry after `summary`. The scale measurements are not retried: a run takes minutes and
+/// measures work, not a timer, so a second run is for a person to ask for.
 #[must_use]
 pub fn retry(summary: &Summary) -> Retry {
     let mut out = Retry::default();
@@ -458,10 +471,10 @@ pub fn retry(summary: &Summary) -> Retry {
         }
         match by_name(&l.name).map(|m| m.source) {
             Some(Source::Bench(id)) => out.benches.push(id),
+            Some(Source::Test(TestId::Scale)) | None => {}
             Some(Source::Test(test)) => {
                 out.tests.insert(test);
             }
-            None => {}
         }
     }
     out
@@ -600,7 +613,9 @@ mod tests {
 
     const QUICK: Scope = Scope {
         mode: Mode::Quick,
+        benches: true,
         tests: true,
+        scale: false,
     };
 
     /// Every metric expected in a quick run here, measured: times with a typical value of 1.2
@@ -864,8 +879,8 @@ mod tests {
             .filter(|(name, _)| by_name(name).is_some_and(|m| m.source.bench_target().is_some()))
             .collect();
         let without = Scope {
-            mode: Mode::Quick,
             tests: false,
+            ..QUICK
         };
         let s = compare(without, "m", &benches_only, None, DEFAULT_THRESHOLD);
         assert!(s.passed, "{}", render(&s));
@@ -873,6 +888,85 @@ mod tests {
         // With the tests expected, their absence fails.
         let s = compare(QUICK, "m", &benches_only, None, DEFAULT_THRESHOLD);
         assert_eq!(get(&s, "cli.hook.up.tcp").status, Status::Missing);
+    }
+
+    fn scale_readings() -> Readings {
+        METRICS
+            .iter()
+            .filter(|m| m.source == Source::Test(TestId::Scale))
+            .map(|m| (m.name.to_owned(), Reading::same(10.0)))
+            .collect()
+    }
+
+    #[test]
+    fn scale_metrics_are_expected_only_when_run() {
+        let s = compare(QUICK, "m", &all_quick(1.0), None, DEFAULT_THRESHOLD);
+        assert!(!s.scale);
+        assert_eq!(get(&s, "scale.first_scan").status, Status::Skipped);
+        assert!(s.passed, "{}", render(&s));
+        // Asked for and not measured: missing (where the platform can measure them at all).
+        let with = Scope {
+            scale: true,
+            ..QUICK
+        };
+        let s = compare(with, "m", &all_quick(1.0), None, DEFAULT_THRESHOLD);
+        assert!(s.scale);
+        let want = if cfg!(target_os = "linux") {
+            Status::Missing
+        } else {
+            Status::Skipped
+        };
+        assert_eq!(get(&s, "scale.first_scan").status, want);
+        // Measured: checked against the budgets.
+        let mut readings = all_quick(1.0);
+        readings.extend(scale_readings());
+        let s = compare(with, "m", &readings, None, DEFAULT_THRESHOLD);
+        if cfg!(target_os = "linux") {
+            assert!(s.passed, "{}", render(&s));
+            assert_eq!(get(&s, "scale.rss.scan_peak").unit, "MiB");
+            assert_eq!(get(&s, "scale.db.per_session").unit, "KiB");
+        }
+        readings.insert("scale.rss.scan_peak".to_owned(), Reading::same(87.8));
+        let s = compare(with, "m", &readings, None, DEFAULT_THRESHOLD);
+        if cfg!(target_os = "linux") {
+            assert_eq!(get(&s, "scale.rss.scan_peak").status, Status::OverBudget);
+            assert!(!s.passed);
+        }
+    }
+
+    #[test]
+    fn only_scale_leaves_everything_else_skipped() {
+        let only = Scope {
+            mode: Mode::Quick,
+            benches: false,
+            tests: false,
+            scale: true,
+        };
+        let s = compare(only, "m", &scale_readings(), None, DEFAULT_THRESHOLD);
+        assert_eq!(get(&s, "store.since.page_100").status, Status::Skipped);
+        assert_eq!(get(&s, "cli.hook.up.tcp").status, Status::Skipped);
+        if cfg!(target_os = "linux") {
+            assert!(s.passed, "{}", render(&s));
+            assert_eq!(get(&s, "scale.cold_start").status, Status::New);
+        }
+    }
+
+    #[test]
+    fn a_scale_run_is_not_retried() {
+        let with = Scope {
+            scale: true,
+            ..QUICK
+        };
+        let mut readings = all_quick(1.0);
+        readings.extend(scale_readings());
+        readings.insert("scale.first_scan".to_owned(), Reading::same(90_000.0));
+        readings.remove("scale.cold_start");
+        let s = compare(with, "m", &readings, None, DEFAULT_THRESHOLD);
+        if cfg!(target_os = "linux") {
+            assert_eq!(get(&s, "scale.first_scan").status, Status::OverBudget);
+            assert_eq!(get(&s, "scale.cold_start").status, Status::Missing);
+        }
+        assert!(retry(&s).is_empty(), "{:?}", retry(&s));
     }
 
     #[test]
@@ -915,7 +1009,7 @@ mod tests {
         // In full mode the 200 MiB benchmarks are expected too.
         let full = Scope {
             mode: Mode::Full,
-            tests: true,
+            ..QUICK
         };
         let s = compare(full, "m", &all_quick(1.0), None, DEFAULT_THRESHOLD);
         assert_eq!(

@@ -10,6 +10,7 @@
 //! | `runner/tests/idle_cpu.rs` | `idle CPU, 50 transcripts, Never: … = 0.150% of one core` | the percent | the same |
 //! | `hub-work/tests/perf.rs` | `route: GET /v1/tasks?status=in_progress … best 1.20 ms   median 1.50 ms …` | median | best |
 //! | `cli/tests/hook_timing.rs` | `up (loopback TCP): p50 1.10 ms, p99 2.30 ms, max …` | p99 | p50 |
+//! | `pitcrew-bench-scale` (this crate) | `scale rss.scan_peak: value 61.20 best 61.20 MiB   (…)` | `value` | `best` |
 //!
 //! `value` is what the budget limits; `best` is the steadiest number the test prints, which runs
 //! are compared with.
@@ -27,6 +28,20 @@ fn parse_line(line: &str) -> Option<(&'static str, Reading)> {
     idle_cpu(line)
         .or_else(|| task_list(line))
         .or_else(|| hook(line))
+        .or_else(|| scale(line))
+}
+
+/// `scale first_scan: value 51234.00 best 51234.00 ms   (10000 transcripts, …)`, as
+/// `pitcrew-bench-scale` prints a number. The metric is `scale.` and the name.
+fn scale(line: &str) -> Option<(&'static str, Reading)> {
+    let rest = line.strip_prefix("scale ")?;
+    let (name, rest) = rest.split_once(": value ")?;
+    let metric = crate::metrics::METRICS
+        .iter()
+        .find(|m| m.name.strip_prefix("scale.") == Some(name))?;
+    let value: f64 = rest.split_whitespace().next()?.parse().ok()?;
+    let best = number_after(rest, "best")?;
+    Some((metric.name, Reading { value, best }))
 }
 
 /// `idle CPU, 50 transcripts, Never: 3 ticks in 20s = 0.150% of one core`
@@ -116,6 +131,13 @@ up (unix socket): p50 1.10 ms, p99 2.30 ms, max 3.00 ms over 200 runs (limit 10 
 down (stale unix socket): p50 1.00 ms, p99 1.90 ms, max 2.50 ms over 200 runs (limit 5 ms)
 up (loopback TCP): p50 1.20 ms, p99 2.40 ms, max 3.10 ms over 200 runs (limit 10 ms)
 down (loopback TCP, nothing listening): p50 1.05 ms, p99 2.00 ms, max 2.60 ms over 200 runs (limit 5 ms)
+scale: homes 10000 transcripts in 125 project folders, 1.90 GiB
+scale: after 20 s idle (quiet): resident 55.0 MiB, peak 71.0 MiB
+scale first_scan: value 41200.00 best 41200.00 ms   (10000 transcripts, 900000 events, 38.5 s of cpu)
+scale rss.scan_peak: value 71.04 best 70.50 MiB   (VmHWM over the first scan)
+scale cold_start: value 210.50 best 190.25 ms   (spawn to the ready line, median of 5)
+scale hook_to_frame: value 82.00 best 78.00 ms   (POST to the events frame, p50 of 40 (p95 90 ms))
+scale made_up: value 1.00 best 1.00 ms   (not a metric)
 ";
 
     #[test]
@@ -131,6 +153,10 @@ down (loopback TCP, nothing listening): p50 1.05 ms, p99 2.00 ms, max 2.60 ms ov
             ("cli.hook.down.unix", r(1.9, 1.0)),
             ("cli.hook.up.tcp", r(2.4, 1.2)),
             ("cli.hook.down.tcp", r(2.0, 1.05)),
+            ("scale.first_scan", r(41_200.0, 41_200.0)),
+            ("scale.rss.scan_peak", r(71.04, 70.5)),
+            ("scale.cold_start", r(210.5, 190.25)),
+            ("scale.hook_to_frame", r(82.0, 78.0)),
         ]
         .into_iter()
         .collect();
@@ -157,5 +183,7 @@ down (loopback TCP, nothing listening): p50 1.05 ms, p99 2.00 ms, max 2.60 ms ov
         );
         assert!(parse("up (somewhere): p50 1.00 ms, p99 2.00 ms").is_empty());
         assert!(parse("test result: ok. 1 passed").is_empty());
+        assert!(parse("scale first_scan: value x best 1 ms").is_empty());
+        assert!(parse("scale: first_scan value 1.00 best 1.00 ms").is_empty());
     }
 }

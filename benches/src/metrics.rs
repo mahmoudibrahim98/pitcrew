@@ -19,6 +19,12 @@ pub enum Unit {
     /// Percent of one CPU core.
     #[serde(rename = "%cpu")]
     PercentCpu,
+    /// Mebibytes: a process's memory, a file's size.
+    #[serde(rename = "MiB")]
+    Mib,
+    /// Kibibytes: growth per session, per 1,000 events.
+    #[serde(rename = "KiB")]
+    Kib,
 }
 
 impl Unit {
@@ -29,6 +35,8 @@ impl Unit {
             Self::Ms => "ms",
             Self::MibPerS => "MiB/s",
             Self::PercentCpu => "%cpu",
+            Self::Mib => "MiB",
+            Self::Kib => "KiB",
         }
     }
 
@@ -58,11 +66,19 @@ pub enum TestId {
     HubTaskList,
     /// `crates/cli/tests/hook_timing.rs`: `pitcrew hook` wall time.
     CliHookTiming,
+    /// `pitcrew-bench-scale` (this crate): `pitcrewd` with 10,000 transcripts. It takes minutes
+    /// and gigabytes of disk, so `benches/run.sh` runs it only with `--scale`.
+    Scale,
 }
 
 impl TestId {
     /// Every test, in run order.
-    pub const ALL: [Self; 3] = [Self::HubTaskList, Self::CliHookTiming, Self::RunnerIdleCpu];
+    pub const ALL: [Self; 4] = [
+        Self::HubTaskList,
+        Self::CliHookTiming,
+        Self::RunnerIdleCpu,
+        Self::Scale,
+    ];
 
     /// The name `benches/run.sh` knows it by.
     #[must_use]
@@ -71,6 +87,7 @@ impl TestId {
             Self::RunnerIdleCpu => "runner-idle-cpu",
             Self::HubTaskList => "hub-work-perf",
             Self::CliHookTiming => "cli-hook-timing",
+            Self::Scale => "scale",
         }
     }
 
@@ -177,6 +194,22 @@ const HOOK_UP: Budget = Budget {
     name: "pitcrew hook wall time <= 10 ms (P.md); p99 over 200 runs, daemon up",
     value: 10.0,
 };
+const FIRST_SCAN: Budget = Budget {
+    name: "First scan, 10k transcripts on SSD <= 60 s, streamed (P.md)",
+    value: 60_000.0,
+};
+const COLD_START: Budget = Budget {
+    name: "Cold start to serving, index present <= 300 ms (P.md); 10k sessions indexed",
+    value: 300.0,
+};
+const DAEMON_RSS: Budget = Budget {
+    name: "pitcrewd memory, 10k sessions indexed <= 80 MB RSS (P.md; read as 80 MiB)",
+    value: 80.0,
+};
+const HOOK_TO_UI_10K: Budget = Budget {
+    name: "Hook event -> UI change <= 300 ms local (P.md); POST to stream frame, 10k sessions present",
+    value: 300.0,
+};
 const HOOK_DOWN: Budget = Budget {
     name: "pitcrew hook with no daemon listening: p99 <= 5 ms (CLI hook timing test)",
     value: 5.0,
@@ -204,6 +237,14 @@ const fn rate(name: &'static str, bench: &'static str) -> Metric {
 
 const fn test_ms(name: &'static str, test: TestId, budget: Budget) -> Metric {
     metric(name, Source::Test(test), Unit::Ms, Some(budget))
+}
+
+/// A number `pitcrew-bench-scale` prints. Only Linux can read a process's memory from `/proc`.
+const fn scale(name: &'static str, unit: Unit, budget: Option<Budget>) -> Metric {
+    needs(
+        Needs::Linux,
+        metric(name, Source::Test(TestId::Scale), unit, budget),
+    )
 }
 
 const fn full(metric: Metric) -> Metric {
@@ -313,6 +354,19 @@ pub const METRICS: &[Metric] = &[
     ),
     test_ms("cli.hook.up.tcp", TestId::CliHookTiming, HOOK_UP),
     test_ms("cli.hook.down.tcp", TestId::CliHookTiming, HOOK_DOWN),
+    scale("scale.first_scan", Unit::Ms, Some(FIRST_SCAN)),
+    scale("scale.first_scan.first_session", Unit::Ms, None),
+    scale("scale.rss.scan_peak", Unit::Mib, Some(DAEMON_RSS)),
+    scale("scale.rss.scan_steady", Unit::Mib, Some(DAEMON_RSS)),
+    scale("scale.rss.restart_peak", Unit::Mib, Some(DAEMON_RSS)),
+    scale("scale.rss.restart_steady", Unit::Mib, Some(DAEMON_RSS)),
+    scale("scale.cold_start", Unit::Ms, Some(COLD_START)),
+    scale("scale.cold_start.no_tmux", Unit::Ms, None),
+    scale("scale.hook_to_frame", Unit::Ms, Some(HOOK_TO_UI_10K)),
+    scale("scale.db.after_scan", Unit::Mib, None),
+    scale("scale.db.per_session", Unit::Kib, None),
+    scale("scale.db.per_1000_events", Unit::Kib, None),
+    scale("scale.index.after_scan", Unit::Mib, None),
 ];
 
 /// The metric measured by criterion benchmark `bench`.
