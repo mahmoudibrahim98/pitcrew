@@ -1,16 +1,25 @@
-//! Bounds the screen model's work per byte of pane output.
+//! Bounds the screen model's work and memory per byte of pane output.
 //!
-//! vt100 0.16.2 repeats `CSI n L` (insert lines), `CSI n T` (scroll down) and `CSI n @` (insert
-//! characters) `n` times with no limit, and `n` can be 65535: 128 bytes of `ESC[65535L` keep it
-//! busy for seconds. (An upstream bug worth reporting.) [`CsiClamp`] rewrites the count of those,
-//! and of `M`, `S`, `P` and `X`, to at most the screen's rows or columns before vt100 sees it,
-//! which changes nothing a screen can show. It follows vte's states closely enough to find every
-//! CSI that vte dispatches: a CSI survives C0 controls, DEL and bytes from 0x80 (vte executes or
-//! ignores them in place), and only CAN, SUB or ESC end it early.
+//! - **Counts.** vt100 0.16.2 repeats `CSI n L` (insert lines), `CSI n T` (scroll down) and
+//!   `CSI n @` (insert characters) `n` times with no limit, and `n` can be 65535: 128 bytes of
+//!   `ESC[65535L` keep it busy for seconds. (An upstream bug worth reporting.) [`CsiClamp`]
+//!   rewrites the count of those, and of `M`, `S`, `P` and `X`, to at most the screen's rows or
+//!   columns before vt100 sees it, which changes nothing a screen can show.
+//! - **Strings.** vte keeps the body of an OSC string (`ESC ]`) in memory until it ends, with no
+//!   limit. vt100 uses only short ones (titles, the clipboard), so at most [`MAX_STRING`] bytes
+//!   of any string body (OSC, DCS `ESC P`, SOS `ESC X`, PM `ESC ^`, APC `ESC _`) are passed on;
+//!   then the string is cancelled (CAN) and the rest dropped up to its end.
+//!
+//! It follows vte's states closely enough to find every sequence vte acts on: a CSI survives C0
+//! controls, DEL and bytes from 0x80 (vte executes or ignores them in place); CAN, SUB or ESC
+//! end a CSI or a string early, and BEL also ends an OSC.
 
 /// The longest CSI kept back while waiting for its final byte. A longer one is dropped.
 const MAX_HELD: usize = 4096;
+/// The most bytes of one string's body passed on.
+pub(crate) const MAX_STRING: usize = 4096;
 
+const BEL: u8 = 0x07;
 const ESC: u8 = 0x1b;
 const CAN: u8 = 0x18;
 const SUB: u8 = 0x1a;
@@ -27,6 +36,10 @@ enum State {
     Csi,
     /// Inside a CSI too long to keep: dropped up to its final byte.
     Skip,
+    /// Inside a string's body; `osc` if BEL ends it.
+    String { osc: bool },
+    /// Inside a string too long to pass on: dropped up to its end.
+    StringSkip { osc: bool },
 }
 
 /// A streaming filter over pane output, one per screen model.
@@ -34,6 +47,8 @@ enum State {
 pub(crate) struct CsiClamp {
     state: State,
     held: Vec<u8>,
+    /// Bytes of the current string's body passed on so far.
+    passed: usize,
 }
 
 impl CsiClamp {
@@ -74,11 +89,14 @@ impl CsiClamp {
                     return;
                 }
                 out.push(byte);
+                self.passed = 0;
                 self.state = match byte {
                     ESC => State::Escape,
                     CAN | SUB => State::Ground,
                     _ if executed || byte == 0x7f || byte >= 0x80 => State::Escape,
                     0x20..=0x2f => State::EscapeIntermediate,
+                    b']' => State::String { osc: true },
+                    b'P' | b'X' | b'^' | b'_' => State::String { osc: false },
                     _ => State::Ground,
                 };
             }
@@ -129,6 +147,39 @@ impl CsiClamp {
                     self.state = State::Escape;
                 }
                 0x40..=0x7e => self.state = State::Ground,
+                _ => {}
+            },
+            State::String { osc } => match byte {
+                CAN | SUB => {
+                    out.push(byte);
+                    self.state = State::Ground;
+                }
+                ESC => {
+                    out.push(byte);
+                    self.state = State::Escape;
+                }
+                BEL if osc => {
+                    out.push(byte);
+                    self.state = State::Ground;
+                }
+                _ if self.passed < MAX_STRING => {
+                    out.push(byte);
+                    self.passed += 1;
+                }
+                _ => {
+                    // Too long: cancel it, so vte lets go of what it kept.
+                    out.push(CAN);
+                    self.state = State::StringSkip { osc };
+                }
+            },
+            State::StringSkip { osc } => match byte {
+                // vte is back in its ground state after the CAN: drop the end too.
+                CAN | SUB => self.state = State::Ground,
+                BEL if osc => self.state = State::Ground,
+                ESC => {
+                    out.push(byte);
+                    self.state = State::Escape;
+                }
                 _ => {}
             },
         }
@@ -209,6 +260,8 @@ mod tests {
             b"\x1b[38;2;255;0;0m\x1b[2J\x1b[999;999H\x1b[65535A",
             b"\x1b[?65535L\x1b[65535 L\x1b[>65535T",
             b"\x1b]0;title with \x1b[65535L inside\x07",
+            b"\x1b]52;c;aGVsbG8=\x1b\\after",
+            b"\x1bPq#0;2;0;0;0\x1b\\\x1b_apc\x1b\\\x1bXsos\x18\x1b^pm\x1a",
             b"\x1b(B\x1b)0[65535L",
             b"\x1bM\x1b7\x1b8",
         ] {
@@ -242,10 +295,50 @@ mod tests {
     }
 
     #[test]
+    fn long_strings_are_cut_and_dropped_to_their_end() {
+        for (open, close, osc) in [
+            (&b"\x1b]2;"[..], &b"\x07"[..], true),
+            (b"\x1b]2;", b"\x1b\\", true),
+            (b"\x1bPq", b"\x1b\\", false),
+            (b"\x1b_x", b"\x18", false),
+            (b"\x1bXx", b"\x1a", false),
+            (b"\x1b^x", b"\x1b\\", false),
+        ] {
+            let mut input = open.to_vec();
+            input.extend(std::iter::repeat_n(b'a', 1 << 20));
+            // A BEL inside a DCS, SOS, PM or APC does not end it.
+            if !osc {
+                input.extend_from_slice(b"\x07more");
+            }
+            input.extend_from_slice(close);
+            input.extend_from_slice(b"after");
+            let out = run(&input);
+            let mut expected = open.to_vec();
+            expected.extend(std::iter::repeat_n(b'a', MAX_STRING - (open.len() - 2)));
+            expected.push(CAN);
+            if close.first() == Some(&ESC) {
+                expected.extend_from_slice(close);
+            }
+            expected.extend_from_slice(b"after");
+            assert_eq!(out, expected, "{:?}", String::from_utf8_lossy(open));
+        }
+        // An unterminated string never grows the output past the limit.
+        let mut endless = b"\x1b]0;".to_vec();
+        endless.extend(std::iter::repeat_n(b'z', 4 << 20));
+        assert!(run(&endless).len() <= MAX_STRING + 4);
+    }
+
+    #[test]
     fn any_split_gives_the_same_output() {
-        let input =
-            b"x\x1b[65535L\x1b[2;3H\x1b\n[999@\x1b[?25h\x1b]2;t\x07\x1b[38;5;1mend\x1b[100T";
-        let whole = run(input);
+        let mut input =
+            b"x\x1b[65535L\x1b[2;3H\x1b\n[999@\x1b[?25h\x1b]2;t\x07\x1b[38;5;1mend\x1b[100T"
+                .to_vec();
+        input.extend_from_slice(b"\x1b]0;");
+        input.extend(std::iter::repeat_n(b'o', MAX_STRING + 50));
+        input.extend_from_slice(b"\x07\x1bPdcs\x1b\\\x1b_");
+        input.extend(std::iter::repeat_n(b'p', MAX_STRING + 50));
+        input.extend_from_slice(b"\x1b\\tail");
+        let whole = run(&input);
         for split in 0..=input.len() {
             let mut clamp = CsiClamp::default();
             let mut out = Vec::new();

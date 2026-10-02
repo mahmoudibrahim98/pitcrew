@@ -33,7 +33,10 @@ use crate::detect::TmuxVersion;
 ///   moment, so that output is delivered first.
 /// - It traps `INT` and `QUIT`, so Ctrl-C reaches only the program (which gets the default
 ///   handlers back), as it would without the shell.
-const WRAPPER: &str = r#"unset TMUX TMUX_PANE; trap : INT QUIT; "$0" "$@"; s=$?; sleep 0.2 2>/dev/null || sleep 1; exit "$s""#;
+const WRAPPER: &str = r#": pitcrew-wrapper; unset TMUX TMUX_PANE; trap : INT QUIT; "$0" "$@"; s=$?; sleep 0.2 2>/dev/null || sleep 1; exit "$s""#;
+
+/// How tmux shows a pane started with [`WRAPPER`] in `#{pane_start_command}`.
+const WRAPPER_STARTED: &str = r#"/bin/sh -c ": pitcrew-wrapper; "#;
 
 /// The window that holds a new session until its first terminal exists. It ends by itself if
 /// PitCrew stops before removing it.
@@ -74,6 +77,8 @@ const DROP_WAIT: Duration = Duration::from_secs(2);
 ///   the window. A process that left the group (`setsid`, a daemonizing program) survives.
 /// - Programs are found as files on the spec's `PATH` (else this process's), absolute entries
 ///   only; a name that is not a file there is refused.
+/// - `screen()` emulates the output since the last read, up to a work budget: bounded, but call
+///   it (like every method here) from a blocking thread, not an async executor's.
 pub struct TmuxRuntime {
     inner: Arc<Inner>,
     keeper: Option<(JoinHandle<()>, Mutex<Receiver<()>>)>,
@@ -107,14 +112,22 @@ struct Inner {
     keeper: Mutex<Option<Sender<()>>>,
     /// The server last attached to.
     server: Mutex<Option<Server>>,
-    /// Windows of abandoned starts, killed again on the next connection to the same server.
-    pending_kills: Mutex<Vec<(u32, WindowId)>>,
+    /// Windows of abandoned starts whose kill has not been answered yet, killed again on the
+    /// next connection to the same server.
+    pending_kills: Mutex<Vec<(ServerKey, WindowId)>>,
 }
 
-/// A tmux server instance: its pid, and the id of PitCrew's session in it.
+/// A tmux server instance: its pid and start time (a pid alone can be reused).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServerKey {
+    pid: u32,
+    started: u64,
+}
+
+/// A tmux server, and the id of PitCrew's session in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Server {
-    pid: u32,
+    key: ServerKey,
     session: String,
 }
 
@@ -124,8 +137,8 @@ struct Link {
     generation: u64,
     /// The window that created the session, removed once a terminal exists.
     holder: Mutex<Option<WindowId>>,
-    /// The server's pid, from reconcile.
-    server: AtomicU64,
+    /// Which server this is, from reconcile.
+    server: Mutex<Option<ServerKey>>,
 }
 
 /// Why there is no connection.
@@ -363,7 +376,7 @@ impl Inner {
             conn,
             generation,
             holder: Mutex::new(holder),
-            server: AtomicU64::new(0),
+            server: Mutex::new(None),
         });
         self.reconcile(&link, deadline)?;
         if self.shutdown.load(Ordering::Acquire) {
@@ -373,6 +386,7 @@ impl Inner {
             ));
         }
         self.replay_kills(&link, deadline);
+        self.sweep_orphans(&link, deadline);
         *lock(&self.link) = Some(Arc::clone(&link));
         tracing::debug!(pid = link.conn.pid(), "attached to PitCrew's tmux server");
         Ok(link)
@@ -395,8 +409,9 @@ impl Inner {
     fn connect_failed(&self, error: ConnectError) -> Down {
         match error {
             ConnectError::NoSession => {
-                // No server: whatever ran in it has ended.
+                // No server: whatever ran in it has ended, its windows too.
                 lock(&self.terminals).all_died();
+                lock(&self.pending_kills).clear();
                 self.changed.notify_all();
                 Down::NoServer
             }
@@ -415,7 +430,11 @@ impl Inner {
         let commands = [
             Command::new("display-message")
                 .and_then(|c| c.arg(Argument::Flag("-p")))
-                .and_then(|c| c.arg(Argument::Format("#{version} #{pid} #{session_id}"))),
+                .and_then(|c| {
+                    c.arg(Argument::Format(
+                        "#{version} #{pid} #{start_time} #{session_id}",
+                    ))
+                }),
             // New windows take the size `start` sets as default-size, not a client's.
             Command::new("set-option")
                 .and_then(|c| c.arg(Argument::Flag("-g")))
@@ -452,12 +471,12 @@ impl Inner {
         }
         {
             let mut known = lock(&self.server);
-            if known.as_ref().is_some_and(|k| k.pid != server.pid) {
+            if known.as_ref().is_some_and(|k| k.key != server.key) {
                 // Another server: whatever ran in the one before has ended with it.
                 lock(&self.terminals).all_died();
                 lock(&self.pending_kills).clear();
             }
-            link.server.store(u64::from(server.pid), Ordering::Release);
+            *lock(&link.server) = Some(server.key);
             *known = Some(server);
         }
         let listed: Vec<Listed> = replies[2]
@@ -488,10 +507,10 @@ impl Inner {
 
     /// Kills, on a fresh connection, the windows of starts that were given up on this server.
     fn replay_kills(&self, link: &Link, deadline: Instant) {
-        let server = link.server.load(Ordering::Acquire);
+        let server = *lock(&link.server);
         let kills: Vec<Command> = std::mem::take(&mut *lock(&self.pending_kills))
             .into_iter()
-            .filter(|&(pid, _)| u64::from(pid) == server)
+            .filter(|&(key, _)| Some(key) == server)
             .filter_map(|(_, window)| kill_window(window).ok())
             .collect();
         if !kills.is_empty() {
@@ -500,20 +519,66 @@ impl Inner {
         }
     }
 
-    /// A window nobody will use (its start was given up): kill it now, and again on the next
-    /// connection in case this one does not get there.
-    fn discard_window(&self, outbox: &Outbox, server: u64, window: WindowId) {
-        if let Ok(kill) = kill_window(window) {
-            outbox.send_and_forget(&kill);
-        }
-        let Ok(server) = u32::try_from(server) else {
+    /// Kills, on a fresh connection and before any start uses it, the panes a start that never
+    /// finished left behind: untagged, but started by [`WRAPPER`]. A start whose connection was
+    /// lost before tmux answered leaves one. Only one runtime may use a socket.
+    fn sweep_orphans(&self, link: &Link, deadline: Instant) {
+        let Ok(list) = Command::new("list-panes")
+            .and_then(|c| c.arg(Argument::Flag("-s")))
+            .and_then(|c| c.arg(Argument::Flag("-F")))
+            .and_then(|c| {
+                c.arg(Argument::Format(
+                    "#{window_id} #{@pitcrew-terminal}|#{pane_start_command}",
+                ))
+            })
+        else {
             return;
         };
-        let mut pending = lock(&self.pending_kills);
-        if pending.len() >= PENDING_KILLS {
-            pending.remove(0);
+        let Ok(replies) = link.conn.call(&[list], deadline) else {
+            return;
+        };
+        if replies[0].failed {
+            return;
         }
-        pending.push((server, window));
+        let known: Vec<WindowId> = lock(&self.terminals)
+            .all()
+            .filter(|t| t.alive)
+            .map(|t| t.window)
+            .collect();
+        let kills: Vec<Command> = orphans(&replies[0].lines, &known)
+            .into_iter()
+            .filter_map(|window| kill_window(window).ok())
+            .collect();
+        if !kills.is_empty() {
+            tracing::debug!(count = kills.len(), "removing windows of unfinished starts");
+            let _ = link.conn.call(&kills, deadline);
+        }
+    }
+
+    /// A window nobody will use (its start was given up): kill it now, and again on the next
+    /// connection to the same server unless tmux answers this kill first.
+    fn discard_window(&self, outbox: &Outbox, server: Option<ServerKey>, window: WindowId) {
+        let Some(server) = server else {
+            return;
+        };
+        {
+            let mut pending = lock(&self.pending_kills);
+            if pending.len() >= PENDING_KILLS {
+                pending.remove(0);
+            }
+            pending.push((server, window));
+        }
+        let Ok(kill) = kill_window(window) else {
+            return;
+        };
+        let weak = self.me.clone();
+        // Any answer means the kill reached tmux (a failure: the window had gone already).
+        let landed = Waiter::Then(Box::new(move |_| {
+            if let Some(inner) = weak.upgrade() {
+                lock(&inner.pending_kills).retain(|&entry| entry != (server, window));
+            }
+        }));
+        let _ = outbox.send_with(std::slice::from_ref(&kill), vec![landed]);
     }
 
     /// A terminal not known yet may be one a restarted runtime has not listed: attach first.
@@ -666,7 +731,36 @@ impl Inner {
     }
 }
 
-/// `#{version} #{pid} #{session_id}`: the server's facts, if its version is supported.
+/// The windows to remove among `list-panes` lines of `#{window_id} #{@pitcrew-terminal}|
+/// #{pane_start_command}`: untagged, started by [`WRAPPER`], and not a known terminal's. A
+/// window listed more than once (a forged row) is left alone.
+fn orphans(lines: &[Vec<u8>], known: &[WindowId]) -> Vec<WindowId> {
+    let rows: Vec<(WindowId, String)> = lines
+        .iter()
+        .filter_map(|line| {
+            let line = String::from_utf8_lossy(line);
+            let (window, rest) = line.split_once(' ')?;
+            Some((WindowId::parse(window.as_bytes())?, rest.to_owned()))
+        })
+        .collect();
+    let mut found = Vec::new();
+    for (window, rest) in &rows {
+        let Some((tag, started)) = rest.split_once('|') else {
+            continue;
+        };
+        if tag.is_empty()
+            && started.starts_with(WRAPPER_STARTED)
+            && !known.contains(window)
+            && rows.iter().filter(|(w, _)| w == window).count() == 1
+        {
+            found.push(*window);
+        }
+    }
+    found
+}
+
+/// `#{version} #{pid} #{start_time} #{session_id}`: the server's facts, if its version is
+/// supported.
 fn server_facts(about: &str) -> Result<Server, String> {
     let mut fields = about.split(' ');
     let version = fields
@@ -682,13 +776,14 @@ fn server_facts(about: &str) -> Result<Server, String> {
         }
     }
     let pid = fields.next().and_then(|p| p.parse().ok());
+    let started = fields.next().and_then(|s| s.parse().ok());
     let session = fields.next().filter(|s| {
         s.strip_prefix('$')
             .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
     });
-    match (pid, session) {
-        (Some(pid), Some(session)) => Ok(Server {
-            pid,
+    match (pid, started, session) {
+        (Some(pid), Some(started), Some(session)) => Ok(Server {
+            key: ServerKey { pid, started },
             session: session.to_owned(),
         }),
         _ => Err(format!("tmux did not say which server it is: {about:?}")),
@@ -769,7 +864,7 @@ impl Runtime for TmuxRuntime {
             .enter(deadline)
             .ok_or_else(|| RuntimeError::Unavailable("tmux is busy starting a terminal".into()))?;
         let link = inner.connection(deadline, true).map_err(Down::error)?;
-        let server = link.server.load(Ordering::Acquire);
+        let server = *lock(&link.server);
         let default_size = Command::new("set-option")
             .and_then(|c| c.arg(Argument::Text("default-size")))
             .and_then(|c| c.arg(Argument::Text(&format!("{cols}x{rows}"))))
@@ -953,7 +1048,7 @@ impl Runtime for TmuxRuntime {
             .and_then(|line| std::str::from_utf8(line).ok())
             .and_then(|line| line.strip_suffix(" 0"))
             .and_then(|pid| pid.parse::<u32>().ok())
-            .filter(|&pid| Some(pid) == recorded);
+            .filter(|&pid| Some(pid) == recorded && leads_session(pid));
         if let Some(pid) = running {
             stop_group(pid, deadline);
         }
@@ -968,6 +1063,16 @@ impl Runtime for TmuxRuntime {
         inner.changed.notify_all();
         Ok(())
     }
+}
+
+/// True if `pid` leads its own session, as a pane's process does: then its process group is
+/// the pane's, not one a reused pid happens to belong to.
+fn leads_session(pid: u32) -> bool {
+    use rustix::process::{Pid, getsid};
+    i32::try_from(pid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .is_some_and(|pid| getsid(Some(pid)).is_ok_and(|sid| sid == pid))
 }
 
 /// `SIGTERM` to a process group, then `SIGKILL` if it is still there after [`KILL_GRACE`].
@@ -1165,15 +1270,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_server_must_say_a_supported_version_its_pid_and_session() {
+    fn the_server_must_say_a_supported_version_its_pid_start_and_session() {
         assert_eq!(
-            server_facts("3.2a 4242 $0"),
+            server_facts("3.2a 4242 1790906720 $0"),
             Ok(Server {
-                pid: 4242,
+                key: ServerKey {
+                    pid: 4242,
+                    started: 1_790_906_720
+                },
                 session: "$0".into()
             })
         );
-        for old in ["3.1c 1 $0", "2.7 1 $0", "openbsd-6.8 1 $0"] {
+        for old in ["3.1c 1 1 $0", "2.7 1 1 $0", "openbsd-6.8 1 1 $0"] {
             assert!(
                 server_facts(old).expect_err(old).contains("3.2 or newer"),
                 "{old}"
@@ -1183,12 +1291,42 @@ mod tests {
             "",
             "garbage",
             "3.2a",
-            "3.2a x $0",
-            "3.2a 1 0",
-            "3.2a 1 $",
-            "3.2a 1 $x",
+            "3.2a x 1 $0",
+            "3.2a 1 x $0",
+            "3.2a 1 $0",
+            "3.2a 1 1 0",
+            "3.2a 1 1 $",
+            "3.2a 1 1 $x",
         ] {
             assert!(server_facts(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn only_untagged_panes_of_our_wrapper_are_orphans() {
+        let known = [WindowId(1)];
+        let line = |s: &str| s.as_bytes().to_vec();
+        let ours = format!("{WRAPPER_STARTED}unset TMUX\" /usr/bin/sh");
+        let lines = vec![
+            line(&format!("@1 |{ours}")),
+            line(&format!("@2 |{ours}")),
+            line(&format!("@3 term_x|{ours}")),
+            line("@4 |/bin/sh -c \"sleep 60\""),
+            line("@5 |bash"),
+            // A forged row for @6, which is also listed for real.
+            line(&format!("@6 |{ours}")),
+            line("@6 term_y|bash"),
+            line("garbage"),
+        ];
+        assert_eq!(orphans(&lines, &known), vec![WindowId(2)]);
+        // The marker is what tmux shows for the wrapper this runtime runs.
+        assert!(format!("/bin/sh -c \"{WRAPPER}\"").starts_with(WRAPPER_STARTED));
+    }
+
+    #[test]
+    fn only_a_session_leader_is_signalled_as_a_group() {
+        assert!(!leads_session(std::process::id()));
+        assert!(!leads_session(0));
+        assert!(!leads_session(u32::MAX));
     }
 }

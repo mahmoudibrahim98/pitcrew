@@ -14,9 +14,11 @@
 //! - **The server is shared with the programs in it.** tmux gives every pane `$TMUX`, the
 //!   server's socket; the runtime unsets it for the programs it starts, but a program that
 //!   finds the socket (it is in a predictable place) can still run any tmux command on that
-//!   server, as the user. The runtime does not trust what the server tells it beyond that:
-//!   replies to other clients' commands are dropped, tags never move a known terminal, and
-//!   counts in pane output are clamped before the screen model sees them.
+//!   server, as the user. Against that, the runtime limits the damage rather than draws a
+//!   boundary: replies without its guard flag (ordinary hook output) are dropped, tags and
+//!   duplicated rows never move or end a known terminal, and pane output is bounded before the
+//!   screen model sees it. A deliberate attacker running as the same user can still disturb
+//!   PitCrew's terminals in other ways.
 //!
 //! The session exists while terminals do: the server exits when the last one ends. The runtime is
 //! Unix-only; [`detect`] says so elsewhere.

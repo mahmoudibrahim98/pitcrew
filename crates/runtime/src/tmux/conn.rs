@@ -4,9 +4,11 @@
 //! other notification goes to a [`Sink`].
 //!
 //! - **Only our replies.** Replies to commands from this client's stdin carry guard flags `1`.
-//!   The command on the command line, and every hook (`after-*`), reply with flags `0`: anything
-//!   that reaches the server (a program in a pane can) may set hooks, so after the first reply,
-//!   replies without flag `1` are dropped rather than given to the next waiting command.
+//!   The command on the command line, and every hook (`after-*`), reply with flags `0`, so after
+//!   the first reply, replies without flag `1` are dropped rather than given to the next waiting
+//!   command. That keeps ordinary hook output (anything on the server may set hooks) out of our
+//!   replies; it is not a boundary against a deliberate attacker running as the same user, who
+//!   can drive the server in many other ways.
 //! - **Bounded.** A writer thread owns stdin, so a tmux that stops reading fills a bounded
 //!   queue (then `Busy`) instead of blocking the caller.
 //! - **Always cleaned up.** However the reader thread ends, a panic included, it closes the
@@ -146,7 +148,12 @@ pub(crate) enum Waiter {
     Discard,
     Channel(SyncSender<CommandReply>),
     Pending(Arc<Pending>),
+    /// A function run on the reader thread when the reply arrives (not if the connection ends
+    /// first). It must not wait for this connection.
+    Then(Then),
 }
+
+type Then = Box<dyn FnOnce(&CommandReply) + Send>;
 
 /// Commands waiting for their replies, oldest first, and the way to tmux's stdin.
 pub(crate) struct Outbox {
@@ -218,6 +225,7 @@ impl Outbox {
                 let _ = tx.try_send(reply);
             }
             Some(Waiter::Pending(pending)) => pending.deliver(reply, self),
+            Some(Waiter::Then(then)) => then(&reply),
             Some(Waiter::Discard) => {}
             None => tracing::debug!(number = reply.number, "a tmux reply nobody asked for"),
         }
