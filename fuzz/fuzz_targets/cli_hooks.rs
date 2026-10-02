@@ -235,15 +235,11 @@ fn possibly_ours(engine: Engine, bytes: Option<&[u8]>) -> bool {
             })
         }),
         Engine::Codex => toml(bytes).is_some_and(|v| codex_possibly_ours(&v["notify"])),
-        // The installer reads the plugin file lossily: a file that starts with our marker is ours,
-        // whatever bytes follow it.
-        Engine::OpenCode => bytes.is_some_and(|b| {
-            let lossy = String::from_utf8_lossy(b);
-            lossy
-                .strip_prefix(BOM)
-                .unwrap_or(&lossy)
-                .starts_with(OPENCODE_MARKER)
-        }),
+        // The installer reads the plugin file lossily, without stripping a BOM: a file that starts
+        // with our marker is ours, whatever bytes follow it.
+        Engine::OpenCode => {
+            bytes.is_some_and(|b| String::from_utf8_lossy(b).starts_with(OPENCODE_MARKER))
+        }
     }
 }
 
