@@ -13,9 +13,9 @@ use pitcrew_interfaces::source::{
 };
 use pitcrew_protocol::ids::SessionId;
 use pitcrew_protocol::model::Engine;
-use pitcrew_runner::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, PageError, RunnerHandle};
+use pitcrew_runner::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, PageError, PageOptions, RunnerHandle};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::time::Duration;
 
 /// Longest wait for a discovery; it ends as soon as the session is discovered.
@@ -295,4 +295,188 @@ fn transcripts_taken_from_the_handle_read_the_same_pages() {
     assert_eq!(reader.join().unwrap(), page);
     runner.stop();
     assert_eq!(transcripts.transcript_page(s, None, Some(4)).unwrap(), page);
+}
+
+/// Claude's adapter, except that its pages wait until the gate opens, as on a file system that
+/// stopped answering. Each page read says when it starts.
+struct Gate {
+    inner: ClaudeAdapter,
+    open: Mutex<bool>,
+    opened: Condvar,
+    entered: Mutex<mpsc::Sender<()>>,
+}
+
+impl Gate {
+    fn new() -> (Self, mpsc::Receiver<()>) {
+        let (entered, reads) = mpsc::channel();
+        let gate = Self {
+            inner: ClaudeAdapter::new(),
+            open: Mutex::new(false),
+            opened: Condvar::new(),
+            entered: Mutex::new(entered),
+        };
+        (gate, reads)
+    }
+
+    fn open(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+}
+
+impl SourceAdapter for Gate {
+    fn engine(&self) -> Engine {
+        self.inner.engine()
+    }
+    fn discover(&self, home: &Path) -> Result<Vec<TranscriptRef>, SourceError> {
+        self.inner.discover(home)
+    }
+    fn read_from(&self, t: &TranscriptRef, cursor: &Cursor) -> Result<ParseChunk, SourceError> {
+        self.inner.read_from(t, cursor)
+    }
+    fn read_page(
+        &self,
+        t: &TranscriptRef,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<TranscriptPage, SourceError> {
+        let _ = self.entered.lock().unwrap().send(());
+        let mut open = self.open.lock().unwrap();
+        while !*open {
+            open = self.opened.wait(open).unwrap();
+        }
+        drop(open);
+        self.inner.read_page(t, before, limit)
+    }
+}
+
+/// The reason of an `Unavailable`.
+fn reason(r: &Result<TranscriptPage, PageError>) -> &'static str {
+    match r {
+        Err(PageError::Unavailable { reason, .. }) => reason,
+        other => panic!("not unavailable: {other:?}"),
+    }
+}
+
+/// A hung read costs the pool's thread, not the caller's: the call answers when its time is up,
+/// one more waits in the queue and times out, and with the queue full the next is refused at
+/// once. Each step waits for the pool's thread to get there, never for a margin of time.
+#[test]
+fn a_hung_read_times_out_and_a_busy_pool_refuses_at_once() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    std::fs::write(
+        claude_file(home.path(), FIXTURE_ID),
+        fixture_lines().concat(),
+    )
+    .unwrap();
+    let (gate, reads) = Gate::new();
+    let gate = Arc::new(gate);
+    // A safety valve: were a read ever made on the caller's thread, this test would hang
+    // instead of failing.
+    std::thread::spawn({
+        let gate = Arc::clone(&gate);
+        move || {
+            std::thread::sleep(CEILING);
+            gate.open();
+        }
+    });
+    let (runner, s) = watch_with(home.path(), state.path(), gate.clone());
+    let pages = runner
+        .transcripts_with(PageOptions {
+            timeout: Duration::from_millis(300),
+            workers: 1,
+            queue: 1,
+        })
+        .unwrap();
+
+    let first = pages.transcript_page(s, None, None);
+    assert_eq!(reason(&first), "the transcript took too long to read");
+    reads
+        .recv_timeout(CEILING)
+        .expect("the only thread is in the hung read");
+    // The queue was empty: this one waits there, and times out.
+    let second = pages.transcript_page(s, None, None);
+    assert_eq!(reason(&second), "the transcript took too long to read");
+    // The queue is full: refused without waiting for an answer.
+    let third = pages.transcript_page(s, None, None);
+    assert_eq!(
+        reason(&third),
+        "the runner is busy reading other transcripts"
+    );
+
+    // The file system answers again: the queued read runs, and pages are served.
+    gate.open();
+    reads.recv_timeout(CEILING).expect("the queued read ran");
+    assert!(
+        common::eventually(CEILING, || pages.transcript_page(s, None, None).is_ok()),
+        "pages are served again"
+    );
+    runner.stop();
+}
+
+/// Log lines, captured from every thread (the page threads too).
+fn logs() -> &'static Arc<Mutex<Vec<u8>>> {
+    static LOGS: OnceLock<Arc<Mutex<Vec<u8>>>> = OnceLock::new();
+    LOGS.get_or_init(|| {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&buf);
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || LogWriter(Arc::clone(&writer)))
+            .init();
+        buf
+    })
+}
+
+struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The level of each logged page failure of `session`.
+fn page_failures(session: SessionId) -> Vec<String> {
+    let session = session.to_string();
+    String::from_utf8_lossy(&logs().lock().unwrap())
+        .lines()
+        .filter(|l| l.contains("a transcript page failed") && l.contains(&session))
+        .map(|l| {
+            if l.contains(" WARN ") {
+                "warn".to_owned()
+            } else if l.contains("DEBUG") {
+                "debug".to_owned()
+            } else {
+                l.to_owned()
+            }
+        })
+        .collect()
+}
+
+/// A client that keeps asking for a page that cannot be read fills the log with one warning per
+/// session; the rest are at debug.
+#[test]
+fn a_failed_page_is_a_warning_once_per_session() {
+    let _ = logs();
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    std::fs::write(
+        claude_file(home.path(), FIXTURE_ID),
+        fixture_lines().concat(),
+    )
+    .unwrap();
+    let (runner, s) = watch_with(home.path(), state.path(), Arc::new(BrokenPages::default()));
+    for _ in 0..3 {
+        let r = runner.transcript_page(s, None, None);
+        assert_eq!(reason(&r), "the transcript could not be read");
+    }
+    runner.stop();
+    assert_eq!(page_failures(s), ["warn", "debug", "debug"]);
 }

@@ -19,6 +19,7 @@
 //! The optional `changes()` push hint is not provided: the `Runtime` trait has no change
 //! notification to build it from.
 
+use crate::pool::{Pool, PoolError};
 use crate::store::{Store, StoreError, TerminalRow};
 use pitcrew_api::terminal::{Attachment, TerminalError, Terminals};
 use pitcrew_interfaces::runtime::{OutputChunk, Runtime, RuntimeError, StartSpec, TerminalInfo};
@@ -26,8 +27,6 @@ use pitcrew_protocol::ids::{SessionId, TerminalId};
 use pitcrew_protocol::runner::Key;
 use std::fmt;
 use std::io;
-use std::panic::AssertUnwindSafe;
-use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -334,34 +333,17 @@ impl Attachment for RunnerAttachment {
     }
 }
 
-type Job = Box<dyn FnOnce() + Send + 'static>;
-
-/// A small pool of threads for blocking runtime calls, so a caller can stop waiting for one.
+/// Runtime calls, on a small pool of threads (see `pool`), so a caller can stop waiting for one.
 struct Calls {
-    queue: SyncSender<Job>,
+    pool: Pool,
 }
 
 impl Calls {
     /// The threads end once the pool is dropped and the calls they are in return.
     fn start(workers: usize, queue: usize) -> io::Result<Self> {
-        let (tx, rx) = mpsc::sync_channel::<Job>(queue.max(1));
-        let rx = Arc::new(Mutex::new(rx));
-        for i in 0..workers.max(1) {
-            let rx = Arc::clone(&rx);
-            std::thread::Builder::new()
-                .name(format!("pitcrew-runtime-{i}"))
-                .spawn(move || {
-                    loop {
-                        let job = rx.lock().unwrap_or_else(PoisonError::into_inner).recv();
-                        let Ok(job) = job else {
-                            return;
-                        };
-                        // A panic drops the job's reply channel; its caller sees that.
-                        let _ = std::panic::catch_unwind(AssertUnwindSafe(job));
-                    }
-                })?;
-        }
-        Ok(Self { queue: tx })
+        Ok(Self {
+            pool: Pool::start("pitcrew-runtime", workers, queue)?,
+        })
     }
 
     fn run<T: Send + 'static>(
@@ -369,29 +351,18 @@ impl Calls {
         timeout: Duration,
         f: impl FnOnce() -> Result<T, RuntimeError> + Send + 'static,
     ) -> Result<T, TerminalError> {
-        let (reply, answer) = mpsc::sync_channel(1);
-        let job: Job = Box::new(move || {
-            let _ = reply.send(f());
-        });
-        match self.queue.try_send(job) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                return Err(TerminalError::Unavailable(
-                    "The terminal runtime is busy.".into(),
-                ));
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                return Err(TerminalError::Unavailable(
-                    "The terminal runtime has stopped.".into(),
-                ));
-            }
-        }
-        match answer.recv_timeout(timeout) {
+        match self.pool.run(timeout, f) {
             Ok(result) => result.map_err(TerminalError::from),
-            Err(RecvTimeoutError::Timeout) => Err(TerminalError::Unavailable(format!(
+            Err(PoolError::Busy) => Err(TerminalError::Unavailable(
+                "The terminal runtime is busy.".into(),
+            )),
+            Err(PoolError::Stopped) => Err(TerminalError::Unavailable(
+                "The terminal runtime has stopped.".into(),
+            )),
+            Err(PoolError::TimedOut) => Err(TerminalError::Unavailable(format!(
                 "The terminal runtime did not answer within {timeout:?}."
             ))),
-            Err(RecvTimeoutError::Disconnected) => Err(TerminalError::Failed(
+            Err(PoolError::Panicked) => Err(TerminalError::Failed(
                 "The terminal runtime call panicked.".into(),
             )),
         }
@@ -401,6 +372,7 @@ impl Calls {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
 
     /// Waits for the pool's thread to reach a point, however loaded the machine is.
     const REACHED: Duration = Duration::from_secs(60);
@@ -442,8 +414,14 @@ mod tests {
         });
         assert!(timed_out(&second), "{second:?}");
         // ...and with the queue full, another is refused at once, not after its timeout.
+        let asked = Instant::now();
         let third = calls.run(Duration::from_secs(10), || Ok(2));
         assert!(refused(&third), "{third:?}");
+        assert!(
+            asked.elapsed() < Duration::from_secs(9),
+            "{:?}",
+            asked.elapsed()
+        );
 
         // Unstuck, the thread runs the queued call, and the pool works again.
         release.send(()).expect("the stuck call is waiting");

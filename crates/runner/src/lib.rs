@@ -61,6 +61,7 @@ mod hooks;
 mod link;
 mod pages;
 mod plain;
+mod pool;
 mod sink;
 mod store;
 mod store_sink;
@@ -72,7 +73,7 @@ pub use commands::{CommandOptions, RunnerCommands};
 pub use config::{EngineHome, PollMode, RunnerConfig, Timing};
 pub use hooks::RunnerHooks;
 pub use link::{Locations, MemoryLocations, WorkstreamLocation};
-pub use pages::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, PageError, RunnerTranscripts};
+pub use pages::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, PageError, PageOptions, RunnerTranscripts};
 pub use sink::{EventSink, SinkError};
 pub use store::StoreError;
 pub use store_sink::StoreSink;
@@ -111,6 +112,7 @@ pub struct RunnerHandle {
     shared: Arc<watch::Shared>,
     store: Arc<Mutex<store::Store>>,
     watched: Arc<pages::Watched>,
+    transcripts: RunnerTranscripts,
     homes: Vec<EngineHome>,
     stopping: Arc<AtomicBool>,
     watcher: Option<JoinHandle<()>>,
@@ -161,10 +163,24 @@ impl RunnerHandle {
         )?)
     }
 
-    /// Transcript pages of the sessions this runner watches, for the API's transcript route.
+    /// Transcript pages of the sessions this runner watches, for the API's transcript route,
+    /// with default options. Every clone shares the threads the runner started for them.
     #[must_use]
     pub fn transcripts(&self) -> RunnerTranscripts {
-        RunnerTranscripts::new(Arc::clone(&self.watched), Arc::clone(&self.store))
+        self.transcripts.clone()
+    }
+
+    /// Transcript pages, with threads of their own tuned by `options`.
+    ///
+    /// # Errors
+    ///
+    /// The threads that read pages cannot start.
+    pub fn transcripts_with(&self, options: PageOptions) -> Result<RunnerTranscripts, RunnerError> {
+        Ok(RunnerTranscripts::new(
+            Arc::clone(&self.watched),
+            Arc::clone(&self.store),
+            options,
+        )?)
     }
 
     /// A page of `session`'s transcript, per api-v1's "Transcript paging". Blocking; see
@@ -180,7 +196,7 @@ impl RunnerHandle {
         before: Option<u64>,
         limit: Option<usize>,
     ) -> Result<TranscriptPage, PageError> {
-        self.transcripts().transcript_page(session, before, limit)
+        self.transcripts.transcript_page(session, before, limit)
     }
 
     /// Runs hub commands in `terminals`, with default options.
@@ -248,6 +264,11 @@ pub fn start(
     let (tx, rx) = std::sync::mpsc::sync_channel(config.channel_capacity.max(1));
     let shared = Arc::new(watch::Shared::default());
     let watched = Arc::new(pages::Watched::default());
+    let transcripts = RunnerTranscripts::new(
+        Arc::clone(&watched),
+        Arc::clone(&store),
+        PageOptions::default(),
+    )?;
     let stopping = Arc::new(AtomicBool::new(false));
     let retry_max = config.timing.sink_retry_max;
     let homes = config.homes.clone();
@@ -284,6 +305,7 @@ pub fn start(
         shared,
         store,
         watched,
+        transcripts,
         homes,
         stopping,
         watcher: None,

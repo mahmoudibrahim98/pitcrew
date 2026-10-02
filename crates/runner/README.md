@@ -131,9 +131,17 @@ limit)` serves api-v1's "Transcript paging":
   than 1000 counts as 1000 (`MAX_PAGE_LIMIT`), and `0` as `1`.
 - **Errors.** `PageError::UnknownSession`: the runner's index has never had the session.
   `PageError::Unavailable { reason }`: it has, but the transcript is deleted, no longer watched,
-  or cannot be read (an I/O error, an adapter that fails or panics). `reason` names no path.
-- **Blocking.** It reads the file on the caller's thread: run it on the blocking pool, with a
-  timeout (a network filesystem that stops answering may not return).
+  or cannot be read (an I/O error, an adapter that fails or panics), or the read did not end in
+  time, or too many are under way. `reason` names no path.
+- **Bounded.** Reads run on the runner's own small pool (`PageOptions`: 2 threads, 4 waiting,
+  10 seconds by default) and the call waits at most the timeout; a read that does not return is
+  left on its pool thread. With every thread busy and the queue full, a call is refused at once
+  (`Unavailable`, "busy"). So a file system that stops answering, and a UI that keeps polling,
+  tie up these threads only, never the caller's (nor tokio's blocking pool, which the hook
+  intake uses too). `transcripts()` clones share the pool the runner starts;
+  `transcripts_with(options)` gets one of its own.
+- **Logging.** A failed page is logged as a warning the first time for a session, then at debug.
+- **Blocking**, for at most the timeout: call it from `spawn_blocking`, not on an async thread.
 - Like the hooks, it keeps reading after the runner stops, and keeps its index open.
 
 ### For stream 0: replacing the daemon's stand-in
@@ -146,16 +154,21 @@ session id, from its index. To switch:
    `Found`), and keep `handle.transcripts()` in `Runner` next to `hooks` and `terminals`, with an
    accessor.
 2. Keep the route's own checks: the query (`400` for a `before` or `limit` that is not a whole
-   number, and for `limit=0`), the hub's lookup (`404` for a session the hub does not have), the
-   machine (`503` for another machine, or without a runner), and the 10-second timeout around a
-   `spawn_blocking` read.
+   number, and for `limit=0`), the hub's lookup (`404` for a session the hub does not have), and
+   the machine (`503` for another machine, or without a runner). Call the runner from
+   `spawn_blocking`. The route's own 10-second timeout may stay, but the call is bounded now
+   (by `PageOptions::timeout`), so a hung file system no longer leaves a tokio blocking thread
+   behind per request: it ties up at most the runner's page threads, and further requests are
+   refused at once.
 3. Replace `Found::find` and `adapter.read_page` with
    `transcripts.transcript_page(session, before, Some(limit))` (or pass the query's `Option` and
    let the runner apply the default and the cap), and map:
    - `Ok(page)` → `200`;
    - `PageError::UnknownSession` → `404`;
-   - `PageError::Unavailable` → `503 unavailable`.
-4. Delete `Found`, `Recorded`, `names` and their tests.
+   - `PageError::Unavailable` → `503 unavailable` (busy and timed-out reads too; their `reason`
+     says which, and a `Retry-After` would suit them).
+4. Delete `Found`, `Recorded`, `names` and their tests, and the route's own warning on a failed
+   read: the runner logs a failed page as a warning once per session, then at debug.
 
 Three answers change. A deleted transcript was an empty page and is now `503`; a read error was
 `500` and is now `503`; and a session the hub has on this machine that the runner never indexed
