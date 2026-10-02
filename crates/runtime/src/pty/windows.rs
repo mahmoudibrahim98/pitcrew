@@ -43,6 +43,7 @@ use windows_sys::Win32::Security::{
     TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel,
     TokenUser,
 };
+use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -60,6 +61,9 @@ pub const MEDIUM_INTEGRITY: u32 = 0x2000;
 pub const HIGH_INTEGRITY: u32 = 0x3000;
 /// The integrity level of a sandboxed (low) process.
 pub const LOW_INTEGRITY: u32 = 0x1000;
+/// What [`PipeSecurity`] grants its one user (`GA`, generic all), as a pipe's DACL reads it
+/// back: `FILE_ALL_ACCESS` (`FA` in SDDL).
+pub const PIPE_FULL_ACCESS: u32 = FILE_ALL_ACCESS;
 
 /// Who a process or a pipe's client is: its user's SID, and its integrity level (the RID of its
 /// mandatory label: [`MEDIUM_INTEGRITY`] for a normal process, [`HIGH_INTEGRITY`] elevated).
@@ -311,10 +315,20 @@ pub struct Dacl {
 /// One entry of a [`Dacl`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ace {
-    /// Allows access to this SID (`ACCESS_ALLOWED_ACE_TYPE`).
-    Allow(String),
-    /// Denies access to this SID (`ACCESS_DENIED_ACE_TYPE`).
-    Deny(String),
+    /// Allows the access in `mask` to `sid` (`ACCESS_ALLOWED_ACE_TYPE`).
+    Allow {
+        /// The SID, e.g. `S-1-5-21-…`.
+        sid: String,
+        /// The access mask, as stored (generic rights read back mapped, e.g. `FILE_ALL_ACCESS`).
+        mask: u32,
+    },
+    /// Denies the access in `mask` to `sid` (`ACCESS_DENIED_ACE_TYPE`).
+    Deny {
+        /// The SID.
+        sid: String,
+        /// The access mask, as stored.
+        mask: u32,
+    },
     /// Any other kind of entry, by its type number.
     Other(u8),
 }
@@ -397,12 +411,15 @@ unsafe fn read_dacl(descriptor: PSECURITY_DESCRIPTOR, acl: *const ACL) -> io::Re
                 // SAFETY: entries of both types are laid out as `ACCESS_ALLOWED_ACE` (an
                 // `ACCESS_DENIED_ACE` is the same), and the SID begins at `SidStart`, inside the
                 // entry, which lives as long as the DACL.
-                let sid = unsafe { &raw mut (*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart };
+                let (mask, sid) = unsafe {
+                    let entry = ace.cast::<ACCESS_ALLOWED_ACE>();
+                    ((*entry).Mask, &raw mut (*entry).SidStart)
+                };
                 let sid = sid_string(sid.cast::<c_void>())?;
                 if kind == ACCESS_ALLOWED_ACE_TYPE {
-                    Ace::Allow(sid)
+                    Ace::Allow { sid, mask }
                 } else {
-                    Ace::Deny(sid)
+                    Ace::Deny { sid, mask }
                 }
             }
             other => Ace::Other(other),
@@ -738,7 +755,10 @@ mod tests {
                 dacl(&server).expect("dacl"),
                 Dacl {
                     protected: true,
-                    entries: vec![Ace::Allow(sid.clone())],
+                    entries: vec![Ace::Allow {
+                        sid: sid.clone(),
+                        mask: PIPE_FULL_ACCESS,
+                    }],
                 }
             );
             assert_eq!(owner_sid(&server).expect("owner"), sid);

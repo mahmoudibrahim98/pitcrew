@@ -308,10 +308,20 @@ pub(crate) struct Dacl {
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Ace {
-    /// Allows access to this SID (`ACCESS_ALLOWED_ACE_TYPE`).
-    Allow(String),
-    /// Denies access to this SID (`ACCESS_DENIED_ACE_TYPE`).
-    Deny(String),
+    /// Allows the access in `mask` to `sid` (`ACCESS_ALLOWED_ACE_TYPE`).
+    Allow {
+        /// The SID, e.g. `S-1-5-21-…`.
+        sid: String,
+        /// The access mask, as stored (generic rights read back mapped, e.g. `FILE_ALL_ACCESS`).
+        mask: u32,
+    },
+    /// Denies the access in `mask` to `sid` (`ACCESS_DENIED_ACE_TYPE`).
+    Deny {
+        /// The SID.
+        sid: String,
+        /// The access mask, as stored.
+        mask: u32,
+    },
     /// Any other kind of entry, by its type number.
     Other(u8),
 }
@@ -400,7 +410,10 @@ unsafe fn read_dacl(
                 // SAFETY: entries of both types are laid out as `ACCESS_ALLOWED_ACE` (an
                 // `ACCESS_DENIED_ACE` is the same), and the SID begins at `SidStart`, inside the
                 // entry, which lives as long as the DACL.
-                let sid = unsafe { &raw mut (*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart };
+                let (mask, sid) = unsafe {
+                    let entry = ace.cast::<ACCESS_ALLOWED_ACE>();
+                    ((*entry).Mask, &raw mut (*entry).SidStart)
+                };
                 let mut wide: *mut u16 = ptr::null_mut();
                 // SAFETY: `sid` points into the live DACL; `wide` is a valid out-pointer.
                 if unsafe { ConvertSidToStringSidW(sid.cast::<c_void>(), &mut wide) } == 0
@@ -411,9 +424,9 @@ unsafe fn read_dacl(
                 // SAFETY: a NUL-terminated `LocalAlloc` string from the call above, used once.
                 let sid = unsafe { take_local_string(wide) };
                 if kind == ACCESS_ALLOWED_ACE_TYPE {
-                    Ace::Allow(sid)
+                    Ace::Allow { sid, mask }
                 } else {
-                    Ace::Deny(sid)
+                    Ace::Deny { sid, mask }
                 }
             }
             other => Ace::Other(other),
