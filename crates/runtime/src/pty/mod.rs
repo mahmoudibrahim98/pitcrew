@@ -120,7 +120,8 @@ impl Default for PtyOptions {
 
 /// Checks that `endpoint` is safe to listen on or connect to: on Unix, a socket path in a
 /// private directory of the user's (created 0700 if missing; see the tmux runtime's rules),
-/// with nothing but a socket of the user's there; on Windows, a local pipe name.
+/// with nothing but a socket of the user's there; on Windows, a local pipe name
+/// ([`is_local_pipe_name`]).
 ///
 /// # Errors
 ///
@@ -133,15 +134,39 @@ pub fn check_endpoint(endpoint: &Path) -> Result<(), String> {
     #[cfg(not(unix))]
     {
         let name = endpoint.to_string_lossy();
-        let prefix = r"\\.\pipe\";
-        let named = name
-            .get(..prefix.len())
-            .is_some_and(|p| p.eq_ignore_ascii_case(prefix));
-        if !named || name.len() == prefix.len() || name.len() > 256 {
-            return Err(format!("{name} is not a local pipe name (\\\\.\\pipe\\…)"));
+        if is_local_pipe_name(&name) {
+            Ok(())
+        } else {
+            Err(format!(
+                "{name} is not a local pipe name (\\\\.\\pipe\\ and letters, digits, '.', '_' \
+                 or '-', not ending in '.')"
+            ))
         }
-        Ok(())
     }
+}
+
+/// `\\.\pipe\<name>` where the name is `[A-Za-z0-9._-]+`, does not end in a dot, and the whole
+/// is at most 256 characters (the CLI's rule for the daemon's pipe).
+///
+/// Win32 normalizes `\\.\` paths, so a name with `\`, `/` or `..` could leave the pipe namespace:
+/// `\\.\pipe\..\UNC\host\share\x` is an SMB path (connecting would send the user's credentials
+/// to that host), and `\\.\pipe\..\C:\x` a file. Trailing dots are stripped too, so `.`, `..`
+/// and `x.` are refused.
+pub fn is_local_pipe_name(full: &str) -> bool {
+    let prefix = r"\\.\pipe\";
+    let Some(name) = full
+        .get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &full[prefix.len()..])
+    else {
+        return false;
+    };
+    full.len() <= 256
+        && !name.is_empty()
+        && !name.ends_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 /// The PTY runtime is usable: the runner can report [`Capability::Pty`].
@@ -700,6 +725,39 @@ mod tests {
         let options = PtyOptions::new("/tmp/x/ptyd");
         assert_eq!(options.call_timeout, Duration::from_secs(5));
         assert_eq!(options.idle_exit, None);
+    }
+
+    #[test]
+    fn pipe_names_stay_in_the_local_pipe_namespace() {
+        for good in [
+            r"\\.\pipe\pitcrew-ptyd-S-1-5-21-1-2-3-1001",
+            r"\\.\pipe\pitcrew-ptyd-S-1-5-21-1-2-3-1001-elevated",
+            r"\\.\PIPE\a.b_c-d",
+            r"\\.\pipe\x",
+        ] {
+            assert!(is_local_pipe_name(good), "{good}");
+        }
+        let long = format!(r"\\.\pipe\{}", "x".repeat(250));
+        for bad in [
+            r"\\.\pipe\..\UNC\host\share\x",
+            r"\\.\pipe\..\C:\x",
+            r"\\.\pipe\a\..\..\UNC\host\share",
+            r"\\.\pipe\UNC\host\share",
+            r"\\.\pipe\a/b",
+            r"\\.\pipe\..",
+            r"\\.\pipe\.",
+            r"\\.\pipe\x.",
+            r"\\.\pipe\",
+            r"\\.\pipe\a b",
+            r"\\.\pipe\a:b",
+            r"\\host\pipe\x",
+            r"\\?\pipe\x",
+            r"C:\pipe\x",
+            "pipe-name",
+            long.as_str(),
+        ] {
+            assert!(!is_local_pipe_name(bad), "{bad}");
+        }
     }
 
     #[test]
