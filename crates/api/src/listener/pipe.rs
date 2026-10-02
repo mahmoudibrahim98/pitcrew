@@ -94,7 +94,7 @@ impl axum::serve::Listener for NamedPipe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::listener::pipe_security::{current_user_sid, dacl_sddl, owner_sid};
+    use crate::listener::pipe_security::{Ace, Dacl, current_user_sid, dacl, owner_sid};
 
     #[tokio::test]
     async fn the_current_user_owns_it_and_alone_has_access() {
@@ -104,11 +104,16 @@ mod tests {
             .as_nanos();
         let name = format!(r"\\.\pipe\pitcrewd-unit-{}-{nanos}", std::process::id());
         let pipe = NamedPipe::bind(&name).unwrap();
-        let sddl = dacl_sddl(&pipe.next).unwrap();
         let sid = current_user_sid().unwrap();
-        assert!(sddl.starts_with("D:P"), "{sddl}");
-        assert_eq!(sddl.matches("(A;").count(), 1, "{sddl}");
-        assert!(sddl.contains(&sid), "{sddl} lacks {sid}");
+        // Compared as SIDs: the DACL's SDDL text names some users by alias (the built-in
+        // Administrator, as CI's runner is, by `LA`).
+        assert_eq!(
+            dacl(&pipe.next).unwrap(),
+            Dacl {
+                protected: true,
+                entries: vec![Ace::Allow(sid.clone())],
+            }
+        );
         // Named explicitly, so even an elevated daemon's pipe is owned by the user.
         assert_eq!(owner_sid(&pipe.next).unwrap(), sid);
         // A client reads the same owner through its own handle.

@@ -6,6 +6,8 @@ import { createServer } from 'node:net';
 import { fileURLToPath } from 'node:url';
 
 const SERVER = fileURLToPath(new globalThis.URL('../../mock-hub/src/server.ts', import.meta.url));
+// The tests' pinned clock, so the hub stamps events on the same time line as the UI.
+const CLOCK = new globalThis.URL('./clock.ts', import.meta.url).href;
 
 export async function freePort(): Promise<number> {
   const server = createServer();
@@ -22,7 +24,7 @@ export interface HubProcess {
 }
 
 export async function spawnHub(port: number): Promise<HubProcess> {
-  const child = spawn(process.execPath, [SERVER], {
+  const child = spawn(process.execPath, ['--import', CLOCK, SERVER], {
     env: { ...process.env, PORT: String(port) },
     stdio: ['ignore', 'pipe', 'inherit'],
   });

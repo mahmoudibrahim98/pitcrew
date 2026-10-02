@@ -954,11 +954,11 @@ impl Remotes {
         let name = name.to_owned();
         let options = DeployOptions {
             progress: Some(Arc::new(move |p: pitcrew_remote::helper::Progress| {
-                let percent = if p.total == 0 {
-                    100
-                } else {
-                    p.sent.saturating_mul(100) / p.total
-                };
+                let percent = p
+                    .sent
+                    .saturating_mul(100)
+                    .checked_div(p.total)
+                    .unwrap_or(100);
                 // Every 10 %, and once at the end.
                 let step = percent / 10;
                 if reported.fetch_max(step + 1, Ordering::Relaxed) <= step {

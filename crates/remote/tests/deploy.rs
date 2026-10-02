@@ -441,11 +441,17 @@ mod unix {
         me
     }
 
+    /// The first executable file named `name` on the `PATH`, as a shell finds it. A file that is
+    /// not executable is passed over: some installers leave one named `env` in `~/.local/bin`,
+    /// to be sourced, and a link to it would leave the sandbox without a working `env`.
     pub(crate) fn which(name: &str) -> Option<PathBuf> {
         let path = std::env::var_os("PATH")?;
         std::env::split_paths(&path)
             .map(|dir| dir.join(name))
-            .find(|p| p.is_file())
+            .find(|p| {
+                std::fs::metadata(p)
+                    .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            })
     }
 
     /// A script named `name` in `bin`.

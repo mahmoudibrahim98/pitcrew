@@ -11,7 +11,9 @@
 //!   filled with exactly that class, aligned for it (`u64` storage). The SID it points to lies
 //!   inside that buffer, which outlives its use.
 //! - Memory Win32 allocates with `LocalAlloc` (strings, descriptors) is freed exactly once with
-//!   `LocalFree`, after its last use.
+//!   `LocalFree`, after its last use. Pointers into a descriptor (its owner, its DACL and the
+//!   DACL's entries) are used only while it lives.
+//! - A DACL entry is read as the structure its header's type names.
 //! - Handles we open are owned by `OwnedHandle` and closed exactly once. Handles we are given
 //!   are borrowed (`AsHandle`), so they stay open for the call.
 //! - A descriptor is never changed after creation and Win32 only reads it, so sharing it between
@@ -34,10 +36,12 @@ use windows_sys::Win32::Security::Authorization::{
     SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    DACL_SECURITY_INFORMATION, GetTokenInformation, LABEL_SECURITY_INFORMATION,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce,
+    GetSecurityDescriptorControl, GetTokenInformation, LABEL_SECURITY_INFORMATION,
     OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    RevertToSelf, SECURITY_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
-    TOKEN_USER, TokenIntegrityLevel, TokenUser,
+    RevertToSelf, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR_CONTROL,
+    TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel,
+    TokenUser,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -293,13 +297,121 @@ pub fn owner_sid(object: &impl AsHandle) -> io::Result<String> {
     sid
 }
 
-/// The DACL of a kernel object (such as a pipe), in SDDL: for checks and tests.
+/// A kernel object's DACL, read part by part rather than as SDDL text: SDDL writes some SIDs as
+/// aliases (the built-in Administrator as `LA`, say), so comparing its text with a SID string is
+/// wrong. Each SID here is in its full form (`S-1-5-21-…`), which names one SID exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Dacl {
+    /// Protected: it inherits no entries from a parent (`SE_DACL_PROTECTED`, `P` in SDDL).
+    pub protected: bool,
+    /// Its entries, in order.
+    pub entries: Vec<Ace>,
+}
+
+/// One entry of a [`Dacl`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ace {
+    /// Allows access to this SID (`ACCESS_ALLOWED_ACE_TYPE`).
+    Allow(String),
+    /// Denies access to this SID (`ACCESS_DENIED_ACE_TYPE`).
+    Deny(String),
+    /// Any other kind of entry, by its type number.
+    Other(u8),
+}
+
+// From `Win32_System_SystemServices`, a feature needed for nothing else.
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+
+/// The DACL of a kernel object (such as a pipe), read through any handle opened with
+/// `READ_CONTROL`: for checks and tests.
 ///
 /// # Errors
 ///
-/// If it cannot be read.
-pub fn dacl_sddl(object: &impl AsHandle) -> io::Result<String> {
-    security_sddl(object, DACL_SECURITY_INFORMATION)
+/// If it cannot be read, or the object has no DACL at all (which would let anyone in).
+pub fn dacl(object: &impl AsHandle) -> io::Result<Dacl> {
+    let mut acl: *mut ACL = ptr::null_mut();
+    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+    // SAFETY: the handle is borrowed from a live object; `acl` and `descriptor` are valid
+    // out-pointers and the unused ones are null, as allowed. `acl` points into `descriptor`,
+    // freed below after the last use of `acl`.
+    let status = unsafe {
+        GetSecurityInfo(
+            object.as_handle().as_raw_handle(),
+            SE_KERNEL_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut acl,
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(
+            i32::try_from(status).unwrap_or(-1),
+        ));
+    }
+    // SAFETY: `descriptor` came from the call above and is still alive; `acl` is its DACL or
+    // null.
+    let read = unsafe { read_dacl(descriptor, acl) };
+    // SAFETY: allocated by `GetSecurityInfo`, freed once, after the last use of `acl`.
+    unsafe {
+        LocalFree(descriptor);
+    }
+    read
+}
+
+/// Reads a descriptor's DACL into a [`Dacl`].
+///
+/// # Safety
+///
+/// `descriptor` must be a live security descriptor, and `acl` null or that descriptor's DACL.
+unsafe fn read_dacl(descriptor: PSECURITY_DESCRIPTOR, acl: *const ACL) -> io::Result<Dacl> {
+    let mut control: SECURITY_DESCRIPTOR_CONTROL = 0;
+    let mut revision = 0u32;
+    // SAFETY: `descriptor` is live (guaranteed by the caller); both out-pointers are valid.
+    if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if acl.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the object has no DACL, so anyone may open it",
+        ));
+    }
+    // SAFETY: `acl` is the descriptor's live DACL (guaranteed by the caller).
+    let count = unsafe { (*acl).AceCount };
+    let mut entries = Vec::with_capacity(usize::from(count));
+    for index in 0..u32::from(count) {
+        let mut ace: *mut c_void = ptr::null_mut();
+        // SAFETY: `acl` is live and `index` is below its entry count; `ace` is a valid
+        // out-pointer, and receives a pointer into the DACL.
+        if unsafe { GetAce(acl, index, &mut ace) } == 0 || ace.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: every entry starts with an `ACE_HEADER`, and entries are 4-byte aligned.
+        let kind = unsafe { (*ace.cast::<ACE_HEADER>()).AceType };
+        entries.push(match kind {
+            ACCESS_ALLOWED_ACE_TYPE | ACCESS_DENIED_ACE_TYPE => {
+                // SAFETY: entries of both types are laid out as `ACCESS_ALLOWED_ACE` (an
+                // `ACCESS_DENIED_ACE` is the same), and the SID begins at `SidStart`, inside the
+                // entry, which lives as long as the DACL.
+                let sid = unsafe { &raw mut (*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart };
+                let sid = sid_string(sid.cast::<c_void>())?;
+                if kind == ACCESS_ALLOWED_ACE_TYPE {
+                    Ace::Allow(sid)
+                } else {
+                    Ace::Deny(sid)
+                }
+            }
+            other => Ace::Other(other),
+        });
+    }
+    Ok(Dacl {
+        protected: (control & SE_DACL_PROTECTED) != 0,
+        entries,
+    })
 }
 
 /// The integrity level a kernel object's mandatory label gives it (such as a pipe's), read
@@ -622,10 +734,13 @@ mod tests {
                 .expect("pipe");
             let sid = current_user_sid().expect("sid");
             assert!(sid.starts_with("S-1-"), "{sid}");
-            let dacl = dacl_sddl(&server).expect("dacl");
-            assert!(dacl.starts_with("D:P"), "{dacl}");
-            assert_eq!(dacl.matches("(A;").count(), 1, "{dacl}");
-            assert!(dacl.contains(&sid), "{dacl}");
+            assert_eq!(
+                dacl(&server).expect("dacl"),
+                Dacl {
+                    protected: true,
+                    entries: vec![Ace::Allow(sid.clone())],
+                }
+            );
             assert_eq!(owner_sid(&server).expect("owner"), sid);
             // The name is taken: a second first instance is refused.
             assert!(

@@ -266,6 +266,13 @@ fn progress_is_monotonic_and_reaches_the_total() {
 fn an_unreadable_folder_and_an_unreadable_file_are_warnings_not_failures() {
     use std::os::unix::fs::PermissionsExt;
 
+    if rustix::process::geteuid().is_root() {
+        eprintln!(
+            "skipped: running as root, which reads folders and files whatever their mode, so \
+             nothing can be made unreadable"
+        );
+        return;
+    }
     let dir = tempfile::tempdir().expect("tempdir");
 
     // A whole home whose `projects` folder cannot be listed.

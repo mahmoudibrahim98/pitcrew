@@ -677,6 +677,13 @@ mod tests {
     #[test]
     fn a_failed_write_leaves_the_store_unchanged() {
         use std::os::unix::fs::PermissionsExt as _;
+        if crate::euid() == 0 {
+            eprintln!(
+                "skipped: running as root, which writes into a read-only directory anyway, so \
+                 the write cannot be made to fail"
+            );
+            return;
+        }
         let (_tmp, dir) = private_tmp();
         let store = FileTokenStore::open(dir.as_path()).unwrap();
         // A read-only directory makes creating the temporary file fail.
