@@ -9,7 +9,9 @@ See `docs/build/streams/L.md`, `docs/build/contracts/api-v1.md` and
 | `transport.ts` | The seam every request and socket goes through: `Transport` (`request(method, path, body) → { status, contentType, body }`, `openSocket(path) → TransportSocket`). `browserTransport()`: `fetch` and `WebSocket` with the bearer token (development). `TransportSocket.bufferedAmount` is bytes sent but not yet taken: the real `WebSocket`'s own, here. `isDesktop()`: `window.__TAURI_INTERNALS__` exists. |
 | `gateway.ts` | The desktop transport: the gateway's commands and channels, exactly as the contract says. No token, header or `VITE_*` value. `GatewaySocket.bufferedAmount` is the bytes still queued in its own outbox; past 8 MiB there the socket closes itself with 1013 (`the sender ignored back-pressure`), as the daemon does to a receiver that falls behind — a sender is expected to watch it, the same as a browser `WebSocket`'s. |
 | `desktop.tsx` | The desktop app's workspaces: `gateway_workspaces()` and `gateway://workspaces`, and one data scope per workspace (`Workspaces`, `<WorkspacesProvider>`). `open(id)`/`leave(id)` track which workspace is in view: a workspace left in the background for `backgroundMs` (10 minutes) has its stream closed, resumed with `since` by the next `open()` — see "Workspaces in the desktop app" below. `onNavigate()` subscribes to `gateway://navigate` before the first `gateway_workspaces()` call — the gateway holds a launch-time deep link until then — and holds a target that still arrives first until the list is known (`pendingNavigateMs`, 60 s, after which it is dropped rather than acted on with a stale list), so every delivery carries the list to check the target against. With `gateway.ts` and `@tauri-apps/api`, loaded only in the desktop app, by dynamic import; elsewhere import from them with `import type` only. |
-| `workspaces.tsx` | What the shell sees of them: `useGatewayWorkspaces()` (`null` in a browser), `<WorkspaceScope ws>`, `useGatewayNavigate(onTarget)` (follows `gateway://navigate`, raw and unvalidated — the shell checks it, `shell/gateway-navigate.ts` — together with the workspace list, already known by the time it fires), and the gateway's types. |
+| `workspaces.tsx` | What the shell sees of them: `useGatewayWorkspaces()` (`null` in a browser), `<WorkspaceScope ws>`, `useGatewayNavigate(onTarget)` (follows `gateway://navigate`, raw and unvalidated — the shell checks it, `shell/gateway-navigate.ts` — together with the workspace list, already known by the time it fires), `useRemoteGateway()` and `useGatewayPrompts()` (both `null` in a browser: see "Remote workspaces and prompts" below), and the gateway's types. |
+| `remote.ts` | Remote workspaces and SSH's prompts: the contract's types (`RemoteProbe`, `RemotePlanRequest`, `RemotePlan`, `RemoteProgress`, `GatewayPrompt`, `PromptReply`), the `RemoteGateway` interface, and the checks every answer and event passes (`parseRemoteProbe`, `parseRemotePlan`, `parseProgress`, `parsePrompt`, …). No Tauri: `gateway.ts` implements it. |
+| `setup.ts` | The first run: `setUp(api, queryClient, setup)`, `useSetUp()` and the `useSetup()` mutation (`POST /v1/setup`). It refreshes the workspace, `me`, members and machines itself (see "The first run" below); a `409` is a `SetupConflict` saying whether the workspace was `alreadySetUp`. |
 | `root.tsx` | `<AppData>`: picks the data layer once, at start, and loads it on demand: `desktop.tsx` in the desktop app; `browser.tsx` in a browser, in development only. A production build outside the desktop app fails closed: an error screen, no request. |
 | `browser.tsx` | The browser's data layer (development): `<DataProvider>` over `browserTransport` with `config.ts`. Never loaded in the desktop app; not in production builds. |
 | `errors.ts` | `ApiError { code, status }`, and `GatewayError` (an `ApiError` with status 0 and the gateway's own `gateway` code). |
@@ -74,6 +76,57 @@ reconnects at once (also when a connection attempt was still out). A workspace t
 The gateway emits `gateway://workspaces` only on changes, so a failed `gateway_workspaces()` is
 read again with back-off (1 s doubling to 30 s) until the list is known; the shell shows the error
 with a Retry button (`useGatewayWorkspaces().retry()`).
+
+## The first run: `setup_needed` and `useSetup()`
+
+`GET /v1/workspace` answers `setup_needed: true` while the hub has no person (api-v1.md, "The
+first run"); `useWorkspace().data.setup_needed` carries it, and the shell sends such a workspace to
+the first-run wizard. `POST /v1/setup` is the one write that updates the cache itself, because
+nothing in the event log says the workspace was named or set up:
+
+- on success, the workspace's entry gets the new name and `setup_needed: false`, and `me` the new
+  person, **at once**, so the shell never sees the stale flag and sends the person back into the
+  wizard; then the workspace, `me`, members and machines are invalidated (refetched, which also
+  cancels any fetch from before setup still in flight);
+- on `409`, it reads `GET /v1/workspace` again into the cache, and rejects with a `SetupConflict`
+  whose `alreadySetUp` says which `409` it was: the workspace is set up (go Home) or the handle is
+  taken;
+- anything else (`400 invalid`, say) rejects with the `ApiError` unchanged.
+
+`useSetup()` works in any data scope: the browser's hub, or one desktop workspace (a remote one
+just added, say), through that workspace's gateway transport.
+
+## Remote workspaces and prompts (desktop only)
+
+`Gateway.remote` (`remote.ts`, implemented in `gateway.ts`) carries the gateway's remote commands,
+exactly as desktop-gateway.md says: `sshHosts()`, `remoteProbe(host)` (with `tmux?.version` when
+the gateway gives it), `remotePlan(req)` (sent as one argument, `req`, like `gateway_request`),
+`remoteAdd(plan, onProgress)` (progress on a `Channel`: each `step` one of the plan's, the last
+`{ step: 'add', … }` for the whole add), `workspaceRemove(workspace, stopHelper)`,
+`workspaceRetry(workspace)`, `remoteCancel(plan)` (a gateway without the command rejects),
+`onPrompt`, `onPromptClosed` and `replyPrompt(id, { answer } | { accept } | {})`. Prompt kinds are
+`password`, `passphrase` and `otp` (an `answer`), `host_key` and `confirm` (`accept`), and
+`notice` (nothing to answer); `kind` says who asks, and the UI never guesses it from `text`.
+
+- **Every payload is checked.** A malformed answer to a command rejects with a `GatewayError`
+  (`internal`); a malformed progress message, prompt or `prompt-closed` is dropped (with one
+  warning that never quotes it). Workspaces, from the list, its event or `remoteAdd`, pass one
+  check (`toGatewayWorkspace`), which keeps `detail` only as a string; a list payload that is not a
+  list never replaces a known list (a read that is not one is retried, as a failed read is).
+- **Text** for people loses its control characters, except new lines and tabs in a prompt's
+  `text` and a progress `detail`. A long one keeps its **end**, where ssh's question (or the news)
+  is, behind a `…`. Plan steps and progress steps are cleaned the same way (`cleanStep`), so a
+  message still names its step. A job script is kept verbatim.
+- **Prompts** queue in the registry (`Workspaces.prompts`, oldest first; the same `id` again, as
+  the gateway sends after a page reload, keeps its place instead of queueing twice). The registry
+  follows `prompt`, `prompt-closed`, `workspaces` and `navigate` together, **before** its first
+  `gateway_workspaces` read: the gateway holds a prompt raised before the page listens (a
+  reconnect at launch) until that read. `gateway://prompt-closed` withdraws one; `replyPrompt`
+  takes one off and sends the reply once. **The queue never holds an answer**, and a refused reply
+  is not logged (its message could quote what was sent): the answer is read from the dialog's
+  uncontrolled field as it is sent (`shell/prompt-dialog.tsx`).
+- **In a browser** there is no registry: `useRemoteGateway()` and `useGatewayPrompts()` are `null`,
+  and the UI says that connecting a machine needs the desktop app.
 
 ## Sockets for features: `useOpenSocket()`
 

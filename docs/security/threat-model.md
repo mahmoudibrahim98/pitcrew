@@ -7,8 +7,8 @@ every review that finds a security issue, updates it.
   review `s/K/shell-and-gateway`, `s/J/slurm`, `s/G/jira-read`, `s/C/import-and-reopen`, the recap
   chain (`integrator/recap-contract`, `s/E/recap-index`, `s/H/recap-routes`, `s/L/recap-data`,
   `s/N/recap-views`) and `integrator/daemon-recaps`. The fuzz runs in §8 are against the same
-  commit. Still open: `s/B/control-hardening`, `s/K/tray-notifications-links`, `s/J/tunnel`,
-  `s/F/recap-hardening`, `s/D/hub-link`. The previous review was against `b251180`.
+  commit. The branches still open then (`s/B/control-hardening`, `s/K/tray-notifications-links`,
+  `s/J/tunnel`, `s/F/recap-hardening`, `s/D/hub-link`) have all merged since. The previous review was against `b251180`.
 - **Status:** **In place** (on `main`, with a test) · **Partial** (some of it on `main`) ·
   **Planned** (in an open branch, not on `main`) · **Open** (a gap: the owner must act; listed
   again in [Open items](#7-open-items)).
@@ -491,8 +491,8 @@ The seeds are 457 files, 342 KiB in all.
   `store_import` reaches the 1,000-line import batches only through its repetition byte,
   `jira_adf` the 20,000-node and 65,536-character caps only through its tree-building program,
   and `remote_site` the 64 KiB cap only through its padding bits.
-- `tmux_control` targets `feed` as it is on `main`; branch B changes it to return a `Result`
-  (O15).
+- `tmux_control` targets `feed`, which returns a `Result` since B's hardening merged (O15, closed):
+  a desync on arbitrary bytes is allowed, and small well-formed streams must parse.
 - `adapter_read`, `opencode_store`, `cli_hooks` and `store_import` are slow: each input writes
   files (and for the store, opens a database) before anything is checked.
 - `opencode_store` instruments PitCrew's code, not SQLite's: mutated database bytes mostly fail

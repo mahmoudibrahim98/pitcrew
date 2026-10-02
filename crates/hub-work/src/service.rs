@@ -78,7 +78,9 @@ pub struct WorkService {
     clock: Clock,
     writes: Mutex<()>,
     dispatcher: Option<Arc<dyn Dispatcher>>,
-    hub_machine: Option<MachineId>,
+    /// Set at construction, or later once a fresh hub is set up (see
+    /// [`WorkService::set_hub_machine`]).
+    hub_machine: Mutex<Option<MachineId>>,
     /// The recap index, built from the log on first use (see [`crate::RecapIndex`]).
     recaps: Mutex<RecapSync>,
     /// Called once, after `set_up` commits (see [`SetupListener`]).
@@ -91,7 +93,7 @@ impl std::fmt::Debug for WorkService {
             .field("workspace_id", &self.workspace_id)
             .field("store", &self.store)
             .field("dispatcher", &self.dispatcher)
-            .field("hub_machine", &self.hub_machine)
+            .field("hub_machine", &self.hub_machine())
             .finish_non_exhaustive()
     }
 }
@@ -108,7 +110,7 @@ impl WorkService {
             clock: Arc::new(system_clock),
             writes: Mutex::new(()),
             dispatcher: None,
-            hub_machine: None,
+            hub_machine: Mutex::new(None),
             recaps: Mutex::new(RecapSync::default()),
             setup_listener: None,
         }
@@ -133,9 +135,19 @@ impl WorkService {
     /// must set it: without it, such a dispatch answers `503 unavailable` (the hub does not guess
     /// one of the workspace's machines).
     #[must_use]
-    pub fn with_hub_machine(mut self, machine: MachineId) -> Self {
-        self.hub_machine = Some(machine);
+    pub fn with_hub_machine(self, machine: MachineId) -> Self {
+        self.set_hub_machine(machine);
         self
+    }
+
+    /// Sets the hub's machine on a service already shared, as [`WorkService::with_hub_machine`]
+    /// does at construction: for a fresh hub, whose machine exists only once `set_up` has run.
+    /// Dispatches from then on may run there.
+    pub fn set_hub_machine(&self, machine: MachineId) {
+        *self
+            .hub_machine
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(machine);
     }
 
     /// Calls `listener` once, after each successful `set_up` commits (see [`SetupListener`]): the
@@ -203,7 +215,10 @@ impl WorkService {
     }
 
     pub(crate) fn hub_machine(&self) -> Option<MachineId> {
-        self.hub_machine
+        *self
+            .hub_machine
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     pub(crate) fn setup_listener(&self) -> Option<Arc<dyn SetupListener>> {

@@ -27,6 +27,12 @@ pitcrew-fixtures.workspace = true
 pitcrew-runner.workspace = true
 pitcrew-ingest.workspace = true
 pitcrew-interfaces.workspace = true
+# `pitcrewd connect`: the stdio bridge a remote helper is reached through
+# (`pitcrew_remote::bridge::main`).
+pitcrew-remote.workspace = true
+# `pitcrewd init`: the `pitcrew` CLI's blocking client (its transport checks, HTTP and errors) for
+# `POST /v1/setup`. Not in the root's `[workspace.dependencies]`, hence the path.
+pitcrew-cli = { path = "../cli" }
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true

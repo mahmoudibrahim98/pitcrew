@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::{CollectSink, claude_file, config, discovered, fixture_lines_as, labels};
+use common::{CollectSink, claude_file, config, discovered, fixture_lines_as, labels, place};
 use pitcrew_api::Terminals as _;
 use pitcrew_ingest::claude::ClaudeAdapter;
 use pitcrew_interfaces::fake::FakeRuntime;
@@ -21,7 +21,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const WAIT: Duration = Duration::from_secs(5);
+/// Longest wait for the watcher thread. Waits end as soon as what they wait for happens; this is
+/// only a ceiling, generous so a loaded machine is slow, not a failure.
+const CEILING: Duration = Duration::from_secs(60);
 
 /// `FakeRuntime` that records what it started, and whose programs exit on Ctrl-C when asked to.
 #[derive(Debug, Default)]
@@ -158,13 +160,15 @@ fn a_started_session_is_linked_to_its_terminal_and_driven_through_it() {
         ]
     );
 
-    // The CLI writes its transcript: the session is discovered in its terminal.
-    std::fs::write(
-        claude_file(home.path(), &native),
-        fixture_lines_as(&native)[..3].concat(),
-    )
-    .unwrap();
-    r.sink.wait_for(2, WAIT).expect("discovery");
+    // The CLI writes its transcript: the session is discovered in its terminal. Its folder is
+    // new, so the folder watches may or may not see it in time; a rescan finds it either way,
+    // and the file appears whole, so whichever finds it reads all of it.
+    place(
+        &claude_file(home.path(), &native),
+        &fixture_lines_as(&native)[..3].concat(),
+    );
+    r.runner.rescan();
+    r.sink.wait_for(2, CEILING).expect("discovery");
     let session = discovered(&r.sink.events());
     assert_eq!(session.native_id, native);
     assert_eq!(session.terminal, Some(terminal));
@@ -206,7 +210,7 @@ fn a_started_session_is_linked_to_its_terminal_and_driven_through_it() {
     };
     assert_eq!(r.commands.run(end, &kill), ok());
     assert!(!runtime.info(terminal).unwrap().alive);
-    assert!(common::eventually(WAIT, || labels(&r.sink.events())
+    assert!(common::eventually(CEILING, || labels(&r.sink.events())
         .contains(&"ended".to_owned())));
     std::thread::sleep(Duration::from_millis(200));
     let events = r.sink.events();

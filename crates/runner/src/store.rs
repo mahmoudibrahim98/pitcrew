@@ -219,6 +219,16 @@ impl Store {
         Ok(keys)
     }
 
+    /// Whether the index has a row for `session`, whether or not its transcript is still there.
+    pub fn has_session(&self, session: SessionId) -> Result<bool, StoreError> {
+        let found: Option<i64> = self
+            .conn
+            .prepare_cached("SELECT 1 FROM transcripts WHERE session_id = ?1")?
+            .query_row([session.0.to_string()], |r| r.get(0))
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     /// Moves a row to the transcript's new canonical path (a folder above it became a symlink).
     pub fn set_path(&self, session: SessionId, path: &Path) -> Result<(), StoreError> {
         self.conn.execute(
@@ -289,7 +299,8 @@ impl Store {
         Ok(())
     }
 
-    /// The session whose transcript names itself `native_id`, if one is indexed.
+    /// The session whose transcript names itself `native_id`, if one is indexed. Sub-agents are
+    /// not sessions one resumes: one named like a session is never taken for it.
     pub fn session_by_native(
         &self,
         engine: Engine,
@@ -300,6 +311,7 @@ impl Store {
             .query_row(
                 "SELECT session_id FROM transcripts
                  WHERE engine = ?1 AND json_extract(meta, '$.native_id') = ?2
+                   AND NOT COALESCE(json_extract(meta, '$.is_subagent'), 0)
                  ORDER BY mtime DESC LIMIT 1",
                 params![engine_text(engine)?, native_id],
                 |r| r.get(0),
@@ -462,6 +474,17 @@ impl Store {
             [now.saturating_sub(OUTCOME_TTL_MS)],
         )?;
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Hides the transcripts table (or brings it back), so lookups in it fail.
+    #[cfg(test)]
+    pub fn hide_transcripts(&self, hidden: bool) -> Result<(), StoreError> {
+        self.conn.execute_batch(if hidden {
+            "ALTER TABLE transcripts RENAME TO transcripts_hidden"
+        } else {
+            "ALTER TABLE transcripts_hidden RENAME TO transcripts"
+        })?;
         Ok(())
     }
 
@@ -710,6 +733,35 @@ mod tests {
             meta: None,
             facts: Facts::default(),
         }
+    }
+
+    /// A sub-agent named like a session, even a newer one, is never the session to resume.
+    #[test]
+    fn a_sub_agent_named_like_a_session_is_not_that_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open");
+        let saved = |path: &str, mtime: TimestampMs, is_subagent: bool| {
+            let mut r = row(path);
+            r.mtime = mtime;
+            r.meta = Some(SessionMeta {
+                native_id: "n".into(),
+                is_subagent,
+                ..SessionMeta::default()
+            });
+            store.insert(&r).expect("insert");
+            store
+                .commit(&Commit::Full(Box::new(r.clone())))
+                .expect("full");
+            r.session
+        };
+        let session = saved("/t/n.jsonl", 1, false);
+        saved("/t/s/subagents/n.jsonl", 2, true);
+        assert_eq!(
+            store
+                .session_by_native(Engine::Claude, "n")
+                .expect("native"),
+            Some(session)
+        );
     }
 
     #[test]

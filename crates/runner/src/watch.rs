@@ -25,11 +25,12 @@
 
 use crate::agents::{SessionAgent, SessionAgents};
 use crate::config::{EngineHome, PollMode, Timing};
-use crate::derive::{self, Derived, Facts, Reported};
+use crate::derive::{self, Derived, Facts, Parent, Reported};
 use crate::fsinfo::{self, FileStat};
 use crate::held::Held;
 use crate::hooks::{self, Sender};
 use crate::link::{self, Locations, WorkstreamLocation};
+use crate::pages::Watched;
 use crate::sink::Batch;
 use crate::store::{Commit, Row, Store, path_text};
 use notify::event::{EventKind, MetadataKind, ModifyKind};
@@ -346,8 +347,11 @@ pub(crate) struct Watcher {
     last_rediscover: Option<Instant>,
     /// Workstream locations, to link sessions to.
     locations: Option<Arc<dyn Locations>>,
-    /// The CLI's session id → tracked transcript.
+    /// The CLI's session id → tracked transcript, for sessions; sub-agents have their own map,
+    /// looked up after it (see `map_native`).
     by_native: HashMap<(Engine, String), u64>,
+    /// A sub-agent's CLI id → tracked transcript.
+    by_sub_native: HashMap<(Engine, String), u64>,
     by_session: HashMap<SessionId, u64>,
     /// Hooks for sessions not indexed yet.
     held: Held,
@@ -355,6 +359,8 @@ pub(crate) struct Watcher {
     agents: Option<Arc<dyn SessionAgents>>,
     /// The agent lookup panicked; warned once.
     lookup_panicked: bool,
+    /// The tracked transcripts by session, for transcript pages.
+    watched: Arc<Watched>,
 }
 
 pub(crate) struct Setup {
@@ -372,6 +378,7 @@ pub(crate) struct Setup {
     pub shared: Arc<Shared>,
     pub locations: Option<Arc<dyn Locations>>,
     pub agents: Option<Arc<dyn SessionAgents>>,
+    pub watched: Arc<Watched>,
 }
 
 impl Watcher {
@@ -446,10 +453,12 @@ impl Watcher {
             last_rediscover: None,
             locations: s.locations,
             by_native: HashMap::new(),
+            by_sub_native: HashMap::new(),
             by_session: HashMap::new(),
             held: Held::default(),
             agents: s.agents,
             lookup_panicked: false,
+            watched: s.watched,
         }
     }
 
@@ -843,9 +852,21 @@ impl Watcher {
             .insert((row.path.clone(), row.inner_id.clone()), id);
         self.by_path.entry(row.path.clone()).or_default().push(id);
         self.by_session.insert(row.session, id);
-        if row.meta.is_some() {
-            self.by_native.insert((row.engine, native_id(&row)), id);
+        if let Some(meta) = &row.meta {
+            self.map_native(
+                id,
+                row.session,
+                row.engine,
+                &native_id(&row),
+                meta.is_subagent,
+                true,
+            );
         }
+        self.watched.insert(
+            row.session,
+            Arc::clone(&self.homes[home].adapter),
+            tref.clone(),
+        );
         self.note_outside(&row.path, home);
         self.tracked.insert(
             id,
@@ -885,7 +906,9 @@ impl Watcher {
         }
         self.by_raw.retain(|_, i| *i != id);
         self.by_native.retain(|_, i| *i != id);
+        self.by_sub_native.retain(|_, i| *i != id);
         self.by_session.remove(&row.session);
+        self.watched.remove(row.session);
         for d in &t.watched {
             self.unwatch_dir(d);
         }
@@ -1152,31 +1175,43 @@ impl Watcher {
         let engine = t.row.engine;
         let native = native_id(&t.row);
         let path = t.row.path.clone();
+        let home = t.home;
         let subagent = t.row.meta.as_ref().is_some_and(|m| m.is_subagent);
         let started = t.row.meta.as_ref().and_then(|m| m.started);
-        if !native.is_empty() {
-            self.by_native.insert((engine, native.clone()), id);
-        }
+        self.map_native(id, session, engine, &native, subagent, first);
 
         // Facts from elsewhere: the parent of a sub-agent, the terminal the runner started the
         // session in, hooks that came before the transcript, and workstream locations.
         let (parent, terminal, held) = if first {
-            let parent = subagent.then(|| self.parent_of(engine, &path)).flatten();
+            let parent = if subagent {
+                self.parent_of(engine, &path, home)
+            } else {
+                Ok(Parent::None)
+            };
             let terminal = if subagent {
                 None
             } else {
                 self.claim_terminal(session, engine, &native, cwd.as_deref(), started)
             };
-            let held = self.allowed_held(session, engine, &native);
+            let held = self.allowed_held(session, parent, engine, &native);
             (parent, terminal, held)
         } else {
-            (None, None, Vec::new())
+            (Ok(Parent::None), None, Vec::new())
         };
         let places = (first || moved).then(|| self.places(session)).flatten();
 
         let Some(t) = self.tracked.get_mut(&id) else {
             return Ok(());
         };
+        // Kept with the row, so its hooks are judged by the parent its discovery names, after a
+        // restart too. A failed lookup is not kept: it is tried again at the next hook.
+        if first
+            && subagent
+            && let Ok(found) = parent
+        {
+            t.row.facts.parent = Some(found);
+        }
+        let parent = parent.ok().and_then(Parent::session);
         let event = |id, at, body| Event {
             id,
             at,
@@ -1258,9 +1293,7 @@ impl Watcher {
     fn apply_reports(&mut self, reports: Vec<Signal>) -> Result<(), Hangup> {
         for s in reports {
             let id = match &s.target {
-                Target::Native { engine, native_id } => {
-                    self.by_native.get(&(*engine, native_id.clone())).copied()
-                }
+                Target::Native { engine, native_id } => self.find_native(*engine, native_id),
                 Target::Session(session) => self.by_session.get(session).copied(),
             };
             let indexed = id.and_then(|id| {
@@ -1273,7 +1306,8 @@ impl Watcher {
             match (indexed, s.origin) {
                 (Some((id, _)), Origin::Runner) => self.apply_report(id, &s.report)?,
                 (Some((id, session)), Origin::Hook(sender)) => {
-                    match hooks::refusal(&sender, &self.agent_of(session)) {
+                    let parent = self.parent_for(id);
+                    match hooks::refusal(&sender, &self.runs_as(session, parent)) {
                         None => self.apply_report(id, &s.report)?,
                         Some(reason) => {
                             tracing::debug!(%session, target = ?s.target, member = %sender.member(), reason, "hook refused; dropped");
@@ -1317,14 +1351,60 @@ impl Watcher {
         }
     }
 
+    /// Who a session runs as, for its hooks: its own agent as the [`SessionAgents`] tell, or, for
+    /// a sub-agent they say has none, its parent's. A sub-agent runs as its parent, and the hub
+    /// may not have stored it yet: at its discovery, and until the sink's write lands, only its
+    /// parent's agent is known.
+    ///
+    /// It fails closed: the session's own answer, when it is an agent or unknown, stands (the
+    /// parent never overrides it); the parent's answer is taken as it is, unknown included; and
+    /// a sub-agent whose parent could not be looked up is unknown.
+    fn runs_as(
+        &mut self,
+        session: SessionId,
+        parent: Result<Parent, LookupFailed>,
+    ) -> SessionAgent {
+        match (self.agent_of(session), parent) {
+            (SessionAgent::NoAgent, Ok(Parent::Session(parent))) => self.agent_of(parent),
+            (SessionAgent::NoAgent, Err(LookupFailed)) => SessionAgent::Unknown,
+            (own, _) => own,
+        }
+    }
+
+    /// The parent of a tracked session: the one kept with its row, or, for a sub-agent indexed
+    /// before parents were kept, looked up now and kept. A failed lookup is not kept.
+    fn parent_for(&mut self, id: u64) -> Result<Parent, LookupFailed> {
+        let Some(t) = self.tracked.get(&id) else {
+            return Ok(Parent::None);
+        };
+        if let Some(parent) = t.row.facts.parent {
+            return Ok(parent);
+        }
+        if !t.row.meta.as_ref().is_some_and(|m| m.is_subagent) {
+            return Ok(Parent::None);
+        }
+        let (engine, path, home) = (t.row.engine, t.row.path.clone(), t.home);
+        let parent = self.parent_of(engine, &path, home)?;
+        if let Some(t) = self.tracked.get_mut(&id) {
+            t.row.facts.parent = Some(parent);
+        }
+        Ok(parent)
+    }
+
     /// The hooks held for a newly discovered session whose senders may apply them, oldest
-    /// first. The others are dropped.
-    fn allowed_held(&mut self, session: SessionId, engine: Engine, native: &str) -> Vec<Reported> {
+    /// first. The others are dropped. A sub-agent's are judged as its parent's (see `runs_as`).
+    fn allowed_held(
+        &mut self,
+        session: SessionId,
+        parent: Result<Parent, LookupFailed>,
+        engine: Engine,
+        native: &str,
+    ) -> Vec<Reported> {
         let held = self.held.take(engine, native, Instant::now());
         if held.is_empty() {
             return Vec::new();
         }
-        let agent = self.agent_of(session);
+        let agent = self.runs_as(session, parent);
         held.into_iter()
             .filter_map(|(sender, report)| match hooks::refusal(&sender, &agent) {
                 None => Some(report),
@@ -1364,6 +1444,57 @@ impl Watcher {
                 commit: Commit::Full(Box::new(t.row.clone())),
             })
             .map_err(|_| Hangup)
+    }
+
+    /// Maps tracked transcript `id` (session `session`) by its CLI id, for the hooks that name
+    /// it. Sessions and sub-agents have separate maps, and a hook is matched to a session first:
+    /// a sub-agent whose id equals a session's (its `agentId` is whatever its transcript says)
+    /// never takes that session's hooks, whichever of the two was found first.
+    ///
+    /// Among sessions the last one found takes an id, as before (one session seen in two homes).
+    /// Among sub-agents the one indexed first keeps it, by its session id, so the same one after
+    /// a restart too (which finds the newest first); a later one is refused it (`loud`: said as
+    /// a warning).
+    fn map_native(
+        &mut self,
+        id: u64,
+        session: SessionId,
+        engine: Engine,
+        native: &str,
+        subagent: bool,
+        loud: bool,
+    ) {
+        if native.is_empty() {
+            return;
+        }
+        let key = (engine, native.to_owned());
+        if !subagent {
+            self.by_native.insert(key, id);
+            return;
+        }
+        let holder = match self.by_sub_native.get(&key) {
+            None => None,
+            Some(&held) if held == id => return,
+            Some(held) => self.tracked.get(held).map(|t| t.row.session),
+        };
+        if holder.is_some_and(|first| first < session) {
+            if loud {
+                tracing::warn!(engine = ?engine, id = native, %session, "two sub-agents name the same id; its hooks go to the one indexed first");
+            } else {
+                tracing::debug!(engine = ?engine, id = native, %session, "two sub-agents name the same id; its hooks go to the one indexed first");
+            }
+            return;
+        }
+        self.by_sub_native.insert(key, id);
+    }
+
+    /// The tracked transcript a hook's CLI id names: a session's before a sub-agent's.
+    fn find_native(&self, engine: Engine, native: &str) -> Option<u64> {
+        let key = (engine, native.to_owned());
+        self.by_native
+            .get(&key)
+            .or_else(|| self.by_sub_native.get(&key))
+            .copied()
     }
 
     /// Holds a hook for a session whose transcript is not indexed yet (see `held`), and looks
@@ -1433,20 +1564,36 @@ impl Watcher {
         Ok(())
     }
 
-    /// For a Claude sub-agent's transcript, its parent's session. A parent not indexed yet gets
-    /// its session id now, which its discovery then keeps.
-    fn parent_of(&self, engine: Engine, path: &Path) -> Option<SessionId> {
-        let parent = parent_transcript(path)?.canonicalize().ok()?;
+    /// For a Claude sub-agent's transcript (at `path`, canonical, in home `home`), its parent's
+    /// session. The parent's transcript must be a regular file, not a link, inside the same home
+    /// (see [`parent_file`]); otherwise the sub-agent has no parent. A parent not indexed yet
+    /// gets its session id now, which its discovery then keeps. An index or I/O error is a failed
+    /// lookup, never "no parent".
+    fn parent_of(&self, engine: Engine, path: &Path, home: usize) -> Result<Parent, LookupFailed> {
+        let Some(parent) = parent_transcript(path) else {
+            return Ok(Parent::None);
+        };
+        match parent_file(&parent, path, &self.homes[home].path) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::debug!(path = %parent.display(), "a sub-agent's parent is not a plain file in its home; it has no parent");
+                return Ok(Parent::None);
+            }
+            Err(e) => {
+                tracing::warn!(path = %parent.display(), error = %e, "cannot look at a sub-agent's parent; its hooks are refused for now");
+                return Err(LookupFailed);
+            }
+        }
         if let Some(t) = self
             .by_key
             .get(&(parent.clone(), None))
             .and_then(|id| self.tracked.get(id))
         {
-            return Some(t.row.session);
+            return Ok(Parent::Session(t.row.session));
         }
         let store = self.store_lock();
         match store.find(&parent, None) {
-            Ok(Some(row)) => Some(row.session),
+            Ok(Some(row)) => Ok(Parent::Session(row.session)),
             Ok(None) => {
                 let row = new_row(&TranscriptRef {
                     engine,
@@ -1456,16 +1603,16 @@ impl Watcher {
                     modified: 0,
                 });
                 match store.insert(&row) {
-                    Ok(()) => Some(row.session),
+                    Ok(()) => Ok(Parent::Session(row.session)),
                     Err(e) => {
-                        tracing::warn!(path = %row.path.display(), error = %e, "cannot index a sub-agent's parent");
-                        None
+                        tracing::warn!(path = %row.path.display(), error = %e, "cannot index a sub-agent's parent; its hooks are refused for now");
+                        Err(LookupFailed)
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!(path = %parent.display(), error = %e, "cannot look up a sub-agent's parent");
-                None
+                tracing::warn!(path = %parent.display(), error = %e, "cannot look up a sub-agent's parent; its hooks are refused for now");
+                Err(LookupFailed)
             }
         }
     }
@@ -1601,7 +1748,7 @@ fn after(now: Instant, d: Duration) -> Instant {
 
 /// An adapter call that failed or panicked.
 #[derive(Debug, thiserror::Error)]
-enum AdapterError {
+pub(crate) enum AdapterError {
     #[error(transparent)]
     Source(#[from] SourceError),
     #[error("the source adapter panicked: {0}")]
@@ -1610,7 +1757,7 @@ enum AdapterError {
 
 /// Runs an adapter call, turning a panic into an error: one bad transcript must not stop the
 /// watcher.
-fn guard<T>(call: impl FnOnce() -> Result<T, SourceError>) -> Result<T, AdapterError> {
+pub(crate) fn guard<T>(call: impl FnOnce() -> Result<T, SourceError>) -> Result<T, AdapterError> {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
         Ok(result) => result.map_err(AdapterError::Source),
         Err(panic) => Err(AdapterError::Panic(panic_text(&*panic).to_owned())),
@@ -1812,6 +1959,26 @@ fn session_of(
     }
 }
 
+/// A sub-agent's parent could not be looked up (the index or the filesystem failed). Its hooks
+/// are refused, as for an unknown agent, and the lookup is tried again at the next one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LookupFailed;
+
+/// Whether `parent`, the transcript a sub-agent at `child` names as its parent, may be taken as
+/// one: a regular file (a link is not followed), inside `home`, and not the sub-agent itself.
+/// `child` is canonical, so the folders above `parent` are real ones; only its last part could
+/// be a link. A file that is not there is no parent; another I/O error is an error.
+fn parent_file(parent: &Path, child: &Path, home: &Path) -> io::Result<bool> {
+    if parent == child || !parent.starts_with(home) {
+        return Ok(false);
+    }
+    match std::fs::symlink_metadata(parent) {
+        Ok(meta) => Ok(meta.file_type().is_file()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// For a Claude sub-agent transcript `<project>/<session>/subagents/<agent>.jsonl`, its parent's
 /// transcript `<project>/<session>.jsonl`.
 fn parent_transcript(path: &Path) -> Option<PathBuf> {
@@ -1948,6 +2115,153 @@ mod tests {
             event_id(s, 0, Cause::Link(1), 0, 1000)
         );
         assert_eq!(a.0.timestamp_ms(), 1000);
+    }
+
+    #[test]
+    fn a_parent_is_a_plain_file_in_the_sub_agents_home() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let project = home.join("projects").join("p");
+        let child = project.join("s").join("subagents").join("a.jsonl");
+        std::fs::create_dir_all(child.parent().unwrap()).unwrap();
+        std::fs::write(&child, b"{}\n").unwrap();
+        let parent = project.join("s.jsonl");
+        assert_eq!(parent_transcript(&child), Some(parent.clone()));
+
+        // Not there yet: no parent. A regular file: the parent.
+        assert!(!parent_file(&parent, &child, &home).unwrap());
+        std::fs::write(&parent, b"{}\n").unwrap();
+        assert!(parent_file(&parent, &child, &home).unwrap());
+        // Never the sub-agent itself, nor a file outside its home, nor a folder.
+        assert!(!parent_file(&child, &child, &home).unwrap());
+        assert!(!parent_file(&parent, &child, &root.join("other-home")).unwrap());
+        let folder = project.join("t.jsonl");
+        std::fs::create_dir(&folder).unwrap();
+        assert!(!parent_file(&folder, &child, &home).unwrap());
+    }
+
+    /// A link is never followed: not to another session's transcript (which would lend the
+    /// sub-agent that session's agent), nor back to the sub-agent itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_parent_is_no_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().canonicalize().unwrap();
+        let project = home.join("projects").join("p");
+        let child = project.join("s").join("subagents").join("a.jsonl");
+        std::fs::create_dir_all(child.parent().unwrap()).unwrap();
+        std::fs::write(&child, b"{}\n").unwrap();
+        let other = project.join("other.jsonl");
+        std::fs::write(&other, b"{}\n").unwrap();
+        let parent = project.join("s.jsonl");
+        for target in [&other, &child] {
+            let _ = std::fs::remove_file(&parent);
+            std::os::unix::fs::symlink(target, &parent).unwrap();
+            assert!(!parent_file(&parent, &child, &home).unwrap(), "{target:?}");
+        }
+    }
+
+    /// A watcher over one Claude home, with nothing tracked, and the agents it asks.
+    fn bare_watcher(
+        home: &Path,
+        state: &Path,
+    ) -> (
+        Watcher,
+        Arc<crate::MemoryAgents>,
+        std::sync::mpsc::Receiver<Batch>,
+    ) {
+        let agents = Arc::new(crate::MemoryAgents::new());
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        let watcher = Watcher::new(Setup {
+            workspace: WorkspaceId::new(),
+            machine: MachineId::new(),
+            owner: MemberId::new(),
+            timing: Timing::default(),
+            poll: PollMode::Always,
+            max_batch: 64,
+            homes: vec![EngineHome {
+                engine: Engine::Claude,
+                path: home.to_path_buf(),
+            }],
+            adapters: vec![Arc::new(pitcrew_interfaces::fake::FakeSource::new(
+                Engine::Claude,
+                Vec::new(),
+                Vec::new(),
+            ))],
+            rows: Vec::new(),
+            store: Arc::new(Mutex::new(Store::open(state).unwrap())),
+            tx,
+            shared: Arc::default(),
+            locations: None,
+            agents: Some(agents.clone()),
+            watched: Arc::default(),
+        });
+        (watcher, agents, rx)
+    }
+
+    /// When the index cannot say who a sub-agent's parent is, its hooks are refused (unknown),
+    /// and the lookup is not kept: once the index answers, the parent is found and kept.
+    #[test]
+    fn a_failed_parent_lookup_refuses_and_is_tried_again() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let project = home.join("projects").join("p");
+        let child = project.join("s").join("subagents").join("a.jsonl");
+        std::fs::create_dir_all(child.parent().unwrap()).unwrap();
+        std::fs::write(&child, b"{}\n").unwrap();
+        std::fs::write(project.join("s.jsonl"), b"{}\n").unwrap();
+        let (mut w, agents, _rx) = bare_watcher(&home, state.path());
+
+        let tref = TranscriptRef {
+            engine: Engine::Claude,
+            path: child.clone(),
+            inner_id: None,
+            size: 0,
+            modified: 0,
+        };
+        let mut row = new_row(&tref);
+        row.discovered = true;
+        row.meta = Some(pitcrew_interfaces::source::SessionMeta {
+            native_id: "a".into(),
+            is_subagent: true,
+            ..Default::default()
+        });
+        let sub = row.session;
+        let id = w.track(row, tref, 0);
+
+        w.store_lock().hide_transcripts(true).unwrap();
+        assert_eq!(w.parent_for(id), Err(LookupFailed));
+        assert_eq!(w.runs_as(sub, Err(LookupFailed)), SessionAgent::Unknown);
+        assert_eq!(
+            w.tracked[&id].row.facts.parent, None,
+            "a failure is not kept"
+        );
+        // The sub-agent's own answer, when it has one, still stands.
+        let own = SessionAgent::Agent {
+            agent: MemberId::new(),
+            owner: None,
+        };
+        agents.set(sub, own);
+        assert_eq!(w.runs_as(sub, Err(LookupFailed)), own);
+        agents.forget(sub);
+
+        w.store_lock().hide_transcripts(false).unwrap();
+        let Ok(Parent::Session(parent)) = w.parent_for(id) else {
+            panic!("the parent is found once the index answers");
+        };
+        assert_eq!(
+            w.tracked[&id].row.facts.parent,
+            Some(Parent::Session(parent))
+        );
+        let writer = SessionAgent::Agent {
+            agent: MemberId::new(),
+            owner: Some(MemberId::new()),
+        };
+        agents.set(parent, writer);
+        let found = w.parent_for(id);
+        assert_eq!(w.runs_as(sub, found), writer);
     }
 
     #[test]

@@ -34,6 +34,8 @@ import type {
   RecapDayScope,
   Session,
   SessionFilters,
+  Setup,
+  SetupResult,
   Subtask,
   Task,
   TaskFilters,
@@ -42,7 +44,7 @@ import type {
   Team,
   TranscriptPage,
   TranscriptQuery,
-  Workspace,
+  WorkspaceInfo,
   Workstream,
 } from './types.ts';
 
@@ -162,8 +164,14 @@ export function createApi(options: ApiOptions) {
     transport,
     request,
     me: (signal?: AbortSignal) => get<Member>('/v1/me', undefined, signal),
-    workspace: (signal?: AbortSignal) =>
-      get<{ workspace: Workspace; rev: number }>('/v1/workspace', undefined, signal),
+    /** `setup_needed` is `true` while the hub has no person yet (a fresh hub). */
+    workspace: (signal?: AbortSignal) => get<WorkspaceInfo>('/v1/workspace', undefined, signal),
+    /**
+     * The first run: names the workspace, its person (the device token's member) and this
+     * machine. `400 invalid` for a bad field, `409 conflict` once set up or when the handle is
+     * taken. Use `setUp()` (`setup.ts`) or `useSetup()`, which also refresh the cache.
+     */
+    setup: (setup: Setup) => request<SetupResult>('POST', '/v1/setup', { body: setup }),
     machines: (signal?: AbortSignal) => get<Machine[]>('/v1/machines', undefined, signal),
     members: (signal?: AbortSignal) => get<Member[]>('/v1/members', undefined, signal),
     personas: (signal?: AbortSignal) => get<Persona[]>('/v1/personas', undefined, signal),

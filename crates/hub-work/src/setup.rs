@@ -9,6 +9,7 @@
 
 use crate::commands::require_person;
 use crate::error::{Result, WorkError};
+use crate::office::OFFICE_HANDLE;
 use crate::query;
 use crate::service::WorkService;
 use pitcrew_protocol::api::{Caller, Setup, SetupDone};
@@ -47,15 +48,23 @@ pub trait SetupListener: Send + Sync {
     fn set_up(&self, done: &SetupDone);
 }
 
-/// A string field of a [`Setup`] body: 1 to `max_chars` characters (Unicode code points), with no
-/// control character anywhere. Not trimmed: the contract gives no trimming rule for setup, unlike
-/// task titles and labels.
+/// Whitespace as JavaScript's `String.prototype.trim` sees it, so that this hub and the mock hub
+/// store the same name: Unicode's `White_Space` except U+0085 (a control character, so refused
+/// rather than trimmed), plus U+FEFF. Rust's `str::trim` differs in exactly those two.
+fn is_trimmed_space(c: char) -> bool {
+    (c.is_whitespace() && c != '\u{85}') || c == '\u{feff}'
+}
+
+/// A name of a [`Setup`] body (api-v1.md, "The first run"): trimmed of whitespace, then 1 to
+/// `max_chars` characters (Unicode code points) with no control character anywhere. Returned
+/// trimmed, as it is stored.
 fn checked_text(value: &str, field: &str, max_chars: usize) -> Result<String> {
+    let value = value.trim_matches(is_trimmed_space);
     // The byte-length check first: a value of more bytes than 4 per character allowed is too long
     // anyway, so an oversized input costs no full character count.
     if value.is_empty() || value.len() > max_chars * 4 || value.chars().count() > max_chars {
         return Err(WorkError::invalid(format!(
-            "{field} must be 1 to {max_chars} characters."
+            "{field} must be 1 to {max_chars} characters after trimming."
         )));
     }
     if value.chars().any(char::is_control) {
@@ -122,7 +131,9 @@ impl WorkService {
     /// `forbidden` for an agent token; `invalid` for a field out of its length bound, a malformed
     /// handle, or a control character anywhere; `conflict` when the workspace already has a
     /// person, or when the handle is already taken (so a retried request never makes a second
-    /// person: the first call to commit wins, every other sees the conflict).
+    /// person: the first call to commit wins, every other sees the conflict). `@office`
+    /// ([`OFFICE_HANDLE`]) is reserved for the back office, so it is always taken, even before
+    /// the back office's member exists.
     pub fn set_up(&self, caller: &Caller, setup: Setup) -> Result<SetupDone> {
         require_person(caller, "Setting up the workspace")?;
         let checked = checked_setup(setup)?;
@@ -132,6 +143,11 @@ impl WorkService {
                 return Err(WorkError::conflict(
                     "This workspace already has a person; setup runs once.",
                 ));
+            }
+            if checked.handle == OFFICE_HANDLE {
+                return Err(WorkError::conflict(format!(
+                    "{OFFICE_HANDLE} is reserved for the back office."
+                )));
             }
             if query::member_with_handle(c, &checked.handle)?.is_some() {
                 return Err(WorkError::conflict(format!(
@@ -223,6 +239,56 @@ mod tests {
         // Code points, not bytes.
         assert!(checked_setup(setup(&"é".repeat(80), "Sam", "@sam", "PC")).is_ok());
         assert!(checked_setup(setup(&"é".repeat(81), "Sam", "@sam", "PC")).is_err());
+    }
+
+    #[test]
+    fn names_are_trimmed_then_counted_and_stored_trimmed() {
+        let checked = checked_setup(setup(
+            "  Demo Lab\t",
+            "\u{3000}Sam Rivera ",
+            "@sam",
+            "\nThis laptop\r\n",
+        ))
+        .unwrap();
+        assert_eq!(checked.workspace_name, "Demo Lab");
+        assert_eq!(checked.person_name, "Sam Rivera");
+        assert_eq!(checked.machine_name, "This laptop");
+        // Whitespace inside a name stays.
+        let inside = checked_setup(setup("Demo  Lab", "Sam", "@sam", "PC")).unwrap();
+        assert_eq!(inside.workspace_name, "Demo  Lab");
+        // Nothing but whitespace is empty.
+        for blank in [" ", "\t\n", "\u{a0}\u{2003}", "\u{feff}"] {
+            assert!(
+                checked_setup(setup(blank, "Sam", "@sam", "PC")).is_err(),
+                "{blank:?}"
+            );
+            assert!(
+                checked_setup(setup("Lab", blank, "@sam", "PC")).is_err(),
+                "{blank:?}"
+            );
+            assert!(
+                checked_setup(setup("Lab", "Sam", "@sam", blank)).is_err(),
+                "{blank:?}"
+            );
+        }
+        // Counted after trimming: 80 characters and padding fit.
+        let padded = format!("  {}  ", "x".repeat(80));
+        assert!(checked_setup(setup(&padded, "Sam", "@sam", "PC")).is_ok());
+        let padded = format!(" {} ", "x".repeat(60));
+        assert!(checked_setup(setup("Lab", "Sam", "@sam", &padded)).is_ok());
+        // As JavaScript trims: U+FEFF goes, U+0085 (a control character) stays and is refused.
+        assert_eq!(
+            checked_setup(setup("\u{feff}Lab", "Sam", "@sam", "PC"))
+                .unwrap()
+                .workspace_name,
+            "Lab"
+        );
+        assert!(checked_setup(setup("Lab\u{85}", "Sam", "@sam", "PC")).is_err());
+        // A control character inside is still refused (a tab at an end is trimmed, above).
+        assert!(checked_setup(setup("La\tb", "Sam", "@sam", "PC")).is_err());
+        // The handle is not trimmed.
+        assert!(checked_handle(" @sam").is_err());
+        assert!(checked_handle("@sam ").is_err());
     }
 
     #[test]

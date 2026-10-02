@@ -12,23 +12,17 @@ import { createApi } from './api.ts';
 import { createGateway } from './gateway.ts';
 import { createLive } from './live.ts';
 import { createQueryClient } from './provider.tsx';
+import { toGatewayWorkspace, type GatewayPrompt, type PromptReply, type RemoteGateway } from './remote.ts';
 import {
   WorkspacesContext,
   type Gateway,
   type GatewayWorkspace,
+  type PromptQueue,
   type WorkspaceData,
   type WorkspaceList,
   type WorkspaceRegistry,
-  type WorkspaceState,
 } from './workspaces.tsx';
 
-const STATES: readonly WorkspaceState[] = ['connecting', 'ready', 'unreachable', 'needs_pairing'];
-
-function isWorkspace(value: unknown): value is GatewayWorkspace {
-  if (typeof value !== 'object' || value === null) return false;
-  const { id, name, state } = value as Record<string, unknown>;
-  return typeof id === 'string' && id !== '' && typeof name === 'string' && STATES.includes(state as WorkspaceState);
-}
 
 function messageOf(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -49,7 +43,11 @@ export interface WorkspacesOptions {
 /** The workspaces and their data scopes. No React here. */
 export class Workspaces implements WorkspaceRegistry {
   readonly store: StoreApi<WorkspaceList> = createStore<WorkspaceList>(() => ({}));
+  /** SSH's prompts, never their answers (those live in the dialog's own state only). */
+  readonly prompts: StoreApi<PromptQueue> = createStore<PromptQueue>(() => ({ prompts: [] }));
+  readonly remote: RemoteGateway | null;
   readonly #gateway: Gateway;
+  #unlistenPrompts: Array<() => void> = [];
   readonly #createQueryClient: () => QueryClient;
   readonly #data = new Map<string, WorkspaceData>();
   /** Workspaces opened so far: their streams run, also in the background, until `stop()`. */
@@ -84,6 +82,7 @@ export class Workspaces implements WorkspaceRegistry {
 
   constructor(gateway: Gateway, options: WorkspacesOptions = {}) {
     this.#gateway = gateway;
+    this.remote = gateway.remote ?? null;
     this.#createQueryClient = options.createQueryClient ?? createQueryClient;
     this.#listBackoff = options.listBackoff ?? { initialMs: 1_000, maxMs: 30_000 };
     this.#backgroundMs = options.backgroundMs ?? 10 * 60_000;
@@ -109,6 +108,9 @@ export class Workspaces implements WorkspaceRegistry {
     this.#unlistenWorkspaces = undefined;
     this.#unlistenNavigate?.();
     this.#unlistenNavigate = undefined;
+    for (const unlisten of this.#unlistenPrompts.splice(0)) unlisten();
+    // Nobody is left to answer them; the gateway withdraws or times them out.
+    this.prompts.setState({ prompts: [] });
     if (this.#listTimer !== undefined) clearTimeout(this.#listTimer);
     this.#listTimer = undefined;
     this.#clearPendingNavigate();
@@ -203,6 +205,48 @@ export class Workspaces implements WorkspaceRegistry {
     }
   }
 
+  replyPrompt(id: string, reply: PromptReply): void {
+    if (!this.#dropPrompt(id) || this.remote === null) return;
+    // Not logged, whatever happens: a rejection's message could quote what was sent.
+    this.remote.replyPrompt(id, reply).catch(() => console.warn('pitcrew: the gateway did not take a prompt reply.'));
+  }
+
+  #queuePrompt(prompt: GatewayPrompt): void {
+    const { prompts } = this.prompts.getState();
+    // A prompt asked again (same id) keeps its place, with the newer text.
+    const index = prompts.findIndex((p) => p.id === prompt.id);
+    this.prompts.setState({
+      prompts: index === -1 ? [...prompts, prompt] : prompts.map((p, i) => (i === index ? prompt : p)),
+    });
+  }
+
+  /** Takes a prompt off the queue; false if it was not on it (answered, or withdrawn). */
+  #dropPrompt(id: string): boolean {
+    const { prompts } = this.prompts.getState();
+    if (!prompts.some((p) => p.id === id)) return false;
+    this.prompts.setState({ prompts: prompts.filter((p) => p.id !== id) });
+    return true;
+  }
+
+  /** Follows the gateway's prompts, from the start: a reconnect at launch can ask for a password. */
+  async #followPrompts(current: () => boolean): Promise<void> {
+    const remote = this.remote;
+    if (remote === null) return;
+    const subscribe = async (what: string, start: () => Promise<() => void>) => {
+      try {
+        const unlisten = await start();
+        if (current()) this.#unlistenPrompts.push(unlisten);
+        else unlisten();
+      } catch (error) {
+        if (current()) console.warn(`pitcrew: cannot follow ${what}`, error);
+      }
+    };
+    await Promise.all([
+      subscribe('gateway://prompt', () => remote.onPrompt((prompt) => current() && this.#queuePrompt(prompt))),
+      subscribe('gateway://prompt-closed', () => remote.onPromptClosed((id) => current() && this.#dropPrompt(id))),
+    ]);
+  }
+
   #cancelLeave(id: string): void {
     const timer = this.#leaving.get(id);
     if (timer !== undefined) {
@@ -212,31 +256,37 @@ export class Workspaces implements WorkspaceRegistry {
   }
 
   /**
-   * Subscribes to both events first, then reads the list, so no change — and no deep link, which
-   * the gateway holds until this first read — falls between subscribing and reading.
+   * Subscribes to every event first, then reads the list, so no change falls between subscribing
+   * and reading — and nothing the gateway holds until this first read (a launch-time deep link, a
+   * prompt raised while reconnecting at launch) is emitted before anyone listens.
    */
   async #follow(generation: number): Promise<void> {
     const current = () => generation === this.#generation;
-    try {
-      const unlisten = await this.#gateway.onWorkspaces((list) => {
-        if (!current()) return;
-        this.#heard = true;
-        this.#update(list);
-      });
-      if (current()) this.#unlistenWorkspaces = unlisten;
-      else unlisten();
-    } catch (error) {
-      if (current()) console.warn('pitcrew: cannot follow the gateway’s workspaces', error);
-    }
-    try {
-      const unlisten = await this.#gateway.onNavigate((target) => {
-        if (current()) this.#onGatewayNavigate(target);
-      });
-      if (current()) this.#unlistenNavigate = unlisten;
-      else unlisten();
-    } catch (error) {
-      if (current()) console.warn('pitcrew: cannot follow gateway://navigate', error);
-    }
+    const workspaces = async () => {
+      try {
+        const unlisten = await this.#gateway.onWorkspaces((list) => {
+          if (!current()) return;
+          this.#heard = true;
+          this.#update(list);
+        });
+        if (current()) this.#unlistenWorkspaces = unlisten;
+        else unlisten();
+      } catch (error) {
+        if (current()) console.warn('pitcrew: cannot follow the gateway’s workspaces', error);
+      }
+    };
+    const navigate = async () => {
+      try {
+        const unlisten = await this.#gateway.onNavigate((target) => {
+          if (current()) this.#onGatewayNavigate(target);
+        });
+        if (current()) this.#unlistenNavigate = unlisten;
+        else unlisten();
+      } catch (error) {
+        if (current()) console.warn('pitcrew: cannot follow gateway://navigate', error);
+      }
+    };
+    await Promise.all([workspaces(), navigate(), this.#followPrompts(current)]);
     if (current()) await this.#read(generation);
   }
 
@@ -251,7 +301,8 @@ export class Workspaces implements WorkspaceRegistry {
     this.#reading = generation;
     this.#listTimer = undefined;
     try {
-      const list = await this.#gateway.workspaces();
+      const list: unknown = await this.#gateway.workspaces();
+      if (!Array.isArray(list)) throw new Error('The gateway answered with something that is not a list of workspaces.');
       // An event heard meanwhile is at least as new as this answer.
       if (current() && !this.#heard) this.#update(list);
     } catch (error) {
@@ -267,7 +318,12 @@ export class Workspaces implements WorkspaceRegistry {
   }
 
   #update(received: unknown): void {
-    const list = Array.isArray(received) ? received.filter(isWorkspace) : [];
+    // Not a list at all: keep the one known (a read retries until there is one).
+    if (!Array.isArray(received)) {
+      console.warn('pitcrew: ignored a gateway://workspaces payload that is not a list.');
+      return;
+    }
+    const list = received.flatMap((item) => toGatewayWorkspace(item) ?? []);
     const before = this.store.getState().list;
     this.store.setState({ list, error: undefined });
     if (this.#listTimer !== undefined) clearTimeout(this.#listTimer);

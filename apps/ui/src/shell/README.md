@@ -20,6 +20,8 @@ See `docs/build/streams/L.md` and ADR-0008.
 | `proof-page.tsx` | The data layer's proof page, a dev-only route at `/dev/proof`. |
 | `gateway-navigate.ts` | `gateway://navigate` (deep links, the app's own notifications), in the desktop only: `parseNavigateTarget` and `navigateHref` are the pure checks, `useGatewayNavigation()` wires them to the router. See "Navigating from outside the window" below. |
 | `notice.tsx` | `<Notice>`: a brief, dismissible message with nowhere better to show (an unknown-workspace deep link, today), from `useShell`'s `notice`. Mounted once, at the root, above `/`'s redirect. |
+| `prompts.tsx`, `prompt-dialog.tsx` | SSH's prompts, in the desktop only: `<GatewayPrompts>` is mounted once, at the root, and shows the oldest prompt in `<PromptDialog>` (a lazy chunk). See "SSH's prompts" below. |
+| `remove-workspace.tsx` | "Remove workspace…" (remote workspaces, desktop only): the confirmation, with "Also stop PitCrew on the remote (cancels its SLURM job)". A lazy chunk. |
 
 ## Workspaces in the desktop app
 
@@ -31,11 +33,69 @@ the desktop app"):
 - each workspace has its own data scope: switching remounts the frame, and never shows another
   workspace's data;
 - a workspace that is `unreachable` or `needs_pairing` keeps the frame (so another is one click
-  away) and shows why in the main area, with the gateway's `detail`; the top bar's pill says so;
+  away) and shows why in the main area, with the gateway's `detail`; the top bar's pill says so.
+  A remote one that is `unreachable` (a sign-in cancelled while reconnecting, say) offers Retry
+  (`gateway_workspace_retry`);
+- a workspace the gateway drops while it is on screen (removed, here or elsewhere) is left for the
+  next ready one, or `/`; one never listed while on screen stays a not-found page;
 - `/` opens the workspace last opened, or the first ready one; an id the gateway does not list
   is not found;
 - a workspace out of view for 10 minutes has its stream closed, resumed with `since` when it is
-  opened again (`src/data/README.md`, "Workspaces in the desktop app").
+  opened again (`src/data/README.md`, "Workspaces in the desktop app");
+- the switcher ends with "Connect a remote machine…", which opens `paths.connect()` (the onboarding
+  feature's wizard, a root route), and, when the workspace on screen is remote, "Remove
+  workspace…", which asks first (optionally stopping the remote's helper, which cancels its SLURM
+  job), then opens another workspace. In a browser the connect item is disabled and says the
+  desktop app is needed; there is nothing to remove;
+- with no workspace at all, `/` says "No workspaces yet." and offers the same connect action.
+
+## The first run: `setup_needed`
+
+A hub with no person yet answers `GET /v1/workspace` with `setup_needed: true` (api-v1.md, "The
+first run"). The frame sends such a workspace to `paths.setup(ws)` (`/w/$ws/onboarding`, the
+onboarding feature's first-run wizard), in the browser and in the desktop app, from whatever page
+was asked for. There is no loop:
+
+- the routes that set a workspace up say so with `staticData.setup: true`, and are exempt (the
+  shell's own placeholder at that path too, so the redirect always lands somewhere);
+- a finished setup flips `setup_needed` off in the cache at once (`src/data/setup.ts`), before the
+  wizard navigates to Home.
+
+A `setup` route is shown bare, without the sidebar, top bar or Orchestrator, and is never
+remembered as a layout's last page. In the desktop app it keeps a small header with the workspace
+switcher, so another workspace, connecting a machine, or removing this one (a remote) stays one
+click away. A workspace is remembered as the last one opened only once it is set up (or when the
+gateway cannot reach it), so `/` does not keep reopening a workspace waiting for setup.
+
+## SSH's prompts
+
+Any gateway command that talks to a remote, and a connection reconnecting, may make SSH ask for a
+password, a key's passphrase, a one-time code, or a new host key's confirmation
+(desktop-gateway.md, "Prompts"). `<GatewayPrompts>` (mounted once, in `routes.tsx`'s root) shows
+the oldest one; the rest wait, and the dialog says how many.
+
+- It says which host is asking and where an answer goes, from `kind` (never guessed from the
+  text): "Sent to {host}" for a password or a code, "Unlocks your key on this computer; not sent to
+  {host}" for a passphrase, "Trust this host's key?" for a host key; a `confirm` is ssh's own
+  yes-or-no question, and a `notice` is information only.
+- ssh's `text` is plain text (untrusted, never rendered as markup), in a box that scrolls
+  (focusable) so the field and the buttons always show. A long text arrives with its end kept
+  (`src/data/remote.ts`).
+- A password, passphrase or code goes in a password field with autocomplete off; Send stays off
+  while it is empty. A host key shows its fingerprint, with Reject and Accept (Accept stays off
+  when the gateway gave no fingerprint to compare); a `confirm` has Reject and Accept. A `notice`
+  ("touch your security key") has nothing to answer: it stays until the gateway withdraws it, has
+  no close button, ignores Esc, and only "Stop sign-in" stops ssh.
+- Every other kind has "Cancel sign-in", which replies with neither field; Esc does the same, and
+  the button says so (`aria-keyshortcuts`). A click outside the dialog does nothing. A
+  `gateway://prompt-closed` withdraws the prompt without a reply.
+- Enter does nothing for 300 ms after the dialog opens, so typing meant for another field cannot
+  send a half-typed password.
+- **The answer is never in state or in the DOM.** The field is uncontrolled (React copies a
+  controlled input's value into its `value` attribute, and so into `outerHTML`, snapshots and
+  traces); the answer is read from it once, as it is sent, and the field is cleared at that
+  moment. Each prompt gets a fresh field (keyed by its id). It is never logged or put in a store,
+  a query cache, the URL or storage (`tests/prompts.test.tsx` looks for it everywhere).
 
 ## Navigating from outside the window
 
@@ -96,6 +156,7 @@ A `Feature` has:
 | `id` | Unique: `console`, `projects`, `onboarding`. |
 | `layout` | `'projects'`, `'console'` or `'both'`: where its routes, entries and commands belong unless they say otherwise. |
 | `routes(parent)` | Its TanStack Router subtree under `/w/$ws`. Called once per router with the workspace route as `parent` (so tests can build several routers). |
+| `rootRoutes(root)` | Routes outside any workspace, under `/`, for what runs before there is one (the onboarding feature's "connect a remote machine" wizard at `/connect`). They render without the frame or a workspace's data. |
 | `nav` | Sidebar entries (below). |
 | `commands` | Palette commands (below). |
 | `create` | "+ New" items (below). |
@@ -159,6 +220,8 @@ rely on these paths; build them with `paths` from `index.ts`.
 | `tasks/$task` (key or id) | `task(ws, key)` | projects | N |
 | `console` | `console(ws)` | console | M |
 | `console/$session` | `session(ws, id)` | console | M |
+| `onboarding` (`staticData.setup`) | `setup(ws)` | both | O |
+| `/connect` (a root route, outside `/w/$ws`) | `connect()` | none | O |
 
 - **Param names** `$project`, `$workstream`, `$task` and `$session` feed the breadcrumb and the
   sidebar's current item; use them.
@@ -166,6 +229,7 @@ rely on these paths; build them with `paths` from `index.ts`.
   feature's `layout` when they do not set one, and children inherit it. On a route of one layout,
   that layout is on; on a `both` route (the Inbox) the workspace's stored layout stays.
 - **`staticData.title`** names the page in the breadcrumb when no param does ("Board").
+- **`staticData.setup`** marks a route that sets a workspace up (see "The first run" above).
 - `/` redirects to the hub's workspace (in the desktop app, see above); `/w/$ws` redirects to the stored layout's last page (or its
   home: `home` for Projects, `console` for the Agent console). Unknown paths show a not-found page
   inside the frame.

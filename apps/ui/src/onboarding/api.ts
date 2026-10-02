@@ -1,12 +1,14 @@
-// The onboarding wizards' backend contract. None of these routes exist on the hub yet (see
-// README.md for the proposed shapes); `createFakeOnboardingApi` in `fake-api.ts` is the only
-// implementation today, and every step is built against the `OnboardingApi` interface below so a
-// real client can replace the fake without touching a step component.
+// The onboarding wizards' backend contract. Setup (`POST /v1/setup`) and the host list
+// (`gateway_ssh_hosts`) are real (`hub-api.ts`); the other routes do not exist on the hub yet (see
+// README.md for the proposed shapes), and `createFakeOnboardingApi` in `fake-api.ts` is their only
+// implementation. Every step is built against the `OnboardingApi` interface below, so a real call
+// replaces a fake one without touching a step component.
 //
 // Reuses wire types from `../data` (`Engine`, `Machine`, `Project`, `Workstream`, …) rather than
 // redeclaring them, since the real routes below would return the same objects.
 
 import type { Engine, MachineKind, Project, Workstream } from '../data/index.ts';
+import type { SetupField } from './validation.ts';
 
 /** A machine to check, install on, sign into or scan: not yet a registered `Machine`. */
 export type MachineTarget =
@@ -212,24 +214,55 @@ export interface SafetySettings {
   backOfficeCaps: BackOfficeCaps;
 }
 
+/** `POST /v1/setup`'s body, as the form holds it (names already trimmed: `trimmedSetup`). */
 export interface SetupWorkspaceInput {
-  name: string;
-  primaryMachine: MachineTarget;
+  workspaceName: string;
+  person: { name: string; handle: string };
+  machineName: string;
 }
 
 export interface SetupWorkspaceResult {
   workspace: { id: string; name: string };
+  me: { name: string; handle: string };
 }
 
 /**
- * The onboarding wizards' backend contract (proposed; see README.md). Every method is called from
- * a step component through `useOnboardingApi()` (`api-context.tsx`); `fake-api.ts` is the only
- * implementation so far.
+ * Why setup was refused, for the form to show by the right field: a `400` names a field, a `409`
+ * is either the handle (taken) or the whole workspace (`alreadySetUp`: someone finished first, so
+ * there is nothing left to do but go Home).
+ */
+export class SetupRefused extends Error {
+  readonly field: SetupField | undefined;
+  readonly alreadySetUp: boolean;
+
+  constructor(message: string, options: { field?: SetupField | undefined; alreadySetUp?: boolean } = {}) {
+    super(message);
+    this.name = 'SetupRefused';
+    this.field = options.field;
+    this.alreadySetUp = options.alreadySetUp ?? false;
+  }
+}
+
+/** Every call; `unavailable` lists those with no backend yet. */
+export type OnboardingCall = Exclude<keyof OnboardingApi, 'unavailable'>;
+
+/**
+ * The onboarding wizards' backend contract (see README.md). Every method is called from a step
+ * component through `useOnboardingApi()` (`api-context.tsx`). `hub-api.ts` is the real one (setup
+ * and the host list so far); `fake-api.ts` implements all of it, for tests and a development flag.
  */
 export interface OnboardingApi {
-  /** SSH hosts from the user's `~/.ssh/config` and WSL distros, for the machine picker. */
+  /**
+   * The calls with no backend yet: each rejects, and `stepsFor` leaves out the steps that need
+   * one. They come back as their routes land.
+   */
+  readonly unavailable: ReadonlySet<OnboardingCall>;
+  /** SSH hosts from the person's ssh config (and, in the fake, WSL distros), for a host picker. */
   discoverHosts(): Promise<DiscoveredHost[]>;
-  /** Names and remembers the workspace's primary machine. Idempotent: safe to call again. */
+  /**
+   * The first run (`POST /v1/setup`): names the workspace, its person and this machine. Once
+   * only; rejects with a `SetupRefused` when the hub says no.
+   */
   setupWorkspace(input: SetupWorkspaceInput): Promise<SetupWorkspaceResult>;
 
   checkMachine(target: MachineTarget): Promise<MachineCheckResult>;

@@ -24,6 +24,8 @@
 //!   senders that may change each session, as [`SessionAgents`] tells;
 //! - [`RunnerHandle::terminals`] serves the API's terminals from a runtime ([`RunnerTerminals`]);
 //! - [`RunnerHandle::commands`] runs hub commands ([`RunnerCommands`]);
+//! - [`RunnerHandle::transcripts`] serves the API's transcript pages from the transcripts it
+//!   watches ([`RunnerTranscripts`]);
 //! - with [`Locations`], sessions are linked to workstreams by folder or branch.
 //!
 //! ```no_run
@@ -41,6 +43,7 @@
 //! let hooks = runner.hooks(); // a pitcrew_api::HookSink
 //! let terminals = runner.terminals(runtime)?; // a pitcrew_api::Terminals
 //! let commands = runner.commands(&terminals);
+//! let transcripts = runner.transcripts(); // for GET /v1/sessions/{id}/transcript
 //! # Ok(()) }
 //! ```
 //!
@@ -56,7 +59,9 @@ mod fsinfo;
 mod held;
 mod hooks;
 mod link;
+mod pages;
 mod plain;
+mod pool;
 mod sink;
 mod store;
 mod store_sink;
@@ -68,13 +73,15 @@ pub use commands::{CommandOptions, RunnerCommands};
 pub use config::{EngineHome, PollMode, RunnerConfig, Timing};
 pub use hooks::RunnerHooks;
 pub use link::{Locations, MemoryLocations, WorkstreamLocation};
+pub use pages::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, PageError, PageOptions, RunnerTranscripts};
 pub use sink::{EventSink, SinkError};
 pub use store::StoreError;
 pub use store_sink::StoreSink;
 pub use terminals::{RunnerTerminals, TerminalOptions};
 
 use pitcrew_interfaces::runtime::Runtime;
-use pitcrew_interfaces::source::SourceAdapter;
+use pitcrew_interfaces::source::{SourceAdapter, TranscriptPage};
+use pitcrew_protocol::ids::SessionId;
 use pitcrew_protocol::model::TimestampMs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -97,13 +104,15 @@ pub enum RunnerError {
 
 /// A running watcher. Stops when dropped.
 ///
-/// The hooks, terminals and commands it hands out keep working with the runner's index after it
-/// stops (reported states are then ignored), and keep the index open: start a runner on the same
-/// state directory again only once they are dropped.
+/// The hooks, terminals, commands and transcripts it hands out keep working with the runner's
+/// index after it stops (reported states are then ignored), and keep the index open: start a
+/// runner on the same state directory again only once they are dropped.
 #[derive(Debug)]
 pub struct RunnerHandle {
     shared: Arc<watch::Shared>,
     store: Arc<Mutex<store::Store>>,
+    watched: Arc<pages::Watched>,
+    transcripts: RunnerTranscripts,
     homes: Vec<EngineHome>,
     stopping: Arc<AtomicBool>,
     watcher: Option<JoinHandle<()>>,
@@ -152,6 +161,42 @@ impl RunnerHandle {
             Arc::clone(&self.store),
             options,
         )?)
+    }
+
+    /// Transcript pages of the sessions this runner watches, for the API's transcript route,
+    /// with default options. Every clone shares the threads the runner started for them.
+    #[must_use]
+    pub fn transcripts(&self) -> RunnerTranscripts {
+        self.transcripts.clone()
+    }
+
+    /// Transcript pages, with threads of their own tuned by `options`.
+    ///
+    /// # Errors
+    ///
+    /// The threads that read pages cannot start.
+    pub fn transcripts_with(&self, options: PageOptions) -> Result<RunnerTranscripts, RunnerError> {
+        Ok(RunnerTranscripts::new(
+            Arc::clone(&self.watched),
+            Arc::clone(&self.store),
+            options,
+        )?)
+    }
+
+    /// A page of `session`'s transcript, per api-v1's "Transcript paging". Blocking; see
+    /// [`RunnerTranscripts::transcript_page`].
+    ///
+    /// # Errors
+    ///
+    /// [`PageError::UnknownSession`] if the runner has no such session, [`PageError::Unavailable`]
+    /// if its transcript is gone or cannot be read.
+    pub fn transcript_page(
+        &self,
+        session: SessionId,
+        before: Option<u64>,
+        limit: Option<usize>,
+    ) -> Result<TranscriptPage, PageError> {
+        self.transcripts.transcript_page(session, before, limit)
     }
 
     /// Runs hub commands in `terminals`, with default options.
@@ -218,6 +263,12 @@ pub fn start(
     let store = Arc::new(Mutex::new(store));
     let (tx, rx) = std::sync::mpsc::sync_channel(config.channel_capacity.max(1));
     let shared = Arc::new(watch::Shared::default());
+    let watched = Arc::new(pages::Watched::default());
+    let transcripts = RunnerTranscripts::new(
+        Arc::clone(&watched),
+        Arc::clone(&store),
+        PageOptions::default(),
+    )?;
     let stopping = Arc::new(AtomicBool::new(false));
     let retry_max = config.timing.sink_retry_max;
     let homes = config.homes.clone();
@@ -237,6 +288,7 @@ pub fn start(
         shared: Arc::clone(&shared),
         locations: config.locations,
         agents: config.agents,
+        watched: Arc::clone(&watched),
     });
 
     let dispatcher = {
@@ -252,6 +304,8 @@ pub fn start(
     let mut handle = RunnerHandle {
         shared,
         store,
+        watched,
+        transcripts,
         homes,
         stopping,
         watcher: None,

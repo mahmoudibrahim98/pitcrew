@@ -1,7 +1,8 @@
 // @vitest-environment happy-dom
 //
-// Walks the first-run wizard end to end against the fake `OnboardingApi`: every step renders,
-// validates where it should, and advances; the skippable steps can be skipped instead.
+// Walks the first-run wizard end to end against the fake `OnboardingApi` (which has every step):
+// every step renders, validates where it should, and advances; the skippable steps can be skipped
+// instead.
 
 import { cleanup, fireEvent, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -29,22 +30,30 @@ async function rowForTextAsync(text: string | RegExp): Promise<HTMLElement> {
   return rowOf(await screen.findByText(text));
 }
 
+/** Fills the workspace step: a name, a person (the handle follows), and keeps the machine's name. */
+function fillWorkspace(name = 'My team') {
+  fireEvent.change(screen.getByLabelText('Workspace name'), { target: { value: name } });
+  fireEvent.change(screen.getByLabelText('Your name'), { target: { value: 'Sam Rivera' } });
+}
+
 describe('the first-run wizard', () => {
   it('runs start to finish, validating, fixing, streaming and skipping along the way', async () => {
-    renderWizard('first-run', createFakeOnboardingApi({ speed: 0 }));
+    renderWizard(createFakeOnboardingApi({ speed: 0 }));
 
     // 1. Welcome: theme and density, no validation, always advances.
     await heading('Welcome to PitCrew');
     fireEvent.click(screen.getByRole('radio', { name: 'Dark' }));
     fireEvent.click(screen.getByRole('button', { name: 'Get started' }));
 
-    // 2. Workspace: an empty name is rejected.
+    // 2. Workspace: empty names are refused by their fields; the handle follows the name.
     await heading('Your first workspace');
     fireEvent.click(continueButton());
-    const alert = await screen.findByRole('alert');
-    expect(alert.textContent ?? '').toMatch(/name/i);
-    fireEvent.change(screen.getByLabelText('Workspace name'), { target: { value: 'My team' } });
-    fireEvent.click(screen.getByRole('radio', { name: /This computer/ }));
+    const alerts = await screen.findAllByRole('alert');
+    expect(alerts.map((a) => a.textContent)).toEqual(['Give the workspace a name.', 'Enter your name.', 'Give yourself a handle.']);
+    expect(screen.getByLabelText('Workspace name')).toBe(document.activeElement);
+    fillWorkspace();
+    expect((screen.getByLabelText('Your handle') as HTMLInputElement).value).toBe('@sam');
+    expect((screen.getByLabelText('This machine’s name') as HTMLInputElement).value).toBe('This computer');
     fireEvent.click(continueButton());
 
     // 3. Machine check: waits for the check, then a fixable row can be fixed.
@@ -108,20 +117,35 @@ describe('the first-run wizard', () => {
 
     // 12. Done: summarises the run and links Home.
     await heading("You're set up");
-    const summary = await screen.findByText(/is ready on This computer/);
-    expect(summary.textContent ?? '').toContain('My team');
+    const summary = await screen.findByText(/is ready, with you as/);
+    expect(summary.textContent).toBe('“My team” is ready, with you as Sam Rivera (@sam) on This computer.');
     fireEvent.click(screen.getByRole('button', { name: 'Go to Home' }));
     await screen.findByRole('heading', { level: 1, name: 'Home' });
   }, 20_000);
 
+  it('never sends setup twice: Back to the workspace step only shows what was set', async () => {
+    renderWizard(createFakeOnboardingApi({ speed: 0 }));
+    await heading('Welcome to PitCrew');
+    fireEvent.click(screen.getByRole('button', { name: 'Get started' }));
+    await heading('Your first workspace');
+    fillWorkspace();
+    fireEvent.click(continueButton());
+    await heading('Checking the machine');
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }));
+    await heading('Your first workspace');
+    expect(screen.queryByLabelText('Workspace name')).toBeNull();
+    expect(screen.getByText('“My team” is set up, with you as Sam Rivera (@sam).')).toBeTruthy();
+    fireEvent.click(continueButton());
+    await heading('Checking the machine');
+  });
+
   it('keeps an explicitly chosen launcher on Back and Forward (review r1, item 1)', async () => {
-    renderWizard('first-run', createFakeOnboardingApi({ speed: 0 }));
+    renderWizard(createFakeOnboardingApi({ speed: 0 }));
     await heading('Welcome to PitCrew');
     fireEvent.click(screen.getByRole('button', { name: 'Get started' }));
 
     await heading('Your first workspace');
-    fireEvent.change(screen.getByLabelText('Workspace name'), { target: { value: 'My team' } });
-    fireEvent.click(screen.getByRole('radio', { name: /This computer/ }));
+    fillWorkspace();
     fireEvent.click(continueButton());
 
     await heading('Checking the machine');
@@ -147,7 +171,7 @@ describe('the first-run wizard', () => {
   });
 
   it('the stepper only lets you jump to a step already reached', async () => {
-    renderWizard('first-run', createFakeOnboardingApi({ speed: 0 }));
+    renderWizard(createFakeOnboardingApi({ speed: 0 }));
     await heading('Welcome to PitCrew');
     const machineCheckTab = screen.getByRole('tab', { name: /Machine check/ }) as HTMLButtonElement;
     expect(machineCheckTab.disabled).toBe(true);

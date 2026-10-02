@@ -8,6 +8,16 @@
 import { Channel, invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { GatewayError, toGatewayError } from './errors.ts';
+import {
+  parseHosts,
+  parseProgress,
+  parsePrompt,
+  parsePromptClosed,
+  parseRemotePlan,
+  parseRemoteProbe,
+  toGatewayWorkspace,
+  type RemoteGateway,
+} from './remote.ts';
 import type { Method, SocketClose, Transport, TransportResponse, TransportSocket } from './transport.ts';
 import type { Gateway, GatewayWorkspace } from './workspaces.tsx';
 
@@ -16,6 +26,12 @@ export const WORKSPACES_EVENT = 'gateway://workspaces';
 
 /** Emitted with a `NavigateTarget`: a deep link, or a click on the app's own notifications. */
 export const NAVIGATE_EVENT = 'gateway://navigate';
+
+/** SSH asks for a password, a passphrase, a code, or a new host key's confirmation. */
+export const PROMPT_EVENT = 'gateway://prompt';
+
+/** A prompt no longer wanted, `{ id }`. */
+export const PROMPT_CLOSED_EVENT = 'gateway://prompt-closed';
 
 export interface GatewayRequest {
   workspace: string;
@@ -47,6 +63,84 @@ export function createGateway(): Gateway {
     onWorkspaces: (listener) => listen<GatewayWorkspace[]>(WORKSPACES_EVENT, (event) => listener(event.payload)),
     onNavigate: (listener) => listen<unknown>(NAVIGATE_EVENT, (event) => listener(event.payload)),
     transport: (id, name) => gatewayTransport(id, name),
+    remote: createRemoteGateway(),
+  };
+}
+
+/** An answer that does not have the contract's shape: the gateway's fault, never acted on. */
+function malformed(what: string): GatewayError {
+  return new GatewayError('internal', `The gateway's ${what} was malformed.`);
+}
+
+/**
+ * The remote commands and prompt events (desktop-gateway.md, "Remote workspaces"). Answers are
+ * checked and a malformed one is refused; malformed events and progress messages are dropped.
+ * A prompt's answer goes to `gateway_prompt_reply` and nowhere else: not logged, not kept.
+ */
+export function createRemoteGateway(): RemoteGateway {
+  return {
+    sshHosts: async () => parseHosts(await call<unknown>('gateway_ssh_hosts', {})),
+
+    async remoteProbe(host) {
+      const probe = parseRemoteProbe(await call<unknown>('gateway_remote_probe', { host }));
+      if (probe === undefined) throw malformed('probe');
+      return probe;
+    },
+
+    // One argument, `req`, as `gateway_request` takes.
+    async remotePlan(req) {
+      const plan = parseRemotePlan(await call<unknown>('gateway_remote_plan', { req }));
+      if (plan === undefined) throw malformed('plan');
+      return plan;
+    },
+
+    async remoteAdd(plan, onProgress) {
+      let warned = false;
+      const events = new Channel<unknown>((message) => {
+        const progress = parseProgress(message);
+        if (progress !== undefined) onProgress(progress);
+        else if (!warned) {
+          warned = true;
+          console.warn('pitcrew: dropped a malformed progress message from gateway_remote_add.');
+        }
+      });
+      const workspace = toGatewayWorkspace(await call<unknown>('gateway_remote_add', { plan, events }));
+      if (workspace === undefined) throw malformed('new workspace');
+      return workspace;
+    },
+
+    async workspaceRemove(workspace, stopHelper) {
+      await call<unknown>('gateway_workspace_remove', { workspace, stopHelper });
+    },
+
+    async workspaceRetry(workspace) {
+      await call<unknown>('gateway_workspace_retry', { workspace });
+    },
+
+    async remoteCancel(plan) {
+      await call<unknown>('gateway_remote_cancel', { plan });
+    },
+
+    onPrompt: (listener) =>
+      listen<unknown>(PROMPT_EVENT, (event) => {
+        const prompt = parsePrompt(event.payload);
+        if (prompt !== undefined) listener(prompt);
+        else console.warn('pitcrew: dropped a malformed gateway://prompt.');
+      }),
+
+    onPromptClosed: (listener) =>
+      listen<unknown>(PROMPT_CLOSED_EVENT, (event) => {
+        const id = parsePromptClosed(event.payload);
+        if (id !== undefined) listener(id);
+      }),
+
+    async replyPrompt(id, reply) {
+      // Exactly one of the fields, or none (a cancel); never both, never anything else.
+      const args: Record<string, unknown> = { id };
+      if ('answer' in reply && typeof reply.answer === 'string') args.answer = reply.answer;
+      else if ('accept' in reply && typeof reply.accept === 'boolean') args.accept = reply.accept;
+      await call<unknown>('gateway_prompt_reply', args);
+    },
   };
 }
 

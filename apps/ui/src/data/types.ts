@@ -57,6 +57,33 @@ export interface Workspace {
   name: string;
 }
 
+/** `GET /v1/workspace`. */
+export interface WorkspaceInfo {
+  workspace: Workspace;
+  /** The current event revision. */
+  rev: number;
+  /** `true` while the workspace has no person (a fresh hub); omitted means `false`. */
+  setup_needed?: boolean;
+}
+
+/**
+ * `POST /v1/setup`: the first run (api-v1.md, "The first run"). The three names are 1–80, 1–80
+ * and 1–60 code points after trimming; the handle is `@` and 1–32 of `a-z 0-9 _ -`, not trimmed.
+ * None may hold a control character.
+ */
+export interface Setup {
+  workspace_name: string;
+  person: { name: string; handle: string };
+  machine_name: string;
+}
+
+/** `POST /v1/setup`'s answer: the person is the device token's member from now on. */
+export interface SetupResult {
+  workspace: Workspace;
+  me: Member;
+  machine: Machine;
+}
+
 export interface Machine {
   id: MachineId;
   name: string;
