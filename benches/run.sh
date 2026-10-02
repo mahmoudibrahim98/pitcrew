@@ -10,7 +10,7 @@
 #   --full             Local mode (the default): 20 and 200 MiB transcripts, more samples.
 #   --no-tests         Leave out the timing tests of the runner, hub-work and CLI crates.
 #   --scale            Also run the scale measurements: the real pitcrewd over 10,000 synthetic
-#                      transcripts (about 10 minutes, 3 GiB of disk in the temp dir, Linux only).
+#                      transcripts (about 5 minutes, 2 GiB of disk in the temp dir, Linux only).
 #                      Not retried; see benches/README.md.
 #   --scale-only       Run only the scale measurements.
 #   --baseline FILE    The baseline for this machine class (default: benches/baseline.json).
@@ -49,7 +49,7 @@ while [ $# -gt 0 ]; do
     --write-baseline) write=1; report+=(--write-baseline --recorded "$(date -u +%Y-%m-%d)"); shift ;;
     --extend-baseline) report+=(--extend-baseline); shift ;;
     --note) report+=(--note "$2"); shift 2 ;;
-    -h | --help) sed -n '2,25p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,22p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done

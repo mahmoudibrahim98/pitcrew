@@ -2,7 +2,8 @@
 //!
 //! The budgets come from the table in `docs/build/streams/P.md`; the store's targets come from
 //! `crates/store/README.md` (stream C), the task list's from `crates/hub-work/tests/perf.rs`
-//! (stream E) and the hook's from `crates/cli/tests/hook_timing.rs` (stream I). A metric with no
+//! (stream E), the hook's from `crates/cli/tests/hook_timing.rs` (stream I), and the daemon's with
+//! 10,000 transcripts from `pitcrew-bench-scale` (this crate, `src/scale.rs`). A metric with no
 //! budget is still checked for regressions.
 
 use serde::{Deserialize, Serialize};

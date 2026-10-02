@@ -619,8 +619,8 @@ pub fn run(options: &Options) -> Result<()> {
         .clone()
         .unwrap_or_else(std::env::temp_dir);
     fs::create_dir_all(&parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    // Roughly 250 KiB a transcript for the homes, and about as much again for the state.
-    let need_kib = options.sessions as u64 * 500 + options.min_free_gib * (1 << 20);
+    // Roughly 150 KiB a transcript for the homes and 50 KiB for the state, with room to spare.
+    let need_kib = options.sessions as u64 * 250 + options.min_free_gib * (1 << 20);
     if let Some(free) = free_kib(&parent)
         && free < need_kib
     {
