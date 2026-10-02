@@ -388,13 +388,23 @@ mod unix {
                 ExitCode::SUCCESS
             }
             (_, Some(socket)) => {
-                // Its umask, for the test that it is the user's and not the script's.
-                let umask = std::fs::read_to_string("/proc/self/status")
-                    .unwrap_or_default()
-                    .lines()
-                    .find_map(|l| l.strip_prefix("Umask:").map(|v| v.trim().to_owned()))
-                    .unwrap_or_default();
-                println!("fake pitcrewd umask {umask}");
+                // Its umask, for the test that it is the user's and not the script's. Read
+                // before any thread starts, so setting it back at once races nothing.
+                println!("fake pitcrewd umask {}", own_umask());
+                // The signals it got ignored, of SIGUSR1 and SIGUSR2, for the SLURM tests. A
+                // shell started from here keeps them ignored, and lives on after sending one to
+                // itself only if it is (macOS has no /proc to read them from, nor a `ps` field).
+                let ignored: Vec<&str> = ["USR1", "USR2"]
+                    .into_iter()
+                    .filter(|signal| {
+                        Command::new("/bin/sh")
+                            .arg("-c")
+                            .arg(format!("kill -s {signal} $$ && echo kept"))
+                            .output()
+                            .is_ok_and(|out| out.stdout == b"kept\n")
+                    })
+                    .collect();
+                println!("fake pitcrewd ignores {ignored:?}");
                 let _ = std::fs::remove_file(&socket);
                 let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
                 println!("fake pitcrewd listening");
@@ -625,7 +635,8 @@ mod unix {
         }
 
         pub(crate) fn build(sh: &Path, customize: impl FnOnce(&Path)) -> Self {
-            let dir = tempfile::tempdir().unwrap();
+            // Short: the machine's sockets (ssh's, the helper's, a node-local one) live under it.
+            let dir = pitcrew_fixtures::temp::short_tempdir().unwrap();
             let home = dir.path().join("home");
             std::fs::create_dir(&home).unwrap();
             let bin = dir.path().join("bin");
@@ -823,19 +834,40 @@ mod unix {
     }
 
     pub(crate) fn comm(pid: u32) -> String {
-        std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        if let Ok(name) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+            return name.trim().to_owned();
+        }
+        // No /proc (macOS): ps names the command, there by its path.
+        Command::new("ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()])
+            .output()
+            .map(|out| {
+                let name = String::from_utf8_lossy(&out.stdout);
+                name.trim()
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
             .unwrap_or_default()
-            .trim()
-            .to_owned()
     }
 
-    /// The umask of a process (`self`, or a pid), as /proc prints it: `0022`.
-    pub(crate) fn umask_of(pid: &str) -> String {
-        std::fs::read_to_string(format!("/proc/{pid}/status"))
-            .unwrap()
+    /// This process's umask, as /proc prints it: `0022`.
+    pub(crate) fn own_umask() -> String {
+        use rustix::fs::Mode;
+        // Read by setting it, then put back at once (the cases run one at a time).
+        let mask = rustix::process::umask(Mode::empty());
+        rustix::process::umask(mask);
+        format!("{:04o}", mask.bits())
+    }
+
+    /// Another process's umask, as /proc prints it (`0022`), where there is a /proc to read it
+    /// from (Linux); `None` elsewhere.
+    pub(crate) fn umask_of(pid: u32) -> Option<String> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        status
             .lines()
             .find_map(|l| l.strip_prefix("Umask:").map(|v| v.trim().to_owned()))
-            .unwrap()
     }
 
     fn uname_n() -> String {
@@ -1141,7 +1173,9 @@ mod unix {
         };
         let err = block_on(deploy(&m.plain(), &helper("4.0.0"), &impatient)).unwrap_err();
         assert!(matches!(&err, HelperError::Busy(_)), "{err:?}");
-        assert!(err.to_string().contains(&uname_n()), "{err}");
+        // The holder by name, as the script writes it (at most 40 characters: CI's macOS hosts
+        // have longer ones).
+        assert!(err.to_string().contains(&this_name()), "{err}");
         a.join().unwrap().unwrap();
         assert_eq!(m.link("current").as_deref(), Some("3.0.0"));
         assert_eq!(m.link("previous").as_deref(), Some("2.0.0"));
@@ -1162,13 +1196,14 @@ mod unix {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let touch = |when: &str| {
-            let touched = Command::new("touch")
-                .args(["-d", when])
-                .arg(&lock)
-                .status()
+        // Sets the lock directory's time to `minutes` ago (from here, not `touch`: GNU's and
+        // BSD's take different date forms).
+        let touch = |minutes: u64| {
+            let when = SystemTime::now() - Duration::from_secs(minutes * 60);
+            std::fs::File::open(&lock)
+                .unwrap()
+                .set_modified(when)
                 .unwrap();
-            assert!(touched.success());
         };
 
         // A fresh lock from another host (a login node sharing this home): it is waited for,
@@ -1184,12 +1219,12 @@ mod unix {
 
         // Its directory a little older than stale_lock (5 minutes) is not enough: clocks may
         // differ by up to 10 minutes...
-        touch("8 minutes ago");
+        touch(8);
         let err = block_on(deploy(&m.plain(), &helper("1.0.0"), &impatient)).unwrap_err();
         assert!(matches!(err, HelperError::Busy(_)), "{err:?}");
 
         // ...beyond that it is broken.
-        touch("16 minutes ago");
+        touch(16);
         block_on(deploy(&m.plain(), &helper("1.0.0"), &impatient)).unwrap();
         assert!(!lock.exists());
 
@@ -1229,7 +1264,7 @@ mod unix {
             ),
         )
         .unwrap();
-        touch("now");
+        touch(0);
         block_on(deploy(&m.plain(), &helper("3.0.0"), &impatient)).unwrap();
         assert!(!lock.exists());
 
@@ -1265,7 +1300,7 @@ mod unix {
             std::fs::write(lock.join("owner"), &owner).unwrap();
             let err = block_on(deploy(&m.plain(), &helper("4.0.0"), &impatient)).unwrap_err();
             assert!(matches!(err, HelperError::Busy(_)), "{owner}: {err:?}");
-            touch("16 minutes ago");
+            touch(16);
             block_on(deploy(&m.plain(), &helper("4.0.0"), &impatient)).unwrap();
             assert!(!lock.exists(), "{owner}");
         }
@@ -1423,8 +1458,9 @@ mod unix {
         let probe = block_on(fake.ssh.probe("cluster")).unwrap();
         let target = Target::new(fake.ssh.clone(), "cluster", &probe).unwrap();
         assert_eq!(target.layout(), &m.layout());
-        let want = match std::env::consts::ARCH {
-            "aarch64" => Platform::LinuxAarch64,
+        let want = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("macos", _) => Platform::MacOs,
+            (_, "aarch64") => Platform::LinuxAarch64,
             _ => Platform::LinuxX86_64,
         };
         assert_eq!(target.platform(), want);
@@ -1572,11 +1608,17 @@ mod unix {
     fn mv_without_t_falls_back() {
         let real = which("mv").unwrap();
         let real = real.display();
-        // BSD: -h instead of -T.
+        // BSD: -h instead of -T. Played over the real `mv`, with its own flag for it (macOS's is
+        // BSD's already).
+        let no_follow = if cfg!(target_os = "macos") {
+            "-h"
+        } else {
+            "-T"
+        };
         let bsd = format!(
             "case \"$1\" in\n\
              -T) echo 'mv: illegal option -- T' >&2; exit 64 ;;\n\
-             -h) shift; exec '{real}' -T \"$@\" ;;\n\
+             -h) shift; exec '{real}' {no_follow} \"$@\" ;;\n\
              esac\n\
              exec '{real}' \"$@\""
         );
@@ -1637,7 +1679,9 @@ mod unix {
     /// writable by no one else unless sticky; symbolic links on the way are followed.
     fn the_way_to_the_root_is_checked() {
         let m = Machine::new();
-        let base = m.dir.path().to_path_buf();
+        // Canonical: macOS's /var is a link to /private/var, which the walk resolves, and the
+        // stand-in `ls` below must be asked about the paths it names.
+        let base = m.dir.path().canonicalize().unwrap();
         let at = |root: &Path| {
             m.target_at(
                 &m.fake(Remote::default()),
@@ -1734,6 +1778,155 @@ mod unix {
         assert!(!base.join("real3/u/.pitcrew").exists());
     }
 
+    /// An access control list on a directory on the way is judged by what it grants where `ls`
+    /// can list it (macOS's `ls -le`), and refused where it cannot be read or the system is not
+    /// one whose ACLs the check knows: on macOS the mode bits alone can look safe. Here a
+    /// stand-in `uname` and `ls` play each system, so this runs anywhere.
+    fn an_acl_on_the_way_is_judged_by_what_it_grants() {
+        let m = Machine::new();
+        // Canonical, as in `the_way_to_the_root_is_checked`.
+        let base = m.dir.path().canonicalize().unwrap();
+        let acl = base.join("acl");
+        std::fs::create_dir_all(acl.join("u")).unwrap();
+        std::fs::set_permissions(&acl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = acl.join("u/.pitcrew");
+        let (ls, uname) = (which("ls").unwrap(), which("uname").unwrap());
+        // `uname -s` says `os`; `acl` shows a `+`, and `ls -le` lists `entries` for it (`None`:
+        // it fails).
+        let system = |os: &str, entries: Option<&[&str]>| {
+            shim(
+                &m.bin,
+                "uname",
+                &format!(
+                    "case $1 in -s) echo {os} ;; *) exec '{}' \"$@\" ;; esac",
+                    uname.display()
+                ),
+            );
+            let plus = format!(
+                "'{}' -ldn \"$last\" | awk '{{ $1 = $1 \"+\"; print }}'",
+                ls.display()
+            );
+            let list = match entries {
+                Some(entries) => {
+                    let quoted: Vec<String> = entries.iter().map(|e| format!("'{e}'")).collect();
+                    format!("{plus}; printf '%s\\n' {}; exit", quoted.join(" "))
+                }
+                None => "exit 1".to_owned(),
+            };
+            shim(
+                &m.bin,
+                "ls",
+                &format!(
+                    "last=\nfor a in \"$@\"; do last=$a; done\n\
+                     if [ \"$last\" = '{}' ]; then\n\
+                     case $1 in -ldn) {plus}; exit ;; -lde) {list} ;; esac\n\
+                     fi\n\
+                     exec '{}' \"$@\"",
+                    acl.display(),
+                    ls.display()
+                ),
+            );
+        };
+        let deploy_here = || {
+            let target = m.target_at(
+                &m.fake(Remote::default()),
+                Layout::at(root.to_str().unwrap()).unwrap(),
+            );
+            block_on(deploy(&target, &helper("1.0.0"), &quick()))
+        };
+        let refused = |why: &str| {
+            let err = deploy_here().unwrap_err();
+            assert!(
+                matches!(&err, HelperError::UnsafeDirectory(d) if d.contains(why)),
+                "{why}: {err:?}"
+            );
+            assert!(!root.exists());
+        };
+
+        // macOS: an entry that lets someone else add, remove or rename what is in it.
+        system(
+            "Darwin",
+            Some(&[
+                " 0: group:everyone deny delete",
+                " 1: user:mallory allow list,add_file,delete_child",
+            ]),
+        );
+        refused("lets others change it:  1: user:mallory allow list,add_file,delete_child");
+        system("Darwin", Some(&[" 0: user:mallory allow write"]));
+        refused("allow write");
+        // An entry not in the form the check knows, or a list that cannot be read.
+        system("Darwin", Some(&[" 0: something else"]));
+        refused("lets others change it:  0: something else");
+        system("Darwin", None);
+        refused("cannot read the access control list");
+        // A system whose ACLs the check does not know, or one whose name it cannot read.
+        system("FreeBSD", Some(&[]));
+        refused("which cannot be checked on FreeBSD");
+        system("", Some(&[]));
+        refused("which cannot be checked on this system");
+
+        // Linux: a POSIX ACL's grants are bounded by the group bits, checked already (r-x here).
+        system("Linux", None);
+        deploy_here().unwrap();
+        assert!(root.join("bin/1.0.0/pitcrewd").is_file());
+        std::fs::remove_dir_all(&root).unwrap();
+        // macOS: entries that deny, or allow only reading and searching, as on a home folder.
+        system(
+            "Darwin",
+            Some(&[
+                " 0: group:everyone deny delete",
+                " 1: user:_spotlight inherited allow list,search,readattr,file_inherit,directory_inherit",
+            ]),
+        );
+        deploy_here().unwrap();
+        assert!(root.join("bin/1.0.0/pitcrewd").is_file());
+    }
+
+    /// The same with macOS's own ACLs (`chmod +a`) and its own `ls -le`.
+    fn a_macos_acl_on_the_way_is_judged_by_what_it_grants() {
+        if !cfg!(target_os = "macos") {
+            eprintln!("skipped: needs macOS's chmod +a and ls -le");
+            return;
+        }
+        let m = Machine::new();
+        let base = m.dir.path().canonicalize().unwrap();
+        let acl = base.join("acl");
+        std::fs::create_dir_all(acl.join("u")).unwrap();
+        std::fs::set_permissions(&acl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let root = acl.join("u/.pitcrew");
+        let chmod = |args: &[&str]| {
+            let status = Command::new("/bin/chmod")
+                .args(args)
+                .arg(&acl)
+                .status()
+                .unwrap();
+            assert!(status.success(), "chmod {args:?}");
+        };
+        let deploy_here = || {
+            let target = m.target_at(
+                &m.fake(Remote::default()),
+                Layout::at(root.to_str().unwrap()).unwrap(),
+            );
+            block_on(deploy(&target, &helper("1.0.0"), &quick()))
+        };
+        // The mode bits say drwxr-xr-x; the ACL lets everyone add and remove entries.
+        chmod(&[
+            "+a",
+            "everyone allow add_file,add_subdirectory,delete_child",
+        ]);
+        let err = deploy_here().unwrap_err();
+        assert!(
+            matches!(&err, HelperError::UnsafeDirectory(d) if d.contains("lets others change it")),
+            "{err:?}"
+        );
+        assert!(!root.exists());
+        // One that only denies, as on every macOS home folder, is fine.
+        chmod(&["-N"]);
+        chmod(&["+a", "everyone deny delete"]);
+        deploy_here().unwrap();
+        assert!(root.join("bin/1.0.0/pitcrewd").is_file());
+    }
+
     /// A shell start-up file that reads stdin eats the start of the script: what is left must
     /// not run, even a tail that would remove things.
     fn a_partly_eaten_script_never_runs() {
@@ -1817,7 +2010,11 @@ mod unix {
         block_on(deploy(&target, &helper("1.0.0"), &quick())).unwrap();
         let launcher = DirectLauncher::new(launch_options());
         let started = block_on(launcher.start(&target)).unwrap();
-        assert_eq!(umask_of(&started.endpoint.pid.to_string()), "0027");
+        // Read from outside where /proc allows (Linux); everywhere, the helper's own report
+        // below says it too.
+        if let Some(mask) = umask_of(started.endpoint.pid) {
+            assert_eq!(mask, "0027");
+        }
         // What the script made stays private all the same.
         assert_private(&m.root());
         block_on(launcher.stop(&target)).unwrap();
@@ -1910,12 +2107,22 @@ mod unix {
 
         let m = Machine::new();
         std::fs::set_permissions(&m.home, std::fs::Permissions::from_mode(0o2755)).unwrap();
+        // Linux gives a new directory its parent's set-group-ID bit; BSD and macOS do not (the
+        // group is always the parent's there). Whichever this system does is accepted.
+        let probe = m.home.join("probe");
+        std::fs::create_dir(&probe).unwrap();
+        let private = if mode(&probe) & 0o2000 != 0 {
+            0o2700
+        } else {
+            0o700
+        };
+        std::fs::remove_dir(&probe).unwrap();
         block_on(deploy(&m.plain(), &helper("1.0.0"), &quick())).unwrap();
-        assert_eq!(mode(&m.root()), 0o2700);
-        assert_eq!(mode(&m.bin_dir()), 0o2700);
+        assert_eq!(mode(&m.root()), private);
+        assert_eq!(mode(&m.bin_dir()), private);
         let launcher = DirectLauncher::new(launch_options());
         block_on(launcher.start(&m.plain())).unwrap();
-        assert_eq!(mode(&m.run_dir()), 0o2700);
+        assert_eq!(mode(&m.run_dir()), private);
         assert!(block_on(launcher.stop(&m.plain())).unwrap().pid.is_some());
     }
 
@@ -2051,14 +2258,17 @@ mod unix {
             assert!(!m.run_dir().join(gone).exists(), "{gone}");
         }
         // The log: the version's own binary was started, not `current`, with the umask the
-        // user's session had rather than the script's 077. It stays private itself.
+        // user's session had rather than the script's 077. It stays private itself. macOS hands
+        // the script the full path it was started by, from the root's physical path.
         let log = std::fs::read_to_string(m.run_dir().join("pitcrewd.log")).unwrap();
+        let full = m.root().canonicalize().unwrap().join("bin/1.0.0/pitcrewd");
         assert!(
-            log.contains("pitcrewd script: bin/1.0.0/pitcrewd\n"),
+            log.contains("pitcrewd script: bin/1.0.0/pitcrewd\n")
+                || log.contains(&format!("pitcrewd script: {}\n", full.display())),
             "{log}"
         );
         assert!(
-            log.contains(&format!("fake pitcrewd umask {}\n", umask_of("self"))),
+            log.contains(&format!("fake pitcrewd umask {}\n", own_umask())),
             "{log}"
         );
         assert_eq!(mode(&m.run_dir().join("pitcrewd.log")), 0o600);
@@ -2496,6 +2706,14 @@ mod unix {
             (
                 "the_way_to_the_root_is_checked",
                 the_way_to_the_root_is_checked,
+            ),
+            (
+                "an_acl_on_the_way_is_judged_by_what_it_grants",
+                an_acl_on_the_way_is_judged_by_what_it_grants,
+            ),
+            (
+                "a_macos_acl_on_the_way_is_judged_by_what_it_grants",
+                a_macos_acl_on_the_way_is_judged_by_what_it_grants,
             ),
             (
                 "a_partly_eaten_script_never_runs",

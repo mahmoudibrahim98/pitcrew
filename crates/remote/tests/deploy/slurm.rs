@@ -7,8 +7,8 @@
 
 use crate::unix::{
     Machine, RUN_ENV, Remote, alive, assert_private, block_on, comm, eventually, helper,
-    helper_from, helper_script, me, mode, posix_shells, private_dir, quick, run_mark, script_len,
-    shim, umask_of,
+    helper_from, helper_script, me, mode, own_umask, posix_shells, private_dir, quick, run_mark,
+    script_len, shim,
 };
 use pitcrew_protocol::model::Scheduler;
 use pitcrew_remote::helper::slurm::{self, Cancelled, JobExit, LastHop, Site, SocketPlace};
@@ -845,20 +845,6 @@ fn job_scripts_left(m: &Machine) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// SIGUSR1 and SIGUSR2 as bits of `/proc/<pid>/status`'s signal masks (signal n is bit n - 1).
-const USR_SIGNALS: u64 = (1 << 9) | (1 << 11);
-
-/// The signals `pid` ignores, from `/proc/<pid>/status` (`SigIgn`).
-fn ignored_signals(pid: u32) -> u64 {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
-    let mask = status
-        .lines()
-        .find_map(|l| l.strip_prefix("SigIgn:"))
-        .unwrap()
-        .trim();
-    u64::from_str_radix(mask, 16).unwrap()
-}
-
 /// Sends SIGUSR1 and SIGUSR2 to `pid`, as `sbatch --signal=B:…` would to the batch shell, and
 /// gives it a moment to act on them.
 fn send_usr_signals(pid: u32) {
@@ -1052,7 +1038,7 @@ fn slurm_submit_pending_running_stop() {
     assert_eq!(mode(&out), 0o600);
     let text = read(&out);
     assert!(
-        text.contains(&format!("fake pitcrewd umask {}\n", umask_of("self"))),
+        text.contains(&format!("fake pitcrewd umask {}\n", own_umask())),
         "{text}"
     );
     assert_private(&m.root());
@@ -2082,11 +2068,15 @@ fn slurm_under_every_posix_sh() {
         // again, so they do not end it and the helper does not inherit them ignored.
         let id = started.endpoint.job.unwrap();
         let job_shell = sim.job(id).pgid.unwrap();
-        assert_eq!(
-            ignored_signals(started.endpoint.pid) & USR_SIGNALS,
-            0,
-            "{}",
-            shell.display()
+        let out = m.run_dir().join(format!("slurm-{id}.out"));
+        eventually("the helper's report of its signals", || {
+            read(&out).contains("fake pitcrewd ignores ")
+        });
+        assert!(
+            read(&out).contains("fake pitcrewd ignores []\n"),
+            "{}: {}",
+            shell.display(),
+            read(&out)
         );
         send_usr_signals(job_shell);
         assert!(alive(job_shell), "{}", shell.display());

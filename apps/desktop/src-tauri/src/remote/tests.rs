@@ -171,7 +171,8 @@ struct Rig {
 }
 
 fn rig() -> Rig {
-    let dir = tempfile::tempdir().unwrap();
+    // Short: the runtime directory, with ssh's and the askpass sockets, is under it.
+    let dir = pitcrew_fixtures::temp::short_tempdir().unwrap();
     let runtime_dir = dir.path().join("rt");
     std::fs::create_dir(&runtime_dir).unwrap();
     #[cfg(unix)]

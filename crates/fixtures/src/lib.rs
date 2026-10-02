@@ -12,6 +12,7 @@
 //!   `transcripts/codex`, `transcripts/opencode`).
 //! - [`homes`]: a home folder of the test's own for every program a test starts, on every
 //!   platform, and the check that a command reaches no real home.
+//! - [`temp`]: temporary folders short enough for unix sockets, also on macOS.
 //!
 //! **Everything here is made up.** Never add real transcripts, host names, paths or people. Real
 //! samples for local testing go in `data/private/`, which is ignored by git.
@@ -22,6 +23,7 @@
 #![forbid(unsafe_code)]
 
 pub mod homes;
+pub mod temp;
 
 use pitcrew_protocol::events::Event;
 use pitcrew_protocol::ids::ProjectId;

@@ -973,6 +973,7 @@ mod tests {
             "pc_where",
             "pc_alive",
             "pc_dir_ok",
+            "pc_acl_ok",
             "pc_safe_way",
             "pc_private",
         ] {

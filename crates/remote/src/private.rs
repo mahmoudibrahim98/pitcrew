@@ -219,7 +219,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn unsuitable_names_fall_back() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = pitcrew_fixtures::temp::short_tempdir().unwrap();
         let spaced = tmp.path().join("with space");
         let long = tmp.path().join("x".repeat(60));
         let good = tmp.path().join("ok");
@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn a_squatted_dir_falls_back() {
         use std::os::unix::fs::PermissionsExt as _;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = pitcrew_fixtures::temp::short_tempdir().unwrap();
         let squatted = tmp.path().join("squatted");
         std::fs::create_dir(&squatted).unwrap();
         std::fs::set_permissions(&squatted, std::fs::Permissions::from_mode(0o777)).unwrap();

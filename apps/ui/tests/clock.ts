@@ -2,6 +2,8 @@
 // are fixed while timeouts and back-offs still see time pass. setup.ts installs it in every test
 // file, and hub-process.ts preloads it into the mock hubs tests start as child processes, so the
 // hub and the UI agree on the time. `vi.useFakeTimers` starts from it too.
+// Call `vi.useFakeTimers()` before `vi.setSystemTime()`: without fake timers, `vi.useRealTimers()`
+// then restores the unpinned `Date`.
 
 /** 1 October 2026, 09:00 UTC: the morning after the demo data's last event. */
 export const PINNED_NOW = Date.UTC(2026, 9, 1, 9, 0);

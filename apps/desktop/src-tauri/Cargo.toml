@@ -101,6 +101,8 @@ mac-notification-sys = "0.6"
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["ws"] }
+# `temp::short_tempdir`, for the remote cases' sockets on macOS.
+pitcrew-fixtures = { path = "../../../crates/fixtures" }
 # A canary record through the log bridge (no_token.rs). Already in the lockfile through Tauri.
 log = "0.4"
 # The helpers' sha256 in the remote cases' manifests. The version the root workspace uses.

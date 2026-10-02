@@ -49,7 +49,7 @@ pc_fail() {
 }
 pc_nap() { sleep 0.2 2>/dev/null || sleep 1; }
 
-# These five are the same text as in helper.sh (a test checks it).
+# These six are the same text as in helper.sh (a test checks it).
 
 # A path as the user knows it: relative paths are inside the root.
 pc_where() {
@@ -73,8 +73,8 @@ pc_alive() {
 }
 
 # pc_dir_ok DIR: DIR, on the way to $pc_goal, is a directory owned by root or this user, and
-# writable by the group or others only if sticky (as /tmp). Anyone else could rename what is
-# under it after the checks.
+# writable by the group or others only if sticky (as /tmp), by its mode bits and by any access
+# control list (pc_acl_ok). Anyone else could rename what is under it after the checks.
 pc_dir_ok() {
   pc_ls=$(ls -ldn "$1" 2>/dev/null | awk '{print $1, $3}')
   pc_m=${pc_ls%% *} pc_u=${pc_ls#* }
@@ -93,6 +93,41 @@ pc_dir_ok() {
         *) pc_fail unsafe_dir "$1, on the way to $pc_goal, is writable by others ($pc_m)" ;;
       esac
       ;;
+  esac
+  case $pc_m in
+    ??????????[+@]*) pc_acl_ok "$1" ;;
+  esac
+}
+
+# pc_acl_ok DIR: DIR, on the way to $pc_goal, has an access control list (+), or extended
+# attributes that may hide one (macOS's @). No one else may add, remove or rename what is in it
+# through one:
+# - Linux: a POSIX ACL's grants are bounded by its mask, which ls shows as the group bits, and
+#   pc_dir_ok has checked those.
+# - macOS: the mode bits leave the ACL out. ls -le lists it, and every entry must deny, or allow
+#   only reading and searching.
+# - Anywhere else the check cannot tell, so the directory is refused; so it is on macOS when the
+#   list cannot be read or an entry is not understood.
+pc_acl_ok() {
+  case $pc_os:$pc_m in
+    Linux:??????????+*) return 0 ;;
+    Darwin:*) ;;
+    *) pc_fail unsafe_dir "$1, on the way to $pc_goal, has an access control list ($pc_m), which cannot be checked on ${pc_os:-this system}" ;;
+  esac
+  pc_acl=$(ls -lde "$1" 2>/dev/null) || pc_fail unsafe_dir "cannot read the access control list of $1, on the way to $pc_goal"
+  pc_acl=$(printf '%s\n' "$pc_acl" | awk '
+    BEGIN {
+      n = split("list search read execute readattr readextattr readsecurity file_inherit directory_inherit limit_inherit only_inherit", w, " ")
+      for (i = 1; i <= n; i++) ok[w[i]] = 1
+    }
+    NR == 1 { next }
+    NF < 3 || ($(NF - 1) != "allow" && $(NF - 1) != "deny") { bad = 1; line = $0; exit }
+    $(NF - 1) == "deny" { next }
+    { k = split($NF, p, ","); for (i = 1; i <= k; i++) if (!(p[i] in ok)) { bad = 1; line = $0; exit } }
+    END { if (bad) print "refused: " line; else if (NR > 0) print "ok" }')
+  case $pc_acl in
+    ok) ;;
+    *) pc_fail unsafe_dir "$1, on the way to $pc_goal, has an access control list that lets others change it: ${pc_acl#refused: }" ;;
   esac
 }
 
@@ -210,6 +245,8 @@ pc_job=${SLURM_JOB_ID:-}
 case $pc_job in ''|*[!0123456789]*) pc_fail usage "not run by SLURM (no SLURM_JOB_ID)" ;; esac
 pc_me=$(id -u 2>/dev/null)
 case $pc_me in ''|*[!0123456789]*) pc_fail io "id -u failed" ;; esac
+# The kernel, for what ls can tell of access control lists (pc_acl_ok).
+pc_os=$(uname -s 2>/dev/null)
 
 # 1. The way to the root, the root, and the version to start.
 pc_safe_way "$pc_root"

@@ -1381,6 +1381,7 @@ dependencies = [
  "pitcrew-recap",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -1499,6 +1500,7 @@ name = "pitcrew-remote"
 version = "0.0.0"
 dependencies = [
  "getrandom",
+ "pitcrew-fixtures",
  "pitcrew-protocol",
  "proptest",
  "rustix",

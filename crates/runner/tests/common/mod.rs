@@ -17,60 +17,66 @@ use std::time::{Duration, Instant};
 /// Collects events; can be closed so `accept` blocks (to test backpressure).
 #[derive(Debug, Default)]
 pub struct CollectSink {
-    events: Mutex<Vec<(Instant, Event)>>,
-    closed: Mutex<bool>,
+    /// One mutex for everything `cv` waits on: a condition variable must be used with one mutex
+    /// only, which macOS's standard library checks.
+    state: Mutex<SinkState>,
     cv: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct SinkState {
+    events: Vec<(Instant, Event)>,
+    closed: bool,
 }
 
 impl CollectSink {
     pub fn close(&self) {
-        *self.closed.lock().unwrap() = true;
+        self.state.lock().unwrap().closed = true;
     }
 
     pub fn open(&self) {
-        *self.closed.lock().unwrap() = false;
+        self.state.lock().unwrap().closed = false;
         self.cv.notify_all();
     }
 
     pub fn events(&self) -> Vec<Event> {
-        self.events
+        self.state
             .lock()
             .unwrap()
+            .events
             .iter()
             .map(|(_, e)| e.clone())
             .collect()
     }
 
     pub fn len(&self) -> usize {
-        self.events.lock().unwrap().len()
+        self.state.lock().unwrap().events.len()
     }
 
     /// Waits until at least `n` events have arrived; returns when the n-th arrived.
     pub fn wait_for(&self, n: usize, timeout: Duration) -> Option<Instant> {
         let end = Instant::now() + timeout;
-        let mut events = self.events.lock().unwrap();
-        while events.len() < n {
+        let mut state = self.state.lock().unwrap();
+        while state.events.len() < n {
             let now = Instant::now();
             if now >= end {
                 return None;
             }
-            events = self.cv.wait_timeout(events, end - now).unwrap().0;
+            state = self.cv.wait_timeout(state, end - now).unwrap().0;
         }
-        Some(events[n - 1].0)
+        Some(state.events[n - 1].0)
     }
 }
 
 impl EventSink for CollectSink {
     fn accept(&self, events: &[Event]) -> Result<(), SinkError> {
-        let mut closed = self.closed.lock().unwrap();
-        while *closed {
-            closed = self.cv.wait(closed).unwrap();
+        let mut state = self.state.lock().unwrap();
+        while state.closed {
+            state = self.cv.wait(state).unwrap();
         }
-        drop(closed);
         let now = Instant::now();
-        self.events
-            .lock()
-            .unwrap()
+        state
+            .events
             .extend(events.iter().cloned().map(|e| (now, e)));
         self.cv.notify_all();
         Ok(())

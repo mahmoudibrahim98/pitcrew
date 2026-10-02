@@ -309,7 +309,8 @@ struct Fake {
 
 impl Fake {
     fn new(scenario: &Scenario) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        // Short: the runtime directory, with ssh's and the askpass sockets, is under it.
+        let dir = pitcrew_fixtures::temp::short_tempdir().unwrap();
         let ssh = dir
             .path()
             .join(format!("ssh{}", std::env::consts::EXE_SUFFIX));
@@ -701,10 +702,13 @@ fn the_fake_sends_empty_credentials_when_askpass_fails() {
     assert!(!fake.ran());
 
     // One that exists but always fails (not ours): the fake, like ssh, sends empty passwords.
+    // `false` is in /bin on Linux, and only in /usr/bin on macOS.
     if cfg!(unix) {
-        let ssh = fake
-            .ssh()
-            .with_prompts("/bin/false", Handler::new(|_| None));
+        let fails = ["/bin/false", "/usr/bin/false"]
+            .into_iter()
+            .find(|p| Path::new(p).is_file())
+            .expect("a false program");
+        let ssh = fake.ssh().with_prompts(fails, Handler::new(|_| None));
         let err = block_on(ssh.run("cluster", &["true"])).unwrap_err();
         assert!(matches!(err, SshError::AuthFailed { .. }), "{err:?}");
         assert_eq!(fake.sent(), ["empty", "empty", "empty"]);

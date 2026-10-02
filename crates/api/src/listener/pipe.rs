@@ -111,7 +111,11 @@ mod tests {
             dacl(&pipe.next).unwrap(),
             Dacl {
                 protected: true,
-                entries: vec![Ace::Allow(sid.clone())],
+                // `GA` as granted reads back as `FILE_ALL_ACCESS` (`FA`).
+                entries: vec![Ace::Allow {
+                    sid: sid.clone(),
+                    mask: 0x001F_01FF,
+                }],
             }
         );
         // Named explicitly, so even an elevated daemon's pipe is owned by the user.

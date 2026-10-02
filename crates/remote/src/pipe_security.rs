@@ -294,6 +294,8 @@ pub(crate) fn assert_current_user_only(sddl: &str) {
     let fields: Vec<&str> = entry.split(';').collect();
     assert_eq!(fields.len(), 6, "{sddl}");
     assert_eq!(fields[0], "A", "not an allowing entry: {sddl}");
+    // `GA` as granted reads back as `FILE_ALL_ACCESS`.
+    assert_eq!(fields[2], "FA", "the entry's rights: {sddl}");
     assert_eq!(sid(fields[5]), me, "the entry's account: {sddl}");
 }
 

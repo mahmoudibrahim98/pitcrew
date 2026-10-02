@@ -765,7 +765,16 @@ mod unix {
     }
 
     /// The one-per-endpoint lock, held while ptyd runs.
-    pub(super) struct Lock(#[allow(dead_code)] File);
+    pub(super) struct Lock(File);
+
+    impl Drop for Lock {
+        /// Unlocks before the file is closed: a process another thread is starting holds a copy
+        /// of every descriptor until it runs its program, and an flock lasts while any copy is
+        /// open.
+        fn drop(&mut self) {
+            let _ = rustix::fs::flock(&self.0, FlockOperation::Unlock);
+        }
+    }
 
     impl Lock {
         pub(super) fn take(endpoint: &Path) -> Result<Self, LockError> {
@@ -847,7 +856,8 @@ mod tests {
     fn the_listener_is_ours_local_and_at_our_level() {
         use super::*;
         use pitcrew_runtime::pty::windows::{
-            Ace, Dacl, Identity, PipeSecurity, current_identity, dacl, label_integrity, owner_sid,
+            Ace, Dacl, Identity, PIPE_FULL_ACCESS, PipeSecurity, current_identity, dacl,
+            label_integrity, owner_sid,
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -865,7 +875,10 @@ mod tests {
                 dacl(&listener.next).expect("dacl"),
                 Dacl {
                     protected: true,
-                    entries: vec![Ace::Allow(me.user.clone())],
+                    entries: vec![Ace::Allow {
+                        sid: me.user.clone(),
+                        mask: PIPE_FULL_ACCESS,
+                    }],
                 }
             );
             assert_eq!(owner_sid(&listener.next).expect("owner"), me.user);

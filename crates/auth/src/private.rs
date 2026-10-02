@@ -191,6 +191,15 @@ impl ExclusiveLock {
     }
 }
 
+#[cfg(unix)]
+impl Drop for ExclusiveLock {
+    /// Unlocks before the file is closed: a process another thread is starting holds a copy of
+    /// every descriptor until it runs its program, and an flock lasts while any copy is open.
+    fn drop(&mut self) {
+        let _ = rustix::fs::flock(&self._file, rustix::fs::FlockOperation::Unlock);
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
