@@ -61,7 +61,7 @@ fn is_hidden(c: char) -> bool {
 }
 
 fn sorted(mut blocks: Vec<Block>) -> Vec<Block> {
-    blocks.sort_by(|a, b| (a.start, a.id).cmp(&(b.start, b.id)));
+    blocks.sort_by_key(|b| (b.start, b.id));
     blocks
 }
 

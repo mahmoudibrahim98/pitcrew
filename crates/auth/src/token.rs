@@ -32,12 +32,9 @@ pub const fn prefix(scope: TokenScope) -> &'static str {
 /// The scope a token claims by its prefix, if it is well formed. Says nothing about validity.
 #[must_use]
 pub fn claimed_scope(token: &str) -> Option<TokenScope> {
-    let (scope, body) = if let Some(body) = token.strip_prefix(DEVICE_PREFIX) {
-        (TokenScope::Device, body)
-    } else if let Some(body) = token.strip_prefix(AGENT_PREFIX) {
-        (TokenScope::Agent, body)
-    } else {
-        return None;
+    let (scope, body) = match token.strip_prefix(DEVICE_PREFIX) {
+        Some(body) => (TokenScope::Device, body),
+        None => (TokenScope::Agent, token.strip_prefix(AGENT_PREFIX)?),
     };
     let bytes = URL_SAFE_NO_PAD.decode(body).ok()?;
     (bytes.len() == TOKEN_BYTES).then_some(scope)

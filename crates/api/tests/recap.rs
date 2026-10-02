@@ -496,7 +496,7 @@ impl RecapSource for DemoRecapSource {
                     && before.is_none_or(|cutoff| b.block.id < cutoff)
             })
             .collect();
-        matching.sort_by(|a, b| b.block.id.cmp(&a.block.id));
+        matching.sort_by_key(|b| std::cmp::Reverse(b.block.id));
         let at_start = matching.len() <= limit;
         let blocks = matching.into_iter().take(limit).cloned().collect();
         Ok(BlocksPage { blocks, at_start })

@@ -219,21 +219,19 @@ pub fn read_token(path: &Path) -> io::Result<Option<String>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        match fs::symlink_metadata(path) {
-            // `read_regular` refuses anything but a regular file.
-            Ok(meta) if meta.is_file() => {
-                if meta.uid() != pitcrew_auth::euid() || meta.mode() & 0o077 != 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!(
-                            "{} must be ours and private (mode 600), but has mode {:o}",
-                            path.display(),
-                            meta.mode() & 0o777
-                        ),
-                    ));
-                }
-            }
-            _ => {}
+        // `read_regular` refuses anything but a regular file.
+        if let Ok(meta) = fs::symlink_metadata(path)
+            && meta.is_file()
+            && (meta.uid() != pitcrew_auth::euid() || meta.mode() & 0o077 != 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} must be ours and private (mode 600), but has mode {:o}",
+                    path.display(),
+                    meta.mode() & 0o777
+                ),
+            ));
         }
     }
     Ok(read_regular(path, MAX_TOKEN_FILE)?.map(|text| text.trim().to_owned()))
