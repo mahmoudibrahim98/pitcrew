@@ -1323,6 +1323,7 @@ dependencies = [
  "pitcrew-protocol",
  "pitcrew-remote",
  "pitcrew-runner",
+ "pitcrew-runtime",
  "pitcrew-store",
  "serde",
  "serde_json",

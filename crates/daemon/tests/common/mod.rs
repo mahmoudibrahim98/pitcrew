@@ -4,6 +4,7 @@
 #![allow(dead_code, clippy::unwrap_used)]
 
 use serde_json::Value;
+use std::ffi::OsString;
 use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -99,6 +100,27 @@ impl Daemon {
 
     /// As [`Daemon::start_on`], but returns how it failed.
     pub fn try_start_on(state: &Path, listen: &str, extra: &[&str]) -> Result<Self, Refused> {
+        Self::try_start_with(state, listen, extra, &[])
+    }
+
+    /// As [`Daemon::start`], with these environment variables too (e.g. [`TMUX_SOCKET`] for a
+    /// usable tmux socket, or `PATH`).
+    pub fn start_with(state: &Path, extra: &[&str], env: &[(&str, OsString)]) -> Self {
+        Self::try_start_with(state, "tcp:127.0.0.1:0", extra, env).unwrap_or_else(|refused| {
+            panic!(
+                "pitcrewd did not start ({}):\n{}",
+                refused.status, refused.stderr
+            )
+        })
+    }
+
+    /// As [`Daemon::start_on`], with these environment variables too; returns how it failed.
+    pub fn try_start_with(
+        state: &Path,
+        listen: &str,
+        extra: &[&str],
+        env: &[(&str, OsString)],
+    ) -> Result<Self, Refused> {
         let started = Instant::now();
         let mut command = Command::new(PITCREWD);
         command
@@ -107,7 +129,12 @@ impl Daemon {
             .args(["serve", "--listen", listen])
             .args(extra)
             .env("PITCREW_LOG", "debug");
-        let mut child = private_homes(&mut command, state)
+        private_homes(&mut command, state);
+        private_tmux(&mut command, state);
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -397,6 +424,26 @@ fn private_homes<'a>(command: &'a mut Command, state: &Path) -> &'a mut Command 
         .env_remove("XDG_DATA_HOME")
 }
 
+/// The variable that sets the daemon's tmux socket.
+pub const TMUX_SOCKET: &str = "PITCREW_TMUX_SOCKET";
+
+/// **Never the real tmux socket.** Without [`TMUX_SOCKET`], a daemon's terminals would use
+/// PitCrew's default socket, where a real PitCrew's terminals live. Every daemon a test starts
+/// therefore gets a socket whose directory is refused (its parent does not exist), so tmux is not
+/// used and the daemon serves with no terminal runtime, as on a machine without tmux. A test that
+/// wants tmux passes a private socket of its own (`tests/terminals.rs`).
+fn private_tmux<'a>(command: &'a mut Command, state: &Path) -> &'a mut Command {
+    command.env(TMUX_SOCKET, refused_tmux_socket(state))
+}
+
+/// The socket [`private_tmux`] gives a daemon on `state`: in a folder whose parent does not
+/// exist, which the runtime refuses without making anything.
+pub fn refused_tmux_socket(state: &Path) -> PathBuf {
+    let mut dir = state.as_os_str().to_owned();
+    dir.push("-no-tmux");
+    PathBuf::from(dir).join("missing").join("tmux")
+}
+
 /// Runs `pitcrewd <args>` to completion, with a home folder of its own (see [`private_homes`]).
 pub fn run(args: &[&std::ffi::OsStr]) -> std::process::Output {
     let home = tempfile::tempdir().expect("a temporary home");
@@ -625,6 +672,11 @@ impl Ws {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    /// Answers the server's keepalive Ping with an empty Pong (masked, as a client's frames are).
+    pub fn pong(&mut self) -> io::Result<()> {
+        self.stream.write_all(&[0x8a, 0x80, 0, 0, 0, 0])
     }
 
     /// The next text frame as JSON, skipping pings.

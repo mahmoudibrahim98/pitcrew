@@ -5,8 +5,9 @@
 //! the hub and the runner share this one process (ADR-0009).
 //!
 //! - `pitcrewd serve [--listen private|tcp:127.0.0.1:<port>] [--demo] [--no-office]
-//!   [--homes <dir>…] [--no-runner]`: see [`serve`], [`office`] and [`runner`]. A fresh hub is set
-//!   up once, while it serves ([`setup`]).
+//!   [--homes <dir>…] [--no-runner]`: see [`serve`], [`office`] and [`runner`]; the runner's
+//!   terminals run in tmux where it is usable ([`runtime`]; `PITCREW_TMUX_SOCKET` sets its socket
+//!   for tests and development). A fresh hub is set up once, while it serves ([`setup`]).
 //! - `pitcrewd init --workspace <name> --name <person> --handle <@handle> --machine <name>`: sets
 //!   a fresh hub up through the running daemon ([`init`]).
 //! - `pitcrewd connect --socket <path> [--framed] [--nonce <hex>]`: the stdio bridge to a daemon's
@@ -30,7 +31,9 @@ mod office;
 mod recaps;
 mod refs;
 mod runner;
+mod runtime;
 mod serve;
+mod sessions;
 mod setup;
 mod state;
 mod terminals;

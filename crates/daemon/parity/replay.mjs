@@ -62,7 +62,12 @@ function startDaemon(binary, { office }) {
     const [command, argv] = /\.m?js$/.test(binary) ? [process.execPath, [binary, ...args]] : [binary, args];
     const child = spawn(command, argv, {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, PITCREW_LOG: process.env.PITCREW_LOG ?? 'warn' },
+      env: {
+        ...process.env,
+        PITCREW_LOG: process.env.PITCREW_LOG ?? 'warn',
+        // A tmux socket of its own, so the replay never reaches a real PitCrew's terminals.
+        PITCREW_TMUX_SOCKET: join(state, 'tmux', 's'),
+      },
     });
     let stderr = '';
     child.stderr.on('data', (chunk) => (stderr += chunk));

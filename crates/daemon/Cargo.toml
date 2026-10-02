@@ -27,6 +27,8 @@ pitcrew-fixtures.workspace = true
 pitcrew-runner.workspace = true
 pitcrew-ingest.workspace = true
 pitcrew-interfaces.workspace = true
+# The runner's terminals: `TmuxRuntime` on PitCrew's private tmux server, and its detection.
+pitcrew-runtime.workspace = true
 # `pitcrewd connect`: the stdio bridge a remote helper is reached through
 # (`pitcrew_remote::bridge::main`).
 pitcrew-remote.workspace = true
