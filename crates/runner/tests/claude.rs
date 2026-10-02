@@ -410,6 +410,7 @@ fn the_first_session_in_an_empty_home_is_discovered_at_once() {
 }
 
 /// The path the runner's index stores for each transcript.
+#[cfg(unix)]
 fn index_paths(state: &Path) -> Vec<String> {
     let db = rusqlite::Connection::open(state.join("runner.sqlite3")).unwrap();
     let mut stmt = db
