@@ -124,10 +124,11 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # Every test binary runs, so one failure doesn't hide the rest.
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --no-fail-fast
       - name: The API crate builds without the store
-        if: matrix.os == 'ubuntu-latest'
+        if: ${{ !cancelled() && matrix.os == 'ubuntu-latest' }}
         run: cargo clippy -p pitcrew-api --no-default-features --all-targets --locked -- -D warnings
 
   # The desktop shell is its own Cargo workspace (see the root Cargo.toml), checked here.
@@ -162,7 +163,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked
+        run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml --locked --no-fail-fast
 
   deny:
     name: Licences and advisories
