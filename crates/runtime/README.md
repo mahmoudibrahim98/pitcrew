@@ -9,7 +9,9 @@ and [`PtyRuntime`](#ptyruntime-and-pitcrew-ptyd) (Unix and Windows, terminals ow
 `pitcrew-ptyd`). [Choosing one](#choosing-a-runtime) prefers tmux.
 
 The building blocks come first. **tmux 3.2 is the
-minimum supported portable release.** `detect_tmux(path)` executes `path -V` directly and
+minimum supported portable release**, and every later one is supported: the runtime is tested
+on 3.2a, 3.3a, 3.4, 3.5a and 3.6a (see [tmux versions](#tmux-versions); nothing there gave a
+reason to raise the floor). `detect_tmux(path)` executes `path -V` directly and
 returns a parsed `TmuxVersion` or a fallback error. The probe is limited to two seconds and
 4 KiB per output stream; a timed-out process is killed and reaped. It blocks the calling thread
 for up to those two seconds, so call it from async code through `spawn_blocking`. Version parsing recognizes
@@ -108,8 +110,9 @@ tmux server that belongs to PitCrew alone.
 - **Attaching by hand:** `tmux -S <socket> attach -t pitcrew` (with the default socket in
   `/tmp`, `tmux -S /tmp/pitcrew-$(id -u)/tmux attach -t pitcrew`), then pick a window, or attach
   to one terminal with its `native_target`: `attach -t pitcrew:@12`. Window sizes are PitCrew's
-  (`window-size manual`), so an attached terminal shows them as they are. tmux's default key
-  bindings apply (prefix `C-b`, detach with `C-b d`).
+  (each window's own `window-size` is `manual`), so an attached terminal shows them as they are.
+  tmux's default key bindings apply (prefix `C-b`, detach with `C-b d`), and a window made there
+  (`C-b c`) is the person's: the runtime leaves it alone.
 - **The server is shared with the programs in it.** tmux gives every pane `$TMUX`, the server's
   socket. The runtime unsets it for the programs it starts (people attach from their own
   terminals, which this does not affect), but a program that finds the socket can still run any
@@ -153,6 +156,17 @@ tmux server that belongs to PitCrew alone.
   kill. If the connection is lost before tmux answers at all, the next connection, before any
   start uses it, kills untagged panes that the wrapper started (it begins with a marker,
   `: pitcrew-wrapper;`, which `#{pane_start_command}` shows); only one runtime may use a socket.
+- **Sizes.** The global `window-size` depends on the server's version, read when the runtime
+  attaches: `manual` on 3.2, where it makes a new window take `default-size` whoever is
+  attached; `latest` on 3.3 and later, where a global `manual` crashes the server (see
+  [tmux versions](#tmux-versions)). `start` sets it again, with the session's `default-size`
+  (the size asked for), in the same send as `new-window`, so a `manual` set by hand since cannot
+  crash the server. On 3.3 and later a new window takes the size of a client attached with one
+  of its own, if any: `start` reads the size tmux made it (`new-window -P`), and then always
+  resizes it to the size asked for with `resize-window`, which also makes the window's own
+  `window-size` `manual` on every version, so no client resizes it. Output printed before that
+  is emulated at the size it was printed for. A failed resize is logged. `resize` uses
+  `resize-window` too.
 - **Input.** `write` sends `send-keys -H` in 1 KiB commands; `send_keys` sends tmux key names.
   Both first leave copy mode (query `#{pane_in_mode}`, `send-keys -X cancel`, query again), under
   one lock, and refuse input to a pane stuck in a mode. Input (or a resize) that timed out may
@@ -204,7 +218,8 @@ tmux server that belongs to PitCrew alone.
   daemonizing program) survives. Killing an ended terminal is a no-op.
 - **Bounds.** Every call is bounded by `TmuxOptions::call_timeout` (5 s; `start`:
   `start_timeout`, 15 s) and answers `Unavailable` past it. Sizes are 1 to 1000, as in the API.
-- **Detection.** `tmux::detect(&options)` finds tmux, checks its version (3.2 or newer), the
+- **Detection.** `tmux::detect(&options)` finds tmux, checks its version (3.2 or newer; see
+  [tmux versions](#tmux-versions) for the ones tested), the
   socket's directory and the socket, and that `tmux -S <socket> start-server` works; it gives
   `TmuxSupport` (with tmux's absolute path, and `capability()` `Capability::Tmux`) or
   `RuntimeError::Unavailable` with the reason. A running server must also say it is 3.2 or
@@ -215,6 +230,33 @@ tmux 3.2a behaviour this relies on, found while building it: a pane that closes 
 `%unlinked-window-close`, even from the client's own session; a pane's process leads its own
 process group and session; and `respawn-pane -k` on a pane under `remain-on-exit` sometimes
 crashes the 3.2a server, so the runtime never uses it.
+
+### tmux versions
+
+The real-tmux tests (`tests/tmux.rs`, `tests/tmux_runtime.rs`, and the daemon's tmux tests) pass
+on tmux 3.2a, 3.3a, 3.4 (Ubuntu 24.04's, and GitHub's `ubuntu-latest`), 3.5a and 3.6a; the
+others were built from the release tarballs. What differs after 3.2a:
+
+- **A global `window-size manual` crashes the server at its next new window**, on 3.3a, 3.4,
+  3.5a and 3.6a (`new-window`, `new-session`, or `C-b c` from a person). Since 3.3,
+  `clients_calculate_size` (`resize.c`) reads the manual size of the window it is given, and
+  `spawn_window` gives it none for a window not made yet: a NULL dereference (a segfault at
+  address `0x208` on 3.4). 3.2a returned before that read. The control client then reads
+  `%exit server exited unexpectedly`, which is how "the tmux control connection closed" showed
+  up in the tests. So the global is `manual` only on 3.2 (and `next-3.2`), and `latest` on
+  everything else, OpenBSD's numbering included (it does not say which tmux it is); each
+  window is made `manual` itself, which is safe on every version (see **Sizes** above).
+- **With a global `latest`, a new window takes the size of a client attached with one of its
+  own** (a person's terminal, or a control client after `refresh-client -C`), and `default-size`
+  only when there is none. On 3.2a, `latest` would instead give it the creating control
+  client's 80x24. Hence the global by version, and the resize in `start`.
+- **Unchanged, checked against the 3.2a, 3.4 and 3.5a sources and by the tests on each
+  version:** how `-C` clients attach and how `new-session` from the command line answers;
+  `%begin` flags (`1` for commands from the client's stdin, `0` for the command line and
+  hooks); the `%exit` reasons (the same strings); `%unlinked-window-close` for a window of the
+  client's own session; and the parsing of `send-keys -l`/`-H` (3.4's "expand arguments to
+  send-keys" applies to `-N` only). The runtime never uses `refresh-client`. 3.3's access list
+  (`server-access`) always admits the server's own user.
 
 Measured on tmux 3.2a in WSL before review round 1 (`cargo test --release -p pitcrew-runtime
 --test tmux_runtime -- --ignored --nocapture`): 50 MiB of `yes` output reached the replay buffer

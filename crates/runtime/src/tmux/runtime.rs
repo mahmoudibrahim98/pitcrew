@@ -20,7 +20,7 @@ use super::state::{self, Claim, LIST_FORMAT, Listed, MAX_SIZE, RESERVE, Term, Te
 use super::{OFFSET_OPTION, SESSION, TERMINAL_OPTION, TmuxOptions};
 use crate::command::{Argument, Command, FormatError};
 use crate::control::{CommandReply, Notification, PaneId, WindowId};
-use crate::detect::TmuxVersion;
+use crate::detect::{TmuxVersion, VersionKind};
 use crate::gate::Gate;
 
 /// The shell script every terminal runs, with the program (an absolute path, so never a shell
@@ -128,10 +128,11 @@ struct ServerKey {
     started: u64,
 }
 
-/// A tmux server, and the id of PitCrew's session in it.
+/// A tmux server, its version, and the id of PitCrew's session in it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Server {
     key: ServerKey,
+    version: TmuxVersion,
     session: String,
 }
 
@@ -143,6 +144,8 @@ struct Link {
     holder: Mutex<Option<WindowId>>,
     /// Which server this is, from reconcile.
     server: Mutex<Option<ServerKey>>,
+    /// The global `window-size` for this server's version, from reconcile.
+    window_size: Mutex<&'static str>,
 }
 
 /// Why there is no connection.
@@ -392,6 +395,8 @@ impl Inner {
             generation,
             holder: Mutex::new(holder),
             server: Mutex::new(None),
+            // Safe on every version until reconcile reads which this one is.
+            window_size: Mutex::new("latest"),
         });
         self.reconcile(&link, deadline)?;
         if self.shutdown.load(Ordering::Acquire) {
@@ -442,32 +447,20 @@ impl Inner {
 
     /// Checks the server and brings the terminals up to date with its panes.
     fn reconcile(&self, link: &Link, deadline: Instant) -> Result<(), Down> {
-        let commands = [
-            Command::new("display-message")
-                .and_then(|c| c.arg(Argument::Flag("-p")))
-                .and_then(|c| {
-                    c.arg(Argument::Format(
-                        "#{version} #{pid} #{start_time} #{session_id}",
-                    ))
-                }),
-            // New windows take the size `start` sets as default-size, not a client's.
-            Command::new("set-option")
-                .and_then(|c| c.arg(Argument::Flag("-g")))
-                .and_then(|c| c.arg(Argument::Text("window-size")))
-                .and_then(|c| c.arg(Argument::Text("manual"))),
-            Command::new("list-panes")
-                .and_then(|c| c.arg(Argument::Flag("-s")))
-                .and_then(|c| c.arg(Argument::Flag("-F")))
-                .and_then(|c| c.arg(Argument::Format(LIST_FORMAT))),
-        ]
-        .into_iter()
-        .collect::<Result<Vec<_>, FormatError>>()
-        .map_err(|e| Down::Unavailable(e.to_string()))?;
-        let replies = link
+        let unavailable = |e: FormatError| Down::Unavailable(e.to_string());
+        let about = Command::new("display-message")
+            .and_then(|c| c.arg(Argument::Flag("-p")))
+            .and_then(|c| {
+                c.arg(Argument::Format(
+                    "#{version} #{pid} #{start_time} #{session_id}",
+                ))
+            })
+            .map_err(unavailable)?;
+        let reply = link
             .conn
-            .call(&commands, deadline)
+            .call(&[about], deadline)
             .map_err(|e| Down::Unavailable(call_error(e)))?;
-        let about = replies[0]
+        let about = reply[0]
             .lines
             .first()
             .map(|v| String::from_utf8_lossy(v).into_owned())
@@ -479,7 +472,24 @@ impl Inner {
                 return Err(Down::Unavailable(why));
             }
         };
-        for reply in &replies[1..] {
+        // The global `window-size` depends on the server's version, so it follows the check.
+        let global = global_window_size(&server.version);
+        *lock(&link.window_size) = global;
+        let commands = [
+            set_global_window_size(global),
+            Command::new("list-panes")
+                .and_then(|c| c.arg(Argument::Flag("-s")))
+                .and_then(|c| c.arg(Argument::Flag("-F")))
+                .and_then(|c| c.arg(Argument::Format(LIST_FORMAT))),
+        ]
+        .into_iter()
+        .collect::<Result<Vec<_>, FormatError>>()
+        .map_err(unavailable)?;
+        let replies = link
+            .conn
+            .call(&commands, deadline)
+            .map_err(|e| Down::Unavailable(call_error(e)))?;
+        for reply in &replies {
             if reply.failed {
                 return Err(Down::Unavailable(format!("tmux: {}", reply_text(reply))));
             }
@@ -494,7 +504,7 @@ impl Inner {
             *lock(&link.server) = Some(server.key);
             *known = Some(server);
         }
-        let listed: Vec<Listed> = replies[2]
+        let listed: Vec<Listed> = replies[1]
             .lines
             .iter()
             .filter_map(|line| state::parse_listed(line))
@@ -781,15 +791,15 @@ fn server_facts(about: &str) -> Result<Server, String> {
     let version = fields
         .next()
         .and_then(|v| format!("tmux {v}").parse::<TmuxVersion>().ok());
-    match version {
-        Some(v) if v.is_supported() => {}
+    let version = match version {
+        Some(v) if v.is_supported() => v,
         other => {
             let shown = other.map_or_else(|| "an unknown version".to_owned(), |v| v.to_string());
             return Err(format!(
                 "the running tmux server is {shown}; PitCrew needs 3.2 or newer"
             ));
         }
-    }
+    };
     let pid = fields.next().and_then(|p| p.parse().ok());
     let started = fields.next().and_then(|s| s.parse().ok());
     let session = fields.next().filter(|s| {
@@ -799,9 +809,32 @@ fn server_facts(about: &str) -> Result<Server, String> {
     match (pid, started, session) {
         (Some(pid), Some(started), Some(session)) => Ok(Server {
             key: ServerKey { pid, started },
+            version,
             session: session.to_owned(),
         }),
         _ => Err(format!("tmux did not say which server it is: {about:?}")),
+    }
+}
+
+/// The server's global `window-size`, set when the runtime attaches and again in every
+/// `start`. Every window `start` makes is sized `default-size` (set just before) and then
+/// resized to the size asked for, which makes it `manual` itself, so attached clients never
+/// resize it; what the global option adds depends on the version.
+///
+/// - **tmux 3.2:** `manual`, so a new window takes `default-size` whoever is attached.
+/// - **tmux 3.3 and later:** `latest`. There a global `manual` crashes the server at its next
+///   new window: `clients_calculate_size` reads the manual size of the window being made,
+///   which does not exist yet (a NULL dereference, seen on 3.3a to 3.6a). With `latest`
+///   a new window takes `default-size` unless someone is attached with a size of their own;
+///   then it takes theirs, and `start` resizes it at once.
+/// - **OpenBSD's own numbering** (which does not say which tmux it is): `latest`, which works
+///   on every version.
+fn global_window_size(version: &TmuxVersion) -> &'static str {
+    match version.kind {
+        VersionKind::Release | VersionKind::Next if (version.major, version.minor) < (3, 3) => {
+            "manual"
+        }
+        _ => "latest",
     }
 }
 
@@ -880,6 +913,9 @@ impl Runtime for TmuxRuntime {
             .ok_or_else(|| RuntimeError::Unavailable("tmux is busy starting a terminal".into()))?;
         let link = inner.connection(deadline, true).map_err(Down::error)?;
         let server = *lock(&link.server);
+        // The global again, in the same send as `new-window`: a `manual` set since (by hand, or
+        // by a program that found the socket) would crash tmux 3.3 and later at that window.
+        let global = set_global_window_size(*lock(&link.window_size)).map_err(invalid)?;
         let default_size = Command::new("set-option")
             .and_then(|c| c.arg(Argument::Text("default-size")))
             .and_then(|c| c.arg(Argument::Text(&format!("{cols}x{rows}"))))
@@ -888,25 +924,34 @@ impl Runtime for TmuxRuntime {
         let weak = inner.me.clone();
         // If this call gives up before tmux answers, the window it gets is removed then.
         let created = Pending::new(move |reply, outbox| {
-            if let (Some(inner), Some((window, _, _))) = (weak.upgrade(), parse_ids(reply))
+            if let (Some(inner), Some(created)) = (weak.upgrade(), parse_created(reply))
                 && !reply.failed
             {
-                inner.discard_window(outbox, server, window);
+                inner.discard_window(outbox, server, created.window);
             }
         });
         let sent = link.conn.outbox().send_with(
-            &[default_size, new_window],
-            vec![Waiter::Discard, Waiter::Pending(Arc::clone(&created))],
+            &[global, default_size, new_window],
+            vec![
+                Waiter::Discard,
+                Waiter::Discard,
+                Waiter::Pending(Arc::clone(&created)),
+            ],
         );
         let created = sent
             .and_then(|()| created.wait(deadline))
             .map_err(|e| RuntimeError::Unavailable(call_error(e)))
-            .and_then(|reply| match parse_ids(&reply) {
-                Some(ids) if !reply.failed => Ok(ids),
+            .and_then(|reply| match parse_created(&reply) {
+                Some(created) if !reply.failed => Ok(created),
                 _ => Err(spawn(format!("tmux: {}", reply_text(&reply)))),
             });
-        let (window, pane, pid) = match created {
-            Ok(ids) => ids,
+        let Created {
+            window,
+            pane,
+            pid,
+            size,
+        } = match created {
+            Ok(created) => created,
             Err(e) => {
                 // Do not leave a session behind for a terminal that never started.
                 if let Some(holder) = holder
@@ -918,28 +963,46 @@ impl Runtime for TmuxRuntime {
             }
         };
         let id = TerminalId::new();
+        // The window was made at `default-size` or, on tmux 3.3 and later, at the size of a
+        // client attached with a size of its own. It is resized below either way; its first
+        // output was drawn at the size it was made with.
+        let (made_cols, made_rows) = size.unwrap_or((cols, rows));
         lock(&inner.terminals).claim(Claim {
             id,
             name,
             window,
             pane,
             pid,
-            cols,
-            rows,
+            cols: made_cols,
+            rows: made_rows,
             offset: 0,
             alive: true,
         });
         let mut commands = vec![
             set_pane_option(pane, TERMINAL_OPTION, &id.to_string()).map_err(invalid)?,
             offset_command(pane, RESERVE).map_err(invalid)?,
+            // Always, even at the size it has: this also makes the window's own `window-size`
+            // manual, so no client resizes it, one that attached since it was made included.
+            resize_window(window, cols, rows).map_err(invalid)?,
         ];
         if let Some(holder) = holder {
             commands.push(kill_window(holder).map_err(invalid)?);
         }
         match inner.call(&link, &commands, deadline) {
             Ok(replies) if !replies[0].failed => {
+                if replies[2].failed {
+                    tracing::warn!(
+                        %window,
+                        why = %reply_text(&replies[2]),
+                        "could not size a new tmux window; clients may resize it"
+                    );
+                }
+                let mut terminals = lock(&inner.terminals);
                 if !replies[1].failed {
-                    lock(&inner.terminals).reserved(id, RESERVE);
+                    terminals.reserved(id, RESERVE);
+                }
+                if !replies[2].failed {
+                    terminals.set_size(id, cols, rows);
                 }
             }
             // The window is gone already: the program ended at once. Its output is readable.
@@ -976,14 +1039,7 @@ impl Runtime for TmuxRuntime {
         })?;
         let deadline = Instant::now() + self.inner.options.call_timeout;
         let (link, window, _) = self.inner.live(id, deadline)?;
-        let command = Command::new("resize-window")
-            .and_then(|c| c.arg(Argument::Flag("-t")))
-            .and_then(|c| c.arg(Argument::Window(window)))
-            .and_then(|c| c.arg(Argument::Flag("-x")))
-            .and_then(|c| c.arg(Argument::Number(cols.into())))
-            .and_then(|c| c.arg(Argument::Flag("-y")))
-            .and_then(|c| c.arg(Argument::Number(rows.into())))
-            .map_err(invalid)?;
+        let command = resize_window(window, cols, rows).map_err(invalid)?;
         let reply = self.inner.call(&link, &[command], deadline)?;
         if reply[0].failed {
             return Err(failed(&reply[0]));
@@ -1162,7 +1218,9 @@ fn new_window(spec: &StartSpec, name: &str, options: &TmuxOptions) -> Result<Com
             .arg(Argument::Flag("-d"))?
             .arg(Argument::Flag("-P"))?
             .arg(Argument::Flag("-F"))?
-            .arg(Argument::Format("#{window_id} #{pane_id} #{pane_pid}"))?;
+            .arg(Argument::Format(
+                "#{window_id} #{pane_id} #{pane_pid} #{pane_width} #{pane_height}",
+            ))?;
         if !name.is_empty() {
             command = command
                 .arg(Argument::Flag("-n"))?
@@ -1190,14 +1248,50 @@ fn new_window(spec: &StartSpec, name: &str, options: &TmuxOptions) -> Result<Com
     build().map_err(|e| e.to_string())
 }
 
-/// `@1 %1 4242` (the pid is optional) from `new-window -P`.
-fn parse_ids(reply: &CommandReply) -> Option<(WindowId, PaneId, Option<u32>)> {
+/// What `new-window -P` says about the window it made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Created {
+    window: WindowId,
+    pane: PaneId,
+    pid: Option<u32>,
+    /// The pane's size: (cols, rows).
+    size: Option<(u16, u16)>,
+}
+
+/// `@1 %1 4242 80 24` from `new-window -P` (the pid and the size are optional).
+fn parse_created(reply: &CommandReply) -> Option<Created> {
     let line = std::str::from_utf8(reply.lines.first()?).ok()?;
     let mut fields = line.split(' ');
     let window = WindowId::parse(fields.next()?.as_bytes())?;
     let pane = PaneId::parse(fields.next()?.as_bytes())?;
     let pid = fields.next().and_then(|p| p.parse().ok());
-    Some((window, pane, pid))
+    let mut number = || fields.next().and_then(|n| n.parse().ok());
+    let size = number().zip(number());
+    Some(Created {
+        window,
+        pane,
+        pid,
+        size,
+    })
+}
+
+/// `set-option -g window-size <value>`, the value [`global_window_size`] gives.
+fn set_global_window_size(value: &str) -> Result<Command, FormatError> {
+    Command::new("set-option")?
+        .arg(Argument::Flag("-g"))?
+        .arg(Argument::Text("window-size"))?
+        .arg(Argument::Text(value))
+}
+
+/// `resize-window` also makes the window's own `window-size` manual, on every version.
+fn resize_window(window: WindowId, cols: u16, rows: u16) -> Result<Command, FormatError> {
+    Command::new("resize-window")?
+        .arg(Argument::Flag("-t"))?
+        .arg(Argument::Window(window))?
+        .arg(Argument::Flag("-x"))?
+        .arg(Argument::Number(cols.into()))?
+        .arg(Argument::Flag("-y"))?
+        .arg(Argument::Number(rows.into()))
 }
 
 fn set_pane_option(pane: PaneId, option: &str, value: &str) -> Result<Command, FormatError> {
@@ -1261,9 +1355,14 @@ mod tests {
                     pid: 4242,
                     started: 1_790_906_720
                 },
+                version: version("3.2a"),
                 session: "$0".into()
             })
         );
+        for newer in ["3.3a", "3.4", "3.5a", "next-3.6", "openbsd-7.4"] {
+            let facts = server_facts(&format!("{newer} 1 1 $3")).expect(newer);
+            assert_eq!(facts.version, version(newer));
+        }
         for old in ["3.1c 1 1 $0", "2.7 1 1 $0", "openbsd-6.8 1 1 $0"] {
             assert!(
                 server_facts(old).expect_err(old).contains("3.2 or newer"),
@@ -1282,6 +1381,59 @@ mod tests {
             "3.2a 1 1 $x",
         ] {
             assert!(server_facts(bad).is_err(), "{bad}");
+        }
+    }
+
+    fn version(text: &str) -> TmuxVersion {
+        format!("tmux {text}").parse().expect(text)
+    }
+
+    #[test]
+    fn the_global_window_size_is_manual_only_where_new_windows_survive_it() {
+        for old in ["3.2", "3.2a", "next-3.2"] {
+            assert_eq!(global_window_size(&version(old)), "manual", "{old}");
+        }
+        // A global `manual` crashes 3.3 and later at the next new window; OpenBSD's numbering
+        // does not say which tmux it is.
+        for newer in [
+            "next-3.3",
+            "3.3",
+            "3.3a",
+            "3.4",
+            "3.5",
+            "3.5a",
+            "3.6",
+            "4.0",
+            "openbsd-6.9",
+            "openbsd-7.4",
+        ] {
+            assert_eq!(global_window_size(&version(newer)), "latest", "{newer}");
+        }
+    }
+
+    #[test]
+    fn new_window_replies_give_ids_and_the_size_made() {
+        let reply = |line: &str| CommandReply {
+            time: 1,
+            number: 1,
+            flags: 1,
+            failed: false,
+            lines: vec![line.as_bytes().to_vec()],
+        };
+        assert_eq!(
+            parse_created(&reply("@3 %4 4242 80 24")),
+            Some(Created {
+                window: WindowId(3),
+                pane: PaneId(4),
+                pid: Some(4242),
+                size: Some((80, 24)),
+            })
+        );
+        let partial = parse_created(&reply("@3 %4  50")).expect("ids");
+        assert_eq!((partial.pid, partial.size), (None, None));
+        assert_eq!(parse_created(&reply("@3 %4")).map(|c| c.size), Some(None));
+        for bad in ["", "%4 @3 1 80 24", "@3"] {
+            assert_eq!(parse_created(&reply(bad)), None, "{bad}");
         }
     }
 

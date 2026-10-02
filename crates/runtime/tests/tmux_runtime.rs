@@ -15,6 +15,7 @@
 use std::collections::hash_map::RandomState;
 use std::future::Future;
 use std::hash::BuildHasher;
+use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -25,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime};
 use pitcrew_interfaces::runtime::{Runtime, RuntimeError, StartSpec};
 use pitcrew_protocol::ids::TerminalId;
 use pitcrew_protocol::runner::{Capability, Key};
-use pitcrew_runtime::detect::{DetectError, detect_tmux};
+use pitcrew_runtime::detect::{DetectError, VersionKind, detect_tmux};
 use pitcrew_runtime::tmux::{self, OFFSET_OPTION, TERMINAL_OPTION, TmuxOptions, TmuxRuntime};
 
 /// Generous: other agents build on this machine at the same time.
@@ -438,6 +439,122 @@ fn write_read_by_offset_resize_ctrl_c_and_kill() {
         rt.read_output(unknown, 0, 1),
         Err(RuntimeError::NotFound(_))
     ));
+    drop(rt);
+    fx.finish();
+}
+
+/// tmux 3.3 and later crash at a new window while the global `window-size` is `manual`, and
+/// size new windows by attached clients otherwise: a terminal still gets the size asked for and
+/// keeps it, a person's own new window does not bring the server down, and neither does a start
+/// after someone set the global to `manual` by hand.
+#[test]
+fn terminals_keep_their_size_whoever_attaches() {
+    let Some(fx) = Fixture::new("sizes") else {
+        return;
+    };
+    let version = detect_tmux("tmux").expect("version");
+    let rt = fx.runtime();
+    let first = rt
+        .start(&fx.spec("first", "sh", &["-c", "printf ready; cat"]))
+        .expect("start");
+    wait_for(&rt, first.id, 0, b"ready");
+    let global = fx.tmux(&["show-options", "-gv", "window-size"]);
+    let manual_is_safe = matches!(version.kind, VersionKind::Release | VersionKind::Next)
+        && (version.major, version.minor) < (3, 3);
+    assert_eq!(global, if manual_is_safe { "manual" } else { "latest" });
+
+    // Someone attaches with a size of their own (a control client stands in for a person's
+    // terminal; tmux counts both the same).
+    let mut person = Command::new("tmux")
+        .arg("-S")
+        .arg(&fx.options.socket)
+        .args(["-C", "attach-session", "-t", "pitcrew"])
+        .env_remove("TMUX")
+        .env(MARK, &fx.mark)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("attach");
+    let mut person_says = |command: &str| {
+        let stdin = person.stdin.as_mut().expect("stdin");
+        writeln!(stdin, "{command}").expect("write to the person's client");
+    };
+    // (tmux shows no height for a control client.)
+    let has_width = |cols: &str| {
+        fx.tmux(&["list-clients", "-F", "#{client_width}"])
+            .lines()
+            .any(|width| width == cols)
+    };
+    person_says("refresh-client -C 50x10");
+    eventually("the person's size counts", || has_width("50"));
+
+    let sized = rt
+        .start(&fx.spec(
+            "sized",
+            "sh",
+            &["-c", "printf ready; read x; stty size; cat"],
+        ))
+        .expect("start");
+    let target = sized.native_target.clone().expect("target");
+    let size_of = |target: &str| {
+        fx.tmux(&[
+            "list-panes",
+            "-t",
+            target,
+            "-F",
+            "#{pane_width}x#{pane_height}",
+        ])
+    };
+    assert_eq!(size_of(&target), "80x24");
+    assert_eq!(
+        fx.tmux(&["show-options", "-wv", "-t", &target, "window-size"]),
+        "manual"
+    );
+    let (_, at) = wait_for(&rt, sized.id, 0, b"ready");
+    rt.write(sized.id, b"\r").expect("write");
+    wait_for(&rt, sized.id, at, b"24 80");
+    let screen = rt.screen(sized.id).expect("screen");
+    assert_eq!((screen.cols, screen.rows.len()), (80, 24));
+
+    // The person's size changes no terminal.
+    person_says("refresh-client -C 40x8");
+    eventually("the person's new size counts", || has_width("40"));
+    assert_eq!(size_of(&target), "80x24");
+    assert_eq!(
+        size_of(first.native_target.as_deref().expect("target")),
+        "80x24"
+    );
+
+    // A window the person makes (`C-b c`) leaves the server and the terminals running.
+    fx.tmux(&["new-window", "-d", "-t", "pitcrew", "sleep 600"]);
+    assert!(
+        fx.server_running(),
+        "a person's new window ended the server"
+    );
+    assert!(rt.info(sized.id).expect("info").alive);
+    rt.write(sized.id, b"still\r").expect("write");
+    wait_for(&rt, sized.id, at, b"still\r\nstill\r\n");
+
+    // Someone sets the global to `manual` by hand: the next start sets it back before its window.
+    fx.tmux(&["set-option", "-g", "window-size", "manual"]);
+    let third = rt
+        .start(&fx.spec("third", "sh", &["-c", "printf ready; cat"]))
+        .expect("start after a manual global");
+    wait_for(&rt, third.id, 0, b"ready");
+    assert!(fx.server_running(), "a start ended the server");
+    assert_eq!(fx.tmux(&["show-options", "-gv", "window-size"]), global);
+    assert_eq!(
+        size_of(third.native_target.as_deref().expect("target")),
+        "80x24"
+    );
+    assert!(rt.info(sized.id).expect("info").alive);
+
+    drop(person.stdin.take());
+    person.wait().expect("the person's client ends");
+    rt.kill(first.id).expect("kill");
+    rt.kill(sized.id).expect("kill");
+    rt.kill(third.id).expect("kill");
     drop(rt);
     fx.finish();
 }
