@@ -15,7 +15,7 @@
         "Cargo.toml", "rust-toolchain.toml", "clippy.toml", "deny.toml", "rustfmt.toml",
         "package.json", "pnpm-workspace.yaml", ".npmrc",
         ".gitignore", ".gitattributes", ".editorconfig",
-        "LICENSE", "NOTICE", "README.md", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md", "SECURITY.md",
+        "LICENSE", "NOTICE", "README.md", "CLAUDE.md", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md", "SECURITY.md",
         ".github/workflows/ci.yml",
         ".github/workflows/fuzz.yml", ".github/pull_request_template.md", ".github/CODEOWNERS",
         ".github/dependabot.yml", ".github/ISSUE_TEMPLATE/**", ".github/scrub/**", ".github/actions/**",

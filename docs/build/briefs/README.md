@@ -106,6 +106,9 @@ worktrees or branches, and do not switch branches.** Before any other work:
 If the branch is wrong, or you are on `main`, **stop and tell the user**. Edit only files inside
 this worktree.
 
+**In a cloud session** (`CLAUDE_CODE_REMOTE=true`) there is no worktree: create your brief's branch
+from `main` if you are not on it, and follow the root `CLAUDE.md`.
+
 ## 2. Environment
 
 - **Windows:** use PowerShell. Run git from PowerShell, not inside WSL, because the worktree
@@ -120,6 +123,7 @@ this worktree.
   Keep `CARGO_BUILD_JOBS=4`: several agents build at once, and unbounded parallel builds have
   run the machine out of memory.
 - **Linux and macOS:** run `cargo` directly.
+- **Cloud sessions:** run `cargo` directly, and mind the VM's disk (see the root `CLAUDE.md`).
 - **Node 24** runs natively. `npm test` runs the mock-hub and CI-script tests.
   `npm run mock-hub` serves the fake daemon on `http://127.0.0.1:47317`. Its tokens are
   `dev-device-token` (a person) and `dev-agent-token` (an agent).
@@ -166,7 +170,8 @@ Plus every acceptance check in your brief.
 
 1. Commit to your branch in small, clear commits. End each message with the co-author line your
    tool adds, if any.
-2. **Do not push, merge, rebase `main`, or touch any other branch.**
+2. **Do not push, merge, rebase `main`, or touch any other branch.** In a cloud session, push only
+   your own branch and open a pull request instead (see the root `CLAUDE.md`); never push to `main`.
 3. End with a report in the shape of `.github/pull_request_template.md`:
    - what changed, with the files;
    - how you checked it, pasting **real output**;
