@@ -12,6 +12,7 @@
 //! invoke('gateway_remote_probe', { host })                       // → RemoteProbe
 //! invoke('gateway_remote_plan', { req: { host, launcher, site, job } })  // → RemotePlan
 //! invoke('gateway_remote_add', { plan, events: new Channel() })  // → GatewayWorkspace
+//! invoke('gateway_workspace_retry', { workspace })
 //! invoke('gateway_workspace_remove', { workspace, stopHelper })
 //! invoke('gateway_prompt_reply', { id, answer })                 // or { id, accept }, or { id }
 //! ```
@@ -58,10 +59,21 @@ pub fn gateway_workspaces<R: Runtime>(
     list
 }
 
-/// `gateway_ssh_hosts() → { hosts: string[] }`.
+/// `gateway_ssh_hosts() → { hosts: string[] }`. Async, so the config is never read on the main
+/// thread.
 #[tauri::command]
-pub fn gateway_ssh_hosts<R: Runtime>(webview: Webview<R>) -> Result<SshHosts, GatewayError> {
-    Ok(remotes(&webview)?.ssh_hosts())
+pub async fn gateway_ssh_hosts<R: Runtime>(webview: Webview<R>) -> Result<SshHosts, GatewayError> {
+    Ok(remotes(&webview)?.ssh_hosts().await)
+}
+
+/// `gateway_workspace_retry({ workspace })`: tries a remote workspace's connection again now.
+#[tauri::command]
+pub async fn gateway_workspace_retry<R: Runtime>(
+    webview: Webview<R>,
+    workspace: Option<Value>,
+) -> Result<(), GatewayError> {
+    let workspace = string(workspace, "workspace")?;
+    remotes(&webview)?.retry(&workspace)
 }
 
 /// `gateway_remote_probe({ host }) → RemoteProbe`.

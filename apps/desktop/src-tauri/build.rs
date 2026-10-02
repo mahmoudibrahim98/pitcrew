@@ -13,6 +13,7 @@ fn main() {
         "gateway_remote_probe",
         "gateway_remote_plan",
         "gateway_remote_add",
+        "gateway_workspace_retry",
         "gateway_workspace_remove",
         "gateway_prompt_reply",
     ]);

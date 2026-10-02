@@ -2,10 +2,12 @@
 //! (`pitcrew-remote`), the gateway's [`Connector`] over it with the token from the keychain, and
 //! the task that keeps the workspace's state in step with the tunnel's.
 //!
-//! **States** follow the tunnel ([`state_of`]): `ready` while connected; `connecting` while it
-//! connects, or while the way does not answer and it is checking (with the reason in `detail`);
-//! `unreachable` with the reason once it gave up for now (it goes on trying as the tunnel says).
-//! The transport the tunnel found worth remembering is saved with the workspace.
+//! **States** follow the tunnel ([`state_of`]): `ready` while connected (`needs_pairing` instead
+//! when its token is no longer in the keychain); `connecting` while it connects, or while the way
+//! does not answer and it is checking (with the reason in `detail`); `unreachable` with the
+//! reason once it gave up for now (it goes on trying as the tunnel says, or at
+//! `gateway_workspace_retry`). The transport the tunnel found worth remembering is saved with the
+//! workspace.
 
 use crate::gateway::{BoxFuture, Connected, Connector, GatewayError};
 use crate::keychain::TokenStore;
@@ -129,6 +131,25 @@ pub fn state_of(link: &LinkState) -> (WorkspaceState, Option<String>) {
     }
 }
 
+/// The state of a connected remote workspace, by whether its token is in the keychain.
+fn token_state(workspace: &str, tokens: &dyn TokenStore) -> (WorkspaceState, Option<String>) {
+    match tokens.get(workspace) {
+        Ok(Some(_)) => (WorkspaceState::Ready, None),
+        Ok(None) => (
+            WorkspaceState::NeedsPairing,
+            Some(
+                "this computer has no token for this workspace any more; remove it and add the \
+                 machine again"
+                    .to_owned(),
+            ),
+        ),
+        Err(e) => (
+            WorkspaceState::Unreachable,
+            Some(format!("cannot read this workspace's token: {e}")),
+        ),
+    }
+}
+
 /// A remote workspace's tunnel, and the task following it.
 pub(crate) struct Link {
     tunnel: Tunnel,
@@ -144,14 +165,16 @@ impl fmt::Debug for Link {
 }
 
 impl Link {
-    /// Follows `tunnel` for workspace `workspace` in `registry`, on `runtime`.
+    /// Follows `tunnel` for workspace `workspace` in `registry`, its token in `tokens`, on
+    /// `runtime`.
     pub(crate) fn start(
         workspace: String,
         tunnel: Tunnel,
         registry: Arc<Registry>,
+        tokens: Arc<dyn TokenStore>,
         runtime: &tokio::runtime::Handle,
     ) -> Self {
-        let follower = runtime.spawn(follow(workspace, tunnel.clone(), registry));
+        let follower = runtime.spawn(follow(workspace, tunnel.clone(), registry, tokens));
         Self {
             tunnel,
             follower: Mutex::new(Some(follower)),
@@ -161,6 +184,11 @@ impl Link {
     /// The computer woke, or the network changed: the tunnel checks its way at once.
     pub(crate) fn wake(&self) {
         self.tunnel.wake();
+    }
+
+    /// The person asked to try again: the tunnel starts over from `unreachable` now.
+    pub(crate) fn retry(&self) {
+        self.tunnel.retry();
     }
 
     /// Stops the tunnel (every connection through it ends) and the task following it.
@@ -178,15 +206,24 @@ impl Link {
 }
 
 /// Keeps workspace `workspace`'s state in step with `tunnel`'s, and saves the transport worth
-/// remembering, until the tunnel closes.
-async fn follow(workspace: String, tunnel: Tunnel, registry: Arc<Registry>) {
+/// remembering, until the tunnel closes. Connected but without its token in the keychain, it is
+/// `needs_pairing`, not `ready`.
+async fn follow(
+    workspace: String,
+    tunnel: Tunnel,
+    registry: Arc<Registry>,
+    tokens: Arc<dyn TokenStore>,
+) {
     let mut watch = tunnel.watch();
     loop {
         let now = watch.borrow_and_update().clone();
         if now == LinkState::Closed {
             return;
         }
-        let (state, detail) = state_of(&now);
+        let (mut state, mut detail) = state_of(&now);
+        if state == WorkspaceState::Ready {
+            (state, detail) = token_state(&workspace, &*tokens);
+        }
         tracing::debug!(%workspace, host = tunnel.host(), ?state, "remote link");
         registry.set_state(&workspace, state, detail);
         if now.is_connected()
@@ -205,6 +242,18 @@ async fn follow(workspace: String, tunnel: Tunnel, registry: Arc<Registry>) {
 mod tests {
     use super::*;
     use pitcrew_remote::{Transport, Unreachable};
+
+    #[test]
+    fn connected_without_a_token_needs_pairing() {
+        let tokens = crate::keychain::MemoryStore::default();
+        let (state, detail) = token_state("01JR", &tokens);
+        assert_eq!(state, WorkspaceState::NeedsPairing);
+        assert!(detail.unwrap().contains("add the machine again"));
+        tokens
+            .set("01JR", &DeviceToken::new("pcd_x").unwrap())
+            .unwrap();
+        assert_eq!(token_state("01JR", &tokens), (WorkspaceState::Ready, None));
+    }
 
     #[test]
     fn link_states_map_to_workspace_states() {

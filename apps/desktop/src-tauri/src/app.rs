@@ -114,6 +114,7 @@ pub fn configure<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
             commands::gateway_remote_probe,
             commands::gateway_remote_plan,
             commands::gateway_remote_add,
+            commands::gateway_workspace_retry,
             commands::gateway_workspace_remove,
             commands::gateway_prompt_reply,
         ])

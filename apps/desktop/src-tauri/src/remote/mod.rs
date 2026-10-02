@@ -29,7 +29,8 @@
 //! reconnects by itself, and a task keeping the workspace's state in step with it. At start,
 //! [`Remotes::resume`] makes them again for the workspaces saved in the registry; a computer that
 //! slept is noticed by a timer that fires late ([`Remotes::watch_wakes`]), and every tunnel is
-//! told to check at once.
+//! told to check at once. A connection that gave up (a sign-in cancelled while reconnecting)
+//! starts over at [`Remotes::retry`].
 
 pub mod helpers;
 pub mod link;
@@ -177,6 +178,16 @@ pub struct RemoteProbe {
     /// SLURM, if the machine has it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub slurm: Option<SlurmFound>,
+    /// tmux, if the machine has it (the tmux launcher needs 3.2 or newer).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tmux: Option<TmuxFound>,
+}
+
+/// tmux on the machine.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TmuxFound {
+    /// `tmux -V`'s version, e.g. `3.3a`.
+    pub version: String,
 }
 
 /// A helper already on the machine.
@@ -331,9 +342,9 @@ impl Remotes {
         &self.prompts
     }
 
-    /// `gateway_ssh_hosts`: the concrete `Host` names of the person's ssh config.
-    #[must_use]
-    pub fn ssh_hosts(&self) -> SshHosts {
+    /// `gateway_ssh_hosts`: the concrete `Host` names of the person's ssh config, read off the
+    /// async threads.
+    pub async fn ssh_hosts(&self) -> SshHosts {
         let home = self.options.home.clone().or_else(pitcrew_remote::home_dir);
         let Some(home) = home else {
             return SshHosts { hosts: Vec::new() };
@@ -343,7 +354,12 @@ impl Remotes {
             .ssh_config
             .clone()
             .unwrap_or_else(|| home.join(".ssh").join("config"));
-        let list = pitcrew_remote::list_hosts_in(&config, &home);
+        let listed =
+            tokio::task::spawn_blocking(move || pitcrew_remote::list_hosts_in(&config, &home))
+                .await;
+        let Ok(list) = listed else {
+            return SshHosts { hosts: Vec::new() };
+        };
         for note in &list.notes {
             tracing::debug!(note = %tidy(note), "reading the ssh config");
         }
@@ -368,6 +384,9 @@ impl Remotes {
             default_partition: probe.slurm.default_partition.clone(),
             srun_overlap: probe.slurm.srun_overlap,
         });
+        let tmux = probe.tmux_version.as_ref().map(|version| TmuxFound {
+            version: tidy(version),
+        });
         tracing::info!(host, os = %probe.info.os, arch = %probe.info.arch, "probed a machine");
         Ok(RemoteProbe {
             host: host.to_owned(),
@@ -375,6 +394,7 @@ impl Remotes {
             arch: tidy(&probe.info.arch),
             helper,
             slurm,
+            tmux,
         })
     }
 
@@ -579,35 +599,63 @@ impl Remotes {
     /// Makes the tunnels of the remote workspaces saved in the registry (at start). One that
     /// cannot be made is `unreachable`, saying why.
     pub fn resume(&self) {
-        let _runtime = self.runtime.enter();
         for record in self.registry.records() {
-            let Connection::Remote(remote) = &record.connection else {
-                continue;
-            };
-            match self.tunnel_for(remote) {
-                Ok(tunnel) => {
-                    let connector = RemoteConnector::new(
-                        record.id.clone(),
-                        tunnel.clone(),
-                        Arc::clone(&self.tokens),
-                    );
-                    self.registry.attach(&record.id, Arc::new(connector));
-                    let link = Link::start(
-                        record.id.clone(),
-                        tunnel,
-                        Arc::clone(&self.registry),
-                        &self.runtime,
-                    );
-                    self.lock_links().insert(record.id.clone(), Arc::new(link));
+            if let Connection::Remote(remote) = &record.connection {
+                self.reconnect(&record.id, remote);
+            }
+        }
+    }
+
+    /// `gateway_workspace_retry`: tries remote workspace `workspace`'s connection again now
+    /// (after a cancelled sign-in, say). Its tunnel starts over (`Connector::retry`); one that
+    /// could not be made at start is made again. Returns once the attempt has started; the state
+    /// follows on `gateway://workspaces`.
+    ///
+    /// # Errors
+    /// `unknown_workspace`; `invalid` for the local workspace.
+    pub fn retry(&self, workspace: &str) -> Result<(), GatewayError> {
+        let record = self
+            .registry
+            .record(workspace)
+            .ok_or_else(|| GatewayError::unknown_workspace(workspace))?;
+        let Connection::Remote(remote) = &record.connection else {
+            return Err(GatewayError::invalid(
+                "the local workspace has no remote connection to try again",
+            ));
+        };
+        let link = self.lock_links().get(&record.id).cloned();
+        match link {
+            Some(link) => link.retry(),
+            None => self.reconnect(&record.id, remote),
+        }
+        tracing::info!(workspace = %record.id, host = %remote.host, "trying the connection again");
+        Ok(())
+    }
+
+    /// Makes saved remote workspace `id`'s tunnel and the task following it.
+    fn reconnect(&self, id: &str, remote: &RemoteConnection) {
+        let _runtime = self.runtime.enter();
+        match self.tunnel_for(remote) {
+            Ok(tunnel) => {
+                let connector =
+                    RemoteConnector::new(id.to_owned(), tunnel.clone(), Arc::clone(&self.tokens));
+                self.registry.attach(id, Arc::new(connector));
+                let link = Link::start(
+                    id.to_owned(),
+                    tunnel,
+                    Arc::clone(&self.registry),
+                    Arc::clone(&self.tokens),
+                    &self.runtime,
+                );
+                let old = self.lock_links().insert(id.to_owned(), Arc::new(link));
+                if let Some(old) = old {
+                    self.runtime.spawn(async move { old.close().await });
                 }
-                Err(e) => {
-                    tracing::warn!(workspace = %record.id, error = %e, "cannot reach a remote workspace");
-                    self.registry.set_state(
-                        &record.id,
-                        WorkspaceState::Unreachable,
-                        Some(e.message),
-                    );
-                }
+            }
+            Err(e) => {
+                tracing::warn!(workspace = %id, error = %e, "cannot reach a remote workspace");
+                self.registry
+                    .set_state(id, WorkspaceState::Unreachable, Some(e.message));
             }
         }
     }
@@ -1055,6 +1103,7 @@ impl Remotes {
             id.to_owned(),
             tunnel,
             Arc::clone(&self.registry),
+            Arc::clone(&self.tokens),
             &self.runtime,
         );
         self.lock_links().insert(id.to_owned(), Arc::new(link));
@@ -1484,13 +1533,17 @@ mod tests {
                 default_partition: Some("batch".into()),
                 srun_overlap: true,
             }),
+            tmux: Some(TmuxFound {
+                version: "3.3a".into(),
+            }),
         };
         assert_eq!(
             serde_json::to_value(probe).unwrap(),
             serde_json::json!({
                 "host": "hpc-login", "os": "linux", "arch": "x86_64",
                 "helper": { "version": "0.4.0", "running": true },
-                "slurm": { "version": "slurm 23.02.7", "defaultPartition": "batch", "srunOverlap": true }
+                "slurm": { "version": "slurm 23.02.7", "defaultPartition": "batch", "srunOverlap": true },
+                "tmux": { "version": "3.3a" }
             })
         );
     }
