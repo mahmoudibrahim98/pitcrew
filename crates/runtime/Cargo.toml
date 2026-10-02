@@ -11,6 +11,14 @@ authors.workspace = true
 [dependencies]
 pitcrew-protocol.workspace = true
 pitcrew-interfaces.workspace = true
+tracing.workspace = true
+# The screen model behind `Runtime::screen`, fed by `%output` (never `capture-pane`).
+vt100.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# The user's uid for the private socket directory, and signals, without unsafe code. The
+# version pitcrew-remote and tempfile already use.
+rustix = { version = "=1.1.5", features = ["process"] }
 
 [dev-dependencies]
 proptest.workspace = true

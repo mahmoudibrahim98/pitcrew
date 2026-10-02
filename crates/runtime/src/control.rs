@@ -13,7 +13,7 @@ macro_rules! tmux_id {
         pub struct $name(pub u64);
 
         impl $name {
-            fn parse(bytes: &[u8]) -> Option<Self> {
+            pub(crate) fn parse(bytes: &[u8]) -> Option<Self> {
                 Some(Self(number(bytes.strip_prefix($prefix.as_bytes())?)?))
             }
         }

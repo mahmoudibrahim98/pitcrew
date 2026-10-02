@@ -143,6 +143,7 @@ pub fn detect_tmux(path: impl AsRef<Path>) -> Result<TmuxVersion, DetectError> {
     let mut child = ProbeChild(
         Command::new(path.as_ref())
             .arg("-V")
+            .current_dir("/")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

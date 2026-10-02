@@ -67,6 +67,11 @@ impl ReplayBuffer {
         self.end
     }
 
+    /// Offset of the oldest byte still retained; `end()` when none is.
+    pub fn start(&self) -> u64 {
+        self.end - self.data.len() as u64
+    }
+
     /// Read at most `max` bytes, clamping `from` to the retained interval.
     ///
     /// Requests before retained history set `truncated`, including empty reads.
