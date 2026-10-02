@@ -97,7 +97,8 @@ impl TerminalRuntime {
         }
     }
 
-    /// `runtime`, holding `lock`, its terminals running in `capability` at `place`.
+    /// `runtime`, holding `lock`, its terminals running in `capability` (the chosen runtime's,
+    /// `Chosen::capability`) at `place`.
     fn locked(
         runtime: Box<dyn Runtime>,
         lock: Lock,
@@ -421,10 +422,13 @@ impl Plan {
         }
         let (version, tmux) = (support.version.clone(), support.tmux.clone());
         let (tmux_options, pty_options) = (self.tmux.clone(), self.pty.clone());
-        let runtime = blocking(move || {
-            Chosen::Tmux(support)
+        let (runtime, capability) = blocking(move || {
+            let chosen = Chosen::Tmux(support);
+            let capability = chosen.capability();
+            let runtime = chosen
                 .into_runtime(tmux_options, pty_options)
-                .map_err(reason)
+                .map_err(reason)?;
+            Ok((runtime, capability))
         })
         .await?;
         tracing::info!(
@@ -435,12 +439,7 @@ impl Plan {
             socket.display(),
             pitcrew_runtime::tmux::SESSION,
         );
-        Ok(TerminalRuntime::locked(
-            runtime,
-            lock,
-            Capability::Tmux,
-            socket,
-        ))
+        Ok(TerminalRuntime::locked(runtime, lock, capability, socket))
     }
 
     #[cfg(not(unix))]
@@ -464,17 +463,19 @@ impl Plan {
             let (tmux_options, pty_options) = (self.tmux.clone(), self.pty.clone());
             blocking(move || {
                 let lock = lock_endpoint(&endpoint)?;
-                let runtime = Chosen::Pty {
+                let chosen = Chosen::Pty {
                     support,
                     no_tmux: why,
-                }
-                .into_runtime(tmux_options, pty_options)
-                .map_err(reason)?;
-                Ok((runtime, lock))
+                };
+                let capability = chosen.capability();
+                let runtime = chosen
+                    .into_runtime(tmux_options, pty_options)
+                    .map_err(reason)?;
+                Ok((runtime, lock, capability))
             })
             .await
         };
-        let (runtime, lock) = built.map_err(|no_pty| format!("{no_tmux}; {no_pty}"))?;
+        let (runtime, lock, capability) = built.map_err(|no_pty| format!("{no_tmux}; {no_pty}"))?;
         tracing::info!(
             ptyd = %ptyd.display(),
             endpoint = %endpoint.display(),
@@ -482,12 +483,7 @@ impl Plan {
             "the runner's terminals run in pitcrew-ptyd, which keeps them running when pitcrewd \
              stops; tmux is not used: {no_tmux}"
         );
-        Ok(TerminalRuntime::locked(
-            runtime,
-            lock,
-            Capability::Pty,
-            endpoint,
-        ))
+        Ok(TerminalRuntime::locked(runtime, lock, capability, endpoint))
     }
 }
 

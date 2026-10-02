@@ -187,7 +187,14 @@ impl Rig {
             .unwrap()
             .as_nanos();
         let mark = format!("pty-{test}-{}-{nanos}", std::process::id());
-        let names = Mutex::new(vec![tmp.path().display().to_string()]);
+        // As given, and resolved (Windows may show a temporary folder by its short name or its
+        // long one).
+        let mut names = vec![tmp.path().display().to_string()];
+        if let Ok(real) = std::fs::canonicalize(tmp.path()) {
+            let real = real.display().to_string();
+            names.push(real.strip_prefix(r"\\?\").unwrap_or(&real).to_owned());
+        }
+        let names = Mutex::new(names);
         Some(Self {
             tmp,
             homes,
@@ -332,7 +339,7 @@ fn marked(mark: &str) -> Vec<(u32, String)> {
             .filter_map(|line| {
                 let (pid, rest) = line.trim().split_once(' ')?;
                 let pid: u32 = pid.parse().ok()?;
-                (pid != me).then(|| (pid, rest.chars().take(200).collect()))
+                (pid != me).then(|| (pid, rest.to_owned()))
             })
             .collect()
     }
