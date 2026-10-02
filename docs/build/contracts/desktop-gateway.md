@@ -148,6 +148,7 @@ interface RemoteProbe {
   os: string; arch: string;                 // e.g. "linux", "x86_64"
   helper?: { version: string; running: boolean };
   slurm?: { version: string; defaultPartition?: string; srunOverlap: boolean };
+  tmux?: { version: string };              // offer the tmux launcher only from 3.2 on
 }
 ```
 
@@ -183,6 +184,12 @@ string }`, ending with one `done` or `failed` for the whole add. A plan is used 
   token never reaches the webview, a log, or a file of ours.
 - **A fresh remote hub** is set up like a local one: the UI calls `POST /v1/setup` through
   `gateway_request` for that workspace.
+- `gateway_remote_cancel({ plan })` stops an add that is still running, and undoes what it
+  started (stops the helper, cancels a submitted job). The add then ends `failed`. Cancelling an
+  add that has finished does nothing.
+- `gateway_workspace_retry({ workspace })` tries a remote workspace's connection again at once, for
+  example after a sign-in was cancelled while reconnecting (which leaves it `unreachable` until
+  then). It returns when the attempt has started; the state follows on `gateway://workspaces`.
 - `gateway_workspace_remove({ workspace, stopHelper: boolean })` forgets a workspace and deletes
   its keychain token. With `stopHelper`, it first stops the remote helper (cancelling its job for
   SLURM).
@@ -200,16 +207,28 @@ gateway emits `gateway://prompt`:
 interface GatewayPrompt {
   id: string;
   host: string;
-  kind: 'password' | 'passphrase' | 'otp' | 'host_key';
+  kind: 'password' | 'passphrase' | 'otp' | 'host_key' | 'confirm' | 'notice';
   text: string;                    // ssh's question, cleaned of control characters; untrusted
   fingerprint?: string;            // host_key: the key's fingerprint, to compare
 }
 ```
 
 and the UI answers with `gateway_prompt_reply({ id, answer?: string, accept?: boolean })`: `answer`
-for the first three kinds, and `accept` for a host key. A reply with neither cancels. A prompt that
+for the first three kinds, and `accept` for a host key or a `confirm` (ssh's other yes/no
+ questions, such as accepting updated host keys). A `notice` (such as `touch your security key`)
+ needs no answer: it is closed when ssh moves on, and a reply with neither stops ssh. A reply with
+ neither cancels. A prompt that
 is no longer wanted is withdrawn with the event `gateway://prompt-closed` `{ id }`.
 
+- **`kind` says who asks, and is never guessed from `text`.** `passphrase` and `host_key` are
+  only for ssh's own local questions (unlocking a key on this computer, trusting a new host key).
+  Anything the server sends (keyboard-interactive text, which OpenSSH marks with a leading
+  `(user@host)`) is `password` or `otp`, whatever its words say. The UI tells the person where the
+  answer goes: to the host for `password` and `otp`, and nowhere off this computer for
+  `passphrase`.
+- **Prompts are held for the page.** A prompt raised before the page listens (a reconnect at
+  launch) is held until the page first calls `gateway_workspaces`, and every open prompt is emitted
+  again, with the same `id`, after a reload. The UI de-duplicates by `id`.
 - An answer is passed to ssh once, and is never stored or logged. It is in memory only as long as
   the reply takes.
 - A host key the person accepts goes into their own `known_hosts`, by ssh itself.

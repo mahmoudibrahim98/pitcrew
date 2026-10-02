@@ -21,7 +21,10 @@ fn control(c: &mut Criterion) {
             let mut parser = ControlParser::new();
             let mut notifications = 0usize;
             for chunk in data.chunks(CHUNK) {
-                notifications += parser.feed(black_box(chunk)).len();
+                notifications += parser
+                    .feed(black_box(chunk))
+                    .expect("generated control output parses")
+                    .len();
             }
             notifications
         });
