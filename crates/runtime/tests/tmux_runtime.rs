@@ -445,7 +445,8 @@ fn write_read_by_offset_resize_ctrl_c_and_kill() {
 
 /// tmux 3.3 and later crash at a new window while the global `window-size` is `manual`, and
 /// size new windows by attached clients otherwise: a terminal still gets the size asked for and
-/// keeps it, and a person's own new window does not bring the server down.
+/// keeps it, a person's own new window does not bring the server down, and neither does a start
+/// after someone set the global to `manual` by hand.
 #[test]
 fn terminals_keep_their_size_whoever_attaches() {
     let Some(fx) = Fixture::new("sizes") else {
@@ -535,10 +536,25 @@ fn terminals_keep_their_size_whoever_attaches() {
     rt.write(sized.id, b"still\r").expect("write");
     wait_for(&rt, sized.id, at, b"still\r\nstill\r\n");
 
+    // Someone sets the global to `manual` by hand: the next start sets it back before its window.
+    fx.tmux(&["set-option", "-g", "window-size", "manual"]);
+    let third = rt
+        .start(&fx.spec("third", "sh", &["-c", "printf ready; cat"]))
+        .expect("start after a manual global");
+    wait_for(&rt, third.id, 0, b"ready");
+    assert!(fx.server_running(), "a start ended the server");
+    assert_eq!(fx.tmux(&["show-options", "-gv", "window-size"]), global);
+    assert_eq!(
+        size_of(third.native_target.as_deref().expect("target")),
+        "80x24"
+    );
+    assert!(rt.info(sized.id).expect("info").alive);
+
     drop(person.stdin.take());
     person.wait().expect("the person's client ends");
     rt.kill(first.id).expect("kill");
     rt.kill(sized.id).expect("kill");
+    rt.kill(third.id).expect("kill");
     drop(rt);
     fx.finish();
 }

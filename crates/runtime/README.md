@@ -156,15 +156,17 @@ tmux server that belongs to PitCrew alone.
   kill. If the connection is lost before tmux answers at all, the next connection, before any
   start uses it, kills untagged panes that the wrapper started (it begins with a marker,
   `: pitcrew-wrapper;`, which `#{pane_start_command}` shows); only one runtime may use a socket.
-- **Sizes.** `start` sets the session's `default-size` to the size asked for just before
-  `new-window`, then sets the new window's own `window-size` to `manual`, so no client resizes
-  it. The global `window-size` depends on the server's version, read when the runtime attaches:
-  `manual` on 3.2, where it makes a new window take `default-size` whoever is attached; `latest`
-  on 3.3 and later, where a global `manual` crashes the server (see
-  [tmux versions](#tmux-versions)). There a new window takes the size of a client attached with
-  one of its own, if any, so `start` reads the size tmux made it (`new-window -P`) and resizes
-  it at once when that is not the size asked for; output printed before that is emulated at the
-  size it was printed for. `resize` uses `resize-window`, which also makes a window `manual`.
+- **Sizes.** The global `window-size` depends on the server's version, read when the runtime
+  attaches: `manual` on 3.2, where it makes a new window take `default-size` whoever is
+  attached; `latest` on 3.3 and later, where a global `manual` crashes the server (see
+  [tmux versions](#tmux-versions)). `start` sets it again, with the session's `default-size`
+  (the size asked for), in the same send as `new-window`, so a `manual` set by hand since cannot
+  crash the server. On 3.3 and later a new window takes the size of a client attached with one
+  of its own, if any: `start` reads the size tmux made it (`new-window -P`), and then always
+  resizes it to the size asked for with `resize-window`, which also makes the window's own
+  `window-size` `manual` on every version, so no client resizes it. Output printed before that
+  is emulated at the size it was printed for. A failed resize is logged. `resize` uses
+  `resize-window` too.
 - **Input.** `write` sends `send-keys -H` in 1 KiB commands; `send_keys` sends tmux key names.
   Both first leave copy mode (query `#{pane_in_mode}`, `send-keys -X cancel`, query again), under
   one lock, and refuse input to a pane stuck in a mode. Input (or a resize) that timed out may

@@ -144,6 +144,8 @@ struct Link {
     holder: Mutex<Option<WindowId>>,
     /// Which server this is, from reconcile.
     server: Mutex<Option<ServerKey>>,
+    /// The global `window-size` for this server's version, from reconcile.
+    window_size: Mutex<&'static str>,
 }
 
 /// Why there is no connection.
@@ -393,6 +395,8 @@ impl Inner {
             generation,
             holder: Mutex::new(holder),
             server: Mutex::new(None),
+            // Safe on every version until reconcile reads which this one is.
+            window_size: Mutex::new("latest"),
         });
         self.reconcile(&link, deadline)?;
         if self.shutdown.load(Ordering::Acquire) {
@@ -469,11 +473,10 @@ impl Inner {
             }
         };
         // The global `window-size` depends on the server's version, so it follows the check.
+        let global = global_window_size(&server.version);
+        *lock(&link.window_size) = global;
         let commands = [
-            Command::new("set-option")
-                .and_then(|c| c.arg(Argument::Flag("-g")))
-                .and_then(|c| c.arg(Argument::Text("window-size")))
-                .and_then(|c| c.arg(Argument::Text(global_window_size(&server.version)))),
+            set_global_window_size(global),
             Command::new("list-panes")
                 .and_then(|c| c.arg(Argument::Flag("-s")))
                 .and_then(|c| c.arg(Argument::Flag("-F")))
@@ -813,9 +816,10 @@ fn server_facts(about: &str) -> Result<Server, String> {
     }
 }
 
-/// The server's global `window-size`. Every window `start` makes is sized `default-size` (set
-/// just before) and then made `manual` itself, so attached clients never resize it; what the
-/// global option adds depends on the version.
+/// The server's global `window-size`, set when the runtime attaches and again in every
+/// `start`. Every window `start` makes is sized `default-size` (set just before) and then
+/// resized to the size asked for, which makes it `manual` itself, so attached clients never
+/// resize it; what the global option adds depends on the version.
 ///
 /// - **tmux 3.2:** `manual`, so a new window takes `default-size` whoever is attached.
 /// - **tmux 3.3 and later:** `latest`. There a global `manual` crashes the server at its next
@@ -909,6 +913,9 @@ impl Runtime for TmuxRuntime {
             .ok_or_else(|| RuntimeError::Unavailable("tmux is busy starting a terminal".into()))?;
         let link = inner.connection(deadline, true).map_err(Down::error)?;
         let server = *lock(&link.server);
+        // The global again, in the same send as `new-window`: a `manual` set since (by hand, or
+        // by a program that found the socket) would crash tmux 3.3 and later at that window.
+        let global = set_global_window_size(*lock(&link.window_size)).map_err(invalid)?;
         let default_size = Command::new("set-option")
             .and_then(|c| c.arg(Argument::Text("default-size")))
             .and_then(|c| c.arg(Argument::Text(&format!("{cols}x{rows}"))))
@@ -924,8 +931,12 @@ impl Runtime for TmuxRuntime {
             }
         });
         let sent = link.conn.outbox().send_with(
-            &[default_size, new_window],
-            vec![Waiter::Discard, Waiter::Pending(Arc::clone(&created))],
+            &[global, default_size, new_window],
+            vec![
+                Waiter::Discard,
+                Waiter::Discard,
+                Waiter::Pending(Arc::clone(&created)),
+            ],
         );
         let created = sent
             .and_then(|()| created.wait(deadline))
@@ -953,8 +964,8 @@ impl Runtime for TmuxRuntime {
         };
         let id = TerminalId::new();
         // The window was made at `default-size` or, on tmux 3.3 and later, at the size of a
-        // client attached with a size of its own. Then it is resized below; its first output
-        // was drawn at the size it was made with.
+        // client attached with a size of its own. It is resized below either way; its first
+        // output was drawn at the size it was made with.
         let (made_cols, made_rows) = size.unwrap_or((cols, rows));
         lock(&inner.terminals).claim(Claim {
             id,
@@ -967,26 +978,30 @@ impl Runtime for TmuxRuntime {
             offset: 0,
             alive: true,
         });
-        let resize = size != Some((cols, rows));
         let mut commands = vec![
             set_pane_option(pane, TERMINAL_OPTION, &id.to_string()).map_err(invalid)?,
             offset_command(pane, RESERVE).map_err(invalid)?,
-            // Its own `window-size manual`: no client resizes it (see `global_window_size`).
-            manual_window_size(window).map_err(invalid)?,
+            // Always, even at the size it has: this also makes the window's own `window-size`
+            // manual, so no client resizes it, one that attached since it was made included.
+            resize_window(window, cols, rows).map_err(invalid)?,
         ];
-        if resize {
-            commands.push(resize_window(window, cols, rows).map_err(invalid)?);
-        }
         if let Some(holder) = holder {
             commands.push(kill_window(holder).map_err(invalid)?);
         }
         match inner.call(&link, &commands, deadline) {
             Ok(replies) if !replies[0].failed => {
+                if replies[2].failed {
+                    tracing::warn!(
+                        %window,
+                        why = %reply_text(&replies[2]),
+                        "could not size a new tmux window; clients may resize it"
+                    );
+                }
                 let mut terminals = lock(&inner.terminals);
                 if !replies[1].failed {
                     terminals.reserved(id, RESERVE);
                 }
-                if resize && !replies[3].failed {
+                if !replies[2].failed {
                     terminals.set_size(id, cols, rows);
                 }
             }
@@ -1260,17 +1275,15 @@ fn parse_created(reply: &CommandReply) -> Option<Created> {
     })
 }
 
-/// The window keeps the size the runtime gives it, whoever attaches.
-fn manual_window_size(window: WindowId) -> Result<Command, FormatError> {
+/// `set-option -g window-size <value>`, the value [`global_window_size`] gives.
+fn set_global_window_size(value: &str) -> Result<Command, FormatError> {
     Command::new("set-option")?
-        .arg(Argument::Flag("-w"))?
-        .arg(Argument::Flag("-t"))?
-        .arg(Argument::Window(window))?
+        .arg(Argument::Flag("-g"))?
         .arg(Argument::Text("window-size"))?
-        .arg(Argument::Text("manual"))
+        .arg(Argument::Text(value))
 }
 
-/// `resize-window` also makes the window's own `window-size` manual.
+/// `resize-window` also makes the window's own `window-size` manual, on every version.
 fn resize_window(window: WindowId, cols: u16, rows: u16) -> Result<Command, FormatError> {
     Command::new("resize-window")?
         .arg(Argument::Flag("-t"))?
