@@ -41,17 +41,23 @@ tmux_id!(
 /// One complete command response, including its `%begin` metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandReply {
+    /// Opening guard timestamp, in seconds since the Unix epoch.
     pub time: u64,
+    /// tmux's command sequence number.
     pub number: u64,
+    /// Guard flags. All three guard fields must match before a reply closes.
     pub flags: u64,
     /// True for `%error`, false for `%end`.
     pub failed: bool,
-    /// Lines between the guards, with only the terminating LF removed.
+    /// Untrusted text between the guards, with only the terminating LF removed.
+    /// Pane content can forge guards. Never use `capture-pane` replies for an
+    /// untrusted screen; use a terminal model driven by `%output` instead.
     pub lines: Vec<Vec<u8>>,
 }
 
 /// A complete reply or asynchronous notification from tmux.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Notification {
     CommandReply(CommandReply),
     Output {
@@ -98,22 +104,94 @@ pub enum Notification {
     Continue {
         pane: PaneId,
     },
+    PaneModeChanged {
+        pane: PaneId,
+    },
     Exit {
         reason: Option<Vec<u8>>,
     },
-    /// Unknown or malformed notifications are preserved, without the leading `%`.
-    /// Non-protocol lines are also kept here. `args` excludes one separating space.
+    /// Unknown or malformed records. `name` excludes the optional leading `%`;
+    /// `args` excludes one separating space. Both fields preserve arbitrary bytes.
     Other {
-        name: String,
+        notification: bool,
+        name: Vec<u8>,
         args: Vec<u8>,
     },
 }
+
+/// Storage limits. LF is excluded from the line limit; every reply body line
+/// charges its wire bytes, one LF, and 32 bytes of allocation overhead.
+/// The optional transport CR counts towards both limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ParserLimits {
+    pub max_line_bytes: usize,
+    pub max_reply_bytes: usize,
+}
+
+impl ParserLimits {
+    pub const fn new(max_line_bytes: usize, max_reply_bytes: usize) -> Self {
+        Self {
+            max_line_bytes,
+            max_reply_bytes,
+        }
+    }
+}
+
+impl Default for ParserLimits {
+    fn default() -> Self {
+        Self {
+            max_line_bytes: 1024 * 1024,
+            max_reply_bytes: 4 * 1024 * 1024,
+        }
+    }
+}
+
+/// The connection cannot be parsed safely. Drop its parser and reconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DesyncError {
+    LineTooLong {
+        limit: usize,
+    },
+    ReplyTooLarge {
+        limit: usize,
+    },
+    /// Reports both conditions when EOF falls inside a reply body line.
+    UnexpectedEof {
+        unfinished_reply: bool,
+        partial_line_bytes: usize,
+    },
+}
+
+impl fmt::Display for DesyncError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LineTooLong { limit } => write!(f, "tmux line exceeds {limit} bytes; reconnect"),
+            Self::ReplyTooLarge { limit } => {
+                write!(f, "tmux reply exceeds {limit} bytes; reconnect")
+            }
+            Self::UnexpectedEof {
+                unfinished_reply,
+                partial_line_bytes,
+            } => write!(
+                f,
+                "tmux EOF with unfinished reply={unfinished_reply}, partial line bytes={partial_line_bytes}; reconnect"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DesyncError {}
 
 /// One parser per control-mode connection. Feeding empty input is a no-op.
 #[derive(Debug, Default)]
 pub struct ControlParser {
     pending: Vec<u8>,
     reply: Option<CommandReply>,
+    reply_bytes: usize,
+    limits: ParserLimits,
+    desync: Option<DesyncError>,
 }
 
 impl ControlParser {
@@ -121,35 +199,98 @@ impl ControlParser {
         Self::default()
     }
 
+    pub fn with_limits(limits: ParserLimits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+
     /// Accept arbitrary transport chunks, including splits inside UTF-8 or octal escapes.
-    pub fn feed(&mut self, mut bytes: &[u8]) -> Vec<Notification> {
+    /// On error, notifications from this call are discarded and the error is
+    /// latched. Buffered input is released; subsequent feeds return that error.
+    pub fn feed(&mut self, mut bytes: &[u8]) -> Result<Vec<Notification>, DesyncError> {
+        if let Some(error) = self.desync {
+            return Err(error);
+        }
         let mut notifications = Vec::new();
         while let Some(end) = bytes.iter().position(|&byte| byte == b'\n') {
-            self.pending.extend_from_slice(&bytes[..end]);
+            self.retain(&bytes[..end])?;
             let line = std::mem::take(&mut self.pending);
-            if let Some(notification) = self.line(line) {
+            if let Some(notification) = self.line(line)? {
                 notifications.push(notification);
             }
             bytes = &bytes[end + 1..];
         }
-        self.pending.extend_from_slice(bytes);
-        notifications
+        self.retain(bytes)?;
+        Ok(notifications)
     }
 
-    fn line(&mut self, line: Vec<u8>) -> Option<Notification> {
-        let (name, args) = split(&line);
+    /// Consume the connection parser at EOF, reporting incomplete state.
+    pub fn finish(self) -> Result<(), DesyncError> {
+        if let Some(error) = self.desync {
+            return Err(error);
+        }
+        if self.reply.is_some() || !self.pending.is_empty() {
+            return Err(DesyncError::UnexpectedEof {
+                unfinished_reply: self.reply.is_some(),
+                partial_line_bytes: self.pending.len(),
+            });
+        }
+        Ok(())
+    }
+
+    fn fail(&mut self, error: DesyncError) -> DesyncError {
+        self.pending = Vec::new();
+        self.reply = None;
+        self.reply_bytes = 0;
+        self.desync = Some(error);
+        error
+    }
+
+    fn retain(&mut self, bytes: &[u8]) -> Result<(), DesyncError> {
+        if bytes.len() > self.limits.max_line_bytes - self.pending.len() {
+            return Err(self.fail(DesyncError::LineTooLong {
+                limit: self.limits.max_line_bytes,
+            }));
+        }
+        self.pending.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn line(&mut self, line: Vec<u8>) -> Result<Option<Notification>, DesyncError> {
+        let normalized = if line.starts_with(b"%") {
+            line.strip_suffix(b"\r").unwrap_or(&line)
+        } else {
+            &line
+        };
+        let (name, args) = split(normalized);
         if let Some(reply) = &mut self.reply {
             // tmux never interleaves notifications in a reply. Even lines starting
             // with '%' are response data unless they are the matching end guard.
             if matches!(name, b"%end" | b"%error")
-                && guard(args)
-                    .is_some_and(|(time, number, _)| time == reply.time && number == reply.number)
+                && guard(args).is_some_and(|(time, number, flags)| {
+                    time == reply.time && number == reply.number && flags == reply.flags
+                })
             {
                 reply.failed = name == b"%error";
-                return self.reply.take().map(Notification::CommandReply);
+                self.reply_bytes = 0;
+                return Ok(self.reply.take().map(Notification::CommandReply));
             }
+            let available = self.limits.max_reply_bytes - self.reply_bytes;
+            // Include the LF and per-line allocation cost, including empty lines.
+            let Some(cost) = line
+                .len()
+                .checked_add(1 + 32)
+                .filter(|&cost| cost <= available)
+            else {
+                return Err(self.fail(DesyncError::ReplyTooLarge {
+                    limit: self.limits.max_reply_bytes,
+                }));
+            };
+            self.reply_bytes += cost;
             reply.lines.push(line);
-            return None;
+            return Ok(None);
         }
         if name == b"%begin"
             && let Some((time, number, flags)) = guard(args)
@@ -161,14 +302,15 @@ impl ControlParser {
                 failed: false,
                 lines: Vec::new(),
             });
-            return None;
+            return Ok(None);
         }
-        Some(
-            parse_notification(name, args).unwrap_or_else(|| Notification::Other {
-                name: String::from_utf8_lossy(name.strip_prefix(b"%").unwrap_or(name)).into_owned(),
+        Ok(Some(parse_notification(name, args).unwrap_or_else(|| {
+            Notification::Other {
+                notification: name.starts_with(b"%"),
+                name: name.strip_prefix(b"%").unwrap_or(name).to_vec(),
                 args: args.to_vec(),
-            }),
-        )
+            }
+        })))
     }
 }
 
@@ -264,6 +406,9 @@ fn parse_notification(name: &[u8], args: &[u8]) -> Option<Notification> {
             pane: PaneId::parse(args)?,
         },
         b"%continue" => Continue {
+            pane: PaneId::parse(args)?,
+        },
+        b"%pane-mode-changed" => PaneModeChanged {
             pane: PaneId::parse(args)?,
         },
         b"%exit" => Exit {

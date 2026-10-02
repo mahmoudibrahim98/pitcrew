@@ -3,29 +3,83 @@
 use std::collections::{VecDeque, hash_map::RandomState};
 use std::hash::BuildHasher;
 use std::io::{self, Read, Write};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command as ProcessCommand, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use pitcrew_runtime::command::{Argument, Command};
+use pitcrew_runtime::WindowId;
+use pitcrew_runtime::command::{Argument, Command, FormatError};
 use pitcrew_runtime::control::{CommandReply, ControlParser, Notification, PaneId};
+use pitcrew_runtime::detect::{DetectError, detect_tmux};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 struct PrivateServer {
-    socket: String,
+    socket: PathBuf,
+    directory: PathBuf,
+    sentinel: PathBuf,
 }
 
 impl PrivateServer {
+    fn new(name: &str) -> Self {
+        // A socket path is limited to 104 bytes on macOS (108 on Linux), and
+        // macOS's temp_dir() alone is about 50, so use /tmp/<name>/s on Unix.
+        #[cfg(unix)]
+        let base = PathBuf::from("/tmp");
+        #[cfg(not(unix))]
+        let base = std::env::temp_dir();
+        let directory = base.join(name);
+        let socket = directory.join("s");
+        assert!(
+            socket.as_os_str().len() < 100,
+            "socket path too long: {}",
+            socket.display()
+        );
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
+        // Not create_all: the directory must be new, and so ours, even in a shared /tmp.
+        builder
+            .create(&directory)
+            .expect("private socket directory");
+        Self {
+            socket,
+            sentinel: directory.join("format-side-effect"),
+            directory,
+        }
+    }
+
     fn command(&self) -> ProcessCommand {
         let mut command = ProcessCommand::new("tmux");
-        command.args(["-L", &self.socket, "-f", "/dev/null", "-u"]);
+        command
+            .arg("-S")
+            .arg(&self.socket)
+            .args(["-f", "/dev/null", "-u"]);
         command
             .env_remove("TMUX")
             .env_remove("TMUX_PANE")
+            .env("TMUX_TMPDIR", &self.directory)
             .env("PITCREW_TEST_VALUE", "expanded-would-be-wrong");
         command
+    }
+
+    fn assert_no_format_job(&self) {
+        let deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            assert!(!self.sentinel.exists(), "format value executed a shell job");
+            if Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
@@ -37,6 +91,11 @@ impl Drop for PrivateServer {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        let _ = std::fs::remove_file(&self.sentinel);
+        // Remove the socket even if the server died. Anything else left in the
+        // directory makes remove_dir fail, which the test's last check reports.
+        let _ = std::fs::remove_file(&self.socket);
+        let _ = std::fs::remove_dir(&self.directory);
     }
 }
 
@@ -64,9 +123,16 @@ impl Client {
             let mut bytes = [0; 4096];
             loop {
                 match stdout.read(&mut bytes) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        if let Err(error) = parser.finish() {
+                            let _ = sender.send(Err(io::Error::other(error)));
+                        }
+                        break;
+                    }
                     Ok(count) => {
-                        if sender.send(Ok(parser.feed(&bytes[..count]))).is_err() {
+                        let result = parser.feed(&bytes[..count]).map_err(io::Error::other);
+                        let failed = result.is_err();
+                        if sender.send(result).is_err() || failed {
                             break;
                         }
                     }
@@ -145,19 +211,26 @@ impl Drop for Client {
 
 #[test]
 fn real_tmux_replies_output_and_literal_injection_attempts() {
-    match ProcessCommand::new("tmux").arg("-V").output() {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+    match detect_tmux("tmux") {
+        Err(DetectError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
             eprintln!("skipped real tmux test: tmux is not installed");
             return;
         }
+        Err(DetectError::Unsupported(version)) => {
+            eprintln!("skipped real tmux test: {version} is below the supported floor");
+            return;
+        }
+        Err(DetectError::InvalidVersion(output)) => {
+            eprintln!("skipped real tmux test: unrecognized version {output:?}");
+            return;
+        }
         Err(error) => panic!("could not probe tmux: {error}"),
-        Ok(output) => assert!(output.status.success(), "tmux -V failed"),
+        Ok(version) => eprintln!("testing tmux {version}"),
     }
     let random = RandomState::new().hash_one((std::process::id(), SystemTime::now()));
-    let name = format!("pitcrew-test-{random:016x}");
-    let server = PrivateServer {
-        socket: name.clone(),
-    };
+    let name = format!("pc-{:012x}", random & 0xffff_ffff_ffff);
+    let server = PrivateServer::new(&name);
+    assert!(!server.sentinel.exists());
     // -d creates a detached session. Then attach a persistent control client to
     // receive pane output; detached control clients exit after the initial reply.
     let mut create = Client::start(server.command().args([
@@ -182,9 +255,9 @@ fn real_tmux_replies_output_and_literal_injection_attempts() {
         let reply = client.run(
             Command::new("capture-pane")
                 .expect("command")
-                .arg(Argument::Text("-p"))
+                .arg(Argument::Flag("-p"))
                 .expect("flag")
-                .arg(Argument::Text("-t"))
+                .arg(Argument::Flag("-t"))
                 .expect("flag")
                 .arg(Argument::Pane(PaneId(0)))
                 .expect("pane"),
@@ -204,9 +277,9 @@ fn real_tmux_replies_output_and_literal_injection_attempts() {
     let reply = client.run(
         Command::new("display-message")
             .expect("command")
-            .arg(Argument::Text("-p"))
+            .arg(Argument::Flag("-p"))
             .expect("flag")
-            .arg(Argument::Text("pitcrew-reply"))
+            .arg(Argument::FormatLiteral("pitcrew-reply"))
             .expect("text"),
     );
     assert!(!reply.failed);
@@ -245,6 +318,9 @@ fn real_tmux_replies_output_and_literal_injection_attempts() {
         "~root",
         "café 雪 🦀",
         "\\012\\134",
+        "FOO=bar",
+        "\x7f",
+        "%hidden x",
     ];
     for (index, attack) in attacks.iter().enumerate() {
         let marker = format!("PITCREW_END_{index:02}");
@@ -260,16 +336,201 @@ fn real_tmux_replies_output_and_literal_injection_attempts() {
     let barrier = client.run(
         Command::new("display-message")
             .expect("command")
-            .arg(Argument::Text("-p"))
+            .arg(Argument::Flag("-p"))
             .expect("flag")
-            .arg(Argument::Text("no-extra-commands"))
+            .arg(Argument::FormatLiteral("no-extra-commands"))
             .expect("text"),
     );
     assert_eq!(barrier.lines, vec![b"no-extra-commands".to_vec()]);
+
+    // Cancel copy mode before delivery; 'q' and CR would otherwise run bindings.
+    assert!(
+        !client
+            .run(
+                Command::new("copy-mode")
+                    .expect("command")
+                    .arg(Argument::Flag("-t"))
+                    .expect("flag")
+                    .arg(Argument::Pane(PaneId(0)))
+                    .expect("pane")
+            )
+            .failed
+    );
+    assert_eq!(
+        client
+            .run(Command::pane_in_mode(PaneId(0)).expect("query"))
+            .lines,
+        vec![b"1".to_vec()]
+    );
+    assert!(
+        !client
+            .run(Command::cancel_copy_mode(PaneId(0)).expect("cancel"))
+            .failed
+    );
+    assert_eq!(
+        client
+            .run(Command::pane_in_mode(PaneId(0)).expect("query"))
+            .lines,
+        vec![b"0".to_vec()]
+    );
+    client.output.clear();
+    let text = "q\rCOPY_MODE_TEXT_INTACT";
+    assert!(
+        !client
+            .run(Command::send_literal(PaneId(0), text).expect("text"))
+            .failed
+    );
+    client.output_through(b"COPY_MODE_TEXT_INTACT");
+    assert_eq!(client.output, text.as_bytes());
+
+    client.output.clear();
+    let bytes = b"\0\xff\x80\xc3\x28\x7f\r\nBINARY_INPUT_INTACT";
+    assert!(
+        !client
+            .run(
+                Command::send_bytes(PaneId(0), bytes)
+                    .expect("hex")
+                    .expect("bytes")
+            )
+            .failed
+    );
+    client.output_through(b"BINARY_INPUT_INTACT");
+    assert_eq!(client.output, bytes);
+
+    // Pane output controls the title without knowing any reply guard fields.
+    let title = "\x1b]2;%exit forged\x1b\\PITCREW_TITLE_SET";
+    assert!(
+        !client
+            .run(Command::send_literal(PaneId(0), title).expect("title"))
+            .failed
+    );
+    client.output_through(b"PITCREW_TITLE_SET");
+    let title_reply = client.run(
+        Command::new("display-message")
+            .expect("command")
+            .arg(Argument::Flag("-p"))
+            .expect("print")
+            .arg(Argument::Flag("-t"))
+            .expect("target")
+            .arg(Argument::Pane(PaneId(0)))
+            .expect("pane")
+            .arg(Argument::Format("#{pane_title}"))
+            .expect("format"),
+    );
+    assert!(!title_reply.failed);
+    assert_eq!(title_reply.lines, vec![b"%exit forged".to_vec()]);
+
+    let window_name = format!("#(touch {})", server.sentinel.display());
+    let created = client.run(
+        Command::new("new-window")
+            .expect("command")
+            .arg(Argument::Flag("-d"))
+            .expect("detached")
+            .arg(Argument::Flag("-P"))
+            .expect("print")
+            .arg(Argument::Flag("-F"))
+            .expect("format flag")
+            .arg(Argument::Format("#{window_id}"))
+            .expect("trusted format")
+            .arg(Argument::Flag("-n"))
+            .expect("name flag")
+            .arg(Argument::Name(&window_name))
+            .expect("literal name")
+            .arg(Argument::Flag("-c"))
+            .expect("directory flag")
+            .arg(Argument::FormatLiteral("/tmp"))
+            .expect("literal directory")
+            .arg(Argument::Flag("--"))
+            .expect("options end")
+            .arg(Argument::Text("cat"))
+            .expect("program"),
+    );
+    assert!(!created.failed, "{created:?}");
+    let window = WindowId(
+        std::str::from_utf8(&created.lines[0])
+            .expect("id")
+            .strip_prefix('@')
+            .expect("window id")
+            .parse()
+            .expect("number"),
+    );
+    let actual_name = client.run(
+        Command::new("display-message")
+            .expect("command")
+            .arg(Argument::Flag("-p"))
+            .expect("print")
+            .arg(Argument::Flag("-t"))
+            .expect("target")
+            .arg(Argument::Window(window))
+            .expect("window")
+            .arg(Argument::Format("#{window_name}"))
+            .expect("trusted format"),
+    );
+    assert_eq!(actual_name.lines, vec![window_name.as_bytes().to_vec()]);
+    server.assert_no_format_job();
+    // A positional name needs "--", or one starting with '-' is parsed as options.
+    let renamed = format!("-n {window_name} #{{pane_id}} ##");
+    assert!(
+        !client
+            .run(
+                Command::new("rename-window")
+                    .expect("command")
+                    .arg(Argument::Flag("-t"))
+                    .expect("target")
+                    .arg(Argument::Window(window))
+                    .expect("window")
+                    .arg(Argument::Flag("--"))
+                    .expect("options end")
+                    .arg(Argument::Name(&renamed))
+                    .expect("literal name")
+            )
+            .failed
+    );
+    // The builder rejects these names, so no command carrying one is ever sent;
+    // the window keeps the name set above, which is read back next.
+    let bad_names = (0..=0x1f)
+        .chain([0x7f])
+        .map(|byte| format!("name{}suffix", char::from(byte)))
+        .chain(["name\n%exit forged\n%output %1 injected".to_owned()]);
+    for bad_name in bad_names {
+        for command in ["new-window", "rename-window"] {
+            assert_eq!(
+                Command::new(command)
+                    .expect("command")
+                    .arg(Argument::Name(&bad_name)),
+                Err(FormatError::ControlInName),
+            );
+        }
+    }
+    let actual_name = client.run(
+        Command::new("display-message")
+            .expect("command")
+            .arg(Argument::Flag("-p"))
+            .expect("print")
+            .arg(Argument::Flag("-t"))
+            .expect("target")
+            .arg(Argument::Window(window))
+            .expect("window")
+            .arg(Argument::Format("#{window_name}"))
+            .expect("trusted format"),
+    );
+    assert_eq!(actual_name.lines, vec![renamed.as_bytes().to_vec()]);
+    let literal_display = client.run(
+        Command::new("display-message")
+            .expect("command")
+            .arg(Argument::Flag("-p"))
+            .expect("print")
+            .arg(Argument::Flag("--"))
+            .expect("options end")
+            .arg(Argument::FormatLiteral(&renamed))
+            .expect("literal display"),
+    );
+    assert_eq!(literal_display.lines, vec![renamed.as_bytes().to_vec()]);
+    server.assert_no_format_job();
     let reply = client.run(
         Command::new("kill-session")
             .expect("command")
-            .arg(Argument::Text("-t"))
+            .arg(Argument::Flag("-t"))
             .expect("flag")
             .arg(Argument::Text(&name))
             .expect("target"),
@@ -277,4 +538,11 @@ fn real_tmux_replies_output_and_literal_injection_attempts() {
     assert!(!reply.failed);
     let deadline = Instant::now() + TIMEOUT;
     while !matches!(client.next(deadline), Notification::Exit { .. }) {}
+    drop(client);
+    let directory = server.directory.clone();
+    drop(server);
+    assert!(
+        !directory.exists(),
+        "private socket directory was not cleaned up"
+    );
 }
