@@ -35,3 +35,29 @@ RAM and **30 GB of disk**).
   Never print or commit tokens.
 - **Agent homes:** tests always use temporary homes. Never point anything at a real `~/.claude`,
   `~/.codex` or OpenCode data folder, in the cloud or anywhere else.
+
+## Several briefs in one cloud session (main session plus subagents)
+
+When one cloud session is asked to run several briefs, it is the **main session**. Each brief runs as
+a **subagent**, and all of them share one VM. The main session:
+
+1. **Gives each brief a worktree and branch.** For each brief, from an up-to-date `main`:
+   `git worktree add ../wt-<short-name> -b <the brief's branch> origin/main`. A subagent works only in
+   its own worktree.
+2. **Shares one build cache.** Every subagent sets
+   `CARGO_TARGET_DIR=/root/.cache/pitcrew-target` (outside the worktrees). Dependencies are then built
+   once, and cargo's lock makes concurrent builds wait for each other instead of filling the disk.
+   Never give a subagent its own target directory.
+3. **Runs at most two subagents that build Rust at a time.** Briefs that only touch docs, Node or CI
+   files may run alongside. Check `df -h` before starting another, and keep at least 6 GB free. If disk
+   runs low, `cargo clean -p <crate>` for crates no running subagent needs, or wait for one to finish.
+4. **Tells each subagent:**
+   - to read this file, `docs/build/briefs/README.md` and its brief;
+   - to commit to its branch in its worktree;
+   - to push and open its own pull request with its report as the body;
+   - to stay in its brief's paths;
+   - to touch no other worktree.
+5. **Doesn't merge anything.** The integrator reviews and merges every pull request. The main session
+   reports the pull-request URLs, and what each subagent said it did not do.
+6. **Cleans up** each worktree (`git worktree remove`) after its pull request is open, so the next
+   brief has room.
