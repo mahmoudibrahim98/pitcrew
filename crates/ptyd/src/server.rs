@@ -847,7 +847,7 @@ mod tests {
     fn the_listener_is_ours_local_and_at_our_level() {
         use super::*;
         use pitcrew_runtime::pty::windows::{
-            Identity, current_identity, dacl_sddl, label_integrity, owner_sid,
+            Identity, PipeSecurity, current_identity, dacl_sddl, label_integrity, owner_sid,
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -872,10 +872,41 @@ mod tests {
             );
             // A second ptyd cannot take the name.
             assert!(Listener::bind(Path::new(&name)).is_err());
-            // Through the network redirector (as a remote client would come), it is refused.
-            let remote = format!(r"\\127.0.0.1\pipe\{short}");
-            let opened = tokio::net::windows::named_pipe::ClientOptions::new().open(&remote);
-            assert!(opened.is_err(), "a remote client was let in");
+            // Remote clients, compared with a control: two pipes of ours labelled low (so the
+            // label stops nobody), one made without the flag, one with the listener's options.
+            // Through the network redirector (as a remote client comes), the control must be
+            // reachable for the check to mean anything, and the listener's must not.
+            let open_remotely = |short: &str| {
+                tokio::net::windows::named_pipe::ClientOptions::new()
+                    .open(format!(r"\\127.0.0.1\pipe\{short}"))
+            };
+            let low = PipeSecurity::for_identity(&Identity {
+                user: me.user.clone(),
+                integrity: pitcrew_runtime::pty::windows::LOW_INTEGRITY,
+            })
+            .expect("descriptor");
+            let control = format!("{short}-control");
+            let mut plain = tokio::net::windows::named_pipe::ServerOptions::new();
+            plain.first_pipe_instance(true);
+            let _control = low
+                .create(&plain, &format!(r"\\.\pipe\{control}"))
+                .expect("control pipe");
+            match open_remotely(&control) {
+                Err(e) => eprintln!(
+                    "skipped the remote check: the control pipe cannot be reached through the \
+                     network redirector here: {e}"
+                ),
+                Ok(_) => {
+                    let guarded = format!("{short}-guarded");
+                    let _guarded = low
+                        .create(&Listener::options(true), &format!(r"\\.\pipe\{guarded}"))
+                        .expect("guarded pipe");
+                    assert!(
+                        open_remotely(&guarded).is_err(),
+                        "a remote client was let in"
+                    );
+                }
+            }
             // And a client of another integrity level is refused after its hello.
             let other = Identity {
                 user: me.user.clone(),

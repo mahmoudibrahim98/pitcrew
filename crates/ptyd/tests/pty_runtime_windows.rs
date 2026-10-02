@@ -483,17 +483,14 @@ fn a_ptyd_at_another_integrity_level_refuses_and_is_refused() {
         fx.finish();
         return;
     };
-    match reply {
-        Ok(Some(frame)) => {
-            let reply: Reply = serde_json::from_slice(&frame.header).expect("reply");
-            let why = reply
-                .err
-                .expect("a low ptyd served a medium client")
-                .message;
-            assert!(why.contains("integrity"), "{why}");
-        }
-        // Refused before the hello was read: refused all the same.
-        Ok(None) | Err(_) => {}
+    // No answer at all (refused before the hello was read) is a refusal too.
+    if let Ok(Some(frame)) = reply {
+        let reply: Reply = serde_json::from_slice(&frame.header).expect("reply");
+        let why = reply
+            .err
+            .expect("a low ptyd served a medium client")
+            .message;
+        assert!(why.contains("integrity"), "{why}");
     }
     // And the runtime refuses its pipe, labelled low, before sending anything.
     let client = fx.runtime();
