@@ -1,14 +1,20 @@
 //! Verbs and the hook over a real named pipe (Windows only).
+//!
+//! The pipe is the daemon's own listener (`pitcrew_api::NamedPipe`): its descriptor names the
+//! current user as the owner, which the CLI requires. A pipe created with the default descriptor
+//! is owned by the token's default owner instead, which for an elevated process (or on a machine
+//! whose policy says so) is the Administrators group, and the CLI rightly refuses it.
 
 #![cfg(windows)]
 #![allow(clippy::unwrap_used)]
 
 mod common;
 
+use axum::serve::Listener as _;
 use common::*;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use tokio::net::windows::named_pipe::NamedPipeServer;
 
 /// Serves `handler` on a new pipe from a background thread. Returns the pipe's name and the
 /// requests it receives.
@@ -24,21 +30,14 @@ fn serve_pipe(handler: Handler) -> (String, Arc<Mutex<Vec<Recorded>>>) {
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
+            .enable_time()
             .build()
             .unwrap();
         runtime.block_on(async move {
-            let mut server = ServerOptions::new()
-                .first_pipe_instance(true)
-                .create(&pipe)
-                .unwrap();
+            let mut listener = pitcrew_api::NamedPipe::bind(&pipe).unwrap();
             ready.send(()).unwrap();
             loop {
-                let connected = server.connect().await;
-                let next = ServerOptions::new().create(&pipe).unwrap();
-                let mut conn = std::mem::replace(&mut server, next);
-                if connected.is_err() {
-                    continue;
-                }
+                let (mut conn, _) = listener.accept().await;
                 let Some(request) = read_request(&mut conn).await else {
                     continue;
                 };
@@ -106,7 +105,9 @@ fn a_missing_pipe_is_unavailable() {
 #[test]
 fn the_hook_delivers_over_a_named_pipe() {
     let (pipe, requests) = serve_pipe(Arc::new(|_| (202, String::new())));
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pitcrew"))
+    let home = tempfile::tempdir().unwrap();
+    let mut command = pitcrew_command(&home.path().join("home"));
+    command
         .args(["hook", "claude", "Stop"])
         .env_remove("PITCREW_URL")
         .env_remove("PITCREW_TOKEN_FILE")
@@ -114,9 +115,8 @@ fn the_hook_delivers_over_a_named_pipe() {
         .env("PITCREW_TOKEN", TOKEN)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(std::process::Stdio::piped());
+    let mut child = checked(&mut command).spawn().unwrap();
     {
         use std::io::Write as _;
         child.stdin.take().unwrap().write_all(b"{\"a\":1}").unwrap();

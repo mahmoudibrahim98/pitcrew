@@ -38,10 +38,63 @@ pub use open::{FileKind, NotRegularFile, refusal};
 /// The protocol version this crate was built against.
 pub const PROTOCOL_VERSION: u32 = pitcrew_protocol::PROTOCOL_VERSION;
 
-/// The user's home folder: `HOME`, else `USERPROFILE`.
+/// The user's home folder, where the agents keep theirs (see [`home_from`]).
 fn user_home() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .filter(|d| !d.is_empty())
+    home_from(|name| std::env::var_os(name))
+}
+
+/// The home folder `var` names. On Windows `USERPROFILE`, else `HOME`: the agents find their homes
+/// there (Claude Code's and OpenCode's `os.homedir()` read `USERPROFILE`, Codex asks Windows for
+/// the profile), and a `HOME` set for Git or another Unix tool can name another folder. Elsewhere
+/// `HOME`, else `USERPROFILE`. An empty variable counts as unset.
+fn home_from(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+    let (first, second) = if cfg!(windows) {
+        ("USERPROFILE", "HOME")
+    } else {
+        ("HOME", "USERPROFILE")
+    };
+    let set = |name| var(name).filter(|d| !d.is_empty());
+    set(first)
+        .or_else(|| set(second))
         .map(std::path::PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    fn home(pairs: &[(&str, &str)]) -> Option<PathBuf> {
+        let env: HashMap<&str, OsString> = pairs.iter().map(|(k, v)| (*k, v.into())).collect();
+        super::home_from(|name| env.get(name).cloned())
+    }
+
+    #[test]
+    fn the_home_is_the_platforms_own_variable_first() {
+        let both = [("HOME", "/h/unix"), ("USERPROFILE", "/h/profile")];
+        let first = if cfg!(windows) {
+            "/h/profile"
+        } else {
+            "/h/unix"
+        };
+        assert_eq!(home(&both), Some(PathBuf::from(first)));
+        assert_eq!(home(&[("HOME", "/h/unix")]), Some(PathBuf::from("/h/unix")));
+        assert_eq!(
+            home(&[("USERPROFILE", "/h/profile")]),
+            Some(PathBuf::from("/h/profile"))
+        );
+        // An empty variable is unset.
+        let (empty, other, fallback) = if cfg!(windows) {
+            ("USERPROFILE", "HOME", "/h/unix")
+        } else {
+            ("HOME", "USERPROFILE", "/h/profile")
+        };
+        assert_eq!(
+            home(&[(empty, ""), (other, fallback)]),
+            Some(PathBuf::from(fallback))
+        );
+        assert_eq!(home(&[(empty, "")]), None);
+        assert_eq!(home(&[]), None);
+    }
 }

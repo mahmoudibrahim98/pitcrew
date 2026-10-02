@@ -662,7 +662,7 @@ impl Oracle {
                 line: block_line(b, &self.names),
             })
             .collect();
-        out.sort_by(|a, b| b.block.id.cmp(&a.block.id));
+        out.sort_by_key(|b| std::cmp::Reverse(b.block.id));
         out
     }
 

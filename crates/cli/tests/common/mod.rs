@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::path::Path;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 pub const TOKEN: &str = "pca_test-token";
@@ -296,6 +298,23 @@ pub fn reply_bytes(status: u16, body: &str) -> Vec<u8> {
         body.len()
     )
     .into_bytes()
+}
+
+/// `pitcrew`, the binary under test, with `home` (a temporary folder of the test's; it need not
+/// exist) as its home folder on every platform: the hook (`--chain`) and `hooks install` look for
+/// the agents' homes, which must never be the real ones (`pitcrew_fixtures::homes`). Start it with
+/// [`checked`] once every variable is set.
+pub fn pitcrew_command(home: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pitcrew"));
+    pitcrew_fixtures::homes::private_home(&mut command, home);
+    command
+}
+
+/// `command`, once `pitcrew_fixtures::homes::check_private_home` has found that it can reach no
+/// real home: call it last, just before starting the command.
+pub fn checked(command: &mut Command) -> &mut Command {
+    pitcrew_fixtures::homes::check_private_home(command);
+    command
 }
 
 /// A URL where nothing listens.

@@ -14,7 +14,7 @@
 mod common;
 
 use common::*;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 const RUNS: usize = 200;
@@ -28,7 +28,7 @@ fn time_runs(env: &[(String, String)]) -> Vec<Duration> {
     std::fs::write(&payload, PAYLOAD).unwrap();
     let mut times = Vec::with_capacity(RUNS);
     for _ in 0..RUNS {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_pitcrew"));
+        let mut cmd = pitcrew_command(&tmp.path().join("home"));
         cmd.args(["hook", "claude", "Stop"]);
         for var in [
             "PITCREW_SOCKET",
@@ -43,6 +43,7 @@ fn time_runs(env: &[(String, String)]) -> Vec<Duration> {
             .stdin(std::fs::File::open(&payload).unwrap())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        checked(&mut cmd);
         let started = Instant::now();
         let status = cmd.status().unwrap();
         times.push(started.elapsed());

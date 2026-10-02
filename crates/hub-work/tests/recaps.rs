@@ -41,7 +41,7 @@ fn demo_directory(ws: &DemoWorkspace) -> Directory {
 /// The fixture's blocks newest first, as `GET /v1/recaps/blocks` serves them.
 fn fixture_blocks() -> Vec<RecapBlock> {
     let mut blocks = demo_recaps().expect("demo-recaps.json parses").blocks;
-    blocks.sort_by(|a, b| b.block.id.cmp(&a.block.id));
+    blocks.sort_by_key(|b| std::cmp::Reverse(b.block.id));
     blocks
 }
 

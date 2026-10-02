@@ -19,8 +19,10 @@ The token is sent only after the server passes an identity check (`pitcrew_api::
 
 - **Unix socket:** the directory is ours and 0700 and the socket is ours (before connecting),
   and on Linux the peer runs as us (`SO_PEERCRED`, after).
-- **Named pipe:** opened at identification-level impersonation, and the pipe's owner SID matches
-  the current user (or our token's default owner, if elevated).
+- **Named pipe:** opened at identification-level impersonation, and the pipe's owner SID is
+  exactly the current user's. The daemon names the current user as its pipe's owner, elevated or
+  not; a pipe created with the default descriptor is owned by the token's default owner, which for
+  an elevated process (or by policy) is the Administrators group, and is refused.
 - **Loopback TCP:** no check is possible, which is why it is for development only.
 
 Verbs check `GET /v1/host/info` (without the token) first and refuse a daemon whose protocol
@@ -73,6 +75,12 @@ to `/v1/hooks/{engine}/{event}`.
 
 The hook **always exits 0 and prints nothing**, even if it panics, and gives up after 500 ms
 whatever the daemon does. Global flags before it (`pitcrew --json hook …`) keep it on this path. Set `PITCREW_HOOK_DEBUG=1` to see on stderr why an event was not delivered.
+
+`pitcrew hooks install` writes Claude Code's hooks as `<pitcrew> hook claude <Event>`. Claude Code
+runs that with a shell: `bash`, which on Windows is Git Bash, or PowerShell on a Windows machine
+without Git Bash. The path is quoted for POSIX `sh`, only if needed, and on Windows its `\` become
+`/` first, so a plain path (`C:/Users/sam/.local/bin/pitcrew.exe`) runs unquoted in both shells; a
+path with a blank is single-quoted, for Git Bash.
 
 Its wall time (release build, spawn to exit, 200 runs) is measured by:
 

@@ -12,6 +12,14 @@ use std::time::{Duration, Instant, SystemTime};
 const BASE_MS: i64 = 1_767_225_600_000;
 const DAY_MS: i64 = 86_400_000;
 
+/// `root` joined with each `/`-separated part of `relative`: a real path on every platform, as the
+/// CLIs write their `cwd`s (`C:\…\work\proj-a` on Windows, not `C:\…\work/proj-a`).
+fn under(root: &Path, relative: &str) -> PathBuf {
+    relative
+        .split('/')
+        .fold(root.to_path_buf(), |path, part| path.join(part))
+}
+
 fn claude_line(session_id: &str, cwd: &str, branch: &str, ts: &str, sidechain: bool) -> String {
     let mut v = json!({
         "type": "user", "sessionId": session_id, "cwd": cwd, "gitBranch": branch,
@@ -45,7 +53,7 @@ fn write_line(path: &Path, line: &str, mtime_ms: i64) {
 fn claude_home(root: &Path) -> PathBuf {
     let home = root.join("claude-home");
     let proj = home.join("projects").join("enc-a");
-    let proj_a = format!("{}", root.join("work/proj-a").display());
+    let proj_a = format!("{}", under(root, "work/proj-a").display());
     let recent = BASE_MS + 5 * DAY_MS;
     write_line(
         &proj.join("s1.jsonl"),
@@ -66,7 +74,7 @@ fn claude_home(root: &Path) -> PathBuf {
         &proj.join("s3.jsonl"),
         &claude_line(
             "s3",
-            &format!("{}", root.join("work/proj-a/apps/web").display()),
+            &format!("{}", under(root, "work/proj-a/apps/web").display()),
             "main",
             "2026-01-03T00:00:00Z",
             false,
@@ -77,14 +85,14 @@ fn claude_home(root: &Path) -> PathBuf {
         &proj.join("s4.jsonl"),
         &claude_line(
             "s4",
-            &format!("{}", root.join("work/notes/x").display()),
+            &format!("{}", under(root, "work/notes/x").display()),
             "",
             "2026-01-04T00:00:00Z",
             false,
         ),
         BASE_MS - 100 * DAY_MS, // old: outside the 90-day window
     );
-    fs::create_dir_all(root.join("work/proj-a/.git")).expect("git dir");
+    fs::create_dir_all(under(root, "work/proj-a/.git")).expect("git dir");
     home
 }
 
@@ -104,19 +112,19 @@ fn codex_line(id: &str, cwd: &str, branch: &str, ts: &str, subagent: bool) -> St
 /// A Codex home with one recent session in a git-rooted `proj-b`.
 fn codex_home(root: &Path) -> PathBuf {
     let home = root.join("codex-home");
-    let path = home.join("sessions/2026/01/05/rollout-test-1.jsonl");
+    let path = under(&home, "sessions/2026/01/05/rollout-test-1.jsonl");
     write_line(
         &path,
         &codex_line(
             "codex-1",
-            &format!("{}", root.join("work/proj-b").display()),
+            &format!("{}", under(root, "work/proj-b").display()),
             "master",
             "2026-01-05T00:00:00Z",
             false,
         ),
         BASE_MS + 5 * DAY_MS,
     );
-    fs::create_dir_all(root.join("work/proj-b/.git")).expect("git dir");
+    fs::create_dir_all(under(root, "work/proj-b/.git")).expect("git dir");
     home
 }
 
@@ -136,7 +144,7 @@ fn opencode_home(root: &Path) -> PathBuf {
          );",
     )
     .expect("schema");
-    let y = root.join("work/notes/y");
+    let y = under(root, "work/notes/y");
     let recent = BASE_MS + 5 * DAY_MS;
     conn.execute(
         "INSERT INTO session (id, project_id, parent_id, directory, title, version, time_created, time_updated)
@@ -154,11 +162,14 @@ fn opencode_home(root: &Path) -> PathBuf {
     home
 }
 
-/// Strips `needle` out of every string in `value`, for snapshots that must not carry a tempdir's
-/// non-deterministic path.
+/// Replaces `needle` with `<ROOT>` in every string in `value`, for snapshots that must not carry a
+/// tempdir's non-deterministic path. Those strings are paths under it, whose separators become `/`,
+/// so one snapshot serves every platform.
 fn redact(value: &mut Value, needle: &str) {
     match value {
-        Value::String(s) if s.contains(needle) => *s = s.replace(needle, "<ROOT>"),
+        Value::String(s) if s.contains(needle) => {
+            *s = s.replace(needle, "<ROOT>").replace('\\', "/");
+        }
         Value::Array(a) => a.iter_mut().for_each(|v| redact(v, needle)),
         Value::Object(o) => o.values_mut().for_each(|v| redact(v, needle)),
         _ => {}

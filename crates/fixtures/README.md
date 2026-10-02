@@ -10,6 +10,17 @@ Shared, **synthetic** test data. Every stream builds against it, and the mock hu
 | `data/transcripts/codex/rollout-demo.jsonl` | A Codex rollout: `session_meta`, `turn_context`, plan (`update_plan`), shell calls, `apply_patch`, agent message, token count, task complete. |
 | `data/transcripts/opencode/schema.sql`, `seed.sql` | An approximation of an OpenCode SQLite store, with one session. |
 
+## A home of the test's own
+
+`homes::private_home` gives a program a test starts (`pitcrewd`, `pitcrew`) a home folder of the
+test's own: `HOME`, `USERPROFILE`, `APPDATA` and `LOCALAPPDATA` point inside it, and the variables
+that send a lookup elsewhere (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`,
+`XDG_CONFIG_HOME`, `OPENCODE_CONFIG_DIR`, `HOMEDRIVE`, `HOMEPATH`) are removed. On Windows a home
+lookup reads `USERPROFILE` (Windows' own known-folder lookup expands it too), not only `HOME`.
+`homes::check_private_home`, called just before the program starts, panics if any of them is
+inherited, removed where it must be set, or outside the temporary folder. Every harness that starts
+one of our programs calls both.
+
 The transcript shapes follow the CLIs' formats as of late 2026, from public documentation and
 observation. They are **approximations**: stream A checks them against real files and corrects
 them through a contract change (`s/0/contract-…`).

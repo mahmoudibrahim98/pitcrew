@@ -521,6 +521,11 @@ mod tests {
             .find_map(|w| w[1].strip_prefix(&format!("{name}=")))
     }
 
+    /// Unix only: a link with a control socket (`ControlMaster`), and a node link through the
+    /// login's master, exist only where ssh has connection reuse. Windows' OpenSSH has none:
+    /// there the supervisor starts every link without a master, and a node link jumps through the
+    /// login (`-J`), which the next test checks on every platform.
+    #[cfg(unix)]
     #[test]
     fn links_keep_forwarding_off_and_notice_loss() {
         let ssh = Ssh::new("ssh");
@@ -599,22 +604,57 @@ mod tests {
                  hpc-login"
             )
         );
-        // Windows: ssh's own jump.
+    }
+
+    /// Without a master (always on Windows): no control socket, readiness from the log's
+    /// "Authenticated to", forwarding still off, and a node reached with ssh's own jump.
+    #[test]
+    fn without_a_master_a_node_link_jumps_through_the_login() {
+        let ssh = Ssh::new("ssh");
+        // A runtime directory in the platform's form (made up; nothing is created).
+        let dir = if cfg!(windows) {
+            PathBuf::from(r"C:\Temp\pitcrew-ssh\t0123abcd")
+        } else {
+            PathBuf::from("/run/user/1000/pitcrew-ssh/t0123abcd")
+        };
+        let log = dir.join("log-3");
         let args = link_args(
             &LinkSpec {
                 master: false,
-                ..spec(&ssh, dir, Some(Via::Jump("hpc-login")))
+                ..spec(&ssh, &dir, Some(Via::Jump("hpc-login")))
             },
-            &dir.join("log-3"),
+            &log,
             None,
             false,
         )
         .unwrap();
+        assert_eq!(args[..4], ["-N", "-T", "-E", log.to_str().unwrap()]);
+        for (name, value) in [
+            ("LogLevel", "VERBOSE"),
+            ("ForwardAgent", "no"),
+            ("ForwardX11", "no"),
+            ("PermitLocalCommand", "no"),
+            ("ClearAllForwardings", "yes"),
+            ("RemoteCommand", "none"),
+            ("CanonicalizeHostname", "no"),
+        ] {
+            assert_eq!(option(&args, name), Some(value), "{name}");
+        }
+        for name in [
+            "ControlMaster",
+            "ControlPath",
+            "ControlPersist",
+            "ProxyCommand",
+        ] {
+            assert_eq!(option(&args, name), None, "{name}");
+        }
         let at = args.iter().position(|a| a == "-J").unwrap();
         assert_eq!(args[at + 1], "hpc-login");
-        assert_eq!(option(&args, "ControlMaster"), None);
+        assert_eq!(args[args.len() - 2..], ["--", "hpc-login"]);
     }
 
+    /// Unix only, as a node link through the login's master is (see above).
+    #[cfg(unix)]
     #[test]
     fn the_proxy_command_quotes_for_sh_and_escapes_for_ssh() {
         let command = proxy_through(

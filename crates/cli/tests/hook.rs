@@ -8,7 +8,7 @@ mod common;
 use common::*;
 use serde_json::json;
 use std::io::Write as _;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::{Duration, Instant};
 
 const PAYLOAD: &str = r#"{"session_id":"00000000-0000-4000-8000-000000000000","hook_event_name":"Stop","cwd":"/work/example"}"#;
@@ -21,9 +21,10 @@ fn hook(args: &[&str], env: &[(&str, &str)], stdin: Option<&[u8]>) -> (Output, D
     pitcrew(&all, env, stdin)
 }
 
-/// Runs `pitcrew <args>` with only `env` among the `PITCREW_*` variables.
+/// Runs `pitcrew <args>` with only `env` among the `PITCREW_*` variables, and a home of its own.
 fn pitcrew(args: &[&str], env: &[(&str, &str)], stdin: Option<&[u8]>) -> (Output, Duration) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_pitcrew"));
+    let home = tempfile::tempdir().unwrap();
+    let mut cmd = pitcrew_command(&home.path().join("home"));
     cmd.args(args);
     for var in [
         "PITCREW_SOCKET",
@@ -45,6 +46,7 @@ fn pitcrew(args: &[&str], env: &[(&str, &str)], stdin: Option<&[u8]>) -> (Output
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    checked(&mut cmd);
     let started = Instant::now();
     let mut child = cmd.spawn().unwrap();
     if let Some(bytes) = stdin {

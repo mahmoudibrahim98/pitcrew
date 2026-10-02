@@ -948,7 +948,8 @@ fn build_workstreams(
         .map(|(folder, sess)| {
             let (recent_30d, recent_90d) = recency_counts(&sess, now);
             WorkstreamSuggestion {
-                id: format!("{root_label}/{folder}"),
+                // The folder's own path, with this platform's separator.
+                id: root.join(&folder).to_string_lossy().into_owned(),
                 name: folder,
                 branch: None,
                 session_count: sess.len(),

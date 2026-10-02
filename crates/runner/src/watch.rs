@@ -479,7 +479,7 @@ impl Watcher {
     /// first), then discovers.
     fn start(&mut self) -> Result<(), Hangup> {
         let mut rows = std::mem::take(&mut self.rows);
-        rows.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+        rows.sort_by_key(|row| std::cmp::Reverse(row.mtime));
         for mut row in rows {
             if self.shared.stopping() {
                 return Err(Hangup);
@@ -761,7 +761,7 @@ impl Watcher {
             }
         }
         // Newest first: live sessions are indexed before a backlog of old ones.
-        found.sort_by(|a, b| b.0.cmp(&a.0));
+        found.sort_by_key(|f| std::cmp::Reverse(f.0));
         for (_, h, raw, tref, canonical) in found {
             self.serve_due()?;
             self.add(h, raw, tref, canonical)?;
