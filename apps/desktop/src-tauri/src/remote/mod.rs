@@ -86,8 +86,9 @@ const READ_TOKEN: &str =
 /// How the app reaches remote machines.
 #[derive(Clone)]
 pub struct RemoteOptions {
-    /// The ssh program: `ssh` on `PATH` unless the settings name one.
-    pub ssh: PathBuf,
+    /// The ssh program: `ssh` on `PATH` unless the settings name one; or why the configured one
+    /// is not used.
+    pub ssh: Result<PathBuf, String>,
     /// `pitcrew-askpass`, or why it is missing.
     pub askpass: Result<PathBuf, String>,
     /// The helper binaries.
@@ -129,7 +130,11 @@ impl fmt::Debug for RemoteOptions {
 impl RemoteOptions {
     /// The defaults, with these programs and helpers.
     #[must_use]
-    pub fn new(ssh: PathBuf, askpass: Result<PathBuf, String>, helpers: Helpers) -> Self {
+    pub fn new(
+        ssh: Result<PathBuf, String>,
+        askpass: Result<PathBuf, String>,
+        helpers: Helpers,
+    ) -> Self {
         Self {
             ssh,
             askpass,
@@ -1067,12 +1072,17 @@ impl Remotes {
     /// The ssh every remote call uses: the person's OpenSSH, with only the environment it needs,
     /// and prompts through `pitcrew-askpass` to the hub.
     fn ssh(&self) -> Result<Ssh, GatewayError> {
+        let program = self
+            .options
+            .ssh
+            .clone()
+            .map_err(|why| GatewayError::internal(tidy(&why)))?;
         let askpass = self
             .options
             .askpass
             .clone()
             .map_err(|why| GatewayError::internal(tidy(&why)))?;
-        let mut ssh = Ssh::new(&self.options.ssh)
+        let mut ssh = Ssh::new(program)
             .with_env_passthrough(Vec::<String>::new())
             .with_prompts(askpass, Arc::clone(&self.prompts) as Arc<dyn PromptHandler>);
         if let Some(dir) = &self.options.runtime_dir {

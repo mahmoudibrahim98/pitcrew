@@ -243,7 +243,7 @@ mod unix {
         let asker = app.handle().clone();
         let prompts = Arc::new(PromptHub::new(move |e| app::emit_prompt(&asker, e)));
         let mut options = RemoteOptions::new(
-            machine.ssh.clone(),
+            Ok(machine.ssh.clone()),
             Ok(machine.askpass.clone()),
             Helpers::in_dir(machine.helpers.clone()),
         );

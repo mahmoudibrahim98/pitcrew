@@ -190,10 +190,13 @@ pub fn emit_prompt<R: Runtime>(app: &AppHandle<R>, event: &PromptEvent) {
     }
 }
 
-/// The remote workspaces' options from the settings: the ssh to use, `pitcrew-askpass` next to
-/// the app (or as set), and the helpers installed with it (`helpers/` beside the program or in
-/// the app's resources) or as set.
-fn remote_options(
+/// The remote workspaces' options from the settings: the ssh to use (`ssh` on `PATH`, or a
+/// configured one that passes the same checks as `pitcrewd`), `pitcrew-askpass` next to the app
+/// (or as set), and the helpers installed with it (`helpers/` beside the program or in the app's
+/// resources) or as set. Either way the helpers' checksums are the ones compiled into the app
+/// ([`Helpers::new`]).
+#[must_use]
+pub fn remote_options(
     settings: &Settings,
     beside: Option<&std::path::Path>,
     resources: Option<&std::path::Path>,
@@ -203,7 +206,7 @@ fn remote_options(
         tracing::warn!(error = %e, "remote machines cannot ask for passwords");
     }
     let helpers = match &settings.helpers {
-        Some(dir) => Helpers::in_dir(dir.clone()),
+        Some(dir) => Helpers::new(vec![dir.clone()]),
         None => Helpers::new(
             [resources, beside]
                 .into_iter()
@@ -212,14 +215,16 @@ fn remote_options(
                 .collect(),
         ),
     };
-    RemoteOptions::new(
-        settings
-            .ssh
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from("ssh")),
-        askpass,
-        helpers,
-    )
+    let ssh = match &settings.ssh {
+        None => Ok(std::path::PathBuf::from("ssh")),
+        Some(path) => locate::check_trusted(path)
+            .map(|()| path.clone())
+            .map_err(|why| format!("not running the configured ssh, {}: {why}", path.display())),
+    };
+    if let Err(e) = &ssh {
+        tracing::warn!(error = %e, "remote machines cannot be reached");
+    }
+    RemoteOptions::new(ssh, askpass, helpers)
 }
 
 /// The supervisor, kept to stop the daemon when the app quits.
@@ -413,6 +418,36 @@ fn shutdown<R: Runtime>(app: &AppHandle<R>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A configured ssh is checked like `pitcrewd`: one others could write is not run.
+    #[cfg(unix)]
+    #[test]
+    fn a_configured_ssh_others_can_write_is_not_used() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("bin");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ssh = dir.join("ssh");
+        std::fs::write(&ssh, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let settings = Settings {
+            ssh: Some(ssh.clone()),
+            ..Settings::default()
+        };
+        assert_eq!(remote_options(&settings, None, None).ssh, Ok(ssh.clone()));
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let refused = remote_options(&settings, None, None).ssh.unwrap_err();
+        assert!(
+            refused.contains("not running the configured ssh"),
+            "{refused}"
+        );
+        // Without a setting, ssh comes from PATH, as the person runs it.
+        assert_eq!(
+            remote_options(&Settings::default(), None, None).ssh,
+            Ok(std::path::PathBuf::from("ssh"))
+        );
+    }
 
     #[test]
     fn only_the_apps_own_origin_is_allowed() {

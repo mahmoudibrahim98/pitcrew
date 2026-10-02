@@ -11,12 +11,15 @@
 //! helpers/manifest.json    { "version": "0.4.0", "sha256": { "pitcrewd-x86_64-unknown-linux-musl": "…", … } }
 //! ```
 //!
-//! A release build may carry the manifest compiled in (`PITCREW_HELPERS_MANIFEST`, its JSON, set
-//! when the app is built): the sha256 is then the app's own, as ADR-0009 says, and
-//! `manifest.json` is not read. Either way the bytes are checked against it before anything is
-//! sent ([`Helper::new`]), and again on the machine ([`pitcrew_remote::deploy`]). On Unix the
-//! manifest and the helper must belong to root or the person and be writable by no one else,
-//! as for `pitcrewd` ([`crate::daemon::locate`]).
+//! **The checksums are the app's own** (ADR-0009): the manifest's JSON is compiled in when the
+//! app is built (`PITCREW_HELPERS_MANIFEST`). A **release build** uses only that one: without it,
+//! planning fails ("this build has no helper checksums"), and `manifest.json` is never trusted,
+//! also when the helpers' folder is set in the settings (the compiled checksums still apply).
+//! Only a **debug build** without compiled checksums reads `manifest.json` beside the helpers
+//! (development). Either way the bytes are checked against the checksum before anything is sent
+//! ([`Helper::new`]), and again on the machine ([`pitcrew_remote::deploy`]). On Unix the helper
+//! (and a `manifest.json` read) must belong to root or the person and be writable by no one
+//! else, as for `pitcrewd` ([`crate::daemon::locate`]).
 
 use crate::daemon::locate::{self, LocateError};
 use pitcrew_remote::helper::{MAX_HELPER_SIZE, validate_version};
@@ -52,11 +55,13 @@ pub struct Manifest {
     pub sha256: BTreeMap<String, String>,
 }
 
-/// Where the helpers are.
+/// Where the helpers are, and where their checksums come from.
 #[derive(Clone, Debug)]
 pub struct Helpers {
     dirs: Vec<PathBuf>,
     compiled: Option<&'static str>,
+    /// Whether `manifest.json` may stand in for compiled checksums (debug builds only).
+    file_manifest: bool,
 }
 
 /// A helper found for a platform: not read yet.
@@ -73,22 +78,25 @@ pub struct HelperRef {
 }
 
 impl Helpers {
-    /// The helpers in the first of `dirs` that exists, with the manifest compiled into the app
-    /// if there is one.
+    /// The helpers in the first of `dirs` that exists (the installed folder, or the one the
+    /// settings name), with the checksums compiled into the app; a debug build without them
+    /// reads `manifest.json`.
     #[must_use]
     pub fn new(dirs: Vec<PathBuf>) -> Self {
-        Self {
-            dirs,
-            compiled: COMPILED,
-        }
+        Self::with(dirs, COMPILED, cfg!(debug_assertions))
     }
 
-    /// The helpers in `dir`, with its `manifest.json` (development, tests).
+    /// The helpers in `dir`, with its `manifest.json` (tests; a release build still refuses it).
     #[must_use]
     pub fn in_dir(dir: PathBuf) -> Self {
+        Self::with(vec![dir], None, cfg!(debug_assertions))
+    }
+
+    fn with(dirs: Vec<PathBuf>, compiled: Option<&'static str>, file_manifest: bool) -> Self {
         Self {
-            dirs: vec![dir],
-            compiled: None,
+            dirs,
+            compiled,
+            file_manifest,
         }
     }
 
@@ -114,7 +122,12 @@ impl Helpers {
         let manifest = match self.compiled {
             Some(text) => serde_json::from_str::<Manifest>(text)
                 .map_err(|e| format!("the helper manifest built into the app is not valid: {e}"))?,
-            None => read_manifest(&dir.join(MANIFEST))?,
+            None if self.file_manifest => read_manifest(&dir.join(MANIFEST))?,
+            None => {
+                return Err("this build has no helper checksums (it was built without \
+                     PITCREW_HELPERS_MANIFEST), so it deploys no helper"
+                    .to_owned());
+            }
         };
         validate_version(&manifest.version).map_err(|e| e.to_string())?;
         let sha256 = manifest.sha256.get(artefact).ok_or_else(|| {
@@ -255,6 +268,44 @@ mod tests {
             .find(Platform::LinuxX86_64)
             .unwrap_err();
         assert!(e.contains("no helpers folder"), "{e}");
+    }
+
+    /// A release build: only checksums compiled into the app count, wherever the folder is.
+    #[test]
+    fn a_release_build_trusts_only_compiled_checksums() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("helpers");
+        std::fs::create_dir(&dir).unwrap();
+        private(&dir);
+        let artefact = Platform::LinuxX86_64.artefact();
+        let bytes = b"the real helper";
+        std::fs::write(dir.join(artefact), bytes).unwrap();
+        // A manifest.json someone wrote beside it, matching the file.
+        let planted =
+            serde_json::json!({ "version": "9.9.9", "sha256": { artefact: hex_sha256(bytes) } });
+        std::fs::write(dir.join(MANIFEST), planted.to_string()).unwrap();
+
+        // No checksums compiled in: refused, manifest.json or not.
+        let e = Helpers::with(vec![dir.clone()], None, false)
+            .find(Platform::LinuxX86_64)
+            .unwrap_err();
+        assert!(e.contains("this build has no helper checksums"), "{e}");
+
+        // Compiled checksums apply to an overridden folder too, and manifest.json is ignored: a
+        // file that does not match them is refused before anything is sent.
+        let compiled: &'static str = Box::leak(
+            serde_json::json!({ "version": "1.2.3", "sha256": { artefact: hex_sha256(b"what the app was built with") } })
+                .to_string()
+                .into_boxed_str(),
+        );
+        let found = Helpers::with(vec![dir], Some(compiled), false)
+            .find(Platform::LinuxX86_64)
+            .unwrap();
+        assert_eq!(found.version, "1.2.3", "not the planted manifest's");
+        assert!(matches!(
+            Helpers::load(&found),
+            Err(HelperError::LocalHashMismatch)
+        ));
     }
 
     #[cfg(unix)]
