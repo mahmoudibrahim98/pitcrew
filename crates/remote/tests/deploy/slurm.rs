@@ -855,7 +855,7 @@ fn usr_signals() -> u64 {
 }
 
 /// The signals `pid` ignores: `/proc/<pid>/status`'s `SigIgn` where there is a /proc (Linux),
-/// else `ps -o sigignore=` (macOS), both a hexadecimal mask.
+/// else `ps -o sigignore=` (macOS), both a hexadecimal mask (`ps` may write it with `0x`).
 fn ignored_signals(pid: u32) -> u64 {
     let mask = match std::fs::read_to_string(format!("/proc/{pid}/status")) {
         Ok(status) => status
@@ -872,7 +872,8 @@ fn ignored_signals(pid: u32) -> u64 {
             String::from_utf8(out.stdout).unwrap().trim().to_owned()
         }
     };
-    u64::from_str_radix(&mask, 16).unwrap()
+    let hex = mask.strip_prefix("0x").unwrap_or(&mask);
+    u64::from_str_radix(hex, 16).unwrap_or_else(|e| panic!("the ignored signals {mask:?}: {e}"))
 }
 
 /// Sends SIGUSR1 and SIGUSR2 to `pid`, as `sbatch --signal=B:…` would to the batch shell, and

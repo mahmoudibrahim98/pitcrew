@@ -388,13 +388,9 @@ mod unix {
                 ExitCode::SUCCESS
             }
             (_, Some(socket)) => {
-                // Its umask, for the test that it is the user's and not the script's.
-                let umask = std::fs::read_to_string("/proc/self/status")
-                    .unwrap_or_default()
-                    .lines()
-                    .find_map(|l| l.strip_prefix("Umask:").map(|v| v.trim().to_owned()))
-                    .unwrap_or_default();
-                println!("fake pitcrewd umask {umask}");
+                // Its umask, for the test that it is the user's and not the script's. Read
+                // before any thread starts, so setting it back at once races nothing.
+                println!("fake pitcrewd umask {}", own_umask());
                 let _ = std::fs::remove_file(&socket);
                 let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
                 println!("fake pitcrewd listening");
@@ -1203,7 +1199,9 @@ mod unix {
         };
         let err = block_on(deploy(&m.plain(), &helper("4.0.0"), &impatient)).unwrap_err();
         assert!(matches!(&err, HelperError::Busy(_)), "{err:?}");
-        assert!(err.to_string().contains(&uname_n()), "{err}");
+        // The holder by name, as the script writes it (at most 40 characters: CI's macOS hosts
+        // have longer ones).
+        assert!(err.to_string().contains(&this_name()), "{err}");
         a.join().unwrap().unwrap();
         assert_eq!(m.link("current").as_deref(), Some("3.0.0"));
         assert_eq!(m.link("previous").as_deref(), Some("2.0.0"));
@@ -2286,10 +2284,13 @@ mod unix {
             assert!(!m.run_dir().join(gone).exists(), "{gone}");
         }
         // The log: the version's own binary was started, not `current`, with the umask the
-        // user's session had rather than the script's 077. It stays private itself.
+        // user's session had rather than the script's 077. It stays private itself. macOS hands
+        // the script the full path it was started by, from the root's physical path.
         let log = std::fs::read_to_string(m.run_dir().join("pitcrewd.log")).unwrap();
+        let full = m.root().canonicalize().unwrap().join("bin/1.0.0/pitcrewd");
         assert!(
-            log.contains("pitcrewd script: bin/1.0.0/pitcrewd\n"),
+            log.contains("pitcrewd script: bin/1.0.0/pitcrewd\n")
+                || log.contains(&format!("pitcrewd script: {}\n", full.display())),
             "{log}"
         );
         assert!(
