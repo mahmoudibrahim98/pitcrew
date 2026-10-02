@@ -226,6 +226,14 @@ pub fn config(home: &Path, state: &Path) -> RunnerConfig {
     c
 }
 
+/// Puts a whole file at `path` at once: written beside it under a name no adapter discovers,
+/// then renamed into place, so a discovery never sees it half written.
+pub fn place(path: &Path, bytes: &[u8]) {
+    let part = path.with_extension("part");
+    std::fs::write(&part, bytes).unwrap();
+    std::fs::rename(&part, path).unwrap();
+}
+
 pub fn append(path: &Path, bytes: &[u8]) {
     use std::io::Write;
     let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();

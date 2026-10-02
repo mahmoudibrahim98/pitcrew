@@ -42,7 +42,8 @@ pub enum SessionAgent {
 /// - **A sub-agent session** (one with a `parent`) runs as its parent: answer the parent's agent.
 ///   The runner states sub-agent sessions without an agent of their own, so answering only the
 ///   session's own field would refuse the dispatched agent's hooks from its sub-agents and let
-///   any person's through.
+///   any person's through. For a sub-agent not stored yet, answer `NoAgent` as for any session:
+///   when its transcript names a parent, the runner then asks about the parent itself.
 ///
 /// # Rules for implementations
 ///
