@@ -5,6 +5,7 @@
 fn main() {
     let manifest = tauri_build::AppManifest::new().commands(&[
         "gateway_workspaces",
+        "gateway_local_host",
         "gateway_request",
         "gateway_socket_open",
         "gateway_socket_send",

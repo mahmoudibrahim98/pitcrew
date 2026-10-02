@@ -10,6 +10,7 @@
 //! - [`daemon`]: finding, starting and supervising the local `pitcrewd`, and connecting to it with
 //!   the client checks of `pitcrew_api::client`.
 //! - [`registry`]: the workspaces, saved in the app's local data directory.
+//! - [`host`]: this computer's name, for onboarding's machine-name default.
 //! - [`remote`]: remote workspaces: adding a machine (probe, plan, add), its tunnel, SSH's
 //!   prompts in the app, and removing it.
 //! - [`keychain`]: where remote workspaces' device tokens live.
@@ -25,6 +26,7 @@ pub mod attention;
 pub mod commands;
 pub mod daemon;
 pub mod gateway;
+pub mod host;
 pub mod keychain;
 pub mod logging;
 pub mod navigate;
