@@ -102,8 +102,9 @@ pub(crate) struct Term {
     /// Held while the program is signalled, and while it is reaped.
     #[cfg(unix)]
     reap: Arc<Mutex<()>>,
+    /// The program's job; terminated and closed by a kill.
     #[cfg(windows)]
-    job: Option<pitcrew_runtime::pty::windows::Job>,
+    job: Mutex<Option<pitcrew_runtime::pty::windows::Job>>,
     #[cfg(windows)]
     killer: Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>,
 }
@@ -307,7 +308,7 @@ impl Terms {
             #[cfg(unix)]
             reap: Arc::new(Mutex::new(())),
             #[cfg(windows)]
-            job: started.job.take(),
+            job: Mutex::new(started.job.take()),
             #[cfg(windows)]
             killer: Mutex::new(killer),
         });
@@ -431,7 +432,9 @@ impl Terms {
         }
         #[cfg(windows)]
         {
-            if let Some(job) = &term.job {
+            // Closing the job (it kills on close) would do as well; terminating first does not
+            // wait for the last handle to go.
+            if let Some(job) = lock(&term.job).take() {
                 job.terminate();
             }
             let _ = lock(&term.killer).kill();

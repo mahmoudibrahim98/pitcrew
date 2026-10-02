@@ -92,24 +92,57 @@ impl Fixture {
 
     /// A program and its arguments in a new terminal of 80 by 24.
     pub fn spec(&self, name: &str, program: &str, args: &[&str]) -> StartSpec {
-        StartSpec {
-            program: program.into(),
-            args: args.iter().map(|a| (*a).to_owned()).collect(),
-            cwd: self.dir.display().to_string(),
-            env: Vec::new(),
-            name: name.into(),
-            cols: 80,
-            rows: 24,
-        }
+        spec_in(&self.dir, name, program, args)
     }
 
     /// A shell script: `sh -c` on Unix, `cmd.exe /d /v:on /c` on Windows.
     pub fn script(&self, name: &str, script: &str) -> StartSpec {
-        if cfg!(windows) {
-            self.spec(name, "cmd.exe", &["/d", "/v:on", "/c", script])
-        } else {
-            self.spec(name, "sh", &["-c", script])
-        }
+        script_in(&self.dir, name, script)
+    }
+
+    /// Runs [`client_role`] in a new process of this test binary (its test named `role`): a
+    /// client that starts [`ECHO`] in a terminal, types `one`, and waits to be killed. Returns
+    /// the process, the terminal, the output's end then, and the ptyd it used.
+    pub fn client_process(&self, role: &str) -> (std::process::Child, TerminalId, u64, u32) {
+        use std::io::BufRead;
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                role,
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CLIENT_ENDPOINT, &self.options.endpoint)
+            .env(CLIENT_DIR, &self.dir)
+            .env(MARK, &self.mark)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("client process");
+        let stdout = child.stdout.take().expect("stdout");
+        let (found, report) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // libtest prints `test client_role ... ` first, on the same line.
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if let Some((_, rest)) = line.split_once("TERMINAL ") {
+                    let _ = found.send(rest.to_owned());
+                }
+            }
+        });
+        let Ok(line) = report.recv_timeout(WAIT) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the client process reported no terminal");
+        };
+        let mut fields = line.split(' ');
+        let id = fields.next().and_then(|f| f.parse().ok()).expect("id");
+        let end = fields.next().and_then(|f| f.parse().ok()).expect("end");
+        let ptyd = fields.next().and_then(|f| f.parse().ok()).expect("ptyd");
+        (child, id, end, ptyd)
     }
 
     /// Remembers a process to check at the end (on Windows, where marks cannot be read).
@@ -182,6 +215,76 @@ impl Drop for Fixture {
             self.teardown();
         }
     }
+}
+
+/// Where [`client_role`] finds its ptyd and its directory.
+const CLIENT_ENDPOINT: &str = "PITCREW_PTYD_TEST_CLIENT_ENDPOINT";
+const CLIENT_DIR: &str = "PITCREW_PTYD_TEST_CLIENT_DIR";
+
+/// Prints `ready`, then copies what is typed (on Windows, each line as `[line]`).
+pub const ECHO: &str = if cfg!(windows) {
+    "echo ready& for /l %n in (1,1,100000) do @(set l=& set /p l=& echo [!l!])"
+} else {
+    "printf ready; cat"
+};
+
+pub fn spec_in(dir: &std::path::Path, name: &str, program: &str, args: &[&str]) -> StartSpec {
+    StartSpec {
+        program: program.into(),
+        args: args.iter().map(|a| (*a).to_owned()).collect(),
+        cwd: dir.display().to_string(),
+        env: Vec::new(),
+        name: name.into(),
+        cols: 80,
+        rows: 24,
+    }
+}
+
+pub fn script_in(dir: &std::path::Path, name: &str, script: &str) -> StartSpec {
+    if cfg!(windows) {
+        spec_in(dir, name, "cmd.exe", &["/d", "/v:on", "/c", script])
+    } else {
+        spec_in(dir, name, "sh", &["-c", script])
+    }
+}
+
+/// Waits until `word`, typed into an [`ECHO`] terminal with Enter, has come back.
+pub fn echoed(rt: &PtyRuntime, id: TerminalId, word: &str) {
+    if cfg!(windows) {
+        wait_for_screen(rt, id, &format!("[{word}]"));
+    } else {
+        wait_for(rt, id, 0, format!("{word}\r\n{word}\r\n").as_bytes());
+    }
+}
+
+/// The client process of [`Fixture::client_process`]; does nothing in an ordinary test run.
+pub fn client_role() {
+    let (Some(endpoint), Some(dir)) = (
+        std::env::var_os(CLIENT_ENDPOINT),
+        std::env::var_os(CLIENT_DIR),
+    ) else {
+        return;
+    };
+    let mut options = PtyOptions::new(endpoint);
+    options.ptyd = ptyd();
+    options
+        .env
+        .push((MARK.into(), std::env::var(MARK).unwrap_or_default()));
+    options.idle_exit = Some(IDLE);
+    options.start_timeout = Duration::from_secs(30);
+    let rt = PtyRuntime::new(options).expect("runtime");
+    let t = rt
+        .start(&script_in(std::path::Path::new(&dir), "client", ECHO))
+        .expect("start");
+    wait_for(&rt, t.id, 0, b"ready");
+    rt.write(t.id, b"one\r").expect("write");
+    echoed(&rt, t.id, "one");
+    let end = rt.read_output(t.id, u64::MAX, 0).expect("end").end;
+    let ptyd = rt.ptyd_pid().expect("connected");
+    println!("TERMINAL {} {end} {ptyd}", t.id);
+    std::io::Write::flush(&mut std::io::stdout()).expect("flush");
+    // Until it is killed.
+    std::thread::sleep(WAIT * 4);
 }
 
 /// Live processes carrying `mark` (Linux: `/proc`; macOS: `ps -E`; Windows: none can be read).

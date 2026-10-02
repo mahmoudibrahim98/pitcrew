@@ -14,15 +14,42 @@ mod common;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{Fixture, IDLE, contains, eventually, running, wait_for, wait_for_screen};
+use common::{
+    ECHO, Fixture, IDLE, contains, echoed, eventually, running, wait_for, wait_for_screen,
+};
 use pitcrew_interfaces::runtime::{Runtime, RuntimeError, RuntimeKind};
 use pitcrew_protocol::ids::TerminalId;
 use pitcrew_protocol::runner::{Capability, Key};
 use pitcrew_runtime::pty;
 use pitcrew_runtime::tmux::TmuxOptions;
 
-/// Prints `ready`, then each line typed as `[line]`.
-const ECHO: &str = "echo ready& for /l %n in (1,1,100000) do @(set l=& set /p l=& echo [!l!])";
+#[test]
+fn a_client_process_killed_outright_leaves_ptyd_and_its_terminal_running() {
+    let fx = Fixture::new("client-killed");
+    let (mut client, id, end, ptyd) = fx.client_process("client_role");
+    fx.saw(Some(ptyd));
+    client.kill().expect("kill the client");
+    client.wait().expect("reap the client");
+    std::thread::sleep(IDLE * 2);
+    assert!(running(ptyd), "ptyd ended with its client");
+    let rt = fx.runtime();
+    let found = rt.info(id).expect("info");
+    assert!(found.alive);
+    fx.saw(found.pid);
+    let resumed = rt.read_output(id, end, usize::MAX).expect("read");
+    assert_eq!((resumed.offset, resumed.truncated), (end, false));
+    rt.write(id, b"two\r").expect("write");
+    echoed(&rt, id, "two");
+    rt.kill(id).expect("kill");
+    drop(rt);
+    fx.finish();
+}
+
+#[test]
+#[ignore = "the client process of another test, run by it"]
+fn client_role() {
+    common::client_role();
+}
 
 #[test]
 fn write_read_by_offset_resize_ctrl_c_and_kill() {
@@ -166,8 +193,9 @@ fn hostile_output_neither_slows_the_screen_nor_stops_others() {
 fn two_terminals_interleave_without_mixing() {
     let fx = Fixture::new("two");
     let rt = fx.runtime();
+    // The loop in parentheses, so what follows it runs once, after it.
     let count =
-        |tag: &str| format!("for /l %i in (1000,1,1199) do @(echo {tag}%i)& echo DONE& set /p x=");
+        |tag: &str| format!("(for /l %i in (1000,1,1199) do @echo {tag}%i)& echo DONE& set /p x=");
     let ta = rt.start(&fx.script("a", &count("A"))).expect("start a");
     fx.saw_ptyd(&rt);
     fx.saw(ta.pid);

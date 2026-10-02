@@ -365,6 +365,37 @@ fn ptyd_outlives_its_client_and_exits_once_idle() {
 }
 
 #[test]
+fn a_client_process_killed_outright_leaves_ptyd_and_its_terminal_running() {
+    let fx = Fixture::new("client-killed");
+    let (mut client, id, end, ptyd) = fx.client_process("client_role");
+    fx.saw(Some(ptyd));
+    // No goodbye: the client process is killed with its connection open.
+    client.kill().expect("kill the client");
+    client.wait().expect("reap the client");
+    std::thread::sleep(IDLE * 2);
+    assert!(running(ptyd), "ptyd ended with its client");
+    let rt = fx.runtime();
+    let found = rt.info(id).expect("info");
+    assert!(found.alive);
+    fx.saw(found.pid);
+    assert_eq!(rt.ptyd_pid(), Some(ptyd));
+    let resumed = rt.read_output(id, end, usize::MAX).expect("read");
+    assert_eq!((resumed.offset, resumed.truncated), (end, false));
+    rt.write(id, b"two\r").expect("write");
+    let (more, _) = wait_for(&rt, id, end, b"two\r\ntwo\r\n");
+    assert_eq!(more, b"two\r\ntwo\r\n");
+    rt.kill(id).expect("kill");
+    drop(rt);
+    fx.finish();
+}
+
+#[test]
+#[ignore = "the client process of another test, run by it"]
+fn client_role() {
+    common::client_role();
+}
+
+#[test]
 fn a_second_ptyd_is_refused() {
     let fx = Fixture::new("second");
     let rt = fx.runtime();

@@ -141,6 +141,12 @@ impl Conn {
         let (answer, answered) = mpsc::sync_channel(1);
         lock(&self.waiters).insert(id, answer);
         let forget = || lock(&self.waiters).remove(&id);
+        // The I/O thread marks the connection closed, then drops every waiter: one added
+        // after that would wait for nothing.
+        if !self.is_open() {
+            forget();
+            return Err(CallError::Closed);
+        }
         match self.outbox.try_send(frame.encode()) {
             Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
