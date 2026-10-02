@@ -76,8 +76,9 @@ The types the API serves (`Block` and its parts, `Check`, `Summary`, `Span`, `Da
 Everything is pure and deterministic. Event text is untrusted: it is cleaned and capped before it
 is kept. Cleaning removes control characters, direction-changing and invisible characters, and
 Unicode tag characters (U+E0000–E007F, which can carry text a person does not see but a model
-reading the recap does). The set is the same as `pitcrew_sync_github::bounds::is_hidden`; change
-both together (`text.rs` pins it in a test). Of that set, the line and paragraph separators
+reading the recap does). The set is `pitcrew_protocol::text::is_hidden`, which the GitHub and Jira
+syncs and the CLI drop too (`text.rs` pins it in a test, as each of them does). Of that set, the
+line and paragraph separators
 (U+2028, U+2029) become a space, like a line break, so the words around them stay apart. Counts,
 files, facts, tasks and receipts per block are capped by `Config`.
 

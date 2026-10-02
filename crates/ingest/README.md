@@ -4,6 +4,35 @@ Transcript parsers for Claude Code, Codex and OpenCode (incremental, by offset),
 
 **Owned by stream A** — see [docs/build/streams/A.md](../../docs/build/streams/A.md).
 
+## Reading only regular files
+
+Discovery lists regular files only, and does not follow links below a home. A read comes later,
+so every read opens the transcript again without following a link in its **last** component
+and checks, on the opened handle, that it is a regular file (`src/open.rs`):
+
+- **Unix:** `O_NOFOLLOW | O_NONBLOCK | O_NOCTTY`, then `fstat`: a regular file with one link.
+  A named pipe cannot block the open; a hard link (agents never make one) is refused.
+- **Windows:** `FILE_FLAG_OPEN_REPARSE_POINT`, then the handle's attributes: a symbolic link, a
+  junction, any other reparse point or a folder is refused.
+- **OpenCode** stores, which SQLite opens by path: the check above, then on Unix SQLite gets the
+  store's folder resolved and `SQLITE_OPEN_NOFOLLOW` (it opens every file with `O_NOFOLLOW`
+  too), so a link put in place of the store after the check is refused as well; on Windows the
+  checked handle is held without delete sharing until SQLite has opened the store, so the file
+  cannot be renamed or replaced in between. The side files SQLite opens itself (`-wal`, `-shm`,
+  `-journal`) get the same check first, and the store is always opened with `readonly_shm=1`, so
+  SQLite never writes `-shm`, whatever it names. Left: a swap in the moment between the check
+  and SQLite's own open.
+
+Folders above the transcript may be links (a home on another drive). This applies to
+`read_from`, `read_page`, OpenCode's discovery (which opens each store) and the scan's 64 KiB
+prefix reads.
+
+A refused file is `SourceError::Io` carrying a `NotRegularFile` (its path and what is there:
+`FileKind::Link`, `Directory`, `Fifo`, …); `pitcrew_ingest::refusal(&err)` finds it. Its message
+names the path and the kind, never the contents. Callers treat it like any other read error: the
+runner warns once per file and does not read it again until it changes; discovery of an OpenCode
+home skips such a store; the scan counts it unreadable.
+
 ## Offsets and refs, for consumers
 
 Every `TranscriptItem` has an `offset`, and every read returns a `Cursor`. What they mean depends

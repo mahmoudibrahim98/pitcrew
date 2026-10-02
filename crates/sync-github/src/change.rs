@@ -823,7 +823,7 @@ mod malformed_timestamp_tests {
 
     #[test]
     fn r10_residual_an_html_url_with_userinfo_is_untrusted() {
-        // Stream Q's open-r10-kept-link-with-userinfo regression (O30): `%75ser` is userinfo
+        // Stream Q's r10-kept-link-with-userinfo regression (O30): `%75ser` is userinfo
         // ("user", percent-encoded) sitting before the real host — the URL parses to
         // `github.com`, same as `origin::trusted_next_url` refuses this for a `next` link.
         let mut malformed_fields = 0u32;
@@ -843,7 +843,7 @@ mod malformed_timestamp_tests {
 
     #[test]
     fn r10_residual_an_html_url_on_an_unexpected_port_is_untrusted() {
-        // Stream Q's open-r10-kept-link-on-another-port regression (O30): the host string matches
+        // Stream Q's r10-kept-link-on-another-port regression (O30): the host string matches
         // but the port does not, so this is not the configured web origin either.
         let mut malformed_fields = 0u32;
         let mut on_another_port = issue("2026-01-01T00:00:00Z");
@@ -862,7 +862,7 @@ mod malformed_timestamp_tests {
 
     #[test]
     fn r10_residual_an_oversized_html_url_is_untrusted() {
-        // Stream Q's open-r10-kept-link-without-a-cap regression (O30): a trusted scheme, host
+        // Stream Q's r10-kept-link-without-a-cap regression (O30): a trusted scheme, host
         // and port do not also mean a reasonable length — a kept link is shown to a person.
         let mut malformed_fields = 0u32;
         let mut huge = issue("2026-01-01T00:00:00Z");

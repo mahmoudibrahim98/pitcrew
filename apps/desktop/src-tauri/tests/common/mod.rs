@@ -18,7 +18,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use pitcrew_desktop::daemon::LocalConnector;
 use pitcrew_desktop::daemon::endpoint::Endpoint;
-use pitcrew_desktop::gateway::{Delivery, Sink, SinkClosed};
+use pitcrew_desktop::gateway::{Connector, Delivery, Sink, SinkClosed};
+use pitcrew_desktop::registry::{
+    Connection, LauncherKind, Registry, RemoteConnection, WorkspaceKind, WorkspaceRecord,
+    WorkspaceState,
+};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt as _;
@@ -34,6 +38,40 @@ pub const WORKSPACE_NAME: &str = "Demo Lab";
 pub const SAM: &str = "01JA0000000000000000000001";
 pub const WRITER: &str = "01JA0000000000000000000002";
 pub const OTHER: &str = "01JA0000000000000000000003";
+
+/// Registers `id` as the local workspace, ready, reached through `connector`, as the app does
+/// once the local daemon answers.
+pub fn register_local(registry: &Registry, id: &str, name: &str, connector: Arc<dyn Connector>) {
+    registry.attach_local(connector);
+    registry.set_local(id, name).unwrap();
+}
+
+/// Registers a remote workspace `id` on `hpc-login`, in `state`, reached through `connector`
+/// (the gateway does not care how a connector reaches its daemon).
+pub fn register_remote(
+    registry: &Registry,
+    id: &str,
+    name: &str,
+    connector: Arc<dyn Connector>,
+    state: WorkspaceState,
+) {
+    let record = WorkspaceRecord {
+        id: id.into(),
+        name: name.into(),
+        kind: WorkspaceKind::Remote,
+        connection: Connection::Remote(Box::new(RemoteConnection {
+            host: "hpc-login".into(),
+            launcher: LauncherKind::Direct,
+            root: "/home/sam/.pitcrew".into(),
+            platform: "x86_64-unknown-linux-musl".into(),
+            site: None,
+            job: None,
+            last_hop: None,
+            transport: None,
+        })),
+    };
+    registry.claim_remote(record, connector, state).unwrap();
+}
 
 /// Ask `n`'s id.
 pub fn ask_id(n: u8) -> String {

@@ -758,7 +758,7 @@ mod tests {
 
     #[tokio::test]
     async fn r28_a_hostile_retry_after_is_capped_not_overflowed() {
-        // Stream Q's open-r28-retry-after-overflow regression: `retry-after: 9223372036854775807`
+        // Stream Q's r28-retry-after-overflow regression: `retry-after: 9223372036854775807`
         // (i64::MAX) used to overflow `now_unix + retry_after` — a panic with overflow checks, a
         // deadline wrapped into the past in release, so the very next call would retry at once
         // instead of actually backing off.

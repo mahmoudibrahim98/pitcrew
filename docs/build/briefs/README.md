@@ -66,11 +66,11 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [B-tmux-runtime](B-tmux-runtime.md) | B · Runtime | `s/B/tmux-runtime` | Opus-class | **Merged** |
 | [0-daemon-setup](0-daemon-setup.md) | 0 · Composition root | `integrator/daemon-setup` | Opus-class | **Merged** |
 | [0-onboarding-wiring](0-onboarding-wiring.md) | 0 · Contracts | `integrator/onboarding-wiring` | Opus-class | **Merged** |
-| [0-hardening-sweep](0-hardening-sweep.md) | 0 · Contracts | `integrator/hardening-sweep` | Opus-class | In progress |
+| [0-hardening-sweep](0-hardening-sweep.md) | 0 · Contracts | `integrator/hardening-sweep` | Opus-class | **Merged** |
 | [D-runner-followups](D-runner-followups.md) | D · Runner | `s/D/runner-followups` | Opus-class | **Merged** |
-| [K-remote-followups](K-remote-followups.md) | K · Desktop shell | `s/K/remote-followups` | Opus-class | Next |
-| [0-daemon-runtime](0-daemon-runtime.md) | 0 · Composition root | `integrator/daemon-runtime` | Opus-class | Next |
-| [B-pty-runtime](B-pty-runtime.md) | B · Runtime | `s/B/pty-runtime` | Opus-class | Next |
+| [K-remote-followups](K-remote-followups.md) | K · Desktop shell | `s/K/remote-followups` | Opus-class | **Merged** |
+| [0-daemon-runtime](0-daemon-runtime.md) | 0 · Composition root | `integrator/daemon-runtime` | Opus-class | In progress |
+| [B-pty-runtime](B-pty-runtime.md) | B · Runtime | `s/B/pty-runtime` | Opus-class | In progress |
 | [0-daemon-solo](0-daemon-solo.md) | 0 · Composition root | `integrator/daemon-solo` | Opus-class | **Merged** |
 | [N-projects-wiring](N-projects-wiring.md) | N · Projects layout | `s/N/projects-wiring` | Sonnet-class | **Merged** |
 | [L-shell-polish](L-shell-polish.md) | L · UI foundation | `s/L/shell-polish` | Sonnet-class | **Merged** |

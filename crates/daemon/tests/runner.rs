@@ -544,9 +544,39 @@ fn get_raw(port: u16, path: &str, token: &str) -> Vec<u8> {
     got
 }
 
-/// A stop always finishes in bounded time: here the transcript is swapped for a FIFO that no one
-/// writes, so opening it waits forever, both in the runner's watcher (it reads a changed file)
-/// and in a transcript request. The daemon still exits, cleanly, and says what it left behind.
+/// A named pipe put in a transcript's place by `mkfifo` and `rename`.
+#[cfg(unix)]
+fn swap_for_a_fifo(dir: &Path, path: &Path) {
+    let fifo = dir.join("fifo");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    std::fs::rename(&fifo, path).unwrap();
+}
+
+/// A transcript of about a terabyte with no line break after its first lines: the rest is a hole,
+/// so it takes no disk blocks, but a reader looking for the end of that line still reads it all,
+/// forwards (the runner's watcher) or backwards (a page). At the hundreds of MB/s to the few GB/s
+/// that zero-filled reads go, that is minutes, far past a stop's bounds.
+#[cfg(unix)]
+fn grow_without_a_line_break(path: &Path) {
+    use std::os::unix::fs::MetadataExt as _;
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.set_len(1 << 40).unwrap();
+    file.sync_all().unwrap();
+    let meta = file.metadata().unwrap();
+    assert_eq!(meta.len(), 1 << 40);
+    // `st_blocks` counts 512-byte blocks, as `du` does: the fixture's lines, not the terabyte.
+    let on_disk = meta.blocks() * 512;
+    assert!(on_disk < 1 << 20, "the hole takes {on_disk} bytes on disk");
+}
+
+/// A stop always finishes in bounded time: here the transcript grows by a terabyte with no line
+/// break (a hole: no disk blocks), so a read of it does not return for minutes, both in the
+/// runner's watcher (it reads a changed file) and in a transcript request. The daemon still exits,
+/// cleanly, and says what it left behind.
 #[cfg(unix)]
 #[test]
 fn a_read_that_never_returns_does_not_keep_the_daemon_from_stopping() {
@@ -561,13 +591,7 @@ fn a_read_that_never_returns_does_not_keep_the_daemon_from_stopping() {
         .unwrap()
         .to_owned();
 
-    let fifo = tmp.path().join("fifo");
-    let made = std::process::Command::new("mkfifo")
-        .arg(&fifo)
-        .status()
-        .unwrap();
-    assert!(made.success());
-    std::fs::rename(&fifo, &path).unwrap();
+    grow_without_a_line_break(&path);
     let request = {
         let (port, token) = (daemon.port, device.clone());
         let path = format!("/v1/sessions/{sid}/transcript");
@@ -593,4 +617,70 @@ fn a_read_that_never_returns_does_not_keep_the_daemon_from_stopping() {
         assert!(logs.contains(said), "no {said:?} in:\n{logs}");
     }
     let _ = request.join();
+}
+
+/// A transcript swapped for a named pipe is refused as soon as it is opened, not waited on: the
+/// runner's watcher and a transcript request both answer at once, and a stop finds nothing left
+/// running.
+#[cfg(unix)]
+#[test]
+fn a_transcript_swapped_for_a_fifo_is_refused_at_once_and_the_stop_is_clean() {
+    use std::sync::mpsc;
+    let (tmp, state) = state_dir();
+    let homes = tmp.path().join("homes");
+    let native = "efefefef-9999-4999-8999-efefefefefef";
+    let path = claude_transcript(&homes.join(".claude"), native, &fixture_lines(native)[..5]);
+    let mut daemon = Daemon::start(&state, &["--demo", "--homes", homes.to_str().unwrap()]);
+    let device = daemon.device_token();
+    let sid = session_named(&daemon, &device, native)["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    swap_for_a_fifo(tmp.path(), &path);
+    // The watcher reads the changed file and is refused, without blocking on the pipe.
+    daemon.wait_for_log("is a named pipe, not a regular file", WAIT);
+
+    // So is a transcript request: it is answered (the status is the route's to choose), quickly.
+    let (sent, answered) = mpsc::channel();
+    {
+        let (port, token) = (daemon.port, device.clone());
+        let path = format!("/v1/sessions/{sid}/transcript");
+        std::thread::spawn(move || {
+            let _ = sent.send(get_raw(port, &path, &token));
+        });
+    }
+    let asked = Instant::now();
+    let Ok(reply) = answered.recv_timeout(Duration::from_secs(10)) else {
+        // Release a reader stuck on the pipe, so nothing is left behind, then fail.
+        let fifo = path.clone();
+        std::thread::spawn(move || std::fs::OpenOptions::new().write(true).open(fifo));
+        panic!(
+            "a transcript request waited on a named pipe:\n{}",
+            daemon.stderr()
+        );
+    };
+    let reply = String::from_utf8_lossy(&reply);
+    assert!(reply.starts_with("HTTP/1.1 "), "{reply}");
+    assert!(
+        asked.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        asked.elapsed()
+    );
+
+    let stopping = Instant::now();
+    let status = daemon.terminate();
+    let took = stopping.elapsed();
+    let logs = daemon.stderr();
+    assert!(status.success(), "{status}:\n{logs}");
+    // Well inside the drain (10 s) a stuck read would wait out.
+    assert!(took < Duration::from_secs(8), "{took:?}:\n{logs}");
+    assert!(logs.contains("stopped"), "{logs}");
+    for left in [
+        "the runner is still stopping",
+        "work on the blocking pool is still running",
+        "the store is still open at exit",
+    ] {
+        assert!(!logs.contains(left), "{left:?} in:\n{logs}");
+    }
 }

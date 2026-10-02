@@ -16,6 +16,11 @@ serde_json.workspace = true
 tracing.workspace = true
 rusqlite.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# `O_NOFOLLOW` and `O_NONBLOCK` when opening a transcript (`src/open.rs`), without unsafe code.
+# The version `pitcrew-auth` and `pitcrew-cli` already use.
+rustix = { version = "=1.1.5", features = ["fs"] }
+
 [dev-dependencies]
 pitcrew-fixtures.workspace = true
 insta.workspace = true

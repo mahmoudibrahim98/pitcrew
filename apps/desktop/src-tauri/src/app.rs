@@ -106,6 +106,7 @@ pub fn configure<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder
         .invoke_handler(tauri::generate_handler![
             commands::gateway_workspaces,
+            commands::gateway_local_host,
             commands::gateway_request,
             commands::gateway_socket_open,
             commands::gateway_socket_send,

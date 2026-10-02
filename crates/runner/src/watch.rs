@@ -6,7 +6,9 @@
 //! bounded channel, and changes that arrive meanwhile coalesce into one read per file.
 //!
 //! Transcripts are keyed by their canonical path, so a home reached through a symlink, or one that
-//! did not exist yet at the first start, keeps its session ids across restarts.
+//! did not exist yet at the first start, keeps its session ids across restarts. Only the folder is
+//! resolved: a transcript's own name never is, so one swapped for a link is not tracked at, or
+//! moved to, the link's target (`transcript_key`).
 //!
 //! On a local filesystem these folders are watched:
 //! - each home and its first-level folders (a new `projects` folder, the first session ever);
@@ -515,10 +517,18 @@ impl Watcher {
     }
 
     /// A stored path whose canonical form changed (a folder above it became a symlink) moves to
-    /// the new form, so the transcript keeps its session. False if the row can't be used.
+    /// the new form, so the transcript keeps its session. A transcript that is now a link, or
+    /// anything else but a regular file, is never moved to where it points: the row stays, and
+    /// reads refuse the path until a regular file is back. False if the row can't be used.
     fn follow_canonical(&self, row: &mut Row) -> bool {
-        let Ok(canonical) = row.path.canonicalize() else {
-            return true;
+        let canonical = match transcript_key(&row.path) {
+            Ok(canonical) => canonical,
+            Err(e) => {
+                if e.kind() == io::ErrorKind::InvalidInput {
+                    tracing::warn!(path = %row.path.display(), "a transcript is no longer a regular file (a link?); not following it");
+                }
+                return true;
+            }
         };
         if canonical == row.path {
             return true;
@@ -733,11 +743,12 @@ impl Watcher {
                 if self.by_raw.contains_key(&raw) || self.skipped.contains(&raw) {
                     continue;
                 }
-                // Keys are canonical: the file exists now, so this is when to resolve it.
-                let canonical = match tref.path.canonicalize() {
+                // Keys are canonical: the file exists now, so this is when to resolve it (its
+                // folder only: a transcript swapped for a link since discovery is not tracked).
+                let canonical = match transcript_key(&tref.path) {
                     Ok(c) => c,
                     Err(e) => {
-                        tracing::debug!(path = %tref.path.display(), error = %e, "a discovered transcript is gone");
+                        tracing::debug!(path = %tref.path.display(), error = %e, "a discovered transcript is gone, or no longer a regular file");
                         continue;
                     }
                 };
@@ -936,12 +947,13 @@ impl Watcher {
         self.outside.insert(dir.to_path_buf());
     }
 
+    /// The home a stored transcript belongs to: one of its engine's homes that holds it. A row
+    /// outside every home (a home that moved, or a path that should never have been stored) is
+    /// not tracked; discovery finds the transcript again where it is now.
     fn home_for(&self, engine: Engine, path: &Path) -> Option<usize> {
-        let same = |h: &Home| h.engine == engine;
         self.homes
             .iter()
-            .position(|h| same(h) && path.starts_with(&h.path))
-            .or_else(|| self.homes.iter().position(same))
+            .position(|h| h.engine == engine && path.starts_with(&h.path))
     }
 
     /// Stats one transcript and reads it if it changed. Returns whether it changed.
@@ -1964,6 +1976,34 @@ fn session_of(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LookupFailed;
 
+/// A transcript's key: its folder resolved (so a home reached through a symlink keeps its
+/// sessions), joined with its own name, which is never resolved. A transcript swapped for a link
+/// must not be tracked, or have its row moved, at the link's target: reads would then open that
+/// target, a regular file, and the ingest's own check (`pitcrew_ingest`'s `NotRegularFile`) would
+/// pass. `InvalidInput` if the path is not a regular file now (a link, a folder, a pipe); the
+/// I/O error if it, or its folder, is gone.
+fn transcript_key(path: &Path) -> io::Result<PathBuf> {
+    let Some(name) = path.file_name() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a transcript path with no file name",
+        ));
+    };
+    let folder = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let key = folder.canonicalize()?.join(name);
+    if std::fs::symlink_metadata(&key)?.file_type().is_file() {
+        Ok(key)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a transcript that is not a regular file",
+        ))
+    }
+}
+
 /// Whether `parent`, the transcript a sub-agent at `child` names as its parent, may be taken as
 /// one: a regular file (a link is not followed), inside `home`, and not the sub-agent itself.
 /// `child` is canonical, so the folders above `parent` are real ones; only its last part could
@@ -2139,6 +2179,38 @@ mod tests {
         let folder = project.join("t.jsonl");
         std::fs::create_dir(&folder).unwrap();
         assert!(!parent_file(&folder, &child, &home).unwrap());
+    }
+
+    /// A transcript's key resolves its folder (a linked home included) but never its own name:
+    /// a transcript that is now a link (to a file or a folder) has no key, so it is neither
+    /// tracked nor moved to the link's target; neither has a folder or a missing file.
+    #[cfg(unix)]
+    #[test]
+    fn a_transcript_key_resolves_the_folder_only() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let real = root.join("real");
+        std::fs::create_dir(&real).unwrap();
+        let home = root.join("home");
+        symlink(&real, &home).unwrap();
+        std::fs::write(real.join("a.jsonl"), b"{}\n").unwrap();
+        assert_eq!(
+            transcript_key(&home.join("a.jsonl")).unwrap(),
+            real.join("a.jsonl")
+        );
+
+        let target = root.join("target.jsonl");
+        std::fs::write(&target, b"{}\n").unwrap();
+        symlink(&target, real.join("b.jsonl")).unwrap();
+        symlink(&real, real.join("c.jsonl")).unwrap();
+        std::fs::create_dir(real.join("d.jsonl")).unwrap();
+        for name in ["b.jsonl", "c.jsonl", "d.jsonl"] {
+            let err = transcript_key(&home.join(name)).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{name}");
+        }
+        let gone = transcript_key(&home.join("e.jsonl")).unwrap_err();
+        assert_eq!(gone.kind(), io::ErrorKind::NotFound);
     }
 
     /// A link is never followed: not to another session's transcript (which would lend the

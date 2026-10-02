@@ -579,9 +579,10 @@ fn opencode_batch(
         .collect()
 }
 
-/// The first `max` bytes of `path`; `None` if it cannot be opened.
+/// The first `max` bytes of `path`; `None` if it cannot be opened, or is no longer a regular file
+/// (see [`crate::open`]).
 fn read_prefix(path: &Path, max: u64) -> Option<Vec<u8>> {
-    let file = fs::File::open(path).ok()?;
+    let file = crate::open::open_transcript(path).ok()?;
     let mut buf = Vec::new();
     file.take(max).read_to_end(&mut buf).ok()?;
     Some(buf)

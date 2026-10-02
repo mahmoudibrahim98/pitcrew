@@ -2,6 +2,7 @@
 //! reporting, discovery helpers, and the backward record walk that pages use.
 
 use crate::lines::{self, Backward, Line, OwnedLine, Pending, SkipReason, SkippedLine};
+use crate::open::open_transcript;
 use crate::text::{from_hex, to_hex};
 use pitcrew_interfaces::source::{
     Cursor, ParseChunk, SessionMeta, SourceError, TranscriptItem, TranscriptRef,
@@ -9,7 +10,7 @@ use pitcrew_interfaces::source::{
 use pitcrew_protocol::model::{Engine, TimestampMs};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
@@ -59,9 +60,10 @@ struct Stored<S> {
     pending: Option<CarriedLine>,
 }
 
-/// Reads complete lines from `cursor` to the end of the file at `path`.
+/// Reads complete lines from `cursor` to the end of the file at `path`, if it is a regular file
+/// (see [`crate::open`]).
 pub(crate) fn read<F: Format>(path: &Path, cursor: &Cursor) -> Result<ReadReport, SourceError> {
-    let mut file = File::open(path)?;
+    let mut file = open_transcript(path)?;
     let len = file.metadata()?.len();
     if cursor.offset > len {
         return Err(SourceError::Unreadable {

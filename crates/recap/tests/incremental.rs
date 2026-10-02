@@ -57,19 +57,7 @@ fn limit() -> impl Strategy<Value = Option<usize>> {
 }
 
 fn is_hidden(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{00AD}'
-                | '\u{061C}'
-                | '\u{180E}'
-                | '\u{200B}'..='\u{200F}'
-                | '\u{2028}'..='\u{202E}'
-                | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{FEFF}'
-                | '\u{E0000}'..='\u{E007F}'
-        )
+    c.is_control() || pitcrew_protocol::text::is_hidden(c)
 }
 
 fn sorted(mut blocks: Vec<Block>) -> Vec<Block> {

@@ -149,7 +149,9 @@ impl OpenCodeAdapter {
     ///
     /// [`SourceError::Unreadable`] if the session or a required table is missing;
     /// [`SourceError::Io`] with [`io::ErrorKind::WouldBlock`] if a writer holds the store or
-    /// changed it during the read (retry later).
+    /// changed it during the read (retry later); [`SourceError::Io`] carrying a
+    /// [`NotRegularFile`](crate::NotRegularFile) if the store is now a link, or anything else that
+    /// is not a regular file (see [`crate::refusal`]).
     pub fn read(
         &self,
         transcript: &TranscriptRef,
@@ -364,7 +366,7 @@ impl SourceAdapter for OpenCodeAdapter {
             }
             let path = entry.path();
             // A locked or changing store fails the whole call, to be retried; one that cannot be
-            // read is skipped.
+            // read, or is no longer a regular file (see `crate::open`), is skipped.
             let listed = Store::open(&path).and_then(|store| {
                 let sessions = if store.has_sessions() {
                     store.sessions()?
@@ -379,7 +381,9 @@ impl SourceAdapter for OpenCodeAdapter {
                     note_unreadable(&path, None);
                     sessions
                 }
-                Err(SourceError::Io(e)) => return Err(SourceError::Io(e)),
+                Err(SourceError::Io(e)) if crate::open::refusal_in(&e).is_none() => {
+                    return Err(SourceError::Io(e));
+                }
                 Err(e) => {
                     if note_unreadable(&path, Some(&e.to_string())) {
                         tracing::warn!(path = %path.display(), error = %e, "skipped an unreadable OpenCode store");
