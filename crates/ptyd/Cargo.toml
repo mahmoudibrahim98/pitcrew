@@ -21,7 +21,9 @@ pitcrew-runtime.workspace = true
 portable-pty.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+# `signal`: a SIGCHLD handler in place of an inherited SIG_IGN, so ended programs stay
+# waitable (Unix). The daemon builds tokio with it already.
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 # Process groups and signals for kill, waiting without reaping (`waitid` with `WNOWAIT`),

@@ -317,6 +317,91 @@ fn kill_ends_the_program_and_what_it_started() {
 }
 
 #[test]
+fn batch_files_get_no_argument_cmd_would_act_on() {
+    let fx = Fixture::new("batch");
+    let rt = fx.runtime();
+    std::fs::write(
+        fx.dir.join("t.cmd"),
+        "@echo off\r\necho args: %*\r\nset /p x=\r\n",
+    )
+    .expect("batch file");
+    let dir = fx.dir.display().to_string();
+    let hostile = "&echo x>pwned";
+    // By its bare name (found through PATHEXT), and by names Windows reads as `t.cmd`.
+    for program in [
+        format!(r"{dir}\t"),
+        format!(r"{dir}\t.cmd"),
+        format!(r"{dir}\t.cmd."),
+        format!(r"{dir}\t.cmd "),
+        format!(r"{dir}\t.cmd::$DATA"),
+    ] {
+        match rt.start(&fx.spec("batch", &program, &[hostile])) {
+            Err(RuntimeError::Spawn { reason, .. }) => eprintln!("{program:?}: {reason}"),
+            other => panic!("{program:?} was started: {other:?}"),
+        }
+    }
+    // Ordinary arguments run it.
+    let t = rt
+        .start(&fx.spec("batch", &format!(r"{dir}\t.cmd"), &["--resume", "x.y"]))
+        .expect("start");
+    fx.saw_ptyd(&rt);
+    fx.saw(t.pid);
+    wait_for_screen(&rt, t.id, "args: --resume x.y");
+    assert!(!fx.dir.join("pwned").exists(), "cmd.exe ran the argument");
+    rt.kill(t.id).expect("kill");
+    drop(rt);
+    fx.finish();
+}
+
+#[test]
+fn thirty_two_terminals_tailed_at_once_all_wait() {
+    let fx = Fixture::new("tail-32");
+    let rt = fx.runtime();
+    let mut tails = Vec::new();
+    for n in 0..32 {
+        let t = rt.start(&fx.script(&format!("t{n}"), ECHO)).expect("start");
+        if n == 0 {
+            fx.saw_ptyd(&rt);
+        }
+        fx.saw(t.pid);
+        tails.push(t.id);
+    }
+    for &id in &tails {
+        wait_for(&rt, id, 0, b"ready");
+    }
+    let ends: Vec<u64> = tails
+        .iter()
+        .map(|&id| rt.read_output(id, u64::MAX, 0).expect("end").end)
+        .collect();
+    let woken = std::thread::scope(|scope| {
+        let waiting: Vec<_> = tails
+            .iter()
+            .zip(&ends)
+            .map(|(&id, &end)| {
+                let rt = &rt;
+                scope.spawn(move || rt.wait_for_output(id, end, Duration::from_secs(30)))
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(500));
+        for &id in &tails {
+            rt.write(id, b"x\r").expect("write");
+        }
+        waiting
+            .into_iter()
+            .map(|w| w.join().expect("tail thread"))
+            .collect::<Vec<_>>()
+    });
+    for (woke, end) in woken.into_iter().zip(ends) {
+        assert!(woke.expect("a waiting read") > end);
+    }
+    for id in tails {
+        rt.kill(id).expect("kill");
+    }
+    drop(rt);
+    fx.finish();
+}
+
+#[test]
 fn detection_reports_the_pty_runtime_or_why_not() {
     let fx = Fixture::new("detect");
     let support = pty::detect(&fx.options).expect("usable");

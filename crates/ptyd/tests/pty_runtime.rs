@@ -396,6 +396,104 @@ fn client_role() {
 }
 
 #[test]
+fn thirty_two_terminals_tailed_at_once_all_wait() {
+    let fx = Fixture::new("tail-32");
+    let rt = fx.runtime();
+    let mut tails = Vec::new();
+    for n in 0..32 {
+        let t = rt
+            .start(&fx.script(&format!("t{n}"), "printf ready; exec cat"))
+            .expect("start");
+        if n == 0 {
+            fx.saw_ptyd(&rt);
+        }
+        tails.push(t.id);
+    }
+    let ends: Vec<u64> = tails
+        .iter()
+        .map(|&id| wait_for(&rt, id, 0, b"ready").1)
+        .collect();
+    let woken = std::thread::scope(|scope| {
+        let waiting: Vec<_> = tails
+            .iter()
+            .zip(&ends)
+            .map(|(&id, &end)| {
+                let rt = &rt;
+                scope.spawn(move || rt.wait_for_output(id, end, Duration::from_secs(20)))
+            })
+            .collect();
+        // Every read is waiting now (none was refused as busy); then each gets output.
+        std::thread::sleep(Duration::from_millis(500));
+        for &id in &tails {
+            rt.write(id, b"x\r").expect("write");
+        }
+        waiting
+            .into_iter()
+            .map(|w| w.join().expect("tail thread"))
+            .collect::<Vec<_>>()
+    });
+    for ((woke, end), id) in woken.into_iter().zip(ends).zip(&tails) {
+        let now = woke.expect("a waiting read");
+        assert!(now > end, "{id}: {now} <= {end}");
+    }
+    for id in tails {
+        rt.kill(id).expect("kill");
+    }
+    drop(rt);
+    fx.finish();
+}
+
+#[test]
+fn an_ending_nobody_was_told_about_keeps_ptyd_running() {
+    let fx = Fixture::new("unseen-ending");
+    let rt = fx.runtime();
+    let t = rt
+        .start(&fx.script("brief", "sleep 0.3; printf bye"))
+        .expect("start");
+    fx.saw_ptyd(&rt);
+    let ptyd = rt.ptyd_pid().expect("connected");
+    drop(rt);
+    // It ends with no client connected, then ptyd has been idle for well past its idle time.
+    std::thread::sleep(IDLE * 4);
+    assert!(
+        running(ptyd),
+        "ptyd exited with an ending nobody was told about"
+    );
+    let rt = fx.runtime();
+    let listed = rt.list().expect("list");
+    assert_eq!(listed.len(), 1);
+    assert!(!listed[0].alive);
+    assert!(wait_for(&rt, t.id, 0, b"bye").0.ends_with(b"bye"));
+    drop(rt);
+    // Told now: it exits once idle.
+    eventually("ptyd exits once the ending was seen", || !running(ptyd));
+    fx.finish();
+}
+
+#[test]
+fn a_kill_ends_early_when_the_program_goes_at_once() {
+    let fx = Fixture::new("kill-quick");
+    let rt = fx.runtime();
+    let mut fastest = Duration::MAX;
+    for n in 0..3 {
+        let t = rt
+            .start(&fx.script(&format!("quick{n}"), "printf ready; exec cat"))
+            .expect("start");
+        if n == 0 {
+            fx.saw_ptyd(&rt);
+        }
+        wait_for(&rt, t.id, 0, b"ready");
+        let started = Instant::now();
+        rt.kill(t.id).expect("kill");
+        fastest = fastest.min(started.elapsed());
+    }
+    // cat ends on SIGTERM: no need to wait out the half second before SIGKILL.
+    assert!(fastest < Duration::from_millis(450), "{fastest:?}");
+    drop(rt);
+    fx.finish();
+}
+
+#[test]
 fn a_second_ptyd_is_refused() {
     let fx = Fixture::new("second");
     let rt = fx.runtime();

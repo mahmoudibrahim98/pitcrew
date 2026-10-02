@@ -118,10 +118,10 @@ impl Scanner {
             (b'c', b"" | b"0") => events.push(Event::Answer(b"\x1b[?1;2c")),
             (b'c', b">" | b">0") => events.push(Event::Answer(b"\x1b[>0;10;1c")),
             (b'p', b"!") => events.push(Event::AppCursor(false)),
-            (b'h' | b'l', [b'?', modes @ ..]) => {
-                if modes.split(|&b| b == b';').any(|mode| mode == b"1") {
-                    events.push(Event::AppCursor(last == b'h'));
-                }
+            (b'h' | b'l', [b'?', modes @ ..])
+                if modes.split(|&b| b == b';').any(|mode| mode == b"1") =>
+            {
+                events.push(Event::AppCursor(last == b'h'));
             }
             _ => {}
         }

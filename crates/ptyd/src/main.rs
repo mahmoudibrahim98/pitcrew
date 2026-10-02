@@ -41,6 +41,10 @@ pub(crate) struct Config {
     pub(crate) idle_exit: Duration,
     /// Serve from this process (otherwise, on Unix, start a detached copy that does).
     pub(crate) foreground: bool,
+    /// The uid clients must have, in place of ours: `--expect-uid`, accepted by debug builds
+    /// only, for the tests of the peer check.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) expect_uid: Option<u32>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -62,6 +66,7 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
     let mut history = pitcrew_runtime::replay::DEFAULT_CAPACITY;
     let mut idle_exit = server::IDLE_EXIT;
     let mut foreground = false;
+    let mut expect_uid = None;
     while let Some(flag) = args.next() {
         let mut value = || {
             args.next()
@@ -79,6 +84,9 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
                 idle_exit = Duration::from_millis(number(value()?)? as u64);
             }
             Some("--foreground") => foreground = true,
+            Some("--expect-uid") if cfg!(debug_assertions) => {
+                expect_uid = Some(u32::try_from(number(value()?)?).map_err(|e| e.to_string())?);
+            }
             _ => return Err(format!("unknown argument {flag:?}\n{USAGE}")),
         }
     }
@@ -88,6 +96,7 @@ fn parse(args: &[OsString]) -> Result<Command, String> {
         history,
         idle_exit,
         foreground,
+        expect_uid,
     }))
 }
 
@@ -151,8 +160,22 @@ mod tests {
                 history: 4096,
                 idle_exit: Duration::from_millis(250),
                 foreground: true,
+                expect_uid: None,
             }))
         );
+        // A test hook of debug builds only.
+        let hook = parse(&args(&["serve", "--endpoint", "x", "--expect-uid", "7"]));
+        if cfg!(debug_assertions) {
+            assert!(matches!(
+                hook,
+                Ok(Command::Serve(Config {
+                    expect_uid: Some(7),
+                    ..
+                }))
+            ));
+        } else {
+            assert!(hook.is_err());
+        }
         for bad in [
             &[][..],
             &["serve"][..],

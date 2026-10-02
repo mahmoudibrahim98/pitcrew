@@ -302,3 +302,153 @@ fn a_ptyd_of_another_protocol_or_one_that_sends_garbage_is_refused_with_a_reason
     let _ = std::fs::remove_file(&fx2.options.endpoint);
     fx2.finish();
 }
+
+#[test]
+fn a_ptyd_that_closes_during_hello_counts_as_none() {
+    // As one that is exiting, or lost the race to serve: no terminals, rather than an error.
+    let fx = Fixture::new("closes");
+    fake(&fx, drop);
+    let rt = fx.runtime();
+    assert_eq!(rt.list().expect("no ptyd, no terminals"), Vec::new());
+    drop(rt);
+    let _ = std::fs::remove_file(&fx.options.endpoint);
+    fx.finish();
+}
+
+/// Starts a ptyd in the foreground, outside any runtime, with `extra` arguments, through `sh`
+/// (so the shell can change what it inherits first: `prefix`), and waits for its socket.
+fn foreground_ptyd(fx: &Fixture, prefix: &str, extra: &[&str]) -> std::process::Child {
+    let script = format!(
+        r#"{prefix} p="$0"; e="$1"; shift; exec "$p" serve --foreground --endpoint "$e" "$@""#
+    );
+    let mut rest = vec![
+        fx.options.endpoint.display().to_string(),
+        "--idle-exit-ms".into(),
+        "500".into(),
+    ];
+    rest.extend(extra.iter().map(|s| (*s).to_owned()));
+    let child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .arg(common::ptyd())
+        .args(&rest)
+        .env(common::MARK, &fx.mark)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("ptyd");
+    fx.saw(Some(child.id()));
+    common::eventually("ptyd listens", || {
+        UnixStream::connect(&fx.options.endpoint).is_ok()
+    });
+    child
+}
+
+// It uses the debug builds' test hooks (`--expect-uid`, `PtyOptions::expect_uid`).
+#[cfg(debug_assertions)]
+#[test]
+fn a_peer_of_another_uid_is_refused_by_ptyd_and_by_the_client() {
+    let fx = Fixture::new("peer-uid");
+    let me = rustix::process::getuid().as_raw();
+    // ptyd told (a debug build's test hook) that its user is another uid: it refuses us before
+    // reading a byte, so the hello is never answered.
+    let other = (me + 1).to_string();
+    let mut ptyd = foreground_ptyd(&fx, "", &["--expect-uid", &other]);
+    let mut stream = connect(&fx);
+    let _ = hello(&mut stream, PROTOCOL);
+    assert!(closed(&mut stream), "ptyd served a client of another uid");
+    let _ = ptyd.kill();
+    let _ = ptyd.wait();
+    let _ = std::fs::remove_file(&fx.options.endpoint);
+
+    // A real ptyd of ours, and a client told the server must be another uid: it refuses.
+    let rt = fx.runtime();
+    let t = rt
+        .start(&fx.script("ours", "printf ready; exec cat"))
+        .expect("start");
+    fx.saw_ptyd(&rt);
+    wait_for(&rt, t.id, 0, b"ready");
+    let mut wary = fx.options.clone();
+    wary.expect_uid = Some(me + 1);
+    let wary = pitcrew_runtime::PtyRuntime::new(wary).expect("runtime");
+    match wary.list() {
+        Err(RuntimeError::Unavailable(why)) => assert!(why.contains("served by uid"), "{why}"),
+        other => panic!("the client accepted a server of another uid: {other:?}"),
+    }
+    drop(wary);
+    rt.kill(t.id).expect("kill");
+    drop(rt);
+    fx.finish();
+}
+
+#[test]
+fn an_ignored_sigchld_does_not_lose_exit_codes() {
+    let fx = Fixture::new("sigchld");
+    // ptyd inherits SIGCHLD ignored: ended children would be reaped by the kernel, with their
+    // exit status, unless ptyd takes SIGCHLD back.
+    let mut ptyd = foreground_ptyd(&fx, "trap '' CHLD;", &[]);
+    let rt = fx.runtime();
+    let t = rt
+        .start(&fx.script("seven", "printf ready; read x; exit 7"))
+        .expect("start");
+    wait_for(&rt, t.id, 0, b"ready");
+    rt.write(t.id, b"\r").expect("write");
+    common::wait_dead(&rt, t.id);
+    let mut stream = connect(&fx);
+    assert!(hello(&mut stream, PROTOCOL).is_some_and(|r| r.ok.is_some()));
+    let info = Request {
+        id: 2,
+        op: Op::Info { terminal: t.id },
+    };
+    stream.write_all(&frame(&info, Vec::new())).expect("write");
+    let reply = read_reply(&mut stream).expect("info");
+    let described: pitcrew_runtime::pty::proto::Terminal =
+        serde_json::from_value(reply.ok.expect("ok")).expect("terminal");
+    assert_eq!(described.exit_code, Some(7), "{described:?}");
+    drop(stream);
+    drop(rt);
+    common::eventually("ptyd exits once idle", || {
+        ptyd.try_wait().is_ok_and(|s| s.is_some())
+    });
+    fx.finish();
+}
+
+#[test]
+fn the_log_is_appended_to_and_started_afresh_by_its_owner() {
+    let fx = Fixture::new("log");
+    let log = fx.dir.join("ptyd.log");
+    std::fs::write(&log, "a line of an older ptyd\n").expect("old log");
+    let rt = fx.runtime();
+    let t = rt
+        .start(&fx.script("one", "printf ready; exec cat"))
+        .expect("start");
+    fx.saw_ptyd(&rt);
+    wait_for(&rt, t.id, 0, b"ready");
+    let text = || std::fs::read_to_string(&log).unwrap_or_default();
+    common::eventually("ptyd logs that it serves", || text().contains("serving on"));
+    // The ptyd that took the lock started its log afresh.
+    assert!(!text().contains("an older ptyd"), "{}", text());
+    // A second one (started detached, as a runtime would) loses the race and says so, after the
+    // running one's lines, which stay.
+    let second = std::process::Command::new(common::ptyd())
+        .args(["serve", "--endpoint"])
+        .arg(&fx.options.endpoint)
+        .env(common::MARK, &fx.mark)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("second ptyd");
+    assert!(second.success());
+    common::eventually("the second ptyd's refusal is logged", || {
+        text().contains("already")
+    });
+    let lines = text();
+    let serving = lines.find("serving on").expect("serving");
+    let refused = lines.find("already").expect("refused");
+    assert!(serving < refused, "{lines}");
+    rt.kill(t.id).expect("kill");
+    drop(rt);
+    fx.finish();
+}

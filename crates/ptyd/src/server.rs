@@ -1,18 +1,29 @@
 //! Where ptyd listens, who may connect, and how requests are served.
 //!
 //! - **One per user and endpoint.** On Unix a lock file next to the socket (`flock`), taken
-//!   before the socket is bound; on Windows the pipe's first instance (`FILE_FLAG_FIRST_PIPE_INSTANCE`).
-//!   A second ptyd exits with status 3.
+//!   before the socket is bound; on Windows the pipe's first instance
+//!   (`FILE_FLAG_FIRST_PIPE_INSTANCE`). A second ptyd exits with status 3.
 //! - **Who may connect.** On Unix the socket's directory is private (0700, checked before it is
-//!   used) and every client's uid (`SO_PEERCRED`) must be ours. On Windows the pipe's DACL grants
-//!   the current user alone, remote clients are refused (`PIPE_REJECT_REMOTE_CLIENTS`), and the
-//!   user of every client's process token must be ours. Anyone else is disconnected at once.
-//! - **Bounded.** At most 32 clients; a client says hello within 10 seconds; at most 16 of its
-//!   slow requests (start, screen, read, kill), and 64 of everyone's, are in progress until
-//!   their replies are written, so replies a client does not read stay bounded; frames are
-//!   capped by the protocol. A client that stops reading stops being read.
-//! - **Idle exit.** With no terminals running and no client connected for a while (30 seconds
-//!   by default), ptyd exits, removing its socket.
+//!   used) and every client's uid (`SO_PEERCRED`) must be ours, before anything is read. On
+//!   Windows the pipe's DACL grants the current user alone, its mandatory label refuses
+//!   processes below ptyd's integrity level, remote clients are refused
+//!   (`PIPE_REJECT_REMOTE_CLIENTS`), the user of the client's process must be ours before
+//!   anything is read, and after the hello the client's own token (read by impersonating it at
+//!   the identification level it allows) must be our user at our integrity level: an elevated
+//!   ptyd serves only elevated clients, an ordinary one only ordinary ones.
+//! - **Bounded.**
+//!   - At most 32 clients; a client says hello within 10 seconds.
+//!   - At most 16 slow requests (start, screen, kill) of a client, and 64 of everyone's, are
+//!     in progress until their replies are written.
+//!   - Reads that wait for output have their own budget (256 per client, 1024 in all), since
+//!     waiting holds no data: a daemon can tail every terminal at once.
+//!   - Reply payloads queued for a client are at most 8 MiB (64 MiB for all clients); a reply
+//!     waits for room, so a client that stops reading stops being read.
+//!   - A reply not written within 30 seconds ends the connection, and so does a client that
+//!     stopped sending and has not taken its last replies 15 seconds later.
+//! - **Idle exit.** With no terminal running, no client connected, and no ended terminal that
+//!   no client has been told about (kept for at most 10 minutes), for a while (30 seconds by
+//!   default), ptyd exits, removing its socket.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -38,20 +49,44 @@ pub(crate) const IDLE_EXIT: Duration = Duration::from_secs(30);
 const MAX_CLIENTS: usize = 32;
 /// A client must say hello within this.
 const HELLO_WITHIN: Duration = Duration::from_secs(10);
-/// Slow requests (start, screen, read, kill) of one client in progress at once, at most; one
-/// is in progress until its reply is written.
+/// Slow requests (start, screen, kill) of one client in progress at once, at most; one is in
+/// progress until its reply is written.
 const IN_FLIGHT: usize = 16;
-/// Slow requests of all clients in progress at once, at most. With reads of at most 4 MiB,
-/// replies waiting for slow clients hold at most 256 MiB.
+/// Slow requests of all clients in progress at once, at most.
 const ALL_IN_FLIGHT: usize = 64;
+/// Reads waiting for output, per client and in all.
+const WAITING: usize = 256;
+const ALL_WAITING: usize = 1024;
+/// Reply payload queued for one client, and for all, in KiB: a reply waits for room.
+const REPLY_KIB: usize = 8 << 10;
+const ALL_REPLY_KIB: usize = 64 << 10;
 /// Replies queued for one client.
-const REPLIES: usize = 32;
+const REPLIES: usize = 64;
+/// A reply must be written within this, or the connection ends.
+const WRITE_WITHIN: Duration = Duration::from_secs(30);
+/// A client that stopped sending has this long to take its last replies.
+const DRAIN_WITHIN: Duration = Duration::from_secs(MAX_WAIT_MS / 1000 + 5);
 
 struct State {
     terms: Arc<Terms>,
     clients: AtomicUsize,
-    /// Permits for slow requests, shared by all clients.
+    /// Budgets shared by all clients.
     slow: Arc<Semaphore>,
+    waiting: Arc<Semaphore>,
+    reply_kib: Arc<Semaphore>,
+    /// The uid clients must have (this process's, unless a debug build was told otherwise).
+    #[cfg(unix)]
+    uid: u32,
+    /// Who clients must be.
+    #[cfg(windows)]
+    me: pitcrew_runtime::pty::windows::Identity,
+}
+
+/// One client's budgets.
+struct Budgets {
+    slow: Arc<Semaphore>,
+    waiting: Arc<Semaphore>,
+    reply_kib: Arc<Semaphore>,
 }
 
 /// Counts a client while it is connected, whatever ends its task.
@@ -93,6 +128,10 @@ pub(crate) fn run(config: &Config, args: &[OsString]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // The log is ours now: start it afresh (it is appended to, so a ptyd that lost the race
+    // above left the running one's lines alone).
+    #[cfg(unix)]
+    unix::truncate_log();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("ptyd-io")
@@ -105,12 +144,33 @@ pub(crate) fn run(config: &Config, args: &[OsString]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    #[cfg(windows)]
+    let me = match pitcrew_runtime::pty::windows::current_identity() {
+        Ok(me) => me,
+        Err(e) => {
+            log!("cannot read our own token: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let state = Arc::new(State {
         terms: Terms::new(config.history),
         clients: AtomicUsize::new(0),
         slow: Arc::new(Semaphore::new(ALL_IN_FLIGHT)),
+        waiting: Arc::new(Semaphore::new(ALL_WAITING)),
+        reply_kib: Arc::new(Semaphore::new(ALL_REPLY_KIB)),
+        #[cfg(unix)]
+        uid: config
+            .expect_uid
+            .unwrap_or_else(|| rustix::process::getuid().as_raw()),
+        #[cfg(windows)]
+        me,
     });
     let served = runtime.block_on(async {
+        // A `SIGCHLD` ignored by whoever started us would make programs vanish without a
+        // trace (no exit status, and nothing to hold their pid during a kill). A handler,
+        // unlike `SIG_IGN`, keeps ended children waitable; tokio installs one safely.
+        #[cfg(unix)]
+        let _children = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?;
         let listener = Listener::bind(&config.endpoint)?;
         log!(
             "{} (protocol {PROTOCOL}) serving on {}",
@@ -156,7 +216,7 @@ async fn serve(mut listener: Listener, state: &Arc<State>, idle: Duration) {
                         continue;
                     }
                 };
-                if let Err(why) = check_peer(&stream) {
+                if let Err(why) = check_peer(&stream, state) {
                     log!("refused a client: {why}");
                     continue;
                 }
@@ -172,7 +232,10 @@ async fn serve(mut listener: Listener, state: &Arc<State>, idle: Duration) {
                 });
             }
             _ = tick.tick() => {
-                if state.clients.load(Ordering::Acquire) > 0 || state.terms.live() > 0 {
+                let busy = state.clients.load(Ordering::Acquire) > 0
+                    || state.terms.live() > 0
+                    || state.terms.unseen_endings() > 0;
+                if busy {
                     quiet_since = None;
                 } else if quiet_since.get_or_insert_with(Instant::now).elapsed() >= idle {
                     return;
@@ -182,29 +245,47 @@ async fn serve(mut listener: Listener, state: &Arc<State>, idle: Duration) {
     }
 }
 
-/// A reply on its way to a client, with the permits of the slow request it answers: they are
-/// given back once it is written, so a client that stops reading holds at most [`IN_FLIGHT`]
-/// large replies.
+/// A reply on its way to a client, with the permits it holds until it is written: a slow
+/// request's, and room for its payload.
 struct Outgoing {
     frame: Frame,
-    _permits: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
+    _permits: Vec<OwnedSemaphorePermit>,
 }
 
 type Replies = mpsc::Sender<Outgoing>;
 
 /// Serves one client until it disconnects.
-async fn client<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S, state: &Arc<State>) {
+async fn client<S>(mut stream: S, state: &Arc<State>)
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    State: CheckAfterHello<S>,
+{
+    // The hello is read before the stream is split: on Windows the client's token can be read
+    // only once it has sent something, and through the pipe itself.
+    let Ok(Ok(Some(hello_frame))) =
+        tokio::time::timeout(HELLO_WITHIN, proto::read_frame(&mut stream)).await
+    else {
+        return;
+    };
+    let identity = state.check_after_hello(&stream);
     let (mut reader, mut writer) = tokio::io::split(stream);
     let (replies, mut outgoing) = mpsc::channel::<Outgoing>(REPLIES);
-    let writing = tokio::spawn(async move {
+    let mut writing = tokio::spawn(async move {
         while let Some(reply) = outgoing.recv().await {
-            if proto::write_frame(&mut writer, &reply.frame).await.is_err() {
+            let written =
+                tokio::time::timeout(WRITE_WITHIN, proto::write_frame(&mut writer, &reply.frame))
+                    .await;
+            if !matches!(written, Ok(Ok(()))) {
                 break;
             }
         }
     });
-    if hello(&mut reader, &replies).await {
-        let in_flight = Arc::new(Semaphore::new(IN_FLIGHT));
+    if hello(&hello_frame, identity, &replies).await {
+        let budgets = Budgets {
+            slow: Arc::new(Semaphore::new(IN_FLIGHT)),
+            waiting: Arc::new(Semaphore::new(WAITING)),
+            reply_kib: Arc::new(Semaphore::new(REPLY_KIB)),
+        };
         // A read error or a frame over the limits ends the connection.
         while let Ok(Some(frame)) = proto::read_frame(&mut reader).await {
             let request = match serde_json::from_slice::<Request>(&frame.header) {
@@ -212,7 +293,7 @@ async fn client<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S, state: &A
                 Err(e) => match serde_json::from_slice::<IdOnly>(&frame.header) {
                     Ok(IdOnly { id }) => {
                         let reply = Reply::err(id, FailureKind::Invalid, format!("{e}"));
-                        if !send(&replies, reply, Vec::new()).await {
+                        if !send(&replies, reply, Vec::new(), Vec::new()).await {
                             break;
                         }
                         continue;
@@ -220,13 +301,64 @@ async fn client<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S, state: &A
                     Err(_) => break,
                 },
             };
-            if !handle(request, frame.payload, state, &replies, &in_flight).await {
+            if !handle(request, frame.payload, state, &replies, &budgets).await {
                 break;
             }
         }
     }
     drop(replies);
-    let _ = writing.await;
+    // The client has stopped sending; it gets a little while for its last replies.
+    if tokio::time::timeout(DRAIN_WITHIN, &mut writing)
+        .await
+        .is_err()
+    {
+        writing.abort();
+    }
+}
+
+/// What is checked once a client's hello has been read.
+trait CheckAfterHello<S> {
+    fn check_after_hello(&self, stream: &S) -> Result<(), String>;
+}
+
+#[cfg(unix)]
+impl<S> CheckAfterHello<S> for State {
+    /// Nothing more: the peer's uid was checked before anything was read.
+    fn check_after_hello(&self, _: &S) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl CheckAfterHello<tokio::net::windows::named_pipe::NamedPipeServer> for State {
+    /// The client's own token: our user, at our integrity level.
+    fn check_after_hello(
+        &self,
+        pipe: &tokio::net::windows::named_pipe::NamedPipeServer,
+    ) -> Result<(), String> {
+        let theirs = pitcrew_runtime::pty::windows::pipe_client_identity(pipe)
+            .map_err(|e| format!("cannot read the client's token: {e}"))?;
+        same_identity(&theirs, &self.me)
+    }
+}
+
+/// A client must be our user at our integrity level.
+#[cfg(windows)]
+fn same_identity(
+    theirs: &pitcrew_runtime::pty::windows::Identity,
+    mine: &pitcrew_runtime::pty::windows::Identity,
+) -> Result<(), String> {
+    if theirs.user != mine.user {
+        Err(format!("the client runs as {}, not this user", theirs.user))
+    } else if theirs.integrity != mine.integrity {
+        Err(format!(
+            "the client runs at integrity level {:#x}, and this pitcrew-ptyd at {:#x}: an \
+             elevated pitcrew-ptyd serves only elevated clients, and the other way round",
+            theirs.integrity, mine.integrity
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -234,47 +366,44 @@ struct IdOnly {
     id: u64,
 }
 
-/// The first request must be `hello` with our protocol. True if it was.
-async fn hello<R: AsyncRead + Unpin>(reader: &mut R, replies: &Replies) -> bool {
-    let Ok(Ok(Some(frame))) = tokio::time::timeout(HELLO_WITHIN, proto::read_frame(reader)).await
-    else {
-        return false;
-    };
+/// The first request must be `hello` with our protocol, from a client that passed the checks
+/// made after it. True if it was.
+async fn hello(frame: &Frame, identity: Result<(), String>, replies: &Replies) -> bool {
     let Ok(Request { id, op }) = serde_json::from_slice::<Request>(&frame.header) else {
         return false;
     };
-    match op {
-        Op::Hello { protocol } if protocol == PROTOCOL => {
-            let hello = Hello {
-                protocol: PROTOCOL,
-                version: env!("CARGO_PKG_VERSION").into(),
-                pid: std::process::id(),
-            };
-            send(replies, Reply::ok(id, &hello), Vec::new()).await
-        }
-        Op::Hello { protocol } => {
-            let why = format!("this pitcrew-ptyd speaks protocol {PROTOCOL}, not {protocol}");
-            let _ = send(
-                replies,
-                Reply::err(id, FailureKind::Unsupported, why),
-                Vec::new(),
-            )
-            .await;
-            false
-        }
-        _ => false,
+    let Op::Hello { protocol } = op else {
+        return false;
+    };
+    let refusal = if let Err(why) = identity {
+        log!("refused a client: {why}");
+        Some(why)
+    } else if protocol != PROTOCOL {
+        Some(format!(
+            "this pitcrew-ptyd speaks protocol {PROTOCOL}, not {protocol}"
+        ))
+    } else {
+        None
+    };
+    if let Some(why) = refusal {
+        let reply = Reply::err(id, FailureKind::Unsupported, why);
+        let _ = send(replies, reply, Vec::new(), Vec::new()).await;
+        return false;
     }
+    let hello = Hello {
+        protocol: PROTOCOL,
+        version: env!("CARGO_PKG_VERSION").into(),
+        pid: std::process::id(),
+    };
+    send(replies, Reply::ok(id, &hello), Vec::new(), Vec::new()).await
 }
 
-async fn send(replies: &Replies, reply: Reply, payload: Vec<u8>) -> bool {
-    send_with(replies, reply, payload, None).await
-}
-
-async fn send_with(
+/// Queues a reply with the permits it holds until written. False if the connection is gone.
+async fn send(
     replies: &Replies,
     reply: Reply,
     payload: Vec<u8>,
-    permits: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
+    permits: Vec<OwnedSemaphorePermit>,
 ) -> bool {
     let frame = Frame::new(&reply, payload).unwrap_or_else(|e| Frame {
         header: serde_json::to_vec(&Reply::err(reply.id, FailureKind::Io, e.to_string()))
@@ -288,6 +417,27 @@ async fn send_with(
         })
         .await
         .is_ok()
+}
+
+/// Room for a payload of `bytes` in the client's and everyone's reply budgets, waited for.
+async fn room(
+    bytes: usize,
+    mine: &Arc<Semaphore>,
+    all: &Arc<Semaphore>,
+) -> Vec<OwnedSemaphorePermit> {
+    let kib = u32::try_from(bytes.div_ceil(1024)).unwrap_or(u32::MAX);
+    if kib == 0 {
+        return Vec::new();
+    }
+    let mut permits = Vec::with_capacity(2);
+    // The semaphores are never closed, so these only fail if they were.
+    if let Ok(permit) = Arc::clone(mine).acquire_many_owned(kib).await {
+        permits.push(permit);
+    }
+    if let Ok(permit) = Arc::clone(all).acquire_many_owned(kib).await {
+        permits.push(permit);
+    }
+    permits
 }
 
 fn done(id: u64, result: Result<(), Failed>) -> Reply {
@@ -304,14 +454,22 @@ fn answer(id: u64, result: Result<impl serde::Serialize, Failed>) -> Reply {
     }
 }
 
-/// Serves one request. Input, resizes and quick questions are answered in order, here; slow
-/// requests run on their own. False if the connection is gone.
+/// Both permits of a budget (the client's, then everyone's), or `None` if either is spent.
+fn take(mine: &Arc<Semaphore>, all: &Arc<Semaphore>) -> Option<Vec<OwnedSemaphorePermit>> {
+    let mine = Arc::clone(mine).try_acquire_owned().ok()?;
+    let all = Arc::clone(all).try_acquire_owned().ok()?;
+    Some(vec![mine, all])
+}
+
+/// Serves one request. Input, resizes, quick questions and reads that do not wait are answered
+/// in order, here; slow requests and waiting reads run on their own. False if the connection
+/// is gone.
 async fn handle(
     request: Request,
     payload: Vec<u8>,
     state: &Arc<State>,
     replies: &Replies,
-    in_flight: &Arc<Semaphore>,
+    budgets: &Budgets,
 ) -> bool {
     let Request { id, op } = request;
     let terms = &state.terms;
@@ -328,31 +486,69 @@ async fn handle(
             cols,
             rows,
         } => done(id, terms.resize(terminal, cols, rows)),
-        Op::Info { terminal } => answer(id, terms.get(terminal).map(|t| t.describe())),
+        Op::Info { terminal } => answer(id, terms.get(terminal).map(|t| t.describe_seen())),
         Op::List => Reply::ok(id, &terms.list()),
         Op::Hello { .. } => Reply::err(id, FailureKind::Invalid, "hello was said already"),
-        Op::Start { .. } | Op::Screen { .. } | Op::Read { .. } | Op::Kill { .. } => {
-            let permits = Arc::clone(in_flight)
-                .try_acquire_owned()
-                .and_then(|mine| Ok((mine, Arc::clone(&state.slow).try_acquire_owned()?)));
-            let Ok(permits) = permits else {
+        Op::Read {
+            terminal,
+            from,
+            max,
+            wait_ms: 0,
+        } => {
+            let (reply, data) = match terms.get(terminal) {
+                Ok(term) => read_now(id, &term, from, max),
+                Err((kind, message)) => (Reply::err(id, kind, message), Vec::new()),
+            };
+            let permits = room(data.len(), &budgets.reply_kib, &state.reply_kib).await;
+            return send(replies, reply, data, permits).await;
+        }
+        Op::Read {
+            terminal,
+            from,
+            max,
+            wait_ms,
+        } => {
+            let Some(waiting) = take(&budgets.waiting, &state.waiting) else {
+                let busy = Reply::err(id, FailureKind::Busy, "too many reads are waiting");
+                return send(replies, busy, Vec::new(), Vec::new()).await;
+            };
+            let term = match terms.get(terminal) {
+                Ok(term) => term,
+                Err((kind, message)) => {
+                    let reply = Reply::err(id, kind, message);
+                    return send(replies, reply, Vec::new(), Vec::new()).await;
+                }
+            };
+            let (state, replies) = (Arc::clone(state), replies.clone());
+            let mine = Arc::clone(&budgets.reply_kib);
+            tokio::spawn(async move {
+                let (reply, data) = read_waiting(id, &term, from, max, wait_ms).await;
+                // Done waiting: the payload takes reply room instead.
+                drop(waiting);
+                let permits = room(data.len(), &mine, &state.reply_kib).await;
+                let _ = send(&replies, reply, data, permits).await;
+            });
+            return true;
+        }
+        Op::Start { .. } | Op::Screen { .. } | Op::Kill { .. } => {
+            let Some(permits) = take(&budgets.slow, &state.slow) else {
                 let busy = Reply::err(id, FailureKind::Busy, "too many requests are in progress");
-                return send(replies, busy, Vec::new()).await;
+                return send(replies, busy, Vec::new(), Vec::new()).await;
             };
             let (state, replies) = (Arc::clone(state), replies.clone());
             tokio::spawn(async move {
-                let (reply, payload) = slow(id, op, &state).await;
-                let _ = send_with(&replies, reply, payload, Some(permits)).await;
+                let reply = slow(id, op, &state).await;
+                let _ = send(&replies, reply, Vec::new(), permits).await;
             });
             return true;
         }
         _ => Reply::err(id, FailureKind::Unsupported, "an unknown request"),
     };
-    send(replies, reply, Vec::new()).await
+    send(replies, reply, Vec::new(), Vec::new()).await
 }
 
-/// A request that may take a while: on a blocking thread, or waiting for output.
-async fn slow(id: u64, op: Op, state: &Arc<State>) -> (Reply, Vec<u8>) {
+/// A request that may take a while, on a blocking thread.
+async fn slow(id: u64, op: Op, state: &Arc<State>) -> Reply {
     let terms = Arc::clone(&state.terms);
     let blocking = move |work: Box<dyn FnOnce() -> Reply + Send>| async move {
         tokio::task::spawn_blocking(work)
@@ -376,58 +572,51 @@ async fn slow(id: u64, op: Op, state: &Arc<State>) -> (Reply, Vec<u8>) {
                 cols,
                 rows,
             };
-            let reply = blocking(Box::new(move || answer(id, terms.start(request)))).await;
-            (reply, Vec::new())
+            blocking(Box::new(move || answer(id, terms.start(request)))).await
         }
-        Op::Kill { terminal } => {
-            let reply = blocking(Box::new(move || done(id, terms.kill(terminal)))).await;
-            (reply, Vec::new())
-        }
+        Op::Kill { terminal } => blocking(Box::new(move || done(id, terms.kill(terminal)))).await,
         Op::Screen { terminal } => match terms.get(terminal) {
             Ok(term) => {
-                let reply = blocking(Box::new(move || {
+                blocking(Box::new(move || {
                     Reply::ok(id, &term.shared.screened.screen(&term.id))
                 }))
-                .await;
-                (reply, Vec::new())
+                .await
             }
-            Err((kind, message)) => (Reply::err(id, kind, message), Vec::new()),
+            Err((kind, message)) => Reply::err(id, kind, message),
         },
-        Op::Read {
-            terminal,
-            from,
-            max,
-            wait_ms,
-        } => match terms.get(terminal) {
-            Ok(term) => read(id, &term, from, max, wait_ms).await,
-            Err((kind, message)) => (Reply::err(id, kind, message), Vec::new()),
-        },
-        _ => (
-            Reply::err(id, FailureKind::Unsupported, "an unknown request"),
-            Vec::new(),
-        ),
+        _ => Reply::err(id, FailureKind::Unsupported, "an unknown request"),
     }
 }
 
-/// Output from `from`; with `wait_ms`, waits while there is none past it and the program runs.
-async fn read(id: u64, term: &Term, from: u64, max: u64, wait_ms: u64) -> (Reply, Vec<u8>) {
+/// Output from `from`, now.
+fn read_now(id: u64, term: &Term, from: u64, max: u64) -> (Reply, Vec<u8>) {
     let max = usize::try_from(max).unwrap_or(usize::MAX).min(MAX_READ);
+    let chunk = term.shared.screened.read(from, max);
+    let alive = term.shared.alive();
+    if !alive {
+        term.seen();
+    }
+    let head = Chunk {
+        offset: chunk.offset,
+        end: chunk.end,
+        truncated: chunk.truncated,
+        alive,
+    };
+    (Reply::ok(id, &head), chunk.data)
+}
+
+/// Output from `from`, waiting up to `wait_ms` while there is none past it and the program
+/// runs.
+async fn read_waiting(id: u64, term: &Term, from: u64, max: u64, wait_ms: u64) -> (Reply, Vec<u8>) {
     let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms.min(MAX_WAIT_MS));
     loop {
         let changed = term.shared.changed.notified();
         tokio::pin!(changed);
         // Registered before looking, so output arriving in between is not missed.
         changed.as_mut().enable();
-        let chunk = term.shared.screened.read(from, max);
-        let alive = term.shared.alive();
-        if chunk.end > from || !alive || tokio::time::Instant::now() >= deadline {
-            let head = Chunk {
-                offset: chunk.offset,
-                end: chunk.end,
-                truncated: chunk.truncated,
-                alive,
-            };
-            return (Reply::ok(id, &head), chunk.data);
+        let past = term.shared.screened.end() > from;
+        if past || !term.shared.alive() || tokio::time::Instant::now() >= deadline {
+            return read_now(id, term, from, max);
         }
         tokio::select! {
             () = &mut changed => {}
@@ -436,13 +625,13 @@ async fn read(id: u64, term: &Term, from: u64, max: u64, wait_ms: u64) -> (Reply
     }
 }
 
-/// Refuses a client that is not this user.
+/// Refuses a client that is not this user, before anything is read from it.
 #[cfg(unix)]
-fn check_peer(stream: &tokio::net::UnixStream) -> Result<(), String> {
+fn check_peer(stream: &tokio::net::UnixStream, state: &State) -> Result<(), String> {
     let peer = stream
         .peer_cred()
         .map_err(|e| format!("cannot read its credentials: {e}"))?;
-    same_user(peer.uid(), rustix::process::getuid().as_raw())
+    same_user(peer.uid(), state.uid)
 }
 
 #[cfg(unix)]
@@ -454,15 +643,18 @@ fn same_user(peer: u32, me: u32) -> Result<(), String> {
     }
 }
 
-/// Refuses a client whose process token is not this user's.
+/// Refuses a client whose process is not this user's, before anything is read from it. (The
+/// client's own token, which no pid can stand in for, is checked after its hello.)
 #[cfg(windows)]
-fn check_peer(pipe: &tokio::net::windows::named_pipe::NamedPipeServer) -> Result<(), String> {
-    use pitcrew_runtime::pty::windows::{current_user_sid, pipe_client_pid, process_user_sid};
+fn check_peer(
+    pipe: &tokio::net::windows::named_pipe::NamedPipeServer,
+    state: &State,
+) -> Result<(), String> {
+    use pitcrew_runtime::pty::windows::{pipe_client_pid, process_user_sid};
     let pid = pipe_client_pid(pipe).map_err(|e| format!("cannot tell who it is: {e}"))?;
     let theirs =
         process_user_sid(pid).map_err(|e| format!("cannot read process {pid}'s user: {e}"))?;
-    let mine = current_user_sid().map_err(|e| format!("cannot read our own user: {e}"))?;
-    if theirs == mine {
+    if theirs == state.me.user {
         Ok(())
     } else {
         Err(format!("process {pid} runs as {theirs}, not this user"))
@@ -501,6 +693,7 @@ struct Listener {
 
 #[cfg(windows)]
 impl Listener {
+    /// Every instance: local clients only, both directions.
     fn options(first: bool) -> tokio::net::windows::named_pipe::ServerOptions {
         let mut options = tokio::net::windows::named_pipe::ServerOptions::new();
         options
@@ -540,10 +733,11 @@ impl Listener {
 mod unix {
     use std::ffi::OsString;
     use std::fs::File;
+    use std::os::fd::AsFd;
     use std::path::{Path, PathBuf};
     use std::process::{Command, ExitCode, Stdio};
 
-    use rustix::fs::{FlockOperation, Mode, OFlags};
+    use rustix::fs::{FileType, FlockOperation, Mode, OFlags};
 
     use crate::Config;
 
@@ -554,11 +748,12 @@ mod unix {
         PathBuf::from(name)
     }
 
-    /// Opens a file of ours in the private directory, never through a link.
-    fn open(path: &Path, truncate: bool) -> std::io::Result<File> {
+    /// Opens a file of ours in the private directory, never through a link; the log is opened
+    /// for appending.
+    fn open(path: &Path, append: bool) -> std::io::Result<File> {
         let mut flags = OFlags::CREATE | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        if truncate {
-            flags |= OFlags::TRUNC;
+        if append {
+            flags |= OFlags::APPEND;
         }
         let fd = rustix::fs::open(path, flags, Mode::from_raw_mode(0o600))?;
         Ok(File::from(fd))
@@ -588,8 +783,18 @@ mod unix {
         }
     }
 
-    /// Starts the real ptyd as a detached copy of this one (its log next to the socket) and
-    /// returns, so the process that started this one is not left with a child to reap.
+    /// Empties our log, if standard error is one (a regular file), once the lock is ours.
+    pub(super) fn truncate_log() {
+        let stderr = std::io::stderr();
+        let fd = stderr.as_fd();
+        if rustix::fs::fstat(fd).is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode).is_file()) {
+            let _ = rustix::fs::ftruncate(fd, 0);
+        }
+    }
+
+    /// Starts the real ptyd as a detached copy of this one (its log, appended to, next to the
+    /// socket) and returns, so the process that started this one is not left with a child to
+    /// reap.
     pub(super) fn detach(config: &Config, args: &[OsString]) -> ExitCode {
         if let Err(why) = pitcrew_runtime::pty::check_endpoint(&config.endpoint) {
             eprintln!("pitcrew-ptyd: {why}");
@@ -631,19 +836,59 @@ mod tests {
         use super::*;
         let me = rustix::process::getuid().as_raw();
         assert!(same_user(me, me).is_ok());
-        let other = if me == 0 { 1000 } else { 0 };
-        let why = same_user(other, me).expect_err("another uid");
+        let why = same_user(me + 1, me).expect_err("another uid");
         assert!(why.contains("not this user"), "{why}");
-        // A real connection from this process passes.
-        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("pair");
-        a.set_nonblocking(true).expect("nonblocking");
+    }
+
+    /// The listener's own options and descriptor: our user alone, at our integrity level, and
+    /// no remote client (opening the pipe through the network redirector is refused).
+    #[cfg(windows)]
+    #[test]
+    fn the_listener_is_ours_local_and_at_our_level() {
+        use super::*;
+        use pitcrew_runtime::pty::windows::{
+            Identity, current_identity, dacl_sddl, label_integrity, owner_sid,
+        };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("runtime");
         rt.block_on(async {
-            let a = tokio::net::UnixStream::from_std(a).expect("tokio stream");
-            assert!(check_peer(&a).is_ok());
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let short = format!("pitcrew-ptyd-unit-listener-{}-{nanos}", std::process::id());
+            let name = format!(r"\\.\pipe\{short}");
+            let listener = Listener::bind(Path::new(&name)).expect("bind");
+            let me = current_identity().expect("identity");
+            let dacl = dacl_sddl(&listener.next).expect("dacl");
+            assert!(dacl.starts_with("D:P"), "{dacl}");
+            assert_eq!(dacl.matches("(A;").count(), 1, "{dacl}");
+            assert!(dacl.contains(&me.user), "{dacl}");
+            assert_eq!(owner_sid(&listener.next).expect("owner"), me.user);
+            assert_eq!(
+                label_integrity(&listener.next).expect("label"),
+                Some(me.integrity)
+            );
+            // A second ptyd cannot take the name.
+            assert!(Listener::bind(Path::new(&name)).is_err());
+            // Through the network redirector (as a remote client would come), it is refused.
+            let remote = format!(r"\\127.0.0.1\pipe\{short}");
+            let opened = tokio::net::windows::named_pipe::ClientOptions::new().open(&remote);
+            assert!(opened.is_err(), "a remote client was let in");
+            // And a client of another integrity level is refused after its hello.
+            let other = Identity {
+                user: me.user.clone(),
+                integrity: me.integrity + 0x1000,
+            };
+            let why = same_identity(&other, &me).expect_err("another level");
+            assert!(why.contains("integrity"), "{why}");
+            let stranger = Identity {
+                user: "S-1-5-21-1-2-3-4".into(),
+                integrity: me.integrity,
+            };
+            assert!(same_identity(&stranger, &me).is_err());
+            assert!(same_identity(&me, &me).is_ok());
         });
     }
 }

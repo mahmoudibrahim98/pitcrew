@@ -54,6 +54,8 @@ const KILL_WAIT: Duration = Duration::from_secs(3);
 const CLOSE_AFTER: Duration = Duration::from_millis(300);
 /// Bytes read from a PTY at a time.
 const READ_CHUNK: usize = 64 << 10;
+/// How long an ending no client has been told about keeps an idle ptyd running.
+const UNSEEN_KEPT: Duration = Duration::from_secs(600);
 
 /// A refusal: its kind and a message for people.
 pub(crate) type Failed = (FailureKind, String);
@@ -83,11 +85,22 @@ pub(crate) struct Shared {
     /// Input bytes queued and not yet written.
     pending: AtomicUsize,
     size: Mutex<(u16, u16)>,
+    /// When the program ended.
+    ended_at: Mutex<Option<Instant>>,
+    /// A client has been told the program ended (by `info`, `list`, a read, or its kill).
+    seen: AtomicBool,
 }
 
 impl Shared {
     pub(crate) fn alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
+    }
+
+    /// An ending no client has been told about, recent enough to keep ptyd running for.
+    fn unseen_ending(&self) -> bool {
+        !self.alive()
+            && !self.seen.load(Ordering::Acquire)
+            && lock(&self.ended_at).is_some_and(|at| at.elapsed() < UNSEEN_KEPT)
     }
 }
 
@@ -121,6 +134,20 @@ impl Term {
             cols,
             rows,
         }
+    }
+
+    /// As [`Term::describe`], and a client now knows whether it has ended.
+    pub(crate) fn describe_seen(&self) -> Terminal {
+        let described = self.describe();
+        if !described.alive {
+            self.seen();
+        }
+        described
+    }
+
+    /// A client has been told this terminal's program ended.
+    pub(crate) fn seen(&self) {
+        self.shared.seen.store(true, Ordering::Release);
     }
 
     fn send(&self, input: Input) -> Result<(), TrySendError<Input>> {
@@ -205,9 +232,18 @@ impl Terms {
 
     pub(crate) fn list(&self) -> Vec<Terminal> {
         let terms: Vec<Arc<Term>> = lock(&self.registry).terms.values().cloned().collect();
-        let mut all: Vec<Terminal> = terms.iter().map(|t| t.describe()).collect();
+        let mut all: Vec<Terminal> = terms.iter().map(|t| t.describe_seen()).collect();
         all.sort_by_key(|t| t.id);
         all
+    }
+
+    /// Ended terminals no client has been told about (in the last ten minutes).
+    pub(crate) fn unseen_endings(&self) -> usize {
+        lock(&self.registry)
+            .terms
+            .values()
+            .filter(|t| t.shared.unseen_ending())
+            .count()
     }
 
     /// A terminal's program has ended: it stays readable until 16 more have.
@@ -290,6 +326,8 @@ impl Terms {
             app_cursor: AtomicBool::new(false),
             pending: AtomicUsize::new(0),
             size: Mutex::new((request.cols, request.rows)),
+            ended_at: Mutex::new(None),
+            seen: AtomicBool::new(false),
         });
         let (input, queued) = mpsc::sync_channel(INPUT_QUEUE);
         let mut child = started
@@ -412,11 +450,17 @@ impl Terms {
     }
 
     /// Ends a terminal's program and everything it started, and waits (a few seconds at most)
-    /// for its end to be seen. Ending an ended one does nothing. Blocking: call it from a
-    /// blocking thread.
+    /// for its end to be seen. On Unix, ending an ended one does nothing (its process group
+    /// may no longer be its own); on Windows its job is still terminated, ending what the
+    /// program left running. Blocking: call it from a blocking thread.
     pub(crate) fn kill(&self, id: TerminalId) -> Result<(), Failed> {
         let term = self.get(id)?;
+        term.seen();
         if !term.shared.alive() {
+            #[cfg(windows)]
+            if let Some(job) = lock(&term.job).take() {
+                job.terminate();
+            }
             return Ok(());
         }
         #[cfg(unix)]
@@ -485,24 +529,33 @@ impl Drop for Started {
     }
 }
 
-/// `SIGTERM` to a process group, then `SIGKILL` if any of it is still there after
-/// [`KILL_GRACE`]. The leader must not have been reaped (the caller holds the reap lock).
+/// `SIGTERM` to a process group, then `SIGKILL` to what is left of it once its leader has ended
+/// or [`KILL_GRACE`] has passed. The leader must not have been reaped (the caller holds the
+/// reap lock), so the group is still its own while it is signalled: an ended, unreaped leader
+/// keeps it in place, and is how its end is seen early (`waitid` with `WNOHANG | WNOWAIT`).
 #[cfg(unix)]
 fn stop_group(leader: u32) {
-    use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
+    use rustix::process::{
+        Pid, Signal, WaitId, WaitIdOptions, kill_process_group, test_kill_process_group, waitid,
+    };
     let Some(group) = i32::try_from(leader).ok().and_then(Pid::from_raw) else {
         return;
     };
     if kill_process_group(group, Signal::TERM).is_err() {
         return;
     }
+    let ended = || {
+        let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+        matches!(waitid(WaitId::Pid(group), options), Ok(Some(_)))
+    };
     let grace = Instant::now() + KILL_GRACE;
-    while Instant::now() < grace {
+    while Instant::now() < grace && !ended() {
         if test_kill_process_group(group).is_err() {
             return;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
+    // Whatever of the group ignored SIGTERM (the leader may have ended, its jobs not).
     let _ = kill_process_group(group, Signal::KILL);
 }
 
@@ -614,6 +667,7 @@ fn finish(term: &Term, status: Option<portable_pty::ExitStatus>) {
         .filter(|s| s.signal().is_none())
         .map(|s| i64::from(s.exit_code()));
     *lock(&term.shared.exit_code) = code;
+    *lock(&term.shared.ended_at) = Some(Instant::now());
     term.shared.alive.store(false, Ordering::Release);
     term.shared.changed.notify_waiters();
     log!("{} ended (exit code {code:?})", term.id);
