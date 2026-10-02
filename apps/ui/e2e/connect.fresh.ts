@@ -124,9 +124,9 @@ test('connects a remote machine, answering SSH in the app, and sets its fresh hu
   expect(leaked).toBe(false);
 
   // The switcher can remove it again, after asking. (It goes by the gateway's name for it.)
-  await page.getByRole('button', { name: 'Workspace: hpc-login' }).click();
+  await page.getByRole('button', { name: 'Workspace: hpc-login · login.example.org' }).click();
   await page.getByRole('menuitem', { name: 'Remove workspace…' }).click();
-  const remove = page.getByRole('dialog', { name: 'Remove hpc-login?' });
+  const remove = page.getByRole('dialog', { name: 'Remove hpc-login · login.example.org?' });
   await expect(remove.getByRole('checkbox', { name: 'Also stop PitCrew on the remote (cancels its SLURM job)' })).toBeVisible();
   await expectNoAxeViolations(page, 'remove dialog');
   await remove.getByRole('button', { name: 'Cancel' }).click();

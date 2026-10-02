@@ -1695,6 +1695,7 @@ impl Core {
                 id: id.to_owned(),
                 name,
                 kind: WorkspaceKind::Remote,
+                host: Some(host.to_owned()),
                 state: WorkspaceState::Ready,
                 detail: None,
             }))

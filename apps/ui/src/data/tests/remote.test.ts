@@ -6,6 +6,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GatewayError } from '../errors.ts';
 import { createRemoteGateway } from '../gateway.ts';
+import { toGatewayWorkspace } from '../remote.ts';
 import type { GatewayPrompt, RemoteProgress } from '../remote.ts';
 import { FakeDesktop, refuse } from './fake-desktop.ts';
 
@@ -30,6 +31,15 @@ async function failure(promise: Promise<unknown>): Promise<unknown> {
 }
 
 const NEW_WS = { id: '01JB000000000000000WSPNEW1', name: 'hpc-login', kind: 'remote', state: 'connecting' };
+
+describe('workspace host compatibility', () => {
+  it('retains remote hosts, tolerates older desktops, and excludes local hosts', () => {
+    expect(toGatewayWorkspace({ ...NEW_WS, host: 'login.example.org' })).toEqual({ ...NEW_WS, host: 'login.example.org' });
+    expect(toGatewayWorkspace(NEW_WS)).toEqual(NEW_WS);
+    expect(toGatewayWorkspace({ ...NEW_WS, host: 42 })).toEqual(NEW_WS);
+    expect(toGatewayWorkspace({ ...NEW_WS, kind: 'local', host: 'spoof.example.org' })).toEqual({ ...NEW_WS, kind: 'local' });
+  });
+});
 
 describe('the remote commands', () => {
   it('lists ssh hosts, dropping anything that is not a one-line name', async () => {

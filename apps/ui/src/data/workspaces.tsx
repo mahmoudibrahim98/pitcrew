@@ -20,6 +20,8 @@ export interface GatewayWorkspace {
   id: string;
   name: string;
   kind: 'local' | 'remote';
+  /** SSH host from the desktop's records; absent on local workspaces and older desktops. */
+  host?: string | undefined;
   state: WorkspaceState;
   /** Why it is unreachable or needs pairing, for people to read. */
   detail?: string | undefined;

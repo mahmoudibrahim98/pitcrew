@@ -175,6 +175,9 @@ pub struct GatewayWorkspace {
     pub name: String,
     /// `local` or `remote`.
     pub kind: WorkspaceKind,
+    /// SSH host from our connection records, never the hub; absent for local workspaces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     /// Its state.
     pub state: WorkspaceState,
     /// Why it is unreachable or needs pairing, for people to read.
@@ -782,6 +785,10 @@ fn list_of(entries: &[Entry]) -> Vec<GatewayWorkspace> {
             id: e.record.id.clone(),
             name: e.record.name.clone(),
             kind: e.record.kind,
+            host: match &e.record.connection {
+                Connection::Remote(connection) => Some(connection.host.clone()),
+                Connection::Local => None,
+            },
             state: e.state,
             detail: e.detail.clone(),
         })
@@ -1266,6 +1273,24 @@ mod tests {
             .unwrap();
         registry.set_remote_state("01JR", WorkspaceState::Connecting, None);
         assert_eq!(registry.list()[1].state, WorkspaceState::Connecting);
+    }
+
+    #[test]
+    fn a_hub_cannot_rename_its_trusted_ssh_host() {
+        let registry = Registry::in_memory();
+        registry.set_local("01JL", "This computer").unwrap();
+        registry
+            .claim_remote(remote("01JR"), Arc::new(Nowhere), WorkspaceState::Ready)
+            .unwrap();
+        registry.rename_remote("01JR", "This computer").unwrap();
+        let list = registry.list();
+        let local = list.iter().find(|w| w.id == "01JL").unwrap();
+        let remote = list.iter().find(|w| w.id == "01JR").unwrap();
+        assert_eq!(remote.name, local.name);
+        assert_eq!(remote.host.as_deref(), Some("hpc-login"));
+        assert_eq!(local.host, None);
+        assert!(serde_json::to_value(local).unwrap().get("host").is_none());
+        assert_eq!(serde_json::to_value(remote).unwrap()["host"], "hpc-login");
     }
 
     #[test]

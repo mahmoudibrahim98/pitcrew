@@ -1,3 +1,4 @@
+import { WorkspaceName } from '../workspace-name.tsx';
 // What shows instead of a page when there is no workspace data to show: a full-screen status
 // line (opening, listing workspaces), or, in the desktop app, why the gateway cannot reach a
 // workspace. Never a spinner: a workspace that is unreachable or needs pairing says so.
@@ -57,7 +58,7 @@ export function WorkspaceUnavailable({ workspace }: { workspace: GatewayWorkspac
     >
       <p className="font-mono text-xs text-ink-2">{WORKSPACE_STATE_LABEL[workspace.state]}</p>
       <h1 className="text-xl font-semibold">
-        {pairing ? `${workspace.name} needs pairing` : `Cannot reach ${workspace.name}`}
+        {pairing ? <><WorkspaceName workspace={workspace} /> needs pairing</> : <>Cannot reach <WorkspaceName workspace={workspace} /></>}
       </h1>
       <p className="text-sm text-ink-2">
         {pairing

@@ -14,7 +14,7 @@ import { createApi } from '../../data/api.ts';
 import { WorkspacesProvider } from '../../data/desktop.tsx';
 import { createGateway } from '../../data/gateway.ts';
 import { createQueryClient, DataProvider } from '../../data/provider.tsx';
-import { FakeDesktop, refuse } from '../../data/tests/fake-desktop.ts';
+import { FakeDesktop, refuse, remoteWorkspace } from '../../data/tests/fake-desktop.ts';
 import type { GatewayWorkspace } from '../../data/workspaces.tsx';
 import { defineFeature } from '../feature.ts';
 import { paths } from '../paths.ts';
@@ -24,7 +24,7 @@ import { initialShellState, useShell } from '../store.ts';
 const ALPHA = '01JB000000000000000WSPALPH';
 const BETA = '01JB000000000000000WSPBETA';
 const alpha: GatewayWorkspace = { id: ALPHA, name: 'Alpha Lab', kind: 'local', state: 'ready' };
-const beta: GatewayWorkspace = { id: BETA, name: 'hpc-login', kind: 'remote', state: 'ready' };
+const beta = remoteWorkspace(BETA, 'hpc-login', 'login.example.org');
 const PATIENCE = { timeout: 8_000 };
 
 /** A stand-in for the onboarding feature's connect wizard at `paths.connect()`. */
@@ -78,6 +78,25 @@ describe('in the desktop app', () => {
     return router;
   }
 
+  it('distinguishes a remote hub impersonating the local name by its trusted host', async () => {
+    desktop.workspaces = [alpha, { ...beta, name: alpha.name }];
+    desktop.daemons.set(BETA, tinyDaemon({ id: BETA, name: alpha.name }, []));
+    renderDesktop(paths.home(BETA));
+    await screen.findByRole('heading', { level: 1, name: 'Home' }, PATIENCE);
+    expect(screen.getByRole('navigation', { name: 'Breadcrumb' }).textContent).toContain('Alpha Lab · login.example.org');
+    const menu = await openSwitcher('Alpha Lab · login.example.org');
+    expect(within(menu).getByRole('menuitemradio', { name: 'Alpha Lab · login.example.org' })).toBeTruthy();
+    expect(within(menu).getByRole('menuitemradio', { name: /^Alpha Lab$/ }).textContent).not.toContain('login.example.org');
+  });
+
+  it('keeps the host and state in an unreachable remote menu name', async () => {
+    desktop.workspaces = [alpha, { ...beta, state: 'unreachable' }];
+    renderDesktop(paths.home(ALPHA));
+    await screen.findByRole('link', { name: 'Alpha project' }, PATIENCE);
+    const menu = await openSwitcher('Alpha Lab');
+    expect(within(menu).getByRole('menuitemradio', { name: 'hpc-login · login.example.org · Unreachable' })).toBeTruthy();
+  });
+
   it('opens the connect wizard from the switcher', async () => {
     const router = renderDesktop(paths.home(ALPHA));
     await screen.findByRole('link', { name: 'Alpha project' }, PATIENCE);
@@ -98,20 +117,20 @@ describe('in the desktop app', () => {
     await screen.findByRole('link', { name: 'Beta project' }, PATIENCE);
 
     // Cancel first: nothing is removed.
-    let menu = await openSwitcher('hpc-login');
+    let menu = await openSwitcher('hpc-login · login.example.org');
     fireEvent.click(within(menu).getByRole('menuitem', { name: 'Remove workspace…' }));
-    let dialog = await screen.findByRole('dialog', { name: 'Remove hpc-login?' });
+    let dialog = await screen.findByRole('dialog', { name: 'Remove hpc-login · login.example.org?' });
     fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
     await vi.waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
     expect(desktop.commands('gateway_workspace_remove')).toEqual([]);
     // Focus goes back to the switcher, not to the page's body.
     await vi.waitFor(() =>
-      expect(document.activeElement).toBe(within(sidebar()).getByRole('button', { name: 'Workspace: hpc-login' })),
+      expect(document.activeElement).toBe(within(sidebar()).getByRole('button', { name: 'Workspace: hpc-login · login.example.org' })),
     );
 
-    menu = await openSwitcher('hpc-login');
+    menu = await openSwitcher('hpc-login · login.example.org');
     fireEvent.click(within(menu).getByRole('menuitem', { name: 'Remove workspace…' }));
-    dialog = await screen.findByRole('dialog', { name: 'Remove hpc-login?' });
+    dialog = await screen.findByRole('dialog', { name: 'Remove hpc-login · login.example.org?' });
     const stop = within(dialog).getByRole('checkbox', { name: 'Also stop PitCrew on the remote (cancels its SLURM job)' });
     expect((stop as HTMLInputElement).checked).toBe(false);
     fireEvent.click(stop);
@@ -127,9 +146,9 @@ describe('in the desktop app', () => {
     desktop.remove = () => refuse('unreachable', 'ssh: hpc-login: connection timed out');
     const router = renderDesktop(paths.home(BETA));
     await screen.findByRole('link', { name: 'Beta project' }, PATIENCE);
-    const menu = await openSwitcher('hpc-login');
+    const menu = await openSwitcher('hpc-login · login.example.org');
     fireEvent.click(within(menu).getByRole('menuitem', { name: 'Remove workspace…' }));
-    const dialog = await screen.findByRole('dialog', { name: 'Remove hpc-login?' });
+    const dialog = await screen.findByRole('dialog', { name: 'Remove hpc-login · login.example.org?' });
     fireEvent.click(within(dialog).getByRole('button', { name: 'Remove' }));
     expect((await within(dialog).findByRole('alert')).textContent).toBe('ssh: hpc-login: connection timed out');
     expect(desktop.commands('gateway_workspace_remove')).toEqual([{ workspace: BETA, stopHelper: false }]);
@@ -143,7 +162,7 @@ describe('in the desktop app', () => {
       return null;
     };
     renderDesktop(paths.home(BETA));
-    await screen.findByRole('heading', { level: 1, name: 'Cannot reach hpc-login' }, PATIENCE);
+    await screen.findByRole('heading', { level: 1, name: 'Cannot reach hpc-login · login.example.org' }, PATIENCE);
     fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
     await screen.findByRole('link', { name: 'Beta project' }, PATIENCE);
     expect(desktop.commands('gateway_workspace_retry')).toEqual([{ workspace: BETA }]);

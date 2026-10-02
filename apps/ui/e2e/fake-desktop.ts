@@ -123,7 +123,7 @@ export function installFakeDesktop({ hubUrl, token, jobScript }: FakeDesktopOpti
     const info = (await (await fetch(`${hubUrl}/v1/workspace`, { headers: { Authorization: `Bearer ${token}` } })).json()) as {
       workspace: { id: string };
     };
-    const workspace = { id: info.workspace.id, name: 'hpc-login', kind: 'remote', state: 'ready' };
+    const workspace = { id: info.workspace.id, name: 'hpc-login', host: 'login.example.org', kind: 'remote', state: 'ready' };
     workspaces = [workspace];
     emit('gateway://workspaces', workspaces);
     progress({ step: PAIR, state: 'done' });

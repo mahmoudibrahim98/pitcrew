@@ -40,10 +40,14 @@ interface GatewayWorkspace {
   id: string;        // the daemon's workspace id (a ULID), as in `/w/$ws/…`
   name: string;
   kind: 'local' | 'remote';
+  host?: string;    // remote only: SSH host from the desktop's own connection records, never the hub
   state: 'connecting' | 'ready' | 'unreachable' | 'needs_pairing';
   detail?: string;   // why it is unreachable or needs pairing, for people to read
 }
 ```
+
+The UI must show `host` next to every remote workspace name, including accessible menu names.
+Older desktops may omit it; local workspaces leave it unset. A hub rename never changes this host.
 
 The gateway emits the Tauri event `gateway://workspaces` with the same list whenever it changes.
 
