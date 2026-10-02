@@ -21,6 +21,11 @@
 //! `asked.log` as `yes`, `no`, `text` or `empty`, never itself. Each call is logged to
 //! `calls.log` as its kind and host.
 //!
+//! **Other knobs**, as files in the machine's directory: `noisy` makes every command print a
+//! login banner on stdout first, as a chatty `.bashrc` would; `drop` ends the next link that
+//! sees it (it takes the file), as a server closing the connection; `fail-stop` makes a call
+//! running the helper script's `stop` fail as a lost connection.
+//!
 //! The binary is also `pitcrew-askpass` (`<machine>/pitcrew-askpass`), as the real one: the
 //! crate's own client.
 //!
@@ -251,6 +256,20 @@ fn run(machine: &Path, call: &Call) -> u8 {
     let Some(command) = &call.command else {
         return 255;
     };
+    if machine.join("fail-stop").exists()
+        && decode(command).is_some_and(|line| line.contains(" stop ") || line.contains(" 'stop' "))
+    {
+        call.say("Connection closed by 192.0.2.10 port 22");
+        return 255;
+    }
+    if machine.join("noisy").exists() {
+        let mut out = std::io::stdout();
+        let _ = writeln!(
+            out,
+            "Welcome to {HOST}!\nLast login: yesterday from 192.0.2.1\n@@pitcrew-token-begin-x\nnot-a-token"
+        );
+        let _ = out.flush();
+    }
     let mark = std::fs::read_to_string(machine.join("mark")).unwrap_or_default();
     let user = std::env::var("USER").unwrap_or_else(|_| "sam".to_owned());
     let path = format!("{}:/usr/bin:/bin", machine.join("bin").display());
@@ -302,13 +321,40 @@ fn link(machine: &Path, call: &Call) -> u8 {
             }
         });
     }
+    let mut code = 0;
     while !exit.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(100));
+        // The server closes this connection (one link takes the knob).
+        if std::fs::remove_file(machine.join("drop")).is_ok() {
+            call.say(&format!(
+                "Connection to {} closed by remote host.",
+                call.host
+            ));
+            code = 255;
+            break;
+        }
     }
     if let Some(control) = &control {
         let _ = std::fs::remove_file(control);
     }
-    0
+    code
+}
+
+/// Undoes `pitcrew-remote`'s shell-neutral wrapper,
+/// `/bin/sh -c 'unset -f printf 2>/dev/null; eval "$(printf "\ooo…")"'`, to see the command line.
+fn decode(wrapped: &str) -> Option<String> {
+    let escapes = wrapped
+        .strip_prefix("/bin/sh -c 'unset -f printf 2>/dev/null; eval \"$(printf \"")?
+        .strip_suffix("\")\"'")?;
+    let bytes = escapes
+        .as_bytes()
+        .chunks(4)
+        .map(|c| match c {
+            [b'\\', rest @ ..] => u8::from_str_radix(std::str::from_utf8(rest).ok()?, 8).ok(),
+            _ => None,
+        })
+        .collect::<Option<Vec<u8>>>()?;
+    String::from_utf8(bytes).ok()
 }
 
 /// One client of a link: one request line, one answer line.
@@ -538,6 +584,30 @@ impl Machine {
         std::fs::write(self.dir.join("password"), password).unwrap();
     }
 
+    /// From now on every command prints a login banner (and a false marker) first.
+    pub fn noisy(&self) {
+        std::fs::write(self.dir.join("noisy"), "").unwrap();
+    }
+
+    /// The server closes the current link's connection (once).
+    pub fn drop_link(&self) {
+        std::fs::write(self.dir.join("drop"), "").unwrap();
+    }
+
+    /// Whether the link has taken the `drop` knob yet.
+    pub fn dropped(&self) -> bool {
+        !self.dir.join("drop").exists()
+    }
+
+    /// Whether calls stopping the helper fail.
+    pub fn fail_stop(&self, fail: bool) {
+        if fail {
+            std::fs::write(self.dir.join("fail-stop"), "").unwrap();
+        } else {
+            let _ = std::fs::remove_file(self.dir.join("fail-stop"));
+        }
+    }
+
     /// From now on the host key is unknown until accepted.
     pub fn unknown_host_key(&self) {
         std::fs::write(self.dir.join("hostkey"), "").unwrap();
@@ -637,13 +707,16 @@ pub fn version_of(pitcrewd: &Path) -> String {
 }
 
 /// The helpers' folder: for this platform, a stand-in for the release helper that is the real
-/// `pitcrewd`, serving the demo workspace; and its manifest.
+/// `pitcrewd`, serving the demo workspace (seeded on its first start, kept after); and its
+/// manifest.
 fn helpers(dir: &Path, real: &Path) {
     use sha2::{Digest as _, Sha256};
     let artefact = platform().artefact();
     let body = format!(
         "#!/bin/sh\n# The real pitcrewd, serving the demo workspace.\n\
-         if [ \"$1\" = serve ]; then shift; exec '{real}' serve --demo \"$@\"; fi\n\
+         if [ \"$1\" = serve ] && [ ! -e \"$HOME/.demo-seeded\" ]; then\n\
+         \x20 : > \"$HOME/.demo-seeded\"; shift; exec '{real}' serve --demo \"$@\"\n\
+         fi\n\
          exec '{real}' \"$@\"\n",
         real = real.display()
     );

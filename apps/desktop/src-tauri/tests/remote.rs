@@ -1,6 +1,7 @@
 //! Remote workspaces end to end, through Tauri's IPC on the mock runtime with the app's real
-//! ACL: probe, plan, add, requests and sockets through the tunnel, remove; SLURM's exact job
-//! script; SSH's prompts in the app; and no token anywhere it must not be.
+//! ACL: probe, plan, add, requests and sockets through the tunnel, retry, restart, remove;
+//! SLURM's exact job script; SSH's prompts in the app; a hub claiming another workspace's id; and
+//! no token anywhere it must not be.
 //!
 //! The machine (`hpc-login`) is fake: this computer's `/bin/sh` in a temporary home, behind a
 //! fake `ssh` that plays OpenSSH's calls, ControlMasters and forwards included (`remote/fake.rs`).
@@ -40,12 +41,16 @@ mod unix {
     use crate::fake::{self, FINGERPRINT, HOST, Machine};
     use pitcrew_desktop::app::{self, MAIN, WORKSPACES_EVENT};
     use pitcrew_desktop::gateway::Gateway;
-    use pitcrew_desktop::keychain::{MemoryStore, TokenStore as _};
+    use pitcrew_desktop::keychain::{MemoryStore, TokenStore};
     use pitcrew_desktop::logging;
     use pitcrew_desktop::navigate::Navigator;
-    use pitcrew_desktop::registry::{self, Registry};
+    use pitcrew_desktop::registry::{
+        self, Connection, LauncherKind, Registry, RemoteConnection, WorkspaceKind, WorkspaceRecord,
+        WorkspaceState,
+    };
     use pitcrew_desktop::remote::prompt::{PROMPT_CLOSED_EVENT, PROMPT_EVENT};
-    use pitcrew_desktop::remote::{Helpers, PromptHub, RemoteOptions, Remotes};
+    use pitcrew_desktop::remote::{GatewayPrompt, Helpers, PromptHub, RemoteOptions, Remotes};
+    use pitcrew_desktop::token::DeviceToken;
     use serde_json::{Value, json};
     use std::io::Write;
     use std::path::{Path, PathBuf};
@@ -60,6 +65,12 @@ mod unix {
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::fmt::MakeWriter;
 
+    /// The demo workspace's id and name, as the real hub reports them (`crates/fixtures`).
+    const DEMO: &str = "01JB000000000000000WSP0001";
+    const DEMO_NAME: &str = "Demo Lab";
+    /// The fake machine's password, when it asks for one.
+    const PASSWORD: &str = "correct-horse";
+
     // ─── The runner ───────────────────────────────────────────────────────────────────────
 
     type Case = (&'static str, fn());
@@ -73,6 +84,18 @@ mod unix {
         (
             "prompts_round_trip_and_a_cancel_fails_the_add_cleanly",
             prompts_round_trip_and_a_cancel_fails_the_add_cleanly,
+        ),
+        (
+            "a_hub_cannot_take_another_workspaces_id",
+            a_hub_cannot_take_another_workspaces_id,
+        ),
+        (
+            "a_saved_remote_comes_back_after_a_restart",
+            a_saved_remote_comes_back_after_a_restart,
+        ),
+        (
+            "a_cancelled_sign_in_while_reconnecting_is_retried",
+            a_cancelled_sign_in_while_reconnecting_is_retried,
         ),
         (
             "plans_expire_and_missing_programs_are_clear_errors",
@@ -191,13 +214,15 @@ mod unix {
 
     // ─── The app around a machine ────────────────────────────────────────────────────────
 
-    /// How the prompt responder answers.
+    /// How the prompt responder (the UI) answers.
     #[derive(Clone, Debug, Default)]
     struct Answers {
         /// The password to type; `None` cancels.
         password: Option<String>,
         /// Whether to trust an unknown host key.
         accept_host_key: bool,
+        /// Leave prompts open: the case answers them itself.
+        hold: bool,
     }
 
     struct World {
@@ -206,7 +231,7 @@ mod unix {
         registry: Arc<Registry>,
         registry_file: PathBuf,
         tokens: Arc<MemoryStore>,
-        machine: Machine,
+        machine: Arc<Machine>,
         /// `(event, payload)`, in order.
         events: Arc<Mutex<Vec<(String, String)>>>,
         /// What went to the webview on channels: `(channel, text)`.
@@ -214,15 +239,29 @@ mod unix {
         /// Every command's result or error, as text.
         results: Arc<Mutex<Vec<String>>>,
         answers: Arc<Mutex<Answers>>,
-        _data: tempfile::TempDir,
+        data: Arc<tempfile::TempDir>,
     }
 
+    /// A fresh machine and a fresh app.
     fn world(slurm: bool, tweak: impl FnOnce(&mut RemoteOptions, &Machine)) -> World {
-        let machine = Machine::new(slurm, pitcrewd());
-        let data = tempfile::tempdir().unwrap();
+        build(
+            Arc::new(Machine::new(slurm, pitcrewd())),
+            Arc::new(tempfile::tempdir().unwrap()),
+            Arc::new(MemoryStore::default()),
+            tweak,
+        )
+    }
+
+    /// The app over `machine`, with its registry file in `data` and its keychain `tokens`, as
+    /// `app::setup` makes it: the saved remote workspaces are resumed.
+    fn build(
+        machine: Arc<Machine>,
+        data: Arc<tempfile::TempDir>,
+        tokens: Arc<MemoryStore>,
+        tweak: impl FnOnce(&mut RemoteOptions, &Machine),
+    ) -> World {
         let registry_file = data.path().join("data").join(registry::FILE_NAME);
         let registry = Arc::new(Registry::load(registry_file.clone()));
-        let tokens = Arc::new(MemoryStore::default());
         let channels: Arc<Mutex<Vec<(u32, String)>>> = Arc::default();
         let captured = Arc::clone(&channels);
         let builder = mock_builder().channel_interceptor(move |_w, callback, _i, body| {
@@ -255,7 +294,7 @@ mod unix {
         let remotes = Remotes::new(
             options,
             Arc::clone(&registry),
-            Arc::clone(&tokens) as Arc<dyn pitcrew_desktop::keychain::TokenStore>,
+            Arc::clone(&tokens) as Arc<dyn TokenStore>,
             prompts,
             tauri::async_runtime::handle().inner().clone(),
         );
@@ -289,6 +328,9 @@ mod unix {
                 for payload in to_answer {
                     let prompt: Value = serde_json::from_str(&payload).unwrap();
                     let now = answers.lock().unwrap().clone();
+                    if now.hold {
+                        continue;
+                    }
                     let args = match prompt["kind"].as_str() {
                         Some("host_key") => {
                             json!({ "id": prompt["id"], "accept": now.accept_host_key })
@@ -303,6 +345,7 @@ mod unix {
                 }
             });
         }
+        app.state::<Remotes>().resume();
         World {
             app,
             main,
@@ -314,7 +357,7 @@ mod unix {
             channels,
             results,
             answers,
-            _data: data,
+            data,
         }
     }
 
@@ -324,6 +367,19 @@ mod unix {
             let result = invoke(&self.main, cmd, args);
             self.results.lock().unwrap().push(text_of(&result));
             result
+        }
+
+        /// Plans and adds the machine with the direct launcher; the workspace's id.
+        fn add_direct(&self, channel: u32) -> Result<String, Value> {
+            let plan = self.call(
+                "gateway_remote_plan",
+                json!({ "req": { "host": HOST, "launcher": "direct" } }),
+            )?;
+            let added = self.call(
+                "gateway_remote_add",
+                json!({ "plan": plan["plan"], "events": format!("__CHANNEL__:{channel}") }),
+            )?;
+            Ok(added["id"].as_str().unwrap().to_owned())
         }
 
         fn channel(&self, id: u32) -> Vec<Value> {
@@ -350,13 +406,34 @@ mod unix {
             self.app.state::<Remotes>()
         }
 
+        /// Workspace `id`'s state now.
+        fn state(&self, id: &str) -> Option<WorkspaceState> {
+            self.registry
+                .list()
+                .into_iter()
+                .find(|w| w.id == id)
+                .map(|w| w.state)
+        }
+
         /// Waits until `check` holds.
         fn wait(&self, what: &str, check: impl Fn(&Self) -> bool) {
             let deadline = Instant::now() + Duration::from_secs(60);
             while !check(self) {
-                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for {what}: {:?}",
+                    self.registry.list()
+                );
                 std::thread::sleep(Duration::from_millis(50));
             }
+        }
+
+        /// Waits for a prompt to be open, and returns the oldest.
+        fn open_prompt(&self) -> GatewayPrompt {
+            self.wait("an open prompt", |w| {
+                !w.remotes().prompts().open().is_empty()
+            });
+            self.remotes().prompts().open().remove(0)
         }
 
         /// Everything the webview could have seen, as text.
@@ -365,6 +442,17 @@ mod unix {
             all.extend(self.channels.lock().unwrap().iter().map(|(_, t)| t.clone()));
             all.extend(self.events.lock().unwrap().iter().map(|(_, p)| p.clone()));
             all
+        }
+
+        /// The app quits and starts again, over the same machine, keychain and registry file.
+        fn restart(&self) -> World {
+            self.shutdown();
+            build(
+                Arc::clone(&self.machine),
+                Arc::clone(&self.data),
+                Arc::clone(&self.tokens),
+                |_, _| {},
+            )
         }
 
         fn shutdown(&self) {
@@ -414,36 +502,63 @@ mod unix {
             .collect()
     }
 
+    /// The hub's device token, read on the machine as the person could.
+    fn hub_token(machine: &Machine) -> String {
+        let out = Command::new(pitcrewd())
+            .args(["token", "show-path"])
+            .env_clear()
+            .env("HOME", &machine.home)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        let path = String::from_utf8(out.stdout).unwrap();
+        std::fs::read_to_string(path.trim())
+            .unwrap()
+            .trim()
+            .to_owned()
+    }
+
+    /// The token, and the part after its prefix, appear in nothing the webview saw (results,
+    /// errors, channel messages, events) and in no log line. `logged` proves the case's lines
+    /// are in the capture.
+    fn no_token(w: &World, token: &str, logged: &str) {
+        let secret = token.split_once('_').map_or(token, |(_, rest)| rest);
+        assert!(secret.len() >= 16, "a real token");
+        let seen = w.seen_by_the_webview();
+        assert!(seen.len() > 5, "{seen:#?}");
+        for text in &seen {
+            assert!(!text.contains(secret), "the webview saw the token: {text}");
+            assert!(!text.contains("pitcrew.bearer."), "{text}");
+        }
+        let logs = log_text();
+        assert!(logs.contains(logged), "the log is captured");
+        for line in logs.lines() {
+            assert!(!line.contains(secret), "a log line holds the token: {line}");
+        }
+    }
+
+    /// Whether this computer has tmux where the fake machine's `PATH` finds it.
+    fn has_tmux() -> bool {
+        ["/usr/bin/tmux", "/bin/tmux"]
+            .iter()
+            .any(|p| Path::new(p).exists())
+    }
+
     // ─── The cases ───────────────────────────────────────────────────────────────────────
 
-    /// Probe, plan and add with the direct launcher: the workspace is `ready`, requests and
-    /// sockets reach the real hub through the tunnel, the transport is remembered, a probe sees
-    /// the helper running, and remove stops it and deletes the keychain entry. No token reaches
-    /// the webview or the logs.
+    /// Probe, plan and add with the direct launcher, on a machine whose start-up files talk:
+    /// the workspace is `ready`, requests and sockets reach the real hub through the tunnel, the
+    /// transport is remembered, a probe sees the helper running, another window can call none
+    /// of the remote commands (with a real prompt open and a real workspace), and remove stops
+    /// the helper and deletes the keychain entry. No token reaches the webview or the logs.
     fn a_direct_helper_end_to_end() {
         let w = world(false, |_, _| {});
+        // Login banners (and a false token marker) before every command's output.
+        w.machine.noisy();
 
         // The host list comes from the (temporary) ssh config: concrete hosts only.
         let hosts = w.call("gateway_ssh_hosts", json!({})).unwrap();
         assert_eq!(hosts, json!({ "hosts": [HOST] }));
-        // Another window has no capability for any of the new commands.
-        let other = WebviewWindowBuilder::new(&w.app, "other", Default::default())
-            .build()
-            .unwrap();
-        for (cmd, args) in [
-            ("gateway_ssh_hosts", json!({})),
-            ("gateway_remote_probe", json!({ "host": HOST })),
-            ("gateway_prompt_reply", json!({ "id": "x" })),
-            (
-                "gateway_workspace_remove",
-                json!({ "workspace": "x", "stopHelper": false }),
-            ),
-        ] {
-            assert!(
-                invoke(&other, cmd, args).is_err(),
-                "{cmd} from another window"
-            );
-        }
 
         let probe = w
             .call("gateway_remote_probe", json!({ "host": HOST }))
@@ -459,6 +574,10 @@ mod unix {
         );
         assert!(probe.get("helper").is_none(), "nothing there yet: {probe}");
         assert!(probe.get("slurm").is_none(), "{probe}");
+        assert_eq!(probe.get("tmux").is_some(), has_tmux(), "{probe}");
+        if let Some(tmux) = probe.get("tmux") {
+            assert!(!tmux["version"].as_str().unwrap().is_empty(), "{probe}");
+        }
         let e = w
             .call(
                 "gateway_remote_probe",
@@ -497,6 +616,7 @@ mod unix {
             .unwrap();
         assert_eq!(added["kind"], "remote", "{added}");
         assert_eq!(added["state"], "ready", "{added}");
+        assert_eq!(added["name"], DEMO_NAME, "{added}");
         let id = added["id"].as_str().unwrap().to_owned();
         let mut expected = Vec::new();
         for step in &steps {
@@ -526,6 +646,77 @@ mod unix {
             &json!({ "step": "add", "state": "failed", "detail": e["message"] })
         );
 
+        // Another window can call none of the remote commands: Tauri's ACL refuses them (a
+        // plain string, not a GatewayError) before any of them runs, with a real prompt open,
+        // a real workspace and a real (used) plan.
+        w.machine.require_password(PASSWORD);
+        w.answers.lock().unwrap().hold = true;
+        let probing = {
+            let window = w.main.clone();
+            std::thread::spawn(move || {
+                invoke(&window, "gateway_remote_probe", json!({ "host": HOST }))
+            })
+        };
+        let open = w.open_prompt();
+        assert_eq!(serde_json::to_value(open.kind).unwrap(), "password");
+        let other = WebviewWindowBuilder::new(&w.app, "other", Default::default())
+            .build()
+            .unwrap();
+        for (cmd, args) in [
+            ("gateway_ssh_hosts", json!({})),
+            ("gateway_remote_probe", json!({ "host": HOST })),
+            (
+                "gateway_remote_plan",
+                json!({ "req": { "host": HOST, "launcher": "direct" } }),
+            ),
+            (
+                "gateway_remote_add",
+                json!({ "plan": plan["plan"], "events": "__CHANNEL__:73" }),
+            ),
+            ("gateway_workspace_retry", json!({ "workspace": id })),
+            (
+                "gateway_workspace_remove",
+                json!({ "workspace": id, "stopHelper": true }),
+            ),
+            (
+                "gateway_prompt_reply",
+                json!({ "id": open.id, "answer": "from another window" }),
+            ),
+        ] {
+            let refused = invoke(&other, cmd, args).unwrap_err();
+            let message = refused.as_str().unwrap_or_else(|| {
+                panic!("{cmd} from another window was not refused by the ACL: {refused}")
+            });
+            assert!(
+                message.contains(cmd) && message.contains("not allowed"),
+                "{cmd}: {message}"
+            );
+        }
+        // Nothing ran: the prompt is still open, the workspace still there and ready.
+        assert!(
+            w.remotes().prompts().open().iter().any(|p| p.id == open.id),
+            "the other window's reply did not reach the prompt"
+        );
+        assert_eq!(w.state(&id), Some(WorkspaceState::Ready));
+        assert!(w.channel(73).is_empty());
+        // The main window answers it; later prompts the responder answers.
+        {
+            let mut answers = w.answers.lock().unwrap();
+            answers.hold = false;
+            answers.password = Some(PASSWORD.into());
+        }
+        w.call(
+            "gateway_prompt_reply",
+            json!({ "id": open.id, "answer": PASSWORD }),
+        )
+        .unwrap();
+        // That probe sees the helper running.
+        let probe = probing.join().unwrap().unwrap();
+        assert_eq!(
+            probe["helper"],
+            json!({ "version": version, "running": true })
+        );
+
         // The workspace is in the list, ready, and its requests reach the real hub.
         let list = w.call("gateway_workspaces", json!({})).unwrap();
         assert!(
@@ -543,10 +734,7 @@ mod unix {
             .unwrap();
         assert_eq!(workspace["status"], 200, "{workspace}");
         assert!(
-            workspace["body"]
-                .as_str()
-                .unwrap()
-                .contains(added["name"].as_str().unwrap()),
+            workspace["body"].as_str().unwrap().contains(DEMO_NAME),
             "{workspace}"
         );
         let me = w
@@ -585,7 +773,8 @@ mod unix {
         assert!(saved.contains(&format!("\"host\": \"{HOST}\"")), "{saved}");
         assert!(saved.contains("\"launcher\": \"direct\""), "{saved}");
 
-        // The token: in the keychain (here in memory), and the hub's own.
+        // The token: in the keychain (here in memory), and the hub's own (read between the
+        // markers, whatever the start-up files printed).
         let token = hub_token(&w.machine);
         assert_eq!(
             w.tokens.get(&id).unwrap().map(|t| t.expose().to_owned()),
@@ -593,16 +782,7 @@ mod unix {
         );
         assert!(!saved.contains(&token));
 
-        // A second probe sees the helper running.
-        let probe = w
-            .call("gateway_remote_probe", json!({ "host": HOST }))
-            .unwrap();
-        assert_eq!(
-            probe["helper"],
-            json!({ "version": version, "running": true })
-        );
-
-        // The local workspace cannot be removed; an unknown one is unknown.
+        // An unknown workspace is unknown; stopHelper is required.
         let e = w
             .call(
                 "gateway_workspace_remove",
@@ -661,49 +841,12 @@ mod unix {
         );
 
         // No token anywhere the webview or a log could see.
-        no_token(&w, &token);
+        no_token(&w, &token, "added a remote workspace");
     }
 
-    /// The hub's device token, read on the machine as the person could.
-    fn hub_token(machine: &Machine) -> String {
-        let out = Command::new(pitcrewd())
-            .args(["token", "show-path"])
-            .env_clear()
-            .env("HOME", &machine.home)
-            .env("PATH", "/usr/bin:/bin")
-            .output()
-            .unwrap();
-        let path = String::from_utf8(out.stdout).unwrap();
-        std::fs::read_to_string(path.trim())
-            .unwrap()
-            .trim()
-            .to_owned()
-    }
-
-    /// The token, and the part after its prefix, appear in nothing the webview saw (results,
-    /// errors, channel messages, events) and in no log line.
-    fn no_token(w: &World, token: &str) {
-        let secret = token.split_once('_').map_or(token, |(_, rest)| rest);
-        assert!(secret.len() >= 16, "a real token");
-        let seen = w.seen_by_the_webview();
-        assert!(seen.len() > 20, "{seen:#?}");
-        for text in &seen {
-            assert!(!text.contains(secret), "the webview saw the token: {text}");
-            assert!(!text.contains("pitcrew.bearer."), "{text}");
-        }
-        let logs = log_text();
-        assert!(
-            logs.contains("added a remote workspace"),
-            "the log is captured"
-        );
-        for line in logs.lines() {
-            assert!(!line.contains(secret), "a log line holds the token: {line}");
-        }
-    }
-
-    /// SLURM: the plan returns the exact script, and adding submits exactly that text. Here the
-    /// job stays pending: the add gives up after its wait, cancels the job it submitted, and
-    /// registers nothing.
+    /// SLURM: the plan returns the exact script, and adding submits exactly that text, even
+    /// when the site recipe it was made from changed in between. Here the job stays pending: the
+    /// add gives up after its wait, cancels the job it submitted, and registers nothing.
     fn slurm_submits_exactly_the_planned_script() {
         let w = world(true, |options, _| {
             options.job_wait = Duration::from_secs(3);
@@ -717,11 +860,12 @@ mod unix {
             json!({ "version": "slurm 23.02.7", "defaultPartition": "batch", "srunOverlap": false })
         );
 
-        // A job option SLURM would read as another directive is refused; so is an unknown site,
-        // and a job for another launcher.
+        // A job option SLURM would read as another directive is refused; so is an unknown or
+        // malformed site, and a job for another launcher.
         for req in [
             json!({ "host": HOST, "launcher": "slurm", "job": { "partition": "gpu --uid=0" } }),
             json!({ "host": HOST, "launcher": "slurm", "site": "nowhere" }),
+            json!({ "host": HOST, "launcher": "slurm", "site": "../../etc/passwd" }),
             json!({ "host": HOST, "launcher": "direct", "job": { "partition": "gpu" } }),
             json!({ "host": HOST, "launcher": "slurm", "job": { "time": "UNLIMITED" } }),
         ] {
@@ -731,11 +875,20 @@ mod unix {
             assert_eq!(e["code"], "invalid", "{req}: {e}");
         }
 
+        // The person's own recipe for the cluster.
+        let sites = w.machine.laptop_home.join("sites");
+        std::fs::create_dir_all(&sites).unwrap();
+        let recipe = sites.join("lab.toml");
+        std::fs::write(
+            &recipe,
+            "description = \"The lab's cluster\"\npartition = \"gpu\"\nmodules = [\"python/3.12\"]\n",
+        )
+        .unwrap();
         let plan = w
             .call(
                 "gateway_remote_plan",
-                json!({ "req": { "host": HOST, "launcher": "slurm", "site": "generic",
-                        "job": { "partition": "gpu", "account": "proj0001", "time": "01:00:00",
+                json!({ "req": { "host": HOST, "launcher": "slurm", "site": "lab",
+                        "job": { "account": "proj0001", "time": "01:00:00",
                                  "cpus": 2, "memory": "4G", "gpus": "1" } } }),
             )
             .unwrap();
@@ -754,6 +907,7 @@ mod unix {
         ] {
             assert!(script.lines().any(|l| l == line), "{line} in {script}");
         }
+        assert!(script.contains("python/3.12"), "{script}");
         let steps: Vec<String> = serde_json::from_value(plan["steps"].clone()).unwrap();
         assert!(
             steps[1].contains("Submit the job script below"),
@@ -763,6 +917,13 @@ mod unix {
             !w.machine.slurm.join("submitted.sh").exists(),
             "nothing submitted yet"
         );
+
+        // The recipe changes after the plan: what is submitted is still what was shown.
+        std::fs::write(
+            &recipe,
+            "description = \"The lab's cluster\"\npartition = \"cpu\"\nmodules = [\"python/3.13\"]\nsbatch = [\"--constraint=a100\"]\n",
+        )
+        .unwrap();
 
         let e = w
             .call(
@@ -777,10 +938,18 @@ mod unix {
             std::fs::read_to_string(w.machine.slurm.join("submitted.sh")).unwrap(),
             script
         );
-        // The job this add submitted was cancelled again, by its name and this user.
+        // The job this add submitted was cancelled again, by its name and this user, so the
+        // error does not say it may still be queued.
         let cancelled = std::fs::read_to_string(w.machine.slurm.join("scancel.log")).unwrap();
         assert!(cancelled.contains("--name=pitcrew-helper-"), "{cancelled}");
         assert!(cancelled.trim_end().ends_with("4242"), "{cancelled}");
+        assert!(
+            !e["message"]
+                .as_str()
+                .unwrap()
+                .contains("may still be queued"),
+            "{e}"
+        );
         let messages = w.channel(80);
         assert!(
             messages.iter().any(|m| m["state"] == "running"
@@ -808,14 +977,16 @@ mod unix {
 
     /// A host key and a password asked in the app, answered through `gateway_prompt_reply`;
     /// then a prompt answered with neither fails the add cleanly: nothing deployed, nothing
-    /// registered, no empty password sent.
+    /// registered, no empty password sent. Replies of the wrong shape, and answers over 4 KiB,
+    /// are refused with the prompt still open.
     fn prompts_round_trip_and_a_cancel_fails_the_add_cleanly() {
         let w = world(false, |_, _| {});
         w.machine.unknown_host_key();
-        w.machine.require_password("correct-horse");
+        w.machine.require_password(PASSWORD);
         *w.answers.lock().unwrap() = Answers {
-            password: Some("correct-horse".into()),
+            password: Some(PASSWORD.into()),
             accept_host_key: true,
+            hold: false,
         };
 
         let probe = w
@@ -859,6 +1030,40 @@ mod unix {
             .unwrap_err();
         assert_eq!(e["code"], "invalid");
 
+        // With a prompt open: an answer over 4 KiB, and an accept for a password, are refused,
+        // and the prompt stays open for the right answer.
+        w.answers.lock().unwrap().hold = true;
+        let probing = {
+            let window = w.main.clone();
+            std::thread::spawn(move || {
+                invoke(&window, "gateway_remote_probe", json!({ "host": HOST }))
+            })
+        };
+        let open = w.open_prompt();
+        let e = w
+            .call(
+                "gateway_prompt_reply",
+                json!({ "id": open.id, "answer": "x".repeat(4097) }),
+            )
+            .unwrap_err();
+        assert_eq!(e["code"], "invalid");
+        assert!(e["message"].as_str().unwrap().contains("4096"), "{e}");
+        let e = w
+            .call(
+                "gateway_prompt_reply",
+                json!({ "id": open.id, "accept": true }),
+            )
+            .unwrap_err();
+        assert_eq!(e["code"], "invalid");
+        assert!(w.remotes().prompts().open().iter().any(|p| p.id == open.id));
+        w.answers.lock().unwrap().hold = false;
+        w.call(
+            "gateway_prompt_reply",
+            json!({ "id": open.id, "answer": PASSWORD }),
+        )
+        .unwrap();
+        probing.join().unwrap().unwrap();
+
         let plan = w
             .call(
                 "gateway_remote_plan",
@@ -868,7 +1073,6 @@ mod unix {
 
         // Now the person cancels the password prompt.
         w.answers.lock().unwrap().password = None;
-        let asked_before = w.machine.asked().len();
         let e = w
             .call(
                 "gateway_remote_add",
@@ -900,11 +1104,10 @@ mod unix {
         assert!(w.machine.endpoint().is_none());
         assert!(w.registry.list().is_empty());
         assert!(
-            !w.machine.asked()[asked_before..].contains(&"empty".to_owned()),
+            !w.machine.asked().contains(&"empty".to_owned()),
             "{:?}",
             w.machine.asked()
         );
-        assert!(!w.machine.asked().contains(&"empty".to_owned()));
         let closed = w.events(PROMPT_CLOSED_EVENT);
         for prompt in w.events(PROMPT_EVENT) {
             assert!(closed.contains(&json!({ "id": prompt["id"] })), "{prompt}");
@@ -912,11 +1115,199 @@ mod unix {
         assert!(w.remotes().prompts().open().is_empty());
         // The password never reached a log line, an event or a result.
         for text in w.seen_by_the_webview() {
-            assert!(!text.contains("correct-horse"), "{text}");
+            assert!(!text.contains(PASSWORD), "{text}");
         }
         for line in log_text().lines() {
-            assert!(!line.contains("correct-horse"), "{line}");
+            assert!(!line.contains(PASSWORD), "{line}");
         }
+    }
+
+    /// The hub's id is not trusted: a hub reporting the id of a remote workspace on another
+    /// machine, or of the local workspace, is refused, and that workspace's entry and token are
+    /// untouched. The helper the failed add started is stopped again; when that fails too, the
+    /// error says it may still be running. The hub's token is nowhere it must not be.
+    fn a_hub_cannot_take_another_workspaces_id() {
+        let w = world(false, |_, _| {});
+        // The demo hub's id, already held by a workspace on another machine.
+        w.registry
+            .insert(
+                WorkspaceRecord {
+                    id: DEMO.into(),
+                    name: "Original".into(),
+                    kind: WorkspaceKind::Remote,
+                    connection: Connection::Remote(Box::new(RemoteConnection {
+                        host: "other-login".into(),
+                        launcher: LauncherKind::Direct,
+                        root: "/home/sam/.pitcrew".into(),
+                        platform: fake::platform().target().into(),
+                        site: None,
+                        job: None,
+                        last_hop: None,
+                        transport: None,
+                    })),
+                },
+                None,
+                WorkspaceState::Unreachable,
+            )
+            .unwrap();
+        let original =
+            DeviceToken::new("pcd_original-token-of-the-workspace-already-here").unwrap();
+        w.tokens.set(DEMO, &original).unwrap();
+
+        let e = w.add_direct(110).unwrap_err();
+        assert_eq!(e["code"], "invalid", "{e}");
+        let message = e["message"].as_str().unwrap();
+        assert!(
+            message.contains("already added as \"Original\"; remove it first"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("may still be running"),
+            "the undo worked: {message}"
+        );
+        assert_eq!(w.tokens.get(DEMO).unwrap(), Some(original.clone()));
+        let Some(WorkspaceRecord {
+            connection: Connection::Remote(kept),
+            name,
+            ..
+        }) = w.registry.record(DEMO)
+        else {
+            panic!("the original workspace is gone");
+        };
+        assert_eq!(
+            (kept.host.as_str(), name.as_str()),
+            ("other-login", "Original")
+        );
+        let steps = steps_of(&w.channel(110));
+        assert_eq!(
+            steps[steps.len() - 2..],
+            [
+                (
+                    "Pair: keep its device token in this computer's keychain".to_owned(),
+                    "failed".to_owned()
+                ),
+                ("add".to_owned(), "failed".to_owned())
+            ]
+        );
+        // The helper this add started was stopped again.
+        assert!(w.machine.endpoint().is_none(), "the helper still runs");
+        let token = hub_token(&w.machine);
+
+        // The local workspace's id: refused too. This time stopping the helper fails as well,
+        // and the error says so.
+        w.registry.remove(DEMO).unwrap();
+        w.tokens.delete(DEMO).unwrap();
+        w.registry.set_local(DEMO, "Here").unwrap();
+        w.machine.fail_stop(true);
+        let e = w.add_direct(111).unwrap_err();
+        assert_eq!(e["code"], "invalid", "{e}");
+        let message = e["message"].as_str().unwrap();
+        assert!(
+            message.contains("this computer's own workspace"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!("PitCrew's helper may still be running on {HOST}")),
+            "{message}"
+        );
+        assert_eq!(
+            w.channel(111).last().unwrap()["detail"],
+            e["message"],
+            "the failed add's detail says it too"
+        );
+        assert!(w.machine.endpoint().is_some(), "the stop really failed");
+        assert_eq!(w.tokens.get(DEMO).unwrap(), None);
+        assert_eq!(w.registry.record(DEMO).unwrap().kind, WorkspaceKind::Local);
+        assert_eq!(w.registry.list().len(), 1);
+        w.machine.fail_stop(false);
+
+        // A pairing that failed after reading the token leaks it nowhere.
+        no_token(
+            &w,
+            &token,
+            "a hub claimed the id of a workspace already here",
+        );
+        assert!(!log_text().contains("original-token-of-the-workspace"));
+    }
+
+    /// The app quits and starts again: the saved remote workspace's tunnel is made again, and it
+    /// is `ready` with its token from the keychain. Without its token it `needs_pairing`.
+    fn a_saved_remote_comes_back_after_a_restart() {
+        let w = world(false, |_, _| {});
+        let id = w.add_direct(120).unwrap();
+        assert_eq!(id, DEMO);
+
+        let again = w.restart();
+        again.wait("the saved workspace ready again", |w| {
+            w.state(&id) == Some(WorkspaceState::Ready)
+        });
+        let me = again
+            .call(
+                "gateway_request",
+                json!({ "req": { "workspace": id, "method": "GET", "path": "/v1/me" } }),
+            )
+            .unwrap();
+        assert_eq!(me["status"], 200, "{me}");
+
+        // The keychain lost the token: connected, but it needs pairing, and nothing is sent.
+        again.tokens.delete(&id).unwrap();
+        let third = again.restart();
+        third.wait("the workspace needs pairing", |w| {
+            w.state(&id) == Some(WorkspaceState::NeedsPairing)
+        });
+        let e = third
+            .call(
+                "gateway_request",
+                json!({ "req": { "workspace": id, "method": "GET", "path": "/v1/me" } }),
+            )
+            .unwrap_err();
+        assert_eq!(e["code"], "needs_pairing", "{e}");
+    }
+
+    /// A sign-in cancelled while the tunnel reconnects leaves the workspace `unreachable` until
+    /// `gateway_workspace_retry`, which brings it back to `ready`.
+    fn a_cancelled_sign_in_while_reconnecting_is_retried() {
+        let w = world(false, |_, _| {});
+        let id = w.add_direct(130).unwrap();
+        assert_eq!(w.state(&id), Some(WorkspaceState::Ready));
+
+        // The server closes the connection; reconnecting asks for a password, which the
+        // person cancels.
+        w.machine.require_password(PASSWORD);
+        w.answers.lock().unwrap().password = None;
+        w.machine.drop_link();
+        w.wait("the link dropped", |w| w.machine.dropped());
+        w.wait("unreachable after the cancel", |w| {
+            w.state(&id) == Some(WorkspaceState::Unreachable)
+        });
+        // It stays so: nothing tries again by itself.
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(w.state(&id), Some(WorkspaceState::Unreachable));
+
+        // The person tries again, and answers this time.
+        w.answers.lock().unwrap().password = Some(PASSWORD.into());
+        let retried = w
+            .call("gateway_workspace_retry", json!({ "workspace": id }))
+            .unwrap();
+        assert_eq!(retried, Value::Null);
+        w.wait("ready after the retry", |w| {
+            w.state(&id) == Some(WorkspaceState::Ready)
+        });
+        let me = w
+            .call(
+                "gateway_request",
+                json!({ "req": { "workspace": id, "method": "GET", "path": "/v1/me" } }),
+            )
+            .unwrap();
+        assert_eq!(me["status"], 200, "{me}");
+        assert!(w.machine.asked().contains(&"text".to_owned()));
+
+        let e = w
+            .call("gateway_workspace_retry", json!({ "workspace": "nope" }))
+            .unwrap_err();
+        assert_eq!(e["code"], "unknown_workspace");
+        let e = w.call("gateway_workspace_retry", json!({})).unwrap_err();
+        assert_eq!(e["code"], "invalid");
     }
 
     /// An expired plan is refused; a machine without a helper for its platform, or an app
@@ -963,18 +1354,33 @@ mod unix {
         );
         drop(w);
 
-        // No pitcrew-askpass: nothing runs ssh.
-        let w = world(false, |options, _| {
-            options.askpass = Err("pitcrew-askpass is not next to the app".into());
-        });
-        let e = w
-            .call("gateway_remote_probe", json!({ "host": HOST }))
-            .unwrap_err();
-        assert_eq!(e["code"], "internal");
-        assert!(
-            e["message"].as_str().unwrap().contains("pitcrew-askpass"),
-            "{e}"
-        );
-        assert!(w.machine.calls().is_empty(), "{:?}", w.machine.calls());
+        // No pitcrew-askpass, or a configured ssh that failed its checks: nothing runs ssh.
+        for (askpass, ssh, said) in [
+            (
+                Err("pitcrew-askpass is not next to the app".to_owned()),
+                None,
+                "pitcrew-askpass",
+            ),
+            (
+                Ok(()),
+                Some("not running the configured ssh: it can be written by other users".to_owned()),
+                "configured ssh",
+            ),
+        ] {
+            let w = world(false, |options, _| {
+                if let Err(why) = askpass {
+                    options.askpass = Err(why);
+                }
+                if let Some(why) = ssh {
+                    options.ssh = Err(why);
+                }
+            });
+            let e = w
+                .call("gateway_remote_probe", json!({ "host": HOST }))
+                .unwrap_err();
+            assert_eq!(e["code"], "internal");
+            assert!(e["message"].as_str().unwrap().contains(said), "{e}");
+            assert!(w.machine.calls().is_empty(), "{:?}", w.machine.calls());
+        }
     }
 }
