@@ -76,6 +76,12 @@ to `/v1/hooks/{engine}/{event}`.
 The hook **always exits 0 and prints nothing**, even if it panics, and gives up after 500 ms
 whatever the daemon does. Global flags before it (`pitcrew --json hook …`) keep it on this path. Set `PITCREW_HOOK_DEBUG=1` to see on stderr why an event was not delivered.
 
+`pitcrew hooks install` writes Claude Code's hooks as `<pitcrew> hook claude <Event>`. Claude Code
+runs that with a shell: `bash`, which on Windows is Git Bash, or PowerShell on a Windows machine
+without Git Bash. The path is quoted for POSIX `sh`, only if needed, and on Windows its `\` become
+`/` first, so a plain path (`C:/Users/sam/.local/bin/pitcrew.exe`) runs unquoted in both shells; a
+path with a blank is single-quoted, for Git Bash.
+
 Its wall time (release build, spawn to exit, 200 runs) is measured by:
 
 ```text

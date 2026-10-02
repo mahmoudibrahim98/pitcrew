@@ -55,15 +55,20 @@ pub(crate) fn path(env: Env<'_>) -> Result<PathBuf> {
     Ok(super::config_dir(env, "CLAUDE_CONFIG_DIR", ".claude")?.join(FILE_NAME))
 }
 
-/// Quotes the executable's path for Claude Code's `command` field: **always** wrapped in quotes
-/// on Windows, never left bare, because Claude Code may run hooks through Git Bash, whose POSIX
-/// `sh` treats an unquoted backslash as an escape character — `C:\Users\...` unquoted loses its
-/// backslashes there, even though the identical bare path is perfectly fine when `cmd.exe` runs
-/// it directly. Quoting unconditionally sidesteps having to know in advance which shell will run
-/// it. On Unix, the usual "quote only if needed" (`shell_quote_unix`) is used.
+/// Quotes the executable's path for Claude Code's `command` field, which Claude Code runs with a
+/// shell: `bash` everywhere, which on Windows is Git Bash, and PowerShell on a Windows machine
+/// without Git Bash (Claude Code's hooks reference, the `shell` field). So it is quoted for POSIX
+/// `sh`, only if needed (`shell_quote_unix`): single quotes keep every character literal, where
+/// double quotes would still expand `$` and a backtick and fold `\\`.
+///
+/// On Windows the path's `\` become `/` first, which Windows, Git Bash and PowerShell all read as
+/// separators: in bash an unquoted `\` is an escape, so `C:\Users\…` would lose its backslashes,
+/// and a plain path then needs no quotes at all. Unquoted, it runs in PowerShell too, which treats
+/// a leading quoted word as a string rather than a program; a path with a blank or another
+/// character `sh` gives a meaning to is single-quoted, which suits Git Bash, the default.
 fn claude_quote_exe_path(path: &str) -> String {
     if cfg!(windows) {
-        format!("\"{}\"", path.replace('"', "\"\""))
+        super::shell_quote_unix(&path.replace('\\', "/"))
     } else {
         super::shell_quote_unix(path)
     }
@@ -1092,23 +1097,57 @@ mod tests {
         assert_eq!(restored, original);
     }
 
+    /// Quoted for `sh` (Claude Code's `bash`, Git Bash on Windows) only where needed, and always
+    /// recognised as ours.
     #[test]
-    fn the_quoted_command_matches_the_platform() {
-        let cmd = command("/a/b c/pitcrew", "Stop");
-        if cfg!(windows) {
-            assert_eq!(cmd, "\"/a/b c/pitcrew\" hook claude Stop");
-        } else {
-            assert_eq!(cmd, "'/a/b c/pitcrew' hook claude Stop");
+    fn the_command_is_quoted_for_sh_only_where_needed() {
+        for (exe, expected) in [
+            ("/a/b/pitcrew", "/a/b/pitcrew hook claude Stop"),
+            ("/a/b c/pitcrew", "'/a/b c/pitcrew' hook claude Stop"),
+            ("/a/it's/pitcrew", r"'/a/it'\''s/pitcrew' hook claude Stop"),
+            ("/a/$x/pitcrew", "'/a/$x/pitcrew' hook claude Stop"),
+        ] {
+            let cmd = command(exe, "Stop");
+            assert_eq!(cmd, expected);
+            assert!(command_is_ours(&cmd, "Stop"), "{cmd}");
         }
     }
 
+    /// On Windows a path's `\` become `/`: unquoted, a plain path runs in Git Bash (where `\` is an
+    /// escape) and in PowerShell alike. On Unix `\` is an ordinary character of a file name.
     #[test]
-    fn windows_command_is_always_quoted_even_without_special_characters() {
-        let cmd = command("/a/b/pitcrew", "Stop");
+    fn a_windows_path_is_written_with_forward_slashes() {
+        let plain = command(r"C:\Users\sam\.local\bin\pitcrew.exe", "Stop");
+        let spaced = command(r"C:\Program Files\PitCrew\pitcrew.exe", "Stop");
+        let unc = command(r"\\host\share\pitcrew.exe", "Stop");
         if cfg!(windows) {
-            assert_eq!(cmd, "\"/a/b/pitcrew\" hook claude Stop");
+            assert_eq!(
+                plain,
+                "C:/Users/sam/.local/bin/pitcrew.exe hook claude Stop"
+            );
+            assert_eq!(
+                spaced,
+                "'C:/Program Files/PitCrew/pitcrew.exe' hook claude Stop"
+            );
+            assert_eq!(unc, "//host/share/pitcrew.exe hook claude Stop");
         } else {
-            assert_eq!(cmd, "/a/b/pitcrew hook claude Stop");
+            assert_eq!(
+                plain,
+                r"'C:\Users\sam\.local\bin\pitcrew.exe' hook claude Stop"
+            );
+            assert_eq!(
+                spaced,
+                r"'C:\Program Files\PitCrew\pitcrew.exe' hook claude Stop"
+            );
+            assert_eq!(unc, r"'\\host\share\pitcrew.exe' hook claude Stop");
         }
+        for cmd in [&plain, &spaced, &unc] {
+            assert!(command_is_ours(cmd, "Stop"), "{cmd}");
+        }
+        // What earlier versions wrote on Windows is still ours (and stale, so install rewrites it).
+        assert!(command_is_ours(
+            r#""C:\Users\sam\.local\bin\pitcrew.exe" hook claude Stop"#,
+            "Stop"
+        ));
     }
 }
