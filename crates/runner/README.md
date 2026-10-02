@@ -200,15 +200,28 @@ that caused it; `StoreSink` authors those events as that caller (`author` the me
 
 **Option B: a protocol field.** `author` keeps meaning who reported the event (the hub stamps it, as
 now), and an optional field says what caused a state change, e.g. on `session_state_changed` and
-`session_ended`: `"cause": {"kind": "hook", "member": "<MemberId>"}`, or `"transcript"`, or
+`session_ended`: `"cause": {"kind": "hook", "receipt": "<HookReceiptId>"}`, or `"transcript"`, or
 `"runner"` (a command it ran). The runner fills it from `Origin`; a missing field reads as unknown.
 
+- **Informational only.** `cause` is for people reading the history (recaps, the audit trail).
+  It is never taken as `author` or `on_behalf_of`, never used to authorize anything, never moves
+  `task_moved`'s attribution (its mover), and no office rule reads it. Only the token-stamped
+  `author` carries authority.
+- **A receipt, not a member.** It names the hook by a receipt id the hub issued when its hook
+  intake accepted the delivery, not by a raw member id. The hub knows which token each receipt
+  came with, so a runner cannot claim a member it never received a hook from: a receipt the hub
+  did not issue, or issued for another session, is shown as unverified. The runner gets the
+  receipt with the hook (`HookEvent` would carry it) and keeps it with a held hook.
+- **Folded held hooks.** Held hooks from several senders fold into one `session_discovered`.
+  It names every receipt it folded in, oldest first, and the last one that changed the state is
+  the one that set the session's first state; refused held hooks are not named.
 - For: one meaning everywhere, in process and remote; authority stays with the hub's stamping,
   and the cause is information the recap and audit views can show ("the writer's Stop hook");
   older events and clients are unaffected (an optional field). It also records the transcript and
   command cases, which A cannot tell apart from each other.
-- Against: a contract change (stream 0: protocol, `api-v1.md`, the mock hub and UI types), and a
-  remote runner's `cause` is its claim, which the hub cannot check unless hooks reach it directly.
+- Against: a contract change (stream 0: protocol, `api-v1.md`, the hook intake's receipts, the
+  mock hub and UI types). A remote runner's `cause` is still its claim about which receipt caused
+  a change; the receipt bounds the claim to hooks the hub really received.
 
 **Recommendation: B.** Authorship should keep one meaning, stamped by the hub from the token that
 delivered the events, and the cause is better recorded as what it is. A also cannot cover the
