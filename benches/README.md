@@ -11,6 +11,8 @@ benches/run.sh --quick            # CI: 20 MiB only, fewer samples
 benches/run.sh --no-tests         # leave out the other crates' timing tests (about a minute less)
 benches/run.sh --write-baseline   # record this machine's numbers in benches/baseline.json
 benches/run.sh --extend-baseline  # compare, and add the passing metrics the baseline lacks
+benches/run.sh --scale            # also the scale measurements: pitcrewd with 10,000 transcripts (below)
+benches/run.sh --scale-only       # only those (about 5 minutes, 2 GiB of disk, Linux)
 cargo bench -p pitcrew-benches    # criterion alone (full mode; PITCREW_BENCH_MODE=quick for quick)
 ```
 
@@ -62,8 +64,200 @@ change that slows the work down still slows the fastest sample.
 Transcripts are synthetic, shaped like the fixtures, with one 24 KiB tool result per turn; they
 are in the page cache when measured, so `read_page` is the parse cost, not a cold disk read.
 
-Not measured yet: `pitcrewd` memory with 10k sessions, cold start, first scan of 10k transcripts,
-the `pitcrew` verb round trip, and the desktop numbers (stream K).
+From `pitcrew-bench-scale`, the real `pitcrewd` over 10,000 synthetic transcripts (next section):
+
+| Metric | What | Unit | Budget |
+|---|---|---|---|
+| `scale.first_scan` | Setup request until the runner has read every transcript to its end, page cache dropped | ms | First scan, 10k transcripts on SSD ≤ 60 s, streamed (budget only) |
+| `scale.first_scan.first_session` | Until the first session is in the log (the scan streams) | ms | none (not compared: 100 ms polls) |
+| `scale.rss.{scan_peak,scan_steady}` | `VmHWM` over the first scan and the idle after it; `VmRSS` after 20 s idle | MiB | `pitcrewd` memory, 10k sessions indexed ≤ 80 MB RSS (read as 80 MiB) |
+| `scale.rss.{restart_peak,restart_steady}` | The same for a daemon started with the index present | MiB | the same |
+| `scale.cold_start`, `.no_tmux` | Process spawn to the ready line, index present: median of 5 (tmux detection as shipped; tmux refused, median of 3) | ms | Cold start to serving ≤ 300 ms (`.no_tmux`: none) |
+| `scale.hook_to_frame` | `POST /v1/hooks/claude/…` until the `events` frame for its state change arrives on `/v1/stream`: p50 of 40 | ms | Hook event → UI change ≤ 300 ms local |
+| `scale.db.after_scan` | `hub.db` after a clean stop | MiB | none |
+| `scale.db.per_session` | `hub.db` growth over an empty store, per session | KiB | none |
+| `scale.db.per_1000_events` | `hub.db` growth for events from live transcripts, per 1,000 | KiB | none |
+| `scale.index.after_scan` | The runner's own index (`runner/<log id>/`) | MiB | none |
+
+Not measured yet: the `pitcrew` verb round trip and the desktop numbers (stream K; they need a
+display).
+
+## Scale: `pitcrewd` with 10,000 transcripts
+
+The budgets that depend on a person's whole history (memory with 10k sessions indexed, cold
+start, the first scan, how the database grows) need the real daemon over a real-sized history.
+`pitcrew-bench-scale` (`src/bin/scale.rs`, `src/scale.rs`) writes one into a temp folder, runs the
+release `pitcrewd` on it, and prints each number as a line `external.rs` reads, so the report
+checks them like the rest. Nothing real is read: the homes are generated, the daemon is started
+with `--homes` on them, and its `HOME` and every variable that points elsewhere is the run's own
+(`pitcrew_fixtures::homes` refuses to start it otherwise).
+
+```bash
+benches/run.sh --scale-only        # all of it, then the report
+cargo build --profile bench -p pitcrew-daemon      # pitcrewd, built beside the tool (run.sh does this)
+cargo run --profile bench -p pitcrew-benches --bin pitcrew-bench-scale -- scan     # one command per measurement:
+#   scan    generate, first scan, memory during and after it, database size
+#   start   scan, then cold start and memory with the index present
+#   hook    scan, then hook to stream frame
+#   growth  scan, then the database's growth per 1,000 events
+#   all     everything (the default)
+cargo run --profile bench -p pitcrew-benches --bin pitcrew-bench-scale -- gen --out DIR   # only write the homes
+```
+
+Options: `--sessions N` (default 10,000), `--seed N`, `--pitcrewd PATH` (or `$PITCREWD`; default
+the `pitcrewd` next to the tool), `--idle SECONDS` (20), `--starts N` (5), `--probes N` (40),
+`--growth-turns N` (40), `--keep-cache` (do not drop the page cache), `--work DIR`, `--keep`
+(keep the folder). It needs Linux (`/proc`), about 2 GiB in the temp dir (it refuses to start
+unless that and 6 GiB to spare are free; `--min-free-gib`), and root to drop the page cache (without it
+the scan reads what the generator just wrote, from memory; the output says which). It cleans up
+after itself: every daemon is stopped with SIGTERM and waited for (and killed if the run fails
+half way), the run's tmux servers are killed, the folder is removed, and it warns if anything of
+the run is still running. Set `TMPDIR` to put the folder elsewhere.
+
+### What a run does
+
+1. **Generates the homes** (`src/homes.rs`), about 10 s, deterministic from `--seed`.
+2. **First scan.** Starts a daemon on an empty state (to size an empty database), starts it again,
+   sets the workspace up with `POST /v1/setup` (which starts the runner), and watches until the
+   runner's index holds every transcript read to its end. Timed from the setup request. Memory
+   is read every 5 s and again after the daemon has used almost no CPU for 2 s (at least 20 s).
+   Then it lists the sessions through the API (`GET /v1/sessions` must return all 10,000), stops
+   the daemon cleanly and sizes `hub.db` and the runner's index.
+3. **Starts** with the index present, five times (spawn to the ready line), then three with tmux
+   refused, once after dropping the page cache, and once more to stay up: its memory after it
+   has caught up and gone quiet.
+4. **Hooks.** Sends `UserPromptSubmit` and `Stop` alternately for one session (forty times after
+   five that are not counted) with the stream open, and times each from just before the request
+   until its `events` frame arrives.
+5. **Growth.** Appends 40 turns to each of the 24 live sessions (6,240 events), waits until the
+   log stops growing, stops the daemon and sizes `hub.db` again.
+
+### The history
+
+Generated as the fixtures are shaped (prompt, plan, tool calls with results, edits with a
+structured patch, a closing message, a turn duration) with what a real history adds:
+
+| | |
+|---|---|
+| Mix | 6,000 Claude sessions, 1,000 Claude sub-agents (next to a longer session), 2,000 Codex rollouts, 1,000 OpenCode sessions in one store: 10,000 transcripts, 1.50 GiB, 1.35 M records |
+| Length | 45% of sessions are 1-2 turns, 30% 3-10, 20% 11-40, 5% 41-250. Claude files: median 46 KB, mean 174 KB, p99 2.6 MB, largest 3.6 MB; Codex: median 42 KB, mean 154 KB; the OpenCode store is 87 MB |
+| Tool results | Log-normal: file reads median 4 KiB (200 B to 48 KiB), shell output median 700 B |
+| Folders, months | 156 working directories (125 projects, some with git worktrees), a few holding most sessions; starts spread over 270 days, more of them recent; file times are the end of each session |
+| Live | 24 Claude sessions written in the last 4 hours (the watcher keeps their folders watched), which the growth stage writes to |
+| Events | The runner derives 611,924 events from it (61 a session): 399 k `tool_ran`, 133 k `turn_ended`, 70 k `file_edited`, 10 k `session_discovered` |
+
+How much memory and database that takes depends on this shape, above all on events a session
+(see "How it scales"). It is a heavy user's history, not a typical one.
+
+### Numbers
+
+This VM: 4 vCPU Intel Xeon @ 2.10 GHz under KVM, 16 GiB RAM, Ubuntu 24.04 (Linux 6.18), ext4 on a
+virtio disk (the guest cannot tell if it is an SSD), Rust 1.97, tmux 3.4. Built from this
+branch's sources in the `bench` profile (the shipped `release`: thin LTO, stripped). Nothing else
+ran: the machine was idle (load average at the start 0.1-0.7, see below), after the builds had
+finished. Run D is the recorded run (`benches/run.sh --scale-only`, load average 0.34 0.54 0.63 at
+the start, page cache dropped); the range is over six full runs (A-C with the page cache warm,
+load 0.36, 0.35, 0.10; D-F with it dropped, load 0.34, 0.72 and 0.39: E started right after cargo
+had rebuilt the tool, and F is the final code).
+
+| Metric | Budget | Run D | Range, 6 runs | |
+|---|---|---|---|---|
+| `scale.first_scan` | 60 s | 31.0 s | 26.9-28.0 s warm, 28.5-31.0 s dropped | within |
+| `scale.first_scan.first_session` | streamed | 507 ms | 0.2 s warm, 0.41-0.51 s dropped | 1,000 sessions after 2.9-4.7 s |
+| `scale.rss.scan_peak` | 80 MiB | **88.1 MiB** | 87.6-89.1 | **over** (+10%) |
+| `scale.rss.scan_steady` | 80 MiB | **85.7 MiB** | 85.7-88.6 | **over** (+7%) |
+| `scale.rss.restart_peak` | 80 MiB | **127.5 MiB** | 127.4-127.7 | **over** (+59%) |
+| `scale.rss.restart_steady` | 80 MiB | **127.5 MiB** | 127.4-127.7 | **over** (+59%) |
+| `scale.cold_start` (tmux detection as shipped) | 300 ms | 100.8 ms (best 93.7) | median 99.9-114 ms, best 88.6-98.8 | within |
+| `scale.cold_start.no_tmux` | | 66.3 ms | 65.5-75.2 ms | |
+| first start after dropping the page cache (printed, not a metric) | 300 ms | 251 ms | 217-259 ms | within, close |
+| `scale.hook_to_frame` | 300 ms | 79.0 ms (p95 80, max 83) | p50 78.8-79.5 ms, max 80-154 | within |
+| `scale.db.after_scan` | | 349.6 MiB | 349.6-349.7 | 598 bytes an event |
+| `scale.db.per_session` | | 35.76 KiB | 35.76 | 61 events a session |
+| `scale.db.per_1000_events` | | 478 KiB | 476-480 | |
+| `scale.index.after_scan` | | 12.86 MiB | 12.84-12.86 | 1.3 KiB a transcript |
+
+`GET /v1/sessions` with all 10,000 sessions answers in 32-52 ms (3.1 MiB). The daemon logged no
+warning or error that a fresh start does not always log. The "first start after dropping the page
+cache" row is a start that reads the binary, the database and the index from disk, as the first
+start after boot does: 70-86% of the budget.
+
+**Over budget: memory.** The 80 MB in P.md is read as 80 MiB (80 MB would be 76.3 MiB, which
+makes it worse). Seen from the outside, with the same state, by turning parts of the daemon off
+(`pitcrewd serve --no-runner`, `--no-office`, run by hand on a state this tool kept with
+`--keep`; RSS 12 s after start):
+
+| Daemon | RSS | Heap |
+|---|---|---|
+| default, index present | 126.5 MiB | 115.6 MiB |
+| `--no-office` | 126.4 MiB | 115.6 MiB |
+| `--no-runner` | 66.5 MiB | 56.7 MiB |
+| `--no-runner --no-office` | 66.0 MiB | 56.4 MiB |
+
+- **The recap index is about 51 MiB** of the hub's 56 MiB heap. `pitcrewd` builds it at every
+  start from the whole log on the blocking pool (`built the recap index rev=611924 ms=2441`), and
+  with the runner and the office off the heap goes from 5 MiB at 0.05 s to 56 MiB at 3 s, which is
+  that build. That is about 88 bytes an event, so it grows with events, not sessions: 612 k events
+  here.
+- **The runner is about 60 MiB** with the index present: its start loads the index's 10,000 rows
+  (cursor, session facts and metadata, as JSON in its database) and tracks every one, about 6
+  KiB a transcript. With it, the daemon is at 61 MiB 0.15 s after the start and at 126 MiB when
+  the recap index is done.
+- **The office does not matter** (0.1 MiB).
+- During the first scan the same two grow together (36 MiB after 5 s, 87 MiB at 30 s: about 6.5
+  MiB a thousand transcripts), which is why the first scan ends at 88 MiB, and a restart, which
+  loads everything at once and builds the recap index from scratch, at 127 MiB.
+
+**Not over budget, but what dominates.**
+
+- *First scan, 27-31 s of 60.* 323-372 transcripts a second, 20-23 k events a second; 34-39 s of
+  CPU over 27-31 s wall on 4 vCPUs. Two runner threads do nearly all of it: the sink thread
+  (appending 612 k events to `hub.db` with the work model's projections, and saving each cursor
+  in the runner's index) 17.1-18.8 s, and the watcher (reading, parsing and deriving the events)
+  13.8-16.6 s, each busy about half to two-thirds of the time, joined by a 64-batch channel. It is
+  CPU-bound: reading from disk instead of the page cache costs 8-10% (26.8-28.0 s warm against
+  29.0-31.0 s dropped). It streams: the first session is in the log after 0.2-0.5 s and 1,000
+  after 2.9-4.7 s.
+- *Cold start, 100 ms of 300.* Tmux detection is on the path to the ready line (`block_on`): it
+  costs about 35 ms (66 ms with tmux refused). Opening the store and starting the runner with 10k
+  rows is the rest, about 3-6 ms a thousand sessions (see "How it scales"). The recap index's
+  2.4 s build does not delay it.
+- *Hook to frame, 79 ms of 300.* 75 ms of that is the stream's batch window (the default
+  config); the request, the runner and the append are under 4 ms, with 10,000 sessions present
+  or not (the `stream.append_to_frame` benchmarks give 76.4 ms with none).
+- *Database.* 598 bytes an event (the event's JSON, four indexes, and the work model's
+  projections); live events cost 478 KiB a thousand, a little less than the average because
+  they only append. A heavy history of 612 k events is 350 MiB. The runner's index adds
+  12.9 MiB.
+
+### How it scales
+
+`start --sessions N` with the same mix (page cache warm):
+
+| Transcripts | Events | First scan | RSS, first scan (peak / steady) | RSS, restart | Cold start | `hub.db` |
+|---|---|---|---|---|---|---|
+| 2,500 | 148 k | 6.6 s | 39.8 / 39.2 MiB | 48.9 MiB | 57 ms | 85.5 MiB |
+| 5,000 | 309 k | 14.1 s | 56.2 / 55.2 MiB | 79.8 MiB | 71 ms | 177.4 MiB |
+| 10,000 | 612 k | 26.9-28.0 s | 88.3 / 87.5 MiB | 127.6 MiB | 100 ms | 349.6 MiB |
+
+Everything is linear in the history. At this density the restart RSS crosses 80 MiB at about 5,000
+transcripts (9.6 MiB a thousand) and the first scan's at about 8,900 (6.5 MiB a thousand); the
+first scan would take 60 s at about 22,000.
+
+### Limits of these numbers
+
+- One synthetic shape on one VM. Memory follows events (the recap index) and transcripts (the
+  runner), so a history with fewer events a session needs less; the table above gives the slope.
+- The cold-start and restart numbers have a warm page cache, except the one printed after
+  dropping it. The first scan is run with the cache dropped when the run may (root), which
+  needs a fresh disk read of 1.5 GiB; the guest's disk may not be an SSD.
+- The hook is timed over loopback TCP from this process; the desktop reaches the same routes
+  over the private socket. The stream's WebSocket write is included (the client reads it).
+- The first scan is one sample per run, and the memory numbers are read from `/proc` once, so the
+  scale metrics are not retried. Between six runs the first scan moved by 15% (cache warm and
+  dropped together) and 9% with the cache the same, the first session by 25%; memory by 1-4%.
+- Windows and macOS are not measured (the tool reads `/proc`); it compiles there and refuses to
+  run.
 
 ## Summary format
 
@@ -110,3 +304,18 @@ held the load average near 10, and the slowdown outlasted both retries. So the l
 but a real regression under about 2x could hide in this noise: use the laptop baseline to see
 orders of magnitude and the budgets' headroom, and gate on a quiet, dedicated runner with its own
 baseline.
+
+### The cloud VM baseline
+
+[`baseline-cloud-vm.json`](baseline-cloud-vm.json) is the baseline of the scale metrics for the
+cloud VM class above (a 4 vCPU Xeon, 16 GiB; the machine string differs from the laptop's, so
+the laptop's file is left alone and the numbers are not mixed). It was written with
+`benches/run.sh --scale-only --baseline benches/baseline-cloud-vm.json --extend-baseline` on the
+idle VM, which adds only the metrics within their budgets, and then trimmed by the noise rule:
+what is in it agreed within 10% across the runs (cold start best 88.6-98.8 ms, the stream 78.0
+ms, the database sizes to 0.1%). Left out: the four `scale.rss.*` (over their budgets),
+`scale.first_scan` and `scale.first_scan.first_session` (one sample that moved by 9% and 25%
+between runs; checked against the budget only, `compare = false` in `metrics.rs`). Compare with
+`benches/run.sh --scale-only --baseline benches/baseline-cloud-vm.json`; runs E and F did, and
+every metric in the file was `ok`, within 6% (the cold start best 5.4% better in E, 4.7% worse
+in F).

@@ -2,7 +2,8 @@
 //!
 //! The budgets come from the table in `docs/build/streams/P.md`; the store's targets come from
 //! `crates/store/README.md` (stream C), the task list's from `crates/hub-work/tests/perf.rs`
-//! (stream E) and the hook's from `crates/cli/tests/hook_timing.rs` (stream I). A metric with no
+//! (stream E), the hook's from `crates/cli/tests/hook_timing.rs` (stream I), and the daemon's with
+//! 10,000 transcripts from `pitcrew-bench-scale` (this crate, `src/scale.rs`). A metric with no
 //! budget is still checked for regressions.
 
 use serde::{Deserialize, Serialize};
@@ -19,6 +20,12 @@ pub enum Unit {
     /// Percent of one CPU core.
     #[serde(rename = "%cpu")]
     PercentCpu,
+    /// Mebibytes: a process's memory, a file's size.
+    #[serde(rename = "MiB")]
+    Mib,
+    /// Kibibytes: growth per session, per 1,000 events.
+    #[serde(rename = "KiB")]
+    Kib,
 }
 
 impl Unit {
@@ -29,6 +36,8 @@ impl Unit {
             Self::Ms => "ms",
             Self::MibPerS => "MiB/s",
             Self::PercentCpu => "%cpu",
+            Self::Mib => "MiB",
+            Self::Kib => "KiB",
         }
     }
 
@@ -58,11 +67,19 @@ pub enum TestId {
     HubTaskList,
     /// `crates/cli/tests/hook_timing.rs`: `pitcrew hook` wall time.
     CliHookTiming,
+    /// `pitcrew-bench-scale` (this crate): `pitcrewd` with 10,000 transcripts. It takes minutes
+    /// and gigabytes of disk, so `benches/run.sh` runs it only with `--scale`.
+    Scale,
 }
 
 impl TestId {
     /// Every test, in run order.
-    pub const ALL: [Self; 3] = [Self::HubTaskList, Self::CliHookTiming, Self::RunnerIdleCpu];
+    pub const ALL: [Self; 4] = [
+        Self::HubTaskList,
+        Self::CliHookTiming,
+        Self::RunnerIdleCpu,
+        Self::Scale,
+    ];
 
     /// The name `benches/run.sh` knows it by.
     #[must_use]
@@ -71,6 +88,7 @@ impl TestId {
             Self::RunnerIdleCpu => "runner-idle-cpu",
             Self::HubTaskList => "hub-work-perf",
             Self::CliHookTiming => "cli-hook-timing",
+            Self::Scale => "scale",
         }
     }
 
@@ -144,7 +162,8 @@ pub struct Metric {
     /// Where it can be measured.
     pub needs: Needs,
     /// Whether runs are compared with the baseline. Off where the measurement's resolution is
-    /// coarser than the threshold (idle CPU is counted in 0.05% ticks), so only the budget is
+    /// coarser than the threshold (idle CPU is counted in 0.05% ticks), or where one sample
+    /// moves by about the threshold from run to run (the first scan), so only the budget is
     /// checked.
     pub compare: bool,
 }
@@ -177,6 +196,22 @@ const HOOK_UP: Budget = Budget {
     name: "pitcrew hook wall time <= 10 ms (P.md); p99 over 200 runs, daemon up",
     value: 10.0,
 };
+const FIRST_SCAN: Budget = Budget {
+    name: "First scan, 10k transcripts on SSD <= 60 s, streamed (P.md)",
+    value: 60_000.0,
+};
+const COLD_START: Budget = Budget {
+    name: "Cold start to serving, index present <= 300 ms (P.md); 10k sessions indexed",
+    value: 300.0,
+};
+const DAEMON_RSS: Budget = Budget {
+    name: "pitcrewd memory, 10k sessions indexed <= 80 MB RSS (P.md; read as 80 MiB)",
+    value: 80.0,
+};
+const HOOK_TO_UI_10K: Budget = Budget {
+    name: "Hook event -> UI change <= 300 ms local (P.md); POST to stream frame, 10k sessions present",
+    value: 300.0,
+};
 const HOOK_DOWN: Budget = Budget {
     name: "pitcrew hook with no daemon listening: p99 <= 5 ms (CLI hook timing test)",
     value: 5.0,
@@ -204,6 +239,24 @@ const fn rate(name: &'static str, bench: &'static str) -> Metric {
 
 const fn test_ms(name: &'static str, test: TestId, budget: Budget) -> Metric {
     metric(name, Source::Test(test), Unit::Ms, Some(budget))
+}
+
+/// A number `pitcrew-bench-scale` prints. Only Linux can read a process's memory from `/proc`.
+const fn scale(name: &'static str, unit: Unit, budget: Option<Budget>) -> Metric {
+    needs(
+        Needs::Linux,
+        metric(name, Source::Test(TestId::Scale), unit, budget),
+    )
+}
+
+/// A scale number checked against its budget only: it is one sample (a scan takes half a
+/// minute) that moved by 7% or more between runs on a quiet machine, or it is read at a
+/// resolution (100 ms polls) too coarse for a 10% threshold.
+const fn scale_budget_only(name: &'static str, unit: Unit, budget: Option<Budget>) -> Metric {
+    Metric {
+        compare: false,
+        ..scale(name, unit, budget)
+    }
 }
 
 const fn full(metric: Metric) -> Metric {
@@ -313,6 +366,19 @@ pub const METRICS: &[Metric] = &[
     ),
     test_ms("cli.hook.up.tcp", TestId::CliHookTiming, HOOK_UP),
     test_ms("cli.hook.down.tcp", TestId::CliHookTiming, HOOK_DOWN),
+    scale_budget_only("scale.first_scan", Unit::Ms, Some(FIRST_SCAN)),
+    scale_budget_only("scale.first_scan.first_session", Unit::Ms, None),
+    scale("scale.rss.scan_peak", Unit::Mib, Some(DAEMON_RSS)),
+    scale("scale.rss.scan_steady", Unit::Mib, Some(DAEMON_RSS)),
+    scale("scale.rss.restart_peak", Unit::Mib, Some(DAEMON_RSS)),
+    scale("scale.rss.restart_steady", Unit::Mib, Some(DAEMON_RSS)),
+    scale("scale.cold_start", Unit::Ms, Some(COLD_START)),
+    scale("scale.cold_start.no_tmux", Unit::Ms, None),
+    scale("scale.hook_to_frame", Unit::Ms, Some(HOOK_TO_UI_10K)),
+    scale("scale.db.after_scan", Unit::Mib, None),
+    scale("scale.db.per_session", Unit::Kib, None),
+    scale("scale.db.per_1000_events", Unit::Kib, None),
+    scale("scale.index.after_scan", Unit::Mib, None),
 ];
 
 /// The metric measured by criterion benchmark `bench`.

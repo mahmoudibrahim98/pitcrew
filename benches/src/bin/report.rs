@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! pitcrew-bench-report --criterion DIR [--criterion DIR ...] [--tests FILE ...] [--no-tests]
+//!                      [--scale | --only-scale]
 //!                      [--baseline FILE] [--out FILE] [--mode quick|full] [--threshold 0.10]
 //!                      [--machine LABEL] [--retry-plan FILE]
 //!                      [--write-baseline | --extend-baseline] [--recorded DATE] [--note TEXT]
@@ -13,6 +14,10 @@
 //! each metric keeps its better numbers. `--retry-plan` writes what failed, for `run.sh` to run
 //! again ([`report::Retry::plan`]); it is empty when nothing did. `--no-tests` says the timing
 //! tests were left out, so their metrics are skipped rather than missing.
+//!
+//! The scale measurements (`pitcrew-bench-scale`) are tests too: their output is one more
+//! `--tests` file. They are expected only with `--scale` (on top of the rest) or `--only-scale`
+//! (instead of the rest, which is then skipped and needs no `--criterion`).
 //!
 //! `--write-baseline` replaces the baseline with this run; `--extend-baseline` adds the metrics
 //! the baseline has no value for, if they pass (not over budget).
@@ -26,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: pitcrew-bench-report --criterion DIR [--criterion DIR ...] \
-[--tests FILE ...] [--no-tests] [--baseline FILE] [--out FILE] [--mode quick|full] \
+[--tests FILE ...] [--no-tests] [--scale | --only-scale] [--baseline FILE] [--out FILE] [--mode quick|full] \
 [--threshold FRACTION] [--machine LABEL] [--retry-plan FILE] \
 [--write-baseline | --extend-baseline] [--recorded DATE] [--note TEXT]";
 
@@ -42,6 +47,8 @@ struct Args {
     criterion: Vec<PathBuf>,
     tests: Vec<PathBuf>,
     no_tests: bool,
+    scale: bool,
+    only_scale: bool,
     baseline: PathBuf,
     out: Option<PathBuf>,
     mode: Mode,
@@ -66,6 +73,8 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         criterion: Vec::new(),
         tests: Vec::new(),
         no_tests: false,
+        scale: false,
+        only_scale: false,
         baseline: PathBuf::from("benches/baseline.json"),
         out: None,
         mode: Mode::from_env(),
@@ -82,6 +91,8 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--criterion" => out.criterion.push(PathBuf::from(value()?)),
             "--tests" => out.tests.push(PathBuf::from(value()?)),
             "--no-tests" => out.no_tests = true,
+            "--scale" => out.scale = true,
+            "--only-scale" => out.only_scale = true,
             "--baseline" => out.baseline = PathBuf::from(value()?),
             "--out" => out.out = Some(PathBuf::from(value()?)),
             "--mode" => {
@@ -106,7 +117,14 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             other => return Err(format!("unknown argument {other:?}\n{USAGE}")),
         }
     }
-    if out.criterion.is_empty() {
+    if out.scale && out.only_scale {
+        return Err("--scale and --only-scale exclude each other".to_owned());
+    }
+    if out.only_scale {
+        if !out.criterion.is_empty() || out.no_tests {
+            return Err("--only-scale leaves out the benchmarks and the other tests".to_owned());
+        }
+    } else if out.criterion.is_empty() {
         return Err(format!("--criterion is required\n{USAGE}"));
     }
     if out.no_tests && !out.tests.is_empty() {
@@ -175,7 +193,9 @@ fn run(args: &Args) -> Result<bool, String> {
     let machine = args.machine.clone().unwrap_or_else(report::machine);
     let scope = Scope {
         mode: args.mode,
-        tests: !args.no_tests,
+        benches: !args.only_scale,
+        tests: !args.no_tests && !args.only_scale,
+        scale: args.scale || args.only_scale,
     };
 
     if args.action == BaselineAction::Write {
@@ -270,6 +290,10 @@ mod tests {
         let a = args("--criterion c --no-tests --extend-baseline").unwrap();
         assert!(a.no_tests);
         assert_eq!(a.action, BaselineAction::Extend);
+        let a = args("--criterion c --tests t --scale").unwrap();
+        assert!(a.scale && !a.only_scale);
+        let a = args("--only-scale --tests t").unwrap();
+        assert!(a.only_scale && a.criterion.is_empty());
     }
 
     #[test]
@@ -281,5 +305,8 @@ mod tests {
         assert!(args("--criterion c --bogus").is_err());
         assert!(args("--criterion c --write-baseline --extend-baseline").is_err());
         assert!(args("--criterion c --no-tests --tests t").is_err());
+        assert!(args("--criterion c --scale --only-scale").is_err());
+        assert!(args("--criterion c --only-scale").is_err());
+        assert!(args("--only-scale --no-tests").is_err());
     }
 }
