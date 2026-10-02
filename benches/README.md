@@ -156,25 +156,25 @@ virtio disk (the guest cannot tell if it is an SSD), Rust 1.97, tmux 3.4. Built 
 branch's sources in the `bench` profile (the shipped `release`: thin LTO, stripped). Nothing else
 ran: the machine was idle (load average at the start 0.1-0.7, see below), after the builds had
 finished. Run D is the recorded run (`benches/run.sh --scale-only`, load average 0.34 0.54 0.63 at
-the start, page cache dropped); the range is over five full runs (A-C with the page cache warm,
-load 0.36, 0.35, 0.10; D and E with it dropped, load 0.34 and 0.72, E started right after cargo
-had rebuilt the tool).
+the start, page cache dropped); the range is over six full runs (A-C with the page cache warm,
+load 0.36, 0.35, 0.10; D-F with it dropped, load 0.34, 0.72 and 0.39: E started right after cargo
+had rebuilt the tool, and F is the final code).
 
-| Metric | Budget | Run D | Range, 5 runs | |
+| Metric | Budget | Run D | Range, 6 runs | |
 |---|---|---|---|---|
-| `scale.first_scan` | 60 s | 31.0 s | 26.9-28.0 s warm, 29.9-31.0 s dropped | within |
-| `scale.first_scan.first_session` | streamed | 507 ms | 0.2 s warm, 0.4-0.5 s dropped | 1,000 sessions after 2.9-4.7 s |
-| `scale.rss.scan_peak` | 80 MiB | **88.1 MiB** | 88.1-89.1 | **over** (+10%) |
+| `scale.first_scan` | 60 s | 31.0 s | 26.9-28.0 s warm, 28.5-31.0 s dropped | within |
+| `scale.first_scan.first_session` | streamed | 507 ms | 0.2 s warm, 0.41-0.51 s dropped | 1,000 sessions after 2.9-4.7 s |
+| `scale.rss.scan_peak` | 80 MiB | **88.1 MiB** | 87.6-89.1 | **over** (+10%) |
 | `scale.rss.scan_steady` | 80 MiB | **85.7 MiB** | 85.7-88.6 | **over** (+7%) |
 | `scale.rss.restart_peak` | 80 MiB | **127.5 MiB** | 127.4-127.7 | **over** (+59%) |
 | `scale.rss.restart_steady` | 80 MiB | **127.5 MiB** | 127.4-127.7 | **over** (+59%) |
-| `scale.cold_start` (tmux detection as shipped) | 300 ms | 100.8 ms (best 93.7) | median 100-114 ms, best 88.6-98.8 | within |
-| `scale.cold_start.no_tmux` | | 66.3 ms | 65-75 ms | |
+| `scale.cold_start` (tmux detection as shipped) | 300 ms | 100.8 ms (best 93.7) | median 99.9-114 ms, best 88.6-98.8 | within |
+| `scale.cold_start.no_tmux` | | 66.3 ms | 65.5-75.2 ms | |
 | first start after dropping the page cache (printed, not a metric) | 300 ms | 251 ms | 217-259 ms | within, close |
-| `scale.hook_to_frame` | 300 ms | 79.0 ms (p95 80, max 83) | p50 78.8-79.3 ms, max 80-96 | within |
+| `scale.hook_to_frame` | 300 ms | 79.0 ms (p95 80, max 83) | p50 78.8-79.5 ms, max 80-154 | within |
 | `scale.db.after_scan` | | 349.6 MiB | 349.6-349.7 | 598 bytes an event |
 | `scale.db.per_session` | | 35.76 KiB | 35.76 | 61 events a session |
-| `scale.db.per_1000_events` | | 478 KiB | 476-479 | |
+| `scale.db.per_1000_events` | | 478 KiB | 476-480 | |
 | `scale.index.after_scan` | | 12.86 MiB | 12.84-12.86 | 1.3 KiB a transcript |
 
 `GET /v1/sessions` with all 10,000 sessions answers in 32-52 ms (3.1 MiB). The daemon logged no
@@ -254,8 +254,8 @@ first scan would take 60 s at about 22,000.
 - The hook is timed over loopback TCP from this process; the desktop reaches the same routes
   over the private socket. The stream's WebSocket write is included (the client reads it).
 - The first scan is one sample per run, and the memory numbers are read from `/proc` once, so the
-  scale metrics are not retried. Between five runs the first scan moved by 15% (cache warm and
-  dropped together) and 7% with the cache the same, the first session by 25%; memory by 1-4%.
+  scale metrics are not retried. Between six runs the first scan moved by 15% (cache warm and
+  dropped together) and 9% with the cache the same, the first session by 25%; memory by 1-4%.
 - Windows and macOS are not measured (the tool reads `/proc`); it compiles there and refuses to
   run.
 
@@ -312,9 +312,10 @@ cloud VM class above (a 4 vCPU Xeon, 16 GiB; the machine string differs from the
 the laptop's file is left alone and the numbers are not mixed). It was written with
 `benches/run.sh --scale-only --baseline benches/baseline-cloud-vm.json --extend-baseline` on the
 idle VM, which adds only the metrics within their budgets, and then trimmed by the noise rule:
-what is in it agreed within 10% across five runs (cold start best 88.6-98.8 ms, the stream 78.0
+what is in it agreed within 10% across the runs (cold start best 88.6-98.8 ms, the stream 78.0
 ms, the database sizes to 0.1%). Left out: the four `scale.rss.*` (over their budgets),
-`scale.first_scan` and `scale.first_scan.first_session` (one sample that moved by 7% and 25%
+`scale.first_scan` and `scale.first_scan.first_session` (one sample that moved by 9% and 25%
 between runs; checked against the budget only, `compare = false` in `metrics.rs`). Compare with
-`benches/run.sh --scale-only --baseline benches/baseline-cloud-vm.json`; run E did, and every
-metric in the file was `ok`, within 6% (the cold start, 5.4% better).
+`benches/run.sh --scale-only --baseline benches/baseline-cloud-vm.json`; runs E and F did, and
+every metric in the file was `ok`, within 6% (the cold start best 5.4% better in E, 4.7% worse
+in F).
