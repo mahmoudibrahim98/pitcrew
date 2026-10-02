@@ -445,7 +445,10 @@ impl Recaps {
     pub fn with_config(config: Config, seed: Option<Directory>) -> Self {
         let (db, broken) = match BlockDb::memory() {
             Ok(db) => (Some(db), None),
-            Err(e) => (None, Some(format!("cannot open the recap blocks' database: {e}"))),
+            Err(e) => (
+                None,
+                Some(format!("cannot open the recap blocks' database: {e}")),
+            ),
         };
         Self {
             builder: BlockBuilder::new(config, seed.unwrap_or_default()),
@@ -769,7 +772,6 @@ impl Recaps {
         }
         Ok(DaysPage { days, at_start })
     }
-
 }
 
 /// A page's size: the default when absent, at most `max`, and never 0.
@@ -1138,15 +1140,18 @@ mod tests {
             name: "W".into(),
         };
         let file = dir.path().join("recaps.sqlite3");
-        let work =
-            WorkService::new(Arc::clone(&store), workspace.clone()).with_recap_file(&file);
+        let work = WorkService::new(Arc::clone(&store), workspace.clone()).with_recap_file(&file);
         assert!(!file.exists(), "made when the index is first built");
-        store.append(&[tool_run(1, 1), tool_run(2, 2)]).expect("append");
+        store
+            .append(&[tool_run(1, 1), tool_run(2, 2)])
+            .expect("append");
         assert_eq!(work.sync_recaps().expect("sync"), 2);
         assert!(file.exists());
 
         // Two more events, the second one opening a new block, cannot be stored.
-        store.append(&[tool_run(3, 3), tool_run(4, 60)]).expect("append");
+        store
+            .append(&[tool_run(3, 3), tool_run(4, 60)])
+            .expect("append");
         STORE_FAILS.with(|f| f.set(true));
         assert!(work.sync_recaps().is_err());
         assert!(
@@ -1159,7 +1164,10 @@ mod tests {
         let page = work
             .recap_blocks(&BlockFilter::default(), None, None)
             .expect("built again");
-        assert!(!file.exists(), "built again in memory, not on the disk that failed");
+        assert!(
+            !file.exists(),
+            "built again in memory, not on the disk that failed"
+        );
         let fresh = WorkService::new(Arc::clone(&store), workspace);
         assert_eq!(
             page,
@@ -1222,7 +1230,10 @@ mod tests {
         recaps.push(&events);
         let mut memory = Recaps::new(None);
         memory.push(&events);
-        let all = |r: &Recaps| r.blocks(&BlockFilter::default(), None, None).expect("blocks");
+        let all = |r: &Recaps| {
+            r.blocks(&BlockFilter::default(), None, None)
+                .expect("blocks")
+        };
         assert_eq!(all(&recaps), all(&memory));
         assert_eq!(recaps.len(), 1);
         #[cfg(unix)]

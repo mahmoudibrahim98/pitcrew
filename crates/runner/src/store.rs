@@ -5,14 +5,14 @@
 //! through a lock file. On a network filesystem the index uses a rollback journal, since WAL's
 //! shared memory is not safe there.
 
-use crate::derive::Facts;
+use crate::derive::{Facts, Parent};
 use crate::fsinfo;
 use pitcrew_interfaces::source::{Cursor, SessionMeta};
 use pitcrew_protocol::ids::{CommandId, SessionId, TerminalId};
 use pitcrew_protocol::model::{Engine, TimestampMs};
 use pitcrew_protocol::runner::CommandOutcome;
 use rusqlite::{Connection, OptionalExtension as _, params};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -89,6 +89,74 @@ pub(crate) struct Row {
     pub facts: Facts,
 }
 
+/// What the watcher keeps of a transcript row from the start: what tells a change, and what
+/// routes hooks to its session. The rest of the row is read when needed ([`Store::load`]).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Indexed {
+    pub session: SessionId,
+    pub engine: Engine,
+    pub path: PathBuf,
+    pub inner_id: Option<String>,
+    pub size: u64,
+    pub mtime: TimestampMs,
+    pub identity: Option<String>,
+    pub caught_up: bool,
+    pub discovered: bool,
+    /// The CLI's id for the session (see `watch::native_id`), once a read learned its metadata.
+    pub native: Option<String>,
+    pub subagent: bool,
+    /// The parent kept with the row (`Facts::parent`).
+    pub parent: Option<Parent>,
+}
+
+struct RawIndexed {
+    session: String,
+    engine: String,
+    path: String,
+    inner_id: String,
+    size: i64,
+    mtime: i64,
+    identity: Option<String>,
+    caught_up: bool,
+    discovered: bool,
+    has_meta: bool,
+    native_id: Option<String>,
+    subagent: bool,
+    parent: Option<String>,
+}
+
+impl RawIndexed {
+    fn decode(self) -> Result<Indexed, StoreError> {
+        let path = PathBuf::from(self.path);
+        let inner_id = Some(self.inner_id).filter(|s| !s.is_empty());
+        let native = self.has_meta.then(|| {
+            self.native_id
+                .filter(|n| !n.is_empty())
+                .or_else(|| inner_id.clone())
+                .or_else(|| path.file_stem().map(|s| s.to_string_lossy().into_owned()))
+                .unwrap_or_default()
+        });
+        Ok(Indexed {
+            session: parse_id(&self.session)?,
+            engine: engine_from(self.engine)?,
+            inner_id,
+            size: u64::try_from(self.size).map_err(|_| StoreError::Range("size".into()))?,
+            mtime: self.mtime,
+            identity: self.identity,
+            caught_up: self.caught_up,
+            discovered: self.discovered,
+            native,
+            subagent: self.subagent,
+            parent: self
+                .parent
+                .as_deref()
+                .map(serde_json::from_str)
+                .transpose()?,
+            path,
+        })
+    }
+}
+
 /// What to save once the sink has accepted a batch.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Commit {
@@ -162,8 +230,61 @@ impl Store {
         Ok(())
     }
 
+    /// What the watcher keeps of every transcript at start ([`Indexed`]), without decoding the
+    /// cursors, facts and metadata: those are read with [`Store::load`] when needed.
+    pub fn load_index(&self) -> Result<Vec<Indexed>, StoreError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, engine, path, inner_id, size, mtime, identity, caught_up,
+                    discovered, meta IS NOT NULL, json_extract(meta, '$.native_id'),
+                    COALESCE(json_extract(meta, '$.is_subagent'), 0), facts -> '$.parent'
+             FROM transcripts ORDER BY path, inner_id",
+        )?;
+        let raw = stmt.query_map([], |r| {
+            Ok(RawIndexed {
+                session: r.get(0)?,
+                engine: r.get(1)?,
+                path: r.get(2)?,
+                inner_id: r.get(3)?,
+                size: r.get(4)?,
+                mtime: r.get(5)?,
+                identity: r.get(6)?,
+                caught_up: r.get(7)?,
+                discovered: r.get(8)?,
+                has_meta: r.get(9)?,
+                native_id: r.get(10)?,
+                subagent: r.get(11)?,
+                parent: r.get(12)?,
+            })
+        })?;
+        let mut rows = Vec::new();
+        for r in raw {
+            match r?.decode() {
+                Ok(row) => rows.push(row),
+                // One bad row must not stop the runner. Its path stays taken, so that transcript is
+                // not indexed again until the row is removed.
+                Err(e) => tracing::error!(error = %e, "skipping an unreadable runner store row"),
+            }
+        }
+        Ok(rows)
+    }
+
+    /// A transcript's whole row, by its session.
+    pub fn load(&self, session: SessionId) -> Result<Option<Row>, StoreError> {
+        let id = session.0.to_string();
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {COLUMNS} FROM transcripts WHERE session_id = ?1"
+        ))?;
+        let Some(raw) = stmt.query_row([&id], raw_row).optional()? else {
+            return Ok(None);
+        };
+        let keys = self.accepted_keys(&id)?;
+        raw.decode(keys).map(Some)
+    }
+
+    #[cfg(test)]
     pub fn load_all(&self) -> Result<Vec<Row>, StoreError> {
-        let mut accepted: HashMap<String, HashSet<u64>> = HashMap::new();
+        let mut accepted: std::collections::HashMap<String, HashSet<u64>> =
+            std::collections::HashMap::new();
         {
             let mut stmt = self
                 .conn
@@ -481,7 +602,13 @@ impl Store {
 
     #[cfg(test)]
     pub fn get(&self, session: SessionId) -> Result<Option<Row>, StoreError> {
-        Ok(self.load_all()?.into_iter().find(|r| r.session == session))
+        let found = self.load(session)?;
+        assert_eq!(
+            found,
+            self.load_all()?.into_iter().find(|r| r.session == session),
+            "a row loaded alone is the row loaded with the others"
+        );
+        Ok(found)
     }
 }
 

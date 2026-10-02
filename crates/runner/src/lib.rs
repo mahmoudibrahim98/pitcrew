@@ -259,7 +259,7 @@ pub fn start(
 ) -> Result<RunnerHandle, RunnerError> {
     let store = store::Store::open(&config.state_dir)?;
     // Starting with an empty index would give every transcript a new session id.
-    let rows = store.load_all()?;
+    let rows = store.load_index()?;
     let store = Arc::new(Mutex::new(store));
     let (tx, rx) = std::sync::mpsc::sync_channel(config.channel_capacity.max(1));
     let shared = Arc::new(watch::Shared::default());

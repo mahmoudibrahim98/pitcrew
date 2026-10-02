@@ -53,7 +53,12 @@ fn ask(index: &dyn RecapIndex, world: &World, what: u8, limit: usize) {
         }
         2 => {
             index
-                .recap_days(DaysScope::Workstream(world.workstreams[1].id), 120, None, None)
+                .recap_days(
+                    DaysScope::Workstream(world.workstreams[1].id),
+                    120,
+                    None,
+                    None,
+                )
                 .expect("days");
         }
         _ => {
@@ -61,9 +66,7 @@ fn ask(index: &dyn RecapIndex, world: &World, what: u8, limit: usize) {
                 session: Some(world.sessions[0].id),
                 ..BlockFilter::default()
             };
-            index
-                .recap_blocks(&filter, None, Some(2))
-                .expect("blocks");
+            index.recap_blocks(&filter, None, Some(2)).expect("blocks");
         }
     }
 }
@@ -118,8 +121,8 @@ fn a_file_left_by_a_crash_is_never_served() {
     // Another log's index, in full, at the path the next service uses.
     let other = tempfile::tempdir().expect("tempdir");
     let left = other.path().join("left.sqlite3");
-    let full = WorkService::new(open_store(other.path()), world.workspace.clone())
-        .with_recap_file(&left);
+    let full =
+        WorkService::new(open_store(other.path()), world.workspace.clone()).with_recap_file(&left);
     full.store().append(&setup).expect("append");
     full.store().append(&events).expect("append");
     full.sync_recaps().expect("sync");
@@ -138,5 +141,8 @@ fn a_file_left_by_a_crash_is_never_served() {
     store.append(second).expect("append");
     assert_eq!(dump(&work, &world, 50), dump(&memory, &world, 50));
     let log = log_events(&work);
-    assert_eq!(oracle_dump(&Oracle::new(&log), &world), dump(&work, &world, 50));
+    assert_eq!(
+        oracle_dump(&Oracle::new(&log), &world),
+        dump(&work, &world, 50)
+    );
 }

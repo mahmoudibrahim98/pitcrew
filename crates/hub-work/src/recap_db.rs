@@ -174,8 +174,8 @@ impl BlockDb {
                     tasks = ?6, body = ?7
                  WHERE id = ?1",
             )?;
-            let mut link = tx
-                .prepare_cached("INSERT OR IGNORE INTO block_tasks (task, id) VALUES (?1, ?2)")?;
+            let mut link =
+                tx.prepare_cached("INSERT OR IGNORE INTO block_tasks (task, id) VALUES (?1, ?2)")?;
             let mut unlink =
                 tx.prepare_cached("DELETE FROM block_tasks WHERE task = ?1 AND id = ?2")?;
             for block in blocks {
@@ -194,8 +194,7 @@ impl BlockDb {
                     tasks,
                     body,
                 ];
-                let before: Option<Vec<u8>> =
-                    old.query_row([&id[..]], |r| r.get(0)).optional()?;
+                let before: Option<Vec<u8>> = old.query_row([&id[..]], |r| r.get(0)).optional()?;
                 match before {
                     None => {
                         insert.execute(values)?;
@@ -269,9 +268,8 @@ impl BlockDb {
     /// The last place among `scope`'s blocks before `below` (all of them without it).
     pub fn latest(&self, scope: Scope, below: Option<Place>) -> Result<Option<Place>> {
         let (column, id) = scope.column();
-        let row = |r: &pitcrew_store::sql::Row<'_>| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
-        };
+        let row =
+            |r: &pitcrew_store::sql::Row<'_>| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?));
         let found = match below {
             None => self
                 .conn
