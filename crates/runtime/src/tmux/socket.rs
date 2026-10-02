@@ -1,17 +1,19 @@
 //! The private directory that holds the server's socket.
 
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 
 /// macOS limits a socket path to 104 bytes including the NUL (Linux: 108).
 const SOCKET_PATH_MAX: usize = 103;
 
 /// Makes sure `socket`'s directory exists, belongs to this user, is a real directory (not a
-/// link) and is closed to everyone else, creating it (0700) if missing. Its parent must exist.
+/// link) and is closed to everyone else, creating it (0700) if missing (its parent must exist);
+/// and that `socket` itself is either absent or a socket of this user's. Checked before every
+/// connection, since the directory can be replaced while PitCrew runs.
 ///
-/// A directory someone else made, or one open to others, is refused, never repaired: anyone who
-/// can reach the socket controls every terminal.
+/// Anything else is refused, never repaired: anyone who can reach the socket controls every
+/// terminal.
 pub(crate) fn ensure_private(socket: &Path) -> Result<(), String> {
     if socket.as_os_str().len() > SOCKET_PATH_MAX {
         return Err(format!(
@@ -53,7 +55,24 @@ pub(crate) fn ensure_private(socket: &Path) -> Result<(), String> {
             dir.display()
         ));
     }
-    Ok(())
+    match std::fs::symlink_metadata(socket) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("cannot inspect {}: {e}", socket.display())),
+        Ok(meta) if meta.file_type().is_socket() && meta.uid() == me => Ok(()),
+        Ok(_) => Err(format!(
+            "{} is not a socket of this user's",
+            socket.display()
+        )),
+    }
+}
+
+/// True if `dir` is a real directory of this user's that nobody else can enter or change.
+pub(crate) fn is_private_dir(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir).is_ok_and(|meta| {
+        meta.file_type().is_dir()
+            && meta.uid() == rustix::process::getuid().as_raw()
+            && meta.permissions().mode() & 0o077 == 0
+    })
 }
 
 #[cfg(test)]
@@ -104,6 +123,15 @@ mod tests {
         std::os::unix::fs::symlink(base.join("fresh"), &link).expect("symlink");
         let why = ensure_private(&link.join("s")).expect_err("symlink");
         assert!(why.contains("not a directory"), "{why}");
+
+        // The socket itself must be absent or a socket.
+        std::fs::write(base.join("fresh").join("s"), b"not a socket").expect("file");
+        let why = ensure_private(&socket).expect_err("a file at the socket path");
+        assert!(why.contains("not a socket"), "{why}");
+        std::fs::remove_file(base.join("fresh").join("s")).expect("remove");
+        assert!(is_private_dir(&base.join("fresh")));
+        assert!(!is_private_dir(&open));
+        assert!(!is_private_dir(&link));
 
         assert!(ensure_private(Path::new("relative/s")).is_err());
         let long = format!("/tmp/{}/s", "x".repeat(120));

@@ -10,7 +10,13 @@
 //!   its terminals after a restart, and [`OFFSET_OPTION`] records where its output numbering
 //!   resumes.
 //! - **People can attach:** `tmux -S <socket> attach -t pitcrew` (the socket is
-//!   [`TmuxRuntime::socket`]); a terminal's `native_target` (`pitcrew:@12`) selects its window.
+//!   `TmuxRuntime::socket`); a terminal's `native_target` (`pitcrew:@12`) selects its window.
+//! - **The server is shared with the programs in it.** tmux gives every pane `$TMUX`, the
+//!   server's socket; the runtime unsets it for the programs it starts, but a program that
+//!   finds the socket (it is in a predictable place) can still run any tmux command on that
+//!   server, as the user. The runtime does not trust what the server tells it beyond that:
+//!   replies to other clients' commands are dropped, tags never move a known terminal, and
+//!   counts in pane output are clamped before the screen model sees them.
 //!
 //! The session exists while terminals do: the server exits when the last one ends. The runtime is
 //! Unix-only; [`detect`] says so elsewhere.
@@ -18,7 +24,11 @@
 mod detect;
 
 #[cfg(unix)]
+mod clamp;
+#[cfg(unix)]
 mod conn;
+#[cfg(unix)]
+mod exe;
 #[cfg(unix)]
 mod runtime;
 #[cfg(unix)]
@@ -47,7 +57,8 @@ pub const OFFSET_OPTION: &str = "@pitcrew-offset";
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct TmuxOptions {
-    /// The tmux executable, looked up on `PATH` unless it contains a slash.
+    /// The tmux executable. A name without a slash is looked up on `PATH` (absolute entries
+    /// only) once, when the runtime is created or tmux is detected.
     pub tmux: PathBuf,
     /// The private server's socket. Its directory must belong to the user and be closed to
     /// everyone else (mode 0700); it is created if missing.
@@ -76,20 +87,52 @@ impl TmuxOptions {
         }
     }
 
-    /// `/tmp/pitcrew-<uid>/tmux` on Unix: short enough for any platform's socket path limit,
-    /// and the same for every PitCrew process of this user, so a restarted daemon finds it.
+    /// Where PitCrew's server lives by default, the first that is usable of:
+    /// - `$TMUX_TMPDIR/pitcrew-<uid>/tmux`, if `TMUX_TMPDIR` is a private directory of this
+    ///   user's (where the user keeps tmux sockets);
+    /// - `$XDG_RUNTIME_DIR/pitcrew/tmux`, if that is private (it usually is). Note that the
+    ///   system removes it when the user's last login session ends, socket included, so a
+    ///   runner that must outlive logins should pass its own socket;
+    /// - `/tmp/pitcrew-<uid>/tmux`.
+    ///
+    /// Each is short enough for every platform's socket path limit. The choice depends on the
+    /// environment: a daemon restarted with a different one would not find its terminals, so
+    /// a host should keep the socket it chose (or pass one) across restarts.
     pub fn default_socket() -> PathBuf {
         #[cfg(unix)]
         {
-            PathBuf::from(format!(
-                "/tmp/pitcrew-{}/tmux",
-                rustix::process::getuid().as_raw()
-            ))
+            let uid = rustix::process::getuid().as_raw();
+            let private = |var: &str| {
+                std::env::var_os(var)
+                    .map(PathBuf::from)
+                    .filter(|dir| dir.is_absolute() && socket::is_private_dir(dir))
+            };
+            let candidates = [
+                private("TMUX_TMPDIR").map(|dir| dir.join(format!("pitcrew-{uid}")).join("tmux")),
+                private("XDG_RUNTIME_DIR").map(|dir| dir.join("pitcrew").join("tmux")),
+            ];
+            candidates
+                .into_iter()
+                .flatten()
+                .find(|socket| socket.as_os_str().len() <= 100)
+                .unwrap_or_else(|| PathBuf::from(format!("/tmp/pitcrew-{uid}/tmux")))
         }
         #[cfg(not(unix))]
         {
             std::env::temp_dir().join("pitcrew").join("tmux")
         }
+    }
+
+    /// The tmux executable as an absolute path: `tmux` itself if it contains a slash, otherwise
+    /// the first match in this process's `PATH` (absolute entries only).
+    #[cfg(unix)]
+    pub(crate) fn resolved_tmux(&self) -> Option<PathBuf> {
+        let name = self.tmux.to_str()?;
+        exe::find(
+            name,
+            std::env::var_os("PATH").as_deref(),
+            std::path::Path::new("/"),
+        )
     }
 }
 

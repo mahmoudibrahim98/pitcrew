@@ -3,15 +3,21 @@
 //! one client's commands in order, each line with exactly one `%begin`/`%end` block), and every
 //! other notification goes to a [`Sink`].
 //!
-//! Nothing blocks a caller for longer than its deadline: a writer thread owns stdin, so a tmux
-//! that stops reading fills a bounded queue (then `Busy`) instead of blocking the caller.
+//! - **Only our replies.** Replies to commands from this client's stdin carry guard flags `1`.
+//!   The command on the command line, and every hook (`after-*`), reply with flags `0`: anything
+//!   that reaches the server (a program in a pane can) may set hooks, so after the first reply,
+//!   replies without flag `1` are dropped rather than given to the next waiting command.
+//! - **Bounded.** A writer thread owns stdin, so a tmux that stops reading fills a bounded
+//!   queue (then `Busy`) instead of blocking the caller.
+//! - **Always cleaned up.** However the reader thread ends, a panic included, it closes the
+//!   connection, reaps the client and tells the sink.
 
 use std::collections::VecDeque;
 use std::io::{self, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command as Process, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -56,8 +62,90 @@ pub(crate) enum ConnectError {
     Duplicate,
     /// tmux did not answer in time.
     TimedOut,
+    /// The socket or its directory is not safe to use.
+    Unsafe(String),
     /// Anything else, with tmux's words.
     Failed(String),
+}
+
+/// A reply whose caller may stop waiting: one that arrives later goes to `abandoned` instead,
+/// on the reader thread (so a window created for a caller that gave up can be removed).
+pub(crate) struct Pending {
+    state: Mutex<PendingState>,
+    ready: Condvar,
+    abandoned: Abandoned,
+}
+
+type Abandoned = Box<dyn Fn(&CommandReply, &Outbox) + Send + Sync>;
+
+enum PendingState {
+    Waiting,
+    Abandoned,
+    Replied(CommandReply),
+    Closed,
+}
+
+impl Pending {
+    pub(crate) fn new(
+        abandoned: impl Fn(&CommandReply, &Outbox) + Send + Sync + 'static,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(PendingState::Waiting),
+            ready: Condvar::new(),
+            abandoned: Box::new(abandoned),
+        })
+    }
+
+    /// The reply, or past `deadline` an error; the reply is then handed to `abandoned`.
+    pub(crate) fn wait(&self, deadline: Instant) -> Result<CommandReply, CallError> {
+        let mut state = lock(&self.state);
+        loop {
+            match std::mem::replace(&mut *state, PendingState::Waiting) {
+                PendingState::Replied(reply) => return Ok(reply),
+                PendingState::Closed => {
+                    *state = PendingState::Closed;
+                    return Err(CallError::Closed);
+                }
+                PendingState::Abandoned | PendingState::Waiting => {}
+            }
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                *state = PendingState::Abandoned;
+                return Err(CallError::TimedOut);
+            };
+            state = self
+                .ready
+                .wait_timeout(state, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
+    fn deliver(&self, reply: CommandReply, outbox: &Outbox) {
+        let mut state = lock(&self.state);
+        if matches!(*state, PendingState::Abandoned) {
+            drop(state);
+            (self.abandoned)(&reply, outbox);
+        } else {
+            *state = PendingState::Replied(reply);
+            self.ready.notify_all();
+        }
+    }
+
+    fn close(&self) {
+        let mut state = lock(&self.state);
+        if matches!(*state, PendingState::Waiting) {
+            *state = PendingState::Closed;
+            self.ready.notify_all();
+        }
+    }
+}
+
+/// Who gets a command's reply.
+pub(crate) enum Waiter {
+    /// Nobody.
+    Discard,
+    Channel(SyncSender<CommandReply>),
+    Pending(Arc<Pending>),
 }
 
 /// Commands waiting for their replies, oldest first, and the way to tmux's stdin.
@@ -67,8 +155,7 @@ pub(crate) struct Outbox {
 }
 
 struct Queue {
-    /// `None` for a command whose reply nobody waits for.
-    waiters: VecDeque<Option<SyncSender<CommandReply>>>,
+    waiters: VecDeque<Waiter>,
     /// `None` once the connection is closed.
     lines: Option<Sender<Vec<u8>>>,
 }
@@ -79,31 +166,30 @@ impl Outbox {
         &self,
         commands: &[Command],
     ) -> Result<Vec<Receiver<CommandReply>>, CallError> {
-        let mut queue = lock(&self.queue);
         let mut replies = Vec::with_capacity(commands.len());
         let mut waiters = Vec::with_capacity(commands.len());
         for _ in commands {
             let (tx, rx) = mpsc::sync_channel(1);
-            waiters.push(Some(tx));
+            waiters.push(Waiter::Channel(tx));
             replies.push(rx);
         }
-        self.enqueue(&mut queue, commands, waiters)?;
+        self.send_with(commands, waiters)?;
         Ok(replies)
     }
 
     /// Sends a command whose reply is discarded. False if it could not be queued.
     pub(crate) fn send_and_forget(&self, command: &Command) -> bool {
-        let mut queue = lock(&self.queue);
-        self.enqueue(&mut queue, std::slice::from_ref(command), vec![None])
+        self.send_with(std::slice::from_ref(command), vec![Waiter::Discard])
             .is_ok()
     }
 
-    fn enqueue(
+    /// Sends `commands` in order, each with its waiter.
+    pub(crate) fn send_with(
         &self,
-        queue: &mut Queue,
         commands: &[Command],
-        waiters: Vec<Option<SyncSender<CommandReply>>>,
+        waiters: Vec<Waiter>,
     ) -> Result<(), CallError> {
+        let mut queue = lock(&self.queue);
         let Some(lines) = &queue.lines else {
             return Err(CallError::Closed);
         };
@@ -128,18 +214,26 @@ impl Outbox {
     fn deliver(&self, reply: CommandReply) {
         let waiter = lock(&self.queue).waiters.pop_front();
         match waiter {
-            Some(Some(tx)) => {
+            Some(Waiter::Channel(tx)) => {
                 let _ = tx.try_send(reply);
             }
-            Some(None) => {}
+            Some(Waiter::Pending(pending)) => pending.deliver(reply, self),
+            Some(Waiter::Discard) => {}
             None => tracing::debug!(number = reply.number, "a tmux reply nobody asked for"),
         }
     }
 
     fn close(&self) {
-        let mut queue = lock(&self.queue);
-        queue.lines = None;
-        queue.waiters.clear();
+        let waiters = {
+            let mut queue = lock(&self.queue);
+            queue.lines = None;
+            std::mem::take(&mut queue.waiters)
+        };
+        for waiter in waiters {
+            if let Waiter::Pending(pending) = waiter {
+                pending.close();
+            }
+        }
     }
 
     pub(crate) fn is_open(&self) -> bool {
@@ -157,7 +251,8 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
-    /// Starts `tmux -S <socket> -f /dev/null -u -C <args>` and waits for the reply to `args`.
+    /// Starts `tmux -S <socket> -f /dev/null -u -C <args>` and waits for the reply to `args`,
+    /// after checking again that the socket and its directory are this user's alone.
     ///
     /// `args` must be fixed text: tmux splits process arguments ending in `;` into separate
     /// commands. Every user value goes over stdin through [`Command`].
@@ -167,6 +262,7 @@ impl Connection {
         sink: Arc<dyn Sink>,
         deadline: Instant,
     ) -> Result<(Self, CommandReply), ConnectError> {
+        super::socket::ensure_private(&options.socket).map_err(ConnectError::Unsafe)?;
         let mut process = Process::new(&options.tmux);
         process
             .arg("-S")
@@ -201,7 +297,7 @@ impl Connection {
         let outbox = Arc::new(Outbox {
             queue: Mutex::new(Queue {
                 // The reply to the command on the command line comes first.
-                waiters: VecDeque::from([Some(first_tx)]),
+                waiters: VecDeque::from([Waiter::Channel(first_tx)]),
                 lines: Some(lines_tx),
             }),
             queued: Arc::clone(&queued),
@@ -347,6 +443,28 @@ struct Threads {
     stderr_done: SyncSender<()>,
 }
 
+/// What the reader thread does when it ends, however it ends.
+struct ReaderExit {
+    outbox: Arc<Outbox>,
+    child: Arc<Mutex<Option<Child>>>,
+    sink: Arc<dyn Sink>,
+    done: SyncSender<()>,
+    why: String,
+}
+
+impl Drop for ReaderExit {
+    fn drop(&mut self) {
+        self.outbox.close();
+        let taken = lock(&self.child).take();
+        if let Some(mut child) = taken {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.sink.closed(&self.why);
+        let _ = self.done.send(());
+    }
+}
+
 fn spawn_threads(t: Threads) -> io::Result<()> {
     let Threads {
         stdin,
@@ -387,15 +505,14 @@ fn spawn_threads(t: Threads) -> io::Result<()> {
     thread::Builder::new()
         .name("pitcrew-tmux-read".into())
         .spawn(move || {
-            let why = read_loop(stdout, &outbox, &*sink);
-            outbox.close();
-            let taken = lock(&child).take();
-            if let Some(mut child) = taken {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            sink.closed(&why);
-            let _ = done.send(());
+            let mut exit = ReaderExit {
+                outbox,
+                child,
+                sink,
+                done,
+                why: "the tmux reader stopped unexpectedly".into(),
+            };
+            exit.why = read_loop(stdout, &exit.outbox, &*exit.sink);
         })?;
     Ok(())
 }
@@ -403,6 +520,7 @@ fn spawn_threads(t: Threads) -> io::Result<()> {
 fn read_loop(mut stdout: ChildStdout, outbox: &Outbox, sink: &dyn Sink) -> String {
     let mut parser = ControlParser::new();
     let mut buf = vec![0; READ_CHUNK];
+    let mut first = true;
     loop {
         let n = match stdout.read(&mut buf) {
             Ok(0) => {
@@ -419,7 +537,14 @@ fn read_loop(mut stdout: ChildStdout, outbox: &Outbox, sink: &dyn Sink) -> Strin
             Ok(notifications) => {
                 for notification in notifications {
                     match notification {
-                        Notification::CommandReply(reply) => outbox.deliver(reply),
+                        Notification::CommandReply(reply) if first || reply.flags & 1 == 1 => {
+                            first = false;
+                            outbox.deliver(reply);
+                        }
+                        Notification::CommandReply(reply) => tracing::debug!(
+                            number = reply.number,
+                            "dropped a tmux reply to a command this client did not send"
+                        ),
                         other => sink.notify(other, outbox),
                     }
                 }
@@ -456,4 +581,76 @@ fn write_loop(
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::sync::atomic::AtomicBool;
+
+    /// A sink that panics on the first notification.
+    struct Panicky {
+        closed: AtomicBool,
+    }
+
+    impl Sink for Panicky {
+        fn notify(&self, _: Notification, _: &Outbox) {
+            panic!("injected sink panic");
+        }
+
+        fn closed(&self, _: &str) {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn a_reader_panic_still_closes_reaps_and_reports() {
+        let dir = std::env::temp_dir().join(format!(
+            "pc-conn-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .expect("dir");
+        // A stand-in for tmux: one reply, one notification, then it waits for stdin to close.
+        let fake = dir.join("fake-tmux");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nprintf '%%begin 1 1 0\\n%%end 1 1 0\\n%%output %%1 hi\\n'\nexec cat >/dev/null\n",
+        )
+        .expect("script");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let mut options = TmuxOptions::new(dir.join("s"));
+        options.tmux = fake;
+        let sink = Arc::new(Panicky {
+            closed: AtomicBool::new(false),
+        });
+        let (conn, _) = Connection::open(
+            &options,
+            &["attach-session"],
+            sink.clone(),
+            Instant::now() + Duration::from_secs(20),
+        )
+        .expect("open");
+        let pid = conn.pid();
+        // The reader thread panics on `%output`; its exit guard closes the connection.
+        let reaped = lock(&conn.done).recv_timeout(Duration::from_secs(20));
+        assert!(reaped.is_ok(), "the reader never finished");
+        assert!(
+            sink.closed.load(Ordering::SeqCst),
+            "closed() was not called"
+        );
+        assert!(!conn.is_open());
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the client was not reaped"
+        );
+        drop(conn);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
 }

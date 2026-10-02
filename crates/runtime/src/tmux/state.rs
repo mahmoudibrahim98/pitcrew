@@ -2,17 +2,30 @@
 //! screen model. Updated from `%output`, `%window-close` and `%layout-change` on the reader
 //! thread, and read by the runtime's calls.
 //!
-//! The screen model is fed lazily, from the replay buffer, when the screen is read or resized:
-//! output nobody looks at costs no terminal emulation. If more output arrived since than the
-//! buffer keeps, the model starts again from the oldest byte kept (2 MiB of output redraws any
-//! screen many times; modes set before it, such as a scroll region, are lost).
+//! - **The screen model** of each terminal has its own lock, and is fed lazily from the replay
+//!   buffer when the screen is read: output nobody looks at costs no emulation, and one
+//!   terminal's screen never holds up another terminal or the reader thread. Size changes are
+//!   recorded with the offset they happened at and applied in order then. If more output
+//!   arrived since than the buffer keeps, the model starts again from the oldest byte kept
+//!   (2 MiB redraws any screen many times; modes set before it, such as a scroll region, are
+//!   lost). Counts in the output are clamped first ([`super::clamp`]).
+//! - **Panes and tags.** Within one server's life a pane id never changes owner, so a known
+//!   live terminal is always found by its own pane, whatever tag that pane carries now; a tag
+//!   is only used to adopt a pane the runtime does not know (after a restart), and only if no
+//!   other pane carries the same id.
+//! - **Lost output.** After the control client was replaced, a terminal's numbering skips one
+//!   offset, so a reader at the old end reads `truncated`: output may have been printed while
+//!   no client was attached. The history before stays readable.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use pitcrew_interfaces::runtime::{OutputChunk, Screen, TerminalInfo};
 use pitcrew_protocol::ids::TerminalId;
 
 use super::SESSION;
+use super::clamp::CsiClamp;
+use super::conn::lock;
 use crate::control::{PaneId, WindowId};
 use crate::replay::ReplayBuffer;
 
@@ -23,13 +36,19 @@ pub(crate) const RESERVE: u64 = 1 << 20;
 /// Dead terminals kept readable, newest deaths first.
 const DEAD_KEPT: usize = 16;
 /// Output kept per pane that is not (yet) a known terminal: a new window's first bytes can
-/// arrive before its creator records it.
+/// arrive before its creator records it, and output after a reconnect waits for reconcile.
 const UNCLAIMED_BYTES: usize = 256 << 10;
 /// Such panes tracked at once.
 const UNCLAIMED_PANES: usize = 32;
+/// Size changes remembered until the screen model has applied them.
+const RESIZES_KEPT: usize = 64;
 
 /// Terminal sizes the runtime accepts, as the API does.
 pub(crate) const MAX_SIZE: u16 = 1000;
+
+fn clamp(size: u16) -> u16 {
+    size.clamp(1, MAX_SIZE)
+}
 
 pub(crate) struct Term {
     pub(crate) id: TerminalId,
@@ -38,10 +57,18 @@ pub(crate) struct Term {
     pub(crate) pane: PaneId,
     pub(crate) pid: Option<u32>,
     pub(crate) alive: bool,
+    /// False from a lost connection until reconcile finds the pane again.
+    attached: bool,
     buffer: ReplayBuffer,
-    screen: vt100::Parser,
-    /// Output up to here has been fed to `screen`.
-    screened: u64,
+    /// The offset `buffer` was started at.
+    origin: u64,
+    /// History from before output was lost, readable until the next loss.
+    previous: Option<ReplayBuffer>,
+    screen: Arc<Mutex<ScreenModel>>,
+    /// The latest size: (cols, rows).
+    size: (u16, u16),
+    /// Size changes not yet known to be applied: (offset, cols, rows).
+    resizes: VecDeque<(u64, u16, u16)>,
     /// The resume offset last stored in tmux (or being stored).
     reserved: u64,
 }
@@ -62,23 +89,149 @@ impl Term {
     }
 
     pub(crate) fn read(&self, from: u64, max: usize) -> OutputChunk {
+        if let Some(previous) = &self.previous
+            && from < previous.end()
+        {
+            let mut chunk = previous.read(from, max);
+            chunk.end = self.buffer.end();
+            return chunk;
+        }
         self.buffer.read(from, max)
     }
 
-    /// Feeds the screen model the output it has not seen.
-    fn catch_up(&mut self) {
-        let unseen = self.buffer.read(self.screened, usize::MAX);
-        if unseen.truncated {
-            let (rows, cols) = self.screen.screen().size();
-            self.screen = vt100::Parser::new(rows, cols, 0);
+    fn resized(&mut self, cols: u16, rows: u16) {
+        let size = (clamp(cols), clamp(rows));
+        if size == self.size {
+            return;
         }
-        self.screen.process(&unseen.data);
+        self.size = size;
+        if self.resizes.len() >= RESIZES_KEPT {
+            self.resizes.pop_front();
+        }
+        self.resizes.push_back((self.buffer.end(), size.0, size.1));
+    }
+
+    /// Numbering skips one offset: whatever was printed while detached is not in the stream.
+    fn lose_output(&mut self, history: usize) {
+        let next = self.buffer.end().saturating_add(1);
+        let fresh = ReplayBuffer::with_capacity_at(history, next);
+        self.previous = Some(std::mem::replace(&mut self.buffer, fresh));
+        self.origin = next;
+    }
+
+    /// The output a screen model that has seen everything before `from` still needs.
+    fn unseen(&mut self, from: u64) -> Unseen {
+        while self.resizes.front().is_some_and(|r| r.0 < from) {
+            self.resizes.pop_front();
+        }
+        let mut pieces = Vec::new();
+        let mut restart = false;
+        let mut at = from;
+        if let Some(previous) = &self.previous
+            && at < previous.end()
+        {
+            let chunk = previous.read(at, usize::MAX);
+            restart = chunk.truncated;
+            pieces.push((chunk.offset, chunk.data));
+            at = self.origin;
+        }
+        if self.buffer.start() > at.max(self.origin) {
+            // The buffer has dropped bytes the model never saw: start again from what is kept.
+            pieces.clear();
+            restart = true;
+        }
+        let chunk = self.buffer.read(at, usize::MAX);
+        pieces.push((chunk.offset, chunk.data));
+        Unseen {
+            pieces,
+            restart,
+            resizes: self.resizes.iter().copied().collect(),
+            end: self.buffer.end(),
+        }
+    }
+}
+
+/// Output a screen model has not processed, with the size changes among it.
+pub(crate) struct Unseen {
+    /// In order, each with the offset of its first byte.
+    pieces: Vec<(u64, Vec<u8>)>,
+    /// What the model had not seen was dropped: it starts again.
+    restart: bool,
+    resizes: Vec<(u64, u16, u16)>,
+    end: u64,
+}
+
+/// A terminal's screen, from its output.
+pub(crate) struct ScreenModel {
+    parser: vt100::Parser,
+    clamp: CsiClamp,
+    /// Output before this offset has been processed.
+    screened: u64,
+}
+
+impl ScreenModel {
+    fn new(cols: u16, rows: u16, offset: u64) -> Self {
+        Self {
+            parser: vt100::Parser::new(clamp(rows), clamp(cols), 0),
+            clamp: CsiClamp::default(),
+            screened: offset,
+        }
+    }
+
+    fn catch_up(&mut self, unseen: Unseen) {
+        let mut resizes = unseen.resizes.into_iter().peekable();
+        if unseen.restart {
+            let start = unseen.pieces.first().map_or(unseen.end, |p| p.0);
+            let (mut rows, mut cols) = self.parser.screen().size();
+            while let Some(&(at, c, r)) = resizes.peek()
+                && at <= start
+            {
+                (cols, rows) = (c, r);
+                resizes.next();
+            }
+            self.parser = vt100::Parser::new(rows, cols, 0);
+            self.clamp = CsiClamp::default();
+        }
+        for (offset, data) in unseen.pieces {
+            let mut at = offset;
+            let mut rest = data.as_slice();
+            loop {
+                while let Some(&(when, cols, rows)) = resizes.peek()
+                    && when <= at
+                {
+                    self.parser.screen_mut().set_size(rows, cols);
+                    resizes.next();
+                }
+                let until = resizes.peek().map_or(u64::MAX, |r| r.0);
+                let take = usize::try_from(until - at)
+                    .unwrap_or(usize::MAX)
+                    .min(rest.len());
+                self.feed(&rest[..take]);
+                rest = &rest[take..];
+                at += take as u64;
+                if rest.is_empty() {
+                    break;
+                }
+            }
+        }
+        for (_, cols, rows) in resizes {
+            self.parser.screen_mut().set_size(rows, cols);
+        }
         self.screened = unseen.end;
     }
 
-    pub(crate) fn screen(&mut self) -> Screen {
-        self.catch_up();
-        let screen = self.screen.screen();
+    fn feed(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let (rows, cols) = self.parser.screen().size();
+        let mut clamped = Vec::with_capacity(bytes.len());
+        self.clamp.filter(bytes, rows, cols, &mut clamped);
+        self.parser.process(&clamped);
+    }
+
+    fn snapshot(&self) -> Screen {
+        let screen = self.parser.screen();
         let (rows, cols) = screen.size();
         let (cursor_row, cursor_col) = screen.cursor_position();
         let mut lines: Vec<String> = screen
@@ -93,19 +246,16 @@ impl Term {
             cursor_col,
         }
     }
-
-    /// Output so far was drawn at the old size.
-    pub(crate) fn set_size(&mut self, cols: u16, rows: u16) {
-        let (cols, rows) = (clamp(cols), clamp(rows));
-        if self.screen.screen().size() != (rows, cols) {
-            self.catch_up();
-            self.screen.screen_mut().set_size(rows, cols);
-        }
-    }
 }
 
-fn clamp(size: u16) -> u16 {
-    size.clamp(1, MAX_SIZE)
+/// A terminal's screen now. Takes its own lock, and `terminals` only briefly, so it never holds
+/// up other terminals. Lock order: a screen model, then `terminals`; never the reverse.
+pub(crate) fn screen(terminals: &Mutex<Terminals>, id: TerminalId) -> Option<Screen> {
+    let model = Arc::clone(&lock(terminals).terms.get(&id)?.screen);
+    let mut model = lock(&model);
+    let unseen = lock(terminals).terms.get_mut(&id)?.unseen(model.screened);
+    model.catch_up(unseen);
+    Some(model.snapshot())
 }
 
 /// A terminal to record: started now, or found in tmux after a restart.
@@ -122,6 +272,15 @@ pub(crate) struct Claim {
     pub(crate) alive: bool,
 }
 
+/// What a pane's `@pitcrew-terminal` says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tag {
+    None,
+    Id(TerminalId),
+    /// Something that is not a terminal id.
+    Invalid,
+}
+
 /// One pane as `list-panes` reported it (see [`LIST_FORMAT`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Listed {
@@ -132,7 +291,7 @@ pub(crate) struct Listed {
     pub(crate) cols: u16,
     pub(crate) rows: u16,
     pub(crate) offset: Option<u64>,
-    pub(crate) terminal: Option<TerminalId>,
+    pub(crate) tag: Tag,
     pub(crate) name: String,
 }
 
@@ -140,31 +299,23 @@ pub(crate) struct Listed {
 /// spaces and `|`.
 pub(crate) const LIST_FORMAT: &str = "#{window_id} #{pane_id} #{pane_pid} #{pane_dead} #{pane_width} #{pane_height} #{@pitcrew-offset}|#{@pitcrew-terminal}|#{window_name}";
 
-/// Reads one line of [`LIST_FORMAT`]; `None` if it is malformed. Pane text never reaches these
-/// fields, but they are checked anyway.
+/// Reads one line of [`LIST_FORMAT`]. The window and pane ids come first and must parse: a line
+/// without them is not a pane. The option values can be set by anything that reaches the
+/// server (a program in a pane can), so a bad one only makes that field unknown.
 pub(crate) fn parse_listed(line: &[u8]) -> Option<Listed> {
-    let line = std::str::from_utf8(line).ok()?;
+    let line = String::from_utf8_lossy(line);
     let mut fields = line.splitn(7, ' ');
     let window = WindowId::parse(fields.next()?.as_bytes())?;
     let pane = PaneId::parse(fields.next()?.as_bytes())?;
-    let pid = fields.next()?.parse().ok();
-    let dead = match fields.next()? {
-        "0" => false,
-        "1" => true,
-        _ => return None,
-    };
-    let cols = fields.next()?.parse().ok()?;
-    let rows = fields.next()?.parse().ok()?;
-    let mut rest = fields.next()?.splitn(3, '|');
-    let offset = rest.next()?;
-    let offset = if offset.is_empty() {
-        None
-    } else {
-        Some(offset.parse().ok()?)
-    };
-    let terminal = match rest.next()? {
-        "" => None,
-        id => Some(id.parse().ok()?),
+    let pid = fields.next().and_then(|p| p.parse().ok());
+    let dead = fields.next() == Some("1");
+    let cols = fields.next().and_then(|c| c.parse().ok()).unwrap_or(80);
+    let rows = fields.next().and_then(|r| r.parse().ok()).unwrap_or(24);
+    let mut rest = fields.next().unwrap_or_default().splitn(3, '|');
+    let offset = rest.next().and_then(|o| o.parse().ok());
+    let tag = match rest.next() {
+        None | Some("") => Tag::None,
+        Some(id) => id.parse().map_or(Tag::Invalid, Tag::Id),
     };
     Some(Listed {
         window,
@@ -174,8 +325,8 @@ pub(crate) fn parse_listed(line: &[u8]) -> Option<Listed> {
         cols,
         rows,
         offset,
-        terminal,
-        name: rest.next()?.to_owned(),
+        tag,
+        name: rest.next().unwrap_or_default().to_owned(),
     })
 }
 
@@ -253,7 +404,7 @@ fn expect(input: &mut &[u8], byte: u8) -> Option<()> {
 pub(crate) struct Terminals {
     terms: HashMap<TerminalId, Term>,
     panes: HashMap<PaneId, TerminalId>,
-    unclaimed: HashMap<PaneId, Vec<u8>>,
+    unclaimed: HashMap<PaneId, ReplayBuffer>,
     unclaimed_order: VecDeque<PaneId>,
     dead: VecDeque<TerminalId>,
     history: usize,
@@ -277,10 +428,6 @@ impl Terminals {
 
     pub(crate) fn get(&self, id: TerminalId) -> Option<&Term> {
         self.terms.get(&id)
-    }
-
-    pub(crate) fn get_mut(&mut self, id: TerminalId) -> Option<&mut Term> {
-        self.terms.get_mut(&id)
     }
 
     pub(crate) fn all(&self) -> impl Iterator<Item = &Term> {
@@ -325,25 +472,28 @@ impl Terminals {
             }
             self.unclaimed_order.push_back(pane);
         }
-        let kept = self.unclaimed.entry(pane).or_default();
-        kept.extend_from_slice(data);
-        if kept.len() > UNCLAIMED_BYTES {
-            let excess = kept.len() - UNCLAIMED_BYTES;
-            kept.drain(..excess);
-        }
+        self.unclaimed
+            .entry(pane)
+            .or_insert_with(|| ReplayBuffer::new(UNCLAIMED_BYTES))
+            .append(data);
+    }
+
+    fn take_unclaimed(&mut self, pane: PaneId) -> Vec<u8> {
+        self.unclaimed_order.retain(|p| *p != pane);
+        self.unclaimed
+            .remove(&pane)
+            .map(|kept| kept.read(0, usize::MAX).data)
+            .unwrap_or_default()
     }
 
     /// Records a terminal, with any output its pane produced before. Numbering starts at
     /// `claim.offset`; nobody has read the earlier bytes, so they are renumbered from there.
     pub(crate) fn claim(&mut self, claim: Claim) -> TerminalInfo {
-        let early = self.unclaimed.remove(&claim.pane).unwrap_or_default();
-        self.unclaimed_order.retain(|p| *p != claim.pane);
-        if let Some(old) = self.terms.get(&claim.id) {
+        let early = self.take_unclaimed(claim.pane);
+        if let Some(old) = self.terms.get(&claim.id)
+            && self.panes.get(&old.pane) == Some(&claim.id)
+        {
             self.panes.remove(&old.pane);
-        }
-        if !claim.alive {
-            // An ended program's pane id may already belong to a newer pane.
-            self.panes.remove(&claim.pane);
         }
         let mut term = Term {
             id: claim.id,
@@ -352,9 +502,17 @@ impl Terminals {
             pane: claim.pane,
             pid: claim.pid,
             alive: claim.alive,
+            attached: true,
             buffer: ReplayBuffer::with_capacity_at(self.history, claim.offset),
-            screen: vt100::Parser::new(clamp(claim.rows), clamp(claim.cols), 0),
-            screened: claim.offset,
+            origin: claim.offset,
+            previous: None,
+            screen: Arc::new(Mutex::new(ScreenModel::new(
+                claim.cols,
+                claim.rows,
+                claim.offset,
+            ))),
+            size: (clamp(claim.cols), clamp(claim.rows)),
+            resizes: VecDeque::new(),
             reserved: claim.offset,
         };
         term.buffer.append(&early);
@@ -391,15 +549,16 @@ impl Terminals {
         !ids.is_empty()
     }
 
+    /// A pane's size changed (`%layout-change`). Applied to the screen when it is next read.
     pub(crate) fn pane_size(&mut self, pane: PaneId, cols: u16, rows: u16) {
         if let Some(term) = self.panes.get(&pane).and_then(|id| self.terms.get_mut(id)) {
-            term.set_size(cols, rows);
+            term.resized(cols, rows);
         }
     }
 
     pub(crate) fn set_size(&mut self, id: TerminalId, cols: u16, rows: u16) {
         if let Some(term) = self.terms.get_mut(&id) {
-            term.set_size(cols, rows);
+            term.resized(cols, rows);
         }
     }
 
@@ -420,11 +579,18 @@ impl Terminals {
         self.bury(id);
     }
 
-    /// Forgets output of panes no terminal has claimed. Called before attaching: such output
-    /// only matters within one connection, and pane ids repeat across servers.
-    pub(crate) fn forget_unclaimed(&mut self) {
+    /// The control client is going away or being replaced. Until reconcile has found each live
+    /// terminal's pane again, their output waits with the unclaimed output (pane ids repeat
+    /// across servers), and a terminal found again marks its output lost in between.
+    pub(crate) fn detach(&mut self) {
         self.unclaimed.clear();
         self.unclaimed_order.clear();
+        for term in self.terms.values_mut().filter(|t| t.alive) {
+            term.attached = false;
+            if self.panes.get(&term.pane) == Some(&term.id) {
+                self.panes.remove(&term.pane);
+            }
+        }
     }
 
     /// The server is gone: so is every terminal in it.
@@ -452,59 +618,87 @@ impl Terminals {
         }
     }
 
-    /// Brings the records up to date with `list-panes`: tagged panes not known yet are adopted
-    /// (numbering resumes at their stored offset), known ones are updated, and live terminals
-    /// missing from the list have ended. Returns the adopted terminals, whose resume offsets the
-    /// caller stores again before anyone reads them.
+    /// Brings the records up to date with `list-panes` of the same server.
+    ///
+    /// - A live terminal keeps its own pane (found again after a reconnect); one whose pane is
+    ///   gone has ended. Its pane's tag is not consulted: a program could have changed it.
+    /// - Another pane tagged with an id the runtime does not know is adopted, numbering on from
+    ///   its stored offset, unless the id is on more than one pane (none is adopted then).
+    ///
+    /// Returns the adopted terminals, whose resume offsets the caller stores again before
+    /// anyone reads them.
     pub(crate) fn reconcile(&mut self, listed: &[Listed]) -> Vec<(TerminalId, PaneId, u64)> {
-        let mut adopted = Vec::new();
-        let mut seen = Vec::new();
-        for row in listed {
-            let Some(id) = row.terminal else { continue };
-            seen.push(id);
-            match self.terms.get_mut(&id) {
-                Some(term) => {
-                    if term.pane != row.pane {
-                        self.panes.remove(&term.pane);
-                        self.panes.insert(row.pane, id);
-                        term.pane = row.pane;
-                    }
-                    term.window = row.window;
-                    term.pid = row.pid.or(term.pid);
-                    term.set_size(row.cols, row.rows);
-                    if row.dead {
-                        self.died(id);
-                    }
-                }
-                None => {
-                    let offset = row.offset.unwrap_or(0);
-                    self.claim(Claim {
-                        id,
-                        name: row.name.clone(),
-                        window: row.window,
-                        pane: row.pane,
-                        pid: row.pid,
-                        cols: row.cols,
-                        rows: row.rows,
-                        offset,
-                        alive: !row.dead,
-                    });
-                    if !row.dead {
-                        adopted.push((id, row.pane, offset.saturating_add(RESERVE)));
-                    }
-                }
-            }
-        }
-        let gone: Vec<TerminalId> = self
+        let rows: HashMap<PaneId, &Listed> = listed.iter().map(|row| (row.pane, row)).collect();
+        let known: Vec<(TerminalId, PaneId)> = self
             .terms
             .values()
-            .filter(|t| t.alive && !seen.contains(&t.id))
-            .map(|t| t.id)
+            .filter(|t| t.alive)
+            .map(|t| (t.id, t.pane))
             .collect();
-        for id in gone {
-            self.died(id);
+        let known_panes: HashSet<PaneId> = known.iter().map(|&(_, pane)| pane).collect();
+        for (id, pane) in known {
+            match rows.get(&pane) {
+                Some(row) if !row.dead => self.found(id, row),
+                _ => self.died(id),
+            }
+        }
+        let mut copies: HashMap<TerminalId, usize> = HashMap::new();
+        for row in listed.iter().filter(|row| !known_panes.contains(&row.pane)) {
+            if let Tag::Id(id) = row.tag {
+                *copies.entry(id).or_default() += 1;
+            }
+        }
+        let mut adopted = Vec::new();
+        for row in listed.iter().filter(|row| !known_panes.contains(&row.pane)) {
+            let Tag::Id(id) = row.tag else { continue };
+            if copies.get(&id).is_some_and(|&n| n > 1) {
+                tracing::warn!(%id, pane = %row.pane, "a terminal id is on several panes; adopting none");
+                continue;
+            }
+            if self.terms.contains_key(&id) {
+                tracing::warn!(%id, pane = %row.pane, "a pane carries a known terminal's id; ignoring it");
+                continue;
+            }
+            let offset = row.offset.unwrap_or(0);
+            self.claim(Claim {
+                id,
+                name: row.name.clone(),
+                window: row.window,
+                pane: row.pane,
+                pid: row.pid,
+                cols: row.cols,
+                rows: row.rows,
+                offset,
+                alive: !row.dead,
+            });
+            if !row.dead {
+                adopted.push((id, row.pane, offset.saturating_add(RESERVE)));
+            }
         }
         adopted
+    }
+
+    /// A live terminal's pane is listed: map it again, after a reconnect with a gap first.
+    fn found(&mut self, id: TerminalId, row: &Listed) {
+        let reattached = self.terms.get(&id).is_some_and(|t| !t.attached);
+        let early = if reattached {
+            self.take_unclaimed(row.pane)
+        } else {
+            Vec::new()
+        };
+        let history = self.history;
+        let Some(term) = self.terms.get_mut(&id) else {
+            return;
+        };
+        if reattached {
+            term.lose_output(history);
+            term.buffer.append(&early);
+            term.attached = true;
+        }
+        term.window = row.window;
+        term.pid = row.pid.or(term.pid);
+        term.resized(row.cols, row.rows);
+        self.panes.insert(row.pane, id);
     }
 
     /// Every live terminal's pane and exact end, to store when the runtime shuts down.
@@ -555,6 +749,28 @@ mod tests {
         }
     }
 
+    fn row(tag: Tag, pane: u64, offset: Option<u64>, dead: bool) -> Listed {
+        Listed {
+            window: WindowId(pane),
+            pane: PaneId(pane),
+            pid: Some(7),
+            dead,
+            cols: 30,
+            rows: 6,
+            offset,
+            tag,
+            name: "found".into(),
+        }
+    }
+
+    fn shown(t: &Mutex<Terminals>, id: TerminalId) -> Screen {
+        screen(t, id).expect("screen")
+    }
+
+    fn data(t: &Terminals, id: TerminalId, from: u64) -> OutputChunk {
+        t.get(id).expect("term").read(from, usize::MAX)
+    }
+
     #[test]
     fn layouts_give_every_pane_its_size() {
         assert_eq!(layout_panes(b"a87e,100x30,0,0,1"), vec![(1, 100, 30)]);
@@ -582,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn listed_panes_parse_strictly() {
+    fn listed_panes_need_ids_and_tolerate_bad_option_values() {
         let id = TerminalId::new();
         let line = format!("@3 %7 1234 0 80 24 2097152|{id}|agent | one");
         assert_eq!(
@@ -595,43 +811,41 @@ mod tests {
                 cols: 80,
                 rows: 24,
                 offset: Some(2_097_152),
-                terminal: Some(id),
+                tag: Tag::Id(id),
                 name: "agent | one".into(),
             })
         );
         let untagged = parse_listed(b"@0 %0  1 80 24 ||pitcrew-start").expect("untagged");
         assert_eq!(
-            (
-                untagged.terminal,
-                untagged.offset,
-                untagged.dead,
-                untagged.pid
-            ),
-            (None, None, true, None)
+            (untagged.tag, untagged.offset, untagged.dead, untagged.pid),
+            (Tag::None, None, true, None)
         );
-        for bad in [
-            &b"@0 %0 99 0 80 24"[..],
-            b"@0 %0 99 2 80 24 ||x",
-            b"0 %0 99 0 80 24 ||x",
-            b"@0 %0 99 0 80 24 x||",
-            b"@0 %0 99 0 80 24 |term_nonsense|",
-            b"@0 %0 99 0 80 24 \xff||",
-        ] {
+        // A forged or damaged value makes only that field unknown.
+        let bad = parse_listed(b"@0 %4 99 0 80 24 x|term_nonsense|").expect("bad values");
+        assert_eq!(
+            (bad.pane, bad.offset, bad.tag),
+            (PaneId(4), None, Tag::Invalid)
+        );
+        assert!(parse_listed(b"@0 %4 99 0 80 24 \xff|\xff|\xff").is_some());
+        for bad in [&b"0 %0 99 0 80 24 ||x"[..], b"@0 0 1", b"", b"garbage"] {
             assert_eq!(parse_listed(bad), None, "{bad:?}");
         }
     }
 
     #[test]
     fn early_output_is_kept_and_renumbered_when_claimed() {
-        let mut t = Terminals::new(1024);
-        t.output(PaneId(5), b"early ", |_, _| true);
+        let t = Mutex::new(Terminals::new(1024));
         let id = TerminalId::new();
-        t.claim(claim(id, 5, 100));
-        t.output(PaneId(5), b"late", |_, _| true);
-        let chunk = t.get(id).expect("term").read(0, 100);
-        assert_eq!((chunk.offset, chunk.end, chunk.truncated), (100, 110, true));
-        assert_eq!(chunk.data, b"early late");
-        assert_eq!(t.get_mut(id).expect("term").screen().rows[0], "early late");
+        {
+            let mut t = lock(&t);
+            t.output(PaneId(5), b"early ", |_, _| true);
+            t.claim(claim(id, 5, 100));
+            t.output(PaneId(5), b"late", |_, _| true);
+            let chunk = data(&t, id, 0);
+            assert_eq!((chunk.offset, chunk.end, chunk.truncated), (100, 110, true));
+            assert_eq!(chunk.data, b"early late");
+        }
+        assert_eq!(shown(&t, id).rows[0], "early late");
     }
 
     #[test]
@@ -643,7 +857,7 @@ mod tests {
         assert_eq!(t.unclaimed.len(), UNCLAIMED_PANES);
         assert!(!t.unclaimed.contains_key(&PaneId(0)));
         t.output(PaneId(100), &vec![b'y'; UNCLAIMED_BYTES + 10], |_, _| true);
-        assert_eq!(t.unclaimed[&PaneId(100)].len(), UNCLAIMED_BYTES);
+        assert_eq!(t.take_unclaimed(PaneId(100)).len(), UNCLAIMED_BYTES);
     }
 
     #[test]
@@ -683,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_adopts_updates_and_buries() {
+    fn reconcile_adopts_finds_and_buries() {
         let mut t = Terminals::new(1024);
         let (known, vanished, found, dead) = (
             TerminalId::new(),
@@ -693,26 +907,14 @@ mod tests {
         );
         t.claim(claim(known, 1, 0));
         t.claim(claim(vanished, 2, 0));
-        let row = |terminal, pane, offset, dead| Listed {
-            window: WindowId(pane),
-            pane: PaneId(pane),
-            pid: Some(7),
-            dead,
-            cols: 30,
-            rows: 6,
-            offset,
-            terminal,
-            name: "found".into(),
-        };
         let adopted = t.reconcile(&[
-            row(Some(known), 1, None, false),
-            row(Some(found), 3, Some(5000), false),
-            row(Some(dead), 4, Some(10), true),
-            row(None, 0, None, false),
+            row(Tag::Id(known), 1, None, false),
+            row(Tag::Id(found), 3, Some(5000), false),
+            row(Tag::Id(dead), 4, Some(10), true),
+            row(Tag::None, 0, None, false),
         ]);
         assert_eq!(adopted, vec![(found, PaneId(3), 5000 + RESERVE)]);
         assert!(t.get(known).expect("known").alive);
-        assert_eq!(t.get_mut(known).expect("known").screen().cols, 30);
         assert!(!t.get(vanished).expect("vanished").alive);
         let found_term = t.get(found).expect("found");
         assert!(found_term.alive);
@@ -722,6 +924,74 @@ mod tests {
             Some("pitcrew:@3")
         );
         assert!(!t.get(dead).expect("dead").alive);
+    }
+
+    #[test]
+    fn tags_cannot_move_a_known_terminal_or_adopt_copies() {
+        let mut t = Terminals::new(1024);
+        let (mine, unknown) = (TerminalId::new(), TerminalId::new());
+        t.claim(claim(mine, 1, 0));
+        // Someone copied my tag to pane 2 and wrote garbage into mine, and put one unknown id
+        // on two panes.
+        let adopted = t.reconcile(&[
+            row(Tag::Invalid, 1, None, false),
+            row(Tag::Id(mine), 2, None, false),
+            row(Tag::Id(unknown), 3, Some(9), false),
+            row(Tag::Id(unknown), 4, Some(9), false),
+        ]);
+        assert!(adopted.is_empty(), "{adopted:?}");
+        assert!(t.get(unknown).is_none());
+        let term = t.get(mine).expect("mine");
+        assert!(term.alive, "an unreadable tag is not a missing pane");
+        assert_eq!(term.pane, PaneId(1));
+        t.output(PaneId(1), b"to mine", |_, _| true);
+        t.output(PaneId(2), b"to the copy", |_, _| true);
+        assert_eq!(data(&t, mine, 0).data, b"to mine");
+        // Without its own pane, it has ended, whatever other panes say.
+        t.reconcile(&[row(Tag::Id(mine), 2, None, false)]);
+        assert!(!t.get(mine).expect("mine").alive);
+    }
+
+    #[test]
+    fn a_reconnect_marks_lost_output_and_keeps_the_history() {
+        let mut t = Terminals::new(1024);
+        let id = TerminalId::new();
+        t.claim(claim(id, 1, 0));
+        t.output(PaneId(1), b"before", |_, _| true);
+        t.detach();
+        // Output on the new connection waits until reconcile has found the pane again.
+        t.output(PaneId(1), b"early ", |_, _| true);
+        assert_eq!(t.get(id).expect("term").end(), 6);
+        t.reconcile(&[row(Tag::Id(id), 1, None, false)]);
+        t.output(PaneId(1), b"after", |_, _| true);
+        let old = data(&t, id, 0);
+        assert_eq!(
+            (old.offset, old.data.as_slice(), old.end, old.truncated),
+            (0, &b"before"[..], 18, false)
+        );
+        let gap = data(&t, id, 6);
+        assert_eq!(
+            (gap.offset, gap.data.as_slice(), gap.truncated),
+            (7, &b"early after"[..], true)
+        );
+        // A reconcile on the same connection marks nothing.
+        t.reconcile(&[row(Tag::Id(id), 1, None, false)]);
+        assert_eq!(t.get(id).expect("term").end(), 18);
+    }
+
+    #[test]
+    fn a_new_server_reusing_a_dead_terminals_pane_id_gets_its_own_output() {
+        let mut t = Terminals::new(1024);
+        let (old, new) = (TerminalId::new(), TerminalId::new());
+        t.claim(claim(old, 1, 0));
+        t.output(PaneId(1), b"old", |_, _| true);
+        t.window_closed(WindowId(1));
+        t.detach();
+        t.output(PaneId(1), b"first ", |_, _| true);
+        t.claim(claim(new, 1, 0));
+        t.output(PaneId(1), b"words", |_, _| true);
+        assert_eq!(data(&t, old, 0).data, b"old");
+        assert_eq!(data(&t, new, 0).data, b"first words");
     }
 
     #[test]
@@ -740,73 +1010,117 @@ mod tests {
         assert!(t.get(ids[2]).is_none());
         assert!(t.get(ids[3]).is_some_and(|x| !x.alive));
         assert!(!t.any_alive());
-        // A late output for an evicted pane is not mistaken for another terminal's.
         t.output(PaneId(0), b"x", |_, _| true);
         assert!(t.all().all(|x| x.end() == 0));
     }
 
     #[test]
-    fn a_new_server_reusing_a_dead_terminals_pane_id_gets_its_own_output() {
-        let mut t = Terminals::new(1024);
-        let (old, new) = (TerminalId::new(), TerminalId::new());
-        t.claim(claim(old, 1, 0));
-        t.output(PaneId(1), b"old", |_, _| true);
-        t.window_closed(WindowId(1));
-        // A later server numbers its panes from the start again.
-        t.forget_unclaimed();
-        t.output(PaneId(1), b"first ", |_, _| true);
-        t.claim(claim(new, 1, 0));
-        t.output(PaneId(1), b"words", |_, _| true);
-        assert_eq!(t.get(old).expect("old").read(0, 100).data, b"old");
-        assert_eq!(t.get(new).expect("new").read(0, 100).data, b"first words");
-    }
-
-    #[test]
-    fn screens_follow_cursor_movement_and_resizes() {
-        let mut t = Terminals::new(1024);
+    fn screens_follow_cursor_movement_and_resizes_in_order() {
+        let t = Mutex::new(Terminals::new(1024));
         let id = TerminalId::new();
-        t.claim(claim(id, 1, 0));
-        t.output(
+        lock(&t).claim(claim(id, 1, 0));
+        lock(&t).output(
             PaneId(1),
             b"\x1b[2J\x1b[3;5Hprompt> \x1b[1;1Htop\rT\x1b[3;13H",
             |_, _| true,
         );
-        let screen = t.get_mut(id).expect("term").screen();
-        assert_eq!(screen.rows.len(), 5);
-        assert_eq!(screen.rows[0], "Top");
-        assert_eq!(screen.rows[2], "    prompt>");
-        assert_eq!((screen.cursor_row, screen.cursor_col), (2, 12));
-        t.pane_size(PaneId(1), 40, 3);
-        let screen = t.get_mut(id).expect("term").screen();
-        assert_eq!((screen.cols, screen.rows.len()), (40, 3));
-        t.set_size(id, 0, 5000);
-        let screen = t.get_mut(id).expect("term").screen();
-        assert_eq!((screen.cols, screen.rows.len()), (1, usize::from(MAX_SIZE)));
+        let s = shown(&t, id);
+        assert_eq!(s.rows.len(), 5);
+        assert_eq!(s.rows[0], "Top");
+        assert_eq!(s.rows[2], "    prompt>");
+        assert_eq!((s.cursor_row, s.cursor_col), (2, 12));
+        // Output drawn before a resize lands at the old size, even when read after it: a long
+        // line wraps at 20 columns, then the screen grows to 40.
+        lock(&t).output(PaneId(1), b"\x1b[5;1H0123456789abcdefghij", |_, _| true);
+        lock(&t).pane_size(PaneId(1), 40, 3);
+        lock(&t).output(PaneId(1), b"\x1b[3;1H0123456789abcdefghijKLMNOP", |_, _| {
+            true
+        });
+        let s = shown(&t, id);
+        assert_eq!((s.cols, s.rows.len()), (40, 3));
+        assert_eq!(s.rows[2], "0123456789abcdefghijKLMNOP");
+        lock(&t).set_size(id, 0, 5000);
+        let s = shown(&t, id);
+        assert_eq!((s.cols, s.rows.len()), (1, usize::from(MAX_SIZE)));
     }
 
     #[test]
     fn the_screen_model_catches_up_lazily_and_restarts_after_an_overflow() {
-        let mut t = Terminals::new(64);
+        let t = Mutex::new(Terminals::new(64));
         let id = TerminalId::new();
-        t.claim(claim(id, 1, 0));
-        t.output(PaneId(1), b"\x1b[3;3Hkept", |_, _| true);
-        assert_eq!(t.get_mut(id).expect("term").screen().rows[2], "  kept");
-        t.output(PaneId(1), b"\x1b[4;1Hmore", |_, _| true);
-        let screen = t.get_mut(id).expect("term").screen();
-        assert_eq!(
-            (screen.rows[2].as_str(), screen.rows[3].as_str()),
-            ("  kept", "more")
-        );
-        // More output than the buffer keeps arrives before the next look: the model starts
-        // again from the oldest byte kept.
-        t.output(PaneId(1), &[b'.'; 200], |_, _| true);
-        t.output(PaneId(1), b"\x1b[1;1Hfresh", |_, _| true);
-        let screen = t.get_mut(id).expect("term").screen();
-        assert!(screen.rows[0].starts_with("fresh"), "{screen:?}");
+        lock(&t).claim(claim(id, 1, 0));
+        lock(&t).output(PaneId(1), b"\x1b[3;3Hkept", |_, _| true);
+        assert_eq!(shown(&t, id).rows[2], "  kept");
+        lock(&t).output(PaneId(1), b"\x1b[4;1Hmore", |_, _| true);
+        let s = shown(&t, id);
+        assert_eq!((s.rows[2].as_str(), s.rows[3].as_str()), ("  kept", "more"));
+        lock(&t).output(PaneId(1), &[b'.'; 200], |_, _| true);
+        lock(&t).output(PaneId(1), b"\x1b[1;1Hfresh", |_, _| true);
+        let s = shown(&t, id);
+        assert!(s.rows[0].starts_with("fresh"), "{s:?}");
+        assert!(!s.rows.iter().any(|r| r.contains("kept")), "{s:?}");
+    }
+
+    #[test]
+    fn the_screen_continues_across_lost_output() {
+        let t = Mutex::new(Terminals::new(1024));
+        let id = TerminalId::new();
+        lock(&t).claim(claim(id, 1, 0));
+        lock(&t).output(PaneId(1), b"\x1b[1;1Hone", |_, _| true);
+        {
+            let mut t = lock(&t);
+            t.detach();
+            t.reconcile(&[row(Tag::Id(id), 1, None, false)]);
+            t.output(PaneId(1), b"\x1b[2;1Htwo", |_, _| true);
+        }
+        let s = shown(&t, id);
+        assert_eq!((s.rows[0].as_str(), s.rows[1].as_str()), ("one", "two"));
+    }
+
+    #[test]
+    fn huge_counts_cost_no_more_than_the_screen_size() {
+        let t = Mutex::new(Terminals::new(1 << 20));
+        let id = TerminalId::new();
+        lock(&t).claim(claim(id, 1, 0));
+        let flood: Vec<u8> = b"\x1b[65535L\x1b[65535T\x1b[65535@"
+            .iter()
+            .copied()
+            .cycle()
+            .take(64 << 10)
+            .collect();
+        lock(&t).output(PaneId(1), &flood, |_, _| true);
+        lock(&t).output(PaneId(1), b"\x1b[1;1Hstill here", |_, _| true);
+        let started = std::time::Instant::now();
+        let s = shown(&t, id);
         assert!(
-            !screen.rows.iter().any(|r| r.contains("kept")),
-            "{screen:?}"
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
         );
+        assert_eq!(s.rows[0], "still here");
+    }
+
+    #[test]
+    fn a_busy_screen_model_holds_up_no_other_terminal() {
+        let t = Mutex::new(Terminals::new(1024));
+        let (a, b) = (TerminalId::new(), TerminalId::new());
+        lock(&t).claim(claim(a, 1, 0));
+        lock(&t).claim(claim(b, 2, 0));
+        let model = Arc::clone(&lock(&t).terms.get(&a).expect("a").screen);
+        std::thread::scope(|scope| {
+            // As if `a`'s screen were being computed from a flood.
+            let busy = lock(&model);
+            let (tx, rx) = std::sync::mpsc::channel();
+            let t = &t;
+            scope.spawn(move || {
+                // The reader thread records output, and `b`'s screen is read meanwhile.
+                lock(t).output(PaneId(2), b"hello", |_, _| true);
+                let _ = tx.send(shown(t, b));
+            });
+            let got = rx.recv_timeout(std::time::Duration::from_secs(10));
+            drop(busy);
+            assert_eq!(got.expect("b was held up").rows[0], "hello");
+        });
     }
 
     #[test]

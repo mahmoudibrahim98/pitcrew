@@ -19,6 +19,8 @@ use crate::detect::TmuxVersion;
 pub struct TmuxSupport {
     /// The installed tmux.
     pub version: TmuxVersion,
+    /// It, as an absolute path: pass it on as [`TmuxOptions::tmux`].
+    pub tmux: PathBuf,
     /// The private server's socket, for `tmux -S <socket> attach`.
     pub socket: PathBuf,
 }
@@ -30,9 +32,9 @@ impl TmuxSupport {
     }
 }
 
-/// Checks that tmux is installed, at least 3.2, and can start a server on the private socket
-/// (creating its directory). Otherwise the runtime is [`RuntimeError::Unavailable`], with the
-/// reason for people.
+/// Checks that tmux is installed (found once on `PATH`, absolute entries only), at least 3.2,
+/// and can start a server on the private socket (creating its directory). Otherwise the runtime
+/// is [`RuntimeError::Unavailable`], with the reason for people.
 ///
 /// Blocks for up to about twice [`TmuxOptions::call_timeout`]: from async code use
 /// [`detect_async`], or a blocking thread. A server it starts exits again at once (it has no
@@ -113,27 +115,31 @@ mod unix {
     use crate::detect::{DetectError, detect_tmux};
 
     pub(super) fn detect(options: &TmuxOptions) -> Result<TmuxSupport, RuntimeError> {
-        let version = detect_tmux(&options.tmux).map_err(|e| {
-            RuntimeError::Unavailable(match e {
-                DetectError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
-                    format!("tmux is not installed ({:?} was not found)", options.tmux)
-                }
-                other => other.to_string(),
-            })
+        let missing = || {
+            RuntimeError::Unavailable(format!(
+                "tmux is not installed ({:?} was not found)",
+                options.tmux
+            ))
+        };
+        let tmux = options.resolved_tmux().ok_or_else(missing)?;
+        let version = detect_tmux(&tmux).map_err(|e| match e {
+            DetectError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => missing(),
+            other => RuntimeError::Unavailable(other.to_string()),
         })?;
         super::super::socket::ensure_private(&options.socket).map_err(RuntimeError::Unavailable)?;
-        start_server(options)?;
+        start_server(&tmux, options)?;
         Ok(TmuxSupport {
             version,
+            tmux,
             socket: options.socket.clone(),
         })
     }
 
     /// `tmux -S <socket> start-server`: proves a server can run there, or one already does and
     /// speaks this client's protocol.
-    fn start_server(options: &TmuxOptions) -> Result<(), RuntimeError> {
+    fn start_server(tmux: &std::path::Path, options: &TmuxOptions) -> Result<(), RuntimeError> {
         let unavailable = |why: String| RuntimeError::Unavailable(why);
-        let mut child = Command::new(&options.tmux)
+        let mut child = Command::new(tmux)
             .arg("-S")
             .arg(&options.socket)
             .args(["-f", "/dev/null", "start-server"])
