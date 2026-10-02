@@ -40,7 +40,7 @@ mod fake;
 mod unix {
     use crate::fake::{self, FINGERPRINT, HOST, Machine};
     use pitcrew_desktop::app::{self, MAIN, WORKSPACES_EVENT};
-    use pitcrew_desktop::gateway::Gateway;
+    use pitcrew_desktop::gateway::{BoxFuture, Connected, Connector, Gateway, GatewayError};
     use pitcrew_desktop::keychain::{MemoryStore, TokenStore};
     use pitcrew_desktop::logging;
     use pitcrew_desktop::navigate::Navigator;
@@ -70,6 +70,15 @@ mod unix {
     const DEMO_NAME: &str = "Demo Lab";
     /// The fake machine's password, when it asks for one.
     const PASSWORD: &str = "correct-horse";
+
+    /// A connector to nowhere, for a workspace registered by hand.
+    struct Nowhere;
+
+    impl Connector for Nowhere {
+        fn connect(&self) -> BoxFuture<'_, Result<Connected, GatewayError>> {
+            Box::pin(async { Err(GatewayError::unreachable("nowhere")) })
+        }
+    }
 
     // ─── The runner ───────────────────────────────────────────────────────────────────────
 
@@ -1152,7 +1161,7 @@ mod unix {
         let w = world(false, |_, _| {});
         // The demo hub's id, already held by a workspace on another machine.
         w.registry
-            .insert(
+            .claim_remote(
                 WorkspaceRecord {
                     id: DEMO.into(),
                     name: "Original".into(),
@@ -1168,7 +1177,7 @@ mod unix {
                         transport: None,
                     })),
                 },
-                None,
+                Arc::new(Nowhere),
                 WorkspaceState::Unreachable,
             )
             .unwrap();

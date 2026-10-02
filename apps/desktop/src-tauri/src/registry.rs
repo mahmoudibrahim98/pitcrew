@@ -7,7 +7,8 @@
 //!   memory only. Every change to the list calls the change listener, which emits
 //!   `gateway://workspaces` in the app.
 //! - On first start the list is empty until the local daemon answers `GET /v1/workspace`; then
-//!   the local workspace is registered with its id and name.
+//!   the local workspace is registered with its id and name. An id a remote workspace holds is
+//!   refused, and kept: once that remote is gone, the local workspace comes back with it.
 //! - A remote workspace ([`Connection::Remote`]) keeps how to reach its machine: the host, the
 //!   launcher, the helper's root and platform, for SLURM the site recipe, the job options and the
 //!   last hop, and the transport the tunnel found worth remembering. No secret: its device token
@@ -207,6 +208,8 @@ pub struct Taken {
 pub struct Claimed {
     id: String,
     previous: Option<Entry>,
+    /// The claim's own connector: its entry is the one at `id` with this connector.
+    connector: Arc<dyn Connector>,
 }
 
 impl fmt::Debug for Claimed {
@@ -227,6 +230,17 @@ struct Inner {
     local: Option<Arc<dyn Connector>>,
     /// The local daemon's state while no local workspace is registered yet.
     local_state: Option<(WorkspaceState, Option<String>)>,
+    /// The id and name the local daemon reported while a remote workspace held that id: taken
+    /// once that remote is gone, unless the daemon's state changed meanwhile.
+    refused_local: Option<(String, String)>,
+}
+
+/// What registering the local workspace did.
+enum Local {
+    /// A remote workspace holds the id: nothing was registered.
+    Refused,
+    /// Registered, or updated; whether its saved record changed.
+    Registered { changed: bool },
 }
 
 /// The registry.
@@ -346,86 +360,46 @@ impl Registry {
     /// another id (its state was reset), the entry takes the new id.
     ///
     /// An id a remote workspace holds is refused: the local workspace (or, on first start, the
-    /// local daemon's state) is `unreachable`, saying so, and nothing is replaced.
+    /// local daemon's state) is `unreachable`, saying so, and nothing is replaced. The id and name
+    /// are kept, and registered once that remote workspace is removed (unless the local daemon's
+    /// state changes first).
     ///
     /// # Errors
     /// The registry file cannot be written. The registry in memory is updated anyway.
     pub fn set_local(&self, id: &str, name: &str) -> io::Result<()> {
         let mut inner = self.lock();
         let before = list_of(&inner.entries);
-        if let Some(remote) = inner
-            .entries
-            .iter()
-            .find(|e| e.record.id == id && e.record.kind != WorkspaceKind::Local)
-        {
-            let detail = format!(
-                "this computer's hub reports the id of the remote workspace {}; remove that one \
-                 first",
-                crate::gateway::error::shorten(&remote.record.name)
-            );
-            tracing::warn!(workspace = %id, "the local daemon reports the id of a remote workspace; not registering it");
-            let mut found = false;
-            for entry in &mut inner.entries {
-                if entry.record.kind == WorkspaceKind::Local {
-                    entry.state = WorkspaceState::Unreachable;
-                    entry.detail = Some(detail.clone());
-                    found = true;
-                }
-            }
-            if !found {
-                inner.local_state = Some((WorkspaceState::Unreachable, Some(detail)));
-            }
-            self.changed(inner, &before);
-            return Ok(());
-        }
-        let connector = inner.local.clone();
-        inner.local_state = None;
-        let record = WorkspaceRecord {
-            id: id.to_owned(),
-            name: name.to_owned(),
-            kind: WorkspaceKind::Local,
-            connection: Connection::Local,
-        };
-        let changed_record = match inner
-            .entries
-            .iter_mut()
-            .find(|e| e.record.kind == WorkspaceKind::Local)
-        {
-            Some(entry) => {
-                if entry.record.id != id {
-                    tracing::warn!(old = %entry.record.id, new = %id, "the local daemon hosts another workspace now");
-                }
-                let changed = entry.record != record;
-                entry.record = record;
-                entry.state = WorkspaceState::Ready;
-                entry.detail = None;
-                entry.connector = connector;
-                changed
-            }
-            None => {
-                tracing::info!(workspace = %id, "registered the local workspace");
-                inner.entries.push(Entry {
-                    record,
-                    state: WorkspaceState::Ready,
-                    detail: None,
-                    connector,
-                });
-                true
-            }
-        };
-        let saved = if changed_record {
-            self.save(&inner.entries)
-        } else {
-            Ok(())
+        let saved = match register_local(&mut inner, id, name) {
+            Local::Registered { changed: true } => self.save(&inner.entries),
+            Local::Registered { changed: false } | Local::Refused => Ok(()),
         };
         self.changed(inner, &before);
         saved
     }
 
+    /// The local workspace the daemon reported while a remote workspace held its id, registered
+    /// now if that id is free. Called with the lock held, after an entry went.
+    fn take_refused_local(&self, inner: &mut Inner) {
+        let Some((id, name)) = inner.refused_local.clone() else {
+            return;
+        };
+        if inner.entries.iter().any(|e| e.record.id == id) {
+            return;
+        }
+        tracing::info!(workspace = %id, "the remote workspace that held the local id is gone; registering the local workspace");
+        if let Local::Registered { changed: true } = register_local(inner, &id, &name)
+            && let Err(e) = self.save(&inner.entries)
+        {
+            tracing::warn!(workspace = %id, error = %e, "the local workspace is registered but not saved");
+        }
+    }
+
     /// Sets the local workspace's state, or remembers it until the local workspace is registered.
+    /// A refused id kept for later ([`Registry::set_local`]) is dropped: the daemon moved on.
     pub fn set_local_state(&self, state: WorkspaceState, detail: Option<String>) {
         let mut inner = self.lock();
         let before = list_of(&inner.entries);
+        inner.refused_local = None;
         let mut found = false;
         for entry in &mut inner.entries {
             if entry.record.kind == WorkspaceKind::Local {
@@ -451,31 +425,6 @@ impl Registry {
     #[must_use]
     pub fn pending_local_state(&self) -> Option<(WorkspaceState, Option<String>)> {
         self.lock().local_state.clone()
-    }
-
-    /// Adds a workspace with its connector (tests; remote workspaces later). Replaces one with the
-    /// same id.
-    ///
-    /// # Errors
-    /// The registry file cannot be written.
-    pub fn insert(
-        &self,
-        record: WorkspaceRecord,
-        connector: Option<Arc<dyn Connector>>,
-        state: WorkspaceState,
-    ) -> io::Result<()> {
-        let mut inner = self.lock();
-        let before = list_of(&inner.entries);
-        inner.entries.retain(|e| e.record.id != record.id);
-        inner.entries.push(Entry {
-            record,
-            state,
-            detail: None,
-            connector,
-        });
-        let saved = self.save(&inner.entries);
-        self.changed(inner, &before);
-        saved
     }
 
     /// Registers remote workspace `record` (a [`Connection::Remote`]) with its connector, in
@@ -521,7 +470,7 @@ impl Registry {
             record,
             state,
             detail: None,
-            connector: Some(connector),
+            connector: Some(Arc::clone(&connector)),
         };
         let previous = match held {
             Some(at) => Some(std::mem::replace(&mut inner.entries[at], entry)),
@@ -534,27 +483,67 @@ impl Registry {
             tracing::warn!(workspace = %id, error = %e, "the workspace is added but the registry is not saved");
         }
         self.changed(inner, &before);
-        Ok(Claimed { id, previous })
+        Ok(Claimed {
+            id,
+            previous,
+            connector,
+        })
     }
 
     /// Undoes [`Registry::claim_remote`]: the entry it replaced comes back, or the one it added
-    /// goes.
+    /// goes. Only while the entry at its id is still the claim's own (its connector): one that
+    /// was removed meanwhile stays removed, and one that replaced it stays.
     pub fn unclaim(&self, claimed: Claimed) {
         let mut inner = self.lock();
         let before = list_of(&inner.entries);
-        let at = inner.entries.iter().position(|e| e.record.id == claimed.id);
-        match (at, claimed.previous) {
-            (Some(at), Some(previous)) => inner.entries[at] = previous,
-            (Some(at), None) => {
+        let Some(at) = inner.entries.iter().position(|e| {
+            e.record.id == claimed.id
+                && e.connector
+                    .as_ref()
+                    .is_some_and(|c| Arc::ptr_eq(c, &claimed.connector))
+        }) else {
+            tracing::info!(workspace = %claimed.id, "the claim's entry is gone or replaced; nothing to undo");
+            return;
+        };
+        match claimed.previous {
+            Some(previous) => inner.entries[at] = previous,
+            None => {
                 inner.entries.remove(at);
+                self.take_refused_local(&mut inner);
             }
-            (None, Some(previous)) => inner.entries.push(previous),
-            (None, None) => {}
         }
         if let Err(e) = self.save(&inner.entries) {
             tracing::warn!(workspace = %claimed.id, error = %e, "cannot save the workspace registry");
         }
         self.changed(inner, &before);
+    }
+
+    /// Takes `name` for remote workspace `id` (its hub's own, cleaned), if it differs.
+    ///
+    /// # Errors
+    /// The registry file cannot be written. The registry in memory is updated anyway.
+    pub fn rename_remote(&self, id: &str, name: &str) -> io::Result<()> {
+        let mut inner = self.lock();
+        let before = list_of(&inner.entries);
+        let renamed = inner
+            .entries
+            .iter_mut()
+            .find(|e| e.record.id == id && e.record.kind == WorkspaceKind::Remote)
+            .is_some_and(|entry| {
+                if entry.record.name == name {
+                    return false;
+                }
+                entry.record.name = name.to_owned();
+                true
+            });
+        let saved = if renamed {
+            tracing::info!(workspace = %id, "the hub's workspace has a new name");
+            self.save(&inner.entries)
+        } else {
+            Ok(())
+        };
+        self.changed(inner, &before);
+        saved
     }
 
     /// Sets a workspace's state.
@@ -595,7 +584,8 @@ impl Registry {
         }
     }
 
-    /// Forgets workspace `id`, and returns what was saved for it.
+    /// Forgets workspace `id`, and returns what was saved for it. If the local daemon reported
+    /// that id while this workspace held it, the local workspace is registered now.
     ///
     /// # Errors
     /// The registry file cannot be written. The workspace is gone from memory anyway.
@@ -606,6 +596,7 @@ impl Registry {
             return Ok(None);
         };
         let entry = inner.entries.remove(at);
+        self.take_refused_local(&mut inner);
         let saved = self.save(&inner.entries);
         self.changed(inner, &before);
         saved.map(|()| Some(entry.record))
@@ -671,6 +662,73 @@ impl Registry {
             tracing::warn!(file = %file.display(), error = %e, "cannot save the workspace registry");
         })
     }
+}
+
+/// Registers the local workspace as its daemon reported it ([`Registry::set_local`]), with the
+/// lock held.
+fn register_local(inner: &mut Inner, id: &str, name: &str) -> Local {
+    if let Some(remote) = inner
+        .entries
+        .iter()
+        .find(|e| e.record.id == id && e.record.kind != WorkspaceKind::Local)
+    {
+        let detail = format!(
+            "this computer's hub reports the id of the remote workspace {}; remove that one \
+             first",
+            crate::gateway::error::shorten(&remote.record.name)
+        );
+        tracing::warn!(workspace = %id, "the local daemon reports the id of a remote workspace; not registering it");
+        let mut found = false;
+        for entry in &mut inner.entries {
+            if entry.record.kind == WorkspaceKind::Local {
+                entry.state = WorkspaceState::Unreachable;
+                entry.detail = Some(detail.clone());
+                found = true;
+            }
+        }
+        if !found {
+            inner.local_state = Some((WorkspaceState::Unreachable, Some(detail)));
+        }
+        inner.refused_local = Some((id.to_owned(), name.to_owned()));
+        return Local::Refused;
+    }
+    let connector = inner.local.clone();
+    inner.local_state = None;
+    inner.refused_local = None;
+    let record = WorkspaceRecord {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        kind: WorkspaceKind::Local,
+        connection: Connection::Local,
+    };
+    let changed = match inner
+        .entries
+        .iter_mut()
+        .find(|e| e.record.kind == WorkspaceKind::Local)
+    {
+        Some(entry) => {
+            if entry.record.id != id {
+                tracing::warn!(old = %entry.record.id, new = %id, "the local daemon hosts another workspace now");
+            }
+            let changed = entry.record != record;
+            entry.record = record;
+            entry.state = WorkspaceState::Ready;
+            entry.detail = None;
+            entry.connector = connector;
+            changed
+        }
+        None => {
+            tracing::info!(workspace = %id, "registered the local workspace");
+            inner.entries.push(Entry {
+                record,
+                state: WorkspaceState::Ready,
+                detail: None,
+                connector,
+            });
+            true
+        }
+    };
+    Local::Registered { changed }
 }
 
 fn list_of(entries: &[Entry]) -> Vec<GatewayWorkspace> {
@@ -774,15 +832,6 @@ mod tests {
         }
     }
 
-    fn record(id: &str) -> WorkspaceRecord {
-        WorkspaceRecord {
-            id: id.into(),
-            name: format!("Workspace {id}"),
-            kind: WorkspaceKind::Remote,
-            connection: Connection::Local,
-        }
-    }
-
     #[test]
     fn the_local_workspace_is_registered_saved_and_reloaded() {
         let tmp = tempfile::tempdir().unwrap();
@@ -852,11 +901,7 @@ mod tests {
             ErrorCode::UnknownWorkspace
         );
         registry
-            .insert(
-                record("R"),
-                Some(Arc::new(Nowhere)),
-                WorkspaceState::NeedsPairing,
-            )
+            .claim_remote(remote("R"), Arc::new(Nowhere), WorkspaceState::NeedsPairing)
             .unwrap();
         assert_eq!(
             registry.connector("R").err().unwrap().code,
@@ -897,11 +942,7 @@ mod tests {
         let seen = Arc::clone(&events);
         registry.on_change(move |list| seen.lock().unwrap().push(list.to_vec()));
         registry
-            .insert(
-                remote("01JR"),
-                Some(Arc::new(Nowhere)),
-                WorkspaceState::Ready,
-            )
+            .claim_remote(remote("01JR"), Arc::new(Nowhere), WorkspaceState::Ready)
             .unwrap();
         let text = std::fs::read_to_string(&file).unwrap();
         let saved: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -1053,6 +1094,132 @@ mod tests {
         assert_eq!(local.id, "01JL");
         assert_eq!(local.state, WorkspaceState::Unreachable);
         assert_eq!(registry.record("01JR").unwrap().kind, WorkspaceKind::Remote);
+    }
+
+    /// The local daemon reported an id a remote held, and was refused: once that remote is
+    /// removed (or its claim undone), the local workspace comes back with that id and name,
+    /// ready and saved. Not when the daemon's state changed meanwhile.
+    #[test]
+    fn the_local_workspace_comes_back_once_the_remote_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join(FILE_NAME);
+        let registry = Registry::load(file.clone());
+        registry.attach_local(Arc::new(Nowhere));
+        registry
+            .claim_remote(remote("01JR"), Arc::new(Nowhere), WorkspaceState::Ready)
+            .unwrap();
+        // First start: refused, with no local workspace yet.
+        registry.set_local("01JR", "Mine").unwrap();
+        assert_eq!(
+            registry.pending_local_state().unwrap().0,
+            WorkspaceState::Unreachable
+        );
+        registry.remove("01JR").unwrap();
+        let list = registry.list();
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(
+            (list[0].id.as_str(), list[0].name.as_str(), list[0].kind),
+            ("01JR", "Mine", WorkspaceKind::Local)
+        );
+        assert_eq!(list[0].state, WorkspaceState::Ready);
+        assert!(registry.connector("01JR").is_ok(), "the local connector");
+        assert_eq!(registry.pending_local_state(), None);
+        assert_eq!(
+            Registry::load(file).record("01JR").unwrap().kind,
+            WorkspaceKind::Local,
+            "saved"
+        );
+
+        // With a local workspace already, refused again: the old local entry takes the id once
+        // the claim that held it is undone.
+        let registry = Registry::in_memory();
+        registry.attach_local(Arc::new(Nowhere));
+        registry.set_local("01JL", "Here").unwrap();
+        let claimed = registry
+            .claim_remote(remote("01JX"), Arc::new(Nowhere), WorkspaceState::Ready)
+            .unwrap();
+        registry.set_local("01JX", "Here, reset").unwrap();
+        assert_eq!(registry.record("01JL").unwrap().kind, WorkspaceKind::Local);
+        registry.unclaim(claimed);
+        let list = registry.list();
+        assert_eq!(list.len(), 1, "{list:?}");
+        assert_eq!(
+            (list[0].id.as_str(), list[0].name.as_str(), list[0].state),
+            ("01JX", "Here, reset", WorkspaceState::Ready)
+        );
+
+        // The daemon's state changed after the refusal: what it reported then is not taken.
+        let registry = Registry::in_memory();
+        registry
+            .claim_remote(remote("01JR"), Arc::new(Nowhere), WorkspaceState::Ready)
+            .unwrap();
+        registry.set_local("01JR", "Mine").unwrap();
+        registry.set_local_state(WorkspaceState::Connecting, None);
+        registry.remove("01JR").unwrap();
+        assert!(registry.list().is_empty());
+    }
+
+    /// Undoing a claim touches only the claim's own entry: one removed meanwhile stays removed
+    /// (the entry it replaced does not come back), and one that replaced it stays.
+    #[test]
+    fn unclaim_touches_only_its_own_entry() {
+        let registry = Registry::in_memory();
+        let mut first = remote("01JR");
+        first.name = "First".into();
+        registry
+            .claim_remote(first, Arc::new(Nowhere), WorkspaceState::Ready)
+            .unwrap();
+        // Paired again (same machine), then removed before the pairing is undone.
+        let claimed = registry
+            .claim_remote(
+                remote("01JR"),
+                Arc::new(Nowhere),
+                WorkspaceState::Connecting,
+            )
+            .unwrap();
+        registry.remove("01JR").unwrap();
+        registry.unclaim(claimed);
+        assert!(registry.list().is_empty(), "nothing restored");
+
+        // Paired again twice: undoing the first claim leaves the second's entry.
+        let claimed = registry
+            .claim_remote(remote("01JR"), Arc::new(Nowhere), WorkspaceState::Ready)
+            .unwrap();
+        let mut second = remote("01JR");
+        second.name = "Second".into();
+        registry
+            .claim_remote(second, Arc::new(Nowhere), WorkspaceState::Ready)
+            .unwrap();
+        registry.unclaim(claimed);
+        assert_eq!(registry.record("01JR").unwrap().name, "Second");
+    }
+
+    #[test]
+    fn a_remote_takes_its_hubs_new_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join(FILE_NAME);
+        let registry = Registry::load(file.clone());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&events);
+        registry.on_change(move |list| seen.lock().unwrap().push(list.to_vec()));
+        registry.attach_local(Arc::new(Nowhere));
+        registry.set_local("01JL", "Here").unwrap();
+        registry
+            .claim_remote(remote("01JR"), Arc::new(Nowhere), WorkspaceState::Ready)
+            .unwrap();
+        let before = events.lock().unwrap().len();
+        registry.rename_remote("01JR", "Thesis lab").unwrap();
+        assert_eq!(registry.record("01JR").unwrap().name, "Thesis lab");
+        assert_eq!(events.lock().unwrap().len(), before + 1);
+        // The same name again is no change; the local workspace is not a remote's to rename.
+        registry.rename_remote("01JR", "Thesis lab").unwrap();
+        registry.rename_remote("01JL", "Hijacked").unwrap();
+        assert_eq!(events.lock().unwrap().len(), before + 1);
+        assert_eq!(registry.record("01JL").unwrap().name, "Here");
+        assert_eq!(
+            Registry::load(file).record("01JR").unwrap().name,
+            "Thesis lab"
+        );
     }
 
     #[test]

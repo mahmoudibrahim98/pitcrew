@@ -6,13 +6,11 @@
 
 mod common;
 
-use common::{FakeDaemon, WORKSPACE_ID, WORKSPACE_NAME};
+use common::{FakeDaemon, WORKSPACE_ID, WORKSPACE_NAME, register_local};
 use pitcrew_desktop::app::{self, MAIN, WORKSPACES_EVENT};
 use pitcrew_desktop::gateway::Gateway;
 use pitcrew_desktop::navigate::{self, NAVIGATE_EVENT, NavigateTarget, Navigator};
-use pitcrew_desktop::registry::{
-    Connection, Registry, WorkspaceKind, WorkspaceRecord, WorkspaceState,
-};
+use pitcrew_desktop::registry::{Registry, WorkspaceState};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -38,18 +36,12 @@ fn world() -> World {
     let tmp = tempfile::tempdir().unwrap();
     let daemon = FakeDaemon::start(&tmp.path().join("state"), TOKEN);
     let registry = Arc::new(Registry::in_memory());
-    registry
-        .insert(
-            WorkspaceRecord {
-                id: WORKSPACE_ID.into(),
-                name: WORKSPACE_NAME.into(),
-                kind: WorkspaceKind::Local,
-                connection: Connection::Local,
-            },
-            Some(Arc::new(daemon.connector())),
-            WorkspaceState::Ready,
-        )
-        .unwrap();
+    register_local(
+        &registry,
+        WORKSPACE_ID,
+        WORKSPACE_NAME,
+        Arc::new(daemon.connector()),
+    );
     let channels: Channels = Arc::default();
     let captured = Arc::clone(&channels);
     let builder = mock_builder().channel_interceptor(move |_webview, callback, _index, body| {

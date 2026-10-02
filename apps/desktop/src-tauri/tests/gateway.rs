@@ -6,15 +6,16 @@
 
 mod common;
 
-use common::{FakeDaemon, Recorder, WORKSPACE_ID, WORKSPACE_NAME, close_of, closes_in};
+use common::{
+    FakeDaemon, Recorder, WORKSPACE_ID, WORKSPACE_NAME, close_of, closes_in, register_local,
+    register_remote,
+};
 use pitcrew_desktop::daemon::LocalConnector;
 use pitcrew_desktop::daemon::endpoint::Endpoint;
 use pitcrew_desktop::gateway::{
     Delivery, ErrorCode, Gateway, GatewayError, GatewayRequest, GatewayResponse, Limits, Payload,
 };
-use pitcrew_desktop::registry::{
-    Connection, Registry, WorkspaceKind, WorkspaceRecord, WorkspaceState,
-};
+use pitcrew_desktop::registry::{Registry, WorkspaceState};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -40,27 +41,26 @@ fn world_with(limits: Limits) -> World {
     let tmp = tempfile::tempdir().unwrap();
     let daemon = FakeDaemon::start(&tmp.path().join("state"), TOKEN);
     let registry = Arc::new(Registry::in_memory());
-    registry
-        .insert(
-            record(WORKSPACE_ID, WORKSPACE_NAME),
-            Some(Arc::new(daemon.connector())),
-            WorkspaceState::Ready,
-        )
-        .unwrap();
+    register_local(
+        &registry,
+        WORKSPACE_ID,
+        WORKSPACE_NAME,
+        Arc::new(daemon.connector()),
+    );
     let down = tmp.path().join("down");
     std::fs::create_dir_all(down.join("run")).unwrap();
-    registry
-        .insert(
-            record(DOWN, "Down"),
-            Some(Arc::new(LocalConnector::with_token_path(
-                Endpoint::Unix {
-                    dir: down.join("run"),
-                },
-                down.join("device.token"),
-            ))),
-            WorkspaceState::Ready,
-        )
-        .unwrap();
+    register_remote(
+        &registry,
+        DOWN,
+        "Down",
+        Arc::new(LocalConnector::with_token_path(
+            Endpoint::Unix {
+                dir: down.join("run"),
+            },
+            down.join("device.token"),
+        )),
+        WorkspaceState::Ready,
+    );
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -72,15 +72,6 @@ fn world_with(limits: Limits) -> World {
         daemon,
         registry,
         _tmp: tmp,
-    }
-}
-
-fn record(id: &str, name: &str) -> WorkspaceRecord {
-    WorkspaceRecord {
-        id: id.into(),
-        name: name.into(),
-        kind: WorkspaceKind::Local,
-        connection: Connection::Local,
     }
 }
 
