@@ -2,6 +2,7 @@
 
 use clap::{ArgAction, Args, Parser, Subcommand};
 use pitcrew_protocol::model::Engine;
+use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -30,9 +31,54 @@ pub struct Cli {
 pub enum Command {
     /// Serve API v1 until Ctrl+C or SIGTERM.
     Serve(ServeArgs),
+    /// Set up a fresh workspace (its first run), through the daemon running on this state
+    /// directory: for people without the desktop, whose onboarding does the same.
+    Init(InitArgs),
+    /// The stdio bridge to a daemon's socket, for a remote machine's helper reached over SSH:
+    /// `pitcrewd connect --socket <path> [--framed] [--nonce <hex>]`. Uses no state directory.
+    #[command(disable_help_flag = true)]
+    Connect(ConnectArgs),
     /// The desktop's device token.
     #[command(subcommand)]
     Token(TokenCommand),
+}
+
+/// `pitcrewd init`: the fields of `POST /v1/setup` (api-v1.md, "The first run").
+#[derive(Debug, Args)]
+pub struct InitArgs {
+    /// The workspace's name, 1–80 characters.
+    #[arg(long, value_name = "NAME")]
+    pub workspace: String,
+
+    /// Your name, 1–80 characters.
+    #[arg(long, value_name = "PERSON")]
+    pub name: String,
+
+    /// Your handle: `@` and 1–32 of a-z, 0-9, `_` and `-`. The `@` may be left out (PowerShell
+    /// reads a bare `@sam` as something else).
+    #[arg(long, value_name = "@HANDLE")]
+    pub handle: String,
+
+    /// This machine's name, 1–60 characters.
+    #[arg(long, value_name = "NAME")]
+    pub machine: String,
+
+    /// Where the daemon of this state directory listens, as given to its `serve --listen`.
+    #[arg(long, value_name = "WHERE", default_value = "private")]
+    pub listen: ListenArg,
+}
+
+/// `pitcrewd connect`: everything after it goes to the bridge as it is, which reads it itself.
+#[derive(Debug, Args)]
+pub struct ConnectArgs {
+    /// `--socket <path> [--framed] [--nonce <hex>]`.
+    #[arg(
+        num_args = 0..,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "ARGS"
+    )]
+    pub args: Vec<OsString>,
 }
 
 /// `pitcrewd serve`.
@@ -312,6 +358,86 @@ mod tests {
         };
         assert!(args.demo);
         assert!(args.no_office);
+    }
+
+    /// Everything after `connect` reaches the bridge as it is, flags included; the bridge reads
+    /// it (and says what is wrong, with its own exit code).
+    #[test]
+    fn connect_hands_everything_after_it_to_the_bridge() {
+        let args = |list: &[&str]| -> Vec<OsString> {
+            let mut all = vec!["pitcrewd", "connect"];
+            all.extend_from_slice(list);
+            let cli = Cli::try_parse_from(all).unwrap();
+            let Some(Command::Connect(ConnectArgs { args })) = cli.command else {
+                panic!("not connect");
+            };
+            args
+        };
+        let given = [
+            "--socket",
+            "/home/me/.pitcrew/run/pitcrewd.sock",
+            "--framed",
+            "--nonce",
+            "0a1b",
+        ];
+        assert_eq!(args(&given), given.map(OsString::from));
+        assert!(args(&[]).is_empty());
+        for odd in [&["--help"][..], &["-x", "--socket"], &["--verbose", "y"]] {
+            assert_eq!(
+                args(odd),
+                odd.iter().map(OsString::from).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn init_takes_the_four_names_and_where_the_daemon_listens() {
+        let cli = Cli::try_parse_from([
+            "pitcrewd",
+            "--state-dir",
+            "x",
+            "init",
+            "--workspace",
+            "Demo Lab",
+            "--name",
+            "Sam Rivera",
+            "--handle",
+            "@sam",
+            "--machine",
+            "This laptop",
+        ])
+        .unwrap();
+        let Some(Command::Init(args)) = cli.command else {
+            panic!("not init");
+        };
+        assert_eq!(args.workspace, "Demo Lab");
+        assert_eq!(args.name, "Sam Rivera");
+        assert_eq!(args.handle, "@sam");
+        assert_eq!(args.machine, "This laptop");
+        assert_eq!(args.listen, ListenArg::Private);
+        let tcp = Cli::try_parse_from([
+            "pitcrewd",
+            "init",
+            "--workspace",
+            "L",
+            "--name",
+            "S",
+            "--handle",
+            "s",
+            "--machine",
+            "M",
+            "--listen",
+            "tcp:127.0.0.1:47460",
+        ])
+        .unwrap();
+        let Some(Command::Init(args)) = tcp.command else {
+            panic!("not init");
+        };
+        assert_eq!(args.listen, "tcp:127.0.0.1:47460".parse().unwrap());
+        // Each is needed.
+        assert!(
+            Cli::try_parse_from(["pitcrewd", "init", "--workspace", "L", "--name", "S"]).is_err()
+        );
     }
 
     #[test]

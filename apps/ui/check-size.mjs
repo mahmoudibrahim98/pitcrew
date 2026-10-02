@@ -2,7 +2,9 @@
 // - the entry script and every module it preloads, gzipped, must stay under 250 kB (lazy chunks,
 //   such as routes and the palette, do not count);
 // - the desktop gateway, and `@tauri-apps/api` with it, must not be in it: the desktop app loads
-//   them on demand, so a browser never downloads them. They must be in a lazy chunk instead.
+//   them on demand, so a browser never downloads them. They must be in a lazy chunk instead;
+// - the onboarding fake (`src/onboarding/fake-api.ts`, `fake-first-run.tsx`) must not be in any
+//   chunk at all: it is for tests and development builds only.
 // Usage: node check-size.mjs [dist]
 
 import { readdirSync, readFileSync } from 'node:fs';
@@ -15,6 +17,11 @@ const BUDGET = 250 * 1000;
  * `@tauri-apps/api` contain.
  */
 const DESKTOP_ONLY = ['cannot follow the gateway', 'gateway_socket_open', '__TAURI_TO_IPC_KEY__', 'plugin:event|listen'];
+/** Literal strings only the onboarding fake contains (minifying keeps strings, not names). */
+const FAKE_ONLY = {
+  'src/onboarding/fake-api.ts': 'sam@example.com',
+  'src/onboarding/fake-first-run.tsx': 'every step runs against a fake',
+};
 
 const dist = process.argv[2] ?? 'dist';
 const html = readFileSync(join(dist, 'index.html'), 'utf8');
@@ -62,5 +69,27 @@ if (missing.length > 0) {
   failed = true;
 } else {
   console.log(`Desktop gateway and @tauri-apps/api: lazy only (${lazy.map(({ name }) => `/assets/${name}`).join(', ')})`);
+}
+
+// The onboarding fake must not ship. Each marker must still be in its source file, or this check
+// would pass without looking for anything.
+const here = new URL('.', import.meta.url);
+for (const [source, marker] of Object.entries(FAKE_ONLY)) {
+  if (!readFileSync(new URL(source, here), 'utf8').includes(marker)) {
+    console.error(`${source} no longer contains "${marker}": update FAKE_ONLY in check-size.mjs.`);
+    failed = true;
+  }
+}
+const shipped = readdirSync(join(dist, 'assets'))
+  .filter((name) => name.endsWith('.js'))
+  .filter((name) => {
+    const text = readFileSync(join(dist, 'assets', name), 'utf8');
+    return Object.values(FAKE_ONLY).some((marker) => text.includes(marker));
+  });
+if (shipped.length > 0) {
+  console.error(`The onboarding fake is in the build: ${shipped.map((name) => `/assets/${name}`).join(', ')}`);
+  failed = true;
+} else {
+  console.log('Onboarding fake: not in the build');
 }
 if (failed) process.exit(1);

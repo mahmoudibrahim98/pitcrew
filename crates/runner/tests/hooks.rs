@@ -36,6 +36,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower::ServiceExt as _;
 
 const WAIT: Duration = Duration::from_secs(5);
+/// Longest wait in the tests that wait only for events (never for a margin of time): generous,
+/// so a loaded machine is slow, not a failure.
+const CEILING: Duration = Duration::from_secs(60);
 
 fn now_ms() -> TimestampMs {
     i64::try_from(
@@ -741,6 +744,386 @@ fn a_hook_for_an_unknown_session_looks_in_local_homes_but_not_network_ones() {
         runner.stop();
         assert_eq!(after - before, looks, "{poll:?}");
     }
+}
+
+/// Writes the transcript of Claude sub-agent `agent_id`, started by the fixture's session in
+/// `home`, whole (see `common::place`).
+fn place_sub_agent(home: &Path, agent_id: &str) {
+    place_sub_agent_of(home, FIXTURE_ID, agent_id, agent_id);
+}
+
+/// Writes `<session>/subagents/<file>.jsonl` in `home`, whole: a sub-agent whose records name it
+/// `agent_id`.
+fn place_sub_agent_of(home: &Path, session: &str, file: &str, agent_id: &str) {
+    let dir = claude_file(home, session)
+        .with_extension("")
+        .join("subagents");
+    std::fs::create_dir_all(&dir).unwrap();
+    let lines = String::from_utf8(fixture_lines()[..3].concat())
+        .unwrap()
+        .replace(
+            r#""isSidechain":false"#,
+            &format!(r#""isSidechain":true,"agentId":"{agent_id}""#),
+        );
+    common::place(&dir.join(format!("{file}.jsonl")), lines.as_bytes());
+}
+
+/// Delivers a hook that applies, and waits for its event: every hook delivered before it has
+/// then been decided (the watcher decides hooks in order).
+fn settle(hooks: &dyn HookSink, sink: &CollectSink, hook: HookEvent) {
+    let before = sink.len();
+    hooks.deliver(hook);
+    sink.wait_for(before + 1, CEILING)
+        .expect("the settling hook's event");
+}
+
+/// The discovered session whose CLI id is `native`.
+fn discovered_as(events: &[Event], native: &str) -> pitcrew_protocol::model::Session {
+    events
+        .iter()
+        .find_map(|e| match &e.body {
+            EventBody::SessionDiscovered { session } if session.native_id == native => {
+                Some(session.clone())
+            }
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// A sub-agent runs as its parent. At its discovery the hub has not stored it yet (its
+/// `session_discovered` is on its way), so its own lookup says "no agent": its held hooks are
+/// judged by its parent's agent instead, as are its live ones until the hub knows it.
+#[test]
+fn a_sub_agents_hooks_are_judged_by_its_parents_agent() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    std::fs::write(
+        claude_file(home.path(), FIXTURE_ID),
+        fixture_lines()[..5].concat(),
+    )
+    .unwrap();
+    let agents = Arc::new(MemoryAgents::new());
+    let (runner, sink) = start(home.path(), state.path(), Some(agents.clone()));
+    sink.wait_for(3, CEILING).expect("the parent's discovery");
+    let main = discovered(&sink.events()).id;
+    // The parent runs as `writer`; the hub knows nothing of its sub-agents.
+    let owner = person();
+    let writer = agent_of(&owner);
+    agents.set(main, runs_as(&writer));
+
+    let hooks = runner.hooks();
+    let now = now_ms();
+    // Held for `agent-a1`: the writer's own permission prompt, then newer hooks that are
+    // refused: a sibling agent of the same owner ends it, another person's agent stops it.
+    hooks.deliver(asks(
+        &writer,
+        "agent-a1",
+        "Allow the writer's helper to run make?",
+        now,
+    ));
+    hooks.deliver(hook(&agent_of(&owner), "SessionEnd", "agent-a1", now + 1));
+    hooks.deliver(hook(&agent_of(&person()), "Stop", "agent-a1", now + 2));
+    // Held for `agent-a2`, by the device rule: the writer's owner answers for it; another
+    // person's newer end is refused.
+    hooks.deliver(asks(
+        &owner,
+        "agent-a2",
+        "The owner answers for the helper",
+        now,
+    ));
+    hooks.deliver(hook(&person(), "SessionEnd", "agent-a2", now + 1));
+    // The owner stops the parent: once that is in, every hook above is held.
+    settle(&hooks, &sink, hook(&owner, "Stop", FIXTURE_ID, now + 3));
+
+    place_sub_agent(home.path(), "agent-a1");
+    place_sub_agent(home.path(), "agent-a2");
+    runner.rescan();
+    sink.wait_for(4 + 2 * 2, CEILING)
+        .expect("both sub-agents' discoveries");
+    let events = sink.events();
+    let (a1, a2) = (
+        discovered_as(&events, "agent-a1"),
+        discovered_as(&events, "agent-a2"),
+    );
+    assert_eq!((a1.parent, a2.parent), (Some(main), Some(main)));
+    assert_eq!(
+        labels_of(&events, a1.id),
+        ["discovered:Waiting", "tool:TodoWrite"]
+    );
+    assert_eq!(
+        a1.status_line.as_deref(),
+        Some("Allow the writer's helper to run make?")
+    );
+    assert_eq!(
+        labels_of(&events, a2.id),
+        ["discovered:Waiting", "tool:TodoWrite"]
+    );
+    assert_eq!(
+        a2.status_line.as_deref(),
+        Some("The owner answers for the helper")
+    );
+
+    // Live, while the hub still knows nothing of `agent-a1`: another agent's end is refused,
+    // the writer's stop applies.
+    let n = sink.len();
+    let at = now_ms() + 10;
+    hooks.deliver(hook(&agent_of(&person()), "SessionEnd", "agent-a1", at));
+    settle(&hooks, &sink, hook(&writer, "Stop", "agent-a1", at + 1));
+    runner.stop();
+    let events = sink.events();
+    assert_eq!(labels(&events[n..]), ["state:Idle"]);
+    assert_eq!(session_of(&events[n]), Some(a1.id));
+
+    // After a restart the parent is looked up again, at the first hook: `agent-a2` is still
+    // the writer's, and only the writer (or its owner) changes it.
+    let agents = Arc::new(MemoryAgents::new());
+    agents.set(main, runs_as(&writer));
+    let (runner, sink) = start(home.path(), state.path(), Some(agents));
+    let hooks = runner.hooks();
+    let at = now_ms() + 20;
+    hooks.deliver(hook(&agent_of(&owner), "SessionEnd", "agent-a2", at));
+    settle(&hooks, &sink, hook(&writer, "Stop", "agent-a2", at + 1));
+    runner.stop();
+    let events = sink.events();
+    assert_eq!(labels(&events), ["state:Idle"]);
+    assert_eq!(session_of(&events[0]), Some(a2.id));
+}
+
+/// Every discovered session whose CLI id is `native`, in the order discovered.
+fn all_discovered_as(events: &[Event], native: &str) -> Vec<SessionId> {
+    events
+        .iter()
+        .filter_map(|e| match &e.body {
+            EventBody::SessionDiscovered { session } if session.native_id == native => {
+                Some(session.id)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// A sub-agent's id is whatever its transcript says. One named like a session never takes that
+/// session's hooks, whether it is found after the session or, after a restart (newest first),
+/// before it. Of two sub-agents with one id, the one indexed first keeps it, after a restart too.
+#[test]
+fn a_sub_agent_named_like_a_session_never_takes_its_native_id() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    std::fs::write(
+        claude_file(home.path(), FIXTURE_ID),
+        fixture_lines()[..5].concat(),
+    )
+    .unwrap();
+    // Nobody runs as an agent: a person's hook applies wherever it lands.
+    let (runner, sink) = start(
+        home.path(),
+        state.path(),
+        Some(Arc::new(MemoryAgents::new())),
+    );
+    sink.wait_for(3, CEILING).expect("the session's discovery");
+    let other = |n: u8| format!("eeeeeeee-0000-4000-8000-00000000000{n}");
+    // Found after it: a sub-agent that names itself the session.
+    place_sub_agent_of(home.path(), &other(1), "agent-e1", FIXTURE_ID);
+    runner.rescan();
+    sink.wait_for(5, CEILING)
+        .expect("the look-alike's discovery");
+    // Two sub-agents with one id, found one after the other.
+    place_sub_agent_of(home.path(), &other(2), "agent-e2", "agent-dup");
+    runner.rescan();
+    sink.wait_for(7, CEILING).expect("the first sub-agent");
+    place_sub_agent_of(home.path(), &other(3), "agent-e3", "agent-dup");
+    runner.rescan();
+    sink.wait_for(9, CEILING).expect("the second sub-agent");
+    let events = sink.events();
+    let [main, look_alike] = all_discovered_as(&events, FIXTURE_ID)[..] else {
+        panic!("{:?}", labels(&events));
+    };
+    let [first, second] = all_discovered_as(&events, "agent-dup")[..] else {
+        panic!("{:?}", labels(&events));
+    };
+    assert!(first < second);
+
+    let me = person();
+    let hooks = runner.hooks();
+    let n = sink.len();
+    let at = now_ms() + 10;
+    settle(&hooks, &sink, hook(&me, "Stop", FIXTURE_ID, at));
+    settle(&hooks, &sink, hook(&me, "Stop", "agent-dup", at + 1));
+    runner.stop();
+    let events = sink.events();
+    assert_eq!(
+        events[n..].iter().map(session_of).collect::<Vec<_>>(),
+        [Some(main), Some(first)],
+        "{:?}",
+        labels(&events[n..])
+    );
+
+    // After a restart, the look-alike and the second sub-agent are found first (they are
+    // newer): the ids still go to the session and to the first sub-agent.
+    let (runner, sink) = start(
+        home.path(),
+        state.path(),
+        Some(Arc::new(MemoryAgents::new())),
+    );
+    let hooks = runner.hooks();
+    let at = now_ms() + 20;
+    settle(
+        &hooks,
+        &sink,
+        asks(&me, FIXTURE_ID, "The session waits", at),
+    );
+    settle(
+        &hooks,
+        &sink,
+        asks(&me, "agent-dup", "The first waits", at + 1),
+    );
+    runner.stop();
+    let events = sink.events();
+    assert_eq!(
+        events.iter().map(session_of).collect::<Vec<_>>(),
+        [Some(main), Some(first)],
+        "{:?}",
+        labels(&events)
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| { session_of(e) == Some(look_alike) || session_of(e) == Some(second) })
+    );
+}
+
+/// `MemoryAgents`, except that the lookup panics for the sessions in `panics`.
+#[derive(Debug, Default)]
+struct Scripted {
+    answers: MemoryAgents,
+    panics: std::sync::Mutex<Vec<SessionId>>,
+}
+
+impl SessionAgents for Scripted {
+    fn agent_of(&self, session: SessionId) -> SessionAgent {
+        assert!(
+            !self.panics.lock().unwrap().contains(&session),
+            "test double: the lookup for this session panics"
+        );
+        self.answers.agent_of(session)
+    }
+}
+
+/// The parent stands in only for a sub-agent the hub says has no agent, and it fails closed:
+/// - a sub-agent's own `Unknown` stands: its parent's agent and that agent's owner are refused;
+/// - a sub-agent's own agent stands: its parent's agent is refused, its own applies;
+/// - the parent's `Unknown`, or a lookup for it that panics, refuses everyone, the owner too.
+#[test]
+fn a_sub_agents_own_answer_stands_and_its_parent_fails_closed() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    std::fs::write(
+        claude_file(home.path(), FIXTURE_ID),
+        fixture_lines()[..5].concat(),
+    )
+    .unwrap();
+    let subs = ["agent-u1", "agent-o1", "agent-n1"];
+    for id in subs {
+        place_sub_agent(home.path(), id);
+    }
+    let agents = Arc::new(Scripted::default());
+    let (runner, sink) = start(home.path(), state.path(), Some(agents.clone()));
+    sink.wait_for(3 + 3 * 2, CEILING)
+        .expect("the parent and its three sub-agents");
+    let events = sink.events();
+    let main = discovered_as(&events, FIXTURE_ID).id;
+    let [unknown, own, plain] = subs.map(|id| {
+        let s = discovered_as(&events, id);
+        assert_eq!(s.parent, Some(main), "{id}");
+        s.id
+    });
+    let owner = person();
+    let writer = agent_of(&owner);
+    let other = agent_of(&person());
+    agents.answers.set(main, runs_as(&writer));
+    agents.answers.set(unknown, SessionAgent::Unknown);
+    agents.answers.set(own, runs_as(&other));
+    // `plain`: the hub knows no agent for it, so its parent's decides.
+
+    let hooks = runner.hooks();
+    let n = sink.len();
+    let at = now_ms() + 10;
+    // Refused: who runs `agent-u1` is unknown, whatever its parent runs as.
+    hooks.deliver(hook(&writer, "SessionEnd", "agent-u1", at));
+    hooks.deliver(asks(&owner, "agent-u1", "The owner answers anyway", at));
+    // Refused: `agent-o1` runs as `other`, not as its parent's agent. `other` applies.
+    hooks.deliver(hook(&writer, "SessionEnd", "agent-o1", at));
+    settle(&hooks, &sink, hook(&other, "Stop", "agent-o1", at + 1));
+    // `agent-n1` follows its parent: the writer's own hook applies.
+    settle(&hooks, &sink, hook(&writer, "Stop", "agent-n1", at + 2));
+
+    // The parent's agent is unknown: nobody changes `agent-n1`, not even the writer's owner.
+    agents.answers.set(main, SessionAgent::Unknown);
+    hooks.deliver(asks(
+        &owner,
+        "agent-n1",
+        "The owner, parent unknown",
+        at + 3,
+    ));
+    settle(
+        &hooks,
+        &sink,
+        asks(&other, "agent-o1", "Waiting for other", at + 4),
+    );
+    // The lookup for the parent panics: the same.
+    agents.answers.set(main, runs_as(&writer));
+    agents.panics.lock().unwrap().push(main);
+    hooks.deliver(asks(&owner, "agent-n1", "The owner, lookup panics", at + 5));
+    settle(&hooks, &sink, hook(&other, "Stop", "agent-o1", at + 6));
+    runner.stop();
+
+    let events = sink.events();
+    let after = &events[n..];
+    assert!(labels_of(after, unknown).is_empty(), "{:?}", labels(after));
+    assert_eq!(
+        labels_of(after, own),
+        ["state:Idle", "state:Waiting", "state:Idle"]
+    );
+    assert_eq!(labels_of(after, plain), ["state:Idle"]);
+    assert_eq!(after.len(), 4, "{:?}", labels(after));
+}
+
+/// A sub-agent's parent transcript that is a link, here to another session that runs as an
+/// agent, is not followed: the sub-agent has no parent, so that agent's hook is refused.
+#[cfg(unix)]
+#[test]
+fn a_linked_parent_lends_a_sub_agent_no_agent() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let victim = "dddddddd-0000-4000-8000-000000000001";
+    let target = claude_file(home.path(), victim);
+    std::fs::write(&target, fixture_lines_as(victim)[..5].concat()).unwrap();
+    // The fixture session's transcript is a link to the victim's; its sub-agent is real.
+    std::os::unix::fs::symlink(&target, claude_file(home.path(), FIXTURE_ID)).unwrap();
+    let agents = Arc::new(MemoryAgents::new());
+    let (runner, sink) = start(home.path(), state.path(), Some(agents.clone()));
+    sink.wait_for(3, CEILING).expect("the victim's discovery");
+    let victim_session = discovered_as(&sink.events(), victim).id;
+    let owner = person();
+    let writer = agent_of(&owner);
+    agents.set(victim_session, runs_as(&writer));
+
+    let hooks = runner.hooks();
+    let now = now_ms();
+    hooks.deliver(asks(&writer, "agent-l1", "Through the link", now));
+    settle(&hooks, &sink, hook(&owner, "Stop", victim, now + 1));
+    place_sub_agent(home.path(), "agent-l1");
+    runner.rescan();
+    sink.wait_for(4 + 2, CEILING)
+        .expect("the sub-agent's discovery");
+    runner.stop();
+    let events = sink.events();
+    let sub = discovered_as(&events, "agent-l1");
+    assert_eq!(sub.parent, None);
+    assert_eq!(
+        labels_of(&events, sub.id),
+        ["discovered:Working", "tool:TodoWrite"]
+    );
 }
 
 #[test]

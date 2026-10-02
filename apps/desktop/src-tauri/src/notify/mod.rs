@@ -108,7 +108,7 @@ pub fn clean(text: &str, max: usize) -> String {
 /// characters, the soft hyphen, the combining grapheme joiner, the Mongolian vowel separator,
 /// the Hangul fillers, variation selectors, interlinear annotation marks, tag characters and the
 /// byte-order mark.
-fn is_invisible(c: char) -> bool {
+pub(crate) fn is_invisible(c: char) -> bool {
     matches!(
         c,
         '\u{00AD}'

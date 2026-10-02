@@ -79,14 +79,20 @@ pub mod recap;
 pub mod routes;
 mod seed;
 mod service;
+mod setup;
 
 pub use activity::EventRefs;
 pub use commands::{AnswerAsk, BriefEdit, NewAsk, NewComment, WorkstreamPatch};
 pub use dispatch::{DispatchError, DispatchRequest, Dispatcher, NewDispatch};
 pub use edits::{LABEL_CHARS, MAX_LABELS, TITLE_CHARS};
 pub use error::{INTERNAL_MESSAGE, Result, WorkError};
-pub use office::{Applied, BackOffice, OfficeCommands, OfficeRun, projections_with_office};
-pub use pitcrew_protocol::api::{NewProject, NewTask, NewWorkstream};
+pub use office::{
+    Applied, BackOffice, OFFICE_HANDLE, OFFICE_NAME, OfficeCommands, OfficeRun,
+    projections_with_office,
+};
+pub use pitcrew_protocol::api::{
+    NewProject, NewTask, NewWorkstream, Setup, SetupDone, SetupPerson,
+};
 pub use pitcrew_protocol::model::TaskPatch;
 pub use projection::projections;
 pub use query::{AskFilter, REF_SCAN_BUDGET, RefFilter, SessionFilter, TaskFilter, TaskRef};
@@ -94,6 +100,7 @@ pub use recap::{BlockFilter, DAY_CACHE_ENTRIES, DaysScope, RecapIndex, Recaps};
 pub use routes::{agent_routes, device_routes, routes};
 pub use seed::demo_events;
 pub use service::{Clock, WorkService, WorkspaceAt};
+pub use setup::SetupListener;
 
 /// The protocol version this crate was built against.
 pub const PROTOCOL_VERSION: u32 = pitcrew_protocol::PROTOCOL_VERSION;

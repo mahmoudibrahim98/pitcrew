@@ -472,8 +472,9 @@ mod tests {
         let mut parser = ControlParser::new();
         let mut all = Vec::new();
         for chunk in data.chunks(1000) {
-            all.extend(parser.feed(chunk));
+            all.extend(parser.feed(chunk).expect("generated control output parses"));
         }
+        parser.finish().expect("the stream ends on a complete line");
         assert!(
             !all.iter().any(|n| matches!(n, Notification::Other { .. })),
             "no unknown lines"

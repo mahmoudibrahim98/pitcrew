@@ -5,24 +5,33 @@
 //! the hub and the runner share this one process (ADR-0009).
 //!
 //! - `pitcrewd serve [--listen private|tcp:127.0.0.1:<port>] [--demo] [--no-office]
-//!   [--homes <dir>…] [--no-runner]`: see [`serve`], [`office`] and [`runner`].
+//!   [--homes <dir>…] [--no-runner]`: see [`serve`], [`office`] and [`runner`]. A fresh hub is set
+//!   up once, while it serves ([`setup`]).
+//! - `pitcrewd init --workspace <name> --name <person> --handle <@handle> --machine <name>`: sets
+//!   a fresh hub up through the running daemon ([`init`]).
+//! - `pitcrewd connect --socket <path> [--framed] [--nonce <hex>]`: the stdio bridge to a daemon's
+//!   socket, for a remote helper reached over SSH (`pitcrew_remote::bridge`).
 //! - `pitcrewd token show-path`: where the device token is kept, never the token.
 //! - `pitcrewd --version`: the version and the protocol range.
 //!
-//! `--state-dir <dir>` works with every command; [`state`] lists what is in it. Logs go to
-//! stderr, at the level in `PITCREW_LOG` (default `info`); stdout carries only the
-//! `pitcrewd listening on …` line, and the path from `token show-path`.
+//! `--state-dir <dir>` works with every command but `connect`, which uses none; [`state`] lists
+//! what is in it. Logs go to stderr, at the level in `PITCREW_LOG` (default `info`); stdout
+//! carries only the `pitcrewd listening on …` line, the path from `token show-path`, what `init`
+//! set up, and the bridge's bytes.
 //!
 //! **Owned by stream 0.**
 
 mod agents;
 mod cli;
 mod cors;
+mod host;
+mod init;
 mod office;
 mod recaps;
 mod refs;
 mod runner;
 mod serve;
+mod setup;
 mod state;
 mod terminals;
 mod transcripts;
@@ -43,14 +52,23 @@ fn main() -> ExitCode {
         Cli::command()
             .error(
                 clap::error::ErrorKind::MissingSubcommand,
-                "say what to do: `pitcrewd serve`, `pitcrewd token show-path`, or `--version`",
+                "say what to do: `pitcrewd serve`, `pitcrewd init`, `pitcrewd token show-path`, \
+                 or `--version`",
             )
             .exit();
     };
+    // Before anything else: on a remote machine the bridge must not look for a state directory,
+    // and its stdout is the connection's. It logs nothing; its errors go to stderr.
+    if let Command::Connect(args) = command {
+        return pitcrew_remote::bridge::main(args.args);
+    }
     init_logging();
     let result = StateDir::resolve(cli.state_dir).and_then(|state| match command {
         Command::Serve(args) => serve::serve(&state, &args),
+        Command::Init(args) => Ok(init::init(&state, &args)),
         Command::Token(TokenCommand::ShowPath) => Ok(show_path(&state)),
+        // Returned above.
+        Command::Connect(args) => Ok(pitcrew_remote::bridge::main(args.args)),
     });
     match result {
         Ok(code) => code,

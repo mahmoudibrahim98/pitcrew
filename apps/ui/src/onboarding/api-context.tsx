@@ -1,9 +1,9 @@
-// Provides the `OnboardingApi` to the wizard tree. The routes wire up the fake (`fake-api.ts`);
-// tests pass their own instance (usually `createFakeOnboardingApi({ speed: 0 })`) so they do not
-// wait on real timers.
+// Provides the `OnboardingApi` to the wizard tree. The first-run page gives the real one
+// (`hub-api.ts`), or the fake in a development build that asks for it; tests pass their own
+// (usually `createFakeOnboardingApi({ speed: 0 })`) so they do not wait on real timers. There is no
+// default: nothing falls back to the fake.
 
-import { createContext, use, useState, type ReactNode } from 'react';
-import { createFakeOnboardingApi } from './fake-api.ts';
+import { createContext, use, type ReactNode } from 'react';
 import type { OnboardingApi } from './api.ts';
 
 const OnboardingApiContext = createContext<OnboardingApi | null>(null);
@@ -14,14 +14,6 @@ export function useOnboardingApi(): OnboardingApi {
   return api;
 }
 
-export function OnboardingApiProvider({
-  api,
-  children,
-}: {
-  /** Defaults to a fresh fake. Pass one in tests to control its speed or seed its state. */
-  api?: OnboardingApi;
-  children: ReactNode;
-}) {
-  const [fallback] = useState(() => api ?? createFakeOnboardingApi());
-  return <OnboardingApiContext value={api ?? fallback}>{children}</OnboardingApiContext>;
+export function OnboardingApiProvider({ api, children }: { api: OnboardingApi; children: ReactNode }) {
+  return <OnboardingApiContext value={api}>{children}</OnboardingApiContext>;
 }

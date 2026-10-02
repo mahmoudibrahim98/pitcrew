@@ -43,14 +43,19 @@ server. `TAURI_CONFIG='{"build":{"frontendDist":"…"}}'` bundles a UI built els
 
 **Settings.** `settings.json` in the app's config directory (`~/.config/org.pitcrew.desktop`,
 `%APPDATA%\org.pitcrew.desktop`, `~/Library/Application Support/org.pitcrew.desktop`), all
-optional; `PITCREW_PITCREWD` and `PITCREW_STATE_DIR` override them:
+optional; `PITCREW_PITCREWD`, `PITCREW_STATE_DIR`, `PITCREW_SSH`, `PITCREW_ASKPASS` and
+`PITCREW_HELPERS` override them:
 
 ```json
-{ "pitcrewd": "/opt/pitcrew/bin/pitcrewd", "stateDir": "/home/sam/.local/share/pitcrew" }
+{ "pitcrewd": "/opt/pitcrew/bin/pitcrewd", "stateDir": "/home/sam/.local/share/pitcrew",
+  "ssh": "/usr/bin/ssh", "askpass": "/opt/pitcrew/bin/pitcrew-askpass",
+  "helpers": "/opt/pitcrew/helpers" }
 ```
 
 Without `stateDir` the app uses the daemon's own default, so it finds a `pitcrewd` started by
-hand. Logs go to stderr at `PITCREW_DESKTOP_LOG` (default `info`).
+hand. Without `ssh`, `askpass` and `helpers` it uses `ssh` on `PATH` and what it was installed
+with (see "Remote workspaces"). Paths must be absolute. Logs go to stderr at
+`PITCREW_DESKTOP_LOG` (default `info`).
 
 **Preferences.** `preferences.json` beside it is the app's own file, changed from the tray menu
 (the app never writes `settings.json`):
@@ -222,19 +227,142 @@ invoke('gateway_socket_close', { socket, code, reason })
   (a reload) or its window is destroyed, its sockets close with 1001 and nothing more is sent to
   it. A socket that finishes opening after its page reloaded is closed at once.
 
+## Remote workspaces (`src/remote`)
+
+The contract's "Remote workspaces" and "Prompts", on stream J's `pitcrew-remote` and the
+person's own OpenSSH and `~/.ssh/config`:
+
+```js
+invoke('gateway_ssh_hosts')                                    // → { hosts: string[] }
+invoke('gateway_remote_probe', { host })                       // → RemoteProbe
+invoke('gateway_remote_plan', { req: { host, launcher, site, job } })  // → { plan, steps, jobScript? }
+invoke('gateway_remote_add', { plan, events: channel })        // → GatewayWorkspace
+invoke('gateway_remote_cancel', { plan })
+invoke('gateway_workspace_retry', { workspace })
+invoke('gateway_workspace_remove', { workspace, stopHelper })
+invoke('gateway_prompt_reply', { id, answer })                 // or { id, accept }; { id } cancels
+// events: gateway://prompt (GatewayPrompt), gateway://prompt-closed ({ id })
+```
+
+- **Probe** runs `pitcrew-remote`'s probe, then asks the direct launcher (or, for a SLURM
+  helper, the scheduler) what is installed and running: `helper: { version, running }`;
+  `slurm` when `sbatch` is there; `tmux: { version }` when tmux is (the tmux launcher needs 3.2
+  or newer).
+- **Plan** changes nothing on the machine. It probes again, finds the helper for the machine's
+  platform (below), checks the launcher (tmux 3.2 or newer; for SLURM the tools and the site
+  recipe: the built-in `generic`, or `~/.pitcrew/sites/<name>.toml`), and for SLURM renders the
+  job script from the person's options (`time` as SLURM writes it, never `UNLIMITED`; `gpus` a
+  count or `type:count`, sent as `--gres=gpu:…`). A job of the helper's already queued or
+  running is used instead: the plan says so and holds no script. The plan is kept under a
+  random id for 10 minutes, at most 32 at once, and used once: `add` takes it whatever happens.
+- **Add** carries the plan out, step by step, with progress on `events`: each step of the plan
+  as `{ step, state: "running" }` then `"done"` or `"failed"` (with `detail`; the upload adds
+  `"running"` messages with `"N% sent"`, and a SLURM job its state, e.g.
+  `"job 4242 pending (Priority)"`), ending with one `{ step: "add", state: "done" | "failed" }`.
+  1. *Deploy*: the helper's bytes are checked against their sha256 before anything is sent, and
+     again on the machine (`pitcrew_remote::deploy`).
+  2. *Launch*: the direct or tmux launcher starts it; for SLURM, exactly the plan's script is
+     submitted, and the add waits for the job to run and its helper to listen (10 minutes,
+     asking every 2 s), saying how it stands.
+  3. *Connect*: the tunnel (`pitcrew_remote::Connector`) is started and must connect (3
+     minutes).
+  4. *Pair*: the hub's device token is read over SSH (`cat` of the file `pitcrewd token
+     show-path` names, between this call's random begin and end markers, so a login shell's
+     chatter around it does not count; at most 8 KiB) and checked by asking the hub
+     `GET /v1/workspace` with it. **The hub's answer is not trusted**: its workspace id is
+     claimed in the registry in one step that refuses an id already held by the local
+     workspace, or by a remote one on another machine (another host or root), with "already
+     added as <name>; remove it first"; only the same machine may be paired again (its entry is
+     replaced). Only then is the token kept in the keychain under that id (if that fails, the
+     claim is undone), and the workspace is `ready`. Its name is cleaned like a notification's
+     text and cut to 80 characters. (A local daemon that reports a remote workspace's id is
+     refused the same way: the local workspace is `unreachable`, saying so.)
+
+  If a step fails after this add started the helper (or submitted its job), it is stopped (or
+  cancelled) again, within 90 s; if that fails too, the error (and the add's last `detail`) says
+  so: "PitCrew's helper may still be running on <host>", or "job <id> may still be queued on
+  <host>; cancel it with scancel <id>". Errors: a refused plan or launch is `invalid`, a lost
+  connection, a cancelled prompt or a job that does not start in time `unreachable`.
+- **Cancel** (`gateway_remote_cancel`) stops the add carrying out that plan and undoes what it
+  started, as a failed step does; the add then fails with `unreachable` ("adding <host> was
+  cancelled"). Waiting stops at once (the upload, the SLURM job, the connection, the pairing);
+  starting the helper or submitting its job finishes first, so that what it started is known
+  and undone. A plan not used yet is dropped (its add then fails `invalid`); a finished add or
+  an unknown plan is left alone.
+- **Retry** (`gateway_workspace_retry`) starts a remote workspace's tunnel over now
+  (`Connector::retry()`), for instance after a sign-in was cancelled while reconnecting, which
+  leaves it `unreachable` until then; a tunnel that could not be made at start is made again.
+  It returns once the attempt has started; the state follows on `gateway://workspaces`.
+- **Remove** forgets a remote workspace and deletes its keychain entry, after stopping its
+  helper (`stopHelper: true`; for SLURM, cancelling its job). If the stop fails, nothing is
+  forgotten. The local workspace cannot be removed.
+- **Connections.** The registry keeps, for each remote workspace, its host, launcher, the
+  helper's root and platform, for SLURM the site, the job options and the last hop, and the
+  transport the tunnel found worth remembering (`Connector::transport()`), never a secret. Each
+  has a tunnel and a task following it: `ready` while connected (`needs_pairing` instead when its
+  token is no longer in the keychain); `connecting` while connecting or while the way does not
+  answer (the reason in `detail`); `unreachable` with the reason once the tunnel gave up for now
+  (it keeps trying as `pitcrew-remote` says, or at a retry). Requests and sockets go through
+  `Connector::connect()` with the token from the keychain, read for each connection. At start
+  the tunnels of saved workspaces are made again; at quit they close.
+- **Waking up.** Tauri tells the app nothing about sleep or network changes on the desktop, so a
+  5 s timer that fires 10 s or more late means the computer slept, and every tunnel is told to
+  check at once (`wake()`). The tunnel notices a jumped wall clock itself; this catches Windows,
+  whose monotonic clock runs during sleep. Network changes are not watched.
+- **Prompts** from every remote ssh call (the tunnel's reconnections included) go through
+  `pitcrew-askpass` to `gateway://prompt` `{ id, host, kind, text, fingerprint? }` in the main
+  window, and wait for `gateway_prompt_reply`. **The kind says who asks**: `passphrase`,
+  `host_key` and `confirm` are only ssh's own local questions; text the server wrote
+  (keyboard-interactive, which OpenSSH marks with a leading `(user@host)`) is always `password`
+  or `otp`, whatever its words say, so "Enter passphrase for key …" from a server is a
+  `password` prompt (the answer goes to that host). Kinds: `password`, `passphrase` and `otp` take
+  `answer`; `host_key` (with its `fingerprint`, the `SHA256:…` or `MD5:…` of the question) and
+  `confirm` (ssh's other yes/no questions, such as "Accept updated hostkeys?") take `accept`; a
+  `notice` ("touch your security key") takes no answer and is closed when ssh moves on. A reply
+  with neither cancels (ssh stops; a `confirm` is answered no). A reply of the wrong shape, or
+  an answer over 4 KiB, is `invalid` and the prompt stays open. `text` loses control, bidi and
+  invisible characters (line breaks kept) and is cut at 2000 characters. The answer goes to ssh
+  once, in a `Secret`, and is never logged or kept. Every prompt ends with
+  `gateway://prompt-closed { id }`: answered, or stale (ssh stopped waiting, the call ended).
+  **Prompts are held for the page**: one raised before the page listens (a reconnect at launch)
+  is emitted again, with the same id, when the main page first asks for the workspaces, and so
+  is every open prompt after a reload; the UI keys them by id.
+- **What the app ships for it** (stream P):
+  - `pitcrew-askpass` next to the app's executable (`pitcrew-askpass.exe` on Windows), or
+    `askpass` in the settings. Without it no remote command runs ssh: they fail with a clear
+    `internal` error. It is checked like `pitcrewd` (owner and mode on Unix).
+  - The helpers, in `helpers/` in the app's resources or next to its executable, or `helpers`
+    in the settings: `pitcrewd-x86_64-unknown-linux-musl`, `pitcrewd-aarch64-unknown-linux-musl`,
+    `pitcrewd-universal-apple-darwin` (`Platform::artefact()`), each checked like `pitcrewd` on
+    Unix. A missing helper is a clear `invalid` error at plan time.
+  - **Their checksums, compiled in** (ADR-0009): build the app with `PITCREW_HELPERS_MANIFEST`
+    set to `{ "version": "<pitcrewd --version's second word>", "sha256": { "<file>": "<hex>" } }`.
+    A **release build** trusts only those: without them, planning fails with `invalid` ("this
+    build has no helper checksums"), and a `manifest.json` beside the helpers is never read,
+    also when the settings name another helpers folder (the compiled checksums still apply).
+    Only a **debug build** without compiled checksums reads `manifest.json` there
+    (development).
+- **ssh** is `ssh` on `PATH`, as the person runs it; a configured `ssh` (settings or
+  `PITCREW_SSH`) is checked like `pitcrewd` (owner and mode on Unix) and refused otherwise, with
+  a clear `internal` error. It gets only `pitcrew-remote`'s minimal environment. The host must
+  be one ssh takes as a name (no leading `-`); a site recipe's name is `a-z 0-9 _ -`. Messages
+  and logged reasons pass through `redact` and lose control, bidi and invisible characters.
+
 ## The window, the CSP and the capability (`src/app.rs`, `tauri.conf.json`, `capabilities/`)
 
 - One window, `main`, created in code with its guards: navigation away from the app's origin
   (`tauri://localhost`, `http://tauri.localhost` on Windows, or the dev server in debug builds) is
   refused, new windows and downloads are denied, devtools exist only in debug builds. The
   single-instance plugin focuses it on a second launch (and hands over its deep link).
-- **The capability** (`capabilities/main.json`) gives `main` the five gateway commands and
+- **The capability** (`capabilities/main.json`) gives `main` the gateway's thirteen commands (the
+  five of workspaces, requests and sockets, and the eight of remote workspaces and prompts) and
   `core:event:allow-listen`/`allow-unlisten`, nothing else: no `core:default`, no shell, fs, http,
   opener or notification plugin, no emitting events. `build.rs` declares the commands in the
   app's ACL manifest, so no command runs without a capability naming it. The default `dynamic-acl`
   feature is off, so none can be added at run time. Tauri 2.12 cannot scope `listen` to one event
-  name; the app emits only `gateway://workspaces` and `gateway://navigate`, and the webview
-  cannot emit either. The tray, the notifications and the preferences add no command.
+  name; the app emits only `gateway://workspaces`, `gateway://navigate`, `gateway://prompt` and
+  `gateway://prompt-closed`, to the main window, and the webview cannot emit any. The tray, the
+  notifications and the preferences add no command.
 - **The CSP:**
 
   | Directive | Value | Why |
@@ -261,11 +389,14 @@ invoke('gateway_socket_close', { socket, code, reason })
 - `workspaces.json` in the app's **local** data directory (never a roaming one), written
   atomically (a new private file, mode 600 on Unix, renamed over the old) with
   `{ "version": 1, "workspaces": [{ "id", "name", "kind", "connection": { "type": "local" } }] }`.
-  States live in memory; every change emits `gateway://workspaces` with the whole list. On first
-  start the list is empty until the local daemon answers `GET /v1/workspace`. An unreadable file
-  is moved aside to `workspaces.json.invalid`.
+  A remote workspace's connection is `{ "type": "remote", "host", "launcher", "root",
+  "platform", "site"?, "job"?, "lastHop"?, "transport"? }`. States live in memory; every change
+  emits `gateway://workspaces` with the whole list. On first start the list is empty until the
+  local daemon answers `GET /v1/workspace`. An unreadable file is moved aside to
+  `workspaces.json.invalid`.
 - `keychain::TokenStore` with `OsKeychain` (`keyring`: Keychain Services, Credential Manager, the
-  Secret Service over zbus) and `MemoryStore`. Only tests use it so far; remote pairing will.
+  Secret Service over zbus) and `MemoryStore` (tests). Remote workspaces' tokens live there,
+  under the workspace's id (service `org.pitcrew.desktop`).
 
 ## Tests
 
@@ -279,6 +410,7 @@ invoke('gateway_socket_close', { socket, code, reason })
 | `attention.rs` | "Needs you" against the fake daemon's live stream: the snapshot (only the person's open asks), raised and answered, other members' asks and other events ignored, resuming with `since` without a snapshot, the bound and the snapshot it asks for, a new event log, one watcher per ready workspace, a reconnect at once when the workspace is ready again, a snapshot that keeps failing retried 50, 100, 200, then 400 ms apart (the cap) and from the first wait again once it works, and too many asks read as "N+" with no hot retry. |
 | `no_token.rs` | Every command, channel message, event, error and log line (at trace, Tauri's and tungstenite's records included) is searched for a known token; the fake daemon even echoes it in response headers, and fake `pitcrewd`s print it on stderr and in the ready line; the "needs you" subscription (snapshot, live ask, reconnect), the notifications and tray lines it leads to, the navigation events, and a dropped deep link carrying the token are searched too; a canary record proves the log bridge works. |
 | `supervisor.rs` | Fake `pitcrewd` scripts: start and SIGTERM on quit; quitting while it starts and while `token show-path` runs; a growing backoff; giving up; never ready; no `pitcrewd`; a running daemon used, its workspace registered, and never stopped; starting our own when that one goes away. |
+| `remote.rs` | Remote workspaces through the IPC, against a fake machine (`remote/fake.rs`: this computer's `/bin/sh` in a temporary home behind a fake `ssh` that plays links, ControlMasters, forwards and sessions, and asks through askpass) whose helper is the **real `pitcrewd --demo`**. Direct: probe (with `tmux` when there is one), plan and add on a machine whose start-up files print banners and a false token marker, the workspace `ready`, `gateway_request` and a socket reaching the hub through the forwarded socket, the transport saved, the token the hub's own, the helper seen running, remove stopping it and deleting the keychain entry, a plan used once, and another window refused by Tauri's ACL for all eight remote commands (with a real prompt open and a real workspace, which stay so). SLURM (stand-in `sbatch`, `squeue`, `scancel`, `sinfo`): the plan's exact script submitted byte for byte though the site recipe changed after planning, a job that stays pending cancelled again, bad job options and sites refused. Prompts: a host key and a password answered in the app, a server's keyboard-interactive `Enter passphrase for key '~/.ssh/id_ed25519':` asked as a `password`, an answer over 4 KiB and a reply of the wrong shape refused with the prompt still open, then a cancelled password failing the add cleanly (nothing deployed or registered, no empty password sent, every prompt withdrawn). Takeover: a hub reporting the id of a remote on another machine, or of the local workspace, refused with that workspace and its token untouched, the helper stopped again, and a stop that fails named in the error. A restart: the saved remote `ready` again; a sign-in its reconnect asks for before the page listens held and emitted again (same id) at the page's first `gateway_workspaces`, once; `needs_pairing` once its token is gone. Cancel: an add cancelled while its SLURM job is pending (the job cancelled) and while its connection does not come (the helper stopped), nothing registered; a plan cancelled before its add is dropped; a finished add or unknown plan left alone. A sign-in cancelled while reconnecting, then `gateway_workspace_retry` back to `ready`. An expired plan, a missing helper, a missing `pitcrew-askpass` and a refused configured `ssh`. No token in any result, channel message, event or log line, after an add and after a refused pairing. Its own `main` (`harness = false`): the binary is also the fake `ssh` and `pitcrew-askpass`. `pitcrewd` is `PITCREW_TEST_PITCREWD`, else built once from the root workspace into the target's temporary folder. |
 
 Unit tests cover the rest: the deep-link parser as a table of hostile links, and a held target's
 60 s (`navigate.rs`); the tracker (`attention/tracker.rs`); the text, the rate limiter and the
@@ -286,6 +418,17 @@ pacing, one look at the window per frame (`notify/mod.rs`); the D-Bus notifier a
 notification service over a private connection, clicks and closes included (`notify/linux.rs`);
 the tray's lines; closing into the tray (`shell.rs`); the preferences; who registers the scheme,
 the Linux handler and `mimeapps.list`: a foreign `APPIMAGE`, a debug build without the opt-in, a
-foreign and a dangling default, a linked and an oversized file, the mode kept (`scheme.rs`).
+foreign and a dangling default, a linked and an oversized file, the mode kept (`scheme.rs`); a
+configured `ssh` others can write refused (`app.rs`); the prompt hub (a password round trip,
+cancel, stale prompts withdrawn and replayed, host keys and their fingerprints, server text never
+a passphrase or a host key, each kind's own reply shape, the 4 KiB cap, text cleaning;
+`remote/prompt.rs`), plans used once, expired and pushed out, site names and job options checked
+(`remote/plan.rs`), helpers by platform, their hash and owner checks, a release build trusting
+only compiled checksums, and askpass
+(`remote/helpers.rs`), the tunnel's states as workspace states, `needs_pairing` without a token
+(`remote/link.rs`), the error codes and progress shape, the token read between its markers, a
+hub's name cleaned and cut, a failed undo in the error (`remote/mod.rs`), and remote records
+saved, reloaded, given their transport and removed, a remote refused another workspace's id and
+the local daemon refused a remote's (`registry.rs`).
 
 The OS keychain test is `#[ignore]`d: it needs an unlocked keychain (`cargo test -- --ignored`).

@@ -16,6 +16,9 @@
 //! - **A runner that cannot start** (its index cannot be opened or is locked, a thread cannot
 //!   start) does not stop the hub: `serve` warns with the reason and the folder, and serves
 //!   without it, as with no machine or no person.
+//! - **When.** With the daemon, when the workspace has a person and a local machine; otherwise
+//!   once it is set up (`crate::setup`), without a restart. The routes reach it through
+//!   [`Attached`], which is empty until then.
 
 use crate::agents::HubAgents;
 use crate::cli::HomeArg;
@@ -23,6 +26,7 @@ use crate::state::StateDir;
 use crate::terminals::NoRuntime;
 use crate::transcripts::{Found, Recorded};
 use anyhow::{Context as _, bail};
+use pitcrew_api::{HookEvent, HookSink, LogHookSink};
 use pitcrew_hub_work::WorkService;
 use pitcrew_ingest::claude::ClaudeAdapter;
 use pitcrew_ingest::codex::CodexAdapter;
@@ -35,8 +39,63 @@ use pitcrew_runner::{
 };
 use pitcrew_store::Store;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+/// What the routes use of a running runner.
+#[derive(Clone, Debug)]
+pub struct Parts {
+    /// The machine it runs on.
+    pub machine: MachineId,
+    /// The API's hook sink.
+    pub hooks: RunnerHooks,
+    /// The runner's terminals, over [`NoRuntime`] until `crates/runtime` has a runtime.
+    pub terminals: RunnerTerminals,
+    /// The transcripts its discoveries found.
+    pub found: Arc<Found>,
+    /// Whether it watches at least one home (`GET /v1/host/info`'s `watch` capability).
+    pub watches: bool,
+}
+
+/// The runner the routes reach, once there is one: set once, when it starts (with the daemon, or
+/// once the workspace is set up), and never unset. Empty, the hub serves as with `--no-runner`.
+#[derive(Debug, Default)]
+pub struct Attached(OnceLock<Parts>);
+
+impl Attached {
+    /// One that already has `parts`.
+    #[cfg(test)]
+    pub fn with(parts: Parts) -> Self {
+        let attached = Self::default();
+        attached.set(parts);
+        attached
+    }
+
+    /// The runner's parts, if it runs.
+    pub fn get(&self) -> Option<&Parts> {
+        self.0.get()
+    }
+
+    /// Attaches the runner. A second runner is not attached (there is one per process).
+    pub fn set(&self, parts: Parts) {
+        if self.0.set(parts).is_err() {
+            tracing::warn!("a second runner was not attached");
+        }
+    }
+}
+
+/// The API's hook sink: the runner's once it runs; before that hooks are only logged (debug).
+#[derive(Debug)]
+pub struct Hooks(pub Arc<Attached>);
+
+impl HookSink for Hooks {
+    fn deliver(&self, event: HookEvent) {
+        match self.0.get() {
+            Some(runner) => runner.hooks.deliver(event),
+            None => LogHookSink.deliver(event),
+        }
+    }
+}
 
 /// The runner, running. Stop it with [`Runner::stop`]; dropped without that (a start that
 /// fails after the runner started), it is stopped on a thread of its own, so the drop never
@@ -45,38 +104,48 @@ use std::time::Duration;
 pub struct Runner {
     /// `None` once stopping.
     handle: Option<RunnerHandle>,
-    hooks: RunnerHooks,
-    terminals: RunnerTerminals,
-    machine: MachineId,
-    found: Arc<Found>,
-    /// Whether it watches at least one home.
-    watches: bool,
+    parts: Parts,
 }
 
 impl Runner {
-    /// The API's hook sink.
-    pub fn hooks(&self) -> RunnerHooks {
-        self.hooks.clone()
+    /// What the routes use of it.
+    pub fn parts(&self) -> Parts {
+        self.parts.clone()
     }
 
-    /// The runner's terminals, over [`NoRuntime`] until `crates/runtime` has a runtime.
-    pub fn terminals(&self) -> RunnerTerminals {
-        self.terminals.clone()
-    }
+    /// A real runner that watches no home and keeps what it reports nowhere, its index in
+    /// `dir`.
+    #[cfg(test)]
+    pub fn idle(dir: &std::path::Path) -> Self {
+        use pitcrew_protocol::events::Event;
+        use pitcrew_protocol::ids::WorkspaceId;
+        use pitcrew_runner::{EventSink, SinkError};
 
-    /// The machine it runs on.
-    pub fn machine(&self) -> MachineId {
-        self.machine
-    }
+        #[derive(Debug)]
+        struct Nowhere;
+        impl EventSink for Nowhere {
+            fn accept(&self, _events: &[Event]) -> Result<(), SinkError> {
+                Ok(())
+            }
+        }
 
-    /// The transcripts its discoveries found.
-    pub fn found(&self) -> Arc<Found> {
-        Arc::clone(&self.found)
-    }
-
-    /// Whether it watches at least one home (`GET /v1/host/info`'s `watch` capability).
-    pub fn watches(&self) -> bool {
-        self.watches
+        let machine = MachineId::new();
+        let config = RunnerConfig::new(WorkspaceId::new(), machine, MemberId::new(), dir);
+        let handle = pitcrew_runner::start(config, Vec::new(), Arc::new(Nowhere))
+            .expect("an idle runner starts");
+        let terminals = handle
+            .terminals(Arc::new(NoRuntime))
+            .expect("its terminals start");
+        Self {
+            parts: Parts {
+                machine,
+                hooks: handle.hooks(),
+                terminals,
+                found: Arc::new(Found::default()),
+                watches: false,
+            },
+            handle: Some(handle),
+        }
     }
 
     /// Stops the watcher and waits for it, at most `within`: what it already read is still handed
@@ -169,12 +238,16 @@ pub fn start(
 ) -> anyhow::Result<Option<Runner>> {
     let Some(machine) = machine else {
         tracing::warn!(
-            "the runner is off: the workspace has no local machine yet for its sessions to run on"
+            "the runner is off: the workspace has no local machine yet for its sessions to run \
+             on; it starts once the workspace is set up"
         );
         return Ok(None);
     };
     let Some(owner) = person(work)? else {
-        tracing::warn!("the runner is off: the workspace has no person yet to own what it reports");
+        tracing::warn!(
+            "the runner is off: the workspace has no person yet to own what it reports; it \
+             starts once the workspace is set up"
+        );
         return Ok(None);
     };
     let log = store.log_id();
@@ -221,17 +294,20 @@ pub fn start(
         tracing::info!(%machine, "the runner watches no home (--demo without --homes)");
     }
     Ok(Some(Runner {
-        hooks: handle.hooks(),
+        parts: Parts {
+            machine,
+            hooks: handle.hooks(),
+            terminals,
+            found,
+            watches,
+        },
         handle: Some(handle),
-        terminals,
-        machine,
-        found,
-        watches,
     }))
 }
 
-/// The workspace's first person: they own this desktop, and author what the runner reports.
-fn person(work: &WorkService) -> anyhow::Result<Option<MemberId>> {
+/// The workspace's first person: they own this desktop, author what the runner reports, and own
+/// the back office's member. `None` before the workspace is set up.
+pub fn person(work: &WorkService) -> anyhow::Result<Option<MemberId>> {
     Ok(work
         .members()
         .context("cannot list the members")?

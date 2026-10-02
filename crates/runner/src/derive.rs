@@ -36,6 +36,29 @@ pub(crate) struct Facts {
     /// Links emitted so far; they make the ids of link events unique.
     #[serde(default)]
     pub links: u32,
+    /// The parent its hooks are judged by, once looked up: for a sub-agent, the one its
+    /// `session_discovered` named, so a restart does not derive another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Parent>,
+}
+
+/// A session's parent, as the runner found it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Parent {
+    /// Not a sub-agent, or a sub-agent whose transcript names no parent the runner follows.
+    None,
+    /// The parent's session.
+    Session(SessionId),
+}
+
+impl Parent {
+    pub fn session(self) -> Option<SessionId> {
+        match self {
+            Self::None => None,
+            Self::Session(s) => Some(s),
+        }
+    }
 }
 
 impl Default for Facts {
@@ -49,6 +72,7 @@ impl Default for Facts {
             reports: 0,
             linked: None,
             links: 0,
+            parent: None,
         }
     }
 }

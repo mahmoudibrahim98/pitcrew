@@ -1188,3 +1188,100 @@ fn the_fixture_has_an_active_dispatch_and_an_office_agent() {
     assert_eq!(office_member.kind, MemberKind::Agent);
     assert_eq!(office_member.owner, Some(member(SAM)));
 }
+
+/// A store with only `members`, each added by itself, for `ensure_office_member`.
+fn hub_of(dir: &Path, members: &[Member]) -> Arc<WorkService> {
+    let store = common::open(&dir.join("hub.db"));
+    let workspace = demo().workspace;
+    let events: Vec<Event> = members
+        .iter()
+        .map(|m| Event {
+            id: EventId::new(),
+            at: 1_790_800_000_000,
+            workspace: workspace.id,
+            author: m.id,
+            on_behalf_of: None,
+            body: EventBody::MemberAdded { member: m.clone() },
+        })
+        .collect();
+    if !events.is_empty() {
+        store.append(&events).expect("append");
+    }
+    Arc::new(WorkService::new(store, workspace))
+}
+
+fn named(kind: MemberKind, handle: &str, owner: Option<MemberId>) -> Member {
+    Member {
+        id: MemberId::new(),
+        kind,
+        handle: handle.to_owned(),
+        name: handle.trim_start_matches('@').to_owned(),
+        owner,
+        persona: None,
+    }
+}
+
+/// `@office` is found when it is an agent of the person, else added once, by the person, through
+/// the writer; a person, another person's agent or no one's agent holding it is a conflict.
+#[test]
+fn the_office_member_is_found_or_added_once() {
+    use pitcrew_hub_work::{OFFICE_HANDLE, OFFICE_NAME};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let lee = named(MemberKind::Human, "@lee", None);
+    let work = hub_of(dir.path(), std::slice::from_ref(&lee));
+    let before = work.store().latest_rev().expect("rev");
+    let office = work.ensure_office_member(lee.id).expect("added");
+    assert_eq!(office.kind, MemberKind::Agent);
+    assert_eq!(office.handle, OFFICE_HANDLE);
+    assert_eq!(office.name, OFFICE_NAME);
+    assert_eq!(office.owner, Some(lee.id));
+    let added = events_since(&work, before);
+    assert_eq!(added.len(), 1, "{added:?}");
+    assert_eq!(added[0].author, lee.id);
+    assert_eq!(added[0].on_behalf_of, None);
+    assert!(matches!(&added[0].body, EventBody::MemberAdded { member } if *member == office));
+    assert_eq!(work.member(&office.id).expect("member"), office);
+    // Found the next time, and nothing is appended.
+    let rev = work.store().latest_rev().expect("rev");
+    assert_eq!(work.ensure_office_member(lee.id).expect("found"), office);
+    assert_eq!(work.store().latest_rev().expect("rev"), rev);
+    // Only a person owns it.
+    assert_eq!(
+        code(work.ensure_office_member(office.id)),
+        ErrorCode::Invalid
+    );
+    assert_eq!(
+        code(work.ensure_office_member(MemberId::new())),
+        ErrorCode::Invalid
+    );
+    // The demo's own @office is the demo person's agent: found.
+    let seeded = tempfile::tempdir().expect("tempdir");
+    let demo_hub = common::seeded(seeded.path());
+    let rev = demo_hub.store().latest_rev().expect("rev");
+    assert_eq!(
+        demo_hub
+            .ensure_office_member(member(SAM))
+            .expect("found")
+            .id,
+        member(OFFICE)
+    );
+    assert_eq!(demo_hub.store().latest_rev().expect("rev"), rev);
+
+    // Held by a person, another person's agent, or no one's agent: a conflict, nothing appended.
+    let kim = named(MemberKind::Human, "@kim", None);
+    for holder in [
+        named(MemberKind::Human, OFFICE_HANDLE, None),
+        named(MemberKind::Agent, OFFICE_HANDLE, Some(kim.id)),
+        named(MemberKind::Agent, OFFICE_HANDLE, None),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let work = hub_of(dir.path(), &[lee.clone(), kim.clone(), holder.clone()]);
+        let rev = work.store().latest_rev().expect("rev");
+        assert_eq!(
+            code(work.ensure_office_member(lee.id)),
+            ErrorCode::Conflict,
+            "{holder:?}"
+        );
+        assert_eq!(work.store().latest_rev().expect("rev"), rev);
+    }
+}

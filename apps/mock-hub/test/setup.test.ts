@@ -108,6 +108,17 @@ describe('POST /v1/setup', () => {
         { ...SETUP, workspace_name: 'Lab\u0007' },
         { ...SETUP, person: { name: 'Sam\u0007', handle: '@sam' } },
         { ...SETUP, machine_name: 'Laptop\u0007' },
+        // Nothing but whitespace is empty once trimmed.
+        { ...SETUP, workspace_name: ' \t\n ' },
+        { ...SETUP, person: { name: ' 　', handle: '@sam' } },
+        { ...SETUP, machine_name: '  ' },
+        // Counted after trimming: still too long.
+        { ...SETUP, workspace_name: ` ${long(81)} ` },
+        // The handle is not trimmed.
+        { ...SETUP, person: { name: 'Sam', handle: ' @sam' } },
+        { ...SETUP, person: { name: 'Sam', handle: '@sam ' } },
+        // U+0085 at an end is a control character, which trimming keeps: refused.
+        { ...SETUP, workspace_name: 'Lab\u0085' },
       ];
       for (const json of cases) {
         refused(await call(server, 'POST', '/v1/setup', { token: DEVICE, json }), 400, JSON.stringify(json));
@@ -148,6 +159,27 @@ describe('POST /v1/setup', () => {
       assert.deepEqual(machines.body, [machine]);
     }));
 
+  it('trims the three names, counts them after trimming, and stores them trimmed', () =>
+    fresh(async (server) => {
+      const padded = {
+        workspace_name: `  ${'x'.repeat(80)}\t`,
+        person: { name: '　Sam Rivera\n', handle: '@sam' },
+        machine_name: ' This  laptop ',
+      };
+      const res = await call<SetupDone>(server, 'POST', '/v1/setup', { token: DEVICE, json: padded });
+      assert.equal(res.status, 200);
+      assert.equal(res.body.workspace.name, 'x'.repeat(80));
+      assert.equal(res.body.me.name, 'Sam Rivera');
+      assert.equal(res.body.machine.name, 'This  laptop', 'whitespace inside a name stays');
+
+      const workspace = await call<WorkspaceReply>(server, 'GET', '/v1/workspace', { token: DEVICE });
+      assert.equal(workspace.body.workspace.name, 'x'.repeat(80));
+      const me = await call<Member>(server, 'GET', '/v1/me', { token: DEVICE });
+      assert.equal(me.body.name, 'Sam Rivera');
+      const machines = await call<Machine[]>(server, 'GET', '/v1/machines', { token: DEVICE });
+      assert.equal(machines.body[0]?.name, 'This  laptop');
+    }));
+
   it('answers 409 once set up, and never creates a second person', () =>
     fresh(async (server) => {
       const first = await call<SetupDone>(server, 'POST', '/v1/setup', { token: DEVICE, json: SETUP });
@@ -164,15 +196,42 @@ describe('POST /v1/setup', () => {
 
   it('answers 409 on a handle clash, even before a person exists', () =>
     fresh(async (server) => {
-      // As if an agent such as @office had been configured before anyone set the workspace up.
-      server.hub.members.push({ id: '01JB000000000000000MEM0099', kind: 'agent', handle: '@office', name: 'Office' });
+      // As if an agent had been configured before anyone set the workspace up.
+      server.hub.members.push({ id: '01JB000000000000000MEM0099', kind: 'agent', handle: '@helper', name: 'Helper' });
       const res = await call(server, 'POST', '/v1/setup', {
         token: DEVICE,
-        json: { ...SETUP, person: { name: 'Sam Rivera', handle: '@office' } },
+        json: { ...SETUP, person: { name: 'Sam Rivera', handle: '@helper' } },
       });
       refused(res, 409, 'handle taken');
       const workspace = await call<WorkspaceReply>(server, 'GET', '/v1/workspace', { token: DEVICE });
       assert.equal(workspace.body.setup_needed, true, 'the clash must not have set the workspace up');
+    }));
+
+  it('reserves @office for the back office, though no member holds it', () =>
+    fresh(async (server) => {
+      assert.equal(server.hub.members.length, 0);
+      const office = { name: 'Sam Rivera', handle: '@office' };
+      const res = await call<ApiError>(server, 'POST', '/v1/setup', {
+        token: DEVICE,
+        json: { ...SETUP, person: office },
+      });
+      refused(res, 409, 'reserved handle');
+      assert.match(res.body.message, /reserved/);
+      // A 400 still comes first.
+      refused(
+        await call(server, 'POST', '/v1/setup', {
+          token: DEVICE,
+          json: { ...SETUP, person: office, machine_name: 'x'.repeat(61) },
+        }),
+        400,
+        'reserved handle and a machine name too long',
+      );
+      const workspace = await call<WorkspaceReply>(server, 'GET', '/v1/workspace', { token: DEVICE });
+      assert.equal(workspace.body.setup_needed, true, 'the reserved handle must not have set the workspace up');
+      assert.equal(workspace.body.rev, 0);
+      // Any other handle still sets it up.
+      const done = await call<SetupDone>(server, 'POST', '/v1/setup', { token: DEVICE, json: SETUP });
+      assert.equal(done.status, 200);
     }));
 
   it('appends member_added then machine_added, which a connected stream sees live', () =>

@@ -8,9 +8,13 @@
 //!   `gateway://workspaces` in the app.
 //! - On first start the list is empty until the local daemon answers `GET /v1/workspace`; then
 //!   the local workspace is registered with its id and name.
-//! - Remote workspaces come with pairing: `kind` and [`Connection`] leave room for them.
+//! - A remote workspace ([`Connection::Remote`]) keeps how to reach its machine: the host, the
+//!   launcher, the helper's root and platform, for SLURM the site recipe, the job options and the
+//!   last hop, and the transport the tunnel found worth remembering. No secret: its device token
+//!   is in the OS keychain ([`crate::keychain`]).
 
 use crate::gateway::{Connector, GatewayError};
+use pitcrew_remote::Transport;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io::{self, Write as _};
@@ -30,7 +34,7 @@ const MAX_FILE: u64 = 4 * 1024 * 1024;
 pub enum WorkspaceKind {
     /// On this machine.
     Local,
-    /// Elsewhere, through an SSH tunnel (later).
+    /// On another machine, through an SSH tunnel.
     Remote,
 }
 
@@ -41,8 +45,97 @@ pub enum Connection {
     /// The person's own `pitcrewd` on this machine, over its private socket or pipe, with the
     /// token from the file `pitcrewd token show-path` names.
     Local,
-    // Remote workspaces (an SSH tunnel to the daemon's socket, a token in the keychain) are added
-    // here with pairing.
+    /// A helper on another machine, through the tunnel of `pitcrew-remote`, with the token kept
+    /// in the OS keychain.
+    Remote(Box<RemoteConnection>),
+}
+
+/// How a remote workspace's helper was started, and so how it is found, checked and stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LauncherKind {
+    /// In the background (`setsid nohup`).
+    Direct,
+    /// In its own tmux session.
+    Tmux,
+    /// As a SLURM batch job on a compute node.
+    Slurm,
+}
+
+impl LauncherKind {
+    /// Its name, as the contract and `endpoint.json` write it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Tmux => "tmux",
+            Self::Slurm => "slurm",
+        }
+    }
+}
+
+/// How the login node reaches a SLURM job's compute node (a site recipe's `last_hop`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HopKind {
+    /// `ssh <node>` from the login node.
+    #[default]
+    Ssh,
+    /// `srun --jobid <id> --overlap` from the login node.
+    Srun,
+}
+
+/// The job options the person asked for (the contract's `RemotePlanRequest.job`), as asked.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobRequest {
+    /// `--partition`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition: Option<String>,
+    /// `--account`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// `--qos`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qos: Option<String>,
+    /// `--time`, as SLURM writes it (`08:00:00`, `2-00:00:00`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<String>,
+    /// `--cpus-per-task`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<u32>,
+    /// `--mem`, e.g. `8G`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
+    /// GPUs for `--gres`: a count (`2`), or a type and count (`a100:2`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpus: Option<String>,
+}
+
+/// How to reach a remote workspace's helper. Nothing here is a secret.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteConnection {
+    /// The host, as given to ssh (a `Host` of the person's ssh config, or a name they typed).
+    pub host: String,
+    /// How the helper was started.
+    pub launcher: LauncherKind,
+    /// Where PitCrew lives on the machine (`~/.pitcrew`, absolute).
+    pub root: String,
+    /// The machine's platform, as `pitcrew_remote::Platform::target` names it.
+    pub platform: String,
+    /// The SLURM site recipe the job was made from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site: Option<String>,
+    /// The SLURM job options the person asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<JobRequest>,
+    /// How the login node reaches the job's node (SLURM).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_hop: Option<HopKind>,
+    /// The transport worth remembering for this machine (`pitcrew_remote::Connector::transport`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<Transport>,
 }
 
 /// A workspace as saved.
@@ -99,6 +192,30 @@ struct Entry {
     state: WorkspaceState,
     detail: Option<String>,
     connector: Option<Arc<dyn Connector>>,
+}
+
+/// Why [`Registry::claim_remote`] refused an id: another workspace holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Taken {
+    /// The name it is held under.
+    pub name: String,
+    /// Whether that is the local workspace.
+    pub local: bool,
+}
+
+/// What [`Registry::claim_remote`] did, to undo it ([`Registry::unclaim`]).
+pub struct Claimed {
+    id: String,
+    previous: Option<Entry>,
+}
+
+impl fmt::Debug for Claimed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Claimed")
+            .field("id", &self.id)
+            .field("replaced", &self.previous.is_some())
+            .finish()
+    }
 }
 
 type Listener = Arc<dyn Fn(&[GatewayWorkspace]) + Send + Sync>;
@@ -228,11 +345,39 @@ impl Registry {
     /// registered one, and marks it ready. There is one local workspace: if the daemon now reports
     /// another id (its state was reset), the entry takes the new id.
     ///
+    /// An id a remote workspace holds is refused: the local workspace (or, on first start, the
+    /// local daemon's state) is `unreachable`, saying so, and nothing is replaced.
+    ///
     /// # Errors
     /// The registry file cannot be written. The registry in memory is updated anyway.
     pub fn set_local(&self, id: &str, name: &str) -> io::Result<()> {
         let mut inner = self.lock();
         let before = list_of(&inner.entries);
+        if let Some(remote) = inner
+            .entries
+            .iter()
+            .find(|e| e.record.id == id && e.record.kind != WorkspaceKind::Local)
+        {
+            let detail = format!(
+                "this computer's hub reports the id of the remote workspace {}; remove that one \
+                 first",
+                crate::gateway::error::shorten(&remote.record.name)
+            );
+            tracing::warn!(workspace = %id, "the local daemon reports the id of a remote workspace; not registering it");
+            let mut found = false;
+            for entry in &mut inner.entries {
+                if entry.record.kind == WorkspaceKind::Local {
+                    entry.state = WorkspaceState::Unreachable;
+                    entry.detail = Some(detail.clone());
+                    found = true;
+                }
+            }
+            if !found {
+                inner.local_state = Some((WorkspaceState::Unreachable, Some(detail)));
+            }
+            self.changed(inner, &before);
+            return Ok(());
+        }
         let connector = inner.local.clone();
         inner.local_state = None;
         let record = WorkspaceRecord {
@@ -333,6 +478,85 @@ impl Registry {
         saved
     }
 
+    /// Registers remote workspace `record` (a [`Connection::Remote`]) with its connector, in
+    /// `state`, unless its id is another workspace's: the check and the insert are one step.
+    ///
+    /// The id comes from the remote hub (`GET /v1/workspace`), so it is not trusted: a hub may
+    /// claim the id of a workspace already here. That is refused when the id is the local
+    /// workspace's, or a remote one's on another machine (another host or root). Only the same
+    /// machine may take its id again (pairing it again), and then its entry is replaced.
+    ///
+    /// # Errors
+    /// [`Taken`], with the name the id is held under; nothing changed.
+    pub fn claim_remote(
+        &self,
+        record: WorkspaceRecord,
+        connector: Arc<dyn Connector>,
+        state: WorkspaceState,
+    ) -> Result<Claimed, Taken> {
+        let Connection::Remote(new) = &record.connection else {
+            return Err(Taken {
+                name: record.name.clone(),
+                local: true,
+            });
+        };
+        let mut inner = self.lock();
+        let before = list_of(&inner.entries);
+        let held = inner.entries.iter().position(|e| e.record.id == record.id);
+        if let Some(at) = held {
+            let old = &inner.entries[at].record;
+            let same_machine = match &old.connection {
+                Connection::Remote(old) => old.host == new.host && old.root == new.root,
+                Connection::Local => false,
+            };
+            if old.kind == WorkspaceKind::Local || !same_machine {
+                return Err(Taken {
+                    name: old.name.clone(),
+                    local: old.kind == WorkspaceKind::Local,
+                });
+            }
+        }
+        let id = record.id.clone();
+        let entry = Entry {
+            record,
+            state,
+            detail: None,
+            connector: Some(connector),
+        };
+        let previous = match held {
+            Some(at) => Some(std::mem::replace(&mut inner.entries[at], entry)),
+            None => {
+                inner.entries.push(entry);
+                None
+            }
+        };
+        if let Err(e) = self.save(&inner.entries) {
+            tracing::warn!(workspace = %id, error = %e, "the workspace is added but the registry is not saved");
+        }
+        self.changed(inner, &before);
+        Ok(Claimed { id, previous })
+    }
+
+    /// Undoes [`Registry::claim_remote`]: the entry it replaced comes back, or the one it added
+    /// goes.
+    pub fn unclaim(&self, claimed: Claimed) {
+        let mut inner = self.lock();
+        let before = list_of(&inner.entries);
+        let at = inner.entries.iter().position(|e| e.record.id == claimed.id);
+        match (at, claimed.previous) {
+            (Some(at), Some(previous)) => inner.entries[at] = previous,
+            (Some(at), None) => {
+                inner.entries.remove(at);
+            }
+            (None, Some(previous)) => inner.entries.push(previous),
+            (None, None) => {}
+        }
+        if let Err(e) = self.save(&inner.entries) {
+            tracing::warn!(workspace = %claimed.id, error = %e, "cannot save the workspace registry");
+        }
+        self.changed(inner, &before);
+    }
+
     /// Sets a workspace's state.
     pub fn set_state(&self, id: &str, state: WorkspaceState, detail: Option<String>) {
         let mut inner = self.lock();
@@ -342,6 +566,73 @@ impl Registry {
             entry.detail = detail;
         }
         self.changed(inner, &before);
+    }
+
+    /// Workspace `id` as saved.
+    #[must_use]
+    pub fn record(&self, id: &str) -> Option<WorkspaceRecord> {
+        self.lock()
+            .entries
+            .iter()
+            .find(|e| e.record.id == id)
+            .map(|e| e.record.clone())
+    }
+
+    /// Every workspace as saved, in order.
+    #[must_use]
+    pub fn records(&self) -> Vec<WorkspaceRecord> {
+        self.lock()
+            .entries
+            .iter()
+            .map(|e| e.record.clone())
+            .collect()
+    }
+
+    /// Gives workspace `id` its connector (a remote workspace loaded from the file).
+    pub fn attach(&self, id: &str, connector: Arc<dyn Connector>) {
+        if let Some(entry) = self.lock().entries.iter_mut().find(|e| e.record.id == id) {
+            entry.connector = Some(connector);
+        }
+    }
+
+    /// Forgets workspace `id`, and returns what was saved for it.
+    ///
+    /// # Errors
+    /// The registry file cannot be written. The workspace is gone from memory anyway.
+    pub fn remove(&self, id: &str) -> io::Result<Option<WorkspaceRecord>> {
+        let mut inner = self.lock();
+        let before = list_of(&inner.entries);
+        let Some(at) = inner.entries.iter().position(|e| e.record.id == id) else {
+            return Ok(None);
+        };
+        let entry = inner.entries.remove(at);
+        let saved = self.save(&inner.entries);
+        self.changed(inner, &before);
+        saved.map(|()| Some(entry.record))
+    }
+
+    /// Remembers the transport the tunnel found for remote workspace `id`, if it changed.
+    ///
+    /// # Errors
+    /// The registry file cannot be written.
+    pub fn set_transport(&self, id: &str, transport: Transport) -> io::Result<()> {
+        let mut inner = self.lock();
+        let changed = inner
+            .entries
+            .iter_mut()
+            .find(|e| e.record.id == id)
+            .is_some_and(|entry| match &mut entry.record.connection {
+                Connection::Remote(remote) if remote.transport != Some(transport) => {
+                    remote.transport = Some(transport);
+                    true
+                }
+                _ => false,
+            });
+        if changed {
+            self.save(&inner.entries)
+        } else {
+            Ok(())
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -573,6 +864,195 @@ mod tests {
         );
         registry.set_state("R", WorkspaceState::Ready, None);
         assert!(registry.connector("R").is_ok());
+    }
+
+    fn remote(id: &str) -> WorkspaceRecord {
+        WorkspaceRecord {
+            id: id.into(),
+            name: "Cluster".into(),
+            kind: WorkspaceKind::Remote,
+            connection: Connection::Remote(Box::new(RemoteConnection {
+                host: "hpc-login".into(),
+                launcher: LauncherKind::Slurm,
+                root: "/home/sam/.pitcrew".into(),
+                platform: "x86_64-unknown-linux-musl".into(),
+                site: Some("generic".into()),
+                job: Some(JobRequest {
+                    partition: Some("gpu".into()),
+                    time: Some("08:00:00".into()),
+                    ..JobRequest::default()
+                }),
+                last_hop: Some(HopKind::Srun),
+                transport: None,
+            })),
+        }
+    }
+
+    #[test]
+    fn remote_workspaces_are_saved_reloaded_and_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join(FILE_NAME);
+        let registry = Registry::load(file.clone());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&events);
+        registry.on_change(move |list| seen.lock().unwrap().push(list.to_vec()));
+        registry
+            .insert(
+                remote("01JR"),
+                Some(Arc::new(Nowhere)),
+                WorkspaceState::Ready,
+            )
+            .unwrap();
+        let text = std::fs::read_to_string(&file).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            saved["workspaces"][0]["connection"],
+            serde_json::json!({
+                "type": "remote", "host": "hpc-login", "launcher": "slurm",
+                "root": "/home/sam/.pitcrew", "platform": "x86_64-unknown-linux-musl",
+                "site": "generic", "job": { "partition": "gpu", "time": "08:00:00" },
+                "lastHop": "srun"
+            })
+        );
+
+        // The transport is remembered once, and saved.
+        registry.set_transport("01JR", Transport::Stdio).unwrap();
+        registry.set_transport("01JR", Transport::Stdio).unwrap();
+        let reloaded = Registry::load(file.clone());
+        let Some(WorkspaceRecord {
+            connection: Connection::Remote(saved),
+            ..
+        }) = reloaded.record("01JR")
+        else {
+            panic!("not reloaded");
+        };
+        assert_eq!(saved.transport, Some(Transport::Stdio));
+        assert_eq!(reloaded.list()[0].state, WorkspaceState::Connecting);
+        assert!(
+            reloaded.connector("01JR").is_err(),
+            "no connector until attached"
+        );
+        reloaded.attach("01JR", Arc::new(Nowhere));
+        assert!(reloaded.connector("01JR").is_ok());
+
+        // Removing forgets it, saves, and says so.
+        let before = events.lock().unwrap().len();
+        let removed = registry.remove("01JR").unwrap().unwrap();
+        assert_eq!(removed.id, "01JR");
+        assert!(registry.list().is_empty());
+        assert_eq!(events.lock().unwrap().len(), before + 1);
+        assert_eq!(registry.remove("01JR").unwrap(), None);
+        assert!(Registry::load(file).list().is_empty());
+    }
+
+    fn remote_on(id: &str, host: &str, root: &str) -> WorkspaceRecord {
+        let mut record = remote(id);
+        if let Connection::Remote(r) = &mut record.connection {
+            r.host = host.into();
+            r.root = root.into();
+        }
+        record
+    }
+
+    #[test]
+    fn a_remote_cannot_take_another_workspaces_id() {
+        let registry = Registry::in_memory();
+        registry.attach_local(Arc::new(Nowhere));
+        registry.set_local("01JL", "Here").unwrap();
+        registry
+            .claim_remote(
+                remote_on("01JR", "hpc-login", "/home/sam/.pitcrew"),
+                Arc::new(Nowhere),
+                WorkspaceState::Ready,
+            )
+            .unwrap();
+        // The local workspace's id.
+        let taken = registry
+            .claim_remote(
+                remote_on("01JL", "evil", "/home/sam/.pitcrew"),
+                Arc::new(Nowhere),
+                WorkspaceState::Ready,
+            )
+            .unwrap_err();
+        assert_eq!(
+            taken,
+            Taken {
+                name: "Here".into(),
+                local: true
+            }
+        );
+        // A remote's id, from another host or another root.
+        for (host, root) in [
+            ("evil", "/home/sam/.pitcrew"),
+            ("hpc-login", "/scratch/sam/.pitcrew"),
+        ] {
+            let taken = registry
+                .claim_remote(
+                    remote_on("01JR", host, root),
+                    Arc::new(Nowhere),
+                    WorkspaceState::Ready,
+                )
+                .unwrap_err();
+            assert_eq!(taken.name, "Cluster");
+            assert!(!taken.local);
+        }
+        let Some(WorkspaceRecord {
+            connection: Connection::Remote(kept),
+            ..
+        }) = registry.record("01JR")
+        else {
+            panic!("the remote is gone");
+        };
+        assert_eq!(kept.host, "hpc-login", "nothing changed");
+        assert_eq!(registry.record("01JL").unwrap().kind, WorkspaceKind::Local);
+
+        // The same machine again (pairing it again) replaces its entry; undoing puts it back.
+        let mut again = remote_on("01JR", "hpc-login", "/home/sam/.pitcrew");
+        again.name = "Cluster, again".into();
+        let claimed = registry
+            .claim_remote(again, Arc::new(Nowhere), WorkspaceState::Connecting)
+            .unwrap();
+        assert_eq!(registry.record("01JR").unwrap().name, "Cluster, again");
+        registry.unclaim(claimed);
+        assert_eq!(registry.record("01JR").unwrap().name, "Cluster");
+        assert_eq!(registry.list().len(), 2);
+        // A new id is added; undoing removes it.
+        let claimed = registry
+            .claim_remote(
+                remote_on("01JN", "gpu-box", "/home/sam/.pitcrew"),
+                Arc::new(Nowhere),
+                WorkspaceState::Ready,
+            )
+            .unwrap();
+        assert_eq!(registry.list().len(), 3);
+        registry.unclaim(claimed);
+        assert_eq!(registry.list().len(), 2);
+    }
+
+    #[test]
+    fn the_local_daemon_cannot_take_a_remotes_id() {
+        let registry = Registry::in_memory();
+        registry
+            .claim_remote(remote("01JR"), Arc::new(Nowhere), WorkspaceState::Ready)
+            .unwrap();
+        // First start: no local workspace yet.
+        registry.set_local("01JR", "Mine").unwrap();
+        assert_eq!(registry.list().len(), 1);
+        assert_eq!(registry.list()[0].kind, WorkspaceKind::Remote);
+        let (state, detail) = registry.pending_local_state().unwrap();
+        assert_eq!(state, WorkspaceState::Unreachable);
+        assert!(detail.unwrap().contains("remote workspace"));
+        // With a local workspace already: it is not replaced.
+        registry.set_local("01JL", "Here").unwrap();
+        registry.set_local("01JR", "Mine").unwrap();
+        let local = registry
+            .list()
+            .into_iter()
+            .find(|w| w.kind == WorkspaceKind::Local)
+            .unwrap();
+        assert_eq!(local.id, "01JL");
+        assert_eq!(local.state, WorkspaceState::Unreachable);
+        assert_eq!(registry.record("01JR").unwrap().kind, WorkspaceKind::Remote);
     }
 
     #[test]

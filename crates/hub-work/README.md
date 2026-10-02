@@ -24,7 +24,8 @@ let mut last = store.latest_rev()?;
 let work = Arc::new(
     WorkService::new(Arc::clone(&store), workspace)      // a protocol `Workspace` (id and name)
         .with_dispatcher(runner_link)                     // Arc<dyn Dispatcher>, stream D
-        .with_hub_machine(this_machine),                  // where folderless dispatches run
+        .with_hub_machine(this_machine)                   // where folderless dispatches run
+        .with_setup_listener(setup_listener),              // starts the office and runner on setup
 );
 let parts = RouterParts::new()
     .agent(pitcrew_hub_work::agent_routes().layer(Extension(Arc::clone(&work))))
@@ -281,10 +282,11 @@ block holds seed events.
 
 The machine is the request's, else the machine of the task's workstream's first location, else the
 project's root's, else the hub's own. **The daemon must name the hub's machine** with
-`with_hub_machine`; without it, a dispatch with nowhere else to run answers `503` (the hub does
-not guess one of the workspace's machines). The folder is the first of those locations on that
-machine, else `~`. The engine, model and permission mode come from the agent's persona (Claude
-Code by default). Without a dispatcher the route answers `503`.
+`with_hub_machine`, or with `set_hub_machine(&self, MachineId)` on the shared service once a
+fresh hub is set up (its machine exists only then); without it, a dispatch with nowhere else to
+run answers `503` (the hub does not guess one of the workspace's machines). The folder is the
+first of those locations on that machine, else `~`. The engine, model and permission mode come
+from the agent's persona (Claude Code by default). Without a dispatcher the route answers `503`.
 
 **For the runner link (stream D):** if the hub stops between step 1 and step 3, a `starting`
 session and an open dispatch are left behind. The runner link must reconcile them: on start-up,
@@ -320,6 +322,7 @@ whatever it sent.
 | `dispatch_working` | the runner link | moves the dispatched task to in progress as the agent, when the rules allow; 409 for an ended dispatch, or a racing writer that moved the task first |
 | `mirror_plan` | the runner link | replaces the agent's `agent_plan` lines of its own task from a `PlanUpdated` |
 | `seed` | the daemon | imports a `DemoWorkspace` into an empty work model |
+| `ensure_office_member(owner)` | the daemon | finds or adds the back office's member (see "The back office"); 400 `owner` is not a person; 409 `@office` held by a person, another person's agent or no one's agent |
 | `run_office`, `OfficeCommands` | the back office | see "The back office" |
 
 "Own task" means the agent is the assignee or holds an active (not ended) dispatch on it.
@@ -371,6 +374,14 @@ authored by the office's member, on behalf of its owner:
 Every action must cite receipts (400 without). The office's member must be an agent; a person
 cannot be the back office.
 
+**Its member** (`ensure_office_member(owner) -> Member`): the member holding `@office`
+(`OFFICE_HANDLE`) when it is an agent owned by `owner`, the workspace's person; when no member
+holds the handle, a new agent ("Back office", owned by `owner`) appended in one `member_added`
+authored by `owner`, under the command lock like any command, so the daemon may call it while the
+hub serves (right after `set_up`) as well as at start. `@office` held by a person, another
+person's agent or no one's agent is a `409`: the back office never acts as a person, nor for
+someone else. Found or added once and reused, since the run log's settings name the member.
+
 **Running a range again is safe.** The events an action appends get ids derived from the store's
 `log_id`, the run-log entry's revision and `seq`, and the event's place in the action (a ULID with
 the entry's time and 80 bits of a SHA-256 of those), and are appended with `append_new`. An action
@@ -397,15 +408,61 @@ Agent and device tokens (`agent_routes`): `GET /v1/me`, `GET /v1/members`,
 `POST /v1/tasks/{id}/move`, `PUT /v1/tasks/{id}/subtasks`, `POST /v1/tasks/{id}/comments`,
 `GET /v1/asks?to=&state=`, `POST /v1/asks`, `POST /v1/asks/{id}/answer`.
 
-Device tokens only (`device_routes`): `GET /v1/workspace`, `GET /v1/machines`,
+Device tokens only (`device_routes`): `GET /v1/workspace`, `POST /v1/setup`, `GET /v1/machines`,
 `GET /v1/personas`, `GET /v1/teams`, `GET|POST /v1/projects`, `GET /v1/projects/{id}`,
 `GET /v1/workstreams?project=`, `POST /v1/workstreams`, `GET|PATCH /v1/workstreams/{id}`,
 `POST /v1/tasks`, `PATCH /v1/tasks/{id-or-key}`, `POST /v1/tasks/{id}/assign`,
 `POST /v1/tasks/{id}/dispatch`, `GET /v1/sessions?machine=&workstream=&task=&state=`,
 `GET /v1/sessions/{id}`, `GET /v1/briefs`, `PUT /v1/briefs/{project|workstream}/{id}`.
 
-`GET /v1/workspace` answers `{ workspace, rev }`; `rev` is the lowest checkpoint of the work
-projections (`projection_state.rev`), the revision every work table reflects.
+`GET /v1/workspace` answers `{ workspace, rev, setup_needed }`; `rev` is the lowest checkpoint of
+the work projections (`projection_state.rev`), the revision every work table reflects, and
+`setup_needed` is `true` while the workspace has no person yet, omitted (never `false` on the
+wire) once it does. See "The first run" for `POST /v1/setup` and the daemon's seam.
+
+## The first run (`POST /v1/setup`)
+
+A fresh hub has a device token but no person, no machine and no name (api-v1.md, "The first
+run"). `WorkService::set_up(caller, Setup) -> Result<SetupDone>` (`src/setup.rs`) runs it once,
+through the one writer:
+
+- device tokens only (`forbidden` for an agent, checked before the body);
+- every field checked exactly as the contract says (the three names trimmed, then counted in
+  code points and stored trimmed; the handle's shape, not trimmed; no control characters), `400`
+  before the `409`s. Whitespace is what JavaScript's `trim` removes (Unicode's `White_Space`
+  except U+0085, plus U+FEFF), so this hub and the mock hub store the same names;
+- `409 conflict` once the workspace already has a person, or if the handle is taken (by another
+  member the hub already knows, e.g. a back office added before a person existed) — so a retried
+  request never makes a second person: the first call to commit wins, every other sees the
+  conflict. `@office` (`OFFICE_HANDLE`) is reserved for the back office and always taken, even
+  before its member exists;
+- appends, in one append, `member_added` for the caller's own member id (kind `human`, no owner)
+  and `machine_added` (kind `local`, liveness `live`, a new id), both authored by the caller;
+- returns the new member and machine alongside the workspace (its id, and the name just set).
+
+**Two seams for the daemon**, since the workspace's name is kept outside the event log (in
+`workspace.json`, which the daemon owns) and setup is also when the daemon must start what needed
+a person (the back office, and the runner on this machine; api-v1.md, "The first run"):
+
+- `WorkService::set_workspace_name(&self, name: String)`: sets the name `GET /v1/workspace` (and
+  `set_up`'s own `SetupDone.workspace.name`) serves from then on. `set_up` calls it itself once its
+  append commits, with the name the request gave; the daemon also calls it on every start, with
+  the name it read from `workspace.json`, so the two never disagree. Without a call, the service
+  serves the name it was constructed with (`WorkService::new`'s `workspace.name`).
+- `SetupListener` (`pub trait { fn set_up(&self, done: &SetupDone); }`), registered with
+  `WorkService::with_setup_listener(Arc<dyn SetupListener>)` before the service is shared. Called
+  **once**, synchronously, right after `set_up`'s append commits (so it never sees a setup that
+  did not take) and with the command lock still held (so nothing else can write to the work model
+  between the commit and the listener seeing it). The daemon's listener is where `workspace.json`
+  gets written and the back office and runner get started; this crate does neither (out of scope;
+  see the brief).
+  - **Reads only, never a write, and never panic.** The lock still held is a plain, non-reentrant
+    `std::sync::Mutex` (`set_up` itself is still on the stack): reads (`WorkService::read`,
+    `members`, `tasks`, ...) are fine, but calling any command (`create_task`, a second `set_up`,
+    ...) from the listener deadlocks the thread. A panic here unwinds through `set_up`: the route
+    answers `500`, but the append already committed, so a retry then answers `409`, never a second
+    person. If the daemon's own work can fail or needs to write to the work model, hand `done` to
+    its own task (a channel, `tokio::spawn`, ...) and do that work off this call stack.
 
 Errors are `ApiError` bodies: a malformed id or unknown thing in the path is `404`, in the body or
 query `400`; bodies over 1 MiB are `400`. A `500` is logged in full and its body always says
@@ -432,7 +489,8 @@ query `400`; bodies over 1 MiB are `400`. A `500` is logged in full and its body
   `can_move`; answers (only the office's own asks), asks, comments and brief proposals (pinned
   and not); a run log several pages long applied whole, once, in order; a range run twice
   appends once, and a re-run after a crash applies only what was missing; a run log with other
-  rules than the `BackOffice` is an error.
+  rules than the `BackOffice` is an error; `ensure_office_member` adds `@office` once, by the
+  person, finds it afterwards (and the demo's), and is a `409` when someone else holds the handle.
 - `tests/rebuild.rs`: rebuilding every projection, building them on open, and applying one event
   per append all give identical tables, over every table, with task edits, key clashes, new
   projects and workstreams, and pending and accepted proposals in the log.

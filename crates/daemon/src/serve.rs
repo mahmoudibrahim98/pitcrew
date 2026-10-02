@@ -3,55 +3,61 @@
 //! Start:
 //! 1. The token registry, which locks the state directory: a second daemon stops here.
 //! 2. The store, opened once, with the work model's projections, to learn the workspace
-//!    (`workspace.json` holds its name) and, with `--demo`, to refuse a store with data. Unless
-//!    `--no-office`, also who the back office acts as, `@office` ([`crate::office::member`]); when
-//!    it can run, the office's run log, which needs that member, is registered on the open store
-//!    (`Store::register`), so a network filesystem's lease is never let go of in between. When it
-//!    cannot, `office.json` is removed.
-//! 3. The one `WorkService` for the store, with the hub's own machine (the workspace's local one).
-//!    It has no dispatcher, so a dispatch answers 503 and records nothing (see the README,
-//!    "Dispatch").
+//!    (`workspace.json` holds its name, which the service serves) and, with `--demo`, to refuse a
+//!    store with data.
+//! 3. The one `WorkService` for the store, with the hub's own machine (the workspace's local one)
+//!    and the setup listener ([`crate::setup::Signal`]). It has no dispatcher, so a dispatch
+//!    answers 503 and records nothing (see the README, "Dispatch").
 //! 4. With `--demo`: mint the tokens, seed the demo workspace.
 //! 5. The device token: reused from `device.token` while it still verifies, else minted.
-//! 6. Unless `--no-runner`, the runner ([`crate::runner`]): it watches the homes and writes into
+//! 6. Unless `--no-office`, the back office ([`crate::office::start`]): `@office` found or added
+//!    through the service, and its run log registered on the open store (`Store::register`), so a
+//!    network filesystem's lease is never let go of in between. When it cannot run (no person
+//!    yet, or `@office` is not the person's agent), `office.json` is removed.
+//! 7. Unless `--no-runner`, the runner ([`crate::runner`]): it watches the homes and writes into
 //!    the store at once.
-//! 7. The recap index's warm-up on the blocking pool, not waited for; the back office's loop; the
-//!    routes (`RouterParts`, with the activity index, the recaps, the runner's hooks, terminals
-//!    and transcripts); the listener; and one line on stdout: `pitcrewd listening on <where>`.
+//! 8. The recap index's warm-up on the blocking pool, not waited for; the back office's loop; for
+//!    a workspace not set up yet, the task that starts the office and the runner once it is
+//!    ([`crate::setup::after_setup`]); the routes (`RouterParts`, with the activity index, the
+//!    recaps, the runner's hooks, terminals and transcripts, and host info as it is now,
+//!    [`crate::host`]); the listener; and one line on stdout: `pitcrewd listening on <where>`.
 //!
 //! Stop (Ctrl+C or Ctrl+Break, or SIGTERM or SIGHUP on Unix): the server stops accepting and
 //! finishes in-flight requests (`pitcrew-api` closes open WebSockets with 1001) while the back
 //! office finishes its run in progress and saves where it got to, and the runner hands what it
-//! read to the store and stops; then the store closes, checkpointing its WAL, and the lock is
-//! released last.
+//! read to the store and stops (whether they started with the daemon or after setup); then the
+//! store closes, checkpointing its WAL, and the lock is released last.
 
 use crate::cli::{ListenArg, ServeArgs};
+use crate::host::HostInfoNow;
 use crate::office::Office;
 use crate::recaps::WorkRecaps;
 use crate::refs::WorkRefs;
-use crate::runner::Runner;
+use crate::runner::{Attached, Hooks, Runner};
+use crate::setup::{AfterSetup, Workers};
 use crate::state::{StateDir, read_token, read_workspace, write_token, write_workspace};
 use crate::terminals::SessionTerminals;
 use crate::transcripts::Transcripts;
 use anyhow::{Context as _, bail};
 use axum::Extension;
 use pitcrew_api::{
-    Activity, Bound, EventRefs, EventSource, HookIntake, HookSink, Listen, LogHookSink,
-    RecapSource, Recaps, RouterParts, StoreSource, StreamConfig, TerminalConfig, Terminals,
+    Activity, Bound, EventRefs, EventSource, HookIntake, HookSink, Listen, RecapSource, Recaps,
+    RouterParts, StoreSource, StreamConfig, TerminalConfig, Terminals,
 };
 use pitcrew_auth::{FileTokenStore, TokenError, TokenStore};
 use pitcrew_fixtures::DemoWorkspace;
-use pitcrew_hub_work::{BackOffice, WorkService};
-use pitcrew_protocol::api::{Caller, HostRole, TokenScope};
+use pitcrew_hub_work::{SetupDone, WorkService};
+use pitcrew_protocol::api::{Caller, TokenScope};
 use pitcrew_protocol::ids::{MachineId, MemberId, WorkspaceId};
 use pitcrew_protocol::model::{MachineKind, MemberKind, Workspace};
-use pitcrew_protocol::runner::Capability;
+use pitcrew_runner::EngineHome;
 use pitcrew_store::{Projection, Store, StoreOptions};
 use std::io::Write as _;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 
 /// Hook events queued for the sink before new ones are dropped.
 const HOOK_QUEUE: usize = 1024;
@@ -93,25 +99,39 @@ pub fn serve(state: &StateDir, args: &ServeArgs) -> anyhow::Result<ExitCode> {
         let _entered = runtime.enter();
         Stop::listen().context("cannot listen for stop signals")?
     };
-    let runner = if args.no_runner {
-        tracing::info!("the runner is off (--no-runner)");
-        None
-    } else {
-        let homes = crate::runner::homes(&args.homes, args.demo, crate::runner::default_homes);
-        match crate::runner::start(state, &hub.work, &hub.store, hub.machine, homes) {
-            Ok(runner) => runner,
-            // The hub is still worth serving (the desktop reaches its work), and a supervisor
-            // cannot pass --no-runner.
-            Err(e) => {
-                tracing::warn!(
-                    "the runner cannot start, so this hub serves without it (no session is \
-                     watched, hooks are only logged): {e:#}"
-                );
-                None
+    // The homes are settled now, for a runner that starts only once the workspace is set up too.
+    let homes = (!args.no_runner)
+        .then(|| crate::runner::homes(&args.homes, args.demo, crate::runner::default_homes));
+    let runner = match &homes {
+        None => {
+            tracing::info!("the runner is off (--no-runner)");
+            None
+        }
+        Some(homes) => {
+            match crate::runner::start(state, &hub.work, &hub.store, hub.machine, homes.clone()) {
+                Ok(runner) => runner,
+                // The hub is still worth serving (the desktop reaches its work), and a supervisor
+                // cannot pass --no-runner.
+                Err(e) => {
+                    tracing::warn!(
+                        "the runner cannot start, so this hub serves without it (no session is \
+                         watched, hooks are only logged): {e:#}"
+                    );
+                    None
+                }
             }
         }
     };
-    let served = runtime.block_on(run(hub, runner, stop, state, args.listen.clone(), started));
+    let served = runtime.block_on(run(Serving {
+        hub,
+        runner,
+        homes,
+        office: !args.no_office,
+        stop,
+        state,
+        listen: args.listen.clone(),
+        started,
+    }));
     stop_runtime(runtime);
     if store.upgrade().is_none() {
         tracing::info!("store closed");
@@ -137,10 +157,12 @@ struct Hub {
     office: Option<Office>,
     /// The hub's own machine, the workspace's first local one, if it has one.
     machine: Option<MachineId>,
+    /// For a workspace that is not set up yet (no person): what `POST /v1/setup` hands over.
+    set_up: Option<oneshot::Receiver<SetupDone>>,
 }
 
-/// Steps 1–5: the token registry, the store, the workspace and its service, the back office's
-/// member, the demo, the device token. Without `office`, the back office does not run.
+/// Steps 1–6: the token registry, the store, the workspace and its service, the demo, the device
+/// token, the back office. Without `office`, the back office does not run.
 fn open(state: &StateDir, demo: bool, office: bool) -> anyhow::Result<Hub> {
     open_with(state, demo, office, StoreOptions::default())
 }
@@ -168,9 +190,9 @@ fn open_with(
     };
 
     let path = state.store();
-    // The work model alone first: the back office's run log needs its member, which may have to
-    // be found or added in the store, so it is registered once that is done.
-    let store = open_store(&path, options, pitcrew_hub_work::projections())?;
+    // The work model alone: the back office's run log, which needs its member, is registered on
+    // the open store once the member is found or added (step 6).
+    let store = Arc::new(open_store(&path, options, pitcrew_hub_work::projections())?);
     let latest = store.latest_rev().context("cannot read the store")?;
 
     let demo = if demo {
@@ -186,60 +208,35 @@ fn open_with(
         None
     };
 
+    // Its name, from `workspace.json`, is what the service serves from the start (the field
+    // `set_workspace_name` sets, which setup sets too).
     let workspace = hosted_workspace(state, &store, demo.as_ref())?;
-    let member = if office {
-        crate::office::member(&store, &workspace, demo.as_ref())?
-    } else {
-        tracing::info!("the back office is off (--no-office)");
-        None
-    };
-    // Built once: its run log in the store and `run_office` must use the same settings.
-    let back_office = member.map(|m| Arc::new(BackOffice::new(m)));
-    match &back_office {
-        // On the store as it is open, so a network filesystem's lease is held throughout. The run
-        // log catches up as it would at an open, over a `member_added` just appended too.
-        Some(back_office) => store
-            .register(Box::new(back_office.run_log()))
-            .with_context(|| {
-                format!(
-                    "cannot add the back office's run log to the store {}",
-                    path.display()
-                )
-            })?,
-        // Whatever is appended while the office is off is never acted on later.
-        None => crate::office::forget(state),
-    }
-    let store = Arc::new(store);
-
     // The one writer of this store (hub-work's "One writer"): everything shares this `Arc`.
     // No dispatcher (see the README, "Dispatch"): a dispatch answers 503 and records nothing,
     // rather than appending a dispatch that can only fail.
-    let work = WorkService::new(Arc::clone(&store), workspace);
+    let (signal, set_up) = crate::setup::signal();
+    let work = Arc::new(
+        WorkService::new(Arc::clone(&store), workspace).with_setup_listener(Arc::new(signal)),
+    );
     let machines = match &demo {
         Some(demo) => demo.machines.clone(),
         None => work.machines().context("cannot list the machines")?,
     };
-    let machine = machines
-        .iter()
-        .find(|m| m.kind == MachineKind::Local)
-        .map(|m| (m.id, m.name.clone()));
-    let work = Arc::new(match &machine {
-        Some((id, name)) => {
-            tracing::info!(machine = %id, %name, "the hub's own machine");
-            work.with_hub_machine(*id)
+    let machine = machines.iter().find(|m| m.kind == MachineKind::Local);
+    match machine {
+        Some(machine) => {
+            tracing::info!(machine = %machine.id, name = %machine.name, "the hub's own machine");
+            work.set_hub_machine(machine.id);
         }
-        None => {
-            tracing::warn!(
-                "the workspace has no local machine, so a dispatch for a task without a folder \
-                 answers 503, and the runner stays off, until one is added"
-            );
-            work
-        }
-    });
-    let machine = machine.map(|(id, _)| id);
+        None => tracing::warn!(
+            "the workspace has no local machine, so a dispatch for a task without a folder \
+             answers 503, and the runner stays off, until it is set up"
+        ),
+    }
+    let machine = machine.map(|m| m.id);
 
     // Tokens before seeding: if minting fails, the store stays empty and `--demo` can be retried.
-    match &demo {
+    let person = match &demo {
         Some(demo) => {
             let person = demo_person(demo)?;
             device_token(state, &*tokens, Some(person), || Ok(person))?;
@@ -250,20 +247,32 @@ fn open_with(
                 events = seeded.len(),
                 "seeded the demo workspace"
             );
+            Some(person)
         }
         None => {
-            device_token(state, &*tokens, None, || first_person(&work))?;
+            let person = crate::runner::person(&work)?;
+            device_token(state, &*tokens, None, || {
+                Ok(person.unwrap_or_else(new_member))
+            })?;
+            person
         }
-    }
-    let office = back_office
-        .map(|back_office| Office::new(back_office, state, &store, demo.is_some()))
-        .transpose()?;
+    };
+    let office = if office {
+        crate::office::start(state, &work, person, demo.is_some())?
+    } else {
+        tracing::info!("the back office is off (--no-office)");
+        // Whatever is appended while the office is off is never acted on later.
+        crate::office::forget(state);
+        None
+    };
     Ok(Hub {
         tokens,
         store,
         work,
         office,
         machine,
+        // Only a workspace without a person can be set up; otherwise setup answers 409.
+        set_up: person.is_none().then_some(set_up),
     })
 }
 
@@ -318,8 +327,8 @@ fn hosted_workspace(
         (None, Some(saved)) => saved,
         (None, None) => {
             tracing::warn!(
-                "the store is empty and there is no way to create a workspace yet; start with \
-                 --demo to try the demo workspace"
+                "the workspace is not set up yet: set it up from the desktop, or with `pitcrewd \
+                 init` (or start with --demo to try the demo workspace)"
             );
             Workspace {
                 id: WorkspaceId::new(),
@@ -406,58 +415,74 @@ fn demo_person(demo: &DemoWorkspace) -> anyhow::Result<MemberId> {
         .context("the demo workspace has no person")
 }
 
-/// The workspace's first person, who owns this desktop in the solo case. A store without one gets
-/// a new member id, which nothing knows yet.
-fn first_person(work: &WorkService) -> anyhow::Result<MemberId> {
-    let members = work.members().context("cannot list the members")?;
-    Ok(match members.iter().find(|m| m.kind == MemberKind::Human) {
-        Some(person) => person.id,
-        None => {
-            tracing::warn!(
-                "the workspace has no person yet; the device token acts as a new member that \
-                 nothing knows, so GET /v1/me answers 404"
-            );
-            MemberId::new()
-        }
-    })
+/// Who a new device token acts as in a workspace without a person: a new member id, which nothing
+/// knows until setup makes it the person (`POST /v1/setup` or `pitcrewd init`).
+fn new_member() -> MemberId {
+    tracing::warn!(
+        "the workspace has no person yet; the device token acts as a new member that nothing \
+         knows, so GET /v1/me answers 404 until the workspace is set up"
+    );
+    MemberId::new()
 }
 
-/// Step 7 onwards: serve until a stop signal, then shut down in order.
-async fn run(
+/// What [`run`] serves with.
+struct Serving<'a> {
     hub: Hub,
+    /// The runner, if it started with the daemon.
     runner: Option<Runner>,
-    mut stop: Stop,
-    state: &StateDir,
+    /// The runner's homes; `None` with `--no-runner`.
+    homes: Option<Vec<EngineHome>>,
+    /// Whether the back office runs (not with `--no-office`), for one that starts after setup.
+    office: bool,
+    stop: Stop,
+    state: &'a StateDir,
     listen: ListenArg,
     started: Instant,
-) -> anyhow::Result<()> {
+}
+
+/// Step 8 onwards: serve until a stop signal, then shut down in order.
+async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
+    let Serving {
+        hub,
+        runner,
+        homes,
+        office: office_on,
+        mut stop,
+        state,
+        listen,
+        started,
+    } = serving;
     let Hub {
         tokens,
         store,
         work,
         office,
         machine: _,
+        set_up,
     } = hub;
-    let office_work = Arc::clone(&work);
     warm_up_recaps(&work);
+
+    // The back office's loop and the runner, for the stop; and the runner for the routes, now or
+    // once the workspace is set up.
+    let workers = Arc::new(Workers::default());
+    let attached = Arc::new(Attached::default());
+    if let Some(runner) = runner {
+        attached.set(runner.parts());
+        // Nothing is stopping yet.
+        let _ = workers.keep_runner(runner);
+    }
 
     let events: Arc<dyn EventSource> =
         Arc::new(StoreSource::new(Arc::clone(&store), store.log_id()));
     // Hooks change sessions' state through the runner, for the senders that may (its README,
     // "Who may change a session through a hook"); without it they are only logged.
-    let hook_sink: Arc<dyn HookSink> = match &runner {
-        Some(runner) => Arc::new(runner.hooks()),
-        None => Arc::new(LogHookSink),
-    };
+    let hook_sink: Arc<dyn HookSink> = Arc::new(Hooks(Arc::clone(&attached)));
     let hooks = HookIntake::start(hook_sink, HOOK_QUEUE).context("cannot start the hook intake")?;
     let terminals: Arc<dyn Terminals> = Arc::new(SessionTerminals::new(
         Arc::clone(&work),
-        runner.as_ref().map(|r| (r.machine(), r.terminals())),
+        Arc::clone(&attached),
     ));
-    let transcripts = Transcripts::new(
-        Arc::clone(&work),
-        runner.as_ref().map(|r| (r.machine(), r.found())),
-    );
+    let transcripts = Transcripts::new(Arc::clone(&work), Arc::clone(&attached));
     // The activity index (`project=`, `workstream=`, and wider `task=` and `session=` matches).
     let refs: Arc<dyn EventRefs> = Arc::new(WorkRefs(Arc::clone(&work)));
     // The recap index (`GET /v1/recaps/blocks` and `/days`), kept current on every query.
@@ -477,19 +502,9 @@ async fn run(
             TerminalConfig::default(),
         ))
         .device(transcripts.routes())
-        .device(pitcrew_hub_work::device_routes().layer(Extension(work)));
-    let (roles, capabilities) = match &runner {
-        Some(runner) => (
-            vec![HostRole::Hub, HostRole::Runner],
-            if runner.watches() {
-                vec![Capability::Watch]
-            } else {
-                Vec::new()
-            },
-        ),
-        None => (vec![HostRole::Hub], Vec::new()),
-    };
-    let info = pitcrew_api::local_host_info(env!("CARGO_PKG_VERSION"), roles, capabilities);
+        .device(pitcrew_hub_work::device_routes().layer(Extension(Arc::clone(&work))));
+    // The roles and capabilities as they are at each request (the runner may start later).
+    let info = Arc::new(HostInfoNow::new(Arc::clone(&attached)));
 
     let (listen, dev) = match listen {
         ListenArg::Private => (
@@ -515,13 +530,33 @@ async fn run(
         .with_context(|| format!("cannot listen on {}", describe(&listen)))?;
     let at = bound.describe();
     let token_store: Arc<dyn TokenStore> = Arc::clone(&tokens) as Arc<dyn TokenStore>;
-    let mut app = pitcrew_api::router(info, token_store, parts);
+    let mut app = pitcrew_api::router(info.now(), token_store, parts).layer(
+        axum::middleware::from_fn_with_state(info, crate::host::answer),
+    );
     if dev {
         app = app.layer(axum::middleware::from_fn(crate::cors::cors));
     }
     // The back office subscribes to the store's appends before anything is served (and its first
     // run covers whatever was appended before).
-    let office = office.map(|office| office.spawn(office_work));
+    if let Some(office) = office {
+        let _ = workers.keep_office(office.spawn(Arc::clone(&work)));
+    }
+    // A workspace not set up yet: what needed a person starts once it is, without a restart.
+    if let Some(set_up) = set_up {
+        drop(tokio::spawn(crate::setup::after_setup(
+            set_up,
+            AfterSetup {
+                state: state.clone(),
+                work: Arc::clone(&work),
+                office: office_on,
+                homes,
+                attached: Arc::clone(&attached),
+                workers: Arc::clone(&workers),
+                drain: DRAIN,
+            },
+        )));
+    }
+    drop(work);
     let (draining, drain) = tokio::sync::oneshot::channel::<()>();
     let mut serving = tokio::spawn(bound.serve(app, async move {
         let _ = drain.await;
@@ -553,8 +588,10 @@ async fn run(
 
     // The server stops accepting, finishes in-flight requests and closes its WebSockets, while the
     // back office finishes its run in progress and the runner hands the store what it read; all
-    // three let go of the store before it closes.
+    // three let go of the store before it closes. One that starts after setup from now on is
+    // stopped as it starts.
     let _ = draining.send(());
+    let (office, runner) = workers.take();
     let office_stopped = async {
         if let Some(office) = office {
             office.stop(DRAIN).await;
@@ -924,7 +961,7 @@ mod tests {
         // The first start with a person adds @office, owned by them.
         let hub = open(&state, false, true).unwrap();
         let office = hub.office.as_ref().unwrap().member();
-        let found = members_called(&hub.work, crate::office::HANDLE);
+        let found = members_called(&hub.work, pitcrew_hub_work::OFFICE_HANDLE);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, office);
         assert_eq!(found[0].kind, MemberKind::Agent);
@@ -1214,7 +1251,10 @@ mod tests {
             added.to_rev,
             "no member was added"
         );
-        assert_eq!(members_called(&hub.work, crate::office::HANDLE).len(), 1);
+        assert_eq!(
+            members_called(&hub.work, pitcrew_hub_work::OFFICE_HANDLE).len(),
+            1
+        );
         assert!(!state.office().exists(), "the office is off: no progress");
     }
 
@@ -1232,11 +1272,11 @@ mod tests {
         let agent = |owner: Option<MemberId>| Member {
             kind: MemberKind::Agent,
             owner,
-            ..person(crate::office::HANDLE)
+            ..person(pitcrew_hub_work::OFFICE_HANDLE)
         };
         let (lee, kim) = (person("@lee"), person("@kim"));
         // A person holds the handle.
-        office_stays_off_with(&[lee.clone(), person(crate::office::HANDLE)]);
+        office_stays_off_with(&[lee.clone(), person(pitcrew_hub_work::OFFICE_HANDLE)]);
         // Another person's agent.
         office_stays_off_with(&[lee.clone(), kim.clone(), agent(Some(kim.id))]);
         // No one's agent.

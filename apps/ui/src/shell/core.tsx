@@ -93,8 +93,11 @@ const pages = (name: PageName) => lazyRouteComponent(() => import('./pages/place
 
 /** Placeholder pages at the well-known paths. A feature route at the same path replaces one. */
 function placeholderRoutes(parent: WorkspaceRoute): AnyRoute[] {
-  const route = (path: string, component: PageName, staticData: { layout: Feature['layout']; title?: string }) =>
-    createRoute({ getParentRoute: () => parent, path, component: pages(component), staticData });
+  const route = (
+    path: string,
+    component: PageName,
+    staticData: { layout: Feature['layout']; title?: string; setup?: boolean },
+  ) => createRoute({ getParentRoute: () => parent, path, component: pages(component), staticData });
   return [
     route('home', 'HomePage', { layout: 'projects', title: 'Home' }),
     route('inbox', 'InboxPage', { layout: 'both', title: 'Inbox' }),
@@ -110,6 +113,8 @@ function placeholderRoutes(parent: WorkspaceRoute): AnyRoute[] {
     route('tasks/$task', 'TaskPage', { layout: 'projects' }),
     route('console', 'ConsolePage', { layout: 'console', title: 'Agent console' }),
     route('console/$session', 'SessionPage', { layout: 'console' }),
+    // `paths.setup`: where a workspace with `setup_needed` is sent, so it exists in every build.
+    route('onboarding', 'SetupPage', { layout: 'both', title: 'Set up', setup: true }),
   ];
 }
 

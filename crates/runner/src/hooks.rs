@@ -52,8 +52,10 @@ use std::sync::Arc;
 ///
 /// The token's `on_behalf_of` never widens what an agent may change. A hook for a session not
 /// indexed yet is held with its sender and decided when the session is discovered; one refused
-/// then is dropped. Codex's `notify` follows the same rule. Each sender holds at most 32 hooks:
-/// a flood from one sender drops its own oldest, not another's.
+/// then is dropped. A sub-agent runs as its parent: when [`SessionAgents`] know no agent for it
+/// (the hub may not have stored it yet), its parent's decides. Codex's `notify` follows the same
+/// rule. Each sender holds at most 32 hooks: a flood from one sender drops its own oldest, not
+/// another's.
 ///
 /// [`RunnerHandle::hooks`]: crate::RunnerHandle::hooks
 /// [`SessionAgents`]: crate::SessionAgents

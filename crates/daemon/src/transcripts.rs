@@ -14,12 +14,13 @@
 //!   (a file on a filesystem that does not answer) answers `503` and is left running; a stop
 //!   waits for it only so long (`serve`).
 //!
-//! Answers: an unknown session is `404`; one on another machine, or any without a runner, is
-//! `503 unavailable`; one on this machine whose transcript is not found (a demo session, a
+//! Answers: an unknown session is `404`; one on another machine, or any without a runner (with
+//! `--no-runner`, or before a fresh workspace is set up), is `503 unavailable`; one on this machine whose transcript is not found (a demo session, a
 //! deleted file) is an empty page at the start, as the mock hub answers for a session it has no
 //! transcript for. `limit` defaults to 200 and counts as 1000 above it; `limit=0`, and a `before`
 //! or `limit` that is not a whole number, are `400`.
 
+use crate::runner::Attached;
 use axum::extract::rejection::{PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
@@ -30,7 +31,7 @@ use pitcrew_interfaces::source::{
     Cursor, ParseChunk, SourceAdapter, SourceError, TranscriptPage, TranscriptRef,
 };
 use pitcrew_protocol::api::ErrorCode;
-use pitcrew_protocol::ids::{MachineId, SessionId};
+use pitcrew_protocol::ids::SessionId;
 use pitcrew_protocol::model::Engine;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -180,14 +181,15 @@ impl SourceAdapter for Recorded {
 #[derive(Debug)]
 pub struct Transcripts {
     work: Arc<WorkService>,
-    /// The runner's machine and what it found; `None` without a runner.
-    runner: Option<(MachineId, Arc<Found>)>,
+    /// The runner, once it runs: its machine and what it found.
+    runner: Arc<Attached>,
 }
 
 impl Transcripts {
-    /// Transcripts of the sessions `work` knows, among those the runner on `machine` found.
+    /// Transcripts of the sessions `work` knows, among those the runner found on its machine once
+    /// it runs.
     #[must_use]
-    pub fn new(work: Arc<WorkService>, runner: Option<(MachineId, Arc<Found>)>) -> Self {
+    pub fn new(work: Arc<WorkService>, runner: Arc<Attached>) -> Self {
         Self { work, runner }
     }
 
@@ -218,7 +220,7 @@ impl Transcripts {
                 ));
             }
         };
-        let Some((machine, transcripts)) = &self.runner else {
+        let Some(runner) = self.runner.get() else {
             return Err(ErrorResponse::new(
                 ErrorCode::Unavailable,
                 format!(
@@ -227,7 +229,8 @@ impl Transcripts {
                 ),
             ));
         };
-        if found.machine != *machine {
+        let (machine, transcripts) = (runner.machine, &runner.found);
+        if found.machine != machine {
             return Err(ErrorResponse::new(
                 ErrorCode::Unavailable,
                 format!(
