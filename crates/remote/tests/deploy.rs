@@ -154,6 +154,10 @@ mod unix {
         /// The umask the remote command starts with.
         #[serde(default)]
         pub(crate) umask: Option<String>,
+        /// DIAG (temporary): trace the script (`sh -x`) into `trace.log` beside the fake, with
+        /// its exit status.
+        #[serde(default)]
+        pub(crate) trace: bool,
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -221,6 +225,15 @@ mod unix {
                 line.replacen("'/bin/sh' -c", &format!("'{sh}' -c"), 1),
             ),
             None => ("/bin/sh".to_owned(), command.clone()),
+        };
+        let script = if remote.trace {
+            format!(
+                "exec 2>>'{}'; {}; echo \"DIAG exit $?\" >&2",
+                dir.join("trace.log").display(),
+                line.replacen("'/bin/sh' -c", "'/bin/sh' -xc", 1)
+            )
+        } else {
+            script
         };
         let mut child = Command::new(&shell);
         match &remote.umask {
@@ -811,14 +824,26 @@ mod unix {
             m.lock().exists(),
             std::fs::read_to_string(m.lock().join("owner")).ok(),
             run(&["ls", "-laR", m.root().to_str().unwrap()]),
-            run(&["ps", "-axo", "pid,ppid,pgid,stat,etime,command"])
+            run(&["ps", "-axww", "-o", "pid,ppid,pgid,stat,etime,command"])
                 .lines()
-                .filter(|l| l.contains(m.dir.path().to_str().unwrap())
+                .filter(|l| l.contains("sh -")
                     || l.contains(" sh ")
-                    || l.contains("cat"))
+                    || l.contains("pitcrew")
+                    || l.contains(" cat"))
+                .map(|l| l.chars().take(300).collect::<String>())
                 .collect::<Vec<_>>()
                 .join("\n"),
-        )
+        ) + &std::fs::read_dir(m.dir.path())
+            .unwrap()
+            .filter_map(|e| std::fs::read_to_string(e.unwrap().path().join("trace.log")).ok())
+            .map(|trace| {
+                let lines: Vec<&str> = trace.lines().collect();
+                format!(
+                    "\ntrace, last lines:\n{}",
+                    lines[lines.len().saturating_sub(60)..].join("\n")
+                )
+            })
+            .collect::<String>()
     }
 
     pub(crate) fn eventually(what: &str, check: impl Fn() -> bool) {
@@ -1077,6 +1102,7 @@ mod unix {
         // The connection drops: the remote script sees end of file, and cleans up.
         let fake = m.fake(Remote {
             cut_after: Some(cut),
+            trace: true,
             ..Remote::default()
         });
         let err = block_on(deploy(&m.target(&fake), &helper, &quick())).unwrap_err();
@@ -1094,6 +1120,12 @@ mod unix {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
+        let trace = std::fs::read_to_string(fake.dir.join("trace.log")).unwrap_or_default();
+        let lines: Vec<&str> = trace.lines().collect();
+        println!(
+            "DIAG trace of the cut upload, last lines:\n{}",
+            lines[lines.len().saturating_sub(40)..].join("\n")
+        );
         assert!(!m.bin_dir().join("1.0.0/pitcrewd").exists());
         assert_eq!(m.link("current"), None);
 
