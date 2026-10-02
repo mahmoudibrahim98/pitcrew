@@ -1072,8 +1072,12 @@ dependencies = [
  "pitcrew-interfaces",
  "pitcrew-protocol",
  "rustix",
+ "serde",
+ "serde_json",
+ "tokio",
  "tracing",
  "vt100",
+ "windows-sys",
 ]
 
 [[package]]
