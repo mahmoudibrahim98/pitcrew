@@ -28,8 +28,10 @@
 //! running the helper script's `stop` fail as a lost connection; `kbdint` makes the server ask
 //! for the password with its text, marked `(sam@hpc-login)` as OpenSSH marks keyboard-interactive
 //! prompts; `stall` makes links wait for ever before signing in, as a server that does not
-//! answer; `version` is what `ssh -V` says. In the machine's home, `.demo-seeded` makes the
-//! helper start a fresh hub instead of the demo workspace.
+//! answer; `version` is what `ssh -V` says, and an OpenSSH older than 8.4 there behaves like one:
+//! without `DISPLAY` it ignores askpass, reads an empty answer and sends it (logged `empty`), as
+//! real ones do. In the machine's home, `.demo-seeded` makes the helper start a fresh hub instead
+//! of the demo workspace.
 //!
 //! The binary is also `pitcrew-askpass` (`<machine>/pitcrew-askpass`), as the real one: the
 //! crate's own client.
@@ -226,7 +228,7 @@ fn sign_in(machine: &Path, call: &Call) -> bool {
              This key is not known by any other names.\n\
              Are you sure you want to continue connecting (yes/no/[fingerprint])? "
         );
-        let trusted = !batch && ask(&text).as_deref() == Some("yes");
+        let trusted = !batch && ask(machine, &text).as_deref() == Some("yes");
         if !batch {
             append(&asked, if trusted { "yes" } else { "no" });
         }
@@ -244,7 +246,7 @@ fn sign_in(machine: &Path, call: &Call) -> bool {
         };
         if !batch {
             for _ in 0..3 {
-                let answer = ask(&question).unwrap_or_default();
+                let answer = ask(machine, &question).unwrap_or_default();
                 append(&asked, if answer.is_empty() { "empty" } else { "text" });
                 if answer == expected.trim_end() {
                     return true;
@@ -259,8 +261,14 @@ fn sign_in(machine: &Path, call: &Call) -> bool {
     true
 }
 
-/// Asks through `SSH_ASKPASS`, as ssh does: the answer, or `None` when askpass failed.
-fn ask(prompt: &str) -> Option<String> {
+/// Asks through `SSH_ASKPASS`, as ssh does: the answer, or `None` when askpass failed. An ssh
+/// older than 8.4 (the machine's `version`) uses askpass only with `DISPLAY` set, whatever
+/// `SSH_ASKPASS_REQUIRE` says; without it, and without a terminal, it reads an empty answer,
+/// which it then sends.
+fn ask(machine: &Path, prompt: &str) -> Option<String> {
+    if older_than_8_4(machine) && std::env::var_os("DISPLAY").is_none() {
+        return Some(String::new());
+    }
     let program = std::env::var_os("SSH_ASKPASS")?;
     let out = Command::new(program).arg(prompt).output().ok()?;
     out.status.success().then(|| {
@@ -268,6 +276,25 @@ fn ask(prompt: &str) -> Option<String> {
             .trim_end_matches('\n')
             .to_owned()
     })
+}
+
+/// Whether the machine's `version` (what `ssh -V` says) is an OpenSSH older than 8.4.
+fn older_than_8_4(machine: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(machine.join("version")) else {
+        return false;
+    };
+    let Some(at) = text.find("OpenSSH_") else {
+        return false;
+    };
+    let version: String = text[at..]
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let mut parts = version.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    let major = parts.next().unwrap_or(0);
+    let minor = parts.next().unwrap_or(0);
+    (major, minor) < (8, 4)
 }
 
 /// Runs the call's command on the machine.

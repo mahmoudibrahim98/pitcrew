@@ -5,10 +5,20 @@
 //! `SSH_ASKPASS_REQUIRE=force`. An older ssh hands server text over unmarked, so a server could
 //! ask for "the passphrase for key …" and pass for this computer asking.
 //!
-//! So `ssh -V` is asked once per ssh program ([`SshVersions`]), and every prompt goes through
-//! [`GatedPrompts`]: from an older ssh, or one whose version cannot be told, no prompt is shown
-//! or answered. It is refused (ssh is stopped before it can send anything), and the call fails
-//! with [`NEEDED`] ([`Verdict::refusal`]). Keys that need no prompt still work.
+//! An older ssh would not use askpass at all: before 8.4 it asks through askpass only with
+//! `DISPLAY` set, which ssh's minimal environment leaves out, and with no terminal it reads an
+//! empty answer and sends it, up to three empty passwords that `pam_faillock` or fail2ban count
+//! as failed logins.
+//!
+//! So `ssh -V` is asked once per ssh program ([`SshVersions`]), before ssh is built, and only
+//! a verdict of 8.4 or newer gives ssh prompts ([`SshCheck::prompts_allowed`]). Any other ssh
+//! (older, one whose version cannot be told, or one not asked yet) runs in `BatchMode`: it never
+//! asks, so passwords, keyboard-interactive and unknown host keys are refused, the call fails
+//! with [`NEEDED`] ([`Verdict::refusal`]), and keys that need no prompt still work. The verdict
+//! is kept for the app's life, so the message says to restart PitCrew after updating ssh.
+//! [`GatedPrompts`] stays in front of the prompt hub as a second layer: a prompt that reaches it
+//! from an ssh not judged fit is refused, never shown or answered (ssh is stopped before it can
+//! send anything).
 
 use super::prompt::PromptHub;
 use pitcrew_remote::{PromptCancel, PromptFuture, PromptHandler, PromptRequest, Reply};
@@ -75,9 +85,12 @@ impl Verdict {
     pub fn refusal(&self) -> Option<String> {
         match self {
             Self::Fit(_) => None,
-            Self::TooOld(version) => Some(format!("{NEEDED}; this computer's ssh is {version}")),
+            Self::TooOld(version) => Some(format!(
+                "{NEEDED}; this computer's ssh is {version} (restart PitCrew after updating ssh)"
+            )),
             Self::Unknown(why) => Some(format!(
-                "{NEEDED}; this computer's ssh version cannot be told ({why})"
+                "{NEEDED}; this computer's ssh version cannot be told ({why}; restart PitCrew \
+                 after updating ssh)"
             )),
         }
     }
@@ -213,6 +226,17 @@ impl SshCheck {
         let program = self.program.as_ref()?;
         self.versions.known(program)?.refusal()
     }
+
+    /// Whether ssh may be given prompts: only once `ssh -V` was asked and said 8.4 or newer.
+    /// Otherwise ssh runs in `BatchMode`, so it never asks (an older ssh would not use askpass,
+    /// and would send empty passwords instead).
+    #[must_use]
+    pub fn prompts_allowed(&self) -> bool {
+        self.program
+            .as_ref()
+            .and_then(|program| self.versions.known(program))
+            .is_some_and(|verdict| verdict.allows_prompts())
+    }
 }
 
 /// The prompt handler every remote ssh call gets: the [`PromptHub`], behind the version gate.
@@ -317,7 +341,8 @@ mod tests {
         assert_eq!(
             old.refusal().as_deref(),
             Some(
-                "ssh 8.4 or newer is needed to sign in from the app; this computer's ssh is OpenSSH 8.1"
+                "ssh 8.4 or newer is needed to sign in from the app; this computer's ssh is \
+                 OpenSSH 8.1 (restart PitCrew after updating ssh)"
             )
         );
         assert_eq!(Verdict::of("OpenSSH_9.6p1").refusal(), None);
@@ -351,6 +376,7 @@ mod tests {
         assert_eq!(versions.known(&program), None);
         let check = SshCheck::new(Arc::clone(&versions), Some(program.clone()));
         assert_eq!(check.known_refusal(), None, "not asked yet");
+        assert!(!check.prompts_allowed(), "not asked yet: no prompts");
         for _ in 0..3 {
             assert_eq!(
                 versions.verdict(&program).await,
@@ -358,6 +384,7 @@ mod tests {
             );
         }
         assert!(check.known_refusal().unwrap().contains("OpenSSH 8.1"));
+        assert!(!check.prompts_allowed(), "too old: no prompts");
         assert_eq!(std::fs::read_to_string(&count).unwrap().lines().count(), 1);
         // A program that is not there cannot be told.
         let missing = tmp.path().join("nowhere");
@@ -365,6 +392,19 @@ mod tests {
             versions.verdict(&missing).await,
             Verdict::Unknown(_)
         ));
+        assert!(!SshCheck::new(Arc::clone(&versions), Some(missing)).prompts_allowed());
+        // A new enough one gets prompts, once asked.
+        let fit = tmp.path().join("ssh-new");
+        std::fs::write(
+            &fit,
+            "#!/bin/sh\necho 'OpenSSH_9.6p1, OpenSSL 3.0.13' >&2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fit, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let check = SshCheck::new(Arc::clone(&versions), Some(fit));
+        assert!(!check.prompts_allowed());
+        check.ask().await;
+        assert!(check.prompts_allowed());
         assert_eq!(SshCheck::new(versions, None).refusal().await, None);
     }
 }

@@ -268,6 +268,22 @@ impl Rig {
         self.remotes.core.lock_links().len()
     }
 
+    /// Waits (10 s at most) until `check` holds.
+    fn wait(&self, what: &str, check: impl Fn(&Self) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !check(self) {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The saved remote, resumed: its link is in (resuming asks `ssh -V` first, in a task).
+    fn resumed_remote(&self) {
+        self.saved_remote();
+        self.remotes.resume();
+        self.wait("the resumed link", |rig| rig.links() == 1);
+    }
+
     /// No link is left, and every tunnel made so far ends closed.
     fn nothing_left_open(&self) {
         assert_eq!(self.links(), 0);
@@ -383,9 +399,7 @@ fn a_cancel_racing_the_start_of_an_add_is_not_lost() {
 #[test]
 fn a_retry_during_a_remove_leaves_no_link_tunnel_or_token() {
     let rig = rig();
-    rig.saved_remote();
-    rig.remotes.resume();
-    assert_eq!(rig.links(), 1);
+    rig.resumed_remote();
     let (paused, go) = rig.pause_at("remove: forgotten");
     let removing = {
         let remotes = Arc::clone(&rig.remotes);
@@ -431,34 +445,142 @@ fn a_retry_racing_a_remove_puts_no_link_in() {
     rig.nothing_left_open();
 }
 
-/// A pairing whose workspace is removed between its claim and keeping its token: the token is
-/// deleted again, no link is put in, and pairing fails.
-#[test]
-fn a_pairing_racing_a_remove_keeps_no_token() {
-    let rig = rig();
+/// Pairs the machine again from another thread (pairing's synchronous last part), with a fresh
+/// tunnel; its outcome comes from the thread, with the tunnel (which the add closes when
+/// pairing fails).
+fn pair_again(
+    rig: &Rig,
+) -> std::thread::JoinHandle<(Result<GatewayWorkspace, GatewayError>, Tunnel)> {
     let tunnel = rig.remotes.core.tunnel_for(&connection()).unwrap();
-    let (paused, go) = rig.pause_at("pair: claimed");
-    let pairing = {
+    let remotes = Arc::clone(&rig.remotes);
+    std::thread::spawn(move || {
+        let kept = remotes
+            .core
+            .keep(HOST, tunnel.clone(), connection(), ID, "Cluster", token());
+        (kept, tunnel)
+    })
+}
+
+/// A pairing of the same machine that comes while a remove is taking the workspace out: it
+/// waits for the remove's step to end, then stays whole, with its entry, its token and its
+/// link (the remove does not take them).
+#[test]
+fn a_pairing_during_a_remove_keeps_its_token_and_link() {
+    let rig = rig();
+    rig.resumed_remote();
+    let (paused, go) = rig.pause_at("remove: forgotten");
+    let removing = {
         let remotes = Arc::clone(&rig.remotes);
-        let tunnel = tunnel.clone();
-        std::thread::spawn(move || {
-            remotes
-                .core
-                .keep(HOST, tunnel, connection(), ID, "Cluster", token())
-        })
+        let handle = rig.rt.handle().clone();
+        std::thread::spawn(move || handle.block_on(remotes.remove(ID, false)))
     };
     paused.recv_timeout(Duration::from_secs(10)).unwrap();
-    assert!(rig.registry.record(ID).is_some(), "claimed");
-    rig.rt.block_on(rig.remotes.remove(ID, false)).unwrap();
-    go.send(()).unwrap();
-    let e = pairing.join().unwrap().unwrap_err();
-    assert_eq!(e.code, ErrorCode::Unreachable, "{e:?}");
-    assert!(
-        e.message.contains("removed while it was being added"),
-        "{e:?}"
-    );
-    assert_eq!(rig.tokens.get(ID).unwrap(), None);
-    assert_eq!(rig.links(), 0);
+    // The entry is out; the remove has not yet taken its link out.
     assert!(rig.registry.record(ID).is_none());
+    let pairing = pair_again(&rig);
+    // Time for the pairing to run, if nothing holds it back.
+    std::thread::sleep(Duration::from_millis(300));
+    go.send(()).unwrap();
+    removing.join().unwrap().unwrap();
+    pairing.join().unwrap().0.unwrap();
+    assert!(rig.registry.record(ID).is_some(), "the new pairing's entry");
+    assert_eq!(rig.tokens.get(ID).unwrap(), Some(token()), "its token");
+    let link = rig.remotes.core.lock_links().get(ID).cloned();
+    let link = link.expect("its link");
+    assert!(link.following(), "its link is live");
+    let list = rig.registry.list();
+    assert_eq!(list.len(), 1, "{list:?}");
+}
+
+/// A remove that comes while a pairing is between its claim and its token waits for the pairing
+/// to end, then removes it all: no entry, no token, no link, no open tunnel.
+#[test]
+fn a_remove_during_a_pairing_waits_and_removes_it_all() {
+    let rig = rig();
+    let (paused, go) = rig.pause_at("pair: claimed");
+    let pairing = pair_again(&rig);
+    paused.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert!(rig.registry.record(ID).is_some(), "claimed");
+    let removing = {
+        let remotes = Arc::clone(&rig.remotes);
+        let handle = rig.rt.handle().clone();
+        std::thread::spawn(move || handle.block_on(remotes.remove(ID, false)))
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    go.send(()).unwrap();
+    pairing.join().unwrap().0.unwrap();
+    removing.join().unwrap().unwrap();
+    assert!(rig.registry.record(ID).is_none());
+    assert_eq!(rig.tokens.get(ID).unwrap(), None);
     rig.nothing_left_open();
+}
+
+/// Once the app quits, nothing is put in: not a retry's attempt, not a pairing.
+#[test]
+fn nothing_is_put_in_after_shutdown() {
+    let rig = rig();
+    rig.saved_remote();
+    rig.rt.block_on(rig.remotes.shutdown());
+    rig.remotes.retry(ID).unwrap();
+    let (kept, tunnel) = pair_again(&rig).join().unwrap();
+    let e = kept.unwrap_err();
+    assert!(e.message.contains("PitCrew is quitting"), "{e:?}");
+    // The add closes the tunnel of a pairing that failed.
+    rig.rt.block_on(tunnel.close());
+    assert!(rig.remotes.core.lock_retries().is_empty());
+    assert_eq!(
+        rig.tokens.get(ID).unwrap(),
+        Some(token()),
+        "the saved token stays"
+    );
+    rig.nothing_left_open();
+}
+
+/// A link stops following its tunnel before the tunnel closes, so nothing the tunnel reports
+/// while closing reaches the workspace.
+#[test]
+fn a_link_stops_following_before_its_tunnel_closes() {
+    use std::future::Future as _;
+    let rig = rig();
+    rig.resumed_remote();
+    let link = rig.remotes.core.lock_links().get(ID).cloned().unwrap();
+    assert!(link.following());
+    let closing = link.close();
+    let mut closing = std::pin::pin!(closing);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    // The first poll stops the follower; the tunnel's close then waits for its task.
+    let _ = closing.as_mut().poll(&mut cx);
+    assert!(!link.following(), "the follower stopped first");
+    rig.rt.block_on(closing);
+}
+
+/// A remote's link never sets the state of the local workspace, even with the same id (a link
+/// that outlived its remote, whose id the local workspace took back).
+#[test]
+fn a_remote_link_never_sets_the_local_workspaces_state() {
+    let rig = rig();
+    rig.registry.attach_local(Arc::new(Nowhere));
+    rig.registry.set_local(ID, "Here").unwrap();
+    let tunnel = rig.remotes.core.tunnel_for(&connection()).unwrap();
+    let link = {
+        let _runtime = rig.rt.enter();
+        Link::start(
+            ID.into(),
+            tunnel.clone(),
+            rig.remotes.core.follow(),
+            None,
+            rig.rt.handle(),
+        )
+    };
+    // Its follower reports the tunnel's states at once (`connecting`), then its failure (there is
+    // no ssh), for a remote.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while tunnel.state() == LinkState::Connecting && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let local = rig.registry.list().remove(0);
+    assert_eq!(local.kind, WorkspaceKind::Local);
+    assert_eq!((local.state, local.detail), (WorkspaceState::Ready, None));
+    rig.rt.block_on(link.close());
 }

@@ -1472,9 +1472,11 @@ mod unix {
         assert_eq!(me["status"], 200, "{me}");
     }
 
-    /// An ssh older than 8.4 (the fake says 8.1) gets no prompt answered: none is shown, ssh is
-    /// stopped before it sends anything, and the error says why. `ssh -V` is asked once. Keys
-    /// that need no prompt still work.
+    /// An ssh older than 8.4 (the fake says 8.1, and like a real one it would send empty
+    /// passwords rather than use askpass) runs without prompts: none is shown or answered, no
+    /// empty password is sent, and the error says why. `ssh -V` is asked once. Keys that need no
+    /// prompt still work; the saved workspace's reconnect, and the one after a restart, ask
+    /// nothing either, and say why in the workspace's detail.
     fn an_old_ssh_gets_no_prompt_answered() {
         let w = world(false, |_, _| {});
         w.machine
@@ -1496,6 +1498,10 @@ mod unix {
                 "{message}"
             );
             assert!(message.contains("OpenSSH 8.1"), "{message}");
+            assert!(
+                message.contains("restart PitCrew after updating ssh"),
+                "{message}"
+            );
         };
         // A password, asked by ssh and by the server; a new host key.
         w.machine.require_password(PASSWORD);
@@ -1515,13 +1521,45 @@ mod unix {
         assert!(w.machine.asked().is_empty(), "{:?}", w.machine.asked());
         assert_eq!(w.machine.calls_of("version"), 1, "{:?}", w.machine.calls());
 
-        // With keys, nothing is asked, and it works.
+        // With keys, nothing is asked, and it works: a probe, and an add.
         w.machine.sign_in_with_keys();
         let probe = w
             .call("gateway_remote_probe", json!({ "host": HOST }))
             .unwrap();
         assert_eq!(probe["host"], HOST);
         assert_eq!(w.machine.calls_of("version"), 1);
+        let id = w.add_direct(170).unwrap();
+        assert_eq!(w.state(&id), Some(WorkspaceState::Ready));
+
+        // The machine asks for a password from now on: its reconnect, then its reconnect after a
+        // restart, send nothing and say why.
+        let no_sign_in = |w: &World| {
+            w.wait("the reconnect refused", |w| {
+                w.registry.list().iter().any(|ws| {
+                    ws.id == id
+                        && ws.state == WorkspaceState::Unreachable
+                        && ws.detail.as_deref().is_some_and(|d| {
+                            d.contains("ssh 8.4 or newer is needed to sign in from the app")
+                        })
+                })
+            });
+            assert!(w.events(PROMPT_EVENT).is_empty());
+            assert!(
+                !w.machine.asked().contains(&"empty".to_owned()),
+                "{:?}",
+                w.machine.asked()
+            );
+        };
+        w.machine.require_password(PASSWORD);
+        w.machine.drop_link();
+        no_sign_in(&w);
+        let again = w.restart(Answers::default());
+        no_sign_in(&again);
+        assert!(
+            again.machine.asked().is_empty(),
+            "{:?}",
+            again.machine.asked()
+        );
     }
 
     /// A name set on the hub (by first-run setup, on a fresh hub) shows once the tunnel connects

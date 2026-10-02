@@ -31,8 +31,9 @@
 //! **Prompts** (passwords, passphrases, one-time codes, host keys, other yes/no questions and
 //! notices) from any of these calls, and from the tunnel reconnecting, go through
 //! `pitcrew-askpass` to the [`PromptHub`] ([`prompt`]), behind the ssh version gate ([`gate`]):
-//! an ssh older than 8.4 gets none answered. A missing `pitcrew-askpass` (or a configured `ssh`
-//! that fails its checks) is a clear error before any ssh call.
+//! only an ssh that said 8.4 or newer gets prompts; any other runs in `BatchMode` and never
+//! asks. A missing `pitcrew-askpass` (or a configured `ssh` that fails its checks) is a clear
+//! error before any ssh call.
 //!
 //! **Afterwards** each remote workspace has a [`link::Link`]: the tunnel's `Connector`, which
 //! reconnects by itself, and a task keeping the workspace's state in step with it. At start,
@@ -40,8 +41,9 @@
 //! slept is noticed by a timer that fires late ([`Remotes::watch_wakes`]), and every tunnel is
 //! told to check at once. A connection that gave up (a sign-in cancelled while reconnecting)
 //! starts over at [`Remotes::retry`], with retries coalesced. A link is put in only while its
-//! workspace is still registered, and [`Remotes::remove`] takes the workspace out before it
-//! closes the link, so a retry or a pairing racing a remove leaves nothing behind.
+//! workspace is still a registered remote one and the app is not quitting; a remove's token,
+//! entry and link change under the same lock as a pairing's claim, token and link, so a retry or
+//! a pairing racing a remove leaves nothing behind, and loses nothing.
 
 pub mod gate;
 pub mod helpers;
@@ -74,7 +76,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -337,11 +339,9 @@ fn cancelled(host: &str) -> GatewayError {
     GatewayError::unreachable(format!("adding {host} was cancelled"))
 }
 
-/// The error of an add whose workspace was removed while it paired.
-fn removed_meanwhile(host: &str) -> GatewayError {
-    GatewayError::unreachable(format!(
-        "the workspace on {host} was removed while it was being added"
-    ))
+/// The error of an add that could not finish because the app is quitting.
+fn quitting(host: &str) -> GatewayError {
+    GatewayError::unreachable(format!("adding {host} stopped: PitCrew is quitting"))
 }
 
 /// `work`, unless the add is cancelled first: then `work` is dropped where it waits.
@@ -419,6 +419,8 @@ impl Remotes {
                 versions: Arc::default(),
                 links: Links::default(),
                 retries: Retries::default(),
+                membership: Arc::default(),
+                closed: Arc::default(),
                 runtime,
                 #[cfg(test)]
                 seams: Seams::default(),
@@ -701,14 +703,15 @@ impl Remotes {
     /// With `stop_helper`, first stops its helper (cancelling its job for SLURM); if that fails,
     /// nothing is forgotten.
     ///
-    /// The workspace leaves the registry before its link closes, so a retry or a pairing that
-    /// comes meanwhile finds no workspace to put a link in for; its token is deleted before (a
-    /// keychain that fails forgets nothing) and after (a pairing in flight may have kept it in
-    /// between).
+    /// Its token, its entry and its link go in one step, under the membership lock that
+    /// pairing's claim, token and link take too ([`Core::keep`]): a pairing of the same machine
+    /// comes wholly before (and is removed with it) or wholly after (and stays, with its token
+    /// and link). A retry that comes meanwhile finds no workspace to put a link in for
+    /// ([`Core::install`]). The link closes after that step.
     ///
     /// # Errors
     /// `unknown_workspace`; `invalid` for the local workspace; the stop's error; `internal` when
-    /// the keychain cannot delete the token.
+    /// the keychain cannot delete the token (then nothing is forgotten).
     pub async fn remove(&self, workspace: &str, stop_helper: bool) -> Result<(), GatewayError> {
         let core = &self.core;
         let record = core
@@ -729,33 +732,51 @@ impl Remotes {
                 .map_err(|e| core.helper_err(&remote.host, &e))?;
             tracing::info!(workspace = %record.id, host = %remote.host, pid = ?stopped.pid, "stopped the remote helper");
         }
-        core.tokens.delete(&record.id).map_err(|e| {
-            GatewayError::internal(format!("cannot delete the workspace's token: {e}"))
-        })?;
-        if let Err(e) = core.registry.remove(&record.id) {
-            tracing::warn!(workspace = %record.id, error = %e, "the workspace is removed but the registry is not saved");
-        }
-        core.at("remove: forgotten");
-        let link = core.lock_links().remove(&record.id);
-        core.lock_retries().remove(&record.id);
+        let link = {
+            let _membership = core.lock_membership();
+            core.tokens.delete(&record.id).map_err(|e| {
+                GatewayError::internal(format!("cannot delete the workspace's token: {e}"))
+            })?;
+            if let Err(e) = core.registry.remove(&record.id) {
+                tracing::warn!(workspace = %record.id, error = %e, "the workspace is removed but the registry is not saved");
+            }
+            core.at("remove: forgotten");
+            core.lock_retries().remove(&record.id);
+            core.lock_links().remove(&record.id)
+        };
         if let Some(link) = link {
             link.close().await;
-        }
-        if let Err(e) = core.tokens.delete(&record.id) {
-            tracing::warn!(workspace = %record.id, error = %e, "cannot delete the workspace's token again");
         }
         tracing::info!(workspace = %record.id, host = %remote.host, "removed a remote workspace");
         Ok(())
     }
 
-    /// Makes the tunnels of the remote workspaces saved in the registry (at start). One that
-    /// cannot be made is `unreachable`, saying why.
+    /// Makes the tunnels of the remote workspaces saved in the registry (at start), in a task
+    /// that first asks `ssh -V`, so that each tunnel's ssh gets prompts only if it may
+    /// ([`gate`]). One that cannot be made is `unreachable`, saying why.
     pub fn resume(&self) {
-        for record in self.core.registry.records() {
-            if let Connection::Remote(remote) = &record.connection {
-                self.core.reconnect(&record.id, remote, None);
-            }
+        let saved: Vec<(String, RemoteConnection)> = self
+            .core
+            .registry
+            .records()
+            .into_iter()
+            .filter_map(|record| match record.connection {
+                Connection::Remote(remote) => Some((record.id, *remote)),
+                Connection::Local => None,
+            })
+            .collect();
+        if saved.is_empty() {
+            return;
         }
+        let core = self.core.clone();
+        self.core.runtime.spawn(async move {
+            if core.programs().is_ok() {
+                core.ssh_check().ask().await;
+            }
+            for (id, remote) in saved {
+                core.reconnect(&id, &remote, None);
+            }
+        });
     }
 
     /// `gateway_workspace_retry`: tries remote workspace `workspace`'s connection again now
@@ -813,7 +834,9 @@ impl Remotes {
         }
     }
 
-    /// Closes every tunnel (the app is quitting).
+    /// Closes every tunnel (the app is quitting). From then on no link is put in (a coalesced
+    /// retry's next attempt, a resume or a pairing still running): the flag is set under the
+    /// links lock, which [`Core::install`] checks it under.
     pub async fn shutdown(&self) {
         if let Some(task) = self
             .waker
@@ -823,7 +846,14 @@ impl Remotes {
         {
             task.abort();
         }
-        let links: Vec<Arc<Link>> = self.core.lock_links().drain().map(|(_, l)| l).collect();
+        let links: Vec<Arc<Link>> = {
+            // The membership lock first, as pairing takes it: one running finishes first, and
+            // its link is closed here; one that comes after sees the flag.
+            let _membership = self.core.lock_membership();
+            let mut links = self.core.lock_links();
+            self.core.closed.store(true, Ordering::SeqCst);
+            links.drain().map(|(_, l)| l).collect()
+        };
         self.core.lock_retries().clear();
         for link in links {
             link.close().await;
@@ -1282,6 +1312,12 @@ struct Core {
     versions: Arc<SshVersions>,
     links: Links,
     retries: Retries,
+    /// Held while a workspace's entry, token and link change together: pairing's claim, token
+    /// and link ([`Core::keep`]), and remove's token, entry and link ([`Remotes::remove`]). All
+    /// synchronous; links close after it is released.
+    membership: Arc<Mutex<()>>,
+    /// Set (under the links lock) when the app quits: no link is put in after that.
+    closed: Arc<AtomicBool>,
     runtime: tokio::runtime::Handle,
     #[cfg(test)]
     seams: Seams,
@@ -1320,9 +1356,8 @@ impl Core {
     #[inline]
     fn at(&self, _point: &'static str) {}
 
-    /// The ssh every remote call uses: the person's OpenSSH, with only the environment it needs,
-    /// and prompts through `pitcrew-askpass` to the hub, behind the version gate.
-    fn ssh(&self) -> Result<Ssh, GatewayError> {
+    /// The ssh program and `pitcrew-askpass`, or why remote calls cannot run.
+    fn programs(&self) -> Result<(PathBuf, PathBuf), GatewayError> {
         let program = self
             .options
             .ssh
@@ -1333,14 +1368,24 @@ impl Core {
             .askpass
             .clone()
             .map_err(|why| GatewayError::internal(tidy(&why)))?;
-        let prompts = GatedPrompts::new(
-            program.clone(),
-            Arc::clone(&self.versions),
-            Arc::clone(&self.prompts),
-        );
-        let mut ssh = Ssh::new(program)
-            .with_env_passthrough(Vec::<String>::new())
-            .with_prompts(askpass, Arc::new(prompts) as Arc<dyn PromptHandler>);
+        Ok((program, askpass))
+    }
+
+    /// The ssh every remote call uses: the person's OpenSSH, with only the environment it needs.
+    /// Prompts go through `pitcrew-askpass` to the hub, behind the version gate, only once
+    /// `ssh -V` said 8.4 or newer; otherwise ssh runs in `BatchMode` and never asks ([`gate`]).
+    /// This takes the verdict as known now: [`Core::checked_ssh`] asks first.
+    fn ssh(&self) -> Result<Ssh, GatewayError> {
+        let (program, askpass) = self.programs()?;
+        let mut ssh = Ssh::new(program.clone()).with_env_passthrough(Vec::<String>::new());
+        if self.ssh_check().prompts_allowed() {
+            let prompts = GatedPrompts::new(
+                program,
+                Arc::clone(&self.versions),
+                Arc::clone(&self.prompts),
+            );
+            ssh = ssh.with_prompts(askpass, Arc::new(prompts) as Arc<dyn PromptHandler>);
+        }
         if let Some(dir) = &self.options.runtime_dir {
             ssh = ssh.with_runtime_dir(dir);
         }
@@ -1350,11 +1395,12 @@ impl Core {
         Ok(ssh)
     }
 
-    /// [`Core::ssh`], once `ssh -V` has been asked (so a refused prompt's error can say why).
+    /// [`Core::ssh`], once `ssh -V` has been asked: it gets prompts only if they may be shown,
+    /// and a refused sign-in's error can say why.
     async fn checked_ssh(&self) -> Result<Ssh, GatewayError> {
-        let ssh = self.ssh()?;
+        self.programs()?;
         self.ssh_check().ask().await;
-        Ok(ssh)
+        self.ssh()
     }
 
     /// Whether this computer's ssh may answer prompts.
@@ -1454,7 +1500,7 @@ impl Core {
             Err(e) => {
                 tracing::warn!(workspace = %id, error = %e, "cannot reach a remote workspace");
                 self.registry
-                    .set_state(id, WorkspaceState::Unreachable, Some(e.message));
+                    .set_remote_state(id, WorkspaceState::Unreachable, Some(e.message));
                 return false;
             }
         };
@@ -1467,10 +1513,11 @@ impl Core {
         self.install(id, tunnel, connector, ended)
     }
 
-    /// Puts in a link following `tunnel` for workspace `id`, with `connector` attached, if the
-    /// workspace is still registered; the link it replaces closes. Checked under the links lock,
-    /// and [`Remotes::remove`] takes the workspace out of the registry before it takes its link
-    /// out: a link put in before is closed by the remove, and one after finds no workspace.
+    /// Puts in a link following `tunnel` for workspace `id`, with `connector` attached, if `id`
+    /// is still a registered remote workspace and the app is not quitting; the link it replaces
+    /// closes. Checked under the links lock, and [`Remotes::remove`] takes the workspace out of
+    /// the registry before it takes its link out: a link put in before is closed by the remove,
+    /// and one after finds no workspace. [`Remotes::shutdown`] sets `closed` under the same lock.
     /// Otherwise `tunnel` closes. Whether the link was put in.
     fn install(
         &self,
@@ -1480,13 +1527,22 @@ impl Core {
         ended: Option<Ended>,
     ) -> bool {
         let mut links = self.lock_links();
-        if self.registry.record(id).is_none() {
+        let quitting = self.closed.load(Ordering::SeqCst);
+        let remote = self
+            .registry
+            .record(id)
+            .is_some_and(|r| r.kind == WorkspaceKind::Remote);
+        if quitting || !remote {
             drop(links);
-            tracing::info!(workspace = %id, "the workspace was removed meanwhile; its new connection is closed");
+            if quitting {
+                tracing::info!(workspace = %id, "the app is quitting; a new connection is closed");
+            } else {
+                tracing::info!(workspace = %id, "the workspace was removed meanwhile; its new connection is closed");
+            }
             self.runtime.spawn(async move { tunnel.close().await });
             return false;
         }
-        self.registry.attach(id, connector);
+        self.registry.attach_remote(id, connector);
         let link = Link::start(id.to_owned(), tunnel, self.follow(), ended, &self.runtime);
         let old = links.insert(id.to_owned(), Arc::new(link));
         drop(links);
@@ -1564,9 +1620,10 @@ impl Core {
     ///
     /// The id is claimed in the registry first, in one step that refuses another workspace's id
     /// (the local one's, or a remote one's on another machine), and only then is the token kept
-    /// under it; if keeping it fails, the claim is undone. A remove that comes meanwhile takes
-    /// the workspace out, maybe before the token is kept: then the token is deleted again, no
-    /// link is put in, and pairing fails.
+    /// under it; if keeping it fails, the claim is undone. Claim, token and link go under the
+    /// membership lock, as remove's token, entry and link do, so a remove of the same id comes
+    /// wholly before or wholly after; so does the app quitting ([`Remotes::shutdown`] takes it
+    /// too), which makes pairing fail before it claims anything.
     fn keep(
         &self,
         host: &str,
@@ -1576,6 +1633,10 @@ impl Core {
         name: &str,
         token: DeviceToken,
     ) -> Result<GatewayWorkspace, GatewayError> {
+        let _membership = self.lock_membership();
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(quitting(host));
+        }
         let name = workspace_name(name);
         let connector: Arc<dyn Connector> = Arc::new(RemoteConnector::new(
             id.to_owned(),
@@ -1614,14 +1675,17 @@ impl Core {
             )));
         }
         drop(token);
+        // Under the membership lock the entry cannot go, nor the app start quitting: this puts
+        // the link in. Should it not, nothing of this pairing stays.
         if !self.install(id, tunnel, connector, None) {
-            tracing::info!(host, workspace = %id, "the workspace was removed while it was being added");
             if let Err(e) = self.tokens.delete(id) {
-                tracing::warn!(workspace = %id, error = %e, "cannot delete the token of a workspace removed meanwhile");
+                tracing::warn!(workspace = %id, error = %e, "cannot delete the token of a pairing that did not finish");
             }
-            return Err(removed_meanwhile(host));
+            self.registry.unclaim(claimed);
+            return Err(quitting(host));
         }
-        self.registry.set_state(id, WorkspaceState::Ready, None);
+        self.registry
+            .set_remote_state(id, WorkspaceState::Ready, None);
         Ok(self
             .registry
             .list()
@@ -1688,6 +1752,12 @@ impl Core {
 
     fn lock_links(&self) -> MutexGuard<'_, HashMap<String, Arc<Link>>> {
         self.links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_membership(&self) -> MutexGuard<'_, ()> {
+        self.membership
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }

@@ -235,10 +235,20 @@ impl Link {
         }
     }
 
-    /// Stops the tunnel (every connection through it ends) and the task following it.
+    /// Stops the task following the tunnel, at once, then the tunnel (every connection through it
+    /// ends): nothing it reports while closing reaches the workspace's state.
     pub(crate) async fn close(&self) {
-        self.tunnel.close().await;
         self.detach();
+        self.tunnel.close().await;
+    }
+
+    /// Whether a task still follows the tunnel (tests).
+    #[cfg(test)]
+    pub(crate) fn following(&self) -> bool {
+        self.follower
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
     }
 }
 
@@ -290,7 +300,7 @@ async fn follow_tunnel(workspace: String, tunnel: Tunnel, follow: Follow, mut en
             });
         }
         tracing::debug!(%workspace, host = tunnel.host(), ?state, "remote link");
-        follow.registry.set_state(&workspace, state, detail);
+        follow.registry.set_remote_state(&workspace, state, detail);
         if now.is_connected() {
             if let Some(transport) = tunnel.transport()
                 && let Err(e) = follow.registry.set_transport(&workspace, transport)
