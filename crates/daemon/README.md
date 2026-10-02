@@ -421,9 +421,10 @@ user's `~/.tmux.conf` does not, and the user's own tmux server is never touched.
 **`GET /v1/sessions/{id}/terminal`** is answered by `SessionTerminals` (`src/terminals.rs`): a
 session the hub does not know is `404`; one on another machine `503` (no remote runners yet); one
 on this machine is `RunnerTerminals`' to find, `404` while it has no terminal (a session PitCrew
-did not start, or any without a runtime). Every runtime call, `screen()` included, runs on the
-runner's own small pool, bounded (5 seconds; starting a program 30), and the route calls the seam
-on the blocking pool, bounded too.
+did not start, or any without a runtime). Every runtime call goes through `RunnerTerminals`, which
+runs it on the runner's own small pool, bounded (5 seconds; starting a program 30), and the route
+calls the seam on the blocking pool, bounded too. Nothing in the daemon calls `screen()` yet; it
+would go the same way (the runtime's README: call it from a blocking thread).
 
 **Session commands** (`src/sessions.rs`, device routes) are run by the runner's `RunnerCommands`:
 
@@ -591,7 +592,7 @@ without `--homes` watches that folder, never the machine's own. Transcripts come
 default a socket in a folder whose parent does not exist, which the runtime refuses (making
 nothing), so the daemon serves without a terminal runtime, as on a machine without tmux; the tmux
 test gives its daemons a private socket in its temporary folder. None uses PitCrew's default
-socket or the user's tmux server.
+socket or the user's tmux server (detection still runs `tmux -V`, which reaches no server).
 
 `tests/serve.rs` starts the real binary on a temporary state directory and a free port, and
 covers `--version`, `token show-path`, tokens and scopes, the work routes (with the workspace,

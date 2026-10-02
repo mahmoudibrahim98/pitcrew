@@ -326,6 +326,7 @@ async fn discovered(
 ) -> Result<Option<Session>, ErrorResponse> {
     let started = Instant::now();
     let mut rescans = RESCANS.iter().peekable();
+    let mut warned = false;
     let filter = SessionFilter {
         machine: Some(runner.machine),
         ..SessionFilter::default()
@@ -338,7 +339,11 @@ async fn discovered(
                     return Ok(Some(found));
                 }
             }
-            Err(e) => tracing::warn!(error = %e, "cannot list sessions to find a started one"),
+            Err(e) if !warned => {
+                warned = true;
+                tracing::warn!(error = %e, "cannot list sessions to find a started one");
+            }
+            Err(e) => tracing::debug!(error = %e, "cannot list sessions to find a started one"),
         }
         let waited = started.elapsed();
         if waited >= DISCOVERY {
