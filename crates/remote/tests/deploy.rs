@@ -824,19 +824,40 @@ mod unix {
     }
 
     pub(crate) fn comm(pid: u32) -> String {
-        std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        if let Ok(name) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+            return name.trim().to_owned();
+        }
+        // No /proc (macOS): ps names the command, there by its path.
+        Command::new("ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()])
+            .output()
+            .map(|out| {
+                let name = String::from_utf8_lossy(&out.stdout);
+                name.trim()
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            })
             .unwrap_or_default()
-            .trim()
-            .to_owned()
     }
 
-    /// The umask of a process (`self`, or a pid), as /proc prints it: `0022`.
-    pub(crate) fn umask_of(pid: &str) -> String {
-        std::fs::read_to_string(format!("/proc/{pid}/status"))
-            .unwrap()
+    /// This process's umask, as /proc prints it: `0022`.
+    pub(crate) fn own_umask() -> String {
+        use rustix::fs::Mode;
+        // Read by setting it, then put back at once (the cases run one at a time).
+        let mask = rustix::process::umask(Mode::empty());
+        rustix::process::umask(mask);
+        format!("{:04o}", mask.bits())
+    }
+
+    /// Another process's umask, as /proc prints it (`0022`), where there is a /proc to read it
+    /// from (Linux); `None` elsewhere.
+    pub(crate) fn umask_of(pid: u32) -> Option<String> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        status
             .lines()
             .find_map(|l| l.strip_prefix("Umask:").map(|v| v.trim().to_owned()))
-            .unwrap()
     }
 
     fn uname_n() -> String {
@@ -1163,13 +1184,14 @@ mod unix {
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        let touch = |when: &str| {
-            let touched = Command::new("touch")
-                .args(["-d", when])
-                .arg(&lock)
-                .status()
+        // Sets the lock directory's time to `minutes` ago (from here, not `touch`: GNU's and
+        // BSD's take different date forms).
+        let touch = |minutes: u64| {
+            let when = SystemTime::now() - Duration::from_secs(minutes * 60);
+            std::fs::File::open(&lock)
+                .unwrap()
+                .set_modified(when)
                 .unwrap();
-            assert!(touched.success());
         };
 
         // A fresh lock from another host (a login node sharing this home): it is waited for,
@@ -1185,12 +1207,12 @@ mod unix {
 
         // Its directory a little older than stale_lock (5 minutes) is not enough: clocks may
         // differ by up to 10 minutes...
-        touch("8 minutes ago");
+        touch(8);
         let err = block_on(deploy(&m.plain(), &helper("1.0.0"), &impatient)).unwrap_err();
         assert!(matches!(err, HelperError::Busy(_)), "{err:?}");
 
         // ...beyond that it is broken.
-        touch("16 minutes ago");
+        touch(16);
         block_on(deploy(&m.plain(), &helper("1.0.0"), &impatient)).unwrap();
         assert!(!lock.exists());
 
@@ -1230,7 +1252,7 @@ mod unix {
             ),
         )
         .unwrap();
-        touch("now");
+        touch(0);
         block_on(deploy(&m.plain(), &helper("3.0.0"), &impatient)).unwrap();
         assert!(!lock.exists());
 
@@ -1266,7 +1288,7 @@ mod unix {
             std::fs::write(lock.join("owner"), &owner).unwrap();
             let err = block_on(deploy(&m.plain(), &helper("4.0.0"), &impatient)).unwrap_err();
             assert!(matches!(err, HelperError::Busy(_)), "{owner}: {err:?}");
-            touch("16 minutes ago");
+            touch(16);
             block_on(deploy(&m.plain(), &helper("4.0.0"), &impatient)).unwrap();
             assert!(!lock.exists(), "{owner}");
         }
@@ -1424,8 +1446,9 @@ mod unix {
         let probe = block_on(fake.ssh.probe("cluster")).unwrap();
         let target = Target::new(fake.ssh.clone(), "cluster", &probe).unwrap();
         assert_eq!(target.layout(), &m.layout());
-        let want = match std::env::consts::ARCH {
-            "aarch64" => Platform::LinuxAarch64,
+        let want = match (std::env::consts::OS, std::env::consts::ARCH) {
+            ("macos", _) => Platform::MacOs,
+            (_, "aarch64") => Platform::LinuxAarch64,
             _ => Platform::LinuxX86_64,
         };
         assert_eq!(target.platform(), want);
@@ -1573,11 +1596,17 @@ mod unix {
     fn mv_without_t_falls_back() {
         let real = which("mv").unwrap();
         let real = real.display();
-        // BSD: -h instead of -T.
+        // BSD: -h instead of -T. Played over the real `mv`, with its own flag for it (macOS's is
+        // BSD's already).
+        let no_follow = if cfg!(target_os = "macos") {
+            "-h"
+        } else {
+            "-T"
+        };
         let bsd = format!(
             "case \"$1\" in\n\
              -T) echo 'mv: illegal option -- T' >&2; exit 64 ;;\n\
-             -h) shift; exec '{real}' -T \"$@\" ;;\n\
+             -h) shift; exec '{real}' {no_follow} \"$@\" ;;\n\
              esac\n\
              exec '{real}' \"$@\""
         );
@@ -1969,7 +1998,11 @@ mod unix {
         block_on(deploy(&target, &helper("1.0.0"), &quick())).unwrap();
         let launcher = DirectLauncher::new(launch_options());
         let started = block_on(launcher.start(&target)).unwrap();
-        assert_eq!(umask_of(&started.endpoint.pid.to_string()), "0027");
+        // Read from outside where /proc allows (Linux); everywhere, the helper's own report
+        // below says it too.
+        if let Some(mask) = umask_of(started.endpoint.pid) {
+            assert_eq!(mask, "0027");
+        }
         // What the script made stays private all the same.
         assert_private(&m.root());
         block_on(launcher.stop(&target)).unwrap();
@@ -2062,12 +2095,22 @@ mod unix {
 
         let m = Machine::new();
         std::fs::set_permissions(&m.home, std::fs::Permissions::from_mode(0o2755)).unwrap();
+        // Linux gives a new directory its parent's set-group-ID bit; BSD and macOS do not (the
+        // group is always the parent's there). Whichever this system does is accepted.
+        let probe = m.home.join("probe");
+        std::fs::create_dir(&probe).unwrap();
+        let private = if mode(&probe) & 0o2000 != 0 {
+            0o2700
+        } else {
+            0o700
+        };
+        std::fs::remove_dir(&probe).unwrap();
         block_on(deploy(&m.plain(), &helper("1.0.0"), &quick())).unwrap();
-        assert_eq!(mode(&m.root()), 0o2700);
-        assert_eq!(mode(&m.bin_dir()), 0o2700);
+        assert_eq!(mode(&m.root()), private);
+        assert_eq!(mode(&m.bin_dir()), private);
         let launcher = DirectLauncher::new(launch_options());
         block_on(launcher.start(&m.plain())).unwrap();
-        assert_eq!(mode(&m.run_dir()), 0o2700);
+        assert_eq!(mode(&m.run_dir()), private);
         assert!(block_on(launcher.stop(&m.plain())).unwrap().pid.is_some());
     }
 
@@ -2210,7 +2253,7 @@ mod unix {
             "{log}"
         );
         assert!(
-            log.contains(&format!("fake pitcrewd umask {}\n", umask_of("self"))),
+            log.contains(&format!("fake pitcrewd umask {}\n", own_umask())),
             "{log}"
         );
         assert_eq!(mode(&m.run_dir().join("pitcrewd.log")), 0o600);
