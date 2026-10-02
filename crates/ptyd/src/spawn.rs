@@ -313,13 +313,20 @@ mod tests {
         let path = OsString::from("relative/bin::/usr/bin:/bin");
         let sh = find("sh", Some(&path), Path::new("/")).expect("sh");
         assert!(sh.is_absolute() && sh.ends_with("sh"), "{}", sh.display());
-        for builtin in ["eval", "exec", "trap", "cd"] {
+        for builtin in ["eval", "exec", "trap"] {
             assert_eq!(
                 find(builtin, Some(&path), Path::new("/")),
                 None,
                 "{builtin}"
             );
         }
+        // `cd` has no file on Linux, but macOS ships a `/usr/bin/cd` script: a program file like
+        // any other, so it is found there.
+        let cd = ["/usr/bin/cd", "/bin/cd"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|file| file.is_file());
+        assert_eq!(find("cd", Some(&path), Path::new("/")), cd);
         assert_eq!(find("sh", None, Path::new("/")), None);
         assert_eq!(
             find("bin/sh", Some(&path), Path::new("/")),
