@@ -88,12 +88,14 @@ A fresh hub has a device token but no person, no machine and no name. The deskto
   - `person.handle` is `@` followed by 1–32 of `a-z 0-9 _ -`;
   - `machine_name` is 1–60 characters.
   - The three names are counted in Unicode code points after trimming whitespace, and stored
-    trimmed. The handle is not trimmed.
+    trimmed. Whitespace is what JavaScript's `String.prototype.trim` removes, so the hub and the
+    mock agree. The handle is not trimmed.
   - None of them may contain control characters. Anything else is `400 invalid`.
 - **Once only:** `409 conflict` when the workspace already has a person, or when the handle is
-  taken. An agent token gets `403`.
+  taken. `@office` is reserved for the back office and is always taken. An agent token gets `403`.
 - **After setup,** the hub starts what needed a person: the back office, and the runner on this
-  machine. `setup_needed` becomes `false`.
+  machine. `setup_needed` becomes `false` at once. The answer may come a moment before they have
+  started: `GET /v1/host/info`'s roles show the runner once it runs.
 - **The mock** starts with the demo's person, so `setup_needed` is `false` and setup answers
   `409`. Start it with `PITCREW_MOCK_FRESH=1` for an empty workspace (no members, machines or
   work) whose setup succeeds once.
