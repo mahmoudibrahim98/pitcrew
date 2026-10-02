@@ -12,10 +12,12 @@ pub mod control;
 pub mod detect;
 pub mod keys;
 pub mod replay;
+pub mod tmux;
 
 pub use control::{ControlParser, Notification, PaneId, SessionId, WindowId};
 pub use detect::{TmuxVersion, detect_tmux};
 pub use replay::ReplayBuffer;
+pub use tmux::TmuxOptions;
 
 /// The protocol version this crate was built against.
 pub const PROTOCOL_VERSION: u32 = pitcrew_protocol::PROTOCOL_VERSION;
