@@ -27,5 +27,9 @@ insta.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 
+[target.'cfg(unix)'.dev-dependencies]
+# The effective uid: the unreadable-file test skips itself as root, who reads anything.
+rustix = { version = "=1.1.5", features = ["process"] }
+
 [lints]
 workspace = true
