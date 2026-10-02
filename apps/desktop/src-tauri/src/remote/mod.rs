@@ -20,9 +20,10 @@
 //! only into the `Authorization` header or the WebSocket subprotocol of a request to that hub.
 //! It is never in a result, an event, an error, a log line or a file of ours.
 //!
-//! **Prompts** (passwords, passphrases, one-time codes, host keys) from any of these calls, and
-//! from the tunnel reconnecting, go through `pitcrew-askpass` to the [`PromptHub`]
-//! ([`prompt`]). A missing `pitcrew-askpass` is a clear error before any ssh call.
+//! **Prompts** (passwords, passphrases, one-time codes, host keys, other yes/no questions and
+//! notices) from any of these calls, and from the tunnel reconnecting, go through
+//! `pitcrew-askpass` to the [`PromptHub`] ([`prompt`]). A missing `pitcrew-askpass` (or a
+//! configured `ssh` that fails its checks) is a clear error before any ssh call.
 //!
 //! **Afterwards** each remote workspace has a [`link::Link`]: the tunnel's `Connector`, which
 //! reconnects by itself, and a task keeping the workspace's state in step with it. At start,

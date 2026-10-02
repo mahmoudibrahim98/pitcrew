@@ -1,5 +1,5 @@
 //! SSH's questions, asked in the app (the contract's "Prompts"): a password, a key's passphrase,
-//! a one-time code, or whether to trust a host key.
+//! a one-time code, whether to trust a host key, another yes/no question, or a notice.
 //!
 //! [`PromptHub`] is the [`PromptHandler`] every remote ssh call gets (through
 //! `pitcrew-askpass`). For each question it emits `gateway://prompt` with a [`GatewayPrompt`] and
@@ -7,15 +7,17 @@
 //! when it was answered, and when it went stale first (ssh stopped waiting, or the call ended),
 //! so the dialog closes.
 //!
-//! - **Answers** go to ssh once, inside a [`Secret`] (overwritten when dropped), and are never
-//!   kept, logged or sent anywhere else.
+//! - **Kinds and replies.** `password`, `passphrase` and `otp` take `answer`; `host_key` (with
+//!   its `fingerprint`) and `confirm` (ssh's other yes/no questions, such as
+//!   `UpdateHostKeys=ask`'s "Accept updated hostkeys?") take `accept`; a `notice` ("touch your
+//!   security key") takes no answer and is closed when ssh moves on. A reply with neither
+//!   cancels: ssh stops (for a `confirm`, it answers no). A reply of the wrong shape is `invalid`
+//!   and the prompt stays open.
+//! - **Answers** go to ssh once, inside a [`Secret`], and are never kept, logged or sent
+//!   anywhere else.
 //! - **The text** is ssh's (and partly the server's): control, bidi and invisible characters are
 //!   removed (line breaks kept), and it is cut to [`MAX_TEXT`] characters. The UI shows it as
 //!   text, with the host that asks.
-//! - **Kinds.** The contract has four. SSH's yes/no questions other than a host key
-//!   (`UpdateHostKeys=ask`'s "Accept updated hostkeys?", a key's use to confirm) and its notices
-//!   ("touch your security key") are shown as `host_key`: accept answers yes, anything else no
-//!   (for a notice, it stops ssh).
 //! - **A page that (re)loads** gets the open prompts again when it first asks for the workspaces
 //!   ([`PromptHub::page_listening`]), so a prompt raised while no page listened (at start, while
 //!   reconnecting) is not lost. Prompts are keyed by id: the UI shows one id once.
@@ -66,8 +68,12 @@ pub enum PromptKindName {
     Passphrase,
     /// A one-time code.
     Otp,
-    /// A yes/no question: a new host key, or another confirmation.
+    /// Whether to trust a new host key.
     HostKey,
+    /// Another yes/no question.
+    Confirm,
+    /// Information only; closed when ssh moves on.
+    Notice,
 }
 
 impl From<PromptKind> for PromptKindName {
@@ -76,8 +82,22 @@ impl From<PromptKind> for PromptKindName {
             PromptKind::Password => Self::Password,
             PromptKind::Passphrase => Self::Passphrase,
             PromptKind::Otp => Self::Otp,
-            _ => Self::HostKey,
+            PromptKind::HostKey => Self::HostKey,
+            PromptKind::Confirm => Self::Confirm,
+            PromptKind::Notice => Self::Notice,
         }
+    }
+}
+
+impl PromptKindName {
+    /// Whether the reply is typed text.
+    fn takes_answer(self) -> bool {
+        matches!(self, Self::Password | Self::Passphrase | Self::Otp)
+    }
+
+    /// Whether the reply is yes or no.
+    fn takes_accept(self) -> bool {
+        matches!(self, Self::HostKey | Self::Confirm)
     }
 }
 
@@ -164,38 +184,49 @@ impl PromptHub {
     }
 
     /// `gateway_prompt_reply`: `answer` for a password, passphrase or one-time code, `accept` for
-    /// a yes/no question; neither cancels. The answer goes to ssh once and is then overwritten.
+    /// a host key or a `confirm`, neither for a notice; neither cancels any prompt. The answer
+    /// goes to ssh once.
     ///
     /// # Errors
-    /// `invalid`: both given, an answer over [`MAX_ANSWER`] bytes, or no such open prompt (it
-    /// was answered, or went stale).
+    /// `invalid`, with the prompt still open: both given, an answer over [`MAX_ANSWER`] bytes, or
+    /// a reply of the wrong shape for the prompt's kind. `invalid` too when no such prompt is
+    /// open (it was answered, or went stale).
     pub fn reply(
         &self,
         id: &str,
         answer: Option<Secret>,
         accept: Option<bool>,
     ) -> Result<(), GatewayError> {
+        let invalid = |why: &str| Err(GatewayError::invalid(why.to_owned()));
+        let mut pending = self.lock();
+        let Some(kind) = pending.get(id).map(|p| p.prompt.kind) else {
+            return Err(GatewayError::invalid(format!(
+                "no prompt {} is open",
+                crate::gateway::error::shorten(id)
+            )));
+        };
         let reply = match (answer, accept) {
-            (Some(_), Some(_)) => {
-                return Err(GatewayError::invalid(
-                    "reply with answer or accept, not both",
-                ));
-            }
+            (Some(_), Some(_)) => return invalid("reply with answer or accept, not both"),
             (Some(answer), None) if answer.expose().len() > MAX_ANSWER => {
                 return Err(GatewayError::invalid(format!(
                     "an answer is at most {MAX_ANSWER} bytes"
                 )));
             }
+            (Some(_), None) if !kind.takes_answer() => {
+                return invalid("this prompt takes accept (or neither), not an answer");
+            }
+            (None, Some(_)) if !kind.takes_accept() => {
+                return invalid("this prompt takes an answer (or neither), not accept");
+            }
             (Some(answer), None) => Reply::Text(answer),
             (None, Some(true)) => Reply::Accept,
             (None, Some(false) | None) => Reply::Cancel,
         };
-        let pending = self.lock().remove(id).ok_or_else(|| {
-            GatewayError::invalid(format!(
-                "no prompt {} is open",
-                crate::gateway::error::shorten(id)
-            ))
-        })?;
+        let taken = pending.remove(id);
+        drop(pending);
+        let Some(pending) = taken else {
+            return invalid("the prompt closed");
+        };
         let cancelled = matches!(reply, Reply::Cancel);
         // The waiting call takes it; if it went stale meanwhile, the answer is dropped here.
         let _ = pending.reply.send(reply);
@@ -451,6 +482,101 @@ mod tests {
         );
     }
 
+    /// Asks `kind` and returns the open prompt, and the call waiting for its reply.
+    async fn ask(
+        hub: &Arc<PromptHub>,
+        events: &Mutex<Vec<PromptEvent>>,
+        n: usize,
+        kind: PromptKind,
+    ) -> (GatewayPrompt, tokio::task::JoinHandle<Reply>) {
+        let (trigger, cancel) = PromptCancel::pair();
+        let asking = tokio::spawn({
+            let hub = Arc::clone(hub);
+            async move {
+                let reply = hub.prompt(request(kind, "Question? "), cancel).await;
+                drop(trigger);
+                reply
+            }
+        });
+        (opened(events, n).await, asking)
+    }
+
+    #[tokio::test]
+    async fn an_answer_is_at_most_4_kib() {
+        let (hub, events) = hub();
+        let (prompt, asking) = ask(&hub, &events, 0, PromptKind::Password).await;
+        let e = hub
+            .reply(
+                &prompt.id,
+                Some(Secret::new("x".repeat(MAX_ANSWER + 1))),
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(e.code, crate::gateway::ErrorCode::Invalid);
+        assert!(e.message.contains("4096"), "{}", e.message);
+        assert_eq!(hub.open().len(), 1, "the prompt stays open");
+        hub.reply(&prompt.id, Some(Secret::new("x".repeat(MAX_ANSWER))), None)
+            .unwrap();
+        match asking.await.unwrap() {
+            Reply::Text(secret) => assert_eq!(secret.expose().len(), MAX_ANSWER),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn each_kind_takes_its_own_reply() {
+        let (hub, events) = hub();
+        for (n, (kind, name, wrong, right)) in [
+            (
+                PromptKind::Otp,
+                "otp",
+                (None, Some(true)),
+                (Some("123456"), None),
+            ),
+            (
+                PromptKind::HostKey,
+                "host_key",
+                (Some("yes"), None),
+                (None, Some(true)),
+            ),
+            (
+                PromptKind::Confirm,
+                "confirm",
+                (Some("yes"), None),
+                (None, Some(false)),
+            ),
+            (
+                PromptKind::Notice,
+                "notice",
+                (None, Some(true)),
+                (None, None),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (prompt, asking) = ask(&hub, &events, n, kind).await;
+            assert_eq!(serde_json::to_value(prompt.kind).unwrap(), name);
+            let (answer, accept) = wrong;
+            let e = hub
+                .reply(&prompt.id, answer.map(Secret::new), accept)
+                .unwrap_err();
+            assert_eq!(e.code, crate::gateway::ErrorCode::Invalid, "{name}");
+            assert_eq!(hub.open().len(), 1, "{name}: still open");
+            let (answer, accept) = right;
+            hub.reply(&prompt.id, answer.map(Secret::new), accept)
+                .unwrap();
+            let reply = asking.await.unwrap();
+            match name {
+                "otp" => assert!(matches!(reply, Reply::Text(_))),
+                "host_key" => assert!(matches!(reply, Reply::Accept)),
+                // No to a yes/no question, and nothing to a notice: both are a cancel here,
+                // which pitcrew-remote turns into "no" for a confirm and stops ssh for a notice.
+                _ => assert!(matches!(reply, Reply::Cancel)),
+            }
+        }
+    }
+
     #[test]
     fn text_is_cleaned() {
         assert_eq!(
@@ -464,8 +590,8 @@ mod tests {
             (PromptKind::Passphrase, "passphrase"),
             (PromptKind::Otp, "otp"),
             (PromptKind::HostKey, "host_key"),
-            (PromptKind::Confirm, "host_key"),
-            (PromptKind::Notice, "host_key"),
+            (PromptKind::Confirm, "confirm"),
+            (PromptKind::Notice, "notice"),
         ] {
             assert_eq!(
                 serde_json::to_value(PromptKindName::from(kind)).unwrap(),

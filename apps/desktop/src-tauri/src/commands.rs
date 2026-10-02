@@ -122,8 +122,8 @@ pub async fn gateway_workspace_remove<R: Runtime>(
 }
 
 /// `gateway_prompt_reply({ id, answer?, accept? })`: `answer` for a password, passphrase or
-/// one-time code, `accept` for a host key; neither cancels. The answer is passed to ssh once,
-/// and never kept or logged.
+/// one-time code, `accept` for a host key or a `confirm`, neither for a `notice`; neither cancels
+/// any prompt. The answer is passed to ssh once, and never kept or logged.
 #[tauri::command]
 pub fn gateway_prompt_reply<R: Runtime>(
     webview: Webview<R>,
