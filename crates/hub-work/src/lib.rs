@@ -76,6 +76,7 @@ mod office;
 pub mod projection;
 pub mod query;
 pub mod recap;
+mod recap_db;
 pub mod routes;
 mod seed;
 mod service;

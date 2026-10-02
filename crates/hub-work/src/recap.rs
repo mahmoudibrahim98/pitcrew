@@ -49,6 +49,7 @@
 use crate::codec::sql_rev;
 use crate::error::{Result, WorkError};
 use crate::projection::Tasks;
+use crate::recap_db::{self, BlockDb, Scope};
 use crate::service::WorkService;
 use pitcrew_protocol::events::{BriefTarget, Event, EventBody};
 use pitcrew_protocol::ids::{EventId, MemberId, ProjectId, SessionId, TaskId, WorkstreamId};
@@ -61,10 +62,10 @@ use pitcrew_recap::{
     BlockBuilder, Config, Directory, RuleSummarizer, block_line, date_of, day_recaps,
 };
 use pitcrew_store::sql::{Connection, OptionalExtension, params};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
-use std::ops::Bound;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
 use std::sync::{MutexGuard, PoisonError};
 
 /// The most day paragraphs a [`Recaps`] keeps by default.
@@ -159,64 +160,6 @@ pub trait RecapIndex: Send + Sync + std::fmt::Debug {
         before: Option<&Date>,
         limit: Option<usize>,
     ) -> Result<DaysPage>;
-}
-
-/// The blocks linked to one workstream or project: by id, for filters, and by start, for days.
-#[derive(Debug, Default)]
-struct Linked {
-    ids: BTreeSet<EventId>,
-    starts: BTreeSet<(TimestampMs, EventId)>,
-}
-
-impl Linked {
-    fn add(&mut self, id: EventId, start: TimestampMs) {
-        self.ids.insert(id);
-        self.starts.insert((start, id));
-    }
-
-    fn remove(&mut self, id: EventId, start: TimestampMs) {
-        self.ids.remove(&id);
-        self.starts.remove(&(start, id));
-    }
-
-    fn is_empty(&self) -> bool {
-        self.ids.is_empty()
-    }
-}
-
-/// What a block is indexed by.
-#[derive(Debug, PartialEq, Eq)]
-struct Links {
-    start: TimestampMs,
-    session: Option<SessionId>,
-    tasks: Vec<TaskId>,
-    workstream: Option<WorkstreamId>,
-    project: Option<ProjectId>,
-}
-
-impl Links {
-    fn of(block: &Block) -> Self {
-        Self {
-            start: block.start,
-            session: block.session,
-            tasks: block.tasks.clone(),
-            workstream: block.workstream,
-            project: block.project,
-        }
-    }
-}
-
-fn add_id<K: Hash + Eq>(map: &mut HashMap<K, BTreeSet<EventId>>, key: K, id: EventId) {
-    map.entry(key).or_default().insert(id);
-}
-
-fn remove_id<K: Hash + Eq>(map: &mut HashMap<K, BTreeSet<EventId>>, key: K, id: EventId) {
-    if let Some(set) = map.get_mut(&key) {
-        set.remove(&id);
-        if set.is_empty() {
-            map.remove(&key);
-        }
-    }
 }
 
 /// Most ids [`Unnamed`] and the asks' descriptions hold. Ids come from untrusted events; past this,
@@ -446,8 +389,17 @@ impl DayCache {
 /// The recaps of a log: the recap engine's blocks, kept current as events are pushed, with their
 /// lines and day paragraphs. See the [module docs](self).
 ///
-/// Pure and in memory: it reads no store and no clock. [`WorkService`] keeps one current from its
-/// store; build one directly to recap a slice of a log, e.g. the demo fixture's.
+/// It reads no store and no clock. [`WorkService`] keeps one current from its store; build one
+/// directly to recap a slice of a log, e.g. the demo fixture's.
+///
+/// **Where the blocks are.** The engine keeps what it needs to go on (its directory and the blocks
+/// still open); every block made so far, open or closed, is in a SQLite database of the index's
+/// own, in memory ([`Recaps::new`]) or in a file ([`Recaps::in_file`]), so a long history need not
+/// be held in memory. Queries read the blocks they answer with from there.
+///
+/// **Broken.** If storing a batch of blocks fails (a full disk), the database is behind the engine
+/// and cannot catch up: the index counts as broken ([`Recaps::is_broken`]), every query answers an
+/// internal error, and [`WorkService`] builds a new one from the log.
 pub struct Recaps {
     /// The one directory, for both grouping events into blocks and naming things in lines and
     /// paragraphs: `builder.directory()`.
@@ -462,19 +414,19 @@ pub struct Recaps {
     unnamed: Unnamed,
     /// Events the engine panicked on, left out.
     failed: u64,
-    blocks: BTreeMap<EventId, Block>,
-    sessions: HashMap<SessionId, BTreeSet<EventId>>,
-    tasks: HashMap<TaskId, BTreeSet<EventId>>,
-    workstreams: HashMap<WorkstreamId, Linked>,
-    projects: HashMap<ProjectId, Linked>,
+    /// Every block, indexed by its links; `None` if it could not be opened.
+    db: Option<BlockDb>,
+    /// Why the blocks are not what the engine made (see "Broken" above).
+    broken: Option<String>,
     cache: DayCache,
 }
 
 impl std::fmt::Debug for Recaps {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Recaps")
-            .field("blocks", &self.blocks.len())
+            .field("blocks", &self.len())
             .field("cached_days", &self.cache.entries.len())
+            .field("broken", &self.broken)
             .finish_non_exhaustive()
     }
 }
@@ -482,7 +434,7 @@ impl std::fmt::Debug for Recaps {
 impl Recaps {
     /// Recaps with the engine's default settings (the contract's gap and caps). `seed` is what was
     /// known before the first event pushed: `None` for a log read from its start, or the
-    /// projections' lists for a slice of one.
+    /// projections' lists for a slice of one. The blocks are kept in memory.
     #[must_use]
     pub fn new(seed: Option<Directory>) -> Self {
         Self::with_config(Config::default(), seed)
@@ -491,17 +443,47 @@ impl Recaps {
     /// Recaps with other engine settings.
     #[must_use]
     pub fn with_config(config: Config, seed: Option<Directory>) -> Self {
+        let (db, broken) = match BlockDb::memory() {
+            Ok(db) => (Some(db), None),
+            Err(e) => (None, Some(format!("cannot open the recap blocks' database: {e}"))),
+        };
         Self {
             builder: BlockBuilder::new(config, seed.unwrap_or_default()),
             names_gen: 0,
             unnamed: Unnamed::default(),
             failed: 0,
-            blocks: BTreeMap::new(),
-            sessions: HashMap::new(),
-            tasks: HashMap::new(),
-            workstreams: HashMap::new(),
-            projects: HashMap::new(),
+            db,
+            broken,
             cache: DayCache::new(DAY_CACHE_ENTRIES),
+        }
+    }
+
+    /// Keeps the blocks in a database file at `path` instead of memory: a cache, replaced if
+    /// something is there already, and removed when these recaps are dropped. Call it before the
+    /// first [`Recaps::push`]. The file is private to the user (0600 on Unix).
+    ///
+    /// # Errors
+    ///
+    /// `invalid` if blocks were pushed already; an internal error if the file cannot be made.
+    pub fn in_file(mut self, path: &Path) -> Result<Self> {
+        self.use_file(path)?;
+        Ok(self)
+    }
+
+    /// [`Recaps::in_file`] in place; on an error the blocks stay in memory.
+    fn use_file(&mut self, path: &Path) -> Result<()> {
+        if !self.is_empty() {
+            return Err(WorkError::invalid(
+                "the recap index already has blocks in memory",
+            ));
+        }
+        match BlockDb::file(path) {
+            Ok(db) => {
+                self.db = Some(db);
+                self.broken = None;
+                Ok(())
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -516,7 +498,7 @@ impl Recaps {
     ///
     /// An event the engine panics on is left out (and logged, and counted in
     /// [`Recaps::failed_events`]) rather than taking the index down; a rebuild leaves it out the
-    /// same way.
+    /// same way. If the blocks cannot be stored, the index is broken ([`Recaps::is_broken`]).
     pub fn push(&mut self, events: &[Event]) {
         for event in events {
             let taken = catch_unwind(AssertUnwindSafe(|| {
@@ -544,8 +526,54 @@ impl Recaps {
             }
         }
         let changes = self.builder.take_changes();
-        for block in changes.closed.into_iter().chain(changes.open) {
-            self.put(block);
+        let mut blocks = changes.closed;
+        blocks.extend(changes.open);
+        for block in &blocks {
+            self.unnamed.note(self.builder.directory(), block);
+        }
+        if self.broken.is_some() {
+            return;
+        }
+        #[cfg(test)]
+        let stored = tests::store_fails().map_or_else(|| self.store(&blocks), Err);
+        #[cfg(not(test))]
+        let stored = self.store(&blocks);
+        if let Err(e) = stored {
+            tracing::error!(error = %e, "the recap index cannot store its blocks; it is rebuilt");
+            self.broken = Some(e.to_string());
+        }
+    }
+
+    /// Stores blocks that began or changed.
+    fn store(&mut self, blocks: &[Block]) -> Result<()> {
+        self.db_mut()?.put(blocks)
+    }
+
+    /// Whether the blocks could not be stored, so the index no longer matches the log (see
+    /// "Broken" on [`Recaps`]).
+    #[must_use]
+    pub fn is_broken(&self) -> bool {
+        self.broken.is_some()
+    }
+
+    /// The blocks' database, unless the index is broken.
+    fn db(&self) -> Result<&BlockDb> {
+        match (&self.db, &self.broken) {
+            (Some(db), None) => Ok(db),
+            (_, broken) => Err(WorkError::internal(format!(
+                "the recap index is broken: {}",
+                broken.as_deref().unwrap_or("no database")
+            ))),
+        }
+    }
+
+    fn db_mut(&mut self) -> Result<&mut BlockDb> {
+        match (&mut self.db, &self.broken) {
+            (Some(db), None) => Ok(db),
+            (_, broken) => Err(WorkError::internal(format!(
+                "the recap index is broken: {}",
+                broken.as_deref().unwrap_or("no database")
+            ))),
         }
     }
 
@@ -600,13 +628,13 @@ impl Recaps {
     /// How many blocks there are, open and closed.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.blocks.len()
+        self.db.as_ref().map_or(0, BlockDb::len)
     }
 
     /// Whether there are no blocks yet.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
+        self.len() == 0
     }
 
     /// How many day paragraphs are cached.
@@ -639,62 +667,17 @@ impl Recaps {
         limit: Option<usize>,
     ) -> Result<BlocksPage> {
         let limit = page_limit(limit, BLOCKS_DEFAULT_LIMIT, BLOCKS_MAX_LIMIT)?;
-        let empty = || BlocksPage {
-            blocks: Vec::new(),
-            at_start: true,
-        };
-        // Walk the smallest set of blocks one of the filters names; with none, every block.
-        let named = [
-            filter.session.map(|s| self.sessions.get(&s)),
-            filter.task.map(|t| self.tasks.get(&t)),
-            filter
-                .workstream
-                .map(|w| self.workstreams.get(&w).map(|l| &l.ids)),
-            filter
-                .project
-                .map(|p| self.projects.get(&p).map(|l| &l.ids)),
-        ];
-        let mut smallest: Option<&BTreeSet<EventId>> = None;
-        for set in named.into_iter().flatten() {
-            let Some(set) = set else {
-                return Ok(empty());
-            };
-            if smallest.is_none_or(|s| set.len() < s.len()) {
-                smallest = Some(set);
-            }
-        }
-        let below = (
-            Bound::Unbounded,
-            before.map_or(Bound::Unbounded, Bound::Excluded),
-        );
-        let ids: Box<dyn Iterator<Item = &EventId> + '_> = match smallest {
-            Some(set) => Box::new(set.range(below).rev()),
-            None => Box::new(self.blocks.range(below).map(|(id, _)| id).rev()),
-        };
-        let mut blocks = Vec::new();
-        for id in ids {
-            let Some(block) = self.blocks.get(id) else {
-                continue;
-            };
-            if !filter.matches(block) {
-                continue;
-            }
-            if blocks.len() == limit {
-                return Ok(BlocksPage {
-                    blocks,
-                    at_start: false,
-                });
-            }
-            blocks.push(RecapBlock {
-                block: block.clone(),
-                line: guarded("writing a block's line", || {
-                    block_line(block, self.builder.directory())
-                })?,
-            });
+        let (found, more) = self.db()?.page(filter, before, limit)?;
+        let mut blocks = Vec::with_capacity(found.len());
+        for block in found {
+            let line = guarded("writing a block's line", || {
+                block_line(&block, self.builder.directory())
+            })?;
+            blocks.push(RecapBlock { block, line });
         }
         Ok(BlocksPage {
             blocks,
-            at_start: true,
+            at_start: !more,
         })
     }
 
@@ -723,36 +706,28 @@ impl Recaps {
         {
             return Err(WorkError::invalid("before must be a date, YYYY-MM-DD."));
         }
+        let db = self.db()?;
         let linked = match scope {
-            DaysScope::Workstream(w) => self.workstreams.get(&w),
-            DaysScope::Project(p) => self.projects.get(&p),
-        };
-        let Some(linked) = linked else {
-            return Ok(DaysPage {
-                days: Vec::new(),
-                at_start: true,
-            });
+            DaysScope::Workstream(w) => Scope::Workstream(recap_db::key(w.0)),
+            DaysScope::Project(p) => Scope::Project(recap_db::key(p.0)),
         };
         // Blocks that start before `before` begins at this offset fall on earlier days (except
         // where `date_of` clamps far-off times, which the date check below catches).
         let nil = EventId(ulid::Ulid::nil());
         let mut upper = before
             .and_then(|d| day_start(d, tz_minutes))
-            .map_or(Bound::Unbounded, |ms| Bound::Excluded((ms, nil)));
+            .map(|ms| (ms, nil));
         // A date at a time, newest first: the latest start below `upper` names the date, and
         // every block from that date's first millisecond up to it falls on it (a block's day only
         // grows with its start). Where `date_of` clamps far-off times, a block at a time.
-        let mut dates: Vec<(Date, Vec<&Block>)> = Vec::new();
+        let mut dates: Vec<(Date, Vec<Block>)> = Vec::new();
         let mut at_start = true;
-        while let Some(&(start, id)) = linked.starts.range((Bound::Unbounded, upper)).next_back() {
+        while let Some((start, id)) = db.latest(linked, upper)? {
             let date = date_of(start, tz_minutes);
             let lowest = day_start(&date, tz_minutes)
                 .filter(|ms| *ms <= start && date_of(*ms, tz_minutes) == date)
                 .map_or((start, id), |ms| (ms, nil));
-            let window = linked
-                .starts
-                .range((Bound::Included(lowest), Bound::Included((start, id))));
-            upper = Bound::Excluded(lowest);
+            upper = Some(lowest);
             if before.is_some_and(|b| date >= *b) {
                 continue;
             }
@@ -764,15 +739,16 @@ impl Recaps {
             if !same {
                 dates.push((date, Vec::new()));
             }
+            let window = db.window(linked, lowest, (start, id))?;
             if let Some((_, blocks)) = dates.last_mut() {
-                blocks.extend(window.rev().filter_map(|(_, id)| self.blocks.get(id)));
+                blocks.extend(window);
             }
         }
         let mut days = Vec::new();
         for (date, blocks) in dates {
             // The entry without a workstream first (`None` sorts first), then by workstream id.
             let mut groups: BTreeMap<Option<WorkstreamId>, Vec<&Block>> = BTreeMap::new();
-            for block in blocks {
+            for block in &blocks {
                 groups.entry(block.workstream).or_default().push(block);
             }
             for (workstream, mut group) in groups {
@@ -794,60 +770,6 @@ impl Recaps {
         Ok(DaysPage { days, at_start })
     }
 
-    /// Stores a block that began or changed, and re-indexes it if its links or start moved.
-    fn put(&mut self, block: Block) {
-        self.unnamed.note(self.builder.directory(), &block);
-        let links = Links::of(&block);
-        match self.blocks.get(&block.id).map(Links::of) {
-            Some(old) if old == links => {}
-            Some(old) => {
-                self.unlink(block.id, old);
-                self.link(block.id, &links);
-            }
-            None => self.link(block.id, &links),
-        }
-        self.blocks.insert(block.id, block);
-    }
-
-    fn link(&mut self, id: EventId, links: &Links) {
-        if let Some(s) = links.session {
-            add_id(&mut self.sessions, s, id);
-        }
-        for t in &links.tasks {
-            add_id(&mut self.tasks, *t, id);
-        }
-        if let Some(w) = links.workstream {
-            self.workstreams.entry(w).or_default().add(id, links.start);
-        }
-        if let Some(p) = links.project {
-            self.projects.entry(p).or_default().add(id, links.start);
-        }
-    }
-
-    fn unlink(&mut self, id: EventId, links: Links) {
-        if let Some(s) = links.session {
-            remove_id(&mut self.sessions, s, id);
-        }
-        for t in links.tasks {
-            remove_id(&mut self.tasks, t, id);
-        }
-        if let Some(w) = links.workstream
-            && let Some(linked) = self.workstreams.get_mut(&w)
-        {
-            linked.remove(id, links.start);
-            if linked.is_empty() {
-                self.workstreams.remove(&w);
-            }
-        }
-        if let Some(p) = links.project
-            && let Some(linked) = self.projects.get_mut(&p)
-        {
-            linked.remove(id, links.start);
-            if linked.is_empty() {
-                self.projects.remove(&p);
-            }
-        }
-    }
 }
 
 /// A page's size: the default when absent, at most `max`, and never 0.
@@ -923,6 +845,12 @@ fn task_clashes(conn: &Connection, from: u64, to: u64) -> Result<(u64, HashSet<u
 pub(crate) struct RecapSync {
     recaps: Recaps,
     rev: u64,
+    /// Where the blocks go: a file (see [`WorkService::with_recap_file`]), or memory.
+    file: Option<PathBuf>,
+    /// The file is still to be opened, before the next read of the log.
+    to_open: bool,
+    /// The directory's bound, for tests ([`WorkService::with_recap_directory_limit`]).
+    limit: Option<usize>,
 }
 
 impl Default for RecapSync {
@@ -930,17 +858,44 @@ impl Default for RecapSync {
         Self {
             recaps: Recaps::new(None),
             rev: 0,
+            file: None,
+            to_open: false,
+            limit: None,
         }
     }
 }
 
 impl RecapSync {
-    fn with_recaps(recaps: Recaps) -> Self {
-        Self { recaps, rev: 0 }
+    /// Starts again from the log: an empty index, with the same file (opened afresh at the next
+    /// read) and bound.
+    fn reset(&mut self) {
+        // The old index, and its file, go now; the file is made again by `open`.
+        self.recaps = Recaps::new(self.limit.map(Directory::with_limit));
+        self.rev = 0;
+        self.to_open = self.file.is_some();
+    }
+
+    /// Opens the file, when there is one still to open. If it cannot be made, the blocks stay in
+    /// memory (logged): recaps still answer, at the memory's cost.
+    fn open(&mut self) {
+        if !std::mem::take(&mut self.to_open) {
+            return;
+        }
+        let Some(path) = self.file.clone() else {
+            return;
+        };
+        if let Err(e) = self.recaps.use_file(&path) {
+            tracing::warn!(
+                file = %path.display(),
+                error = %e,
+                "the recap index keeps its blocks in memory"
+            );
+        }
     }
 
     /// Reads the log after `rev`, a page at a time, into the index. A page is applied whole or
-    /// not at all, so an error leaves the index where it was, ready to read the same page again.
+    /// not at all, so an error reading it leaves the index where it was, ready to read the same
+    /// page again.
     ///
     /// Only up to the revision the tasks projection has applied: before that, whether a
     /// `task_created` was refused is not known (another process may append without the work
@@ -971,6 +926,11 @@ impl RecapSync {
                 .map(|e| e.event)
                 .collect();
             self.recaps.push(&events);
+            if self.recaps.is_broken() {
+                return Err(WorkError::internal(
+                    "the recap index could not store its blocks; the next query builds it again",
+                ));
+            }
             self.rev = upto;
             if !more {
                 return Ok(());
@@ -990,9 +950,29 @@ impl WorkService {
     /// # Errors
     ///
     /// Reading the log or the tasks projection (internal errors). The index keeps every page it
-    /// read before the error, and the next call goes on from there.
+    /// read before the error, and the next call goes on from there. If the blocks cannot be
+    /// stored, the next call builds the index again from the log.
     pub fn sync_recaps(&self) -> Result<u64> {
         Ok(self.recap_state()?.rev)
+    }
+
+    /// Keeps the recap index's blocks in a file at `path` rather than in memory, so they cost
+    /// disk, not memory, however long the log. A cache: whatever is at `path` is replaced when the
+    /// index is first built (and whenever it is built again), and the file is removed when the
+    /// service is dropped; it is never read from one run to the next. The file is private to the
+    /// user (0600 on Unix). If it cannot be made, the blocks stay in memory (logged).
+    ///
+    /// One file per service: two services (or processes) must not share a path.
+    #[must_use]
+    pub fn with_recap_file(self, path: impl Into<PathBuf>) -> Self {
+        let mut state = self
+            .recap_lock()
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        state.file = Some(path.into());
+        state.reset();
+        drop(state);
+        self
     }
 
     /// Rebuilds the recap index with a directory bounded to `limit` entries of each kind
@@ -1004,7 +984,8 @@ impl WorkService {
             .recap_lock()
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        *state = RecapSync::with_recaps(Recaps::new(Some(Directory::with_limit(limit))));
+        state.limit = Some(limit);
+        state.reset();
         drop(state);
         self
     }
@@ -1016,10 +997,15 @@ impl WorkService {
             // A panic part-way through an update may have left the index half-changed: start
             // again from the log.
             let mut state = poisoned.into_inner();
-            *state = RecapSync::default();
+            state.reset();
             lock.clear_poison();
             state
         });
+        if state.recaps.is_broken() {
+            tracing::warn!("building the recap index again from the log");
+            state.reset();
+        }
+        state.open();
         state.catch_up(self)?;
         Ok(state)
     }
@@ -1057,6 +1043,14 @@ mod tests {
 
     thread_local! {
         static FAIL_ON: Cell<Option<EventId>> = const { Cell::new(None) };
+        static STORE_FAILS: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Makes storing blocks fail, on this thread, while set.
+    pub(super) fn store_fails() -> Option<WorkError> {
+        STORE_FAILS
+            .with(Cell::get)
+            .then(|| WorkError::internal("storing blocks fails, for the test"))
     }
 
     /// Makes the engine "panic" on one event, on this thread.
@@ -1109,6 +1103,105 @@ mod tests {
                 .expect("blocks"),
             page
         );
+    }
+
+    /// A batch of blocks that cannot be stored (a full disk) fails the query that read it, and
+    /// the next one builds the index again from the log, in a new file: what was half-written is
+    /// never served.
+    #[test]
+    fn a_failed_write_is_rebuilt_from_the_log() {
+        use pitcrew_protocol::model::Workspace;
+        use pitcrew_store::{Store, StoreOptions};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            Store::open_with(
+                dir.path().join("hub.db"),
+                StoreOptions::default(),
+                crate::projections(),
+            )
+            .expect("store"),
+        );
+        let workspace = Workspace {
+            id: WorkspaceId(ulid::Ulid::from(2u128)),
+            name: "W".into(),
+        };
+        let file = dir.path().join("recaps.sqlite3");
+        let work =
+            WorkService::new(Arc::clone(&store), workspace.clone()).with_recap_file(&file);
+        assert!(!file.exists(), "made when the index is first built");
+        store.append(&[tool_run(1, 1), tool_run(2, 2)]).expect("append");
+        assert_eq!(work.sync_recaps().expect("sync"), 2);
+        assert!(file.exists());
+
+        // Two more events, the second one opening a new block, cannot be stored.
+        store.append(&[tool_run(3, 3), tool_run(4, 60)]).expect("append");
+        STORE_FAILS.with(|f| f.set(true));
+        assert!(work.sync_recaps().is_err());
+        assert!(
+            work.recap_blocks(&BlockFilter::default(), None, None)
+                .is_err(),
+            "a broken index answers nothing until it is built again"
+        );
+        STORE_FAILS.with(|f| f.set(false));
+
+        let page = work
+            .recap_blocks(&BlockFilter::default(), None, None)
+            .expect("built again");
+        let fresh = WorkService::new(Arc::clone(&store), workspace);
+        assert_eq!(
+            page,
+            fresh
+                .recap_blocks(&BlockFilter::default(), None, None)
+                .expect("fresh")
+        );
+        assert_eq!(page.blocks.len(), 2);
+        assert_eq!(page.blocks[1].block.counts.tools_run, 3);
+        assert!(file.exists());
+        drop(work);
+        assert!(!file.exists(), "removed with the service");
+    }
+
+    /// A file left at the path (a crash, another log) is replaced, never read: the index answers
+    /// from the log alone. The file is private.
+    #[test]
+    fn a_leftover_file_is_replaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("recaps.sqlite3");
+        let events: Vec<Event> = (1..=3).map(|n| tool_run(n, n as i64)).collect();
+        // What a process that died would leave: another index's blocks.
+        let mut old = Recaps::new(None)
+            .in_file(&dir.path().join("old.sqlite3"))
+            .expect("file");
+        old.push(&[tool_run(9, 500)]);
+        std::fs::copy(dir.path().join("old.sqlite3"), &file).expect("copy");
+        drop(old);
+        assert!(file.exists());
+
+        let mut recaps = Recaps::new(None).in_file(&file).expect("file");
+        recaps.push(&events);
+        let mut memory = Recaps::new(None);
+        memory.push(&events);
+        let all = |r: &Recaps| r.blocks(&BlockFilter::default(), None, None).expect("blocks");
+        assert_eq!(all(&recaps), all(&memory));
+        assert_eq!(recaps.len(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&file).expect("meta").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        // Garbage there is replaced too.
+        drop(recaps);
+        std::fs::write(&file, b"not a database").expect("write");
+        let mut recaps = Recaps::new(None).in_file(&file).expect("file");
+        recaps.push(&events);
+        assert_eq!(all(&recaps), all(&memory));
+
+        // Only an empty index moves to a file.
+        assert!(memory.in_file(&dir.path().join("other")).is_err());
     }
 
     #[test]
