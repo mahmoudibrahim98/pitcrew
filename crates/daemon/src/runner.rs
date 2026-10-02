@@ -19,12 +19,14 @@
 //! - **When.** With the daemon, when the workspace has a person and a local machine; otherwise
 //!   once it is set up (`crate::setup`), without a restart. The routes reach it through
 //!   [`Attached`], which is empty until then.
+//! - **Its terminals** run on the runtime chosen at start ([`TerminalRuntime`]: tmux where it is
+//!   usable, else none); its commands start and drive sessions in them (`crate::sessions`), and
+//!   its transcript pages answer `GET /v1/sessions/{id}/transcript` (`crate::transcripts`).
 
 use crate::agents::HubAgents;
 use crate::cli::HomeArg;
+use crate::runtime::TerminalRuntime;
 use crate::state::StateDir;
-use crate::terminals::NoRuntime;
-use crate::transcripts::{Found, Recorded};
 use anyhow::{Context as _, bail};
 use pitcrew_api::{HookEvent, HookSink, LogHookSink};
 use pitcrew_hub_work::WorkService;
@@ -35,7 +37,8 @@ use pitcrew_interfaces::source::SourceAdapter;
 use pitcrew_protocol::ids::{MachineId, MemberId};
 use pitcrew_protocol::model::{Engine, MemberKind};
 use pitcrew_runner::{
-    EngineHome, RunnerConfig, RunnerHandle, RunnerHooks, RunnerTerminals, StoreSink,
+    EngineHome, RunnerCommands, RunnerConfig, RunnerHandle, RunnerHooks, RunnerTerminals,
+    RunnerTranscripts, StoreSink,
 };
 use pitcrew_store::Store;
 use std::path::PathBuf;
@@ -49,12 +52,16 @@ pub struct Parts {
     pub machine: MachineId,
     /// The API's hook sink.
     pub hooks: RunnerHooks,
-    /// The runner's terminals, over [`NoRuntime`] until `crates/runtime` has a runtime.
+    /// The runner's terminals, over the runtime chosen at start.
     pub terminals: RunnerTerminals,
-    /// The transcripts its discoveries found.
-    pub found: Arc<Found>,
+    /// Its commands: start a session in a terminal, type into it, end it.
+    pub commands: RunnerCommands,
+    /// Pages of the transcripts it watches.
+    pub transcripts: RunnerTranscripts,
     /// Whether it watches at least one home (`GET /v1/host/info`'s `watch` capability).
     pub watches: bool,
+    /// Whether its terminals run in tmux (host info's `tmux` capability).
+    pub tmux: bool,
 }
 
 /// The runner the routes reach, once there is one: set once, when it starts (with the daemon, or
@@ -133,17 +140,10 @@ impl Runner {
         let config = RunnerConfig::new(WorkspaceId::new(), machine, MemberId::new(), dir);
         let handle = pitcrew_runner::start(config, Vec::new(), Arc::new(Nowhere))
             .expect("an idle runner starts");
-        let terminals = handle
-            .terminals(Arc::new(NoRuntime))
+        let parts = parts_of(&handle, machine, &TerminalRuntime::none(), false)
             .expect("its terminals start");
         Self {
-            parts: Parts {
-                machine,
-                hooks: handle.hooks(),
-                terminals,
-                found: Arc::new(Found::default()),
-                watches: false,
-            },
+            parts,
             handle: Some(handle),
         }
     }
@@ -223,8 +223,28 @@ pub fn default_homes() -> Vec<(Engine, PathBuf)> {
         .collect()
 }
 
+/// What the routes use of the runner `handle` on `machine`, its terminals over `runtime`.
+fn parts_of(
+    handle: &RunnerHandle,
+    machine: MachineId,
+    runtime: &TerminalRuntime,
+    watches: bool,
+) -> Result<Parts, pitcrew_runner::RunnerError> {
+    let terminals = handle.terminals(runtime.runtime())?;
+    Ok(Parts {
+        machine,
+        hooks: handle.hooks(),
+        commands: handle.commands(&terminals),
+        terminals,
+        transcripts: handle.transcripts(),
+        watches,
+        tmux: runtime.tmux(),
+    })
+}
+
 /// Starts the runner on `machine`, watching `homes`, writing to `store` through `work`'s
-/// workspace. `None` when it cannot run here yet (no machine or no person; logged).
+/// workspace, its terminals over `runtime`. `None` when it cannot run here yet (no machine or no
+/// person; logged).
 ///
 /// # Errors
 /// The runner's index cannot be opened (its folder is in the error), or its threads cannot
@@ -235,6 +255,7 @@ pub fn start(
     store: &Arc<Store>,
     machine: Option<MachineId>,
     homes: Vec<EngineHome>,
+    runtime: &TerminalRuntime,
 ) -> anyhow::Result<Option<Runner>> {
     let Some(machine) = machine else {
         tracing::warn!(
@@ -256,15 +277,11 @@ pub fn start(
     }
     let dir = state.runner().join(log);
 
-    let found = Arc::new(Found::default());
-    let adapters: Vec<Arc<dyn SourceAdapter>> = [
-        Arc::new(ClaudeAdapter::new()) as Arc<dyn SourceAdapter>,
+    let adapters: Vec<Arc<dyn SourceAdapter>> = vec![
+        Arc::new(ClaudeAdapter::new()),
         Arc::new(CodexAdapter::new()),
         Arc::new(OpenCodeAdapter::new()),
-    ]
-    .into_iter()
-    .map(|adapter| Arc::new(Recorded::new(adapter, Arc::clone(&found))) as Arc<dyn SourceAdapter>)
-    .collect();
+    ];
 
     let mut config = RunnerConfig::new(work.workspace(), machine, owner, &dir)
         .with_agents(Arc::new(HubAgents::new(Arc::clone(work))));
@@ -281,8 +298,8 @@ pub fn start(
             dir.display()
         )
     })?;
-    let terminals = match handle.terminals(Arc::new(NoRuntime)) {
-        Ok(terminals) => terminals,
+    let parts = match parts_of(&handle, machine, runtime, watches) {
+        Ok(parts) => parts,
         Err(e) => {
             stop_aside(handle);
             return Err(anyhow::Error::new(e).context("cannot start the runner's terminals"));
@@ -294,13 +311,7 @@ pub fn start(
         tracing::info!(%machine, "the runner watches no home (--demo without --homes)");
     }
     Ok(Some(Runner {
-        parts: Parts {
-            machine,
-            hooks: handle.hooks(),
-            terminals,
-            found,
-            watches,
-        },
+        parts,
         handle: Some(handle),
     }))
 }

@@ -1,24 +1,23 @@
-//! `GET /v1/sessions/{id}/transcript?before=&limit=` (api-v1, "Transcript paging"), over the
-//! transcripts the runner watches.
+//! `GET /v1/sessions/{id}/transcript?before=&limit=` (api-v1, "Transcript paging"), from the
+//! runner's own transcript pages (`RunnerTranscripts`).
 //!
-//! **A stand-in, here until the runner serves pages itself.** The runner knows which transcript
-//! each of its sessions is, but does not say (its index is its own); and `pitcrew-api` has no
-//! transcript seam yet. So the daemon:
-//! - hands the runner its adapters wrapped in [`Recorded`], which keeps what each home's last
-//!   discovery found ([`Found`]); the route reads only those transcripts, so only the homes the
-//!   runner watches;
-//! - finds a session's transcript by its engine and native id, by the names each CLI gives its
-//!   files: Claude's `<id>.jsonl` and its sub-agents' `agent-<id>.jsonl`, Codex's
-//!   `rollout-<time>-<id>.jsonl`, OpenCode's inner id in its store ([`names`]);
-//! - pages it with the adapter's own `read_page`. A read that does not return within 10 seconds
-//!   (a file on a filesystem that does not answer) answers `503` and is left running; a stop
-//!   waits for it only so long (`serve`).
+//! The route checks what only the hub knows, then asks the runner, which finds the session's
+//! transcript by its id among those it watches and reads the page with the adapter's own
+//! `read_page`, on its own small pool of threads, bounded in time:
+//! - the query: `limit` defaults to 200 and counts as 1000 above it; `limit=0`, and a `before` or
+//!   `limit` that is not a whole number, are `400`;
+//! - an unknown session is `404`; one on another machine, or any without a runner (with
+//!   `--no-runner`, or before a fresh workspace is set up), is `503 unavailable`;
+//! - a session of this machine that the runner has not indexed (a demo session, or a dispatched
+//!   one whose transcript does not exist yet) is an empty page with `at_start: true`, as for a
+//!   session without a transcript;
+//! - a transcript that is gone or cannot be read, and a read that is busy or does not finish in
+//!   time, are `503 unavailable`, saying which (the runner logs the first failure for a session as
+//!   a warning, later ones at debug).
 //!
-//! Answers: an unknown session is `404`; one on another machine, or any without a runner (with
-//! `--no-runner`, or before a fresh workspace is set up), is `503 unavailable`; one on this machine whose transcript is not found (a demo session, a
-//! deleted file) is an empty page at the start, as the mock hub answers for a session it has no
-//! transcript for. `limit` defaults to 200 and counts as 1000 above it; `limit=0`, and a `before`
-//! or `limit` that is not a whole number, are `400`.
+//! The runner bounds each read (10 seconds) on its own threads, so a filesystem that does not
+//! answer ties up those threads, never tokio's blocking pool for long. The route still gives the
+//! call [`READ_TIMEOUT`] as a backstop.
 
 use crate::runner::Attached;
 use axum::extract::rejection::{PathRejection, QueryRejection};
@@ -27,167 +26,28 @@ use axum::routing::get;
 use axum::{Json, Router};
 use pitcrew_auth::ErrorResponse;
 use pitcrew_hub_work::WorkService;
-use pitcrew_interfaces::source::{
-    Cursor, ParseChunk, SourceAdapter, SourceError, TranscriptPage, TranscriptRef,
-};
+use pitcrew_interfaces::source::TranscriptPage;
 use pitcrew_protocol::api::ErrorCode;
 use pitcrew_protocol::ids::SessionId;
-use pitcrew_protocol::model::Engine;
+use pitcrew_runner::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, PageError};
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::fmt;
-use std::path::{Path as FsPath, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
-/// Items in a page when `limit` is not given.
-const DEFAULT_LIMIT: usize = 200;
-/// Most items in a page; a larger `limit` counts as this.
-const MAX_LIMIT: usize = 1000;
-/// Longest a page may take to read.
-const READ_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// What the last discovery of each watched home found.
-#[derive(Default)]
-pub struct Found {
-    homes: Mutex<HashMap<(Engine, PathBuf), Discovered>>,
-}
-
-struct Discovered {
-    adapter: Arc<dyn SourceAdapter>,
-    transcripts: Vec<TranscriptRef>,
-}
-
-impl fmt::Debug for Found {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let homes = self.homes.lock().unwrap_or_else(PoisonError::into_inner);
-        f.debug_struct("Found")
-            .field("homes", &homes.len())
-            .finish_non_exhaustive()
-    }
-}
-
-impl Found {
-    fn record(&self, adapter: &Arc<dyn SourceAdapter>, home: &FsPath, found: &[TranscriptRef]) {
-        self.homes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(
-                (adapter.engine(), home.to_path_buf()),
-                Discovered {
-                    adapter: Arc::clone(adapter),
-                    transcripts: found.to_vec(),
-                },
-            );
-    }
-
-    /// The transcript the CLI `engine` names `native` (see [`names`]), with the adapter that
-    /// reads it; the newest if several are (one session in two homes).
-    fn find(
-        &self,
-        engine: Engine,
-        native: &str,
-    ) -> Option<(Arc<dyn SourceAdapter>, TranscriptRef)> {
-        if native.is_empty() {
-            return None;
-        }
-        let homes = self.homes.lock().unwrap_or_else(PoisonError::into_inner);
-        homes
-            .iter()
-            .filter(|((e, _), _)| *e == engine)
-            .flat_map(|(_, d)| d.transcripts.iter().map(move |t| (&d.adapter, t)))
-            .filter(|(_, t)| names(engine, t, native))
-            .max_by_key(|(_, t)| t.modified)
-            .map(|(adapter, t)| (Arc::clone(adapter), t.clone()))
-    }
-}
-
-/// Whether `t` is the transcript `engine` writes for the session it calls `native`, by the names
-/// that CLI gives its files, so an id never matches another kind of file's name:
-/// - Claude: `<native>.jsonl`, or `agent-<native>.jsonl` for a sub-agent;
-/// - Codex: `rollout-<time>-<native>.jsonl`, or the whole name when its records name no id;
-/// - OpenCode: the store's inner id.
-fn names(engine: Engine, t: &TranscriptRef, native: &str) -> bool {
-    let stem = || t.path.file_stem().and_then(|s| s.to_str());
-    match engine {
-        Engine::OpenCode => t.inner_id.as_deref() == Some(native),
-        Engine::Claude => {
-            stem().is_some_and(|stem| stem == native || stem.strip_prefix("agent-") == Some(native))
-        }
-        Engine::Codex => stem().is_some_and(|stem| {
-            stem.strip_prefix("rollout-").is_some_and(|rest| {
-                stem == native
-                    || rest
-                        .strip_suffix(native)
-                        .is_some_and(|time| time.ends_with('-'))
-            })
-        }),
-        _ => false,
-    }
-}
-
-/// An adapter that records what each discovery finds in [`Found`], and otherwise is `inner`.
-pub struct Recorded {
-    inner: Arc<dyn SourceAdapter>,
-    found: Arc<Found>,
-}
-
-impl Recorded {
-    /// `inner`, recording into `found`.
-    #[must_use]
-    pub fn new(inner: Arc<dyn SourceAdapter>, found: Arc<Found>) -> Self {
-        Self { inner, found }
-    }
-}
-
-impl fmt::Debug for Recorded {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Recorded")
-            .field("engine", &self.inner.engine())
-            .finish_non_exhaustive()
-    }
-}
-
-impl SourceAdapter for Recorded {
-    fn engine(&self) -> Engine {
-        self.inner.engine()
-    }
-
-    fn discover(&self, home: &FsPath) -> Result<Vec<TranscriptRef>, SourceError> {
-        let found = self.inner.discover(home)?;
-        self.found.record(&self.inner, home, &found);
-        Ok(found)
-    }
-
-    fn read_from(
-        &self,
-        transcript: &TranscriptRef,
-        cursor: &Cursor,
-    ) -> Result<ParseChunk, SourceError> {
-        self.inner.read_from(transcript, cursor)
-    }
-
-    fn read_page(
-        &self,
-        transcript: &TranscriptRef,
-        before: Option<u64>,
-        limit: usize,
-    ) -> Result<TranscriptPage, SourceError> {
-        self.inner.read_page(transcript, before, limit)
-    }
-}
+/// Longest the route waits for a page: the runner's own bound (10 seconds), and some slack.
+const READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The route's state.
 #[derive(Debug)]
 pub struct Transcripts {
     work: Arc<WorkService>,
-    /// The runner, once it runs: its machine and what it found.
+    /// The runner, once it runs: its machine and its transcript pages.
     runner: Arc<Attached>,
 }
 
 impl Transcripts {
-    /// Transcripts of the sessions `work` knows, among those the runner found on its machine once
-    /// it runs.
+    /// Transcripts of the sessions `work` knows, read by the runner on its machine once it runs.
     #[must_use]
     pub fn new(work: Arc<WorkService>, runner: Arc<Attached>) -> Self {
         Self { work, runner }
@@ -200,7 +60,7 @@ impl Transcripts {
             .with_state(Arc::new(self))
     }
 
-    /// The page, or why not. Blocking.
+    /// The page, or why not. Blocking, for at most the runner's bound.
     fn page(
         &self,
         session: SessionId,
@@ -229,8 +89,7 @@ impl Transcripts {
                 ),
             ));
         };
-        let (machine, transcripts) = (runner.machine, &runner.found);
-        if found.machine != machine {
+        if found.machine != runner.machine {
             return Err(ErrorResponse::new(
                 ErrorCode::Unavailable,
                 format!(
@@ -238,19 +97,17 @@ impl Transcripts {
                 ),
             ));
         }
-        let Some((adapter, transcript)) = transcripts.find(found.engine, &found.native_id) else {
-            return Ok(empty());
-        };
-        match adapter.read_page(&transcript, before, limit) {
+        match runner
+            .transcripts
+            .transcript_page(session, before, Some(limit))
+        {
             Ok(page) => Ok(page),
-            Err(SourceError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(empty()),
-            Err(e) => {
-                tracing::warn!(error = %e, %session, "cannot read a session's transcript");
-                Err(ErrorResponse::new(
-                    ErrorCode::Internal,
-                    "The transcript could not be read.",
-                ))
-            }
+            // A session of this machine the runner never indexed has no transcript here yet.
+            Err(PageError::UnknownSession(_)) => Ok(empty()),
+            Err(PageError::Unavailable { reason, .. }) => Err(ErrorResponse::new(
+                ErrorCode::Unavailable,
+                format!("Session {session}'s transcript cannot be read now: {reason}."),
+            )),
         }
     }
 }
@@ -303,10 +160,12 @@ async fn page(
         .map(|v| whole(v).ok_or_else(|| invalid("before must be a whole number.")))
         .transpose()?;
     let limit = match query.limit.as_deref() {
-        None => DEFAULT_LIMIT,
+        None => DEFAULT_PAGE_LIMIT,
         Some(v) => match whole(v) {
             Some(0) | None => return Err(invalid("limit must be a whole number of at least 1.")),
-            Some(n) => usize::try_from(n).unwrap_or(MAX_LIMIT).min(MAX_LIMIT),
+            Some(n) => usize::try_from(n)
+                .unwrap_or(MAX_PAGE_LIMIT)
+                .min(MAX_PAGE_LIMIT),
         },
     };
     let read = tokio::task::spawn_blocking(move || transcripts.page(session, before, limit));
@@ -336,117 +195,11 @@ async fn page(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn at(path: &str, inner: Option<&str>, modified: i64) -> TranscriptRef {
-        TranscriptRef {
-            engine: Engine::Claude,
-            path: PathBuf::from(path),
-            inner_id: inner.map(Into::into),
-            size: 0,
-            modified,
-        }
-    }
-
-    #[test]
-    fn transcripts_are_found_by_the_name_their_cli_gives_them() {
-        use Engine::{Claude, Codex, OpenCode};
-        let uuid = "2b6f1a8e-4c1d-4f5e-9a37-0c8d1e2f3a4b";
-        let main = at(&format!("/h/p/{uuid}.jsonl"), None, 0);
-        let sub = at("/h/p/s/subagents/agent-a1b2c3.jsonl", None, 0);
-        let rollout = at(
-            &format!("/h/sessions/2026/09/30/rollout-2026-09-30T08-00-00-{uuid}.jsonl"),
-            None,
-            0,
-        );
-        let store = at("/h/opencode.db", Some("ses_1"), 0);
-        // Claude: `<id>.jsonl`, sub-agents `agent-<id>.jsonl`.
-        assert!(names(Claude, &main, uuid));
-        assert!(names(Claude, &sub, "a1b2c3"));
-        // Codex: `rollout-<time>-<id>.jsonl`, or the whole name.
-        assert!(names(Codex, &rollout, uuid));
-        let stem = format!("rollout-2026-09-30T08-00-00-{uuid}");
-        assert!(names(Codex, &rollout, &stem));
-        // OpenCode: the inner id, whatever the store's file is called.
-        assert!(names(OpenCode, &store, "ses_1"));
-        assert!(!names(
-            OpenCode,
-            &at("/h/ses_1.db", Some("ses_2"), 0),
-            "ses_1"
-        ));
-
-        // Each engine's rule only: a Claude id never names a rollout, nor a Codex id a Claude
-        // file or a sub-agent, nor a file name an OpenCode session.
-        assert!(!names(Claude, &rollout, uuid));
-        assert!(!names(Codex, &main, uuid));
-        assert!(!names(Codex, &sub, "a1b2c3"));
-        assert!(!names(OpenCode, &main, uuid));
-        // Not a part of another name.
-        for other in [
-            "/h/p/xa1b2c3.jsonl",
-            "/h/p/a1b2c3-x.jsonl",
-            "/h/p/old-a1b2c3.jsonl",
-            "/h/p/agent-xa1b2c3.jsonl",
-        ] {
-            assert!(!names(Claude, &at(other, None, 0), "a1b2c3"), "{other}");
-        }
-        let other_rollout = at(&format!("/h/x-2026-{uuid}.jsonl"), None, 0);
-        assert!(!names(Codex, &other_rollout, uuid));
-    }
-
-    #[derive(Debug)]
-    struct Lists(Vec<TranscriptRef>);
-    impl SourceAdapter for Lists {
-        fn engine(&self) -> Engine {
-            Engine::Claude
-        }
-        fn discover(&self, _home: &FsPath) -> Result<Vec<TranscriptRef>, SourceError> {
-            Ok(self.0.clone())
-        }
-        fn read_from(&self, _: &TranscriptRef, _: &Cursor) -> Result<ParseChunk, SourceError> {
-            Ok(ParseChunk::default())
-        }
-        fn read_page(
-            &self,
-            _: &TranscriptRef,
-            _: Option<u64>,
-            _: usize,
-        ) -> Result<TranscriptPage, SourceError> {
-            Ok(empty())
-        }
-    }
-
-    #[test]
-    fn a_discovery_replaces_what_the_home_had_and_the_newest_wins() {
-        let found = Arc::new(Found::default());
-        let old = at("/h/p/s1.jsonl", None, 9);
-        let other = at("/h/p/old-s1.jsonl", None, 99);
-        let first = Recorded::new(
-            Arc::new(Lists(vec![old.clone(), other])),
-            Arc::clone(&found),
-        );
-        assert_eq!(first.discover(FsPath::new("/h")).unwrap().len(), 2);
-        assert_eq!(
-            found.find(Engine::Claude, "s1").map(|f| f.1),
-            Some(old.clone())
-        );
-        assert!(found.find(Engine::Codex, "s1").is_none());
-        assert!(found.find(Engine::Claude, "").is_none());
-
-        // A home's next discovery replaces what it had.
-        let none = Recorded::new(Arc::new(Lists(Vec::new())), Arc::clone(&found));
-        none.discover(FsPath::new("/h")).unwrap();
-        assert!(found.find(Engine::Claude, "s1").is_none());
-
-        // The same session in two homes: the newest.
-        let newer = at("/h2/p/s1.jsonl", None, 10);
-        Recorded::new(Arc::new(Lists(vec![old.clone()])), Arc::clone(&found))
-            .discover(FsPath::new("/h"))
-            .unwrap();
-        Recorded::new(Arc::new(Lists(vec![newer.clone()])), Arc::clone(&found))
-            .discover(FsPath::new("/h2"))
-            .unwrap();
-        assert_eq!(found.find(Engine::Claude, "s1").map(|f| f.1), Some(newer));
-    }
+    use crate::runner::Runner;
+    use pitcrew_protocol::events::{Event, EventBody};
+    use pitcrew_protocol::ids::{MachineId, MemberId, WorkspaceId};
+    use pitcrew_protocol::model::{Engine, Session, SessionState, Workspace};
+    use pitcrew_store::{Store, StoreOptions};
 
     #[test]
     fn whole_numbers_only() {
@@ -455,5 +208,82 @@ mod tests {
         for bad in ["", "-1", "1.5", "+1", " 1", "abc", "99999999999999999999"] {
             assert_eq!(whole(bad), None, "{bad}");
         }
+    }
+
+    fn session(machine: MachineId) -> Session {
+        Session {
+            id: SessionId::new(),
+            engine: Engine::Claude,
+            native_id: "n".into(),
+            machine,
+            cwd: "/w".into(),
+            branch: None,
+            title: None,
+            agent: None,
+            workstream: None,
+            task: None,
+            link_basis: None,
+            state: SessionState::Idle,
+            status_line: None,
+            started: 1,
+            last_activity: 1,
+            terminal: None,
+            parent: None,
+        }
+    }
+
+    fn code(r: &Result<TranscriptPage, ErrorResponse>) -> String {
+        match r {
+            Ok(page) if page.items.is_empty() && page.at_start => "empty".to_owned(),
+            Ok(_) => "page".to_owned(),
+            Err(e) => format!("{:?}", e.0.code),
+        }
+    }
+
+    /// By where the session is: unknown `404`; this machine's, never indexed by the runner, an
+    /// empty page at the start; another machine's, or any before a runner is attached, `503`.
+    #[test]
+    fn whose_transcript_and_where() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            Store::open_with(
+                tmp.path().join("hub.db"),
+                StoreOptions::default(),
+                pitcrew_hub_work::projections(),
+            )
+            .unwrap(),
+        );
+        let workspace = Workspace {
+            id: WorkspaceId::new(),
+            name: "Lab".into(),
+        };
+        let work = Arc::new(WorkService::new(Arc::clone(&store), workspace.clone()));
+        let runner = Runner::idle(&tmp.path().join("runner"));
+        let parts = runner.parts();
+        let (local, remote) = (session(parts.machine), session(MachineId::new()));
+        for s in [&local, &remote] {
+            store
+                .append(&[Event::now(
+                    workspace.id,
+                    MemberId::new(),
+                    EventBody::SessionDiscovered { session: s.clone() },
+                )])
+                .unwrap();
+        }
+
+        let attached = Arc::new(Attached::default());
+        let transcripts = Transcripts::new(work, Arc::clone(&attached));
+        let page = |s: SessionId| code(&transcripts.page(s, None, 10));
+        assert_eq!(page(SessionId::new()), "NotFound");
+        assert_eq!(page(local.id), "Unavailable", "no runner yet");
+        attached.set(parts);
+        assert_eq!(page(SessionId::new()), "NotFound");
+        assert_eq!(page(local.id), "empty");
+        assert_eq!(page(remote.id), "Unavailable");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(runner.stop(Duration::from_secs(10)));
     }
 }

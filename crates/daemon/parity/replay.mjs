@@ -57,7 +57,9 @@ function startDaemon(binary, { office }) {
   return async () => {
     const state = mkdtempSync(join(tmpdir(), 'pitcrew-parity-'));
     const dir = join(state, 'state');
-    const args = ['--state-dir', dir, 'serve', '--demo', '--listen', 'tcp:127.0.0.1:0', ...(office ? [] : ['--no-office'])];
+    // A tmux socket inside the temporary folder (removed with it), never the user's.
+    const tmux = ['--tmux-socket', join(state, 'tmux', 's')];
+    const args = ['--state-dir', dir, 'serve', '--demo', '--listen', 'tcp:127.0.0.1:0', ...tmux, ...(office ? [] : ['--no-office'])];
     // A script stands in for the binary when checking this file itself.
     const [command, argv] = /\.m?js$/.test(binary) ? [process.execPath, [binary, ...args]] : [binary, args];
     const child = spawn(command, argv, {

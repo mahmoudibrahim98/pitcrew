@@ -2,8 +2,10 @@
 //!
 //! The runner owns the session → terminal mapping. It holds the terminals it started (linked to
 //! their session once its transcript is found, see `RunnerCommands`) and those linked by hand,
-//! in its own index, with each one's tmux target: a runtime that gives a terminal a new id after
-//! a restart is followed by that target.
+//! in its own index, with each one's tmux target (for people to attach). A link is kept only
+//! while the runtime lists its terminal **by that id**: a runtime keeps a terminal's id across a
+//! restart (tmux tags each pane with it), and a target alone is never followed, since another
+//! server can reuse it for a terminal that is not this one.
 //!
 //! The `Attachment` contract:
 //! - **every call is bounded in time.** Runtime calls run on a small pool of threads and are
@@ -137,8 +139,24 @@ impl RunnerTerminals {
         Ok(self.store().terminal_of(session)?.map(|t| t.terminal))
     }
 
-    /// Follows terminals the runtime now knows by another id (same tmux target), and forgets
-    /// those it no longer has.
+    /// The session that runs in `terminal`, once the runner has linked them (when the session's
+    /// transcript is found, for a terminal it started).
+    ///
+    /// # Errors
+    ///
+    /// The runner's index cannot be read.
+    pub fn session_of(&self, terminal: TerminalId) -> Result<Option<SessionId>, StoreError> {
+        Ok(self
+            .store()
+            .terminals()?
+            .into_iter()
+            .find(|t| t.terminal == terminal)
+            .and_then(|t| t.session))
+    }
+
+    /// Forgets the terminals the runtime no longer lists by their id. A terminal listed under
+    /// another id is not this one, even with the same tmux target: another server (after a
+    /// restart, or another daemon's) may have given that target to a different terminal.
     pub fn refresh(&self) {
         let listed = match self.call(self.inner.options.call_timeout, |rt| rt.list()) {
             Ok(listed) => listed,
@@ -159,19 +177,8 @@ impl RunnerTerminals {
             if listed.iter().any(|t| t.id == row.terminal) {
                 continue;
             }
-            let moved = row.native_target.as_ref().and_then(|target| {
-                listed
-                    .iter()
-                    .find(|t| t.native_target.as_ref() == Some(target))
-            });
-            let saved = match moved {
-                Some(t) => store.retarget_terminal(row.terminal, t.id),
-                None => {
-                    tracing::debug!(terminal = %row.terminal, "a terminal is gone; forgetting it");
-                    store.forget_terminal(row.terminal)
-                }
-            };
-            if let Err(e) = saved {
+            tracing::debug!(terminal = %row.terminal, "a terminal is gone; forgetting it");
+            if let Err(e) = store.forget_terminal(row.terminal) {
                 tracing::warn!(error = %e, "cannot update a stored terminal");
             }
         }
