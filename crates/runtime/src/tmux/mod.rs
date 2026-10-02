@@ -26,15 +26,13 @@
 mod detect;
 
 #[cfg(unix)]
-mod clamp;
-#[cfg(unix)]
 mod conn;
 #[cfg(unix)]
-mod exe;
+pub(crate) mod exe;
 #[cfg(unix)]
 mod runtime;
 #[cfg(unix)]
-mod socket;
+pub(crate) mod socket;
 #[cfg(unix)]
 mod state;
 

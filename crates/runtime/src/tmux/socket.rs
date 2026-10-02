@@ -19,13 +19,13 @@ const SOCKET_PATH_MAX: usize = 103;
 pub(crate) fn ensure_private(socket: &Path) -> Result<(), String> {
     if socket.as_os_str().len() > SOCKET_PATH_MAX {
         return Err(format!(
-            "the tmux socket path {} is longer than {SOCKET_PATH_MAX} bytes",
+            "the socket path {} is longer than {SOCKET_PATH_MAX} bytes",
             socket.display()
         ));
     }
     if !socket.is_absolute() {
         return Err(format!(
-            "the tmux socket path {} is not absolute",
+            "the socket path {} is not absolute",
             socket.display()
         ));
     }

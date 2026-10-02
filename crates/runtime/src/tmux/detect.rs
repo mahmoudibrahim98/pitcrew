@@ -1,16 +1,13 @@
 //! Is the tmux runtime usable here? tmux must be installed, new enough, and able to start a
 //! server on PitCrew's private socket.
 
-use std::future::Future;
 use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
-use std::task::{Context, Poll, Waker};
 
 use pitcrew_interfaces::runtime::RuntimeError;
 use pitcrew_protocol::runner::Capability;
 
 use super::TmuxOptions;
+use crate::background::Background;
 use crate::detect::TmuxVersion;
 
 /// tmux is usable: the runner can report [`Capability::Tmux`].
@@ -55,55 +52,19 @@ pub fn detect(options: &TmuxOptions) -> Result<TmuxSupport, RuntimeError> {
 
 /// [`detect`] on its own thread, as a future that any executor can await without blocking.
 pub fn detect_async(options: TmuxOptions) -> Detecting {
-    let slot = Arc::new(Mutex::new(Slot::default()));
-    let filled = Arc::clone(&slot);
-    let spawned = std::thread::Builder::new()
-        .name("pitcrew-tmux-detect".into())
-        .spawn(move || {
-            let result = detect(&options);
-            let waker = {
-                let mut slot = filled.lock().unwrap_or_else(PoisonError::into_inner);
-                slot.result = Some(result);
-                slot.waker.take()
-            };
-            if let Some(waker) = waker {
-                waker.wake();
-            }
-        });
-    if let Err(e) = spawned {
-        slot.lock().unwrap_or_else(PoisonError::into_inner).result = Some(Err(
-            RuntimeError::Unavailable(format!("cannot start the tmux check: {e}")),
-        ));
-    }
-    Detecting { slot }
+    crate::background::spawn(
+        "pitcrew-tmux-detect",
+        move || detect(&options),
+        |why| {
+            Err(RuntimeError::Unavailable(format!(
+                "cannot start the tmux check: {why}"
+            )))
+        },
+    )
 }
 
 /// The future [`detect_async`] returns.
-#[derive(Debug)]
-pub struct Detecting {
-    slot: Arc<Mutex<Slot>>,
-}
-
-#[derive(Debug, Default)]
-struct Slot {
-    result: Option<Result<TmuxSupport, RuntimeError>>,
-    waker: Option<Waker>,
-}
-
-impl Future for Detecting {
-    type Output = Result<TmuxSupport, RuntimeError>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
-        match slot.result.take() {
-            Some(result) => Poll::Ready(result),
-            None => {
-                slot.waker = Some(cx.waker().clone());
-                Poll::Pending
-            }
-        }
-    }
-}
+pub type Detecting = Background<Result<TmuxSupport, RuntimeError>>;
 
 #[cfg(unix)]
 mod unix {

@@ -1,4 +1,4 @@
-//! Named keys for tmux and a PTY in normal cursor-key mode.
+//! Named keys for tmux and for a PTY.
 
 use pitcrew_protocol::runner::Key;
 
@@ -17,20 +17,31 @@ pub fn tmux_key(key: Key) -> &'static str {
     }
 }
 
-/// Bytes for a conventional VT-compatible PTY. Backspace is DEL.
+/// Bytes for a conventional VT-compatible PTY in normal cursor-key mode. Backspace is DEL.
 ///
-/// Arrow keys use normal cursor mode (CSI), not application cursor mode (SS3).
-/// A future PTY runtime must account for the application's terminal modes.
+/// Arrow keys use normal cursor mode (CSI). A program that set application cursor mode
+/// (`DECCKM`, `ESC [ ? 1 h`) expects [`pty_key_in`] with `application_cursor` set; pitcrew-ptyd
+/// follows the mode.
 pub fn pty_key(key: Key) -> &'static [u8] {
-    match key {
-        Key::Enter => b"\r",
-        Key::Escape => b"\x1b",
-        Key::Tab => b"\t",
-        Key::Up => b"\x1b[A",
-        Key::Down => b"\x1b[B",
-        Key::Left => b"\x1b[D",
-        Key::Right => b"\x1b[C",
-        Key::Backspace => b"\x7f",
-        Key::CtrlC => b"\x03",
+    pty_key_in(key, false)
+}
+
+/// Bytes for a PTY, with arrows in application cursor mode (SS3: `ESC O A`) when the program
+/// has asked for it, else in normal mode (CSI: `ESC [ A`), as a terminal sends them.
+pub fn pty_key_in(key: Key, application_cursor: bool) -> &'static [u8] {
+    match (key, application_cursor) {
+        (Key::Enter, _) => b"\r",
+        (Key::Escape, _) => b"\x1b",
+        (Key::Tab, _) => b"\t",
+        (Key::Up, false) => b"\x1b[A",
+        (Key::Down, false) => b"\x1b[B",
+        (Key::Left, false) => b"\x1b[D",
+        (Key::Right, false) => b"\x1b[C",
+        (Key::Up, true) => b"\x1bOA",
+        (Key::Down, true) => b"\x1bOB",
+        (Key::Left, true) => b"\x1bOD",
+        (Key::Right, true) => b"\x1bOC",
+        (Key::Backspace, _) => b"\x7f",
+        (Key::CtrlC, _) => b"\x03",
     }
 }
