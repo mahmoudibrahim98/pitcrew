@@ -6,9 +6,13 @@
 //! component and checks what it opened, on the opened handle, so nothing can change between the
 //! check and the read:
 //! - **Unix:** `O_NOFOLLOW` (a link fails the open), with `O_NONBLOCK` so a named pipe cannot
-//!   block it, then `fstat` must say a regular file.
+//!   block it and `O_NOCTTY` so a terminal device cannot become ours, then `fstat` must say a
+//!   regular file with one link: agents never hard-link transcripts, and a hard link is how a
+//!   file elsewhere (a key, or a file someone else's process would overwrite) is given a
+//!   transcript's name without a symbolic link.
 //! - **Windows:** `FILE_FLAG_OPEN_REPARSE_POINT` (the link or junction itself is opened, not its
-//!   target), then the handle's attributes must say neither a reparse point nor a directory.
+//!   target), then the handle's attributes must say neither a reparse point nor a directory. Hard
+//!   links are not counted there (std has no stable way to read the count).
 //!
 //! Only the last component is checked: folders above it may be links (a home on another drive),
 //! as discovery already allows. A refused file is a [`NotRegularFile`] error, which says what was
@@ -36,6 +40,8 @@ pub enum FileKind {
     Socket,
     /// A block or character device.
     Device,
+    /// A regular file with more than one hard link (Unix).
+    HardLinked,
     /// Something else that is not a regular file.
     Other,
 }
@@ -49,13 +55,15 @@ impl fmt::Display for FileKind {
             Self::Fifo => "a named pipe",
             Self::Socket => "a socket",
             Self::Device => "a device",
+            Self::HardLinked => "a file with other hard links",
             Self::Other => "something else",
         })
     }
 }
 
-/// A transcript path that names something other than a regular file. It is not read. Carried
-/// inside [`SourceError::Io`]; find it with [`refusal`].
+/// A transcript path (or an OpenCode store's side file) that names something other than a regular
+/// file of its own: a link, a pipe, a folder, a device, or a file with other hard links. It is not
+/// read. Carried inside [`SourceError::Io`]; find it with [`refusal`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NotRegularFile {
     /// The transcript's path.
@@ -66,12 +74,18 @@ pub struct NotRegularFile {
 
 impl fmt::Display for NotRegularFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{} is {}, not a regular file; it is not read",
-            self.path.display(),
-            self.kind
-        )
+        match self.kind {
+            FileKind::HardLinked => write!(
+                f,
+                "{} is a file with other hard links; it is not read",
+                self.path.display()
+            ),
+            kind => write!(
+                f,
+                "{} is {kind}, not a regular file; it is not read",
+                self.path.display()
+            ),
+        }
     }
 }
 
@@ -122,11 +136,12 @@ mod imp {
     use rustix::io::Errno;
     use std::fs::File;
     use std::io;
-    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt as _};
     use std::path::Path;
 
     pub(super) fn open(path: &Path, _hold: bool) -> io::Result<File> {
-        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let flags =
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
         let fd = match rustix::fs::open(path, flags, rustix::fs::Mode::empty()) {
             Ok(fd) => fd,
             // A link in the last component: `ELOOP` (Linux, macOS), `EMLINK` (FreeBSD).
@@ -136,7 +151,11 @@ mod imp {
             Err(e) => return Err(e.into()),
         };
         let file = File::from(fd);
-        let kind = file.metadata()?.file_type();
+        let meta = file.metadata()?;
+        let kind = meta.file_type();
+        if kind.is_file() && meta.nlink() > 1 {
+            return Err(refused(path, FileKind::HardLinked));
+        }
         if !kind.is_file() {
             let what = if kind.is_dir() {
                 FileKind::Directory
@@ -357,6 +376,25 @@ mod tests {
             let home = dir.path().join("home");
             symlink(&real, &home).expect("link");
             assert_eq!(contents(open_transcript(&home.join("t.jsonl"))), "{}\n");
+        }
+
+        /// A hard link gives a file elsewhere a transcript's name with no symbolic link to see;
+        /// agents never make one, so a file with more than one link is refused.
+        #[test]
+        fn a_hard_linked_file_is_refused() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let secret = dir.path().join("secret");
+            std::fs::write(&secret, "PRIVATE KEY").expect("write");
+            let path = dir.path().join("t.jsonl");
+            std::fs::hard_link(&secret, &path).expect("hard link");
+            for result in [open_transcript(&path), hold_transcript(&path)] {
+                let err = result.expect_err("hard-linked");
+                assert_eq!(refusal_in(&err).map(|r| r.kind), Some(FileKind::HardLinked));
+                assert!(!err.to_string().contains("PRIVATE"), "{err}");
+            }
+            // Once it is the only name again, it is an ordinary transcript.
+            std::fs::remove_file(&secret).expect("remove");
+            assert_eq!(contents(open_transcript(&path)), "PRIVATE KEY");
         }
     }
 
