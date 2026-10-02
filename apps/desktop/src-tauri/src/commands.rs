@@ -12,6 +12,7 @@
 //! invoke('gateway_remote_probe', { host })                       // → RemoteProbe
 //! invoke('gateway_remote_plan', { req: { host, launcher, site, job } })  // → RemotePlan
 //! invoke('gateway_remote_add', { plan, events: new Channel() })  // → GatewayWorkspace
+//! invoke('gateway_remote_cancel', { plan })
 //! invoke('gateway_workspace_retry', { workspace })
 //! invoke('gateway_workspace_remove', { workspace, stopHelper })
 //! invoke('gateway_prompt_reply', { id, answer })                 // or { id, accept }, or { id }
@@ -116,6 +117,19 @@ pub async fn gateway_remote_add<R: Runtime>(
         }
     });
     remotes(&webview)?.add(&plan, progress).await
+}
+
+/// `gateway_remote_cancel({ plan })`: stops the add carrying out `plan`, if one is running, and
+/// undoes what it started; that add then ends `failed`. A plan not used yet is dropped. An add
+/// that has finished, or an unknown plan, is left alone.
+#[tauri::command]
+pub fn gateway_remote_cancel<R: Runtime>(
+    webview: Webview<R>,
+    plan: Option<Value>,
+) -> Result<(), GatewayError> {
+    let plan = string(plan, "plan")?;
+    remotes(&webview)?.cancel(&plan);
+    Ok(())
 }
 
 /// `gateway_workspace_remove({ workspace, stopHelper })`.

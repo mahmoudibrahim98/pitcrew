@@ -24,7 +24,10 @@
 //! **Other knobs**, as files in the machine's directory: `noisy` makes every command print a
 //! login banner on stdout first, as a chatty `.bashrc` would; `drop` ends the next link that
 //! sees it (it takes the file), as a server closing the connection; `fail-stop` makes a call
-//! running the helper script's `stop` fail as a lost connection.
+//! running the helper script's `stop` fail as a lost connection; `kbdint` makes the server ask
+//! for the password with its text, marked `(sam@hpc-login)` as OpenSSH marks keyboard-interactive
+//! prompts; `stall` makes links wait for ever before signing in, as a server that does not
+//! answer.
 //!
 //! The binary is also `pitcrew-askpass` (`<machine>/pitcrew-askpass`), as the real one: the
 //! crate's own client.
@@ -301,6 +304,10 @@ fn run(machine: &Path, call: &Call) -> u8 {
 
 /// `ssh -N`: a link, as a ControlMaster or a heartbeat. The network never fails here.
 fn link(machine: &Path, call: &Call) -> u8 {
+    // A server that does not answer: the link waits until it is stopped.
+    while machine.join("stall").exists() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
     if !sign_in(machine, call) {
         return 255;
     }
@@ -597,6 +604,15 @@ impl Machine {
             None => {
                 let _ = std::fs::remove_file(self.dir.join("kbdint"));
             }
+        }
+    }
+
+    /// Whether new links wait for ever before signing in.
+    pub fn stall_links(&self, stall: bool) {
+        if stall {
+            std::fs::write(self.dir.join("stall"), "").unwrap();
+        } else {
+            let _ = std::fs::remove_file(self.dir.join("stall"));
         }
     }
 

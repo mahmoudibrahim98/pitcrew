@@ -15,6 +15,7 @@
 //!    asking the hub which workspace it hosts, and registers the workspace with its token in the
 //!    OS keychain. If a step fails after the helper was started (or its job submitted) by this
 //!    add, that is stopped again; if stopping fails too, the error says what may be left.
+//!    [`Remotes::cancel`] stops a running add the same way.
 //!
 //! **The hub's answer is not trusted.** Its workspace id is claimed in the registry in one step
 //! that refuses an id already held by the local workspace, or by a remote one on another machine
@@ -69,6 +70,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+use tokio::sync::watch;
 
 /// The step name of the whole add, in its last progress event.
 pub const ADD_STEP: &str = "add";
@@ -306,6 +308,59 @@ fn with_note(error: GatewayError, note: Option<String>) -> GatewayError {
     }
 }
 
+/// Fires when the person cancels a running add ([`Remotes::cancel`]).
+struct Cancel(watch::Receiver<bool>);
+
+impl Cancel {
+    fn is_set(&self) -> bool {
+        *self.0.borrow()
+    }
+
+    /// Completes once the add is cancelled (never, if it is not).
+    async fn fired(&self) {
+        let mut rx = self.0.clone();
+        if rx.wait_for(|set| *set).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// The error of an add the person cancelled.
+fn cancelled(host: &str) -> GatewayError {
+    GatewayError::unreachable(format!("adding {host} was cancelled"))
+}
+
+/// `work`, unless the add is cancelled first: then `work` is dropped where it waits.
+async fn or_cancelled<T>(
+    cancel: &Cancel,
+    host: &str,
+    work: impl Future<Output = Result<T, GatewayError>>,
+) -> Result<T, GatewayError> {
+    tokio::select! {
+        biased;
+        () = cancel.fired() => Err(cancelled(host)),
+        done = work => done,
+    }
+}
+
+/// The adds running, by plan id, each with its cancel.
+type Adds = Mutex<HashMap<String, watch::Sender<bool>>>;
+
+/// Forgets a running add however it ends.
+struct Running<'a> {
+    adds: &'a Adds,
+    plan: String,
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.adds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.plan);
+    }
+}
+
 type Links = Arc<Mutex<HashMap<String, Arc<Link>>>>;
 
 /// Remote workspaces: the gateway's remote commands, and the tunnels of the workspaces added.
@@ -315,6 +370,7 @@ pub struct Remotes {
     tokens: Arc<dyn TokenStore>,
     prompts: Arc<PromptHub>,
     plans: Mutex<PlanStore<Plan>>,
+    adds: Adds,
     links: Links,
     runtime: tokio::runtime::Handle,
     waker: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -347,6 +403,7 @@ impl Remotes {
             tokens,
             prompts,
             plans: Mutex::new(PlanStore::new(ttl)),
+            adds: Adds::default(),
             links: Links::default(),
             runtime,
             waker: Mutex::new(None),
@@ -540,8 +597,8 @@ impl Remotes {
     ///
     /// # Errors
     /// `invalid` for a plan that is unknown, used or expired, and for a launch the machine
-    /// refuses; `unreachable` when the connection is lost or a prompt is cancelled; others as
-    /// the steps fail.
+    /// refuses; `unreachable` when the connection is lost, a prompt is cancelled or the add is
+    /// ([`Remotes::cancel`]); others as the steps fail.
     pub async fn add(
         &self,
         plan: &str,
@@ -549,10 +606,16 @@ impl Remotes {
     ) -> Result<GatewayWorkspace, GatewayError> {
         let taken = self.lock_plans().take(plan, Instant::now());
         let result = match taken {
-            Ok(plan) => {
-                let host = plan.host.clone();
-                tracing::info!(host, launcher = plan.launcher.as_str(), "adding a machine");
-                let result = self.carry_out(plan, &progress).await;
+            Ok(taken) => {
+                let host = taken.host.clone();
+                tracing::info!(host, launcher = taken.launcher.as_str(), "adding a machine");
+                let (cancel_tx, cancel_rx) = watch::channel(false);
+                self.lock_adds().insert(plan.to_owned(), cancel_tx);
+                let _running = Running {
+                    adds: &self.adds,
+                    plan: plan.to_owned(),
+                };
+                let result = self.carry_out(taken, &progress, &Cancel(cancel_rx)).await;
                 match &result {
                     Ok(workspace) => {
                         tracing::info!(host, workspace = %workspace.id, "added a remote workspace");
@@ -572,6 +635,25 @@ impl Remotes {
             )),
         }
         result
+    }
+
+    /// `gateway_remote_cancel`: stops the add carrying out plan `plan`, if one is running, and
+    /// undoes what it started (the helper it started is stopped, the job it submitted
+    /// cancelled); that add then fails. A step already running on the machine (starting the
+    /// helper, submitting the job) finishes first, so that what it started is known and undone;
+    /// waiting (for the upload, the job, the connection, the pairing) stops at once. A plan not
+    /// used yet is dropped, so an add that comes after the cancel fails. An add that has
+    /// finished, or an unknown plan, is left alone.
+    pub fn cancel(&self, plan: &str) {
+        let unused = self.lock_plans().take(plan, Instant::now()).is_ok();
+        let running = self
+            .lock_adds()
+            .get(plan)
+            .map(|add| add.send_replace(true))
+            .is_some();
+        if unused || running {
+            tracing::info!(running, "cancelled adding a machine");
+        }
     }
 
     /// `gateway_workspace_remove`: forgets remote workspace `workspace` and deletes its token.
@@ -726,10 +808,13 @@ impl Remotes {
 
     // ─── Adding ─────────────────────────────────────────────────────────────────────────────
 
+    /// Carries out `plan`'s steps. When `cancel` fires, the step waiting stops (one starting the
+    /// helper or submitting its job finishes first), and what this add started is undone.
     async fn carry_out(
         &self,
         plan: Plan,
         progress: &Progress,
+        cancel: &Cancel,
     ) -> Result<GatewayWorkspace, GatewayError> {
         let Plan {
             host,
@@ -742,22 +827,27 @@ impl Remotes {
             last_hop,
             steps,
         } = plan;
+        // Nothing is started yet: the upload just stops.
         step(
             progress,
             &steps.deploy,
-            self.deploy(&target, &helper, &steps.deploy, progress),
+            or_cancelled(
+                cancel,
+                &host,
+                self.deploy(&target, &helper, &steps.deploy, progress),
+            ),
         )
         .await?;
         let (started, undo) = step(
             progress,
             &steps.launch,
-            self.launch(&target, launcher, script, &steps.launch, progress),
+            self.launch(&target, launcher, script, &steps.launch, progress, cancel),
         )
         .await?;
         let tunnel = match step(
             progress,
             &steps.connect,
-            self.connect(&target, started, last_hop, None),
+            self.connect(&target, started, last_hop, None, cancel),
         )
         .await
         {
@@ -774,10 +864,12 @@ impl Remotes {
             last_hop: last_hop.map(hop_kind),
             transport: tunnel.transport(),
         };
+        // Pairing registers the workspace only in its last, synchronous part, so a cancel that
+        // drops it while it waits leaves nothing registered.
         match step(
             progress,
             &steps.pair,
-            self.pair(&target, tunnel.clone(), record),
+            or_cancelled(cancel, &host, self.pair(&target, tunnel.clone(), record)),
         )
         .await
         {
@@ -834,7 +926,8 @@ impl Remotes {
 
     /// Starts the helper; for SLURM, submits the plan's script and waits for the job to run.
     /// Returns the launcher the tunnel asks where the helper is, and what to stop if a later
-    /// step fails.
+    /// step fails. Starting or submitting is not cut short by `cancel`, so that what it started
+    /// is known; the cancel is honoured right after, and while waiting for the job.
     async fn launch(
         &self,
         target: &Target,
@@ -842,8 +935,12 @@ impl Remotes {
         script: Option<JobScript>,
         name: &str,
         progress: &Progress,
+        cancel: &Cancel,
     ) -> Result<(Arc<dyn Launcher>, Undo), GatewayError> {
         let host = target.host();
+        if cancel.is_set() {
+            return Err(cancelled(host));
+        }
         if kind != LauncherKind::Slurm {
             let launcher = launcher_of(kind);
             let started = launcher
@@ -861,6 +958,9 @@ impl Remotes {
             } else {
                 Undo::Nothing
             };
+            if cancel.is_set() {
+                return Err(with_note(cancelled(host), self.undo(target, undo).await));
+            }
             return Ok((launcher, undo));
         }
         let slurm = SlurmLauncher::default();
@@ -918,7 +1018,13 @@ impl Remotes {
                 }
             }
         };
-        match self.wait_for_job(target, &slurm, job, name, progress).await {
+        let waited = or_cancelled(
+            cancel,
+            host,
+            self.wait_for_job(target, &slurm, job, name, progress),
+        )
+        .await;
+        match waited {
             Ok(()) => Ok((Arc::new(slurm), undo)),
             Err(e) => Err(with_note(e, self.undo(target, undo).await)),
         }
@@ -1002,13 +1108,14 @@ impl Remotes {
         Some(left)
     }
 
-    /// Starts the tunnel and waits for it to connect.
+    /// Starts the tunnel and waits for it to connect, or for `cancel` (the tunnel is closed).
     async fn connect(
         &self,
         target: &Target,
         launcher: Arc<dyn Launcher>,
         last_hop: Option<LastHop>,
         transport: Option<Transport>,
+        cancel: &Cancel,
     ) -> Result<Tunnel, GatewayError> {
         let host = target.host().to_owned();
         let daemon =
@@ -1019,14 +1126,21 @@ impl Remotes {
                 .map_err(|e| link::tunnel_error(&host, &e))?
         };
         let mut watch = tunnel.watch();
-        let reached = tokio::time::timeout(
-            self.options.connect_wait,
-            watch.wait_for(|s| {
-                s.is_connected() || matches!(s, LinkState::Unreachable { .. } | LinkState::Closed)
-            }),
-        )
-        .await
-        .map(|r| r.map(|state| state.clone()));
+        let waited = tokio::select! {
+            biased;
+            () = cancel.fired() => None,
+            reached = tokio::time::timeout(
+                self.options.connect_wait,
+                watch.wait_for(|s| {
+                    s.is_connected()
+                        || matches!(s, LinkState::Unreachable { .. } | LinkState::Closed)
+                }),
+            ) => Some(reached.map(|r| r.map(|state| state.clone()))),
+        };
+        let Some(reached) = waited else {
+            tunnel.close().await;
+            return Err(cancelled(&host));
+        };
         match reached {
             Ok(Ok(state)) if state.is_connected() => Ok(tunnel),
             Ok(Ok(state)) => {
@@ -1236,6 +1350,12 @@ impl Remotes {
             crate::gateway::error::shorten(name),
             dir.join(format!("{name}.toml")).display()
         )))
+    }
+
+    fn lock_adds(&self) -> MutexGuard<'_, HashMap<String, watch::Sender<bool>>> {
+        self.adds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn lock_plans(&self) -> MutexGuard<'_, PlanStore<Plan>> {

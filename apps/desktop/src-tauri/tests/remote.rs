@@ -97,6 +97,7 @@ mod unix {
             "a_cancelled_sign_in_while_reconnecting_is_retried",
             a_cancelled_sign_in_while_reconnecting_is_retried,
         ),
+        ("an_add_can_be_cancelled", an_add_can_be_cancelled),
         (
             "plans_expire_and_missing_programs_are_clear_errors",
             plans_expire_and_missing_programs_are_clear_errors,
@@ -678,6 +679,7 @@ mod unix {
                 "gateway_remote_add",
                 json!({ "plan": plan["plan"], "events": "__CHANNEL__:73" }),
             ),
+            ("gateway_remote_cancel", json!({ "plan": plan["plan"] })),
             ("gateway_workspace_retry", json!({ "workspace": id })),
             (
                 "gateway_workspace_remove",
@@ -1363,6 +1365,138 @@ mod unix {
         assert_eq!(e["code"], "unknown_workspace");
         let e = w.call("gateway_workspace_retry", json!({})).unwrap_err();
         assert_eq!(e["code"], "invalid");
+    }
+
+    /// `gateway_remote_cancel` stops a running add and undoes what it started: a submitted job
+    /// that waits to start is cancelled, a helper started for a connection that does not come is
+    /// stopped. Nothing is registered, and the add ends `failed`. A plan cancelled before its
+    /// add is dropped; cancelling a finished add or an unknown plan does nothing.
+    fn an_add_can_be_cancelled() {
+        // SLURM: cancelled while the job is pending (the add would wait a minute).
+        let w = world(true, |options, _| {
+            options.job_wait = Duration::from_secs(60);
+            options.job_poll = Duration::from_millis(300);
+        });
+        let plan = w
+            .call(
+                "gateway_remote_plan",
+                json!({ "req": { "host": HOST, "launcher": "slurm" } }),
+            )
+            .unwrap();
+        let adding = {
+            let window = w.main.clone();
+            let plan = plan["plan"].clone();
+            std::thread::spawn(move || {
+                invoke(
+                    &window,
+                    "gateway_remote_add",
+                    json!({ "plan": plan, "events": "__CHANNEL__:140" }),
+                )
+            })
+        };
+        w.wait("the job pending", |w| {
+            w.channel(140)
+                .iter()
+                .any(|m| m["detail"].as_str().unwrap_or("").contains("pending"))
+        });
+        let cancelled = Instant::now();
+        let none = w
+            .call("gateway_remote_cancel", json!({ "plan": plan["plan"] }))
+            .unwrap();
+        assert_eq!(none, Value::Null);
+        let e = adding.join().unwrap().unwrap_err();
+        assert!(
+            cancelled.elapsed() < Duration::from_secs(20),
+            "it stopped waiting"
+        );
+        assert_eq!(e["code"], "unreachable", "{e}");
+        let message = e["message"].as_str().unwrap();
+        assert!(message.contains("cancelled"), "{message}");
+        assert!(!message.contains("may still be queued"), "{message}");
+        let cancelled_jobs = std::fs::read_to_string(w.machine.slurm.join("scancel.log")).unwrap();
+        assert!(
+            cancelled_jobs.trim_end().ends_with("4242"),
+            "{cancelled_jobs}"
+        );
+        assert_eq!(
+            steps_of(&w.channel(140)).last().unwrap(),
+            &("add".to_owned(), "failed".to_owned())
+        );
+        assert!(w.registry.list().is_empty());
+        // The add has finished: cancelling it again, or an unknown plan, does nothing.
+        for plan in [plan["plan"].clone(), json!("no-such-plan")] {
+            assert_eq!(
+                w.call("gateway_remote_cancel", json!({ "plan": plan }))
+                    .unwrap(),
+                Value::Null
+            );
+        }
+        let e = w
+            .call("gateway_remote_cancel", json!({ "plan": 7 }))
+            .unwrap_err();
+        assert_eq!(e["code"], "invalid");
+        drop(w);
+
+        // Direct: the helper is started, then the connection does not come; cancelled while
+        // it waits, the helper is stopped again.
+        let w = world(false, |options, _| {
+            options.connect_wait = Duration::from_secs(60);
+        });
+        w.machine.stall_links(true);
+        let plan = w
+            .call(
+                "gateway_remote_plan",
+                json!({ "req": { "host": HOST, "launcher": "direct" } }),
+            )
+            .unwrap();
+        let steps: Vec<String> = serde_json::from_value(plan["steps"].clone()).unwrap();
+        let adding = {
+            let window = w.main.clone();
+            let plan = plan["plan"].clone();
+            std::thread::spawn(move || {
+                invoke(
+                    &window,
+                    "gateway_remote_add",
+                    json!({ "plan": plan, "events": "__CHANNEL__:141" }),
+                )
+            })
+        };
+        w.wait("connecting", |w| {
+            steps_of(&w.channel(141)).contains(&(steps[2].clone(), "running".to_owned()))
+        });
+        assert!(w.machine.endpoint().is_some(), "the helper runs");
+        w.call("gateway_remote_cancel", json!({ "plan": plan["plan"] }))
+            .unwrap();
+        let e = adding.join().unwrap().unwrap_err();
+        assert!(e["message"].as_str().unwrap().contains("cancelled"), "{e}");
+        assert!(w.machine.endpoint().is_none(), "the helper was stopped");
+        assert!(w.registry.list().is_empty());
+        assert_eq!(
+            steps_of(&w.channel(141))[steps_of(&w.channel(141)).len() - 2..],
+            [
+                (steps[2].clone(), "failed".to_owned()),
+                ("add".to_owned(), "failed".to_owned())
+            ]
+        );
+        w.machine.stall_links(false);
+
+        // A plan cancelled before its add is dropped: the add finds no plan, and starts nothing.
+        let plan = w
+            .call(
+                "gateway_remote_plan",
+                json!({ "req": { "host": HOST, "launcher": "direct" } }),
+            )
+            .unwrap();
+        w.call("gateway_remote_cancel", json!({ "plan": plan["plan"] }))
+            .unwrap();
+        let e = w
+            .call(
+                "gateway_remote_add",
+                json!({ "plan": plan["plan"], "events": "__CHANNEL__:142" }),
+            )
+            .unwrap_err();
+        assert_eq!(e["code"], "invalid", "{e}");
+        assert!(w.machine.endpoint().is_none());
     }
 
     /// An expired plan is refused; a machine without a helper for its platform, or an app
