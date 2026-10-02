@@ -82,6 +82,18 @@ fn host_info(daemon: &Daemon) -> Value {
     ok(&daemon.get("/v1/host/info", None), 200)
 }
 
+/// `HEAD /v1/host/info`'s `Content-Length` (it has no body), and the length `GET`'s body has now.
+fn host_info_head_and_get(daemon: &Daemon) -> (usize, usize) {
+    let head = request(daemon.port, "HEAD", "/v1/host/info", None, None, &[]);
+    assert_eq!(head.status, 200);
+    assert!(head.body.is_empty(), "{}", head.body);
+    assert_eq!(head.header("content-type"), Some("application/json"));
+    let length = head.header("content-length").unwrap().parse().unwrap();
+    let get = daemon.get("/v1/host/info", None);
+    assert_eq!(get.status, 200);
+    (length, get.body.len())
+}
+
 fn members_called(daemon: &Daemon, token: &str, handle: &str) -> Vec<Value> {
     ok(&daemon.get("/v1/members", Some(token)), 200)
         .as_array()
@@ -215,6 +227,19 @@ fn a_fresh_hub_waits_for_its_setup() {
     );
     assert!(!state.join("workspace.json").exists());
     assert!(!state.join("office.json").exists());
+
+    // `@office` is the back office's, though it has no member yet: a setup asking for it is a
+    // `409`, and changes nothing.
+    let reserved = daemon.post(
+        "/v1/setup",
+        Some(&device),
+        &setup_body("Lab", "Lee", "@office", "PC"),
+    );
+    assert_eq!(reserved.status, 409, "{}", reserved.body);
+    assert_eq!(reserved.code(), "conflict");
+    let workspace = ok(&daemon.get("/v1/workspace", Some(&device)), 200);
+    assert_eq!(workspace["setup_needed"], true);
+    assert!(!daemon.stderr().contains(SET_UP));
 }
 
 /// `POST /v1/setup`, then without a restart: the name (kept in `workspace.json`), `@office` acting
@@ -226,6 +251,10 @@ fn setup_starts_the_office_and_the_runner_and_a_restart_keeps_them() {
     let homes = homes_with_a_transcript(tmp.path());
     let mut daemon = fresh(&state, &homes);
     let device = daemon.device_token();
+    // HEAD of host info answers as GET does, without the body.
+    let (head, get) = host_info_head_and_get(&daemon);
+    assert_eq!(head, get);
+    let fresh_length = get;
 
     // The names are trimmed, and stored trimmed.
     let done = ok(
@@ -269,6 +298,10 @@ fn setup_starts_the_office_and_the_runner_and_a_restart_keeps_them() {
         (info["roles"] == json!(["hub", "runner"])).then_some(info)
     });
     assert_eq!(info["capabilities"], json!(["watch"]));
+    // HEAD follows too: the length of the answer with the runner, never the router's fixed one.
+    let (head, get) = host_info_head_and_get(&daemon);
+    assert_eq!(head, get);
+    assert!(head > fresh_length, "{head} <= {fresh_length}");
     let session = eventually("the transcript's session", || {
         ok(&daemon.get("/v1/sessions", Some(&device)), 200)
             .as_array()

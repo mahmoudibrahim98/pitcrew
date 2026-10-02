@@ -113,6 +113,41 @@ impl Runner {
         self.parts.clone()
     }
 
+    /// A real runner that watches no home and keeps what it reports nowhere, its index in
+    /// `dir`.
+    #[cfg(test)]
+    pub fn idle(dir: &std::path::Path) -> Self {
+        use pitcrew_protocol::events::Event;
+        use pitcrew_protocol::ids::WorkspaceId;
+        use pitcrew_runner::{EventSink, SinkError};
+
+        #[derive(Debug)]
+        struct Nowhere;
+        impl EventSink for Nowhere {
+            fn accept(&self, _events: &[Event]) -> Result<(), SinkError> {
+                Ok(())
+            }
+        }
+
+        let machine = MachineId::new();
+        let config = RunnerConfig::new(WorkspaceId::new(), machine, MemberId::new(), dir);
+        let handle = pitcrew_runner::start(config, Vec::new(), Arc::new(Nowhere))
+            .expect("an idle runner starts");
+        let terminals = handle
+            .terminals(Arc::new(NoRuntime))
+            .expect("its terminals start");
+        Self {
+            parts: Parts {
+                machine,
+                hooks: handle.hooks(),
+                terminals,
+                found: Arc::new(Found::default()),
+                watches: false,
+            },
+            handle: Some(handle),
+        }
+    }
+
     /// Stops the watcher and waits for it, at most `within`: what it already read is still handed
     /// to the store first. Then it holds the store no more.
     ///

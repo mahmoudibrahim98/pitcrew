@@ -3,14 +3,15 @@
 //!
 //! `pitcrew_api::router` answers this route with the `HostInfo` it was built with, but the runner
 //! may start after the router is built (once a fresh workspace is set up). So [`answer`], a layer
-//! over the whole app, answers `GET /v1/host/info` itself, from [`HostInfoNow`]; every other
-//! request (`HEAD` included) goes on to the router. A stand-in: `pitcrew-api` could take a source
-//! of host info instead of a value (see the README, "Not wired yet").
+//! over the whole app, answers `GET` and `HEAD /v1/host/info` itself, from [`HostInfoNow`]; every
+//! other request goes on to the router. A stand-in: `pitcrew-api` could take a source of host info
+//! instead of a value (see the README, "Not wired yet").
 
 use crate::runner::Attached;
-use axum::Json;
+use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::Method;
+use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use axum::http::{HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse as _, Response};
 use pitcrew_protocol::api::{HostInfo, HostRole};
@@ -58,16 +59,40 @@ impl HostInfoNow {
     }
 }
 
-/// Answers `GET /v1/host/info` from `info`; passes everything else on.
+/// Answers `GET` and `HEAD /v1/host/info` from `info`; passes everything else on, so the
+/// router's fixed answer is never served.
 pub async fn answer(
     State(info): State<Arc<HostInfoNow>>,
     request: Request,
     next: Next,
 ) -> Response {
-    if request.method() == Method::GET && request.uri().path() == PATH {
-        return Json(info.now()).into_response();
+    let method = request.method();
+    if request.uri().path() == PATH && (method == Method::GET || method == Method::HEAD) {
+        return reply(&info.now(), method == Method::HEAD);
     }
     next.run(request).await
+}
+
+/// `info` as JSON; for `HEAD`, the same headers (the length the body would have) and no body.
+fn reply(info: &HostInfo, head: bool) -> Response {
+    match serde_json::to_vec(info) {
+        Ok(json) => {
+            let headers = [
+                (CONTENT_TYPE, HeaderValue::from_static("application/json")),
+                (CONTENT_LENGTH, HeaderValue::from(json.len())),
+            ];
+            let body = if head {
+                Body::empty()
+            } else {
+                Body::from(json)
+            };
+            (headers, body).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "cannot write the host info");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -131,5 +156,29 @@ mod tests {
             assert_eq!(after.machine, before.machine);
         }
         runner.stop();
+    }
+
+    /// `GET` has the JSON; `HEAD` the same headers, the length included, and no body.
+    #[test]
+    fn head_has_gets_headers_and_no_body() {
+        let info = HostInfoNow::new(Arc::new(Attached::default())).now();
+        let json = serde_json::to_vec(&info).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        for head in [false, true] {
+            let response = reply(&info, head);
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
+            assert_eq!(
+                response.headers()[CONTENT_LENGTH],
+                json.len().to_string().as_str()
+            );
+            let body = runtime
+                .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+                .unwrap();
+            let expected: &[u8] = if head { &[] } else { &json };
+            assert_eq!(&body[..], expected, "head: {head}");
+        }
     }
 }

@@ -282,6 +282,16 @@ pub struct Running {
 }
 
 impl Running {
+    /// A loop that does nothing but wait to be stopped, on the current runtime.
+    #[cfg(test)]
+    pub fn idle() -> Self {
+        let (stop, mut stopped) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let _ = stopped.changed().await;
+        });
+        Self { stop, task }
+    }
+
     /// Stops the loop and waits for it, at most `within`. A run in progress finishes first; then
     /// where the office got to is saved.
     pub async fn stop(self, within: Duration) {

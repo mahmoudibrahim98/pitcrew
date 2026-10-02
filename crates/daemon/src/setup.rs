@@ -258,12 +258,46 @@ mod tests {
         signal.set_up(&first);
     }
 
+    /// Kept until the stop begins, and taken by it; handed back once it has begun, so a setup
+    /// that starts the office or the runner while the daemon stops stops them itself, at once.
     #[test]
-    fn nothing_is_kept_once_the_stop_has_begun() {
-        let workers = Workers::default();
-        assert!(!workers.stopping());
-        let (office, runner) = workers.take();
-        assert!(office.is_none() && runner.is_none());
-        assert!(workers.stopping());
+    fn what_starts_once_the_stop_has_begun_is_handed_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let within = Duration::from_secs(10);
+        runtime.block_on(async {
+            // Before the stop: kept, and the stop takes them.
+            let workers = Workers::default();
+            assert!(!workers.stopping());
+            assert!(workers.keep_office(Running::idle()).is_none());
+            assert!(
+                workers
+                    .keep_runner(Runner::idle(&tmp.path().join("before")))
+                    .is_none()
+            );
+            let (office, runner) = workers.take();
+            assert!(workers.stopping());
+            office.expect("the office was kept").stop(within).await;
+            runner.expect("the runner was kept").stop(within).await;
+
+            // Once the stop has begun: handed back, and nothing is kept for it to take.
+            let workers = Workers::default();
+            let (office, runner) = workers.take();
+            assert!(office.is_none() && runner.is_none());
+            let office = workers
+                .keep_office(Running::idle())
+                .expect("the office is handed back");
+            let runner = workers
+                .keep_runner(Runner::idle(&tmp.path().join("after")))
+                .expect("the runner is handed back");
+            let (office_kept, runner_kept) = workers.take();
+            assert!(office_kept.is_none(), "the office was kept after the stop");
+            assert!(runner_kept.is_none(), "the runner was kept after the stop");
+            office.stop(within).await;
+            runner.stop(within).await;
+        });
     }
 }

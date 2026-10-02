@@ -138,7 +138,9 @@ restart:
    start (`--homes`, else this user's own; none with `--demo`, which never needs setup), and
    attaches it to the routes and host info.
 
-A part that cannot start is logged and stays off until the next start, which starts it as any
+The answer to `POST /v1/setup` comes once step 1 commits, so it may come a moment before steps
+2–4 are done (api-v1.md says so): host info's roles show the runner once it runs. A part that
+cannot start is logged and stays off until the next start, which starts it as any
 start with a person does; the name is served even if `workspace.json` cannot be written (logged
 as an error: a restart would then call the workspace "Workspace"). A second setup, or a racing
 one, is a `409` and starts nothing. On every start the name comes from `workspace.json` (step 2
@@ -214,7 +216,9 @@ the hub's one writer, hub-work's `WorkService::ensure_office_member(owner)`:
   serves, which the command lock makes safe;
 - the office stays off (logged) when the workspace has no person yet to own it (until it is set
   up), or when `@office` is a person, another person's agent, or an agent of no one (a `409` from
-  `ensure_office_member`): it never acts as a person, or for someone else.
+  `ensure_office_member`): it never acts as a person, or for someone else. Setup never makes
+  `@office` a person's handle: it is reserved (api-v1.md, "The first run"), so on a hub set up
+  here only data from elsewhere can hold it.
 
 Why an event rather than seeding: the office's member is workspace data like any other, so it
 belongs in the log, where every projection (and a rebuild) sees it; and the run log must know the
@@ -320,8 +324,9 @@ reaching.
 is off; capabilities `["watch"]` only while it watches at least one home (so not with `--demo`
 alone), else `[]`. They are read at each request, so a runner that starts after setup shows at
 once: `pitcrew_api::router` answers the route with the value it was built with, so the daemon
-answers `GET /v1/host/info` itself in a layer over the app (`src/host.rs`) and passes every other
-request on (`HEAD` included, which gets the router's answer).
+answers `GET` and `HEAD /v1/host/info` itself in a layer over the app (`src/host.rs`; `HEAD` with
+the same headers, its length included, and no body) and passes every other request on, so the
+router's fixed answer is never served.
 
 **Hooks, and `SessionAgents`.** `POST /v1/hooks/{engine}/{event}` goes through the API's
 `HookIntake` to `RunnerHooks`, which applies a hook only when its sender may change the session
@@ -563,12 +568,14 @@ Claude fixture's transcript):
 
 - a fresh start: `setup_needed` is true and the name "Workspace", `GET /v1/me` is `404`, host
   info has roles `["hub"]` and no capability, no `@office`, the office and the runner logged off,
-  no session though a transcript waits in the home, no `workspace.json`;
+  no session though a transcript waits in the home, no `workspace.json`; a setup asking for
+  `@office` is `409` and changes nothing;
 - `POST /v1/setup` with padded names (stored trimmed), then without a restart: `GET /v1/workspace`
   has the name and no `setup_needed`, `GET /v1/me` is the person, `workspace.json` holds the id
   and the name, `@office` is an agent owned by the person and acts (a dispatch of an in-progress
   task finishing moves it to review, authored by `@office` on behalf of the person, as in
-  `tests/office.rs`), host info shows the runner and `watch`, and the transcript is a session of
+  `tests/office.rs`), host info shows the runner and `watch` (`HEAD` too: no body, and the
+  `Content-Length` of `GET`'s answer, before setup and after), and the transcript is a session of
   the new machine. A second setup is `409`; no token is in the logs. A restart keeps the name,
   shows the runner at once, starts the office from its start, finds the same `@office` (one), and
   keeps the session;
@@ -621,7 +628,8 @@ sub-agents up their chain (16 sessions resolve; 17, or 16 below a parent not sto
 `Unknown`), and answers `Unknown` for a chain that disagrees or loops and for an agent the hub
 does not know as one; `src/terminals.rs` answers `404`, `503` or the runner's answer by where the
 session is, with and without a runner, and with one attached later; `src/host.rs` answers the
-runner's role and `watch` once one is attached; `src/transcripts.rs` finds each CLI's file names
+runner's role and `watch` once one is attached, and `HEAD` with `GET`'s headers and no body;
+`src/transcripts.rs` finds each CLI's file names
 and no other engine's (no Claude id names a rollout, no Codex id a Claude file), takes the newest
 of one session in two homes, and replaces a home's list at each discovery; `src/runner.rs` and
 `src/cli.rs` check that `--demo` alone watches nothing (the person's homes are not even looked
@@ -629,7 +637,8 @@ up), how `--homes` values become homes, and that `--no-runner` refuses `--homes`
 also checks that everything after `connect` reaches the bridge as it is, and `init`'s arguments;
 `src/init.rs` the request's body (a bare handle given its `@`) and the client pointed at the state
 directory's socket, or the `--listen` given; `src/setup.rs` that the listener hands the setup over
-once and that nothing is kept once the stop has begun.
+once, and that an office loop and a runner (real, watching nothing) are kept until the stop begins
+and handed back, not kept, once it has.
 
 ## Not wired yet
 
