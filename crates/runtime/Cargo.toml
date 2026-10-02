@@ -14,11 +14,30 @@ pitcrew-interfaces.workspace = true
 tracing.workspace = true
 # The screen model behind `Runtime::screen`, fed by `%output` (never `capture-pane`).
 vt100.workspace = true
+# pitcrew-ptyd's protocol (`pty::proto`): JSON headers.
+serde.workspace = true
+serde_json.workspace = true
+# The connection to pitcrew-ptyd, on a thread of its own: a socket, or on Windows a named pipe
+# with overlapped I/O, so a read and a write can be in progress at once.
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 # The user's uid for the private socket directory, and signals, without unsafe code. The
 # version pitcrew-remote and tempfile already use.
 rustix = { version = "=1.1.5", features = ["process"] }
+
+[target.'cfg(windows)'.dependencies]
+# The pipe's owner and DACL, its client's user, and Job Objects (`pty::windows`). The version
+# tokio already uses.
+windows-sys = { version = "=0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_JobObjects",
+  "Win32_System_Pipes",
+  "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 proptest.workspace = true
