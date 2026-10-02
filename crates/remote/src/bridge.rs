@@ -441,8 +441,8 @@ pub(crate) mod unix {
     /// How long [`hung_up`] waits.
     const HANG_UP_WAIT: Duration = Duration::from_millis(200);
 
-    /// Waits up to 200 ms for the daemon to close its side of `socket` completely (both
-    /// directions: `POLLHUP`), and says whether it has.
+    /// Waits up to [`HANG_UP_WAIT`] for the daemon to close its side of `socket` completely
+    /// (both directions: `POLLHUP`), and says whether it has.
     ///
     /// macOS builds `poll` on kqueue and watches a descriptor only through the filters its
     /// requested events select: asked for nothing it reports nothing, a hang-up included, and
@@ -459,10 +459,11 @@ pub(crate) mod unix {
         };
         let started = std::time::Instant::now();
         let mut fds = [PollFd::new(socket, events)];
-        let wait = Timespec {
+        // 200 ms always fits; were it not to, `poll` returns at once and the sleep below waits.
+        let wait = Timespec::try_from(HANG_UP_WAIT).unwrap_or(Timespec {
             tv_sec: 0,
-            tv_nsec: 200_000_000,
-        };
+            tv_nsec: 0,
+        });
         let hung_up = poll(&mut fds, Some(&wait)).is_ok_and(|_| {
             fds.first()
                 .is_some_and(|fd| fd.revents().intersects(PollFlags::HUP | PollFlags::ERR))
@@ -556,6 +557,10 @@ mod tests {
         let mut got = Vec::new();
         client_out.read_to_end(&mut got).unwrap();
         assert_eq!(got, b"bye");
+        // A half-close is not a hang-up: the bridge goes on. (Were it taken for one, the copy
+        // up would still carry what follows, so only this tells.)
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(!pumping.is_finished(), "a half-close ended the bridge");
         client_in.write_all(b"still here").unwrap();
         client_in.shutdown(std::net::Shutdown::Write).unwrap();
         let mut heard = Vec::new();
