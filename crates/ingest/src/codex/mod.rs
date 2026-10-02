@@ -22,6 +22,7 @@ pub use parse::{CodexRecord, RecordFacts, parse_line};
 use crate::bound::MAX_TITLE_CHARS;
 use crate::jsonl::{self, Format, Skips, set_first, set_latest};
 use crate::lines::{Backward, SkipReason};
+use crate::open::open_transcript;
 use crate::text::title;
 use pitcrew_interfaces::source::{
     Cursor, ParseChunk, SessionMeta, SourceAdapter, SourceError, TranscriptItem, TranscriptPage,
@@ -29,7 +30,7 @@ use pitcrew_interfaces::source::{
 };
 use pitcrew_protocol::model::{Engine, TimestampMs};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -60,7 +61,9 @@ impl CodexAdapter {
     ///
     /// # Errors
     ///
-    /// I/O errors, or [`SourceError::Unreadable`] if the file is now shorter than the cursor.
+    /// I/O errors, or [`SourceError::Unreadable`] if the file is now shorter than the cursor. A
+    /// transcript that is now a link, or anything else that is not a regular file, is not read: an
+    /// I/O error carrying a [`NotRegularFile`](crate::NotRegularFile) (see [`crate::refusal`]).
     pub fn read(
         &self,
         transcript: &TranscriptRef,
@@ -134,7 +137,7 @@ impl SourceAdapter for CodexAdapter {
         limit: usize,
     ) -> Result<TranscriptPage, SourceError> {
         let path = &transcript.path;
-        let mut file = File::open(path)?;
+        let mut file = open_transcript(path)?;
         let len = file.metadata()?.len();
         let mut back = Backward::new(&mut file, len);
         let end = back.align(before.unwrap_or(len))?;

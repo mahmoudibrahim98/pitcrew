@@ -155,7 +155,7 @@ mod tests {
 
     #[test]
     fn r32_a_dot_owner_or_repo_is_rejected() {
-        // Stream Q's open-r32-dot-repo-in-closing-reference regression: a single `.` passes the
+        // Stream Q's r32-dot-repo-in-closing-reference regression: a single `.` passes the
         // same bare character-class check `..` did, and resolves to the *parent* page once
         // spliced into the link — `https://github.com/example-org/./issues/1` is
         // `https://github.com/example-org/issues/1` to a WHATWG parser, not the issue the

@@ -11,6 +11,9 @@
 //! - [`recap`]: activity blocks, summaries with receipts and day paragraphs, as the API serves
 //!   them.
 //!
+//! Besides the six, [`text`] holds the one set of hidden characters every crate drops from
+//! untrusted text.
+//!
 //! **Change process.** This crate belongs to stream 0. Other streams propose changes in a
 //! `s/0/contract-…` pull request. Breaking changes bump [`version::PROTOCOL_VERSION`].
 //! See `docs/build/contracts.md`.
@@ -23,6 +26,7 @@ pub mod ids;
 pub mod model;
 pub mod recap;
 pub mod runner;
+pub mod text;
 pub mod transcript;
 pub mod version;
 

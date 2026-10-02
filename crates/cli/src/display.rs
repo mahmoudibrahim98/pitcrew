@@ -5,58 +5,15 @@
 //! (they reorder what is shown) and other invisible Unicode format characters (they can hide or
 //! spoof text without being seen) are removed. `--json` output is left exact.
 //!
-//! The non-control part of the set below is meant to be the union of what
-//! `pitcrew_recap::text::clean`'s `is_hidden` and `pitcrew_sync_github::bounds::is_hidden` drop,
-//! plus the combining grapheme joiner, the Hangul filler characters, variation selectors and the
-//! full tag-character block (those two crates currently drop a narrower range, `U+E0001` and
-//! `U+E0020..=U+E007F`, and lack `U+FFF9..=U+FFFB`) — see this stream's report for exactly what
-//! they should each add to converge; this module does not edit them (out of this stream's
-//! ownership).
+//! The invisible and bidirectional characters are `pitcrew_protocol::text::is_hidden`, the one set
+//! the recap engine and the GitHub and Jira syncs drop too. This module adds control characters.
+//! The line and paragraph separators in the set (U+2028, U+2029) break a line, so [`line`] and
+//! [`text`] show them as a space rather than dropping them, as the recap engine's `clean` does.
 
-/// Unicode bidirectional formatting characters: marks, embeddings, overrides and isolates.
-/// (General Category `Cf`, like every character in [`is_invisible_format`].)
-fn is_bidi_control(c: char) -> bool {
-    matches!(
-        c,
-        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
-    )
-}
-
-/// Other Unicode characters that render as nothing, or as a blank placeholder glyph: zero-width
-/// space/joiners, the word joiner and invisible math operators, soft hyphen, the combining
-/// grapheme joiner, the Mongolian vowel separator, the BOM, interlinear-annotation marks,
-/// variation selectors, the Hangul filler characters, and the language-tag block (used to smuggle
-/// hidden text after a visible emoji). A task title made of these plus ordinary letters can look
-/// identical to another title while comparing unequal, or hide extra instructions a reader would
-/// never see.
-fn is_invisible_format(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'                 // soft hyphen
-            | '\u{034F}'            // combining grapheme joiner
-            | '\u{115F}' | '\u{1160}' // Hangul choseong/jungseong fillers
-            | '\u{180E}'            // Mongolian vowel separator
-            | '\u{200B}'..='\u{200D}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{3164}'            // Hangul filler
-            | '\u{FE00}'..='\u{FE0F}' // variation selectors
-            | '\u{FEFF}'
-            | '\u{FFA0}'            // halfwidth Hangul filler
-            | '\u{FFF9}'..='\u{FFFB}'
-            | '\u{E0000}'..='\u{E007F}' // tag characters
-            | '\u{E0100}'..='\u{E01EF}' // variation selectors supplement
-    )
-}
-
-/// U+2028 and U+2029: hidden like every other character above, but they break a line, so [`line`]
-/// and [`text`] show them as a space rather than dropping them, the same as `pitcrew_recap`'s
-/// `clean` does with its own line/paragraph separators.
-fn is_line_separator(c: char) -> bool {
-    matches!(c, '\u{2028}' | '\u{2029}')
-}
+use pitcrew_protocol::text::is_line_separator;
 
 fn is_hidden(c: char) -> bool {
-    c.is_control() || is_bidi_control(c) || is_invisible_format(c) || is_line_separator(c)
+    c.is_control() || pitcrew_protocol::text::is_hidden(c)
 }
 
 /// One line: every control character is dropped, except that tabs, line breaks and the Unicode
@@ -141,9 +98,9 @@ mod tests {
         assert_eq!(line("a\u{2028}\u{2029}b"), "a  b");
     }
 
-    /// The hidden set, written out in full: every range the `matches!` blocks above test for,
-    /// flattened. Pinned the same way `pitcrew_recap::text`'s own `is_hidden` is, so a future edit
-    /// cannot silently narrow or widen what gets dropped.
+    /// The hidden set, written out in full: control characters plus
+    /// `pitcrew_protocol::text::is_hidden`, which the recap engine and the GitHub and Jira syncs
+    /// drop too. Pinned in each of them (without the controls): change them together.
     const HIDDEN: &[(u32, u32)] = &[
         (0x0000, 0x001F), // C0 controls
         (0x007F, 0x009F), // DEL and the C1 controls
@@ -173,6 +130,11 @@ mod tests {
                 .iter()
                 .any(|&(lo, hi)| (lo..=hi).contains(&u32::from(c)));
             assert_eq!(is_hidden(c), listed, "U+{:04X}", u32::from(c));
+            if listed {
+                // Dropped, or a line break shown as a space; never printed as itself.
+                let shown = line(&format!("a{c}b"));
+                assert!(shown == "ab" || shown == "a b", "U+{:04X}", u32::from(c));
+            }
         }
     }
 }

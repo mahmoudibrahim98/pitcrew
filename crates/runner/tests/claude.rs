@@ -409,6 +409,71 @@ fn the_first_session_in_an_empty_home_is_discovered_at_once() {
     assert!(found.is_some(), "not discovered without a rescan");
 }
 
+/// The path the runner's index stores for each transcript.
+#[cfg(unix)]
+fn index_paths(state: &Path) -> Vec<String> {
+    let db = rusqlite::Connection::open(state.join("runner.sqlite3")).unwrap();
+    let mut stmt = db
+        .prepare("SELECT path FROM transcripts ORDER BY path")
+        .unwrap();
+    stmt.query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// A tracked transcript swapped for a link to another (whole, readable) transcript, between two
+/// runs: the next start does not move its row to the link's target, nothing is read through the
+/// link, and the target is not indexed as a new session either.
+#[cfg(unix)]
+#[test]
+fn a_transcript_swapped_for_a_link_is_not_followed_at_the_next_start() {
+    logs();
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let path = session_file(home.path());
+    let lines = fixture_lines();
+    std::fs::write(&path, lines[..5].concat()).unwrap();
+    let start = || {
+        let sink = Arc::new(CollectSink::default());
+        let runner = pitcrew_runner::start(
+            config(home.path(), state.path()),
+            vec![Arc::new(ClaudeAdapter::new())],
+            sink.clone(),
+        )
+        .unwrap();
+        (runner, sink)
+    };
+
+    let (runner, sink) = start();
+    sink.wait_for(3, WAIT).expect("discovery");
+    std::thread::sleep(Duration::from_millis(300));
+    runner.stop();
+    let stored = index_paths(state.path());
+    assert_eq!(stored, [canonical(&path)]);
+
+    // Between runs the transcript becomes a link to a whole transcript elsewhere.
+    let target = elsewhere.path().join("target.jsonl");
+    std::fs::write(&target, lines.concat()).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+
+    let (runner, sink) = start();
+    std::thread::sleep(Duration::from_millis(800));
+    runner.rescan();
+    std::thread::sleep(Duration::from_millis(800));
+    runner.stop();
+    assert_eq!(
+        sink.len(),
+        0,
+        "read through the link: {:?}",
+        labels(&sink.events())
+    );
+    assert_eq!(index_paths(state.path()), stored, "the row moved");
+    assert_eq!(notes("canonical path changed", &canonical(&target)), 0);
+}
+
 /// On HPC a home is often reached through a symlink (`/home` → `/gpfs/home`), and may not exist
 /// before the first `claude` run. Either way a transcript must keep its session id when the home
 /// is later named by its real path.

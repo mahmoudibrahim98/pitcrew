@@ -14,13 +14,13 @@
 //! - the day cache holds at most its size; the same events fail the engine in both;
 //! - paging ends: each block page moves back, and each days page moves to earlier dates;
 //! - **hidden characters gone**: no line, paragraph or block text holds a character
-//!   `pitcrew_fuzz::is_hidden_char` names (R33: the engine keeps tag characters, the soft hyphen
-//!   and U+180E, and U+2028/U+2029 in file paths, until `s/F/recap-hardening` merges). Receipts
-//!   are not text: they are copied from the events they cite, as they are.
+//!   `pitcrew_fuzz::is_hidden_char` names (R33, fixed: the engine kept tag characters, the soft
+//!   hyphen and U+180E, and U+2028/U+2029 in file paths). Receipts are not text: they are copied
+//!   from the events they cite, as they are.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use pitcrew_fuzz::{is_hidden_char, skip_known};
+use pitcrew_fuzz::is_hidden_char;
 use pitcrew_hub_work::{BlockFilter, DaysScope, Recaps};
 use pitcrew_protocol::events::Event;
 use pitcrew_protocol::ids::{EventId, ProjectId, SessionId, TaskId, WorkstreamId};
@@ -247,16 +247,10 @@ fn check_text(value: &serde_json::Value, key: &str) {
     match value {
         serde_json::Value::String(s) => {
             if let Some(c) = s.chars().find(|&c| is_hidden_char(c)) {
-                let fixed_soon = matches!(
-                    c,
-                    '\u{00AD}' | '\u{180E}' | '\u{2028}' | '\u{2029}' | '\u{E0000}'..='\u{E007F}'
+                panic!(
+                    "a hidden character U+{:04X} in a recap's {key:?}: {s:?}",
+                    u32::from(c)
                 );
-                if !(skip_known() && fixed_soon) {
-                    panic!(
-                        "a hidden character U+{:04X} in a recap's {key:?}: {s:?}",
-                        u32::from(c)
-                    );
-                }
             }
         }
         serde_json::Value::Array(items) => items.iter().for_each(|v| check_text(v, key)),

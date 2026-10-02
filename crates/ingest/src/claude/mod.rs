@@ -11,6 +11,7 @@ pub use parse::{ClaudeRecord, RecordFacts, parse_line};
 use crate::bound::MAX_TITLE_CHARS;
 use crate::jsonl::{self, Format, Skips, read_dir_or_empty, set_first, set_latest};
 use crate::lines::{Backward, SkipReason};
+use crate::open::open_transcript;
 use crate::text::title;
 use pitcrew_interfaces::source::{
     Cursor, ParseChunk, SessionMeta, SourceAdapter, SourceError, TranscriptItem, TranscriptPage,
@@ -18,7 +19,7 @@ use pitcrew_interfaces::source::{
 };
 use pitcrew_protocol::model::{Engine, TimestampMs};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -46,7 +47,9 @@ impl ClaudeAdapter {
     ///
     /// # Errors
     ///
-    /// I/O errors, or [`SourceError::Unreadable`] if the file is now shorter than the cursor.
+    /// I/O errors, or [`SourceError::Unreadable`] if the file is now shorter than the cursor. A
+    /// transcript that is now a link, or anything else that is not a regular file, is not read: an
+    /// I/O error carrying a [`NotRegularFile`](crate::NotRegularFile) (see [`crate::refusal`]).
     pub fn read(
         &self,
         transcript: &TranscriptRef,
@@ -128,7 +131,7 @@ impl SourceAdapter for ClaudeAdapter {
         before: Option<u64>,
         limit: usize,
     ) -> Result<TranscriptPage, SourceError> {
-        let mut file = File::open(&transcript.path)?;
+        let mut file = open_transcript(&transcript.path)?;
         let len = file.metadata()?.len();
         let mut back = Backward::new(&mut file, len);
         let end = back.align(before.unwrap_or(len))?;
