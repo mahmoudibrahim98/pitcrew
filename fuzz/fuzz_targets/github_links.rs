@@ -199,7 +199,8 @@ fn check_under(model: &Parsed, base: &Parsed, url: &str) {
 fn check_reads_the_same(link: &str, sent: &Parsed) {
     let raw = url_model::parse(link)
         .unwrap_or_else(|| panic!("the model cannot read a followed link: {link:?}"));
-    let decoded = |p: &Parsed| -> Vec<String> { p.segments.iter().map(|s| percent_decode(s)).collect() };
+    let decoded =
+        |p: &Parsed| -> Vec<String> { p.segments.iter().map(|s| percent_decode(s)).collect() };
     assert!(
         raw.same_origin(sent) && decoded(&raw) == decoded(sent),
         "the followed link {link:?} reads as {raw:?}, the request as {sent:?}"
