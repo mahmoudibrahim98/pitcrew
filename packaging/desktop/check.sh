@@ -266,10 +266,12 @@ check_dmg() { # FILE
   fi
   for f in "$app/Contents/MacOS"/* "$app/Contents/Resources/helpers/pitcrewd-universal-apple-darwin"; do
     archs=$(lipo -archs "$f" 2>/dev/null)
-    case " $archs " in
-      *" x86_64 "*" arm64 "* | *" arm64 "*" x86_64 "*) ok "DMG: $(basename "$f"): $archs" ;;
-      *) fail "DMG: $(basename "$f") is not universal ($archs)" ;;
-    esac
+    # Each name is matched on its own: in " x86_64 arm64 " the two share the space between them.
+    if [[ " $archs " == *" x86_64 "* && " $archs " == *" arm64 "* ]]; then
+      ok "DMG: $(basename "$f"): $archs"
+    else
+      fail "DMG: $(basename "$f") is not universal ($archs)"
+    fi
   done
   run_sidecars DMG "$app/Contents/MacOS"
   hdiutil detach -quiet "$mounted" && mounted=""

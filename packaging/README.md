@@ -139,7 +139,9 @@ or the person, and nobody else can write them; on Windows, no `Zone.Identifier`)
 
 - **.deb:** Tauri writes every entry owned by root with 0755 or 0644, which dpkg installs.
 - **AppImage:** the image's files are root's (`unsquashfs -lln`); mounted or extracted, the app
-  sees them as root's or the person's.
+  sees them as root's or the person's. Tauri's image carries some files (the bundled libraries'
+  copyright notices) with mode 0777, so `build.sh` rebuilds its file system with only the owner able
+  to write. This needs `squashfs-tools`; the runtime in front of the file system is kept as it is.
 - **DMG:** the person drags the app out, and owns the copy. **Run it from Applications, not from
   the mounted DMG:** a mounted image reports its files as owned by uid 99, so the app would
   refuse its own `pitcrewd` there.

@@ -12,7 +12,7 @@ root=$(cd "$here/.." && pwd)
 tmp=$(mktemp -d)
 # desktop/build.sh stages inside the repository (dist/ is ignored by git).
 stage_dir="$root/dist/packaging-test-$$"
-trap 'rm -rf "$tmp" "$stage_dir"' EXIT
+trap 'rm -rf "$tmp" "$stage_dir" "$stage_dir-mac"' EXIT
 failed=0
 passed=0
 
@@ -156,6 +156,25 @@ stub "$bins/pitcrewd-$musl" "pitcrewd ../../escape"
 check "a version that could name another folder fails" 1 desktop_stage x86_64-unknown-linux-gnu
 stub "$bins/pitcrewd-$musl" "pitcrewd 1.2.3 (protocol 1, oldest accepted 1)"
 check "staged again" 0 desktop_stage x86_64-unknown-linux-gnu
+check "a Linux stage names the sidecars for its target only" 0 \
+  test "$(find "$stage_dir/bin" -type f | wc -l)" -eq 3
+
+# A universal macOS build compiles the app once per architecture, and tauri-build wants the
+# sidecars under each architecture's name as well as the universal one.
+cp "$bins/pitcrewd-universal-apple-darwin" "$tmp/saved-helper"
+stub "$bins/pitcrewd-universal-apple-darwin" "pitcrewd 1.2.3 (protocol 1, oldest accepted 1)"
+stub "$bins/pitcrew-ptyd-universal-apple-darwin" "pitcrew-ptyd 1.2.3 (protocol 1)"
+stub "$bins/pitcrew-askpass-universal-apple-darwin" "" 2 "pitcrew-askpass: not started by PitCrew (PITCREW_ASKPASS_ADDR unset)"
+check "staging the macOS desktop" 0 \
+  bash "$here/desktop/build.sh" --stage-only --dist "$bins" --stage "$stage_dir-mac" universal-apple-darwin
+for bin in pitcrewd pitcrew-ptyd pitcrew-askpass; do
+  for name in universal-apple-darwin aarch64-apple-darwin x86_64-apple-darwin; do
+    check "the universal $bin is staged as $bin-$name" 0 \
+      cmp -s "$stage_dir-mac/bin/$bin-$name" "$bins/$bin-universal-apple-darwin"
+  done
+done
+mv "$tmp/saved-helper" "$bins/pitcrewd-universal-apple-darwin"
+rm -f "$bins/pitcrew-ptyd-universal-apple-darwin" "$bins/pitcrew-askpass-universal-apple-darwin"
 
 # --- desktop/check.sh on a stand-in .deb laid out as Tauri's
 if command -v dpkg-deb >/dev/null 2>&1 && [ "$(uname -s)" = Linux ]; then
