@@ -67,8 +67,17 @@ pc_where() {
   esac
 }
 
-# Whether this run holds the lock directory $1: its owner line is the one this run wrote.
-pc_owns() { [ -n "$pc_mine" ] && [ "$(cat "$1/owner" 2>/dev/null)" = "$pc_mine" ]; }
+# Whether this run holds the lock directory $1: its owner file is the one line this run wrote.
+# Read with `read`, not `$(cat ...)`: once a write to a closed stdout has failed (the connection
+# dropped), bash 3.2, macOS's /bin/sh, keeps the bytes it could not write, and the subshell of a
+# command substitution writes them out as it exits, into the text compared. The clean-up would
+# then leave its own lock behind.
+pc_owns() {
+  [ -n "$pc_mine" ] && [ -f "$1/owner" ] || return 1
+  pc_oline= pc_orest=
+  { IFS= read -r pc_oline; IFS= read -r pc_orest; } 2>/dev/null < "$1/owner"
+  [ "$pc_oline" = "$pc_mine" ] && [ -z "$pc_orest" ]
+}
 
 # pc_alive PID: whether PID is a live process. A zombie is not: where nothing reaps orphans (a
 # container without an init), a dead helper stays one.
