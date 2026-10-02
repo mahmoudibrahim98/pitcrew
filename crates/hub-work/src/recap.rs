@@ -960,7 +960,8 @@ impl WorkService {
     /// disk, not memory, however long the log. A cache: whatever is at `path` is replaced when the
     /// index is first built (and whenever it is built again), and the file is removed when the
     /// service is dropped; it is never read from one run to the next. The file is private to the
-    /// user (0600 on Unix). If it cannot be made, the blocks stay in memory (logged).
+    /// user (0600 on Unix). If it cannot be made, or the disk later refuses blocks (the index is
+    /// then built again), the blocks stay in memory from then on (logged).
     ///
     /// One file per service: two services (or processes) must not share a path.
     #[must_use]
@@ -1002,7 +1003,16 @@ impl WorkService {
             state
         });
         if state.recaps.is_broken() {
-            tracing::warn!("building the recap index again from the log");
+            // The disk refused the blocks (full, or failing): building them there again would
+            // likely fail the same way, at the cost of reading the whole log each time.
+            if let Some(file) = state.file.take() {
+                tracing::warn!(
+                    file = %file.display(),
+                    "building the recap index again from the log, with its blocks in memory"
+                );
+            } else {
+                tracing::warn!("building the recap index again from the log");
+            }
             state.reset();
         }
         state.open();
@@ -1106,7 +1116,7 @@ mod tests {
     }
 
     /// A batch of blocks that cannot be stored (a full disk) fails the query that read it, and
-    /// the next one builds the index again from the log, in a new file: what was half-written is
+    /// the next one builds the index again from the log, in memory: what was half-written is
     /// never served.
     #[test]
     fn a_failed_write_is_rebuilt_from_the_log() {
@@ -1149,6 +1159,7 @@ mod tests {
         let page = work
             .recap_blocks(&BlockFilter::default(), None, None)
             .expect("built again");
+        assert!(!file.exists(), "built again in memory, not on the disk that failed");
         let fresh = WorkService::new(Arc::clone(&store), workspace);
         assert_eq!(
             page,
@@ -1158,6 +1169,34 @@ mod tests {
         );
         assert_eq!(page.blocks.len(), 2);
         assert_eq!(page.blocks[1].block.counts.tools_run, 3);
+    }
+
+    /// The file is the service's: made when the index is first built, removed when the service
+    /// is dropped.
+    #[test]
+    fn the_file_lives_with_the_service() {
+        use pitcrew_protocol::model::Workspace;
+        use pitcrew_store::{Store, StoreOptions};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            Store::open_with(
+                dir.path().join("hub.db"),
+                StoreOptions::default(),
+                crate::projections(),
+            )
+            .expect("store"),
+        );
+        let workspace = Workspace {
+            id: WorkspaceId(ulid::Ulid::from(2u128)),
+            name: "W".into(),
+        };
+        let file = dir.path().join("recaps.sqlite3");
+        let work = WorkService::new(Arc::clone(&store), workspace).with_recap_file(&file);
+        assert!(!file.exists(), "made when the index is first built");
+        store.append(&[tool_run(1, 1)]).expect("append");
+        assert_eq!(work.sync_recaps().expect("sync"), 1);
         assert!(file.exists());
         drop(work);
         assert!(!file.exists(), "removed with the service");
