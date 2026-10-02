@@ -1385,9 +1385,9 @@ mod unix {
         assert_eq!(e["code"], "invalid");
     }
 
-    /// Five retries while one attempt runs make one more attempt after it (it failed), not one
-    /// each; a retry of a connected workspace does nothing. An attempt is one sign-in: one link,
-    /// one prompt.
+    /// Retries while one attempt runs (its sign-in waiting for the person) leave it be, and make
+    /// one more attempt after it (it failed), not one each; a retry of a connected workspace does
+    /// nothing. An attempt is one sign-in: one link, one prompt.
     fn retries_are_coalesced() {
         let w = world(false, |_, _| {});
         let id = w.add_direct(150).unwrap();
@@ -1404,19 +1404,31 @@ mod unix {
         let links = w.machine.calls_of("link");
         let prompts = w.events(PROMPT_EVENT).len();
 
-        // Five clicks: one attempt, which asks once.
-        for _ in 0..5 {
+        // A click starts an attempt, which asks; four more clicks while it waits for the person
+        // leave it be: the same prompt stays open, and nothing else signs in.
+        let retry = |w: &World| {
             let retried = w
                 .call("gateway_workspace_retry", json!({ "workspace": id }))
                 .unwrap();
             assert_eq!(retried, Value::Null);
-        }
+        };
+        retry(&w);
         let first = w.open_prompt();
+        for _ in 0..4 {
+            retry(&w);
+        }
         std::thread::sleep(Duration::from_secs(1));
         assert_eq!(w.state(&id), Some(WorkspaceState::Connecting));
+        let open: Vec<String> = w
+            .remotes()
+            .prompts()
+            .open()
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(open, [first.id.clone()], "the same prompt, still open");
         assert_eq!(w.machine.calls_of("link"), links + 1, "one attempt");
         assert_eq!(w.events(PROMPT_EVENT).len(), prompts + 1);
-        assert_eq!(w.remotes().prompts().open().len(), 1);
 
         // That attempt fails (its sign-in is cancelled): one more comes, as asked meanwhile.
         w.call("gateway_prompt_reply", json!({ "id": first.id }))
