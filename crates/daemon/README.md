@@ -109,8 +109,9 @@ read is handed to the store first, its threads end, and with them its hold on th
 runner stopped`). Each gets 10 seconds. This holds whether they started with the daemon or after
 setup; one that a setup in flight starts once the stop has begun is stopped as it starts. Then,
 once the runner has stopped, the terminals' runtime is let go of (`the terminals' runtime
-detached`): tmux stores each terminal's exact output offset and its control client detaches,
-while **the terminals keep running** (a stop never ends an agent; see "Terminals"). Meanwhile the
+detached`): tmux stores each terminal's exact output offset, its control client detaches, and
+the socket's lock is released, while **the terminals keep running** (a stop never ends an agent;
+see "Terminals"). Meanwhile the
 store closes, checkpointing its WAL so only `hub.db` remains, and the lock is released last. The
 log ends with `store closed` and `stopped`.
 
