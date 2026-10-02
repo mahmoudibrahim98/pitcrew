@@ -23,14 +23,14 @@
 //! - **an accepted `#SBATCH` option** is one word, `--name` or `--name=value`, with no newline,
 //!   `#`, quote or space, and no value that starts with `-` (R25, fixed); a name from
 //!   `ALLOWED_SBATCH`, alone only for `SBATCH_FLAGS`; and `JobSpec::new` accepts what
-//!   `check_sbatch_option` accepted (R34: it does not for a value holding `hetjob` or `packjob`);
+//!   `check_sbatch_option` accepted (R34, fixed: a value holding `hetjob` or `packjob` was let
+//!   through);
 //! - **the job script**: when `JobSpec::render` accepts the options, every `#SBATCH` line is one
 //!   directive word before the first command, none holds `hetjob` or `packjob` in any case, and the
 //!   job name, working directory and output appear once each, from PitCrew.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use pitcrew_fuzz::skip_known;
 use pitcrew_fuzz::slurm::{check_script, target};
 use pitcrew_remote::helper::slurm::{
     ALLOWED_SBATCH, JobExit, JobOptions, JobSpec, SBATCH_FLAGS, WallTime, check_sbatch_option,
@@ -157,15 +157,6 @@ fn sbatch(text: &str) {
         ..JobOptions::default()
     };
     let Ok(spec) = JobSpec::new(&generic(), &options) else {
-        let hetjob = options.sbatch.iter().any(|o| {
-            let o = o.to_ascii_lowercase();
-            o.contains("hetjob") || o.contains("packjob")
-        });
-        if skip_known() && hetjob {
-            // Known finding R34: `check_sbatch_option` lets these words through; `JobSpec::new`
-            // (`JobOptions::check`) refuses them.
-            return;
-        }
         panic!("options check_sbatch_option accepted are refused by JobSpec::new: {options:?}");
     };
     if let Ok(script) = spec.render(target()) {

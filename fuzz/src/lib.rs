@@ -14,8 +14,7 @@ use std::sync::OnceLock;
 
 /// Whether to relax the checks for findings already reported and listed in
 /// `docs/security/threat-model.md` §8 (`PITCREW_FUZZ_SKIP_KNOWN=1`), so a run can look past them.
-/// Off by default: a known finding still fails the target until it is fixed. Open now: R34
-/// (`remote_slurm`).
+/// Off by default: a known finding still fails the target until it is fixed. Open now: none.
 #[must_use]
 pub fn skip_known() -> bool {
     static SKIP: OnceLock<bool> = OnceLock::new();
