@@ -67,6 +67,11 @@ pub struct PtyOptions {
     /// How long a ptyd this runtime starts waits, with no terminals and no clients, before it
     /// exits. `None`: its default (30 seconds).
     pub idle_exit: Option<Duration>,
+    /// Debug builds only, for the tests of the peer check: the uid the server must run as, in
+    /// place of this process's (Unix).
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub expect_uid: Option<u32>,
 }
 
 impl PtyOptions {
@@ -80,6 +85,20 @@ impl PtyOptions {
             start_timeout: Duration::from_secs(15),
             history: crate::replay::DEFAULT_CAPACITY,
             idle_exit: None,
+            #[cfg(debug_assertions)]
+            expect_uid: None,
+        }
+    }
+
+    /// The uid the server must have, if not this process's.
+    fn expect_uid(&self) -> Option<u32> {
+        #[cfg(debug_assertions)]
+        {
+            self.expect_uid
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            None
         }
     }
 
@@ -88,7 +107,10 @@ impl PtyOptions {
     /// - Unix: `$XDG_RUNTIME_DIR/pitcrew/ptyd` if that directory is private (it usually is; the
     ///   system removes it when the user's last login ends, which ends ptyd's reach too), else
     ///   `/tmp/pitcrew-<uid>/ptyd`, next to the tmux runtime's socket.
-    /// - Windows: `\\.\pipe\pitcrew-ptyd-<the user's SID>`.
+    /// - Windows: `\\.\pipe\pitcrew-ptyd-<the user's SID>`, with `-elevated` added when this
+    ///   process is elevated: an elevated ptyd (started by an elevated daemon) serves only
+    ///   elevated clients, on a pipe of its own, so an ordinary process of the user can never
+    ///   start programs through it.
     pub fn default_endpoint() -> PathBuf {
         #[cfg(unix)]
         {
@@ -103,7 +125,12 @@ impl PtyOptions {
         #[cfg(windows)]
         {
             let user = windows::current_user_sid().unwrap_or_else(|_| "unknown".into());
-            PathBuf::from(format!(r"\\.\pipe\pitcrew-ptyd-{user}"))
+            let elevated = if windows::is_elevated() {
+                "-elevated"
+            } else {
+                ""
+            };
+            PathBuf::from(format!(r"\\.\pipe\pitcrew-ptyd-{user}{elevated}"))
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -426,7 +453,7 @@ impl Inner {
         let endpoint = &self.options.endpoint;
         let mut patience = None;
         loop {
-            match Conn::open(endpoint, deadline, patience) {
+            match Conn::open(endpoint, deadline, patience, self.options.expect_uid()) {
                 Ok(conn) => {
                     let conn = Arc::new(conn);
                     *lock(&self.conn) = Some(Arc::clone(&conn));
@@ -725,6 +752,52 @@ mod tests {
         let options = PtyOptions::new("/tmp/x/ptyd");
         assert_eq!(options.call_timeout, Duration::from_secs(5));
         assert_eq!(options.idle_exit, None);
+    }
+
+    /// A pipe of ours at another integrity level (here low, which any process may set) is
+    /// refused before a byte is sent: as a medium client refuses an elevated ptyd's pipe.
+    #[cfg(windows)]
+    #[test]
+    fn a_pipe_at_another_integrity_level_is_refused() {
+        use tokio::net::windows::named_pipe::ServerOptions;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let name = format!(
+            r"\\.\pipe\pitcrew-ptyd-unit-level-{}-{nanos}",
+            std::process::id()
+        );
+        let me = windows::current_identity().expect("identity");
+        let low = windows::PipeSecurity::for_identity(&windows::Identity {
+            user: me.user.clone(),
+            integrity: windows::LOW_INTEGRITY,
+        })
+        .expect("descriptor");
+        let _server = rt.block_on(async {
+            low.create(ServerOptions::new().first_pipe_instance(true), &name)
+                .expect("pipe")
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        match Conn::open(Path::new(&name), deadline, None, None) {
+            Err(ConnectError::Unsafe(why)) => assert!(why.contains("integrity"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        // Our own level passes the check (and then waits for a hello nobody answers).
+        let same = windows::PipeSecurity::current_user_only().expect("descriptor");
+        let name2 = format!("{name}-same");
+        let _server2 = rt.block_on(async {
+            same.create(ServerOptions::new().first_pipe_instance(true), &name2)
+                .expect("pipe")
+        });
+        let deadline = Instant::now() + Duration::from_millis(500);
+        assert!(matches!(
+            Conn::open(Path::new(&name2), deadline, None, None),
+            Err(ConnectError::TimedOut)
+        ));
     }
 
     #[test]

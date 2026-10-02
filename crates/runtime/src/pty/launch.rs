@@ -125,11 +125,18 @@ fn spawn(mut command: Command, ptyd: &Path, _deadline: Instant) -> Result<(), St
     command.arg("--foreground").stderr(Stdio::null());
     let detached = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
     // Leaving our job, if we are in one, keeps ptyd alive when that job is closed; a job that
-    // does not allow it refuses the whole start, so then it starts inside.
+    // does not allow it refuses the whole start, so then it starts inside (and ends with it).
     let spawned = command
         .creation_flags(detached | CREATE_BREAKAWAY_FROM_JOB)
         .spawn()
-        .or_else(|_| command.creation_flags(detached).spawn());
+        .or_else(|e| {
+            tracing::warn!(
+                error = %e,
+                "pitcrew-ptyd could not leave this process's job (CREATE_BREAKAWAY_FROM_JOB); \
+                 starting it inside, so it ends when that job is closed"
+            );
+            command.creation_flags(detached).spawn()
+        });
     // The handle is closed; the process runs on.
     spawned
         .map(drop)

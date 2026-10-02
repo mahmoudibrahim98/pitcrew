@@ -85,6 +85,7 @@ impl Conn {
         endpoint: &Path,
         deadline: Instant,
         patience: Option<Instant>,
+        expect_uid: Option<u32>,
     ) -> Result<Self, ConnectError> {
         let (outbox, inbox) = tokio::sync::mpsc::channel(QUEUE);
         let waiters: Waiters = Arc::default();
@@ -98,7 +99,11 @@ impl Conn {
             std::thread::Builder::new()
                 .name("pitcrew-pty-io".into())
                 .spawn(move || {
-                    let until = Until { deadline, patience };
+                    let until = Until {
+                        deadline,
+                        patience,
+                        expect_uid,
+                    };
                     io_thread(&endpoint, until, inbox, &waiters, &open, &stop, &ready);
                 })
                 .map_err(|e| ConnectError::Failed(format!("cannot start a thread: {e}")))?
@@ -197,6 +202,8 @@ struct Until {
     deadline: Instant,
     /// Until when an endpoint nobody listens on is tried again.
     patience: Option<Instant>,
+    /// The uid the server must have, if not ours (Unix; a hook for tests).
+    expect_uid: Option<u32>,
 }
 
 fn io_thread(
@@ -224,15 +231,21 @@ fn io_thread(
     let deadline = until.deadline;
     runtime.block_on(async {
         let left = deadline.saturating_duration_since(Instant::now());
+        // Nobody listening, or a ptyd that closes the connection before answering hello (one
+        // that is exiting, or lost the race to serve), is tried again while patience lasts.
         let patient = async {
             loop {
-                match connect(endpoint).await {
+                let attempt = async {
+                    let stream = connect(endpoint, until.expect_uid).await?;
+                    handshake(stream).await
+                };
+                match attempt.await {
                     Err(ConnectError::Absent)
                         if until.patience.is_some_and(|p| Instant::now() < p) =>
                     {
                         tokio::time::sleep(Duration::from_millis(20)).await;
                     }
-                    connected => return connected,
+                    done => return done,
                 }
             }
         };
@@ -240,8 +253,8 @@ fn io_thread(
             connected = tokio::time::timeout(left, patient) => connected,
             () = stop.notified() => return,
         };
-        let stream = match connected {
-            Ok(Ok(stream)) => stream,
+        let (reader, writer, hello) = match connected {
+            Ok(Ok(connected)) => connected,
             Ok(Err(e)) => {
                 open.store(false, Ordering::Release);
                 let _ = ready.send(Err(e));
@@ -253,69 +266,86 @@ fn io_thread(
                 return;
             }
         };
-        run(stream, deadline, inbox, waiters, stop, ready).await;
+        if ready.send(Ok(hello)).is_err() {
+            // The opener has given up.
+            return;
+        }
+        run(reader, writer, inbox, waiters, stop).await;
     });
     open.store(false, Ordering::Release);
     // Whoever still waits learns the connection is gone.
     lock(waiters).clear();
 }
 
+type Halves<S> = (tokio::io::ReadHalf<S>, tokio::io::WriteHalf<S>, Hello);
+
+/// The end of the stream, or a connection reset or broken: the other side went away.
+fn gone(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::BrokenPipe
+    )
+}
+
+/// Says hello. A ptyd that goes away before answering counts as [`ConnectError::Absent`].
+async fn handshake<S: AsyncRead + AsyncWrite>(stream: S) -> Result<Halves<S>, ConnectError> {
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let io = |what: &str, e: std::io::Error| {
+        if gone(&e) {
+            ConnectError::Absent
+        } else {
+            ConnectError::Failed(format!("cannot {what} pitcrew-ptyd: {e}"))
+        }
+    };
+    let frame = Frame::new(
+        &Request {
+            id: 1,
+            op: Op::Hello {
+                protocol: proto::PROTOCOL,
+            },
+        },
+        Vec::new(),
+    )
+    .map_err(|e| ConnectError::Failed(e.to_string()))?;
+    proto::write_frame(&mut writer, &frame)
+        .await
+        .map_err(|e| io("write to", e))?;
+    let reply = proto::read_frame(&mut reader)
+        .await
+        .map_err(|e| io("read from", e))?
+        .ok_or(ConnectError::Absent)?;
+    let reply: Reply = serde_json::from_slice(&reply.header)
+        .map_err(|e| ConnectError::Failed(format!("pitcrew-ptyd's hello: {e}")))?;
+    let hello = match (reply.ok, reply.err) {
+        (Some(ok), None) => {
+            let hello: Hello = serde_json::from_value(ok)
+                .map_err(|e| ConnectError::Failed(format!("pitcrew-ptyd's hello: {e}")))?;
+            if hello.protocol != proto::PROTOCOL {
+                return Err(ConnectError::Protocol(hello));
+            }
+            hello
+        }
+        (_, Some(failure)) => {
+            return Err(ConnectError::Failed(format!(
+                "pitcrew-ptyd refused: {}",
+                failure.message
+            )));
+        }
+        _ => return Err(ConnectError::Failed("an empty hello".into())),
+    };
+    Ok((reader, writer, hello))
+}
+
 async fn run<S: AsyncRead + AsyncWrite>(
-    stream: S,
-    deadline: Instant,
+    mut reader: tokio::io::ReadHalf<S>,
+    mut writer: tokio::io::WriteHalf<S>,
     mut inbox: tokio::sync::mpsc::Receiver<Vec<u8>>,
     waiters: &Waiters,
     stop: &Notify,
-    ready: &SyncSender<Result<Hello, ConnectError>>,
 ) {
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    let hello = async {
-        let frame = Frame::new(
-            &Request {
-                id: 1,
-                op: Op::Hello {
-                    protocol: proto::PROTOCOL,
-                },
-            },
-            Vec::new(),
-        )
-        .map_err(|e| ConnectError::Failed(e.to_string()))?;
-        proto::write_frame(&mut writer, &frame)
-            .await
-            .map_err(|e| ConnectError::Failed(format!("cannot write to pitcrew-ptyd: {e}")))?;
-        let reply = proto::read_frame(&mut reader)
-            .await
-            .map_err(|e| ConnectError::Failed(format!("cannot read from pitcrew-ptyd: {e}")))?
-            .ok_or_else(|| ConnectError::Failed("pitcrew-ptyd closed the connection".into()))?;
-        let reply: Reply = serde_json::from_slice(&reply.header)
-            .map_err(|e| ConnectError::Failed(format!("pitcrew-ptyd's hello: {e}")))?;
-        match (reply.ok, reply.err) {
-            (Some(ok), None) => {
-                let hello: Hello = serde_json::from_value(ok)
-                    .map_err(|e| ConnectError::Failed(format!("pitcrew-ptyd's hello: {e}")))?;
-                if hello.protocol == proto::PROTOCOL {
-                    Ok(hello)
-                } else {
-                    Err(ConnectError::Protocol(hello))
-                }
-            }
-            (_, Some(failure)) => Err(ConnectError::Failed(format!(
-                "pitcrew-ptyd refused: {}",
-                failure.message
-            ))),
-            _ => Err(ConnectError::Failed("an empty hello".into())),
-        }
-    };
-    let left = deadline.saturating_duration_since(Instant::now());
-    let hello = match tokio::time::timeout(left, hello).await {
-        Ok(hello) => hello,
-        Err(_) => Err(ConnectError::TimedOut),
-    };
-    let failed = hello.is_err();
-    if ready.send(hello).is_err() || failed {
-        // The opener has given up, or the handshake failed.
-        return;
-    }
     let read = async {
         // Read errors, a bad frame included, end the connection.
         while let Ok(Some(frame)) = proto::read_frame(&mut reader).await {
@@ -347,8 +377,13 @@ async fn run<S: AsyncRead + AsyncWrite>(
     }
 }
 
+/// Connects and checks the server is this user (`expect_uid`, when given, in its place: a hook
+/// for tests).
 #[cfg(unix)]
-async fn connect(endpoint: &Path) -> Result<tokio::net::UnixStream, ConnectError> {
+async fn connect(
+    endpoint: &Path,
+    expect_uid: Option<u32>,
+) -> Result<tokio::net::UnixStream, ConnectError> {
     crate::tmux::socket::ensure_private(endpoint).map_err(ConnectError::Unsafe)?;
     let stream = tokio::net::UnixStream::connect(endpoint)
         .await
@@ -361,7 +396,7 @@ async fn connect(endpoint: &Path) -> Result<tokio::net::UnixStream, ConnectError
     let peer = stream
         .peer_cred()
         .map_err(|e| ConnectError::Failed(format!("cannot check pitcrew-ptyd's user: {e}")))?;
-    let me = rustix::process::getuid().as_raw();
+    let me = expect_uid.unwrap_or_else(|| rustix::process::getuid().as_raw());
     if peer.uid() != me {
         return Err(ConnectError::Unsafe(format!(
             "{} is served by uid {}, not this user ({me})",
@@ -372,9 +407,43 @@ async fn connect(endpoint: &Path) -> Result<tokio::net::UnixStream, ConnectError
     Ok(stream)
 }
 
+/// The pipe must be the current user's, at our integrity level: an elevated ptyd's pipe is
+/// labelled high (and refuses medium clients itself), and a ptyd started from an ordinary
+/// process must not serve an elevated one, nor the other way round. A pipe without a label
+/// counts as medium, as Windows treats it.
+#[cfg(windows)]
+pub(crate) fn check_pipe(
+    pipe: &impl std::os::windows::io::AsHandle,
+    endpoint: &Path,
+) -> Result<(), ConnectError> {
+    use super::windows::{MEDIUM_INTEGRITY, current_identity, label_integrity, owner_sid};
+    let failed = |what: &str, e: std::io::Error| ConnectError::Failed(format!("{what}: {e}"));
+    let owner = owner_sid(pipe).map_err(|e| failed("cannot check pitcrew-ptyd's pipe", e))?;
+    let me = current_identity().map_err(|e| failed("cannot read our own token", e))?;
+    if owner != me.user {
+        return Err(ConnectError::Unsafe(format!(
+            "{} belongs to another user ({owner})",
+            endpoint.display()
+        )));
+    }
+    let level = label_integrity(pipe)
+        .map_err(|e| failed("cannot read pitcrew-ptyd's pipe's label", e))?
+        .unwrap_or(MEDIUM_INTEGRITY);
+    if level != me.integrity {
+        return Err(ConnectError::Unsafe(format!(
+            "{} is served at integrity level {level:#x}, and this process runs at {:#x} (an \
+             elevated pitcrew-ptyd serves only elevated clients, and the other way round)",
+            endpoint.display(),
+            me.integrity
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 async fn connect(
     endpoint: &Path,
+    _expect_uid: Option<u32>,
 ) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, ConnectError> {
     use tokio::net::windows::named_pipe::ClientOptions;
     use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
@@ -389,17 +458,7 @@ async fn connect(
             .open(endpoint.as_os_str());
         match opened {
             Ok(client) => {
-                let owner = super::windows::owner_sid(&client).map_err(|e| {
-                    ConnectError::Failed(format!("cannot check pitcrew-ptyd's pipe: {e}"))
-                })?;
-                let me = super::windows::current_user_sid()
-                    .map_err(|e| ConnectError::Failed(format!("cannot read our own user: {e}")))?;
-                if owner != me {
-                    return Err(ConnectError::Unsafe(format!(
-                        "{} belongs to another user ({owner})",
-                        endpoint.display()
-                    )));
-                }
+                check_pipe(&client, endpoint)?;
                 return Ok(client);
             }
             // Every instance is busy: one is made for each connection, so wait a moment.

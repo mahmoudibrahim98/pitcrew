@@ -1,20 +1,23 @@
 //! Windows security and process control for the PTY runtime and pitcrew-ptyd: who owns a pipe,
-//! who is on its other end, a pipe only the current user can open, and Job Objects.
+//! who is on its other end (user and integrity level), a pipe only the current user at the
+//! current integrity level can open, and Job Objects.
 //!
 //! **This is the only `unsafe` code in pitcrew-runtime and pitcrew-ptyd.** The Win32 calls below
 //! have no safe binding in the dependency tree. Every function here is safe to call; each
 //! `unsafe` block says why it is sound. In general:
 //! - Every out-pointer passed to Win32 points at a live local of the right type, and every
 //!   buffer is passed with its true length.
-//! - A `TOKEN_USER` is read from a buffer `GetTokenInformation` filled with exactly that class,
-//!   aligned for it (`u64` storage). The SID it points to lies inside that buffer, which outlives
-//!   its use.
+//! - A `TOKEN_USER` or `TOKEN_MANDATORY_LABEL` is read from a buffer `GetTokenInformation`
+//!   filled with exactly that class, aligned for it (`u64` storage). The SID it points to lies
+//!   inside that buffer, which outlives its use.
 //! - Memory Win32 allocates with `LocalAlloc` (strings, descriptors) is freed exactly once with
 //!   `LocalFree`, after its last use.
 //! - Handles we open are owned by `OwnedHandle` and closed exactly once. Handles we are given
 //!   are borrowed (`AsHandle`), so they stay open for the call.
 //! - A descriptor is never changed after creation and Win32 only reads it, so sharing it between
 //!   threads is sound.
+//! - Impersonating a pipe's client is undone on the same thread before the function returns;
+//!   should that fail, the process aborts rather than go on as the client.
 
 #![allow(unsafe_code)]
 
@@ -31,19 +34,38 @@ use windows_sys::Win32::Security::Authorization::{
     SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    DACL_SECURITY_INFORMATION, GetTokenInformation, OWNER_SECURITY_INFORMATION,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    DACL_SECURITY_INFORMATION, GetTokenInformation, LABEL_SECURITY_INFORMATION,
+    OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    RevertToSelf, SECURITY_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    TOKEN_USER, TokenIntegrityLevel, TokenUser,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
-use windows_sys::Win32::System::Pipes::GetNamedPipeClientProcessId;
+use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, ImpersonateNamedPipeClient};
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+    GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
 };
+
+/// The integrity level of a normal, non-elevated process.
+pub const MEDIUM_INTEGRITY: u32 = 0x2000;
+/// The integrity level of an elevated process.
+pub const HIGH_INTEGRITY: u32 = 0x3000;
+/// The integrity level of a sandboxed (low) process.
+pub const LOW_INTEGRITY: u32 = 0x1000;
+
+/// Who a process or a pipe's client is: its user's SID, and its integrity level (the RID of its
+/// mandatory label: [`MEDIUM_INTEGRITY`] for a normal process, [`HIGH_INTEGRITY`] elevated).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    /// The user's SID, e.g. `S-1-5-21-…`.
+    pub user: String,
+    /// The integrity level.
+    pub integrity: u32,
+}
 
 /// The current user's SID, e.g. `S-1-5-21-…`.
 ///
@@ -51,6 +73,15 @@ use windows_sys::Win32::System::Threading::{
 ///
 /// If our own process token cannot be read.
 pub fn current_user_sid() -> io::Result<String> {
+    current_identity().map(|identity| identity.user)
+}
+
+/// This process's user and integrity level.
+///
+/// # Errors
+///
+/// If our own process token cannot be read.
+pub fn current_identity() -> io::Result<Identity> {
     let mut token: HANDLE = ptr::null_mut();
     // SAFETY: `GetCurrentProcess` returns a pseudo-handle that is always valid and needs no
     // closing; `token` is a valid out-pointer.
@@ -59,7 +90,62 @@ pub fn current_user_sid() -> io::Result<String> {
     }
     // SAFETY: `token` was just opened, and nothing else owns it.
     let token = unsafe { OwnedHandle::from_raw_handle(token) };
-    token_user_sid(&token)
+    token_identity(&token)
+}
+
+/// True if this process runs elevated (at high integrity or above).
+pub fn is_elevated() -> bool {
+    current_identity().is_ok_and(|identity| identity.integrity >= HIGH_INTEGRITY)
+}
+
+/// The user and integrity level of the client on the other end of a server's pipe instance,
+/// from the client's own token: the server impersonates it (at the identification level the
+/// client allows) just long enough to read that token. The client must have written something
+/// the server has read (Windows takes the identity of the last message read).
+///
+/// # Errors
+///
+/// If the client cannot be impersonated or its token read.
+pub fn pipe_client_identity(pipe: &impl AsHandle) -> io::Result<Identity> {
+    // SAFETY: `pipe` is borrowed for the call, so its handle is open. This makes the calling
+    // thread act as the client until `RevertToSelf` below, which runs before returning.
+    if unsafe { ImpersonateNamedPipeClient(pipe.as_handle().as_raw_handle()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut token: HANDLE = ptr::null_mut();
+    // SAFETY: `GetCurrentThread` is a pseudo-handle that is always valid; `token` is a valid
+    // out-pointer. `OpenAsSelf` (1) checks access against our own token, as the client allows
+    // only identification.
+    let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) };
+    let failed = (opened == 0).then(io::Error::last_os_error);
+    // SAFETY: no arguments; it ends the impersonation started above, on this thread.
+    if unsafe { RevertToSelf() } == 0 {
+        // Going on while acting as the client would be wrong for everything that follows.
+        std::process::abort();
+    }
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    // SAFETY: `token` was just opened, and nothing else owns it.
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    token_identity(&token)
+}
+
+fn token_identity(token: &OwnedHandle) -> io::Result<Identity> {
+    let user = token_sid(token, TokenUser)?;
+    let label = token_sid(token, TokenIntegrityLevel)?;
+    let integrity = integrity_rid(&label).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{label} is not an integrity level"),
+        )
+    })?;
+    Ok(Identity { user, integrity })
+}
+
+/// The integrity level an integrity SID (`S-1-16-<level>`) names.
+pub fn integrity_rid(sid: &str) -> Option<u32> {
+    sid.strip_prefix("S-1-16-")?.parse().ok()
 }
 
 /// The SID of the user of the process with id `pid`.
@@ -82,7 +168,7 @@ pub fn process_user_sid(pid: u32) -> io::Result<String> {
     }
     // SAFETY: `token` was just opened, and nothing else owns it.
     let token = unsafe { OwnedHandle::from_raw_handle(token) };
-    token_user_sid(&token)
+    token_sid(&token, TokenUser)
 }
 
 /// The process id of the client on the other end of a server's pipe instance.
@@ -100,29 +186,29 @@ pub fn pipe_client_pid(pipe: &impl AsHandle) -> io::Result<u32> {
     Ok(pid)
 }
 
-/// The SID of the user a token belongs to.
-fn token_user_sid(token: &OwnedHandle) -> io::Result<String> {
+/// A SID a token holds, as a string: its user's (`TokenUser`) or its integrity label's
+/// (`TokenIntegrityLevel`). Any other class is refused.
+fn token_sid(token: &OwnedHandle, class: TOKEN_INFORMATION_CLASS) -> io::Result<String> {
+    if class != TokenUser && class != TokenIntegrityLevel {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a SID class",
+        ));
+    }
     let mut len = 0u32;
     // SAFETY: a size query: null buffer, zero length, valid length out-pointer. It fails with
     // ERROR_INSUFFICIENT_BUFFER and sets `len`.
-    unsafe {
-        GetTokenInformation(
-            token.as_raw_handle(),
-            TokenUser,
-            ptr::null_mut(),
-            0,
-            &mut len,
-        )
-    };
+    unsafe { GetTokenInformation(token.as_raw_handle(), class, ptr::null_mut(), 0, &mut len) };
     if len == 0 {
         return Err(io::Error::last_os_error());
     }
     let mut buffer = vec![0u64; (len as usize).div_ceil(size_of::<u64>())];
-    // SAFETY: `buffer` holds at least `len` bytes and is aligned for `TOKEN_USER` (pointers).
+    // SAFETY: `buffer` holds at least `len` bytes and is aligned for `TOKEN_USER` and
+    // `TOKEN_MANDATORY_LABEL` (both hold pointers).
     let ok = unsafe {
         GetTokenInformation(
             token.as_raw_handle(),
-            TokenUser,
+            class,
             buffer.as_mut_ptr().cast::<c_void>(),
             len,
             &mut len,
@@ -131,12 +217,18 @@ fn token_user_sid(token: &OwnedHandle) -> io::Result<String> {
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: filled by the call above with the `TokenUser` class, i.e. a `TOKEN_USER`.
-    let sid: PSID = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let sid: PSID = if class == TokenUser {
+        // SAFETY: filled by the call above with the `TokenUser` class, i.e. a `TOKEN_USER`.
+        unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+    } else {
+        // SAFETY: filled by the call above with the `TokenIntegrityLevel` class, i.e. a
+        // `TOKEN_MANDATORY_LABEL`.
+        unsafe { (*buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()).Label.Sid }
+    };
     if sid.is_null() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "the token has no user SID",
+            "the token has no such SID",
         ));
     }
     sid_string(sid)
@@ -207,6 +299,37 @@ pub fn owner_sid(object: &impl AsHandle) -> io::Result<String> {
 ///
 /// If it cannot be read.
 pub fn dacl_sddl(object: &impl AsHandle) -> io::Result<String> {
+    security_sddl(object, DACL_SECURITY_INFORMATION)
+}
+
+/// The integrity level a kernel object's mandatory label gives it (such as a pipe's), read
+/// through any handle opened with `READ_CONTROL`; `None` if it has no label, which Windows
+/// treats as [`MEDIUM_INTEGRITY`].
+///
+/// # Errors
+///
+/// If it cannot be read.
+pub fn label_integrity(object: &impl AsHandle) -> io::Result<Option<u32>> {
+    security_sddl(object, LABEL_SECURITY_INFORMATION).map(|sddl| parse_label(&sddl))
+}
+
+/// The integrity level in an SDDL mandatory label (`S:(ML;;NWNR;;;HI)`), if there is one.
+pub fn parse_label(sddl: &str) -> Option<u32> {
+    let start = sddl.find("(ML;")?;
+    let ace = &sddl[start + 1..];
+    let ace = &ace[..ace.find(')')?];
+    match ace.rsplit(';').next()? {
+        "LW" => Some(LOW_INTEGRITY),
+        "ME" => Some(MEDIUM_INTEGRITY),
+        "MP" => Some(MEDIUM_INTEGRITY + 0x100),
+        "HI" => Some(HIGH_INTEGRITY),
+        "SI" => Some(0x4000),
+        sid => integrity_rid(sid),
+    }
+}
+
+/// Parts of a kernel object's security descriptor, in SDDL.
+fn security_sddl(object: &impl AsHandle, info: OBJECT_SECURITY_INFORMATION) -> io::Result<String> {
     let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
     // SAFETY: the handle is borrowed from a live object; unused out-pointers are null;
     // `descriptor` is a valid out-pointer and receives a `LocalAlloc` block, freed below.
@@ -214,7 +337,7 @@ pub fn dacl_sddl(object: &impl AsHandle) -> io::Result<String> {
         GetSecurityInfo(
             object.as_handle().as_raw_handle(),
             SE_KERNEL_OBJECT,
-            DACL_SECURITY_INFORMATION,
+            info,
             ptr::null_mut(),
             ptr::null_mut(),
             ptr::null_mut(),
@@ -234,7 +357,7 @@ pub fn dacl_sddl(object: &impl AsHandle) -> io::Result<String> {
         ConvertSecurityDescriptorToStringSecurityDescriptorW(
             descriptor,
             SDDL_REVISION_1,
-            DACL_SECURITY_INFORMATION,
+            info,
             &mut wide,
             ptr::null_mut(),
         )
@@ -252,7 +375,8 @@ pub fn dacl_sddl(object: &impl AsHandle) -> io::Result<String> {
     Ok(unsafe { take_local_string(wide) })
 }
 
-/// A security descriptor that makes the current user a pipe's owner and its only grantee.
+/// A security descriptor that makes the current user a pipe's owner and its only grantee, at
+/// the current integrity level.
 #[derive(Debug)]
 pub struct PipeSecurity {
     descriptor: PSECURITY_DESCRIPTOR,
@@ -264,16 +388,29 @@ unsafe impl Send for PipeSecurity {}
 unsafe impl Sync for PipeSecurity {}
 
 impl PipeSecurity {
-    /// The current user as owner (`O:`), and a protected DACL (`P`: nothing is inherited) with
-    /// one entry: the current user, with full access. Nobody else, SYSTEM and Administrators
-    /// included, is granted anything.
+    /// The current user as owner (`O:`); a protected DACL (`P`: nothing is inherited) with one
+    /// entry, the current user with full access (nobody else, SYSTEM and Administrators
+    /// included, is granted anything); and a mandatory label at this process's integrity level
+    /// that refuses both reads and writes from below (`NWNR`). So an elevated ptyd's pipe
+    /// cannot be opened by the same user's ordinary (medium) processes.
     ///
     /// # Errors
     ///
     /// If our token cannot be read or the descriptor cannot be built.
     pub fn current_user_only() -> io::Result<Self> {
-        let sid = current_user_sid()?;
-        let sddl: Vec<u16> = Self::sddl(&sid).encode_utf16().chain(Some(0)).collect();
+        let me = current_identity()?;
+        Self::for_identity(&me)
+    }
+
+    /// The same descriptor for another user's SID or integrity level: for tests (a process may
+    /// label an object at or below its own level only).
+    ///
+    /// # Errors
+    ///
+    /// If the descriptor cannot be built.
+    pub fn for_identity(identity: &Identity) -> io::Result<Self> {
+        let text = Self::sddl(&identity.user, identity.integrity);
+        let sddl: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
         let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
         // SAFETY: `sddl` is NUL-terminated; `descriptor` is a valid out-pointer; the size
         // out-pointer may be null.
@@ -291,9 +428,16 @@ impl PipeSecurity {
         Ok(Self { descriptor })
     }
 
-    /// The descriptor, in SDDL, for a user's SID.
-    pub fn sddl(sid: &str) -> String {
-        format!("O:{sid}D:P(A;;GA;;;{sid})")
+    /// The descriptor, in SDDL, for a user's SID and an integrity level.
+    pub fn sddl(sid: &str, integrity: u32) -> String {
+        let label = match integrity {
+            LOW_INTEGRITY => "LW".to_owned(),
+            MEDIUM_INTEGRITY => "ME".to_owned(),
+            HIGH_INTEGRITY => "HI".to_owned(),
+            0x4000 => "SI".to_owned(),
+            other => format!("S-1-16-{other}"),
+        };
+        format!("O:{sid}D:P(A;;GA;;;{sid})S:(ML;;NWNR;;;{label})")
     }
 
     /// Creates a pipe instance with this descriptor.
@@ -401,6 +545,29 @@ impl Job {
             TerminateJobObject(self.0.as_raw_handle(), 1);
         }
     }
+
+    /// Whether the process with id `pid` is in this job.
+    ///
+    /// # Errors
+    ///
+    /// If the process cannot be opened (it has ended, say).
+    pub fn contains(&self, pid: u32) -> io::Result<bool> {
+        // SAFETY: a plain call; the result is checked before use.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `process` was just opened, and nothing else owns it.
+        let process = unsafe { OwnedHandle::from_raw_handle(process) };
+        let mut inside = 0;
+        // SAFETY: both handles are live for the call; `inside` is a valid out-pointer.
+        let ok =
+            unsafe { IsProcessInJob(process.as_raw_handle(), self.0.as_raw_handle(), &mut inside) };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(inside != 0)
+    }
 }
 
 /// Copies a NUL-terminated wide string allocated with `LocalAlloc`, then frees it.
@@ -466,13 +633,89 @@ mod tests {
                     .create(ServerOptions::new().first_pipe_instance(true), &name)
                     .is_err()
             );
-            let client = ClientOptions::new().open(&name).expect("client");
+            // The pipe carries this process's integrity level, whatever it is (medium here,
+            // high on an elevated CI runner).
+            let me = current_identity().expect("identity");
+            assert_eq!(me.user, sid);
+            assert!(me.integrity >= MEDIUM_INTEGRITY, "{me:?}");
+            assert_eq!(is_elevated(), me.integrity >= HIGH_INTEGRITY);
+            assert_eq!(label_integrity(&server).expect("label"), Some(me.integrity));
+            let mut client = ClientOptions::new()
+                .security_qos_flags(
+                    windows_sys::Win32::Storage::FileSystem::SECURITY_SQOS_PRESENT
+                        | windows_sys::Win32::Storage::FileSystem::SECURITY_IDENTIFICATION,
+                )
+                .open(&name)
+                .expect("client");
+            let mut server = server;
             server.connect().await.expect("connect");
             assert_eq!(owner_sid(&client).expect("owner"), sid);
+            assert_eq!(label_integrity(&client).expect("label"), Some(me.integrity));
             let pid = pipe_client_pid(&server).expect("client pid");
             assert_eq!(pid, std::process::id());
             assert_eq!(process_user_sid(pid).expect("client sid"), sid);
+            // The client's own token, through impersonation, once it has written something.
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            client.write_all(b"hello").await.expect("write");
+            let mut got = [0u8; 5];
+            server.read_exact(&mut got).await.expect("read");
+            assert_eq!(pipe_client_identity(&server).expect("client identity"), me);
+            // Impersonation is over: this thread is itself again.
+            assert_eq!(current_identity().expect("identity"), me);
         });
+    }
+
+    #[test]
+    fn a_pipe_labelled_below_us_is_seen_as_such() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let name = name("label");
+            let me = current_identity().expect("identity");
+            // A process may label an object at or below its own level: low is always allowed.
+            let low = PipeSecurity::for_identity(&Identity {
+                user: me.user.clone(),
+                integrity: LOW_INTEGRITY,
+            })
+            .expect("descriptor");
+            let server = low
+                .create(ServerOptions::new().first_pipe_instance(true), &name)
+                .expect("pipe");
+            assert_eq!(
+                label_integrity(&server).expect("label"),
+                Some(LOW_INTEGRITY)
+            );
+            // We can still open it (writing down is allowed), and see its level from there.
+            let client = ClientOptions::new().open(&name).expect("client");
+            assert_eq!(
+                label_integrity(&client).expect("label"),
+                Some(LOW_INTEGRITY)
+            );
+        });
+    }
+
+    #[test]
+    fn labels_and_descriptors_parse() {
+        assert_eq!(parse_label("S:(ML;;NWNR;;;HI)"), Some(HIGH_INTEGRITY));
+        assert_eq!(parse_label("S:(ML;;NW;;;ME)"), Some(MEDIUM_INTEGRITY));
+        assert_eq!(parse_label("S:(ML;;NWNR;;;LW)"), Some(LOW_INTEGRITY));
+        assert_eq!(parse_label("S:(ML;;NW;;;S-1-16-8448)"), Some(0x2100));
+        assert_eq!(parse_label("S:"), None);
+        assert_eq!(parse_label(""), None);
+        assert_eq!(parse_label("D:P(A;;FA;;;S-1-5-21-1)"), None);
+        assert_eq!(integrity_rid("S-1-16-12288"), Some(HIGH_INTEGRITY));
+        assert_eq!(integrity_rid("S-1-5-21-1"), None);
+        assert_eq!(
+            PipeSecurity::sddl("S-1-5-21-1", MEDIUM_INTEGRITY),
+            "O:S-1-5-21-1D:P(A;;GA;;;S-1-5-21-1)S:(ML;;NWNR;;;ME)"
+        );
+        assert_eq!(
+            PipeSecurity::sddl("S-1-5-21-1", HIGH_INTEGRITY),
+            "O:S-1-5-21-1D:P(A;;GA;;;S-1-5-21-1)S:(ML;;NWNR;;;HI)"
+        );
+        assert!(PipeSecurity::sddl("S-1-5-21-1", 0x2100).ends_with("S-1-16-8448)"));
     }
 
     #[test]
@@ -483,21 +726,61 @@ mod tests {
             .spawn()
             .expect("child");
         job.assign_pid(child.id()).expect("assign");
+        assert!(job.contains(child.id()).expect("in the job"));
         job.terminate();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            if child.try_wait().expect("wait").is_some() {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the job did not end it"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert_eq!(
-            PipeSecurity::sddl("S-1-5-21-1"),
-            "O:S-1-5-21-1D:P(A;;GA;;;S-1-5-21-1)"
+        wait_until("the job ends its process", || {
+            child.try_wait().expect("wait").is_some()
+        });
+    }
+
+    #[test]
+    fn a_job_holds_and_ends_a_grandchild_with_its_own_console() {
+        // PowerShell starts ping with `Start-Process`, which gives it a console of its own (so
+        // closing a pseudo console would not end it), prints its id, and waits.
+        let job = Job::new().expect("job");
+        let mut child = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "$p = Start-Process -PassThru -WindowStyle Hidden ping -ArgumentList '-n','60','127.0.0.1'; \
+                 [Console]::Out.WriteLine($p.Id); [Console]::Out.Flush(); Start-Sleep 60",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("powershell");
+        job.assign_pid(child.id()).expect("assign");
+        let mut line = String::new();
+        let stdout = child.stdout.take().expect("stdout");
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(stdout), &mut line)
+            .expect("the grandchild's id");
+        let grandchild: u32 = line.trim().parse().expect("a pid");
+        assert!(
+            job.contains(grandchild).expect("look"),
+            "the grandchild left the job"
         );
+        job.terminate();
+        wait_until("the job ends the child", || {
+            child.try_wait().expect("wait").is_some()
+        });
+        // Gone, or exiting: either it cannot be opened any more, or it is no longer running.
+        wait_until("the job ends the grandchild", || !running(grandchild));
+    }
+
+    /// Whether process `pid` still runs.
+    fn running(pid: u32) -> bool {
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
+    }
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "never: {what}");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 }
