@@ -4,15 +4,13 @@
 //! - A session the hub does not know is `404 not_found`.
 //! - A session on another machine is `503 unavailable`: this hub reaches no other machine yet.
 //! - A session on this machine is the runner's to answer (`RunnerTerminals`): `404` while it has
-//!   no terminal, which is every session today (see [`NoRuntime`]).
+//!   no terminal (a session PitCrew did not start, or any session without a runtime).
 //! - Without a runner (`--no-runner`, or before a fresh workspace is set up), every known session
 //!   is `503 unavailable`.
 //!
-//! **The runtime.** `crates/runtime` holds tmux control mode's building blocks (its parser,
-//! command builder and replay buffer) but no `Runtime` yet: `TmuxRuntime` and the PTY runtime are
-//! stream B's later briefs. Until one exists, the runner's terminals run over [`NoRuntime`], which
-//! starts nothing and reaches nothing, so no session has a terminal here. Swapping in the real
-//! runtime (tmux where present, else the PTY one) is one line in `Runner::terminals`.
+//! **The runtime** is chosen at start (`crate::runtime`): tmux where it is usable, else
+//! [`NoRuntime`], which starts nothing and reaches nothing, so no session has a terminal here.
+//! The PTY runtime, for machines without tmux, is stream B's next brief.
 
 use crate::runner::Attached;
 use pitcrew_api::{Attachment, TerminalError, Terminals};
@@ -69,9 +67,9 @@ impl Terminals for SessionTerminals {
     }
 }
 
-/// The runtime while `crates/runtime` has none (see the [module docs](self)). It owns no
-/// terminal, as the trait means it: it lists none, every terminal is `NotFound`, and starting one
-/// is `Unavailable`.
+/// The runtime where tmux cannot be used (see the [module docs](self)). It owns no terminal, as
+/// the trait means it: it lists none, every terminal is `NotFound`, and starting one is
+/// `Unavailable`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoRuntime;
 
@@ -83,7 +81,9 @@ impl Runtime for NoRuntime {
 
     fn start(&self, _spec: &StartSpec) -> Result<TerminalInfo, RuntimeError> {
         Err(RuntimeError::Unavailable(
-            "this build of pitcrewd has no terminal runtime yet".to_owned(),
+            "this machine has no terminal runtime for pitcrewd (tmux 3.2 or newer is needed; \
+             the daemon's log says why it is not used)"
+                .to_owned(),
         ))
     }
 
@@ -129,7 +129,6 @@ impl Runtime for NoRuntime {
 mod tests {
     use super::*;
     use crate::runner::Parts;
-    use crate::transcripts::Found;
     use pitcrew_protocol::events::{Event, EventBody};
     use pitcrew_protocol::ids::{MachineId, MemberId, WorkspaceId};
     use pitcrew_protocol::model::{Engine, Session, SessionState, Workspace};
@@ -213,12 +212,15 @@ mod tests {
             Arc::new(Nowhere),
         )
         .unwrap();
+        let terminals = runner.terminals(Arc::new(NoRuntime)).unwrap();
         let parts = Parts {
             machine: here,
             hooks: runner.hooks(),
-            terminals: runner.terminals(Arc::new(NoRuntime)).unwrap(),
-            found: Arc::new(Found::default()),
+            commands: runner.commands(&terminals),
+            terminals,
+            transcripts: runner.transcripts(),
             watches: false,
+            tmux: false,
         };
 
         let with =

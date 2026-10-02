@@ -4,6 +4,7 @@
 #![allow(dead_code, clippy::unwrap_used)]
 
 use serde_json::Value;
+use std::ffi::OsString;
 use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -39,6 +40,8 @@ pub mod id {
     pub const SES2: &str = "01JB000000000000000SES0002";
     /// The demo's own machine, "This laptop": the runner's.
     pub const LAPTOP: &str = "01JB000000000000000MCH0001";
+    /// The demo's cluster: a machine of the workspace this hub cannot reach.
+    pub const CLUSTER: &str = "01JB000000000000000MCH0002";
     pub const REVIEWER: &str = "01JB000000000000000MEM0004";
     pub const SES_UNKNOWN: &str = "01JB000000000000000SES0099";
     /// PAP-1's active dispatch (@writer, session 1).
@@ -99,6 +102,34 @@ impl Daemon {
 
     /// As [`Daemon::start_on`], but returns how it failed.
     pub fn try_start_on(state: &Path, listen: &str, extra: &[&str]) -> Result<Self, Refused> {
+        Self::try_start_with(state, listen, extra, &[], Tmux::Refused)
+    }
+
+    /// As [`Daemon::start`], with these environment variables too (e.g. `PATH`), and `tmux` for
+    /// its terminals' tmux socket.
+    pub fn start_with(
+        state: &Path,
+        extra: &[&str],
+        env: &[(&str, OsString)],
+        tmux: Tmux<'_>,
+    ) -> Self {
+        Self::try_start_with(state, "tcp:127.0.0.1:0", extra, env, tmux).unwrap_or_else(|refused| {
+            panic!(
+                "pitcrewd did not start ({}):\n{}",
+                refused.status, refused.stderr
+            )
+        })
+    }
+
+    /// As [`Daemon::start_on`], with these environment variables too, and `tmux` for its
+    /// terminals' tmux socket; returns how it failed.
+    pub fn try_start_with(
+        state: &Path,
+        listen: &str,
+        extra: &[&str],
+        env: &[(&str, OsString)],
+        tmux: Tmux<'_>,
+    ) -> Result<Self, Refused> {
         let started = Instant::now();
         let mut command = Command::new(PITCREWD);
         command
@@ -107,7 +138,31 @@ impl Daemon {
             .args(["serve", "--listen", listen])
             .args(extra)
             .env("PITCREW_LOG", "debug");
-        let mut child = private_homes(&mut command, state)
+        private_homes(&mut command, state);
+        match tmux {
+            Tmux::Refused => {
+                command.arg("--tmux-socket").arg(refused_tmux_socket(state));
+            }
+            Tmux::At(socket) => {
+                command.arg("--tmux-socket").arg(socket);
+            }
+            // The state directory's own socket, under the runtime's per-user directory, which
+            // must then be the test's own: `TMUX_TMPDIR`, a private directory of the test's.
+            Tmux::StateDefault => {
+                let own = env
+                    .iter()
+                    .find(|(name, _)| *name == "TMUX_TMPDIR")
+                    .is_some_and(|(_, dir)| Path::new(dir).starts_with(std::env::temp_dir()));
+                assert!(
+                    own,
+                    "a daemon on its default tmux socket needs a TMUX_TMPDIR of its own"
+                );
+            }
+        }
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -397,6 +452,28 @@ fn private_homes<'a>(command: &'a mut Command, state: &Path) -> &'a mut Command 
         .env_remove("XDG_DATA_HOME")
 }
 
+/// **Never a real tmux socket.** A test daemon's terminals' tmux socket:
+#[derive(Clone, Copy, Debug)]
+pub enum Tmux<'a> {
+    /// The default for every test daemon: a socket whose directory is refused (its parent does
+    /// not exist), so tmux is not used and the daemon serves with no terminal runtime, as on a
+    /// machine without tmux.
+    Refused,
+    /// A private socket of the test's own (`--tmux-socket`).
+    At(&'a Path),
+    /// The state directory's own default socket, under the runtime's per-user directory, which
+    /// the test must point at a private directory of its own with `TMUX_TMPDIR` (checked).
+    StateDefault,
+}
+
+/// The socket [`Tmux::Refused`] gives a daemon on `state`: in a folder whose parent does not
+/// exist, which the runtime refuses without making anything.
+pub fn refused_tmux_socket(state: &Path) -> PathBuf {
+    let mut dir = state.as_os_str().to_owned();
+    dir.push("-no-tmux");
+    PathBuf::from(dir).join("missing").join("tmux")
+}
+
 /// Runs `pitcrewd <args>` to completion, with a home folder of its own (see [`private_homes`]).
 pub fn run(args: &[&std::ffi::OsStr]) -> std::process::Output {
     let home = tempfile::tempdir().expect("a temporary home");
@@ -625,6 +702,11 @@ impl Ws {
                 Err(e) => return Err(e),
             }
         }
+    }
+
+    /// Answers the server's keepalive Ping with an empty Pong (masked, as a client's frames are).
+    pub fn pong(&mut self) -> io::Result<()> {
+        self.stream.write_all(&[0x8a, 0x80, 0, 0, 0, 0])
     }
 
     /// The next text frame as JSON, skipping pings.

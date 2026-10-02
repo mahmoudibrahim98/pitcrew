@@ -501,15 +501,17 @@ async fn a_terminal_that_disappears_mid_stream_has_exited() {
     .unwrap();
 }
 
-/// A tmux-like runtime: after a restart its terminals have new ids but the same targets.
+/// A tmux-like runtime whose terminals can be replaced by others with the same targets, as a
+/// different server (restarted, or another daemon's) gives out the same window ids.
 #[derive(Debug, Default)]
 struct Renumbering {
     terminals: Mutex<Vec<TerminalInfo>>,
 }
 
 impl Renumbering {
-    fn renumber(&self) {
-        for t in self.terminals.lock().unwrap().iter_mut() {
+    /// The first terminal is now a different one, at the same target.
+    fn replace_first(&self) {
+        if let Some(t) = self.terminals.lock().unwrap().first_mut() {
             t.id = TerminalId::new();
         }
     }
@@ -576,30 +578,40 @@ impl Runtime for Renumbering {
     }
 }
 
+/// After a restart, a link is kept only for a terminal the runtime still lists by its id. One
+/// whose target now belongs to a different terminal (another server reused it) is forgotten, not
+/// moved onto that terminal; one whose terminal is gone is forgotten too.
 #[test]
-fn links_survive_a_restart_by_their_tmux_target() {
+fn links_follow_terminal_ids_never_targets() {
     use pitcrew_api::Terminals as _;
     let state = tempfile::tempdir().unwrap();
     let runtime = Arc::new(Renumbering::default());
-    let (kept, lost) = (SessionId::new(), SessionId::new());
-    {
+    let (replaced, kept, lost) = (SessionId::new(), SessionId::new(), SessionId::new());
+    let b = {
         let runner = runner(state.path());
         let terminals: RunnerTerminals = runner.terminals_with(runtime.clone(), options()).unwrap();
         let a = runtime.start(&spec()).unwrap().id;
         let b = runtime.start(&spec()).unwrap().id;
-        terminals.link(kept, a).unwrap();
-        terminals.link(lost, b).unwrap();
-        assert!(terminals.attach(kept).is_ok());
+        let c = runtime.start(&spec()).unwrap().id;
+        terminals.link(replaced, a).unwrap();
+        terminals.link(kept, b).unwrap();
+        terminals.link(lost, c).unwrap();
+        assert!(terminals.attach(replaced).is_ok());
         runner.stop();
-    }
+        b
+    };
 
-    // The runtime restarted: new ids, same targets; and the second window is gone.
-    runtime.renumber();
-    runtime.terminals.lock().unwrap().truncate(1);
+    // The first window is now another terminal at the same target; the third is gone.
+    runtime.replace_first();
+    runtime.terminals.lock().unwrap().truncate(2);
+    let stranger = runtime.list().unwrap()[0].clone();
     let runner = runner(state.path());
     let terminals = runner.terminals_with(runtime.clone(), options()).unwrap();
-    let now = runtime.list().unwrap()[0].id;
-    assert_eq!(terminals.terminal_of(kept).unwrap(), Some(now));
+    assert_eq!(terminals.terminal_of(replaced).unwrap(), None);
+    assert!(terminals.attach(replaced).is_err());
+    assert_eq!(terminals.session_of(stranger.id).unwrap(), None);
+    assert_eq!(terminals.terminal_of(kept).unwrap(), Some(b));
+    assert_eq!(terminals.session_of(b).unwrap(), Some(kept));
     assert!(terminals.attach(kept).is_ok());
     assert_eq!(terminals.terminal_of(lost).unwrap(), None);
     assert!(terminals.attach(lost).is_err());

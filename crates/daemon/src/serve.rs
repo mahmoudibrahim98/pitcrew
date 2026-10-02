@@ -14,19 +14,22 @@
 //!    through the service, and its run log registered on the open store (`Store::register`), so a
 //!    network filesystem's lease is never let go of in between. When it cannot run (no person
 //!    yet, or `@office` is not the person's agent), `office.json` is removed.
-//! 7. Unless `--no-runner`, the runner ([`crate::runner`]): it watches the homes and writes into
-//!    the store at once.
+//! 7. Unless `--no-runner`, the terminals' runtime ([`crate::runtime`]: tmux where it is usable,
+//!    detected off the async executor), then the runner ([`crate::runner`]): it watches the homes
+//!    and writes into the store at once, and its terminals run on that runtime.
 //! 8. The recap index's warm-up on the blocking pool, not waited for; the back office's loop; for
 //!    a workspace not set up yet, the task that starts the office and the runner once it is
 //!    ([`crate::setup::after_setup`]); the routes (`RouterParts`, with the activity index, the
-//!    recaps, the runner's hooks, terminals and transcripts, and host info as it is now,
-//!    [`crate::host`]); the listener; and one line on stdout: `pitcrewd listening on <where>`.
+//!    recaps, the runner's hooks, terminals, session commands and transcripts, and host info as
+//!    it is now, [`crate::host`]); the listener; and one line on stdout:
+//!    `pitcrewd listening on <where>`.
 //!
 //! Stop (Ctrl+C or Ctrl+Break, or SIGTERM or SIGHUP on Unix): the server stops accepting and
 //! finishes in-flight requests (`pitcrew-api` closes open WebSockets with 1001) while the back
 //! office finishes its run in progress and saves where it got to, and the runner hands what it
 //! read to the store and stops (whether they started with the daemon or after setup); then the
-//! store closes, checkpointing its WAL, and the lock is released last.
+//! terminals' runtime is let go of (tmux stores each terminal's output offset; the terminals keep
+//! running) while the store closes, checkpointing its WAL; and the lock is released last.
 
 use crate::cli::{ListenArg, ServeArgs};
 use crate::host::HostInfoNow;
@@ -34,6 +37,8 @@ use crate::office::Office;
 use crate::recaps::WorkRecaps;
 use crate::refs::WorkRefs;
 use crate::runner::{Attached, Hooks, Runner};
+use crate::runtime::TerminalRuntime;
+use crate::sessions::Sessions;
 use crate::setup::{AfterSetup, Workers};
 use crate::state::{StateDir, read_token, read_workspace, write_token, write_workspace};
 use crate::terminals::SessionTerminals;
@@ -69,6 +74,9 @@ const RELEASE: Duration = Duration::from_secs(3);
 /// How long the async runtime then waits for work still on its blocking pool. What is still
 /// running after that is left to end with the process.
 const ABANDON: Duration = Duration::from_secs(5);
+/// How long letting go of the terminals' runtime may take (tmux stores the terminals' offsets
+/// and detaches), alongside the store's [`RELEASE`].
+const DETACH: Duration = Duration::from_secs(5);
 
 /// Runs `pitcrewd serve` until a stop signal.
 ///
@@ -102,13 +110,29 @@ pub fn serve(state: &StateDir, args: &ServeArgs) -> anyhow::Result<ExitCode> {
     // The homes are settled now, for a runner that starts only once the workspace is set up too.
     let homes = (!args.no_runner)
         .then(|| crate::runner::homes(&args.homes, args.demo, crate::runner::default_homes));
+    // So is the terminals' runtime: detected off the executor, on a thread of its own.
+    let terminals = if args.no_runner {
+        TerminalRuntime::none()
+    } else {
+        runtime.block_on(TerminalRuntime::choose(
+            state.root(),
+            args.tmux_socket.clone(),
+        ))
+    };
     let runner = match &homes {
         None => {
             tracing::info!("the runner is off (--no-runner)");
             None
         }
         Some(homes) => {
-            match crate::runner::start(state, &hub.work, &hub.store, hub.machine, homes.clone()) {
+            match crate::runner::start(
+                state,
+                &hub.work,
+                &hub.store,
+                hub.machine,
+                homes.clone(),
+                &terminals,
+            ) {
                 Ok(runner) => runner,
                 // The hub is still worth serving (the desktop reaches its work), and a supervisor
                 // cannot pass --no-runner.
@@ -126,6 +150,7 @@ pub fn serve(state: &StateDir, args: &ServeArgs) -> anyhow::Result<ExitCode> {
         hub,
         runner,
         homes,
+        terminals,
         office: !args.no_office,
         stop,
         state,
@@ -432,6 +457,8 @@ struct Serving<'a> {
     runner: Option<Runner>,
     /// The runner's homes; `None` with `--no-runner`.
     homes: Option<Vec<EngineHome>>,
+    /// The runner's terminals' runtime, for a runner that starts after setup too.
+    terminals: TerminalRuntime,
     /// Whether the back office runs (not with `--no-office`), for one that starts after setup.
     office: bool,
     stop: Stop,
@@ -446,6 +473,7 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         hub,
         runner,
         homes,
+        terminals: runtime,
         office: office_on,
         mut stop,
         state,
@@ -483,6 +511,7 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         Arc::clone(&attached),
     ));
     let transcripts = Transcripts::new(Arc::clone(&work), Arc::clone(&attached));
+    let sessions = Sessions::new(Arc::clone(&work), Arc::clone(&attached));
     // The activity index (`project=`, `workstream=`, and wider `task=` and `session=` matches).
     let refs: Arc<dyn EventRefs> = Arc::new(WorkRefs(Arc::clone(&work)));
     // The recap index (`GET /v1/recaps/blocks` and `/days`), kept current on every query.
@@ -502,6 +531,7 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
             TerminalConfig::default(),
         ))
         .device(transcripts.routes())
+        .device(sessions.routes())
         .device(pitcrew_hub_work::device_routes().layer(Extension(Arc::clone(&work))));
     // The roles and capabilities as they are at each request (the runner may start later).
     let info = Arc::new(HostInfoNow::new(Arc::clone(&attached)));
@@ -550,6 +580,7 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
                 work: Arc::clone(&work),
                 office: office_on,
                 homes,
+                runtime: runtime.clone(),
                 attached: Arc::clone(&attached),
                 workers: Arc::clone(&workers),
                 drain: DRAIN,
@@ -608,7 +639,9 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         tokio::join!(office_stopped, runner_stopped, finish(&mut serving));
     }
     drop(tokens);
-    close_store(store).await;
+    // The runner has stopped: let go of its terminals' runtime, so tmux stores where each
+    // terminal's output got to (the terminals keep running), while the store closes.
+    tokio::join!(runtime.detach(DETACH), close_store(store));
     failed.map_or(Ok(()), Err)
 }
 

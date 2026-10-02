@@ -24,6 +24,7 @@
 
 use crate::office::{self, Running};
 use crate::runner::{Attached, Runner};
+use crate::runtime::TerminalRuntime;
 use crate::state::{StateDir, write_workspace};
 use pitcrew_hub_work::{SetupDone, SetupListener, WorkService};
 use pitcrew_runner::EngineHome;
@@ -114,6 +115,8 @@ pub struct AfterSetup {
     pub office: bool,
     /// The runner's homes; `None` with `--no-runner`.
     pub homes: Option<Vec<EngineHome>>,
+    /// The runtime its terminals run on, chosen at start.
+    pub runtime: TerminalRuntime,
     /// Where the runner is attached for the routes.
     pub attached: Arc<Attached>,
     pub workers: Arc<Workers>,
@@ -190,9 +193,10 @@ async fn start_office(hub: &AfterSetup, done: &SetupDone) {
 /// Step 4: the runner on the new machine, attached to the routes.
 async fn start_runner(hub: &AfterSetup, done: &SetupDone, homes: Vec<EngineHome>) {
     let (state, work, machine) = (hub.state.clone(), Arc::clone(&hub.work), done.machine.id);
+    let runtime = hub.runtime.clone();
     let started = tokio::task::spawn_blocking(move || {
         let store = Arc::clone(work.store());
-        crate::runner::start(&state, &work, &store, Some(machine), homes)
+        crate::runner::start(&state, &work, &store, Some(machine), homes, &runtime)
     })
     .await;
     match started {

@@ -41,6 +41,10 @@ named by their id (`tok_…`) and token files by their path. Stdout carries one 
 daemon is ready, `pitcrewd listening on <where>`, which supervisors and tests wait for; `init`'s
 one line; and, for `connect`, only the bridge's bytes.
 
+`serve --tmux-socket <path>` (hidden from `--help`, warned in the log) puts the runner's tmux
+server on that socket instead of the state directory's own (see "Terminals"), **for tests and
+development** only.
+
 ## The state directory
 
 | Path | What |
@@ -87,9 +91,10 @@ Windows it must be under the user's profile, whose ACL it inherits.
    office is off (`--no-office`, no person yet, or no member it may act as), `office.json` is
    removed instead.
 7. The stop signals' handlers, so a stop from here on takes the clean path (see "Stop").
-8. Unless `--no-runner`, the runner (see "The runner"). It reads the homes and writes into the
-   store at once: the back office's first run covers what it appended, like anything else. A
-   runner that cannot start does not stop the hub (see "The runner").
+8. Unless `--no-runner`, the terminals' runtime (see "Terminals": tmux where it is usable,
+   detected off the async executor, else none), then the runner (see "The runner"). It reads the
+   homes and writes into the store at once: the back office's first run covers what it appended,
+   like anything else. A runner that cannot start does not stop the hub (see "The runner").
 9. The recap index's warm-up (see "Recaps"), started and not waited for; the back office's loop;
    for a workspace without a person, the task that waits for its setup (see "The first run");
    the routes; the listener; and the ready line.
@@ -102,18 +107,24 @@ README) and removes its unix socket. Meanwhile, as in the same step, the back of
 run it is in and saves `office.json` (`the back office stopped`), and the runner stops: what it has
 read is handed to the store first, its threads end, and with them its hold on the store (`the
 runner stopped`). Each gets 10 seconds. This holds whether they started with the daemon or after
-setup; one that a setup in flight starts once the stop has begun is stopped as it starts. Then the
+setup; one that a setup in flight starts once the stop has begun is stopped as it starts. Then,
+once the runner has stopped, the terminals' runtime is let go of (`the terminals' runtime
+detached`): tmux stores each terminal's exact output offset, its control client detaches, and
+the socket's lock is released, while **the terminals keep running** (a stop never ends an agent;
+see "Terminals"). Meanwhile the
 store closes, checkpointing its WAL so only `hub.db` remains, and the lock is released last. The
 log ends with `store closed` and `stopped`.
 
 **A stop always ends, within about 20 seconds.** Whatever does not finish in time is left behind
 and ends with the process, and the log says so (warnings): a runner stuck in a discovery or a read
-on a filesystem that does not answer (`the runner is still stopping`); a transcript read past its
-10 seconds (`a transcript read has not returned`); anything that still holds the store 3 seconds
-after the server stopped; and, last, work still on the blocking pool 5 seconds later (`work on the
-blocking pool is still running`). The store is then closed with the process (`the store is still
-open at exit`), and its next open recovers the log from its write-ahead file. Bounds: the 10
-seconds of the stop step, 3 for the store's holders, 5 for the blocking pool.
+on a filesystem that does not answer (`the runner is still stopping`); a transcript read past the
+route's 15 seconds (`a transcript read has not returned`; the runner gives up on its own reads
+after 10); a tmux that does not let go within 5 seconds (`the terminals' runtime is still
+detaching`); anything that still holds the store 3 seconds after the server stopped; and, last,
+work still on the blocking pool 5 seconds later (`work on the blocking pool is still running`).
+The store is then closed with the process (`the store is still open at exit`), and its next open
+recovers the log from its write-ahead file. Bounds: the 10 seconds of the stop step, then 5 for
+the runtime alongside 3 for the store's holders, then 5 for the blocking pool.
 
 ## The first run
 
@@ -310,9 +321,10 @@ person, it stays off (logged), as the back office does without a person, until t
 set up: then it starts on the new machine, watching the homes the daemon was started with,
 without a restart (see "The first run"). Its index is `runner/<log id>/`.
 
-**Reaching it.** The routes (hooks, terminals, transcripts, host info) reach the runner through
-`runner::Attached`, set once when it starts, with the daemon or after setup; until then hooks are
-only logged and terminals and transcripts answer `503`, as with `--no-runner`.
+**Reaching it.** The routes (hooks, terminals, session commands, transcripts, host info) reach the
+runner through `runner::Attached`, set once when it starts, with the daemon or after setup; until
+then hooks are only logged and terminals, session commands and transcripts answer `503`, as with
+`--no-runner`.
 
 **A runner that cannot start** (its index cannot be opened or is locked, one of its threads,
 its terminals' included, cannot start) does not stop the hub: the daemon warns (`the runner cannot
@@ -321,9 +333,10 @@ start, so this hub serves without it`, with the reason and the index's folder) a
 reaching.
 
 **`GET /v1/host/info`** answers roles `["hub", "runner"]` while the runner runs, `["hub"]` when it
-is off; capabilities `["watch"]` only while it watches at least one home (so not with `--demo`
-alone), else `[]`. They are read at each request, so a runner that starts after setup shows at
-once: `pitcrew_api::router` answers the route with the value it was built with, so the daemon
+is off. Capabilities, while the runner runs: `tmux` when its terminals run in tmux (see
+"Terminals"), and `watch` while it watches at least one home (so not with `--demo` alone), in that
+order; `[]` without a runner. They are read at each request, so a runner that starts after setup
+shows at once: `pitcrew_api::router` answers the route with the value it was built with, so the daemon
 answers `GET` and `HEAD /v1/host/info` itself in a layer over the app (`src/host.rs`; `HEAD` with
 the same headers, its length included, and no body) and passes every other request on, so the
 router's fixed answer is never served.
@@ -358,36 +371,129 @@ members:
   agent in the hub, so the person's hooks (device token) change them and an agent token's do not.
   How a real agent's hooks authenticate is a separate design.
 
-**Terminals.** `GET /v1/sessions/{id}/terminal` is answered by `SessionTerminals`
-(`src/terminals.rs`): a session the hub does not know is `404`; one on another machine `503` (no
-remote runners yet); one on this machine is `RunnerTerminals`' to find, `404` while it has no
-terminal. **The runtime:** `crates/runtime` has tmux control mode's building blocks but no
-`Runtime` yet (`TmuxRuntime` and the PTY runtime are stream B's later briefs), so the runner's
-terminals run over `NoRuntime`, which owns no terminal and starts none. Every session of this
-machine is therefore `404` today. When stream B's runtime lands, `Runner::terminals` takes tmux
-where `has_tmux`, else the PTY runtime.
+**Transcripts.** `GET /v1/sessions/{id}/transcript?before=&limit=` (api-v1, "Transcript paging")
+is served by `src/transcripts.rs` from the runner's own pages (`RunnerTranscripts`, its README's
+"Transcript pages"): the runner finds a session's transcript by its id among those it watches,
+and reads the page with the adapter's own `read_page`, on its own two threads, giving up after 10
+seconds (a busy pool refuses at once). The route keeps what only the hub knows:
 
-**Transcripts** (a stand-in). `GET /v1/sessions/{id}/transcript?before=&limit=` (api-v1,
-"Transcript paging") is served by `src/transcripts.rs`, because neither the runner nor
-`pitcrew-api` serves transcript pages yet:
+- the query: `limit` 200 by default, 1000 at most; a `limit=0`, or a `before` or `limit` that is
+  not a whole number, `400`;
+- an unknown session `404`; another machine's, or any without a runner, `503`;
+- a session of this machine the runner has not indexed (the demo's, or a dispatched one whose
+  transcript does not exist yet) an empty page with `at_start: true`, as the mock answers for a
+  session without a transcript;
+- a transcript that is gone (deleted) or cannot be read, and a read that is busy or does not end
+  in time, `503 unavailable`, with the runner's reason (never a path). The runner logs the first
+  failure for a session as a warning, later ones at debug.
 
-- the daemon hands the runner its three adapters wrapped in `Recorded`, which keeps what each
-  home's latest discovery found; the route only reads those, so only watched homes;
-- a session's transcript is found by its engine and native id, by each CLI's own file names only:
-  Claude's `<id>.jsonl` and its sub-agents' `agent-<id>.jsonl`, Codex's
-  `rollout-<time>-<id>.jsonl` (or the whole name, when the rollout's records name no id), and
-  OpenCode's inner id; so an id cannot match another kind of file. The newest, if one session is
-  in two homes;
-- it is paged by the adapter's own `read_page` on the blocking pool, given 10 seconds: a read that
-  does not return by then answers `503` and is logged as left running (see "Stop");
-- unknown session `404`; another machine's, or any without a runner, `503`; a session of this
-  machine whose transcript is not found (the demo's, a deleted file) an empty page at the start,
-  as the mock answers for a session without one; `limit` 200 by default, 1000 at most, and a
-  `limit=0` or a `before` or `limit` that is not a whole number `400`.
+The call runs on the blocking pool with the route's own 15 seconds as a backstop; since the runner
+bounds its reads, a filesystem that does not answer ties up the runner's two page threads, not a
+tokio thread per request.
 
-The runner's index already knows each session's transcript exactly. Proposal for stream D: a
-`RunnerHandle::transcript_page(session, before, limit)`; and for stream H, a `Transcripts` seam
-and route in `pitcrew-api` like `Terminals`. Then this module goes.
+## Terminals
+
+The runner's terminals (`RunnerTerminals`, over `src/runtime.rs`'s `TerminalRuntime`) are where
+the sessions PitCrew starts run.
+
+**The runtime, chosen at start** (unless `--no-runner`), in this order:
+
+1. The socket's directory is made private (0700 if missing; one that is not is refused, never
+   repaired), and its lock (`<socket dir>/lock`, `flock`) is taken for the runtime's life.
+2. `pitcrew_runtime::tmux::detect_async` checks, on a thread of its own, that tmux is installed (an
+   absolute path on `PATH`), 3.2 or newer, and can start a server on that socket.
+3. A server already running there must have no sessions but PitCrew's own (`pitcrew`): one with
+   others (a person's own tmux, if a socket names it) is refused and left as it is.
+
+If all hold, the terminals are windows of that server (`TmuxRuntime`: its README has the details),
+the log says `the runner's terminals run in tmux; attach to them with tmux -S <socket> attach -t
+pitcrew`, and host info reports `tmux`. Otherwise there is no runtime (`NoRuntime`): no session has
+a terminal here, starting one is `503`, and the log says why as a warning (`the runner's terminals
+cannot use tmux …`: not installed, too old, the socket's directory refused, `another pitcrewd uses
+this tmux socket`, a server with sessions `that are not PitCrew's`). On Windows (no tmux) it says
+so at info; the PTY runtime is stream B's next brief.
+
+**One server per state directory.** The socket is
+`<dir>/<8 hex digits of the sha256 of the canonical state directory>/tmux`, where `<dir>` is the
+runtime's private per-user directory: `$TMUX_TMPDIR/pitcrew-<uid>` or `$XDG_RUNTIME_DIR/pitcrew`
+when that is a private directory, else `/tmp/pitcrew-<uid>` (also when the path would pass the
+103-byte socket limit). So two daemons of one user (a real one and a demo, a development one,
+another state directory) never share a server: not its terminals, not their offsets, not the
+environment its programs inherit (the daemon that starts a server gives it its own `HOME`,
+`PATH` and the rest). The lock keeps a second runtime off one socket even when a socket is named
+twice. The hidden `serve --tmux-socket <path>` names another socket, with a warning, **for tests
+and development**; tests always pass it, or point the per-user directory at their own folder
+(`TMUX_TMPDIR`). The per-user directory depends on the environment, so a daemon restarted in
+another one (say without `XDG_RUNTIME_DIR`) does not find its terminals.
+
+**Attaching by hand:** `tmux -S <socket> attach -t pitcrew` (the socket is in the start log), then
+pick a window (each is named after the CLI and the folder, e.g. `claude paper`); or one terminal,
+`tmux -S <socket> attach -t pitcrew:@<n>`. Detach with `C-b d`. tmux's own key bindings apply; the
+user's `~/.tmux.conf` does not, and the user's own tmux server is never touched.
+
+**`GET /v1/sessions/{id}/terminal`** is answered by `SessionTerminals` (`src/terminals.rs`): a
+session the hub does not know is `404`; one on another machine `503` (no remote runners yet); one
+on this machine is `RunnerTerminals`' to find, `404` while it has no terminal (a session PitCrew
+did not start, or any without a runtime). Every runtime call goes through `RunnerTerminals`, which
+runs it on the runner's own small pool, bounded (5 seconds; starting a program 30), and the route
+calls the seam on the blocking pool, bounded too. Nothing in the daemon calls `screen()` yet; it
+would go the same way (the runtime's README: call it from a blocking thread).
+
+**Session commands** (`src/sessions.rs`, device routes) are run by the runner's `RunnerCommands`:
+
+| Route | What |
+|---|---|
+| `POST /v1/sessions` | Starts the CLI (`engine`) in a new terminal in `cwd` (see below), with `brief` (at most 64 KiB), `model` and `permission_mode`; `202` with the session. |
+| `POST /v1/sessions/{id}/send` | Types `text` (at most 64 KiB), then Enter. |
+| `POST /v1/sessions/{id}/keys` | Sends `keys` (1 to 64). |
+| `POST /v1/sessions/{id}/interrupt` | Escape. |
+| `POST /v1/sessions/{id}/end` | `graceful`: Ctrl-C twice, then waits up to 10 seconds for the CLI to exit; `kill`: SIGTERM to its process group, SIGKILL half a second later, and the window closes. Either reports the session ended (`session_ended`). |
+
+- **Starting.** The runner learns a session's id only when the CLI writes its transcript; Claude
+  is started with a session id of the runner's choosing (`--session-id`), so the match is exact,
+  and other CLIs are matched by folder and start time. So `POST /v1/sessions` starts the CLI,
+  waits up to 30 seconds for the runner to discover its session in that terminal (asking it to
+  look again after 1, 3, 7 and 15 seconds), and answers `202` with the session as the hub stores
+  it (`terminal` set). If it does not appear (Claude writes its transcript at its first prompt, so
+  a start without a brief waits for a person), it answers `503` saying so: the CLI keeps running
+  in its terminal, and its session appears on the stream once its transcript does.
+- `machine` must be a machine of the workspace (`400`) and the runner's (`503` for another).
+  `agent` and `task` are refused with `503` for now: a session started for an agent must be stored
+  under the agent before its CLI starts, which needs the runner to adopt a session id (see
+  "Dispatch"). `persona` is passed on (the runner does not use it yet); `bypass_permissions` is
+  refused by the runner (`400`), and so is a session id or model that could be read as an option.
+- **`cwd`**: absolute, at most 4096 bytes, an existing folder; resolved once by the daemon (links
+  and `..`), and the CLI starts in the resolved folder. On Unix it and every folder above it must
+  belong to root or this user, and none may be writable by every user (o+w), except a sticky
+  folder above it (as `/tmp`): anyone who can write there could plant files the CLI reads as its
+  project's (settings, hooks, instructions) or swap the folder. Refused is `400`, saying which
+  folder. Anything on a Windows drive mounted in WSL without metadata (`/mnt/c`, mode 777) is
+  refused too, with no exception. **Group-writable folders are allowed** (a project shared with a
+  group, as on a cluster), the folder itself or any above it; a start in one is logged at info (`a
+  session starts in a folder that members of its group can change`), naming them, since the
+  group's members can change what the CLI reads there.
+- **Who may.** A person may command a session with no agent, or one whose agent they own; a
+  session of another person's agent, or of an agent the hub does not know, is `403`. It is the
+  runner's rule for hooks (its README), asked of the hub's tables (`HubAgents`).
+- An unknown session is `404`; one on another machine, or any without a runner, `503`; an ended
+  one, or one without a terminal here, `409`. A command the runner refuses is `400`; one that
+  fails (the runtime cannot start or reach the terminal, or does not answer in time) is `503`.
+- **Bounds.** A body is at most 1 MiB (`400 invalid` past it). Commands run on the blocking pool,
+  at most 16 at once, and starts at most 4 at once, each holding its place through its wait for
+  the session (`503` past either). A command's place is given back only when the command returns,
+  even after the request stopped waiting for it (45 seconds, over the runner's own timeouts).
+  Every lookup (the session, its agent, its terminal, the folder) is bounded by 5 seconds (`503`).
+  While a start waits, it looks the session up by its terminal in the runner's index, every
+  200 ms, not through the hub's whole list.
+
+**Restarts.** A stop lets go of the runtime only after the runner has stopped: dropping
+`TmuxRuntime` stores each terminal's exact output offset in tmux (`@pitcrew-offset`) and detaches;
+the terminals and their programs keep running. The next start's runtime finds them again by their
+tags, the runner's index still links each to its session, and output is numbered on from the
+stored offset: a client that reconnects with `from=<the offset it had>` misses nothing printed
+since, and one from `0` is told (`truncated`) where the kept output begins. Output printed while
+no daemon was attached is not in the stream (tmux sends only live output); the terminal's screen
+shows it to a person who attaches. `end` ends a terminal; nothing else does.
 
 ## Dispatch
 
@@ -403,15 +509,16 @@ dispatch"); then `RunnerCommands` becomes hub-work's `Dispatcher` here.
 
 | Route | From |
 |---|---|
-| `GET /v1/host/info` (no token) | `src/host.rs`, a layer over `pitcrew-api`'s app (see "The runner"); roles `["hub", "runner"]` while the runner runs, else `["hub"]`; capabilities `["watch"]` while it watches a home, else `[]`; read at each request |
+| `GET /v1/host/info` (no token) | `src/host.rs`, a layer over `pitcrew-api`'s app (see "The runner"); roles `["hub", "runner"]` while the runner runs, else `["hub"]`; capabilities, while it runs, `tmux` when its terminals run in tmux and `watch` while it watches a home, else `[]`; read at each request |
 | Work routes, agent and device, with `GET /v1/workspace`, `POST /v1/setup` and `GET /v1/sessions[/{id}]` | `pitcrew-hub-work` (`agent_routes`, `device_routes`); setup's listener is the daemon's (see "The first run") |
 | `POST /v1/tasks/{id}/dispatch` | `pitcrew-hub-work` without a dispatcher: `503 unavailable`, and nothing is recorded, not even an assignment (see "Dispatch") |
 | `GET /v1/stream` | `pitcrew-api` over the store (`StoreSource`) |
 | `GET /v1/events` | `pitcrew-api`'s `Activity` over the store, with the work model's activity index (`with_refs`, through the `WorkRefs` adapter in `src/refs.rs`): `project=` and `workstream=` match events about them, their tasks and their sessions, and `task=` and `session=` also match their sessions' and dispatches' events |
 | `GET /v1/recaps/blocks`, `GET /v1/recaps/days` | `pitcrew-api`'s `Recaps` over the hub's recap index (hub-work's `RecapIndex`, implemented by its `WorkService`), through the `WorkRecaps` adapter in `src/recaps.rs`; see "Recaps" |
 | `POST /v1/hooks/{engine}/{event}` | `pitcrew-api` into the runner's `RunnerHooks` (see "The runner"); with `--no-runner`, logged at debug (engine, event, member; never the body) |
-| `GET /v1/sessions/{id}/terminal` | `pitcrew-api` over `SessionTerminals` (see "The runner") |
-| `GET /v1/sessions/{id}/transcript` | `src/transcripts.rs`, a device route (see "The runner") |
+| `GET /v1/sessions/{id}/terminal` | `pitcrew-api` over `SessionTerminals` (see "Terminals") |
+| `POST /v1/sessions`, `POST /v1/sessions/{id}/send`, `/keys`, `/interrupt`, `/end` | `src/sessions.rs`, device routes, through the runner's `RunnerCommands` (see "Terminals") |
+| `GET /v1/sessions/{id}/transcript` | `src/transcripts.rs`, a device route, from the runner's `RunnerTranscripts` (see "The runner") |
 
 On development TCP only, the daemon answers CORS as the mock hub does: preflights from
 `http://localhost:<port>`, `http://127.0.0.1:<port>` and the Tauri app's origins get `204` and
@@ -469,6 +576,9 @@ VITE_PITCREW_TOKEN="$(cat "$(cargo run -q -p pitcrew-daemon -- --state-dir /tmp/
   corepack pnpm --filter @pitcrew/ui dev
 ```
 
+On a machine with tmux, a development daemon on its own state directory gets a tmux server of its
+own, next to a real PitCrew's (see "Terminals").
+
 `--demo` works once per state directory; restart without it to keep the data, or use a new
 directory for a fresh demo. With `--demo` the runner watches no agent home; `--homes <dir>` points
 it at one (a folder with a copy of `crates/fixtures/data/transcripts/claude/demo-session.jsonl`
@@ -508,6 +618,13 @@ with `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `XDG_DATA_HOME` removed: a start with
 without `--homes` watches that folder, never the machine's own. Transcripts come from
 `crates/fixtures`, under synthetic session ids.
 
+**No test touches a real tmux.** Every daemon the tests start gets `--tmux-socket` (`Tmux` in
+`tests/common`): by default a socket in a folder whose parent does not exist, which the runtime
+refuses (making nothing), so the daemon serves without a terminal runtime, as on a machine without
+tmux; the tmux tests give their daemons private sockets in their temporary folders, or a
+`TMUX_TMPDIR` there for a state directory's default socket (the helper refuses a daemon on its
+default socket without one). None uses PitCrew's own per-user directory or the user's tmux server.
+
 `tests/serve.rs` starts the real binary on a temporary state directory and a free port, and
 covers `--version`, `token show-path`, tokens and scopes, the work routes (with the workspace,
 sessions, and a dispatch that answers 503 and records nothing), the stream (a move
@@ -526,6 +643,9 @@ allow for the back office appending after a write (the demo's asks are old by th
   transcript (`GET /v1/sessions/{id}/transcript`, paged by one item and from `before`; bad
   queries `400`); lines appended to the file reach `GET /v1/stream` live (tool runs, the edit, the
   turn's end), the session goes idle, the transcript grows, and each record is in the log once;
+- transcript pages come from the runner: an indexed transcript's pages; the demo's session of this
+  machine, which the runner never indexed, an empty page at the start; and once the transcript is
+  deleted, `503 unavailable` saying it is gone, with no path;
 - hooks through the real route and real tokens: `@writer`'s hook changes its own session; its
   hooks on `@reviewer`'s session and on a session without an agent change nothing; the person's
   change `@reviewer`'s (an agent they own) and the agentless one. Each refused hook would leave a
@@ -543,9 +663,55 @@ allow for the back office appending after a write (the demo's asks are old by th
 - on Unix, SIGTERM: `the runner stopped` and `the back office stopped` before `store closed`; a
   restart with lines written meanwhile keeps the session's id, adds the rest, and stores nothing
   twice;
-- on Unix, a stop with a read that never returns (the transcript swapped for a FIFO no one writes,
-  which both the watcher and a transcript request then open): the daemon still exits cleanly, in
-  about 18 seconds, logging the runner, the read and the store it left behind.
+- on Unix, a stop with a read that does not return for minutes (the transcript grown by a
+  terabyte with no line break, a sparse file that takes no disk blocks, which both the watcher and
+  a transcript request then read to the end of its line): the daemon still exits cleanly, within
+  30 seconds, logging the runner, the work on the blocking pool and the store it left behind;
+- on Unix, a transcript swapped for a named pipe is refused as soon as it is opened (`is a named
+  pipe, not a regular file`), by the watcher and by a transcript request, which is answered within
+  5 seconds; a stop then takes under 8 seconds and leaves nothing behind.
+
+`tests/terminals.rs`, the runner's terminals:
+
+- without tmux (the refused socket every test daemon has by default): host info has no `tmux`,
+  the log warns why (and warns of `--tmux-socket`), the demo's session of this machine has no
+  terminal (`404`), `POST /v1/sessions` is `503`, a command for a session without a terminal `409`,
+  for another machine's `503`, for an unknown one `404`; malformed bodies `400`; each bound one
+  past its limit (`text`, `keys`, `brief`, `cwd`, a body past 1 MiB) `400 invalid`, and at its
+  limit passes; a relative or missing `cwd`, and one under a folder every user can write to,
+  `400`, while one under a group-writable folder goes on to the missing runtime (`503`) and the
+  log names that folder at info; a
+  session of another person's agent (added through the hub's events) `403` for `send`, `keys`,
+  `interrupt` and `end`, before its lack of a terminal, while one of the person's own agent gets
+  to that `409`; an agent token `403` on all five routes;
+- in tmux (Unix, tmux 3.2 or newer; skipped with a message otherwise, or failed when
+  `PITCREW_REQUIRE_TMUX=1`), with a private socket, a stand-in `claude` first on the daemon's
+  `PATH` (it writes its transcript, in its `CLAUDE_CONFIG_DIR`, for the `--session-id` it is given,
+  then prints each byte it reads as `KEY <hex>`), and `--homes`: host info has `["tmux",
+  "watch"]` and the log the attach command; `POST /v1/sessions` answers `202` with the session,
+  `terminal` set, and its window is in tmux (`claude work`); a start for the demo's cluster (`503`),
+  with `bypass_permissions` or a `--dangerously-…` model (`400`) starts nothing; the terminal
+  WebSocket streams the stand-in's output; `send`, `keys` and `interrupt` reach it (`KEY 68`, `KEY
+  69`, `KEY 09`, `KEY 1b`). SIGTERM: `the runner stopped`, then `the terminals' runtime detached`,
+  then `store closed`; the pane is alive, and its `@pitcrew-offset` is exactly where the stream
+  ended. The next daemon reports `tmux` again and finds the terminal: a stream from that offset
+  gets the new output with nothing lost, one from `0` a `truncated` frame naming the offset. A
+  second session, its folder given as `<work>/../work`, runs in the resolved folder and is named
+  after it; ended `graceful`, it prints its goodbye, its stream ends with `exit`, and it is
+  `ended`. A third, in a folder under a group-writable one (mode 2775), starts (`202`), the log
+  names that folder at info, and `kill` ends it. `kill` ends the first (`exit`, close `1000`,
+  `ended`), and a command for it is then `409`. With all ended, tmux's server exits, and once the
+  daemon has stopped nothing with the test's mark (`PITCREW_TEST_RUN`, which the daemon's tmux
+  server and panes inherit) is left;
+- two daemons on two state directories, on their default sockets (under the test's
+  `TMUX_TMPDIR`): two sockets, in directories named by 8 hex digits, two servers, each holding only
+  its own session's terminal; a third daemon given the first's socket finds it locked
+  (`another pitcrewd uses this tmux socket`), has no `tmux`, and touches nothing;
+- a tmux server with a session of someone else's (`mine`): the daemon has no `tmux`, says the
+  server has sessions `that are not PitCrew's`, and leaves it as it was, before and after its
+  stop;
+- whatever the outcome, each test kills its servers (`tmux -S <its socket> kill-server`) and
+  anything still marked.
 
 `tests/office.rs`, with `--demo`, appends what the runner link will report straight to the store
 (the daemon looks at it with its next append, here a comment through the API, or at its next
@@ -628,13 +794,24 @@ sub-agents up their chain (16 sessions resolve; 17, or 16 below a parent not sto
 `Unknown`), and answers `Unknown` for a chain that disagrees or loops and for an agent the hub
 does not know as one; `src/terminals.rs` answers `404`, `503` or the runner's answer by where the
 session is, with and without a runner, and with one attached later; `src/host.rs` answers the
-runner's role and `watch` once one is attached, and `HEAD` with `GET`'s headers and no body;
-`src/transcripts.rs` finds each CLI's file names
-and no other engine's (no Claude id names a rollout, no Codex id a Claude file), takes the newest
-of one session in two homes, and replaces a home's list at each discovery; `src/runner.rs` and
+runner's role, `tmux` and `watch` (each, both, neither) once one is attached, and `HEAD` with
+`GET`'s headers and no body; `src/transcripts.rs` answers `404`, `503`, or an empty page for a
+session of this machine the runner never indexed, with and without a runner; `src/sessions.rs`
+checks the bodies and every bound at its limit and one past it, the hook rule for who may command
+a session (each scope against no agent, an owned agent, another's, one without an owner, and an
+unknown one), which sessions take a command (`404`, `503`, `403`, `409`), what a start needs (a
+person, an absolute folder, a machine of the workspace, no `agent` or `task`), folders resolved
+(`..` and links), refused (relative, missing, a file, under a folder every user can write to
+unless sticky, writable by every user themselves) and allowed when group-writable, themselves or
+above, with those folders named; and a start with no runtime `503`; `src/runtime.rs` checks that
+a let-go runtime answers `Unavailable` to every call and is dropped, that a refused socket means
+no tmux and makes nothing, that each state directory has a socket of its own (the same however spelled), that
+socket directories are made private (and an open one refused, not repaired) and locked once, and
+which sessions of a server are not PitCrew's (a stand-in `tmux` answering); `src/runner.rs` and
 `src/cli.rs` check that `--demo` alone watches nothing (the person's homes are not even looked
 up), how `--homes` values become homes, and that `--no-runner` refuses `--homes`. `src/cli.rs`
-also checks that everything after `connect` reaches the bridge as it is, and `init`'s arguments;
+also checks that everything after `connect` reaches the bridge as it is, `init`'s arguments, and
+that `--tmux-socket` parses and is hidden from help;
 `src/init.rs` the request's body (a bare handle given its `@`) and the client pointed at the state
 directory's socket, or the `--listen` given; `src/setup.rs` that the listener hands the setup over
 once, and that an office loop and a runner (real, watching nothing) are kept until the stop begins
@@ -644,8 +821,16 @@ and handed back, not kept, once it has.
 
 - The dispatcher (see "Dispatch"), and agent tokens for real sessions: how a real agent's hooks
   authenticate is a separate design.
-- A real terminal runtime (stream B), and transcript pages from the runner itself (see "The
-  runner").
+- The PTY runtime (stream B's next brief): on machines without tmux 3.2, Windows included, no
+  session has a terminal yet.
+- `POST /v1/sessions` with `agent` or `task` (`503`; it needs the runner to adopt a session id, as
+  dispatch does), and `POST /v1/sessions/{id}/link`, which no route serves yet.
+- The first prompt (`brief`) is passed to the CLI as an argument, so other users of the machine
+  can read it in the process list (`/proc/<pid>/cmdline`), and tmux shows it in the pane's
+  `pane_start_command`. Passing it on the CLI's standard input, or through a private file, would
+  keep it to the user (threat model O43).
+- Folders on a Windows drive mounted in WSL without metadata (mode 777) are refused as a session's
+  `cwd` (see "Terminals"), by decision: there is no exception for `/mnt/<drive>`.
 - Linking sessions to workstreams by folder or branch: the runner can (`Locations`), but the daemon
   does not pass it the workstreams' locations yet, so nothing is linked by folder or branch.
 - Host info from `pitcrew-api` itself: its `router` takes a fixed `HostInfo`, so the daemon answers

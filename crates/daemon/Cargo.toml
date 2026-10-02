@@ -27,6 +27,8 @@ pitcrew-fixtures.workspace = true
 pitcrew-runner.workspace = true
 pitcrew-ingest.workspace = true
 pitcrew-interfaces.workspace = true
+# The runner's terminals: `TmuxRuntime` on PitCrew's private tmux server, and its detection.
+pitcrew-runtime.workspace = true
 # `pitcrewd connect`: the stdio bridge a remote helper is reached through
 # (`pitcrew_remote::bridge::main`).
 pitcrew-remote.workspace = true
@@ -42,6 +44,13 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# The tmux socket's directory name: 8 hex digits of the state directory's sha256.
+sha2.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# The tmux socket's lock (flock, O_NOFOLLOW), without unsafe code. The version pitcrew-auth,
+# pitcrew-runner and pitcrew-runtime already use, so nothing new enters the lockfile.
+rustix = { version = "=1.1.5", features = ["fs"] }
 
 [dev-dependencies]
 tempfile.workspace = true
