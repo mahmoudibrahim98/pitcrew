@@ -103,17 +103,12 @@ fn built_ptyd() -> PathBuf {
     Path::new(common::PITCREWD).with_file_name(PTYD)
 }
 
-/// A new temporary folder: under `/tmp` on Unix, so socket paths stay short (macOS's own
-/// temporary folder is long).
+/// A new temporary folder, in the system's own: the daemons' homes are made in it, and
+/// `pitcrew_fixtures::homes` accepts homes only inside that folder (`/var/folders/…/T` on macOS,
+/// not `/tmp`). Its sockets still fit macOS's 103 bytes: the longest, a state directory's default
+/// endpoint under the test's `TMUX_TMPDIR` (`<tmp>/td/pitcrew-<uid>/<8 hex>/ptyd`), is about 90.
 fn temporary() -> tempfile::TempDir {
-    if cfg!(unix) {
-        tempfile::Builder::new()
-            .prefix("pc")
-            .tempdir_in("/tmp")
-            .unwrap()
-    } else {
-        tempfile::tempdir().unwrap()
-    }
+    tempfile::tempdir().unwrap()
 }
 
 /// One test's setup: homes, a working folder, the stand-in `claude`, and the pitcrew-ptyd to run.
