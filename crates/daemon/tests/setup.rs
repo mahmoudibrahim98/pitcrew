@@ -523,18 +523,17 @@ fn connect_carries_a_request_to_the_daemon() {
     std::fs::create_dir(&home).unwrap();
 
     let bridge = |stdin: &[u8], extra: &[&str]| -> Output {
-        let mut child = Command::new(common::PITCREWD)
+        let mut command = Command::new(common::PITCREWD);
+        command
             .arg("connect")
             .arg("--socket")
             .arg(&socket)
-            .args(extra)
-            .env("HOME", &home)
-            .env_remove("XDG_DATA_HOME")
+            .args(extra);
+        pitcrew_fixtures::homes::private_home(&mut command, &home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::piped());
+        let mut child = common::spawn(&mut command).unwrap();
         // Stdin stays open while the answer comes, as an HTTP client's does: the daemon closes
         // the connection once it has answered (`Connection: close`), which ends the bridge.
         let mut input = child.stdin.take().unwrap();

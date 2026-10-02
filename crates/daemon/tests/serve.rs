@@ -54,17 +54,15 @@ fn version_names_the_protocol_range() {
     );
 }
 
-/// `--version` needs no state directory and creates nothing.
-#[cfg(unix)]
+/// `--version` needs no state directory and creates nothing, in its home (where the default state
+/// directory would be, on every platform) or anywhere in it.
 #[test]
 fn version_touches_no_state() {
     let home = tempfile::tempdir().unwrap();
-    let out = std::process::Command::new(common::PITCREWD)
-        .arg("--version")
-        .env("HOME", home.path())
-        .env_remove("XDG_DATA_HOME")
-        .output()
-        .unwrap();
+    let mut command = std::process::Command::new(common::PITCREWD);
+    command.arg("--version");
+    pitcrew_fixtures::homes::private_home(&mut command, home.path());
+    let out = common::output(&mut command).unwrap();
     assert!(out.status.success());
     assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
 }

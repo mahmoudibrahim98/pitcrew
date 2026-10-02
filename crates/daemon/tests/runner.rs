@@ -397,19 +397,40 @@ fn a_demo_watches_no_home_of_its_own() {
     daemon.stop();
     drop(daemon);
 
-    // Started again without --demo, it watches this user's homes.
+    // Started again without --demo, it watches this user's homes: exactly the three in its home,
+    // whatever the platform looks up (on Windows, `USERPROFILE` and the rest point there too).
     let daemon = Daemon::start(&state, &[]);
     daemon.wait_for_log("the runner watches these homes", WAIT);
     let found = session_named(&daemon, &device, native);
     assert_eq!(found["state"], "idle");
-    assert!(
-        daemon.stderr().contains(&format!(
-            "Claude={}",
-            home_of(&state).join(".claude").display()
-        )),
-        "{}",
-        daemon.stderr()
-    );
+    let home = home_of(&state);
+    let mut expected = vec![
+        format!("Claude={}", home.join(".claude").display()),
+        format!("Codex={}", home.join(".codex").display()),
+        format!(
+            "OpenCode={}",
+            home.join(".local").join("share").join("opencode").display()
+        ),
+    ];
+    expected.sort();
+    assert_eq!(watched_homes(&daemon.stderr()), expected);
+}
+
+/// The homes the runner's log line names (`homes=[…]`, a list of quoted `Engine=path`).
+fn watched_homes(logs: &str) -> Vec<String> {
+    let line = logs
+        .lines()
+        .find(|l| l.contains("the runner watches these homes"))
+        .unwrap_or_else(|| panic!("no homes in the log:\n{logs}"));
+    let list = line
+        .split_once("homes=")
+        .and_then(|(_, rest)| rest.find(']').map(|end| &rest[..=end]))
+        .unwrap_or_else(|| panic!("no list of homes: {line}"));
+    // Rust's debug format of plain strings, which JSON reads the same way.
+    let mut homes: Vec<String> =
+        serde_json::from_str(list).unwrap_or_else(|e| panic!("{e}: {list}"));
+    homes.sort();
+    homes
 }
 
 /// `--no-runner`: no runner role, hooks are only logged, and no session has a terminal or a

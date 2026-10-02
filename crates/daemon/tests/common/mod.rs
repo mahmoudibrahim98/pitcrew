@@ -162,12 +162,11 @@ impl Daemon {
         for (name, value) in env {
             command.env(name, value);
         }
-        let mut child = command
+        command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn pitcrewd");
+            .stderr(Stdio::piped());
+        let mut child = spawn(&mut command).expect("spawn pitcrewd");
 
         let stderr = Arc::new(Mutex::new(String::new()));
         let mut err = child.stderr.take().expect("stderr");
@@ -440,16 +439,24 @@ pub fn home_of(state: &Path) -> PathBuf {
 
 /// **Never the real homes.** A daemon started without `--homes` (and without `--demo`) watches
 /// this user's agent homes, which hold the person's private transcripts. Every daemon a test
-/// starts therefore gets [`home_of`] as its home folder, and none of the variables that point
-/// the adapters elsewhere.
+/// starts therefore gets [`home_of`] as its home folder on every platform (`HOME`, and on Windows
+/// `USERPROFILE`, `APPDATA` and `LOCALAPPDATA` too), and none of the variables that point the
+/// adapters elsewhere (`pitcrew_fixtures::homes`). [`spawn`] checks it before every start.
 fn private_homes<'a>(command: &'a mut Command, state: &Path) -> &'a mut Command {
-    let home = home_of(state);
-    command
-        .env("HOME", &home)
-        .env("USERPROFILE", &home)
-        .env_remove("CLAUDE_CONFIG_DIR")
-        .env_remove("CODEX_HOME")
-        .env_remove("XDG_DATA_HOME")
+    pitcrew_fixtures::homes::private_home(command, &home_of(state))
+}
+
+/// Starts `command`, a `pitcrewd` of a test's, once [`pitcrew_fixtures::homes::check_private_home`]
+/// has found that it can reach no real home.
+pub fn spawn(command: &mut Command) -> io::Result<Child> {
+    pitcrew_fixtures::homes::check_private_home(command);
+    command.spawn()
+}
+
+/// As [`spawn`], waiting for it to end with its output.
+pub fn output(command: &mut Command) -> io::Result<std::process::Output> {
+    pitcrew_fixtures::homes::check_private_home(command);
+    command.output()
 }
 
 /// **Never a real tmux socket.** A test daemon's terminals' tmux socket:
@@ -479,10 +486,8 @@ pub fn run(args: &[&std::ffi::OsStr]) -> std::process::Output {
     let home = tempfile::tempdir().expect("a temporary home");
     let mut command = Command::new(PITCREWD);
     command.args(args);
-    private_homes(&mut command, &home.path().join("state"))
-        .stdin(Stdio::null())
-        .output()
-        .expect("run pitcrewd")
+    private_homes(&mut command, &home.path().join("state")).stdin(Stdio::null());
+    output(&mut command).expect("run pitcrewd")
 }
 
 // ─── HTTP ────────────────────────────────────────────────────────────────────────────────────────

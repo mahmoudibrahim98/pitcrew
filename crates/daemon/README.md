@@ -307,8 +307,9 @@ explicit:
   says `the runner watches no home (--demo without --homes)`;
 - otherwise this user's own, as each adapter finds them (`pitcrew_ingest::scan::default_homes`):
   `CLAUDE_CONFIG_DIR` or `~/.claude`, `CODEX_HOME` or `~/.codex`, and `$XDG_DATA_HOME/opencode` or
-  `~/.local/share/opencode` (on Windows too). The log lists them (`the runner watches these
-  homes`). A home that does not exist yet is picked up when it appears.
+  `~/.local/share/opencode` (on Windows too), where `~` is `USERPROFILE` on Windows (as the agents
+  themselves read it), else `HOME`. The log lists them (`the runner watches these homes`). A home
+  that does not exist yet is picked up when it appears.
 
 Tests never watch a real home (see "Tests").
 
@@ -613,10 +614,14 @@ event right after a write may see `@office`'s reminders instead, depending on ti
 ## Tests
 
 **No test watches a real agent home.** Every daemon the tests start (`tests/common`) gets a home
-folder of its own, `<state dir>-home` in the test's temporary folder, as `HOME` and `USERPROFILE`,
-with `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `XDG_DATA_HOME` removed: a start without `--demo` and
-without `--homes` watches that folder, never the machine's own. Transcripts come from
-`crates/fixtures`, under synthetic session ids.
+folder of its own, `<state dir>-home` in the test's temporary folder, on every platform
+(`pitcrew_fixtures::homes`): `HOME` and `USERPROFILE` are that folder and `APPDATA` and
+`LOCALAPPDATA` are in it (on Windows the agent homes come from `USERPROFILE`, and so does the
+default state directory), with `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_DATA_HOME`,
+`XDG_CONFIG_HOME`, `OPENCODE_CONFIG_DIR`, `HOMEDRIVE` and `HOMEPATH` removed. Every start checks
+that first (`check_private_home`), and `a_demo_watches_no_home_of_its_own` checks the outcome: with
+`--demo` no home is watched, and without it exactly the three homes in that folder. Transcripts
+come from `crates/fixtures`, under synthetic session ids.
 
 **No test touches a real tmux.** Every daemon the tests start gets `--tmux-socket` (`Tmux` in
 `tests/common`): by default a socket in a folder whose parent does not exist, which the runtime
