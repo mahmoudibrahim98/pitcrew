@@ -401,6 +401,112 @@ fn thirty_two_terminals_tailed_at_once_all_wait() {
     fx.finish();
 }
 
+/// A ptyd at another integrity level than its client serves nothing, whichever side checks.
+/// Windows starts a process at the lower of its parent's level and its file's, so a copy of
+/// ptyd whose file is labelled low runs at low integrity, below this test. Where files cannot
+/// be labelled, or labels do not lower programs (an application-control policy that runs
+/// approved programs elevated, say), the test says so and skips.
+#[test]
+fn a_ptyd_at_another_integrity_level_refuses_and_is_refused() {
+    use pitcrew_runtime::pty::proto::{self, Frame, Op, PROTOCOL, Reply, Request};
+    let fx = Fixture::new("levels");
+    let low = fx.dir.join("pitcrew-ptyd-low.exe");
+    std::fs::copy(common::ptyd(), &low).expect("copy ptyd");
+    let labelled = Command::new("icacls")
+        .arg(&low)
+        .args(["/setintegritylevel", "low"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !labelled {
+        eprintln!("skipped: icacls cannot label a copy of ptyd low here");
+        fx.finish();
+        return;
+    }
+    let mut ptyd = Command::new(&low)
+        .args([
+            "serve",
+            "--foreground",
+            "--idle-exit-ms",
+            "60000",
+            "--endpoint",
+        ])
+        .arg(&fx.options.endpoint)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("low ptyd");
+    fx.saw(Some(ptyd.id()));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    // A client that skips its own label check is refused by ptyd, after its hello.
+    let me = pitcrew_runtime::pty::windows::current_identity().expect("identity");
+    let reply = rt.block_on(async {
+        let deadline = Instant::now() + common::WAIT;
+        let mut pipe = loop {
+            match tokio::net::windows::named_pipe::ClientOptions::new()
+                .open(fx.options.endpoint.as_os_str())
+            {
+                Ok(pipe) => break pipe,
+                Err(e) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "the low ptyd never listened: {e}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
+        };
+        let level = pitcrew_runtime::pty::windows::label_integrity(&pipe).expect("label");
+        if level == Some(me.integrity) {
+            return None;
+        }
+        let hello = Request {
+            id: 1,
+            op: Op::Hello { protocol: PROTOCOL },
+        };
+        let frame = Frame::new(&hello, Vec::new()).expect("frame");
+        proto::write_frame(&mut pipe, &frame).await.expect("hello");
+        Some(proto::read_frame(&mut pipe).await)
+    });
+    let Some(reply) = reply else {
+        eprintln!(
+            "skipped: the labelled copy runs at this test's own level ({:#x}) here",
+            me.integrity
+        );
+        let _ = ptyd.kill();
+        let _ = ptyd.wait();
+        fx.finish();
+        return;
+    };
+    match reply {
+        Ok(Some(frame)) => {
+            let reply: Reply = serde_json::from_slice(&frame.header).expect("reply");
+            let why = reply
+                .err
+                .expect("a low ptyd served a medium client")
+                .message;
+            assert!(why.contains("integrity"), "{why}");
+        }
+        // Refused before the hello was read: refused all the same.
+        Ok(None) | Err(_) => {}
+    }
+    // And the runtime refuses its pipe, labelled low, before sending anything.
+    let client = fx.runtime();
+    match client.list() {
+        Err(RuntimeError::Unavailable(why)) => assert!(why.contains("integrity"), "{why}"),
+        other => panic!("the runtime used a low ptyd: {other:?}"),
+    }
+    drop(client);
+    let _ = ptyd.kill();
+    let _ = ptyd.wait();
+    fx.finish();
+}
+
 #[test]
 fn detection_reports_the_pty_runtime_or_why_not() {
     let fx = Fixture::new("detect");
