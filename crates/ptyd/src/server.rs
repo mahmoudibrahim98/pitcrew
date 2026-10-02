@@ -847,7 +847,7 @@ mod tests {
     fn the_listener_is_ours_local_and_at_our_level() {
         use super::*;
         use pitcrew_runtime::pty::windows::{
-            Identity, PipeSecurity, current_identity, dacl_sddl, label_integrity, owner_sid,
+            Ace, Dacl, Identity, PipeSecurity, current_identity, dacl, label_integrity, owner_sid,
         };
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -861,10 +861,13 @@ mod tests {
             let name = format!(r"\\.\pipe\{short}");
             let listener = Listener::bind(Path::new(&name)).expect("bind");
             let me = current_identity().expect("identity");
-            let dacl = dacl_sddl(&listener.next).expect("dacl");
-            assert!(dacl.starts_with("D:P"), "{dacl}");
-            assert_eq!(dacl.matches("(A;").count(), 1, "{dacl}");
-            assert!(dacl.contains(&me.user), "{dacl}");
+            assert_eq!(
+                dacl(&listener.next).expect("dacl"),
+                Dacl {
+                    protected: true,
+                    entries: vec![Ace::Allow(me.user.clone())],
+                }
+            );
             assert_eq!(owner_sid(&listener.next).expect("owner"), me.user);
             assert_eq!(
                 label_integrity(&listener.next).expect("label"),
