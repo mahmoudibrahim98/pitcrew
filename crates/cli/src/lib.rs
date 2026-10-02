@@ -222,6 +222,9 @@ enum HooksAction {
         /// Preview chaining a foreign Codex `notify` instead of reporting a conflict.
         #[arg(long)]
         chain: bool,
+        /// Claude Code hook form; auto requires Claude Code 2.1.139 or newer for exec.
+        #[arg(long, value_enum, default_value_t = install::HookForm::Auto)]
+        hook_form: install::HookForm,
     },
     /// Wire `pitcrew hook` into each agent CLI, after showing the diff and asking to confirm.
     Install {
@@ -234,6 +237,9 @@ enum HooksAction {
         /// conflict.
         #[arg(long)]
         chain: bool,
+        /// Claude Code hook form; auto falls back to shell if version detection fails.
+        #[arg(long, value_enum, default_value_t = install::HookForm::Auto)]
+        hook_form: install::HookForm,
     },
     /// Remove exactly what `install` wrote, after showing the diff and asking to confirm.
     Uninstall {

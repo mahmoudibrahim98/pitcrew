@@ -76,11 +76,36 @@ to `/v1/hooks/{engine}/{event}`.
 The hook **always exits 0 and prints nothing**, even if it panics, and gives up after 500 ms
 whatever the daemon does. Global flags before it (`pitcrew --json hook …`) keep it on this path. Set `PITCREW_HOOK_DEBUG=1` to see on stderr why an event was not delivered.
 
-`pitcrew hooks install` writes Claude Code's hooks as `<pitcrew> hook claude <Event>`. Claude Code
-runs that with a shell: `bash`, which on Windows is Git Bash, or PowerShell on a Windows machine
-without Git Bash. The path is quoted for POSIX `sh`, only if needed, and on Windows its `\` become
-`/` first, so a plain path (`C:/Users/sam/.local/bin/pitcrew.exe`) runs unquoted in both shells; a
-path with a blank is single-quoted, for Git Bash.
+`pitcrew hooks install --hook-form auto|exec|shell` defaults to `auto`. It probes
+`claude --version` on the installed CLI's PATH for at most 750 ms, and writes exec form only for
+Claude Code **2.1.139 or newer**. The official [2.1.139 changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md#21139)
+introduces the hook `args: string[]` field. Missing, old, failed, unreadable or timed-out probes
+use shell form and say so in the install output. `--hook-form exec` requires a successful version probe and
+refuses installation when compatibility cannot be verified; `--hook-form shell` forces the existing shell behavior.
+`hooks diff` accepts the same option and previews the chosen command and arguments.
+
+Exec form spawns the exact absolute path reported by the OS, without quoting or converting
+Windows separators (the real `pitcrew.exe`), and passes the argument array directly:
+
+```json
+{"type":"command","command":"/home/sam/Program Files/pitcrew","args":["hook","claude","Stop"],"timeout":5}
+```
+
+A filesystem path can legally contain `${...}`. Claude Code has its own placeholder expansion,
+independent of shell quoting; until a literal escape is documented, installation refuses paths
+containing `${` rather than risk substituting a different program. Move the executable to a
+literal path to install these hooks. Ordinary spaces, quotes and dollar signs are literal in
+exec form.
+
+Shell form writes `<pitcrew> hook claude <Event>`. Claude Code runs that with a shell: Bash
+(Git Bash on Windows), or PowerShell on Windows without Git Bash. Paths are quoted for POSIX
+`sh` when needed; on Windows, backslashes become `/`, so a plain path works unquoted in both
+shells, while a path with spaces uses Git Bash quoting.
+
+Reinstalling updates stale paths and migrates between forms without duplicates. It preserves
+user options such as timeout. Uninstall recognises both forms; extra arguments, another program,
+and shell commands merely mentioning pitcrew are left untouched. Codex and OpenCode installation
+is unchanged. The hook itself still exits 0 and prints nothing.
 
 Its wall time (release build, spawn to exit, 200 runs) is measured by:
 

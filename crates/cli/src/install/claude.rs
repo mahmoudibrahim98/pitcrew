@@ -27,6 +27,10 @@
 //! same thing to Claude Code either way, so nothing is actually lost, only the file's own
 //! formatting there.
 //!
+//! Exec hooks (Claude Code >=2.1.139) are ours only when `args` is exactly
+//! `["hook", "claude", "<Event>"]` and the unquoted command's file name is pitcrew(.exe).
+//! Installing converts between forms, keeps one owned hook, and preserves foreign hooks.
+//!
 //! Re-running `install` after the executable moved updates just the stale hooks' `command` text
 //! in place (`Status::Stale` until then); it never duplicates them.
 //!
@@ -35,7 +39,7 @@
 //! the file has one, is preserved.
 
 use super::jsontext::{self, Entry, Member};
-use super::{Change, Plan, Status, Target};
+use super::{Change, HookForm, Plan, Status, Target};
 use crate::config::Env;
 use crate::error::{Error, Result};
 use std::fmt::Write as _;
@@ -78,10 +82,27 @@ fn command(exe: &str, event: &str) -> String {
     format!("{} hook claude {event}", claude_quote_exe_path(exe))
 }
 
-fn matcher_object(exe: &str, event: &str) -> String {
+fn selected_command(exe: &str, event: &str, form: HookForm) -> String {
+    if form == HookForm::Exec {
+        exe.to_owned()
+    } else {
+        command(exe, event)
+    }
+}
+
+fn matcher_object(exe: &str, event: &str, form: HookForm) -> String {
+    let args = if form == HookForm::Exec {
+        format!(
+            r#", "args": ["hook", "claude", {}]"#,
+            jsontext::escape(event)
+        )
+    } else {
+        String::new()
+    };
     format!(
-        r#"{{"matcher": "", "hooks": [{{"type": "command", "command": {}, "timeout": 5}}]}}"#,
-        jsontext::escape(&command(exe, event))
+        r#"{{"matcher": "", "hooks": [{{"type": "command", "command": {}{}, "timeout": 5}}]}}"#,
+        jsontext::escape(&selected_command(exe, event, form)),
+        args
     )
 }
 
@@ -107,14 +128,14 @@ fn brackets(indent: &str, inner: &str) -> String {
 }
 
 /// A freshly formatted file, for when there is nothing to preserve.
-fn fresh_document(exe: &str) -> String {
+fn fresh_document(exe: &str, form: HookForm) -> String {
     let mut out = String::from("{\n  \"hooks\": {\n");
     for (i, event) in EVENTS.iter().enumerate() {
         let sep = if i + 1 == EVENTS.len() { "" } else { "," };
         let _ = write!(
             &mut out,
             "    \"{event}\": [\n      {}\n    ]{sep}\n",
-            matcher_object(exe, event)
+            matcher_object(exe, event, form)
         );
     }
     out.push_str("  }\n}\n");
@@ -128,6 +149,7 @@ struct Found {
     group_index: usize,
     hook_index: usize,
     command_value: Entry,
+    hook_value: Entry,
     /// Whether the enclosing group is *exactly* our shape — `matcher: ""`, and this is its only
     /// hook — so removing it can safely remove the whole group rather than just this one hook.
     exactly_ours: bool,
@@ -137,11 +159,19 @@ struct Found {
 /// is ever returned; there should only be one, since `install` never adds a second once one is
 /// found, and every caller here re-scans fresh after each edit.
 fn find_ours(bytes: &[u8], arr: &jsontext::Arr, event: &str) -> Option<Found> {
+    find_all_ours(bytes, arr, event).into_iter().next()
+}
+
+fn find_all_ours(bytes: &[u8], arr: &jsontext::Arr, event: &str) -> Vec<Found> {
+    let mut found = Vec::new();
     for (group_index, el) in arr.elements.iter().enumerate() {
         if bytes.get(el.value_start) != Some(&b'{') {
             continue; // not an object: not a matcher group we understand, so never ours
         }
         let group = jsontext::object(bytes, el.value_start);
+        if duplicate_key(&group.members).is_some() {
+            continue;
+        }
         let Some(hooks_member) = group.members.iter().find(|m| m.key == "hooks") else {
             continue;
         };
@@ -171,32 +201,62 @@ fn find_ours(bytes: &[u8], arr: &jsontext::Arr, event: &str) -> Option<Found> {
                 continue;
             }
             let (text, _) = jsontext::parse_string(bytes, cmd_member.entry.value_start);
-            if command_is_ours(&text, event) {
-                return Some(Found {
+            let hook: serde_json::Value =
+                match serde_json::from_slice(&bytes[hook_el.value_start..hook_el.value_end]) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+            if duplicate_key(&hook_obj.members).is_some() || hook["type"] != "command" {
+                continue;
+            }
+            let ours = match hook.get("args") {
+                Some(args) => {
+                    args == &serde_json::json!(["hook", "claude", event])
+                        && super::is_our_exe_name(text.rsplit(['/', '\\']).next().unwrap_or(""))
+                }
+                None => command_is_ours(&text, event),
+            };
+            if ours {
+                found.push(Found {
                     group_index,
                     hook_index,
                     command_value: cmd_member.entry,
-                    exactly_ours: matcher_is_empty_string && inner.elements.len() == 1,
+                    hook_value: *hook_el,
+                    exactly_ours: matcher_is_empty_string
+                        && inner.elements.len() == 1
+                        && group.members.len() == 2,
                 });
             }
         }
     }
-    None
+    found
 }
 
 fn command_matches_current(
     bytes: &[u8],
-    command_value_start: usize,
+    found: &Found,
     exe: &str,
     event: &str,
+    form: HookForm,
 ) -> bool {
-    jsontext::parse_string(bytes, command_value_start).0 == command(exe, event)
+    let hook: serde_json::Value = match serde_json::from_slice(
+        &bytes[found.hook_value.value_start..found.hook_value.value_end],
+    ) {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    hook["command"] == selected_command(exe, event, form)
+        && if form == HookForm::Exec {
+            hook["args"] == serde_json::json!(["hook", "claude", event])
+        } else {
+            hook.get("args").is_none()
+        }
 }
 
 /// Adds `event`'s matcher object to `doc` if it is not already there, re-scanning fresh (the
 /// document is small; this keeps every case, including ones nested two or three levels deep,
 /// correct without duplicating the splicing logic).
-fn insert_event(doc: &str, exe: &str, event: &str) -> String {
+fn insert_event(doc: &str, exe: &str, event: &str, form: HookForm) -> String {
     let bytes = doc.as_bytes();
     let root = jsontext::object(bytes, jsontext::skip_ws(bytes, 0));
     let Some(hooks_member) = root.members.iter().find(|m| m.key == "hooks") else {
@@ -212,7 +272,7 @@ fn insert_event(doc: &str, exe: &str, event: &str) -> String {
                 &child_indent,
                 &format!(
                     "\"{event}\": {}",
-                    brackets(&inner_indent, &matcher_object(exe, event))
+                    brackets(&inner_indent, &matcher_object(exe, event, form))
                 )
             )
         );
@@ -237,7 +297,7 @@ fn insert_event(doc: &str, exe: &str, event: &str) -> String {
                 .unwrap_or_else(|| format!("{hooks_indent}  "));
             let new_text = format!(
                 "\"{event}\": {}",
-                brackets(&child_indent, &matcher_object(exe, event))
+                brackets(&child_indent, &matcher_object(exe, event, form))
             );
             let entries: Vec<Entry> = hooks_obj.members.iter().map(|m| m.entry).collect();
             jsontext::append(
@@ -267,7 +327,7 @@ fn insert_event(doc: &str, exe: &str, event: &str) -> String {
                 doc,
                 &arr.elements,
                 arr.close,
-                &matcher_object(exe, event),
+                &matcher_object(exe, event, form),
                 &child_indent,
                 &event_indent,
             )
@@ -279,7 +339,7 @@ fn insert_event(doc: &str, exe: &str, event: &str) -> String {
 /// executable's path, re-scanning fresh (an earlier event's rewrite in this same call may have
 /// shifted later offsets). A no-op if the hook can no longer be found (should not happen: this is
 /// only ever called for an event `inspect` already classified as stale).
-fn update_stale_event(doc: &str, exe: &str, event: &str) -> String {
+fn update_stale_event(doc: &str, exe: &str, event: &str, form: HookForm) -> String {
     let bytes = doc.as_bytes();
     let root = jsontext::object(bytes, jsontext::skip_ws(bytes, 0));
     let Some(hooks_member) = root.members.iter().find(|m| m.key == "hooks") else {
@@ -299,13 +359,50 @@ fn update_stale_event(doc: &str, exe: &str, event: &str) -> String {
     let Some(found) = find_ours(bytes, &arr, event) else {
         return doc.to_owned();
     };
-    let new_value = jsontext::escape(&command(exe, event));
-    format!(
+    // Change only our command and args fields, retaining timeout and any user options.
+    let mut replacement = doc[found.hook_value.value_start..found.hook_value.value_end].to_owned();
+    let command_start = found.command_value.value_start - found.hook_value.value_start;
+    let command_end = found.command_value.value_end - found.hook_value.value_start;
+    replacement.replace_range(
+        command_start..command_end,
+        &jsontext::escape(&selected_command(exe, event, form)),
+    );
+    let parsed = jsontext::object(replacement.as_bytes(), 0);
+    let args = parsed.members.iter().find(|m| m.key == "args");
+    if form == HookForm::Exec {
+        let value = format!(r#"["hook", "claude", {}]"#, jsontext::escape(event));
+        if let Some(args) = args {
+            replacement.replace_range(args.entry.value_start..args.entry.value_end, &value);
+        } else {
+            let entries: Vec<_> = parsed.members.iter().map(|m| m.entry).collect();
+            replacement = jsontext::append(
+                &replacement,
+                &entries,
+                parsed.close,
+                &format!("\"args\": {value}"),
+                "  ",
+                "",
+            );
+        }
+    } else if let Some(index) = parsed.members.iter().position(|m| m.key == "args") {
+        let entries: Vec<_> = parsed.members.iter().map(|m| m.entry).collect();
+        replacement = jsontext::remove(&replacement, &entries, index);
+    }
+    let mut updated = format!(
         "{}{}{}",
-        &doc[..found.command_value.value_start],
-        new_value,
-        &doc[found.command_value.value_end..]
-    )
+        &doc[..found.hook_value.value_start],
+        replacement,
+        &doc[found.hook_value.value_end..]
+    );
+    // Keep one owned hook even if an old settings file contains both forms.
+    loop {
+        let (next, removed) = remove_nth_event(&updated, event, 1);
+        if !removed {
+            break;
+        }
+        updated = next;
+    }
+    updated
 }
 
 fn duplicate_key(members: &[Member]) -> Option<&str> {
@@ -368,7 +465,7 @@ enum EventState {
 
 /// Checks the existing structure without changing anything: which events already have one of our
 /// hooks, and whether it names the current executable or an old path.
-fn inspect(doc: &str, exe: &str) -> Result<Vec<EventState>> {
+fn inspect(doc: &str, exe: &str, form: HookForm) -> Result<Vec<EventState>> {
     let bytes = doc.as_bytes();
     let Some(hooks_obj) = parse_checked(doc)? else {
         return Ok(EVENTS.iter().map(|_| EventState::Missing).collect());
@@ -383,7 +480,8 @@ fn inspect(doc: &str, exe: &str) -> Result<Vec<EventState>> {
         states.push(match find_ours(bytes, &arr, event) {
             None => EventState::Missing,
             Some(found)
-                if command_matches_current(bytes, found.command_value.value_start, exe, event) =>
+                if command_matches_current(bytes, &found, exe, event, form)
+                    && find_all_ours(bytes, &arr, event).len() == 1 =>
             {
                 EventState::Fresh
             }
@@ -413,7 +511,26 @@ fn conflicting(detail: String) -> Plan {
     }
 }
 
-pub(crate) fn plan_install(env: Env<'_>, exe: &str) -> Result<Plan> {
+#[cfg(test)]
+fn plan_install(env: Env<'_>, exe: &str) -> Result<Plan> {
+    plan_install_with_form(env, exe, HookForm::Shell)
+}
+
+pub(crate) fn plan_install_with_form(env: Env<'_>, exe: &str, requested: HookForm) -> Result<Plan> {
+    // Claude interpolates its own placeholders before execution, independently of a shell.
+    // Without a documented literal escape, refusing is safer than installing a different path.
+    if exe.contains("${") {
+        return Err(Error::invalid(
+            "pitcrew's path contains a Claude placeholder opener (${); install it at a literal path before wiring Claude hooks",
+        ));
+    }
+    let (form, reason) = super::hook_form::select(requested, env)?;
+    let mut plan = plan_for_form(env, exe, form)?;
+    plan.detail = format!("{}; {reason}", plan.detail);
+    Ok(plan)
+}
+
+fn plan_for_form(env: Env<'_>, exe: &str, form: HookForm) -> Result<Plan> {
     let path = path(env)?;
     let (before, original, had_bom) = read_text(&path)?;
 
@@ -425,7 +542,7 @@ pub(crate) fn plan_install(env: Env<'_>, exe: &str) -> Result<Plan> {
             changes: vec![Change {
                 path,
                 before,
-                after: super::with_bom(had_bom, fresh_document(exe)).into_bytes(),
+                after: super::with_bom(had_bom, fresh_document(exe, form)).into_bytes(),
                 delete: false,
                 executable: false,
             }],
@@ -448,7 +565,7 @@ pub(crate) fn plan_install(env: Env<'_>, exe: &str) -> Result<Plan> {
         }
     }
 
-    let states = match inspect(&original, exe) {
+    let states = match inspect(&original, exe, form) {
         Ok(v) => v,
         Err(e) => return Ok(conflicting(format!("{}: {}", path.display(), e.message))),
     };
@@ -479,10 +596,10 @@ pub(crate) fn plan_install(env: Env<'_>, exe: &str) -> Result<Plan> {
 
     let mut doc = original.clone();
     for event in missing.iter().copied() {
-        doc = insert_event(&doc, exe, event);
+        doc = insert_event(&doc, exe, event, form);
     }
     for event in stale.iter().copied() {
-        doc = update_stale_event(&doc, exe, event);
+        doc = update_stale_event(&doc, exe, event, form);
     }
 
     let status = if missing.len() == EVENTS.len() {
@@ -502,7 +619,7 @@ pub(crate) fn plan_install(env: Env<'_>, exe: &str) -> Result<Plan> {
     }
     if !stale.is_empty() {
         parts.push(format!(
-            "{} stale (an old executable path): {}",
+            "{} stale (an old executable path, hook form, or duplicate): {}",
             stale.len(),
             stale.join(", ")
         ));
@@ -528,6 +645,10 @@ pub(crate) fn plan_install(env: Env<'_>, exe: &str) -> Result<Plan> {
 /// itself, untouched. The event's whole key is then removed too if that leaves its array empty
 /// (`remove_event_key_if_empty`). Returns whether anything changed.
 fn remove_event(doc: &str, event: &str) -> (String, bool) {
+    remove_nth_event(doc, event, 0)
+}
+
+fn remove_nth_event(doc: &str, event: &str, which: usize) -> (String, bool) {
     let bytes = doc.as_bytes();
     let root = jsontext::object(bytes, jsontext::skip_ws(bytes, 0));
     let Some(hooks_member) = root.members.iter().find(|m| m.key == "hooks") else {
@@ -544,7 +665,7 @@ fn remove_event(doc: &str, event: &str) -> (String, bool) {
         return (doc.to_owned(), false);
     }
     let arr = jsontext::array(bytes, event_member.entry.value_start);
-    let Some(found) = find_ours(bytes, &arr, event) else {
+    let Some(found) = find_all_ours(bytes, &arr, event).into_iter().nth(which) else {
         return (doc.to_owned(), false);
     };
 
@@ -710,6 +831,109 @@ mod tests {
                 std::fs::write(&c.path, &c.after).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn exec_hooks_migrate_both_ways_without_losing_user_options() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = env_of(&[("CLAUDE_CONFIG_DIR", tmp.path().to_str().unwrap())]);
+        let path = path(&env).unwrap();
+        apply(&plan_install(&env, EXE).unwrap());
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        saved["hooks"]["Stop"][0]["hooks"][0]["timeout"] = serde_json::json!(17);
+        saved["hooks"]["Stop"][0]["hooks"][0]["async"] = serde_json::json!(true);
+        std::fs::write(&path, saved.to_string()).unwrap();
+        let new_exe = "/home/sam/Program Files/pitcrew";
+        let exec = plan_for_form(&env, new_exe, HookForm::Exec).unwrap();
+        apply(&exec);
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for event in EVENTS {
+            let hook = &saved["hooks"][event][0]["hooks"][0];
+            assert_eq!(hook["command"], new_exe);
+            assert_eq!(hook["args"], serde_json::json!(["hook", "claude", event]));
+        }
+        assert_eq!(saved["hooks"]["Stop"][0]["hooks"][0]["timeout"], 17);
+        assert_eq!(saved["hooks"]["Stop"][0]["hooks"][0]["async"], true);
+        assert!(
+            plan_for_form(&env, new_exe, HookForm::Exec)
+                .unwrap()
+                .changes
+                .is_empty()
+        );
+        apply(&plan_for_form(&env, new_exe, HookForm::Shell).unwrap());
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["hooks"]["Stop"][0]["hooks"][0]["command"],
+            command(new_exe, "Stop")
+        );
+        assert!(saved["hooks"]["Stop"][0]["hooks"][0].get("args").is_none());
+        apply(&plan_uninstall(&env).unwrap());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap()).unwrap(),
+            serde_json::json!({})
+        );
+    }
+
+    #[test]
+    fn mixed_owned_forms_are_consolidated_and_foreign_exec_hooks_are_preserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = env_of(&[("CLAUDE_CONFIG_DIR", tmp.path().to_str().unwrap())]);
+        let path = path(&env).unwrap();
+        let foreign = serde_json::json!([
+            {"type":"command", "command":"/home/sam/bin/pitcrew", "args":["hook", "claude", "Stop", "extra"]},
+            {"type":"command", "command":"/home/sam/bin/not-pitcrew", "args":["hook", "claude", "Stop"]},
+            {"type":"command", "command":"echo hi; pitcrew hook claude Stop"},
+            {"type":"command", "command":"pitcrew hook claude Stop", "args":[]}
+        ]);
+        let mut hooks = vec![
+            serde_json::json!({"type":"command", "command":command(EXE,"Stop")}),
+            serde_json::json!({"type":"command", "command":EXE, "args":["hook","claude","Stop"]}),
+        ];
+        hooks.extend(foreign.as_array().unwrap().iter().cloned());
+        std::fs::write(
+            &path,
+            serde_json::json!({"hooks":{"Stop":[{"matcher":"", "hooks":hooks}]}}).to_string(),
+        )
+        .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        apply(&plan_for_form(&env, EXE, HookForm::Exec).unwrap());
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["hooks"]["Stop"][0]["hooks"].as_array().unwrap().len(),
+            5
+        );
+        assert!(
+            plan_for_form(&env, EXE, HookForm::Exec)
+                .unwrap()
+                .changes
+                .is_empty()
+        );
+        apply(&plan_uninstall(&env).unwrap());
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["hooks"]["Stop"][0]["hooks"], foreign);
+        std::fs::write(&path, original).unwrap();
+        apply(&plan_uninstall(&env).unwrap());
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["hooks"]["Stop"][0]["hooks"], foreign);
+    }
+
+    #[test]
+    fn a_path_that_could_be_interpolated_is_refused_without_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = env_of(&[("CLAUDE_CONFIG_DIR", tmp.path().to_str().unwrap())]);
+        for form in [HookForm::Exec, HookForm::Shell] {
+            assert!(
+                plan_install_with_form(&env, "/home/sam/${CLAUDE_PLUGIN_ROOT}/pitcrew", form)
+                    .is_err()
+            );
+        }
+        assert!(!path(&env).unwrap().exists());
     }
 
     #[test]
