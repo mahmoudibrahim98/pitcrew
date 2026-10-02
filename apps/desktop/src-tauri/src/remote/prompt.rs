@@ -7,6 +7,10 @@
 //! when it was answered, and when it went stale first (ssh stopped waiting, or the call ended),
 //! so the dialog closes.
 //!
+//! - **Kinds say who asks.** `passphrase`, `host_key` and `confirm` are only ssh's own local
+//!   questions. Text the server wrote (keyboard-interactive, marked by OpenSSH with a leading
+//!   `(user@host)`) is always `password` or `otp`, whatever its words say, so a server cannot
+//!   pass for this computer asking for a key's passphrase.
 //! - **Kinds and replies.** `password`, `passphrase` and `otp` take `answer`; `host_key` (with
 //!   its `fingerprint`) and `confirm` (ssh's other yes/no questions, such as
 //!   `UpdateHostKeys=ask`'s "Accept updated hostkeys?") take `accept`; a `notice` ("touch your
@@ -263,12 +267,13 @@ impl PromptHandler for PromptHub {
     fn prompt(&self, request: PromptRequest, cancel: PromptCancel) -> PromptFuture<'_> {
         Box::pin(async move {
             let id = crate::remote::new_id();
+            let kind = kind_of(&request);
             let prompt = GatewayPrompt {
                 id: id.clone(),
                 host: request.host.clone(),
-                kind: request.kind.into(),
+                kind,
                 text: clean_text(&request.prompt),
-                fingerprint: (request.kind == PromptKind::HostKey)
+                fingerprint: (kind == PromptKindName::HostKey)
                     .then(|| fingerprint(&request.prompt))
                     .flatten(),
             };
@@ -289,6 +294,21 @@ impl PromptHandler for PromptHub {
                 () = cancel.cancelled() => Reply::Cancel,
             }
         })
+    }
+}
+
+/// The kind the UI is told: who asks, never guessed from the words alone. Text the server wrote
+/// (keyboard-interactive, which OpenSSH 8.4 and newer, the version prompts need, starts with
+/// `(user@host)`) is a `password` or an `otp`, whatever it says: never a `passphrase`, a
+/// `host_key` or a yes/no question, which only ssh's own local questions are. The bridge's
+/// classification already follows this rule; this holds it here too.
+fn kind_of(request: &PromptRequest) -> PromptKindName {
+    let kind = PromptKindName::from(request.kind);
+    let from_server = request.prompt.starts_with('(');
+    if from_server && !matches!(kind, PromptKindName::Password | PromptKindName::Otp) {
+        PromptKindName::Password
+    } else {
+        kind
     }
 }
 
@@ -575,6 +595,74 @@ mod tests {
                 _ => assert!(matches!(reply, Reply::Cancel)),
             }
         }
+    }
+
+    /// A hostile server's keyboard-interactive text that reads like this computer asking for a
+    /// key's passphrase (OpenSSH puts the `(user@host)` mark in front).
+    const HOSTILE: &str = "(sam@hpc-login) Enter passphrase for key '~/.ssh/id_ed25519':";
+
+    #[test]
+    fn server_text_is_a_password_or_a_code_whatever_it_says() {
+        // The bridge already says so.
+        assert_eq!(
+            pitcrew_remote::askpass::classify(HOSTILE, None),
+            PromptKind::Password
+        );
+        // And so does the hub, whatever the bridge says: server text is never a passphrase, a
+        // host key or a yes/no question.
+        for kind in [
+            PromptKind::Passphrase,
+            PromptKind::HostKey,
+            PromptKind::Confirm,
+            PromptKind::Notice,
+            PromptKind::Password,
+        ] {
+            assert_eq!(
+                kind_of(&request(kind, HOSTILE)),
+                PromptKindName::Password,
+                "{kind:?}"
+            );
+        }
+        let code = "(sam@hpc-login) Verification code:";
+        assert_eq!(
+            kind_of(&request(PromptKind::Otp, code)),
+            PromptKindName::Otp
+        );
+        // ssh's own questions keep their kind.
+        let own = "Enter passphrase for key '/home/sam/.ssh/id_ed25519': ";
+        assert_eq!(
+            kind_of(&request(PromptKind::Passphrase, own)),
+            PromptKindName::Passphrase
+        );
+        assert_eq!(
+            kind_of(&request(
+                PromptKind::HostKey,
+                "Are you sure you want to continue connecting (yes/no/[fingerprint])? "
+            )),
+            PromptKindName::HostKey
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hostile_passphrase_question_is_asked_as_a_password() {
+        let (hub, events) = hub();
+        let (_trigger, cancel) = PromptCancel::pair();
+        let asking = tokio::spawn({
+            let hub = Arc::clone(&hub);
+            async move {
+                hub.prompt(request(PromptKind::Passphrase, HOSTILE), cancel)
+                    .await
+            }
+        });
+        let prompt = opened(&events, 0).await;
+        assert_eq!(
+            serde_json::to_value(&prompt).unwrap(),
+            serde_json::json!({
+                "id": prompt.id, "host": "hpc-login", "kind": "password", "text": HOSTILE
+            })
+        );
+        hub.reply(&prompt.id, None, None).unwrap();
+        assert!(matches!(asking.await.unwrap(), Reply::Cancel));
     }
 
     #[test]

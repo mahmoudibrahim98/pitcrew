@@ -1017,6 +1017,21 @@ mod unix {
         for prompt in &prompts {
             assert!(closed.contains(&json!({ "id": prompt["id"] })), "{prompt}");
         }
+
+        // The server asks, with words that read like this computer asking for a key's
+        // passphrase: it is a password prompt all the same (the answer goes to that host).
+        let hostile = "Enter passphrase for key '~/.ssh/id_ed25519':";
+        w.machine.keyboard_interactive(Some(hostile));
+        let before = w.events(PROMPT_EVENT).len();
+        w.call("gateway_remote_probe", json!({ "host": HOST }))
+            .unwrap();
+        let asked = w.events(PROMPT_EVENT)[before].clone();
+        assert_eq!(asked["kind"], "password", "{asked}");
+        assert_eq!(asked["host"], HOST);
+        assert_eq!(asked["text"], format!("(sam@{HOST}) {hostile}"));
+        assert!(asked.get("fingerprint").is_none(), "{asked}");
+        w.machine.keyboard_interactive(None);
+
         // A reply for no open prompt, and malformed replies, are refused.
         let e = w
             .call(

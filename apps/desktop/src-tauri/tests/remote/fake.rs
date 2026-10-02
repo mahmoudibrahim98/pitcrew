@@ -223,9 +223,14 @@ fn sign_in(machine: &Path, call: &Call) -> bool {
         std::fs::write(machine.join("known"), "").unwrap_or_default();
     }
     if let Ok(expected) = std::fs::read_to_string(machine.join("password")) {
+        // Asked by the server (keyboard-interactive, marked as OpenSSH marks it), or by ssh.
+        let question = match std::fs::read_to_string(machine.join("kbdint")) {
+            Ok(text) => format!("(sam@{HOST}) {text}"),
+            Err(_) => format!("sam@{HOST}'s password: "),
+        };
         if !batch {
             for _ in 0..3 {
-                let answer = ask(&format!("sam@{HOST}'s password: ")).unwrap_or_default();
+                let answer = ask(&question).unwrap_or_default();
                 append(&asked, if answer.is_empty() { "empty" } else { "text" });
                 if answer == expected.trim_end() {
                     return true;
@@ -582,6 +587,17 @@ impl Machine {
     /// From now on logins ask for `password`.
     pub fn require_password(&self, password: &str) {
         std::fs::write(self.dir.join("password"), password).unwrap();
+    }
+
+    /// From now on the password is asked by the server (keyboard-interactive) with `text`, or,
+    /// with `None`, by ssh again.
+    pub fn keyboard_interactive(&self, text: Option<&str>) {
+        match text {
+            Some(text) => std::fs::write(self.dir.join("kbdint"), text).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(self.dir.join("kbdint"));
+            }
+        }
     }
 
     /// From now on every command prints a login banner (and a false marker) first.
