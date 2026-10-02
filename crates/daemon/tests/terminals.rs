@@ -198,7 +198,8 @@ fn without_tmux_the_daemon_serves_with_no_terminal_runtime() {
     let at = send_to(&json!({ "text": "a".repeat(64 * 1024) }));
     assert_eq!(at.status, 409, "{}", at.body);
 
-    // Folders: relative, missing, a file, or under one others can change are refused.
+    // Folders: relative, missing, or under one every user can write to are refused; under a
+    // group-writable one, the start goes on (here to the missing runtime), and says so.
     invalid(start(&start_in("work")), "a relative cwd");
     let missing = tmp.path().join("none").join("..").join("work");
     invalid(start(&start_in(missing.to_str().unwrap())), "a missing cwd");
@@ -210,11 +211,26 @@ fn without_tmux_the_daemon_serves_with_no_terminal_runtime() {
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
         let open = start(&start_in(shared.join("w").to_str().unwrap()));
         assert_eq!(open.status, 400, "{}", open.body);
+        assert!(open.body.contains("changed by every user"), "{}", open.body);
+        let team = tmp.path().join("team");
+        std::fs::create_dir_all(team.join("w")).unwrap();
+        std::fs::set_permissions(&team, std::fs::Permissions::from_mode(0o775)).unwrap();
+        let shared_by_group = start(&start_in(team.join("w").to_str().unwrap()));
+        assert_eq!(shared_by_group.status, 503, "{}", shared_by_group.body);
         assert!(
-            open.body.contains("changed by other users"),
+            shared_by_group.body.contains("no terminal runtime"),
             "{}",
-            open.body
+            shared_by_group.body
         );
+        let team = std::fs::canonicalize(&team).unwrap();
+        daemon.wait_for_log("members of its group can change", WAIT);
+        let logged = daemon.stderr();
+        let line = logged
+            .lines()
+            .find(|l| l.contains("members of its group can change"))
+            .unwrap();
+        assert!(line.contains("INFO"), "{line}");
+        assert!(line.contains(team.to_str().unwrap()), "{line}");
     }
 
     // Who may: a session run by another person's agent is refused, whatever the command, before
@@ -379,9 +395,14 @@ done
         Ok(tmux)
     }
 
+    /// The tmux tests run one at a time, as the runtime's own do: several daemons, each with
+    /// tmux servers, at once on a loaded machine is where tmux was seen to drop a client before
+    /// its first answer.
+    static SERIAL: Mutex<()> = Mutex::new(());
+
     /// One test's setup: homes, a working folder, the stand-in `claude`, and a private tmux
     /// socket. Dropped, it kills every tmux server it knows of and anything still carrying its
-    /// mark.
+    /// mark (while it still holds [`SERIAL`]).
     struct Rig {
         tmp: tempfile::TempDir,
         homes: PathBuf,
@@ -392,12 +413,16 @@ done
         mark: String,
         /// Every socket a server may run on, killed at the end.
         sockets: Mutex<Vec<PathBuf>>,
+        _serial: std::sync::MutexGuard<'static, ()>,
     }
 
     impl Rig {
         /// `None`, after saying why, where tmux 3.2 or newer is not installed; a failure instead
         /// when `PITCREW_REQUIRE_TMUX=1`.
         fn new() -> Option<Self> {
+            let serial = SERIAL
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let tmp = tempfile::tempdir().unwrap();
             // Short, for the socket path limit; its directory is made private by the daemon.
             let socket = tmp.path().join("t").join("s");
@@ -448,6 +473,7 @@ done
                 tmux,
                 mark: format!("terminals-{}-{nanos}", std::process::id()),
                 tmp,
+                _serial: serial,
             })
         }
 
@@ -933,6 +959,31 @@ done
         second.until("the exit", |t| t.texts.iter().any(|v| v["type"] == "exit"));
         eventually("the second session ends", || {
             session(&daemon, &device, &b_id)["state"] == "ended"
+        });
+
+        // A third, in a folder under a group-writable one (a shared project): it starts, and the
+        // log names that folder at info. Killed at once.
+        let team = rig.root().join("team");
+        std::fs::create_dir_all(team.join("work")).unwrap();
+        std::fs::set_permissions(&team, std::fs::Permissions::from_mode(0o2775)).unwrap();
+        let c = start_claude(&daemon, team.join("work").to_str().unwrap(), &device);
+        let c_id = c["id"].as_str().unwrap().to_owned();
+        let logs = daemon.stderr();
+        let line = logs
+            .lines()
+            .find(|l| l.contains("members of its group can change"))
+            .unwrap_or_else(|| panic!("no group-writable folder in the log:\n{logs}"));
+        let team = std::fs::canonicalize(&team).unwrap();
+        assert!(line.contains("INFO"), "{line}");
+        assert!(line.contains(team.to_str().unwrap()), "{line}");
+        post(
+            &daemon,
+            &format!("/v1/sessions/{c_id}/end"),
+            &device,
+            &json!({ "mode": "kill" }),
+        );
+        eventually("the third session ends", || {
+            session(&daemon, &device, &c_id)["state"] == "ended"
         });
 
         // `end` with `kill` ends the first: its stream says so and closes, and so does tmux.

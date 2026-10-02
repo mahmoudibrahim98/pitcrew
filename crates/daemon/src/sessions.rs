@@ -24,9 +24,10 @@
 //!   another).
 //! - `cwd` ([`checked_cwd`]): absolute, at most [`MAX_CWD`] bytes, an existing folder, resolved
 //!   once here (links and `..`) and passed on resolved. On Unix it and every folder above it must
-//!   belong to root or this user, and none may be writable by others (group or world), except
-//!   that a folder above it may be if it is sticky (as `/tmp`): another user who can write there
-//!   could plant files the CLI reads as its project's (settings, hooks), or swap the folder.
+//!   belong to root or this user, and none may be writable by every user (o+w), except that a
+//!   folder above it may be if it is sticky (as `/tmp`): anyone who can write there could plant
+//!   files the CLI reads as its project's (settings, hooks), or swap the folder. Group-writable
+//!   folders (a shared project) are allowed, and a start in one is logged at info, naming them.
 //!
 //! **Who may.** A person (device token) may command only a session with no agent, or one whose
 //! agent they own: the runner's rule for hooks ([`may_command`], over the hub's sessions and
@@ -434,16 +435,23 @@ async fn start(
         )));
     }
     let given = start.cwd;
-    let cwd = bounded(move || checked_cwd(&given))
+    let folder = bounded(move || checked_cwd(&given))
         .await?
         .map_err(invalid)?;
-    let name = window_name(start.engine, &cwd);
+    if !folder.group_writable.is_empty() {
+        tracing::info!(
+            cwd = %folder.path,
+            group_writable = ?folder.group_writable,
+            "a session starts in a folder that members of its group can change"
+        );
+    }
+    let name = window_name(start.engine, &folder.path);
     let done = sessions
         .run(
             &runner,
             RunnerCommand::StartSession {
                 engine: start.engine,
-                cwd,
+                cwd: folder.path,
                 name,
                 brief: start.brief,
                 persona: start.persona,
@@ -488,10 +496,20 @@ async fn start(
     }
 }
 
-/// `cwd` resolved (links and `..`), if it is a folder PitCrew may start a CLI in: absolute,
-/// existing, and on Unix, it and every folder above it belong to root or this user, and none can
-/// be changed by other users except a sticky folder above it. Otherwise why not. Blocking.
-fn checked_cwd(cwd: &str) -> Result<String, String> {
+/// A folder a CLI may start in ([`checked_cwd`]).
+#[derive(Debug, PartialEq, Eq)]
+struct Folder {
+    /// Resolved: links and `..` followed.
+    path: String,
+    /// It, or folders above it, that members of their group can change (logged at info).
+    group_writable: Vec<String>,
+}
+
+/// `cwd` resolved (links and `..`), if it is a folder PitCrew may start a CLI in: absolute and
+/// existing; on Unix, it and every folder above it belong to root or this user, and none is
+/// writable by every user (o+w) except a sticky folder above it. Group-writable folders pass, and
+/// are named so the start can say so. Otherwise why not. Blocking.
+fn checked_cwd(cwd: &str) -> Result<Folder, String> {
     let given = std::path::Path::new(cwd);
     if !given.is_absolute() {
         return Err("cwd must be an absolute folder.".to_owned());
@@ -505,6 +523,7 @@ fn checked_cwd(cwd: &str) -> Result<String, String> {
             return Err(format!("cwd {} is not a folder.", real.display()));
         }
         let me = pitcrew_auth::euid();
+        let mut group_writable = Vec::new();
         for (i, folder) in real.ancestors().enumerate() {
             let meta = std::fs::metadata(folder)
                 .map_err(|e| format!("cannot inspect {}: {e}.", folder.display()))?;
@@ -516,28 +535,38 @@ fn checked_cwd(cwd: &str) -> Result<String, String> {
                 ));
             }
             let mode = meta.mode();
-            let open = mode & 0o022 != 0;
-            let sticky = mode & 0o1000 != 0;
-            // The folder itself must be closed; one above it may be open if it is sticky.
-            if open && (i == 0 || !sticky) {
+            // A sticky folder above it (as /tmp) lets no one replace what is under it.
+            let sticky_above = i > 0 && mode & 0o1000 != 0;
+            if mode & 0o002 != 0 && !sticky_above {
                 return Err(format!(
-                    "{} can be changed by other users (mode {:03o}), so a session may not start \
+                    "{} can be changed by every user (mode {:03o}), so a session may not start \
                      under it.",
                     folder.display(),
                     mode & 0o7777
                 ));
             }
+            if mode & 0o020 != 0 && !sticky_above {
+                group_writable.push(folder.display().to_string());
+            }
         }
-        real.into_os_string()
+        let path = real
+            .into_os_string()
             .into_string()
-            .map_err(|_| "cwd must be UTF-8.".to_owned())
+            .map_err(|_| "cwd must be UTF-8.".to_owned())?;
+        Ok(Folder {
+            path,
+            group_writable,
+        })
     }
     #[cfg(not(unix))]
     {
         if !given.is_dir() {
             return Err(format!("cwd {cwd} is not a folder."));
         }
-        Ok(cwd.to_owned())
+        Ok(Folder {
+            path: cwd.to_owned(),
+            group_writable: Vec::new(),
+        })
     }
 }
 
@@ -805,46 +834,67 @@ mod tests {
         assert!(!may_command(agent(writer, sam), SessionAgent::Unknown));
     }
 
-    /// A folder is resolved, `..` and links included; one under a folder others can change is
-    /// refused, unless that folder is sticky and above it; so is one others can change itself.
+    /// A folder is resolved, `..` and links included. One under a folder every user can write
+    /// to is refused, unless that folder is sticky and above it; so is one every user can write
+    /// to itself. Group-writable folders, itself or above it, pass and are named.
     #[cfg(unix)]
     #[test]
-    fn folders_are_resolved_and_must_be_closed() {
+    fn folders_are_resolved_and_must_be_closed_to_everyone() {
         use std::os::unix::fs::PermissionsExt as _;
         let tmp = tempfile::tempdir().unwrap();
         let real = std::fs::canonicalize(tmp.path()).unwrap();
         let work = real.join("work");
         std::fs::create_dir_all(work.join("sub")).unwrap();
+        let path = |cwd: &str| checked_cwd(cwd).map(|f| f.path);
         let dotted = format!("{}/work/sub/..", real.display());
-        assert_eq!(checked_cwd(&dotted).unwrap(), work.to_str().unwrap());
+        assert_eq!(path(&dotted).unwrap(), work.to_str().unwrap());
         let link = real.join("link");
         std::os::unix::fs::symlink(&work, &link).unwrap();
         assert_eq!(
-            checked_cwd(link.to_str().unwrap()).unwrap(),
+            path(link.to_str().unwrap()).unwrap(),
             work.to_str().unwrap()
         );
-        assert!(checked_cwd("work").is_err(), "relative");
-        assert!(checked_cwd(real.join("none").to_str().unwrap()).is_err());
+        assert!(
+            checked_cwd(work.to_str().unwrap())
+                .unwrap()
+                .group_writable
+                .is_empty()
+        );
+        assert!(path("work").is_err(), "relative");
+        assert!(path(real.join("none").to_str().unwrap()).is_err());
         std::fs::write(real.join("file"), "x").unwrap();
-        assert!(checked_cwd(real.join("file").to_str().unwrap()).is_err());
+        assert!(path(real.join("file").to_str().unwrap()).is_err());
 
-        // Under a folder anyone can write to.
+        // Under a folder every user can write to.
         let shared = real.join("shared");
         std::fs::create_dir_all(shared.join("w")).unwrap();
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
-        let why = checked_cwd(shared.join("w").to_str().unwrap()).unwrap_err();
-        assert!(why.contains("changed by other users"), "{why}");
+        let why = path(shared.join("w").to_str().unwrap()).unwrap_err();
+        assert!(why.contains("changed by every user"), "{why}");
         // Sticky, as /tmp: fine above, not as the folder itself.
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
-        assert!(checked_cwd(shared.join("w").to_str().unwrap()).is_ok());
-        assert!(checked_cwd(shared.to_str().unwrap()).is_err());
-        // Group-writable itself.
+        let under = checked_cwd(shared.join("w").to_str().unwrap()).unwrap();
+        assert!(under.group_writable.is_empty(), "{under:?}");
+        assert!(path(shared.to_str().unwrap()).is_err());
+        // Writable by every user itself.
+        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o757)).unwrap();
+        assert!(path(work.to_str().unwrap()).is_err());
+
+        // Group-writable, itself or above it: allowed, and named.
         std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o775)).unwrap();
-        assert!(checked_cwd(work.to_str().unwrap()).is_err());
+        let itself = checked_cwd(work.to_str().unwrap()).unwrap();
+        assert_eq!(itself.group_writable, [work.to_str().unwrap()]);
+        let team = real.join("team");
+        std::fs::create_dir_all(team.join("w")).unwrap();
+        std::fs::set_permissions(&team, std::fs::Permissions::from_mode(0o2775)).unwrap();
+        let below = checked_cwd(team.join("w").to_str().unwrap()).unwrap();
+        assert_eq!(below.path, team.join("w").to_str().unwrap());
+        assert_eq!(below.group_writable, [team.to_str().unwrap()]);
         std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o755)).unwrap();
         // `..` out of a refused folder resolves to where it leads, which is checked instead.
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
         let out = format!("{}/shared/w/../../work", real.display());
-        assert_eq!(checked_cwd(&out).unwrap(), work.to_str().unwrap());
+        assert_eq!(path(&out).unwrap(), work.to_str().unwrap());
     }
 
     fn session(machine: MachineId, state: SessionState, agent: Option<MemberId>) -> Session {
