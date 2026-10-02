@@ -5,7 +5,7 @@
 use crate::slurm::{self as fake_slurm, Config};
 use crate::tunnel_fake::{
     APP_ENV, ASKED, AppSpec, CLOSE_WRITE, DROP_AFTER, FORWARD_FAIL_ONCE, FORWARD_SILENT,
-    MAX_SESSIONS, NET, NO_FORWARDING, Net, PASSWORD, REFUSED, TUNNEL_LOG, TunnelCall,
+    HOLD_CHECKS, MAX_SESSIONS, NET, NO_FORWARDING, Net, PASSWORD, REFUSED, TUNNEL_LOG, TunnelCall,
 };
 use crate::unix::{
     Machine, RUN_ENV, Remote, alive, daemon, deploy_and_start, launch_options, me, mode,
@@ -186,12 +186,19 @@ fn open_when_free(
     }
 }
 
-/// The tunnel calls the machine's fake ssh saw.
+/// The tunnel calls the machine's fake ssh saw. A last line without its newline is still being
+/// written, and is left for the next look.
 fn tunnel_calls(m: &Machine) -> Vec<TunnelCall> {
-    std::fs::read_to_string(m.dir.path().join(TUNNEL_LOG))
-        .unwrap_or_default()
+    let mut log = std::fs::read(m.dir.path().join(TUNNEL_LOG)).unwrap_or_default();
+    log.truncate(
+        log.iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |end| end + 1),
+    );
+    String::from_utf8(log)
+        .unwrap()
         .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{e}: {l:?}")))
         .collect()
 }
 
@@ -1370,7 +1377,9 @@ fn tunnel_links_left_by_a_crash_are_stopped() {
 }
 
 /// A burst of failed connections (the helper refuses its socket now): one check of where the
-/// daemon is, not one per connection.
+/// daemon is, not one per connection. Paced by events, not the clock: the check the first
+/// failure asks for is held open until the burst is over (no other may start while one runs),
+/// so the burst may take as long as the machine needs.
 fn tunnel_a_burst_of_failures_makes_one_check() {
     use std::os::unix::fs::PermissionsExt as _;
     let m = Machine::new();
@@ -1417,22 +1426,30 @@ fn tunnel_a_burst_of_failures_makes_one_check() {
             })
             .count()
     };
+    let refused = || {
+        let err = rt.block_on(connector.connect()).unwrap_err();
+        assert!(matches!(err, TunnelError::Refused(_)), "{err:?}");
+    };
     let before = checks(&m);
-    let burst = Instant::now();
-    rt.block_on(async {
-        for _ in 0..15 {
-            let err = connector.connect().await.unwrap_err();
-            assert!(matches!(err, TunnelError::Refused(_)), "{err:?}");
-        }
-    });
-    let took = burst.elapsed();
-    assert!(took < Duration::from_secs(8), "the burst took {took:?}");
+    let hold = m.dir.path().join(HOLD_CHECKS);
+    std::fs::write(&hold, "").unwrap();
+    refused();
     crate::unix::eventually("a check", || checks(&m) > before);
-    std::thread::sleep(Duration::from_secs(3));
+    for _ in 1..15 {
+        refused();
+    }
     assert_eq!(checks(&m) - before, 1, "checks for a burst of 15 failures");
-    // The failures after the first asked too: one more check comes once the gap (10 s) is over,
-    // not none.
-    crate::unix::eventually("the deferred check", || checks(&m) - before == 2);
+    std::fs::remove_file(&hold).unwrap();
+    // The failures after the first asked too: one more check comes once the first is over and
+    // the gap (10 s) has passed, not none. Nothing asks for a third.
+    let asked = Instant::now();
+    while checks(&m) - before < 2 {
+        assert!(
+            asked.elapsed() < Duration::from_secs(120),
+            "no deferred check"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     std::thread::sleep(Duration::from_secs(1));
     assert_eq!(checks(&m) - before, 2);
     assert_eq!(links(&m), 1);
