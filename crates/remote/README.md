@@ -46,7 +46,8 @@ on Unix; on Windows it is `USERPROFILE` (where Windows' own OpenSSH looks), else
   - **Stopping:** a cancel, a timeout or a dropped call stops ssh and everything it started
     (askpass, `ProxyJump` hops, `Match exec`): its process group on Unix, its **Job Object** on
     Windows (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so the OS also ends it if PitCrew dies). The
-    Job Object needs four Win32 calls; `src/job.rs` is the crate's only unsafe code.
+    Job Object needs four Win32 calls; `src/job.rs` and `src/pipe_security.rs` (below) are the
+    crate's only unsafe code.
   - **Errors:** ssh's own messages go to a log (`-E`, at `LogLevel=ERROR`) apart from the remote
     stderr. Exit 255 is an error only when that log shows ssh failing, and its kind comes only
     from ssh's own message formats, matched as whole lines. ssh logs server text without
@@ -57,8 +58,9 @@ on Unix; on Windows it is `USERPROFILE` (where Windows' own OpenSSH looks), else
   - `Ssh::run_limited` adds an output cap and a timeout that pauses while a prompt is open.
 - **Askpass bridge.** With `Ssh::with_prompts(askpass, handler)`, ssh runs `pitcrew-askpass`
   for passwords, passphrases, one-time codes and host keys; it asks the desktop's
-  `PromptHandler` over a private socket (a named pipe on Windows, which the client opens at
-  identification level only). Both ends prove a per-call key first. Answers are never stored
+  `PromptHandler` over a private socket (on Windows a named pipe that the current user owns
+  and alone may open, with remote clients rejected, which the client opens at identification
+  level only). Both ends prove a per-call key first. Answers are never stored
   or logged. Needs OpenSSH 8.4+ on the local machine. The askpass path must be absolute and
   exist (a missing one would fail every prompt). Without a handler, calls run in `BatchMode`
   and fail instead of prompting.

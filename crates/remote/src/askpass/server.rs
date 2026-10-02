@@ -186,11 +186,15 @@ fn listen(dir: &Path, name: &str, shared: Arc<Shared>) -> io::Result<(String, Jo
 fn listen(_dir: &Path, name: &str, shared: Arc<Shared>) -> io::Result<(String, JoinHandle<()>)> {
     use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
     let addr = format!(r"\\.\pipe\pitcrew-askpass-{name}");
-    let create = |addr: &str, first: bool| -> io::Result<NamedPipeServer> {
-        ServerOptions::new()
+    // The current user owns every instance and alone may open it: the default descriptor would
+    // let everyone read it.
+    let security = crate::pipe_security::PipeSecurity::current_user_only()?;
+    let create = move |addr: &str, first: bool| -> io::Result<NamedPipeServer> {
+        let mut options = ServerOptions::new();
+        options
             .first_pipe_instance(first)
-            .reject_remote_clients(true)
-            .create(addr)
+            .reject_remote_clients(true);
+        security.create(&options, addr)
     };
     // `first_pipe_instance` fails if the name exists, so nobody can have squatted it. From then
     // on an instance of ours always exists: the replacement is created before the previous one
@@ -454,6 +458,34 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("timed out waiting for {what}");
+    }
+
+    /// Windows: every instance of the pipe is the current user's alone (the default descriptor
+    /// would let everyone read it): the first, and the one made when it is taken.
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_pipe_is_the_current_users_alone() {
+        use crate::pipe_security::{assert_current_user_only, owner_and_dacl};
+        let dir = tempfile::tempdir().unwrap();
+        let handler = Scripted::new(|_| Some(Reply::Cancel));
+        let server = AskpassServer::start(&dir.path().join("rt"), "cluster", handler).unwrap();
+        let open = |addr: &str| {
+            for _ in 0..100 {
+                if let Ok(pipe) = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(addr)
+                {
+                    return pipe;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            panic!("cannot open {addr}");
+        };
+        let first = open(&server.addr);
+        assert_current_user_only(&owner_and_dacl(&first).unwrap());
+        let next = open(&server.addr);
+        assert_current_user_only(&owner_and_dacl(&next).unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread")]
