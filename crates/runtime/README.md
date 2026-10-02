@@ -93,8 +93,10 @@ tmux server that belongs to PitCrew alone. `PtyRuntime` and the PTY supervisor a
   ends, socket included; a runner that must outlive logins, or a daemon restarted in another
   environment, should pass its own socket.) Its directory is created 0700; one that belongs to
   someone else, is a link, or is open to others is refused, never repaired, and so is anything
-  at the socket path that is not a socket of the user's. This is checked again before every
-  connection (the directory can be replaced while PitCrew runs) and by detection. The server
+  at the socket path that is not a socket of the user's. Every directory above it must belong
+  to root or the user, and only a sticky one (like `/tmp`) may be writable by others, as OpenSSH
+  requires of its files. This is checked again before every connection (the directory can be
+  replaced while PitCrew runs) and by detection. The server
   starts with `-f /dev/null`: the user's `~/.tmux.conf` does not apply, and a person's own tmux
   server and sessions are never touched. Every tmux process the runtime starts gets
   `-S <socket>`; tmux itself is found once, as an absolute path (absolute `PATH` entries only).
@@ -106,9 +108,11 @@ tmux server that belongs to PitCrew alone. `PtyRuntime` and the PTY supervisor a
 - **The server is shared with the programs in it.** tmux gives every pane `$TMUX`, the server's
   socket. The runtime unsets it for the programs it starts (people attach from their own
   terminals, which this does not affect), but a program that finds the socket can still run any
-  tmux command on that server, as the user can. So the runtime trusts nothing the server says
-  beyond the replies to its own commands, never lets a tag move a known terminal, and clamps
-  counts in pane output before emulating it.
+  tmux command on that server, as the user can. The runtime limits what that can do rather than
+  drawing a boundary: replies without its guard flag (ordinary hook output) are dropped, tags and
+  duplicated `list-panes` rows never move or end a known terminal, and pane output is bounded
+  before it is emulated. A deliberate attacker running as the same user can still disturb
+  PitCrew's terminals in other ways.
 - **Layout.** One session, `pitcrew`, holds every terminal as a window with one pane. The pane
   option `@pitcrew-terminal` holds the `TerminalId`, so `list()` finds terminals after a restart;
   `@pitcrew-offset` holds where its output numbering resumes. The session and server exist while
@@ -120,9 +124,10 @@ tmux server that belongs to PitCrew alone. `PtyRuntime` and the PTY supervisor a
   queue, not a stuck caller. Replies are matched to commands in order (tmux answers one client's
   stdin in order, one `%begin`/`%end` per line). Replies to this client's own commands carry
   guard flag `1`; the command on the command line and every hook (`after-*`) reply with `0`, and
-  after the first reply those are dropped, so a hook someone set cannot be taken for the answer
-  to one of our commands. However the reader thread ends, a panic included, it closes the
-  connection, reaps the client and lets the runtime reattach.
+  after the first reply those are dropped, so ordinary hook output is not taken for the answer
+  to one of our commands (this is not a boundary against a deliberate same-user attacker).
+  However the reader thread ends, a panic included, it closes the connection, reaps the client
+  and lets the runtime reattach.
 - **Starting a program.** The program is found as a file on the spec's `PATH` (else the
   runtime's; absolute entries only), so a shell builtin such as `eval` is refused, as is a name
   that is not an executable file there or that starts with `-`. Then `new-window -d` with the
@@ -136,7 +141,10 @@ tmux server that belongs to PitCrew alone. `PtyRuntime` and the PTY supervisor a
   `TerminalInfo::pid` is therefore not the program's own process but its parent, that shell,
   which leads the process group the program and its children run in. If `start` gives up before
   tmux answers, the window tmux then makes is killed when the answer arrives, and again on the
-  next connection to the same server in case that kill did not land.
+  next connection to the same server (known by its pid and start time) unless tmux answered that
+  kill. If the connection is lost before tmux answers at all, the next connection, before any
+  start uses it, kills untagged panes that the wrapper started (it begins with a marker,
+  `: pitcrew-wrapper;`, which `#{pane_start_command}` shows); only one runtime may use a socket.
 - **Input.** `write` sends `send-keys -H` in 1 KiB commands; `send_keys` sends tmux key names.
   Both first leave copy mode (query `#{pane_in_mode}`, `send-keys -X cancel`, query again), under
   one lock, and refuse input to a pane stuck in a mode. Input (or a resize) that timed out may
@@ -150,8 +158,10 @@ tmux server that belongs to PitCrew alone. `PtyRuntime` and the PTY supervisor a
 - **Tags.** Within one server's life a pane id never changes owner, so a known live terminal is
   always found by its own pane, whatever its tag says now (a garbled tag does not end it, a
   copied one does not move it). A tag only adopts a pane the runtime does not know, and an id
-  found on more than one pane is adopted on none. A server with another pid has none of the old
-  terminals.
+  found on more than one pane is adopted on none. A raw newline in an option value makes
+  `list-panes` print a forged extra row (seen on 3.2a): a pane id listed more than once is not
+  believed, so a known terminal on it keeps its window and stays alive, and such a pane is never
+  adopted. A server with another pid or start time has none of the old terminals.
 - **Reconnecting.** If the control client dies, a keeper thread attaches again (50 ms, doubling
   to 2 s) while terminals are alive. Until each terminal's pane is found again, its output waits
   aside; then its numbering skips one offset, so a reader at the old end reads `truncated`
@@ -168,12 +178,21 @@ tmux server that belongs to PitCrew alone. `PtyRuntime` and the PTY supervisor a
   down) and `CSI n @` (insert characters) loop `n` times with no limit, so 128 bytes of
   `ESC[65535L` take seconds. A streaming filter (`tmux/clamp.rs`) lowers the count of those, and
   of `M`, `S`, `P` and `X`, to the screen's rows or columns first, following vte's states (a CSI
-  survives C0 controls, DEL and high bytes; only CAN, SUB or ESC end it). The work per sequence
-  is then bounded by the screen's size, which the API caps at 1000 by 1000.
+  survives C0 controls, DEL and high bytes; only CAN, SUB or ESC end it). It also passes at most
+  4 KiB of a string's body (OSC, DCS, SOS, PM, APC), then cancels it and drops the rest to its
+  end, since vte keeps an OSC body in memory with no limit. The work per sequence is then
+  bounded by the screen's size, which the API caps at 1000 by 1000, and a read is bounded too:
+  if the backlog times the screen's area is past a budget, the model starts again from the last
+  256 KiB. The model is at least 2 columns wide (vt100 panics drawing a wide character in 1),
+  and if vt100 panics anyway, the model starts again past that output instead of failing at
+  every read. `screen()` is bounded but may emulate up to that budget: call it, like every
+  method here, from a blocking thread rather than an async executor's.
 - **Ended programs** stay readable (`alive: false`) until 16 more have ended. `kill` sends the
   pane's process group `SIGTERM`, then `SIGKILL` after half a second, then closes the window, so
-  a program that ignores `SIGHUP`, and its background jobs, end too. A process that left the
-  group (`setsid`, a daemonizing program) survives. Killing an ended terminal is a no-op.
+  a program that ignores `SIGHUP`, and its background jobs, end too. The group is signalled only
+  if its leader is still the pane's recorded process and leads its own session, as a pane's
+  process does (so a reused pid is not signalled). A process that left the group (`setsid`, a
+  daemonizing program) survives. Killing an ended terminal is a no-op.
 - **Bounds.** Every call is bounded by `TmuxOptions::call_timeout` (5 s; `start`:
   `start_timeout`, 15 s) and answers `Unavailable` past it. Sizes are 1 to 1000, as in the API.
 - **Detection.** `tmux::detect(&options)` finds tmux, checks its version (3.2 or newer), the
