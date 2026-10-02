@@ -4,6 +4,7 @@
 //! The fake `ssh` is this test binary, started by a small script (`<machine>/ssh`) that names its
 //! role and its machine; ssh's own environment is the minimal one `pitcrew-remote` gives it. It
 //! plays:
+//! - `ssh -V`: its version, on stderr as OpenSSH writes it (9.6, or what `version` holds);
 //! - `ssh -G -- <host>`: what the host resolves to;
 //! - `ssh -N … -- <host>`, a link: it signs in (see below), logs "Authenticated to …" to its
 //!   `-E` log, and with a `ControlPath` is a ControlMaster listening there: `check`, `exit`,
@@ -27,7 +28,8 @@
 //! running the helper script's `stop` fail as a lost connection; `kbdint` makes the server ask
 //! for the password with its text, marked `(sam@hpc-login)` as OpenSSH marks keyboard-interactive
 //! prompts; `stall` makes links wait for ever before signing in, as a server that does not
-//! answer.
+//! answer; `version` is what `ssh -V` says. In the machine's home, `.demo-seeded` makes the
+//! helper start a fresh hub instead of the demo workspace.
 //!
 //! The binary is also `pitcrew-askpass` (`<machine>/pitcrew-askpass`), as the real one: the
 //! crate's own client.
@@ -55,6 +57,8 @@ pub const RUN: &str = "PITCREW_DESKTOP_TEST_RUN";
 pub const HOST: &str = "hpc-login";
 /// The host key's fingerprint, as the fake ssh shows it.
 pub const FINGERPRINT: &str = "SHA256:ZmFrZS1ob3N0LWtleS1mb3ItdGhlLWRlc2t0b3A";
+/// What `ssh -V` says unless the machine's `version` says otherwise.
+const DEFAULT_VERSION: &str = "OpenSSH_9.6p1 Ubuntu-3ubuntu13.5, OpenSSL 3.0.13 30 Jan 2024";
 
 /// Plays this binary's role, if it has one.
 pub fn act() -> Option<ExitCode> {
@@ -174,6 +178,13 @@ fn ssh() -> u8 {
         return 255;
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args == ["-V"] {
+        append(&machine.join("calls.log"), "version");
+        let version = std::fs::read_to_string(machine.join("version"))
+            .unwrap_or_else(|_| DEFAULT_VERSION.to_owned());
+        eprintln!("{}", version.trim_end());
+        return 0;
+    }
     let call = Call::parse(&args);
     let kind = call.kind();
     append(&machine.join("calls.log"), &format!("{kind} {}", call.host));
@@ -594,6 +605,31 @@ impl Machine {
     /// From now on logins ask for `password`.
     pub fn require_password(&self, password: &str) {
         std::fs::write(self.dir.join("password"), password).unwrap();
+    }
+
+    /// From now on logins ask nothing: a key signs in, and the host key is known.
+    pub fn sign_in_with_keys(&self) {
+        let _ = std::fs::remove_file(self.dir.join("password"));
+        let _ = std::fs::remove_file(self.dir.join("hostkey"));
+    }
+
+    /// From now on `ssh -V` says `text`.
+    pub fn ssh_version(&self, text: &str) {
+        std::fs::write(self.dir.join("version"), text).unwrap();
+    }
+
+    /// The helper starts a fresh hub (named "Workspace" until it is set up), not the demo
+    /// workspace.
+    pub fn fresh_hub(&self) {
+        std::fs::write(self.home.join(".demo-seeded"), "").unwrap();
+    }
+
+    /// How many calls of `kind` ssh got (`link`, `run`, `version`, …).
+    pub fn calls_of(&self, kind: &str) -> usize {
+        self.calls()
+            .iter()
+            .filter(|c| c.split(' ').next() == Some(kind))
+            .count()
     }
 
     /// From now on the password is asked by the server (keyboard-interactive) with `text`, or,

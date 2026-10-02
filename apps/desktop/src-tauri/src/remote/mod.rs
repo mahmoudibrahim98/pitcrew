@@ -15,12 +15,14 @@
 //!    asking the hub which workspace it hosts, and registers the workspace with its token in the
 //!    OS keychain. If a step fails after the helper was started (or its job submitted) by this
 //!    add, that is stopped again; if stopping fails too, the error says what may be left.
-//!    [`Remotes::cancel`] stops a running add the same way.
+//!    [`Remotes::cancel`] stops a running add the same way. Taking the plan and recording the
+//!    add's cancel are one step, so a cancel is never lost between them.
 //!
 //! **The hub's answer is not trusted.** Its workspace id is claimed in the registry in one step
 //! that refuses an id already held by the local workspace, or by a remote one on another machine
 //! (another host or root): a hostile hub cannot take over another workspace's entry or token.
-//! Only the same machine may be paired again. Its name is cleaned and cut.
+//! Only the same machine may be paired again. Its name is cleaned and cut, at pairing and each
+//! time the tunnel connects again.
 //!
 //! **The token** goes from ssh's output into a [`DeviceToken`] and the keychain, and from there
 //! only into the `Authorization` header or the WebSocket subprotocol of a request to that hub.
@@ -28,15 +30,18 @@
 //!
 //! **Prompts** (passwords, passphrases, one-time codes, host keys, other yes/no questions and
 //! notices) from any of these calls, and from the tunnel reconnecting, go through
-//! `pitcrew-askpass` to the [`PromptHub`] ([`prompt`]). A missing `pitcrew-askpass` (or a
-//! configured `ssh` that fails its checks) is a clear error before any ssh call.
+//! `pitcrew-askpass` to the [`PromptHub`] ([`prompt`]), behind the ssh version gate ([`gate`]):
+//! an ssh older than 8.4 gets none answered. A missing `pitcrew-askpass` (or a configured `ssh`
+//! that fails its checks) is a clear error before any ssh call.
 //!
 //! **Afterwards** each remote workspace has a [`link::Link`]: the tunnel's `Connector`, which
 //! reconnects by itself, and a task keeping the workspace's state in step with it. At start,
 //! [`Remotes::resume`] makes them again for the workspaces saved in the registry; a computer that
 //! slept is noticed by a timer that fires late ([`Remotes::watch_wakes`]), and every tunnel is
 //! told to check at once. A connection that gave up (a sign-in cancelled while reconnecting)
-//! starts over at [`Remotes::retry`].
+//! starts over at [`Remotes::retry`], with retries coalesced. A link is put in only while its
+//! workspace is still registered, and [`Remotes::remove`] takes the workspace out before it
+//! closes the link, so a retry or a pairing racing a remove leaves nothing behind.
 
 pub mod gate;
 pub mod helpers;
@@ -49,20 +54,20 @@ pub use helpers::{HelperRef, Helpers};
 pub use plan::{RemotePlan, RemotePlanRequest};
 pub use prompt::{GatewayPrompt, PromptEvent, PromptHub};
 
-use crate::gateway::GatewayError;
+use crate::gateway::{Connector, GatewayError};
 use crate::keychain::TokenStore;
 use crate::registry::{
     Connection, GatewayWorkspace, HopKind, JobRequest, LauncherKind, Registry, RemoteConnection,
     WorkspaceKind, WorkspaceRecord, WorkspaceState,
 };
 use crate::token::DeviceToken;
-use link::{Link, Pairing, RemoteConnector, Tunnel};
+use link::{Ended, Follow, Link, Outcome, Pairing, RemoteConnector, Tunnel};
 use pitcrew_remote::helper::slurm::{Site, check_tools, generic, load_sites, sites_dir};
 use pitcrew_remote::helper::tmux_name;
 use pitcrew_remote::{
     ConnectorOptions, Daemon, DeployOptions, DirectLauncher, HelperError, JobScript, JobSpec,
     JobState, LastHop, LaunchOptions, Launcher, Layout, Limits, LinkState, Platform, PromptHandler,
-    SiteRecipe as _, SlurmLauncher, Ssh, SshError, Target, TmuxLauncher, Transport,
+    SiteRecipe as _, SlurmLauncher, Ssh, SshError, Target, TmuxLauncher, Transport, Unreachable,
 };
 use plan::PlanStore;
 use serde::Serialize;
@@ -332,6 +337,13 @@ fn cancelled(host: &str) -> GatewayError {
     GatewayError::unreachable(format!("adding {host} was cancelled"))
 }
 
+/// The error of an add whose workspace was removed while it paired.
+fn removed_meanwhile(host: &str) -> GatewayError {
+    GatewayError::unreachable(format!(
+        "the workspace on {host} was removed while it was being added"
+    ))
+}
+
 /// `work`, unless the add is cancelled first: then `work` is dropped where it waits.
 async fn or_cancelled<T>(
     cancel: &Cancel,
@@ -365,24 +377,23 @@ impl Drop for Running<'_> {
 
 type Links = Arc<Mutex<HashMap<String, Arc<Link>>>>;
 
+/// The workspaces whose retry's attempt is running, each with whether another retry came
+/// meanwhile.
+type Retries = Arc<Mutex<HashMap<String, bool>>>;
+
 /// Remote workspaces: the gateway's remote commands, and the tunnels of the workspaces added.
 pub struct Remotes {
-    options: RemoteOptions,
-    registry: Arc<Registry>,
-    tokens: Arc<dyn TokenStore>,
-    prompts: Arc<PromptHub>,
+    core: Core,
     plans: Mutex<PlanStore<Plan>>,
     adds: Adds,
-    links: Links,
-    runtime: tokio::runtime::Handle,
     waker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl fmt::Debug for Remotes {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Remotes")
-            .field("options", &self.options)
-            .field("links", &self.lock_links().len())
+            .field("options", &self.core.options)
+            .field("links", &self.core.lock_links().len())
             .finish_non_exhaustive()
     }
 }
@@ -400,14 +411,20 @@ impl Remotes {
     ) -> Self {
         let ttl = options.plan_ttl;
         Self {
-            options,
-            registry,
-            tokens,
-            prompts,
+            core: Core {
+                options: Arc::new(options),
+                registry,
+                tokens,
+                prompts,
+                versions: Arc::default(),
+                links: Links::default(),
+                retries: Retries::default(),
+                runtime,
+                #[cfg(test)]
+                seams: Seams::default(),
+            },
             plans: Mutex::new(PlanStore::new(ttl)),
             adds: Adds::default(),
-            links: Links::default(),
-            runtime,
             waker: Mutex::new(None),
         }
     }
@@ -415,18 +432,18 @@ impl Remotes {
     /// The prompt hub, for `gateway_prompt_reply`.
     #[must_use]
     pub fn prompts(&self) -> &Arc<PromptHub> {
-        &self.prompts
+        &self.core.prompts
     }
 
     /// `gateway_ssh_hosts`: the concrete `Host` names of the person's ssh config, read off the
     /// async threads.
     pub async fn ssh_hosts(&self) -> SshHosts {
-        let home = self.options.home.clone().or_else(pitcrew_remote::home_dir);
+        let options = &self.core.options;
+        let home = options.home.clone().or_else(pitcrew_remote::home_dir);
         let Some(home) = home else {
             return SshHosts { hosts: Vec::new() };
         };
-        let config = self
-            .options
+        let config = options
             .ssh_config
             .clone()
             .unwrap_or_else(|| home.join(".ssh").join("config"));
@@ -449,8 +466,11 @@ impl Remotes {
     /// `internal` without `pitcrew-askpass`.
     pub async fn probe(&self, host: &str) -> Result<RemoteProbe, GatewayError> {
         check_host(host)?;
-        let ssh = self.ssh()?;
-        let probe = ssh.probe(host).await.map_err(|e| ssh_error(host, &e))?;
+        let ssh = self.core.checked_ssh().await?;
+        let probe = ssh
+            .probe(host)
+            .await
+            .map_err(|e| self.core.ssh_err(host, &e))?;
         let helper = match Target::new(ssh, host, &probe) {
             Ok(target) => helper_status(&target).await,
             Err(_) => None,
@@ -490,10 +510,15 @@ impl Remotes {
         if let Some(site) = &req.site {
             plan::check_site_name(site)?;
         }
-        let ssh = self.ssh()?;
-        let probe = ssh.probe(&host).await.map_err(|e| ssh_error(&host, &e))?;
-        let target = Target::new(ssh, &host, &probe).map_err(|e| helper_error(&host, &e))?;
+        let ssh = self.core.checked_ssh().await?;
+        let probe = ssh
+            .probe(&host)
+            .await
+            .map_err(|e| self.core.ssh_err(&host, &e))?;
+        let target =
+            Target::new(ssh, &host, &probe).map_err(|e| self.core.helper_err(&host, &e))?;
         let helper = self
+            .core
             .options
             .helpers
             .find(target.platform())
@@ -606,17 +631,28 @@ impl Remotes {
         plan: &str,
         progress: Progress,
     ) -> Result<GatewayWorkspace, GatewayError> {
-        let taken = self.lock_plans().take(plan, Instant::now());
-        let result = match taken {
-            Ok(taken) => {
-                let host = taken.host.clone();
-                tracing::info!(host, launcher = taken.launcher.as_str(), "adding a machine");
+        // The plan is taken and the add's cancel recorded in one step, under the plans lock,
+        // which `cancel` takes first too: a cancel comes before both, and drops the plan, or
+        // after both, and finds the add.
+        let started = {
+            let mut plans = self.lock_plans();
+            let taken = plans.take(plan, Instant::now());
+            self.core.at("add: plan taken");
+            taken.map(|taken| {
                 let (cancel_tx, cancel_rx) = watch::channel(false);
                 self.lock_adds().insert(plan.to_owned(), cancel_tx);
+                (taken, cancel_rx)
+            })
+        };
+        let result = match started {
+            Ok((taken, cancel_rx)) => {
                 let _running = Running {
                     adds: &self.adds,
                     plan: plan.to_owned(),
                 };
+                self.core.at("add: running");
+                let host = taken.host.clone();
+                tracing::info!(host, launcher = taken.launcher.as_str(), "adding a machine");
                 let result = self.carry_out(taken, &progress, &Cancel(cancel_rx)).await;
                 match &result {
                     Ok(workspace) => {
@@ -647,12 +683,15 @@ impl Remotes {
     /// used yet is dropped, so an add that comes after the cancel fails. An add that has
     /// finished, or an unknown plan, is left alone.
     pub fn cancel(&self, plan: &str) {
-        let unused = self.lock_plans().take(plan, Instant::now()).is_ok();
+        // The plans lock first, as `add` takes it: see there.
+        let mut plans = self.lock_plans();
+        let unused = plans.take(plan, Instant::now()).is_ok();
         let running = self
             .lock_adds()
             .get(plan)
             .map(|add| add.send_replace(true))
             .is_some();
+        drop(plans);
         if unused || running {
             tracing::info!(running, "cancelled adding a machine");
         }
@@ -662,11 +701,17 @@ impl Remotes {
     /// With `stop_helper`, first stops its helper (cancelling its job for SLURM); if that fails,
     /// nothing is forgotten.
     ///
+    /// The workspace leaves the registry before its link closes, so a retry or a pairing that
+    /// comes meanwhile finds no workspace to put a link in for; its token is deleted before (a
+    /// keychain that fails forgets nothing) and after (a pairing in flight may have kept it in
+    /// between).
+    ///
     /// # Errors
     /// `unknown_workspace`; `invalid` for the local workspace; the stop's error; `internal` when
     /// the keychain cannot delete the token.
     pub async fn remove(&self, workspace: &str, stop_helper: bool) -> Result<(), GatewayError> {
-        let record = self
+        let core = &self.core;
+        let record = core
             .registry
             .record(workspace)
             .ok_or_else(|| GatewayError::unknown_workspace(workspace))?;
@@ -676,22 +721,28 @@ impl Remotes {
             ));
         };
         if stop_helper {
-            let target = self.target_of(remote)?;
+            core.ssh_check().ask().await;
+            let target = core.target_of(remote)?;
             let stopped = launcher_of(remote.launcher)
                 .stop(&target)
                 .await
-                .map_err(|e| helper_error(&remote.host, &e))?;
+                .map_err(|e| core.helper_err(&remote.host, &e))?;
             tracing::info!(workspace = %record.id, host = %remote.host, pid = ?stopped.pid, "stopped the remote helper");
         }
-        self.tokens.delete(&record.id).map_err(|e| {
+        core.tokens.delete(&record.id).map_err(|e| {
             GatewayError::internal(format!("cannot delete the workspace's token: {e}"))
         })?;
-        let link = self.lock_links().remove(&record.id);
+        if let Err(e) = core.registry.remove(&record.id) {
+            tracing::warn!(workspace = %record.id, error = %e, "the workspace is removed but the registry is not saved");
+        }
+        core.at("remove: forgotten");
+        let link = core.lock_links().remove(&record.id);
+        core.lock_retries().remove(&record.id);
         if let Some(link) = link {
             link.close().await;
         }
-        if let Err(e) = self.registry.remove(&record.id) {
-            tracing::warn!(workspace = %record.id, error = %e, "the workspace is removed but the registry is not saved");
+        if let Err(e) = core.tokens.delete(&record.id) {
+            tracing::warn!(workspace = %record.id, error = %e, "cannot delete the workspace's token again");
         }
         tracing::info!(workspace = %record.id, host = %remote.host, "removed a remote workspace");
         Ok(())
@@ -700,22 +751,24 @@ impl Remotes {
     /// Makes the tunnels of the remote workspaces saved in the registry (at start). One that
     /// cannot be made is `unreachable`, saying why.
     pub fn resume(&self) {
-        for record in self.registry.records() {
+        for record in self.core.registry.records() {
             if let Connection::Remote(remote) = &record.connection {
-                self.reconnect(&record.id, remote);
+                self.core.reconnect(&record.id, remote, None);
             }
         }
     }
 
     /// `gateway_workspace_retry`: tries remote workspace `workspace`'s connection again now
-    /// (after a cancelled sign-in, say). Its tunnel starts over (`Connector::retry`); one that
-    /// could not be made at start is made again. Returns once the attempt has started; the state
-    /// follows on `gateway://workspaces`.
+    /// (after a cancelled sign-in, say), with a fresh tunnel, which is `connecting` until its
+    /// first attempt ends. Retries while that attempt runs make one more attempt after it, if it
+    /// did not connect, not one each. A connected workspace is left alone. Returns once the
+    /// attempt has started; the state follows on `gateway://workspaces`.
     ///
     /// # Errors
     /// `unknown_workspace`; `invalid` for the local workspace.
     pub fn retry(&self, workspace: &str) -> Result<(), GatewayError> {
         let record = self
+            .core
             .registry
             .record(workspace)
             .ok_or_else(|| GatewayError::unknown_workspace(workspace))?;
@@ -724,46 +777,14 @@ impl Remotes {
                 "the local workspace has no remote connection to try again",
             ));
         };
-        let link = self.lock_links().get(&record.id).cloned();
-        match link {
-            Some(link) => link.retry(),
-            None => self.reconnect(&record.id, remote),
-        }
         tracing::info!(workspace = %record.id, host = %remote.host, "trying the connection again");
+        self.core.retry(&record.id, remote);
         Ok(())
-    }
-
-    /// Makes saved remote workspace `id`'s tunnel and the task following it.
-    fn reconnect(&self, id: &str, remote: &RemoteConnection) {
-        let _runtime = self.runtime.enter();
-        match self.tunnel_for(remote) {
-            Ok(tunnel) => {
-                let connector =
-                    RemoteConnector::new(id.to_owned(), tunnel.clone(), Arc::clone(&self.tokens));
-                self.registry.attach(id, Arc::new(connector));
-                let link = Link::start(
-                    id.to_owned(),
-                    tunnel,
-                    Arc::clone(&self.registry),
-                    Arc::clone(&self.tokens),
-                    &self.runtime,
-                );
-                let old = self.lock_links().insert(id.to_owned(), Arc::new(link));
-                if let Some(old) = old {
-                    self.runtime.spawn(async move { old.close().await });
-                }
-            }
-            Err(e) => {
-                tracing::warn!(workspace = %id, error = %e, "cannot reach a remote workspace");
-                self.registry
-                    .set_state(id, WorkspaceState::Unreachable, Some(e.message));
-            }
-        }
     }
 
     /// Tells every tunnel to check its way now (the computer woke, or the network changed).
     pub fn wake(&self) {
-        wake_all(&self.links);
+        wake_all(&self.core.links);
     }
 
     /// Watches for the computer waking from sleep: a timer that fires much later than asked
@@ -771,8 +792,8 @@ impl Remotes {
     /// tunnel notices a jump of the wall clock itself; on Windows the monotonic clock runs
     /// during sleep, which this catches.)
     pub fn watch_wakes(&self) {
-        let links = Arc::clone(&self.links);
-        let task = self.runtime.spawn(async move {
+        let links = Arc::clone(&self.core.links);
+        let task = self.core.runtime.spawn(async move {
             loop {
                 let before = Instant::now();
                 tokio::time::sleep(WAKE_TICK).await;
@@ -802,7 +823,8 @@ impl Remotes {
         {
             task.abort();
         }
-        let links: Vec<Arc<Link>> = self.lock_links().drain().map(|(_, l)| l).collect();
+        let links: Vec<Arc<Link>> = self.core.lock_links().drain().map(|(_, l)| l).collect();
+        self.core.lock_retries().clear();
         for link in links {
             link.close().await;
         }
@@ -921,7 +943,7 @@ impl Remotes {
         };
         let deployed = pitcrew_remote::deploy(target, &helper, &options)
             .await
-            .map_err(|e| helper_error(&host, &e))?;
+            .map_err(|e| self.core.helper_err(&host, &e))?;
         tracing::info!(host, version = %deployed.version, uploaded = deployed.uploaded, "deployed the helper");
         Ok(())
     }
@@ -948,7 +970,7 @@ impl Remotes {
             let started = launcher
                 .start(target)
                 .await
-                .map_err(|e| helper_error(host, &e))?;
+                .map_err(|e| self.core.helper_err(host, &e))?;
             tracing::info!(
                 host,
                 launcher = kind.as_str(),
@@ -973,7 +995,7 @@ impl Remotes {
                     .with_script(script)
                     .submit(target)
                     .await
-                    .map_err(|e| helper_error(host, &e))?;
+                    .map_err(|e| self.core.helper_err(host, &e))?;
                 tracing::info!(
                     host,
                     job = submitted.job,
@@ -1001,7 +1023,7 @@ impl Remotes {
                 let status = slurm
                     .job_status(target)
                     .await
-                    .map_err(|e| helper_error(host, &e))?;
+                    .map_err(|e| self.core.helper_err(host, &e))?;
                 match status.job {
                     Some(job)
                         if matches!(
@@ -1042,13 +1064,13 @@ impl Remotes {
         progress: &Progress,
     ) -> Result<(), GatewayError> {
         let host = target.host();
-        let deadline = Instant::now() + self.options.job_wait;
+        let deadline = Instant::now() + self.core.options.job_wait;
         let mut said = String::new();
         loop {
             let status = slurm
                 .job_status(target)
                 .await
-                .map_err(|e| helper_error(host, &e))?;
+                .map_err(|e| self.core.helper_err(host, &e))?;
             if status.ready() {
                 return Ok(());
             }
@@ -1072,10 +1094,10 @@ impl Remotes {
             if Instant::now() >= deadline {
                 return Err(GatewayError::unreachable(format!(
                     "the helper's job {job} on {host} has not started within {} minutes: {now}",
-                    self.options.job_wait.as_secs().div_ceil(60)
+                    self.core.options.job_wait.as_secs().div_ceil(60)
                 )));
             }
-            tokio::time::sleep(self.options.job_poll).await;
+            tokio::time::sleep(self.core.options.job_poll).await;
         }
     }
 
@@ -1123,8 +1145,8 @@ impl Remotes {
         let daemon =
             Daemon::new(target.clone(), launcher).with_last_hop(last_hop.unwrap_or_default());
         let tunnel = {
-            let _runtime = self.runtime.enter();
-            Tunnel::start(daemon, self.connector_options(transport))
+            let _runtime = self.core.runtime.enter();
+            Tunnel::start(daemon, self.core.connector_options(transport))
                 .map_err(|e| link::tunnel_error(&host, &e))?
         };
         let mut watch = tunnel.watch();
@@ -1132,7 +1154,7 @@ impl Remotes {
             biased;
             () = cancel.fired() => None,
             reached = tokio::time::timeout(
-                self.options.connect_wait,
+                self.core.options.connect_wait,
                 watch.wait_for(|s| {
                     s.is_connected()
                         || matches!(s, LinkState::Unreachable { .. } | LinkState::Closed)
@@ -1147,9 +1169,19 @@ impl Remotes {
             Ok(Ok(state)) if state.is_connected() => Ok(tunnel),
             Ok(Ok(state)) => {
                 tunnel.close().await;
+                let mut why = tidy(&state.to_string());
+                if matches!(
+                    state,
+                    LinkState::Unreachable {
+                        why: Unreachable::SignIn,
+                        ..
+                    }
+                ) && let Some(refusal) = self.core.ssh_check().refusal().await
+                {
+                    why = format!("{why}; {refusal}");
+                }
                 Err(GatewayError::unreachable(format!(
-                    "cannot reach the helper on {host}: {}",
-                    tidy(&state.to_string())
+                    "cannot reach the helper on {host}: {why}"
                 )))
             }
             Ok(Err(_)) => Err(GatewayError::unreachable(format!(
@@ -1160,19 +1192,15 @@ impl Remotes {
                 tunnel.close().await;
                 Err(GatewayError::unreachable(format!(
                     "no connection to the helper on {host} within {} s: {}",
-                    self.options.connect_wait.as_secs(),
+                    self.core.options.connect_wait.as_secs(),
                     tidy(&state.to_string())
                 )))
             }
         }
     }
 
-    /// Reads the hub's token over SSH, checks it, and registers the workspace with it.
-    ///
-    /// The workspace's id and name come from the hub, so they are not trusted: the id is claimed
-    /// in the registry first, in one step that refuses another workspace's id (the local one's,
-    /// or a remote one's on another machine), and only then is the token kept under it. If
-    /// keeping it fails, the claim is undone.
+    /// Reads the hub's token over SSH, checks it, and registers the workspace with it
+    /// ([`Core::keep`]).
     async fn pair(
         &self,
         target: &Target,
@@ -1180,7 +1208,7 @@ impl Remotes {
         remote: RemoteConnection,
     ) -> Result<GatewayWorkspace, GatewayError> {
         let host = target.host().to_owned();
-        let token = read_token(target).await?;
+        let token = self.core.read_token(target).await?;
         let pairing = Pairing {
             tunnel: tunnel.clone(),
             token: token.clone(),
@@ -1194,74 +1222,106 @@ impl Remotes {
                 ))
             })?;
         drop(pairing);
-        let name = workspace_name(&name);
-        let connector = RemoteConnector::new(id.clone(), tunnel.clone(), Arc::clone(&self.tokens));
-        let record = WorkspaceRecord {
-            id: id.clone(),
-            name: name.clone(),
-            kind: WorkspaceKind::Remote,
-            connection: Connection::Remote(Box::new(remote)),
-        };
-        let claimed = self
-            .registry
-            .claim_remote(record, Arc::new(connector), WorkspaceState::Connecting)
-            .map_err(|taken| {
-                tracing::warn!(host, workspace = %id, "a hub claimed the id of a workspace already here");
-                let held = crate::gateway::error::shorten(&taken.name);
-                GatewayError::invalid(if taken.local {
-                    format!(
-                        "the hub on {host} reports the id of this computer's own workspace, \
-                         already added as {held}"
-                    )
-                } else {
-                    format!(
-                        "the hub on {host} reports the id of a workspace already added as \
-                         {held}; remove it first"
-                    )
-                })
-            })?;
-        if let Err(e) = self.tokens.set(&id, &token) {
-            self.registry.unclaim(claimed);
-            return Err(GatewayError::internal(format!(
-                "cannot keep the workspace's token: {e}"
-            )));
-        }
-        drop(token);
-        Ok(self.follow(&id, &name, tunnel))
-    }
-
-    /// Workspace `id` is claimed and its token kept: it is ready, and a task follows its tunnel
-    /// (replacing the one of an earlier pairing of the same machine).
-    fn follow(&self, id: &str, name: &str, tunnel: Tunnel) -> GatewayWorkspace {
-        self.registry.set_state(id, WorkspaceState::Ready, None);
-        let link = Link::start(
-            id.to_owned(),
-            tunnel,
-            Arc::clone(&self.registry),
-            Arc::clone(&self.tokens),
-            &self.runtime,
-        );
-        let old = self.lock_links().insert(id.to_owned(), Arc::new(link));
-        if let Some(old) = old {
-            self.runtime.spawn(async move { old.close().await });
-        }
-        self.registry
-            .list()
-            .into_iter()
-            .find(|w| w.id == id)
-            .unwrap_or_else(|| GatewayWorkspace {
-                id: id.to_owned(),
-                name: name.to_owned(),
-                kind: WorkspaceKind::Remote,
-                state: WorkspaceState::Ready,
-                detail: None,
-            })
+        self.core.keep(&host, tunnel, remote, &id, &name, token)
     }
 
     // ─── Parts ──────────────────────────────────────────────────────────────────────────────
 
+    /// A SLURM site recipe: the built-in `generic` one, or one of the person's.
+    fn site(&self, name: Option<&str>) -> Result<Site, GatewayError> {
+        let name = name.unwrap_or("generic");
+        if name == "generic" {
+            return Ok(generic());
+        }
+        let Some(dir) = self.core.options.sites_dir.clone().or_else(sites_dir) else {
+            return Err(GatewayError::invalid(
+                "there is no home folder to find site recipes in",
+            ));
+        };
+        for loaded in load_sites(&dir) {
+            match loaded {
+                Ok(site) if site.name == name => return Ok(site),
+                Err(e)
+                    if std::path::Path::new(&e.file)
+                        .file_stem()
+                        .is_some_and(|stem| stem == name) =>
+                {
+                    return Err(GatewayError::invalid(tidy(&e.to_string())));
+                }
+                _ => {}
+            }
+        }
+        Err(GatewayError::invalid(format!(
+            "there is no site recipe {:?}: add {}",
+            crate::gateway::error::shorten(name),
+            dir.join(format!("{name}.toml")).display()
+        )))
+    }
+
+    fn lock_adds(&self) -> MutexGuard<'_, HashMap<String, watch::Sender<bool>>> {
+        self.adds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_plans(&self) -> MutexGuard<'_, PlanStore<Plan>> {
+        self.plans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// What reaches the saved workspaces' machines: their ssh, their tunnels and links, and their
+/// retries. Cheap to clone, so a link's follower can start a retry's next attempt.
+#[derive(Clone)]
+struct Core {
+    options: Arc<RemoteOptions>,
+    registry: Arc<Registry>,
+    tokens: Arc<dyn TokenStore>,
+    prompts: Arc<PromptHub>,
+    versions: Arc<SshVersions>,
+    links: Links,
+    retries: Retries,
+    runtime: tokio::runtime::Handle,
+    #[cfg(test)]
+    seams: Seams,
+}
+
+/// Unit tests' handles on races: a hook called at named points (to pause there), and every
+/// tunnel made (to see that each one ends closed).
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct Seams {
+    hook: Arc<Mutex<Option<Hook>>>,
+    tunnels: Arc<Mutex<Vec<Tunnel>>>,
+}
+
+/// Called with each named point the code reaches.
+#[cfg(test)]
+type Hook = Arc<dyn Fn(&'static str) + Send + Sync>;
+
+impl Core {
+    /// A named point of an add, a remove, a pairing or a reconnect, where a unit test may pause
+    /// to order a race. Nothing outside tests.
+    #[cfg(test)]
+    fn at(&self, point: &'static str) {
+        let hook = self
+            .seams
+            .hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook(point);
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn at(&self, _point: &'static str) {}
+
     /// The ssh every remote call uses: the person's OpenSSH, with only the environment it needs,
-    /// and prompts through `pitcrew-askpass` to the hub.
+    /// and prompts through `pitcrew-askpass` to the hub, behind the version gate.
     fn ssh(&self) -> Result<Ssh, GatewayError> {
         let program = self
             .options
@@ -1273,9 +1333,14 @@ impl Remotes {
             .askpass
             .clone()
             .map_err(|why| GatewayError::internal(tidy(&why)))?;
+        let prompts = GatedPrompts::new(
+            program.clone(),
+            Arc::clone(&self.versions),
+            Arc::clone(&self.prompts),
+        );
         let mut ssh = Ssh::new(program)
             .with_env_passthrough(Vec::<String>::new())
-            .with_prompts(askpass, Arc::clone(&self.prompts) as Arc<dyn PromptHandler>);
+            .with_prompts(askpass, Arc::new(prompts) as Arc<dyn PromptHandler>);
         if let Some(dir) = &self.options.runtime_dir {
             ssh = ssh.with_runtime_dir(dir);
         }
@@ -1283,6 +1348,47 @@ impl Remotes {
             ssh = ssh.with_multiplex(on);
         }
         Ok(ssh)
+    }
+
+    /// [`Core::ssh`], once `ssh -V` has been asked (so a refused prompt's error can say why).
+    async fn checked_ssh(&self) -> Result<Ssh, GatewayError> {
+        let ssh = self.ssh()?;
+        self.ssh_check().ask().await;
+        Ok(ssh)
+    }
+
+    /// Whether this computer's ssh may answer prompts.
+    fn ssh_check(&self) -> SshCheck {
+        SshCheck::new(
+            Arc::clone(&self.versions),
+            self.options.ssh.as_ref().ok().cloned(),
+        )
+    }
+
+    /// An ssh failure as a gateway error ([`ssh_error`]); when this computer's ssh may answer no
+    /// prompt, a sign-in that failed says so. (No prompt from that ssh is ever shown, so none
+    /// was cancelled by the person: the gate refused it.)
+    fn ssh_err(&self, host: &str, error: &SshError) -> GatewayError {
+        let mapped = ssh_error(host, error);
+        let Some(refusal) = self.ssh_check().known_refusal() else {
+            return mapped;
+        };
+        match error {
+            SshError::Cancelled => GatewayError::unreachable(format!("{host}: {refusal}")),
+            SshError::AuthFailed { .. } | SshError::HostKeyRejected { .. } => {
+                with_note(mapped, Some(refusal))
+            }
+            _ => mapped,
+        }
+    }
+
+    /// A helper failure as a gateway error ([`helper_error`]), its ssh failures as
+    /// [`Core::ssh_err`] says.
+    fn helper_err(&self, host: &str, error: &HelperError) -> GatewayError {
+        match error {
+            HelperError::Ssh(e) => self.ssh_err(host, e),
+            other => helper_error(host, other),
+        }
     }
 
     fn connector_options(&self, transport: Option<Transport>) -> ConnectorOptions {
@@ -1319,55 +1425,275 @@ impl Remotes {
         };
         let daemon = Daemon::new(target, launcher_of(remote.launcher)).with_last_hop(last_hop);
         let _runtime = self.runtime.enter();
-        Tunnel::start(daemon, self.connector_options(remote.transport))
-            .map_err(|e| link::tunnel_error(&remote.host, &e))
+        let tunnel = Tunnel::start(daemon, self.connector_options(remote.transport))
+            .map_err(|e| link::tunnel_error(&remote.host, &e))?;
+        #[cfg(test)]
+        self.seams
+            .tunnels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(tunnel.clone());
+        Ok(tunnel)
     }
 
-    /// A SLURM site recipe: the built-in `generic` one, or one of the person's.
-    fn site(&self, name: Option<&str>) -> Result<Site, GatewayError> {
-        let name = name.unwrap_or("generic");
-        if name == "generic" {
-            return Ok(generic());
+    /// What a link's follower keeps in step.
+    fn follow(&self) -> Follow {
+        Follow {
+            registry: Arc::clone(&self.registry),
+            tokens: Arc::clone(&self.tokens),
+            ssh: self.ssh_check(),
         }
-        let Some(dir) = self.options.sites_dir.clone().or_else(sites_dir) else {
-            return Err(GatewayError::invalid(
-                "there is no home folder to find site recipes in",
-            ));
+    }
+
+    /// Makes saved remote workspace `id`'s tunnel and the link following it ([`Core::install`]).
+    /// One that cannot be made leaves the workspace `unreachable`, saying why. `ended` hears how
+    /// the tunnel's first attempt ends. Whether a link was put in.
+    fn reconnect(&self, id: &str, remote: &RemoteConnection, ended: Option<Ended>) -> bool {
+        let tunnel = match self.tunnel_for(remote) {
+            Ok(tunnel) => tunnel,
+            Err(e) => {
+                tracing::warn!(workspace = %id, error = %e, "cannot reach a remote workspace");
+                self.registry
+                    .set_state(id, WorkspaceState::Unreachable, Some(e.message));
+                return false;
+            }
         };
-        for loaded in load_sites(&dir) {
-            match loaded {
-                Ok(site) if site.name == name => return Ok(site),
-                Err(e)
-                    if std::path::Path::new(&e.file)
-                        .file_stem()
-                        .is_some_and(|stem| stem == name) =>
-                {
-                    return Err(GatewayError::invalid(tidy(&e.to_string())));
-                }
-                _ => {}
+        self.at("reconnect: tunnel made");
+        let connector = Arc::new(RemoteConnector::new(
+            id.to_owned(),
+            tunnel.clone(),
+            Arc::clone(&self.tokens),
+        ));
+        self.install(id, tunnel, connector, ended)
+    }
+
+    /// Puts in a link following `tunnel` for workspace `id`, with `connector` attached, if the
+    /// workspace is still registered; the link it replaces closes. Checked under the links lock,
+    /// and [`Remotes::remove`] takes the workspace out of the registry before it takes its link
+    /// out: a link put in before is closed by the remove, and one after finds no workspace.
+    /// Otherwise `tunnel` closes. Whether the link was put in.
+    fn install(
+        &self,
+        id: &str,
+        tunnel: Tunnel,
+        connector: Arc<dyn Connector>,
+        ended: Option<Ended>,
+    ) -> bool {
+        let mut links = self.lock_links();
+        if self.registry.record(id).is_none() {
+            drop(links);
+            tracing::info!(workspace = %id, "the workspace was removed meanwhile; its new connection is closed");
+            self.runtime.spawn(async move { tunnel.close().await });
+            return false;
+        }
+        self.registry.attach(id, connector);
+        let link = Link::start(id.to_owned(), tunnel, self.follow(), ended, &self.runtime);
+        let old = links.insert(id.to_owned(), Arc::new(link));
+        drop(links);
+        if let Some(old) = old {
+            old.detach();
+            self.runtime.spawn(async move { old.close().await });
+        }
+        true
+    }
+
+    /// A retry of workspace `id` ([`Remotes::retry`]): a fresh attempt, unless one runs (then one
+    /// more comes after it) or the workspace is connected.
+    fn retry(&self, id: &str, remote: &RemoteConnection) {
+        if self
+            .lock_links()
+            .get(id)
+            .is_some_and(|link| link.is_connected())
+        {
+            tracing::debug!(workspace = %id, "connected: nothing to try again");
+            return;
+        }
+        {
+            let mut retries = self.lock_retries();
+            if let Some(again) = retries.get_mut(id) {
+                *again = true;
+                tracing::debug!(workspace = %id, "an attempt runs: one more comes after it");
+                return;
+            }
+            retries.insert(id.to_owned(), false);
+        }
+        self.attempt(id, remote);
+    }
+
+    /// Starts a retry's attempt: a fresh tunnel, whose first attempt's end the link's follower
+    /// tells [`Core::attempt_ended`].
+    fn attempt(&self, id: &str, remote: &RemoteConnection) {
+        let core = self.clone();
+        let workspace = id.to_owned();
+        let ended: Ended = Box::new(move |outcome| core.attempt_ended(&workspace, outcome));
+        if !self.reconnect(id, remote, Some(ended)) {
+            self.lock_retries().remove(id);
+        }
+    }
+
+    /// A retry's attempt ended: one more if it failed and a retry came meanwhile; else the
+    /// workspace takes retries afresh.
+    fn attempt_ended(&self, id: &str, outcome: Outcome) {
+        let again = {
+            let mut retries = self.lock_retries();
+            let again = outcome == Outcome::Failed && retries.get(id) == Some(&true);
+            if again {
+                retries.insert(id.to_owned(), false);
+            } else {
+                retries.remove(id);
+            }
+            again
+        };
+        if !again {
+            return;
+        }
+        match self.registry.record(id).map(|r| r.connection) {
+            Some(Connection::Remote(remote)) => {
+                tracing::info!(workspace = %id, "trying the connection once more, as asked meanwhile");
+                self.attempt(id, &remote);
+            }
+            _ => {
+                self.lock_retries().remove(id);
             }
         }
-        Err(GatewayError::invalid(format!(
-            "there is no site recipe {:?}: add {}",
-            crate::gateway::error::shorten(name),
-            dir.join(format!("{name}.toml")).display()
-        )))
     }
 
-    fn lock_adds(&self) -> MutexGuard<'_, HashMap<String, watch::Sender<bool>>> {
-        self.adds
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// The last, synchronous part of pairing: claims workspace `id` (named `name` by its hub,
+    /// which is not trusted) for the machine `remote` reaches, keeps `token` in the keychain
+    /// under it, and puts in the link following `tunnel`.
+    ///
+    /// The id is claimed in the registry first, in one step that refuses another workspace's id
+    /// (the local one's, or a remote one's on another machine), and only then is the token kept
+    /// under it; if keeping it fails, the claim is undone. A remove that comes meanwhile takes
+    /// the workspace out, maybe before the token is kept: then the token is deleted again, no
+    /// link is put in, and pairing fails.
+    fn keep(
+        &self,
+        host: &str,
+        tunnel: Tunnel,
+        remote: RemoteConnection,
+        id: &str,
+        name: &str,
+        token: DeviceToken,
+    ) -> Result<GatewayWorkspace, GatewayError> {
+        let name = workspace_name(name);
+        let connector: Arc<dyn Connector> = Arc::new(RemoteConnector::new(
+            id.to_owned(),
+            tunnel.clone(),
+            Arc::clone(&self.tokens),
+        ));
+        let record = WorkspaceRecord {
+            id: id.to_owned(),
+            name: name.clone(),
+            kind: WorkspaceKind::Remote,
+            connection: Connection::Remote(Box::new(remote)),
+        };
+        let claimed = self
+            .registry
+            .claim_remote(record, Arc::clone(&connector), WorkspaceState::Connecting)
+            .map_err(|taken| {
+                tracing::warn!(host, workspace = %id, "a hub claimed the id of a workspace already here");
+                let held = crate::gateway::error::shorten(&taken.name);
+                GatewayError::invalid(if taken.local {
+                    format!(
+                        "the hub on {host} reports the id of this computer's own workspace, \
+                         already added as {held}"
+                    )
+                } else {
+                    format!(
+                        "the hub on {host} reports the id of a workspace already added as \
+                         {held}; remove it first"
+                    )
+                })
+            })?;
+        self.at("pair: claimed");
+        if let Err(e) = self.tokens.set(id, &token) {
+            self.registry.unclaim(claimed);
+            return Err(GatewayError::internal(format!(
+                "cannot keep the workspace's token: {e}"
+            )));
+        }
+        drop(token);
+        if !self.install(id, tunnel, connector, None) {
+            tracing::info!(host, workspace = %id, "the workspace was removed while it was being added");
+            if let Err(e) = self.tokens.delete(id) {
+                tracing::warn!(workspace = %id, error = %e, "cannot delete the token of a workspace removed meanwhile");
+            }
+            return Err(removed_meanwhile(host));
+        }
+        self.registry.set_state(id, WorkspaceState::Ready, None);
+        Ok(self
+            .registry
+            .list()
+            .into_iter()
+            .find(|w| w.id == id)
+            .unwrap_or_else(|| GatewayWorkspace {
+                id: id.to_owned(),
+                name,
+                kind: WorkspaceKind::Remote,
+                state: WorkspaceState::Ready,
+                detail: None,
+            }))
     }
 
-    fn lock_plans(&self) -> MutexGuard<'_, PlanStore<Plan>> {
-        self.plans
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// Reads the hub's device token over SSH, between this call's random markers (so whatever a
+    /// login shell's start-up files print around it does not count). An error never holds it.
+    async fn read_token(&self, target: &Target) -> Result<DeviceToken, GatewayError> {
+        let host = target.host();
+        let helper = target.layout().current_binary();
+        let tag = new_id();
+        let begin = format!("@@pitcrew-token-begin-{tag}");
+        let end = format!("@@pitcrew-token-end-{tag}");
+        let output = target
+            .ssh()
+            .run_limited(
+                host,
+                &[
+                    "sh",
+                    "-c",
+                    READ_TOKEN,
+                    "sh",
+                    helper.as_str(),
+                    begin.as_str(),
+                    end.as_str(),
+                ],
+                TOKEN_LIMITS,
+            )
+            .await
+            .map_err(|e| self.ssh_err(host, &e))?;
+        if output.success() {
+            std::str::from_utf8(&output.stdout)
+                .ok()
+                .and_then(|text| between(text, &begin, &end))
+                .and_then(|token| DeviceToken::new(token).ok())
+                .ok_or_else(|| {
+                    GatewayError::internal(format!(
+                        "the helper's token file on {host} does not hold a token"
+                    ))
+                })
+        } else {
+            let said = String::from_utf8_lossy(&output.stderr);
+            let last = said
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("");
+            Err(GatewayError::unreachable(format!(
+                "cannot read the helper's device token on {host} (exit code {:?}): {}",
+                output.code,
+                tidy(last)
+            )))
+        }
     }
 
     fn lock_links(&self) -> MutexGuard<'_, HashMap<String, Arc<Link>>> {
         self.links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_retries(&self) -> MutexGuard<'_, HashMap<String, bool>> {
+        self.retries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -1454,56 +1780,6 @@ async fn helper_status(target: &Target) -> Option<HelperFound> {
     })
 }
 
-/// Reads the hub's device token over SSH, between this call's random markers (so whatever a
-/// login shell's start-up files print around it does not count). An error never holds it.
-async fn read_token(target: &Target) -> Result<DeviceToken, GatewayError> {
-    let host = target.host();
-    let helper = target.layout().current_binary();
-    let tag = new_id();
-    let begin = format!("@@pitcrew-token-begin-{tag}");
-    let end = format!("@@pitcrew-token-end-{tag}");
-    let output = target
-        .ssh()
-        .run_limited(
-            host,
-            &[
-                "sh",
-                "-c",
-                READ_TOKEN,
-                "sh",
-                helper.as_str(),
-                begin.as_str(),
-                end.as_str(),
-            ],
-            TOKEN_LIMITS,
-        )
-        .await
-        .map_err(|e| ssh_error(host, &e))?;
-    if output.success() {
-        std::str::from_utf8(&output.stdout)
-            .ok()
-            .and_then(|text| between(text, &begin, &end))
-            .and_then(|token| DeviceToken::new(token).ok())
-            .ok_or_else(|| {
-                GatewayError::internal(format!(
-                    "the helper's token file on {host} does not hold a token"
-                ))
-            })
-    } else {
-        let said = String::from_utf8_lossy(&output.stderr);
-        let last = said
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("");
-        Err(GatewayError::unreachable(format!(
-            "cannot read the helper's device token on {host} (exit code {:?}): {}",
-            output.code,
-            tidy(last)
-        )))
-    }
-}
-
 /// The text between the line `begin` and the line `end`, trimmed: the one the remote command
 /// printed between its markers.
 fn between<'a>(text: &'a str, begin: &str, end: &str) -> Option<&'a str> {
@@ -1516,7 +1792,7 @@ fn between<'a>(text: &'a str, begin: &str, end: &str) -> Option<&'a str> {
 /// A workspace's name as the hub gives it, which is not trusted: cleaned as a notification's
 /// text is (no control, bidi or invisible characters, whitespace collapsed) and cut to 80
 /// characters.
-fn workspace_name(name: &str) -> String {
+pub(crate) fn workspace_name(name: &str) -> String {
     let name = crate::notify::clean(name, 80);
     if name.is_empty() {
         "Remote workspace".to_owned()
@@ -1613,150 +1889,4 @@ pub(crate) fn new_id() -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ids_are_random_hex() {
-        let a = new_id();
-        let b = new_id();
-        assert_eq!(a.len(), 32);
-        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
-        assert_ne!(a, b);
-    }
-
-    #[test]
-    fn messages_are_tidied() {
-        assert_eq!(
-            tidy("auth failed\nfor pcd_SECRETSECRETSECRET \u{1b}[0m"),
-            "auth failed for pcd_…  [0m"
-        );
-        assert_eq!(tidy(&"word ".repeat(400)).chars().count(), 1001);
-        // A long run of token characters is taken for a secret.
-        assert_eq!(tidy(&"x".repeat(2000)), "…");
-    }
-
-    #[test]
-    fn failures_get_the_contracts_codes() {
-        use crate::gateway::ErrorCode;
-        assert_eq!(
-            ssh_error("hpc-login", &SshError::Cancelled).message,
-            "signing in to hpc-login was cancelled"
-        );
-        assert_eq!(
-            ssh_error("hpc-login", &SshError::Cancelled).code,
-            ErrorCode::Unreachable
-        );
-        assert_eq!(
-            ssh_error(
-                "hpc-login",
-                &SshError::AuthFailed {
-                    stderr: "Permission denied".into()
-                }
-            )
-            .code,
-            ErrorCode::Unreachable
-        );
-        assert_eq!(
-            helper_error("hpc-login", &HelperError::NoHashTool).code,
-            ErrorCode::Invalid
-        );
-        assert_eq!(
-            helper_error("hpc-login", &HelperError::SubmitFailed("no account".into())).code,
-            ErrorCode::Invalid
-        );
-        assert_eq!(
-            helper_error("hpc-login", &HelperError::Slurm("squeue failed".into())).code,
-            ErrorCode::Unreachable
-        );
-        assert_eq!(
-            helper_error("hpc-login", &HelperError::Ssh(SshError::Cancelled)).code,
-            ErrorCode::Unreachable
-        );
-        assert_eq!(
-            check_host("-oProxyCommand=x").unwrap_err().code,
-            ErrorCode::Invalid
-        );
-        assert!(check_host("hpc-login").is_ok());
-    }
-
-    #[test]
-    fn progress_is_the_contracts_shape() {
-        assert_eq!(
-            serde_json::to_value(AddProgress::new("Copy", StepState::Running, None)).unwrap(),
-            serde_json::json!({ "step": "Copy", "state": "running" })
-        );
-        assert_eq!(
-            serde_json::to_value(AddProgress::new(
-                ADD_STEP,
-                StepState::Failed,
-                Some("why".into())
-            ))
-            .unwrap(),
-            serde_json::json!({ "step": "add", "state": "failed", "detail": "why" })
-        );
-        let probe = RemoteProbe {
-            host: "hpc-login".into(),
-            os: "linux".into(),
-            arch: "x86_64".into(),
-            helper: Some(HelperFound {
-                version: "0.4.0".into(),
-                running: true,
-            }),
-            slurm: Some(SlurmFound {
-                version: "slurm 23.02.7".into(),
-                default_partition: Some("batch".into()),
-                srun_overlap: true,
-            }),
-            tmux: Some(TmuxFound {
-                version: "3.3a".into(),
-            }),
-        };
-        assert_eq!(
-            serde_json::to_value(probe).unwrap(),
-            serde_json::json!({
-                "host": "hpc-login", "os": "linux", "arch": "x86_64",
-                "helper": { "version": "0.4.0", "running": true },
-                "slurm": { "version": "slurm 23.02.7", "defaultPartition": "batch", "srunOverlap": true },
-                "tmux": { "version": "3.3a" }
-            })
-        );
-    }
-
-    #[test]
-    fn the_token_is_read_between_its_markers() {
-        let (begin, end) = ("@@pitcrew-token-begin-ab", "@@pitcrew-token-end-ab");
-        let out = format!(
-            "Welcome to hpc-login!\nlast login yesterday\n{begin}\npcd_secret\n\n{end}\nbye\n"
-        );
-        assert_eq!(between(&out, begin, end), Some("pcd_secret"));
-        assert_eq!(between("pcd_secret\n", begin, end), None);
-        assert_eq!(between(&format!("{begin}\npcd_secret"), begin, end), None);
-    }
-
-    #[test]
-    fn a_hubs_name_is_cleaned_and_cut() {
-        assert_eq!(
-            workspace_name("Demo\u{202e}  Lab\n\u{1b}[31m"),
-            "Demo Lab [31m"
-        );
-        assert_eq!(workspace_name("x".repeat(500).as_str()).chars().count(), 80);
-        assert_eq!(workspace_name("\u{200b}\n"), "Remote workspace");
-    }
-
-    #[test]
-    fn a_failed_undo_is_in_the_error() {
-        let e = GatewayError::unreachable("cannot reach the helper on hpc-login");
-        assert_eq!(with_note(e.clone(), None), e);
-        let e = with_note(
-            e,
-            Some("job 4242 may still be queued on hpc-login; cancel it with scancel 4242".into()),
-        );
-        assert_eq!(e.code, crate::gateway::ErrorCode::Unreachable);
-        assert!(
-            e.message.ends_with("cancel it with scancel 4242"),
-            "{}",
-            e.message
-        );
-    }
-}
+mod tests;

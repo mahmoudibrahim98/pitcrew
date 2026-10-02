@@ -106,6 +106,15 @@ mod unix {
             "a_cancelled_sign_in_while_reconnecting_is_retried",
             a_cancelled_sign_in_while_reconnecting_is_retried,
         ),
+        ("retries_are_coalesced", retries_are_coalesced),
+        (
+            "an_old_ssh_gets_no_prompt_answered",
+            an_old_ssh_gets_no_prompt_answered,
+        ),
+        (
+            "a_name_set_on_the_hub_shows_after_a_reconnect",
+            a_name_set_on_the_hub_shows_after_a_reconnect,
+        ),
         ("an_add_can_be_cancelled", an_add_can_be_cancelled),
         (
             "plans_expire_and_missing_programs_are_clear_errors",
@@ -1374,6 +1383,180 @@ mod unix {
         assert_eq!(e["code"], "unknown_workspace");
         let e = w.call("gateway_workspace_retry", json!({})).unwrap_err();
         assert_eq!(e["code"], "invalid");
+    }
+
+    /// Five retries while one attempt runs make one more attempt after it (it failed), not one
+    /// each; a retry of a connected workspace does nothing. An attempt is one sign-in: one link,
+    /// one prompt.
+    fn retries_are_coalesced() {
+        let w = world(false, |_, _| {});
+        let id = w.add_direct(150).unwrap();
+        // The connection drops; reconnecting asks for a password, which the person cancels.
+        w.machine.require_password(PASSWORD);
+        w.answers.lock().unwrap().hold = true;
+        w.machine.drop_link();
+        let open = w.open_prompt();
+        w.call("gateway_prompt_reply", json!({ "id": open.id }))
+            .unwrap();
+        w.wait("unreachable after the cancel", |w| {
+            w.state(&id) == Some(WorkspaceState::Unreachable)
+        });
+        let links = w.machine.calls_of("link");
+        let prompts = w.events(PROMPT_EVENT).len();
+
+        // Five clicks: one attempt, which asks once.
+        for _ in 0..5 {
+            let retried = w
+                .call("gateway_workspace_retry", json!({ "workspace": id }))
+                .unwrap();
+            assert_eq!(retried, Value::Null);
+        }
+        let first = w.open_prompt();
+        std::thread::sleep(Duration::from_secs(1));
+        assert_eq!(w.state(&id), Some(WorkspaceState::Connecting));
+        assert_eq!(w.machine.calls_of("link"), links + 1, "one attempt");
+        assert_eq!(w.events(PROMPT_EVENT).len(), prompts + 1);
+        assert_eq!(w.remotes().prompts().open().len(), 1);
+
+        // That attempt fails (its sign-in is cancelled): one more comes, as asked meanwhile.
+        w.call("gateway_prompt_reply", json!({ "id": first.id }))
+            .unwrap();
+        w.wait("the next attempt's prompt", |w| {
+            w.remotes()
+                .prompts()
+                .open()
+                .iter()
+                .any(|p| p.id != first.id)
+        });
+        let second = w.open_prompt();
+        assert_eq!(w.machine.calls_of("link"), links + 2);
+        // It signs in, and nothing comes after it.
+        w.call(
+            "gateway_prompt_reply",
+            json!({ "id": second.id, "answer": PASSWORD }),
+        )
+        .unwrap();
+        w.wait("ready", |w| w.state(&id) == Some(WorkspaceState::Ready));
+        std::thread::sleep(Duration::from_secs(2));
+        assert_eq!(w.machine.calls_of("link"), links + 2);
+        assert_eq!(w.events(PROMPT_EVENT).len(), prompts + 2);
+
+        // Connected: a retry leaves it alone.
+        w.call("gateway_workspace_retry", json!({ "workspace": id }))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(w.machine.calls_of("link"), links + 2);
+        assert_eq!(w.state(&id), Some(WorkspaceState::Ready));
+        let me = w
+            .call(
+                "gateway_request",
+                json!({ "req": { "workspace": id, "method": "GET", "path": "/v1/me" } }),
+            )
+            .unwrap();
+        assert_eq!(me["status"], 200, "{me}");
+    }
+
+    /// An ssh older than 8.4 (the fake says 8.1) gets no prompt answered: none is shown, ssh is
+    /// stopped before it sends anything, and the error says why. `ssh -V` is asked once. Keys
+    /// that need no prompt still work.
+    fn an_old_ssh_gets_no_prompt_answered() {
+        let w = world(false, |_, _| {});
+        w.machine
+            .ssh_version("OpenSSH_8.1p1, OpenSSL 1.1.1k  FIPS 25 Mar 2021");
+        // The UI would answer anything it is asked.
+        *w.answers.lock().unwrap() = Answers {
+            password: Some(PASSWORD.into()),
+            accept_host_key: true,
+            hold: false,
+        };
+        let refused = |w: &World| {
+            let e = w
+                .call("gateway_remote_probe", json!({ "host": HOST }))
+                .unwrap_err();
+            assert_eq!(e["code"], "unreachable", "{e}");
+            let message = e["message"].as_str().unwrap();
+            assert!(
+                message.contains("ssh 8.4 or newer is needed to sign in from the app"),
+                "{message}"
+            );
+            assert!(message.contains("OpenSSH 8.1"), "{message}");
+        };
+        // A password, asked by ssh and by the server; a new host key.
+        w.machine.require_password(PASSWORD);
+        refused(&w);
+        w.machine
+            .keyboard_interactive(Some("Enter passphrase for key '~/.ssh/id_ed25519':"));
+        refused(&w);
+        w.machine.keyboard_interactive(None);
+        w.machine.unknown_host_key();
+        refused(&w);
+        // Nothing was shown, nothing answered, nothing sent (not even an empty password).
+        assert!(
+            w.events(PROMPT_EVENT).is_empty(),
+            "{:?}",
+            w.events(PROMPT_EVENT)
+        );
+        assert!(w.machine.asked().is_empty(), "{:?}", w.machine.asked());
+        assert_eq!(w.machine.calls_of("version"), 1, "{:?}", w.machine.calls());
+
+        // With keys, nothing is asked, and it works.
+        w.machine.sign_in_with_keys();
+        let probe = w
+            .call("gateway_remote_probe", json!({ "host": HOST }))
+            .unwrap();
+        assert_eq!(probe["host"], HOST);
+        assert_eq!(w.machine.calls_of("version"), 1);
+    }
+
+    /// A name set on the hub (by first-run setup, on a fresh hub) shows once the tunnel connects
+    /// again, cleaned as at pairing, saved, and sent to the page.
+    fn a_name_set_on_the_hub_shows_after_a_reconnect() {
+        let name_of = |w: &World, id: &str| {
+            w.registry
+                .list()
+                .into_iter()
+                .find(|ws| ws.id == id)
+                .map(|ws| ws.name)
+                .unwrap_or_default()
+        };
+        let w = world(false, |_, _| {});
+        // A fresh hub: "Workspace" until it is set up.
+        w.machine.fresh_hub();
+        let id = w.add_direct(160).unwrap();
+        assert_ne!(id, DEMO);
+        assert_eq!(name_of(&w, &id), "Workspace");
+        let body = json!({
+            "workspace_name": "Thesis\u{202e} lab",
+            "person": { "name": "Sam Rivera", "handle": "@sam" },
+            "machine_name": "Cluster login",
+        });
+        let setup = w
+            .call(
+                "gateway_request",
+                json!({ "req": { "workspace": id, "method": "POST", "path": "/v1/setup",
+                                 "body": body.to_string() } }),
+            )
+            .unwrap();
+        assert!(setup["status"].as_u64().unwrap() < 300, "{setup}");
+        // Until the tunnel connects again, the hub is not asked.
+        assert_eq!(name_of(&w, &id), "Workspace");
+
+        w.machine.drop_link();
+        w.wait("the hub's new name", |w| name_of(w, &id) == "Thesis lab");
+        assert!(
+            std::fs::read_to_string(&w.registry_file)
+                .unwrap()
+                .contains("\"name\": \"Thesis lab\""),
+            "saved"
+        );
+        w.wait("the new name sent to the page", |w| {
+            w.events(WORKSPACES_EVENT).iter().any(|list| {
+                list.as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|ws| ws["id"] == id.as_str() && ws["name"] == "Thesis lab")
+            })
+        });
     }
 
     /// `gateway_remote_cancel` stops a running add and undoes what it started: a submitted job
