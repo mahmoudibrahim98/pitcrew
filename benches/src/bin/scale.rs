@@ -3,7 +3,7 @@
 //! ```text
 //! pitcrew-bench-scale [scan|start|hook|growth|all] [--sessions N] [--seed N] [--pitcrewd PATH]
 //!                     [--idle SECONDS] [--starts N] [--probes N] [--growth-turns N]
-//!                     [--work DIR] [--min-free-gib N] [--keep]
+//!                     [--work DIR] [--min-free-gib N] [--keep] [--keep-cache]
 //! pitcrew-bench-scale gen --out DIR [--sessions N] [--seed N]
 //! ```
 //!
@@ -33,7 +33,7 @@ use std::time::{Duration, SystemTime};
 
 const USAGE: &str = "usage: pitcrew-bench-scale [scan|start|hook|growth|all] [--sessions N] \
 [--seed N] [--pitcrewd PATH] [--idle SECONDS] [--starts N] [--probes N] [--growth-turns N] \
-[--work DIR] [--min-free-gib N] [--keep]\n       pitcrew-bench-scale gen --out DIR \
+[--work DIR] [--min-free-gib N] [--keep] [--keep-cache]\n       pitcrew-bench-scale gen --out DIR \
 [--sessions N] [--seed N]";
 
 #[derive(Debug, PartialEq)]
@@ -94,6 +94,7 @@ fn parse(mut args: impl Iterator<Item = String>, pitcrewd: PathBuf) -> Result<Co
             "--work" => options.work_parent = Some(PathBuf::from(value()?)),
             "--out" => out = Some(PathBuf::from(value()?)),
             "--keep" => options.keep = true,
+            "--keep-cache" => options.drop_cache = false,
             "-h" | "--help" => return Err(USAGE.to_owned()),
             other => return Err(format!("unknown argument {other:?}\n{USAGE}")),
         }
@@ -193,6 +194,8 @@ mod tests {
         assert_eq!(options("").sessions, homes::TRANSCRIPTS);
         assert_eq!(options("scan").stage, Stage::Scan);
         assert_eq!(options("hook --probes 3 --idle 1").probes, 3);
+        assert!(options("").drop_cache);
+        assert!(!options("scan --keep-cache").drop_cache);
         let o = options("growth --sessions 200 --seed 9 --pitcrewd /x/pitcrewd --keep --work /w");
         assert_eq!(
             (o.stage, o.sessions, o.seed, o.keep),

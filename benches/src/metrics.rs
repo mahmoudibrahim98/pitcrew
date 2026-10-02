@@ -161,7 +161,8 @@ pub struct Metric {
     /// Where it can be measured.
     pub needs: Needs,
     /// Whether runs are compared with the baseline. Off where the measurement's resolution is
-    /// coarser than the threshold (idle CPU is counted in 0.05% ticks), so only the budget is
+    /// coarser than the threshold (idle CPU is counted in 0.05% ticks), or where one sample
+    /// moves by about the threshold from run to run (the first scan), so only the budget is
     /// checked.
     pub compare: bool,
 }
@@ -245,6 +246,16 @@ const fn scale(name: &'static str, unit: Unit, budget: Option<Budget>) -> Metric
         Needs::Linux,
         metric(name, Source::Test(TestId::Scale), unit, budget),
     )
+}
+
+/// A scale number checked against its budget only: it is one sample (a scan takes half a
+/// minute) that moved by 7% or more between runs on a quiet machine, or it is read at a
+/// resolution (100 ms polls) too coarse for a 10% threshold.
+const fn scale_budget_only(name: &'static str, unit: Unit, budget: Option<Budget>) -> Metric {
+    Metric {
+        compare: false,
+        ..scale(name, unit, budget)
+    }
 }
 
 const fn full(metric: Metric) -> Metric {
@@ -354,8 +365,8 @@ pub const METRICS: &[Metric] = &[
     ),
     test_ms("cli.hook.up.tcp", TestId::CliHookTiming, HOOK_UP),
     test_ms("cli.hook.down.tcp", TestId::CliHookTiming, HOOK_DOWN),
-    scale("scale.first_scan", Unit::Ms, Some(FIRST_SCAN)),
-    scale("scale.first_scan.first_session", Unit::Ms, None),
+    scale_budget_only("scale.first_scan", Unit::Ms, Some(FIRST_SCAN)),
+    scale_budget_only("scale.first_scan.first_session", Unit::Ms, None),
     scale("scale.rss.scan_peak", Unit::Mib, Some(DAEMON_RSS)),
     scale("scale.rss.scan_steady", Unit::Mib, Some(DAEMON_RSS)),
     scale("scale.rss.restart_peak", Unit::Mib, Some(DAEMON_RSS)),

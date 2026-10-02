@@ -657,6 +657,14 @@ mod tests {
         s.metrics.iter().find(|l| l.name == name).unwrap()
     }
 
+    fn base_from_scope(scope: Scope, readings: &Readings) -> Baseline {
+        to_baseline(
+            &compare(scope, "m", readings, None, DEFAULT_THRESHOLD),
+            None,
+            None,
+        )
+    }
+
     fn base_from(readings: &Readings) -> Baseline {
         to_baseline(
             &compare(QUICK, "m", readings, None, DEFAULT_THRESHOLD),
@@ -948,6 +956,29 @@ mod tests {
         if cfg!(target_os = "linux") {
             assert!(s.passed, "{}", render(&s));
             assert_eq!(get(&s, "scale.cold_start").status, Status::New);
+        }
+    }
+
+    #[test]
+    fn the_first_scan_is_checked_against_its_budget_not_the_baseline() {
+        let with = Scope {
+            scale: true,
+            ..QUICK
+        };
+        let mut readings = all_quick(1.0);
+        readings.extend(scale_readings());
+        readings.insert("scale.first_scan".to_owned(), Reading::same(20_000.0));
+        readings.insert("scale.cold_start".to_owned(), Reading::same(100.0));
+        let base = base_from_scope(with, &readings);
+        // Half as slow again is within the 60 s budget, so it passes; a cold start 20% slower
+        // than its baseline regresses.
+        readings.insert("scale.first_scan".to_owned(), Reading::same(31_000.0));
+        readings.insert("scale.cold_start".to_owned(), Reading::same(120.0));
+        let s = compare(with, "m", &readings, Some(&base), DEFAULT_THRESHOLD);
+        if cfg!(target_os = "linux") {
+            let scan = get(&s, "scale.first_scan");
+            assert_eq!((scan.baseline, scan.status), (None, Status::Ok));
+            assert_eq!(get(&s, "scale.cold_start").status, Status::Regressed);
         }
     }
 

@@ -105,6 +105,10 @@ pub struct Options {
     pub growth_events: u64,
     /// Keep the folder (and say where it is) instead of deleting it.
     pub keep: bool,
+    /// Drop the page cache before the first scan (when allowed: it needs root), so the scan
+    /// reads the transcripts from disk as a first run does, not from the memory the generator
+    /// just wrote them into.
+    pub drop_cache: bool,
     /// Where to make the folder; the system temp dir if not given.
     pub work_parent: Option<PathBuf>,
     /// The least free space, in GiB, that must remain after the run's estimated need.
@@ -130,6 +134,7 @@ impl Options {
             growth_turns: 40,
             growth_events: 5_000,
             keep: false,
+            drop_cache: true,
             work_parent: None,
             min_free_gib: 6,
             scan_timeout: Duration::from_secs(30 * 60),
@@ -178,15 +183,14 @@ struct Env {
     work: PathBuf,
     homes: PathBuf,
     state: PathBuf,
+    /// `TMUX_TMPDIR` for the daemons: short, because tmux's socket path must fit a unix socket
+    /// address (the daemon falls back to a shared `/tmp/pitcrew-<uid>` when it would not).
+    tmux: PathBuf,
 }
 
 impl Env {
     fn hub_db(&self) -> PathBuf {
         self.state.join("hub.db")
-    }
-
-    fn tmux_dir(&self) -> PathBuf {
-        self.work.join("tmux")
     }
 
     fn log(&self, n: usize) -> PathBuf {
@@ -224,7 +228,7 @@ impl Daemon {
         match tmux {
             Tmux::AsShipped => {
                 command
-                    .env("TMUX_TMPDIR", env.tmux_dir())
+                    .env("TMUX_TMPDIR", &env.tmux)
                     .env_remove("XDG_RUNTIME_DIR");
             }
             Tmux::Refused => {
@@ -290,9 +294,17 @@ impl Daemon {
         }
     }
 
-    /// The distinct warnings and errors in the log so far, without their times, and how many
-    /// lines there were.
+    /// The distinct warnings and errors in the log, without their times, and how many lines
+    /// there were. What a fresh daemon says before its workspace is set up, and that it listens
+    /// on loopback TCP, is left out: those lines are always there.
     fn log_problems(&self) -> (usize, Vec<String>) {
+        const EXPECTED: [&str; 5] = [
+            "the workspace is not set up yet",
+            "the workspace has no local machine",
+            "the workspace has no person yet",
+            "the runner is off: the workspace has no local machine",
+            "listening on loopback TCP",
+        ];
         let text = fs::read_to_string(&self.log).unwrap_or_default();
         let mut seen: Vec<String> = Vec::new();
         let mut count = 0;
@@ -303,6 +315,9 @@ impl Daemon {
             else {
                 continue;
             };
+            if EXPECTED.iter().any(|e| rest.contains(e)) {
+                continue;
+            }
             count += 1;
             let rest: String = rest.chars().take(160).collect();
             if !seen.contains(&rest) && seen.len() < 5 {
@@ -369,7 +384,7 @@ impl Drop for Daemon {
 /// Kills the tmux servers the run's daemons may have started (their sockets are under the run's
 /// own `TMUX_TMPDIR`).
 fn kill_tmux(env: &Env) {
-    let mut stack = vec![env.tmux_dir()];
+    let mut stack = vec![env.tmux.clone()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
             continue;
@@ -640,11 +655,22 @@ pub fn run(options: &Options) -> Result<()> {
 }
 
 fn measure(options: &Options, work: &Path) -> Result<()> {
+    let short = std::env::temp_dir();
+    let short = if short.as_os_str().len() <= 40 {
+        short
+    } else {
+        PathBuf::from("/tmp")
+    };
+    let tmux = tempfile::Builder::new()
+        .prefix("pcs-")
+        .tempdir_in(&short)
+        .map_err(|e| format!("cannot make a folder in {}: {e}", short.display()))?;
     let env = Env {
         bin: options.pitcrewd.clone(),
         work: work.to_path_buf(),
         homes: work.join("homes"),
         state: work.join("state"),
+        tmux: tmux.path().to_path_buf(),
     };
     fs::create_dir_all(env.work.join("home")).map_err(|e| e.to_string())?;
     let result = stages(options, &env);
@@ -678,9 +704,20 @@ fn stages(options: &Options, env: &Env) -> Result<()> {
     );
     let total = s.transcripts() as u64;
     sync();
+    let dropped = options.drop_cache && drop_caches();
+    println!(
+        "scale: page cache {} before the first scan",
+        if dropped {
+            "dropped"
+        } else if options.drop_cache {
+            "could not be dropped (not allowed); the generator's files are still in memory"
+        } else {
+            "kept"
+        }
+    );
 
     // 2. The first scan.
-    let scanned = first_scan(options, env, total)?;
+    let scanned = first_scan(options, env, total, dropped)?;
     sync();
 
     // 3. Starts with the index present.
@@ -706,6 +743,12 @@ fn sync() {
     let _ = Command::new("sync").status();
 }
 
+/// Drops the page cache, if the system allows it. Returns whether it did.
+fn drop_caches() -> bool {
+    sync();
+    fs::write("/proc/sys/vm/drop_caches", "3").is_ok()
+}
+
 fn load_average() -> String {
     fs::read_to_string("/proc/loadavg")
         .map(|s| s.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
@@ -714,7 +757,7 @@ fn load_average() -> String {
 
 /// Starts a daemon on the empty state to size an empty database, stops it, starts it again,
 /// sets the workspace up, and watches the runner index the homes.
-fn first_scan(options: &Options, env: &Env, total: u64) -> Result<Scanned> {
+fn first_scan(options: &Options, env: &Env, total: u64, dropped: bool) -> Result<Scanned> {
     let mut first = Daemon::start(env, Tmux::AsShipped, 0)?;
     let empty_start = first.ready_in;
     first.stop()?;
@@ -855,7 +898,7 @@ fn first_scan(options: &Options, env: &Env, total: u64) -> Result<Scanned> {
     }
     let (problems, distinct) = daemon.log_problems();
     println!(
-        "scale: daemon log: {problems} warnings or errors{}",
+        "scale: daemon log: {problems} unexpected warnings or errors{}",
         if distinct.is_empty() {
             String::new()
         } else {
@@ -883,8 +926,13 @@ fn first_scan(options: &Options, env: &Env, total: u64) -> Result<Scanned> {
         ms(scan),
         "ms",
         &format!(
-            "{total} transcripts, {rev} events, {:.1} s of cpu",
-            ticks_scan as f64 / 100.0
+            "{total} transcripts, {rev} events, {:.1} s of cpu, {}",
+            ticks_scan as f64 / 100.0,
+            if dropped {
+                "read from disk (page cache dropped)"
+            } else {
+                "read from the page cache"
+            }
         ),
     );
     if let Some(first) = first_session {
@@ -976,9 +1024,7 @@ fn cold_starts(options: &Options, env: &Env, total: u64) -> Result<()> {
         d.stop()?;
     }
     // After the caches are dropped, if that is allowed: a first start after boot.
-    sync();
-    let dropped = fs::write("/proc/sys/vm/drop_caches", "3").is_ok();
-    let cold_cache = if dropped {
+    let cold_cache = if drop_caches() {
         let mut d = Daemon::start(env, Tmux::AsShipped, 40)?;
         let t = ms(d.ready_in);
         d.stop()?;

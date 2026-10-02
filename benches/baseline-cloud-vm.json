@@ -1,0 +1,44 @@
+{
+  "schema": 1,
+  "machine": "Intel(R) Xeon(R) Processor @ 2.10GHz, 4 threads, 16 GiB RAM, linux x86_64",
+  "recorded": "2026-10-02",
+  "mode": "full",
+  "note": "Cloud VM class: 4 vCPU Intel Xeon @ 2.10GHz under KVM, 16 GiB RAM, Ubuntu 24.04, Linux 6.18, ext4 on a virtio disk, Rust 1.97, tmux 3.4. Only the scale metrics (benches/run.sh --scale-only), added with --extend-baseline on a quiet VM (nothing else running; load average under 0.4 at the start). Four earlier runs of the same code agreed within 10% on every best value. scale.first_scan and scale.first_scan.first_session are not here: they are one sample that moved by 7% (the scan, 29.0 to 31.0 s with the page cache dropped) or 25% (the first session, polled every 100 ms) between runs, so they are checked against their budgets only. The four rss.* metrics are not here: they are over their 80 MiB budget, and --extend-baseline adds only metrics within theirs. Compare with: benches/run.sh --scale-only --baseline benches/baseline-cloud-vm.json",
+  "metrics": {
+    "scale.cold_start": {
+      "value": 100.8,
+      "best": 93.69,
+      "unit": "ms"
+    },
+    "scale.cold_start.no_tmux": {
+      "value": 66.26,
+      "best": 64.32,
+      "unit": "ms"
+    },
+    "scale.db.after_scan": {
+      "value": 349.6,
+      "best": 349.6,
+      "unit": "MiB"
+    },
+    "scale.db.per_1000_events": {
+      "value": 478.2,
+      "best": 478.2,
+      "unit": "KiB"
+    },
+    "scale.db.per_session": {
+      "value": 35.76,
+      "best": 35.76,
+      "unit": "KiB"
+    },
+    "scale.hook_to_frame": {
+      "value": 79.0,
+      "best": 78.02,
+      "unit": "ms"
+    },
+    "scale.index.after_scan": {
+      "value": 12.86,
+      "best": 12.86,
+      "unit": "MiB"
+    }
+  }
+}
