@@ -243,16 +243,57 @@ pub(crate) fn owner_and_dacl(object: &impl std::os::windows::io::AsHandle) -> io
     Ok(unsafe { take_local_string(wide) })
 }
 
-/// What the askpass server's pipe must have: the current user as owner, and a protected DACL
-/// with one entry, allowing the current user. For tests.
+/// A SID as `S-1-…`, from that form or from one of SDDL's aliases: SDDL writes some SIDs as
+/// aliases (the built-in Administrator, as CI's Windows runner is, as `LA`). For tests.
+#[cfg(test)]
+pub(crate) fn sid_of(text: &str) -> io::Result<String> {
+    use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+    let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+    let mut sid: PSID = ptr::null_mut();
+    // SAFETY: `wide` is NUL-terminated; `sid` is a valid out-pointer and receives a `LocalAlloc`
+    // block, freed below.
+    if unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) } == 0 || sid.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let mut out: *mut u16 = ptr::null_mut();
+    // SAFETY: `sid` came from the call above and is alive; `out` is a valid out-pointer.
+    let ok = unsafe { ConvertSidToStringSidW(sid, &mut out) };
+    // Read the error before `LocalFree` can overwrite it.
+    let failed = (ok == 0 || out.is_null()).then(io::Error::last_os_error);
+    // SAFETY: allocated by `ConvertStringSidToSidW`, freed once, after its last use.
+    unsafe {
+        LocalFree(sid);
+    }
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    // SAFETY: a NUL-terminated `LocalAlloc` string from the call above, used once.
+    Ok(unsafe { take_local_string(out) })
+}
+
+/// What the askpass server's pipe must have, from its owner and DACL in SDDL
+/// ([`owner_and_dacl`]): the current user as owner, and a protected DACL with one entry,
+/// allowing the current user. SIDs are compared as SIDs, not as SDDL text. For tests.
 #[cfg(test)]
 pub(crate) fn assert_current_user_only(sddl: &str) {
-    let sid = current_user_sid().expect("the current user's SID");
-    assert!(sid.starts_with("S-1-"), "{sid}");
-    assert!(sddl.starts_with(&format!("O:{sid}D:P(")), "{sddl}");
-    assert_eq!(sddl.matches('(').count(), 1, "{sddl}");
-    assert!(sddl.contains("(A;"), "{sddl}");
-    assert!(sddl.ends_with(&format!(";;;{sid})")), "{sddl}");
+    let me = current_user_sid().expect("the current user's SID");
+    assert!(me.starts_with("S-1-"), "{me}");
+    let sid = |text: &str| sid_of(text).unwrap_or_else(|e| panic!("{text:?} in {sddl}: {e}"));
+    let (owner, dacl) = sddl
+        .strip_prefix("O:")
+        .and_then(|rest| rest.split_once("D:"))
+        .unwrap_or_else(|| panic!("no owner and DACL: {sddl}"));
+    assert_eq!(sid(owner), me, "the owner: {sddl}");
+    let entry = dacl
+        .strip_prefix("P(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("not a protected DACL of entries: {sddl}"));
+    assert!(!entry.contains('('), "more than one entry: {sddl}");
+    // type;flags;rights;object;inherited object;account
+    let fields: Vec<&str> = entry.split(';').collect();
+    assert_eq!(fields.len(), 6, "{sddl}");
+    assert_eq!(fields[0], "A", "not an allowing entry: {sddl}");
+    assert_eq!(sid(fields[5]), me, "the entry's account: {sddl}");
 }
 
 #[cfg(test)]
@@ -274,6 +315,11 @@ mod tests {
         options.first_pipe_instance(true);
         let server = security.create(&options, &name).unwrap();
         assert_current_user_only(&owner_and_dacl(&server).unwrap());
+        // SIDs from SDDL, whatever form it writes them in.
+        let me = current_user_sid().unwrap();
+        assert_eq!(sid_of(&me).unwrap(), me);
+        assert_eq!(sid_of("BA").unwrap(), "S-1-5-32-544");
+        assert!(sid_of("not a sid").is_err());
         // The default descriptor has more entries (Everyone may read).
         let plain = ServerOptions::new()
             .first_pipe_instance(true)
