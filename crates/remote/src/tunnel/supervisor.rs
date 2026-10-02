@@ -297,6 +297,11 @@ impl Supervisor {
         // A connection that held only briefly since the failing began.
         let mut flapped = false;
         loop {
+            // An attempt from unreachable shows, so that its end is a change too, even when it
+            // fails again for the same reason.
+            if matches!(*self.shared.state.borrow(), LinkState::Unreachable { .. }) {
+                self.shared.set(LinkState::Connecting);
+            }
             let outcome = {
                 let establishing = self.establish();
                 tokio::pin!(establishing);

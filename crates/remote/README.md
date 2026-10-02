@@ -6,7 +6,9 @@ Remote machines: SSH connection manager, helper deployment, launchers (direct, t
 
 ## What is here
 
-Everything goes through the user's own **system OpenSSH** and `~/.ssh/config`.
+Everything goes through the user's own **system OpenSSH** and `~/.ssh/config`. `~` is `HOME`
+on Unix; on Windows it is `USERPROFILE` (where Windows' own OpenSSH looks), else `HOME`, for
+`~/.ssh/config` and `~/.pitcrew/sites` alike.
 
 - `list_hosts()` lists concrete `Host` names from `~/.ssh/config` and its `Include`s (cycles
   skipped, at most 256 files). `Ssh::resolve(host)` asks `ssh -G` what a host means; the config
@@ -44,7 +46,8 @@ Everything goes through the user's own **system OpenSSH** and `~/.ssh/config`.
   - **Stopping:** a cancel, a timeout or a dropped call stops ssh and everything it started
     (askpass, `ProxyJump` hops, `Match exec`): its process group on Unix, its **Job Object** on
     Windows (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so the OS also ends it if PitCrew dies). The
-    Job Object needs four Win32 calls; `src/job.rs` is the crate's only unsafe code.
+    Job Object needs four Win32 calls; `src/job.rs` and `src/pipe_security.rs` (below) are the
+    crate's only unsafe code.
   - **Errors:** ssh's own messages go to a log (`-E`, at `LogLevel=ERROR`) apart from the remote
     stderr. Exit 255 is an error only when that log shows ssh failing, and its kind comes only
     from ssh's own message formats, matched as whole lines. ssh logs server text without
@@ -55,8 +58,9 @@ Everything goes through the user's own **system OpenSSH** and `~/.ssh/config`.
   - `Ssh::run_limited` adds an output cap and a timeout that pauses while a prompt is open.
 - **Askpass bridge.** With `Ssh::with_prompts(askpass, handler)`, ssh runs `pitcrew-askpass`
   for passwords, passphrases, one-time codes and host keys; it asks the desktop's
-  `PromptHandler` over a private socket (a named pipe on Windows, which the client opens at
-  identification level only). Both ends prove a per-call key first. Answers are never stored
+  `PromptHandler` over a private socket (on Windows a named pipe that the current user owns
+  and alone may open, with remote clients rejected, which the client opens at identification
+  level only). Both ends prove a per-call key first. Answers are never stored
   or logged. Needs OpenSSH 8.4+ on the local machine. The askpass path must be absolute and
   exist (a missing one would fail every prompt). Without a handler, calls run in `BatchMode`
   and fail instead of prompting.
@@ -464,6 +468,21 @@ connector.close().await;
   forward). A failed sign-in or a cancelled prompt (also one for a connection, on Windows) is
   `Unreachable { SignIn }` and waits for `retry()`. Prompts while reconnecting go through the
   askpass bridge; nothing is stored. Resuming the API stream (`since=`) is the caller's.
+- **Attempts show.** Each attempt from `Unreachable` (its time came, `retry()`, `wake()`)
+  makes the state `Connecting` until it ends: `Connected`, `Unverifiable`, or `Unreachable`
+  again, even for the same reason. Connections wait for it (up to `connect_wait`). To follow
+  one attempt, mark the watch seen, ask, then wait for a change and for the end:
+
+  ```rust
+  let mut state = connector.watch();
+  state.borrow_and_update();
+  connector.retry();
+  state.changed().await?;                    // the attempt started (and may have ended)
+  let end = state.wait_for(|s| *s != LinkState::Connecting).await?.clone();
+  ```
+
+  The same connector keeps its login link where it can (a helper not running, a refused
+  record), so a retry through it costs no new sign-in, where a new connector would.
 - **Security:** agent and X11 forwarding, local commands and configured forwardings are off on
   every call; every `-o` is PitCrew's; ssh gets only `MINIMAL_ENV` (and passed-through names);
   local sockets live in the 0700 directory; only the root's socket is forwarded; reasons in

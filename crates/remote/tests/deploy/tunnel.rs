@@ -5,7 +5,7 @@
 use crate::slurm::{self as fake_slurm, Config};
 use crate::tunnel_fake::{
     APP_ENV, ASKED, AppSpec, CLOSE_WRITE, DROP_AFTER, FORWARD_FAIL_ONCE, FORWARD_SILENT,
-    MAX_SESSIONS, NET, NO_FORWARDING, Net, PASSWORD, REFUSED, TUNNEL_LOG, TunnelCall,
+    HOLD_CHECKS, MAX_SESSIONS, NET, NO_FORWARDING, Net, PASSWORD, REFUSED, TUNNEL_LOG, TunnelCall,
 };
 use crate::unix::{
     Machine, RUN_ENV, Remote, alive, daemon, deploy_and_start, launch_options, me, mode,
@@ -186,12 +186,19 @@ fn open_when_free(
     }
 }
 
-/// The tunnel calls the machine's fake ssh saw.
+/// The tunnel calls the machine's fake ssh saw. A last line without its newline is still being
+/// written, and is left for the next look.
 fn tunnel_calls(m: &Machine) -> Vec<TunnelCall> {
-    std::fs::read_to_string(m.dir.path().join(TUNNEL_LOG))
-        .unwrap_or_default()
+    let mut log = std::fs::read(m.dir.path().join(TUNNEL_LOG)).unwrap_or_default();
+    log.truncate(
+        log.iter()
+            .rposition(|&b| b == b'\n')
+            .map_or(0, |end| end + 1),
+    );
+    String::from_utf8(log)
+        .unwrap()
         .lines()
-        .map(|l| serde_json::from_str(l).unwrap())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("{e}: {l:?}")))
         .collect()
 }
 
@@ -1370,7 +1377,9 @@ fn tunnel_links_left_by_a_crash_are_stopped() {
 }
 
 /// A burst of failed connections (the helper refuses its socket now): one check of where the
-/// daemon is, not one per connection.
+/// daemon is, not one per connection. Paced by events, not the clock: the check the first
+/// failure asks for is held open until the burst is over (no other may start while one runs),
+/// so the burst may take as long as the machine needs.
 fn tunnel_a_burst_of_failures_makes_one_check() {
     use std::os::unix::fs::PermissionsExt as _;
     let m = Machine::new();
@@ -1417,22 +1426,30 @@ fn tunnel_a_burst_of_failures_makes_one_check() {
             })
             .count()
     };
+    let refused = || {
+        let err = rt.block_on(connector.connect()).unwrap_err();
+        assert!(matches!(err, TunnelError::Refused(_)), "{err:?}");
+    };
     let before = checks(&m);
-    let burst = Instant::now();
-    rt.block_on(async {
-        for _ in 0..15 {
-            let err = connector.connect().await.unwrap_err();
-            assert!(matches!(err, TunnelError::Refused(_)), "{err:?}");
-        }
-    });
-    let took = burst.elapsed();
-    assert!(took < Duration::from_secs(8), "the burst took {took:?}");
+    let hold = m.dir.path().join(HOLD_CHECKS);
+    std::fs::write(&hold, "").unwrap();
+    refused();
     crate::unix::eventually("a check", || checks(&m) > before);
-    std::thread::sleep(Duration::from_secs(3));
+    for _ in 1..15 {
+        refused();
+    }
     assert_eq!(checks(&m) - before, 1, "checks for a burst of 15 failures");
-    // The failures after the first asked too: one more check comes once the gap (10 s) is over,
-    // not none.
-    crate::unix::eventually("the deferred check", || checks(&m) - before == 2);
+    std::fs::remove_file(&hold).unwrap();
+    // The failures after the first asked too: one more check comes once the first is over and
+    // the gap (10 s) has passed, not none. Nothing asks for a third.
+    let asked = Instant::now();
+    while checks(&m) - before < 2 {
+        assert!(
+            asked.elapsed() < Duration::from_secs(120),
+            "no deferred check"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     std::thread::sleep(Duration::from_secs(1));
     assert_eq!(checks(&m) - before, 2);
     assert_eq!(links(&m), 1);
@@ -1444,6 +1461,85 @@ fn tunnel_a_burst_of_failures_makes_one_check() {
     assert!(echo(&rt, &connector, &data) == data);
     rt.block_on(connector.close());
     stop_helper(&m);
+}
+
+/// Each attempt from unreachable (a wake's, a retry's, or its time's) is `Connecting` until it
+/// ends, so a watcher sees where it ends though it fails again for the same reason; connections
+/// wait for it. Paced by holding the attempt's endpoint check, not by the clock.
+fn tunnel_attempts_from_unreachable_show() {
+    let m = Machine::new();
+    pitcrew_remote_deploy(&m.plain());
+    let rt = runtime();
+    let launcher = Arc::new(DirectLauncher::new(launch_options()));
+    // No attempt comes by itself while the case runs.
+    let patient = ConnectorOptions {
+        retry_every: Duration::from_secs(600),
+        ..options()
+    };
+    let connector = start(&rt, Daemon::new(target(&m), launcher), patient);
+    let not_running = |s: &LinkState| {
+        matches!(
+            s,
+            LinkState::Unreachable {
+                why: Unreachable::NotRunning,
+                ..
+            }
+        )
+    };
+    let first = wait_for(
+        &rt,
+        &connector,
+        "not running",
+        Duration::from_secs(30),
+        not_running,
+    );
+    let hold = m.dir.path().join(HOLD_CHECKS);
+
+    // A wake's attempt: connecting while it runs, and a connection waits for it.
+    std::fs::write(&hold, "").unwrap();
+    connector.wake();
+    wait_for(
+        &rt,
+        &connector,
+        "the wake's attempt",
+        Duration::from_secs(30),
+        |s| *s == LinkState::Connecting,
+    );
+    let waiting = {
+        let connector = connector.clone();
+        rt.spawn(async move { connector.connect().await.map(drop) })
+    };
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!waiting.is_finished(), "a connection did not wait");
+    std::fs::remove_file(&hold).unwrap();
+    let again = wait_for(
+        &rt,
+        &connector,
+        "not running again",
+        Duration::from_secs(30),
+        not_running,
+    );
+    assert_eq!(again, first);
+    let err = rt.block_on(waiting).unwrap().unwrap_err();
+    assert!(
+        matches!(err, TunnelError::NotConnected(ref s) if not_running(s)),
+        "{err:?}"
+    );
+
+    // A retry's attempt, followed as the README shows: its start is a change, and so its end.
+    std::fs::write(&hold, "").unwrap();
+    let mut state = connector.watch();
+    state.borrow_and_update();
+    connector.retry();
+    rt.block_on(state.changed()).unwrap();
+    assert_eq!(*state.borrow_and_update(), LinkState::Connecting);
+    std::fs::remove_file(&hold).unwrap();
+    let end = rt
+        .block_on(state.wait_for(|s| *s != LinkState::Connecting))
+        .unwrap()
+        .clone();
+    assert_eq!(end, first);
+    rt.block_on(connector.close());
 }
 
 /// Without connection reuse (as on Windows) each connection signs in by itself. Closing the
@@ -2204,6 +2300,10 @@ pub(crate) const CASES: &[(&str, fn())] = &[
     (
         "tunnel_a_burst_of_failures_makes_one_check",
         tunnel_a_burst_of_failures_makes_one_check,
+    ),
+    (
+        "tunnel_attempts_from_unreachable_show",
+        tunnel_attempts_from_unreachable_show,
     ),
     (
         "tunnel_without_connection_reuse",

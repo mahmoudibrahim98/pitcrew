@@ -23,9 +23,12 @@ pub mod askpass;
 pub mod bridge;
 mod config;
 pub mod helper;
-// The crate's only unsafe code: a Job Object for ssh on Windows.
+// The crate's only unsafe code, Win32 calls on Windows: a Job Object for ssh, and the askpass
+// pipe's security descriptor.
 #[cfg(windows)]
 mod job;
+#[cfg(windows)]
+mod pipe_security;
 mod private;
 pub mod probe;
 pub mod quote;

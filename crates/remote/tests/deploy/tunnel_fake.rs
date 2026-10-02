@@ -32,8 +32,9 @@
 //! `refused.log`), `forward-fail-once` (the next forward request fails), `forward-silent`
 //! (forwarded connections are taken and never answered), `max-sessions`
 //! (sshd's `MaxSessions`), `drop-after` (seconds a link lasts), `password` (logins to `cluster`
-//! ask for it; each ask is logged to `asked.log` as `text` or `empty`, never the answer). Each
-//! tunnel call is logged to `tunnel.log`.
+//! ask for it; each ask is logged to `asked.log` as `text` or `empty`, never the answer),
+//! `hold-checks` (sessions other than `pitcrewd connect` wait while it exists, after they are
+//! logged). Each tunnel call is logged to `tunnel.log`, one write per line.
 //!
 //! The fake daemon (`pitcrewd serve`) echoes every connection, half-closes like it, answers
 //! `GET` with HTTP, and on `close-write\n` says `closing\n`, half-closes, and appends what it
@@ -65,6 +66,7 @@ pub(crate) const FORWARD_SILENT: &str = "forward-silent";
 pub(crate) const MAX_SESSIONS: &str = "max-sessions";
 pub(crate) const DROP_AFTER: &str = "drop-after";
 pub(crate) const PASSWORD: &str = "password";
+pub(crate) const HOLD_CHECKS: &str = "hold-checks";
 /// What the fake daemon reads to half-close first.
 pub(crate) const CLOSE_WRITE: &[u8] = b"close-write\n";
 /// Makes the binary play an app that starts a connector and dies (see [`act_as_app`]).
@@ -232,8 +234,24 @@ pub(crate) fn fake(remote: &Remote, dir: &Path, args: &[String]) -> Option<u8> {
         "control" => control_op(&call),
         "link" => link(&machine, &call),
         "stdio" => stdio_forward(&call),
-        _ => session(remote, &call),
+        _ => {
+            hold_checks(&machine, &call);
+            session(remote, &call)
+        }
     })
+}
+
+/// Holds a session that is not a connection (an endpoint check, say) while `hold-checks`
+/// exists.
+fn hold_checks(machine: &Path, call: &Call) {
+    let connection = call
+        .command
+        .as_deref()
+        .and_then(decode)
+        .is_some_and(|line| line.contains(" connect "));
+    while !connection && machine.join(HOLD_CHECKS).exists() {
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// A call that logs in by itself (no connection reuse): to `cluster`, asks for the machine's
@@ -267,7 +285,11 @@ fn log_call(machine: &Path, call: &Call, kind: &str) {
         .append(true)
         .open(machine.join(TUNNEL_LOG))
     {
-        let _ = writeln!(file, "{}", serde_json::to_string(&entry).unwrap());
+        // One write per line: fake ssh processes log at once, and two writes each could
+        // interleave into one line.
+        let mut line = serde_json::to_string(&entry).unwrap();
+        line.push('\n');
+        let _ = file.write_all(line.as_bytes());
     }
 }
 
@@ -546,12 +568,12 @@ fn sign_in(machine: &Path, host: &str, expected: &str) -> bool {
             .append(true)
             .open(machine.join(ASKED))
             .unwrap();
-        writeln!(
-            asked,
-            "{}",
-            if answer.is_empty() { "empty" } else { "text" }
-        )
-        .unwrap();
+        let said = if answer.is_empty() {
+            "empty\n"
+        } else {
+            "text\n"
+        };
+        asked.write_all(said.as_bytes()).unwrap();
         if answer == expected {
             return true;
         }

@@ -262,7 +262,9 @@ fn check_plain_path(what: &str, path: &str, max: usize) -> Result<(), HelperErro
 
 /// Checks one extra `#SBATCH` option: `--name=value`, or `--name` alone for [`SBATCH_FLAGS`];
 /// the name on [`ALLOWED_SBATCH`], the value 1 to 256 characters of `A-Z a-z 0-9 _ . , : = + / @
-/// % & | [ ] ( ) * -`, not starting with `-` (`--comment=--uid=0` could read as an option).
+/// % & | [ ] ( ) * -`, not starting with `-` (`--comment=--uid=0` could read as an option), and
+/// no `hetjob` or `packjob` in any case (the rule [`JobSpec::new`] and [`JobSpec::render`] apply
+/// to every line, so an option accepted here is never refused there).
 ///
 /// # Errors
 /// [`HelperError::InvalidArgument`] naming the problem.
@@ -311,7 +313,7 @@ pub fn check_sbatch_option(option: &str) -> Result<(), HelperError> {
         }
         None => {}
     }
-    Ok(())
+    check_no_hetjob(option)
 }
 
 /// Refuses an `#SBATCH` line holding `hetjob` or `packjob` in any case: SLURM up to 20.11 would
@@ -445,6 +447,7 @@ impl JobOptions {
         }
         // Each value is an `#SBATCH` line of its own: refused here already, so that what a
         // recipe loads with also renders (the script checks each line again).
+        // `check_sbatch_option` has already applied the rule to the extra options.
         let values = [
             &self.partition,
             &self.account,
@@ -453,7 +456,7 @@ impl JobOptions {
             &self.gres,
             &self.job_name,
         ];
-        for value in values.into_iter().flatten().chain(&self.sbatch) {
+        for value in values.into_iter().flatten() {
             check_no_hetjob(value)?;
         }
         Ok(())
@@ -888,6 +891,50 @@ mod tests {
         };
         assert!(options.check().is_err());
         assert!(JobSpec::new(&generic(), &options).is_err());
+    }
+
+    /// Fuzz finding R34 (`fuzz/regressions/remote_slurm/r34-hetjob-word-passes-the-option-check`,
+    /// read from that file): `check_sbatch_option` accepted `--comment=a-hetjob-b`, which
+    /// `JobSpec::new` refuses. The target's property: what the option check accepts, a job takes.
+    #[test]
+    fn the_option_check_refuses_what_a_job_refuses() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fuzz/regressions/remote_slurm/r34-hetjob-word-passes-the-option-check");
+        let raw = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let (mode, text) = raw.split_first().unwrap();
+        assert_eq!(mode % 4, 3, "the input checks #SBATCH options");
+        let found = std::str::from_utf8(text).unwrap();
+        assert_eq!(found, "--comment=a-hetjob-b");
+
+        let err = check_sbatch_option(found).unwrap_err();
+        assert!(err.to_string().contains("\"hetjob\""), "{err}");
+        let job = |option: &str| {
+            let options = JobOptions {
+                sbatch: vec![option.to_owned()],
+                ..JobOptions::default()
+            };
+            JobSpec::new(&generic(), &options)
+        };
+        for option in [
+            found,
+            "--comment=PackJob",
+            "--constraint=a100&HETJOB",
+            "--wckey=packjobs",
+            "--dependency=afterok:1,hetjob",
+        ] {
+            assert!(check_sbatch_option(option).is_err(), "{option}");
+            assert!(job(option).is_err(), "{option}");
+        }
+        for option in [
+            "--comment=a-het-job-b",
+            "--comment=hetjo-b",
+            "--comment=pack-job",
+            "--constraint=a100",
+            "--exclusive",
+        ] {
+            check_sbatch_option(option).unwrap();
+            job(option).unwrap();
+        }
     }
 
     #[test]
