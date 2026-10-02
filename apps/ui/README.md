@@ -25,7 +25,7 @@ corepack pnpm --filter @pitcrew/ui dev    # the UI on http://127.0.0.1:5173
 | `dev` | Vite dev server on 127.0.0.1:5173 |
 | `build` | Type-check, then a production build into `dist/` |
 | `preview` | Serve `dist/` on 127.0.0.1:4173 |
-| `test` | Vitest: the data layer, the shell and the design components, against the real mock hub on a free port. `tests/setup.ts` pins the time zone (UTC), the locale for dates (en-GB) and the clock (from 1 October 2026), so dates render the same on every machine |
+| `test` | Vitest: the data layer, the shell and the design components, against the real mock hub on a free port. `tests/setup.ts` pins the time zone (UTC), the locale for dates (en-GB) and the clock (from 1 October 2026, in the mock hubs tests start too), so dates render the same on every machine |
 | `e2e` | Playwright: the shell against its own mock hub (ports 47399 and 5199; `E2E_HUB_PORT` and `E2E_UI_PORT` move them), with axe checks. `PLAYWRIGHT_CHANNEL=msedge` or `chrome` uses an installed browser. |
 | `size` | After `build`: fails if the initial JS is over 250 kB gzipped, or holds the desktop gateway or `@tauri-apps/api` (the desktop app loads them on demand) |
 | `typecheck` | `tsc -b` |

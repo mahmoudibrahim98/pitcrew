@@ -5,11 +5,10 @@
 // - the default locale for dates is en-GB ("10 Oct", "Wednesday, 30 September 2026"). Node's own
 //   default comes from the system (and on Windows ignores LANG), so the date formatters are
 //   wrapped instead;
-// - the clock starts at PINNED_NOW and runs at the real rate: relative times ("3h") are fixed,
-//   while timeouts and back-offs still see time pass. `vi.useFakeTimers` starts from it too.
+// - the clock starts at 1 October 2026, 09:00 UTC (clock.ts).
 
-/** 1 October 2026, 09:00 UTC: the morning after the demo data's last event. */
-export const PINNED_NOW = Date.UTC(2026, 9, 1, 9, 0);
+import './clock.ts';
+
 export const PINNED_LOCALE = 'en-GB';
 
 process.env.TZ = 'UTC';
@@ -32,12 +31,3 @@ for (const method of ['toLocaleString', 'toLocaleDateString', 'toLocaleTimeStrin
     return native.call(this, locales ?? PINNED_LOCALE, options);
   };
 }
-
-const RealDate = Date;
-const offset = PINNED_NOW - RealDate.now();
-const now = () => RealDate.now() + offset;
-globalThis.Date = new Proxy(RealDate, {
-  construct: (target, args, newTarget) => Reflect.construct(target, args.length === 0 ? [now()] : args, newTarget),
-  apply: () => new RealDate(now()).toString(),
-  get: (target, key, receiver) => (key === 'now' ? now : Reflect.get(target, key, receiver)),
-});

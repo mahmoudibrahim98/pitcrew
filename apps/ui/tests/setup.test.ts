@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { PINNED_NOW } from './setup.ts';
+import { PINNED_NOW } from './clock.ts';
 
 // tests/setup.ts pins what rendered dates depend on, whatever the machine's settings.
 describe('the test setup', () => {
