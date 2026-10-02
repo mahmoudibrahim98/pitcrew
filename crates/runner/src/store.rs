@@ -372,15 +372,6 @@ impl Store {
         raw.into_iter().map(RawTerminal::decode).collect()
     }
 
-    /// The runtime knows a terminal by a new id now (e.g. tmux, after a restart).
-    pub fn retarget_terminal(&self, old: TerminalId, new: TerminalId) -> Result<(), StoreError> {
-        self.conn.execute(
-            "UPDATE terminals SET terminal_id = ?2 WHERE terminal_id = ?1",
-            params![old.0.to_string(), new.0.to_string()],
-        )?;
-        Ok(())
-    }
-
     pub fn forget_terminal(&self, terminal: TerminalId) -> Result<(), StoreError> {
         self.conn.execute(
             "DELETE FROM terminals WHERE terminal_id = ?1",
@@ -906,14 +897,6 @@ mod tests {
         assert_eq!(
             store.terminal_of(s2).expect("of").map(|t| t.terminal),
             Some(next.terminal)
-        );
-        let moved = TerminalId::new();
-        store
-            .retarget_terminal(next.terminal, moved)
-            .expect("retarget");
-        assert_eq!(
-            store.terminal_of(s2).expect("of").map(|t| t.terminal),
-            Some(moved)
         );
         store.unlink_session(s2).expect("unlink");
         assert!(store.terminal_of(s2).expect("of").is_none());
