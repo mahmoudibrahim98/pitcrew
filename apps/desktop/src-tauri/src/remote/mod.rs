@@ -11,10 +11,15 @@
 //! 2. [`Remotes::add`] carries out that plan, once: it deploys the helper (checked against its
 //!    sha256 here and on the machine), starts it (submitting exactly the shown script for
 //!    SLURM), connects through the tunnel, and pairs: it reads the hub's device token over SSH
-//!    (from the file `pitcrewd token show-path` names), checks it by asking the hub which
-//!    workspace it hosts, keeps it in the OS keychain, and registers the workspace. If a step
-//!    fails after the helper was started (or its job submitted) by this add, that is stopped
-//!    again.
+//!    (from the file `pitcrewd token show-path` names, between random markers), checks it by
+//!    asking the hub which workspace it hosts, and registers the workspace with its token in the
+//!    OS keychain. If a step fails after the helper was started (or its job submitted) by this
+//!    add, that is stopped again; if stopping fails too, the error says what may be left.
+//!
+//! **The hub's answer is not trusted.** Its workspace id is claimed in the registry in one step
+//! that refuses an id already held by the local workspace, or by a remote one on another machine
+//! (another host or root): a hostile hub cannot take over another workspace's entry or token.
+//! Only the same machine may be paired again. Its name is cleaned and cut.
 //!
 //! **The token** goes from ssh's output into a [`DeviceToken`] and the keychain, and from there
 //! only into the `Authorization` header or the WebSocket subprotocol of a request to that hub.
@@ -81,9 +86,10 @@ const TOKEN_LIMITS: Limits = Limits {
     timeout: Some(Duration::from_secs(60)),
 };
 
-/// Prints the hub's device token: the file `pitcrewd token show-path` names. `$1` is the helper.
-const READ_TOKEN: &str =
-    "p=$(\"$1\" token show-path) || exit 3\n[ -f \"$p\" ] || exit 4\nexec cat -- \"$p\"";
+/// Prints the hub's device token, the file `pitcrewd token show-path` names, between the lines
+/// `$2` and `$3`. `$1` is the helper.
+const READ_TOKEN: &str = "p=$(\"$1\" token show-path) || exit 3\n[ -f \"$p\" ] || exit 4\n\
+                          printf '%s\\n' \"$2\"\ncat -- \"$p\" || exit 5\nprintf '\\n%s\\n' \"$3\"";
 
 /// How the app reaches remote machines.
 #[derive(Clone)]
@@ -286,7 +292,18 @@ impl Steps {
 /// What a failed add stops again.
 enum Undo {
     Nothing,
-    Stop(Arc<dyn Launcher>),
+    /// The helper this add started.
+    Helper(Arc<dyn Launcher>),
+    /// The SLURM job this add submitted.
+    Job(Arc<dyn Launcher>, u64),
+}
+
+/// `error`, saying also what a failed undo left behind.
+fn with_note(error: GatewayError, note: Option<String>) -> GatewayError {
+    match note {
+        None => error,
+        Some(note) => GatewayError::new(error.code, format!("{}; {note}", error.message)),
+    }
 }
 
 type Links = Arc<Mutex<HashMap<String, Arc<Link>>>>;
@@ -745,10 +762,7 @@ impl Remotes {
         .await
         {
             Ok(tunnel) => tunnel,
-            Err(e) => {
-                self.undo(&target, undo).await;
-                return Err(e);
-            }
+            Err(e) => return Err(with_note(e, self.undo(&target, undo).await)),
         };
         let record = RemoteConnection {
             host: host.clone(),
@@ -770,8 +784,7 @@ impl Remotes {
             Ok(workspace) => Ok(workspace),
             Err(e) => {
                 tunnel.close().await;
-                self.undo(&target, undo).await;
-                Err(e)
+                Err(with_note(e, self.undo(&target, undo).await))
             }
         }
     }
@@ -844,7 +857,7 @@ impl Remotes {
                 "the helper runs"
             );
             let undo = if started.started_now {
-                Undo::Stop(Arc::clone(&launcher))
+                Undo::Helper(Arc::clone(&launcher))
             } else {
                 Undo::Nothing
             };
@@ -876,7 +889,7 @@ impl Remotes {
                     ));
                 }
                 let undo = if submitted.submitted_now {
-                    Undo::Stop(Arc::new(slurm.clone()))
+                    Undo::Job(Arc::new(slurm.clone()), submitted.job)
                 } else {
                     Undo::Nothing
                 };
@@ -907,10 +920,7 @@ impl Remotes {
         };
         match self.wait_for_job(target, &slurm, job, name, progress).await {
             Ok(()) => Ok((Arc::new(slurm), undo)),
-            Err(e) => {
-                self.undo(target, undo).await;
-                Err(e)
-            }
+            Err(e) => Err(with_note(e, self.undo(target, undo).await)),
         }
     }
 
@@ -961,29 +971,35 @@ impl Remotes {
         }
     }
 
-    /// Stops what a failed add started, as far as it can.
-    async fn undo(&self, target: &Target, undo: Undo) {
-        let Undo::Stop(launcher) = undo else {
-            return;
+    /// Stops what a failed add started, as far as it can. `None` when there was nothing to stop
+    /// or it stopped; else what the person should know, for the add's error.
+    async fn undo(&self, target: &Target, undo: Undo) -> Option<String> {
+        let host = target.host();
+        let (launcher, left) = match undo {
+            Undo::Nothing => return None,
+            Undo::Helper(launcher) => (
+                launcher,
+                format!("PitCrew's helper may still be running on {host}"),
+            ),
+            Undo::Job(launcher, job) => (
+                launcher,
+                format!("job {job} may still be queued on {host}; cancel it with scancel {job}"),
+            ),
         };
-        match tokio::time::timeout(UNDO_WAIT, launcher.stop(target)).await {
+        let why = match tokio::time::timeout(UNDO_WAIT, launcher.stop(target)).await {
             Ok(Ok(_)) => {
                 tracing::info!(
-                    host = target.host(),
+                    host,
                     launcher = launcher.name(),
                     "stopped what the failed add started"
                 );
+                return None;
             }
-            Ok(Err(e)) => {
-                tracing::warn!(host = target.host(), error = %tidy(&e.to_string()), "cannot stop what the failed add started");
-            }
-            Err(_) => {
-                tracing::warn!(
-                    host = target.host(),
-                    "stopping what the failed add started took too long"
-                );
-            }
-        }
+            Ok(Err(e)) => tidy(&e.to_string()),
+            Err(_) => format!("no answer within {} s", UNDO_WAIT.as_secs()),
+        };
+        tracing::warn!(host, error = %why, "cannot stop what the failed add started");
+        Some(left)
     }
 
     /// Starts the tunnel and waits for it to connect.
@@ -1035,7 +1051,12 @@ impl Remotes {
         }
     }
 
-    /// Reads the hub's token over SSH, checks it, keeps it, and registers the workspace.
+    /// Reads the hub's token over SSH, checks it, and registers the workspace with it.
+    ///
+    /// The workspace's id and name come from the hub, so they are not trusted: the id is claimed
+    /// in the registry first, in one step that refuses another workspace's id (the local one's,
+    /// or a remote one's on another machine), and only then is the token kept under it. If
+    /// keeping it fails, the claim is undone.
     async fn pair(
         &self,
         target: &Target,
@@ -1057,48 +1078,46 @@ impl Remotes {
                 ))
             })?;
         drop(pairing);
-        if self
-            .registry
-            .record(&id)
-            .is_some_and(|r| r.kind == WorkspaceKind::Local)
-        {
-            return Err(GatewayError::invalid(format!(
-                "the hub on {host} hosts this computer's own workspace"
-            )));
-        }
-        self.tokens.set(&id, &token).map_err(|e| {
-            GatewayError::internal(format!("cannot keep the workspace's token: {e}"))
-        })?;
-        drop(token);
-        Ok(self.register(&id, &name, remote, tunnel))
-    }
-
-    /// Registers workspace `id`, ready, reached through `tunnel`.
-    fn register(
-        &self,
-        id: &str,
-        name: &str,
-        remote: RemoteConnection,
-        tunnel: Tunnel,
-    ) -> GatewayWorkspace {
-        let old = self.lock_links().remove(id);
-        if let Some(old) = old {
-            self.runtime.spawn(async move { old.close().await });
-        }
-        let connector =
-            RemoteConnector::new(id.to_owned(), tunnel.clone(), Arc::clone(&self.tokens));
+        let name = workspace_name(&name);
+        let connector = RemoteConnector::new(id.clone(), tunnel.clone(), Arc::clone(&self.tokens));
         let record = WorkspaceRecord {
-            id: id.to_owned(),
-            name: name.to_owned(),
+            id: id.clone(),
+            name: name.clone(),
             kind: WorkspaceKind::Remote,
             connection: Connection::Remote(Box::new(remote)),
         };
-        if let Err(e) =
-            self.registry
-                .insert(record, Some(Arc::new(connector)), WorkspaceState::Ready)
-        {
-            tracing::warn!(workspace = %id, error = %e, "the workspace is added but the registry is not saved");
+        let claimed = self
+            .registry
+            .claim_remote(record, Arc::new(connector), WorkspaceState::Connecting)
+            .map_err(|taken| {
+                tracing::warn!(host, workspace = %id, "a hub claimed the id of a workspace already here");
+                let held = crate::gateway::error::shorten(&taken.name);
+                GatewayError::invalid(if taken.local {
+                    format!(
+                        "the hub on {host} reports the id of this computer's own workspace, \
+                         already added as {held}"
+                    )
+                } else {
+                    format!(
+                        "the hub on {host} reports the id of a workspace already added as \
+                         {held}; remove it first"
+                    )
+                })
+            })?;
+        if let Err(e) = self.tokens.set(&id, &token) {
+            self.registry.unclaim(claimed);
+            return Err(GatewayError::internal(format!(
+                "cannot keep the workspace's token: {e}"
+            )));
         }
+        drop(token);
+        Ok(self.follow(&id, &name, tunnel))
+    }
+
+    /// Workspace `id` is claimed and its token kept: it is ready, and a task follows its tunnel
+    /// (replacing the one of an earlier pairing of the same machine).
+    fn follow(&self, id: &str, name: &str, tunnel: Tunnel) -> GatewayWorkspace {
+        self.registry.set_state(id, WorkspaceState::Ready, None);
         let link = Link::start(
             id.to_owned(),
             tunnel,
@@ -1106,7 +1125,10 @@ impl Remotes {
             Arc::clone(&self.tokens),
             &self.runtime,
         );
-        self.lock_links().insert(id.to_owned(), Arc::new(link));
+        let old = self.lock_links().insert(id.to_owned(), Arc::new(link));
+        if let Some(old) = old {
+            self.runtime.spawn(async move { old.close().await });
+        }
         self.registry
             .list()
             .into_iter()
@@ -1310,24 +1332,36 @@ async fn helper_status(target: &Target) -> Option<HelperFound> {
     })
 }
 
-/// Reads the hub's device token over SSH. The command's output is overwritten once read; an
-/// error never holds it.
+/// Reads the hub's device token over SSH, between this call's random markers (so whatever a
+/// login shell's start-up files print around it does not count). An error never holds it.
 async fn read_token(target: &Target) -> Result<DeviceToken, GatewayError> {
     let host = target.host();
     let helper = target.layout().current_binary();
-    let mut output = target
+    let tag = new_id();
+    let begin = format!("@@pitcrew-token-begin-{tag}");
+    let end = format!("@@pitcrew-token-end-{tag}");
+    let output = target
         .ssh()
         .run_limited(
             host,
-            &["sh", "-c", READ_TOKEN, "sh", helper.as_str()],
+            &[
+                "sh",
+                "-c",
+                READ_TOKEN,
+                "sh",
+                helper.as_str(),
+                begin.as_str(),
+                end.as_str(),
+            ],
             TOKEN_LIMITS,
         )
         .await
         .map_err(|e| ssh_error(host, &e))?;
-    let token = if output.success() {
+    if output.success() {
         std::str::from_utf8(&output.stdout)
             .ok()
-            .and_then(|text| DeviceToken::new(text.trim()).ok())
+            .and_then(|text| between(text, &begin, &end))
+            .and_then(|token| DeviceToken::new(token).ok())
             .ok_or_else(|| {
                 GatewayError::internal(format!(
                     "the helper's token file on {host} does not hold a token"
@@ -1345,9 +1379,28 @@ async fn read_token(target: &Target) -> Result<DeviceToken, GatewayError> {
             output.code,
             tidy(last)
         )))
-    };
-    output.stdout.fill(0);
-    token
+    }
+}
+
+/// The text between the line `begin` and the line `end`, trimmed: the one the remote command
+/// printed between its markers.
+fn between<'a>(text: &'a str, begin: &str, end: &str) -> Option<&'a str> {
+    let start = text.find(&format!("{begin}\n"))? + begin.len() + 1;
+    let rest = text.get(start..)?;
+    let stop = rest.find(&format!("\n{end}"))?;
+    rest.get(..stop).map(str::trim)
+}
+
+/// A workspace's name as the hub gives it, which is not trusted: cleaned as a notification's
+/// text is (no control, bidi or invisible characters, whitespace collapsed) and cut to 80
+/// characters.
+fn workspace_name(name: &str) -> String {
+    let name = crate::notify::clean(name, 80);
+    if name.is_empty() {
+        "Remote workspace".to_owned()
+    } else {
+        name
+    }
 }
 
 /// Refuses a host name ssh would not take, before anything runs.
@@ -1545,6 +1598,43 @@ mod tests {
                 "slurm": { "version": "slurm 23.02.7", "defaultPartition": "batch", "srunOverlap": true },
                 "tmux": { "version": "3.3a" }
             })
+        );
+    }
+
+    #[test]
+    fn the_token_is_read_between_its_markers() {
+        let (begin, end) = ("@@pitcrew-token-begin-ab", "@@pitcrew-token-end-ab");
+        let out = format!(
+            "Welcome to hpc-login!\nlast login yesterday\n{begin}\npcd_secret\n\n{end}\nbye\n"
+        );
+        assert_eq!(between(&out, begin, end), Some("pcd_secret"));
+        assert_eq!(between("pcd_secret\n", begin, end), None);
+        assert_eq!(between(&format!("{begin}\npcd_secret"), begin, end), None);
+    }
+
+    #[test]
+    fn a_hubs_name_is_cleaned_and_cut() {
+        assert_eq!(
+            workspace_name("Demo\u{202e}  Lab\n\u{1b}[31m"),
+            "Demo Lab [31m"
+        );
+        assert_eq!(workspace_name("x".repeat(500).as_str()).chars().count(), 80);
+        assert_eq!(workspace_name("\u{200b}\n"), "Remote workspace");
+    }
+
+    #[test]
+    fn a_failed_undo_is_in_the_error() {
+        let e = GatewayError::unreachable("cannot reach the helper on hpc-login");
+        assert_eq!(with_note(e.clone(), None), e);
+        let e = with_note(
+            e,
+            Some("job 4242 may still be queued on hpc-login; cancel it with scancel 4242".into()),
+        );
+        assert_eq!(e.code, crate::gateway::ErrorCode::Unreachable);
+        assert!(
+            e.message.ends_with("cancel it with scancel 4242"),
+            "{}",
+            e.message
         );
     }
 }

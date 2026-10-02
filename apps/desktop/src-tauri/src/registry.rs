@@ -194,6 +194,30 @@ struct Entry {
     connector: Option<Arc<dyn Connector>>,
 }
 
+/// Why [`Registry::claim_remote`] refused an id: another workspace holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Taken {
+    /// The name it is held under.
+    pub name: String,
+    /// Whether that is the local workspace.
+    pub local: bool,
+}
+
+/// What [`Registry::claim_remote`] did, to undo it ([`Registry::unclaim`]).
+pub struct Claimed {
+    id: String,
+    previous: Option<Entry>,
+}
+
+impl fmt::Debug for Claimed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Claimed")
+            .field("id", &self.id)
+            .field("replaced", &self.previous.is_some())
+            .finish()
+    }
+}
+
 type Listener = Arc<dyn Fn(&[GatewayWorkspace]) + Send + Sync>;
 
 #[derive(Default)]
@@ -321,11 +345,39 @@ impl Registry {
     /// registered one, and marks it ready. There is one local workspace: if the daemon now reports
     /// another id (its state was reset), the entry takes the new id.
     ///
+    /// An id a remote workspace holds is refused: the local workspace (or, on first start, the
+    /// local daemon's state) is `unreachable`, saying so, and nothing is replaced.
+    ///
     /// # Errors
     /// The registry file cannot be written. The registry in memory is updated anyway.
     pub fn set_local(&self, id: &str, name: &str) -> io::Result<()> {
         let mut inner = self.lock();
         let before = list_of(&inner.entries);
+        if let Some(remote) = inner
+            .entries
+            .iter()
+            .find(|e| e.record.id == id && e.record.kind != WorkspaceKind::Local)
+        {
+            let detail = format!(
+                "this computer's hub reports the id of the remote workspace {}; remove that one \
+                 first",
+                crate::gateway::error::shorten(&remote.record.name)
+            );
+            tracing::warn!(workspace = %id, "the local daemon reports the id of a remote workspace; not registering it");
+            let mut found = false;
+            for entry in &mut inner.entries {
+                if entry.record.kind == WorkspaceKind::Local {
+                    entry.state = WorkspaceState::Unreachable;
+                    entry.detail = Some(detail.clone());
+                    found = true;
+                }
+            }
+            if !found {
+                inner.local_state = Some((WorkspaceState::Unreachable, Some(detail)));
+            }
+            self.changed(inner, &before);
+            return Ok(());
+        }
         let connector = inner.local.clone();
         inner.local_state = None;
         let record = WorkspaceRecord {
@@ -424,6 +476,85 @@ impl Registry {
         let saved = self.save(&inner.entries);
         self.changed(inner, &before);
         saved
+    }
+
+    /// Registers remote workspace `record` (a [`Connection::Remote`]) with its connector, in
+    /// `state`, unless its id is another workspace's: the check and the insert are one step.
+    ///
+    /// The id comes from the remote hub (`GET /v1/workspace`), so it is not trusted: a hub may
+    /// claim the id of a workspace already here. That is refused when the id is the local
+    /// workspace's, or a remote one's on another machine (another host or root). Only the same
+    /// machine may take its id again (pairing it again), and then its entry is replaced.
+    ///
+    /// # Errors
+    /// [`Taken`], with the name the id is held under; nothing changed.
+    pub fn claim_remote(
+        &self,
+        record: WorkspaceRecord,
+        connector: Arc<dyn Connector>,
+        state: WorkspaceState,
+    ) -> Result<Claimed, Taken> {
+        let Connection::Remote(new) = &record.connection else {
+            return Err(Taken {
+                name: record.name.clone(),
+                local: true,
+            });
+        };
+        let mut inner = self.lock();
+        let before = list_of(&inner.entries);
+        let held = inner.entries.iter().position(|e| e.record.id == record.id);
+        if let Some(at) = held {
+            let old = &inner.entries[at].record;
+            let same_machine = match &old.connection {
+                Connection::Remote(old) => old.host == new.host && old.root == new.root,
+                Connection::Local => false,
+            };
+            if old.kind == WorkspaceKind::Local || !same_machine {
+                return Err(Taken {
+                    name: old.name.clone(),
+                    local: old.kind == WorkspaceKind::Local,
+                });
+            }
+        }
+        let id = record.id.clone();
+        let entry = Entry {
+            record,
+            state,
+            detail: None,
+            connector: Some(connector),
+        };
+        let previous = match held {
+            Some(at) => Some(std::mem::replace(&mut inner.entries[at], entry)),
+            None => {
+                inner.entries.push(entry);
+                None
+            }
+        };
+        if let Err(e) = self.save(&inner.entries) {
+            tracing::warn!(workspace = %id, error = %e, "the workspace is added but the registry is not saved");
+        }
+        self.changed(inner, &before);
+        Ok(Claimed { id, previous })
+    }
+
+    /// Undoes [`Registry::claim_remote`]: the entry it replaced comes back, or the one it added
+    /// goes.
+    pub fn unclaim(&self, claimed: Claimed) {
+        let mut inner = self.lock();
+        let before = list_of(&inner.entries);
+        let at = inner.entries.iter().position(|e| e.record.id == claimed.id);
+        match (at, claimed.previous) {
+            (Some(at), Some(previous)) => inner.entries[at] = previous,
+            (Some(at), None) => {
+                inner.entries.remove(at);
+            }
+            (None, Some(previous)) => inner.entries.push(previous),
+            (None, None) => {}
+        }
+        if let Err(e) = self.save(&inner.entries) {
+            tracing::warn!(workspace = %claimed.id, error = %e, "cannot save the workspace registry");
+        }
+        self.changed(inner, &before);
     }
 
     /// Sets a workspace's state.
@@ -812,6 +943,116 @@ mod tests {
         assert_eq!(events.lock().unwrap().len(), before + 1);
         assert_eq!(registry.remove("01JR").unwrap(), None);
         assert!(Registry::load(file).list().is_empty());
+    }
+
+    fn remote_on(id: &str, host: &str, root: &str) -> WorkspaceRecord {
+        let mut record = remote(id);
+        if let Connection::Remote(r) = &mut record.connection {
+            r.host = host.into();
+            r.root = root.into();
+        }
+        record
+    }
+
+    #[test]
+    fn a_remote_cannot_take_another_workspaces_id() {
+        let registry = Registry::in_memory();
+        registry.attach_local(Arc::new(Nowhere));
+        registry.set_local("01JL", "Here").unwrap();
+        registry
+            .claim_remote(
+                remote_on("01JR", "hpc-login", "/home/sam/.pitcrew"),
+                Arc::new(Nowhere),
+                WorkspaceState::Ready,
+            )
+            .unwrap();
+        // The local workspace's id.
+        let taken = registry
+            .claim_remote(
+                remote_on("01JL", "evil", "/home/sam/.pitcrew"),
+                Arc::new(Nowhere),
+                WorkspaceState::Ready,
+            )
+            .unwrap_err();
+        assert_eq!(
+            taken,
+            Taken {
+                name: "Here".into(),
+                local: true
+            }
+        );
+        // A remote's id, from another host or another root.
+        for (host, root) in [
+            ("evil", "/home/sam/.pitcrew"),
+            ("hpc-login", "/scratch/sam/.pitcrew"),
+        ] {
+            let taken = registry
+                .claim_remote(
+                    remote_on("01JR", host, root),
+                    Arc::new(Nowhere),
+                    WorkspaceState::Ready,
+                )
+                .unwrap_err();
+            assert_eq!(taken.name, "Cluster");
+            assert!(!taken.local);
+        }
+        let Some(WorkspaceRecord {
+            connection: Connection::Remote(kept),
+            ..
+        }) = registry.record("01JR")
+        else {
+            panic!("the remote is gone");
+        };
+        assert_eq!(kept.host, "hpc-login", "nothing changed");
+        assert_eq!(registry.record("01JL").unwrap().kind, WorkspaceKind::Local);
+
+        // The same machine again (pairing it again) replaces its entry; undoing puts it back.
+        let mut again = remote_on("01JR", "hpc-login", "/home/sam/.pitcrew");
+        again.name = "Cluster, again".into();
+        let claimed = registry
+            .claim_remote(again, Arc::new(Nowhere), WorkspaceState::Connecting)
+            .unwrap();
+        assert_eq!(registry.record("01JR").unwrap().name, "Cluster, again");
+        registry.unclaim(claimed);
+        assert_eq!(registry.record("01JR").unwrap().name, "Cluster");
+        assert_eq!(registry.list().len(), 2);
+        // A new id is added; undoing removes it.
+        let claimed = registry
+            .claim_remote(
+                remote_on("01JN", "gpu-box", "/home/sam/.pitcrew"),
+                Arc::new(Nowhere),
+                WorkspaceState::Ready,
+            )
+            .unwrap();
+        assert_eq!(registry.list().len(), 3);
+        registry.unclaim(claimed);
+        assert_eq!(registry.list().len(), 2);
+    }
+
+    #[test]
+    fn the_local_daemon_cannot_take_a_remotes_id() {
+        let registry = Registry::in_memory();
+        registry
+            .claim_remote(remote("01JR"), Arc::new(Nowhere), WorkspaceState::Ready)
+            .unwrap();
+        // First start: no local workspace yet.
+        registry.set_local("01JR", "Mine").unwrap();
+        assert_eq!(registry.list().len(), 1);
+        assert_eq!(registry.list()[0].kind, WorkspaceKind::Remote);
+        let (state, detail) = registry.pending_local_state().unwrap();
+        assert_eq!(state, WorkspaceState::Unreachable);
+        assert!(detail.unwrap().contains("remote workspace"));
+        // With a local workspace already: it is not replaced.
+        registry.set_local("01JL", "Here").unwrap();
+        registry.set_local("01JR", "Mine").unwrap();
+        let local = registry
+            .list()
+            .into_iter()
+            .find(|w| w.kind == WorkspaceKind::Local)
+            .unwrap();
+        assert_eq!(local.id, "01JL");
+        assert_eq!(local.state, WorkspaceState::Unreachable);
+        assert_eq!(registry.record("01JR").unwrap().kind, WorkspaceKind::Remote);
     }
 
     #[test]
