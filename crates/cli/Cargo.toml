@@ -36,11 +36,15 @@ pitcrew-auth.workspace = true
 rustix = { version = "=1.1.5", features = ["fs", "net", "process"] }
 
 [dev-dependencies]
+# A home of their own for the binaries the tests start (`pitcrew_fixtures::homes`).
+pitcrew-fixtures.workspace = true
 tempfile.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]
-# A named-pipe server for the transport test. The workspace's version.
-tokio = { workspace = true, features = ["io-util", "net", "rt"] }
+# The transport test serves on the daemon's own pipe listener (`pitcrew_api::NamedPipe`), through
+# axum's `Listener` trait. The workspace's versions.
+axum.workspace = true
+tokio = { workspace = true, features = ["io-util", "net", "rt", "time"] }
 
 [lints]
 workspace = true

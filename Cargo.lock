@@ -1292,9 +1292,11 @@ dependencies = [
 name = "pitcrew-cli"
 version = "0.0.0"
 dependencies = [
+ "axum",
  "clap",
  "pitcrew-api",
  "pitcrew-auth",
+ "pitcrew-fixtures",
  "pitcrew-protocol",
  "rustix",
  "serde",
