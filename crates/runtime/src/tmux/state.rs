@@ -2,17 +2,10 @@
 //! screen model. Updated from `%output`, `%window-close` and `%layout-change` on the reader
 //! thread, and read by the runtime's calls.
 //!
-//! - **The screen model** of each terminal has its own lock, and is fed lazily from the replay
-//!   buffer when the screen is read: output nobody looks at costs no emulation, and one
-//!   terminal's screen never holds up another terminal or the reader thread. Size changes are
-//!   recorded with the offset they happened at and applied in order then. If more output
-//!   arrived since than the buffer keeps, the model starts again from the oldest byte kept
-//!   (2 MiB redraws any screen many times; modes set before it, such as a scroll region, are
-//!   lost), and so it does if the backlog times the screen's area is past a work budget, from
-//!   the last 256 KiB. Counts and strings in the output are bounded first
-//!   ([`super::clamp`]); the model is at least 2 columns wide (vt100 panics on a wide character
-//!   in 1); and should vt100 panic anyway, the model starts again past that output instead of
-//!   failing on it at every read.
+//! - **The screen model** of each terminal ([`crate::screen`]) has its own lock, and is fed
+//!   lazily from the replay buffer when the screen is read: output nobody looks at costs no
+//!   emulation, and one terminal's screen never holds up another terminal or the reader thread.
+//!   Its work is bounded as that module describes.
 //! - **Panes and tags.** Within one server's life a pane id never changes owner, so a known
 //!   live terminal is always found by its own pane, whatever tag that pane carries now; a tag
 //!   is only used to adopt a pane the runtime does not know (after a restart), and only if no
@@ -28,10 +21,11 @@ use pitcrew_interfaces::runtime::{OutputChunk, Screen, TerminalInfo};
 use pitcrew_protocol::ids::TerminalId;
 
 use super::SESSION;
-use super::clamp::CsiClamp;
 use super::conn::lock;
 use crate::control::{PaneId, WindowId};
 use crate::replay::ReplayBuffer;
+pub(crate) use crate::screen::MAX_SIZE;
+use crate::screen::{RESIZES_KEPT, ScreenModel, Unseen, clamp, columns};
 
 /// How far ahead of the output the stored resume offset is kept. A restart after a crash
 /// resumes numbering at most this far past the last byte a reader saw.
@@ -44,26 +38,6 @@ const DEAD_KEPT: usize = 16;
 const UNCLAIMED_BYTES: usize = 256 << 10;
 /// Such panes tracked at once.
 const UNCLAIMED_PANES: usize = 32;
-/// Size changes remembered until the screen model has applied them.
-const RESIZES_KEPT: usize = 64;
-
-/// Terminal sizes the runtime accepts, as the API does.
-pub(crate) const MAX_SIZE: u16 = 1000;
-
-/// The screen model's work per read, in bytes of output times cells of screen. 2 MiB of output
-/// on a 200 by 80 screen fits; a big backlog on a huge screen does not.
-const WORK_BUDGET: u64 = 1 << 35;
-/// What a model that is over its budget starts again from.
-const BUDGET_TAIL: usize = 256 << 10;
-
-fn clamp(size: u16) -> u16 {
-    size.clamp(1, MAX_SIZE)
-}
-
-/// Columns of a screen model: vt100 0.16.2 panics drawing a wide character on 1 column.
-fn columns(size: u16) -> u16 {
-    size.clamp(2, MAX_SIZE)
-}
 
 pub(crate) struct Term {
     pub(crate) id: TerminalId,
@@ -157,147 +131,13 @@ impl Term {
         }
         let chunk = self.buffer.read(at, usize::MAX);
         pieces.push((chunk.offset, chunk.data));
-        let total: usize = pieces.iter().map(|(_, data)| data.len()).sum();
-        let area = u64::from(self.size.0) * u64::from(self.size.1);
-        if total > BUDGET_TAIL && (total as u64).saturating_mul(area) > WORK_BUDGET {
-            pieces = tail(pieces, BUDGET_TAIL);
-            restart = true;
-        }
-        Unseen {
+        Unseen::new(
             pieces,
             restart,
-            resizes: self.resizes.iter().copied().collect(),
-            end: self.buffer.end(),
-            size: self.size,
-        }
-    }
-}
-
-/// The last `keep` bytes of `pieces`, with their offsets.
-fn tail(pieces: Vec<(u64, Vec<u8>)>, keep: usize) -> Vec<(u64, Vec<u8>)> {
-    let mut kept = Vec::new();
-    let mut left = keep;
-    for (offset, data) in pieces.into_iter().rev() {
-        if left == 0 {
-            break;
-        }
-        if data.len() <= left {
-            left -= data.len();
-            kept.push((offset, data));
-        } else {
-            let cut = data.len() - left;
-            kept.push((offset + cut as u64, data[cut..].to_vec()));
-            left = 0;
-        }
-    }
-    kept.reverse();
-    kept
-}
-
-/// Output a screen model has not processed, with the size changes among it.
-pub(crate) struct Unseen {
-    /// In order, each with the offset of its first byte.
-    pieces: Vec<(u64, Vec<u8>)>,
-    /// What the model had not seen was dropped: it starts again.
-    restart: bool,
-    resizes: Vec<(u64, u16, u16)>,
-    end: u64,
-    /// The latest size: (cols, rows).
-    size: (u16, u16),
-}
-
-/// A terminal's screen, from its output.
-pub(crate) struct ScreenModel {
-    parser: vt100::Parser,
-    clamp: CsiClamp,
-    /// Output before this offset has been processed.
-    screened: u64,
-    #[cfg(test)]
-    panic_once: bool,
-}
-
-impl ScreenModel {
-    fn new(cols: u16, rows: u16, offset: u64) -> Self {
-        Self {
-            parser: vt100::Parser::new(clamp(rows), columns(cols), 0),
-            clamp: CsiClamp::default(),
-            screened: offset,
-            #[cfg(test)]
-            panic_once: false,
-        }
-    }
-
-    fn catch_up(&mut self, unseen: Unseen) {
-        let mut resizes = unseen.resizes.into_iter().peekable();
-        if unseen.restart {
-            let start = unseen.pieces.first().map_or(unseen.end, |p| p.0);
-            let (mut rows, mut cols) = self.parser.screen().size();
-            while let Some(&(at, c, r)) = resizes.peek()
-                && at <= start
-            {
-                (cols, rows) = (c, r);
-                resizes.next();
-            }
-            self.parser = vt100::Parser::new(rows, cols, 0);
-            self.clamp = CsiClamp::default();
-        }
-        for (offset, data) in unseen.pieces {
-            let mut at = offset;
-            let mut rest = data.as_slice();
-            loop {
-                while let Some(&(when, cols, rows)) = resizes.peek()
-                    && when <= at
-                {
-                    self.parser.screen_mut().set_size(rows, cols);
-                    resizes.next();
-                }
-                let until = resizes.peek().map_or(u64::MAX, |r| r.0);
-                let take = usize::try_from(until - at)
-                    .unwrap_or(usize::MAX)
-                    .min(rest.len());
-                self.feed(&rest[..take]);
-                rest = &rest[take..];
-                at += take as u64;
-                if rest.is_empty() {
-                    break;
-                }
-            }
-        }
-        for (_, cols, rows) in resizes {
-            self.parser.screen_mut().set_size(rows, cols);
-        }
-        self.screened = unseen.end;
-    }
-
-    fn feed(&mut self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
-        }
-        #[cfg(test)]
-        if std::mem::take(&mut self.panic_once) {
-            panic!("injected screen model panic");
-        }
-        let (rows, cols) = self.parser.screen().size();
-        let mut clamped = Vec::with_capacity(bytes.len());
-        self.clamp.filter(bytes, rows, cols, &mut clamped);
-        self.parser.process(&clamped);
-    }
-
-    fn snapshot(&self) -> Screen {
-        let screen = self.parser.screen();
-        let (rows, cols) = screen.size();
-        let (cursor_row, cursor_col) = screen.cursor_position();
-        let mut lines: Vec<String> = screen
-            .rows(0, cols)
-            .map(|row| row.trim_end_matches(' ').to_owned())
-            .collect();
-        lines.truncate(usize::from(rows));
-        Screen {
-            rows: lines,
-            cols,
-            cursor_row,
-            cursor_col,
-        }
+            self.resizes.iter().copied().collect(),
+            self.buffer.end(),
+            self.size,
+        )
     }
 }
 
@@ -310,17 +150,7 @@ pub(crate) fn screen(terminals: &Mutex<Terminals>, id: TerminalId) -> Option<Scr
     let model = Arc::clone(&lock(terminals).terms.get(&id)?.screen);
     let mut model = lock(&model);
     let unseen = lock(terminals).terms.get_mut(&id)?.unseen(model.screened);
-    let (end, (cols, rows)) = (unseen.end, unseen.size);
-    let shown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        model.catch_up(unseen);
-        model.snapshot()
-    }));
-    Some(shown.unwrap_or_else(|_| {
-        // Starting again past the output that broke it, rather than failing on it at every read.
-        tracing::warn!(terminal = %id, "the screen model failed on this output; starting it again");
-        *model = ScreenModel::new(cols, rows, end);
-        model.snapshot()
-    }))
+    Some(model.show(unseen, &id))
 }
 
 /// A terminal to record: started now, or found in tmux after a restart.

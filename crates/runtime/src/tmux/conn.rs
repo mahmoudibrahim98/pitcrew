@@ -312,6 +312,7 @@ impl Connection {
         });
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         let stderr_text = Arc::new(Mutex::new(Vec::new()));
+        let exit_reason = Arc::new(Mutex::new(None));
         let (stderr_done_tx, stderr_done_rx) = mpsc::sync_channel(1);
         let spawned = spawn_threads(Threads {
             stdin,
@@ -325,6 +326,7 @@ impl Connection {
             done: done_tx,
             stderr_text: Arc::clone(&stderr_text),
             stderr_done: stderr_done_tx,
+            exit_reason: Arc::clone(&exit_reason),
         });
         let connection = Self {
             outbox,
@@ -348,12 +350,16 @@ impl Connection {
                 Err(ConnectError::TimedOut)
             }
             Err(RecvTimeoutError::Disconnected) => {
-                // tmux ended before answering: the reason is on stderr.
+                // tmux ended before answering: the reason is on stderr, or in the `%exit` line
+                // on stdout (as when the server exits while the client starts).
                 let _ = stderr_done_rx.recv_timeout(Duration::from_secs(1));
-                let text = String::from_utf8_lossy(&lock(&stderr_text))
+                let stderr = String::from_utf8_lossy(&lock(&stderr_text))
                     .trim()
                     .to_owned();
-                Err(classify(&text))
+                Err(classify(&ended_text(
+                    &stderr,
+                    lock(&exit_reason).as_deref(),
+                )))
             }
         }
     }
@@ -413,11 +419,27 @@ impl Drop for Connection {
     }
 }
 
+/// Why a client that never answered ended: its stderr, and the reason on its `%exit` line.
+fn ended_text(stderr: &str, exit: Option<&[u8]>) -> String {
+    let exit = exit.map(|reason| {
+        String::from_utf8_lossy(reason)
+            .chars()
+            .take(200)
+            .collect::<String>()
+    });
+    match (stderr.is_empty(), exit) {
+        (_, None) => stderr.to_owned(),
+        (true, Some(reason)) => format!("tmux exited: {reason}"),
+        (false, Some(reason)) => format!("{stderr} (tmux exited: {reason})"),
+    }
+}
+
 /// tmux's reasons, as it prints them, mapped to what the runtime does next.
 fn classify(text: &str) -> ConnectError {
     if text.contains("no sessions")
         || text.contains("can't find session")
         || text.contains("no server running")
+        || text.contains("server exited")
         || text.contains("No such file or directory")
         || text.contains("Connection refused")
     {
@@ -449,6 +471,8 @@ struct Threads {
     done: SyncSender<()>,
     stderr_text: Arc<Mutex<Vec<u8>>>,
     stderr_done: SyncSender<()>,
+    /// The reason on tmux's `%exit` line, if it printed one.
+    exit_reason: Arc<Mutex<Option<Vec<u8>>>>,
 }
 
 /// What the reader thread does when it ends, however it ends.
@@ -486,6 +510,7 @@ fn spawn_threads(t: Threads) -> io::Result<()> {
         done,
         stderr_text,
         stderr_done,
+        exit_reason,
     } = t;
     let writer_child = Arc::clone(&child);
     thread::Builder::new()
@@ -520,12 +545,17 @@ fn spawn_threads(t: Threads) -> io::Result<()> {
                 done,
                 why: "the tmux reader stopped unexpectedly".into(),
             };
-            exit.why = read_loop(stdout, &exit.outbox, &*exit.sink);
+            exit.why = read_loop(stdout, &exit.outbox, &*exit.sink, &exit_reason);
         })?;
     Ok(())
 }
 
-fn read_loop(mut stdout: ChildStdout, outbox: &Outbox, sink: &dyn Sink) -> String {
+fn read_loop(
+    mut stdout: ChildStdout,
+    outbox: &Outbox,
+    sink: &dyn Sink,
+    exit_reason: &Mutex<Option<Vec<u8>>>,
+) -> String {
     let mut parser = ControlParser::new();
     let mut buf = vec![0; READ_CHUNK];
     let mut first = true;
@@ -553,6 +583,12 @@ fn read_loop(mut stdout: ChildStdout, outbox: &Outbox, sink: &dyn Sink) -> Strin
                             number = reply.number,
                             "dropped a tmux reply to a command this client did not send"
                         ),
+                        Notification::Exit { reason } => {
+                            let mut kept = lock(exit_reason);
+                            *kept = reason.clone();
+                            drop(kept);
+                            sink.notify(Notification::Exit { reason }, outbox);
+                        }
                         other => sink.notify(other, outbox),
                     }
                 }
@@ -659,6 +695,69 @@ mod tests {
             "the client was not reaped"
         );
         drop(conn);
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// A sink that ignores everything.
+    struct Quiet;
+
+    impl Sink for Quiet {
+        fn notify(&self, _: Notification, _: &Outbox) {}
+        fn closed(&self, _: &str) {}
+    }
+
+    #[test]
+    fn a_client_that_exits_before_its_first_reply_says_why() {
+        let dir = std::env::temp_dir().join(format!(
+            "pc-conn-exit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .expect("dir");
+        let mut options = TmuxOptions::new(dir.join("s"));
+        for (script, expected) in [
+            // The reason only on stdout, as tmux prints it when its server goes away.
+            (
+                "printf '%%exit server exited unexpectedly\\n'",
+                ConnectError::NoSession,
+            ),
+            (
+                "printf '%%exit something odd\\n'",
+                ConnectError::Failed("tmux exited: something odd".into()),
+            ),
+            (
+                "echo 'lost server' >&2; printf '%%exit\\n'",
+                ConnectError::Failed("lost server".into()),
+            ),
+            (
+                "true",
+                ConnectError::Failed("tmux exited without a reason".into()),
+            ),
+        ] {
+            let fake = dir.join("fake-tmux");
+            std::fs::write(&fake, format!("#!/bin/sh\n{script}\n")).expect("script");
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+            options.tmux = fake;
+            let opened = Connection::open(
+                &options,
+                &["attach-session"],
+                Arc::new(Quiet),
+                Instant::now() + Duration::from_secs(20),
+            );
+            match opened {
+                Err(e) => assert_eq!(e, expected, "{script}"),
+                Ok(_) => panic!("{script}: opened"),
+            }
+        }
+        assert_eq!(
+            ended_text("no server", Some(b"detached")),
+            "no server (tmux exited: detached)"
+        );
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 }

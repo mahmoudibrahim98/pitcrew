@@ -711,9 +711,16 @@ fn a_replaced_socket_directory_or_socket_is_refused() {
     let mut options = fx.options.clone();
     options.socket = sub.join("s");
     let rt = TmuxRuntime::new(options.clone()).expect("runtime");
+    // The runtime attaches once in the background as it starts, which (re)creates the
+    // directory: let that finish first. (`list` waits for an attach in progress.)
+    assert!(rt.list().expect("list").is_empty());
     // Behind the runtime's back, its directory is swapped for one open to others...
     std::fs::rename(&sub, fx.dir.join("sub.old")).expect("move aside");
-    std::fs::create_dir(&sub).expect("open directory");
+    // ...made by us, or by a late background attach (a private one, opened up here).
+    match std::fs::create_dir(&sub) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => panic!("open directory: {e}"),
+        _ => {}
+    }
     std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     match rt.start(&fx.spec("x", "sh", &["-c", "exec cat"])) {
         Err(RuntimeError::Unavailable(why)) => assert!(why.contains("0700"), "{why}"),

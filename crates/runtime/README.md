@@ -4,7 +4,11 @@ Terminal runtimes: tmux control mode and the PTY supervisor, behind pitcrew-inte
 
 **Owned by stream B** — see [docs/build/streams/B.md](../../docs/build/streams/B.md).
 
-The current implementation provides the building blocks for the runtimes. **tmux 3.2 is the
+Two runtimes implement `Runtime`: [`TmuxRuntime`](#tmuxruntime-unix) (Unix, tmux 3.2 or newer)
+and [`PtyRuntime`](#ptyruntime-and-pitcrew-ptyd) (Unix and Windows, terminals owned by
+`pitcrew-ptyd`). [Choosing one](#choosing-a-runtime) prefers tmux.
+
+The building blocks come first. **tmux 3.2 is the
 minimum supported portable release.** `detect_tmux(path)` executes `path -V` directly and
 returns a parsed `TmuxVersion` or a fallback error. The probe is limited to two seconds and
 4 KiB per output stream; a timed-out process is killed and reaped. It blocks the calling thread
@@ -59,8 +63,9 @@ the executable; the runtime must also verify any already-running server it conne
   Zero capacity and zero-length reads are supported. `starting_at(offset)` resumes numbering
   with the default capacity; `with_capacity_at(capacity, offset)` customizes both. At `u64::MAX`,
   numbering saturates and unaddressable incoming bytes are discarded without renumbering history.
-- `keys::{tmux_key, pty_key}` cover every protocol `Key`. PTY arrows use normal cursor mode;
-  application cursor mode will need terminal-state handling in the later PTY runtime.
+- `keys::{tmux_key, pty_key, pty_key_in}` cover every protocol `Key`. `pty_key` sends arrows in
+  normal cursor mode; `pty_key_in` follows application cursor mode (SS3 arrows), which
+  pitcrew-ptyd tracks for each terminal.
 
 Protocol references: [tmux control mode](https://github.com/tmux/tmux/wiki/Control-Mode) and
 [tmux command parsing](https://man.openbsd.org/tmux.1#PARSING_SYNTAX).
@@ -85,7 +90,7 @@ semicolons, backslashes, variables, shell-looking text, newlines, formats, and U
 ## `TmuxRuntime` (Unix)
 
 `tmux::TmuxRuntime` implements `Runtime` over one long-lived control client (`tmux -C`) of a
-tmux server that belongs to PitCrew alone. `PtyRuntime` and the PTY supervisor are later briefs.
+tmux server that belongs to PitCrew alone.
 
 - **A private server.** The socket is `TmuxOptions::default_socket()`: under `$TMUX_TMPDIR` or
   `$XDG_RUNTIME_DIR` when that is a private directory of the user's, else
@@ -118,7 +123,10 @@ tmux server that belongs to PitCrew alone. `PtyRuntime` and the PTY supervisor a
   `@pitcrew-offset` holds where its output numbering resumes. The session and server exist while
   terminals do: a short-lived `pitcrew-start` window holds a new session until its first
   terminal exists (it ends by itself after 60 seconds if PitCrew stops first). A renamed session
-  is found again by its id, on the same server.
+  is found again by its id, on the same server. A failed attach can leave a server that exits
+  at once (it has no session); a session made just then dies with it, and the client says only
+  `%exit server exited unexpectedly` on stdout: that reason is read (with stderr) and means no
+  server, and `start` tries `new-session` again, up to three more times.
 - **One connection.** Commands go to the client's stdin through `command::Command` (never a
   process per command); a writer thread owns stdin, so a tmux that stops reading costs a bounded
   queue, not a stuck caller. Replies are matched to commands in order (tmux answers one client's
@@ -168,7 +176,8 @@ tmux server that belongs to PitCrew alone. `PtyRuntime` and the PTY supervisor a
   (output printed while no client was attached is not in the stream), and the history before
   stays readable. At the start the keeper also attaches once, to record output from terminals
   of a previous run. With no server left, every terminal has ended.
-- **`screen()`** comes from a `vt100` model fed from the replay buffer when the screen is read
+- **`screen()`** comes from a `vt100` model (`screen`, shared with pitcrew-ptyd) fed from the
+  replay buffer when the screen is read
   (never from `capture-pane`), so output nobody looks at costs no emulation. Each terminal's model
   has its own lock, and a size change is recorded with the offset it happened at and applied in
   order then; the reader thread never emulates, so one terminal's screen holds up no other
@@ -176,7 +185,7 @@ tmux server that belongs to PitCrew alone. `PtyRuntime` and the PTY supervisor a
   starts again from the oldest byte kept; modes set before that (a scroll region, say) are lost.
   **vt100 0.16.2 bug (worth reporting upstream):** `CSI n L` (insert lines), `CSI n T` (scroll
   down) and `CSI n @` (insert characters) loop `n` times with no limit, so 128 bytes of
-  `ESC[65535L` take seconds. A streaming filter (`tmux/clamp.rs`) lowers the count of those, and
+  `ESC[65535L` take seconds. A streaming filter (`screen/clamp.rs`) lowers the count of those, and
   of `M`, `S`, `P` and `X`, to the screen's rows or columns first, following vte's states (a CSI
   survives C0 controls, DEL and high bytes; only CAN, SUB or ESC end it). It also passes at most
   4 KiB of a string's body (OSC, DCS, SOS, PM, APC), then cancels it and drops the rest to its
@@ -218,3 +227,108 @@ socket and mark every process they start with `PITCREW_TEST_RUN=<mark>` (the run
 to tmux, whose server and panes inherit it). They run one at a time; each checks, with its
 runtime dropped and before killing its server, that no control client and no runtime thread is
 left, then kills its server and checks through `/proc` that nothing with its mark is left.
+
+## `PtyRuntime` and pitcrew-ptyd
+
+`pty::PtyRuntime` implements `Runtime` as a client of `pitcrew-ptyd` (`crates/ptyd`, see its
+README), a small supervisor that owns the terminals and outlives `pitcrewd`: restarting or
+upgrading the daemon never ends a session. It is for machines without a usable tmux, native
+Windows above all (ConPTY there).
+
+- **One ptyd per user**, on `PtyOptions::endpoint` (`PtyOptions::default_endpoint()`):
+  - Unix: a socket, `$XDG_RUNTIME_DIR/pitcrew/ptyd` when that directory is private, else
+    `/tmp/pitcrew-<uid>/ptyd`, in a directory checked by the same rules as the tmux socket's
+    (0700, ours, no link, every directory above owned by root or us and not open to others
+    unless sticky), before every connection. As with tmux, the system removes
+    `$XDG_RUNTIME_DIR` when the user's last login ends; a runner that must outlive logins
+    should pass its own endpoint.
+  - Windows: the pipe `\\.\pipe\pitcrew-ptyd-<the user's SID>`, or
+    `…-<SID>-elevated` when this process is elevated, so an elevated daemon's ptyd (which runs
+    elevated, and outlives it) is never the one an ordinary process reaches.
+  - `check_endpoint` is the check both sides make: on Windows a pipe name must be
+    `\\.\pipe\` and `[A-Za-z0-9._-]`, not ending in a dot (the CLI's rule), since Win32
+    normalizes `..\` and `\\.\pipe\..\UNC\host\share` would be an SMB path that sends the
+    user's credentials to that host. Tests never use the default endpoint.
+- **Each side checks the other.** On Unix the client checks the directory, then the server's
+  uid (`SO_PEERCRED`); ptyd refuses a client of another uid before reading anything. On
+  Windows:
+  - the client opens the pipe asking for identification only (`SECURITY_SQOS_PRESENT |
+    SECURITY_IDENTIFICATION`: the server may not act as us), and requires the pipe's owner to
+    be the current user (another user cannot create a pipe owned by us) and its mandatory
+    label to be at the client's own integrity level (a pipe without a label counts as medium);
+  - ptyd's pipe has a DACL granting the current user alone, a mandatory label at ptyd's
+    integrity level refusing reads and writes from below (`S:(ML;;NWNR;;;<level>)`), and
+    refuses remote clients; ptyd checks the user of the client's process before reading
+    anything, and after the hello the client's own token (impersonating it at the
+    identification level it allows, `ImpersonateNamedPipeClient`, `OpenThreadToken`,
+    `RevertToSelf`): our user at our integrity level. So an elevated ptyd serves only
+    elevated clients, an ordinary one only ordinary ones, and an ordinary process of the user
+    can never start elevated programs through ptyd (a UAC bypass otherwise).
+- **Starting ptyd.** `start` starts ptyd when none answers: `PtyOptions::ptyd` (by default
+  `pitcrew-ptyd` next to the running executable; `PATH` is never searched), detached so it
+  outlives the caller. On Unix the process started only starts the real ptyd and exits (no
+  zombie is left), and the real one calls `setsid`; its log is next to the socket
+  (`ptyd.log`). On Windows it is started detached, in a new process group, outside this
+  process's job when the job allows it. Other calls never start ptyd: with none running there
+  are no terminals (`list` is empty, a terminal is `NotFound`).
+- **The connection** is run by a thread of its own (`pitcrew-pty-io`) with a small tokio
+  runtime: one task reads replies and hands each to its waiting caller, another writes
+  requests. Callers on any thread wait for their reply with a deadline, so a ptyd that stops
+  answering costs a bounded queue (256 requests), never a stuck caller. On Windows the pipe uses
+  overlapped I/O, which a read and a write in progress at once need.
+- **Bounds.** Every call is bounded by `call_timeout` (5 s; `start`: `start_timeout`, 15 s,
+  which includes starting ptyd; `kill`: 4 s more) and answers `Unavailable` past it. Input that
+  timed out may still reach the terminal. Sizes are 1 to 1000. A `read` returns at most 4 MiB;
+  writes go in pieces of 256 KiB.
+- **Reconnecting and restarts.** Offsets live in ptyd, so nothing is lost when the connection
+  drops or the daemon restarts: the next call connects again, `list()` finds every terminal,
+  and output goes on from the last offset (nothing is `truncated` unless more than the history
+  arrived meanwhile). Reads, `screen`, `info`, `list`, `resize` and `kill` try once more on a
+  new connection; input and `start` do not, since they may have taken effect. `disconnect()`
+  closes the connection by hand. Dropping the runtime closes it; terminals keep running. A
+  ptyd that closes the connection before answering hello (one that is exiting, or lost the race
+  to serve) counts as none running, and is tried again while a just-started one is awaited.
+- **Tailing.** Reads that wait for output (`wait_for_output`) have their own budget in ptyd
+  (256 per connection), apart from the 16 slow requests (start, screen, kill), so a daemon can
+  tail every terminal at once.
+- **Versions.** The protocol (`pty::proto`, version 1) is ptyd's own, apart from API v1. A ptyd
+  of another protocol is refused with a message saying which it speaks; its terminals keep
+  running (see ptyd's README).
+- **Terminals.** `TerminalInfo::pid` is the program's own process (on Unix it leads its session
+  and process group). Nothing can attach to a PTY by hand, so `native_target` is `None`.
+  `wait_for_output(id, offset, timeout)` waits for output past an offset (ptyd waits at most
+  10 s per request).
+- **`screen()`** is computed in ptyd, by the same screen model as tmux's (`screen::Screened`:
+  the clamp filter, its own lock per terminal, the work budget). Call it, like every method,
+  from a blocking thread.
+
+`pty::windows` holds the only `unsafe` code of this crate and of pitcrew-ptyd (Windows only):
+SIDs and integrity levels, a pipe's owner, DACL and label, the client of a pipe (its process,
+and its token by impersonation), and Job Objects. The crate denies `unsafe_code` (pitcrew-ptyd
+forbids it); that module alone allows it, with a `SAFETY` comment on every block.
+`tests/unsafe_guard.rs` fails if any other source file of either crate allows it.
+
+**Residuals** (known, accepted for now):
+
+- **Job Objects on Windows.** portable-pty cannot start a program suspended, so ptyd puts it in
+  its job just after it starts: a process it starts in that instant escapes the job, and a
+  kill. The CLIs start nothing that early.
+- **The environment** of every terminal is ptyd's own (plus the request's variables, and on
+  Windows the registry's, which portable-pty adds), and ptyd's is that of the first process
+  that started it: a later daemon with a different environment does not change it, as with
+  tmux's server.
+- **Batch-file CLIs on Windows.** npm installs CLIs as `.cmd` shims, which `cmd.exe` runs and
+  parses again; ptyd refuses any argument with `" % ! ^ & | < > ( )`, so ordinary prompt text
+  (with a parenthesis, say) cannot be passed to such a CLI. A later round could resolve
+  `claude.cmd` to `node.exe` and its script, and run that instead.
+- **Huge screens.** A `screen` answer must fit one frame header (1 MiB of JSON), which a
+  1000 by 1000 screen full of wide characters can exceed; it is then refused.
+
+## Choosing a runtime
+
+`choose(&TmuxOptions, &PtyOptions)` detects tmux (`tmux::detect`) and, when it is not usable,
+the PTY runtime (`pty::detect`: ptyd is a program file at its absolute path and its endpoint is
+safe; nothing is started). It returns `Chosen::Tmux` or `Chosen::Pty` (with why tmux was not
+used), whose `capability()` is `Capability::Tmux` or `Capability::Pty`, or `Unavailable` with
+both reasons. `choose_async` runs it on its own thread as a future any executor can await, so
+detection never blocks an async caller. `Chosen::into_runtime` builds the runtime.

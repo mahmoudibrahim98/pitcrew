@@ -1,4 +1,5 @@
-//! Bounds the screen model's work and memory per byte of pane output.
+//! Bounds the screen model's work and memory per byte of terminal output (a tmux pane's, or a
+//! PTY's in pitcrew-ptyd).
 //!
 //! - **Counts.** vt100 0.16.2 repeats `CSI n L` (insert lines), `CSI n T` (scroll down) and
 //!   `CSI n @` (insert characters) `n` times with no limit, and `n` can be 65535: 128 bytes of
@@ -42,7 +43,7 @@ enum State {
     StringSkip { osc: bool },
 }
 
-/// A streaming filter over pane output, one per screen model.
+/// A streaming filter over terminal output, one per screen model.
 #[derive(Debug, Default)]
 pub(crate) struct CsiClamp {
     state: State,

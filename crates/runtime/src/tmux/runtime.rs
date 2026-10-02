@@ -21,6 +21,7 @@ use super::{OFFSET_OPTION, SESSION, TERMINAL_OPTION, TmuxOptions};
 use crate::command::{Argument, Command, FormatError};
 use crate::control::{CommandReply, Notification, PaneId, WindowId};
 use crate::detect::TmuxVersion;
+use crate::gate::Gate;
 
 /// The shell script every terminal runs, with the program (an absolute path, so never a shell
 /// builtin) as `$0` and its arguments as `$@`: they are positional parameters, never parsed as
@@ -57,6 +58,9 @@ const PENDING_KILLS: usize = 64;
 
 /// How long dropping the runtime waits for its keeper thread.
 const DROP_WAIT: Duration = Duration::from_secs(2);
+
+/// Further tries of `new-session` when the server it reached went away under it.
+const NEW_SESSION_TRIES: usize = 3;
 
 /// PitCrew's terminals as windows of a private tmux server (see the [module docs](super)).
 ///
@@ -355,7 +359,18 @@ impl Inner {
                 let mut args = vec!["new-session", "-s", SESSION, "-n", HOLDER_NAME];
                 args.extend(["-P", "-F", "#{window_id}", "--"]);
                 args.extend(HOLDER);
-                match self.connect(&args, deadline) {
+                // The failed attach may have started a server that exits at once (it has no
+                // session); a new session made just then dies with it ("server exited
+                // unexpectedly", seen as no server). The next try gets a fresh server.
+                let mut made = self.connect(&args, deadline);
+                for _ in 0..NEW_SESSION_TRIES {
+                    if !matches!(made, Err(ConnectError::NoSession)) || Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                    made = self.connect(&args, deadline);
+                }
+                match made {
                     Ok((conn, generation, reply)) => {
                         let holder = reply.lines.first().and_then(|line| WindowId::parse(line));
                         (conn, generation, holder)
@@ -1092,38 +1107,6 @@ fn stop_group(leader: u32, deadline: Instant) {
         std::thread::sleep(Duration::from_millis(10));
     }
     let _ = kill_process_group(group, Signal::KILL);
-}
-
-/// A serialising lock with a deadline.
-#[derive(Default)]
-struct Gate {
-    busy: Mutex<bool>,
-    free: Condvar,
-}
-
-struct Pass<'a>(&'a Gate);
-
-impl Gate {
-    fn enter(&self, deadline: Instant) -> Option<Pass<'_>> {
-        let mut busy = lock(&self.busy);
-        while *busy {
-            let left = deadline.checked_duration_since(Instant::now())?;
-            busy = self
-                .free
-                .wait_timeout(busy, left)
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .0;
-        }
-        *busy = true;
-        Some(Pass(self))
-    }
-}
-
-impl Drop for Pass<'_> {
-    fn drop(&mut self) {
-        *lock(&self.0.busy) = false;
-        self.0.free.notify_one();
-    }
 }
 
 fn check_size(cols: u16, rows: u16) -> Result<(u16, u16), String> {

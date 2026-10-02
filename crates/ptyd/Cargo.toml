@@ -14,6 +14,25 @@ path = "src/main.rs"
 
 [dependencies]
 pitcrew-protocol.workspace = true
+# The protocol, the screen model (clamp filter, work budget), the replay buffer, key bytes, the
+# endpoint checks, and on Windows the pipe's security and Job Objects (`pty::windows`).
+pitcrew-runtime.workspace = true
+# The PTYs: openpty on Unix, ConPTY on Windows (ADR-0005).
+portable-pty.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# `signal`: a SIGCHLD handler in place of an inherited SIG_IGN, so ended programs stay
+# waitable (Unix). The daemon builds tokio with it already.
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+[target.'cfg(unix)'.dependencies]
+# Process groups and signals for kill, waiting without reaping (`waitid` with `WNOWAIT`),
+# `setsid`, and the lock file (`flock`, opened without following links), without unsafe code.
+# The version pitcrew-runtime and tempfile already use.
+rustix = { version = "=1.1.5", features = ["fs", "process"] }
+
+[dev-dependencies]
+pitcrew-interfaces.workspace = true
 
 [lints]
 workspace = true
