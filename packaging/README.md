@@ -177,6 +177,28 @@ or the person, and nobody else can write them; on Windows, no `Zone.Identifier`)
   what has ended there. A running `pitcrewd.exe` is moved aside the same way: the app goes on
   using that daemon until it stops.
 
+### Tried in a cloud VM
+
+2026-10-02, Ubuntu 24.04 x86_64 with WebKitGTK 2.52, Rust 1.97, as root, Tauri CLI 2.12.1
+(`cargo install --locked`, 5.5 minutes):
+
+- `build-release.sh --zig` for both musl targets: all four binaries static, in under 3 minutes
+  each; `pitcrewd` is 13 MB.
+- `desktop/build.sh x86_64-unknown-linux-gnu`, with a few-byte stand-in for the macOS helper
+  (the VM cannot build it): `PitCrew_0.0.0_amd64.deb` (23.2 MB) and `PitCrew_0.0.0_amd64.AppImage`
+  (91.2 MB). `check.sh` passed on both (owners and modes from `dpkg-deb -c` and `unsquashfs
+  -lln`, `desktop-file-validate` included), and `smoke.sh` started the app from the unpacked
+  `.deb` and from the AppImage under Xvfb: its own `pitcrewd` ready, the window up, no askpass
+  warning, and the AppImage's `pitcrew://` handler registered.
+- `check-windows.ps1` parses (PowerShell 7.4), and `installer-hooks.nsh` compiles with
+  `makensis -WX` in a minimal installer; neither has run on Windows here.
+
+**Sizes.** The budget is 25 MB per installer. Each `pitcrewd` build is about 5.5 MB compressed,
+and an installer carries three or four of them: its own, the two Linux helpers and the macOS
+helper (two architectures). With the real macOS helper the `.deb` should come to about 34 MB; on
+Linux and macOS the app's own `pitcrewd` and one helper are the same file, carried twice. The
+AppImage also carries WebKitGTK and GTK, hence its 91 MB. The checks report these as warnings.
+
 ## Checksums
 
 `SHA256SUMS` lists every file in the directory as `<hex>  <name>`, sorted by name, which is what
