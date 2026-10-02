@@ -41,9 +41,9 @@ named by their id (`tok_…`) and token files by their path. Stdout carries one 
 daemon is ready, `pitcrewd listening on <where>`, which supervisors and tests wait for; `init`'s
 one line; and, for `connect`, only the bridge's bytes.
 
-`PITCREW_TMUX_SOCKET=<path>` puts the runner's tmux server on that socket instead of PitCrew's
-default (see "Terminals"), **for tests and development**: a second daemon on the same machine
-(a demo, a parity run) must not share a real PitCrew's terminals.
+`serve --tmux-socket <path>` (hidden from `--help`, warned in the log) puts the runner's tmux
+server on that socket instead of the state directory's own (see "Terminals"), **for tests and
+development** only.
 
 ## The state directory
 
@@ -395,23 +395,35 @@ tokio thread per request.
 The runner's terminals (`RunnerTerminals`, over `src/runtime.rs`'s `TerminalRuntime`) are where
 the sessions PitCrew starts run.
 
-**The runtime, chosen at start** (unless `--no-runner`): `pitcrew_runtime::tmux::detect_async`
-checks, on a thread of its own, that tmux is installed (an absolute path on `PATH`), 3.2 or newer,
-and can start a server on PitCrew's private socket. If so, the terminals are windows of that
-server (`TmuxRuntime`: its README has the details), the log says `the runner's terminals run in
-tmux; attach to them with tmux -S <socket> attach -t pitcrew`, and host info reports `tmux`.
-Otherwise there is no runtime (`NoRuntime`): no session has a terminal here, starting one is
-`503`, and the log says why as a warning (`the runner's terminals cannot use tmux …`: not
-installed, too old, the socket's directory refused). On Windows (no tmux) it says so at info; the
-PTY runtime is stream B's next brief.
+**The runtime, chosen at start** (unless `--no-runner`), in this order:
 
-**The socket** is the runtime's default: `$TMUX_TMPDIR/pitcrew-<uid>/tmux` or
-`$XDG_RUNTIME_DIR/pitcrew/tmux` when that directory is private, else `/tmp/pitcrew-<uid>/tmux`, its
-directory 0700 and checked before every connection. `PITCREW_TMUX_SOCKET` sets another, for tests
-and development; **tests always set it**. The default depends on the environment, so a daemon
-restarted in another one (say without `XDG_RUNTIME_DIR`) does not find its terminals; and it does
-not depend on the state directory, so two daemons of one user share it unless one is given its own
-(see "Not wired yet").
+1. The socket's directory is made private (0700 if missing; one that is not is refused, never
+   repaired), and its lock (`<socket dir>/lock`, `flock`) is taken for the runtime's life.
+2. `pitcrew_runtime::tmux::detect_async` checks, on a thread of its own, that tmux is installed (an
+   absolute path on `PATH`), 3.2 or newer, and can start a server on that socket.
+3. A server already running there must have no sessions but PitCrew's own (`pitcrew`): one with
+   others (a person's own tmux, if a socket names it) is refused and left as it is.
+
+If all hold, the terminals are windows of that server (`TmuxRuntime`: its README has the details),
+the log says `the runner's terminals run in tmux; attach to them with tmux -S <socket> attach -t
+pitcrew`, and host info reports `tmux`. Otherwise there is no runtime (`NoRuntime`): no session has
+a terminal here, starting one is `503`, and the log says why as a warning (`the runner's terminals
+cannot use tmux …`: not installed, too old, the socket's directory refused, `another pitcrewd uses
+this tmux socket`, a server with sessions `that are not PitCrew's`). On Windows (no tmux) it says
+so at info; the PTY runtime is stream B's next brief.
+
+**One server per state directory.** The socket is
+`<dir>/<8 hex digits of the sha256 of the canonical state directory>/tmux`, where `<dir>` is the
+runtime's private per-user directory: `$TMUX_TMPDIR/pitcrew-<uid>` or `$XDG_RUNTIME_DIR/pitcrew`
+when that is a private directory, else `/tmp/pitcrew-<uid>` (also when the path would pass the
+103-byte socket limit). So two daemons of one user (a real one and a demo, a development one,
+another state directory) never share a server: not its terminals, not their offsets, not the
+environment its programs inherit (the daemon that starts a server gives it its own `HOME`,
+`PATH` and the rest). The lock keeps a second runtime off one socket even when a socket is named
+twice. The hidden `serve --tmux-socket <path>` names another socket, with a warning, **for tests
+and development**; tests always pass it, or point the per-user directory at their own folder
+(`TMUX_TMPDIR`). The per-user directory depends on the environment, so a daemon restarted in
+another one (say without `XDG_RUNTIME_DIR`) does not find its terminals.
 
 **Attaching by hand:** `tmux -S <socket> attach -t pitcrew` (the socket is in the start log), then
 pick a window (each is named after the CLI and the folder, e.g. `claude paper`); or one terminal,
@@ -430,9 +442,9 @@ would go the same way (the runtime's README: call it from a blocking thread).
 
 | Route | What |
 |---|---|
-| `POST /v1/sessions` | Starts the CLI (`engine`) in a new terminal in `cwd` (absolute, existing), with `brief`, `model` and `permission_mode`; `202` with the session. |
-| `POST /v1/sessions/{id}/send` | Types `text`, then Enter. |
-| `POST /v1/sessions/{id}/keys` | Sends `keys` (at least one). |
+| `POST /v1/sessions` | Starts the CLI (`engine`) in a new terminal in `cwd` (see below), with `brief` (at most 64 KiB), `model` and `permission_mode`; `202` with the session. |
+| `POST /v1/sessions/{id}/send` | Types `text` (at most 64 KiB), then Enter. |
+| `POST /v1/sessions/{id}/keys` | Sends `keys` (1 to 64). |
 | `POST /v1/sessions/{id}/interrupt` | Escape. |
 | `POST /v1/sessions/{id}/end` | `graceful`: Ctrl-C twice, then waits up to 10 seconds for the CLI to exit; `kill`: SIGTERM to its process group, SIGKILL half a second later, and the window closes. Either reports the session ended (`session_ended`). |
 
@@ -448,12 +460,27 @@ would go the same way (the runtime's README: call it from a blocking thread).
   `agent` and `task` are refused with `503` for now: a session started for an agent must be stored
   under the agent before its CLI starts, which needs the runner to adopt a session id (see
   "Dispatch"). `persona` is passed on (the runner does not use it yet); `bypass_permissions` is
-  refused by the runner (`400`).
+  refused by the runner (`400`), and so is a session id or model that could be read as an option.
+- **`cwd`**: absolute, at most 4096 bytes, an existing folder; resolved once by the daemon (links
+  and `..`), and the CLI starts in the resolved folder. On Unix it and every folder above it must
+  belong to root or this user, and none may be writable by other users (group or world), except a
+  sticky folder above it (as `/tmp`): someone else who can write there could plant files the CLI
+  reads as its project's (settings, hooks, instructions) or swap the folder. Refused is `400`,
+  saying which folder. So a group-writable project folder is refused, and so is anything on a
+  Windows drive mounted in WSL without metadata (`/mnt/c`, mode 777).
+- **Who may.** A person may command a session with no agent, or one whose agent they own; a
+  session of another person's agent, or of an agent the hub does not know, is `403`. It is the
+  runner's rule for hooks (its README), asked of the hub's tables (`HubAgents`).
 - An unknown session is `404`; one on another machine, or any without a runner, `503`; an ended
   one, or one without a terminal here, `409`. A command the runner refuses is `400`; one that
   fails (the runtime cannot start or reach the terminal, or does not answer in time) is `503`.
-- Commands run on the blocking pool, at most 16 at once (`503` past that), each bounded by the
-  runner's own timeouts and by 45 seconds here.
+- **Bounds.** A body is at most 1 MiB (`400 invalid` past it). Commands run on the blocking pool,
+  at most 16 at once, and starts at most 4 at once, each holding its place through its wait for
+  the session (`503` past either). A command's place is given back only when the command returns,
+  even after the request stopped waiting for it (45 seconds, over the runner's own timeouts).
+  Every lookup (the session, its agent, its terminal, the folder) is bounded by 5 seconds (`503`).
+  While a start waits, it looks the session up by its terminal in the runner's index, every
+  200 ms, not through the hub's whole list.
 
 **Restarts.** A stop lets go of the runtime only after the runner has stopped: dropping
 `TmuxRuntime` stores each terminal's exact output offset in tmux (`@pitcrew-offset`) and detaches;
@@ -545,9 +572,8 @@ VITE_PITCREW_TOKEN="$(cat "$(cargo run -q -p pitcrew-daemon -- --state-dir /tmp/
   corepack pnpm --filter @pitcrew/ui dev
 ```
 
-On a machine with tmux, a development daemon next to a real PitCrew should also get a tmux socket
-of its own (`PITCREW_TMUX_SOCKET=/tmp/pitcrew-dev-tmux/s`, say), or it shares the real one's
-terminals (see "Terminals").
+On a machine with tmux, a development daemon on its own state directory gets a tmux server of its
+own, next to a real PitCrew's (see "Terminals").
 
 `--demo` works once per state directory; restart without it to keep the data, or use a new
 directory for a fresh demo. With `--demo` the runner watches no agent home; `--homes <dir>` points
@@ -588,11 +614,12 @@ with `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `XDG_DATA_HOME` removed: a start with
 without `--homes` watches that folder, never the machine's own. Transcripts come from
 `crates/fixtures`, under synthetic session ids.
 
-**No test touches a real tmux.** Every daemon the tests start gets `PITCREW_TMUX_SOCKET`: by
-default a socket in a folder whose parent does not exist, which the runtime refuses (making
-nothing), so the daemon serves without a terminal runtime, as on a machine without tmux; the tmux
-test gives its daemons a private socket in its temporary folder. None uses PitCrew's default
-socket or the user's tmux server (detection still runs `tmux -V`, which reaches no server).
+**No test touches a real tmux.** Every daemon the tests start gets `--tmux-socket` (`Tmux` in
+`tests/common`): by default a socket in a folder whose parent does not exist, which the runtime
+refuses (making nothing), so the daemon serves without a terminal runtime, as on a machine without
+tmux; the tmux tests give their daemons private sockets in their temporary folders, or a
+`TMUX_TMPDIR` there for a state directory's default socket (the helper refuses a daemon on its
+default socket without one). None uses PitCrew's own per-user directory or the user's tmux server.
 
 `tests/serve.rs` starts the real binary on a temporary state directory and a free port, and
 covers `--version`, `token show-path`, tokens and scopes, the work routes (with the workspace,
@@ -639,25 +666,40 @@ allow for the back office appending after a write (the demo's asks are old by th
 `tests/terminals.rs`, the runner's terminals:
 
 - without tmux (the refused socket every test daemon has by default): host info has no `tmux`,
-  the log warns why, the demo's session of this machine has no terminal (`404`), `POST
-  /v1/sessions` is `503`, a command for a session without a terminal `409`, for another machine's
-  `503`, for an unknown one `404`; malformed bodies `400`; an agent token `403`;
-- in tmux (Unix, tmux 3.2 or newer; skipped with a message otherwise), with a private socket, a
-  stand-in `claude` first on the daemon's `PATH` (it writes its transcript for the `--session-id`
-  it is given, then prints each byte it reads as `KEY <hex>`), and `--homes`: host info has
-  `["tmux", "watch"]` and the log the attach command; `POST /v1/sessions` answers `202` with the
-  session, `terminal` set, and its window is in tmux (`claude work`); the terminal WebSocket
-  streams the stand-in's output; `send`, `keys` and `interrupt` reach it (`KEY 68`, `KEY 69`, `KEY
-  09`, `KEY 1b`). SIGTERM: `the runner stopped`, then `the terminals' runtime detached`, then
-  `store closed`; the pane is alive, and its `@pitcrew-offset` is exactly where the stream ended.
-  The next daemon reports `tmux` again and finds the terminal: a stream from that offset gets the
-  new output with nothing lost, one from `0` a `truncated` frame naming the offset. A second
-  session ended `graceful` prints its goodbye, its stream ends with `exit`, and it is `ended`;
-  `kill` ends the first (`exit`, close `1000`, `ended`), and a command for it is then `409`. With
-  both ended, tmux's server exits, and once the daemon has stopped nothing with the test's mark
-  (`PITCREW_TEST_RUN`, which the daemon's tmux server and panes inherit) is left; whatever the
-  outcome, the test kills its server (`tmux -S <its socket> kill-server`) and anything still
-  marked.
+  the log warns why (and warns of `--tmux-socket`), the demo's session of this machine has no
+  terminal (`404`), `POST /v1/sessions` is `503`, a command for a session without a terminal `409`,
+  for another machine's `503`, for an unknown one `404`; malformed bodies `400`; each bound one
+  past its limit (`text`, `keys`, `brief`, `cwd`, a body past 1 MiB) `400 invalid`, and at its
+  limit passes; a relative or missing `cwd`, and one under a folder anyone can write to, `400`; a
+  session of another person's agent (added through the hub's events) `403` for `send`, `keys`,
+  `interrupt` and `end`, before its lack of a terminal, while one of the person's own agent gets
+  to that `409`; an agent token `403` on all five routes;
+- in tmux (Unix, tmux 3.2 or newer; skipped with a message otherwise, or failed when
+  `PITCREW_REQUIRE_TMUX=1`), with a private socket, a stand-in `claude` first on the daemon's
+  `PATH` (it writes its transcript, in its `CLAUDE_CONFIG_DIR`, for the `--session-id` it is given,
+  then prints each byte it reads as `KEY <hex>`), and `--homes`: host info has `["tmux",
+  "watch"]` and the log the attach command; `POST /v1/sessions` answers `202` with the session,
+  `terminal` set, and its window is in tmux (`claude work`); a start for the demo's cluster (`503`),
+  with `bypass_permissions` or a `--dangerously-…` model (`400`) starts nothing; the terminal
+  WebSocket streams the stand-in's output; `send`, `keys` and `interrupt` reach it (`KEY 68`, `KEY
+  69`, `KEY 09`, `KEY 1b`). SIGTERM: `the runner stopped`, then `the terminals' runtime detached`,
+  then `store closed`; the pane is alive, and its `@pitcrew-offset` is exactly where the stream
+  ended. The next daemon reports `tmux` again and finds the terminal: a stream from that offset
+  gets the new output with nothing lost, one from `0` a `truncated` frame naming the offset. A
+  second session, its folder given as `<work>/../work`, runs in the resolved folder and is named
+  after it; ended `graceful`, it prints its goodbye, its stream ends with `exit`, and it is
+  `ended`; `kill` ends the first (`exit`, close `1000`, `ended`), and a command for it is then
+  `409`. With both ended, tmux's server exits, and once the daemon has stopped nothing with the
+  test's mark (`PITCREW_TEST_RUN`, which the daemon's tmux server and panes inherit) is left;
+- two daemons on two state directories, on their default sockets (under the test's
+  `TMUX_TMPDIR`): two sockets, in directories named by 8 hex digits, two servers, each holding only
+  its own session's terminal; a third daemon given the first's socket finds it locked
+  (`another pitcrewd uses this tmux socket`), has no `tmux`, and touches nothing;
+- a tmux server with a session of someone else's (`mine`): the daemon has no `tmux`, says the
+  server has sessions `that are not PitCrew's`, and leaves it as it was, before and after its
+  stop;
+- whatever the outcome, each test kills its servers (`tmux -S <its socket> kill-server`) and
+  anything still marked.
 
 `tests/office.rs`, with `--demo`, appends what the runner link will report straight to the store
 (the daemon looks at it with its next append, here a comment through the API, or at its next
@@ -743,13 +785,20 @@ session is, with and without a runner, and with one attached later; `src/host.rs
 runner's role, `tmux` and `watch` (each, both, neither) once one is attached, and `HEAD` with
 `GET`'s headers and no body; `src/transcripts.rs` answers `404`, `503`, or an empty page for a
 session of this machine the runner never indexed, with and without a runner; `src/sessions.rs`
-checks the bodies, which sessions take a command (`404`, `503`, `409`) and what a start needs (an
-absolute folder, a machine of the workspace, no `agent` or `task`), and a start with no runtime
-`503`; `src/runtime.rs` checks that a let-go runtime answers `Unavailable` to every call and is
-dropped, and that a refused socket means no tmux and makes nothing; `src/runner.rs` and
+checks the bodies and every bound at its limit and one past it, the hook rule for who may command
+a session (each scope against no agent, an owned agent, another's, one without an owner, and an
+unknown one), which sessions take a command (`404`, `503`, `403`, `409`), what a start needs (a
+person, an absolute folder, a machine of the workspace, no `agent` or `task`), folders resolved
+(`..` and links) and refused (relative, missing, a file, under a folder anyone can write to unless
+sticky, open themselves), and a start with no runtime `503`; `src/runtime.rs` checks that a let-go
+runtime answers `Unavailable` to every call and is dropped, that a refused socket means no tmux and
+makes nothing, that each state directory has a socket of its own (the same however spelled), that
+socket directories are made private (and an open one refused, not repaired) and locked once, and
+which sessions of a server are not PitCrew's (a stand-in `tmux` answering); `src/runner.rs` and
 `src/cli.rs` check that `--demo` alone watches nothing (the person's homes are not even looked
 up), how `--homes` values become homes, and that `--no-runner` refuses `--homes`. `src/cli.rs`
-also checks that everything after `connect` reaches the bridge as it is, and `init`'s arguments;
+also checks that everything after `connect` reaches the bridge as it is, `init`'s arguments, and
+that `--tmux-socket` parses and is hidden from help;
 `src/init.rs` the request's body (a bare handle given its `@`) and the client pointed at the state
 directory's socket, or the `--listen` given; `src/setup.rs` that the listener hands the setup over
 once, and that an office loop and a runner (real, watching nothing) are kept until the stop begins
@@ -763,10 +812,13 @@ and handed back, not kept, once it has.
   session has a terminal yet.
 - `POST /v1/sessions` with `agent` or `task` (`503`; it needs the runner to adopt a session id, as
   dispatch does), and `POST /v1/sessions/{id}/link`, which no route serves yet.
-- A tmux socket per daemon: the default socket is per user, not per state directory, so two
-  daemons of one user (a real one and a demo, say) share one tmux server, and the second's runtime
-  adopts the first's terminals, unless one is given `PITCREW_TMUX_SOCKET`. A proposal: derive the
-  default from the state directory, or lock the socket's directory for one runtime.
+- The first prompt (`brief`) is passed to the CLI as an argument, so other users of the machine
+  can read it in the process list (`/proc/<pid>/cmdline`), and tmux shows it in the pane's
+  `pane_start_command`. Passing it on the CLI's standard input, or through a private file, would
+  keep it to the user (threat model O42).
+- Group-writable project folders, and folders on a Windows drive mounted in WSL without metadata
+  (mode 777), are refused as a session's `cwd` (see "Terminals"). Allowing a group the user alone
+  is in (a user private group) would need the group's members checked.
 - Linking sessions to workstreams by folder or branch: the runner can (`Locations`), but the daemon
   does not pass it the workstreams' locations yet, so nothing is linked by folder or branch.
 - Host info from `pitcrew-api` itself: its `router` takes a fixed `HostInfo`, so the daemon answers
