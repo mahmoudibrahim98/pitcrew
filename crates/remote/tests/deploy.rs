@@ -855,7 +855,11 @@ mod unix {
     /// This process's umask, as /proc prints it: `0022`.
     pub(crate) fn own_umask() -> String {
         use rustix::fs::Mode;
-        // Read by setting it, then put back at once (the cases run one at a time).
+        if let Some(mask) = umask_in("/proc/self/status") {
+            return mask;
+        }
+        // No /proc (macOS), or one without the umask (before Linux 4.7): read by setting it,
+        // then put back at once (the cases run one at a time).
         let mask = rustix::process::umask(Mode::empty());
         rustix::process::umask(mask);
         format!("{:04o}", mask.bits())
@@ -864,7 +868,12 @@ mod unix {
     /// Another process's umask, as /proc prints it (`0022`), where there is a /proc to read it
     /// from (Linux); `None` elsewhere.
     pub(crate) fn umask_of(pid: u32) -> Option<String> {
-        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        umask_in(&format!("/proc/{pid}/status"))
+    }
+
+    /// The `Umask:` line of a /proc status file.
+    fn umask_in(status: &str) -> Option<String> {
+        let status = std::fs::read_to_string(status).ok()?;
         status
             .lines()
             .find_map(|l| l.strip_prefix("Umask:").map(|v| v.trim().to_owned()))
