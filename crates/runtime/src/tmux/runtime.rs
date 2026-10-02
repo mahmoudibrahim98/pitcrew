@@ -59,6 +59,9 @@ const PENDING_KILLS: usize = 64;
 /// How long dropping the runtime waits for its keeper thread.
 const DROP_WAIT: Duration = Duration::from_secs(2);
 
+/// Further tries of `new-session` when the server it reached went away under it.
+const NEW_SESSION_TRIES: usize = 3;
+
 /// PitCrew's terminals as windows of a private tmux server (see the [module docs](super)).
 ///
 /// - Every call is bounded by [`TmuxOptions::call_timeout`] (`start` by
@@ -356,7 +359,18 @@ impl Inner {
                 let mut args = vec!["new-session", "-s", SESSION, "-n", HOLDER_NAME];
                 args.extend(["-P", "-F", "#{window_id}", "--"]);
                 args.extend(HOLDER);
-                match self.connect(&args, deadline) {
+                // The failed attach may have started a server that exits at once (it has no
+                // session); a new session made just then dies with it ("server exited
+                // unexpectedly", seen as no server). The next try gets a fresh server.
+                let mut made = self.connect(&args, deadline);
+                for _ in 0..NEW_SESSION_TRIES {
+                    if !matches!(made, Err(ConnectError::NoSession)) || Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                    made = self.connect(&args, deadline);
+                }
+                match made {
                     Ok((conn, generation, reply)) => {
                         let holder = reply.lines.first().and_then(|line| WindowId::parse(line));
                         (conn, generation, holder)
