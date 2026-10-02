@@ -831,6 +831,81 @@ fn a_copied_tag_does_not_move_a_terminal() {
 }
 
 #[test]
+fn a_forged_list_row_neither_moves_nor_ends_a_terminal() {
+    let Some(fx) = Fixture::new("forgedrow") else {
+        return;
+    };
+    let rt = fx.runtime();
+    let t = rt
+        .start(&fx.spec("real", "sh", &["-c", "printf ready; exec cat"]))
+        .expect("start");
+    let (_, ready) = wait_for(&rt, t.id, 0, b"ready");
+    let pane = fx.pane_of(t.id);
+    // A raw newline in a user option starts a row of its own in `list-panes`: this one says
+    // the pane is dead, in another window.
+    let forged = format!("1\n@99 {pane} 1 1 80 24 ");
+    fx.tmux(&["set-option", "-p", "-t", &pane, OFFSET_OPTION, &forged]);
+    let listed = rt.list().expect("list");
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert!(listed[0].alive, "a forged row ended the terminal");
+    assert_eq!(listed[0].native_target, t.native_target);
+    rt.write(t.id, b"still\r").expect("write");
+    wait_for(&rt, t.id, ready, b"still\r\nstill\r\n");
+    rt.kill(t.id).expect("kill");
+    drop(rt);
+    fx.finish();
+}
+
+#[test]
+fn a_new_connection_removes_windows_of_unfinished_starts() {
+    let Some(fx) = Fixture::new("orphans") else {
+        return;
+    };
+    let rt = fx.runtime();
+    let t = rt
+        .start(&fx.spec("kept", "sh", &["-c", "printf ready; exec cat"]))
+        .expect("start");
+    wait_for(&rt, t.id, 0, b"ready");
+    // What a start leaves when its connection dies before it can tag the window: an untagged
+    // pane started by the wrapper. And a window of someone else's, which must stay.
+    fx.tmux(&[
+        "new-window",
+        "-d",
+        "-t",
+        "pitcrew:",
+        "--",
+        "/bin/sh",
+        "-c",
+        ": pitcrew-wrapper; exec cat",
+    ]);
+    fx.tmux(&[
+        "new-window",
+        "-d",
+        "-t",
+        "pitcrew:",
+        "--",
+        "/bin/sh",
+        "-c",
+        "exec cat",
+    ]);
+    assert_eq!(fx.tags().len(), 3);
+    let first = rt.control_pid().expect("attached");
+    signal(first, rustix::process::Signal::KILL);
+    eventually("a new control client", || {
+        rt.control_pid().is_some_and(|pid| pid != first)
+    });
+    let id = t.id.to_string();
+    eventually("the orphan is gone and the rest stays", || {
+        let tags = fx.tags();
+        tags.len() == 2 && tags.iter().filter(|(_, tag)| *tag == id).count() == 1
+    });
+    assert!(rt.info(t.id).expect("info").alive);
+    rt.kill(t.id).expect("kill");
+    drop(rt);
+    fx.finish();
+}
+
+#[test]
 fn copy_mode_is_left_before_input() {
     let Some(fx) = Fixture::new("copymode") else {
         return;
