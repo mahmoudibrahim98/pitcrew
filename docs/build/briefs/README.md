@@ -70,8 +70,8 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [D-runner-followups](D-runner-followups.md) | D · Runner | `s/D/runner-followups` | Opus-class | **Merged** |
 | [K-remote-followups](K-remote-followups.md) | K · Desktop shell | `s/K/remote-followups` | Opus-class | **Merged** |
 | [0-daemon-runtime](0-daemon-runtime.md) | 0 · Composition root | `integrator/daemon-runtime` | Opus-class | **Merged** |
-| [B-pty-runtime](B-pty-runtime.md) | B · Runtime | `s/B/pty-runtime` | Opus-class | In progress |
-| [0-windows-native](0-windows-native.md) | 0 · Contracts | `integrator/windows-native` | Opus-class | In progress |
+| [B-pty-runtime](B-pty-runtime.md) | B · Runtime | `s/B/pty-runtime` | Opus-class | **Merged** |
+| [0-windows-native](0-windows-native.md) | 0 · Contracts | `integrator/windows-native` | Opus-class | **Merged** |
 | [0-daemon-solo](0-daemon-solo.md) | 0 · Composition root | `integrator/daemon-solo` | Opus-class | **Merged** |
 | [N-projects-wiring](N-projects-wiring.md) | N · Projects layout | `s/N/projects-wiring` | Sonnet-class | **Merged** |
 | [L-shell-polish](L-shell-polish.md) | L · UI foundation | `s/L/shell-polish` | Sonnet-class | **Merged** |
