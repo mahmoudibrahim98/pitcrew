@@ -18,12 +18,20 @@
 mod detect;
 
 #[cfg(unix)]
+mod conn;
+#[cfg(unix)]
+mod runtime;
+#[cfg(unix)]
 mod socket;
+#[cfg(unix)]
+mod state;
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 pub use detect::{Detecting, TmuxSupport, detect, detect_async};
+#[cfg(unix)]
+pub use runtime::TmuxRuntime;
 
 /// The tmux session that holds PitCrew's terminals.
 pub const SESSION: &str = "pitcrew";
