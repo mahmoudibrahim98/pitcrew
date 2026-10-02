@@ -1426,7 +1426,11 @@ mod unix {
             .into_iter()
             .map(|p| p.id)
             .collect();
-        assert_eq!(open, [first.id.clone()], "the same prompt, still open");
+        assert_eq!(
+            open,
+            std::slice::from_ref(&first.id),
+            "the same prompt, still open"
+        );
         assert_eq!(w.machine.calls_of("link"), links + 1, "one attempt");
         assert_eq!(w.events(PROMPT_EVENT).len(), prompts + 1);
 
