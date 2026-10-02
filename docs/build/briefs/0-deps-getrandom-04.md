@@ -13,7 +13,7 @@
 
 ## Goal
 
-Dependabot's PR #2 bumps `getrandom` from 0.3.4 to 0.4.3. `getrandom` makes the secrets PitCrew
+Dependabot's PR #4 bumps `getrandom` from 0.3.4 to 0.4.3. `getrandom` makes the secrets PitCrew
 relies on:
 - API tokens (`crates/auth/src/token.rs` ~50);
 - the askpass helper's one-time secret (`crates/remote/src/askpass/mod.rs` ~330);
