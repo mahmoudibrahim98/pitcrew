@@ -6,9 +6,9 @@
 //! sends SIGTERM to that group, and SIGKILL after a "KillWait".
 
 use crate::unix::{
-    Machine, RUN_ENV, Remote, alive, assert_private, block_on, comm, eventually, helper,
-    helper_from, helper_script, me, mode, own_umask, posix_shells, private_dir, quick, run_mark,
-    script_len, shim,
+    Listing, Machine, RUN_ENV, Remote, alive, assert_private, block_on, comm, darwin_ls,
+    eventually, helper, helper_from, helper_script, me, mode, own_umask, play_acl, posix_shells,
+    private_dir, quick, rewritten, run_mark, script_len, shim,
 };
 use pitcrew_protocol::model::Scheduler;
 use pitcrew_remote::helper::slurm::{self, Cancelled, JobExit, LastHop, Site, SocketPlace};
@@ -74,6 +74,9 @@ pub(crate) struct Config {
     /// some SLURM versions' I/O forwarding does), and labels each line with `0: ` where
     /// `SLURM_LABELIO` is set.
     pub(crate) line_buffered: bool,
+    /// Text of job scripts replaced as sbatch spools them, as the node's own files make them
+    /// read (see `darwin_ls`).
+    pub(crate) rewrite: Vec<(String, String)>,
 }
 
 impl Default for Config {
@@ -95,6 +98,7 @@ impl Default for Config {
             cluster: None,
             scancel_error: None,
             scancel_misses: false,
+            rewrite: Vec::new(),
         }
     }
 }
@@ -333,6 +337,7 @@ fn sbatch(dir: &Path, config: &Config, args: &[String]) -> ExitCode {
         + 1;
     write_atomic(&next, id.to_string().as_bytes());
     let spool = dir.join("spool").join(format!("{id}.sh"));
+    let text = rewritten(&text, &config.rewrite);
     std::fs::write(&spool, &text).unwrap();
     std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o700)).unwrap();
     let job = FakeJob {
@@ -1607,6 +1612,121 @@ fn slurm_recipes_add_lines_and_modules() {
     block_on(launcher(&script).cancel(&target)).unwrap();
 }
 
+/// The set-up script's own access control list is judged as the way to it is: stand-in `uname`
+/// and `ls` play each system on the node (on macOS, as /bin/ls: see `darwin_ls`).
+fn slurm_set_up_scripts_with_an_acl_are_judged() {
+    let (m, sim) = machine(Config::default());
+    sim.set(|config| config.rewrite = vec![darwin_ls()]);
+    let target = m.plain();
+    block_on(deploy(&target, &helper("1.0.0"), &quick())).unwrap();
+    let site = module_site(&m, SocketPlace::Root);
+    let init = PathBuf::from(site.modules_init.clone().unwrap());
+    let script = render(&target, &site, &JobOptions::default());
+    let loaded = m.dir.path().join("loaded.log");
+    let refused = |os: &str, listing: Listing<'_>, why: &str| {
+        play_acl(&m.bin, os, &init, listing);
+        let err = block_on(launcher(&script).start(&target)).unwrap_err();
+        assert!(
+            matches!(&err, HelperError::StartFailed(d) if d.contains("unsafe_file") && d.contains(why)),
+            "{os}: {why}: {err:?}"
+        );
+        assert!(!loaded.exists());
+    };
+    let started = |os: &str, listing: Listing<'_>| {
+        play_acl(&m.bin, os, &init, listing);
+        block_on(launcher(&script).start(&target)).unwrap();
+        assert_eq!(
+            read(&loaded),
+            "load example-toolchain/1.0\nload nodejs/22\n"
+        );
+        block_on(launcher(&script).cancel(&target)).unwrap();
+        std::fs::remove_file(&loaded).unwrap();
+    };
+    let see = format!("(run /bin/ls -led {} to see it)", init.display());
+
+    // macOS: an entry that lets someone else change the script, inherited or not. The refusal
+    // says how to see it.
+    refused(
+        "Darwin",
+        Listing::Entries(&[
+            " 0: group:everyone deny delete",
+            " 1: user:mallory allow read,write,append",
+        ]),
+        &format!("lets others change it:  1: user:mallory allow read,write,append {see}"),
+    );
+    refused(
+        "Darwin",
+        Listing::Entries(&[" 0: group:staff inherited allow read,writeextattr"]),
+        "inherited allow read,writeextattr",
+    );
+    // A list that cannot be read: ls fails, or prints nothing.
+    refused(
+        "Darwin",
+        Listing::Fails,
+        &format!("has an access control list that cannot be read {see}"),
+    );
+    refused(
+        "Darwin",
+        Listing::Empty,
+        "has an access control list that cannot be read",
+    );
+    // A system whose ACLs the check does not know.
+    refused(
+        "FreeBSD",
+        Listing::Entries(&[]),
+        "which cannot be checked on FreeBSD",
+    );
+    // Linux: a POSIX ACL's grants are bounded by the group bits, checked already (r-- here).
+    started("Linux", Listing::Fails);
+    // macOS: entries that deny, whatever they deny, or allow only reading and running it,
+    // whatever name they have.
+    started(
+        "Darwin",
+        Listing::Entries(&[
+            " 0: user:mallory deny write,append,delete,writeattr,writeextattr,writesecurity,chown",
+            " 1: group:CORP\\Domain Users allow read,execute,readattr,readextattr,readsecurity,synchronize",
+        ]),
+    );
+}
+
+/// The same with macOS's own ACLs (`chmod +a`) and its own `ls -le`.
+fn slurm_set_up_script_with_a_macos_acl() {
+    if !cfg!(target_os = "macos") {
+        eprintln!("skipped: needs macOS's chmod +a and ls -le");
+        return;
+    }
+    let (m, _sim) = machine(Config::default());
+    let target = m.plain();
+    block_on(deploy(&target, &helper("1.0.0"), &quick())).unwrap();
+    let site = module_site(&m, SocketPlace::Root);
+    let init = site.modules_init.clone().unwrap();
+    let script = render(&target, &site, &JobOptions::default());
+    let chmod = |args: &[&str]| {
+        let status = Command::new("/bin/chmod")
+            .args(args)
+            .arg(&init)
+            .status()
+            .unwrap();
+        assert!(status.success(), "chmod {args:?}");
+    };
+    // The mode bits say -rw-r--r--; the ACL lets everyone change it.
+    chmod(&["+a", "everyone allow write,append"]);
+    let err = block_on(launcher(&script).start(&target)).unwrap_err();
+    assert!(
+        matches!(&err, HelperError::StartFailed(d) if d.contains("unsafe_file") && d.contains("lets others change it")),
+        "{err:?}"
+    );
+    // One that only lets them read it is fine.
+    chmod(&["-N"]);
+    chmod(&["+a", "everyone allow read"]);
+    block_on(launcher(&script).start(&target)).unwrap();
+    assert_eq!(
+        read(&m.dir.path().join("loaded.log")),
+        "load example-toolchain/1.0\nload nodejs/22\n"
+    );
+    block_on(launcher(&script).cancel(&target)).unwrap();
+}
+
 /// The socket on the node's own disk: `$TMPDIR`, else `/tmp`.
 fn slurm_socket_on_node_local_tmpdir() {
     let (m, sim) = machine(Config::default());
@@ -2111,6 +2231,14 @@ pub(crate) const CASES: &[(&str, fn())] = &[
     (
         "slurm_recipes_add_lines_and_modules",
         slurm_recipes_add_lines_and_modules,
+    ),
+    (
+        "slurm_set_up_scripts_with_an_acl_are_judged",
+        slurm_set_up_scripts_with_an_acl_are_judged,
+    ),
+    (
+        "slurm_set_up_script_with_a_macos_acl",
+        slurm_set_up_script_with_a_macos_acl,
     ),
     (
         "slurm_socket_on_node_local_tmpdir",

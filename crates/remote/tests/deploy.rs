@@ -154,6 +154,10 @@ mod unix {
         /// The umask the remote command starts with.
         #[serde(default)]
         pub(crate) umask: Option<String>,
+        /// Text of the script replaced, as the machine's own files make it read (see
+        /// [`darwin_ls`]).
+        #[serde(default)]
+        pub(crate) rewrite: Vec<(String, String)>,
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -263,6 +267,16 @@ mod unix {
         let mut eaten = std::io::Read::take(&mut from_app, eat);
         let swallowed = std::io::copy(&mut eaten, &mut std::io::sink()).unwrap_or(0);
         count += swallowed;
+        if !remote.rewrite.is_empty() {
+            // The script whole, then as this machine reads it.
+            let mut head = Vec::new();
+            let _ = std::io::Read::take(&mut from_app, script_len()).read_to_end(&mut head);
+            if head == SCRIPT.as_bytes() {
+                head = rewritten(SCRIPT, &remote.rewrite).into_bytes();
+            }
+            count += head.len() as u64;
+            let _ = to_remote.write_all(&head);
+        }
         loop {
             let mut want = buf.len() as u64;
             for mark in [remote.cut_after, remote.pause_after.filter(|_| !paused)]
@@ -470,6 +484,88 @@ mod unix {
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// `text` with each `(from, to)` of `rewrite` replaced. Each `to` is as long as its `from`,
+    /// so a script keeps the length it is checked by.
+    pub(crate) fn rewritten(text: &str, rewrite: &[(String, String)]) -> String {
+        let mut text = text.to_owned();
+        for (from, to) in rewrite {
+            assert_eq!(from.len(), to.len(), "{from:?} -> {to:?}");
+            assert!(
+                text.contains(from.as_str()),
+                "{from:?} is not in the script"
+            );
+            text = text.replace(from.as_str(), to);
+        }
+        text
+    }
+
+    /// A Mac whose `/bin/ls` is the stand-in on the tool path: the scripts' `/bin/ls` on macOS
+    /// reads as `ls`, padded to the same length.
+    pub(crate) fn darwin_ls() -> (String, String) {
+        (
+            "pc_ls_cmd=/bin/ls ;;".to_owned(),
+            format!("pc_ls_cmd={:<7} ;;", "ls"),
+        )
+    }
+
+    /// What a stand-in `ls -lde` prints for a path with an access control list.
+    #[derive(Clone, Copy)]
+    pub(crate) enum Listing<'a> {
+        /// The path's own line, then these entries.
+        Entries(&'a [&'a str]),
+        /// These entries without the path's line.
+        Headless(&'a [&'a str]),
+        /// Nothing, and exits 0.
+        Empty,
+        /// Nothing, and fails.
+        Fails,
+    }
+
+    /// Stand-ins in `bin`, playing a system where `path` has an access control list: `uname -s`
+    /// says `os`, `ls -ldn` shows a `+` in the mode of `path`, and `ls -lde` lists it as
+    /// `listing` says. Everything else goes to the real tools.
+    pub(crate) fn play_acl(bin: &Path, os: &str, path: &Path, listing: Listing<'_>) {
+        let (ls, uname) = (which("ls").unwrap(), which("uname").unwrap());
+        shim(
+            bin,
+            "uname",
+            &format!(
+                "case $1 in -s) echo {os} ;; *) exec '{}' \"$@\" ;; esac",
+                uname.display()
+            ),
+        );
+        let plus = format!(
+            "'{}' -ldn \"$last\" | awk '{{ $1 = $1 \"+\"; print }}'",
+            ls.display()
+        );
+        let entries = |entries: &[&str]| {
+            if entries.is_empty() {
+                return ":".to_owned();
+            }
+            let quoted: Vec<String> = entries.iter().map(|e| format!("'{e}'")).collect();
+            format!("printf '%s\\n' {}", quoted.join(" "))
+        };
+        let list = match listing {
+            Listing::Entries(list) => format!("{plus}; {}; exit", entries(list)),
+            Listing::Headless(list) => format!("{}; exit", entries(list)),
+            Listing::Empty => "exit 0".to_owned(),
+            Listing::Fails => "exit 1".to_owned(),
+        };
+        shim(
+            bin,
+            "ls",
+            &format!(
+                "last=\nfor a in \"$@\"; do last=$a; done\n\
+                 if [ \"$last\" = '{}' ]; then\n\
+                 case $1 in -ldn) {plus}; exit ;; -lde) {list} ;; esac\n\
+                 fi\n\
+                 exec '{}' \"$@\"",
+                path.display(),
+                ls.display()
+            ),
+        );
     }
 
     /// A hash tool played by this binary (see [`act_as_tool`]).
@@ -1691,11 +1787,14 @@ mod unix {
     fn the_way_to_the_root_is_checked() {
         let m = Machine::new();
         // Canonical: macOS's /var is a link to /private/var, which the walk resolves, and the
-        // stand-in `ls` below must be asked about the paths it names.
+        // stand-in `ls` below must be asked about the paths it names (on macOS, as /bin/ls).
         let base = m.dir.path().canonicalize().unwrap();
         let at = |root: &Path| {
             m.target_at(
-                &m.fake(Remote::default()),
+                &m.fake(Remote {
+                    rewrite: vec![darwin_ls()],
+                    ..Remote::default()
+                }),
                 Layout::at(root.to_str().unwrap()).unwrap(),
             )
         };
@@ -1792,7 +1891,8 @@ mod unix {
     /// An access control list on a directory on the way is judged by what it grants where `ls`
     /// can list it (macOS's `ls -le`), and refused where it cannot be read or the system is not
     /// one whose ACLs the check knows: on macOS the mode bits alone can look safe. Here a
-    /// stand-in `uname` and `ls` play each system, so this runs anywhere.
+    /// stand-in `uname` and `ls` play each system (on macOS, as `/bin/ls`: see `darwin_ls`), so
+    /// this runs anywhere.
     fn an_acl_on_the_way_is_judged_by_what_it_grants() {
         let m = Machine::new();
         // Canonical, as in `the_way_to_the_root_is_checked`.
@@ -1801,49 +1901,16 @@ mod unix {
         std::fs::create_dir_all(acl.join("u")).unwrap();
         std::fs::set_permissions(&acl, std::fs::Permissions::from_mode(0o755)).unwrap();
         let root = acl.join("u/.pitcrew");
-        let (ls, uname) = (which("ls").unwrap(), which("uname").unwrap());
-        // `uname -s` says `os`; `acl` shows a `+`, and `ls -le` lists `entries` for it (`None`:
-        // it fails).
-        let system = |os: &str, entries: Option<&[&str]>| {
-            shim(
-                &m.bin,
-                "uname",
-                &format!(
-                    "case $1 in -s) echo {os} ;; *) exec '{}' \"$@\" ;; esac",
-                    uname.display()
-                ),
-            );
-            let plus = format!(
-                "'{}' -ldn \"$last\" | awk '{{ $1 = $1 \"+\"; print }}'",
-                ls.display()
-            );
-            let list = match entries {
-                Some(entries) => {
-                    let quoted: Vec<String> = entries.iter().map(|e| format!("'{e}'")).collect();
-                    format!("{plus}; printf '%s\\n' {}; exit", quoted.join(" "))
-                }
-                None => "exit 1".to_owned(),
-            };
-            shim(
-                &m.bin,
-                "ls",
-                &format!(
-                    "last=\nfor a in \"$@\"; do last=$a; done\n\
-                     if [ \"$last\" = '{}' ]; then\n\
-                     case $1 in -ldn) {plus}; exit ;; -lde) {list} ;; esac\n\
-                     fi\n\
-                     exec '{}' \"$@\"",
-                    acl.display(),
-                    ls.display()
-                ),
-            );
+        let system = |os: &str, listing: Listing<'_>| play_acl(&m.bin, os, &acl, listing);
+        let deploy_with = |remote: Remote| {
+            let target = m.target_at(&m.fake(remote), Layout::at(root.to_str().unwrap()).unwrap());
+            block_on(deploy(&target, &helper("1.0.0"), &quick()))
         };
         let deploy_here = || {
-            let target = m.target_at(
-                &m.fake(Remote::default()),
-                Layout::at(root.to_str().unwrap()).unwrap(),
-            );
-            block_on(deploy(&target, &helper("1.0.0"), &quick()))
+            deploy_with(Remote {
+                rewrite: vec![darwin_ls()],
+                ..Remote::default()
+            })
         };
         let refused = |why: &str| {
             let err = deploy_here().unwrap_err();
@@ -1853,47 +1920,96 @@ mod unix {
             );
             assert!(!root.exists());
         };
+        let deployed = |result: Result<_, HelperError>| {
+            result.unwrap();
+            assert!(root.join("bin/1.0.0/pitcrewd").is_file());
+            std::fs::remove_dir_all(&root).unwrap();
+        };
+        let see = format!("(run /bin/ls -led {} to see it)", acl.display());
 
-        // macOS: an entry that lets someone else add, remove or rename what is in it.
+        // macOS: an entry that lets someone else add, remove or rename what is in it, inherited
+        // or not, whatever name it has. The refusal says how to see it.
         system(
             "Darwin",
-            Some(&[
+            Listing::Entries(&[
                 " 0: group:everyone deny delete",
                 " 1: user:mallory allow list,add_file,delete_child",
             ]),
         );
-        refused("lets others change it:  1: user:mallory allow list,add_file,delete_child");
-        system("Darwin", Some(&[" 0: user:mallory allow write"]));
+        refused(&format!(
+            "lets others change it:  1: user:mallory allow list,add_file,delete_child {see}"
+        ));
+        system(
+            "Darwin",
+            Listing::Entries(&[" 0: user:mallory allow write"]),
+        );
         refused("allow write");
-        // An entry not in the form the check knows, or a list that cannot be read.
-        system("Darwin", Some(&[" 0: something else"]));
+        system(
+            "Darwin",
+            Listing::Entries(&[
+                " 0: group:staff inherited allow list,search,add_subdirectory,file_inherit,directory_inherit",
+            ]),
+        );
+        refused(
+            "lets others change it:  0: group:staff inherited allow list,search,add_subdirectory",
+        );
+        system(
+            "Darwin",
+            Listing::Entries(&[" 0: group:CORP\\Domain Users allow list,add_file"]),
+        );
+        refused("lets others change it:  0: group:CORP\\Domain Users allow list,add_file");
+        // An entry not in the form the check knows, or a list that cannot be read: ls fails,
+        // prints nothing, or does not list the directory first.
+        system("Darwin", Listing::Entries(&[" 0: something else"]));
         refused("lets others change it:  0: something else");
-        system("Darwin", None);
-        refused("cannot read the access control list");
+        system("Darwin", Listing::Fails);
+        refused(&format!(
+            "has an access control list that cannot be read {see}"
+        ));
+        system("Darwin", Listing::Empty);
+        refused("has an access control list that cannot be read");
+        system(
+            "Darwin",
+            Listing::Headless(&[" 0: group:everyone allow list"]),
+        );
+        refused("has an access control list that cannot be read");
         // A system whose ACLs the check does not know, or one whose name it cannot read.
-        system("FreeBSD", Some(&[]));
+        system("FreeBSD", Listing::Entries(&[]));
         refused("which cannot be checked on FreeBSD");
-        system("", Some(&[]));
+        system("", Listing::Entries(&[]));
         refused("which cannot be checked on this system");
 
         // Linux: a POSIX ACL's grants are bounded by the group bits, checked already (r-x here).
-        system("Linux", None);
-        deploy_here().unwrap();
-        assert!(root.join("bin/1.0.0/pitcrewd").is_file());
-        std::fs::remove_dir_all(&root).unwrap();
-        // macOS: entries that deny, or allow only reading and searching, as on a home folder.
+        system("Linux", Listing::Fails);
+        deployed(deploy_here());
+        // macOS: entries that deny, whatever they deny, or allow only reading, searching and
+        // the like, as on a home folder or a share mounted over SMB (synchronize), whatever
+        // name they have.
         system(
             "Darwin",
-            Some(&[
+            Listing::Entries(&[
                 " 0: group:everyone deny delete",
-                " 1: user:_spotlight inherited allow list,search,readattr,file_inherit,directory_inherit",
+                " 1: user:mallory deny add_file,add_subdirectory,delete_child,writeattr,writeextattr,writesecurity,chown",
+                " 2: user:_spotlight inherited allow list,search,readattr,file_inherit,directory_inherit",
+                " 3: group:CORP\\Domain Users allow list,search,readattr,readextattr,readsecurity,synchronize",
             ]),
         );
-        deploy_here().unwrap();
-        assert!(root.join("bin/1.0.0/pitcrewd").is_file());
+        deployed(deploy_here());
+
+        // On macOS the scripts ask /bin/ls, whatever the tool path finds first: the stand-in
+        // there is not asked. (/bin/ls is this system's own, and shows no ACL on `acl`.)
+        if Path::new("/bin/ls").is_file() {
+            system(
+                "Darwin",
+                Listing::Entries(&[" 0: user:mallory allow list,add_file"]),
+            );
+            deployed(deploy_with(Remote::default()));
+        }
     }
 
-    /// The same with macOS's own ACLs (`chmod +a`) and its own `ls -le`.
+    /// The same with macOS's own ACLs (`chmod +a`) and its own `ls -le`, also with an `ls` first
+    /// on the tool path that cannot list ACLs (as GNU's, which has no `-e`) and hides their
+    /// marks (as uutils' and busybox's show none): it is not asked.
     fn a_macos_acl_on_the_way_is_judged_by_what_it_grants() {
         if !cfg!(target_os = "macos") {
             eprintln!("skipped: needs macOS's chmod +a and ls -le");
@@ -1920,22 +2036,38 @@ mod unix {
             );
             block_on(deploy(&target, &helper("1.0.0"), &quick()))
         };
-        // The mode bits say drwxr-xr-x; the ACL lets everyone add and remove entries.
-        chmod(&[
-            "+a",
-            "everyone allow add_file,add_subdirectory,delete_child",
-        ]);
-        let err = deploy_here().unwrap_err();
-        assert!(
-            matches!(&err, HelperError::UnsafeDirectory(d) if d.contains("lets others change it")),
-            "{err:?}"
-        );
-        assert!(!root.exists());
-        // One that only denies, as on every macOS home folder, is fine.
-        chmod(&["-N"]);
-        chmod(&["+a", "everyone deny delete"]);
-        deploy_here().unwrap();
-        assert!(root.join("bin/1.0.0/pitcrewd").is_file());
+        let real = which("ls").unwrap();
+        for other_ls in [false, true] {
+            if other_ls {
+                shim(
+                    &m.bin,
+                    "ls",
+                    &format!(
+                        "case $1 in *e*) echo \"ls: invalid option -- 'e'\" >&2; exit 2 ;; esac\n\
+                         '{}' \"$@\" | awk '{{ sub(/[+@]$/, \"\", $1); print }}'",
+                        real.display()
+                    ),
+                );
+                std::fs::remove_dir_all(&root).unwrap();
+                chmod(&["-N"]);
+            }
+            // The mode bits say drwxr-xr-x; the ACL lets everyone add and remove entries.
+            chmod(&[
+                "+a",
+                "everyone allow add_file,add_subdirectory,delete_child",
+            ]);
+            let err = deploy_here().unwrap_err();
+            assert!(
+                matches!(&err, HelperError::UnsafeDirectory(d) if d.contains("lets others change it")),
+                "{other_ls}: {err:?}"
+            );
+            assert!(!root.exists());
+            // One that only denies, as on every macOS home folder, is fine.
+            chmod(&["-N"]);
+            chmod(&["+a", "everyone deny delete"]);
+            deploy_here().unwrap();
+            assert!(root.join("bin/1.0.0/pitcrewd").is_file());
+        }
     }
 
     /// A shell start-up file that reads stdin eats the start of the script: what is left must
@@ -2077,9 +2209,9 @@ mod unix {
         assert!(stopped.pid.is_some());
     }
 
-    /// macOS shows `@` for extended attributes, which hides an ACL's `+`: `ls -le` is asked.
-    /// A set-group-ID parent (group project directories) makes new directories `drwx--S---`,
-    /// which are private all the same.
+    /// macOS shows `@` for extended attributes, which hides an ACL's `+`: `ls -le` is asked
+    /// (the stand-in `ls`, on macOS as /bin/ls). A set-group-ID parent (group project
+    /// directories) makes new directories `drwx--S---`, which are private all the same.
     fn acls_behind_an_at_sign_and_setgid_parents() {
         let real = which("ls").unwrap();
         for acl in [true, false] {
@@ -2104,7 +2236,11 @@ mod unix {
                     real = real.display(),
                 ),
             );
-            let result = block_on(deploy(&m.plain(), &helper("1.0.0"), &quick()));
+            let fake = m.fake(Remote {
+                rewrite: vec![darwin_ls()],
+                ..Remote::default()
+            });
+            let result = block_on(deploy(&m.target(&fake), &helper("1.0.0"), &quick()));
             if acl {
                 let err = result.unwrap_err();
                 assert!(

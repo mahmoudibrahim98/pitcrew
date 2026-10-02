@@ -981,6 +981,9 @@ mod tests {
         }
         let nap = "\npc_nap() { sleep 0.2 2>/dev/null || sleep 1; }\n";
         assert!(helper.contains(nap) && JOB_BODY.contains(nap));
+        // And the same ls: on macOS, /bin/ls by its path.
+        let ls = "\npc_ls_cmd=ls\ncase $pc_os in Darwin) pc_ls_cmd=/bin/ls ;; esac\n";
+        assert!(helper.contains(ls) && JOB_BODY.contains(ls));
     }
 
     #[test]

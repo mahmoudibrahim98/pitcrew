@@ -61,7 +61,7 @@ pc_alive() {
 # writable by the group or others only if sticky (as /tmp), by its mode bits and by any access
 # control list (pc_acl_ok). Anyone else could rename what is under it after the checks.
 pc_dir_ok() {
-  pc_ls=$(ls -ldn "$1" 2>/dev/null | awk '{print $1, $3}')
+  pc_ls=$("$pc_ls_cmd" -ldn "$1" 2>/dev/null | awk '{print $1, $3}')
   pc_m=${pc_ls%% *} pc_u=${pc_ls#* }
   case $pc_m in
     d*) ;;
@@ -80,40 +80,48 @@ pc_dir_ok() {
       ;;
   esac
   case $pc_m in
-    ??????????[+@]*) pc_acl_ok "$1" ;;
+    ??????????[+@]*)
+      pc_acl_ok "$1" || pc_fail unsafe_dir "$1, on the way to $pc_goal, $pc_why" ;;
   esac
 }
 
-# pc_acl_ok DIR: DIR, on the way to $pc_goal, has an access control list (+), or extended
-# attributes that may hide one (macOS's @). No one else may add, remove or rename what is in it
-# through one:
+# pc_acl_ok PATH: whether PATH, whose mode pc_m shows an access control list (+), or extended
+# attributes that may hide one (macOS's @), lets no one else change it, or what is in it,
+# through one; pc_why says why not.
 # - Linux: a POSIX ACL's grants are bounded by its mask, which ls shows as the group bits, and
-#   pc_dir_ok has checked those.
-# - macOS: the mode bits leave the ACL out. ls -le lists it, and every entry must deny, or allow
-#   only reading and searching.
-# - Anywhere else the check cannot tell, so the directory is refused; so it is on macOS when the
-#   list cannot be read or an entry is not understood.
+#   the caller has checked those.
+# - macOS: the mode bits leave the ACL out. ls -le lists PATH, then the ACL, and every entry
+#   must deny, or allow only reading, listing, searching or executing, reading attributes,
+#   extended attributes or the ACL, and synchronize (which SMB-style ACLs carry). Who an entry
+#   names is not looked up: one for the user, root or group:admin that allows more fails too.
+# - Anywhere else the check cannot tell, so it fails; so it does on macOS when the list cannot
+#   be read (ls fails, or does not list PATH first) or an entry is not understood.
 pc_acl_ok() {
   case $pc_os:$pc_m in
     Linux:??????????+*) return 0 ;;
     Darwin:*) ;;
-    *) pc_fail unsafe_dir "$1, on the way to $pc_goal, has an access control list ($pc_m), which cannot be checked on ${pc_os:-this system}" ;;
+    *)
+      pc_why="has an access control list ($pc_m), which cannot be checked on ${pc_os:-this system}"
+      return 1 ;;
   esac
-  pc_acl=$(ls -lde "$1" 2>/dev/null) || pc_fail unsafe_dir "cannot read the access control list of $1, on the way to $pc_goal"
-  pc_acl=$(printf '%s\n' "$pc_acl" | awk '
+  pc_why="has an access control list that cannot be read (run /bin/ls -led $1 to see it)"
+  pc_acl=$("$pc_ls_cmd" -lde "$1" 2>/dev/null) || return 1
+  pc_acl=$(printf '%s\n' "$pc_acl" | awk -v m="$pc_m" '
     BEGIN {
-      n = split("list search read execute readattr readextattr readsecurity file_inherit directory_inherit limit_inherit only_inherit", w, " ")
+      n = split("list search read execute readattr readextattr readsecurity synchronize file_inherit directory_inherit limit_inherit only_inherit", w, " ")
       for (i = 1; i <= n; i++) ok[w[i]] = 1
     }
-    NR == 1 { next }
+    NR == 1 { if (substr($1, 1, 1) != substr(m, 1, 1)) { bad = 2; exit } next }
     NF < 3 || ($(NF - 1) != "allow" && $(NF - 1) != "deny") { bad = 1; line = $0; exit }
     $(NF - 1) == "deny" { next }
     { k = split($NF, p, ","); for (i = 1; i <= k; i++) if (!(p[i] in ok)) { bad = 1; line = $0; exit } }
-    END { if (bad) print "refused: " line; else if (NR > 0) print "ok" }')
+    END { if (bad == 2) print "unread"; else if (bad) print "refused: " line; else print "ok" }')
   case $pc_acl in
-    ok) ;;
-    *) pc_fail unsafe_dir "$1, on the way to $pc_goal, has an access control list that lets others change it: ${pc_acl#refused: }" ;;
+    ok) return 0 ;;
+    'refused: '*)
+      pc_why="has an access control list that lets others change it: ${pc_acl#refused: } (run /bin/ls -led $1 to see it)" ;;
   esac
+  return 1
 }
 
 # pc_safe_way PATH: resolves PATH's parent one component at a time, as the kernel does, and
@@ -137,7 +145,7 @@ pc_safe_way() {
       if [ "$pc_hops" -gt 40 ]; then
         pc_fail unsafe_dir "too many symbolic links on the way to $pc_goal"
       fi
-      pc_u=$(ls -ldn "$pc_next" 2>/dev/null | awk '{print $3}')
+      pc_u=$("$pc_ls_cmd" -ldn "$pc_next" 2>/dev/null | awk '{print $3}')
       case $pc_u in
         0|"$pc_me") ;;
         *) pc_fail unsafe_dir "the link $pc_next, on the way to $pc_goal, belongs to uid $pc_u" ;;
@@ -162,13 +170,13 @@ pc_private() {
   fi
   if [ -L "$1" ]; then pc_fail unsafe_dir "$(pc_where "$1") is a symbolic link"; fi
   if [ ! -d "$1" ]; then pc_fail unsafe_dir "$(pc_where "$1") is not a directory"; fi
-  pc_ls=$(ls -ldn "$1" 2>/dev/null | awk '{print $1, $3}')
+  pc_ls=$("$pc_ls_cmd" -ldn "$1" 2>/dev/null | awk '{print $1, $3}')
   case $pc_ls in
     "drwx------ $pc_me"|"drwx------. $pc_me"|"drwx--S--- $pc_me"|"drwx--S---. $pc_me") ;;
     "drwx------@ $pc_me"|"drwx--S---@ $pc_me")
       # macOS shows @ for extended attributes, which hides the + of an ACL; ls -le lists any.
-      if [ "$(ls -lde "$1" 2>/dev/null | wc -l | tr -d ' ')" != 1 ]; then
-        pc_fail unsafe_dir "$(pc_where "$1") has an access control list"
+      if [ "$("$pc_ls_cmd" -lde "$1" 2>/dev/null | wc -l | tr -d ' ')" != 1 ]; then
+        pc_fail unsafe_dir "$(pc_where "$1") has an access control list (run /bin/ls -led $(pc_where "$1") to see it)"
       fi
       ;;
     *) pc_fail unsafe_dir "$(pc_where "$1") must be owned by uid $pc_me with mode drwx------ and no ACL; it is: $pc_ls" ;;
@@ -176,13 +184,13 @@ pc_private() {
 }
 
 # pc_safe_file FILE: FILE (a script this job sources), and the way to it, belong to root or this
-# user and are writable by no one else, as the way to the root; a symbolic link is followed, and
-# must be theirs too.
+# user and are writable by no one else, as the way to the root, by their mode bits and by any
+# access control list (pc_acl_ok); a symbolic link is followed, and must be theirs too.
 pc_safe_file() {
   pc_file=$1 pc_fhops=0
   while :; do
     pc_safe_way "$pc_file"
-    pc_ls=$(ls -ldn "$pc_file" 2>/dev/null | awk '{print $1, $3}')
+    pc_ls=$("$pc_ls_cmd" -ldn "$pc_file" 2>/dev/null | awk '{print $1, $3}')
     pc_m=${pc_ls%% *} pc_u=${pc_ls#* }
     case $pc_u in
       0|"$pc_me") ;;
@@ -196,6 +204,10 @@ pc_safe_file() {
         case $pc_target in /*) pc_file=$pc_target ;; *) pc_file=${pc_file%/*}/$pc_target ;; esac
         ;;
       -????w*|-???????w*) pc_fail unsafe_file "$pc_file is writable by others ($pc_m)" ;;
+      -?????????[+@]*)
+        pc_acl_ok "$pc_file" || pc_fail unsafe_file "$pc_file $pc_why"
+        return 0
+        ;;
       -*) return 0 ;;
       *) pc_fail unsafe_file "$pc_file is not a regular file" ;;
     esac
@@ -232,6 +244,11 @@ pc_me=$(id -u 2>/dev/null)
 case $pc_me in ''|*[!0123456789]*) pc_fail io "id -u failed" ;; esac
 # The kernel, for what ls can tell of access control lists (pc_acl_ok).
 pc_os=$(uname -s 2>/dev/null)
+# The ls that reads modes and access control lists: on macOS its own, by path, whatever the
+# tool path finds first. GNU ls cannot list an ACL (-e), so it would refuse every home folder
+# (each has one), and uutils' or busybox's ls shows no + for one, which would go unjudged.
+pc_ls_cmd=ls
+case $pc_os in Darwin) pc_ls_cmd=/bin/ls ;; esac
 
 # 1. The way to the root, the root, and the version to start.
 pc_safe_way "$pc_root"
