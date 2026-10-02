@@ -23,11 +23,12 @@
 //! - `machine` must be a machine of the workspace (`400` otherwise) and the runner's (`503` for
 //!   another).
 //! - `cwd` ([`checked_cwd`]): absolute, at most [`MAX_CWD`] bytes, an existing folder, resolved
-//!   once here (links and `..`) and passed on resolved. On Unix it and every folder above it must
-//!   belong to root or this user, and none may be writable by every user (o+w), except that a
-//!   folder above it may be if it is sticky (as `/tmp`): anyone who can write there could plant
-//!   files the CLI reads as its project's (settings, hooks), or swap the folder. Group-writable
-//!   folders (a shared project) are allowed, and a start in one is logged at info, naming them.
+//!   once here (links and `..`; on Windows `.` and `..` in its text, as Windows itself resolves
+//!   them) and passed on resolved. On Unix it and every folder above it must belong to root or
+//!   this user, and none may be writable by every user (o+w), except that a folder above it may be
+//!   if it is sticky (as `/tmp`): anyone who can write there could plant files the CLI reads as its
+//!   project's (settings, hooks), or swap the folder. Group-writable folders (a shared project)
+//!   are allowed, and a start in one is logged at info, naming them.
 //!
 //! **Who may.** A person (device token) may command only a session with no agent, or one whose
 //! agent they own: the runner's rule for hooks ([`may_command`], over the hub's sessions and
@@ -505,10 +506,10 @@ struct Folder {
     group_writable: Vec<String>,
 }
 
-/// `cwd` resolved (links and `..`), if it is a folder PitCrew may start a CLI in: absolute and
-/// existing; on Unix, it and every folder above it belong to root or this user, and none is
-/// writable by every user (o+w) except a sticky folder above it. Group-writable folders pass, and
-/// are named so the start can say so. Otherwise why not. Blocking.
+/// `cwd` resolved (links and `..`; on Windows, in its text), if it is a folder PitCrew may start
+/// a CLI in: absolute and existing; on Unix, it and every folder above it belong to root or this
+/// user, and none is writable by every user (o+w) except a sticky folder above it. Group-writable
+/// folders pass, and are named so the start can say so. Otherwise why not. Blocking.
 fn checked_cwd(cwd: &str) -> Result<Folder, String> {
     let given = std::path::Path::new(cwd);
     if !given.is_absolute() {
@@ -560,11 +561,20 @@ fn checked_cwd(cwd: &str) -> Result<Folder, String> {
     }
     #[cfg(not(unix))]
     {
-        if !given.is_dir() {
-            return Err(format!("cwd {cwd} is not a folder."));
+        // Windows resolves `.` and `..` in a path's text before it looks at any folder, so
+        // `C:\w\none\..\work` is `C:\w\work` even where `none` does not exist. Resolved the same
+        // way here, the runner gets the folder the CLI really starts in, with `\` separators.
+        let real = std::path::absolute(given)
+            .map_err(|e| format!("cwd {cwd:?} cannot be resolved: {e}."))?;
+        if !real.is_dir() {
+            return Err(format!("cwd {} is not a folder.", real.display()));
         }
+        let path = real
+            .into_os_string()
+            .into_string()
+            .map_err(|_| "cwd must be UTF-8.".to_owned())?;
         Ok(Folder {
-            path: cwd.to_owned(),
+            path,
             group_writable: Vec::new(),
         })
     }
@@ -895,6 +905,35 @@ mod tests {
         std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
         let out = format!("{}/shared/w/../../work", real.display());
         assert_eq!(path(&out).unwrap(), work.to_str().unwrap());
+    }
+
+    /// On Windows a folder is resolved as Windows resolves it: `.`, `..` and `/` in the text,
+    /// through a folder that does not exist too. Relative, missing and file paths are refused.
+    #[cfg(windows)]
+    #[test]
+    fn folders_are_resolved_as_windows_resolves_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(work.join("sub")).unwrap();
+        let path = |cwd: &str| checked_cwd(cwd).map(|f| f.path);
+        let root = tmp.path().display();
+        assert_eq!(
+            path(&format!(r"{root}\none\..\work")).unwrap(),
+            work.to_str().unwrap()
+        );
+        assert_eq!(
+            path(&format!("{root}/work/sub/..")).unwrap(),
+            work.to_str().unwrap()
+        );
+        assert_eq!(
+            path(&format!(r"{root}\work\.")).unwrap(),
+            work.to_str().unwrap()
+        );
+        assert!(path("work").is_err(), "relative");
+        assert!(path(r"\work").is_err(), "no drive");
+        assert!(path(&format!(r"{root}\none\work")).is_err(), "missing");
+        std::fs::write(tmp.path().join("file"), "x").unwrap();
+        assert!(path(&format!(r"{root}\file")).is_err(), "a file");
     }
 
     fn session(machine: MachineId, state: SessionState, agent: Option<MemberId>) -> Session {

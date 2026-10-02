@@ -201,8 +201,23 @@ fn without_tmux_the_daemon_serves_with_no_terminal_runtime() {
     // Folders: relative, missing, or under one every user can write to are refused; under a
     // group-writable one, the start goes on (here to the missing runtime), and says so.
     invalid(start(&start_in("work")), "a relative cwd");
-    let missing = tmp.path().join("none").join("..").join("work");
+    let missing = tmp.path().join("none").join("work");
     invalid(start(&start_in(missing.to_str().unwrap())), "a missing cwd");
+    // `..` after a folder that does not exist: Unix resolves it on disk, so the folder is
+    // missing; Windows resolves it in the text, so it is `work`, and the start goes on (here to
+    // the missing runtime).
+    let through_missing = tmp.path().join("none").join("..").join("work");
+    let through_missing = start(&start_in(through_missing.to_str().unwrap()));
+    if cfg!(unix) {
+        invalid(through_missing, "a cwd through a missing folder");
+    } else {
+        assert_eq!(through_missing.status, 503, "{}", through_missing.body);
+        assert!(
+            through_missing.body.contains("no terminal runtime"),
+            "{}",
+            through_missing.body
+        );
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
