@@ -38,11 +38,13 @@
 //! told to check at once. A connection that gave up (a sign-in cancelled while reconnecting)
 //! starts over at [`Remotes::retry`].
 
+pub mod gate;
 pub mod helpers;
 pub mod link;
 pub mod plan;
 pub mod prompt;
 
+pub use gate::{GatedPrompts, SshCheck, SshVersions, Verdict};
 pub use helpers::{HelperRef, Helpers};
 pub use plan::{RemotePlan, RemotePlanRequest};
 pub use prompt::{GatewayPrompt, PromptEvent, PromptHub};
