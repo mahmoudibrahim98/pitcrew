@@ -3,6 +3,7 @@
 //!
 //! ```js
 //! invoke('gateway_workspaces')
+//! invoke('gateway_local_host')                                   // → { name }
 //! invoke('gateway_request', { req: { workspace, method, path, body } })
 //! invoke('gateway_socket_open', { workspace, path, events: new Channel() })  // → { socket }
 //! invoke('gateway_socket_send', { socket, text })   // or { socket, binary }
@@ -25,6 +26,7 @@ use crate::app::MAIN;
 use crate::gateway::{
     Delivery, Gateway, GatewayError, GatewayRequest, GatewayResponse, Payload, Sink, SinkClosed,
 };
+use crate::host::LocalHost;
 use crate::navigate::Navigator;
 use crate::registry::GatewayWorkspace;
 use crate::remote::{
@@ -58,6 +60,13 @@ pub fn gateway_workspaces<R: Runtime>(
         }
     }
     list
+}
+
+/// `gateway_local_host() → { name }`: this computer's host name, cleaned, for onboarding's
+/// machine-name default ([`crate::host`]).
+#[tauri::command]
+pub fn gateway_local_host() -> LocalHost {
+    crate::host::local_host()
 }
 
 /// `gateway_ssh_hosts() → { hosts: string[] }`. Async, so the config is never read on the main
