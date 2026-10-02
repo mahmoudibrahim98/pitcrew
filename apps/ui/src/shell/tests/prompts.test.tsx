@@ -184,10 +184,10 @@ describe('the prompt dialog', () => {
       host: 'hpc-login',
       kind: 'host_key',
       text: "The authenticity of host 'hpc-login' can't be established.",
-      fingerprint: 'SHA256:nThbg6kXUpJWGl7E1IGOCspRomTxdCARLviKw6E5SY8',
+      fingerprint: 'SHA256:bWFkZS11cC1rZXktZm9yLXRlc3RzLW9ubHktMDAwMQ',
     });
     await screen.findByRole('dialog', { name: "Check hpc-login's host key" }, PATIENCE);
-    expect(within(dialog()).getByTestId('prompt-fingerprint').textContent).toBe('SHA256:nThbg6kXUpJWGl7E1IGOCspRomTxdCARLviKw6E5SY8');
+    expect(within(dialog()).getByTestId('prompt-fingerprint').textContent).toBe('SHA256:bWFkZS11cC1rZXktZm9yLXRlc3RzLW9ubHktMDAwMQ');
     expect(within(dialog()).queryByRole('textbox')).toBeNull();
     let reply = desktop.nextReply();
     fireEvent.click(within(dialog()).getByRole('button', { name: 'Accept' }));

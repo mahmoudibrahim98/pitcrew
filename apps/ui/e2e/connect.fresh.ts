@@ -54,7 +54,7 @@ test('connects a remote machine, answering SSH in the app, and sets its fresh hu
   // 2. Probe: SSH asks to confirm the host key first.
   const hostKey = page.getByRole('dialog', { name: "Check hpc-login's host key" });
   await expect(hostKey).toBeVisible();
-  await expect(hostKey.getByTestId('prompt-fingerprint')).toHaveText('SHA256:nThbg6kXUpJWGl7E1IGOCspRomTxdCARLviKw6E5SY8');
+  await expect(hostKey.getByTestId('prompt-fingerprint')).toHaveText('SHA256:bWFkZS11cC1rZXktZm9yLXRlc3RzLW9ubHktMDAwMQ');
   await expectNoAxeViolations(page, 'host key dialog');
   await hostKey.getByRole('button', { name: 'Accept' }).click();
   await expect(heading(page, 'Checking hpc-login')).toBeVisible();

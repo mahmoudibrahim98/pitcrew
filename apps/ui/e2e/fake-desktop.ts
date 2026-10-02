@@ -169,7 +169,7 @@ export function installFakeDesktop({ hubUrl, token, jobScript }: FakeDesktopOpti
           host,
           kind: 'host_key',
           text: `The authenticity of host '${host}' can't be established.`,
-          fingerprint: 'SHA256:nThbg6kXUpJWGl7E1IGOCspRomTxdCARLviKw6E5SY8',
+          fingerprint: 'SHA256:bWFkZS11cC1rZXktZm9yLXRlc3RzLW9ubHktMDAwMQ',
         });
         if (reply.accept !== true) return fail('unreachable', 'Host key verification failed.');
         return {
