@@ -9,7 +9,8 @@
 //! **Unsafe code.** This module and `job.rs` are the only ones of the crate that use it: the
 //! workspace denies `unsafe_code`, and these two alone allow it, because the Win32 calls below
 //! have no safe binding in the dependency tree, and tokio takes the descriptor only through
-//! `create_with_security_attributes_raw`. Every function here is safe to call. Soundness:
+//! `create_with_security_attributes_raw`. Every function here that is not an `unsafe fn` is safe
+//! to call; the one that is, `take_local_string`, states what its caller must uphold. Soundness:
 //! - Every out-pointer passed to Win32 points at a live local of the right type, and every buffer
 //!   is passed with its true length.
 //! - The `TOKEN_USER` read comes from a buffer that `GetTokenInformation` filled with that very
