@@ -207,6 +207,14 @@ and are not echoed on `Session`. With a `task`, the session is linked with `link
 **whole records**, so a page can exceed `limit` when one record yields many items. `at_start` is
 true when nothing older exists, even if `from` is greater than 0 (a transcript's first record need
 not start at byte 0).
+- A session whose machine's runner has not indexed a transcript for it (a demo session, or a
+  dispatched one whose transcript does not exist yet) answers **an empty page** with
+  `at_start: true` (`items` empty, `from` and `to` 0), as for a session without a transcript.
+- A transcript that is gone (deleted) or cannot be read, and a read that is busy or does not finish
+  in time, answer `503 unavailable`; the message says which, and names no path. So do a session on
+  a machine the hub cannot reach and, on a hub without a runner, every session.
+- An unknown session is `404`; a `limit` of 0, or a `before` or `limit` that is not a whole number,
+  is `400`.
 
 ### Asks, briefs, activity
 
