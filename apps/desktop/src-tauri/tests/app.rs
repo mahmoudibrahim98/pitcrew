@@ -6,13 +6,11 @@
 
 mod common;
 
-use common::{FakeDaemon, WORKSPACE_ID, WORKSPACE_NAME};
+use common::{FakeDaemon, WORKSPACE_ID, WORKSPACE_NAME, register_local};
 use pitcrew_desktop::app::{self, MAIN, WORKSPACES_EVENT};
 use pitcrew_desktop::gateway::Gateway;
 use pitcrew_desktop::navigate::{self, NAVIGATE_EVENT, NavigateTarget, Navigator};
-use pitcrew_desktop::registry::{
-    Connection, Registry, WorkspaceKind, WorkspaceRecord, WorkspaceState,
-};
+use pitcrew_desktop::registry::{Registry, WorkspaceState};
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -38,18 +36,12 @@ fn world() -> World {
     let tmp = tempfile::tempdir().unwrap();
     let daemon = FakeDaemon::start(&tmp.path().join("state"), TOKEN);
     let registry = Arc::new(Registry::in_memory());
-    registry
-        .insert(
-            WorkspaceRecord {
-                id: WORKSPACE_ID.into(),
-                name: WORKSPACE_NAME.into(),
-                kind: WorkspaceKind::Local,
-                connection: Connection::Local,
-            },
-            Some(Arc::new(daemon.connector())),
-            WorkspaceState::Ready,
-        )
-        .unwrap();
+    register_local(
+        &registry,
+        WORKSPACE_ID,
+        WORKSPACE_NAME,
+        Arc::new(daemon.connector()),
+    );
     let channels: Channels = Arc::default();
     let captured = Arc::clone(&channels);
     let builder = mock_builder().channel_interceptor(move |_webview, callback, _index, body| {
@@ -306,6 +298,29 @@ fn only_the_main_window_may_call_the_gateway_and_nothing_else() {
         assert!(denied.is_err(), "{cmd} was allowed: {denied:?}");
     }
     assert!(w.daemon.seen.lock().unwrap().authorizations.len() <= 1);
+}
+
+/// `gateway_local_host`: this computer's host name, cleaned, for the main window only.
+#[test]
+fn the_local_host_name_is_for_the_main_window_only() {
+    let w = world();
+    let main = w.window(MAIN);
+    let other = w.window("other");
+    let answer = invoke(&main, "gateway_local_host", json!({})).unwrap();
+    let expected =
+        pitcrew_desktop::host::clean_host(rustix::system::uname().nodename().to_str().unwrap());
+    assert_eq!(answer, json!({ "name": expected }));
+    let name = answer["name"].as_str().unwrap();
+    assert!(!name.is_empty() && name.chars().count() <= 60, "{name}");
+    // Another window: Tauri's ACL refuses it before it runs.
+    let refused = invoke(&other, "gateway_local_host", json!({})).unwrap_err();
+    let message = refused.as_str().unwrap_or_else(|| {
+        panic!("gateway_local_host from another window was not refused by the ACL: {refused}")
+    });
+    assert!(
+        message.contains("gateway_local_host") && message.contains("not allowed"),
+        "{message}"
+    );
 }
 
 #[test]

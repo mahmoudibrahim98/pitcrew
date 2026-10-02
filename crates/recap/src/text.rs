@@ -2,6 +2,14 @@
 //! block or shown in a summary, so lengths are bounded and nothing can reorder or hide text.
 
 use pitcrew_protocol::model::Receipt;
+// The hidden set is shared: the GitHub and Jira syncs and the CLI drop the same characters.
+// Hidden characters are dropped so a crafted name cannot make a summary read differently from
+// what it says, and so tag characters cannot carry text a person does not see but a model
+// reading the recap does (recap text reaches agents; see `docs/security/threat-model.md`). The
+// line and paragraph separators in the set never reach the output as themselves, but [`clean`]
+// and [`clean_tail`] turn them into a space, like any other line break, so that the words on
+// either side are not run together.
+use pitcrew_protocol::text::{is_hidden, is_line_separator};
 
 /// Longest file path kept in a block, in characters.
 pub(crate) const PATH_CHARS: usize = 200;
@@ -16,38 +24,8 @@ pub(crate) const JOB_CHARS: usize = 32;
 /// Longest text field a receipt may carry, in bytes. Longer receipts are not kept.
 const RECEIPT_TEXT_BYTES: usize = 1024;
 
-/// Characters that change text direction or are invisible. They are dropped so a crafted name
-/// cannot make a summary read differently from what it says, and so tag characters cannot carry
-/// text a person does not see but a model reading the recap does (recap text reaches agents; see
-/// `docs/security/threat-model.md`).
-///
-/// The set is the same as `pitcrew_sync_github::bounds::is_hidden`, which cleans what the GitHub
-/// sync stores: change both together. The line and paragraph separators in it never reach the
-/// output as themselves, but [`clean`] and [`clean_tail`] turn them into a space, like any other
-/// line break, so that the words on either side are not run together.
-fn is_hidden(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}' // soft hyphen
-            | '\u{061C}' // Arabic letter mark
-            | '\u{180E}' // Mongolian vowel separator
-            | '\u{200B}'..='\u{200F}' // zero-width space and joiners, direction marks
-            | '\u{2028}'..='\u{2029}' // line and paragraph separators
-            | '\u{202A}'..='\u{202E}' // direction embeddings and overrides
-            | '\u{2060}'..='\u{2064}' // word joiner, invisible operators
-            | '\u{2066}'..='\u{2069}' // direction isolates
-            | '\u{FEFF}' // byte order mark, zero-width no-break space
-            | '\u{E0000}'..='\u{E007F}' // tag characters
-    )
-}
-
-/// U+2028 and U+2029: hidden, but they break a line, so they stand for a space.
-fn is_line_separator(c: char) -> bool {
-    matches!(c, '\u{2028}' | '\u{2029}')
-}
-
 /// Cleans untrusted text for display: hidden and direction-changing characters are dropped (the
-/// same set `pitcrew_sync_github::bounds::is_hidden` drops, tag characters included),
+/// shared set, `pitcrew_protocol::text::is_hidden`, tag characters included),
 /// control characters, line and paragraph separators and whitespace runs become one space, the
 /// ends are trimmed, and at most `max` characters are kept (the last one is `…` when the text was
 /// cut). Work is bounded by `max`, not by the input length.
@@ -248,18 +226,26 @@ mod tests {
         assert_eq!(clean(&spaces, 5), "a…");
     }
 
-    /// The hidden set, written out: `pitcrew_sync_github::bounds::is_hidden` drops exactly these.
+    /// The hidden set, written out: `pitcrew_protocol::text::is_hidden`, which the GitHub and Jira
+    /// syncs and the CLI drop too. Pinned in each of them: change them together.
     const HIDDEN: &[(u32, u32)] = &[
         (0x00AD, 0x00AD),
+        (0x034F, 0x034F),
         (0x061C, 0x061C),
+        (0x115F, 0x1160),
         (0x180E, 0x180E),
         (0x200B, 0x200F),
         (0x2028, 0x2029),
         (0x202A, 0x202E),
         (0x2060, 0x2064),
         (0x2066, 0x2069),
+        (0x3164, 0x3164),
+        (0xFE00, 0xFE0F),
         (0xFEFF, 0xFEFF),
+        (0xFFA0, 0xFFA0),
+        (0xFFF9, 0xFFFB),
         (0xE0000, 0xE007F),
+        (0xE0100, 0xE01EF),
     ];
 
     #[test]
@@ -269,6 +255,43 @@ mod tests {
                 .iter()
                 .any(|&(lo, hi)| (lo..=hi).contains(&u32::from(c)));
             assert_eq!(is_hidden(c), listed, "U+{:04X}", u32::from(c));
+            if listed {
+                // Dropped, or a line break shown as a space; never kept as itself.
+                let text = format!("a{c}b");
+                let want = if is_line_separator(c) { "a b" } else { "ab" };
+                assert_eq!(clean(&text, 60), want, "clean: U+{:04X}", u32::from(c));
+                assert_eq!(clean_tail(&text, 60), want, "tail: U+{:04X}", u32::from(c));
+                assert!(!is_plain_path(&text), "plain: U+{:04X}", u32::from(c));
+            }
+        }
+    }
+
+    #[test]
+    fn the_sets_additions_are_dropped() {
+        // What the shared set added to the engine's own: the combining grapheme joiner, the Hangul
+        // fillers, variation selectors (both blocks) and the interlinear annotation marks.
+        for c in [
+            '\u{034F}',
+            '\u{115F}',
+            '\u{1160}',
+            '\u{3164}',
+            '\u{FFA0}',
+            '\u{FE00}',
+            '\u{FE0F}',
+            '\u{E0100}',
+            '\u{E01EF}',
+            '\u{FFF9}',
+            '\u{FFFA}',
+            '\u{FFFB}',
+        ] {
+            let text = format!("task{c} title");
+            assert_eq!(clean(&text, 60), "task title", "U+{:04X}", u32::from(c));
+            assert_eq!(
+                clean_tail(&format!("src/a{c}.rs"), 60),
+                "src/a.rs",
+                "U+{:04X}",
+                u32::from(c)
+            );
         }
     }
 

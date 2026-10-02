@@ -356,7 +356,7 @@ mod tests {
 
     #[test]
     fn r31_an_empty_segment_in_the_middle_of_the_next_links_path_is_not_under_the_api_base() {
-        // Stream Q's open-r31-empty-segment-in-next-link regression: a server that merges
+        // Stream Q's r31-empty-segment-in-next-link regression: a server that merges
         // repeated slashes would treat `/api//v3/...` as `/api/v3/...`, but a stricter proxy in
         // front of it might route the raw, unmerged path somewhere else — the same kind of
         // divergence R9 closed for `.`/`..` segments.
@@ -371,7 +371,7 @@ mod tests {
 
     #[test]
     fn r31_a_leading_empty_segment_in_the_next_links_path_is_not_under_the_api_base() {
-        // Stream Q's open-r31-leading-empty-segment-in-next-link regression.
+        // Stream Q's r31-leading-empty-segment-in-next-link regression.
         assert!(
             trusted_next_url(
                 "https://ghe.example.com//api/v3/repos/example-org/demo-repo/milestones?page=2",

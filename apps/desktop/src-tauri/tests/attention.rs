@@ -7,11 +7,11 @@
 
 mod common;
 
-use common::{FakeDaemon, OTHER, SAM, WORKSPACE_ID, WORKSPACE_NAME, WRITER, ask, ask_id};
-use pitcrew_desktop::attention::{Attention, AttentionSink, Count, Limits, NewAsk};
-use pitcrew_desktop::registry::{
-    Connection, GatewayWorkspace, Registry, WorkspaceKind, WorkspaceRecord, WorkspaceState,
+use common::{
+    FakeDaemon, OTHER, SAM, WORKSPACE_ID, WORKSPACE_NAME, WRITER, ask, ask_id, register_local,
 };
+use pitcrew_desktop::attention::{Attention, AttentionSink, Count, Limits, NewAsk};
+use pitcrew_desktop::registry::{GatewayWorkspace, Registry, WorkspaceState};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -84,18 +84,13 @@ fn needs_you_follows_the_daemon() {
     daemon.answer(9);
 
     let registry = Arc::new(Registry::in_memory());
-    registry
-        .insert(
-            WorkspaceRecord {
-                id: WORKSPACE_ID.into(),
-                name: WORKSPACE_NAME.into(),
-                kind: WorkspaceKind::Local,
-                connection: Connection::Local,
-            },
-            Some(Arc::new(daemon.connector())),
-            WorkspaceState::Connecting,
-        )
-        .unwrap();
+    register_local(
+        &registry,
+        WORKSPACE_ID,
+        WORKSPACE_NAME,
+        Arc::new(daemon.connector()),
+    );
+    registry.set_local_state(WorkspaceState::Connecting, None);
     let sink = Arc::new(Recorder::default());
     let attention = Attention::with_limits(
         Arc::clone(&registry),
@@ -212,18 +207,7 @@ fn an_unreachable_daemon_is_retried_and_ready_reconnects_at_once() {
     let connector = Arc::new(daemon.connector());
     drop(daemon);
     let registry = Arc::new(Registry::in_memory());
-    registry
-        .insert(
-            WorkspaceRecord {
-                id: WORKSPACE_ID.into(),
-                name: WORKSPACE_NAME.into(),
-                kind: WorkspaceKind::Local,
-                connection: Connection::Local,
-            },
-            Some(connector),
-            WorkspaceState::Ready,
-        )
-        .unwrap();
+    register_local(&registry, WORKSPACE_ID, WORKSPACE_NAME, connector);
     let sink = Arc::new(Recorder::default());
     let attention = Attention::with_limits(
         Arc::clone(&registry),
@@ -260,18 +244,12 @@ fn watching(daemon: &FakeDaemon, limits: Limits) -> (tokio::runtime::Runtime, At
         .build()
         .unwrap();
     let registry = Arc::new(Registry::in_memory());
-    registry
-        .insert(
-            WorkspaceRecord {
-                id: WORKSPACE_ID.into(),
-                name: WORKSPACE_NAME.into(),
-                kind: WorkspaceKind::Local,
-                connection: Connection::Local,
-            },
-            Some(Arc::new(daemon.connector())),
-            WorkspaceState::Ready,
-        )
-        .unwrap();
+    register_local(
+        &registry,
+        WORKSPACE_ID,
+        WORKSPACE_NAME,
+        Arc::new(daemon.connector()),
+    );
     let attention = Attention::with_limits(
         Arc::clone(&registry),
         Arc::new(Recorder::default()),

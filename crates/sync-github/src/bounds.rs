@@ -2,6 +2,15 @@
 //! [`strip_hidden`]/[`cap_chars`]/[`cap_labels`], which also keep untrusted text honest about what
 //! it displays as.
 
+// Characters that change text direction or are invisible: `pitcrew_protocol::text::is_hidden`,
+// the one set the recap engine and the CLI drop too. Dropped from any upstream text this crate
+// stores or re-emits (round 2 review item R10), so a crafted title, body, label or name cannot
+// make a change — or anything downstream reading it, such as a summary or a UI list — display
+// differently from what it actually says, and so a run of Unicode tag characters cannot smuggle
+// text invisible to a person but readable by another LLM into a title, body or label (a
+// prompt-injection vector into whatever later reads these fields — round 3 review item S-6).
+use pitcrew_protocol::text::is_hidden;
+
 /// Stop paginating after this many pages in one call. The next sync call resumes through the
 /// `since` cursor (issues) or the stored "last seen" bound (pull requests).
 pub const MAX_PAGES_PER_CALL: usize = 20;
@@ -72,39 +81,6 @@ impl Default for Limits {
             max_items: MAX_ITEMS_PER_SYNC,
         }
     }
-}
-
-/// Characters that change text direction or are invisible. Dropped from any upstream text this
-/// crate stores or re-emits (round 2 review item R10), so a crafted title, body, label or name
-/// cannot make a change — or anything downstream reading it, such as a summary or a UI list —
-/// display differently from what it actually says, and so a run of Unicode tag characters cannot
-/// smuggle text invisible to a person but readable by another LLM into a title, body or label (a
-/// prompt-injection vector into whatever later reads these fields — round 3 review item S-6).
-///
-/// This is meant to be the *same* character set `pitcrew_recap::text::clean`'s own `is_hidden`
-/// drops, reimplemented here rather than taken as a dependency on that crate (`pitcrew-recap`
-/// depends on sync data flowing *up* to it, not the other way around, and this check is small
-/// enough that duplicating it is cheaper than a new cross-stream dependency) — **when this set
-/// changes, `pitcrew_recap::text::is_hidden` needs the identical change**, or the two diverge on
-/// exactly the kind of input this exists to catch; that crate is owned by stream F, outside this
-/// stream's path ownership. Round 3's addition here (tag characters, soft hyphen, the Mongolian
-/// vowel separator, and the two line/paragraph separators) could not be mirrored there in that
-/// same change, but `s/F/recap-hardening` (R33) has since made `pitcrew_recap::text::is_hidden`
-/// match this set exactly — the two sets agree again as of this round.
-fn is_hidden(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'            // soft hyphen
-            | '\u{061C}'      // Arabic letter mark
-            | '\u{180E}'      // Mongolian vowel separator
-            | '\u{200B}'..='\u{200F}' // zero-width space/joiners, LTR/RTL marks
-            | '\u{2028}'..='\u{2029}' // line/paragraph separator
-            | '\u{202A}'..='\u{202E}' // bidi embedding/override
-            | '\u{2060}'..='\u{2064}' // word joiner, invisible operators
-            | '\u{2066}'..='\u{2069}' // bidi isolates
-            | '\u{FEFF}'      // byte-order mark / zero-width no-break space
-            | '\u{E0000}'..='\u{E007F}' // Unicode tag characters
-    )
 }
 
 /// Whether `s` contains any [`is_hidden`] character. For text that gets *stripped* (titles,
@@ -200,6 +176,73 @@ mod tests {
         // to read as smuggled instruction text — the prompt-injection concern this set exists for.
         let tagged = format!("hello{}{}", '\u{E0068}', '\u{E0069}');
         assert_eq!(strip_hidden(&tagged), "hello");
+    }
+
+    /// The hidden set, written out: `pitcrew_protocol::text::is_hidden`, which the recap engine and
+    /// the CLI drop too. Pinned in each of them: change them together.
+    const HIDDEN: &[(u32, u32)] = &[
+        (0x00AD, 0x00AD),
+        (0x034F, 0x034F),
+        (0x061C, 0x061C),
+        (0x115F, 0x1160),
+        (0x180E, 0x180E),
+        (0x200B, 0x200F),
+        (0x2028, 0x2029),
+        (0x202A, 0x202E),
+        (0x2060, 0x2064),
+        (0x2066, 0x2069),
+        (0x3164, 0x3164),
+        (0xFE00, 0xFE0F),
+        (0xFEFF, 0xFEFF),
+        (0xFFA0, 0xFFA0),
+        (0xFFF9, 0xFFFB),
+        (0xE0000, 0xE007F),
+        (0xE0100, 0xE01EF),
+    ];
+
+    #[test]
+    fn the_hidden_set_is_pinned() {
+        let mut buf = [0u8; 4];
+        for c in (0..=0x10_FFFFu32).filter_map(char::from_u32) {
+            let listed = HIDDEN
+                .iter()
+                .any(|&(lo, hi)| (lo..=hi).contains(&u32::from(c)));
+            let one = c.encode_utf8(&mut buf);
+            assert_eq!(contains_hidden(one), listed, "U+{:04X}", u32::from(c));
+            if listed {
+                assert_eq!(
+                    strip_hidden(&format!("a{c}b")),
+                    "ab",
+                    "U+{:04X}",
+                    u32::from(c)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strip_hidden_drops_the_shared_sets_additions() {
+        // What the shared set added to this crate's own: the combining grapheme joiner, the
+        // Hangul fillers, variation selectors (both blocks) and the interlinear annotation marks.
+        for c in [
+            '\u{034F}',
+            '\u{115F}',
+            '\u{1160}',
+            '\u{3164}',
+            '\u{FFA0}',
+            '\u{FE00}',
+            '\u{FE0F}',
+            '\u{E0100}',
+            '\u{E01EF}',
+            '\u{FFF9}',
+            '\u{FFFA}',
+            '\u{FFFB}',
+        ] {
+            let title = format!("Fix{c} login");
+            assert_eq!(strip_hidden(&title), "Fix login", "U+{:04X}", u32::from(c));
+            assert_eq!(cap_chars(&title, 9), "Fix login", "U+{:04X}", u32::from(c));
+            assert!(contains_hidden(&title), "U+{:04X}", u32::from(c));
+        }
     }
 
     #[test]

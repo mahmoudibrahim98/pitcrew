@@ -4,6 +4,7 @@
 //! The fake `ssh` is this test binary, started by a small script (`<machine>/ssh`) that names its
 //! role and its machine; ssh's own environment is the minimal one `pitcrew-remote` gives it. It
 //! plays:
+//! - `ssh -V`: its version, on stderr as OpenSSH writes it (9.6, or what `version` holds);
 //! - `ssh -G -- <host>`: what the host resolves to;
 //! - `ssh -N … -- <host>`, a link: it signs in (see below), logs "Authenticated to …" to its
 //!   `-E` log, and with a `ControlPath` is a ControlMaster listening there: `check`, `exit`,
@@ -27,7 +28,10 @@
 //! running the helper script's `stop` fail as a lost connection; `kbdint` makes the server ask
 //! for the password with its text, marked `(sam@hpc-login)` as OpenSSH marks keyboard-interactive
 //! prompts; `stall` makes links wait for ever before signing in, as a server that does not
-//! answer.
+//! answer; `version` is what `ssh -V` says, and an OpenSSH older than 8.4 there behaves like one:
+//! without `DISPLAY` it ignores askpass, reads an empty answer and sends it (logged `empty`), as
+//! real ones do. In the machine's home, `.demo-seeded` makes the helper start a fresh hub instead
+//! of the demo workspace.
 //!
 //! The binary is also `pitcrew-askpass` (`<machine>/pitcrew-askpass`), as the real one: the
 //! crate's own client.
@@ -55,6 +59,8 @@ pub const RUN: &str = "PITCREW_DESKTOP_TEST_RUN";
 pub const HOST: &str = "hpc-login";
 /// The host key's fingerprint, as the fake ssh shows it.
 pub const FINGERPRINT: &str = "SHA256:ZmFrZS1ob3N0LWtleS1mb3ItdGhlLWRlc2t0b3A";
+/// What `ssh -V` says unless the machine's `version` says otherwise.
+const DEFAULT_VERSION: &str = "OpenSSH_9.6p1 Ubuntu-3ubuntu13.5, OpenSSL 3.0.13 30 Jan 2024";
 
 /// Plays this binary's role, if it has one.
 pub fn act() -> Option<ExitCode> {
@@ -174,6 +180,13 @@ fn ssh() -> u8 {
         return 255;
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args == ["-V"] {
+        append(&machine.join("calls.log"), "version");
+        let version = std::fs::read_to_string(machine.join("version"))
+            .unwrap_or_else(|_| DEFAULT_VERSION.to_owned());
+        eprintln!("{}", version.trim_end());
+        return 0;
+    }
     let call = Call::parse(&args);
     let kind = call.kind();
     append(&machine.join("calls.log"), &format!("{kind} {}", call.host));
@@ -215,7 +228,7 @@ fn sign_in(machine: &Path, call: &Call) -> bool {
              This key is not known by any other names.\n\
              Are you sure you want to continue connecting (yes/no/[fingerprint])? "
         );
-        let trusted = !batch && ask(&text).as_deref() == Some("yes");
+        let trusted = !batch && ask(machine, &text).as_deref() == Some("yes");
         if !batch {
             append(&asked, if trusted { "yes" } else { "no" });
         }
@@ -233,7 +246,7 @@ fn sign_in(machine: &Path, call: &Call) -> bool {
         };
         if !batch {
             for _ in 0..3 {
-                let answer = ask(&question).unwrap_or_default();
+                let answer = ask(machine, &question).unwrap_or_default();
                 append(&asked, if answer.is_empty() { "empty" } else { "text" });
                 if answer == expected.trim_end() {
                     return true;
@@ -248,8 +261,14 @@ fn sign_in(machine: &Path, call: &Call) -> bool {
     true
 }
 
-/// Asks through `SSH_ASKPASS`, as ssh does: the answer, or `None` when askpass failed.
-fn ask(prompt: &str) -> Option<String> {
+/// Asks through `SSH_ASKPASS`, as ssh does: the answer, or `None` when askpass failed. An ssh
+/// older than 8.4 (the machine's `version`) uses askpass only with `DISPLAY` set, whatever
+/// `SSH_ASKPASS_REQUIRE` says; without it, and without a terminal, it reads an empty answer,
+/// which it then sends.
+fn ask(machine: &Path, prompt: &str) -> Option<String> {
+    if older_than_8_4(machine) && std::env::var_os("DISPLAY").is_none() {
+        return Some(String::new());
+    }
     let program = std::env::var_os("SSH_ASKPASS")?;
     let out = Command::new(program).arg(prompt).output().ok()?;
     out.status.success().then(|| {
@@ -257,6 +276,25 @@ fn ask(prompt: &str) -> Option<String> {
             .trim_end_matches('\n')
             .to_owned()
     })
+}
+
+/// Whether the machine's `version` (what `ssh -V` says) is an OpenSSH older than 8.4.
+fn older_than_8_4(machine: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(machine.join("version")) else {
+        return false;
+    };
+    let Some(at) = text.find("OpenSSH_") else {
+        return false;
+    };
+    let version: String = text[at..]
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let mut parts = version.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+    let major = parts.next().unwrap_or(0);
+    let minor = parts.next().unwrap_or(0);
+    (major, minor) < (8, 4)
 }
 
 /// Runs the call's command on the machine.
@@ -594,6 +632,31 @@ impl Machine {
     /// From now on logins ask for `password`.
     pub fn require_password(&self, password: &str) {
         std::fs::write(self.dir.join("password"), password).unwrap();
+    }
+
+    /// From now on logins ask nothing: a key signs in, and the host key is known.
+    pub fn sign_in_with_keys(&self) {
+        let _ = std::fs::remove_file(self.dir.join("password"));
+        let _ = std::fs::remove_file(self.dir.join("hostkey"));
+    }
+
+    /// From now on `ssh -V` says `text`.
+    pub fn ssh_version(&self, text: &str) {
+        std::fs::write(self.dir.join("version"), text).unwrap();
+    }
+
+    /// The helper starts a fresh hub (named "Workspace" until it is set up), not the demo
+    /// workspace.
+    pub fn fresh_hub(&self) {
+        std::fs::write(self.home.join(".demo-seeded"), "").unwrap();
+    }
+
+    /// How many calls of `kind` ssh got (`link`, `run`, `version`, …).
+    pub fn calls_of(&self, kind: &str) -> usize {
+        self.calls()
+            .iter()
+            .filter(|c| c.split(' ').next() == Some(kind))
+            .count()
     }
 
     /// From now on the password is asked by the server (keyboard-interactive) with `text`, or,

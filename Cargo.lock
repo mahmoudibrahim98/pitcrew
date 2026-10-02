@@ -1377,6 +1377,7 @@ dependencies = [
  "pitcrew-protocol",
  "proptest",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

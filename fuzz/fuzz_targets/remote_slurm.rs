@@ -14,14 +14,16 @@
 //! - **wall times round-trip**: what `parse_wall_time` accepts is exactly the documented grammar
 //!   (`m`, `m:s`, `h:m:s`, `d-h`, `d-h:m`, `d-h:m:s`, numbers of 1 to 9 digits, or `UNLIMITED`/
 //!   `INFINITE`), with the seconds it says, and prints and reads back as the same time; and
-//!   `format_wall_time` of any duration is `[D-]HH:MM:SS` with the seconds rounded up, and reads
+//!   `format_wall_time` of any duration (`u64::MAX` seconds and a fraction too: R27, fixed) is
+//!   `[D-]HH:MM:SS` with the seconds rounded up, and reads
 //!   back as the same time. Both while the days fit in 9 digits: the fields may overflow into the
 //!   next unit (`1:99`), so a time can be read that prints with more days than can be read back;
 //! - `JobExit::parse` accepts exactly `code:signal` (two `u32`s, as Rust reads them) and prints
 //!   back the same;
 //! - **an accepted `#SBATCH` option** is one word, `--name` or `--name=value`, with no newline,
-//!   `#`, quote or space, and no value that starts with `-` (R25); a name from `ALLOWED_SBATCH`,
-//!   alone only for `SBATCH_FLAGS`;
+//!   `#`, quote or space, and no value that starts with `-` (R25, fixed); a name from
+//!   `ALLOWED_SBATCH`, alone only for `SBATCH_FLAGS`; and `JobSpec::new` accepts what
+//!   `check_sbatch_option` accepted (R34: it does not for a value holding `hetjob` or `packjob`);
 //! - **the job script**: when `JobSpec::render` accepts the options, every `#SBATCH` line is one
 //!   directive word before the first command, none holds `hetjob` or `packjob` in any case, and the
 //!   job name, working directory and output appear once each, from PitCrew.
@@ -98,10 +100,6 @@ fn duration(bytes: &[u8]) {
     raw[..n].copy_from_slice(&bytes[..n]);
     let secs = u64::from_le_bytes(raw[..8].try_into().expect("8 bytes"));
     let nanos = u32::from_le_bytes(raw[8..].try_into().expect("4 bytes")) % 1_000_000_000;
-    if skip_known() && secs == u64::MAX && nanos > 0 {
-        // Known finding R27: rounding up overflows.
-        return;
-    }
     let time = Duration::new(secs, nanos);
     let printed = format_wall_time(time);
     let rounded = secs.saturating_add(u64::from(nanos > 0));
@@ -159,6 +157,15 @@ fn sbatch(text: &str) {
         ..JobOptions::default()
     };
     let Ok(spec) = JobSpec::new(&generic(), &options) else {
+        let hetjob = options.sbatch.iter().any(|o| {
+            let o = o.to_ascii_lowercase();
+            o.contains("hetjob") || o.contains("packjob")
+        });
+        if skip_known() && hetjob {
+            // Known finding R34: `check_sbatch_option` lets these words through; `JobSpec::new`
+            // (`JobOptions::check`) refuses them.
+            return;
+        }
         panic!("options check_sbatch_option accepted are refused by JobSpec::new: {options:?}");
     };
     if let Ok(script) = spec.render(target()) {
@@ -189,12 +196,10 @@ fn check_accepted(option: &str) {
         None => assert!(SBATCH_FLAGS.contains(&name), "{option:?} needs a value"),
         Some(value) => {
             assert!(!value.is_empty(), "an empty value: {option:?}");
-            if !skip_known() {
-                assert!(
-                    !value.starts_with('-'),
-                    "an accepted #SBATCH value that starts with '-': {option:?}"
-                );
-            }
+            assert!(
+                !value.starts_with('-'),
+                "an accepted #SBATCH value that starts with '-': {option:?}"
+            );
         }
     }
 }

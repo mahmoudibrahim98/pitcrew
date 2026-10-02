@@ -11,7 +11,9 @@
 
 mod common;
 
-use common::{FakeDaemon, SAM, WORKSPACE_ID, WORKSPACE_NAME, WRITER, ask};
+use common::{
+    FakeDaemon, SAM, WORKSPACE_ID, WORKSPACE_NAME, WRITER, ask, register_local, register_remote,
+};
 use pitcrew_desktop::app::{self, MAIN, WORKSPACES_EVENT};
 use pitcrew_desktop::attention::{Attention, AttentionSink, Count, Limits, NewAsk};
 use pitcrew_desktop::daemon::endpoint::Endpoint;
@@ -21,9 +23,7 @@ use pitcrew_desktop::gateway::Gateway;
 use pitcrew_desktop::logging;
 use pitcrew_desktop::navigate::{self, NAVIGATE_EVENT, Navigator};
 use pitcrew_desktop::notify::notice_for;
-use pitcrew_desktop::registry::{
-    Connection, Registry, WorkspaceKind, WorkspaceRecord, WorkspaceState,
-};
+use pitcrew_desktop::registry::{Registry, WorkspaceState};
 use pitcrew_desktop::tray::{tooltip, workspace_line};
 use serde_json::{Value, json};
 use std::io::Write;
@@ -112,40 +112,28 @@ fn no_token_reaches_the_webview_or_the_logs() {
     let tmp = tempfile::tempdir().unwrap();
     let daemon = FakeDaemon::start(&tmp.path().join("state"), TOKEN);
     let registry = Arc::new(Registry::in_memory());
-    let local = WorkspaceRecord {
-        id: WORKSPACE_ID.into(),
-        name: WORKSPACE_NAME.into(),
-        kind: WorkspaceKind::Local,
-        connection: Connection::Local,
-    };
-    registry
-        .insert(
-            local,
-            Some(Arc::new(daemon.connector())),
-            WorkspaceState::Ready,
-        )
-        .unwrap();
+    register_local(
+        &registry,
+        WORKSPACE_ID,
+        WORKSPACE_NAME,
+        Arc::new(daemon.connector()),
+    );
     // A workspace whose token file is there but whose daemon is not.
     let down_dir = tmp.path().join("down");
     std::fs::create_dir_all(down_dir.join("run")).unwrap();
     std::fs::copy(daemon.token_file(), down_dir.join("device.token")).unwrap();
-    registry
-        .insert(
-            WorkspaceRecord {
-                id: DOWN.into(),
-                name: "Down".into(),
-                kind: WorkspaceKind::Remote,
-                connection: Connection::Local,
+    register_remote(
+        &registry,
+        DOWN,
+        "Down",
+        Arc::new(LocalConnector::with_token_path(
+            Endpoint::Unix {
+                dir: down_dir.join("run"),
             },
-            Some(Arc::new(LocalConnector::with_token_path(
-                Endpoint::Unix {
-                    dir: down_dir.join("run"),
-                },
-                down_dir.join("device.token"),
-            ))),
-            WorkspaceState::Ready,
-        )
-        .unwrap();
+            down_dir.join("device.token"),
+        )),
+        WorkspaceState::Ready,
+    );
 
     let channels: Arc<Mutex<Vec<InvokeResponseBody>>> = Arc::default();
     let captured = Arc::clone(&channels);

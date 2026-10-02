@@ -13,7 +13,9 @@
 //!   "scan again": counts, plus suggested projects and workstreams.
 //!
 //! Transcripts are attacker-controllable text: every parser bounds its allocations, skips lines it
-//! cannot use, and exposes a `parse_line` function so it can be fuzzed on its own.
+//! cannot use, and exposes a `parse_line` function so it can be fuzzed on its own. A transcript is
+//! read only if it is still a regular file when it is opened, not a link to another file (see
+//! [`NotRegularFile`]).
 
 #![forbid(unsafe_code)]
 
@@ -22,6 +24,7 @@ pub mod claude;
 pub mod codex;
 mod jsonl;
 mod lines;
+mod open;
 pub mod opencode;
 mod patch;
 pub mod scan;
@@ -30,6 +33,7 @@ mod time;
 
 pub use jsonl::{MAX_REPORTED_SKIPS, ReadReport};
 pub use lines::{MAX_LINE_BYTES, SkipReason, SkippedLine};
+pub use open::{FileKind, NotRegularFile, refusal};
 
 /// The protocol version this crate was built against.
 pub const PROTOCOL_VERSION: u32 = pitcrew_protocol::PROTOCOL_VERSION;

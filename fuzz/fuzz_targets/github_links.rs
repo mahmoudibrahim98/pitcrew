@@ -1,8 +1,9 @@
 //! The links `pitcrew_sync_github` trusts from a server: the `Link: rel="next"` it follows with
-//! the token (`origin::trusted_next_url`, reached through `sync::sync`), the `html_url` it keeps
-//! in an `ExternalRef` (`change::trusted_html_url`), and the closing references it reads from a
-//! pull request's body (`links::linked_issues`). A GitHub Enterprise server, or anything in front
-//! of it, controls the first two (B10, U6); anyone who opens a pull request writes the third (U2).
+//! the token (`origin::trusted_next_url`, called directly on the link as the client reads it from
+//! the header, and reached through `sync::sync`), the `html_url` it keeps in an `ExternalRef`
+//! (`change::trusted_html_url`), and the closing references it reads from a pull request's body
+//! (`links::linked_issues`). A GitHub Enterprise server, or anything in front of it, controls the
+//! first two (B10, U6); anyone who opens a pull request writes the third (U2).
 //!
 //! Input: a flags byte (bits 0-1: the API base), then three sections separated by `0xFF` bytes:
 //! the `next` link, the `html_url` every item carries, and the pull request's body. A fake GitHub
@@ -13,26 +14,28 @@
 //! code under test uses.
 //!
 //! Checks, besides "no panic":
-//! - **the token stays under the API base**: every request goes to the base's scheme, host and
-//!   port, with a path whose segments start with the base's (an empty segment counts: R31);
-//!   a followed link reads the same in the model before and after the client parses it (its
-//!   segments compared percent-decoded);
+//! - **the token stays under the API base**: every link `trusted_next_url` accepts, and every
+//!   request, goes to the base's scheme, host and port, with a path whose segments start with the
+//!   base's (an empty segment counts: R31, fixed); a trusted link reads the same in the model
+//!   before and after the client parses it (its segments compared percent-decoded);
 //! - **kept links are pinned**: every `ExternalRef` URL is `https` on the expected web host, with
-//!   no userinfo, the default port and at most 2,048 bytes (the R10 residuals), and nothing hidden;
+//!   no userinfo, the default port and at most 2,048 bytes (the R10 residuals, fixed), and nothing
+//!   hidden;
 //! - **closing references**: each `owner/repo#n` has an owner and repo of `[A-Za-z0-9._-]+` that
-//!   are not `..`, and its link's path is exactly `/owner/repo/issues/n` (R32: a `.` repo is a dot
-//!   segment).
+//!   are not `..`, and its link's path is exactly `/owner/repo/issues/n` (R32, fixed: a `.` repo
+//!   was a dot segment).
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
 use pitcrew_fuzz::url_model::{self, Parsed};
-use pitcrew_fuzz::{is_hidden_char, percent_decode, skip_known};
+use pitcrew_fuzz::{is_hidden_char, percent_decode};
 use pitcrew_protocol::model::ExternalRef;
+use pitcrew_sync_github::link_header::next_link;
 use pitcrew_sync_github::links::linked_issues;
 use pitcrew_sync_github::sync::sync;
 use pitcrew_sync_github::{
     AuthToken, GithubTimestamp, RepoRef, Request, Response, SyncConfig, SyncState, Transport,
-    TransportError, UpstreamChange,
+    TransportError, UpstreamChange, trusted_next_url,
 };
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,6 +59,11 @@ struct Fake {
 }
 
 impl Fake {
+    /// The `Link` header the first milestones page carries.
+    fn header(&self) -> String {
+        format!("<{}>; rel=\"next\"", self.link)
+    }
+
     fn answer(&self, url: &str) -> Response {
         let path = url.split(['?', '#']).next().unwrap_or("");
         let ok = |items: serde_json::Value, headers: Vec<(String, String)>| Response {
@@ -65,7 +73,7 @@ impl Fake {
         };
         let at = "2026-09-30T08:00:00Z";
         if path.ends_with("/milestones") && !self.linked.swap(true, Ordering::Relaxed) {
-            let header = format!("<{}>; rel=\"next\"", self.link);
+            let header = self.header();
             let milestone = json!({"number": 1, "title": "v1", "state": "open",
                                    "html_url": self.html_url});
             ok(json!([milestone]), vec![("Link".to_owned(), header)])
@@ -136,9 +144,23 @@ fuzz_target!(|input: &[u8]| {
         now: GithubTimestamp::new("2026-09-30T08:00:00Z"),
         api_base: base.map(str::to_owned),
     };
+    // `origin::trusted_next_url`, the seam the client follows a `next` link through, checked
+    // directly on the link as the client reads it from the header: what it trusts, the model must
+    // put under the base, and must read the same as the link the server sent.
+    let next = next_link(&fake.header());
+    let trusted = next
+        .as_deref()
+        .and_then(|n| trusted_next_url(n, base_text))
+        .map(|u| u.as_str().to_owned());
+    if let (Some(next), Some(url)) = (&next, &trusted) {
+        let model = url_model::parse(url)
+            .unwrap_or_else(|| panic!("the model cannot read a trusted link: {url:?}"));
+        check_under(&model, &base_model, url);
+        check_reads_the_same(next, &model);
+    }
+
     let outcome = runtime().block_on(sync(SyncState::default(), &fake, &config));
 
-    let followed = url::Url::parse(&link).ok().map(|u| u.as_str().to_owned());
     let sent = fake
         .sent
         .into_inner()
@@ -147,21 +169,12 @@ fuzz_target!(|input: &[u8]| {
         let model = url_model::parse(&request.url)
             .unwrap_or_else(|| panic!("the model cannot read a sent URL: {:?}", request.url));
         check_under(&model, &base_model, &request.url);
-        if followed.as_deref() == Some(request.url.as_str()) {
-            // The client percent-encodes some characters in the path (`<`, `{`, …); the model
-            // keeps them as written, so the two compare decoded.
-            let raw = url_model::parse(&link)
-                .unwrap_or_else(|| panic!("the model cannot read a followed link: {link:?}"));
-            let decoded = |p: &Parsed| -> Vec<String> {
-                p.segments.iter().map(|s| percent_decode(s)).collect()
-            };
-            assert!(
-                raw.same_origin(&model) && decoded(&raw) == decoded(&model),
-                "the followed link {link:?} reads as {raw:?}, the request as {model:?}"
-            );
+        if let Some(next) = &next
+            && trusted.as_deref() == Some(request.url.as_str())
+        {
+            check_reads_the_same(next, &model);
         }
     }
-
     for change in &outcome.changes {
         for link in refs(change) {
             check_pinned(link, &web_host, base_model.port);
@@ -174,16 +187,24 @@ fn check_under(model: &Parsed, base: &Parsed, url: &str) {
         model.same_origin(base),
         "a request with the token left the API base's origin: {url:?} is {model:?}"
     );
-    if model.is_under(base) {
-        return;
-    }
-    let lax: Vec<&String> = model.segments.iter().filter(|s| !s.is_empty()).collect();
-    let base_segments: Vec<&String> = base.base_segments().iter().collect();
-    if skip_known() && lax.starts_with(&base_segments) {
-        // Known finding R31: empty segments are ignored when the path is compared.
-        return;
-    }
-    panic!("a request with the token left the API base's path: {url:?} is {model:?}");
+    assert!(
+        model.is_under(base),
+        "a request with the token left the API base's path: {url:?} is {model:?}"
+    );
+}
+
+/// The link the server sent and the URL the client parsed from it are the same place. The client
+/// percent-encodes some characters in the path (`<`, `{`, …); the model keeps them as written, so
+/// the two compare decoded.
+fn check_reads_the_same(link: &str, sent: &Parsed) {
+    let raw = url_model::parse(link)
+        .unwrap_or_else(|| panic!("the model cannot read a followed link: {link:?}"));
+    let decoded =
+        |p: &Parsed| -> Vec<String> { p.segments.iter().map(|s| percent_decode(s)).collect() };
+    assert!(
+        raw.same_origin(sent) && decoded(&raw) == decoded(sent),
+        "the followed link {link:?} reads as {raw:?}, the request as {sent:?}"
+    );
 }
 
 /// Every reference a change carries.
@@ -218,10 +239,6 @@ fn check_pinned(link: &ExternalRef, web_host: &str, base_port: u16) {
         model.host == web_host || model.host == "github.com",
         "a kept link on another host: {url:?}"
     );
-    if skip_known() {
-        // Known: the R10 residuals (port, userinfo, length) are open (O30).
-        return;
-    }
     assert!(!model.userinfo, "a kept link with userinfo: {url:?}");
     assert!(
         model.port == 443 || model.port == base_port,
@@ -257,10 +274,6 @@ fn closing_references(body: &str) {
             (model.scheme.as_str(), model.host.as_str()),
             ("https", "github.com")
         );
-        if skip_known() && (owner == "." || repo == ".") {
-            // Known finding R32: a `.` owner or repo is a dot segment.
-            continue;
-        }
         assert_eq!(
             model.segments,
             [owner, repo, "issues", number],

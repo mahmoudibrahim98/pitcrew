@@ -80,9 +80,9 @@ pitcrew-remote = { path = "../../../crates/remote" }
 getrandom = "0.3"
 
 [target.'cfg(unix)'.dependencies]
-# SIGTERM to the daemon, and O_NOFOLLOW for the token file, without unsafe code. The version
-# pitcrew-auth already uses.
-rustix = { version = "1.1", features = ["fs", "process"] }
+# SIGTERM to the daemon, O_NOFOLLOW for the token file, and the host name (`uname`), without
+# unsafe code. The version pitcrew-auth already uses.
+rustix = { version = "1.1", features = ["fs", "process", "system"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Notifications (org.freedesktop.Notifications, with their clicks) and finding the tray's host

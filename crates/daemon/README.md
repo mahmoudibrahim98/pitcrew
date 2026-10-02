@@ -816,7 +816,7 @@ and handed back, not kept, once it has.
 - The first prompt (`brief`) is passed to the CLI as an argument, so other users of the machine
   can read it in the process list (`/proc/<pid>/cmdline`), and tmux shows it in the pane's
   `pane_start_command`. Passing it on the CLI's standard input, or through a private file, would
-  keep it to the user (threat model O42).
+  keep it to the user (threat model O43).
 - Group-writable project folders, and folders on a Windows drive mounted in WSL without metadata
   (mode 777), are refused as a session's `cwd` (see "Terminals"). Allowing a group the user alone
   is in (a user private group) would need the group's members checked.

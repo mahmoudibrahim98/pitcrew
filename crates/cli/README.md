@@ -30,8 +30,9 @@ are accepted**; a person's (device) token is refused with exit 2.
 ## Verbs
 
 All take `--json`, which prints the daemon's JSON on stdout, exactly (errors as
-`{"code", "message"}` on stderr). Text output removes control and bidirectional-override
-characters from everything the daemon sends. Task arguments are a key (`PAP-4`, any case) or an
+`{"code", "message"}` on stderr). Text output removes control characters, and the hidden set
+every crate drops (`pitcrew_protocol::text::is_hidden`: bidirectional overrides, zero-width and
+other invisible characters, tag characters), from everything the daemon sends. Task arguments are a key (`PAP-4`, any case) or an
 id (`tsk_…` or a bare ULID); anything else is refused before a request is made.
 
 ```text
