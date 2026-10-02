@@ -228,6 +228,48 @@ fn a_transcript_is_a_session_with_its_transcript_and_live_records() {
     assert_eq!(edits, 1, "{events:?}");
 }
 
+/// Transcript pages come from the runner: an indexed transcript's pages; an empty page at the
+/// start for a session of this machine the runner never indexed (the demo's); and `503` for a
+/// transcript that was deleted, saying why.
+#[test]
+fn transcript_pages_come_from_the_runner() {
+    let (tmp, state) = state_dir();
+    let homes = tmp.path().join("homes");
+    let native = "9a8b7c6d-1111-4222-8333-444455556666";
+    let path = claude_transcript(&homes.join(".claude"), native, &fixture_lines(native)[..5]);
+    let daemon = Daemon::start(&state, &["--demo", "--homes", homes.to_str().unwrap()]);
+    let device = daemon.device_token();
+    let sid = session_named(&daemon, &device, native)["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let page = transcript(&daemon, &device, &sid);
+    assert_eq!(page["at_start"], true, "{page}");
+    assert!(!page["items"].as_array().unwrap().is_empty(), "{page}");
+
+    let demo = transcript(&daemon, &device, id::SES1);
+    assert_eq!(
+        demo,
+        json!({ "items": [], "from": 0, "to": 0, "at_start": true })
+    );
+
+    std::fs::remove_file(&path).unwrap();
+    let reply = daemon.get(&format!("/v1/sessions/{sid}/transcript"), Some(&device));
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert_eq!(reply.code(), "unavailable");
+    assert!(
+        reply.body.contains("the transcript is gone"),
+        "{}",
+        reply.body
+    );
+    assert!(
+        !reply.body.contains(path.to_str().unwrap()),
+        "no path: {}",
+        reply.body
+    );
+}
+
 /// A hook changes a session only when its sender may (the runner's ownership rule), through the
 /// real hook route and real tokens: the session's own agent, or the person who owns it; never
 /// another agent. Each refused hook would have left a state no allowed one does.
