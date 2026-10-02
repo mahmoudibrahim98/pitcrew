@@ -765,7 +765,16 @@ mod unix {
     }
 
     /// The one-per-endpoint lock, held while ptyd runs.
-    pub(super) struct Lock(#[allow(dead_code)] File);
+    pub(super) struct Lock(File);
+
+    impl Drop for Lock {
+        /// Unlocks before the file is closed: a process another thread is starting holds a copy
+        /// of every descriptor until it runs its program, and an flock lasts while any copy is
+        /// open.
+        fn drop(&mut self) {
+            let _ = rustix::fs::flock(&self.0, FlockOperation::Unlock);
+        }
+    }
 
     impl Lock {
         pub(super) fn take(endpoint: &Path) -> Result<Self, LockError> {

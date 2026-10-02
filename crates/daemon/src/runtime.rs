@@ -309,6 +309,14 @@ mod unix {
         }
     }
 
+    impl Drop for SocketLock {
+        /// Unlocks before the descriptor is closed: a process another thread is starting holds
+        /// a copy of it until it runs its program, and an flock lasts while any copy is open.
+        fn drop(&mut self) {
+            let _ = rustix::fs::flock(&self._fd, rustix::fs::FlockOperation::Unlock);
+        }
+    }
+
     /// The sessions of the tmux server on `socket` that are not PitCrew's (none if no server
     /// runs there).
     pub(super) fn foreign_sessions(tmux: &Path, socket: &Path) -> Result<Vec<String>, String> {

@@ -605,40 +605,7 @@ fn links_follow_terminal_ids_never_targets() {
     runtime.replace_first();
     runtime.terminals.lock().unwrap().truncate(2);
     let stranger = runtime.list().unwrap()[0].clone();
-    // DIAG (temporary, macOS CI): how long the first runner's lock outlives it, and who holds it.
-    let started = std::time::Instant::now();
-    let mut first_error = None;
-    let runner = loop {
-        let config = RunnerConfig::new(
-            WorkspaceId::new(),
-            MachineId::new(),
-            MemberId::new(),
-            state.path(),
-        );
-        match pitcrew_runner::start(config, Vec::new(), Arc::new(CollectSink::default())) {
-            Ok(runner) => break runner,
-            Err(e) => {
-                if first_error.is_none() {
-                    let lsof = std::process::Command::new("lsof")
-                        .arg(state.path().join("runner.lock"))
-                        .output()
-                        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
-                    first_error = Some(format!("{e}; lsof: {lsof:?}"));
-                }
-                assert!(
-                    started.elapsed() < Duration::from_secs(10),
-                    "DIAG still locked after 10 s: {first_error:?}"
-                );
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
-    };
-    if let Some(error) = &first_error {
-        panic!(
-            "DIAG the second runner started after {:?}; first error: {error}",
-            started.elapsed()
-        );
-    }
+    let runner = runner(state.path());
     let terminals = runner.terminals_with(runtime.clone(), options()).unwrap();
     assert_eq!(terminals.terminal_of(replaced).unwrap(), None);
     assert!(terminals.attach(replaced).is_err());
