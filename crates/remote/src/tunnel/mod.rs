@@ -86,9 +86,10 @@
 //! the person (a one-time code): that waits for a wake or [`Connector::retry`]. A helper that is
 //! not running (or a job that ended) is unreachable at once and asked about again every
 //! `retry_every` through the login link; a failed sign-in or a cancelled prompt (also for a
-//! connection, on Windows) waits for `retry()`. Prompts while reconnecting go through the
-//! askpass bridge as for any call; nothing is stored. Resuming the API stream (`since=`) is the
-//! caller's.
+//! connection, on Windows) waits for `retry()`. Each attempt from `Unreachable` makes the state
+//! [`LinkState::Connecting`] until it ends, so a watcher sees each attempt's end, even one that
+//! fails again for the same reason. Prompts while reconnecting go through the askpass bridge as
+//! for any call; nothing is stored. Resuming the API stream (`since=`) is the caller's.
 //!
 //! **Windows** works, with fewer comforts: no ControlMaster, so each connection logs in, and a
 //! password or one-time code is asked each time; keys are the way there. Each endpoint check is
@@ -162,7 +163,9 @@ pub enum Unreachable {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LinkState {
-    /// Starting: not connected yet, and no failure yet.
+    /// An attempt is under way: the first, or one from [`LinkState::Unreachable`] (a retry, a
+    /// wake, or its time came). Each such attempt ends in another state, so a watcher sees where
+    /// it ends even when it fails again for the same reason. Connections wait for it.
     Connecting,
     /// Connections go through.
     Connected {
@@ -702,8 +705,9 @@ impl Connector {
         let _ = self.inner.events.send(Event::Wake);
     }
 
-    /// Starts over now from [`LinkState::Unreachable`] (the person asked to). Ignored while
-    /// connected.
+    /// Starts over now from [`LinkState::Unreachable`] (the person asked to): the state is
+    /// [`LinkState::Connecting`] until the attempt ends. Ignored while connected, or while an
+    /// attempt runs.
     pub fn retry(&self) {
         let _ = self.inner.events.send(Event::Retry);
     }

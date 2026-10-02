@@ -464,6 +464,21 @@ connector.close().await;
   forward). A failed sign-in or a cancelled prompt (also one for a connection, on Windows) is
   `Unreachable { SignIn }` and waits for `retry()`. Prompts while reconnecting go through the
   askpass bridge; nothing is stored. Resuming the API stream (`since=`) is the caller's.
+- **Attempts show.** Each attempt from `Unreachable` (its time came, `retry()`, `wake()`)
+  makes the state `Connecting` until it ends: `Connected`, `Unverifiable`, or `Unreachable`
+  again, even for the same reason. Connections wait for it (up to `connect_wait`). To follow
+  one attempt, mark the watch seen, ask, then wait for a change and for the end:
+
+  ```rust
+  let mut state = connector.watch();
+  state.borrow_and_update();
+  connector.retry();
+  state.changed().await?;                    // the attempt started (and may have ended)
+  let end = state.wait_for(|s| *s != LinkState::Connecting).await?.clone();
+  ```
+
+  The same connector keeps its login link where it can (a helper not running, a refused
+  record), so a retry through it costs no new sign-in, where a new connector would.
 - **Security:** agent and X11 forwarding, local commands and configured forwardings are off on
   every call; every `-o` is PitCrew's; ssh gets only `MINIMAL_ENV` (and passed-through names);
   local sockets live in the 0700 directory; only the root's socket is forwarded; reasons in
