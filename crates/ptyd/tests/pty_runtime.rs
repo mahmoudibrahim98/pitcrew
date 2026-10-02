@@ -575,7 +575,7 @@ fn throughput_of_50_mb() {
     rt.write(t.id, b"\r").expect("go");
     // Read every byte, as a daemon streaming it to a client would.
     let deadline = Instant::now() + Duration::from_secs(600);
-    let (mut at, mut received, mut gaps) = (ready + 1, 0u64, 0u32);
+    let (mut at, mut received, mut gaps) = (ready, 0u64, 0u32);
     while at < ready + TOTAL {
         assert!(Instant::now() < deadline, "50 MB within 10 minutes");
         let chunk = rt.read_output(t.id, at, usize::MAX).expect("read");

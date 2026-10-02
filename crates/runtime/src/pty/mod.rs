@@ -41,6 +41,9 @@ use crate::screen::MAX_SIZE;
 const WRITE_CHUNK: usize = 256 << 10;
 /// How long a starting ptyd is waited for before it is started again.
 const RELAUNCH: Duration = Duration::from_secs(3);
+/// The longest ptyd spends on a kill: half a second between `SIGTERM` and `SIGKILL`, then up
+/// to three seconds for the end to be seen.
+const KILL_TIME: Duration = Duration::from_secs(4);
 
 /// Where pitcrew-ptyd is and how to reach it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,8 +207,9 @@ pub fn detect_async(options: PtyOptions) -> Background<Result<PtySupport, Runtim
 /// PitCrew's terminals in pitcrew-ptyd (see the [module docs](self)).
 ///
 /// - Every call is bounded by [`PtyOptions::call_timeout`] (`start` by
-///   [`PtyOptions::start_timeout`]) and answers `Unavailable` past it. Input that timed out may
-///   still reach the terminal.
+///   [`PtyOptions::start_timeout`]; `kill` by 4 seconds more, the time ptyd may take to end a
+///   program) and answers `Unavailable` past it. Input that timed out may still reach the
+///   terminal.
 /// - `start` starts ptyd if none runs. Other calls only connect: with no ptyd there are no
 ///   terminals (`list` is empty, a terminal is `NotFound`).
 /// - A lost connection is replaced on the next call; reads, `screen`, `info`, `list`, `resize`
@@ -329,10 +333,12 @@ impl PtyRuntime {
             max: max.min(MAX_READ) as u64,
             wait_ms,
         };
-        let (value, data) = self
+        let (value, mut data) = self
             .inner
             .ask(op, Vec::new(), deadline, false, true)
             .map_err(|e| terminal_error(id, e))?;
+        // Never more than asked for, whatever the other end sends.
+        data.truncate(max);
         Ok((decode(value)?, data))
     }
 
@@ -352,7 +358,13 @@ impl PtyRuntime {
         payload: Vec<u8>,
         retry: bool,
     ) -> Result<(), RuntimeError> {
-        let deadline = Instant::now() + self.inner.options.call_timeout;
+        // ptyd may spend up to `KILL_TIME` ending a program, on top of the usual wait.
+        let extra = if matches!(op, Op::Kill { .. }) {
+            KILL_TIME
+        } else {
+            Duration::ZERO
+        };
+        let deadline = Instant::now() + self.inner.options.call_timeout + extra;
         self.inner
             .ask(op, payload, deadline, false, retry)
             .map(drop)

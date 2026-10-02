@@ -7,8 +7,10 @@
 //!   used) and every client's uid (`SO_PEERCRED`) must be ours. On Windows the pipe's DACL grants
 //!   the current user alone, remote clients are refused (`PIPE_REJECT_REMOTE_CLIENTS`), and the
 //!   user of every client's process token must be ours. Anyone else is disconnected at once.
-//! - **Bounded.** At most 32 clients; a client says hello within 10 seconds; at most 64 of its
-//!   slow requests (start, screen, read, kill) run at once; frames are capped by the protocol.
+//! - **Bounded.** At most 32 clients; a client says hello within 10 seconds; at most 16 of its
+//!   slow requests (start, screen, read, kill), and 64 of everyone's, are in progress until
+//!   their replies are written, so replies a client does not read stay bounded; frames are
+//!   capped by the protocol. A client that stops reading stops being read.
 //! - **Idle exit.** With no terminals running and no client connected for a while (30 seconds
 //!   by default), ptyd exits, removing its socket.
 
@@ -25,7 +27,7 @@ use pitcrew_runtime::pty::proto::{
     Request,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::terms::{Failed, StartRequest, Term, Terms};
 use crate::{ALREADY_RUNNING, Config, log};
@@ -36,14 +38,20 @@ pub(crate) const IDLE_EXIT: Duration = Duration::from_secs(30);
 const MAX_CLIENTS: usize = 32;
 /// A client must say hello within this.
 const HELLO_WITHIN: Duration = Duration::from_secs(10);
-/// Slow requests of one client running at once, at most.
-const IN_FLIGHT: usize = 64;
+/// Slow requests (start, screen, read, kill) of one client in progress at once, at most; one
+/// is in progress until its reply is written.
+const IN_FLIGHT: usize = 16;
+/// Slow requests of all clients in progress at once, at most. With reads of at most 4 MiB,
+/// replies waiting for slow clients hold at most 256 MiB.
+const ALL_IN_FLIGHT: usize = 64;
 /// Replies queued for one client.
-const REPLIES: usize = 64;
+const REPLIES: usize = 32;
 
 struct State {
     terms: Arc<Terms>,
     clients: AtomicUsize,
+    /// Permits for slow requests, shared by all clients.
+    slow: Arc<Semaphore>,
 }
 
 /// Counts a client while it is connected, whatever ends its task.
@@ -100,6 +108,7 @@ pub(crate) fn run(config: &Config, args: &[OsString]) -> ExitCode {
     let state = Arc::new(State {
         terms: Terms::new(config.history),
         clients: AtomicUsize::new(0),
+        slow: Arc::new(Semaphore::new(ALL_IN_FLIGHT)),
     });
     let served = runtime.block_on(async {
         let listener = Listener::bind(&config.endpoint)?;
@@ -173,13 +182,23 @@ async fn serve(mut listener: Listener, state: &Arc<State>, idle: Duration) {
     }
 }
 
+/// A reply on its way to a client, with the permits of the slow request it answers: they are
+/// given back once it is written, so a client that stops reading holds at most [`IN_FLIGHT`]
+/// large replies.
+struct Outgoing {
+    frame: Frame,
+    _permits: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
+}
+
+type Replies = mpsc::Sender<Outgoing>;
+
 /// Serves one client until it disconnects.
 async fn client<S: AsyncRead + AsyncWrite + Send + 'static>(stream: S, state: &Arc<State>) {
     let (mut reader, mut writer) = tokio::io::split(stream);
-    let (replies, mut outgoing) = mpsc::channel::<Frame>(REPLIES);
+    let (replies, mut outgoing) = mpsc::channel::<Outgoing>(REPLIES);
     let writing = tokio::spawn(async move {
-        while let Some(frame) = outgoing.recv().await {
-            if proto::write_frame(&mut writer, &frame).await.is_err() {
+        while let Some(reply) = outgoing.recv().await {
+            if proto::write_frame(&mut writer, &reply.frame).await.is_err() {
                 break;
             }
         }
@@ -216,7 +235,7 @@ struct IdOnly {
 }
 
 /// The first request must be `hello` with our protocol. True if it was.
-async fn hello<R: AsyncRead + Unpin>(reader: &mut R, replies: &mpsc::Sender<Frame>) -> bool {
+async fn hello<R: AsyncRead + Unpin>(reader: &mut R, replies: &Replies) -> bool {
     let Ok(Ok(Some(frame))) = tokio::time::timeout(HELLO_WITHIN, proto::read_frame(reader)).await
     else {
         return false;
@@ -247,13 +266,28 @@ async fn hello<R: AsyncRead + Unpin>(reader: &mut R, replies: &mpsc::Sender<Fram
     }
 }
 
-async fn send(replies: &mpsc::Sender<Frame>, reply: Reply, payload: Vec<u8>) -> bool {
+async fn send(replies: &Replies, reply: Reply, payload: Vec<u8>) -> bool {
+    send_with(replies, reply, payload, None).await
+}
+
+async fn send_with(
+    replies: &Replies,
+    reply: Reply,
+    payload: Vec<u8>,
+    permits: Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)>,
+) -> bool {
     let frame = Frame::new(&reply, payload).unwrap_or_else(|e| Frame {
         header: serde_json::to_vec(&Reply::err(reply.id, FailureKind::Io, e.to_string()))
             .unwrap_or_default(),
         payload: Vec::new(),
     });
-    replies.send(frame).await.is_ok()
+    replies
+        .send(Outgoing {
+            frame,
+            _permits: permits,
+        })
+        .await
+        .is_ok()
 }
 
 fn done(id: u64, result: Result<(), Failed>) -> Reply {
@@ -276,7 +310,7 @@ async fn handle(
     request: Request,
     payload: Vec<u8>,
     state: &Arc<State>,
-    replies: &mpsc::Sender<Frame>,
+    replies: &Replies,
     in_flight: &Arc<Semaphore>,
 ) -> bool {
     let Request { id, op } = request;
@@ -298,15 +332,17 @@ async fn handle(
         Op::List => Reply::ok(id, &terms.list()),
         Op::Hello { .. } => Reply::err(id, FailureKind::Invalid, "hello was said already"),
         Op::Start { .. } | Op::Screen { .. } | Op::Read { .. } | Op::Kill { .. } => {
-            let Ok(permit) = Arc::clone(in_flight).try_acquire_owned() else {
+            let permits = Arc::clone(in_flight)
+                .try_acquire_owned()
+                .and_then(|mine| Ok((mine, Arc::clone(&state.slow).try_acquire_owned()?)));
+            let Ok(permits) = permits else {
                 let busy = Reply::err(id, FailureKind::Busy, "too many requests are in progress");
                 return send(replies, busy, Vec::new()).await;
             };
             let (state, replies) = (Arc::clone(state), replies.clone());
             tokio::spawn(async move {
                 let (reply, payload) = slow(id, op, &state).await;
-                let _ = send(&replies, reply, payload).await;
-                drop(permit);
+                let _ = send_with(&replies, reply, payload, Some(permits)).await;
             });
             return true;
         }
