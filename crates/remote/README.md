@@ -488,8 +488,9 @@ then it prints its ready mark (`\0pitcrew-bridge 1 ready <nonce>\n`, or `READY` 
 nonce) and copies stdin to the socket and the socket to stdout. Half-closes pass both ways (end
 of file on stdin shuts down the socket's write side; the daemon's end of file closes stdout),
 and it ends once both sides are done, or as soon as the daemon has closed its side altogether
-(seen by `poll`'s `POLLHUP`; macOS may not report it for a unix socket, so there the bridge ends
-when the client stops sending, which an HTTP client that has read end of file does).
+(seen by `poll`'s `POLLHUP`; macOS's `poll` reports nothing for a descriptor asked about no
+events, and takes a half-close for a hang-up when asked about input, so there it asks whether the
+socket can be written, which reports the hang-up alone).
 Framed (`--framed`), its output is chunks of at most 64 KiB, each `<length as 8 hex digits>:`,
 the bytes, and `\n`, ending with `00000000:\n`: every chunk ends a line, so a line-buffered
 `srun` passes it on at once. Exit codes: 2 usage, 3 not this user's (`EXIT_UNSAFE`), 4 no

@@ -438,27 +438,40 @@ pub(crate) mod unix {
         let _ = socket.shutdown(Shutdown::Write);
     }
 
+    /// How long [`hung_up`] waits.
+    const HANG_UP_WAIT: Duration = Duration::from_millis(200);
+
     /// Waits up to 200 ms for the daemon to close its side of `socket` completely (both
-    /// directions: `POLLHUP`), and says whether it has. macOS's `poll` may never say so for a
-    /// unix socket: there the bridge ends when the client stops sending (or a write to the
-    /// daemon fails), not as soon as the daemon has closed. The client has read end of file by
-    /// then; one that closes (as an HTTP client does) ends it.
+    /// directions: `POLLHUP`), and says whether it has.
+    ///
+    /// macOS builds `poll` on kqueue and watches a descriptor only through the filters its
+    /// requested events select: asked for nothing it reports nothing, a hang-up included, and
+    /// asked for input it takes the daemon's half-close for a hang-up. Asked whether the socket
+    /// can be written, it reports `POLLHUP` once the daemon has closed both directions, and
+    /// `POLLOUT` at once otherwise, so the rest of the wait is slept. Linux and the BSDs report a
+    /// hang-up unasked.
     fn hung_up(socket: &UnixStream) -> bool {
         use rustix::event::{PollFd, PollFlags, Timespec, poll};
-        let mut fds = [PollFd::new(socket, PollFlags::empty())];
+        let events = if cfg!(target_vendor = "apple") {
+            PollFlags::OUT
+        } else {
+            PollFlags::empty()
+        };
+        let started = std::time::Instant::now();
+        let mut fds = [PollFd::new(socket, events)];
         let wait = Timespec {
             tv_sec: 0,
             tv_nsec: 200_000_000,
         };
-        match poll(&mut fds, Some(&wait)) {
-            Ok(_) => fds
-                .first()
-                .is_some_and(|fd| fd.revents().intersects(PollFlags::HUP | PollFlags::ERR)),
-            Err(_) => {
-                std::thread::sleep(Duration::from_millis(200));
-                false
-            }
+        let hung_up = poll(&mut fds, Some(&wait)).is_ok_and(|_| {
+            fds.first()
+                .is_some_and(|fd| fd.revents().intersects(PollFlags::HUP | PollFlags::ERR))
+        });
+        if !hung_up {
+            // `poll` came back early (the socket is writable, on macOS) or failed: don't spin.
+            std::thread::sleep(HANG_UP_WAIT.saturating_sub(started.elapsed()));
         }
+        hung_up
     }
 }
 
