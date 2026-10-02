@@ -820,7 +820,7 @@ fn server_facts(about: &str) -> Result<Server, String> {
 /// - **tmux 3.2:** `manual`, so a new window takes `default-size` whoever is attached.
 /// - **tmux 3.3 and later:** `latest`. There a global `manual` crashes the server at its next
 ///   new window: `clients_calculate_size` reads the manual size of the window being made,
-///   which does not exist yet (a NULL dereference, seen on 3.3a, 3.4 and 3.5a). With `latest`
+///   which does not exist yet (a NULL dereference, seen on 3.3a to 3.6a). With `latest`
 ///   a new window takes `default-size` unless someone is attached with a size of their own;
 ///   then it takes theirs, and `start` resizes it at once.
 /// - **OpenBSD's own numbering** (which does not say which tmux it is): `latest`, which works

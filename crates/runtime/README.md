@@ -10,8 +10,8 @@ and [`PtyRuntime`](#ptyruntime-and-pitcrew-ptyd) (Unix and Windows, terminals ow
 
 The building blocks come first. **tmux 3.2 is the
 minimum supported portable release**, and every later one is supported: the runtime is tested
-on 3.2a, 3.3a, 3.4 and 3.5a (see [tmux versions](#tmux-versions); nothing there gave a reason to
-raise the floor). `detect_tmux(path)` executes `path -V` directly and
+on 3.2a, 3.3a, 3.4, 3.5a and 3.6a (see [tmux versions](#tmux-versions); nothing there gave a
+reason to raise the floor). `detect_tmux(path)` executes `path -V` directly and
 returns a parsed `TmuxVersion` or a fallback error. The probe is limited to two seconds and
 4 KiB per output stream; a timed-out process is killed and reaped. It blocks the calling thread
 for up to those two seconds, so call it from async code through `spawn_blocking`. Version parsing recognizes
@@ -232,11 +232,11 @@ crashes the 3.2a server, so the runtime never uses it.
 ### tmux versions
 
 The real-tmux tests (`tests/tmux.rs`, `tests/tmux_runtime.rs`, and the daemon's tmux tests) pass
-on tmux 3.2a, 3.3a, 3.4 (Ubuntu 24.04's, and GitHub's `ubuntu-latest`) and 3.5a; 3.3a and 3.5a
-were built from the release tarballs. What differs after 3.2a:
+on tmux 3.2a, 3.3a, 3.4 (Ubuntu 24.04's, and GitHub's `ubuntu-latest`), 3.5a and 3.6a; the
+others were built from the release tarballs. What differs after 3.2a:
 
-- **A global `window-size manual` crashes the server at its next new window**, on 3.3a, 3.4
-  and 3.5a (`new-window`, `new-session`, or `C-b c` from a person). Since 3.3,
+- **A global `window-size manual` crashes the server at its next new window**, on 3.3a, 3.4,
+  3.5a and 3.6a (`new-window`, `new-session`, or `C-b c` from a person). Since 3.3,
   `clients_calculate_size` (`resize.c`) reads the manual size of the window it is given, and
   `spawn_window` gives it none for a window not made yet: a NULL dereference (a segfault at
   address `0x208` on 3.4). 3.2a returned before that read. The control client then reads
@@ -248,13 +248,13 @@ were built from the release tarballs. What differs after 3.2a:
   own** (a person's terminal, or a control client after `refresh-client -C`), and `default-size`
   only when there is none. On 3.2a, `latest` would instead give it the creating control
   client's 80x24. Hence the global by version, and the resize in `start`.
-- **Unchanged, checked against each version's sources and the tests:** how `-C` clients attach
-  and how `new-session` from the command line answers; `%begin` flags (`1` for commands from
-  the client's stdin, `0` for the command line and hooks); the `%exit` reasons (the same
-  strings); `%unlinked-window-close` for a window of the client's own session; and the parsing
-  of `send-keys -l`/`-H` (3.4's "expand arguments to send-keys" applies to `-N` only). The
-  runtime never uses `refresh-client`. 3.3's access list (`server-access`) always admits the
-  server's own user.
+- **Unchanged, checked against the 3.2a, 3.4 and 3.5a sources and by the tests on each
+  version:** how `-C` clients attach and how `new-session` from the command line answers;
+  `%begin` flags (`1` for commands from the client's stdin, `0` for the command line and
+  hooks); the `%exit` reasons (the same strings); `%unlinked-window-close` for a window of the
+  client's own session; and the parsing of `send-keys -l`/`-H` (3.4's "expand arguments to
+  send-keys" applies to `-N` only). The runtime never uses `refresh-client`. 3.3's access list
+  (`server-access`) always admits the server's own user.
 
 Measured on tmux 3.2a in WSL before review round 1 (`cargo test --release -p pitcrew-runtime
 --test tmux_runtime -- --ignored --nocapture`): 50 MiB of `yes` output reached the replay buffer
