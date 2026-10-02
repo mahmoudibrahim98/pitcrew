@@ -800,6 +800,31 @@ mod unix {
         runtime().block_on(future)
     }
 
+    /// DIAG (temporary, macOS CI): what a machine holds and which processes run.
+    pub(crate) fn diag(m: &Machine) -> String {
+        let run = |args: &[&str]| {
+            Command::new(args[0])
+                .args(&args[1..])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_else(|e| e.to_string())
+        };
+        format!(
+            "DIAG temporaries={:?} lock={} owner={:?}\nls:\n{}\nps:\n{}",
+            m.temporaries(),
+            m.lock().exists(),
+            std::fs::read_to_string(m.lock().join("owner")).ok(),
+            run(&["ls", "-laR", m.root().to_str().unwrap()]),
+            run(&["ps", "-axo", "pid,ppid,pgid,stat,etime,command"])
+                .lines()
+                .filter(|l| l.contains(m.dir.path().to_str().unwrap())
+                    || l.contains(" sh ")
+                    || l.contains("cat"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+
     pub(crate) fn eventually(what: &str, check: impl Fn() -> bool) {
         let start = Instant::now();
         while !check() {
@@ -1063,9 +1088,16 @@ mod unix {
             matches!(err, HelperError::Ssh(SshError::Ssh { code: 255, .. })),
             "{err:?}"
         );
-        eventually("the remote script to clean up", || {
-            m.temporaries().is_empty() && !m.lock().exists()
-        });
+        // DIAG (temporary): what is left when the clean-up does not come.
+        let start = Instant::now();
+        while !(m.temporaries().is_empty() && !m.lock().exists()) {
+            assert!(
+                start.elapsed() < Duration::from_secs(15),
+                "timed out: the remote script to clean up\n{}",
+                diag(&m)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
         assert!(!m.bin_dir().join("1.0.0/pitcrewd").exists());
         assert_eq!(m.link("current"), None);
 
@@ -1127,7 +1159,15 @@ mod unix {
         assert!(m.lock().exists());
         let start = Instant::now();
         let second = helper("2.0.0");
-        let b = block_on(deploy(&m.plain(), &second, &quick())).unwrap();
+        // DIAG (temporary): the state when the wait gives up.
+        let b = block_on(deploy(&m.plain(), &second, &quick())).unwrap_or_else(|e| {
+            panic!(
+                "{e:?} after {:?}; first finished: {}\n{}",
+                start.elapsed(),
+                a.is_finished(),
+                diag(&m)
+            )
+        });
         let waited = start.elapsed();
         let a = a.join().unwrap().unwrap();
         assert!(a.uploaded && b.uploaded);
