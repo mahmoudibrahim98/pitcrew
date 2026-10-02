@@ -112,11 +112,12 @@ export interface WizardState {
 /** This machine's name until the person gives another: the webview cannot read the host name. */
 export const DEFAULT_MACHINE_NAME = 'This computer';
 
-export function initialWizardState(): WizardState {
+/** `machineName`: a remote hub's own machine (the gateway's name for it), else this computer. */
+export function initialWizardState(machineName: string = DEFAULT_MACHINE_NAME): WizardState {
   return {
     theme: 'system',
     density: 'comfortable',
-    setup: { workspaceName: '', personName: '', handle: '', machineName: DEFAULT_MACHINE_NAME },
+    setup: { workspaceName: '', personName: '', handle: '', machineName },
     handleEdited: false,
     primaryMachine: { kind: 'local' },
     machineCheckByTarget: {},

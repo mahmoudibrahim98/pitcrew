@@ -36,7 +36,8 @@ export function DoneStep() {
         {state.accounts.some((a) => a.signedIn) && <li>Signed in to your agents.</li>}
       </ul>
       <div className="mt-6">
-        <Button variant="primary" onClick={() => void router.navigate({ href: paths.home(ws) })}>
+        {/* Replacing the wizard: Back from Home is not the finished first run. */}
+        <Button variant="primary" onClick={() => void router.navigate({ href: paths.home(ws), replace: true })}>
           Go to Home
         </Button>
       </div>

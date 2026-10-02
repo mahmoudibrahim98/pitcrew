@@ -31,6 +31,7 @@ export function ConnectPage() {
       remote={remote}
       onOpen={(workspace) => void router.navigate({ href: paths.workspace(workspace.id) })}
       onCancel={() => (router.history.canGoBack() ? router.history.back() : void router.navigate({ href: '/' }))}
+      onLeave={() => void router.navigate({ href: '/' })}
     />
   );
 }

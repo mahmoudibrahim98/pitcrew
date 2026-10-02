@@ -45,9 +45,13 @@ function capitalize(text: string): string {
   return text.charAt(0).toUpperCase() + text.slice(1);
 }
 
+/** Taken by the back office, always (api-v1.md, "The first run"). */
+export const RESERVED_HANDLES: readonly string[] = ['@office'];
+
 export function checkHandle(handle: string): string | undefined {
   if (handle === '') return 'Give yourself a handle.';
   if (!HANDLE.test(handle)) return 'A handle is "@" and 1 to 32 lower-case letters, digits, "_" or "-".';
+  if (RESERVED_HANDLES.includes(handle)) return `${handle} is the back office’s handle. Choose another.`;
   return undefined;
 }
 
@@ -102,15 +106,25 @@ export function fieldOfMessage(message: string): SetupField | undefined {
   return undefined;
 }
 
-// eslint-disable-next-line no-control-regex
-const WHITESPACE_OR_CONTROL = /[\s\u0000-\u001F\u007F-\u009F]/u;
+/**
+ * What a host may be: an ssh config `Host` name or a host name, optionally after `user@`, or an
+ * IPv6 address in brackets. Nothing else: no spaces, quotes, `%` tokens, shell characters, or
+ * invisible and direction-changing characters. An allow-list, so what is not named here is out.
+ */
+const HOST = /^(?:[A-Za-z0-9._-]+@)?(?:[A-Za-z0-9._-]+|\[[0-9A-Fa-f:.]+\])$/;
 
-/** A host the person typed (or picked): ssh must never read it as an option. */
+/** A host the person typed (or picked): ssh must never read it, or its user, as an option. */
 export function checkHost(host: string): string | undefined {
   if (host === '') return 'Pick a host, or type one.';
-  if (host.startsWith('-')) return 'A host cannot start with "-".';
-  if (WHITESPACE_OR_CONTROL.test(host)) return 'A host cannot contain spaces or control characters.';
   if (codePoints(host) > 255) return 'That host name is too long.';
+  const at = host.lastIndexOf('@');
+  const user = at === -1 ? undefined : host.slice(0, at);
+  const name = at === -1 ? host : host.slice(at + 1);
+  if (name.startsWith('-')) return 'A host cannot start with "-".';
+  if (user?.startsWith('-') === true) return 'A user name cannot start with "-".';
+  if (!HOST.test(host)) {
+    return 'A host is a name from your ssh config, or user@host: letters, digits, ".", "_" and "-" only.';
+  }
   return undefined;
 }
 
@@ -119,6 +133,22 @@ export function checkJobText(value: string, what: string): string | undefined {
   if (CONTROL.test(value)) return `${capitalize(what)} cannot contain control characters.`;
   if (codePoints(value) > 200) return `Keep ${what} to 200 characters.`;
   return undefined;
+}
+
+const BIDI = /[\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/u;
+const ZERO_WIDTH = /[\u200B-\u200D\u2060\uFEFF]/u;
+
+/**
+ * What in a job script could make what a person reads differ from what runs: direction-changing
+ * characters (text shown in another order), zero-width characters (text not shown at all), and
+ * carriage returns (a terminal can overprint a line). Empty when there is none.
+ */
+export function scriptHazards(script: string): string[] {
+  const found: string[] = [];
+  if (BIDI.test(script)) found.push('direction-changing characters');
+  if (ZERO_WIDTH.test(script)) found.push('zero-width characters');
+  if (script.includes('\r')) found.push('carriage returns');
+  return found;
 }
 
 /** CPUs, when given: a whole number from 1. */

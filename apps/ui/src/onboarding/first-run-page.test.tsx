@@ -1,0 +1,102 @@
+// @vitest-environment happy-dom
+// @vitest-environment-options {"url": "http://localhost:5173/"}
+// The first-run route itself, in the desktop app over a fake gateway: a remote hub reaching it
+// through the redirect starts from the gateway's name for its machine; Done replaces the wizard
+// with Home; and a workspace already set up goes Home at once (unless the development flag asks
+// for the fake wizard).
+
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { createMemoryHistory, RouterProvider } from '@tanstack/react-router';
+import { StrictMode } from 'react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createApi } from '../data/api.ts';
+import { WorkspacesProvider } from '../data/desktop.tsx';
+import { createGateway, gatewayTransport } from '../data/gateway.ts';
+import { FakeDesktop, freshDaemon } from '../data/tests/fake-desktop.ts';
+import type { GatewayWorkspace } from '../data/workspaces.tsx';
+import { paths } from '../shell/paths.ts';
+import { createAppRouter } from '../shell/routes.tsx';
+import { initialShellState, useShell } from '../shell/store.ts';
+import { feature as onboarding } from './index.ts';
+
+const WS = '01JB000000000000000WSPFRSH';
+const REMOTE: GatewayWorkspace = { id: WS, name: 'hpc-login', kind: 'remote', state: 'ready' };
+const PATIENCE = { timeout: 8_000 };
+
+let desktop: FakeDesktop;
+let fresh = freshDaemon(WS);
+
+beforeEach(() => {
+  desktop = new FakeDesktop({ workspaces: [REMOTE] }).install();
+  fresh = freshDaemon(WS);
+  desktop.daemons.set(WS, fresh.daemon);
+});
+
+afterEach(() => {
+  cleanup();
+  desktop.uninstall();
+  localStorage.clear();
+  useShell.setState(initialShellState);
+});
+
+function renderApp(path: string) {
+  const router = createAppRouter([onboarding], { history: createMemoryHistory({ initialEntries: [path] }) });
+  render(
+    <StrictMode>
+      <WorkspacesProvider gateway={createGateway()}>
+        <RouterProvider router={router} />
+      </WorkspacesProvider>
+    </StrictMode>,
+  );
+  return router;
+}
+
+const heading = (name: string | RegExp) => screen.findByRole('heading', { level: 1, name }, PATIENCE);
+
+describe('the first-run route', () => {
+  it("starts a remote hub's machine name from the gateway's name, and replaces itself with Home", async () => {
+    const router = renderApp('/');
+    await heading('Welcome to PitCrew');
+    expect(router.state.location.pathname).toBe(paths.setup(WS));
+    fireEvent.click(screen.getByRole('button', { name: 'Get started' }));
+    await heading('Your first workspace');
+    const machine = screen.getByLabelText('The remote machine’s name') as HTMLInputElement;
+    expect(machine.value).toBe('hpc-login');
+    fireEvent.change(screen.getByLabelText('Workspace name'), { target: { value: 'Cluster Lab' } });
+    fireEvent.change(screen.getByLabelText('Your name'), { target: { value: 'Sam Rivera' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+
+    await heading("You're set up");
+    expect(fresh.setups).toEqual([
+      { workspace_name: 'Cluster Lab', person: { name: 'Sam Rivera', handle: '@sam' }, machine_name: 'hpc-login' },
+    ]);
+    fireEvent.click(screen.getByRole('button', { name: 'Go to Home' }));
+    await heading('Home');
+    // Every step on the way replaced the one before: Back cannot reopen the finished wizard.
+    expect(router.history.canGoBack()).toBe(false);
+  });
+
+  it('sends a workspace that is set up already Home', async () => {
+    await createApi({ transport: gatewayTransport(WS) }).setup({
+      workspace_name: 'Cluster Lab',
+      person: { name: 'Sam Rivera', handle: '@sam' },
+      machine_name: 'hpc-login',
+    });
+    const router = renderApp(paths.setup(WS));
+    await heading('Home');
+    expect(router.state.location.pathname).toBe(paths.home(WS));
+    expect(fresh.setups).toHaveLength(1);
+  });
+
+  it('shows the fake wizard on a set-up workspace when the development flag asks for it', async () => {
+    await createApi({ transport: gatewayTransport(WS) }).setup({
+      workspace_name: 'Cluster Lab',
+      person: { name: 'Sam Rivera', handle: '@sam' },
+      machine_name: 'hpc-login',
+    });
+    const router = renderApp(`${paths.setup(WS)}?onboarding=fake`);
+    await heading('Welcome to PitCrew');
+    await vi.waitFor(() => expect(screen.getByRole('note').textContent).toContain('against a fake'));
+    expect(router.state.location.pathname).toBe(paths.setup(WS));
+  });
+});

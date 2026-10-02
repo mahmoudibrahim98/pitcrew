@@ -9,6 +9,7 @@
 
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { createMemoryHistory, RouterProvider } from '@tanstack/react-router';
+import { StrictMode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WorkspacesProvider } from '../../data/desktop.tsx';
 import { createGateway } from '../../data/gateway.ts';
@@ -61,12 +62,18 @@ afterEach(() => {
   useShell.setState(initialShellState);
 });
 
+/**
+ * The whole app, in StrictMode as `main.tsx` runs it: effects run twice in development, and no
+ * remote call may run twice because of it.
+ */
 function renderApp(path = '/connect') {
   const router = createAppRouter([onboarding], { history: createMemoryHistory({ initialEntries: [path] }) });
   render(
-    <WorkspacesProvider gateway={createGateway()}>
-      <RouterProvider router={router} />
-    </WorkspacesProvider>,
+    <StrictMode>
+      <WorkspacesProvider gateway={createGateway()}>
+        <RouterProvider router={router} />
+      </WorkspacesProvider>
+    </StrictMode>,
   );
   return router;
 }
@@ -192,6 +199,10 @@ describe('connecting a remote machine', () => {
     fireEvent.click(button('Open hpc-login'));
     await heading('Home');
     expect(router.state.location.pathname).toBe(`/w/${NEW.id}/home`);
+    // Under StrictMode, each remote call that changes or asks something ran once.
+    for (const cmd of ['gateway_remote_probe', 'gateway_remote_plan', 'gateway_remote_add', 'gateway_prompt_reply']) {
+      expect(desktop.commands(cmd), cmd).toHaveLength(1);
+    }
     // The answer went to the gateway once, and is nowhere else.
     expect(JSON.stringify(useShell.getState())).not.toContain(SECRET);
     expect(document.documentElement.outerHTML).not.toContain(SECRET);
@@ -231,7 +242,7 @@ describe('connecting a remote machine', () => {
     await toReview();
     fireEvent.click(button('Connect'));
     const dialog = await screen.findByRole('dialog', { name: 'hpc-login asks for a password' }, PATIENCE);
-    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel sign-in' }));
 
     const alert = await screen.findByRole('alert', undefined, PATIENCE);
     expect(alert.textContent).toBe('Connecting failed at “Copy pitcrewd 0.4.0 to ~/.pitcrew (plan-1)”: Authentication cancelled.');
@@ -244,6 +255,131 @@ describe('connecting a remote machine', () => {
     fireEvent.click(button('Back to review'));
     await heading('Review: connect hpc-login');
     await vi.waitFor(() => expect(screen.getByTestId('plan-steps').textContent).toContain('(plan-2)'));
+  });
+
+  it('can be left running: back to PitCrew, while the add goes on and its workspace shows up', async () => {
+    let finish: () => Promise<void> = async () => {};
+    desktop.add = (plan, channel) =>
+      new Promise((resolve) => {
+        const [copy = ''] = stepsOf(plan);
+        channel.send({ step: copy, state: 'running' });
+        finish = async () => {
+          desktop.daemons.set(NEW.id, fresh.daemon);
+          await desktop.setWorkspaces([NEW]);
+          channel.send({ step: 'add', state: 'done' });
+          resolve(NEW);
+        };
+      });
+    const router = renderApp();
+    await toReview();
+    fireEvent.click(button('Connect'));
+    await heading('Connecting hpc-login');
+    fireEvent.click(button('Leave it running'));
+    await screen.findByText('No workspaces yet.', undefined, PATIENCE);
+    expect(router.state.location.pathname).toBe('/');
+    expect(desktop.commands('gateway_remote_cancel')).toEqual([]);
+
+    // The add finishes in the gateway; its workspace is listed, and `/` opens it (to its setup).
+    await finish();
+    await vi.waitFor(() => expect(router.state.location.pathname).toBe(`/w/${NEW.id}/onboarding`), PATIENCE);
+  });
+
+  it('stops a running add after asking, through gateway_remote_cancel', async () => {
+    let fail: () => void = () => {};
+    desktop.add = (plan, channel) =>
+      new Promise((_resolve, reject) => {
+        const [copy = '', submit = ''] = stepsOf(plan);
+        channel.send({ step: copy, state: 'done' });
+        channel.send({ step: submit, state: 'running', detail: 'job 4242 pending (Priority)' });
+        fail = () => {
+          channel.send({ step: submit, state: 'failed', detail: 'Job 4242 cancelled.' });
+          channel.send({ step: 'add', state: 'failed', detail: 'Stopped at your request.' });
+          reject({ code: 'unreachable', message: 'cancelled' });
+        };
+      });
+    desktop.cancel = () => {
+      fail();
+      return Promise.resolve(null);
+    };
+    renderApp();
+    await toReview();
+    fireEvent.click(button('Connect'));
+    await heading('Connecting hpc-login');
+    fireEvent.click(button('Stop connecting…'));
+    // It asks first: keeping on sends nothing.
+    let confirm = await screen.findByRole('dialog', { name: 'Stop connecting hpc-login?' });
+    fireEvent.click(within(confirm).getByRole('button', { name: 'Keep connecting' }));
+    await vi.waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(desktop.commands('gateway_remote_cancel')).toEqual([]);
+
+    fireEvent.click(button('Stop connecting…'));
+    confirm = await screen.findByRole('dialog', { name: 'Stop connecting hpc-login?' });
+    fireEvent.click(within(confirm).getByRole('button', { name: 'Stop connecting' }));
+    const alert = await screen.findByRole('alert', undefined, PATIENCE);
+    expect(alert.textContent).toBe('Connecting was stopped: Job 4242 cancelled.');
+    expect(desktop.commands('gateway_remote_cancel')).toEqual([{ plan: 'plan-1' }]);
+    expect(button('Back to review')).toBeTruthy();
+  });
+
+  it('says so when the gateway cannot stop an add yet, and keeps waiting', async () => {
+    desktop.add = (plan, channel) => {
+      channel.send({ step: stepsOf(plan)[0] ?? '', state: 'running' });
+      return new Promise(() => {});
+    };
+    // FakeDesktop's default: "command gateway_remote_cancel not found", as an older gateway says.
+    renderApp();
+    await toReview();
+    fireEvent.click(button('Connect'));
+    await heading('Connecting hpc-login');
+    fireEvent.click(button('Stop connecting…'));
+    const confirm = await screen.findByRole('dialog', { name: 'Stop connecting hpc-login?' });
+    fireEvent.click(within(confirm).getByRole('button', { name: 'Stop connecting' }));
+    expect((await screen.findByRole('alert', undefined, PATIENCE)).textContent).toBe(
+      'This version of the desktop app cannot stop a connection yet. Leave it running, then remove the workspace once it shows up.',
+    );
+    expect(button('Leave it running')).toBeTruthy();
+    expect((button('Stop connecting…') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('shows a launch refused once under way as a failure, not as a new plan', async () => {
+    desktop.add = (plan, channel) => {
+      const [copy = '', submit = ''] = stepsOf(plan);
+      channel.send({ step: copy, state: 'done' });
+      channel.send({ step: submit, state: 'failed', detail: 'sbatch: error: invalid partition specified: gpu' });
+      return refuse('invalid', 'The launch was refused.');
+    };
+    renderApp();
+    await toReview();
+    fireEvent.click(button('Connect'));
+    const alert = await screen.findByRole('alert', undefined, PATIENCE);
+    expect(alert.textContent).toBe('Connecting failed at “Submit the job below”: sbatch: error: invalid partition specified: gpu');
+    expect(desktop.commands('gateway_remote_plan')).toHaveLength(1);
+    fireEvent.click(button('Back to review'));
+    await heading('Review: connect hpc-login');
+    await vi.waitFor(() => expect(screen.getByTestId('plan-steps').textContent).toContain('(plan-2)'));
+  });
+
+  it('warns when the job script holds invisible or direction-changing characters', async () => {
+    const tricky = `#!/bin/bash\nexec pitcrewd serve # ${String.fromCodePoint(0x202e)}lmao\r\n`;
+    desktop.plan = () => ({ plan: 'plan-1', steps: stepsOf('plan-1'), jobScript: tricky });
+    renderApp();
+    await toReview();
+    expect(screen.getByTestId('job-script').textContent).toBe(tricky);
+    expect((await screen.findByRole('alert')).textContent).toContain('direction-changing characters, carriage returns');
+  });
+
+  it('can leave the new hub to set up later', async () => {
+    desktop.add = addAsking();
+    const router = renderApp();
+    await toReview();
+    fireEvent.click(button('Connect'));
+    const dialog = await screen.findByRole('dialog', { name: 'hpc-login asks for a password' }, PATIENCE);
+    fireEvent.change(within(dialog).getByLabelText('Password'), { target: { value: SECRET } });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Send' }));
+    await heading('Set up hpc-login');
+    fireEvent.click(button('Set it up later'));
+    await vi.waitFor(() => expect(router.state.location.pathname).not.toBe('/connect'));
+    expect(fresh.setups).toEqual([]);
   });
 
   it("falls back on the whole add's detail when no step says why", async () => {
@@ -302,7 +438,12 @@ describe('connecting a remote machine', () => {
     expect(typed.getAttribute('aria-invalid')).toBe('true');
     fireEvent.change(typed, { target: { value: 'hpc login' } });
     fireEvent.click(button('Continue'));
-    expect((await screen.findByRole('alert')).textContent).toBe('A host cannot contain spaces or control characters.');
+    expect((await screen.findByRole('alert')).textContent).toBe(
+      'A host is a name from your ssh config, or user@host: letters, digits, ".", "_" and "-" only.',
+    );
+    fireEvent.change(typed, { target: { value: 'sam@-oProxyCommand=sh' } });
+    fireEvent.click(button('Continue'));
+    expect((await screen.findByRole('alert')).textContent).toBe('A host cannot start with "-".');
     expect(desktop.commands('gateway_remote_probe')).toEqual([]);
 
     fireEvent.change(typed, { target: { value: 'sam@server.example.org' } });

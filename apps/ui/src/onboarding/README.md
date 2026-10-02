@@ -32,17 +32,22 @@ Done**, then Home:
 
 - **Workspace** is `POST /v1/setup`: the workspace's name, your name, your handle (suggested from
   the first word of your name, `Sam Rivera` → `@sam`, until you type one), and this machine's name
-  (`This computer` until you give another: the webview cannot read the host name).
-- **Validation mirrors the contract** before anything is sent: names are trimmed and counted in
-  Unicode code points (1–80, 1–80, 1–60), the handle is `@` and 1–32 of `a-z 0-9 _ -` (not
-  trimmed), and nothing may hold a control character. Each problem shows by its field, which gets
-  focus.
+  (`This computer` until you give another: the webview cannot read the host name). A remote hub
+  sent here by the redirect is a remote machine: the field says so, and starts from the gateway's
+  name for it.
+- **Validation mirrors the contract** before anything is sent: names are trimmed (as JavaScript's
+  `trim` does, which the hub matches) and counted in Unicode code points (1–80, 1–80, 1–60), the
+  handle is `@` and 1–32 of `a-z 0-9 _ -` (not trimmed, and never `@office`, the back office's),
+  and nothing may hold a control character. Each problem shows by its field, which gets focus.
 - **The hub's refusals** show by the right field too: a `400` by the field its message names
   (otherwise above the buttons), a `409` for a taken handle by the handle. A `409` because the
   workspace was set up meanwhile goes Home: the data layer has already read the workspace again,
   so the shell does not send it back.
-- **Done** goes Home. The data layer turned `setup_needed` off in the cache when setup succeeded,
-  so there is no loop.
+- **Done** goes Home, replacing the wizard in the history. The data layer turned `setup_needed`
+  off in the cache when setup succeeded, so there is no loop.
+- A workspace that is set up already, opened at `/onboarding`, goes Home at once, unless this
+  visit is the one that set it up (its Done step is still to come) or the development flag asks
+  for the fake wizard.
 
 The other steps (machine check, helper install, sign-in, integrations, scan, create, import, hooks,
 safety) need routes that do not exist yet, so `createHubOnboardingApi` lists their calls in
@@ -63,8 +68,10 @@ desktop's "No workspaces yet" screen. It is a root route (`Feature.rootRoutes`),
 before any workspace exists. It drives the gateway's remote commands:
 
 1. **Host**: one from your ssh config (`discoverHosts`, the gateway's `sshHosts`), or typed. A host
-   is checked first: no leading `-` (ssh would read it as an option), no whitespace or control
-   characters.
+   is checked first against an allow-list: a name of letters, digits, `.`, `_` and `-`, optionally
+   after `user@`, or an IPv6 address in brackets, with no leading `-` in the user or the host (ssh
+   would read it as an option). Nothing else: no spaces, quotes, `%` tokens, shell characters, or
+   invisible and direction-changing characters.
 2. **Probe** (`remoteProbe`): the OS and architecture, whether PitCrew is there and running,
    SLURM's version and default partition, and tmux's version when the gateway gives it.
 3. **Launcher**: `direct`, `tmux` or `slurm`. SLURM only where the probe found it; tmux only from
@@ -73,21 +80,30 @@ before any workspace exists. It drives the gateway's remote commands:
    start from), account, QoS, time (`08:00:00`, `2-00:00:00`), CPUs, memory (`16G`) and GPUs
    (`2`, `a100:2`).
 4. **Review** (`remotePlan`): the plan's steps and, for SLURM, the exact `jobScript`, verbatim, in a
-   monospace block. "Nothing changes on the remote until you press Connect." A plan the gateway
-   refuses shows its message.
+   monospace block, with a warning when it holds direction-changing or zero-width characters or
+   carriage returns (what you read may not be what runs). "Nothing changes on the remote until you
+   press Connect." A plan the gateway refuses shows its message.
 5. **Connect** (`remoteAdd`): every step of the plan, each with its latest state and detail ("40%
    sent", "job 4242 pending (Priority)"); the last message, `add`, is the whole add's outcome. A
    SLURM job can wait in the queue for minutes: the wizard waits too, with no time limit of its
-   own. A failure shows its step and detail (else the whole add's), and "Back to review" gets a
-   fresh plan (a plan is used once). SSH's questions arrive meanwhile through the shell's prompt
-   dialog.
+   own. Meanwhile:
+   - **Leave it running** goes back to PitCrew; the add goes on in the gateway, and its workspace
+     shows up in the switcher when it is ready;
+   - **Stop connecting…** asks first, then calls `gateway_remote_cancel({ plan })`, which undoes
+     what the add started; a gateway without the command says so, and the add goes on.
+   A failure shows its step and detail (worked out from the progress, else the whole add's), and
+   "Back to review" gets a fresh plan (a plan is used once). SSH's questions arrive meanwhile
+   through the shell's prompt dialog.
 6. **Setup**: if the new workspace has `setup_needed`, the same setup form, against that workspace
-   through its own gateway transport (in its data scope).
+   through its own gateway transport (in its data scope). **Set it up later** leaves it: opening
+   the workspace later leads to its first run.
 7. **Done**: opens the new workspace.
 
 **A plan is never submitted without being shown.** Connect sends the plan on screen. When the
-gateway refuses it as `invalid` (expired after 10 minutes, already used, or a launch it refused),
-the wizard goes back to Review with a fresh plan and says why, and only another Connect sends it.
+gateway refuses it as `invalid` before anything started (expired after 10 minutes, or already
+used), the wizard goes back to Review with a fresh plan and says why, and only another Connect
+sends it. A launch refused once the add is under way is a failure like any other: its step and
+detail, and "Back to review".
 
 Every remote call starts from a button press, never from an effect, so React's development
 double-mount cannot make one twice (two password prompts, or one plan submitted twice). A late

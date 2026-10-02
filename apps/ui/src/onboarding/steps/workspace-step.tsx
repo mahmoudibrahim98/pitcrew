@@ -10,7 +10,7 @@ import { StepFooter } from '../step-footer.tsx';
 import { useWizard } from '../wizard-context.tsx';
 
 export function WorkspaceStep() {
-  const { state, patch, next } = useWizard();
+  const { state, patch, next, machineLabel } = useWizard();
   const api = useOnboardingApi();
   const router = useRouter();
   const ws = useWorkspaceId();
@@ -42,7 +42,8 @@ export function WorkspaceStep() {
         patch({ setupResult });
         next();
       }}
-      onAlreadySetUp={() => void router.navigate({ href: paths.home(ws) })}
+      onAlreadySetUp={() => void router.navigate({ href: paths.home(ws), replace: true })}
+      machineLabel={machineLabel}
       footer={(busy) => <StepFooter nextLabel="Continue" busy={busy} />}
     />
   );

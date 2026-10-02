@@ -25,12 +25,12 @@ import {
   type RemoteProbe,
   type RemoteProgress,
 } from '../../data/index.ts';
-import { Button, CheckIcon } from '../../design/index.ts';
+import { Button, CheckIcon, Dialog, DialogContent, DialogFooter } from '../../design/index.ts';
 import { cx } from '../../lib/cx.ts';
 import type { DiscoveredHost } from '../api.ts';
 import { createHubOnboardingApi } from '../hub-api.ts';
 import { SetupForm } from '../setup-form.tsx';
-import { checkCpus, checkHost, checkJobText, type SetupValues } from '../validation.ts';
+import { checkCpus, checkHost, checkJobText, scriptHazards, type SetupValues } from '../validation.ts';
 
 type Step = 'host' | 'probe' | 'launcher' | 'review' | 'connect' | 'setup' | 'done';
 
@@ -116,7 +116,11 @@ interface State {
   /** Why Review shows a fresh plan. */
   notice?: string | undefined;
   progress: RemoteProgress[];
-  failure?: { step?: string | undefined; detail: string } | undefined;
+  /** The add ended without a workspace: its error's message (the step and detail come from `progress`). */
+  failure?: { message: string; cancelled: boolean } | undefined;
+  /** The person asked to stop the add (`gateway_remote_cancel`), and why that did not work, if not. */
+  cancelling?: boolean | undefined;
+  cancelError?: string | undefined;
   workspace?: GatewayWorkspace | undefined;
   setup: SetupValues;
   handleEdited: boolean;
@@ -173,11 +177,18 @@ export function ConnectWizard({
   remote,
   onOpen,
   onCancel,
+  onLeave,
 }: {
   remote: RemoteGateway;
   /** Opens the new workspace. */
   onOpen(workspace: GatewayWorkspace): void;
+  /** Gives up before anything changed on the remote. */
   onCancel(): void;
+  /**
+   * Back to PitCrew while the add goes on in the gateway (its workspace shows up in the switcher
+   * when it is ready), or with the new hub left to set up later.
+   */
+  onLeave(): void;
 }) {
   const [state, setState] = useState<State>(INITIAL);
   const patch = (update: Partial<State>) => setState((s) => ({ ...s, ...update }));
@@ -226,9 +237,11 @@ export function ConnectWizard({
 
   async function connect(shown: RemotePlan, request: RemotePlanRequest) {
     const g = begin();
-    patch({ step: 'connect', progress: [], failure: undefined, notice: undefined });
+    let started = false;
+    patch({ step: 'connect', progress: [], failure: undefined, notice: undefined, cancelling: false, cancelError: undefined });
     try {
       const workspace = await remote.remoteAdd(shown.plan, (progress) => {
+        started = true;
         if (current(g)) setState((s) => ({ ...s, progress: merge(s.progress, progress) }));
       });
       if (current(g)) {
@@ -242,16 +255,29 @@ export function ConnectWizard({
       }
     } catch (error) {
       if (!current(g)) return;
-      if (error instanceof GatewayError && error.gateway === 'invalid') {
-        // Expired, used, or refused: back to Review with a fresh plan, shown before any Connect.
+      if (error instanceof GatewayError && error.gateway === 'invalid' && !started) {
+        // Refused before it started (expired, or already used): back to Review with a fresh plan,
+        // shown before any Connect. A launch refused once under way is a failure like any other.
         void plan(request, `The gateway refused that plan (${error.message}). Here is a fresh one: check it, then press Connect.`);
         return;
       }
-      setState((s) => {
-        // The step that failed, with its detail, else the whole add's ("add"), else the error's.
-        const failed = [...s.progress].reverse().find((p) => p.state === 'failed' && p.step !== ADD);
-        const whole = s.progress.find((p) => p.step === ADD);
-        return { ...s, failure: { step: failed?.step, detail: failed?.detail ?? whole?.detail ?? messageOf(error) } };
+      setState((s) => ({ ...s, failure: { message: messageOf(error), cancelled: s.cancelling === true }, cancelling: false }));
+    }
+  }
+
+  /** Stops the add on screen, after the person confirmed it; the add then ends `failed`. */
+  async function cancelAdd(shown: RemotePlan) {
+    patch({ cancelling: true, cancelError: undefined });
+    try {
+      await remote.remoteCancel(shown.plan);
+    } catch (error) {
+      const unknown =
+        (error instanceof GatewayError && error.gateway === 'invalid') || /not found|unknown command/i.test(messageOf(error));
+      patch({
+        cancelling: false,
+        cancelError: unknown
+          ? 'This version of the desktop app cannot stop a connection yet. Leave it running, then remove the workspace once it shows up.'
+          : `Could not stop it: ${messageOf(error)}`,
       });
     }
   }
@@ -334,6 +360,12 @@ export function ConnectWizard({
               heading={heading}
               onReview={() => void plan(request, 'The last plan was used. Here is a fresh one: check it, then press Connect.')}
               onCancel={onCancel}
+              onLeave={() => {
+                // The add goes on in the gateway; nothing here waits for it any more.
+                begin();
+                onLeave();
+              }}
+              onStop={() => state.plan !== undefined && void cancelAdd(state.plan)}
             />
           )}
           {state.step === 'setup' && state.workspace !== undefined && (
@@ -343,6 +375,7 @@ export function ConnectWizard({
               heading={heading}
               workspace={state.workspace}
               onDone={() => go('done')}
+              onLater={onLeave}
             />
           )}
           {state.step === 'done' && state.workspace !== undefined && (
@@ -765,6 +798,7 @@ function ReviewStep({
   onConnect(plan: RemotePlan): void;
 }) {
   const { plan, planError, notice } = state;
+  const hazards = plan?.jobScript === undefined ? [] : scriptHazards(plan.jobScript);
   return (
     <div>
       <Heading heading={heading}>Review: connect {state.host}</Heading>
@@ -794,6 +828,12 @@ function ReviewStep({
               >
                 {plan.jobScript}
               </pre>
+              {hazards.length > 0 && (
+                <p role="alert" className="mt-2 rounded-sm border border-risk bg-risk-soft px-3 py-2 text-sm text-ink">
+                  This script contains {hazards.join(', ')}: what you see above may not be what runs. Do not connect
+                  unless you know why they are there.
+                </p>
+              )}
             </>
           )}
           <p className="mt-4 text-sm font-medium text-ink">Nothing changes on the remote until you press Connect.</p>
@@ -833,13 +873,24 @@ function ConnectStep({
   heading,
   onReview,
   onCancel,
+  onLeave,
+  onStop,
 }: {
   state: State;
   heading: HeadingRef;
   onReview(): void;
   onCancel(): void;
+  onLeave(): void;
+  /** Stops the add (asked for, and confirmed). */
+  onStop(): void;
 }) {
   const { progress, failure } = state;
+  const [confirming, setConfirming] = useState(false);
+  // Worked out from the progress as it is now: the step that failed, with its detail, else the
+  // whole add's ("add"), else the error's.
+  const failedStep = [...progress].reverse().find((p) => p.state === 'failed' && p.step !== ADD);
+  const whole = progress.find((p) => p.step === ADD);
+  const failedDetail = failedStep?.detail ?? whole?.detail ?? failure?.message;
   // The plan's steps, in its order, each with its latest message; then any step it did not name.
   const planned = state.plan?.steps ?? [];
   const extra = progress.filter((p) => p.step !== ADD && !planned.includes(p.step)).map((p) => p.step);
@@ -870,18 +921,59 @@ function ConnectStep({
       </ol>
       {failure !== undefined && (
         <Alert>
-          {failure.step === undefined ? 'Connecting failed' : `Connecting failed at “${failure.step}”`}: {failure.detail}
+          {failure.cancelled
+            ? 'Connecting was stopped'
+            : failedStep === undefined
+              ? 'Connecting failed'
+              : `Connecting failed at “${failedStep.step}”`}
+          : {failedDetail}
         </Alert>
       )}
-      {failure !== undefined && (
+      {failure === undefined && state.cancelling === true && <Status>Stopping, and undoing what was started…</Status>}
+      {state.cancelError !== undefined && <Alert>{state.cancelError}</Alert>}
+      {failure !== undefined ? (
         <Footer>
           <Button variant="ghost" onClick={onCancel}>
-            Cancel
+            Close
           </Button>
           <Button variant="primary" onClick={onReview}>
             Back to review
           </Button>
         </Footer>
+      ) : (
+        <Footer>
+          <Button variant="ghost" disabled={state.cancelling === true} onClick={() => setConfirming(true)}>
+            Stop connecting…
+          </Button>
+          <Button onClick={onLeave}>Leave it running</Button>
+        </Footer>
+      )}
+      {failure === undefined && (
+        <p className="mt-2 text-xs text-ink-2">
+          Leave it running to go back to PitCrew: the connection goes on, and the workspace shows up in the switcher
+          when it is ready.
+        </p>
+      )}
+      {confirming && (
+        <Dialog open onOpenChange={(open) => !open && setConfirming(false)}>
+          <DialogContent
+            title={`Stop connecting ${state.host}?`}
+            description="PitCrew stops what it started there, such as the helper or a submitted job, and connects nothing."
+          >
+            <DialogFooter>
+              <Button onClick={() => setConfirming(false)}>Keep connecting</Button>
+              <Button
+                variant="primary"
+                onClick={() => {
+                  setConfirming(false);
+                  onStop();
+                }}
+              >
+                Stop connecting
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       )}
     </div>
   );
@@ -895,12 +987,15 @@ function SetupStep({
   heading,
   workspace,
   onDone,
+  onLater,
 }: {
   state: State;
   patch(update: Partial<State>): void;
   heading: HeadingRef;
   workspace: GatewayWorkspace;
   onDone(): void;
+  /** Leaves it for now: opening the workspace later leads to its first run. */
+  onLater(): void;
 }) {
   return (
     <div>
@@ -917,12 +1012,27 @@ function SetupStep({
       >
         <RemoteSetup state={state} patch={patch} onDone={onDone} />
       </WorkspaceScope>
+      {/* Also while the new workspace is still on its way. */}
+      <p className="mt-6 text-xs text-ink-2">
+        <button type="button" onClick={onLater} className="font-medium text-accent-text underline underline-offset-2">
+          Set it up later
+        </button>
+        : PitCrew asks again when you open {workspace.name}.
+      </p>
     </div>
   );
 }
 
 /** In the new workspace's data scope: sets it up through its own gateway transport, if it needs it. */
-function RemoteSetup({ state, patch, onDone }: { state: State; patch(update: Partial<State>): void; onDone(): void }) {
+function RemoteSetup({
+  state,
+  patch,
+  onDone,
+}: {
+  state: State;
+  patch(update: Partial<State>): void;
+  onDone(): void;
+}) {
   const info = useWorkspace().data;
   const gateway = useGatewayWorkspace();
   const setUp = useSetUp();

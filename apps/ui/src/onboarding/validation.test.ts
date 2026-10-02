@@ -9,6 +9,7 @@ import {
   checkSetup,
   codePoints,
   fieldOfMessage,
+  scriptHazards,
   suggestHandle,
   trimmedSetup,
   type SetupValues,
@@ -56,6 +57,7 @@ describe('setup', () => {
     ['@sam rivera', 'A handle is "@" and 1 to 32 lower-case letters, digits, "_" or "-".'],
     [' @sam', 'A handle is "@" and 1 to 32 lower-case letters, digits, "_" or "-".'],
     [`@${'a'.repeat(33)}`, 'A handle is "@" and 1 to 32 lower-case letters, digits, "_" or "-".'],
+    ['@office', '@office is the back office’s handle. Choose another.'],
   ])('checks the handle %j', (handle, message) => {
     expect(checkHandle(handle)).toBe(message);
   });
@@ -94,21 +96,56 @@ describe('setup', () => {
   });
 });
 
+const NOT_A_HOST = 'A host is a name from your ssh config, or user@host: letters, digits, ".", "_" and "-" only.';
+const RLO = String.fromCodePoint(0x202e);
+const ZWSP = String.fromCodePoint(0x200b);
+
 describe('a typed host', () => {
   it.each([
     ['hpc-login', undefined],
     ['sam@server.example.org', undefined],
+    ['sam_rivera@hpc-login.example.edu', undefined],
     ['10.0.0.7', undefined],
+    ['[2001:db8::7]', undefined],
+    ['sam@[2001:db8::7]', undefined],
     ['', 'Pick a host, or type one.'],
     ['-oProxyCommand=sh', 'A host cannot start with "-".'],
     ['-J', 'A host cannot start with "-".'],
-    ['hpc login', 'A host cannot contain spaces or control characters.'],
-    ['hpc\tlogin', 'A host cannot contain spaces or control characters.'],
-    ['hpc\nlogin', 'A host cannot contain spaces or control characters.'],
-    ['hpc\u0000', 'A host cannot contain spaces or control characters.'],
+    ['sam@-oProxyCommand=sh', 'A host cannot start with "-".'],
+    ['-oProxyCommand=sh@hpc-login', 'A user name cannot start with "-".'],
     ['h'.repeat(256), 'That host name is too long.'],
   ])('checks %j', (host, message) => {
     expect(checkHost(host)).toBe(message);
+  });
+
+  // Everything not on the allow-list: whitespace, ssh's % tokens, the shell's characters, quotes,
+  // globs, and characters that hide or reorder text.
+  it.each([
+    'hpc login',
+    'hpc\tlogin',
+    'hpc\nlogin',
+    `hpc${String.fromCodePoint(0)}`,
+    'hpc%h',
+    'hpc$HOME',
+    'hpc`id`',
+    'hpc;id',
+    'hpc|id',
+    'hpc&id',
+    "hpc'login",
+    'hpc"login',
+    'hpc\\login',
+    'hpc*',
+    'hpc?',
+    'hpc!',
+    `hpc${RLO}nigol`,
+    `hpc${ZWSP}login`,
+    `sam${ZWSP}@hpc-login`,
+    'sam@@hpc-login',
+    '@hpc-login',
+    'hpc-login@',
+    '[not-an-address]',
+  ])('refuses %j', (host) => {
+    expect(checkHost(host)).toBe(NOT_A_HOST);
   });
 
   it.each([
@@ -121,5 +158,19 @@ describe('a typed host', () => {
     ['four', 'CPUs is a whole number, 1 or more.'],
   ])('checks CPUs %j', (value, message) => {
     expect(checkCpus(value)).toBe(message);
+  });
+});
+
+describe('a job script', () => {
+  it('names what could make it read differently from what runs', () => {
+    expect(scriptHazards('#!/bin/bash\n#SBATCH --time=08:00:00\nexec pitcrewd serve\n')).toEqual([]);
+    expect(scriptHazards(`exec pitcrewd serve # ${RLO}evil`)).toEqual(['direction-changing characters']);
+    expect(scriptHazards(`exec pitcrewd${ZWSP} serve`)).toEqual(['zero-width characters']);
+    expect(scriptHazards('exec pitcrewd serve\r# hidden\n')).toEqual(['carriage returns']);
+    expect(scriptHazards(`${String.fromCodePoint(0x2066)}x${String.fromCodePoint(0xfeff)}\r\n`)).toEqual([
+      'direction-changing characters',
+      'zero-width characters',
+      'carriage returns',
+    ]);
   });
 });
