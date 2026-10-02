@@ -46,6 +46,11 @@ interface GatewayWorkspace {
 ```
 
 The gateway emits the Tauri event `gateway://workspaces` with the same list whenever it changes.
+
+`gateway_local_host() → { name: string }`: this computer's host name, for onboarding's default
+machine name (`POST /v1/setup`'s `machine_name`). Only its first label (no domain, no `.local`),
+cleaned like a workspace name (no control, bidi or invisible characters; whitespace collapsed), at
+most 60 characters; `"This computer"` when nothing is left. Main window only.
 The UI's `/w/$ws` routes use these ids. Adding, pairing and removing workspaces are later
 commands (onboarding, stream O).
 
@@ -226,6 +231,9 @@ is no longer wanted is withdrawn with the event `gateway://prompt-closed` `{ id 
   `(user@host)`) is `password` or `otp`, whatever its words say. The UI tells the person where the
   answer goes: to the host for `password` and `otp`, and nowhere off this computer for
   `passphrase`.
+- **ssh 8.4 or newer.** Older ssh does not mark the server's text, so the gateway shows and answers
+  no prompt for it: the call fails saying ssh 8.4 or newer is needed. Keys that need no prompt still
+  work.
 - **Prompts are held for the page.** A prompt raised before the page listens (a reconnect at
   launch) is held until the page first calls `gateway_workspaces`, and every open prompt is emitted
   again, with the same `id`, after a reload. The UI de-duplicates by `id`.
