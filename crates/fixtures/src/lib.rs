@@ -10,6 +10,8 @@
 //!   The mock hub serves its recap routes from them.
 //! - [`data_dir`]: the folder holding the JSON and the sample transcripts (`transcripts/claude`,
 //!   `transcripts/codex`, `transcripts/opencode`).
+//! - [`homes`]: a home folder of the test's own for every program a test starts, on every
+//!   platform, and the check that a command reaches no real home.
 //!
 //! **Everything here is made up.** Never add real transcripts, host names, paths or people. Real
 //! samples for local testing go in `data/private/`, which is ignored by git.
@@ -18,6 +20,8 @@
 //! (`s/0/contract-…`).
 
 #![forbid(unsafe_code)]
+
+pub mod homes;
 
 use pitcrew_protocol::events::Event;
 use pitcrew_protocol::ids::ProjectId;
