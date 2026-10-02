@@ -1290,11 +1290,13 @@ mod unix {
         assert!(matches!(err, HelperError::Busy(_)), "{err:?}");
         std::fs::remove_dir_all(&lock).unwrap();
 
-        // This host's lock whose pid or time cannot be read: judged by the directory's age too,
+        // This host's lock whose pid or time cannot be read, or whose owner file has more than
+        // one line (even naming a process that is gone): judged by the directory's age too,
         // waited for while fresh and broken once old.
         for owner in [
             format!("{} {} 00ff not-a-time\n", this_host(), std::process::id()),
             format!("{} not-a-pid 00ff {now}\n", this_host()),
+            format!("{} {} 00ff {now}\nmore\n", this_host(), dead_pid()),
         ] {
             private_dir(&lock);
             std::fs::write(lock.join("owner"), &owner).unwrap();

@@ -67,15 +67,24 @@ pc_where() {
   esac
 }
 
-# Whether this run holds the lock directory $1: its owner file is the one line this run wrote.
+# pc_owner DIR: the owner line of the lock directory DIR into pc_oline, and the line after it
+# into pc_orest (none, in a file this script wrote); both empty when there is no owner file.
 # Read with `read`, not `$(cat ...)`: once a write to a closed stdout has failed (the connection
 # dropped), bash 3.2, macOS's /bin/sh, keeps the bytes it could not write, and the subshell of a
-# command substitution writes them out as it exits, into the text compared. The clean-up would
-# then leave its own lock behind.
-pc_owns() {
-  [ -n "$pc_mine" ] && [ -f "$1/owner" ] || return 1
+# command substitution writes them out as it exits, into the text read. A lock would then not
+# be recognised: the clean-up would leave its own lock behind, and a stale one moved aside would
+# be put back rather than removed.
+pc_owner() {
   pc_oline= pc_orest=
-  { IFS= read -r pc_oline; IFS= read -r pc_orest; } 2>/dev/null < "$1/owner"
+  if [ -f "$1/owner" ]; then
+    { IFS= read -r pc_oline; IFS= read -r pc_orest; } 2>/dev/null < "$1/owner"
+  fi
+}
+
+# Whether this run holds the lock directory $1: its owner file is the one line this run wrote.
+pc_owns() {
+  [ -n "$pc_mine" ] || return 1
+  pc_owner "$1"
   [ "$pc_oline" = "$pc_mine" ] && [ -z "$pc_orest" ]
 }
 
@@ -275,19 +284,21 @@ pc_enter() {
 
 # --- Locks -------------------------------------------------------------------------------
 
-# pc_stale DIR MINUTES: whether the lock DIR may be broken; its owner line goes to pc_judged.
+# pc_stale DIR MINUTES: whether the lock DIR may be broken; its owner file goes to pc_judged
+# and pc_judged_rest (see pc_owner).
 # - Taken on this host (its name, whatever the id: see pc_host): when its process is gone, or
 #   it is older than MINUTES by this host's clock (the owner line records when it was taken).
-# - Taken elsewhere, with no owner line yet, or with a pid or time that cannot be read: another
-#   host's clock cannot be compared with this one, so only when the directory is older than
-#   MINUTES plus 10. Hosts sharing a home must keep their clocks, and the file server's, within
-#   10 minutes of each other.
+# - Taken elsewhere, with no owner line yet, or with a pid or time that cannot be read (or more
+#   than one line): another host's clock cannot be compared with this one, so only when the
+#   directory is older than MINUTES plus 10. Hosts sharing a home must keep their clocks, and the
+#   file server's, within 10 minutes of each other.
 pc_stale() {
-  pc_judged=$(cat "$1/owner" 2>/dev/null)
+  pc_owner "$1"
+  pc_judged=$pc_oline pc_judged_rest=$pc_orest
   pc_ohost=${pc_judged%% *}
+  pc_judged_here=0
   case $pc_judged in
-    *' '*) if pc_this_host "$pc_ohost"; then pc_judged_here=1; else pc_judged_here=0; fi ;;
-    *) pc_judged_here=0 ;;
+    *' '*) if [ -z "$pc_judged_rest" ] && pc_this_host "$pc_ohost"; then pc_judged_here=1; fi ;;
   esac
   case $pc_judged_here in
     1)
@@ -335,7 +346,8 @@ pc_lock() {
     if [ -d "$1" ] && pc_stale "$1" "$3"; then
       pc_aside=$1.stale.$pc_tag.$pc_waited
       if mv "$1" "$pc_aside" 2>/dev/null; then
-        if [ "$(cat "$pc_aside/owner" 2>/dev/null)" = "$pc_judged" ]; then
+        pc_owner "$pc_aside"
+        if [ "$pc_oline" = "$pc_judged" ] && [ "$pc_orest" = "$pc_judged_rest" ]; then
           rm -rf "$pc_aside"
         elif [ ! -e "$1" ]; then
           mv "$pc_aside" "$1" 2>/dev/null

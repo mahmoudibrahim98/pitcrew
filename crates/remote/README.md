@@ -172,9 +172,11 @@ let started = DirectLauncher::default().start(&target).await?;   // or TmuxLaunc
   killed deploy does not block the next one for long) or when it is older than the limit by
   this host's own clock. Another host's clock cannot be compared with this one, so a lock from
   another host (a login node sharing the home), without an owner line yet, or whose pid or
-  time cannot be read, is stale only when its directory is older than the limit plus 10
-  minutes: hosts sharing a home, and the file server, must agree on the time within 10
-  minutes. A stale lock is moved aside atomically and removed; if what was moved is not the
+  time cannot be read (or whose owner file has more than one line), is stale only when its
+  directory is older than the limit plus 10 minutes: hosts sharing a home, and the file
+  server, must agree on the time within 10 minutes. Owner files are read with `read`, never
+  `$(cat …)`, which bash 3.2 (macOS's `/bin/sh`) can fill with output it failed to write
+  earlier. A stale lock is moved aside atomically and removed; if what was moved is not the
   lock judged stale, it is put back while the name is free. Every step that changes
   something (sweeping, `chmod`, removing a damaged copy, the rename, the switch, GC; in the
   launchers removing old records, launching, writing `endpoint.json`, signalling, removing
