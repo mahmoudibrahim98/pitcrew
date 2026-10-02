@@ -72,6 +72,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [0-daemon-runtime](0-daemon-runtime.md) | 0 · Composition root | `integrator/daemon-runtime` | Opus-class | **Merged** |
 | [B-pty-runtime](B-pty-runtime.md) | B · Runtime | `s/B/pty-runtime` | Opus-class | **Merged** |
 | [0-windows-native](0-windows-native.md) | 0 · Contracts | `integrator/windows-native` | Opus-class | **Merged** |
+| [J-remote-followups](J-remote-followups.md) | J · Remote and HPC | `s/J/remote-followups` | Opus-class | Next (first cloud session) |
 | [0-daemon-solo](0-daemon-solo.md) | 0 · Composition root | `integrator/daemon-solo` | Opus-class | **Merged** |
 | [N-projects-wiring](N-projects-wiring.md) | N · Projects layout | `s/N/projects-wiring` | Sonnet-class | **Merged** |
 | [L-shell-polish](L-shell-polish.md) | L · UI foundation | `s/L/shell-polish` | Sonnet-class | **Merged** |
