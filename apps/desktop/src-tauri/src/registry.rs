@@ -193,6 +193,9 @@ struct Entry {
     state: WorkspaceState,
     detail: Option<String>,
     connector: Option<Arc<dyn Connector>>,
+    /// The [`Registry::claim_remote`] that put it in (0: none, it was loaded or is the local
+    /// workspace). Attaching another connector keeps it.
+    claim: u64,
 }
 
 /// Why [`Registry::claim_remote`] refused an id: another workspace holds it.
@@ -208,8 +211,8 @@ pub struct Taken {
 pub struct Claimed {
     id: String,
     previous: Option<Entry>,
-    /// The claim's own connector: its entry is the one at `id` with this connector.
-    connector: Arc<dyn Connector>,
+    /// The claim's generation: its entry is the one at `id` that carries it.
+    claim: u64,
 }
 
 impl fmt::Debug for Claimed {
@@ -233,6 +236,8 @@ struct Inner {
     /// The id and name the local daemon reported while a remote workspace held that id: taken
     /// once that remote is gone, unless the daemon's state changed meanwhile.
     refused_local: Option<(String, String)>,
+    /// The last claim's generation ([`Entry::claim`]).
+    claims: u64,
 }
 
 /// What registering the local workspace did.
@@ -293,6 +298,7 @@ impl Registry {
                 state: WorkspaceState::Connecting,
                 detail: None,
                 connector: None,
+                claim: 0,
             })
             .collect();
         Self {
@@ -466,11 +472,14 @@ impl Registry {
             }
         }
         let id = record.id.clone();
+        inner.claims += 1;
+        let claim = inner.claims;
         let entry = Entry {
             record,
             state,
             detail: None,
-            connector: Some(Arc::clone(&connector)),
+            connector: Some(connector),
+            claim,
         };
         let previous = match held {
             Some(at) => Some(std::mem::replace(&mut inner.entries[at], entry)),
@@ -486,22 +495,22 @@ impl Registry {
         Ok(Claimed {
             id,
             previous,
-            connector,
+            claim,
         })
     }
 
     /// Undoes [`Registry::claim_remote`]: the entry it replaced comes back, or the one it added
-    /// goes. Only while the entry at its id is still the claim's own (its connector): one that
-    /// was removed meanwhile stays removed, and one that replaced it stays.
+    /// goes. Only while the entry at its id is still the claim's own (its generation; attaching
+    /// another connector keeps it): one that was removed meanwhile stays removed, and one that
+    /// replaced it stays.
     pub fn unclaim(&self, claimed: Claimed) {
         let mut inner = self.lock();
         let before = list_of(&inner.entries);
-        let Some(at) = inner.entries.iter().position(|e| {
-            e.record.id == claimed.id
-                && e.connector
-                    .as_ref()
-                    .is_some_and(|c| Arc::ptr_eq(c, &claimed.connector))
-        }) else {
+        let Some(at) = inner
+            .entries
+            .iter()
+            .position(|e| e.record.id == claimed.id && e.claim == claimed.claim)
+        else {
             tracing::info!(workspace = %claimed.id, "the claim's entry is gone or replaced; nothing to undo");
             return;
         };
@@ -548,9 +557,30 @@ impl Registry {
 
     /// Sets a workspace's state.
     pub fn set_state(&self, id: &str, state: WorkspaceState, detail: Option<String>) {
+        self.set_state_of(id, None, state, detail);
+    }
+
+    /// Sets remote workspace `id`'s state; nothing if `id` is not a remote one's. What follows a
+    /// remote connection uses this, so a link that outlived its workspace cannot set the state of
+    /// the local workspace that took its id.
+    pub fn set_remote_state(&self, id: &str, state: WorkspaceState, detail: Option<String>) {
+        self.set_state_of(id, Some(WorkspaceKind::Remote), state, detail);
+    }
+
+    fn set_state_of(
+        &self,
+        id: &str,
+        kind: Option<WorkspaceKind>,
+        state: WorkspaceState,
+        detail: Option<String>,
+    ) {
         let mut inner = self.lock();
         let before = list_of(&inner.entries);
-        if let Some(entry) = inner.entries.iter_mut().find(|e| e.record.id == id) {
+        if let Some(entry) = inner
+            .entries
+            .iter_mut()
+            .find(|e| e.record.id == id && kind.is_none_or(|k| e.record.kind == k))
+        {
             entry.state = state;
             entry.detail = detail;
         }
@@ -580,6 +610,19 @@ impl Registry {
     /// Gives workspace `id` its connector (a remote workspace loaded from the file).
     pub fn attach(&self, id: &str, connector: Arc<dyn Connector>) {
         if let Some(entry) = self.lock().entries.iter_mut().find(|e| e.record.id == id) {
+            entry.connector = Some(connector);
+        }
+    }
+
+    /// Gives remote workspace `id` its connector; nothing if `id` is not a remote one's (the
+    /// local workspace that took its id back keeps the local daemon's).
+    pub fn attach_remote(&self, id: &str, connector: Arc<dyn Connector>) {
+        if let Some(entry) = self
+            .lock()
+            .entries
+            .iter_mut()
+            .find(|e| e.record.id == id && e.record.kind == WorkspaceKind::Remote)
+        {
             entry.connector = Some(connector);
         }
     }
@@ -724,6 +767,7 @@ fn register_local(inner: &mut Inner, id: &str, name: &str) -> Local {
                 state: WorkspaceState::Ready,
                 detail: None,
                 connector,
+                claim: 0,
             });
             true
         }
@@ -1160,9 +1204,18 @@ mod tests {
     }
 
     /// Undoing a claim touches only the claim's own entry: one removed meanwhile stays removed
-    /// (the entry it replaced does not come back), and one that replaced it stays.
+    /// (the entry it replaced does not come back), and one that replaced it stays. A connector
+    /// attached to it meanwhile (a retry) keeps it the claim's own.
     #[test]
     fn unclaim_touches_only_its_own_entry() {
+        let registry = Registry::in_memory();
+        let claimed = registry
+            .claim_remote(remote("01JA"), Arc::new(Nowhere), WorkspaceState::Ready)
+            .unwrap();
+        registry.attach("01JA", Arc::new(Nowhere));
+        registry.unclaim(claimed);
+        assert!(registry.list().is_empty(), "still its own: undone");
+
         let registry = Registry::in_memory();
         let mut first = remote("01JR");
         first.name = "First".into();
@@ -1192,6 +1245,27 @@ mod tests {
             .unwrap();
         registry.unclaim(claimed);
         assert_eq!(registry.record("01JR").unwrap().name, "Second");
+    }
+
+    /// A remote's state setter never touches the local workspace, even with the same id (a link
+    /// that outlived its remote, whose id the local workspace took back).
+    #[test]
+    fn a_remotes_state_never_lands_on_the_local_workspace() {
+        let registry = Registry::in_memory();
+        registry.attach_local(Arc::new(Nowhere));
+        registry.set_local("01JL", "Here").unwrap();
+        registry.set_remote_state(
+            "01JL",
+            WorkspaceState::Unreachable,
+            Some("a remote's".into()),
+        );
+        let local = registry.list().remove(0);
+        assert_eq!((local.state, local.detail), (WorkspaceState::Ready, None));
+        registry
+            .claim_remote(remote("01JR"), Arc::new(Nowhere), WorkspaceState::Ready)
+            .unwrap();
+        registry.set_remote_state("01JR", WorkspaceState::Connecting, None);
+        assert_eq!(registry.list()[1].state, WorkspaceState::Connecting);
     }
 
     #[test]
