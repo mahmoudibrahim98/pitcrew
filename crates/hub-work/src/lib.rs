@@ -86,7 +86,10 @@ pub use commands::{AnswerAsk, BriefEdit, NewAsk, NewComment, WorkstreamPatch};
 pub use dispatch::{DispatchError, DispatchRequest, Dispatcher, NewDispatch};
 pub use edits::{LABEL_CHARS, MAX_LABELS, TITLE_CHARS};
 pub use error::{INTERNAL_MESSAGE, Result, WorkError};
-pub use office::{Applied, BackOffice, OfficeCommands, OfficeRun, projections_with_office};
+pub use office::{
+    Applied, BackOffice, OFFICE_HANDLE, OFFICE_NAME, OfficeCommands, OfficeRun,
+    projections_with_office,
+};
 pub use pitcrew_protocol::api::{
     NewProject, NewTask, NewWorkstream, Setup, SetupDone, SetupPerson,
 };

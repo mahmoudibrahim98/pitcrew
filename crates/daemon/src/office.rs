@@ -1,11 +1,12 @@
 //! The back office: its member, `@office`, and the loop that applies what it decides.
 //!
 //! **Its member.** The office acts as an agent of the workspace, `@office`, owned by the
-//! workspace's owner (its first person, whom the device token also acts as). With `--demo` it is
-//! the demo's own `@office`, which the seed adds with everything else. Otherwise the daemon reuses
-//! the workspace's `@office` when it is an agent of that owner, and on the first start without one
-//! appends a `member_added` for it, authored by the owner ([`member`]). The office acts inside
-//! this process, through the hub's one `WorkService`, so it has no token.
+//! workspace's owner (its first person, whom the device token also acts as). It is found or added
+//! through the hub's one writer (`WorkService::ensure_office_member`): with `--demo` it is the
+//! demo's own `@office`, which the seed adds with everything else; otherwise the workspace's
+//! `@office` when it is an agent of that owner, else a new one, appended in a `member_added`
+//! authored by the owner, at the first start with a person or right after setup ([`start`]). The
+//! office acts inside this process, through the hub's one `WorkService`, so it has no token.
 //!
 //! **The loop** (hub-work's "Wiring"): subscribe to the store's appends, read the newest revision
 //! straight away, then run `WorkService::run_office` over every revision from the first one not
@@ -27,13 +28,10 @@
 
 use crate::state::{StateDir, read_json, remove, write_json};
 use anyhow::Context as _;
-use pitcrew_fixtures::DemoWorkspace;
-use pitcrew_hub_work::{BackOffice, OfficeRun, WorkError, WorkService};
+use pitcrew_hub_work::{BackOffice, OFFICE_HANDLE, OfficeRun, WorkError, WorkService};
 use pitcrew_office::ApplyError;
 use pitcrew_protocol::api::ErrorCode;
-use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::MemberId;
-use pitcrew_protocol::model::{Member, MemberKind, Workspace};
 use pitcrew_store::{RevRange, Store};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -45,10 +43,6 @@ use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-/// The back office's handle.
-pub const HANDLE: &str = "@office";
-/// Its display name, as in the demo.
-const NAME: &str = "Back office";
 /// How often, at most, `office.json` is rewritten while the office runs; progress is saved this
 /// long after a run at the latest.
 const SAVE_EVERY: Duration = Duration::from_secs(1);
@@ -57,93 +51,58 @@ const RETRY_FIRST: Duration = Duration::from_secs(1);
 /// The longest wait before trying a failed range again.
 const RETRY_MAX: Duration = Duration::from_secs(60);
 
-/// Who the back office acts as, as described in the [module docs](self): the demo's `@office`
-/// with `--demo`, else the workspace's `@office`, added now if there is none. Either way it must be
-/// an agent owned by the workspace's person who would own a new one (its first person).
+/// The back office of `work`'s store, ready to run, as described in the [module docs](self): it
+/// acts as `@office`, owned by `owner` (the workspace's person), found or added through `work`
+/// (`ensure_office_member`), and its run log is registered on the open store
+/// (`Store::register`, so a network filesystem's lease is never let go of). `fresh` (a store just
+/// seeded with `--demo`): the office looks at it from the first revision (see [`Office::new`]).
 ///
-/// The `member_added` is appended straight to `store`, before the hub's `WorkService` exists and
-/// before anything is served, so it races with no other writer. (The work model has no command for
-/// adding a member yet.)
+/// Runs at start, before anything is served, and once a fresh workspace is set up, while the hub
+/// serves: the member is added through the one writer either way.
 ///
-/// `None`, logged, when the office cannot run: the workspace has no person yet to own it, or
-/// `@office` is a person, an agent of someone else, or an agent of no one.
+/// `None`, logged, when the office cannot run: no `owner` yet (a workspace not set up), or
+/// `@office` is a person, an agent of someone else, or an agent of no one. Its progress
+/// (`office.json`) is then forgotten.
 ///
 /// # Errors
-/// The store cannot be read or appended to.
-pub fn member(
-    store: &Store,
-    workspace: &Workspace,
-    demo: Option<&DemoWorkspace>,
-) -> anyhow::Result<Option<MemberId>> {
-    let members = match demo {
-        Some(demo) => demo.members.clone(),
-        None => store
-            .read(pitcrew_hub_work::query::members)
-            .context("cannot list the members")?,
-    };
-    let owner = members.iter().find(|m| m.kind == MemberKind::Human);
-    if let Some(found) = members.iter().find(|m| m.handle == HANDLE) {
-        return Ok(reusable(found, owner));
-    }
-    if demo.is_some() {
-        tracing::warn!("the demo workspace has no {HANDLE}, so the back office is off");
-        return Ok(None);
-    }
+/// The store cannot be read or appended to, or the run log cannot be registered.
+pub fn start(
+    state: &StateDir,
+    work: &WorkService,
+    owner: Option<MemberId>,
+    fresh: bool,
+) -> anyhow::Result<Option<Office>> {
     let Some(owner) = owner else {
         tracing::warn!(
             "the workspace has no person yet to own the back office's member, so the back \
-             office is off; it starts on the first start after one is added"
+             office is off; it starts once the workspace is set up"
         );
+        forget(state);
         return Ok(None);
     };
-    let office = Member {
-        id: MemberId::new(),
-        kind: MemberKind::Agent,
-        handle: HANDLE.to_owned(),
-        name: NAME.to_owned(),
-        owner: Some(owner.id),
-        persona: None,
+    let member = match work.ensure_office_member(owner) {
+        Ok(member) => member,
+        Err(e) if e.code() == ErrorCode::Conflict => {
+            tracing::warn!(error = %e, "the back office is off: {OFFICE_HANDLE} cannot be it");
+            forget(state);
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(
+                anyhow::Error::new(e).context("cannot find or add the back office's member")
+            );
+        }
     };
-    let id = office.id;
-    let added = Event::now(
-        workspace.id,
-        owner.id,
-        EventBody::MemberAdded { member: office },
-    );
+    tracing::info!(member = %member.id, %owner, "the back office's member is {OFFICE_HANDLE}");
+    // Built once: its run log in the store and `run_office` must use the same settings.
+    let office = Arc::new(BackOffice::new(member.id));
+    let store = work.store();
+    // On the store as it is open. The run log catches up as it would at an open, over a
+    // `member_added` just appended too.
     store
-        .append(&[added])
-        .context("cannot add the back office's member")?;
-    tracing::info!(member = %id, owner = %owner.handle, "added the back office's member {HANDLE}");
-    Ok(Some(id))
-}
-
-/// The member that holds `@office`, if it can be the back office: an agent owned by `owner`, the
-/// workspace's person who would own a new one. Otherwise `None`, logged: the office stays off
-/// rather than act as a person, for someone else, or for no one.
-fn reusable(found: &Member, owner: Option<&Member>) -> Option<MemberId> {
-    let expected = owner.map(|o| o.id);
-    match found.kind {
-        MemberKind::Agent if found.owner.is_some() && found.owner == expected => Some(found.id),
-        MemberKind::Agent => {
-            let name =
-                |id: Option<MemberId>| id.map_or_else(|| "no one".to_owned(), |m| m.to_string());
-            tracing::warn!(
-                member = %found.id,
-                owner = %name(found.owner),
-                expected = %name(expected),
-                "{HANDLE} is an agent of someone other than the workspace's person, so the back \
-                 office is off"
-            );
-            None
-        }
-        MemberKind::Human => {
-            tracing::warn!(
-                member = %found.id,
-                "{HANDLE} is a person in this workspace, so the back office is off"
-            );
-            None
-        }
-    }
+        .register(Box::new(office.run_log()))
+        .context("cannot add the back office's run log to the store")?;
+    Office::new(office, state, store, fresh).map(Some)
 }
 
 /// Forgets where the back office got to, for a start without it: the next start with it begins at
@@ -284,7 +243,7 @@ impl Office {
             member = %office.member(),
             from = last + 1,
             latest,
-            "the back office acts as {HANDLE}"
+            "the back office acts as {OFFICE_HANDLE}"
         );
         Ok(Self {
             office,
@@ -323,6 +282,16 @@ pub struct Running {
 }
 
 impl Running {
+    /// A loop that does nothing but wait to be stopped, on the current runtime.
+    #[cfg(test)]
+    pub fn idle() -> Self {
+        let (stop, mut stopped) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let _ = stopped.changed().await;
+        });
+        Self { stop, task }
+    }
+
     /// Stops the loop and waits for it, at most `within`. A run in progress finishes first; then
     /// where the office got to is saved.
     pub async fn stop(self, within: Duration) {
@@ -616,38 +585,6 @@ mod tests {
         std::fs::remove_dir(state.office()).unwrap();
         assert!(progress.save(7));
         assert_eq!(progress.read(), Some(7));
-    }
-
-    fn person(handle: &str) -> Member {
-        Member {
-            id: MemberId::new(),
-            kind: MemberKind::Human,
-            handle: handle.to_owned(),
-            name: handle.trim_start_matches('@').to_owned(),
-            owner: None,
-            persona: None,
-        }
-    }
-
-    fn agent(owner: Option<&Member>) -> Member {
-        Member {
-            kind: MemberKind::Agent,
-            owner: owner.map(|o| o.id),
-            ..person(HANDLE)
-        }
-    }
-
-    #[test]
-    fn only_an_agent_of_the_workspaces_person_is_reused() {
-        let lee = person("@lee");
-        let kim = person("@kim");
-        let ours = agent(Some(&lee));
-        assert_eq!(reusable(&ours, Some(&lee)), Some(ours.id));
-        // Someone else's agent, no one's, a person, or no person to compare with: off.
-        assert_eq!(reusable(&agent(Some(&kim)), Some(&lee)), None);
-        assert_eq!(reusable(&agent(None), Some(&lee)), None);
-        assert_eq!(reusable(&person(HANDLE), Some(&lee)), None);
-        assert_eq!(reusable(&ours, None), None);
     }
 
     #[test]

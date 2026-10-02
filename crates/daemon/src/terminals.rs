@@ -5,7 +5,8 @@
 //! - A session on another machine is `503 unavailable`: this hub reaches no other machine yet.
 //! - A session on this machine is the runner's to answer (`RunnerTerminals`): `404` while it has
 //!   no terminal, which is every session today (see [`NoRuntime`]).
-//! - Without a runner (`--no-runner`), every known session is `503 unavailable`.
+//! - Without a runner (`--no-runner`, or before a fresh workspace is set up), every known session
+//!   is `503 unavailable`.
 //!
 //! **The runtime.** `crates/runtime` holds tmux control mode's building blocks (its parser,
 //! command builder and replay buffer) but no `Runtime` yet: `TmuxRuntime` and the PTY runtime are
@@ -13,29 +14,29 @@
 //! starts nothing and reaches nothing, so no session has a terminal here. Swapping in the real
 //! runtime (tmux where present, else the PTY one) is one line in `Runner::terminals`.
 
+use crate::runner::Attached;
 use pitcrew_api::{Attachment, TerminalError, Terminals};
 use pitcrew_hub_work::WorkService;
 use pitcrew_interfaces::runtime::{
     OutputChunk, Runtime, RuntimeError, RuntimeKind, Screen, StartSpec, TerminalInfo,
 };
 use pitcrew_protocol::api::ErrorCode;
-use pitcrew_protocol::ids::{MachineId, SessionId, TerminalId};
+use pitcrew_protocol::ids::{SessionId, TerminalId};
 use pitcrew_protocol::runner::Key;
-use pitcrew_runner::RunnerTerminals;
 use std::sync::Arc;
 
 /// Sessions' terminals: the hub decides whose they are, the runner finds them.
 #[derive(Debug)]
 pub struct SessionTerminals {
     work: Arc<WorkService>,
-    /// The runner's machine and its terminals; `None` without a runner.
-    runner: Option<(MachineId, RunnerTerminals)>,
+    /// The runner, once it runs: its machine and its terminals.
+    runner: Arc<Attached>,
 }
 
 impl SessionTerminals {
-    /// Terminals of the sessions `work` knows, found by the runner on `machine`.
+    /// Terminals of the sessions `work` knows, found by the runner on its machine once it runs.
     #[must_use]
-    pub fn new(work: Arc<WorkService>, runner: Option<(MachineId, RunnerTerminals)>) -> Self {
+    pub fn new(work: Arc<WorkService>, runner: Arc<Attached>) -> Self {
         Self { work, runner }
     }
 }
@@ -54,16 +55,16 @@ impl Terminals for SessionTerminals {
                 ));
             }
         };
-        match &self.runner {
+        match self.runner.get() {
             None => Err(TerminalError::Unavailable(format!(
                 "Session {session} has no terminal here: no runner is attached to this hub."
             ))),
-            Some((machine, _)) if found.machine != *machine => {
+            Some(runner) if found.machine != runner.machine => {
                 Err(TerminalError::Unavailable(format!(
                     "Session {session} runs on another machine, which this hub cannot reach yet."
                 )))
             }
-            Some((_, terminals)) => terminals.attach(session),
+            Some(runner) => runner.terminals.attach(session),
         }
     }
 }
@@ -127,8 +128,10 @@ impl Runtime for NoRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runner::Parts;
+    use crate::transcripts::Found;
     use pitcrew_protocol::events::{Event, EventBody};
-    use pitcrew_protocol::ids::{MemberId, WorkspaceId};
+    use pitcrew_protocol::ids::{MachineId, MemberId, WorkspaceId};
     use pitcrew_protocol::model::{Engine, Session, SessionState, Workspace};
     use pitcrew_runner::{EventSink, RunnerConfig, SinkError};
     use pitcrew_store::{Store, StoreOptions};
@@ -210,17 +213,29 @@ mod tests {
             Arc::new(Nowhere),
         )
         .unwrap();
-        let runner_terminals = runner.terminals(Arc::new(NoRuntime)).unwrap();
+        let parts = Parts {
+            machine: here,
+            hooks: runner.hooks(),
+            terminals: runner.terminals(Arc::new(NoRuntime)).unwrap(),
+            found: Arc::new(Found::default()),
+            watches: false,
+        };
 
-        let with = SessionTerminals::new(Arc::clone(&work), Some((here, runner_terminals)));
+        let with =
+            SessionTerminals::new(Arc::clone(&work), Arc::new(Attached::with(parts.clone())));
         assert_eq!(code(with.attach(SessionId::new())), "not_found");
         assert_eq!(code(with.attach(remote.id)), "unavailable");
         // This machine's session has no terminal.
         assert_eq!(code(with.attach(local.id)), "not_found");
 
-        let without = SessionTerminals::new(work, None);
+        // Without a runner yet, then with one attached later (a hub set up while it runs).
+        let attached = Arc::new(Attached::default());
+        let without = SessionTerminals::new(work, Arc::clone(&attached));
         assert_eq!(code(without.attach(SessionId::new())), "not_found");
         assert_eq!(code(without.attach(local.id)), "unavailable");
+        assert_eq!(code(without.attach(remote.id)), "unavailable");
+        attached.set(parts);
+        assert_eq!(code(without.attach(local.id)), "not_found");
         assert_eq!(code(without.attach(remote.id)), "unavailable");
         runner.stop();
     }

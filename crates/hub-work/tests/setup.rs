@@ -200,6 +200,57 @@ async fn a_handle_clash_gives_409_even_without_a_person_yet() {
     assert_eq!(work.members().expect("members").len(), 1);
 }
 
+/// `@office` is reserved for the back office (api-v1.md, "The first run"): always taken, even on
+/// a hub whose back office has no member yet; a `400` still comes before it.
+#[tokio::test]
+async fn office_is_reserved_even_before_the_back_office_exists() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let work = fresh(dir.path());
+    let app = app(&work);
+    assert!(work.members().expect("members").is_empty());
+    let caller = device(MemberId::new());
+    let (ws, name, handle, machine) = GOOD;
+
+    let reserved = call(
+        &app,
+        Some(caller),
+        "POST",
+        "/v1/setup",
+        Some(body(ws, name, "@office", machine)),
+    )
+    .await;
+    expect(&reserved, 409);
+    assert!(
+        reserved.1["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("reserved")),
+        "{}",
+        reserved.1
+    );
+    let malformed = call(
+        &app,
+        Some(caller),
+        "POST",
+        "/v1/setup",
+        Some(body(ws, name, "@office", &"x".repeat(61))),
+    )
+    .await;
+    expect(&malformed, 400);
+    assert!(work.members().expect("members").is_empty());
+    assert!(work.machines().expect("machines").is_empty());
+
+    // Any other handle still sets the workspace up.
+    let done = call(
+        &app,
+        Some(caller),
+        "POST",
+        "/v1/setup",
+        Some(body(ws, name, handle, machine)),
+    )
+    .await;
+    expect(&done, 200);
+}
+
 #[tokio::test]
 async fn a_workspace_with_only_an_agent_still_needs_setup_and_accepts_a_different_handle() {
     let dir = tempfile::tempdir().expect("tempdir");

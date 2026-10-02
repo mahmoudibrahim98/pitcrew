@@ -418,6 +418,17 @@ async fn without_any_folder_a_dispatch_runs_on_the_hubs_machine() {
         202,
     );
     assert_eq!(runner.calls()[0].machine, LAPTOP.parse().expect("m"));
+    // Set later on the shared service (a hub set up while it runs), it is used from then on.
+    other.set_hub_machine(CLUSTER.parse().expect("machine"));
+    expect(
+        &dispatch(&other, "BARE-1", json!({ "agent": REVIEWER })).await,
+        202,
+    );
+    let calls = runner.calls();
+    assert_eq!(
+        (calls[1].machine, calls[1].cwd.as_str()),
+        (CLUSTER.parse().expect("m"), "~")
+    );
 }
 
 #[tokio::test]

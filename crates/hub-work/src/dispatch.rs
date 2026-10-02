@@ -27,7 +27,8 @@
 //!
 //! **Where it runs.** The machine is the request's `machine`, else the machine of the task's
 //! workstream's first location, else the project's root, else the hub's own machine. The daemon
-//! must name that one with [`WorkService::with_hub_machine`]: without it, a dispatch with nowhere
+//! must name that one with [`WorkService::with_hub_machine`] (or, for a hub set up while it runs,
+//! [`WorkService::set_hub_machine`]): without it, a dispatch with nowhere
 //! else to run answers `503` rather than guessing among the workspace's machines. The folder is
 //! the first of those locations on that machine, or `~` when none is. The engine, model and
 //! permission mode come from the agent's persona (Claude Code by default).
@@ -248,7 +249,7 @@ impl WorkService {
     }
 
     /// The machine of the first location, else the hub's own machine
-    /// ([`WorkService::with_hub_machine`]); `unavailable` when there is neither.
+    /// ([`WorkService::set_hub_machine`]); `unavailable` when there is neither.
     fn default_machine(&self, conn: &Connection, locations: &[Location]) -> Result<Machine> {
         if let Some(location) = locations.first() {
             return query::machine(conn, &location.machine)?.ok_or_else(|| {

@@ -74,8 +74,10 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
 - **The first run** (`POST /v1/setup`, "Fresh mode" above). `GET /v1/workspace` answers
   `setup_needed: true` while the workspace has no person. In demo mode setup always answers 409; in
   fresh mode it validates `workspace_name`, `person.name`, `person.handle` and `machine_name`
-  exactly as the contract says (lengths, the handle's shape, no control characters), answers 409
-  once already set up or on a handle clash, and otherwise appends `member_added` and
+  exactly as the contract says (the three names trimmed with `String.prototype.trim`, then
+  counted in code points and stored trimmed; the handle's shape, not trimmed; no control
+  characters), answers 409 once already set up, on a handle clash, or for `@office` (reserved for
+  the back office, though the mock has none), and otherwise appends `member_added` and
   `machine_added` for the device token's own member, so it and `GET /v1/me` mean that person from
   then on.
 - **Auth and scopes.** Agent tokens reach only routes marked **agent**. They read the whole
