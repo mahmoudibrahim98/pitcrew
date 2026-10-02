@@ -74,7 +74,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [0-windows-native](0-windows-native.md) | 0 · Contracts | `integrator/windows-native` | Opus-class | **Merged** |
 | [J-remote-followups](J-remote-followups.md) | J · Remote and HPC | `s/J/remote-followups` | Opus-class | **Merged** (PR #6) |
 | [0-ci-green](0-ci-green.md) | 0 · Contracts | `integrator/ci-green` | Opus-class | **Merged** (PR #8) |
-| [B-tmux-compat](B-tmux-compat.md) | B · Runtime | `s/B/tmux-compat` | Opus-class | In progress (cloud) |
+| [B-tmux-compat](B-tmux-compat.md) | B · Runtime | `s/B/tmux-compat` | Opus-class | **Merged** (PR #7) |
 | [0-daemon-pty](0-daemon-pty.md) | 0 · Composition root | `integrator/daemon-pty` | Opus-class | Next (cloud) |
 | [P-desktop-bundle](P-desktop-bundle.md) | P · Packaging | `integrator/desktop-bundle` | Opus-class | Next (cloud) |
 | [P-measure](P-measure.md) | P · Packaging | `s/P/measure` | Sonnet-class | Next (cloud) |
