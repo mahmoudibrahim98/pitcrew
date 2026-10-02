@@ -40,6 +40,8 @@ pub mod id {
     pub const SES2: &str = "01JB000000000000000SES0002";
     /// The demo's own machine, "This laptop": the runner's.
     pub const LAPTOP: &str = "01JB000000000000000MCH0001";
+    /// The demo's cluster: a machine of the workspace this hub cannot reach.
+    pub const CLUSTER: &str = "01JB000000000000000MCH0002";
     pub const REVIEWER: &str = "01JB000000000000000MEM0004";
     pub const SES_UNKNOWN: &str = "01JB000000000000000SES0099";
     /// PAP-1's active dispatch (@writer, session 1).
@@ -100,13 +102,18 @@ impl Daemon {
 
     /// As [`Daemon::start_on`], but returns how it failed.
     pub fn try_start_on(state: &Path, listen: &str, extra: &[&str]) -> Result<Self, Refused> {
-        Self::try_start_with(state, listen, extra, &[])
+        Self::try_start_with(state, listen, extra, &[], Tmux::Refused)
     }
 
-    /// As [`Daemon::start`], with these environment variables too (e.g. [`TMUX_SOCKET`] for a
-    /// usable tmux socket, or `PATH`).
-    pub fn start_with(state: &Path, extra: &[&str], env: &[(&str, OsString)]) -> Self {
-        Self::try_start_with(state, "tcp:127.0.0.1:0", extra, env).unwrap_or_else(|refused| {
+    /// As [`Daemon::start`], with these environment variables too (e.g. `PATH`), and `tmux` for
+    /// its terminals' tmux socket.
+    pub fn start_with(
+        state: &Path,
+        extra: &[&str],
+        env: &[(&str, OsString)],
+        tmux: Tmux<'_>,
+    ) -> Self {
+        Self::try_start_with(state, "tcp:127.0.0.1:0", extra, env, tmux).unwrap_or_else(|refused| {
             panic!(
                 "pitcrewd did not start ({}):\n{}",
                 refused.status, refused.stderr
@@ -114,12 +121,14 @@ impl Daemon {
         })
     }
 
-    /// As [`Daemon::start_on`], with these environment variables too; returns how it failed.
+    /// As [`Daemon::start_on`], with these environment variables too, and `tmux` for its
+    /// terminals' tmux socket; returns how it failed.
     pub fn try_start_with(
         state: &Path,
         listen: &str,
         extra: &[&str],
         env: &[(&str, OsString)],
+        tmux: Tmux<'_>,
     ) -> Result<Self, Refused> {
         let started = Instant::now();
         let mut command = Command::new(PITCREWD);
@@ -130,7 +139,26 @@ impl Daemon {
             .args(extra)
             .env("PITCREW_LOG", "debug");
         private_homes(&mut command, state);
-        private_tmux(&mut command, state);
+        match tmux {
+            Tmux::Refused => {
+                command.arg("--tmux-socket").arg(refused_tmux_socket(state));
+            }
+            Tmux::At(socket) => {
+                command.arg("--tmux-socket").arg(socket);
+            }
+            // The state directory's own socket, under the runtime's per-user directory, which
+            // must then be the test's own: `TMUX_TMPDIR`, a private directory of the test's.
+            Tmux::StateDefault => {
+                let own = env
+                    .iter()
+                    .find(|(name, _)| *name == "TMUX_TMPDIR")
+                    .is_some_and(|(_, dir)| Path::new(dir).starts_with(std::env::temp_dir()));
+                assert!(
+                    own,
+                    "a daemon on its default tmux socket needs a TMUX_TMPDIR of its own"
+                );
+            }
+        }
         for (name, value) in env {
             command.env(name, value);
         }
@@ -424,19 +452,21 @@ fn private_homes<'a>(command: &'a mut Command, state: &Path) -> &'a mut Command 
         .env_remove("XDG_DATA_HOME")
 }
 
-/// The variable that sets the daemon's tmux socket.
-pub const TMUX_SOCKET: &str = "PITCREW_TMUX_SOCKET";
-
-/// **Never the real tmux socket.** Without [`TMUX_SOCKET`], a daemon's terminals would use
-/// PitCrew's default socket, where a real PitCrew's terminals live. Every daemon a test starts
-/// therefore gets a socket whose directory is refused (its parent does not exist), so tmux is not
-/// used and the daemon serves with no terminal runtime, as on a machine without tmux. A test that
-/// wants tmux passes a private socket of its own (`tests/terminals.rs`).
-fn private_tmux<'a>(command: &'a mut Command, state: &Path) -> &'a mut Command {
-    command.env(TMUX_SOCKET, refused_tmux_socket(state))
+/// **Never a real tmux socket.** A test daemon's terminals' tmux socket:
+#[derive(Clone, Copy, Debug)]
+pub enum Tmux<'a> {
+    /// The default for every test daemon: a socket whose directory is refused (its parent does
+    /// not exist), so tmux is not used and the daemon serves with no terminal runtime, as on a
+    /// machine without tmux.
+    Refused,
+    /// A private socket of the test's own (`--tmux-socket`).
+    At(&'a Path),
+    /// The state directory's own default socket, under the runtime's per-user directory, which
+    /// the test must point at a private directory of its own with `TMUX_TMPDIR` (checked).
+    StateDefault,
 }
 
-/// The socket [`private_tmux`] gives a daemon on `state`: in a folder whose parent does not
+/// The socket [`Tmux::Refused`] gives a daemon on `state`: in a folder whose parent does not
 /// exist, which the runtime refuses without making anything.
 pub fn refused_tmux_socket(state: &Path) -> PathBuf {
     let mut dir = state.as_os_str().to_owned();

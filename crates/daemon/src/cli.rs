@@ -111,6 +111,11 @@ pub struct ServeArgs {
     /// session has a terminal here.
     #[arg(long)]
     pub no_runner: bool,
+
+    /// For tests and development only: the runner's tmux server's socket, instead of this state
+    /// directory's own. Its directory must be private (it is made 0700 if missing).
+    #[arg(long, value_name = "PATH", hide = true)]
+    pub tmux_socket: Option<PathBuf>,
 }
 
 /// One `--homes` value.
@@ -296,6 +301,24 @@ mod tests {
         assert!(!args.no_office, "the back office is on by default");
         assert!(!args.no_runner, "the runner is on by default");
         assert!(args.homes.is_empty());
+        assert!(
+            args.tmux_socket.is_none(),
+            "the state directory's own socket"
+        );
+    }
+
+    /// `--tmux-socket` is for tests and development: it parses, and help does not show it.
+    #[test]
+    fn the_tmux_socket_option_is_hidden() {
+        let cli = Cli::try_parse_from(["pitcrewd", "serve", "--tmux-socket", "/tmp/x/s"]).unwrap();
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("not serve");
+        };
+        assert_eq!(args.tmux_socket, Some(PathBuf::from("/tmp/x/s")));
+        let mut command = Cli::command();
+        let serve = command.find_subcommand_mut("serve").unwrap();
+        let help = serve.render_long_help().to_string();
+        assert!(!help.contains("tmux-socket"), "{help}");
     }
 
     #[test]

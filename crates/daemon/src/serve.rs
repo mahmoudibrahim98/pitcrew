@@ -114,7 +114,10 @@ pub fn serve(state: &StateDir, args: &ServeArgs) -> anyhow::Result<ExitCode> {
     let terminals = if args.no_runner {
         TerminalRuntime::none()
     } else {
-        runtime.block_on(TerminalRuntime::choose(crate::runtime::socket_from_env()))
+        runtime.block_on(TerminalRuntime::choose(
+            state.root(),
+            args.tmux_socket.clone(),
+        ))
     };
     let runner = match &homes {
         None => {

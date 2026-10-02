@@ -6,8 +6,9 @@
 //!
 //! - `pitcrewd serve [--listen private|tcp:127.0.0.1:<port>] [--demo] [--no-office]
 //!   [--homes <dir>…] [--no-runner]`: see [`serve`], [`office`] and [`runner`]; the runner's
-//!   terminals run in tmux where it is usable ([`runtime`]; `PITCREW_TMUX_SOCKET` sets its socket
-//!   for tests and development). A fresh hub is set up once, while it serves ([`setup`]).
+//!   terminals run in tmux where it is usable, one server per state directory ([`runtime`]; the
+//!   hidden `--tmux-socket` names another, for tests and development). A fresh hub is set up
+//!   once, while it serves ([`setup`]).
 //! - `pitcrewd init --workspace <name> --name <person> --handle <@handle> --machine <name>`: sets
 //!   a fresh hub up through the running daemon ([`init`]).
 //! - `pitcrewd connect --socket <path> [--framed] [--nonce <hex>]`: the stdio bridge to a daemon's
