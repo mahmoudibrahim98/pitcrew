@@ -6,7 +6,9 @@ Remote machines: SSH connection manager, helper deployment, launchers (direct, t
 
 ## What is here
 
-Everything goes through the user's own **system OpenSSH** and `~/.ssh/config`.
+Everything goes through the user's own **system OpenSSH** and `~/.ssh/config`. `~` is `HOME`
+on Unix; on Windows it is `USERPROFILE` (where Windows' own OpenSSH looks), else `HOME`, for
+`~/.ssh/config` and `~/.pitcrew/sites` alike.
 
 - `list_hosts()` lists concrete `Host` names from `~/.ssh/config` and its `Include`s (cycles
   skipped, at most 256 files). `Ssh::resolve(host)` asks `ssh -G` what a host means; the config

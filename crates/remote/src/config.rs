@@ -4,6 +4,7 @@
 //! business: ask it with [`crate::Ssh::resolve`], which runs `ssh -G`.
 
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -22,18 +23,24 @@ pub struct HostList {
     pub notes: Vec<String>,
 }
 
-/// The user's home directory: `HOME`, or `USERPROFILE` on Windows.
+/// The user's home directory, where `~/.ssh/config` and `~/.pitcrew/sites` are: `HOME` on
+/// Unix; on Windows `USERPROFILE` (where Windows' own OpenSSH looks for `.ssh\config`), else
+/// `HOME`. An empty variable counts as unset.
 #[must_use]
 pub fn home_dir() -> Option<PathBuf> {
-    let var = |name| std::env::var_os(name).filter(|v| !v.is_empty());
-    var("HOME")
-        .or_else(|| {
-            if cfg!(windows) {
-                var("USERPROFILE")
-            } else {
-                None
-            }
-        })
+    home_from(cfg!(windows), |name| std::env::var_os(name))
+}
+
+/// [`home_dir`] on Windows or not, reading the environment with `var`.
+fn home_from(windows: bool, var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let names: &[&str] = if windows {
+        &["USERPROFILE", "HOME"]
+    } else {
+        &["HOME"]
+    };
+    names
+        .iter()
+        .find_map(|name| var(name).filter(|v| !v.is_empty()))
         .map(PathBuf::from)
 }
 
@@ -278,6 +285,54 @@ fn wild(pattern: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An environment of `vars` alone.
+    fn env(vars: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
+        let vars: Vec<(String, OsString)> = vars
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), OsString::from(value)))
+            .collect();
+        move |name| vars.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn the_home_is_the_profile_first_on_windows() {
+        let profile = r"C:\Users\someone";
+        let both = [("HOME", "/home/someone"), ("USERPROFILE", profile)];
+        assert_eq!(home_from(true, env(&both)), Some(PathBuf::from(profile)));
+        let home = [("HOME", "/home/someone")];
+        assert_eq!(
+            home_from(true, env(&home)),
+            Some(PathBuf::from("/home/someone"))
+        );
+        let empty = [("USERPROFILE", ""), ("HOME", "/home/someone")];
+        assert_eq!(
+            home_from(true, env(&empty)),
+            Some(PathBuf::from("/home/someone"))
+        );
+        assert_eq!(home_from(true, env(&[("USERPROFILE", "")])), None);
+        assert_eq!(home_from(true, env(&[])), None);
+    }
+
+    #[test]
+    fn the_home_is_home_alone_on_unix() {
+        let both = [
+            ("HOME", "/home/someone"),
+            ("USERPROFILE", r"C:\Users\someone"),
+        ];
+        assert_eq!(
+            home_from(false, env(&both)),
+            Some(PathBuf::from("/home/someone"))
+        );
+        assert_eq!(home_from(false, env(&[("USERPROFILE", "/x")])), None);
+        assert_eq!(home_from(false, env(&[("HOME", "")])), None);
+        assert_eq!(home_from(false, env(&[])), None);
+        // This platform's order, on this process's environment.
+        assert_eq!(
+            home_dir(),
+            home_from(cfg!(windows), |name| std::env::var_os(name))
+        );
+    }
 
     fn write(path: &Path, text: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
