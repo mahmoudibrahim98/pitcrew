@@ -327,6 +327,8 @@ function hostInfo(hub: Hub): HostInfo {
 
 /** `@` followed by 1 to 32 of lower-case letters, digits, `_` or `-` (api-v1.md, "The first run"). */
 const SETUP_HANDLE = /^@[a-z0-9_-]{1,32}$/;
+/** The back office's handle, reserved: setup never gives it to a person. */
+const OFFICE_HANDLE = '@office';
 /** C0 and C1 control characters, disallowed in every `Setup` string. */
 const CONTROL_CHARS = /[\u0000-\u001F\u007F-\u009F]/;
 
@@ -366,6 +368,10 @@ const setupHub: Handler = (hub, ctx) => {
     throw invalid('person.handle must be "@" followed by 1 to 32 of a-z, 0-9, "_" or "-".');
   }
   const machineName = setupText(fields.string('machine_name'), 'machine_name', 60);
+  // Reserved for the back office (the mock has none): always taken.
+  if (handle === OFFICE_HANDLE) {
+    throw conflict(`${OFFICE_HANDLE} is reserved for the back office.`);
+  }
   if (hub.members.some((m) => m.handle === handle)) {
     throw conflict(`The handle ${handle} is already taken.`);
   }

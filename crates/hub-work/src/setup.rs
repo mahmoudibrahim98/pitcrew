@@ -9,6 +9,7 @@
 
 use crate::commands::require_person;
 use crate::error::{Result, WorkError};
+use crate::office::OFFICE_HANDLE;
 use crate::query;
 use crate::service::WorkService;
 use pitcrew_protocol::api::{Caller, Setup, SetupDone};
@@ -130,7 +131,9 @@ impl WorkService {
     /// `forbidden` for an agent token; `invalid` for a field out of its length bound, a malformed
     /// handle, or a control character anywhere; `conflict` when the workspace already has a
     /// person, or when the handle is already taken (so a retried request never makes a second
-    /// person: the first call to commit wins, every other sees the conflict).
+    /// person: the first call to commit wins, every other sees the conflict). `@office`
+    /// ([`OFFICE_HANDLE`]) is reserved for the back office, so it is always taken, even before
+    /// the back office's member exists.
     pub fn set_up(&self, caller: &Caller, setup: Setup) -> Result<SetupDone> {
         require_person(caller, "Setting up the workspace")?;
         let checked = checked_setup(setup)?;
@@ -140,6 +143,11 @@ impl WorkService {
                 return Err(WorkError::conflict(
                     "This workspace already has a person; setup runs once.",
                 ));
+            }
+            if checked.handle == OFFICE_HANDLE {
+                return Err(WorkError::conflict(format!(
+                    "{OFFICE_HANDLE} is reserved for the back office."
+                )));
             }
             if query::member_with_handle(c, &checked.handle)?.is_some() {
                 return Err(WorkError::conflict(format!(

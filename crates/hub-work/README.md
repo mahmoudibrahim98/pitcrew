@@ -434,7 +434,8 @@ through the one writer:
 - `409 conflict` once the workspace already has a person, or if the handle is taken (by another
   member the hub already knows, e.g. a back office added before a person existed) — so a retried
   request never makes a second person: the first call to commit wins, every other sees the
-  conflict;
+  conflict. `@office` (`OFFICE_HANDLE`) is reserved for the back office and always taken, even
+  before its member exists;
 - appends, in one append, `member_added` for the caller's own member id (kind `human`, no owner)
   and `machine_added` (kind `local`, liveness `live`, a new id), both authored by the caller;
 - returns the new member and machine alongside the workspace (its id, and the name just set).

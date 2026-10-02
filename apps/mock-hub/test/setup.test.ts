@@ -196,15 +196,42 @@ describe('POST /v1/setup', () => {
 
   it('answers 409 on a handle clash, even before a person exists', () =>
     fresh(async (server) => {
-      // As if an agent such as @office had been configured before anyone set the workspace up.
-      server.hub.members.push({ id: '01JB000000000000000MEM0099', kind: 'agent', handle: '@office', name: 'Office' });
+      // As if an agent had been configured before anyone set the workspace up.
+      server.hub.members.push({ id: '01JB000000000000000MEM0099', kind: 'agent', handle: '@helper', name: 'Helper' });
       const res = await call(server, 'POST', '/v1/setup', {
         token: DEVICE,
-        json: { ...SETUP, person: { name: 'Sam Rivera', handle: '@office' } },
+        json: { ...SETUP, person: { name: 'Sam Rivera', handle: '@helper' } },
       });
       refused(res, 409, 'handle taken');
       const workspace = await call<WorkspaceReply>(server, 'GET', '/v1/workspace', { token: DEVICE });
       assert.equal(workspace.body.setup_needed, true, 'the clash must not have set the workspace up');
+    }));
+
+  it('reserves @office for the back office, though no member holds it', () =>
+    fresh(async (server) => {
+      assert.equal(server.hub.members.length, 0);
+      const office = { name: 'Sam Rivera', handle: '@office' };
+      const res = await call<ApiError>(server, 'POST', '/v1/setup', {
+        token: DEVICE,
+        json: { ...SETUP, person: office },
+      });
+      refused(res, 409, 'reserved handle');
+      assert.match(res.body.message, /reserved/);
+      // A 400 still comes first.
+      refused(
+        await call(server, 'POST', '/v1/setup', {
+          token: DEVICE,
+          json: { ...SETUP, person: office, machine_name: 'x'.repeat(61) },
+        }),
+        400,
+        'reserved handle and a machine name too long',
+      );
+      const workspace = await call<WorkspaceReply>(server, 'GET', '/v1/workspace', { token: DEVICE });
+      assert.equal(workspace.body.setup_needed, true, 'the reserved handle must not have set the workspace up');
+      assert.equal(workspace.body.rev, 0);
+      // Any other handle still sets it up.
+      const done = await call<SetupDone>(server, 'POST', '/v1/setup', { token: DEVICE, json: SETUP });
+      assert.equal(done.status, 200);
     }));
 
   it('appends member_added then machine_added, which a connected stream sees live', () =>
