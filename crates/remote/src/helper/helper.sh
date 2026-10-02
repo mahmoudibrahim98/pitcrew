@@ -585,14 +585,14 @@ pc_tmux() { tmux -L "$pc_tmux_name" -f /dev/null "$@"; }
 # Run by the /bin/sh a launcher starts, inside the root, as
 # `sh -c "$PC_EXEC" sh UMASK UID ROOT PIDFILE LOG HELPER ARGS...`. It checks that its directory
 # is still the root the script entered (ROOT, its physical path: tmux enters it by name) and
-# still private, records its pid, sends its output to the log (opened while the umask is still
-# 077), restores the user's umask, and becomes the helper. Its stdin is the launcher's:
-# /dev/null, or under tmux the pane's terminal, since tmux takes a pane whose terminal nobody
-# holds open for dead.
+# still private (read with the checks' ls, pc_ls_cmd), records its pid, sends its output to the
+# log (opened while the umask is still 077), restores the user's umask, and becomes the helper.
+# Its stdin is the launcher's: /dev/null, or under tmux the pane's terminal, since tmux takes a
+# pane whose terminal nobody holds open for dead.
 PC_EXEC='m=$1 u=$2 w=$3 p=$4 l=$5
 shift 5
 [ "$(pwd -P)" = "$w" ] || exit 98
-d=$(ls -ldn . 2>/dev/null | awk "{print \$1, \$3}")
+d=$('"$pc_ls_cmd"' -ldn . 2>/dev/null | awk "{print \$1, \$3}")
 case $d in
 "drwx------ $u"|"drwx------. $u"|"drwx------@ $u"|"drwx--S--- $u"|"drwx--S---. $u"|"drwx--S---@ $u") ;;
 *) exit 98 ;;

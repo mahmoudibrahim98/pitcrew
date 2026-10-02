@@ -2070,6 +2070,62 @@ mod unix {
         }
     }
 
+    /// On macOS the launched helper's own check that the root is still private asks `/bin/ls`
+    /// too, whatever the tool path finds first. A stand-in `uname` plays macOS, so this runs
+    /// anywhere with a `/bin/ls`.
+    fn the_launch_check_asks_the_checks_ls() {
+        if !Path::new("/bin/ls").is_file() {
+            eprintln!("skipped: no /bin/ls");
+            return;
+        }
+        let m = Machine::new();
+        let (ls, uname) = (which("ls").unwrap(), which("uname").unwrap());
+        shim(
+            &m.bin,
+            "uname",
+            &format!(
+                "case $1 in -s) echo Darwin ;; *) exec '{}' \"$@\" ;; esac",
+                uname.display()
+            ),
+        );
+        // The stand-in shows the root open to everyone, but only to the launched helper's check:
+        // the start holds run/.lock then, and not yet when it enters the root itself.
+        shim(
+            &m.bin,
+            "ls",
+            &format!(
+                "if [ \"$*\" = '-ldn .' ] && [ -d run/.lock ]; then\n\
+                 echo 'drwxrwxrwx 2 0 0 64 Oct  1 12:00 .'; exit\n\
+                 fi\n\
+                 exec '{}' \"$@\"",
+                ls.display()
+            ),
+        );
+        let launcher = DirectLauncher::new(LaunchOptions {
+            ready_timeout: Duration::from_secs(3),
+            ..launch_options()
+        });
+
+        // Where /bin/ls reads as the stand-in, the helper does not start: its check failed.
+        let target = m.target(&m.fake(Remote {
+            rewrite: vec![darwin_ls()],
+            ..Remote::default()
+        }));
+        block_on(deploy(&target, &helper("1.0.0"), &quick())).unwrap();
+        let err = block_on(launcher.start(&target)).unwrap_err();
+        assert!(
+            matches!(&err, HelperError::StartFailed(d) if d.contains("no socket")),
+            "{err:?}"
+        );
+        assert!(!m.run_dir().join("pitcrewd.pid").exists());
+
+        // Where it is the system's own, the stand-in is not asked.
+        let target = m.target(&m.fake(Remote::default()));
+        block_on(launcher.start(&target)).unwrap();
+        let stopped = block_on(launcher.stop(&target)).unwrap();
+        assert!(stopped.pid.is_some());
+    }
+
     /// A shell start-up file that reads stdin eats the start of the script: what is left must
     /// not run, even a tail that would remove things.
     fn a_partly_eaten_script_never_runs() {
@@ -2861,6 +2917,10 @@ mod unix {
             (
                 "a_macos_acl_on_the_way_is_judged_by_what_it_grants",
                 a_macos_acl_on_the_way_is_judged_by_what_it_grants,
+            ),
+            (
+                "the_launch_check_asks_the_checks_ls",
+                the_launch_check_asks_the_checks_ls,
             ),
             (
                 "a_partly_eaten_script_never_runs",

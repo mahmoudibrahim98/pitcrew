@@ -153,10 +153,10 @@ let started = DirectLauncher::default().start(&target).await?;   // or TmuxLaunc
   so the helper bytes behind it stay on stdin. It runs the script only if it has its first line,
   its last line and its length: a `.bashrc` that eats stdin cannot make a tail of it run. The
   script then drops every function standing in for a tool it uses (bash imports exported ones).
-  It reports between random markers, like the probe. On macOS the checks above read modes and
-  ACLs with `/bin/ls`, by its path, whatever `ls` the tool path finds first: GNU `ls` has no
-  `-e`, so every deploy would be refused (every home folder has an ACL), and uutils' or
-  busybox's `ls` shows no `+`, so an ACL would go unjudged.
+  It reports between random markers, like the probe. On macOS the checks above (the launched
+  helper's too) read modes and ACLs with `/bin/ls`, by its path, whatever `ls` the tool path
+  finds first: GNU `ls` has no `-e`, so every deploy would be refused (every home folder has an
+  ACL), and uutils' or busybox's `ls` shows no `+`, so an ACL would go unjudged.
 - **Deploy** is at most two calls, each under the `bin/.lock` lock:
   1. `check` verifies a copy already installed under the version (sha256 computed on the
      machine, then `--version`) and switches to it. The same deploy again stops here: it only
@@ -554,13 +554,13 @@ daemon (`EXIT_NO_DAEMON`), 1 other. Messages name what is wrong, never the path.
   links; sticky ones allowed), ACLs on the way (stand-in `uname` and `ls` playing macOS,
   FreeBSD and Linux: entries that grant, inherited or not, deny or only read, names with
   spaces, `synchronize`, lists that fail, are empty or do not list the directory; macOS's own
-  `chmod +a` on macOS, with an `ls` first on the tool path that is not asked), a partly eaten
-  script, look-alike tools in `PATH` and exported bash functions, ACLs behind macOS's `@`,
-  set-group-ID parents, odd host names, the file modes during the upload, a stalled upload,
-  the helper's umask, and the direct and tmux launchers
-  (start, status, stop, `endpoint.json`, failures, other hosts, two roots on one host). It runs
-  the whole flow again with each POSIX shell of `PITCREW_TEST_SHELLS` as the machine's
-  `/bin/sh`;
+  `chmod +a` on macOS, with an `ls` first on the tool path that is not asked; the launched
+  helper's own check does not ask it either), a partly eaten script, look-alike tools in
+  `PATH` and exported bash functions, ACLs behind macOS's `@`, set-group-ID parents, odd host
+  names, the file modes during the upload, a stalled upload, the helper's umask, and the direct
+  and tmux launchers (start, status, stop, `endpoint.json`, failures, other hosts, two roots on
+  one host). It runs the whole flow again with each POSIX shell of `PITCREW_TEST_SHELLS` as the
+  machine's `/bin/sh`;
 - the SLURM cases in `tests/deploy/slurm.rs` (a `#[path]` module of `deploy.rs`), where the
   binary also plays `sbatch`, `squeue`, `scancel`, `sacct`, `srun` and `sinfo` with their state
   in files (honouring `SQUEUE_STATES`, `SCANCEL_STATE`, `SCANCEL_INTERACTIVE`, scancel's and
