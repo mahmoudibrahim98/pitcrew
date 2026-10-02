@@ -14,7 +14,20 @@ export {
   useOpenSocket,
 } from './provider.tsx';
 export { clauses, useRecapBlocks, useRecapDays, type Clause, type RecapBlocksOptions, type RecapDaysOptions } from './recaps.ts';
+export type {
+  GatewayPrompt,
+  JobOptions,
+  PromptKind,
+  PromptReply,
+  RemoteGateway,
+  RemoteLauncher,
+  RemotePlan,
+  RemotePlanRequest,
+  RemoteProbe,
+  RemoteProgress,
+} from './remote.ts';
 export { AppData } from './root.tsx';
+export { setUp, SetupConflict, useSetUp, useSetup } from './setup.ts';
 export { streamPath, terminalPath, type StreamStatus } from './stream.ts';
 export {
   isDesktop,
@@ -28,8 +41,11 @@ export type * from './types.ts';
 export { CHECKS, TRANSCRIPT_KINDS } from './types.ts';
 export {
   useGatewayNavigate,
+  useGatewayPrompts,
   useGatewayWorkspaces,
+  useRemoteGateway,
   WorkspaceScope,
+  type GatewayPrompts,
   type GatewayWorkspace,
   type ScopeFallback,
   type WorkspaceList,

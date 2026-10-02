@@ -2,6 +2,9 @@
 // progress over short timers, and fabricates scan suggestions from synthetic data (never real
 // transcripts, host names or tokens). The UI is built against `OnboardingApi`, not this file, so a
 // real client can replace it without touching a step component.
+//
+// For tests, and for a development build's `?onboarding=fake` (`first-run-page.tsx`). A production
+// build never loads it: nothing outside tests imports it except behind `import.meta.env.DEV`.
 
 import type {
   AgentAccount,
@@ -29,7 +32,8 @@ import type {
   StartSignInResult,
   Streamed,
 } from './api.ts';
-import { machineTargetLabel, targetKey } from './api.ts';
+import { machineTargetLabel, SetupRefused, targetKey } from './api.ts';
+import { checkSetup, type SetupField } from './validation.ts';
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -161,8 +165,11 @@ export function createFakeOnboardingApi(options: FakeOnboardingApiOptions = {}):
     ['gitlab', { id: 'gitlab', connected: false }],
   ]);
   let nextSignIn = 0;
+  let setUp = false;
 
   return {
+    unavailable: new Set(),
+
     async discoverHosts(): Promise<DiscoveredHost[]> {
       await wait(delay(150));
       return [
@@ -174,8 +181,21 @@ export function createFakeOnboardingApi(options: FakeOnboardingApiOptions = {}):
 
     async setupWorkspace(input: SetupWorkspaceInput): Promise<SetupWorkspaceResult> {
       await wait(delay(100));
-      if (input.name.trim() === '') throw new Error('Workspace name is required');
-      return { workspace: { id: 'ws-local', name: input.name.trim() } };
+      // The hub's own checks, so the fake refuses what the hub would.
+      const errors = checkSetup({
+        workspaceName: input.workspaceName,
+        personName: input.person.name,
+        handle: input.person.handle,
+        machineName: input.machineName,
+      });
+      const [field, message] = Object.entries(errors)[0] ?? [];
+      if (message !== undefined) throw new SetupRefused(message, { field: field as SetupField });
+      if (setUp) throw new SetupRefused('This workspace is already set up.', { alreadySetUp: true });
+      setUp = true;
+      return {
+        workspace: { id: 'ws-local', name: input.workspaceName.trim() },
+        me: { name: input.person.name.trim(), handle: input.person.handle },
+      };
     },
 
     async checkMachine(target: MachineTarget): Promise<MachineCheckResult> {

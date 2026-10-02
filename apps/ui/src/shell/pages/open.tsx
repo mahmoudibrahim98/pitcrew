@@ -7,11 +7,13 @@ import { useEffect } from 'react';
 import {
   useConnection,
   useGatewayWorkspaces,
+  useRemoteGateway,
   useWorkspace,
   useWorkstreams,
   type GatewayWorkspace,
   type WorkspacesView,
 } from '../../data/index.ts';
+import { Button } from '../../design/index.ts';
 import { LAYOUTS, useWorkspaceId } from '../layout.ts';
 import { paths } from '../paths.ts';
 import { lastPath, storedLayout, useShell } from '../store.ts';
@@ -20,7 +22,7 @@ import { LOADING, Page } from './page.tsx';
 import { StatusScreen, WorkspacesFailed } from './unavailable.tsx';
 
 /** Replaces the location with `href` (a path with its search). */
-function Redirect({ href }: { href: string }) {
+export function Redirect({ href }: { href: string }) {
   const router = useRouter();
   useEffect(() => {
     void router.navigate({ href, replace: true });
@@ -55,9 +57,34 @@ function OpenDesktopWorkspace({ workspaces }: { workspaces: WorkspacesView }) {
   const { list, error, retry } = workspaces;
   const pick = list === undefined ? undefined : pickWorkspace(list, last);
   if (pick !== undefined) return <Redirect href={paths.workspace(pick.id)} />;
-  if (list !== undefined) return <StatusScreen>No workspaces yet.</StatusScreen>;
+  if (list !== undefined) return <NoWorkspaces />;
   if (error !== undefined) return <WorkspacesFailed message={error} onRetry={retry} />;
   return <StatusScreen>Loading workspaces…</StatusScreen>;
+}
+
+/** The desktop app with no workspace at all: say so, and offer to connect one. */
+function NoWorkspaces() {
+  return (
+    <main className="grid min-h-dvh place-items-center bg-bg px-6 text-ink">
+      <div className="flex max-w-md flex-col items-center gap-3 text-center">
+        <h1 className="text-lg font-semibold">No workspaces yet.</h1>
+        <p className="text-sm text-ink-2">A workspace is a PitCrew hub: on this machine, or on a remote one over SSH.</p>
+        <ConnectButton />
+      </div>
+    </main>
+  );
+}
+
+/** Opens the "connect a remote machine" wizard; none where the gateway has no remote commands. */
+function ConnectButton() {
+  const router = useRouter();
+  const remote = useRemoteGateway();
+  if (remote === null) return null;
+  return (
+    <Button variant="primary" onClick={() => void router.navigate({ href: paths.connect() })}>
+      Connect a remote machine…
+    </Button>
+  );
 }
 
 /** `workstreams/$workstream`: for callers that know a workstream but not its project. */

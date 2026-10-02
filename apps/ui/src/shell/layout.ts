@@ -65,8 +65,9 @@ export function LayoutMemory() {
   // The resolved location, not the pending one: it is the one the matches belong to.
   const href = useRouterState({ select: (s) => s.resolvedLocation?.href });
   const route = useRouterState({ select: (s) => layoutOfMatches(s.matches) });
+  // Neither a missing page nor the first-run wizard is a place to come back to.
   const found = useRouterState({
-    select: (s) => s.matches.every((m) => m.status !== 'notFound' && m.status !== 'error'),
+    select: (s) => s.matches.every((m) => m.status !== 'notFound' && m.status !== 'error' && m.staticData?.setup !== true),
   });
   const idle = useRouterState({ select: (s) => s.status === 'idle' });
   const remember = useShell((s) => s.remember);

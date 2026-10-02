@@ -3,13 +3,14 @@
 // starts the wizard over.
 
 import { createContext, use, useCallback, useMemo, useState, type ReactNode } from 'react';
+import { useOnboardingApi } from './api-context.tsx';
 import { stepsFor, type StepMeta } from './steps.ts';
-import { initialWizardState, type WizardMode, type WizardState } from './wizard-state.ts';
+import { initialWizardState, type WizardState } from './wizard-state.ts';
 
 export type WizardPatch = Partial<WizardState> | ((state: WizardState) => Partial<WizardState>);
 
 export interface WizardContextValue {
-  mode: WizardMode;
+  /** The steps the API can serve (`stepsFor`). */
   steps: readonly StepMeta[];
   state: WizardState;
   patch(update: WizardPatch): void;
@@ -23,7 +24,17 @@ export interface WizardContextValue {
   back(): void;
   /** Like `next`, for a step the user chose to skip; both advance the same way. */
   skip(): void;
+  /** The machine name field's label: this computer's, or a remote machine's. */
+  machineLabel: string;
 }
+
+/** What the first run starts from, when the workspace is not this computer's own hub. */
+export interface WizardDefaults {
+  machineName?: string | undefined;
+  machineLabel?: string | undefined;
+}
+
+export const LOCAL_MACHINE_LABEL = 'This machine’s name';
 
 /** `steps` is always non-empty (`steps.ts`); this only ever throws on a genuinely bad index. */
 function stepAt(steps: readonly StepMeta[], index: number): StepMeta {
@@ -40,15 +51,11 @@ export function useWizard(): WizardContextValue {
   return ctx;
 }
 
-export function WizardProvider({
-  mode,
-  children,
-}: {
-  mode: WizardMode;
-  children: ReactNode;
-}) {
-  const steps = useMemo(() => stepsFor(mode), [mode]);
-  const [state, setState] = useState<WizardState>(() => initialWizardState(mode));
+/** Inside an `OnboardingApiProvider`: the steps follow what its API can do. */
+export function WizardProvider({ defaults = {}, children }: { defaults?: WizardDefaults; children: ReactNode }) {
+  const api = useOnboardingApi();
+  const steps = useMemo(() => stepsFor(api), [api]);
+  const [state, setState] = useState<WizardState>(() => initialWizardState(defaults.machineName));
   const [stepIndex, setStepIndex] = useState(0);
   const [furthest, setFurthest] = useState(0);
 
@@ -80,7 +87,6 @@ export function WizardProvider({
   const back = useCallback(() => setStepIndex((i) => Math.max(0, i - 1)), []);
 
   const value: WizardContextValue = {
-    mode,
     steps,
     state,
     patch,
@@ -91,6 +97,7 @@ export function WizardProvider({
     next,
     back,
     skip: next,
+    machineLabel: defaults.machineLabel ?? LOCAL_MACHINE_LABEL,
   };
 
   return <WizardContext value={value}>{children}</WizardContext>;

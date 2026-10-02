@@ -224,6 +224,15 @@ export function ConsolePage() {
   );
 }
 
+/** `paths.setup`, until the onboarding feature serves its first-run wizard there. */
+export function SetupPage() {
+  return (
+    <Page title="Set up">
+      <p className="text-sm text-ink-2">This workspace needs setting up, and this build has no setup wizard.</p>
+    </Page>
+  );
+}
+
 export function SessionPage() {
   const { session: id } = useRouteParams();
   const sessions = useSessions().data;

@@ -3,8 +3,15 @@
 // collapses to a rail of icons (Ctrl B).
 
 import { Link, useRouter } from '@tanstack/react-router';
-import { Suspense, useId, type ReactNode } from 'react';
-import { useGatewayWorkspaces, useMe, useWorkspace, type WorkspaceState } from '../data/index.ts';
+import { lazy, Suspense, useId, useRef, useState, type ReactNode } from 'react';
+import {
+  useGatewayWorkspaces,
+  useMe,
+  useRemoteGateway,
+  useWorkspace,
+  type GatewayWorkspace,
+  type WorkspaceState,
+} from '../data/index.ts';
 import {
   Avatar,
   ChevronsUpDownIcon,
@@ -38,57 +45,106 @@ const ITEM =
   'aria-[current=page]:bg-card aria-[current=page]:font-medium aria-[current=page]:text-ink ' +
   'aria-[current=page]:shadow-[0_0_0_1px_var(--pc-line)]';
 
-function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
+const RemoveWorkspaceDialog = lazy(() =>
+  import('./remove-workspace.tsx').then((m) => ({ default: m.RemoveWorkspaceDialog })),
+);
+
+const SWITCHER_ID = 'shell-workspace-switcher';
+
+/** The workspace switcher: in the sidebar, and on the bare setup page in the desktop app. */
+export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
   const router = useRouter();
   const ws = useWorkspaceId();
   const workspace = useWorkspace().data?.workspace;
   // The desktop app lists the gateway's workspaces, and follows its changes; a browser has the
   // hub's one workspace.
   const desktop = useGatewayWorkspaces();
+  const remote = useRemoteGateway();
+  const [removing, setRemoving] = useState<GatewayWorkspace | null>(null);
+  const removingRef = useRef(false);
   const workspaces: { id: string; name: string; state?: WorkspaceState }[] =
     desktop !== null ? (desktop.list ?? []) : workspace === undefined ? [] : [workspace];
   const name = workspaces.find((w) => w.id === ws)?.name ?? workspace?.name ?? 'Workspace';
+  // Only a remote workspace can be removed: the local one is this machine's own hub.
+  const current = desktop?.list?.find((w) => w.id === ws);
+  const removable = remote !== null && current?.kind === 'remote' ? current : undefined;
+  const closeRemove = () => {
+    removingRef.current = false;
+    setRemoving(null);
+  };
   return (
-    <Menu>
-      <MenuTrigger asChild>
-        <button
-          type="button"
-          aria-label={`Workspace: ${name}`}
-          className={cx(
-            'flex h-9 min-w-0 flex-1 items-center gap-2 rounded-md px-1.5 text-left outline-none hover:bg-hover',
-            FOCUS_RING,
-          )}
-        >
-          <span
-            aria-hidden
-            className="inline-flex size-6 shrink-0 items-center justify-center rounded-sm bg-ink text-xs font-semibold text-bg"
+    <>
+      <Menu>
+        <MenuTrigger asChild>
+          <button
+            id={SWITCHER_ID}
+            type="button"
+            aria-label={`Workspace: ${name}`}
+            className={cx(
+              'flex h-9 min-w-0 flex-1 items-center gap-2 rounded-md px-1.5 text-left outline-none hover:bg-hover',
+              FOCUS_RING,
+            )}
           >
-            {name.slice(0, 1).toUpperCase()}
-          </span>
-          {!collapsed && (
-            <>
-              <span className="min-w-0 flex-1 truncate text-sm font-semibold text-ink">{name}</span>
-              <ChevronsUpDownIcon className="size-3.5 text-ink-2" />
-            </>
-          )}
-        </button>
-      </MenuTrigger>
-      <MenuContent className="w-60">
-        <MenuLabel>Workspaces</MenuLabel>
-        <MenuRadioGroup
-          value={ws}
-          onValueChange={(id) => void router.navigate({ href: paths.workspace(id) })}
+            <span
+              aria-hidden
+              className="inline-flex size-6 shrink-0 items-center justify-center rounded-sm bg-ink text-xs font-semibold text-bg"
+            >
+              {name.slice(0, 1).toUpperCase()}
+            </span>
+            {!collapsed && (
+              <>
+                <span className="min-w-0 flex-1 truncate text-sm font-semibold text-ink">{name}</span>
+                <ChevronsUpDownIcon className="size-3.5 text-ink-2" />
+              </>
+            )}
+          </button>
+        </MenuTrigger>
+        <MenuContent
+          className="w-64"
+          // The removal dialog takes focus; do not pull it back to the trigger.
+          onCloseAutoFocus={(event) => {
+            if (removingRef.current) event.preventDefault();
+          }}
         >
-          {workspaces.map((w) => (
-            <MenuRadioItem key={w.id} value={w.id}>
-              {w.state === undefined || w.state === 'ready' ? w.name : `${w.name} · ${WORKSPACE_STATE_LABEL[w.state]}`}
-            </MenuRadioItem>
-          ))}
-        </MenuRadioGroup>
-        <MenuSeparator />
-        <MenuItem disabled>Add a workspace (coming later)</MenuItem>
-      </MenuContent>
-    </Menu>
+          <MenuLabel>Workspaces</MenuLabel>
+          <MenuRadioGroup value={ws} onValueChange={(id) => void router.navigate({ href: paths.workspace(id) })}>
+            {workspaces.map((w) => (
+              <MenuRadioItem key={w.id} value={w.id}>
+                {w.state === undefined || w.state === 'ready' ? w.name : `${w.name} · ${WORKSPACE_STATE_LABEL[w.state]}`}
+              </MenuRadioItem>
+            ))}
+          </MenuRadioGroup>
+          <MenuSeparator />
+          {remote === null ? (
+            // A browser (development) reaches one hub, and has no gateway to connect another.
+            <MenuItem disabled>Connect a remote machine (desktop app only)</MenuItem>
+          ) : (
+            <MenuItem onSelect={() => void router.navigate({ href: paths.connect() })}>Connect a remote machine…</MenuItem>
+          )}
+          {removable !== undefined && (
+            <MenuItem
+              onSelect={() => {
+                removingRef.current = true;
+                setRemoving(removable);
+              }}
+            >
+              Remove workspace…
+            </MenuItem>
+          )}
+        </MenuContent>
+      </Menu>
+      {removing !== null && remote !== null && (
+        <Suspense fallback={null}>
+          <RemoveWorkspaceDialog
+            workspace={removing}
+            remote={remote}
+            onClose={closeRemove}
+            // The dialog has no trigger of its own (the menu item is gone by then): back to the switcher.
+            returnFocus={() => document.getElementById(SWITCHER_ID)?.focus()}
+          />
+        </Suspense>
+      )}
+    </>
   );
 }
 

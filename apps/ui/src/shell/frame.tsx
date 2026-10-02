@@ -1,13 +1,14 @@
 // The frame every page lives in: sidebar, top bar, the page, and the Orchestrator panel. It sits
 // inside the workspace's data scope (in the desktop app, each workspace has its own).
 
-import { Outlet, useRouter } from '@tanstack/react-router';
-import { lazy, Suspense, useEffect, type MouseEvent } from 'react';
+import { Outlet, useRouter, useRouterState } from '@tanstack/react-router';
+import { lazy, Suspense, useEffect, useRef, type MouseEvent } from 'react';
 import {
   useGatewayWorkspace,
   useGatewayWorkspaces,
   useWorkspace,
   WorkspaceScope,
+  type GatewayWorkspace,
   type ScopeFallback,
 } from '../data/index.ts';
 import { TooltipProvider } from '../design/index.ts';
@@ -15,9 +16,11 @@ import { CreateDialog } from './create.tsx';
 import { LayoutMemory, useLayout, useWorkspaceId } from './layout.ts';
 import { OrchestratorPanel } from './orchestrator.tsx';
 import { NotFoundPage } from './pages/not-found.tsx';
+import { Redirect } from './pages/open.tsx';
 import { StatusScreen, WorkspacesFailed, WorkspaceUnavailable } from './pages/unavailable.tsx';
+import { paths } from './paths.ts';
 import { useShellShortcuts } from './shortcuts.ts';
-import { Sidebar } from './sidebar.tsx';
+import { Sidebar, WorkspaceSwitcher } from './sidebar.tsx';
 import { useShell } from './store.ts';
 import { TopBar } from './top-bar.tsx';
 
@@ -52,9 +55,32 @@ function ScopeMissing({ reason }: { reason: ScopeFallback }) {
   );
 }
 
+/**
+ * In the desktop app: when the workspace on screen leaves the gateway's list (removed, from this
+ * window or elsewhere), go to the next ready workspace, or `/`, rather than stay on a page that is
+ * no longer there. A workspace never listed while on screen stays a not-found page.
+ */
+function useLeaveWhenDropped(ws: string): void {
+  const router = useRouter();
+  const list = useGatewayWorkspaces()?.list;
+  const seen = useRef<string | null>(null);
+  useEffect(() => {
+    if (list === undefined) return;
+    if (list.some((w) => w.id === ws)) {
+      seen.current = ws;
+      return;
+    }
+    if (seen.current !== ws) return;
+    seen.current = null;
+    const next = list.find((w) => w.state === 'ready') ?? list[0];
+    void router.navigate({ href: next === undefined ? '/' : paths.workspace(next.id), replace: true });
+  }, [list, ws, router]);
+}
+
 /** `/w/$ws`: the frame, in the workspace's data scope. Another workspace remounts everything. */
 export function WorkspaceFrame() {
   const ws = useWorkspaceId();
+  useLeaveWhenDropped(ws);
   return (
     <WorkspaceScope key={ws} ws={ws} fallback={(reason) => <ScopeMissing reason={reason} />}>
       <Frame />
@@ -63,27 +89,78 @@ export function WorkspaceFrame() {
 }
 
 function Frame() {
-  const router = useRouter();
   const ws = useWorkspaceId();
-  const layout = useLayout();
-  const known = useWorkspace().data?.workspace;
+  const info = useWorkspace().data;
   // The gateway's entry, in the desktop app: a workspace it cannot reach shows why, not a page.
   const gateway = useGatewayWorkspace();
   const unavailable = gateway?.state === 'unreachable' || gateway?.state === 'needs_pairing' ? gateway : undefined;
-  const paletteOpen = useShell((s) => s.paletteOpen);
-  const orchestratorOpen = useShell((s) => s.orchestratorOpen);
+  // The first-run wizard's own routes: exempt from the redirect below, and shown bare.
+  const setupRoute = useRouterState({ select: (s) => s.matches.some((m) => m.staticData?.setup === true) });
   const setLastWorkspace = useShell((s) => s.setLastWorkspace);
-  useShellShortcuts(router, ws);
-  usePrefetchPalette();
-  useEffect(() => setLastWorkspace(ws), [setLastWorkspace, ws]);
+  // `/` reopens the last workspace: not one still waiting for setup (it would land in the wizard
+  // every time), but one the gateway cannot reach is remembered (it comes back).
+  const remember = (info !== undefined && info.setup_needed !== true) || unavailable !== undefined;
+  useEffect(() => {
+    if (remember) setLastWorkspace(ws);
+  }, [remember, setLastWorkspace, ws]);
 
-  if (known !== undefined && known.id !== ws) {
+  if (info !== undefined && info.workspace.id !== ws) {
     return (
       <main className="min-h-dvh bg-bg text-ink">
         <NotFoundPage />
       </main>
     );
   }
+  // A hub with no person yet goes through setup first. No loop: the wizard's routes are exempt,
+  // and a finished setup turns `setup_needed` off in the cache before anything navigates.
+  if (info?.setup_needed === true && !setupRoute) {
+    return (
+      <>
+        <Redirect href={paths.setup(ws)} />
+        <StatusScreen>Opening setup…</StatusScreen>
+      </>
+    );
+  }
+  if (setupRoute) {
+    return (
+      <div className="flex min-h-dvh flex-col bg-bg text-ink">
+        <SetupHeader />
+        <main id="main" tabIndex={-1} className="flex-1 outline-none">
+          {unavailable === undefined ? <Outlet /> : <WorkspaceUnavailable workspace={unavailable} />}
+        </main>
+      </div>
+    );
+  }
+  return <FullFrame unavailable={unavailable} />;
+}
+
+/**
+ * In the desktop app, the bare setup page keeps the workspace switcher: another workspace, a
+ * remote machine to connect, or this one to remove (a remote) stay one click away, so a workspace
+ * waiting for setup is never a dead end. A browser's hub has only this one workspace.
+ */
+function SetupHeader() {
+  const desktop = useGatewayWorkspaces();
+  if (desktop === null) return null;
+  return (
+    <TooltipProvider>
+      <header className="flex h-12 items-center border-b border-line bg-bg px-2">
+        <div className="flex w-(--pc-sidebar-width) min-w-0">
+          <WorkspaceSwitcher collapsed={false} />
+        </div>
+      </header>
+    </TooltipProvider>
+  );
+}
+
+function FullFrame({ unavailable }: { unavailable: GatewayWorkspace | undefined }) {
+  const router = useRouter();
+  const ws = useWorkspaceId();
+  const layout = useLayout();
+  const paletteOpen = useShell((s) => s.paletteOpen);
+  const orchestratorOpen = useShell((s) => s.orchestratorOpen);
+  useShellShortcuts(router, ws);
+  usePrefetchPalette();
 
   return (
     <TooltipProvider>
