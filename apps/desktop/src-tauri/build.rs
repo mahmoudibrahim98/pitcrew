@@ -9,6 +9,14 @@ fn main() {
         "gateway_socket_open",
         "gateway_socket_send",
         "gateway_socket_close",
+        "gateway_ssh_hosts",
+        "gateway_remote_probe",
+        "gateway_remote_plan",
+        "gateway_remote_add",
+        "gateway_remote_cancel",
+        "gateway_workspace_retry",
+        "gateway_workspace_remove",
+        "gateway_prompt_reply",
     ]);
     let attributes = tauri_build::Attributes::new().app_manifest(manifest);
     if let Err(e) = tauri_build::try_build(attributes) {

@@ -1,14 +1,19 @@
-//! The app's settings: where `pitcrewd` is, and which state directory it uses.
+//! The app's settings: where `pitcrewd` is, which state directory it uses, and for remote
+//! machines which `ssh`, `pitcrew-askpass` and helper binaries to use.
 //!
 //! Read from `settings.json` in the app's config directory, if there is one:
 //!
 //! ```json
-//! { "pitcrewd": "/opt/pitcrew/bin/pitcrewd", "stateDir": "/home/sam/.local/share/pitcrew" }
+//! { "pitcrewd": "/opt/pitcrew/bin/pitcrewd", "stateDir": "/home/sam/.local/share/pitcrew",
+//!   "ssh": "/usr/bin/ssh", "askpass": "/opt/pitcrew/bin/pitcrew-askpass",
+//!   "helpers": "/opt/pitcrew/helpers" }
 //! ```
 //!
-//! `PITCREW_PITCREWD` and `PITCREW_STATE_DIR` override them (development and tests). Without a
-//! state directory the daemon's own default is used, so the app and a `pitcrewd` started by hand
-//! find the same socket.
+//! `PITCREW_PITCREWD`, `PITCREW_STATE_DIR`, `PITCREW_SSH`, `PITCREW_ASKPASS` and
+//! `PITCREW_HELPERS` override them (development and tests). Without a state directory the
+//! daemon's own default is used, so the app and a `pitcrewd` started by hand find the same
+//! socket. Without the others the app uses `ssh` from `PATH`, and the `pitcrew-askpass` and
+//! `helpers/` it was installed with.
 
 use serde::Deserialize;
 use std::ffi::OsString;
@@ -27,6 +32,16 @@ pub struct Settings {
     /// The daemon's state directory, passed as `--state-dir`.
     #[serde(default)]
     pub state_dir: Option<PathBuf>,
+    /// The OpenSSH client for remote machines, instead of `ssh` on `PATH`.
+    #[serde(default)]
+    pub ssh: Option<PathBuf>,
+    /// The `pitcrew-askpass` program, instead of the one next to the app.
+    #[serde(default)]
+    pub askpass: Option<PathBuf>,
+    /// The folder of helper binaries (`pitcrewd-<target>` and `manifest.json`) deployed to
+    /// remote machines, instead of the one installed with the app (development).
+    #[serde(default)]
+    pub helpers: Option<PathBuf>,
 }
 
 impl Settings {
@@ -52,15 +67,21 @@ impl Settings {
         }
     }
 
-    /// Applies `PITCREW_PITCREWD` and `PITCREW_STATE_DIR` from `env`, when set and not empty.
+    /// Applies `PITCREW_PITCREWD`, `PITCREW_STATE_DIR`, `PITCREW_SSH`, `PITCREW_ASKPASS` and
+    /// `PITCREW_HELPERS` from `env`, when set and not empty.
     #[must_use]
     pub fn with_env(mut self, env: impl Fn(&str) -> Option<OsString>) -> Self {
         let var = |name: &str| env(name).filter(|v| !v.is_empty()).map(PathBuf::from);
-        if let Some(path) = var("PITCREW_PITCREWD") {
-            self.pitcrewd = Some(path);
-        }
-        if let Some(path) = var("PITCREW_STATE_DIR") {
-            self.state_dir = Some(path);
+        for (name, setting) in [
+            ("PITCREW_PITCREWD", &mut self.pitcrewd),
+            ("PITCREW_STATE_DIR", &mut self.state_dir),
+            ("PITCREW_SSH", &mut self.ssh),
+            ("PITCREW_ASKPASS", &mut self.askpass),
+            ("PITCREW_HELPERS", &mut self.helpers),
+        ] {
+            if let Some(path) = var(name) {
+                *setting = Some(path);
+            }
         }
         self.checked()
     }
@@ -70,6 +91,9 @@ impl Settings {
         for (name, path) in [
             ("pitcrewd", &mut self.pitcrewd),
             ("stateDir", &mut self.state_dir),
+            ("ssh", &mut self.ssh),
+            ("askpass", &mut self.askpass),
+            ("helpers", &mut self.helpers),
         ] {
             if path.as_ref().is_some_and(|p| !p.is_absolute()) {
                 tracing::warn!(
@@ -118,17 +142,32 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(Settings::load(tmp.path()), Settings::default());
 
-        let file = serde_json::json!({ "pitcrewd": abs("/opt/pitcrew/pitcrewd"), "stateDir": abs("/srv/state") });
+        let file = serde_json::json!({
+            "pitcrewd": abs("/opt/pitcrew/pitcrewd"),
+            "stateDir": abs("/srv/state"),
+            "ssh": abs("/usr/bin/ssh"),
+            "askpass": abs("/opt/pitcrew/pitcrew-askpass"),
+            "helpers": abs("/opt/pitcrew/helpers"),
+        });
         std::fs::write(tmp.path().join(FILE_NAME), file.to_string()).unwrap();
         let settings = Settings::load(tmp.path());
         assert_eq!(settings.pitcrewd, Some(abs("/opt/pitcrew/pitcrewd")));
         assert_eq!(settings.state_dir, Some(abs("/srv/state")));
+        assert_eq!(settings.ssh, Some(abs("/usr/bin/ssh")));
+        assert_eq!(settings.askpass, Some(abs("/opt/pitcrew/pitcrew-askpass")));
+        assert_eq!(settings.helpers, Some(abs("/opt/pitcrew/helpers")));
 
         let env_dir = abs("/home/sam/state");
         let env_dir_os = env_dir.clone().into_os_string();
-        let settings =
-            settings.with_env(|name| (name == "PITCREW_STATE_DIR").then(|| env_dir_os.clone()));
+        let helpers = abs("/home/sam/helpers");
+        let helpers_os = helpers.clone().into_os_string();
+        let settings = settings.with_env(|name| match name {
+            "PITCREW_STATE_DIR" => Some(env_dir_os.clone()),
+            "PITCREW_HELPERS" => Some(helpers_os.clone()),
+            _ => None,
+        });
         assert_eq!(settings.state_dir, Some(env_dir));
+        assert_eq!(settings.helpers, Some(helpers));
         assert_eq!(settings.pitcrewd, Some(abs("/opt/pitcrew/pitcrewd")));
     }
 
@@ -139,13 +178,14 @@ mod tests {
         assert_eq!(Settings::load(tmp.path()), Settings::default());
         std::fs::write(
             tmp.path().join(FILE_NAME),
-            r#"{ "stateDir": "relative/dir" }"#,
+            r#"{ "stateDir": "relative/dir", "askpass": "pitcrew-askpass" }"#,
         )
         .unwrap();
-        assert_eq!(Settings::load(tmp.path()).state_dir, None);
-        let settings = Settings::default().with_env(|_| Some(OsString::from("bin/pitcrewd")));
-        assert_eq!(settings.pitcrewd, None);
+        let settings = Settings::load(tmp.path());
         assert_eq!(settings.state_dir, None);
+        assert_eq!(settings.askpass, None);
+        let settings = Settings::default().with_env(|_| Some(OsString::from("bin/pitcrewd")));
+        assert_eq!(settings, Settings::default());
     }
 
     #[test]
