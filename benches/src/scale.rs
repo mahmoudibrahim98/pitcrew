@@ -665,6 +665,14 @@ fn measure(options: &Options, work: &Path) -> Result<()> {
         .prefix("pcs-")
         .tempdir_in(&short)
         .map_err(|e| format!("cannot make a folder in {}: {e}", short.display()))?;
+    // The daemon uses TMUX_TMPDIR only if it is private to this user; a temp dir follows the
+    // umask.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(tmux.path(), fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("cannot make {} private: {e}", tmux.path().display()))?;
+    }
     let env = Env {
         bin: options.pitcrewd.clone(),
         work: work.to_path_buf(),
