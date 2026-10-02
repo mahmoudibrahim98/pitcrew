@@ -248,16 +248,19 @@ mod unix {
             Arc::new(Machine::new(slurm, pitcrewd())),
             Arc::new(tempfile::tempdir().unwrap()),
             Arc::new(MemoryStore::default()),
+            Answers::default(),
             tweak,
         )
     }
 
     /// The app over `machine`, with its registry file in `data` and its keychain `tokens`, as
-    /// `app::setup` makes it: the saved remote workspaces are resumed.
+    /// `app::setup` makes it: the saved remote workspaces are resumed, the UI answering prompts
+    /// as `answers` says.
     fn build(
         machine: Arc<Machine>,
         data: Arc<tempfile::TempDir>,
         tokens: Arc<MemoryStore>,
+        answers: Answers,
         tweak: impl FnOnce(&mut RemoteOptions, &Machine),
     ) -> World {
         let registry_file = data.path().join("data").join(registry::FILE_NAME);
@@ -318,7 +321,7 @@ mod unix {
             });
         }
         // The UI: it answers each prompt as `answers` says, through the IPC.
-        let answers: Arc<Mutex<Answers>> = Arc::default();
+        let answers = Arc::new(Mutex::new(answers));
         let results: Arc<Mutex<Vec<String>>> = Arc::default();
         {
             let answers = Arc::clone(&answers);
@@ -444,13 +447,15 @@ mod unix {
             all
         }
 
-        /// The app quits and starts again, over the same machine, keychain and registry file.
-        fn restart(&self) -> World {
+        /// The app quits and starts again, over the same machine, keychain and registry file,
+        /// its UI answering as `answers` says.
+        fn restart(&self, answers: Answers) -> World {
             self.shutdown();
             build(
                 Arc::clone(&self.machine),
                 Arc::clone(&self.data),
                 Arc::clone(&self.tokens),
+                answers,
                 |_, _| {},
             )
         }
@@ -1246,13 +1251,14 @@ mod unix {
     }
 
     /// The app quits and starts again: the saved remote workspace's tunnel is made again, and it
-    /// is `ready` with its token from the keychain. Without its token it `needs_pairing`.
+    /// is `ready` with its token from the keychain. A sign-in that reconnect asks for before the
+    /// page listens is held for the page. Without its token the workspace `needs_pairing`.
     fn a_saved_remote_comes_back_after_a_restart() {
         let w = world(false, |_, _| {});
         let id = w.add_direct(120).unwrap();
         assert_eq!(id, DEMO);
 
-        let again = w.restart();
+        let again = w.restart(Answers::default());
         again.wait("the saved workspace ready again", |w| {
             w.state(&id) == Some(WorkspaceState::Ready)
         });
@@ -1264,9 +1270,43 @@ mod unix {
             .unwrap();
         assert_eq!(me["status"], 200, "{me}");
 
+        // The machine now asks for a password: the reconnect at launch asks before the page
+        // listens. The prompt is held, and emitted again (same id) when the page first asks for
+        // the workspaces; not again on later asks.
+        w.machine.require_password(PASSWORD);
+        let held = again.restart(Answers {
+            hold: true,
+            ..Answers::default()
+        });
+        let open = held.open_prompt();
+        assert_eq!(serde_json::to_value(open.kind).unwrap(), "password");
+        let emitted = |w: &World| {
+            w.events(PROMPT_EVENT)
+                .iter()
+                .filter(|p| p["id"] == open.id.as_str())
+                .count()
+        };
+        let before = emitted(&held);
+        held.call("gateway_workspaces", json!({})).unwrap();
+        assert_eq!(emitted(&held), before + 1, "emitted again for the page");
+        held.call("gateway_workspaces", json!({})).unwrap();
+        assert_eq!(emitted(&held), before + 1, "only once");
+        assert_eq!(held.state(&id), Some(WorkspaceState::Connecting));
+        held.call(
+            "gateway_prompt_reply",
+            json!({ "id": open.id, "answer": PASSWORD }),
+        )
+        .unwrap();
+        held.wait("ready once the page answered", |w| {
+            w.state(&id) == Some(WorkspaceState::Ready)
+        });
+
         // The keychain lost the token: connected, but it needs pairing, and nothing is sent.
-        again.tokens.delete(&id).unwrap();
-        let third = again.restart();
+        held.tokens.delete(&id).unwrap();
+        let third = held.restart(Answers {
+            password: Some(PASSWORD.into()),
+            ..Answers::default()
+        });
         third.wait("the workspace needs pairing", |w| {
             w.state(&id) == Some(WorkspaceState::NeedsPairing)
         });
