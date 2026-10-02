@@ -112,9 +112,18 @@ case "$stage" in
 esac
 
 # Sidecars, named as Tauri's externalBin wants them (<name>-<target>[.exe]); it drops the target.
+# A universal macOS build compiles the app once per architecture, and tauri-build checks for the
+# sidecars under each architecture's name too; the universal binary serves both. Only the
+# universal-apple-darwin copy goes into the bundle.
+names=("$target")
+if [ "$target" = universal-apple-darwin ]; then
+  names+=(aarch64-apple-darwin x86_64-apple-darwin)
+fi
 for bin in "${sidecars[@]}"; do
-  cp "$dist/$bin-$from$exe" "$stage/bin/$bin-$target$exe"
-  chmod 0755 "$stage/bin/$bin-$target$exe"
+  for name in "${names[@]}"; do
+    cp "$dist/$bin-$from$exe" "$stage/bin/$bin-$name$exe"
+    chmod 0755 "$stage/bin/$bin-$name$exe"
+  done
 done
 
 # The helpers are data here: uploaded to remote machines, never run on this one.

@@ -156,7 +156,9 @@ jobs:
     permissions:
       contents: read
     strategy:
-      fail-fast: true
+      # A release stops at the first failed installer; a manual run builds them all, so one run
+      # shows every OS's result.
+      fail-fast: ${{ github.event_name == 'push' }}
       matrix:
         include:
           - os: ubuntu-24.04
