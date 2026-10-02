@@ -5,10 +5,13 @@
 //!   on the request's `PATH` (else ptyd's own), absolute entries only, so a name is never a
 //!   shell builtin and the working directory never decides what runs. On Windows, `PATHEXT`
 //!   extensions are tried too.
+//! - **Windows names.** A program whose name ends in a dot or a space, or names a stream
+//!   (`:` after the drive), is refused: Windows would run another file than the name shows.
 //! - **Windows batch files** (`.bat`, `.cmd`, such as npm's shims) run through `cmd.exe`, which
-//!   parses their arguments again with its own rules; an argument with a character `cmd.exe`
-//!   treats specially (`" % ! ^ & | < > ( )` or a control character) is refused rather than
-//!   risk running something else.
+//!   parses their command line again with its own rules; an argument with a character
+//!   `cmd.exe` treats specially (`" % ! ^ & | < > ( )` or a control character), or such a
+//!   character in the batch file's path (`( )` allowed there once the path is quoted for a
+//!   space), is refused rather than risk running something else.
 //! - The working directory must be absolute and exist; variable names must be names (POSIX
 //!   names on Unix; on Windows, no `=`) and nothing may hold a NUL.
 
@@ -82,15 +85,8 @@ pub(crate) fn prepare(
         .or_else(|| std::env::var_os("PATH"));
     let found = find(program, path.as_deref(), dir)
         .ok_or_else(|| format!("{program:?} is not a program file on PATH"))?;
-    #[cfg(windows)]
-    if is_batch(&found)
-        && let Some(arg) = args.iter().find(|a| !cmd_safe(a))
-    {
-        return Err(format!(
-            "{} is a batch file, which cmd.exe runs, and the argument {arg:?} holds a \
-             character cmd.exe would act on",
-            found.display()
-        ));
+    if cfg!(windows) {
+        check_windows_program(&found, args)?;
     }
     let mut command = CommandBuilder::new(&found);
     command.args(args);
@@ -187,20 +183,87 @@ fn is_program(path: &Path) -> bool {
     })
 }
 
+/// Refuses, on Windows, a program path whose name Windows would read differently than it looks,
+/// and a batch file with an argument (or a path) `cmd.exe` would act on.
+///
+/// - Windows drops trailing dots and spaces from a file name, and `name:stream` names a file's
+///   stream: `t.cmd.`, `t.cmd ` and `t.cmd::$DATA` all run `t.cmd`, through `cmd.exe`, while
+///   their extension does not look like `.cmd` (the CVE-2024-43402 class). Such names are
+///   refused outright, so what is left is judged by the extension Windows uses.
+/// - A batch file's command line is parsed again by `cmd.exe`: every argument, and the path
+///   itself, must be free of `" % ! ^ & | < >` and control characters. `( )` are refused in
+///   arguments, and in the path unless it holds a space (then it is quoted, and they are
+///   literal inside quotes).
+fn check_windows_program(found: &Path, args: &[String]) -> Result<(), String> {
+    let shown = found.display();
+    if let Some(why) = misleading_name(found) {
+        return Err(format!("{shown}: {why}"));
+    }
+    if !is_batch(found) {
+        return Ok(());
+    }
+    if let Some(arg) = args.iter().find(|a| !cmd_safe(a)) {
+        return Err(format!(
+            "{shown} is a batch file, which cmd.exe runs, and the argument {arg:?} holds a \
+             character cmd.exe would act on"
+        ));
+    }
+    if !batch_path_safe(&found.to_string_lossy()) {
+        return Err(format!(
+            "{shown} is a batch file, which cmd.exe runs, and its path holds a character \
+             cmd.exe would act on"
+        ));
+    }
+    Ok(())
+}
+
+/// Why Windows would read this path's name as something else: a stream (`:` after the drive),
+/// or a trailing dot or space on the file name.
+fn misleading_name(path: &Path) -> Option<&'static str> {
+    let full = path.to_string_lossy();
+    let rest = full
+        .strip_prefix(r"\\?\")
+        .or_else(|| full.strip_prefix(r"\\.\"))
+        .unwrap_or(&full);
+    let rest = match rest.as_bytes() {
+        [drive, b':', ..] if drive.is_ascii_alphabetic() => &rest[2..],
+        _ => rest,
+    };
+    if rest.contains(':') {
+        return Some("a name with ':' names a file's stream, which is refused");
+    }
+    let name = path.file_name()?.to_string_lossy();
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Some("a name ending in a dot or a space is refused (Windows drops them)");
+    }
+    None
+}
+
 /// A `.bat` or `.cmd` file, which Windows runs through `cmd.exe`.
-#[cfg_attr(not(windows), allow(dead_code))]
 fn is_batch(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("bat") || e.eq_ignore_ascii_case("cmd"))
 }
 
+/// A character `cmd.exe` may act on even inside quotes, or in a value it parses again.
+fn cmd_special(c: char) -> bool {
+    c.is_control() || matches!(c, '"' | '%' | '!' | '^' | '&' | '|' | '<' | '>')
+}
+
 /// An argument `cmd.exe` passes on unchanged once quoted.
-#[cfg_attr(not(windows), allow(dead_code))]
 fn cmd_safe(arg: &str) -> bool {
-    !arg.chars().any(|c| {
-        c.is_control() || matches!(c, '"' | '%' | '!' | '^' | '&' | '|' | '<' | '>' | '(' | ')')
-    })
+    !arg.chars()
+        .any(|c| cmd_special(c) || matches!(c, '(' | ')'))
+}
+
+/// A batch file's path `cmd.exe` takes as it is. portable-pty quotes it when it holds a space,
+/// and `( )` are literal inside quotes.
+fn batch_path_safe(path: &str) -> bool {
+    let quoted = path.contains(' ');
+    !path
+        .chars()
+        .any(|c| cmd_special(c) || (!quoted && matches!(c, '(' | ')')))
 }
 
 #[cfg(test)]
@@ -215,18 +278,15 @@ mod tests {
     fn requests_are_checked() {
         let tmp = std::env::temp_dir();
         let cwd = tmp.to_str().expect("utf-8 temp dir");
+        let missing = tmp.join("no-such-dir-pitcrew");
+        let missing = missing.to_str().expect("utf-8");
         for (argv, cwd, env, why) in [
             (strings(&[]), cwd, vec![], "no program"),
             (strings(&[""]), cwd, vec![], "empty"),
             (strings(&["-x"]), cwd, vec![], "may not start"),
             (strings(&["sh", "a\0b"]), cwd, vec![], "NUL"),
             (strings(&["sh"]), "relative/dir", vec![], "not absolute"),
-            (
-                strings(&["sh"]),
-                "/nonexistent/pitcrew/dir",
-                vec![],
-                "does not exist",
-            ),
+            (strings(&["sh"]), missing, vec![], "does not exist"),
             (
                 strings(&["sh"]),
                 cwd,
@@ -311,5 +371,56 @@ mod tests {
         ] {
             assert!(!cmd_safe(unsafe_arg), "{unsafe_arg}");
         }
+    }
+
+    #[test]
+    fn names_windows_reads_differently_are_refused() {
+        for misleading in [
+            r"C:\npm\claude.cmd.",
+            r"C:\npm\claude.cmd ",
+            r"C:\npm\claude.cmd. . ",
+            r"C:\npm\claude.cmd::$DATA",
+            r"C:\npm\claude.cmd:x",
+            r"\\?\C:\npm\claude.cmd:x",
+            r"C:\npm:dir\claude.cmd",
+            r"relative.cmd:x",
+        ] {
+            assert!(
+                misleading_name(Path::new(misleading)).is_some(),
+                "{misleading}"
+            );
+        }
+        for plain in [
+            r"C:\npm\claude.cmd",
+            r"\\?\C:\Program Files\nodejs\node.exe",
+            r"\\.\C:\x\y.exe",
+            r"D:\a.b\c",
+            r"C:\x\.hidden",
+        ] {
+            assert_eq!(misleading_name(Path::new(plain)), None, "{plain}");
+        }
+        // A batch file's own path is judged too; ( ) only once quoted for its space.
+        assert!(batch_path_safe(
+            r"C:\Users\a\AppData\Roaming\npm\claude.cmd"
+        ));
+        assert!(batch_path_safe(r"C:\Program Files (x86)\x\t.cmd"));
+        for bad in [
+            r"C:\a&b\t.cmd",
+            r"C:\(x)\t.cmd",
+            r"C:\100%\t.cmd",
+            r"C:\a b\x^y\t.cmd",
+            r"C:\a b\x!y!\t.cmd",
+        ] {
+            assert!(!batch_path_safe(bad), "{bad}");
+        }
+        // Applied together: a plain exe passes whatever its arguments; a batch file does not.
+        let hostile = strings(&["&echo x>pwned"]);
+        assert!(check_windows_program(Path::new(r"C:\x\tool.exe"), &hostile).is_ok());
+        for refused in [r"C:\x\t.cmd", r"C:\x\t.BAT", r"C:\x\t.cmd.", r"C:\x\t.cmd "] {
+            let why = check_windows_program(Path::new(refused), &hostile).expect_err(refused);
+            assert!(why.contains("cmd.exe") || why.contains("refused"), "{why}");
+        }
+        assert!(check_windows_program(Path::new(r"C:\x\t.cmd"), &strings(&["--resume"])).is_ok());
+        assert!(check_windows_program(Path::new(r"C:\a&b\t.cmd"), &[]).is_err());
     }
 }
