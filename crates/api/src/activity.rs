@@ -663,11 +663,16 @@ mod tests {
     fn the_walk_stops_at_max_depth() {
         let id = SessionId::new();
         let filter = KeyMatch::session(id);
-        // The object holding `session` at `level`, 1 being the body itself.
+        // The object holding `session` at `level`, 1 being the body itself. Nested by moving each
+        // value into the next, not with `json!({ "inner": [value] })`: that serializes `value`
+        // again, recursing once per level, which overflowed a test thread's stack at 1000 levels
+        // in a Windows debug build.
         let nested = |level: usize| {
             let mut value = serde_json::json!({ "session": id.0.to_string() });
             for _ in 1..level {
-                value = serde_json::json!({ "inner": [value] });
+                let mut outer = serde_json::Map::new();
+                outer.insert("inner".to_owned(), serde_json::Value::Array(vec![value]));
+                value = serde_json::Value::Object(outer);
             }
             value
         };
