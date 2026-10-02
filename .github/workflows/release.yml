@@ -1,6 +1,9 @@
-# Owned by stream P. Builds pitcrewd and pitcrew for every platform on a `v*` tag, then writes
-# SHA256SUMS and SBOMs, attests build provenance and opens a DRAFT GitHub release. A manual run
-# (workflow_dispatch) builds and uploads the artefacts only: no attestation, no release.
+# Owned by stream P. On a `v*` tag: builds pitcrewd, pitcrew, pitcrew-ptyd and pitcrew-askpass
+# for every platform, then the desktop installers from those same binaries (Linux .deb and
+# AppImage, macOS DMG, Windows NSIS), checks the installers, writes SHA256SUMS and SBOMs, attests
+# build provenance and opens a DRAFT GitHub release. A manual run (workflow_dispatch) builds,
+# checks and uploads the artefacts only: no attestation, no release, nothing published (the
+# `attest` and `release` jobs run only for a pushed `v*` tag).
 #
 # Actions are pinned by commit SHA (`gh api repos/<owner>/<repo>/git/ref/tags/<tag>`); tools are
 # pinned by version (cargo install --locked) or by hash (Zig: packaging/zig-requirements.txt).
@@ -26,6 +29,9 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_ZIGBUILD_VERSION: "0.23.4"
   CARGO_CYCLONEDX_VERSION: "0.5.9"
+  # The Tauri CLI that bundles the desktop: the same major.minor as the desktop's tauri crate (and
+  # the UI's @tauri-apps/api), as docs/build/contracts/desktop-gateway.md requires.
+  TAURI_CLI_VERSION: "2.12.1"
   # centos:7 (glibc 2.17), by digest: the static helper must run on an old Linux, offline.
   OLD_GLIBC_IMAGE: docker.io/library/centos:7@sha256:be65f488b7764ad3638f236b7b515b3678369a5124c47b8d32916d6487418ea4
 
@@ -98,7 +104,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          for bin in pitcrewd pitcrew; do
+          for bin in pitcrewd pitcrew pitcrew-ptyd pitcrew-askpass; do
             file "dist/$bin-$TARGET" | tee /dev/stderr | grep -Eq 'statically linked|static-pie linked'
           done
 
@@ -107,8 +113,10 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          docker run --rm --network none -v "$PWD/dist:/dist:ro" "$OLD_GLIBC_IMAGE" \
-            "/dist/pitcrewd-$TARGET" --version
+          for bin in pitcrewd pitcrew-ptyd; do
+            docker run --rm --network none -v "$PWD/dist:/dist:ro" "$OLD_GLIBC_IMAGE" \
+              "/dist/$bin-$TARGET" --version
+          done
 
       - name: Sign (macOS placeholder)
         if: runner.os == 'macOS'
@@ -137,9 +145,137 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # The desktop installers, from the build job's binaries: pitcrewd, pitcrew-ptyd and
+  # pitcrew-askpass next to the app (on Linux the static x86_64 musl builds), the three helpers in
+  # helpers/, and their checksums compiled into the app. See packaging/README.md.
+  desktop:
+    name: Desktop (${{ matrix.target }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            rust-targets: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: universal-apple-darwin
+            rust-targets: aarch64-apple-darwin x86_64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            rust-targets: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Rust
+        shell: bash
+        env:
+          RUST_TARGETS: ${{ matrix.rust-targets }}
+        run: |
+          channel=$(sed -nE 's/^channel *= *"([^"]+)".*/\1/p' rust-toolchain.toml)
+          if [ -z "$channel" ]; then echo "::error::no channel in rust-toolchain.toml"; exit 1; fi
+          read -r -a targets <<<"$RUST_TARGETS"
+          rustup toolchain install "$channel" --profile minimal
+          rustup target add --toolchain "$channel" "${targets[@]}"
+          rustc --version
+
+      # The libraries Tauri links (as in ci.yml), and what the checks use: unsquashfs for the
+      # AppImage's owners, desktop-file-validate, and Xvfb to start the app.
+      - name: Linux libraries and tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev \
+            squashfs-tools desktop-file-utils xvfb xauth
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      # The UI the app serves (apps/ui/dist). pnpm comes from the root package.json, by corepack.
+      - name: The UI
+        shell: bash
+        run: |
+          corepack enable
+          pnpm install --frozen-lockfile
+          pnpm --filter @pitcrew/ui build
+
+      - name: Tauri CLI
+        shell: bash
+        run: cargo install tauri-cli --locked --version "${TAURI_CLI_VERSION}"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: bin-*
+          merge-multiple: true
+          path: dist
+
+      # Tauri's bundler signs while it bundles (the app before its DMG; the programs, then the
+      # installer, on Windows), so these placeholders stand before it. See packaging/README.md.
+      - name: Sign the app (macOS placeholder)
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: bash packaging/sign.sh macos dist
+
+      - name: Sign the app (Windows placeholder)
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: bash packaging/sign.sh windows dist
+
+      - name: Bundle
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: bash packaging/desktop/build.sh --dist dist --out dist/desktop "$TARGET"
+
+      # Sizes against the 25 MB budget (a warning when over), the layout, the helpers' sha256
+      # against the compiled manifest, owners and modes, pitcrew:// and, on Windows, a real
+      # install, upgrade and removal.
+      - name: Check the installers
+        shell: bash
+        run: bash packaging/desktop/check.sh --manifest dist/desktop-stage/helpers/manifest.json dist/desktop/*
+
+      # The app started once, as installed, in a throwaway home: its own pitcrewd and askpass.
+      - name: Start the installed app (Linux)
+        if: runner.os == 'Linux'
+        env:
+          # No FUSE needed: the AppImage runs from a folder it extracts itself.
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          sudo apt-get install -y ./dist/desktop/*.deb
+          bash packaging/desktop/smoke.sh /usr/bin/pitcrew-desktop
+          bash packaging/desktop/smoke.sh dist/desktop/*.AppImage
+
+      - name: Start the app (macOS)
+        if: runner.os == 'macOS'
+        run: bash packaging/desktop/smoke.sh dist/desktop/*.dmg
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-${{ matrix.target }}
+          path: dist/desktop/*
+          if-no-files-found: error
+          retention-days: 7
+
   manifest:
     name: Checksums and SBOM
-    needs: build
+    needs: [build, desktop]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -153,6 +289,11 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: bin-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: desktop-*
           merge-multiple: true
           path: dist
       - name: SBOM

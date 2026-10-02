@@ -32,7 +32,20 @@
   },
   "bundle": {
     "active": false,
-    "icon": ["icons/icon.png", "icons/icon.ico"]
+    "targets": ["deb", "appimage", "app", "dmg", "nsis"],
+    "publisher": "The PitCrew Authors",
+    "copyright": "Copyright The PitCrew Authors",
+    "license": "Apache-2.0",
+    "category": "DeveloperTool",
+    "shortDescription": "Tracks AI coding agents' sessions, locally and on remote machines.",
+    "longDescription": "PitCrew tracks AI coding agents' sessions on this computer and on remote and HPC machines, and shows when an agent needs you.",
+    "icon": ["icons/icon.png", "icons/icon.ico"],
+    "linux": {
+      "deb": { "recommends": ["openssh-client"] }
+    },
+    "windows": {
+      "nsis": { "installMode": "currentUser" }
+    }
   },
   "plugins": {
     "deep-link": {

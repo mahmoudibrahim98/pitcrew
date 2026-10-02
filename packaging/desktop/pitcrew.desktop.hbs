@@ -1,0 +1,17 @@
+{{!-- The .deb's and the AppImage's desktop entry (bundle.linux.deb.desktopTemplate, set by
+packaging/desktop/build.sh). Tauri's own template has no %u in Exec, so the desktop would start
+PitCrew for a pitcrew:// link without passing the link on. --~}}
+[Desktop Entry]
+Categories={{categories}}
+{{#if comment}}
+Comment={{comment}}
+{{/if}}
+Exec={{exec}} %u
+StartupWMClass={{exec}}
+Icon={{icon}}
+Name={{name}}
+Terminal=false
+Type=Application
+{{#if mime_type}}
+MimeType={{mime_type}};
+{{/if}}

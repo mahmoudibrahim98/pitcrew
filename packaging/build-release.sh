@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Builds release binaries of pitcrewd (the daemon and remote helper) and pitcrew (the agent CLI),
-# then writes a SHA256SUMS manifest next to them.
+# Builds release binaries of pitcrewd (the daemon and remote helper), pitcrew (the agent CLI),
+# pitcrew-ptyd (the terminal supervisor, installed next to pitcrewd) and pitcrew-askpass (ssh's
+# prompt helper, installed next to the desktop app), then writes a SHA256SUMS manifest next to
+# them.
 #
 #   packaging/build-release.sh [--out DIR] [--zig] TARGET...
 #
@@ -13,10 +15,10 @@
 # file in DIR. See packaging/README.md.
 set -euo pipefail
 
-bins=(pitcrewd pitcrew)
-packages=(-p pitcrew-daemon -p pitcrew-cli)
+bins=(pitcrewd pitcrew pitcrew-ptyd pitcrew-askpass)
+packages=(-p pitcrew-daemon -p pitcrew-cli -p pitcrew-ptyd -p pitcrew-remote)
 
-usage() { sed -n '2,14p' "$0"; }
+usage() { sed -n '2,16p' "$0"; }
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=dist
