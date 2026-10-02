@@ -40,7 +40,7 @@ macro_rules! ulid_id {
             /// Creates a new, time-ordered id.
             #[must_use]
             pub fn new() -> Self {
-                Self(Ulid::new())
+                Self(Ulid::generate())
             }
         }
 

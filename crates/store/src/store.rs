@@ -953,7 +953,7 @@ fn ensure_log_id(conn: &mut Connection) -> Result<String> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute(
         "INSERT OR IGNORE INTO meta (key, value) VALUES ('log_id', ?1)",
-        [ulid::Ulid::new().to_string()],
+        [ulid::Ulid::generate().to_string()],
     )?;
     let id = tx.query_row("SELECT value FROM meta WHERE key = 'log_id'", [], |r| {
         r.get(0)

@@ -509,7 +509,7 @@ fn checked<'a>(what: &str, value: &'a str, is_plain: fn(&str) -> bool) -> Result
 /// A random UUID (version 4), as Claude's `--session-id` wants.
 fn new_uuid() -> String {
     // A ULID's random part has 80 bits; two of them fill 128.
-    let bits = (ulid::Ulid::new().random() << 48) ^ ulid::Ulid::new().random();
+    let bits = (ulid::Ulid::generate().random() << 48) ^ ulid::Ulid::generate().random();
     let mut b = bits.to_be_bytes();
     // Version 4, variant 10xx.
     b[6] = (b[6] & 0x0f) | 0x40;
