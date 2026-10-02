@@ -63,7 +63,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [E-setup](E-setup.md) | E · Work model | `s/E/setup` | Sonnet-class | **Merged** |
 | [0-mock-setup](0-mock-setup.md) | 0 · Contracts | `integrator/mock-setup` | Sonnet-class | **Merged** |
 | [K-remote-workspaces](K-remote-workspaces.md) | K · Desktop shell | `s/K/remote-workspaces` | Opus-class | **Merged** |
-| [B-tmux-runtime](B-tmux-runtime.md) | B · Runtime | `s/B/tmux-runtime` | Opus-class | In progress |
+| [B-tmux-runtime](B-tmux-runtime.md) | B · Runtime | `s/B/tmux-runtime` | Opus-class | **Merged** |
 | [0-daemon-setup](0-daemon-setup.md) | 0 · Composition root | `integrator/daemon-setup` | Opus-class | **Merged** |
 | [0-onboarding-wiring](0-onboarding-wiring.md) | 0 · Contracts | `integrator/onboarding-wiring` | Opus-class | **Merged** |
 | [0-hardening-sweep](0-hardening-sweep.md) | 0 · Contracts | `integrator/hardening-sweep` | Opus-class | In progress |
