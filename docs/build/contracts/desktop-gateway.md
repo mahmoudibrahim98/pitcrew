@@ -195,6 +195,8 @@ string }`, ending with one `done` or `failed` for the whole add. A plan is used 
 - `gateway_workspace_retry({ workspace })` tries a remote workspace's connection again at once, for
   example after a sign-in was cancelled while reconnecting (which leaves it `unreachable` until
   then). It returns when the attempt has started; the state follows on `gateway://workspaces`.
+  Retries while an attempt runs make one more attempt after it, not one each, and the workspace is
+  `connecting` during the attempt.
 - `gateway_workspace_remove({ workspace, stopHelper: boolean })` forgets a workspace and deletes
   its keychain token. With `stopHelper`, it first stops the remote helper (cancelling its job for
   SLURM).
