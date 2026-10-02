@@ -14,7 +14,7 @@ Globs: `*` matches within one path segment, `**` across segments.
 
 | Stream | Owns |
 |---|---|
-| **0** Contracts and skeleton | Root manifests and configs (`Cargo.toml`, `package.json`, `pnpm-workspace.yaml`, `rust-toolchain.toml`, `clippy.toml`, `deny.toml`, dotfiles), root docs (`README`, `CLAUDE.md`, `LICENSE`, `NOTICE`, `CONTRIBUTING`, `CODE_OF_CONDUCT`, `SECURITY`), `.github/workflows/ci.yml`, `fuzz.yml` and the other `.github` files, `scripts/`, `.cargo/`, `.vscode/`, `docs/*.md`, `crates/protocol`, `crates/interfaces`, `crates/fixtures`, `crates/daemon`, `crates/store/migrations/00*` (and `*.md` there), `apps/mock-hub`, `packages/tokens`, `packages/protocol-ts`, `docs/adr`, `docs/build` |
+| **0** Contracts and skeleton | Root manifests and configs (`Cargo.toml`, `package.json`, `pnpm-workspace.yaml`, `rust-toolchain.toml`, `clippy.toml`, `deny.toml`, dotfiles), root docs (`README`, `AGENTS.md`, `CLAUDE.md`, `LICENSE`, `NOTICE`, `CONTRIBUTING`, `CODE_OF_CONDUCT`, `SECURITY`), `.github/workflows/ci.yml`, `fuzz.yml` and the other `.github` files, `scripts/`, `.cargo/`, `.vscode/`, `docs/*.md`, `crates/protocol`, `crates/interfaces`, `crates/fixtures`, `crates/daemon`, `crates/store/migrations/00*` (and `*.md` there), `apps/mock-hub`, `packages/tokens`, `packages/protocol-ts`, `docs/adr`, `docs/build` |
 | **A** Ingest | `crates/ingest/**` |
 | **B** Runtime | `crates/runtime/**`, `crates/ptyd/**` |
 | **C** Store | `crates/store/*` (manifest, README, `build.rs`), `src`, `tests`, `benches`, `crates/store/migrations/01*` |

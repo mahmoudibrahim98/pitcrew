@@ -82,6 +82,12 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [J-acl-followups](J-acl-followups.md) | J · Remote and HPC | `s/J/acl-followups` | Opus-class | Ready |
 | [0-memory-budget](0-memory-budget.md) | 0 · Composition root | `integrator/memory-budget` | Opus-class | Ready |
 | [0-trust-sweep](0-trust-sweep.md) | 0 · Contracts | `integrator/trust-sweep` | Opus-class | Ready once PR #9 merges |
+| [0-deps-ulid-3](0-deps-ulid-3.md) | 0 · Contracts | `integrator/deps-ulid-3` | Codex | Ready |
+| [0-deps-getrandom-04](0-deps-getrandom-04.md) | 0 · Contracts | `integrator/deps-getrandom-04` | Codex | Ready |
+| [0-deps-tungstenite-030](0-deps-tungstenite-030.md) | 0 · Contracts | `integrator/deps-tungstenite-030` | Codex | Ready |
+| [0-deps-typescript-7](0-deps-typescript-7.md) | 0 · Contracts | `integrator/deps-typescript-7` | Codex | Ready |
+| [0-workspace-host](0-workspace-host.md) | 0 · Contracts | `integrator/workspace-host` | Codex | Ready |
+| [I-hook-exec-form](I-hook-exec-form.md) | I · CLI and hooks | `s/I/hook-exec-form` | Codex | Ready |
 | [0-daemon-solo](0-daemon-solo.md) | 0 · Composition root | `integrator/daemon-solo` | Opus-class | **Merged** |
 | [N-projects-wiring](N-projects-wiring.md) | N · Projects layout | `s/N/projects-wiring` | Sonnet-class | **Merged** |
 | [L-shell-polish](L-shell-polish.md) | L · UI foundation | `s/L/shell-polish` | Sonnet-class | **Merged** |
@@ -116,8 +122,9 @@ worktrees or branches, and do not switch branches.** Before any other work:
 If the branch is wrong, or you are on `main`, **stop and tell the user**. Edit only files inside
 this worktree.
 
-**In a cloud session** (`CLAUDE_CODE_REMOTE=true`) there is no worktree: create your brief's branch
-from `main` if you are not on it, and follow the root `CLAUDE.md`.
+**In a cloud session** (`CLAUDE_CODE_REMOTE=true`, or a Codex cloud task) there is no worktree:
+create your brief's branch from `main` if you are not on it. Then follow the root `CLAUDE.md` (Claude
+Code) or `AGENTS.md` (Codex and other agents).
 
 ## 2. Environment
 
@@ -133,7 +140,8 @@ from `main` if you are not on it, and follow the root `CLAUDE.md`.
   Keep `CARGO_BUILD_JOBS=4`: several agents build at once, and unbounded parallel builds have
   run the machine out of memory.
 - **Linux and macOS:** run `cargo` directly.
-- **Cloud sessions:** run `cargo` directly, and mind the VM's disk (see the root `CLAUDE.md`).
+- **Cloud sessions:** run `cargo` directly, and mind the VM's disk (see the root `CLAUDE.md` or
+  `AGENTS.md`).
 - **Node 24** runs natively. `npm test` runs the mock-hub and CI-script tests.
   `npm run mock-hub` serves the fake daemon on `http://127.0.0.1:47317`. Its tokens are
   `dev-device-token` (a person) and `dev-agent-token` (an agent).
@@ -181,7 +189,8 @@ Plus every acceptance check in your brief.
 1. Commit to your branch in small, clear commits. End each message with the co-author line your
    tool adds, if any.
 2. **Do not push, merge, rebase `main`, or touch any other branch.** In a cloud session, push only
-   your own branch and open a pull request instead (see the root `CLAUDE.md`); never push to `main`.
+   your own branch and open a pull request instead (see the root `CLAUDE.md` or `AGENTS.md`); never
+   push to `main`.
 3. End with a report in the shape of `.github/pull_request_template.md`:
    - what changed, with the files;
    - how you checked it, pasting **real output**;
