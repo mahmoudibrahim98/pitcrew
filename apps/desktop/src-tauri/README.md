@@ -279,10 +279,11 @@ invoke('gateway_prompt_reply', { id, answer })                 // or { id, accep
      workspace, or by a remote one on another machine (another host or root), with "already
      added as <name>; remove it first"; only the same machine may be paired again (its entry is
      replaced). Only then is the token kept in the keychain under that id (if that fails, the
-     claim is undone, but only while the entry is still the claim's own: one removed meanwhile
-     stays removed), and the workspace is `ready`. A remove that came meanwhile took the entry
-     out, maybe before the token was kept: then the token is deleted again, no link is put in,
-     and the add fails ("removed while it was being added"). Its name is cleaned like a
+     claim is undone, but only while the entry is still the claim's own, by its claim's
+     generation: one removed or replaced meanwhile stays), its link is put in, and the workspace
+     is `ready`. Claim, token and link go under one lock that a remove's token, entry and link
+     take too, so a remove of the same id comes wholly before or wholly after; so does the app
+     quitting, which fails the add before anything is claimed. Its name is cleaned like a
      notification's text and cut to 80 characters. (A local daemon that reports a remote
      workspace's id is refused the same way: the local workspace is `unreachable`, saying so.
      The id and name it reported are kept, and once that remote workspace is removed, the local
@@ -311,11 +312,14 @@ invoke('gateway_prompt_reply', { id, answer })                 // or { id, accep
   attempt has started; the state follows on `gateway://workspaces`.
 - **Remove** forgets a remote workspace and deletes its keychain entry, after stopping its
   helper (`stopHelper: true`; for SLURM, cancelling its job). If the stop fails, nothing is
-  forgotten. The local workspace cannot be removed. The workspace leaves the registry before its
-  link closes, and a link is put in (by a retry, a reconnect or a pairing) only while its
-  workspace is registered, checked under the links lock: a retry or a pairing racing a remove
-  leaves no link, tunnel or token. The token is deleted before (a keychain that fails forgets
-  nothing) and again after (a pairing in flight may have kept it in between).
+  forgotten. The local workspace cannot be removed. Its token, its entry and its link go in one
+  step, under the lock pairing takes for its claim, token and link (a keychain that fails
+  forgets nothing): a pairing of the same machine comes wholly before (and goes with it) or
+  wholly after (and stays, with its token and link). A link is put in (by a retry or a
+  reconnect) only while its workspace is a registered remote one, checked under the links lock,
+  so a retry racing a remove leaves no link or tunnel. The link closes after that step, its
+  follower stopped first, and what follows a remote connection only ever sets a remote
+  workspace's state (never the local workspace's that took its id back).
 - **Connections.** The registry keeps, for each remote workspace, its host, launcher, the
   helper's root and platform, for SLURM the site, the job options and the last hop, and the
   transport the tunnel found worth remembering (`Connector::transport()`), never a secret. Each
@@ -324,7 +328,9 @@ invoke('gateway_prompt_reply', { id, answer })                 // or { id, accep
   answer (the reason in `detail`); `unreachable` with the reason once the tunnel gave up for now
   (it keeps trying as `pitcrew-remote` says, or at a retry). Requests and sockets go through
   `Connector::connect()` with the token from the keychain, read for each connection. At start
-  the tunnels of saved workspaces are made again; at quit they close.
+  the tunnels of saved workspaces are made again, in a task that first asks `ssh -V` (below); at
+  quit they close, and from then on no link is put in (a coalesced retry's next attempt, a
+  resume or a pairing still running).
 - **Names.** Each time a workspace's tunnel connects, its hub is asked `GET /v1/workspace` again,
   and its name (cleaned and cut as at pairing) is taken and saved, so a name set on the hub (by
   first-run setup, say) shows in the switcher. A hub that now reports another workspace's id is
@@ -343,12 +349,18 @@ invoke('gateway_prompt_reply', { id, answer })                 // or { id, accep
   `answer`; `host_key` (with its `fingerprint`, the `SHA256:…` or `MD5:…` of the question) and
   `confirm` (ssh's other yes/no questions, such as "Accept updated hostkeys?") take `accept`; a
   `notice` ("touch your security key") takes no answer and is closed when ssh moves on. **The
-  kind rule needs OpenSSH 8.4 or newer** (the `(user@host)` mark, and `SSH_ASKPASS_REQUIRE`),
-  so `ssh -V` is asked once per ssh program (`src/remote/gate.rs`), and an older ssh, or one
-  whose version cannot be told, gets no prompt shown or answered: it is refused (ssh is stopped
-  before it sends anything, as for a cancel), and the call fails with "ssh 8.4 or newer is
-  needed to sign in from the app; this computer's ssh is OpenSSH 8.1" (a failed sign-in of a
-  saved workspace says so in its `detail`). Keys that need no prompt still work. A reply
+  kind rule needs OpenSSH 8.4 or newer** (the `(user@host)` mark, and `SSH_ASKPASS_REQUIRE`).
+  An older one would not even use askpass: without `DISPLAY` (which its minimal environment
+  leaves out) and a terminal it sends empty passwords, up to three, which `pam_faillock` or
+  fail2ban count as failed logins. So `ssh -V` is asked once per ssh program
+  (`src/remote/gate.rs`), before ssh is built, and only an ssh judged 8.4 or newer gets prompts;
+  any other (older, one whose version cannot be told, or not asked yet) runs in `BatchMode` and
+  never asks: passwords, keyboard-interactive and unknown host keys are refused, and the call
+  fails with "ssh 8.4 or newer is needed to sign in from the app; this computer's ssh is
+  OpenSSH 8.1 (restart PitCrew after updating ssh)" (a failed sign-in of a saved workspace says
+  so in its `detail`; the verdict lasts as long as the app runs). Keys that need no prompt still
+  work. The gate also stays in front of the prompt hub: a prompt from an ssh not judged fit is
+  refused, never shown or answered (ssh is stopped before it sends anything). A reply
   with neither cancels (ssh stops; a `confirm` is answered no). A reply of the wrong shape, or
   an answer over 4 KiB, is `invalid` and the prompt stays open. `text` loses control, bidi and
   invisible characters (line breaks kept) and is cut at 2000 characters. The answer goes to ssh
@@ -378,7 +390,7 @@ invoke('gateway_prompt_reply', { id, answer })                 // or { id, accep
   be one ssh takes as a name (no leading `-`); a site recipe's name is `a-z 0-9 _ -`. Messages
   and logged reasons pass through `redact` and lose control, bidi and invisible characters.
   Windows' own OpenSSH reads `OpenSSH_for_Windows_9.5p2` on Windows 11 24H2, which may prompt;
-  Windows 10's built-in 7.7 and 8.1 get no prompt answered (keys only). Askpass with Windows'
+  Windows 10's built-in 7.7 and 8.1 run in `BatchMode` (keys only). Askpass with Windows'
   OpenSSH has not been run yet.
 
 ## The window, the CSP and the capability (`src/app.rs`, `tauri.conf.json`, `capabilities/`)
@@ -444,7 +456,7 @@ invoke('gateway_prompt_reply', { id, answer })                 // or { id, accep
 | `attention.rs` | "Needs you" against the fake daemon's live stream: the snapshot (only the person's open asks), raised and answered, other members' asks and other events ignored, resuming with `since` without a snapshot, the bound and the snapshot it asks for, a new event log, one watcher per ready workspace, a reconnect at once when the workspace is ready again, a snapshot that keeps failing retried 50, 100, 200, then 400 ms apart (the cap) and from the first wait again once it works, and too many asks read as "N+" with no hot retry. |
 | `no_token.rs` | Every command, channel message, event, error and log line (at trace, Tauri's and tungstenite's records included) is searched for a known token; the fake daemon even echoes it in response headers, and fake `pitcrewd`s print it on stderr and in the ready line; the "needs you" subscription (snapshot, live ask, reconnect), the notifications and tray lines it leads to, the navigation events, and a dropped deep link carrying the token are searched too; a canary record proves the log bridge works. |
 | `supervisor.rs` | Fake `pitcrewd` scripts: start and SIGTERM on quit; quitting while it starts and while `token show-path` runs; a growing backoff; giving up; never ready; no `pitcrewd`; a running daemon used, its workspace registered, and never stopped; starting our own when that one goes away. |
-| `remote.rs` | Remote workspaces through the IPC, against a fake machine (`remote/fake.rs`: this computer's `/bin/sh` in a temporary home behind a fake `ssh` that plays links, ControlMasters, forwards and sessions, and asks through askpass) whose helper is the **real `pitcrewd --demo`**. Direct: probe (with `tmux` when there is one), plan and add on a machine whose start-up files print banners and a false token marker, the workspace `ready`, `gateway_request` and a socket reaching the hub through the forwarded socket, the transport saved, the token the hub's own, the helper seen running, remove stopping it and deleting the keychain entry, a plan used once, and another window refused by Tauri's ACL for all eight remote commands (with a real prompt open and a real workspace, which stay so). SLURM (stand-in `sbatch`, `squeue`, `scancel`, `sinfo`): the plan's exact script submitted byte for byte though the site recipe changed after planning, a job that stays pending cancelled again, bad job options and sites refused. Prompts: a host key and a password answered in the app, a server's keyboard-interactive `Enter passphrase for key '~/.ssh/id_ed25519':` asked as a `password`, an answer over 4 KiB and a reply of the wrong shape refused with the prompt still open, then a cancelled password failing the add cleanly (nothing deployed or registered, no empty password sent, every prompt withdrawn). Takeover: a hub reporting the id of a remote on another machine, or of the local workspace, refused with that workspace and its token untouched, the helper stopped again, and a stop that fails named in the error. A restart: the saved remote `ready` again; a sign-in its reconnect asks for before the page listens held and emitted again (same id) at the page's first `gateway_workspaces`, once; `needs_pairing` once its token is gone. Cancel: an add cancelled while its SLURM job is pending (the job cancelled) and while its connection does not come (the helper stopped), nothing registered; a plan cancelled before its add is dropped; a finished add or unknown plan left alone. A sign-in cancelled while reconnecting, then `gateway_workspace_retry` back to `ready`. Retries coalesced: four clicks while a retry's sign-in waits for the person leave it be (the same prompt open, one link, one prompt), then exactly one more attempt once that sign-in is cancelled, nothing after it connects, and nothing for a connected workspace. An ssh that says it is 8.1: no prompt shown or answered (a password, a server's passphrase-like text, a host key), nothing sent, the error naming the 8.4 rule, `ssh -V` asked once, keys still working. A fresh hub set up through `gateway_request` (`POST /v1/setup`): its new name, cleaned, in the switcher and saved after the tunnel reconnects. An expired plan, a missing helper, a missing `pitcrew-askpass` and a refused configured `ssh`. No token in any result, channel message, event or log line, after an add and after a refused pairing. Its own `main` (`harness = false`): the binary is also the fake `ssh` and `pitcrew-askpass`. `pitcrewd` is `PITCREW_TEST_PITCREWD`, else built once from the root workspace into the target's temporary folder. |
+| `remote.rs` | Remote workspaces through the IPC, against a fake machine (`remote/fake.rs`: this computer's `/bin/sh` in a temporary home behind a fake `ssh` that plays links, ControlMasters, forwards and sessions, and asks through askpass) whose helper is the **real `pitcrewd --demo`**. Direct: probe (with `tmux` when there is one), plan and add on a machine whose start-up files print banners and a false token marker, the workspace `ready`, `gateway_request` and a socket reaching the hub through the forwarded socket, the transport saved, the token the hub's own, the helper seen running, remove stopping it and deleting the keychain entry, a plan used once, and another window refused by Tauri's ACL for all eight remote commands (with a real prompt open and a real workspace, which stay so). SLURM (stand-in `sbatch`, `squeue`, `scancel`, `sinfo`): the plan's exact script submitted byte for byte though the site recipe changed after planning, a job that stays pending cancelled again, bad job options and sites refused. Prompts: a host key and a password answered in the app, a server's keyboard-interactive `Enter passphrase for key '~/.ssh/id_ed25519':` asked as a `password`, an answer over 4 KiB and a reply of the wrong shape refused with the prompt still open, then a cancelled password failing the add cleanly (nothing deployed or registered, no empty password sent, every prompt withdrawn). Takeover: a hub reporting the id of a remote on another machine, or of the local workspace, refused with that workspace and its token untouched, the helper stopped again, and a stop that fails named in the error. A restart: the saved remote `ready` again; a sign-in its reconnect asks for before the page listens held and emitted again (same id) at the page's first `gateway_workspaces`, once; `needs_pairing` once its token is gone. Cancel: an add cancelled while its SLURM job is pending (the job cancelled) and while its connection does not come (the helper stopped), nothing registered; a plan cancelled before its add is dropped; a finished add or unknown plan left alone. A sign-in cancelled while reconnecting, then `gateway_workspace_retry` back to `ready`. Retries coalesced: four clicks while a retry's sign-in waits for the person leave it be (the same prompt open, one link, one prompt), then exactly one more attempt once that sign-in is cancelled, nothing after it connects, and nothing for a connected workspace. An ssh that says it is 8.1 (the fake then behaves like a real one: no askpass without `DISPLAY`, an empty password sent instead): it runs in `BatchMode`, so no prompt is shown or answered (a password, a server's passphrase-like text, a host key) and no empty password is sent, the error naming the 8.4 rule and the restart, `ssh -V` asked once, keys still working for a probe and an add, and the saved workspace's reconnect, and its reconnect after a restart, refused the same way with the rule in its `detail`. A fresh hub set up through `gateway_request` (`POST /v1/setup`): its new name, cleaned, in the switcher and saved after the tunnel reconnects. An expired plan, a missing helper, a missing `pitcrew-askpass` and a refused configured `ssh`. No token in any result, channel message, event or log line, after an add and after a refused pairing. Its own `main` (`harness = false`): the binary is also the fake `ssh` and `pitcrew-askpass`. `pitcrewd` is `PITCREW_TEST_PITCREWD`, else built once from the root workspace into the target's temporary folder. |
 
 Unit tests cover the rest: the deep-link parser as a table of hostile links, and a held target's
 60 s (`navigate.rs`); the tracker (`attention/tracker.rs`); the text, the rate limiter and the
@@ -461,15 +473,19 @@ a passphrase or a host key, each kind's own reply shape, the 4 KiB cap, text cle
 only compiled checksums, and askpass
 (`remote/helpers.rs`), the tunnel's states as workspace states, `needs_pairing` without a token
 (`remote/link.rs`), `ssh -V`'s versions read (Linux's, macOS's and Windows' OpenSSH, 8.4 the
-oldest that may prompt, anything else refused) and asked once per program (`remote/gate.rs`),
+oldest that may prompt, anything else refused), asked once per program, and prompts allowed
+only once it said 8.4 or newer (`remote/gate.rs`),
 the error codes and progress shape, the token read between its markers, a hub's name cleaned
 and cut, a failed undo in the error, and the races, each ordered by a test-only hook that pauses
 the code at a named point: a cancel between an add taking its plan and recording its cancel, a
-retry during a remove, a retry whose tunnel is made while a remove runs, and a pairing whose
-workspace is removed between its claim and its token, none leaving a link, an open tunnel or a
-token (`remote/tests.rs`); remote records saved, reloaded, given their transport, renamed and
-removed, a remote refused another workspace's id and the local daemon refused a remote's, the
-local workspace back once that remote is removed (or its claim undone), and a claim undone only
-while its entry is its own (`registry.rs`); and host names cleaned (`host.rs`).
+retry during a remove, a retry whose tunnel is made while a remove runs, a pairing during a
+remove (it waits, and keeps its token and link) and a remove during a pairing (it waits, and
+removes it all), nothing put in after shutdown, a link that stops following before its tunnel
+closes, and a remote's link that never sets the local workspace's state (`remote/tests.rs`);
+remote records saved, reloaded, given their transport, renamed and removed, a remote refused
+another workspace's id and the local daemon refused a remote's, the local workspace back once
+that remote is removed (or its claim undone), a claim undone only while its entry is its own
+(also after a connector was attached), and a remote's state setter that leaves the local
+workspace alone (`registry.rs`); and host names cleaned (`host.rs`).
 
 The OS keychain test is `#[ignore]`d: it needs an unlocked keychain (`cargo test -- --ignored`).
