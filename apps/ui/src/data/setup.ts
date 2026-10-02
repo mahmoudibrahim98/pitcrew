@@ -52,14 +52,17 @@ export async function setUp(api: Api, queryClient: QueryClient, setup: Setup): P
 }
 
 async function conflict(api: Api, queryClient: QueryClient, error: ApiError): Promise<SetupConflict> {
+  let alreadySetUp = false;
   try {
     const info = await api.workspace();
     queryClient.setQueryData<WorkspaceInfo>(keys.workspace, info);
-    return new SetupConflict(error, info.setup_needed !== true);
+    alreadySetUp = info.setup_needed !== true;
   } catch {
     // Cannot tell: the hub's own message says which.
-    return new SetupConflict(error, false);
   }
+  // Someone set it up, or holds the handle: either way the same four keys may have changed.
+  for (const queryKey of REFRESHED) void queryClient.invalidateQueries({ queryKey });
+  return new SetupConflict(error, alreadySetUp);
 }
 
 /** `setUp` bound to this scope's API and cache (a stable function). */

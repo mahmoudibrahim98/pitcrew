@@ -94,11 +94,21 @@ describe('setUp', () => {
     // Someone else finishes setup first.
     await client.setup({ ...SETUP, person: { name: 'Alex Kim', handle: '@alex' } });
 
+    const gets = (path: string) =>
+      desktop.commands('gateway_request').filter((a) => (a.req as { method: string; path: string }).path === path).length;
+    const before = { members: gets('/v1/members'), machines: gets('/v1/machines'), me: gets('/v1/me') };
+
     const error = await setUp(client, queryClient, SETUP).catch((e: unknown) => e);
     expect(error).toBeInstanceOf(SetupConflict);
     expect(error).toBeInstanceOf(ApiError);
     expect((error as SetupConflict).alreadySetUp).toBe(true);
     expect(queryClient.getQueryData<WorkspaceInfo>(keys.workspace)?.setup_needed).toBeUndefined();
+    // The same four keys refetch as after a setup of its own: someone else's person is `me` now.
+    await settled();
+    expect(gets('/v1/members')).toBeGreaterThan(before.members);
+    expect(gets('/v1/machines')).toBeGreaterThan(before.machines);
+    expect(gets('/v1/me')).toBeGreaterThan(before.me);
+    expect(queryClient.getQueryData<Member>(keys.me)?.handle).toBe('@alex');
     stop();
   });
 

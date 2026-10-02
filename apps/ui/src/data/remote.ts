@@ -106,6 +106,12 @@ export interface RemoteGateway {
    * say). Resolves once the attempt has started; its state follows on `gateway://workspaces`.
    */
   workspaceRetry(workspace: string): Promise<void>;
+  /**
+   * Stops an add still running, and undoes what it started (the helper, a submitted job); the add
+   * then ends `failed`. Does nothing once the add has finished. A gateway without the command
+   * rejects (`invalid`, or "command … not found").
+   */
+  remoteCancel(plan: string): Promise<void>;
   /** Follows `gateway://prompt`; malformed prompts are dropped. Resolves to an unsubscribe. */
   onPrompt(listener: (prompt: GatewayPrompt) => void): Promise<() => void>;
   /** Follows `gateway://prompt-closed`: the prompt `id` is no longer wanted. */
@@ -134,14 +140,37 @@ function record(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-/** Text for people to read: control characters out (new lines and tabs kept), at most `max`. */
+/** Marks where a long text was cut. */
+const CUT = '…';
+
+/** At most `max` code points, keeping the end: ssh's actual question is at the end of its text. */
+function keepTail(value: string, max: number): string {
+  const points = [...value];
+  return points.length <= max ? value : CUT + points.slice(points.length - (max - 1)).join('');
+}
+
+/** At most `max` code points, keeping the start. */
+function keepHead(value: string, max: number): string {
+  const points = [...value];
+  return points.length <= max ? value : points.slice(0, max - 1).join('') + CUT;
+}
+
+/** Text for people to read: control characters out (new lines and tabs kept), its end kept. */
 function cleanText(value: string, max = MAX_TEXT): string {
-  return value.replace(CONTROL_EXCEPT_LINES, '').slice(0, max);
+  return keepTail(value.replace(CONTROL_EXCEPT_LINES, ''), max);
 }
 
 /** A one-line string: every control character out, at most `max`. */
 function cleanLine(value: string, max = MAX_SHORT): string {
-  return value.replace(CONTROL, '').slice(0, max);
+  return keepHead(value.replace(CONTROL, ''), max);
+}
+
+/**
+ * A plan's step, or a progress message's: cleaned the same way on both, so a message still names
+ * the step it is about.
+ */
+export function cleanStep(value: string): string {
+  return cleanLine(value);
 }
 
 function optionalString(value: unknown): string | undefined | false {
@@ -149,17 +178,29 @@ function optionalString(value: unknown): string | undefined | false {
   return typeof value === 'string' ? value : false;
 }
 
-export function isGatewayWorkspace(value: unknown): value is GatewayWorkspace {
+/**
+ * A workspace from the gateway (its list, its event, a new one from `remoteAdd`), or `undefined`
+ * when it is not one. `detail` is kept only when it is a string.
+ */
+export function toGatewayWorkspace(value: unknown): GatewayWorkspace | undefined {
   const v = record(value);
-  if (v === undefined) return false;
-  return (
-    typeof v.id === 'string' &&
-    v.id !== '' &&
-    typeof v.name === 'string' &&
-    (v.kind === 'local' || v.kind === 'remote') &&
-    STATES.includes(v.state as WorkspaceState) &&
-    (v.detail === undefined || v.detail === null || typeof v.detail === 'string')
-  );
+  if (
+    v === undefined ||
+    typeof v.id !== 'string' ||
+    v.id === '' ||
+    typeof v.name !== 'string' ||
+    (v.kind !== 'local' && v.kind !== 'remote') ||
+    !STATES.includes(v.state as WorkspaceState)
+  ) {
+    return undefined;
+  }
+  return {
+    id: v.id,
+    name: v.name,
+    kind: v.kind,
+    state: v.state as WorkspaceState,
+    ...(typeof v.detail === 'string' ? { detail: v.detail } : {}),
+  };
 }
 
 /** `{ hosts: string[] }`: the host names that are non-empty one-line strings; others are dropped. */
@@ -213,7 +254,7 @@ export function parseRemotePlan(value: unknown): RemotePlan | undefined {
   if (jobScript === false) return undefined;
   return {
     plan: v.plan,
-    steps: (v.steps as string[]).map((step) => cleanText(step, MAX_SHORT)),
+    steps: (v.steps as string[]).map(cleanStep),
     ...(jobScript === undefined ? {} : { jobScript }),
   };
 }
@@ -226,7 +267,7 @@ export function parseProgress(value: unknown): RemoteProgress | undefined {
   const detail = optionalString(v.detail);
   if (detail === false) return undefined;
   return {
-    step: cleanLine(v.step),
+    step: cleanStep(v.step),
     state: v.state as RemoteProgress['state'],
     ...(detail === undefined ? {} : { detail: cleanText(detail) }),
   };

@@ -62,6 +62,8 @@ export class FakeDesktop {
   add: (plan: string, channel: FakeChannel) => Promise<unknown> = () => refuse('invalid', 'No add set up.');
   remove: (workspace: string, stopHelper: boolean) => Promise<unknown> = () => Promise.resolve(null);
   retry: (workspace: string) => Promise<unknown> = () => Promise.resolve(null);
+  /** `gateway_remote_cancel`; the default is a gateway without the command, as before K added it. */
+  cancel: (plan: string) => Promise<unknown> = () => Promise.reject('command gateway_remote_cancel not found');
   /** Called with each `gateway_prompt_reply`'s arguments. */
   onReply: ((args: Record<string, unknown>) => void) | undefined;
 
@@ -134,6 +136,8 @@ export class FakeDesktop {
         return this.remove(String(args.workspace), args.stopHelper === true);
       case 'gateway_workspace_retry':
         return this.retry(String(args.workspace));
+      case 'gateway_remote_cancel':
+        return this.cancel(String(args.plan));
       case 'gateway_prompt_reply':
         this.onReply?.(args);
         return null;

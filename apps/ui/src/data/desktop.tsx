@@ -12,7 +12,7 @@ import { createApi } from './api.ts';
 import { createGateway } from './gateway.ts';
 import { createLive } from './live.ts';
 import { createQueryClient } from './provider.tsx';
-import type { GatewayPrompt, PromptReply, RemoteGateway } from './remote.ts';
+import { toGatewayWorkspace, type GatewayPrompt, type PromptReply, type RemoteGateway } from './remote.ts';
 import {
   WorkspacesContext,
   type Gateway,
@@ -21,16 +21,8 @@ import {
   type WorkspaceData,
   type WorkspaceList,
   type WorkspaceRegistry,
-  type WorkspaceState,
 } from './workspaces.tsx';
 
-const STATES: readonly WorkspaceState[] = ['connecting', 'ready', 'unreachable', 'needs_pairing'];
-
-function isWorkspace(value: unknown): value is GatewayWorkspace {
-  if (typeof value !== 'object' || value === null) return false;
-  const { id, name, state } = value as Record<string, unknown>;
-  return typeof id === 'string' && id !== '' && typeof name === 'string' && STATES.includes(state as WorkspaceState);
-}
 
 function messageOf(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -249,8 +241,10 @@ export class Workspaces implements WorkspaceRegistry {
         if (current()) console.warn(`pitcrew: cannot follow ${what}`, error);
       }
     };
-    await subscribe('gateway://prompt', () => remote.onPrompt((prompt) => current() && this.#queuePrompt(prompt)));
-    await subscribe('gateway://prompt-closed', () => remote.onPromptClosed((id) => current() && this.#dropPrompt(id)));
+    await Promise.all([
+      subscribe('gateway://prompt', () => remote.onPrompt((prompt) => current() && this.#queuePrompt(prompt))),
+      subscribe('gateway://prompt-closed', () => remote.onPromptClosed((id) => current() && this.#dropPrompt(id))),
+    ]);
   }
 
   #cancelLeave(id: string): void {
@@ -262,33 +256,37 @@ export class Workspaces implements WorkspaceRegistry {
   }
 
   /**
-   * Subscribes to both events first, then reads the list, so no change — and no deep link, which
-   * the gateway holds until this first read — falls between subscribing and reading.
+   * Subscribes to every event first, then reads the list, so no change falls between subscribing
+   * and reading — and nothing the gateway holds until this first read (a launch-time deep link, a
+   * prompt raised while reconnecting at launch) is emitted before anyone listens.
    */
   async #follow(generation: number): Promise<void> {
     const current = () => generation === this.#generation;
-    try {
-      const unlisten = await this.#gateway.onWorkspaces((list) => {
-        if (!current()) return;
-        this.#heard = true;
-        this.#update(list);
-      });
-      if (current()) this.#unlistenWorkspaces = unlisten;
-      else unlisten();
-    } catch (error) {
-      if (current()) console.warn('pitcrew: cannot follow the gateway’s workspaces', error);
-    }
-    try {
-      const unlisten = await this.#gateway.onNavigate((target) => {
-        if (current()) this.#onGatewayNavigate(target);
-      });
-      if (current()) this.#unlistenNavigate = unlisten;
-      else unlisten();
-    } catch (error) {
-      if (current()) console.warn('pitcrew: cannot follow gateway://navigate', error);
-    }
-    // Independent of the list: not awaited, so it cannot hold up the first read.
-    void this.#followPrompts(current);
+    const workspaces = async () => {
+      try {
+        const unlisten = await this.#gateway.onWorkspaces((list) => {
+          if (!current()) return;
+          this.#heard = true;
+          this.#update(list);
+        });
+        if (current()) this.#unlistenWorkspaces = unlisten;
+        else unlisten();
+      } catch (error) {
+        if (current()) console.warn('pitcrew: cannot follow the gateway’s workspaces', error);
+      }
+    };
+    const navigate = async () => {
+      try {
+        const unlisten = await this.#gateway.onNavigate((target) => {
+          if (current()) this.#onGatewayNavigate(target);
+        });
+        if (current()) this.#unlistenNavigate = unlisten;
+        else unlisten();
+      } catch (error) {
+        if (current()) console.warn('pitcrew: cannot follow gateway://navigate', error);
+      }
+    };
+    await Promise.all([workspaces(), navigate(), this.#followPrompts(current)]);
     if (current()) await this.#read(generation);
   }
 
@@ -303,7 +301,8 @@ export class Workspaces implements WorkspaceRegistry {
     this.#reading = generation;
     this.#listTimer = undefined;
     try {
-      const list = await this.#gateway.workspaces();
+      const list: unknown = await this.#gateway.workspaces();
+      if (!Array.isArray(list)) throw new Error('The gateway answered with something that is not a list of workspaces.');
       // An event heard meanwhile is at least as new as this answer.
       if (current() && !this.#heard) this.#update(list);
     } catch (error) {
@@ -319,7 +318,12 @@ export class Workspaces implements WorkspaceRegistry {
   }
 
   #update(received: unknown): void {
-    const list = Array.isArray(received) ? received.filter(isWorkspace) : [];
+    // Not a list at all: keep the one known (a read retries until there is one).
+    if (!Array.isArray(received)) {
+      console.warn('pitcrew: ignored a gateway://workspaces payload that is not a list.');
+      return;
+    }
+    const list = received.flatMap((item) => toGatewayWorkspace(item) ?? []);
     const before = this.store.getState().list;
     this.store.setState({ list, error: undefined });
     if (this.#listTimer !== undefined) clearTimeout(this.#listTimer);

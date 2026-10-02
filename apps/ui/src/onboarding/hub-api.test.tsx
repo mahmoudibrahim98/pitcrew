@@ -32,6 +32,7 @@ function remoteWith(hosts: string[]): RemoteGateway {
     remoteAdd: no,
     workspaceRemove: no,
     workspaceRetry: no,
+    remoteCancel: no,
     onPrompt: no,
     onPromptClosed: no,
     replyPrompt: no,

@@ -103,19 +103,28 @@ exactly as desktop-gateway.md says: `sshHosts()`, `remoteProbe(host)` (with `tmu
 the gateway gives it), `remotePlan(req)` (sent as one argument, `req`, like `gateway_request`),
 `remoteAdd(plan, onProgress)` (progress on a `Channel`: each `step` one of the plan's, the last
 `{ step: 'add', … }` for the whole add), `workspaceRemove(workspace, stopHelper)`,
-`workspaceRetry(workspace)`, `onPrompt`, `onPromptClosed` and
-`replyPrompt(id, { answer } | { accept } | {})`. Prompt kinds are `password`, `passphrase` and
-`otp` (an `answer`), `host_key` and `confirm` (`accept`), and `notice` (nothing to answer).
+`workspaceRetry(workspace)`, `remoteCancel(plan)` (a gateway without the command rejects),
+`onPrompt`, `onPromptClosed` and `replyPrompt(id, { answer } | { accept } | {})`. Prompt kinds are
+`password`, `passphrase` and `otp` (an `answer`), `host_key` and `confirm` (`accept`), and
+`notice` (nothing to answer); `kind` says who asks, and the UI never guesses it from `text`.
 
 - **Every payload is checked.** A malformed answer to a command rejects with a `GatewayError`
   (`internal`); a malformed progress message, prompt or `prompt-closed` is dropped (with one
-  warning that never quotes it). Text for people (a prompt's `text`, a progress `detail`) loses its
-  control characters, except new lines and tabs, and a job script is kept verbatim.
+  warning that never quotes it). Workspaces, from the list, its event or `remoteAdd`, pass one
+  check (`toGatewayWorkspace`), which keeps `detail` only as a string; a list payload that is not a
+  list never replaces a known list (a read that is not one is retried, as a failed read is).
+- **Text** for people loses its control characters, except new lines and tabs in a prompt's
+  `text` and a progress `detail`. A long one keeps its **end**, where ssh's question (or the news)
+  is, behind a `…`. Plan steps and progress steps are cleaned the same way (`cleanStep`), so a
+  message still names its step. A job script is kept verbatim.
 - **Prompts** queue in the registry (`Workspaces.prompts`, oldest first; the same `id` again, as
-  the gateway sends after a page reload, keeps its place instead of queueing twice), from the
-  moment the registry starts, since a reconnect at launch can ask for a password. `gateway://prompt-closed` withdraws one; `replyPrompt` takes one off and sends the reply
-  once. **The queue never holds an answer**, and a refused reply is not logged (its message could
-  quote what was sent): the answer lives only in the dialog's own state (`shell/prompt-dialog.tsx`).
+  the gateway sends after a page reload, keeps its place instead of queueing twice). The registry
+  follows `prompt`, `prompt-closed`, `workspaces` and `navigate` together, **before** its first
+  `gateway_workspaces` read: the gateway holds a prompt raised before the page listens (a
+  reconnect at launch) until that read. `gateway://prompt-closed` withdraws one; `replyPrompt`
+  takes one off and sends the reply once. **The queue never holds an answer**, and a refused reply
+  is not logged (its message could quote what was sent): the answer is read from the dialog's
+  uncontrolled field as it is sent (`shell/prompt-dialog.tsx`).
 - **In a browser** there is no registry: `useRemoteGateway()` and `useGatewayPrompts()` are `null`,
   and the UI says that connecting a machine needs the desktop app.
 

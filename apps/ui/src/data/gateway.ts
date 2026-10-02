@@ -9,13 +9,13 @@ import { Channel, invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { GatewayError, toGatewayError } from './errors.ts';
 import {
-  isGatewayWorkspace,
   parseHosts,
   parseProgress,
   parsePrompt,
   parsePromptClosed,
   parseRemotePlan,
   parseRemoteProbe,
+  toGatewayWorkspace,
   type RemoteGateway,
 } from './remote.ts';
 import type { Method, SocketClose, Transport, TransportResponse, TransportSocket } from './transport.ts';
@@ -104,8 +104,8 @@ export function createRemoteGateway(): RemoteGateway {
           console.warn('pitcrew: dropped a malformed progress message from gateway_remote_add.');
         }
       });
-      const workspace = await call<unknown>('gateway_remote_add', { plan, events });
-      if (!isGatewayWorkspace(workspace)) throw malformed('new workspace');
+      const workspace = toGatewayWorkspace(await call<unknown>('gateway_remote_add', { plan, events }));
+      if (workspace === undefined) throw malformed('new workspace');
       return workspace;
     },
 
@@ -115,6 +115,10 @@ export function createRemoteGateway(): RemoteGateway {
 
     async workspaceRetry(workspace) {
       await call<unknown>('gateway_workspace_retry', { workspace });
+    },
+
+    async remoteCancel(plan) {
+      await call<unknown>('gateway_remote_cancel', { plan });
     },
 
     onPrompt: (listener) =>

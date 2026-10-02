@@ -137,6 +137,43 @@ describe('the remote commands', () => {
     ]);
   });
 
+  it('cleans plan steps and progress steps the same way, so each message finds its step', async () => {
+    const step = 'Copy pitcrewd\u0007 0.4.0\n to ~/.pitcrew';
+    desktop.plan = () => ({ plan: 'plan-9', steps: [step] });
+    const plan = await createRemoteGateway().remotePlan({ host: 'h', launcher: 'direct' });
+    desktop.add = async (_plan, channel) => {
+      channel.send({ step, state: 'running', detail: `${'x'.repeat(3000)} 40% sent` });
+      return NEW_WS;
+    };
+    const seen: RemoteProgress[] = [];
+    await createRemoteGateway().remoteAdd('plan-9', (p) => seen.push(p));
+    expect(seen[0]?.step).toBe(plan.steps[0]);
+    expect(plan.steps[0]).toBe('Copy pitcrewd 0.4.0 to ~/.pitcrew');
+    // A long detail keeps its end, where the news is, and marks the cut.
+    expect(seen[0]?.detail?.startsWith('…')).toBe(true);
+    expect(seen[0]?.detail?.endsWith(' 40% sent')).toBe(true);
+  });
+
+  it('keeps a new workspace’s detail only when it is a string', async () => {
+    desktop.add = () => Promise.resolve({ ...NEW_WS, detail: null });
+    expect(await createRemoteGateway().remoteAdd('p', () => {})).toEqual(NEW_WS);
+    desktop.add = () => Promise.resolve({ ...NEW_WS, detail: 7 });
+    expect(await createRemoteGateway().remoteAdd('p', () => {})).toEqual(NEW_WS);
+    desktop.add = () => Promise.resolve({ ...NEW_WS, detail: 'Waiting for the job.' });
+    expect(await createRemoteGateway().remoteAdd('p', () => {})).toEqual({ ...NEW_WS, detail: 'Waiting for the job.' });
+  });
+
+  it('cancels an add by its plan, and passes on a gateway without the command', async () => {
+    desktop.cancel = () => Promise.resolve(null);
+    await createRemoteGateway().remoteCancel('plan-7');
+    expect(desktop.commands('gateway_remote_cancel')).toEqual([{ plan: 'plan-7' }]);
+    desktop.cancel = () => Promise.reject('command gateway_remote_cancel not found');
+    expect(await failure(createRemoteGateway().remoteCancel('plan-7'))).toMatchObject({
+      gateway: 'internal',
+      message: 'command gateway_remote_cancel not found',
+    });
+  });
+
   it('retries a workspace, by its id alone', async () => {
     await createRemoteGateway().workspaceRetry('01JB000000000000000WSPNEW1');
     expect(desktop.commands('gateway_workspace_retry')).toEqual([{ workspace: '01JB000000000000000WSPNEW1' }]);
@@ -177,6 +214,17 @@ describe('prompts', () => {
     unlistenClosed();
     await desktop.prompt({ id: 'p6', host: 'hpc-login', kind: 'password', text: 'Again?' });
     expect(prompts).toHaveLength(4);
+  });
+
+  it("keeps the end of a long prompt, where ssh's question is, and marks the cut", async () => {
+    const prompts: GatewayPrompt[] = [];
+    await createRemoteGateway().onPrompt((p) => prompts.push(p));
+    const banner = 'Authorised use only. '.repeat(400);
+    await desktop.prompt({ id: 'p1', host: 'hpc-login', kind: 'password', text: `${banner}(sam@hpc-login) Password: ` });
+    const text = prompts[0]?.text ?? '';
+    expect([...text]).toHaveLength(2000);
+    expect(text.startsWith('…')).toBe(true);
+    expect(text.endsWith('(sam@hpc-login) Password: ')).toBe(true);
   });
 
   it('replies with exactly the answer, the acceptance, or neither', async () => {
