@@ -171,6 +171,28 @@ pub fn job_options(job: Option<&JobRequest>) -> Result<JobOptions, GatewayError>
     Ok(options)
 }
 
+/// Checks a site recipe's name as `pitcrew-remote` does (it is also a file name): 1 to 64
+/// characters of `a-z 0-9 _ -`, starting with a letter or digit.
+///
+/// # Errors
+/// `invalid` for any other name.
+pub fn check_site_name(name: &str) -> Result<(), GatewayError> {
+    let ok = (1..=64).contains(&name.len())
+        && name.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(GatewayError::invalid(format!(
+            "the site {}: a site recipe's name is 1 to 64 characters of a-z 0-9 _ -, starting \
+             with a letter or digit",
+            crate::gateway::error::shorten(name)
+        )))
+    }
+}
+
 /// `--gres` for `gpus`: a count is `gpu:<n>`, a type and count `gpu:<type>:<n>`; a value that
 /// already starts with `gpu` is taken as written.
 fn gres(gpus: &str) -> String {
@@ -184,6 +206,25 @@ fn gres(gpus: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn site_names_are_plain() {
+        for ok in ["generic", "lab-cluster", "site_2", "0x"] {
+            assert!(check_site_name(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "../etc/passwd",
+            "Lab",
+            "-x",
+            "_x",
+            "a/b",
+            "a.toml",
+            &"a".repeat(65),
+        ] {
+            assert!(check_site_name(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn a_plan_is_used_once_and_expires() {

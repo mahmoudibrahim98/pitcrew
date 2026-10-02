@@ -391,6 +391,9 @@ impl Remotes {
                 "a site and job options are for the slurm launcher only",
             ));
         }
+        if let Some(site) = &req.site {
+            plan::check_site_name(site)?;
+        }
         let ssh = self.ssh()?;
         let probe = ssh.probe(&host).await.map_err(|e| ssh_error(&host, &e))?;
         let target = Target::new(ssh, &host, &probe).map_err(|e| helper_error(&host, &e))?;
@@ -1352,18 +1355,18 @@ fn helper_error(host: &str, error: &HelperError) -> GatewayError {
 }
 
 /// Text from ssh, the machine or the tunnel as it may go into a message or a log line: anything
-/// token-shaped removed ([`crate::redact`]), control characters as spaces, at most 1000
-/// characters.
+/// token-shaped removed ([`crate::redact`]), control characters as spaces, bidi and invisible
+/// characters removed ([`crate::notify::is_invisible`]), at most 1000 characters.
 #[must_use]
 pub fn tidy(text: &str) -> String {
     const MAX: usize = 1000;
     let redacted = crate::redact::redact(text);
-    let mut out: String = redacted
+    let mut kept = redacted
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .take(MAX)
-        .collect();
-    if redacted.chars().count() > MAX {
+        .filter(|c| !crate::notify::is_invisible(*c))
+        .map(|c| if c.is_control() { ' ' } else { c });
+    let mut out: String = kept.by_ref().take(MAX).collect();
+    if kept.next().is_some() {
         out.push('…');
     }
     out.trim().to_owned()
