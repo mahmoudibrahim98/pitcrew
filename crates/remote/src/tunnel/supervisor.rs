@@ -1326,7 +1326,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn private_dirs_are_new_and_locked() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = pitcrew_fixtures::temp::short_tempdir().unwrap();
         let ssh = Ssh::new("ssh").with_runtime_dir(tmp.path().join("rt"));
         let a = PrivateDir::new(&ssh).unwrap();
         let name = a.path.file_name().unwrap().to_str().unwrap().to_owned();

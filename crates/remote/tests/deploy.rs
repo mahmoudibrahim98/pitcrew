@@ -625,7 +625,8 @@ mod unix {
         }
 
         pub(crate) fn build(sh: &Path, customize: impl FnOnce(&Path)) -> Self {
-            let dir = tempfile::tempdir().unwrap();
+            // Short: the machine's sockets (ssh's, the helper's, a node-local one) live under it.
+            let dir = pitcrew_fixtures::temp::short_tempdir().unwrap();
             let home = dir.path().join("home");
             std::fs::create_dir(&home).unwrap();
             let bin = dir.path().join("bin");

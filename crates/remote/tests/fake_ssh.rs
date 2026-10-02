@@ -309,7 +309,8 @@ struct Fake {
 
 impl Fake {
     fn new(scenario: &Scenario) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        // Short: the runtime directory, with ssh's and the askpass sockets, is under it.
+        let dir = pitcrew_fixtures::temp::short_tempdir().unwrap();
         let ssh = dir
             .path()
             .join(format!("ssh{}", std::env::consts::EXE_SUFFIX));
