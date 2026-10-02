@@ -9,9 +9,13 @@ import { defineConfig } from 'vitest/config';
 // forks one worker per CPU, and that many mock hubs starting at once flakes with ECONNRESET
 // under heavy machine load. Cap it well below the core count; 4 is plenty of parallelism for
 // this suite's size without piling on concurrent hub startups.
+//
+// tests/setup.ts pins the time zone, the locale for dates and the clock, so rendered dates read
+// the same on every machine.
 export default defineConfig({
   test: {
     include: ['tests/**/*.test.{ts,tsx}', 'src/**/*.test.{ts,tsx}'],
+    setupFiles: ['tests/setup.ts'],
     environment: 'node',
     testTimeout: 10_000,
     maxWorkers: Math.min(4, cpus().length),
