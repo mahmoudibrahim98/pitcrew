@@ -130,9 +130,13 @@ let started = DirectLauncher::default().start(&target).await?;   // or TmuxLaunc
   uses relative paths only; a launched helper checks that the directory it starts in is that
   root, by its physical path, and private (tmux enters it by name; every `#` in it is doubled,
   since tmux reads formats there) before it runs. Directories above the root, and a SLURM
-  recipe's `modules_init` script and the way to it, are judged by their owner and mode bits
-  only: an ACL on one of them is not refused (on Linux a POSIX ACL shows only as a `+`, NFSv4
-  and GPFS ACLs do not show at all, and on macOS `ls` hides one behind `@`).
+  recipe's `modules_init` script and the way to it, are judged by their owner and mode bits,
+  and by any ACL they show (`+`, or macOS's `@`, which can hide one; `pc_acl_ok`): on Linux a
+  POSIX ACL's grants are bounded by its mask, which `ls` shows as the group bits, so those
+  bits suffice; on macOS the mode bits leave the ACL out, so `ls -le` must list only entries
+  that deny, or allow reading and searching; on any other system, or when the list cannot be
+  read or an entry is not understood, the directory is refused. NFSv4 and GPFS ACLs on Linux
+  do not show in `ls` at all, so they are not judged.
 - **The remote side** is one script, `src/helper/helper.sh`, sent on **stdin** (the Windows
   command-line limit leaves the shell-neutral wrapper about 7,500 bytes). The command line is a
   fixed bootstrap run by `/bin/sh` (by path, whatever `sh` the user's `PATH` finds). It drops
