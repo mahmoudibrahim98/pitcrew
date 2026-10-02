@@ -25,9 +25,10 @@
 //!   `ALLOWED_SBATCH`, alone only for `SBATCH_FLAGS`; and `JobSpec::new` accepts what
 //!   `check_sbatch_option` accepted (R34, fixed: a value holding `hetjob` or `packjob` was let
 //!   through);
-//! - **the job script**: when `JobSpec::render` accepts the options, every `#SBATCH` line is one
-//!   directive word before the first command, none holds `hetjob` or `packjob` in any case, and the
-//!   job name, working directory and output appear once each, from PitCrew.
+//! - **the job script**: `JobSpec::render` accepts what `JobSpec::new` accepted (the target is
+//!   plain), so a rule that lets a word through both checks is still caught; every `#SBATCH` line
+//!   is one directive word before the first command, none holds `hetjob` or `packjob` in any case,
+//!   and the job name, working directory and output appear once each, from PitCrew.
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
@@ -159,8 +160,9 @@ fn sbatch(text: &str) {
     let Ok(spec) = JobSpec::new(&generic(), &options) else {
         panic!("options check_sbatch_option accepted are refused by JobSpec::new: {options:?}");
     };
-    if let Ok(script) = spec.render(target()) {
-        check_script(script.text());
+    match spec.render(target()) {
+        Ok(script) => check_script(script.text()),
+        Err(e) => panic!("options JobSpec::new accepted do not render: {e}: {options:?}"),
     }
 }
 
