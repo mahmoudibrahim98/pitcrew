@@ -43,7 +43,7 @@ use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{EventId, MachineId, MemberId, SessionId, TerminalId, WorkspaceId};
 use pitcrew_protocol::model::{Engine, LinkBasis, Session, SessionState, TimestampMs};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -323,8 +323,9 @@ struct Tracked {
     watched: Vec<Arc<Path>>,
     poll_every: Duration,
     next_poll: Instant,
-    /// Size and mtime at which reading failed: not read again until the file changes.
-    failed_at: Option<(u64, TimestampMs)>,
+    /// Size and mtime at which reading failed: not read again until the file changes. Boxed:
+    /// rare, and every transcript has the field.
+    failed_at: Option<Box<(u64, TimestampMs)>>,
     /// A read failure was logged as a warning; later ones are quieter until a read works.
     warned: bool,
     /// The whole row, while in use or not saved yet.
@@ -436,6 +437,107 @@ fn key(path: &Path, inner_id: Option<&str>) -> Key {
     (Arc::from(path), inner_id.map(Arc::from))
 }
 
+/// The tracked transcripts by id, in id order: a sorted vector. Ids only grow (`next_id`), so a
+/// new one goes at the end, and one leaves only when its transcript is deleted. Every transcript
+/// has an entry, and a `BTreeMap` fed growing keys leaves its nodes about half full: this holds
+/// them close to their size, growing by an eighth at a time.
+struct IdMap<T> {
+    entries: Vec<(u64, T)>,
+}
+
+impl<T> Default for IdMap<T> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl<T> IdMap<T> {
+    fn find(&self, id: u64) -> Result<usize, usize> {
+        self.entries.binary_search_by_key(&id, |(k, _)| *k)
+    }
+
+    fn get(&self, id: &u64) -> Option<&T> {
+        self.find(*id).ok().map(|i| &self.entries[i].1)
+    }
+
+    fn get_mut(&mut self, id: &u64) -> Option<&mut T> {
+        self.find(*id).ok().map(|i| &mut self.entries[i].1)
+    }
+
+    fn insert(&mut self, id: u64, value: T) {
+        match self.find(id) {
+            Ok(i) => self.entries[i].1 = value,
+            Err(i) => {
+                if self.entries.len() == self.entries.capacity() {
+                    self.entries.reserve_exact(self.entries.len() / 8 + 16);
+                }
+                self.entries.insert(i, (id, value));
+            }
+        }
+    }
+
+    fn remove(&mut self, id: &u64) -> Option<T> {
+        self.find(*id).ok().map(|i| self.entries.remove(i).1)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&u64, &T)> {
+        self.entries.iter().map(|(k, v)| (k, v))
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &u64> {
+        self.entries.iter().map(|(k, _)| k)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &T> {
+        self.entries.iter().map(|(_, v)| v)
+    }
+}
+
+#[cfg(test)]
+impl<T> std::ops::Index<&u64> for IdMap<T> {
+    type Output = T;
+
+    fn index(&self, id: &u64) -> &T {
+        self.get(id).expect("tracked")
+    }
+}
+
+/// The tracked transcripts at one path: one, or several in a store of many sessions (OpenCode's).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Ids {
+    One(u64),
+    Many(Vec<u64>),
+}
+
+impl Ids {
+    fn push(&mut self, id: u64) {
+        match self {
+            Self::One(first) => *self = Self::Many(vec![*first, id]),
+            Self::Many(ids) => ids.push(id),
+        }
+    }
+
+    /// Takes `id` out. False once none is left.
+    fn remove(&mut self, id: u64) -> bool {
+        match self {
+            Self::One(only) => *only != id,
+            Self::Many(ids) => {
+                ids.retain(|i| *i != id);
+                !ids.is_empty()
+            }
+        }
+    }
+
+    fn to_vec(&self) -> Vec<u64> {
+        match self {
+            Self::One(id) => vec![*id],
+            Self::Many(ids) => ids.clone(),
+        }
+    }
+}
+
 /// Why the watcher stopped early.
 struct Hangup;
 
@@ -453,7 +555,7 @@ pub(crate) struct Watcher {
     notify: Option<notify::RecommendedWatcher>,
     /// The index as loaded by `start()`; tracked by the watcher's own start.
     rows: Vec<Indexed>,
-    tracked: BTreeMap<u64, Tracked>,
+    tracked: IdMap<Tracked>,
     next_id: u64,
     /// Tracked transcripts whose whole row is in memory ([`Loaded`]).
     loaded: Vec<u64>,
@@ -462,7 +564,7 @@ pub(crate) struct Watcher {
     /// Key as discovered through a symlink → tracked transcript, so each discovered path is
     /// canonicalized once. A path discovered as it is (canonical) is found in `by_key` instead.
     by_raw: HashMap<RawKey, u64>,
-    by_path: HashMap<Arc<Path>, Vec<u64>>,
+    by_path: HashMap<Arc<Path>, Ids>,
     /// Watched folders and how many holders each has.
     dirs: HashMap<Arc<Path>, usize>,
     /// Folders that could not be watched: warned once, retried on rediscovery.
@@ -568,7 +670,7 @@ impl Watcher {
             shared: s.shared,
             notify,
             rows: s.rows,
-            tracked: BTreeMap::new(),
+            tracked: IdMap::default(),
             next_id: 0,
             loaded: Vec::new(),
             by_key: HashMap::new(),
@@ -737,7 +839,7 @@ impl Watcher {
         let now = Instant::now();
         let mut maybe_new = false;
         for (path, created) in wake.due {
-            match self.by_path.get(path.as_path()).cloned() {
+            match self.by_path.get(path.as_path()).map(Ids::to_vec) {
                 Some(ids) => {
                     for id in ids {
                         self.serve_due()?;
@@ -830,7 +932,7 @@ impl Watcher {
             for id in self
                 .by_path
                 .get(path.as_path())
-                .cloned()
+                .map(Ids::to_vec)
                 .unwrap_or_default()
             {
                 self.check(id)?;
@@ -1024,7 +1126,12 @@ impl Watcher {
         }
         self.by_key
             .insert((Arc::clone(&path), t.inner_id.clone()), id);
-        self.by_path.entry(Arc::clone(&path)).or_default().push(id);
+        match self.by_path.entry(Arc::clone(&path)) {
+            std::collections::hash_map::Entry::Occupied(mut ids) => ids.get_mut().push(id),
+            std::collections::hash_map::Entry::Vacant(none) => {
+                none.insert(Ids::One(id));
+            }
+        }
         self.by_session.insert(entry.session, id);
         if let Some(native) = &entry.native {
             self.map_native(
@@ -1121,10 +1228,10 @@ impl Watcher {
         tracing::info!(path = %t.path.display(), session = %t.session, "transcript deleted; no longer watching it");
         self.by_key
             .remove(&(Arc::clone(&t.path), t.inner_id.clone()));
-        let empty = self.by_path.get_mut(&*t.path).is_some_and(|ids| {
-            ids.retain(|i| *i != id);
-            ids.is_empty()
-        });
+        let empty = self
+            .by_path
+            .get_mut(&*t.path)
+            .is_some_and(|ids| !ids.remove(id));
         if empty {
             self.by_path.remove(&*t.path);
         }
@@ -1193,7 +1300,7 @@ impl Watcher {
         let Some(t) = self.tracked.get(&id) else {
             return Ok(false);
         };
-        if t.failed_at == Some((st.size, st.mtime))
+        if t.failed_at.as_deref() == Some(&(st.size, st.mtime))
             || (t.caught_up
                 && t.size == st.size
                 && t.mtime == st.mtime
@@ -1356,7 +1463,7 @@ impl Watcher {
                 }
                 Err(e) => {
                     // Not read again until the file changes, and warned about once.
-                    t.failed_at = Some((st.size, st.mtime));
+                    t.failed_at = Some(Box::new((st.size, st.mtime)));
                     if t.warned {
                         tracing::debug!(path = %t.path.display(), error = %e, "cannot read transcript");
                     } else {
@@ -2353,6 +2460,46 @@ mod tests {
             mtime: 2,
             identity: Some(identity.into()),
         }
+    }
+
+    #[test]
+    fn the_id_map_keeps_ids_in_order() {
+        let mut m = IdMap::default();
+        for id in [3u64, 1, 7, 5] {
+            m.insert(id, id * 10);
+        }
+        m.insert(5, 55);
+        assert_eq!(m.keys().copied().collect::<Vec<_>>(), [1, 3, 5, 7]);
+        assert_eq!(m.values().copied().collect::<Vec<_>>(), [10, 30, 55, 70]);
+        assert_eq!(m.get(&7), Some(&70));
+        assert_eq!(m.get(&4), None);
+        if let Some(v) = m.get_mut(&1) {
+            *v = 11;
+        }
+        assert_eq!(m.remove(&3), Some(30));
+        assert_eq!(m.remove(&3), None);
+        assert_eq!(m.keys().copied().collect::<Vec<_>>(), [1, 5, 7]);
+        assert_eq!(m[&1], 11);
+        // Growing by an eighth, not doubling.
+        let mut big = IdMap::default();
+        for id in 0..10_000u64 {
+            big.insert(id, ());
+        }
+        assert!(big.entries.capacity() < 10_000 + 10_000 / 8 + 32);
+    }
+
+    #[test]
+    fn ids_at_one_path() {
+        let mut ids = Ids::One(4);
+        assert_eq!(ids.to_vec(), [4]);
+        ids.push(9);
+        ids.push(2);
+        assert_eq!(ids.to_vec(), [4, 9, 2]);
+        assert!(ids.remove(9));
+        assert!(ids.remove(4));
+        assert!(!ids.remove(2), "none left");
+        assert!(!Ids::One(1).remove(1));
+        assert!(Ids::One(1).remove(2));
     }
 
     #[test]
