@@ -1,7 +1,7 @@
-# Brief 0 · Fix four more flaky tests
+# Brief 0 · Fix five more flaky tests
 
 - **Stream:** 0 · Contracts (test fixes in two streams). **Branch:** `integrator/flaky-tests-2`.
-  **Paths:** `crates/api/tests/terminal.rs`, `crates/runner/tests/fake_source.rs` and `crates/hub-work/tests/recap_file.rs`.
+  **Paths:** `crates/api/tests/terminal.rs`, `crates/runner/tests/fake_source.rs`, `crates/runner/tests/hooks.rs` and `crates/hub-work/tests/recap_file.rs`.
 - **First read:** [README.md](README.md), the root `AGENTS.md` (or `CLAUDE.md`), and
   [0-flaky-tests.md](0-flaky-tests.md) (PR #19), whose rules apply here too: no retries, no skipped
   assertions, and a looser bound only with a reason.
@@ -40,6 +40,7 @@ Two tests failed on CI runners for timing reasons unrelated to the PRs they ran 
    - **The problem:** it got a 503 during the WebSocket handshake, where it expected the stream to open and then close with 1011.
    - **The question:** is either answer correct under load (its name allows both)? If so, make the test accept a 503 at the handshake as well as 1011 after the open. If not, find the timing that lets the stall reach the handshake.
 4. **The `recap_file.rs` property test** (`crates/hub-work/tests/recap_file.rs`; found reviewing PR #30) fails whenever it draws an empty `specs`. Decide whether an empty input is a valid case. If it is, make the property hold for it; if not, make the strategy never generate it. Say which.
+5. **`crates/runner/tests/hooks.rs` ~944** (an assertion `first < second`; failed on ubuntu CI for PR #32, passed 3/3 locally). Find the timing it depends on, and make it deterministic in the same way: assert the ordering it means, not wall-clock luck.
 
 ## Acceptance
 
