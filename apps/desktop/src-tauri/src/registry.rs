@@ -184,12 +184,9 @@ pub struct GatewayWorkspace {
     pub id: String,
     /// Its name.
     pub name: String,
-    /// WSL distribution, shown as `wsl:<distro>`; absent for older workspace entries.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub host: Option<String>,
     /// `local` or `remote`.
     pub kind: WorkspaceKind,
-    /// SSH host from our connection records, never the hub; absent for local workspaces.
+    /// SSH host or WSL distro from our records, never the hub; absent for local workspaces.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     /// Its state.
@@ -800,16 +797,12 @@ fn list_of(entries: &[Entry]) -> Vec<GatewayWorkspace> {
         .map(|e| GatewayWorkspace {
             id: e.record.id.clone(),
             name: e.record.name.clone(),
-            host: match &e.record.connection {
-                Connection::Remote(remote) => remote
-                    .target
-                    .as_ref()
-                    .map(|WslTarget::Wsl { distro }| format!("wsl:{distro}")),
-                _ => None,
-            },
             kind: e.record.kind,
             host: match &e.record.connection {
-                Connection::Remote(connection) => Some(connection.host.clone()),
+                Connection::Remote(connection) => Some(match &connection.target {
+                    Some(WslTarget::Wsl { distro }) => format!("wsl:{distro}"),
+                    None => connection.host.clone(),
+                }),
                 Connection::Local => None,
             },
             state: e.state,
@@ -1315,6 +1308,30 @@ mod tests {
         assert_eq!(local.host, None);
         assert!(serde_json::to_value(local).unwrap().get("host").is_none());
         assert_eq!(serde_json::to_value(remote).unwrap()["host"], "hpc-login");
+    }
+
+    #[test]
+    fn a_hub_cannot_rename_its_trusted_wsl_distro() {
+        let registry = Registry::in_memory();
+        let mut record = remote("01JR");
+        let Connection::Remote(connection) = &mut record.connection else {
+            panic!("expected a remote fixture");
+        };
+        connection.host = String::new();
+        connection.target = Some(WslTarget::Wsl {
+            distro: "ExampleLinux".into(),
+        });
+        registry
+            .claim_remote(record, Arc::new(Nowhere), WorkspaceState::Ready)
+            .unwrap();
+        registry.rename_remote("01JR", "This computer").unwrap();
+        let workspace = registry.list().remove(0);
+        assert_eq!(workspace.name, "This computer");
+        assert_eq!(workspace.host.as_deref(), Some("wsl:ExampleLinux"));
+        assert_eq!(
+            serde_json::to_value(workspace).unwrap()["host"],
+            "wsl:ExampleLinux"
+        );
     }
 
     #[test]

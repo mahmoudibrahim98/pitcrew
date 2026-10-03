@@ -207,7 +207,6 @@ export function toGatewayWorkspace(value: unknown): GatewayWorkspace | undefined
     ...(v.kind === 'remote' && typeof v.host === 'string' ? { host: cleanLine(v.host) } : {}),
     kind: v.kind,
     state: v.state as WorkspaceState,
-    ...(v.kind === 'remote' && typeof v.host === 'string' ? { host: v.host } : {}),
     ...(typeof v.detail === 'string' ? { detail: v.detail } : {}),
   };
 }
