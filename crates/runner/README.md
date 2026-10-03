@@ -183,9 +183,10 @@ the flag defaults to `false` and is for the concrete Claude/Codex JSONL adapters
 snapshots hold at most 4,096 directories; a link, unreadable folder or larger tree disables the
 cache. Unix directory ctime is checked too, so restoring mtime cannot conceal a name change.
 
-The daemon rounds notification deadlines to a 175 ms grid after the existing 100 ms debounce.
-`RunnerConfig::notification_window` defaults to zero for other callers. This adds less than
-175 ms, so source reads remain scheduled within 275 ms; polling and hook reports are not rounded.
+Notification deadlines use a grid capped at 10 ms after the existing 100 ms debounce, even
+when `RunnerConfig::notification_window` requests a larger window (the daemon requests 175 ms).
+The field defaults to zero for other callers. Rounding adds less than 10 ms, so source reads
+are due within 110 ms of the notification; polling and hook reports are not rounded.
 Adjacent completed reads of different transcripts can share one sink acceptance and one cursor
 transaction, preserving order and limiting a group to four batches and `max_batch_events` events (an indivisible source
 item retains its existing exception). Cursors move only after the whole group is accepted; failed

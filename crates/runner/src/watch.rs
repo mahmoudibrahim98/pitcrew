@@ -58,6 +58,8 @@ use ulid::Ulid;
 const MAX_READS_PER_REFRESH: usize = 4096;
 /// Recently used hot rows retained after saving; cold history still lives in the index.
 const HOT_ROW_CACHE: usize = 64;
+/// Leave room in the 300 ms write-to-event budget after notification debounce.
+const MAX_NOTIFICATION_GRID: Duration = Duration::from_millis(10);
 /// Dirty paths held before the watcher falls back to checking everything.
 const MAX_DIRTY_PATHS: usize = 10_000;
 /// Least time between rediscoveries triggered by unknown files.
@@ -447,7 +449,7 @@ pub(crate) fn notify_handler(
     }
 }
 
-/// Keeps debounce as the minimum delay, adding strictly less than one grid interval.
+/// Keeps debounce as the minimum delay, adding strictly less than 10 ms.
 fn round_deadline(due: Instant, epoch: Instant, window: Duration) -> Instant {
     if window.is_zero() {
         return due;
@@ -455,7 +457,7 @@ fn round_deadline(due: Instant, epoch: Instant, window: Duration) -> Instant {
     let Some(elapsed) = due.checked_duration_since(epoch) else {
         return due;
     };
-    let width = window.as_nanos();
+    let width = window.min(MAX_NOTIFICATION_GRID).as_nanos();
     let Some(rounded) = elapsed
         .as_nanos()
         .checked_add(width - 1)
@@ -2934,20 +2936,28 @@ mod tests {
     #[test]
     fn notification_grid_preserves_debounce_and_bounds_extra_latency() {
         let epoch = Instant::now();
-        let grid = Duration::from_millis(175);
-        for ms in 0..700 {
-            let due = epoch + Duration::from_millis(ms);
-            let rounded = round_deadline(due, epoch, grid);
-            assert!(rounded >= due);
-            assert!(rounded.duration_since(due) < grid);
-            assert_eq!(round_deadline(due, epoch, Duration::ZERO), due);
+        for grid in [
+            Duration::from_millis(3),
+            Duration::from_millis(10),
+            Duration::from_millis(175),
+            Duration::MAX,
+        ] {
+            for ms in 0..700 {
+                let due = epoch + Duration::from_millis(ms);
+                let rounded = round_deadline(due, epoch, grid);
+                assert!(rounded >= due);
+                assert!(rounded.duration_since(due) < grid);
+                assert!(rounded.duration_since(due) < MAX_NOTIFICATION_GRID);
+                assert_eq!(round_deadline(due, epoch, Duration::ZERO), due);
+            }
         }
+        let grid = Duration::from_millis(175);
         assert_eq!(
             round_deadline(epoch - Duration::from_millis(1), epoch, grid),
             epoch - Duration::from_millis(1)
         );
-        let one = epoch + Duration::from_millis(100);
-        let two = epoch + Duration::from_millis(110);
+        let one = epoch + Duration::from_millis(101);
+        let two = epoch + Duration::from_millis(109);
         assert_eq!(
             round_deadline(one, epoch, grid),
             round_deadline(two, epoch, grid)

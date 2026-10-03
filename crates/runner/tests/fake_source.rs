@@ -40,6 +40,8 @@ fn new_items_arrive_fast_and_a_restart_resumes_from_the_cursor() {
         labels(&sink.events()),
         ["discovered:Idle", "turn@0", "turn@1", "turn@2"]
     );
+    // Sink acceptance can precede the watcher's final read that establishes EOF.
+    assert!(eventually(Duration::from_secs(2), || source.reads().len() >= 4));
     assert_eq!(source.reads(), [0, 1, 2, 3]);
 
     // A loaded runner may delay one notification. Keep the product's 300 ms budget for the

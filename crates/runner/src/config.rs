@@ -98,8 +98,9 @@ pub struct RunnerConfig {
     /// Concrete Claude/Codex JSONL adapters exhaust items when their byte cursor reaches EOF.
     /// Leave false for custom adapters and cursors that count logical items instead of bytes.
     pub byte_file_cursors: bool,
-    /// Round notification deadlines up to this grid after debounce; zero disables grouping.
-    /// Adds less than this duration. Polling and hook reports retain their deadlines.
+    /// Round notification deadlines up to this grid, capped at 10 ms, after debounce.
+    /// Zero disables grouping. Adds less than the smaller of this duration and 10 ms.
+    /// Polling and hook reports retain their deadlines.
     pub notification_window: Duration,
     /// The environment of a CLI started for a session the hub named (see [`SessionEnv`]).
     /// Without it, such a CLI gets none: no token, so its hooks are refused.
