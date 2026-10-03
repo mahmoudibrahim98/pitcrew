@@ -16,8 +16,9 @@ Codex, OpenCode) at once, on their laptop, on servers and on HPC clusters. It gi
   helper on the remote for you, with no root and no internet needed there, and SLURM-aware.
 - **Import** of the sessions already on each machine, or a fresh start.
 
-> **Status: pre-alpha.** Nothing is usable yet. The repository is being built in parallel streams;
-> see [`docs/build`](docs/build/README.md).
+> **Status: pre-alpha.** The synthetic demo, daemon, UI and desktop gateway run; several
+> integration paths are still incomplete. See the [architecture](docs/architecture.md),
+> [getting-started guide](docs/getting-started.md) and [build status](docs/build/briefs/README.md).
 
 ## Architecture in one picture
 

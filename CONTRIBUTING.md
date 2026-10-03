@@ -6,6 +6,9 @@ other's files.
 
 ## Before you start
 
+Read the [architecture](docs/architecture.md) and [getting-started guide](docs/getting-started.md)
+for the process map, prerequisites, checks and isolated demo.
+
 1. Read [`docs/build/README.md`](docs/build/README.md) and the card for your stream in
    [`docs/build/streams`](docs/build/streams).
 2. Check [`docs/build/ownership.json`](docs/build/ownership.json): it lists the paths your stream
@@ -15,8 +18,8 @@ other's files.
 
 ## Branches and pull requests
 
-- Name branches `s/<stream>/<short-topic>`, for example `s/A/claude-parser`. The integrator uses
-  `s/0/…`.
+- Name branches `s/<stream>/<short-topic>`, for example `s/A/claude-parser`. Cross-stream briefs use
+  `integrator/<topic>`. Use exactly the branch named by your brief.
 - Keep pull requests small and focused on one work package.
 - **Contributors never merge their own pull requests.** The integrator merges.
 - CI must be green:
