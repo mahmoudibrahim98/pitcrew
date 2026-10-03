@@ -6,6 +6,7 @@ import { useRouter } from '@tanstack/react-router';
 import { useId, useState } from 'react';
 import { useGatewayWorkspaces, type GatewayWorkspace, type RemoteGateway } from '../data/index.ts';
 import { Button, Dialog, DialogContent, DialogFooter } from '../design/index.ts';
+import { WorkspaceName } from './workspace-name.tsx';
 import { paths } from './paths.ts';
 import { useShell } from './store.ts';
 
@@ -53,7 +54,7 @@ export function RemoveWorkspaceDialog({
   return (
     <Dialog open onOpenChange={(open) => !open && !busy && onClose()}>
       <DialogContent
-        title={`Remove ${workspace.name}?`}
+        title={<>Remove <WorkspaceName workspace={workspace} suffix="?" /></>}
         description="This app forgets the workspace and its key. Its data stays on the remote."
         onCloseAutoFocus={(event) => {
           event.preventDefault();
