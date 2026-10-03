@@ -257,7 +257,15 @@ fn recap_days(&self, scope: DaysScope, tz_minutes: i32, before: Option<&Date>,
   own blocks, in the order the in-memory sets gave (by id, newest first; a scope's by
   `(start, id)` for days). Each batch of blocks is one transaction. `Recaps::new` keeps the
   database in memory; `WorkService::with_recap_file(path)`, which the daemon uses, in a file, so a
-  long history costs disk instead. P-measure's history (`benches/README.md`, "At scale": 612,000
+  long history costs disk instead. On a local filesystem the file is at the requested path.
+  On a network or unknown filesystem it goes in a private local folder: the temporary folder
+  first, then `$XDG_RUNTIME_DIR`, skipping unsuitable or networked bases. If neither works,
+  blocks stay in memory. On Unix the folder's name hashes the canonical requested path and uid;
+  a leftover is reused only if `lstat` shows a real directory owned by this user with mode 0700.
+  Otherwise (and on Windows) a random folder is used. A clean stop removes the file and folder;
+  a hard kill leaves them behind. The next start at the same Unix path replaces the stable
+  folder's cache; random leftovers remain until the temporary folder is cleaned.
+  P-measure's history (`benches/README.md`, "At scale": 612,000
   events, 10,000 sessions) makes 10,000 blocks, a 33 MiB file; with the blocks in memory the
   index held about 51 MiB, and now about 17 MiB at its peak (the engine's directory, and the
   blocks it still holds open: a history scanned newest first leaves most of them open).
@@ -542,7 +550,9 @@ query `400`; bodies over 1 MiB are `400`. A `500` is logged in full and its body
   starts from the first events on); and every receipt points into the log. `tests/recap_file.rs`:
   the same with the blocks in a file (`with_recap_file`), which equals a rebuild in memory and the
   engine, lives and dies with the service, and when a crashed run left one behind (another log's
-  index, or garbage) is replaced, never served. Unit tests in `src/recap.rs`: a batch of blocks
+  index, or garbage) is replaced, never served. `src/recap_db.rs` unit tests cover local placement,
+  private local fallback, memory fallback, and safe reuse of a folder left by a hard kill.
+  Unit tests in `src/recap.rs`: a batch of blocks
   that cannot be stored fails its query, and the next one rebuilds from the log. `tests/recap_common/`
   holds the generator and the oracle.
 - `tests/sessions.rs`, `tests/dispatch.rs`, `tests/routes.rs`, `tests/self_moving.rs`: the other

@@ -1798,8 +1798,8 @@ impl Core {
             .unwrap_or_else(|| GatewayWorkspace {
                 id: id.to_owned(),
                 name,
-                host: None,
                 kind: WorkspaceKind::Remote,
+                host: Some(host.to_owned()),
                 state: WorkspaceState::Ready,
                 detail: None,
             }))

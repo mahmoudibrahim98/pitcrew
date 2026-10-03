@@ -34,6 +34,7 @@ DIR='{dir}'
 case "$*" in
   *"token show-path"*) {show_path} ;;
   *"serve --listen private"*)
+    trap 'echo "term $$" >> "$DIR/log"; exit 0' TERM
     echo "start $$" >> "$DIR/log"
     {serve}
     ;;
