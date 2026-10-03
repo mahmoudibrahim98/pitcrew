@@ -1452,7 +1452,7 @@ mod tests {
                 err,
                 StoreError::TooNew {
                     found: 99,
-                    known: 2
+                    known: 3
                 }
             ),
             "{err}"
