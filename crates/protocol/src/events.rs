@@ -23,6 +23,7 @@ pub use crate::model::BriefTarget;
 
 /// One entry in the log.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Event {
     /// Id; sorts by creation time.
     pub id: EventId,
@@ -34,6 +35,7 @@ pub struct Event {
     pub author: MemberId,
     /// For an agent's events, the person it acts for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub on_behalf_of: Option<MemberId>,
     /// What happened.
     pub body: EventBody,
@@ -59,6 +61,7 @@ impl Event {
 
 /// What happened. On the wire: `{"type": "task_moved", "data": {…}}`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum EventBody {
@@ -107,6 +110,7 @@ pub enum EventBody {
         to: SessionState,
         /// A one-line status, if the runner has one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         status_line: Option<String>,
     },
     /// An agent finished a turn.
@@ -143,6 +147,7 @@ pub enum EventBody {
         removed: u32,
         /// Where the edit is in the transcript.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         receipt: Option<Receipt>,
     },
     /// A session's facts changed after it was discovered, e.g. a custom title set later.
@@ -151,9 +156,11 @@ pub enum EventBody {
         session: SessionId,
         /// New title, if it changed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         title: Option<String>,
         /// New git branch, if it changed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         branch: Option<String>,
     },
     /// A session was linked to a workstream or task.
@@ -162,9 +169,11 @@ pub enum EventBody {
         session: SessionId,
         /// The workstream.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         workstream: Option<WorkstreamId>,
         /// The task.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         task: Option<TaskId>,
         /// Why.
         basis: LinkBasis,
@@ -217,6 +226,7 @@ pub enum EventBody {
         task: TaskId,
         /// The new assignee.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         assignee: Option<MemberId>,
     },
     /// A task's title, description, priority, labels, dates, dependencies, workstream or
@@ -249,6 +259,7 @@ pub enum EventBody {
         outcome: DispatchOutcome,
         /// The agent's closing summary.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         summary: Option<String>,
     },
 
@@ -271,9 +282,11 @@ pub enum EventBody {
     CommentPosted {
         /// On this task.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         task: Option<TaskId>,
         /// Or on this workstream.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         workstream: Option<WorkstreamId>,
         /// Text (markdown).
         text: String,
@@ -289,6 +302,7 @@ pub enum EventBody {
         text: String,
         /// Proposed next step, if any.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         next: Option<String>,
         /// Evidence for every claim.
         receipts: Vec<Receipt>,
@@ -306,6 +320,7 @@ pub enum EventBody {
         text: String,
         /// The next step now in force, if any.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         next: Option<String>,
         /// Whether a person pinned it. Pinned briefs only get proposals.
         pinned: bool,
@@ -317,11 +332,13 @@ pub enum EventBody {
     DecisionRecorded {
         /// Workstream it belongs to.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         workstream: Option<WorkstreamId>,
         /// The decision.
         text: String,
         /// Why.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         why: Option<String>,
         /// Evidence.
         #[serde(default)]
