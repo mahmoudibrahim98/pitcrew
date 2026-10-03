@@ -98,6 +98,19 @@ Some agents run locally on a Windows machine instead of in a cloud container. Th
   at a real `~/.claude`, `~/.codex` or OpenCode data folder, and never run a real `claude`, `codex` or
   `opencode` binary in a test: use the stand-ins the tests already have.
 
+## Commit identity
+
+Commits in this public repository carry no personal e-mail address. Before your first commit, check
+`git config user.email`. If it isn't a GitHub `noreply` address, set the repository's identity to the
+maintainer's public noreply one:
+
+```bash
+git config user.name "mahmoudibrahim98"
+git config user.email "73237782+mahmoudibrahim98@users.noreply.github.com"
+```
+
+CI's scrub gate checks every commit's author and committer, and fails the pull request otherwise.
+
 ## The pull request
 
 Push your branch and open a pull request whose body is your report, in the shape of

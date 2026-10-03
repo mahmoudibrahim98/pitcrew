@@ -17,7 +17,7 @@
         ".gitignore", ".gitattributes", ".editorconfig",
         "LICENSE", "NOTICE", "README.md", "AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md", "CODE_OF_CONDUCT.md", "SECURITY.md",
         ".github/workflows/ci.yml",
-        ".github/workflows/fuzz.yml", ".github/pull_request_template.md", ".github/CODEOWNERS",
+        ".github/workflows/fuzz.yml", ".github/workflows/codeql.yml", ".github/workflows/workflow-security.yml", ".github/workflows/protocol-ts.yml", ".github/workflows/api-conformance.yml", ".github/pull_request_template.md", ".github/CODEOWNERS",
         ".github/dependabot.yml", ".github/ISSUE_TEMPLATE/**", ".github/scrub/**", ".github/actions/**",
         "scripts/ci/**", "scripts/*", ".cargo/**", ".vscode/**",
         "crates/protocol/**", "crates/interfaces/**", "crates/fixtures/**", "crates/daemon/**",
