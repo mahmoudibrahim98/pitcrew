@@ -619,9 +619,13 @@ impl Ssh {
             } else {
                 command
             };
+            // `--cd ~`: start in the distro user's home, not a translation of the app's Windows
+            // working directory (which wsl.exe warns about when it cannot translate it).
             return Ok(vec![
                 "-d".into(),
                 host.into(),
+                "--cd".into(),
+                "~".into(),
                 "--exec".into(),
                 "/bin/sh".into(),
                 "-c".into(),
@@ -881,6 +885,12 @@ impl Ssh {
         let mut command = tokio::process::Command::new(&self.program);
         if let EnvPolicy::Minimal(extra) = &self.env {
             command.env_clear().envs(minimal_env(extra));
+        }
+        if self.wsl {
+            // wsl.exe's own messages (errors, warnings) in UTF-8 rather than UTF-16LE, so they
+            // reach people readable. Transport calls only: the distribution listing is parsed
+            // as UTF-16LE, and the distro's own output is passed through unchanged either way.
+            command.env("WSL_UTF8", "1");
         }
         command
             .stdin(Stdio::null())
@@ -1652,6 +1662,42 @@ mod tests {
             );
         }
         assert!(control_path(Path::new(&format!("/tmp/{}", "x".repeat(60)))).is_err());
+    }
+
+    /// WSL calls: the distro as one argument, the home as the working directory, wsl.exe's own
+    /// messages in UTF-8; none of it for ssh, nor for the distribution listing.
+    #[test]
+    fn wsl_calls_start_at_home_with_readable_messages() {
+        let dir = Path::new("/run/user/1000/pitcrew-ssh");
+        let wsl = Ssh::wsl("wsl.exe");
+        for distro in [
+            "Lab 'quoted' distro",
+            "a \"b\" c\\",
+            "trailing\\",
+            "& ^ % !",
+        ] {
+            let args = wsl
+                .args(dir, &dir.join("log"), distro, "true".into(), &[])
+                .unwrap();
+            assert_eq!(
+                args,
+                ["-d", distro, "--cd", "~", "--exec", "/bin/sh", "-c", "true"]
+            );
+        }
+        assert!(
+            wsl.args(dir, &dir.join("log"), "-x", "true".into(), &[])
+                .is_err()
+        );
+        let utf8 = |ssh: &Ssh| {
+            ssh.command()
+                .as_std()
+                .get_envs()
+                .find(|(name, _)| *name == "WSL_UTF8")
+                .and_then(|(_, value)| value.map(ToOwned::to_owned))
+        };
+        assert_eq!(utf8(&wsl), Some("1".into()));
+        assert_eq!(utf8(&Ssh::new("ssh").minimal_env()), None);
+        assert_eq!(utf8(&Ssh::new("wsl.exe").minimal_env()), None);
     }
 
     #[tokio::test(start_paused = true)]
