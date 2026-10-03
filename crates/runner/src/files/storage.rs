@@ -291,33 +291,33 @@ $p=$env:PITCREW_FILE_ACL_PATH
 $action=$env:PITCREW_FILE_ACL_ACTION
 $sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User
 if ($action -eq 'createfile') {
-  $s=New-Object System.Security.AccessControl.FileSecurity
+  $s=[System.Security.AccessControl.FileSecurity]::new()
   $s.SetOwner($sid); $s.SetAccessRuleProtection($true,$false)
-  $r=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','Allow')
+  $r=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','Allow')
   $s.AddAccessRule($r)
   $f=[System.IO.FileStream]::new($p,[System.IO.FileMode]::CreateNew,[System.Security.AccessControl.FileSystemRights]::FullControl,[System.IO.FileShare]::ReadWrite,4096,[System.IO.FileOptions]::None,$s)
   $f.Dispose()
 }
 if ($action -eq 'directory' -and -not [System.IO.Directory]::Exists($p)) {
-  $s=New-Object System.Security.AccessControl.DirectorySecurity
+  $s=[System.Security.AccessControl.DirectorySecurity]::new()
   $s.SetOwner($sid); $s.SetAccessRuleProtection($true,$false)
-  $r=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow')
+  $r=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow')
   $s.AddAccessRule($r)
-  [System.IO.Directory]::CreateDirectory($p,$s) | Out-Null
+  $null=[System.IO.Directory]::CreateDirectory($p,$s)
 }
-$item=Get-Item -LiteralPath $p -Force
-if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'link' }
+$attributes=[System.IO.File]::GetAttributes($p)
+if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'link' }
 if ($action -eq 'copy') {
-  Set-Acl -LiteralPath $p -AclObject (Get-Acl -LiteralPath $env:PITCREW_FILE_ACL_SOURCE)
+  [System.IO.File]::SetAccessControl($p,[System.IO.File]::GetAccessControl($env:PITCREW_FILE_ACL_SOURCE))
   exit 0
 }
 if ($action -eq 'file') {
-  $s=New-Object System.Security.AccessControl.FileSecurity
+  $s=[System.Security.AccessControl.FileSecurity]::new()
   $s.SetOwner($sid); $s.SetAccessRuleProtection($true,$false)
-  $r=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','Allow')
-  $s.AddAccessRule($r); Set-Acl -LiteralPath $p -AclObject $s
+  $r=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','Allow')
+  $s.AddAccessRule($r); [System.IO.File]::SetAccessControl($p,$s)
 }
-$s=Get-Acl -LiteralPath $p
+$s=if (($attributes -band [System.IO.FileAttributes]::Directory) -ne 0) { [System.IO.Directory]::GetAccessControl($p) } else { [System.IO.File]::GetAccessControl($p) }
 if ($s.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value -or -not $s.AreAccessRulesProtected) { throw 'owner' }
 $rules=$s.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])
 if ($rules.Count -eq 0) { throw 'empty' }
@@ -325,22 +325,27 @@ foreach ($r in $rules) {
   if ($r.IdentityReference.Value -ne $sid.Value -or $r.AccessControlType -ne 'Allow' -or $r.FileSystemRights -ne 'FullControl') { throw 'public' }
 }
 "#;
-    let output = std::process::Command::new("powershell.exe")
-        .args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            SCRIPT,
-        ])
-        .env("PITCREW_FILE_ACL_PATH", path)
-        .env("PITCREW_FILE_ACL_ACTION", action)
-        .env("PITCREW_FILE_ACL_SOURCE", source.unwrap_or(path))
-        .creation_flags(0x0800_0000)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()?;
+    let system = std::env::var_os("SystemRoot")
+        .map(std::path::PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .ok_or_else(FileError::forbidden)?;
+    let output =
+        std::process::Command::new(system.join("System32/WindowsPowerShell/v1.0/powershell.exe"))
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                SCRIPT,
+            ])
+            .env("PITCREW_FILE_ACL_PATH", path)
+            .env("PITCREW_FILE_ACL_ACTION", action)
+            .env("PITCREW_FILE_ACL_SOURCE", source.unwrap_or(path))
+            .creation_flags(0x0800_0000)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
     if output.success() {
         Ok(())
     } else {
@@ -367,24 +372,32 @@ pub(super) fn backup(directory: &Path, root: &Path, relative: &str, bytes: &[u8]
             .map_err(|_| FileError::forbidden())?;
         let (prefix, suffix) = name.split_once('-').ok_or_else(FileError::forbidden)?;
         if prefix.len() != 64
-            || !prefix.bytes().all(|b| b.is_ascii_hexdigit())
-            || suffix.parse::<ulid::Ulid>().is_err()
+            || !prefix
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         {
             return Err(FileError::forbidden());
         }
+        let id = suffix
+            .parse::<ulid::Ulid>()
+            .map_err(|_| FileError::forbidden())?;
         private_check(&entry.path(), false)?;
         let file = open(&entry.path(), false)?;
         if links(&file)? != 1 || file.metadata()?.len() > super::MAX_FILE_BYTES {
             return Err(FileError::forbidden());
         }
-        existing.push((
-            file.metadata()?.modified()?,
-            prefix.to_owned(),
-            entry.path(),
-            file.metadata()?.len(),
-        ));
+        existing.push((id, prefix.to_owned(), entry.path(), file.metadata()?.len()));
     }
     existing.sort();
+    // Strictly newer than every stored backup, even within one clock tick or after a restart.
+    let mut next = ulid::Ulid::generate();
+    if let Some((last, _, _, _)) = existing.last().filter(|entry| next <= entry.0) {
+        next = ulid::Ulid::from(
+            u128::from(*last)
+                .checked_add(1)
+                .ok_or_else(FileError::forbidden)?,
+        );
+    }
     let mut total: u64 = existing.iter().map(|e| e.3).sum();
     let mut count = existing.iter().filter(|e| e.1 == key).count();
     for (_, prefix, path, size) in existing {
@@ -406,7 +419,7 @@ pub(super) fn backup(directory: &Path, root: &Path, relative: &str, bytes: &[u8]
         }
     }
     held.verify()?;
-    let path = directory.join(format!("{key}-{}", ulid::Ulid::generate()));
+    let path = directory.join(format!("{key}-{next}"));
     #[cfg(unix)]
     let mut file = {
         use rustix::fs::{Mode, OFlags};
@@ -439,6 +452,25 @@ mod tests {
     use super::*;
     use crate::files::Files;
     use pitcrew_protocol::files::{FileEncoding, WriteFile};
+    #[test]
+    fn windows_acl_ignores_inherited_module_search_paths()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let modules = tmp.path().join("empty-modules");
+        fs::create_dir(&modules)?;
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "files::storage::tests::windows_private_acl_and_permissions_survive_replacement",
+                "--exact",
+            ])
+            .env("PSModulePath", modules)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "ACL helper must not depend on inherited module search paths"
+        );
+        Ok(())
+    }
     #[test]
     fn windows_private_acl_and_permissions_survive_replacement()
     -> std::result::Result<(), Box<dyn std::error::Error>> {

@@ -101,6 +101,16 @@ fn a_root_inside_git_is_readable_but_never_writable() -> TestResult {
             .is_err()
     );
     assert!(files.write(&root, "new", write(None, "wrong")).is_err());
+    let alias = tmp.path().join(".GIT");
+    if fs::symlink_metadata(&alias).is_ok() {
+        let read = files.read(&alias, "config")?;
+        assert!(
+            files
+                .write(&alias, "config", write(Some(read.revision), "wrong"))
+                .is_err()
+        );
+        assert!(files.write(&alias, "new", write(None, "wrong")).is_err());
+    }
     assert_eq!(fs::read(root.join("config"))?, b"synthetic git data");
     Ok(())
 }
@@ -191,7 +201,8 @@ fn caps_and_retention() -> TestResult {
     let data = "x".repeat(MAX_FILE_BYTES as usize);
     for n in 0..9 {
         let path = format!("big{n}");
-        let current = files.write(&root, &path, write(None, &data))?;
+        let marked = format!("{n}{}", &data[1..]);
+        let current = files.write(&root, &path, write(None, &marked))?;
         files.write(&root, &path, write(Some(current.revision), "small"))?;
     }
     let sizes: Vec<_> = fs::read_dir(state.join("file-backups"))?
@@ -199,6 +210,12 @@ fn caps_and_retention() -> TestResult {
         .collect::<Result<_, _>>()?;
     assert!(sizes.iter().sum::<u64>() <= 64 * 1024 * 1024);
     assert!(sizes.iter().all(|&s| s <= MAX_FILE_BYTES));
+    assert_eq!(sizes.len(), 8);
+    let mut newest: Vec<_> = fs::read_dir(state.join("file-backups"))?
+        .map(|entry| fs::read(entry?.path()).map(|bytes| bytes[0]))
+        .collect::<Result<_, _>>()?;
+    newest.sort();
+    assert_eq!(newest, b"12345678");
     Ok(())
 }
 #[test]

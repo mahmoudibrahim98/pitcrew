@@ -264,11 +264,29 @@ impl Files {
         } else {
             checked.path.parent().ok_or_else(FileError::invalid)?
         };
-        if resolved.canonicalize()?.components().any(|component| {
+        let resolved = resolved.canonicalize()?;
+        if resolved.components().any(|component| {
             let name = component.as_os_str().to_string_lossy();
             name == ".git" || cfg!(windows) && name.eq_ignore_ascii_case(".git")
         }) {
             return Err(FileError::forbidden());
+        }
+        // On a case-insensitive Unix volume, realpath can preserve an alias's spelling.
+        #[cfg(unix)]
+        for ancestor in resolved.ancestors() {
+            use std::os::unix::fs::MetadataExt as _;
+            let Some(parent) = ancestor.parent() else {
+                continue;
+            };
+            let git = match fs::symlink_metadata(parent.join(".git")) {
+                Ok(meta) => meta,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let meta = fs::symlink_metadata(ancestor)?;
+            if meta.dev() == git.dev() && meta.ino() == git.ino() {
+                return Err(FileError::forbidden());
+            }
         }
         let old = if checked.exists {
             if !checked.last().metadata()?.is_file() || storage::links(checked.last())? > 1 {
@@ -470,6 +488,37 @@ mod tests {
             assert!(!moved);
             assert!(result.is_ok());
         }
+        Ok(())
+    }
+    #[test]
+    fn a_file_swap_between_check_and_open_is_refused_or_prevented() -> TestResult {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path().join("root");
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&root)?;
+        fs::write(root.join("file"), "inside")?;
+        fs::write(&outside, "synthetic outside")?;
+        let mut moved = false;
+        let result = Checked::walk_with(&root, "file", false, &mut |p| {
+            if p == root.join("file") {
+                moved = fs::rename(p, root.join("moved")).is_ok();
+                #[cfg(unix)]
+                if moved {
+                    std::os::unix::fs::symlink(&outside, p).expect("synthetic file link");
+                }
+            }
+        });
+        #[cfg(unix)]
+        {
+            assert!(moved);
+            assert!(result.is_err());
+        }
+        #[cfg(windows)]
+        {
+            assert!(!moved);
+            assert!(result.is_ok());
+        }
+        assert_eq!(fs::read(outside)?, b"synthetic outside");
         Ok(())
     }
 }
