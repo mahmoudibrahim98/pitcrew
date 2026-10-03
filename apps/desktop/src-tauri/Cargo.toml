@@ -77,7 +77,7 @@ keyring = "4.2"
 # tunnel's `Connector` (stream J), over the person's own OpenSSH.
 pitcrew-remote = { path = "../../../crates/remote" }
 # Random plan and prompt ids. The version pitcrew-remote already uses.
-getrandom = "0.3"
+getrandom = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 # SIGTERM to the daemon, O_NOFOLLOW for the token file, and the host name (`uname`), without
