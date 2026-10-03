@@ -466,6 +466,31 @@ fn no_runner_watches_nothing_and_serves_no_terminal() {
     );
     assert_eq!(reply.status, 202);
     daemon.wait_for_log("hook received", WAIT);
+
+    // Nothing can start a session: a dispatch answers 503 saying why, after its own checks, and
+    // records nothing; so does a start for an agent.
+    let rev = daemon.latest_rev(&device);
+    let reply = daemon.post(
+        &format!("/v1/tasks/{}/dispatch", id::PAP2),
+        Some(&device),
+        &json!({ "agent": id::WRITER }),
+    );
+    assert_eq!(reply.status, 503, "{}", reply.body);
+    assert!(reply.body.contains("no runner"), "{}", reply.body);
+    let done = daemon.post(
+        &format!("/v1/tasks/{}/dispatch", id::PAP7),
+        Some(&device),
+        &json!({ "agent": id::WRITER }),
+    );
+    assert_eq!(done.status, 409, "a done task: {}", done.body);
+    let start = daemon.post(
+        "/v1/sessions",
+        Some(&device),
+        &json!({ "machine": id::LAPTOP, "engine": "claude", "cwd": tmp.path(),
+                 "agent": id::WRITER }),
+    );
+    assert_eq!(start.status, 503, "{}", start.body);
+    assert_eq!(daemon.latest_rev(&device), rev, "nothing recorded");
 }
 
 /// SIGTERM: the runner hands the store what it read and stops before the store closes, as the

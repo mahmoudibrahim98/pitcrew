@@ -66,6 +66,7 @@ mod link;
 mod pages;
 mod plain;
 mod pool;
+mod session_env;
 mod sink;
 mod store;
 mod store_sink;
@@ -73,11 +74,13 @@ mod terminals;
 mod watch;
 
 pub use agents::{MemoryAgents, SessionAgent, SessionAgents};
+pub use commands::Started;
 pub use commands::{CommandOptions, RunnerCommands};
 pub use config::{EngineHome, PollMode, RunnerConfig, Timing};
 pub use hooks::RunnerHooks;
 pub use link::{Locations, MemoryLocations, WorkstreamLocation};
 pub use pages::{DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, PageError, PageOptions, RunnerTranscripts};
+pub use session_env::SessionEnv;
 pub use sink::{EventSink, SinkError};
 pub use store::StoreError;
 pub use store_sink::StoreSink;
@@ -118,6 +121,7 @@ pub struct RunnerHandle {
     watched: Arc<pages::Watched>,
     transcripts: RunnerTranscripts,
     homes: Vec<EngineHome>,
+    session_env: Option<Arc<dyn SessionEnv>>,
     stopping: Arc<AtomicBool>,
     watcher: Option<JoinHandle<()>>,
     dispatcher: Option<JoinHandle<()>>,
@@ -220,6 +224,7 @@ impl RunnerHandle {
             terminals.clone(),
             Arc::clone(&self.shared),
             self.homes.clone(),
+            self.session_env.clone(),
             options,
         )
     }
@@ -276,6 +281,7 @@ pub fn start(
     let stopping = Arc::new(AtomicBool::new(false));
     let retry_max = config.timing.sink_retry_max;
     let homes = config.homes.clone();
+    let session_env = config.session_env.clone();
 
     let watcher = watch::Watcher::new(watch::Setup {
         workspace: config.workspace,
@@ -311,6 +317,7 @@ pub fn start(
         watched,
         transcripts,
         homes,
+        session_env,
         stopping,
         watcher: None,
         dispatcher: Some(dispatcher),

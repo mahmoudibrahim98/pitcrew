@@ -17,6 +17,7 @@ use pitcrew_protocol::model::{
 use pitcrew_store::sql::Connection;
 use pitcrew_store::{RevRange, Store};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// Where commands get the time from. The default is the system clock.
@@ -85,6 +86,9 @@ pub struct WorkService {
     recaps: Mutex<RecapSync>,
     /// Called once, after `set_up` commits (see [`SetupListener`]).
     setup_listener: Option<Arc<dyn SetupListener>>,
+    /// Dispatches whose session has reported `working` while this service runs (see
+    /// [`WorkService::follow_sessions`]): their task moved then, and is not moved again.
+    working: Mutex<HashSet<DispatchId>>,
 }
 
 impl std::fmt::Debug for WorkService {
@@ -113,6 +117,7 @@ impl WorkService {
             hub_machine: Mutex::new(None),
             recaps: Mutex::new(RecapSync::default()),
             setup_listener: None,
+            working: Mutex::new(HashSet::new()),
         }
     }
 
@@ -124,7 +129,8 @@ impl WorkService {
     }
 
     /// Starts dispatched sessions through `dispatcher` (the runner link). Without one,
-    /// `POST /v1/tasks/{id}/dispatch` answers `503 unavailable`.
+    /// `POST /v1/tasks/{id}/dispatch` answers `503 unavailable` once the request has passed its
+    /// other checks, and records nothing.
     #[must_use]
     pub fn with_dispatcher(mut self, dispatcher: Arc<dyn Dispatcher>) -> Self {
         self.dispatcher = Some(dispatcher);
@@ -219,6 +225,14 @@ impl WorkService {
             .hub_machine
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether this is the first `working` seen for `dispatch` while this service runs.
+    pub(crate) fn first_working(&self, dispatch: DispatchId) -> bool {
+        self.working
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(dispatch)
     }
 
     pub(crate) fn setup_listener(&self) -> Option<Arc<dyn SetupListener>> {

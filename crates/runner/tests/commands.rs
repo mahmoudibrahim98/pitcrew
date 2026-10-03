@@ -111,6 +111,7 @@ fn start_claude(cwd: &Path) -> RunnerCommand {
         model: None,
         account: None,
         permission_mode: PermissionMode::Default,
+        session: None,
     }
 }
 

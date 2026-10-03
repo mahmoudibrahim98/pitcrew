@@ -1,14 +1,4 @@
 {
-  "dispatch success": {
-    "row": "D1",
-    "actual": 503,
-    "wanted": 202
-  },
-  "dispatch completed conflict": {
-    "row": "D2",
-    "actual": 503,
-    "wanted": 409
-  },
   "session link manual": {
     "row": "D3",
     "actual": 404,

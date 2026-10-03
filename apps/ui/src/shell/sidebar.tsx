@@ -39,6 +39,8 @@ import type { ResolvedNav } from './registry.ts';
 import { SHORTCUTS } from './shortcuts.ts';
 import { useShell } from './store.ts';
 
+import { WorkspaceName, workspaceLabel } from './workspace-name.tsx';
+
 const ITEM =
   'flex h-7 min-w-0 items-center gap-2 rounded-sm px-2 text-sm text-ink-2 outline-none ' +
   `hover:bg-hover hover:text-ink ${FOCUS_RING} ` +
@@ -62,9 +64,10 @@ export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
   const remote = useRemoteGateway();
   const [removing, setRemoving] = useState<GatewayWorkspace | null>(null);
   const removingRef = useRef(false);
-  const workspaces: { id: string; name: string; state?: WorkspaceState }[] =
+  const workspaces: { id: string; name: string; kind?: GatewayWorkspace['kind']; host?: string | undefined; state?: WorkspaceState }[] =
     desktop !== null ? (desktop.list ?? []) : workspace === undefined ? [] : [workspace];
-  const name = workspaces.find((w) => w.id === ws)?.name ?? workspace?.name ?? 'Workspace';
+  const selected = workspaces.find((w) => w.id === ws) ?? { name: workspace?.name ?? 'Workspace' };
+  const name = selected.name;
   // Only a remote workspace can be removed: the local one is this machine's own hub.
   const current = desktop?.list?.find((w) => w.id === ws);
   const removable = remote !== null && current?.kind === 'remote' ? current : undefined;
@@ -79,9 +82,9 @@ export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
           <button
             id={SWITCHER_ID}
             type="button"
-            aria-label={`Workspace: ${name}`}
+            aria-label={`Workspace: ${workspaceLabel(selected)}`}
             className={cx(
-              'flex h-9 min-w-0 flex-1 items-center gap-2 rounded-md px-1.5 text-left outline-none hover:bg-hover',
+              'flex min-h-9 min-w-0 flex-1 items-center gap-2 rounded-md px-1.5 text-left outline-none hover:bg-hover',
               FOCUS_RING,
             )}
           >
@@ -93,7 +96,7 @@ export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
             </span>
             {!collapsed && (
               <>
-                <span className="min-w-0 flex-1 truncate text-sm font-semibold text-ink">{name}</span>
+                <span className="min-w-0 flex-1 text-sm font-semibold text-ink"><WorkspaceName workspace={selected} /></span>
                 <ChevronsUpDownIcon className="size-3.5 text-ink-2" />
               </>
             )}
@@ -109,8 +112,8 @@ export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
           <MenuLabel>Workspaces</MenuLabel>
           <MenuRadioGroup value={ws} onValueChange={(id) => void router.navigate({ href: paths.workspace(id) })}>
             {workspaces.map((w) => (
-              <MenuRadioItem key={w.id} value={w.id}>
-                {w.state === undefined || w.state === 'ready' ? w.name : `${w.name} · ${WORKSPACE_STATE_LABEL[w.state]}`}
+              <MenuRadioItem key={w.id} value={w.id} className="h-auto min-h-7">
+                <WorkspaceName workspace={w} suffix={w.state !== undefined && w.state !== 'ready' ? ` · ${WORKSPACE_STATE_LABEL[w.state]}` : ''} />
               </MenuRadioItem>
             ))}
           </MenuRadioGroup>

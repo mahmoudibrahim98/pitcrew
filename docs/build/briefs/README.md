@@ -85,19 +85,20 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [0-deps-getrandom-04](0-deps-getrandom-04.md) | 0 · Contracts | `integrator/deps-getrandom-04` | Codex | **Merged** (PR #15) |
 | [0-deps-tungstenite-030](0-deps-tungstenite-030.md) | 0 · Contracts | `integrator/deps-tungstenite-030` | Codex | Blocked: the released axum still needs tungstenite 0.29 |
 | [0-deps-typescript-7](0-deps-typescript-7.md) | 0 · Contracts | `integrator/deps-typescript-7` | Codex | **Merged** (PR #16: stays on 6 for now) |
-| [0-workspace-host](0-workspace-host.md) | 0 · Contracts | `integrator/workspace-host` | Codex | In review (PR #17, fixes pushed) |
+| [0-workspace-host](0-workspace-host.md) | 0 · Contracts | `integrator/workspace-host` | Codex | **Merged** (PR #17) |
 | [I-hook-exec-form](I-hook-exec-form.md) | I · CLI and hooks | `s/I/hook-exec-form` | Codex | **Merged** (PR #18) |
 | [0-flaky-tests](0-flaky-tests.md) | 0 · Contracts | `integrator/flaky-tests` | Codex | **Merged** (PR #19) |
 | [0-flaky-tests-2](0-flaky-tests-2.md) | 0 · Contracts | `integrator/flaky-tests-2` | Codex | **Merged** (PR #34) |
 | [0-review-followups](0-review-followups.md) | 0 · Contracts | `integrator/review-followups` | Opus-class | **Merged** (PR #30) |
-| [0-dispatch](0-dispatch.md) | 0 · Composition root | `integrator/dispatch` | Opus-class | Changes requested (PR #33) |
+| [0-dispatch](0-dispatch.md) | 0 · Composition root | `integrator/dispatch` | Opus-class | **Merged** (PR #33; follow-ups in 0-dispatch-followups) |
+| [0-dispatch-followups](0-dispatch-followups.md) | 0 · Composition root | `integrator/dispatch-followups` | Codex | Ready |
 | [0-onboarding-scan](0-onboarding-scan.md) | 0 · Contracts | `integrator/onboarding-scan` | Opus-class | **Merged** (PR #32) |
-| [0-session-linking](0-session-linking.md) | 0 · Composition root | `integrator/session-linking` | Codex | Ready once 0-dispatch merges |
+| [0-session-linking](0-session-linking.md) | 0 · Composition root | `integrator/session-linking` | Codex | Ready (after 0-dispatch-followups: same files) |
 | [0-idle-cpu](0-idle-cpu.md) | 0 · Composition root | `integrator/idle-cpu` | Codex | In progress (Codex, cloud) |
-| [0-scan-followups](0-scan-followups.md) | 0 · Contracts | `integrator/scan-followups` | Codex | In progress (Codex, cloud) |
+| [0-scan-followups](0-scan-followups.md) | 0 · Contracts | `integrator/scan-followups` | Codex | PR #38 (Rust checks being finished locally) |
 | [0-docs-followups](0-docs-followups.md) | 0 · Contracts | `integrator/docs-followups` | Codex | **Merged** (PR #35) |
-| [0-read-cursors](0-read-cursors.md) | 0 · Contracts | `integrator/read-cursors` | Codex | In progress (Codex, local) |
-| [0-files-api](0-files-api.md) | 0 · Contracts | `integrator/files-api` | Codex (local, Windows) | In progress (Codex, local) |
+| [0-read-cursors](0-read-cursors.md) | 0 · Contracts | `integrator/read-cursors` | Codex | PR #36 (CI fixes in progress) |
+| [0-files-api](0-files-api.md) | 0 · Contracts | `integrator/files-api` | Codex (local, Windows) | PR #37: contract only so far; `Cargo.lock` now allowed, implementation next |
 | [0-ci-security](0-ci-security.md) | 0 · Contracts | `integrator/ci-security` | Codex | **Merged** (PR #22) |
 | [0-protocol-ts](0-protocol-ts.md) | 0 · Contracts | `integrator/protocol-ts` | Codex | **Merged** (PR #23) |
 | [0-api-conformance](0-api-conformance.md) | 0 · Contracts | `integrator/api-conformance` | Codex | **Merged** (PR #24) |
