@@ -162,6 +162,11 @@ before the dispatch's CLI starts.
   abandons: its terminal is forgotten once its program has ended. Imported transcripts without
   a runner-started terminal remain `Reported`; a missing local index is never evidence that an
   imported CLI exited.
+  Startup refresh keeps the terminal row of a runner-started CLI with a session even when the
+  runtime no longer lists its id. That row preserves provenance: an indexed dispatched session
+  still answers `Exited` if its CLI disappeared while the daemon was down. Hand-linked terminals
+  and unclaimed starts retain the usual refresh behavior; no missing terminal is followed by its
+  old target. Imported transcripts never acquire this exit evidence.
 
 ## Memory
 
