@@ -340,7 +340,7 @@ impl Target {
         platform: Platform,
     ) -> Result<Self, HelperError> {
         let host = host.into();
-        crate::quote::validate_host(&host)?;
+        ssh.validate_destination(&host)?;
         Ok(Self {
             ssh,
             host,

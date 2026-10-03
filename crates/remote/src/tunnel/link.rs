@@ -103,11 +103,22 @@ impl Link {
     /// # Errors
     /// ssh failed (its error, from its log), a prompt was cancelled, or `wait` passed.
     pub(crate) async fn start(spec: LinkSpec<'_>, wait: Duration) -> Result<Self, SshError> {
-        validate_host(spec.host)?;
+        spec.ssh.validate_destination(spec.host)?;
         let log = SshLog::new(spec.dir)?;
         let control = spec.master.then(|| spec.dir.join(spec.name));
-        let fork = knows_fork_after_authentication(spec.ssh, spec.host).await;
-        let args = link_args(&spec, log.path(), control.as_deref(), fork)?;
+        let args = if spec.ssh.is_wsl() {
+            // A distro exit ends this heartbeat and triggers the existing reconnect ladder.
+            let command = crate::quote::remote_command(&[
+                "sh",
+                "-c",
+                "printf 'pitcrew-wsl-ready\\n' >&2; while :; do sleep 2; done",
+            ])?;
+            spec.ssh
+                .args(spec.dir, log.path(), spec.host, command, &[])?
+        } else {
+            let fork = knows_fork_after_authentication(spec.ssh, spec.host).await;
+            link_args(&spec, log.path(), control.as_deref(), fork)?
+        };
         if let Some(control) = &control {
             let _ = std::fs::remove_file(control);
         }
@@ -127,7 +138,26 @@ impl Link {
             stderr,
             patient: spec.patient,
         };
-        link.ready(wait).await?;
+        if spec.ssh.is_wsl() {
+            tokio::time::timeout(wait, async {
+                loop {
+                    if text(&link.stderr)
+                        .lines()
+                        .any(|line| line == "pitcrew-wsl-ready")
+                    {
+                        return Ok(());
+                    }
+                    if !link.alive() {
+                        return Err(SshError::UnexpectedOutput("WSL heartbeat exited".into()));
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            })
+            .await
+            .map_err(|_| SshError::TimedOut(wait))??;
+        } else {
+            link.ready(wait).await?;
+        }
         Ok(link)
     }
 

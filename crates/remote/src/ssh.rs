@@ -385,6 +385,8 @@ enum EnvPolicy {
 /// The ssh program and how to call it. Cheap to clone.
 #[derive(Clone)]
 pub struct Ssh {
+    wsl: bool,
+    wsl_home: Option<String>,
     program: PathBuf,
     prompts: Option<Prompts>,
     /// `None`: the first usable of [`crate::private::default_runtime_dirs`].
@@ -422,12 +424,51 @@ impl Ssh {
     pub fn new(program: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
+            wsl: false,
+            wsl_home: None,
             prompts: None,
             runtime_dir: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             multiplex: cfg!(unix),
             env: EnvPolicy::Inherit,
             through: None,
+        }
+    }
+
+    /// Uses WSL as the command transport, without SSH configuration or prompts.
+    #[must_use]
+    pub fn wsl(program: impl Into<PathBuf>) -> Self {
+        let mut transport = Self::new(program).with_multiplex(false).minimal_env();
+        transport.wsl = true;
+        transport
+    }
+
+    /// Whether this command transport is WSL.
+    #[must_use]
+    pub fn is_wsl(&self) -> bool {
+        self.wsl
+    }
+
+    /// Overrides HOME inside WSL, for isolated integration tests or a separate helper home.
+    ///
+    /// # Errors
+    /// The transport is not WSL or the home is not an absolute, safe layout path.
+    pub fn with_wsl_home(mut self, home: &str) -> Result<Self, SshError> {
+        if !self.wsl {
+            return Err(SshError::InvalidArgument(
+                "HOME override requires WSL".into(),
+            ));
+        }
+        crate::Layout::in_home(home).map_err(|e| SshError::InvalidArgument(e.to_string()))?;
+        self.wsl_home = Some(home.to_owned());
+        Ok(self)
+    }
+
+    pub(crate) fn validate_destination(&self, host: &str) -> Result<(), SshError> {
+        if self.wsl {
+            crate::wsl::validate_distro(host)
+        } else {
+            validate_host(host)
         }
     }
 
@@ -566,6 +607,27 @@ impl Ssh {
         command: String,
         extra: &[String],
     ) -> Result<Vec<String>, SshError> {
+        if self.wsl {
+            self.validate_destination(host)?;
+            if !extra.is_empty() {
+                return Err(SshError::InvalidArgument(
+                    "SSH options cannot be used with WSL".into(),
+                ));
+            }
+            let command = if let Some(home) = &self.wsl_home {
+                format!("export HOME={}; {command}", crate::quote::sh_quote(home))
+            } else {
+                command
+            };
+            return Ok(vec![
+                "-d".into(),
+                host.into(),
+                "--exec".into(),
+                "/bin/sh".into(),
+                "-c".into(),
+                command,
+            ]);
+        }
         let log = log.to_str().ok_or_else(|| {
             SshError::InvalidArgument("the runtime directory is not valid UTF-8".to_owned())
         })?;
@@ -739,7 +801,7 @@ impl Ssh {
         input: Option<Input<'_>>,
         limits: Limits,
     ) -> Result<Output, SshError> {
-        validate_host(host)?;
+        self.validate_destination(host)?;
         let remote = remote_command(argv)?;
         self.check_askpass()?;
         let dir = self.runtime_dir()?;
@@ -797,7 +859,12 @@ impl Ssh {
     /// # Errors
     /// As [`Ssh::resolve`].
     pub async fn resolve_with(&self, host: &str, limits: Limits) -> Result<ResolvedHost, SshError> {
-        validate_host(host)?;
+        if self.wsl {
+            return Err(SshError::InvalidArgument(
+                "WSL has no SSH configuration to resolve".into(),
+            ));
+        }
+        self.validate_destination(host)?;
         let mut command = self.command();
         command.args(["-G", "--", host]);
         let (status, stdout, stderr) = drive(command, None, limits, None).await?;
