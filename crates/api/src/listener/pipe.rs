@@ -94,7 +94,9 @@ impl axum::serve::Listener for NamedPipe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::listener::pipe_security::{Ace, Dacl, current_user_sid, dacl, owner_sid};
+    use crate::listener::pipe_security::{
+        Ace, Dacl, FILE_ALL_ACCESS, current_user_sid, dacl, owner_sid,
+    };
 
     #[tokio::test]
     async fn the_current_user_owns_it_and_alone_has_access() {
@@ -114,7 +116,7 @@ mod tests {
                 // `GA` as granted reads back as `FILE_ALL_ACCESS` (`FA`).
                 entries: vec![Ace::Allow {
                     sid: sid.clone(),
-                    mask: 0x001F_01FF,
+                    mask: FILE_ALL_ACCESS,
                 }],
             }
         );

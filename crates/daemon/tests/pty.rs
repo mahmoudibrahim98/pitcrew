@@ -831,20 +831,22 @@ fn digits(state: &Path) -> String {
 }
 
 /// One ptyd per state directory: two daemons of one user, on their state directories' own
-/// endpoints, run their terminals in two ptyds, each holding only its own; on Unix a third daemon
-/// given the first's endpoint finds it locked and runs without terminals.
+/// endpoints, run their terminals in two ptyds, each holding only its own; a third daemon given
+/// the first's endpoint finds it locked and runs without terminals.
 #[test]
 fn each_state_directory_has_a_ptyd_of_its_own() {
     let Some(rig) = Rig::new("two") else {
         return;
     };
-    // On Unix the runtime's per-user directory is inside this test's folder.
+    // On Unix the runtime's per-user directory is inside this test's folder. On Windows the
+    // endpoints' lock files are in `%LOCALAPPDATA%\PitCrew`, which one user's daemons share: here
+    // a folder of this test's, given to all three.
     let tmpdir = rig.root().join("td");
     let env = if cfg!(unix) {
         private_folder(&tmpdir);
         vec![("TMUX_TMPDIR", tmpdir.clone().into_os_string())]
     } else {
-        Vec::new()
+        vec![("LOCALAPPDATA", rig.root().join("local").into_os_string())]
     };
     let start = |name: &str| {
         rig.start_on(
@@ -899,15 +901,15 @@ fn each_state_directory_has_a_ptyd_of_its_own() {
     );
 
     // A third daemon given the first's endpoint: locked, so no terminals for it, and the first's
-    // ptyd is not touched. (Windows takes no lock beyond the state directory's own.)
-    #[cfg(unix)]
+    // ptyd is not touched.
     {
         let ea_arg = ea.to_str().unwrap().to_owned();
+        let c_env: &[(&str, OsString)] = if cfg!(unix) { &[] } else { &env };
         let c = rig.start_on(
             &rig.root().join("c"),
             &rig.root().join("c-homes"),
             &["--demo", "--ptyd-endpoint", &ea_arg],
-            &[],
+            c_env,
         );
         let info = c.get("/v1/host/info", None).json();
         assert_eq!(info["capabilities"], json!(["watch"]), "{info}");

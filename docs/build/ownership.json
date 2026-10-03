@@ -21,6 +21,7 @@
         ".github/dependabot.yml", ".github/ISSUE_TEMPLATE/**", ".github/scrub/**", ".github/actions/**",
         "scripts/ci/**", "scripts/*", ".cargo/**", ".vscode/**",
         "crates/protocol/**", "crates/interfaces/**", "crates/fixtures/**", "crates/daemon/**",
+        "crates/trust/**",
         "crates/store/migrations/00*", "crates/store/migrations/*.md",
         "apps/mock-hub/**", "packages/tokens/**", "packages/protocol-ts/**",
         "docs/*.md", "docs/adr/**", "docs/build/**"

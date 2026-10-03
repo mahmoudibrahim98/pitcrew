@@ -7,7 +7,8 @@
 //!   `/tmp/pitcrew-<uid>`, checked before every connection), on Windows a named pipe only the
 //!   current user can open. Each side checks the other is the same user.
 //! - **[`PtyRuntime`]** is its client. It starts ptyd (found next to the running executable,
-//!   never on `PATH`) when a terminal is started and none runs, and reconnects as needed.
+//!   never on `PATH`, and checked as the desktop checks `pitcrewd` just before each start) when a
+//!   terminal is started and none runs, and reconnects as needed.
 //!   Output offsets live in ptyd, so a reconnect or a new runtime loses none: after a daemon
 //!   restart, [`Runtime::list`] finds the terminals and output goes on from the last offset.
 //! - **The protocol** ([`proto`]) is ptyd's own, versioned apart from API v1.
@@ -213,10 +214,11 @@ impl PtySupport {
     }
 }
 
-/// Checks that pitcrew-ptyd is where `options` says (a program file at an absolute path) and
-/// that its endpoint is safe ([`check_endpoint`], which creates the Unix socket's directory).
-/// It starts nothing. Quick, but it touches the file system: from async code use
-/// [`detect_async`].
+/// Checks that pitcrew-ptyd is where `options` says (a program file at an absolute path), that
+/// it passes the trust check every program PitCrew launches passes ([`launch::check_trusted`];
+/// it is checked again before each launch), and that its endpoint is safe ([`check_endpoint`],
+/// which creates the Unix socket's directory). It starts nothing. Quick, but it touches the file
+/// system: from async code use [`detect_async`].
 ///
 /// # Errors
 ///
@@ -233,6 +235,7 @@ pub fn detect(options: &PtyOptions) -> Result<PtySupport, RuntimeError> {
             options.ptyd.display()
         )));
     }
+    launch::check_trusted(&options.ptyd).map_err(RuntimeError::Unavailable)?;
     check_endpoint(&options.endpoint).map_err(RuntimeError::Unavailable)?;
     #[cfg(windows)]
     windows::current_user_sid()

@@ -2816,12 +2816,12 @@ dependencies = [
  "pitcrew-auth",
  "pitcrew-interfaces",
  "pitcrew-protocol",
+ "pitcrew-trust",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tungstenite",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2861,6 +2861,7 @@ dependencies = [
  "pitcrew-fixtures",
  "pitcrew-protocol",
  "pitcrew-remote",
+ "pitcrew-trust",
  "rustix",
  "serde",
  "serde_json",
@@ -2915,6 +2916,7 @@ version = "0.0.0"
 dependencies = [
  "getrandom 0.4.3",
  "pitcrew-protocol",
+ "pitcrew-trust",
  "rustix",
  "serde",
  "serde_json",
@@ -2922,6 +2924,15 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "toml_edit 0.25.15+spec-1.1.0",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "pitcrew-trust"
+version = "0.0.0"
+dependencies = [
+ "rustix",
+ "tokio",
  "windows-sys 0.61.2",
 ]
 

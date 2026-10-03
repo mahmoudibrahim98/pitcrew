@@ -45,8 +45,11 @@ toml_edit = { version = "=0.25.15", default-features = false, features = ["parse
 rustix = { version = "=1.1.5", features = ["event", "fs", "process", "stdio"] }
 
 [target.'cfg(windows)'.dependencies]
-# Job Objects for ssh (src/job.rs), the askpass pipe's security descriptor
-# (src/pipe_security.rs) and the pipe client's security flags. The version tokio already uses.
+# The askpass pipe's security descriptor (src/pipe_security.rs): the one copy of that Win32 code,
+# shared with the API's and pitcrew-ptyd's pipes.
+pitcrew-trust.workspace = true
+# Job Objects for ssh (src/job.rs) and the pipe client's security flags. The version tokio
+# already uses.
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
