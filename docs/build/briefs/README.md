@@ -92,11 +92,11 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [0-review-followups](0-review-followups.md) | 0 · Contracts | `integrator/review-followups` | Opus-class | **Merged** (PR #30) |
 | [0-dispatch](0-dispatch.md) | 0 · Composition root | `integrator/dispatch` | Opus-class | **Merged** (PR #33; follow-ups in 0-dispatch-followups) |
 | [0-dispatch-followups](0-dispatch-followups.md) | 0 · Composition root | `integrator/dispatch-followups` | Codex | **Merged** (PR #39) |
-| [0-dispatch-followups-2](0-dispatch-followups-2.md) | 0 · Composition root | `integrator/dispatch-followups-2` | Codex | Ready |
+| [0-dispatch-followups-2](0-dispatch-followups-2.md) | 0 · Composition root | `integrator/dispatch-followups-2` | Codex | **Merged** (PR #41) |
 | [0-flaky-tests-3](0-flaky-tests-3.md) | 0 · Contracts | `integrator/flaky-tests-3` | Codex (local, Windows) | Ready |
 | [0-onboarding-scan](0-onboarding-scan.md) | 0 · Contracts | `integrator/onboarding-scan` | Opus-class | **Merged** (PR #32) |
-| [0-session-linking](0-session-linking.md) | 0 · Composition root | `integrator/session-linking` | Codex | Ready |
-| [0-idle-cpu](0-idle-cpu.md) | 0 · Composition root | `integrator/idle-cpu` | Codex | In progress (Codex, cloud) |
+| [0-session-linking](0-session-linking.md) | 0 · Composition root | `integrator/session-linking` | Codex | In progress (Codex, cloud) |
+| [0-idle-cpu](0-idle-cpu.md) | 0 · Composition root | `integrator/idle-cpu` | Codex | PR #40 (latency fix in progress) |
 | [0-scan-followups](0-scan-followups.md) | 0 · Contracts | `integrator/scan-followups` | Codex | **Merged** (PR #38) |
 | [0-docs-followups](0-docs-followups.md) | 0 · Contracts | `integrator/docs-followups` | Codex | **Merged** (PR #35) |
 | [0-read-cursors](0-read-cursors.md) | 0 · Contracts | `integrator/read-cursors` | Codex | **Merged** (PR #36) |
