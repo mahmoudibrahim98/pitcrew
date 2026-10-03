@@ -16,6 +16,9 @@ use std::fmt;
 ///
 /// - **Paths and addresses, never secrets.** A terminal runtime keeps the variables a program was
 ///   started with (tmux's `new-window -e`), so a token travels as a file the variable names.
+/// - **Nothing inherited may win.** The runtime passes the host's own environment on, so a
+///   variable the CLI would read before these (`PITCREW_TOKEN` before `PITCREW_TOKEN_FILE`) is
+///   given here, empty; an empty value is set, not dropped.
 /// - **Bound to the session the hub stored**, not to anything a command says: the token's caller
 ///   comes from the hub's record of `session`.
 /// - **Never call back into the runner**: it is asked while a start runs.

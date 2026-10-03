@@ -110,8 +110,10 @@ before the dispatch's CLI starts.
   - gives the CLI the environment the host's `SessionEnv` returns for the session
     (`RunnerConfig::with_session_env`). The daemon's gives a session run as an agent
     `PITCREW_TOKEN_FILE`, the path of a private file holding an **agent** token bound to that
-    agent and its owner, and where the hub listens. Values are paths and addresses, never
-    secrets (a runtime keeps a program's variables). An error refuses the start;
+    agent and its owner, and where the hub listens, with `PITCREW_TOKEN` and the endpoint
+    variables it does not listen on set empty so that nothing the CLI inherits wins over them.
+    Values are paths and addresses, never secrets (a runtime keeps a program's variables). An
+    error refuses the start;
   - has the CLI's transcript **adopt** the id instead of minting one, before anything names the
     session:
     - **Claude**: by exact CLI id. The runner chose the `--session-id`, so the transcript's name
@@ -132,14 +134,24 @@ before the dispatch's CLI starts.
     either start is for a named session: the two could not be told apart. Two starts for no
     named session are left to the folder match, as before;
   - refuses to start a session it knows already (a transcript or a terminal under that id).
+- **A terminal whose program ended** before its transcript appeared will write none, so no
+  transcript is taken for it: the folder match skips it (the watcher asks the runtime about the
+  folder's candidates, without the index locked: `Shared::has_ended`), and a Codex or OpenCode
+  start in its folder retires it (forgets its row). A Claude terminal is matched by its exact
+  id, so it keeps its row until the host retires it (`RunnerCommands::retire`, once the hub gave
+  up on the session).
 - Re-statements keep naming no agent, which the hub reads as "keep the one you have": the hub
   knows the agent before the first hook, and the agent's own hooks change its session.
 - **Sub-agents** keep runner-minted ids, with `parent` set to the named session.
   `SessionAgents` must resolve them to their parent's agent (see above).
 - `RunnerCommands::started(session)` tells the host where a named start stands: `Reported` (its
-  transcript is indexed under it), `Running` (its terminal's program runs, the transcript is not
-  found yet), `Gone` (no terminal and no transcript here, or its program ended first) or
-  `Unknown`. The daemon reconciles the sessions it stored ahead of the runner with it.
+  transcript is indexed under it), `Running` (its start is under way, from the moment its command
+  runs until it returns, `Shared::under_way`; or its terminal's program runs and the transcript
+  is not found yet), `TooLate` (matched by folder, its program runs, and the 15-minute claim
+  window is over: no transcript can be taken for it any more), `Gone` (no terminal and no
+  transcript here, or its program ended first) or `Unknown`. The daemon reconciles the sessions
+  it stored ahead of the runner with it, and calls `RunnerCommands::retire` for each one it
+  abandons: its terminal is forgotten once its program has ended.
 
 ## Memory
 

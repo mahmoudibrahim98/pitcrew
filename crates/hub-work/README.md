@@ -144,6 +144,9 @@ change.
 (`dispatch`, `manual`, `claimed`) is never replaced by an inferred one (`folder`, `branch`,
 `imported`), nor by a re-stated `session_discovered` without a link. A firm link replaces any
 link. Agents stay the same way: a re-stated session without an `agent` keeps the one it had.
+An ended session stays ended (projection version 3): a re-stated `session_discovered` keeps its
+state and status line, so a CLI that turns up after the hub ended its session (it decided the CLI
+had not started) does not bring the session back. A later `session_state_changed` still applies.
 
 **Tasks: `task_updated`.** The projection writes the event's patch into the task as it is
 (`TaskPatch::apply`) and rewrites the filter columns and child rows with it, so a task moved to
@@ -294,9 +297,12 @@ block holds seed events.
 
 `POST /v1/tasks/{id}/dispatch` (`WorkService::dispatch_task`, `src/dispatch.rs`):
 
-1. checks the request (`404` task, before the body is read; `400` agent, machine, or a person as
-   the agent; `409` done or canceled, or the agent already holds an active dispatch on the task,
-   such as a second click; `503` no live machine), then whether a session can start there at all
+1. checks the request (`404` task, before the body is read; `400` agent, machine, a person as the
+   agent, or a brief longer than `MAX_BRIEF`, 64 KiB, given or the task's description it defaults
+   to: it goes on the CLI's command line; `403` an agent the caller does not own, since **a person
+   runs only their own agents**, `require_owner`; `409` done or canceled, or the agent already
+   holds an active dispatch on the task, such as a second click; `503` no live machine; in that
+   order: the `403` needs the agent known), then whether a session can start there at all
    (`503` without a dispatcher, or when `Dispatcher::can_start` says no: the daemon's answers so
    when no runner is attached yet, or for a machine it cannot reach). Nothing is recorded for any
    of these. Then it appends, in one transaction: `task_assigned` to the agent if the task has
@@ -328,8 +334,10 @@ to `WorkService::follow_sessions`:
   once more, as the rules allow);
 - the agent's report: when the dispatch's agent moves its task to review (`pitcrew report <task>
   --review`), `move_task` appends `dispatch_finished` (`succeeded`) for each active dispatch the
-  agent holds on the task, in the same transaction as the move. The back office's
-  `dispatch_to_review` rule moves a task still in progress when a dispatch succeeds;
+  agent holds on the task, in the same transaction as the move. A task a person already moved to
+  review counts as the report: the dispatches succeed, nothing moves, and the move answers the
+  task as it is (not `409`). The back office's `dispatch_to_review` rule moves a task still in
+  progress when a dispatch succeeds;
 - `session_ended` (or a change to `ended`) of a session whose dispatch is still open finishes it:
   `canceled` with "The session ended without a report." (the recaps say "stopped work"), or
   `failed` with "The session ended before its CLI started." when the runner never reported the
@@ -342,9 +350,11 @@ Events about sessions without an open dispatch change nothing, so replays are ha
 an empty CLI id until the runner reports them. `unreported_sessions(machine)` lists them, and the
 runner link reconciles them, at start (a crash between step 1 and step 3) and while a start it
 made is not confirmed: a session whose CLI the runner did start is reported under its id; one it
-never started, or whose terminal ended before its transcript appeared, is abandoned
-(`abandon_session`: its open dispatch finishes as `failed` with the reason, and it ends). A
-session already ended or reported meanwhile is left as it is.
+never started, or whose terminal ended before its transcript appeared, or (Codex, OpenCode) whose
+transcript did not appear within the runner's 15-minute claim window, is abandoned
+(`abandon_session`: its open dispatch finishes as `failed` with the reason, and it ends). A start
+still under way (the runner link has not had the runner's answer) is never abandoned. A session
+already ended or reported meanwhile is left as it is.
 
 ## Commands
 
@@ -374,7 +384,7 @@ whatever it sent.
 | `dispatch_task` | person | see "Dispatch" |
 | `dispatch_working` | the runner link (through `follow_sessions`) | moves the dispatched task to in progress as the agent, when the rules allow; 409 for an ended dispatch, or a racing writer that moved the task first |
 | `follow_sessions` | the runner link | see "Dispatch": a dispatched session's first `working` moves its task, its end finishes its dispatch |
-| `record_start` | person (`POST /v1/sessions` with `agent` or `task`) | 403 agent; 400 unknown machine, agent or task, or a person as the agent. Appends the `starting` session |
+| `record_start` | person (`POST /v1/sessions` with `agent` or `task`) | 403 agent; 400 unknown machine, agent or task, or a person as the agent; 403 an agent the caller does not own. Appends the `starting` session |
 | `abandon_session` | the runner link | 404 unknown session; nothing for one ended or reported. Fails its open dispatch and ends it |
 | `mirror_plan` | not called yet | replaces the agent's `agent_plan` lines of its own task from a `PlanUpdated`; the runner reports no plans to the hub yet |
 | `seed` | the daemon | imports a `DemoWorkspace` into an empty work model |
@@ -628,3 +638,5 @@ right after one new event 1.6 / 0.9 ms. Reading and decoding the log is most of 
   the hub does, but does not finish a dispatch: not when its agent moves the task to review
   (`succeeded`), nor when its session ends (`canceled` or `failed`), as api-v1's "Dispatch" now
   says the hub does (`follow_sessions`, `move_task`).
+- The mock lets a person dispatch any agent; the hub only the caller's own (`403` otherwise), and
+  refuses a brief over 64 KiB (`400`). `apps/mock-hub` is outside this crate's paths.
