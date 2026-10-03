@@ -361,7 +361,7 @@ fn persist(path: &Path, entries: &[Entry]) -> Result<(), TokenError> {
     let mut json = serde_json::to_vec_pretty(&file).map_err(|e| io_err(io::Error::other(e)))?;
     json.push(b'\n');
 
-    let tmp = path.with_extension(format!("json.{}.tmp", ulid::Ulid::new()));
+    let tmp = path.with_extension(format!("json.{}.tmp", ulid::Ulid::generate()));
     let written = create_new_private_file(&tmp).and_then(|mut out| {
         out.write_all(&json)?;
         out.sync_all()?;

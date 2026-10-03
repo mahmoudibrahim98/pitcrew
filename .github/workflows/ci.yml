@@ -97,6 +97,8 @@ jobs:
       - run: pnpm --filter @pitcrew/ui lint
       - run: pnpm --filter @pitcrew/ui test
       - run: pnpm --filter @pitcrew/ui build
+      - name: Desktop CSP and built UI
+        run: node scripts/ci/csp-check.mjs
       - name: End-to-end (Chromium)
         run: |
           pnpm --filter @pitcrew/ui exec playwright install --with-deps chromium

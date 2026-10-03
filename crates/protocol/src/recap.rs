@@ -37,6 +37,7 @@ pub const MAX_TZ_MINUTES: i32 = 14 * 60;
 
 /// A kind of check a command runs. The order is the strength used for command chains.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Check {
     /// A test suite, e.g. `cargo test` or `pytest`.
@@ -50,6 +51,7 @@ pub enum Check {
 /// What a block groups: one session's events, or, for events outside any active session, one
 /// workstream's (or, for tasks without a workstream, one project's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum BlockKey {
     /// A session's work.
@@ -62,6 +64,7 @@ pub enum BlockKey {
 
 /// A burst of work: events of one key with no pause longer than the gap.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Block {
     /// The first event's id. It is stable: rebuilding from the same events gives the same id.
     pub id: EventId,
@@ -75,12 +78,15 @@ pub struct Block {
     pub end: TimestampMs,
     /// The session, for a session's block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub session: Option<SessionId>,
     /// The workstream the work belongs to, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub workstream: Option<WorkstreamId>,
     /// The project the work belongs to, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub project: Option<ProjectId>,
     /// Tasks the work touched, in order of first mention (capped).
     #[serde(default)]
@@ -88,6 +94,7 @@ pub struct Block {
     /// The agent doing the work: the session's agent, or the author of the first tool run, edit
     /// or turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub agent: Option<MemberId>,
     /// Distinct authors of the block's events, in order of first appearance (capped).
     #[serde(default)]
@@ -128,6 +135,7 @@ impl Block {
 
 /// Counts over all of a block's events. They are never capped.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Counts {
     /// Events in the block.
     pub events: u32,
@@ -155,6 +163,7 @@ pub struct Counts {
 
 /// One file edited in a block.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct FileTouch {
     /// Path as the agent reported it, cleaned and capped (the end is kept).
     pub path: String,
@@ -170,6 +179,7 @@ pub struct FileTouch {
 
 /// A notable fact, with the evidence for it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Fact {
     /// Who did it: the author of the event (for merged facts, of the first one).
     pub by: MemberId,
@@ -184,27 +194,32 @@ pub struct Fact {
 /// What a fact says. Repeated facts about the same thing in one block are merged: two moves of
 /// one task become one move from the first status to the last.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FactKind {
     /// A session was seen for the first time.
     SessionStarted {
         /// Its title, cleaned.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         title: Option<String>,
     },
     /// A session was linked to a workstream or task.
     SessionLinked {
         /// The workstream.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         workstream: Option<WorkstreamId>,
         /// The task.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         task: Option<TaskId>,
     },
     /// The session stopped to wait for a person.
     SessionWaiting {
         /// The last status line, cleaned.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         status_line: Option<String>,
     },
     /// The session ended.
@@ -220,11 +235,13 @@ pub enum FactKind {
     DispatchFinished {
         /// The task, if the dispatch is known.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         task: Option<TaskId>,
         /// How it ended.
         outcome: DispatchOutcome,
         /// The agent's closing summary, cleaned.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         summary: Option<String>,
     },
     /// A task was created.
@@ -247,6 +264,7 @@ pub enum FactKind {
         task: TaskId,
         /// The latest assignee.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         assignee: Option<MemberId>,
     },
     /// A task's plan (its subtasks) was updated.
@@ -295,9 +313,11 @@ pub enum FactKind {
     Commented {
         /// On this task.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         task: Option<TaskId>,
         /// Or on this workstream.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         workstream: Option<WorkstreamId>,
         /// Members mentioned (capped).
         #[serde(default)]
@@ -335,6 +355,7 @@ pub enum FactKind {
 
 /// Text whose every clause is a span with receipts.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Summary {
     /// The prose.
     pub text: String,
@@ -345,6 +366,7 @@ pub struct Summary {
 
 /// One clause of a summary and the evidence for it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Span {
     /// Byte range in the summary text, on character boundaries. On the wire,
     /// `{"start": …, "end": …}` in UTF-8 bytes.
@@ -368,9 +390,11 @@ impl Summary {
 
 /// The paragraph for one workstream's day, with the blocks it covers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct DayRecap {
     /// The workstream; `None` for blocks not linked to one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub workstream: Option<WorkstreamId>,
     /// The day.
     pub date: Date,
@@ -384,6 +408,7 @@ pub struct DayRecap {
 
 /// A block with its one-line summary.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct RecapBlock {
     /// The block.
     pub block: Block,
@@ -395,6 +420,7 @@ pub struct RecapBlock {
 ///
 /// Page backwards by passing the last block's `id` as `before`. Only `at_start` ends paging.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct BlocksPage {
     /// The blocks, newest first (by block id).
     pub blocks: Vec<RecapBlock>,
@@ -406,6 +432,7 @@ pub struct BlocksPage {
 ///
 /// Page backwards by passing the last entry's `date` as `before`. Only `at_start` ends paging.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct DaysPage {
     /// The paragraphs: newest date first; within a date, the one without a workstream first,
     /// then by workstream id.

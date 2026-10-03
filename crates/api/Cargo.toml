@@ -29,13 +29,9 @@ default = ["store"]
 store = ["dep:pitcrew-store"]
 
 [target.'cfg(windows)'.dependencies]
-# The named pipe's security descriptor. The version tokio already uses.
-windows-sys = { version = "=0.61.2", features = [
-  "Win32_Foundation",
-  "Win32_Security",
-  "Win32_Security_Authorization",
-  "Win32_System_Threading",
-] }
+# The named pipe's security descriptor, and its owner for the client's check: the one copy of
+# that Win32 code, shared with the askpass and pitcrew-ptyd pipes.
+pitcrew-trust.workspace = true
 
 [dev-dependencies]
 pitcrew-fixtures.workspace = true

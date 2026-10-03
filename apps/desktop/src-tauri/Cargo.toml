@@ -47,6 +47,9 @@ pitcrew-protocol = { path = "../../../crates/protocol" }
 # Only `pitcrew_api::client`: the checks a client makes before trusting a local daemon with a
 # token (the socket and its directory are ours; the pipe's owner is us). No store, no server.
 pitcrew-api = { path = "../../../crates/api", default-features = false }
+# `check_trusted`: the check every program PitCrew launches passes (here `pitcrewd` and the
+# remote helpers; the daemon checks `pitcrew-ptyd` with it too). No async, nothing new.
+pitcrew-trust = { path = "../../../crates/trust" }
 # 2.12.x exactly: the Tauri CLI refuses a major.minor that differs from the UI's @tauri-apps/api
 # (docs/build/contracts/desktop-gateway.md, "Versions"). Default features minus `dbus` and
 # `dynamic-acl`: no capability can be added at run time. `tray-icon`: the tray (on Linux through
@@ -77,7 +80,7 @@ keyring = "4.2"
 # tunnel's `Connector` (stream J), over the person's own OpenSSH.
 pitcrew-remote = { path = "../../../crates/remote" }
 # Random plan and prompt ids. The version pitcrew-remote already uses.
-getrandom = "0.3"
+getrandom = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 # SIGTERM to the daemon, O_NOFOLLOW for the token file, and the host name (`uname`), without
@@ -125,6 +128,9 @@ todo = "warn"
 unwrap_used = "warn"
 
 [profile.release]
+opt-level = "z"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+# The tray callbacks isolate failures with catch_unwind; preserve their recovery.
+panic = "unwind"

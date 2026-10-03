@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 /// What a runner can do on its machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Capability {
@@ -36,6 +37,7 @@ pub enum Capability {
 
 /// Messages from a runner to its hub.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RunnerToHub {
     /// First message after connecting.
@@ -81,6 +83,7 @@ pub enum RunnerToHub {
 
 /// Messages from a hub to a runner.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HubToRunner {
     /// Reply to `Hello`.
@@ -108,6 +111,7 @@ pub enum HubToRunner {
 
 /// A key to send to a terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Key {
     /// Enter.
@@ -132,6 +136,7 @@ pub enum Key {
 
 /// How to end a session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum EndMode {
     /// Ask the CLI to exit, then wait for the process to go.
@@ -142,6 +147,7 @@ pub enum EndMode {
 
 /// Commands a hub sends to a runner.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum RunnerCommand {
@@ -155,16 +161,20 @@ pub enum RunnerCommand {
         name: String,
         /// First prompt.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         brief: Option<String>,
         /// Persona it is made from.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         persona: Option<PersonaId>,
         /// Model override.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         model: Option<String>,
         /// Which CLI account home to use (e.g. a `CLAUDE_CONFIG_DIR`). The runner resolves it;
         /// secrets never travel in commands.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         account: Option<String>,
         /// Permission mode.
         #[serde(default)]
@@ -235,12 +245,14 @@ pub enum RunnerCommand {
 
 /// The outcome of a command.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum CommandOutcome {
     /// Done. Optional structured detail, such as a new session's id.
     Ok {
         /// Detail.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         detail: Option<serde_json::Value>,
     },
     /// Refused by policy, for example a permission mode that isn't allowed.

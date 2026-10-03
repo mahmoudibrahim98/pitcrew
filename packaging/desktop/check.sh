@@ -209,6 +209,33 @@ check_deb() { # FILE
   if can_run_linux; then run_sidecars deb "$root/usr/bin"; fi
 }
 
+check_rpm() { # FILE
+  local rpm_file=$1 root="$tmp/rpm" listing="$tmp/rpm-listing" tool
+  for tool in rpm rpm2cpio cpio; do
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      fail "rpm: $tool is required to check $rpm_file"
+      return
+    fi
+  done
+  # Query the package metadata, never the host's installed RPM database.
+  if ! rpm -qp --qf '[%{FILEMODES:perms} %{FILEUSERNAME}/%{FILEGROUPNAME} %{FILESIZES} %{FILENAMES}\n]' \
+    "$rpm_file" >"$listing"; then
+    fail "rpm: cannot read owners and modes from $rpm_file"
+    return
+  fi
+  rm -rf "$root"
+  mkdir -p "$root"
+  if ! rpm2cpio "$rpm_file" | (cd "$root" && cpio -idm --no-absolute-filenames --quiet); then
+    fail "rpm: cannot unpack $rpm_file"
+    return
+  fi
+  check_listing rpm <"$listing"
+  check_tree rpm "$root/usr/bin" "$root/usr/lib/$product/helpers"
+  check_desktop_entry rpm "$root/usr/share/applications/$product.desktop"
+  echo "  Requires: $(rpm -qp --requires "$rpm_file")"
+  if can_run_linux; then run_sidecars rpm "$root/usr/bin"; fi
+}
+
 check_appimage() { # FILE
   local image root offset
   image=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
@@ -297,6 +324,7 @@ for installer in "${installers[@]}"; do
   check_size "$installer"
   case "$installer" in
     *.deb) check_deb "$installer" ;;
+    *.rpm) check_rpm "$installer" ;;
     *.AppImage) check_appimage "$installer" ;;
     *.dmg) check_dmg "$installer" ;;
     *-setup.exe) check_nsis "$installer" ;;

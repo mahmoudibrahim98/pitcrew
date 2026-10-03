@@ -1,17 +1,20 @@
-# Brief 0 · Fix the three flaky tests
+# Brief 0 · Fix the four flaky tests
 
-- **Stream:** 0 · Contracts (test fixes in three streams). **Branch:** `integrator/flaky-tests`.
+- **Stream:** 0 · Contracts (test fixes in four streams). **Branch:** `integrator/flaky-tests`.
   **Paths:**
   - `apps/desktop/src-tauri/tests/supervisor.rs`;
   - `benches/src/client.rs`;
-  - `apps/ui/e2e/**`, plus the UI's CSS only if item 3 needs it.
+  - `apps/ui/e2e/**`, plus the UI's CSS only if item 3 needs it;
+  - `crates/ptyd/tests/**` and the PTY client's connect path in `crates/runtime/src/pty/**`, for
+    item 4.
 - **First read:** [README.md](README.md), the root `AGENTS.md` (or `CLAUDE.md`), and the READMEs of
   `apps/desktop/src-tauri` (the daemon supervisor), `benches` and `apps/ui` (end-to-end tests).
 - **Suggested agent:** Codex, or any coding agent.
 
 ## Goal
 
-Three tests fail now and then on CI for reasons in the tests, not the product. They turn unrelated
+Four tests fail now and then on CI, three for reasons in the tests and one (item 4) because of a
+platform difference. They turn unrelated
 pull requests red. Make each one deterministic **without weakening what it checks**: no retries, no
 wider tolerances without a reason, no skipped assertions.
 
@@ -43,6 +46,21 @@ wider tolerances without a reason, no skipped assertions.
      disables transitions under it (it should; check).
    - **If the contrast is really too low in the final dark state,** fix the colour token instead,
      and say so.
+4. **`a_ptyd_that_closes_during_hello_counts_as_none`** (`crates/ptyd/tests/protocol.rs` ~312;
+   failed on macOS, on PR #13).
+   - **What happened:** the stand-in ptyd hangs up during the hello, and the client answered
+     `Unavailable("cannot check pitcrew-ptyd's user: Socket is not connected (os error 57)")`
+     instead of "no ptyd".
+   - **The cause:** on macOS, the peer-credential check (`getpeereid`) fails with `ENOTCONN` once the
+     peer has already closed, before the client sees the closed stream.
+   - **This one is a product question, not just the test:** a peer that hung up before it could be
+     identified should count as "no ptyd", like a hang-up during the hello. Map exactly that case
+     (`ENOTCONN` or the platform's equivalent, after the peer has closed) to the same answer, in the
+     client.
+   - **Keep refusing** a peer whose identity can be read and is wrong, and any other error: those
+     stay refusals with a reason (the threat model's ptyd rows).
+   - **Test:** the closed-peer case on both Linux and macOS, plus a case showing a wrong-uid peer
+     is still refused.
 
 ## Acceptance
 

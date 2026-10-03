@@ -195,11 +195,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev \
             libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev \
-            squashfs-tools desktop-file-utils xvfb xauth
+            squashfs-tools desktop-file-utils rpm rpm2cpio cpio xvfb xauth
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
+          # Release inputs must not come from a package cache populated by another workflow.
+          package-manager-cache: false
 
       # The UI the app serves (apps/ui/dist). pnpm comes from the root package.json, by corepack.
       - name: The UI
@@ -252,6 +254,10 @@ jobs:
       - name: Check the installers
         shell: bash
         run: bash packaging/desktop/check.sh --manifest dist/desktop-stage/helpers/manifest.json dist/desktop/*
+
+      - name: Largest installer payload files
+        shell: bash
+        run: bash packaging/desktop/contents.sh dist/desktop/* | tee -a "$GITHUB_STEP_SUMMARY"
 
       # The app started once, as installed, in a throwaway home: its own pitcrewd and askpass.
       - name: Start the installed app (Linux)

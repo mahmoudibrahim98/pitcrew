@@ -9,6 +9,7 @@ import { expect, test, type Page } from '@playwright/test';
 
 // A dozen-plus axe scans on top of the wizard's own (short, real) delays.
 test.setTimeout(90_000);
+test.use({ reducedMotion: 'reduce' });
 
 async function currentWorkspace(page: Page): Promise<string> {
   await expect(page).toHaveURL(/\/w\/[^/]+\//);
@@ -18,6 +19,7 @@ async function currentWorkspace(page: Page): Promise<string> {
 }
 
 async function expectNoAxeViolations(page: Page, label: string) {
+  await page.waitForFunction(() => document.getAnimations().every((animation) => animation.playState === 'finished'));
   const result = await new AxeBuilder({ page }).analyze();
   expect(result.violations.map((v) => `${v.id}: ${v.nodes.map((n) => n.target.join(' ')).join(', ')}`), label).toEqual(
     [],
@@ -41,6 +43,7 @@ async function walkFirstRun(page: Page, theme: 'Light' | 'Dark') {
   const welcomePanel = page.getByRole('tabpanel', { name: 'Welcome' });
   await welcomePanel.getByRole('radio', { name: theme }).click();
   await expect(page.locator('html')).toHaveAttribute('data-theme', theme.toLowerCase());
+  await expect(page.locator('html')).toHaveCSS('color-scheme', theme.toLowerCase());
   await expectNoAxeViolations(page, `welcome (${theme})`);
   await page.getByRole('button', { name: 'Get started' }).click();
 

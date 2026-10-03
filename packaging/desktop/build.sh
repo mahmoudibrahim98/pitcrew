@@ -12,7 +12,7 @@
 #   packaging/desktop/build.sh [--dist DIR] [--stage DIR] [--out DIR] [--bundles LIST]
 #                              [--stage-only] TARGET
 #
-#   TARGET        x86_64-unknown-linux-gnu (deb, AppImage), universal-apple-darwin (app, DMG) or
+#   TARGET        x86_64-unknown-linux-gnu (deb, rpm, AppImage), universal-apple-darwin (app, DMG) or
 #                 x86_64-pc-windows-msvc (NSIS). Run it on that OS.
 #   --dist        build-release.sh's output, from the same commit (default: dist). It holds
 #                 pitcrewd, pitcrew-ptyd and pitcrew-askpass for TARGET's OS (on Linux the static
@@ -22,7 +22,7 @@
 #                 the repository: Tauri's configuration names them relative to
 #                 apps/desktop/src-tauri.
 #   --out         Where the installers are copied (default: dist/desktop).
-#   --bundles     Tauri's bundle formats, comma-separated (default: deb,appimage | app,dmg | nsis).
+#   --bundles     Tauri's bundle formats (default: deb,rpm,appimage | app,dmg | nsis).
 #   --stage-only  Stage the inputs and write the configuration, then stop (no Tauri, no UI).
 #
 # Relative paths are taken from the repository's root, as in build-release.sh. Needs the UI built
@@ -62,7 +62,7 @@ fi
 
 # The sidecars' own target in DIST, their suffix, and the OS's installers.
 case "$target" in
-  x86_64-unknown-linux-gnu) from=x86_64-unknown-linux-musl exe="" default_bundles=deb,appimage ;;
+  x86_64-unknown-linux-gnu) from=x86_64-unknown-linux-musl exe="" default_bundles=deb,rpm,appimage ;;
   universal-apple-darwin) from=universal-apple-darwin exe="" default_bundles=app,dmg ;;
   x86_64-pc-windows-msvc) from=x86_64-pc-windows-msvc exe=.exe default_bundles=nsis ;;
   *) echo "unsupported desktop target: $target" >&2; exit 2 ;;
@@ -171,7 +171,8 @@ cat >"$stage/tauri.bundle.json" <<EOF
     ],
     "resources": { "$rel/helpers": "helpers" },
     "linux": {
-      "deb": { "desktopTemplate": "../../../packaging/desktop/pitcrew.desktop.hbs" }
+      "deb": { "desktopTemplate": "../../../packaging/desktop/pitcrew.desktop.hbs" },
+      "rpm": { "desktopTemplate": "../../../packaging/desktop/pitcrew.desktop.hbs" }
     },
     "windows": {
       "nsis": { "installerHooks": "../../../packaging/desktop/installer-hooks.nsh" }
@@ -245,7 +246,7 @@ fix_appimage_modes() { # FILE
 
 mkdir -p "$out"
 found=0
-for f in "$bundle_dir"/deb/*.deb "$bundle_dir"/appimage/*.AppImage "$bundle_dir"/dmg/*.dmg \
+for f in "$bundle_dir"/deb/*.deb "$bundle_dir"/rpm/*.rpm "$bundle_dir"/appimage/*.AppImage "$bundle_dir"/dmg/*.dmg \
   "$bundle_dir"/nsis/*-setup.exe; do
   [ -f "$f" ] || continue
   cp "$f" "$out/"

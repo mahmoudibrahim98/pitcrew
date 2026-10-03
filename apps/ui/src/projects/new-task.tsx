@@ -16,6 +16,7 @@ export function NewTaskDialog({ close }: { close(): void }) {
   const [workstream, setWorkstream] = useState('');
   const [title, setTitle] = useState('');
   const [assignee, setAssignee] = useState('');
+  const [due, setDue] = useState('');
   const workstreams = useWorkstreams(project === '' ? undefined : project);
   const projectId = project !== '' ? project : (projects.data?.[0]?.id ?? '');
 
@@ -30,6 +31,7 @@ export function NewTaskDialog({ close }: { close(): void }) {
         title: text,
         ...(workstream === '' ? {} : { workstream }),
         ...(assignee === '' ? {} : { assignee }),
+        ...(due === '' ? {} : { due }),
       },
       {
         onSuccess: (task) => {
@@ -99,6 +101,9 @@ export function NewTaskDialog({ close }: { close(): void }) {
             ))}
           </select>
         )}
+      </Field>
+      <Field label="Due date (optional)">
+        {(id) => <input id={id} type="date" value={due} onChange={(event) => setDue(event.target.value)} className={inputClass} />}
       </Field>
       {create.error !== null && <ErrorNote error={create.error} what="create the task" />}
       <DialogFooter>

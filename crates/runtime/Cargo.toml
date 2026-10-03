@@ -20,6 +20,10 @@ serde_json.workspace = true
 # The connection to pitcrew-ptyd, on a thread of its own: a socket, or on Windows a named pipe
 # with overlapped I/O, so a read and a write can be in progress at once.
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+# The trust check pitcrew-ptyd passes before it is detected and before each launch, as the
+# desktop checks pitcrewd; on Windows, the SIDs, owners, DACLs, labels and descriptors of ptyd's
+# pipe (re-exported in `pty::windows`).
+pitcrew-trust.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # The user's uid for the private socket directory, and signals, without unsafe code. The
@@ -27,13 +31,14 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "sync"
 rustix = { version = "=1.1.5", features = ["process"] }
 
 [target.'cfg(windows)'.dependencies]
-# The pipe's owner and DACL, its client's user, and Job Objects (`pty::windows`). The version
-# tokio already uses.
+# The pipe client's user and token, Job Objects, and the endpoint's lock file (`pty::windows`).
+# The version tokio already uses.
 windows-sys = { version = "=0.61.2", features = [
   "Win32_Foundation",
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_Storage_FileSystem",
+  "Win32_System_IO",
   "Win32_System_JobObjects",
   "Win32_System_Pipes",
   "Win32_System_Threading",
@@ -41,6 +46,7 @@ windows-sys = { version = "=0.61.2", features = [
 
 [dev-dependencies]
 proptest.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

@@ -6,19 +6,26 @@
 //!   socket names it, is refused and left as it is). Otherwise the terminals are owned by
 //!   `pitcrew-ptyd` (`PtyRuntime`; ConPTY on Windows), found next to this `pitcrewd`, never on
 //!   `PATH`. Either way they outlive the daemon. Host info reports `tmux` or `pty`.
+//! - **ptyd is not a planted binary.** It starts every agent, so it must pass the check the
+//!   desktop makes of `pitcrewd` (`pitcrew_trust::check_trusted`: on Unix owner and mode of the
+//!   program, the file it resolves to and both folders; on Windows no `Zone.Identifier`). One that
+//!   fails is warned about and not used, as if it were missing; the PTY runtime checks it again
+//!   just before each launch, which may come hours later.
 //! - **Otherwise none** ([`NoRuntime`]): no session has a terminal here, and the log says why for
 //!   both (tmux: not installed, too old, the socket's directory refused, another daemon holds the
 //!   socket, a server that is not PitCrew's alone, not Unix; pitcrew-ptyd: not installed next to
-//!   `pitcrewd`, its endpoint refused, another daemon holds it).
+//!   `pitcrewd`, failing the trust check, its endpoint refused, another daemon holds it).
 //! - **One place per state directory** ([`default_socket`], [`default_endpoint`]): on Unix the tmux
 //!   socket and ptyd's endpoint are `tmux` and `ptyd` in one directory,
 //!   `<the runtime's private per-user directory>/<8 hex digits of the state directory's sha256>/`;
 //!   on Windows ptyd's pipe is the user's own with `-<8 hex digits>` added. So two daemons of one
 //!   user (a real one and a demo, say) never share a tmux server or a ptyd: not their terminals,
 //!   not their offsets, not the environment their programs inherit.
-//! - **One runtime per place** (Unix): an exclusive lock in that directory (`lock`) is held for the
-//!   runtime's life, the same lock whichever runtime runs; a second daemon given the same socket or
-//!   endpoint runs without terminals, warned.
+//! - **One runtime per place**: an exclusive lock is held for the runtime's life, and a second
+//!   daemon given the same socket or endpoint runs without terminals, warned. On Unix it is `lock`
+//!   in that directory, the same lock whichever runtime runs. On Windows it is ptyd's endpoint's
+//!   own lock file, `%LOCALAPPDATA%\PitCrew\ptyd-<16 hex digits of the endpoint's sha256>.lock`
+//!   (`LockFileEx`), so two daemons cannot share one ptyd through `--ptyd-endpoint`.
 //! - **Overrides, for tests and development** ([`Overrides`]), each warned when used: the hidden
 //!   `serve --tmux-socket`, `--ptyd`, `--ptyd-endpoint`, `--ptyd-idle-exit-ms` and
 //!   `--terminal-runtime pty`. **Tests always pass `--tmux-socket` and `--ptyd`.**
@@ -85,16 +92,18 @@ impl TerminalRuntime {
     /// on the state directory `state`'s own socket or endpoint unless `overrides` says otherwise;
     /// otherwise none, logging why. Detection and the runtime's setup run off the async executor.
     pub async fn choose(state: &Path, overrides: &Overrides) -> Self {
-        match Plan::new(state, overrides).choose().await {
-            Ok(runtime) => runtime,
-            Err(why) => {
-                tracing::warn!(
-                    "the runner's terminals cannot use tmux or pitcrew-ptyd, so no session has a \
-                     terminal here: {why}"
-                );
-                Self::none()
-            }
-        }
+        Self::chosen(Plan::new(state, overrides).choose().await)
+    }
+
+    /// The runtime a plan chose, or none, logging why.
+    fn chosen(plan: Result<Self, String>) -> Self {
+        plan.unwrap_or_else(|why| {
+            tracing::warn!(
+                "the runner's terminals cannot use tmux or pitcrew-ptyd, so no session has a \
+                 terminal here: {why}"
+            );
+            Self::none()
+        })
     }
 
     /// `runtime`, holding `lock`, its terminals running in `capability` (the chosen runtime's,
@@ -261,6 +270,10 @@ struct Plan {
     /// ptyd's endpoint is the state directory's own, so its per-user directory may be made.
     own_endpoint: bool,
     force_pty: bool,
+    /// Where ptyd's endpoints' lock files are (Windows): `%LOCALAPPDATA%\PitCrew`, if it is
+    /// known.
+    #[cfg(windows)]
+    ptyd_locks: Option<PathBuf>,
 }
 
 impl Plan {
@@ -321,6 +334,8 @@ impl Plan {
             pty,
             own_endpoint: overrides.ptyd_endpoint.is_none(),
             force_pty: overrides.force_pty,
+            #[cfg(windows)]
+            ptyd_locks: windows::lock_dir(),
         }
     }
 
@@ -333,8 +348,9 @@ impl Plan {
         } else {
             self.prepare_tmux().await
         };
-        // ptyd's endpoint's directory, made private as the socket's is, if ptyd is installed (a
-        // missing one makes nothing).
+        // ptyd's endpoint's directory, made private as the socket's is, if ptyd is installed
+        // and passes the trust check. A missing one makes nothing (detection says why); one that
+        // fails the check is warned about, makes nothing, and is not used.
         let endpoint = {
             let (ptyd, endpoint, own) = (
                 self.pty.ptyd.clone(),
@@ -342,11 +358,14 @@ impl Plan {
                 self.own_endpoint,
             );
             blocking(move || {
-                if installed(&ptyd) {
-                    prepare_endpoint(&endpoint, own)
-                } else {
-                    Ok(())
+                if !installed(&ptyd) {
+                    return Ok(());
                 }
+                if let Err(why) = pitcrew_runtime::pty::launch::check_trusted(&ptyd) {
+                    tracing::warn!("{why}; the runner's terminals do not use it");
+                    return Err(why);
+                }
+                prepare_endpoint(&endpoint, own)
             })
             .await
         };
@@ -399,7 +418,7 @@ impl Plan {
 
     #[cfg(not(unix))]
     async fn prepare_tmux(&self) -> Result<Lock, String> {
-        Ok(Lock)
+        Ok(Lock::default())
     }
 
     /// tmux, detected usable, on a server with no sessions but PitCrew's; or why not.
@@ -463,7 +482,12 @@ impl Plan {
         let built = {
             let (endpoint, why) = (endpoint.clone(), no_tmux.clone());
             let (tmux_options, pty_options) = (self.tmux.clone(), self.pty.clone());
+            #[cfg(windows)]
+            let locks = self.ptyd_locks.clone();
             blocking(move || {
+                #[cfg(windows)]
+                let lock = windows::lock_endpoint(&endpoint, locks.as_deref())?;
+                #[cfg(not(windows))]
                 let lock = lock_endpoint(&endpoint)?;
                 let chosen = Chosen::Pty {
                     support,
@@ -519,8 +543,8 @@ fn prepare_endpoint(endpoint: &Path, own: bool) -> Result<(), String> {
 }
 
 /// The lock of ptyd's endpoint: on Unix the one in its directory, the tmux socket's when they
-/// share it. On Windows none: the pipe is the state directory's own, whose lock (`tokens.lock`)
-/// the daemon already holds.
+/// share it; on Windows its own lock file (`windows::lock_endpoint`).
+#[cfg(not(windows))]
 fn lock_endpoint(endpoint: &Path) -> Result<Lock, String> {
     #[cfg(unix)]
     {
@@ -540,10 +564,68 @@ fn lock_endpoint(endpoint: &Path) -> Result<Lock, String> {
 #[cfg(unix)]
 type Lock = unix::SocketLock;
 
-/// Nothing to hold (see [`lock_endpoint`]).
-#[cfg(not(unix))]
-#[derive(Debug)]
+/// The lock a runtime holds for ptyd's endpoint; none for tmux, which does not run here.
+#[cfg(windows)]
+#[derive(Debug, Default)]
+struct Lock {
+    _held: Option<pitcrew_runtime::pty::windows::FileLock>,
+}
+
+/// Nothing to hold.
+#[cfg(not(any(unix, windows)))]
+#[derive(Debug, Default)]
 struct Lock;
+
+#[cfg(windows)]
+mod windows {
+    use super::Lock;
+    use pitcrew_runtime::pty::windows::FileLock;
+    use std::path::{Path, PathBuf};
+
+    /// Where ptyd's endpoints' lock files are: `PitCrew` in the user's local data folder
+    /// (`%LOCALAPPDATA%`, else Windows' own answer), the folder of the default state directory
+    /// (`…\PitCrew\data`). One user's daemons share it, whatever their state directories.
+    pub(super) fn lock_dir() -> Option<PathBuf> {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute())
+            .or_else(|| {
+                directories::BaseDirs::new().map(|dirs| dirs.data_local_dir().to_path_buf())
+            })
+            .map(|dir| dir.join("PitCrew"))
+    }
+
+    /// `ptyd-<16 hex digits>.lock` in `dir`: the digits are the start of the sha256 of the
+    /// endpoint's name in lower case, as Windows does not tell pipe names apart by case.
+    pub(super) fn lock_file(dir: &Path, endpoint: &Path) -> PathBuf {
+        use sha2::{Digest as _, Sha256};
+        let name = endpoint.to_string_lossy().to_ascii_lowercase();
+        let hash = Sha256::digest(name.as_bytes());
+        let digits: String = hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+        dir.join(format!("ptyd-{digits}.lock"))
+    }
+
+    /// ptyd's endpoint's own lock (`LockFileEx` on its lock file in `dir`), held while the
+    /// runtime lives: a second daemon given the same endpoint is refused.
+    pub(super) fn lock_endpoint(endpoint: &Path, dir: Option<&Path>) -> Result<Lock, String> {
+        let dir = dir.ok_or_else(|| {
+            "cannot find this user's local data folder (%LOCALAPPDATA%) for pitcrew-ptyd's \
+             endpoint lock"
+                .to_owned()
+        })?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        let path = lock_file(dir, endpoint);
+        match FileLock::try_exclusive(&path) {
+            Ok(Some(lock)) => Ok(Lock { _held: Some(lock) }),
+            Ok(None) => Err(format!(
+                "another pitcrewd uses this pitcrew-ptyd endpoint (it holds {})",
+                path.display()
+            )),
+            Err(e) => Err(format!("cannot lock {}: {e}", path.display())),
+        }
+    }
+}
 
 #[cfg(unix)]
 mod unix {
@@ -641,6 +723,8 @@ mod unix {
     impl Drop for SocketLock {
         /// Unlocks before the descriptor is closed: a process another thread is starting holds
         /// a copy of it until it runs its program, and an flock lasts while any copy is open.
+        /// `LOCK_UN` releases the lock of the open file every copy shares, so a child forked to
+        /// keep the lock would lose it here; none is meant to.
         fn drop(&mut self) {
             let _ = rustix::fs::flock(&self._fd, rustix::fs::FlockOperation::Unlock);
         }
@@ -973,39 +1057,92 @@ mod tests {
         assert!(!tmp.path().join("p").exists(), "nothing was made");
     }
 
-    /// A program file where pitcrew-ptyd is looked for, a private endpoint: forced, the PTY
-    /// runtime is chosen (nothing is started: ptyd starts with the first terminal). On Unix its
-    /// endpoint's directory is made private and locked, so a second daemon given the same endpoint
-    /// gets no runtime until the first lets go of it.
-    #[test]
-    fn a_forced_pty_runtime_is_chosen_and_its_endpoint_locked() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bin = tmp.path().join("bin");
-        std::fs::create_dir(&bin).unwrap();
-        let ptyd = bin.join(pitcrew_runtime::pty::launch::PTYD);
-        std::fs::write(&ptyd, "#!/bin/sh\nexit 1\n").unwrap();
+    /// A stand-in pitcrew-ptyd in `dir` (both 0755 on Unix), which leaves `ran` next to `dir`
+    /// if it is ever run.
+    fn fake_ptyd(dir: &Path) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let ptyd = dir.join(pitcrew_runtime::pty::launch::PTYD);
+        let ran = dir.with_file_name("ran");
+        std::fs::write(
+            &ptyd,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", ran.display()),
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&ptyd, std::fs::Permissions::from_mode(0o755)).unwrap();
+            for path in [dir, &ptyd] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
         }
+        ptyd
+    }
+
+    /// Overrides for the state directory `tmp` that force the PTY runtime with `ptyd`, on an
+    /// endpoint of the test's own, `name`: a socket in `tmp/p`, or a pipe.
+    fn forced(tmp: &Path, ptyd: &Path, name: &str) -> Overrides {
         let endpoint = if cfg!(windows) {
             PathBuf::from(format!(
-                r"\\.\pipe\pitcrew-ptyd-unit-{}-{}",
+                r"\\.\pipe\pitcrew-ptyd-unit-{name}-{}-{}",
                 std::process::id(),
-                state_hash(tmp.path())
+                state_hash(tmp)
             ))
         } else {
-            tmp.path().join("p").join("ptyd")
+            tmp.join("p").join("ptyd")
         };
-        let overrides = Overrides {
-            tmux_socket: Some(tmp.path().join("missing").join("dir").join("tmux")),
-            ptyd: Some(ptyd),
-            ptyd_endpoint: Some(endpoint.clone()),
+        Overrides {
+            tmux_socket: Some(tmp.join("missing").join("dir").join("tmux")),
+            ptyd: Some(ptyd.to_path_buf()),
+            ptyd_endpoint: Some(endpoint),
             ptyd_idle_exit: Some(Duration::from_millis(500)),
             force_pty: true,
+        }
+    }
+
+    /// [`TerminalRuntime::choose`] for the state directory `tmp`, with ptyd's endpoint lock files
+    /// (Windows) in `tmp/locks`, never in the user's own folder.
+    fn choose_in(tmp: &Path, overrides: &Overrides) -> TerminalRuntime {
+        let plan = Plan::new(tmp, overrides);
+        #[cfg(windows)]
+        let plan = Plan {
+            ptyd_locks: Some(tmp.join("locks")),
+            ..plan
         };
-        let first = block_on(TerminalRuntime::choose(tmp.path(), &overrides));
+        TerminalRuntime::chosen(block_on(plan.choose()))
+    }
+
+    /// What makes a ptyd fail the trust check here, and what the reason then says: on Unix
+    /// another user could write it (group-writable), on Windows it was downloaded from the web.
+    #[cfg(unix)]
+    const UNTRUSTED: &str = "can be written by other users (mode 775)";
+    #[cfg(windows)]
+    const UNTRUSTED: &str = "Zone.Identifier";
+
+    fn untrust(ptyd: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(ptyd, std::fs::Permissions::from_mode(0o775)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let mut stream = ptyd.as_os_str().to_owned();
+            stream.push(":Zone.Identifier");
+            std::fs::write(PathBuf::from(stream), "[ZoneTransfer]\r\nZoneId=3\r\n").unwrap();
+        }
+    }
+
+    /// A program file where pitcrew-ptyd is looked for, a private endpoint: forced, the PTY
+    /// runtime is chosen (nothing is started: ptyd starts with the first terminal). Its endpoint
+    /// is locked (on Unix in its directory, made private; on Windows by its own lock file), so a
+    /// second daemon given the same endpoint gets no runtime until the first lets go of it.
+    #[test]
+    fn a_forced_pty_runtime_is_chosen_and_its_endpoint_locked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ptyd = fake_ptyd(&tmp.path().join("bin"));
+        let overrides = forced(tmp.path(), &ptyd, "forced");
+        let endpoint = overrides.ptyd_endpoint.clone().unwrap();
+        let first = choose_in(tmp.path(), &overrides);
         assert_eq!(first.capability(), Some(Capability::Pty));
         assert_eq!(first.runtime().kind(), RuntimeKind::Pty);
         // No ptyd runs on that endpoint: there are no terminals.
@@ -1018,15 +1155,81 @@ mod tests {
             let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700);
             assert!(dir.join("lock").exists());
-            let second = block_on(TerminalRuntime::choose(tmp.path(), &overrides));
-            assert_eq!(second.capability(), None, "the endpoint is locked");
-            block_on(first.detach(Duration::from_secs(5)));
-            let third = block_on(TerminalRuntime::choose(tmp.path(), &overrides));
-            assert_eq!(third.capability(), Some(Capability::Pty));
-            block_on(third.detach(Duration::from_secs(5)));
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let locks = tmp.path().join("locks");
+            assert!(windows::lock_file(&locks, &endpoint).is_file());
+            // Pipe names do not differ by case: the same endpoint in capitals is locked too.
+            let shouting = Overrides {
+                ptyd_endpoint: Some(PathBuf::from(
+                    endpoint.to_string_lossy().to_ascii_uppercase(),
+                )),
+                ..overrides.clone()
+            };
+            let second = choose_in(tmp.path(), &shouting);
+            assert_eq!(second.capability(), None, "the endpoint is locked");
+        }
+        let second = choose_in(tmp.path(), &overrides);
+        assert_eq!(second.capability(), None, "the endpoint is locked");
         block_on(first.detach(Duration::from_secs(5)));
+        let third = choose_in(tmp.path(), &overrides);
+        assert_eq!(
+            third.capability(),
+            Some(Capability::Pty),
+            "{}",
+            endpoint.display()
+        );
+        block_on(third.detach(Duration::from_secs(5)));
+        assert!(!tmp.path().join("ran").exists(), "ptyd was never started");
+    }
+
+    /// A ptyd that fails the trust check (here group-writable on Unix, downloaded on Windows) is
+    /// not used, as if it were missing: no runtime, and nothing made or locked for its endpoint.
+    #[test]
+    fn an_untrusted_ptyd_is_not_used() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ptyd = fake_ptyd(&tmp.path().join("bin"));
+        untrust(&ptyd);
+        let overrides = forced(tmp.path(), &ptyd, "untrusted");
+        let chosen = choose_in(tmp.path(), &overrides);
+        assert_eq!(chosen.capability(), None);
+        assert!(
+            !tmp.path().join("p").exists(),
+            "nothing made for its endpoint"
+        );
+        assert!(!tmp.path().join("locks").exists(), "nothing locked");
+        assert!(!tmp.path().join("ran").exists(), "ptyd was never started");
+        // The reason, as `Plan::choose` gives it (and the warning logs it).
+        let why = match block_on(Plan::new(tmp.path(), &overrides).choose()) {
+            Err(why) => why,
+            Ok(_) => panic!("chosen"),
+        };
+        assert!(why.contains("not running pitcrew-ptyd at"), "{why}");
+        assert!(why.contains(UNTRUSTED), "{why}");
+    }
+
+    /// A ptyd that passed when the runtime was chosen, and fails the check when the first
+    /// terminal would start it (hours later, say), is refused then: the start fails cleanly,
+    /// with the reason, and ptyd never runs.
+    #[test]
+    fn a_ptyd_changed_after_choose_is_refused_at_launch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ptyd = fake_ptyd(&tmp.path().join("bin"));
+        let overrides = forced(tmp.path(), &ptyd, "changed");
+        let chosen = choose_in(tmp.path(), &overrides);
+        assert_eq!(chosen.capability(), Some(Capability::Pty));
+        untrust(&ptyd);
+        match chosen.runtime().start(&spec()) {
+            Err(RuntimeError::Unavailable(why)) => {
+                assert!(why.contains("not running pitcrew-ptyd at"), "{why}");
+                assert!(why.contains(UNTRUSTED), "{why}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(chosen.runtime().list().unwrap().is_empty());
+        assert!(!tmp.path().join("ran").exists(), "ptyd was never started");
+        block_on(chosen.detach(Duration::from_secs(5)));
     }
 
     /// Where tmux cannot be used (here its socket's directory is refused; elsewhere than Unix
@@ -1034,29 +1237,13 @@ mod tests {
     #[test]
     fn without_tmux_the_pty_runtime_is_chosen() {
         let tmp = tempfile::tempdir().unwrap();
-        let ptyd = tmp.path().join(pitcrew_runtime::pty::launch::PTYD);
-        std::fs::write(&ptyd, "#!/bin/sh\nexit 1\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&ptyd, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let endpoint = if cfg!(windows) {
-            PathBuf::from(format!(
-                r"\\.\pipe\pitcrew-ptyd-unit-auto-{}-{}",
-                std::process::id(),
-                state_hash(tmp.path())
-            ))
-        } else {
-            tmp.path().join("p").join("ptyd")
-        };
+        let ptyd = fake_ptyd(&tmp.path().join("bin"));
         let overrides = Overrides {
-            tmux_socket: Some(tmp.path().join("missing").join("dir").join("tmux")),
-            ptyd: Some(ptyd),
-            ptyd_endpoint: Some(endpoint),
-            ..Overrides::default()
+            force_pty: false,
+            ptyd_idle_exit: None,
+            ..forced(tmp.path(), &ptyd, "auto")
         };
-        let chosen = block_on(TerminalRuntime::choose(tmp.path(), &overrides));
+        let chosen = choose_in(tmp.path(), &overrides);
         assert_eq!(chosen.capability(), Some(Capability::Pty));
         assert!(
             !tmp.path().join("missing").exists(),

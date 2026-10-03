@@ -199,6 +199,15 @@ export function queryValue(query: URLSearchParams, key: string): string | undefi
   return value === null || value === '' ? undefined : value;
 }
 
+/** Parse an optional id filter like the Rust FromStr implementations. */
+export function queryId(query: URLSearchParams, key: string, prefix: string): string | undefined {
+  const value = queryValue(query, key);
+  if (value === undefined) return undefined;
+  const bare = value.startsWith(`${prefix}_`) ? value.slice(prefix.length + 1) : value;
+  if (!isUlid(bare)) throw invalid(`${key} must be a ULID or ${prefix}_ followed by a ULID.`);
+  return bare.toUpperCase();
+}
+
 /** Every non-empty value of a repeatable query parameter, checked against an enum. */
 export function queryEnums<T extends string>(
   query: URLSearchParams,

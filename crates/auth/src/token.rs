@@ -138,7 +138,7 @@ impl TokenId {
     /// A new id.
     #[must_use]
     pub fn new() -> Self {
-        Self(Ulid::new())
+        Self(Ulid::generate())
     }
 }
 
