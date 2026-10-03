@@ -34,6 +34,8 @@ none of this folder lands in the initial bundle until a projects route is visite
 | `overview.tsx` | `ProjectOverview`/`WorkstreamOverview` (with their own header, for standalone use and tests) and the header-less `ProjectOverviewBody`/`WorkstreamOverviewBody` the project/workstream pages' Overview tab reuses; `WorkstreamsTable`, `NeedsYouPanel`. |
 | `home.tsx` | `Home`; "since you last looked" keeps the last seen revision per workspace in local storage. |
 | `format.ts` | Labels, tones, dates, event sentences and a block's counts. |
+| `calendar.tsx`, `calendar-dates.ts` | Calendar route: due tasks by month, filters for me/project/workstream, locale week starts, arrow-key day navigation, Enter to show a day's tasks, and a phone agenda. Calendar arithmetic uses UTC solely to keep date-only values stable. |
+| `timeline.tsx`, `scheduled-task.tsx`, `schedule.css` | Project Timeline: workstream rows on a shared week/month axis, exact due-date labels, a today line, undated tasks apart, and status symbols and borders. Scrolling stays in the timeline; task buttons open the drawer and regain focus when it closes. |
 | `people.tsx`, `ui.tsx` | Avatars; small shared pieces (candidates for `src/design`). |
 
 ## The task page
@@ -120,6 +122,21 @@ removed, tools run and failed, turns; or the events, when it has none of those) 
 page (stream M's, which this stream does not edit).
 
 ## Tests
+
+Calendar and Timeline use the same live `useTasks` queries as the board: task date, status and
+workstream changes refresh from the stream. New task accepts an optional due date so the Calendar
+empty state points to a usable control. Changing dates by dragging is outside this feature.
+
+`tests/calendar-dates.test.ts` covers month/year boundaries, leap day, locale week starts, keyboard
+steps and placement on both timeline axes. `tests/calendar-timeline.test.tsx` exercises filters,
+the drawer, due-date creation and streamed date/status/workstream changes against the mock hub.
+`tests/e2e/calendar-timeline.spec.ts` checks keyboard focus, drawer focus restoration, the phone
+agenda, contained scrolling and axe in light and dark themes. It uses its own task date patches,
+without changing shared fixtures. To run only these browser checks without screenshots or traces:
+
+```sh
+corepack pnpm exec playwright test -c src/projects/tests/e2e/playwright.config.ts calendar-timeline.spec.ts
+```
 
 `tests/` runs against the real mock hub (one per test, on a free port) under happy-dom:
 
