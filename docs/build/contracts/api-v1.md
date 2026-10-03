@@ -46,16 +46,10 @@ Every failure returns an `ApiError` body, `{"code": "…", "message": "…"}`:
 | `unavailable` | 503 | The session's machine is unreachable |
 | `internal` | 500 | Anything else |
 
-## Files API proposal (not implemented)
+## Files API
 
-Brief `0-files-api` proposes the following device-only routes. This section is a
-contract proposal, not an available API: implementation is blocked by the brief's
-path scope. The brief now permits `Cargo.lock` for the safe Windows
-handle-information dependency. The proposed `ErrorCode::TooLarge` and
-`ErrorCode::Unsupported` additions also require updating the exhaustive
-`ErrorKind::from_code` match in `crates/cli/src/error.rs`, outside the brief's
-listed paths. The implementation must not proceed without that scope being
-extended. No protocol types or generated bindings exist yet.
+Brief `0-files-api` implements these device-only routes. Wire types live in
+`crates/protocol/src/files.rs`, with generated TypeScript in `packages/protocol-ts`.
 
 | Method and path | Request and response |
 |---|---|
@@ -104,7 +98,7 @@ untouched; temporary files are cleaned up.
 
 Before replacement, keep the old bytes under the daemon state directory's
 `file-backups/`, keyed by a hash of root and relative path, never by client path
-components. Proposed retention: newest three backups per file, 64 MiB total,
+components. Retention: newest three backups per file, 64 MiB total,
 oldest first eviction; an individual backup is at most 8 MiB. Unix directories
 and files must be owner-only (0700 and 0600); Windows needs an owner-only DACL.
 Reject squatted directories, links and reparse points. Failure to create a private
@@ -112,7 +106,7 @@ backup refuses the write. Logging records counts and fixed reasons only, never
 paths or contents. Backup retention is independent of UI file changes.
 
 Errors use the usual `code` and `message`, with optional `size` for `413 too_large`
-and `current_revision` for conflicts. Proposed additions to `ErrorCode` are
+and `current_revision` for conflicts. Additional `ErrorCode` values are
 `too_large` (413) and `unsupported` (501). Bad paths, queries and bodies are 400;
 unknown workstreams, locations and files are 404; links, escapes, hard-linked
 write targets and `.git` writes are 403; I/O failures use fixed messages without

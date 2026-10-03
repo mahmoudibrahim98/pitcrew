@@ -35,3 +35,6 @@ JSON integers are generated as `number`, matching the wire, including timestamps
 TypeScript cannot express integer ranges or enforce JavaScript's safe-integer bounds. String types
 also do not validate ULIDs, key syntax or calendar dates. Validate untrusted JSON at the boundary.
 The protocol's non-exhaustive enums may acquire variants; consumers must handle unknown tags.
+
+Files API exports include FileEntry, FileKind, FileList, FileEncoding, FileContent and WriteFile.
+WriteFile.revision is required and nullable; null means exclusive creation.

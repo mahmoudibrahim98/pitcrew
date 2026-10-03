@@ -3,4 +3,4 @@
 /**
  * Machine-readable error codes.
  */
-export type ErrorCode = "unauthorized" | "forbidden" | "not_found" | "conflict" | "invalid" | "unavailable" | "internal";
+export type ErrorCode = "unauthorized" | "forbidden" | "not_found" | "conflict" | "invalid" | "unavailable" | "too_large" | "unsupported" | "internal";
