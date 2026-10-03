@@ -458,7 +458,7 @@ fn a_named_claude_session_is_reported_once_under_its_name() {
     ));
     assert_eq!(r.runtime.list().unwrap().len(), 1);
 
-    // After a restart it keeps the name.
+    // After a restart it keeps the name and observes the terminal missing from the new runtime.
     let Rig {
         runner,
         terminals,
@@ -473,7 +473,8 @@ fn a_named_claude_session_is_reported_once_under_its_name() {
         state.path(),
         TokenFiles::default(),
     );
-    assert_eq!(r.commands.started(named), Started::Reported);
+    assert_eq!(r.terminals.terminal_of(named).unwrap(), Some(terminal));
+    assert_eq!(r.commands.started(named), Started::Exited);
     r.runner.stop();
 }
 
