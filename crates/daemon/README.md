@@ -64,7 +64,7 @@ in the log when used (see "Terminals"):
 | `demo-agent.token` | With `--demo` only: a token for the demo's first agent, `@writer`, `pca_…`. Private. |
 | `workspace.json` | The workspace's id and name (`GET /v1/workspace`), which the event log does not hold. Written by `--demo`, and by the first run (`POST /v1/setup`, `pitcrewd init`). Atomic (a private file renamed into place). Private. |
 | `office.json` | Where the back office got to in the log (`{ "log", "done" }`), so a restart runs it again from there. Removed by any start with the office off (`--no-office`, or no owner for `@office` yet, as before setup). Private. |
-| `recaps.sqlite3` | The recap index's blocks (hub-work's README, "Recaps"): a cache, made when the index is built at start, replaced at every start and removed at a clean stop; never read from one run to the next. Private. |
+| `recaps.sqlite3` | The recap index's blocks (hub-work's README, "Recaps"): a cache, made when the index is built at start, replaced at every start and removed at a clean stop; never read from one run to the next. Private. On a network or unknown filesystem, kept in a private local fallback folder (temp before `$XDG_RUNTIME_DIR`), or memory if neither works; see "Recaps". |
 | `runner/<log id>/` | The runner's index (`pitcrew-runner`): every transcript it watches, its session id, and how far it has been read into this store. One folder per hub log (the store's `log_id`), so a new store learns every session from the start. |
 | `run/pitcrewd.sock` | The private socket (Unix). On Windows the API uses the current user's named pipe, `\\.\pipe\pitcrewd-<user SID>`. |
 
@@ -606,7 +606,12 @@ answered by the hub's recap index: hub-work's `RecapIndex`, which its one `WorkS
 implements (hub-work's README, "Recaps"). Blocks and day paragraphs are derived from the log, so
 a restart builds them again. The blocks are kept on disk, not in memory, in `recaps.sqlite3` in the
 state directory (`WorkService::with_recap_file`): a cache of this run's, replaced when the index is
-built and removed when the daemon stops.
+built and removed when the daemon stops cleanly. On a network or unknown filesystem, the cache
+moves to a private local folder (temp before `$XDG_RUNTIME_DIR`), or stays in memory if neither
+base works. Unix names that folder from the canonical requested path and uid and reuses a hard
+kill's leftover only when `lstat` shows this user's real 0700 directory, replacing its cache.
+Otherwise, and on Windows, the name is random; hard-kill leftovers remain until temp cleanup.
+See hub-work's README, "Recaps", for placement and lifecycle details.
 
 - **The adapter** (`src/recaps.rs`, like `src/refs.rs` for the activity index): `pitcrew-api`
   does not depend on the work model, so `WorkRecaps` copies the route's `BlockFilter` field for
