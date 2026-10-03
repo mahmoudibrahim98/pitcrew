@@ -77,12 +77,18 @@ The hook **always exits 0 and prints nothing**, even if it panics, and gives up 
 whatever the daemon does. Global flags before it (`pitcrew --json hook …`) keep it on this path. Set `PITCREW_HOOK_DEBUG=1` to see on stderr why an event was not delivered.
 
 `pitcrew hooks install --hook-form auto|exec|shell` defaults to `auto`. It probes
-`claude --version` on the installed CLI's PATH for at most 750 ms, and writes exec form only for
+`claude --version` on the installed CLI's PATH for at most 3 seconds, and writes exec form only for
 Claude Code **2.1.139 or newer**. The official [2.1.139 changelog](https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md#21139)
 introduces the hook `args: string[]` field. Missing, old, failed, unreadable or timed-out probes
 use shell form and say so in the install output. `--hook-form exec` requires a successful version probe and
 refuses installation when compatibility cannot be verified; `--hook-form shell` forces the existing shell behavior.
 `hooks diff` accepts the same option and previews the chosen command and arguments.
+
+The probe checks the first Claude Code on PATH. Other installs (including IDE-bundled copies
+or ones on a different PATH) may read the same settings. Use `--hook-form shell` if any of
+those installs is older than 2.1.139: an older CLI ignores `args` and runs bare `pitcrew`,
+whose usage exit code 2 can block UserPromptSubmit or Stop hooks. `hooks status` never runs
+Claude Code; it accepts either form at the current executable path and reports each form's count.
 
 Exec form spawns the exact absolute path reported by the OS, without quoting or converting
 Windows separators (the real `pitcrew.exe`), and passes the argument array directly:
