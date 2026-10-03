@@ -27,8 +27,15 @@ fn fake_binary() -> Result<&'static Path> {
                 std::fs::write(dir.join("probed"), "yes").unwrap();
                 let text = std::fs::read_to_string(dir.join("version.txt")).unwrap();
                 match text.as_str() {
-                    "timeout" => std::thread::sleep(std::time::Duration::from_secs(5)),
+                    "timeout" => {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        std::fs::write(dir.join("survived"), "yes").unwrap();
+                    },
                     "failed" => std::process::exit(1),
+                    "slow" => {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        println!("2.1.139");
+                    },
                     "invalid-utf8" => { std::io::stdout().write_all(&[255]).unwrap(); },
                     "huge" => { println!("{}", "x".repeat(8192)); },
                     _ => println!("{text}"),
@@ -76,6 +83,7 @@ fn auto_selects_only_supported_versions_and_every_failure_falls_back() -> Result
     for (version, exec) in [
         ("2.1.139 (Claude Code)", true),
         ("2.1.140", true),
+        ("slow", true),
         ("2.1.138", false),
         ("unknown", false),
         ("failed", false),
@@ -188,6 +196,14 @@ fn explicit_forms_diff_migration_and_uninstall_are_safe() -> Result {
     assert!(run(&home, &bin, &exec)?.status.success());
     assert_eq!(settings(&home)?, first);
     std::fs::remove_file(bin.join("probed"))?;
+    let status = run(&home, &bin, &["hooks", "status", "--engine", "claude"])?;
+    assert!(status.status.success());
+    let text = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        text.contains("installed") && text.contains("5 exec form"),
+        "{text}"
+    );
+    assert!(!bin.join("probed").exists(), "status must not probe Claude");
     let diff = run(
         &home,
         &bin,
@@ -281,5 +297,59 @@ fn explicit_exec_never_installs_for_an_older_or_missing_claude() -> Result {
         assert!(!home.join(".claude/settings.json").exists());
         assert!(String::from_utf8_lossy(&output.stdout).contains("2.1.139"));
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn cmd_shim_supports_exec_and_timeout_ends_its_descendant() -> Result {
+    let tmp = tempfile::tempdir()?;
+    let bin = tmp.path().join("bin with spaces");
+    let home = tmp.path().join("home");
+    std::fs::create_dir(&bin)?;
+    std::fs::copy(fake_binary()?, bin.join("stand-in.exe"))?;
+    std::fs::write(bin.join("version.txt"), "2.1.139")?;
+    std::fs::write(
+        bin.join("claude.cmd"),
+        "@echo off\r\n\"%~dp0stand-in.exe\" %*\r\n",
+    )?;
+    let args = ["hooks", "install", "--engine", "claude", "--yes"];
+    let output = run(&home, &bin, &args)?;
+    assert!(output.status.success());
+    assert!(
+        bin.join("probed").exists(),
+        "the cmd shim must actually run"
+    );
+    assert!(
+        settings(&home)?["hooks"]["Stop"][0]["hooks"][0]
+            .get("args")
+            .is_some()
+    );
+
+    std::fs::remove_file(bin.join("probed"))?;
+    std::fs::write(bin.join("version.txt"), "timeout")?;
+    // The shim exits immediately; its child inherits the probe's output pipe and sleeps.
+    std::fs::write(
+        bin.join("claude.cmd"),
+        "@echo off\r\nstart /b \"\" \"%~dp0stand-in.exe\" %*\r\nexit /b 0\r\n",
+    )?;
+    let start = Instant::now();
+    let output = run(&home, &bin, &args)?;
+    assert!(output.status.success());
+    assert!(start.elapsed().as_secs() < 4, "the whole job must time out");
+    assert!(
+        bin.join("probed").exists(),
+        "the descendant must actually start"
+    );
+    assert!(
+        settings(&home)?["hooks"]["Stop"][0]["hooks"][0]
+            .get("args")
+            .is_none()
+    );
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(
+        !bin.join("survived").exists(),
+        "the descendant must be terminated"
+    );
     Ok(())
 }
