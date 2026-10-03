@@ -548,6 +548,7 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         ))
         .device(Activity::new(events).with_refs(refs).routes())
         .device(Recaps::new(recaps).routes())
+        .device(crate::scan::routes(Arc::clone(&work), homes.as_deref()))
         .device(pitcrew_api::terminal::routes(
             terminals,
             TerminalConfig::default(),

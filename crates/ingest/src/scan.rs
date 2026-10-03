@@ -27,7 +27,6 @@ use crate::codex::{self, CodexAdapter};
 use crate::opencode::{self, OpenCodeAdapter};
 use pitcrew_interfaces::source::{SourceAdapter, TranscriptRef};
 use pitcrew_protocol::model::{Engine, TimestampMs};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
@@ -119,141 +118,12 @@ fn now_ms() -> TimestampMs {
 
 // ─── Output ──────────────────────────────────────────────────────────────────────────────────
 
-/// One progress tick, sent at most every 100 ms.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScanProgress {
-    /// Transcripts looked at so far.
-    pub scanned: usize,
-    /// Total transcripts discovered. Always `Some` in this implementation: discovery (a directory
-    /// walk) finishes before the first tick.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub total: Option<usize>,
-    /// A path recently finished, for a "scanning …" line. Best-effort: a tick can land between
-    /// messages and carry nothing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
-}
-
-/// Sessions found for one engine.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EngineCount {
-    /// The CLI.
-    pub engine: Engine,
-    /// Sessions found.
-    pub count: usize,
-}
-
-/// Sessions found under one account home.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HomeCount {
-    /// The CLI.
-    pub engine: Engine,
-    /// The home folder, as given in [`ScanHome`].
-    pub home: String,
-    /// Sessions found.
-    pub count: usize,
-}
-
-/// Sessions found with one working directory.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FolderCount {
-    /// The `cwd`.
-    pub path: String,
-    /// Sessions found.
-    pub count: usize,
-}
-
-/// Sessions started in one calendar month, UTC.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MonthCount {
-    /// `YYYY-MM`.
-    pub month: String,
-    /// Sessions found.
-    pub count: usize,
-}
-
-/// Counts from a scan. `by_engine`, `by_home`, `by_folder` and `by_month` cover ordinary sessions
-/// only: a sub-agent session shares its parent's folder and month, so folding it in would double
-/// those buckets without adding information. Sub-agent sessions are counted once, separately, in
-/// `subagent_sessions`.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScanCounts {
-    /// Ordinary (non-sub-agent) sessions found.
-    pub sessions: usize,
-    /// Sub-agent sessions found, counted separately.
-    pub subagent_sessions: usize,
-    /// Per engine.
-    pub by_engine: Vec<EngineCount>,
-    /// Per account home.
-    pub by_home: Vec<HomeCount>,
-    /// Per folder, busiest first. Folders that are the same real place but spelled differently
-    /// (see the module docs) are counted together, under one of their original spellings.
-    pub by_folder: Vec<FolderCount>,
-    /// Per month, most recent first.
-    pub by_month: Vec<MonthCount>,
-    /// The earliest session start found.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub first_activity: Option<TimestampMs>,
-    /// The most recent activity found (a transcript's modification time).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_activity: Option<TimestampMs>,
-}
-
-/// A suggested workstream inside a [`Suggestion`]'s project: either an active sub-folder
-/// (`branch: None`, named after the folder) or a non-default branch (`branch: Some`, named after
-/// it). A project can suggest both kinds, and a session can count toward one of each.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkstreamSuggestion {
-    /// Stable within its project.
-    pub id: String,
-    /// Display name.
-    pub name: String,
-    /// Set for a branch-based suggestion.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    /// Sessions in it.
-    pub session_count: usize,
-    /// Of those, in the last 30 days.
-    pub recent_30d: usize,
-    /// Of those, in the last 90 days.
-    pub recent_90d: usize,
-}
-
-/// A suggested project: a repository root (the nearest ancestor with a `.git`), or, for cwds with
-/// no `.git` above them, a folder shared by several of them. Never the user's home directory, one
-/// of the scanned [`ScanHome`]s, or a well-known system folder.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Suggestion {
-    /// Stable across a re-scan: the root's path.
-    pub id: String,
-    /// Display name (the root folder's name).
-    pub name: String,
-    /// The root folder.
-    pub path: String,
-    /// Whether a `.git` was found at or above it (versus a grouped non-git folder).
-    pub is_git: bool,
-    /// Sessions under it (any depth), excluding sub-agents.
-    pub session_count: usize,
-    /// Of those, in the last 30 days.
-    pub recent_30d: usize,
-    /// Of those, in the last 90 days.
-    pub recent_90d: usize,
-    /// Suggested workstreams inside it, ranked the same way as projects.
-    pub workstreams: Vec<WorkstreamSuggestion>,
-}
-
-/// The result of [`scan`].
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScanReport {
-    /// Counts.
-    pub counts: ScanCounts,
-    /// Suggested projects, most recently active first.
-    pub suggestions: Vec<Suggestion>,
-    /// Folders or transcripts skipped because they could not be read (permission denied, a
-    /// vanished file, a locked store) or whose read panicked. Not fatal: the rest of the scan
-    /// still ran.
-    pub unreadable: u64,
-}
+// The scan's results are wire types (`POST /v1/machines/{id}/scan`), so they live in the protocol;
+// they are re-exported here for this crate's callers.
+pub use pitcrew_protocol::scan::{
+    EngineCount, FolderCount, HomeCount, MonthCount, ScanCounts, ScanProgress, ScanReport,
+    Suggestion, WorkstreamSuggestion,
+};
 
 // ─── The scan ────────────────────────────────────────────────────────────────────────────────
 

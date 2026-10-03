@@ -84,14 +84,13 @@ built for onboarding's scan step and "scan again". It is **not** an import: it n
   `ScanReport::unreadable`; the rest of the scan still runs. Adapters already do not follow
   directory symlinks, so a symlink cycle cannot make the walk hang.
 
-### Proposed move into `pitcrew-protocol`
+### The wire types live in `pitcrew-protocol`
 
-`ScanReport`, `ScanProgress`, `EngineCount`, `HomeCount`, `FolderCount`, `MonthCount`,
-`Suggestion` and `WorkstreamSuggestion` (all in `scan.rs`, all `Serialize`/`Deserialize`) are
-written to become the wire types for the planned `POST /v1/machines/{id}/scan` contract
-(`docs/build/contracts.md`'s "Machine scan API", proposed by A + O). They would move to a new
-`pitcrew_protocol::scan` module unchanged; `ScanHome` and `ScanOptions` stay here; they describe a
-local filesystem walk, not something the wire protocol needs to name (the hub would build a
-`Vec<ScanHome>` from `MachineInfo`/account state and call `scan::scan` itself, or a future runner
-command would). See this crate's final report for the exact diff against the onboarding UI's
-proposed `ScanResult`/`ScanProgressEvent` shapes (`apps/ui/src/onboarding/api.ts`).
+`ScanReport`, `ScanProgress`, `ScanCounts`, `EngineCount`, `HomeCount`, `FolderCount`,
+`MonthCount`, `Suggestion` and `WorkstreamSuggestion` are the wire types of
+`POST /v1/machines/{id}/scan` (`docs/build/contracts/api-v1.md`, "Machine scan"), so they are in
+`pitcrew_protocol::scan`, unchanged, and `scan.rs` re-exports them (`pitcrew_ingest::scan::ScanReport`
+still names them). `ScanHome` and `ScanOptions` stay here: they describe a local filesystem walk,
+not something the wire names. The daemon (`crates/daemon/src/scan.rs`) builds the `ScanHome`s from
+the runner's homes and calls `scan::scan` on its blocking pool; the onboarding UI maps the report to
+its own camelCase `ScanResult` (`apps/ui/src/onboarding/scan-wire.ts`).

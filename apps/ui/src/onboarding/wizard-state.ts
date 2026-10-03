@@ -88,6 +88,8 @@ export interface WizardState {
   scanStatus: StepStatus;
   scanProgress?: { scanned: number; total?: number } | undefined;
   scanResult?: ScanResult;
+  /** Why the last scan did not finish (`scanStatus: 'error'`). */
+  scanError?: string | undefined;
 
   // Create projects and workstreams
   createProjects: CreateProjectDraft[];

@@ -46,6 +46,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 # The tmux socket's directory name: 8 hex digits of the state directory's sha256.
 sha2.workspace = true
+# `Stream`, for the machine scan's streamed answer (`axum::body::Body::from_stream`). Already in the
+# lockfile through axum, at this version; not in the root's `[workspace.dependencies]`.
+futures-core = "=0.3.34"
 
 [target.'cfg(unix)'.dependencies]
 # The tmux socket's lock (flock, O_NOFOLLOW), without unsafe code. The version pitcrew-auth,

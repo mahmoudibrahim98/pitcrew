@@ -268,6 +268,24 @@ function send(res: ServerResponse, reply: Reply): void {
   if (reply.status === 401) {
     res.setHeader('WWW-Authenticate', 'Bearer');
   }
+  if (reply.stream !== undefined) {
+    res.writeHead(reply.status, {
+      'Content-Type': reply.stream.contentType,
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    // A client that went away misses the rest; the route's work goes on to its end regardless.
+    const open = (): boolean => !res.destroyed && !res.writableEnded;
+    reply.stream.start({
+      write: (line) => {
+        if (open()) res.write(line);
+      },
+      end: () => {
+        if (open()) res.end();
+      },
+    });
+    return;
+  }
   if (reply.body === undefined) {
     res.writeHead(reply.status).end();
     return;

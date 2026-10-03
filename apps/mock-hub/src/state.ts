@@ -69,9 +69,11 @@ export interface Delays {
   reply: number;
   /** From a graceful `end` to `session_ended`. */
   end: number;
+  /** A machine scan, from its first progress frame to its report (`scan.ts`). */
+  scan: number;
 }
 
-export const DEFAULT_DELAYS: Delays = { start: 1500, reply: 800, end: 300 };
+export const DEFAULT_DELAYS: Delays = { start: 1500, reply: 800, end: 300, scan: 1000 };
 
 /** How many revisions one filtered `GET /v1/events` request examines at most. */
 export const DEFAULT_SCAN_WINDOW = 500;
