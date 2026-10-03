@@ -540,22 +540,41 @@ async fn a_stalled_write_holds_up_neither_output_nor_pings() {
     tokio::task::spawn_blocking(move || {
         let mut socket = connect(addr, &token, &format!("/v1/sessions/{session}/terminal"));
         runtime.stall_writes.store(true, Ordering::SeqCst);
+        let started = Instant::now();
         socket.send(Message::Binary(b"k".to_vec().into())).unwrap();
         wait_for("the stalled write", || {
             runtime.stalled.load(Ordering::SeqCst) == 1
         });
+        let stalled_since = Instant::now();
 
         // Output while the write hangs: more than the queue holds, for longer than the pump
         // would wait on a full queue. Before, nothing drained the queue during a stall.
-        let started = Instant::now();
         let mut rounds = 0;
-        while started.elapsed() < Duration::from_millis(700) {
+        let bound = Duration::from_millis(1200);
+        let flowing_for = Duration::from_millis(400);
+        while rounds < 5 || stalled_since.elapsed() < flowing_for {
+            assert!(
+                started.elapsed() < bound,
+                "{rounds} rounds before the stall deadline"
+            );
+            socket
+                .get_mut()
+                .set_read_timeout(Some(bound.saturating_sub(started.elapsed())))
+                .unwrap();
             runtime.inner.write(terminal, b"0123456789").unwrap();
             assert_eq!(read_bytes(&mut socket, 10), b"0123456789");
             rounds += 1;
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(rounds >= 5, "{rounds} rounds of output during the stall");
+        assert!(
+            rounds >= 5 && stalled_since.elapsed() >= flowing_for && started.elapsed() < bound,
+            "{rounds} rounds in {:?} during the stall",
+            started.elapsed()
+        );
+        socket
+            .get_mut()
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
 
         // The stalled runtime, not the reader, is what ends the stream.
         assert_eq!(read_close(&mut socket), CloseCode::Error);
@@ -791,13 +810,33 @@ async fn a_stalled_runtime_answers_503_or_closes_with_1011() {
     stalling.read.store(true, Ordering::SeqCst);
     let addr = serve(app).await;
     let token = fixture.device_token.clone();
-    let code = tokio::task::spawn_blocking(move || {
-        let mut socket = connect(addr, &token, &path);
-        read_close(&mut socket)
+    tokio::task::spawn_blocking(move || {
+        let stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request = format!("ws://{addr}{path}").into_client_request().unwrap();
+        request.headers_mut().insert(
+            "sec-websocket-protocol",
+            HeaderValue::from_str(&format!("pitcrew.v1, pitcrew.bearer.{token}")).unwrap(),
+        );
+        match tungstenite::client(request, stream) {
+            Ok((mut socket, response)) => {
+                assert_eq!(response.headers()["sec-websocket-protocol"], "pitcrew.v1");
+                assert_eq!(read_close(&mut socket), CloseCode::Error);
+            }
+            Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(response))) => {
+                // Calls that time out before the upgrade answer 503; after it they close 1011.
+                assert_eq!(response.status(), 503);
+                let body: serde_json::Value =
+                    serde_json::from_slice(response.body().as_ref().unwrap()).unwrap();
+                assert_eq!(body["code"], "unavailable");
+            }
+            Err(error) => panic!("unexpected handshake failure: {error}"),
+        }
     })
     .await
     .unwrap();
-    assert_eq!(code, CloseCode::Error);
     stalling.read.store(false, Ordering::SeqCst);
 }
 
