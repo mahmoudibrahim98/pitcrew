@@ -14,7 +14,7 @@
 //!   read again; the next start on the same path replaces it.
 //! - **On a local disk.** A cache file asked for on a network filesystem (detected as the store
 //!   detects its own, `pitcrew_store::detect`) goes in a private folder of its own on a local disk
-//!   instead: in the runtime directory (`$XDG_RUNTIME_DIR`) or the temporary folder; with
+//!   instead: in the temporary folder, or else the runtime directory (`$XDG_RUNTIME_DIR`); with
 //!   neither, the blocks stay in memory ([`BlockDb::local`]).
 //!   - On Unix the folder is named after the path asked for and the user, so the next start on
 //!     that path finds the folder a hard kill left behind (SIGKILL, the OOM killer, a power cut)
@@ -316,15 +316,18 @@ fn folder_of(path: &Path) -> PathBuf {
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
 }
 
-/// Where a private folder for the recap file may be made, in order: the user's runtime
-/// directory (`$XDG_RUNTIME_DIR`, when set to an absolute path) and the temporary folder.
+/// Where a private folder for the recap file may be made, in order: the temporary folder, then
+/// the user's runtime directory (`$XDG_RUNTIME_DIR`, when set to an absolute path). The runtime
+/// directory is a `tmpfs`, held in memory and capped by logind, so the file there would spend the
+/// memory it is meant to save; it is for when the temporary folder cannot be used (on a network
+/// filesystem itself, say). Some systems put the temporary folder in memory too.
 fn local_bases() -> Vec<PathBuf> {
-    let mut bases: Vec<PathBuf> = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|dir| dir.is_absolute())
-        .into_iter()
-        .collect();
-    bases.push(std::env::temp_dir());
+    let mut bases = vec![std::env::temp_dir()];
+    bases.extend(
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute()),
+    );
     bases
 }
 
@@ -366,10 +369,10 @@ impl BlockDb {
 
     /// An empty database for a cache file meant for `path`, kept on a local disk: at `path` when
     /// its folder is on one; when that is on a network filesystem (or one not recognised, as the
-    /// store treats it), in a private folder of its own in the runtime directory or the temporary
-    /// folder ([`BlockDb::file`] there; on Unix the folder is named after `path` and used again
-    /// after a hard kill, see [`OwnedFolder::make`]); in memory when neither can be had. Logs
-    /// where it went when that is not `path`.
+    /// store treats it), in a private folder of its own in the temporary folder or else the
+    /// runtime directory ([`BlockDb::file`] there; on Unix the folder is named after `path` and
+    /// used again after a hard kill, see [`OwnedFolder::make`]); in memory when neither can be
+    /// had. Logs where it went when that is not `path`.
     pub fn local(path: &Path) -> Result<Self> {
         Self::local_with(
             path,

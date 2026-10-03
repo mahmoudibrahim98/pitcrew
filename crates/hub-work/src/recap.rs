@@ -1000,8 +1000,8 @@ impl WorkService {
     ///
     /// **On a local disk.** When the folder of `path` is on a network filesystem (detected as the
     /// store detects its own; a filesystem not recognised counts as one), the file goes in a
-    /// private folder (0700 on Unix) in the runtime directory (`$XDG_RUNTIME_DIR`) or the
-    /// temporary folder instead, removed with it; when neither can be had, the blocks stay in
+    /// private folder (0700 on Unix) in the temporary folder, or else the runtime directory
+    /// (`$XDG_RUNTIME_DIR`), instead, removed with it; when neither can be had, the blocks stay in
     /// memory. Either is logged. On Unix that folder is named after `path` and the user, so the
     /// one a hard kill left behind is used again, and its file replaced, at the next start on
     /// `path`; on Windows its name is random, and a hard kill leaves it behind.
