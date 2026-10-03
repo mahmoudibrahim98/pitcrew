@@ -6,7 +6,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GatewayError } from '../errors.ts';
 import { createRemoteGateway } from '../gateway.ts';
-import type { GatewayPrompt, RemoteProgress } from '../remote.ts';
+import { toGatewayWorkspace, type GatewayPrompt, type RemoteProgress } from '../remote.ts';
 import { FakeDesktop, refuse } from './fake-desktop.ts';
 
 let desktop: FakeDesktop;
@@ -46,6 +46,12 @@ describe('the remote commands', () => {
     await expect(remote.wslDistros?.()).rejects.toBeInstanceOf(GatewayError);
     desktop.wsl = { available: false, distros: [] };
     expect(await remote.wslDistros?.()).toEqual(desktop.wsl);
+  });
+  it('keeps a workspace host on remote workspaces only', () => {
+    const host = "wsl:Lab 'quoted' distro";
+    expect(toGatewayWorkspace({ ...NEW_WS, host })).toEqual({ ...NEW_WS, host });
+    expect(toGatewayWorkspace({ ...NEW_WS, kind: 'local', host })).toEqual({ ...NEW_WS, kind: 'local' });
+    expect(toGatewayWorkspace({ ...NEW_WS, host: 42 })).toEqual(NEW_WS);
   });
   it('lists ssh hosts, dropping anything that is not a one-line name', async () => {
     desktop.hosts = { hosts: ['hpc-login', 42, '', 'build\nbox', 'build-box', 'hpc-login', null] };

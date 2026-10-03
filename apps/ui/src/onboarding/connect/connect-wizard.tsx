@@ -452,8 +452,10 @@ function HostStep({
 
   useEffect(() => {
     let live = true;
+    // WSL without a distribution answers `available: false` (wsl.exe fails), like no WSL at all:
+    // the WSL choice appears only with something to choose.
     remote.wslDistros?.().then(
-      (found) => { if (live) setDistros(found.available ? found.distros : null); },
+      (found) => { if (live) setDistros(found.available && found.distros.length > 0 ? found.distros : null); },
       (error: unknown) => { if (live) setWslError(messageOf(error)); },
     );
     api.discoverHosts().then(
@@ -497,7 +499,6 @@ function HostStep({
       {distros !== null && (
         <fieldset className="mt-4 flex flex-col gap-2">
           <legend>A WSL distro on this computer</legend>
-          {distros.length === 0 && <p>No distributions are registered.</p>}
           {distros.map((distro) => (
             <label key={distro.name} className="flex gap-2 text-sm">
               <input type="radio" name="machine" disabled={distro.version !== 2}

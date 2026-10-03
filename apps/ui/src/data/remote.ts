@@ -186,7 +186,8 @@ function optionalString(value: unknown): string | undefined | false {
 
 /**
  * A workspace from the gateway (its list, its event, a new one from `remoteAdd`), or `undefined`
- * when it is not one. `detail` is kept only when it is a string.
+ * when it is not one. `detail` is kept only when it is a string; `host` (`wsl:<distro>` for a
+ * WSL machine) only on a remote workspace.
  */
 export function toGatewayWorkspace(value: unknown): GatewayWorkspace | undefined {
   const v = record(value);
@@ -203,7 +204,7 @@ export function toGatewayWorkspace(value: unknown): GatewayWorkspace | undefined
   return {
     id: v.id,
     name: v.name,
-    ...(typeof v.host === 'string' ? { host: cleanLine(v.host) } : {}),
+    ...(v.kind === 'remote' && typeof v.host === 'string' ? { host: cleanLine(v.host) } : {}),
     kind: v.kind,
     state: v.state as WorkspaceState,
     ...(typeof v.detail === 'string' ? { detail: v.detail } : {}),

@@ -106,6 +106,16 @@ it('selects a stopped WSL2 distro and reviews a WSL plan without SSH prompts', a
   expect(desktop.commands('gateway_remote_plan')).toEqual([{ req: { host: '', target, launcher: 'direct' } }]);
 });
 
+it('offers no WSL choice when WSL lists no distribution', async () => {
+  desktop.wsl = { available: true, distros: [] };
+  renderApp();
+  await heading('Connect a remote machine');
+  await screen.findByRole('radio', { name: 'hpc-login' }, PATIENCE);
+  await vi.waitFor(() => expect(desktop.commands('gateway_wsl_distros').length).toBeGreaterThan(0));
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  expect(screen.queryByText('A WSL distro on this computer')).toBeNull();
+});
+
 /** Host, Probe and Launcher (SLURM, 2 CPUs), up to Review. */
 async function toReview() {
   await heading('Connect a remote machine');
