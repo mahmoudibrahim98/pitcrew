@@ -158,10 +158,12 @@ it.
 
 - **Finding it:** the configured path, then `pitcrewd` next to the app's executable, then (debug
   builds only) `PATH`, absolute entries only. A configured path that is not a program is an error.
-- **Not a planted binary:** on Unix the program, its directory, and the directory of the path as
-  given must be owned by root or us and not writable by group or others. On Windows a program
-  downloaded from the web (with a `Zone.Identifier` stream) is refused; its owner is not checked
-  yet (that needs the Win32 security API, which needs `unsafe`).
+- **Not a planted binary:** `src/daemon/locate.rs` calls `pitcrew_trust::check_trusted`
+  (`crates/trust`), the one check every program PitCrew launches passes (the daemon makes it of
+  `pitcrew-ptyd` too). On Unix the file the path resolves to, that file's directory, and the
+  directory of the path as given must be owned by root or us and not writable by group or others.
+  On Windows a program downloaded from the web (with a `Zone.Identifier` stream) is refused; its
+  owner is not checked (see the trust crate's README).
 - **Find or start:** if a daemon already answers `GET /v1/host/info` on this user's private
   socket or pipe, the app uses it and never stops it. Otherwise it starts
   `pitcrewd [--state-dir <dir>] serve --listen private` and waits up to 20 s for

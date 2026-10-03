@@ -30,6 +30,8 @@ macro_rules! ulid_id {
     ($(#[$meta:meta])* $name:ident, $prefix:literal) => {
         $(#[$meta])*
         #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+        #[cfg_attr(feature = "ts", ts(type = "string"))]
         #[serde(transparent)]
         pub struct $name(pub Ulid);
 
@@ -40,7 +42,7 @@ macro_rules! ulid_id {
             /// Creates a new, time-ordered id.
             #[must_use]
             pub fn new() -> Self {
-                Self(Ulid::new())
+                Self(Ulid::generate())
             }
         }
 
@@ -140,6 +142,8 @@ ulid_id!(
 /// Rules: 2–10 characters, the first an uppercase ASCII letter, the rest uppercase letters or
 /// digits.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(type = "string"))]
 #[serde(try_from = "String", into = "String")]
 pub struct ProjectKey(String);
 
@@ -189,6 +193,8 @@ impl fmt::Display for ProjectKey {
 
 /// A people-facing task key, such as `CMP-104`. The number is unique within its project.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[cfg_attr(feature = "ts", ts(type = "string"))]
 #[serde(try_from = "String", into = "String")]
 pub struct TaskKey {
     /// The project's key.

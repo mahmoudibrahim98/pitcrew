@@ -16,7 +16,7 @@
 
 ## Goal
 
-Dependabot's PR #4 bumps `tungstenite` from 0.29.0 to 0.30.0. Move every user of `tungstenite` and
+Dependabot's PR #2 bumps `tungstenite` from 0.29.0 to 0.30.0. Move every user of `tungstenite` and
 `tokio-tungstenite` to 0.30 together, with the WebSocket behaviour unchanged.
 
 ## What to do

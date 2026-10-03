@@ -35,6 +35,12 @@ pitcrew-auth.workspace = true
 # pitcrew-auth already uses.
 rustix = { version = "=1.1.5", features = ["fs", "net", "process"] }
 
+[target.'cfg(windows)'.dependencies]
+# Safe suspended launch into a kill-on-close Job object; avoids new unsafe code here.
+# MIT OR Apache-2.0, pinned for the CLI only.
+process-wrap = { version = "=10.0.1", default-features = false, features = ["tokio1", "job-object", "kill-on-drop"] }
+tokio = { workspace = true, features = ["io-util", "process", "rt", "time"] }
+
 [dev-dependencies]
 # A home of their own for the binaries the tests start (`pitcrew_fixtures::homes`).
 pitcrew-fixtures.workspace = true

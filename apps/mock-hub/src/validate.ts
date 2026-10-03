@@ -199,6 +199,19 @@ export function queryValue(query: URLSearchParams, key: string): string | undefi
   return value === null || value === '' ? undefined : value;
 }
 
+/**
+ * An id in the query (a filter, or a recap block cursor): the bare ULID or its prefixed form
+ * (`ses_…`), in either case, as `FromStr` in ids.rs accepts. A malformed one is a 400; an absent
+ * or empty one is `undefined`. Returned bare and in upper case.
+ */
+export function queryId(query: URLSearchParams, key: string, prefix: string): string | undefined {
+  const value = queryValue(query, key);
+  if (value === undefined) return undefined;
+  const bare = value.startsWith(`${prefix}_`) ? value.slice(prefix.length + 1) : value;
+  if (!isUlid(bare)) throw invalid(`${key} must be a ULID or ${prefix}_ followed by a ULID.`);
+  return bare.toUpperCase();
+}
+
 /** Every non-empty value of a repeatable query parameter, checked against an enum. */
 export function queryEnums<T extends string>(
   query: URLSearchParams,

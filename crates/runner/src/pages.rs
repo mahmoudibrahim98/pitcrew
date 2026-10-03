@@ -23,9 +23,11 @@ use crate::store::Store;
 use crate::watch::{AdapterError, guard};
 use pitcrew_interfaces::source::{SourceAdapter, SourceError, TranscriptPage, TranscriptRef};
 use pitcrew_protocol::ids::SessionId;
+use pitcrew_protocol::model::{Engine, TimestampMs};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -58,27 +60,34 @@ pub(crate) struct Watched {
     sessions: RwLock<HashMap<SessionId, Source>>,
 }
 
+/// A tracked transcript, as pages read it: its path shared with the watcher's own entry.
 #[derive(Clone)]
-struct Source {
-    adapter: Arc<dyn SourceAdapter>,
-    transcript: TranscriptRef,
+pub(crate) struct Source {
+    pub adapter: Arc<dyn SourceAdapter>,
+    pub engine: Engine,
+    pub path: Arc<Path>,
+    pub inner_id: Option<Arc<str>>,
+    /// Size and modification time when the watcher began tracking it.
+    pub size: u64,
+    pub modified: TimestampMs,
+}
+
+impl Source {
+    fn transcript(&self) -> TranscriptRef {
+        TranscriptRef {
+            engine: self.engine,
+            path: self.path.to_path_buf(),
+            inner_id: self.inner_id.as_deref().map(str::to_owned),
+            size: self.size,
+            modified: self.modified,
+        }
+    }
 }
 
 impl Watched {
-    /// The watcher tracks `session`'s transcript, read by `adapter`.
-    pub fn insert(
-        &self,
-        session: SessionId,
-        adapter: Arc<dyn SourceAdapter>,
-        transcript: TranscriptRef,
-    ) {
-        self.write().insert(
-            session,
-            Source {
-                adapter,
-                transcript,
-            },
-        );
+    /// The watcher tracks `session`'s transcript.
+    pub fn insert(&self, session: SessionId, source: Source) {
+        self.write().insert(session, source);
     }
 
     /// The watcher no longer tracks `session`'s transcript.
@@ -245,7 +254,8 @@ impl Inner {
         let Some(source) = self.watched.get(session) else {
             return Err(self.not_watched(session));
         };
-        match guard(|| source.adapter.read_page(&source.transcript, before, limit)) {
+        let transcript = source.transcript();
+        match guard(|| source.adapter.read_page(&transcript, before, limit)) {
             Ok(page) => Ok(page),
             Err(AdapterError::Source(SourceError::Io(e)))
                 if e.kind() == io::ErrorKind::NotFound =>

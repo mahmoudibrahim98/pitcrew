@@ -19,6 +19,7 @@ export interface GatewayWorkspace {
   /** The daemon's workspace id (a ULID), as in `/w/$ws/…`. */
   id: string;
   name: string;
+  host?: string | undefined;
   kind: 'local' | 'remote';
   /** SSH host from the desktop's records; absent on local workspaces and older desktops. */
   host?: string | undefined;

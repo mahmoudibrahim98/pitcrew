@@ -13,6 +13,12 @@ name = "pitcrew-askpass"
 path = "src/bin/pitcrew-askpass.rs"
 
 [[test]]
+# The binary doubles as a configurable fake wsl.exe on every platform.
+name = "wsl"
+path = "tests/wsl.rs"
+harness = false
+
+[[test]]
 # Its own `main`: the test binary doubles as the fake `ssh` it drives.
 name = "fake_ssh"
 path = "tests/fake_ssh.rs"
@@ -33,7 +39,7 @@ thiserror.workspace = true
 # `macros` for `select!` and `try_join!`.
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 # OS randomness for askpass keys and nonces. Already in the lockfile through `ulid`.
-getrandom = "=0.3.4"
+getrandom = "=0.4.3"
 # Reading users' site recipes (~/.pitcrew/sites/*.toml) strictly, key by key. The version
 # stream I's pitcrew-cli already uses (MIT OR Apache-2.0); parsing only.
 toml_edit = { version = "=0.25.15", default-features = false, features = ["parse"] }
@@ -45,8 +51,11 @@ toml_edit = { version = "=0.25.15", default-features = false, features = ["parse
 rustix = { version = "=1.1.5", features = ["event", "fs", "process", "stdio"] }
 
 [target.'cfg(windows)'.dependencies]
-# Job Objects for ssh (src/job.rs), the askpass pipe's security descriptor
-# (src/pipe_security.rs) and the pipe client's security flags. The version tokio already uses.
+# The askpass pipe's security descriptor (src/pipe_security.rs): the one copy of that Win32 code,
+# shared with the API's and pitcrew-ptyd's pipes.
+pitcrew-trust.workspace = true
+# Job Objects for ssh (src/job.rs) and the pipe client's security flags. The version tokio
+# already uses.
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",

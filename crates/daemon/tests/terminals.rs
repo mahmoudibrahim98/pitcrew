@@ -9,8 +9,9 @@
 //!   server and its panes inherit the daemon's environment); the test ends by checking through
 //!   `/proc` that nothing with its mark is left and, however it ends, kills its servers (`tmux -S
 //!   <its socket> kill-server`) and anything still marked.
-//! - **Without tmux** (a refused socket directory, as every other test's daemon has): the daemon
-//!   serves as before, with no terminal runtime, and the session commands' checks hold.
+//! - **Without tmux** (a refused socket directory, as every other test's daemon has, and no
+//!   pitcrew-ptyd where it is looked for): the daemon serves with no terminal runtime, and the
+//!   session commands' checks hold. The PTY runtime's tests are in `tests/pty.rs`.
 
 #![allow(clippy::unwrap_used)]
 
@@ -87,14 +88,27 @@ fn without_tmux_the_daemon_serves_with_no_terminal_runtime() {
 
     let info = daemon.get("/v1/host/info", None).json();
     assert_eq!(info["roles"], json!(["hub", "runner"]));
-    assert_eq!(info["capabilities"], json!(["watch"]), "no tmux: {info}");
+    assert_eq!(
+        info["capabilities"],
+        json!(["watch"]),
+        "no tmux, no pty: {info}"
+    );
     let logs = daemon.stderr();
+    let why = logs
+        .lines()
+        .find(|l| l.contains("the runner's terminals cannot use tmux or pitcrew-ptyd"))
+        .unwrap_or_else(|| panic!("no reason in the log:\n{logs}"));
+    assert!(why.contains("WARN"), "{why}");
+    // Where pitcrew-ptyd was looked for (here where the test helper put none).
+    assert!(
+        why.contains(&format!(
+            "pitcrew-ptyd is not installed at {}",
+            common::missing_ptyd(&state).display()
+        )),
+        "{why}"
+    );
+    assert!(logs.contains("--ptyd"), "the override is warned: {logs}");
     if cfg!(unix) {
-        let why = logs
-            .lines()
-            .find(|l| l.contains("the runner's terminals cannot use tmux"))
-            .unwrap_or_else(|| panic!("no reason in the log:\n{logs}"));
-        assert!(why.contains("WARN"), "{why}");
         // The refused socket's directory, which was not made.
         assert!(why.contains("cannot create"), "{why}");
         assert!(!refused_tmux_socket(&state).parent().unwrap().exists());
@@ -103,10 +117,7 @@ fn without_tmux_the_daemon_serves_with_no_terminal_runtime() {
             "the override is warned: {logs}"
         );
     } else {
-        assert!(
-            logs.contains("the runner's terminals have no runtime on this system yet"),
-            "{logs}"
-        );
+        assert!(why.contains("tmux runs on Unix-like systems only"), "{why}");
     }
 
     // The demo's session of this machine has no terminal; starting one fails as unavailable.

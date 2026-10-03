@@ -24,6 +24,12 @@ looks for it next to the running executable (`pty::launch::beside_current_exe`),
 `PtyOptions::ptyd` says, never on `PATH`. Stream P bundles it with `pitcrewd`, in the same
 directory. It must be built with the same `PROTOCOL` as the daemon it ships with.
 
+Since it starts every agent, it must not be a planted binary: it passes
+`pitcrew_trust::check_trusted` (`crates/trust`), the check the desktop makes of `pitcrewd` (on
+Unix its owner and mode, the file it resolves to and both folders; on Windows no
+`Zone.Identifier`). The daemon checks it when it chooses its terminals' runtime (one that fails
+is warned about and not used), and the runtime checks it again just before it starts it.
+
 ## The protocol
 
 Version 1, its own (`pitcrew_runtime::pty::proto`), apart from API v1: length-prefixed frames
@@ -121,9 +127,11 @@ out of order. `start` takes argv, never a shell command line.
   emulation (above), and the answers ptyd writes back are fixed or numbers.
 - **The same user is not a boundary.** Programs run as the user and can reach the endpoint as
   the user can, as with tmux's socket.
-- **`unsafe`.** None in this crate (`forbid(unsafe_code)`). The Win32 calls it needs (the pipe's
-  descriptor, the client's token, Job Objects) are in `pitcrew_runtime::pty::windows`, the one
-  module of either crate that allows `unsafe`, with a `SAFETY` comment on every block.
+- **`unsafe`.** None in this crate (`forbid(unsafe_code)`). The Win32 calls it needs are in
+  `pitcrew_runtime::pty::windows` (the client's process and token, Job Objects), the one module
+  of either crate that allows `unsafe`, with a `SAFETY` comment on every block, and, for the
+  pipe's descriptor, owner, DACL and label, in `pitcrew_trust::windows` (`crates/trust`), the one
+  copy of that code behind every PitCrew pipe, which `pty::windows` re-exports.
 
 ## Running
 
@@ -154,10 +162,12 @@ out of order. `start` takes argv, never a shell command line.
 the listener's own options: DACL, owner, label, a second instance refused, a client through
 the network redirector (`\\127.0.0.1\pipe\…`) refused, and the identity comparison.
 `pitcrew-runtime`'s `pty::windows` tests cover the pipe's DACL, owner and label, the client's
-pid, user and token (by impersonation), a pipe labelled low, label parsing, and Job Objects (a
-grandchild with its own console, started by `Start-Process`, is in the job and ends with it);
-its `pty` tests cover the pipe-name rule and a client refusing a pipe at another integrity
-level.
+pid, user and token (by impersonation), a pipe labelled low, ptyd's descriptor, the endpoint's
+lock file, and Job Objects (a grandchild with its own console, started by `Start-Process`, is in
+the job and ends with it); its `pty` tests cover the pipe-name rule, a client refusing a pipe at
+another integrity level, and a ptyd that fails the trust check refused before it runs.
+`pitcrew-trust`'s tests cover the shared pipe-security code (descriptors read back through
+both ends of a pipe, SIDs from text) and label parsing.
 
 The integration tests start the real binary through `PtyRuntime`, each test with its own
 endpoint (a new 0700 directory in `/tmp`, or a pipe with a random name; never the default), and

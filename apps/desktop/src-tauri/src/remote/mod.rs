@@ -108,6 +108,9 @@ pub struct RemoteOptions {
     /// The ssh program: `ssh` on `PATH` unless the settings name one; or why the configured one
     /// is not used.
     pub ssh: Result<PathBuf, String>,
+    /// wsl.exe: `%SystemRoot%\System32\wsl.exe` ([`pitcrew_remote::wsl::default_program`]);
+    /// tests name a stand-in.
+    pub wsl: PathBuf,
     /// `pitcrew-askpass`, or why it is missing.
     pub askpass: Result<PathBuf, String>,
     /// The helper binaries.
@@ -156,6 +159,7 @@ impl RemoteOptions {
     ) -> Self {
         Self {
             ssh,
+            wsl: pitcrew_remote::wsl::default_program(),
             askpass,
             helpers,
             runtime_dir: None,
@@ -269,6 +273,7 @@ pub type Progress = Arc<dyn Fn(&AddProgress) + Send + Sync>;
 /// What a plan holds until it is carried out.
 struct Plan {
     host: String,
+    wsl: Option<crate::registry::WslTarget>,
     launcher: LauncherKind,
     target: Target,
     helper: HelperRef,
@@ -467,8 +472,25 @@ impl Remotes {
     /// `invalid` for a host ssh would not take; `unreachable` when ssh fails (with its reason);
     /// `internal` without `pitcrew-askpass`.
     pub async fn probe(&self, host: &str) -> Result<RemoteProbe, GatewayError> {
-        check_host(host)?;
-        let ssh = self.core.checked_ssh().await?;
+        self.probe_target(host, None).await
+    }
+
+    /// Lists local distributions without reading SSH configuration.
+    pub async fn wsl_distros(&self) -> Result<pitcrew_remote::WslDistros, GatewayError> {
+        pitcrew_remote::Wsl::new(&self.core.options.wsl)
+            .distros()
+            .await
+            .map_err(|e| GatewayError::unreachable(tidy(&e.to_string())))
+    }
+
+    /// Probes a transport selected by the caller.
+    pub async fn probe_target(
+        &self,
+        host: &str,
+        target: Option<&crate::registry::WslTarget>,
+    ) -> Result<RemoteProbe, GatewayError> {
+        let (host, ssh) = self.core.transport(host, target).await?;
+        let host = host.as_str();
         let probe = ssh
             .probe(host)
             .await
@@ -477,11 +499,16 @@ impl Remotes {
             Ok(target) => helper_status(&target).await,
             Err(_) => None,
         };
-        let slurm = probe.slurm.sbatch.as_ref().map(|version| SlurmFound {
-            version: tidy(version),
-            default_partition: probe.slurm.default_partition.clone(),
-            srun_overlap: probe.slurm.srun_overlap,
-        });
+        let slurm = probe
+            .slurm
+            .sbatch
+            .as_ref()
+            .filter(|_| target.is_none())
+            .map(|version| SlurmFound {
+                version: tidy(version),
+                default_partition: probe.slurm.default_partition.clone(),
+                srun_overlap: probe.slurm.srun_overlap,
+            });
         let tmux = probe.tmux_version.as_ref().map(|version| TmuxFound {
             version: tidy(version),
         });
@@ -502,8 +529,10 @@ impl Remotes {
     /// `invalid` for a request, a machine or a job PitCrew refuses (with why), or a missing
     /// helper; `unreachable` when ssh fails.
     pub async fn plan(&self, req: RemotePlanRequest) -> Result<RemotePlan, GatewayError> {
-        let host = req.host.clone();
-        check_host(&host)?;
+        if req.target.is_some() && req.launcher == LauncherKind::Slurm {
+            return Err(GatewayError::invalid("WSL supports direct and tmux only"));
+        }
+        let (host, ssh) = self.core.transport(&req.host, req.target.as_ref()).await?;
         if req.launcher != LauncherKind::Slurm && (req.site.is_some() || req.job.is_some()) {
             return Err(GatewayError::invalid(
                 "a site and job options are for the slurm launcher only",
@@ -512,7 +541,6 @@ impl Remotes {
         if let Some(site) = &req.site {
             plan::check_site_name(site)?;
         }
-        let ssh = self.core.checked_ssh().await?;
         let probe = ssh
             .probe(&host)
             .await
@@ -592,7 +620,14 @@ impl Remotes {
         let steps = Steps {
             deploy,
             launch,
-            connect: format!("Connect to the helper on {host} through SSH"),
+            connect: format!(
+                "Connect to the helper on {host} through {}",
+                if req.target.is_some() {
+                    "WSL stdio"
+                } else {
+                    "SSH"
+                }
+            ),
             pair: "Pair: keep its device token in this computer's keychain".to_owned(),
         };
         let id = new_id();
@@ -603,6 +638,7 @@ impl Remotes {
         };
         let plan = Plan {
             host: host.clone(),
+            wsl: req.target,
             launcher: req.launcher,
             target,
             helper,
@@ -724,7 +760,9 @@ impl Remotes {
             ));
         };
         if stop_helper {
-            core.ssh_check().ask().await;
+            if remote.target.is_none() {
+                core.ssh_check().ask().await;
+            }
             let target = core.target_of(remote)?;
             let stopped = launcher_of(remote.launcher)
                 .stop(&target)
@@ -770,7 +808,7 @@ impl Remotes {
         }
         let core = self.core.clone();
         self.core.runtime.spawn(async move {
-            if core.programs().is_ok() {
+            if saved.iter().any(|(_, remote)| remote.target.is_none()) && core.programs().is_ok() {
                 core.ssh_check().ask().await;
             }
             for (id, remote) in saved {
@@ -872,6 +910,7 @@ impl Remotes {
     ) -> Result<GatewayWorkspace, GatewayError> {
         let Plan {
             host,
+            wsl,
             launcher,
             target,
             helper,
@@ -909,6 +948,7 @@ impl Remotes {
             Err(e) => return Err(with_note(e, self.undo(&target, undo).await)),
         };
         let record = RemoteConnection {
+            target: wsl,
             host: host.clone(),
             launcher,
             root: target.layout().root().to_owned(),
@@ -1371,6 +1411,54 @@ impl Core {
         Ok((program, askpass))
     }
 
+    /// The WSL transport: wsl.exe, without SSH configuration, prompts or host keys.
+    fn wsl(&self) -> Ssh {
+        let mut transport = Ssh::wsl(&self.options.wsl);
+        if let Some(dir) = &self.options.runtime_dir {
+            transport = transport.with_runtime_dir(dir);
+        }
+        transport
+    }
+
+    /// The machine a probe or plan is about, and how to reach it: a registered WSL2 distro
+    /// (started first if it is stopped, within [`pitcrew_remote::wsl::START_LIMITS`], so the
+    /// probe's 30 s are not spent on WSL's cold start), or an ssh host.
+    async fn transport(
+        &self,
+        host: &str,
+        target: Option<&crate::registry::WslTarget>,
+    ) -> Result<(String, Ssh), GatewayError> {
+        if let Some(crate::registry::WslTarget::Wsl { distro }) = target {
+            if !host.is_empty() {
+                return Err(GatewayError::invalid("choose SSH or WSL, not both"));
+            }
+            let list = pitcrew_remote::Wsl::new(&self.options.wsl)
+                .distros()
+                .await
+                .map_err(|e| GatewayError::unreachable(tidy(&e.to_string())))?;
+            let found = list
+                .distros
+                .iter()
+                .find(|d| d.name == *distro)
+                .ok_or_else(|| GatewayError::invalid("the WSL distribution is not registered"))?;
+            if found.version != 2 {
+                return Err(GatewayError::invalid(
+                    "WSL1 is unsupported; select a WSL2 distribution",
+                ));
+            }
+            let wsl = self.wsl();
+            if !found.running {
+                wsl.start_wsl(distro)
+                    .await
+                    .map_err(|e| ssh_error(distro, &e))?;
+            }
+            Ok((distro.clone(), wsl))
+        } else {
+            check_host(host)?;
+            Ok((host.to_owned(), self.checked_ssh().await?))
+        }
+    }
+
     /// The ssh every remote call uses: the person's OpenSSH, with only the environment it needs.
     /// Prompts go through `pitcrew-askpass` to the hub, behind the version gate, only once
     /// `ssh -V` said 8.4 or newer; otherwise ssh runs in `BatchMode` and never asks ([`gate`]).
@@ -1458,8 +1546,24 @@ impl Core {
                 ))
             })?;
         let layout = Layout::at(&remote.root).map_err(|e| helper_error(&remote.host, &e))?;
-        Target::with_layout(self.ssh()?, &remote.host, layout, platform)
-            .map_err(|e| helper_error(&remote.host, &e))
+        Target::with_layout(
+            if let Some(crate::registry::WslTarget::Wsl { distro }) = &remote.target {
+                if *distro != remote.host
+                    || remote.launcher == LauncherKind::Slurm
+                    || remote.last_hop.is_some()
+                    || platform == Platform::MacOs
+                {
+                    return Err(GatewayError::invalid("invalid saved WSL target"));
+                }
+                self.wsl()
+            } else {
+                self.ssh()?
+            },
+            &remote.host,
+            layout,
+            platform,
+        )
+        .map_err(|e| helper_error(&remote.host, &e))
     }
 
     /// A tunnel for a saved remote workspace (not connected yet).
@@ -1694,6 +1798,7 @@ impl Core {
             .unwrap_or_else(|| GatewayWorkspace {
                 id: id.to_owned(),
                 name,
+                host: None,
                 kind: WorkspaceKind::Remote,
                 host: Some(host.to_owned()),
                 state: WorkspaceState::Ready,

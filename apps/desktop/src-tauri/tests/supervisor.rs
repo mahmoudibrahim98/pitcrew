@@ -52,11 +52,42 @@ const HEALTHY: &str = r#"trap 'echo "term $$" >> "$DIR/log"; exit 0' TERM
     echo "pitcrewd listening on $DIR/state/run/pitcrewd.sock"
     while true; do sleep 0.05; done"#;
 
-/// Gets ready, then stops on its own.
-const CRASHES: &str = r#"echo "pitcrewd listening on $DIR/state/run/pitcrewd.sock"
-    sleep 0.2
-    echo "the store is corrupt" >&2
-    exit 3"#;
+/// A compiled stand-in logs its own start and exit times, excluding the run's duration
+/// from backoff measurements. The first run is deliberately slower than the later ones.
+fn crashing_pitcrewd(dir: &Path) -> PathBuf {
+    let source = dir.join("fake.rs");
+    std::fs::write(&source, r#"
+use std::{fs::OpenOptions, io::Write, time::{Duration, SystemTime, UNIX_EPOCH}};
+fn main() {
+    let exe = std::env::current_exe().unwrap();
+    let dir = exe.parent().unwrap();
+    if std::env::args().any(|arg| arg == "token") {
+        println!("{}", dir.join("device.token").display());
+        return;
+    }
+    let log = dir.join("log");
+    let first = !log.exists();
+    let mut file = OpenOptions::new().create(true).append(true).open(log).unwrap();
+    writeln!(file, "start {}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()).unwrap();
+    println!("pitcrewd listening on {}/state/run/pitcrewd.sock", dir.display());
+    std::thread::sleep(Duration::from_millis(if first { 600 } else { 200 }));
+    eprintln!("the store is corrupt");
+    writeln!(file, "exit {}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()).unwrap();
+    std::process::exit(3);
+}
+"#).unwrap();
+    let program = dir.join("pitcrewd");
+    assert!(
+        std::process::Command::new("rustc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&program)
+            .status()
+            .unwrap()
+            .success()
+    );
+    program
+}
 
 /// Never gets ready.
 const FAILS_AT_START: &str = r#"echo "pitcrewd: another pitcrewd is already running" >&2
@@ -166,7 +197,7 @@ fn it_starts_the_daemon_and_stops_it_when_the_app_quits() {
 #[test]
 fn it_restarts_with_a_growing_backoff_then_gives_up() {
     let tmp = tempfile::tempdir().unwrap();
-    let program = fake_pitcrewd(tmp.path(), CRASHES);
+    let program = crashing_pitcrewd(tmp.path());
     let rt = runtime();
     rt.block_on(async {
         let supervisor = Supervisor::start(options(Ok(program), tmp.path()), &rt.handle().clone());
@@ -185,11 +216,25 @@ fn it_restarts_with_a_growing_backoff_then_gives_up() {
             state.changed().await.unwrap();
         };
         assert_eq!(readies.len(), 4, "four runs before giving up");
-        // Each run lasts about 0.2 s; the waits between them are 0.1, 0.2, then 0.4 s.
-        let gaps: Vec<Duration> = readies.windows(2).map(|w| w[1] - w[0]).collect();
+        let times: Vec<u128> = log(tmp.path())
+            .iter()
+            .map(|line| line.split_once(' ').unwrap().1.parse().unwrap())
+            .collect();
+        assert_eq!(times.len(), 8, "four starts and exits");
+        let waits: Vec<Duration> = (0..3)
+            .map(|i| {
+                Duration::from_nanos(u64::try_from(times[2 * i + 2] - times[2 * i + 1]).unwrap())
+            })
+            .collect();
+        for (wait, expected) in waits.iter().zip([100, 200, 400]) {
+            assert!(
+                *wait >= Duration::from_millis(expected),
+                "backoff: {waits:?}"
+            );
+        }
         assert!(
-            gaps[2] >= gaps[0] + Duration::from_millis(200),
-            "the backoff grows: {gaps:?}"
+            waits.windows(2).all(|pair| pair[1] > pair[0]),
+            "the backoff grows: {waits:?}"
         );
         assert!(given_up.contains("4 times in a row"), "{given_up}");
         assert!(given_up.contains("exit status: 3"), "{given_up}");

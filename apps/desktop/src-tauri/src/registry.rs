@@ -113,10 +113,21 @@ pub struct JobRequest {
     pub gpus: Option<String>,
 }
 
+/// A local distribution, bound into a plan and persisted for reconnect.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum WslTarget {
+    /// WSL2; WSL1 is rejected before probing.
+    Wsl { distro: String },
+}
+
 /// How to reach a remote workspace's helper. Nothing here is a secret.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteConnection {
+    /// Local WSL target; absent for existing SSH entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<WslTarget>,
     /// The host, as given to ssh (a `Host` of the person's ssh config, or a name they typed).
     pub host: String,
     /// How the helper was started.
@@ -173,6 +184,9 @@ pub struct GatewayWorkspace {
     pub id: String,
     /// Its name.
     pub name: String,
+    /// WSL distribution, shown as `wsl:<distro>`; absent for older workspace entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
     /// `local` or `remote`.
     pub kind: WorkspaceKind,
     /// SSH host from our connection records, never the hub; absent for local workspaces.
@@ -464,7 +478,9 @@ impl Registry {
         if let Some(at) = held {
             let old = &inner.entries[at].record;
             let same_machine = match &old.connection {
-                Connection::Remote(old) => old.host == new.host && old.root == new.root,
+                Connection::Remote(old) => {
+                    old.host == new.host && old.root == new.root && old.target == new.target
+                }
                 Connection::Local => false,
             };
             if old.kind == WorkspaceKind::Local || !same_machine {
@@ -784,6 +800,13 @@ fn list_of(entries: &[Entry]) -> Vec<GatewayWorkspace> {
         .map(|e| GatewayWorkspace {
             id: e.record.id.clone(),
             name: e.record.name.clone(),
+            host: match &e.record.connection {
+                Connection::Remote(remote) => remote
+                    .target
+                    .as_ref()
+                    .map(|WslTarget::Wsl { distro }| format!("wsl:{distro}")),
+                _ => None,
+            },
             kind: e.record.kind,
             host: match &e.record.connection {
                 Connection::Remote(connection) => Some(connection.host.clone()),
@@ -968,6 +991,7 @@ mod tests {
             name: "Cluster".into(),
             kind: WorkspaceKind::Remote,
             connection: Connection::Remote(Box::new(RemoteConnection {
+                target: None,
                 host: "hpc-login".into(),
                 launcher: LauncherKind::Slurm,
                 root: "/home/sam/.pitcrew".into(),

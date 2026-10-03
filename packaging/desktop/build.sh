@@ -12,7 +12,7 @@
 #   packaging/desktop/build.sh [--dist DIR] [--stage DIR] [--out DIR] [--bundles LIST]
 #                              [--stage-only] TARGET
 #
-#   TARGET        x86_64-unknown-linux-gnu (deb, AppImage), universal-apple-darwin (app, DMG) or
+#   TARGET        x86_64-unknown-linux-gnu (deb, rpm, AppImage), universal-apple-darwin (app, DMG) or
 #                 x86_64-pc-windows-msvc (NSIS). Run it on that OS.
 #   --dist        build-release.sh's output, from the same commit (default: dist). It holds
 #                 pitcrewd, pitcrew-ptyd and pitcrew-askpass for TARGET's OS (on Linux the static
@@ -22,7 +22,7 @@
 #                 the repository: Tauri's configuration names them relative to
 #                 apps/desktop/src-tauri.
 #   --out         Where the installers are copied (default: dist/desktop).
-#   --bundles     Tauri's bundle formats, comma-separated (default: deb,appimage | app,dmg | nsis).
+#   --bundles     Tauri's bundle formats (default: deb,rpm,appimage | app,dmg | nsis).
 #   --stage-only  Stage the inputs and write the configuration, then stop (no Tauri, no UI).
 #
 # Relative paths are taken from the repository's root, as in build-release.sh. Needs the UI built
@@ -62,7 +62,7 @@ fi
 
 # The sidecars' own target in DIST, their suffix, and the OS's installers.
 case "$target" in
-  x86_64-unknown-linux-gnu) from=x86_64-unknown-linux-musl exe="" default_bundles=deb,appimage ;;
+  x86_64-unknown-linux-gnu) from=x86_64-unknown-linux-musl exe="" default_bundles=deb,rpm,appimage ;;
   universal-apple-darwin) from=universal-apple-darwin exe="" default_bundles=app,dmg ;;
   x86_64-pc-windows-msvc) from=x86_64-pc-windows-msvc exe=.exe default_bundles=nsis ;;
   *) echo "unsupported desktop target: $target" >&2; exit 2 ;;
@@ -112,9 +112,18 @@ case "$stage" in
 esac
 
 # Sidecars, named as Tauri's externalBin wants them (<name>-<target>[.exe]); it drops the target.
+# A universal macOS build compiles the app once per architecture, and tauri-build checks for the
+# sidecars under each architecture's name too; the universal binary serves both. Only the
+# universal-apple-darwin copy goes into the bundle.
+names=("$target")
+if [ "$target" = universal-apple-darwin ]; then
+  names+=(aarch64-apple-darwin x86_64-apple-darwin)
+fi
 for bin in "${sidecars[@]}"; do
-  cp "$dist/$bin-$from$exe" "$stage/bin/$bin-$target$exe"
-  chmod 0755 "$stage/bin/$bin-$target$exe"
+  for name in "${names[@]}"; do
+    cp "$dist/$bin-$from$exe" "$stage/bin/$bin-$name$exe"
+    chmod 0755 "$stage/bin/$bin-$name$exe"
+  done
 done
 
 # The helpers are data here: uploaded to remote machines, never run on this one.
@@ -162,7 +171,8 @@ cat >"$stage/tauri.bundle.json" <<EOF
     ],
     "resources": { "$rel/helpers": "helpers" },
     "linux": {
-      "deb": { "desktopTemplate": "../../../packaging/desktop/pitcrew.desktop.hbs" }
+      "deb": { "desktopTemplate": "../../../packaging/desktop/pitcrew.desktop.hbs" },
+      "rpm": { "desktopTemplate": "../../../packaging/desktop/pitcrew.desktop.hbs" }
     },
     "windows": {
       "nsis": { "installerHooks": "../../../packaging/desktop/installer-hooks.nsh" }
@@ -194,12 +204,53 @@ read -r -a tauri <<<"${TAURI_CLI:-cargo tauri}"
     --features custom-protocol --bundles "$bundles" --config "$rel/tauri.bundle.json"
 )
 
+# Tauri's AppImage carries some files (the bundled libraries' copyright notices) with mode 0777,
+# apparently copied from symlinks. Mounted, the image is read-only, but extracted
+# (--appimage-extract) they would be writable by anyone, and check.sh refuses them. So the image's
+# file system is rebuilt with only the owner able to write, everything root's as before, the same
+# compression and block size; the runtime in front of it is kept byte for byte.
+fix_appimage_modes() { # FILE
+  local image=$1 offset work info comp block tool
+  for tool in unsquashfs mksquashfs; do
+    command -v "$tool" >/dev/null 2>&1 || {
+      echo "::error::$tool is needed to fix the AppImage's modes: install squashfs-tools" >&2
+      exit 1
+    }
+  done
+  chmod 0755 "$image"
+  offset=$("$image" --appimage-offset)
+  # The image's own modes, as check.sh reads them (links are judged by what they lead to).
+  if ! unsquashfs -lln -o "$offset" "$image" |
+    awk '$1 !~ /^l/ && (substr($1, 6, 1) == "w" || substr($1, 9, 1) == "w") { found = 1 } END { exit !found }'; then
+    return
+  fi
+  work=$(mktemp -d)
+  # Extracted with no umask, so every other mode comes back exactly; then only the writes go.
+  (umask 000 && unsquashfs -no-xattrs -o "$offset" -d "$work/root" "$image" >/dev/null)
+  chmod -R go-w "$work/root" # symlinks met on the way are left alone, not followed
+  info=$(unsquashfs -s -o "$offset" "$image")
+  comp=$(printf '%s\n' "$info" | sed -nE 's/^Compression ([a-z0-9]+).*/\1/p')
+  block=$(printf '%s\n' "$info" | sed -nE 's/^Block size ([0-9]+).*/\1/p')
+  if [ -z "$comp" ] || [ -z "$block" ]; then
+    echo "::error::cannot read the AppImage's compression and block size" >&2
+    exit 1
+  fi
+  head -c "$offset" "$image" >"$work/image"
+  mksquashfs "$work/root" "$work/fs" -noappend -all-root -no-xattrs -comp "$comp" -b "$block" >/dev/null
+  cat "$work/fs" >>"$work/image"
+  chmod 0755 "$work/image"
+  mv "$work/image" "$image"
+  rm -rf "$work"
+  echo "rebuilt $(basename "$image"): nothing in it is writable by others"
+}
+
 mkdir -p "$out"
 found=0
-for f in "$bundle_dir"/deb/*.deb "$bundle_dir"/appimage/*.AppImage "$bundle_dir"/dmg/*.dmg \
+for f in "$bundle_dir"/deb/*.deb "$bundle_dir"/rpm/*.rpm "$bundle_dir"/appimage/*.AppImage "$bundle_dir"/dmg/*.dmg \
   "$bundle_dir"/nsis/*-setup.exe; do
   [ -f "$f" ] || continue
   cp "$f" "$out/"
+  case "$f" in *.AppImage) fix_appimage_modes "$out/$(basename "$f")" ;; esac
   echo "$out/$(basename "$f")"
   found=$((found + 1))
 done

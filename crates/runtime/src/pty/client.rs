@@ -385,7 +385,7 @@ async fn connect(
     expect_uid: Option<u32>,
 ) -> Result<tokio::net::UnixStream, ConnectError> {
     crate::tmux::socket::ensure_private(endpoint).map_err(ConnectError::Unsafe)?;
-    let stream = tokio::net::UnixStream::connect(endpoint)
+    let mut stream = tokio::net::UnixStream::connect(endpoint)
         .await
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
@@ -393,9 +393,37 @@ async fn connect(
             }
             _ => ConnectError::Failed(format!("cannot connect to {}: {e}", endpoint.display())),
         })?;
-    let peer = stream
-        .peer_cred()
-        .map_err(|e| ConnectError::Failed(format!("cannot check pitcrew-ptyd's user: {e}")))?;
+    check_peer(&mut stream, endpoint, expect_uid).await?;
+    Ok(stream)
+}
+
+#[cfg(unix)]
+async fn peer_error(stream: &mut tokio::net::UnixStream, error: std::io::Error) -> ConnectError {
+    use tokio::io::AsyncReadExt as _;
+    // Only the platform's ENOTCONN with confirmed EOF is an exiting peer. A credential
+    // failure on a live peer must never turn into permission to start another ptyd.
+    if error.raw_os_error() == Some(rustix::io::Errno::NOTCONN.raw_os_error()) {
+        let mut byte = [0];
+        if matches!(
+            tokio::time::timeout(Duration::from_millis(100), stream.read(&mut byte)).await,
+            Ok(Ok(0))
+        ) {
+            return ConnectError::Absent;
+        }
+    }
+    ConnectError::Failed(format!("cannot check pitcrew-ptyd's user: {error}"))
+}
+
+#[cfg(unix)]
+async fn check_peer(
+    stream: &mut tokio::net::UnixStream,
+    endpoint: &Path,
+    expect_uid: Option<u32>,
+) -> Result<(), ConnectError> {
+    let peer = match stream.peer_cred() {
+        Ok(peer) => peer,
+        Err(error) => return Err(peer_error(stream, error).await),
+    };
     let me = expect_uid.unwrap_or_else(|| rustix::process::getuid().as_raw());
     if peer.uid() != me {
         return Err(ConnectError::Unsafe(format!(
@@ -404,7 +432,50 @@ async fn connect(
             peer.uid()
         )));
     }
-    Ok(stream)
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod peer_tests {
+    use super::*;
+
+    #[test]
+    fn closed_peer_and_wrong_uid_remain_distinct() -> Result<(), Box<dyn std::error::Error>> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let (mut client, server) = tokio::net::UnixStream::pair()?;
+            let wrong = rustix::process::getuid().as_raw() + 1;
+            assert!(
+                matches!(check_peer(&mut client, Path::new("/synthetic/ptyd"), Some(wrong)).await,
+                Err(ConnectError::Unsafe(reason)) if reason.contains("served by uid"))
+            );
+            let not_connected =
+                || std::io::Error::from_raw_os_error(rustix::io::Errno::NOTCONN.raw_os_error());
+            assert!(
+                matches!(
+                    peer_error(&mut client, not_connected()).await,
+                    ConnectError::Failed(_)
+                ),
+                "a live peer with a credential error must be refused"
+            );
+            drop(server);
+            assert!(matches!(
+                peer_error(&mut client, not_connected()).await,
+                ConnectError::Absent
+            ));
+            assert!(matches!(
+                peer_error(
+                    &mut client,
+                    std::io::Error::from_raw_os_error(rustix::io::Errno::ACCESS.raw_os_error())
+                )
+                .await,
+                ConnectError::Failed(_)
+            ));
+            Ok::<_, Box<dyn std::error::Error>>(())
+        })
+    }
 }
 
 /// The pipe must be the current user's, at our integrity level: an elevated ptyd's pipe is

@@ -1,49 +1,38 @@
-//! Windows security and process control for the PTY runtime and pitcrew-ptyd: who owns a pipe,
-//! who is on its other end (user and integrity level), a pipe only the current user at the
-//! current integrity level can open, and Job Objects.
+//! Windows process control and peer checks for the PTY runtime and pitcrew-ptyd: who is on the
+//! other end of a pipe (its process's user, and its own token by impersonation), the descriptor of
+//! ptyd's pipe (the current user alone, at the current integrity level), Job Objects, and the
+//! lock file that gives one ptyd endpoint to one daemon.
+//!
+//! The current user, owners, DACLs, labels and descriptors are `pitcrew_trust::windows`, the one
+//! copy of that code behind every PitCrew pipe; they are re-exported here for pitcrew-ptyd.
 //!
 //! **This is the only `unsafe` code in pitcrew-runtime and pitcrew-ptyd.** The Win32 calls below
 //! have no safe binding in the dependency tree. Every function here is safe to call; each
 //! `unsafe` block says why it is sound. In general:
-//! - Every out-pointer passed to Win32 points at a live local of the right type, and every
-//!   buffer is passed with its true length.
-//! - A `TOKEN_USER` or `TOKEN_MANDATORY_LABEL` is read from a buffer `GetTokenInformation`
-//!   filled with exactly that class, aligned for it (`u64` storage). The SID it points to lies
-//!   inside that buffer, which outlives its use.
-//! - Memory Win32 allocates with `LocalAlloc` (strings, descriptors) is freed exactly once with
-//!   `LocalFree`, after its last use. Pointers into a descriptor (its owner, its DACL and the
-//!   DACL's entries) are used only while it lives.
-//! - A DACL entry is read as the structure its header's type names.
-//! - Handles we open are owned by `OwnedHandle` and closed exactly once. Handles we are given
-//!   are borrowed (`AsHandle`), so they stay open for the call.
-//! - A descriptor is never changed after creation and Win32 only reads it, so sharing it between
-//!   threads is sound.
+//! - Every out-pointer passed to Win32 points at a live local of the right type.
+//! - Handles we open are owned by `OwnedHandle` (or a `File`) and closed exactly once. Handles we
+//!   are given are borrowed (`AsHandle`), so they stay open for the call.
 //! - Impersonating a pipe's client is undone on the same thread before the function returns;
 //!   should that fail, the process aborts rather than go on as the client.
+//! - A file is locked and unlocked only through a handle we opened for synchronous I/O, so the
+//!   `OVERLAPPED` passed (for the offset) is not used after the call returns.
 
 #![allow(unsafe_code)]
 
-use std::ffi::c_void;
+use std::fs::File;
 use std::io;
 use std::os::windows::io::{AsHandle, AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+use std::path::Path;
 use std::ptr;
 
+use pitcrew_trust::windows::SecurityDescriptor;
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
-use windows_sys::Win32::Foundation::{HANDLE, LocalFree};
-use windows_sys::Win32::Security::Authorization::{
-    ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
-    SE_KERNEL_OBJECT,
+use windows_sys::Win32::Foundation::{ERROR_IO_PENDING, ERROR_LOCK_VIOLATION, HANDLE};
+use windows_sys::Win32::Security::{RevertToSelf, TOKEN_QUERY};
+use windows_sys::Win32::Storage::FileSystem::{
+    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, UnlockFileEx,
 };
-use windows_sys::Win32::Security::{
-    ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce,
-    GetSecurityDescriptorControl, GetTokenInformation, LABEL_SECURITY_INFORMATION,
-    OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
-    RevertToSelf, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR_CONTROL,
-    TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel,
-    TokenUser,
-};
-use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+use windows_sys::Win32::System::IO::OVERLAPPED;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
@@ -51,60 +40,18 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, ImpersonateNamedPipeClient};
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken,
+    GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken,
     PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
 };
 
-/// The integrity level of a normal, non-elevated process.
-pub const MEDIUM_INTEGRITY: u32 = 0x2000;
-/// The integrity level of an elevated process.
-pub const HIGH_INTEGRITY: u32 = 0x3000;
-/// The integrity level of a sandboxed (low) process.
-pub const LOW_INTEGRITY: u32 = 0x1000;
+pub use pitcrew_trust::windows::{
+    Ace, Dacl, HIGH_INTEGRITY, Identity, LOW_INTEGRITY, MEDIUM_INTEGRITY, current_identity,
+    current_user_sid, dacl, integrity_rid, is_elevated, label_integrity, owner_sid, parse_label,
+};
+
 /// What [`PipeSecurity`] grants its one user (`GA`, generic all), as a pipe's DACL reads it
 /// back: `FILE_ALL_ACCESS` (`FA` in SDDL).
-pub const PIPE_FULL_ACCESS: u32 = FILE_ALL_ACCESS;
-
-/// Who a process or a pipe's client is: its user's SID, and its integrity level (the RID of its
-/// mandatory label: [`MEDIUM_INTEGRITY`] for a normal process, [`HIGH_INTEGRITY`] elevated).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Identity {
-    /// The user's SID, e.g. `S-1-5-21-…`.
-    pub user: String,
-    /// The integrity level.
-    pub integrity: u32,
-}
-
-/// The current user's SID, e.g. `S-1-5-21-…`.
-///
-/// # Errors
-///
-/// If our own process token cannot be read.
-pub fn current_user_sid() -> io::Result<String> {
-    current_identity().map(|identity| identity.user)
-}
-
-/// This process's user and integrity level.
-///
-/// # Errors
-///
-/// If our own process token cannot be read.
-pub fn current_identity() -> io::Result<Identity> {
-    let mut token: HANDLE = ptr::null_mut();
-    // SAFETY: `GetCurrentProcess` returns a pseudo-handle that is always valid and needs no
-    // closing; `token` is a valid out-pointer.
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `token` was just opened, and nothing else owns it.
-    let token = unsafe { OwnedHandle::from_raw_handle(token) };
-    token_identity(&token)
-}
-
-/// True if this process runs elevated (at high integrity or above).
-pub fn is_elevated() -> bool {
-    current_identity().is_ok_and(|identity| identity.integrity >= HIGH_INTEGRITY)
-}
+pub const PIPE_FULL_ACCESS: u32 = pitcrew_trust::windows::FILE_ALL_ACCESS;
 
 /// The user and integrity level of the client on the other end of a server's pipe instance,
 /// from the client's own token: the server impersonates it (at the identification level the
@@ -136,24 +83,7 @@ pub fn pipe_client_identity(pipe: &impl AsHandle) -> io::Result<Identity> {
     }
     // SAFETY: `token` was just opened, and nothing else owns it.
     let token = unsafe { OwnedHandle::from_raw_handle(token) };
-    token_identity(&token)
-}
-
-fn token_identity(token: &OwnedHandle) -> io::Result<Identity> {
-    let user = token_sid(token, TokenUser)?;
-    let label = token_sid(token, TokenIntegrityLevel)?;
-    let integrity = integrity_rid(&label).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{label} is not an integrity level"),
-        )
-    })?;
-    Ok(Identity { user, integrity })
-}
-
-/// The integrity level an integrity SID (`S-1-16-<level>`) names.
-pub fn integrity_rid(sid: &str) -> Option<u32> {
-    sid.strip_prefix("S-1-16-")?.parse().ok()
+    pitcrew_trust::windows::token_identity(&token)
 }
 
 /// The SID of the user of the process with id `pid`.
@@ -176,7 +106,7 @@ pub fn process_user_sid(pid: u32) -> io::Result<String> {
     }
     // SAFETY: `token` was just opened, and nothing else owns it.
     let token = unsafe { OwnedHandle::from_raw_handle(token) };
-    token_sid(&token, TokenUser)
+    pitcrew_trust::windows::token_user_sid(&token)
 }
 
 /// The process id of the client on the other end of a server's pipe instance.
@@ -194,327 +124,10 @@ pub fn pipe_client_pid(pipe: &impl AsHandle) -> io::Result<u32> {
     Ok(pid)
 }
 
-/// A SID a token holds, as a string: its user's (`TokenUser`) or its integrity label's
-/// (`TokenIntegrityLevel`). Any other class is refused.
-fn token_sid(token: &OwnedHandle, class: TOKEN_INFORMATION_CLASS) -> io::Result<String> {
-    if class != TokenUser && class != TokenIntegrityLevel {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "not a SID class",
-        ));
-    }
-    let mut len = 0u32;
-    // SAFETY: a size query: null buffer, zero length, valid length out-pointer. It fails with
-    // ERROR_INSUFFICIENT_BUFFER and sets `len`.
-    unsafe { GetTokenInformation(token.as_raw_handle(), class, ptr::null_mut(), 0, &mut len) };
-    if len == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let mut buffer = vec![0u64; (len as usize).div_ceil(size_of::<u64>())];
-    // SAFETY: `buffer` holds at least `len` bytes and is aligned for `TOKEN_USER` and
-    // `TOKEN_MANDATORY_LABEL` (both hold pointers).
-    let ok = unsafe {
-        GetTokenInformation(
-            token.as_raw_handle(),
-            class,
-            buffer.as_mut_ptr().cast::<c_void>(),
-            len,
-            &mut len,
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let sid: PSID = if class == TokenUser {
-        // SAFETY: filled by the call above with the `TokenUser` class, i.e. a `TOKEN_USER`.
-        unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid }
-    } else {
-        // SAFETY: filled by the call above with the `TokenIntegrityLevel` class, i.e. a
-        // `TOKEN_MANDATORY_LABEL`.
-        unsafe { (*buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()).Label.Sid }
-    };
-    if sid.is_null() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "the token has no such SID",
-        ));
-    }
-    sid_string(sid)
-}
-
-/// A SID as a string.
-fn sid_string(sid: PSID) -> io::Result<String> {
-    let mut wide: *mut u16 = ptr::null_mut();
-    // SAFETY: the callers pass a SID that stays alive for this call; `wide` is a valid
-    // out-pointer.
-    if unsafe { ConvertSidToStringSidW(sid, &mut wide) } == 0 || wide.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `wide` is a NUL-terminated `LocalAlloc` string, not used afterwards.
-    Ok(unsafe { take_local_string(wide) })
-}
-
-/// The SID of a kernel object's owner, such as a pipe's, read through any handle to it opened
-/// with `READ_CONTROL` (a pipe client opened for reading has it).
-///
-/// A pipe's owner is its creator's user, or whoever its descriptor names; naming another user
-/// takes the restore privilege. So another user's pipe cannot claim the current user as owner.
-///
-/// # Errors
-///
-/// If the owner cannot be read.
-pub fn owner_sid(object: &impl AsHandle) -> io::Result<String> {
-    let mut owner: PSID = ptr::null_mut();
-    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-    // SAFETY: the handle is borrowed from a live object; `owner` and `descriptor` are valid
-    // out-pointers and the unused ones are null, as allowed. `owner` points into `descriptor`,
-    // freed below after the last use of `owner`.
-    let status = unsafe {
-        GetSecurityInfo(
-            object.as_handle().as_raw_handle(),
-            SE_KERNEL_OBJECT,
-            OWNER_SECURITY_INFORMATION,
-            &mut owner,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            &mut descriptor,
-        )
-    };
-    if status != 0 {
-        return Err(io::Error::from_raw_os_error(
-            i32::try_from(status).unwrap_or(-1),
-        ));
-    }
-    let sid = if owner.is_null() {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "the object has no owner",
-        ))
-    } else {
-        sid_string(owner)
-    };
-    // SAFETY: allocated by `GetSecurityInfo`, freed once, after the last use of `owner`.
-    unsafe {
-        LocalFree(descriptor);
-    }
-    sid
-}
-
-/// A kernel object's DACL, read part by part rather than as SDDL text: SDDL writes some SIDs as
-/// aliases (the built-in Administrator as `LA`, say), so comparing its text with a SID string is
-/// wrong. Each SID here is in its full form (`S-1-5-21-…`), which names one SID exactly.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Dacl {
-    /// Protected: it inherits no entries from a parent (`SE_DACL_PROTECTED`, `P` in SDDL).
-    pub protected: bool,
-    /// Its entries, in order.
-    pub entries: Vec<Ace>,
-}
-
-/// One entry of a [`Dacl`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Ace {
-    /// Allows the access in `mask` to `sid` (`ACCESS_ALLOWED_ACE_TYPE`).
-    Allow {
-        /// The SID, e.g. `S-1-5-21-…`.
-        sid: String,
-        /// The access mask, as stored (generic rights read back mapped, e.g. `FILE_ALL_ACCESS`).
-        mask: u32,
-    },
-    /// Denies the access in `mask` to `sid` (`ACCESS_DENIED_ACE_TYPE`).
-    Deny {
-        /// The SID.
-        sid: String,
-        /// The access mask, as stored.
-        mask: u32,
-    },
-    /// Any other kind of entry, by its type number.
-    Other(u8),
-}
-
-// From `Win32_System_SystemServices`, a feature needed for nothing else.
-const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
-const ACCESS_DENIED_ACE_TYPE: u8 = 1;
-
-/// The DACL of a kernel object (such as a pipe), read through any handle opened with
-/// `READ_CONTROL`: for checks and tests.
-///
-/// # Errors
-///
-/// If it cannot be read, or the object has no DACL at all (which would let anyone in).
-pub fn dacl(object: &impl AsHandle) -> io::Result<Dacl> {
-    let mut acl: *mut ACL = ptr::null_mut();
-    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-    // SAFETY: the handle is borrowed from a live object; `acl` and `descriptor` are valid
-    // out-pointers and the unused ones are null, as allowed. `acl` points into `descriptor`,
-    // freed below after the last use of `acl`.
-    let status = unsafe {
-        GetSecurityInfo(
-            object.as_handle().as_raw_handle(),
-            SE_KERNEL_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            &mut acl,
-            ptr::null_mut(),
-            &mut descriptor,
-        )
-    };
-    if status != 0 {
-        return Err(io::Error::from_raw_os_error(
-            i32::try_from(status).unwrap_or(-1),
-        ));
-    }
-    // SAFETY: `descriptor` came from the call above and is still alive; `acl` is its DACL or
-    // null.
-    let read = unsafe { read_dacl(descriptor, acl) };
-    // SAFETY: allocated by `GetSecurityInfo`, freed once, after the last use of `acl`.
-    unsafe {
-        LocalFree(descriptor);
-    }
-    read
-}
-
-/// Reads a descriptor's DACL into a [`Dacl`].
-///
-/// # Safety
-///
-/// `descriptor` must be a live security descriptor, and `acl` null or that descriptor's DACL.
-unsafe fn read_dacl(descriptor: PSECURITY_DESCRIPTOR, acl: *const ACL) -> io::Result<Dacl> {
-    let mut control: SECURITY_DESCRIPTOR_CONTROL = 0;
-    let mut revision = 0u32;
-    // SAFETY: `descriptor` is live (guaranteed by the caller); both out-pointers are valid.
-    if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if acl.is_null() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "the object has no DACL, so anyone may open it",
-        ));
-    }
-    // SAFETY: `acl` is the descriptor's live DACL (guaranteed by the caller).
-    let count = unsafe { (*acl).AceCount };
-    let mut entries = Vec::with_capacity(usize::from(count));
-    for index in 0..u32::from(count) {
-        let mut ace: *mut c_void = ptr::null_mut();
-        // SAFETY: `acl` is live and `index` is below its entry count; `ace` is a valid
-        // out-pointer, and receives a pointer into the DACL.
-        if unsafe { GetAce(acl, index, &mut ace) } == 0 || ace.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: every entry starts with an `ACE_HEADER`, and entries are 4-byte aligned.
-        let kind = unsafe { (*ace.cast::<ACE_HEADER>()).AceType };
-        entries.push(match kind {
-            ACCESS_ALLOWED_ACE_TYPE | ACCESS_DENIED_ACE_TYPE => {
-                // SAFETY: entries of both types are laid out as `ACCESS_ALLOWED_ACE` (an
-                // `ACCESS_DENIED_ACE` is the same), and the SID begins at `SidStart`, inside the
-                // entry, which lives as long as the DACL.
-                let (mask, sid) = unsafe {
-                    let entry = ace.cast::<ACCESS_ALLOWED_ACE>();
-                    ((*entry).Mask, &raw mut (*entry).SidStart)
-                };
-                let sid = sid_string(sid.cast::<c_void>())?;
-                if kind == ACCESS_ALLOWED_ACE_TYPE {
-                    Ace::Allow { sid, mask }
-                } else {
-                    Ace::Deny { sid, mask }
-                }
-            }
-            other => Ace::Other(other),
-        });
-    }
-    Ok(Dacl {
-        protected: (control & SE_DACL_PROTECTED) != 0,
-        entries,
-    })
-}
-
-/// The integrity level a kernel object's mandatory label gives it (such as a pipe's), read
-/// through any handle opened with `READ_CONTROL`; `None` if it has no label, which Windows
-/// treats as [`MEDIUM_INTEGRITY`].
-///
-/// # Errors
-///
-/// If it cannot be read.
-pub fn label_integrity(object: &impl AsHandle) -> io::Result<Option<u32>> {
-    security_sddl(object, LABEL_SECURITY_INFORMATION).map(|sddl| parse_label(&sddl))
-}
-
-/// The integrity level in an SDDL mandatory label (`S:(ML;;NWNR;;;HI)`), if there is one.
-pub fn parse_label(sddl: &str) -> Option<u32> {
-    let start = sddl.find("(ML;")?;
-    let ace = &sddl[start + 1..];
-    let ace = &ace[..ace.find(')')?];
-    match ace.rsplit(';').next()? {
-        "LW" => Some(LOW_INTEGRITY),
-        "ME" => Some(MEDIUM_INTEGRITY),
-        "MP" => Some(MEDIUM_INTEGRITY + 0x100),
-        "HI" => Some(HIGH_INTEGRITY),
-        "SI" => Some(0x4000),
-        sid => integrity_rid(sid),
-    }
-}
-
-/// Parts of a kernel object's security descriptor, in SDDL.
-fn security_sddl(object: &impl AsHandle, info: OBJECT_SECURITY_INFORMATION) -> io::Result<String> {
-    let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-    // SAFETY: the handle is borrowed from a live object; unused out-pointers are null;
-    // `descriptor` is a valid out-pointer and receives a `LocalAlloc` block, freed below.
-    let status = unsafe {
-        GetSecurityInfo(
-            object.as_handle().as_raw_handle(),
-            SE_KERNEL_OBJECT,
-            info,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            ptr::null_mut(),
-            &mut descriptor,
-        )
-    };
-    if status != 0 {
-        return Err(io::Error::from_raw_os_error(
-            i32::try_from(status).unwrap_or(-1),
-        ));
-    }
-    let mut wide: *mut u16 = ptr::null_mut();
-    // SAFETY: `descriptor` came from the call above and is still alive; `wide` is a valid
-    // out-pointer.
-    let ok = unsafe {
-        ConvertSecurityDescriptorToStringSecurityDescriptorW(
-            descriptor,
-            SDDL_REVISION_1,
-            info,
-            &mut wide,
-            ptr::null_mut(),
-        )
-    };
-    // Read the error before `LocalFree` can overwrite it.
-    let failed = (ok == 0 || wide.is_null()).then(io::Error::last_os_error);
-    // SAFETY: allocated by `GetSecurityInfo`, freed once.
-    unsafe {
-        LocalFree(descriptor);
-    }
-    if let Some(e) = failed {
-        return Err(e);
-    }
-    // SAFETY: a NUL-terminated `LocalAlloc` string from the call above, not used afterwards.
-    Ok(unsafe { take_local_string(wide) })
-}
-
 /// A security descriptor that makes the current user a pipe's owner and its only grantee, at
-/// the current integrity level.
+/// the current integrity level: ptyd's policy, on `pitcrew_trust`'s descriptor.
 #[derive(Debug)]
-pub struct PipeSecurity {
-    descriptor: PSECURITY_DESCRIPTOR,
-}
-
-// SAFETY: see the module comment; the descriptor is never changed and only read by Win32.
-unsafe impl Send for PipeSecurity {}
-// SAFETY: as above.
-unsafe impl Sync for PipeSecurity {}
+pub struct PipeSecurity(SecurityDescriptor);
 
 impl PipeSecurity {
     /// The current user as owner (`O:`); a protected DACL (`P`: nothing is inherited) with one
@@ -538,34 +151,12 @@ impl PipeSecurity {
     ///
     /// If the descriptor cannot be built.
     pub fn for_identity(identity: &Identity) -> io::Result<Self> {
-        let text = Self::sddl(&identity.user, identity.integrity);
-        let sddl: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
-        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
-        // SAFETY: `sddl` is NUL-terminated; `descriptor` is a valid out-pointer; the size
-        // out-pointer may be null.
-        let ok = unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                sddl.as_ptr(),
-                SDDL_REVISION_1,
-                &mut descriptor,
-                ptr::null_mut(),
-            )
-        };
-        if ok == 0 || descriptor.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self { descriptor })
+        SecurityDescriptor::from_sddl(&Self::sddl(&identity.user, identity.integrity)).map(Self)
     }
 
     /// The descriptor, in SDDL, for a user's SID and an integrity level.
     pub fn sddl(sid: &str, integrity: u32) -> String {
-        let label = match integrity {
-            LOW_INTEGRITY => "LW".to_owned(),
-            MEDIUM_INTEGRITY => "ME".to_owned(),
-            HIGH_INTEGRITY => "HI".to_owned(),
-            0x4000 => "SI".to_owned(),
-            other => format!("S-1-16-{other}"),
-        };
+        let label = pitcrew_trust::sddl::label(integrity);
         format!("O:{sid}D:P(A;;GA;;;{sid})S:(ML;;NWNR;;;{label})")
     }
 
@@ -576,28 +167,70 @@ impl PipeSecurity {
     /// As [`ServerOptions::create`]: with `first_pipe_instance`, `PermissionDenied` when the
     /// name is taken.
     pub fn create(&self, options: &ServerOptions, name: &str) -> io::Result<NamedPipeServer> {
-        let mut attributes = SECURITY_ATTRIBUTES {
-            nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
-            lpSecurityDescriptor: self.descriptor,
-            bInheritHandle: 0,
-        };
-        // SAFETY: `attributes` is a valid `SECURITY_ATTRIBUTES` whose descriptor lives as long
-        // as `self`; the call only reads it, during the call.
-        unsafe {
-            options.create_with_security_attributes_raw(
-                name,
-                ptr::from_mut(&mut attributes).cast::<c_void>(),
-            )
-        }
+        self.0.create_pipe(options, name)
     }
 }
 
-impl Drop for PipeSecurity {
+/// An exclusive lock on a whole file (`LockFileEx`), held until it is dropped, and then released
+/// (`UnlockFileEx`) before the file is closed: Windows releases a lock left to the close only
+/// "depending on available system resources". The lock belongs to this handle, so another
+/// handle, in this process or another, cannot take it meanwhile.
+#[derive(Debug)]
+pub struct FileLock(File);
+
+impl FileLock {
+    /// Opens `path` (creating it if missing) and locks it, without waiting: `None` if another
+    /// handle holds a lock on it.
+    ///
+    /// # Errors
+    ///
+    /// If the file cannot be opened, or Windows fails the lock for another reason.
+    pub fn try_exclusive(path: &Path) -> io::Result<Option<Self>> {
+        // Opened here, so the handle is synchronous (std never asks for overlapped I/O).
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        let mut overlapped = OVERLAPPED::default();
+        // SAFETY: the handle is open for the call, and synchronous, so the call is over when it
+        // returns and only reads `overlapped` (a live local: offset 0) during it. The range is
+        // the whole file.
+        let locked = unsafe {
+            LockFileEx(
+                file.as_raw_handle(),
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        };
+        if locked != 0 {
+            return Ok(Some(Self(file)));
+        }
+        let e = io::Error::last_os_error();
+        let held = [ERROR_LOCK_VIOLATION, ERROR_IO_PENDING]
+            .iter()
+            .any(|&code| e.raw_os_error() == i32::try_from(code).ok());
+        if held { Ok(None) } else { Err(e) }
+    }
+}
+
+impl Drop for FileLock {
     fn drop(&mut self) {
-        // SAFETY: allocated by `ConvertStringSecurityDescriptorToSecurityDescriptorW`, freed
-        // once.
+        let mut overlapped = OVERLAPPED::default();
+        // SAFETY: as in `try_exclusive`: an open, synchronous handle, a live local, and the
+        // range that was locked.
         unsafe {
-            LocalFree(self.descriptor);
+            UnlockFileEx(
+                self.0.as_raw_handle(),
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            );
         }
     }
 }
@@ -696,24 +329,6 @@ impl Job {
             return Err(io::Error::last_os_error());
         }
         Ok(inside != 0)
-    }
-}
-
-/// Copies a NUL-terminated wide string allocated with `LocalAlloc`, then frees it.
-///
-/// # Safety
-///
-/// `wide` must be a valid, NUL-terminated, `LocalAlloc`-allocated string not used afterwards.
-unsafe fn take_local_string(wide: *mut u16) -> String {
-    // SAFETY: guaranteed by the caller.
-    unsafe {
-        let mut n = 0;
-        while *wide.add(n) != 0 {
-            n += 1;
-        }
-        let text = String::from_utf16_lossy(std::slice::from_raw_parts(wide, n));
-        LocalFree(wide.cast::<c_void>());
-        text
     }
 }
 
@@ -831,17 +446,10 @@ mod tests {
         });
     }
 
+    /// ptyd's descriptor: ours alone, labelled at the level asked for. (Labels themselves, and
+    /// reading a DACL back, are `pitcrew_trust`'s tests.)
     #[test]
-    fn labels_and_descriptors_parse() {
-        assert_eq!(parse_label("S:(ML;;NWNR;;;HI)"), Some(HIGH_INTEGRITY));
-        assert_eq!(parse_label("S:(ML;;NW;;;ME)"), Some(MEDIUM_INTEGRITY));
-        assert_eq!(parse_label("S:(ML;;NWNR;;;LW)"), Some(LOW_INTEGRITY));
-        assert_eq!(parse_label("S:(ML;;NW;;;S-1-16-8448)"), Some(0x2100));
-        assert_eq!(parse_label("S:"), None);
-        assert_eq!(parse_label(""), None);
-        assert_eq!(parse_label("D:P(A;;FA;;;S-1-5-21-1)"), None);
-        assert_eq!(integrity_rid("S-1-16-12288"), Some(HIGH_INTEGRITY));
-        assert_eq!(integrity_rid("S-1-5-21-1"), None);
+    fn the_descriptor_is_ours_alone_at_a_level() {
         assert_eq!(
             PipeSecurity::sddl("S-1-5-21-1", MEDIUM_INTEGRITY),
             "O:S-1-5-21-1D:P(A;;GA;;;S-1-5-21-1)S:(ML;;NWNR;;;ME)"
@@ -851,6 +459,28 @@ mod tests {
             "O:S-1-5-21-1D:P(A;;GA;;;S-1-5-21-1)S:(ML;;NWNR;;;HI)"
         );
         assert!(PipeSecurity::sddl("S-1-5-21-1", 0x2100).ends_with("S-1-16-8448)"));
+        assert_eq!(
+            parse_label(&PipeSecurity::sddl("S-1-5-21-1", LOW_INTEGRITY)),
+            Some(LOW_INTEGRITY)
+        );
+    }
+
+    /// One lock per file: a second handle, here in this same process, is refused until the
+    /// first lets go; the file is made if missing and kept.
+    #[test]
+    fn a_file_lock_has_one_holder() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("ptyd-0123456789abcdef.lock");
+        let first = FileLock::try_exclusive(&path).expect("lock").expect("free");
+        assert!(path.is_file());
+        assert!(FileLock::try_exclusive(&path).expect("try").is_none());
+        drop(first);
+        let again = FileLock::try_exclusive(&path).expect("lock").expect("free");
+        assert!(FileLock::try_exclusive(&path).expect("try").is_none());
+        drop(again);
+        assert!(path.is_file(), "the file stays");
+        // A folder that does not exist is an error, not a lock.
+        assert!(FileLock::try_exclusive(&tmp.path().join("missing").join("x.lock")).is_err());
     }
 
     #[test]

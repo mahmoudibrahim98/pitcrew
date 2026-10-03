@@ -1,6 +1,6 @@
 //! `GET /v1/host/info` as it is now: roles `["hub", "runner"]` while the runner runs, else
-//! `["hub"]`; while it runs, capabilities `tmux` when its terminals run in tmux and `watch` when
-//! it watches at least one home (in that order), else `[]`.
+//! `["hub"]`; while it runs, capabilities `tmux` when its terminals run in tmux or `pty` when they
+//! run in pitcrew-ptyd, and `watch` when it watches at least one home (in that order), else `[]`.
 //!
 //! `pitcrew_api::router` answers this route with the `HostInfo` it was built with, but the runner
 //! may start after the router is built (once a fresh workspace is set up). So [`answer`], a layer
@@ -45,13 +45,11 @@ impl HostInfoNow {
         match self.runner.get() {
             Some(runner) => {
                 info.roles = vec![HostRole::Hub, HostRole::Runner];
-                info.capabilities = [
-                    (runner.tmux, Capability::Tmux),
-                    (runner.watches, Capability::Watch),
-                ]
-                .into_iter()
-                .filter_map(|(has, capability)| has.then_some(capability))
-                .collect();
+                info.capabilities = runner
+                    .runtime
+                    .into_iter()
+                    .chain(runner.watches.then_some(Capability::Watch))
+                    .collect();
             }
             None => {
                 info.roles = vec![HostRole::Hub];
@@ -131,20 +129,30 @@ mod tests {
         )
         .unwrap();
         let terminals = runner.terminals(Arc::new(NoRuntime)).unwrap();
-        let parts = |watches, tmux| Parts {
+        let parts = |watches, runtime| Parts {
             machine: MachineId::new(),
             hooks: runner.hooks(),
             commands: runner.commands(&terminals),
             terminals: terminals.clone(),
             transcripts: runner.transcripts(),
             watches,
-            tmux,
+            runtime,
         };
-        for (watches, tmux, expected) in [
-            (false, false, vec![]),
-            (true, false, vec![Capability::Watch]),
-            (false, true, vec![Capability::Tmux]),
-            (true, true, vec![Capability::Tmux, Capability::Watch]),
+        for (watches, runtime, expected) in [
+            (false, None, vec![]),
+            (true, None, vec![Capability::Watch]),
+            (false, Some(Capability::Tmux), vec![Capability::Tmux]),
+            (
+                true,
+                Some(Capability::Tmux),
+                vec![Capability::Tmux, Capability::Watch],
+            ),
+            (false, Some(Capability::Pty), vec![Capability::Pty]),
+            (
+                true,
+                Some(Capability::Pty),
+                vec![Capability::Pty, Capability::Watch],
+            ),
         ] {
             let attached = Arc::new(Attached::default());
             let info = HostInfoNow::new(Arc::clone(&attached));
@@ -153,7 +161,7 @@ mod tests {
             assert_eq!(before.protocol, pitcrew_protocol::PROTOCOL_VERSION);
             assert_eq!(before.roles, [HostRole::Hub]);
             assert!(before.capabilities.is_empty());
-            attached.set(parts(watches, tmux));
+            attached.set(parts(watches, runtime));
             let after = info.now();
             assert_eq!(after.roles, [HostRole::Hub, HostRole::Runner]);
             assert_eq!(after.capabilities, expected);

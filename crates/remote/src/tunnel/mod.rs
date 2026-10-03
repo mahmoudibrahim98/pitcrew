@@ -553,9 +553,7 @@ impl Shared {
         });
     }
 
-    /// Records the transport worth remembering ([`Connector::transport`]). Only forwarding,
-    /// Unix's, decides one.
-    #[cfg(unix)]
+    /// Records the transport worth remembering ([`Connector::transport`]), including WSL stdio.
     fn remember(&self, transport: Transport) {
         if let Ok(mut remembered) = self.transport.lock() {
             *remembered = Some(transport);

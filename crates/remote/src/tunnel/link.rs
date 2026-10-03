@@ -7,6 +7,10 @@
 //! - **Windows** (or without connection reuse): OpenSSH there has no ControlMaster, so it is
 //!   only a heartbeat: a connection whose keepalives notice a lost network. It is ready once ssh
 //!   logs that it authenticated.
+//! - **WSL**: a heartbeat too, a `sh` in the distro that ends when the distro stops. It is ready
+//!   once the mark it prints on stdout, with a random tag of the call's, has arrived, waiting at
+//!   least [`crate::wsl::START_WAIT`] for a stopped distro to start. Never through a jump host
+//!   or a ControlMaster.
 //!
 //! **Keepalives** (`ServerAliveInterval` [`KEEPALIVE_INTERVAL`]) end it after a silence that
 //! depends on what else watches the network:
@@ -29,6 +33,7 @@ use crate::quote::validate_host;
 use crate::ssh::{Running, SshLog, classify_failure, expire, last_line};
 use crate::{Ssh, SshError};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncReadExt as _;
@@ -46,6 +51,12 @@ pub const KEEPALIVE_COUNT_PATIENT: u32 = 14;
 // second); a patient link notices through its probe instead.
 const _: () = assert!((KEEPALIVE_COUNT + 1) * KEEPALIVE_INTERVAL + 1 < 10);
 const _: () = assert!((KEEPALIVE_COUNT_PATIENT + 1) * KEEPALIVE_INTERVAL == 30);
+
+/// The start of the WSL heartbeat's ready mark; the call's tag and a newline follow.
+const WSL_READY: &str = "@@pitcrew-wsl-ready-";
+/// The WSL heartbeat, run as `sh -c WSL_HEARTBEAT sh <tag>`: the mark on stdout, then nothing
+/// until the distro stops.
+const WSL_HEARTBEAT: &str = "printf '@@pitcrew-wsl-ready-%s\\n' \"$1\"; while :; do sleep 2; done";
 
 /// How a link reaches its host when that is a compute node.
 #[derive(Clone, Copy, Debug)]
@@ -103,11 +114,31 @@ impl Link {
     /// # Errors
     /// ssh failed (its error, from its log), a prompt was cancelled, or `wait` passed.
     pub(crate) async fn start(spec: LinkSpec<'_>, wait: Duration) -> Result<Self, SshError> {
-        validate_host(spec.host)?;
+        spec.ssh.validate_destination(spec.host)?;
+        if spec.ssh.is_wsl() && (spec.via.is_some() || spec.master) {
+            return Err(SshError::InvalidArgument(
+                "a WSL distribution is reached directly, without a jump host or a ControlMaster"
+                    .into(),
+            ));
+        }
         let log = SshLog::new(spec.dir)?;
         let control = spec.master.then(|| spec.dir.join(spec.name));
-        let fork = knows_fork_after_authentication(spec.ssh, spec.host).await;
-        let args = link_args(&spec, log.path(), control.as_deref(), fork)?;
+        let mut ready_mark = None;
+        let args = if spec.ssh.is_wsl() {
+            // A distro exit ends this heartbeat and triggers the existing reconnect ladder. It
+            // says it runs on stdout, with a tag of this call's, which only the distro writes:
+            // wsl.exe's own notices (UTF-16LE unless WSL_UTF8 is honoured) go to stderr, and
+            // even one on stdout would not hide the mark from a search for its bytes.
+            let tag =
+                crate::askpass::to_hex(&crate::askpass::random::<8>().map_err(SshError::Setup)?);
+            ready_mark = Some(format!("{WSL_READY}{tag}\n").into_bytes());
+            let command = crate::quote::remote_command(&["sh", "-c", WSL_HEARTBEAT, "sh", &tag])?;
+            spec.ssh
+                .args(spec.dir, log.path(), spec.host, command, &[])?
+        } else {
+            let fork = knows_fork_after_authentication(spec.ssh, spec.host).await;
+            link_args(&spec, log.path(), control.as_deref(), fork)?
+        };
         if let Some(control) = &control {
             let _ = std::fs::remove_file(control);
         }
@@ -117,6 +148,8 @@ impl Link {
             _ => &[],
         };
         let (mut proc, askpass) = spec.ssh.spawn(spec.dir, spec.host, args, false, env)?;
+        // Taken before `drain`, which then leaves stdout alone.
+        let marked = ready_mark.map(|mark| watch_for(&mut proc, mark));
         let stderr = drain(&mut proc);
         let mut link = Self {
             host: spec.host.to_owned(),
@@ -127,8 +160,41 @@ impl Link {
             stderr,
             patient: spec.patient,
         };
-        link.ready(wait).await?;
+        match marked {
+            // A stopped distro starts first: WSL's cold start can take far longer than a login.
+            Some(marked) => {
+                link.wsl_ready(&marked, wait.max(crate::wsl::START_WAIT))
+                    .await?
+            }
+            None => link.ready(wait).await?,
+        }
         Ok(link)
+    }
+
+    /// Waits up to `wait` for the WSL heartbeat's mark (`marked`).
+    async fn wsl_ready(&mut self, marked: &AtomicBool, wait: Duration) -> Result<(), SshError> {
+        let waiting = async {
+            loop {
+                if marked.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                if !self.alive() {
+                    // wsl.exe's own error, readable whichever encoding it chose.
+                    let said = last_line(&text(&self.stderr).replace('\0', ""));
+                    return Err(SshError::UnexpectedOutput(if said.is_empty() {
+                        "the WSL heartbeat exited".to_owned()
+                    } else {
+                        format!("the WSL heartbeat exited: {said}")
+                    }));
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        };
+        let waited = tokio::time::timeout(wait, waiting).await;
+        if waited.is_err() {
+            self.proc.kill().await;
+        }
+        waited.unwrap_or(Err(SshError::TimedOut(wait)))
     }
 
     /// Whether it waits 30 s of silence before giving up (see the module docs).
@@ -294,6 +360,43 @@ pub(crate) fn drain(proc: &mut Running) -> Arc<Mutex<Vec<u8>>> {
         });
     }
     kept
+}
+
+/// Reads the process's stdout to its end (a pipe nobody reads would block it), setting the flag
+/// returned once the bytes of `mark` have gone by, wherever they are in it.
+fn watch_for(proc: &mut Running, mark: Vec<u8>) -> Arc<AtomicBool> {
+    let marked = Arc::new(AtomicBool::new(false));
+    if let Some(mut out) = proc.child.stdout.take() {
+        let marked = marked.clone();
+        tokio::spawn(async move {
+            let mut seen: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                let n = match out.read(&mut buf).await {
+                    Ok(n) if n > 0 => n,
+                    _ => break,
+                };
+                if marked.load(Ordering::Acquire) {
+                    continue;
+                }
+                seen.extend_from_slice(buf.get(..n).unwrap_or_default());
+                if contains(&seen, &mark) {
+                    marked.store(true, Ordering::Release);
+                    seen = Vec::new();
+                } else {
+                    // Only a tail shorter than the mark can still be the start of it.
+                    let excess = seen.len().saturating_sub(mark.len().saturating_sub(1));
+                    seen.drain(..excess);
+                }
+            }
+        });
+    }
+    marked
+}
+
+/// Whether `needle` occurs in `haystack`.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 /// Whether `path` is a socket (not following a link).
@@ -691,6 +794,48 @@ mod tests {
         assert!(knows_fork("hostname h\nforkafterauthentication yes\n"));
         assert!(knows_fork("ForkAfterAuthentication no\n"));
         assert!(!knows_fork("hostname h\nport 22\n"));
+    }
+
+    /// A WSL link is the distro's own heartbeat: a jump host or a ControlMaster asked of it is a
+    /// mistake, refused before anything runs (the program does not exist).
+    #[tokio::test]
+    async fn wsl_links_refuse_a_jump_host_and_a_master() {
+        let dir = tempfile::tempdir().unwrap();
+        let wsl = Ssh::wsl(dir.path().join("no-such-wsl.exe"));
+        let control = dir.path().join("login");
+        for (via, master) in [
+            (Some(Via::Jump("hpc-login")), false),
+            (
+                Some(Via::Master {
+                    control: &control,
+                    login: "hpc-login",
+                }),
+                false,
+            ),
+            (None, true),
+        ] {
+            let spec = LinkSpec {
+                host: "Lab distro",
+                master,
+                ..spec(&wsl, dir.path(), via)
+            };
+            let err = Link::start(spec, Duration::from_secs(1)).await.unwrap_err();
+            assert!(matches!(err, SshError::InvalidArgument(_)), "{err:?}");
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn marks_are_found_anywhere_in_the_bytes() {
+        let mark = b"@@pitcrew-wsl-ready-00ff\n";
+        let mut noisy: Vec<u8> = "wsl: a notice\r\n"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        noisy.extend_from_slice(mark);
+        assert!(contains(&noisy, mark));
+        assert!(!contains(b"@@pitcrew-wsl-ready-00fe\n", mark));
+        assert!(!contains(b"anything", b""));
     }
 
     #[test]

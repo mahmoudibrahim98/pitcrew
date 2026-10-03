@@ -264,7 +264,7 @@ impl Supervisor {
         let prompts = Arc::new(AtomicU64::new(0));
         Self {
             master: cfg!(unix) && ssh.multiplexes(),
-            prefer_stdio: options.transport == Some(Transport::Stdio),
+            prefer_stdio: ssh.is_wsl() || options.transport == Some(Transport::Stdio),
             forward_known: options.transport == Some(Transport::Forwarded),
             ssh: ssh.counting_prompts(prompts.clone()),
             prompts,
@@ -560,6 +560,15 @@ impl Supervisor {
         .await
         .map_err(|e| Failure::ssh(&e, &format!("connecting to {host}")))?;
         self.login = Some(link);
+        if self.ssh.is_wsl() {
+            // A new distro process follows a reboot or shutdown. The launcher is idempotent,
+            // so restore the deployed helper before resolving its new socket.
+            self.daemon
+                .launcher
+                .start(&self.status_target())
+                .await
+                .map_err(|e| no_route(NoRoute::Failed(e), &host))?;
+        }
         Ok(())
     }
 
@@ -657,6 +666,9 @@ impl Supervisor {
                 let doing = format!("reaching the helper on {}", self.target_name(&route));
                 return Err(Failure::tunnel(&e, &doing));
             }
+        }
+        if self.ssh.is_wsl() {
+            self.shared.remember(Transport::Stdio);
         }
         Ok(active)
     }
