@@ -15,7 +15,7 @@ export function useMoveCursor() {
   const api = useApi();
   const client = useQueryClient();
   return useMutation({
-    mutationFn: ({ scope, rev }: ReadCursor) => api.request<ReadCursor>('PUT', `/v1/me/cursors/${encodeURIComponent(scope)}`, { body: { rev } }),
+    mutationFn: ({ scope, rev, signal }: ReadCursor & { signal?: AbortSignal }) => api.request<ReadCursor>('PUT', `/v1/me/cursors/${encodeURIComponent(scope)}`, { body: { rev }, ...(signal === undefined ? {} : { signal }) }),
     onSuccess: () => client.invalidateQueries({ queryKey: ['cursors'] }),
   });
 }

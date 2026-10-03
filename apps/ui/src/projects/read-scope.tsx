@@ -18,14 +18,18 @@ export function ReadScope({ scope }: { scope: string }) {
 }
 
 function Dwell({ scope, rev, seen }: { scope: string; rev: number; seen: number }) {
-  const [initialRev] = useState(rev);
+  const [initial] = useState({ rev, seen });
   const { mutate, error } = useMoveCursor();
   useEffect(() => {
-    if (initialRev <= seen) return;
+    if (initial.rev <= initial.seen) return;
+    const controller = new AbortController();
     const timer = setTimeout(() => {
-      mutate({ scope, rev: initialRev });
+      mutate({ scope, rev: initial.rev, signal: controller.signal });
     }, 1000);
-    return () => clearTimeout(timer);
-  }, [scope, initialRev, seen, mutate]);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [scope, initial, mutate]);
   return error === null ? null : <ErrorNote error={error} what="save your read cursor" />;
 }
