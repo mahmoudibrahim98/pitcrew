@@ -116,6 +116,30 @@ before the dispatch's CLI starts.
 - **Sub-agents** keep runner-minted ids even then (the dispatch names only the main session),
   with `parent` set to it. `SessionAgents` must resolve them to their parent's agent (see above).
 
+## Memory
+
+The watcher tracks every transcript in its index, so what it keeps of one is paid 10,000 times
+over in a heavy history. It keeps only what tells a change and what routes hooks to the session
+(`Tracked` in `src/watch.rs`): the session id, the engine, the path (one `Arc<Path>`, shared by
+its maps, its folder watches and the transcript pages), the inner id, size, mtime and file
+identity as last read, `caught_up` and `discovered`, the CLI's id and whether it is a sub-agent,
+and the parent its hooks are judged by. The tracked transcripts are a vector sorted by id (ids
+only grow), not a `BTreeMap`, whose nodes a run of growing ids leaves half full.
+
+The rest of a row (the cursor with the adapter's state, the session's metadata and facts, the
+accepted items of a replay) is read from the index (`Store::load`) when the transcript changes, a
+hook reports, the sessions are linked again or the transcript is deleted, and let go once the
+sink thread has saved every batch that carries it (counted per row). A row stays in memory while
+it holds a change no batch carries yet (a report that moved when the state was last reported but
+not the state, a re-index before a read that failed), while a replay after a crash is under way,
+or after a save that failed (it is then ahead of the index, as before). At start, each row is read
+whole and only that much of it is kept.
+
+Measured with `heaptrack` on a restart over P-measure's 10,000 transcripts (`benches/README.md`,
+"At scale"): about **0.87 KiB a transcript** (the maps' hash tables 409 bytes, the tracked entry
+243, the path 128, the CLI's id 32, folder watches 32, the identity 18), against about 4 KiB when
+every row was held whole.
+
 ## Transcript pages
 
 `RunnerHandle::transcripts()` hands out a `RunnerTranscripts` (cheap to clone, `Send + Sync`);

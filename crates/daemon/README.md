@@ -56,6 +56,7 @@ development** only.
 | `demo-agent.token` | With `--demo` only: a token for the demo's first agent, `@writer`, `pca_…`. Private. |
 | `workspace.json` | The workspace's id and name (`GET /v1/workspace`), which the event log does not hold. Written by `--demo`, and by the first run (`POST /v1/setup`, `pitcrewd init`). Atomic (a private file renamed into place). Private. |
 | `office.json` | Where the back office got to in the log (`{ "log", "done" }`), so a restart runs it again from there. Removed by any start with the office off (`--no-office`, or no owner for `@office` yet, as before setup). Private. |
+| `recaps.sqlite3` | The recap index's blocks (hub-work's README, "Recaps"): a cache, made when the index is built at start, replaced at every start and removed at a clean stop; never read from one run to the next. Private. |
 | `runner/<log id>/` | The runner's index (`pitcrew-runner`): every transcript it watches, its session id, and how far it has been read into this store. One folder per hub log (the store's `log_id`), so a new store learns every session from the start. |
 | `run/pitcrewd.sock` | The private socket (Unix). On Windows the API uses the current user's named pipe, `\\.\pipe\pitcrewd-<user SID>`. |
 
@@ -529,8 +530,10 @@ On development TCP only, the daemon answers CORS as the mock hub does: preflight
 
 `GET /v1/recaps/blocks` and `GET /v1/recaps/days` (api-v1, "Recaps"; device tokens only) are
 answered by the hub's recap index: hub-work's `RecapIndex`, which its one `WorkService`
-implements (hub-work's README, "Recaps"). Blocks and day paragraphs are derived from the log and
-held in memory, never stored, so a restart builds them again.
+implements (hub-work's README, "Recaps"). Blocks and day paragraphs are derived from the log, so
+a restart builds them again. The blocks are kept on disk, not in memory, in `recaps.sqlite3` in the
+state directory (`WorkService::with_recap_file`): a cache of this run's, replaced when the index is
+built and removed when the daemon stops.
 
 - **The adapter** (`src/recaps.rs`, like `src/refs.rs` for the activity index): `pitcrew-api`
   does not depend on the work model, so `WorkRecaps` copies the route's `BlockFilter` field for
