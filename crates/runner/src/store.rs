@@ -109,52 +109,39 @@ pub(crate) struct Indexed {
     pub parent: Option<Parent>,
 }
 
-struct RawIndexed {
-    session: String,
-    engine: String,
-    path: String,
-    inner_id: String,
-    size: i64,
-    mtime: i64,
-    identity: Option<String>,
-    caught_up: bool,
-    discovered: bool,
-    has_meta: bool,
-    native_id: Option<String>,
-    subagent: bool,
-    parent: Option<String>,
+impl Indexed {
+    /// What the watcher keeps of `row`.
+    pub fn of(row: &Row) -> Self {
+        Self {
+            session: row.session,
+            engine: row.engine,
+            path: row.path.clone(),
+            inner_id: row.inner_id.clone(),
+            size: row.size,
+            mtime: row.mtime,
+            identity: row.identity.clone(),
+            caught_up: row.caught_up,
+            discovered: row.discovered,
+            native: row.meta.as_ref().map(|_| native_id(row)),
+            subagent: row.meta.as_ref().is_some_and(|m| m.is_subagent),
+            parent: row.facts.parent,
+        }
+    }
 }
 
-impl RawIndexed {
-    fn decode(self) -> Result<Indexed, StoreError> {
-        let path = PathBuf::from(self.path);
-        let inner_id = Some(self.inner_id).filter(|s| !s.is_empty());
-        let native = self.has_meta.then(|| {
-            self.native_id
-                .filter(|n| !n.is_empty())
-                .or_else(|| inner_id.clone())
-                .or_else(|| path.file_stem().map(|s| s.to_string_lossy().into_owned()))
-                .unwrap_or_default()
-        });
-        Ok(Indexed {
-            session: parse_id(&self.session)?,
-            engine: engine_from(self.engine)?,
-            inner_id,
-            size: u64::try_from(self.size).map_err(|_| StoreError::Range("size".into()))?,
-            mtime: self.mtime,
-            identity: self.identity,
-            caught_up: self.caught_up,
-            discovered: self.discovered,
-            native,
-            subagent: self.subagent,
-            parent: self
-                .parent
-                .as_deref()
-                .map(serde_json::from_str)
-                .transpose()?,
-            path,
+/// The CLI's id for the session: from its records, else the store's inner id, else the file name.
+pub(crate) fn native_id(row: &Row) -> String {
+    row.meta
+        .as_ref()
+        .map(|m| m.native_id.clone())
+        .filter(|n| !n.is_empty())
+        .or_else(|| row.inner_id.clone())
+        .or_else(|| {
+            row.path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
         })
-    }
+        .unwrap_or_default()
 }
 
 /// What to save once the sink has accepted a batch.
@@ -230,36 +217,19 @@ impl Store {
         Ok(())
     }
 
-    /// What the watcher keeps of every transcript at start ([`Indexed`]), without decoding the
-    /// cursors, facts and metadata: those are read with [`Store::load`] when needed.
+    /// What the watcher keeps of every transcript at start ([`Indexed`]). Each row is read
+    /// whole, as before, and let go once its [`Indexed`] is taken: the cursors, facts and metadata
+    /// are read again with [`Store::load`] when needed.
     pub fn load_index(&self) -> Result<Vec<Indexed>, StoreError> {
-        let mut stmt = self.conn.prepare(
-            "SELECT session_id, engine, path, inner_id, size, mtime, identity, caught_up,
-                    discovered, meta IS NOT NULL, json_extract(meta, '$.native_id'),
-                    COALESCE(json_extract(meta, '$.is_subagent'), 0), facts -> '$.parent'
-             FROM transcripts ORDER BY path, inner_id",
-        )?;
-        let raw = stmt.query_map([], |r| {
-            Ok(RawIndexed {
-                session: r.get(0)?,
-                engine: r.get(1)?,
-                path: r.get(2)?,
-                inner_id: r.get(3)?,
-                size: r.get(4)?,
-                mtime: r.get(5)?,
-                identity: r.get(6)?,
-                caught_up: r.get(7)?,
-                discovered: r.get(8)?,
-                has_meta: r.get(9)?,
-                native_id: r.get(10)?,
-                subagent: r.get(11)?,
-                parent: r.get(12)?,
-            })
-        })?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM transcripts ORDER BY path, inner_id"
+        ))?;
+        let mut found = stmt.query([])?;
         let mut rows = Vec::new();
-        for r in raw {
-            match r?.decode() {
-                Ok(row) => rows.push(row),
+        while let Some(r) = found.next()? {
+            // The accepted items do not matter here: `load` reads them with the row.
+            match raw_row(r)?.decode(HashSet::new()) {
+                Ok(row) => rows.push(Indexed::of(&row)),
                 // One bad row must not stop the runner. Its path stays taken, so that transcript is
                 // not indexed again until the row is removed.
                 Err(e) => tracing::error!(error = %e, "skipping an unreadable runner store row"),
@@ -969,6 +939,62 @@ mod tests {
                 .expect("find")
                 .is_some()
         );
+    }
+
+    /// The start keeps of each row what the watcher needs, the same as from the whole row, and a
+    /// row that cannot be read is skipped without stopping the others.
+    #[test]
+    fn the_index_at_start_is_what_the_rows_say() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open");
+        let mut session = row("/t/a.jsonl");
+        session.size = 7;
+        session.mtime = 9;
+        session.identity = Some("1:2".into());
+        session.caught_up = true;
+        session.discovered = true;
+        session.meta = Some(SessionMeta {
+            native_id: String::new(),
+            ..SessionMeta::default()
+        });
+        let mut sub = row("/t/s/subagents/b.jsonl");
+        sub.inner_id = Some("b".into());
+        sub.meta = Some(SessionMeta {
+            native_id: "agent-b".into(),
+            is_subagent: true,
+            ..SessionMeta::default()
+        });
+        sub.facts.parent = Some(Parent::Session(session.session));
+        let fresh = row("/t/c.jsonl");
+        let broken = row("/t/d.jsonl");
+        for r in [&session, &sub, &fresh, &broken] {
+            store.insert(r).expect("insert");
+            store
+                .commit(&Commit::Full(Box::new(r.clone())))
+                .expect("full");
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE transcripts SET facts = '{not json' WHERE session_id = ?1",
+                [broken.session.0.to_string()],
+            )
+            .expect("break a row");
+
+        let index = store.load_index().expect("index");
+        assert_eq!(
+            index,
+            vec![
+                Indexed::of(&session),
+                Indexed::of(&fresh),
+                Indexed::of(&sub)
+            ]
+        );
+        // Without a native id in its records, a session is known by its file name.
+        assert_eq!(index[0].native.as_deref(), Some("a"));
+        assert_eq!(index[2].native.as_deref(), Some("agent-b"));
+        assert!(index[2].subagent);
+        assert_eq!(index[1].native, None, "not read yet");
     }
 
     fn terminal(engine: Engine, native_id: Option<&str>, cwd: &str, at: i64) -> TerminalRow {

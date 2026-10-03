@@ -35,7 +35,7 @@ use crate::link::{self, Locations, WorkstreamLocation};
 use crate::pages::Source;
 use crate::pages::Watched;
 use crate::sink::Batch;
-use crate::store::{Commit, Indexed, Row, Store, path_text};
+use crate::store::{Commit, Indexed, Row, Store, native_id, path_text};
 use notify::event::{EventKind, MetadataKind, ModifyKind};
 use notify::{RecursiveMode, Watcher as _};
 use pitcrew_interfaces::source::{Cursor, ParseChunk, SourceAdapter, SourceError, TranscriptRef};
@@ -338,6 +338,33 @@ struct Loaded {
     /// Batches sent with this row's changes that are not saved yet (see `sink::Batch`). At zero
     /// the index holds this row, so it can go.
     unsaved: Arc<AtomicUsize>,
+    /// Changed since the last batch that saves it (a re-index before a read that failed, a report
+    /// that moved `reported_at` but not the state): kept until a batch carries it, as every row
+    /// was before the index saved only what batches carry.
+    dirty: bool,
+}
+
+impl Loaded {
+    fn new(row: Row) -> Box<Self> {
+        Box::new(Self {
+            row,
+            unsaved: Arc::default(),
+            dirty: false,
+        })
+    }
+
+    /// The row is in a batch about to be sent: what the batch counts against.
+    fn sending(&mut self) -> Arc<AtomicUsize> {
+        self.dirty = false;
+        Arc::clone(&self.unsaved)
+    }
+
+    /// Whether the index holds all of it, so it can go. A row in the middle of a replay after a
+    /// crash (`accepted` not empty) stays: the index forgets the accepted items at the first full
+    /// save, and the rest of the replay still needs them.
+    fn saved(&self) -> bool {
+        !self.dirty && self.row.accepted.is_empty() && self.unsaved.load(Ordering::Acquire) == 0
+    }
 }
 
 impl Tracked {
@@ -959,7 +986,7 @@ impl Watcher {
                 return Ok(());
             }
         };
-        let id = self.track(&indexed(&row), Some(row), h, tref.size, tref.modified);
+        let id = self.track(&Indexed::of(&row), Some(row), h, tref.size, tref.modified);
         self.note_raw(raw, &canonical, id);
         self.check(id)?;
         Ok(())
@@ -992,10 +1019,7 @@ impl Watcher {
             .map_or_else(|| Arc::from(entry.path.as_path()), |(p, _)| Arc::clone(p));
         let mut t = Tracked::new(entry, Arc::clone(&path), home, &self.timing);
         if let Some(row) = row {
-            t.loaded = Some(Box::new(Loaded {
-                row,
-                unsaved: Arc::default(),
-            }));
+            t.loaded = Some(Loaded::new(row));
             self.loaded.push(id);
         }
         self.by_key
@@ -1058,10 +1082,7 @@ impl Watcher {
         if row.facts.parent.is_none() {
             row.facts.parent = t.parent;
         }
-        t.loaded = Some(Box::new(Loaded {
-            row,
-            unsaved: Arc::default(),
-        }));
+        t.loaded = Some(Loaded::new(row));
         self.loaded.push(id);
         true
     }
@@ -1073,10 +1094,7 @@ impl Watcher {
             let Some(t) = tracked.get_mut(id) else {
                 return false;
             };
-            let saved = t
-                .loaded
-                .as_ref()
-                .is_none_or(|l| l.unsaved.load(Ordering::Acquire) == 0);
+            let saved = t.loaded.as_deref().is_none_or(Loaded::saved);
             if saved {
                 t.loaded = None;
             }
@@ -1292,10 +1310,11 @@ impl Watcher {
         };
         let tref = t.tref(st.size, st.mtime);
         let adapter = Arc::clone(&self.homes[t.home].adapter);
-        if let Some(row) = t.row()
-            && needs_reindex(row, &st)
+        if let Some(l) = t.loaded.as_deref_mut()
+            && needs_reindex(&l.row, &st)
         {
-            reindex(row, &st);
+            reindex(&mut l.row, &st);
+            l.dirty = true;
         }
         let mut retried = false;
         for n in 0..=MAX_READS_PER_REFRESH {
@@ -1311,10 +1330,10 @@ impl Watcher {
                     .mark(vec![t.path.to_path_buf()], Instant::now(), false);
                 break;
             }
-            let Some(row) = t.loaded.as_deref_mut().map(|l| &mut l.row) else {
+            let Some(l) = t.loaded.as_deref_mut() else {
                 return Ok(());
             };
-            let cursor = row.cursor.clone();
+            let cursor = l.row.cursor.clone();
             match guard(|| adapter.read_from(&tref, &cursor)) {
                 Ok(chunk) => {
                     // Any cursor change is progress; OpenCode's lives in `state`, not `offset`.
@@ -1328,11 +1347,12 @@ impl Watcher {
                     }
                 }
                 Err(AdapterError::Source(SourceError::Unreadable { reason, .. }))
-                    if !retried && row.inner_id.is_none() && cursor.offset > st.size =>
+                    if !retried && l.row.inner_id.is_none() && cursor.offset > st.size =>
                 {
                     tracing::debug!(reason, "adapter reports a shorter file");
                     retried = true;
-                    reindex(row, &st);
+                    reindex(&mut l.row, &st);
+                    l.dirty = true;
                 }
                 Err(e) => {
                     // Not read again until the file changes, and warned about once.
@@ -1509,7 +1529,7 @@ impl Watcher {
         }
 
         let batches = split(events, self.max_batch, row);
-        let unsaved = Arc::clone(&l.unsaved);
+        let unsaved = l.sending();
         t.sync();
         for mut b in batches {
             b.unsaved = Some(Arc::clone(&unsaved));
@@ -1662,7 +1682,12 @@ impl Watcher {
             return Ok(());
         };
         let row = &mut l.row;
+        let was = row.facts.clone();
         let Some(from) = derive::report(&mut row.facts, r) else {
+            // The state stands, but when it was reported, or its status line, may have moved.
+            if row.facts != was {
+                l.dirty = true;
+            }
             return Ok(());
         };
         row.facts.reports += 1;
@@ -1680,7 +1705,7 @@ impl Watcher {
             })
             .collect();
         let commit = Commit::Full(Box::new(row.clone()));
-        let unsaved = Some(Arc::clone(&l.unsaved));
+        let unsaved = Some(l.sending());
         t.sync();
         self.send(Batch {
             events,
@@ -1802,7 +1827,7 @@ impl Watcher {
                 body,
             };
             let commit = Commit::Full(Box::new(l.row.clone()));
-            let unsaved = Some(Arc::clone(&l.unsaved));
+            let unsaved = Some(l.sending());
             self.send(Batch {
                 events: vec![event],
                 commit,
@@ -2158,39 +2183,6 @@ fn discovered_id_time(row: &Row) -> TimestampMs {
         .as_ref()
         .and_then(|m| m.started)
         .unwrap_or_else(|| TimestampMs::try_from(row.session.0.timestamp_ms()).unwrap_or(0))
-}
-
-/// What the watcher keeps of `row` (see [`Tracked`]).
-fn indexed(row: &Row) -> Indexed {
-    Indexed {
-        session: row.session,
-        engine: row.engine,
-        path: row.path.clone(),
-        inner_id: row.inner_id.clone(),
-        size: row.size,
-        mtime: row.mtime,
-        identity: row.identity.clone(),
-        caught_up: row.caught_up,
-        discovered: row.discovered,
-        native: row.meta.as_ref().map(|_| native_id(row)),
-        subagent: row.meta.as_ref().is_some_and(|m| m.is_subagent),
-        parent: row.facts.parent,
-    }
-}
-
-/// The CLI's id for the session: from its records, else the store's inner id, else the file name.
-fn native_id(row: &Row) -> String {
-    row.meta
-        .as_ref()
-        .map(|m| m.native_id.clone())
-        .filter(|n| !n.is_empty())
-        .or_else(|| row.inner_id.clone())
-        .or_else(|| {
-            row.path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-        })
-        .unwrap_or_default()
 }
 
 fn session_of(
@@ -2681,6 +2673,83 @@ mod tests {
         assert!(w.loaded.is_empty());
     }
 
+    /// A change no batch carries yet keeps the whole row in memory until one does, as before:
+    /// a report that repeats the state still moves when the state was last reported, and a late
+    /// hook is judged by that.
+    #[test]
+    fn a_change_not_saved_yet_keeps_the_row() {
+        use pitcrew_interfaces::source::TranscriptItem;
+
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let path = home.join("projects").join("p").join("s.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"x").unwrap();
+        let adapter = Arc::new(Growing::default());
+        adapter.transcripts.lock().unwrap().push(TranscriptRef {
+            engine: Engine::Claude,
+            path: path.clone(),
+            inner_id: None,
+            size: 1,
+            modified: 0,
+        });
+        let base = 1_790_755_200_000;
+        let turn = |n: u64| TranscriptItem::TurnEnded {
+            at: base + i64::try_from(n).unwrap(),
+            offset: n,
+        };
+        adapter.items.lock().unwrap().push(turn(0));
+        let (mut w, _agents, rx) = watcher_with(&home, state.path(), adapter.clone());
+        assert!(w.start().is_ok());
+        let id = *w.tracked.keys().next().unwrap();
+        save_all(&w, &rx);
+        w.let_go();
+        assert!(w.loaded.is_empty());
+        let session = w.tracked[&id].session;
+        let now = w.store_lock().load(session).unwrap().unwrap().facts.state;
+
+        // The same state, reported later with a status line: no event, nothing to save yet.
+        let same = Reported {
+            at: base + 100,
+            to: now,
+            status_line: Some("thinking".into()),
+        };
+        assert!(w.apply_report(id, &same).is_ok());
+        assert!(rx.try_recv().is_err(), "no batch for a state that stands");
+        w.let_go();
+        assert_eq!(
+            w.loaded,
+            [id],
+            "the report's time is not saved yet: the row stays"
+        );
+
+        // A hook from before that report is late, and changes nothing.
+        let other = if now == SessionState::Working {
+            SessionState::Waiting
+        } else {
+            SessionState::Working
+        };
+        let late = Reported {
+            at: base + 50,
+            to: other,
+            status_line: None,
+        };
+        assert!(w.apply_report(id, &late).is_ok());
+        assert!(rx.try_recv().is_err(), "a late hook moves nothing");
+
+        // The next read carries the row, report time and all; then it goes.
+        adapter.items.lock().unwrap().push(turn(1));
+        std::fs::write(&path, b"xy").unwrap();
+        assert!(w.check(id).is_ok_and(|changed| changed));
+        save_all(&w, &rx);
+        w.let_go();
+        assert!(w.loaded.is_empty());
+        let saved = w.store_lock().load(session).unwrap().unwrap();
+        assert_eq!(saved.facts.reported_at, Some(base + 100));
+        assert_eq!(saved.cursor.offset, 2);
+    }
+
     /// When the index cannot say who a sub-agent's parent is, its hooks are refused (unknown),
     /// and the lookup is not kept: once the index answers, the parent is found and kept.
     #[test]
@@ -2710,7 +2779,7 @@ mod tests {
             ..Default::default()
         });
         let sub = row.session;
-        let id = w.track(&indexed(&row), Some(row), 0, tref.size, tref.modified);
+        let id = w.track(&Indexed::of(&row), Some(row), 0, tref.size, tref.modified);
 
         w.store_lock().hide_transcripts(true).unwrap();
         assert_eq!(w.parent_for(id), Err(LookupFailed));
