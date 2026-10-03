@@ -217,6 +217,28 @@ not start at byte 0).
 - An unknown session is `404`; a `limit` of 0, or a `before` or `limit` that is not a whole number,
   is `400`.
 
+### Read cursors
+
+`GET /v1/me/cursors` returns `ReadCursor[]` for the token's person, sorted by scope.
+`PUT /v1/me/cursors/{scope}` takes `{ "rev": u64 }` and returns a `ReadCursor`
+(`{ "scope": String, "rev": u64 }`). Both routes are person-only: agent tokens get 403,
+including malformed PUT bodies. Cursors belong to a person across all their devices.
+
+Scopes are `workspace`, `project:<ProjectId>` or `workstream:<WorkstreamId>` (bare ULIDs).
+Malformed scopes are 400; unknown projects/workstreams are 404. An absent cursor means 0.
+Revisions ahead of the hub's current log are 400. A revision equal to or below the stored
+one returns the current cursor without appending. Moving forward appends `cursor_moved`
+with `{ "scope", "rev" }`, authored by the person; its projection keeps the maximum revision
+per author and scope. Clients refetch cursors on this stream event. Cursor events are read
+metadata, excluded from Home's changes and from recap activity.
+
+Activity and recap routes keep their existing paging contract. Clients fetch their cursor,
+compare activity revisions to it, and mark revisions greater than it new. Home counts the
+new items in its loaded window (and indicates when older pages remain). Mark all as read
+advances to the newest activity revision actually shown. Project and workstream views
+advance their own scope after a one-second dwell, to the newest activity revision loaded
+when that visit began; arriving live events remain new until another visit.
+
 ### Asks, briefs, activity
 
 | Method and path | Body → response | Notes |
