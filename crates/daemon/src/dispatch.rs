@@ -965,6 +965,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let folder = tmp.path().join("work");
         std::fs::create_dir_all(&folder).unwrap();
+        // The dispatcher resolves cwd; macOS temporary paths may pass through /var's symlink.
+        let folder = folder.canonicalize().unwrap();
         let home = tmp.path().join("codex");
         let mut demo = pitcrew_fixtures::demo_workspace().unwrap();
         let sam = demo.members.iter().find(|m| m.handle == "@sam").unwrap().id;
