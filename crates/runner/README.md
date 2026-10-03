@@ -86,35 +86,72 @@ before the dispatch's CLI starts.
   none for it); `NoAgent` for one stored without, or not stored at all; `Unknown` whenever in
   doubt (a failed lookup, an agent whose member cannot be read).
 - A sub-agent session (one with a `parent`) runs as its parent: answer the parent's agent. The
-  runner states sub-agent sessions without an agent of their own; once it adopts dispatch ids
-  (below), a dispatched agent's sub-agents must resolve to that agent, or its hooks from them are
-  refused and any person's apply. For a sub-agent the hub has not stored, `NoAgent` is the right
-  answer: the runner then asks about the parent itself (above).
+  runner states sub-agent sessions without an agent of their own; as it adopts the ids the hub
+  names (below), a dispatched agent's sub-agents must resolve to that agent, or its hooks from
+  them are refused and any person's apply. For a sub-agent the hub has not stored, `NoAgent` is
+  the right answer: the runner then asks about the parent itself (above).
 - It must see the hub's **latest** session writes. A stale cache answering `NoAgent` for a
   session that has since gained an agent would let any person's hook change it.
 - It must **not call back into the runner** (its handle, hooks, terminals or commands): the
   runner asks from its watcher thread. It should answer quickly; a panic counts as `Unknown`.
 
-## Session ids today, and dispatch
+## Session ids, and sessions the hub named
 
 - The runner mints its own `SessionId` for every transcript it discovers, and its
   `session_discovered` names **no agent**.
 - The hub's sessions projection keeps the agent a session already has when it is stated again
-  without one (`agent = COALESCE(excluded.agent, agent)` in `hub-work`'s `work.sessions`).
-- A session the hub has not stored therefore has no agent: an agent comes only from a dispatch,
-  which stores its session, agent named, before its CLI starts.
-- **Consequence today:** a dispatched session has two ids, the dispatch's (with the agent) and
-  the runner's (without). Hooks resolve to the runner's, so the dispatched agent's own hooks are
-  refused, and any person's apply as for a session without an agent.
-- **When the runner implements the hub's `Dispatcher`**, it must report the session under the
-  dispatch's `DispatchRequest::session` and not discover it again under another id. The design
-  allows it: `RunnerCommands` already starts Claude with a native id it chose (`--session-id`)
-  and records the terminal under it, so that record can carry the dispatch's `SessionId`, and
-  discovery can take the id from it instead of minting one. Its re-statements must keep naming no
-  agent, which the hub reads as "keep the one you have". The rule then holds as intended: the hub
-  knows the agent before the first hook.
-- **Sub-agents** keep runner-minted ids even then (the dispatch names only the main session),
-  with `parent` set to it. `SessionAgents` must resolve them to their parent's agent (see above).
+  without one (`agent = COALESCE(excluded.agent, agent)` in `hub-work`'s `work.sessions`), and a
+  firm link (`dispatch`, `manual`, `claimed`).
+- **A session the hub named.** A dispatch (and `POST /v1/sessions` with `agent` or `task`) stores
+  its session first, agent named, state `starting`, then sends `StartSession` with `session` set
+  to its id. The runner then:
+  - records the terminal under that session at once: text, keys, interrupts and ends reach it
+    before its transcript exists, and `RunnerTerminals::session_of(terminal)` answers it;
+  - gives the CLI the environment the host's `SessionEnv` returns for the session
+    (`RunnerConfig::with_session_env`). The daemon's gives a session run as an agent
+    `PITCREW_TOKEN_FILE`, the path of a private file holding an **agent** token bound to that
+    agent and its owner, and where the hub listens, with `PITCREW_TOKEN` and the endpoint
+    variables it does not listen on set empty so that nothing the CLI inherits wins over them.
+    Values are paths and addresses, never secrets (a runtime keeps a program's variables). An
+    error refuses the start;
+  - has the CLI's transcript **adopt** the id instead of minting one, before anything names the
+    session:
+    - **Claude**: by exact CLI id. The runner chose the `--session-id`, so the transcript's name
+      (`<id>.jsonl`) is known when it is found, and its row is made under the named session
+      (`add()`); also when a sub-agent of it is found first and its parent's row is made then
+      (`parent_of()`);
+    - **Codex and OpenCode**: by folder and start time, at the first read, when the claim of a
+      waiting terminal (`Store::claim_terminal`) finds one started for a named session: the row,
+      saved under the id it was found with, moves to the named one in the same transaction, and
+      the watcher's maps follow (`Watcher::adopt`). Nothing has named the first id yet;
+    - **a start still under way**: a CLI may write its transcript before the runner has recorded
+      its terminal (the runtime's `start` has not returned). The start is known to the watcher
+      meanwhile (`Shared::starting`, a `Pending` start), so the transcript still takes the
+      name, by the same rules; it is then reported without its terminal, which is linked to the
+      session when it is recorded;
+  - refuses a second start in a folder where a CLI matched by folder (Codex, OpenCode) still
+    waits for its transcript (inside the 15-minute claim window, its program running), when
+    either start is for a named session: the two could not be told apart. Two starts for no
+    named session are left to the folder match, as before;
+  - refuses to start a session it knows already (a transcript or a terminal under that id).
+- **A terminal whose program ended** before its transcript appeared will write none, so no
+  transcript is taken for it: the folder match skips it (the watcher asks the runtime about the
+  folder's candidates, without the index locked: `Shared::has_ended`), and a Codex or OpenCode
+  start in its folder retires it (forgets its row). A Claude terminal is matched by its exact
+  id, so it keeps its row until the host retires it (`RunnerCommands::retire`, once the hub gave
+  up on the session).
+- Re-statements keep naming no agent, which the hub reads as "keep the one you have": the hub
+  knows the agent before the first hook, and the agent's own hooks change its session.
+- **Sub-agents** keep runner-minted ids, with `parent` set to the named session.
+  `SessionAgents` must resolve them to their parent's agent (see above).
+- `RunnerCommands::started(session)` tells the host where a named start stands: `Reported` (its
+  transcript is indexed under it), `Running` (its start is under way, from the moment its command
+  runs until it returns, `Shared::under_way`; or its terminal's program runs and the transcript
+  is not found yet), `TooLate` (matched by folder, its program runs, and the 15-minute claim
+  window is over: no transcript can be taken for it any more), `Gone` (no terminal and no
+  transcript here, or its program ended first) or `Unknown`. The daemon reconciles the sessions
+  it stored ahead of the runner with it, and calls `RunnerCommands::retire` for each one it
+  abandons: its terminal is forgotten once its program has ended.
 
 ## Memory
 

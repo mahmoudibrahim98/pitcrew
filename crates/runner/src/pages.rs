@@ -95,6 +95,14 @@ impl Watched {
         self.write().remove(&session);
     }
 
+    /// The transcript tracked as `from` is now `to`'s (it adopted a session the hub named).
+    pub fn rekey(&self, from: SessionId, to: SessionId) {
+        let mut sessions = self.write();
+        if let Some(source) = sessions.remove(&from) {
+            sessions.insert(to, source);
+        }
+    }
+
     fn get(&self, session: SessionId) -> Option<Source> {
         self.sessions
             .read()
