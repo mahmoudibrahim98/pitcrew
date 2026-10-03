@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     let runtime = tokio::runtime::Runtime::new()?;
-    let temporary = tempfile::tempdir()?;
+    let temporary = pitcrew_fixtures::temp::short_tempdir()?;
     let fake = temporary
         .path()
         .join(format!("wsl{}", std::env::consts::EXE_SUFFIX));
@@ -114,7 +114,7 @@ async fn real_wsl() -> Result<(), Box<dyn Error>> {
         println!("test real_wsl_isolated_home ... not requested (PITCREW_TEST_WSL_DISTRO unset)");
         return Ok(());
     };
-    let local = tempfile::tempdir()?;
+    let local = pitcrew_fixtures::temp::short_tempdir()?;
     let transport = Ssh::wsl("wsl.exe").with_runtime_dir(local.path().join("rt"));
     let limits = Limits {
         max_output: Some(1024 * 1024),
@@ -197,7 +197,7 @@ async fn transport_flow() -> Result<(), Box<dyn Error>> {
     use sha2::{Digest as _, Sha256};
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    let temp = tempfile::tempdir()?;
+    let temp = pitcrew_fixtures::temp::short_tempdir()?;
     std::fs::write(temp.path().join("fake-wsl"), [])?;
     let program = temp
         .path()

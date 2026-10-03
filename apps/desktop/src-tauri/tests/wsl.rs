@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 async fn check() -> Result<(), Box<dyn Error>> {
-    let temp = tempfile::tempdir()?;
+    let temp = pitcrew_fixtures::temp::short_tempdir()?;
     let dir = temp.path();
     std::fs::write(dir.join("fake-wsl"), [])?;
     let program = dir.join(format!("wsl{}", std::env::consts::EXE_SUFFIX));
