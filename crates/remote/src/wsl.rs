@@ -1,9 +1,34 @@
-//! Local WSL distribution discovery, using the existing bounded process runner.
+//! Local WSL distribution discovery, using the existing bounded process runner, and starting a
+//! stopped distribution before the first call that needs it.
 
 use crate::{Limits, Ssh, SshError};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::time::Duration;
+
+/// How long the first call to a stopped distribution may take: WSL may have to start its virtual
+/// machine as well as the distribution, which can take well over a probe's 30 s
+/// ([`crate::PROBE_LIMITS`]) on a cold start. The WSL heartbeat waits at least this long too.
+pub const START_WAIT: Duration = Duration::from_secs(120);
+
+/// Bounds for [`Ssh::start_wsl`]: [`START_WAIT`], and little output (the command prints none).
+pub const START_LIMITS: Limits = Limits {
+    max_output: Some(64 * 1024),
+    timeout: Some(START_WAIT),
+};
+
+/// `%SystemRoot%\System32\wsl.exe`, the system's own launcher, rather than whatever `wsl.exe`
+/// comes first on `PATH`. Only without `SystemRoot` (and on other platforms, where WSL is
+/// never there) is it the bare name, looked up on `PATH`.
+#[must_use]
+pub fn default_program() -> PathBuf {
+    match std::env::var_os("SystemRoot") {
+        Some(root) if cfg!(windows) && !root.is_empty() => {
+            PathBuf::from(root).join("System32").join("wsl.exe")
+        }
+        _ => PathBuf::from("wsl.exe"),
+    }
+}
 
 /// A distribution reported by `wsl.exe --list --verbose`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -34,8 +59,9 @@ pub struct Wsl {
 }
 
 impl Default for Wsl {
+    /// [`default_program`].
     fn default() -> Self {
-        Self::new("wsl.exe")
+        Self::new(default_program())
     }
 }
 
@@ -95,6 +121,40 @@ impl Wsl {
     }
 }
 
+impl Ssh {
+    /// Starts `distro` if it is stopped, by running `true` in it within [`START_LIMITS`], so the
+    /// calls that follow (a probe, within 30 s) do not pay for WSL's cold start. Harmless on a
+    /// running distribution.
+    ///
+    /// # Errors
+    /// This is not a WSL transport, wsl.exe fails or breaks the limits, or `true` fails.
+    pub async fn start_wsl(&self, distro: &str) -> Result<(), SshError> {
+        self.start_wsl_with(distro, START_LIMITS).await
+    }
+
+    /// [`Ssh::start_wsl`] with other limits.
+    ///
+    /// # Errors
+    /// As [`Ssh::start_wsl`].
+    pub async fn start_wsl_with(&self, distro: &str, limits: Limits) -> Result<(), SshError> {
+        if !self.is_wsl() {
+            return Err(SshError::InvalidArgument(
+                "only a WSL distribution can be started".into(),
+            ));
+        }
+        let output = self.run_limited(distro, &["true"], limits).await?;
+        if output.success() {
+            Ok(())
+        } else {
+            Err(SshError::UnexpectedOutput(format!(
+                "starting the WSL distribution failed with {:?}: {}",
+                output.code,
+                crate::ssh::last_line(&String::from_utf8_lossy(&output.stderr))
+            )))
+        }
+    }
+}
+
 fn unavailable() -> WslDistros {
     WslDistros {
         available: false,
@@ -119,6 +179,11 @@ pub(crate) fn validate_distro(name: &str) -> Result<(), SshError> {
 
 /// Parses UTF-16LE (with or without a BOM), preserving spaces and quotes in names.
 ///
+/// Rows have fixed leading columns: the default marker (`*`, or a blank) in column 0, a blank in
+/// column 1, and the name from column 2. So a name that itself starts with `*` stays a name. The
+/// version is the last word and the (localized, possibly multi-word) state comes before it,
+/// after a run of blanks.
+///
 /// # Errors
 /// Truncated UTF-16, invalid Unicode, or a malformed table row.
 pub fn parse_distros(bytes: &[u8]) -> Result<Vec<WslDistro>, SshError> {
@@ -131,9 +196,13 @@ pub fn parse_distros(bytes: &[u8]) -> Result<Vec<WslDistro>, SshError> {
         .filter(|line| !line.trim().is_empty())
         .skip(1)
     {
-        let line = line.trim();
-        let default = line.starts_with('*');
-        let line = line.strip_prefix('*').unwrap_or(line).trim_start();
+        let mut columns = line.chars();
+        let default = match (columns.next(), columns.next()) {
+            (Some('*'), Some(' ')) => true,
+            (Some(' '), Some(' ')) => false,
+            _ => return Err(invalid()),
+        };
+        let line = columns.as_str().trim_end();
         let version_at = line.rfind(char::is_whitespace).ok_or_else(invalid)?;
         let version = line[version_at..]
             .trim()
@@ -211,5 +280,43 @@ mod tests {
         let text = "NAME STATE VERSION\n  Lab  Running  broken\n";
         let bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
         assert!(parse_distros(&bytes).is_err());
+    }
+
+    fn utf16(text: &str) -> Vec<u8> {
+        text.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    #[test]
+    fn the_default_marker_is_column_zero_and_names_start_at_column_two() {
+        let text = "  NAME            STATE           VERSION\r\n  *star distro    Stopped         2\r\n* *also          Running         2\r\n";
+        let rows = parse_distros(&utf16(text)).unwrap();
+        assert_eq!(
+            (rows[0].name.as_str(), rows[0].default),
+            ("*star distro", false)
+        );
+        assert_eq!((rows[1].name.as_str(), rows[1].default), ("*also", true));
+        // Anything else in the marker columns is not a row of this table.
+        for bad in [
+            "*Lab            Running         2",
+            " xLab           Running         2",
+            "x Lab           Running         2",
+            "   Lab          Running         2",
+        ] {
+            let text = format!("  NAME  STATE  VERSION\r\n{bad}\r\n");
+            assert!(parse_distros(&utf16(&text)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_cold_start_gets_longer_than_a_probe() {
+        assert!(Some(START_WAIT) > crate::PROBE_LIMITS.timeout);
+        assert_eq!(START_LIMITS.timeout, Some(START_WAIT));
+        if cfg!(windows) && std::env::var_os("SystemRoot").is_some() {
+            let program = default_program();
+            assert!(program.is_absolute(), "{program:?}");
+            assert!(program.ends_with("System32/wsl.exe"), "{program:?}");
+        } else if !cfg!(windows) {
+            assert_eq!(default_program(), PathBuf::from("wsl.exe"));
+        }
     }
 }
