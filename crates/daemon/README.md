@@ -41,9 +41,16 @@ named by their id (`tok_…`) and token files by their path. Stdout carries one 
 daemon is ready, `pitcrewd listening on <where>`, which supervisors and tests wait for; `init`'s
 one line; and, for `connect`, only the bridge's bytes.
 
-`serve --tmux-socket <path>` (hidden from `--help`, warned in the log) puts the runner's tmux
-server on that socket instead of the state directory's own (see "Terminals"), **for tests and
-development** only.
+**For tests and development only**, `serve` takes hidden options (not in `--help`), each warned
+in the log when used (see "Terminals"):
+
+| Option | What |
+|---|---|
+| `--tmux-socket <path>` | The runner's tmux server on that socket instead of the state directory's own. |
+| `--ptyd <path>` | That pitcrew-ptyd instead of the one next to `pitcrewd`. |
+| `--ptyd-endpoint <path>` | pitcrew-ptyd on that endpoint (a socket path on Unix, a pipe name on Windows) instead of the state directory's own. |
+| `--ptyd-idle-exit-ms <ms>` | A pitcrew-ptyd this daemon starts exits after that long idle (its own default is 30 seconds). |
+| `--terminal-runtime pty` | The terminals run in pitcrew-ptyd even where tmux is usable (`auto`, the default, prefers tmux). |
 
 ## The state directory
 
@@ -91,8 +98,9 @@ Windows it must be under the user's profile, whose ACL it inherits.
    office is off (`--no-office`, no person yet, or no member it may act as), `office.json` is
    removed instead.
 7. The stop signals' handlers, so a stop from here on takes the clean path (see "Stop").
-8. Unless `--no-runner`, the terminals' runtime (see "Terminals": tmux where it is usable,
-   detected off the async executor, else none), then the runner (see "The runner"). It reads the
+8. Unless `--no-runner`, the terminals' runtime (see "Terminals": tmux where it is usable, else
+   pitcrew-ptyd where it is installed, else none, detected off the async executor), then the
+   runner (see "The runner"). It reads the
    homes and writes into the store at once: the back office's first run covers what it appended,
    like anything else. A runner that cannot start does not stop the hub (see "The runner").
 9. The recap index's warm-up (see "Recaps"), started and not waited for; the back office's loop;
@@ -109,9 +117,10 @@ read is handed to the store first, its threads end, and with them its hold on th
 runner stopped`). Each gets 10 seconds. This holds whether they started with the daemon or after
 setup; one that a setup in flight starts once the stop has begun is stopped as it starts. Then,
 once the runner has stopped, the terminals' runtime is let go of (`the terminals' runtime
-detached`): tmux stores each terminal's exact output offset, its control client detaches, and
-the socket's lock is released, while **the terminals keep running** (a stop never ends an agent;
-see "Terminals"). Meanwhile the
+detached`): tmux stores each terminal's exact output offset and its control client detaches, or
+the connection to pitcrew-ptyd closes (ptyd keeps every terminal's output and offsets); then the
+lock is released, while **the terminals keep running** (a stop never ends an agent; see
+"Terminals"). Meanwhile the
 store closes, checkpointing its WAL so only `hub.db` remains, and the lock is released last. The
 log ends with `store closed` and `stopped`.
 
@@ -119,7 +128,7 @@ log ends with `store closed` and `stopped`.
 and ends with the process, and the log says so (warnings): a runner stuck in a discovery or a read
 on a filesystem that does not answer (`the runner is still stopping`); a transcript read past the
 route's 15 seconds (`a transcript read has not returned`; the runner gives up on its own reads
-after 10); a tmux that does not let go within 5 seconds (`the terminals' runtime is still
+after 10); a runtime that does not let go within 5 seconds (`the terminals' runtime is still
 detaching`); anything that still holds the store 3 seconds after the server stopped; and, last,
 work still on the blocking pool 5 seconds later (`work on the blocking pool is still running`).
 The store is then closed with the process (`the store is still open at exit`), and its next open
@@ -334,11 +343,12 @@ start, so this hub serves without it`, with the reason and the index's folder) a
 reaching.
 
 **`GET /v1/host/info`** answers roles `["hub", "runner"]` while the runner runs, `["hub"]` when it
-is off. Capabilities, while the runner runs: `tmux` when its terminals run in tmux (see
-"Terminals"), and `watch` while it watches at least one home (so not with `--demo` alone), in that
-order; `[]` without a runner. They are read at each request, so a runner that starts after setup
-shows at once: `pitcrew_api::router` answers the route with the value it was built with, so the daemon
-answers `GET` and `HEAD /v1/host/info` itself in a layer over the app (`src/host.rs`; `HEAD` with
+is off. Capabilities, while the runner runs: `tmux` when its terminals run in tmux or `pty` when
+they run in pitcrew-ptyd (see "Terminals"), and `watch` while it watches at least one home (so
+not with `--demo` alone), in that order; `[]` without a runner. They are read at each request, so
+a runner that starts after setup shows at once: `pitcrew_api::router` answers the route with the
+value it was built with, so the daemon answers `GET` and `HEAD /v1/host/info` itself in a layer
+over the app (`src/host.rs`; `HEAD` with
 the same headers, its length included, and no body) and passes every other request on, so the
 router's fixed answer is never served.
 
@@ -397,40 +407,93 @@ tokio thread per request.
 The runner's terminals (`RunnerTerminals`, over `src/runtime.rs`'s `TerminalRuntime`) are where
 the sessions PitCrew starts run.
 
-**The runtime, chosen at start** (unless `--no-runner`), in this order:
+**The runtime, chosen at start** (unless `--no-runner`): **tmux where it is usable, else
+pitcrew-ptyd** (the PTY runtime), else none. `src/runtime.rs` does it in this order, every step off
+the async executor:
 
-1. The socket's directory is made private (0700 if missing; one that is not is refused, never
-   repaired), and its lock (`<socket dir>/lock`, `flock`) is taken for the runtime's life.
-2. `pitcrew_runtime::tmux::detect_async` checks, on a thread of its own, that tmux is installed (an
-   absolute path on `PATH`), 3.2 or newer, and can start a server on that socket.
-3. A server already running there must have no sessions but PitCrew's own (`pitcrew`): one with
-   others (a person's own tmux, if a socket names it) is refused and left as it is.
+1. The tmux socket's directory is made private (0700 if missing; one that is not is refused, never
+   repaired), and its lock (`<socket dir>/lock`, `flock`) is taken. A lock another daemon holds
+   means no tmux (`another pitcrewd uses this tmux socket`), before tmux is asked anything.
+2. If pitcrew-ptyd is installed (see "Where pitcrew-ptyd is"), its endpoint's directory is made
+   private the same way. A missing ptyd makes nothing.
+3. `pitcrew_runtime::choose_async(TmuxOptions, PtyOptions)` checks, on a thread of its own, that
+   tmux is installed (an absolute path on `PATH`), 3.2 or newer, and can start a server on that
+   socket; if not, that pitcrew-ptyd is a program file where it is looked for and that its
+   endpoint is safe (nothing is started).
+4. For tmux, a server already running there must have no sessions but PitCrew's own (`pitcrew`):
+   one with others (a person's own tmux, if a socket names it) is refused and left as it is, and
+   the PTY runtime is tried instead.
+5. The runtime is built with `Chosen::into_runtime`, behind the daemon's own wrapper that lets go
+   of it at stop. For the PTY runtime the tmux lock is let go of, and the endpoint's lock taken (the
+   same file when both are in one directory, as by default).
 
-If all hold, the terminals are windows of that server (`TmuxRuntime`: its README has the details),
-the log says `the runner's terminals run in tmux; attach to them with tmux -S <socket> attach -t
-pitcrew`, and host info reports `tmux`. Otherwise there is no runtime (`NoRuntime`): no session has
-a terminal here, starting one is `503`, and the log says why as a warning (`the runner's terminals
-cannot use tmux …`: not installed, too old, the socket's directory refused, `another pitcrewd uses
-this tmux socket`, a server with sessions `that are not PitCrew's`). On Windows (no tmux) it says
-so at info; the PTY runtime is stream B's next brief.
+In tmux, the terminals are windows of that server (`TmuxRuntime`: its README has the details), the
+log says `the runner's terminals run in tmux; attach to them with tmux -S <socket> attach -t
+pitcrew`, and host info reports `tmux`. In pitcrew-ptyd (`PtyRuntime`), the log says `the runner's
+terminals run in pitcrew-ptyd, which keeps them running when pitcrewd stops; tmux is not used:
+<why>` at info, with the ptyd it runs, its endpoint and (Unix) its log, and host info reports
+`pty`. Nothing is started yet: the runtime starts ptyd, detached, with the first terminal, and
+ptyd exits by itself once it has had no terminal and no client for 30 seconds.
 
-**One server per state directory.** The socket is
+Otherwise there is no runtime (`NoRuntime`): no session has a terminal here, starting one is
+`503`, and the log says why for both as a warning, `the runner's terminals cannot use tmux or
+pitcrew-ptyd, so no session has a terminal here: <tmux's reason>; <ptyd's reason>`. tmux: not
+installed, too old, the socket's directory refused, `another pitcrewd uses this tmux socket`, a
+server with sessions `that are not PitCrew's`, or not Unix. ptyd: `pitcrew-ptyd is not installed
+at <the path it was looked for at>`, its endpoint refused, or `another pitcrewd uses this
+pitcrew-ptyd endpoint`.
+
+**Where pitcrew-ptyd is.** Next to the running `pitcrewd`, in the same directory
+(`pitcrew-ptyd.exe` on Windows), and **never on `PATH`**: the daemon runs only the ptyd it ships
+with, built with the same protocol (stream P bundles it; see `crates/ptyd`'s README). A ptyd of
+another protocol already running on the endpoint is refused at its first call, with a message, and
+its terminals keep running.
+
+**One tmux server and one ptyd per state directory.** The socket is
 `<dir>/<8 hex digits of the sha256 of the canonical state directory>/tmux`, where `<dir>` is the
 runtime's private per-user directory: `$TMUX_TMPDIR/pitcrew-<uid>` or `$XDG_RUNTIME_DIR/pitcrew`
 when that is a private directory, else `/tmp/pitcrew-<uid>` (also when the path would pass the
-103-byte socket limit). So two daemons of one user (a real one and a demo, a development one,
-another state directory) never share a server: not its terminals, not their offsets, not the
-environment its programs inherit (the daemon that starts a server gives it its own `HOME`,
-`PATH` and the rest). The lock keeps a second runtime off one socket even when a socket is named
-twice. The hidden `serve --tmux-socket <path>` names another socket, with a warning, **for tests
-and development**; tests always pass it, or point the per-user directory at their own folder
-(`TMUX_TMPDIR`). The per-user directory depends on the environment, so a daemon restarted in
-another one (say without `XDG_RUNTIME_DIR`) does not find its terminals.
+103-byte socket limit). ptyd's endpoint follows the same rule: on Unix it is `ptyd` next to the
+socket, in the same directory and under the same lock (ptyd keeps its own `ptyd.lock` and its log,
+`ptyd.log`, there too); on Windows it is the user's pipe with the same digits,
+`\\.\pipe\pitcrew-ptyd-<user SID>-<8 hex digits>` (`…-<SID>-elevated-<8 hex digits>` for an
+elevated daemon). So two daemons of one user (a real one and a demo, a development one, another
+state directory) never share a tmux server or a ptyd: not their terminals, not their offsets, not
+the environment their programs inherit (the daemon that starts a server or a ptyd gives it its
+own `HOME`, `PATH` and the rest). On Unix the lock keeps a second runtime off one socket or endpoint
+even when one is named twice; on Windows no lock is taken beyond the state directory's own
+(`tokens.lock`), which the default pipe, named after it, already follows. The per-user directory
+depends on the environment, so a daemon restarted in another one (say without
+`XDG_RUNTIME_DIR`) does not find its terminals.
 
-**Attaching by hand:** `tmux -S <socket> attach -t pitcrew` (the socket is in the start log), then
-pick a window (each is named after the CLI and the folder, e.g. `claude paper`); or one terminal,
-`tmux -S <socket> attach -t pitcrew:@<n>`. Detach with `C-b d`. tmux's own key bindings apply; the
-user's `~/.tmux.conf` does not, and the user's own tmux server is never touched.
+**For tests and development**, the hidden `serve` options (see "Commands") name another socket
+(`--tmux-socket`), another ptyd (`--ptyd`) or endpoint (`--ptyd-endpoint`), a shorter idle exit
+(`--ptyd-idle-exit-ms`), or force the PTY runtime where tmux is usable (`--terminal-runtime pty`),
+each with a warning. Tests always pass `--tmux-socket` and `--ptyd`, or point the per-user
+directory at their own folder (`TMUX_TMPDIR`).
+
+**Deploying pitcrewd with pitcrew-ptyd.** ptyd outlives the daemon only if what runs the daemon
+lets it:
+
+- **systemd.** A unit's default `KillMode=control-group` kills every process left in the unit's
+  control group when the unit stops or restarts, ptyd and its terminals included: ptyd leaves the
+  daemon's session (`setsid`), not its control group. A unit that runs `pitcrewd` must set
+  `KillMode=process` (or `mixed`), or ptyd must run in a unit or scope of its own; otherwise every
+  stop of the daemon ends every agent. (A tmux server the daemon started is in the same control
+  group, and ends the same way.)
+- **Windows Job Objects.** The runtime starts ptyd outside any job `pitcrewd` is in
+  (`CREATE_BREAKAWAY_FROM_JOB`). A job that does not allow breakaway
+  (`JOB_OBJECT_LIMIT_BREAKAWAY_OK`) refuses that, so ptyd starts inside it (logged as a warning)
+  and ends when the job is closed, with every terminal; a job with `KILL_ON_JOB_CLOSE` (as many
+  supervisors and terminals use) closes with its last handle. Whatever starts `pitcrewd` in a job
+  (the desktop app, a service wrapper) must allow breakaway.
+
+**Attaching by hand** (tmux only): `tmux -S <socket> attach -t pitcrew` (the socket is in the start
+log), then pick a window (each is named after the CLI and the folder, e.g. `claude paper`); or one
+terminal, `tmux -S <socket> attach -t pitcrew:@<n>`. Detach with `C-b d`. tmux's own key bindings
+apply; the user's `~/.tmux.conf` does not, and the user's own tmux server is never touched.
+Nothing attaches to a terminal of pitcrew-ptyd by hand: its terminals have no `native_target`,
+and are reached through the API only.
 
 **`GET /v1/sessions/{id}/terminal`** is answered by `SessionTerminals` (`src/terminals.rs`): a
 session the hub does not know is `404`; one on another machine `503` (no remote runners yet); one
@@ -487,14 +550,22 @@ would go the same way (the runtime's README: call it from a blocking thread).
   While a start waits, it looks the session up by its terminal in the runner's index, every
   200 ms, not through the hub's whole list.
 
-**Restarts.** A stop lets go of the runtime only after the runner has stopped: dropping
-`TmuxRuntime` stores each terminal's exact output offset in tmux (`@pitcrew-offset`) and detaches;
-the terminals and their programs keep running. The next start's runtime finds them again by their
-tags, the runner's index still links each to its session, and output is numbered on from the
-stored offset: a client that reconnects with `from=<the offset it had>` misses nothing printed
-since, and one from `0` is told (`truncated`) where the kept output begins. Output printed while
-no daemon was attached is not in the stream (tmux sends only live output); the terminal's screen
-shows it to a person who attaches. `end` ends a terminal; nothing else does.
+**Restarts.** A stop lets go of the runtime only after the runner has stopped; the terminals and
+their programs keep running, and the runner's index still links each to its session.
+
+- **tmux:** dropping `TmuxRuntime` stores each terminal's exact output offset in tmux
+  (`@pitcrew-offset`) and detaches. The next start's runtime finds the terminals again by their
+  tags, and output is numbered on from the stored offset: a client that reconnects with
+  `from=<the offset it had>` misses nothing printed since, and one from `0` is told (`truncated`)
+  where the kept output begins. Output printed while no daemon was attached is not in the stream
+  (tmux sends only live output); the terminal's screen shows it to a person who attaches.
+- **pitcrew-ptyd:** dropping `PtyRuntime` closes its connection; **offsets live in ptyd**, which
+  keeps reading every terminal while no daemon is connected. The next start's runtime connects
+  again and `list()` finds every terminal by its id: a client that reconnects with `from=<the
+  offset it had>` gets everything printed since, what was printed while no daemon ran included,
+  and one from `0` the whole history ptyd keeps (2 MiB a terminal; `truncated` only past that).
+
+`end` ends a terminal; nothing else does.
 
 ## Dispatch
 
@@ -510,7 +581,7 @@ dispatch"); then `RunnerCommands` becomes hub-work's `Dispatcher` here.
 
 | Route | From |
 |---|---|
-| `GET /v1/host/info` (no token) | `src/host.rs`, a layer over `pitcrew-api`'s app (see "The runner"); roles `["hub", "runner"]` while the runner runs, else `["hub"]`; capabilities, while it runs, `tmux` when its terminals run in tmux and `watch` while it watches a home, else `[]`; read at each request |
+| `GET /v1/host/info` (no token) | `src/host.rs`, a layer over `pitcrew-api`'s app (see "The runner"); roles `["hub", "runner"]` while the runner runs, else `["hub"]`; capabilities, while it runs, `tmux` or `pty` for where its terminals run and `watch` while it watches a home, else `[]`; read at each request |
 | Work routes, agent and device, with `GET /v1/workspace`, `POST /v1/setup` and `GET /v1/sessions[/{id}]` | `pitcrew-hub-work` (`agent_routes`, `device_routes`); setup's listener is the daemon's (see "The first run") |
 | `POST /v1/tasks/{id}/dispatch` | `pitcrew-hub-work` without a dispatcher: `503 unavailable`, and nothing is recorded, not even an assignment (see "Dispatch") |
 | `GET /v1/stream` | `pitcrew-api` over the store (`StoreSource`) |
@@ -577,8 +648,9 @@ VITE_PITCREW_TOKEN="$(cat "$(cargo run -q -p pitcrew-daemon -- --state-dir /tmp/
   corepack pnpm --filter @pitcrew/ui dev
 ```
 
-On a machine with tmux, a development daemon on its own state directory gets a tmux server of its
-own, next to a real PitCrew's (see "Terminals").
+A development daemon on its own state directory gets a tmux server, or a pitcrew-ptyd, of its own,
+next to a real PitCrew's (see "Terminals"). `cargo build` puts `pitcrew-ptyd` next to `pitcrewd` in
+`target/debug` when it builds the workspace (`cargo build -p pitcrew-ptyd` builds it alone).
 
 `--demo` works once per state directory; restart without it to keep the data, or use a new
 directory for a fresh demo. With `--demo` the runner watches no agent home; `--homes <dir>` points
@@ -623,12 +695,18 @@ that first (`check_private_home`), and `a_demo_watches_no_home_of_its_own` check
 `--demo` no home is watched, and without it exactly the three homes in that folder. Transcripts
 come from `crates/fixtures`, under synthetic session ids.
 
-**No test touches a real tmux.** Every daemon the tests start gets `--tmux-socket` (`Tmux` in
-`tests/common`): by default a socket in a folder whose parent does not exist, which the runtime
-refuses (making nothing), so the daemon serves without a terminal runtime, as on a machine without
-tmux; the tmux tests give their daemons private sockets in their temporary folders, or a
-`TMUX_TMPDIR` there for a state directory's default socket (the helper refuses a daemon on its
-default socket without one). None uses PitCrew's own per-user directory or the user's tmux server.
+**No test touches a real tmux or a real pitcrew-ptyd.** Every daemon the tests start gets
+`--tmux-socket` (`Tmux` in `tests/common`): by default a socket in a folder whose parent does not
+exist, which the runtime refuses (making nothing); and `--ptyd`: by default a path in a folder
+that does not exist (`missing_ptyd`), so the daemon has no PTY runtime either (making nothing for
+its endpoint), and serves without a terminal runtime, as on a machine with neither. The tmux tests
+give their daemons private sockets in their temporary folders, or a `TMUX_TMPDIR` there for a
+state directory's default socket (the helper refuses a daemon on its default socket without one).
+The PTY tests give theirs the pitcrew-ptyd built next to `pitcrewd` and an endpoint in their
+temporary folders (`--ptyd-endpoint`), or a `TMUX_TMPDIR` there for the state directory's own (the
+helper refuses a real `--ptyd` without one of them on Unix; on Windows the state directory's own
+pipe is the test's alone). None uses PitCrew's own per-user directory, the user's tmux server or
+the user's ptyd.
 
 `tests/serve.rs` starts the real binary on a temporary state directory and a free port, and
 covers `--version`, `token show-path`, tokens and scopes, the work routes (with the workspace,
@@ -678,9 +756,11 @@ allow for the back office appending after a write (the demo's asks are old by th
 
 `tests/terminals.rs`, the runner's terminals:
 
-- without tmux (the refused socket every test daemon has by default): host info has no `tmux`,
-  the log warns why (and warns of `--tmux-socket`), the demo's session of this machine has no
-  terminal (`404`), `POST /v1/sessions` is `503`, a command for a session without a terminal `409`,
+- without tmux or pitcrew-ptyd (the refused socket and the missing ptyd every test daemon has by
+  default): host info has neither `tmux` nor `pty`, the log warns why for both (naming where
+  pitcrew-ptyd was looked for, and warning of `--tmux-socket` and `--ptyd`), the demo's session
+  of this machine has no terminal (`404`), `POST /v1/sessions` is `503`, a command for a session
+  without a terminal `409`,
   for another machine's `503`, for an unknown one `404`; malformed bodies `400`; each bound one
   past its limit (`text`, `keys`, `brief`, `cwd`, a body past 1 MiB) `400 invalid`, and at its
   limit passes; a relative or missing `cwd`, and one under a folder every user can write to,
@@ -717,6 +797,43 @@ allow for the back office appending after a write (the demo's asks are old by th
   stop;
 - whatever the outcome, each test kills its servers (`tmux -S <its socket> kill-server`) and
   anything still marked.
+
+`tests/pty.rs`, the runner's terminals in pitcrew-ptyd, forced (`--terminal-runtime pty`) even
+where tmux is installed, on Linux, macOS and Windows: the pitcrew-ptyd cargo built next to
+`pitcrewd` (`--ptyd`; the tests that need it say they are skipped when it is not built, and fail
+instead under `CI` or with `PITCREW_REQUIRE_PTYD=1`), an idle exit of half a second
+(`--ptyd-idle-exit-ms`), `--homes`, and a stand-in `claude` first on the daemon's `PATH` (as in
+the tmux tests; on Windows a `claude.cmd` running a PowerShell script, as npm's shims do, that reads
+keys with Ctrl-C as input). ptyd is looked at through a `PtyRuntime` of the test's own on the same
+endpoint, which lists and reads and never starts one:
+
+- the whole life of a session: host info has `["pty", "watch"]`, the log says the terminals run in
+  pitcrew-ptyd on the test's endpoint and warns of each override, and no ptyd runs before the
+  first terminal; `POST /v1/sessions` answers `202` with the session, `terminal` set, and ptyd
+  holds exactly that terminal (`claude work`, no `native_target`); a start for the demo's cluster
+  (`503`), with `bypass_permissions` or a `--dangerously-…` model (`400`) starts nothing; the
+  terminal WebSocket streams the stand-in's output; `send`, `keys` and `interrupt` reach it (`KEY
+  68`, `KEY 69`, Enter, `KEY 09`, `KEY 1b`), and on Unix ptyd holds the same stream byte for byte.
+  A `d` makes the stand-in print `DELAYED` two seconds later, while the daemon stops: on Unix the
+  log has `the runner stopped`, then `the terminals' runtime detached` (naming pitcrew-ptyd), then
+  `store closed`; the same ptyd keeps the terminal alive and holds `DELAYED`. The next daemon
+  reports `pty` and finds the terminal: a stream from the old offset gets `KEY 64` and `DELAYED`
+  with nothing lost (no `truncated`), and one from `0` the whole output, also without
+  `truncated`. A second session (its folder given with `..` on Unix) ended `graceful` prints its
+  goodbye, its stream ends with `exit`, and it is `ended`; `kill` ends the first (`exit`, close
+  `1000`, `ended`), and a command for it is then `409`. ptyd still lists both, ended. With the
+  daemon stopped, ptyd exits once idle (on Unix removing its socket), and nothing of the test's is
+  left: nothing with its mark (`/proc` on Linux, `ps -E` on macOS), or on Windows no process whose
+  command line names its folder or its pipe;
+- two daemons on two state directories, on their own endpoints (under the test's `TMUX_TMPDIR` on
+  Unix, the user's pipe with the state directory's digits on Windows): each endpoint is the one the
+  daemon's rule gives, in the log; each daemon's session is the only terminal of its own ptyd, and
+  the two ptyds are two processes; on Unix a third daemon given the first's endpoint finds it
+  locked (`another pitcrewd uses this pitcrew-ptyd endpoint`), has no `pty`, and the first's ptyd
+  is not touched;
+- a missing pitcrew-ptyd (forced, where the daemon is told to look): no runtime, a warning naming
+  where it looked (`pitcrew-ptyd is not installed at …`) and that tmux was not tried, `POST
+  /v1/sessions` `503`, and nothing made for the endpoint.
 
 `tests/office.rs`, with `--demo`, appends what the runner link will report straight to the store
 (the daemon looks at it with its next append, here a comment through the API, or at its next
@@ -799,8 +916,8 @@ sub-agents up their chain (16 sessions resolve; 17, or 16 below a parent not sto
 `Unknown`), and answers `Unknown` for a chain that disagrees or loops and for an agent the hub
 does not know as one; `src/terminals.rs` answers `404`, `503` or the runner's answer by where the
 session is, with and without a runner, and with one attached later; `src/host.rs` answers the
-runner's role, `tmux` and `watch` (each, both, neither) once one is attached, and `HEAD` with
-`GET`'s headers and no body; `src/transcripts.rs` answers `404`, `503`, or an empty page for a
+runner's role, `tmux` or `pty` and `watch` (each, both, neither) once one is attached, and `HEAD`
+with `GET`'s headers and no body; `src/transcripts.rs` answers `404`, `503`, or an empty page for a
 session of this machine the runner never indexed, with and without a runner; `src/sessions.rs`
 checks the bodies and every bound at its limit and one past it, the hook rule for who may command
 a session (each scope against no agent, an owned agent, another's, one without an owner, and an
@@ -812,11 +929,18 @@ above, with those folders named; and a start with no runtime `503`; `src/runtime
 a let-go runtime answers `Unavailable` to every call and is dropped, that a refused socket means
 no tmux and makes nothing, that each state directory has a socket of its own (the same however spelled), that
 socket directories are made private (and an open one refused, not repaired) and locked once, and
-which sessions of a server are not PitCrew's (a stand-in `tmux` answering); `src/runner.rs` and
+which sessions of a server are not PitCrew's (a stand-in `tmux` answering); and for the PTY
+runtime, that ptyd's endpoint is next to the tmux socket on Unix, under the same lock (held by one
+runtime at a time, whichever takes it), and the user's pipe with the state directory's digits on
+Windows; that pitcrew-ptyd is looked for next to the running executable by default; that a refused
+socket and no ptyd mean no runtime and make nothing for either; that without tmux, or forced, a
+program file where ptyd is looked for gives the PTY runtime (nothing started), whose endpoint a
+second daemon then finds locked (Unix); and that reasons read plainly; `src/runner.rs` and
 `src/cli.rs` check that `--demo` alone watches nothing (the person's homes are not even looked
 up), how `--homes` values become homes, and that `--no-runner` refuses `--homes`. `src/cli.rs`
 also checks that everything after `connect` reaches the bridge as it is, `init`'s arguments, and
-that `--tmux-socket` parses and is hidden from help;
+that `--tmux-socket`, `--ptyd`, `--ptyd-endpoint`, `--ptyd-idle-exit-ms` and `--terminal-runtime`
+parse (a bad value refused) and are hidden from help;
 `src/init.rs` the request's body (a bare handle given its `@`) and the client pointed at the state
 directory's socket, or the `--listen` given; `src/setup.rs` that the listener hands the setup over
 once, and that an office loop and a runner (real, watching nothing) are kept until the stop begins
@@ -826,8 +950,10 @@ and handed back, not kept, once it has.
 
 - The dispatcher (see "Dispatch"), and agent tokens for real sessions: how a real agent's hooks
   authenticate is a separate design.
-- The PTY runtime (stream B's next brief): on machines without tmux 3.2, Windows included, no
-  session has a terminal yet.
+- Bundling `pitcrew-ptyd` next to `pitcrewd` in the installers (stream P, `P-desktop-bundle`):
+  until then, an installed `pitcrewd` without tmux (Windows above all) has no terminal runtime.
+- On Windows, no lock guards ptyd's pipe beyond the state directory's own: a daemon given another
+  daemon's pipe with the hidden `--ptyd-endpoint` would share that ptyd.
 - `POST /v1/sessions` with `agent` or `task` (`503`; it needs the runner to adopt a session id, as
   dispatch does), and `POST /v1/sessions/{id}/link`, which no route serves yet.
 - The first prompt (`brief`) is passed to the CLI as an argument, so other users of the machine
