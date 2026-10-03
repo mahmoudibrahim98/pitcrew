@@ -35,6 +35,12 @@ function projectsRoutes(parent: WorkspaceRoute): AnyRoute[] {
       }),
       createRoute({
         getParentRoute: () => projectsLayout,
+        path: 'calendar',
+        staticData: { title: 'Calendar' },
+        component: lazyRouteComponent(() => import('./calendar.tsx'), 'CalendarPage'),
+      }),
+      createRoute({
+        getParentRoute: () => projectsLayout,
         path: 'projects',
         staticData: { title: 'Projects' },
         component: lazyRouteComponent(() => import('./projects-list.tsx'), 'ProjectsListPage'),
@@ -73,8 +79,12 @@ export const feature = defineFeature({
   nav: [
     { id: 'projects-list', label: 'Projects', to: 'projects', order: 25 },
     { id: 'members', label: 'Members', to: 'members', order: 35 },
+    { id: 'calendar', label: 'Calendar', to: 'calendar', section: 'Workspace', order: 50 },
   ],
-  commands: [{ id: 'go-projects', label: 'Go to Projects', group: 'Go to', run: (c) => c.go('projects') }],
+  commands: [
+    { id: 'go-projects', label: 'Go to Projects', group: 'Go to', run: (c) => c.go('projects') },
+    { id: 'go-calendar', label: 'Go to Calendar', group: 'Go to', run: (c) => c.go('calendar') },
+  ],
   create: [{ id: 'task', label: 'Task', order: 10, dialog: lazy(() => import('./new-task.tsx').then((m) => ({ default: m.NewTaskDialog }))) }],
 });
 
