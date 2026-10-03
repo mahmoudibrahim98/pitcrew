@@ -289,6 +289,8 @@ pub struct SetupDone {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct EventsPage {
+    /// Actual log revisions, in the same order as `events`.
+    pub revisions: Vec<u64>,
     /// The events, oldest first.
     pub events: Vec<Event>,
     /// Revision of the first returned event; with no events, where the scan stopped (0 at the

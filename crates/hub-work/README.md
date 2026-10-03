@@ -109,8 +109,8 @@ keeps the maximum revision for each author and scope, so rebuilding never moves 
 `GET /v1/me/cursors` and `PUT /v1/me/cursors/{scope}` are device-only routes, also checked
 by the service. Commands serialize validation and append, reject future revisions and
 unknown scopes, and append nothing for an equal or older revision. This follows the same
-event-based storage and stream delivery as the work model. Cursor events are excluded
-from the recap index. `tests/cursors.rs` covers isolation, refusals, no-op writes and replay.
+event-based storage as the work model. Cursor events are private: only the author's
+devices receive live or replayed cursor events; activity routes and recap inputs exclude them. `tests/cursors.rs` covers isolation, refusals, no-op writes and replay.
 
 | Name | Tables (migration) | Events |
 |---|---|---|

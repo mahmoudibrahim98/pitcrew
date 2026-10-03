@@ -1294,7 +1294,7 @@ const listEvents: Handler = (hub, ctx) => {
   const revs: number[] = [];
   for (; rev >= floor && revs.length <= limit; rev--) {
     const event = hub.eventAt(rev);
-    if (event !== undefined && touches(hub, event.body, filter)) {
+    if (event !== undefined && event.body.type !== 'cursor_moved' && touches(hub, event.body, filter)) {
       revs.push(rev);
     }
   }
@@ -1303,6 +1303,7 @@ const listEvents: Handler = (hub, ctx) => {
   const page = revs.slice(0, limit).reverse();
   return ok({
     events: page.map((r) => hub.eventAt(r)),
+    revisions: page,
     from_rev: page[0] ?? (atStart ? 0 : rev + 1),
     to_rev: page.at(-1) ?? 0,
     at_start: atStart,
@@ -1506,6 +1507,7 @@ const ROUTES: Route[] = [
   route('GET', '/v1/briefs', 'device', listBriefs),
   route('PUT', '/v1/briefs/:kind/:id', 'device', putBrief),
   route('GET', '/v1/events', 'device', listEvents),
+  route('GET', '/v1/activity', 'device', listEvents),
   // Recaps: from the fixture the recap engine wrote (recaps.ts).
   route('GET', '/v1/recaps/blocks', 'device', (hub, ctx) => ok(blocksPage(hub.recaps, ctx.query))),
   route('GET', '/v1/recaps/days', 'device', (hub, ctx) => ok(daysPage(hub.recaps, ctx.query))),

@@ -72,6 +72,8 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
 - **Read cursors.** Device-only `GET /v1/me/cursors` and `PUT /v1/me/cursors/{scope}`,
   forward-only for each person and scope, with `cursor_moved` on a forward write.
   `dev-second-device-token` represents a second synthetic person for isolation tests.
+  Cursor events appear only in the author's device streams, including replay; activity
+  and recaps exclude them. Activity pages count real events and return their actual revisions.
   Like other mock state, cursors last until the server stops.
 
 - **Every route in the contract**, with the `ApiError` body and status for each failure (400, 401,

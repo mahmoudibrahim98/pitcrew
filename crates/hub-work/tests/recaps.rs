@@ -1130,3 +1130,37 @@ fn generated_logs_have_every_kind_of_block() {
     }
     assert!(oracle.blocks.iter().any(|b| b.workstream.is_none()));
 }
+
+#[test]
+fn read_metadata_never_changes_recap_blocks_or_days() {
+    let ws = demo();
+    let mut recaps = Recaps::new(Some(demo_directory(&ws)));
+    recaps.push(&ws.events);
+    let before = recaps
+        .blocks(&BlockFilter::default(), None, Some(200))
+        .expect("blocks");
+    let days: Vec<_> = demo_scopes(&ws)
+        .into_iter()
+        .map(|scope| {
+            let page = recaps.days(scope, 0, None, Some(30)).expect("days");
+            (scope, page)
+        })
+        .collect();
+    let mut metadata = ws.events[0].clone();
+    metadata.id = EventId::new();
+    metadata.at += 86_400_000;
+    metadata.body = EventBody::CursorMoved {
+        scope: "workspace".into(),
+        rev: 15,
+    };
+    recaps.push(&[metadata]);
+    assert_eq!(
+        recaps
+            .blocks(&BlockFilter::default(), None, Some(200))
+            .expect("blocks"),
+        before
+    );
+    for (scope, page) in days {
+        assert_eq!(recaps.days(scope, 0, None, Some(30)).expect("days"), page);
+    }
+}

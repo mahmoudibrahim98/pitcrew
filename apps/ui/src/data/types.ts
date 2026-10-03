@@ -664,6 +664,7 @@ export interface AskFilters {
  * hub's scan stopped. Only `at_start` ends paging: pass `from_rev` as `before` for older events.
  */
 export interface EventsPage {
+  revisions?: number[];
   events: Event[];
   from_rev: number;
   to_rev: number;

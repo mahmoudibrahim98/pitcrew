@@ -54,6 +54,9 @@ Out of scope, by assumption:
 | A6 | The event log and workspace state | Authorship (who did what) and decisions must be true; the log must stay available. |
 | A7 | The helper binary, installers and updates | Whatever they contain runs on every machine. |
 
+Read cursors are private read metadata: activity and recap inputs exclude them; live and
+replayed streams deliver them only to the author's devices, never other members or agents.
+
 ## 3. Actors
 
 | Id | Actor | Can | Assumed not to |

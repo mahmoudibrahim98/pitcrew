@@ -33,16 +33,16 @@ export function streamSince(query: URLSearchParams): number | undefined {
  * Sends `hello`, then the events after `since` (if the client is behind), then every new batch.
  * Each connection keeps its own cursor, so a client never gets an event twice.
  */
-export function openStream(hub: Hub, conn: WebSocketConnection, since: number | undefined): void {
+export function openStream(hub: Hub, conn: WebSocketConnection, since: number | undefined, person?: string): void {
   let cursor = hub.rev;
   sendFrame(conn, { type: 'hello', rev: cursor, log: hub.logId });
   if (since !== undefined && since < cursor) {
-    sendEvents(conn, since, hub.eventsAfter(since));
+    sendEvents(conn, since, hub.eventsAfter(since), person);
   }
   const unsubscribe = hub.subscribe(() => {
     const fresh = hub.eventsAfter(cursor);
     if (fresh.length > 0) {
-      sendEvents(conn, cursor, fresh);
+      sendEvents(conn, cursor, fresh, person);
       cursor += fresh.length;
     }
   });
@@ -54,15 +54,18 @@ export function openStream(hub: Hub, conn: WebSocketConnection, since: number | 
 }
 
 /** Sends `events` (which follow revision `after`) as one or more `events` frames. */
-function sendEvents(conn: WebSocketConnection, after: number, events: Event[]): void {
-  for (let i = 0; i < events.length; i += REPLAY_BATCH) {
-    const batch = events.slice(i, i + REPLAY_BATCH);
-    sendFrame(conn, {
-      type: 'events',
-      from_rev: after + i + 1,
-      to_rev: after + i + batch.length,
-      events: batch,
-    });
+function sendEvents(conn: WebSocketConnection, after: number, events: Event[], person?: string): void {
+  let i = 0;
+  while (i < events.length) {
+    const start = i;
+    while (i < events.length && i - start < REPLAY_BATCH &&
+      (events[i]?.body.type !== 'cursor_moved' || events[i]?.author === person)) i++;
+    if (i > start) {
+      sendFrame(conn, { type: 'events', from_rev: after + start + 1, to_rev: after + i,
+        events: events.slice(start, i) });
+    } else {
+      i++;
+    }
   }
 }
 

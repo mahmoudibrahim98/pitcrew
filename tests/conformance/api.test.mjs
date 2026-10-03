@@ -718,11 +718,11 @@ check('terminal agent refused', () =>
 check('terminal invalid size refused', () =>
   refusedUpgrade(`/v1/sessions/${context.sessions[0].id}/terminal?cols=0&rows=24`, 400),
 );
-async function stream(since) {
+async function stream(since, token = person) {
   const url = new URL('/v1/stream', base);
   url.protocol = 'ws:';
   if (since !== undefined) url.searchParams.set('since', since);
-  const ws = new WebSocket(url, ['pitcrew.v1', `pitcrew.bearer.${person}`]);
+  const ws = new WebSocket(url, ['pitcrew.v1', `pitcrew.bearer.${token}`]);
   const frames = [];
   const waiters = [];
   let failure;
@@ -976,4 +976,51 @@ check('agent plan keeps human lines and stamps attribution', async () => {
   });
   assert.equal(event.author, context.agentMe.id);
   assert.equal(event.on_behalf_of, context.me.id);
+});
+
+check('cursor metadata is private in live/replay and does not consume activity pages', async () => {
+  const second = process.env.PITCREW_CONFORMANCE_SECOND_PERSON;
+  const owner = await stream();
+  const other = await stream(undefined, second);
+  let replay;
+  try {
+    const hello = await owner.next();
+    await other.next();
+    const comments = [];
+    for (let i = 0; i < 3; i++) {
+      await api('/v1/me/cursors/workspace', 200, undefined, { method: 'PUT', body: { rev: hello.rev + i * 2 } });
+      comments.push(await api(`/v1/tasks/${context.task.id}/comments`, 201, schemas.event, {
+        method: 'POST', body: { text: `Synthetic privacy barrier ${i}`, mentions: [] },
+      }));
+    }
+    const until = async (client) => {
+      const seen = [];
+      for (;;) {
+        const frame = await client.next();
+        if (frame.type !== 'events') continue;
+        assert.equal(frame.events.length, frame.to_rev - frame.from_rev + 1);
+        seen.push(...frame.events);
+        if (seen.some((e) => e.id === comments[2].id)) return seen;
+      }
+    };
+    const mine = await until(owner);
+    assert.equal(mine.filter((e) => e.body.type === 'cursor_moved').length, 3);
+    assert.equal((await until(other)).filter((e) => e.body.type === 'cursor_moved').length, 0);
+    replay = await stream(hello.rev, second);
+    await replay.next();
+    assert.equal((await until(replay)).filter((e) => e.body.type === 'cursor_moved').length, 0);
+    for (const route of ['/v1/events', '/v1/activity']) {
+      const page = await api(`${route}?limit=3`);
+      assert.deepEqual(page.events.map((e) => e.id), comments.map((e) => e.id));
+      assert.deepEqual(page.revisions, [hello.rev + 2, hello.rev + 4, hello.rev + 6]);
+      assert.equal(page.from_rev, page.revisions[0]);
+      assert.equal(page.to_rev, page.revisions[2]);
+      assert.equal(page.at_start, false);
+      const all = await api(`${route}?limit=500`);
+      assert.ok(all.events.every((e) => e.body.type !== 'cursor_moved'));
+      await api(route, 403, undefined, { token: agent });
+    }
+  } finally {
+    owner.ws.close(); other.ws.close(); replay?.ws.close();
+  }
 });

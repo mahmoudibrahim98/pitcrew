@@ -97,3 +97,16 @@ it('aborts a pending dwell write when the scope unmounts', async () => {
   await settled(() => expect(view.queryClient.isMutating()).toBe(0));
   expect(await otherClient(hub).request('GET', '/v1/me/cursors')).toEqual([]);
 });
+
+it('Home reaches unread changes behind a metadata-only tail and marks their actual revision', async () => {
+  for (let rev = 15; rev < 75; rev++) {
+    await otherClient(hub, 'dev-second-device-token').request('PUT', '/v1/me/cursors/workspace', { body: { rev } });
+  }
+  renderWithHub(<Home />, hub);
+  const region = await screen.findByRole('region', { name: 'Since you last looked' });
+  await within(region).findByText('15 new changes');
+  expect(within(region).queryByText('Nothing new since you last looked.')).toBeNull();
+  within(region).getByRole('button', { name: 'Mark all as read' }).click();
+  await within(region).findByText('Nothing new since you last looked.');
+  expect(await otherClient(hub).request('GET', '/v1/me/cursors')).toEqual([{ scope: 'workspace', rev: 15 }]);
+});
