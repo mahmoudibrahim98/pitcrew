@@ -4,6 +4,8 @@
   **Branch:** `integrator/scan-followups`.
   **Paths:**
   - `crates/daemon/src/scan.rs`, `crates/daemon/src/host.rs`, `crates/ingest/src/scan.rs` (and the ingest README);
+  - `crates/ingest/src/opencode/mod.rs` (item 6), and `crates/ingest/tests/**` only where the new
+    `ScanOptions` fields need it;
   - `crates/protocol/**` (the scan module's `ScanReport`, for the partial flag), and the regenerated `packages/protocol-ts`;
   - `tests/conformance/**`, `docs/build/contracts/api-v1.md`;
   - `apps/mock-hub/**`, only to align host info;
