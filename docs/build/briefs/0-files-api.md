@@ -5,7 +5,9 @@
   **Paths:**
   - `docs/build/contracts/api-v1.md`, `docs/security/threat-model.md`;
   - `crates/protocol/**` (types, runner commands; regenerate `packages/protocol-ts`);
-  - `crates/runner/**` (the file operations themselves, with their tests);
+  - `crates/runner/**` (the file operations themselves, with their tests), and `Cargo.lock` for a
+    dependency they need (for example `winapi-util`, already locked, for Windows link counts and
+    file ids; no `unsafe`);
   - `crates/hub-work/**` (only to resolve a workstream's location for the route), `crates/daemon/**`;
   - `apps/mock-hub/**`, `tests/conformance/**`;
   - the READMEs of the crates touched.
