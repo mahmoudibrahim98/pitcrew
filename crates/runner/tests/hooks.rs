@@ -210,19 +210,17 @@ fn a_stop_hook_beats_the_watcher_and_the_transcript_then_agrees() {
     );
     sink.wait_for(3, WAIT).expect("discovery");
     assert_eq!(labels(&sink.events())[0], "discovered:Working");
-    // Let the watcher finish its first read; it would read the new lines at once otherwise.
-    std::thread::sleep(Duration::from_millis(300));
-
-    // The CLI writes the rest of its turn and fires its Stop hook.
+    // Establish that the Stop hook wins before making the older transcript items readable.
     let hooks = runner.hooks();
-    append(&path, &lines[5..].concat());
     hooks.deliver(hook(&person(), "Stop", FIXTURE_ID, now_ms()));
+    sink.wait_for(4, WAIT).expect("idle from the Stop hook");
+    append(&path, &lines[5..].concat());
 
     sink.wait_for(9, WAIT).expect("events after the turn");
     std::thread::sleep(Duration::from_millis(300));
     runner.stop();
     let events = sink.events();
-    // Idle comes from the hook, first. The transcript's items, all written before the hook, add
+    // Idle comes from the hook, first. The transcript's items, all timestamped before the hook, add
     // their tools and turn end but no state changes: nothing is said twice or undone.
     assert_eq!(
         labels(&events[3..]),
