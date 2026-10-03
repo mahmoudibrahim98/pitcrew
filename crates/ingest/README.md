@@ -75,7 +75,8 @@ built for onboarding's scan step and "scan again". It is **not** an import: it n
   default: the machine's parallelism) that claim work from a shared queue, so one huge OpenCode
   store does not stall the others. `progress` is only ever called on the caller's own thread, at
   most every 100 ms.
-- **Cancellation and budget.** `ScanOptions.cancel` stops scheduling between homes and files;
+- **Cancellation and budget.** `ScanOptions.cancel` stops scheduling between homes, files and
+  suggestion directories (including ancestors checked for git roots);
   `budget` defaults to ten minutes. The report has `partial: true` when stopped. In-flight
   discovery or filesystem reads must finish first; these checks cannot interrupt a hung OS call.
 - **Suggestions.** A project is the nearest `.git` ancestor of a `cwd`; cwds with no `.git` above
