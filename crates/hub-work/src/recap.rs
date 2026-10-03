@@ -44,12 +44,16 @@
 //! to another day or workstream), or when a name it could show changed. At most a set number of
 //! entries are kept ([`DAY_CACHE_ENTRIES`]); past that, the one used longest ago goes.
 //!
+//! So a query reads only its blocks' heads (id, start, workstream, last event) to find its dates
+//! and check each cached paragraph, and reads and decodes the bodies of a paragraph's blocks only
+//! when it writes that paragraph again.
+//!
 //! [`Store::since`]: pitcrew_store::Store::since
 
 use crate::codec::sql_rev;
 use crate::error::{Result, WorkError};
 use crate::projection::Tasks;
-use crate::recap_db::{self, BlockDb, Scope};
+use crate::recap_db::{self, BlockDb, Head, Place, Scope};
 use crate::service::WorkService;
 use pitcrew_protocol::events::{BriefTarget, Event, EventBody};
 use pitcrew_protocol::ids::{EventId, MemberId, ProjectId, SessionId, TaskId, WorkstreamId};
@@ -332,17 +336,18 @@ impl DayCache {
         }
     }
 
-    /// The paragraph for `blocks` (one workstream's blocks on one date, in order), from the cache
-    /// when it was written from the same blocks and names.
+    /// The paragraph for the blocks `covers` names (`(id, last)` of one workstream's blocks on
+    /// one date, in order), from the cache when it was written from the same blocks and names;
+    /// otherwise written from the blocks `load` reads (those, in that order).
     fn get_or_make(
         &mut self,
         key: DayKey,
-        blocks: &[&Block],
+        covers: Vec<(EventId, EventId)>,
         names: &Directory,
         names_gen: u64,
+        load: impl FnOnce() -> Result<Vec<Block>>,
     ) -> Result<Vec<DayRecap>> {
         self.clock = self.clock.wrapping_add(1);
-        let covers: Vec<(EventId, EventId)> = blocks.iter().map(|b| (b.id, b.last)).collect();
         if let Some(hit) = self.entries.get_mut(&key)
             && hit.covers == covers
             && hit.names == names_gen
@@ -350,7 +355,12 @@ impl DayCache {
             hit.used = self.clock;
             return Ok(hit.recaps.clone());
         }
-        let owned: Vec<Block> = blocks.iter().map(|b| (*b).clone()).collect();
+        let owned = load()?;
+        if !owned.iter().map(|b| (b.id, b.last)).eq(covers.iter().copied()) {
+            return Err(WorkError::internal(
+                "the recap index's blocks do not match their heads",
+            ));
+        }
         let recaps = guarded("writing a day recap", || {
             day_recaps(&owned, names, key.tz, &RuleSummarizer)
         })?
@@ -475,19 +485,26 @@ impl Recaps {
 
     /// [`Recaps::in_file`] in place; on an error the blocks stay in memory.
     fn use_file(&mut self, path: &Path) -> Result<()> {
+        self.use_db(|| BlockDb::file(path))
+    }
+
+    /// Keeps the blocks in a cache file meant for `path`, on a local disk ([`BlockDb::local`]: at
+    /// `path`, in a private local folder when `path` is on a network filesystem, or in memory);
+    /// on an error the blocks stay in memory.
+    fn use_local_file(&mut self, path: &Path) -> Result<()> {
+        self.use_db(|| BlockDb::local(path))
+    }
+
+    /// Moves the (empty) index to the database `open` makes.
+    fn use_db(&mut self, open: impl FnOnce() -> Result<BlockDb>) -> Result<()> {
         if !self.is_empty() {
             return Err(WorkError::invalid(
                 "the recap index already has blocks in memory",
             ));
         }
-        match BlockDb::file(path) {
-            Ok(db) => {
-                self.db = Some(db);
-                self.broken = None;
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+        self.db = Some(open()?);
+        self.broken = None;
+        Ok(())
     }
 
     /// Keeps at most `entries` day paragraphs (0: none) instead of [`DAY_CACHE_ENTRIES`].
@@ -561,13 +578,7 @@ impl Recaps {
 
     /// The blocks' database, unless the index is broken.
     fn db(&self) -> Result<&BlockDb> {
-        match (&self.db, &self.broken) {
-            (Some(db), None) => Ok(db),
-            (_, broken) => Err(WorkError::internal(format!(
-                "the recap index is broken: {}",
-                broken.as_deref().unwrap_or("no database")
-            ))),
-        }
+        usable(self.db.as_ref(), self.broken.as_deref())
     }
 
     fn db_mut(&mut self) -> Result<&mut BlockDb> {
@@ -709,7 +720,8 @@ impl Recaps {
         {
             return Err(WorkError::invalid("before must be a date, YYYY-MM-DD."));
         }
-        let db = self.db()?;
+        // The fields apart, so the cache can read bodies from the database while it changes.
+        let db = usable(self.db.as_ref(), self.broken.as_deref())?;
         let linked = match scope {
             DaysScope::Workstream(w) => Scope::Workstream(recap_db::key(w.0)),
             DaysScope::Project(p) => Scope::Project(recap_db::key(p.0)),
@@ -723,7 +735,8 @@ impl Recaps {
         // A date at a time, newest first: the latest start below `upper` names the date, and
         // every block from that date's first millisecond up to it falls on it (a block's day only
         // grows with its start). Where `date_of` clamps far-off times, a block at a time.
-        let mut dates: Vec<(Date, Vec<Block>)> = Vec::new();
+        // Each date with the range of places its blocks span, lowest first, and their heads.
+        let mut dates: Vec<(Date, Place, Place, Vec<Head>)> = Vec::new();
         let mut at_start = true;
         while let Some((start, id)) = db.latest(linked, upper)? {
             let date = date_of(start, tz_minutes);
@@ -734,43 +747,58 @@ impl Recaps {
             if before.is_some_and(|b| date >= *b) {
                 continue;
             }
-            let same = dates.last().is_some_and(|(last, _)| *last == date);
+            let same = dates.last().is_some_and(|(last, ..)| *last == date);
             if !same && dates.len() >= limit {
                 at_start = false;
                 break;
             }
             if !same {
-                dates.push((date, Vec::new()));
+                dates.push((date, lowest, (start, id), Vec::new()));
             }
             let window = db.window(linked, lowest, (start, id))?;
-            if let Some((_, blocks)) = dates.last_mut() {
-                blocks.extend(window);
+            if let Some((_, low, _, heads)) = dates.last_mut() {
+                // Windows of one date follow on from each other, downwards.
+                *low = lowest;
+                heads.extend(window);
             }
         }
         let mut days = Vec::new();
-        for (date, blocks) in dates {
+        for (date, low, high, heads) in dates {
             // The entry without a workstream first (`None` sorts first), then by workstream id.
-            let mut groups: BTreeMap<Option<WorkstreamId>, Vec<&Block>> = BTreeMap::new();
-            for block in &blocks {
-                groups.entry(block.workstream).or_default().push(block);
+            let mut groups: BTreeMap<Option<WorkstreamId>, Vec<Head>> = BTreeMap::new();
+            for head in heads {
+                groups.entry(head.workstream).or_default().push(head);
             }
             for (workstream, mut group) in groups {
-                group.sort_by_key(|b| (b.start, b.id));
+                group.sort_by_key(|h| (h.start, h.id));
                 let key = DayKey {
                     scope,
                     tz: tz_minutes,
                     date: date.clone(),
                     workstream,
                 };
+                let covers = group.iter().map(|h| (h.id, h.last)).collect();
                 days.extend(self.cache.get_or_make(
                     key,
-                    &group,
+                    covers,
                     self.builder.directory(),
                     self.names_gen,
+                    || db.bodies(linked, low, high, workstream),
                 )?);
             }
         }
         Ok(DaysPage { days, at_start })
+    }
+}
+
+/// `db`, unless the index is `broken` (or has no database).
+fn usable<'a>(db: Option<&'a BlockDb>, broken: Option<&str>) -> Result<&'a BlockDb> {
+    match (db, broken) {
+        (Some(db), None) => Ok(db),
+        (_, broken) => Err(WorkError::internal(format!(
+            "the recap index is broken: {}",
+            broken.unwrap_or("no database")
+        ))),
     }
 }
 
@@ -877,8 +905,9 @@ impl RecapSync {
         self.to_open = self.file.is_some();
     }
 
-    /// Opens the file, when there is one still to open. If it cannot be made, the blocks stay in
-    /// memory (logged): recaps still answer, at the memory's cost.
+    /// Opens the file, when there is one still to open: on a local disk ([`BlockDb::local`]). If
+    /// it cannot be made, the blocks stay in memory (logged): recaps still answer, at the
+    /// memory's cost.
     fn open(&mut self) {
         if !std::mem::take(&mut self.to_open) {
             return;
@@ -886,7 +915,7 @@ impl RecapSync {
         let Some(path) = self.file.clone() else {
             return;
         };
-        if let Err(e) = self.recaps.use_file(&path) {
+        if let Err(e) = self.recaps.use_local_file(&path) {
             tracing::warn!(
                 file = %path.display(),
                 error = %e,
@@ -964,6 +993,12 @@ impl WorkService {
     /// service is dropped; it is never read from one run to the next. The file is private to the
     /// user (0600 on Unix). If it cannot be made, or the disk later refuses blocks (the index is
     /// then built again), the blocks stay in memory from then on (logged).
+    ///
+    /// **On a local disk.** When the folder of `path` is on a network filesystem (detected as the
+    /// store detects its own; a filesystem not recognised counts as one), the file goes in a new
+    /// private folder (0700 on Unix) in the runtime directory (`$XDG_RUNTIME_DIR`) or the
+    /// temporary folder instead, removed with it; when neither can be had, the blocks stay in
+    /// memory. Either is logged.
     ///
     /// One file per service: two services (or processes) must not share a path.
     #[must_use]
@@ -1252,6 +1287,225 @@ mod tests {
 
         // Only an empty index moves to a file.
         assert!(memory.in_file(&dir.path().join("other")).is_err());
+    }
+
+    /// A project with two workstreams, a session in each, and a task outside them; then four
+    /// days of work in both sessions, and a move of the task each day: `(project, workstreams,
+    /// sessions, events)`.
+    fn linked_log() -> (ProjectId, [WorkstreamId; 2], [SessionId; 2], Vec<Event>) {
+        use pitcrew_protocol::ids::{MachineId, ProjectKey, TaskKey};
+        use pitcrew_protocol::model::{
+            Engine, Health, Mover, Priority, Project, ProjectStatus, Session, SessionState, Task,
+            TaskStatus, Workstream, WorkstreamStatus,
+        };
+        let id = |kind: u128, n: u128| ulid::Ulid::from((kind << 96) | n);
+        let person = MemberId(id(4, 0));
+        let project = ProjectId(id(3, 0));
+        let streams = [WorkstreamId(id(5, 0)), WorkstreamId(id(5, 1))];
+        let sessions = [SessionId(id(7, 0)), SessionId(id(7, 1))];
+        let task = TaskId(id(6, 0));
+        let mut n = 0u128;
+        let mut event = |at: i64, body: EventBody| {
+            n += 1;
+            Event {
+                id: EventId(id(1, n)),
+                at,
+                workspace: WorkspaceId(ulid::Ulid::from(2u128)),
+                author: person,
+                on_behalf_of: None,
+                body,
+            }
+        };
+        let t0 = 1_790_755_200_000; // 2026-09-30 08:00 UTC
+        let mut events = vec![event(
+            t0 - DAY_MS,
+            EventBody::ProjectCreated {
+                project: Project {
+                    id: project,
+                    key: ProjectKey::new("PAP").expect("key"),
+                    name: "Paper".into(),
+                    status: ProjectStatus::InProgress,
+                    lead: person,
+                    members: vec![person],
+                    start: None,
+                    due: None,
+                    root: None,
+                    external: vec![],
+                },
+            },
+        )];
+        for (i, w) in streams.iter().enumerate() {
+            let workstream = Workstream {
+                id: *w,
+                project,
+                name: format!("Stream {i}"),
+                status: WorkstreamStatus::Active,
+                health: Health::OnTrack,
+                locations: vec![],
+                external: vec![],
+            };
+            events.push(event(t0 - DAY_MS, EventBody::WorkstreamCreated { workstream }));
+        }
+        let task_body = Task {
+            id: task,
+            key: TaskKey::new(ProjectKey::new("PAP").expect("key"), 1).expect("key"),
+            title: "Outside the streams".into(),
+            project,
+            workstream: None,
+            description: String::new(),
+            status: TaskStatus::Todo,
+            priority: Priority::None,
+            assignee: None,
+            labels: vec![],
+            start: None,
+            due: None,
+            blocked_by: vec![],
+            source: None,
+            accept_auto: false,
+            subtasks: vec![],
+        };
+        events.push(event(t0 - DAY_MS, EventBody::TaskCreated { task: task_body }));
+        for (s, w) in sessions.iter().zip(streams) {
+            let session = Session {
+                id: *s,
+                engine: Engine::Claude,
+                native_id: "native".into(),
+                machine: MachineId(ulid::Ulid::from(1u128)),
+                cwd: "/work".into(),
+                branch: None,
+                title: None,
+                agent: None,
+                workstream: Some(w),
+                task: None,
+                link_basis: None,
+                state: SessionState::Working,
+                status_line: None,
+                started: t0,
+                last_activity: t0,
+                terminal: None,
+                parent: None,
+            };
+            events.push(event(t0 - DAY_MS, EventBody::SessionDiscovered { session }));
+        }
+        let statuses = [TaskStatus::Todo, TaskStatus::InProgress];
+        for day in 0..4i64 {
+            for (k, s) in sessions.iter().enumerate() {
+                for minute in 0..3i64 {
+                    let at = t0 + day * DAY_MS + (k as i64 * 10 + minute) * 60_000;
+                    events.push(event(
+                        at,
+                        EventBody::ToolRan {
+                            session: *s,
+                            tool: "Bash".into(),
+                            target: "cargo test".into(),
+                            outcome: "ok".into(),
+                            failed: false,
+                            receipt: Receipt::Transcript {
+                                session: *s,
+                                offset: minute as u64,
+                            },
+                        },
+                    ));
+                }
+            }
+            let i = usize::try_from(day).unwrap_or(0) % 2;
+            events.push(event(
+                t0 + day * DAY_MS + 3_600_000,
+                EventBody::TaskMoved {
+                    task,
+                    from: statuses[i],
+                    to: statuses[1 - i],
+                    mover: Mover::Person,
+                },
+            ));
+        }
+        (project, streams, sessions, events)
+    }
+
+    /// Day queries answered from the cache read no block's body, and answer what paragraphs
+    /// written afresh say; new work on a day has only that day's paragraph written again, from
+    /// its own blocks' bodies.
+    #[test]
+    fn days_from_the_cache_read_no_body_and_answer_as_written_afresh() {
+        use crate::recap_db::tests::decoded;
+        let (project, streams, sessions, events) = linked_log();
+        let mut cached = Recaps::new(None);
+        let mut fresh = Recaps::new(None).with_day_cache(0);
+        cached.push(&events);
+        fresh.push(&events);
+        let scopes = [
+            DaysScope::Project(project),
+            DaysScope::Workstream(streams[0]),
+            DaysScope::Workstream(streams[1]),
+        ];
+        let queries: Vec<(DaysScope, i32, Option<Date>, Option<usize>)> = scopes
+            .iter()
+            .flat_map(|scope| {
+                [
+                    (*scope, 0, None, None),
+                    (*scope, 120, None, Some(2)),
+                    (*scope, -300, Some(Date("2026-10-02".into())), Some(30)),
+                ]
+            })
+            .collect();
+        let ask = |r: &mut Recaps, (scope, tz, before, limit): &(DaysScope, i32, Option<Date>, Option<usize>)| {
+            r.days(*scope, *tz, before.as_ref(), *limit).expect("days")
+        };
+
+        // Written once: the paragraphs read their blocks' bodies.
+        let first: Vec<DaysPage> = queries.iter().map(|q| ask(&mut cached, q)).collect();
+        for (q, page) in queries.iter().zip(&first) {
+            assert_eq!(page, &ask(&mut fresh, q), "{q:?}");
+        }
+        // The day things were created, and four days of work.
+        let whole = &first[0];
+        assert_eq!(whole.days.iter().map(|d| &d.date).collect::<HashSet<_>>().len(), 5);
+        for workstream in [None, Some(streams[0]), Some(streams[1])] {
+            assert!(
+                whole.days.iter().any(|d| d.workstream == workstream),
+                "an entry for {workstream:?}"
+            );
+        }
+        assert!(cached.days_written() > 0);
+
+        // Again: every paragraph from the cache, and not one body read.
+        let written = cached.days_written();
+        for (q, page) in queries.iter().zip(&first) {
+            let before = decoded();
+            assert_eq!(&ask(&mut cached, q), page, "{q:?}");
+            assert_eq!(decoded(), before, "{q:?} decoded a body");
+        }
+        assert_eq!(cached.days_written(), written);
+
+        // More work in the first session on the last day: that paragraph alone is written again,
+        // from the bodies of the blocks it covers and no others.
+        let mut more = tool_run(1_000, 0);
+        more.at = 1_790_755_200_000 + 3 * DAY_MS + 5 * 60_000;
+        if let EventBody::ToolRan {
+            session, receipt, ..
+        } = &mut more.body
+        {
+            *session = sessions[0];
+            *receipt = Receipt::Transcript {
+                session: sessions[0],
+                offset: 9,
+            };
+        }
+        cached.push(std::slice::from_ref(&more));
+        fresh.push(std::slice::from_ref(&more));
+        let stream = (DaysScope::Workstream(streams[0]), 0, None, None);
+        let want = ask(&mut fresh, &stream);
+        let before = decoded();
+        let got = ask(&mut cached, &stream);
+        assert_eq!(got, want);
+        assert_ne!(got, first[3], "the latest paragraph changed");
+        assert_eq!(cached.days_written(), written + 1);
+        assert_eq!(decoded() - before, got.days[0].blocks.len());
+        // And the rest still from the cache.
+        for q in &queries {
+            let want = ask(&mut fresh, q);
+            assert_eq!(ask(&mut cached, q), want, "{q:?}");
+        }
     }
 
     #[test]
