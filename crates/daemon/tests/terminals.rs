@@ -814,7 +814,11 @@ done
         let mut daemon = rig.start(&["--demo"]);
         let device = daemon.device_token();
         let info = daemon.get("/v1/host/info", None).json();
-        assert_eq!(info["capabilities"], json!(["tmux", "watch", "scan"]), "{info}");
+        assert_eq!(
+            info["capabilities"],
+            json!(["tmux", "watch", "scan"]),
+            "{info}"
+        );
         let logs = daemon.stderr();
         assert!(
             logs.contains("the runner's terminals run in tmux")
@@ -926,7 +930,11 @@ done
         // The next daemon finds the terminal, and its output goes on from that offset.
         let daemon = rig.start(&[]);
         let info = daemon.get("/v1/host/info", None).json();
-        assert_eq!(info["capabilities"], json!(["tmux", "watch", "scan"]), "{info}");
+        assert_eq!(
+            info["capabilities"],
+            json!(["tmux", "watch", "scan"]),
+            "{info}"
+        );
         let mut resumed = Terminal::open(&daemon, &a_id, Some(offset), &device);
         let mut from_start = Terminal::open(&daemon, &a_id, None, &device);
         post(
@@ -1075,7 +1083,11 @@ done
         assert_ne!(sa, sb);
         for (daemon, socket) in [(&a, &sa), (&b, &sb)] {
             let info = daemon.get("/v1/host/info", None).json();
-            assert_eq!(info["capabilities"], json!(["tmux", "watch", "scan"]), "{info}");
+            assert_eq!(
+                info["capabilities"],
+                json!(["tmux", "watch", "scan"]),
+                "{info}"
+            );
             assert!(socket.starts_with(&tmpdir), "{}", socket.display());
             let dir = socket
                 .parent()
