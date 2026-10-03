@@ -733,7 +733,7 @@ fn move_row(
 /// Whether terminal `t`, still waiting for its transcript, could be `found`'s by folder: started
 /// for a CLI whose id is not chosen in advance, in its folder, within the claim window (as of
 /// `now`), and no later than it (with [`CLAIM_SLACK_MS`] of slack).
-fn by_folder(t: &TerminalRow, found: &Found<'_>, now: TimestampMs) -> bool {
+pub(crate) fn by_folder(t: &TerminalRow, found: &Found<'_>, now: TimestampMs) -> bool {
     t.native_id.is_none()
         && found.cwd.is_some_and(|c| same_dir(c, &t.cwd))
         && t.started_at >= now.saturating_sub(CLAIM_WINDOW_MS)

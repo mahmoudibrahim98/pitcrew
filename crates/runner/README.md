@@ -140,7 +140,9 @@ before the dispatch's CLI starts.
   runtime locks held). After that scan, an unmatched terminal accepts no later folder match;
   migration `0003_folder_claims.sql` keeps that closed claim across runner restarts.
   a Codex or OpenCode start in its folder retires it (forgets its row). A failed or timed-out
-  scan leaves it eligible and refuses retirement until discovery succeeds. A Claude terminal
+  scan leaves it eligible and refuses retirement until discovery succeeds for its engine's
+  homes and any unread transcript that could belong to it. Unrelated engines and transcripts
+  with another exact CLI id or a nonmatching folder/start time do not hold its scan open. A Claude terminal
   is matched by its exact
   id, so it keeps its row until the host retires it (`RunnerCommands::retire`, once the hub gave
   up on the session).

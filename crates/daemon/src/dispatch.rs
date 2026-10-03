@@ -806,6 +806,156 @@ mod tests {
     }
 
     #[test]
+    fn an_unrelated_empty_transcript_does_not_block_dispatch_retirement() {
+        use pitcrew_interfaces::source::{
+            Cursor, ParseChunk, SourceAdapter, SourceError, TranscriptPage, TranscriptRef,
+        };
+
+        // Model an adapter that cannot read session metadata from the empty old transcript.
+        struct MissingMetadata(pitcrew_ingest::claude::ClaudeAdapter);
+        impl SourceAdapter for MissingMetadata {
+            fn engine(&self) -> Engine {
+                Engine::Claude
+            }
+            fn discover(&self, home: &Path) -> Result<Vec<TranscriptRef>, SourceError> {
+                self.0.discover(home)
+            }
+            fn read_from(
+                &self,
+                transcript: &TranscriptRef,
+                _: &Cursor,
+            ) -> Result<ParseChunk, SourceError> {
+                Err(SourceError::Unreadable {
+                    path: transcript.path.clone(),
+                    reason: "session metadata is missing".into(),
+                })
+            }
+            fn read_page(
+                &self,
+                transcript: &TranscriptRef,
+                before: Option<u64>,
+                limit: usize,
+            ) -> Result<TranscriptPage, SourceError> {
+                self.0.read_page(transcript, before, limit)
+            }
+        }
+        for engine in [Engine::Codex, Engine::Claude] {
+            let tmp = tempfile::tempdir().unwrap();
+            let sam = member(MemberKind::Human, "@sam", None);
+            let writer = member(MemberKind::Agent, "@writer", Some(sam.id));
+            let mut pending = session(Some(writer.id));
+            pending.engine = engine;
+            let folder = tmp.path().join("work");
+            std::fs::create_dir_all(&folder).unwrap();
+            pending.cwd = folder.to_str().unwrap().to_owned();
+            let work = work(tmp.path(), &[&sam, &writer], &[&pending]);
+            let dispatch = pitcrew_protocol::model::Dispatch {
+                id: DispatchId::new(),
+                task: TaskId::new(),
+                agent: writer.id,
+                session: Some(pending.id),
+                brief: "Submit the seeds".into(),
+                started: 1,
+                ended: None,
+                outcome: None,
+                summary: None,
+            };
+            work.store()
+                .append(&[Event::now(
+                    work.workspace(),
+                    sam.id,
+                    EventBody::DispatchStarted {
+                        dispatch: dispatch.clone(),
+                    },
+                )])
+                .unwrap();
+            let claude = tmp.path().join("claude");
+            let codex = tmp.path().join("codex");
+            let empty = claude.join("projects/old/empty.jsonl");
+            std::fs::create_dir_all(empty.parent().unwrap()).unwrap();
+            std::fs::write(empty, b"").unwrap();
+            let config = pitcrew_runner::RunnerConfig::new(
+                work.workspace(),
+                pending.machine,
+                sam.id,
+                tmp.path().join("runner"),
+            )
+            .with_home(Engine::Claude, &claude)
+            .with_home(Engine::Codex, &codex);
+            let runner = pitcrew_runner::start(
+                config,
+                vec![
+                    Arc::new(MissingMetadata(pitcrew_ingest::claude::ClaudeAdapter::new())),
+                    Arc::new(pitcrew_ingest::codex::CodexAdapter::new()),
+                ],
+                Arc::new(pitcrew_runner::StoreSink::new(work.store().clone(), sam.id)),
+            )
+            .unwrap();
+            let runtime = Arc::new(pitcrew_interfaces::fake::FakeRuntime::default());
+            let terminals = runner.terminals(runtime.clone()).unwrap();
+            let commands = runner.commands(&terminals);
+            let command = |named| RunnerCommand::StartSession {
+                engine,
+                cwd: pending.cwd.clone(),
+                name: "Seeds".into(),
+                brief: None,
+                persona: None,
+                model: None,
+                account: None,
+                permission_mode: PermissionMode::Default,
+                session: Some(named),
+            };
+            assert!(matches!(
+                commands.run(CommandId::new(), &command(pending.id)),
+                CommandOutcome::Ok { .. }
+            ));
+            let terminal = terminals.terminal_of(pending.id).unwrap().unwrap();
+            pitcrew_interfaces::runtime::Runtime::kill(runtime.as_ref(), terminal).unwrap();
+            assert_eq!(
+                commands.started(pending.id),
+                Started::Gone,
+                "an unrelated empty transcript must not block the exited CLI's final scan"
+            );
+            let starts: Arc<dyn Starts> = Arc::new(commands.clone());
+            let attached = Attached::default();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let mut gone = HashSet::new();
+                for _ in 0..2 {
+                    look_at(
+                        &Arc::downgrade(&work),
+                        &attached,
+                        pending.machine,
+                        &starts,
+                        &mut gone,
+                    )
+                    .await;
+                }
+            });
+            assert_eq!(
+                work.dispatch(&dispatch.id).unwrap().outcome,
+                Some(pitcrew_protocol::model::DispatchOutcome::Failed)
+            );
+            assert_eq!(
+                work.session(&pending.id).unwrap().state,
+                SessionState::Ended
+            );
+            assert_eq!(terminals.terminal_of(pending.id).unwrap(), None);
+            assert!(
+                matches!(
+                    commands.run(CommandId::new(), &command(SessionId::new())),
+                    CommandOutcome::Ok { .. }
+                ),
+                "a new start must not be told to try again"
+            );
+            runner.stop();
+        }
+    }
+
+    #[test]
     fn a_reported_dispatch_finishes_when_its_cli_exits_without_a_hook() {
         let tmp = tempfile::tempdir().unwrap();
         let sam = member(MemberKind::Human, "@sam", None);

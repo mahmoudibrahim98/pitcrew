@@ -1058,10 +1058,9 @@ impl Watcher {
             }
         }
         if !wake.exit_scans.is_empty() {
-            let complete = self.homes.iter().all(|h| !h.discover_failing)
-                && self.tracked.iter().all(|(_, t)| t.discovered);
             for (terminal, reply) in wake.exit_scans {
-                let closed = complete && self.store_lock().close_folder_claim(terminal).is_ok();
+                let closed = self.exit_scan_complete(terminal)
+                    && self.store_lock().close_folder_claim(terminal).is_ok();
                 if closed {
                     self.shared.lock().exhausted.insert(terminal);
                 }
@@ -1070,6 +1069,78 @@ impl Watcher {
         }
         self.let_go();
         Ok(())
+    }
+
+    /// Only this terminal's engine and possible transcripts can hold its final scan open.
+    fn exit_scan_complete(&mut self, terminal: TerminalId) -> bool {
+        let terminals = match self.store_lock().terminals() {
+            Ok(terminals) => terminals,
+            Err(e) => {
+                tracing::warn!(%terminal, error = %e, "cannot look up the terminal's final scan");
+                return false;
+            }
+        };
+        let Some(terminal) = terminals.into_iter().find(|t| t.terminal == terminal) else {
+            return true;
+        };
+        let Some(engine) = terminal.engine else {
+            return true;
+        };
+        if self
+            .homes
+            .iter()
+            .any(|h| h.engine == engine && h.discover_failing)
+        {
+            return false;
+        }
+        let unread: Vec<u64> = self
+            .tracked
+            .iter()
+            .filter(|(_, t)| t.engine == engine && !t.discovered && !t.subagent)
+            .map(|(id, _)| *id)
+            .collect();
+        let now = crate::now_ms();
+        for id in unread {
+            if !self.load(id) {
+                return false;
+            }
+            let Some(t) = self.tracked.get_mut(&id) else {
+                return false;
+            };
+            let caught_up = t.caught_up;
+            let Some(row) = t.row() else {
+                return false;
+            };
+            if terminal.session == Some(row.session) {
+                return false;
+            }
+            let native = native_id(row);
+            if let Some(expected) = &terminal.native_id {
+                if *expected == native {
+                    return false;
+                }
+                continue;
+            }
+            // A successful read with no metadata cannot be claimed by folder. A failed or
+            // unfinished read may still reveal this terminal's folder on the next attempt.
+            let Some(meta) = &row.meta else {
+                if !caught_up {
+                    return false;
+                }
+                continue;
+            };
+            let found = store::Found {
+                session: row.session,
+                engine,
+                native_id: &native,
+                cwd: meta.cwd.as_deref(),
+                started: meta.started.unwrap_or(now),
+            };
+            if store::by_folder(&terminal, &found, now) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Checks every transcript of one home by size and mtime.
