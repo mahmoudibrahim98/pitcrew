@@ -3,7 +3,8 @@
 - **Stream:** 0 · Contracts (daemon route, ingest options, conformance and CI).
   **Branch:** `integrator/scan-followups`.
   **Paths:**
-  - `crates/daemon/src/scan.rs`, `crates/ingest/src/scan.rs` (and the ingest README);
+  - `crates/daemon/src/scan.rs`, `crates/daemon/src/host.rs`, `crates/ingest/src/scan.rs` (and the ingest README);
+  - `crates/protocol/**` (the scan module's `ScanReport`, for the partial flag), and the regenerated `packages/protocol-ts`;
   - `tests/conformance/**`, `docs/build/contracts/api-v1.md`;
   - `apps/mock-hub/**`, only to align host info;
   - `.github/workflows/ci.yml` (one step).
