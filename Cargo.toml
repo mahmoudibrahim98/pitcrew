@@ -69,6 +69,7 @@ pitcrew-api = { path = "crates/api" }
 pitcrew-auth = { path = "crates/auth" }
 pitcrew-remote = { path = "crates/remote" }
 pitcrew-legacy = { path = "crates/legacy" }
+pitcrew-trust = { path = "crates/trust" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

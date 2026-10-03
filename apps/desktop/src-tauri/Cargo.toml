@@ -47,6 +47,9 @@ pitcrew-protocol = { path = "../../../crates/protocol" }
 # Only `pitcrew_api::client`: the checks a client makes before trusting a local daemon with a
 # token (the socket and its directory are ours; the pipe's owner is us). No store, no server.
 pitcrew-api = { path = "../../../crates/api", default-features = false }
+# `check_trusted`: the check every program PitCrew launches passes (here `pitcrewd` and the
+# remote helpers; the daemon checks `pitcrew-ptyd` with it too). No async, nothing new.
+pitcrew-trust = { path = "../../../crates/trust" }
 # 2.12.x exactly: the Tauri CLI refuses a major.minor that differs from the UI's @tauri-apps/api
 # (docs/build/contracts/desktop-gateway.md, "Versions"). Default features minus `dbus` and
 # `dynamic-acl`: no capability can be added at run time. `tray-icon`: the tray (on Linux through

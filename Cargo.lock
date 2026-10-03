@@ -1274,6 +1274,7 @@ dependencies = [
  "pitcrew-interfaces",
  "pitcrew-protocol",
  "pitcrew-store",
+ "pitcrew-trust",
  "proptest",
  "serde",
  "serde_json",
@@ -1282,7 +1283,6 @@ dependencies = [
  "tower",
  "tracing",
  "tungstenite",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1502,6 +1502,7 @@ dependencies = [
  "getrandom",
  "pitcrew-fixtures",
  "pitcrew-protocol",
+ "pitcrew-trust",
  "proptest",
  "rustix",
  "serde",
@@ -1548,10 +1549,12 @@ version = "0.0.0"
 dependencies = [
  "pitcrew-interfaces",
  "pitcrew-protocol",
+ "pitcrew-trust",
  "proptest",
  "rustix",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "vt100",
@@ -1604,6 +1607,16 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "pitcrew-trust"
+version = "0.0.0"
+dependencies = [
+ "rustix",
+ "tempfile",
+ "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
