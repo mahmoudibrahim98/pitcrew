@@ -137,8 +137,9 @@ struct OwnedFolder(PathBuf);
 
 impl OwnedFolder {
     /// A new folder in `base` that only this user may open (0700 on Unix), with a name no one
-    /// can guess beforehand. `base` must not let others rename what is in it (on Unix: not
-    /// writable by group or others, unless sticky, as `/tmp` is).
+    /// can guess beforehand. `base` must not let others rename or remove what is in it: on Unix
+    /// it belongs to root or to this user, and is not writable by group or others unless sticky,
+    /// as `/tmp` is ([`base_is_safe`]).
     fn make(base: &Path) -> io::Result<Self> {
         let meta = fs::metadata(base)?;
         if !meta.is_dir() {
@@ -146,14 +147,8 @@ impl OwnedFolder {
         }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mode = meta.permissions().mode();
-            if mode & 0o022 != 0 && mode & 0o1000 == 0 {
-                return Err(io::Error::other(format!(
-                    "others can change what is in it (mode {:o})",
-                    mode & 0o7777
-                )));
-            }
+            use std::os::unix::fs::MetadataExt as _;
+            base_is_safe(meta.uid(), meta.mode(), effective_uid()?).map_err(io::Error::other)?;
         }
         let path = base.join(format!("pitcrew-recaps-{}", EventId::new().0));
         #[cfg(unix)]
@@ -185,6 +180,34 @@ impl Drop for OwnedFolder {
             tracing::warn!(folder = %self.0.display(), error = %e, "cannot remove the recap index's folder");
         }
     }
+}
+
+/// This process's effective user: the owner of a socket it makes, which the kernel gives the user
+/// it makes files as (Linux and macOS alike). `std` has no `geteuid`, and this crate takes no
+/// dependency for one.
+#[cfg(unix)]
+fn effective_uid() -> io::Result<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+    let socket = std::os::unix::net::UnixDatagram::unbound()?;
+    let file = fs::File::from(std::os::fd::OwnedFd::from(socket));
+    Ok(file.metadata()?.uid())
+}
+
+/// Whether a folder owned by `uid`, with `mode`, may hold the private folder for `me`: it belongs
+/// to root or to `me` (the owner rule of `pitcrew_trust::check_trusted`), and others cannot rename
+/// or remove what is in it (not writable by group or others, unless sticky, as `/tmp` is).
+#[cfg(unix)]
+fn base_is_safe(uid: u32, mode: u32, me: u32) -> Result<(), String> {
+    if uid != 0 && uid != me {
+        return Err(format!("it belongs to another user (uid {uid})"));
+    }
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Err(format!(
+            "others can change what is in it (mode {:o})",
+            mode & 0o7777
+        ));
+    }
+    Ok(())
 }
 
 /// The folder a file at `path` is in (`.` for a bare name).
@@ -703,5 +726,35 @@ pub(crate) mod tests {
             Some(made[0].join("recaps.sqlite3").as_path())
         );
         assert_eq!(mode(&made[0]), 0o700);
+    }
+
+    /// The base rule itself, with owners no test can make without root: a base must be root's or
+    /// ours, and closed to others unless sticky.
+    #[cfg(unix)]
+    #[test]
+    fn the_owner_and_mode_rules() {
+        let me = 1000;
+        let dir = 0o040_000;
+        for (uid, mode) in [(0, 0o1777), (0, 0o755), (me, 0o700), (me, 0o1777)] {
+            assert_eq!(base_is_safe(uid, dir | mode, me), Ok(()), "{uid} {mode:o}");
+        }
+        for (uid, mode) in [(1001, 0o700), (1001, 0o1777), (me, 0o777), (0, 0o775)] {
+            assert!(base_is_safe(uid, dir | mode, me).is_err(), "{uid} {mode:o}");
+        }
+    }
+
+    /// The user owners are checked against (read from a socket's owner) is the one this process
+    /// makes files as.
+    #[cfg(unix)]
+    #[test]
+    fn the_effective_uid_is_the_owner_of_what_this_process_makes() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("made");
+        fs::write(&file, b"").expect("write");
+        assert_eq!(
+            effective_uid().expect("uid"),
+            fs::metadata(&file).expect("meta").uid()
+        );
     }
 }
