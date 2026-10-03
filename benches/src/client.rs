@@ -216,6 +216,28 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
 
+    fn read_request(stream: &mut TcpStream) -> Vec<u8> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            stream.read_exact(&mut byte).unwrap();
+            head.push(byte[0]);
+            assert!(head.len() <= 16 * 1024, "request headers too large");
+        }
+        let length = std::str::from_utf8(&head)
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map_or(0, |(_, value)| value.trim().parse::<usize>().unwrap());
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body).unwrap();
+        body
+    }
+
     #[test]
     fn reads_a_content_length_and_a_chunked_answer() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -226,8 +248,12 @@ mod tests {
                 "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n",
             ] {
                 let (mut s, _) = listener.accept().unwrap();
-                let mut seen = [0u8; 1024];
-                let _ = s.read(&mut seen).unwrap();
+                let body = read_request(&mut s);
+                if reply.contains("202 Accepted") {
+                    assert_eq!(body, b"{}");
+                } else {
+                    assert!(body.is_empty());
+                }
                 s.write_all(reply.as_bytes()).unwrap();
             }
         });
@@ -239,6 +265,25 @@ mod tests {
     }
 
     #[test]
+    fn the_standin_drains_a_body_that_arrives_after_the_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert_eq!(read_request(&mut stream), b"body");
+        });
+        let mut client = TcpStream::connect(address).unwrap();
+        client
+            .write_all(b"POST /x HTTP/1.1\r\nContent-Length: 4\r\n\r\n")
+            .unwrap();
+        thread::sleep(Duration::from_millis(20));
+        client.write_all(b"bo").unwrap();
+        thread::sleep(Duration::from_millis(20));
+        client.write_all(b"dy").unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
     fn reads_frames_of_every_length_and_skips_pings() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -246,8 +291,7 @@ mod tests {
         let sent = long.clone();
         let server = thread::spawn(move || {
             let (mut s, _) = listener.accept().unwrap();
-            let mut seen = [0u8; 1024];
-            let _ = s.read(&mut seen).unwrap();
+            assert!(read_request(&mut s).is_empty());
             let mut out =
                 b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n".to_vec();
             out.extend_from_slice(&[0x81, 2, b'h', b'i']);
