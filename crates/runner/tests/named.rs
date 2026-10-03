@@ -1,8 +1,9 @@
 //! Sessions the hub named (`StartSession`'s `session`, a dispatch's): the CLI's transcript is
 //! reported under that id, once, for each engine (the real adapters, `FakeRuntime`, transcripts
 //! written as each CLI writes them); its sub-agents keep ids of their own with it as their parent;
-//! the CLI gets what the `SessionEnv` gives; and a second start in a folder where a CLI matched by
-//! folder still waits is refused.
+//! the CLI gets what the `SessionEnv` gives; a second start in a folder where a CLI matched by
+//! folder still waits is refused; a start under way is running, never gone; and a terminal whose
+//! program ended before its transcript appeared is never taken for a later transcript.
 
 #![allow(clippy::unwrap_used)]
 
@@ -25,7 +26,8 @@ use pitcrew_runner::{
     RunnerCommands, RunnerConfig, RunnerHandle, RunnerTerminals, SessionEnv, Started, Timing,
 };
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 /// Longest wait for the watcher thread: a ceiling, not a delay.
@@ -77,16 +79,57 @@ impl Runtime for Recording {
     }
 }
 
-/// Gives every named session's CLI a token file's path (never a token), or refuses.
+/// Holds whoever waits on it until it is opened.
+#[derive(Debug, Default)]
+struct Gate {
+    open: Mutex<bool>,
+    opened: Condvar,
+    waiting: AtomicBool,
+}
+
+impl Gate {
+    fn wait(&self) {
+        self.waiting.store(true, Ordering::SeqCst);
+        let mut open = self.open.lock().unwrap();
+        while !*open {
+            open = self.opened.wait(open).unwrap();
+        }
+    }
+
+    fn is_waiting(&self) -> bool {
+        self.waiting.load(Ordering::SeqCst)
+    }
+
+    fn open(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+}
+
+/// Opens a [`Gate`] when dropped, so a failed assertion never leaves a start waiting on it.
+struct Opens(Arc<Gate>);
+
+impl Drop for Opens {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+/// Gives every named session's CLI a token file's path (never a token), or refuses; with a
+/// `gate`, only once it is opened (a start held under way).
 #[derive(Debug, Default)]
 struct TokenFiles {
     refuse: bool,
     asked: Mutex<Vec<SessionId>>,
+    gate: Option<Arc<Gate>>,
 }
 
 impl SessionEnv for TokenFiles {
     fn env_for(&self, session: SessionId) -> Result<Vec<(String, String)>, String> {
         self.asked.lock().unwrap().push(session);
+        if let Some(gate) = &self.gate {
+            gate.wait();
+        }
         if self.refuse {
             return Err("the session's agent has no owner".into());
         }
@@ -672,4 +715,116 @@ fn a_transcript_found_while_its_start_is_under_way_takes_the_name() {
     assert_eq!(sessions_named(&sink.events()), [named]);
     drop((terminals, commands));
     runner.stop();
+}
+
+/// A start for a named session is under way from the moment its command runs until it returns:
+/// all that time, before its program or its terminal exists, `started` says it runs, so the hub's
+/// reconciliation never takes it for one that did not start. Claude (its id chosen here) and
+/// Codex (matched by folder, waiting for the folder's lock) alike.
+#[test]
+fn a_start_under_way_is_running_never_gone() {
+    for engine in [Engine::Claude, Engine::Codex] {
+        let home = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let gate = Arc::new(Gate::default());
+        let r = Rig::new(
+            engine,
+            home.path(),
+            state.path(),
+            TokenFiles {
+                gate: Some(Arc::clone(&gate)),
+                ..TokenFiles::default()
+            },
+        );
+        let named = SessionId::new();
+        assert_eq!(r.commands.started(named), Started::Gone);
+
+        let opens = Opens(Arc::clone(&gate));
+        let commands = r.commands.clone();
+        let command = start(engine, work.path(), Some(named));
+        let starting = std::thread::spawn(move || commands.run(CommandId::new(), &command));
+        assert!(common::eventually(CEILING, || gate.is_waiting()));
+        // Held while its environment is made: no program, no terminal, and yet under way.
+        assert!(r.runtime.list().unwrap().is_empty());
+        assert_eq!(r.terminals.terminal_of(named).unwrap(), None);
+        for _ in 0..3 {
+            assert_eq!(r.commands.started(named), Started::Running, "{engine:?}");
+        }
+
+        drop(opens);
+        let outcome = starting.join().unwrap();
+        assert!(
+            matches!(outcome, CommandOutcome::Ok { .. }),
+            "{engine:?}: {outcome:?}"
+        );
+        assert!(r.terminals.terminal_of(named).unwrap().is_some());
+        assert_eq!(r.commands.started(named), Started::Running, "{engine:?}");
+        r.runner.stop();
+    }
+}
+
+/// The reported case: S1 (Codex, for a named session) is started, then killed before it writes
+/// its rollout; S2 is started in the same folder. The folder's next rollout is S2's, not S1's.
+/// And with no start after the killed one, a rollout written in its folder (a CLI started by
+/// hand) is a session of its own: a terminal whose program ended is never matched by folder.
+/// Once the hub gives up on such a session, its terminal is retired.
+#[test]
+fn a_terminal_whose_program_ended_claims_no_transcript() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let r = Rig::new(
+        Engine::Codex,
+        home.path(),
+        state.path(),
+        TokenFiles::default(),
+    );
+    let kill = |session| {
+        r.run(&RunnerCommand::EndSession {
+            session,
+            mode: EndMode::Kill,
+        })
+    };
+
+    let s1 = SessionId::new();
+    r.start(Engine::Codex, work.path(), Some(s1));
+    assert_eq!(kill(s1), CommandOutcome::Ok { detail: None });
+    let s2 = SessionId::new();
+    let (t2, _) = r.start(Engine::Codex, work.path(), Some(s2));
+    assert_eq!(r.commands.started(s1), Started::Gone);
+    assert_eq!(r.commands.started(s2), Started::Running);
+
+    let native = "5d2c8e1f-3a4b-4c6d-9e7f-0a1b2c3d4e5f";
+    place_codex(home.path(), native, work.path());
+    let session = r.discovered(native);
+    assert_eq!(session.id, s2, "{:?}", labels(&r.sink.events()));
+    assert_eq!(session.terminal, Some(t2));
+    assert_eq!(r.commands.started(s2), Started::Reported);
+    assert_eq!(r.commands.started(s1), Started::Gone);
+
+    // Killed, and no start after it: a rollout in its folder is not its.
+    let s3 = SessionId::new();
+    r.start(Engine::Codex, work.path(), Some(s3));
+    assert_eq!(kill(s3), CommandOutcome::Ok { detail: None });
+    let by_hand = "6e3d9f20-4b5c-4d7e-8f90-1b2c3d4e5f60";
+    place_codex(home.path(), by_hand, work.path());
+    let own = r.discovered(by_hand);
+    assert_ne!(own.id, s3, "{:?}", labels(&r.sink.events()));
+    assert_eq!(own.terminal, None);
+    assert_eq!(r.commands.started(s3), Started::Gone);
+
+    // The hub gave up on S3: its terminal is retired, once. A reported session keeps its own.
+    assert!(r.commands.retire(s3).unwrap());
+    assert!(!r.commands.retire(s3).unwrap());
+    assert!(!r.commands.retire(s2).unwrap());
+    assert_eq!(r.terminals.terminal_of(s3).unwrap(), None);
+    assert_eq!(r.terminals.terminal_of(s2).unwrap(), Some(t2));
+    let events = r.sink.events();
+    assert!(
+        !sessions_named(&events).contains(&s1) && !sessions_named(&events).contains(&s3),
+        "{:?}",
+        labels(&events)
+    );
+    r.runner.stop();
 }

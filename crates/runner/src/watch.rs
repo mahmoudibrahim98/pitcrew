@@ -36,6 +36,7 @@ use crate::pages::Source;
 use crate::pages::Watched;
 use crate::sink::Batch;
 use crate::store::{self, Claim, Commit, Indexed, Row, Store, native_id, path_text};
+use crate::terminals::{RunnerTerminals, WeakTerminals};
 use notify::event::{EventKind, MetadataKind, ModifyKind};
 use notify::{RecursiveMode, Watcher as _};
 use pitcrew_interfaces::source::{Cursor, ParseChunk, SourceAdapter, SourceError, TranscriptRef};
@@ -117,6 +118,35 @@ pub(crate) struct Shared {
     cv: Condvar,
     /// Starts for sessions the hub named whose terminal is not recorded yet (see [`Pending`]).
     pending: Mutex<Vec<Pending>>,
+    /// Commands starting a session the hub named, from when they are run until they return: how
+    /// many for each session (see [`Shared::under_way`]).
+    under_way: Mutex<HashMap<SessionId, usize>>,
+    /// The terminals the runner's commands start CLIs in, once there are any: asked whether a
+    /// terminal's program still runs (see [`Shared::has_ended`]).
+    terminals: Mutex<Option<WeakTerminals>>,
+}
+
+/// Keeps a start for a session the hub named known as under way ([`Shared::under_way`]) until
+/// dropped.
+pub(crate) struct UnderWay<'a> {
+    shared: &'a Shared,
+    session: SessionId,
+}
+
+impl Drop for UnderWay<'_> {
+    fn drop(&mut self) {
+        let mut under_way = self
+            .shared
+            .under_way
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(n) = under_way.get_mut(&self.session) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                under_way.remove(&self.session);
+            }
+        }
+    }
 }
 
 /// A start for a session the hub named, from just before its program starts until its terminal
@@ -281,6 +311,51 @@ impl Shared {
             shared: self,
             session,
         }
+    }
+
+    /// A command starting `session`, a session the hub named, runs: until the guard is dropped
+    /// (when the command returns, its terminal recorded or the start refused), the session's
+    /// start is under way, and `RunnerCommands::started` answers it as running.
+    pub fn under_way(&self, session: SessionId) -> UnderWay<'_> {
+        *self
+            .under_way
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(session)
+            .or_insert(0) += 1;
+        UnderWay {
+            shared: self,
+            session,
+        }
+    }
+
+    /// Whether a command starting `session` runs now.
+    pub fn is_under_way(&self, session: SessionId) -> bool {
+        self.under_way
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&session)
+    }
+
+    /// The runner's commands start CLIs in `terminals`: [`Shared::has_ended`] asks them.
+    pub fn set_terminals(&self, terminals: &RunnerTerminals) {
+        *self
+            .terminals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(terminals.downgrade());
+    }
+
+    /// Whether `terminal`'s program has certainly ended: its runtime says so, or no longer has
+    /// it. False while it runs, and when that cannot be told (no terminals yet, or a runtime that
+    /// does not answer). Blocking: it asks the runtime, for at most its call timeout.
+    pub fn has_ended(&self, terminal: TerminalId) -> bool {
+        let terminals = self
+            .terminals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(WeakTerminals::upgrade);
+        terminals.is_some_and(|t| t.has_ended(terminal))
     }
 
     /// The session of a start under way whose CLI is `native` (an id the runner chose), or that
@@ -2104,6 +2179,10 @@ impl Watcher {
 
     /// The terminal the runner started a newly discovered session in, if it did, and the session
     /// the hub named for it, which the transcript then adopts (its row is moved in the index).
+    ///
+    /// A terminal matched by folder whose program has ended is not this transcript's: a CLI that
+    /// was killed, or ended, before its transcript appeared never writes one. The runtime is
+    /// asked about those terminals without the index locked.
     fn claim_terminal(
         &self,
         session: SessionId,
@@ -2113,8 +2192,29 @@ impl Watcher {
         started: Option<TimestampMs>,
     ) -> Option<Claim> {
         let now = crate::now_ms();
+        let found = store::Found {
+            session,
+            engine,
+            native_id: native,
+            cwd,
+            started: started.unwrap_or(now),
+        };
+        let candidates = self
+            .store_lock()
+            .folder_candidates(&found, now)
+            .unwrap_or_else(|e| {
+                tracing::warn!(%session, error = %e, "cannot look up the terminals started in the session's folder");
+                Vec::new()
+            });
+        let ended: Vec<TerminalId> = candidates
+            .into_iter()
+            .filter(|t| self.shared.has_ended(*t))
+            .collect();
+        if !ended.is_empty() {
+            tracing::debug!(%session, ?ended, "terminals in the folder whose program ended are not matched");
+        }
         self.store_lock()
-            .claim_terminal(session, engine, native, cwd, started.unwrap_or(now), now)
+            .claim_terminal(&found, now, &ended)
             .unwrap_or_else(|e| {
                 tracing::warn!(%session, error = %e, "cannot look up the session's terminal");
                 None

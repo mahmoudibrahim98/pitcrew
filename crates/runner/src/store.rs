@@ -34,7 +34,7 @@ const TERMINAL_COLUMNS: &str =
 
 /// A terminal started for a CLI whose session id is not known in advance is claimed by a session
 /// in its folder that starts within this long.
-const CLAIM_WINDOW_MS: TimestampMs = 15 * 60 * 1000;
+pub(crate) const CLAIM_WINDOW_MS: TimestampMs = 15 * 60 * 1000;
 /// Clock slack when matching a session's start to its terminal's.
 pub(crate) const CLAIM_SLACK_MS: TimestampMs = 5_000;
 /// Command outcomes are kept this long.
@@ -170,6 +170,20 @@ pub(crate) struct TerminalRow {
     pub native_id: Option<String>,
     pub cwd: String,
     pub started_at: TimestampMs,
+}
+
+/// A newly discovered session, as [`Store::claim_terminal`] matches it to a started terminal.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Found<'a> {
+    /// The id it was found with.
+    pub session: SessionId,
+    pub engine: Engine,
+    /// The CLI's own id for it.
+    pub native_id: &'a str,
+    /// Its folder, when its transcript names one.
+    pub cwd: Option<&'a str>,
+    /// When it started.
+    pub started: TimestampMs,
 }
 
 /// A started terminal claimed by a newly discovered transcript ([`Store::claim_terminal`]).
@@ -548,9 +562,26 @@ impl Store {
             .collect())
     }
 
+    /// The terminals `found` could be matched to by folder and start time (see
+    /// [`Store::claim_terminal`]), oldest first.
+    pub fn folder_candidates(
+        &self,
+        found: &Found<'_>,
+        now: TimestampMs,
+    ) -> Result<Vec<TerminalId>, StoreError> {
+        Ok(self
+            .waiting(found.engine)?
+            .iter()
+            .filter(|t| by_folder(t, found, now))
+            .map(|t| t.terminal)
+            .collect())
+    }
+
     /// The terminal a newly discovered session runs in: the one already linked to it (a replay,
     /// or a session the hub named), else a started terminal waiting for it, matched by the CLI's
     /// session id or, for a CLI whose id is not chosen in advance, by folder and start time.
+    /// Terminals in `ended` (their program ended, so they will write no transcript) are not
+    /// matched by folder.
     ///
     /// A terminal started for a session the hub named makes the transcript **adopt** that
     /// session: its row, saved under `session` (the id it was given when found), is moved to the
@@ -558,30 +589,25 @@ impl Store {
     /// use that id for everything it reports.
     pub fn claim_terminal(
         &self,
-        session: SessionId,
-        engine: Engine,
-        native_id: &str,
-        cwd: Option<&str>,
-        started: TimestampMs,
+        found: &Found<'_>,
         now: TimestampMs,
+        ended: &[TerminalId],
     ) -> Result<Option<Claim>, StoreError> {
+        let (session, native_id) = (found.session, found.native_id);
         if let Some(t) = self.terminal_of(session)? {
             return Ok(Some(Claim {
                 terminal: t.terminal,
                 adopted: None,
             }));
         }
-        let waiting = self.waiting(engine)?;
+        let waiting = self.waiting(found.engine)?;
         let by_id = waiting
             .iter()
             .find(|t| !native_id.is_empty() && t.native_id.as_deref() == Some(native_id));
         let by_folder = || {
-            waiting.iter().find(|t| {
-                t.native_id.is_none()
-                    && cwd.is_some_and(|c| same_dir(c, &t.cwd))
-                    && t.started_at >= now.saturating_sub(CLAIM_WINDOW_MS)
-                    && started >= t.started_at.saturating_sub(CLAIM_SLACK_MS)
-            })
+            waiting
+                .iter()
+                .find(|t| by_folder(t, found, now) && !ended.contains(&t.terminal))
         };
         let Some(t) = by_id.or_else(by_folder) else {
             return Ok(None);
@@ -689,6 +715,16 @@ fn move_row(
         params![from, to],
     )?;
     Ok(())
+}
+
+/// Whether terminal `t`, still waiting for its transcript, could be `found`'s by folder: started
+/// for a CLI whose id is not chosen in advance, in its folder, within the claim window (as of
+/// `now`), and no later than it (with [`CLAIM_SLACK_MS`] of slack).
+fn by_folder(t: &TerminalRow, found: &Found<'_>, now: TimestampMs) -> bool {
+    t.native_id.is_none()
+        && found.cwd.is_some_and(|c| same_dir(c, &t.cwd))
+        && t.started_at >= now.saturating_sub(CLAIM_WINDOW_MS)
+        && found.started >= t.started_at.saturating_sub(CLAIM_SLACK_MS)
 }
 
 /// Whether two folder paths name the same folder, ignoring trailing separators.
@@ -1108,6 +1144,22 @@ mod tests {
         assert_eq!(index[1].native, None, "not read yet");
     }
 
+    fn found<'a>(
+        session: SessionId,
+        engine: Engine,
+        native_id: &'a str,
+        cwd: &'a str,
+        started: i64,
+    ) -> Found<'a> {
+        Found {
+            session,
+            engine,
+            native_id,
+            cwd: Some(cwd),
+            started,
+        }
+    }
+
     fn terminal(engine: Engine, native_id: Option<&str>, cwd: &str, at: i64) -> TerminalRow {
         TerminalRow {
             terminal: TerminalId::new(),
@@ -1133,9 +1185,16 @@ mod tests {
 
         // A Claude session with another id does not take it; the one with its id does.
         let (s1, s2) = (SessionId::new(), SessionId::new());
-        let claim = |s, engine, native: &str, cwd, started| {
+        let claim = |session, engine, native_id: &str, cwd, started| {
+            let found = Found {
+                session,
+                engine,
+                native_id,
+                cwd,
+                started,
+            };
             store
-                .claim_terminal(s, engine, native, cwd, started, now)
+                .claim_terminal(&found, now, &[])
                 .expect("claim")
                 .map(|c| {
                     assert_eq!(c.adopted, None, "no session was named");
@@ -1224,7 +1283,7 @@ mod tests {
             None
         );
         let claim = store
-            .claim_terminal(claude, Engine::Claude, "abc", Some("/w"), now, now)
+            .claim_terminal(&found(claude, Engine::Claude, "abc", "/w", now), now, &[])
             .expect("claim");
         assert_eq!(
             claim,
@@ -1263,7 +1322,11 @@ mod tests {
             })
             .expect("partial");
         let claim = store
-            .claim_terminal(found.session, Engine::Codex, "n", Some("/w/p"), now, now)
+            .claim_terminal(
+                &self::found(found.session, Engine::Codex, "n", "/w/p", now),
+                now,
+                &[],
+            )
             .expect("claim");
         assert_eq!(
             claim,
@@ -1291,7 +1354,11 @@ mod tests {
         // Claimed again (a replay), it is the session's own terminal.
         assert_eq!(
             store
-                .claim_terminal(codex, Engine::Codex, "n", Some("/w/p"), now, now)
+                .claim_terminal(
+                    &self::found(codex, Engine::Codex, "n", "/w/p", now),
+                    now,
+                    &[]
+                )
                 .expect("claim"),
             Some(Claim {
                 terminal: by_folder.terminal,
