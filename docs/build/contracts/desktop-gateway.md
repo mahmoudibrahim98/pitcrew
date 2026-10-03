@@ -40,6 +40,7 @@ interface GatewayWorkspace {
   id: string;        // the daemon's workspace id (a ULID), as in `/w/$ws/…`
   name: string;
   kind: 'local' | 'remote';
+  host?: string;     // remote SSH host, or `wsl:<distro>` for WSL
   state: 'connecting' | 'ready' | 'unreachable' | 'needs_pairing';
   detail?: string;   // why it is unreachable or needs pairing, for people to read
 }
@@ -145,6 +146,31 @@ script.
 `gateway_ssh_hosts() → { hosts: string[] }`: the concrete `Host` names in the person's ssh config,
 for a picker. The person may also type a host.
 
+The following WSL extension is specified by brief `0-wsl-machines`. Desktop implementation is
+blocked until its path scope includes the command manifest and main-window capability; these
+WSL commands and target forms are not yet callable.
+
+`gateway_wsl_distros() → { available: boolean, distros: WslDistro[] }` lists local distros:
+
+```ts
+interface WslDistro { name: string; default: boolean; running: boolean; version: number }
+interface WslTarget { kind: 'wsl'; distro: string }
+```
+
+Missing WSL is a normal `{ available: false, distros: [] }` answer. A stopped WSL2 distro
+can be selected; probing starts it. WSL1 is refused with an explanation. The wizard offers
+“A WSL distro on this computer” only when available.
+
+Probe accepts `{ host }` unchanged, or `{ host: '', target: WslTarget }`. Plans use the same
+target form; a nonempty SSH host together with a target is refused. Add takes the opaque plan
+unchanged, which binds the chosen transport and distro. WSL permits only direct and tmux.
+No SSH configuration, askpass, host keys, SLURM or systemd-user are involved. Commands use
+`wsl.exe -d <distro> --exec /bin/sh -c …`, with the distro as one argument and POSIX-quoted
+commands. The API uses `pitcrewd connect` over stdio, never port forwarding. Deployment uses
+the Linux musl helper, compiled checksum manifest, atomic switch and existing private-directory
+checks. The saved registry records the target; restart and retry use the usual connection ladder
+and workspace states. Pairing reads the token over that transport and keeps it in the OS keychain.
+
 `gateway_remote_probe({ host }) → RemoteProbe`:
 
 ```ts
@@ -162,6 +188,7 @@ interface RemoteProbe {
 ```ts
 interface RemotePlanRequest {
   host: string;
+  target?: WslTarget;
   launcher: 'direct' | 'tmux' | 'slurm';
   site?: string;                            // a site recipe's name, for slurm
   job?: { partition?: string; account?: string; qos?: string; time?: string;
