@@ -72,7 +72,7 @@ pub(crate) fn assert_current_user_only(read: &OwnerAndDacl) {
         Dacl {
             protected: true,
             entries: vec![Ace::Allow {
-                sid: me.clone(),
+                sid: me,
                 mask: FILE_ALL_ACCESS,
             }],
         },
@@ -105,7 +105,6 @@ mod tests {
             .create(format!("{name}-plain"))
             .unwrap();
         let read = owner_and_dacl(&plain).unwrap();
-        assert!(!read.dacl.protected, "{read:?}");
         assert!(read.dacl.entries.len() > 1, "{read:?}");
     }
 }

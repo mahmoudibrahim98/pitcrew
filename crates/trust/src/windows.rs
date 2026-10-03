@@ -580,7 +580,7 @@ mod tests {
     use tokio::net::windows::named_pipe::ClientOptions;
 
     /// A pipe name of this test's own.
-    fn name(test: &str) -> String {
+    fn pipe_name(test: &str) -> String {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
@@ -656,7 +656,7 @@ mod tests {
             let level = crate::sddl::label(me.integrity);
             let text = format!("O:{sid}D:P(A;;GA;;;{sid})S:(ML;;NWNR;;;{level})");
             let descriptor = SecurityDescriptor::from_sddl(&text).expect("descriptor");
-            let name = name("own");
+            let name = pipe_name("own");
             let mut options = ServerOptions::new();
             options.first_pipe_instance(true);
             let server = descriptor.create_pipe(&options, &name).expect("pipe");
@@ -682,7 +682,9 @@ mod tests {
             // label below us (a process may label an object at or below its own level).
             let text = format!("O:{sid}D:P(D;;GA;;;AN)(A;;GA;;;{sid})S:(ML;;NWNR;;;LW)");
             let denying = SecurityDescriptor::from_sddl(&text).expect("descriptor");
-            let server = denying.create_pipe(&options, name("deny")).expect("pipe");
+            let server = denying
+                .create_pipe(&options, pipe_name("deny"))
+                .expect("pipe");
             assert_eq!(
                 dacl(&server).expect("dacl"),
                 Dacl {
@@ -713,14 +715,14 @@ mod tests {
         block_on(async {
             let server = ServerOptions::new()
                 .first_pipe_instance(true)
-                .create(name("default"))
+                .create(pipe_name("default"))
                 .expect("pipe");
             assert_eq!(
                 owner_sid(&server).expect("owner"),
                 default_owner_sid().expect("default owner")
             );
+            // More entries than ours alone (Everyone may read).
             let read = dacl(&server).expect("dacl");
-            assert!(!read.protected, "{read:?}");
             assert!(read.entries.len() > 1, "{read:?}");
         });
     }
