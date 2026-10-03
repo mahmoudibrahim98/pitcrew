@@ -9,6 +9,10 @@ import type { Event } from "./Event.ts";
  */
 export type EventsPage = { 
 /**
+ * Actual log revisions, in the same order as `events`.
+ */
+revisions: Array<number>, 
+/**
  * The events, oldest first.
  */
 events: Array<Event>, 

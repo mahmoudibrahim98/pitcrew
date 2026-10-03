@@ -9,13 +9,12 @@
 //!   scanning a remote machine is not supported yet.
 //! - **One at a time per machine:** a scan holds its machine's place from the moment it is
 //!   accepted until its walk ends, and a second scan meanwhile is `409`. A client that goes away
-//!   does not stop the walk (`pitcrew_ingest::scan` has no way to be stopped part-way); it runs to
-//!   its end, bounded as it is, and its result is dropped.
+//!   cancels further work between files. A ten-minute budget returns a partial report.
 //! - **The answer** is `200` with `Content-Type: application/x-ndjson`: one [`ScanFrame`] per
 //!   line. A `progress` frame at once (`scanned: 0`), then the walk's own ticks (at most every
-//!   100 ms; the last one has `scanned == total`), then `done` with the report, or `error` if the
+//!   100 ms; the last one has `scanned == total` unless partial), then `done` with the report, or `error` if the
 //!   walk panicked. Ticks are dropped rather than waited for when the client reads slowly; the
-//!   last tick and the final frame are always sent.
+//!   last tick and the final frame wait at most 30 seconds before closing the stream.
 //! - **Privacy:** the report names the person's folders and branches. The route is a device
 //!   route (`RouterParts::device`), so an agent token gets `403`, and the log records counts,
 //!   never paths.
@@ -42,6 +41,7 @@ use std::collections::HashSet;
 use std::convert::Infallible;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -49,6 +49,8 @@ use tokio::sync::mpsc;
 
 /// Frames waiting for a client that reads slowly; ticks beyond these are dropped.
 const FRAMES: usize = 16;
+/// Maximum wait for a client to read a required frame.
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the route waits to learn the workspace's machines.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 /// The answer's media type: newline-delimited JSON.
@@ -233,32 +235,42 @@ async fn start(
     // At once, so the client knows the scan was accepted before the walk has found anything.
     let _ = frames.try_send(line(&ScanFrame::Progress(ScanProgress::default())));
     let hold = scans.hold;
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
     drop(tokio::task::spawn_blocking(move || {
-        walk(&homes, hold, &frames);
+        walk(&homes, hold, &frames, worker_cancel);
         // Its place is given back only once the walk has ended, whether or not anyone listens.
         drop(claim);
     }));
-    Ok(Frames(rx))
+    Ok(Frames(rx, cancel))
 }
 
 /// The walk, on the blocking pool: sends its ticks and then its last frame to `frames`.
-fn walk(homes: &[ScanHome], hold: Duration, frames: &mpsc::Sender<Bytes>) {
+fn walk(homes: &[ScanHome], hold: Duration, frames: &mpsc::Sender<Bytes>, cancel: Arc<AtomicBool>) {
     if !hold.is_zero() {
         std::thread::sleep(hold);
     }
     let started = Instant::now();
-    let options = ScanOptions::default();
+    let options = ScanOptions {
+        cancel: Arc::clone(&cancel),
+        ..ScanOptions::default()
+    };
     let walked = catch_unwind(AssertUnwindSafe(|| {
         pitcrew_ingest::scan::scan(homes, &options, |tick| {
-            let last = tick.total == Some(tick.scanned);
+            let last = tick.path.is_none() || tick.total == Some(tick.scanned);
             let frame = line(&ScanFrame::Progress(tick));
-            // A tick may be dropped for a slow client; the last one is waited for. Either fails
-            // at once if the client has gone, and the walk goes on.
-            let _sent = if last {
-                frames.blocking_send(frame).is_ok()
+            // Ordinary ticks may be dropped; required frames have a bounded wait.
+            if frames.is_closed() {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            let sent = if last {
+                send_with_timeout(frames, frame, SEND_TIMEOUT)
             } else {
                 frames.try_send(frame).is_ok()
             };
+            if last && !sent {
+                cancel.store(true, Ordering::Relaxed);
+            }
         })
     }));
     let last = match walked {
@@ -281,8 +293,24 @@ fn walk(homes: &[ScanHome], hold: Duration, frames: &mpsc::Sender<Bytes>) {
             }
         }
     };
-    if frames.blocking_send(line(&last)).is_err() {
+    if !cancel.load(Ordering::Relaxed) && !send_with_timeout(frames, line(&last), SEND_TIMEOUT) {
         tracing::debug!("the scan's client went away before its result");
+    }
+}
+
+/// Bounded sends on the blocking pool, including tests without a Tokio runtime.
+fn send_with_timeout(frames: &mpsc::Sender<Bytes>, mut frame: Bytes, timeout: Duration) -> bool {
+    let started = Instant::now();
+    loop {
+        match frames.try_send(frame) {
+            Ok(()) => return true,
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            Err(mpsc::error::TrySendError::Full(returned)) => frame = returned,
+        }
+        if started.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5).min(timeout.saturating_sub(started.elapsed())));
     }
 }
 
@@ -300,7 +328,13 @@ fn line(frame: &ScanFrame) -> Bytes {
 
 /// The answer's body: the frames, as the walk sends them, until it drops its sender.
 #[derive(Debug)]
-struct Frames(mpsc::Receiver<Bytes>);
+struct Frames(mpsc::Receiver<Bytes>, Arc<AtomicBool>);
+
+impl Drop for Frames {
+    fn drop(&mut self) {
+        self.1.store(true, Ordering::Relaxed);
+    }
+}
 
 impl futures_core::Stream for Frames {
     type Item = Result<Bytes, Infallible>;
@@ -384,7 +418,12 @@ mod tests {
     #[test]
     fn a_walk_ends_with_its_last_tick_and_the_report() {
         let (frames, mut rx) = mpsc::channel(FRAMES);
-        walk(&[], Duration::ZERO, &frames);
+        walk(
+            &[],
+            Duration::ZERO,
+            &frames,
+            Arc::new(AtomicBool::new(false)),
+        );
         drop(frames);
         let mut got = Vec::new();
         while let Ok(bytes) = rx.try_recv() {
@@ -406,6 +445,26 @@ mod tests {
 
         let (frames, rx) = mpsc::channel(FRAMES);
         drop(rx);
-        walk(&[], Duration::ZERO, &frames);
+        walk(
+            &[],
+            Duration::ZERO,
+            &frames,
+            Arc::new(AtomicBool::new(false)),
+        );
+    }
+
+    #[test]
+    fn a_nonreading_client_times_out_and_a_dropped_body_cancels() {
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(Bytes::new()).unwrap();
+        assert!(!send_with_timeout(
+            &tx,
+            Bytes::new(),
+            Duration::from_millis(20)
+        ));
+        let cancel = Arc::new(AtomicBool::new(false));
+        drop(Frames(rx, Arc::clone(&cancel)));
+        assert!(cancel.load(Ordering::Relaxed));
+        assert!(!send_with_timeout(&tx, Bytes::new(), SEND_TIMEOUT));
     }
 }

@@ -7,7 +7,7 @@
 //   an event touches it is refetched once, by its exact key, after that fetch settles, since the
 //   fetch may predate the event. The same goes for a patch that lands while a fetch under its keys
 //   is in flight: the older response would overwrite it.
-// - A reset (a gap, or another event log) drops the cache; coming back from `reconnecting`
+// - A reset (a replaced event log) drops the cache; coming back from `reconnecting`
 //   refetches failed queries.
 
 import type { QueryClient } from '@tanstack/react-query';

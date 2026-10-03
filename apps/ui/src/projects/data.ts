@@ -150,6 +150,7 @@ export async function fetchActivity(
       signal,
     });
   let events: Event[] = [];
+  let revisions: number[] = [];
   let before: number | undefined;
   let toRev = 0;
   let atStart = false;
@@ -163,12 +164,14 @@ export async function fetchActivity(
     const page = await get(before, past ? ACTIVITY_PAGE - found : EVENTS_MAX_LIMIT);
     if (past) {
       spent += 1;
-      found += page.events.length;
+      found += page.events.filter((event) => event.body.type !== 'cursor_moved').length;
     } else {
       covering += 1;
     }
-    events = [...page.events, ...events];
-    if (toRev === 0 && page.events.length > 0) toRev = page.to_rev;
+    const real = withRevisions(page).filter(({ event }) => event.body.type !== 'cursor_moved');
+    events = [...real.map(({ event }) => event), ...events];
+    revisions = [...real.map(({ rev }) => rev), ...revisions];
+    if (toRev === 0 && real.length > 0) toRev = real.at(-1)?.rev ?? 0;
     atStart = page.at_start;
     // A page that is not at the start but gives no older position cannot be continued: stop
     // there rather than ask for the same thing again.
@@ -177,7 +180,7 @@ export async function fetchActivity(
     }
     before = page.from_rev;
   }
-  return { events, from_rev: before ?? 0, to_rev: toRev, at_start: atStart };
+  return { events, revisions, from_rev: before ?? 0, to_rev: toRev, at_start: atStart };
 }
 
 /**
@@ -208,12 +211,11 @@ export function useActivity(filters: EventFilters = {}) {
 }
 
 /**
- * The revision of each event in an **unfiltered** page (revisions are contiguous there; with
- * filters they are not).
+ * The actual revision of each event; older hubs omit `revisions`.
  */
 export function withRevisions(page: ActivityPage): { event: Event; rev: number }[] {
   const first = page.to_rev - page.events.length + 1;
-  return page.events.map((event, i) => ({ event, rev: first + i }));
+  return page.events.map((event, i) => ({ event, rev: page.revisions?.[i] ?? first + i }));
 }
 
 /** Names for members, tasks, workstreams, projects, sessions and machines, from the cache. */

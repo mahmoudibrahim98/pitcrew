@@ -177,12 +177,7 @@ export class StreamClient {
       case 'events': {
         const rev = this.#rev ?? 0;
         if (frame.to_rev <= rev) return;
-        if (frame.from_rev > rev + 1) {
-          // Frames are contiguous, so a gap means we lost events: start over.
-          this.#rev = frame.to_rev;
-          this.#options.onReset(frame.to_rev);
-          return;
-        }
+        // Private cursor writes create gaps between frames. Each frame itself is contiguous.
         // Skip any events already seen.
         const fresh =
           frame.from_rev <= rev ? frame.events.slice(rev - frame.from_rev + 1) : frame.events;

@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { createHash, randomBytes } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startServer } from '../../apps/mock-hub/src/server.ts';
 
@@ -97,6 +98,7 @@ try {
     env.PITCREW_CONFORMANCE_URL = mock.url;
     env.PITCREW_CONFORMANCE_PERSON = 'dev-device-token';
     env.PITCREW_CONFORMANCE_AGENT = 'dev-agent-token';
+    env.PITCREW_CONFORMANCE_SECOND_PERSON = 'dev-second-device-token';
   } else {
     build = spawn(
       'cargo',
@@ -107,6 +109,16 @@ try {
     if (code !== 0) throw new Error('Daemon build failed');
     const state = join(temporary, 'state');
     await mkdir(state, { mode: 0o700 });
+    // Provision a second synthetic person's credential before the daemon owns the registry.
+    // The suite never prints either credential or opens a real user's registry.
+    const second = `pcd_${randomBytes(32).toString('base64url')}`;
+    await writeFile(join(state, 'tokens.json'), JSON.stringify({ version: 1, tokens: [{
+      id: '01J00000000000000000000001',
+      sha256: createHash('sha256').update(second).digest('hex'),
+      caller: { member: '01JB000000000000000MEM0007', scope: 'device' },
+      created_at: 0,
+    }] }), { mode: 0o600 });
+    env.PITCREW_CONFORMANCE_SECOND_PERSON = second;
     const refused = join(temporary, 'not-a-socket');
     await writeFile(refused, 'Synthetic runtime refusal\n');
     // A dispatch starts its agent's CLI: stand-ins first on the daemon's PATH, never a real one.

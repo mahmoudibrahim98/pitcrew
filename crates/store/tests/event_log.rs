@@ -350,6 +350,7 @@ fn other_bodies() -> Vec<EventBody> {
     let demo = pitcrew_fixtures::demo_workspace().expect("fixture");
     let session = &demo.sessions[0];
     let bodies = [
+        json!({"type": "cursor_moved", "data": {"scope": "workspace", "rev": 15}}),
         json!({"type": "machine_liveness", "data": {
             "machine": demo.machines[2].id, "liveness": "stopped"}}),
         json!({"type": "session_discovered", "data": {"session": session}}),

@@ -522,6 +522,7 @@ export interface Event {
 
 /** On the wire: `{"type": "task_moved", "data": {…}}`. */
 export type EventBody =
+  | { type: 'cursor_moved'; data: { scope: string; rev: number } }
   | { type: 'machine_added'; data: { machine: Machine } }
   | { type: 'member_added'; data: { member: Member } }
   | { type: 'persona_saved'; data: { persona: Persona } }
@@ -590,6 +591,7 @@ export type EventType = EventBody['type'];
 
 /** Every `EventBody` type, so tests and the invalidation map can check they cover them all. */
 export const EVENT_TYPES = [
+  'cursor_moved',
   'machine_added',
   'member_added',
   'persona_saved',
@@ -662,6 +664,7 @@ export interface AskFilters {
  * hub's scan stopped. Only `at_start` ends paging: pass `from_rev` as `before` for older events.
  */
 export interface EventsPage {
+  revisions?: number[];
   events: Event[];
   from_rev: number;
   to_rev: number;

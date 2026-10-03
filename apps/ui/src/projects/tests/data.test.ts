@@ -73,7 +73,7 @@ describe('fetchActivity', () => {
     const { api, calls } = fakeEvents(100_000, () => false, 100);
     const page = await fetchActivity(api, { task: 'T' }, undefined);
     expect(calls).toHaveLength(ACTIVITY_BUDGET);
-    expect(page).toEqual({ events: [], from_rev: 99_201, to_rev: 0, at_start: false });
+    expect(page).toEqual({ events: [], revisions: [], from_rev: 99_201, to_rev: 0, at_start: false });
   });
 
   it('stops on a page that cannot be continued', async () => {
@@ -95,6 +95,20 @@ describe('fetchActivity', () => {
     expect(page.events).toHaveLength(30);
     expect(page.at_start).toBe(true);
   });
+});
+
+it('counts only real events and pages past a metadata-only tail defensively', async () => {
+  let calls = 0;
+  const api = { request: async () => {
+    calls++;
+    return calls === 1
+      ? { events: Array.from({ length: 50 }, (_, i) => ({ ...event(i + 51), body: { type: 'cursor_moved', data: { scope: 'workspace', rev: 1 } } })), from_rev: 51, to_rev: 100, at_start: false }
+      : { events: [event(2), event(40)], revisions: [2, 40], from_rev: 2, to_rev: 40, at_start: true };
+  } } as unknown as Api;
+  const page = await fetchActivity(api, {}, undefined);
+  expect(calls).toBe(2);
+  expect(page.events.map((e) => e.id)).toEqual(['E2', 'E40']);
+  expect(withRevisions(page).map((e) => e.rev)).toEqual([2, 40]);
 });
 
 describe('withRevisions', () => {

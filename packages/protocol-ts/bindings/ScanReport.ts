@@ -7,6 +7,10 @@ import type { Suggestion } from "./Suggestion.ts";
  */
 export type ScanReport = { 
 /**
+ * Whether cancellation or the time budget stopped the scan early.
+ */
+partial?: boolean, 
+/**
  * Counts.
  */
 counts: ScanCounts, 

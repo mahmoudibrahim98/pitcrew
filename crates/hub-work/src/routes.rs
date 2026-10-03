@@ -71,6 +71,8 @@ where
 {
     Router::new()
         .route("/v1/workspace", get(get_workspace))
+        .route("/v1/me/cursors", get(get_cursors))
+        .route("/v1/me/cursors/{scope}", put(put_cursor))
         .route("/v1/setup", post(post_setup))
         .route("/v1/machines", get(list_machines))
         .route("/v1/personas", get(list_personas))
@@ -583,6 +585,24 @@ async fn answer_ask(
 
 async fn list_briefs(Work(w): Work, Person(_): Person) -> Reply<Vec<Brief>> {
     Ok(Json(blocking(w, WorkService::briefs).await?))
+}
+
+async fn get_cursors(
+    Work(w): Work,
+    Person(caller): Person,
+) -> Reply<Vec<pitcrew_protocol::api::ReadCursor>> {
+    Ok(Json(blocking(w, move |w| w.cursors(&caller)).await?))
+}
+
+async fn put_cursor(
+    Work(w): Work,
+    Person(caller): Person,
+    Segments(scope): Segments<String>,
+    Body(request): Body<pitcrew_protocol::api::MoveCursor>,
+) -> Reply<pitcrew_protocol::api::ReadCursor> {
+    Ok(Json(
+        blocking(w, move |w| w.move_cursor(&caller, &scope, request.rev)).await?,
+    ))
 }
 
 async fn put_brief(
