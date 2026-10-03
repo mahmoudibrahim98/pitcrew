@@ -1,4 +1,4 @@
-# Brief 0 · Fix two more timing-flaky tests
+# Brief 0 · Fix three more timing-flaky tests
 
 - **Stream:** 0 · Contracts (test fixes in two streams). **Branch:** `integrator/flaky-tests-2`.
   **Paths:** `crates/api/tests/terminal.rs` and `crates/runner/tests/fake_source.rs`.
@@ -35,6 +35,10 @@ Two tests failed on CI runners for timing reasons unrelated to the PRs they ran 
      catches a missed notification, which would fall back to the slow schedule.
    - The budget itself is measured properly in `benches/`. Don't touch the restart half of the
      test.
+
+3. **`a_stalled_runtime_answers_503_or_closes_with_1011`** (`crates/api/tests/terminal.rs`; failed natively on Windows while a parallel build ran, then passed 5/5 alone).
+   - **The problem:** it got a 503 during the WebSocket handshake, where it expected the stream to open and then close with 1011.
+   - **The question:** is either answer correct under load (its name allows both)? If so, make the test accept a 503 at the handshake as well as 1011 after the open. If not, find the timing that lets the stall reach the handshake.
 
 ## Acceptance
 

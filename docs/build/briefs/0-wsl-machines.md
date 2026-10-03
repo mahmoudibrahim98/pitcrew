@@ -5,7 +5,7 @@
   **Paths:**
   - `docs/build/contracts/desktop-gateway.md`;
   - `crates/remote/**`;
-  - `apps/desktop/src-tauri/src/**` and its tests;
+  - `apps/desktop/src-tauri/src/**` and its tests, plus `build.rs` (Tauri's command list), `capabilities/**` (what the window may call) and `Cargo.toml`, as the new gateway commands need them;
   - `apps/ui/src/onboarding/connect/**` and `apps/ui/src/data/**`, with their tests;
   - `docs/security/threat-model.md`;
   - the lockfiles.
