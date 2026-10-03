@@ -81,6 +81,31 @@ function renderApp(path = '/connect') {
 const heading = (name: string | RegExp) => screen.findByRole('heading', { level: 1, name }, PATIENCE);
 const button = (name: string | RegExp) => screen.getByRole('button', { name });
 
+it('selects a stopped WSL2 distro and reviews a WSL plan without SSH prompts', async () => {
+  const distro = "Lab 'quoted' distro";
+  desktop.wsl = { available: true, distros: [
+    { name: distro, default: true, running: false, version: 2 },
+    { name: 'Legacy distro', default: false, running: false, version: 1 },
+  ] };
+  desktop.probe = () => ({ host: distro, os: 'linux', arch: 'x86_64' });
+  desktop.plan = () => ({ plan: 'wsl-plan', steps: ['Copy the Linux helper', 'Connect through WSL stdio'] });
+  renderApp();
+  await heading('Connect a remote machine');
+  expect((await screen.findByRole('radio', { name: /Legacy distro/ }) as HTMLInputElement).disabled).toBe(true);
+  fireEvent.click(await screen.findByRole('radio', { name: /Lab 'quoted' distro/ }));
+  fireEvent.click(button('Continue'));
+  await screen.findByTestId('probe');
+  fireEvent.click(button('Continue'));
+  await heading(`How PitCrew runs on ${distro}`);
+  fireEvent.click(screen.getByRole('radio', { name: /Directly/ }));
+  fireEvent.click(button('Review the plan'));
+  await heading(`Review: connect ${distro}`);
+  expect(await screen.findByText('Connect through WSL stdio')).toBeTruthy();
+  const target = { kind: 'wsl', distro };
+  expect(desktop.commands('gateway_remote_probe')).toEqual([{ host: '', target }]);
+  expect(desktop.commands('gateway_remote_plan')).toEqual([{ req: { host: '', target, launcher: 'direct' } }]);
+});
+
 /** Host, Probe and Launcher (SLURM, 2 CPUs), up to Review. */
 async function toReview() {
   await heading('Connect a remote machine');

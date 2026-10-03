@@ -27,6 +27,7 @@ import {
 } from '../../data/index.ts';
 import { Button, CheckIcon, Dialog, DialogContent, DialogFooter } from '../../design/index.ts';
 import { cx } from '../../lib/cx.ts';
+import type { WslDistro, WslTarget } from '../../data/remote.ts';
 import type { DiscoveredHost } from '../api.ts';
 import { createHubOnboardingApi } from '../hub-api.ts';
 import { SetupForm } from '../setup-form.tsx';
@@ -102,7 +103,8 @@ interface State {
   /** The host picked from the list, or typed. */
   picked: string;
   typed: string;
-  source: 'list' | 'typed';
+  source: 'list' | 'typed' | 'wsl';
+  target?: WslTarget | undefined;
   hostError?: string | undefined;
   /** The host the later steps are about. */
   host: string;
@@ -206,11 +208,11 @@ export function ConnectWizard({
     patch({ ...update, step });
   }
 
-  async function probe(host: string) {
+  async function probe(host: string, target?: WslTarget) {
     const g = begin();
-    patch({ step: 'probe', host, probe: undefined, probeError: undefined });
+    patch({ step: 'probe', host, target, probe: undefined, probeError: undefined });
     try {
-      const found = await remote.remoteProbe(host);
+      const found = await remote.remoteProbe(target === undefined ? host : '', target);
       if (!current(g)) return;
       setState((s) => ({
         ...s,
@@ -282,7 +284,9 @@ export function ConnectWizard({
     }
   }
 
-  const request = planRequest(state.host, state.launcher, state.job);
+  const request = state.target === undefined
+    ? planRequest(state.host, state.launcher, state.job)
+    : { host: '', target: state.target, launcher: state.launcher };
   const index = STEPS.findIndex((s) => s.id === state.step);
 
   return (
@@ -321,7 +325,7 @@ export function ConnectWizard({
               patch={patch}
               heading={heading}
               onCancel={onCancel}
-              onContinue={(host) => void probe(host)}
+              onContinue={(host, target) => void probe(host, target)}
             />
           )}
           {state.step === 'probe' && (
@@ -329,7 +333,7 @@ export function ConnectWizard({
               state={state}
               heading={heading}
               onBack={() => go('host')}
-              onRetry={() => void probe(state.host)}
+              onRetry={() => void probe(state.host, state.target)}
               onContinue={() => go('launcher')}
               onCancel={onCancel}
             />
@@ -436,16 +440,22 @@ function HostStep({
   patch(update: Partial<State>): void;
   heading: HeadingRef;
   onCancel(): void;
-  onContinue(host: string): void;
+  onContinue(host: string, target?: WslTarget): void;
 }) {
   const api = useMemo(() => createHubOnboardingApi({ remote }), [remote]);
   const [hosts, setHosts] = useState<DiscoveredHost[] | null>(null);
+  const [distros, setDistros] = useState<WslDistro[] | null>(null);
+  const [wslError, setWslError] = useState<string | null>(null);
   const [listError, setListError] = useState<string | null>(null);
   const typedId = useId();
   const errorId = useId();
 
   useEffect(() => {
     let live = true;
+    remote.wslDistros?.().then(
+      (found) => { if (live) setDistros(found.available ? found.distros : null); },
+      (error: unknown) => { if (live) setWslError(messageOf(error)); },
+    );
     api.discoverHosts().then(
       (found) => live && setHosts(found.filter((h) => h.kind === 'ssh')),
       (error: unknown) => {
@@ -457,7 +467,7 @@ function HostStep({
     return () => {
       live = false;
     };
-  }, [api]);
+  }, [api, remote]);
 
   const chosen = state.source === 'typed' ? state.typed.trim() : state.picked;
 
@@ -465,13 +475,16 @@ function HostStep({
     <form
       onSubmit={(event) => {
         event.preventDefault();
-        const problem = checkHost(chosen);
+        const distro = state.source === 'wsl' ? distros?.find((d) => d.name === chosen) : undefined;
+        const problem = state.source === 'wsl'
+          ? distro?.version === 2 ? undefined : 'Select a WSL2 distribution. WSL1 is unsupported.'
+          : checkHost(chosen);
         if (problem !== undefined) {
           patch({ hostError: problem });
           return;
         }
         patch({ hostError: undefined });
-        onContinue(chosen);
+        onContinue(chosen, distro === undefined ? undefined : { kind: 'wsl', distro: distro.name });
       }}
     >
       <Heading heading={heading}>Connect a remote machine</Heading>
@@ -480,6 +493,21 @@ function HostStep({
         config, or type one.
       </p>
 
+      {wslError !== null && <p role="status">Could not list WSL distributions ({wslError}).</p>}
+      {distros !== null && (
+        <fieldset className="mt-4 flex flex-col gap-2">
+          <legend>A WSL distro on this computer</legend>
+          {distros.length === 0 && <p>No distributions are registered.</p>}
+          {distros.map((distro) => (
+            <label key={distro.name} className="flex gap-2 text-sm">
+              <input type="radio" name="machine" disabled={distro.version !== 2}
+                checked={state.source === 'wsl' && state.picked === distro.name}
+                onChange={() => patch({ picked: distro.name, source: 'wsl', hostError: undefined })} />
+              {distro.name}{distro.default ? ' (default)' : ''} — {distro.version !== 2 ? 'WSL1 unsupported' : distro.running ? 'Running' : 'Stopped; starts when probed'}
+            </label>
+          ))}
+        </fieldset>
+      )}
       <fieldset className="mt-4 flex flex-col gap-1.5">
         <legend className="mb-1.5 text-sm font-medium text-ink">Hosts in your ssh config</legend>
         {hosts === null && <p className="text-xs text-ink-2">Reading your ssh config…</p>}

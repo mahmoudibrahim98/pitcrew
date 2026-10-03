@@ -8,6 +8,10 @@
 
 import type { GatewayWorkspace, WorkspaceState } from './workspaces.tsx';
 
+export interface WslTarget { kind: 'wsl'; distro: string }
+export interface WslDistro { name: string; default: boolean; running: boolean; version: number }
+export interface WslDistros { available: boolean; distros: WslDistro[] }
+
 /** `gateway_remote_probe`: what is on the remote, found without changing anything. */
 export interface RemoteProbe {
   host: string;
@@ -38,6 +42,7 @@ export interface JobOptions {
 /** `gateway_remote_plan`'s request. */
 export interface RemotePlanRequest {
   host: string;
+  target?: WslTarget;
   launcher: RemoteLauncher;
   /** A site recipe's name, for slurm. */
   site?: string;
@@ -95,7 +100,8 @@ export type PromptReply = { answer: string } | { accept: boolean } | Record<stri
 export interface RemoteGateway {
   /** The concrete `Host` names in the person's ssh config. The person may also type a host. */
   sshHosts(): Promise<string[]>;
-  remoteProbe(host: string): Promise<RemoteProbe>;
+  wslDistros?(): Promise<WslDistros>;
+  remoteProbe(host: string, target?: WslTarget): Promise<RemoteProbe>;
   remotePlan(request: RemotePlanRequest): Promise<RemotePlan>;
   /** Carries out a plan: deploy, launch, pair, register. `onProgress` gets each checked message. */
   remoteAdd(plan: string, onProgress: (progress: RemoteProgress) => void): Promise<GatewayWorkspace>;
@@ -197,6 +203,7 @@ export function toGatewayWorkspace(value: unknown): GatewayWorkspace | undefined
   return {
     id: v.id,
     name: v.name,
+    ...(typeof v.host === 'string' ? { host: cleanLine(v.host) } : {}),
     kind: v.kind,
     state: v.state as WorkspaceState,
     ...(typeof v.detail === 'string' ? { detail: v.detail } : {}),
@@ -212,6 +219,21 @@ export function parseHosts(value: unknown): string[] {
     if (typeof host === 'string' && host !== '' && cleanLine(host) === host) seen.add(host);
   }
   return [...seen];
+}
+
+export function parseWslDistros(value: unknown): WslDistros | undefined {
+  const v = record(value);
+  if (typeof v?.available !== 'boolean' || !Array.isArray(v.distros)) return undefined;
+  const distros: WslDistro[] = [];
+  for (const entry of v.distros) {
+    const d = record(entry);
+    if (typeof d?.name !== 'string' || d.name === '' || [...d.name].some((c) => c.charCodeAt(0) < 32) ||
+      typeof d.default !== 'boolean' || typeof d.running !== 'boolean' || typeof d.version !== 'number' ||
+      !Number.isInteger(d.version) || d.version < 1) return undefined;
+    distros.push({ name: d.name, default: d.default, running: d.running, version: d.version });
+  }
+  if (!v.available && distros.length !== 0) return undefined;
+  return { available: v.available, distros };
 }
 
 export function parseRemoteProbe(value: unknown): RemoteProbe | undefined {
