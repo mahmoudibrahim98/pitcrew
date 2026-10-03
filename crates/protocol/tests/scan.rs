@@ -44,6 +44,7 @@ fn progress_frames_leave_out_what_is_not_known_yet() {
 #[test]
 fn the_done_frame_carries_the_report_in_snake_case() {
     let report = ScanReport {
+        partial: None,
         counts: ScanCounts {
             sessions: 2,
             subagent_sessions: 1,
@@ -179,4 +180,18 @@ fn an_empty_scan_still_has_every_list() {
             "unreadable": 0,
         })
     );
+}
+
+#[test]
+fn a_partial_report_is_explicit_and_old_reports_remain_complete() {
+    let report = ScanReport {
+        partial: Some(true),
+        ..ScanReport::default()
+    };
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(json["partial"], true);
+    assert_eq!(serde_json::from_value::<ScanReport>(json).unwrap(), report);
+    let old = serde_json::to_value(ScanReport::default()).unwrap();
+    assert!(old.get("partial").is_none());
+    assert_eq!(serde_json::from_value::<ScanReport>(old).unwrap().partial, None);
 }

@@ -52,6 +52,7 @@ const report = object({
   }),
   suggestions: list(suggestion),
   unreadable: integer,
+  'partial?': (v) => assert.equal(typeof v, 'boolean'),
 });
 const frame = tagged('type', {
   progress: object({ scanned: integer, 'total?': integer, 'path?': text }),
@@ -62,8 +63,10 @@ const frame = tagged('type', {
 /** What the contract promises of any report, beyond its shape. */
 function consistent(r) {
   const sum = (items) => items.reduce((n, item) => n + item.count, 0);
-  for (const key of ['by_engine', 'by_home', 'by_folder', 'by_month'])
+  for (const key of ['by_engine', 'by_home'])
     assert.equal(sum(r.counts[key]), r.counts.sessions, `${key} adds up to sessions`);
+  for (const key of ['by_folder', 'by_month'])
+    assert.ok(sum(r.counts[key]) <= r.counts.sessions, `${key} excludes missing facts`);
   const folders = r.counts.by_folder.map((f) => f.count);
   assert.deepEqual(folders, [...folders].sort((a, b) => b - a), 'by_folder is busiest first');
   const months = r.counts.by_month.map((m) => m.month);

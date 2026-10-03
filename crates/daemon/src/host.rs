@@ -1,6 +1,7 @@
 //! `GET /v1/host/info` as it is now: roles `["hub", "runner"]` while the runner runs, else
 //! `["hub"]`; while it runs, capabilities `tmux` when its terminals run in tmux or `pty` when they
-//! run in pitcrew-ptyd, and `watch` when it watches at least one home (in that order), else `[]`.
+//! run in pitcrew-ptyd, and `watch` when it watches at least one home (in that order).
+//! The hub always advertises `scan`; without a runner, its scan route returns conflict.
 //!
 //! `pitcrew_api::router` answers this route with the `HostInfo` it was built with, but the runner
 //! may start after the router is built (once a fresh workspace is set up). So [`answer`], a layer
@@ -49,11 +50,12 @@ impl HostInfoNow {
                     .runtime
                     .into_iter()
                     .chain(runner.watches.then_some(Capability::Watch))
+                    .chain([Capability::Scan])
                     .collect();
             }
             None => {
                 info.roles = vec![HostRole::Hub];
-                info.capabilities = Vec::new();
+                info.capabilities = vec![Capability::Scan];
             }
         }
         info
@@ -160,11 +162,11 @@ mod tests {
             assert_eq!(before.name, "pitcrewd");
             assert_eq!(before.protocol, pitcrew_protocol::PROTOCOL_VERSION);
             assert_eq!(before.roles, [HostRole::Hub]);
-            assert!(before.capabilities.is_empty());
+            assert_eq!(before.capabilities, [Capability::Scan]);
             attached.set(parts(watches, runtime));
             let after = info.now();
             assert_eq!(after.roles, [HostRole::Hub, HostRole::Runner]);
-            assert_eq!(after.capabilities, expected);
+            assert_eq!(after.capabilities, [expected, vec![Capability::Scan]].concat());
             assert_eq!(after.machine, before.machine);
         }
         runner.stop();

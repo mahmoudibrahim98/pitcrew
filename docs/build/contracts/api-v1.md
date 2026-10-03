@@ -422,22 +422,25 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
   ignored; send none.
 - **One scan at a time per machine.** A scan holds its machine from the moment it is accepted
   until its walk ends; a second one meanwhile is `409 conflict`. A client that closes the answer
-  early does not stop the walk: it ends on its own (it is bounded), and only then may the machine
-  be scanned again.
+  early cancels further work between homes and files. A ten-minute budget also stops further
+  work and returns the counts collected so far with `partial: true`. An in-flight filesystem
+  operation must finish before cancellation takes effect and the machine can be scanned again.
 - **The answer** is `200` with `Content-Type: application/x-ndjson`: one `ScanFrame` JSON object
   per line, written as the walk goes. Read it as a stream for live progress, or whole.
   - `{"type":"progress","scanned":0}` at once. Then `{"type":"progress","scanned":N,"total":M}`
     (with `"path"`, a transcript just read, when there is one) at most every 100 ms; the last
-    progress frame has `scanned` equal to `total`.
+    progress frame has `scanned` equal to `total` for a complete scan; a partial scan may have less.
   - Then exactly one last frame: `{"type":"done","report":ScanReport}`, or, if the scan failed
     after the answer began, `{"type":"error","code":ErrorCode,"message":String}`.
-  - A client that reads slowly may miss progress frames, never the last progress frame or the
-    last frame.
-- `ScanReport`: `{ "counts": ScanCounts, "suggestions": Suggestion[], "unreadable": u64 }`.
+  - A client that reads slowly may miss progress frames. Sending the last progress frame or
+    final frame waits at most 30 seconds; on timeout the stream closes and releases its claim.
+- `ScanReport`: `{ "counts": ScanCounts, "suggestions": Suggestion[], "unreadable": u64, "partial"?: bool }`.
   - `ScanCounts`: `{ "sessions", "subagent_sessions", "by_engine": [{ "engine", "count" }],
     "by_home": [{ "engine", "home", "count" }], "by_folder": [{ "path", "count" }],
     "by_month": [{ "month", "count" }], "first_activity"?, "last_activity"? }`. The `by_` lists
     count ordinary sessions; sub-agent sessions are counted once, in `subagent_sessions`.
+    Sessions without a working directory are omitted from `by_folder`; sessions without a
+    start time are omitted from `by_month`, so either list may sum to less than `sessions`.
     `by_folder` is busiest first, `by_month` (`YYYY-MM`, UTC) most recent first.
   - `Suggestion`, a suggested project: `{ "id", "name", "path", "is_git", "session_count",
     "recent_30d", "recent_90d", "workstreams": WorkstreamSuggestion[] }`. `path` is a repository
@@ -449,6 +452,8 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
     `branch`; `id` is the folder's own path, which is also where it is), or a branch other than
     `main`, `master`, `trunk`, `develop` and `HEAD` (with `branch`; `id` is
     `<project path>#<branch>`, and it is the project's `path` on that branch).
+  - `partial`, when true, means cancellation or the budget stopped the scan early. Absent means
+    false, for compatibility with older servers.
   - `unreadable` counts homes, folders and transcripts skipped because they could not be read;
     the rest of the scan still ran.
   - Paths are the machine's own, as its CLIs wrote them. A session's folder and branch are the ones

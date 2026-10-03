@@ -107,6 +107,7 @@ before(async () => {
 check('host info without auth', async () => {
   const h = await api('/v1/host/info', 200, schemas.host, { token: null });
   assert.equal(h.name, 'pitcrewd');
+  assert.ok(h.capabilities.includes('scan'));
   assert.ok(h.protocol_min <= h.protocol);
 });
 const personRoutes = [
