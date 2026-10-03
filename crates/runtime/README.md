@@ -308,7 +308,10 @@ Windows above all (ConPTY there).
     can never start elevated programs through ptyd (a UAC bypass otherwise).
 - **Starting ptyd.** `start` starts ptyd when none answers: `PtyOptions::ptyd` (by default
   `pitcrew-ptyd` next to the running executable; `PATH` is never searched), detached so it
-  outlives the caller. On Unix the process started only starts the real ptyd and exits (no
+  outlives the caller. Just before, it checks the program again with `pty::launch::check_trusted`
+  (`pitcrew_trust::check_trusted`, the check the desktop makes of `pitcrewd`), since ptyd starts
+  at the first terminal, possibly hours after detection: one that fails is never started, and
+  the start answers `Unavailable` with why. On Unix the process started only starts the real ptyd and exits (no
   zombie is left), and the real one calls `setsid`; its log is next to the socket
   (`ptyd.log`). On Windows it is started detached, in a new process group, outside this
   process's job when the job allows it. Other calls never start ptyd: with none running there
@@ -345,10 +348,14 @@ Windows above all (ConPTY there).
   from a blocking thread.
 
 `pty::windows` holds the only `unsafe` code of this crate and of pitcrew-ptyd (Windows only):
-SIDs and integrity levels, a pipe's owner, DACL and label, the client of a pipe (its process,
-and its token by impersonation), and Job Objects. The crate denies `unsafe_code` (pitcrew-ptyd
-forbids it); that module alone allows it, with a `SAFETY` comment on every block.
-`tests/unsafe_guard.rs` fails if any other source file of either crate allows it.
+the client of a pipe (its process, and its token by impersonation), Job Objects, and the lock
+file that gives one endpoint to one daemon (`FileLock`, `LockFileEx`). SIDs and integrity
+levels, a pipe's owner, DACL and label, and the descriptor ptyd's pipe is made with are
+`pitcrew_trust::windows` (`crates/trust`), the one copy of that code behind every PitCrew pipe,
+with its own `unsafe` code there; `pty::windows` keeps ptyd's policy (the descriptor it asks
+for, the checks of its peers) and re-exports what pitcrew-ptyd uses. The crate denies
+`unsafe_code` (pitcrew-ptyd forbids it); that module alone allows it, with a `SAFETY` comment on
+every block. `tests/unsafe_guard.rs` fails if any other source file of either crate allows it.
 
 **Residuals** (known, accepted for now):
 
@@ -369,8 +376,9 @@ forbids it); that module alone allows it, with a `SAFETY` comment on every block
 ## Choosing a runtime
 
 `choose(&TmuxOptions, &PtyOptions)` detects tmux (`tmux::detect`) and, when it is not usable,
-the PTY runtime (`pty::detect`: ptyd is a program file at its absolute path and its endpoint is
-safe; nothing is started). It returns `Chosen::Tmux` or `Chosen::Pty` (with why tmux was not
+the PTY runtime (`pty::detect`: ptyd is a program file at its absolute path, it passes
+`pitcrew_trust::check_trusted` (on Unix its owner and mode, the file it resolves to and both
+folders; on Windows no `Zone.Identifier`), and its endpoint is safe; nothing is started). It returns `Chosen::Tmux` or `Chosen::Pty` (with why tmux was not
 used), whose `capability()` is `Capability::Tmux` or `Capability::Pty`, or `Unavailable` with
 both reasons. `choose_async` runs it on its own thread as a future any executor can await, so
 detection never blocks an async caller. `Chosen::into_runtime` builds the runtime.

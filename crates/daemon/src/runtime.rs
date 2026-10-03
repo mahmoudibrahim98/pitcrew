@@ -582,9 +582,12 @@ mod windows {
     use pitcrew_runtime::pty::windows::FileLock;
     use std::path::{Path, PathBuf};
 
-    /// Where ptyd's endpoints' lock files are: `PitCrew` in the user's local data folder
-    /// (`%LOCALAPPDATA%`, else Windows' own answer), the folder of the default state directory
-    /// (`…\PitCrew\data`). One user's daemons share it, whatever their state directories.
+    /// Where ptyd's endpoints' lock files are: `PitCrew` in `%LOCALAPPDATA%` when that is set to
+    /// an absolute path, and only otherwise in the local data folder Windows knows for the user
+    /// (`FOLDERID_LocalAppData`). The variable comes first, so pointing it elsewhere (as the tests
+    /// do) moves the locks too. The default state directory (`…\PitCrew\data`) is always in the
+    /// known folder, so the two share `PitCrew` only while the variable names that folder, as it
+    /// does unless changed. One user's daemons share it, whatever their state directories.
     pub(super) fn lock_dir() -> Option<PathBuf> {
         std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)

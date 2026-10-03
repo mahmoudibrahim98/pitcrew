@@ -8,6 +8,7 @@
 //! | `demo-agent.token` | With `--demo`: a token for the demo's first agent. Private (0600). |
 //! | `workspace.json` | The workspace's id and name, which the event log does not hold. Private (0600). |
 //! | `office.json` | Where the back office got to in the log, so a restart runs it again from there. Private (0600). |
+//! | `recaps.sqlite3` | The recap index's blocks (`WorkService::with_recap_file`): a cache, made when the index is first built, replaced at every start and removed when the daemon stops; never read from one run to the next. Private (0600). When this directory is on a network filesystem, it is in a private folder of its own on a local disk instead, or the blocks stay in memory. |
 //! | `runner/<log id>/` | The runner's index of the transcripts it watches (`pitcrew-runner`), one per hub log. |
 //! | `run/pitcrewd.sock` | The private socket (Unix). |
 
