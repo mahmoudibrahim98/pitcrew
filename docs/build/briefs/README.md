@@ -89,13 +89,13 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [I-hook-exec-form](I-hook-exec-form.md) | I · CLI and hooks | `s/I/hook-exec-form` | Codex | Changes requested (PR #18) |
 | [0-flaky-tests](0-flaky-tests.md) | 0 · Contracts | `integrator/flaky-tests` | Codex | **Merged** (PR #19) |
 | [0-flaky-tests-2](0-flaky-tests-2.md) | 0 · Contracts | `integrator/flaky-tests-2` | Codex | Ready |
-| [0-review-followups](0-review-followups.md) | 0 · Contracts | `integrator/review-followups` | Opus-class | Ready |
+| [0-review-followups](0-review-followups.md) | 0 · Contracts | `integrator/review-followups` | Opus-class | In review (PR #30) |
 | [0-ci-security](0-ci-security.md) | 0 · Contracts | `integrator/ci-security` | Codex | **Merged** (PR #22) |
 | [0-protocol-ts](0-protocol-ts.md) | 0 · Contracts | `integrator/protocol-ts` | Codex | **Merged** (PR #23) |
 | [0-api-conformance](0-api-conformance.md) | 0 · Contracts | `integrator/api-conformance` | Codex | **Merged** (PR #24) |
 | [0-installer-size](0-installer-size.md) | 0 · Contracts | `integrator/installer-size` | Codex | **Merged** (PR #26) |
-| [P-measure-more](P-measure-more.md) | P · Packaging | `s/P/measure-more` | Codex | Ready |
-| [0-contributor-docs](0-contributor-docs.md) | 0 · Contracts | `integrator/contributor-docs` | Codex | Ready |
+| [P-measure-more](P-measure-more.md) | P · Packaging | `s/P/measure-more` | Codex | **Merged** (PR #27) |
+| [0-contributor-docs](0-contributor-docs.md) | 0 · Contracts | `integrator/contributor-docs` | Codex | **Merged** (PR #29) |
 | [0-wsl-machines](0-wsl-machines.md) | 0 · Contracts | `integrator/wsl-machines` | Codex (local, Windows) | In progress (draft PR #28) |
 | [N-calendar-timeline](N-calendar-timeline.md) | N · Projects layout | `s/N/calendar-timeline` | Codex (local) | **Merged** (PR #21) |
 | [0-daemon-solo](0-daemon-solo.md) | 0 · Composition root | `integrator/daemon-solo` | Opus-class | **Merged** |
