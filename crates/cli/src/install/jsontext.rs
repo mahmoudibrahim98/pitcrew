@@ -199,7 +199,8 @@ pub(crate) fn array(b: &[u8], open: usize) -> Arr {
 }
 
 /// Removes one entry (object member or array element) from `doc`, keeping the container valid:
-/// a non-last entry is deleted together with its own trailing comma; the last entry is deleted
+/// a non-last entry is deleted with its own trailing comma and, when preceded by another entry,
+/// the whitespace after that entry's comma; the last entry is deleted
 /// together with the comma that used to follow the previous one (there is none to put back). The
 /// only remaining entry is deleted together with one surrounding `\n` + indent run on each side
 /// (at most one, matching exactly what `append`'s empty-container branch would have added),
@@ -209,7 +210,14 @@ pub(crate) fn array(b: &[u8], open: usize) -> Arr {
 pub(crate) fn remove(doc: &str, entries: &[Entry], index: usize) -> String {
     let e = entries[index];
     let (del_start, del_end) = if index + 1 < entries.len() {
-        (e.start, e.end)
+        (
+            if index > 0 {
+                entries[index - 1].end
+            } else {
+                e.start
+            },
+            e.end,
+        )
     } else if index > 0 {
         (entries[index - 1].value_end, e.end)
     } else {
@@ -220,12 +228,17 @@ pub(crate) fn remove(doc: &str, entries: &[Entry], index: usize) -> String {
         }
         if start > 0 && bytes[start - 1] == b'\n' {
             start -= 1;
+            if start > 0 && bytes[start - 1] == b'\r' {
+                start -= 1;
+            }
         }
         let mut end = e.end;
         while end < bytes.len() && matches!(bytes[end], b' ' | b'\t') {
             end += 1;
         }
-        if end < bytes.len() && bytes[end] == b'\n' {
+        if bytes.get(end..end + 2) == Some(b"\r\n") {
+            end += 2;
+        } else if end < bytes.len() && bytes[end] == b'\n' {
             end += 1;
         }
         (start, end)
@@ -246,18 +259,24 @@ pub(crate) fn append(
     child_indent: &str,
     parent_indent: &str,
 ) -> String {
+    let newline = line_ending(doc);
     match entries.last() {
         Some(last) => format!(
-            "{},\n{child_indent}{new_text}{}",
+            "{},{newline}{child_indent}{new_text}{}",
             &doc[..last.value_end],
             &doc[last.value_end..]
         ),
         None => format!(
-            "{}\n{child_indent}{new_text}\n{parent_indent}{}",
+            "{}{newline}{child_indent}{new_text}{newline}{parent_indent}{}",
             &doc[..close],
             &doc[close..]
         ),
     }
+}
+
+/// The document's line ending, defaulting to LF for a single-line file.
+pub(crate) fn line_ending(doc: &str) -> &str {
+    if doc.contains("\r\n") { "\r\n" } else { "\n" }
 }
 
 /// A string as a JSON string literal (with the surrounding quotes).
@@ -285,6 +304,19 @@ pub(crate) fn escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crlf_append_and_remove_round_trip_empty_and_populated_containers() {
+        for original in ["{\r\n}", "{\r\n  \"a\": 1\r\n}"] {
+            let obj = object(original.as_bytes(), 0);
+            let entries: Vec<_> = obj.members.iter().map(|m| m.entry).collect();
+            let appended = append(original, &entries, obj.close, r#""b": 2"#, "  ", "");
+            assert!(!appended.replace("\r\n", "").contains('\n'));
+            let obj = object(appended.as_bytes(), 0);
+            let entries: Vec<_> = obj.members.iter().map(|m| m.entry).collect();
+            assert_eq!(remove(&appended, &entries, entries.len() - 1), original);
+        }
+    }
 
     #[test]
     fn reads_object_members_and_their_spans() {

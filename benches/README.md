@@ -193,7 +193,9 @@ things held most of it, and both changed with the memory brief:
 
 - **The recap index** kept every block in memory and is rebuilt from the whole log at every
   start (`built the recap index rev=611924 ms=2668` before, `ms=2926` now). Its blocks now go to a
-  SQLite file of the index's own, `recaps.sqlite3` in the state directory: a cache replaced at
+  SQLite file of the index's own, `recaps.sqlite3` in the state directory on a local filesystem
+  (on a network or unknown filesystem, a private local folder in temp before `$XDG_RUNTIME_DIR`,
+  or memory if neither works): a cache replaced at
   every start and removed at a clean stop, never read from one run to the next (hub-work's README,
   "Recaps"). Here that is 10,000 blocks (one a session) in 33 MiB of disk. What stays in memory is
   the recap engine's directory and the blocks it still holds open.

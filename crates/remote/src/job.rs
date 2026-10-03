@@ -7,8 +7,8 @@
 //! Windows ends them too. No ssh child can outlive the call and send empty credentials to a
 //! jump host.
 //!
-//! **Unsafe code.** This module and `pipe_security.rs` are the only ones of the crate that use
-//! it: the workspace denies `unsafe_code`, and these two alone allow it. Here because the four
+//! **Unsafe code.** This is the only module of the crate that uses it: the workspace denies
+//! `unsafe_code`, and this module alone allows it. Here because the four
 //! Win32 calls below have no safe binding in the dependency tree, and tokio's `Child` hands out
 //! only a raw handle. Each unsafe block has a `SAFETY` comment; every function here is safe to
 //! call. The job handle lives in an `OwnedHandle`, so it is closed exactly once, and process
