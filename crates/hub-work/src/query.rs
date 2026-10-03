@@ -712,6 +712,28 @@ pub fn unreported_sessions(conn: &Connection, machine: &MachineId) -> Result<Vec
     Ok(rows.collect::<sql::Result<_>>()?)
 }
 
+/// Starts still awaiting a transcript, plus sessions with an active dispatch, after adoption too.
+pub fn reconciling_sessions(conn: &Connection, machine: &MachineId) -> Result<Vec<Session>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {SESSION_COLS} FROM work_sessions
+         WHERE machine = ?1 AND state != ?3
+           AND ((state = ?2 AND native_id = '')
+                OR EXISTS (SELECT 1 FROM work_dispatches
+                           WHERE work_dispatches.session = work_sessions.id
+                             AND work_dispatches.ended IS NULL))
+         ORDER BY rev, id"
+    ))?;
+    let rows = stmt.query_map(
+        params![
+            machine.text(),
+            enum_text(&SessionState::Starting)?,
+            enum_text(&SessionState::Ended)?
+        ],
+        session_row,
+    )?;
+    Ok(rows.collect::<sql::Result<_>>()?)
+}
+
 /// One session.
 pub fn session(conn: &Connection, id: &SessionId) -> Result<Option<Session>> {
     Ok(conn

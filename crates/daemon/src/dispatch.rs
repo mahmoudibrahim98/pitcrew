@@ -28,10 +28,12 @@
 //!   known, is not started.
 //! - **Following** ([`FollowingSink`]): every batch the runner's `StoreSink` stores is handed to
 //!   `WorkService::follow_sessions`, which moves the dispatched task on the session's first
-//!   `working` and finishes the dispatch when its session ends (see hub-work's "Dispatch").
+//!   `working` or finished transcript turn and finishes the dispatch when its session ends
+//!   (see hub-work's "Dispatch").
 //! - **Reconciling** ([`reconcile`]): at start, once the runner attaches, and after each start of
 //!   a session the hub stored ahead of the runner, the sessions on the runner's machine still
-//!   `starting` with no CLI id are looked at, then again with a growing pause (1 s up to a
+//!   `starting` with no CLI id, plus sessions with active dispatches after adoption, are looked
+//!   at, then again with a growing pause (1 s up to a
 //!   minute) while any waits. One whose start is under way (this hub is starting it,
 //!   [`Attached::starting`], or the runner's command for it has not returned), whose CLI runs, or
 //!   whose transcript the runner has, is left to be reported. One the runner has no terminal and
@@ -40,6 +42,8 @@
 //!   dispatch fails, it ends, and the runner retires its terminal, so no later transcript is
 //!   taken for it. So is one matched by folder whose transcript did not appear within the
 //!   runner's claim window (15 minutes): none can be matched to it any more.
+//!   A reported CLI that exits without an end hook ends its session and cancels its dispatch;
+//!   an adoption still on its way to the hub is allowed to arrive first.
 
 use crate::agents::HubAgents;
 use crate::runner::{Attached, Parts};
@@ -403,7 +407,7 @@ async fn look_at(
     let work = work.upgrade()?;
     let reading = Arc::clone(&work);
     let sessions =
-        match tokio::task::spawn_blocking(move || reading.unreported_sessions(&machine)).await {
+        match tokio::task::spawn_blocking(move || reading.reconciling_sessions(&machine)).await {
             Ok(Ok(sessions)) => sessions,
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "cannot list the sessions waiting for their CLI");
@@ -431,6 +435,21 @@ async fn look_at(
             .await
             .unwrap_or_else(|e| Started::Unknown(e.to_string()));
         let reason = match started {
+            Started::Gone if !session.native_id.is_empty() => {
+                // The hub may hold imported/demo sessions this runner never started. Only an
+                // observed terminal exit (Exited) ends an adopted dispatch.
+                gone.remove(&id);
+                waiting = true;
+                continue;
+            }
+            Started::Exited if !session.native_id.is_empty() => DID_NOT_START,
+            Started::Exited => {
+                // Adoption has reached the runner's index but its re-statement has not reached
+                // the hub yet. Do not fail a dispatch for a transcript already found.
+                gone.remove(&id);
+                waiting = true;
+                continue;
+            }
             Started::Gone if gone.remove(&id) => DID_NOT_START,
             Started::TooLate => TOO_LATE,
             Started::Gone => {
@@ -447,6 +466,7 @@ async fn look_at(
                 continue;
             }
             Started::Unknown(why) => {
+                gone.remove(&id);
                 tracing::debug!(session = %id, why, "cannot tell yet whether a session's CLI started");
                 waiting = true;
                 continue;
@@ -454,7 +474,11 @@ async fn look_at(
         };
         let (abandoning, retiring) = (Arc::clone(&work), Arc::clone(starts));
         let abandoned = tokio::task::spawn_blocking(move || {
-            let abandoned = abandoning.abandon_session(&id, reason);
+            let abandoned = if session.native_id.is_empty() {
+                abandoning.abandon_session(&id, reason)
+            } else {
+                abandoning.dispatched_cli_exited(&id)
+            };
             if abandoned.is_ok() {
                 retiring.retire(id);
             }
@@ -779,6 +803,276 @@ mod tests {
         fn retire(&self, session: SessionId) {
             self.retired.lock().unwrap().push(session);
         }
+    }
+
+    #[test]
+    fn an_unrelated_empty_transcript_does_not_block_dispatch_retirement() {
+        use pitcrew_interfaces::source::{
+            Cursor, ParseChunk, SourceAdapter, SourceError, TranscriptPage, TranscriptRef,
+        };
+
+        // Model an adapter that cannot read session metadata from the empty old transcript.
+        struct MissingMetadata(pitcrew_ingest::claude::ClaudeAdapter);
+        impl SourceAdapter for MissingMetadata {
+            fn engine(&self) -> Engine {
+                Engine::Claude
+            }
+            fn discover(&self, home: &Path) -> Result<Vec<TranscriptRef>, SourceError> {
+                self.0.discover(home)
+            }
+            fn read_from(
+                &self,
+                transcript: &TranscriptRef,
+                _: &Cursor,
+            ) -> Result<ParseChunk, SourceError> {
+                Err(SourceError::Unreadable {
+                    path: transcript.path.clone(),
+                    reason: "session metadata is missing".into(),
+                })
+            }
+            fn read_page(
+                &self,
+                transcript: &TranscriptRef,
+                before: Option<u64>,
+                limit: usize,
+            ) -> Result<TranscriptPage, SourceError> {
+                self.0.read_page(transcript, before, limit)
+            }
+        }
+        for engine in [Engine::Codex, Engine::Claude] {
+            let tmp = tempfile::tempdir().unwrap();
+            let sam = member(MemberKind::Human, "@sam", None);
+            let writer = member(MemberKind::Agent, "@writer", Some(sam.id));
+            let mut pending = session(Some(writer.id));
+            pending.engine = engine;
+            let folder = tmp.path().join("work");
+            std::fs::create_dir_all(&folder).unwrap();
+            pending.cwd = folder.to_str().unwrap().to_owned();
+            let work = work(tmp.path(), &[&sam, &writer], &[&pending]);
+            let dispatch = pitcrew_protocol::model::Dispatch {
+                id: DispatchId::new(),
+                task: TaskId::new(),
+                agent: writer.id,
+                session: Some(pending.id),
+                brief: "Submit the seeds".into(),
+                started: 1,
+                ended: None,
+                outcome: None,
+                summary: None,
+            };
+            work.store()
+                .append(&[Event::now(
+                    work.workspace(),
+                    sam.id,
+                    EventBody::DispatchStarted {
+                        dispatch: dispatch.clone(),
+                    },
+                )])
+                .unwrap();
+            let claude = tmp.path().join("claude");
+            let codex = tmp.path().join("codex");
+            let empty = claude.join("projects/old/empty.jsonl");
+            std::fs::create_dir_all(empty.parent().unwrap()).unwrap();
+            std::fs::write(empty, b"").unwrap();
+            let config = pitcrew_runner::RunnerConfig::new(
+                work.workspace(),
+                pending.machine,
+                sam.id,
+                tmp.path().join("runner"),
+            )
+            .with_home(Engine::Claude, &claude)
+            .with_home(Engine::Codex, &codex);
+            let runner = pitcrew_runner::start(
+                config,
+                vec![
+                    Arc::new(MissingMetadata(pitcrew_ingest::claude::ClaudeAdapter::new())),
+                    Arc::new(pitcrew_ingest::codex::CodexAdapter::new()),
+                ],
+                Arc::new(pitcrew_runner::StoreSink::new(work.store().clone(), sam.id)),
+            )
+            .unwrap();
+            let runtime = Arc::new(pitcrew_interfaces::fake::FakeRuntime::default());
+            let terminals = runner.terminals(runtime.clone()).unwrap();
+            let commands = runner.commands(&terminals);
+            let command = |named| RunnerCommand::StartSession {
+                engine,
+                cwd: pending.cwd.clone(),
+                name: "Seeds".into(),
+                brief: None,
+                persona: None,
+                model: None,
+                account: None,
+                permission_mode: PermissionMode::Default,
+                session: Some(named),
+            };
+            assert!(matches!(
+                commands.run(CommandId::new(), &command(pending.id)),
+                CommandOutcome::Ok { .. }
+            ));
+            let terminal = terminals.terminal_of(pending.id).unwrap().unwrap();
+            pitcrew_interfaces::runtime::Runtime::kill(runtime.as_ref(), terminal).unwrap();
+            assert_eq!(
+                commands.started(pending.id),
+                Started::Gone,
+                "an unrelated empty transcript must not block the exited CLI's final scan"
+            );
+            let starts: Arc<dyn Starts> = Arc::new(commands.clone());
+            let attached = Attached::default();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let mut gone = HashSet::new();
+                for _ in 0..2 {
+                    look_at(
+                        &Arc::downgrade(&work),
+                        &attached,
+                        pending.machine,
+                        &starts,
+                        &mut gone,
+                    )
+                    .await;
+                }
+            });
+            assert_eq!(
+                work.dispatch(&dispatch.id).unwrap().outcome,
+                Some(pitcrew_protocol::model::DispatchOutcome::Failed)
+            );
+            assert_eq!(
+                work.session(&pending.id).unwrap().state,
+                SessionState::Ended
+            );
+            assert_eq!(terminals.terminal_of(pending.id).unwrap(), None);
+            assert!(
+                matches!(
+                    commands.run(CommandId::new(), &command(SessionId::new())),
+                    CommandOutcome::Ok { .. }
+                ),
+                "a new start must not be told to try again"
+            );
+            runner.stop();
+        }
+    }
+
+    #[test]
+    fn a_reported_dispatch_finishes_when_its_cli_exits_without_a_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sam = member(MemberKind::Human, "@sam", None);
+        let writer = member(MemberKind::Agent, "@writer", Some(sam.id));
+        let mut reported = session(Some(writer.id));
+        reported.native_id = "synthetic-cli-id".into();
+        reported.state = SessionState::Idle;
+        let work = work(tmp.path(), &[&sam, &writer], &[&reported]);
+        let dispatch = pitcrew_protocol::model::Dispatch {
+            id: DispatchId::new(),
+            task: TaskId::new(),
+            agent: writer.id,
+            session: Some(reported.id),
+            brief: "Submit the seeds".into(),
+            started: 1,
+            ended: None,
+            outcome: None,
+            summary: None,
+        };
+        work.store()
+            .append(&[Event::now(
+                work.workspace(),
+                sam.id,
+                EventBody::DispatchStarted {
+                    dispatch: dispatch.clone(),
+                },
+            )])
+            .unwrap();
+        let told = Arc::new(Told::default());
+        let starts: Arc<dyn Starts> = told.clone();
+        let attached = Attached::default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut gone = HashSet::new();
+            told.answers
+                .lock()
+                .unwrap()
+                .insert(reported.id, Started::Reported);
+            assert_eq!(
+                look_at(
+                    &Arc::downgrade(&work),
+                    &attached,
+                    reported.machine,
+                    &starts,
+                    &mut gone
+                )
+                .await,
+                Some(true)
+            );
+            assert_eq!(work.dispatch(&dispatch.id).unwrap().outcome, None);
+            told.answers
+                .lock()
+                .unwrap()
+                .insert(reported.id, Started::Exited);
+            for _ in 0..3 {
+                look_at(
+                    &Arc::downgrade(&work),
+                    &attached,
+                    reported.machine,
+                    &starts,
+                    &mut gone,
+                )
+                .await;
+            }
+        });
+        assert_eq!(
+            work.dispatch(&dispatch.id).unwrap().outcome,
+            Some(pitcrew_protocol::model::DispatchOutcome::Canceled),
+            "an exited reported CLI must finish its active dispatch"
+        );
+        assert_eq!(
+            work.session(&reported.id).unwrap().state,
+            SessionState::Ended
+        );
+        assert!(told.asked.lock().unwrap().contains(&reported.id));
+    }
+
+    #[test]
+    fn an_exited_adoption_is_allowed_to_reach_the_hub_before_it_finishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sam = member(MemberKind::Human, "@sam", None);
+        let pending = session(None);
+        let work = work(tmp.path(), &[&sam], &[&pending]);
+        let attached = Attached::default();
+        let told = Arc::new(Told::default());
+        told.answers
+            .lock()
+            .unwrap()
+            .insert(pending.id, Started::Exited);
+        let starts: Arc<dyn Starts> = told;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut gone = HashSet::new();
+            for _ in 0..3 {
+                assert_eq!(
+                    look_at(
+                        &Arc::downgrade(&work),
+                        &attached,
+                        pending.machine,
+                        &starts,
+                        &mut gone
+                    )
+                    .await,
+                    Some(true)
+                );
+                assert_eq!(
+                    work.session(&pending.id).unwrap().state,
+                    SessionState::Starting
+                );
+            }
+        });
     }
 
     /// The reconciliation never takes a start this hub is making for one whose CLI did not start,

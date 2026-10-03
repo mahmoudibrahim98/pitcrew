@@ -23,7 +23,7 @@
 //!    (the machine is unreachable), `409` (the runner refused) or `500` (it failed).
 //!
 //! **The task moves itself** ([`WorkService::follow_sessions`], fed what the runner reports):
-//! - when the dispatched session first reports `working`, the task moves to in progress
+//! - when the dispatched session first reports `working` or a finished transcript turn, the task moves to in progress
 //!   ([`WorkService::dispatch_working`]);
 //! - when the agent reports the work done (it moves its task to review, which is what
 //!   `pitcrew report <task> --review` does), the dispatch finishes as `succeeded`, in the same
@@ -465,6 +465,8 @@ impl WorkService {
     ///   a `session_state_changed` to it) moves the task to in progress, once per dispatch while
     ///   this service runs: a person who moves the task back is not overruled by the agent's
     ///   next turn;
+    /// - a finished transcript turn is equivalent evidence of work, including on a first read
+    ///   whose state changes were folded and whose final state is idle;
     /// - its `session_ended` (or a change to `ended`) finishes a dispatch still open: `canceled`
     ///   with "The session ended without a report.", or `failed` if the runner never reported
     ///   the session (its CLI never started).
@@ -488,6 +490,9 @@ impl WorkService {
                     to: SessionState::Working,
                     ..
                 } => self.session_working(session)?,
+                // A first read folds state changes and may already be idle. A finished
+                // transcript turn still proves that this dispatched session worked.
+                EventBody::TurnEnded { session, .. } => self.session_working(session)?,
                 EventBody::SessionEnded { session }
                 | EventBody::SessionStateChanged {
                     session,
@@ -622,6 +627,59 @@ impl WorkService {
     /// Database errors.
     pub fn unreported_sessions(&self, machine: &MachineId) -> Result<Vec<Session>> {
         self.read(|c| query::unreported_sessions(c, machine))
+    }
+
+    /// Sessions whose starts or active dispatch terminals the runner link must keep watching.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub fn reconciling_sessions(&self, machine: &MachineId) -> Result<Vec<Session>> {
+        self.read(|c| query::reconciling_sessions(c, machine))
+    }
+
+    /// Ends a reported session whose dispatched CLI exited without a report or end hook.
+    /// Rechecks the dispatch under the command lock: a report that won the race keeps its
+    /// outcome. The dispatch and session end together, authored by the agent for its owner.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub fn dispatched_cli_exited(&self, session: &SessionId) -> Result<()> {
+        let _guard = self.lock();
+        let found = self.read(|c| {
+            let Some(dispatch) = query::active_dispatch_of(c, session)? else {
+                return Ok(None);
+            };
+            let Some(s) = query::session(c, session)? else {
+                return Ok(None);
+            };
+            if s.state == SessionState::Ended || s.native_id.is_empty() {
+                return Ok(None);
+            }
+            let owner = query::member(c, &dispatch.agent)?.and_then(|m| m.owner);
+            Ok(Some((dispatch, owner)))
+        })?;
+        let Some((dispatch, owner)) = found else {
+            return Ok(());
+        };
+        self.append(&[
+            self.event(
+                dispatch.agent,
+                owner,
+                EventBody::SessionEnded { session: *session },
+            ),
+            self.event(
+                dispatch.agent,
+                owner,
+                EventBody::DispatchFinished {
+                    dispatch: dispatch.id,
+                    outcome: DispatchOutcome::Canceled,
+                    summary: Some(ENDED_WITHOUT_REPORT.to_owned()),
+                },
+            ),
+        ])?;
+        Ok(())
     }
 }
 
