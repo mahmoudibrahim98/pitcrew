@@ -60,6 +60,7 @@ the task key (`PAP-4`).
 | `GET /v1/workspace` | → `{ "workspace": Workspace, "rev": u64, "setup_needed": bool }` | `rev` is the current event revision. `setup_needed` is `true` while the workspace has no person (a fresh hub); omitted means `false`. |
 | `POST /v1/setup` | `Setup` → `{ "workspace": Workspace, "me": Member, "machine": Machine }` | The first run (see below). Device tokens only. |
 | `GET /v1/machines` | → `Machine[]` | |
+| `POST /v1/machines/{id}/scan` | → lines of `ScanFrame` (200) | Scans the machine's agent homes for onboarding. Device tokens only. See "Machine scan". |
 | `GET /v1/members` | → `Member[]` | **agent** |
 | `GET /v1/personas` | → `Persona[]` | |
 | `GET /v1/teams` | → `Team[]` | |
@@ -399,6 +400,68 @@ of the demo's events. They do not change with what you do through the mock, and 
 | Method and path | Body → response | Notes |
 |---|---|---|
 | `POST /v1/hooks/{engine}/{event}` | the CLI's hook payload (a JSON object, ≤ 1 MiB) → 202 | Sent by `pitcrew hook`. `engine` is an `Engine`; `event` is the CLI's own event name (e.g. `SessionStart`, `Stop`), matching `[A-Za-z][A-Za-z0-9_-]{0,63}`. The hub uses it for session state and never blocks the caller. **agent** |
+
+### Machine scan
+
+| Method and path | Body → response | Notes |
+|---|---|---|
+| `POST /v1/machines/{id}/scan` | none → lines of `ScanFrame` (200) | Device tokens only. See below. |
+
+Onboarding's scan step: what agent sessions a machine has, and which projects and workstreams they
+suggest. The types are in `crates/protocol/src/scan.rs`.
+
+- **What it reads.** A read-only, bounded walk of the machine's agent homes (`~/.claude`,
+  `~/.codex`, OpenCode's data folder, or where `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and
+  `XDG_DATA_HOME` point). On the daemon these are the runner's homes: `--homes` when given, none
+  with `--demo` alone. It reads a prefix of each transcript (one indexed row of an OpenCode
+  store), never a whole transcript, and never prompt text. It is not an import: it appends no
+  event and creates nothing.
+- **Which machine.** Only the hub's own (its first `local` machine). An unknown or malformed id
+  is `404`. Another machine of the workspace is `409 conflict`: scanning it is not supported yet.
+  A hub that reads no agent homes (the daemon with `--no-runner`) is `409` too. The body is
+  ignored; send none.
+- **One scan at a time per machine.** A scan holds its machine from the moment it is accepted
+  until its walk ends; a second one meanwhile is `409 conflict`. A client that closes the answer
+  early does not stop the walk: it ends on its own (it is bounded), and only then may the machine
+  be scanned again.
+- **The answer** is `200` with `Content-Type: application/x-ndjson`: one `ScanFrame` JSON object
+  per line, written as the walk goes. Read it as a stream for live progress, or whole.
+  - `{"type":"progress","scanned":0}` at once. Then `{"type":"progress","scanned":N,"total":M}`
+    (with `"path"`, a transcript just read, when there is one) at most every 100 ms; the last
+    progress frame has `scanned` equal to `total`.
+  - Then exactly one last frame: `{"type":"done","report":ScanReport}`, or, if the scan failed
+    after the answer began, `{"type":"error","code":ErrorCode,"message":String}`.
+  - A client that reads slowly may miss progress frames, never the last progress frame or the
+    last frame.
+- `ScanReport`: `{ "counts": ScanCounts, "suggestions": Suggestion[], "unreadable": u64 }`.
+  - `ScanCounts`: `{ "sessions", "subagent_sessions", "by_engine": [{ "engine", "count" }],
+    "by_home": [{ "engine", "home", "count" }], "by_folder": [{ "path", "count" }],
+    "by_month": [{ "month", "count" }], "first_activity"?, "last_activity"? }`. The `by_` lists
+    count ordinary sessions; sub-agent sessions are counted once, in `subagent_sessions`.
+    `by_folder` is busiest first, `by_month` (`YYYY-MM`, UTC) most recent first.
+  - `Suggestion`, a suggested project: `{ "id", "name", "path", "is_git", "session_count",
+    "recent_30d", "recent_90d", "workstreams": WorkstreamSuggestion[] }`. `path` is a repository
+    root (the nearest folder with a `.git`), or a folder shared by several sessions' folders that
+    have none; never the person's home, an agent home or a system folder. `id` is the path, stable
+    across scans. Most recently active first: sessions in the last 30 days, then 90, then all.
+  - `WorkstreamSuggestion`: `{ "id", "name", "branch"?, "session_count", "recent_30d",
+    "recent_90d" }`. Either a first-level sub-folder of the project with sessions in it (no
+    `branch`; `id` is the folder's own path, which is also where it is), or a branch other than
+    `main`, `master`, `trunk`, `develop` and `HEAD` (with `branch`; `id` is
+    `<project path>#<branch>`, and it is the project's `path` on that branch).
+  - `unreadable` counts homes, folders and transcripts skipped because they could not be read;
+    the rest of the scan still ran.
+  - Paths are the machine's own, as its CLIs wrote them. A session's folder and branch are the ones
+    it started with.
+- **Privacy.** The report names the person's folders and branches. It goes only to the device
+  token that asked, and is kept nowhere; an agent token gets `403`.
+- **Creating from a scan** is `POST /v1/projects` (`root` at the suggestion's `path`) and
+  `POST /v1/workstreams` (one location per suggested workstream, as above).
+- **Why not `/v1/stream`.** The stream is the workspace's shared feed: every device connected
+  receives every frame, and a scan's paths are one person's. The answer also keeps the progress,
+  the result and its failure together, and closing it is how a client stops listening.
+- **The mock** answers with a fixed synthetic report (folders under `/home/sam/`), after about a
+  second of progress, by the same rules: the hub's own machine only, `409` while one runs.
 
 ## Live updates: `GET /v1/stream?since=<rev>` (WebSocket, device tokens)
 
