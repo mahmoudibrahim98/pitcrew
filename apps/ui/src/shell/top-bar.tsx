@@ -211,7 +211,7 @@ export function TopBar() {
   const setOrchestratorOpen = useShell((s) => s.setOrchestratorOpen);
   // On a narrow bar the shortcut hints go first, then the button labels (kept for screen readers).
   return (
-    <header className="@container flex h-12 shrink-0 items-center gap-3 border-b border-line bg-bg px-3">
+    <header className="@container flex min-h-12 shrink-0 items-center gap-3 border-b border-line bg-bg px-3">
       <LayoutSwitcher />
       <Breadcrumb />
       <div className="ml-auto flex shrink-0 items-center gap-1.5">

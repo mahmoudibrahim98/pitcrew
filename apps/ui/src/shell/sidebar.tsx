@@ -84,7 +84,7 @@ export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
             type="button"
             aria-label={`Workspace: ${workspaceLabel(selected)}`}
             className={cx(
-              'flex h-9 min-w-0 flex-1 items-center gap-2 rounded-md px-1.5 text-left outline-none hover:bg-hover',
+              'flex min-h-9 min-w-0 flex-1 items-center gap-2 rounded-md px-1.5 text-left outline-none hover:bg-hover',
               FOCUS_RING,
             )}
           >
@@ -112,7 +112,7 @@ export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
           <MenuLabel>Workspaces</MenuLabel>
           <MenuRadioGroup value={ws} onValueChange={(id) => void router.navigate({ href: paths.workspace(id) })}>
             {workspaces.map((w) => (
-              <MenuRadioItem key={w.id} value={w.id}>
+              <MenuRadioItem key={w.id} value={w.id} className="h-auto min-h-7">
                 <WorkspaceName workspace={w} suffix={w.state !== undefined && w.state !== 'ready' ? ` · ${WORKSPACE_STATE_LABEL[w.state]}` : ''} />
               </MenuRadioItem>
             ))}
