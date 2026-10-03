@@ -74,12 +74,12 @@ export const feature = defineFeature({
   id: 'projects',
   layout: 'projects',
   routes: projectsRoutes,
-  // Both sort before the shell's own "Agent console" (order 40): e2e/shell.spec.ts's keyboard
+  // Entries sort before the shell's own "Agent console" (order 40): e2e/shell.spec.ts's keyboard
   // test tabs from it straight to the projects tree, which comes right after the top nav list.
   nav: [
     { id: 'projects-list', label: 'Projects', to: 'projects', order: 25 },
     { id: 'members', label: 'Members', to: 'members', order: 35 },
-    { id: 'calendar', label: 'Calendar', to: 'calendar', section: 'Workspace', order: 50 },
+    { id: 'calendar', label: 'Calendar', to: 'calendar', order: 37 },
   ],
   commands: [
     { id: 'go-projects', label: 'Go to Projects', group: 'Go to', run: (c) => c.go('projects') },
