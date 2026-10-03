@@ -26,6 +26,7 @@
 mod agents;
 mod cli;
 mod cors;
+mod dispatch;
 mod host;
 mod init;
 mod office;

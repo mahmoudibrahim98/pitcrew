@@ -7,6 +7,11 @@
 //!
 //! **Agents stay too.** A re-stated session without an `agent` keeps the agent it had (the one a
 //! dispatch named, say); one that names an agent takes it.
+//!
+//! **An ended session stays ended.** A re-stated `session_discovered` does not bring back a
+//! session that has ended (one the hub ended because its CLI did not start, whose CLI then turns
+//! up after all): it keeps its state and status line. A later `session_state_changed` still
+//! applies (a resumed CLI works in its session again).
 
 use super::{Applied, clear, exec};
 use crate::codec::{IdText, enum_text, opt_enum_col, opt_text, sql_rev};
@@ -23,8 +28,8 @@ pub struct Sessions;
 impl Sessions {
     /// The projection's name.
     pub const NAME: &'static str = "work.sessions";
-    /// 2: firm links, and agents, are kept.
-    const VERSION: u32 = 2;
+    /// 2: firm links, and agents, are kept. 3: an ended session stays ended when re-stated.
+    const VERSION: u32 = 3;
 }
 
 /// Whether a link made by a dispatch, a person or the agent itself.
@@ -161,7 +166,8 @@ fn touch(tx: &Transaction<'_>, session: &SessionId, at: TimestampMs) -> Applied 
 }
 
 fn session_discovered(tx: &Transaction<'_>, rev: i64, s: &Session) -> Applied {
-    // A re-statement keeps a firm link it would otherwise lose, and an agent it does not name.
+    // A re-statement keeps a firm link it would otherwise lose, an agent it does not name, and an
+    // end.
     let keep_link = !replaces_link(link_basis(tx, &s.id)?, s.link_basis);
     exec(
         tx,
@@ -175,7 +181,8 @@ fn session_discovered(tx: &Transaction<'_>, rev: i64, s: &Session) -> Applied {
            workstream = CASE WHEN ?19 THEN workstream ELSE excluded.workstream END,
            task = CASE WHEN ?19 THEN task ELSE excluded.task END,
            link_basis = CASE WHEN ?19 THEN link_basis ELSE excluded.link_basis END,
-           state = excluded.state, status_line = excluded.status_line,
+           state = CASE WHEN state = ?20 THEN state ELSE excluded.state END,
+           status_line = CASE WHEN state = ?20 THEN status_line ELSE excluded.status_line END,
            started = excluded.started, last_activity = excluded.last_activity,
            terminal = excluded.terminal, parent = excluded.parent",
         params![
@@ -198,6 +205,7 @@ fn session_discovered(tx: &Transaction<'_>, rev: i64, s: &Session) -> Applied {
             opt_text(s.terminal.as_ref()),
             opt_text(s.parent.as_ref()),
             keep_link,
+            enum_text(&SessionState::Ended)?,
         ],
     )?;
     Ok(())

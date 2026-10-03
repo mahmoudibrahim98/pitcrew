@@ -20,8 +20,8 @@ use pitcrew_protocol::ids::{
     AskId, DispatchId, MemberId, SessionId, SubtaskId, TaskId, TaskKey, WorkstreamId,
 };
 use pitcrew_protocol::model::{
-    Answer, Ask, AskKind, AskState, Brief, Health, MemberKind, Mover, Receipt, Subtask,
-    SubtaskSource, Task, TaskStatus, Workstream, WorkstreamStatus,
+    Answer, Ask, AskKind, AskState, Brief, DispatchOutcome, Health, MemberKind, Mover, Receipt,
+    Subtask, SubtaskSource, Task, TaskStatus, Workstream, WorkstreamStatus,
 };
 use pitcrew_protocol::transcript::{PlanItem, PlanStatus};
 use pitcrew_store::sql::Connection;
@@ -321,6 +321,12 @@ impl WorkService {
 
     /// Moves a task. The mover comes from the caller: a person, or an agent on its own task.
     ///
+    /// **An agent's report.** An agent that moves a task to review while it holds an active
+    /// dispatch on it (`pitcrew report <task> --review`) reports that dispatch's work done: each
+    /// such dispatch finishes as `succeeded` (`dispatch_finished`), in the same transaction as the
+    /// move. A task a person already moved to review counts as that report: the dispatches
+    /// succeed, nothing moves, and the task is returned as it is.
+    ///
     /// # Errors
     ///
     /// `not_found` for an unknown task; `forbidden` for an agent on a task not its own;
@@ -328,10 +334,15 @@ impl WorkService {
     /// task first (see "One writer" on [`WorkService`]).
     pub fn move_task(&self, caller: &Caller, task: &TaskRef, to: TaskStatus) -> Result<Task> {
         let _guard = self.lock();
-        let task = self.read(|c| {
+        let (task, reported) = self.read(|c| {
             let task = query::task(c, task)?.ok_or_else(|| no_task(task))?;
             require_own_task(c, caller, &task)?;
-            Ok(task)
+            let reported = if caller.scope == TokenScope::Agent && to == TaskStatus::Review {
+                query::active_dispatches(c, &task.id, &caller.member)?
+            } else {
+                Vec::new()
+            };
+            Ok((task, reported))
         })?;
         // An agent that got past the check above is on its own task.
         let mover = if caller.is_person() {
@@ -339,6 +350,21 @@ impl WorkService {
         } else {
             Mover::Agent { on_own_task: true }
         };
+        let finished = |dispatch| {
+            self.by(
+                caller,
+                EventBody::DispatchFinished {
+                    dispatch,
+                    outcome: DispatchOutcome::Succeeded,
+                    summary: None,
+                },
+            )
+        };
+        if task.status == to && !reported.is_empty() {
+            let events: Vec<_> = reported.into_iter().map(finished).collect();
+            self.append(&events)?;
+            return Ok(task);
+        }
         if !task.status.can_move(to, mover) {
             return Err(WorkError::conflict(move_refusal(&task, to, mover)));
         }
@@ -348,7 +374,9 @@ impl WorkService {
             to,
             mover,
         };
-        self.append(&[self.by(caller, body)])?;
+        let mut events = vec![self.by(caller, body)];
+        events.extend(reported.into_iter().map(finished));
+        self.append(&events)?;
         self.reload_moved(task.id, to)
     }
 

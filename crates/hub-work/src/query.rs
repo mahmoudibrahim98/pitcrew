@@ -243,6 +243,14 @@ pub fn has_person(conn: &Connection) -> Result<bool> {
         .query_row(params![enum_text(&MemberKind::Human)?], |r| r.get(0))?)
 }
 
+/// The workspace's first person, the one a fresh hub's setup made; `None` before setup.
+pub fn first_person(conn: &Connection) -> Result<Option<MemberId>> {
+    Ok(conn
+        .prepare_cached("SELECT id FROM work_members WHERE kind = ?1 ORDER BY rev, id LIMIT 1")?
+        .query_row(params![enum_text(&MemberKind::Human)?], |r| col(r, 0))
+        .optional()?)
+}
+
 const PERSONA_COLS: &str = "id, name, engine, model, instructions, permission_mode";
 
 fn persona_row(r: &Row<'_>) -> sql::Result<Persona> {
@@ -617,6 +625,31 @@ pub fn has_active_dispatch(conn: &Connection, task: &TaskId, agent: &MemberId) -
         .is_some())
 }
 
+/// The active (not ended) dispatches `agent` holds on `task`, oldest first.
+pub fn active_dispatches(
+    conn: &Connection,
+    task: &TaskId,
+    agent: &MemberId,
+) -> Result<Vec<DispatchId>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id FROM work_dispatches WHERE task = ?1 AND agent = ?2 AND ended IS NULL
+         ORDER BY rev, id",
+    )?;
+    let rows = stmt.query_map(params![task.text(), agent.text()], |r| col(r, 0))?;
+    Ok(rows.collect::<sql::Result<_>>()?)
+}
+
+/// The active (not ended) dispatch that runs in `session`, if any.
+pub fn active_dispatch_of(conn: &Connection, session: &SessionId) -> Result<Option<Dispatch>> {
+    Ok(conn
+        .prepare_cached(&format!(
+            "SELECT {DISPATCH_COLS} FROM work_dispatches WHERE session = ?1 AND ended IS NULL
+             ORDER BY rev, id LIMIT 1"
+        ))?
+        .query_row(params![session.text()], dispatch_row)
+        .optional()?)
+}
+
 /// Whether the task is `member`'s own: it is the assignee, or holds an active dispatch on it.
 pub fn is_own_task(conn: &Connection, task: &Task, member: &MemberId) -> Result<bool> {
     Ok(task.assignee.as_ref() == Some(member) || has_active_dispatch(conn, &task.id, member)?)
@@ -662,6 +695,20 @@ pub fn sessions(conn: &Connection, filter: &SessionFilter) -> Result<Vec<Session
         w.sql()
     ))?;
     let rows = stmt.query_map(params_from_iter(w.params.iter()), session_row)?;
+    Ok(rows.collect::<sql::Result<_>>()?)
+}
+
+/// Sessions on `machine` the hub stored ahead of its runner (a dispatch's, or a start for an
+/// agent or a task) that the runner has not reported yet: state `starting` and no CLI id.
+pub fn unreported_sessions(conn: &Connection, machine: &MachineId) -> Result<Vec<Session>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {SESSION_COLS} FROM work_sessions
+         WHERE machine = ?1 AND state = ?2 AND native_id = '' ORDER BY rev, id"
+    ))?;
+    let rows = stmt.query_map(
+        params![machine.text(), enum_text(&SessionState::Starting)?],
+        session_row,
+    )?;
     Ok(rows.collect::<sql::Result<_>>()?)
 }
 

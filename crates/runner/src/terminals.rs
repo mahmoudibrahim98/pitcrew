@@ -29,7 +29,7 @@ use pitcrew_protocol::ids::{SessionId, TerminalId};
 use pitcrew_protocol::runner::Key;
 use std::fmt;
 use std::io;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 /// Tuning for [`RunnerTerminals`].
@@ -79,6 +79,23 @@ impl fmt::Debug for RunnerTerminals {
             .field("runtime", &self.inner.runtime.kind())
             .field("options", &self.inner.options)
             .finish_non_exhaustive()
+    }
+}
+
+/// [`RunnerTerminals`] that do not keep their runtime or threads alive: the watcher's way to ask
+/// whether a program ended.
+#[derive(Clone)]
+pub(crate) struct WeakTerminals(Weak<Inner>);
+
+impl WeakTerminals {
+    pub(crate) fn upgrade(&self) -> Option<RunnerTerminals> {
+        self.0.upgrade().map(|inner| RunnerTerminals { inner })
+    }
+}
+
+impl fmt::Debug for WeakTerminals {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WeakTerminals").finish_non_exhaustive()
     }
 }
 
@@ -217,6 +234,20 @@ impl RunnerTerminals {
 
     pub(crate) fn info(&self, terminal: TerminalId) -> Result<TerminalInfo, TerminalError> {
         self.call(self.inner.options.call_timeout, move |rt| rt.info(terminal))
+    }
+
+    /// Whether `terminal`'s program has certainly ended: the runtime says so, or no longer has
+    /// the terminal. False while it runs, or when the runtime does not answer.
+    pub(crate) fn has_ended(&self, terminal: TerminalId) -> bool {
+        match self.info(terminal) {
+            Ok(info) => !info.alive,
+            Err(TerminalError::NotFound(_)) => true,
+            Err(_) => false,
+        }
+    }
+
+    pub(crate) fn downgrade(&self) -> WeakTerminals {
+        WeakTerminals(Arc::downgrade(&self.inner))
     }
 
     pub(crate) fn kill(&self, terminal: TerminalId) -> Result<(), TerminalError> {

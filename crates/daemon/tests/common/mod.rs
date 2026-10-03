@@ -414,9 +414,9 @@ impl Drop for Daemon {
 }
 
 /// Appends `bodies` to the demo workspace's store in `state` from this process, authored by
-/// `author` on behalf of `owner`, as another writer would (here: in place of the runner link, which
-/// is not wired in yet). A running daemon is not told: it looks at them with its next append, or at
-/// its next start. Returns their revisions.
+/// `author` on behalf of `owner`, as another writer would (a dispatch's end, or what a crash left
+/// behind). A running daemon is not told: it looks at them with its next append, or at its next
+/// start. Returns their revisions.
 pub fn append_to_store(
     state: &Path,
     author: &str,
