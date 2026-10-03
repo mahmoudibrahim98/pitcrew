@@ -90,6 +90,16 @@ pub struct RunnerConfig {
     /// Who runs each session, to decide whose hooks may change it (see
     /// [`RunnerHooks`](crate::RunnerHooks)). Without it, every hook is refused.
     pub agents: Option<Arc<dyn SessionAgents>>,
+    /// Cache layouts for concrete file adapters on notification-backed homes; on Unix this also
+    /// checks quiet OpenCode databases and falls back when SQLite side files exist.
+    /// Leave false for custom adapters whose discovery can change without directory changes.
+    pub cache_file_discovery: bool,
+    /// Concrete Claude/Codex JSONL adapters exhaust items when their byte cursor reaches EOF.
+    /// Leave false for custom adapters and cursors that count logical items instead of bytes.
+    pub byte_file_cursors: bool,
+    /// Round notification deadlines up to this grid after debounce; zero disables grouping.
+    /// Adds less than this duration. Polling and hook reports retain their deadlines.
+    pub notification_window: Duration,
 }
 
 impl RunnerConfig {
@@ -113,6 +123,9 @@ impl RunnerConfig {
             max_batch_events: 256,
             locations: None,
             agents: None,
+            cache_file_discovery: false,
+            byte_file_cursors: false,
+            notification_window: Duration::ZERO,
         }
     }
 

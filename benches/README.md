@@ -358,6 +358,7 @@ Run each independently, or run the combined budget report:
 
 ```bash
 benches/more.sh cpu         # 50 transcripts; static and growing, 180 seconds each
+benches/more.sh cpu --cpu-history # 10,000 transcripts, including the same 50 growing files
 benches/more.sh verbs       # 10,000 transcripts; whoami, task list, task show
 benches/more.sh hook-cli    # CLI hook: loaded daemon, then daemon stopped
 benches/more.sh hook-live   # matching hook state frame amid 50 growing transcripts
@@ -463,3 +464,107 @@ container has no graphical display or Xvfb, and its unrelated-UID private-path a
 prevent a usable terminal runtime. Cold start to interactive (1.5 s) and idle RAM with three
 workspaces (300 MB) remain for a local graphical run. Daemon RSS/startup and stream delivery are
 not substituted for those desktop measurements.
+
+
+### Idle CPU follow-up, 2026-10-03 (`0-idle-cpu`)
+
+Started from `main` at `6b18a6a`. The following before/after runs use the same synthetic harness,
+Rust 1.99, AMD EPYC 9V74 cloud environment class (four available threads, 33 GiB RAM), and the
+shipped release/bench profile with `opt-level = "z"`. PR #27's older absolute CPU numbers above
+used the earlier profile; the fresh controls below are the comparison for this change. The
+cloud environment resumed between the earlier profiling/controls and final runs. Page cache was
+retained; no builds, tests or profiler ran beside these CPU windows.
+
+```bash
+benches/more.sh cpu --keep-cache
+benches/more.sh cpu --cpu-history --keep-cache
+```
+
+`--cpu-history` keeps the default 10,000 generated transcripts **including** the 50 live files,
+rather than forcing the CPU-only stage down to 50 Claude files. The history mix is unchanged:
+Claude 6,000 + 1,000 sub-agents, Codex 2,000, OpenCode 1,000; 1.50 GiB and 1,345,483 records.
+Demo seed sessions are additional. Every static/growing window is 180 seconds; growing follows
+10 seconds of writer warmup. Each full growing run wrote 1,897 lines and verified all 50
+persisted cursors at their new file ends.
+
+| Whole daemon CPU, one core | Before | After | Before ticks | After ticks |
+|---|---:|---:|---:|---:|
+| Static, 50 files | 0.01% | 0.00% | 1 / 180.06 s | 0 / 180.06 s |
+| Growing, 50 files | 0.55% | 0.33% | 99 / 180.06 s | 59 / 180.06 s |
+| Static, 10k history | 0.38% | 0.08% | 69 / 180.07 s | 15 / 180.04 s |
+| Growing, 10k history | 1.17% | **0.46%** | 210 / 180.05 s | 82 / 180.06 s |
+
+#### Profile and the work removed
+
+Before changing runtime code, an unstripped build with the same optimisation was sampled during
+the growing 10k stage with `perf record -e cpu-clock:u -F 999 --call-graph dwarf,16384 -p PID
+-- sleep 90`. It captured 730 user-space CPU samples, with none lost. The profiler was outside
+the official before/after windows. These are sample shares, not wall-time measurements; kernel
+work is included in the `/proc` CPU numbers but excluded from this user-space profile.
+
+The text flame-graph summary groups each stack once (nested inclusive costs are not added):
+
+```text
+watcher / handle / full-history polling filter       105  14.4%
+watcher / rediscover / adapter walks, sorts, maps     137  18.8%
+watcher / check / load / SQLite + cursor JSON        113  15.5%
+watcher / check / remaining stat, read, derivation    127  17.4%
+sink / accept + cursor commits / SQLite              152  20.8%
+notification/library paths                           26   3.6%
+other, including inlined scheduling/library work      70   9.6%
+```
+
+The hot paths were `Watcher::handle` scanning all tracked rows for polling even when no home
+was polled, `Watcher::rediscover → SourceAdapter::discover` walking/sorting the file history,
+`Watcher::check → load → Store::load` decoding saved rows for every live change, and the sink's
+SQLite commits. The polling-filter closure alone had 13.15% self samples. Hub-work appeared in
+4/730 inclusive samples (0.55%); raw notification paths in 29/730 (4.0%). They did not justify
+changing the hub or dropping watches. The slow sweep remains on its original schedule.
+
+The runner now bypasses polling-list scans when there are no polled homes, retains at most 64
+saved hot rows separately from unsaved rows, shares immutable cursor snapshots, caches update
+statements, and avoids redundant EOF reads for the concrete byte-cursor adapters. Periodic
+file discovery checks bounded directory snapshots; Unix quiet OpenCode databases also check
+identity, size, mtime and ctime, with SQLite side files forcing full discovery. Explicit rescans,
+new-file events, overflow, watcher errors, failed watches and network polling retain full work.
+All transcripts still get their scheduled size/mtime/identity checks, including deletion checks.
+
+The daemon's 100 ms notification debounce is rounded to a 175 ms grid, adding less than 175 ms;
+source reads are therefore due within 275 ms. Polling and hook reports are not rounded. Adjacent
+completed reads of different sessions can share one sink acceptance and one atomic cursor
+transaction, bounded to four batches and the existing event limit. Partial/backfill batches
+keep their boundaries and backpressure. Cursor advancement still follows durable acceptance;
+failed acceptance retries identical events and failed cursor transactions pin all affected rows.
+
+#### Other guarantees and limits
+
+The runner's existing five-write latency/restart test passed with latencies
+174.11, 174.97, 174.92, 175.03 and 174.82 ms (each strictly below 300 ms), and no reads/events were
+repeated on restart. Real-Claude tests cover byte EOF, partial/appended lines, truncation,
+replacement, symlink refusal, deletion/reappearance and stable session IDs. Cache, polling,
+forced discovery, grouping/retry, accepted-item replay and atomic rollback tests also pass.
+Two existing row-unload tests now explicitly make their rows cold, preserving their assertions;
+new tests separately verify bounded saved-hot retention, unsaved pinning and cooling.
+
+The other budgets were checked after the CPU windows, without concurrent builds or tests:
+
+```bash
+target/release/pitcrew-bench-scale scan --keep-cache
+benches/more.sh hook-live --keep-cache
+```
+
+| Measurement | After | Budget / condition |
+|---|---:|---|
+| 10k first scan | 13.86 s | ≤ 60 s; page cache retained, cold SSD timing not verified |
+| First scan peak / steady RSS | 39.45 / 38.40 MiB | ≤ 80 MiB |
+| Hook → matching frame, 50 growing + 10k | p50 78.94 ms; p95 79.63; p99 80.76; max 83.20 | p50 ≤ 300 ms; 200 probes |
+
+The scan streamed its first session after 205 ms and produced 611,924 events for all 10,000
+sessions. The loaded hook run wrote another 1,099 lines and verified all 50 persisted cursors.
+The container's unrelated-UID ancestors prevent a terminal runtime; the measured daemon still
+served the real API, hooks and stream. No graphical or terminal result is inferred from it.
+
+No baseline was extended: these are budget observations on shared cloud hardware, without the
+stable repeated same-machine evidence required for a 10% regression baseline. Temporary raw
+profile artifacts from the earlier environment did not survive resumption; their text summary
+is retained above. Desktop CPU and graphical budgets were outside this brief.

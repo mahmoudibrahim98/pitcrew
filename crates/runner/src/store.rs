@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Migrations, applied in order; `PRAGMA user_version` counts those applied.
@@ -75,7 +76,7 @@ pub(crate) struct Row {
     pub engine: Engine,
     pub path: PathBuf,
     pub inner_id: Option<String>,
-    pub cursor: Cursor,
+    pub cursor: Arc<Cursor>,
     pub size: u64,
     pub mtime: TimestampMs,
     pub identity: Option<String>,
@@ -340,35 +341,45 @@ impl Store {
                 engine_text(row.engine)?,
                 path_text(&row.path)?,
                 row.inner_id.as_deref().unwrap_or(""),
-                serde_json::to_string(&row.cursor)?,
+                serde_json::to_string(row.cursor.as_ref())?,
             ],
         )?;
         Ok(())
     }
 
     pub fn commit(&self, commit: &Commit) -> Result<(), StoreError> {
+        self.commit_many(std::iter::once(commit))
+    }
+
+    /// Saves adjacent accepted batches atomically, in their existing order.
+    pub fn commit_many<'a>(
+        &self,
+        commits: impl Iterator<Item = &'a Commit>,
+    ) -> Result<(), StoreError> {
         let tx = self.conn.unchecked_transaction()?;
-        match commit {
-            Commit::Partial { session, keys } => {
-                let mut insert = tx.prepare_cached(
+        for commit in commits {
+            match commit {
+                Commit::Partial { session, keys } => {
+                    let mut insert = tx.prepare_cached(
                     "INSERT OR IGNORE INTO accepted_items (session_id, item_key) VALUES (?1, ?2)",
                 )?;
-                let session = session.0.to_string();
-                for k in keys {
-                    insert.execute(params![session, to_i64_bits(*k)])?;
+                    let session = session.0.to_string();
+                    for k in keys {
+                        insert.execute(params![session, to_i64_bits(*k)])?;
+                    }
                 }
-            }
-            Commit::Full(row) => {
-                let session = row.session.0.to_string();
-                // `emitted_through` (0001) is no longer used; it is cleared as rows are saved.
-                tx.execute(
-                    "UPDATE transcripts SET cursor = ?2, size = ?3, mtime = ?4, identity = ?5,
+                Commit::Full(row) => {
+                    let session = row.session.0.to_string();
+                    // `emitted_through` (0001) is no longer used; it is cleared as rows are saved.
+                    tx.prepare_cached(
+                        "UPDATE transcripts SET cursor = ?2, size = ?3, mtime = ?4, identity = ?5,
                         caught_up = ?6, generation = ?7, discovered = ?8, emitted_through = NULL,
                         meta = ?9, facts = ?10
                      WHERE session_id = ?1",
-                    params![
+                    )?
+                    .execute(params![
                         session,
-                        serde_json::to_string(&row.cursor)?,
+                        serde_json::to_string(row.cursor.as_ref())?,
                         to_i64(row.size)?,
                         row.mtime,
                         row.identity,
@@ -377,13 +388,11 @@ impl Store {
                         row.discovered,
                         row.meta.as_ref().map(serde_json::to_string).transpose()?,
                         serde_json::to_string(&row.facts)?,
-                    ],
-                )?;
-                // The cursor now covers every accepted item.
-                tx.execute(
-                    "DELETE FROM accepted_items WHERE session_id = ?1",
-                    [&session],
-                )?;
+                    ])?;
+                    // The cursor now covers every accepted item.
+                    tx.prepare_cached("DELETE FROM accepted_items WHERE session_id = ?1")?
+                        .execute([&session])?;
+                }
             }
         }
         tx.commit()?;
@@ -722,7 +731,7 @@ impl RawRow {
             engine: engine_from(self.engine)?,
             path: PathBuf::from(self.path),
             inner_id: Some(self.inner_id).filter(|s| !s.is_empty()),
-            cursor: serde_json::from_str(&self.cursor)?,
+            cursor: Arc::new(serde_json::from_str(&self.cursor)?),
             size: u64::try_from(self.size).map_err(|_| StoreError::Range("size".into()))?,
             mtime: self.mtime,
             identity: self.identity,
@@ -823,7 +832,7 @@ mod tests {
             engine: Engine::Claude,
             path: path.into(),
             inner_id: None,
-            cursor: Cursor::default(),
+            cursor: Arc::default(),
             size: 0,
             mtime: 0,
             identity: None,
@@ -866,6 +875,52 @@ mod tests {
     }
 
     #[test]
+    fn grouped_commits_keep_order_and_roll_back_every_cursor_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let mut a = row("/t/a.jsonl");
+        let mut b = row("/t/b.jsonl");
+        store.insert(&a).unwrap();
+        store.insert(&b).unwrap();
+        a.cursor = Arc::new(Cursor {
+            offset: 10,
+            state: None,
+        });
+        b.cursor = Arc::new(Cursor {
+            offset: 20,
+            state: None,
+        });
+        b.size = u64::MAX; // Fails after the first row's UPDATE within the transaction.
+        let partial = Commit::Partial {
+            session: a.session,
+            keys: vec![7],
+        };
+        let full_a = Commit::Full(Box::new(a.clone()));
+        let bad_b = Commit::Full(Box::new(b.clone()));
+        assert!(
+            store
+                .commit_many([&partial, &full_a, &bad_b].into_iter())
+                .is_err()
+        );
+        let saved = store.load(a.session).unwrap().unwrap();
+        assert_eq!(saved.cursor.offset, 0, "no earlier cursor advanced");
+        assert!(saved.accepted.is_empty(), "partial keys rolled back too");
+        assert_eq!(store.load(b.session).unwrap().unwrap().cursor.offset, 0);
+        b.size = 20;
+        let full_b = Commit::Full(Box::new(b.clone()));
+        store
+            .commit_many([&partial, &full_a, &full_b].into_iter())
+            .unwrap();
+        let saved = store.load(a.session).unwrap().unwrap();
+        assert_eq!(saved.cursor, a.cursor);
+        assert!(
+            saved.accepted.is_empty(),
+            "the later full cursor covers the partial keys"
+        );
+        assert_eq!(store.load(b.session).unwrap().unwrap().cursor, b.cursor);
+    }
+
+    #[test]
     fn rows_round_trip_and_commits_apply() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open");
@@ -885,15 +940,15 @@ mod tests {
         // A partial commit changes nothing but the accepted items.
         assert_eq!(got.accepted, keys.iter().copied().collect());
         assert!(!got.discovered);
-        assert_eq!(got.cursor, Cursor::default());
+        assert_eq!(*got.cursor, Cursor::default());
         let found = store.find(&r.path, None).expect("find").expect("row");
         assert_eq!(found.accepted, got.accepted);
 
         let mut full = got.clone();
-        full.cursor = Cursor {
+        full.cursor = Arc::new(Cursor {
             offset: 99,
             state: Some(serde_json::json!({"k": 1})),
-        };
+        });
         full.size = 120;
         full.identity = Some("1:2".into());
         full.facts.state = SessionState::Idle;
