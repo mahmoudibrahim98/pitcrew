@@ -205,15 +205,16 @@ impl BlockDb {
                         if before == tasks {
                             continue;
                         }
-                        for task in before.chunks_exact(16) {
-                            if !tasks.chunks_exact(16).any(|t| t == task) {
-                                unlink.execute(params![task, &id[..]])?;
+                        let now: &[[u8; 16]] = tasks.as_chunks().0;
+                        for task in before.as_chunks::<16>().0 {
+                            if !now.contains(task) {
+                                unlink.execute(params![&task[..], &id[..]])?;
                             }
                         }
                     }
                 }
-                for task in tasks.chunks_exact(16) {
-                    link.execute(params![task, &id[..]])?;
+                for task in tasks.as_chunks::<16>().0 {
+                    link.execute(params![&task[..], &id[..]])?;
                 }
             }
         }
