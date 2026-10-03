@@ -16,7 +16,11 @@
 //!   `session_discovered`, `session_state_changed`, `tool_ran`, `file_edited` and `turn_ended`
 //!   events for an [`EventSink`], through a bounded channel;
 //! - a cursor is saved only after the sink accepts the events read before it, so a crash repeats
-//!   events (with the same ids) rather than losing them.
+//!   events (with the same ids) rather than losing them;
+//! - in memory the watcher keeps of each transcript only what tells a change (size, mtime, file
+//!   identity) and what routes hooks to its session; the rest of its row (the cursor, the
+//!   session's facts and metadata) is read from the index when the transcript changes or a hook
+//!   reports, and let go once the index has saved it (the README's "Memory").
 //!
 //! Connected to a hub in the same process (the solo case in ADR-0009):
 //! - [`StoreSink`] writes the events into the hub's store, once each;
@@ -259,7 +263,7 @@ pub fn start(
 ) -> Result<RunnerHandle, RunnerError> {
     let store = store::Store::open(&config.state_dir)?;
     // Starting with an empty index would give every transcript a new session id.
-    let rows = store.load_all()?;
+    let rows = store.load_index()?;
     let store = Arc::new(Mutex::new(store));
     let (tx, rx) = std::sync::mpsc::sync_channel(config.channel_capacity.max(1));
     let shared = Arc::new(watch::Shared::default());

@@ -25,7 +25,8 @@ let work = Arc::new(
     WorkService::new(Arc::clone(&store), workspace)      // a protocol `Workspace` (id and name)
         .with_dispatcher(runner_link)                     // Arc<dyn Dispatcher>, stream D
         .with_hub_machine(this_machine)                   // where folderless dispatches run
-        .with_setup_listener(setup_listener),              // starts the office and runner on setup
+        .with_setup_listener(setup_listener)               // starts the office and runner on setup
+        .with_recap_file(state_dir.join("recaps.sqlite3")), // the recap blocks on disk (see "Recaps")
 );
 let parts = RouterParts::new()
     .agent(pitcrew_hub_work::agent_routes().layer(Extension(Arc::clone(&work))))
@@ -213,9 +214,10 @@ fn recap_days(&self, scope: DaysScope, tz_minutes: i32, before: Option<&Date>,
   already. Copy the filter's four fields, map the scope variant for variant, pass `before.as_ref()`
   for days, and convert the error as for `EventRefs`. Once the route has validated, an `invalid`
   from the index means the two disagree about the contract: a bug, worth logging as one.
-- **Kept current on read.** `Recaps` (the index itself, pure and in memory) feeds the recap
-  engine's `BlockBuilder` every event in log order and keeps every block, open and closed, indexed
-  by session, task, workstream and project. The service's `Recaps` starts empty: **every query
+- **Kept current on read.** `Recaps` (the index itself; it reads no store and no clock) feeds the
+  recap engine's `BlockBuilder` every event in log order and keeps every block, open and closed,
+  indexed by session, task, workstream and project (see "Where the blocks are"). The service's
+  `Recaps` starts empty: **every query
   first reads the log from the last revision the index applied** (`Store::since`, 1,000 events at a
   time, each page applied whole or not at all), then answers. That is the back office's "from the
   first revision not looked at" without a subscription: no event is missed or applied twice,
@@ -247,11 +249,34 @@ fn recap_days(&self, scope: DaysScope, tz_minutes: i32, before: Option<&Date>,
   while it was unknown ("a task" becomes "PAP-9"). Then every paragraph is written again. A new
   member, task or ask that nothing named yet changes no paragraph. At most `DAY_CACHE_ENTRIES`
   (2,048) are kept, least recently used out first.
-- **Memory.** Every block stays in memory (they are derived, never stored): one to six kilobytes
-  each as JSON, depending on how much it holds (see "Timings"). One directory (not a second copy
-  for names) keeps the recap index's own memory to about the engine's own figure for one
-  (125–170 MB at the bound; see the `crates/recap` README), half what two would cost. A hub
-  restart rebuilds the index.
+- **Where the blocks are.** The engine keeps in memory only what it needs to go on: its directory
+  and the blocks still open. Every block made so far, open or closed, is written as it begins or
+  changes to a SQLite database of the index's own (`src/recap_db.rs`), never to `hub.db`: one row
+  a block (its JSON, its start, and the session, workstream and project it is linked to), its
+  tasks in a table of their own, and a partial index for each filter, so a query reads only its
+  own blocks, in the order the in-memory sets gave (by id, newest first; a scope's by
+  `(start, id)` for days). Each batch of blocks is one transaction. `Recaps::new` keeps the
+  database in memory; `WorkService::with_recap_file(path)`, which the daemon uses, in a file, so a
+  long history costs disk instead. P-measure's history (`benches/README.md`, "At scale": 612,000
+  events, 10,000 sessions) makes 10,000 blocks, a 33 MiB file; with the blocks in memory the
+  index held about 51 MiB, and now about 17 MiB at its peak (the engine's directory, and the
+  blocks it still holds open: a history scanned newest first leaves most of them open).
+- **The file is a cache, never the truth.** It is replaced whenever the index is built (the first
+  query or `sync_recaps`, so at every start) and removed when the service is dropped: it is never
+  read from one run to the next, so a crash, even in the middle of a write, can leave a file behind
+  but never a stale answer. It is private (0600 on Unix). It is written without a journal on disk
+  and without `fsync` (`journal_mode=MEMORY`, `synchronous=OFF`, an exclusive lock), since a crash
+  discards it anyway; a transaction still rolls back. One file per service: two services (or
+  processes) must not share a path.
+- **A write that fails rebuilds the index.** If a batch of blocks cannot be stored (a full disk),
+  the database is behind the engine: the index is broken, the query that met it answers an
+  internal error, and the next one builds the index again from the log, with its blocks in memory
+  from then on (logged). If the file cannot be made at all, the blocks stay in memory (a warning).
+- **Memory.** One directory (not a second copy for names) keeps the recap index's own memory to
+  about the engine's own figure for one (125–170 MB at the bound; see the `crates/recap` README),
+  half what two would cost, plus SQLite's page cache for the file (1 MiB). In memory
+  (`Recaps::new`), the blocks take one to six kilobytes each as JSON, depending on how much each
+  holds (see "Timings"). A hub restart rebuilds the index.
 
 **The seeded demo is not the fixture.** `crates/fixtures/data/demo-recaps.json` is the engine over
 the demo's slice of events, with the demo's lists known beforehand; fed exactly that, the index
@@ -514,7 +539,11 @@ query `400`; bodies over 1 MiB are `400`. A `500` is logged in full and its body
   `tests/recap_props.rs`: property tests that an index kept current through random batches, with
   queries in between, equals a rebuild and the engine over the whole log, through a store and in
   memory (with small engine caps and caches, and with the directory's own bound tiny, so eviction
-  starts from the first events on); and every receipt points into the log. `tests/recap_common/`
+  starts from the first events on); and every receipt points into the log. `tests/recap_file.rs`:
+  the same with the blocks in a file (`with_recap_file`), which equals a rebuild in memory and the
+  engine, lives and dies with the service, and when a crashed run left one behind (another log's
+  index, or garbage) is replaced, never served. Unit tests in `src/recap.rs`: a batch of blocks
+  that cannot be stored fails its query, and the next one rebuilds from the log. `tests/recap_common/`
   holds the generator and the oracle.
 - `tests/sessions.rs`, `tests/dispatch.rs`, `tests/routes.rs`, `tests/self_moving.rs`: the other
   routes and commands. `tests/task_shape.rs`: the `Task` shape pin.
