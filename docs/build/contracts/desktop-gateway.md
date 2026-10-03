@@ -155,16 +155,19 @@ interface WslDistro { name: string; default: boolean; running: boolean; version:
 interface WslTarget { kind: 'wsl'; distro: string }
 ```
 
-Missing WSL is a normal `{ available: false, distros: [] }` answer. A stopped WSL2 distro
-can be selected; probing starts it. WSL1 is refused with an explanation. The wizard offers
-“A WSL distro on this computer” only when available.
+Missing WSL is a normal `{ available: false, distros: [] }` answer, and so is WSL without any
+distro (wsl.exe then fails the listing). A stopped WSL2 distro can be selected: probe and plan
+start it first, allowing up to 120 s for WSL's cold start, before the usual 30 s probe. WSL1 is
+refused with an explanation. The wizard offers “A WSL distro on this computer” only when there
+is a distro to choose.
 
 Probe accepts `{ host }` unchanged, or `{ host: '', target: WslTarget }`. Plans use the same
 target form; a nonempty SSH host together with a target is refused. Add takes the opaque plan
 unchanged, which binds the chosen transport and distro. WSL permits only direct and tmux.
 No SSH configuration, askpass, host keys, SLURM or systemd-user are involved. Commands use
-`wsl.exe -d <distro> --exec /bin/sh -c …`, with the distro as one argument and POSIX-quoted
-commands. The API uses `pitcrewd connect` over stdio, never port forwarding. Deployment uses
+`%SystemRoot%\System32\wsl.exe -d <distro> --cd ~ --exec /bin/sh -c …`, with the distro as one
+argument, POSIX-quoted commands and `WSL_UTF8=1` (so wsl.exe's own errors read as text); an ssh
+host may not start with `wsl:`, the form a WSL workspace's `host` takes. The API uses `pitcrewd connect` over stdio, never port forwarding. Deployment uses
 the Linux musl helper, compiled checksum manifest, atomic switch and existing private-directory
 checks. The saved registry records the target; restart and retry use the usual connection ladder
 and workspace states. Pairing reads the token over that transport and keeps it in the OS keychain.
