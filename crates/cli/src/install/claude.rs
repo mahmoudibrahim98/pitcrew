@@ -765,9 +765,16 @@ pub(crate) fn plan_uninstall(env: Env<'_>) -> Result<Plan> {
     let mut doc = original.clone();
     let mut removed = 0usize;
     for event in EVENTS {
-        let (new_doc, did) = remove_event(&doc, event);
-        doc = new_doc;
-        if did {
+        let mut removed_event = false;
+        loop {
+            let (new_doc, did) = remove_event(&doc, event);
+            if !did {
+                break;
+            }
+            doc = new_doc;
+            removed_event = true;
+        }
+        if removed_event {
             removed += 1;
         }
     }
