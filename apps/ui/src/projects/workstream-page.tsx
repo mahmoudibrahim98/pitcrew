@@ -1,4 +1,4 @@
-// The workstream page: a header and five tabs (Where it stands, Board, Tasks, Agents, Activity).
+// The workstream page: a header and six tabs.
 // The route is `projects/$project/workstreams/$workstream`; the tab on screen is this component's
 // own state, not the URL.
 
@@ -15,9 +15,10 @@ import { HEALTH, WORKSTREAM_STATUS } from './format.ts';
 import { useProjectsNav } from './nav.tsx';
 import { WorkstreamOverviewBody } from './overview.tsx';
 import { TasksList } from './tasks-list.tsx';
+import { FilesTab } from './files.tsx';
 import { ErrorNote, MaybeLink } from './ui.tsx';
 
-type Tab = 'stands' | 'board' | 'tasks' | 'agents' | 'activity';
+type Tab = 'stands' | 'board' | 'tasks' | 'agents' | 'activity' | 'files';
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'stands', label: 'Where it stands' },
@@ -25,6 +26,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: 'tasks', label: 'Tasks' },
   { id: 'agents', label: 'Agents' },
   { id: 'activity', label: 'Activity' },
+  { id: 'files', label: 'Files' },
 ];
 
 const TAB_ITEM =
@@ -42,6 +44,8 @@ function NotFound() {
 export function WorkstreamPage() {
   const { workstream: id }: { workstream?: string } = useParams({ strict: false });
   const [tab, setTab] = useState<Tab>('stands');
+  const [filesDirty, setFilesDirty] = useState(false);
+  const [filesBusy, setFilesBusy] = useState(false);
   const workstreams = useWorkstreams();
   const names = useNames();
   const nav = useProjectsNav();
@@ -83,7 +87,12 @@ export function WorkstreamPage() {
         <ToggleGroup.Root
           type="single"
           value={tab}
-          onValueChange={(value) => value !== '' && setTab(value as Tab)}
+          onValueChange={(value) => {
+            if (value === '' || value === tab || filesBusy) return;
+            if (filesDirty && !window.confirm('Discard unsaved changes?')) return;
+            setFilesDirty(false);
+            setTab(value as Tab);
+          }}
           aria-label="Workstream sections"
           className="inline-flex w-fit flex-wrap rounded-sm border border-line bg-sunken p-0.5"
         >
@@ -102,6 +111,7 @@ export function WorkstreamPage() {
           {tab === 'tasks' && <TasksList workstream={workstream.id} />}
           {tab === 'agents' && <AgentsNow workstream={workstream.id} title="Agents" />}
           {tab === 'activity' && <ActivityFeed filters={{ workstream: workstream.id }} title="Activity" />}
+          {tab === 'files' && <FilesTab key={workstream.id} workstream={workstream} onDirty={setFilesDirty} onBusy={setFilesBusy} />}
         </>
       )}
     </div>
