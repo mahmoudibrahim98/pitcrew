@@ -92,10 +92,11 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [0-review-followups](0-review-followups.md) | 0 · Contracts | `integrator/review-followups` | Opus-class | **Merged** (PR #30) |
 | [0-dispatch](0-dispatch.md) | 0 · Composition root | `integrator/dispatch` | Opus-class | Changes requested (PR #33) |
 | [0-onboarding-scan](0-onboarding-scan.md) | 0 · Contracts | `integrator/onboarding-scan` | Opus-class | **Merged** (PR #32) |
-| [0-session-linking](0-session-linking.md) | 0 · Composition root | `integrator/session-linking` | Opus-class | Ready once 0-dispatch merges |
-| [0-idle-cpu](0-idle-cpu.md) | 0 · Composition root | `integrator/idle-cpu` | Opus-class | Ready (cloud VM) |
+| [0-session-linking](0-session-linking.md) | 0 · Composition root | `integrator/session-linking` | Codex | Ready once 0-dispatch merges |
+| [0-idle-cpu](0-idle-cpu.md) | 0 · Composition root | `integrator/idle-cpu` | Codex | Ready (cloud VM) |
 | [0-scan-followups](0-scan-followups.md) | 0 · Contracts | `integrator/scan-followups` | Codex | Ready |
 | [0-docs-followups](0-docs-followups.md) | 0 · Contracts | `integrator/docs-followups` | Codex | Ready |
+| [0-read-cursors](0-read-cursors.md) | 0 · Contracts | `integrator/read-cursors` | Codex | In progress (Codex, local) |
 | [0-ci-security](0-ci-security.md) | 0 · Contracts | `integrator/ci-security` | Codex | **Merged** (PR #22) |
 | [0-protocol-ts](0-protocol-ts.md) | 0 · Contracts | `integrator/protocol-ts` | Codex | **Merged** (PR #23) |
 | [0-api-conformance](0-api-conformance.md) | 0 · Contracts | `integrator/api-conformance` | Codex | **Merged** (PR #24) |
