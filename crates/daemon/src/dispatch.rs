@@ -619,19 +619,18 @@ mod tests {
         rt.block_on(runner.stop(Duration::from_secs(10)));
     }
 
-    /// `~` is this user's home.
+    /// `~` is this user's home, checked as any folder is.
     #[test]
     fn a_dispatch_without_a_folder_runs_in_the_home() {
         let home = directories::BaseDirs::new()
             .unwrap()
             .home_dir()
             .to_path_buf();
-        if !home.is_dir() || crate::sessions::checked_cwd(home.to_str().unwrap()).is_err() {
+        let Ok(checked) = crate::sessions::checked_cwd(home.to_str().unwrap()) else {
             eprintln!("skipped: this user's home is not a folder a session may start in");
             return;
-        }
-        let real = std::fs::canonicalize(&home).unwrap();
-        assert_eq!(folder("~").unwrap(), real.to_str().unwrap());
+        };
+        assert_eq!(folder("~").unwrap(), checked.path);
         assert!(folder("relative").is_err());
     }
 }

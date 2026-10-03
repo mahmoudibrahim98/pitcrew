@@ -553,8 +553,8 @@ impl WorkService {
         if found.state == SessionState::Ended || !found.native_id.is_empty() {
             return Ok(());
         }
-        // Authored by the session's agent (for its owner) when it has one, as the runner's own
-        // reports of it would be; else by the dispatch's agent.
+        // Authored by the dispatch's agent, else the session's, for its owner (as the hub's other
+        // reports of a dispatch are); for a session without either, by the workspace's person.
         let (author, owner) = match (&dispatch, found.agent) {
             (Some((d, owner)), _) => (d.agent, *owner),
             (None, Some(agent)) => (
@@ -576,7 +576,10 @@ impl WorkService {
                 EventBody::DispatchFinished {
                     dispatch: d.id,
                     outcome: DispatchOutcome::Failed,
-                    summary: Some(format!("The session could not start: {reason}.")),
+                    summary: Some(format!(
+                        "The session could not start: {}.",
+                        reason.trim_end_matches('.')
+                    )),
                 },
             ));
         }
