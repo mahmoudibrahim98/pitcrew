@@ -91,6 +91,13 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
   `dispatch_started` and `session_discovered`. Done or canceled tasks answer 409.
 - **Creating projects and workstreams** (`POST /v1/projects`, `POST /v1/workstreams`) with the
   contract's defaults; a project key already in use is 409, an unknown project for a workstream 404.
+- **The machine scan** (`POST /v1/machines/{id}/scan`): a fixed synthetic report (14 sessions in
+  three agent homes under `/home/sam`, the fixtures' folders and a few more, and three suggested
+  projects with workstreams from sub-folders and branches), as newline-delimited frames: a
+  `progress` frame at once, four more over about a second (`startServer({ delays: { scan } })`),
+  then `done`. Only the hub's own machine (its first `local` one); another is 409, an unknown one
+  404. One scan at a time: a second is 409 until the first has written its report, even if its
+  client went away. It reads no folder.
 - **Editing tasks** (`PATCH /v1/tasks/{id-or-key}`): every rule in the contract (title, labels,
   workstream, `blocked_by` with cycles as 409, dates). `task_updated` carries only the fields that
   changed, and a patch that changes nothing emits nothing.
@@ -124,7 +131,8 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
 
 ## What it does not do
 
-- It runs no agents and reads no real transcripts; replies and terminal screens are canned.
+- It runs no agents and reads no real transcripts; replies, terminal screens and the scan's report
+  are canned.
 - Nothing is saved: restart the server to get the demo workspace back.
 - No back office or tracker sync: briefs are only proposed by the fixture, dispatches never finish
   on their own, workstream health never changes by itself, and mentions do not create asks.
@@ -165,6 +173,7 @@ a single entry point.
 | `src/simulate.ts` | Simulated session liveness. |
 | `src/transcripts.ts` | Canned transcripts and paging. |
 | `src/recaps.ts` | The recap routes, paged from the recaps fixture. |
+| `src/scan.ts` | The machine scan: its synthetic report and streamed frames. |
 | `src/ws.ts` | A minimal WebSocket server (RFC 6455). |
 | `src/types.ts` | Wire types mirroring `crates/protocol`. |
 | `src/rules.ts` | `can_move` and date checks ported from `model.rs`. |
