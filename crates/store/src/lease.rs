@@ -501,7 +501,11 @@ fn decide(
 /// renames this into place and is responsible for removing the temp name afterward either way.
 fn write_candidate(path: &Path, data: &LeaseData) -> std::io::Result<PathBuf> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = dir.join(format!(".{}.tmp-{}", file_name(path), ulid::Ulid::new()));
+    let tmp = dir.join(format!(
+        ".{}.tmp-{}",
+        file_name(path),
+        ulid::Ulid::generate()
+    ));
     let json = serde_json::to_vec(data)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     {

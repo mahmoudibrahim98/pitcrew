@@ -33,6 +33,22 @@ fn ids_accept_prefixed_and_bare_forms() {
 }
 
 #[test]
+fn stored_ulid_text_and_json_are_compatible_with_ulid_1() {
+    // ULID spec vector, pinned before upgrading from 1.2.1.
+    const TEXT: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    const JSON: &str = "\"01ARZ3NDEKTSV4RRFFQ69G5FAV\"";
+    let id: TaskId = TEXT.parse().unwrap();
+    assert_eq!(id.0.to_string(), TEXT);
+    assert_eq!(id.to_string(), format!("tsk_{TEXT}"));
+    assert_eq!(serde_json::to_string(&id).unwrap(), JSON);
+    assert_eq!(serde_json::from_str::<TaskId>(JSON).unwrap(), id);
+    assert_eq!(
+        ulid::Ulid::from_parts(1_469_922_850_259, 0xd6764c61efb99302bd5b).to_string(),
+        TEXT
+    );
+}
+
+#[test]
 fn project_and_task_keys() {
     assert!(ProjectKey::new("CMP").is_ok());
     assert!(ProjectKey::new("TL2").is_ok());
