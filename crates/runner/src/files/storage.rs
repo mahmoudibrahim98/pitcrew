@@ -80,7 +80,7 @@ pub(super) fn permissions(
         let _ = (source, target);
     }
     #[cfg(windows)]
-    acl(target, Some(source), "copy")?;
+    pitcrew_trust::windows::copy_file_dacl(source, target)?;
     Ok(())
 }
 
@@ -125,17 +125,10 @@ impl Temporary {
         }
         #[cfg(windows)]
         {
-            use std::os::windows::fs::OpenOptionsExt as _;
             let _ = parent;
             let path = parent_path.join(format!(".pitcrew-{}", ulid::Ulid::generate()));
-            acl(&path, None, "createfile")?;
+            let file = pitcrew_trust::windows::create_private_file(&path)?;
             let cleanup = tempfile::TempPath::try_from_path(path)?;
-            let file = fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .share_mode(1 | 2)
-                .custom_flags(0x0020_0000)
-                .open(&cleanup)?;
             if link(&file.metadata()?) || links(&file)? != 1 || !same(&file, &cleanup)? {
                 return Err(FileError::forbidden());
             }
@@ -237,7 +230,7 @@ impl Drop for Temporary {
 }
 #[cfg(windows)]
 pub(super) fn private_file(path: &Path) -> Result<()> {
-    acl(path, None, "file")?;
+    pitcrew_trust::windows::set_private_file(path)?;
     Ok(())
 }
 fn private_dir(path: &Path, parent: &File) -> Result<()> {
@@ -257,7 +250,12 @@ fn private_dir(path: &Path, parent: &File) -> Result<()> {
     #[cfg(windows)]
     {
         let _ = parent;
-        acl(path, None, "directory")?;
+        match pitcrew_trust::windows::create_private_directory(path) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+            Err(e) => return Err(e.into()),
+        }
+        private_check(path, true)?;
     }
     Ok(())
 }
@@ -276,81 +274,8 @@ fn private_check(path: &Path, directory: bool) -> Result<()> {
         }
     }
     #[cfg(windows)]
-    acl(path, None, "check")?;
+    pitcrew_trust::windows::check_private_object(path)?;
     Ok(())
-}
-
-// Windows std has no safe ACL API. Use the OS's .NET ACL API with literal paths passed through
-// environment variables, never command interpolation. Directory security is set at creation.
-#[cfg(windows)]
-fn acl(path: &Path, source: Option<&Path>, action: &str) -> Result<()> {
-    use std::os::windows::process::CommandExt as _;
-    const SCRIPT: &str = r#"
-$ErrorActionPreference='Stop'
-$p=$env:PITCREW_FILE_ACL_PATH
-$action=$env:PITCREW_FILE_ACL_ACTION
-$sid=[System.Security.Principal.WindowsIdentity]::GetCurrent().User
-if ($action -eq 'createfile') {
-  $s=[System.Security.AccessControl.FileSecurity]::new()
-  $s.SetOwner($sid); $s.SetAccessRuleProtection($true,$false)
-  $r=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','Allow')
-  $s.AddAccessRule($r)
-  $f=[System.IO.FileStream]::new($p,[System.IO.FileMode]::CreateNew,[System.Security.AccessControl.FileSystemRights]::FullControl,[System.IO.FileShare]::ReadWrite,4096,[System.IO.FileOptions]::None,$s)
-  $f.Dispose()
-}
-if ($action -eq 'directory' -and -not [System.IO.Directory]::Exists($p)) {
-  $s=[System.Security.AccessControl.DirectorySecurity]::new()
-  $s.SetOwner($sid); $s.SetAccessRuleProtection($true,$false)
-  $r=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow')
-  $s.AddAccessRule($r)
-  $null=[System.IO.Directory]::CreateDirectory($p,$s)
-}
-$attributes=[System.IO.File]::GetAttributes($p)
-if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'link' }
-if ($action -eq 'copy') {
-  [System.IO.File]::SetAccessControl($p,[System.IO.File]::GetAccessControl($env:PITCREW_FILE_ACL_SOURCE))
-  exit 0
-}
-if ($action -eq 'file') {
-  $s=[System.Security.AccessControl.FileSecurity]::new()
-  $s.SetOwner($sid); $s.SetAccessRuleProtection($true,$false)
-  $r=[System.Security.AccessControl.FileSystemAccessRule]::new($sid,'FullControl','Allow')
-  $s.AddAccessRule($r); [System.IO.File]::SetAccessControl($p,$s)
-}
-$s=if (($attributes -band [System.IO.FileAttributes]::Directory) -ne 0) { [System.IO.Directory]::GetAccessControl($p) } else { [System.IO.File]::GetAccessControl($p) }
-if ($s.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $sid.Value -or -not $s.AreAccessRulesProtected) { throw 'owner' }
-$rules=$s.GetAccessRules($true,$true,[System.Security.Principal.SecurityIdentifier])
-if ($rules.Count -eq 0) { throw 'empty' }
-foreach ($r in $rules) {
-  if ($r.IdentityReference.Value -ne $sid.Value -or $r.AccessControlType -ne 'Allow' -or $r.FileSystemRights -ne 'FullControl') { throw 'public' }
-}
-"#;
-    let system = std::env::var_os("SystemRoot")
-        .map(std::path::PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .ok_or_else(FileError::forbidden)?;
-    let output =
-        std::process::Command::new(system.join("System32/WindowsPowerShell/v1.0/powershell.exe"))
-            .args([
-                "-NoLogo",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                SCRIPT,
-            ])
-            .env("PITCREW_FILE_ACL_PATH", path)
-            .env("PITCREW_FILE_ACL_ACTION", action)
-            .env("PITCREW_FILE_ACL_SOURCE", source.unwrap_or(path))
-            .creation_flags(0x0800_0000)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()?;
-    if output.success() {
-        Ok(())
-    } else {
-        Err(FileError::forbidden())
-    }
 }
 
 /// Flat hash-keyed private files. Never trust names or contents left by another process.
@@ -434,12 +359,7 @@ pub(super) fn backup(directory: &Path, root: &Path, relative: &str, bytes: &[u8]
         )
     };
     #[cfg(windows)]
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)?;
-    #[cfg(windows)]
-    private_file(&path)?;
+    let mut file = pitcrew_trust::windows::create_private_file(&path)?;
     held.verify()?;
     file.write_all(bytes)?;
     file.sync_all()?;
@@ -452,25 +372,6 @@ mod tests {
     use super::*;
     use crate::files::Files;
     use pitcrew_protocol::files::{FileEncoding, WriteFile};
-    #[test]
-    fn windows_acl_ignores_inherited_module_search_paths()
-    -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let tmp = tempfile::tempdir()?;
-        let modules = tmp.path().join("empty-modules");
-        fs::create_dir(&modules)?;
-        let output = std::process::Command::new(std::env::current_exe()?)
-            .args([
-                "files::storage::tests::windows_private_acl_and_permissions_survive_replacement",
-                "--exact",
-            ])
-            .env("PSModulePath", modules)
-            .output()?;
-        assert!(
-            output.status.success(),
-            "ACL helper must not depend on inherited module search paths"
-        );
-        Ok(())
-    }
     #[test]
     fn windows_private_acl_and_permissions_survive_replacement()
     -> std::result::Result<(), Box<dyn std::error::Error>> {

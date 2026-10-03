@@ -17,10 +17,8 @@ New files are private. Before replacement, `file-backups` in state retains the n
 backups per root/path and 64 MiB total, evicting oldest first by a strictly increasing stored identifier;
 each is at most 8 MiB. Hash keys
 normalize Windows casing. Unix storage is current-user-owned 0700/0600. Windows creates and
-checks protected owner-only DACLs through the fixed system PowerShell host and direct .NET APIs,
-independent of inherited module search paths, with literal paths
-passed in environment variables and no profile or output. Unavailable ACL support refuses the
-write. Existing public, linked, malformed or hard-linked backup storage fails closed.
+checks protected owner-only DACLs through native Windows security calls in pitcrew-trust;
+ACL failures refuse the write. Existing public, linked, malformed or hard-linked backup storage fails closed.
 
 Same-account concurrent mutation is not a separate security principal: Unix cannot prevent a
 privileged owner moving an already-open directory after the final check, and Windows must close

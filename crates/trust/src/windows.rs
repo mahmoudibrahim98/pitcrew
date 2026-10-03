@@ -1,9 +1,10 @@
 //! Windows: who this process is, who owns an object and what its DACL and mandatory label hold,
-//! SIDs from text, and security descriptors for named pipes.
+//! SIDs from text, security descriptors for named pipes, and private file storage.
 //!
 //! The one copy of this code. The API's pipe (pitcrew-api), the askpass pipe (pitcrew-remote)
 //! and pitcrew-ptyd's pipe (pitcrew-runtime) keep their own policy (the descriptor they ask for,
-//! what they check) and call these. A DACL is compared by SID, never as SDDL text, which names
+//! what they check) and call these. The runner uses native file security for private storage.
+//! A DACL is compared by SID, never as SDDL text, which names
 //! some SIDs by alias.
 //!
 //! **The crate's only `unsafe` code.** The Win32 calls below have no safe binding in the
@@ -28,24 +29,34 @@
 #![allow(unsafe_code)]
 
 use std::ffi::{OsStr, c_void};
+use std::fs::File;
 use std::io;
+use std::os::windows::ffi::OsStrExt as _;
+use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::windows::io::{AsHandle, AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+use std::path::Path;
 use std::ptr;
 
 use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
+use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Foundation::{HANDLE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
     ConvertStringSecurityDescriptorToSecurityDescriptorW, ConvertStringSidToSidW, GetSecurityInfo,
-    SDDL_REVISION_1, SE_KERNEL_OBJECT,
+    SDDL_REVISION_1, SE_FILE_OBJECT, SE_KERNEL_OBJECT, SetSecurityInfo,
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce,
-    GetSecurityDescriptorControl, GetTokenInformation, LABEL_SECURITY_INFORMATION,
-    OBJECT_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    GetSecurityDescriptorControl, GetSecurityDescriptorDacl, GetSecurityDescriptorOwner,
+    GetTokenInformation, LABEL_SECURITY_INFORMATION, OBJECT_SECURITY_INFORMATION,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
     SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR_CONTROL, TOKEN_INFORMATION_CLASS,
     TOKEN_MANDATORY_LABEL, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER, TokenIntegrityLevel, TokenOwner,
-    TokenUser,
+    TokenUser, UNPROTECTED_DACL_SECURITY_INFORMATION,
+};
+use windows_sys::Win32::Storage::FileSystem::{
+    CREATE_NEW, CreateDirectoryW, CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -469,6 +480,280 @@ fn security_sddl(object: &impl AsHandle, info: OBJECT_SECURITY_INFORMATION) -> i
     Ok(unsafe { take_local_string(wide) })
 }
 
+/// Creates a new file with the current user as owner and a protected, owner-only FullControl DACL.
+/// The returned read/write handle denies delete sharing. No existing file is overwritten.
+///
+/// # Errors
+/// If the path exists, contains a NUL, or Windows cannot create the secured file.
+pub fn create_private_file(path: &Path) -> io::Result<File> {
+    let descriptor = private_descriptor(false)?;
+    create_secured_file(path, &descriptor)
+}
+
+fn create_secured_file(path: &Path, descriptor: &SecurityDescriptor) -> io::Result<File> {
+    let wide = wide_path(path)?;
+    let attributes = security_attributes(descriptor);
+    // SAFETY: the path is NUL-terminated; attributes and its descriptor are live for the call.
+    // CREATE_NEW creates only a new object and the handle is owned below if successful.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &attributes,
+            CREATE_NEW,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: the successful call returned a new handle that nothing else owns.
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+/// Creates a new folder with a protected, owner-only FullControl DACL, inherited by its children.
+///
+/// # Errors
+/// If the path exists, contains a NUL, or Windows cannot create the secured folder.
+pub fn create_private_directory(path: &Path) -> io::Result<()> {
+    let descriptor = private_descriptor(true)?;
+    let wide = wide_path(path)?;
+    let attributes = security_attributes(&descriptor);
+    // SAFETY: the NUL-terminated path, attributes and descriptor remain live during the call.
+    if unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn private_descriptor(directory: bool) -> io::Result<SecurityDescriptor> {
+    let sid = current_user_sid()?;
+    let inherit = if directory { "OICI" } else { "" };
+    SecurityDescriptor::from_sddl(&format!("O:{sid}D:P(A;{inherit};FA;;;{sid})"))
+}
+
+fn security_attributes(descriptor: &SecurityDescriptor) -> SECURITY_ATTRIBUTES {
+    SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
+        lpSecurityDescriptor: descriptor.descriptor,
+        bInheritHandle: 0,
+    }
+}
+
+fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
+    let wide: Vec<_> = path.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the path holds a NUL",
+        ));
+    }
+    Ok(wide.into_iter().chain(Some(0)).collect())
+}
+
+// Standard security rights, without granting data access just to inspect or change an ACL.
+const READ_CONTROL: u32 = 0x0002_0000;
+const WRITE_DAC: u32 = 0x0004_0000;
+const WRITE_OWNER: u32 = 0x0008_0000;
+
+fn security_file(path: &Path, access: u32) -> io::Result<File> {
+    let file = std::fs::OpenOptions::new()
+        .access_mode(
+            access
+                | READ_CONTROL
+                | windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES
+                | windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE,
+        )
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "a reparse point is refused",
+        ));
+    }
+    Ok(file)
+}
+
+/// Sets the current user as owner and a protected, owner-only FullControl DACL on an existing file.
+///
+/// # Errors
+/// If opening or setting security fails, or the object is a directory or reparse point.
+pub fn set_private_file(path: &Path) -> io::Result<()> {
+    let file = security_file(path, READ_CONTROL | WRITE_DAC)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "a regular file is required",
+        ));
+    }
+    let descriptor = private_descriptor(false)?;
+    if descriptor_owner(&file_descriptor(&file)?)? == current_user_sid()? {
+        apply_file_descriptor(&file, &descriptor, false, true)
+    } else {
+        // Keep the first handle alive so the path cannot be replaced while reopening it.
+        let writable = security_file(path, WRITE_DAC | WRITE_OWNER)?;
+        apply_file_descriptor(&writable, &descriptor, true, true)
+    }
+}
+
+fn apply_file_descriptor(
+    file: &File,
+    descriptor: &SecurityDescriptor,
+    owner: bool,
+    protected: bool,
+) -> io::Result<()> {
+    let mut acl = ptr::null_mut();
+    let mut sid = ptr::null_mut();
+    let mut present = 0;
+    let mut defaulted = 0;
+    // SAFETY: the descriptor is valid and live; each output points to a local of the correct
+    // type. Returned pointers belong to the descriptor, which outlives SetSecurityInfo below.
+    let ok = unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor.descriptor,
+            &mut present,
+            &mut acl,
+            &mut defaulted,
+        ) != 0
+            && GetSecurityDescriptorOwner(descriptor.descriptor, &mut sid, &mut defaulted) != 0
+    };
+    if !ok {
+        return Err(io::Error::last_os_error());
+    }
+    if present == 0 || acl.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "a DACL is required",
+        ));
+    }
+    let info = DACL_SECURITY_INFORMATION
+        | if protected {
+            PROTECTED_DACL_SECURITY_INFORMATION
+        } else {
+            UNPROTECTED_DACL_SECURITY_INFORMATION
+        }
+        | if owner { OWNER_SECURITY_INFORMATION } else { 0 };
+    // SAFETY: the file handle is borrowed and live; the SID and ACL point into the live
+    // descriptor. The unused group and SACL are null, as permitted by the selected flags.
+    let status = unsafe {
+        SetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            info,
+            if owner { sid } else { ptr::null_mut() },
+            ptr::null_mut(),
+            acl,
+            ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        return Err(os_error(status));
+    }
+    Ok(())
+}
+
+fn file_descriptor(file: &File) -> io::Result<SecurityDescriptor> {
+    let mut descriptor = ptr::null_mut();
+    // SAFETY: the file handle is live; descriptor is a valid out-pointer. Unused pointers may
+    // be null; the returned LocalAlloc descriptor is owned and freed by SecurityDescriptor.
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(os_error(status));
+    }
+    Ok(SecurityDescriptor { descriptor })
+}
+
+fn descriptor_dacl(descriptor: &SecurityDescriptor) -> io::Result<Dacl> {
+    let mut acl = ptr::null_mut();
+    let mut present = 0;
+    let mut defaulted = 0;
+    // SAFETY: descriptor is live and the output pointers point to locals of the correct types.
+    if unsafe {
+        GetSecurityDescriptorDacl(
+            descriptor.descriptor,
+            &mut present,
+            &mut acl,
+            &mut defaulted,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: acl is null or belongs to the live descriptor, as returned above.
+    unsafe { read_dacl(descriptor.descriptor, acl) }
+}
+
+/// Copies a regular file's DACL and its inheritance protection to another regular file.
+/// The destination owner is unchanged. Both handles deny delete sharing during the copy.
+///
+/// # Errors
+/// If either file cannot be opened, is a reparse point or directory, or its security cannot be read/set.
+pub fn copy_file_dacl(source: &Path, target: &Path) -> io::Result<()> {
+    let source = security_file(source, READ_CONTROL)?;
+    let target = security_file(target, WRITE_DAC)?;
+    if !source.metadata()?.is_file() || !target.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "regular files are required",
+        ));
+    }
+    let descriptor = file_descriptor(&source)?;
+    let protected = descriptor_dacl(&descriptor)?.protected;
+    apply_file_descriptor(&target, &descriptor, false, protected)
+}
+
+/// Checks that a file or folder is owned by the current user and has a protected DACL
+/// containing only FullControl allow entries for that SID. Empty and null DACLs are refused.
+///
+/// # Errors
+/// If security cannot be read, the object is a reparse point, or any security check fails.
+pub fn check_private_object(path: &Path) -> io::Result<()> {
+    let file = security_file(path, READ_CONTROL)?;
+    let descriptor = file_descriptor(&file)?;
+    let sid = current_user_sid()?;
+    let dacl = descriptor_dacl(&descriptor)?;
+    let own = descriptor_owner(&descriptor)? == sid;
+    if !own || !dacl.protected || dacl.entries.is_empty()
+        || !dacl.entries.iter().all(|entry| matches!(entry, Ace::Allow { sid: who, mask } if who == &sid && *mask == FILE_ALL_ACCESS)) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "owner-only security is required"));
+    }
+    Ok(())
+}
+
+fn descriptor_owner(descriptor: &SecurityDescriptor) -> io::Result<String> {
+    let mut owner = ptr::null_mut();
+    let mut defaulted = 0;
+    // SAFETY: descriptor is live; both output pointers point to correctly typed locals.
+    if unsafe { GetSecurityDescriptorOwner(descriptor.descriptor, &mut owner, &mut defaulted) } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if owner.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "an owner is required",
+        ));
+    }
+    // SAFETY: the non-null owner returned above belongs to the still-live descriptor.
+    unsafe { sid_string(owner) }
+}
+
 /// A security descriptor made from SDDL, for the named pipes a server creates. The text is the
 /// caller's policy: which owner, which entries, which label.
 #[derive(Debug)]
@@ -578,6 +863,131 @@ unsafe fn take_local_string(wide: *mut u16) -> String {
 mod tests {
     use super::*;
     use tokio::net::windows::named_pipe::ClientOptions;
+
+    #[test]
+    fn private_files_and_folders_are_secured_at_creation() -> io::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let folder = tmp.path().join("private");
+        create_private_directory(&folder).expect("create folder");
+        check_private_object(&folder).expect("check folder");
+        let path = folder.join("file");
+        let mut file = create_private_file(&path).expect("create file");
+        use std::io::Write as _;
+        file.write_all(b"original")?;
+        check_private_object(&path).expect("check file");
+        assert_eq!(
+            create_private_file(&path).expect_err("exclusive").kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(
+            create_private_directory(&folder)
+                .expect_err("exclusive")
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&path)?, b"original");
+        // A normal child inherits only the owner's entries, but is not protected itself.
+        let child = folder.join("inherited");
+        std::fs::write(&child, b"child")?;
+        let acl = descriptor_dacl(&file_descriptor(
+            &security_file(&child, READ_CONTROL).expect("open child"),
+        )?)?;
+        assert!(!acl.protected);
+        assert_eq!(
+            acl.entries,
+            vec![Ace::Allow {
+                sid: current_user_sid()?,
+                mask: FILE_ALL_ACCESS
+            }]
+        );
+        assert!(check_private_object(&child).is_err());
+        set_private_file(&child).expect("set child private");
+        check_private_object(&child)?;
+        assert_eq!(std::fs::read(child)?, b"child");
+        assert!(set_private_file(&folder).is_err());
+        assert!(check_private_object(&tmp.path().join("missing")).is_err());
+        assert_eq!(
+            create_private_file(Path::new("bad\0path"))
+                .expect_err("NUL")
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn copying_a_file_dacl_preserves_permissions_and_protection() -> io::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("target");
+        drop(create_private_file(&source).expect("create source"));
+        drop(create_private_file(&target)?);
+        let sid = current_user_sid()?;
+        for protected in [true, false] {
+            let descriptor =
+                SecurityDescriptor::from_sddl(&format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FR;;;WD)"))?;
+            let file = security_file(&source, WRITE_DAC).expect("open source to set");
+            apply_file_descriptor(&file, &descriptor, false, protected).expect("set source");
+            drop(file);
+            let source_acl =
+                descriptor_dacl(&file_descriptor(&security_file(&source, READ_CONTROL)?)?)?;
+            assert_eq!(source_acl.protected, protected);
+            copy_file_dacl(&source, &target).expect("copy dacl");
+            let target_file = security_file(&target, READ_CONTROL)?;
+            let target_acl = descriptor_dacl(&file_descriptor(&target_file)?)?;
+            assert_eq!(target_acl.protected, protected);
+            // Unprotected ACLs may inherit destination-parent entries as Windows requires.
+            for entry in &source_acl.entries[..2] {
+                assert!(target_acl.entries.contains(entry));
+            }
+            if protected {
+                assert_eq!(target_acl, source_acl);
+            }
+            assert_eq!(owner_sid(&target_file)?, sid);
+            assert!(check_private_object(&target).is_err());
+        }
+        assert!(copy_file_dacl(tmp.path(), &target).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn private_check_refuses_public_denied_empty_partial_and_wrong_owner() -> io::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let sid = current_user_sid()?;
+        for (name, text) in [
+            ("public", format!("O:{sid}D:P(A;;FA;;;{sid})(A;;FR;;;WD)")),
+            ("denied", format!("O:{sid}D:P(D;;FR;;;WD)(A;;FA;;;{sid})")),
+            ("partial", format!("O:{sid}D:P(A;;FR;;;{sid})")),
+            ("empty", format!("O:{sid}D:P")),
+            ("null", format!("O:{sid}D:NO_ACCESS_CONTROL")),
+            ("unprotected", format!("O:{sid}D:(A;;FA;;;{sid})")),
+        ] {
+            let path = tmp.path().join(name);
+            let descriptor = SecurityDescriptor::from_sddl(&text)?;
+            let file = create_secured_file(&path, &descriptor).expect(name);
+            if name == "unprotected" {
+                let writable = security_file(&path, WRITE_DAC)?;
+                apply_file_descriptor(&writable, &descriptor, false, false)?;
+            }
+            assert!(check_private_object(&path).is_err(), "{name}");
+            drop(file);
+            // Restrictive DACLs can deny even the metadata/security reads needed to repair them.
+            if matches!(name, "denied" | "empty" | "partial") {
+                continue;
+            }
+            set_private_file(&path).expect(name);
+            check_private_object(&path)?;
+        }
+        if default_owner_sid()? != sid {
+            let path = tmp.path().join("wrong-owner");
+            let descriptor = SecurityDescriptor::from_sddl(&format!("D:P(A;;FA;;;{sid})"))?;
+            drop(create_secured_file(&path, &descriptor)?);
+            assert!(check_private_object(&path).is_err());
+            set_private_file(&path)?;
+            check_private_object(&path)?;
+        }
+        Ok(())
+    }
 
     /// A pipe name of this test's own.
     fn pipe_name(test: &str) -> String {
