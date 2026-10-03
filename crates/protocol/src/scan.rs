@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 pub enum ScanFrame {
     /// How far the walk has got. The first frame, sent as the scan starts, has `scanned: 0` and
     /// no `total`; later ones come at most every 100 ms, and the last one before `done` has
-    /// `scanned == total`.
+    /// `scanned == total` unless the report is partial.
     Progress(ScanProgress),
     /// The result: the last frame of a scan that finished.
     Done {
@@ -182,6 +182,10 @@ pub struct Suggestion {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ScanReport {
+    /// Whether cancellation or the time budget stopped the scan early.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub partial: Option<bool>,
     /// Counts.
     pub counts: ScanCounts,
     /// Suggested projects, most recently active first.

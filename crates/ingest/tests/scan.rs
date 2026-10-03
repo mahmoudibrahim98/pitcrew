@@ -198,6 +198,7 @@ fn golden_scan_across_all_three_engines() {
     let options = ScanOptions {
         now: BASE_MS + 10 * DAY_MS,
         threads: Some(2),
+        ..ScanOptions::default()
     };
 
     let mut ticks: Vec<ScanProgress> = Vec::new();

@@ -33,7 +33,8 @@ use std::fs;
 use std::io::Read;
 use std::panic::UnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -86,7 +87,7 @@ pub fn default_homes() -> Vec<ScanHome> {
 }
 
 /// Options for [`scan`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ScanOptions {
     /// Now, for ranking by recent activity (sessions in the last 30 and 90 days). Tests pass a
     /// fixed time so rankings are deterministic; [`ScanOptions::default`] uses the real clock.
@@ -94,6 +95,10 @@ pub struct ScanOptions {
     /// Worker threads for the light reads; `None` picks the machine's available parallelism.
     /// Capped at [`MAX_THREADS`] either way.
     pub threads: Option<usize>,
+    /// Set to stop scheduling work between homes and files.
+    pub cancel: Arc<AtomicBool>,
+    /// Maximum time for scheduling work; in-flight filesystem operations must finish.
+    pub budget: Duration,
 }
 
 impl Default for ScanOptions {
@@ -104,6 +109,8 @@ impl Default for ScanOptions {
         Self {
             now: now_ms(),
             threads: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            budget: Duration::from_secs(600),
         }
     }
 }
@@ -130,15 +137,20 @@ pub use pitcrew_protocol::scan::{
 /// A read-only scan of a machine's agent history: discovers every engine's transcripts under
 /// `homes`, reads each one's light session facts, and returns counts plus suggested projects and
 /// workstreams. `progress` is called on the caller's own thread only, at most every 100 ms, and
-/// at least once at the end with `scanned == total`.
+/// at least once at the end; a partial scan may have `scanned < total`.
 pub fn scan(
     homes: &[ScanHome],
     options: &ScanOptions,
     mut progress: impl FnMut(ScanProgress),
 ) -> ScanReport {
+    let started = Instant::now();
+    let stopped = || options.cancel.load(Ordering::Relaxed) || started.elapsed() >= options.budget;
     let mut units: Vec<Unit> = Vec::new();
     let mut unreadable = 0u64;
     for home in homes {
+        if stopped() {
+            break;
+        }
         let found = match home.engine {
             Engine::Claude => ClaudeAdapter.discover(&home.home),
             Engine::Codex => CodexAdapter.discover(&home.home),
@@ -170,9 +182,13 @@ pub fn scan(
             let done = &done;
             let units = &units;
             let tx = tx.clone();
+            let stopped = &stopped;
             handles.push(scope.spawn(move || {
                 let mut out = Vec::new();
                 loop {
+                    if stopped() {
+                        break;
+                    }
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(unit) = units.get(i) else {
                         break;
@@ -227,6 +243,7 @@ pub fn scan(
     }
 
     ScanReport {
+        partial: stopped().then_some(true),
         counts: aggregate_counts(&session_facts),
         suggestions: build_suggestions(&session_facts, homes, options.now, CASE_INSENSITIVE_PATHS),
         unreadable,
@@ -287,18 +304,21 @@ impl Unit {
 /// supposed to panic on untrusted transcript bytes, but transcripts are attacker-controllable
 /// text, so one bad file must not erase a thread's other results.
 fn run_unit(unit: &Unit) -> Vec<Option<SessionFacts>> {
-    run_catching_panics(unit.len(), || unit.label(), || unit.run())
+    run_catching_panics(unit.len(), || unit.run())
 }
 
 /// The mechanism behind [`run_unit`], generic so it is testable with a closure that panics on
-/// purpose rather than needing a real adapter bug. `label` is only called if `f` actually panics.
+/// purpose rather than needing a real adapter bug.
 fn run_catching_panics(
     len: usize,
-    label: impl FnOnce() -> String,
     f: impl FnOnce() -> Vec<Option<SessionFacts>> + UnwindSafe,
 ) -> Vec<Option<SessionFacts>> {
     std::panic::catch_unwind(f).unwrap_or_else(|_| {
-        tracing::warn!(path = %label(), "a scan unit panicked; counted as unreadable");
+        tracing::warn!(
+            count = len,
+            reason = "worker panicked",
+            "scan sessions counted as unreadable"
+        );
         vec![None; len]
     })
 }
@@ -1065,11 +1085,28 @@ mod tests {
     /// returns); that is expected noise from the one deliberate panic below, not a failure.
     #[test]
     fn a_panicking_unit_is_caught_and_counted_unreadable_not_lost() {
-        let out = run_catching_panics(
-            3,
-            || "synthetic.jsonl".to_owned(),
-            || panic!("synthetic panic for the test"),
-        );
+        let out = run_catching_panics(3, || panic!("synthetic panic for the test"));
         assert_eq!(out, vec![None, None, None]);
+    }
+
+    #[test]
+    fn cancellation_and_zero_budget_return_partial_reports() {
+        let home = tempfile::tempdir().unwrap();
+        let homes = [ScanHome {
+            engine: Engine::Claude,
+            home: home.path().to_path_buf(),
+        }];
+        let cancelled = ScanOptions::default();
+        cancelled.cancel.store(true, Ordering::Relaxed);
+        let exhausted = ScanOptions {
+            budget: Duration::ZERO,
+            ..ScanOptions::default()
+        };
+        for options in [cancelled, exhausted] {
+            let report = scan(&homes, &options, |_| {});
+            assert_eq!(report.partial, Some(true));
+            assert_eq!(report.counts.sessions, 0);
+            assert_eq!(report.unreadable, 0);
+        }
     }
 }

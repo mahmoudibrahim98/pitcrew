@@ -214,7 +214,7 @@ fn a_fresh_hub_waits_for_its_setup() {
     assert_eq!(daemon.get("/v1/me", Some(&device)).status, 404);
     let info = host_info(&daemon);
     assert_eq!(info["roles"], json!(["hub"]));
-    assert_eq!(info["capabilities"], json!([]));
+    assert_eq!(info["capabilities"], json!(["scan"]));
     assert!(members_called(&daemon, &device, "@office").is_empty());
     let logs = daemon.stderr();
     assert!(logs.contains("the back office is off"), "{logs}");
@@ -297,7 +297,7 @@ fn setup_starts_the_office_and_the_runner_and_a_restart_keeps_them() {
         let info = host_info(&daemon);
         (info["roles"] == json!(["hub", "runner"])).then_some(info)
     });
-    assert_eq!(info["capabilities"], json!(["watch"]));
+    assert_eq!(info["capabilities"], json!(["watch", "scan"]));
     // HEAD follows too: the length of the answer with the runner, never the router's fixed one.
     let (head, get) = host_info_head_and_get(&daemon);
     assert_eq!(head, get);
@@ -337,7 +337,7 @@ fn setup_starts_the_office_and_the_runner_and_a_restart_keeps_them() {
     assert!(workspace.get("setup_needed").is_none(), "{workspace}");
     let info = host_info(&daemon);
     assert_eq!(info["roles"], json!(["hub", "runner"]));
-    assert_eq!(info["capabilities"], json!(["watch"]));
+    assert_eq!(info["capabilities"], json!(["watch", "scan"]));
     daemon.wait_for_log("the back office acts as @office", WAIT);
     let offices = members_called(&daemon, &device, "@office");
     assert_eq!(offices.len(), 1, "{offices:?}");
