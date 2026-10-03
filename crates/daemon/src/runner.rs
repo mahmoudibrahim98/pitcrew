@@ -7,7 +7,11 @@
 //!   (`CLAUDE_CONFIG_DIR` or `~/.claude`, `CODEX_HOME` or `~/.codex`, `$XDG_DATA_HOME/opencode`
 //!   or `~/.local/share/opencode`).
 //! - **Events** go into the store through the runner's `StoreSink`, authored by the workspace's
-//!   person (its first, whom the device token acts as).
+//!   person (its first, whom the device token acts as); each batch stored is then followed by the
+//!   work model, which moves dispatched tasks with their sessions (`crate::dispatch`).
+//! - **Sessions the hub stored first** (a dispatch's, a start for an agent or a task): the runner
+//!   starts their CLI under the hub's id, which the transcript adopts, and gives it the agent's
+//!   token file (`crate::dispatch::AgentEnv`).
 //! - **Hooks**: who may change a session is decided by [`HubAgents`] over the hub's tables.
 //! - **Its machine** is the hub's own (the workspace's first local machine). Without one, or
 //!   without a person, the runner stays off (logged), as the back office does without a person.
@@ -26,6 +30,7 @@
 
 use crate::agents::HubAgents;
 use crate::cli::HomeArg;
+use crate::dispatch::{AgentEnv, FollowingSink};
 use crate::runtime::TerminalRuntime;
 use crate::state::StateDir;
 use anyhow::{Context as _, bail};
@@ -40,7 +45,7 @@ use pitcrew_protocol::model::{Engine, MemberKind};
 use pitcrew_protocol::runner::Capability;
 use pitcrew_runner::{
     EngineHome, RunnerCommands, RunnerConfig, RunnerHandle, RunnerHooks, RunnerTerminals,
-    RunnerTranscripts, StoreSink,
+    RunnerTranscripts, SessionEnv, StoreSink,
 };
 use pitcrew_store::Store;
 use std::path::PathBuf;
@@ -69,8 +74,14 @@ pub struct Parts {
 
 /// The runner the routes reach, once there is one: set once, when it starts (with the daemon, or
 /// once the workspace is set up), and never unset. Empty, the hub serves as with `--no-runner`.
+///
+/// It also wakes the reconciliation of sessions the hub stored ahead of the runner
+/// ([`crate::dispatch::reconcile`]) when the runner attaches, and after each start of one.
 #[derive(Debug, Default)]
-pub struct Attached(OnceLock<Parts>);
+pub struct Attached {
+    parts: OnceLock<Parts>,
+    starts: tokio::sync::Notify,
+}
 
 impl Attached {
     /// One that already has `parts`.
@@ -83,14 +94,26 @@ impl Attached {
 
     /// The runner's parts, if it runs.
     pub fn get(&self) -> Option<&Parts> {
-        self.0.get()
+        self.parts.get()
     }
 
     /// Attaches the runner. A second runner is not attached (there is one per process).
     pub fn set(&self, parts: Parts) {
-        if self.0.set(parts).is_err() {
+        if self.parts.set(parts).is_err() {
             tracing::warn!("a second runner was not attached");
         }
+        self.started();
+    }
+
+    /// A session the hub stored ahead of the runner was started (or the runner attached): the
+    /// reconciliation looks at the sessions waiting for it.
+    pub fn started(&self) {
+        self.starts.notify_one();
+    }
+
+    /// Waits for the next [`Attached::started`] (one that came while nothing waited counts).
+    pub async fn next_start(&self) {
+        self.starts.notified().await;
     }
 }
 
@@ -246,8 +269,9 @@ fn parts_of(
 }
 
 /// Starts the runner on `machine`, watching `homes`, writing to `store` through `work`'s
-/// workspace, its terminals over `runtime`. `None` when it cannot run here yet (no machine or no
-/// person; logged).
+/// workspace (and handing what it stores to `work` to follow, `crate::dispatch`), its terminals
+/// over `runtime`, the CLIs it starts for sessions the hub stored given what `session_env` says.
+/// `None` when it cannot run here yet (no machine or no person; logged).
 ///
 /// # Errors
 /// The runner's index cannot be opened (its folder is in the error), or its threads cannot
@@ -259,6 +283,7 @@ pub fn start(
     machine: Option<MachineId>,
     homes: Vec<EngineHome>,
     runtime: &TerminalRuntime,
+    session_env: &Arc<AgentEnv>,
 ) -> anyhow::Result<Option<Runner>> {
     let Some(machine) = machine else {
         tracing::warn!(
@@ -287,14 +312,18 @@ pub fn start(
     ];
 
     let mut config = RunnerConfig::new(work.workspace(), machine, owner, &dir)
-        .with_agents(Arc::new(HubAgents::new(Arc::clone(work))));
+        .with_agents(Arc::new(HubAgents::new(Arc::clone(work))))
+        .with_session_env(Arc::clone(session_env) as Arc<dyn SessionEnv>);
     let watched: Vec<String> = homes
         .iter()
         .map(|h| format!("{:?}={}", h.engine, h.path.display()))
         .collect();
     let watches = !homes.is_empty();
     config.homes = homes;
-    let sink = Arc::new(StoreSink::new(Arc::clone(store), owner));
+    let sink = Arc::new(FollowingSink::new(
+        StoreSink::new(Arc::clone(store), owner),
+        Arc::clone(work),
+    ));
     let handle = pitcrew_runner::start(config, adapters, sink).with_context(|| {
         format!(
             "cannot start the runner with its index in {}",

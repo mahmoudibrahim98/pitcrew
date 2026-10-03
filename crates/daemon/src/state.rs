@@ -9,6 +9,7 @@
 //! | `workspace.json` | The workspace's id and name, which the event log does not hold. Private (0600). |
 //! | `office.json` | Where the back office got to in the log, so a restart runs it again from there. Private (0600). |
 //! | `runner/<log id>/` | The runner's index of the transcripts it watches (`pitcrew-runner`), one per hub log. |
+//! | `agents/<agent id>.token` | An agent token for each agent whose sessions the runner started (a dispatch's), bound to that agent and its owner; the CLI is given its path (`PITCREW_TOKEN_FILE`). The folder is private (0700), each file too (0600). |
 //! | `run/pitcrewd.sock` | The private socket (Unix). |
 
 use anyhow::Context as _;
@@ -91,6 +92,12 @@ impl StateDir {
     #[must_use]
     pub fn runner(&self) -> PathBuf {
         self.root.join("runner")
+    }
+
+    /// The agents' token files, for the CLIs the runner starts as them.
+    #[must_use]
+    pub fn agents(&self) -> PathBuf {
+        self.root.join("agents")
     }
 }
 

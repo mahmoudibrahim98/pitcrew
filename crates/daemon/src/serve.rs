@@ -5,9 +5,11 @@
 //! 2. The store, opened once, with the work model's projections, to learn the workspace
 //!    (`workspace.json` holds its name, which the service serves) and, with `--demo`, to refuse a
 //!    store with data.
-//! 3. The one `WorkService` for the store, with the hub's own machine (the workspace's local one)
-//!    and the setup listener ([`crate::setup::Signal`]). It has no dispatcher, so a dispatch
-//!    answers 503 and records nothing (see the README, "Dispatch").
+//! 3. The one `WorkService` for the store, with the hub's own machine (the workspace's local one),
+//!    the setup listener ([`crate::setup::Signal`]), and its dispatcher: the runner link over the
+//!    runner [`Attached`] here, empty until the runner starts ([`crate::dispatch`]). The CLIs the
+//!    runner starts for sessions the hub stored get their agent's token file
+//!    ([`crate::dispatch::AgentEnv`]).
 //! 4. With `--demo`: mint the tokens, seed the demo workspace.
 //! 5. The device token: reused from `device.token` while it still verifies, else minted.
 //! 6. Unless `--no-office`, the back office ([`crate::office::start`]): `@office` found or added
@@ -22,7 +24,9 @@
 //!    a workspace not set up yet, the task that starts the office and the runner once it is
 //!    ([`crate::setup::after_setup`]); the routes (`RouterParts`, with the activity index, the
 //!    recaps, the runner's hooks, terminals, session commands and transcripts, and host info as
-//!    it is now, [`crate::host`]); the listener; and one line on stdout:
+//!    it is now, [`crate::host`]); the listener, which the agents' CLIs are told
+//!    (`PITCREW_SOCKET`, `PITCREW_PIPE` or `PITCREW_URL`); the reconciliation of sessions stored
+//!    ahead of the runner ([`crate::dispatch::reconcile`]); and one line on stdout:
 //!    `pitcrewd listening on <where>`.
 //!
 //! Stop (Ctrl+C or Ctrl+Break, or SIGTERM or SIGHUP on Unix): the server stops accepting and
@@ -34,6 +38,7 @@
 //! released last.
 
 use crate::cli::{ListenArg, ServeArgs, TerminalRuntimeArg};
+use crate::dispatch::{AgentEnv, RunnerLink};
 use crate::host::HostInfoNow;
 use crate::office::Office;
 use crate::recaps::WorkRecaps;
@@ -136,6 +141,7 @@ pub fn serve(state: &StateDir, args: &ServeArgs) -> anyhow::Result<ExitCode> {
                 hub.machine,
                 homes.clone(),
                 &terminals,
+                &hub.session_env,
             ) {
                 Ok(runner) => runner,
                 // The hub is still worth serving (the desktop reaches its work), and a supervisor
@@ -200,6 +206,10 @@ struct Hub {
     machine: Option<MachineId>,
     /// For a workspace that is not set up yet (no person): what `POST /v1/setup` hands over.
     set_up: Option<oneshot::Receiver<SetupDone>>,
+    /// The runner, once it runs: the routes' and the dispatcher's.
+    attached: Arc<Attached>,
+    /// What the CLIs the runner starts for sessions the hub stored get.
+    session_env: Arc<AgentEnv>,
 }
 
 /// Steps 1–6: the token registry, the store, the workspace and its service, the demo, the device
@@ -253,16 +263,24 @@ fn open_with(
     // `set_workspace_name` sets, which setup sets too).
     let workspace = hosted_workspace(state, &store, demo.as_ref())?;
     // The one writer of this store (hub-work's "One writer"): everything shares this `Arc`.
-    // No dispatcher (see the README, "Dispatch"): a dispatch answers 503 and records nothing,
-    // rather than appending a dispatch that can only fail.
+    // Its dispatcher is the runner link over the runner attached here, made now and filled when
+    // the runner starts (with the daemon, or once the workspace is set up): until then, and with
+    // --no-runner, a dispatch answers 503 and records nothing.
     let (signal, set_up) = crate::setup::signal();
+    let attached = Arc::new(Attached::default());
     // The recap index keeps its blocks on disk, in a cache file of its own next to the store
     // (replaced when the index is built, removed when the daemon stops), not in memory.
     let work = Arc::new(
         WorkService::new(Arc::clone(&store), workspace)
             .with_setup_listener(Arc::new(signal))
+            .with_dispatcher(Arc::new(RunnerLink::new(Arc::clone(&attached))))
             .with_recap_file(state.root().join(RECAP_FILE)),
     );
+    let session_env = Arc::new(AgentEnv::new(
+        &work,
+        Arc::clone(&tokens) as Arc<dyn TokenStore>,
+        state.agents(),
+    ));
     let machines = match &demo {
         Some(demo) => demo.machines.clone(),
         None => work.machines().context("cannot list the machines")?,
@@ -318,6 +336,8 @@ fn open_with(
         machine,
         // Only a workspace without a person can be set up; otherwise setup answers 409.
         set_up: person.is_none().then_some(set_up),
+        attached,
+        session_env,
     })
 }
 
@@ -507,13 +527,14 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         office,
         machine: _,
         set_up,
+        attached,
+        session_env,
     } = hub;
     warm_up_recaps(&work);
 
-    // The back office's loop and the runner, for the stop; and the runner for the routes, now or
-    // once the workspace is set up.
+    // The back office's loop and the runner, for the stop; and the runner for the routes and the
+    // dispatcher, now or once the workspace is set up.
     let workers = Arc::new(Workers::default());
-    let attached = Arc::new(Attached::default());
     if let Some(runner) = runner {
         attached.set(runner.parts());
         // Nothing is stopping yet.
@@ -579,6 +600,12 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         .await
         .with_context(|| format!("cannot listen on {}", describe(&listen)))?;
     let at = bound.describe();
+    // Where the agents' CLIs (their hooks, `pitcrew`) reach this daemon.
+    match bound.tcp_addr() {
+        Some(addr) => session_env.listening("PITCREW_URL", format!("http://{addr}")),
+        None if cfg!(windows) => session_env.listening("PITCREW_PIPE", at.clone()),
+        None => session_env.listening("PITCREW_SOCKET", at.clone()),
+    }
     let token_store: Arc<dyn TokenStore> = Arc::clone(&tokens) as Arc<dyn TokenStore>;
     let mut app = pitcrew_api::router(info.now(), token_store, parts).layer(
         axum::middleware::from_fn_with_state(info, crate::host::answer),
@@ -602,11 +629,18 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
                 homes,
                 runtime: runtime.clone(),
                 attached: Arc::clone(&attached),
+                session_env: Arc::clone(&session_env),
                 workers: Arc::clone(&workers),
                 drain: DRAIN,
             },
         )));
     }
+    // Sessions the hub stored ahead of the runner: those a crash left, and each new start's.
+    drop(tokio::spawn(crate::dispatch::reconcile(
+        Arc::downgrade(&work),
+        Arc::clone(&attached),
+    )));
+    drop(session_env);
     drop(work);
     let (draining, drain) = tokio::sync::oneshot::channel::<()>();
     let mut serving = tokio::spawn(bound.serve(app, async move {

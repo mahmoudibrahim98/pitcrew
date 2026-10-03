@@ -22,6 +22,7 @@
 //!   daemon or after setup, for the stop to stop. One started once the stop has begun is stopped
 //!   at once.
 
+use crate::dispatch::AgentEnv;
 use crate::office::{self, Running};
 use crate::runner::{Attached, Runner};
 use crate::runtime::TerminalRuntime;
@@ -119,6 +120,8 @@ pub struct AfterSetup {
     pub runtime: TerminalRuntime,
     /// Where the runner is attached for the routes.
     pub attached: Arc<Attached>,
+    /// What the CLIs the runner starts for sessions the hub stored get (`crate::dispatch`).
+    pub session_env: Arc<AgentEnv>,
     pub workers: Arc<Workers>,
     /// How long a part started after the stop began gets to stop.
     pub drain: Duration,
@@ -194,9 +197,18 @@ async fn start_office(hub: &AfterSetup, done: &SetupDone) {
 async fn start_runner(hub: &AfterSetup, done: &SetupDone, homes: Vec<EngineHome>) {
     let (state, work, machine) = (hub.state.clone(), Arc::clone(&hub.work), done.machine.id);
     let runtime = hub.runtime.clone();
+    let session_env = Arc::clone(&hub.session_env);
     let started = tokio::task::spawn_blocking(move || {
         let store = Arc::clone(work.store());
-        crate::runner::start(&state, &work, &store, Some(machine), homes, &runtime)
+        crate::runner::start(
+            &state,
+            &work,
+            &store,
+            Some(machine),
+            homes,
+            &runtime,
+            &session_env,
+        )
     })
     .await;
     match started {
