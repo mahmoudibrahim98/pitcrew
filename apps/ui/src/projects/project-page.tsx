@@ -12,6 +12,7 @@ import { PROJECT_STATUS, formatDay } from './format.ts';
 import { ProjectOverviewBody, WorkstreamsTable } from './overview.tsx';
 import { ErrorNote } from './ui.tsx';
 import { Timeline } from './timeline.tsx';
+import { ReadScope } from './read-scope.tsx';
 
 type Tab = 'overview' | 'workstreams' | 'board' | 'timeline' | 'activity';
 
@@ -52,6 +53,7 @@ export function ProjectPage() {
 
   return (
     <div className="mx-auto flex min-w-0 w-full max-w-5xl flex-col gap-4 px-6 py-6">
+      {project !== undefined && <ReadScope key={project.id} scope={`project:${project.id}`} />}
       <header className="flex flex-col gap-2">
         <p className="font-mono text-xs text-ink-2">{project?.key ?? ''}</p>
         <div className="flex flex-wrap items-center gap-2">

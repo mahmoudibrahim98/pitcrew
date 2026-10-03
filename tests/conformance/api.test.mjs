@@ -89,6 +89,37 @@ function check(name, fn) {
   });
 }
 let context = {};
+check('per-person read cursors are forward-only and person-only', async () => {
+  const second = process.env.PITCREW_CONFORMANCE_SECOND_PERSON;
+  assert.ok(second, 'Runner must provide a second synthetic device credential');
+  const projects = await api('/v1/projects');
+  const streams = await api('/v1/workstreams');
+  const checkCursor = (v) => {
+    assert.equal(typeof v.scope, 'string');
+    assert.ok(Number.isSafeInteger(v.rev) && v.rev >= 0);
+  };
+  for (const scope of ['workspace', `project:${projects[0].id}`, `workstream:${streams[0].id}`]) {
+    const path = `/v1/me/cursors/${encodeURIComponent(scope)}`;
+    const moved = await api(path, 200, checkCursor, { method: 'PUT', body: { rev: 10 } });
+    for (const rev of [2, 10, 0]) {
+      assert.deepEqual(await api(path, 200, checkCursor, { method: 'PUT', body: { rev } }), moved);
+    }
+    assert.deepEqual(await api(path, 200, checkCursor, { method: 'PUT', token: second, body: { rev: 3 } }), { scope, rev: 3 });
+    await api(path, 403, undefined, { method: 'PUT', token: agent, body: { rev: 'bad' } });
+  }
+  const mine = await api('/v1/me/cursors', 200, list(checkCursor));
+  const theirs = await api('/v1/me/cursors', 200, list(checkCursor), { token: second });
+  assert.equal(mine.length, 3);
+  assert.ok(mine.every((c) => c.rev === 10));
+  assert.equal(theirs.length, 3);
+  assert.ok(theirs.every((c) => c.rev === 3));
+  await api('/v1/me/cursors', 403, undefined, { token: agent });
+  for (const rev of [-1, 1.5, '10', Number.MAX_SAFE_INTEGER]) {
+    await api('/v1/me/cursors/workspace', 400, undefined, { method: 'PUT', body: { rev } });
+  }
+  await api('/v1/me/cursors/task:bad', 400, undefined, { method: 'PUT', body: { rev: 1 } });
+  await api(`/v1/me/cursors/project:${missing}`, 404, undefined, { method: 'PUT', body: { rev: 1 } });
+});
 before(async () => {
   const [me, agentMe, machines, members, projects, streams, sessions] = await Promise.all([
     api('/v1/me', 200, schemas.member),

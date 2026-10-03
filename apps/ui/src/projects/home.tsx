@@ -1,10 +1,8 @@
 // Home: where things stand across projects, the agents at work, what needs you, and what changed
-// since you last looked (the last revision you marked as seen, kept in local storage for now).
+// since you last looked, using the person's hub cursor across devices.
 
-import { create } from 'zustand';
-import { persist } from 'zustand/middleware';
 import { Button, StatusPill } from '../design/index.ts';
-import { useWorkspace } from '../data/index.ts';
+import { useMoveCursor, useReadCursors } from '../data/cursors.ts';
 import { AuthorAvatar } from './activity.tsx';
 import { AgentsNow } from './agents.tsx';
 import {
@@ -22,20 +20,6 @@ import {
 import { ASK_KIND, PROJECT_STATUS, describeEvent, formatWhen } from './format.ts';
 import { useProjectsNav } from './nav.tsx';
 import { ErrorNote, MaybeLink, Panel } from './ui.tsx';
-
-/** The last revision marked as seen, per workspace. UI state only; it never reaches the hub. */
-export const useLastSeen = create<{
-  byWorkspace: Record<string, number>;
-  markSeen(workspace: string, rev: number): void;
-}>()(
-  persist(
-    (set) => ({
-      byWorkspace: {},
-      markSeen: (workspace, rev) => set((s) => ({ byWorkspace: { ...s.byWorkspace, [workspace]: rev } })),
-    }),
-    { name: 'pitcrew.projects.last-seen' },
-  ),
-);
 
 export function Home() {
   return (
@@ -145,34 +129,36 @@ function NeedsYou() {
 }
 
 function SinceLastLooked() {
-  const workspace = useWorkspace();
-  const id = workspace.data?.workspace.id;
-  const lastSeen = useLastSeen((s) => (id === undefined ? undefined : s.byWorkspace[id]));
-  const markSeen = useLastSeen((s) => s.markSeen);
+  const cursors = useReadCursors();
+  const move = useMoveCursor();
+  const lastSeen = cursors.data?.find((c) => c.scope === 'workspace')?.rev ?? 0;
   const activity = useActivity();
   const members = useMemberMap();
   const names = useNames();
   const page = activity.data;
-  const all = page === undefined ? [] : withRevisions(page);
-  const fresh = (lastSeen === undefined ? all.slice(-10) : all.filter((e) => e.rev > lastSeen)).reverse();
-  const more = page !== undefined && lastSeen !== undefined && !page.at_start && page.from_rev > lastSeen + 1;
+  const all = page === undefined ? [] : withRevisions(page).filter(({ event }) => event.body.type !== 'cursor_moved');
+  const fresh = cursors.data === undefined ? [] : all.filter((e) => e.rev > lastSeen).reverse();
+  const newestShown = fresh[0]?.rev;
+  const more = page !== undefined && !page.at_start && page.from_rev > lastSeen + 1;
   return (
     <Panel
       title="Since you last looked"
       actions={
-        id !== undefined && page !== undefined && fresh.length > 0 ? (
-          <Button variant="ghost" onClick={() => markSeen(id, page.to_rev)}>
-            Mark all as seen
+        newestShown !== undefined ? (
+          <Button variant="ghost" disabled={move.isPending} onClick={() => move.mutate({ scope: 'workspace', rev: newestShown })}>
+            Mark all as read
           </Button>
         ) : undefined
       }
     >
       {activity.error !== null && <ErrorNote error={activity.error} what="load what changed" />}
-      {page !== undefined && lastSeen === undefined && (
-        <p className="mb-2 text-sm text-ink-2">The latest changes. Mark them as seen to see only what is new next time.</p>
-      )}
-      {page !== undefined && lastSeen !== undefined && fresh.length === 0 && (
+      {cursors.error !== null && <ErrorNote error={cursors.error} what="load your read cursor" />}
+      {move.error !== null && <ErrorNote error={move.error} what="mark changes as read" />}
+      {page !== undefined && cursors.data !== undefined && fresh.length === 0 && (
         <p className="text-sm text-ink-2">Nothing new since you last looked.</p>
+      )}
+      {fresh.length > 0 && (
+        <p role="status" className="mb-2 text-sm text-ink-2">{fresh.length} new {fresh.length === 1 ? 'change' : 'changes'}{more ? ' in this window' : ''}</p>
       )}
       {fresh.length > 0 && (
         <ol aria-label="Changes" className="flex flex-col gap-1.5">
@@ -180,6 +166,7 @@ function SinceLastLooked() {
             <li key={event.id} className="flex items-start gap-2 text-sm">
               <AuthorAvatar event={event} members={members} />
               <p className="min-w-0 flex-1">
+                <span className="mr-2 text-xs font-medium">New</span>
                 <span className="font-medium">{names.member(event.author)}</span>{' '}
                 <span className="text-ink-2">{describeEvent(event, names)}</span>
               </p>
