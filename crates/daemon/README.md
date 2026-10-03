@@ -64,8 +64,9 @@ in the log when used (see "Terminals"):
 | `demo-agent.token` | With `--demo` only: a token for the demo's first agent, `@writer`, `pca_…`. Private. |
 | `workspace.json` | The workspace's id and name (`GET /v1/workspace`), which the event log does not hold. Written by `--demo`, and by the first run (`POST /v1/setup`, `pitcrewd init`). Atomic (a private file renamed into place). Private. |
 | `office.json` | Where the back office got to in the log (`{ "log", "done" }`), so a restart runs it again from there. Removed by any start with the office off (`--no-office`, or no owner for `@office` yet, as before setup). Private. |
-| `recaps.sqlite3` | The recap index's blocks (hub-work's README, "Recaps"): a cache, made when the index is built at start, replaced at every start and removed at a clean stop; never read from one run to the next. Private. |
+| `recaps.sqlite3` | The recap index's blocks (hub-work's README, "Recaps"): a cache, made when the index is built at start, replaced at every start and removed at a clean stop; never read from one run to the next. Private. On a network or unknown filesystem, kept in a private local fallback folder (temp before `$XDG_RUNTIME_DIR`), or memory if neither works; see "Recaps". |
 | `runner/<log id>/` | The runner's index (`pitcrew-runner`): every transcript it watches, its session id, and how far it has been read into this store. One folder per hub log (the store's `log_id`), so a new store learns every session from the start. |
+| `agents/<agent id>.token` | An agent token for each agent whose CLI the runner started (a dispatch's, or `POST /v1/sessions` with `agent`), bound to that agent and its owner, `pca_…`. The CLI is given its path (`PITCREW_TOKEN_FILE`), never the token. Minted once, reused while it verifies as exactly that. The folder is 0700, each file 0600. |
 | `run/pitcrewd.sock` | The private socket (Unix). On Windows the API uses the current user's named pipe, `\\.\pipe\pitcrewd-<user SID>`. |
 
 On Unix the directory is created 0700, and an existing one must already be ours and private; on
@@ -85,7 +86,9 @@ Windows it must be under the user's profile, whose ACL it inherits.
      demo's "This laptop"). Without one (before setup), a dispatch for a task with no folder
      answers 503, and the runner stays off.
    - The setup listener (see "The first run").
-   - No dispatcher (see "Dispatch").
+   - Its dispatcher, the runner link over the runner attached here, which is empty until the
+     runner starts (see "Dispatch"); and what the CLIs the runner starts for an agent get, its
+     token's file (`AgentEnv`).
 4. With `--demo`: mint the tokens, then seed. Tokens come first, so a failure leaves the store
    empty and `--demo` can be retried.
 5. The device token: `device.token` is reused while it verifies as a device token; otherwise a
@@ -107,7 +110,8 @@ Windows it must be under the user's profile, whose ACL it inherits.
    like anything else. A runner that cannot start does not stop the hub (see "The runner").
 9. The recap index's warm-up (see "Recaps"), started and not waited for; the back office's loop;
    for a workspace without a person, the task that waits for its setup (see "The first run");
-   the routes; the listener; and the ready line.
+   the routes; the listener, which the agents' CLIs are told; the reconciliation of the sessions
+   stored ahead of the runner (see "Dispatch"); and the ready line.
 
 ### Stop
 
@@ -376,13 +380,15 @@ members:
 - It reads the store only, never the runner, so it cannot wait for the watcher thread that asks.
 - **A window at discovery.** The runner decides the hooks it held for a new session when it
   discovers it, before the hub has stored the session. Its `parent` cannot be seen then, so a
-  sub-agent answers "no agent" even when its parent has one. Harmless today (every parent is the
-  runner's own session, without an agent); once dispatch ids are adopted, a dispatched agent's
-  held hooks for its sub-agents would be refused and a person's applied. The fix is the runner's:
-  ask about the parent (`agent_of(parent)` when the sub-agent answers "no agent"), or pass it in.
-- **Consequence today** (the runner README, "Session ids today"): the runner's sessions have no
-  agent in the hub, so the person's hooks (device token) change them and an agent token's do not.
-  How a real agent's hooks authenticate is a separate design.
+  sub-agent answers "no agent" even when its parent has one; the runner then asks about the
+  parent itself (`agent_of(parent)`), so a dispatched agent's held hooks for its sub-agents are
+  judged by that agent.
+- **Whose hooks apply** (the runner README, "Session ids, and sessions the hub named"): a session
+  the runner found on its own has no agent in the hub, so the person's hooks (device token)
+  change it and an agent token's do not. A dispatched session (or one started for an agent) runs
+  as its agent from the start: the runner reports its CLI under the id the hub stored with the
+  agent, and the CLI's hooks carry that agent's token (see "Dispatch"), so the agent's own hooks
+  change it, and its owner's.
 
 **Transcripts.** `GET /v1/sessions/{id}/transcript?before=&limit=` (api-v1, "Transcript paging")
 is served by `src/transcripts.rs` from the runner's own pages (`RunnerTranscripts`, its README's
@@ -523,11 +529,19 @@ would go the same way (the runtime's README: call it from a blocking thread).
   it (`terminal` set). If it does not appear (Claude writes its transcript at its first prompt, so
   a start without a brief waits for a person), it answers `503` saying so: the CLI keeps running
   in its terminal, and its session appears on the stream once its transcript does.
+- **With `agent` or `task`** the hub stores the session first (state `starting`, the agent
+  named, linked to the task with `link_basis: manual`; `400` for an unknown agent or task, or a
+  person as the agent; `403` for an agent the caller does not own), and the runner starts the CLI
+  under that id, which its transcript adopts, as for a dispatch (see "Dispatch"): the start
+  answers `202` with the session as stored once the CLI has started, and the CLI of a session run
+  as an agent gets that agent's token file. If the runner refuses or fails, the session ends and
+  the error is answered; if it has not answered in time, the start answers `503` and the session
+  stays `starting` until it does (a refusal or failure then ends it). A Codex or OpenCode start
+  in a folder where one started for an agent or a task (or a dispatch's) still waits for its
+  transcript is refused (`400`): the two could not be told apart.
 - `machine` must be a machine of the workspace (`400`) and the runner's (`503` for another).
-  `agent` and `task` are refused with `503` for now: a session started for an agent must be stored
-  under the agent before its CLI starts, which needs the runner to adopt a session id (see
-  "Dispatch"). `persona` is passed on (the runner does not use it yet); `bypass_permissions` is
-  refused by the runner (`400`), and so is a session id or model that could be read as an option.
+  `persona` is passed on (the runner does not use it yet); `bypass_permissions` is refused by the
+  runner (`400`), and so is a session id or model that could be read as an option.
 - **`cwd`**: absolute, at most 4096 bytes, an existing folder; resolved once by the daemon (links
   and `..`), and the CLI starts in the resolved folder. On Unix it and every folder above it must
   belong to root or this user, and none may be writable by every user (o+w), except a sticky
@@ -571,13 +585,73 @@ their programs keep running, and the runner's index still links each to its sess
 
 ## Dispatch
 
-`POST /v1/tasks/{id}/dispatch` keeps answering `503 unavailable`, recording nothing: the daemon
-gives hub-work no `Dispatcher`. A dispatch stores its session, agent named, before its CLI starts;
-the runner, which mints its own session ids, would then discover that CLI's transcript as a second
-session without the agent. The dispatched agent's hooks would resolve to the runner's session and
-be refused (and any person's applied), and the dispatch's own session would never move. The runner
-must first adopt the dispatch's session id (the runner README, "Session ids today, and
-dispatch"); then `RunnerCommands` becomes hub-work's `Dispatcher` here.
+`POST /v1/tasks/{id}/dispatch` starts the agent's CLI on this machine, as a session already linked
+to the task (`src/dispatch.rs`; hub-work's README, "Dispatch", for what is recorded):
+
+- **The dispatcher** is `RunnerLink`, hub-work's `Dispatcher` over the runner's `RunnerCommands`.
+  It is built over the [`Attached`] runner, which `open_with` now makes before the `WorkService`
+  (rather than adding a late `set_dispatcher` to the service): the service's dispatcher is fixed
+  when the one service is made and shared, and it reaches the same runner the session routes
+  reach, attached at start or once the workspace is set up. Without one attached (before setup,
+  `--no-runner`, a runner that could not start), or for a machine other than the runner's, a
+  dispatch answers `503` with the reason, after its own `404`, `400`, `403` and `409`, and
+  nothing is recorded. A person may dispatch only an agent they own (hub-work's `403`).
+- **Starting** runs the dispatch's `StartSession`, which names the dispatch's session: the runner
+  records the terminal under it at once and has the CLI's transcript adopt it (Claude by the
+  `--session-id` it chose, Codex and OpenCode by folder and start time), so the session appears
+  once, under the dispatch's id, linked to the task, with its terminal. The folder (`~` is this
+  user's home) is resolved and checked as `POST /v1/sessions` checks a `cwd` (see "Terminals").
+  The runner refusing (a folder that is not one, a permission mode it does not allow, a second
+  Codex or OpenCode start in a folder where one for a named session still waits) is `409`; a start
+  that fails (no terminal runtime, one that does not answer) is `503`. Either way the dispatch is
+  finished as failed and its session ended.
+- **The CLI's token.** The runner gives the CLI of a session the hub stored the environment
+  `AgentEnv` (the runner's `SessionEnv`) returns: for a session run as an agent, `PITCREW_TOKEN_FILE`
+  is `agents/<agent id>.token` in the state directory, a private file holding an **agent** token
+  bound to that agent and its owner (minted once, reused while it verifies as exactly that), and
+  `PITCREW_SOCKET` (or `PITCREW_PIPE`, or `PITCREW_URL` on development TCP) says where this daemon
+  listens. The person's device token is never given, and no token is put in the environment
+  itself (tmux keeps a program's variables). **Nothing inherited wins over these**: ptyd and the
+  daemon's tmux server pass the daemon's own environment on, and the CLI reads `PITCREW_TOKEN`
+  before `PITCREW_TOKEN_FILE` (and the platform's endpoint before `PITCREW_URL`), so a daemon
+  started from a shell exporting a person's token would otherwise hand it to every agent.
+  `PITCREW_TOKEN` and the endpoint variables the daemon does not listen on are set empty, which
+  the CLI reads as unset. An agent without an owner, or a session whose agent is not known, is
+  not started. A session without an agent gets nothing.
+- **The task moves itself.** The runner's `StoreSink` is wrapped in `FollowingSink`: every batch
+  the store takes is handed to `WorkService::follow_sessions`. The dispatched session's first
+  `working` moves its task to in progress; its end finishes a dispatch still open (`canceled`,
+  or `failed` if never reported). The agent's report (it moves the task to review) finishes the
+  dispatch as `succeeded`, and the back office's `dispatch_to_review` covers a task left in
+  progress.
+- **Reconciling** (`reconcile`, a task of the daemon): at start, when the runner attaches, and
+  after each start of a session the hub stored ahead of the runner, it looks at the sessions on
+  the runner's machine still `starting` with no CLI id, plus sessions with active dispatches
+  after adoption (`reconciling_sessions`), then again with
+  a pause growing from 1 s to a minute while any waits. A start still under way is left alone,
+  however long the runner takes: this hub's own (`Attached::starting`, held by the dispatcher and
+  by `POST /v1/sessions` from before the runner is asked until it answers) is not even asked
+  about, and the runner answers its own as `Running` until its command returns. One whose CLI
+  runs, or whose transcript the runner has, is left to be reported. One the runner has no
+  terminal and no transcript for (a crash between the dispatch and its start), or whose program
+  ended before its transcript appeared, twice in a row with a rescan between, is abandoned: its
+  dispatch fails ("its CLI did not start here, or ended before its transcript appeared"), it
+  ends, and the runner retires its terminal (`RunnerCommands::retire`), so no later transcript
+  is taken for it. So is a Codex or OpenCode session whose transcript has not appeared within
+  the runner's 15-minute claim window (`Started::TooLate`), at once: none can be matched to it
+  any more; its CLI is left running in its terminal. Before calling an exited unreported CLI
+  gone, the runner scans existing transcripts for adoption. `Started::Exited` keeps waiting
+  until that adoption reaches the hub; after it does, terminal exit ends the session and cancels
+  the dispatch without an end hook. A report that finished the dispatch meanwhile keeps its
+  outcome. With no runner attached it waits.
+- **`POST /v1/sessions` with `agent` or `task`** goes through the same adoption: the hub stores
+  the session first (`record_start`; `403` for an agent the caller does not own), then the CLI
+  starts under its id (see "Terminals"). A start the runner has not answered within
+  `COMMAND_TIMEOUT` (45 s) is answered `503` and the session left `starting`; a refusal or a
+  failure that comes later still ends it.
+
+The queue, per-agent concurrency, hand-off, and runners on other machines (over the JSON-lines
+link) are not part of this.
 
 ## Routes
 
@@ -585,7 +659,7 @@ dispatch"); then `RunnerCommands` becomes hub-work's `Dispatcher` here.
 |---|---|
 | `GET /v1/host/info` (no token) | `src/host.rs`, a layer over `pitcrew-api`'s app (see "The runner"); roles `["hub", "runner"]` while the runner runs, else `["hub"]`; capabilities, while it runs, `tmux` or `pty` for where its terminals run and `watch` while it watches a home, else `[]`; read at each request |
 | Work routes, agent and device, with `GET /v1/workspace`, `POST /v1/setup` and `GET /v1/sessions[/{id}]` | `pitcrew-hub-work` (`agent_routes`, `device_routes`); setup's listener is the daemon's (see "The first run") |
-| `POST /v1/tasks/{id}/dispatch` | `pitcrew-hub-work` without a dispatcher: `503 unavailable`, and nothing is recorded, not even an assignment (see "Dispatch") |
+| `POST /v1/tasks/{id}/dispatch` | `pitcrew-hub-work`, with `src/dispatch.rs`'s `RunnerLink` as its dispatcher (see "Dispatch") |
 | `GET /v1/stream` | `pitcrew-api` over the store (`StoreSource`) |
 | `GET /v1/events` | `pitcrew-api`'s `Activity` over the store, with the work model's activity index (`with_refs`, through the `WorkRefs` adapter in `src/refs.rs`): `project=` and `workstream=` match events about them, their tasks and their sessions, and `task=` and `session=` also match their sessions' and dispatches' events |
 | `GET /v1/recaps/blocks`, `GET /v1/recaps/days` | `pitcrew-api`'s `Recaps` over the hub's recap index (hub-work's `RecapIndex`, implemented by its `WorkService`), through the `WorkRecaps` adapter in `src/recaps.rs`; see "Recaps" |
@@ -606,7 +680,12 @@ answered by the hub's recap index: hub-work's `RecapIndex`, which its one `WorkS
 implements (hub-work's README, "Recaps"). Blocks and day paragraphs are derived from the log, so
 a restart builds them again. The blocks are kept on disk, not in memory, in `recaps.sqlite3` in the
 state directory (`WorkService::with_recap_file`): a cache of this run's, replaced when the index is
-built and removed when the daemon stops.
+built and removed when the daemon stops cleanly. On a network or unknown filesystem, the cache
+moves to a private local folder (temp before `$XDG_RUNTIME_DIR`), or stays in memory if neither
+base works. Unix names that folder from the canonical requested path and uid and reuses a hard
+kill's leftover only when `lstat` shows this user's real 0700 directory, replacing its cache.
+Otherwise, and on Windows, the name is random; hard-kill leftovers remain until temp cleanup.
+See hub-work's README, "Recaps", for placement and lifecycle details.
 
 - **The adapter** (`src/recaps.rs`, like `src/refs.rs` for the activity index): `pitcrew-api`
   does not depend on the work model, so `WorkRecaps` copies the route's `BlockFilter` field for
@@ -865,9 +944,9 @@ endpoint, which lists and reads and never starts one:
   where it looked (`pitcrew-ptyd is not installed at …`) and that tmux was not tried, `POST
   /v1/sessions` `503`, and nothing made for the endpoint.
 
-`tests/office.rs`, with `--demo`, appends what the runner link will report straight to the store
-(the daemon looks at it with its next append, here a comment through the API, or at its next
-start):
+`tests/office.rs`, with `--demo`, appends a dispatch's end straight to the store, as another
+writer would (the daemon looks at it with its next append, here a comment through the API, or at
+its next start):
 
 - a dispatch that finishes moves its task to review, authored by `@office` on behalf of `@sam` as
   the back office; `@office` is an agent owned by `@sam`, and has no token;
@@ -880,6 +959,29 @@ start):
 - `GET /v1/events?project=…` and `?workstream=…` answer 200 with exactly the events about them
   (checked against the ids each event names), paged by 500 and by 1; filters combine; an unknown
   project is an empty page, a malformed id a 400, an agent a 403.
+
+`tests/dispatch.rs` (Unix), dispatch end to end: `--demo`, temporary homes (`--homes`), the
+runner's terminals in the pitcrew-ptyd built next to `pitcrewd` (`--terminal-runtime pty`, an
+endpoint of the test's; skipped with a message when it is not built, unless `CI` or
+`PITCREW_REQUIRE_PTYD=1`), and stand-in `claude` and `codex` scripts first on its `PATH`, which
+write their transcript as the CLI does when given a prompt and note what they were given. Every
+process the daemon starts carries the test's mark, and none is left at the end.
+
+- for Claude (`@writer`) and Codex (`@runner`), each in a project folder of the test's: the
+  dispatch's session appears once, under the dispatch's id, linked to the task, with its terminal;
+  the CLI got `PITCREW_TOKEN_FILE` naming `agents/<agent>.token` (0600), an agent token for that
+  agent and `@sam` (`GET /v1/me` is the agent; it may not dispatch; it is not the device token),
+  and `PITCREW_URL`, and no token in its environment, though the daemon was started with the
+  person's token in `PITCREW_TOKEN` and another socket in `PITCREW_SOCKET` (read as the CLI reads
+  them, `pitcrew_cli::config`, its variables give the agent's token and the daemon's address);
+  the agent's own hooks change the session;
+  its first `working` moves the task to in progress; the agent's move to review (its report)
+  finishes the dispatch as succeeded, authored by the agent for `@sam`; ending the session leaves
+  it so;
+- after a crash (`kill -KILL`) with a dispatch whose CLI runs (its transcript held back) and one
+  appended as if the hub stopped before starting it: at the next start the second fails ("did not
+  start") and its session ends, while the first is kept and reported under its id once its
+  transcript appears; ended without a report, its dispatch is `canceled`.
 
 `tests/setup.rs`, the first run, fresh daemons with temporary homes (`--homes`, holding the
 Claude fixture's transcript):
@@ -1000,14 +1102,17 @@ and handed back, not kept, once it has.
 
 ## Not wired yet
 
-- The dispatcher (see "Dispatch"), and agent tokens for real sessions: how a real agent's hooks
-  authenticate is a separate design.
+- Agent tokens for sessions PitCrew did not start: a CLI a person runs by hand has no agent and
+  no token of PitCrew's, and how such a session would authenticate as an agent is a separate
+  design. Agent token files are not revoked when an agent's sessions end (a token is reused for
+  its next).
+- The queue, per-agent concurrency and hand-off (hub-work E.md item 4), and dispatch to another
+  machine's runner (the JSON-lines link): such a dispatch answers `503`.
 - Bundling `pitcrew-ptyd` next to `pitcrewd` in the installers (stream P, `P-desktop-bundle`):
   until then, an installed `pitcrewd` without tmux (Windows above all) has no terminal runtime.
 - On Windows, no lock guards ptyd's pipe beyond the state directory's own: a daemon given another
   daemon's pipe with the hidden `--ptyd-endpoint` would share that ptyd.
-- `POST /v1/sessions` with `agent` or `task` (`503`; it needs the runner to adopt a session id, as
-  dispatch does), and `POST /v1/sessions/{id}/link`, which no route serves yet.
+- `POST /v1/sessions/{id}/link`, which no route serves yet.
 - The first prompt (`brief`) is passed to the CLI as an argument, so other users of the machine
   can read it in the process list (`/proc/<pid>/cmdline`), and tmux shows it in the pane's
   `pane_start_command`. Passing it on the CLI's standard input, or through a private file, would

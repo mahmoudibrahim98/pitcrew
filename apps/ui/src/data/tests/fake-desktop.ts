@@ -45,6 +45,11 @@ function channelOf(value: unknown): FakeChannel {
   return new FakeChannel(id);
 }
 
+/** A remote identity whose host comes from the fake desktop, separately from hub data. */
+export function remoteWorkspace(id: string, name: string, host: string): GatewayWorkspace {
+  return { id, name, host, kind: 'remote', state: 'ready' };
+}
+
 export interface FakeDesktopOptions {
   workspaces?: GatewayWorkspace[];
 }

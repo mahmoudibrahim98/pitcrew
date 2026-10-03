@@ -2,6 +2,7 @@
 // line (opening, listing workspaces), or, in the desktop app, why the gateway cannot reach a
 // workspace. Never a spinner: a workspace that is unreachable or needs pairing says so.
 
+import { WorkspaceName } from '../workspace-name.tsx';
 import { useState, type ReactNode } from 'react';
 import { useRemoteGateway, type GatewayWorkspace } from '../../data/index.ts';
 import { Button } from '../../design/index.ts';
@@ -57,7 +58,7 @@ export function WorkspaceUnavailable({ workspace }: { workspace: GatewayWorkspac
     >
       <p className="font-mono text-xs text-ink-2">{WORKSPACE_STATE_LABEL[workspace.state]}</p>
       <h1 className="text-xl font-semibold">
-        {pairing ? `${workspace.name} needs pairing` : `Cannot reach ${workspace.name}`}
+        {pairing ? <><WorkspaceName workspace={workspace} /> needs pairing</> : <>Cannot reach <WorkspaceName workspace={workspace} /></>}
       </h1>
       <p className="text-sm text-ink-2">
         {pairing

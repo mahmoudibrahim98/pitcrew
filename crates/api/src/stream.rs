@@ -24,8 +24,9 @@ use axum::extract::{Query, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
-use pitcrew_auth::{ErrorResponse, WS_PROTOCOL};
+use pitcrew_auth::{ErrorResponse, Person, WS_PROTOCOL};
 use pitcrew_protocol::api::{ErrorCode, StreamFrame};
+use pitcrew_protocol::{MemberId, events::EventBody};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,6 +105,7 @@ struct StreamQuery {
 
 async fn stream(
     State(state): State<StreamState>,
+    Person(caller): Person,
     shutdown: Option<Extension<HubShutdown>>,
     query: Result<Query<StreamQuery>, axum::extract::rejection::QueryRejection>,
     upgrade: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
@@ -119,7 +121,7 @@ async fn stream(
         .protocols([WS_PROTOCOL])
         .max_message_size(MAX_INBOUND)
         .max_frame_size(MAX_INBOUND)
-        .on_upgrade(move |socket| session(socket, state, query.since, shutdown))
+        .on_upgrade(move |socket| session(socket, state, query.since, shutdown, caller.member))
 }
 
 fn invalid(message: &str) -> Response {
@@ -135,9 +137,10 @@ async fn session(
     state: StreamState,
     since: Option<u64>,
     mut shutdown: Option<HubShutdown>,
+    person: MemberId,
 ) {
     let (frames, mut queue) = mpsc::channel(state.config.queue_frames.max(1));
-    let pump = pump(state.source, since, state.config, frames);
+    let pump = pump_for_person(state.source, since, state.config, frames, Some(person));
     tokio::pin!(pump);
     let hub_down = HubShutdown::wait(&mut shutdown);
     tokio::pin!(hub_down);
@@ -197,6 +200,16 @@ pub async fn pump(
     config: StreamConfig,
     out: mpsc::Sender<StreamFrame>,
 ) -> StreamEnd {
+    pump_for_person(source, since, config, out, None).await
+}
+
+async fn pump_for_person(
+    source: Arc<dyn EventSource>,
+    since: Option<u64>,
+    config: StreamConfig,
+    out: mpsc::Sender<StreamFrame>,
+    person: Option<MemberId>,
+) -> StreamEnd {
     // Subscribe first: anything appended after this point is announced.
     let mut revs = source.subscribe();
     let rev = match read(&source, |s| s.latest_rev()).await {
@@ -205,6 +218,7 @@ pub async fn pump(
     };
     let closed = out.clone();
     let mut pump = Pump {
+        person,
         log: source.log_id(),
         source,
         config: StreamConfig {
@@ -274,6 +288,7 @@ pub async fn pump(
 }
 
 struct Pump {
+    person: Option<MemberId>,
     source: Arc<dyn EventSource>,
     log: String,
     config: StreamConfig,
@@ -283,6 +298,24 @@ struct Pump {
 }
 
 impl Pump {
+    async fn send_visible(
+        &self,
+        visible: &mut Vec<crate::source::StoredEvent>,
+    ) -> Result<(), StreamEnd> {
+        if let (Some(first), Some(last)) = (visible.first(), visible.last()) {
+            self.send(StreamFrame::Events {
+                from_rev: first.rev,
+                to_rev: last.rev,
+                events: std::mem::take(visible)
+                    .into_iter()
+                    .map(|e| e.event)
+                    .collect(),
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Queues a frame, waiting at most `send_timeout` for room.
     async fn send(&self, frame: StreamFrame) -> Result<(), StreamEnd> {
         match tokio::time::timeout(self.config.send_timeout, self.out.send(frame)).await {
@@ -297,19 +330,24 @@ impl Pump {
         while self.last_sent < target {
             let (after, page) = (self.last_sent, self.config.page);
             let batch = read(&self.source, move |s| s.since(after, page)).await?;
-            let (Some(first), Some(last)) = (batch.first(), batch.last()) else {
+            let (Some(_first), Some(last)) = (batch.first(), batch.last()) else {
                 // The source announced revisions it does not have; try again on the next one.
                 tracing::warn!(after, target, "event source returned nothing to send");
                 break;
             };
-            let (from_rev, to_rev) = (first.rev, last.rev);
-            let events = batch.into_iter().map(|e| e.event).collect();
-            self.send(StreamFrame::Events {
-                from_rev,
-                to_rev,
-                events,
-            })
-            .await?;
+            let to_rev = last.rev;
+            let mut visible = Vec::new();
+            for stored in batch {
+                if matches!(stored.event.body, EventBody::CursorMoved { .. })
+                    && self.person != Some(stored.event.author)
+                {
+                    self.send_visible(&mut visible).await?;
+                } else {
+                    visible.push(stored);
+                }
+            }
+            self.send_visible(&mut visible).await?;
+            // Advance over hidden revisions too, even when a whole page was metadata.
             self.last_sent = to_rev;
         }
         Ok(())
@@ -367,6 +405,79 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn cursor_stream_is_private_in_replay_and_live_with_metadata_only_pages() {
+        let author = MemberId::new();
+        let mut input = events(8);
+        for event in &mut input[1..7] {
+            event.author = author;
+            event.body = EventBody::CursorMoved {
+                scope: "workspace".into(),
+                rev: 1,
+            };
+        }
+        for person in [Some(author), Some(MemberId::new()), None] {
+            let source = Arc::new(MemorySource::new("private", 16));
+            source.append(input.clone());
+            let (tx, mut rx) = mpsc::channel(32);
+            let task = tokio::spawn(pump_for_person(
+                source.clone(),
+                Some(0),
+                quick(),
+                tx,
+                person,
+            ));
+            assert!(matches!(rx.recv().await, Some(StreamFrame::Hello { .. })));
+            let mut seen = Vec::new();
+            loop {
+                let frame = timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if let StreamFrame::Events {
+                    from_rev,
+                    to_rev,
+                    events,
+                } = frame
+                {
+                    assert_eq!(events.len() as u64, to_rev - from_rev + 1);
+                    seen.extend(from_rev..=to_rev);
+                    if to_rev == source.latest_rev().unwrap() {
+                        break;
+                    }
+                }
+            }
+            let end = source.latest_rev().unwrap();
+            if person == Some(author) {
+                assert_eq!(seen, (1..=end).collect::<Vec<_>>());
+            } else {
+                assert_eq!(seen, vec![1, 8]);
+            }
+            let mut live = events(2);
+            live[0].author = author;
+            live[0].body = EventBody::CursorMoved {
+                scope: "workspace".into(),
+                rev: 8,
+            };
+            source.append(live);
+            let mut received = Vec::new();
+            loop {
+                let frame = timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if let StreamFrame::Events { to_rev, events, .. } = frame {
+                    received.extend(events);
+                    if to_rev == end + 2 {
+                        break;
+                    }
+                }
+            }
+            assert_eq!(received.len(), if person == Some(author) { 2 } else { 1 });
+            task.abort();
+        }
     }
 
     fn quick() -> StreamConfig {

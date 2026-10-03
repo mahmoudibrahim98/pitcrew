@@ -4,6 +4,11 @@ The API client, the `/v1/stream` connection, and how events keep the TanStack Qu
 See `docs/build/streams/L.md`, `docs/build/contracts/api-v1.md` and
 `docs/build/contracts/desktop-gateway.md`. Import from `src/data/index.ts`.
 
+`cursors.ts` exposes live queries and mutations for the person's read cursors. The
+`cursor_moved` stream event invalidates `['cursors']`, including writes on another
+device; it is excluded from recap invalidation. Each workspace's existing data scope
+keeps its cursor cache separate, and failed mutations retain the previous cursor.
+
 | File | What |
 |---|---|
 | `transport.ts` | The seam every request and socket goes through: `Transport` (`request(method, path, body) → { status, contentType, body }`, `openSocket(path) → TransportSocket`). `browserTransport()`: `fetch` and `WebSocket` with the bearer token (development). `TransportSocket.bufferedAmount` is bytes sent but not yet taken: the real `WebSocket`'s own, here. `isDesktop()`: `window.__TAURI_INTERNALS__` exists. |
@@ -19,7 +24,7 @@ See `docs/build/streams/L.md`, `docs/build/contracts/api-v1.md` and
 | `config.ts` | `browserConfig()`: `VITE_PITCREW_API` (default `http://127.0.0.1:47317`) and `VITE_PITCREW_TOKEN` (default `dev-device-token`), dev server only; any build fails while the token is set. Loaded only by `browser.tsx`. The only file that may read `import.meta.env` (ESLint; `import.meta.env.DEV` is allowed anywhere). |
 | `types.ts` | Hand-written wire types mirroring the serde names, until generated types exist: the model, `Brief`, `EventsPage` (alias `ActivityPage`), transcripts (`TranscriptItem`, `TranscriptPage`, `PlanItem`), recaps (`Block`, `Summary`, `Span`, `BlocksPage`, `DaysPage`, …), `Key`, `EndMode`, and request bodies. `EVENT_TYPES` lists every `EventBody` type, `TRANSCRIPT_KINDS` every transcript item kind, `CHECKS` every `Check`. |
 | `keys.ts` | Query keys. Lists and details sit under separate prefixes (`['tasks', 'list', filters]`, `['tasks', 'detail', id]`); `keys.recaps.blocks(filters)` and `keys.recaps.days(scope, tz)` hold every page an infinite query has loaded (`keys.recaps.all` is the prefix for "every recap key"). |
-| `stream.ts` | `StreamClient({ transport })`: resume by `since`, reset when `since` is ahead of `hello.rev`, when `hello.log` changes, or on a revision gap; capped back-off that starts over only after a stable connection; reconnect after 60 s of silence, or at once with `retryNow()`. `streamPath()`, `terminalPath()`. No React. |
+| `stream.ts` | `StreamClient({ transport })`: resume by `since`, reset when `since` is ahead of `hello.rev`, or when `hello.log` changes; accepts private revision gaps; capped back-off that starts over only after a stable connection; reconnect after 60 s of silence, or at once with `retryNow()`. `streamPath()`, `terminalPath()`. No React. |
 | `patches.ts` | Events that carry the whole object (`task_created`, `subtasks_replaced`, `session_discovered`) are written into the cache, except into queries already invalidated (they refetch anyway). |
 | `invalidation.ts` | One entry per event type → the keys it touches. Every event also touches `['events']`. Recaps have their own rule (`recaps.ts`'s `recapScopeMap`, wired in by `live.ts`), since it needs the query cache, not just the event. |
 | `recaps.ts` | `clauses(summary)`: a `Summary`'s text split into its receipted clauses and the plain text joining them, converting the contract's UTF-8 byte spans correctly. `useRecapBlocks(filters, { limit? })` and `useRecapDays(scope, { tz?, limit? })`: infinite queries (`useLiveInfiniteQuery`) paged backwards by the last block's id / day's date; `.blocks`/`.days` flatten the loaded pages, `.atStart`, `.loadMore()`. `tz` defaults to the viewer's own offset (`-new Date().getTimezoneOffset()`); pass `0` against the mock hub and from e2e suites, which only have days for `tz=0`. Also `recapScopeMap`/`recapScopeForEvents`: the event → scope half of the live-update rule (API v1, "Recaps"), cache-free and table-tested; `live.ts` supplies the cache and turns the scope into query keys. |

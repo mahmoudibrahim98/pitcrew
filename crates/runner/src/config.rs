@@ -2,6 +2,7 @@
 
 use crate::agents::SessionAgents;
 use crate::link::Locations;
+use crate::session_env::SessionEnv;
 use pitcrew_protocol::ids::{MachineId, MemberId, WorkspaceId};
 use pitcrew_protocol::model::Engine;
 use std::path::PathBuf;
@@ -100,6 +101,9 @@ pub struct RunnerConfig {
     /// Round notification deadlines up to this grid after debounce; zero disables grouping.
     /// Adds less than this duration. Polling and hook reports retain their deadlines.
     pub notification_window: Duration,
+    /// The environment of a CLI started for a session the hub named (see [`SessionEnv`]).
+    /// Without it, such a CLI gets none: no token, so its hooks are refused.
+    pub session_env: Option<Arc<dyn SessionEnv>>,
 }
 
 impl RunnerConfig {
@@ -126,6 +130,7 @@ impl RunnerConfig {
             cache_file_discovery: false,
             byte_file_cursors: false,
             notification_window: Duration::ZERO,
+            session_env: None,
         }
     }
 
@@ -150,6 +155,14 @@ impl RunnerConfig {
     #[must_use]
     pub fn with_agents(mut self, agents: Arc<dyn SessionAgents>) -> Self {
         self.agents = Some(agents);
+        self
+    }
+
+    /// Gives a CLI started for a session the hub named the environment `env` says (see
+    /// [`SessionEnv`]).
+    #[must_use]
+    pub fn with_session_env(mut self, env: Arc<dyn SessionEnv>) -> Self {
+        self.session_env = Some(env);
         self
     }
 }

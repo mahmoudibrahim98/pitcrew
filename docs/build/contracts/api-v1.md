@@ -176,13 +176,54 @@ A fresh hub has a device token but no person, no machine and no name. The deskto
   that differ (lists compare in order), with `null` for a field it cleared. A patch that changes
   nothing, `{}` included, returns the task and emits nothing.
 
-**Dispatch.** Starts a session for the agent on the task:
-- `409 conflict` if the task is done or canceled.
+**Dispatch.** Starts a session for the agent on the task. People only (`403` for an agent), and
+**only their own agents**: a person may dispatch an agent whose `owner` is that person, never
+another person's agent or one with no owner (explicit sharing may come later).
+- Refusals, in this order, with nothing recorded: `404` an unknown task; `400` an unknown agent or
+  machine, a person named as the agent, or a brief (the one given, or the task's description or
+  title it defaults to) longer than 64 KiB; `403 forbidden` an agent the caller does not own;
+  `409 conflict` if the task is done or canceled, or the agent already holds an active dispatch on
+  it; `503 unavailable` when no machine can run it (none is live, the hub has no runner attached
+  yet, or the machine's runner cannot be reached).
 - If the task has no assignee, it is assigned to the agent (`task_assigned`).
 - The machine and folder default to the workstream's first location, then the project's root,
-  then the hub's own machine.
-- Emits `dispatch_started`, then `session_discovered` (state `starting`, `link_basis: dispatch`).
-  When the session starts working, the task moves to in progress (`task_moved`, mover `agent`).
+  then the hub's own machine (in the home folder, `~`).
+- Emits `dispatch_started`, then `session_discovered` (state `starting`, `link_basis: dispatch`),
+  then starts the agent's CLI there. The runner reports the CLI as **that session**: its
+  transcript takes the dispatch's session id, and the session is never discovered a second time
+  under another. The CLI runs with an **agent** token for the dispatched agent, acting for its
+  owner (its hooks and `pitcrew` use it), never a person's token.
+- If the CLI cannot start, the dispatch finishes at once (`dispatch_finished`, outcome `failed`,
+  the reason as its summary), the session ends (`session_ended`), and the dispatch answers `409`
+  (the runner refused: a folder that is not one, a permission mode it does not allow, or a Codex
+  or OpenCode start in a folder where another, for a dispatch or a start for an agent or task,
+  still waits for its transcript: the two could not be told apart), `503` (the machine or its
+  terminals cannot be reached) or `500`.
+- **The task moves itself** (the hub, following what the runner reports):
+  - when the session first reports `working`, or reports a finished transcript turn (including
+    a first read whose final state is already idle), the task moves to in progress (`task_moved`, mover
+    `agent`, authored by the agent for its owner), if an agent may move it there;
+  - when the agent reports the work done, by moving its task to review (`pitcrew report <task>
+    --review`), the dispatch finishes as `succeeded` (`dispatch_finished`) in the same
+    transaction as the move. A task a person already moved to review counts as that report: the
+    agent's move answers `200` with the task, unchanged, and the dispatch succeeds. The back
+    office moves a task still in progress to review when a dispatch succeeds
+    (`dispatch_to_review`);
+  - when the session ends without that report, including its terminal's CLI exiting without an
+    end hook, the dispatch finishes as `canceled`, summary "The
+    session ended without a report." (it stopped work), or as `failed`, summary "The session
+    ended before its CLI started.", if the runner never reported the session;
+  - when its CLI never started (the hub stopped between the dispatch and the start, or the CLI
+    ended without writing a transcript), or a Codex or OpenCode CLI's transcript did not appear
+    within 15 minutes of its start (past that, no transcript is matched to it by folder), the hub
+    finishes the dispatch as `failed` and ends the session, at its next start or once it sees
+    that. Before retiring an exited terminal, the runner scans and matches transcripts already
+    written: exit before the watcher's first read does not prevent adoption. Active dispatches
+    remain watched after adoption, until a report or terminal exit finishes them. A start still
+    under way is never taken for one that did not start.
+  A person can always move the task themselves; the session's later turns do not move it back. A
+  session the hub ended stays ended: the runner re-stating it (`session_discovered`) does not
+  bring it back.
 
 ### Sessions
 
@@ -191,7 +232,7 @@ A fresh hub has a device token but no person, no machine and no name. The deskto
 | `GET /v1/sessions?machine=&workstream=&task=&state=` | → `Session[]` | |
 | `GET /v1/sessions/{id}` | → `Session` | |
 | `GET /v1/sessions/{id}/transcript?before=&limit=` | → `TranscriptPage` | See "Transcript paging". |
-| `POST /v1/sessions` | `StartSession` → `Session` (202) | Starts a new session. Emits `session_discovered`. |
+| `POST /v1/sessions` | `StartSession` → `Session` (202) | Starts a new session. Emits `session_discovered`. See below. |
 | `POST /v1/sessions/{id}/send` | `{ "text": String }` → 204 | Types text and presses Enter. |
 | `POST /v1/sessions/{id}/keys` | `{ "keys": Key[] }` → 204 | e.g. `["escape"]`. |
 | `POST /v1/sessions/{id}/interrupt` | → 204 | |
@@ -202,6 +243,16 @@ A fresh hub has a device token but no person, no machine and no name. The deskto
 "task"?: TaskId, "brief"?: String, "persona"?: PersonaId, "model"?: String,
 "permission_mode"?: PermissionMode }`. `persona`, `model` and `permission_mode` are launch options
 and are not echoed on `Session`. With a `task`, the session is linked with `link_basis: "manual"`.
+- With an `agent` or a `task`, the hub stores the session before its CLI starts
+  (`session_discovered`, state `starting`, the agent named, linked to the task) and answers it
+  (`202`) once the CLI has started; the runner reports the CLI under that id, as for a dispatch,
+  and a session run as an agent gets that agent's token, never a person's. `400` for an unknown
+  agent or task, or a person named as the agent; `403 forbidden` for an agent the caller does not
+  own (as for a dispatch, a person runs only their own agents). If the runner refuses or fails
+  the start, the session ends (`session_ended`) and the start answers why. If the runner does not
+  answer in time, the start answers `503` and the session stays `starting`: the hub ends it later
+  only if its CLI did not start, as for a dispatch. It moves no task: only a dispatch does.
+- Without them, the start answers once the runner has found the CLI's transcript.
 
 **Transcript paging.** Tail-first: without `before`, the newest page; pass a page's `from` as
 `before` to get the previous one. `limit` counts items (default 200, max 1000). Pages hold
@@ -216,6 +267,30 @@ not start at byte 0).
   a machine the hub cannot reach and, on a hub without a runner, every session.
 - An unknown session is `404`; a `limit` of 0, or a `before` or `limit` that is not a whole number,
   is `400`.
+
+### Read cursors
+
+`GET /v1/me/cursors` returns `ReadCursor[]` for the token's person, sorted by scope.
+`PUT /v1/me/cursors/{scope}` takes `{ "rev": u64 }` and returns a `ReadCursor`
+(`{ "scope": String, "rev": u64 }`). Both routes are person-only: agent tokens get 403,
+including malformed PUT bodies. Cursors belong to a person across all their devices.
+
+Scopes are `workspace`, `project:<ProjectId>` or `workstream:<WorkstreamId>` (bare ULIDs).
+Malformed scopes are 400; unknown projects/workstreams are 404. An absent cursor means 0.
+Revisions ahead of the hub's current log are 400. A revision equal to or below the stored
+one returns the current cursor without appending. Moving forward appends `cursor_moved`
+with `{ "scope", "rev" }`, authored by the person; its projection keeps the maximum revision
+per author and scope. Clients refetch cursors on this stream event. Cursor events are read
+metadata, private to their person: never in activity or recap inputs, and never in
+other people's streams (including replay). Only that person's device tokens receive
+`cursor_moved`; agent tokens never receive it. The UI also excludes it defensively.
+
+Activity and recap routes keep their existing paging contract. Clients fetch their cursor,
+compare activity revisions to it, and mark revisions greater than it new. Home counts the
+new items in its loaded window (and indicates when older pages remain). Mark all as read
+advances to the newest activity revision actually shown. Project and workstream views
+advance their own scope after a one-second dwell, to the newest activity revision loaded
+when that visit began; arriving live events remain new until another visit.
 
 ### Asks, briefs, activity
 
@@ -252,10 +327,13 @@ put there. Its **pending proposal** is the newest `brief_proposed` for that targ
 - An `agent` token: only asks addressed to itself, and only of kind `question` or `mention`.
 - `decision`, `approval` and `review` always need a `device` token.
 
-**Activity paging** (`GET /v1/events`, response type `EventsPage`): events oldest first within
-the page, the newest page when `before` is absent. `before` is an exclusive revision. `from_rev`
-and `to_rev` are the revisions of the first and last returned events; with filters they need not
-be contiguous. Pass `from_rev` as `before` for the previous page. Default limit 100, max 500;
+**Activity paging** (`GET /v1/events`, also available as `GET /v1/activity`, response type
+`EventsPage`): events oldest first within the page, the newest page when `before` is absent. `before` is an exclusive revision. `from_rev`
+and `to_rev` are the revisions of the first and last returned events. `revisions: u64[]`
+contains each returned event's actual revision in the same order; revisions need not be
+contiguous, even without filters. Cursor writes are skipped before counting the limit,
+so an unfiltered page holds up to its limit of real events. Pass `from_rev` as `before` for
+the previous page. Default limit 100, max 500;
 `limit=0` is 400.
 - **Only `at_start` ends paging.** With filters the hub scans a bounded window per request, so a
   page may hold fewer than `limit` events, even none. An empty page that is not at the start has
@@ -422,22 +500,25 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
   ignored; send none.
 - **One scan at a time per machine.** A scan holds its machine from the moment it is accepted
   until its walk ends; a second one meanwhile is `409 conflict`. A client that closes the answer
-  early does not stop the walk: it ends on its own (it is bounded), and only then may the machine
-  be scanned again.
+  early cancels further work between homes and files. A ten-minute budget also stops further
+  work and returns the counts collected so far with `partial: true`. An in-flight filesystem
+  operation must finish before cancellation takes effect and the machine can be scanned again.
 - **The answer** is `200` with `Content-Type: application/x-ndjson`: one `ScanFrame` JSON object
   per line, written as the walk goes. Read it as a stream for live progress, or whole.
   - `{"type":"progress","scanned":0}` at once. Then `{"type":"progress","scanned":N,"total":M}`
     (with `"path"`, a transcript just read, when there is one) at most every 100 ms; the last
-    progress frame has `scanned` equal to `total`.
+    progress frame has `scanned` equal to `total` for a complete scan; a partial scan may have less.
   - Then exactly one last frame: `{"type":"done","report":ScanReport}`, or, if the scan failed
     after the answer began, `{"type":"error","code":ErrorCode,"message":String}`.
-  - A client that reads slowly may miss progress frames, never the last progress frame or the
-    last frame.
-- `ScanReport`: `{ "counts": ScanCounts, "suggestions": Suggestion[], "unreadable": u64 }`.
+  - A client that reads slowly may miss progress frames. Sending the last progress frame or
+    final frame waits at most 30 seconds; on timeout the stream closes and releases its claim.
+- `ScanReport`: `{ "counts": ScanCounts, "suggestions": Suggestion[], "unreadable": u64, "partial"?: bool }`.
   - `ScanCounts`: `{ "sessions", "subagent_sessions", "by_engine": [{ "engine", "count" }],
     "by_home": [{ "engine", "home", "count" }], "by_folder": [{ "path", "count" }],
     "by_month": [{ "month", "count" }], "first_activity"?, "last_activity"? }`. The `by_` lists
     count ordinary sessions; sub-agent sessions are counted once, in `subagent_sessions`.
+    Sessions without a working directory are omitted from `by_folder`; sessions without a
+    start time are omitted from `by_month`, so either list may sum to less than `sessions`.
     `by_folder` is busiest first, `by_month` (`YYYY-MM`, UTC) most recent first.
   - `Suggestion`, a suggested project: `{ "id", "name", "path", "is_git", "session_count",
     "recent_30d", "recent_90d", "workstreams": WorkstreamSuggestion[] }`. `path` is a repository
@@ -449,6 +530,8 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
     `branch`; `id` is the folder's own path, which is also where it is), or a branch other than
     `main`, `master`, `trunk`, `develop` and `HEAD` (with `branch`; `id` is
     `<project path>#<branch>`, and it is the project's `path` on that branch).
+  - `partial`, when true, means cancellation or the budget stopped the scan early. Absent means
+    false, for compatibility with older servers.
   - `unreadable` counts homes, folders and transcripts skipped because they could not be read;
     the rest of the scan still ran.
   - Paths are the machine's own, as its CLIs wrote them. A session's folder and branch are the ones
@@ -472,7 +555,10 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
 - **`log` identifies the hub's event log.** It is created with the store and never changes.
   Revisions only count within one log: if `log` differs from the one the client's cache came
   from, or `since` is newer than `N`, the client must drop its cached state and refetch.
-- `events` frames carry `from_rev..=to_rev` and the events in order. Small changes are batched
+- `events` frames carry contiguous `from_rev..=to_rev` and the events in order.
+  Private cursor writes create gaps between frames: clients accept those gaps without resetting
+  or renumbering events. Replay scans past hidden revisions, including metadata-only pages.
+  No empty frame or cursor payload is sent for hidden writes. Small changes are batched
   over 50–100 ms.
 - `{"type":"ping","at":…}` every 20 s. A client that sees nothing for 60 s reconnects.
 - Agents and hooks use HTTP; the stream is for `device` tokens in v1.

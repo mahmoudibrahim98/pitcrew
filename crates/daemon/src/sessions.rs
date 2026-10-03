@@ -17,9 +17,21 @@
 //! a start without a brief may wait for a person), it answers `503 unavailable`: the CLI keeps
 //! running in its terminal, and its session appears on the stream once its transcript does.
 //!
-//! - `agent` and `task` are not supported yet (`503`): a session started for an agent must be
-//!   known under the agent before its CLI starts, which needs the runner to adopt a session id
-//!   (stream D's dispatch work). `persona` is passed on; the runner does not use it yet.
+//! - **With `agent` or `task`**, the hub stores the session first (`WorkService::record_start`:
+//!   state `starting`, the agent named, linked to the task by hand; `400` for an unknown agent or
+//!   task, or a person as the agent), then the runner starts the CLI under that id, which its
+//!   transcript adopts, as a dispatch's does (`crate::dispatch`): the CLI of a session run as an
+//!   agent gets that agent's token file, never the person's token. A person may name only an
+//!   agent they own (`403` otherwise), as for a dispatch. The start answers `202` with the
+//!   session as stored, at once. If the runner refuses or fails, the session ends
+//!   (`WorkService::abandon_session`) and the error is answered; one the runner answers only
+//!   after the request gave up ([`COMMAND_TIMEOUT`]) is answered `503` and left `starting`, the
+//!   hub's start of it under way (`Attached::starting`) until the runner answers: a refusal or a
+//!   failure then ends it, and a CLI that never reports its session is reconciled later
+//!   (`crate::dispatch::reconcile`). A second start of Codex or OpenCode in a folder where one
+//!   started for an agent or a task still waits is refused (`400`): the two could not be told
+//!   apart.
+//! - `persona` is passed on; the runner does not use it yet.
 //! - `machine` must be a machine of the workspace (`400` otherwise) and the runner's (`503` for
 //!   another).
 //! - `cwd` ([`checked_cwd`]): absolute, at most [`MAX_CWD`] bytes, an existing folder, resolved
@@ -57,8 +69,8 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use pitcrew_auth::{Authenticated, ErrorResponse};
-use pitcrew_hub_work::WorkService;
 use pitcrew_hub_work::routes::MAX_BODY;
+use pitcrew_hub_work::{RecordedStart, WorkError, WorkService};
 use pitcrew_protocol::api::{Caller, ErrorCode, TokenScope};
 use pitcrew_protocol::ids::{
     CommandId, MachineId, MemberId, PersonaId, SessionId, TaskId, TerminalId,
@@ -87,8 +99,8 @@ pub const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_TEXT: usize = 64 * 1024;
 /// The most keys `keys` sends at once.
 pub const MAX_KEYS: usize = 64;
-/// The longest first prompt a start takes, in bytes.
-pub const MAX_BRIEF: usize = 64 * 1024;
+/// The longest first prompt a start takes, in bytes (a dispatch's brief is bounded the same).
+pub const MAX_BRIEF: usize = pitcrew_hub_work::MAX_BRIEF;
 /// The longest `cwd`, in bytes.
 pub const MAX_CWD: usize = 4096;
 /// How often the runner's index is looked at while waiting for a started session.
@@ -112,6 +124,8 @@ pub struct Sessions {
     agents: Arc<HubAgents>,
     commands: Arc<Semaphore>,
     starts: Arc<Semaphore>,
+    /// [`COMMAND_TIMEOUT`], but in tests.
+    command_timeout: Duration,
 }
 
 impl Sessions {
@@ -124,7 +138,15 @@ impl Sessions {
             runner,
             commands: Arc::new(Semaphore::new(MAX_COMMANDS)),
             starts: Arc::new(Semaphore::new(MAX_STARTS)),
+            command_timeout: COMMAND_TIMEOUT,
         }
+    }
+
+    /// Gives up on a command after `timeout` instead of [`COMMAND_TIMEOUT`].
+    #[cfg(test)]
+    fn with_command_timeout(mut self, timeout: Duration) -> Self {
+        self.command_timeout = timeout;
+        self
     }
 
     /// The routes. Mount them as **device** routes (`RouterParts::device`).
@@ -159,7 +181,7 @@ impl Sessions {
             drop(permit);
             outcome
         });
-        match tokio::time::timeout(COMMAND_TIMEOUT, running).await {
+        match tokio::time::timeout(self.command_timeout, running).await {
             Ok(Ok(CommandOutcome::Ok { detail })) => Ok(Done { detail }),
             Ok(Ok(CommandOutcome::Rejected { reason })) => Err(invalid(reason)),
             Ok(Ok(CommandOutcome::Failed { error })) => Err(unavailable(error)),
@@ -172,7 +194,7 @@ impl Sessions {
             }
             Err(_) => {
                 tracing::warn!(
-                    seconds = COMMAND_TIMEOUT.as_secs(),
+                    seconds = self.command_timeout.as_secs(),
                     "a session command has not returned; it is left running"
                 );
                 Err(unavailable("The command took too long."))
@@ -289,6 +311,97 @@ impl Sessions {
         }
     }
 
+    /// Starts `command`, the CLI of `session`, which the hub has stored: answers it as stored once
+    /// the runner has started its CLI, or ends it and answers why the runner could not. A start
+    /// the runner has not answered in time is answered `503` and left `starting`: the hub's start
+    /// of it stays under way until the runner answers (the reconciliation leaves it alone), and a
+    /// refusal or failure then still ends it.
+    async fn start_recorded(
+        &self,
+        runner: &Parts,
+        command: RunnerCommand,
+        session: Session,
+    ) -> Result<(StatusCode, Json<Session>), ErrorResponse> {
+        let id = session.id;
+        // Taken first: until the runner answers, the session is not one whose CLI did not start.
+        let starting = self.runner.starting(id);
+        let Ok(permit) = Arc::clone(&self.commands).try_acquire_owned() else {
+            self.abandon(id, "too many session commands are running")
+                .await;
+            return Err(unavailable(
+                "Too many session commands are running; try again in a moment.",
+            ));
+        };
+        let (commands, work, attached) = (
+            runner.commands.clone(),
+            Arc::clone(&self.work),
+            Arc::clone(&self.runner),
+        );
+        let running = tokio::task::spawn_blocking(move || {
+            let outcome = commands.run(CommandId::new(), &command);
+            drop(permit);
+            match &outcome {
+                CommandOutcome::Ok { .. } => {
+                    tracing::info!(session = %id, "started the CLI of a session stored for an agent or a task");
+                }
+                CommandOutcome::Rejected { reason: why }
+                | CommandOutcome::Failed { error: why } => {
+                    if let Err(e) = work.abandon_session(&id, why) {
+                        tracing::warn!(session = %id, error = %e, "cannot end a session whose CLI did not start");
+                    }
+                }
+            }
+            // Answered: the reconciliation may look at it again.
+            drop(starting);
+            attached.started();
+            outcome
+        });
+        match tokio::time::timeout(self.command_timeout, running).await {
+            Ok(Ok(CommandOutcome::Ok { .. })) => {
+                let work = Arc::clone(&self.work);
+                let stored = bounded(move || work.session(&id)).await?;
+                Ok((StatusCode::ACCEPTED, Json(stored.unwrap_or(session))))
+            }
+            Ok(Ok(CommandOutcome::Rejected { reason })) => Err(invalid(reason)),
+            Ok(Ok(CommandOutcome::Failed { error })) => Err(unavailable(error)),
+            Ok(Err(e)) => {
+                // It did not answer: the reconciliation decides whether its CLI started.
+                tracing::error!(session = %id, error = %e, "starting a session's CLI failed");
+                self.runner.started();
+                Err(ErrorResponse::new(
+                    ErrorCode::Internal,
+                    "The command could not be run.",
+                ))
+            }
+            Err(_) => {
+                tracing::warn!(
+                    session = %id,
+                    seconds = self.command_timeout.as_secs(),
+                    "the start of a session's CLI has not returned; it is left running, and the \
+                     session starting"
+                );
+                Err(unavailable(format!(
+                    "The runner has not started session {id}'s CLI yet. The session stays \
+                     starting: it ends if its CLI does not start."
+                )))
+            }
+        }
+    }
+
+    /// Ends `session`, stored for a start that did not happen, logging why it cannot.
+    async fn abandon(&self, session: SessionId, reason: &str) {
+        let (work, reason) = (Arc::clone(&self.work), reason.to_owned());
+        match bounded(move || work.abandon_session(&session, &reason)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(%session, error = %e, "cannot end a session whose CLI did not start")
+            }
+            Err(e) => {
+                tracing::warn!(%session, error = ?e.0.message, "ending a session whose CLI did not start timed out")
+            }
+        }
+    }
+
     /// Asks the runner to look for new transcripts now (discovery runs on its watcher thread),
     /// unless every command permit is taken.
     fn rescan(&self, runner: &Parts) {
@@ -349,12 +462,6 @@ impl StartSession {
         }
         if self.brief.as_ref().is_some_and(|b| b.len() > MAX_BRIEF) {
             return Err(invalid(format!("brief must be at most {MAX_BRIEF} bytes.")));
-        }
-        if self.agent.is_some() || self.task.is_some() {
-            return Err(unavailable(
-                "Starting a session for an agent or a task is not supported here yet; start it \
-                 without `agent` and `task`.",
-            ));
         }
         Ok(())
     }
@@ -447,21 +554,39 @@ async fn start(
         );
     }
     let name = window_name(start.engine, &folder.path);
-    let done = sessions
-        .run(
-            &runner,
-            RunnerCommand::StartSession {
-                engine: start.engine,
-                cwd: folder.path,
-                name,
-                brief: start.brief,
-                persona: start.persona,
-                model: start.model,
-                account: None,
-                permission_mode: start.permission_mode.unwrap_or_default(),
-            },
+    // For an agent or a task, the hub stores the session first, and the CLI is started under it.
+    let recorded = if start.agent.is_some() || start.task.is_some() {
+        let work = Arc::clone(&sessions.work);
+        let record = RecordedStart {
+            machine: start.machine,
+            engine: start.engine,
+            cwd: folder.path.clone(),
+            agent: start.agent,
+            task: start.task,
+        };
+        Some(
+            bounded(move || work.record_start(&caller, record))
+                .await?
+                .map_err(work_error)?,
         )
-        .await?;
+    } else {
+        None
+    };
+    let command = RunnerCommand::StartSession {
+        engine: start.engine,
+        cwd: folder.path,
+        name,
+        brief: start.brief,
+        persona: start.persona,
+        model: start.model,
+        account: None,
+        permission_mode: start.permission_mode.unwrap_or_default(),
+        session: recorded.as_ref().map(|s| s.id),
+    };
+    if let Some(session) = recorded {
+        return sessions.start_recorded(&runner, command, session).await;
+    }
+    let done = sessions.run(&runner, command).await?;
     let detail = done.detail.unwrap_or_default();
     let Some(terminal) = detail
         .get("terminal")
@@ -499,18 +624,18 @@ async fn start(
 
 /// A folder a CLI may start in ([`checked_cwd`]).
 #[derive(Debug, PartialEq, Eq)]
-struct Folder {
+pub(crate) struct Folder {
     /// Resolved: links and `..` followed.
-    path: String,
+    pub(crate) path: String,
     /// It, or folders above it, that members of their group can change (logged at info).
-    group_writable: Vec<String>,
+    pub(crate) group_writable: Vec<String>,
 }
 
 /// `cwd` resolved (links and `..`; on Windows, in its text), if it is a folder PitCrew may start
 /// a CLI in: absolute and existing; on Unix, it and every folder above it belong to root or this
 /// user, and none is writable by every user (o+w) except a sticky folder above it. Group-writable
 /// folders pass, and are named so the start can say so. Otherwise why not. Blocking.
-fn checked_cwd(cwd: &str) -> Result<Folder, String> {
+pub(crate) fn checked_cwd(cwd: &str) -> Result<Folder, String> {
     let given = std::path::Path::new(cwd);
     if !given.is_absolute() {
         return Err("cwd must be an absolute folder.".to_owned());
@@ -674,6 +799,11 @@ async fn read(body: Body) -> Result<axum::body::Bytes, ErrorResponse> {
 /// The body as `T`, or a `400` saying what it should be.
 fn parse<T: DeserializeOwned>(body: &[u8], what: &str) -> Result<T, ErrorResponse> {
     serde_json::from_slice(body).map_err(|e| invalid(format!("The body must be {what}: {e}.")))
+}
+
+/// A work-model refusal as the API answers it; an internal error with no detail.
+fn work_error(e: WorkError) -> ErrorResponse {
+    ErrorResponse(e.to_api())
 }
 
 /// `f` on the blocking pool (a read of the hub's store, the runner's index, the filesystem), for
@@ -979,8 +1109,8 @@ mod tests {
     /// Which sessions take a command, before the runner is asked: unknown `404`; without a runner,
     /// or on another machine, `503`; another person's agent's, or an unknown agent's, `403`;
     /// ended, or without a terminal here, `409`. Starting needs a person, a machine of the
-    /// workspace, the runner's, and an absolute folder; `agent` and `task` are not supported yet.
-    /// With no runtime, a start fails as `503`.
+    /// workspace, the runner's, and an absolute folder; `agent` and `task` must be known. With no
+    /// runtime, a start fails as `503`, and a session stored for an agent ends.
     #[test]
     fn which_sessions_take_commands() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1087,8 +1217,46 @@ mod tests {
             "not a machine of the workspace"
         );
         let mut with_agent = start_body(here.id, folder);
+        with_agent["agent"] = serde_json::json!(MemberId::new());
+        assert_eq!(
+            code(&starting(as_lee, with_agent.clone())),
+            "Invalid",
+            "an unknown agent"
+        );
+        with_agent["agent"] = serde_json::json!(lee.id);
+        assert_eq!(
+            code(&starting(as_lee, with_agent.clone())),
+            "Invalid",
+            "a person as the agent"
+        );
+        // A person runs only their own agents: kim's is refused, and nothing is stored.
+        let stored = sessions.work.sessions(&Default::default()).unwrap().len();
+        with_agent["agent"] = serde_json::json!(kims.id);
+        assert_eq!(
+            code(&starting(as_lee, with_agent.clone())),
+            "Forbidden",
+            "another person's agent"
+        );
+        assert_eq!(
+            sessions.work.sessions(&Default::default()).unwrap().len(),
+            stored
+        );
+        let mut with_task = start_body(here.id, folder);
+        with_task["task"] = serde_json::json!(pitcrew_protocol::ids::TaskId::new());
+        assert_eq!(
+            code(&starting(as_lee, with_task)),
+            "Invalid",
+            "an unknown task"
+        );
+        // Stored for the agent, then ended when the idle runner (no runtime) cannot start it.
         with_agent["agent"] = serde_json::json!(lees.id);
+        let before = sessions.work.sessions(&Default::default()).unwrap().len();
         assert_eq!(code(&starting(as_lee, with_agent)), "Unavailable");
+        let all = sessions.work.sessions(&Default::default()).unwrap();
+        assert_eq!(all.len(), before + 1);
+        let stored = all.last().unwrap();
+        assert_eq!(stored.agent, Some(lees.id));
+        assert_eq!(stored.state, SessionState::Ended);
         let as_agent = Caller {
             member: lees.id,
             scope: TokenScope::Agent,
@@ -1103,6 +1271,151 @@ mod tests {
             code(&starting(as_lee, start_body(here.id, folder))),
             "Unavailable"
         );
+        rt.block_on(runner.stop(Duration::from_secs(10)));
+    }
+
+    /// Holds the environment of a start's CLI until opened, so the start stays under way.
+    #[derive(Debug, Default)]
+    struct Held {
+        open: std::sync::Mutex<bool>,
+        opened: std::sync::Condvar,
+        waiting: std::sync::atomic::AtomicBool,
+    }
+
+    impl Held {
+        fn open(&self) {
+            *self.open.lock().unwrap() = true;
+            self.opened.notify_all();
+        }
+    }
+
+    /// Opens a [`Held`] when dropped, so a failed assertion fails the test instead of leaving
+    /// the start, and the runtime that waits for it, hanging.
+    struct Opens(Arc<Held>);
+
+    impl Drop for Opens {
+        fn drop(&mut self) {
+            self.0.open();
+        }
+    }
+
+    impl pitcrew_runner::SessionEnv for Held {
+        fn env_for(&self, _: SessionId) -> Result<Vec<(String, String)>, String> {
+            self.waiting
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.opened.wait(open).unwrap();
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    /// A start for an agent that the runner has not answered in time is answered `503` and left
+    /// `starting`: the hub's start of it and the runner's are both under way, so the
+    /// reconciliation leaves it alone. When the runner answers at last (here a failure: the idle
+    /// runner has no terminal runtime), the session ends.
+    #[test]
+    fn a_start_the_runner_has_not_answered_is_left_starting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            Store::open_with(
+                tmp.path().join("hub.db"),
+                StoreOptions::default(),
+                pitcrew_hub_work::projections(),
+            )
+            .unwrap(),
+        );
+        let workspace = Workspace {
+            id: WorkspaceId::new(),
+            name: "Lab".into(),
+        };
+        let work = Arc::new(WorkService::new(Arc::clone(&store), workspace.clone()));
+        let held = Arc::new(Held::default());
+        let runner = Runner::idle_with(
+            &tmp.path().join("runner"),
+            Some(Arc::clone(&held) as Arc<dyn pitcrew_runner::SessionEnv>),
+        );
+        let parts = runner.parts();
+        let lee = member(MemberKind::Human, "@lee", None);
+        let helper = member(MemberKind::Agent, "@helper", Some(lee.id));
+        let events: Vec<Event> = [
+            EventBody::MachineAdded {
+                machine: Machine {
+                    id: parts.machine,
+                    name: "PC".into(),
+                    kind: MachineKind::Local,
+                    info: None,
+                    liveness: Liveness::Live,
+                },
+            },
+            EventBody::MemberAdded {
+                member: lee.clone(),
+            },
+            EventBody::MemberAdded {
+                member: helper.clone(),
+            },
+        ]
+        .into_iter()
+        .map(|b| Event::now(workspace.id, lee.id, b))
+        .collect();
+        store.append(&events).unwrap();
+        let attached = Arc::new(Attached::with(parts.clone()));
+        let sessions = Arc::new(
+            Sessions::new(Arc::clone(&work), Arc::clone(&attached))
+                .with_command_timeout(Duration::from_millis(200)),
+        );
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Dropped before the runtime, even when an assertion fails.
+        let opens = Opens(Arc::clone(&held));
+        let folder = std::fs::canonicalize(tmp.path()).unwrap();
+        let body = serde_json::json!({
+            "machine": parts.machine,
+            "engine": "claude",
+            "cwd": folder.to_str().unwrap(),
+            "agent": helper.id,
+        });
+        let as_lee = Caller {
+            member: lee.id,
+            scope: TokenScope::Device,
+            on_behalf_of: None,
+        };
+        let answer = rt.block_on(start(
+            State(Arc::clone(&sessions)),
+            Authenticated(as_lee),
+            Body::from(body.to_string()),
+        ));
+        assert_eq!(code(&answer), "Unavailable");
+        assert!(held.waiting.load(std::sync::atomic::Ordering::SeqCst));
+        let stored = work
+            .sessions(&Default::default())
+            .unwrap()
+            .into_iter()
+            .find(|s| s.agent == Some(helper.id))
+            .unwrap();
+        assert_eq!(
+            stored.state,
+            SessionState::Starting,
+            "not ended: its start is under way"
+        );
+        assert!(attached.is_starting(stored.id));
+        assert_eq!(
+            parts.commands.started(stored.id),
+            pitcrew_runner::Started::Running
+        );
+
+        // The runner answers at last: it could not start it. The session ends.
+        drop(opens);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while work.session(&stored.id).unwrap().state != SessionState::Ended
+            || attached.is_starting(stored.id)
+        {
+            assert!(Instant::now() < deadline, "the session never ended");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         rt.block_on(runner.stop(Duration::from_secs(10)));
     }
 }

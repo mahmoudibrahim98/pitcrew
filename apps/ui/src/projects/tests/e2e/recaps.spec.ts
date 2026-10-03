@@ -153,7 +153,7 @@ for (const theme of ['light', 'dark'] as const) {
       await expect(days(page).getByRole('heading', { level: 4 }).first()).toHaveText('Submission');
       await days(page).getByRole('button', { name: '2 bursts of work', exact: true }).click();
       await expect(page.getByRole('list', { name: /^Bursts of work, / }).locator('[data-summary]')).toHaveCount(2);
-      await page.screenshot({ path: info.outputPath(`summary-${layout}-${theme}.png`), fullPage: true });
+      if (process.env.PITCREW_E2E_SCREENSHOTS === '1') await page.screenshot({ path: info.outputPath(`summary-${layout}-${theme}.png`), fullPage: true });
       expect(await axeViolations(page)).toEqual([]);
 
       // A clause's evidence, open.
@@ -161,7 +161,7 @@ for (const theme of ['light', 'dark'] as const) {
       await days(page).getByRole('button', { name: new RegExp(`^${name.replace(/[()+]/g, '\\$&')}, with evidence`) }).click();
       await expect(evidence(page, name)).toBeFocused();
       await expect(evidence(page, name).getByRole('list', { name: 'Files' })).toBeVisible();
-      await page.screenshot({ path: info.outputPath(`evidence-${layout}-${theme}.png`) });
+      if (process.env.PITCREW_E2E_SCREENSHOTS === '1') await page.screenshot({ path: info.outputPath(`evidence-${layout}-${theme}.png`) });
       expect(await axeViolations(page)).toEqual([]);
     });
   }

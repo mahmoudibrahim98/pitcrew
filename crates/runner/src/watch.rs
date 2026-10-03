@@ -36,7 +36,8 @@ use crate::link::{self, Locations, WorkstreamLocation};
 use crate::pages::Source;
 use crate::pages::Watched;
 use crate::sink::Batch;
-use crate::store::{Commit, Indexed, Row, Store, native_id, path_text};
+use crate::store::{self, Claim, Commit, Indexed, Row, Store, native_id, path_text};
+use crate::terminals::{RunnerTerminals, WeakTerminals};
 use notify::event::{EventKind, MetadataKind, ModifyKind};
 use notify::{RecursiveMode, Watcher as _};
 use pitcrew_interfaces::source::{Cursor, ParseChunk, SourceAdapter, SourceError, TranscriptRef};
@@ -118,6 +119,67 @@ pub(crate) enum Target {
 pub(crate) struct Shared {
     signals: Mutex<Signals>,
     cv: Condvar,
+    /// Starts for sessions the hub named whose terminal is not recorded yet (see [`Pending`]).
+    pending: Mutex<Vec<Pending>>,
+    /// Commands starting a session the hub named, from when they are run until they return: how
+    /// many for each session (see [`Shared::under_way`]).
+    under_way: Mutex<HashMap<SessionId, usize>>,
+    /// The terminals the runner's commands start CLIs in, once there are any: asked whether a
+    /// terminal's program still runs (see [`Shared::has_ended`]).
+    terminals: Mutex<Option<WeakTerminals>>,
+}
+
+/// Keeps a start for a session the hub named known as under way ([`Shared::under_way`]) until
+/// dropped.
+pub(crate) struct UnderWay<'a> {
+    shared: &'a Shared,
+    session: SessionId,
+}
+
+impl Drop for UnderWay<'_> {
+    fn drop(&mut self) {
+        let mut under_way = self
+            .shared
+            .under_way
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(n) = under_way.get_mut(&self.session) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                under_way.remove(&self.session);
+            }
+        }
+    }
+}
+
+/// A start for a session the hub named, from just before its program starts until its terminal
+/// is recorded in the index. A CLI may write its transcript in between, and the watcher find it
+/// then: it still takes the name (and its terminal is linked when it is recorded).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Pending {
+    pub session: SessionId,
+    pub engine: Engine,
+    /// The CLI's id, when the runner chose it (Claude's `--session-id`); else it is matched by
+    /// folder and start time, as a recorded terminal is.
+    pub native_id: Option<String>,
+    pub cwd: String,
+    pub started_at: TimestampMs,
+}
+
+/// Keeps a [`Pending`] start known to the watcher until dropped.
+pub(crate) struct Starting<'a> {
+    shared: &'a Shared,
+    session: SessionId,
+}
+
+impl Drop for Starting<'_> {
+    fn drop(&mut self) {
+        self.shared
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|p| p.session != self.session);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -138,6 +200,9 @@ struct Signals {
     signals_warned_at: Option<Instant>,
     /// Workstream locations changed: link every session again.
     relink: bool,
+    /// An exited terminal gets one final discovery before it stops accepting transcripts.
+    exit_scans: Vec<(TerminalId, SyncSender<bool>)>,
+    exhausted: HashSet<TerminalId>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -205,6 +270,25 @@ impl Shared {
         self.cv.notify_one();
     }
 
+    /// Waits for the watcher to match transcripts already written by an exited CLI. No index
+    /// or runtime lock may be held while waiting. A failed scan must not retire the terminal.
+    pub fn scan_exit(&self, terminal: TerminalId) -> bool {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        {
+            let mut s = self.lock();
+            if s.exhausted.contains(&terminal) {
+                return true;
+            }
+            if s.stop {
+                return false;
+            }
+            s.exit_scans.push((terminal, tx));
+            s.rediscover_at = Some(Instant::now());
+        }
+        self.cv.notify_one();
+        rx.recv_timeout(Duration::from_secs(30)).unwrap_or(false)
+    }
+
     /// Hands a reported state to the watcher. It never blocks: a hook must not wait. When too
     /// many wait, the sender with the most waiting loses its oldest, so a flood from one sender
     /// costs only that sender.
@@ -239,6 +323,93 @@ impl Shared {
 
     fn stopping(&self) -> bool {
         self.lock().stop
+    }
+
+    /// A start for a session the hub named is under way: until the guard is dropped (once its
+    /// terminal is recorded), a transcript that matches it takes its session.
+    pub fn starting(&self, pending: Pending) -> Starting<'_> {
+        let session = pending.session;
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(pending);
+        Starting {
+            shared: self,
+            session,
+        }
+    }
+
+    /// A command starting `session`, a session the hub named, runs: until the guard is dropped
+    /// (when the command returns, its terminal recorded or the start refused), the session's
+    /// start is under way, and `RunnerCommands::started` answers it as running.
+    pub fn under_way(&self, session: SessionId) -> UnderWay<'_> {
+        *self
+            .under_way
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(session)
+            .or_insert(0) += 1;
+        UnderWay {
+            shared: self,
+            session,
+        }
+    }
+
+    /// Whether a command starting `session` runs now.
+    pub fn is_under_way(&self, session: SessionId) -> bool {
+        self.under_way
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&session)
+    }
+
+    /// The runner's commands start CLIs in `terminals`: [`Shared::has_ended`] asks them.
+    pub fn set_terminals(&self, terminals: &RunnerTerminals) {
+        *self
+            .terminals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(terminals.downgrade());
+    }
+
+    /// Whether `terminal`'s program has certainly ended: its runtime says so, or no longer has
+    /// it. False while it runs, and when that cannot be told (no terminals yet, or a runtime that
+    /// does not answer). Blocking: it asks the runtime, for at most its call timeout.
+    pub fn has_ended(&self, terminal: TerminalId) -> bool {
+        let terminals = self
+            .terminals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(WeakTerminals::upgrade);
+        terminals.is_some_and(|t| t.has_ended(terminal))
+    }
+
+    /// The session of a start under way whose CLI is `native` (an id the runner chose), or that
+    /// started in `cwd` no later than `started` (with [`store::CLAIM_SLACK_MS`] of slack).
+    fn pending_session(
+        &self,
+        engine: Engine,
+        native: &str,
+        cwd: Option<&str>,
+        started: Option<TimestampMs>,
+    ) -> Option<SessionId> {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending
+            .iter()
+            .filter(|p| p.engine == engine)
+            .find(|p| match &p.native_id {
+                Some(id) => !native.is_empty() && id == native,
+                None => {
+                    cwd.is_some_and(|c| store::same_dir(c, &p.cwd))
+                        && started.is_some_and(|s| {
+                            s >= p.started_at.saturating_sub(store::CLAIM_SLACK_MS)
+                        })
+                }
+            })
+            .map(|p| p.session)
     }
 }
 
@@ -874,6 +1045,7 @@ impl Watcher {
                     look,
                     reports: s.reports.drain(..).collect(),
                     relink: std::mem::take(&mut s.relink),
+                    exit_scans: std::mem::take(&mut s.exit_scans),
                 });
             }
             s = shared
@@ -941,8 +1113,90 @@ impl Watcher {
                 t.next_poll = after(Instant::now(), t.poll_every);
             }
         }
+        if !wake.exit_scans.is_empty() {
+            for (terminal, reply) in wake.exit_scans {
+                let closed = self.exit_scan_complete(terminal)
+                    && self.store_lock().close_folder_claim(terminal).is_ok();
+                if closed {
+                    self.shared.lock().exhausted.insert(terminal);
+                }
+                let _ = reply.send(closed);
+            }
+        }
         self.let_go();
         Ok(())
+    }
+
+    /// Only this terminal's engine and possible transcripts can hold its final scan open.
+    fn exit_scan_complete(&mut self, terminal: TerminalId) -> bool {
+        let terminals = match self.store_lock().terminals() {
+            Ok(terminals) => terminals,
+            Err(e) => {
+                tracing::warn!(%terminal, error = %e, "cannot look up the terminal's final scan");
+                return false;
+            }
+        };
+        let Some(terminal) = terminals.into_iter().find(|t| t.terminal == terminal) else {
+            return true;
+        };
+        let Some(engine) = terminal.engine else {
+            return true;
+        };
+        if self
+            .homes
+            .iter()
+            .any(|h| h.engine == engine && h.discover_failing)
+        {
+            return false;
+        }
+        let unread: Vec<u64> = self
+            .tracked
+            .iter()
+            .filter(|(_, t)| t.engine == engine && !t.discovered && !t.subagent)
+            .map(|(id, _)| *id)
+            .collect();
+        let now = crate::now_ms();
+        for id in unread {
+            if !self.load(id) {
+                return false;
+            }
+            let Some(t) = self.tracked.get_mut(&id) else {
+                return false;
+            };
+            let caught_up = t.caught_up;
+            let Some(row) = t.row() else {
+                return false;
+            };
+            if terminal.session == Some(row.session) {
+                return false;
+            }
+            let native = native_id(row);
+            if let Some(expected) = &terminal.native_id {
+                if *expected == native {
+                    return false;
+                }
+                continue;
+            }
+            // A successful read with no metadata cannot be claimed by folder. A failed or
+            // unfinished read may still reveal this terminal's folder on the next attempt.
+            let Some(meta) = &row.meta else {
+                if !caught_up {
+                    return false;
+                }
+                continue;
+            };
+            let found = store::Found {
+                session: row.session,
+                engine,
+                native_id: &native,
+                cwd: meta.cwd.as_deref(),
+                started: meta.started.unwrap_or(now),
+            };
+            if store::by_folder(&terminal, &found, now) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Checks every transcript of one home by size and mtime.
@@ -1153,10 +1407,15 @@ impl Watcher {
                 row
             }
             Ok(None) => {
-                let row = new_row(&TranscriptRef {
+                let mut row = new_row(&TranscriptRef {
                     path: canonical.clone(),
                     ..tref.clone()
                 });
+                if let Some(named) =
+                    self.named_session(tref.engine, &canonical, tref.inner_id.as_deref())
+                {
+                    row.session = named;
+                }
                 if let Err(e) = self.store_lock().insert(&row) {
                     tracing::error!(path = %row.path.display(), error = %e, "cannot index a transcript");
                     return Ok(());
@@ -1598,7 +1857,7 @@ impl Watcher {
         let Some(row) = t.row() else {
             return Ok(());
         };
-        let session = row.session;
+        let mut session = row.session;
         let place = |row: &Row| row.meta.as_ref().map(|m| (m.cwd.clone(), m.branch.clone()));
         let was = place(row);
         if let Some(meta) = chunk.meta {
@@ -1607,12 +1866,41 @@ impl Watcher {
         let first = !row.discovered;
         let moved = !first && place(row) != was;
         let cwd = row.meta.as_ref().and_then(|m| m.cwd.clone());
+        let engine = row.engine;
+        let native = native_id(row);
+        let subagent = row.meta.as_ref().is_some_and(|m| m.is_subagent);
+        let started = row.meta.as_ref().and_then(|m| m.started);
+
+        // The terminal the runner started a new session in, claimed before anything names the
+        // session: one started for a session the hub named makes the transcript adopt that id.
+        // So does such a start still under way (its terminal not recorded yet): the session is
+        // then reported without its terminal, which is linked when it is recorded.
+        let terminal = if first && !subagent {
+            let claim = self.claim_terminal(session, engine, &native, cwd.as_deref(), started);
+            let named = match claim {
+                Some(c) => c.adopted,
+                None => self
+                    .shared
+                    .pending_session(engine, &native, cwd.as_deref(), started)
+                    .filter(|named| *named != session && self.move_row(session, *named)),
+            };
+            if let Some(named) = named {
+                self.adopt(id, session, named);
+                session = named;
+            }
+            claim.map(|c| c.terminal)
+        } else {
+            None
+        };
+
+        let Some(row) = self.tracked.get_mut(&id).and_then(Tracked::row) else {
+            return Ok(());
+        };
         let ctx = derive::Ctx {
             session,
             cwd: cwd.as_deref(),
             emit_states: !first,
         };
-
         let mut derived: Vec<Derived> = Vec::new();
         let mut seen: HashMap<u64, u32> = HashMap::new();
         for item in &chunk.items {
@@ -1629,29 +1917,20 @@ impl Watcher {
                 derived.truncate(before);
             }
         }
-        let engine = row.engine;
-        let native = native_id(row);
-        let subagent = row.meta.as_ref().is_some_and(|m| m.is_subagent);
-        let started = row.meta.as_ref().and_then(|m| m.started);
         self.map_native(id, session, engine, &native, subagent, first);
 
-        // Facts from elsewhere: the parent of a sub-agent, the terminal the runner started the
-        // session in, hooks that came before the transcript, and workstream locations.
-        let (parent, terminal, held) = if first {
+        // Facts from elsewhere: the parent of a sub-agent, hooks that came before the transcript,
+        // and workstream locations.
+        let (parent, held) = if first {
             let parent = if subagent {
                 self.parent_of(engine, &path, home)
             } else {
                 Ok(Parent::None)
             };
-            let terminal = if subagent {
-                None
-            } else {
-                self.claim_terminal(session, engine, &native, cwd.as_deref(), started)
-            };
             let held = self.allowed_held(session, parent, engine, &native);
-            (parent, terminal, held)
+            (parent, held)
         } else {
-            (Ok(Parent::None), None, Vec::new())
+            (Ok(Parent::None), Vec::new())
         };
         let places = (first || moved).then(|| self.places(session)).flatten();
 
@@ -2076,17 +2355,23 @@ impl Watcher {
         {
             return Ok(Parent::Session(t.session));
         }
-        let store = self.store_lock();
-        match store.find(&parent, None) {
+        let found = self.store_lock().find(&parent, None);
+        match found {
             Ok(Some(row)) => Ok(Parent::Session(row.session)),
             Ok(None) => {
-                let row = new_row(&TranscriptRef {
+                // A parent started for a session the hub named is that session already.
+                let named = self.named_session(engine, &parent, None);
+                let mut row = new_row(&TranscriptRef {
                     engine,
                     path: parent,
                     inner_id: None,
                     size: 0,
                     modified: 0,
                 });
+                if let Some(named) = named {
+                    row.session = named;
+                }
+                let store = self.store_lock();
                 match store.insert(&row) {
                     Ok(()) => Ok(Parent::Session(row.session)),
                     Err(e) => {
@@ -2102,7 +2387,11 @@ impl Watcher {
         }
     }
 
-    /// The terminal the runner started a newly discovered session in, if it did.
+    /// The terminal the runner started a newly discovered session in, if it did, and the session
+    /// the hub named for it, which the transcript then adopts (its row is moved in the index).
+    ///
+    /// An exited terminal can still own an unread transcript. It stops accepting folder matches
+    /// only after its final scan has completed; the runtime is asked without the index locked.
     fn claim_terminal(
         &self,
         session: SessionId,
@@ -2110,14 +2399,88 @@ impl Watcher {
         native: &str,
         cwd: Option<&str>,
         started: Option<TimestampMs>,
-    ) -> Option<TerminalId> {
+    ) -> Option<Claim> {
         let now = crate::now_ms();
+        let found = store::Found {
+            session,
+            engine,
+            native_id: native,
+            cwd,
+            started: started.unwrap_or(now),
+        };
+        let candidates = self
+            .store_lock()
+            .folder_candidates(&found, now)
+            .unwrap_or_else(|e| {
+                tracing::warn!(%session, error = %e, "cannot look up the terminals started in the session's folder");
+                Vec::new()
+            });
+        let ended: Vec<TerminalId> = candidates
+            .into_iter()
+            .filter(|t| self.shared.has_ended(*t) && self.shared.lock().exhausted.contains(t))
+            .collect();
+        if !ended.is_empty() {
+            tracing::debug!(%session, ?ended, "terminals in the folder whose program ended are not matched");
+        }
         self.store_lock()
-            .claim_terminal(session, engine, native, cwd, started.unwrap_or(now), now)
+            .claim_terminal(&found, now, &ended)
             .unwrap_or_else(|e| {
                 tracing::warn!(%session, error = %e, "cannot look up the session's terminal");
                 None
             })
+    }
+
+    /// Transcript `id`, found as `from`, adopts `to`, the session the hub named for the terminal
+    /// it runs in (the index has moved its row): everything that finds it by session follows. No
+    /// event has named `from`: this happens at its discovery.
+    fn adopt(&mut self, id: u64, from: SessionId, to: SessionId) {
+        tracing::debug!(%from, %to, "a new transcript takes the session the hub named for its terminal");
+        if let Some(t) = self.tracked.get_mut(&id) {
+            t.session = to;
+            if let Some(row) = t.row() {
+                row.session = to;
+            }
+        }
+        if self.by_session.get(&from) == Some(&id) {
+            self.by_session.remove(&from);
+        }
+        self.by_session.insert(to, id);
+        self.watched.rekey(from, to);
+    }
+
+    /// The session a transcript not indexed yet takes: the one the hub named for a terminal the
+    /// runner started (or is starting) with the CLI id the transcript is named by (Claude's
+    /// `<id>.jsonl`, from its `--session-id`), if one waits; else none, and it gets a new one.
+    fn named_session(
+        &self,
+        engine: Engine,
+        path: &Path,
+        inner_id: Option<&str>,
+    ) -> Option<SessionId> {
+        let native = match inner_id {
+            Some(inner) => inner.to_owned(),
+            None => path.file_stem()?.to_str()?.to_owned(),
+        };
+        let recorded = self
+            .store_lock()
+            .named_session(engine, &native)
+            .unwrap_or_else(|e| {
+                tracing::warn!(path = %path.display(), error = %e, "cannot look up a session the hub named; the transcript gets an id of its own");
+                None
+            });
+        recorded.or_else(|| self.shared.pending_session(engine, &native, None, None))
+    }
+
+    /// Moves the index's row of a transcript found as `from` to `to`, a session the hub named
+    /// whose start is under way. False (logged) if it cannot.
+    fn move_row(&self, from: SessionId, to: SessionId) -> bool {
+        match self.store_lock().move_row(from, to) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(%from, %to, error = %e, "cannot give a transcript the session the hub named; it keeps its own");
+                false
+            }
+        }
     }
 
     fn store_lock(&self) -> MutexGuard<'_, Store> {
@@ -2137,6 +2500,7 @@ struct Wake {
     look: bool,
     reports: Vec<Signal>,
     relink: bool,
+    exit_scans: Vec<(TerminalId, SyncSender<bool>)>,
 }
 
 /// Whether a home is polled, and whether it is slow (a network filesystem, swept and rediscovered

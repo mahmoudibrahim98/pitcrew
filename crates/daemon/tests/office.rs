@@ -2,9 +2,10 @@
 //! dispatch, an action the hub refuses, a restart that runs a range again, and the `project=` and
 //! `workstream=` activity filters.
 //!
-//! The runner link is not wired in yet, so a dispatch's end is appended to the store from the test,
-//! as that link will report it; the daemon looks at it with its next append (a comment through the
-//! API here) or at its next start.
+//! A dispatch's end is appended to the store from the test, as another writer would (the hub
+//! itself finishes a dispatch as succeeded together with the agent's move to review, so the
+//! office's rule only meets a task still in progress after such an end); the daemon looks at it
+//! with its next append (a comment through the API here) or at its next start.
 
 #![allow(clippy::unwrap_used)]
 
@@ -457,7 +458,7 @@ fn activity_filters_by_project_and_workstream_through_the_index() {
     assert_eq!(unknown.status, 200);
     assert_eq!(
         unknown.json(),
-        json!({ "events": [], "from_rev": 0, "to_rev": 0, "at_start": true })
+        json!({ "events": [], "revisions": [], "from_rev": 0, "to_rev": 0, "at_start": true })
     );
     let malformed = daemon.get("/v1/events?workstream=nope", Some(&device));
     assert_eq!(malformed.status, 400);

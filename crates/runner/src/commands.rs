@@ -3,19 +3,35 @@
 //! - **Idempotent by `CommandId`:** an outcome is saved in the runner's index before `run`
 //!   returns, and a command id seen again (also after a restart, for a week) returns that outcome
 //!   without running anything. The same id sent twice at once runs once; the second call waits.
-//! - **Starting a session** starts its CLI in a new terminal. The runner learns the session's id
+//! - **Starting a session** starts its CLI in a new terminal. The runner learns the CLI's own id
 //!   only when its transcript appears; the terminal is then linked to it, and its
 //!   `session_discovered` names the terminal. Claude is started with a session id chosen here, so
 //!   the match is exact; other CLIs are matched by folder and start time.
+//! - **A session the hub named** (`StartSession`'s `session`, a dispatch's): the terminal is that
+//!   session's from the start (text, keys and ends reach it at once), and the CLI's transcript
+//!   **adopts** the id instead of getting one of its own (see `watch`): Claude's by the id it was
+//!   started with, the others' by folder and start time. The CLI gets the environment the
+//!   [`SessionEnv`] gives it (an agent token's file). A session this runner already knows is not
+//!   started again. Two CLIs matched by folder that wait for their transcripts in one folder
+//!   cannot be told apart, so a start there is refused while one waits (inside the claim window,
+//!   its program still running) when either of them is for a named session. A terminal there
+//!   whose program ended without a transcript is retired after a final scan at such a start (forgotten:
+//!   it will write no transcript, and none is taken for it), and the watcher's folder match skips
+//!   it meanwhile.
+//! - **Where a named session stands** ([`RunnerCommands::started`]), for the hub's
+//!   reconciliation: a start still under way (from the moment its command is run until it
+//!   returns) is running, never gone; and [`RunnerCommands::retire`] forgets the terminal of one
+//!   the hub gave up on, once its program has ended.
 //! - Text, keys, interrupts and ends go to the session's terminal. Ending a session reports it
 //!   ended (`session_state_changed` and `session_ended`) at once.
 
 use crate::config::EngineHome;
 use crate::derive::Reported;
 use crate::plain;
-use crate::store::TerminalRow;
+use crate::session_env::SessionEnv;
+use crate::store::{CLAIM_WINDOW_MS, StoreError, TerminalRow};
 use crate::terminals::RunnerTerminals;
-use crate::watch::{Origin, Shared, Signal, Target};
+use crate::watch::{Origin, Pending, Shared, Signal, Target};
 use pitcrew_api::terminal::TerminalError;
 use pitcrew_interfaces::runtime::StartSpec;
 use pitcrew_protocol::ids::{CommandId, SessionId, TerminalId};
@@ -61,9 +77,34 @@ struct Inner {
     terminals: RunnerTerminals,
     shared: Arc<Shared>,
     homes: Vec<EngineHome>,
+    session_env: Option<Arc<dyn SessionEnv>>,
     options: CommandOptions,
     running: Mutex<HashSet<CommandId>>,
     done: Condvar,
+    /// Held by a start of a CLI matched by folder, from its check of the folder until its
+    /// terminal is recorded, so two such starts cannot both find the folder free.
+    by_folder: Mutex<()>,
+}
+
+/// Where a session the hub named for a start stands on this runner ([`RunnerCommands::started`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Started {
+    /// Its transcript is indexed under it and its terminal runs: the runner reports it.
+    Reported,
+    /// Its transcript is indexed, but its terminal's program has exited or disappeared.
+    Exited,
+    /// Its start is under way (its command has not returned), or its terminal's program runs and
+    /// its transcript has not been found yet.
+    Running,
+    /// Its terminal's program runs, but it is matched by folder (Codex, OpenCode) and its
+    /// transcript did not appear within the claim window (15 minutes) of its start: no transcript
+    /// can be taken for it any more.
+    TooLate,
+    /// Neither: this runner never started it (or forgot it), or its program ended before its
+    /// transcript was found.
+    Gone,
+    /// Cannot tell now: the index or the runtime did not answer.
+    Unknown(String),
 }
 
 impl fmt::Debug for RunnerCommands {
@@ -79,24 +120,125 @@ impl RunnerCommands {
         terminals: RunnerTerminals,
         shared: Arc<Shared>,
         homes: Vec<EngineHome>,
+        session_env: Option<Arc<dyn SessionEnv>>,
         options: CommandOptions,
     ) -> Self {
+        shared.set_terminals(&terminals);
         Self {
             inner: Arc::new(Inner {
                 terminals,
                 shared,
                 homes,
+                session_env,
                 options,
                 running: Mutex::new(HashSet::new()),
                 done: Condvar::new(),
+                by_folder: Mutex::new(()),
             }),
         }
+    }
+
+    /// Where `session`, one the hub named for a start, stands here: reported (its transcript is
+    /// indexed under it), running (its start is under way, or its terminal's program runs and the
+    /// transcript is not found yet), too late (matched by folder, and past the claim window),
+    /// exited (its transcript is indexed but its terminal ended), gone, or unknown. For the hub's reconciliation of the sessions it stored before their CLI
+    /// started. Blocking: it may ask the runtime about the terminal.
+    pub fn started(&self, session: SessionId) -> Started {
+        // First: a start that returns meanwhile has recorded its terminal by then.
+        if self.inner.shared.is_under_way(session) {
+            return Started::Running;
+        }
+        let terminals = &self.inner.terminals;
+        let known = {
+            let store = terminals.store();
+            store
+                .has_session(session)
+                .and_then(|reported| Ok((reported, store.terminal_of(session)?)))
+        };
+        let (reported, row) = match known {
+            // Imported transcripts have no runner-started terminal to observe.
+            Ok((true, None)) => return Started::Reported,
+            Ok((false, None)) => return Started::Gone,
+            Ok((reported, Some(t))) => (reported, t),
+            Err(e) => return Started::Unknown(e.to_string()),
+        };
+        match terminals.info(row.terminal) {
+            Ok(info) if info.alive => {
+                if reported {
+                    return Started::Reported;
+                }
+                let window_over = crate::now_ms().saturating_sub(row.started_at) > CLAIM_WINDOW_MS;
+                if row.native_id.is_none() && window_over {
+                    Started::TooLate
+                } else {
+                    Started::Running
+                }
+            }
+            Ok(_) | Err(TerminalError::NotFound(_)) => {
+                if reported {
+                    return Started::Exited;
+                }
+                if !self.inner.shared.scan_exit(row.terminal) {
+                    return Started::Unknown(
+                        "the exited CLI's final transcript scan has not completed".into(),
+                    );
+                }
+                match terminals.store().has_session(session) {
+                    Ok(true) => Started::Reported,
+                    Ok(false) => Started::Gone,
+                    Err(e) => Started::Unknown(e.to_string()),
+                }
+            }
+            Err(e) => Started::Unknown(e.to_string()),
+        }
+    }
+
+    /// Forgets the terminal of `session`, one the hub named and has given up on, if its
+    /// transcript was never found and its program has ended: no transcript is taken for it
+    /// afterwards, by its CLI's id or by folder. A terminal whose program still runs is kept (it
+    /// is the session's still, for a person to end). True if one was forgotten.
+    ///
+    /// # Errors
+    ///
+    /// The runner's index cannot be read or written.
+    pub fn retire(&self, session: SessionId) -> Result<bool, StoreError> {
+        let terminals = &self.inner.terminals;
+        let row = {
+            let store = terminals.store();
+            if store.has_session(session)? {
+                return Ok(false);
+            }
+            store.terminal_of(session)?
+        };
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        if !terminals.has_ended(row.terminal) {
+            return Ok(false);
+        }
+        if !self.inner.shared.scan_exit(row.terminal) {
+            return Ok(false);
+        }
+        if terminals.store().has_session(session)? {
+            return Ok(false);
+        }
+        terminals.store().forget_terminal(row.terminal)?;
+        tracing::debug!(%session, terminal = %row.terminal, "retired the terminal of a session whose CLI ended before its transcript appeared");
+        Ok(true)
     }
 
     /// Runs a command once per id, and answers its outcome. Blocking: starting a program or
     /// ending one gracefully can take seconds.
     pub fn run(&self, id: CommandId, command: &RunnerCommand) -> CommandOutcome {
         let inner = &*self.inner;
+        // A start for a session the hub named is under way from now until this returns.
+        let _under_way = match command {
+            RunnerCommand::StartSession {
+                session: Some(session),
+                ..
+            } => Some(inner.shared.under_way(*session)),
+            _ => None,
+        };
         {
             let mut running = inner.running.lock().unwrap_or_else(PoisonError::into_inner);
             while running.contains(&id) {
@@ -135,6 +277,7 @@ impl RunnerCommands {
                 model,
                 account,
                 permission_mode,
+                session,
             } => self.start(&Launch {
                 engine: *engine,
                 cwd,
@@ -144,6 +287,7 @@ impl RunnerCommands {
                 account: account.as_deref(),
                 mode: *permission_mode,
                 resume: None,
+                session: *session,
             }),
             RunnerCommand::ResumeSession {
                 engine,
@@ -159,6 +303,7 @@ impl RunnerCommands {
                 account: None,
                 mode: PermissionMode::Default,
                 resume: Some(native_id),
+                session: None,
             }),
             RunnerCommand::SendText { session, text } => self.on_terminal(*session, |t, id| {
                 t.write(id, text.as_bytes().to_vec())?;
@@ -200,10 +345,28 @@ impl RunnerCommands {
         if !std::path::Path::new(launch.cwd).is_dir() {
             return rejected(format!("{} is not a folder on this machine.", launch.cwd));
         }
-        let env = match self.account_env(launch.engine, launch.account) {
+        if let Some(session) = launch.session {
+            match self.knows(session) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return rejected(format!(
+                        "Session {session} is already known to this runner; it is not started \
+                         again."
+                    ));
+                }
+                Err(e) => return failed(format!("cannot look up session {session}: {e}")),
+            }
+        }
+        let mut env = match self.account_env(launch.engine, launch.account) {
             Ok(env) => env,
             Err(reason) => return rejected(reason),
         };
+        if let (Some(session), Some(provider)) = (launch.session, &inner.session_env) {
+            match provider.env_for(session) {
+                Ok(more) => env.extend(more),
+                Err(reason) => return rejected(reason),
+            }
+        }
         // Claude takes the session id it should use; others are matched by folder.
         let native_id = match (launch.resume, launch.engine) {
             (Some(id), _) => Some(id.to_owned()),
@@ -214,7 +377,31 @@ impl RunnerCommands {
             Ok(spec) => spec,
             Err(reason) => return rejected(reason),
         };
+        // A CLI matched by folder: no other start may take the folder until this one's terminal
+        // is recorded.
+        let _by_folder = native_id.is_none().then(|| {
+            inner
+                .by_folder
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        });
+        if native_id.is_none()
+            && let Some(reason) = self.ambiguous(launch)
+        {
+            return rejected(reason);
+        }
         let started_at = crate::now_ms();
+        // Its CLI may write its transcript before the terminal is recorded below: the watcher
+        // gives it the session the hub named meanwhile too.
+        let _starting = launch.session.map(|session| {
+            inner.shared.starting(Pending {
+                session,
+                engine: launch.engine,
+                native_id: native_id.clone(),
+                cwd: launch.cwd.to_owned(),
+                started_at,
+            })
+        });
         let info = match inner.terminals.start(spec) {
             Ok(info) => info,
             Err(e) => return failed(e.to_string()),
@@ -222,9 +409,11 @@ impl RunnerCommands {
         if launch.mode == PermissionMode::BypassPermissions {
             tracing::warn!(terminal = %info.id, cwd = launch.cwd, engine = ?launch.engine, "started a session with permission prompts bypassed");
         }
-        // A resumed session may be indexed already: link it now.
-        let session = match launch.resume {
-            Some(id) => inner
+        // A resumed session may be indexed already: link it now. A named one is the terminal's
+        // from the start.
+        let session = match (launch.session, launch.resume) {
+            (Some(named), _) => Some(named),
+            (None, Some(id)) => inner
                 .terminals
                 .store()
                 .session_by_native(launch.engine, id)
@@ -232,7 +421,7 @@ impl RunnerCommands {
                     tracing::warn!(error = %e, "cannot look up the resumed session");
                     None
                 }),
-            None => None,
+            (None, None) => None,
         };
         let saved = inner.terminals.store().put_terminal(&TerminalRow {
             terminal: info.id,
@@ -257,6 +446,72 @@ impl RunnerCommands {
                 "session": session,
             })),
         }
+    }
+
+    /// Whether this runner knows `session` already: a transcript indexed under it, or a terminal.
+    fn knows(&self, session: SessionId) -> Result<bool, StoreError> {
+        let store = self.inner.terminals.store();
+        Ok(store.has_session(session)? || store.terminal_of(session)?.is_some())
+    }
+
+    /// Why a start of a CLI matched by folder (not Claude) could be taken for another, or the
+    /// other for it: a start in the same folder still waits for its transcript (inside the claim
+    /// window, its program running), and one of the two is for a session the hub named. Two
+    /// starts for no named session are left to the folder match, as before.
+    ///
+    /// A start there whose program has ended is scanned before retirement: a transcript already
+    /// written still adopts its session, but none written by this new start may take it.
+    fn ambiguous(&self, launch: &Launch<'_>) -> Option<String> {
+        let terminals = &self.inner.terminals;
+        let now = crate::now_ms();
+        let waiting = match terminals.store().waiting_in(launch.engine, launch.cwd, now) {
+            Ok(waiting) => waiting,
+            Err(e) => {
+                return Some(format!(
+                    "cannot look at the starts waiting in {}: {e}",
+                    launch.cwd
+                ));
+            }
+        };
+        let mut blocking = None;
+        for t in waiting {
+            match terminals.info(t.terminal) {
+                Ok(info) if info.alive => {
+                    if blocking.is_none() && (launch.session.is_some() || t.session.is_some()) {
+                        blocking = Some(t);
+                    }
+                }
+                Ok(_) | Err(TerminalError::NotFound(_)) => {
+                    if !self.inner.shared.scan_exit(t.terminal) {
+                        return Some(
+                            "The exited CLI's final transcript scan has not completed; try again."
+                                .into(),
+                        );
+                    }
+                    if t.session
+                        .is_some_and(|s| terminals.store().has_session(s).unwrap_or(true))
+                    {
+                        continue;
+                    }
+                    if let Err(e) = terminals.store().forget_terminal(t.terminal) {
+                        tracing::warn!(terminal = %t.terminal, error = %e, "cannot retire a terminal whose program ended");
+                    } else {
+                        tracing::debug!(terminal = %t.terminal, session = ?t.session, "retired a terminal whose program ended before its transcript appeared");
+                    }
+                }
+                // Cannot tell: neither blocks nor is retired.
+                Err(_) => {}
+            }
+        }
+        let blocking = blocking?;
+        let secs = (now.saturating_sub(blocking.started_at) / 1000).max(0);
+        Some(format!(
+            "Another {:?} session started in {} {secs} s ago has not written its transcript yet, \
+             and {:?} sessions are told apart only by folder and start time, so a second one \
+             started there now could be taken for it. Start this one once that one appears, or \
+             in another folder.",
+            launch.engine, launch.cwd, launch.engine
+        ))
     }
 
     /// The environment that selects an account home: one of the configured homes for the CLI.
@@ -322,6 +577,15 @@ impl RunnerCommands {
         };
         match ended {
             Ok(true) => {
+                let reported = match t.store().has_session(session) {
+                    Ok(reported) => reported,
+                    Err(e) => return failed(e.to_string()),
+                };
+                if !reported && !self.inner.shared.scan_exit(id) {
+                    return failed(
+                        "The CLI exited, but its final transcript scan has not completed.".into(),
+                    );
+                }
                 self.inner.shared.signal(Signal {
                     target: Target::Session(session),
                     report: Reported {
@@ -388,6 +652,8 @@ pub(crate) struct Launch<'a> {
     pub mode: PermissionMode,
     /// Resume this CLI session instead of starting a new one.
     pub resume: Option<&'a str>,
+    /// The session the hub named for it.
+    pub session: Option<SessionId>,
 }
 
 /// The program and arguments for a launch. `new_id` is the session id to give a new Claude
@@ -544,6 +810,72 @@ fn rejected(reason: String) -> CommandOutcome {
 mod tests {
     use super::*;
 
+    /// A start matched by folder (Codex, OpenCode) whose transcript has not appeared within the
+    /// claim window is too late: no transcript can be taken for it any more. One matched by its
+    /// id (Claude), or still inside the window, runs on.
+    #[test]
+    fn a_start_matched_by_folder_is_too_late_past_the_claim_window() {
+        use crate::store::Store;
+        use crate::terminals::TerminalOptions;
+        use pitcrew_interfaces::fake::FakeRuntime;
+        use pitcrew_interfaces::runtime::Runtime as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(Mutex::new(Store::open(dir.path()).expect("open")));
+        let runtime = Arc::new(FakeRuntime::default());
+        let terminals = RunnerTerminals::new(
+            Arc::clone(&runtime) as Arc<dyn pitcrew_interfaces::runtime::Runtime>,
+            Arc::clone(&store),
+            TerminalOptions::default(),
+        )
+        .expect("terminals");
+        let commands = RunnerCommands::new(
+            terminals,
+            Arc::new(Shared::default()),
+            Vec::new(),
+            None,
+            CommandOptions::default(),
+        );
+        let now = crate::now_ms();
+        let named = |engine: Engine, native_id: Option<&str>, started_at| {
+            let info = runtime
+                .start(&StartSpec {
+                    program: "codex".into(),
+                    args: Vec::new(),
+                    cwd: "/w".into(),
+                    env: Vec::new(),
+                    name: "w".into(),
+                    cols: 80,
+                    rows: 24,
+                })
+                .expect("start");
+            let session = SessionId::new();
+            store
+                .lock()
+                .expect("store")
+                .put_terminal(&TerminalRow {
+                    terminal: info.id,
+                    native_target: None,
+                    session: Some(session),
+                    engine: Some(engine),
+                    native_id: native_id.map(Into::into),
+                    cwd: "/w".into(),
+                    started_at,
+                })
+                .expect("put");
+            session
+        };
+        let past = now - CLAIM_WINDOW_MS - 60_000;
+        let late = named(Engine::Codex, None, past);
+        let fresh = named(Engine::OpenCode, None, now);
+        let by_id = named(Engine::Claude, Some("abc"), past);
+        assert_eq!(commands.started(late), Started::TooLate);
+        assert_eq!(commands.started(fresh), Started::Running);
+        assert_eq!(commands.started(by_id), Started::Running);
+        // Still running: not retired.
+        assert!(!commands.retire(late).expect("retire"));
+    }
+
     fn launch(engine: Engine, mode: PermissionMode) -> Launch<'static> {
         Launch {
             engine,
@@ -554,6 +886,7 @@ mod tests {
             account: None,
             mode,
             resume: None,
+            session: None,
         }
     }
 

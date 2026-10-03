@@ -1,12 +1,14 @@
 // A minimal page proving the data layer: projects, workstreams, open asks and live sessions from
 // the hub, and a move that comes back through the stream. Kept as a dev-only route (/dev/proof).
 
+import { WorkspaceName } from './workspace-name.tsx';
 import { Button, StatusPill, ThemeToggle, type Tone } from '../design/index.ts';
 import {
   ApiError,
   useAsks,
   useConnection,
   useGatewayWorkspaces,
+  useGatewayWorkspace,
   useMoveTask,
   useProjects,
   useSessions,
@@ -82,13 +84,14 @@ function Proof() {
   const sessions = useSessions();
   const asks = useAsks({ state: 'open' });
   const { status, problem } = useConnection();
+  const gateway = useGatewayWorkspace();
 
   const error = [workspace, projects, workstreams, tasks, sessions, asks].find((q) => q.error)?.error;
 
   return (
     <main className="mx-auto min-h-dvh max-w-5xl bg-bg px-6 py-8 text-ink">
       <header className="mb-6 flex items-center gap-3">
-        <h1 className="text-xl font-semibold">{workspace.data?.workspace.name ?? 'PitCrew'}</h1>
+        <h1 className="text-xl font-semibold"><WorkspaceName workspace={gateway ?? { name: workspace.data?.workspace.name ?? 'PitCrew' }} /></h1>
         <span data-testid="stream-status">
           {problem === 'unauthorized' ? (
             <StatusPill tone="risk">Token rejected</StatusPill>

@@ -167,6 +167,7 @@ type RecapScopeMap = {
 export const recapScopeMap: RecapScopeMap = {
   // Not activity: they change no recap (API v1, "Recaps", "Live updates").
   machine_added: () => 'excluded',
+  cursor_moved: () => 'excluded',
   machine_liveness: () => 'excluded',
   persona_saved: () => 'excluded',
   team_saved: () => 'excluded',
