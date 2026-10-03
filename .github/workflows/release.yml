@@ -200,6 +200,8 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
+          # Release inputs must not come from a package cache populated by another workflow.
+          package-manager-cache: false
 
       # The UI the app serves (apps/ui/dist). pnpm comes from the root package.json, by corepack.
       - name: The UI
