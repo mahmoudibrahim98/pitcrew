@@ -7,16 +7,18 @@ node tests/conformance/run.mjs mock
 node tests/conformance/run.mjs daemon
 ```
 
-Both commands run the same `api.test.mjs`. No npm dependency is needed. The daemon runner builds
+Both commands run the same `api.test.mjs` and `scan.test.mjs`. No npm dependency is needed. The daemon runner builds
 `pitcrewd` with the locked workspace dependencies, starts a seeded demo on an OS-assigned free
 loopback port, and reads its two private token files without printing them. Each runner creates
 an empty temporary home and cleans up its child process and directory even after test failures.
 The daemon runner deliberately refuses tmux via a regular file in place of its socket and points
 PTY startup at a missing executable, as daemon integration tests do. It never runs an agent or
-connects to a person's terminal. The demo watches no agent homes.
+connects to a person's terminal. The demo watches no agent homes, so its machine scan reports
+nothing; the runner passes `--scan-hold-ms 1500` so that a scan lasts long enough for the second
+one `scan.test.mjs` sends meanwhile to be refused.
 
 To run the suite against an existing **synthetic local demo server**, set these variables and use
-`node --test tests/conformance/api.test.mjs`:
+`node --test tests/conformance/api.test.mjs tests/conformance/scan.test.mjs`:
 
 - `PITCREW_CONFORMANCE_URL`: its loopback HTTP base URL;
 - `PITCREW_CONFORMANCE_PERSON`: device token;
@@ -35,6 +37,15 @@ to upgrade/auth/id/size refusals; it uses no real terminal. Session launch and c
 require a runtime and are not exercised by the shared runner; body and unknown-session refusals
 cover those routes. First-run successful setup is already covered by each server's own tests;
 this seeded suite checks setup conflict and agent refusal.
+
+`scan.test.mjs` covers `POST /v1/machines/{id}/scan` ("Machine scan") in a file of its own: no
+token, an unknown or query token and an agent token refused; an unknown machine `404`; another
+machine of the workspace `409`; the answer's frames (`application/x-ndjson`, `progress` from
+`scanned: 0`, ticks that only grow to `scanned == total`, one `done` last) and its report's shape
+and sums; and a second scan while one is under way `409`, the first still ending with its report.
+That last case needs the server's scan to last a moment: the mock's takes about a second, and a
+daemon needs `--scan-hold-ms`. It never reads a person's agent homes: the mock's report is
+synthetic, and the demo daemon watches none.
 
 See [MISMATCHES.md](MISMATCHES.md) for observed differences and ambiguities. Only the daemon
 runner loads `daemon-deviations.json`. A listed failure must raise exactly its recorded status
