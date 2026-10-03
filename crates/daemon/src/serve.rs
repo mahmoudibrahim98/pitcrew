@@ -914,6 +914,22 @@ mod tests {
         );
     }
 
+    /// The recap index keeps its blocks in `recaps.sqlite3` in the state directory, not in memory:
+    /// made when the index is built, gone with the hub.
+    #[test]
+    fn the_recap_blocks_are_in_the_state_directory_while_the_hub_lives() {
+        let (_tmp, state) = state();
+        let hub = open_with(&state, true, false, StoreOptions::default()).unwrap();
+        let file = state.root().join(RECAP_FILE);
+        assert!(!file.exists(), "made when the index is first built");
+        let rev = hub.work.sync_recaps().unwrap();
+        assert_eq!(rev, hub.store.latest_rev().unwrap());
+        assert!(file.is_file(), "{} is missing", file.display());
+        assert!(std::fs::metadata(&file).unwrap().len() > 0);
+        drop(hub);
+        assert!(!file.exists(), "removed with the hub");
+    }
+
     #[test]
     fn one_daemon_per_state_dir() {
         let (_tmp, state) = state();
