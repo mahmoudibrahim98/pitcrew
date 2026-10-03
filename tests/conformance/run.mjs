@@ -68,8 +68,10 @@ try {
     await mkdir(state, { mode: 0o700 });
     const refused = join(temporary, 'not-a-socket');
     await writeFile(refused, 'Synthetic runtime refusal\n');
+    // Where cargo put it: CARGO_TARGET_DIR when set (as parallel worktrees do), else target/.
+    const targetDir = process.env.CARGO_TARGET_DIR ? resolve(root, process.env.CARGO_TARGET_DIR) : join(root, 'target');
     daemon = spawn(
-      join(root, 'target/debug/pitcrewd'),
+      join(targetDir, 'debug', 'pitcrewd'),
       [
         '--state-dir',
         state,
