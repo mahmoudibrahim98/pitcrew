@@ -40,7 +40,7 @@ use pitcrew_ingest::claude::ClaudeAdapter;
 use pitcrew_ingest::codex::CodexAdapter;
 use pitcrew_ingest::opencode::OpenCodeAdapter;
 use pitcrew_interfaces::source::SourceAdapter;
-use pitcrew_protocol::ids::{MachineId, MemberId};
+use pitcrew_protocol::ids::{MachineId, MemberId, SessionId};
 use pitcrew_protocol::model::{Engine, MemberKind};
 use pitcrew_protocol::runner::Capability;
 use pitcrew_runner::{
@@ -48,8 +48,9 @@ use pitcrew_runner::{
     RunnerTranscripts, SessionEnv, StoreSink,
 };
 use pitcrew_store::Store;
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 /// What the routes use of a running runner.
@@ -76,11 +77,38 @@ pub struct Parts {
 /// once the workspace is set up), and never unset. Empty, the hub serves as with `--no-runner`.
 ///
 /// It also wakes the reconciliation of sessions the hub stored ahead of the runner
-/// ([`crate::dispatch::reconcile`]) when the runner attaches, and after each start of one.
+/// ([`crate::dispatch::reconcile`]) when the runner attaches, and after each start of one; and it
+/// knows which of those starts are under way here ([`Attached::starting`]), which the
+/// reconciliation leaves alone however long they take.
 #[derive(Debug, Default)]
 pub struct Attached {
     parts: OnceLock<Parts>,
     starts: tokio::sync::Notify,
+    /// Sessions whose start this hub is making: how many starts of each.
+    under_way: Mutex<HashMap<SessionId, usize>>,
+}
+
+/// A start of a session the hub stored, under way until dropped ([`Attached::starting`]).
+#[derive(Debug)]
+pub struct Starting {
+    attached: Arc<Attached>,
+    session: SessionId,
+}
+
+impl Drop for Starting {
+    fn drop(&mut self) {
+        let mut under_way = self
+            .attached
+            .under_way
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(n) = under_way.get_mut(&self.session) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                under_way.remove(&self.session);
+            }
+        }
+    }
 }
 
 impl Attached {
@@ -114,6 +142,31 @@ impl Attached {
     /// Waits for the next [`Attached::started`] (one that came while nothing waited counts).
     pub async fn next_start(&self) {
         self.starts.notified().await;
+    }
+
+    /// This hub starts the CLI of `session`, which it stored: until the guard is dropped (once
+    /// the runner has answered, however long that takes), the reconciliation does not take the
+    /// session for one whose CLI did not start. Take it before anything else of the start.
+    #[must_use]
+    pub fn starting(self: &Arc<Self>, session: SessionId) -> Starting {
+        *self
+            .under_way
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(session)
+            .or_insert(0) += 1;
+        Starting {
+            attached: Arc::clone(self),
+            session,
+        }
+    }
+
+    /// Whether this hub is starting `session`'s CLI now ([`Attached::starting`]).
+    pub fn is_starting(&self, session: SessionId) -> bool {
+        self.under_way
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&session)
     }
 }
 
@@ -150,6 +203,12 @@ impl Runner {
     /// `dir`.
     #[cfg(test)]
     pub fn idle(dir: &std::path::Path) -> Self {
+        Self::idle_with(dir, None)
+    }
+
+    /// [`Runner::idle`], whose CLIs for sessions the hub named get what `session_env` gives.
+    #[cfg(test)]
+    pub fn idle_with(dir: &std::path::Path, session_env: Option<Arc<dyn SessionEnv>>) -> Self {
         use pitcrew_protocol::events::Event;
         use pitcrew_protocol::ids::WorkspaceId;
         use pitcrew_runner::{EventSink, SinkError};
@@ -163,7 +222,10 @@ impl Runner {
         }
 
         let machine = MachineId::new();
-        let config = RunnerConfig::new(WorkspaceId::new(), machine, MemberId::new(), dir);
+        let mut config = RunnerConfig::new(WorkspaceId::new(), machine, MemberId::new(), dir);
+        if let Some(env) = session_env {
+            config = config.with_session_env(env);
+        }
         let handle = pitcrew_runner::start(config, Vec::new(), Arc::new(Nowhere))
             .expect("an idle runner starts");
         let parts = parts_of(&handle, machine, &TerminalRuntime::none(), false)

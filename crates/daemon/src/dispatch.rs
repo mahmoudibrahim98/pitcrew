@@ -20,18 +20,26 @@
 //!   directory, 0600) holding an **agent** token bound to that agent and its owner, minted once
 //!   and reused while it verifies as exactly that; and where this daemon listens
 //!   (`PITCREW_SOCKET`, `PITCREW_PIPE` or `PITCREW_URL`). Never the person's device token, and no
-//!   token in the environment itself. A session without an agent gets nothing; one whose agent
-//!   has no owner, or is not known, is not started.
+//!   token in the environment itself. **Nothing inherited wins over them:** the terminal runtime
+//!   passes the daemon's own environment on, and the CLI reads `PITCREW_TOKEN` before
+//!   `PITCREW_TOKEN_FILE`, and a platform's endpoint before `PITCREW_URL`; so `PITCREW_TOKEN` and
+//!   the endpoint variables this daemon does not listen on are set empty, which the CLI reads as
+//!   unset. A session without an agent gets nothing; one whose agent has no owner, or is not
+//!   known, is not started.
 //! - **Following** ([`FollowingSink`]): every batch the runner's `StoreSink` stores is handed to
 //!   `WorkService::follow_sessions`, which moves the dispatched task on the session's first
 //!   `working` and finishes the dispatch when its session ends (see hub-work's "Dispatch").
 //! - **Reconciling** ([`reconcile`]): at start, once the runner attaches, and after each start of
 //!   a session the hub stored ahead of the runner, the sessions on the runner's machine still
 //!   `starting` with no CLI id are looked at, then again with a growing pause (1 s up to a
-//!   minute) while any waits. One whose CLI runs, or whose transcript the runner has, is left to
-//!   be reported; one the runner has no terminal and no transcript for (a crash between the
-//!   dispatch and its start), or whose program ended before its transcript appeared, twice in a
-//!   row with a rescan between, is abandoned: its dispatch fails and it ends.
+//!   minute) while any waits. One whose start is under way (this hub is starting it,
+//!   [`Attached::starting`], or the runner's command for it has not returned), whose CLI runs, or
+//!   whose transcript the runner has, is left to be reported. One the runner has no terminal and
+//!   no transcript for (a crash between the dispatch and its start), or whose program ended
+//!   before its transcript appeared, twice in a row with a rescan between, is abandoned: its
+//!   dispatch fails, it ends, and the runner retires its terminal, so no later transcript is
+//!   taken for it. So is one matched by folder whose transcript did not appear within the
+//!   runner's claim window (15 minutes): none can be matched to it any more.
 
 use crate::agents::HubAgents;
 use crate::runner::{Attached, Parts};
@@ -43,7 +51,8 @@ use pitcrew_protocol::events::Event;
 use pitcrew_protocol::ids::{CommandId, MachineId, MemberId, SessionId};
 use pitcrew_protocol::runner::{CommandOutcome, RunnerCommand};
 use pitcrew_runner::{
-    EventSink, SessionAgent, SessionAgents as _, SessionEnv, SinkError, Started, StoreSink,
+    EventSink, RunnerCommands, SessionAgent, SessionAgents as _, SessionEnv, SinkError, Started,
+    StoreSink,
 };
 use std::collections::HashSet;
 use std::fmt;
@@ -57,6 +66,11 @@ const FIRST_LOOK: Duration = Duration::from_secs(1);
 const LONGEST_LOOK: Duration = Duration::from_secs(60);
 /// The reason an abandoned session's dispatch fails with.
 const DID_NOT_START: &str = "its CLI did not start here, or ended before its transcript appeared";
+/// The reason a session matched by folder whose transcript came too late fails with.
+const TOO_LATE: &str = "its transcript did not appear within 15 minutes of its start, so it can \
+                        no longer be told apart from another CLI's in its folder";
+/// The variables that say where a daemon listens; the CLI reads the platform's own first.
+const ENDPOINTS: [&str; 3] = ["PITCREW_SOCKET", "PITCREW_PIPE", "PITCREW_URL"];
 
 /// hub-work's `Dispatcher` over the runner attached in this process. See the [module docs](self).
 #[derive(Debug)]
@@ -96,6 +110,8 @@ impl Dispatcher for RunnerLink {
     }
 
     fn start(&self, request: &DispatchRequest) -> Result<(), DispatchError> {
+        // From here until the runner answers, the reconciliation leaves the session alone.
+        let _starting = self.attached.starting(request.session);
         let runner = self.runner(&request.machine)?;
         let folder = folder(&request.cwd).map_err(DispatchError::Rejected)?;
         let mut command = request.start_command();
@@ -241,9 +257,18 @@ impl SessionEnv for AgentEnv {
             .into_os_string()
             .into_string()
             .map_err(|_| "the state directory's path is not UTF-8".to_owned())?;
-        let mut env = vec![("PITCREW_TOKEN_FILE".to_owned(), file)];
-        if let Some((variable, value)) = self.endpoint.get() {
-            env.push(((*variable).to_owned(), value.clone()));
+        // Empty is unset to the CLI: an inherited token or endpoint must not win over these.
+        let mut env = vec![
+            ("PITCREW_TOKEN".to_owned(), String::new()),
+            ("PITCREW_TOKEN_FILE".to_owned(), file),
+        ];
+        let listening = self.endpoint.get();
+        for variable in ENDPOINTS {
+            let value = match listening {
+                Some((at, value)) if *at == variable => value.clone(),
+                _ => String::new(),
+            };
+            env.push((variable.to_owned(), value));
         }
         Ok(env)
     }
@@ -325,6 +350,34 @@ pub async fn reconcile(work: Weak<WorkService>, attached: Arc<Attached>) {
     }
 }
 
+/// What the reconciliation asks of the runner. [`pitcrew_runner::RunnerCommands`] here; tests
+/// stand in for it.
+trait Starts: Send + Sync + 'static {
+    /// Where `session` stands on the runner (`RunnerCommands::started`). Blocking.
+    fn started(&self, session: SessionId) -> Started;
+    /// Look for new transcripts now.
+    fn rescan(&self);
+    /// The hub gave up on `session`: forget its terminal if its program ended
+    /// (`RunnerCommands::retire`). Blocking.
+    fn retire(&self, session: SessionId);
+}
+
+impl Starts for RunnerCommands {
+    fn started(&self, session: SessionId) -> Started {
+        RunnerCommands::started(self, session)
+    }
+
+    fn rescan(&self) {
+        self.run(CommandId::new(), &RunnerCommand::Scan { roots: Vec::new() });
+    }
+
+    fn retire(&self, session: SessionId) {
+        if let Err(e) = RunnerCommands::retire(self, session) {
+            tracing::warn!(%session, error = %e, "cannot retire the terminal of a session whose CLI did not start");
+        }
+    }
+}
+
 /// One look: `None` once the work model is gone (the daemon stops); else whether a session still
 /// waits for its CLI. `gone` holds the sessions found gone at the last look.
 async fn look(
@@ -332,11 +385,22 @@ async fn look(
     attached: &Attached,
     gone: &mut HashSet<SessionId>,
 ) -> Option<bool> {
-    let work = work.upgrade()?;
     let Some(runner) = attached.get().cloned() else {
-        return Some(false);
+        return work.upgrade().map(|_| false);
     };
-    let machine = runner.machine;
+    let starts: Arc<dyn Starts> = Arc::new(runner.commands);
+    look_at(work, attached, runner.machine, &starts, gone).await
+}
+
+/// [`look`], at the sessions of `machine`, whose runner `starts` answers for.
+async fn look_at(
+    work: &Weak<WorkService>,
+    attached: &Attached,
+    machine: MachineId,
+    starts: &Arc<dyn Starts>,
+    gone: &mut HashSet<SessionId>,
+) -> Option<bool> {
+    let work = work.upgrade()?;
     let reading = Arc::clone(&work);
     let sessions =
         match tokio::task::spawn_blocking(move || reading.unreported_sessions(&machine)).await {
@@ -354,46 +418,62 @@ async fn look(
     let mut waiting = false;
     let mut rescan = false;
     for session in sessions {
-        let (commands, id) = (runner.commands.clone(), session.id);
-        let started = tokio::task::spawn_blocking(move || commands.started(id))
+        let id = session.id;
+        // This hub is starting it: however long the runner takes, it is not one that did not
+        // start. Asked again once the start returns.
+        if attached.is_starting(id) {
+            gone.remove(&id);
+            waiting = true;
+            continue;
+        }
+        let asking = Arc::clone(starts);
+        let started = tokio::task::spawn_blocking(move || asking.started(id))
             .await
             .unwrap_or_else(|e| Started::Unknown(e.to_string()));
-        match started {
-            Started::Gone if gone.remove(&id) => {
-                let abandoning = Arc::clone(&work);
-                let abandoned = tokio::task::spawn_blocking(move || {
-                    abandoning.abandon_session(&id, DID_NOT_START)
-                })
-                .await;
-                match abandoned {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        tracing::warn!(session = %id, error = %e, "cannot end a session whose CLI did not start")
-                    }
-                    Err(e) => {
-                        tracing::warn!(session = %id, error = %e, "ending a session whose CLI did not start failed")
-                    }
-                }
-            }
+        let reason = match started {
+            Started::Gone if gone.remove(&id) => DID_NOT_START,
+            Started::TooLate => TOO_LATE,
             Started::Gone => {
                 // Its transcript may be there, not found yet: looked for before the next look.
                 gone.insert(id);
                 waiting = true;
                 rescan = true;
+                continue;
             }
             // Reported: its re-statement is on its way to the store.
-            Started::Running | Started::Reported => waiting = true,
+            Started::Running | Started::Reported => {
+                gone.remove(&id);
+                waiting = true;
+                continue;
+            }
             Started::Unknown(why) => {
                 tracing::debug!(session = %id, why, "cannot tell yet whether a session's CLI started");
                 waiting = true;
+                continue;
+            }
+        };
+        let (abandoning, retiring) = (Arc::clone(&work), Arc::clone(starts));
+        let abandoned = tokio::task::spawn_blocking(move || {
+            let abandoned = abandoning.abandon_session(&id, reason);
+            if abandoned.is_ok() {
+                retiring.retire(id);
+            }
+            abandoned
+        })
+        .await;
+        match abandoned {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(session = %id, error = %e, "cannot end a session whose CLI did not start")
+            }
+            Err(e) => {
+                tracing::warn!(session = %id, error = %e, "ending a session whose CLI did not start failed")
             }
         }
     }
     if rescan {
-        let commands = runner.commands.clone();
-        drop(tokio::task::spawn_blocking(move || {
-            commands.run(CommandId::new(), &RunnerCommand::Scan { roots: Vec::new() })
-        }));
+        let starts = Arc::clone(starts);
+        drop(tokio::task::spawn_blocking(move || starts.rescan()));
     }
     Some(waiting)
 }
@@ -508,9 +588,26 @@ mod tests {
         let env = AgentEnv::new(&work, Arc::clone(&tokens), dir.clone());
 
         let first = env.env_for(mine.id).unwrap();
-        assert_eq!(first.len(), 1, "not listening yet: {first:?}");
-        assert_eq!(first[0].0, "PITCREW_TOKEN_FILE");
-        let file = PathBuf::from(&first[0].1);
+        let var = |env: &[(String, String)], name: &str| {
+            let values: Vec<&str> = env
+                .iter()
+                .filter(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+                .collect();
+            assert_eq!(values.len(), 1, "{name} once: {env:?}");
+            values[0].to_owned()
+        };
+        // Not listening yet: no endpoint, and none inherited either.
+        for name in [
+            "PITCREW_TOKEN",
+            "PITCREW_SOCKET",
+            "PITCREW_PIPE",
+            "PITCREW_URL",
+        ] {
+            assert_eq!(var(&first, name), "", "{name} is set empty: {first:?}");
+        }
+        assert_eq!(first.len(), 5, "{first:?}");
+        let file = PathBuf::from(var(&first, "PITCREW_TOKEN_FILE"));
         assert_eq!(file, dir.join(format!("{}.token", writer.id.0)));
         let token = read_token(&file).unwrap().unwrap();
         assert_ne!(token, device.expose());
@@ -531,18 +628,44 @@ mod tests {
         }
         assert!(first.iter().all(|(_, v)| !v.contains(&token)));
 
-        // Reused while it verifies; with where the daemon listens once it does.
+        // Reused while it verifies; with where the daemon listens once it does, and the other
+        // endpoints and the token variable still empty, so an inherited one never wins.
         env.listening("PITCREW_URL", "http://127.0.0.1:47317".into());
         let again = env.env_for(mine.id).unwrap();
-        assert_eq!(again[0], first[0]);
-        assert_eq!(read_token(&file).unwrap().unwrap(), token);
         assert_eq!(
-            again[1],
-            (
-                "PITCREW_URL".to_owned(),
-                "http://127.0.0.1:47317".to_owned()
-            )
+            var(&again, "PITCREW_TOKEN_FILE"),
+            var(&first, "PITCREW_TOKEN_FILE")
         );
+        assert_eq!(read_token(&file).unwrap().unwrap(), token);
+        assert_eq!(var(&again, "PITCREW_URL"), "http://127.0.0.1:47317");
+        for name in ["PITCREW_TOKEN", "PITCREW_SOCKET", "PITCREW_PIPE"] {
+            assert_eq!(var(&again, name), "", "{name}: {again:?}");
+        }
+        // As the CLI reads them, over an environment that already had others.
+        let inherited = [
+            ("PITCREW_TOKEN", device.expose().to_owned()),
+            ("PITCREW_SOCKET", "/home/sam/elsewhere".to_owned()),
+            ("PITCREW_PIPE", r"\\.\pipe\elsewhere".to_owned()),
+        ];
+        let seen = |name: &str| {
+            again
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.clone())
+                .or_else(|| {
+                    inherited
+                        .iter()
+                        .find(|(k, _)| *k == name)
+                        .map(|(_, v)| v.clone())
+                })
+                .map(std::ffi::OsString::from)
+        };
+        let read = pitcrew_cli::config::token_from_env(&seen).unwrap();
+        assert_eq!(read, token, "the agent's token, not the inherited one");
+        assert!(matches!(
+            pitcrew_cli::config::Endpoint::from_env(&seen).unwrap(),
+            pitcrew_cli::config::Endpoint::Tcp { .. }
+        ));
         assert_eq!(tokens.list().len(), 2, "the device's and one agent token");
         // A token that no longer verifies is replaced.
         std::fs::write(&file, "pc_not_a_token\n").unwrap();
@@ -632,5 +755,101 @@ mod tests {
         };
         assert_eq!(folder("~").unwrap(), checked.path);
         assert!(folder("relative").is_err());
+    }
+
+    /// Answers the reconciliation as told, and notes what it was asked.
+    #[derive(Debug, Default)]
+    struct Told {
+        answers: Mutex<std::collections::HashMap<SessionId, Started>>,
+        asked: Mutex<Vec<SessionId>>,
+        retired: Mutex<Vec<SessionId>>,
+    }
+
+    impl Starts for Told {
+        fn started(&self, session: SessionId) -> Started {
+            self.asked.lock().unwrap().push(session);
+            self.answers
+                .lock()
+                .unwrap()
+                .get(&session)
+                .cloned()
+                .unwrap_or(Started::Gone)
+        }
+        fn rescan(&self) {}
+        fn retire(&self, session: SessionId) {
+            self.retired.lock().unwrap().push(session);
+        }
+    }
+
+    /// The reconciliation never takes a start this hub is making for one whose CLI did not start,
+    /// however long the runner takes: it is not even asked about it. Once the start is over, a
+    /// session gone twice in a row (a runner answer between resets it) is abandoned, and its
+    /// terminal retired; one matched by folder past the claim window is abandoned at once.
+    #[test]
+    fn the_reconciliation_leaves_starts_under_way_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sam = member(MemberKind::Human, "@sam", None);
+        let writer = member(MemberKind::Agent, "@writer", Some(sam.id));
+        let machine = MachineId::new();
+        let on = |agent| Session {
+            machine,
+            ..session(agent)
+        };
+        let (held, late, lost, flaky) = (on(Some(writer.id)), on(None), on(None), on(None));
+        let work = work(tmp.path(), &[&sam, &writer], &[&held, &late, &lost, &flaky]);
+        let attached = Arc::new(Attached::default());
+        let told = Arc::new(Told::default());
+        told.answers
+            .lock()
+            .unwrap()
+            .insert(late.id, Started::TooLate);
+        let starts: Arc<dyn Starts> = told.clone();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let weak = Arc::downgrade(&work);
+        let mut gone = HashSet::new();
+        let mut look = || {
+            rt.block_on(look_at(&weak, &attached, machine, &starts, &mut gone))
+                .unwrap()
+        };
+        let state = |s: &Session| work.session(&s.id).unwrap().state;
+
+        let starting = attached.starting(held.id);
+        assert!(look(), "sessions wait");
+        assert_eq!(state(&late), SessionState::Ended, "too late: at once");
+        assert_eq!(state(&lost), SessionState::Starting, "gone once");
+        // A runner answer between two gones: not twice in a row.
+        told.answers
+            .lock()
+            .unwrap()
+            .insert(flaky.id, Started::Running);
+        assert!(look());
+        told.answers.lock().unwrap().remove(&flaky.id);
+        assert_eq!(state(&lost), SessionState::Ended, "gone twice");
+        assert!(look());
+        assert_eq!(state(&flaky), SessionState::Starting);
+        for _ in 0..3 {
+            assert!(look());
+        }
+        assert_eq!(state(&held), SessionState::Starting, "under way");
+        assert!(!told.asked.lock().unwrap().contains(&held.id));
+
+        // The start is over and its CLI did not start: gone twice, abandoned.
+        drop(starting);
+        assert!(look());
+        assert_eq!(state(&held), SessionState::Starting);
+        assert!(!look(), "nothing waits any more");
+        assert_eq!(state(&held), SessionState::Ended);
+        assert_eq!(state(&flaky), SessionState::Ended);
+        let mut retired = told.retired.lock().unwrap().clone();
+        retired.sort_unstable();
+        let mut abandoned = vec![held.id, late.id, lost.id, flaky.id];
+        abandoned.sort_unstable();
+        assert_eq!(
+            retired, abandoned,
+            "each abandoned session's terminal retired"
+        );
     }
 }
