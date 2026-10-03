@@ -22,7 +22,7 @@
         "scripts/ci/**", "scripts/*", ".cargo/**", ".vscode/**",
         "crates/protocol/**", "crates/interfaces/**", "crates/fixtures/**", "crates/daemon/**",
         "crates/store/migrations/00*", "crates/store/migrations/*.md",
-        "apps/mock-hub/**", "packages/tokens/**", "packages/protocol-ts/**",
+        "apps/mock-hub/**", "packages/tokens/**", "packages/protocol-ts/**", "tests/conformance/**",
         "docs/*.md", "docs/adr/**", "docs/build/**"
       ]
     },
