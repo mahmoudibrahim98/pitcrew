@@ -2,12 +2,25 @@
 //! store, in memory or in a file.
 //!
 //! - **One row a block**, its JSON as the body, with the links queries filter by (session,
-//!   workstream, project, and the tasks in a table of their own) and its start, for days. Ids are
-//!   16-byte big-endian blobs, so SQLite orders them as [`EventId`] does.
+//!   workstream, project, and the tasks in a table of their own), and its start and last event,
+//!   for days. Ids are 16-byte big-endian blobs, so SQLite orders them as [`EventId`] does.
+//! - **Days read bodies only to write a paragraph.** A day query reads its blocks' heads
+//!   ([`Head`]: place, workstream, last event) from an index that holds them, which is all a
+//!   cached paragraph needs to be checked; bodies are read and decoded only when their paragraph
+//!   is written again ([`BlockDb::bodies`]).
 //! - **A cache, never the truth.** The file is replaced whenever an index opens it, and removed
 //!   when the index is dropped: the blocks are derived from the log, which the index reads from
-//!   its start each time it is built (see [`crate::recap`]). A crash leaves a file that the next
-//!   start replaces, never one that is read again.
+//!   its start each time it is built (see [`crate::recap`]). A crash leaves a file that is never
+//!   read again; the next start on the same path replaces it.
+//! - **On a local disk.** A cache file asked for on a network filesystem (detected as the store
+//!   detects its own, `pitcrew_store::detect`) goes in a private folder of its own on a local disk
+//!   instead: in the temporary folder, or else the runtime directory (`$XDG_RUNTIME_DIR`); with
+//!   neither, the blocks stay in memory ([`BlockDb::local`]).
+//!   - On Unix the folder is named after the path asked for and the user, so the next start on
+//!     that path finds the folder a hard kill left behind (SIGKILL, the OOM killer, a power cut)
+//!     and replaces its file, as it would at the path asked for ([`OwnedFolder::make`]).
+//!   - On Windows, or when something else has that name, the folder's name is random: a hard kill
+//!     leaves it behind, private to the user, until the temporary folder is cleaned.
 //! - **Writes are all or nothing.** [`BlockDb::put`] writes one batch of changed blocks in one
 //!   transaction. A batch that fails leaves the database where it was, which is then behind the
 //!   index's engine: the index counts as broken, and is rebuilt (see [`crate::Recaps`]).
@@ -17,21 +30,25 @@
 
 use crate::error::{Result, WorkError};
 use crate::recap::BlockFilter;
-use pitcrew_protocol::ids::EventId;
+use pitcrew_protocol::ids::{EventId, WorkstreamId};
 use pitcrew_protocol::model::TimestampMs;
 use pitcrew_protocol::recap::Block;
 use pitcrew_store::sql::types::Value;
 use pitcrew_store::sql::{Connection, OptionalExtension, params, params_from_iter};
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
 /// The tables. Partial indexes, one per filter, so each query walks only its own blocks: by id
-/// for `GET /v1/recaps/blocks`, by `(start, id)` for days.
+/// for `GET /v1/recaps/blocks`, by `(start, id)` for days. The days' indexes also hold what a
+/// day query reads of a block before its body (its workstream and last event), so it reads them
+/// alone. `last` comes before `body` in the row, so reading it never walks a long body's pages.
 const SCHEMA: &str = "
 CREATE TABLE blocks (
     id BLOB NOT NULL PRIMARY KEY,
     start INTEGER NOT NULL,
+    last BLOB NOT NULL,
     session BLOB,
     workstream BLOB,
     project BLOB,
@@ -45,10 +62,11 @@ CREATE TABLE block_tasks (
 ) WITHOUT ROWID;
 CREATE INDEX blocks_session ON blocks (session, id) WHERE session IS NOT NULL;
 CREATE INDEX blocks_workstream ON blocks (workstream, id) WHERE workstream IS NOT NULL;
-CREATE INDEX blocks_workstream_days ON blocks (workstream, start, id)
+CREATE INDEX blocks_workstream_days ON blocks (workstream, start, id, last)
     WHERE workstream IS NOT NULL;
 CREATE INDEX blocks_project ON blocks (project, id) WHERE project IS NOT NULL;
-CREATE INDEX blocks_project_days ON blocks (project, start, id) WHERE project IS NOT NULL;
+CREATE INDEX blocks_project_days ON blocks (project, start, id, workstream, last)
+    WHERE project IS NOT NULL;
 ";
 
 /// The page cache of a file database, in KiB (SQLite's own default is 2,000).
@@ -73,11 +91,25 @@ impl Scope {
 /// A block's place among a scope's: its start, then its id.
 pub(crate) type Place = (TimestampMs, EventId);
 
+/// What a day query reads of a block before its body: enough to group it by day and workstream,
+/// and to tell whether a cached paragraph was written from it as it is now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Head {
+    pub id: EventId,
+    pub start: TimestampMs,
+    pub workstream: Option<WorkstreamId>,
+    /// Its last event: the block has changed when this has.
+    pub last: EventId,
+}
+
 /// The blocks of one recap index. See the [module docs](self).
 pub(crate) struct BlockDb {
     /// Declared before `file`, so the database is closed before its file is removed.
     conn: Connection,
+    /// Declared before `folder`, so the file is removed before its folder.
     _file: Option<OwnedFile>,
+    /// The private folder the file was put in, when its own was on a network filesystem.
+    _folder: Option<OwnedFolder>,
     /// Blocks stored.
     count: usize,
 }
@@ -102,6 +134,201 @@ impl Drop for OwnedFile {
             tracing::warn!(file = %self.0.display(), error = %e, "cannot remove the recap index's file");
         }
     }
+}
+
+/// A private folder for the recap file, which this process removes when dropped (once the file in
+/// it is gone).
+struct OwnedFolder(PathBuf);
+
+impl OwnedFolder {
+    /// A folder in `base` that only this user may open (0700 on Unix), for the recap file meant
+    /// for `key` (its path, with its folder made canonical).
+    ///
+    /// - **The base** must not let others rename or remove what is in it. On Unix it belongs to
+    ///   root or to this user, and is not writable by group or others unless sticky, as `/tmp` is
+    ///   ([`base_is_safe`]).
+    /// - **On Unix, a name of its own.** The folder is named after `key` and the user
+    ///   ([`stable_name`]), so the folder a hard kill left behind is found again at the next start
+    ///   on `key` and used again (its file is then replaced), rather than one more being left. One
+    ///   daemon runs on a state folder at a time, so a folder found at that name is a dead run's.
+    ///   It is used again only if it is a real folder (not a link), this user's, and 0700
+    ///   ([`left_by_us`]); with anything else there, or no `key`, the folder gets a new name no
+    ///   one can guess beforehand.
+    /// - **Elsewhere** (Windows) there is no owner or mode to check such a folder by, so the name
+    ///   is always new.
+    fn make(base: &Path, key: Option<&Path>) -> io::Result<Self> {
+        let meta = fs::metadata(base)?;
+        if !meta.is_dir() {
+            return Err(io::Error::other("not a folder"));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let me = effective_uid()?;
+            base_is_safe(meta.uid(), meta.mode(), me).map_err(io::Error::other)?;
+            if let Some(key) = key
+                && let Some(folder) = Self::named(&base.join(stable_name(key, me)), me)?
+            {
+                return Ok(folder);
+            }
+        }
+        // No name of its own off Unix (see above).
+        #[cfg(not(unix))]
+        let _ = key;
+        Self::create(&base.join(format!("pitcrew-recaps-{}", EventId::new().0)))
+    }
+
+    /// The folder at `path`, a name of its own: made if nothing is there, used again if it is
+    /// what a run that was killed left there ([`left_by_us`]), and `None` if something else is.
+    #[cfg(unix)]
+    fn named(path: &Path, me: u32) -> io::Result<Option<Self>> {
+        use std::os::unix::fs::MetadataExt as _;
+        match Self::create(path) {
+            Ok(folder) => return Ok(Some(folder)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        let found = fs::symlink_metadata(path)?;
+        match left_by_us(found.is_dir(), found.uid(), found.mode(), me) {
+            Ok(()) => {
+                tracing::info!(
+                    folder = %path.display(),
+                    "the recap index's private folder is still there from a run that did not end; \
+                     using it again"
+                );
+                Ok(Some(Self(path.to_path_buf())))
+            }
+            Err(why) => {
+                tracing::warn!(
+                    folder = %path.display(),
+                    why,
+                    "something else has the name of the recap index's private folder, so the \
+                     folder gets a new name"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// A new folder at `path`: `create` fails on anything already there, a link included. 0700 on
+    /// Unix, set explicitly so the umask cannot change it (a folder found again is checked for
+    /// exactly that).
+    fn create(path: &Path) -> io::Result<Self> {
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt as _;
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = fs::DirBuilder::new();
+        builder.create(path)?;
+        let folder = Self(path.to_path_buf());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&folder.0, fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(folder)
+    }
+}
+
+impl Drop for OwnedFolder {
+    fn drop(&mut self) {
+        if let Err(e) = fs::remove_dir(&self.0)
+            && e.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(folder = %self.0.display(), error = %e, "cannot remove the recap index's folder");
+        }
+    }
+}
+
+/// This process's effective user: the owner of a socket it makes, which the kernel gives the user
+/// it makes files as (Linux and macOS alike). `std` has no `geteuid`, and this crate takes no
+/// dependency for one.
+#[cfg(unix)]
+fn effective_uid() -> io::Result<u32> {
+    use std::os::unix::fs::MetadataExt as _;
+    let socket = std::os::unix::net::UnixDatagram::unbound()?;
+    let file = fs::File::from(std::os::fd::OwnedFd::from(socket));
+    Ok(file.metadata()?.uid())
+}
+
+/// Whether a folder owned by `uid`, with `mode`, may hold the private folder for `me`: it belongs
+/// to root or to `me` (the owner rule of `pitcrew_trust::check_trusted`), and others cannot rename
+/// or remove what is in it (not writable by group or others, unless sticky, as `/tmp` is).
+#[cfg(unix)]
+fn base_is_safe(uid: u32, mode: u32, me: u32) -> Result<(), String> {
+    if uid != 0 && uid != me {
+        return Err("it belongs to another user, neither root nor this one".into());
+    }
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Err(format!(
+            "others can change what is in it (mode {:o})",
+            mode & 0o7777
+        ));
+    }
+    Ok(())
+}
+
+/// Whether what is at the private folder's name of its own, as `lstat` shows it (a folder or not,
+/// its owner and mode), is the folder an earlier run of `me` made there ([`OwnedFolder::create`]):
+/// a real folder, not a link to one, owned by `me`, and 0700.
+#[cfg(unix)]
+fn left_by_us(is_dir: bool, uid: u32, mode: u32, me: u32) -> Result<(), String> {
+    if !is_dir {
+        return Err("it is not a folder (a link, or a file)".into());
+    }
+    if uid != me {
+        return Err("it belongs to another user".into());
+    }
+    if mode & 0o7777 != 0o700 {
+        return Err(format!("its mode is {:o}, not 700", mode & 0o7777));
+    }
+    Ok(())
+}
+
+/// The private folder's name of its own for the recap file meant for `key`, for the user `uid`:
+/// `pitcrew-recaps-` and 32 hex digits of a SHA-256 of both. The same path and user always give
+/// the same name.
+#[cfg(unix)]
+fn stable_name(key: &Path, uid: u32) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut hash = Sha256::new();
+    hash.update(b"pitcrew.recaps.folder.v1\0");
+    hash.update(uid.to_be_bytes());
+    hash.update(key.as_os_str().as_bytes());
+    let digest = hash.finalize();
+    let mut name = String::from("pitcrew-recaps-");
+    for byte in &digest[..16] {
+        let _ = write!(name, "{byte:02x}");
+    }
+    name
+}
+
+/// The folder a file at `path` is in (`.` for a bare name).
+fn folder_of(path: &Path) -> PathBuf {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
+/// Where a private folder for the recap file may be made, in order: the temporary folder, then
+/// the user's runtime directory (`$XDG_RUNTIME_DIR`, when set to an absolute path). The runtime
+/// directory is a `tmpfs`, held in memory and capped by logind, so the file there would spend the
+/// memory it is meant to save; it is for when the temporary folder cannot be used (on a network
+/// filesystem itself, say). Some systems put the temporary folder in memory too.
+fn local_bases() -> Vec<PathBuf> {
+    let mut bases = vec![std::env::temp_dir()];
+    bases.extend(
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|dir| dir.is_absolute()),
+    );
+    bases
 }
 
 impl BlockDb {
@@ -140,14 +367,85 @@ impl BlockDb {
         Self::init(conn, Some(owned))
     }
 
+    /// An empty database for a cache file meant for `path`, kept on a local disk: at `path` when
+    /// its folder is on one; when that is on a network filesystem (or one not recognised, as the
+    /// store treats it), in a private folder of its own in the temporary folder or else the
+    /// runtime directory ([`BlockDb::file`] there; on Unix the folder is named after `path` and
+    /// used again after a hard kill, see [`OwnedFolder::make`]); in memory when neither can be
+    /// had. Logs where it went when that is not `path`.
+    pub fn local(path: &Path) -> Result<Self> {
+        Self::local_with(
+            path,
+            &|dir: &Path| pitcrew_store::detect(dir).is_network(),
+            &local_bases(),
+        )
+    }
+
+    /// [`BlockDb::local`], with whether a folder is on a network filesystem (`network`) and where
+    /// a private folder may be made (`bases`, in order) given.
+    fn local_with(path: &Path, network: &dyn Fn(&Path) -> bool, bases: &[PathBuf]) -> Result<Self> {
+        if !network(&folder_of(path)) {
+            return Self::file(path);
+        }
+        let name = path
+            .file_name()
+            .unwrap_or_else(|| OsStr::new("recaps.sqlite3"));
+        // What the private folder is named after: the path asked for, its folder made canonical.
+        let key = fs::canonicalize(folder_of(path))
+            .ok()
+            .map(|folder| folder.join(name));
+        for base in bases {
+            if network(base) {
+                tracing::debug!(folder = %base.display(), "not a local disk, so not for the recap index's file");
+                continue;
+            }
+            let folder = match OwnedFolder::make(base, key.as_deref()) {
+                Ok(folder) => folder,
+                Err(e) => {
+                    tracing::debug!(folder = %base.display(), error = %e, "cannot make a private folder for the recap index's file there");
+                    continue;
+                }
+            };
+            let file = folder.0.join(name);
+            match Self::file(&file) {
+                Ok(mut db) => {
+                    tracing::info!(
+                        asked = %path.display(),
+                        file = %file.display(),
+                        "the recap index's file would be on a network filesystem, so it is in a \
+                         private folder on a local disk instead"
+                    );
+                    db._folder = Some(folder);
+                    return Ok(db);
+                }
+                Err(e) => {
+                    tracing::debug!(file = %file.display(), error = %e, "cannot make the recap index's file there");
+                }
+            }
+        }
+        tracing::warn!(
+            asked = %path.display(),
+            "the recap index's file would be on a network filesystem, and no private folder on a \
+             local disk could be made: the recap index keeps its blocks in memory"
+        );
+        Self::memory()
+    }
+
     fn init(conn: Connection, file: Option<OwnedFile>) -> Result<Self> {
         conn.pragma_update(None, "temp_store", "MEMORY")?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self {
             conn,
             _file: file,
+            _folder: None,
             count: 0,
         })
+    }
+
+    /// Whether the blocks are in a file (not in memory). For tests.
+    #[cfg(test)]
+    pub fn file_path(&self) -> Option<&Path> {
+        self._file.as_ref().map(|f| f.0.as_path())
     }
 
     /// How many blocks are stored.
@@ -166,12 +464,12 @@ impl BlockDb {
         {
             let mut old = tx.prepare_cached("SELECT tasks FROM blocks WHERE id = ?1")?;
             let mut insert = tx.prepare_cached(
-                "INSERT INTO blocks (id, start, session, workstream, project, tasks, body)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO blocks (id, start, last, session, workstream, project, tasks, body)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             )?;
             let mut update = tx.prepare_cached(
-                "UPDATE blocks SET start = ?2, session = ?3, workstream = ?4, project = ?5,
-                    tasks = ?6, body = ?7
+                "UPDATE blocks SET start = ?2, last = ?3, session = ?4, workstream = ?5,
+                    project = ?6, tasks = ?7, body = ?8
                  WHERE id = ?1",
             )?;
             let mut link =
@@ -180,6 +478,7 @@ impl BlockDb {
                 tx.prepare_cached("DELETE FROM block_tasks WHERE task = ?1 AND id = ?2")?;
             for block in blocks {
                 let id = key(block.id.0);
+                let last = key(block.last.0);
                 let tasks: Vec<u8> = block.tasks.iter().flat_map(|t| key(t.0)).collect();
                 let body = serde_json::to_string(block)?;
                 let session = block.session.map(|s| key(s.0).to_vec());
@@ -188,6 +487,7 @@ impl BlockDb {
                 let values = params![
                     &id[..],
                     block.start,
+                    &last[..],
                     session,
                     workstream,
                     project,
@@ -294,11 +594,12 @@ impl BlockDb {
             .transpose()
     }
 
-    /// `scope`'s blocks from `low` to `high`, both included, latest first.
-    pub fn window(&self, scope: Scope, low: Place, high: Place) -> Result<Vec<Block>> {
+    /// The heads of `scope`'s blocks from `low` to `high`, both included, latest first: read
+    /// from the scope's days index alone, without a body.
+    pub fn window(&self, scope: Scope, low: Place, high: Place) -> Result<Vec<Head>> {
         let (column, id) = scope.column();
         let mut stmt = self.conn.prepare_cached(&format!(
-            "SELECT body FROM blocks
+            "SELECT id, start, workstream, last FROM blocks
              WHERE {column} = ?1 AND (start, id) >= (?2, ?3) AND (start, id) <= (?4, ?5)
              ORDER BY start DESC, id DESC"
         ))?;
@@ -309,6 +610,56 @@ impl BlockDb {
                 &key(low.1.0)[..],
                 high.0,
                 &key(high.1.0)[..]
+            ],
+            |r| {
+                Ok((
+                    r.get::<_, Vec<u8>>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<Vec<u8>>>(2)?,
+                    r.get::<_, Vec<u8>>(3)?,
+                ))
+            },
+        )?;
+        let mut heads = Vec::new();
+        for row in rows {
+            let (id, start, workstream, last) = row?;
+            heads.push(Head {
+                id: EventId(ulid::Ulid(from_key(&id)?)),
+                start,
+                workstream: workstream
+                    .map(|w| from_key(&w).map(|w| WorkstreamId(ulid::Ulid(w))))
+                    .transpose()?,
+                last: EventId(ulid::Ulid(from_key(&last)?)),
+            });
+        }
+        Ok(heads)
+    }
+
+    /// The blocks of `scope` from `low` to `high`, both included, whose workstream is
+    /// `workstream`, oldest first: the blocks of one paragraph, found as [`BlockDb::window`] found
+    /// their heads.
+    pub fn bodies(
+        &self,
+        scope: Scope,
+        low: Place,
+        high: Place,
+        workstream: Option<WorkstreamId>,
+    ) -> Result<Vec<Block>> {
+        let (column, id) = scope.column();
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT body FROM blocks
+             WHERE {column} = ?1 AND (start, id) >= (?2, ?3) AND (start, id) <= (?4, ?5)
+                AND workstream IS ?6
+             ORDER BY start, id"
+        ))?;
+        let rows = stmt.query_map(
+            params![
+                &id[..],
+                low.0,
+                &key(low.1.0)[..],
+                high.0,
+                &key(high.1.0)[..],
+                workstream.map(|w| key(w.0).to_vec()),
             ],
             |r| r.get::<_, String>(0),
         )?;
@@ -333,6 +684,8 @@ fn from_key(bytes: &[u8]) -> Result<u128> {
 }
 
 fn decode(body: &str) -> Result<Block> {
+    #[cfg(test)]
+    tests::DECODED.with(|n| n.set(n.get() + 1));
     Ok(serde_json::from_str(body)?)
 }
 
@@ -346,4 +699,320 @@ fn create_private(path: &Path) -> io::Result<()> {
         options.mode(0o600);
     }
     options.open(path).map(drop)
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Block bodies decoded on this thread.
+        pub(crate) static DECODED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Block bodies decoded on this thread so far.
+    pub(crate) fn decoded() -> usize {
+        DECODED.with(Cell::get)
+    }
+
+    fn entries(dir: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = fs::read_dir(dir)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").path())
+            .collect();
+        found.sort();
+        found
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::metadata(path).expect("meta").permissions().mode() & 0o7777
+    }
+
+    /// The private folder's name of its own in `base`, for a file asked for at `asked`.
+    #[cfg(unix)]
+    fn named_folder(base: &Path, asked: &Path) -> PathBuf {
+        let key = fs::canonicalize(folder_of(asked))
+            .expect("canonicalize")
+            .join(asked.file_name().expect("name"));
+        base.join(stable_name(&key, effective_uid().expect("uid")))
+    }
+
+    /// On a local disk, the file is where it was asked for.
+    #[test]
+    fn on_a_local_disk_the_file_is_where_it_was_asked() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let base = tempfile::tempdir().expect("tempdir");
+        let asked = state.path().join("recaps.sqlite3");
+        let db = BlockDb::local_with(&asked, &|_: &Path| false, &[base.path().to_path_buf()])
+            .expect("db");
+        assert_eq!(db.file_path(), Some(asked.as_path()));
+        assert!(asked.is_file());
+        assert!(entries(base.path()).is_empty());
+        drop(db);
+        assert!(!asked.exists());
+    }
+
+    /// When the state directory is on a network filesystem (detection stubbed), the file goes
+    /// in a new private folder in the first local base, never at the path asked for; a base on a
+    /// network filesystem too is skipped. The folder goes with the database.
+    #[test]
+    fn on_a_network_filesystem_the_file_is_in_a_private_local_folder() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let remote = tempfile::tempdir().expect("tempdir");
+        let local = tempfile::tempdir().expect("tempdir");
+        let asked = state.path().join("recaps.sqlite3");
+        let network = |dir: &Path| dir == state.path() || dir == remote.path();
+        let bases = [remote.path().to_path_buf(), local.path().to_path_buf()];
+        let mut db = BlockDb::local_with(&asked, &network, &bases).expect("db");
+
+        assert!(!asked.exists(), "nothing on the network filesystem");
+        assert!(entries(state.path()).is_empty());
+        assert!(entries(remote.path()).is_empty());
+        let made = entries(local.path());
+        assert_eq!(made.len(), 1, "{made:?}");
+        let folder = &made[0];
+        assert!(
+            folder
+                .file_name()
+                .and_then(OsStr::to_str)
+                .is_some_and(|n| n.starts_with("pitcrew-recaps-")),
+            "{folder:?}"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            folder,
+            &named_folder(local.path(), &asked),
+            "a name of its own"
+        );
+        let file = folder.join("recaps.sqlite3");
+        assert_eq!(db.file_path(), Some(file.as_path()));
+        assert_eq!(entries(folder), vec![file.clone()]);
+        #[cfg(unix)]
+        {
+            assert_eq!(mode(folder), 0o700, "the folder is private");
+            assert_eq!(mode(&file), 0o600, "the file is private");
+        }
+        // A working database.
+        db.put(&[]).expect("put");
+        assert_eq!(
+            db.page(&BlockFilter::default(), None, 10).expect("page"),
+            (Vec::new(), false)
+        );
+
+        drop(db);
+        assert!(!folder.exists(), "the folder goes with the database");
+        assert!(entries(local.path()).is_empty());
+    }
+
+    /// With no local base (each one on a network filesystem, or one it cannot use), the blocks
+    /// stay in memory, and nothing is left anywhere.
+    #[test]
+    fn with_no_private_local_folder_the_blocks_stay_in_memory() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let base = tempfile::tempdir().expect("tempdir");
+        let asked = state.path().join("recaps.sqlite3");
+        let bases = [base.path().to_path_buf(), base.path().join("missing")];
+        let db = BlockDb::local_with(&asked, &|_: &Path| true, &bases).expect("db");
+        assert_eq!(db.file_path(), None);
+        let only_state = |dir: &Path| dir == state.path();
+        let missing = [base.path().join("missing")];
+        let also = BlockDb::local_with(&asked, &only_state, &missing).expect("db");
+        assert_eq!(also.file_path(), None);
+        assert!(entries(state.path()).is_empty());
+        assert!(entries(base.path()).is_empty());
+    }
+
+    /// A base whose entries others could rename (writable by group or others, and not sticky) is
+    /// not used; one that is sticky, as `/tmp` is, is.
+    #[cfg(unix)]
+    #[test]
+    fn a_base_others_can_change_is_not_used() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let state = tempfile::tempdir().expect("tempdir");
+        let open = tempfile::tempdir().expect("tempdir");
+        let sticky = tempfile::tempdir().expect("tempdir");
+        fs::set_permissions(open.path(), fs::Permissions::from_mode(0o777)).expect("chmod");
+        fs::set_permissions(sticky.path(), fs::Permissions::from_mode(0o1777)).expect("chmod");
+        let asked = state.path().join("recaps.sqlite3");
+        let network = |dir: &Path| dir == state.path();
+        let bases = [open.path().to_path_buf(), sticky.path().to_path_buf()];
+        let db = BlockDb::local_with(&asked, &network, &bases).expect("db");
+        assert!(entries(open.path()).is_empty());
+        let made = entries(sticky.path());
+        assert_eq!(made.len(), 1);
+        assert_eq!(
+            db.file_path(),
+            Some(made[0].join("recaps.sqlite3").as_path())
+        );
+        assert_eq!(mode(&made[0]), 0o700);
+    }
+
+    /// A hard kill (SIGKILL, the OOM killer, a power cut) runs no destructor, so the private
+    /// folder and its file stay. The next start on the same state folder finds that folder by its
+    /// name, uses it again and replaces the file in it, and its drop leaves nothing.
+    #[cfg(unix)]
+    #[test]
+    fn the_folder_a_hard_kill_left_is_used_again_and_its_file_replaced() {
+        use std::os::unix::fs::MetadataExt as _;
+        let state = tempfile::tempdir().expect("tempdir");
+        let local = tempfile::tempdir().expect("tempdir");
+        let asked = state.path().join("recaps.sqlite3");
+        let network = |dir: &Path| dir == state.path();
+        let bases = [local.path().to_path_buf()];
+        let folder = named_folder(local.path(), &asked);
+        let file = folder.join("recaps.sqlite3");
+
+        let killed = BlockDb::local_with(&asked, &network, &bases).expect("db");
+        assert_eq!(killed.file_path(), Some(file.as_path()));
+        // What a hard kill leaves: no destructor runs (the connection stays open, as it would
+        // until the process is gone).
+        std::mem::forget(killed);
+        assert_eq!(entries(local.path()), vec![folder.clone()]);
+        let old = fs::metadata(&file).expect("the old file").ino();
+
+        let next = BlockDb::local_with(&asked, &network, &bases).expect("db");
+        assert_eq!(next.file_path(), Some(file.as_path()), "the same folder");
+        assert_eq!(entries(local.path()), vec![folder.clone()], "no new folder");
+        assert_eq!(entries(&folder), vec![file.clone()]);
+        assert_ne!(
+            fs::metadata(&file).expect("the new file").ino(),
+            old,
+            "the old file is replaced, not read"
+        );
+        assert_eq!(mode(&folder), 0o700);
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(
+            next.page(&BlockFilter::default(), None, 10).expect("page"),
+            (Vec::new(), false)
+        );
+        drop(next);
+        assert!(entries(local.path()).is_empty(), "nothing left");
+    }
+
+    /// Anything at the private folder's name that is not a folder an earlier run made (a link,
+    /// even to a private folder of ours; a folder another mode; a file) is left alone, and the
+    /// recap file goes in a new folder with a random name instead.
+    #[cfg(unix)]
+    #[test]
+    fn what_is_not_our_folder_at_its_name_is_not_used() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let state = tempfile::tempdir().expect("tempdir");
+        let asked = state.path().join("recaps.sqlite3");
+        let network = |dir: &Path| dir == state.path();
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let target = elsewhere.path().join("private");
+        fs::create_dir(&target).expect("mkdir");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).expect("chmod");
+
+        for case in ["link", "0755", "0770", "file"] {
+            let local = tempfile::tempdir().expect("tempdir");
+            let squatted = named_folder(local.path(), &asked);
+            match case {
+                "link" => std::os::unix::fs::symlink(&target, &squatted).expect("symlink"),
+                "file" => fs::write(&squatted, b"not a folder").expect("write"),
+                mode => {
+                    fs::create_dir(&squatted).expect("mkdir");
+                    let mode = u32::from_str_radix(mode, 8).expect("mode");
+                    fs::set_permissions(&squatted, fs::Permissions::from_mode(mode))
+                        .expect("chmod");
+                }
+            }
+            let before = fs::symlink_metadata(&squatted).expect("lstat");
+
+            let db =
+                BlockDb::local_with(&asked, &network, &[local.path().to_path_buf()]).expect("db");
+            let file = db.file_path().expect("a file").to_path_buf();
+            let folder = folder_of(&file);
+            assert_ne!(folder, squatted, "{case}");
+            assert_eq!(folder_of(&folder), local.path(), "{case}");
+            assert_eq!(mode(&folder), 0o700, "{case}");
+            let after = fs::symlink_metadata(&squatted).expect("lstat");
+            assert_eq!(after.file_type(), before.file_type(), "{case}: left alone");
+            assert_eq!(
+                after.permissions(),
+                before.permissions(),
+                "{case}: left alone"
+            );
+            assert!(
+                entries(&target).is_empty(),
+                "{case}: nothing through the link"
+            );
+            drop(db);
+            assert_eq!(entries(local.path()), vec![squatted], "{case}");
+        }
+    }
+
+    /// The checks themselves, with owners no test can make without root: a folder found at the
+    /// name is used again only if it is a real folder, ours and 0700; a base must be root's or
+    /// ours, and closed to others unless sticky.
+    #[cfg(unix)]
+    #[test]
+    fn the_owner_and_mode_rules() {
+        let me = 1000;
+        let someone_else = 1001;
+        let dir = 0o040_000;
+        assert_eq!(left_by_us(true, me, dir | 0o700, me), Ok(()));
+        for (case, is_dir, uid, mode) in [
+            ("a link", false, me, 0o120_777),
+            ("another user's folder", true, someone_else, dir | 0o700),
+            ("root's folder", true, 0, dir | 0o700),
+            ("a 0755 folder", true, me, dir | 0o755),
+            ("a 0711 folder", true, me, dir | 0o711),
+            ("a sticky folder", true, me, dir | 0o1700),
+        ] {
+            assert!(left_by_us(is_dir, uid, mode, me).is_err(), "{case}");
+        }
+        for (case, uid, mode) in [
+            ("root's, sticky and open", 0, 0o1777),
+            ("root's, 0755", 0, 0o755),
+            ("ours, 0700", me, 0o700),
+            ("ours, sticky and open", me, 0o1777),
+        ] {
+            assert_eq!(base_is_safe(uid, dir | mode, me), Ok(()), "{case}");
+        }
+        for (case, uid, mode) in [
+            ("another user's, 0700", someone_else, 0o700),
+            ("another user's, sticky", someone_else, 0o1777),
+            ("ours, open and not sticky", me, 0o777),
+            ("root's, group-writable", 0, 0o775),
+        ] {
+            assert!(base_is_safe(uid, dir | mode, me).is_err(), "{case}");
+        }
+    }
+
+    /// The user owners are checked against (read from a socket's owner) is the one this process
+    /// makes files as.
+    #[cfg(unix)]
+    #[test]
+    fn the_effective_uid_is_the_owner_of_what_this_process_makes() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("made");
+        fs::write(&file, b"").expect("write");
+        assert!(
+            effective_uid().expect("the effective user")
+                == fs::metadata(&file).expect("meta").uid(),
+            "a socket's owner is not the user this process makes files as"
+        );
+    }
+
+    /// The name of its own depends on the path and the user, and on nothing else.
+    #[cfg(unix)]
+    #[test]
+    fn the_name_of_its_own_is_the_path_and_the_user() {
+        let a = Path::new("/home/sam/.local/state/pitcrew/recaps.sqlite3");
+        let b = Path::new("/home/sam/other/recaps.sqlite3");
+        assert!(stable_name(a, 1000) == stable_name(a, 1000), "the same");
+        assert!(stable_name(a, 1000) != stable_name(b, 1000), "another path");
+        assert!(stable_name(a, 1000) != stable_name(a, 1001), "another user");
+        let name = stable_name(a, 1000);
+        let digits = name.strip_prefix("pitcrew-recaps-").expect("the prefix");
+        assert!(
+            digits.len() == 32 && digits.bytes().all(|b| b.is_ascii_hexdigit()),
+            "32 hex digits after the prefix"
+        );
+    }
 }

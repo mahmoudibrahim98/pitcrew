@@ -199,7 +199,11 @@ export function queryValue(query: URLSearchParams, key: string): string | undefi
   return value === null || value === '' ? undefined : value;
 }
 
-/** Parse an optional id filter like the Rust FromStr implementations. */
+/**
+ * An id in the query (a filter, or a recap block cursor): the bare ULID or its prefixed form
+ * (`ses_…`), in either case, as `FromStr` in ids.rs accepts. A malformed one is a 400; an absent
+ * or empty one is `undefined`. Returned bare and in upper case.
+ */
 export function queryId(query: URLSearchParams, key: string, prefix: string): string | undefined {
   const value = queryValue(query, key);
   if (value === undefined) return undefined;

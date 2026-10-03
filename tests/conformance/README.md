@@ -29,9 +29,10 @@ synthetic value. The suite itself neither imports nor inspects a server implemen
 `schema.mjs` validates required/optional response fields, nested models, enum tags, ids, dates,
 integer cursors, transcript variants and recap UTF-8 spans. It permits extra fields for compatible
 protocol extensions. Tests cover every API-v1 route via a successful request or a refusal/validation
-path, filters, paging to completion, bad cursors, zero limits, authentication and ownership,
-forged authors, WebSocket hello, a mutation frame, and exact replay. Terminal coverage is limited
-to upgrade/auth/id/size refusals; it uses no real terminal. Session launch and command success
+path, filters, paging to completion, bad cursors, zero limits, authentication and ownership (an
+agent token refused on person-only lists and on every person-only write), forged authors,
+WebSocket hello, a mutation frame, and exact replay. Terminal coverage is limited to
+upgrade/auth/id/size refusals; it uses no real terminal. Session launch and command success
 require a runtime and are not exercised by the shared runner; body and unknown-session refusals
 cover those routes. First-run successful setup is already covered by each server's own tests;
 this seeded suite checks setup conflict and agent refusal.
