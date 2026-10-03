@@ -10,8 +10,18 @@ test('files enforce path tables before access and authorize before parsing', asy
     for (const path of ['../x','/absolute','.','a//b','a/./b','a/../b','a/','a\\b','a\0b']) {
       assert.equal((await call(server, 'GET', `${route}?${new URLSearchParams({loc:'0',path})}`, { token: DEVICE })).status, 400, path);
     }
-    if (process.platform === 'win32') for (const path of ['C:/file','C:file','file:stream','CON.txt','COM¹','LPT².txt','end.','end ']) {
+    if (process.platform === 'win32') for (const path of ['C:/file','C:file','file:stream','CON.txt','CON .txt','nul  .log','COM1 .rs','LPT9 .txt','COM¹','LPT².txt','end.','end ']) {
       assert.equal((await call(server, 'GET', `${route}?${new URLSearchParams({loc:'0',path})}`, { token: DEVICE })).status, 400, path);
+    }
+  });
+});
+
+test('file writes reject non-string encodings without creating a file', async () => {
+  await withServer(async server => {
+    const route = `/v1/workstreams/${ID.submission}/files/content?loc=0&path=malformed.txt`;
+    for (const encoding of [['utf8'], ['base64'], {}, null, 1, true]) {
+      assert.equal((await call(server, 'PUT', route, { token: DEVICE, json: { revision: null, encoding, content: 'YWJj' } })).status, 400);
+      assert.equal((await call(server, 'GET', route, { token: DEVICE })).status, 404);
     }
   });
 });

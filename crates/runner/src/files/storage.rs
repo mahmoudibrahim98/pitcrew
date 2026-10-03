@@ -74,11 +74,21 @@ pub(super) fn permissions(
     target_file: &File,
     target: &Path,
 ) -> Result<()> {
-    target_file.set_permissions(file.metadata()?.permissions())?;
+    let metadata = file.metadata()?;
     #[cfg(unix)]
     {
+        use rustix::process::{Gid, Uid};
+        use std::os::unix::fs::MetadataExt as _;
         let _ = (source, target);
+        // Changing group can clear setgid, so restore the mode only after fchown succeeds.
+        rustix::fs::fchown(
+            target_file,
+            Some(Uid::from_raw(target_file.metadata()?.uid())),
+            Some(Gid::from_raw(metadata.gid())),
+        )
+        .map_err(std::io::Error::from)?;
     }
+    target_file.set_permissions(metadata.permissions())?;
     #[cfg(windows)]
     pitcrew_trust::windows::copy_file_dacl(source, target)?;
     Ok(())

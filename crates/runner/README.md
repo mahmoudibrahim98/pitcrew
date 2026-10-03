@@ -12,7 +12,9 @@ in byte order and report truncation. Files are capped at 8 MiB, with SHA-256 rev
 or canonical base64 content.
 
 Writes are serialized, reject `.git` and multi-link targets, recheck revisions, and replace an
-exclusive temporary file in the same folder, preserving permissions (Windows DACL included).
+exclusive temporary file in the same folder, preserving permissions (Unix group and mode,
+Windows DACL included). A Unix group change must succeed before the original mode is restored;
+otherwise replacement is refused.
 New files are private. Before replacement, `file-backups` in state retains the newest three
 backups per root/path and 64 MiB total, evicting oldest first by a strictly increasing stored identifier;
 each is at most 8 MiB. Hash keys

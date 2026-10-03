@@ -40,6 +40,10 @@ test('files: local tree, revisions, binary, bounds, device-only and remote refus
   await request(url('new.bin'), 409, binary);
   await request(url('new.bin'), 400, { encoding: 'utf8', content: 'missing revision' });
   await request(url('new.bin'), 400, { revision: null, encoding: 'base64', content: 'bad=' });
+  for (const encoding of [['utf8'], ['base64'], {}, null, 1, true]) {
+    await request(url('malformed.txt'), 400, { revision: null, encoding, content: 'YWJj' });
+    await request(url('malformed.txt'), 404);
+  }
   for (const path of ['..', '../outside/secret', '/absolute', 'a\\b', 'src//hello.txt', 'src/./hello.txt', 'src/hello.txt/']) await request(url(path), 400);
   for (const path of ['.git', '.git/config', 'src/.git/config']) await request(url(path), 403, { revision: null, encoding: 'utf8', content: 'refused' });
   await request(url('', false), 403, undefined, agent);

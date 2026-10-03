@@ -8,6 +8,49 @@ use std::fs;
 use std::path::Path;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
+#[cfg(unix)]
+#[test]
+fn replacing_a_file_preserves_its_distinct_group_and_mode() -> TestResult {
+    use rustix::process::{Gid, getegid, geteuid, getgroups};
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let tmp = tempfile::tempdir()?;
+    let state = tmp.path().join("state");
+    fs::create_dir(&state)?;
+    let path = tmp.path().join("file");
+    let file = fs::File::create(&path)?;
+    let inherited = file.metadata()?.gid();
+    let group = if geteuid().is_root() {
+        Some(Gid::from_raw(if inherited == 1 { 2 } else { 1 }))
+    } else {
+        getgroups()?
+            .into_iter()
+            .chain([getegid()])
+            .find(|group| group.as_raw() != inherited)
+    };
+    let Some(group) = group else {
+        eprintln!("SKIP distinct-group replacement: no second permitted group");
+        return Ok(());
+    };
+    rustix::fs::fchown(&file, None, Some(group))?;
+    file.set_permissions(fs::Permissions::from_mode(0o2640))?;
+    fs::write(&path, "old")?;
+    // Writing may clear setgid; restore it so permission-copy ordering is checked too.
+    file.set_permissions(fs::Permissions::from_mode(0o2640))?;
+    drop(file);
+    let before = fs::metadata(&path)?;
+    assert_ne!(before.gid(), inherited);
+    let files = Files::new(&state);
+    let revision = files.read(tmp.path(), "file")?.revision;
+    files.write(tmp.path(), "file", write(Some(revision), "new"))?;
+    let after = fs::metadata(&path)?;
+    assert_eq!(after.gid(), before.gid());
+    assert_eq!(after.uid(), before.uid());
+    assert_eq!(after.mode() & 0o7777, before.mode() & 0o7777);
+    assert_eq!(fs::read(&path)?, b"new");
+    Ok(())
+}
+
 fn write(revision: Option<String>, text: &str) -> WriteFile {
     WriteFile {
         revision,

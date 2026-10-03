@@ -26,7 +26,7 @@ function tree(hub: Hub, key: string): Map<string, Entry> {
 function validate(path: string, list: boolean, write: boolean): void {
   if (path === '' && list) return;
   if (!path || path.startsWith('/') || /[\0\\]/.test(path) || path.split('/').some(p => !p || p === '.' || p === '..')) throw invalid('Invalid relative path.');
-  if (process.platform === 'win32' && path.split('/').some(p => /:|[. ]$/.test(p) || /^(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)/i.test(p))) throw invalid('Invalid relative path.');
+  if (process.platform === 'win32' && path.split('/').some(p => /:|[. ]$/.test(p) || /^(CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])$/i.test(p.split('.')[0]!.replace(/ +$/, '')))) throw invalid('Invalid relative path.');
   if (write && path.split('/').some(p => process.platform === 'win32' ? p.toLowerCase() === '.git' : p === '.git')) throw forbidden('Git writes are refused.');
 }
 function content(path: string, bytes: Buffer): unknown {
@@ -71,7 +71,7 @@ export function files(hub: Hub, id: string, query: URLSearchParams, body: unknow
     if (!entry) throw notFound('File not found.');
     return { status: 200, body: content(path, entry.bytes) };
   }
-  if (!isRecord(body) || !Object.hasOwn(body, 'revision') || body['revision'] !== null && (typeof body['revision'] !== 'string' || !/^[0-9a-f]{64}$/.test(body['revision'])) || !['utf8','base64'].includes(String(body['encoding'])) || typeof body['content'] !== 'string' || Object.keys(body).some(k => !['revision','encoding','content'].includes(k))) throw invalid('Invalid file body.');
+  if (!isRecord(body) || !Object.hasOwn(body, 'revision') || body['revision'] !== null && (typeof body['revision'] !== 'string' || !/^[0-9a-f]{64}$/.test(body['revision'])) || typeof body['encoding'] !== 'string' || !['utf8','base64'].includes(body['encoding']) || typeof body['content'] !== 'string' || Object.keys(body).some(k => !['revision','encoding','content'].includes(k))) throw invalid('Invalid file body.');
   const encoded = body['content'];
   if (body['encoding'] === 'base64' && !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(encoded)) throw invalid('Invalid base64.');
   const bytes = Buffer.from(encoded, body['encoding'] === 'utf8' ? 'utf8' : 'base64');
