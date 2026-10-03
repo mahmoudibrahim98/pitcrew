@@ -931,6 +931,17 @@ fn a_sub_agent_named_like_a_session_never_takes_its_native_id() {
     place_sub_agent_of(home.path(), &other(2), "agent-e2", "agent-dup");
     runner.rescan();
     sink.wait_for(7, CEILING).expect("the first sub-agent");
+    let first_discovered = all_discovered_as(&sink.events(), "agent-dup")[0];
+    // Restart resolves duplicates by ULID order. Random bits do not order ids minted in
+    // one millisecond: wait for the next timestamp before making the second discoverable.
+    let deadline = std::time::Instant::now() + CEILING;
+    while SessionId::new().0.timestamp_ms() <= first_discovered.0.timestamp_ms() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the ULID clock did not advance"
+        );
+        std::thread::yield_now();
+    }
     place_sub_agent_of(home.path(), &other(3), "agent-e3", "agent-dup");
     runner.rescan();
     sink.wait_for(9, CEILING).expect("the second sub-agent");
@@ -942,6 +953,7 @@ fn a_sub_agent_named_like_a_session_never_takes_its_native_id() {
         panic!("{:?}", labels(&events));
     };
     assert!(first < second);
+    assert_eq!(first, first_discovered, "discovery order is preserved");
 
     let me = person();
     let hooks = runner.hooks();
