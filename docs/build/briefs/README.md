@@ -78,16 +78,17 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [P-desktop-bundle](P-desktop-bundle.md) | P · Packaging | `integrator/desktop-bundle` | Opus-class | **Merged** (PR #10) |
 | [P-measure](P-measure.md) | P · Packaging | `s/P/measure` | Sonnet-class | **Merged** (PR #12) |
 | [0-macos-green](0-macos-green.md) | 0 · Contracts | `integrator/macos-green` | Opus-class | **Merged** (PR #11) |
-| [J-acl-followups](J-acl-followups.md) | J · Remote and HPC | `s/J/acl-followups` | Opus-class | In review (PR #13) |
-| [0-memory-budget](0-memory-budget.md) | 0 · Composition root | `integrator/memory-budget` | Opus-class | In progress |
-| [0-trust-sweep](0-trust-sweep.md) | 0 · Contracts | `integrator/trust-sweep` | Opus-class | Ready |
-| [0-deps-ulid-3](0-deps-ulid-3.md) | 0 · Contracts | `integrator/deps-ulid-3` | Codex | In review (PR #14) |
-| [0-deps-getrandom-04](0-deps-getrandom-04.md) | 0 · Contracts | `integrator/deps-getrandom-04` | Codex | In review (PR #15) |
+| [J-acl-followups](J-acl-followups.md) | J · Remote and HPC | `s/J/acl-followups` | Opus-class | **Merged** (PR #13) |
+| [0-memory-budget](0-memory-budget.md) | 0 · Composition root | `integrator/memory-budget` | Opus-class | In review (PR #25) |
+| [0-trust-sweep](0-trust-sweep.md) | 0 · Contracts | `integrator/trust-sweep` | Opus-class | In review (PR #20) |
+| [0-deps-ulid-3](0-deps-ulid-3.md) | 0 · Contracts | `integrator/deps-ulid-3` | Codex | **Merged** (PR #14) |
+| [0-deps-getrandom-04](0-deps-getrandom-04.md) | 0 · Contracts | `integrator/deps-getrandom-04` | Codex | **Merged** (PR #15) |
 | [0-deps-tungstenite-030](0-deps-tungstenite-030.md) | 0 · Contracts | `integrator/deps-tungstenite-030` | Codex | Blocked: the released axum still needs tungstenite 0.29 |
-| [0-deps-typescript-7](0-deps-typescript-7.md) | 0 · Contracts | `integrator/deps-typescript-7` | Codex | In review (PR #16: stays on 6 for now) |
+| [0-deps-typescript-7](0-deps-typescript-7.md) | 0 · Contracts | `integrator/deps-typescript-7` | Codex | **Merged** (PR #16: stays on 6 for now) |
 | [0-workspace-host](0-workspace-host.md) | 0 · Contracts | `integrator/workspace-host` | Codex | In review (PR #17) |
 | [I-hook-exec-form](I-hook-exec-form.md) | I · CLI and hooks | `s/I/hook-exec-form` | Codex | In review (PR #18) |
-| [0-flaky-tests](0-flaky-tests.md) | 0 · Contracts | `integrator/flaky-tests` | Codex | Ready |
+| [0-flaky-tests](0-flaky-tests.md) | 0 · Contracts | `integrator/flaky-tests` | Codex | **Merged** (PR #19) |
+| [0-flaky-tests-2](0-flaky-tests-2.md) | 0 · Contracts | `integrator/flaky-tests-2` | Codex | Ready |
 | [0-ci-security](0-ci-security.md) | 0 · Contracts | `integrator/ci-security` | Codex | Ready |
 | [0-protocol-ts](0-protocol-ts.md) | 0 · Contracts | `integrator/protocol-ts` | Codex | Ready |
 | [0-api-conformance](0-api-conformance.md) | 0 · Contracts | `integrator/api-conformance` | Codex | Ready |
