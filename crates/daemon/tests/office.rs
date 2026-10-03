@@ -457,7 +457,7 @@ fn activity_filters_by_project_and_workstream_through_the_index() {
     assert_eq!(unknown.status, 200);
     assert_eq!(
         unknown.json(),
-        json!({ "events": [], "from_rev": 0, "to_rev": 0, "at_start": true })
+        json!({ "events": [], "revisions": [], "from_rev": 0, "to_rev": 0, "at_start": true })
     );
     let malformed = daemon.get("/v1/events?workstream=nope", Some(&device));
     assert_eq!(malformed.status, 400);
