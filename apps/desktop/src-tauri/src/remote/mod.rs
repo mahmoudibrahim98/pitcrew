@@ -108,7 +108,8 @@ pub struct RemoteOptions {
     /// The ssh program: `ssh` on `PATH` unless the settings name one; or why the configured one
     /// is not used.
     pub ssh: Result<PathBuf, String>,
-    /// WSL executable, configurable for portable tests.
+    /// wsl.exe: `%SystemRoot%\System32\wsl.exe` ([`pitcrew_remote::wsl::default_program`]);
+    /// tests name a stand-in.
     pub wsl: PathBuf,
     /// `pitcrew-askpass`, or why it is missing.
     pub askpass: Result<PathBuf, String>,
@@ -158,7 +159,7 @@ impl RemoteOptions {
     ) -> Self {
         Self {
             ssh,
-            wsl: PathBuf::from("wsl.exe"),
+            wsl: pitcrew_remote::wsl::default_program(),
             askpass,
             helpers,
             runtime_dir: None,
@@ -1410,10 +1411,7 @@ impl Core {
         Ok((program, askpass))
     }
 
-    /// The ssh every remote call uses: the person's OpenSSH, with only the environment it needs.
-    /// Prompts go through `pitcrew-askpass` to the hub, behind the version gate, only once
-    /// `ssh -V` said 8.4 or newer; otherwise ssh runs in `BatchMode` and never asks ([`gate`]).
-    /// This takes the verdict as known now: [`Core::checked_ssh`] asks first.
+    /// The WSL transport: wsl.exe, without SSH configuration, prompts or host keys.
     fn wsl(&self) -> Ssh {
         let mut transport = Ssh::wsl(&self.options.wsl);
         if let Some(dir) = &self.options.runtime_dir {
@@ -1422,6 +1420,9 @@ impl Core {
         transport
     }
 
+    /// The machine a probe or plan is about, and how to reach it: a registered WSL2 distro
+    /// (started first if it is stopped, within [`pitcrew_remote::wsl::START_LIMITS`], so the
+    /// probe's 30 s are not spent on WSL's cold start), or an ssh host.
     async fn transport(
         &self,
         host: &str,
@@ -1445,13 +1446,23 @@ impl Core {
                     "WSL1 is unsupported; select a WSL2 distribution",
                 ));
             }
-            Ok((distro.clone(), self.wsl()))
+            let wsl = self.wsl();
+            if !found.running {
+                wsl.start_wsl(distro)
+                    .await
+                    .map_err(|e| ssh_error(distro, &e))?;
+            }
+            Ok((distro.clone(), wsl))
         } else {
             check_host(host)?;
             Ok((host.to_owned(), self.checked_ssh().await?))
         }
     }
 
+    /// The ssh every remote call uses: the person's OpenSSH, with only the environment it needs.
+    /// Prompts go through `pitcrew-askpass` to the hub, behind the version gate, only once
+    /// `ssh -V` said 8.4 or newer; otherwise ssh runs in `BatchMode` and never asks ([`gate`]).
+    /// This takes the verdict as known now: [`Core::checked_ssh`] asks first.
     fn ssh(&self) -> Result<Ssh, GatewayError> {
         let (program, askpass) = self.programs()?;
         let mut ssh = Ssh::new(program.clone()).with_env_passthrough(Vec::<String>::new());

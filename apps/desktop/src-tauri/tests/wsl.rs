@@ -80,9 +80,19 @@ async fn check() -> Result<(), Box<dyn Error>> {
             .await
             .is_err()
     );
+    assert!(fake::commands(dir)?.is_empty());
+    // The distro is stopped: it is started, within its own longer limit, before the probe.
     let probe = remotes.probe_target("", Some(&target)).await?;
     assert_eq!(probe.os, "linux");
     assert!(probe.slurm.is_none());
+    let started = |commands: &[Vec<String>]| commands.iter().filter(|c| *c == &["true"]).count();
+    let commands = fake::commands(dir)?;
+    assert_eq!(
+        commands.first().map(Vec::as_slice),
+        Some(&["true".to_owned()][..])
+    );
+    assert_eq!(started(&commands), 1);
+    assert!(remotes.wsl_distros().await?.distros[0].running);
     for launcher in ["direct", "tmux"] {
         let request: RemotePlanRequest = serde_json::from_value(
             serde_json::json!({"host":"", "target":{"kind":"wsl","distro":fake::DISTRO},"launcher":launcher}),
@@ -136,10 +146,12 @@ async fn check() -> Result<(), Box<dyn Error>> {
     assert!(loaded.list().is_empty());
     assert!(!dir.join("started").exists());
     resumed.shutdown().await;
+    // A running distro is not started again; after the shutdown, the heartbeat started it.
+    assert_eq!(started(&fake::commands(dir)?), 1);
     let calls = std::fs::read_to_string(dir.join("calls.jsonl"))?;
     for line in calls.lines() {
         let args: Vec<String> = serde_json::from_str(line)?;
-        assert!(args[0] == "--list" || (args.len() == 6 && args[1] == fake::DISTRO));
+        assert!(args[0] == "--list" || (args.len() == 8 && args[1] == fake::DISTRO));
         assert!(
             !args
                 .iter()
