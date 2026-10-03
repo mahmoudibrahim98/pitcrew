@@ -24,7 +24,7 @@ use crate::plain;
 use crate::session_env::SessionEnv;
 use crate::store::{StoreError, TerminalRow};
 use crate::terminals::RunnerTerminals;
-use crate::watch::{Origin, Shared, Signal, Target};
+use crate::watch::{Origin, Pending, Shared, Signal, Target};
 use pitcrew_api::terminal::TerminalError;
 use pitcrew_interfaces::runtime::StartSpec;
 use pitcrew_protocol::ids::{CommandId, SessionId, TerminalId};
@@ -304,6 +304,17 @@ impl RunnerCommands {
             return rejected(reason);
         }
         let started_at = crate::now_ms();
+        // Its CLI may write its transcript before the terminal is recorded below: the watcher
+        // gives it the session the hub named meanwhile too.
+        let _starting = launch.session.map(|session| {
+            inner.shared.starting(Pending {
+                session,
+                engine: launch.engine,
+                native_id: native_id.clone(),
+                cwd: launch.cwd.to_owned(),
+                started_at,
+            })
+        });
         let info = match inner.terminals.start(spec) {
             Ok(info) => info,
             Err(e) => return failed(e.to_string()),

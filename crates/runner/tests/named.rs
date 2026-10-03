@@ -551,3 +551,125 @@ fn a_named_start_that_never_ran_is_gone_and_one_without_its_environment_is_refus
     );
     r.runner.stop();
 }
+
+/// A runtime whose program writes its transcript at once and is found before `start` returns, so
+/// the runner records the terminal only after the transcript was discovered.
+#[derive(Debug)]
+struct Eager {
+    inner: Recording,
+    home: PathBuf,
+    sink: Arc<CollectSink>,
+}
+
+impl Runtime for Eager {
+    fn kind(&self) -> RuntimeKind {
+        self.inner.kind()
+    }
+    fn start(&self, spec: &StartSpec) -> Result<TerminalInfo, RuntimeError> {
+        let info = self.inner.start(spec)?;
+        if let Some(native) = spec
+            .args
+            .iter()
+            .find_map(|a| a.strip_prefix("--session-id="))
+        {
+            let dir = self.home.join("projects").join("-eager");
+            std::fs::create_dir_all(&dir).unwrap();
+            place(
+                &dir.join(format!("{native}.jsonl")),
+                &fixture_lines_as(native)[..3].concat(),
+            );
+            assert!(
+                common::eventually(CEILING, || discovered_as(&self.sink.events(), native)
+                    .is_some()),
+                "the transcript was not found while the start was under way"
+            );
+        }
+        Ok(info)
+    }
+    fn write(&self, id: TerminalId, bytes: &[u8]) -> Result<(), RuntimeError> {
+        self.inner.write(id, bytes)
+    }
+    fn send_keys(&self, id: TerminalId, keys: &[Key]) -> Result<(), RuntimeError> {
+        self.inner.send_keys(id, keys)
+    }
+    fn resize(&self, id: TerminalId, cols: u16, rows: u16) -> Result<(), RuntimeError> {
+        self.inner.resize(id, cols, rows)
+    }
+    fn screen(&self, id: TerminalId) -> Result<Screen, RuntimeError> {
+        self.inner.screen(id)
+    }
+    fn read_output(
+        &self,
+        id: TerminalId,
+        from: u64,
+        max: usize,
+    ) -> Result<OutputChunk, RuntimeError> {
+        self.inner.read_output(id, from, max)
+    }
+    fn info(&self, id: TerminalId) -> Result<TerminalInfo, RuntimeError> {
+        self.inner.info(id)
+    }
+    fn list(&self) -> Result<Vec<TerminalInfo>, RuntimeError> {
+        self.inner.list()
+    }
+    fn kill(&self, id: TerminalId) -> Result<(), RuntimeError> {
+        self.inner.kill(id)
+    }
+}
+
+/// A CLI whose transcript is found before the runner has recorded its terminal (a start still
+/// under way) still takes the session the hub named, and its terminal is linked once recorded.
+#[test]
+fn a_transcript_found_while_its_start_is_under_way_takes_the_name() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("projects")).unwrap();
+    let mut config = RunnerConfig::new(
+        WorkspaceId::new(),
+        MachineId::new(),
+        MemberId::new(),
+        state.path(),
+    )
+    .with_home(Engine::Claude, home.path());
+    // Discovery looks often, so the transcript is found while `start` waits for it.
+    config.timing = Timing {
+        rediscover_interval: Duration::from_millis(100),
+        ..Timing::default()
+    };
+    let sink = Arc::new(CollectSink::default());
+    let runner =
+        pitcrew_runner::start(config, vec![Arc::new(ClaudeAdapter::new())], sink.clone()).unwrap();
+    let runtime = Arc::new(Eager {
+        inner: Recording::default(),
+        home: home.path().to_path_buf(),
+        sink: sink.clone(),
+    });
+    let terminals = runner.terminals(runtime).unwrap();
+    let commands = runner.commands(&terminals);
+    let named = SessionId::new();
+    let outcome = commands.run(
+        CommandId::new(),
+        &start(Engine::Claude, work.path(), Some(named)),
+    );
+    let CommandOutcome::Ok {
+        detail: Some(detail),
+    } = &outcome
+    else {
+        panic!("not started: {outcome:?}");
+    };
+    let native = detail["native_id"].as_str().unwrap();
+    let terminal: TerminalId = serde_json::from_value(detail["terminal"].clone()).unwrap();
+    let session = discovered_as(&sink.events(), native).unwrap();
+    assert_eq!(session.id, named, "{:?}", labels(&sink.events()));
+    assert_eq!(
+        session.terminal, None,
+        "found before its terminal was recorded"
+    );
+    assert_eq!(terminals.terminal_of(named).unwrap(), Some(terminal));
+    assert_eq!(commands.started(named), Started::Reported);
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(sessions_named(&sink.events()), [named]);
+    drop((terminals, commands));
+    runner.stop();
+}

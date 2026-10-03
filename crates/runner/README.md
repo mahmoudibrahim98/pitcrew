@@ -122,6 +122,11 @@ before the dispatch's CLI starts.
       waiting terminal (`Store::claim_terminal`) finds one started for a named session: the row,
       saved under the id it was found with, moves to the named one in the same transaction, and
       the watcher's maps follow (`Watcher::adopt`). Nothing has named the first id yet;
+    - **a start still under way**: a CLI may write its transcript before the runner has recorded
+      its terminal (the runtime's `start` has not returned). The start is known to the watcher
+      meanwhile (`Shared::starting`, a `Pending` start), so the transcript still takes the
+      name, by the same rules; it is then reported without its terminal, which is linked to the
+      session when it is recorded;
   - refuses a second start in a folder where a CLI matched by folder (Codex, OpenCode) still
     waits for its transcript (inside the 15-minute claim window, its program running), when
     either start is for a named session: the two could not be told apart. Two starts for no

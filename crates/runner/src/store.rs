@@ -36,7 +36,7 @@ const TERMINAL_COLUMNS: &str =
 /// in its folder that starts within this long.
 const CLAIM_WINDOW_MS: TimestampMs = 15 * 60 * 1000;
 /// Clock slack when matching a session's start to its terminal's.
-const CLAIM_SLACK_MS: TimestampMs = 5_000;
+pub(crate) const CLAIM_SLACK_MS: TimestampMs = 5_000;
 /// Command outcomes are kept this long.
 const OUTCOME_TTL_MS: TimestampMs = 7 * 24 * 60 * 60 * 1000;
 
@@ -589,15 +589,7 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         let adopted = match t.session {
             Some(named) => {
-                let (from, to) = (session.0.to_string(), named.0.to_string());
-                tx.execute(
-                    "UPDATE transcripts SET session_id = ?2 WHERE session_id = ?1",
-                    params![from, to],
-                )?;
-                tx.execute(
-                    "UPDATE accepted_items SET session_id = ?2 WHERE session_id = ?1",
-                    params![from, to],
-                )?;
+                move_row(&tx, session, named)?;
                 Some(named)
             }
             None => {
@@ -613,6 +605,15 @@ impl Store {
             terminal: t.terminal,
             adopted,
         }))
+    }
+
+    /// Moves the row of a transcript found as `from` to `to`, a session the hub named whose
+    /// terminal is not recorded yet (see `watch::Pending`), with its accepted items.
+    pub fn move_row(&self, from: SessionId, to: SessionId) -> Result<(), StoreError> {
+        let tx = self.conn.unchecked_transaction()?;
+        move_row(&tx, from, to)?;
+        tx.commit()?;
+        Ok(())
     }
 
     // ─── Commands ───────────────────────────────────────────────────────────────────────────
@@ -672,8 +673,26 @@ impl Store {
     }
 }
 
+/// Moves a transcript's row, and its accepted items, from session `from` to `to`, in `tx`.
+fn move_row(
+    tx: &rusqlite::Transaction<'_>,
+    from: SessionId,
+    to: SessionId,
+) -> Result<(), StoreError> {
+    let (from, to) = (from.0.to_string(), to.0.to_string());
+    tx.execute(
+        "UPDATE transcripts SET session_id = ?2 WHERE session_id = ?1",
+        params![from, to],
+    )?;
+    tx.execute(
+        "UPDATE accepted_items SET session_id = ?2 WHERE session_id = ?1",
+        params![from, to],
+    )?;
+    Ok(())
+}
+
 /// Whether two folder paths name the same folder, ignoring trailing separators.
-fn same_dir(a: &str, b: &str) -> bool {
+pub(crate) fn same_dir(a: &str, b: &str) -> bool {
     let trim = |s: &str| s.trim_end_matches(['/', '\\']).to_owned();
     trim(a) == trim(b)
 }

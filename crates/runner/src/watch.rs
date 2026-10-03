@@ -35,7 +35,7 @@ use crate::link::{self, Locations, WorkstreamLocation};
 use crate::pages::Source;
 use crate::pages::Watched;
 use crate::sink::Batch;
-use crate::store::{Claim, Commit, Indexed, Row, Store, native_id, path_text};
+use crate::store::{self, Claim, Commit, Indexed, Row, Store, native_id, path_text};
 use notify::event::{EventKind, MetadataKind, ModifyKind};
 use notify::{RecursiveMode, Watcher as _};
 use pitcrew_interfaces::source::{Cursor, ParseChunk, SourceAdapter, SourceError, TranscriptRef};
@@ -115,6 +115,38 @@ pub(crate) enum Target {
 pub(crate) struct Shared {
     signals: Mutex<Signals>,
     cv: Condvar,
+    /// Starts for sessions the hub named whose terminal is not recorded yet (see [`Pending`]).
+    pending: Mutex<Vec<Pending>>,
+}
+
+/// A start for a session the hub named, from just before its program starts until its terminal
+/// is recorded in the index. A CLI may write its transcript in between, and the watcher find it
+/// then: it still takes the name (and its terminal is linked when it is recorded).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Pending {
+    pub session: SessionId,
+    pub engine: Engine,
+    /// The CLI's id, when the runner chose it (Claude's `--session-id`); else it is matched by
+    /// folder and start time, as a recorded terminal is.
+    pub native_id: Option<String>,
+    pub cwd: String,
+    pub started_at: TimestampMs,
+}
+
+/// Keeps a [`Pending`] start known to the watcher until dropped.
+pub(crate) struct Starting<'a> {
+    shared: &'a Shared,
+    session: SessionId,
+}
+
+impl Drop for Starting<'_> {
+    fn drop(&mut self) {
+        self.shared
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|p| p.session != self.session);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -235,6 +267,48 @@ impl Shared {
 
     fn stopping(&self) -> bool {
         self.lock().stop
+    }
+
+    /// A start for a session the hub named is under way: until the guard is dropped (once its
+    /// terminal is recorded), a transcript that matches it takes its session.
+    pub fn starting(&self, pending: Pending) -> Starting<'_> {
+        let session = pending.session;
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(pending);
+        Starting {
+            shared: self,
+            session,
+        }
+    }
+
+    /// The session of a start under way whose CLI is `native` (an id the runner chose), or that
+    /// started in `cwd` no later than `started` (with [`store::CLAIM_SLACK_MS`] of slack).
+    fn pending_session(
+        &self,
+        engine: Engine,
+        native: &str,
+        cwd: Option<&str>,
+        started: Option<TimestampMs>,
+    ) -> Option<SessionId> {
+        let pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending
+            .iter()
+            .filter(|p| p.engine == engine)
+            .find(|p| match &p.native_id {
+                Some(id) => !native.is_empty() && id == native,
+                None => {
+                    cwd.is_some_and(|c| store::same_dir(c, &p.cwd))
+                        && started.is_some_and(|s| {
+                            s >= p.started_at.saturating_sub(store::CLAIM_SLACK_MS)
+                        })
+                }
+            })
+            .map(|p| p.session)
     }
 }
 
@@ -1514,9 +1588,18 @@ impl Watcher {
 
         // The terminal the runner started a new session in, claimed before anything names the
         // session: one started for a session the hub named makes the transcript adopt that id.
+        // So does such a start still under way (its terminal not recorded yet): the session is
+        // then reported without its terminal, which is linked when it is recorded.
         let terminal = if first && !subagent {
             let claim = self.claim_terminal(session, engine, &native, cwd.as_deref(), started);
-            if let Some(named) = claim.and_then(|c| c.adopted) {
+            let named = match claim {
+                Some(c) => c.adopted,
+                None => self
+                    .shared
+                    .pending_session(engine, &native, cwd.as_deref(), started)
+                    .filter(|named| *named != session && self.move_row(session, *named)),
+            };
+            if let Some(named) = named {
                 self.adopt(id, session, named);
                 session = named;
             }
@@ -2057,8 +2140,8 @@ impl Watcher {
     }
 
     /// The session a transcript not indexed yet takes: the one the hub named for a terminal the
-    /// runner started with the CLI id the transcript is named by (Claude's `<id>.jsonl`, from its
-    /// `--session-id`), if one waits; else none, and it gets a new one.
+    /// runner started (or is starting) with the CLI id the transcript is named by (Claude's
+    /// `<id>.jsonl`, from its `--session-id`), if one waits; else none, and it gets a new one.
     fn named_session(
         &self,
         engine: Engine,
@@ -2069,12 +2152,26 @@ impl Watcher {
             Some(inner) => inner.to_owned(),
             None => path.file_stem()?.to_str()?.to_owned(),
         };
-        self.store_lock()
+        let recorded = self
+            .store_lock()
             .named_session(engine, &native)
             .unwrap_or_else(|e| {
                 tracing::warn!(path = %path.display(), error = %e, "cannot look up a session the hub named; the transcript gets an id of its own");
                 None
-            })
+            });
+        recorded.or_else(|| self.shared.pending_session(engine, &native, None, None))
+    }
+
+    /// Moves the index's row of a transcript found as `from` to `to`, a session the hub named
+    /// whose start is under way. False (logged) if it cannot.
+    fn move_row(&self, from: SessionId, to: SessionId) -> bool {
+        match self.store_lock().move_row(from, to) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(%from, %to, error = %e, "cannot give a transcript the session the hub named; it keeps its own");
+                false
+            }
+        }
     }
 
     fn store_lock(&self) -> MutexGuard<'_, Store> {
