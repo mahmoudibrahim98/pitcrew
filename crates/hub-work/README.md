@@ -336,7 +336,9 @@ from the agent's persona (Claude Code by default).
 to `WorkService::follow_sessions`:
 
 - the dispatched session's first `working` (its re-stated `session_discovered` in that state, or
-  a `session_state_changed` to it) calls `dispatch_working`: the task moves to in progress, as the
+  a `session_state_changed` to it), or its first transcript `turn_ended`, calls `dispatch_working`:
+  a completed turn is evidence of work even if the runner's first read folds state changes and
+  discovers the session already idle. The task moves to in progress, as the
   agent for its owner. Once per dispatch while the service runs, so a person who moves the task
   back is not overruled by the agent's next turn (after a restart, the next `working` may move it
   once more, as the rules allow);
@@ -352,6 +354,12 @@ to `WorkService::follow_sessions`:
   session (its CLI id is still empty). Authored by the agent, for its owner.
 
 Events about sessions without an open dispatch change nothing, so replays are harmless.
+
+`reconciling_sessions(machine)` also lists sessions with active dispatches after their CLI id
+appears. The runner link keeps watching their terminals. `dispatched_cli_exited(session)` ends
+a reported session and cancels its active dispatch together, with the same summary and authorship
+as an end hook. It rechecks under the command lock, so a report that already succeeded is kept;
+ending the dispatch also releases the agent for another dispatch on the task.
 
 **Sessions stored ahead of the runner** (a dispatch's, or `POST /v1/sessions` with `agent` or
 `task`, recorded by `record_start`: `starting`, the agent named, linked to the task by hand) have
