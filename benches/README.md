@@ -570,3 +570,33 @@ No baseline was extended: these are budget observations on shared cloud hardware
 stable repeated same-machine evidence required for a 10% regression baseline. Temporary raw
 profile artifacts from the earlier environment did not survive resumption; their text summary
 is retained above. Desktop CPU and graphical budgets were outside this brief.
+
+
+#### After merging dispatch and its follow-ups
+
+Merged `origin/main` at `5453375` into `integrator/idle-cpu` with normal merge commit
+`c9b56f3`, preserving named-session dispatch/adoption, folder claims and the candidate-scoped
+exited-terminal final scan. The daemon keeps main's `FollowingSink` and the idle optimizations.
+The ten named-session tests also run with the daemon's optimization settings; all pass.
+
+The two full CPU commands above were repeated on this merged tree, on the same cloud environment
+class. No builds, tests or profiler ran beside their 180-second static/growing windows. Each
+writer again produced 1,897 lines and all fifty persisted cursors reached the new file ends.
+
+| Whole daemon CPU, one core | Original control `6b18a6a` | Before merge | Merged tree | Merged ticks / wall |
+|---|---:|---:|---:|---:|
+| Static, 50 files | 0.01% | 0.00% | 0.01% | 1 / 180.07 s |
+| Growing, 50 files | 0.55% | 0.33% | 0.36% | 65 / 180.06 s |
+| Static, 10k history | 0.38% | 0.08% | 0.10% | 18 / 180.06 s |
+| Growing, 10k history | 1.17% | 0.46% | **0.48%** | 87 / 180.04 s |
+
+The merged growing 10k result remains below 0.5%; its margin is about three 100 Hz ticks in this
+window. The small movements from the pre-merge results are observations on shared hardware,
+without repeated same-machine evidence establishing a regression. No baseline was extended.
+
+The merged 10k scan with retained page cache completed in **15.09 s**, streamed the first session
+after **102.53 ms**, and kept peak/steady RSS at **39.96 / 39.12 MiB**. It produced the same
+611,924 events. The 60 s scan and 80 MiB memory budgets remain met.
+The merged loaded hook-to-frame run measured **79.17 ms p50**, 79.72 ms p95, 80.84 ms p99 and
+81.47 ms maximum across 200 probes. It wrote 1,099 source lines and again verified every live
+cursor at EOF; the 300 ms budget remains met.
