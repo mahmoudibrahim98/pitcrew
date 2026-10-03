@@ -624,3 +624,7 @@ right after one new event 1.6 / 0.9 ms. Reading and decoding the log is most of 
 - The mock accepts the display form of an id in a body (`"project": "prj_01JB…"` in
   `POST /v1/workstreams`). api-v1 says ids are bare ULIDs, and the hub answers `400` for any
   other form in a body (paths take both).
+- The mock moves a dispatched task to in progress when its simulated session starts working, as
+  the hub does, but does not finish a dispatch: not when its agent moves the task to review
+  (`succeeded`), nor when its session ends (`canceled` or `failed`), as api-v1's "Dispatch" now
+  says the hub does (`follow_sessions`, `move_task`).
