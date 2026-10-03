@@ -43,7 +43,12 @@ descriptor it asks for, what it checks) and calls these:
   `FILE_ALL_ACCESS`), `label_integrity`;
 - **text:** `canonical_sid` (a SID from `S-1-…` or an SDDL alias such as `BA`), and in `sddl`
   (built and tested on every platform) `parse_label`, `integrity_rid`, `label`;
-- **private files and folders:** `create_private_file`, `create_private_directory` create with the current user as owner and a protected FullControl DACL for that SID only; `set_private_file` applies that policy to an existing file; `copy_file_dacl` preserves a file's DACL and its inheritance protection; `check_private_object` checks the owner, protection and every allow entry (FullControl for that SID). File security uses no-follow handles, refuses reparse points and holds handles without delete sharing. Callers hold and verify ancestor paths.
+- **private files and folders:** `create_private_file`, `create_private_directory` create with
+  the current user as owner and a protected FullControl DACL for that SID only; `set_private_file`
+  applies that policy to an existing file; `copy_file_dacl` preserves a file's DACL and its
+  inheritance protection; `check_private_object` checks the owner, protection and every allow
+  entry (FullControl for that SID). File security uses no-follow handles, refuses reparse points
+  and holds handles without delete sharing. Callers hold and verify ancestor paths.
 - **making pipes:** `SecurityDescriptor::from_sddl(text)` and `create_pipe(options, name)`.
 
 DACLs are compared by SID, never as SDDL text, which names some SIDs by alias (the built-in
@@ -60,4 +65,6 @@ text. On Windows: a downloaded program refused; the current user, integrity leve
 owner; SIDs from text and aliases; a pipe made from a descriptor read back through the server's
 handle and a client's (owner, every DACL entry with its mask, a denial, the label); a pipe with
 default security; bad descriptors refused. The Windows tests run on CI's (elevated) runner and
-natively. Private storage tests cover secure exclusive creation, inherited children, applying and copying DACLs, and rejection of public, denied, empty, null, partial, unprotected and wrong-owner security in temporary folders.
+natively. Private storage tests cover secure exclusive creation, inherited children, applying
+and copying DACLs, and rejection of public, denied, empty, null, partial, unprotected and
+wrong-owner security in temporary folders.
