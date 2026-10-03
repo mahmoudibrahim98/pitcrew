@@ -51,6 +51,9 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
         .with_out_dir(&bindings)
         .with_import_extension(Some("ts"));
     api::ApiError::export_all(&config)?;
+    pitcrew_protocol::files::FileList::export_all(&config)?;
+    pitcrew_protocol::files::FileContent::export_all(&config)?;
+    pitcrew_protocol::files::WriteFile::export_all(&config)?;
     api::ReadCursor::export_all(&config)?;
     api::MoveCursor::export_all(&config)?;
     api::Caller::export_all(&config)?;

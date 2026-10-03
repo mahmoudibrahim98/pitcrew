@@ -118,3 +118,6 @@ Its wall time (release build, spawn to exit, 200 runs) is measured by:
 ```text
 cargo test -p pitcrew-cli --release --test hook_timing -- --ignored --nocapture
 ```
+
+Files API error compatibility: too_large (413) maps to invalid / exit 2; unsupported (501)
+maps to unavailable / exit 5, including a response without an API error body.

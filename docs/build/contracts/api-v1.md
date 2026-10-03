@@ -46,6 +46,81 @@ Every failure returns an `ApiError` body, `{"code": "…", "message": "…"}`:
 | `unavailable` | 503 | The session's machine is unreachable |
 | `internal` | 500 | Anything else |
 
+## Files API
+
+Brief `0-files-api` implements these device-only routes. Wire types live in
+`crates/protocol/src/files.rs`, with generated TypeScript in `packages/protocol-ts`.
+
+| Method and path | Request and response |
+|---|---|
+| `GET /v1/workstreams/{id}/files?loc=0&path=src` | List: `{ entries: [{ name, kind, size, modified_at }], truncated }` |
+| `GET /v1/workstreams/{id}/files/content?loc=0&path=src/main.rs` | Read: `{ size, media_type, revision, encoding, content }` |
+| `PUT /v1/workstreams/{id}/files/content?loc=0&path=src/main.rs` | Write: `{ revision, encoding, content }` to the same shape as read |
+
+Using the workstream's location index avoids a second root registry and prevents
+a client from supplying an arbitrary absolute root. `loc` is a required unsigned
+decimal integer indexing `Workstream.locations`; only the hub's own local machine
+is supported. Remote and WSL locations return `501 unsupported`. All three routes
+require a device token; agent tokens receive `403` before any filesystem access.
+
+`path` is required, relative, and uses `/` separators. The empty string lists the
+root only; read and write require a nonempty path. Validate before disk access:
+reject absolute paths, `..`, empty or `.` components, NUL and backslashes. Windows
+also rejects drive, UNC and extended prefixes, colons (alternate data streams),
+reserved device names even with extensions (`CON`, `PRN`, `AUX`, `NUL`, `COM1` to
+`COM9`, `LPT1` to `LPT9`, including Windows' superscript-digit aliases), and trailing
+dots or spaces that Windows normalises. Writes reject every `.git` component
+(case-insensitively on Windows), including a final file named `.git`.
+
+List entries have a UTF-8 name, `kind` of `file`, `folder` or `link`, byte `size`,
+and UTC millisecond `modified_at` (null if unavailable). Non-UTF-8 names and special
+files are omitted. Return at most 5,000 entries sorted by name in UTF-8 byte order;
+`truncated` indicates that the complete directory could not be returned. Symbolic
+links, junctions and all reparse points may be listed as links but never followed.
+Walk each component without following links and check the opened handle's identity
+before reading or writing. Protect ancestor directories against replacement too.
+
+Read at most 8 MiB (8,388,608 bytes). `revision` is the lowercase hexadecimal
+SHA-256 of the exact bytes; `encoding` is `utf8` for valid UTF-8 and otherwise
+`base64` (canonical padded RFC 4648). `media_type` is a conservative type inferred
+from the name, defaulting to `application/octet-stream`; content is always carried
+inside JSON, never served as executable HTML. Responses carry `Cache-Control:
+no-store` and `X-Content-Type-Options: nosniff`.
+
+Write requires the revision returned by read, or JSON null meaning "must not
+exist". Missing `revision` is invalid. A mismatch returns `409 conflict` with
+`current_revision` (null for a missing target). Limit the JSON body to 12 MiB and
+decoded content to 8 MiB. Serialize writes, recheck the target before replacement,
+refuse targets with more than one hard link, preserve existing permissions, and
+write to an exclusively created temporary file in the same directory before
+atomic replacement. New files use private permissions. Refusal leaves the target
+untouched; temporary files are cleaned up.
+
+Before replacement, keep the old bytes under the daemon state directory's
+`file-backups/`, keyed by a hash of root and relative path, never by client path
+components. Retention: newest three backups per file, 64 MiB total,
+oldest first eviction; an individual backup is at most 8 MiB. Unix directories
+and files must be owner-only (0700 and 0600); Windows needs an owner-only DACL.
+Reject squatted directories, links and reparse points. Failure to create a private
+backup refuses the write. Logging records counts and fixed reasons only, never
+paths or contents. Backup retention is independent of UI file changes.
+
+Errors use the usual `code` and `message`, with optional `size` for `413 too_large`
+and `current_revision` for conflicts. Additional `ErrorCode` values are
+`too_large` (413) and `unsupported` (501). Bad paths, queries and bodies are 400;
+unknown workstreams, locations and files are 404; links, escapes, hard-linked
+write targets and `.git` writes are 403; I/O failures use fixed messages without
+paths. Workstream lookup and file operations run off async threads.
+
+Required implementation coverage: table tests for every lexical path rule;
+symbolic-link and Windows-junction list/read/write refusal; deterministic
+check/open and ancestor-swap tests; revision conflicts and exclusive creation;
+hard-link refusal on both platforms; permission preservation; private backups,
+squatting refusal and both retention caps. Shared mock/daemon conformance must
+cover list/read/write, conflicts, agent refusal, traversal, absolute paths, 413
+and 501. The daemon escape fixture must point only to a sibling temporary folder.
+None of these files API tests have been implemented or run yet.
+
 ## Routes
 
 Ids in paths are bare ULIDs (the `tsk_…` display form is also accepted). Task routes also accept

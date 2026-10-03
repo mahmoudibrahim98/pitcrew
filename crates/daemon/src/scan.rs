@@ -429,18 +429,24 @@ mod tests {
         while let Ok(bytes) = rx.try_recv() {
             got.push(serde_json::from_slice::<ScanFrame>(&bytes).unwrap());
         }
-        assert_eq!(
-            got,
-            [
-                ScanFrame::Progress(ScanProgress {
+        // The worker may emit periodic zero ticks while its empty pool starts on a busy host.
+        // Every tick must still be the empty scan's progress, and exactly one done must be last.
+        assert!(got.len() >= 2);
+        for frame in &got[..got.len() - 1] {
+            assert_eq!(
+                frame,
+                &ScanFrame::Progress(ScanProgress {
                     scanned: 0,
                     total: Some(0),
-                    path: None
-                }),
-                ScanFrame::Done {
-                    report: Default::default()
-                },
-            ]
+                    path: None,
+                })
+            );
+        }
+        assert_eq!(
+            got.last(),
+            Some(&ScanFrame::Done {
+                report: Default::default()
+            })
         );
 
         let (frames, rx) = mpsc::channel(FRAMES);
