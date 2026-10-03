@@ -391,7 +391,13 @@ fn run(
         let exe = exe_path(env)?;
         targets
             .iter()
-            .map(|&t| plan_install(t, env, &exe, chain, hook_form))
+            .map(|&t| {
+                if action == Action::Status && t == Target::Claude {
+                    unwrap_or_conflict(t, claude::plan_status(env, &exe))
+                } else {
+                    plan_install(t, env, &exe, chain, hook_form)
+                }
+            })
             .collect()
     };
 

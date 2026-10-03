@@ -239,6 +239,10 @@ fn command_matches_current(
     event: &str,
     form: HookForm,
 ) -> bool {
+    if form == HookForm::Auto {
+        return command_matches_current(bytes, found, exe, event, HookForm::Shell)
+            || command_matches_current(bytes, found, exe, event, HookForm::Exec);
+    }
     let hook: serde_json::Value = match serde_json::from_slice(
         &bytes[found.hook_value.value_start..found.hook_value.value_end],
     ) {
@@ -373,15 +377,19 @@ fn update_stale_event(doc: &str, exe: &str, event: &str, form: HookForm) -> Stri
         let value = format!(r#"["hook", "claude", {}]"#, jsontext::escape(event));
         if let Some(args) = args {
             replacement.replace_range(args.entry.value_start..args.entry.value_end, &value);
-        } else {
-            let entries: Vec<_> = parsed.members.iter().map(|m| m.entry).collect();
-            replacement = jsontext::append(
-                &replacement,
-                &entries,
-                parsed.close,
-                &format!("\"args\": {value}"),
-                "  ",
-                "",
+        } else if let Some(last) = parsed.members.last() {
+            let separator = if replacement.contains('\n') {
+                let newline = if doc.contains("\r\n") { "\r\n" } else { "\n" };
+                format!(
+                    ",{newline}{}",
+                    jsontext::indent_before(replacement.as_bytes(), last.entry.start)
+                )
+            } else {
+                ", ".to_owned()
+            };
+            replacement.insert_str(
+                last.entry.value_end,
+                &format!("{separator}\"args\": {value}"),
             );
         }
     } else if let Some(index) = parsed.members.iter().position(|m| m.key == "args") {
@@ -527,6 +535,48 @@ pub(crate) fn plan_install_with_form(env: Env<'_>, exe: &str, requested: HookFor
     let (form, reason) = super::hook_form::select(requested, env)?;
     let mut plan = plan_for_form(env, exe, form)?;
     plan.detail = format!("{}; {reason}", plan.detail);
+    Ok(plan)
+}
+
+pub(crate) fn plan_status(env: Env<'_>, exe: &str) -> Result<Plan> {
+    let mut plan = plan_for_form(env, exe, HookForm::Auto)?;
+    plan.changes.clear();
+    if plan.status == Status::Conflicting || plan.status == Status::Missing {
+        return Ok(plan);
+    }
+    let (_, original, _) = read_text(&path(env)?)?;
+    let mut exec = 0;
+    let mut shell = 0;
+    if let Some(hooks) = parse_checked(&original)? {
+        for event in EVENTS {
+            if let Some(member) = hooks.members.iter().find(|m| m.key == event) {
+                let arr = jsontext::array(original.as_bytes(), member.entry.value_start);
+                for found in find_all_ours(original.as_bytes(), &arr, event) {
+                    if command_matches_current(
+                        original.as_bytes(),
+                        &found,
+                        exe,
+                        event,
+                        HookForm::Exec,
+                    ) {
+                        exec += 1;
+                    } else if command_matches_current(
+                        original.as_bytes(),
+                        &found,
+                        exe,
+                        event,
+                        HookForm::Shell,
+                    ) {
+                        shell += 1;
+                    }
+                }
+            }
+        }
+    }
+    plan.detail = format!(
+        "{}; current path: {exec} exec form, {shell} shell form",
+        plan.detail
+    );
     Ok(plan)
 }
 
@@ -824,6 +874,47 @@ mod tests {
     }
 
     const EXE: &str = "/home/sam/.local/bin/pitcrew";
+
+    #[test]
+    fn migration_preserves_inline_layout_and_multiline_indent_and_newlines() {
+        for (original, expected) in [
+            (
+                r#"{"type":"command", "command":"pitcrew hook claude Stop", "timeout":17}"#,
+                r#"{"type":"command", "command":"/home/sam/.local/bin/pitcrew", "timeout":17, "args": ["hook", "claude", "Stop"]}"#,
+            ),
+            (
+                "{\r\n\t\"type\": \"command\",\r\n\t\"command\": \"pitcrew hook claude Stop\",\r\n\t\"timeout\": 17\r\n}",
+                "{\r\n\t\"type\": \"command\",\r\n\t\"command\": \"/home/sam/.local/bin/pitcrew\",\r\n\t\"timeout\": 17,\r\n\t\"args\": [\"hook\", \"claude\", \"Stop\"]\r\n}",
+            ),
+            (
+                "{\n    \"type\": \"command\",\n    \"command\": \"pitcrew hook claude Stop\"\n}",
+                "{\n    \"type\": \"command\",\n    \"command\": \"/home/sam/.local/bin/pitcrew\",\n    \"args\": [\"hook\", \"claude\", \"Stop\"]\n}",
+            ),
+        ] {
+            let wrap = |hook: &str| format!(r#"{{"hooks":{{"Stop":[{{"hooks":[{hook}]}}]}}}}"#);
+            assert_eq!(
+                update_stale_event(&wrap(original), EXE, "Stop", HookForm::Exec),
+                wrap(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn status_accepts_mixed_forms_and_detects_stale_paths_without_a_probe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env = env_of(&[("CLAUDE_CONFIG_DIR", tmp.path().to_str().unwrap())]);
+        assert!(plan_status(&env, EXE).unwrap().status == Status::Missing);
+        let original = fresh_document(EXE, HookForm::Shell);
+        let mixed = update_stale_event(&original, EXE, "Stop", HookForm::Exec);
+        std::fs::write(path(&env).unwrap(), &mixed).unwrap();
+        let plan = plan_status(&env, EXE).unwrap();
+        assert!(plan.status == Status::Installed);
+        assert!(plan.detail.contains("1 exec form, 4 shell form"));
+        assert!(plan.changes.is_empty());
+        let stale = plan_status(&env, "/home/sam/new/pitcrew").unwrap();
+        assert!(stale.status == Status::Stale);
+        assert!(stale.changes.is_empty());
+    }
 
     /// Applies every change in `plan` (test helper, without the production re-check-before-write
     /// machinery that lives in `install::mod`).
