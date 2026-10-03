@@ -261,7 +261,7 @@ fn effective_uid() -> io::Result<u32> {
 #[cfg(unix)]
 fn base_is_safe(uid: u32, mode: u32, me: u32) -> Result<(), String> {
     if uid != 0 && uid != me {
-        return Err(format!("it belongs to another user (uid {uid})"));
+        return Err("it belongs to another user, neither root nor this one".into());
     }
     if mode & 0o022 != 0 && mode & 0o1000 == 0 {
         return Err(format!(
@@ -281,7 +281,7 @@ fn left_by_us(is_dir: bool, uid: u32, mode: u32, me: u32) -> Result<(), String> 
         return Err("it is not a folder (a link, or a file)".into());
     }
     if uid != me {
-        return Err(format!("it belongs to another user (uid {uid})"));
+        return Err("it belongs to another user".into());
     }
     if mode & 0o7777 != 0o700 {
         return Err(format!("its mode is {:o}, not 700", mode & 0o7777));
@@ -952,26 +952,34 @@ pub(crate) mod tests {
     #[test]
     fn the_owner_and_mode_rules() {
         let me = 1000;
+        let someone_else = 1001;
         let dir = 0o040_000;
         assert_eq!(left_by_us(true, me, dir | 0o700, me), Ok(()));
-        for (is_dir, uid, mode) in [
-            (false, me, 0o120_777),
-            (true, 1001, dir | 0o700),
-            (true, 0, dir | 0o700),
-            (true, me, dir | 0o755),
-            (true, me, dir | 0o711),
-            (true, me, dir | 0o1700),
+        for (case, is_dir, uid, mode) in [
+            ("a link", false, me, 0o120_777),
+            ("another user's folder", true, someone_else, dir | 0o700),
+            ("root's folder", true, 0, dir | 0o700),
+            ("a 0755 folder", true, me, dir | 0o755),
+            ("a 0711 folder", true, me, dir | 0o711),
+            ("a sticky folder", true, me, dir | 0o1700),
         ] {
-            assert!(
-                left_by_us(is_dir, uid, mode, me).is_err(),
-                "{is_dir} {uid} {mode:o}"
-            );
+            assert!(left_by_us(is_dir, uid, mode, me).is_err(), "{case}");
         }
-        for (uid, mode) in [(0, 0o1777), (0, 0o755), (me, 0o700), (me, 0o1777)] {
-            assert_eq!(base_is_safe(uid, dir | mode, me), Ok(()), "{uid} {mode:o}");
+        for (case, uid, mode) in [
+            ("root's, sticky and open", 0, 0o1777),
+            ("root's, 0755", 0, 0o755),
+            ("ours, 0700", me, 0o700),
+            ("ours, sticky and open", me, 0o1777),
+        ] {
+            assert_eq!(base_is_safe(uid, dir | mode, me), Ok(()), "{case}");
         }
-        for (uid, mode) in [(1001, 0o700), (1001, 0o1777), (me, 0o777), (0, 0o775)] {
-            assert!(base_is_safe(uid, dir | mode, me).is_err(), "{uid} {mode:o}");
+        for (case, uid, mode) in [
+            ("another user's, 0700", someone_else, 0o700),
+            ("another user's, sticky", someone_else, 0o1777),
+            ("ours, open and not sticky", me, 0o777),
+            ("root's, group-writable", 0, 0o775),
+        ] {
+            assert!(base_is_safe(uid, dir | mode, me).is_err(), "{case}");
         }
     }
 
@@ -984,9 +992,10 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let file = dir.path().join("made");
         fs::write(&file, b"").expect("write");
-        assert_eq!(
-            effective_uid().expect("uid"),
-            fs::metadata(&file).expect("meta").uid()
+        assert!(
+            effective_uid().expect("the effective user")
+                == fs::metadata(&file).expect("meta").uid(),
+            "a socket's owner is not the user this process makes files as"
         );
     }
 
@@ -996,11 +1005,14 @@ pub(crate) mod tests {
     fn the_name_of_its_own_is_the_path_and_the_user() {
         let a = Path::new("/home/sam/.local/state/pitcrew/recaps.sqlite3");
         let b = Path::new("/home/sam/other/recaps.sqlite3");
-        assert_eq!(stable_name(a, 1000), stable_name(a, 1000));
-        assert_ne!(stable_name(a, 1000), stable_name(b, 1000));
-        assert_ne!(stable_name(a, 1000), stable_name(a, 1001));
+        assert!(stable_name(a, 1000) == stable_name(a, 1000), "the same");
+        assert!(stable_name(a, 1000) != stable_name(b, 1000), "another path");
+        assert!(stable_name(a, 1000) != stable_name(a, 1001), "another user");
         let name = stable_name(a, 1000);
-        assert_eq!(name.len(), "pitcrew-recaps-".len() + 32, "{name}");
-        assert!(name.starts_with("pitcrew-recaps-"), "{name}");
+        let digits = name.strip_prefix("pitcrew-recaps-").expect("the prefix");
+        assert!(
+            digits.len() == 32 && digits.bytes().all(|b| b.is_ascii_hexdigit()),
+            "32 hex digits after the prefix"
+        );
     }
 }
