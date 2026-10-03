@@ -2,9 +2,10 @@
 //! dispatch, an action the hub refuses, a restart that runs a range again, and the `project=` and
 //! `workstream=` activity filters.
 //!
-//! The runner link is not wired in yet, so a dispatch's end is appended to the store from the test,
-//! as that link will report it; the daemon looks at it with its next append (a comment through the
-//! API here) or at its next start.
+//! A dispatch's end is appended to the store from the test, as another writer would (the hub
+//! itself finishes a dispatch as succeeded together with the agent's move to review, so the
+//! office's rule only meets a task still in progress after such an end); the daemon looks at it
+//! with its next append (a comment through the API here) or at its next start.
 
 #![allow(clippy::unwrap_used)]
 

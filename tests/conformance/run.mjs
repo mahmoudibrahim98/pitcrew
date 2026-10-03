@@ -1,7 +1,7 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
-import { spawn } from 'node:child_process';
+import { delimiter, join, resolve } from 'node:path';
+import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
 import { startServer } from '../../apps/mock-hub/src/server.ts';
@@ -26,6 +26,33 @@ const env = {
   PITCREW_CONFORMANCE_EXPECTED: '',
 };
 let daemon, suite, mock, build;
+// Every process the daemon starts (pitcrew-ptyd, and the stand-in CLIs it runs) inherits this
+// mark, so the cleanup can end them: ptyd keeps a terminal that ended unseen for the next daemon.
+const mark = `pitcrew-conformance-${process.pid}-${Date.now()}`;
+async function marked() {
+  const want = `PITCREW_CONFORMANCE_RUN=${mark}`;
+  if (process.platform === 'linux') {
+    const pids = [];
+    for (const name of await readdir('/proc').catch(() => [])) {
+      if (!/^\d+$/.test(name) || Number(name) === process.pid) continue;
+      const environ = await readFile(`/proc/${name}/environ`).catch(() => null);
+      if (environ?.toString('latin1').split('\0').includes(want)) pids.push(Number(name));
+    }
+    return pids;
+  }
+  if (process.platform === 'darwin') {
+    try {
+      return execFileSync('ps', ['-axE', '-o', 'pid=,command='], { encoding: 'utf8' })
+        .split('\n')
+        .filter((line) => line.split(/\s+/).includes(want))
+        .map((line) => Number(line.trim().split(/\s+/)[0]))
+        .filter((pid) => pid !== process.pid);
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
 async function stop(child) {
   if (!child || child.exitCode !== null) return;
   const exited = once(child, 'exit');
@@ -43,6 +70,12 @@ async function cleanup() {
   stopping = true;
   await stop(suite);
   await stop(daemon);
+  for (const pid of await marked())
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      // Already gone.
+    }
   await stop(build);
   await mock?.close();
   await rm(temporary, { recursive: true, force: true });
@@ -58,16 +91,28 @@ try {
     env.PITCREW_CONFORMANCE_PERSON = 'dev-device-token';
     env.PITCREW_CONFORMANCE_AGENT = 'dev-agent-token';
   } else {
-    build = spawn('cargo', ['build', '-p', 'pitcrew-daemon', '--bin', 'pitcrewd', '--locked'], {
-      cwd: root,
-      stdio: 'inherit',
-    });
+    build = spawn(
+      'cargo',
+      ['build', '-p', 'pitcrew-daemon', '-p', 'pitcrew-ptyd', '--bins', '--locked'],
+      { cwd: root, stdio: 'inherit' },
+    );
     const [code] = await once(build, 'exit');
     if (code !== 0) throw new Error('Daemon build failed');
     const state = join(temporary, 'state');
     await mkdir(state, { mode: 0o700 });
     const refused = join(temporary, 'not-a-socket');
     await writeFile(refused, 'Synthetic runtime refusal\n');
+    // A dispatch starts its agent's CLI: stand-ins first on the daemon's PATH, never a real one.
+    // Each writes nothing and waits until this run's folder is gone (the cleanup), so its
+    // session stays `starting` while the suite runs; pitcrew-ptyd then exits once idle.
+    const bin = join(temporary, 'bin');
+    await mkdir(bin, { mode: 0o700 });
+    const standIn = `#!/bin/sh\nwhile [ -d '${state}' ]; do sleep 1; done\n`;
+    for (const cli of ['claude', 'codex', 'opencode'])
+      await writeFile(join(bin, cli), standIn, { mode: 0o700 });
+    env.PATH = [bin, process.env.PATH].filter(Boolean).join(delimiter);
+    const ptydEndpoint = join(temporary, 'ptyd');
+    await mkdir(ptydEndpoint, { mode: 0o700 });
     // Where cargo put it: CARGO_TARGET_DIR when set (as parallel worktrees do), else target/.
     const targetDir = process.env.CARGO_TARGET_DIR ? resolve(root, process.env.CARGO_TARGET_DIR) : join(root, 'target');
     daemon = spawn(
@@ -81,10 +126,20 @@ try {
         'tcp:127.0.0.1:0',
         '--tmux-socket',
         refused,
+        '--terminal-runtime',
+        'pty',
         '--ptyd',
-        join(temporary, 'missing-ptyd'),
+        join(targetDir, 'debug', 'pitcrew-ptyd'),
+        '--ptyd-endpoint',
+        join(ptydEndpoint, 'ptyd'),
+        '--ptyd-idle-exit-ms',
+        '500',
       ],
-      { cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'] },
+      {
+        cwd: root,
+        env: { ...env, PITCREW_CONFORMANCE_RUN: mark },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
     );
     // Keep diagnostic logs private: they may contain token paths; never print token files.
     let output = '';
