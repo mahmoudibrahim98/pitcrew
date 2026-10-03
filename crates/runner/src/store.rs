@@ -576,7 +576,9 @@ impl Drop for InstanceLock {
     /// Unlocks before the file is closed. A process another thread is starting holds a copy of
     /// every descriptor until it runs its program, and an flock lasts while any copy is open:
     /// closing alone can leave the lock held a moment after the runner stopped, and refuse the
-    /// next one (seen on macOS, where reading the host name starts `hostname`).
+    /// next one (seen on macOS, where reading the host name starts `hostname`). `LOCK_UN`
+    /// releases the lock of the open file every copy shares, so a child forked to keep the lock
+    /// would lose it here; none is meant to.
     fn drop(&mut self) {
         let _ = rustix::fs::flock(&self._file, rustix::fs::FlockOperation::Unlock);
     }
