@@ -1,12 +1,27 @@
 //! A portable recorded WSL machine. Only this test executable and synthetic files are used.
+//!
+//! State lives in files next to the executable: `booted` (the distro runs; without it, the
+//! first call waits [`BOOT`] for it to start), `offline` (the distro was shut down: calls fail
+//! and the heartbeat ends), `installed` and `started` (the helper). Every call is recorded in
+//! `calls.jsonl`, and the words of each command in `commands.jsonl`.
 use std::error::Error;
 use std::io::{BufRead as _, Read as _, Write as _};
 use std::path::Path;
 use std::time::Duration;
 
 pub const DISTRO: &str = "Lab 'quoted' distro";
+/// Names a careless Windows command line would split or change, or a shell would read: each
+/// must reach wsl.exe as one argument, unchanged.
+pub const HOSTILE: [&str; 3] = ["a \"b\" c\\", "trailing\\", "& ^ % !"];
 pub const WORKSPACE: &str = "01JB000000000000000WSP0001";
 pub const TOKEN: &str = "pcd_SYNTHETICWSLTEST000000000000000000000000000000";
+/// How long the stopped distro takes to start on its first call.
+pub const BOOT: Duration = Duration::from_millis(1500);
+/// What wsl.exe says on its own before the distro's output (in UTF-16LE).
+pub const NOTICE: &str = "wsl: A localhost proxy configuration was detected but not mirrored into WSL. WSL in NAT mode does not support localhost proxies.\r\n";
+
+/// The `wsl.exe` arguments of a transport call, around the distro and the command.
+const TRANSPORT: [&str; 5] = ["--cd", "~", "--exec", "/bin/sh", "-c"];
 
 pub fn run(dir: &Path, args: &[String]) -> Result<(), Box<dyn Error>> {
     let mut log = std::fs::OpenOptions::new()
@@ -14,34 +29,71 @@ pub fn run(dir: &Path, args: &[String]) -> Result<(), Box<dyn Error>> {
         .append(true)
         .open(dir.join("calls.jsonl"))?;
     writeln!(log, "{}", serde_json::to_string(args)?)?;
+    let booted = dir.join("booted").exists();
     if args.first().is_some_and(|s| s == "--list") {
+        // The listing is parsed as UTF-16LE: WSL_UTF8 would change it.
+        if std::env::var_os("WSL_UTF8").is_some() {
+            return Err("the distribution listing must not ask for UTF-8".into());
+        }
+        let state = if booted { "Running" } else { "Stopped" };
         let text = if args.iter().any(|s| s == "--running") {
-            "".to_owned()
+            if booted {
+                format!("{DISTRO}\r\n")
+            } else {
+                String::new()
+            }
         } else {
             format!(
-                "\u{feff}NAME                         STATE           VERSION\r\n* {DISTRO}         Stopped         2\r\n  Legacy distro               Stopped         1\r\n"
+                "\u{feff}  NAME                         STATE           VERSION\r\n* {DISTRO}          {state}         2\r\n  Legacy distro                Stopped         1\r\n"
             )
         };
-        let bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
-        std::io::stdout().write_all(&bytes)?;
+        std::io::stdout().write_all(&utf16(&text))?;
         return Ok(());
     }
-    if args.len() != 6 || args[..5] != ["-d", DISTRO, "--exec", "/bin/sh", "-c"] {
+    if args.len() != 8
+        || args[0] != "-d"
+        || !(args[1] == DISTRO || HOSTILE.contains(&args[1].as_str()))
+        || args[2..7] != TRANSPORT
+    {
         return Err("unexpected WSL arguments".into());
     }
-    let words = decode(&args[5])?;
+    if std::env::var("WSL_UTF8").as_deref() != Ok("1") {
+        return Err("a transport call without WSL_UTF8=1".into());
+    }
+    let words = decode(&args[7])?;
+    let mut commands = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("commands.jsonl"))?;
+    writeln!(commands, "{}", serde_json::to_string(&words)?)?;
+    if dir.join("offline").exists() {
+        let _ = std::fs::remove_file(dir.join("booted"));
+        return Err("distro unavailable".into());
+    }
+    if !booted {
+        std::thread::sleep(BOOT);
+        std::fs::write(dir.join("booted"), [])?;
+    }
     if words
         .get(2)
         .is_some_and(|s| s.contains("pitcrew-wsl-ready"))
     {
-        eprintln!("pitcrew-wsl-ready");
+        let tag = words.get(4).ok_or("missing ready tag")?;
+        // wsl.exe's notice comes first, in UTF-16LE: on stderr, and even on stdout, so the
+        // mark follows a line that starts with a NUL.
+        std::io::stderr().write_all(&utf16(NOTICE))?;
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(&utf16(NOTICE))?;
+        writeln!(stdout, "@@pitcrew-wsl-ready-{tag}")?;
+        stdout.flush()?;
         while !dir.join("offline").exists() {
             std::thread::sleep(Duration::from_millis(25));
         }
+        let _ = std::fs::remove_file(dir.join("booted"));
         return Err("distro stopped".into());
     }
-    if dir.join("offline").exists() {
-        return Err("distro unavailable".into());
+    if words == ["true"] {
+        return Ok(());
     }
     if words
         .get(2)
@@ -144,6 +196,21 @@ pub fn run(dir: &Path, args: &[String]) -> Result<(), Box<dyn Error>> {
         return Err("unrecorded WSL command".into());
     }
     Ok(())
+}
+
+/// The words of each command the fake ran, in order (`commands.jsonl`).
+pub fn commands(dir: &Path) -> Result<Vec<Vec<String>>, Box<dyn Error>> {
+    let Ok(text) = std::fs::read_to_string(dir.join("commands.jsonl")) else {
+        return Ok(Vec::new());
+    };
+    Ok(text
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?)
+}
+
+fn utf16(text: &str) -> Vec<u8> {
+    text.encode_utf16().flat_map(u16::to_le_bytes).collect()
 }
 
 fn decode(wrapped: &str) -> Result<Vec<String>, Box<dyn Error>> {

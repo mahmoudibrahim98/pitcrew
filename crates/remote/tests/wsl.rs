@@ -115,16 +115,15 @@ async fn real_wsl() -> Result<(), Box<dyn Error>> {
         return Ok(());
     };
     let local = pitcrew_fixtures::temp::short_tempdir()?;
-    let transport = Ssh::wsl("wsl.exe").with_runtime_dir(local.path().join("rt"));
+    let program = pitcrew_remote::wsl::default_program();
+    let transport = Ssh::wsl(&program).with_runtime_dir(local.path().join("rt"));
     let limits = Limits {
         max_output: Some(1024 * 1024),
         timeout: Some(std::time::Duration::from_secs(30)),
     };
-    let startup = Limits {
-        timeout: Some(std::time::Duration::from_secs(120)),
-        ..limits
-    };
-    let created = transport.run_limited(&distro, &["sh", "-c", "umask 077; HOME=$(mktemp -d /tmp/pitcrew-wsl-test.XXXXXX) || exit; export HOME; printf '%s\\n' \"$HOME\""], startup).await?;
+    // The distro may be stopped: start it within its own, longer limit first.
+    transport.start_wsl(&distro).await?;
+    let created = transport.run_limited(&distro, &["sh", "-c", "umask 077; HOME=$(mktemp -d /tmp/pitcrew-wsl-test.XXXXXX) || exit; export HOME; printf '%s\\n' \"$HOME\""], limits).await?;
     if !created.success() {
         return Err("could not create isolated WSL HOME".into());
     }
@@ -146,6 +145,20 @@ async fn real_wsl() -> Result<(), Box<dyn Error>> {
             .await?;
         assert!(output.success());
         assert_eq!(output.stdout_text(), quote);
+        // `--cd ~`: calls start in the distro user's home (from the passwd database; the HOME
+        // given to commands is the temporary one), not in a translated Windows folder.
+        let cwd = transport
+            .run_limited(
+                &distro,
+                &[
+                    "sh",
+                    "-c",
+                    "h=$(getent passwd \"$(id -u)\" | cut -d: -f6) && [ \"$(pwd -P)\" = \"$(cd \"$h\" && pwd -P)\" ]",
+                ],
+                limits,
+            )
+            .await?;
+        assert!(cwd.success(), "not started in the home: {cwd:?}");
         let target = Target::new(transport.clone(), &distro, &probe)?;
         let bytes = b"#!/bin/sh\nprintf 'pitcrewd 0.0.0\\n'\n";
         let helper = Helper::new(
@@ -191,8 +204,8 @@ async fn real_wsl() -> Result<(), Box<dyn Error>> {
 
 async fn transport_flow() -> Result<(), Box<dyn Error>> {
     use pitcrew_remote::{
-        Connector, ConnectorOptions, Daemon, DeployOptions, DirectLauncher, Helper, Launcher, Ssh,
-        Target, Transport,
+        Connector, ConnectorOptions, Daemon, DeployOptions, DirectLauncher, Helper, Launcher,
+        Limits, Ssh, Target, Transport,
     };
     use sha2::{Digest as _, Sha256};
     use std::sync::Arc;
@@ -204,7 +217,40 @@ async fn transport_flow() -> Result<(), Box<dyn Error>> {
         .join(format!("wsl{}", std::env::consts::EXE_SUFFIX));
     std::fs::copy(std::env::current_exe()?, &program)?;
     let transport = Ssh::wsl(&program).with_runtime_dir(temp.path().join("rt"));
+
+    // The distro is stopped: a call shorter than its start fails, the start's own limit is
+    // enough, and afterwards it answers at once.
+    let quick = Limits {
+        max_output: Some(1024 * 1024),
+        timeout: Some(fake::BOOT / 3),
+    };
+    assert!(matches!(
+        transport.probe_with(fake::DISTRO, quick).await,
+        Err(SshError::TimedOut(_))
+    ));
+    assert!(!temp.path().join("booted").exists());
+    transport.start_wsl(fake::DISTRO).await?;
+    assert!(temp.path().join("booted").exists());
     let probe = transport.probe(fake::DISTRO).await?;
+    assert_eq!(
+        fake::commands(temp.path())?.get(1),
+        Some(&vec!["true".to_owned()])
+    );
+    assert!(matches!(
+        Ssh::new(&program).start_wsl(fake::DISTRO).await,
+        Err(SshError::InvalidArgument(_))
+    ));
+    println!("test fake_wsl_stopped_distro_gets_a_longer_first_call ... ok");
+
+    // Each name reaches wsl.exe as one argument, unchanged (the fake knows no other).
+    for name in fake::HOSTILE {
+        assert_eq!(transport.probe(name).await?.info.hostname, "lab");
+        let log = std::fs::read_to_string(temp.path().join("calls.jsonl"))?;
+        let last: Vec<String> = serde_json::from_str(log.lines().last().ok_or("no call")?)?;
+        assert_eq!(last.get(1).map(String::as_str), Some(name));
+    }
+    println!("test fake_wsl_hostile_distro_names_stay_one_argument ... ok");
+
     let target = Target::new(transport, fake::DISTRO, &probe)?;
     let bytes = b"synthetic helper bytes";
     let helper = Helper::new(
@@ -230,6 +276,8 @@ async fn transport_flow() -> Result<(), Box<dyn Error>> {
         ConnectorOptions::default(),
     )?;
     let mut states = connector.watch();
+    // The heartbeat's mark follows wsl.exe's UTF-16LE notice on stderr and stdout: missing it
+    // would leave the link waiting for its full START_WAIT (two minutes).
     tokio::time::timeout(
         std::time::Duration::from_secs(10),
         states.wait_for(|s| s.is_connected()),
@@ -250,6 +298,6 @@ async fn transport_flow() -> Result<(), Box<dyn Error>> {
     drop(stream);
     connector.close().await;
     launcher.stop(&target).await?;
-    println!("test fake_wsl_probe_deploy_atomic_verify_launch_stdio ... ok");
+    println!("test fake_wsl_probe_deploy_atomic_verify_launch_stdio_past_utf16_notices ... ok");
     Ok(())
 }
