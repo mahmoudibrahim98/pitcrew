@@ -8,15 +8,17 @@ use common::{
     PAPER, RUNNER, SAM, SEED_RUNS, WRITER, agent, app, call, demo, expect, member, open, person,
 };
 use pitcrew_hub_work::{
-    DispatchError, DispatchRequest, Dispatcher, ENDED_WITHOUT_REPORT, INTERNAL_MESSAGE,
-    NEVER_STARTED, NewDispatch, TaskRef, WorkService,
+    DispatchError, DispatchRequest, Dispatcher, ENDED_WITHOUT_REPORT, INTERNAL_MESSAGE, MAX_BRIEF,
+    NEVER_STARTED, NewDispatch, RecordedStart, TaskRef, WorkService,
 };
-use pitcrew_protocol::api::ErrorCode;
+use pitcrew_protocol::api::{Caller, ErrorCode, TokenScope};
 use pitcrew_protocol::events::{Event, EventBody};
-use pitcrew_protocol::ids::{DispatchId, EventId, MachineId, ProjectId, ProjectKey, SessionId};
+use pitcrew_protocol::ids::{
+    DispatchId, EventId, MachineId, MemberId, ProjectId, ProjectKey, SessionId,
+};
 use pitcrew_protocol::model::{
-    DispatchOutcome, Engine, LinkBasis, PermissionMode, Project, ProjectStatus, Session,
-    SessionState, TaskStatus,
+    DispatchOutcome, Engine, LinkBasis, Member, MemberKind, PermissionMode, Project, ProjectStatus,
+    Session, SessionState, TaskPatch, TaskStatus,
 };
 use pitcrew_protocol::runner::RunnerCommand;
 use serde_json::{Value, json};
@@ -1097,5 +1099,250 @@ async fn a_session_started_for_an_agent_and_a_task_is_stored_ahead_of_its_cli() 
     assert_eq!(
         work.session(&session.id).expect("session").state,
         SessionState::Ended
+    );
+}
+
+/// Members other than the demo's: added as the hub adds them, by @sam.
+fn add_members(work: &WorkService, members: &[&Member]) {
+    let events: Vec<Event> = members
+        .iter()
+        .map(|m| Event {
+            id: EventId::new(),
+            at: 1_790_900_000_000,
+            workspace: work.workspace(),
+            author: member(SAM),
+            on_behalf_of: None,
+            body: EventBody::MemberAdded {
+                member: (*m).clone(),
+            },
+        })
+        .collect();
+    work.store().append(&events).expect("append");
+}
+
+fn someone(kind: MemberKind, handle: &str, owner: Option<MemberId>) -> Member {
+    Member {
+        id: MemberId::new(),
+        kind,
+        handle: handle.into(),
+        name: handle.trim_start_matches('@').into(),
+        owner,
+        persona: None,
+    }
+}
+
+fn device(member: MemberId) -> Caller {
+    Caller {
+        member,
+        scope: TokenScope::Device,
+        on_behalf_of: None,
+    }
+}
+
+/// A person runs only their own agents. Dispatching another person's agent, or one with no
+/// owner, is `403` with nothing recorded and the runner link never asked; so is storing a session
+/// for one (`POST /v1/sessions` with `agent`). The agent's owner may do both.
+#[tokio::test]
+async fn a_person_dispatches_and_starts_only_their_own_agents() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner = Recorder::new(Answer::Start);
+    let work = service(dir.path(), Some(Arc::clone(&runner)));
+    let kim = someone(MemberKind::Human, "@kim", None);
+    let kimbot = someone(MemberKind::Agent, "@kimbot", Some(kim.id));
+    let stray = someone(MemberKind::Agent, "@stray", None);
+    add_members(&work, &[&kim, &kimbot, &stray]);
+    let app = app(&work);
+    let laptop: MachineId = LAPTOP.parse().expect("machine");
+    let start = |agent: MemberId| RecordedStart {
+        machine: laptop,
+        engine: Engine::Claude,
+        cwd: "/home/kim/work".into(),
+        agent: Some(agent),
+        task: None,
+    };
+
+    let rev = work.store().latest_rev().expect("rev");
+    for (caller, agent) in [
+        (person(SAM), kimbot.id),
+        (person(SAM), stray.id),
+        (device(kim.id), member(RUNNER)),
+        (device(kim.id), stray.id),
+    ] {
+        let res = call(
+            &app,
+            Some(caller),
+            "POST",
+            "/v1/tasks/PAP-5/dispatch",
+            Some(json!({ "agent": agent })),
+        )
+        .await;
+        expect(&res, 403);
+        assert!(
+            res.1["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("only their own agents")),
+            "{}",
+            res.1
+        );
+        let err = work
+            .record_start(&caller, start(agent))
+            .expect_err("not theirs");
+        assert_eq!(err.code(), ErrorCode::Forbidden, "{err}");
+        assert_eq!(
+            work.store().latest_rev().expect("rev"),
+            rev,
+            "nothing recorded"
+        );
+    }
+    assert!(runner.calls().is_empty(), "the runner link was never asked");
+
+    // Their owner may.
+    let res = call(
+        &app,
+        Some(device(kim.id)),
+        "POST",
+        "/v1/tasks/PAP-5/dispatch",
+        Some(json!({ "agent": kimbot.id })),
+    )
+    .await;
+    expect(&res, 202);
+    assert_eq!(runner.calls().len(), 1);
+    assert_eq!(runner.calls()[0].owner, Some(kim.id));
+    let own = work
+        .record_start(&device(kim.id), start(kimbot.id))
+        .expect("their own");
+    assert_eq!(own.agent, Some(kimbot.id));
+}
+
+/// A dispatch's brief goes on its CLI's command line: one longer than 64 KiB is `400` with
+/// nothing recorded, whether given or the task's description it defaults to. 64 KiB is taken.
+#[tokio::test]
+async fn a_brief_longer_than_64_kib_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner = Recorder::new(Answer::Start);
+    let work = service(dir.path(), Some(Arc::clone(&runner)));
+    let rev = work.store().latest_rev().expect("rev");
+    let res = dispatch(
+        &work,
+        "PAP-5",
+        json!({ "agent": RUNNER, "brief": "a".repeat(MAX_BRIEF + 1) }),
+    )
+    .await;
+    expect(&res, 400);
+    assert!(
+        res.1["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("brief"))
+    );
+    assert_eq!(work.store().latest_rev().expect("rev"), rev);
+
+    work.patch_task(
+        &person(SAM),
+        &TaskRef::parse("PAP-5").expect("key"),
+        TaskPatch {
+            description: Some("d".repeat(MAX_BRIEF + 1)),
+            ..TaskPatch::default()
+        },
+    )
+    .expect("patch");
+    let rev = work.store().latest_rev().expect("rev");
+    let res = dispatch(&work, "PAP-5", json!({ "agent": RUNNER })).await;
+    expect(&res, 400);
+    assert!(
+        res.1["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("description")),
+        "{}",
+        res.1
+    );
+    assert_eq!(work.store().latest_rev().expect("rev"), rev);
+    assert!(runner.calls().is_empty());
+
+    let res = dispatch(
+        &work,
+        "PAP-5",
+        json!({ "agent": RUNNER, "brief": "b".repeat(MAX_BRIEF) }),
+    )
+    .await;
+    expect(&res, 202);
+    assert_eq!(runner.calls()[0].brief.len(), MAX_BRIEF);
+}
+
+/// The agent's report on a task a person already moved to review still reports its work done:
+/// `200` with the task as it is, and the dispatch succeeds (not `canceled` when its session
+/// ends). Nothing moves.
+#[tokio::test]
+async fn a_report_on_a_task_already_in_review_succeeds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner = Recorder::new(Answer::Start);
+    let work = service(dir.path(), Some(Arc::clone(&runner)));
+    let (dispatch_id, session) = dispatched(&work).await;
+    let task = pap5(&work);
+    for to in [TaskStatus::InProgress, TaskStatus::Review] {
+        work.move_task(&person(SAM), &TaskRef::Id(task.id), to)
+            .expect("person moves it");
+    }
+
+    let rev = work.store().latest_rev().expect("rev");
+    let res = call(
+        &app(&work),
+        Some(agent(RUNNER)),
+        "POST",
+        "/v1/tasks/PAP-5/move",
+        Some(json!({ "to": "review" })),
+    )
+    .await;
+    expect(&res, 200);
+    assert_eq!(res.1["status"], "review");
+    let events = events_after(&work, rev);
+    assert_eq!(types(&events), ["dispatch_finished"]);
+    assert_eq!(events[0].author, member(RUNNER));
+    let over = work.dispatch(&dispatch_id).expect("dispatch");
+    assert_eq!(over.outcome, Some(DispatchOutcome::Succeeded));
+
+    // Its session ending afterwards changes nothing more.
+    runner_reports(&work, vec![EventBody::SessionEnded { session }]);
+    assert_eq!(
+        work.dispatch(&dispatch_id).expect("dispatch").outcome,
+        Some(DispatchOutcome::Succeeded)
+    );
+    // Without an active dispatch, the same move is refused as before.
+    let res = call(
+        &app(&work),
+        Some(agent(RUNNER)),
+        "POST",
+        "/v1/tasks/PAP-5/move",
+        Some(json!({ "to": "review" })),
+    )
+    .await;
+    expect(&res, 409);
+}
+
+/// A session the hub ended (its CLI did not start, as far as the hub could tell) stays ended when
+/// the runner re-states it after all: the re-statement does not bring it back.
+#[tokio::test]
+async fn an_ended_session_is_not_revived_by_a_restatement() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner = Recorder::new(Answer::Start);
+    let work = service(dir.path(), Some(Arc::clone(&runner)));
+    let (_, session) = dispatched(&work).await;
+    work.abandon_session(&session, "its CLI did not start")
+        .expect("abandon");
+    assert_eq!(
+        work.session(&session).expect("session").state,
+        SessionState::Ended
+    );
+    for state in [SessionState::Working, SessionState::Idle] {
+        runner_reports(&work, vec![restated(&work, session, state)]);
+        let stored = work.session(&session).expect("session");
+        assert_eq!(stored.state, SessionState::Ended, "re-stated {state:?}");
+        assert!(!stored.native_id.is_empty(), "the rest is taken");
+    }
+    // A session not ended takes the state it is re-stated in.
+    let (_, other) = dispatched_on(&work, "PAP-6").await;
+    runner_reports(&work, vec![restated(&work, other, SessionState::Idle)]);
+    assert_eq!(
+        work.session(&other).expect("session").state,
+        SessionState::Idle
     );
 }

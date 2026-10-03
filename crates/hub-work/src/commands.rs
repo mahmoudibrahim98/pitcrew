@@ -324,7 +324,8 @@ impl WorkService {
     /// **An agent's report.** An agent that moves a task to review while it holds an active
     /// dispatch on it (`pitcrew report <task> --review`) reports that dispatch's work done: each
     /// such dispatch finishes as `succeeded` (`dispatch_finished`), in the same transaction as the
-    /// move.
+    /// move. A task a person already moved to review counts as that report: the dispatches
+    /// succeed, nothing moves, and the task is returned as it is.
     ///
     /// # Errors
     ///
@@ -349,6 +350,21 @@ impl WorkService {
         } else {
             Mover::Agent { on_own_task: true }
         };
+        let finished = |dispatch| {
+            self.by(
+                caller,
+                EventBody::DispatchFinished {
+                    dispatch,
+                    outcome: DispatchOutcome::Succeeded,
+                    summary: None,
+                },
+            )
+        };
+        if task.status == to && !reported.is_empty() {
+            let events: Vec<_> = reported.into_iter().map(finished).collect();
+            self.append(&events)?;
+            return Ok(task);
+        }
         if !task.status.can_move(to, mover) {
             return Err(WorkError::conflict(move_refusal(&task, to, mover)));
         }
@@ -359,16 +375,7 @@ impl WorkService {
             mover,
         };
         let mut events = vec![self.by(caller, body)];
-        events.extend(reported.into_iter().map(|dispatch| {
-            self.by(
-                caller,
-                EventBody::DispatchFinished {
-                    dispatch,
-                    outcome: DispatchOutcome::Succeeded,
-                    summary: None,
-                },
-            )
-        }));
+        events.extend(reported.into_iter().map(finished));
         self.append(&events)?;
         self.reload_moved(task.id, to)
     }

@@ -4,10 +4,12 @@
 //! session:
 //!
 //! 1. Under the command lock, it checks the request (`404` unknown task; `400` unknown agent or
-//!    machine, or a person named as the agent; `409` a done or canceled task, or an agent that
-//!    already holds an active dispatch on the task, such as a second click; `503` no live machine
-//!    to run on), then asks whether it can start there at all (`503` without a dispatcher, or
-//!    when [`Dispatcher::can_start`] says no: no runner attached, a machine it cannot reach).
+//!    machine, a person named as the agent, or a brief longer than [`MAX_BRIEF`]; `403` an agent
+//!    the caller does not own: a person runs only their own agents; `409` a done or canceled
+//!    task, or an agent that already holds an active dispatch on the task, such as a second
+//!    click; `503` no live machine to run on), then asks whether it can start there at all (`503`
+//!    without a dispatcher, or when [`Dispatcher::can_start`] says no: no runner attached, a
+//!    machine it cannot reach).
 //!    Nothing is recorded for any of these. Then it appends, in one transaction:
 //!    - `task_assigned` to the agent, if the task has no assignee;
 //!    - `dispatch_started`, naming the session it will run in (a new id);
@@ -25,8 +27,9 @@
 //!   ([`WorkService::dispatch_working`]);
 //! - when the agent reports the work done (it moves its task to review, which is what
 //!   `pitcrew report <task> --review` does), the dispatch finishes as `succeeded`, in the same
-//!   transaction as the move ([`WorkService::move_task`]); the back office's `dispatch_to_review`
-//!   rule moves a task still in progress when a dispatch succeeds;
+//!   transaction as the move ([`WorkService::move_task`]); a task a person already moved to review
+//!   counts as that report. The back office's `dispatch_to_review` rule moves a task still in
+//!   progress when a dispatch succeeds;
 //! - when the session ends without that report, the dispatch finishes as `canceled` ("stopped
 //!   work"), or as `failed` if its CLI never reported the session at all.
 //!
@@ -53,13 +56,17 @@ use pitcrew_protocol::ids::{
     DispatchId, MachineId, MemberId, PersonaId, SessionId, TaskId, TaskKey, WorkstreamId,
 };
 use pitcrew_protocol::model::{
-    Dispatch, DispatchOutcome, Engine, LinkBasis, Liveness, Location, Machine, MemberKind,
+    Dispatch, DispatchOutcome, Engine, LinkBasis, Liveness, Location, Machine, Member, MemberKind,
     PermissionMode, Session, SessionState, Task, TaskStatus,
 };
 use pitcrew_protocol::runner::RunnerCommand;
 use pitcrew_store::sql::Connection;
 use serde::Deserialize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+
+/// The longest brief a dispatch passes its CLI, in bytes (it goes on the CLI's command line), as
+/// `POST /v1/sessions` allows.
+pub const MAX_BRIEF: usize = 64 * 1024;
 
 /// `POST /v1/tasks/{id}/dispatch`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -206,8 +213,14 @@ fn locations(conn: &Connection, task: &Task) -> Result<Vec<Location>> {
 }
 
 impl WorkService {
-    /// Checks a dispatch and decides where it runs. See the [module docs](self).
-    fn plan_dispatch(&self, conn: &Connection, task: &TaskRef, new: &NewDispatch) -> Result<Plan> {
+    /// Checks a dispatch by `caller` and decides where it runs. See the [module docs](self).
+    fn plan_dispatch(
+        &self,
+        conn: &Connection,
+        caller: &Caller,
+        task: &TaskRef,
+        new: &NewDispatch,
+    ) -> Result<Plan> {
         let task = query::task(conn, task)?.ok_or_else(|| no_task(task))?;
         let agent = query::member(conn, &new.agent)?
             .ok_or_else(|| WorkError::invalid(format!("agent: no member {}.", new.agent)))?;
@@ -224,6 +237,23 @@ impl WorkService {
             ),
             None => None,
         };
+        let given = new.brief.clone().filter(|b| !b.trim().is_empty());
+        let brief = given
+            .clone()
+            .or_else(|| Some(task.description.clone()).filter(|d| !d.trim().is_empty()))
+            .unwrap_or_else(|| task.title.clone());
+        if brief.len() > MAX_BRIEF {
+            return Err(WorkError::invalid(if given.is_some() {
+                format!("brief must be at most {MAX_BRIEF} bytes.")
+            } else {
+                format!(
+                    "{}'s description is longer than a brief may be ({MAX_BRIEF} bytes); give a \
+                     shorter brief.",
+                    task.key
+                )
+            }));
+        }
+        require_owner(caller, &agent)?;
         if matches!(task.status, TaskStatus::Done | TaskStatus::Canceled) {
             let status = crate::codec::enum_text(&task.status).unwrap_or_default();
             return Err(WorkError::conflict(format!(
@@ -254,12 +284,6 @@ impl WorkService {
             Some(id) => query::persona(conn, id)?,
             None => None,
         };
-        let brief = new
-            .brief
-            .clone()
-            .filter(|b| !b.trim().is_empty())
-            .or_else(|| Some(task.description.clone()).filter(|d| !d.trim().is_empty()))
-            .unwrap_or_else(|| task.title.clone());
         Ok(Plan {
             owner: agent.owner,
             cwd: place.map_or_else(|| "~".to_owned(), |l| l.path.clone()),
@@ -302,10 +326,11 @@ impl WorkService {
     ///
     /// # Errors
     ///
-    /// `forbidden` for an agent; `not_found` for an unknown task; `invalid` for an unknown agent
-    /// or machine, or a person as the agent; `conflict` for a done or canceled task, an agent
-    /// already dispatched on it, or a runner that refused; `unavailable` with no dispatcher, no
-    /// live machine, or an unreachable runner; `internal` when the start failed.
+    /// `forbidden` for an agent, or an agent the caller does not own; `not_found` for an unknown
+    /// task; `invalid` for an unknown agent or machine, a person as the agent, or a brief longer
+    /// than [`MAX_BRIEF`]; `conflict` for a done or canceled task, an agent already dispatched on
+    /// it, or a runner that refused; `unavailable` with no dispatcher, no live machine, or an
+    /// unreachable runner; `internal` when the start failed.
     pub fn dispatch_task(
         &self,
         caller: &Caller,
@@ -315,7 +340,7 @@ impl WorkService {
         crate::commands::require_person(caller, "Dispatching a task")?;
         let (request, dispatcher) = {
             let _guard = self.lock();
-            let plan = self.read(|c| self.plan_dispatch(c, task, &new))?;
+            let plan = self.read(|c| self.plan_dispatch(c, caller, task, &new))?;
             // After the plan, so its 404, 400 and 409 answer first, as api-v1 orders them.
             let dispatcher = self.dispatcher().ok_or_else(|| {
                 WorkError::unavailable("This hub cannot start sessions: it has no runner link.")
@@ -625,8 +650,9 @@ impl WorkService {
     ///
     /// # Errors
     ///
-    /// `forbidden` for an agent; `invalid` for an unknown machine, agent or task, or a person
-    /// named as the agent.
+    /// `forbidden` for an agent, or an agent the caller does not own (a person runs only their
+    /// own agents, as for a dispatch); `invalid` for an unknown machine, agent or task, or a
+    /// person named as the agent.
     pub fn record_start(&self, caller: &Caller, start: RecordedStart) -> Result<Session> {
         crate::commands::require_person(caller, "Starting a session")?;
         let _guard = self.lock();
@@ -646,6 +672,7 @@ impl WorkService {
                         agent.handle
                     )));
                 }
+                require_owner(caller, &agent)?;
             }
             match &start.task {
                 Some(id) => query::task(c, &TaskRef::Id(*id))?
@@ -683,6 +710,18 @@ impl WorkService {
         )])?;
         Ok(session)
     }
+}
+
+/// A person runs only their own agents: `forbidden` unless `caller` owns `agent`. An agent with
+/// no owner is no one's to run.
+fn require_owner(caller: &Caller, agent: &Member) -> Result<()> {
+    if agent.owner == Some(caller.member) {
+        return Ok(());
+    }
+    Err(WorkError::forbidden(format!(
+        "{} is not your agent: a person may run only their own agents.",
+        agent.handle
+    )))
 }
 
 /// The summary of a dispatch whose session ended without the agent's report.
