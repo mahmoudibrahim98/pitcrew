@@ -213,8 +213,34 @@ impl Ws {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::thread;
+
+    /// Reads one whole request, its head and its `Content-Length` body. A server that closes with
+    /// bytes of the request still unread sends a reset instead of its answer's end, which the
+    /// client may see before the answer (`ConnectionReset`).
+    fn read_request(s: &mut TcpStream) -> Vec<u8> {
+        let mut got = Vec::new();
+        let mut buf = [0u8; 1024];
+        loop {
+            if let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&got[..end]).to_ascii_lowercase();
+                let len = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if got.len() >= end + 4 + len {
+                    return got;
+                }
+            }
+            let n = s.read(&mut buf).unwrap();
+            if n == 0 {
+                return got;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+    }
 
     #[test]
     fn reads_a_content_length_and_a_chunked_answer() {
@@ -226,8 +252,7 @@ mod tests {
                 "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n",
             ] {
                 let (mut s, _) = listener.accept().unwrap();
-                let mut seen = [0u8; 1024];
-                let _ = s.read(&mut seen).unwrap();
+                read_request(&mut s);
                 s.write_all(reply.as_bytes()).unwrap();
             }
         });
