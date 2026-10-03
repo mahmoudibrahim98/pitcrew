@@ -7,12 +7,16 @@ import type { ErrorCode } from './types.ts';
 export class ApiError extends Error {
   readonly code: ErrorCode;
   readonly status: number;
+  readonly size: number | undefined;
+  readonly current_revision: string | null | undefined;
 
-  constructor(code: ErrorCode, message: string, status: number) {
+  constructor(code: ErrorCode, message: string, status: number, details: { size?: number; current_revision?: string | null } = {}) {
     super(message);
     this.name = 'ApiError';
     this.code = code;
     this.status = status;
+    this.size = details.size;
+    this.current_revision = details.current_revision;
   }
 }
 

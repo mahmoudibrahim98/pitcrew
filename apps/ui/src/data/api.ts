@@ -55,6 +55,8 @@ const ERROR_CODES: readonly ErrorCode[] = [
   'conflict',
   'invalid',
   'unavailable',
+  'too_large',
+  'unsupported',
   'internal',
 ];
 
@@ -65,6 +67,8 @@ const CODE_BY_STATUS: Partial<Record<number, ErrorCode>> = {
   403: 'forbidden',
   404: 'not_found',
   409: 'conflict',
+  413: 'too_large',
+  501: 'unsupported',
   503: 'unavailable',
 };
 
@@ -87,7 +91,12 @@ export function errorFromResponse(res: TransportResponse): ApiError {
     body = undefined;
   }
   if (isErrorBody(body)) {
-    return new ApiError(body.code, body.message, res.status);
+    const details = body as ApiErrorBody & { size?: unknown; current_revision?: unknown };
+    return new ApiError(body.code, body.message, res.status, {
+      ...(typeof details.size === 'number' ? { size: details.size } : {}),
+      ...(details.current_revision === null || typeof details.current_revision === 'string'
+        ? { current_revision: details.current_revision } : {}),
+    });
   }
   const code = CODE_BY_STATUS[res.status] ?? 'internal';
   return new ApiError(code, `HTTP ${res.status} ${res.statusText ?? ''}`.trim(), res.status);
