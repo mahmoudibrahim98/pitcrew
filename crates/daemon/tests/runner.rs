@@ -138,7 +138,7 @@ fn a_transcript_is_a_session_with_its_transcript_and_live_records() {
     let device = daemon.device_token();
     let info = daemon.get("/v1/host/info", None).json();
     assert_eq!(info["roles"], json!(["hub", "runner"]));
-    assert_eq!(info["capabilities"], json!(["watch"]));
+    assert_eq!(info["capabilities"], json!(["watch", "scan"]));
     daemon.wait_for_log("the runner watches these homes", WAIT);
 
     let found = session_named(&daemon, &device, native);
@@ -380,7 +380,7 @@ fn a_demo_watches_no_home_of_its_own() {
     let info = daemon.get("/v1/host/info", None).json();
     assert_eq!(info["roles"], json!(["hub", "runner"]));
     // It runs, but watches nothing.
-    assert_eq!(info["capabilities"], json!([]));
+    assert_eq!(info["capabilities"], json!(["scan"]));
     // Its first discovery has long finished when the recap index is built and the back office has
     // looked at the seed; give the watcher a while more anyway.
     daemon.settle(&device);
@@ -454,7 +454,7 @@ fn no_runner_watches_nothing_and_serves_no_terminal() {
     daemon.wait_for_log("the runner is off (--no-runner)", WAIT);
     let info = daemon.get("/v1/host/info", None).json();
     assert_eq!(info["roles"], json!(["hub"]));
-    assert_eq!(info["capabilities"], json!([]));
+    assert_eq!(info["capabilities"], json!(["scan"]));
     for route in ["terminal", "transcript"] {
         let reply = daemon.get(&format!("/v1/sessions/{}/{route}", id::SES1), Some(&device));
         assert_eq!(reply.status, 503, "{route}: {}", reply.body);
@@ -596,7 +596,7 @@ fn a_runner_that_cannot_start_leaves_the_hub_serving() {
     );
     let info = daemon.get("/v1/host/info", None).json();
     assert_eq!(info["roles"], json!(["hub"]));
-    assert_eq!(info["capabilities"], json!([]));
+    assert_eq!(info["capabilities"], json!(["scan"]));
     let tasks = daemon.get("/v1/tasks", Some(&device));
     assert_eq!(tasks.status, 200, "{}", tasks.body);
     for route in ["terminal", "transcript"] {

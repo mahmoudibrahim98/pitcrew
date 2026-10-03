@@ -33,7 +33,8 @@ use std::fs;
 use std::io::Read;
 use std::panic::UnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -86,7 +87,7 @@ pub fn default_homes() -> Vec<ScanHome> {
 }
 
 /// Options for [`scan`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ScanOptions {
     /// Now, for ranking by recent activity (sessions in the last 30 and 90 days). Tests pass a
     /// fixed time so rankings are deterministic; [`ScanOptions::default`] uses the real clock.
@@ -94,6 +95,10 @@ pub struct ScanOptions {
     /// Worker threads for the light reads; `None` picks the machine's available parallelism.
     /// Capped at [`MAX_THREADS`] either way.
     pub threads: Option<usize>,
+    /// Set to stop scheduling work between homes, files and suggestion directories.
+    pub cancel: Arc<AtomicBool>,
+    /// Maximum time for the scan, including suggestions; in-flight filesystem operations must finish.
+    pub budget: Duration,
 }
 
 impl Default for ScanOptions {
@@ -104,6 +109,8 @@ impl Default for ScanOptions {
         Self {
             now: now_ms(),
             threads: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            budget: Duration::from_secs(600),
         }
     }
 }
@@ -130,15 +137,29 @@ pub use pitcrew_protocol::scan::{
 /// A read-only scan of a machine's agent history: discovers every engine's transcripts under
 /// `homes`, reads each one's light session facts, and returns counts plus suggested projects and
 /// workstreams. `progress` is called on the caller's own thread only, at most every 100 ms, and
-/// at least once at the end with `scanned == total`.
+/// at least once at the end; a partial scan may have `scanned < total`.
 pub fn scan(
     homes: &[ScanHome],
     options: &ScanOptions,
-    mut progress: impl FnMut(ScanProgress),
+    progress: impl FnMut(ScanProgress),
 ) -> ScanReport {
+    scan_with_resolver(homes, options, progress, git_root)
+}
+
+fn scan_with_resolver(
+    homes: &[ScanHome],
+    options: &ScanOptions,
+    mut progress: impl FnMut(ScanProgress),
+    mut resolver: impl FnMut(&Path, &dyn Fn() -> bool) -> Option<PathBuf>,
+) -> ScanReport {
+    let started = Instant::now();
+    let stopped = || options.cancel.load(Ordering::Relaxed) || started.elapsed() >= options.budget;
     let mut units: Vec<Unit> = Vec::new();
     let mut unreadable = 0u64;
     for home in homes {
+        if stopped() {
+            break;
+        }
         let found = match home.engine {
             Engine::Claude => ClaudeAdapter.discover(&home.home),
             Engine::Codex => CodexAdapter.discover(&home.home),
@@ -170,9 +191,13 @@ pub fn scan(
             let done = &done;
             let units = &units;
             let tx = tx.clone();
+            let stopped = &stopped;
             handles.push(scope.spawn(move || {
                 let mut out = Vec::new();
                 loop {
+                    if stopped() {
+                        break;
+                    }
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(unit) = units.get(i) else {
                         break;
@@ -226,9 +251,19 @@ pub fn scan(
         }
     }
 
+    let counts = aggregate_counts(&session_facts);
+    let suggestions = build_suggestions(
+        &session_facts,
+        homes,
+        options.now,
+        CASE_INSENSITIVE_PATHS,
+        &stopped,
+        &mut resolver,
+    );
     ScanReport {
-        counts: aggregate_counts(&session_facts),
-        suggestions: build_suggestions(&session_facts, homes, options.now, CASE_INSENSITIVE_PATHS),
+        partial: stopped().then_some(true),
+        counts,
+        suggestions,
         unreadable,
     }
 }
@@ -287,18 +322,21 @@ impl Unit {
 /// supposed to panic on untrusted transcript bytes, but transcripts are attacker-controllable
 /// text, so one bad file must not erase a thread's other results.
 fn run_unit(unit: &Unit) -> Vec<Option<SessionFacts>> {
-    run_catching_panics(unit.len(), || unit.label(), || unit.run())
+    run_catching_panics(unit.len(), || unit.run())
 }
 
 /// The mechanism behind [`run_unit`], generic so it is testable with a closure that panics on
-/// purpose rather than needing a real adapter bug. `label` is only called if `f` actually panics.
+/// purpose rather than needing a real adapter bug.
 fn run_catching_panics(
     len: usize,
-    label: impl FnOnce() -> String,
     f: impl FnOnce() -> Vec<Option<SessionFacts>> + UnwindSafe,
 ) -> Vec<Option<SessionFacts>> {
     std::panic::catch_unwind(f).unwrap_or_else(|_| {
-        tracing::warn!(path = %label(), "a scan unit panicked; counted as unreadable");
+        tracing::warn!(
+            count = len,
+            reason = "worker panicked",
+            "scan sessions counted as unreadable"
+        );
         vec![None; len]
     })
 }
@@ -612,24 +650,39 @@ fn recency_counts(sessions: &[&SessionFacts], now: TimestampMs) -> (usize, usize
 /// Climbs from `cwd` to the nearest ancestor containing a `.git` (directory or file). Uses
 /// `symlink_metadata` so a `.git` that is itself a symlink is not followed, matching how the
 /// adapters treat symlinks elsewhere in this crate.
-fn git_root(cwd: &Path) -> Option<PathBuf> {
-    cwd.ancestors()
-        .find(|a| fs::symlink_metadata(a.join(".git")).is_ok())
-        .map(Path::to_path_buf)
+fn git_root(cwd: &Path, stopped: &dyn Fn() -> bool) -> Option<PathBuf> {
+    for ancestor in cwd.ancestors() {
+        if stopped() {
+            break;
+        }
+        if fs::symlink_metadata(ancestor.join(".git")).is_ok() {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    None
 }
 
 /// Resolves every distinct cwd to a project root and whether it is a git root, grouping by
 /// [`cmp_key`] so two spellings of the same folder (a different drive-letter case, or `\` vs `/`)
 /// are not treated as different roots. The returned root keeps one of the original spellings, not
 /// a normalised one. Keyed by `cmp_key(cwd)`.
-fn resolve_roots(cwds: &[PathBuf], case_insensitive: bool) -> HashMap<String, (PathBuf, bool)> {
+fn resolve_roots(
+    cwds: &[PathBuf],
+    case_insensitive: bool,
+    stopped: &dyn Fn() -> bool,
+    resolver: &mut impl FnMut(&Path, &dyn Fn() -> bool) -> Option<PathBuf>,
+) -> HashMap<String, (PathBuf, bool)> {
     let mut out: HashMap<String, (PathBuf, bool)> = HashMap::with_capacity(cwds.len());
     let mut non_git: Vec<&PathBuf> = Vec::new();
     for cwd in cwds {
-        match git_root(cwd) {
+        if stopped() {
+            break;
+        }
+        match resolver(cwd, stopped) {
             Some(root) => {
                 out.insert(cmp_key(cwd, case_insensitive), (root, true));
             }
+            None if stopped() => break,
             None => non_git.push(cwd),
         }
     }
@@ -711,7 +764,12 @@ fn build_suggestions(
     homes: &[ScanHome],
     now: TimestampMs,
     case_insensitive: bool,
+    stopped: &dyn Fn() -> bool,
+    resolver: &mut impl FnMut(&Path, &dyn Fn() -> bool) -> Option<PathBuf>,
 ) -> Vec<Suggestion> {
+    if stopped() {
+        return Vec::new();
+    }
     let with_cwd: Vec<&SessionFacts> = facts
         .iter()
         .filter(|f| !f.is_subagent && f.cwd.is_some())
@@ -727,7 +785,7 @@ fn build_suggestions(
     }
     let mut distinct_cwds: Vec<PathBuf> = distinct.into_values().collect();
     distinct_cwds.sort();
-    let roots = resolve_roots(&distinct_cwds, case_insensitive);
+    let roots = resolve_roots(&distinct_cwds, case_insensitive, stopped, resolver);
 
     let mut by_root: HashMap<String, (PathBuf, bool, Vec<&SessionFacts>)> = HashMap::new();
     for f in &with_cwd {
@@ -873,9 +931,9 @@ mod tests {
         let sub = repo.join("crates").join("a");
         fs::create_dir_all(&sub).expect("mkdir");
         fs::create_dir(repo.join(".git")).expect("git dir");
-        assert_eq!(git_root(&sub), Some(repo.clone()));
-        assert_eq!(git_root(&repo), Some(repo));
-        assert_eq!(git_root(dir.path()), None);
+        assert_eq!(git_root(&sub, &|| false), Some(repo.clone()));
+        assert_eq!(git_root(&repo, &|| false), Some(repo));
+        assert_eq!(git_root(dir.path(), &|| false), None);
     }
 
     #[test]
@@ -885,7 +943,7 @@ mod tests {
             PathBuf::from("/w/notes/b"),
             PathBuf::from("/w/alone"),
         ];
-        let roots = resolve_roots(&cwds, false);
+        let roots = resolve_roots(&cwds, false, &|| false, &mut git_root);
         let key = |p: &str| cmp_key(Path::new(p), false);
         assert_eq!(
             roots[&key("/w/notes/a")],
@@ -972,14 +1030,16 @@ mod tests {
         ];
         let homes: [ScanHome; 0] = [];
 
-        let sensitive = build_suggestions(&sessions, &homes, 10_000, false);
+        let sensitive =
+            build_suggestions(&sessions, &homes, 10_000, false, &|| false, &mut git_root);
         assert_eq!(
             sensitive.len(),
             2,
             "case-sensitively, as on Linux, these are two different paths: {sensitive:?}"
         );
 
-        let insensitive = build_suggestions(&sessions, &homes, 10_000, true);
+        let insensitive =
+            build_suggestions(&sessions, &homes, 10_000, true, &|| false, &mut git_root);
         assert_eq!(insensitive.len(), 1, "{insensitive:?}");
         assert_eq!(insensitive[0].session_count, 2);
     }
@@ -1065,11 +1125,105 @@ mod tests {
     /// returns); that is expected noise from the one deliberate panic below, not a failure.
     #[test]
     fn a_panicking_unit_is_caught_and_counted_unreadable_not_lost() {
-        let out = run_catching_panics(
-            3,
-            || "synthetic.jsonl".to_owned(),
-            || panic!("synthetic panic for the test"),
-        );
+        let out = run_catching_panics(3, || panic!("synthetic panic for the test"));
         assert_eq!(out, vec![None, None, None]);
+    }
+
+    fn suggestion_test_home(root: &Path) -> ScanHome {
+        let home = root.join("claude-home");
+        let transcripts = home.join("projects").join("synthetic");
+        fs::create_dir_all(&transcripts).unwrap();
+        for name in ["a", "b", "c"] {
+            let cwd = root.join("work").join(name);
+            fs::create_dir_all(&cwd).unwrap();
+            let line = serde_json::json!({
+                "type": "user", "sessionId": name, "cwd": cwd,
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": {"role": "user", "content": "synthetic"}
+            });
+            fs::write(transcripts.join(format!("{name}.jsonl")), line.to_string()).unwrap();
+        }
+        ScanHome {
+            engine: Engine::Claude,
+            home,
+        }
+    }
+
+    #[test]
+    fn cancellation_during_suggestions_stops_remaining_resolutions() {
+        let root = tempfile::tempdir().unwrap();
+        let home = suggestion_test_home(root.path());
+        let options = ScanOptions::default();
+        let mut resolutions = 0;
+        let report = scan_with_resolver(
+            &[home],
+            &options,
+            |_| {},
+            |cwd, _| {
+                resolutions += 1;
+                options.cancel.store(true, Ordering::Relaxed);
+                Some(cwd.to_path_buf())
+            },
+        );
+        assert_eq!(
+            resolutions, 1,
+            "cancelled suggestions must not resolve remaining directories"
+        );
+        assert_eq!(report.partial, Some(true));
+        assert_eq!(report.counts.sessions, 3);
+        assert_eq!(report.suggestions.len(), 1);
+        assert_eq!(report.suggestions[0].session_count, 1);
+    }
+
+    #[test]
+    fn budget_exhausted_during_suggestions_marks_report_partial() {
+        let root = tempfile::tempdir().unwrap();
+        let home = suggestion_test_home(root.path());
+        let options = ScanOptions {
+            budget: Duration::from_secs(1),
+            ..ScanOptions::default()
+        };
+        let mut resolutions = 0;
+        let report = scan_with_resolver(
+            &[home],
+            &options,
+            |_| {},
+            |cwd, stopped| {
+                resolutions += 1;
+                while !stopped() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Some(cwd.to_path_buf())
+            },
+        );
+        assert_eq!(
+            report.partial,
+            Some(true),
+            "budget exhausted during suggestions must mark the report partial"
+        );
+        assert_eq!(resolutions, 1);
+        assert_eq!(report.counts.sessions, 3);
+        assert_eq!(report.suggestions.len(), 1);
+    }
+
+    #[test]
+    fn cancellation_and_zero_budget_return_partial_reports() {
+        let home = tempfile::tempdir().unwrap();
+        let homes = [ScanHome {
+            engine: Engine::Claude,
+            home: home.path().to_path_buf(),
+        }];
+        let cancelled = ScanOptions::default();
+        cancelled.cancel.store(true, Ordering::Relaxed);
+        let exhausted = ScanOptions {
+            budget: Duration::ZERO,
+            ..ScanOptions::default()
+        };
+        for options in [cancelled, exhausted] {
+            let report = scan(&homes, &options, |_| {});
+            assert_eq!(report.partial, Some(true));
+            assert_eq!(report.counts.sessions, 0);
+            assert_eq!(report.unreadable, 0);
+        }
     }
 }
