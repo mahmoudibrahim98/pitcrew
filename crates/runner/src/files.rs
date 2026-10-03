@@ -307,12 +307,13 @@ impl Files {
             checked.last()
         };
         let mut temp = storage::Temporary::new(parent, parent_handle)?;
+        // Writes can clear setgid on Unix; copy group and mode after the bytes are complete.
+        temp.file_mut().write_all(&data)?;
         if checked.exists {
             storage::permissions(checked.last(), &checked.path, temp.file(), temp.path())?;
         } else {
             temp.make_private()?;
         }
-        temp.file_mut().write_all(&data)?;
         temp.file().sync_all()?;
         checked.verify()?;
         if let Some(old) = old {
