@@ -16,6 +16,8 @@ const STATUS_BY_CODE: Record<ErrorCode, number> = {
   conflict: 409,
   invalid: 400,
   unavailable: 503,
+  too_large: 413,
+  unsupported: 501,
   internal: 500,
 };
 

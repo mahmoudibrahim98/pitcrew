@@ -439,6 +439,8 @@ export const schemas = {
       'conflict',
       'invalid',
       'unavailable',
+      'too_large',
+      'unsupported',
       'internal',
     ),
     message: text,

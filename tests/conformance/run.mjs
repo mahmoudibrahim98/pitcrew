@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, readFile, rm, writeFile, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
@@ -93,6 +93,21 @@ for (const signal of ['SIGINT', 'SIGTERM'])
     void cleanup().then(() => process.exit(130));
   });
 try {
+  const filesRoot = join(temporary, 'files');
+  const outside = join(temporary, 'outside');
+  await mkdir(join(filesRoot, 'src'), { recursive: true });
+  await mkdir(outside);
+  await writeFile(join(filesRoot, 'src', 'hello.txt'), 'hello\n');
+  await writeFile(join(filesRoot, 'large.bin'), Buffer.alloc(8 * 1024 * 1024 + 1));
+  await writeFile(join(outside, 'secret'), 'synthetic outside');
+  try {
+    await symlink(outside, join(filesRoot, 'outside'), process.platform === 'win32' ? 'junction' : 'dir');
+    env.PITCREW_FILES_LINK = '1';
+  } catch (error) {
+    if (!['EPERM', 'EACCES'].includes(error.code)) throw error;
+    console.log('# skipped: conformance link creation refused by the OS');
+  }
+  env.PITCREW_FILES_ROOT = filesRoot;
   if (target === 'mock') {
     mock = await startServer({ port: 0 });
     env.PITCREW_CONFORMANCE_URL = mock.url;
@@ -188,7 +203,7 @@ try {
   }
   suite = spawn(
     process.execPath,
-    ['--test', 'tests/conformance/api.test.mjs', 'tests/conformance/scan.test.mjs'],
+    ['--test', 'tests/conformance/api.test.mjs', 'tests/conformance/scan.test.mjs', 'tests/conformance/files.test.mjs'],
     {
       cwd: root,
       env,

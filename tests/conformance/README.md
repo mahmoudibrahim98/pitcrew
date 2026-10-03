@@ -64,3 +64,9 @@ scope isolation, future/malformed revisions, agent refusals and person isolation
 runner supplies `PITCREW_CONFORMANCE_SECOND_PERSON`: the mock's second synthetic device
 credential, or a random device credential provisioned in the daemon's temporary registry
 before startup. It never modifies a registry owned by a running daemon or a real person.
+
+files.test.mjs runs on both targets: location-root resolution, sorted lists, reads, text and
+binary writes, stale revisions and exclusive creation, bad paths, Git writes, device-only
+auth, file/body caps, remote refusal and outward-link refusal. The runner creates every file
+and link target inside its own temporary folder. Windows daemon conformance keeps its existing
+Unix-runtime skip; Rust daemon HTTP tests cover Files API routes there.
