@@ -645,3 +645,56 @@ export interface DemoRecaps {
   /** Each project's days, by date; within a date, the one without a workstream first. */
   projects: { project: ProjectId; days: DayRecap[] }[];
 }
+
+// ─── The machine scan (crates/protocol `scan`) ─────────────────────────────────────────────────
+
+export interface ScanProgress {
+  scanned: number;
+  total?: number;
+  path?: string;
+}
+
+export interface ScanCounts {
+  sessions: number;
+  subagent_sessions: number;
+  by_engine: { engine: Engine; count: number }[];
+  by_home: { engine: Engine; home: string; count: number }[];
+  by_folder: { path: string; count: number }[];
+  /** `YYYY-MM`, most recent first. */
+  by_month: { month: string; count: number }[];
+  first_activity?: TimestampMs;
+  last_activity?: TimestampMs;
+}
+
+export interface WorkstreamSuggestion {
+  /** A folder's own path, or `<project path>#<branch>`. */
+  id: string;
+  name: string;
+  branch?: string;
+  session_count: number;
+  recent_30d: number;
+  recent_90d: number;
+}
+
+export interface Suggestion {
+  id: string;
+  name: string;
+  path: string;
+  is_git: boolean;
+  session_count: number;
+  recent_30d: number;
+  recent_90d: number;
+  workstreams: WorkstreamSuggestion[];
+}
+
+export interface ScanReport {
+  counts: ScanCounts;
+  suggestions: Suggestion[];
+  unreadable: number;
+}
+
+/** One line of `POST /v1/machines/{id}/scan`'s answer. */
+export type ScanFrame =
+  | ({ type: 'progress' } & ScanProgress)
+  | { type: 'done'; report: ScanReport }
+  | { type: 'error'; code: ErrorCode; message: string };

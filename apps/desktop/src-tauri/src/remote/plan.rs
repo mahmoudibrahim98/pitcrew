@@ -24,6 +24,9 @@ pub const MAX_PLANS: usize = 32;
 pub struct RemotePlanRequest {
     /// The host, as given to ssh.
     pub host: String,
+    /// WSL target, mutually exclusive with a nonempty SSH host.
+    #[serde(default)]
+    pub target: Option<crate::registry::WslTarget>,
     /// How to start the helper.
     pub launcher: LauncherKind,
     /// A site recipe's name (SLURM); `generic` when absent.

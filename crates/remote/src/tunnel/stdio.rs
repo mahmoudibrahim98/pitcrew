@@ -101,7 +101,7 @@ pub(crate) struct Opening<'a> {
 ///   more sessions; with no master, a call through it fails at once);
 /// - [`TunnelError::Bridge`]: anything else, with what it said.
 pub(crate) async fn open(opening: Opening<'_>) -> Result<StdioStream, TunnelError> {
-    crate::quote::validate_host(opening.host)?;
+    opening.ssh.validate_destination(opening.host)?;
     let nonce = crate::askpass::to_hex(&crate::askpass::random::<8>().map_err(SshError::Setup)?);
     let mut argv = opening.argv;
     argv.extend(["--nonce".to_owned(), nonce.clone()]);

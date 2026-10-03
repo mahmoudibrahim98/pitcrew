@@ -57,7 +57,7 @@ stand-in inside your own paths.
 | Gap | Proposed by | Notes |
 |---|---|---|
 | TypeScript types generated from `crates/protocol` into `packages/protocol-ts` | H | e.g. `ts-rs` behind a `ts` feature in protocol; UI streams hand-type what they use until then |
-| Machine scan API (`POST /v1/machines/{id}/scan`, progress over the stream) | A + O | Types for scan results and suggested projects/workstreams |
+| Machine scan API: **in API v1** ("Machine scan"), types in `crates/protocol/src/scan.rs` | A + O | `POST /v1/machines/{id}/scan` for a hub's own machine: progress and the report as newline-delimited JSON in its own answer, not over the stream. Scanning a remote machine is still to come |
 | Machines and helper setup API (add machine, check, install helper, launchers) | J + K | The onboarding wizard's backend |
 | Files API (tree, read, write within project locations) | D | Allowed roots, size caps, canonicalisation |
 | Agent accounts and usage (`claude`/`codex` logins per machine, usage status) | D + M | Status bar and account chips |

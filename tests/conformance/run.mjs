@@ -134,6 +134,9 @@ try {
         join(ptydEndpoint, 'ptyd'),
         '--ptyd-idle-exit-ms',
         '500',
+        // A scan holds its machine this long, so scan.test.mjs can show a second one refused.
+        '--scan-hold-ms',
+        '1500',
       ],
       {
         cwd: root,
@@ -164,11 +167,15 @@ try {
     ).trim();
     env.PITCREW_CONFORMANCE_EXPECTED = join(root, 'tests/conformance/daemon-deviations.json');
   }
-  suite = spawn(process.execPath, ['--test', 'tests/conformance/api.test.mjs'], {
-    cwd: root,
-    env,
-    stdio: 'inherit',
-  });
+  suite = spawn(
+    process.execPath,
+    ['--test', 'tests/conformance/api.test.mjs', 'tests/conformance/scan.test.mjs'],
+    {
+      cwd: root,
+      env,
+      stdio: 'inherit',
+    },
+  );
   const [code] = await once(suite, 'exit');
   process.exitCode = code ?? 1;
 } finally {

@@ -132,6 +132,12 @@ pub struct ServeArgs {
     #[arg(long, value_name = "MS", hide = true)]
     pub ptyd_idle_exit_ms: Option<u64>,
 
+    /// For tests and development only: each machine scan (`POST /v1/machines/{id}/scan`) waits
+    /// this long once it is accepted, holding its machine's place, before it walks the agent
+    /// homes, so a second scan meanwhile can be shown to get 409.
+    #[arg(long, value_name = "MS", hide = true)]
+    pub scan_hold_ms: Option<u64>,
+
     /// For tests and development only: `pty` runs the terminals in pitcrew-ptyd even where tmux
     /// is usable; `auto` (the default) prefers tmux.
     #[arg(long, value_name = "RUNTIME", hide = true, value_enum, default_value_t = TerminalRuntimeArg::Auto)]
@@ -392,6 +398,27 @@ mod tests {
         ] {
             assert!(!help.contains(hidden), "{hidden}: {help}");
         }
+    }
+
+    /// `--scan-hold-ms` is for tests and development too: it parses, a bad value is refused, and
+    /// help does not show it.
+    #[test]
+    fn the_scan_hold_is_hidden() {
+        let cli = Cli::try_parse_from(["pitcrewd", "serve", "--scan-hold-ms", "1500"]).unwrap();
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("not serve");
+        };
+        assert_eq!(args.scan_hold_ms, Some(1500));
+        let defaults = Cli::try_parse_from(["pitcrewd", "serve"]).unwrap();
+        let Some(Command::Serve(args)) = defaults.command else {
+            panic!("not serve");
+        };
+        assert_eq!(args.scan_hold_ms, None);
+        assert!(Cli::try_parse_from(["pitcrewd", "serve", "--scan-hold-ms", "soon"]).is_err());
+        let mut command = Cli::command();
+        let serve = command.find_subcommand_mut("serve").unwrap();
+        let help = serve.render_long_help().to_string();
+        assert!(!help.contains("scan-hold"), "{help}");
     }
 
     #[test]

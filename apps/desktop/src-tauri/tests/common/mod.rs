@@ -60,6 +60,7 @@ pub fn register_remote(
         name: name.into(),
         kind: WorkspaceKind::Remote,
         connection: Connection::Remote(Box::new(RemoteConnection {
+            target: None,
             host: "hpc-login".into(),
             launcher: LauncherKind::Direct,
             root: "/home/sam/.pitcrew".into(),

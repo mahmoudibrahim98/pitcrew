@@ -1,15 +1,31 @@
 // @vitest-environment happy-dom
 //
 // The real `OnboardingApi` (`createHubOnboardingApi`): setup is `POST /v1/setup` (here a stand-in
-// for the data layer's `setUp`), the host list is the gateway's `sshHosts`, and every other call
-// is unavailable, so the first run is Welcome, Workspace, Done. The hub's refusals land by the
-// right field, and a workspace set up meanwhile goes Home.
+// for the data layer's `setUp`), the host list is the gateway's `sshHosts`, the scan is
+// `POST /v1/machines/{id}/scan` and creating from it `POST /v1/projects` and `/v1/workstreams`
+// (here a stand-in for the data layer's client), and every other call is unavailable. Without the
+// client the first run is Welcome, Workspace, Done; with it, Scan and Create come between. The
+// hub's refusals land by the right field, and a workspace set up meanwhile goes Home.
 
 import { cleanup, fireEvent, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, SetupConflict, type RemoteGateway, type Setup, type SetupResult } from '../data/index.ts';
-import { SetupRefused } from './api.ts';
-import { createHubOnboardingApi } from './hub-api.ts';
+import {
+  ApiError,
+  SetupConflict,
+  type Machine,
+  type NewProject,
+  type NewWorkstream,
+  type Project,
+  type RemoteGateway,
+  type Setup,
+  type SetupResult,
+  type TransportResponse,
+  type Workstream,
+} from '../data/index.ts';
+import { SetupRefused, type OnboardingApi, type ProjectSelection, type ScanProgressEvent } from './api.ts';
+import { createHubOnboardingApi, type HubData } from './hub-api.ts';
+import { SCAN_REPORT } from './scan-fixture.ts';
+import { toScanResult } from './scan-wire.ts';
 import { stepsFor } from './steps.ts';
 import { renderWizard, TEST_WS } from './test-support.tsx';
 
@@ -165,5 +181,338 @@ describe('the real first run', () => {
     fireEvent.change(screen.getByLabelText('Your name'), { target: { value: 'Alex Kim' } });
     expect((screen.getByLabelText('Your handle') as HTMLInputElement).value).toBe('@Sam');
     expect(setUp).not.toHaveBeenCalled();
+  });
+});
+
+// ─── The scan and creating from it ─────────────────────────────────────────────────────────────
+
+const LAPTOP = '01JB000000000000000MCH0001';
+const SAM = '01JB000000000000000MEM0001';
+const MACHINES: Machine[] = [
+  { id: '01JB000000000000000MCH0002', name: 'a SLURM cluster', kind: 'ssh', liveness: 'live' },
+  { id: LAPTOP, name: 'This laptop', kind: 'local', liveness: 'live' },
+];
+
+function ndjson(...frames: unknown[]): string {
+  return frames.map((frame) => `${JSON.stringify(frame)}\n`).join('');
+}
+
+const SCANNED: TransportResponse = {
+  status: 200,
+  contentType: 'application/x-ndjson',
+  body: ndjson({ type: 'progress', scanned: 0 }, { type: 'progress', scanned: 6, total: 6 }, { type: 'done', report: SCAN_REPORT }),
+};
+
+interface FakeHubOptions {
+  /** The scan's answer. */
+  scan?: TransportResponse;
+  /** Keys of the workspace's projects. */
+  keys?: string[];
+  /** Keys the hub answers 409 for, as if another client took them meanwhile. */
+  takenMeanwhile?: string[];
+  /** The workstream create (counting from 0) that fails once, as if the hub were out of reach. */
+  failWorkstream?: number;
+}
+
+/** A stand-in for the data layer's client, recording what it is sent. */
+function fakeHub(options: FakeHubOptions = {}) {
+  const sent: string[] = [];
+  const projects: NewProject[] = [];
+  const workstreams: NewWorkstream[] = [];
+  let failWorkstream = options.failWorkstream;
+  const existing: Project[] = (options.keys ?? []).map((key, i) => ({
+    id: `prj-existing-${i}`,
+    key,
+    name: key,
+    status: 'in_progress',
+    lead: SAM,
+    members: [SAM],
+    external: [],
+  }));
+  const data: HubData = {
+    transport: {
+      kind: 'browser',
+      label: 'a test hub',
+      request: (method, path) => {
+        sent.push(`${method} ${path}`);
+        return Promise.resolve(options.scan ?? SCANNED);
+      },
+      openSocket: () => {
+        throw new Error('no sockets in this test');
+      },
+    },
+    machines: () => Promise.resolve(MACHINES),
+    projects: () => Promise.resolve(existing),
+    createProject: (project) => {
+      if (options.takenMeanwhile?.includes(project.key) === true) {
+        return Promise.reject(new ApiError('conflict', `The key ${project.key} is already used.`, 409));
+      }
+      projects.push(project);
+      const created: Project = {
+        id: `prj-${projects.length}`,
+        key: project.key,
+        name: project.name,
+        status: 'in_progress',
+        lead: SAM,
+        members: [SAM],
+        ...(project.root === undefined ? {} : { root: project.root }),
+        external: [],
+      };
+      return Promise.resolve(created);
+    },
+    createWorkstream: (workstream) => {
+      if (failWorkstream === workstreams.length) {
+        failWorkstream = undefined;
+        return Promise.reject(new ApiError('unavailable', 'Cannot reach the hub', 0));
+      }
+      workstreams.push(workstream);
+      const created: Workstream = {
+        id: `wst-${workstreams.length}`,
+        project: workstream.project,
+        name: workstream.name,
+        status: 'active',
+        health: 'on_track',
+        locations: workstream.locations ?? [],
+        external: [],
+      };
+      return Promise.resolve(created);
+    },
+  };
+  return { data, sent, projects, workstreams };
+}
+
+/** Every event of one scan, up to its last. */
+function scanned(api: OnboardingApi, machine: Parameters<OnboardingApi['streamScan']>[0]['machine'] = { kind: 'local' }) {
+  return new Promise<ScanProgressEvent[]>((resolve) => {
+    const events: ScanProgressEvent[] = [];
+    api.streamScan({ machine }, (event) => {
+      events.push(event);
+      if (event.type !== 'progress') resolve(events);
+    });
+  });
+}
+
+const PAPER = '/home/sam/work/paper';
+const TOOLS = '/home/sam/work/tools';
+const DRAFTS = '/home/sam/work/paper/drafts';
+const REVISION = '/home/sam/work/paper#revision-2';
+
+describe('the scan, from the hub', () => {
+  it('is served once the hub api has the workspace’s client: Scan and Create join the first run', () => {
+    const api = createHubOnboardingApi({ setUp: () => Promise.reject(new Error('unused')), data: fakeHub().data });
+    expect(api.unavailable.has('streamScan')).toBe(false);
+    expect(api.unavailable.has('createFromScan')).toBe(false);
+    expect(stepsFor(api).map((s) => s.id)).toEqual(['welcome', 'workspace', 'scan', 'create', 'done']);
+    for (const call of ['checkMachine', 'importSessions', 'hooksDiff', 'saveSafety'] as const) {
+      expect(api.unavailable.has(call)).toBe(true);
+    }
+  });
+
+  it('scans the hub’s own machine, passing on its progress and then the mapped result', async () => {
+    const hub = fakeHub();
+    const events = await scanned(createHubOnboardingApi({ data: hub.data }));
+    expect(hub.sent).toEqual([`POST /v1/machines/${LAPTOP}/scan`]);
+    expect(events).toEqual([
+      { type: 'progress', scanned: 0 },
+      { type: 'progress', scanned: 6, total: 6 },
+      { type: 'done', result: toScanResult(SCAN_REPORT) },
+    ]);
+  });
+
+  it('says why the hub refused a scan', async () => {
+    const message = 'A scan of This laptop is already running; wait for it to finish.';
+    const hub = fakeHub({ scan: { status: 409, body: JSON.stringify({ code: 'conflict', message }) } });
+    expect(await scanned(createHubOnboardingApi({ data: hub.data }))).toEqual([{ type: 'error', message }]);
+    const bare = fakeHub({ scan: { status: 502, body: '<html>Bad gateway</html>' } });
+    expect(await scanned(createHubOnboardingApi({ data: bare.data }))).toEqual([
+      { type: 'error', message: 'The hub answered 502.' },
+    ]);
+  });
+
+  it('ends with an error for an answer that is not the contract’s, or has no report', async () => {
+    const nonsense = fakeHub({ scan: { status: 200, body: 'nonsense\n' } });
+    const [malformed] = await scanned(createHubOnboardingApi({ data: nonsense.data }));
+    expect(malformed).toMatchObject({ type: 'error', message: expect.stringContaining('malformed') as unknown });
+    const cut = fakeHub({ scan: { status: 200, body: ndjson({ type: 'progress', scanned: 0 }) } });
+    expect((await scanned(createHubOnboardingApi({ data: cut.data }))).at(-1)).toEqual({
+      type: 'error',
+      message: 'The scan ended without a result.',
+    });
+    const failed = fakeHub({
+      scan: { status: 200, body: ndjson({ type: 'error', code: 'internal', message: 'The scan failed.' }) },
+    });
+    expect(await scanned(createHubOnboardingApi({ data: failed.data }))).toEqual([
+      { type: 'error', message: 'The scan failed.' },
+    ]);
+  });
+
+  it('scans only this machine for now', async () => {
+    const hub = fakeHub();
+    const [event] = await scanned(createHubOnboardingApi({ data: hub.data }), { kind: 'ssh', host: 'hpc-login' });
+    expect(event?.type).toBe('error');
+    expect(hub.sent).toEqual([]);
+  });
+
+  it('sends nothing when cancelled before its request went out, as StrictMode’s first mount is', async () => {
+    const hub = fakeHub();
+    const onEvent = vi.fn();
+    const streamed = createHubOnboardingApi({ data: hub.data }).streamScan({ machine: { kind: 'local' } }, onEvent);
+    streamed.cancel();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(hub.sent).toEqual([]);
+    expect(onEvent).not.toHaveBeenCalled();
+  });
+});
+
+describe('creating from the scan', () => {
+  const both: ProjectSelection[] = [
+    {
+      suggestionId: PAPER,
+      name: ' Paper ',
+      template: 'research',
+      workstreams: [
+        { suggestionId: DRAFTS, name: 'Drafts' },
+        { suggestionId: REVISION, name: '' },
+      ],
+    },
+    { suggestionId: TOOLS, name: 'tools', template: 'software', workstreams: [] },
+  ];
+
+  it('needs a scan first', async () => {
+    await expect(createHubOnboardingApi({ data: fakeHub().data }).createFromScan(both)).rejects.toThrow('Scan this machine first.');
+  });
+
+  it('creates the chosen projects at their roots and the workstreams where the scan found them', async () => {
+    const hub = fakeHub({ keys: ['PAP'] });
+    const api = createHubOnboardingApi({ data: hub.data });
+    await scanned(api);
+    const result = await api.createFromScan(both);
+    // Keys from the names, unique in the workspace: `PAP` is taken, so the paper is `PAP2`.
+    expect(hub.projects).toEqual([
+      { key: 'PAP2', name: 'Paper', root: { machine: LAPTOP, path: PAPER } },
+      { key: 'TOO', name: 'tools', root: { machine: LAPTOP, path: TOOLS } },
+    ]);
+    // A folder is its own place; a branch is the project's root on that branch. A cleared name is
+    // the suggestion's.
+    expect(hub.workstreams).toEqual([
+      { project: 'prj-1', name: 'Drafts', locations: [{ machine: LAPTOP, path: DRAFTS }] },
+      { project: 'prj-1', name: 'revision-2', locations: [{ machine: LAPTOP, path: PAPER, branch: 'revision-2' }] },
+    ]);
+    expect(result.projects.map((p) => p.key)).toEqual(['PAP2', 'TOO']);
+    expect(result.workstreams.map((w) => w.project)).toEqual(['prj-1', 'prj-1']);
+  });
+
+  it('keeps a workstream’s place when it is moved to another project', async () => {
+    const hub = fakeHub();
+    const api = createHubOnboardingApi({ data: hub.data });
+    await scanned(api);
+    await api.createFromScan([
+      { suggestionId: TOOLS, name: 'Tools', template: 'blank', workstreams: [{ suggestionId: DRAFTS, name: 'Drafts' }] },
+    ]);
+    expect(hub.workstreams).toEqual([
+      { project: 'prj-1', name: 'Drafts', locations: [{ machine: LAPTOP, path: DRAFTS }] },
+    ]);
+  });
+
+  it('tries the next key when the hub says one was taken meanwhile', async () => {
+    const hub = fakeHub({ takenMeanwhile: ['PAP', 'PAP2'] });
+    const api = createHubOnboardingApi({ data: hub.data });
+    await scanned(api);
+    await api.createFromScan([{ suggestionId: PAPER, name: 'paper', template: 'research', workstreams: [] }]);
+    expect(hub.projects.map((p) => p.key)).toEqual(['PAP3']);
+  });
+
+  it('creates only what is missing when tried again after a failure part-way', async () => {
+    const hub = fakeHub({ failWorkstream: 1 });
+    const api = createHubOnboardingApi({ data: hub.data });
+    await scanned(api);
+    await expect(api.createFromScan(both)).rejects.toThrow('Cannot reach the hub');
+    expect(hub.projects).toHaveLength(1);
+    const result = await api.createFromScan(both);
+    expect(hub.projects.map((p) => p.key)).toEqual(['PAP', 'TOO']);
+    expect(hub.workstreams.map((w) => w.name)).toEqual(['Drafts', 'revision-2']);
+    expect(result.projects.map((p) => p.id)).toEqual(['prj-1', 'prj-2']);
+    expect(result.workstreams.map((w) => w.id)).toEqual(['wst-1', 'wst-2']);
+  });
+
+  it('refuses a suggestion the last scan did not have', async () => {
+    const api = createHubOnboardingApi({ data: fakeHub().data });
+    await scanned(api);
+    await expect(
+      api.createFromScan([{ suggestionId: '/home/sam/elsewhere', name: 'Elsewhere', template: 'blank', workstreams: [] }]),
+    ).rejects.toThrow('not in the last scan');
+  });
+});
+
+describe('the real first run, with the scan', () => {
+  it('is Welcome, Workspace, Scan, Create, Done, creating what stayed ticked', async () => {
+    const setUp = vi.fn<(setup: Setup) => Promise<SetupResult>>(() => Promise.resolve(RESULT));
+    const hub = fakeHub();
+    renderWizard(createHubOnboardingApi({ setUp, data: hub.data }));
+    await screen.findByRole('heading', { level: 1, name: 'Welcome to PitCrew' });
+    expect(screen.getAllByRole('tab').map((t) => t.textContent?.replace(/^\d/, ''))).toEqual([
+      'Welcome',
+      'Workspace',
+      'Scan',
+      'Create',
+      'Done',
+    ]);
+    fireEvent.click(screen.getByRole('button', { name: 'Get started' }));
+    await screen.findByRole('heading', { level: 1, name: 'Your first workspace' });
+    fireEvent.change(screen.getByLabelText('Workspace name'), { target: { value: 'Demo Lab' } });
+    fireEvent.change(screen.getByLabelText('Your name'), { target: { value: 'Sam Rivera' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+
+    await screen.findByRole('heading', { level: 1, name: 'Scanning for sessions' });
+    await screen.findByText(/Found 2 likely projects/);
+    expect(screen.getByText(DRAFTS)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+
+    await screen.findByRole('heading', { level: 1, name: 'Create projects and workstreams' });
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Include revision-2' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+
+    await screen.findByRole('heading', { level: 1, name: "You're set up" });
+    expect(screen.getByText('Created 2 projects.')).toBeTruthy();
+    expect(hub.projects.map((p) => [p.key, p.name])).toEqual([
+      ['PAP', 'paper'],
+      ['TOO', 'tools'],
+    ]);
+    expect(hub.workstreams.map((w) => w.name)).toEqual(['drafts']);
+    expect(hub.sent).toEqual([`POST /v1/machines/${LAPTOP}/scan`]);
+  });
+
+  it('says why a scan failed, and tries again on request', async () => {
+    const message = 'A scan of This laptop is already running; wait for it to finish.';
+    let answers = [
+      { status: 409, body: JSON.stringify({ code: 'conflict', message }) },
+      SCANNED,
+    ];
+    const hub = fakeHub();
+    const data: HubData = {
+      ...hub.data,
+      transport: {
+        ...hub.data.transport,
+        request: (method, path, body, signal) => {
+          const [next, ...rest] = answers;
+          answers = rest;
+          void hub.data.transport.request(method, path, body, signal);
+          return Promise.resolve(next ?? SCANNED);
+        },
+      },
+    };
+    renderWizard(createHubOnboardingApi({ setUp: () => Promise.resolve(RESULT), data }));
+    await screen.findByRole('heading', { level: 1, name: 'Welcome to PitCrew' });
+    fireEvent.click(screen.getByRole('button', { name: 'Get started' }));
+    await screen.findByRole('heading', { level: 1, name: 'Your first workspace' });
+    fireEvent.change(screen.getByLabelText('Workspace name'), { target: { value: 'Demo Lab' } });
+    fireEvent.change(screen.getByLabelText('Your name'), { target: { value: 'Sam Rivera' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+
+    expect((await screen.findByRole('alert')).textContent).toBe(message);
+    expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    await screen.findByText(/Found 2 likely projects/);
+    expect(hub.sent).toHaveLength(2);
   });
 });

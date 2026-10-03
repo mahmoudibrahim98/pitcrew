@@ -385,6 +385,8 @@ enum EnvPolicy {
 /// The ssh program and how to call it. Cheap to clone.
 #[derive(Clone)]
 pub struct Ssh {
+    wsl: bool,
+    wsl_home: Option<String>,
     program: PathBuf,
     prompts: Option<Prompts>,
     /// `None`: the first usable of [`crate::private::default_runtime_dirs`].
@@ -422,12 +424,51 @@ impl Ssh {
     pub fn new(program: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
+            wsl: false,
+            wsl_home: None,
             prompts: None,
             runtime_dir: None,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             multiplex: cfg!(unix),
             env: EnvPolicy::Inherit,
             through: None,
+        }
+    }
+
+    /// Uses WSL as the command transport, without SSH configuration or prompts.
+    #[must_use]
+    pub fn wsl(program: impl Into<PathBuf>) -> Self {
+        let mut transport = Self::new(program).with_multiplex(false).minimal_env();
+        transport.wsl = true;
+        transport
+    }
+
+    /// Whether this command transport is WSL.
+    #[must_use]
+    pub fn is_wsl(&self) -> bool {
+        self.wsl
+    }
+
+    /// Overrides HOME inside WSL, for isolated integration tests or a separate helper home.
+    ///
+    /// # Errors
+    /// The transport is not WSL or the home is not an absolute, safe layout path.
+    pub fn with_wsl_home(mut self, home: &str) -> Result<Self, SshError> {
+        if !self.wsl {
+            return Err(SshError::InvalidArgument(
+                "HOME override requires WSL".into(),
+            ));
+        }
+        crate::Layout::in_home(home).map_err(|e| SshError::InvalidArgument(e.to_string()))?;
+        self.wsl_home = Some(home.to_owned());
+        Ok(self)
+    }
+
+    pub(crate) fn validate_destination(&self, host: &str) -> Result<(), SshError> {
+        if self.wsl {
+            crate::wsl::validate_distro(host)
+        } else {
+            validate_host(host)
         }
     }
 
@@ -566,6 +607,31 @@ impl Ssh {
         command: String,
         extra: &[String],
     ) -> Result<Vec<String>, SshError> {
+        if self.wsl {
+            self.validate_destination(host)?;
+            if !extra.is_empty() {
+                return Err(SshError::InvalidArgument(
+                    "SSH options cannot be used with WSL".into(),
+                ));
+            }
+            let command = if let Some(home) = &self.wsl_home {
+                format!("export HOME={}; {command}", crate::quote::sh_quote(home))
+            } else {
+                command
+            };
+            // `--cd ~`: start in the distro user's home, not a translation of the app's Windows
+            // working directory (which wsl.exe warns about when it cannot translate it).
+            return Ok(vec![
+                "-d".into(),
+                host.into(),
+                "--cd".into(),
+                "~".into(),
+                "--exec".into(),
+                "/bin/sh".into(),
+                "-c".into(),
+                command,
+            ]);
+        }
         let log = log.to_str().ok_or_else(|| {
             SshError::InvalidArgument("the runtime directory is not valid UTF-8".to_owned())
         })?;
@@ -739,7 +805,7 @@ impl Ssh {
         input: Option<Input<'_>>,
         limits: Limits,
     ) -> Result<Output, SshError> {
-        validate_host(host)?;
+        self.validate_destination(host)?;
         let remote = remote_command(argv)?;
         self.check_askpass()?;
         let dir = self.runtime_dir()?;
@@ -797,7 +863,12 @@ impl Ssh {
     /// # Errors
     /// As [`Ssh::resolve`].
     pub async fn resolve_with(&self, host: &str, limits: Limits) -> Result<ResolvedHost, SshError> {
-        validate_host(host)?;
+        if self.wsl {
+            return Err(SshError::InvalidArgument(
+                "WSL has no SSH configuration to resolve".into(),
+            ));
+        }
+        self.validate_destination(host)?;
         let mut command = self.command();
         command.args(["-G", "--", host]);
         let (status, stdout, stderr) = drive(command, None, limits, None).await?;
@@ -814,6 +885,12 @@ impl Ssh {
         let mut command = tokio::process::Command::new(&self.program);
         if let EnvPolicy::Minimal(extra) = &self.env {
             command.env_clear().envs(minimal_env(extra));
+        }
+        if self.wsl {
+            // wsl.exe's own messages (errors, warnings) in UTF-8 rather than UTF-16LE, so they
+            // reach people readable. Transport calls only: the distribution listing is parsed
+            // as UTF-16LE, and the distro's own output is passed through unchanged either way.
+            command.env("WSL_UTF8", "1");
         }
         command
             .stdin(Stdio::null())
@@ -1585,6 +1662,42 @@ mod tests {
             );
         }
         assert!(control_path(Path::new(&format!("/tmp/{}", "x".repeat(60)))).is_err());
+    }
+
+    /// WSL calls: the distro as one argument, the home as the working directory, wsl.exe's own
+    /// messages in UTF-8; none of it for ssh, nor for the distribution listing.
+    #[test]
+    fn wsl_calls_start_at_home_with_readable_messages() {
+        let dir = Path::new("/run/user/1000/pitcrew-ssh");
+        let wsl = Ssh::wsl("wsl.exe");
+        for distro in [
+            "Lab 'quoted' distro",
+            "a \"b\" c\\",
+            "trailing\\",
+            "& ^ % !",
+        ] {
+            let args = wsl
+                .args(dir, &dir.join("log"), distro, "true".into(), &[])
+                .unwrap();
+            assert_eq!(
+                args,
+                ["-d", distro, "--cd", "~", "--exec", "/bin/sh", "-c", "true"]
+            );
+        }
+        assert!(
+            wsl.args(dir, &dir.join("log"), "-x", "true".into(), &[])
+                .is_err()
+        );
+        let utf8 = |ssh: &Ssh| {
+            ssh.command()
+                .as_std()
+                .get_envs()
+                .find(|(name, _)| *name == "WSL_UTF8")
+                .and_then(|(_, value)| value.map(ToOwned::to_owned))
+        };
+        assert_eq!(utf8(&wsl), Some("1".into()));
+        assert_eq!(utf8(&Ssh::new("ssh").minimal_env()), None);
+        assert_eq!(utf8(&Ssh::new("wsl.exe").minimal_env()), None);
     }
 
     #[tokio::test(start_paused = true)]

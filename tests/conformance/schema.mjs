@@ -443,4 +443,4 @@ export const schemas = {
     message: text,
   }),
 };
-export { list };
+export { bool, enumeration, integer, list, object, tagged, text };

@@ -34,6 +34,7 @@ mod recaps;
 mod refs;
 mod runner;
 mod runtime;
+mod scan;
 mod serve;
 mod sessions;
 mod setup;
@@ -69,7 +70,10 @@ fn main() -> ExitCode {
     }
     init_logging();
     let result = StateDir::resolve(cli.state_dir).and_then(|state| match command {
-        Command::Serve(args) => serve::serve(&state, &args),
+        Command::Serve(args) => {
+            scan::hold_each(args.scan_hold_ms.map(std::time::Duration::from_millis));
+            serve::serve(&state, &args)
+        }
         Command::Init(args) => Ok(init::init(&state, &args)),
         Command::Token(TokenCommand::ShowPath) => Ok(show_path(&state)),
         // Returned above.

@@ -1,6 +1,6 @@
 //! Deterministic, explicit export; normal protocol tests never write bindings.
 #![cfg(feature = "ts")]
-use pitcrew_protocol::{api, events, ids, model, recap, runner, transcript};
+use pitcrew_protocol::{api, events, ids, model, recap, runner, scan, transcript};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{error::Error, fmt::Debug, fs, path::Path};
 use ts_rs::{Config, TS};
@@ -129,6 +129,16 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
     runner::Key::export_all(&config)?;
     runner::RunnerCommand::export_all(&config)?;
     runner::RunnerToHub::export_all(&config)?;
+    scan::EngineCount::export_all(&config)?;
+    scan::FolderCount::export_all(&config)?;
+    scan::HomeCount::export_all(&config)?;
+    scan::MonthCount::export_all(&config)?;
+    scan::ScanCounts::export_all(&config)?;
+    scan::ScanFrame::export_all(&config)?;
+    scan::ScanProgress::export_all(&config)?;
+    scan::ScanReport::export_all(&config)?;
+    scan::Suggestion::export_all(&config)?;
+    scan::WorkstreamSuggestion::export_all(&config)?;
     transcript::PlanItem::export_all(&config)?;
     transcript::PlanStatus::export_all(&config)?;
     transcript::TranscriptItem::export_all(&config)?;

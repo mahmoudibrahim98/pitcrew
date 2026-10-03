@@ -8,6 +8,7 @@
 
 import { blocksPage, daysPage } from './recaps.ts';
 import { canMove } from './rules.ts';
+import { startScan, type StreamedBody } from './scan.ts';
 import {
   announceSession,
   createSession,
@@ -128,6 +129,8 @@ export interface ApiRequest {
 export interface Reply {
   status: number;
   body?: unknown;
+  /** Instead of `body`: an answer written over time (`POST /v1/machines/{id}/scan`). */
+  stream?: StreamedBody;
 }
 
 interface Context {
@@ -1428,6 +1431,10 @@ const ROUTES: Route[] = [
   ),
   route('POST', '/v1/setup', 'device', setupHub),
   route('GET', '/v1/machines', 'device', (hub) => ok(hub.machines)),
+  route('POST', '/v1/machines/:id/scan', 'device', (hub, ctx) => ({
+    status: 200,
+    stream: startScan(hub, ctx.param('id')),
+  })),
   route('GET', '/v1/members', 'agent', (hub) => ok(hub.members)),
   route('GET', '/v1/personas', 'device', (hub) => ok(hub.personas)),
   route('GET', '/v1/teams', 'device', (hub) => ok(hub.teams)),

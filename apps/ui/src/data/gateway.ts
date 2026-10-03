@@ -10,6 +10,7 @@ import { listen } from '@tauri-apps/api/event';
 import { GatewayError, toGatewayError } from './errors.ts';
 import {
   parseHosts,
+  parseWslDistros,
   parseProgress,
   parsePrompt,
   parsePromptClosed,
@@ -81,8 +82,14 @@ export function createRemoteGateway(): RemoteGateway {
   return {
     sshHosts: async () => parseHosts(await call<unknown>('gateway_ssh_hosts', {})),
 
-    async remoteProbe(host) {
-      const probe = parseRemoteProbe(await call<unknown>('gateway_remote_probe', { host }));
+    async wslDistros() {
+      const list = parseWslDistros(await call<unknown>('gateway_wsl_distros', {}));
+      if (list === undefined) throw malformed('WSL distribution list');
+      return list;
+    },
+
+    async remoteProbe(host, target) {
+      const probe = parseRemoteProbe(await call<unknown>('gateway_remote_probe', { host, ...(target === undefined ? {} : { target }) }));
       if (probe === undefined) throw malformed('probe');
       return probe;
     },

@@ -1176,6 +1176,7 @@ mod unix {
                     name: "Original".into(),
                     kind: WorkspaceKind::Remote,
                     connection: Connection::Remote(Box::new(RemoteConnection {
+                        target: None,
                         host: "other-login".into(),
                         launcher: LauncherKind::Direct,
                         root: "/home/sam/.pitcrew".into(),

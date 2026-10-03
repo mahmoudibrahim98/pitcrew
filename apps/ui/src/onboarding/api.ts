@@ -1,8 +1,9 @@
-// The onboarding wizards' backend contract. Setup (`POST /v1/setup`) and the host list
-// (`gateway_ssh_hosts`) are real (`hub-api.ts`); the other routes do not exist on the hub yet (see
-// README.md for the proposed shapes), and `createFakeOnboardingApi` in `fake-api.ts` is their only
-// implementation. Every step is built against the `OnboardingApi` interface below, so a real call
-// replaces a fake one without touching a step component.
+// The onboarding wizards' backend contract. Setup (`POST /v1/setup`), the host list
+// (`gateway_ssh_hosts`), the scan (`POST /v1/machines/{id}/scan`) and creating from it
+// (`POST /v1/projects`, `POST /v1/workstreams`) are real (`hub-api.ts`); the other routes do not
+// exist on the hub yet (see README.md for the proposed shapes), and `createFakeOnboardingApi` in
+// `fake-api.ts` is their only implementation. Every step is built against the `OnboardingApi`
+// interface below, so a real call replaces a fake one without touching a step component.
 //
 // Reuses wire types from `../data` (`Engine`, `Machine`, `Project`, `Workstream`, …) rather than
 // redeclaring them, since the real routes below would return the same objects.
@@ -92,6 +93,11 @@ export type InstallProgressEvent =
  * React StrictMode's dev-only double-mount relies on this: it cancels the first call's stream
  * before starting the second, and the fake's `cancel()` clears its timers accordingly (see
  * `fake-api.ts`, `streamSteps`).
+ *
+ * The hub's scan is the exception: its walk cannot be stopped part-way, so it never runs twice
+ * instead. A second scan of a machine while one runs is refused (an `error` event), and the real
+ * `streamScan` sends nothing when cancelled before its request went out, as StrictMode's first
+ * mount is.
  */
 export interface Streamed {
   cancel(): void;
@@ -149,7 +155,9 @@ export interface ScanResult {
 
 export type ScanProgressEvent =
   | { type: 'progress'; scanned: number; total?: number; path?: string }
-  | { type: 'done'; result: ScanResult };
+  | { type: 'done'; result: ScanResult }
+  /** The scan could not run or failed (one already running, the hub unreachable…): the last event. */
+  | { type: 'error'; message: string };
 
 export type ProjectTemplate = 'research' | 'software' | 'blank';
 

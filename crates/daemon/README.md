@@ -51,6 +51,7 @@ in the log when used (see "Terminals"):
 | `--ptyd-endpoint <path>` | pitcrew-ptyd on that endpoint (a socket path on Unix, a pipe name on Windows) instead of the state directory's own. |
 | `--ptyd-idle-exit-ms <ms>` | A pitcrew-ptyd this daemon starts exits after that long idle (its own default is 30 seconds). |
 | `--terminal-runtime pty` | The terminals run in pitcrew-ptyd even where tmux is usable (`auto`, the default, prefers tmux). |
+| `--scan-hold-ms <ms>` | Each machine scan waits that long once accepted, holding its machine, before it walks: a second scan meanwhile can be shown to get `409` (see "The machine scan"). |
 
 ## The state directory
 
@@ -641,6 +642,7 @@ link) are not part of this.
 | `GET /v1/stream` | `pitcrew-api` over the store (`StoreSource`) |
 | `GET /v1/events` | `pitcrew-api`'s `Activity` over the store, with the work model's activity index (`with_refs`, through the `WorkRefs` adapter in `src/refs.rs`): `project=` and `workstream=` match events about them, their tasks and their sessions, and `task=` and `session=` also match their sessions' and dispatches' events |
 | `GET /v1/recaps/blocks`, `GET /v1/recaps/days` | `pitcrew-api`'s `Recaps` over the hub's recap index (hub-work's `RecapIndex`, implemented by its `WorkService`), through the `WorkRecaps` adapter in `src/recaps.rs`; see "Recaps" |
+| `POST /v1/machines/{id}/scan` | `src/scan.rs`, a device route, over the runner's homes with `pitcrew_ingest::scan` (see "The machine scan") |
 | `POST /v1/hooks/{engine}/{event}` | `pitcrew-api` into the runner's `RunnerHooks` (see "The runner"); with `--no-runner`, logged at debug (engine, event, member; never the body) |
 | `GET /v1/sessions/{id}/terminal` | `pitcrew-api` over `SessionTerminals` (see "Terminals") |
 | `POST /v1/sessions`, `POST /v1/sessions/{id}/send`, `/keys`, `/interrupt`, `/end` | `src/sessions.rs`, device routes, through the runner's `RunnerCommands` (see "Terminals") |
@@ -680,6 +682,31 @@ built and removed when the daemon stops.
 - **Not the mock's fixture.** The seeded demo's log is not the fixture's slice (the seed's own
   events are activity too), so the blocks and days differ from `demo-recaps.json`; hub-work's
   README, "The seeded demo is not the fixture", says how. The parity replay compares properties.
+
+## The machine scan
+
+`POST /v1/machines/{id}/scan` (api-v1, "Machine scan"; device tokens only) is onboarding's scan
+step: `pitcrew_ingest::scan` over this machine's agent homes, its progress and then its report
+streamed back as newline-delimited `ScanFrame`s (`pitcrew_protocol::scan`). It is `src/scan.rs`,
+one module and one line of the routes in `src/serve.rs`.
+
+- **The homes are the runner's** (see "The runner"): `--homes` when given, none with `--demo`
+  alone (an empty report), else this user's own. With `--no-runner` the hub reads no agent home,
+  so a scan is `409`.
+- **Only the hub's own machine**, the workspace's first local one (as `serve` picks it). An
+  unknown or malformed id is `404`; another machine of the workspace is `409`, saying scanning it
+  is not supported yet. A fresh hub has no machine until it is set up.
+- **One at a time.** A scan holds its machine from the moment it is accepted until its walk ends;
+  a second meanwhile is `409`. The walk cannot be stopped part-way (`pitcrew_ingest::scan` takes
+  no cancel), so a client that goes away leaves it to finish; its result is dropped, and only then
+  is the machine free again. A panic in the walk is an `error` frame, and frees the machine too.
+- **The walk** runs on tokio's blocking pool; the scan's own threads do its reads (a 64 KiB
+  prefix of each transcript, one indexed row of an OpenCode store). A first `progress` frame goes
+  out at once; the walk's ticks (at most every 100 ms) wait for no client: one reading slowly
+  misses some, never the last tick or the last frame.
+- **What it logs:** one line per scan, `scanned this machine's agent homes`, with its counts and
+  how long it took, at info. Never a path: the report goes to the person who asked, and nowhere
+  else.
 
 ## Development: the UI against the daemon
 
@@ -955,6 +982,28 @@ Claude fixture's transcript):
   `GET /v1/workspace` through stdin and stdout, creates nothing in its home, and with no daemon
   exits 4.
 
+`tests/scan.rs`, the machine scan, over temporary homes laid out from the Claude, Codex and
+OpenCode fixtures (their folders moved into the test's own, two of them git repositories):
+
+- the answer is `application/x-ndjson`: `progress` with `scanned: 0` first, ticks that only grow
+  to `scanned == total`, then `done`; its report counts the three sessions by engine, home, folder
+  and month (the earliest start is the Codex fixture's), and suggests the paper's repository with
+  its `paper` folder as a workstream, the runs folder (no `.git`) and the tools' repository; the
+  log has the counts and not the paths;
+- a second scan while the first is held (`--scan-hold-ms`) is `409`, and the first still ends
+  with its report; a client that goes away keeps the machine taken until its walk has ended, and
+  then it scans again;
+- no token `401`, an agent `403`, an unknown or malformed machine `404`, the demo's cluster `409`
+  ("not supported yet"); homes that hold nothing give an empty report with every list present;
+- `--no-runner`: `409`, naming it;
+- a fresh hub: `404` before setup; after it, the new machine is scanned in the daemon's own
+  (test) home folder, as the runner would watch it.
+
+The unit tests in `src/scan.rs` check that a machine has one scan at a time (another machine its
+own), that its place comes back when the walk panics, which machine is the hub's own, that a frame
+is one line of JSON, and that a walk over no home ends with its last tick and an empty report, also
+for a client that has gone. `src/cli.rs` checks that `--scan-hold-ms` parses and is hidden.
+
 `tests/recaps.rs`, with `--demo`, checks what the contract promises of any log (the seeded demo
 is not the mock's fixture):
 
@@ -1050,3 +1099,6 @@ and handed back, not kept, once it has.
 - `--demo` through the setup path (the demo still seeds its own person, machine and name).
 - Remote machines (the desktop's side of the tunnel, and a supervisor of the local daemon), the
   Tauri shell, auto-start and installers.
+- Scanning another machine of the workspace (`POST /v1/machines/{id}/scan` is `409` for one), and
+  stopping a scan part-way: `pitcrew_ingest::scan` takes no cancel, so a scan whose client went
+  away runs to its end. A cancel flag in its `ScanOptions` (stream A) would let the route stop it.

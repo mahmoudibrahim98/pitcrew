@@ -26,6 +26,7 @@ pub mod ids;
 pub mod model;
 pub mod recap;
 pub mod runner;
+pub mod scan;
 pub mod text;
 pub mod transcript;
 pub mod version;

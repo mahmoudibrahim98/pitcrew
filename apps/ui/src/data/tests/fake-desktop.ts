@@ -56,6 +56,7 @@ export class FakeDesktop {
   readonly calls: { cmd: string; args: Record<string, unknown> }[] = [];
   /** What `gateway_ssh_hosts` answers. */
   hosts: unknown = { hosts: [] };
+  wsl: unknown = { available: false, distros: [] };
   probe: (host: string) => unknown = (host) => ({ host, os: 'linux', arch: 'x86_64' });
   plan: (req: unknown) => unknown = () => ({ plan: 'plan-1', steps: ['Copy pitcrewd to ~/.pitcrew'] });
   /** `gateway_remote_add`: progress goes on `channel`; resolve with the workspace, or `refuse`. */
@@ -126,6 +127,8 @@ export class FakeDesktop {
         return null;
       case 'gateway_ssh_hosts':
         return this.hosts;
+      case 'gateway_wsl_distros':
+        return this.wsl;
       case 'gateway_remote_probe':
         return this.probe(String(args.host));
       case 'gateway_remote_plan':

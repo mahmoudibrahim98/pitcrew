@@ -628,3 +628,34 @@ daemon (`EXIT_NO_DAEMON`), 1 other. Messages name what is wrong, never the path.
 The Windows code (Job Object, named pipes) is checked with clippy for
 `x86_64-pc-windows-gnu`; the test suites have not run on Windows yet (the deploy tests need a
 Unix `sh` and skip there).
+
+## WSL command transport
+
+`Ssh::wsl(program)` selects the WSL command transport at the existing deployment and tunnel seam.
+It uses `wsl.exe -d <distro> --cd ~ --exec /bin/sh -c <quoted command>`, without SSH
+configuration, host keys, askpass or multiplexing. The distro is a single argument, including
+spaces, quotes, backslashes and `& ^ % !`. `--cd ~` starts every call in the distro user's home
+rather than a translation of the app's Windows folder; `WSL_UTF8=1` (transport calls only, not
+the listing) makes wsl.exe's own messages UTF-8 rather than UTF-16LE, so its errors read as text.
+`wsl::default_program()` is `%SystemRoot%\System32\wsl.exe` (the bare name on `PATH` only without
+`SystemRoot`).
+
+The existing Linux musl deployment, checksum, private-directory and atomic-switch checks apply.
+Only direct and tmux are offered by the desktop. A separate distro heartbeat (a `sh` that prints
+`@@pitcrew-wsl-ready-<tag>` on stdout, with a random tag for each start, then sleeps) ends when the
+distro stops; the existing connection ladder follows it. It is ready once those bytes arrive,
+wherever they are in its stdout, so a wsl.exe notice before them (in UTF-16LE, on either stream)
+does not hide them; it waits at least `wsl::START_WAIT` (120 s) for that, and never goes through a
+jump host or a ControlMaster. Requests and sockets always use the stdio bridge.
+
+`Wsl::distros` lists UTF-16LE output and uses the quiet running list to avoid localized state
+labels. Rows are read by their fixed columns: the default marker in column 0, the name from
+column 2, so a name starting with `*` stays a name. Missing WSL, and WSL with no distribution
+(wsl.exe fails the listing), are unavailable. A stopped WSL2 distro is started with
+`Ssh::start_wsl` (`true`, within `wsl::START_LIMITS`, 120 s) before the probe's 30 s; WSL1 is
+rejected by the gateway.
+
+The portable fake tests run on every platform. Set `PITCREW_TEST_WSL_DISTRO` to opt into the real
+WSL test. It uses a newly created HOME under /tmp for probe, quoting and synthetic helper deployment,
+checks the private directory and atomic switch, and removes that HOME afterwards. It installs no
+packages, uses no real agent data and never shuts down or changes a distro.
