@@ -81,7 +81,7 @@ can deploy a helper to a remote machine.
 
 | OS | Installers | Next to the app's executable | The helpers |
 |---|---|---|---|
-| Linux x86_64 | `PitCrew_<version>_amd64.deb`, `PitCrew_<version>_amd64.AppImage` | `/usr/bin/` (in the AppImage `usr/bin/`): `pitcrew-desktop`, `pitcrewd`, `pitcrew-ptyd`, `pitcrew-askpass`, the static x86_64 musl builds | `/usr/lib/PitCrew/helpers/` |
+| Linux x86_64 | `PitCrew_<version>_amd64.deb`, `PitCrew-<version>-1.x86_64.rpm`, `PitCrew_<version>_amd64.AppImage` | `/usr/bin/` (in the AppImage `usr/bin/`): `pitcrew-desktop`, `pitcrewd`, `pitcrew-ptyd`, `pitcrew-askpass`, the static x86_64 musl builds | `/usr/lib/PitCrew/helpers/` |
 | macOS, universal | `PitCrew_<version>_universal.dmg` | `PitCrew.app/Contents/MacOS/` | `PitCrew.app/Contents/Resources/helpers/` |
 | Windows x86_64 | `PitCrew_<version>_x64-setup.exe` (NSIS, for the current user, no administrator) | `%LOCALAPPDATA%\PitCrew\` (`.exe`) | `%LOCALAPPDATA%\PitCrew\helpers\` |
 
@@ -121,7 +121,8 @@ packaging/desktop/smoke.sh dist/desktop/*.AppImage     # starts the app in a thr
    the NSIS hooks. These are not in `tauri.conf.json` because `tauri-build` checks on every
    `cargo build` that the sidecars and resources exist, so the desktop's CI job would fail
    without them. `tauri.conf.json` keeps the rest: targets, publisher, licence, category,
-   descriptions, `openssh-client` recommended by the `.deb`, a per-user NSIS installer, and
+   descriptions, `openssh-client` recommended by the `.deb` and `openssh-clients` by the RPM,
+   a per-user NSIS installer, and
    `bundle.active: false`, so a plain `tauri build` makes no installer without the helpers.
 4. Runs `cargo tauri build --target <target> --features custom-protocol --bundles <…> --config …`
    with `PITCREW_HELPERS_MANIFEST` set, and copies the installers to `dist/desktop/`. The app's
@@ -137,7 +138,10 @@ The app refuses a `pitcrewd`, `pitcrew-askpass` or helper that someone else coul
 (`locate::check_trusted`: on Unix the file, its folder and what it resolves to are owned by root
 or the person, and nobody else can write them; on Windows, no `Zone.Identifier`).
 
-- **.deb:** Tauri writes every entry owned by root with 0755 or 0644, which dpkg installs.
+- **.deb and RPM:** Tauri writes every entry owned by root with 0755 or 0644, which the package
+  manager installs. RPM uses XZ level 6 for its payload. `check.sh` queries RPM metadata with
+  `rpm -qp`, extracts with `rpm2cpio` and `cpio`, and applies the same layout, hash, desktop-entry
+  and sidecar execution checks as the deb; it never installs the RPM.
 - **AppImage:** the image's files are root's (`unsquashfs -lln`); mounted or extracted, the app
   sees them as root's or the person's. Tauri's image carries some files (the bundled libraries'
   copyright notices) with mode 0777, so `build.sh` rebuilds its file system with only the owner able
@@ -153,6 +157,7 @@ or the person, and nobody else can write them; on Windows, no `Zone.Identifier`)
 | | `pitcrew://` links | Notifications |
 |---|---|---|
 | `.deb` | `/usr/share/applications/PitCrew.desktop` has `MimeType=x-scheme-handler/pitcrew;` and `Exec=pitcrew-desktop %u` ([`desktop/pitcrew.desktop.hbs`](desktop/pitcrew.desktop.hbs): Tauri's own template has no `%u`, so the link would not reach the app); dpkg's trigger updates the MIME cache. **Checked:** `check.sh` reads the entry (and runs `desktop-file-validate`); the workflow installs the `.deb` and `smoke.sh` starts it. | D-Bus; nothing to register. |
+| RPM | The same `.desktop` template and `Exec=pitcrew-desktop %u` as the deb. **Checked:** owners and modes from RPM metadata, extraction and `desktop-file-validate`. | D-Bus. |
 | AppImage | The same entry inside; the app registers itself on first start (`scheme.rs`: a hidden handler in `~/.local/share/applications` and `mimeapps.list`). **Checked:** `check.sh` reads the entry; `smoke.sh` finds the handler named in the throwaway home's `mimeapps.list`. | D-Bus. |
 | macOS | `CFBundleURLTypes` in `Info.plist`; Launch Services registers it when the app is copied or first opened. **Checked:** `check.sh` reads `CFBundleURLSchemes` with PlistBuddy. | Sent as the bundle id, `org.pitcrew.desktop`. **Checked:** `CFBundleIdentifier`. |
 | Windows | NSIS writes `HKCU\Software\Classes\pitcrew` (`URL Protocol`, `shell\open\command` = `"…\pitcrew-desktop.exe" "%1"`), and removes it on uninstall. **Checked:** `check-windows.ps1` after a real install, and again after removal. | Toasts need an AppUserModelID registered by a Start menu shortcut. NSIS sets `System.AppUserModel.ID` = the app's identifier, `org.pitcrew.desktop`, on its Start menu and desktop shortcuts, and a release build of the app sends its toasts as that identifier already (`notify/windows.rs`), so the app needs no change. **Checked:** `check-windows.ps1` reads the shortcut's property and finds the id in `Get-StartApps`. |
@@ -195,11 +200,100 @@ or the person, and nobody else can write them; on Windows, no `Zone.Identifier`)
 - `check-windows.ps1` parses (PowerShell 7.4), and `installer-hooks.nsh` compiles with
   `makensis -WX` in a minimal installer; neither has run on Windows here.
 
-**Sizes.** The budget is 25 MB per installer. Each `pitcrewd` build is about 5.5 MB compressed,
-and an installer carries three or four of them: its own, the two Linux helpers and the macOS
-helper (two architectures). With the real macOS helper the `.deb` should come to about 34 MB; on
-Linux and macOS the app's own `pitcrewd` and one helper are the same file, carried twice. The
-AppImage also carries WebKitGTK and GTK, hence its 91 MB. The checks report these as warnings.
+### Size
+
+The budget is 25 MB per installer. The existing checker uses MiB (1,048,576 bytes); the tables
+below use decimal MB (1,000,000 bytes) so the exact byte counts remain unambiguous.
+`bash packaging/desktop/contents.sh dist/desktop/*` unpacks each installer without installing it
+and prints the largest twenty files, installer bytes and total payload bytes. The release
+workflow records this on Linux, macOS and Windows. DMGs are mounted read-only on macOS; NSIS
+is inspected with 7-Zip on Windows. These two paths require the integrator's release run.
+
+**Safe changes.** Both Rust release profiles use `opt-level = "z"`, retaining thin LTO, one
+codegen unit and symbol stripping. Keep `panic = "unwind"`: hook sinks, adapter scans, runner
+jobs, recap operations and the tray use `catch_unwind` to isolate failures. The CLI's hook panic
+handler also guarantees exit zero. Changing to abort would break recovery. AppImage
+`bundleMediaFramework = false` is explicit; this was already Tauri's default, so its measured
+saving is **zero**, not the 15–35 MB sometimes attributed to that option. Libraries WebKitGTK
+itself requires remain. RPM uses XZ level 6; it is a new format with no historical baseline.
+
+**Local comparison (2026-10-03).** Debian trixie x86_64 cloud container, Rust 1.99, Zig 0.16,
+Tauri CLI 2.12.1, WebKitGTK 2.52.6. Both musl targets were really built. The universal macOS
+helper could not be built here, and the existing release artifact was blocked by environment
+egress policy. The **same baseline x86_64 Linux daemon** was used in its resource slot before
+and after, with valid hashes and a manifest compiled into the desktop. These are local lab
+installers, **not distributable releases**; the unchanged substitute holds that input constant
+but cannot establish production sizes. The native desktop was compiled with `custom-protocol`
+and the staged manifest/config, then packaged with `tauri bundle`; AppImage modes were checked
+and repaired by the existing build-script function.
+
+| Linux lab installer | Before bytes (MB) | After bytes (MB) | Change | 25 MB budget |
+|---|---:|---:|---:|---|
+| deb | 30,678,044 (30.678) | 24,037,596 (24.038) | −21.6% | within |
+| RPM, XZ 6 in both comparisons | 20,394,313 (20.394) | 16,097,309 (16.097) | −21.1% | within |
+| AppImage | 116,726,264 (116.726) | 117,553,656 (117.554) | +0.7% | over |
+
+The desktop executable alone goes from 15,414,856 to 12,362,960 bytes (−19.8%). These
+installer rows measure the two Rust profile changes together; the raw sidecar table below
+isolates the root profile. RPM compression measured separately on the optimized payload is
+24,033,756 bytes with Gzip level 6 versus 16,097,309 with XZ level 6 (−33.0%). Media-framework
+configuration changes no files because it was already false.
+
+The AppImage payload shrinks from 360,152,395 to 345,283,203 bytes, yet the compressed lab
+installer increases by 827,392 bytes. The fixed substitute equals the baseline native/Linux
+helper, so the before/after images have different opportunities to deduplicate daemon copies.
+The bundled libraries and their largest sizes are unchanged. This artificial comparison is
+not evidence of a production AppImage reduction; a real Mac helper is required to establish
+that delta. It remains far over budget and is why the larger options below stay relevant.
+
+The root profile's raw binary changes (bytes):
+
+| Binary | Before | After | Reduction |
+|---|---:|---:|---:|
+| x86_64 daemon | 13,408,512 | 9,377,264 | 30.1% |
+| aarch64 daemon | 11,834,888 | 8,275,888 | 30.1% |
+| x86_64 CLI | 1,799,584 | 1,483,912 | 17.5% |
+| aarch64 CLI | 1,538,160 | 1,338,448 | 13.0% |
+| x86_64 PTY helper | 1,291,736 | 1,131,432 | 12.4% |
+| aarch64 PTY helper | 1,201,952 | 1,068,560 | 11.1% |
+| x86_64 askpass | 517,624 | 481,752 | 6.9% |
+| aarch64 askpass | 483,744 | 444,320 | 8.1% |
+
+The AppImage's largest library payloads before optimization are WebKitGTK 96,606,841 bytes,
+JavaScriptCore 32,892,473 and ICU data 31,868,993. The deb/RPM instead depend on the system's
+WebKitGTK and GTK; their space goes to the desktop executable and the daemon copies. The
+macOS/Windows file rankings are **not measured here**: run the release workflow on this branch
+and read its new contents summary before quoting savings. Expect the optimized desktop and
+native sidecars to shrink there too; Linux helpers shrink identically in every installer. The
+universal Mac helper requires a real Mac rebuild. No numeric DMG/NSIS reduction is claimed.
+
+The baseline and optimized real Linux daemons passed synthetic demo/API and CLI smoke checks.
+100 runs per `whoami`, `task list`, `task show` stayed below 3.5 ms p95 on both builds (50 ms
+budget); this is a smoke check on an empty demo, not the 10k-history benchmark. All optimized
+x86_64 sidecars ran their version/refusal checks. The aarch64 executables were built and hashed
+but not executed (no emulator). A desktop interactive smoke run was not available without a
+display/Xvfb, and this container's ancestor ownership also blocks private Unix sockets.
+
+**Proposals, not implemented:**
+
+- Compress helpers in resources, then decompress to an owner-only temporary file with exclusive
+  creation, a bounded decoded length and no symlink following. Hash the **decoded executable**
+  against the manifest compiled into the desktop before atomic installation/execution; never
+  trust a downloaded or adjacent manifest. Version upgrades must invalidate the cache. This
+  saves resource bytes but adds startup CPU, cache space and failure handling; existing installer
+  compression already captures much of the saving.
+- Fetch the Mac helper only when adding a Mac. Fetch from a version-pinned release over HTTPS;
+  keep the expected decoded SHA-256 compiled into the desktop, enforce a size limit and atomic
+  owner-only cache, and fail closed on hash/version errors. Downloads and their redirect domains
+  become part of the product, with offline use and release retention costs. TLS alone is not the
+  existing manifest trust guarantee. Windows/Linux users avoid carrying the universal executable.
+- A thinner AppImage could rely on host WebKitGTK/GTK, or ship a separate runtime package. This
+  sacrifices the self-contained installation and compatibility promise and adds platform/version
+  checks. Deb/RPM already make that trade-off. Dropping libraries merely because they look large
+  is unsafe; WebKit's linked libraries and codec dependencies remain even without media bundling.
+- Avoid carrying an identical native daemon twice by changing resource lookup to share the trusted
+  sidecar. This requires a documented lookup/manifest contract change, cross-platform install
+  tests and upgrade behavior. Packaging-only deduplication cannot silently change those paths.
 
 ## Checksums
 
