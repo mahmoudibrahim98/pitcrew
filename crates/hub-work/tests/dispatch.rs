@@ -8,14 +8,15 @@ use common::{
     PAPER, RUNNER, SAM, SEED_RUNS, WRITER, agent, app, call, demo, expect, member, open, person,
 };
 use pitcrew_hub_work::{
-    DispatchError, DispatchRequest, Dispatcher, INTERNAL_MESSAGE, NewDispatch, TaskRef, WorkService,
+    DispatchError, DispatchRequest, Dispatcher, ENDED_WITHOUT_REPORT, INTERNAL_MESSAGE,
+    NEVER_STARTED, NewDispatch, TaskRef, WorkService,
 };
 use pitcrew_protocol::api::ErrorCode;
 use pitcrew_protocol::events::{Event, EventBody};
-use pitcrew_protocol::ids::{EventId, ProjectId, ProjectKey};
+use pitcrew_protocol::ids::{DispatchId, EventId, MachineId, ProjectId, ProjectKey, SessionId};
 use pitcrew_protocol::model::{
-    DispatchOutcome, Engine, LinkBasis, PermissionMode, Project, ProjectStatus, SessionState,
-    TaskStatus,
+    DispatchOutcome, Engine, LinkBasis, PermissionMode, Project, ProjectStatus, Session,
+    SessionState, TaskStatus,
 };
 use pitcrew_protocol::runner::RunnerCommand;
 use serde_json::{Value, json};
@@ -174,11 +175,17 @@ async fn a_dispatch_records_the_assignment_the_dispatch_and_its_session() {
     assert_eq!(request.name, format!("PAP-5 {}", pap5.title));
     match request.start_command() {
         RunnerCommand::StartSession {
-            engine, cwd, brief, ..
+            engine,
+            cwd,
+            brief,
+            session: named,
+            ..
         } => {
             assert_eq!(engine, Engine::Codex);
             assert_eq!(cwd, "/scratch/sam/diffusion-runs");
             assert_eq!(brief.as_deref(), Some(pap5.description.as_str()));
+            // The runner reports the CLI under the dispatch's session, not a new one.
+            assert_eq!(named, Some(session.id));
         }
         other => panic!("{other:?}"),
     }
@@ -676,4 +683,419 @@ async fn a_failed_start_finishes_the_dispatch_and_ends_the_session() {
         assert_eq!(again.0, status, "{answer:?}: {}", again.1);
         assert_eq!(runner.calls().len(), 2);
     }
+}
+
+/// A runner link that cannot start anything now (no runner attached yet, say), or refuses.
+#[derive(Debug)]
+struct NotReady(DispatchError);
+
+impl Dispatcher for NotReady {
+    fn can_start(&self, _: &MachineId) -> Result<(), DispatchError> {
+        Err(self.0.clone())
+    }
+
+    fn start(&self, request: &DispatchRequest) -> Result<(), DispatchError> {
+        panic!("asked to start {request:?} after saying it cannot");
+    }
+}
+
+/// A runner link that cannot start a session answers before anything is recorded, after the
+/// plan's own refusals (api-v1's order: 404, 400, then 409, then 503).
+#[tokio::test]
+async fn a_runner_link_that_cannot_start_refuses_before_recording_anything() {
+    for (error, why, status) in [
+        (
+            DispatchError::Unavailable("no runner is attached yet".into()),
+            "no runner is attached yet",
+            503,
+        ),
+        (
+            DispatchError::Rejected("not on this machine".into()),
+            "not on this machine",
+            409,
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let demo = demo();
+        let work = Arc::new(
+            WorkService::new(open(&dir.path().join("hub.db")), demo.workspace.clone())
+                .with_dispatcher(Arc::new(NotReady(error.clone()))),
+        );
+        work.seed(&demo).expect("seed");
+        let rev = work.store().latest_rev().expect("rev");
+        let res = dispatch(&work, "PAP-5", json!({ "agent": RUNNER })).await;
+        assert_eq!(res.0, status, "{error:?}: {}", res.1);
+        assert!(
+            res.1["message"].as_str().is_some_and(|m| m.contains(why)),
+            "{}",
+            res.1
+        );
+        // The plan's own answers come first.
+        expect(
+            &dispatch(&work, "PAP-7", json!({ "agent": RUNNER })).await,
+            409,
+        );
+        expect(
+            &dispatch(&work, "PAP-5", json!({ "agent": SAM })).await,
+            400,
+        );
+        expect(
+            &dispatch(&work, "PAP-99", json!({ "agent": RUNNER })).await,
+            404,
+        );
+        assert_eq!(
+            work.store().latest_rev().expect("rev"),
+            rev,
+            "nothing recorded"
+        );
+    }
+
+    // Without a runner link at all, too: a done task is a conflict, not unavailable.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let work = service(dir.path(), None);
+    expect(
+        &dispatch(&work, "PAP-7", json!({ "agent": RUNNER })).await,
+        409,
+    );
+}
+
+/// What the runner reports about a session, appended as its sink appends it (authored by the
+/// workspace's person), then followed as the runner link follows it.
+fn runner_reports(work: &WorkService, bodies: Vec<EventBody>) {
+    let events: Vec<Event> = bodies
+        .into_iter()
+        .map(|body| Event {
+            id: EventId::new(),
+            at: 1_790_900_000_000,
+            workspace: work.workspace(),
+            author: member(SAM),
+            on_behalf_of: None,
+            body,
+        })
+        .collect();
+    work.store().append(&events).expect("append");
+    work.follow_sessions(&events).expect("follow");
+}
+
+/// The runner's statement of a dispatched session it found: under the dispatch's id, with the
+/// CLI's id, in `state`, naming no agent and no link.
+fn restated(work: &WorkService, id: SessionId, state: SessionState) -> EventBody {
+    let stored = work.session(&id).expect("session");
+    EventBody::SessionDiscovered {
+        session: Session {
+            native_id: "019a0000-0000-7000-8000-000000000001".into(),
+            agent: None,
+            workstream: None,
+            task: None,
+            link_basis: None,
+            title: None,
+            state,
+            ..stored
+        },
+    }
+}
+
+fn state_changed(session: SessionId, from: SessionState, to: SessionState) -> EventBody {
+    EventBody::SessionStateChanged {
+        session,
+        from,
+        to,
+        status_line: None,
+    }
+}
+
+/// Dispatches PAP-5 to @runner; its dispatch and session.
+async fn dispatched(work: &Arc<WorkService>) -> (DispatchId, SessionId) {
+    let res = dispatch(work, "PAP-5", json!({ "agent": RUNNER })).await;
+    expect(&res, 202);
+    (
+        res.1["id"].as_str().expect("id").parse().expect("dispatch"),
+        res.1["session"]
+            .as_str()
+            .expect("session")
+            .parse()
+            .expect("session"),
+    )
+}
+
+fn pap5(work: &WorkService) -> pitcrew_protocol::model::Task {
+    work.task(&TaskRef::parse("PAP-5").expect("key"))
+        .expect("task")
+}
+
+/// The task moves with its dispatched session: to in progress the first time it works (once: a
+/// person who moves it back is not overruled by the next turn), and the agent's report (its move
+/// to review) finishes the dispatch as succeeded in the same transaction.
+#[tokio::test]
+async fn the_task_moves_with_its_dispatched_session() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner = Recorder::new(Answer::Start);
+    let work = service(dir.path(), Some(Arc::clone(&runner)));
+    let (dispatch_id, session) = dispatched(&work).await;
+    assert_eq!(pap5(&work).status, TaskStatus::Todo);
+
+    // Found idle: nothing moves. Its link and agent stay the dispatch's.
+    runner_reports(&work, vec![restated(&work, session, SessionState::Idle)]);
+    assert_eq!(pap5(&work).status, TaskStatus::Todo);
+    let stored = work.session(&session).expect("session");
+    assert_eq!(stored.agent, Some(member(RUNNER)));
+    assert_eq!(stored.link_basis, Some(LinkBasis::Dispatch));
+    assert_eq!(stored.task, Some(pap5(&work).id));
+
+    // Working: in progress, moved by the agent for its owner.
+    runner_reports(
+        &work,
+        vec![state_changed(
+            session,
+            SessionState::Idle,
+            SessionState::Working,
+        )],
+    );
+    let task = pap5(&work);
+    assert_eq!(task.status, TaskStatus::InProgress);
+    let moved = events_after(&work, work.store().latest_rev().expect("rev") - 1);
+    assert_eq!(moved[0].author, member(RUNNER));
+    assert_eq!(moved[0].on_behalf_of, Some(member(SAM)));
+
+    // A person moves it back; the agent's next turn does not move it again.
+    work.move_task(&person(SAM), &TaskRef::Id(task.id), TaskStatus::Todo)
+        .expect("back");
+    runner_reports(
+        &work,
+        vec![
+            state_changed(session, SessionState::Working, SessionState::Idle),
+            state_changed(session, SessionState::Idle, SessionState::Working),
+        ],
+    );
+    assert_eq!(pap5(&work).status, TaskStatus::Todo);
+
+    // The agent reports it done (`pitcrew report PAP-5 --review`): the move and the dispatch's
+    // end, in one append, by the agent.
+    work.move_task(&person(SAM), &TaskRef::Id(task.id), TaskStatus::InProgress)
+        .expect("forward");
+    let rev = work.store().latest_rev().expect("rev");
+    let app = app(&work);
+    expect(
+        &call(
+            &app,
+            Some(agent(RUNNER)),
+            "POST",
+            "/v1/tasks/PAP-5/move",
+            Some(json!({ "to": "review" })),
+        )
+        .await,
+        200,
+    );
+    let events = events_after(&work, rev);
+    assert_eq!(types(&events), ["task_moved", "dispatch_finished"]);
+    assert!(events.iter().all(|e| e.author == member(RUNNER)));
+    let finished = work.dispatch(&dispatch_id).expect("dispatch");
+    assert_eq!(finished.outcome, Some(DispatchOutcome::Succeeded));
+    assert!(finished.ended.is_some());
+    assert_eq!(pap5(&work).status, TaskStatus::Review);
+
+    // The session ending afterwards changes nothing more.
+    let rev = work.store().latest_rev().expect("rev");
+    runner_reports(&work, vec![EventBody::SessionEnded { session }]);
+    assert_eq!(
+        work.store().latest_rev().expect("rev"),
+        rev + 1,
+        "only the end itself"
+    );
+
+    // A person moving a task to review reports no dispatch's work.
+    let (other, _) = dispatched_on(&work, "PAP-6").await;
+    work.move_task(
+        &person(SAM),
+        &TaskRef::parse("PAP-6").expect("key"),
+        TaskStatus::InProgress,
+    )
+    .expect("start");
+    work.move_task(
+        &person(SAM),
+        &TaskRef::parse("PAP-6").expect("key"),
+        TaskStatus::Review,
+    )
+    .expect("review");
+    assert_eq!(work.dispatch(&other).expect("dispatch").ended, None);
+}
+
+async fn dispatched_on(work: &Arc<WorkService>, key: &str) -> (DispatchId, SessionId) {
+    let res = dispatch(work, key, json!({ "agent": RUNNER })).await;
+    expect(&res, 202);
+    (
+        res.1["id"].as_str().expect("id").parse().expect("dispatch"),
+        res.1["session"]
+            .as_str()
+            .expect("session")
+            .parse()
+            .expect("session"),
+    )
+}
+
+/// A dispatched session that ends without the agent's report finishes its dispatch as canceled
+/// ("stopped work"); one the runner never reported, as failed.
+#[tokio::test]
+async fn a_dispatch_whose_session_ends_without_a_report_is_over() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner = Recorder::new(Answer::Start);
+    let work = service(dir.path(), Some(Arc::clone(&runner)));
+
+    let (first, session) = dispatched(&work).await;
+    runner_reports(
+        &work,
+        vec![
+            restated(&work, session, SessionState::Working),
+            EventBody::SessionEnded { session },
+        ],
+    );
+    assert_eq!(pap5(&work).status, TaskStatus::InProgress, "it did work");
+    let over = work.dispatch(&first).expect("dispatch");
+    assert_eq!(over.outcome, Some(DispatchOutcome::Canceled));
+    assert_eq!(over.summary.as_deref(), Some(ENDED_WITHOUT_REPORT));
+    let last = events_after(&work, work.store().latest_rev().expect("rev") - 1);
+    assert_eq!(last[0].author, member(RUNNER));
+    assert_eq!(last[0].on_behalf_of, Some(member(SAM)));
+
+    // Over, so the agent can be dispatched again; this one's CLI never reports its session.
+    let (second, session) = dispatched(&work).await;
+    runner_reports(&work, vec![EventBody::SessionEnded { session }]);
+    let over = work.dispatch(&second).expect("dispatch");
+    assert_eq!(over.outcome, Some(DispatchOutcome::Failed));
+    assert_eq!(over.summary.as_deref(), Some(NEVER_STARTED));
+
+    // Reports about sessions without a dispatch change nothing.
+    let rev = work.store().latest_rev().expect("rev");
+    work.follow_sessions(&events_after(&work, 0))
+        .expect("replay");
+    assert_eq!(work.store().latest_rev().expect("rev"), rev);
+}
+
+/// A session the hub stored whose CLI never started (a crash between the dispatch and its
+/// start, or a terminal gone before its transcript appeared) is abandoned: its dispatch fails and
+/// it ends. One the runner reported meanwhile, or one already ended, is left as it is.
+#[tokio::test]
+async fn a_session_whose_cli_never_started_is_abandoned() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner = Recorder::new(Answer::Start);
+    let work = service(dir.path(), Some(Arc::clone(&runner)));
+    let cluster: MachineId = CLUSTER.parse().expect("machine");
+    let before = work.unreported_sessions(&cluster).expect("unreported");
+
+    let (dispatch_id, session) = dispatched(&work).await;
+    let unreported = work.unreported_sessions(&cluster).expect("unreported");
+    assert_eq!(unreported.len(), before.len() + 1);
+    assert!(unreported.iter().any(|s| s.id == session));
+    let rev = work.store().latest_rev().expect("rev");
+    work.abandon_session(&session, "its terminal is gone")
+        .expect("abandon");
+    let events = events_after(&work, rev);
+    assert_eq!(types(&events), ["dispatch_finished", "session_ended"]);
+    assert!(events.iter().all(|e| e.author == member(RUNNER)));
+    let over = work.dispatch(&dispatch_id).expect("dispatch");
+    assert_eq!(over.outcome, Some(DispatchOutcome::Failed));
+    assert!(
+        over.summary
+            .as_deref()
+            .is_some_and(|s| s.contains("its terminal is gone")),
+        "{over:?}"
+    );
+    assert_eq!(
+        work.session(&session).expect("session").state,
+        SessionState::Ended
+    );
+    assert_eq!(
+        work.unreported_sessions(&cluster).expect("unreported"),
+        before
+    );
+
+    // Ended: nothing more. Reported meanwhile: left to run.
+    let rev = work.store().latest_rev().expect("rev");
+    work.abandon_session(&session, "again").expect("ended");
+    let (alive, session) = dispatched(&work).await;
+    runner_reports(
+        &work,
+        vec![restated(&work, session, SessionState::Starting)],
+    );
+    let rev2 = work.store().latest_rev().expect("rev");
+    work.abandon_session(&session, "late").expect("reported");
+    assert_eq!(work.store().latest_rev().expect("rev"), rev2);
+    assert!(rev2 > rev);
+    assert_eq!(work.dispatch(&alive).expect("dispatch").ended, None);
+    let err = work
+        .abandon_session(&SessionId::new(), "unknown")
+        .expect_err("unknown");
+    assert_eq!(err.code(), ErrorCode::NotFound);
+}
+
+/// A session a person starts for an agent or a task is stored before its CLI starts, as a
+/// dispatch's is: `starting`, with the agent, linked to the task by hand. One whose start fails is
+/// abandoned: it ends.
+#[tokio::test]
+async fn a_session_started_for_an_agent_and_a_task_is_stored_ahead_of_its_cli() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let work = service(dir.path(), None);
+    let laptop: MachineId = LAPTOP.parse().expect("machine");
+    let task = pap5(&work);
+    let start = |agent: Option<&str>, task: Option<pitcrew_protocol::ids::TaskId>| {
+        pitcrew_hub_work::RecordedStart {
+            machine: laptop,
+            engine: Engine::Claude,
+            cwd: "/home/sam/work/diffusion-paper".into(),
+            agent: agent.map(member),
+            task,
+        }
+    };
+    let rev = work.store().latest_rev().expect("rev");
+    let session = work
+        .record_start(&person(SAM), start(Some(WRITER), Some(task.id)))
+        .expect("recorded");
+    assert_eq!(session.state, SessionState::Starting);
+    assert_eq!(session.native_id, "");
+    assert_eq!(session.agent, Some(member(WRITER)));
+    assert_eq!(session.task, Some(task.id));
+    assert_eq!(session.workstream, task.workstream);
+    assert_eq!(session.link_basis, Some(LinkBasis::Manual));
+    assert_eq!(work.session(&session.id).expect("stored"), session);
+    assert_eq!(types(&events_after(&work, rev)), ["session_discovered"]);
+    // Without a task: no link.
+    let free = work
+        .record_start(&person(SAM), start(Some(WRITER), None))
+        .expect("recorded");
+    assert_eq!(free.link_basis, None);
+
+    for (caller, bad, code) in [
+        (person(SAM), start(Some(SAM), None), ErrorCode::Invalid),
+        (
+            person(SAM),
+            start(Some("01JB000000000000000MEM0099"), None),
+            ErrorCode::Invalid,
+        ),
+        (
+            person(SAM),
+            start(None, Some(pitcrew_protocol::ids::TaskId::new())),
+            ErrorCode::Invalid,
+        ),
+        (
+            agent(WRITER),
+            start(Some(WRITER), None),
+            ErrorCode::Forbidden,
+        ),
+    ] {
+        let rev = work.store().latest_rev().expect("rev");
+        let err = work.record_start(&caller, bad).expect_err("refused");
+        assert_eq!(err.code(), code, "{err}");
+        assert_eq!(work.store().latest_rev().expect("rev"), rev);
+    }
+
+    // Its CLI could not start: it ends, as its agent's.
+    work.abandon_session(&session.id, "no terminal runtime")
+        .expect("abandon");
+    let last = events_after(&work, work.store().latest_rev().expect("rev") - 1);
+    assert_eq!(types(&last), ["session_ended"]);
+    assert_eq!(last[0].author, member(WRITER));
+    assert_eq!(
+        work.session(&session.id).expect("session").state,
+        SessionState::Ended
+    );
 }

@@ -84,7 +84,10 @@ mod setup;
 
 pub use activity::EventRefs;
 pub use commands::{AnswerAsk, BriefEdit, NewAsk, NewComment, WorkstreamPatch};
-pub use dispatch::{DispatchError, DispatchRequest, Dispatcher, NewDispatch};
+pub use dispatch::{
+    DispatchError, DispatchRequest, Dispatcher, ENDED_WITHOUT_REPORT, NEVER_STARTED, NewDispatch,
+    RecordedStart,
+};
 pub use edits::{LABEL_CHARS, MAX_LABELS, TITLE_CHARS};
 pub use error::{INTERNAL_MESSAGE, Result, WorkError};
 pub use office::{
