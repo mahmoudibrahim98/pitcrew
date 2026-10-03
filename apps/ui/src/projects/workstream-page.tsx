@@ -5,6 +5,7 @@
 import { useParams } from '@tanstack/react-router';
 import { ToggleGroup } from 'radix-ui';
 import { useState } from 'react';
+import { ReadScope } from './read-scope.tsx';
 import { StatusPill } from '../design/index.ts';
 import { ActivityFeed } from './activity.tsx';
 import { AgentsNow } from './agents.tsx';
@@ -58,6 +59,7 @@ export function WorkstreamPage() {
 
   return (
     <div className="mx-auto flex max-w-5xl flex-col gap-4 px-6 py-6">
+      {workstream !== undefined && <ReadScope key={workstream.id} scope={`workstream:${workstream.id}`} />}
       <header className="flex flex-col gap-2">
         {workstream !== undefined && (
           <MaybeLink

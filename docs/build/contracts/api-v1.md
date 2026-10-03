@@ -344,6 +344,30 @@ not start at byte 0).
 - An unknown session is `404`; a `limit` of 0, or a `before` or `limit` that is not a whole number,
   is `400`.
 
+### Read cursors
+
+`GET /v1/me/cursors` returns `ReadCursor[]` for the token's person, sorted by scope.
+`PUT /v1/me/cursors/{scope}` takes `{ "rev": u64 }` and returns a `ReadCursor`
+(`{ "scope": String, "rev": u64 }`). Both routes are person-only: agent tokens get 403,
+including malformed PUT bodies. Cursors belong to a person across all their devices.
+
+Scopes are `workspace`, `project:<ProjectId>` or `workstream:<WorkstreamId>` (bare ULIDs).
+Malformed scopes are 400; unknown projects/workstreams are 404. An absent cursor means 0.
+Revisions ahead of the hub's current log are 400. A revision equal to or below the stored
+one returns the current cursor without appending. Moving forward appends `cursor_moved`
+with `{ "scope", "rev" }`, authored by the person; its projection keeps the maximum revision
+per author and scope. Clients refetch cursors on this stream event. Cursor events are read
+metadata, private to their person: never in activity or recap inputs, and never in
+other people's streams (including replay). Only that person's device tokens receive
+`cursor_moved`; agent tokens never receive it. The UI also excludes it defensively.
+
+Activity and recap routes keep their existing paging contract. Clients fetch their cursor,
+compare activity revisions to it, and mark revisions greater than it new. Home counts the
+new items in its loaded window (and indicates when older pages remain). Mark all as read
+advances to the newest activity revision actually shown. Project and workstream views
+advance their own scope after a one-second dwell, to the newest activity revision loaded
+when that visit began; arriving live events remain new until another visit.
+
 ### Asks, briefs, activity
 
 | Method and path | Body → response | Notes |
@@ -379,10 +403,13 @@ put there. Its **pending proposal** is the newest `brief_proposed` for that targ
 - An `agent` token: only asks addressed to itself, and only of kind `question` or `mention`.
 - `decision`, `approval` and `review` always need a `device` token.
 
-**Activity paging** (`GET /v1/events`, response type `EventsPage`): events oldest first within
-the page, the newest page when `before` is absent. `before` is an exclusive revision. `from_rev`
-and `to_rev` are the revisions of the first and last returned events; with filters they need not
-be contiguous. Pass `from_rev` as `before` for the previous page. Default limit 100, max 500;
+**Activity paging** (`GET /v1/events`, also available as `GET /v1/activity`, response type
+`EventsPage`): events oldest first within the page, the newest page when `before` is absent. `before` is an exclusive revision. `from_rev`
+and `to_rev` are the revisions of the first and last returned events. `revisions: u64[]`
+contains each returned event's actual revision in the same order; revisions need not be
+contiguous, even without filters. Cursor writes are skipped before counting the limit,
+so an unfiltered page holds up to its limit of real events. Pass `from_rev` as `before` for
+the previous page. Default limit 100, max 500;
 `limit=0` is 400.
 - **Only `at_start` ends paging.** With filters the hub scans a bounded window per request, so a
   page may hold fewer than `limit` events, even none. An empty page that is not at the start has
@@ -549,22 +576,25 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
   ignored; send none.
 - **One scan at a time per machine.** A scan holds its machine from the moment it is accepted
   until its walk ends; a second one meanwhile is `409 conflict`. A client that closes the answer
-  early does not stop the walk: it ends on its own (it is bounded), and only then may the machine
-  be scanned again.
+  early cancels further work between homes and files. A ten-minute budget also stops further
+  work and returns the counts collected so far with `partial: true`. An in-flight filesystem
+  operation must finish before cancellation takes effect and the machine can be scanned again.
 - **The answer** is `200` with `Content-Type: application/x-ndjson`: one `ScanFrame` JSON object
   per line, written as the walk goes. Read it as a stream for live progress, or whole.
   - `{"type":"progress","scanned":0}` at once. Then `{"type":"progress","scanned":N,"total":M}`
     (with `"path"`, a transcript just read, when there is one) at most every 100 ms; the last
-    progress frame has `scanned` equal to `total`.
+    progress frame has `scanned` equal to `total` for a complete scan; a partial scan may have less.
   - Then exactly one last frame: `{"type":"done","report":ScanReport}`, or, if the scan failed
     after the answer began, `{"type":"error","code":ErrorCode,"message":String}`.
-  - A client that reads slowly may miss progress frames, never the last progress frame or the
-    last frame.
-- `ScanReport`: `{ "counts": ScanCounts, "suggestions": Suggestion[], "unreadable": u64 }`.
+  - A client that reads slowly may miss progress frames. Sending the last progress frame or
+    final frame waits at most 30 seconds; on timeout the stream closes and releases its claim.
+- `ScanReport`: `{ "counts": ScanCounts, "suggestions": Suggestion[], "unreadable": u64, "partial"?: bool }`.
   - `ScanCounts`: `{ "sessions", "subagent_sessions", "by_engine": [{ "engine", "count" }],
     "by_home": [{ "engine", "home", "count" }], "by_folder": [{ "path", "count" }],
     "by_month": [{ "month", "count" }], "first_activity"?, "last_activity"? }`. The `by_` lists
     count ordinary sessions; sub-agent sessions are counted once, in `subagent_sessions`.
+    Sessions without a working directory are omitted from `by_folder`; sessions without a
+    start time are omitted from `by_month`, so either list may sum to less than `sessions`.
     `by_folder` is busiest first, `by_month` (`YYYY-MM`, UTC) most recent first.
   - `Suggestion`, a suggested project: `{ "id", "name", "path", "is_git", "session_count",
     "recent_30d", "recent_90d", "workstreams": WorkstreamSuggestion[] }`. `path` is a repository
@@ -576,6 +606,8 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
     `branch`; `id` is the folder's own path, which is also where it is), or a branch other than
     `main`, `master`, `trunk`, `develop` and `HEAD` (with `branch`; `id` is
     `<project path>#<branch>`, and it is the project's `path` on that branch).
+  - `partial`, when true, means cancellation or the budget stopped the scan early. Absent means
+    false, for compatibility with older servers.
   - `unreadable` counts homes, folders and transcripts skipped because they could not be read;
     the rest of the scan still ran.
   - Paths are the machine's own, as its CLIs wrote them. A session's folder and branch are the ones
@@ -599,7 +631,10 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
 - **`log` identifies the hub's event log.** It is created with the store and never changes.
   Revisions only count within one log: if `log` differs from the one the client's cache came
   from, or `since` is newer than `N`, the client must drop its cached state and refetch.
-- `events` frames carry `from_rev..=to_rev` and the events in order. Small changes are batched
+- `events` frames carry contiguous `from_rev..=to_rev` and the events in order.
+  Private cursor writes create gaps between frames: clients accept those gaps without resetting
+  or renumbering events. Replay scans past hidden revisions, including metadata-only pages.
+  No empty frame or cursor payload is sent for hidden writes. Small changes are batched
   over 50–100 ms.
 - `{"type":"ping","at":…}` every 20 s. A client that sees nothing for 60 s reconnects.
 - Agents and hooks use HTTP; the stream is for `device` tokens in v1.

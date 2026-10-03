@@ -160,6 +160,7 @@ function bareId(ref: string, prefix: string): string {
 }
 
 export class Hub {
+  readonly cursors = new Map<MemberId, Map<string, number>>();
   readonly workspace: Workspace;
   readonly machines: Machine[];
   readonly members: Member[];

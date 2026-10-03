@@ -103,6 +103,8 @@ jobs:
         run: |
           pnpm --filter @pitcrew/ui exec playwright install --with-deps chromium
           pnpm --filter @pitcrew/ui e2e
+      - name: Fresh-config onboarding (Chromium)
+        run: pnpm --filter @pitcrew/ui exec playwright test --config e2e/fresh.config.ts
 
   rust:
     name: Rust (${{ matrix.os }})

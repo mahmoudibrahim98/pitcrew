@@ -525,6 +525,9 @@ impl Recaps {
     /// same way. If the blocks cannot be stored, the index is broken ([`Recaps::is_broken`]).
     pub fn push(&mut self, events: &[Event]) {
         for event in events {
+            if matches!(event.body, EventBody::CursorMoved { .. }) {
+                continue;
+            }
             let taken = catch_unwind(AssertUnwindSafe(|| {
                 let was_named = self.named_before(event);
                 let names_before = self.builder.directory().names_version();

@@ -359,7 +359,7 @@ describe('activity', () => {
       const oldest = await get(`?limit=5&before=${older.from_rev}`);
       assert.deepEqual([oldest.from_rev, oldest.to_rev, oldest.at_start], [1, 5, true]);
       const empty = await get('?before=1');
-      assert.deepEqual(empty, { events: [], from_rev: 0, to_rev: 0, at_start: true });
+      assert.deepEqual(empty, { events: [], revisions: [], from_rev: 0, to_rev: 0, at_start: true });
     }));
 
   it('filters events by what they are about, parents included', () =>
@@ -394,7 +394,7 @@ describe('activity', () => {
           (await call<Activity>(server, 'GET', `/v1/events${query}`, { token: DEVICE })).body;
         // PAP-1's events are revisions 4–7; revisions 8–15 are a gap wider than the window of 5.
         const first = await get(`?task=${ID.pap1}`);
-        assert.deepEqual(first, { events: [], from_rev: 11, to_rev: 0, at_start: false });
+        assert.deepEqual(first, { events: [], revisions: [], from_rev: 11, to_rev: 0, at_start: false });
         const second = await get(`?task=${ID.pap1}&before=${first.from_rev}`);
         assert.deepEqual([second.from_rev, second.to_rev, second.at_start], [6, 7, false]);
         const third = await get(`?task=${ID.pap1}&before=${second.from_rev}`);
@@ -420,9 +420,9 @@ describe('activity', () => {
 
         // A filter that matches nothing: empty pages until the scan reaches revision 1.
         const none = '01JB000000000000000TSK0099';
-        assert.deepEqual(await get(`?task=${none}`), { events: [], from_rev: 11, to_rev: 0, at_start: false });
-        assert.deepEqual(await get(`?task=${none}&before=11`), { events: [], from_rev: 6, to_rev: 0, at_start: false });
-        assert.deepEqual(await get(`?task=${none}&before=6`), { events: [], from_rev: 0, to_rev: 0, at_start: true });
+        assert.deepEqual(await get(`?task=${none}`), { events: [], revisions: [], from_rev: 11, to_rev: 0, at_start: false });
+        assert.deepEqual(await get(`?task=${none}&before=11`), { events: [], revisions: [], from_rev: 6, to_rev: 0, at_start: false });
+        assert.deepEqual(await get(`?task=${none}&before=6`), { events: [], revisions: [], from_rev: 0, to_rev: 0, at_start: true });
 
         // Without filters the window does not apply.
         const all = await get('?limit=10');

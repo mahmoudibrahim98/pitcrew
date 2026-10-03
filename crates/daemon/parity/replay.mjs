@@ -460,7 +460,7 @@ const TESTS = {
     const oldest = await get(`?limit=5&before=${older?.from_rev}`);
     r.check('oldest: [from, to, at_start]', [oldest?.from_rev, oldest?.to_rev, oldest?.at_start], [1, 5, true]);
     const empty = await get('?before=1');
-    r.check('before=1', empty, { events: [], from_rev: 0, to_rev: 0, at_start: true });
+    r.check('before=1', empty, { events: [], revisions: [], from_rev: 0, to_rev: 0, at_start: true });
     // Relative to each server's own log.
     r.check('extra: latest page is the 5 newest', latest?.to_rev - latest?.from_rev, 4);
     r.check('extra: the page before ends just below', older?.to_rev, latest?.from_rev - 1);
@@ -498,7 +498,7 @@ const TESTS = {
     const sliceSeen = pages.flatMap((p) => slice(p?.events ?? [])).map((e) => e.id.slice(-4)).sort();
     r.check('extra: every match of the demo slice', sliceSeen, ['0004', '0005', '0006', '0007']);
     r.check('only the last page is at_start', pages.map((p) => p?.at_start), [...pages.slice(1).map(() => false), true]);
-    r.check('no match', await get('?task=01JB000000000000000TSK0099'), { events: [], from_rev: 0, to_rev: 0, at_start: true });
+    r.check('no match', await get('?task=01JB000000000000000TSK0099'), { events: [], revisions: [], from_rev: 0, to_rev: 0, at_start: true });
   },
 
   // The work-edits contract (apps/mock-hub/test/edits.test.ts): the first test of each route.

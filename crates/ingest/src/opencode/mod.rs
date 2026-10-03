@@ -386,7 +386,11 @@ impl SourceAdapter for OpenCodeAdapter {
                 }
                 Err(e) => {
                     if note_unreadable(&path, Some(&e.to_string())) {
-                        tracing::warn!(path = %path.display(), error = %e, "skipped an unreadable OpenCode store");
+                        tracing::warn!(
+                            count = 1,
+                            reason = "store could not be read",
+                            "skipped an unreadable OpenCode store"
+                        );
                     }
                     continue;
                 }

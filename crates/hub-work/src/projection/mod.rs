@@ -21,6 +21,7 @@
 mod asks;
 mod briefs;
 mod comments;
+mod cursors;
 mod directory;
 mod projects;
 mod refs;
@@ -31,6 +32,7 @@ pub use asks::Asks;
 pub use briefs::Briefs;
 pub(crate) use briefs::target_columns;
 pub use comments::Comments;
+pub use cursors::Cursors;
 pub use directory::Directory;
 pub use projects::Projects;
 pub use refs::Refs;
@@ -52,11 +54,12 @@ pub fn projections() -> Vec<Box<dyn Projection>> {
         Box::new(Comments),
         Box::new(Briefs),
         Box::new(Refs),
+        Box::new(Cursors),
     ]
 }
 
 /// The names of [`projections`], e.g. for `Store::rebuild`.
-pub const NAMES: [&str; 8] = [
+pub const NAMES: [&str; 9] = [
     Directory::NAME,
     Projects::NAME,
     Tasks::NAME,
@@ -65,10 +68,12 @@ pub const NAMES: [&str; 8] = [
     Comments::NAME,
     Briefs::NAME,
     Refs::NAME,
+    Cursors::NAME,
 ];
 
 /// Every table the work model owns, children before parents (the order `reset` clears them in).
-pub const TABLES: [&str; 23] = [
+pub const TABLES: [&str; 24] = [
+    "work_read_cursors",
     "work_team_members",
     "work_teams",
     "work_personas",
