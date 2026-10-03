@@ -400,6 +400,27 @@ mod tests {
         }
     }
 
+    /// `--scan-hold-ms` is for tests and development too: it parses, a bad value is refused, and
+    /// help does not show it.
+    #[test]
+    fn the_scan_hold_is_hidden() {
+        let cli = Cli::try_parse_from(["pitcrewd", "serve", "--scan-hold-ms", "1500"]).unwrap();
+        let Some(Command::Serve(args)) = cli.command else {
+            panic!("not serve");
+        };
+        assert_eq!(args.scan_hold_ms, Some(1500));
+        let defaults = Cli::try_parse_from(["pitcrewd", "serve"]).unwrap();
+        let Some(Command::Serve(args)) = defaults.command else {
+            panic!("not serve");
+        };
+        assert_eq!(args.scan_hold_ms, None);
+        assert!(Cli::try_parse_from(["pitcrewd", "serve", "--scan-hold-ms", "soon"]).is_err());
+        let mut command = Cli::command();
+        let serve = command.find_subcommand_mut("serve").unwrap();
+        let help = serve.render_long_help().to_string();
+        assert!(!help.contains("scan-hold"), "{help}");
+    }
+
     #[test]
     fn homes_are_folders_or_one_engines_home() {
         let cli = Cli::try_parse_from([

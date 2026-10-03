@@ -68,6 +68,14 @@ pub fn hold_each(hold: Option<Duration>) {
 /// The route. Mount it as a **device** route (`RouterParts::device`). `homes` are the runner's
 /// (`None` with `--no-runner`).
 pub fn routes(work: Arc<WorkService>, homes: Option<&[EngineHome]>) -> Router {
+    let hold = HOLD.get().copied().unwrap_or_default();
+    if !hold.is_zero() {
+        tracing::warn!(
+            ms = hold.as_millis(),
+            "for tests and development (--scan-hold-ms): each machine scan waits this long before \
+             it walks"
+        );
+    }
     let scans = Scans {
         work,
         homes: homes.map(|homes| {
@@ -80,7 +88,7 @@ pub fn routes(work: Arc<WorkService>, homes: Option<&[EngineHome]>) -> Router {
                 .collect()
         }),
         running: Running::default(),
-        hold: HOLD.get().copied().unwrap_or_default(),
+        hold,
     };
     Router::new()
         .route("/v1/machines/{id}/scan", post(scan))
@@ -137,7 +145,10 @@ fn conflict(message: impl Into<String>) -> ErrorResponse {
     ErrorResponse::new(ErrorCode::Conflict, message)
 }
 
-async fn scan(State(scans): State<Arc<Scans>>, id: Result<Path<String>, PathRejection>) -> Response {
+async fn scan(
+    State(scans): State<Arc<Scans>>,
+    id: Result<Path<String>, PathRejection>,
+) -> Response {
     match start(&scans, id).await {
         Ok(frames) => (
             StatusCode::OK,

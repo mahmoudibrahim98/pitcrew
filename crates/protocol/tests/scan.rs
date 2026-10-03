@@ -11,10 +11,13 @@ use pitcrew_protocol::scan::{
 use serde_json::{Value, json};
 
 fn round_trip(frame: &ScanFrame, wire: &Value) {
-    assert_eq!(&serde_json::to_value(frame).unwrap(), wire);
-    assert_eq!(&serde_json::from_value::<ScanFrame>(wire.clone()).unwrap(), frame);
+    let json = serde_json::to_value(frame).expect("a frame serialises");
+    assert_eq!(&json, wire);
+    let back: ScanFrame = serde_json::from_value(wire.clone()).expect("the wire shape parses");
+    assert_eq!(&back, frame);
     // A frame is one line.
-    assert!(!serde_json::to_string(frame).unwrap().contains('\n'));
+    let line = serde_json::to_string(frame).expect("a frame serialises");
+    assert!(!line.contains('\n'));
 }
 
 #[test]
