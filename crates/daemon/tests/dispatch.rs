@@ -10,7 +10,10 @@
 //! notes what it was given to reach the hub. The test then checks that:
 //! - the session appears once, under the dispatch's id, linked to the task, with its terminal;
 //! - the CLI was given an **agent** token's file for the dispatched agent (never the person's
-//!   token, and no token in its environment), and where the daemon listens;
+//!   token, and no token in its environment), and where the daemon listens; and that holds though
+//!   the daemon itself was started with the person's token in `PITCREW_TOKEN` and another socket in
+//!   `PITCREW_SOCKET`, which its terminals pass on: read as the CLI reads them
+//!   (`pitcrew_cli::config`), the CLI's variables give the agent's token and the daemon's address;
 //! - the agent's own hooks change the session, and its first `working` moves the task to in
 //!   progress;
 //! - the agent's report (its move to review, what `pitcrew report --review` sends) moves the task
@@ -44,12 +47,15 @@ const RUNNER: &str = "01JB000000000000000MEM0003";
 const FIXTURE_ID: &str = "2b6f1a8e-4c1d-4f5e-9a37-0c8d1e2f3a4b";
 
 /// What every stand-in does first: note, in `@OUT@/<its id>/`, what it was given to reach the
-/// hub (the variables, never a token's text: the test reads the file the variable names).
+/// hub: the variables, in a private folder of the test's, and never printed (the token file's
+/// text is read from the file the variable names; a token in `PITCREW_TOKEN` would be the one the
+/// test started the daemon with).
 const NOTE: &str = r#"out="@OUT@/$id"
 mkdir -p "$out"
 printf '%s' "${PITCREW_TOKEN_FILE:-}" > "$out/token-file"
 printf '%s' "${PITCREW_URL:-}" > "$out/url"
 if [ -n "${PITCREW_TOKEN:-}" ]; then : > "$out/token-in-env"; fi
+env | grep '^PITCREW_' > "$out/env.part"; mv "$out/env.part" "$out/env"
 pwd -P > "$out/cwd"
 "#;
 
@@ -178,6 +184,11 @@ impl Rig {
     /// A daemon on this rig's state (seeded with the demo when `demo`), watching this rig's homes,
     /// its terminals in this rig's ptyd, with the stand-ins first on its `PATH`.
     fn start(&self, demo: bool) -> Daemon {
+        self.start_with(demo, &[])
+    }
+
+    /// [`Rig::start`], with `inherited` in the daemon's environment too.
+    fn start_with(&self, demo: bool, inherited: &[(&str, OsString)]) -> Daemon {
         let path = std::env::var_os("PATH").unwrap_or_default();
         let path = std::env::join_paths(
             std::iter::once(self.bin.clone()).chain(std::env::split_paths(&path)),
@@ -201,7 +212,7 @@ impl Rig {
         if demo {
             args.push("--demo");
         }
-        let env = [
+        let mut env = vec![
             ("PATH", path),
             (MARK, OsString::from(&self.mark)),
             (
@@ -210,6 +221,7 @@ impl Rig {
             ),
             ("CODEX_HOME", self.homes.join(".codex").into_os_string()),
         ];
+        env.extend(inherited.iter().cloned());
         Daemon::start_with(&self.tmp.path().join("state"), &args, &env, Tmux::Refused)
     }
 
@@ -223,6 +235,15 @@ impl Rig {
     /// Whether the stand-in started as `native` had a token in its environment.
     fn token_in_env(&self, native: &str) -> bool {
         self.out.join(native).join("token-in-env").exists()
+    }
+
+    /// The `PITCREW_*` variables the stand-in started as `native` had, empty ones included.
+    fn pitcrew_env(&self, native: &str) -> std::collections::HashMap<String, String> {
+        self.noted(native, "env")
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect()
     }
 
     /// This test's processes still running.
@@ -430,6 +451,22 @@ fn dispatch_and_follow(
     // where the daemon listens; no token in its environment.
     assert!(!rig.token_in_env(&native));
     assert_eq!(rig.noted(&native, "url"), daemon.at);
+    // Though the daemon was started with the person's token and another socket (passed on by its
+    // terminals), the CLI reads the agent's token file and the daemon's address: the two are set
+    // empty for it, which the CLI reads as unset.
+    let vars = rig.pitcrew_env(&native);
+    for name in ["PITCREW_TOKEN", "PITCREW_SOCKET", "PITCREW_PIPE"] {
+        assert_eq!(vars.get(name).map(String::as_str), Some(""), "{name}");
+    }
+    let lookup = |name: &str| vars.get(name).map(OsString::from);
+    let read = pitcrew_cli::config::token_from_env(&lookup)
+        .unwrap_or_else(|e| panic!("the CLI finds no token: {:?}", e.kind));
+    match pitcrew_cli::config::Endpoint::from_env(&lookup) {
+        Ok(pitcrew_cli::config::Endpoint::Tcp { host, .. }) => {
+            assert_eq!(format!("http://{host}"), daemon.at);
+        }
+        other => panic!("the CLI reaches another endpoint: {other:?}"),
+    }
     let file = PathBuf::from(rig.noted(&native, "token-file"));
     assert_eq!(
         file,
@@ -441,7 +478,11 @@ fn dispatch_and_follow(
         assert_eq!(mode & 0o777, 0o600, "{}", file.display());
     }
     let token = common::read_token(&file);
-    assert_ne!(token, device, "never the person's token");
+    assert!(token != device, "never the person's token");
+    assert!(
+        read == token,
+        "the CLI authenticates with the agent's token file, not an inherited token"
+    );
     let me = ok(&daemon.get("/v1/me", Some(&token)), 200, "me");
     assert_eq!(me["id"], agent);
     assert_eq!(me["owner"], id::SAM);
@@ -530,7 +571,20 @@ fn a_dispatched_agent_runs_as_its_session_and_moves_its_task() {
     let Some(rig) = Rig::new() else {
         return;
     };
+    // The demo, set up; then the daemon again, started from a shell that exports the person's
+    // token and another daemon's socket, which its terminals pass on to every CLI.
     let mut daemon = rig.start(true);
+    let device = daemon.device_token();
+    daemon.stop();
+    let elsewhere = rig.tmp.path().join("elsewhere");
+    private_folder(&elsewhere);
+    let mut daemon = rig.start_with(
+        false,
+        &[
+            ("PITCREW_TOKEN", OsString::from(&device)),
+            ("PITCREW_SOCKET", elsewhere.into_os_string()),
+        ],
+    );
     let info = daemon.get("/v1/host/info", None).json();
     assert_eq!(info["capabilities"], json!(["pty", "watch"]), "{info}");
 
