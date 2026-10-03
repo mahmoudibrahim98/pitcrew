@@ -1,5 +1,6 @@
 // Step 8: turn the scan's suggestions into real projects and workstreams. Tick what to keep,
-// rename anything, move a workstream to a different (ticked) project, and pick a template.
+// rename anything, move a workstream to a different (ticked) project, and pick a template. A
+// failure says why and keeps the choices, so Create can be pressed again.
 
 import { useState } from 'react';
 import type { ProjectSelection, ProjectTemplate } from '../api.ts';
@@ -31,6 +32,7 @@ export function CreateStep() {
   const { state, patch, next, skip } = useWizard();
   const api = useOnboardingApi();
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | undefined>();
 
   function updateProject(id: string, fields: Partial<CreateProjectDraft>) {
     patch({ createProjects: state.createProjects.map((p) => (p.suggestionId === id ? { ...p, ...fields } : p)) });
@@ -49,10 +51,13 @@ export function CreateStep() {
       return;
     }
     setBusy(true);
+    setError(undefined);
     try {
       const result = await api.createFromScan(selection);
       patch({ createResult: result });
       next();
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : String(failure));
     } finally {
       setBusy(false);
     }
@@ -150,6 +155,12 @@ export function CreateStep() {
           );
         })}
       </ul>
+
+      {error !== undefined && (
+        <p role="alert" className="mt-3 text-sm text-risk">
+          {error}
+        </p>
+      )}
 
       <StepFooter nextLabel="Create" onSkip={skip} skipLabel="Don't create any yet" busy={busy} />
     </form>

@@ -3,8 +3,10 @@ import { expectNoAxeViolations } from './axe';
 import { FIRST_RUN_HUB, MOCK_DEVICE_TOKEN } from './fresh-hubs';
 
 // The first run in a browser, against a fresh mock hub (`fresh.config.ts`): the shell sends the
-// empty workspace to the first-run wizard, the wizard is Welcome, Workspace, Done against the real
-// `POST /v1/setup`, and Home stays Home afterwards. `GET /v1/me` is then the new person. axe finds
+// empty workspace to the first-run wizard, the wizard is Welcome, Workspace, Scan, Create, Done
+// against the real `POST /v1/setup`, `POST /v1/machines/{id}/scan` (the mock's synthetic report),
+// `POST /v1/projects` and `POST /v1/workstreams`, and Home stays Home afterwards. `GET /v1/me` is
+// then the new person, and the projects and workstreams are where the scan found them. axe finds
 // nothing on the new screens, light and dark.
 
 const AUTH = { Authorization: `Bearer ${MOCK_DEVICE_TOKEN}` };
@@ -14,6 +16,7 @@ function heading(page: Page, name: string | RegExp) {
 }
 
 test('the first run, from an empty workspace to Home as the new person', async ({ page, request }) => {
+  test.setTimeout(120_000);
   const before = await request.get(`${FIRST_RUN_HUB}/v1/workspace`, { headers: AUTH });
   const { workspace, setup_needed } = (await before.json()) as { workspace: { id: string }; setup_needed?: boolean };
   expect(setup_needed).toBe(true);
@@ -26,7 +29,7 @@ test('the first run, from an empty workspace to Home as the new person', async (
   await expect(heading(page, 'Welcome to PitCrew')).toBeVisible();
   await expect(page.getByRole('complementary', { name: 'Sidebar' })).toHaveCount(0);
   // Only the steps the hub can serve.
-  await expect(page.getByRole('tab')).toHaveText([/Welcome/, /Workspace/, /Done/]);
+  await expect(page.getByRole('tab')).toHaveText([/Welcome/, /Workspace/, /Scan/, /Create/, /Done/]);
   await expectNoAxeViolations(page, 'welcome');
 
   // Any other page goes back to setup while it is not done.
@@ -50,9 +53,26 @@ test('the first run, from an empty workspace to Home as the new person', async (
   await expectNoAxeViolations(page, 'workspace');
   await page.getByRole('button', { name: 'Continue' }).click();
 
+  // Scan: the hub's own machine, its counts and suggestions.
+  await expect(heading(page, 'Scanning for sessions')).toBeVisible();
+  await expect(page.getByText(/Found 3 likely projects/)).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText('/home/sam/work/diffusion-paper/paper')).toBeVisible();
+  await expectNoAxeViolations(page, 'scan');
+  await page.getByRole('button', { name: 'Continue' }).click();
+
+  // Create: rename one, leave one out, drop a workstream; the rest is created.
+  await expect(heading(page, 'Create projects and workstreams')).toBeVisible();
+  await page.getByLabel('Include diffusion-runs').uncheck();
+  await page.getByLabel('Include experiments').uncheck();
+  const paper = page.getByRole('listitem').filter({ has: page.getByLabel('Include diffusion-paper') });
+  await paper.getByLabel('Project name').fill('Diffusion paper');
+  await expectNoAxeViolations(page, 'create');
+  await page.getByRole('button', { name: 'Create', exact: true }).click();
+
   // Done, then Home, which stays Home.
   await expect(heading(page, "You're set up")).toBeVisible();
   await expect(page.getByText('“Demo Lab” is ready, with you as Sam Rivera (@sam) on This laptop.')).toBeVisible();
+  await expect(page.getByText('Created 2 projects.')).toBeVisible();
   await expectNoAxeViolations(page, 'done');
   await page.getByRole('button', { name: 'Go to Home' }).click();
   await expect(page).toHaveURL(new RegExp(`/w/${ws}/home$`));
@@ -68,6 +88,32 @@ test('the first run, from an empty workspace to Home as the new person', async (
   };
   expect(after.workspace.name).toBe('Demo Lab');
   expect(after.setup_needed).toBeUndefined();
+
+  // The projects at the scan's roots, keyed from their names, and their workstreams where the scan
+  // found them: a folder, or the project's root on a branch.
+  const machines = (await (await request.get(`${FIRST_RUN_HUB}/v1/machines`, { headers: AUTH })).json()) as { id: string }[];
+  const machine = machines[0]?.id;
+  const projects = (await (await request.get(`${FIRST_RUN_HUB}/v1/projects`, { headers: AUTH })).json()) as {
+    id: string;
+    key: string;
+    name: string;
+    root?: { machine: string; path: string };
+  }[];
+  expect(projects.map((p) => [p.key, p.name, p.root])).toEqual([
+    ['DP', 'Diffusion paper', { machine, path: '/home/sam/work/diffusion-paper' }],
+    ['LT', 'lab-tools', { machine, path: '/home/sam/work/lab-tools' }],
+  ]);
+  const workstreams = (await (await request.get(`${FIRST_RUN_HUB}/v1/workstreams`, { headers: AUTH })).json()) as {
+    project: string;
+    name: string;
+    locations: { machine: string; path: string; branch?: string }[];
+  }[];
+  const [dp, lt] = projects.map((p) => p.id);
+  expect(workstreams.map((w) => [w.project, w.name, w.locations])).toEqual([
+    [dp, 'paper', [{ machine, path: '/home/sam/work/diffusion-paper/paper' }]],
+    [dp, 'revision-2', [{ machine, path: '/home/sam/work/diffusion-paper', branch: 'revision-2' }]],
+    [lt, 'parsers', [{ machine, path: '/home/sam/work/lab-tools', branch: 'parsers' }]],
+  ]);
 
   // A fresh start lands on Home, not on setup.
   await page.goto('/');
