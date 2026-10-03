@@ -8,8 +8,7 @@
 import { readFileSync } from 'node:fs';
 import { isWellFormedDate } from './rules.ts';
 import type { BlocksPage, DayRecap, DaysPage, DemoRecaps } from './types.ts';
-import { isUlid } from './ulid.ts';
-import { invalid, isRecord, queryLimit, queryValue } from './validate.ts';
+import { invalid, isRecord, queryId, queryLimit, queryValue } from './validate.ts';
 
 /** `BLOCKS_DEFAULT_LIMIT`, `BLOCKS_MAX_LIMIT`, … in crates/protocol/src/recap.rs. */
 export const BLOCKS_DEFAULT_LIMIT = 50;
@@ -30,22 +29,6 @@ export function loadRecaps(path: URL): DemoRecaps {
     throw new Error(`${path.pathname}: expected an object with tz, blocks and projects`);
   }
   return parsed as unknown as DemoRecaps;
-}
-
-/**
- * An id in the query: the bare ULID or its prefixed form (`ses_…`), in either case, as `FromStr`
- * in ids.rs accepts. A malformed one is a 400; `undefined` when absent.
- */
-function queryId(query: URLSearchParams, key: string, prefix: string): string | undefined {
-  const value = queryValue(query, key);
-  if (value === undefined) {
-    return undefined;
-  }
-  const bare = value.startsWith(`${prefix}_`) ? value.slice(prefix.length + 1) : value;
-  if (!isUlid(bare)) {
-    throw invalid(`${key} must be an id: a 26-character ULID, or ${prefix}_ and one.`);
-  }
-  return bare.toUpperCase();
 }
 
 /** `tz`: whole minutes east of UTC, within ±14 hours; 0 when absent. */
