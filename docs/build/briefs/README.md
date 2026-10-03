@@ -86,10 +86,10 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [0-deps-tungstenite-030](0-deps-tungstenite-030.md) | 0 · Contracts | `integrator/deps-tungstenite-030` | Codex | Blocked: the released axum still needs tungstenite 0.29 |
 | [0-deps-typescript-7](0-deps-typescript-7.md) | 0 · Contracts | `integrator/deps-typescript-7` | Codex | **Merged** (PR #16: stays on 6 for now) |
 | [0-workspace-host](0-workspace-host.md) | 0 · Contracts | `integrator/workspace-host` | Codex | Changes requested (PR #17) |
-| [I-hook-exec-form](I-hook-exec-form.md) | I · CLI and hooks | `s/I/hook-exec-form` | Codex | Changes requested (PR #18) |
+| [I-hook-exec-form](I-hook-exec-form.md) | I · CLI and hooks | `s/I/hook-exec-form` | Codex | **Merged** (PR #18) |
 | [0-flaky-tests](0-flaky-tests.md) | 0 · Contracts | `integrator/flaky-tests` | Codex | **Merged** (PR #19) |
 | [0-flaky-tests-2](0-flaky-tests-2.md) | 0 · Contracts | `integrator/flaky-tests-2` | Codex | Ready |
-| [0-review-followups](0-review-followups.md) | 0 · Contracts | `integrator/review-followups` | Opus-class | In review (PR #30) |
+| [0-review-followups](0-review-followups.md) | 0 · Contracts | `integrator/review-followups` | Opus-class | **Merged** (PR #30) |
 | [0-dispatch](0-dispatch.md) | 0 · Composition root | `integrator/dispatch` | Opus-class | Ready |
 | [0-onboarding-scan](0-onboarding-scan.md) | 0 · Contracts | `integrator/onboarding-scan` | Opus-class | Ready |
 | [0-session-linking](0-session-linking.md) | 0 · Composition root | `integrator/session-linking` | Opus-class | Ready once 0-dispatch merges |
@@ -100,7 +100,7 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [0-installer-size](0-installer-size.md) | 0 · Contracts | `integrator/installer-size` | Codex | **Merged** (PR #26) |
 | [P-measure-more](P-measure-more.md) | P · Packaging | `s/P/measure-more` | Codex | **Merged** (PR #27) |
 | [0-contributor-docs](0-contributor-docs.md) | 0 · Contracts | `integrator/contributor-docs` | Codex | **Merged** (PR #29) |
-| [0-wsl-machines](0-wsl-machines.md) | 0 · Contracts | `integrator/wsl-machines` | Codex (local, Windows) | In progress (draft PR #28) |
+| [0-wsl-machines](0-wsl-machines.md) | 0 · Contracts | `integrator/wsl-machines` | Codex (local, Windows) | In review (PR #28) |
 | [N-calendar-timeline](N-calendar-timeline.md) | N · Projects layout | `s/N/calendar-timeline` | Codex (local) | **Merged** (PR #21) |
 | [0-daemon-solo](0-daemon-solo.md) | 0 · Composition root | `integrator/daemon-solo` | Opus-class | **Merged** |
 | [N-projects-wiring](N-projects-wiring.md) | N · Projects layout | `s/N/projects-wiring` | Sonnet-class | **Merged** |

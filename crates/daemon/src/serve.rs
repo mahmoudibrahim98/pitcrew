@@ -73,7 +73,8 @@ use tokio::sync::oneshot;
 
 /// Hook events queued for the sink before new ones are dropped.
 const HOOK_QUEUE: usize = 1024;
-/// The recap index's blocks, in the state directory: a cache, replaced at every start.
+/// The recap index's blocks, in the state directory (or in a private folder on a local disk when
+/// that is on a network filesystem; see the state-file table in `state.rs`): a cache.
 const RECAP_FILE: &str = "recaps.sqlite3";
 /// How long the server gets to finish in-flight requests and close its sockets after a stop
 /// signal.
@@ -269,7 +270,8 @@ fn open_with(
     let (signal, set_up) = crate::setup::signal();
     let attached = Arc::new(Attached::default());
     // The recap index keeps its blocks on disk, in a cache file of its own next to the store
-    // (replaced when the index is built, removed when the daemon stops), not in memory.
+    // (replaced when the index is built, removed when the daemon stops; on a local disk instead
+    // when the state directory is on a network filesystem), not in memory.
     let work = Arc::new(
         WorkService::new(Arc::clone(&store), workspace)
             .with_setup_listener(Arc::new(signal))
@@ -946,6 +948,35 @@ mod tests {
             format!("{err:#}").contains("only an empty store"),
             "{err:#}"
         );
+    }
+
+    /// The recap index keeps its blocks in `recaps.sqlite3` in the state directory, not in memory:
+    /// made when the index is built, gone with the hub. The state directory must be on a local
+    /// disk for that (on a network filesystem the file goes elsewhere, which `pitcrew-hub-work`'s
+    /// `recap_db` tests cover), so the test checks the temporary folder is detected as one first.
+    #[test]
+    fn the_recap_blocks_are_in_the_state_directory_while_the_hub_lives() {
+        let (_tmp, state) = state();
+        let hub = open_with(&state, true, false, StoreOptions::default()).unwrap();
+        assert!(
+            !pitcrew_store::detect(state.root()).is_network(),
+            "this test needs its temporary folder on a local disk, and {} is detected as {:?}: \
+             point the temporary folder (TMPDIR, or TEMP on Windows) at one",
+            state.root().display(),
+            pitcrew_store::detect(state.root())
+        );
+        let file = state.root().join(RECAP_FILE);
+        assert!(!file.exists(), "made when the index is first built");
+        let rev = hub.work.sync_recaps().unwrap();
+        assert_eq!(rev, hub.store.latest_rev().unwrap());
+        assert!(
+            file.is_file(),
+            "{} is missing (the state directory was detected as a local disk)",
+            file.display()
+        );
+        assert!(std::fs::metadata(&file).unwrap().len() > 0);
+        drop(hub);
+        assert!(!file.exists(), "removed with the hub");
     }
 
     #[test]

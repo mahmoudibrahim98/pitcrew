@@ -22,7 +22,9 @@
 mod claude;
 mod codex;
 mod difftext;
+mod hook_form;
 mod jsontext;
+pub(crate) use hook_form::HookForm;
 mod opencode;
 
 use crate::config::Env;
@@ -72,8 +74,8 @@ pub(crate) enum Status {
     Partial,
     /// Fully installed.
     Installed,
-    /// Installed, but one or more entries still name an old path of the executable (it moved
-    /// since they were written); `install` refreshes them.
+    /// Installed, but an executable path or hook form changed, or owned hooks are duplicated;
+    /// `install` refreshes them.
     Stale,
     /// Something of ours would collide with content we did not write, or the file could not be
     /// read/parsed/trusted; nothing was changed. The detail says why.
@@ -310,17 +312,41 @@ pub(crate) fn dispatch(
     io: &mut Io<'_>,
     json: bool,
 ) -> Result<()> {
-    let (engine, action, yes, chain) = match action {
-        HooksAction::Status { engine } => (engine.engine, Action::Status, false, false),
-        HooksAction::Diff { engine, chain } => (engine.engine, Action::Diff, false, chain),
-        HooksAction::Install { engine, yes, chain } => (engine.engine, Action::Install, yes, chain),
-        HooksAction::Uninstall { engine, yes } => (engine.engine, Action::Uninstall, yes, false),
+    let (engine, action, yes, chain, hook_form) = match action {
+        HooksAction::Status { engine } => {
+            (engine.engine, Action::Status, false, false, HookForm::Auto)
+        }
+        HooksAction::Diff {
+            engine,
+            chain,
+            hook_form,
+        } => (engine.engine, Action::Diff, false, chain, hook_form),
+        HooksAction::Install {
+            engine,
+            yes,
+            chain,
+            hook_form,
+        } => (engine.engine, Action::Install, yes, chain, hook_form),
+        HooksAction::Uninstall { engine, yes } => {
+            (engine.engine, Action::Uninstall, yes, false, HookForm::Auto)
+        }
     };
     let targets: Vec<Target> = match engine {
         Some(name) => vec![Target::parse(&name)?],
         None => Target::ALL.to_vec(),
     };
-    run(action, &targets, env, io, json, yes, chain)
+    run(
+        action,
+        &targets,
+        env,
+        io,
+        Options {
+            json,
+            yes,
+            chain,
+            hook_form,
+        },
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -331,15 +357,26 @@ enum Action {
     Uninstall,
 }
 
+struct Options {
+    json: bool,
+    yes: bool,
+    chain: bool,
+    hook_form: HookForm,
+}
+
 fn run(
     action: Action,
     targets: &[Target],
     env: Env<'_>,
     io: &mut Io<'_>,
-    json: bool,
-    yes: bool,
-    chain: bool,
+    options: Options,
 ) -> Result<()> {
+    let Options {
+        json,
+        yes,
+        chain,
+        hook_form,
+    } = options;
     let changing = action == Action::Install || action == Action::Uninstall;
     if changing && json && !yes {
         return Err(Error::invalid(
@@ -354,7 +391,13 @@ fn run(
         let exe = exe_path(env)?;
         targets
             .iter()
-            .map(|&t| plan_install(t, env, &exe, chain))
+            .map(|&t| {
+                if action == Action::Status && t == Target::Claude {
+                    unwrap_or_conflict(t, claude::plan_status(env, &exe))
+                } else {
+                    plan_install(t, env, &exe, chain, hook_form)
+                }
+            })
             .collect()
     };
 
@@ -379,9 +422,9 @@ fn unwrap_or_conflict(target: Target, result: Result<Plan>) -> Plan {
     })
 }
 
-fn plan_install(target: Target, env: Env<'_>, exe: &str, chain: bool) -> Plan {
+fn plan_install(target: Target, env: Env<'_>, exe: &str, chain: bool, hook_form: HookForm) -> Plan {
     let result = match target {
-        Target::Claude => claude::plan_install(env, exe),
+        Target::Claude => claude::plan_install_with_form(env, exe, hook_form),
         Target::Codex => codex::plan_install(env, exe, chain),
         Target::OpenCode => opencode::plan_install(env, exe),
     };

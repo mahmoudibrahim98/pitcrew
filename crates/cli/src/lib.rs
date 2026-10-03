@@ -222,6 +222,9 @@ enum HooksAction {
         /// Preview chaining a foreign Codex `notify` instead of reporting a conflict.
         #[arg(long)]
         chain: bool,
+        /// Claude Code hook form; auto requires Claude Code 2.1.139 or newer for exec.
+        #[arg(long, value_enum, default_value_t = install::HookForm::Auto)]
+        hook_form: install::HookForm,
     },
     /// Wire `pitcrew hook` into each agent CLI, after showing the diff and asking to confirm.
     Install {
@@ -234,6 +237,9 @@ enum HooksAction {
         /// conflict.
         #[arg(long)]
         chain: bool,
+        /// Claude Code hook form; auto falls back to shell if version detection fails.
+        #[arg(long, value_enum, default_value_t = install::HookForm::Auto)]
+        hook_form: install::HookForm,
     },
     /// Remove exactly what `install` wrote, after showing the diff and asking to confirm.
     Uninstall {
@@ -278,11 +284,40 @@ enum TaskCommand {
     },
 }
 
+/// The variable Claude Code sets for the commands its hooks run.
+const CLAUDE_HOOK_VAR: &str = "CLAUDE_PROJECT_DIR";
+
+/// Whether a parse of `args` that failed with `kind` is a bare `pitcrew` run as a Claude Code
+/// hook: nothing after the program name but global `--json` flags, no subcommand, stdin not a
+/// terminal, and Claude Code's hook environment present. A Claude Code older than 2.1.139 ignores
+/// a hook's `args` and runs its bare `command`; exit 2 with the usage would then block the prompt
+/// or the stop (2 is Claude Code's blocking code), so such a run exits 0, silently, as the hook
+/// does. A person at a terminal still gets the usage, and so does a command group without its
+/// subcommand (`pitcrew task`), which no hook runs.
+fn bare_hook_run(
+    args: &[OsString],
+    kind: clap::error::ErrorKind,
+    env: Env<'_>,
+    stdin_is_terminal: bool,
+) -> bool {
+    use clap::error::ErrorKind;
+    args.iter().skip(1).all(|a| a == "--json")
+        && matches!(
+            kind,
+            ErrorKind::MissingSubcommand | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        )
+        && !stdin_is_terminal
+        && env(CLAUDE_HOOK_VAR).is_some()
+}
+
 /// Runs `pitcrew` with `args` (including the program name) and returns the exit code.
 pub fn run(args: Vec<OsString>, env: Env<'_>, io: &mut Io<'_>) -> i32 {
-    let cli = match Cli::try_parse_from(args) {
+    let cli = match Cli::try_parse_from(&args) {
         Ok(cli) => cli,
         Err(e) => {
+            if bare_hook_run(&args, e.kind(), env, io.stdin_is_terminal) {
+                return 0;
+            }
             let text = e.render().to_string();
             let out: &mut dyn Write = if e.use_stderr() {
                 &mut *io.stderr
@@ -381,6 +416,78 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<OsString> {
         list.iter().map(OsString::from).collect()
+    }
+
+    /// Runs `pitcrew` with `list`, only `vars` set, and stdin a terminal or not: the exit code,
+    /// stdout and stderr.
+    fn run_with(list: &[&str], vars: &[(&str, &str)], terminal: bool) -> (i32, String, String) {
+        let env = |name: &str| {
+            vars.iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| OsString::from(v))
+        };
+        let mut stdin: &[u8] = b"";
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        let mut io = Io {
+            stdin: &mut stdin,
+            stdin_is_terminal: terminal,
+            stdout: &mut stdout,
+            stderr: &mut stderr,
+        };
+        let code = run(args(list), &env, &mut io);
+        (
+            code,
+            String::from_utf8(stdout).unwrap(),
+            String::from_utf8(stderr).unwrap(),
+        )
+    }
+
+    /// What Claude Code sets for its hooks' commands (synthetic).
+    const HOOK_ENV: [(&str, &str); 1] = [("CLAUDE_PROJECT_DIR", "/home/sam/project")];
+
+    /// A Claude Code older than 2.1.139 runs a hook's bare `command`: `pitcrew`, with the event
+    /// on stdin. Exit 2 would block the prompt or the stop, so it exits 0 and says nothing.
+    #[test]
+    fn a_bare_run_by_an_old_claude_code_hook_is_silent_and_succeeds() {
+        for list in [&["pitcrew"][..], &["pitcrew", "--json"]] {
+            assert_eq!(
+                run_with(list, &HOOK_ENV, false),
+                (0, String::new(), String::new()),
+                "{list:?}"
+            );
+        }
+    }
+
+    /// A person at a terminal, or a run outside a Claude Code hook, still gets the usage and 2;
+    /// and in a hook's environment, anything but a bare run is parsed as before.
+    #[test]
+    fn a_bare_run_at_a_terminal_or_outside_a_hook_shows_the_usage() {
+        for (vars, terminal) in [(&HOOK_ENV[..], true), (&[][..], false), (&[][..], true)] {
+            let (code, stdout, stderr) = run_with(&["pitcrew"], vars, terminal);
+            assert_eq!(code, 2, "{vars:?} {terminal}");
+            assert!(stdout.is_empty(), "{stdout}");
+            assert!(stderr.contains("Usage: pitcrew"), "{stderr}");
+        }
+        // A command group without its subcommand is not a bare run, even in a hook's environment
+        // with stdin piped: it fails as it always has.
+        for list in [
+            &["pitcrew", "task"][..],
+            &["pitcrew", "hooks"],
+            &["pitcrew", "--json", "task"],
+            &["pitcrew", "task", "--json"],
+        ] {
+            let (code, stdout, stderr) = run_with(list, &HOOK_ENV, false);
+            assert_eq!(code, 2, "{list:?}");
+            assert!(stdout.is_empty(), "{list:?}: {stdout}");
+            assert!(stderr.contains("Usage: pitcrew"), "{list:?}: {stderr}");
+        }
+        let (code, stdout, stderr) = run_with(&["pitcrew", "nonsense"], &HOOK_ENV, false);
+        assert_eq!(code, 2);
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(stderr.contains("nonsense"), "{stderr}");
+        let (code, stdout, _) = run_with(&["pitcrew", "--help"], &HOOK_ENV, false);
+        assert_eq!(code, 0);
+        assert!(stdout.contains("Usage: pitcrew"), "{stdout}");
     }
 
     #[test]
