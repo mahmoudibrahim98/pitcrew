@@ -19,6 +19,7 @@ export interface GatewayWorkspace {
   /** The daemon's workspace id (a ULID), as in `/w/$ws/…`. */
   id: string;
   name: string;
+  host?: string | undefined;
   kind: 'local' | 'remote';
   state: WorkspaceState;
   /** Why it is unreachable or needs pairing, for people to read. */

@@ -6,7 +6,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GatewayError } from '../errors.ts';
 import { createRemoteGateway } from '../gateway.ts';
-import type { GatewayPrompt, RemoteProgress } from '../remote.ts';
+import { toGatewayWorkspace, type GatewayPrompt, type RemoteProgress } from '../remote.ts';
 import { FakeDesktop, refuse } from './fake-desktop.ts';
 
 let desktop: FakeDesktop;
@@ -32,6 +32,27 @@ async function failure(promise: Promise<unknown>): Promise<unknown> {
 const NEW_WS = { id: '01JB000000000000000WSPNEW1', name: 'hpc-login', kind: 'remote', state: 'connecting' };
 
 describe('the remote commands', () => {
+  it('lists WSL distros and passes the selected transport through probe and plan', async () => {
+    const distro = { name: "Lab 'quoted' distro", default: true, running: false, version: 2 };
+    desktop.wsl = { available: true, distros: [distro] };
+    const remote = createRemoteGateway();
+    expect(await remote.wslDistros?.()).toEqual(desktop.wsl);
+    const target = { kind: 'wsl' as const, distro: distro.name };
+    await remote.remoteProbe('', target);
+    await remote.remotePlan({ host: '', target, launcher: 'direct' });
+    expect(desktop.commands('gateway_remote_probe')).toEqual([{ host: '', target }]);
+    expect(desktop.commands('gateway_remote_plan')).toEqual([{ req: { host: '', target, launcher: 'direct' } }]);
+    desktop.wsl = { available: true, distros: [{ ...distro, running: 'yes' }] };
+    await expect(remote.wslDistros?.()).rejects.toBeInstanceOf(GatewayError);
+    desktop.wsl = { available: false, distros: [] };
+    expect(await remote.wslDistros?.()).toEqual(desktop.wsl);
+  });
+  it('keeps a workspace host on remote workspaces only', () => {
+    const host = "wsl:Lab 'quoted' distro";
+    expect(toGatewayWorkspace({ ...NEW_WS, host })).toEqual({ ...NEW_WS, host });
+    expect(toGatewayWorkspace({ ...NEW_WS, kind: 'local', host })).toEqual({ ...NEW_WS, kind: 'local' });
+    expect(toGatewayWorkspace({ ...NEW_WS, host: 42 })).toEqual(NEW_WS);
+  });
   it('lists ssh hosts, dropping anything that is not a one-line name', async () => {
     desktop.hosts = { hosts: ['hpc-login', 42, '', 'build\nbox', 'build-box', 'hpc-login', null] };
     expect(await createRemoteGateway().sshHosts()).toEqual(['hpc-login', 'build-box']);

@@ -76,6 +76,14 @@ pub async fn gateway_ssh_hosts<R: Runtime>(webview: Webview<R>) -> Result<SshHos
     Ok(remotes(&webview)?.ssh_hosts().await)
 }
 
+/// Lists WSL distributions for the connect wizard.
+#[tauri::command]
+pub async fn gateway_wsl_distros<R: Runtime>(
+    webview: Webview<R>,
+) -> Result<pitcrew_remote::WslDistros, GatewayError> {
+    remotes(&webview)?.wsl_distros().await
+}
+
 /// `gateway_workspace_retry({ workspace })`: tries a remote workspace's connection again now.
 #[tauri::command]
 pub async fn gateway_workspace_retry<R: Runtime>(
@@ -91,9 +99,16 @@ pub async fn gateway_workspace_retry<R: Runtime>(
 pub async fn gateway_remote_probe<R: Runtime>(
     webview: Webview<R>,
     host: Option<Value>,
+    target: Option<Value>,
 ) -> Result<RemoteProbe, GatewayError> {
     let host = string(host, "host")?;
-    remotes(&webview)?.probe(&host).await
+    let target: Option<crate::registry::WslTarget> = target
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| GatewayError::invalid("invalid WSL target"))?;
+    remotes(&webview)?
+        .probe_target(&host, target.as_ref())
+        .await
 }
 
 /// `gateway_remote_plan(req) → RemotePlan`.

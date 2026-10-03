@@ -32,6 +32,11 @@ name = "remote"
 path = "tests/remote.rs"
 harness = false
 
+[[test]]
+name = "wsl"
+path = "tests/wsl.rs"
+harness = false
+
 [features]
 # Serve the built UI (`apps/ui/dist`) from inside the app instead of the Vite dev server. Release
 # builds must turn it on (`--features custom-protocol`, as the Tauri CLI does); `src/app.rs`

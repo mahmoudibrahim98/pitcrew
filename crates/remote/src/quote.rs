@@ -142,7 +142,8 @@ fn is_host_char(c: char) -> bool {
 /// before it is put on ssh's command line. Only `A-Z a-z 0-9 . _ : % [ ] @ -` are allowed:
 /// older OpenSSH (e.g. 9.5, bundled with Windows) passes other characters on to
 /// `ProxyCommand %h` and `Match exec`, where a shell would read them. It must not look like an
-/// option, before or after `@`.
+/// option, before or after `@`, nor start with `wsl:` (in any case), which is how PitCrew shows
+/// a WSL distribution: an ssh alias must not pass for one.
 ///
 /// # Errors
 /// [`SshError::InvalidHost`] naming the problem.
@@ -153,6 +154,11 @@ pub fn validate_host(host: &str) -> Result<(), SshError> {
         Some("it starts with '-'".to_owned())
     } else if host.contains("@-") {
         Some("the part after '@' starts with '-'".to_owned())
+    } else if host
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("wsl:"))
+    {
+        Some("'wsl:' names a WSL distribution, not an ssh host".to_owned())
     } else {
         host.chars()
             .find(|&c| !is_host_char(c))
@@ -396,11 +402,17 @@ mod tests {
             "[::1]",
             "fe80::1%eth0",
             "gpu_node:2",
+            "wsl",
+            "wsl-box",
+            "sam@wsl:1",
         ] {
             validate_host(good).unwrap();
         }
         for bad in [
             "",
+            "wsl:Ubuntu",
+            "WSL:Ubuntu",
+            "Wsl:",
             "-oProxyCommand=x",
             "user@-oProxyCommand=x",
             "a@b@-c",
