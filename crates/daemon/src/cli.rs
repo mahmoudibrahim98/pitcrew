@@ -132,6 +132,12 @@ pub struct ServeArgs {
     #[arg(long, value_name = "MS", hide = true)]
     pub ptyd_idle_exit_ms: Option<u64>,
 
+    /// For tests and development only: each machine scan (`POST /v1/machines/{id}/scan`) waits
+    /// this long once it is accepted, holding its machine's place, before it walks the agent
+    /// homes, so a second scan meanwhile can be shown to get 409.
+    #[arg(long, value_name = "MS", hide = true)]
+    pub scan_hold_ms: Option<u64>,
+
     /// For tests and development only: `pty` runs the terminals in pitcrew-ptyd even where tmux
     /// is usable; `auto` (the default) prefers tmux.
     #[arg(long, value_name = "RUNTIME", hide = true, value_enum, default_value_t = TerminalRuntimeArg::Auto)]
