@@ -30,12 +30,14 @@ for (const theme of ['light', 'dark'] as const) {
     expect((await request.put(`${HUB}/v1/me/cursors/workspace`, { headers, data: { rev: workspace.rev } })).ok()).toBe(true);
     await expect(region.getByText('Nothing new since you last looked.')).toBeVisible();
     expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
-    for (const [path, scope] of [[`projects/${PAPER}`, `project:${PAPER}`], [`projects/${PAPER}/workstreams/${STREAM}`, `workstream:${STREAM}`]]) {
+    for (const [path, scope, title] of [[`projects/${PAPER}`, `project:${PAPER}`, 'Paper · Diffusion study'], [`projects/${PAPER}/workstreams/${STREAM}`, `workstream:${STREAM}`, 'Submission']]) {
       await page.goto(`/w/${WS}/${path}`);
+      await expect(page.getByRole('main')).toBeVisible();
+      await expect(page.getByRole('heading', { level: 1, name: title, exact: true })).toBeVisible();
       await expect.poll(async () => {
         const cursors = await (await request.get(`${HUB}/v1/me/cursors`, { headers })).json() as { scope: string; rev: number }[];
         return cursors.find((c) => c.scope === scope)?.rev ?? 0;
-      }).toBeGreaterThan(0);
+      }).toBeGreaterThanOrEqual(workspace.rev);
       expect((await new AxeBuilder({ page }).analyze()).violations).toEqual([]);
     }
   });
