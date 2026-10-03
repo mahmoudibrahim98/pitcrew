@@ -80,9 +80,12 @@ todo = "warn"
 unwrap_used = "warn"
 
 [profile.release]
+opt-level = "z"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+# Hooks, scans, runner jobs and domain adapters isolate failures with unwind handlers.
+panic = "unwind"
 
 # Bundled SQLite compiled at -O0 makes store tests slow; optimise just that C code in dev builds.
 [profile.dev.package.libsqlite3-sys]
