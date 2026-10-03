@@ -915,16 +915,29 @@ mod tests {
     }
 
     /// The recap index keeps its blocks in `recaps.sqlite3` in the state directory, not in memory:
-    /// made when the index is built, gone with the hub.
+    /// made when the index is built, gone with the hub. The state directory must be on a local
+    /// disk for that (on a network filesystem the file goes elsewhere, which `pitcrew-hub-work`'s
+    /// `recap_db` tests cover), so the test checks the temporary folder is detected as one first.
     #[test]
     fn the_recap_blocks_are_in_the_state_directory_while_the_hub_lives() {
         let (_tmp, state) = state();
         let hub = open_with(&state, true, false, StoreOptions::default()).unwrap();
+        assert!(
+            !pitcrew_store::detect(state.root()).is_network(),
+            "this test needs its temporary folder on a local disk, and {} is detected as {:?}: \
+             point the temporary folder (TMPDIR, or TEMP on Windows) at one",
+            state.root().display(),
+            pitcrew_store::detect(state.root())
+        );
         let file = state.root().join(RECAP_FILE);
         assert!(!file.exists(), "made when the index is first built");
         let rev = hub.work.sync_recaps().unwrap();
         assert_eq!(rev, hub.store.latest_rev().unwrap());
-        assert!(file.is_file(), "{} is missing", file.display());
+        assert!(
+            file.is_file(),
+            "{} is missing (the state directory was detected as a local disk)",
+            file.display()
+        );
         assert!(std::fs::metadata(&file).unwrap().len() > 0);
         drop(hub);
         assert!(!file.exists(), "removed with the hub");
