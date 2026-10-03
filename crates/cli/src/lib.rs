@@ -281,26 +281,35 @@ enum TaskCommand {
 /// The variable Claude Code sets for the commands its hooks run.
 const CLAUDE_HOOK_VAR: &str = "CLAUDE_PROJECT_DIR";
 
-/// Whether a parse that failed with `kind` is a bare `pitcrew` run as a Claude Code hook: no
-/// subcommand, stdin not a terminal, and Claude Code's hook environment present. A Claude Code
-/// older than 2.1.139 ignores a hook's `args` and runs its bare `command`; exit 2 with the usage
-/// would then block the prompt or the stop (2 is Claude Code's blocking code), so such a run
-/// exits 0, silently, as the hook does. A person at a terminal still gets the usage.
-fn bare_hook_run(kind: clap::error::ErrorKind, env: Env<'_>, stdin_is_terminal: bool) -> bool {
+/// Whether a parse of `args` that failed with `kind` is a bare `pitcrew` run as a Claude Code
+/// hook: nothing after the program name but global `--json` flags, no subcommand, stdin not a
+/// terminal, and Claude Code's hook environment present. A Claude Code older than 2.1.139 ignores
+/// a hook's `args` and runs its bare `command`; exit 2 with the usage would then block the prompt
+/// or the stop (2 is Claude Code's blocking code), so such a run exits 0, silently, as the hook
+/// does. A person at a terminal still gets the usage, and so does a command group without its
+/// subcommand (`pitcrew task`), which no hook runs.
+fn bare_hook_run(
+    args: &[OsString],
+    kind: clap::error::ErrorKind,
+    env: Env<'_>,
+    stdin_is_terminal: bool,
+) -> bool {
     use clap::error::ErrorKind;
-    matches!(
-        kind,
-        ErrorKind::MissingSubcommand | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-    ) && !stdin_is_terminal
+    args.iter().skip(1).all(|a| a == "--json")
+        && matches!(
+            kind,
+            ErrorKind::MissingSubcommand | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        )
+        && !stdin_is_terminal
         && env(CLAUDE_HOOK_VAR).is_some()
 }
 
 /// Runs `pitcrew` with `args` (including the program name) and returns the exit code.
 pub fn run(args: Vec<OsString>, env: Env<'_>, io: &mut Io<'_>) -> i32 {
-    let cli = match Cli::try_parse_from(args) {
+    let cli = match Cli::try_parse_from(&args) {
         Ok(cli) => cli,
         Err(e) => {
-            if bare_hook_run(e.kind(), env, io.stdin_is_terminal) {
+            if bare_hook_run(&args, e.kind(), env, io.stdin_is_terminal) {
                 return 0;
             }
             let text = e.render().to_string();
@@ -452,6 +461,19 @@ mod tests {
             assert_eq!(code, 2, "{vars:?} {terminal}");
             assert!(stdout.is_empty(), "{stdout}");
             assert!(stderr.contains("Usage: pitcrew"), "{stderr}");
+        }
+        // A command group without its subcommand is not a bare run, even in a hook's environment
+        // with stdin piped: it fails as it always has.
+        for list in [
+            &["pitcrew", "task"][..],
+            &["pitcrew", "hooks"],
+            &["pitcrew", "--json", "task"],
+            &["pitcrew", "task", "--json"],
+        ] {
+            let (code, stdout, stderr) = run_with(list, &HOOK_ENV, false);
+            assert_eq!(code, 2, "{list:?}");
+            assert!(stdout.is_empty(), "{list:?}: {stdout}");
+            assert!(stderr.contains("Usage: pitcrew"), "{list:?}: {stderr}");
         }
         let (code, stdout, stderr) = run_with(&["pitcrew", "nonsense"], &HOOK_ENV, false);
         assert_eq!(code, 2);
