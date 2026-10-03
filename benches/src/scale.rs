@@ -22,6 +22,8 @@
 //! run fails half way), tmux servers started under the run's own `TMUX_TMPDIR` are killed, and
 //! the folder is removed unless asked to keep it.
 
+mod more;
+
 use crate::client::{self, Ws};
 use crate::homes::{self, Generated, Homes, Spec};
 use crate::procfs;
@@ -47,8 +49,18 @@ pub enum Stage {
     Hook,
     /// Scan, then the database's growth with new events.
     Growth,
-    /// All of them.
+    /// All historical measurements.
     All,
+    /// Three-minute idle CPU with 50 static and slowly growing transcripts.
+    Cpu,
+    /// CLI verbs with the full history.
+    Verbs,
+    /// CLI hook with a loaded daemon, then with it down.
+    HookCli,
+    /// Hook-to-frame while fifty transcripts grow.
+    HookLive,
+    /// All remaining measurements (opt-in; does not change historical baselines).
+    More,
 }
 
 impl Stage {
@@ -61,8 +73,22 @@ impl Stage {
             "hook" => Self::Hook,
             "growth" => Self::Growth,
             "all" => Self::All,
+            "cpu" => Self::Cpu,
+            "verbs" => Self::Verbs,
+            "hook-cli" => Self::HookCli,
+            "hook-live" => Self::HookLive,
+            "more" => Self::More,
             _ => return None,
         })
+    }
+
+    /// Whether this is an opt-in remaining-budget stage.
+    #[must_use]
+    pub fn more(self) -> bool {
+        matches!(
+            self,
+            Self::Cpu | Self::Verbs | Self::HookCli | Self::HookLive | Self::More
+        )
     }
 
     fn starts(self) -> bool {
@@ -115,6 +141,10 @@ pub struct Options {
     pub min_free_gib: u64,
     /// How long the first scan may take before the run gives up.
     pub scan_timeout: Duration,
+    /// Window for each idle CPU measurement (three minutes by default).
+    pub cpu_window: Duration,
+    /// CLI binary, normally next to pitcrewd.
+    pub pitcrew: PathBuf,
 }
 
 impl Options {
@@ -122,6 +152,10 @@ impl Options {
     #[must_use]
     pub fn new(stage: Stage, pitcrewd: PathBuf) -> Self {
         Self {
+            pitcrew: pitcrewd
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join("pitcrew"),
             stage,
             sessions: homes::TRANSCRIPTS,
             seed: 2026,
@@ -138,6 +172,7 @@ impl Options {
             work_parent: None,
             min_free_gib: 6,
             scan_timeout: Duration::from_secs(30 * 60),
+            cpu_window: Duration::from_secs(180),
         }
     }
 }
@@ -217,6 +252,10 @@ struct Daemon {
 
 impl Daemon {
     fn start(env: &Env, tmux: Tmux, n: usize) -> Result<Self> {
+        Self::start_inner(env, tmux, n, false)
+    }
+
+    fn start_inner(env: &Env, tmux: Tmux, n: usize, demo: bool) -> Result<Self> {
         let log = env.log(n);
         let mut command = Command::new(&env.bin);
         command
@@ -225,6 +264,9 @@ impl Daemon {
             .args(["serve", "--listen", "tcp:127.0.0.1:0", "--homes"])
             .arg(&env.homes)
             .env("PITCREW_LOG", "info");
+        if demo {
+            command.arg("--demo");
+        }
         match tmux {
             Tmux::AsShipped => {
                 command
@@ -691,7 +733,20 @@ fn stages(options: &Options, env: &Env) -> Result<()> {
     println!("scale: load average at the start {}", load_average());
 
     // 1. The homes.
-    let spec = Spec::new(options.seed, options.sessions);
+    let mut spec = Spec::new(options.seed, options.sessions);
+    if options.stage == Stage::Cpu {
+        spec.claude = 50;
+        spec.subagents = 0;
+        spec.codex = 0;
+        spec.opencode = 0;
+    }
+    if options.stage.more() {
+        spec.hot = if matches!(options.stage, Stage::More | Stage::HookLive) {
+            51
+        } else {
+            50
+        };
+    }
     let started = Instant::now();
     let mut made = homes::generate(&spec, &Homes::new(&env.homes), SystemTime::now())
         .map_err(|e| format!("cannot generate the homes: {e}"))?;
@@ -723,6 +778,10 @@ fn stages(options: &Options, env: &Env) -> Result<()> {
             "kept"
         }
     );
+
+    if options.stage.more() {
+        return more::measure(options, env, &mut made, total);
+    }
 
     // 2. The first scan.
     let scanned = first_scan(options, env, total, dropped)?;

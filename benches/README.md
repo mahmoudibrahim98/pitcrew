@@ -79,8 +79,9 @@ From `pitcrew-bench-scale`, the real `pitcrewd` over 10,000 synthetic transcript
 | `scale.db.per_1000_events` | `hub.db` growth for events from live transcripts, per 1,000 | KiB | none |
 | `scale.index.after_scan` | The runner's own index (`runner/<log id>/`) | MiB | none |
 
-Not measured yet: the `pitcrew` verb round trip and the desktop numbers (stream K; they need a
-display).
+The remaining CPU, CLI and loaded-hook measurements are opt-in; see
+[Remaining budgets](#remaining-budgets). Desktop interactive startup and three-workspace RAM
+still need a graphical run (stream K).
 
 ## Scale: `pitcrewd` with 10,000 transcripts
 
@@ -319,3 +320,116 @@ between runs; checked against the budget only, `compare = false` in `metrics.rs`
 `benches/run.sh --scale-only --baseline benches/baseline-cloud-vm.json`; runs E and F did, and
 every metric in the file was `ok`, within 6% (the cold start best 5.4% better in E, 4.7% worse
 in F).
+
+
+## Remaining budgets
+
+Run each independently, or run the combined budget report:
+
+```bash
+benches/more.sh cpu         # 50 transcripts; static and growing, 180 seconds each
+benches/more.sh verbs       # 10,000 transcripts; whoami, task list, task show
+benches/more.sh hook-cli    # CLI hook: loaded daemon, then daemon stopped
+benches/more.sh hook-live   # matching hook state frame amid 50 growing transcripts
+benches/more.sh more        # all four; JSON budget report and a failing exit for a missed budget
+```
+
+The wrapper builds the daemon, CLI and harness with the bench profile and the existing lockfile.
+Output goes to `target/pitcrew-more/<stage>.log`; the combined run also writes `summary.json`.
+These stages are separate from historical `all`/`benches/run.sh` runs, so an ordinary benchmark
+run does not require the new measurements. The default is 200 samples after five warmups for
+CLI/stream timings. Tool flags follow the stage (`--probes`, `--cpu-seconds`, `--pitcrew`,
+`--pitcrewd`, `--sessions` and the historical flags); shorter windows are for smoke checks,
+not evidence for the three-minute CPU budget.
+
+Each stage uses fresh synthetic homes and state, loopback TCP on an allocated port, and a fresh
+seeded demo providing a real registered agent token for ordinary CLI verbs. Device tokens are
+used only for device routes/hooks on the unowned transcript probe. No token is printed or put
+in process arguments. The existing harness stops its daemon, joins the transcript writer and
+stream reader, removes temporary homes even after an error, and checks for surviving processes.
+It retains logs only; `--keep` explicitly retains the synthetic state for investigation.
+The default free-space guard is 6 GiB; one 10k stage used about 1.5 GiB of transcript data and
+completed within the cloud environment's disk.
+
+### Method
+
+- **CPU:** the whole daemon's user + system ticks from Linux `/proc`, divided by `getconf CLK_TCK`
+  and actual elapsed wall time, as a percentage of **one** core. No division by the vCPU count.
+  First indexing and a quiet settling period finish before either 180-second window. Fifty
+  writers append one parseable assistant JSONL record every five seconds each, staggered by
+  100 ms. The writer runs in the harness, outside the measured daemon. Afterward the runner's
+  persisted cursors must reach all fifty new file ends, so ignored writes cannot pass. At
+  100 Hz, a 180-second window has a 0.0056 percentage-point tick quantum.
+- **Verbs:** real `pitcrew --json whoami`, `task list`, and `task show BENCH-1`, process spawn
+  through successful exit, including handshake, API calls and JSON output. Each output must
+  parse; task show must return the created task. Median and p95 are printed; p95 is compared
+  conservatively against the 50 ms budget.
+- **CLI hooks:** real stdin payload, alternating prompt/stop, process spawn to silent zero exit.
+  A successful loaded sample must also deliver the expected session state via the API; silent
+  failure cannot satisfy it. p99 is checked against 10 ms up and 5 ms down. Down is measured
+  after the owned daemon has stopped, on the same now-unserved TCP port.
+- **Live stream:** fifty transcripts grow while a separate stable probe alternates prompt/stop.
+  The probe is reset idle first, so an earlier odd-length CLI run cannot turn the first prompt
+  into a no-op. Each POST must return 202 and a typed event frame must match that session,
+  target state and a revision newer than the pre-request log revision. Receipt time is captured
+  before parsing, not after JSON processing. Probes are spaced by 400 ms. The metric is POST
+  to matching **stream frame**, including the default 75 ms batch window; it does not measure
+  browser rendering or claim a desktop interactive result.
+
+### Cloud measurements, 2026-10-03
+
+AMD EPYC 9V74 class, four available CPU threads, 33 GiB RAM; Linux x86_64 Debian 13 container,
+Rust 1.99, original root release/bench profile. Page cache retained. No build ran alongside the
+measurements. The 10k history held Claude 6,000 + 1,000 sub-agents, Codex 2,000 and OpenCode
+1,000: 1.50 GiB, about 1.345 million source records. CPU-only generated fifty Claude transcripts.
+Demo seed sessions are additional to the generated history. Live-frame runs reserve one probe
+beside the fifty growing files. Values are observations on shared hardware, not universal costs.
+
+| Measurement | Median | p95 | Budget statistic | Budget | Result |
+|---|---:|---:|---:|---:|---|
+| Static CPU, 50 transcripts | — | — | 0.01% of one core | ≤ 0.5% | within |
+| Growing CPU, 50 transcripts | — | — | 0.49% of one core | ≤ 0.5% | within |
+| Static CPU, 10k history | — | — | 0.34% of one core | ≤ 0.5% | within |
+| Growing CPU, 50 live + 10k history | — | — | 1.58% of one core | ≤ 0.5% | **over** |
+| CLI whoami, 10k | 1.665 ms | 2.074 ms | p95 2.074 ms | ≤ 50 ms | within |
+| CLI task list, 10k | 1.915 ms | 2.314 ms | p95 2.314 ms | ≤ 50 ms | within |
+| CLI task show, 10k | 1.843 ms | 2.849 ms | p95 2.849 ms | ≤ 50 ms | within |
+| CLI hook, loaded | 1.284 ms | 1.845 ms | p99 3.417 ms | ≤ 10 ms | within |
+| CLI hook, daemon down | 0.997 ms | 1.312 ms | p99 2.217 ms | ≤ 5 ms | within |
+| Hook → frame, 50 growing + 10k | 77.827 ms | 78.422 ms | p50 77.827 ms | ≤ 300 ms | within |
+
+The CLI's existing test was also run separately, on this machine without a concurrent build:
+
+```bash
+cargo test --locked -p pitcrew-cli --profile bench --test hook_timing -- --ignored --nocapture
+```
+
+| Existing hook timing | p50 | p99 | Budget | Result |
+|---|---:|---:|---:|---|
+| Unconfigured process floor | 0.89 ms | 1.17 ms | informational | — |
+| Unix socket up | 1.05 ms | 1.31 ms | ≤ 10 ms p99 | within |
+| Stale Unix socket down | 0.98 ms | 1.31 ms | ≤ 5 ms p99 | within |
+| Loopback TCP up | 1.16 ms | 1.52 ms | ≤ 10 ms p99 | within |
+| Loopback TCP down | 1.01 ms | 1.35 ms | ≤ 5 ms p99 | within |
+
+**Over-budget CPU:** the growing 10k run added 1.24 percentage points over its static control,
+about 78% of its total CPU. Handling live source changes (watcher wakeups, incremental reads,
+runner/index work and any resulting hub work) dominates that increment; this measures the whole
+pipeline and does not attribute it to an individual function. The fifty-only control separates
+that activity from the extra history's periodic work: growing costs 0.49% without the 10k
+history, leaving only about two 100 Hz ticks of margin in a three-minute window. This control
+suggests the large history is material, but an exact hot-function attribution needs profiling. No optimisation or runtime behavior was
+changed in this brief. The stream timing is close to its deliberate 75 ms batching window.
+
+**Noise and baseline:** load averages at measurement starts ranged from 0.11 to 0.85. Loaded
+hook p99 was 1.726 ms in the combined run and 3.417 ms in the independent run, already beyond
+10% agreement. A hook timing run during compilation also varied substantially. There is no
+stable repeated same-machine baseline evidence: neither baseline file was extended. New metrics
+have `compare = false` and are budget-only; missing values or a budget miss fail the opt-in
+`--only-more` report. An over-budget observation remains a failure, not an ignored assertion.
+
+**Desktop not measured:** native Linux desktop builds succeeded during installer work, but this
+container has no graphical display or Xvfb, and its unrelated-UID private-path ancestors also
+prevent a usable terminal runtime. Cold start to interactive (1.5 s) and idle RAM with three
+workspaces (300 MB) remain for a local graphical run. Daemon RSS/startup and stream delivery are
+not substituted for those desktop measurements.

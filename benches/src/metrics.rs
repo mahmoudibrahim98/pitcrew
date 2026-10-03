@@ -70,15 +70,18 @@ pub enum TestId {
     /// `pitcrew-bench-scale` (this crate): `pitcrewd` with 10,000 transcripts. It takes minutes
     /// and gigabytes of disk, so `benches/run.sh` runs it only with `--scale`.
     Scale,
+    /// The opt-in remaining-budget measurements.
+    More,
 }
 
 impl TestId {
     /// Every test, in run order.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::HubTaskList,
         Self::CliHookTiming,
         Self::RunnerIdleCpu,
         Self::Scale,
+        Self::More,
     ];
 
     /// The name `benches/run.sh` knows it by.
@@ -89,6 +92,7 @@ impl TestId {
             Self::HubTaskList => "hub-work-perf",
             Self::CliHookTiming => "cli-hook-timing",
             Self::Scale => "scale",
+            Self::More => "more",
         }
     }
 
@@ -259,6 +263,23 @@ const fn scale_budget_only(name: &'static str, unit: Unit, budget: Option<Budget
     }
 }
 
+// A shared cloud machine has no stable 10% baseline for these new measurements.
+const fn more(name: &'static str, unit: Unit, value: f64, budget_name: &'static str) -> Metric {
+    Metric {
+        compare: false,
+        needs: Needs::Linux,
+        ..metric(
+            name,
+            Source::Test(TestId::More),
+            unit,
+            Some(Budget {
+                name: budget_name,
+                value,
+            }),
+        )
+    }
+}
+
 const fn full(metric: Metric) -> Metric {
     Metric {
         full_only: true,
@@ -379,6 +400,54 @@ pub const METRICS: &[Metric] = &[
     scale("scale.db.per_session", Unit::Kib, None),
     scale("scale.db.per_1000_events", Unit::Kib, None),
     scale("scale.index.after_scan", Unit::Mib, None),
+    more(
+        "scale.more.cpu.static",
+        Unit::PercentCpu,
+        0.5,
+        "Idle whole-daemon CPU, fifty watched transcripts <= 0.5% of one core (P.md)",
+    ),
+    more(
+        "scale.more.cpu.growing",
+        Unit::PercentCpu,
+        0.5,
+        "Idle whole-daemon CPU, fifty slowly growing transcripts <= 0.5% of one core (P.md)",
+    ),
+    more(
+        "scale.more.cli.whoami",
+        Unit::Ms,
+        50.0,
+        "CLI whoami spawn-to-exit p95 <= 50 ms, 10k sessions (P.md)",
+    ),
+    more(
+        "scale.more.cli.task_list",
+        Unit::Ms,
+        50.0,
+        "CLI task list spawn-to-exit p95 <= 50 ms, 10k sessions (P.md)",
+    ),
+    more(
+        "scale.more.cli.task_show",
+        Unit::Ms,
+        50.0,
+        "CLI task show spawn-to-exit p95 <= 50 ms, 10k sessions (P.md)",
+    ),
+    more(
+        "scale.more.hook.up",
+        Unit::Ms,
+        10.0,
+        "CLI hook spawn-to-exit p99 <= 10 ms, 10k sessions (P.md)",
+    ),
+    more(
+        "scale.more.hook.down",
+        Unit::Ms,
+        5.0,
+        "CLI hook spawn-to-exit p99 <= 5 ms, daemon down (CLI timing test)",
+    ),
+    more(
+        "scale.more.hook_to_frame",
+        Unit::Ms,
+        300.0,
+        "Hook POST to matching stream frame p50 <= 300 ms, fifty growing transcripts (P.md)",
+    ),
 ];
 
 /// The metric measured by criterion benchmark `bench`.
