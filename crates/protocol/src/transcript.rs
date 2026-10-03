@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 /// One meaningful thing in a transcript. Every item carries the byte `offset` of its record, so it
 /// can become a receipt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum TranscriptItem {
@@ -43,6 +44,7 @@ pub enum TranscriptItem {
         target: String,
         /// The raw input, for detail views. Large inputs are truncated by the adapter.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         input: Option<serde_json::Value>,
         /// Record offset.
         offset: u64,
@@ -72,6 +74,7 @@ pub enum TranscriptItem {
         removed: u32,
         /// A unified diff, if the CLI recorded one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         diff: Option<String>,
         /// Record offset.
         offset: u64,
@@ -125,6 +128,7 @@ impl TranscriptItem {
 
 /// One line of an agent's plan.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct PlanItem {
     /// Text.
     pub text: String,
@@ -134,6 +138,7 @@ pub struct PlanItem {
 
 /// Status of a plan line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum PlanStatus {
     /// Not started.
@@ -146,6 +151,7 @@ pub enum PlanStatus {
 
 /// `GET /v1/sessions/{id}/transcript?before=<offset>&limit=<n>`: a page of items, oldest first.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct TranscriptPage {
     /// The items, oldest first.
     pub items: Vec<TranscriptItem>,
