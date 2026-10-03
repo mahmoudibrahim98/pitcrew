@@ -212,6 +212,7 @@ fn rig() -> Rig {
 
 fn connection() -> RemoteConnection {
     RemoteConnection {
+        target: None,
         host: HOST.into(),
         launcher: LauncherKind::Direct,
         root: "/home/sam/.pitcrew".into(),
@@ -334,6 +335,7 @@ fn a_cancel_racing_the_start_of_an_add_is_not_lost() {
     rig.remotes.lock_plans().insert(
         "p".into(),
         Plan {
+            wsl: None,
             host: HOST.into(),
             launcher: LauncherKind::Direct,
             target,

@@ -11,6 +11,7 @@ fn main() {
         "gateway_socket_send",
         "gateway_socket_close",
         "gateway_ssh_hosts",
+        "gateway_wsl_distros",
         "gateway_remote_probe",
         "gateway_remote_plan",
         "gateway_remote_add",

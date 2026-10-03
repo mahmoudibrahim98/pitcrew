@@ -112,6 +112,7 @@ pub fn configure<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
             commands::gateway_socket_send,
             commands::gateway_socket_close,
             commands::gateway_ssh_hosts,
+            commands::gateway_wsl_distros,
             commands::gateway_remote_probe,
             commands::gateway_remote_plan,
             commands::gateway_remote_add,
