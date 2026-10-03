@@ -1,7 +1,7 @@
 //! `pitcrew-bench-scale`: `pitcrewd` with a person's whole history, 10,000 transcripts.
 //!
 //! ```text
-//! pitcrew-bench-scale [scan|start|hook|growth|all] [--sessions N] [--seed N] [--pitcrewd PATH]
+//! pitcrew-bench-scale [scan|start|hook|growth|all|cpu|verbs|hook-cli|hook-live|more] [--sessions N] [--seed N] [--pitcrewd PATH]
 //!                     [--idle SECONDS] [--starts N] [--probes N] [--growth-turns N]
 //!                     [--work DIR] [--min-free-gib N] [--keep] [--keep-cache]
 //! pitcrew-bench-scale gen --out DIR [--sessions N] [--seed N]
@@ -31,8 +31,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
-const USAGE: &str = "usage: pitcrew-bench-scale [scan|start|hook|growth|all] [--sessions N] \
-[--seed N] [--pitcrewd PATH] [--idle SECONDS] [--starts N] [--probes N] [--growth-turns N] \
+const USAGE: &str = "usage: pitcrew-bench-scale [scan|start|hook|growth|all|cpu|verbs|hook-cli|hook-live|more] [--sessions N] \
+[--seed N] [--pitcrewd PATH] [--pitcrew PATH] [--cpu-seconds N] [--idle SECONDS] [--starts N] [--probes N] [--growth-turns N] \
 [--work DIR] [--min-free-gib N] [--keep] [--keep-cache]\n       pitcrew-bench-scale gen --out DIR \
 [--sessions N] [--seed N]";
 
@@ -85,6 +85,10 @@ fn parse(mut args: impl Iterator<Item = String>, pitcrewd: PathBuf) -> Result<Co
                     .parse()
                     .map_err(|_| "--seed is not a number".to_owned())?;
             }
+            "--pitcrew" => options.pitcrew = PathBuf::from(value()?),
+            "--cpu-seconds" => {
+                options.cpu_window = Duration::from_secs(count(&arg, &value()?)? as u64)
+            }
             "--pitcrewd" => options.pitcrewd = PathBuf::from(value()?),
             "--idle" => options.idle = Duration::from_secs(count(&arg, &value()?)? as u64),
             "--starts" => options.starts = count(&arg, &value()?)?,
@@ -102,6 +106,15 @@ fn parse(mut args: impl Iterator<Item = String>, pitcrewd: PathBuf) -> Result<Co
     }
     if options.sessions < 10 {
         return Err("--sessions must be at least 10".to_owned());
+    }
+    if stage.more() && options.sessions < 100 && stage != Stage::Cpu {
+        return Err(
+            "remaining measurements need at least 100 sessions to generate fifty live transcripts"
+                .to_owned(),
+        );
+    }
+    if options.cpu_window.is_zero() {
+        return Err("--cpu-seconds must be positive".to_owned());
     }
     if options.starts == 0 || options.probes == 0 {
         return Err("--starts and --probes must be at least 1".to_owned());

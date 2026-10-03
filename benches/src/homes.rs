@@ -205,6 +205,8 @@ pub struct Spec {
     pub codex: usize,
     /// OpenCode sessions (rows of one store).
     pub opencode: usize,
+    /// Claude transcripts kept live (the historical harness defaults to HOT).
+    pub hot: usize,
 }
 
 impl Spec {
@@ -221,6 +223,7 @@ impl Spec {
             subagents,
             codex,
             opencode: total - claude - subagents - codex,
+            hot: HOT,
         }
     }
 
@@ -289,6 +292,24 @@ pub struct Live {
 }
 
 impl Live {
+    /// Append exactly one synthetic assistant record; a watcher can consume its new cursor.
+    ///
+    /// # Errors
+    /// I/O errors writing the generated transcript.
+    pub fn append_line(&mut self) -> io::Result<u64> {
+        let record = self.writer.assistant(
+            5_000,
+            json!([{"type": "text", "text": "Synthetic live progress."}]),
+            "tool_use",
+        );
+        let mut bytes = Vec::new();
+        push_line(&mut bytes, &record);
+        let mut file = OpenOptions::new().append(true).open(&self.path)?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        Ok(bytes.len() as u64)
+    }
+
     /// Appends `turns` more turns to the transcript, as the CLI writes them. Returns the bytes
     /// written.
     ///
@@ -378,7 +399,7 @@ pub fn generate(spec: &Spec, homes: &Homes, now: SystemTime) -> io::Result<Gener
     // Claude sessions. The first HOT are the live ones.
     for i in 0..spec.claude {
         let mut rng = Rng::for_item(spec.seed, 1, i);
-        let hot = i < HOT;
+        let hot = i < spec.hot;
         let project = &projects[project_index(&mut rng, projects.len())];
         let cwd = rng.pick(&project.cwds).clone();
         let session = rng.uuid();
@@ -403,7 +424,7 @@ pub fn generate(spec: &Spec, homes: &Homes, now: SystemTime) -> io::Result<Gener
             .join(&folder)
             .join(format!("{session}.jsonl"));
         let mtime = if hot {
-            now_ms - (i as i64 + 1) * 9 * 60_000
+            now_ms - (i as i64 + 1) * if spec.hot > HOT { 4 } else { 9 } * 60_000
         } else {
             writer.t_ms
         };
@@ -1313,6 +1334,27 @@ mod tests {
 
     fn small(seed: u64) -> Spec {
         Spec::new(seed, 100)
+    }
+
+    #[test]
+    fn fifty_live_transcripts_append_exactly_one_parseable_record_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spec = Spec::new(2026, 100);
+        spec.hot = 50;
+        let mut made = generate(&spec, &Homes::new(dir.path()), SystemTime::now()).unwrap();
+        assert_eq!(made.live.len(), 50);
+        for live in &mut made.live {
+            let before = fs::read(&live.path).unwrap();
+            let added = live.append_line().unwrap();
+            let after = fs::read(&live.path).unwrap();
+            assert_eq!(after.len() as u64 - before.len() as u64, added);
+            let tail = &after[before.len()..];
+            assert_eq!(tail.iter().filter(|&&b| b == b'\n').count(), 1);
+            let value: Value = serde_json::from_slice(tail).unwrap();
+            assert_eq!(value["type"], "assistant");
+            let session = value["sessionId"].as_str().unwrap();
+            assert!(live.path.ends_with(format!("{session}.jsonl")));
+        }
     }
 
     /// Every transcript `adapter` discovers in `home`, read from the start with nothing skipped.

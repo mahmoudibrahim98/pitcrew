@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! pitcrew-bench-report --criterion DIR [--criterion DIR ...] [--tests FILE ...] [--no-tests]
-//!                      [--scale | --only-scale]
+//!                      [--scale | --only-scale | --only-more]
 //!                      [--baseline FILE] [--out FILE] [--mode quick|full] [--threshold 0.10]
 //!                      [--machine LABEL] [--retry-plan FILE]
 //!                      [--write-baseline | --extend-baseline] [--recorded DATE] [--note TEXT]
@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: pitcrew-bench-report --criterion DIR [--criterion DIR ...] \
-[--tests FILE ...] [--no-tests] [--scale | --only-scale] [--baseline FILE] [--out FILE] [--mode quick|full] \
+[--tests FILE ...] [--no-tests] [--scale | --only-scale | --only-more] [--baseline FILE] [--out FILE] [--mode quick|full] \
 [--threshold FRACTION] [--machine LABEL] [--retry-plan FILE] \
 [--write-baseline | --extend-baseline] [--recorded DATE] [--note TEXT]";
 
@@ -49,6 +49,7 @@ struct Args {
     no_tests: bool,
     scale: bool,
     only_scale: bool,
+    only_more: bool,
     baseline: PathBuf,
     out: Option<PathBuf>,
     mode: Mode,
@@ -75,6 +76,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         no_tests: false,
         scale: false,
         only_scale: false,
+        only_more: false,
         baseline: PathBuf::from("benches/baseline.json"),
         out: None,
         mode: Mode::from_env(),
@@ -93,6 +95,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
             "--no-tests" => out.no_tests = true,
             "--scale" => out.scale = true,
             "--only-scale" => out.only_scale = true,
+            "--only-more" => out.only_more = true,
             "--baseline" => out.baseline = PathBuf::from(value()?),
             "--out" => out.out = Some(PathBuf::from(value()?)),
             "--mode" => {
@@ -120,9 +123,14 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     if out.scale && out.only_scale {
         return Err("--scale and --only-scale exclude each other".to_owned());
     }
-    if out.only_scale {
+    if out.only_more && (out.scale || out.only_scale) {
+        return Err("--only-more excludes scale flags".to_owned());
+    }
+    if out.only_scale || out.only_more {
         if !out.criterion.is_empty() || out.no_tests {
-            return Err("--only-scale leaves out the benchmarks and the other tests".to_owned());
+            return Err(
+                "--only-scale/--only-more leave out the benchmarks and the other tests".to_owned(),
+            );
         }
     } else if out.criterion.is_empty() {
         return Err(format!("--criterion is required\n{USAGE}"));
@@ -193,9 +201,10 @@ fn run(args: &Args) -> Result<bool, String> {
     let machine = args.machine.clone().unwrap_or_else(report::machine);
     let scope = Scope {
         mode: args.mode,
-        benches: !args.only_scale,
-        tests: !args.no_tests && !args.only_scale,
+        benches: !args.only_scale && !args.only_more,
+        tests: !args.no_tests && !args.only_scale && !args.only_more,
         scale: args.scale || args.only_scale,
+        more: args.only_more,
     };
 
     if args.action == BaselineAction::Write {

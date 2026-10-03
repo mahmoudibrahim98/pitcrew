@@ -203,6 +203,8 @@ pub struct Scope {
     pub tests: bool,
     /// Whether the scale measurements (`pitcrew-bench-scale`, 10,000 transcripts) ran.
     pub scale: bool,
+    /// Whether the opt-in remaining-budget measurements ran.
+    pub more: bool,
 }
 
 /// The recorded values a run is compared with.
@@ -314,6 +316,9 @@ pub struct Summary {
     /// Whether the scale measurements ran.
     #[serde(default)]
     pub scale: bool,
+    /// Whether remaining-budget measurements ran.
+    #[serde(default)]
+    pub more: bool,
     /// This machine's class.
     pub machine: String,
     /// The baseline's machine class, if a baseline was used.
@@ -346,6 +351,7 @@ pub fn compare(
         mode: scope.mode,
         tests: scope.tests,
         scale: scope.scale,
+        more: scope.more,
         machine: machine.to_owned(),
         baseline_machine: baseline.map(|b| b.machine.clone()),
         threshold,
@@ -360,6 +366,7 @@ fn expected(metric: &Metric, scope: Scope) -> bool {
     let source_ok = match metric.source {
         Source::Bench(_) => scope.benches,
         Source::Test(TestId::Scale) => scope.scale,
+        Source::Test(TestId::More) => scope.more,
         Source::Test(_) => scope.tests,
     };
     mode_ok && source_ok && metric.needs.here()
@@ -471,7 +478,7 @@ pub fn retry(summary: &Summary) -> Retry {
         }
         match by_name(&l.name).map(|m| m.source) {
             Some(Source::Bench(id)) => out.benches.push(id),
-            Some(Source::Test(TestId::Scale)) | None => {}
+            Some(Source::Test(TestId::Scale | TestId::More)) | None => {}
             Some(Source::Test(test)) => {
                 out.tests.insert(test);
             }
@@ -616,7 +623,52 @@ mod tests {
         benches: true,
         tests: true,
         scale: false,
+        more: false,
     };
+
+    #[test]
+    fn remaining_measurements_are_opt_in_and_missing_or_over_budget_fail() {
+        let only = Scope {
+            mode: Mode::Quick,
+            benches: false,
+            tests: false,
+            scale: false,
+            more: true,
+        };
+        let mut readings: Readings = METRICS
+            .iter()
+            .filter(|m| m.source == Source::Test(TestId::More))
+            .map(|m| {
+                (
+                    m.name.to_owned(),
+                    Reading::same(m.budget.unwrap().value / 2.0),
+                )
+            })
+            .collect();
+        let s = compare(only, "shared cloud", &readings, None, DEFAULT_THRESHOLD);
+        if cfg!(target_os = "linux") {
+            assert!(s.passed);
+            readings.remove("scale.more.hook.up");
+            let s = compare(only, "shared cloud", &readings, None, DEFAULT_THRESHOLD);
+            assert_eq!(get(&s, "scale.more.hook.up").status, Status::Missing);
+            assert!(!s.passed);
+            readings.insert("scale.more.hook.up".to_owned(), Reading::same(11.0));
+            let s = compare(only, "shared cloud", &readings, None, DEFAULT_THRESHOLD);
+            assert_eq!(get(&s, "scale.more.hook.up").status, Status::OverBudget);
+            assert!(!s.passed);
+        }
+        let regular = compare(
+            QUICK,
+            "shared cloud",
+            &run(1.0, 1.0),
+            None,
+            DEFAULT_THRESHOLD,
+        );
+        assert_eq!(
+            get(&regular, "scale.more.cpu.growing").status,
+            Status::Skipped
+        );
+    }
 
     /// Every metric expected in a quick run here, measured: times with a typical value of 1.2
     /// and a best of 1 (scaled by `typical` and `best`), rates as 100 MiB in that time.
@@ -949,6 +1001,7 @@ mod tests {
             benches: false,
             tests: false,
             scale: true,
+            more: false,
         };
         let s = compare(only, "m", &scale_readings(), None, DEFAULT_THRESHOLD);
         assert_eq!(get(&s, "store.since.page_100").status, Status::Skipped);
