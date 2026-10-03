@@ -33,6 +33,8 @@ Globs: `*` matches within one path segment, `**` across segments.
 | **P** Packaging and release | `packaging/**`, `.github/workflows/release*.yml`, `benches/**` |
 | **Q** Security | `docs/security/**`, `fuzz/**` |
 
+The shared API conformance suite (`tests/conformance/**`) is also owned by stream **0**.
+
 ## Rules that make this work
 
 - **Need something in a shared file?** Don't edit it. Expose instead:
