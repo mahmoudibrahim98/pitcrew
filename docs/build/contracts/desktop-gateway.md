@@ -146,9 +146,7 @@ script.
 `gateway_ssh_hosts() → { hosts: string[] }`: the concrete `Host` names in the person's ssh config,
 for a picker. The person may also type a host.
 
-The following WSL extension is specified by brief `0-wsl-machines`. Desktop implementation is
-blocked until its path scope includes the command manifest and main-window capability; these
-WSL commands and target forms are not yet callable.
+The WSL extension uses the same preview, add, registry and reconnect flow as SSH.
 
 `gateway_wsl_distros() → { available: boolean, distros: WslDistro[] }` lists local distros:
 
