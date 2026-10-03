@@ -160,7 +160,9 @@ pub(crate) enum Commit {
 pub(crate) struct TerminalRow {
     pub terminal: TerminalId,
     pub native_target: Option<String>,
-    /// The session it runs, once known.
+    /// The session it runs: once its transcript is found, or from the start for a session the hub
+    /// named (`StartSession`'s `session`), which the transcript then adopts (see
+    /// [`Store::claim_terminal`]).
     pub session: Option<SessionId>,
     /// The CLI started in it; `None` for a terminal linked by hand.
     pub engine: Option<Engine>,
@@ -168,6 +170,15 @@ pub(crate) struct TerminalRow {
     pub native_id: Option<String>,
     pub cwd: String,
     pub started_at: TimestampMs,
+}
+
+/// A started terminal claimed by a newly discovered transcript ([`Store::claim_terminal`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Claim {
+    pub terminal: TerminalId,
+    /// The session the hub named for the terminal, which the transcript now has instead of the
+    /// one it was found with.
+    pub adopted: Option<SessionId>,
 }
 
 #[derive(Debug)]
@@ -479,9 +490,72 @@ impl Store {
         Ok(())
     }
 
-    /// The terminal a newly discovered session runs in: the one already linked to it (a replay),
-    /// else a started terminal waiting for it, matched by the CLI's session id or, for a CLI whose
-    /// id is not chosen in advance, by folder and start time.
+    /// Started terminals of `engine` whose session's transcript has not been found yet: no
+    /// session yet, or one the hub named at the start that no transcript has adopted. Oldest
+    /// first.
+    fn waiting(&self, engine: Engine) -> Result<Vec<TerminalRow>, StoreError> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {TERMINAL_COLUMNS} FROM terminals
+             WHERE engine = ?1
+               AND (session_id IS NULL
+                    OR NOT EXISTS (SELECT 1 FROM transcripts
+                                   WHERE transcripts.session_id = terminals.session_id))
+             ORDER BY started_at"
+        ))?;
+        stmt.query_map([engine_text(engine)?], raw_terminal)?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(RawTerminal::decode)
+            .collect()
+    }
+
+    /// The session a new transcript must take, if a started terminal waits for it under a
+    /// session the hub named: the CLI's id `native_id` (one the runner chose, as Claude's
+    /// `--session-id`) is the terminal's. Nothing is changed; the transcript's row is then
+    /// inserted under that session.
+    pub fn named_session(
+        &self,
+        engine: Engine,
+        native_id: &str,
+    ) -> Result<Option<SessionId>, StoreError> {
+        if native_id.is_empty() {
+            return Ok(None);
+        }
+        Ok(self
+            .waiting(engine)?
+            .into_iter()
+            .find(|t| t.native_id.as_deref() == Some(native_id))
+            .and_then(|t| t.session))
+    }
+
+    /// Terminals of `engine` started in `cwd` within the claim window (as of `now`) for a CLI
+    /// whose id is not chosen in advance, whose transcript has not been found yet: a new start
+    /// there could be taken for one of them.
+    pub fn waiting_in(
+        &self,
+        engine: Engine,
+        cwd: &str,
+        now: TimestampMs,
+    ) -> Result<Vec<TerminalRow>, StoreError> {
+        Ok(self
+            .waiting(engine)?
+            .into_iter()
+            .filter(|t| {
+                t.native_id.is_none()
+                    && same_dir(cwd, &t.cwd)
+                    && t.started_at >= now.saturating_sub(CLAIM_WINDOW_MS)
+            })
+            .collect())
+    }
+
+    /// The terminal a newly discovered session runs in: the one already linked to it (a replay,
+    /// or a session the hub named), else a started terminal waiting for it, matched by the CLI's
+    /// session id or, for a CLI whose id is not chosen in advance, by folder and start time.
+    ///
+    /// A terminal started for a session the hub named makes the transcript **adopt** that
+    /// session: its row, saved under `session` (the id it was given when found), is moved to the
+    /// named one in the same transaction, and [`Claim::adopted`] says so. The caller must then
+    /// use that id for everything it reports.
     pub fn claim_terminal(
         &self,
         session: SessionId,
@@ -490,20 +564,14 @@ impl Store {
         cwd: Option<&str>,
         started: TimestampMs,
         now: TimestampMs,
-    ) -> Result<Option<TerminalId>, StoreError> {
+    ) -> Result<Option<Claim>, StoreError> {
         if let Some(t) = self.terminal_of(session)? {
-            return Ok(Some(t.terminal));
+            return Ok(Some(Claim {
+                terminal: t.terminal,
+                adopted: None,
+            }));
         }
-        let mut stmt = self.conn.prepare_cached(&format!(
-            "SELECT {TERMINAL_COLUMNS} FROM terminals
-             WHERE session_id IS NULL AND engine = ?1 ORDER BY started_at"
-        ))?;
-        let waiting = stmt
-            .query_map([engine_text(engine)?], raw_terminal)?
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(RawTerminal::decode)
-            .collect::<Result<Vec<_>, _>>()?;
+        let waiting = self.waiting(engine)?;
         let by_id = waiting
             .iter()
             .find(|t| !native_id.is_empty() && t.native_id.as_deref() == Some(native_id));
@@ -518,11 +586,33 @@ impl Store {
         let Some(t) = by_id.or_else(by_folder) else {
             return Ok(None);
         };
-        self.conn.execute(
-            "UPDATE terminals SET session_id = ?1 WHERE terminal_id = ?2",
-            params![session.0.to_string(), t.terminal.0.to_string()],
-        )?;
-        Ok(Some(t.terminal))
+        let tx = self.conn.unchecked_transaction()?;
+        let adopted = match t.session {
+            Some(named) => {
+                let (from, to) = (session.0.to_string(), named.0.to_string());
+                tx.execute(
+                    "UPDATE transcripts SET session_id = ?2 WHERE session_id = ?1",
+                    params![from, to],
+                )?;
+                tx.execute(
+                    "UPDATE accepted_items SET session_id = ?2 WHERE session_id = ?1",
+                    params![from, to],
+                )?;
+                Some(named)
+            }
+            None => {
+                tx.execute(
+                    "UPDATE terminals SET session_id = ?1 WHERE terminal_id = ?2",
+                    params![session.0.to_string(), t.terminal.0.to_string()],
+                )?;
+                None
+            }
+        };
+        tx.commit()?;
+        Ok(Some(Claim {
+            terminal: t.terminal,
+            adopted,
+        }))
     }
 
     // ─── Commands ───────────────────────────────────────────────────────────────────────────
@@ -1028,6 +1118,10 @@ mod tests {
             store
                 .claim_terminal(s, engine, native, cwd, started, now)
                 .expect("claim")
+                .map(|c| {
+                    assert_eq!(c.adopted, None, "no session was named");
+                    c.terminal
+                })
         };
         assert_eq!(claim(s1, Engine::Claude, "zzz", Some("/w"), now), None);
         assert_eq!(
@@ -1066,6 +1160,125 @@ mod tests {
         );
         store.unlink_session(s2).expect("unlink");
         assert!(store.terminal_of(s2).expect("of").is_none());
+    }
+
+    /// A terminal started for a session the hub named waits until a transcript adopts that
+    /// session: Claude's by the id it was started with, before its row is made; any CLI's by
+    /// the claim, which moves the row it was found with to the named session.
+    #[test]
+    fn a_named_session_is_adopted_by_its_transcript() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open");
+        let now = 10_000_000;
+        let (claude, codex) = (SessionId::new(), SessionId::new());
+        let mut by_id = terminal(Engine::Claude, Some("abc"), "/w", now);
+        by_id.session = Some(claude);
+        let mut by_folder = terminal(Engine::Codex, None, "/w/p", now - 1000);
+        by_folder.session = Some(codex);
+        for t in [&by_id, &by_folder] {
+            store.put_terminal(t).expect("put");
+        }
+        // The terminals are the named sessions' already, for commands.
+        assert_eq!(
+            store.terminal_of(claude).expect("of").map(|t| t.terminal),
+            Some(by_id.terminal)
+        );
+
+        // Claude's transcript takes its session before its row is made.
+        assert_eq!(
+            store.named_session(Engine::Claude, "zzz").expect("named"),
+            None
+        );
+        assert_eq!(
+            store.named_session(Engine::Codex, "abc").expect("named"),
+            None
+        );
+        assert_eq!(
+            store.named_session(Engine::Claude, "abc").expect("named"),
+            Some(claude)
+        );
+        let mut adopted = row("/h/abc.jsonl");
+        adopted.session = claude;
+        store.insert(&adopted).expect("insert");
+        assert_eq!(
+            store.named_session(Engine::Claude, "abc").expect("named"),
+            None
+        );
+        let claim = store
+            .claim_terminal(claude, Engine::Claude, "abc", Some("/w"), now, now)
+            .expect("claim");
+        assert_eq!(
+            claim,
+            Some(Claim {
+                terminal: by_id.terminal,
+                adopted: None
+            })
+        );
+
+        // Codex's waits in its folder; a transcript found under another id adopts the named one.
+        assert_eq!(
+            store
+                .waiting_in(Engine::Codex, "/w/p/", now)
+                .expect("waiting")
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .waiting_in(Engine::Codex, "/w", now)
+                .expect("waiting")
+                .is_empty()
+        );
+        assert!(
+            store
+                .waiting_in(Engine::Codex, "/w/p", now + CLAIM_WINDOW_MS)
+                .expect("waiting")
+                .is_empty()
+        );
+        let found = row("/h/rollout.jsonl");
+        store.insert(&found).expect("insert");
+        store
+            .commit(&Commit::Partial {
+                session: found.session,
+                keys: vec![7],
+            })
+            .expect("partial");
+        let claim = store
+            .claim_terminal(found.session, Engine::Codex, "n", Some("/w/p"), now, now)
+            .expect("claim");
+        assert_eq!(
+            claim,
+            Some(Claim {
+                terminal: by_folder.terminal,
+                adopted: Some(codex)
+            })
+        );
+        assert!(!store.has_session(found.session).expect("has"));
+        let moved = store
+            .get(codex)
+            .expect("get")
+            .expect("the row, under the named session");
+        assert_eq!(moved.path, found.path);
+        assert!(
+            moved.accepted.contains(&7),
+            "its accepted items moved with it"
+        );
+        assert!(
+            store
+                .waiting_in(Engine::Codex, "/w/p", now)
+                .expect("waiting")
+                .is_empty()
+        );
+        // Claimed again (a replay), it is the session's own terminal.
+        assert_eq!(
+            store
+                .claim_terminal(codex, Engine::Codex, "n", Some("/w/p"), now, now)
+                .expect("claim"),
+            Some(Claim {
+                terminal: by_folder.terminal,
+                adopted: None
+            })
+        );
     }
 
     #[test]

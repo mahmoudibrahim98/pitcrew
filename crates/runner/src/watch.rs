@@ -35,7 +35,7 @@ use crate::link::{self, Locations, WorkstreamLocation};
 use crate::pages::Source;
 use crate::pages::Watched;
 use crate::sink::Batch;
-use crate::store::{Commit, Indexed, Row, Store, native_id, path_text};
+use crate::store::{Claim, Commit, Indexed, Row, Store, native_id, path_text};
 use notify::event::{EventKind, MetadataKind, ModifyKind};
 use notify::{RecursiveMode, Watcher as _};
 use pitcrew_interfaces::source::{Cursor, ParseChunk, SourceAdapter, SourceError, TranscriptRef};
@@ -1072,10 +1072,15 @@ impl Watcher {
                 row
             }
             Ok(None) => {
-                let row = new_row(&TranscriptRef {
+                let mut row = new_row(&TranscriptRef {
                     path: canonical.clone(),
                     ..tref.clone()
                 });
+                if let Some(named) =
+                    self.named_session(tref.engine, &canonical, tref.inner_id.as_deref())
+                {
+                    row.session = named;
+                }
                 if let Err(e) = self.store_lock().insert(&row) {
                     tracing::error!(path = %row.path.display(), error = %e, "cannot index a transcript");
                     return Ok(());
@@ -1493,7 +1498,7 @@ impl Watcher {
         let Some(row) = t.row() else {
             return Ok(());
         };
-        let session = row.session;
+        let mut session = row.session;
         let place = |row: &Row| row.meta.as_ref().map(|m| (m.cwd.clone(), m.branch.clone()));
         let was = place(row);
         if let Some(meta) = chunk.meta {
@@ -1502,12 +1507,32 @@ impl Watcher {
         let first = !row.discovered;
         let moved = !first && place(row) != was;
         let cwd = row.meta.as_ref().and_then(|m| m.cwd.clone());
+        let engine = row.engine;
+        let native = native_id(row);
+        let subagent = row.meta.as_ref().is_some_and(|m| m.is_subagent);
+        let started = row.meta.as_ref().and_then(|m| m.started);
+
+        // The terminal the runner started a new session in, claimed before anything names the
+        // session: one started for a session the hub named makes the transcript adopt that id.
+        let terminal = if first && !subagent {
+            let claim = self.claim_terminal(session, engine, &native, cwd.as_deref(), started);
+            if let Some(named) = claim.and_then(|c| c.adopted) {
+                self.adopt(id, session, named);
+                session = named;
+            }
+            claim.map(|c| c.terminal)
+        } else {
+            None
+        };
+
+        let Some(row) = self.tracked.get_mut(&id).and_then(Tracked::row) else {
+            return Ok(());
+        };
         let ctx = derive::Ctx {
             session,
             cwd: cwd.as_deref(),
             emit_states: !first,
         };
-
         let mut derived: Vec<Derived> = Vec::new();
         let mut seen: HashMap<u64, u32> = HashMap::new();
         for item in &chunk.items {
@@ -1524,29 +1549,20 @@ impl Watcher {
                 derived.truncate(before);
             }
         }
-        let engine = row.engine;
-        let native = native_id(row);
-        let subagent = row.meta.as_ref().is_some_and(|m| m.is_subagent);
-        let started = row.meta.as_ref().and_then(|m| m.started);
         self.map_native(id, session, engine, &native, subagent, first);
 
-        // Facts from elsewhere: the parent of a sub-agent, the terminal the runner started the
-        // session in, hooks that came before the transcript, and workstream locations.
-        let (parent, terminal, held) = if first {
+        // Facts from elsewhere: the parent of a sub-agent, hooks that came before the transcript,
+        // and workstream locations.
+        let (parent, held) = if first {
             let parent = if subagent {
                 self.parent_of(engine, &path, home)
             } else {
                 Ok(Parent::None)
             };
-            let terminal = if subagent {
-                None
-            } else {
-                self.claim_terminal(session, engine, &native, cwd.as_deref(), started)
-            };
             let held = self.allowed_held(session, parent, engine, &native);
-            (parent, terminal, held)
+            (parent, held)
         } else {
-            (Ok(Parent::None), None, Vec::new())
+            (Ok(Parent::None), Vec::new())
         };
         let places = (first || moved).then(|| self.places(session)).flatten();
 
@@ -1971,17 +1987,23 @@ impl Watcher {
         {
             return Ok(Parent::Session(t.session));
         }
-        let store = self.store_lock();
-        match store.find(&parent, None) {
+        let found = self.store_lock().find(&parent, None);
+        match found {
             Ok(Some(row)) => Ok(Parent::Session(row.session)),
             Ok(None) => {
-                let row = new_row(&TranscriptRef {
+                // A parent started for a session the hub named is that session already.
+                let named = self.named_session(engine, &parent, None);
+                let mut row = new_row(&TranscriptRef {
                     engine,
                     path: parent,
                     inner_id: None,
                     size: 0,
                     modified: 0,
                 });
+                if let Some(named) = named {
+                    row.session = named;
+                }
+                let store = self.store_lock();
                 match store.insert(&row) {
                     Ok(()) => Ok(Parent::Session(row.session)),
                     Err(e) => {
@@ -1997,7 +2019,8 @@ impl Watcher {
         }
     }
 
-    /// The terminal the runner started a newly discovered session in, if it did.
+    /// The terminal the runner started a newly discovered session in, if it did, and the session
+    /// the hub named for it, which the transcript then adopts (its row is moved in the index).
     fn claim_terminal(
         &self,
         session: SessionId,
@@ -2005,12 +2028,51 @@ impl Watcher {
         native: &str,
         cwd: Option<&str>,
         started: Option<TimestampMs>,
-    ) -> Option<TerminalId> {
+    ) -> Option<Claim> {
         let now = crate::now_ms();
         self.store_lock()
             .claim_terminal(session, engine, native, cwd, started.unwrap_or(now), now)
             .unwrap_or_else(|e| {
                 tracing::warn!(%session, error = %e, "cannot look up the session's terminal");
+                None
+            })
+    }
+
+    /// Transcript `id`, found as `from`, adopts `to`, the session the hub named for the terminal
+    /// it runs in (the index has moved its row): everything that finds it by session follows. No
+    /// event has named `from`: this happens at its discovery.
+    fn adopt(&mut self, id: u64, from: SessionId, to: SessionId) {
+        tracing::debug!(%from, %to, "a new transcript takes the session the hub named for its terminal");
+        if let Some(t) = self.tracked.get_mut(&id) {
+            t.session = to;
+            if let Some(row) = t.row() {
+                row.session = to;
+            }
+        }
+        if self.by_session.get(&from) == Some(&id) {
+            self.by_session.remove(&from);
+        }
+        self.by_session.insert(to, id);
+        self.watched.rekey(from, to);
+    }
+
+    /// The session a transcript not indexed yet takes: the one the hub named for a terminal the
+    /// runner started with the CLI id the transcript is named by (Claude's `<id>.jsonl`, from its
+    /// `--session-id`), if one waits; else none, and it gets a new one.
+    fn named_session(
+        &self,
+        engine: Engine,
+        path: &Path,
+        inner_id: Option<&str>,
+    ) -> Option<SessionId> {
+        let native = match inner_id {
+            Some(inner) => inner.to_owned(),
+            None => path.file_stem()?.to_str()?.to_owned(),
+        };
+        self.store_lock()
+            .named_session(engine, &native)
+            .unwrap_or_else(|e| {
+                tracing::warn!(path = %path.display(), error = %e, "cannot look up a session the hub named; the transcript gets an id of its own");
                 None
             })
     }

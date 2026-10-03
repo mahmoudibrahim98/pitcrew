@@ -2,6 +2,7 @@
 
 use crate::agents::SessionAgents;
 use crate::link::Locations;
+use crate::session_env::SessionEnv;
 use pitcrew_protocol::ids::{MachineId, MemberId, WorkspaceId};
 use pitcrew_protocol::model::Engine;
 use std::path::PathBuf;
@@ -90,6 +91,9 @@ pub struct RunnerConfig {
     /// Who runs each session, to decide whose hooks may change it (see
     /// [`RunnerHooks`](crate::RunnerHooks)). Without it, every hook is refused.
     pub agents: Option<Arc<dyn SessionAgents>>,
+    /// The environment of a CLI started for a session the hub named (see [`SessionEnv`]).
+    /// Without it, such a CLI gets none: no token, so its hooks are refused.
+    pub session_env: Option<Arc<dyn SessionEnv>>,
 }
 
 impl RunnerConfig {
@@ -113,6 +117,7 @@ impl RunnerConfig {
             max_batch_events: 256,
             locations: None,
             agents: None,
+            session_env: None,
         }
     }
 
@@ -137,6 +142,14 @@ impl RunnerConfig {
     #[must_use]
     pub fn with_agents(mut self, agents: Arc<dyn SessionAgents>) -> Self {
         self.agents = Some(agents);
+        self
+    }
+
+    /// Gives a CLI started for a session the hub named the environment `env` says (see
+    /// [`SessionEnv`]).
+    #[must_use]
+    pub fn with_session_env(mut self, env: Arc<dyn SessionEnv>) -> Self {
+        self.session_env = Some(env);
         self
     }
 }

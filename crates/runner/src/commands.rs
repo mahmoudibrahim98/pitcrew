@@ -3,17 +3,26 @@
 //! - **Idempotent by `CommandId`:** an outcome is saved in the runner's index before `run`
 //!   returns, and a command id seen again (also after a restart, for a week) returns that outcome
 //!   without running anything. The same id sent twice at once runs once; the second call waits.
-//! - **Starting a session** starts its CLI in a new terminal. The runner learns the session's id
+//! - **Starting a session** starts its CLI in a new terminal. The runner learns the CLI's own id
 //!   only when its transcript appears; the terminal is then linked to it, and its
 //!   `session_discovered` names the terminal. Claude is started with a session id chosen here, so
 //!   the match is exact; other CLIs are matched by folder and start time.
+//! - **A session the hub named** (`StartSession`'s `session`, a dispatch's): the terminal is that
+//!   session's from the start (text, keys and ends reach it at once), and the CLI's transcript
+//!   **adopts** the id instead of getting one of its own (see `watch`): Claude's by the id it was
+//!   started with, the others' by folder and start time. The CLI gets the environment the
+//!   [`SessionEnv`] gives it (an agent token's file). A session this runner already knows is not
+//!   started again. Two CLIs matched by folder that wait for their transcripts in one folder
+//!   cannot be told apart, so a start there is refused while one waits (inside the claim window,
+//!   its program still running) when either of them is for a named session.
 //! - Text, keys, interrupts and ends go to the session's terminal. Ending a session reports it
 //!   ended (`session_state_changed` and `session_ended`) at once.
 
 use crate::config::EngineHome;
 use crate::derive::Reported;
 use crate::plain;
-use crate::store::TerminalRow;
+use crate::session_env::SessionEnv;
+use crate::store::{StoreError, TerminalRow};
 use crate::terminals::RunnerTerminals;
 use crate::watch::{Origin, Shared, Signal, Target};
 use pitcrew_api::terminal::TerminalError;
@@ -61,9 +70,27 @@ struct Inner {
     terminals: RunnerTerminals,
     shared: Arc<Shared>,
     homes: Vec<EngineHome>,
+    session_env: Option<Arc<dyn SessionEnv>>,
     options: CommandOptions,
     running: Mutex<HashSet<CommandId>>,
     done: Condvar,
+    /// Held by a start of a CLI matched by folder, from its check of the folder until its
+    /// terminal is recorded, so two such starts cannot both find the folder free.
+    by_folder: Mutex<()>,
+}
+
+/// Where a session the hub named for a start stands on this runner ([`RunnerCommands::started`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Started {
+    /// Its transcript is indexed under it: the runner reports it.
+    Reported,
+    /// Its terminal's program runs, and its transcript has not been found yet.
+    Running,
+    /// Neither: this runner never started it (or forgot it), or its program ended before its
+    /// transcript was found.
+    Gone,
+    /// Cannot tell now: the index or the runtime did not answer.
+    Unknown(String),
 }
 
 impl fmt::Debug for RunnerCommands {
@@ -79,6 +106,7 @@ impl RunnerCommands {
         terminals: RunnerTerminals,
         shared: Arc<Shared>,
         homes: Vec<EngineHome>,
+        session_env: Option<Arc<dyn SessionEnv>>,
         options: CommandOptions,
     ) -> Self {
         Self {
@@ -86,10 +114,37 @@ impl RunnerCommands {
                 terminals,
                 shared,
                 homes,
+                session_env,
                 options,
                 running: Mutex::new(HashSet::new()),
                 done: Condvar::new(),
+                by_folder: Mutex::new(()),
             }),
+        }
+    }
+
+    /// Where `session`, one the hub named for a start, stands here: reported (its transcript is
+    /// indexed under it), running (its terminal's program runs, the transcript is not found yet),
+    /// gone, or unknown. For the hub's reconciliation of the sessions it stored before their CLI
+    /// started. Blocking: it may ask the runtime about the terminal.
+    pub fn started(&self, session: SessionId) -> Started {
+        let terminals = &self.inner.terminals;
+        let known = {
+            let store = terminals.store();
+            store
+                .has_session(session)
+                .and_then(|reported| Ok((reported, store.terminal_of(session)?)))
+        };
+        let terminal = match known {
+            Ok((true, _)) => return Started::Reported,
+            Ok((false, None)) => return Started::Gone,
+            Ok((false, Some(t))) => t.terminal,
+            Err(e) => return Started::Unknown(e.to_string()),
+        };
+        match terminals.info(terminal) {
+            Ok(info) if info.alive => Started::Running,
+            Ok(_) | Err(TerminalError::NotFound(_)) => Started::Gone,
+            Err(e) => Started::Unknown(e.to_string()),
         }
     }
 
@@ -135,6 +190,7 @@ impl RunnerCommands {
                 model,
                 account,
                 permission_mode,
+                session,
             } => self.start(&Launch {
                 engine: *engine,
                 cwd,
@@ -144,6 +200,7 @@ impl RunnerCommands {
                 account: account.as_deref(),
                 mode: *permission_mode,
                 resume: None,
+                session: *session,
             }),
             RunnerCommand::ResumeSession {
                 engine,
@@ -159,6 +216,7 @@ impl RunnerCommands {
                 account: None,
                 mode: PermissionMode::Default,
                 resume: Some(native_id),
+                session: None,
             }),
             RunnerCommand::SendText { session, text } => self.on_terminal(*session, |t, id| {
                 t.write(id, text.as_bytes().to_vec())?;
@@ -200,10 +258,28 @@ impl RunnerCommands {
         if !std::path::Path::new(launch.cwd).is_dir() {
             return rejected(format!("{} is not a folder on this machine.", launch.cwd));
         }
-        let env = match self.account_env(launch.engine, launch.account) {
+        if let Some(session) = launch.session {
+            match self.knows(session) {
+                Ok(false) => {}
+                Ok(true) => {
+                    return rejected(format!(
+                        "Session {session} is already known to this runner; it is not started \
+                         again."
+                    ));
+                }
+                Err(e) => return failed(format!("cannot look up session {session}: {e}")),
+            }
+        }
+        let mut env = match self.account_env(launch.engine, launch.account) {
             Ok(env) => env,
             Err(reason) => return rejected(reason),
         };
+        if let (Some(session), Some(provider)) = (launch.session, &inner.session_env) {
+            match provider.env_for(session) {
+                Ok(more) => env.extend(more),
+                Err(reason) => return rejected(reason),
+            }
+        }
         // Claude takes the session id it should use; others are matched by folder.
         let native_id = match (launch.resume, launch.engine) {
             (Some(id), _) => Some(id.to_owned()),
@@ -214,6 +290,19 @@ impl RunnerCommands {
             Ok(spec) => spec,
             Err(reason) => return rejected(reason),
         };
+        // A CLI matched by folder: no other start may take the folder until this one's terminal
+        // is recorded.
+        let _by_folder = native_id.is_none().then(|| {
+            inner
+                .by_folder
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        });
+        if native_id.is_none()
+            && let Some(reason) = self.ambiguous(launch)
+        {
+            return rejected(reason);
+        }
         let started_at = crate::now_ms();
         let info = match inner.terminals.start(spec) {
             Ok(info) => info,
@@ -222,9 +311,11 @@ impl RunnerCommands {
         if launch.mode == PermissionMode::BypassPermissions {
             tracing::warn!(terminal = %info.id, cwd = launch.cwd, engine = ?launch.engine, "started a session with permission prompts bypassed");
         }
-        // A resumed session may be indexed already: link it now.
-        let session = match launch.resume {
-            Some(id) => inner
+        // A resumed session may be indexed already: link it now. A named one is the terminal's
+        // from the start.
+        let session = match (launch.session, launch.resume) {
+            (Some(named), _) => Some(named),
+            (None, Some(id)) => inner
                 .terminals
                 .store()
                 .session_by_native(launch.engine, id)
@@ -232,7 +323,7 @@ impl RunnerCommands {
                     tracing::warn!(error = %e, "cannot look up the resumed session");
                     None
                 }),
-            None => None,
+            (None, None) => None,
         };
         let saved = inner.terminals.store().put_terminal(&TerminalRow {
             terminal: info.id,
@@ -257,6 +348,42 @@ impl RunnerCommands {
                 "session": session,
             })),
         }
+    }
+
+    /// Whether this runner knows `session` already: a transcript indexed under it, or a terminal.
+    fn knows(&self, session: SessionId) -> Result<bool, StoreError> {
+        let store = self.inner.terminals.store();
+        Ok(store.has_session(session)? || store.terminal_of(session)?.is_some())
+    }
+
+    /// Why a start of a CLI matched by folder (not Claude) could be taken for another, or the
+    /// other for it: a start in the same folder still waits for its transcript (inside the claim
+    /// window, its program running), and one of the two is for a session the hub named. Two
+    /// starts for no named session are left to the folder match, as before.
+    fn ambiguous(&self, launch: &Launch<'_>) -> Option<String> {
+        let terminals = &self.inner.terminals;
+        let now = crate::now_ms();
+        let waiting = match terminals.store().waiting_in(launch.engine, launch.cwd, now) {
+            Ok(waiting) => waiting,
+            Err(e) => {
+                return Some(format!(
+                    "cannot look at the starts waiting in {}: {e}",
+                    launch.cwd
+                ));
+            }
+        };
+        let blocking = waiting
+            .into_iter()
+            .filter(|t| launch.session.is_some() || t.session.is_some())
+            .find(|t| matches!(terminals.info(t.terminal), Ok(info) if info.alive))?;
+        let secs = (now.saturating_sub(blocking.started_at) / 1000).max(0);
+        Some(format!(
+            "Another {:?} session started in {} {secs} s ago has not written its transcript yet, \
+             and {:?} sessions are told apart only by folder and start time, so a second one \
+             started there now could be taken for it. Start this one once that one appears, or \
+             in another folder.",
+            launch.engine, launch.cwd, launch.engine
+        ))
     }
 
     /// The environment that selects an account home: one of the configured homes for the CLI.
@@ -388,6 +515,8 @@ pub(crate) struct Launch<'a> {
     pub mode: PermissionMode,
     /// Resume this CLI session instead of starting a new one.
     pub resume: Option<&'a str>,
+    /// The session the hub named for it.
+    pub session: Option<SessionId>,
 }
 
 /// The program and arguments for a launch. `new_id` is the session id to give a new Claude
@@ -554,6 +683,7 @@ mod tests {
             account: None,
             mode,
             resume: None,
+            session: None,
         }
     }
 
