@@ -34,6 +34,8 @@ pub mod probe;
 pub mod quote;
 mod report;
 mod ssh;
+pub mod wsl;
+pub use wsl::{Wsl, WslDistro, WslDistros};
 pub mod tunnel;
 
 pub use askpass::{

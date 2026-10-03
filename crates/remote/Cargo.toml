@@ -13,6 +13,12 @@ name = "pitcrew-askpass"
 path = "src/bin/pitcrew-askpass.rs"
 
 [[test]]
+# The binary doubles as a configurable fake wsl.exe on every platform.
+name = "wsl"
+path = "tests/wsl.rs"
+harness = false
+
+[[test]]
 # Its own `main`: the test binary doubles as the fake `ssh` it drives.
 name = "fake_ssh"
 path = "tests/fake_ssh.rs"
