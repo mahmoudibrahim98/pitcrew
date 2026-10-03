@@ -33,7 +33,15 @@ import type { WorkstreamStatus } from "./WorkstreamStatus.ts";
 /**
  * What happened. On the wire: `{"type": "task_moved", "data": {…}}`.
  */
-export type EventBody = { "type": "machine_added", "data": { 
+export type EventBody = { "type": "cursor_moved", "data": { 
+/**
+ * `workspace`, `project:<id>` or `workstream:<id>`.
+ */
+scope: string, 
+/**
+ * Last seen log revision.
+ */
+rev: number, } } | { "type": "machine_added", "data": { 
 /**
  * The machine.
  */

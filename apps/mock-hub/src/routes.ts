@@ -85,6 +85,7 @@ export const PROTOCOL_MIN = 1;
 /** The mock's tokens. A `Map`, so no inherited object property can pass for a token. */
 const TOKENS = new Map<string, { member: MemberId; scope: TokenScope }>([
   ['dev-device-token', { member: DEV_DEVICE_MEMBER, scope: 'device' }],
+  ['dev-second-device-token', { member: '01JB000000000000000MEM0007', scope: 'device' }],
   ['dev-agent-token', { member: DEV_AGENT_MEMBER, scope: 'agent' }],
 ]);
 
@@ -1331,6 +1332,8 @@ function touches(hub: Hub, body: EventBody, filter: EventFilter): boolean {
 /** What an event names directly; `touches` adds the parents. */
 function directRefs(hub: Hub, body: EventBody): EventFilter {
   switch (body.type) {
+    case 'cursor_moved':
+      return {};
     case 'session_discovered': {
       const { session } = body.data;
       return { session: session.id, task: session.task, workstream: session.workstream };
@@ -1422,6 +1425,31 @@ const route = (method: string, pattern: string, access: Route['access'], handler
 });
 
 const ROUTES: Route[] = [
+  route('GET', '/v1/me/cursors', 'device', (hub, ctx) => ok(
+    [...(hub.cursors.get(ctx.caller.memberId) ?? new Map<string, number>())]
+      .sort(([a], [b]) => a.localeCompare(b)).map(([scope, rev]) => ({ scope, rev })),
+  )),
+  route('PUT', '/v1/me/cursors/:scope', 'device', (hub, ctx) => {
+    const scope = ctx.param('scope');
+    if (scope !== 'workspace') {
+      const match = /^(project|workstream):([0-7][0-9A-HJKMNP-TV-Z]{25})$/.exec(scope);
+      if (match === null) throw invalid('Invalid cursor scope.');
+      const exists = match[1] === 'project' ? hub.findProject(match[2]!) : hub.findWorkstream(match[2]!);
+      if (exists === undefined) throw notFound('Unknown cursor scope.');
+    }
+    if (!isRecord(ctx.body) || !Number.isSafeInteger(ctx.body['rev']) || typeof ctx.body['rev'] !== 'number' || ctx.body['rev'] < 0 || ctx.body['rev'] > hub.rev) {
+      throw invalid('Revision must be an integer in the log.');
+    }
+    const cursors = hub.cursors.get(ctx.caller.memberId) ?? new Map<string, number>();
+    const current = cursors.get(scope) ?? 0;
+    const rev = Math.max(current, ctx.body['rev']);
+    if (rev > current) {
+      cursors.set(scope, rev);
+      hub.cursors.set(ctx.caller.memberId, cursors);
+      hub.append(ctx.caller.memberId, { type: 'cursor_moved', data: { scope, rev } });
+    }
+    return ok({ scope, rev });
+  }),
   // Host and workspace (`GET /v1/host/info` is handled before auth, in `handleApi`).
   route('GET', '/v1/me', 'agent', (_hub, ctx) =>
     ok(found(ctx.caller.member, 'No member yet; set up the workspace first.')),

@@ -69,6 +69,11 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
 
 ## What it does
 
+- **Read cursors.** Device-only `GET /v1/me/cursors` and `PUT /v1/me/cursors/{scope}`,
+  forward-only for each person and scope, with `cursor_moved` on a forward write.
+  `dev-second-device-token` represents a second synthetic person for isolation tests.
+  Like other mock state, cursors last until the server stops.
+
 - **Every route in the contract**, with the `ApiError` body and status for each failure (400, 401,
   403, 404, 409, 503). Task routes accept an id, a prefixed id (`tsk_…`) or a key (`PAP-4`).
 - **The first run** (`POST /v1/setup`, "Fresh mode" above). `GET /v1/workspace` answers

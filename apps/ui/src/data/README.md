@@ -4,6 +4,11 @@ The API client, the `/v1/stream` connection, and how events keep the TanStack Qu
 See `docs/build/streams/L.md`, `docs/build/contracts/api-v1.md` and
 `docs/build/contracts/desktop-gateway.md`. Import from `src/data/index.ts`.
 
+`cursors.ts` exposes live queries and mutations for the person's read cursors. The
+`cursor_moved` stream event invalidates `['cursors']`, including writes on another
+device; it is excluded from recap invalidation. Each workspace's existing data scope
+keeps its cursor cache separate, and failed mutations retain the previous cursor.
+
 | File | What |
 |---|---|
 | `transport.ts` | The seam every request and socket goes through: `Transport` (`request(method, path, body) → { status, contentType, body }`, `openSocket(path) → TransportSocket`). `browserTransport()`: `fetch` and `WebSocket` with the bearer token (development). `TransportSocket.bufferedAmount` is bytes sent but not yet taken: the real `WebSocket`'s own, here. `isDesktop()`: `window.__TAURI_INTERNALS__` exists. |

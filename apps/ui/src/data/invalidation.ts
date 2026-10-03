@@ -33,6 +33,7 @@ const taskAndWorkstream = (id: string, cache: CacheLookup): QueryKey[] => {
 };
 
 export const invalidationMap: InvalidationMap = {
+  cursor_moved: () => [['cursors']],
   machine_added: () => [keys.machines],
   // The member may be the signed-in one, whose details changed.
   member_added: () => [keys.members, keys.me],

@@ -58,3 +58,9 @@ See [MISMATCHES.md](MISMATCHES.md) for observed differences and ambiguities. Onl
 runner loads `daemon-deviations.json`. A listed failure must raise exactly its recorded status
 mismatch; timeouts, schema failures and different errors still fail. An unexpectedly passing case
 also fails, requiring the stale exception to be removed. There are no skipped or todo tests.
+
+The shared suite also checks read cursors for forward-only movement, project/workstream
+scope isolation, future/malformed revisions, agent refusals and person isolation. The
+runner supplies `PITCREW_CONFORMANCE_SECOND_PERSON`: the mock's second synthetic device
+credential, or a random device credential provisioned in the daemon's temporary registry
+before startup. It never modifies a registry owned by a running daemon or a real person.

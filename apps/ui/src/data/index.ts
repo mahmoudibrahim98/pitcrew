@@ -1,5 +1,6 @@
 export { ApiError, createApi, GatewayError, type Api, type ApiOptions, type GatewayErrorCode } from './api.ts';
 export * from './hooks.ts';
+export { useMoveCursor, useReadCursors, type ReadCursor } from './cursors.ts';
 export { invalidationMap, keysToInvalidate } from './invalidation.ts';
 export { keys } from './keys.ts';
 export type { LiveProblem } from './live.ts';

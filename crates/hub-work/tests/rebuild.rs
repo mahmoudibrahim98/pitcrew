@@ -64,6 +64,8 @@ fn raw(work: &WorkService, author: MemberId, obo: Option<MemberId>, body: EventB
 
 /// A bit of everything, through the commands where there is one and as raw events otherwise.
 fn workload(work: &WorkService) {
+    work.move_cursor(&person(SAM), "workspace", 1)
+        .expect("read cursor");
     let sam = person(SAM);
     let writer = agent(WRITER);
     let pap = "01JB000000000000000PRJ0001".parse().expect("project");

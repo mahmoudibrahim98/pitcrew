@@ -3,7 +3,7 @@
 
 import { fireEvent, screen, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { Home, useLastSeen } from '../home.tsx';
+import { Home } from '../home.tsx';
 import { ProjectOverview, WorkstreamOverview } from '../overview.tsx';
 import { demo, eventually, otherClient, renderWithHub, startHub, stopHub, type Hub } from './harness.tsx';
 
@@ -84,7 +84,6 @@ describe('Home', () => {
 
   beforeEach(async () => {
     localStorage.clear();
-    useLastSeen.setState({ byWorkspace: {} });
     hub = await startHub();
   });
 
@@ -113,13 +112,11 @@ describe('Home', () => {
     renderWithHub(<Home />, hub);
     const since = await screen.findByRole('region', { name: 'Since you last looked' });
     const changes = await within(since).findByRole('list', { name: 'Changes' });
-    expect(within(changes).getAllByRole('listitem')).toHaveLength(10);
-    // The button waits for the workspace id, which keys what was seen.
-    fireEvent.click(await within(since).findByRole('button', { name: 'Mark all as seen' }));
+    expect(within(changes).getAllByRole('listitem')).toHaveLength(15);
+    expect(within(since).getByText('15 new changes')).toBeTruthy();
+    fireEvent.click(await within(since).findByRole('button', { name: 'Mark all as read' }));
     await within(since).findByText('Nothing new since you last looked.');
-    expect(JSON.parse(localStorage.getItem('pitcrew.projects.last-seen') ?? '{}')).toMatchObject({
-      state: { byWorkspace: { '01JB000000000000000WSP0001': 15 } },
-    });
+    expect(await otherClient(hub).request('GET', '/v1/me/cursors')).toEqual([{ scope: 'workspace', rev: 15 }]);
 
     await otherClient(hub).moveTask('PAP-2', 'in_progress');
     const fresh = await within(since).findByRole('list', { name: 'Changes' });

@@ -65,6 +65,13 @@ impl Event {
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum EventBody {
+    /// The author read through this revision in this scope.
+    CursorMoved {
+        /// `workspace`, `project:<id>` or `workstream:<id>`.
+        scope: String,
+        /// Last seen log revision.
+        rev: u64,
+    },
     // Workspace membership: written by the hub.
     /// A machine was added to the workspace, or its details changed.
     MachineAdded {
