@@ -171,7 +171,7 @@ fn demo_serves_the_work_model_with_real_tokens() {
     assert_eq!(info["protocol_min"], pitcrew_protocol::PROTOCOL_MIN);
     assert_eq!(info["roles"], json!(["hub", "runner"]));
     // The demo watches no home.
-    assert_eq!(info["capabilities"], json!([]));
+    assert_eq!(info["capabilities"], json!(["scan"]));
 
     // No token, a malformed one, and the mock hub's dev token are all refused.
     for token in [None, Some("nope"), Some("dev-device-token")] {

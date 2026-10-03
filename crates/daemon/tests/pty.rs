@@ -590,7 +590,7 @@ fn sessions_run_in_ptyd_terminals_that_outlive_the_daemon() {
     let device = daemon.device_token();
     let info = daemon.get("/v1/host/info", None).json();
     assert_eq!(info["roles"], json!(["hub", "runner"]));
-    assert_eq!(info["capabilities"], json!(["pty", "watch"]), "{info}");
+    assert_eq!(info["capabilities"], json!(["pty", "watch", "scan"]), "{info}");
     let line = pty_line(&daemon);
     assert!(line.contains("INFO"), "{line}");
     assert!(line.contains(&endpoint_arg), "{line}");
@@ -738,7 +738,7 @@ fn sessions_run_in_ptyd_terminals_that_outlive_the_daemon() {
     // a reader from the start gets all of it, as ptyd kept it.
     let daemon = rig.start(&["--ptyd-endpoint", &endpoint_arg]);
     let info = daemon.get("/v1/host/info", None).json();
-    assert_eq!(info["capabilities"], json!(["pty", "watch"]), "{info}");
+    assert_eq!(info["capabilities"], json!(["pty", "watch", "scan"]), "{info}");
     let mut resumed = Terminal::open(&daemon, &a_id, Some(offset), &device);
     resumed.shows("DELAYED");
     assert!(
@@ -876,7 +876,7 @@ fn each_state_directory_has_a_ptyd_of_its_own() {
     assert_ne!(ea, eb);
     for (daemon, endpoint) in [(&a, &ea), (&b, &eb)] {
         let info = daemon.get("/v1/host/info", None).json();
-        assert_eq!(info["capabilities"], json!(["pty", "watch"]), "{info}");
+        assert_eq!(info["capabilities"], json!(["pty", "watch", "scan"]), "{info}");
         let line = pty_line(daemon);
         assert!(
             line.contains(&format!("endpoint={}", endpoint.display())),
@@ -912,7 +912,7 @@ fn each_state_directory_has_a_ptyd_of_its_own() {
             c_env,
         );
         let info = c.get("/v1/host/info", None).json();
-        assert_eq!(info["capabilities"], json!(["watch"]), "{info}");
+        assert_eq!(info["capabilities"], json!(["watch", "scan"]), "{info}");
         let logs = c.stderr();
         assert!(
             logs.contains("another pitcrewd uses this pitcrew-ptyd endpoint"),
@@ -977,7 +977,7 @@ fn a_missing_ptyd_means_no_runtime_and_a_clear_log_line() {
     );
     let info = daemon.get("/v1/host/info", None).json();
     assert_eq!(info["roles"], json!(["hub", "runner"]));
-    assert_eq!(info["capabilities"], json!(["watch"]), "{info}");
+    assert_eq!(info["capabilities"], json!(["watch", "scan"]), "{info}");
     let logs = daemon.stderr();
     let why = logs
         .lines()

@@ -90,7 +90,7 @@ fn without_tmux_the_daemon_serves_with_no_terminal_runtime() {
     assert_eq!(info["roles"], json!(["hub", "runner"]));
     assert_eq!(
         info["capabilities"],
-        json!(["watch"]),
+        json!(["watch", "scan"]),
         "no tmux, no pty: {info}"
     );
     let logs = daemon.stderr();
@@ -814,7 +814,7 @@ done
         let mut daemon = rig.start(&["--demo"]);
         let device = daemon.device_token();
         let info = daemon.get("/v1/host/info", None).json();
-        assert_eq!(info["capabilities"], json!(["tmux", "watch"]), "{info}");
+        assert_eq!(info["capabilities"], json!(["tmux", "watch", "scan"]), "{info}");
         let logs = daemon.stderr();
         assert!(
             logs.contains("the runner's terminals run in tmux")
@@ -926,7 +926,7 @@ done
         // The next daemon finds the terminal, and its output goes on from that offset.
         let daemon = rig.start(&[]);
         let info = daemon.get("/v1/host/info", None).json();
-        assert_eq!(info["capabilities"], json!(["tmux", "watch"]), "{info}");
+        assert_eq!(info["capabilities"], json!(["tmux", "watch", "scan"]), "{info}");
         let mut resumed = Terminal::open(&daemon, &a_id, Some(offset), &device);
         let mut from_start = Terminal::open(&daemon, &a_id, None, &device);
         post(
@@ -1075,7 +1075,7 @@ done
         assert_ne!(sa, sb);
         for (daemon, socket) in [(&a, &sa), (&b, &sb)] {
             let info = daemon.get("/v1/host/info", None).json();
-            assert_eq!(info["capabilities"], json!(["tmux", "watch"]), "{info}");
+            assert_eq!(info["capabilities"], json!(["tmux", "watch", "scan"]), "{info}");
             assert!(socket.starts_with(&tmpdir), "{}", socket.display());
             let dir = socket
                 .parent()
@@ -1110,7 +1110,7 @@ done
             &[],
         );
         let info = c.get("/v1/host/info", None).json();
-        assert_eq!(info["capabilities"], json!(["watch"]), "{info}");
+        assert_eq!(info["capabilities"], json!(["watch", "scan"]), "{info}");
         let logs = c.stderr();
         assert!(
             logs.contains("another pitcrewd uses this tmux socket"),
@@ -1171,7 +1171,7 @@ done
             &[],
         );
         let info = daemon.get("/v1/host/info", None).json();
-        assert_eq!(info["capabilities"], json!(["watch"]), "{info}");
+        assert_eq!(info["capabilities"], json!(["watch", "scan"]), "{info}");
         let logs = daemon.stderr();
         assert!(logs.contains("that are not PitCrew's"), "{logs}");
         let sessions = rig.tmux_on(&socket, &["list-sessions", "-F", "#{session_name}"]);
