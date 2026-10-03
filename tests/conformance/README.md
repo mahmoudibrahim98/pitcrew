@@ -18,7 +18,10 @@ its agent's CLI: `claude`, `codex` and `opencode` are stand-ins first on the dae
 shell scripts that write nothing and wait until the run's folder is removed; then ptyd exits once
 idle). It never runs a real agent or connects to a person's terminal. The demo watches no agent
 homes, so its machine scan reports nothing; the runner passes `--scan-hold-ms 1500` so that a scan
-lasts long enough for the second one `scan.test.mjs` sends meanwhile to be refused.
+lasts long enough for the second one `scan.test.mjs` sends meanwhile to be refused. On Windows the
+daemon target is skipped (it says so and exits 0): its stand-ins are Unix shell scripts, and ptyd
+there would look for `.exe` and `.cmd` names on `PATH`, where it could find a real agent CLI. CI
+runs it on Linux.
 
 To run the suite against an existing **synthetic local demo server**, set these variables and use
 `node --test tests/conformance/api.test.mjs tests/conformance/scan.test.mjs`:

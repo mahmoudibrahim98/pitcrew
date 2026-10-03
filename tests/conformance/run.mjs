@@ -9,6 +9,13 @@ import { startServer } from '../../apps/mock-hub/src/server.ts';
 const target = process.argv[2];
 if (!['mock', 'daemon'].includes(target))
   throw new Error('Usage: node tests/conformance/run.mjs mock|daemon');
+if (target === 'daemon' && process.platform === 'win32') {
+  // Its dispatch starts the agent's CLI in pitcrew-ptyd on a Unix socket, and the stand-in CLIs
+  // are shell scripts: on Windows ptyd would look for `.exe`/`.cmd` names on PATH, and could find
+  // a real agent CLI. CI runs this target on Linux.
+  console.log('# skipped: the daemon target runs on Linux and macOS only');
+  process.exit(0);
+}
 const root = resolve(import.meta.dirname, '../..');
 const temporary = await mkdtemp(join(tmpdir(), 'pitcrew-conformance-'));
 const home = join(temporary, 'home');
