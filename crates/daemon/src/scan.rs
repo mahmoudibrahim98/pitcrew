@@ -246,12 +246,7 @@ async fn start(
 }
 
 /// The walk, on the blocking pool: sends its ticks and then its last frame to `frames`.
-fn walk(
-    homes: &[ScanHome],
-    hold: Duration,
-    frames: &mpsc::Sender<Bytes>,
-    cancel: Arc<AtomicBool>,
-) {
+fn walk(homes: &[ScanHome], hold: Duration, frames: &mpsc::Sender<Bytes>, cancel: Arc<AtomicBool>) {
     if !hold.is_zero() {
         std::thread::sleep(hold);
     }
@@ -423,7 +418,12 @@ mod tests {
     #[test]
     fn a_walk_ends_with_its_last_tick_and_the_report() {
         let (frames, mut rx) = mpsc::channel(FRAMES);
-        walk(&[], Duration::ZERO, &frames, Arc::new(AtomicBool::new(false)));
+        walk(
+            &[],
+            Duration::ZERO,
+            &frames,
+            Arc::new(AtomicBool::new(false)),
+        );
         drop(frames);
         let mut got = Vec::new();
         while let Ok(bytes) = rx.try_recv() {
@@ -445,14 +445,23 @@ mod tests {
 
         let (frames, rx) = mpsc::channel(FRAMES);
         drop(rx);
-        walk(&[], Duration::ZERO, &frames, Arc::new(AtomicBool::new(false)));
+        walk(
+            &[],
+            Duration::ZERO,
+            &frames,
+            Arc::new(AtomicBool::new(false)),
+        );
     }
 
     #[test]
     fn a_nonreading_client_times_out_and_a_dropped_body_cancels() {
         let (tx, rx) = mpsc::channel(1);
         tx.try_send(Bytes::new()).unwrap();
-        assert!(!send_with_timeout(&tx, Bytes::new(), Duration::from_millis(20)));
+        assert!(!send_with_timeout(
+            &tx,
+            Bytes::new(),
+            Duration::from_millis(20)
+        ));
         let cancel = Arc::new(AtomicBool::new(false));
         drop(Frames(rx, Arc::clone(&cancel)));
         assert!(cancel.load(Ordering::Relaxed));

@@ -166,7 +166,10 @@ mod tests {
             attached.set(parts(watches, runtime));
             let after = info.now();
             assert_eq!(after.roles, [HostRole::Hub, HostRole::Runner]);
-            assert_eq!(after.capabilities, [expected, vec![Capability::Scan]].concat());
+            assert_eq!(
+                after.capabilities,
+                [expected, vec![Capability::Scan]].concat()
+            );
             assert_eq!(after.machine, before.machine);
         }
         runner.stop();

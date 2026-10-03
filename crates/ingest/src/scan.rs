@@ -33,9 +33,9 @@ use std::fs;
 use std::io::Read;
 use std::panic::UnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How much of a transcript's start the scan reads for its session facts: enough for the first

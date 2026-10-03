@@ -193,5 +193,8 @@ fn a_partial_report_is_explicit_and_old_reports_remain_complete() {
     assert_eq!(serde_json::from_value::<ScanReport>(json).unwrap(), report);
     let old = serde_json::to_value(ScanReport::default()).unwrap();
     assert!(old.get("partial").is_none());
-    assert_eq!(serde_json::from_value::<ScanReport>(old).unwrap().partial, None);
+    assert_eq!(
+        serde_json::from_value::<ScanReport>(old).unwrap().partial,
+        None
+    );
 }
