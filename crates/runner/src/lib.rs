@@ -59,6 +59,7 @@ mod agents;
 mod commands;
 mod config;
 mod derive;
+pub mod files;
 mod fsinfo;
 mod held;
 mod hooks;

@@ -1612,6 +1612,7 @@ name = "pitcrew-runner"
 version = "0.0.0"
 dependencies = [
  "axum",
+ "base64 0.23.1",
  "notify",
  "pitcrew-api",
  "pitcrew-auth",
@@ -1633,6 +1634,7 @@ dependencies = [
  "tracing-subscriber",
  "tungstenite",
  "ulid",
+ "winapi-util",
 ]
 
 [[package]]

@@ -2,6 +2,30 @@
 
 Runner service: watchers, session linking, derived events to the hub, file API.
 
+## Workstream files
+
+`files::Files::new(state)` provides blocking list/read/write operations for a root resolved by the
+hub. Validate relative paths before I/O, retain checked ancestor handles, refuse every link or
+Windows reparse point, and compare opened identities. Unix opens and replacement use directory
+handles; Windows holds ancestors without delete sharing. Lists keep the first 5,000 UTF-8 names
+in byte order and report truncation. Files are capped at 8 MiB, with SHA-256 revisions and UTF-8
+or canonical base64 content.
+
+Writes are serialized, reject `.git` and multi-link targets, recheck revisions, and replace an
+exclusive temporary file in the same folder, preserving permissions (Windows DACL included).
+New files are private. Before replacement, `file-backups` in state retains the newest three
+backups per root/path and 64 MiB total, evicting oldest first; each is at most 8 MiB. Hash keys
+normalize Windows casing. Unix storage is current-user-owned 0700/0600. Windows creates and
+checks protected owner-only DACLs through the OS's PowerShell/.NET ACL API, with literal paths
+passed in environment variables and no profile or output. Unavailable ACL support refuses the
+write. Existing public, linked, malformed or hard-linked backup storage fails closed.
+
+Same-account concurrent mutation is not a separate security principal: Unix cannot prevent a
+privileged owner moving an already-open directory after the final check, and Windows must close
+the target handle before the atomic rename. Handles prevent link redirection; identity and
+revision checks detect swaps observed before replacement, but do not provide a filesystem-wide
+transaction against another writer. No path, content or OS error is logged or returned in errors.
+
 **Owned by stream D** — see [docs/build/streams/D.md](../../docs/build/streams/D.md).
 
 The crate docs (`src/lib.rs`) describe the watcher and the in-process hub link: the store sink,
