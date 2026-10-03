@@ -119,12 +119,12 @@ fn command_is_ours(command: &str, event: &str) -> bool {
         && super::is_our_exe_name(&super::quoted_word_file_name(exe_part))
 }
 
-fn braces(indent: &str, inner: &str) -> String {
-    format!("{{\n{indent}  {inner}\n{indent}}}")
+fn braces(indent: &str, inner: &str, newline: &str) -> String {
+    format!("{{{newline}{indent}  {inner}{newline}{indent}}}")
 }
 
-fn brackets(indent: &str, inner: &str) -> String {
-    format!("[\n{indent}  {inner}\n{indent}]")
+fn brackets(indent: &str, inner: &str, newline: &str) -> String {
+    format!("[{newline}{indent}  {inner}{newline}{indent}]")
 }
 
 /// A freshly formatted file, for when there is nothing to preserve.
@@ -276,8 +276,13 @@ fn insert_event(doc: &str, exe: &str, event: &str, form: HookForm) -> String {
                 &child_indent,
                 &format!(
                     "\"{event}\": {}",
-                    brackets(&inner_indent, &matcher_object(exe, event, form))
-                )
+                    brackets(
+                        &inner_indent,
+                        &matcher_object(exe, event, form),
+                        jsontext::line_ending(doc)
+                    )
+                ),
+                jsontext::line_ending(doc)
             )
         );
         let entries: Vec<Entry> = root.members.iter().map(|m| m.entry).collect();
@@ -301,7 +306,11 @@ fn insert_event(doc: &str, exe: &str, event: &str, form: HookForm) -> String {
                 .unwrap_or_else(|| format!("{hooks_indent}  "));
             let new_text = format!(
                 "\"{event}\": {}",
-                brackets(&child_indent, &matcher_object(exe, event, form))
+                brackets(
+                    &child_indent,
+                    &matcher_object(exe, event, form),
+                    jsontext::line_ending(doc)
+                )
             );
             let entries: Vec<Entry> = hooks_obj.members.iter().map(|m| m.entry).collect();
             jsontext::append(
@@ -379,7 +388,7 @@ fn update_stale_event(doc: &str, exe: &str, event: &str, form: HookForm) -> Stri
             replacement.replace_range(args.entry.value_start..args.entry.value_end, &value);
         } else if let Some(last) = parsed.members.last() {
             let separator = if replacement.contains('\n') {
-                let newline = if doc.contains("\r\n") { "\r\n" } else { "\n" };
+                let newline = jsontext::line_ending(doc);
                 format!(
                     ",{newline}{}",
                     jsontext::indent_before(replacement.as_bytes(), last.entry.start)
@@ -874,6 +883,37 @@ mod tests {
     }
 
     const EXE: &str = "/home/sam/.local/bin/pitcrew";
+
+    #[test]
+    fn hooks_added_to_crlf_settings_use_only_crlf() {
+        for original in [
+            "{\r\n  \"other\": true\r\n}\r\n",
+            "{\r\n  \"hooks\": {}\r\n}\r\n",
+            "{\r\n  \"hooks\": {\r\n    \"Stop\": []\r\n  }\r\n}\r\n",
+        ] {
+            for form in [HookForm::Shell, HookForm::Exec] {
+                let mut installed = original.to_owned();
+                for event in EVENTS {
+                    installed = insert_event(&installed, EXE, event, form);
+                }
+                serde_json::from_str::<serde_json::Value>(&installed).unwrap();
+                assert!(
+                    !installed.replace("\r\n", "").contains('\n'),
+                    "{installed:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn created_exec_hooks_switch_to_shell_without_extra_spaces() {
+        let shell = fresh_document(EXE, HookForm::Shell);
+        let mut converted = fresh_document(EXE, HookForm::Exec);
+        for event in EVENTS {
+            converted = update_stale_event(&converted, EXE, event, HookForm::Shell);
+        }
+        assert_eq!(converted, shell);
+    }
 
     #[test]
     fn migration_preserves_inline_layout_and_multiline_indent_and_newlines() {

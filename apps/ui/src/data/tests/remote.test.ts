@@ -31,6 +31,15 @@ async function failure(promise: Promise<unknown>): Promise<unknown> {
 
 const NEW_WS = { id: '01JB000000000000000WSPNEW1', name: 'hpc-login', kind: 'remote', state: 'connecting' };
 
+describe('workspace host compatibility', () => {
+  it('retains remote hosts, tolerates older desktops, and excludes local hosts', () => {
+    expect(toGatewayWorkspace({ ...NEW_WS, host: 'login.example.org' })).toEqual({ ...NEW_WS, host: 'login.example.org' });
+    expect(toGatewayWorkspace(NEW_WS)).toEqual(NEW_WS);
+    expect(toGatewayWorkspace({ ...NEW_WS, host: 42 })).toEqual(NEW_WS);
+    expect(toGatewayWorkspace({ ...NEW_WS, kind: 'local', host: 'spoof.example.org' })).toEqual({ ...NEW_WS, kind: 'local' });
+  });
+});
+
 describe('the remote commands', () => {
   it('lists WSL distros and passes the selected transport through probe and plan', async () => {
     const distro = { name: "Lab 'quoted' distro", default: true, running: false, version: 2 };
