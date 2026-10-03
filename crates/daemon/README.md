@@ -1126,3 +1126,11 @@ and handed back, not kept, once it has.
 - Scanning another machine of the workspace (`POST /v1/machines/{id}/scan` is `409` for one), and
   stopping a scan part-way: `pitcrew_ingest::scan` takes no cancel, so a scan whose client went
   away runs to its end. A cancel flag in its `ScanOptions` (stream A) would let the route stop it.
+
+## Workstream files
+
+The device-only Files API resolves location roots from the work model and calls the runner on
+the blocking pool. Remote and WSL locations answer 501. Writes require a revision or explicit
+null for creation; JSON bodies are capped at 12 MiB and decoded files at 8 MiB. State now includes
+file-backups: private bounded originals before replacement (runner README, Workstream files).
+Responses use no-store and nosniff, and failures log counts and fixed reasons without paths.
