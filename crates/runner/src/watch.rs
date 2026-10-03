@@ -197,6 +197,9 @@ struct Signals {
     signals_warned_at: Option<Instant>,
     /// Workstream locations changed: link every session again.
     relink: bool,
+    /// An exited terminal gets one final discovery before it stops accepting transcripts.
+    exit_scans: Vec<(TerminalId, SyncSender<bool>)>,
+    exhausted: HashSet<TerminalId>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -261,6 +264,25 @@ impl Shared {
     pub fn rescan(&self) {
         self.lock().rediscover_at = Some(Instant::now());
         self.cv.notify_one();
+    }
+
+    /// Waits for the watcher to match transcripts already written by an exited CLI. No index
+    /// or runtime lock may be held while waiting. A failed scan must not retire the terminal.
+    pub fn scan_exit(&self, terminal: TerminalId) -> bool {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        {
+            let mut s = self.lock();
+            if s.exhausted.contains(&terminal) {
+                return true;
+            }
+            if s.stop {
+                return false;
+            }
+            s.exit_scans.push((terminal, tx));
+            s.rediscover_at = Some(Instant::now());
+        }
+        self.cv.notify_one();
+        rx.recv_timeout(Duration::from_secs(30)).unwrap_or(false)
     }
 
     /// Hands a reported state to the watcher. It never blocks: a hook must not wait. When too
@@ -970,6 +992,7 @@ impl Watcher {
                     look,
                     reports: s.reports.drain(..).collect(),
                     relink: std::mem::take(&mut s.relink),
+                    exit_scans: std::mem::take(&mut s.exit_scans),
                 });
             }
             s = shared
@@ -1032,6 +1055,17 @@ impl Watcher {
                     t.poll_every.saturating_mul(2).min(poll_max)
                 };
                 t.next_poll = after(Instant::now(), t.poll_every);
+            }
+        }
+        if !wake.exit_scans.is_empty() {
+            let complete = self.homes.iter().all(|h| !h.discover_failing)
+                && self.tracked.iter().all(|(_, t)| t.discovered);
+            for (terminal, reply) in wake.exit_scans {
+                let closed = complete && self.store_lock().close_folder_claim(terminal).is_ok();
+                if closed {
+                    self.shared.lock().exhausted.insert(terminal);
+                }
+                let _ = reply.send(closed);
             }
         }
         self.let_go();
@@ -2180,9 +2214,8 @@ impl Watcher {
     /// The terminal the runner started a newly discovered session in, if it did, and the session
     /// the hub named for it, which the transcript then adopts (its row is moved in the index).
     ///
-    /// A terminal matched by folder whose program has ended is not this transcript's: a CLI that
-    /// was killed, or ended, before its transcript appeared never writes one. The runtime is
-    /// asked about those terminals without the index locked.
+    /// An exited terminal can still own an unread transcript. It stops accepting folder matches
+    /// only after its final scan has completed; the runtime is asked without the index locked.
     fn claim_terminal(
         &self,
         session: SessionId,
@@ -2208,7 +2241,7 @@ impl Watcher {
             });
         let ended: Vec<TerminalId> = candidates
             .into_iter()
-            .filter(|t| self.shared.has_ended(*t))
+            .filter(|t| self.shared.has_ended(*t) && self.shared.lock().exhausted.contains(t))
             .collect();
         if !ended.is_empty() {
             tracing::debug!(%session, ?ended, "terminals in the folder whose program ended are not matched");
@@ -2291,6 +2324,7 @@ struct Wake {
     look: bool,
     reports: Vec<Signal>,
     relink: bool,
+    exit_scans: Vec<(TerminalId, SyncSender<bool>)>,
 }
 
 /// Whether a home is polled, and whether it is slow (a network filesystem, swept and rediscovered
