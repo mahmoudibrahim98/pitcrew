@@ -17,10 +17,12 @@ use pitcrew_interfaces::fake::FakeRuntime;
 use pitcrew_interfaces::runtime::{
     OutputChunk, Runtime, RuntimeError, RuntimeKind, Screen, StartSpec, TerminalInfo,
 };
-use pitcrew_interfaces::source::SourceAdapter;
+use pitcrew_interfaces::source::{
+    Cursor, ParseChunk, SourceAdapter, SourceError, TranscriptPage, TranscriptRef,
+};
 use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{CommandId, MachineId, MemberId, SessionId, TerminalId, WorkspaceId};
-use pitcrew_protocol::model::{Engine, PermissionMode, Session};
+use pitcrew_protocol::model::{Engine, PermissionMode, Session, SessionState};
 use pitcrew_protocol::runner::{CommandOutcome, EndMode, Key, RunnerCommand};
 use pitcrew_runner::{
     RunnerCommands, RunnerConfig, RunnerHandle, RunnerTerminals, SessionEnv, Started, Timing,
@@ -156,6 +158,16 @@ impl Rig {
             Engine::Codex => Arc::new(CodexAdapter::new()),
             _ => Arc::new(OpenCodeAdapter::new()),
         };
+        Self::with_adapter(engine, home, state, env, adapter)
+    }
+
+    fn with_adapter(
+        engine: Engine,
+        home: &Path,
+        state: &Path,
+        env: TokenFiles,
+        adapter: Arc<dyn SourceAdapter>,
+    ) -> Self {
         let env = Arc::new(env);
         let mut config =
             RunnerConfig::new(WorkspaceId::new(), MachineId::new(), MemberId::new(), state)
@@ -446,7 +458,7 @@ fn a_named_claude_session_is_reported_once_under_its_name() {
     ));
     assert_eq!(r.runtime.list().unwrap().len(), 1);
 
-    // After a restart it keeps the name.
+    // After a restart it keeps the name and observes the terminal missing from the new runtime.
     let Rig {
         runner,
         terminals,
@@ -461,7 +473,8 @@ fn a_named_claude_session_is_reported_once_under_its_name() {
         state.path(),
         TokenFiles::default(),
     );
-    assert_eq!(r.commands.started(named), Started::Reported);
+    assert_eq!(r.terminals.terminal_of(named).unwrap(), Some(terminal));
+    assert_eq!(r.commands.started(named), Started::Exited);
     r.runner.stop();
 }
 
@@ -826,5 +839,161 @@ fn a_terminal_whose_program_ended_claims_no_transcript() {
         "{:?}",
         labels(&events)
     );
+    r.runner.stop();
+}
+
+/// Holds discovery so the whole transcript and the CLI's exit precede its first read.
+struct HeldSource {
+    inner: Arc<dyn SourceAdapter>,
+    gate: Arc<Gate>,
+}
+
+impl SourceAdapter for HeldSource {
+    fn engine(&self) -> Engine {
+        self.inner.engine()
+    }
+    fn discover(&self, home: &Path) -> Result<Vec<TranscriptRef>, SourceError> {
+        self.gate.wait();
+        self.inner.discover(home)
+    }
+    fn read_from(
+        &self,
+        transcript: &TranscriptRef,
+        cursor: &Cursor,
+    ) -> Result<ParseChunk, SourceError> {
+        self.inner.read_from(transcript, cursor)
+    }
+    fn read_page(
+        &self,
+        transcript: &TranscriptRef,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<TranscriptPage, SourceError> {
+        self.inner.read_page(transcript, before, limit)
+    }
+}
+
+#[test]
+fn a_transcript_written_before_exit_still_adopts_its_dispatch() {
+    for engine in [Engine::Codex, Engine::OpenCode] {
+        let home = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let gate = Arc::new(Gate::default());
+        let opens = Opens(gate.clone());
+        let inner: Arc<dyn SourceAdapter> = match engine {
+            Engine::Codex => Arc::new(CodexAdapter::new()),
+            _ => Arc::new(OpenCodeAdapter::new()),
+        };
+        let r = Rig::with_adapter(
+            engine,
+            home.path(),
+            state.path(),
+            TokenFiles::default(),
+            Arc::new(HeldSource { inner, gate }),
+        );
+        let named = SessionId::new();
+        let (terminal, _) = r.start(engine, work.path(), Some(named));
+        let native = "5d2c8e1f-3a4b-4c6d-9e7f-0a1b2c3d4e5f";
+        match engine {
+            Engine::Codex => {
+                place_codex(home.path(), native, work.path());
+            }
+            _ => place_opencode(home.path(), native, work.path()),
+        }
+        r.runtime.kill(terminal).unwrap();
+        drop(opens);
+        let found = r.discovered(native);
+        assert_eq!(
+            found.id, named,
+            "a transcript written before exit must keep the dispatch session"
+        );
+        assert_eq!(found.terminal, Some(terminal));
+        assert_eq!(sessions_named(&r.sink.events()), [named]);
+        assert_eq!(r.commands.started(named), Started::Exited);
+        r.runner.stop();
+    }
+}
+
+#[test]
+fn a_named_first_read_can_be_idle_with_a_finished_turn() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let gate = Arc::new(Gate::default());
+    let opens = Opens(gate.clone());
+    let r = Rig::with_adapter(
+        Engine::Codex,
+        home.path(),
+        state.path(),
+        TokenFiles::default(),
+        Arc::new(HeldSource {
+            inner: Arc::new(CodexAdapter::new()),
+            gate,
+        }),
+    );
+    let named = SessionId::new();
+    r.start(Engine::Codex, work.path(), Some(named));
+    let native = "5d2c8e1f-3a4b-4c6d-9e7f-0a1b2c3d4e5f";
+    let path = place_codex(home.path(), native, work.path());
+    let mut transcript = std::fs::read_to_string(&path).unwrap();
+    let ended = serde_json::json!({ "timestamp": rfc3339_now(), "type": "event_msg", "payload": { "type": "task_complete", "last_agent_message": "Submitted" } });
+    transcript.push_str(&format!("{ended}\n"));
+    place(&path, transcript.as_bytes());
+    drop(opens);
+    let found = r.discovered(native);
+    assert_eq!(found.id, named);
+    assert_eq!(found.state, SessionState::Idle);
+    let events = r.sink.events();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.body, EventBody::TurnEnded { session, .. } if session == named)),
+        "a finished turn is reported even when first-read state changes are folded"
+    );
+    r.runner.stop();
+}
+
+#[test]
+fn a_redispatch_scans_the_exited_cli_before_retiring_its_terminal() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let gate = Arc::new(Gate::default());
+    let opens = Opens(gate.clone());
+    let r = Rig::with_adapter(
+        Engine::Codex,
+        home.path(),
+        state.path(),
+        TokenFiles::default(),
+        Arc::new(HeldSource {
+            inner: Arc::new(CodexAdapter::new()),
+            gate,
+        }),
+    );
+    let first = SessionId::new();
+    let (terminal, _) = r.start(Engine::Codex, work.path(), Some(first));
+    let native = "5d2c8e1f-3a4b-4c6d-9e7f-0a1b2c3d4e5f";
+    place_codex(home.path(), native, work.path());
+    r.runtime.kill(terminal).unwrap();
+    let next = SessionId::new();
+    let commands = r.commands.clone();
+    let command = start(Engine::Codex, work.path(), Some(next));
+    let starting = std::thread::spawn(move || commands.run(CommandId::new(), &command));
+    drop(opens);
+    assert!(matches!(
+        starting.join().unwrap(),
+        CommandOutcome::Ok { .. }
+    ));
+    assert_eq!(r.discovered(native).id, first);
+    assert_eq!(r.terminals.terminal_of(first).unwrap(), Some(terminal));
+    assert!(
+        !r.commands.retire(first).unwrap(),
+        "an adopted session keeps its terminal"
+    );
+    assert_eq!(r.commands.started(first), Started::Exited);
+    let new_native = "6e3d9f20-4b5c-4d7e-8f90-1b2c3d4e5f60";
+    place_codex(home.path(), new_native, work.path());
+    assert_eq!(r.discovered(new_native).id, next);
     r.runner.stop();
 }

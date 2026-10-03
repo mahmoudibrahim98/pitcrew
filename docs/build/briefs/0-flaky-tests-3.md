@@ -1,4 +1,4 @@
-# Brief 0 · Two more flaky tests
+# Brief 0 · Three more flaky tests
 
 - **Stream:** 0 · Contracts (cross-stream test fixes).
   **Branch:** `integrator/flaky-tests-3`.
@@ -25,6 +25,13 @@ Keep what each test checks. Make it wait for the condition, not for a guess at a
    - **Fix:** wait (with a deadline) for the summary line, or log it before the final frame is sent,
      if that's the better order for the product. Keep the checks that the line holds the counts and
      no path.
+
+3. **The desktop `wsl` test target** (`apps/desktop/src-tauri/tests/wsl.rs`).
+   - **Seen:** on macOS CI (#40's run), the target exited with `Error("trailing characters", line: 1,
+     column: 747)`, though it passes on `main` and on other pull requests. Something it parses (a
+     command's output, or two outputs run together) is sometimes more than one JSON value.
+   - **Fix:** find what it reads and make that robust; keep what it checks. The path list grows by
+     `apps/desktop/src-tauri/tests/wsl.rs` and the code it tests, if the cause is there.
 
 ## Acceptance
 

@@ -626,7 +626,8 @@ to the task (`src/dispatch.rs`; hub-work's README, "Dispatch", for what is recor
   progress.
 - **Reconciling** (`reconcile`, a task of the daemon): at start, when the runner attaches, and
   after each start of a session the hub stored ahead of the runner, it looks at the sessions on
-  the runner's machine still `starting` with no CLI id (`unreported_sessions`), then again with
+  the runner's machine still `starting` with no CLI id, plus sessions with active dispatches
+  after adoption (`reconciling_sessions`), then again with
   a pause growing from 1 s to a minute while any waits. A start still under way is left alone,
   however long the runner takes: this hub's own (`Attached::starting`, held by the dispatcher and
   by `POST /v1/sessions` from before the runner is asked until it answers) is not even asked
@@ -638,7 +639,11 @@ to the task (`src/dispatch.rs`; hub-work's README, "Dispatch", for what is recor
   ends, and the runner retires its terminal (`RunnerCommands::retire`), so no later transcript
   is taken for it. So is a Codex or OpenCode session whose transcript has not appeared within
   the runner's 15-minute claim window (`Started::TooLate`), at once: none can be matched to it
-  any more; its CLI is left running in its terminal. With no runner attached it waits.
+  any more; its CLI is left running in its terminal. Before calling an exited unreported CLI
+  gone, the runner scans existing transcripts for adoption. `Started::Exited` keeps waiting
+  until that adoption reaches the hub; after it does, terminal exit ends the session and cancels
+  the dispatch without an end hook. A report that finished the dispatch meanwhile keeps its
+  outcome. With no runner attached it waits.
 - **`POST /v1/sessions` with `agent` or `task`** goes through the same adoption: the hub stores
   the session first (`record_start`; `403` for an agent the caller does not own), then the CLI
   starts under its id (see "Terminals"). A start the runner has not answered within

@@ -1,0 +1,1 @@
+ALTER TABLE terminals ADD COLUMN folder_claim_closed INTEGER NOT NULL DEFAULT 0;

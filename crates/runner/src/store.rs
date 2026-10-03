@@ -22,6 +22,7 @@ use std::time::Duration;
 const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_transcripts.sql"),
     include_str!("../migrations/0002_links_and_commands.sql"),
+    include_str!("../migrations/0003_folder_claims.sql"),
 ];
 
 const DB_FILE: &str = "runner.sqlite3";
@@ -496,6 +497,17 @@ impl Store {
         Ok(())
     }
 
+    /// A final discovery matched everything already written by an exited CLI. Keep its
+    /// terminal for commands/retirement, but do not take later folder transcripts, after a
+    /// restart either. Exact CLI-id matches (Claude) are unaffected.
+    pub fn close_folder_claim(&self, terminal: TerminalId) -> Result<(), StoreError> {
+        self.conn.execute(
+            "UPDATE terminals SET folder_claim_closed = 1 WHERE terminal_id = ?1 AND native_id IS NULL",
+            [terminal.0.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn unlink_session(&self, session: SessionId) -> Result<(), StoreError> {
         self.conn.execute(
             "DELETE FROM terminals WHERE session_id = ?1",
@@ -511,6 +523,7 @@ impl Store {
         let mut stmt = self.conn.prepare_cached(&format!(
             "SELECT {TERMINAL_COLUMNS} FROM terminals
              WHERE engine = ?1
+               AND (native_id IS NOT NULL OR folder_claim_closed = 0)
                AND (session_id IS NULL
                     OR NOT EXISTS (SELECT 1 FROM transcripts
                                    WHERE transcripts.session_id = terminals.session_id))
@@ -720,7 +733,7 @@ fn move_row(
 /// Whether terminal `t`, still waiting for its transcript, could be `found`'s by folder: started
 /// for a CLI whose id is not chosen in advance, in its folder, within the claim window (as of
 /// `now`), and no later than it (with [`CLAIM_SLACK_MS`] of slack).
-fn by_folder(t: &TerminalRow, found: &Found<'_>, now: TimestampMs) -> bool {
+pub(crate) fn by_folder(t: &TerminalRow, found: &Found<'_>, now: TimestampMs) -> bool {
     t.native_id.is_none()
         && found.cwd.is_some_and(|c| same_dir(c, &t.cwd))
         && t.started_at >= now.saturating_sub(CLAIM_WINDOW_MS)
@@ -1173,6 +1186,38 @@ mod tests {
     }
 
     #[test]
+    fn a_closed_folder_claim_stays_closed_after_reopening() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open");
+        let now = 10_000_000;
+        let dead = terminal(Engine::Codex, None, "/w", now);
+        store.put_terminal(&dead).expect("put");
+        store.close_folder_claim(dead.terminal).expect("close");
+        drop(store);
+        let store = Store::open(dir.path()).expect("reopen");
+        let found = found(
+            SessionId::new(),
+            Engine::Codex,
+            "later-cli",
+            "/w",
+            now + 1000,
+        );
+        assert_eq!(
+            store
+                .claim_terminal(&found, now + 1000, &[])
+                .expect("claim"),
+            None
+        );
+        assert!(
+            store
+                .waiting_in(Engine::Codex, "/w", now + 1000)
+                .expect("waiting")
+                .is_empty()
+        );
+        assert_eq!(store.terminals().expect("terminal retained"), vec![dead]);
+    }
+
+    #[test]
     fn started_terminals_are_claimed_by_their_sessions() {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open");
@@ -1407,7 +1452,7 @@ mod tests {
                 err,
                 StoreError::TooNew {
                     found: 99,
-                    known: 2
+                    known: 3
                 }
             ),
             "{err}"

@@ -825,6 +825,122 @@ fn pap5(work: &WorkService) -> pitcrew_protocol::model::Task {
         .expect("task")
 }
 
+#[tokio::test]
+async fn a_first_read_with_a_finished_turn_moves_the_task() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner = Recorder::new(Answer::Start);
+    let work = service(dir.path(), Some(runner));
+    let (dispatch_id, session) = dispatched(&work).await;
+    let ended = || EventBody::TurnEnded {
+        session,
+        receipt: pitcrew_protocol::model::Receipt::Transcript {
+            session,
+            offset: 123,
+        },
+    };
+    runner_reports(
+        &work,
+        vec![restated(&work, session, SessionState::Idle), ended()],
+    );
+    assert_eq!(
+        pap5(&work).status,
+        TaskStatus::InProgress,
+        "a finished first turn is evidence that the dispatched session worked"
+    );
+    assert_eq!(
+        work.session(&session).expect("session").state,
+        SessionState::Idle
+    );
+    work.move_task(&person(SAM), &TaskRef::Id(pap5(&work).id), TaskStatus::Todo)
+        .expect("back");
+    runner_reports(&work, vec![ended()]);
+    assert_eq!(
+        pap5(&work).status,
+        TaskStatus::Todo,
+        "later turns respect a person's move"
+    );
+    work.move_task(
+        &person(SAM),
+        &TaskRef::Id(pap5(&work).id),
+        TaskStatus::InProgress,
+    )
+    .expect("forward");
+    work.move_task(
+        &agent(RUNNER),
+        &TaskRef::Id(pap5(&work).id),
+        TaskStatus::Review,
+    )
+    .expect("report accepted");
+    assert_eq!(
+        work.dispatch(&dispatch_id).expect("dispatch").outcome,
+        Some(DispatchOutcome::Succeeded)
+    );
+}
+
+#[tokio::test]
+async fn a_cli_exit_releases_the_dispatch_and_preserves_a_report_that_won() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let work = service(dir.path(), Some(Recorder::new(Answer::Start)));
+    let (first, session) = dispatched(&work).await;
+    runner_reports(&work, vec![restated(&work, session, SessionState::Idle)]);
+    let machine = work.session(&session).expect("session").machine;
+    assert!(
+        work.reconciling_sessions(&machine)
+            .expect("reconciling")
+            .iter()
+            .any(|s| s.id == session)
+    );
+    assert!(
+        !work
+            .reconciling_sessions(&MachineId::new())
+            .expect("other machine")
+            .iter()
+            .any(|s| s.id == session)
+    );
+    work.dispatched_cli_exited(&session).expect("exit");
+    assert_eq!(
+        work.dispatch(&first).expect("dispatch").outcome,
+        Some(DispatchOutcome::Canceled)
+    );
+    assert_eq!(
+        work.session(&session).expect("session").state,
+        SessionState::Ended
+    );
+    let rev = work.store().latest_rev().expect("rev");
+    work.dispatched_cli_exited(&session).expect("repeat");
+    assert_eq!(work.store().latest_rev().expect("rev"), rev);
+    assert!(
+        !work
+            .reconciling_sessions(&machine)
+            .expect("ended")
+            .iter()
+            .any(|s| s.id == session)
+    );
+    let (second, next) = dispatched(&work).await;
+    runner_reports(&work, vec![restated(&work, next, SessionState::Working)]);
+    work.move_task(
+        &agent(RUNNER),
+        &TaskRef::Id(pap5(&work).id),
+        TaskStatus::Review,
+    )
+    .expect("report");
+    let rev = work.store().latest_rev().expect("rev");
+    work.dispatched_cli_exited(&next)
+        .expect("exit after report");
+    assert_eq!(
+        work.dispatch(&second).expect("dispatch").outcome,
+        Some(DispatchOutcome::Succeeded)
+    );
+    assert_eq!(work.store().latest_rev().expect("rev"), rev);
+    assert!(
+        !work
+            .reconciling_sessions(&machine)
+            .expect("reported")
+            .iter()
+            .any(|s| s.id == next)
+    );
+}
+
 /// The task moves with its dispatched session: to in progress the first time it works (once: a
 /// person who moves it back is not overruled by the next turn), and the agent's report (its move
 /// to review) finishes the dispatch as succeeded in the same transaction.

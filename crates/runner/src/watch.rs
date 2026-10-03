@@ -197,6 +197,9 @@ struct Signals {
     signals_warned_at: Option<Instant>,
     /// Workstream locations changed: link every session again.
     relink: bool,
+    /// An exited terminal gets one final discovery before it stops accepting transcripts.
+    exit_scans: Vec<(TerminalId, SyncSender<bool>)>,
+    exhausted: HashSet<TerminalId>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -261,6 +264,25 @@ impl Shared {
     pub fn rescan(&self) {
         self.lock().rediscover_at = Some(Instant::now());
         self.cv.notify_one();
+    }
+
+    /// Waits for the watcher to match transcripts already written by an exited CLI. No index
+    /// or runtime lock may be held while waiting. A failed scan must not retire the terminal.
+    pub fn scan_exit(&self, terminal: TerminalId) -> bool {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        {
+            let mut s = self.lock();
+            if s.exhausted.contains(&terminal) {
+                return true;
+            }
+            if s.stop {
+                return false;
+            }
+            s.exit_scans.push((terminal, tx));
+            s.rediscover_at = Some(Instant::now());
+        }
+        self.cv.notify_one();
+        rx.recv_timeout(Duration::from_secs(30)).unwrap_or(false)
     }
 
     /// Hands a reported state to the watcher. It never blocks: a hook must not wait. When too
@@ -970,6 +992,7 @@ impl Watcher {
                     look,
                     reports: s.reports.drain(..).collect(),
                     relink: std::mem::take(&mut s.relink),
+                    exit_scans: std::mem::take(&mut s.exit_scans),
                 });
             }
             s = shared
@@ -1034,8 +1057,90 @@ impl Watcher {
                 t.next_poll = after(Instant::now(), t.poll_every);
             }
         }
+        if !wake.exit_scans.is_empty() {
+            for (terminal, reply) in wake.exit_scans {
+                let closed = self.exit_scan_complete(terminal)
+                    && self.store_lock().close_folder_claim(terminal).is_ok();
+                if closed {
+                    self.shared.lock().exhausted.insert(terminal);
+                }
+                let _ = reply.send(closed);
+            }
+        }
         self.let_go();
         Ok(())
+    }
+
+    /// Only this terminal's engine and possible transcripts can hold its final scan open.
+    fn exit_scan_complete(&mut self, terminal: TerminalId) -> bool {
+        let terminals = match self.store_lock().terminals() {
+            Ok(terminals) => terminals,
+            Err(e) => {
+                tracing::warn!(%terminal, error = %e, "cannot look up the terminal's final scan");
+                return false;
+            }
+        };
+        let Some(terminal) = terminals.into_iter().find(|t| t.terminal == terminal) else {
+            return true;
+        };
+        let Some(engine) = terminal.engine else {
+            return true;
+        };
+        if self
+            .homes
+            .iter()
+            .any(|h| h.engine == engine && h.discover_failing)
+        {
+            return false;
+        }
+        let unread: Vec<u64> = self
+            .tracked
+            .iter()
+            .filter(|(_, t)| t.engine == engine && !t.discovered && !t.subagent)
+            .map(|(id, _)| *id)
+            .collect();
+        let now = crate::now_ms();
+        for id in unread {
+            if !self.load(id) {
+                return false;
+            }
+            let Some(t) = self.tracked.get_mut(&id) else {
+                return false;
+            };
+            let caught_up = t.caught_up;
+            let Some(row) = t.row() else {
+                return false;
+            };
+            if terminal.session == Some(row.session) {
+                return false;
+            }
+            let native = native_id(row);
+            if let Some(expected) = &terminal.native_id {
+                if *expected == native {
+                    return false;
+                }
+                continue;
+            }
+            // A successful read with no metadata cannot be claimed by folder. A failed or
+            // unfinished read may still reveal this terminal's folder on the next attempt.
+            let Some(meta) = &row.meta else {
+                if !caught_up {
+                    return false;
+                }
+                continue;
+            };
+            let found = store::Found {
+                session: row.session,
+                engine,
+                native_id: &native,
+                cwd: meta.cwd.as_deref(),
+                started: meta.started.unwrap_or(now),
+            };
+            if store::by_folder(&terminal, &found, now) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Checks every transcript of one home by size and mtime.
@@ -2180,9 +2285,8 @@ impl Watcher {
     /// The terminal the runner started a newly discovered session in, if it did, and the session
     /// the hub named for it, which the transcript then adopts (its row is moved in the index).
     ///
-    /// A terminal matched by folder whose program has ended is not this transcript's: a CLI that
-    /// was killed, or ended, before its transcript appeared never writes one. The runtime is
-    /// asked about those terminals without the index locked.
+    /// An exited terminal can still own an unread transcript. It stops accepting folder matches
+    /// only after its final scan has completed; the runtime is asked without the index locked.
     fn claim_terminal(
         &self,
         session: SessionId,
@@ -2208,7 +2312,7 @@ impl Watcher {
             });
         let ended: Vec<TerminalId> = candidates
             .into_iter()
-            .filter(|t| self.shared.has_ended(*t))
+            .filter(|t| self.shared.has_ended(*t) && self.shared.lock().exhausted.contains(t))
             .collect();
         if !ended.is_empty() {
             tracing::debug!(%session, ?ended, "terminals in the folder whose program ended are not matched");
@@ -2291,6 +2395,7 @@ struct Wake {
     look: bool,
     reports: Vec<Signal>,
     relink: bool,
+    exit_scans: Vec<(TerminalId, SyncSender<bool>)>,
 }
 
 /// Whether a home is polled, and whether it is slow (a network filesystem, swept and rediscovered

@@ -275,7 +275,8 @@ another person's agent or one with no owner (explicit sharing may come later).
   still waits for its transcript: the two could not be told apart), `503` (the machine or its
   terminals cannot be reached) or `500`.
 - **The task moves itself** (the hub, following what the runner reports):
-  - when the session first reports `working`, the task moves to in progress (`task_moved`, mover
+  - when the session first reports `working`, or reports a finished transcript turn (including
+    a first read whose final state is already idle), the task moves to in progress (`task_moved`, mover
     `agent`, authored by the agent for its owner), if an agent may move it there;
   - when the agent reports the work done, by moving its task to review (`pitcrew report <task>
     --review`), the dispatch finishes as `succeeded` (`dispatch_finished`) in the same
@@ -283,14 +284,18 @@ another person's agent or one with no owner (explicit sharing may come later).
     agent's move answers `200` with the task, unchanged, and the dispatch succeeds. The back
     office moves a task still in progress to review when a dispatch succeeds
     (`dispatch_to_review`);
-  - when the session ends without that report, the dispatch finishes as `canceled`, summary "The
+  - when the session ends without that report, including its terminal's CLI exiting without an
+    end hook, the dispatch finishes as `canceled`, summary "The
     session ended without a report." (it stopped work), or as `failed`, summary "The session
     ended before its CLI started.", if the runner never reported the session;
   - when its CLI never started (the hub stopped between the dispatch and the start, or the CLI
-    ended before its transcript appeared), or a Codex or OpenCode CLI's transcript did not appear
+    ended without writing a transcript), or a Codex or OpenCode CLI's transcript did not appear
     within 15 minutes of its start (past that, no transcript is matched to it by folder), the hub
     finishes the dispatch as `failed` and ends the session, at its next start or once it sees
-    that. A start still under way is never taken for one that did not start.
+    that. Before retiring an exited terminal, the runner scans and matches transcripts already
+    written: exit before the watcher's first read does not prevent adoption. Active dispatches
+    remain watched after adoption, until a report or terminal exit finishes them. A start still
+    under way is never taken for one that did not start.
   A person can always move the task themselves; the session's later turns do not move it back. A
   session the hub ended stays ended: the runner re-stating it (`session_discovered`) does not
   bring it back.

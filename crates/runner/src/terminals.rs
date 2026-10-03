@@ -2,8 +2,9 @@
 //!
 //! The runner owns the session → terminal mapping. It holds the terminals it started (linked to
 //! their session once its transcript is found, see `RunnerCommands`) and those linked by hand,
-//! in its own index, with each one's tmux target (for people to attach). A link is kept only
-//! while the runtime lists its terminal **by that id**: a runtime keeps a terminal's id across a
+//! in its own index, with each one's tmux target (for people to attach). A named CLI start keeps
+//! its row even after the terminal disappears, as evidence for dispatch reconciliation. Other
+//! links are kept only while the runtime lists their terminal **by that id**: a runtime keeps a terminal's id across a
 //! restart (tmux tags each pane with it), and a target alone is never followed, since another
 //! server can reuse it for a terminal that is not this one.
 //!
@@ -171,7 +172,9 @@ impl RunnerTerminals {
             .and_then(|t| t.session))
     }
 
-    /// Forgets the terminals the runtime no longer lists by their id. A terminal listed under
+    /// Forgets the terminals the runtime no longer lists by their id, except CLI starts with a
+    /// session: their rows preserve exit evidence for reconciliation after a restart.
+    /// A terminal listed under
     /// another id is not this one, even with the same tmux target: another server (after a
     /// restart, or another daemon's) may have given that target to a different terminal.
     pub fn refresh(&self) {
@@ -192,6 +195,10 @@ impl RunnerTerminals {
         };
         for row in rows {
             if listed.iter().any(|t| t.id == row.terminal) {
+                continue;
+            }
+            if row.engine.is_some() && row.session.is_some() {
+                // A missing terminal must still distinguish this start from an imported session.
                 continue;
             }
             tracing::debug!(terminal = %row.terminal, "a terminal is gone; forgetting it");
