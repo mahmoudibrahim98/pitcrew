@@ -1,8 +1,8 @@
 // The first-run wizard at `paths.setup(ws)` (`/w/$ws/onboarding`), where the shell sends a
 // workspace that needs setup. A lazy route component (`routes.tsx`), so it is its own chunk.
 //
-// It runs against the real hub (`hub-api.ts`): Welcome, Workspace, Scan, Create, Done. A workspace
-// that is set up already goes Home instead, unless this visit is the one that set it up (its Done step is
+// It runs against the real hub (`hub-api.ts`): Welcome, Workspace, Scan, Create, Done (a remote
+// hub's, without Scan and Create). A workspace that is set up already goes Home instead, unless this visit is the one that set it up (its Done step is
 // still to come). A development build can run every step against the fake instead with
 // `?onboarding=fake`; a production build cannot (the branch, and the fake with it, is dropped at
 // build time).
@@ -52,8 +52,14 @@ function HubFirstRun() {
   // Set as the setup is sent, before the hub answers: the cache then says "set up", and this
   // visit's own Done step must still show rather than be sent Home.
   const [sent, setSent] = useState(false);
+  // A remote hub's own machine is that machine, not this computer: start from the gateway's name.
+  const remoteName = gateway?.kind === 'remote' ? gateway.name : undefined;
+  // The scan reads the hub's own machine's agent homes, which on a remote hub are the remote
+  // machine's: scanning one is a later step, so a remote hub's first run stays without Scan and
+  // Create.
+  const scanData = remoteName === undefined ? data : undefined;
   const api = useMemo((): OnboardingApi => {
-    const hub = createHubOnboardingApi({ setUp, remote, data });
+    const hub = createHubOnboardingApi({ setUp, remote, data: scanData });
     return {
       ...hub,
       setupWorkspace: (input) => {
@@ -61,9 +67,7 @@ function HubFirstRun() {
         return hub.setupWorkspace(input);
       },
     };
-  }, [setUp, remote, data]);
-  // A remote hub's own machine is that machine, not this computer: start from the gateway's name.
-  const remoteName = gateway?.kind === 'remote' ? gateway.name : undefined;
+  }, [setUp, remote, scanData]);
   const defaults = useMemo(
     (): WizardDefaults =>
       remoteName === undefined ? {} : { machineName: remoteName, machineLabel: 'The remote machine’s name' },

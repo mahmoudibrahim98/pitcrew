@@ -65,8 +65,10 @@ Scan, Create, Done**, then Home:
 
 The other steps (machine check, helper install, sign-in, integrations, import, hooks, safety) need
 routes that do not exist yet, so `createHubOnboardingApi` lists their calls in `unavailable` and
-`stepsFor` leaves them out. They come back, unchanged, as their routes land. The connect wizard's
-setup of a remote workspace passes no data client, so it stays Welcome, Workspace, Done.
+`stepsFor` leaves them out. They come back, unchanged, as their routes land. A remote workspace
+(the desktop's gateway says `kind: 'remote'`) gets no data client, so its first run, like the
+connect wizard's setup of one, stays Welcome, Workspace, Done: its hub's own machine is the remote
+one, and scanning a remote machine is a later step.
 
 ### Creating from the scan
 
