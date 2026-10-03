@@ -19,6 +19,7 @@ pub type TimestampMs = i64;
 
 /// A calendar date without a time zone, written `YYYY-MM-DD`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(transparent)]
 pub struct Date(pub String);
 
@@ -45,6 +46,7 @@ impl Date {
 
 /// A workspace: one context, such as "PhD research", hosted by one hub.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Workspace {
     /// Id.
     pub id: crate::ids::WorkspaceId,
@@ -56,6 +58,7 @@ pub struct Workspace {
 
 /// The agent CLI a session runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum Engine {
@@ -69,6 +72,7 @@ pub enum Engine {
 
 /// How a machine is reached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum MachineKind {
     /// The computer the desktop app runs on.
@@ -82,6 +86,7 @@ pub enum MachineKind {
 /// Whether a machine can be reached. **Loss of contact is not death:** an unreachable machine is
 /// `Unverifiable`, and its last known state is still shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Liveness {
     /// Connected, and the runner answers.
@@ -94,6 +99,7 @@ pub enum Liveness {
 
 /// A batch scheduler found on a machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum Scheduler {
@@ -103,6 +109,7 @@ pub enum Scheduler {
 
 /// Facts a runner reports about its machine.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct MachineInfo {
     /// Host name as the machine reports it.
     pub hostname: String,
@@ -114,6 +121,7 @@ pub struct MachineInfo {
     pub has_tmux: bool,
     /// The batch scheduler, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub scheduler: Option<Scheduler>,
     /// Whether the home directory is on a network filesystem (e.g. NFS). This changes storage
     /// rules; see ADR-0004.
@@ -123,6 +131,7 @@ pub struct MachineInfo {
 
 /// A machine known to a workspace.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Machine {
     /// Id.
     pub id: MachineId,
@@ -132,6 +141,7 @@ pub struct Machine {
     pub kind: MachineKind,
     /// Last reported facts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub info: Option<MachineInfo>,
     /// Whether it can be reached now.
     pub liveness: Liveness,
@@ -140,6 +150,7 @@ pub struct Machine {
 /// A folder (and optionally a git branch) on a machine. This is how sessions are linked to
 /// projects and workstreams.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Location {
     /// The machine.
     pub machine: MachineId,
@@ -147,6 +158,7 @@ pub struct Location {
     pub path: String,
     /// The git branch, when the location is branch-specific.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub branch: Option<String>,
 }
 
@@ -154,6 +166,7 @@ pub struct Location {
 
 /// Whether a member is a person or an agent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum MemberKind {
     /// A person.
@@ -164,6 +177,7 @@ pub enum MemberKind {
 
 /// A member of a workspace. People and agents share this shape.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Member {
     /// Id.
     pub id: MemberId,
@@ -175,9 +189,11 @@ pub struct Member {
     pub name: String,
     /// The owning person. Required for agents; absent for people.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub owner: Option<MemberId>,
     /// The persona an agent was created from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub persona: Option<PersonaId>,
 }
 
@@ -195,6 +211,7 @@ impl Member {
 /// How an agent CLI handles permission prompts. The default is the CLI's own behaviour, which
 /// asks. Bypassing is an explicit per-workspace opt-in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
     /// The CLI's own default: it asks before risky actions.
@@ -211,6 +228,7 @@ pub enum PermissionMode {
 
 /// A reusable recipe for new agents.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Persona {
     /// Id.
     pub id: PersonaId,
@@ -220,9 +238,11 @@ pub struct Persona {
     pub engine: Engine,
     /// Model identifier passed to the CLI, if not its default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub model: Option<String>,
     /// Standing instructions given to every agent made from this persona.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub instructions: Option<String>,
     /// Permission mode.
     #[serde(default)]
@@ -231,6 +251,7 @@ pub struct Persona {
 
 /// A group of members with a lead, such as "Paper team".
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Team {
     /// Id.
     pub id: TeamId,
@@ -246,6 +267,7 @@ pub struct Team {
 
 /// A link to an item in an external system.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ExternalRef {
     /// The system.
     pub system: ExternalSystem,
@@ -253,11 +275,13 @@ pub struct ExternalRef {
     pub key: String,
     /// A link to open it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub url: Option<String>,
 }
 
 /// External systems PitCrew links to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ExternalSystem {
@@ -273,6 +297,7 @@ pub enum ExternalSystem {
 
 /// Status of a project.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectStatus {
     /// Being planned.
@@ -287,6 +312,7 @@ pub enum ProjectStatus {
 
 /// A project: a deliverable such as a paper, a thesis part or a product.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Project {
     /// Id.
     pub id: ProjectId,
@@ -303,12 +329,15 @@ pub struct Project {
     pub members: Vec<MemberId>,
     /// Start date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub start: Option<Date>,
     /// Due date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub due: Option<Date>,
     /// The root folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub root: Option<Location>,
     /// Linked external items, such as a repository or a Jira project.
     #[serde(default)]
@@ -317,6 +346,7 @@ pub struct Project {
 
 /// Status of a workstream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkstreamStatus {
     /// A candidate, not started.
@@ -333,6 +363,7 @@ pub enum WorkstreamStatus {
 
 /// Health of an active workstream. It is derived from events, and a person can override it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Health {
     /// On track.
@@ -345,6 +376,7 @@ pub enum Health {
 
 /// A workstream: one line of work inside a project, such as "Seed campaign".
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Workstream {
     /// Id.
     pub id: WorkstreamId,
@@ -368,6 +400,7 @@ pub struct Workstream {
 
 /// Status of a task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     /// Not planned yet.
@@ -386,6 +419,7 @@ pub enum TaskStatus {
 
 /// Who is asking to move a task. The hub checks every move with [`TaskStatus::can_move`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Mover {
     /// A person.
@@ -446,6 +480,7 @@ impl TaskStatus {
 
 /// Priority of a task.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
     /// Urgent.
@@ -463,6 +498,7 @@ pub enum Priority {
 
 /// Where a subtask came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SubtaskSource {
     /// Added by a person.
@@ -476,6 +512,7 @@ pub enum SubtaskSource {
 
 /// One checklist line on a task.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Subtask {
     /// Id.
     pub id: SubtaskId,
@@ -489,6 +526,7 @@ pub struct Subtask {
 
 /// A task: something a person or an agent finishes.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Task {
     /// Id.
     pub id: TaskId,
@@ -498,6 +536,7 @@ pub struct Task {
     pub project: ProjectId,
     /// The workstream, if any. Small projects may have tasks without one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub workstream: Option<WorkstreamId>,
     /// Title.
     pub title: String,
@@ -511,21 +550,25 @@ pub struct Task {
     pub priority: Priority,
     /// The assignee: a person or an agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub assignee: Option<MemberId>,
     /// Labels.
     #[serde(default)]
     pub labels: Vec<String>,
     /// Start date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub start: Option<Date>,
     /// Due date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub due: Option<Date>,
     /// Tasks that must finish first.
     #[serde(default)]
     pub blocked_by: Vec<TaskId>,
     /// The external item this task mirrors, such as a GitHub issue or a Jira issue.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub source: Option<ExternalRef>,
     /// Whether review can complete without a person (see [`Mover::BackOffice`]).
     #[serde(default)]
@@ -542,33 +585,43 @@ pub struct Task {
 /// clears them, which is `Some(None)` here. On the other fields `null` counts as left out. Status,
 /// assignee and subtasks change through their own routes and events.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct TaskPatch {
     /// New workstream; `Some(None)` takes the task out of its workstream.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "nullable")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Option<WorkstreamId>>", optional))]
     pub workstream: Option<Option<WorkstreamId>>,
     /// New title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub title: Option<String>,
     /// New description.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub description: Option<String>,
     /// New priority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub priority: Option<Priority>,
     /// New labels: the whole list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub labels: Option<Vec<String>>,
     /// New start date; `Some(None)` clears it.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "nullable")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Option<Date>>", optional))]
     pub start: Option<Option<Date>>,
     /// New due date; `Some(None)` clears it.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "nullable")]
+    #[cfg_attr(feature = "ts", ts(as = "Option<Option<Date>>", optional))]
     pub due: Option<Option<Date>>,
     /// New list of tasks that must finish first: the whole list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub blocked_by: Option<Vec<TaskId>>,
     /// New acceptance policy (see [`Mover::BackOffice`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub accept_auto: Option<bool>,
 }
 
@@ -644,6 +697,7 @@ mod nullable {
 
 /// State of a session, derived from hooks, transcripts and the terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum SessionState {
     /// Launched; no transcript yet.
@@ -663,6 +717,7 @@ pub enum SessionState {
 /// Why a session is linked to a workstream or task. Links made by a person or a dispatch are never
 /// overridden by inference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum LinkBasis {
     /// Started by a dispatch.
@@ -681,6 +736,7 @@ pub enum LinkBasis {
 
 /// One CLI conversation on one machine.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Session {
     /// Id.
     pub id: SessionId,
@@ -694,26 +750,33 @@ pub struct Session {
     pub cwd: String,
     /// Git branch at the start of the session, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub branch: Option<String>,
     /// Title, from the CLI or a person.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub title: Option<String>,
     /// The agent member running it. Absent for unnamed runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub agent: Option<MemberId>,
     /// Linked workstream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub workstream: Option<WorkstreamId>,
     /// Linked task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub task: Option<TaskId>,
     /// Why it is linked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub link_basis: Option<LinkBasis>,
     /// Current state.
     pub state: SessionState,
     /// A one-line status, e.g. "Running tests → 212 of 240".
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub status_line: Option<String>,
     /// When it started.
     pub started: TimestampMs,
@@ -721,14 +784,17 @@ pub struct Session {
     pub last_activity: TimestampMs,
     /// The terminal it runs in, if the runner owns one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub terminal: Option<TerminalId>,
     /// For a sub-agent's session, the session that started it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub parent: Option<SessionId>,
 }
 
 /// How a dispatch ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchOutcome {
     /// The agent reports the work done.
@@ -741,6 +807,7 @@ pub enum DispatchOutcome {
 
 /// One attempt at a task by one agent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Dispatch {
     /// Id.
     pub id: DispatchId,
@@ -750,6 +817,7 @@ pub struct Dispatch {
     pub agent: MemberId,
     /// The session running it, once started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub session: Option<SessionId>,
     /// The brief the agent was given.
     pub brief: String,
@@ -757,12 +825,15 @@ pub struct Dispatch {
     pub started: TimestampMs,
     /// End time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub ended: Option<TimestampMs>,
     /// Outcome.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub outcome: Option<DispatchOutcome>,
     /// The agent's closing summary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub summary: Option<String>,
 }
 
@@ -770,6 +841,7 @@ pub struct Dispatch {
 
 /// Evidence behind a claim. Every recap line and every "Where it stands" links to receipts.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Receipt {
     /// A byte offset in a session's transcript.
@@ -812,6 +884,7 @@ pub enum Receipt {
 
 /// Which brief ("Where it stands") something is about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum BriefTarget {
     /// "Where the project stands".
@@ -822,6 +895,7 @@ pub enum BriefTarget {
 
 /// Who wrote the brief currently in force.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum BriefSource {
     /// A person wrote or edited it.
@@ -832,6 +906,7 @@ pub enum BriefSource {
 
 /// The "Where it stands" text of a project or workstream, as currently in force.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Brief {
     /// Which brief.
     pub target: BriefTarget,
@@ -839,6 +914,7 @@ pub struct Brief {
     pub text: String,
     /// The next step, if stated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub next: Option<String>,
     /// Pinned by a person; the back office may then only propose changes.
     pub pinned: bool,
@@ -852,17 +928,20 @@ pub struct Brief {
     /// The pending proposal, present exactly when there is one: the newest `brief_proposed` for
     /// the target, newer than the `brief_accepted` that put this brief in force.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub proposal: Option<BriefProposal>,
 }
 
 /// A new "Where it stands" the back office proposed, waiting for a person to accept it or keep
 /// the current one (see [`Brief::proposal`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct BriefProposal {
     /// Proposed text.
     pub text: String,
     /// Proposed next step, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub next: Option<String>,
     /// Evidence for every claim.
     #[serde(default)]
@@ -873,6 +952,7 @@ pub struct BriefProposal {
 
 /// The kind of ask.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum AskKind {
     /// A question from an agent, such as Claude's AskUserQuestion or a terminal prompt.
@@ -889,6 +969,7 @@ pub enum AskKind {
 
 /// Lifecycle of an ask.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum AskState {
     /// Waiting for an answer.
@@ -901,14 +982,17 @@ pub enum AskState {
 
 /// An answer to an ask.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Answer {
     /// Who answered. For decisions and approvals, always a person.
     pub by: MemberId,
     /// The chosen option's index, if the ask offered options.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub option: Option<usize>,
     /// Free-text answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub text: Option<String>,
     /// When.
     pub at: TimestampMs,
@@ -916,6 +1000,7 @@ pub struct Answer {
 
 /// Something that needs a specific member's answer. Asks are what the Inbox lists.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Ask {
     /// Id.
     pub id: AskId,
@@ -927,9 +1012,11 @@ pub struct Ask {
     pub to: MemberId,
     /// Related task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub task: Option<TaskId>,
     /// Related session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub session: Option<SessionId>,
     /// One-line title.
     pub title: String,
@@ -946,6 +1033,7 @@ pub struct Ask {
     pub state: AskState,
     /// The answer, once given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub answer: Option<Answer>,
     /// When it was raised.
     pub created: TimestampMs,

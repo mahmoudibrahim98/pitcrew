@@ -4,7 +4,6 @@
 #[cfg(windows)]
 mod pipe;
 #[cfg(windows)]
-#[allow(unsafe_code)]
 pub(crate) mod pipe_security;
 #[cfg(unix)]
 mod unix;

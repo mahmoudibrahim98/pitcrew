@@ -3,7 +3,7 @@
   "machine": "Intel(R) Xeon(R) Processor @ 2.10GHz, 4 threads, 16 GiB RAM, linux x86_64",
   "recorded": "2026-10-02",
   "mode": "full",
-  "note": "Cloud VM class: 4 vCPU Intel Xeon @ 2.10GHz under KVM, 16 GiB RAM, Ubuntu 24.04, Linux 6.18, ext4 on a virtio disk, Rust 1.97, tmux 3.4. Only the scale metrics (benches/run.sh --scale-only), added with --extend-baseline on a quiet VM (nothing else running; load average under 0.4 at the start). Five runs of the same code (three with the page cache kept, two with it dropped) agreed within 10% on every best value kept here. scale.first_scan and scale.first_scan.first_session are not here: they are one sample that moved by 9% (the scan, 28.5 to 31.0 s with the page cache dropped) or 25% (the first session, polled every 100 ms) between runs, so they are checked against their budgets only. The four rss.* metrics are not here: they are over their 80 MiB budget, and --extend-baseline adds only metrics within theirs. Compare with: benches/run.sh --scale-only --baseline benches/baseline-cloud-vm.json",
+  "note": "Cloud VM class: 4 vCPU Intel Xeon @ 2.10GHz under KVM, 16 GiB RAM, Ubuntu 24.04, Linux 6.18, ext4 on a virtio disk, Rust 1.97, tmux 3.4. Only the scale metrics (benches/run.sh --scale-only), added with --extend-baseline on a quiet VM (nothing else running; load average under 0.4 at the start). Five runs of the same code (three with the page cache kept, two with it dropped) agreed within 10% on every best value kept here. scale.first_scan and scale.first_scan.first_session are not here: they are one sample that moved by 9% (the scan, 28.5 to 31.0 s with the page cache dropped) or 25% (the first session, polled every 100 ms) between runs, so they are checked against their budgets only. The four rss.* metrics were added on 2026-10-03 by the memory-budget brief, from run A of three 10k runs of the same code (scan peak 43.9-44.3, scan steady 42.7-43.3, restart peak and steady 52.8-52.9 MiB: within 1.6%; load average under 0.6 at the start), on a VM of the same shape whose CPU reported 2.80GHz; before that brief they were over their 80 MiB budget. Compare with: benches/run.sh --scale-only --baseline benches/baseline-cloud-vm.json",
   "metrics": {
     "scale.cold_start": {
       "value": 100.8,
@@ -38,6 +38,26 @@
     "scale.index.after_scan": {
       "value": 12.86,
       "best": 12.86,
+      "unit": "MiB"
+    },
+    "scale.rss.restart_peak": {
+      "value": 52.75,
+      "best": 52.75,
+      "unit": "MiB"
+    },
+    "scale.rss.restart_steady": {
+      "value": 52.75,
+      "best": 52.75,
+      "unit": "MiB"
+    },
+    "scale.rss.scan_peak": {
+      "value": 43.89,
+      "best": 43.89,
+      "unit": "MiB"
+    },
+    "scale.rss.scan_steady": {
+      "value": 42.66,
+      "best": 42.66,
       "unit": "MiB"
     }
   }

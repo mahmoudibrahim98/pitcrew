@@ -1,8 +1,9 @@
 # Brief J · ACL check follow-ups from the macOS review
 
 - **Stream:** J · Remote and HPC. **Branch:** `s/J/acl-followups`. **Paths:** `crates/remote/**`
-  (the helper scripts, their SLURM snapshots, tests and README), and `docs/security/threat-model.md`
-  (R35).
+  (the helper scripts, their SLURM snapshots, tests and README).
+  - `docs/security/threat-model.md` is stream Q's, so this branch can't change it (CI's path guard
+    refuses it). Put the R35 text in the PR body, and the integrator applies it at merge.
 - **First read:** [README.md](README.md), the root `CLAUDE.md`, the `crates/remote` README (the way to
   the root, ACLs, `with_tool_path`), and the review on PR #11 (`#issuecomment-5962544997`).
 
@@ -48,7 +49,7 @@ isn't affected, but the check should fail closed by itself rather than rely on t
 
    If `own_umask()` can read `/proc/self/status` where it exists, do that instead of setting the
    umask and restoring it.
-7. **The threat model:** update R35 with what changed.
+7. **The threat model:** write the updated R35 text in the PR body; the integrator applies it.
 
 ## Acceptance
 

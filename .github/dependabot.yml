@@ -11,6 +11,11 @@ updates:
         update-types: [minor, patch]
   - package-ecosystem: npm
     directory: /
+    ignore:
+      # typescript-eslint 8.71.0 (latest) supports TypeScript <6.1.0; watch for a
+      # released parser/estree version supporting the TypeScript 7 native API.
+      - dependency-name: typescript
+        versions: ["7.x"]
     schedule:
       interval: weekly
     groups:

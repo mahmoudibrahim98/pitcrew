@@ -1,6 +1,6 @@
 //! The command line.
 
-use clap::{ArgAction, Args, Parser, Subcommand};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use pitcrew_protocol::model::Engine;
 use std::ffi::OsString;
 use std::net::SocketAddr;
@@ -116,6 +116,36 @@ pub struct ServeArgs {
     /// directory's own. Its directory must be private (it is made 0700 if missing).
     #[arg(long, value_name = "PATH", hide = true)]
     pub tmux_socket: Option<PathBuf>,
+
+    /// For tests and development only: the pitcrew-ptyd executable the runner's terminals use where
+    /// tmux is not, instead of the one next to pitcrewd.
+    #[arg(long, value_name = "PATH", hide = true)]
+    pub ptyd: Option<PathBuf>,
+
+    /// For tests and development only: where pitcrew-ptyd listens (a socket path on Unix, whose
+    /// directory must be private; a pipe name on Windows), instead of this state directory's own.
+    #[arg(long, value_name = "PATH", hide = true)]
+    pub ptyd_endpoint: Option<PathBuf>,
+
+    /// For tests and development only: how long a pitcrew-ptyd this daemon starts waits with no
+    /// terminal and no client before it exits (its own default is 30 seconds).
+    #[arg(long, value_name = "MS", hide = true)]
+    pub ptyd_idle_exit_ms: Option<u64>,
+
+    /// For tests and development only: `pty` runs the terminals in pitcrew-ptyd even where tmux
+    /// is usable; `auto` (the default) prefers tmux.
+    #[arg(long, value_name = "RUNTIME", hide = true, value_enum, default_value_t = TerminalRuntimeArg::Auto)]
+    pub terminal_runtime: TerminalRuntimeArg,
+}
+
+/// `serve --terminal-runtime`: which runtime the runner's terminals use.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum TerminalRuntimeArg {
+    /// tmux where it is usable, else pitcrew-ptyd.
+    #[default]
+    Auto,
+    /// pitcrew-ptyd, even where tmux is usable (tests and development).
+    Pty,
 }
 
 /// One `--homes` value.
@@ -305,20 +335,63 @@ mod tests {
             args.tmux_socket.is_none(),
             "the state directory's own socket"
         );
+        assert!(args.ptyd.is_none(), "the pitcrew-ptyd next to pitcrewd");
+        assert!(
+            args.ptyd_endpoint.is_none(),
+            "the state directory's own endpoint"
+        );
+        assert!(args.ptyd_idle_exit_ms.is_none());
+        assert_eq!(args.terminal_runtime, TerminalRuntimeArg::Auto);
     }
 
-    /// `--tmux-socket` is for tests and development: it parses, and help does not show it.
+    /// `--tmux-socket`, `--ptyd`, `--ptyd-endpoint`, `--ptyd-idle-exit-ms` and
+    /// `--terminal-runtime` are for tests and development: they parse, and help does not show
+    /// them.
     #[test]
-    fn the_tmux_socket_option_is_hidden() {
-        let cli = Cli::try_parse_from(["pitcrewd", "serve", "--tmux-socket", "/tmp/x/s"]).unwrap();
+    fn the_runtime_options_are_hidden() {
+        let cli = Cli::try_parse_from([
+            "pitcrewd",
+            "serve",
+            "--tmux-socket",
+            "/tmp/x/s",
+            "--ptyd",
+            "/opt/p/pitcrew-ptyd",
+            "--ptyd-endpoint",
+            "/tmp/y/ptyd",
+            "--ptyd-idle-exit-ms",
+            "500",
+            "--terminal-runtime",
+            "pty",
+        ])
+        .unwrap();
         let Some(Command::Serve(args)) = cli.command else {
             panic!("not serve");
         };
         assert_eq!(args.tmux_socket, Some(PathBuf::from("/tmp/x/s")));
+        assert_eq!(args.ptyd, Some(PathBuf::from("/opt/p/pitcrew-ptyd")));
+        assert_eq!(args.ptyd_endpoint, Some(PathBuf::from("/tmp/y/ptyd")));
+        assert_eq!(args.ptyd_idle_exit_ms, Some(500));
+        assert_eq!(args.terminal_runtime, TerminalRuntimeArg::Pty);
+        for bad in [
+            &["--terminal-runtime", "screen"][..],
+            &["--ptyd-idle-exit-ms", "soon"],
+        ] {
+            let mut all = vec!["pitcrewd", "serve"];
+            all.extend_from_slice(bad);
+            assert!(Cli::try_parse_from(all).is_err(), "{bad:?}");
+        }
         let mut command = Cli::command();
         let serve = command.find_subcommand_mut("serve").unwrap();
         let help = serve.render_long_help().to_string();
-        assert!(!help.contains("tmux-socket"), "{help}");
+        for hidden in [
+            "tmux-socket",
+            "--ptyd",
+            "ptyd-endpoint",
+            "idle-exit",
+            "terminal-runtime",
+        ] {
+            assert!(!help.contains(hidden), "{hidden}: {help}");
+        }
     }
 
     #[test]

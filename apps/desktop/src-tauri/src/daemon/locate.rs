@@ -3,7 +3,9 @@
 //! elsewhere.
 //!
 //! **A planted binary is refused.** The app hands the daemon it starts the person's token
-//! directory, so the program must be one only the person (or the system) could have put there:
+//! directory, so the program must be one only the person (or the system) could have put there.
+//! The check is `pitcrew_trust::check_trusted`, the one every program PitCrew launches passes
+//! (the daemon checks `pitcrew-ptyd` with it too):
 //!
 //! - Unix: the file it resolves to, its directory, and the directory of the path as given are each
 //!   owned by root or by us, and none can be written by group or others.
@@ -108,79 +110,22 @@ pub fn locate_named(
 
 /// Whether `path` (a file the app reads or runs) passes the checks in the module's docs: on Unix
 /// it, the file it resolves to and their directories belong to root or us and only we can write
-/// them.
+/// them (`pitcrew_trust::check_trusted`).
 ///
 /// # Errors
 /// Why it does not, for people.
 pub fn check_trusted(path: &Path) -> Result<(), String> {
-    check(path)
+    pitcrew_trust::check_trusted(path)
 }
 
 /// `path`, if it passes the checks in the module's docs.
 fn trusted(path: &Path) -> Result<PathBuf, LocateError> {
-    check(path)
+    check_trusted(path)
         .map(|()| path.to_path_buf())
         .map_err(|reason| LocateError::Untrusted {
             path: path.to_path_buf(),
             reason,
         })
-}
-
-#[cfg(unix)]
-fn check(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt as _;
-    let euid = rustix::process::geteuid().as_raw();
-    let inspect = |what: &Path| -> Result<(), String> {
-        let meta = std::fs::metadata(what).map_err(|e| format!("{}: {e}", what.display()))?;
-        owner_and_mode(meta.uid(), meta.mode(), euid)
-            .map_err(|why| format!("{} {why}", what.display()))
-    };
-    let directory = |of: &Path| -> Result<PathBuf, String> {
-        of.parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .ok_or_else(|| format!("{} has no directory", of.display()))
-    };
-    // Whoever can write the directory of the path as given can swap the program (or the link).
-    inspect(&directory(path)?)?;
-    // The file it resolves to, and that file's directory.
-    let real = std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    inspect(&real)?;
-    inspect(&directory(&real)?)
-}
-
-/// Owned by root or by `euid`, and not writable by group or others.
-#[cfg(unix)]
-fn owner_and_mode(uid: u32, mode: u32, euid: u32) -> Result<(), String> {
-    if uid != 0 && uid != euid {
-        return Err(format!("is owned by another user (uid {uid})"));
-    }
-    if mode & 0o022 != 0 {
-        return Err(format!(
-            "can be written by other users (mode {:o})",
-            mode & 0o7777
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn check(path: &Path) -> Result<(), String> {
-    let mut stream = path.as_os_str().to_owned();
-    stream.push(":Zone.Identifier");
-    if std::fs::metadata(PathBuf::from(stream)).is_ok() {
-        return Err(
-            "it was downloaded from the internet (it has a Zone.Identifier); install it from \
-             the app's installer, or unblock it in its properties"
-                .into(),
-        );
-    }
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn check(_path: &Path) -> Result<(), String> {
-    Ok(())
 }
 
 /// A regular file (following links), executable on Unix.
@@ -282,30 +227,6 @@ mod tests {
             locate(None, Some(tmp.path()), None),
             Err(LocateError::NotFound)
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn only_root_or_us_and_never_writable_by_others() {
-        let us = 1000;
-        for (uid, mode) in [
-            (0, 0o100_755),
-            (us, 0o100_755),
-            (us, 0o040_700),
-            (0, 0o040_555),
-        ] {
-            assert_eq!(owner_and_mode(uid, mode, us), Ok(()), "{uid} {mode:o}");
-        }
-        for (uid, mode) in [
-            (1001, 0o100_755),
-            (65534, 0o040_755),
-            (us, 0o100_775),
-            (us, 0o100_757),
-            (0, 0o041_777),
-            (us, 0o040_770),
-        ] {
-            assert!(owner_and_mode(uid, mode, us).is_err(), "{uid} {mode:o}");
-        }
     }
 
     #[cfg(unix)]

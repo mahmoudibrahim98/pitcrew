@@ -19,7 +19,7 @@ thiserror.workspace = true
 tracing.workspace = true
 ulid.workspace = true
 # OS randomness for tokens. Already in the lockfile through `ulid`.
-getrandom = "=0.3.4"
+getrandom = "=0.4.3"
 
 [target.'cfg(unix)'.dependencies]
 # Effective uid, O_NOFOLLOW and flock without unsafe code. The version tempfile already uses.

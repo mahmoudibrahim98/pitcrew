@@ -20,6 +20,7 @@ pub const API_PREFIX: &str = "/v1";
 
 /// The roles a daemon plays (ADR-0009). A solo workspace runs both in one process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum HostRole {
     /// Holds the workspace's shared state: projects, tasks, events, recaps.
@@ -30,6 +31,7 @@ pub enum HostRole {
 
 /// `GET /v1/host/info`: available before authentication, so version skew can be detected early.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct HostInfo {
     /// Always `pitcrewd`.
     pub name: String,
@@ -50,6 +52,7 @@ pub struct HostInfo {
 
 /// The two kinds of token (ADR-0006).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum TokenScope {
     /// A person's desktop. It may take every action, including those only a person may take.
@@ -60,6 +63,7 @@ pub enum TokenScope {
 
 /// Machine-readable error codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     /// No valid token.
@@ -100,6 +104,7 @@ impl ErrorCode {
 /// extensions (`axum::Extension<Caller>`), which the API layer inserts after authentication, and
 /// stamp events with `author = member` and `on_behalf_of`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Caller {
     /// The member the token belongs to: a person (device token) or an agent (agent token).
     pub member: MemberId,
@@ -107,6 +112,7 @@ pub struct Caller {
     pub scope: TokenScope,
     /// For an agent, its owner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub on_behalf_of: Option<MemberId>,
 }
 
@@ -120,6 +126,7 @@ impl Caller {
 
 /// The error body of every failed request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ApiError {
     /// Code.
     pub code: ErrorCode,
@@ -133,36 +140,45 @@ pub struct ApiError {
 
 /// `POST /v1/tasks`: a new task. The hub assigns the id and the next key in the project.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct NewTask {
     /// The project.
     pub project: ProjectId,
     /// The workstream; it must belong to the project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub workstream: Option<WorkstreamId>,
     /// Title.
     pub title: String,
     /// Description; empty if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub description: Option<String>,
     /// Status; `todo` if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub status: Option<TaskStatus>,
     /// Priority; `none` if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub priority: Option<Priority>,
     /// Assignee.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub assignee: Option<MemberId>,
     /// Labels; none if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub labels: Option<Vec<String>>,
     /// Due date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub due: Option<Date>,
 }
 
 /// `POST /v1/projects`: a new project. The hub assigns the id.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct NewProject {
     /// Key used in task keys; unique in the workspace.
     pub key: ProjectKey,
@@ -170,27 +186,34 @@ pub struct NewProject {
     pub name: String,
     /// The lead; the caller if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub lead: Option<MemberId>,
     /// Members; the lead alone if absent. The lead is always a member.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub members: Option<Vec<MemberId>>,
     /// Status; `in_progress` if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub status: Option<ProjectStatus>,
     /// Start date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub start: Option<Date>,
     /// Due date.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub due: Option<Date>,
     /// The root folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub root: Option<Location>,
 }
 
 /// `POST /v1/workstreams`: a new workstream in a project. The hub assigns the id; its health
 /// starts `on_track`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct NewWorkstream {
     /// The project.
     pub project: ProjectId,
@@ -198,15 +221,18 @@ pub struct NewWorkstream {
     pub name: String,
     /// Status; `active` if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub status: Option<WorkstreamStatus>,
     /// Folders or branches whose sessions belong to it; none if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
     pub locations: Option<Vec<Location>>,
 }
 
 /// `POST /v1/setup`: the first run of a fresh hub (api-v1.md, "The first run"). The person is the
 /// device token's own member; the machine is the hub's own, local one.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct Setup {
     /// The workspace's name, 1–80 characters.
     pub workspace_name: String,
@@ -218,6 +244,7 @@ pub struct Setup {
 
 /// The person in a [`Setup`].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SetupPerson {
     /// Display name, 1–80 characters.
     pub name: String,
@@ -227,6 +254,7 @@ pub struct SetupPerson {
 
 /// The answer to `POST /v1/setup`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SetupDone {
     /// The workspace, with its new name.
     pub workspace: Workspace,
@@ -241,6 +269,7 @@ pub struct SetupDone {
 /// Page backwards by passing `from_rev` as `before`. Only `at_start` ends paging: with filters, a
 /// page may hold fewer than `limit` events (even none) while older matches still exist.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct EventsPage {
     /// The events, oldest first.
     pub events: Vec<Event>,
@@ -256,6 +285,7 @@ pub struct EventsPage {
 /// Frames on `GET /v1/stream?since=<rev>`. `rev` is the hub's event revision. A client that
 /// reconnects with `since` receives exactly what it missed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamFrame {
     /// First frame: the current revision, and which event log it counts in.

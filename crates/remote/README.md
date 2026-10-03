@@ -130,13 +130,20 @@ let started = DirectLauncher::default().start(&target).await?;   // or TmuxLaunc
   uses relative paths only; a launched helper checks that the directory it starts in is that
   root, by its physical path, and private (tmux enters it by name; every `#` in it is doubled,
   since tmux reads formats there) before it runs. Directories above the root, and a SLURM
-  recipe's `modules_init` script and the way to it, are judged by their owner and mode bits,
-  and by any ACL they show (`+`, or macOS's `@`, which can hide one; `pc_acl_ok`): on Linux a
-  POSIX ACL's grants are bounded by its mask, which `ls` shows as the group bits, so those
-  bits suffice; on macOS the mode bits leave the ACL out, so `ls -le` must list only entries
-  that deny, or allow reading and searching; on any other system, or when the list cannot be
-  read or an entry is not understood, the directory is refused. NFSv4 and GPFS ACLs on Linux
-  do not show in `ls` at all, so they are not judged.
+  recipe's `modules_init` script itself and the way to it, are judged by their owner and mode
+  bits, and by any ACL they show (`+`, or macOS's `@`, which can hide one; `pc_acl_ok`):
+  - on Linux a POSIX ACL's grants are bounded by its mask, which `ls` shows as the group bits,
+    so those bits suffice;
+  - on macOS the mode bits leave the ACL out, so `/bin/ls -led` must list the path itself, then
+    only entries that deny, or allow reading, listing, searching or executing, reading
+    attributes, extended attributes or the ACL, and `synchronize` (which SMB-style ACLs carry);
+  - on any other system, or when the list cannot be read (`ls` fails, prints nothing, or does
+    not list the path first) or an entry is not understood, the path is refused.
+
+  Who an entry names is not looked up: one that allows more is refused even when it names the
+  user's own account, root or `group:admin`, who could change the path anyway (`chmod -a`
+  removes it). A refusal quotes the entry and says to run `/bin/ls -led <path>` to see the
+  list. NFSv4 and GPFS ACLs on Linux do not show in `ls` at all, so they are not judged.
 - **The remote side** is one script, `src/helper/helper.sh`, sent on **stdin** (the Windows
   command-line limit leaves the shell-neutral wrapper about 7,500 bytes). The command line is a
   fixed bootstrap run by `/bin/sh` (by path, whatever `sh` the user's `PATH` finds). It drops
@@ -146,7 +153,10 @@ let started = DirectLauncher::default().start(&target).await?;   // or TmuxLaunc
   so the helper bytes behind it stay on stdin. It runs the script only if it has its first line,
   its last line and its length: a `.bashrc` that eats stdin cannot make a tail of it run. The
   script then drops every function standing in for a tool it uses (bash imports exported ones).
-  It reports between random markers, like the probe.
+  It reports between random markers, like the probe. On macOS the checks above (the launched
+  helper's too) read modes and ACLs with `/bin/ls`, by its path, whatever `ls` the tool path
+  finds first: GNU `ls` has no `-e`, so every deploy would be refused (every home folder has an
+  ACL), and uutils' or busybox's `ls` shows no `+`, so an ACL would go unjudged.
 - **Deploy** is at most two calls, each under the `bin/.lock` lock:
   1. `check` verifies a copy already installed under the version (sha256 computed on the
      machine, then `--version`) and switches to it. The same deploy again stops here: it only
@@ -172,9 +182,11 @@ let started = DirectLauncher::default().start(&target).await?;   // or TmuxLaunc
   killed deploy does not block the next one for long) or when it is older than the limit by
   this host's own clock. Another host's clock cannot be compared with this one, so a lock from
   another host (a login node sharing the home), without an owner line yet, or whose pid or
-  time cannot be read, is stale only when its directory is older than the limit plus 10
-  minutes: hosts sharing a home, and the file server, must agree on the time within 10
-  minutes. A stale lock is moved aside atomically and removed; if what was moved is not the
+  time cannot be read (or whose owner file has more than one line), is stale only when its
+  directory is older than the limit plus 10 minutes: hosts sharing a home, and the file
+  server, must agree on the time within 10 minutes. Owner files are read with `read`, never
+  `$(cat …)`, which bash 3.2 (macOS's `/bin/sh`) can fill with output it failed to write
+  earlier. A stale lock is moved aside atomically and removed; if what was moved is not the
   lock judged stale, it is put back while the name is free. Every step that changes
   something (sweeping, `chmod`, removing a damaged copy, the rename, the switch, GC; in the
   launchers removing old records, launching, writing `endpoint.json`, signalling, removing
@@ -532,18 +544,23 @@ daemon (`EXIT_NO_DAEMON`), 1 other. Messages name what is wrong, never the path.
 - `tests/deploy.rs` (Unix), where the test binary is a fake `ssh` that runs the real remote
   script with the local `/bin/sh` in a temporary `HOME`, with a `PATH` holding only the tools
   the script may use. It can cut, pause or corrupt the upload, never read it, swallow the start
-  of stdin (as a start-up file would), set the remote umask, or run another shell as
-  `/bin/sh`. The binary also plays `pitcrewd` and the hash tools (in the formats of
-  `sha256sum`, `shasum`, OpenSSL 1.1 and 3). It covers deploy and the idempotent re-run, hash
+  of stdin (as a start-up file would), set the remote umask, run another shell as `/bin/sh`, or
+  read the script as a Mac whose `/bin/ls` is the stand-in on the tool path would. The binary
+  also plays `pitcrewd` and the hash tools (in the formats of `sha256sum`, `shasum`, OpenSSL
+  1.1 and 3). It covers deploy and the idempotent re-run, hash
   mismatch, interrupted and killed uploads, concurrent, stale (by pid, by age on either clock)
   and lost locks, GC, every hash tool, BSD and busybox `mv`, unknown platforms, unsafe
   directories and unsafe ways to the root (group-writable, someone else's, through symbolic
-  links; sticky ones allowed), a partly eaten script, look-alike tools in `PATH` and exported
-  bash functions, ACLs behind macOS's `@`, set-group-ID parents, odd host names, the file modes
-  during the upload, a stalled upload, the helper's umask, and the direct and tmux launchers
-  (start, status, stop, `endpoint.json`, failures, other hosts, two roots on one host). It runs
-  the whole flow again with each POSIX shell of `PITCREW_TEST_SHELLS` as the machine's
-  `/bin/sh`;
+  links; sticky ones allowed), ACLs on the way (stand-in `uname` and `ls` playing macOS,
+  FreeBSD and Linux: entries that grant, inherited or not, deny or only read, names with
+  spaces, `synchronize`, lists that fail, are empty or do not list the directory; macOS's own
+  `chmod +a` on macOS, with an `ls` first on the tool path that is not asked; the launched
+  helper's own check does not ask it either), a partly eaten script, look-alike tools in
+  `PATH` and exported bash functions, ACLs behind macOS's `@`, set-group-ID parents, odd host
+  names, the file modes during the upload, a stalled upload, the helper's umask, and the direct
+  and tmux launchers (start, status, stop, `endpoint.json`, failures, other hosts, two roots on
+  one host). It runs the whole flow again with each POSIX shell of `PITCREW_TEST_SHELLS` as the
+  machine's `/bin/sh`;
 - the SLURM cases in `tests/deploy/slurm.rs` (a `#[path]` module of `deploy.rs`), where the
   binary also plays `sbatch`, `squeue`, `scancel`, `sacct`, `srun` and `sinfo` with their state
   in files (honouring `SQUEUE_STATES`, `SCANCEL_STATE`, `SCANCEL_INTERACTIVE`, scancel's and
@@ -558,9 +575,10 @@ daemon (`EXIT_NO_DAEMON`), 1 other. Messages name what is wrong, never the path.
   queued, starting or running, with squeue failing or missing, and a direct helper that got in
   anyway); a named cluster, and one that would read as an option; a user recipe's extra lines
   and modules (and one with an unknown key, and a set-up script whose functions and aliases
-  would stand in for tools), with unsafe set-up scripts refused; a node-local socket, and an
-  open `$TMPDIR` refused; job scripts
-  eaten, cut or changed on the way; the probe; and a job under each POSIX shell, which also
+  would stand in for tools), with unsafe set-up scripts refused (by mode, by the way to them,
+  or by their own ACL, played by stand-ins and, on macOS, set with `chmod +a`); a node-local
+  socket, and an open `$TMPDIR` refused; job scripts eaten, cut or changed on the way; the
+  probe; and a job under each POSIX shell, which also
   shrugs off SIGUSR1 and SIGUSR2. The scripts' snapshots are unit tests
   (`PITCREW_UPDATE_SNAPSHOTS=1` rewrites them);
 - the tunnel cases in `tests/deploy/tunnel.rs`, where the fake `ssh` also plays the tunnel's

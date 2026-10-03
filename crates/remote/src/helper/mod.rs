@@ -353,6 +353,11 @@ impl Target {
     /// Looks for tools in `path` (`:`-separated absolute directories) before the user's `PATH`,
     /// instead of [`DEFAULT_TOOL_PATH`]: for a site whose tools live elsewhere.
     ///
+    /// On macOS the scripts read modes and access control lists with `/bin/ls`, by its path,
+    /// whatever `ls` this path finds first: GNU `ls` cannot list ACLs (it has no `-e`), so every
+    /// deploy would be refused (every home folder has an ACL), and uutils' or busybox's `ls`
+    /// shows no `+`, so an ACL on the way to the root would go unjudged.
+    ///
     /// # Errors
     /// [`HelperError::InvalidArgument`] for an empty path, a relative directory, or a control
     /// character.

@@ -1,4 +1,4 @@
-// The project page: a header and four tabs (Overview, Workstreams, Board, Activity). The route is
+// The project page: a header and tabs. The route is
 // `projects/$project`; which tab is on is kept in this component's own state, not the URL.
 
 import { useParams } from '@tanstack/react-router';
@@ -11,13 +11,15 @@ import { useProjects } from './data.ts';
 import { PROJECT_STATUS, formatDay } from './format.ts';
 import { ProjectOverviewBody, WorkstreamsTable } from './overview.tsx';
 import { ErrorNote } from './ui.tsx';
+import { Timeline } from './timeline.tsx';
 
-type Tab = 'overview' | 'workstreams' | 'board' | 'activity';
+type Tab = 'overview' | 'workstreams' | 'board' | 'timeline' | 'activity';
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'overview', label: 'Overview' },
   { id: 'workstreams', label: 'Workstreams' },
   { id: 'board', label: 'Board' },
+  { id: 'timeline', label: 'Timeline' },
   { id: 'activity', label: 'Activity' },
 ];
 
@@ -49,7 +51,7 @@ export function ProjectPage() {
   if (projects.data !== undefined && project === undefined) return <NotFound />;
 
   return (
-    <div className="mx-auto flex max-w-5xl flex-col gap-4 px-6 py-6">
+    <div className="mx-auto flex min-w-0 w-full max-w-5xl flex-col gap-4 px-6 py-6">
       <header className="flex flex-col gap-2">
         <p className="font-mono text-xs text-ink-2">{project?.key ?? ''}</p>
         <div className="flex flex-wrap items-center gap-2">
@@ -64,7 +66,7 @@ export function ProjectPage() {
           value={tab}
           onValueChange={(value) => value !== '' && setTab(value as Tab)}
           aria-label="Project sections"
-          className="inline-flex w-fit rounded-sm border border-line bg-sunken p-0.5"
+          className="inline-flex w-fit max-w-full flex-wrap rounded-sm border border-line bg-sunken p-0.5"
         >
           {TABS.map((t) => (
             <ToggleGroup.Item key={t.id} value={t.id} className={TAB_ITEM}>
@@ -79,6 +81,7 @@ export function ProjectPage() {
           {tab === 'overview' && <ProjectOverviewBody project={project.id} />}
           {tab === 'workstreams' && <WorkstreamsTable project={project.id} />}
           {tab === 'board' && <Board project={project.id} />}
+          {tab === 'timeline' && <Timeline project={project.id} />}
           {tab === 'activity' && <ActivityFeed filters={{ project: project.id }} title="Activity" />}
         </>
       )}

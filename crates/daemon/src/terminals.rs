@@ -9,8 +9,8 @@
 //!   is `503 unavailable`.
 //!
 //! **The runtime** is chosen at start (`crate::runtime`): tmux where it is usable, else
-//! [`NoRuntime`], which starts nothing and reaches nothing, so no session has a terminal here.
-//! The PTY runtime, for machines without tmux, is stream B's next brief.
+//! pitcrew-ptyd where it is installed next to `pitcrewd`, else [`NoRuntime`], which starts
+//! nothing and reaches nothing, so no session has a terminal here.
 
 use crate::runner::Attached;
 use pitcrew_api::{Attachment, TerminalError, Terminals};
@@ -67,9 +67,9 @@ impl Terminals for SessionTerminals {
     }
 }
 
-/// The runtime where tmux cannot be used (see the [module docs](self)). It owns no terminal, as
-/// the trait means it: it lists none, every terminal is `NotFound`, and starting one is
-/// `Unavailable`.
+/// The runtime where neither tmux nor pitcrew-ptyd can be used (see the [module docs](self)). It
+/// owns no terminal, as the trait means it: it lists none, every terminal is `NotFound`, and
+/// starting one is `Unavailable`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoRuntime;
 
@@ -81,8 +81,8 @@ impl Runtime for NoRuntime {
 
     fn start(&self, _spec: &StartSpec) -> Result<TerminalInfo, RuntimeError> {
         Err(RuntimeError::Unavailable(
-            "this machine has no terminal runtime for pitcrewd (tmux 3.2 or newer is needed; \
-             the daemon's log says why it is not used)"
+            "this machine has no terminal runtime for pitcrewd (tmux 3.2 or newer, or \
+             pitcrew-ptyd next to pitcrewd, is needed; the daemon's log says why neither is used)"
                 .to_owned(),
         ))
     }
@@ -220,7 +220,7 @@ mod tests {
             terminals,
             transcripts: runner.transcripts(),
             watches: false,
-            tmux: false,
+            runtime: None,
         };
 
         let with =

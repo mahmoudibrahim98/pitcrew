@@ -12,7 +12,7 @@ root=$(cd "$here/.." && pwd)
 tmp=$(mktemp -d)
 # desktop/build.sh stages inside the repository (dist/ is ignored by git).
 stage_dir="$root/dist/packaging-test-$$"
-trap 'rm -rf "$tmp" "$stage_dir"' EXIT
+trap 'rm -rf "$tmp" "$stage_dir" "$stage_dir-mac"' EXIT
 failed=0
 passed=0
 
@@ -156,12 +156,32 @@ stub "$bins/pitcrewd-$musl" "pitcrewd ../../escape"
 check "a version that could name another folder fails" 1 desktop_stage x86_64-unknown-linux-gnu
 stub "$bins/pitcrewd-$musl" "pitcrewd 1.2.3 (protocol 1, oldest accepted 1)"
 check "staged again" 0 desktop_stage x86_64-unknown-linux-gnu
+check "a Linux stage names the sidecars for its target only" 0 \
+  test "$(find "$stage_dir/bin" -type f | wc -l)" -eq 3
+
+# A universal macOS build compiles the app once per architecture, and tauri-build wants the
+# sidecars under each architecture's name as well as the universal one.
+cp "$bins/pitcrewd-universal-apple-darwin" "$tmp/saved-helper"
+stub "$bins/pitcrewd-universal-apple-darwin" "pitcrewd 1.2.3 (protocol 1, oldest accepted 1)"
+stub "$bins/pitcrew-ptyd-universal-apple-darwin" "pitcrew-ptyd 1.2.3 (protocol 1)"
+stub "$bins/pitcrew-askpass-universal-apple-darwin" "" 2 "pitcrew-askpass: not started by PitCrew (PITCREW_ASKPASS_ADDR unset)"
+check "staging the macOS desktop" 0 \
+  bash "$here/desktop/build.sh" --stage-only --dist "$bins" --stage "$stage_dir-mac" universal-apple-darwin
+for bin in pitcrewd pitcrew-ptyd pitcrew-askpass; do
+  for name in universal-apple-darwin aarch64-apple-darwin x86_64-apple-darwin; do
+    check "the universal $bin is staged as $bin-$name" 0 \
+      cmp -s "$stage_dir-mac/bin/$bin-$name" "$bins/$bin-universal-apple-darwin"
+  done
+done
+mv "$tmp/saved-helper" "$bins/pitcrewd-universal-apple-darwin"
+rm -f "$bins/pitcrew-ptyd-universal-apple-darwin" "$bins/pitcrew-askpass-universal-apple-darwin"
 
 # --- desktop/check.sh on a stand-in .deb laid out as Tauri's
 if command -v dpkg-deb >/dev/null 2>&1 && [ "$(uname -s)" = Linux ]; then
   pkg="$tmp/pkg"
   make_deb() { # the .deb from $pkg, as root:root
     mkdir -p "$pkg/DEBIAN"
+    chmod 0755 "$pkg/DEBIAN"
     printf 'Package: pitcrew\nVersion: 1.2.3\nArchitecture: amd64\nMaintainer: The PitCrew Authors\nDescription: stand-in\n' >"$pkg/DEBIAN/control"
     dpkg-deb --root-owner-group --build "$pkg" "$tmp/PitCrew_1.2.3_amd64.deb" >/dev/null
   }
@@ -211,6 +231,77 @@ if command -v dpkg-deb >/dev/null 2>&1 && [ "$(uname -s)" = Linux ]; then
   output_has "no askpass" "pitcrew-askpass is not next to pitcrew-desktop"
 else
   echo "(desktop/check.sh not tested here: it needs dpkg-deb on Linux)"
+fi
+
+# RPM command stand-ins exercise the real checker without installing or building an RPM.
+if [ "$(uname -s)" = Linux ]; then
+  rpm_tools="$tmp/rpm-tools"
+  rpm_tree="$tmp/rpm-tree"
+  rpm_listing="$tmp/rpm-listing"
+  rpm_file="$tmp/PitCrew_1.2.3_x86_64.rpm"
+  mkdir -p "$rpm_tools"
+  printf 'synthetic rpm\n' >"$rpm_file"
+  cat >"$rpm_tools/rpm" <<'STUB'
+#!/bin/sh
+case "$2" in
+  --qf) cat "$RPM_TEST_LISTING" ;;
+  --requires) printf 'webkit2gtk4.1\n' ;;
+  *) exit 2 ;;
+esac
+STUB
+  cat >"$rpm_tools/rpm2cpio" <<'STUB'
+#!/bin/sh
+printf 'synthetic cpio\n'
+STUB
+  cat >"$rpm_tools/cpio" <<'STUB'
+#!/bin/sh
+[ "${RPM_TEST_EXTRACTION_FAIL:-0}" = 0 ] || exit 1
+cat >/dev/null
+cp -R "$RPM_TEST_TREE"/. .
+STUB
+  chmod 0755 "$rpm_tools/"*
+  make_rpm_tree() {
+    rm -rf "$rpm_tree"
+    mkdir -p "$rpm_tree/usr/bin" "$rpm_tree/usr/lib/PitCrew/helpers" "$rpm_tree/usr/share/applications"
+    for bin in pitcrewd pitcrew-ptyd pitcrew-askpass; do
+      cp "$stage_dir/bin/$bin-x86_64-unknown-linux-gnu" "$rpm_tree/usr/bin/$bin"
+    done
+    { printf '#!/bin/sh\n# '; cat "$manifest"; printf '\n'; } >"$rpm_tree/usr/bin/pitcrew-desktop"
+    cp "$stage_dir/helpers/"* "$rpm_tree/usr/lib/PitCrew/helpers/"
+    printf '[Desktop Entry]\nCategories=Development;\nExec=pitcrew-desktop %%u\nIcon=pitcrew-desktop\nName=PitCrew\nTerminal=false\nType=Application\nMimeType=x-scheme-handler/pitcrew;\n' \
+      >"$rpm_tree/usr/share/applications/PitCrew.desktop"
+    chmod -R go-w "$rpm_tree"
+    printf '%s\n' '-rwxr-xr-x root/root 100 /usr/bin/pitcrewd' \
+      'drwxr-xr-x root/root 0 /usr/lib/PitCrew/helpers' >"$rpm_listing"
+  }
+  rpm_check() {
+    env PATH="$rpm_tools:$PATH" RPM_TEST_TREE="$rpm_tree" RPM_TEST_LISTING="$rpm_listing" \
+      bash "$here/desktop/check.sh" --manifest "$manifest" "$rpm_file"
+  }
+  make_rpm_tree
+  check "a complete stand-in rpm passes" 0 rpm_check
+  output_has "rpm checks its owners and modes" "every file and folder is root's"
+  output_has "rpm runs its sidecars" "pitcrew-askpass runs"
+  printf '%s\n' '-rwxr-xr-x sam/root 100 /usr/bin/pitcrewd' >"$rpm_listing"
+  check "rpm rejects a non-root owner" 1 rpm_check
+  printf '%s\n' '-rwxrwxr-x root/root 100 /usr/bin/pitcrewd' >"$rpm_listing"
+  check "rpm rejects group-writable entries" 1 rpm_check
+  make_rpm_tree
+  printf 'modified\n' >>"$rpm_tree/usr/lib/PitCrew/helpers/pitcrewd-aarch64-unknown-linux-musl"
+  check "rpm rejects a helper checksum mismatch" 1 rpm_check
+  make_rpm_tree
+  sed -i 's/ %u//' "$rpm_tree/usr/share/applications/PitCrew.desktop"
+  check "rpm rejects a desktop entry without its URL argument" 1 rpm_check
+  make_rpm_tree
+  printf '#!/bin/sh\n' >"$rpm_tree/usr/bin/pitcrew-desktop"
+  check "rpm rejects missing compiled checksums" 1 rpm_check
+  make_rpm_tree
+  stub "$rpm_tree/usr/bin/pitcrewd" "pitcrewd 9.9.9 (protocol 1)"
+  check "rpm rejects a sidecar version mismatch" 1 rpm_check
+  make_rpm_tree
+  check "rpm extraction failure is reported" 1 env RPM_TEST_EXTRACTION_FAIL=1 \
+    PATH="$rpm_tools:$PATH" RPM_TEST_TREE="$rpm_tree" RPM_TEST_LISTING="$rpm_listing" \
+    bash "$here/desktop/check.sh" --manifest "$manifest" "$rpm_file"
 fi
 
 echo "packaging tests: $passed passed, $failed failed"

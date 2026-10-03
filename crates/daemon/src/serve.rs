@@ -15,8 +15,9 @@
 //!    network filesystem's lease is never let go of in between. When it cannot run (no person
 //!    yet, or `@office` is not the person's agent), `office.json` is removed.
 //! 7. Unless `--no-runner`, the terminals' runtime ([`crate::runtime`]: tmux where it is usable,
-//!    detected off the async executor), then the runner ([`crate::runner`]): it watches the homes
-//!    and writes into the store at once, and its terminals run on that runtime.
+//!    else pitcrew-ptyd, detected off the async executor), then the runner ([`crate::runner`]):
+//!    it watches the homes and writes into the store at once, and its terminals run on that
+//!    runtime.
 //! 8. The recap index's warm-up on the blocking pool, not waited for; the back office's loop; for
 //!    a workspace not set up yet, the task that starts the office and the runner once it is
 //!    ([`crate::setup::after_setup`]); the routes (`RouterParts`, with the activity index, the
@@ -28,16 +29,17 @@
 //! finishes in-flight requests (`pitcrew-api` closes open WebSockets with 1001) while the back
 //! office finishes its run in progress and saves where it got to, and the runner hands what it
 //! read to the store and stops (whether they started with the daemon or after setup); then the
-//! terminals' runtime is let go of (tmux stores each terminal's output offset; the terminals keep
-//! running) while the store closes, checkpointing its WAL; and the lock is released last.
+//! terminals' runtime is let go of (tmux stores each terminal's output offset, or ptyd keeps them;
+//! the terminals keep running) while the store closes, checkpointing its WAL; and the lock is
+//! released last.
 
-use crate::cli::{ListenArg, ServeArgs};
+use crate::cli::{ListenArg, ServeArgs, TerminalRuntimeArg};
 use crate::host::HostInfoNow;
 use crate::office::Office;
 use crate::recaps::WorkRecaps;
 use crate::refs::WorkRefs;
 use crate::runner::{Attached, Hooks, Runner};
-use crate::runtime::TerminalRuntime;
+use crate::runtime::{Overrides, TerminalRuntime};
 use crate::sessions::Sessions;
 use crate::setup::{AfterSetup, Workers};
 use crate::state::{StateDir, read_token, read_workspace, write_token, write_workspace};
@@ -66,6 +68,8 @@ use tokio::sync::oneshot;
 
 /// Hook events queued for the sink before new ones are dropped.
 const HOOK_QUEUE: usize = 1024;
+/// The recap index's blocks, in the state directory: a cache, replaced at every start.
+const RECAP_FILE: &str = "recaps.sqlite3";
 /// How long the server gets to finish in-flight requests and close its sockets after a stop
 /// signal.
 const DRAIN: Duration = Duration::from_secs(10);
@@ -75,7 +79,7 @@ const RELEASE: Duration = Duration::from_secs(3);
 /// running after that is left to end with the process.
 const ABANDON: Duration = Duration::from_secs(5);
 /// How long letting go of the terminals' runtime may take (tmux stores the terminals' offsets
-/// and detaches), alongside the store's [`RELEASE`].
+/// and detaches; ptyd's connection closes), alongside the store's [`RELEASE`].
 const DETACH: Duration = Duration::from_secs(5);
 
 /// Runs `pitcrewd serve` until a stop signal.
@@ -116,7 +120,7 @@ pub fn serve(state: &StateDir, args: &ServeArgs) -> anyhow::Result<ExitCode> {
     } else {
         runtime.block_on(TerminalRuntime::choose(
             state.root(),
-            args.tmux_socket.clone(),
+            &runtime_overrides(args),
         ))
     };
     let runner = match &homes {
@@ -170,6 +174,18 @@ pub fn serve(state: &StateDir, args: &ServeArgs) -> anyhow::Result<ExitCode> {
     served?;
     tracing::info!("stopped");
     Ok(ExitCode::SUCCESS)
+}
+
+/// What `serve`'s hidden options (for tests and development) change in how the terminals'
+/// runtime is chosen.
+fn runtime_overrides(args: &ServeArgs) -> Overrides {
+    Overrides {
+        tmux_socket: args.tmux_socket.clone(),
+        ptyd: args.ptyd.clone(),
+        ptyd_endpoint: args.ptyd_endpoint.clone(),
+        ptyd_idle_exit: args.ptyd_idle_exit_ms.map(Duration::from_millis),
+        force_pty: args.terminal_runtime == TerminalRuntimeArg::Pty,
+    }
 }
 
 /// Everything opened before serving.
@@ -240,8 +256,12 @@ fn open_with(
     // No dispatcher (see the README, "Dispatch"): a dispatch answers 503 and records nothing,
     // rather than appending a dispatch that can only fail.
     let (signal, set_up) = crate::setup::signal();
+    // The recap index keeps its blocks on disk, in a cache file of its own next to the store
+    // (replaced when the index is built, removed when the daemon stops), not in memory.
     let work = Arc::new(
-        WorkService::new(Arc::clone(&store), workspace).with_setup_listener(Arc::new(signal)),
+        WorkService::new(Arc::clone(&store), workspace)
+            .with_setup_listener(Arc::new(signal))
+            .with_recap_file(state.root().join(RECAP_FILE)),
     );
     let machines = match &demo {
         Some(demo) => demo.machines.clone(),
@@ -640,7 +660,8 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
     }
     drop(tokens);
     // The runner has stopped: let go of its terminals' runtime, so tmux stores where each
-    // terminal's output got to (the terminals keep running), while the store closes.
+    // terminal's output got to, or ptyd's connection closes (ptyd keeps the output and offsets);
+    // the terminals keep running. Meanwhile the store closes.
     tokio::join!(runtime.detach(DETACH), close_store(store));
     failed.map_or(Ok(()), Err)
 }

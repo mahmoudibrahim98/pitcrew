@@ -32,9 +32,10 @@ use crate::fsinfo::{self, FileStat};
 use crate::held::Held;
 use crate::hooks::{self, Sender};
 use crate::link::{self, Locations, WorkstreamLocation};
+use crate::pages::Source;
 use crate::pages::Watched;
 use crate::sink::Batch;
-use crate::store::{Commit, Row, Store, path_text};
+use crate::store::{Commit, Indexed, Row, Store, native_id, path_text};
 use notify::event::{EventKind, MetadataKind, ModifyKind};
 use notify::{RecursiveMode, Watcher as _};
 use pitcrew_interfaces::source::{Cursor, ParseChunk, SourceAdapter, SourceError, TranscriptRef};
@@ -42,9 +43,10 @@ use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{EventId, MachineId, MemberId, SessionId, TerminalId, WorkspaceId};
 use pitcrew_protocol::model::{Engine, LinkBasis, Session, SessionState, TimestampMs};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
@@ -277,7 +279,7 @@ struct Home {
     /// Polled as a network filesystem: sweeps and rediscoveries are rarer.
     slow: bool,
     /// The home and its first-level folders, while watched.
-    watched: Vec<PathBuf>,
+    watched: Vec<Arc<Path>>,
     next_sweep: Instant,
     next_rediscover: Instant,
     /// Discovery is failing; warned once until it works again.
@@ -294,24 +296,247 @@ impl Home {
     }
 }
 
-/// One transcript. `row` is the in-memory state, ahead of the store until the sink accepts.
+/// One transcript. Every tracked transcript has one, so it holds only what tells a change (size,
+/// mtime and identity when last read), where the transcript is, how it is watched, and what routes
+/// hooks to its session. The rest of its row (the cursor, the session's facts and metadata) is
+/// read from the index while it is in use, and let go once the index has saved it ([`Loaded`]).
 struct Tracked {
-    row: Row,
-    tref: TranscriptRef,
+    session: SessionId,
+    engine: Engine,
+    /// Shared with the keys that find it, and with the transcript pages.
+    path: Arc<Path>,
+    inner_id: Option<Arc<str>>,
+    size: u64,
+    mtime: TimestampMs,
+    identity: Option<Box<str>>,
+    /// Reading had reached the end of the file at `size` and `mtime`.
+    caught_up: bool,
+    /// Its `session_discovered` was sent.
+    discovered: bool,
+    /// A sub-agent's transcript.
+    subagent: bool,
+    /// The parent its hooks are judged by, once looked up (`Facts::parent`).
+    parent: Option<Parent>,
     home: usize,
     hot: bool,
-    /// Folders this transcript holds a watch on.
-    watched: Vec<PathBuf>,
+    /// Folders this transcript holds a watch on, shared with `Watcher::dirs`.
+    watched: Vec<Arc<Path>>,
     poll_every: Duration,
     next_poll: Instant,
-    /// Size and mtime at which reading failed: not read again until the file changes.
-    failed_at: Option<(u64, TimestampMs)>,
+    /// Size and mtime at which reading failed: not read again until the file changes. Boxed:
+    /// rare, and every transcript has the field.
+    failed_at: Option<Box<(u64, TimestampMs)>>,
     /// A read failure was logged as a warning; later ones are quieter until a read works.
     warned: bool,
+    /// The whole row, while in use or not saved yet.
+    loaded: Option<Box<Loaded>>,
+}
+
+/// A transcript's whole row in memory: ahead of the index until the sink accepts what was read and
+/// the index saves it.
+struct Loaded {
+    row: Row,
+    /// Batches sent with this row's changes that are not saved yet (see `sink::Batch`). At zero
+    /// the index holds this row, so it can go.
+    unsaved: Arc<AtomicUsize>,
+    /// Changed since the last batch that saves it (a re-index before a read that failed, a report
+    /// that moved `reported_at` but not the state): kept until a batch carries it, as every row
+    /// was before the index saved only what batches carry.
+    dirty: bool,
+}
+
+impl Loaded {
+    fn new(row: Row) -> Box<Self> {
+        Box::new(Self {
+            row,
+            unsaved: Arc::default(),
+            dirty: false,
+        })
+    }
+
+    /// The row is in a batch about to be sent: what the batch counts against.
+    fn sending(&mut self) -> Arc<AtomicUsize> {
+        self.dirty = false;
+        Arc::clone(&self.unsaved)
+    }
+
+    /// Whether the index holds all of it, so it can go. A row in the middle of a replay after a
+    /// crash (`accepted` not empty) stays: the index forgets the accepted items at the first full
+    /// save, and the rest of the replay still needs them.
+    fn saved(&self) -> bool {
+        !self.dirty && self.row.accepted.is_empty() && self.unsaved.load(Ordering::Acquire) == 0
+    }
+}
+
+impl Tracked {
+    fn new(row: &Indexed, path: Arc<Path>, home: usize, timing: &Timing) -> Self {
+        Self {
+            session: row.session,
+            engine: row.engine,
+            path,
+            inner_id: row.inner_id.as_deref().map(Arc::from),
+            size: row.size,
+            mtime: row.mtime,
+            identity: row.identity.as_deref().map(Box::from),
+            caught_up: row.caught_up,
+            discovered: row.discovered,
+            subagent: row.subagent,
+            parent: row.parent,
+            home,
+            hot: false,
+            watched: Vec::new(),
+            poll_every: timing.poll_min,
+            next_poll: Instant::now(),
+            failed_at: None,
+            warned: false,
+            loaded: None,
+        }
+    }
+
+    /// The whole row, if it is in memory.
+    fn row(&mut self) -> Option<&mut Row> {
+        self.loaded.as_deref_mut().map(|l| &mut l.row)
+    }
+
+    /// Takes in what the whole row now says.
+    fn sync(&mut self) {
+        let Some(l) = self.loaded.as_deref() else {
+            return;
+        };
+        let row = &l.row;
+        self.size = row.size;
+        self.mtime = row.mtime;
+        if self.identity.as_deref() != row.identity.as_deref() {
+            self.identity = row.identity.as_deref().map(Box::from);
+        }
+        self.caught_up = row.caught_up;
+        self.discovered = row.discovered;
+        self.subagent = row.meta.as_ref().is_some_and(|m| m.is_subagent);
+        self.parent = row.facts.parent;
+    }
+
+    /// The transcript as the adapter reads it, at size `size` and modification time `modified`.
+    fn tref(&self, size: u64, modified: TimestampMs) -> TranscriptRef {
+        TranscriptRef {
+            engine: self.engine,
+            path: self.path.to_path_buf(),
+            inner_id: self.inner_id.as_deref().map(str::to_owned),
+            size,
+            modified,
+        }
+    }
 }
 
 /// A transcript's `(path, inner id)`.
-type Key = (PathBuf, Option<String>);
+type Key = (Arc<Path>, Option<Arc<str>>);
+
+/// A transcript's `(path, inner id)` as discovered.
+type RawKey = (PathBuf, Option<String>);
+
+fn key(path: &Path, inner_id: Option<&str>) -> Key {
+    (Arc::from(path), inner_id.map(Arc::from))
+}
+
+/// The tracked transcripts by id, in id order: a sorted vector. Ids only grow (`next_id`), so a
+/// new one goes at the end, and one leaves only when its transcript is deleted. Every transcript
+/// has an entry, and a `BTreeMap` fed growing keys leaves its nodes about half full: this holds
+/// them close to their size, growing by an eighth at a time.
+struct IdMap<T> {
+    entries: Vec<(u64, T)>,
+}
+
+impl<T> Default for IdMap<T> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl<T> IdMap<T> {
+    fn find(&self, id: u64) -> Result<usize, usize> {
+        self.entries.binary_search_by_key(&id, |(k, _)| *k)
+    }
+
+    fn get(&self, id: &u64) -> Option<&T> {
+        self.find(*id).ok().map(|i| &self.entries[i].1)
+    }
+
+    fn get_mut(&mut self, id: &u64) -> Option<&mut T> {
+        self.find(*id).ok().map(|i| &mut self.entries[i].1)
+    }
+
+    fn insert(&mut self, id: u64, value: T) {
+        match self.find(id) {
+            Ok(i) => self.entries[i].1 = value,
+            Err(i) => {
+                if self.entries.len() == self.entries.capacity() {
+                    self.entries.reserve_exact(self.entries.len() / 8 + 16);
+                }
+                self.entries.insert(i, (id, value));
+            }
+        }
+    }
+
+    fn remove(&mut self, id: &u64) -> Option<T> {
+        self.find(*id).ok().map(|i| self.entries.remove(i).1)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&u64, &T)> {
+        self.entries.iter().map(|(k, v)| (k, v))
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &u64> {
+        self.entries.iter().map(|(k, _)| k)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &T> {
+        self.entries.iter().map(|(_, v)| v)
+    }
+}
+
+#[cfg(test)]
+impl<T> std::ops::Index<&u64> for IdMap<T> {
+    type Output = T;
+
+    fn index(&self, id: &u64) -> &T {
+        self.get(id).expect("tracked")
+    }
+}
+
+/// The tracked transcripts at one path: one, or several in a store of many sessions (OpenCode's).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Ids {
+    One(u64),
+    Many(Vec<u64>),
+}
+
+impl Ids {
+    fn push(&mut self, id: u64) {
+        match self {
+            Self::One(first) => *self = Self::Many(vec![*first, id]),
+            Self::Many(ids) => ids.push(id),
+        }
+    }
+
+    /// Takes `id` out. False once none is left.
+    fn remove(&mut self, id: u64) -> bool {
+        match self {
+            Self::One(only) => *only != id,
+            Self::Many(ids) => {
+                ids.retain(|i| *i != id);
+                !ids.is_empty()
+            }
+        }
+    }
+
+    fn to_vec(&self) -> Vec<u64> {
+        match self {
+            Self::One(id) => vec![*id],
+            Self::Many(ids) => ids.clone(),
+        }
+    }
+}
 
 /// Why the watcher stopped early.
 struct Hangup;
@@ -329,21 +554,23 @@ pub(crate) struct Watcher {
     shared: Arc<Shared>,
     notify: Option<notify::RecommendedWatcher>,
     /// The index as loaded by `start()`; tracked by the watcher's own start.
-    rows: Vec<Row>,
-    tracked: BTreeMap<u64, Tracked>,
+    rows: Vec<Indexed>,
+    tracked: IdMap<Tracked>,
     next_id: u64,
+    /// Tracked transcripts whose whole row is in memory ([`Loaded`]).
+    loaded: Vec<u64>,
     /// Canonical key → tracked transcript.
     by_key: HashMap<Key, u64>,
-    /// Key as discovered (perhaps through a symlink) → tracked transcript, so each discovered
-    /// path is canonicalized once.
-    by_raw: HashMap<Key, u64>,
-    by_path: HashMap<PathBuf, Vec<u64>>,
+    /// Key as discovered through a symlink → tracked transcript, so each discovered path is
+    /// canonicalized once. A path discovered as it is (canonical) is found in `by_key` instead.
+    by_raw: HashMap<RawKey, u64>,
+    by_path: HashMap<Arc<Path>, Ids>,
     /// Watched folders and how many holders each has.
-    dirs: HashMap<PathBuf, usize>,
+    dirs: HashMap<Arc<Path>, usize>,
     /// Folders that could not be watched: warned once, retried on rediscovery.
     watch_failed: HashSet<PathBuf>,
     /// Discovered transcripts that cannot be indexed: warned once.
-    skipped: HashSet<Key>,
+    skipped: HashSet<RawKey>,
     /// Folders outside their home that hold transcripts: warned once.
     outside: HashSet<PathBuf>,
     last_rediscover: Option<Instant>,
@@ -351,9 +578,9 @@ pub(crate) struct Watcher {
     locations: Option<Arc<dyn Locations>>,
     /// The CLI's session id → tracked transcript, for sessions; sub-agents have their own map,
     /// looked up after it (see `map_native`).
-    by_native: HashMap<(Engine, String), u64>,
+    by_native: HashMap<(Engine, Box<str>), u64>,
     /// A sub-agent's CLI id → tracked transcript.
-    by_sub_native: HashMap<(Engine, String), u64>,
+    by_sub_native: HashMap<(Engine, Box<str>), u64>,
     by_session: HashMap<SessionId, u64>,
     /// Hooks for sessions not indexed yet.
     held: Held,
@@ -374,7 +601,7 @@ pub(crate) struct Setup {
     pub max_batch: usize,
     pub homes: Vec<EngineHome>,
     pub adapters: Vec<Arc<dyn SourceAdapter>>,
-    pub rows: Vec<Row>,
+    pub rows: Vec<Indexed>,
     pub store: Arc<Mutex<Store>>,
     pub tx: SyncSender<Batch>,
     pub shared: Arc<Shared>,
@@ -443,8 +670,9 @@ impl Watcher {
             shared: s.shared,
             notify,
             rows: s.rows,
-            tracked: BTreeMap::new(),
+            tracked: IdMap::default(),
             next_id: 0,
+            loaded: Vec::new(),
             by_key: HashMap::new(),
             by_raw: HashMap::new(),
             by_path: HashMap::new(),
@@ -493,19 +721,13 @@ impl Watcher {
             };
             if self
                 .by_key
-                .contains_key(&(row.path.clone(), row.inner_id.clone()))
+                .contains_key(&key(&row.path, row.inner_id.as_deref()))
             {
                 tracing::warn!(path = %row.path.display(), session = %row.session, "a second index row for one transcript; ignoring it");
                 continue;
             }
-            let tref = TranscriptRef {
-                engine: row.engine,
-                path: row.path.clone(),
-                inner_id: row.inner_id.clone(),
-                size: row.size,
-                modified: row.mtime,
-            };
-            self.track(row, tref, home);
+            let (size, modified) = (row.size, row.mtime);
+            self.track(&row, None, home, size, modified);
         }
         let ids: Vec<u64> = self.tracked.keys().copied().collect();
         for id in ids {
@@ -520,7 +742,7 @@ impl Watcher {
     /// the new form, so the transcript keeps its session. A transcript that is now a link, or
     /// anything else but a regular file, is never moved to where it points: the row stays, and
     /// reads refuse the path until a regular file is back. False if the row can't be used.
-    fn follow_canonical(&self, row: &mut Row) -> bool {
+    fn follow_canonical(&self, row: &mut Indexed) -> bool {
         let canonical = match transcript_key(&row.path) {
             Ok(canonical) => canonical,
             Err(e) => {
@@ -617,7 +839,7 @@ impl Watcher {
         let now = Instant::now();
         let mut maybe_new = false;
         for (path, created) in wake.due {
-            match self.by_path.get(&path).cloned() {
+            match self.by_path.get(path.as_path()).map(Ids::to_vec) {
                 Some(ids) => {
                     for id in ids {
                         self.serve_due()?;
@@ -663,6 +885,7 @@ impl Watcher {
                 t.next_poll = after(Instant::now(), t.poll_every);
             }
         }
+        self.let_go();
         Ok(())
     }
 
@@ -686,6 +909,7 @@ impl Watcher {
     /// Between transcripts of a long backfill or sweep: stops if asked, and reads the transcripts
     /// whose changes are due, so live sessions don't wait for the backfill.
     fn serve_due(&mut self) -> Result<(), Hangup> {
+        self.let_go();
         let now = Instant::now();
         let (due, reports): (Vec<PathBuf>, Vec<Signal>) = {
             let mut s = self.shared.lock();
@@ -694,7 +918,7 @@ impl Watcher {
             }
             let mut due = Vec::new();
             s.dirty.retain(|p, d| {
-                if d.due <= now && self.by_path.contains_key(p) {
+                if d.due <= now && self.by_path.contains_key(p.as_path()) {
                     due.push(p.clone());
                     false
                 } else {
@@ -705,7 +929,12 @@ impl Watcher {
         };
         self.apply_reports(reports)?;
         for path in due {
-            for id in self.by_path.get(&path).cloned().unwrap_or_default() {
+            for id in self
+                .by_path
+                .get(path.as_path())
+                .map(Ids::to_vec)
+                .unwrap_or_default()
+            {
                 self.check(id)?;
             }
         }
@@ -716,7 +945,7 @@ impl Watcher {
     fn rediscover(&mut self, which: &[usize]) -> Result<(), Hangup> {
         let now = Instant::now();
         self.last_rediscover = Some(now);
-        let mut found: Vec<(TimestampMs, usize, Key, TranscriptRef, PathBuf)> = Vec::new();
+        let mut found: Vec<(TimestampMs, usize, RawKey, TranscriptRef, PathBuf)> = Vec::new();
         for &h in which {
             self.refresh_home(h);
             let home = &mut self.homes[h];
@@ -739,6 +968,13 @@ impl Watcher {
                 }
             };
             for tref in list {
+                // Tracked already, as discovered: through its canonical path, or through a link.
+                if self
+                    .by_key
+                    .contains_key(&key(&tref.path, tref.inner_id.as_deref()))
+                {
+                    continue;
+                }
                 let raw = (tref.path.clone(), tref.inner_id.clone());
                 if self.by_raw.contains_key(&raw) || self.skipped.contains(&raw) {
                     continue;
@@ -752,8 +988,8 @@ impl Watcher {
                         continue;
                     }
                 };
-                if let Some(&id) = self.by_key.get(&(canonical.clone(), tref.inner_id.clone())) {
-                    self.by_raw.insert(raw, id);
+                if let Some(&id) = self.by_key.get(&key(&canonical, tref.inner_id.as_deref())) {
+                    self.note_raw(raw, &canonical, id);
                     continue;
                 }
                 let mtime = fsinfo::stat(&canonical).map_or(tref.modified, |s| s.mtime);
@@ -816,12 +1052,12 @@ impl Watcher {
     fn add(
         &mut self,
         h: usize,
-        raw: Key,
-        mut tref: TranscriptRef,
+        raw: RawKey,
+        tref: TranscriptRef,
         canonical: PathBuf,
     ) -> Result<(), Hangup> {
-        if let Some(&id) = self.by_key.get(&(canonical.clone(), tref.inner_id.clone())) {
-            self.by_raw.insert(raw, id);
+        if let Some(&id) = self.by_key.get(&key(&canonical, tref.inner_id.as_deref())) {
+            self.note_raw(raw, &canonical, id);
             return Ok(());
         }
         if path_text(&canonical).is_err() {
@@ -829,15 +1065,17 @@ impl Watcher {
             self.skipped.insert(raw);
             return Ok(());
         }
-        tref.path = canonical;
-        let earlier = self.store_lock().find(&tref.path, tref.inner_id.as_deref());
+        let earlier = self.store_lock().find(&canonical, tref.inner_id.as_deref());
         let row = match earlier {
             Ok(Some(row)) => {
-                tracing::debug!(path = %tref.path.display(), session = %row.session, "a transcript seen before; resuming its row");
+                tracing::debug!(path = %canonical.display(), session = %row.session, "a transcript seen before; resuming its row");
                 row
             }
             Ok(None) => {
-                let row = new_row(&tref);
+                let row = new_row(&TranscriptRef {
+                    path: canonical.clone(),
+                    ..tref.clone()
+                });
                 if let Err(e) = self.store_lock().insert(&row) {
                     tracing::error!(path = %row.path.display(), error = %e, "cannot index a transcript");
                     return Ok(());
@@ -846,91 +1084,177 @@ impl Watcher {
                 row
             }
             Err(e) => {
-                tracing::error!(path = %tref.path.display(), error = %e, "cannot look up a transcript");
+                tracing::error!(path = %canonical.display(), error = %e, "cannot look up a transcript");
                 return Ok(());
             }
         };
-        let id = self.track(row, tref, h);
-        self.by_raw.insert(raw, id);
+        let id = self.track(&Indexed::of(&row), Some(row), h, tref.size, tref.modified);
+        self.note_raw(raw, &canonical, id);
         self.check(id)?;
         Ok(())
     }
 
-    fn track(&mut self, row: Row, tref: TranscriptRef, home: usize) -> u64 {
+    /// Remembers a transcript discovered through a link by the path it was discovered at. One
+    /// discovered at its canonical path is found by that.
+    fn note_raw(&mut self, raw: RawKey, canonical: &Path, id: u64) {
+        if raw.0 != canonical {
+            self.by_raw.insert(raw, id);
+        }
+    }
+
+    /// Starts tracking a transcript, with its whole row if it is at hand. `size` and `modified`
+    /// are what the transcript pages are told (the adapter's `TranscriptRef`).
+    fn track(
+        &mut self,
+        entry: &Indexed,
+        row: Option<Row>,
+        home: usize,
+        size: u64,
+        modified: TimestampMs,
+    ) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
+        // Transcripts in one file (OpenCode's) share one path.
+        let path: Arc<Path> = self
+            .by_path
+            .get_key_value(entry.path.as_path())
+            .map_or_else(|| Arc::from(entry.path.as_path()), |(p, _)| Arc::clone(p));
+        let mut t = Tracked::new(entry, Arc::clone(&path), home, &self.timing);
+        if let Some(row) = row {
+            t.loaded = Some(Loaded::new(row));
+            self.loaded.push(id);
+        }
         self.by_key
-            .insert((row.path.clone(), row.inner_id.clone()), id);
-        self.by_path.entry(row.path.clone()).or_default().push(id);
-        self.by_session.insert(row.session, id);
-        if let Some(meta) = &row.meta {
+            .insert((Arc::clone(&path), t.inner_id.clone()), id);
+        match self.by_path.entry(Arc::clone(&path)) {
+            std::collections::hash_map::Entry::Occupied(mut ids) => ids.get_mut().push(id),
+            std::collections::hash_map::Entry::Vacant(none) => {
+                none.insert(Ids::One(id));
+            }
+        }
+        self.by_session.insert(entry.session, id);
+        if let Some(native) = &entry.native {
             self.map_native(
                 id,
-                row.session,
-                row.engine,
-                &native_id(&row),
-                meta.is_subagent,
+                entry.session,
+                entry.engine,
+                native,
+                entry.subagent,
                 true,
             );
         }
         self.watched.insert(
-            row.session,
-            Arc::clone(&self.homes[home].adapter),
-            tref.clone(),
-        );
-        self.note_outside(&row.path, home);
-        self.tracked.insert(
-            id,
-            Tracked {
-                row,
-                tref,
-                home,
-                hot: false,
-                watched: Vec::new(),
-                poll_every: self.timing.poll_min,
-                next_poll: Instant::now(),
-                failed_at: None,
-                warned: false,
+            entry.session,
+            Source {
+                adapter: Arc::clone(&self.homes[home].adapter),
+                engine: entry.engine,
+                path: Arc::clone(&path),
+                inner_id: t.inner_id.clone(),
+                size,
+                modified,
             },
         );
+        self.note_outside(&path, home);
+        self.tracked.insert(id, t);
         self.sync_watches(id);
         id
+    }
+
+    /// Reads a tracked transcript's whole row into memory, unless it is there. False if it cannot
+    /// be read (logged).
+    fn load(&mut self, id: u64) -> bool {
+        let Some(t) = self.tracked.get(&id) else {
+            return false;
+        };
+        if t.loaded.is_some() {
+            return true;
+        }
+        let session = t.session;
+        let found = self.store_lock().load(session);
+        let mut row = match found {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                tracing::error!(%session, "a tracked transcript has no row in the runner's index");
+                return false;
+            }
+            Err(e) => {
+                tracing::error!(%session, error = %e, "cannot read a transcript's row from the runner's index");
+                return false;
+            }
+        };
+        let Some(t) = self.tracked.get_mut(&id) else {
+            return false;
+        };
+        // A parent looked up since the row was saved is saved with it next time.
+        if row.facts.parent.is_none() {
+            row.facts.parent = t.parent;
+        }
+        t.loaded = Some(Loaded::new(row));
+        self.loaded.push(id);
+        true
+    }
+
+    /// Lets go of the whole rows the index has saved: only what tells a change stays in memory.
+    fn let_go(&mut self) {
+        let tracked = &mut self.tracked;
+        self.loaded.retain(|id| {
+            let Some(t) = tracked.get_mut(id) else {
+                return false;
+            };
+            let saved = t.loaded.as_deref().is_none_or(Loaded::saved);
+            if saved {
+                t.loaded = None;
+            }
+            !saved
+        });
+    }
+
+    /// Hands a batch to the sink thread, counting it against its row until it is saved.
+    fn send(&self, batch: Batch) -> Result<(), Hangup> {
+        if let Some(unsaved) = &batch.unsaved {
+            unsaved.fetch_add(1, Ordering::AcqRel);
+        }
+        self.tx.send(batch).map_err(|_| Hangup)
     }
 
     /// Stops tracking a deleted transcript. Its row stays, so if a file comes back at the path it
     /// keeps its session; the row is marked [`GONE`] (in order with the commits already queued),
     /// so that file is read from the start.
     fn drop_deleted(&mut self, id: u64) -> Result<(), Hangup> {
+        self.load(id);
         let Some(t) = self.tracked.remove(&id) else {
             return Ok(());
         };
-        let mut row = t.row;
-        tracing::info!(path = %row.path.display(), session = %row.session, "transcript deleted; no longer watching it");
+        tracing::info!(path = %t.path.display(), session = %t.session, "transcript deleted; no longer watching it");
         self.by_key
-            .remove(&(row.path.clone(), row.inner_id.clone()));
-        let empty = self.by_path.get_mut(&row.path).is_some_and(|ids| {
-            ids.retain(|i| *i != id);
-            ids.is_empty()
-        });
+            .remove(&(Arc::clone(&t.path), t.inner_id.clone()));
+        let empty = self
+            .by_path
+            .get_mut(&*t.path)
+            .is_some_and(|ids| !ids.remove(id));
         if empty {
-            self.by_path.remove(&row.path);
+            self.by_path.remove(&*t.path);
         }
         self.by_raw.retain(|_, i| *i != id);
         self.by_native.retain(|_, i| *i != id);
         self.by_sub_native.retain(|_, i| *i != id);
-        self.by_session.remove(&row.session);
-        self.watched.remove(row.session);
+        self.by_session.remove(&t.session);
+        self.watched.remove(t.session);
         for d in &t.watched {
             self.unwatch_dir(d);
         }
-        row.identity = Some(GONE.to_owned());
-        row.caught_up = false;
-        self.tx
-            .send(Batch {
-                events: Vec::new(),
-                commit: Commit::Full(Box::new(row)),
-            })
-            .map_err(|_| Hangup)
+        self.loaded.retain(|i| *i != id);
+        let Some(mut l) = t.loaded else {
+            tracing::warn!(session = %t.session, "cannot mark a deleted transcript's row; a file back at its path is read from its cursor");
+            return Ok(());
+        };
+        l.row.identity = Some(GONE.to_owned());
+        l.row.caught_up = false;
+        self.send(Batch {
+            events: Vec::new(),
+            commit: Commit::Full(Box::new(l.row)),
+            unsaved: None,
+        })
     }
 
     /// A transcript outside its home (its folder is reached through a symlink) is still indexed,
@@ -961,14 +1285,14 @@ impl Watcher {
         let Some(t) = self.tracked.get(&id) else {
             return Ok(false);
         };
-        let st = match fsinfo::stat(&t.row.path) {
+        let st = match fsinfo::stat(&t.path) {
             Ok(st) => st,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 self.drop_deleted(id)?;
                 return Ok(false);
             }
             Err(e) => {
-                tracing::debug!(path = %t.row.path.display(), error = %e, "transcript not readable");
+                tracing::debug!(path = %t.path.display(), error = %e, "transcript not readable");
                 return Ok(false);
             }
         };
@@ -976,12 +1300,11 @@ impl Watcher {
         let Some(t) = self.tracked.get(&id) else {
             return Ok(false);
         };
-        let row = &t.row;
-        if t.failed_at == Some((st.size, st.mtime))
-            || (row.caught_up
-                && row.size == st.size
-                && row.mtime == st.mtime
-                && fsinfo::same_file(row.identity.as_deref(), st.identity.as_deref()))
+        if t.failed_at.as_deref() == Some(&(st.size, st.mtime))
+            || (t.caught_up
+                && t.size == st.size
+                && t.mtime == st.mtime
+                && fsinfo::same_file(t.identity.as_deref(), st.identity.as_deref()))
         {
             return Ok(false);
         }
@@ -1012,7 +1335,7 @@ impl Watcher {
         let want = if home.polled || self.notify.is_none() {
             Vec::new()
         } else {
-            wanted_dirs(&t.row.path, &home.path, t.hot)
+            wanted_dirs(&t.path, &home.path, t.hot)
         };
         let have = std::mem::take(&mut t.watched);
         let kept = self.reconcile(have, want);
@@ -1022,47 +1345,51 @@ impl Watcher {
     }
 
     /// Moves a holder's watches from `have` to `want`; returns the folders it now holds.
-    fn reconcile(&mut self, have: Vec<PathBuf>, want: Vec<PathBuf>) -> Vec<PathBuf> {
+    fn reconcile(&mut self, have: Vec<Arc<Path>>, want: Vec<PathBuf>) -> Vec<Arc<Path>> {
         let mut kept = Vec::with_capacity(want.len());
         for d in have {
-            if want.contains(&d) {
+            if want.iter().any(|w| *w == *d) {
                 kept.push(d);
             } else {
                 self.unwatch_dir(&d);
             }
         }
         for d in want {
-            if !kept.contains(&d) && self.watch_dir(&d) {
-                kept.push(d);
+            if !kept.iter().any(|k| **k == *d)
+                && let Some(watched) = self.watch_dir(&d)
+            {
+                kept.push(watched);
             }
         }
         kept
     }
 
-    /// Adds a holder to a folder's watch, starting it if needed. Only a working watch counts.
-    fn watch_dir(&mut self, dir: &Path) -> bool {
-        if let Some(n) = self.dirs.get_mut(dir) {
-            *n += 1;
-            return true;
+    /// Adds a holder to a folder's watch, starting it if needed, and returns the folder as the
+    /// watches share it. Only a working watch counts.
+    fn watch_dir(&mut self, dir: &Path) -> Option<Arc<Path>> {
+        if let Some((shared, n)) = self.dirs.get_key_value(dir) {
+            let shared = Arc::clone(shared);
+            let n = n + 1;
+            self.dirs.insert(Arc::clone(&shared), n);
+            return Some(shared);
         }
-        let Some(w) = self.notify.as_mut() else {
-            return false;
-        };
+        let w = self.notify.as_mut()?;
         match w.watch(dir, RecursiveMode::NonRecursive) {
             Ok(()) => {
-                self.dirs.insert(dir.to_path_buf(), 1);
+                let shared: Arc<Path> = Arc::from(dir);
+                self.dirs.insert(Arc::clone(&shared), 1);
                 self.watch_failed.remove(dir);
-                true
+                Some(shared)
             }
             Err(e) if is_not_found(&e) => {
                 tracing::debug!(dir = %dir.display(), "folder is gone; not watching it");
-                false
+                None
             }
             Err(e) => {
                 if self.watch_failed.insert(dir.to_path_buf()) {
                     tracing::warn!(dir = %dir.display(), error = %e, "cannot watch a folder; the sweep still covers it");
                 }
-                false
+                None
             }
         }
     }
@@ -1082,15 +1409,20 @@ impl Watcher {
 
     /// Reads from the stored cursor until the adapter has nothing more.
     fn refresh(&mut self, id: u64, st: FileStat) -> Result<(), Hangup> {
+        if !self.load(id) {
+            return Ok(());
+        }
         let Some(t) = self.tracked.get_mut(&id) else {
             return Ok(());
         };
-        if needs_reindex(&t.row, &st) {
-            reindex(&mut t.row, &st);
-        }
-        t.tref.size = st.size;
-        t.tref.modified = st.mtime;
+        let tref = t.tref(st.size, st.mtime);
         let adapter = Arc::clone(&self.homes[t.home].adapter);
+        if let Some(l) = t.loaded.as_deref_mut()
+            && needs_reindex(&l.row, &st)
+        {
+            reindex(&mut l.row, &st);
+            l.dirty = true;
+        }
         let mut retried = false;
         for n in 0..=MAX_READS_PER_REFRESH {
             if self.shared.stopping() {
@@ -1102,11 +1434,14 @@ impl Watcher {
             if n == MAX_READS_PER_REFRESH {
                 // Let other transcripts have a turn; this one is read again next wake-up.
                 self.shared
-                    .mark(vec![t.row.path.clone()], Instant::now(), false);
+                    .mark(vec![t.path.to_path_buf()], Instant::now(), false);
                 break;
             }
-            let cursor = t.row.cursor.clone();
-            match guard(|| adapter.read_from(&t.tref, &cursor)) {
+            let Some(l) = t.loaded.as_deref_mut() else {
+                return Ok(());
+            };
+            let cursor = l.row.cursor.clone();
+            match guard(|| adapter.read_from(&tref, &cursor)) {
                 Ok(chunk) => {
                     // Any cursor change is progress; OpenCode's lives in `state`, not `offset`.
                     // The last read saves `caught_up`, even when it found nothing new.
@@ -1119,19 +1454,20 @@ impl Watcher {
                     }
                 }
                 Err(AdapterError::Source(SourceError::Unreadable { reason, .. }))
-                    if !retried && t.row.inner_id.is_none() && cursor.offset > st.size =>
+                    if !retried && l.row.inner_id.is_none() && cursor.offset > st.size =>
                 {
                     tracing::debug!(reason, "adapter reports a shorter file");
                     retried = true;
-                    reindex(&mut t.row, &st);
+                    reindex(&mut l.row, &st);
+                    l.dirty = true;
                 }
                 Err(e) => {
                     // Not read again until the file changes, and warned about once.
-                    t.failed_at = Some((st.size, st.mtime));
+                    t.failed_at = Some(Box::new((st.size, st.mtime)));
                     if t.warned {
-                        tracing::debug!(path = %t.row.path.display(), error = %e, "cannot read transcript");
+                        tracing::debug!(path = %t.path.display(), error = %e, "cannot read transcript");
                     } else {
-                        tracing::warn!(path = %t.row.path.display(), error = %e, "cannot read transcript; trying again when it changes");
+                        tracing::warn!(path = %t.path.display(), error = %e, "cannot read transcript; trying again when it changes");
                         t.warned = true;
                     }
                     break;
@@ -1153,15 +1489,19 @@ impl Watcher {
         let Some(t) = self.tracked.get_mut(&id) else {
             return Ok(());
         };
-        let session = t.row.session;
+        let (path, home) = (Arc::clone(&t.path), t.home);
+        let Some(row) = t.row() else {
+            return Ok(());
+        };
+        let session = row.session;
         let place = |row: &Row| row.meta.as_ref().map(|m| (m.cwd.clone(), m.branch.clone()));
-        let was = place(&t.row);
+        let was = place(row);
         if let Some(meta) = chunk.meta {
-            t.row.meta = Some(meta);
+            row.meta = Some(meta);
         }
-        let first = !t.row.discovered;
-        let moved = !first && place(&t.row) != was;
-        let cwd = t.row.meta.as_ref().and_then(|m| m.cwd.clone());
+        let first = !row.discovered;
+        let moved = !first && place(row) != was;
+        let cwd = row.meta.as_ref().and_then(|m| m.cwd.clone());
         let ctx = derive::Ctx {
             session,
             cwd: cwd.as_deref(),
@@ -1178,18 +1518,16 @@ impl Watcher {
                 key = derive::nth(key, *n);
             }
             *n += 1;
-            derive::apply(&mut t.row.facts, &ctx, item, key, &mut derived);
+            derive::apply(&mut row.facts, &ctx, item, key, &mut derived);
             // Accepted before a crash: fold the item, don't send it again.
-            if t.row.accepted.contains(&key) {
+            if row.accepted.contains(&key) {
                 derived.truncate(before);
             }
         }
-        let engine = t.row.engine;
-        let native = native_id(&t.row);
-        let path = t.row.path.clone();
-        let home = t.home;
-        let subagent = t.row.meta.as_ref().is_some_and(|m| m.is_subagent);
-        let started = t.row.meta.as_ref().and_then(|m| m.started);
+        let engine = row.engine;
+        let native = native_id(row);
+        let subagent = row.meta.as_ref().is_some_and(|m| m.is_subagent);
+        let started = row.meta.as_ref().and_then(|m| m.started);
         self.map_native(id, session, engine, &native, subagent, first);
 
         // Facts from elsewhere: the parent of a sub-agent, the terminal the runner started the
@@ -1215,13 +1553,17 @@ impl Watcher {
         let Some(t) = self.tracked.get_mut(&id) else {
             return Ok(());
         };
+        let Some(l) = t.loaded.as_deref_mut() else {
+            return Ok(());
+        };
+        let row = &mut l.row;
         // Kept with the row, so its hooks are judged by the parent its discovery names, after a
         // restart too. A failed lookup is not kept: it is tried again at the next hook.
         if first
             && subagent
             && let Ok(found) = parent
         {
-            t.row.facts.parent = Some(found);
+            row.facts.parent = Some(found);
         }
         let parent = parent.ok().and_then(Parent::session);
         let event = |id, at, body| Event {
@@ -1237,11 +1579,11 @@ impl Watcher {
             // Hooks that came first are folded in, oldest first, unless the transcript is newer.
             let mut changed = false;
             for r in &held {
-                changed |= derive::report(&mut t.row.facts, r).is_some();
+                changed |= derive::report(&mut row.facts, r).is_some();
             }
-            let ended = changed && t.row.facts.state == SessionState::Ended;
-            let s = session_of(&t.row, &t.tref, machine, parent, terminal);
-            let at = discovered_id_time(&t.row);
+            let ended = changed && row.facts.state == SessionState::Ended;
+            let s = session_of(row, st.mtime, machine, parent, terminal);
+            let at = discovered_id_time(row);
             events.push((
                 None,
                 event(
@@ -1251,27 +1593,27 @@ impl Watcher {
                 ),
             ));
             if ended {
-                t.row.facts.reports += 1;
-                let n = t.row.facts.reports;
-                let at = t.row.facts.reported_at.unwrap_or(at);
+                row.facts.reports += 1;
+                let n = row.facts.reports;
+                let at = row.facts.reported_at.unwrap_or(at);
                 events.push((
                     None,
                     event(
-                        event_id(session, t.row.generation, Cause::Report(n), 0, at),
+                        event_id(session, row.generation, Cause::Report(n), 0, at),
                         at,
                         EventBody::SessionEnded { session },
                     ),
                 ));
             }
-            t.row.discovered = true;
+            row.discovered = true;
         }
         if let Some((locations, stands)) = &places {
             let at = if first {
-                discovered_id_time(&t.row)
+                discovered_id_time(row)
             } else {
                 crate::now_ms()
             };
-            if let Some(e) = link_event(&mut t.row, machine, locations, *stands, at) {
+            if let Some(e) = link_event(row, machine, locations, *stands, at) {
                 events.push((None, event(e.0, e.1, e.2)));
             }
         }
@@ -1280,22 +1622,25 @@ impl Watcher {
         for d in derived {
             seq = if last == Some(d.key) { seq + 1 } else { 0 };
             last = Some(d.key);
-            let id = event_id(session, t.row.generation, Cause::Item(d.key), seq, d.at);
+            let id = event_id(session, row.generation, Cause::Item(d.key), seq, d.at);
             events.push((Some(d.key), event(id, d.at, d.body)));
         }
-        t.row.cursor = chunk.cursor;
-        t.row.size = st.size;
-        t.row.mtime = st.mtime;
-        t.row.identity.clone_from(&st.identity);
-        t.row.caught_up = caught_up;
+        row.cursor = chunk.cursor;
+        row.size = st.size;
+        row.mtime = st.mtime;
+        row.identity.clone_from(&st.identity);
+        row.caught_up = caught_up;
         if caught_up {
             // The replay after a crash is over.
-            t.row.accepted.clear();
+            row.accepted.clear();
         }
 
-        let batches = split(events, self.max_batch, &t.row);
-        for b in batches {
-            self.tx.send(b).map_err(|_| Hangup)?;
+        let batches = split(events, self.max_batch, row);
+        let unsaved = l.sending();
+        t.sync();
+        for mut b in batches {
+            b.unsaved = Some(Arc::clone(&unsaved));
+            self.send(b)?;
         }
         Ok(())
     }
@@ -1311,8 +1656,8 @@ impl Watcher {
             let indexed = id.and_then(|id| {
                 self.tracked
                     .get(&id)
-                    .filter(|t| t.row.discovered)
-                    .map(|t| (id, t.row.session))
+                    .filter(|t| t.discovered)
+                    .map(|t| (id, t.session))
             });
             tracing::debug!(target = ?s.target, report = ?s.report, origin = ?s.origin, tracked = ?id, "reported state");
             match (indexed, s.origin) {
@@ -1389,16 +1734,20 @@ impl Watcher {
         let Some(t) = self.tracked.get(&id) else {
             return Ok(Parent::None);
         };
-        if let Some(parent) = t.row.facts.parent {
+        if let Some(parent) = t.parent {
             return Ok(parent);
         }
-        if !t.row.meta.as_ref().is_some_and(|m| m.is_subagent) {
+        if !t.subagent {
             return Ok(Parent::None);
         }
-        let (engine, path, home) = (t.row.engine, t.row.path.clone(), t.home);
+        let (engine, path, home) = (t.engine, Arc::clone(&t.path), t.home);
         let parent = self.parent_of(engine, &path, home)?;
         if let Some(t) = self.tracked.get_mut(&id) {
-            t.row.facts.parent = Some(parent);
+            // Saved with the row's next change (see `load`).
+            t.parent = Some(parent);
+            if let Some(row) = t.row() {
+                row.facts.parent = Some(parent);
+            }
         }
         Ok(parent)
     }
@@ -1430,15 +1779,27 @@ impl Watcher {
 
     fn apply_report(&mut self, id: u64, r: &Reported) -> Result<(), Hangup> {
         let (workspace, owner) = (self.workspace, self.owner);
+        if !self.load(id) {
+            return Ok(());
+        }
         let Some(t) = self.tracked.get_mut(&id) else {
             return Ok(());
         };
-        let Some(from) = derive::report(&mut t.row.facts, r) else {
+        let Some(l) = t.loaded.as_deref_mut() else {
             return Ok(());
         };
-        t.row.facts.reports += 1;
-        let (session, generation, n) = (t.row.session, t.row.generation, t.row.facts.reports);
-        let events = derive::reported_events(session, from, &t.row.facts)
+        let row = &mut l.row;
+        let was = row.facts.clone();
+        let Some(from) = derive::report(&mut row.facts, r) else {
+            // The state stands, but when it was reported, or its status line, may have moved.
+            if row.facts != was {
+                l.dirty = true;
+            }
+            return Ok(());
+        };
+        row.facts.reports += 1;
+        let (session, generation, n) = (row.session, row.generation, row.facts.reports);
+        let events = derive::reported_events(session, from, &row.facts)
             .into_iter()
             .zip(0u32..)
             .map(|(body, seq)| Event {
@@ -1450,12 +1811,14 @@ impl Watcher {
                 body,
             })
             .collect();
-        self.tx
-            .send(Batch {
-                events,
-                commit: Commit::Full(Box::new(t.row.clone())),
-            })
-            .map_err(|_| Hangup)
+        let commit = Commit::Full(Box::new(row.clone()));
+        let unsaved = Some(l.sending());
+        t.sync();
+        self.send(Batch {
+            events,
+            commit,
+            unsaved,
+        })
     }
 
     /// Maps tracked transcript `id` (session `session`) by its CLI id, for the hooks that name
@@ -1479,7 +1842,7 @@ impl Watcher {
         if native.is_empty() {
             return;
         }
-        let key = (engine, native.to_owned());
+        let key = (engine, Box::<str>::from(native));
         if !subagent {
             self.by_native.insert(key, id);
             return;
@@ -1487,7 +1850,7 @@ impl Watcher {
         let holder = match self.by_sub_native.get(&key) {
             None => None,
             Some(&held) if held == id => return,
-            Some(held) => self.tracked.get(held).map(|t| t.row.session),
+            Some(held) => self.tracked.get(held).map(|t| t.session),
         };
         if holder.is_some_and(|first| first < session) {
             if loud {
@@ -1502,7 +1865,7 @@ impl Watcher {
 
     /// The tracked transcript a hook's CLI id names: a session's before a sub-agent's.
     fn find_native(&self, engine: Engine, native: &str) -> Option<u64> {
-        let key = (engine, native.to_owned());
+        let key = (engine, Box::<str>::from(native));
         self.by_native
             .get(&key)
             .or_else(|| self.by_sub_native.get(&key))
@@ -1546,15 +1909,19 @@ impl Watcher {
         let ids: Vec<u64> = self.tracked.keys().copied().collect();
         for id in ids {
             self.serve_due()?;
-            let Some(t) = self.tracked.get_mut(&id) else {
-                continue;
-            };
-            if !t.row.discovered {
+            if !self.tracked.get(&id).is_some_and(|t| t.discovered) || !self.load(id) {
                 continue;
             }
-            let stands = locations.link_of(t.row.session);
+            let Some(l) = self
+                .tracked
+                .get_mut(&id)
+                .and_then(|t| t.loaded.as_deref_mut())
+            else {
+                continue;
+            };
+            let stands = locations.link_of(l.row.session);
             let Some((eid, at, body)) =
-                link_event(&mut t.row, machine, &all, stands, crate::now_ms())
+                link_event(&mut l.row, machine, &all, stands, crate::now_ms())
             else {
                 continue;
             };
@@ -1566,12 +1933,13 @@ impl Watcher {
                 on_behalf_of: None,
                 body,
             };
-            self.tx
-                .send(Batch {
-                    events: vec![event],
-                    commit: Commit::Full(Box::new(t.row.clone())),
-                })
-                .map_err(|_| Hangup)?;
+            let commit = Commit::Full(Box::new(l.row.clone()));
+            let unsaved = Some(l.sending());
+            self.send(Batch {
+                events: vec![event],
+                commit,
+                unsaved,
+            })?;
         }
         Ok(())
     }
@@ -1598,10 +1966,10 @@ impl Watcher {
         }
         if let Some(t) = self
             .by_key
-            .get(&(parent.clone(), None))
+            .get(&key(&parent, None))
             .and_then(|id| self.tracked.get(id))
         {
-            return Ok(Parent::Session(t.row.session));
+            return Ok(Parent::Session(t.session));
         }
         let store = self.store_lock();
         match store.find(&parent, None) {
@@ -1845,6 +2213,7 @@ fn split(events: Vec<(Option<u64>, Event)>, max: usize, row: &Row) -> Vec<Batch>
                     session: row.session,
                     keys: std::mem::take(&mut keys),
                 },
+                unsaved: None,
             });
         }
         if let Some(k) = key {
@@ -1858,6 +2227,7 @@ fn split(events: Vec<(Option<u64>, Event)>, max: usize, row: &Row) -> Vec<Batch>
     out.push(Batch {
         events: current,
         commit: Commit::Full(Box::new(row.clone())),
+        unsaved: None,
     });
     out
 }
@@ -1922,24 +2292,9 @@ fn discovered_id_time(row: &Row) -> TimestampMs {
         .unwrap_or_else(|| TimestampMs::try_from(row.session.0.timestamp_ms()).unwrap_or(0))
 }
 
-/// The CLI's id for the session: from its records, else the store's inner id, else the file name.
-fn native_id(row: &Row) -> String {
-    row.meta
-        .as_ref()
-        .map(|m| m.native_id.clone())
-        .filter(|n| !n.is_empty())
-        .or_else(|| row.inner_id.clone())
-        .or_else(|| {
-            row.path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-        })
-        .unwrap_or_default()
-}
-
 fn session_of(
     row: &Row,
-    tref: &TranscriptRef,
+    modified: TimestampMs,
     machine: MachineId,
     parent: Option<SessionId>,
     terminal: Option<TerminalId>,
@@ -1948,7 +2303,7 @@ fn session_of(
     let last_activity = if row.facts.last_activity > 0 {
         row.facts.last_activity
     } else {
-        tref.modified
+        modified
     };
     Session {
         id: row.session,
@@ -2108,6 +2463,46 @@ mod tests {
     }
 
     #[test]
+    fn the_id_map_keeps_ids_in_order() {
+        let mut m = IdMap::default();
+        for id in [3u64, 1, 7, 5] {
+            m.insert(id, id * 10);
+        }
+        m.insert(5, 55);
+        assert_eq!(m.keys().copied().collect::<Vec<_>>(), [1, 3, 5, 7]);
+        assert_eq!(m.values().copied().collect::<Vec<_>>(), [10, 30, 55, 70]);
+        assert_eq!(m.get(&7), Some(&70));
+        assert_eq!(m.get(&4), None);
+        if let Some(v) = m.get_mut(&1) {
+            *v = 11;
+        }
+        assert_eq!(m.remove(&3), Some(30));
+        assert_eq!(m.remove(&3), None);
+        assert_eq!(m.keys().copied().collect::<Vec<_>>(), [1, 5, 7]);
+        assert_eq!(m[&1], 11);
+        // Growing by an eighth, not doubling.
+        let mut big = IdMap::default();
+        for id in 0..10_000u64 {
+            big.insert(id, ());
+        }
+        assert!(big.entries.capacity() < 10_000 + 10_000 / 8 + 32);
+    }
+
+    #[test]
+    fn ids_at_one_path() {
+        let mut ids = Ids::One(4);
+        assert_eq!(ids.to_vec(), [4]);
+        ids.push(9);
+        ids.push(2);
+        assert_eq!(ids.to_vec(), [4, 9, 2]);
+        assert!(ids.remove(9));
+        assert!(ids.remove(4));
+        assert!(!ids.remove(2), "none left");
+        assert!(!Ids::One(1).remove(1));
+        assert!(Ids::One(1).remove(2));
+    }
+
+    #[test]
     fn reindex_on_shrink_or_replacement_only() {
         let r = row();
         assert!(!needs_reindex(&r, &stat(20, "1:1")));
@@ -2243,6 +2638,27 @@ mod tests {
         Arc<crate::MemoryAgents>,
         std::sync::mpsc::Receiver<Batch>,
     ) {
+        watcher_with(
+            home,
+            state,
+            Arc::new(pitcrew_interfaces::fake::FakeSource::new(
+                Engine::Claude,
+                Vec::new(),
+                Vec::new(),
+            )),
+        )
+    }
+
+    /// A watcher over one Claude home read by `adapter`, with nothing tracked yet.
+    fn watcher_with(
+        home: &Path,
+        state: &Path,
+        adapter: Arc<dyn SourceAdapter>,
+    ) -> (
+        Watcher,
+        Arc<crate::MemoryAgents>,
+        std::sync::mpsc::Receiver<Batch>,
+    ) {
         let agents = Arc::new(crate::MemoryAgents::new());
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
         let watcher = Watcher::new(Setup {
@@ -2256,11 +2672,7 @@ mod tests {
                 engine: Engine::Claude,
                 path: home.to_path_buf(),
             }],
-            adapters: vec![Arc::new(pitcrew_interfaces::fake::FakeSource::new(
-                Engine::Claude,
-                Vec::new(),
-                Vec::new(),
-            ))],
+            adapters: vec![adapter],
             rows: Vec::new(),
             store: Arc::new(Mutex::new(Store::open(state).unwrap())),
             tx,
@@ -2270,6 +2682,219 @@ mod tests {
             watched: Arc::default(),
         });
         (watcher, agents, rx)
+    }
+
+    /// A Claude adapter whose transcripts and items can grow: one item per read, the cursor's
+    /// offset counting items.
+    #[derive(Debug, Default)]
+    struct Growing {
+        transcripts: Mutex<Vec<TranscriptRef>>,
+        items: Mutex<Vec<pitcrew_interfaces::source::TranscriptItem>>,
+    }
+
+    impl SourceAdapter for Growing {
+        fn engine(&self) -> Engine {
+            Engine::Claude
+        }
+
+        fn discover(&self, _home: &Path) -> Result<Vec<TranscriptRef>, SourceError> {
+            Ok(self.transcripts.lock().unwrap().clone())
+        }
+
+        fn read_from(
+            &self,
+            _t: &TranscriptRef,
+            cursor: &Cursor,
+        ) -> Result<ParseChunk, SourceError> {
+            let items = self.items.lock().unwrap();
+            let next: Vec<_> = items
+                .get(usize::try_from(cursor.offset).unwrap())
+                .cloned()
+                .into_iter()
+                .collect();
+            Ok(ParseChunk {
+                cursor: Cursor {
+                    offset: cursor.offset + next.len() as u64,
+                    state: None,
+                },
+                meta: None,
+                items: next,
+            })
+        }
+
+        fn read_page(
+            &self,
+            _t: &TranscriptRef,
+            _before: Option<u64>,
+            _limit: usize,
+        ) -> Result<pitcrew_interfaces::source::TranscriptPage, SourceError> {
+            Err(SourceError::Io(io::Error::other("not paged in this test")))
+        }
+    }
+
+    /// Hands every queued batch to the index, as the sink thread does once the sink accepts it.
+    /// Returns the events.
+    fn save_all(w: &Watcher, rx: &std::sync::mpsc::Receiver<Batch>) -> Vec<Event> {
+        let mut events = Vec::new();
+        while let Ok(batch) = rx.try_recv() {
+            w.store_lock().commit(&batch.commit).unwrap();
+            if let Some(unsaved) = &batch.unsaved {
+                unsaved.fetch_sub(1, Ordering::AcqRel);
+            }
+            events.extend(batch.events);
+        }
+        events
+    }
+
+    /// A transcript's whole row stays in memory only while it is in use or its changes are not
+    /// saved; afterwards the watcher keeps only what tells a change, and the next change reads the
+    /// row back and goes on from the saved cursor.
+    #[test]
+    fn a_saved_row_is_let_go_and_read_back() {
+        use pitcrew_interfaces::source::TranscriptItem;
+
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let path = home.join("projects").join("p").join("s.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"x").unwrap();
+        let adapter = Arc::new(Growing::default());
+        adapter.transcripts.lock().unwrap().push(TranscriptRef {
+            engine: Engine::Claude,
+            path: path.clone(),
+            inner_id: None,
+            size: 1,
+            modified: 0,
+        });
+        let turn = |n: u64| TranscriptItem::TurnEnded {
+            at: 1_790_755_200_000 + i64::try_from(n).unwrap(),
+            offset: n,
+        };
+        adapter.items.lock().unwrap().extend([turn(0), turn(1)]);
+        let (mut w, _agents, rx) = watcher_with(&home, state.path(), adapter.clone());
+
+        assert!(w.start().is_ok());
+        let id = *w.tracked.keys().next().unwrap();
+        w.let_go();
+        assert_eq!(w.loaded, [id], "not saved yet: the row stays");
+        assert!(w.tracked[&id].loaded.is_some());
+        let first = save_all(&w, &rx);
+        assert_eq!(first.len(), 3, "discovered and two turns: {first:?}");
+        w.let_go();
+        assert!(w.loaded.is_empty());
+        assert!(w.tracked[&id].loaded.is_none());
+        let t = &w.tracked[&id];
+        assert!(t.discovered && t.caught_up);
+        assert_eq!(t.size, 1);
+
+        // Two more turns: the row is read back, and reading goes on from where it was saved.
+        adapter.items.lock().unwrap().extend([turn(2), turn(3)]);
+        std::fs::write(&path, b"xyz").unwrap();
+        assert!(w.check(id).is_ok_and(|changed| changed));
+        let more = save_all(&w, &rx);
+        let offsets: Vec<u64> = more
+            .iter()
+            .map(|e| match &e.body {
+                EventBody::TurnEnded {
+                    receipt: pitcrew_protocol::model::Receipt::Transcript { offset, .. },
+                    ..
+                } => *offset,
+                other => panic!("only the new turns: {other:?}"),
+            })
+            .collect();
+        assert_eq!(offsets, [2, 3]);
+        w.let_go();
+        assert!(w.loaded.is_empty());
+        let saved = w
+            .store_lock()
+            .load(w.tracked[&id].session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.cursor.offset, 4);
+        assert_eq!(saved.size, 3);
+        assert_eq!(w.tracked[&id].size, 3);
+
+        // Unchanged: nothing is read, and nothing is loaded.
+        assert!(w.check(id).is_ok_and(|changed| !changed));
+        assert!(w.loaded.is_empty());
+    }
+
+    /// A change no batch carries yet keeps the whole row in memory until one does, as before:
+    /// a report that repeats the state still moves when the state was last reported, and a late
+    /// hook is judged by that.
+    #[test]
+    fn a_change_not_saved_yet_keeps_the_row() {
+        use pitcrew_interfaces::source::TranscriptItem;
+
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let path = home.join("projects").join("p").join("s.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"x").unwrap();
+        let adapter = Arc::new(Growing::default());
+        adapter.transcripts.lock().unwrap().push(TranscriptRef {
+            engine: Engine::Claude,
+            path: path.clone(),
+            inner_id: None,
+            size: 1,
+            modified: 0,
+        });
+        let base = 1_790_755_200_000;
+        let turn = |n: u64| TranscriptItem::TurnEnded {
+            at: base + i64::try_from(n).unwrap(),
+            offset: n,
+        };
+        adapter.items.lock().unwrap().push(turn(0));
+        let (mut w, _agents, rx) = watcher_with(&home, state.path(), adapter.clone());
+        assert!(w.start().is_ok());
+        let id = *w.tracked.keys().next().unwrap();
+        save_all(&w, &rx);
+        w.let_go();
+        assert!(w.loaded.is_empty());
+        let session = w.tracked[&id].session;
+        let now = w.store_lock().load(session).unwrap().unwrap().facts.state;
+
+        // The same state, reported later with a status line: no event, nothing to save yet.
+        let same = Reported {
+            at: base + 100,
+            to: now,
+            status_line: Some("thinking".into()),
+        };
+        assert!(w.apply_report(id, &same).is_ok());
+        assert!(rx.try_recv().is_err(), "no batch for a state that stands");
+        w.let_go();
+        assert_eq!(
+            w.loaded,
+            [id],
+            "the report's time is not saved yet: the row stays"
+        );
+
+        // A hook from before that report is late, and changes nothing.
+        let other = if now == SessionState::Working {
+            SessionState::Waiting
+        } else {
+            SessionState::Working
+        };
+        let late = Reported {
+            at: base + 50,
+            to: other,
+            status_line: None,
+        };
+        assert!(w.apply_report(id, &late).is_ok());
+        assert!(rx.try_recv().is_err(), "a late hook moves nothing");
+
+        // The next read carries the row, report time and all; then it goes.
+        adapter.items.lock().unwrap().push(turn(1));
+        std::fs::write(&path, b"xy").unwrap();
+        assert!(w.check(id).is_ok_and(|changed| changed));
+        save_all(&w, &rx);
+        w.let_go();
+        assert!(w.loaded.is_empty());
+        let saved = w.store_lock().load(session).unwrap().unwrap();
+        assert_eq!(saved.facts.reported_at, Some(base + 100));
+        assert_eq!(saved.cursor.offset, 2);
     }
 
     /// When the index cannot say who a sub-agent's parent is, its hooks are refused (unknown),
@@ -2301,15 +2926,12 @@ mod tests {
             ..Default::default()
         });
         let sub = row.session;
-        let id = w.track(row, tref, 0);
+        let id = w.track(&Indexed::of(&row), Some(row), 0, tref.size, tref.modified);
 
         w.store_lock().hide_transcripts(true).unwrap();
         assert_eq!(w.parent_for(id), Err(LookupFailed));
         assert_eq!(w.runs_as(sub, Err(LookupFailed)), SessionAgent::Unknown);
-        assert_eq!(
-            w.tracked[&id].row.facts.parent, None,
-            "a failure is not kept"
-        );
+        assert_eq!(w.tracked[&id].parent, None, "a failure is not kept");
         // The sub-agent's own answer, when it has one, still stands.
         let own = SessionAgent::Agent {
             agent: MemberId::new(),
@@ -2323,9 +2945,12 @@ mod tests {
         let Ok(Parent::Session(parent)) = w.parent_for(id) else {
             panic!("the parent is found once the index answers");
         };
+        assert_eq!(w.tracked[&id].parent, Some(Parent::Session(parent)));
+        let row = w.tracked.get_mut(&id).and_then(Tracked::row);
         assert_eq!(
-            w.tracked[&id].row.facts.parent,
-            Some(Parent::Session(parent))
+            row.map(|r| r.facts.parent),
+            Some(Some(Parent::Session(parent))),
+            "kept with the row in memory, to be saved with it"
         );
         let writer = SessionAgent::Agent {
             agent: MemberId::new(),

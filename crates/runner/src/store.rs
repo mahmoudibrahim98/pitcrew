@@ -5,14 +5,14 @@
 //! through a lock file. On a network filesystem the index uses a rollback journal, since WAL's
 //! shared memory is not safe there.
 
-use crate::derive::Facts;
+use crate::derive::{Facts, Parent};
 use crate::fsinfo;
 use pitcrew_interfaces::source::{Cursor, SessionMeta};
 use pitcrew_protocol::ids::{CommandId, SessionId, TerminalId};
 use pitcrew_protocol::model::{Engine, TimestampMs};
 use pitcrew_protocol::runner::CommandOutcome;
 use rusqlite::{Connection, OptionalExtension as _, params};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -89,6 +89,61 @@ pub(crate) struct Row {
     pub facts: Facts,
 }
 
+/// What the watcher keeps of a transcript row from the start: what tells a change, and what
+/// routes hooks to its session. The rest of the row is read when needed ([`Store::load`]).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Indexed {
+    pub session: SessionId,
+    pub engine: Engine,
+    pub path: PathBuf,
+    pub inner_id: Option<String>,
+    pub size: u64,
+    pub mtime: TimestampMs,
+    pub identity: Option<String>,
+    pub caught_up: bool,
+    pub discovered: bool,
+    /// The CLI's id for the session (see `watch::native_id`), once a read learned its metadata.
+    pub native: Option<String>,
+    pub subagent: bool,
+    /// The parent kept with the row (`Facts::parent`).
+    pub parent: Option<Parent>,
+}
+
+impl Indexed {
+    /// What the watcher keeps of `row`.
+    pub fn of(row: &Row) -> Self {
+        Self {
+            session: row.session,
+            engine: row.engine,
+            path: row.path.clone(),
+            inner_id: row.inner_id.clone(),
+            size: row.size,
+            mtime: row.mtime,
+            identity: row.identity.clone(),
+            caught_up: row.caught_up,
+            discovered: row.discovered,
+            native: row.meta.as_ref().map(|_| native_id(row)),
+            subagent: row.meta.as_ref().is_some_and(|m| m.is_subagent),
+            parent: row.facts.parent,
+        }
+    }
+}
+
+/// The CLI's id for the session: from its records, else the store's inner id, else the file name.
+pub(crate) fn native_id(row: &Row) -> String {
+    row.meta
+        .as_ref()
+        .map(|m| m.native_id.clone())
+        .filter(|n| !n.is_empty())
+        .or_else(|| row.inner_id.clone())
+        .or_else(|| {
+            row.path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+        })
+        .unwrap_or_default()
+}
+
 /// What to save once the sink has accepted a batch.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Commit {
@@ -162,8 +217,44 @@ impl Store {
         Ok(())
     }
 
+    /// What the watcher keeps of every transcript at start ([`Indexed`]). Each row is read
+    /// whole, as before, and let go once its [`Indexed`] is taken: the cursors, facts and metadata
+    /// are read again with [`Store::load`] when needed.
+    pub fn load_index(&self) -> Result<Vec<Indexed>, StoreError> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM transcripts ORDER BY path, inner_id"
+        ))?;
+        let mut found = stmt.query([])?;
+        let mut rows = Vec::new();
+        while let Some(r) = found.next()? {
+            // The accepted items do not matter here: `load` reads them with the row.
+            match raw_row(r)?.decode(HashSet::new()) {
+                Ok(row) => rows.push(Indexed::of(&row)),
+                // One bad row must not stop the runner. Its path stays taken, so that transcript is
+                // not indexed again until the row is removed.
+                Err(e) => tracing::error!(error = %e, "skipping an unreadable runner store row"),
+            }
+        }
+        Ok(rows)
+    }
+
+    /// A transcript's whole row, by its session.
+    pub fn load(&self, session: SessionId) -> Result<Option<Row>, StoreError> {
+        let id = session.0.to_string();
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {COLUMNS} FROM transcripts WHERE session_id = ?1"
+        ))?;
+        let Some(raw) = stmt.query_row([&id], raw_row).optional()? else {
+            return Ok(None);
+        };
+        let keys = self.accepted_keys(&id)?;
+        raw.decode(keys).map(Some)
+    }
+
+    #[cfg(test)]
     pub fn load_all(&self) -> Result<Vec<Row>, StoreError> {
-        let mut accepted: HashMap<String, HashSet<u64>> = HashMap::new();
+        let mut accepted: std::collections::HashMap<String, HashSet<u64>> =
+            std::collections::HashMap::new();
         {
             let mut stmt = self
                 .conn
@@ -481,7 +572,13 @@ impl Store {
 
     #[cfg(test)]
     pub fn get(&self, session: SessionId) -> Result<Option<Row>, StoreError> {
-        Ok(self.load_all()?.into_iter().find(|r| r.session == session))
+        let found = self.load(session)?;
+        assert_eq!(
+            found,
+            self.load_all()?.into_iter().find(|r| r.session == session),
+            "a row loaded alone is the row loaded with the others"
+        );
+        Ok(found)
     }
 }
 
@@ -576,7 +673,9 @@ impl Drop for InstanceLock {
     /// Unlocks before the file is closed. A process another thread is starting holds a copy of
     /// every descriptor until it runs its program, and an flock lasts while any copy is open:
     /// closing alone can leave the lock held a moment after the runner stopped, and refuse the
-    /// next one (seen on macOS, where reading the host name starts `hostname`).
+    /// next one (seen on macOS, where reading the host name starts `hostname`). `LOCK_UN`
+    /// releases the lock of the open file every copy shares, so a child forked to keep the lock
+    /// would lose it here; none is meant to.
     fn drop(&mut self) {
         let _ = rustix::fs::flock(&self._file, rustix::fs::FlockOperation::Unlock);
     }
@@ -842,6 +941,62 @@ mod tests {
                 .expect("find")
                 .is_some()
         );
+    }
+
+    /// The start keeps of each row what the watcher needs, the same as from the whole row, and a
+    /// row that cannot be read is skipped without stopping the others.
+    #[test]
+    fn the_index_at_start_is_what_the_rows_say() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open");
+        let mut session = row("/t/a.jsonl");
+        session.size = 7;
+        session.mtime = 9;
+        session.identity = Some("1:2".into());
+        session.caught_up = true;
+        session.discovered = true;
+        session.meta = Some(SessionMeta {
+            native_id: String::new(),
+            ..SessionMeta::default()
+        });
+        let mut sub = row("/t/s/subagents/b.jsonl");
+        sub.inner_id = Some("b".into());
+        sub.meta = Some(SessionMeta {
+            native_id: "agent-b".into(),
+            is_subagent: true,
+            ..SessionMeta::default()
+        });
+        sub.facts.parent = Some(Parent::Session(session.session));
+        let fresh = row("/t/c.jsonl");
+        let broken = row("/t/d.jsonl");
+        for r in [&session, &sub, &fresh, &broken] {
+            store.insert(r).expect("insert");
+            store
+                .commit(&Commit::Full(Box::new(r.clone())))
+                .expect("full");
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE transcripts SET facts = '{not json' WHERE session_id = ?1",
+                [broken.session.0.to_string()],
+            )
+            .expect("break a row");
+
+        let index = store.load_index().expect("index");
+        assert_eq!(
+            index,
+            vec![
+                Indexed::of(&session),
+                Indexed::of(&fresh),
+                Indexed::of(&sub)
+            ]
+        );
+        // Without a native id in its records, a session is known by its file name.
+        assert_eq!(index[0].native.as_deref(), Some("a"));
+        assert_eq!(index[2].native.as_deref(), Some("agent-b"));
+        assert!(index[2].subagent);
+        assert_eq!(index[1].native, None, "not read yet");
     }
 
     fn terminal(engine: Engine, native_id: Option<&str>, cwd: &str, at: i64) -> TerminalRow {

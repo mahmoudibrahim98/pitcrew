@@ -20,8 +20,9 @@
 //!   once it is set up (`crate::setup`), without a restart. The routes reach it through
 //!   [`Attached`], which is empty until then.
 //! - **Its terminals** run on the runtime chosen at start ([`TerminalRuntime`]: tmux where it is
-//!   usable, else none); its commands start and drive sessions in them (`crate::sessions`), and
-//!   its transcript pages answer `GET /v1/sessions/{id}/transcript` (`crate::transcripts`).
+//!   usable, else pitcrew-ptyd, else none); its commands start and drive sessions in them
+//!   (`crate::sessions`), and its transcript pages answer `GET /v1/sessions/{id}/transcript`
+//!   (`crate::transcripts`).
 
 use crate::agents::HubAgents;
 use crate::cli::HomeArg;
@@ -36,6 +37,7 @@ use pitcrew_ingest::opencode::OpenCodeAdapter;
 use pitcrew_interfaces::source::SourceAdapter;
 use pitcrew_protocol::ids::{MachineId, MemberId};
 use pitcrew_protocol::model::{Engine, MemberKind};
+use pitcrew_protocol::runner::Capability;
 use pitcrew_runner::{
     EngineHome, RunnerCommands, RunnerConfig, RunnerHandle, RunnerHooks, RunnerTerminals,
     RunnerTranscripts, StoreSink,
@@ -60,8 +62,9 @@ pub struct Parts {
     pub transcripts: RunnerTranscripts,
     /// Whether it watches at least one home (`GET /v1/host/info`'s `watch` capability).
     pub watches: bool,
-    /// Whether its terminals run in tmux (host info's `tmux` capability).
-    pub tmux: bool,
+    /// What its terminals run in: host info's `tmux` or `pty` capability; `None` without a
+    /// terminal runtime.
+    pub runtime: Option<Capability>,
 }
 
 /// The runner the routes reach, once there is one: set once, when it starts (with the daemon, or
@@ -238,7 +241,7 @@ fn parts_of(
         terminals,
         transcripts: handle.transcripts(),
         watches,
-        tmux: runtime.tmux(),
+        runtime: runtime.capability(),
     })
 }
 

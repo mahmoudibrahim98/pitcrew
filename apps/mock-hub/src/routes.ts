@@ -69,8 +69,8 @@ import {
   oneOf,
   queryEnums,
   queryInt,
+  queryId,
   queryLimit,
-  queryValue,
   unavailable,
 } from './validate.ts';
 
@@ -483,7 +483,7 @@ function requireStartBeforeDue(start: string | undefined, due: string | undefine
 }
 
 const listWorkstreams: Handler = (hub, ctx) => {
-  const project = queryValue(ctx.query, 'project');
+  const project = queryId(ctx.query, 'project', 'prj');
   return ok(hub.workstreams.filter((w) => project === undefined || w.project === project));
 };
 
@@ -511,9 +511,9 @@ const patchWorkstream: Handler = (hub, ctx) => {
 // ─── Tasks ──────────────────────────────────────────────────────────────────────────────────────
 
 const listTasks: Handler = (hub, ctx) => {
-  const project = queryValue(ctx.query, 'project');
-  const workstream = queryValue(ctx.query, 'workstream');
-  const assignee = queryValue(ctx.query, 'assignee');
+  const project = queryId(ctx.query, 'project', 'prj');
+  const workstream = queryId(ctx.query, 'workstream', 'wst');
+  const assignee = queryId(ctx.query, 'assignee', 'mem');
   const statuses = queryEnums(ctx.query, 'status', TASK_STATUSES);
   return ok(
     hub.tasks.filter(
@@ -938,9 +938,9 @@ function placeFor(
 // ─── Sessions ───────────────────────────────────────────────────────────────────────────────────
 
 const listSessions: Handler = (hub, ctx) => {
-  const machine = queryValue(ctx.query, 'machine');
-  const workstream = queryValue(ctx.query, 'workstream');
-  const task = queryValue(ctx.query, 'task');
+  const machine = queryId(ctx.query, 'machine', 'mch');
+  const workstream = queryId(ctx.query, 'workstream', 'wst');
+  const task = queryId(ctx.query, 'task', 'tsk');
   const states = queryEnums(ctx.query, 'state', SESSION_STATES);
   return ok(
     hub.sessions.filter(
@@ -1063,7 +1063,7 @@ const linkSession: Handler = (hub, ctx) => {
 // ─── Asks ───────────────────────────────────────────────────────────────────────────────────────
 
 const listAsks: Handler = (hub, ctx) => {
-  const to = queryValue(ctx.query, 'to');
+  const to = queryId(ctx.query, 'to', 'mem');
   const states = queryEnums(ctx.query, 'state', ASK_STATES);
   return ok(
     hub.asks.filter(
@@ -1279,10 +1279,10 @@ const listEvents: Handler = (hub, ctx) => {
   const limit = queryLimit(ctx.query, 100, 500);
   const before = queryInt(ctx.query, 'before', 0);
   const filter: EventFilter = {
-    project: queryValue(ctx.query, 'project'),
-    workstream: queryValue(ctx.query, 'workstream'),
-    task: queryValue(ctx.query, 'task'),
-    session: queryValue(ctx.query, 'session'),
+    project: queryId(ctx.query, 'project', 'prj'),
+    workstream: queryId(ctx.query, 'workstream', 'wst'),
+    task: queryId(ctx.query, 'task', 'tsk'),
+    session: queryId(ctx.query, 'session', 'ses'),
   };
   const filtered = Object.values(filter).some((v) => v !== undefined);
   let rev = Math.min(before ?? Infinity, hub.rev + 1) - 1;

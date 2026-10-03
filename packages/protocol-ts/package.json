@@ -1,0 +1,20 @@
+{
+  "name": "@pitcrew/protocol-ts",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "types": "./index.ts",
+  "exports": {
+    ".": {
+      "types": "./index.ts"
+    }
+  },
+  "scripts": {
+    "generate": "cargo test -p pitcrew-protocol --features ts export_bindings",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3"
+  }
+}

@@ -53,6 +53,30 @@ Never push to `main`, and never merge. The integrator reviews and merges every p
 - **No network after setup?** If a dependency can't be fetched, stop and say so in your report.
   Don't vendor crates, add registries, or work around the lockfile.
 
+## On a maintainer's Windows machine
+
+Some agents run locally on a Windows machine instead of in a cloud container. There:
+
+- **Work only in the git worktree you were given,** on its branch. Never edit the maintainers' main
+  checkout or any other worktree, and never switch branches in one.
+- **Use PowerShell.** Some machines block Git Bash; run Linux-only steps in WSL by piping a script
+  file through `tr -d '\r' | bash`. Inside WSL, `cd` to your worktree in the command itself.
+- **Where programs may run:** company policy may refuse unsigned programs outside `C:\DEV`.
+  - Build with `CARGO_TARGET_DIR=C:\DEV\pitcrew\target-<your task>`, `TEMP` and `TMP` under
+    `C:\DEV\tmp`, and the Rust toolchain from `CARGO_HOME=C:\DEV\cargo` and
+    `RUSTUP_HOME=C:\DEV\rustup` (`C:\DEV\cargo\bin` first on `PATH`).
+  - Set these in every command: the shell may predate them.
+  - Never pipe cargo through `Select-Object -First`: it kills cargo.
+- **The person's own data is off limits:** never read or write their real `~/.claude`, `~/.codex`,
+  OpenCode data, `~/.ssh`, browser profiles or `%APPDATA%` files. Tests use temporary homes only.
+- **Don't change the machine:**
+  - no installers, no `winget` / `choco` / `scoop`;
+  - no system or WSL settings (`wsl --shutdown`, `--unregister`, `.wslconfig` and the like);
+  - no global git config;
+  - no screenshots.
+- **Disk:** check free space before a full build, and delete your own target directory when your
+  pull request is open.
+
 ## Rules
 
 - **Stay in your brief's paths.** If the brief turns out to need a file outside them, stop and
@@ -73,6 +97,19 @@ Never push to `main`, and never merge. The integrator reviews and merges every p
 - **Agent homes:** tests always use temporary homes (`pitcrew_fixtures::homes`). Never point anything
   at a real `~/.claude`, `~/.codex` or OpenCode data folder, and never run a real `claude`, `codex` or
   `opencode` binary in a test: use the stand-ins the tests already have.
+
+## Commit identity
+
+Commits in this public repository carry no personal e-mail address. Before your first commit, check
+`git config user.email`. If it isn't a GitHub `noreply` address, set the repository's identity to the
+maintainer's public noreply one:
+
+```bash
+git config user.name "mahmoudibrahim98"
+git config user.email "73237782+mahmoudibrahim98@users.noreply.github.com"
+```
+
+CI's scrub gate checks every commit's author and committer, and fails the pull request otherwise.
 
 ## The pull request
 

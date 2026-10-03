@@ -159,6 +159,26 @@ impl Daemon {
                 );
             }
         }
+        // **Never a real pitcrew-ptyd**: unless the test names one, the daemon looks for it where
+        // there is none, so it has no PTY runtime either. A test that names one also names its
+        // endpoint, or a private per-user directory for the state directory's own.
+        if extra.contains(&"--ptyd") {
+            let own = extra.contains(&"--ptyd-endpoint")
+                || cfg!(windows)
+                || env
+                    .iter()
+                    .find(|(name, _)| *name == "TMUX_TMPDIR")
+                    .is_some_and(|(_, dir)| {
+                        Path::new(dir).starts_with(std::env::temp_dir())
+                            || Path::new(dir).starts_with("/tmp")
+                    });
+            assert!(
+                own,
+                "a daemon given --ptyd needs --ptyd-endpoint, or a TMUX_TMPDIR of its own"
+            );
+        } else {
+            command.arg("--ptyd").arg(missing_ptyd(state));
+        }
         for (name, value) in env {
             command.env(name, value);
         }
@@ -479,6 +499,18 @@ pub fn refused_tmux_socket(state: &Path) -> PathBuf {
     let mut dir = state.as_os_str().to_owned();
     dir.push("-no-tmux");
     PathBuf::from(dir).join("missing").join("tmux")
+}
+
+/// The pitcrew-ptyd every test daemon is given unless the test names one: in a folder that does
+/// not exist, so the daemon has no PTY runtime, and makes nothing for one.
+pub fn missing_ptyd(state: &Path) -> PathBuf {
+    let mut dir = state.as_os_str().to_owned();
+    dir.push("-no-ptyd");
+    PathBuf::from(dir).join(if cfg!(windows) {
+        "pitcrew-ptyd.exe"
+    } else {
+        "pitcrew-ptyd"
+    })
 }
 
 /// Runs `pitcrewd <args>` to completion, with a home folder of its own (see [`private_homes`]).

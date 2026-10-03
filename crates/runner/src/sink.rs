@@ -2,7 +2,7 @@
 
 use crate::store::{Commit, Store};
 use pitcrew_protocol::events::Event;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,6 +28,10 @@ pub struct SinkError(pub String);
 pub(crate) struct Batch {
     pub events: Vec<Event>,
     pub commit: Commit,
+    /// Batches of the transcript's whole row in memory still to save (the watcher's `Loaded`):
+    /// lowered once this one's commit is saved. A commit that fails leaves it raised, so that
+    /// row, ahead of the index, stays in memory.
+    pub unsaved: Option<Arc<AtomicUsize>>,
 }
 
 /// Delivers batches until the watcher hangs up, or until `stop` while the sink is refusing.
@@ -60,10 +64,15 @@ pub(crate) fn dispatch(
             .lock()
             .map_err(|_| "runner store lock poisoned".to_owned())
             .and_then(|s| s.commit(&batch.commit).map_err(|e| e.to_string()));
-        if let Err(e) = saved {
+        match saved {
+            Ok(()) => {
+                if let Some(unsaved) = &batch.unsaved {
+                    unsaved.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
             // The events went out but the cursor did not move on disk: they repeat after a
             // restart, which receivers already handle.
-            tracing::error!(error = %e, "could not save a transcript cursor");
+            Err(e) => tracing::error!(error = %e, "could not save a transcript cursor"),
         }
     }
 }
