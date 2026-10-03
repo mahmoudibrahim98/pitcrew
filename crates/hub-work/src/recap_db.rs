@@ -10,12 +10,17 @@
 //!   is written again ([`BlockDb::bodies`]).
 //! - **A cache, never the truth.** The file is replaced whenever an index opens it, and removed
 //!   when the index is dropped: the blocks are derived from the log, which the index reads from
-//!   its start each time it is built (see [`crate::recap`]). A crash leaves a file that the next
-//!   start replaces, never one that is read again.
+//!   its start each time it is built (see [`crate::recap`]). A crash leaves a file that is never
+//!   read again; the next start on the same path replaces it.
 //! - **On a local disk.** A cache file asked for on a network filesystem (detected as the store
 //!   detects its own, `pitcrew_store::detect`) goes in a private folder of its own on a local disk
 //!   instead: in the runtime directory (`$XDG_RUNTIME_DIR`) or the temporary folder; with
 //!   neither, the blocks stay in memory ([`BlockDb::local`]).
+//!   - On Unix the folder is named after the path asked for and the user, so the next start on
+//!     that path finds the folder a hard kill left behind (SIGKILL, the OOM killer, a power cut)
+//!     and replaces its file, as it would at the path asked for ([`OwnedFolder::make`]).
+//!   - On Windows, or when something else has that name, the folder's name is random: a hard kill
+//!     leaves it behind, private to the user, until the temporary folder is cleaned.
 //! - **Writes are all or nothing.** [`BlockDb::put`] writes one batch of changed blocks in one
 //!   transaction. A batch that fails leaves the database where it was, which is then behind the
 //!   index's engine: the index counts as broken, and is rebuilt (see [`crate::Recaps`]).
@@ -131,16 +136,27 @@ impl Drop for OwnedFile {
     }
 }
 
-/// A private folder this process created for the recap file, removed when dropped (once the
-/// file in it is gone).
+/// A private folder for the recap file, which this process removes when dropped (once the file in
+/// it is gone).
 struct OwnedFolder(PathBuf);
 
 impl OwnedFolder {
-    /// A new folder in `base` that only this user may open (0700 on Unix), with a name no one
-    /// can guess beforehand. `base` must not let others rename or remove what is in it: on Unix
-    /// it belongs to root or to this user, and is not writable by group or others unless sticky,
-    /// as `/tmp` is ([`base_is_safe`]).
-    fn make(base: &Path) -> io::Result<Self> {
+    /// A folder in `base` that only this user may open (0700 on Unix), for the recap file meant
+    /// for `key` (its path, with its folder made canonical).
+    ///
+    /// - **The base** must not let others rename or remove what is in it. On Unix it belongs to
+    ///   root or to this user, and is not writable by group or others unless sticky, as `/tmp` is
+    ///   ([`base_is_safe`]).
+    /// - **On Unix, a name of its own.** The folder is named after `key` and the user
+    ///   ([`stable_name`]), so the folder a hard kill left behind is found again at the next start
+    ///   on `key` and used again (its file is then replaced), rather than one more being left. One
+    ///   daemon runs on a state folder at a time, so a folder found at that name is a dead run's.
+    ///   It is used again only if it is a real folder (not a link), this user's, and 0700
+    ///   ([`left_by_us`]); with anything else there, or no `key`, the folder gets a new name no
+    ///   one can guess beforehand.
+    /// - **Elsewhere** (Windows) there is no owner or mode to check such a folder by, so the name
+    ///   is always new.
+    fn make(base: &Path, key: Option<&Path>) -> io::Result<Self> {
         let meta = fs::metadata(base)?;
         if !meta.is_dir() {
             return Err(io::Error::other("not a folder"));
@@ -148,9 +164,56 @@ impl OwnedFolder {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
-            base_is_safe(meta.uid(), meta.mode(), effective_uid()?).map_err(io::Error::other)?;
+            let me = effective_uid()?;
+            base_is_safe(meta.uid(), meta.mode(), me).map_err(io::Error::other)?;
+            if let Some(key) = key
+                && let Some(folder) = Self::named(&base.join(stable_name(key, me)), me)?
+            {
+                return Ok(folder);
+            }
         }
-        let path = base.join(format!("pitcrew-recaps-{}", EventId::new().0));
+        // No name of its own off Unix (see above).
+        #[cfg(not(unix))]
+        let _ = key;
+        Self::create(&base.join(format!("pitcrew-recaps-{}", EventId::new().0)))
+    }
+
+    /// The folder at `path`, a name of its own: made if nothing is there, used again if it is
+    /// what a run that was killed left there ([`left_by_us`]), and `None` if something else is.
+    #[cfg(unix)]
+    fn named(path: &Path, me: u32) -> io::Result<Option<Self>> {
+        use std::os::unix::fs::MetadataExt as _;
+        match Self::create(path) {
+            Ok(folder) => return Ok(Some(folder)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        let found = fs::symlink_metadata(path)?;
+        match left_by_us(found.is_dir(), found.uid(), found.mode(), me) {
+            Ok(()) => {
+                tracing::info!(
+                    folder = %path.display(),
+                    "the recap index's private folder is still there from a run that did not end; \
+                     using it again"
+                );
+                Ok(Some(Self(path.to_path_buf())))
+            }
+            Err(why) => {
+                tracing::warn!(
+                    folder = %path.display(),
+                    why,
+                    "something else has the name of the recap index's private folder, so the \
+                     folder gets a new name"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// A new folder at `path`: `create` fails on anything already there, a link included. 0700 on
+    /// Unix, set explicitly so the umask cannot change it (a folder found again is checked for
+    /// exactly that).
+    fn create(path: &Path) -> io::Result<Self> {
         #[cfg(unix)]
         let builder = {
             use std::os::unix::fs::DirBuilderExt as _;
@@ -160,9 +223,8 @@ impl OwnedFolder {
         };
         #[cfg(not(unix))]
         let builder = fs::DirBuilder::new();
-        // Never there before: `create` fails on anything at the path, a link included.
-        builder.create(&path)?;
-        let folder = Self(path);
+        builder.create(path)?;
+        let folder = Self(path.to_path_buf());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -208,6 +270,43 @@ fn base_is_safe(uid: u32, mode: u32, me: u32) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Whether what is at the private folder's name of its own, as `lstat` shows it (a folder or not,
+/// its owner and mode), is the folder an earlier run of `me` made there ([`OwnedFolder::create`]):
+/// a real folder, not a link to one, owned by `me`, and 0700.
+#[cfg(unix)]
+fn left_by_us(is_dir: bool, uid: u32, mode: u32, me: u32) -> Result<(), String> {
+    if !is_dir {
+        return Err("it is not a folder (a link, or a file)".into());
+    }
+    if uid != me {
+        return Err(format!("it belongs to another user (uid {uid})"));
+    }
+    if mode & 0o7777 != 0o700 {
+        return Err(format!("its mode is {:o}, not 700", mode & 0o7777));
+    }
+    Ok(())
+}
+
+/// The private folder's name of its own for the recap file meant for `key`, for the user `uid`:
+/// `pitcrew-recaps-` and 32 hex digits of a SHA-256 of both. The same path and user always give
+/// the same name.
+#[cfg(unix)]
+fn stable_name(key: &Path, uid: u32) -> String {
+    use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut hash = Sha256::new();
+    hash.update(b"pitcrew.recaps.folder.v1\0");
+    hash.update(uid.to_be_bytes());
+    hash.update(key.as_os_str().as_bytes());
+    let digest = hash.finalize();
+    let mut name = String::from("pitcrew-recaps-");
+    for byte in &digest[..16] {
+        let _ = write!(name, "{byte:02x}");
+    }
+    name
 }
 
 /// The folder a file at `path` is in (`.` for a bare name).
@@ -267,9 +366,10 @@ impl BlockDb {
 
     /// An empty database for a cache file meant for `path`, kept on a local disk: at `path` when
     /// its folder is on one; when that is on a network filesystem (or one not recognised, as the
-    /// store treats it), in a new private folder of its own in the runtime directory or the
-    /// temporary folder ([`BlockDb::file`] there); in memory when neither can be had. Logs where
-    /// it went when that is not `path`.
+    /// store treats it), in a private folder of its own in the runtime directory or the temporary
+    /// folder ([`BlockDb::file`] there; on Unix the folder is named after `path` and used again
+    /// after a hard kill, see [`OwnedFolder::make`]); in memory when neither can be had. Logs
+    /// where it went when that is not `path`.
     pub fn local(path: &Path) -> Result<Self> {
         Self::local_with(
             path,
@@ -287,12 +387,16 @@ impl BlockDb {
         let name = path
             .file_name()
             .unwrap_or_else(|| OsStr::new("recaps.sqlite3"));
+        // What the private folder is named after: the path asked for, its folder made canonical.
+        let key = fs::canonicalize(folder_of(path))
+            .ok()
+            .map(|folder| folder.join(name));
         for base in bases {
             if network(base) {
                 tracing::debug!(folder = %base.display(), "not a local disk, so not for the recap index's file");
                 continue;
             }
-            let folder = match OwnedFolder::make(base) {
+            let folder = match OwnedFolder::make(base, key.as_deref()) {
                 Ok(folder) => folder,
                 Err(e) => {
                     tracing::debug!(folder = %base.display(), error = %e, "cannot make a private folder for the recap index's file there");
@@ -624,6 +728,15 @@ pub(crate) mod tests {
         fs::metadata(path).expect("meta").permissions().mode() & 0o7777
     }
 
+    /// The private folder's name of its own in `base`, for a file asked for at `asked`.
+    #[cfg(unix)]
+    fn named_folder(base: &Path, asked: &Path) -> PathBuf {
+        let key = fs::canonicalize(folder_of(asked))
+            .expect("canonicalize")
+            .join(asked.file_name().expect("name"));
+        base.join(stable_name(&key, effective_uid().expect("uid")))
+    }
+
     /// On a local disk, the file is where it was asked for.
     #[test]
     fn on_a_local_disk_the_file_is_where_it_was_asked() {
@@ -664,6 +777,12 @@ pub(crate) mod tests {
                 .and_then(OsStr::to_str)
                 .is_some_and(|n| n.starts_with("pitcrew-recaps-")),
             "{folder:?}"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            folder,
+            &named_folder(local.path(), &asked),
+            "a name of its own"
         );
         let file = folder.join("recaps.sqlite3");
         assert_eq!(db.file_path(), Some(file.as_path()));
@@ -728,13 +847,123 @@ pub(crate) mod tests {
         assert_eq!(mode(&made[0]), 0o700);
     }
 
-    /// The base rule itself, with owners no test can make without root: a base must be root's or
+    /// A hard kill (SIGKILL, the OOM killer, a power cut) runs no destructor, so the private
+    /// folder and its file stay. The next start on the same state folder finds that folder by its
+    /// name, uses it again and replaces the file in it, and its drop leaves nothing.
+    #[cfg(unix)]
+    #[test]
+    fn the_folder_a_hard_kill_left_is_used_again_and_its_file_replaced() {
+        use std::os::unix::fs::MetadataExt as _;
+        let state = tempfile::tempdir().expect("tempdir");
+        let local = tempfile::tempdir().expect("tempdir");
+        let asked = state.path().join("recaps.sqlite3");
+        let network = |dir: &Path| dir == state.path();
+        let bases = [local.path().to_path_buf()];
+        let folder = named_folder(local.path(), &asked);
+        let file = folder.join("recaps.sqlite3");
+
+        let killed = BlockDb::local_with(&asked, &network, &bases).expect("db");
+        assert_eq!(killed.file_path(), Some(file.as_path()));
+        // What a hard kill leaves: no destructor runs (the connection stays open, as it would
+        // until the process is gone).
+        std::mem::forget(killed);
+        assert_eq!(entries(local.path()), vec![folder.clone()]);
+        let old = fs::metadata(&file).expect("the old file").ino();
+
+        let next = BlockDb::local_with(&asked, &network, &bases).expect("db");
+        assert_eq!(next.file_path(), Some(file.as_path()), "the same folder");
+        assert_eq!(entries(local.path()), vec![folder.clone()], "no new folder");
+        assert_eq!(entries(&folder), vec![file.clone()]);
+        assert_ne!(
+            fs::metadata(&file).expect("the new file").ino(),
+            old,
+            "the old file is replaced, not read"
+        );
+        assert_eq!(mode(&folder), 0o700);
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(
+            next.page(&BlockFilter::default(), None, 10).expect("page"),
+            (Vec::new(), false)
+        );
+        drop(next);
+        assert!(entries(local.path()).is_empty(), "nothing left");
+    }
+
+    /// Anything at the private folder's name that is not a folder an earlier run made (a link,
+    /// even to a private folder of ours; a folder another mode; a file) is left alone, and the
+    /// recap file goes in a new folder with a random name instead.
+    #[cfg(unix)]
+    #[test]
+    fn what_is_not_our_folder_at_its_name_is_not_used() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let state = tempfile::tempdir().expect("tempdir");
+        let asked = state.path().join("recaps.sqlite3");
+        let network = |dir: &Path| dir == state.path();
+        let elsewhere = tempfile::tempdir().expect("tempdir");
+        let target = elsewhere.path().join("private");
+        fs::create_dir(&target).expect("mkdir");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).expect("chmod");
+
+        for case in ["link", "0755", "0770", "file"] {
+            let local = tempfile::tempdir().expect("tempdir");
+            let squatted = named_folder(local.path(), &asked);
+            match case {
+                "link" => std::os::unix::fs::symlink(&target, &squatted).expect("symlink"),
+                "file" => fs::write(&squatted, b"not a folder").expect("write"),
+                mode => {
+                    fs::create_dir(&squatted).expect("mkdir");
+                    let mode = u32::from_str_radix(mode, 8).expect("mode");
+                    fs::set_permissions(&squatted, fs::Permissions::from_mode(mode))
+                        .expect("chmod");
+                }
+            }
+            let before = fs::symlink_metadata(&squatted).expect("lstat");
+
+            let db =
+                BlockDb::local_with(&asked, &network, &[local.path().to_path_buf()]).expect("db");
+            let file = db.file_path().expect("a file").to_path_buf();
+            let folder = folder_of(&file);
+            assert_ne!(folder, squatted, "{case}");
+            assert_eq!(folder_of(&folder), local.path(), "{case}");
+            assert_eq!(mode(&folder), 0o700, "{case}");
+            let after = fs::symlink_metadata(&squatted).expect("lstat");
+            assert_eq!(after.file_type(), before.file_type(), "{case}: left alone");
+            assert_eq!(
+                after.permissions(),
+                before.permissions(),
+                "{case}: left alone"
+            );
+            assert!(
+                entries(&target).is_empty(),
+                "{case}: nothing through the link"
+            );
+            drop(db);
+            assert_eq!(entries(local.path()), vec![squatted], "{case}");
+        }
+    }
+
+    /// The checks themselves, with owners no test can make without root: a folder found at the
+    /// name is used again only if it is a real folder, ours and 0700; a base must be root's or
     /// ours, and closed to others unless sticky.
     #[cfg(unix)]
     #[test]
     fn the_owner_and_mode_rules() {
         let me = 1000;
         let dir = 0o040_000;
+        assert_eq!(left_by_us(true, me, dir | 0o700, me), Ok(()));
+        for (is_dir, uid, mode) in [
+            (false, me, 0o120_777),
+            (true, 1001, dir | 0o700),
+            (true, 0, dir | 0o700),
+            (true, me, dir | 0o755),
+            (true, me, dir | 0o711),
+            (true, me, dir | 0o1700),
+        ] {
+            assert!(
+                left_by_us(is_dir, uid, mode, me).is_err(),
+                "{is_dir} {uid} {mode:o}"
+            );
+        }
         for (uid, mode) in [(0, 0o1777), (0, 0o755), (me, 0o700), (me, 0o1777)] {
             assert_eq!(base_is_safe(uid, dir | mode, me), Ok(()), "{uid} {mode:o}");
         }
@@ -756,5 +985,19 @@ pub(crate) mod tests {
             effective_uid().expect("uid"),
             fs::metadata(&file).expect("meta").uid()
         );
+    }
+
+    /// The name of its own depends on the path and the user, and on nothing else.
+    #[cfg(unix)]
+    #[test]
+    fn the_name_of_its_own_is_the_path_and_the_user() {
+        let a = Path::new("/home/sam/.local/state/pitcrew/recaps.sqlite3");
+        let b = Path::new("/home/sam/other/recaps.sqlite3");
+        assert_eq!(stable_name(a, 1000), stable_name(a, 1000));
+        assert_ne!(stable_name(a, 1000), stable_name(b, 1000));
+        assert_ne!(stable_name(a, 1000), stable_name(a, 1001));
+        let name = stable_name(a, 1000);
+        assert_eq!(name.len(), "pitcrew-recaps-".len() + 32, "{name}");
+        assert!(name.starts_with("pitcrew-recaps-"), "{name}");
     }
 }

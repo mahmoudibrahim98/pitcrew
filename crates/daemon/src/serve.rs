@@ -68,7 +68,8 @@ use tokio::sync::oneshot;
 
 /// Hook events queued for the sink before new ones are dropped.
 const HOOK_QUEUE: usize = 1024;
-/// The recap index's blocks, in the state directory: a cache, replaced at every start.
+/// The recap index's blocks, in the state directory (or in a private folder on a local disk when
+/// that is on a network filesystem; see the state-file table in `state.rs`): a cache.
 const RECAP_FILE: &str = "recaps.sqlite3";
 /// How long the server gets to finish in-flight requests and close its sockets after a stop
 /// signal.
@@ -257,7 +258,8 @@ fn open_with(
     // rather than appending a dispatch that can only fail.
     let (signal, set_up) = crate::setup::signal();
     // The recap index keeps its blocks on disk, in a cache file of its own next to the store
-    // (replaced when the index is built, removed when the daemon stops), not in memory.
+    // (replaced when the index is built, removed when the daemon stops; on a local disk instead
+    // when the state directory is on a network filesystem), not in memory.
     let work = Arc::new(
         WorkService::new(Arc::clone(&store), workspace)
             .with_setup_listener(Arc::new(signal))
