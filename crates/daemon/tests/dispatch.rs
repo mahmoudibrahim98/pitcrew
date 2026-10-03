@@ -586,7 +586,11 @@ fn a_dispatched_agent_runs_as_its_session_and_moves_its_task() {
         ],
     );
     let info = daemon.get("/v1/host/info", None).json();
-    assert_eq!(info["capabilities"], json!(["pty", "watch"]), "{info}");
+    assert_eq!(
+        info["capabilities"],
+        json!(["pty", "watch", "scan"]),
+        "{info}"
+    );
 
     // Claude (@writer): its `Stop` and `UserPromptSubmit` hooks.
     dispatch_and_follow(
