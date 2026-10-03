@@ -385,11 +385,18 @@ fn a_scan_streams_progress_and_reports_the_fixtures() {
         "{report:#}"
     );
     // The scan logs its counts (and no path).
-    let logs = daemon.stderr();
-    let line = logs
-        .lines()
-        .find(|l| l.contains("scanned this machine's agent homes"))
-        .unwrap_or_else(|| panic!("no scan in the log:\n{logs}"));
+    let deadline = Instant::now() + WAIT;
+    let line = loop {
+        let logs = daemon.stderr();
+        if let Some(line) = logs
+            .lines()
+            .find(|l| l.contains("scanned this machine's agent homes"))
+        {
+            break line.to_owned();
+        }
+        assert!(Instant::now() < deadline, "no scan in the log:\n{logs}");
+        std::thread::sleep(Duration::from_millis(25));
+    };
     assert!(line.contains("sessions=3"), "{line}");
     assert!(!line.contains(work.paper.to_str().unwrap()), "{line}");
 }

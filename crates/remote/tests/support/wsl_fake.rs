@@ -24,11 +24,7 @@ pub const NOTICE: &str = "wsl: A localhost proxy configuration was detected but 
 const TRANSPORT: [&str; 5] = ["--cd", "~", "--exec", "/bin/sh", "-c"];
 
 pub fn run(dir: &Path, args: &[String]) -> Result<(), Box<dyn Error>> {
-    let mut log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("calls.jsonl"))?;
-    writeln!(log, "{}", serde_json::to_string(args)?)?;
+    record(dir, "calls.jsonl", args)?;
     let booted = dir.join("booted").exists();
     if args.first().is_some_and(|s| s == "--list") {
         // The listing is parsed as UTF-16LE: WSL_UTF8 would change it.
@@ -61,11 +57,7 @@ pub fn run(dir: &Path, args: &[String]) -> Result<(), Box<dyn Error>> {
         return Err("a transport call without WSL_UTF8=1".into());
     }
     let words = decode(&args[7])?;
-    let mut commands = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("commands.jsonl"))?;
-    writeln!(commands, "{}", serde_json::to_string(&words)?)?;
+    record(dir, "commands.jsonl", &words)?;
     if dir.join("offline").exists() {
         let _ = std::fs::remove_file(dir.join("booted"));
         return Err("distro unavailable".into());
@@ -195,6 +187,19 @@ pub fn run(dir: &Path, args: &[String]) -> Result<(), Box<dyn Error>> {
     } else {
         return Err("unrecorded WSL command".into());
     }
+    Ok(())
+}
+
+// Format the newline with the JSON before appending: writeln! may issue separate writes,
+// letting simultaneous heartbeat and helper processes put two values on one line.
+fn record(dir: &Path, name: &str, words: &[String]) -> Result<(), Box<dyn Error>> {
+    let mut bytes = serde_json::to_vec(words)?;
+    bytes.push(b'\n');
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(name))?
+        .write_all(&bytes)?;
     Ok(())
 }
 
