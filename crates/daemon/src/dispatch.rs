@@ -956,6 +956,203 @@ mod tests {
     }
 
     #[test]
+    fn a_dispatch_exited_while_the_daemon_was_down_ends_after_restart() {
+        use pitcrew_hub_work::{NewDispatch, TaskRef};
+        use pitcrew_interfaces::runtime::Runtime as _;
+        use pitcrew_protocol::model::DispatchOutcome;
+        use pitcrew_runner::{RunnerConfig, RunnerHandle};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("work");
+        std::fs::create_dir_all(&folder).unwrap();
+        let home = tmp.path().join("codex");
+        let mut demo = pitcrew_fixtures::demo_workspace().unwrap();
+        let sam = demo.members.iter().find(|m| m.handle == "@sam").unwrap().id;
+        let agent = demo
+            .members
+            .iter()
+            .find(|m| m.handle == "@runner")
+            .unwrap()
+            .id;
+        let machine = demo
+            .machines
+            .iter()
+            .find(|m| m.kind == pitcrew_protocol::model::MachineKind::Local)
+            .unwrap()
+            .id;
+        for project in &mut demo.projects {
+            project.root = None;
+        }
+        for stream in &mut demo.workstreams {
+            for location in &mut stream.locations {
+                location.machine = machine;
+                location.path = folder.to_str().unwrap().into();
+            }
+        }
+        let caller = Caller {
+            member: sam,
+            scope: TokenScope::Device,
+            on_behalf_of: None,
+        };
+        let task = TaskRef::parse("PAP-5").unwrap();
+        let new = || NewDispatch {
+            agent,
+            brief: None,
+            machine: Some(machine),
+        };
+        let open_work = |attached: Arc<Attached>| {
+            let store = Arc::new(
+                Store::open_with(
+                    tmp.path().join("hub.db"),
+                    StoreOptions::default(),
+                    pitcrew_hub_work::projections(),
+                )
+                .unwrap(),
+            );
+            Arc::new(
+                WorkService::new(store, demo.workspace.clone())
+                    .with_dispatcher(Arc::new(RunnerLink::new(attached))),
+            )
+        };
+        let start_runner = |work: &Arc<WorkService>,
+                            runtime: Arc<pitcrew_interfaces::fake::FakeRuntime>,
+                            attached: &Attached|
+         -> RunnerHandle {
+            let config =
+                RunnerConfig::new(work.workspace(), machine, sam, tmp.path().join("runner"))
+                    .with_home(Engine::Codex, &home);
+            let runner = pitcrew_runner::start(
+                config,
+                vec![Arc::new(pitcrew_ingest::codex::CodexAdapter::new())],
+                Arc::new(FollowingSink::new(
+                    StoreSink::new(work.store().clone(), sam),
+                    work.clone(),
+                )),
+            )
+            .unwrap();
+            let terminals = runner.terminals(runtime).unwrap();
+            attached.set(Parts {
+                machine,
+                hooks: runner.hooks(),
+                commands: runner.commands(&terminals),
+                terminals,
+                transcripts: runner.transcripts(),
+                watches: true,
+                runtime: None,
+            });
+            runner
+        };
+        fn rfc3339_now() -> String {
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            let ms = i64::try_from(ms).unwrap();
+            let (days, rest) = (ms.div_euclid(86_400_000), ms.rem_euclid(86_400_000));
+            // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
+            let z = days + 719_468;
+            let era = z.div_euclid(146_097);
+            let doe = z - era * 146_097;
+            let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let day = doy - (153 * mp + 2) / 5 + 1;
+            let month = if mp < 10 { mp + 3 } else { mp - 9 };
+            let year = yoe + era * 400 + i64::from(month <= 2);
+            format!(
+                "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
+                rest / 3_600_000,
+                rest / 60_000 % 60,
+                rest / 1000 % 60,
+                rest % 1000
+            )
+        }
+
+        let write_transcript = |native: &str, cwd: &Path| {
+            let dir = home.join("sessions/2026/10/03");
+            std::fs::create_dir_all(&dir).unwrap();
+            let now = rfc3339_now();
+            let meta = serde_json::json!({"timestamp": now, "type": "session_meta", "payload": {"id": native, "timestamp": now, "cwd": cwd.to_str().unwrap(), "originator": "codex_cli_rs", "cli_version": "0.50.0"}});
+            std::fs::write(
+                dir.join(format!("rollout-{native}.jsonl")),
+                format!("{meta}\n"),
+            )
+            .unwrap();
+        };
+        let attached = Arc::new(Attached::default());
+        let work = open_work(attached.clone());
+        work.seed(&demo).unwrap();
+        let runtime = Arc::new(pitcrew_interfaces::fake::FakeRuntime::default());
+        let runner = start_runner(&work, runtime.clone(), &attached);
+        let dispatch = work.dispatch_task(&caller, &task, new()).unwrap();
+        let named = dispatch.session.unwrap();
+        let terminal = attached
+            .get()
+            .unwrap()
+            .terminals
+            .terminal_of(named)
+            .unwrap()
+            .unwrap();
+        write_transcript("dispatched-cli", &folder);
+        let imported_folder = tmp.path().join("imported-work");
+        std::fs::create_dir_all(&imported_folder).unwrap();
+        write_transcript("imported-cli", &imported_folder);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let imported = loop {
+            runner.rescan();
+            let sessions = work.sessions(&Default::default()).unwrap();
+            if !work.session(&named).unwrap().native_id.is_empty()
+                && let Some(imported) = sessions.iter().find(|s| s.native_id == "imported-cli")
+            {
+                break imported.clone();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "transcripts must be indexed before shutdown"
+            );
+            std::thread::yield_now();
+        };
+        runner.stop();
+
+        drop(attached);
+        drop(work);
+        // The daemon is stopped; the terminal server also loses its terminal rows.
+        runtime.kill(terminal).unwrap();
+        drop(runtime);
+        let attached = Arc::new(Attached::default());
+        let work = open_work(attached.clone());
+        let runner = start_runner(
+            &work,
+            Arc::new(pitcrew_interfaces::fake::FakeRuntime::default()),
+            &attached,
+        );
+        let commands = &attached.get().unwrap().commands;
+        assert_eq!(
+            commands.started(imported.id),
+            Started::Reported,
+            "an imported transcript has no terminal exit evidence"
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(look(&Arc::downgrade(&work), &attached, &mut HashSet::new()));
+        assert_eq!(
+            work.dispatch(&dispatch.id).unwrap().outcome,
+            Some(DispatchOutcome::Canceled),
+            "a CLI that exited while the daemon was down must end its dispatch"
+        );
+        assert_eq!(work.session(&named).unwrap().state, SessionState::Ended);
+        assert_eq!(work.session(&imported.id).unwrap().state, imported.state);
+        let next = work
+            .dispatch_task(&caller, &task, new())
+            .expect("the agent can be dispatched again after restart");
+        assert_ne!(next.session, dispatch.session);
+        assert_eq!(commands.started(next.session.unwrap()), Started::Running);
+        runner.stop();
+    }
+
+    #[test]
     fn a_reported_dispatch_finishes_when_its_cli_exits_without_a_hook() {
         let tmp = tempfile::tempdir().unwrap();
         let sam = member(MemberKind::Human, "@sam", None);
