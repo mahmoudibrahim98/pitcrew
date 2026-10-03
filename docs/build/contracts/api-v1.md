@@ -50,10 +50,12 @@ Every failure returns an `ApiError` body, `{"code": "…", "message": "…"}`:
 
 Brief `0-files-api` proposes the following device-only routes. This section is a
 contract proposal, not an available API: implementation is blocked by the brief's
-path scope. Windows hard-link refusal needs a safe handle-information dependency
-in `crates/runner/Cargo.toml` and the corresponding `Cargo.lock` update; the latter
-is outside the brief's listed paths. The implementation must not proceed without
-that scope being extended. No protocol types or generated bindings exist yet.
+path scope. The brief now permits `Cargo.lock` for the safe Windows
+handle-information dependency. The proposed `ErrorCode::TooLarge` and
+`ErrorCode::Unsupported` additions also require updating the exhaustive
+`ErrorKind::from_code` match in `crates/cli/src/error.rs`, outside the brief's
+listed paths. The implementation must not proceed without that scope being
+extended. No protocol types or generated bindings exist yet.
 
 | Method and path | Request and response |
 |---|---|
