@@ -179,6 +179,14 @@ pub enum RunnerCommand {
         /// Permission mode.
         #[serde(default)]
         permission_mode: PermissionMode,
+        /// The id the new session must be reported under: one the hub has already stored (a
+        /// dispatch's, or a start for an agent or a task), in state `starting`. The runner adopts
+        /// it for the CLI's transcript instead of minting one, so the session is never discovered
+        /// a second time under another id. Without it, the runner mints the id when the
+        /// transcript appears.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        session: Option<SessionId>,
     },
     /// Resume an existing CLI session by its native id.
     ResumeSession {

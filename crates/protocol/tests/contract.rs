@@ -213,6 +213,7 @@ fn runner_frames_round_trip_as_single_lines() {
             model: None,
             account: None,
             permission_mode: PermissionMode::Default,
+            session: Some(SessionId::new()),
         },
     };
     let line = encode_line(&cmd).unwrap();
@@ -225,6 +226,14 @@ fn runner_frames_round_trip_as_single_lines() {
     let v: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(v["command"]["engine"], "opencode");
     assert_eq!(v["command"]["permission_mode"], "default");
+    assert!(v["command"]["session"].is_string());
+    // A start from a hub that names no session decodes without one.
+    let mut older = v["command"].clone();
+    older.as_object_mut().unwrap().remove("session");
+    assert!(matches!(
+        serde_json::from_value::<RunnerCommand>(older).unwrap(),
+        RunnerCommand::StartSession { session: None, .. }
+    ));
 
     let ok = RunnerToHub::CommandResult {
         command: CommandId::new(),
