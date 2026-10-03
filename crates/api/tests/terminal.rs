@@ -809,34 +809,39 @@ async fn a_stalled_runtime_answers_503_or_closes_with_1011() {
 
     stalling.read.store(true, Ordering::SeqCst);
     let addr = serve(app).await;
-    let token = fixture.device_token.clone();
-    tokio::task::spawn_blocking(move || {
-        let stream = TcpStream::connect(addr).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        let mut request = format!("ws://{addr}{path}").into_client_request().unwrap();
-        request.headers_mut().insert(
-            "sec-websocket-protocol",
-            HeaderValue::from_str(&format!("pitcrew.v1, pitcrew.bearer.{token}")).unwrap(),
-        );
-        match tungstenite::client(request, stream) {
-            Ok((mut socket, response)) => {
-                assert_eq!(response.headers()["sec-websocket-protocol"], "pitcrew.v1");
-                assert_eq!(read_close(&mut socket), CloseCode::Error);
+    // Exercise the handshake refusal as well as the post-upgrade timeout on every run.
+    for stall_attach in [false, true] {
+        stalling.attach.store(stall_attach, Ordering::SeqCst);
+        let token = fixture.device_token.clone();
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || {
+            let stream = TcpStream::connect(addr).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = format!("ws://{addr}{path}").into_client_request().unwrap();
+            request.headers_mut().insert(
+                "sec-websocket-protocol",
+                HeaderValue::from_str(&format!("pitcrew.v1, pitcrew.bearer.{token}")).unwrap(),
+            );
+            match tungstenite::client(request, stream) {
+                Ok((mut socket, response)) => {
+                    assert_eq!(response.headers()["sec-websocket-protocol"], "pitcrew.v1");
+                    assert_eq!(read_close(&mut socket), CloseCode::Error);
+                }
+                Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(response))) => {
+                    // Calls that time out before the upgrade answer 503; after it they close 1011.
+                    assert_eq!(response.status(), 503);
+                    // Tungstenite returns after the headers; its body may be only a TCP fragment.
+                    // The ordinary HTTP request above checks the complete error body.
+                }
+                Err(error) => panic!("unexpected handshake failure: {error}"),
             }
-            Err(tungstenite::HandshakeError::Failure(tungstenite::Error::Http(response))) => {
-                // Calls that time out before the upgrade answer 503; after it they close 1011.
-                assert_eq!(response.status(), 503);
-                let body: serde_json::Value =
-                    serde_json::from_slice(response.body().as_ref().unwrap()).unwrap();
-                assert_eq!(body["code"], "unavailable");
-            }
-            Err(error) => panic!("unexpected handshake failure: {error}"),
-        }
-    })
-    .await
-    .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+    stalling.attach.store(false, Ordering::SeqCst);
     stalling.read.store(false, Ordering::SeqCst);
 }
 
