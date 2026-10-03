@@ -46,7 +46,8 @@ interface GatewayWorkspace {
 }
 ```
 
-The UI must show `host` next to every remote workspace name, including accessible menu names.
+The UI must show `host` next to remote workspace names in the workspace switcher (including
+accessible menu names), top bar and remove dialog.
 Older desktops may omit it; local workspaces leave it unset. A hub rename never changes this host.
 
 The gateway emits the Tauri event `gateway://workspaces` with the same list whenever it changes.
