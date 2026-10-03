@@ -95,8 +95,9 @@ proptest! {
             work.store().append(batch).expect("append");
             ask(&work, &world, question.next().copied().unwrap_or(0), limit);
         }
-        prop_assert!(file.exists());
         let incremental = dump(&work, &world, limit);
+        // Empty specs are valid: the first query still builds the file from the setup log.
+        prop_assert!(file.exists());
         let rebuilt = WorkService::new(Arc::clone(work.store()), world.workspace.clone());
         prop_assert_eq!(&dump(&rebuilt, &world, limit), &incremental);
         let log = log_events(&work);
