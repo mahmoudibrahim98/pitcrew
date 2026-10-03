@@ -15,6 +15,24 @@ use crate::model::{
 use crate::runner::Capability;
 use serde::{Deserialize, Serialize};
 
+/// The revision a person has read in a workspace, project or workstream.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct ReadCursor {
+    /// `workspace`, `project:<id>` or `workstream:<id>`.
+    pub scope: String,
+    /// Last seen log revision; only moves forward.
+    pub rev: u64,
+}
+
+/// Request to advance a person's cursor.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct MoveCursor {
+    /// Last seen log revision.
+    pub rev: u64,
+}
+
 /// Prefix of every API route.
 pub const API_PREFIX: &str = "/v1";
 

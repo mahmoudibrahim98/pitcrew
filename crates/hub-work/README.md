@@ -103,6 +103,15 @@ deterministic under one (tested in `tests/single_writer.rs`):
 
 ## Projections
 
+Read cursors use `cursor_moved` events and the `work.cursors` projection
+(`work_read_cursors`, migration 0211). The event author owns the cursor; the projection
+keeps the maximum revision for each author and scope, so rebuilding never moves it back.
+`GET /v1/me/cursors` and `PUT /v1/me/cursors/{scope}` are device-only routes, also checked
+by the service. Commands serialize validation and append, reject future revisions and
+unknown scopes, and append nothing for an equal or older revision. This follows the same
+event-based storage and stream delivery as the work model. Cursor events are excluded
+from the recap index. `tests/cursors.rs` covers isolation, refusals, no-op writes and replay.
+
 | Name | Tables (migration) | Events |
 |---|---|---|
 | `work.directory` | `work_machines`, `work_members`, `work_personas`, `work_teams`, `work_team_members` (0200) | `machine_added`, `machine_liveness`, `member_added`, `persona_saved`, `team_saved` |

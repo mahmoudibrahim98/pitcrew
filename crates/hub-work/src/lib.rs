@@ -69,6 +69,7 @@
 mod activity;
 mod codec;
 mod commands;
+mod cursors;
 mod dispatch;
 mod edits;
 mod error;
