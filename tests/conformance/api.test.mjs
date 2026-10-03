@@ -849,6 +849,72 @@ for (const [path, method] of [
   check(`agent forbidden write ${path}`, () =>
     api(path, 403, undefined, { method, body: {}, token: agent }),
   );
+// The other person-only writes, on things that exist, each with a body a person's request could
+// carry, so only the token's scope refuses them.
+for (const [method, route, path, body] of [
+  ['PATCH', '/v1/tasks/{id}', () => `/v1/tasks/${context.task.id}`, { title: 'Synthetic' }],
+  [
+    'POST',
+    '/v1/tasks/{id}/assign',
+    () => `/v1/tasks/${context.task.id}/assign`,
+    () => ({ assignee: context.agentMe.id }),
+  ],
+  [
+    'POST',
+    '/v1/tasks/{id}/dispatch',
+    () => `/v1/tasks/${context.task.id}/dispatch`,
+    () => ({ agent: context.agentMe.id }),
+  ],
+  [
+    'PATCH',
+    '/v1/workstreams/{id}',
+    () => `/v1/workstreams/${context.workstream.id}`,
+    { status: 'active' },
+  ],
+  [
+    'POST',
+    '/v1/sessions/{id}/send',
+    () => `/v1/sessions/${context.sessions[0].id}/send`,
+    { text: 'Synthetic' },
+  ],
+  [
+    'POST',
+    '/v1/sessions/{id}/keys',
+    () => `/v1/sessions/${context.sessions[0].id}/keys`,
+    { keys: ['enter'] },
+  ],
+  [
+    'POST',
+    '/v1/sessions/{id}/interrupt',
+    () => `/v1/sessions/${context.sessions[0].id}/interrupt`,
+    undefined,
+  ],
+  [
+    'POST',
+    '/v1/sessions/{id}/end',
+    () => `/v1/sessions/${context.sessions[0].id}/end`,
+    { mode: 'graceful' },
+  ],
+  [
+    'POST',
+    '/v1/sessions/{id}/link',
+    () => `/v1/sessions/${context.sessions[0].id}/link`,
+    () => ({ workstream: context.workstream.id }),
+  ],
+  [
+    'PUT',
+    '/v1/briefs/{kind}/{id}',
+    () => `/v1/briefs/project/${context.project.id}`,
+    { text: 'Synthetic' },
+  ],
+])
+  check(`agent forbidden write ${method} ${route}`, () =>
+    api(path(), 403, undefined, {
+      method,
+      body: typeof body === 'function' ? body() : body,
+      token: agent,
+    }),
+  );
 check('agent plan keeps human lines and stamps attribution', async () => {
   const t = await api('/v1/tasks', 201, schemas.task, {
     method: 'POST',
