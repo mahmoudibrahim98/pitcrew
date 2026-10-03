@@ -157,7 +157,7 @@ describe('stream client timing', () => {
     expect(streamUrl('http://127.0.0.1:9000/hub/', undefined)).toBe('ws://127.0.0.1:9000/hub/v1/stream');
   });
 
-  it('resets on a gap in revisions instead of skipping ahead', () => {
+  it('accepts private revision gaps and delivers visible events', () => {
     const resets: number[] = [];
     const { factory, sockets } = fakeSockets();
     const received: Event[] = [];
@@ -170,11 +170,11 @@ describe('stream client timing', () => {
     stream.start();
     sockets[0]?.send({ type: 'hello', rev: 9 });
     sockets[0]?.send({ type: 'events', from_rev: 8, to_rev: 9, events: [taskMoved('E8'), taskMoved('E9')] });
-    expect(resets).toEqual([9]);
-    expect(received).toEqual([]);
+    expect(resets).toEqual([]);
+    expect(received.map((e) => e.id)).toEqual(['E8', 'E9']);
     expect(stream.rev).toBe(9);
     sockets[0]?.send({ type: 'events', from_rev: 10, to_rev: 10, events: [taskMoved('E10')] });
-    expect(received.map((e) => e.id)).toEqual(['E10']);
+    expect(received.map((e) => e.id)).toEqual(['E8', 'E9', 'E10']);
     stream.stop();
   });
 

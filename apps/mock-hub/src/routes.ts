@@ -85,6 +85,7 @@ export const PROTOCOL_MIN = 1;
 /** The mock's tokens. A `Map`, so no inherited object property can pass for a token. */
 const TOKENS = new Map<string, { member: MemberId; scope: TokenScope }>([
   ['dev-device-token', { member: DEV_DEVICE_MEMBER, scope: 'device' }],
+  ['dev-second-device-token', { member: '01JB000000000000000MEM0007', scope: 'device' }],
   ['dev-agent-token', { member: DEV_AGENT_MEMBER, scope: 'agent' }],
 ]);
 
@@ -1293,7 +1294,7 @@ const listEvents: Handler = (hub, ctx) => {
   const revs: number[] = [];
   for (; rev >= floor && revs.length <= limit; rev--) {
     const event = hub.eventAt(rev);
-    if (event !== undefined && touches(hub, event.body, filter)) {
+    if (event !== undefined && event.body.type !== 'cursor_moved' && touches(hub, event.body, filter)) {
       revs.push(rev);
     }
   }
@@ -1302,6 +1303,7 @@ const listEvents: Handler = (hub, ctx) => {
   const page = revs.slice(0, limit).reverse();
   return ok({
     events: page.map((r) => hub.eventAt(r)),
+    revisions: page,
     from_rev: page[0] ?? (atStart ? 0 : rev + 1),
     to_rev: page.at(-1) ?? 0,
     at_start: atStart,
@@ -1331,6 +1333,8 @@ function touches(hub: Hub, body: EventBody, filter: EventFilter): boolean {
 /** What an event names directly; `touches` adds the parents. */
 function directRefs(hub: Hub, body: EventBody): EventFilter {
   switch (body.type) {
+    case 'cursor_moved':
+      return {};
     case 'session_discovered': {
       const { session } = body.data;
       return { session: session.id, task: session.task, workstream: session.workstream };
@@ -1422,6 +1426,31 @@ const route = (method: string, pattern: string, access: Route['access'], handler
 });
 
 const ROUTES: Route[] = [
+  route('GET', '/v1/me/cursors', 'device', (hub, ctx) => ok(
+    [...(hub.cursors.get(ctx.caller.memberId) ?? new Map<string, number>())]
+      .sort(([a], [b]) => a.localeCompare(b)).map(([scope, rev]) => ({ scope, rev })),
+  )),
+  route('PUT', '/v1/me/cursors/:scope', 'device', (hub, ctx) => {
+    const scope = ctx.param('scope');
+    if (scope !== 'workspace') {
+      const match = /^(project|workstream):([0-7][0-9A-HJKMNP-TV-Z]{25})$/.exec(scope);
+      if (match === null) throw invalid('Invalid cursor scope.');
+      const exists = match[1] === 'project' ? hub.findProject(match[2]!) : hub.findWorkstream(match[2]!);
+      if (exists === undefined) throw notFound('Unknown cursor scope.');
+    }
+    if (!isRecord(ctx.body) || !Number.isSafeInteger(ctx.body['rev']) || typeof ctx.body['rev'] !== 'number' || ctx.body['rev'] < 0 || ctx.body['rev'] > hub.rev) {
+      throw invalid('Revision must be an integer in the log.');
+    }
+    const cursors = hub.cursors.get(ctx.caller.memberId) ?? new Map<string, number>();
+    const current = cursors.get(scope) ?? 0;
+    const rev = Math.max(current, ctx.body['rev']);
+    if (rev > current) {
+      cursors.set(scope, rev);
+      hub.cursors.set(ctx.caller.memberId, cursors);
+      hub.append(ctx.caller.memberId, { type: 'cursor_moved', data: { scope, rev } });
+    }
+    return ok({ scope, rev });
+  }),
   // Host and workspace (`GET /v1/host/info` is handled before auth, in `handleApi`).
   route('GET', '/v1/me', 'agent', (_hub, ctx) =>
     ok(found(ctx.caller.member, 'No member yet; set up the workspace first.')),
@@ -1478,6 +1507,7 @@ const ROUTES: Route[] = [
   route('GET', '/v1/briefs', 'device', listBriefs),
   route('PUT', '/v1/briefs/:kind/:id', 'device', putBrief),
   route('GET', '/v1/events', 'device', listEvents),
+  route('GET', '/v1/activity', 'device', listEvents),
   // Recaps: from the fixture the recap engine wrote (recaps.ts).
   route('GET', '/v1/recaps/blocks', 'device', (hub, ctx) => ok(blocksPage(hub.recaps, ctx.query))),
   route('GET', '/v1/recaps/days', 'device', (hub, ctx) => ok(daysPage(hub.recaps, ctx.query))),

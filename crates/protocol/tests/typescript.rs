@@ -21,13 +21,29 @@ fn fixture<T: TS + Serialize + DeserializeOwned + PartialEq + Debug>(
     Ok(())
 }
 
+fn write_exports(source: &Path, destination: &Path) -> Result<(), Box<dyn Error>> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(destination)? {
+        let name = entry?.file_name();
+        assert!(source.join(&name).exists(), "stale binding: {name:?}");
+    }
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            write_exports(&entry.path(), &target)?;
+        } else {
+            fs::write(target, fs::read(entry.path())?)?;
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn export_bindings() -> Result<(), Box<dyn Error>> {
-    let package = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/protocol-ts");
+    let destination = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/protocol-ts");
+    let package = std::env::temp_dir().join(format!("pitcrew-bindings-{}", ids::EventId::new()));
     let bindings = package.join("bindings");
-    if bindings.exists() {
-        fs::remove_dir_all(&bindings)?;
-    }
     fs::create_dir_all(&bindings)?;
     // serde_json writes integers as JSON numbers, never JavaScript bigint literals.
     let config = Config::new()
@@ -35,6 +51,8 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
         .with_out_dir(&bindings)
         .with_import_extension(Some("ts"));
     api::ApiError::export_all(&config)?;
+    api::ReadCursor::export_all(&config)?;
+    api::MoveCursor::export_all(&config)?;
     api::Caller::export_all(&config)?;
     api::ErrorCode::export_all(&config)?;
     api::EventsPage::export_all(&config)?;
@@ -289,5 +307,16 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
         },
     )?;
     fs::write(package.join("tests/fixtures.ts"), examples)?;
+    // Never delete checked-in files. A removed type needs an explicit repository change.
+    write_exports(&bindings, &destination.join("bindings"))?;
+    fs::write(
+        destination.join("index.ts"),
+        fs::read(package.join("index.ts"))?,
+    )?;
+    fs::write(
+        destination.join("tests/fixtures.ts"),
+        fs::read(package.join("tests/fixtures.ts"))?,
+    )?;
+    fs::remove_dir_all(package)?;
     Ok(())
 }

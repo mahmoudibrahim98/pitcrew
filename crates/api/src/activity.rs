@@ -34,7 +34,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use pitcrew_auth::ErrorResponse;
 use pitcrew_protocol::api::{ErrorCode, EventsPage};
-use pitcrew_protocol::events::Event;
+use pitcrew_protocol::events::{Event, EventBody};
 use pitcrew_protocol::ids::{ProjectId, SessionId, TaskId, WorkstreamId};
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -153,6 +153,7 @@ impl Activity {
     pub fn routes(self) -> Router {
         Router::new()
             .route("/v1/events", get(events))
+            .route("/v1/activity", get(events))
             .with_state(self)
     }
 
@@ -251,13 +252,26 @@ fn unfiltered(
     before: u64,
     limit: usize,
 ) -> Result<EventsPage, SourceError> {
-    // One extra event tells whether older ones exist.
-    let mut events = source.before(before, limit.saturating_add(1))?;
-    let at_start = events.len() <= limit;
-    if !at_start {
-        events.remove(0);
+    let mut found = Vec::new();
+    let mut cursor = before;
+    loop {
+        let chunk = source.before(cursor, SCAN_PAGE)?;
+        let Some(first) = chunk.first() else {
+            found.reverse();
+            return Ok(page_of(found, true, 0));
+        };
+        cursor = first.rev;
+        for event in chunk.into_iter().rev() {
+            if matches!(event.event.body, EventBody::CursorMoved { .. }) {
+                continue;
+            }
+            if found.len() == limit {
+                found.reverse();
+                return Ok(page_of(found, false, cursor));
+            }
+            found.push(event);
+        }
     }
-    Ok(page_of(events, at_start, 0))
 }
 
 /// `project` and/or `workstream` alone: the index's answer is the page.
@@ -282,10 +296,12 @@ fn indexed(
         .into());
     }
     let events = events_at(source, &revs)?;
+    let revisions = revs.clone();
     Ok(EventsPage {
+        revisions: revs,
         events,
-        from_rev: revs.first().copied().unwrap_or(scanned_to),
-        to_rev: revs.last().copied().unwrap_or(0),
+        from_rev: revisions.first().copied().unwrap_or(scanned_to),
+        to_rev: revisions.last().copied().unwrap_or(0),
         at_start: scanned_to == 0,
     })
 }
@@ -372,6 +388,7 @@ fn page_of(events: Vec<StoredEvent>, at_start: bool, scanned_to: u64) -> EventsP
         _ => (0, 0),
     };
     EventsPage {
+        revisions: events.iter().map(|e| e.rev).collect(),
         events: events.into_iter().map(|e| e.event).collect(),
         from_rev,
         to_rev,
@@ -473,6 +490,9 @@ impl Matcher {
     }
 
     fn matches(&self, event: &StoredEvent, about: &About) -> bool {
+        if matches!(event.event.body, EventBody::CursorMoved { .. }) {
+            return false;
+        }
         let rev = event.rev;
         // The index first: it is cheap, and the only way `project` and `workstream` match.
         if self.filter.project.is_some() && !about.project.contains(&rev) {
@@ -600,6 +620,34 @@ mod tests {
             project: Some(id),
             ..RefFilter::default()
         }
+    }
+
+    #[test]
+    fn cursor_metadata_does_not_fill_activity_pages() {
+        let source = log(3);
+        let mut metadata = filler(60);
+        for event in &mut metadata {
+            event.body = EventBody::CursorMoved {
+                scope: "workspace".into(),
+                rev: 1,
+            };
+        }
+        source.append(metadata);
+        source.append(filler(2));
+        let activity = Activity::new(source);
+        let page = activity.page(66, 4, &RefFilter::default()).unwrap();
+        assert_eq!(page.revisions, vec![2, 3, 64, 65]);
+        assert_eq!((page.from_rev, page.to_rev, page.at_start), (2, 65, false));
+        assert!(
+            page.events
+                .iter()
+                .all(|e| !matches!(e.body, EventBody::CursorMoved { .. }))
+        );
+        let older = activity
+            .page(page.from_rev, 4, &RefFilter::default())
+            .unwrap();
+        assert_eq!(older.revisions, vec![1]);
+        assert!(older.at_start);
     }
 
     #[test]

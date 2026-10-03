@@ -48,6 +48,9 @@ planted by another user never receives a token:
   `Store::log_id()` lands (brief C-projections).
 - First frame `hello {rev, log}`; if `since < rev`, the missed events in `events` frames of at
   most 500; then live batches, coalesced over 75 ms; `ping` every 20 s.
+- Cursor metadata is delivered only to its author's devices, in live and replay. Frames
+  stay contiguous internally; private revisions create gaps between frames. Activity skips
+  cursor writes before counting its limit and includes each event's actual `revisions`.
 - Exact resume: the pump subscribes before reading `rev`, always reads from the last revision it
   sent, and skips announced ranges it already covered. A lagged subscription re-reads the latest
   revision and catches up.

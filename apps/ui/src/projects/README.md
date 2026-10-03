@@ -84,6 +84,16 @@ hub sends it back.
 
 ## Activity
 
+Home's "Since you last looked" uses the person's hub cursor for `workspace`, shared
+across devices. It marks newer events New and counts them in the loaded activity window;
+"Mark all as read" advances to the newest displayed revision. Cursor metadata is excluded.
+Project/workstream pages advance their own scope after one second, with the revision
+loaded for that visit. Leaving sooner cancels the write; live events during a visit
+do not continuously move it. Failed writes show an error. No cursor lives in local storage.
+`tests/cursors.test.tsx` covers cross-device refresh and dwell behavior; the cursor browser
+tests cover Home, scope visits and axe in both themes. Project browser tests capture no
+screenshots by default; optional recap captures require `PITCREW_E2E_SCREENSHOTS=1`.
+
 `useActivity` keeps one live window of `GET /v1/events`. With filters the hub scans a bounded
 window per request, so pages can be short or empty without being the end; only `at_start` ends
 the feed. One call spends at most 8 requests past what is shown and returns where it stopped;

@@ -191,6 +191,7 @@ const dispatch = object({
   'summary?': text,
 });
 const eventData = {
+  cursor_moved: object({ scope: text, rev: integer }),
   machine_added: object({ machine }),
   member_added: object({ member }),
   persona_saved: object({

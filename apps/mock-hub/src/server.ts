@@ -347,7 +347,7 @@ function serveUpgrade(
     }
     const conn =
       target.kind === 'stream'
-        ? acceptStream(hub, req, socket, head, streamSince(query))
+        ? acceptStream(hub, req, socket, head, streamSince(query), caller.memberId)
         : acceptTerminal(hub, req, socket, head, terminalTarget(hub, target.session, query));
     log(`WS ${path} 101`);
     return conn;
@@ -365,9 +365,10 @@ function acceptStream(
   socket: Duplex,
   head: Buffer,
   since: number | undefined,
+  person: string,
 ): WebSocketConnection {
   const conn = acceptUpgrade(req, socket, head, SUBPROTOCOL);
-  openStream(hub, conn, since);
+  openStream(hub, conn, since, person);
   return conn;
 }
 
