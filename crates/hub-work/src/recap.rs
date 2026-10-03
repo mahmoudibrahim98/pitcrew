@@ -356,7 +356,11 @@ impl DayCache {
             return Ok(hit.recaps.clone());
         }
         let owned = load()?;
-        if !owned.iter().map(|b| (b.id, b.last)).eq(covers.iter().copied()) {
+        if !owned
+            .iter()
+            .map(|b| (b.id, b.last))
+            .eq(covers.iter().copied())
+        {
             return Err(WorkError::internal(
                 "the recap index's blocks do not match their heads",
             ));
@@ -1344,7 +1348,10 @@ mod tests {
                 locations: vec![],
                 external: vec![],
             };
-            events.push(event(t0 - DAY_MS, EventBody::WorkstreamCreated { workstream }));
+            events.push(event(
+                t0 - DAY_MS,
+                EventBody::WorkstreamCreated { workstream },
+            ));
         }
         let task_body = Task {
             id: task,
@@ -1364,7 +1371,10 @@ mod tests {
             accept_auto: false,
             subtasks: vec![],
         };
-        events.push(event(t0 - DAY_MS, EventBody::TaskCreated { task: task_body }));
+        events.push(event(
+            t0 - DAY_MS,
+            EventBody::TaskCreated { task: task_body },
+        ));
         for (s, w) in sessions.iter().zip(streams) {
             let session = Session {
                 id: *s,
@@ -1459,7 +1469,15 @@ mod tests {
         }
         // The day things were created, and four days of work.
         let whole = &first[0];
-        assert_eq!(whole.days.iter().map(|d| &d.date).collect::<HashSet<_>>().len(), 5);
+        assert_eq!(
+            whole
+                .days
+                .iter()
+                .map(|d| &d.date)
+                .collect::<HashSet<_>>()
+                .len(),
+            5
+        );
         for workstream in [None, Some(streams[0]), Some(streams[1])] {
             assert!(
                 whole.days.iter().any(|d| d.workstream == workstream),

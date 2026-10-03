@@ -695,7 +695,10 @@ pub(crate) mod tests {
         assert!(entries(open.path()).is_empty());
         let made = entries(sticky.path());
         assert_eq!(made.len(), 1);
-        assert_eq!(db.file_path(), Some(made[0].join("recaps.sqlite3").as_path()));
+        assert_eq!(
+            db.file_path(),
+            Some(made[0].join("recaps.sqlite3").as_path())
+        );
         assert_eq!(mode(&made[0]), 0o700);
     }
 }
