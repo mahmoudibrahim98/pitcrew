@@ -1,8 +1,8 @@
-import { WorkspaceName } from '../workspace-name.tsx';
 // What shows instead of a page when there is no workspace data to show: a full-screen status
 // line (opening, listing workspaces), or, in the desktop app, why the gateway cannot reach a
 // workspace. Never a spinner: a workspace that is unreachable or needs pairing says so.
 
+import { WorkspaceName } from '../workspace-name.tsx';
 import { useState, type ReactNode } from 'react';
 import { useRemoteGateway, type GatewayWorkspace } from '../../data/index.ts';
 import { Button } from '../../design/index.ts';

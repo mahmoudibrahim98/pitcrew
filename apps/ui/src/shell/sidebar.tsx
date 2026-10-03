@@ -96,7 +96,7 @@ export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
             </span>
             {!collapsed && (
               <>
-                <span className="min-w-0 flex-1 truncate text-sm font-semibold text-ink"><WorkspaceName workspace={selected} /></span>
+                <span className="min-w-0 flex-1 text-sm font-semibold text-ink"><WorkspaceName workspace={selected} /></span>
                 <ChevronsUpDownIcon className="size-3.5 text-ink-2" />
               </>
             )}
@@ -113,8 +113,7 @@ export function WorkspaceSwitcher({ collapsed }: { collapsed: boolean }) {
           <MenuRadioGroup value={ws} onValueChange={(id) => void router.navigate({ href: paths.workspace(id) })}>
             {workspaces.map((w) => (
               <MenuRadioItem key={w.id} value={w.id}>
-                <WorkspaceName workspace={w} />
-                {w.state !== undefined && w.state !== 'ready' && ` · ${WORKSPACE_STATE_LABEL[w.state]}`}
+                <WorkspaceName workspace={w} suffix={w.state !== undefined && w.state !== 'ready' ? ` · ${WORKSPACE_STATE_LABEL[w.state]}` : ''} />
               </MenuRadioItem>
             ))}
           </MenuRadioGroup>

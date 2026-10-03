@@ -58,6 +58,7 @@ function LayoutSwitcher() {
 
 interface Crumb {
   label: string;
+  kind?: 'local' | 'remote' | undefined;
   host?: string | undefined;
   to?: string;
 }
@@ -78,7 +79,7 @@ function useCrumbs(): Crumb[] {
   const tasks = useTasks().data;
   const sessions = useSessions().data;
 
-  const crumbs: Crumb[] = [{ label: gateway?.name ?? workspace?.name ?? 'Workspace', host: gateway?.kind === 'remote' ? gateway.host : undefined, to: paths.workspace(ws) }];
+  const crumbs: Crumb[] = [{ label: gateway?.name ?? workspace?.name ?? 'Workspace', kind: gateway?.kind, host: gateway?.host, to: paths.workspace(ws) }];
   const workstream = workstreams?.find((w) => w.id === params.workstream);
   const task = tasks?.find((t) => t.key === params.task || t.id === params.task);
   const projectId = params.project ?? workstream?.project ?? task?.project;
@@ -110,14 +111,14 @@ function Sep() {
 function CrumbLink({ crumb, last }: { crumb: Crumb; last: boolean }) {
   if (last || crumb.to === undefined) {
     return (
-      <span aria-current={last ? 'page' : undefined} className={cx('truncate', last ? 'font-medium text-ink' : 'text-ink-2')}>
-        <WorkspaceName workspace={{ name: crumb.label, kind: 'remote', host: crumb.host }} />
+      <span aria-current={last ? 'page' : undefined} className={cx('flex min-w-0', last ? 'font-medium text-ink' : 'text-ink-2')}>
+        <WorkspaceName workspace={{ name: crumb.label, kind: crumb.kind, host: crumb.host }} />
       </span>
     );
   }
   return (
-    <Link to={crumb.to} activeOptions={{ exact: true }} className="truncate text-ink-2 hover:text-ink hover:underline">
-      <WorkspaceName workspace={{ name: crumb.label, kind: 'remote', host: crumb.host }} />
+    <Link to={crumb.to} activeOptions={{ exact: true }} className="flex min-w-0 text-ink-2 hover:text-ink hover:underline">
+      <WorkspaceName workspace={{ name: crumb.label, kind: crumb.kind, host: crumb.host }} />
     </Link>
   );
 }
@@ -151,7 +152,7 @@ function Breadcrumb() {
   // Collapsed first, not truncated: everything before the current page gives way before it does,
   // so the page on screen stays readable instead of being crushed to a sliver alongside it.
   const rest = crumbs.slice(0, -1);
-  const fullPath = crumbs.map((c) => workspaceLabel({ name: c.label, kind: 'remote', host: c.host })).join(' / ');
+  const fullPath = crumbs.map((c) => workspaceLabel({ name: c.label, kind: c.kind, host: c.host })).join(' / ');
   if (last === undefined) return <nav aria-label="Breadcrumb" className="min-w-0 flex-1" />;
 
   return (
@@ -163,14 +164,14 @@ function Breadcrumb() {
             {/* The full trail once there is room. */}
             <span className="hidden min-w-0 items-center gap-1.5 @4xl:flex">
               {rest.map((crumb, i) => (
-                <span key={`${i}-$<WorkspaceName workspace={{ name: crumb.label, kind: 'remote', host: crumb.host }} />`} className="flex min-w-0 max-w-48 items-center gap-1.5">
+                <span key={`${i}-${crumb.label}`} className="flex min-w-0 max-w-48 items-center gap-1.5">
                   {i > 0 && <Sep />}
                   <CrumbLink crumb={crumb} last={false} />
                 </span>
               ))}
             </span>
             {/* Collapsed below that: still reachable by name, not gone. */}
-            <CollapsedCrumbs labels={rest.map((c) => workspaceLabel({ name: c.label, kind: 'remote', host: c.host }))} />
+            <CollapsedCrumbs labels={rest.map((c) => workspaceLabel({ name: c.label, kind: c.kind, host: c.host }))} />
           </li>
         )}
         <li className="flex min-w-0 shrink items-center gap-1.5">

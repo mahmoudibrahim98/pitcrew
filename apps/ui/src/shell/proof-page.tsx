@@ -1,7 +1,7 @@
-import { WorkspaceName } from './workspace-name.tsx';
 // A minimal page proving the data layer: projects, workstreams, open asks and live sessions from
 // the hub, and a move that comes back through the stream. Kept as a dev-only route (/dev/proof).
 
+import { WorkspaceName } from './workspace-name.tsx';
 import { Button, StatusPill, ThemeToggle, type Tone } from '../design/index.ts';
 import {
   ApiError,

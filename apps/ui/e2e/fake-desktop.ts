@@ -17,6 +17,7 @@ export interface FakeDesktopOptions {
   token: string;
   /** The SLURM job script the plan shows, verbatim. */
   jobScript: string;
+  initialWorkspace?: { id: string; name: string; host: string; kind: 'remote'; state: 'ready' };
 }
 
 export interface FakeDesktopRecord {
@@ -25,7 +26,7 @@ export interface FakeDesktopRecord {
   adds: string[];
 }
 
-export function installFakeDesktop({ hubUrl, token, jobScript }: FakeDesktopOptions): void {
+export function installFakeDesktop({ hubUrl, token, jobScript, initialWorkspace }: FakeDesktopOptions): void {
   type Callback = (data: unknown) => void;
   const callbacks = new Map<number, Callback>();
   const listeners = new Map<string, Set<number>>();
@@ -33,7 +34,7 @@ export function installFakeDesktop({ hubUrl, token, jobScript }: FakeDesktopOpti
   let nextCallback = 1;
   let nextSocket = 1;
   let plans = 0;
-  let workspaces: unknown[] = [];
+  let workspaces: unknown[] = initialWorkspace === undefined ? [] : [initialWorkspace];
   let pending: { id: string; resolve: (args: Record<string, unknown>) => void } | undefined;
   const record: FakeDesktopRecord = { calls: [], replies: [], adds: [] };
   (window as unknown as { __fakeDesktop: FakeDesktopRecord }).__fakeDesktop = record;
