@@ -225,9 +225,19 @@ check_rpm() { # FILE
   fi
   rm -rf "$root"
   mkdir -p "$root"
-  if ! rpm2cpio "$rpm_file" | (cd "$root" && cpio -idm --no-absolute-filenames --quiet); then
-    fail "rpm: cannot unpack $rpm_file"
-    return
+  # rpm2cpio | cpio, else libarchive's bsdtar (which reads every payload compression rpm uses).
+  # Either way the tree is checked the same; a failure says what the unpackers reported.
+  local unpack_errors="$tmp/rpm-unpack-errors"
+  if ! rpm2cpio "$rpm_file" 2>"$unpack_errors" |
+    (cd "$root" && cpio -idm --no-absolute-filenames --quiet) 2>>"$unpack_errors"; then
+    rm -rf "$root"
+    mkdir -p "$root"
+    if command -v bsdtar >/dev/null 2>&1 && bsdtar -xf "$rpm_file" -C "$root" 2>>"$unpack_errors"; then
+      echo "  note: rpm2cpio | cpio failed ($(head -c 300 "$unpack_errors" | tr '\n' ' ')); unpacked with bsdtar"
+    else
+      fail "rpm: cannot unpack $rpm_file: $(head -c 300 "$unpack_errors" | tr '\n' ' ')"
+      return
+    fi
   fi
   check_listing rpm <"$listing"
   check_tree rpm "$root/usr/bin" "$root/usr/lib/$product/helpers"
