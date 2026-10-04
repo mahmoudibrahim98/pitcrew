@@ -289,9 +289,12 @@ Release dry runs provide the production comparison, including DMG and NSIS.
 Linux reuses `pitcrewd` beside the desktop for the x86_64 musl entry, and macOS reuses its
 universal sidecar for the universal entry. Staging verifies byte identity before omitting
 that resource. Windows has no native remote-helper platform, so all three resources remain.
-The other entries are `helpers/<artefact>.xz` (XZ, level 6). The desktop first looks for
-an explicit uncompressed development helper, then its XZ resource, then the native sidecar
-when the platform matches. An override never changes the compiled manifest trust rule.
+The other entries are `helpers/<artefact>.xz` (XZ, level 6). Installed lookup prefers the native sidecar when the platform matches, then the XZ resource,
+then an uncompressed development helper. An explicit helpers override uses only that folder
+(XZ before raw); it never changes the compiled manifest trust rule. This order ignores raw
+resources left behind by a previous installer. NSIS also removes its three known legacy raw
+resources before installing the compressed replacements; its upgrade test plants synthetic
+legacy files and checks removal.
 
 Decoded resources enter an owner-only cache through an exclusively created 0600 temporary
 file (protected owner-only DACL on Windows). Decoding has a 256 MiB output limit and a

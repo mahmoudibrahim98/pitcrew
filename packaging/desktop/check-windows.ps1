@@ -174,6 +174,10 @@ Start-Sleep -Seconds 2
 Remove-Item -Recurse -Force $state, $log, "$log.out" -ErrorAction SilentlyContinue
 
 # --- Install again while pitcrew-ptyd runs (an upgrade with terminals open)
+# Stand in for resources left by the old uncompressed installer.
+foreach ($entry in $manifestJson.sha256.PSObject.Properties) {
+  [IO.File]::WriteAllText((Join-Path (Join-Path $dir 'helpers') $entry.Name), 'synthetic legacy helper')
+}
 $pipe = '\\.\pipe\pitcrew-check-' + [guid]::NewGuid().ToString('N')
 $ptyd = Start-Process -FilePath (Join-Path $dir 'pitcrew-ptyd.exe') -PassThru -WindowStyle Hidden `
   -ArgumentList @('serve', '--endpoint', $pipe, '--foreground', '--idle-exit-ms', '600000')
@@ -193,6 +197,13 @@ if ($ptyd.HasExited) {
     Ok "installed again while pitcrew-ptyd ran: it kept running from $($aside[0].FullName)"
   }
   Check-Helpers # Check the upgraded compressed resources and embedded manifest too.
+  foreach ($entry in $manifestJson.sha256.PSObject.Properties) {
+    if (Test-Path -LiteralPath (Join-Path (Join-Path $dir 'helpers') $entry.Name)) {
+      Fail "upgrade left the legacy raw helper $($entry.Name)"
+    } else {
+      Ok "upgrade removed the legacy raw helper $($entry.Name)"
+    }
+  }
   Stop-Process -Id $ptyd.Id -Force -ErrorAction SilentlyContinue
   Start-Sleep -Seconds 2
 }

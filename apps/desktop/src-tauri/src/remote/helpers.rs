@@ -146,12 +146,12 @@ impl Helpers {
         })?;
         let raw = dir.join(artefact);
         let compressed = dir.join(format!("{artefact}.xz"));
-        let path = if raw.exists() {
-            raw
+        let path = if matches_native(platform) && self.native.is_some() {
+            self.native
+                .clone()
+                .ok_or_else(|| "missing native daemon".to_owned())?
         } else if compressed.exists() {
             compressed
-        } else if matches_native(platform) {
-            self.native.clone().unwrap_or(raw)
         } else {
             raw
         };
@@ -363,6 +363,8 @@ mod tests {
             let mut encoder = xz2::write::XzEncoder::new(std::fs::File::create(path).unwrap(), 6);
             std::io::Write::write_all(&mut encoder, bytes).unwrap();
             encoder.finish().unwrap();
+            // A previous installer may have left its uncompressed resource behind.
+            std::fs::write(dir.join(platform.artefact()), b"stale helper").unwrap();
             sums.insert(platform.artefact(), hex_sha256(bytes));
         }
         let compiled = Box::leak(
@@ -392,6 +394,11 @@ mod tests {
             Platform::LinuxX86_64
         };
         let path = tmp.path().join(locate::PITCREWD);
+        std::fs::write(
+            dir.join(platform.artefact()),
+            b"stale helper from old installer",
+        )
+        .unwrap();
         std::fs::write(&path, b"version one").unwrap();
         let manifest = |version, bytes: &[u8]| -> &'static str {
             Box::leak(serde_json::json!({"version":version, "sha256":{platform.artefact():hex_sha256(bytes)}})
