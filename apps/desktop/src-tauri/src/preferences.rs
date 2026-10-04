@@ -29,6 +29,8 @@ pub struct Preferences {
     pub quit_on_close: bool,
     /// The person was told, once, that closing the window keeps the app in the tray.
     pub tray_hint_shown: bool,
+    /// Include signed pre-releases in update checks (off by default).
+    pub update_prereleases: bool,
 }
 
 impl Default for Preferences {
@@ -37,6 +39,7 @@ impl Default for Preferences {
             notifications: true,
             quit_on_close: false,
             tray_hint_shown: false,
+            update_prereleases: false,
         }
     }
 }
@@ -147,7 +150,7 @@ mod tests {
         let saved: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(
             saved,
-            serde_json::json!({ "notifications": false, "quitOnClose": false, "trayHintShown": true })
+            serde_json::json!({ "notifications": false, "quitOnClose": false, "trayHintShown": true, "updatePrereleases": false })
         );
         assert_eq!(PreferenceStore::load(tmp.path()).get(), updated);
     }
