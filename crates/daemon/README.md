@@ -68,7 +68,7 @@ in the log when used (see "Terminals"):
 | `recaps.sqlite3` | The recap index's blocks (hub-work's README, "Recaps"): a cache, made when the index is built at start, replaced at every start and removed at a clean stop; never read from one run to the next. Private. On a network or unknown filesystem, kept in a private local fallback folder (temp before `$XDG_RUNTIME_DIR`), or memory if neither works; see "Recaps". |
 | `runner/<log id>/` | The runner's index (`pitcrew-runner`): every transcript it watches, its session id, and how far it has been read into this store. One folder per hub log (the store's `log_id`), so a new store learns every session from the start. |
 | `agents/<agent id>.token` | An agent token for each agent whose CLI the runner started (a dispatch's, or `POST /v1/sessions` with `agent`), bound to that agent and its owner, `pca_…`. The CLI is given its path (`PITCREW_TOKEN_FILE`), never the token. Minted once, reused while it verifies as exactly that. The folder is 0700, each file 0600. |
-| `integrations.json` | The GitHub and Jira connections (never a secret), the tracker sync's member (`@sync`), each connection's last sync status, and the upstream titles of linked milestones and epics. Private. |
+| `integrations.json` | The GitHub and Jira connections (never a secret), each connection's sync member (`@sync` or `@tracker-sync`, an agent of the person who added it) and last sync status, and the upstream titles of linked milestones and epics. Private. |
 | `integrations/<id>.state.json`, `integrations/<id>.secret` | A connection's sync state (cursors, `ETag`s, snapshots of what it read upstream; never in the event log) and its stored secret, when it has one. The folder is 0700 (an owner-only DACL on Windows), each file 0600. |
 | `run/pitcrewd.sock` | The private socket (Unix). On Windows the API uses the current user's named pipe, `\\.\pipe\pitcrewd-<user SID>`. |
 
@@ -1108,12 +1108,14 @@ and handed back, not kept, once it has.
 
 GitHub and Jira, **read-only** (api-v1.md, "Integrations"; `src/integrations/`):
 
-- **Connections** live in `integrations.json`, never in the event log. The first one adds the
-  tracker sync's member (`@sync`, an agent of the person; hub-work's `ensure_sync_member`), which
-  authors everything a sync changes.
-- **Credentials**: `gh auth token` (with `--hostname` for Enterprise), found on the daemon's
-  `PATH` (absolute folders only), checked with `pitcrew_trust::check_trusted`, run without a
-  terminal and read at each sync, never kept; or a secret stored by `PUT …/credential` in
+- **Connections** live in `integrations.json`, never in the event log, each with its own sync
+  member: `@sync` (or `@tracker-sync`), an agent of the person who added it (hub-work's
+  `ensure_sync_member`), which authors everything that connection's sync changes. A repository
+  or Jira project is in one connection at most, on any host (`validate::scope_keys`).
+- **Credentials**: `gh auth token --hostname <host>` (always named, `github.com` included, with
+  `GH_HOST` cleared), found on the daemon's `PATH` (absolute folders only), checked with
+  `pitcrew_trust::check_trusted`, run without a terminal and read at each sync, never kept; or a
+  secret stored by `PUT …/credential` in
   `integrations/<id>.secret` (`secret.rs`). A `Secret` prints as `Secret(***)`; no route returns
   one and nothing logs one (`tests/integrations.rs` checks every answer, the log at debug and the
   saved files).
@@ -1132,7 +1134,8 @@ GitHub and Jira, **read-only** (api-v1.md, "Integrations"; `src/integrations/`):
 - When a repository's or project's links change, its issues (and, on GitHub, pull requests) are
   read again from the start at the next sync.
 - `--integration-fixtures <dir>` swaps the transport for recorded exchanges, answered by URL (a
-  `since=` cursor ignored), for tests: `tests/integrations.rs` and the conformance runner.
+  `since=` cursor ignored) and read again for each request, for tests: `tests/integrations.rs`
+  and the conformance runner, which changes what upstream says by adding a file that sorts first.
 
 ## Not wired yet
 

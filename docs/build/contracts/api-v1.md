@@ -690,7 +690,7 @@ tokens only** (an agent token gets `403`, before anything else is checked). Type
 | `GET /v1/integrations` | → `Integration[]` | Oldest first. |
 | `POST /v1/integrations` | `NewIntegration` → `Integration` (201) | See below. |
 | `GET /v1/integrations/{id}` | → `Integration` | |
-| `DELETE /v1/integrations/{id}` | → 204 | Forgets the connection, its stored credential and its sync state. Links on workstreams stay, as plain links. |
+| `DELETE /v1/integrations/{id}` | → 204 | Forgets the connection, its stored credential and its sync state. Links on workstreams stay, as plain links. A sync of it under way applies nothing more and keeps no state. |
 | `POST /v1/integrations/{id}/test` | → `IntegrationCheck` | Reads upstream once with the credential (see below). Changes nothing. |
 | `POST /v1/integrations/{id}/sync` | → `Integration` (202) | Syncs now, in the background; `status.running` is `true` until it ends. |
 | `PUT /v1/integrations/{id}/credential` | `{ "secret": String }` → 204 | Stores the secret. See "Credentials". |
@@ -714,11 +714,14 @@ tokens only** (an agent token gets `403`, before anything else is checked). Type
   Enterprise server's), and `GH_HOST` is cleared for `gh`, so its default host never decides
   which token is sent where. `stored` waits for a secret (`PUT …/credential`).
 - `interval_minutes` is 5–1440; default 15.
-- A repository, or a Jira site and project, already in another integration is `409 conflict`.
-  Anything else malformed is `400 invalid`.
-- The hub acts through a member of its own, `@sync` (an agent of the person who added the first
-  integration, named "Tracker sync"; `@tracker-sync` when `@sync` is taken), added with
-  `member_added` on the first `POST`. Everything a sync changes is authored by it.
+- A repository or Jira project already in another integration is `409 conflict`, on any host:
+  workstream links and task sources name a repository or an issue key without its host, so the
+  same one on two hosts (github.com and an Enterprise server, or two Jira sites) would move each
+  other's tasks. Anything else malformed is `400 invalid`.
+- Each integration acts through a member of its own, owned by the person who added it: `@sync` (an
+  agent of that person, named "Tracker sync"), or `@tracker-sync` when `@sync` is another person's,
+  added with `member_added` on that person's first `POST`. When both handles are other people's,
+  the `POST` is `409 conflict`. Everything a sync changes is authored by its integration's member.
 
 `Integration`: `{ "id", "name", "settings", "credential": { "source": "gh_cli" | "stored",
 "stored": bool }, "interval_minutes", "added_by": MemberId, "added_at": ms, "status":
@@ -760,8 +763,10 @@ the integration is added) and on `POST …/sync`, one integration at a time:
   Jira), and stops at a rate limit until it lifts (`rate_limited_until`).
 - **Issues become tasks only in a linked scope.** An open issue whose milestone (GitHub) or epic
   (Jira) a workstream links becomes a task in that workstream; otherwise one whose repository or
-  Jira project a workstream links. Issues in no linked scope, and issues already closed when first
-  seen, are skipped (`skipped`). The task's `source` is the issue, its status `todo`.
+  Jira project a workstream links. So does an open issue a later sync finds moved into a milestone
+  or under an epic that routes to a workstream this way. Issues in no linked scope, and issues
+  already closed when first seen, are skipped (`skipped`). The task's `source` is the issue, its
+  status `todo`.
 - **Field owners.** Title, description and labels belong to upstream: an upstream change
   overwrites them (`task_updated`). The assignee belongs to the hub. A change of milestone or epic
   moves the task to the workstream that links the new one (in the same project); otherwise it
@@ -789,10 +794,12 @@ the integration is added) and on `POST …/sync`, one integration at a time:
   choice never hides it. Those routes, like these, are device tokens only.
 
 **The mock** answers every route over the recorded fixtures in `apps/mock-hub/fixtures/`
-(`example-org/demo-repo` on GitHub, project `DEMO` on `https://jira.example.com`), syncs at once
-on `POST …/sync`, and keeps credentials in memory only. The daemon reads them the same way when
-started with the hidden `--integration-fixtures <dir>` (tests only; it then never reaches the
-network).
+(`example-org/demo-repo` on GitHub, project `DEMO` on `https://jira.example.com`), or the folder
+`startServer({ integrationFixtures })` names, syncs at once on `POST …/sync`, and keeps credentials
+in memory only. The daemon reads them the same way when started with the hidden
+`--integration-fixtures <dir>` (tests only; it then never reaches the network). Both read the
+folder again at each sync, so a test changes what upstream says by adding a file whose name sorts
+first.
 
 ## Live updates: `GET /v1/stream?since=<rev>` (WebSocket, device tokens)
 

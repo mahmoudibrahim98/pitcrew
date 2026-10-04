@@ -2,7 +2,7 @@
 //!
 //! | Path | What |
 //! |---|---|
-//! | `integrations.json` | The connections (no secret), the sync's member, each one's status and the upstream titles of linked scopes. Private (0600). |
+//! | `integrations.json` | The connections (no secret), each one's sync member, status and the upstream titles of linked scopes. Private (0600). |
 //! | `integrations/<id>.state.json` | One connection's sync state (`pitcrew_sync_github::SyncState` or `pitcrew_sync_jira::SyncState`: cursors, `ETag`s, snapshots). Private (0600). |
 //! | `integrations/<id>.secret` | Its stored secret, when it has one (see `secret.rs`). |
 
@@ -31,6 +31,11 @@ pub struct Record {
     pub interval_minutes: u32,
     pub added_by: MemberId,
     pub added_at: TimestampMs,
+    /// The member this connection's sync acts as: `@sync` (or `@tracker-sync`), an agent of
+    /// `added_by`. `None` in a file written before it was kept here; the next sync finds or adds
+    /// it.
+    #[serde(default)]
+    pub sync_member: Option<MemberId>,
     /// The last sync's status (`running` is never kept).
     #[serde(default)]
     pub status: SyncStatus,
@@ -46,9 +51,6 @@ pub struct Record {
 /// `integrations.json`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Saved {
-    /// The tracker sync's member, once added.
-    #[serde(default)]
-    pub sync_member: Option<MemberId>,
     /// The connections, oldest first.
     #[serde(default)]
     pub integrations: Vec<Record>,

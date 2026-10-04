@@ -417,7 +417,7 @@ whatever it sent.
 | `seed` | the daemon | imports a `DemoWorkspace` into an empty work model |
 | `ensure_office_member(owner)` | the daemon | finds or adds the back office's member (see "The back office"); 400 `owner` is not a person; 409 `@office` held by a person, another person's agent or no one's agent |
 | `run_office`, `OfficeCommands` | the back office | see "The back office" |
-| `ensure_sync_member(owner)` | the daemon, when a tracker is first connected | finds or adds the tracker sync's member: an agent of `owner` named `@sync` (`@tracker-sync` when `@sync` is someone else's); 400 `owner` is not a person; 409 both handles taken |
+| `ensure_sync_member(owner)` | the daemon, when a person connects a tracker (each connection keeps its own) | finds or adds the tracker sync's member: an agent of `owner` named `@sync` (`@tracker-sync` when `@sync` is someone else's); 400 `owner` is not a person; 409 both handles taken |
 | `SyncCommands` | a tracker sync (`sync_commands(member)`) | see "Tracker sync" |
 
 "Own task" means the agent is the assignee or holds an active (not ended) dispatch on it.

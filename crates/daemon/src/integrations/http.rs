@@ -7,7 +7,9 @@
 //!   a body.
 //! - [`FixtureTransport`]: recorded exchanges from a folder of `*.fixture` files (the sync crates'
 //!   format), answered by method and URL, as often as asked; for tests only (`serve
-//!   --integration-fixtures`). It never reaches the network.
+//!   --integration-fixtures`). The folder is read again for each request, so a test changes
+//!   "upstream" between two syncs by adding a file whose name sorts first. It never reaches the
+//!   network.
 
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Empty, Limited};
@@ -168,64 +170,75 @@ impl Transport for HttpsTransport {
     }
 }
 
+type Exchanges = HashMap<(String, String), RecordedExchange>;
+
 /// Recorded exchanges, answered by method and URL (tests only). See the [module docs](self).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FixtureTransport {
-    exchanges: Arc<HashMap<(String, String), RecordedExchange>>,
+    dir: Arc<std::path::PathBuf>,
 }
 
 impl FixtureTransport {
-    /// Every exchange in the `*.fixture` files of `dir`; the first of two for one method and URL
-    /// wins.
+    /// The exchanges in the `*.fixture` files of `dir`, read now (to fail early) and again for
+    /// each request.
     ///
     /// # Errors
     /// The folder or a file cannot be read, or a file is not in the fixture format.
     pub fn load(dir: &Path) -> anyhow::Result<Self> {
-        let mut names: Vec<_> = std::fs::read_dir(dir)?
-            .filter_map(Result::ok)
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "fixture"))
-            .collect();
-        names.sort();
-        let mut exchanges = HashMap::new();
-        for path in names {
-            let text = std::fs::read_to_string(&path)?;
-            for exchange in parse_fixture(&text)? {
-                exchanges
-                    .entry((exchange.method.clone(), exchange.url.clone()))
-                    .or_insert(exchange);
-            }
-        }
+        read_exchanges(dir)?;
         Ok(Self {
-            exchanges: Arc::new(exchanges),
+            dir: Arc::new(dir.to_path_buf()),
         })
     }
+}
 
-    /// The exchange for `request`: its URL, else its URL without a `since=` parameter (a fixture
-    /// for a first read answers later incremental ones too, as if nothing changed upstream).
-    fn find(&self, request: &Request) -> Option<&RecordedExchange> {
-        let method = request.method.as_str().to_owned();
-        self.exchanges
-            .get(&(method.clone(), request.url.clone()))
-            .or_else(|| {
-                let (base, query) = request.url.split_once('?')?;
-                let kept: Vec<&str> = query
-                    .split('&')
-                    .filter(|pair| !pair.starts_with("since="))
-                    .collect();
-                let url = if kept.is_empty() {
-                    base.to_owned()
-                } else {
-                    format!("{base}?{}", kept.join("&"))
-                };
-                self.exchanges.get(&(method, url))
-            })
+/// Every exchange in the `*.fixture` files of `dir`, by name; the first of two for one method and
+/// URL wins.
+fn read_exchanges(dir: &Path) -> anyhow::Result<Exchanges> {
+    let mut names: Vec<_> = std::fs::read_dir(dir)?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "fixture"))
+        .collect();
+    names.sort();
+    let mut exchanges = HashMap::new();
+    for path in names {
+        let text = std::fs::read_to_string(&path)?;
+        for exchange in parse_fixture(&text)? {
+            exchanges
+                .entry((exchange.method.clone(), exchange.url.clone()))
+                .or_insert(exchange);
+        }
     }
+    Ok(exchanges)
+}
+
+/// The exchange for `request`: its URL, else its URL without a `since=` parameter (a fixture for
+/// a first read answers later incremental ones too, as if nothing changed upstream).
+fn find<'a>(exchanges: &'a Exchanges, request: &Request) -> Option<&'a RecordedExchange> {
+    let method = request.method.as_str().to_owned();
+    exchanges
+        .get(&(method.clone(), request.url.clone()))
+        .or_else(|| {
+            let (base, query) = request.url.split_once('?')?;
+            let kept: Vec<&str> = query
+                .split('&')
+                .filter(|pair| !pair.starts_with("since="))
+                .collect();
+            let url = if kept.is_empty() {
+                base.to_owned()
+            } else {
+                format!("{base}?{}", kept.join("&"))
+            };
+            exchanges.get(&(method, url))
+        })
 }
 
 impl Transport for FixtureTransport {
     async fn send(&self, request: Request) -> Result<Response, TransportError> {
-        match self.find(&request) {
+        let exchanges = read_exchanges(&self.dir)
+            .map_err(|_| failed(&request.url, "the recorded fixtures cannot be read"))?;
+        match find(&exchanges, &request) {
             Some(exchange) => Ok(Response {
                 status: exchange.status,
                 headers: exchange.response_headers.clone(),
@@ -302,6 +315,25 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!missing.to_string().contains("token=x"));
+
+        // The folder is read again for each request: a file whose name sorts first changes what
+        // "upstream" says from then on.
+        std::fs::write(
+            dir.path().join("0-later.fixture"),
+            "GET https://api.github.com/repos/example-org/demo-repo/issues?state=all&per_page=100 HTTP/1.1\n\n\
+             HTTP/1.1 200\nETag: \"e2\"\n\n[{}]\n",
+        )
+        .unwrap();
+        let later = fixtures
+            .send(get(
+                "https://api.github.com/repos/example-org/demo-repo/issues?state=all&per_page=100",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            (later.header("etag"), later.body.as_slice()),
+            (Some("\"e2\""), &b"[{}]"[..])
+        );
     }
 
     #[tokio::test]

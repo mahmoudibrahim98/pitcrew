@@ -352,6 +352,7 @@ impl Integrations {
             interval_minutes: checked.interval_minutes,
             added_by: caller.member,
             added_at: now,
+            sync_member: Some(member.id),
             status: SyncStatus {
                 next_at: Some(now),
                 ..SyncStatus::default()
@@ -361,7 +362,6 @@ impl Integrations {
         };
         {
             let mut saved = lock(&self.saved);
-            saved.sync_member = Some(member.id);
             saved.integrations.push(record.clone());
             self.save(&saved)?;
         }
@@ -383,12 +383,14 @@ impl Integrations {
                 return Err(Refusal::not_found(id));
             }
             self.save(&saved)?;
-        }
-        if let Err(e) = self.secrets.remove(id) {
-            tracing::warn!(integration = %id, error = %e, "cannot remove the integration's secret");
-        }
-        if let Err(e) = self.files.remove_state(id) {
-            tracing::warn!(integration = %id, error = %e, "cannot remove the integration's sync state");
+            // Still under the lock: a sync under way checks the record under it before keeping
+            // its state (`keep_state`), so it cannot write the state back after this.
+            if let Err(e) = self.secrets.remove(id) {
+                tracing::warn!(integration = %id, error = %e, "cannot remove the integration's secret");
+            }
+            if let Err(e) = self.files.remove_state(id) {
+                tracing::warn!(integration = %id, error = %e, "cannot remove the integration's sync state");
+            }
         }
         lock(&self.requested).remove(id);
         tracing::info!(integration = %id, by = %caller.member, "integration removed");
@@ -419,10 +421,17 @@ impl Integrations {
                 "This integration reads `gh auth token` on the hub's machine and keeps no secret.",
             ));
         }
-        self.secrets.save(id, &secret).map_err(|e| {
-            tracing::warn!(integration = %id, error = %e, "cannot store the integration's secret");
-            Refusal::internal("Storing the secret")
-        })?;
+        {
+            // Under the lock `remove` holds: a secret is never kept for a removed integration.
+            let saved = lock(&self.saved);
+            if !saved.integrations.iter().any(|r| r.id == *id) {
+                return Err(Refusal::not_found(id));
+            }
+            self.secrets.save(id, &secret).map_err(|e| {
+                tracing::warn!(integration = %id, error = %e, "cannot store the integration's secret");
+                Refusal::internal("Storing the secret")
+            })?;
+        }
         tracing::info!(integration = %id, by = %caller.member, "integration credential stored");
         self.request(id);
         Ok(())
@@ -618,10 +627,7 @@ impl Integrations {
             scope: String::new(),
             message: r.message,
         })?;
-        let member = lock(&self.saved).sync_member.ok_or_else(|| SyncProblem {
-            scope: String::new(),
-            message: "The sync's member is missing; remove and add the integration again.".into(),
-        })?;
+        let member = self.member_of(record).await?;
         let workstreams = self.workstreams().await.map_err(|r| SyncProblem {
             scope: String::new(),
             message: r.message,
@@ -674,9 +680,11 @@ impl Integrations {
                         scope: e.repo.clone(),
                         message: e.message.clone(),
                     }));
+                let openings = apply::github_openings(&outcome.changes, &outcome.state);
                 let changes = outcome.changes;
+                self.still_there(&record.id)?;
                 let applied = apply_blocking(work, member, ExternalSystem::Github, move |a| {
-                    apply::apply_github(a, &changes);
+                    apply::apply_github(a, &changes, &openings);
                 })
                 .await?;
                 done.merge(applied, outcome.malformed_skipped);
@@ -725,9 +733,11 @@ impl Integrations {
                         scope: e.project.clone(),
                         message: e.message.clone(),
                     }));
+                let openings = apply::jira_openings(&outcome.changes, &outcome.state);
                 let changes = outcome.changes;
+                self.still_there(&record.id)?;
                 let applied = apply_blocking(work, member, ExternalSystem::Jira, move |a| {
-                    apply::apply_jira(a, &changes);
+                    apply::apply_jira(a, &changes, &openings);
                 })
                 .await?;
                 done.merge(applied, outcome.malformed_skipped);
@@ -737,11 +747,53 @@ impl Integrations {
         Ok(done)
     }
 
+    /// The member `record`'s sync acts as: the one kept with it, else (a connection saved before
+    /// it was kept) its owner's, found or added, and kept from now on.
+    async fn member_of(&self, record: &Record) -> Result<MemberId, SyncProblem> {
+        if let Some(member) = record.sync_member {
+            return Ok(member);
+        }
+        let problem = |message: String| SyncProblem {
+            scope: String::new(),
+            message,
+        };
+        let work = self.work().map_err(|r| problem(r.message))?;
+        let owner = record.added_by;
+        let member = tokio::task::spawn_blocking(move || work.ensure_sync_member(owner))
+            .await
+            .map_err(|_| problem("Adding the sync's member failed; see the hub's log.".into()))?
+            .map_err(|e| problem(e.to_string()))?;
+        let mut saved = lock(&self.saved);
+        if let Some(kept) = saved.integrations.iter_mut().find(|r| r.id == record.id) {
+            kept.sync_member = Some(member.id);
+            if let Err(e) = self.files.save(&saved) {
+                tracing::warn!(error = %e, "cannot save the integrations");
+            }
+        }
+        Ok(member.id)
+    }
+
+    /// `Err` once `id` has been removed (`DELETE` during its sync): what the sync read is then
+    /// neither applied nor kept.
+    fn still_there(&self, id: &IntegrationId) -> Result<(), SyncProblem> {
+        if lock(&self.saved).integrations.iter().any(|r| r.id == *id) {
+            Ok(())
+        } else {
+            Err(removed_during_sync())
+        }
+    }
+
     fn keep_state<T: serde::Serialize>(
         &self,
         id: &IntegrationId,
         state: &T,
     ) -> Result<(), SyncProblem> {
+        // Under the lock `remove` holds while it forgets the state: a removed integration's
+        // state is never written back.
+        let saved = lock(&self.saved);
+        if !saved.integrations.iter().any(|r| r.id == *id) {
+            return Err(removed_during_sync());
+        }
         self.files.save_state(id, state).map_err(|e| {
             tracing::warn!(integration = %id, error = %e, "cannot save the sync state");
             SyncProblem {
@@ -749,6 +801,13 @@ impl Integrations {
                 message: "The sync state could not be saved; see the hub's log.".into(),
             }
         })
+    }
+}
+
+fn removed_during_sync() -> SyncProblem {
+    SyncProblem {
+        scope: String::new(),
+        message: "The integration was removed during its sync.".into(),
     }
 }
 
