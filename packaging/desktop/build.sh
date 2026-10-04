@@ -181,6 +181,8 @@ cat >"$stage/tauri.bundle.json" <<EOF
 }
 EOF
 
+node packaging/updater-config.mjs "$stage/tauri.bundle.json"
+
 echo "staged in $stage: pitcrewd $version"
 echo "PITCREW_HELPERS_MANIFEST=$manifest"
 if [ "$stage_only" = 1 ]; then
@@ -257,4 +259,19 @@ done
 if [ "$found" -eq 0 ]; then
   echo "::error::Tauri produced no installer in $bundle_dir" >&2
   exit 1
+fi
+
+# Copy the macOS updater archive (the DMG is only the initial installer).
+for f in "$bundle_dir"/macos/*.app.tar.gz; do
+  [ -f "$f" ] || continue
+  cp "$f" "$out/"
+done
+# Sign the final bytes, AFTER AppImage mode repair. Never copy a pre-repair signature.
+if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+  for f in "$out"/*.AppImage "$out"/*.app.tar.gz "$out"/*-setup.exe; do
+    [ -f "$f" ] || continue
+    update_version=$(node -p "JSON.parse(require('fs').readFileSync(process.argv[1])).version" "$stage/tauri.bundle.json")
+    "${tauri[@]}" signer sign --app-version "$update_version" "$f"
+    [ -s "$f.sig" ] || { echo "::error::missing updater signature" >&2; exit 1; }
+  done
 fi
