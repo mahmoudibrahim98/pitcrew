@@ -228,9 +228,10 @@ export function Workbench({ api, empty }: WorkbenchProps) {
 
   return (
     <div data-workbench="" onKeyDown={onKeyDown} className="flex min-h-0 min-w-0 flex-1">
-      <section aria-label="Workbench" className="flex min-h-0 min-w-0 flex-1 flex-col">
+      {/* The panes are the landmarks ("Pane 1"…); this is only their frame. */}
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <NodeView api={api} node={layout.root} numbers={numbers} count={groups.length} empty={empty} />
-      </section>
+      </div>
       {layout.details.open && (
         <ResizablePanel
           as="aside"
@@ -440,11 +441,6 @@ function GroupView({ group, api, numbers, count, empty }: NodeProps & { group: G
           >
             <PanelRightIcon />
           </Button>
-          {!onlyPane && (
-            <Button variant="ghost" className={toolButton} aria-label={`Close pane ${number}`} title="Close the pane" onClick={() => api.closePane(group.id)}>
-              <CloseIcon />
-            </Button>
-          )}
         </div>
       </div>
       <div
@@ -472,7 +468,7 @@ function GroupView({ group, api, numbers, count, empty }: NodeProps & { group: G
             view={tab.ref.view}
             onView={(view) => api.change((l) => setView(l, group.id, tab.id, view))}
             narrow={false}
-            linksLabel={number === 1 ? undefined : `Linked work, pane ${number}`}
+            pane={number}
           />
         ) : (
           <FileTab
@@ -678,9 +674,13 @@ function TabStrip({
               </div>
             </ContextMenu.Trigger>
             <ContextMenu.Portal>
-              <ContextMenu.Content className="z-50 min-w-52 rounded-md border border-line bg-card p-1 shadow-pop">
+              <ContextMenu.Content
+                className="z-50 min-w-52 rounded-md border border-line bg-card p-1 shadow-pop"
+                // Each action puts focus where its result is (the tab may have moved or gone).
+                onCloseAutoFocus={(event) => event.preventDefault()}
+              >
                 {tab.preview && (
-                  <ContextMenu.Item className={MENU_ITEM} onSelect={() => api.change((l) => keep(l, group.id, tab.id))}>
+                  <ContextMenu.Item className={MENU_ITEM} onSelect={() => api.change((l) => keep(l, group.id, tab.id), { focus: 'tab' })}>
                     Keep open
                   </ContextMenu.Item>
                 )}

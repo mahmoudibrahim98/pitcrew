@@ -414,8 +414,11 @@ export function splitGroup(
     sizes: [0.5, 0.5],
   }));
   if (root === null) return [layout, undefined];
-  // The copied tab keeps the source: it is no longer a preview either.
-  const kept = mapGroup(root, groupId, (g) => ({ ...g, tabs: g.tabs.map((t) => (t.id === source?.id ? keepTab(t) : t)) }));
+  // A tab that was copied is kept on both sides: the source is no longer a preview either.
+  const kept =
+    tabs.length === 0
+      ? root
+      : mapGroup(root, groupId, (g) => ({ ...g, tabs: g.tabs.map((t) => (t.id === source?.id ? keepTab(t) : t)) }));
   return [normalize({ ...next, root: kept ?? root, activeGroup: id }), id];
 }
 

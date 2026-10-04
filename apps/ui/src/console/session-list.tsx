@@ -292,6 +292,8 @@ function SessionRow(props: {
   onOpen: ((where: OpenWhere) => void) | undefined;
 }) {
   const { session } = props;
+  // Opening a tab moves focus to it: the menu must not hand focus back to the row afterwards.
+  const opened = useRef(false);
   const starting = session.state === 'starting';
   const state = STATE[session.state];
   const row = (
@@ -341,15 +343,25 @@ function SessionRow(props: {
   if (props.onLink === undefined && props.onOpen === undefined) return row;
   const item = 'rounded-sm px-2 py-1.5 text-sm outline-none data-highlighted:bg-hover';
   const { onOpen } = props;
+  const open = (where: OpenWhere) => {
+    opened.current = true;
+    onOpen?.(where);
+  };
   return (
     <ContextMenu.Root modal={false}>
       <ContextMenu.Trigger asChild>{row}</ContextMenu.Trigger>
       <ContextMenu.Portal>
-        <ContextMenu.Content className="z-50 min-w-44 rounded-md border border-line bg-card p-1 shadow-pop">
+        <ContextMenu.Content
+          className="z-50 min-w-44 rounded-md border border-line bg-card p-1 shadow-pop"
+          onCloseAutoFocus={(event) => {
+            if (opened.current) event.preventDefault();
+            opened.current = false;
+          }}
+        >
           {onOpen !== undefined && (
             <>
-              <ContextMenu.Item onSelect={() => onOpen('tab')} className={item}>Open in a new tab</ContextMenu.Item>
-              <ContextMenu.Item onSelect={() => onOpen('side')} className={item}>Open to the side</ContextMenu.Item>
+              <ContextMenu.Item onSelect={() => open('tab')} className={item}>Open in a new tab</ContextMenu.Item>
+              <ContextMenu.Item onSelect={() => open('side')} className={item}>Open to the side</ContextMenu.Item>
             </>
           )}
           {props.onLink !== undefined && <ContextMenu.Item onSelect={props.onLink} className={item}>Link to…</ContextMenu.Item>}

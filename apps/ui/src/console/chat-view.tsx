@@ -34,6 +34,8 @@ export interface ChatViewProps {
   /** Items per page; the API's default when absent. */
   pageSize?: number;
   className?: string;
+  /** The region's name ("Chat"); the workbench makes it unique per pane. */
+  label?: string | undefined;
 }
 
 export function ChatView(props: ChatViewProps) {
@@ -41,7 +43,7 @@ export function ChatView(props: ChatViewProps) {
   return <ChatViewBody key={props.sessionId} {...props} />;
 }
 
-function ChatViewBody({ sessionId, pageSize, className }: ChatViewProps) {
+function ChatViewBody({ sessionId, pageSize, className, label }: ChatViewProps) {
   'use no memo'; // TanStack Virtual's instance changes under the React Compiler's memoisation.
   const transcript = useTranscript(sessionId, { pageSize });
   const { view } = transcript;
@@ -130,7 +132,7 @@ function ChatViewBody({ sessionId, pageSize, className }: ChatViewProps) {
   const error = transcript.error;
   return (
     <section
-      aria-label="Chat"
+      aria-label={label ?? 'Chat'}
       className={cx('flex h-full min-h-0 flex-col', className)}
       data-loaded={view.loaded}
     >

@@ -42,11 +42,15 @@ export interface SessionPaneProps {
   view: SessionView;
   onView(view: SessionView): void;
   narrow: boolean;
-  /** The header's "Linked work" landmark name; unique per pane when several show a session. */
-  linksLabel?: string | undefined;
+  /**
+   * Which pane shows the session, when there are several: the session's landmarks ("Chat",
+   * "Linked work") get it in their names, so each stays unique on the page.
+   */
+  pane?: number | undefined;
 }
 
-export function SessionPane({ ws, sessionId, view, onView, narrow, linksLabel }: SessionPaneProps) {
+export function SessionPane({ ws, sessionId, view, onView, narrow, pane }: SessionPaneProps) {
+  const suffix = pane === undefined || pane === 1 ? '' : `, pane ${pane}`;
   const router = useRouter();
   const session = useSession(sessionId);
   if (session.error instanceof ApiError && session.error.code === 'not_found') {
@@ -77,7 +81,7 @@ export function SessionPane({ ws, sessionId, view, onView, narrow, linksLabel }:
         workstreamHref={workstreamHref}
         onOpenWorkstream={(w) => open(workstreamHref(w))}
         compact={narrow && (shown === 'terminal' || shown === 'work')}
-        linksLabel={linksLabel}
+        linksLabel={`Linked work${suffix}`}
       />
       <ViewSwitch
         value={switchValue}
@@ -125,7 +129,7 @@ export function SessionPane({ ws, sessionId, view, onView, narrow, linksLabel }:
       {shown === 'chat' && (
         <>
           <div data-pane="chat" className="min-h-0 flex-1">
-            <ChatView sessionId={sessionId} />
+            <ChatView sessionId={sessionId} label={`Chat${suffix}`} />
           </div>
           <div data-pane="composer" className="shrink-0">
             <Composer sessionId={sessionId} />

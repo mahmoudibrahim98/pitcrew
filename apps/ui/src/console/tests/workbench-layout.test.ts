@@ -235,6 +235,10 @@ describe('the layout model', () => {
       expect((dropped.root as Split).direction, side).toBe(side === 'left' || side === 'right' ? 'row' : 'column');
     }
     expect(dropTab(layout, { group: g.id, tab: b }, g.id, 'center')).toBe(layout);
+    // A preview left behind stays a preview: only a copy keeps its source.
+    const withPreview = reveal(openTab(emptyLayout(), file('kept')), chat('S9'), { preview: true });
+    const moved = dropTab(withPreview, { group: 'g1', tab: activeGroupOf(withPreview).tabs[0]?.id ?? '' }, 'g1', 'right');
+    expect(picture(moved)).toEqual([['S9:chat?*'], ['kept*']]);
     // A pane's only tab dropped on its own side changes nothing.
     const single = openTab(emptyLayout(), file('a'));
     expect(dropTab(single, { group: 'g1', tab: activeGroupOf(single).active ?? '' }, 'g1', 'right')).toBe(single);
