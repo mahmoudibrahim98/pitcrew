@@ -58,3 +58,20 @@ activity, so the office never feeds on itself.
   saved state restores exactly at any point, and caps hold under a flood.
 - `tests/run_log.rs`: the projection stores what the office did and rebuilds identically, with
   any batch size, registered late, after a reopen, and after a rolled-back append.
+
+## Draft board dependency
+
+Brief [0-draft-board](../../docs/build/briefs/0-draft-board.md) requires a dispatched agent to
+return a structured board proposal through the `pitcrew` CLI, before a person accepts any tasks.
+This feature is not implemented. The current CLI has no proposal submission command:
+`report`, `comment`, and `task plan` operate on existing tasks; `ask` and `reply` operate on asks;
+`hook` forwards CLI lifecycle events silently and always exits successfully.
+
+Implementing a proposal submission command requires substantive changes to `crates/cli/**`,
+which the brief does not include in its allowed paths. Extend the brief to include that crate
+and its tests and README before implementation resumes. The submission command should read a
+bounded proposal from stdin, submit it with the dispatched agent's authenticated connection,
+and return a failure when validation or storage fails. The hub must bind the submission to the
+pending draft and its agent, validate evidence session links, and create tasks only when a
+person accepts the proposal. A proposed command spelling is `pitcrew board submit <draft>`,
+to be agreed in the API contract before code; it is not available today.
