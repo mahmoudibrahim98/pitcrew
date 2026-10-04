@@ -449,12 +449,49 @@ for (const [verb, body] of [
   check(`session ${verb} unknown`, () =>
     api(`/v1/sessions/${missing}/${verb}`, 404, undefined, { method: 'POST', body }),
   );
+check('session link validates references', async () => {
+  const path = `/v1/sessions/${context.sessions[0].id}/link`;
+  for (const body of [{}, { workstream: missing }, { task: missing },
+    { workstream: context.streams[0].id, task: context.task.id }]) {
+    await api(path, 400, undefined, { method: 'POST', body });
+  }
+  await api(`/v1/sessions/${missing}/link`, 404, undefined, {
+    method: 'POST', body: { workstream: context.workstream.id },
+  });
+});
+check('session link rejects a task without membership in the named workstream', async () => {
+  const task = await api('/v1/tasks', 201, schemas.task, {
+    method: 'POST', body: { project: context.project.id, title: 'Synthetic task without a workstream' },
+  });
+  const path = `/v1/sessions/${context.sessions[0].id}/link`;
+  await api(path, 400, undefined, {
+    method: 'POST', body: { workstream: context.workstream.id, task: task.id },
+  });
+  const linked = await api(path, 200, schemas.session, { method: 'POST', body: { task: task.id } });
+  assert.equal(linked.task, task.id);
+  assert.ok(!Object.hasOwn(linked, 'workstream'));
+});
+check('session link task derives workstream and emits an event', async () => {
+  const id = context.sessions[0].id;
+  const s = await api(`/v1/sessions/${id}/link`, 200, schemas.session, {
+    method: 'POST', body: { task: context.task.id },
+  });
+  assert.equal(s.task, context.task.id);
+  assert.equal(s.workstream, context.workstream.id);
+  assert.equal(s.link_basis, 'manual');
+  const page = await api(`/v1/events?session=${id}`, 200, schemas.events);
+  const event = page.events.find((e) => e.body.type === 'session_linked' && e.body.data.task === context.task.id);
+  assert.ok(event);
+  assert.equal(event.body.data.basis, 'manual');
+  assert.equal(event.author, context.me.id);
+});
 check('session link manual', async () => {
   const s = await api(`/v1/sessions/${context.sessions[0].id}/link`, 200, schemas.session, {
     method: 'POST',
     body: { workstream: context.workstream.id },
   });
   assert.equal(s.workstream, context.workstream.id);
+  assert.ok(!Object.hasOwn(s, 'task'));
   assert.equal(s.link_basis, 'manual');
 });
 check('transcript page and paging', async () => {

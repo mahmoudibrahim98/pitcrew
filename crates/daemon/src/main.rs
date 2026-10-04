@@ -24,6 +24,7 @@
 //! **Owned by stream 0.**
 
 mod agents;
+mod locations;
 mod cli;
 mod cors;
 mod dispatch;

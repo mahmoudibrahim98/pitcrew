@@ -20,13 +20,22 @@ use pitcrew_protocol::ids::{
     AskId, DispatchId, MemberId, SessionId, SubtaskId, TaskId, TaskKey, WorkstreamId,
 };
 use pitcrew_protocol::model::{
-    Answer, Ask, AskKind, AskState, Brief, DispatchOutcome, Health, MemberKind, Mover, Receipt,
-    Subtask, SubtaskSource, Task, TaskStatus, Workstream, WorkstreamStatus,
+    Answer, Ask, AskKind, AskState, Brief, DispatchOutcome, Health, LinkBasis, MemberKind, Mover, Receipt,
+    Session, Subtask, SubtaskSource, Task, TaskStatus, Workstream, WorkstreamStatus,
 };
 use pitcrew_protocol::transcript::{PlanItem, PlanStatus};
 use pitcrew_store::sql::Connection;
 use serde::Deserialize;
 use std::collections::HashSet;
+
+/// A person's explicit session assignment.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SessionLink {
+    /// Workstream, derived from the task when absent.
+    pub workstream: Option<WorkstreamId>,
+    /// Optional task in that workstream.
+    pub task: Option<TaskId>,
+}
 
 /// `POST /v1/asks`: a new ask, from the caller.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -203,6 +212,61 @@ fn plan_lines(existing: &[Subtask], agent: MemberId, items: &[PlanItem]) -> Vec<
 }
 
 impl WorkService {
+    /// Links a session by hand. Only device callers may do this.
+    ///
+    /// # Errors
+    /// `forbidden` for agents, `not_found` for the session, `invalid` for missing or
+    /// inconsistent body references, or database errors.
+    pub fn link_session(
+        &self,
+        caller: &Caller,
+        id: &SessionId,
+        link: SessionLink,
+    ) -> Result<Session> {
+        if caller.scope != TokenScope::Device {
+            return Err(WorkError::forbidden("Only a person may link a session."));
+        }
+        let _guard = self.lock();
+        let workstream = self.read(|c| {
+            query::session(c, id)?
+                .ok_or_else(|| WorkError::not_found(format!("No session {id}.")))?;
+            let task = match link.task {
+                Some(id) => Some(
+                    query::task(c, &TaskRef::Id(id))?
+                        .ok_or_else(|| WorkError::invalid(format!("task: no task {id}.")))?,
+                ),
+                None => None,
+            };
+            let workstream = link
+                .workstream
+                .or_else(|| task.as_ref().and_then(|t| t.workstream));
+            if link.task.is_none() && workstream.is_none() {
+                return Err(WorkError::invalid("Give a workstream, a task, or both."));
+            }
+            if let Some(id) = workstream {
+                query::workstream(c, &id)?
+                    .ok_or_else(|| WorkError::invalid(format!("workstream: no workstream {id}.")))?;
+            }
+            if let Some(task) = task
+                && workstream.is_some()
+                && task.workstream != workstream
+            {
+                return Err(WorkError::invalid("The task is not in that workstream."));
+            }
+            Ok(workstream)
+        })?;
+        self.append(&[self.by(
+            caller,
+            EventBody::SessionLinked {
+                session: *id,
+                workstream,
+                task: link.task,
+                basis: LinkBasis::Manual,
+            },
+        )])?;
+        self.session(id)
+    }
+
     /// Whether `caller` may write to `task` at all: `not_found` for an unknown task, `forbidden`
     /// for an agent on a task not its own. The routes ask this before reading a request's body, so
     /// a forbidden caller hears `403` whatever it sent; each command checks again under its lock.

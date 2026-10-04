@@ -268,3 +268,12 @@ coloured dot beside `ink-2` text.
   cd apps/ui
   PLAYWRIGHT_CHANNEL=msedge corepack pnpm exec playwright test -c src/console/tests/e2e/playwright.config.ts
   ```
+
+## Link a session
+
+Right-click a session row (or use its header's Actions menu) and choose “Link to…”. Choose a
+workstream and optionally one of its tasks. Changing workstream clears the task; errors keep the
+dialog open for retry. The mutation leaves the cache to the existing `session_linked` stream
+invalidation, so sessions move out of Unsorted without a reload. `link-session.test.tsx` tests
+selection and retry; `tests/e2e/link-session.spec.ts` covers the row action and axe checks. The
+root e2e suite imports that spec through a one-line discovery shim.

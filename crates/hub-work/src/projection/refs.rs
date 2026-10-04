@@ -34,7 +34,7 @@ pub struct Refs;
 impl Refs {
     /// The projection's name.
     pub const NAME: &'static str = "work.refs";
-    const VERSION: u32 = 1;
+    const VERSION: u32 = 2;
 }
 
 /// What an event is about, as bare ULIDs.

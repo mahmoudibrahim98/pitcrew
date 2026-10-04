@@ -1051,7 +1051,7 @@ const linkSession: Handler = (hub, ctx) => {
   if (task === undefined && workstream === undefined) {
     throw invalid('Give a workstream, a task, or both.');
   }
-  if (task?.workstream !== undefined && workstream !== undefined && task.workstream !== workstream.id) {
+  if (task !== undefined && workstream !== undefined && task.workstream !== workstream.id) {
     throw invalid(`${task.key} is not in workstream "${workstream.name}".`);
   }
   session.workstream = workstream?.id;

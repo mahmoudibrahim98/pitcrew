@@ -504,7 +504,7 @@ Device tokens only (`device_routes`): `GET /v1/workspace`, `POST /v1/setup`, `GE
 `GET /v1/workstreams?project=`, `POST /v1/workstreams`, `GET|PATCH /v1/workstreams/{id}`,
 `POST /v1/tasks`, `PATCH /v1/tasks/{id-or-key}`, `POST /v1/tasks/{id}/assign`,
 `POST /v1/tasks/{id}/dispatch`, `GET /v1/sessions?machine=&workstream=&task=&state=`,
-`GET /v1/sessions/{id}`, `GET /v1/briefs`, `PUT /v1/briefs/{project|workstream}/{id}`.
+`GET /v1/sessions/{id}`, `POST /v1/sessions/{id}/link`, `GET /v1/briefs`, `PUT /v1/briefs/{project|workstream}/{id}`.
 
 `GET /v1/workspace` answers `{ workspace, rev, setup_needed }`; `rev` is the lowest checkpoint of
 the work projections (`projection_state.rev`), the revision every work table reflects, and
@@ -667,3 +667,9 @@ right after one new event 1.6 / 0.9 ms. Reading and decoding the log is most of 
   says the hub does (`follow_sessions`, `move_task`).
 - The mock lets a person dispatch any agent; the hub only the caller's own (`403` otherwise), and
   refuses a brief over 64 KiB (`400`). `apps/mock-hub` is outside this crate's paths.
+
+Manual links are person-only (`WorkService::link_session`): an unknown session is 404; missing
+or inconsistent task/workstream references are 400. A task-only link derives its workstream; a
+workstream-only link clears the task. Each emits `session_linked` with basis `manual`. Imported
+links are firm, matching the runner; the sessions projection version is bumped so replay applies
+that rule. `tests/manual_links.rs` covers route validation and protection against later inference.

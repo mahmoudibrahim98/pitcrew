@@ -1112,15 +1112,12 @@ and handed back, not kept, once it has.
   until then, an installed `pitcrewd` without tmux (Windows above all) has no terminal runtime.
 - On Windows, no lock guards ptyd's pipe beyond the state directory's own: a daemon given another
   daemon's pipe with the hidden `--ptyd-endpoint` would share that ptyd.
-- `POST /v1/sessions/{id}/link`, which no route serves yet.
 - The first prompt (`brief`) is passed to the CLI as an argument, so other users of the machine
   can read it in the process list (`/proc/<pid>/cmdline`), and tmux shows it in the pane's
   `pane_start_command`. Passing it on the CLI's standard input, or through a private file, would
   keep it to the user (threat model O43).
 - Folders on a Windows drive mounted in WSL without metadata (mode 777) are refused as a session's
   `cwd` (see "Terminals"), by decision: there is no exception for `/mnt/<drive>`.
-- Linking sessions to workstreams by folder or branch: the runner can (`Locations`), but the daemon
-  does not pass it the workstreams' locations yet, so nothing is linked by folder or branch.
 - Host info from `pitcrew-api` itself: its `router` takes a fixed `HostInfo`, so the daemon answers
   `GET /v1/host/info` in a layer of its own (see "The runner"). Proposal for stream H: `router`
   takes a source of host info (`Arc<dyn Fn() -> HostInfo>`, or a `watch::Receiver`), and the
@@ -1131,3 +1128,16 @@ and handed back, not kept, once it has.
 - Scanning another machine of the workspace (`POST /v1/machines/{id}/scan` is `409` for one), and
   stopping a scan part-way: `pitcrew_ingest::scan` takes no cancel, so a scan whose client went
   away runs to its end. A cancel flag in its `ScanOptions` (stream A) would let the route stop it.
+
+## Linking sessions
+
+`HubLocations` reads workstream locations and current session link bases from the hub. The runner
+links by the deepest folder, then matching branch at equal depth; ties link neither. A store
+subscription compares location snapshots after appends (and on lag) and asks the runner to relink
+existing sessions when locations change. It starts before serving, includes runners started after
+setup, and is canceled when serving ends.
+
+`POST /v1/sessions/{id}/link` is person-only. A workstream and optional task, or a task alone,
+make a manual link. Imported links, like manual/dispatch/claimed links, are firm and are never
+overwritten by folder/branch inference. `tests/linking.rs` covers synthetic transcript discovery,
+branch preference, later creation, and manual-link protection.

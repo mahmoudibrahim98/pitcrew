@@ -1,7 +1,7 @@
 //! `work.sessions`: sessions as the hub sees them, and dispatches.
 //!
 //! **Firm links stay.** A link made by a dispatch, a person or the agent itself (`dispatch`,
-//! `manual`, `claimed`) is never replaced by an inferred one (`folder`, `branch`, `imported`) or
+//! `manual`, `claimed`, `imported`) is never replaced by an inferred one (`folder`, `branch`) or
 //! by a re-stated `session_discovered` that carries no link. The runner re-states sessions as it
 //! learns more about them, and must not undo a dispatch's link by doing so.
 //!
@@ -28,15 +28,15 @@ pub struct Sessions;
 impl Sessions {
     /// The projection's name.
     pub const NAME: &'static str = "work.sessions";
-    /// 2: firm links, and agents, are kept. 3: an ended session stays ended when re-stated.
-    const VERSION: u32 = 3;
+    /// 4: imported links are firm, as in the runner.
+    const VERSION: u32 = 4;
 }
 
 /// Whether a link made by a dispatch, a person or the agent itself.
 fn is_firm(basis: Option<LinkBasis>) -> bool {
     matches!(
         basis,
-        Some(LinkBasis::Dispatch | LinkBasis::Manual | LinkBasis::Claimed)
+        Some(LinkBasis::Dispatch | LinkBasis::Manual | LinkBasis::Claimed | LinkBasis::Imported)
     )
 }
 
@@ -243,8 +243,8 @@ mod tests {
     #[test]
     fn firm_links_are_replaced_only_by_firm_links() {
         use LinkBasis::{Branch, Claimed, Dispatch, Folder, Imported, Manual};
-        let firm = [Dispatch, Manual, Claimed];
-        let inferred = [Folder, Branch, Imported];
+        let firm = [Dispatch, Manual, Claimed, Imported];
+        let inferred = [Folder, Branch];
         for existing in firm {
             for incoming in firm {
                 assert!(replaces_link(Some(existing), Some(incoming)));

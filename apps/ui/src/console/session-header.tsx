@@ -7,6 +7,7 @@ import { ApiError, useMachines, useMembers, useSession, type Task, type Workstre
 import { Button, StatusPill } from '../design/index.ts';
 import { cx } from '../lib/cx.ts';
 import { useEndSession, useTaskById, useWorkstreamById } from './data.ts';
+import { LinkSessionDialog } from './link-session.tsx';
 import { ENGINE_LABEL, inputBlocked, LIVENESS, sessionTitle, STATE } from './format.ts';
 
 export interface SessionHeaderProps {
@@ -38,6 +39,7 @@ export function SessionHeader(props: SessionHeaderProps) {
   const task = useTaskById(session.data?.task);
   const workstream = useWorkstreamById(session.data?.workstream);
   const end = useEndSession(props.sessionId);
+  const [linking, setLinking] = useState(false);
   const [confirming, setConfirming] = useState(false);
 
   if (session.data === undefined) {
@@ -65,7 +67,7 @@ export function SessionHeader(props: SessionHeaderProps) {
       <div className="flex min-w-0 items-center gap-2">
         <h2 className="min-w-0 truncate text-lg font-semibold">{sessionTitle(s)}</h2>
         <StatusPill tone={state.tone}>{state.label}</StatusPill>
-        <DropdownMenu.Root>
+        <DropdownMenu.Root modal={false}>
           <DropdownMenu.Trigger asChild>
             <Button variant="ghost" className="ml-auto" aria-label="Session actions">
               Actions
@@ -80,6 +82,7 @@ export function SessionHeader(props: SessionHeaderProps) {
               <DropdownMenu.Item className={itemClass} disabled={!canEnd} onSelect={() => setConfirming(true)}>
                 End session…
               </DropdownMenu.Item>
+              <DropdownMenu.Item className={itemClass} onSelect={() => setLinking(true)}>Link to…</DropdownMenu.Item>
               <DropdownMenu.Separator className="my-1 h-px bg-line" />
               <PlaceholderItem label="Hand off" onSelect={props.onHandOff} />
               <PlaceholderItem label="Fork" onSelect={props.onFork} />
@@ -88,6 +91,8 @@ export function SessionHeader(props: SessionHeaderProps) {
           </DropdownMenu.Portal>
         </DropdownMenu.Root>
       </div>
+
+      {linking && <LinkSessionDialog session={s} onClose={() => setLinking(false)} />}
 
       {!props.compact && (
         <dl className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-ink-2">
