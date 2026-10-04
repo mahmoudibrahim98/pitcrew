@@ -150,8 +150,8 @@ they agree. Because documents are serialized protocol values, bump `work.tasks`'
 change.
 
 **Sessions: firm links stay.** A link made by a dispatch, a person or the agent itself
-(`dispatch`, `manual`, `claimed`) is never replaced by an inferred one (`folder`, `branch`,
-`imported`), nor by a re-stated `session_discovered` without a link. A firm link replaces any
+(`dispatch`, `manual`, `claimed`, `imported`) is never replaced by an inferred one (`folder`,
+`branch`), nor by a re-stated `session_discovered` without a link. A firm link replaces any
 link. Agents stay the same way: a re-stated session without an `agent` keeps the one it had.
 An ended session stays ended (projection version 3): a re-stated `session_discovered` keeps its
 state and status line, so a CLI that turns up after the hub ended its session (it decided the CLI
