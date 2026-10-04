@@ -322,5 +322,7 @@ STUB
     bash "$here/desktop/check.sh" --manifest "$manifest" "$rpm_file"
 fi
 
+node --test "$here/updater.test.mjs"
+
 echo "packaging tests: $passed passed, $failed failed"
 [ "$failed" -eq 0 ]

@@ -28,6 +28,7 @@ import {
   ThemeToggle,
   Tooltip,
 } from '../design/index.ts';
+import { isDesktop } from '../data/transport.ts';
 import { cx } from '../lib/cx.ts';
 import { useRegistry } from './context.ts';
 import { inLayout } from './feature.ts';
@@ -196,6 +197,7 @@ function Section({ label, children }: { label: string; children: ReactNode }) {
 
 function Footer({ collapsed }: { collapsed: boolean }) {
   const me = useMe().data;
+  const ws = useWorkspaceId();
   return (
     <div className="flex flex-col gap-2 border-t border-line p-2">
       {me !== undefined && (
@@ -207,6 +209,13 @@ function Footer({ collapsed }: { collapsed: boolean }) {
             </span>
           )}
         </div>
+      )}
+      {/* Settings sits here, after the Projects tree, so Tab from the main nav still reaches the
+          tree first. Its only settings so far are the desktop updater's. */}
+      {!collapsed && isDesktop() && (
+        <Link to={paths.under(ws, 'settings')} data-nav="settings" className={ITEM}>
+          <span className="min-w-0 flex-1 truncate">Settings</span>
+        </Link>
       )}
       {!collapsed && <ThemeToggle />}
     </div>

@@ -415,3 +415,54 @@ The desktop sidecars include `pitcrew` alongside `pitcrewd`, `pitcrew-ptyd` and
 even when an app starts without the developer's PATH. Staging and extracted
 installer checks require the CLI and verify its version; NSIS moves a running CLI
 aside during upgrades with the other sidecars.
+
+## Signed desktop updates
+
+The desktop uses [Tauri's updater](https://v2.tauri.app/plugin/updater/). Checks run at startup
+and daily; Settings offers **Check now** and an explicit pre-release opt-in. Installation needs
+confirmation and restarts the app. The plugin checks the minisign signature before installation.
+Linux self-update supports AppImage; deb/rpm users use their package manager.
+
+One-time maintainer setup, on a trusted machine, outside the repository:
+
+```bash
+cargo install tauri-cli --locked --version 2.12.1
+cargo tauri signer generate -w /secure/pitcrew-updater.key
+```
+
+Choose a password and keep the private key and password backed up securely. Do not add either
+to the repository or paste them into logs. Add the **contents** of the private key file to the
+repository Actions secret `TAURI_SIGNING_PRIVATE_KEY`, and its password to
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (empty for an unencrypted key). Add the entire contents of
+`pitcrew-updater.key.pub` to the repository Actions **variable** `TAURI_UPDATER_PUBLIC_KEY`.
+The public key is public configuration: `updater-config.mjs` puts it in the Tauri build overlay,
+which is compiled into each signed app. Keep it stable: existing installs trust that key.
+For a local signed build set these same environment variables before `desktop/build.sh`.
+
+Without the private key, builds still produce every installer but compile an empty public key,
+create no updater artifacts/signatures, and print that automatic updates are unsigned and
+disabled. A private key without a public key, or a password without a key, fails rather than
+silently producing an unusable signed release. Initial unsigned installs require one manual
+installation of a signed build before they can update themselves.
+
+With the key, Tauri builds the updater artifacts. The script copies the macOS `.app.tar.gz`
+archive, signs the **final** AppImage after its permissions are repaired, and signs the NSIS
+installer and macOS archive. Signatures sit beside those files. `updater-feed.mjs` requires all
+four platform entries (the universal macOS archive serves both architectures) and generates
+`latest.json` before `SHA256SUMS`, SBOM verification and provenance attestation. The release tag
+sets the compiled desktop version as well as the feed version. Manual runs use the config's
+version and publish nothing. Installer checks inspect installers only, not `.sig` or updater
+archives. These updater signatures are independent of the installer code-signing placeholders.
+
+On stable checks the app reads `/releases/latest/download/latest.json`. With pre-releases enabled
+it selects the greatest newer semantic version with a feed in the latest 100 published GitHub
+releases, then reads that tag's `latest.json`. Drafts are never offered. Publishing a draft makes
+its feed accessible; publishing a pre-release does not replace GitHub's stable latest feed.
+Release notes open the fixed GitHub tag page in the system browser. The feed is untrusted
+metadata; signing uses `--app-version`, and the app requires that version in the authenticated
+signature (`requireSignedVersion`). Relabeling an old signed artifact as a newer release fails.
+
+Run `node --test packaging/updater.test.mjs` for the feed/config checks; the manifest job runs
+these alongside `bash packaging/test.sh`. Dispatch Release on the branch for the three-OS
+installer checks without publication. Do not rotate the public key without planning a manual
+reinstall or a transition signed with the old key.

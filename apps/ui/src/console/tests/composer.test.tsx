@@ -140,9 +140,12 @@ describe('Composer against the mock hub', () => {
       }
       return fetch(input, init);
     };
-    renderWithHub(hub, <Composer sessionId={ID.ses4} />, { fetch: unavailable });
+    const { requests } = renderWithHub(hub, <Composer sessionId={ID.ses4} />, { fetch: unavailable });
     const input = screen.getByRole('textbox', { name: 'Message to the agent' });
     await eventually(() => expect(input).toHaveProperty('disabled', false));
+    // The 503 holds while the session and its machine stay as they were; wait for the machines too,
+    // or their late arrival (on a busy machine) reads as a change and lifts it before it is seen.
+    await eventually(() => expect(requests.some((r) => r.path === '/v1/machines' && r.status === 200)).toBe(true));
     fireEvent.change(input, { target: { value: 'Are you there?' } });
     fireEvent.keyDown(input, { key: 'Enter' });
     await screen.findByText('This laptop cannot be reached right now.');

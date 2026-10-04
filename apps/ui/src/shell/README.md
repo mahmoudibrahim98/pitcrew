@@ -294,3 +294,13 @@ does nothing, and the palette leaves it out entirely:
 `tests/shell.test.tsx` renders `createAppRouter([stub], { history: createMemoryHistory(…) })`
 inside a `DataProvider` pointed at a mock hub on a free port, checks the stub's nav entry appears
 and routes, and that a feature route replaces a placeholder. Copy it for your feature.
+
+## Desktop updates
+
+The root lazily mounts `DesktopUpdates` once in a desktop webview. It listens before reading
+retained status, offers a dismissible update notice and release notes, and asks for confirmation
+before invoking installation with the exact displayed version. It never downloads updates itself.
+Settings (`/w/$ws/settings`, sidebar and routing in `core.tsx`) offers Check now and saved
+pre-release opt-in; browser mode explains that the desktop manages updates. Errors stay visible
+and retryable. See the desktop gateway contract and `tests/updates.test.tsx` for the IPC and
+consent checks. Tauri bindings remain dynamic imports outside the initial browser bundle.
