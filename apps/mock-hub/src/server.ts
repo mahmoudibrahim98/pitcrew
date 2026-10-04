@@ -143,6 +143,11 @@ async function serveHttp(
   const started = Date.now();
   const method = req.method ?? 'GET';
   const { path, query } = splitUrl(req.url ?? '/');
+  const fileRoute = /^\/v1\/workstreams\/[^/]+\/files(?:\/content)?$/.test(path);
+  if (fileRoute) {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+  }
   let reply: Reply;
   try {
     checkHost(req);
@@ -159,7 +164,7 @@ async function serveHttp(
             path,
             query,
             authorization: req.headers.authorization,
-            readBody: () => readJson(req),
+            readBody: () => readJson(req, fileRoute),
           });
   } catch (error) {
     reply = failureReply(error);
@@ -218,8 +223,8 @@ function splitUrl(url: string): { path: string; query: URLSearchParams } {
 }
 
 /** The request body as JSON; `undefined` when empty. Bodies over 1 MiB are refused. */
-async function readJson(req: IncomingMessage): Promise<unknown> {
-  const bytes = await readBody(req);
+async function readJson(req: IncomingMessage, files = false): Promise<unknown> {
+  const bytes = await readBody(req, files);
   if (bytes.length === 0) {
     return undefined;
   }
@@ -234,19 +239,20 @@ async function readJson(req: IncomingMessage): Promise<unknown> {
  * Reads the whole body, keeping at most MAX_BODY_BYTES. A larger body is still read to its end
  * (and dropped), so the client gets a clean 400 instead of a reset connection.
  */
-function readBody(req: IncomingMessage): Promise<Buffer> {
+function readBody(req: IncomingMessage, files = false): Promise<Buffer> {
+  const cap = files ? 12 * 1024 * 1024 : MAX_BODY_BYTES;
   return new Promise((done, fail) => {
     const chunks: Buffer[] = [];
     let size = 0;
     req.on('data', (chunk: Buffer) => {
       size += chunk.length;
-      if (size <= MAX_BODY_BYTES) {
+      if (size <= cap) {
         chunks.push(chunk);
       }
     });
     req.on('end', () => {
-      if (size > MAX_BODY_BYTES) {
-        fail(invalid(`The body is larger than ${MAX_BODY_BYTES} bytes.`));
+      if (size > cap) {
+        fail(files ? new ApiFailure('too_large', 'File body exceeds the size cap.') : invalid(`The body is larger than ${MAX_BODY_BYTES} bytes.`));
       } else {
         done(Buffer.concat(chunks));
       }

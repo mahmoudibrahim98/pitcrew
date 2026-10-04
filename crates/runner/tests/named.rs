@@ -173,6 +173,10 @@ impl Rig {
             RunnerConfig::new(WorkspaceId::new(), MachineId::new(), MemberId::new(), state)
                 .with_home(engine, home)
                 .with_session_env(env.clone());
+        // Exercise dispatch adoption with the same optimizations as the daemon.
+        config.cache_file_discovery = true;
+        config.byte_file_cursors = true;
+        config.notification_window = Duration::from_millis(175);
         config.timing = Timing {
             cold_interval: Duration::from_secs(600),
             rediscover_interval: Duration::from_secs(600),
@@ -458,7 +462,7 @@ fn a_named_claude_session_is_reported_once_under_its_name() {
     ));
     assert_eq!(r.runtime.list().unwrap().len(), 1);
 
-    // After a restart it keeps the name.
+    // After a restart it keeps the name and observes the terminal missing from the new runtime.
     let Rig {
         runner,
         terminals,
@@ -473,7 +477,8 @@ fn a_named_claude_session_is_reported_once_under_its_name() {
         state.path(),
         TokenFiles::default(),
     );
-    assert_eq!(r.commands.started(named), Started::Reported);
+    assert_eq!(r.terminals.terminal_of(named).unwrap(), Some(terminal));
+    assert_eq!(r.commands.started(named), Started::Exited);
     r.runner.stop();
 }
 

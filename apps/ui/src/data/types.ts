@@ -50,6 +50,8 @@ export type ErrorCode =
   | 'conflict'
   | 'invalid'
   | 'unavailable'
+  | 'too_large'
+  | 'unsupported'
   | 'internal';
 
 export interface Workspace {
@@ -630,6 +632,8 @@ export const EVENT_TYPES_COMPLETE: [Missing] extends [never] ? true : Missing = 
 export interface ApiErrorBody {
   code: ErrorCode;
   message: string;
+  size?: number;
+  current_revision?: string | null;
 }
 
 export type StreamFrame =

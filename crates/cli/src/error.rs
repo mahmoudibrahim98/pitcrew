@@ -76,6 +76,8 @@ impl Kind {
             ErrorCode::NotFound => Self::NotFound,
             ErrorCode::Conflict => Self::Conflict,
             ErrorCode::Unavailable => Self::Unavailable,
+            ErrorCode::TooLarge => Self::Invalid,
+            ErrorCode::Unsupported => Self::Unavailable,
             ErrorCode::Internal => Self::Internal,
         }
     }
@@ -89,7 +91,7 @@ impl Kind {
             403 => Self::Forbidden,
             404 => Self::NotFound,
             409 => Self::Conflict,
-            502..=504 => Self::Unavailable,
+            501..=504 => Self::Unavailable,
             _ => Self::Internal,
         }
     }
@@ -199,5 +201,15 @@ mod tests {
         let err = Error::from_response(500, br#"{"code":"conflict","message":"no"}"#);
         assert_eq!(err.kind, Kind::Conflict);
         assert_eq!(err.message, "no");
+    }
+    #[test]
+    fn file_error_codes_keep_the_existing_exit_categories() {
+        for (code, status, kind) in [
+            (ErrorCode::TooLarge, 413, Kind::Invalid),
+            (ErrorCode::Unsupported, 501, Kind::Unavailable),
+        ] {
+            assert_eq!(Kind::from_code(code), kind);
+            assert_eq!(Kind::from_status(status), kind);
+        }
     }
 }

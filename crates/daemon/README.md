@@ -1141,3 +1141,11 @@ setup, and is canceled when serving ends.
 make a manual link. Imported links, like manual/dispatch/claimed links, are firm and are never
 overwritten by folder/branch inference. `tests/linking.rs` covers synthetic transcript discovery,
 branch preference, later creation, and manual-link protection.
+
+## Workstream files
+
+The device-only Files API resolves location roots from the work model and calls the runner on
+the blocking pool. Remote and WSL locations answer 501. Writes require a revision or explicit
+null for creation; JSON bodies are capped at 12 MiB and decoded files at 8 MiB. State now includes
+file-backups: private bounded originals before replacement (runner README, Workstream files).
+Responses use no-store and nosniff, and failures log counts and fixed reasons without paths.

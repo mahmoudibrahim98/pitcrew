@@ -28,7 +28,7 @@ export function checkPolicy(config) {
     return ['desktop CSP is missing or disabled'];
   }
   if (!directives.has('default-src')) errors.push('default-src must be explicit');
-  for (const name of ['default-src', 'script-src', 'script-src-elem', 'script-src-attr', 'connect-src']) {
+  for (const name of ['default-src', 'script-src', 'script-src-elem', 'script-src-attr', 'connect-src', 'img-src']) {
     const scriptFallback = name.startsWith('script-src-') ? directives.get('script-src') : undefined;
     const sources = directives.get(name) ?? scriptFallback ?? directives.get('default-src');
     if (!sources?.length) {
@@ -37,6 +37,7 @@ export function checkPolicy(config) {
     }
     for (const source of sources) {
       if (["'self'", "'none'"].includes(source)) continue;
+      if (name === 'img-src' && source === 'blob:') continue;
       if (name.startsWith('script-src') &&
           (source === "'report-sample'" ||
            /^'(?:nonce-|sha(?:256|384|512)-)[A-Za-z0-9+/_-]+=*'$/.test(source))) continue;

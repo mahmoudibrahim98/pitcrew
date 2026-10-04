@@ -26,6 +26,28 @@ async fn check() -> Result<(), Box<dyn Error>> {
     std::fs::write(dir.join("fake-wsl"), [])?;
     let program = dir.join(format!("wsl{}", std::env::consts::EXE_SUFFIX));
     std::fs::copy(std::env::current_exe()?, &program)?;
+    // Listing and heartbeat/helper calls can overlap. Every process must append a whole
+    // JSON line, including its newline, before another process writes its record.
+    let mut listings = Vec::new();
+    for _ in 0..16 {
+        listings.push(
+            tokio::process::Command::new(&program)
+                .args(["--list", "--verbose"])
+                .env_remove("WSL_UTF8")
+                .stdout(std::process::Stdio::null())
+                .spawn()?,
+        );
+    }
+    for mut child in listings {
+        assert!(child.wait().await?.success());
+    }
+    let calls = std::fs::read_to_string(dir.join("calls.jsonl"))?;
+    let calls = calls
+        .lines()
+        .map(serde_json::from_str::<Vec<String>>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(calls.len(), 16);
+    assert!(calls.iter().all(|args| args == &["--list", "--verbose"]));
     let helpers = dir.join("helpers");
     std::fs::create_dir(&helpers)?;
     let payload = b"synthetic helper bytes";

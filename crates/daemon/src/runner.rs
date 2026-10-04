@@ -391,6 +391,9 @@ pub fn start(
         .collect();
     let watches = !homes.is_empty();
     config.homes = homes;
+    config.cache_file_discovery = true;
+    config.byte_file_cursors = true;
+    config.notification_window = Duration::from_millis(175);
     let sink = Arc::new(FollowingSink::new(
         StoreSink::new(Arc::clone(store), owner),
         Arc::clone(work),

@@ -28,6 +28,7 @@
 use crate::agents::{SessionAgent, SessionAgents};
 use crate::config::{EngineHome, PollMode, Timing};
 use crate::derive::{self, Derived, Facts, Parent, Reported};
+use crate::discovery::Layout;
 use crate::fsinfo::{self, FileStat};
 use crate::held::Held;
 use crate::hooks::{self, Sender};
@@ -55,6 +56,10 @@ use ulid::Ulid;
 
 /// Reads of one transcript per wake-up before others get a turn.
 const MAX_READS_PER_REFRESH: usize = 4096;
+/// Recently used hot rows retained after saving; cold history still lives in the index.
+const HOT_ROW_CACHE: usize = 64;
+/// Leave room in the 300 ms write-to-event budget after notification debounce.
+const MAX_NOTIFICATION_GRID: Duration = Duration::from_millis(10);
 /// Dirty paths held before the watcher falls back to checking everything.
 const MAX_DIRTY_PATHS: usize = 10_000;
 /// Least time between rediscoveries triggered by unknown files.
@@ -250,6 +255,7 @@ impl Shared {
     }
 
     fn watcher_error(&self, e: &notify::Error) {
+        self.lost_events();
         let now = Instant::now();
         let mut s = self.lock();
         if s.notify_warned_at
@@ -413,7 +419,9 @@ impl Shared {
 pub(crate) fn notify_handler(
     shared: Arc<Shared>,
     debounce: Duration,
+    window: Duration,
 ) -> impl FnMut(notify::Result<notify::Event>) + Send + 'static {
+    let epoch = Instant::now();
     move |res| match res {
         Ok(ev) if ev.need_rescan() => shared.lost_events(),
         // Reads (ours included) and access-time updates are not changes.
@@ -431,10 +439,37 @@ pub(crate) fn notify_handler(
                     | EventKind::Any
                     | EventKind::Other
             );
-            shared.mark(ev.paths, after(Instant::now(), debounce), created);
+            shared.mark(
+                ev.paths,
+                round_deadline(after(Instant::now(), debounce), epoch, window),
+                created,
+            );
         }
         Err(e) => shared.watcher_error(&e),
     }
+}
+
+/// Keeps debounce as the minimum delay, adding strictly less than 10 ms.
+fn round_deadline(due: Instant, epoch: Instant, window: Duration) -> Instant {
+    if window.is_zero() {
+        return due;
+    }
+    let Some(elapsed) = due.checked_duration_since(epoch) else {
+        return due;
+    };
+    let width = window.min(MAX_NOTIFICATION_GRID).as_nanos();
+    let Some(rounded) = elapsed
+        .as_nanos()
+        .checked_add(width - 1)
+        .map(|n| n / width)
+        .and_then(|n| n.checked_mul(width))
+    else {
+        return due;
+    };
+    u64::try_from(rounded)
+        .ok()
+        .and_then(|n| epoch.checked_add(Duration::from_nanos(n)))
+        .unwrap_or(due)
 }
 
 /// A CLI home and how it is watched.
@@ -449,6 +484,7 @@ struct Home {
     polled: bool,
     /// Polled as a network filesystem: sweeps and rediscoveries are rarer.
     slow: bool,
+    layout: Option<Layout>,
     /// The home and its first-level folders, while watched.
     watched: Vec<Arc<Path>>,
     next_sweep: Instant,
@@ -626,6 +662,12 @@ impl<T> Default for IdMap<T> {
 
 impl<T> IdMap<T> {
     fn find(&self, id: u64) -> Result<usize, usize> {
+        // Most histories have contiguous ids. Deletion gaps keep the sorted-vector fallback.
+        if let Ok(i) = usize::try_from(id)
+            && self.entries.get(i).is_some_and(|(key, _)| *key == id)
+        {
+            return Ok(i);
+        }
         self.entries.binary_search_by_key(&id, |(k, _)| *k)
     }
 
@@ -713,6 +755,8 @@ impl Ids {
 struct Hangup;
 
 pub(crate) struct Watcher {
+    byte_file_cursors: bool,
+    cache_file_discovery: bool,
     workspace: WorkspaceId,
     machine: MachineId,
     owner: MemberId,
@@ -728,8 +772,9 @@ pub(crate) struct Watcher {
     rows: Vec<Indexed>,
     tracked: IdMap<Tracked>,
     next_id: u64,
-    /// Tracked transcripts whose whole row is in memory ([`Loaded`]).
+    /// Rows in use or not saved yet. Saved cache entries are checked only when used again.
     loaded: Vec<u64>,
+    cached: VecDeque<u64>,
     /// Canonical key → tracked transcript.
     by_key: HashMap<Key, u64>,
     /// Key as discovered through a symlink → tracked transcript, so each discovered path is
@@ -764,6 +809,9 @@ pub(crate) struct Watcher {
 }
 
 pub(crate) struct Setup {
+    pub notification_window: Duration,
+    pub byte_file_cursors: bool,
+    pub cache_file_discovery: bool,
     pub workspace: WorkspaceId,
     pub machine: MachineId,
     pub owner: MemberId,
@@ -789,6 +837,7 @@ impl Watcher {
             match notify::recommended_watcher(notify_handler(
                 Arc::clone(&s.shared),
                 s.timing.debounce,
+                s.notification_window,
             )) {
                 Ok(w) => Some(w),
                 Err(e) => {
@@ -819,6 +868,7 @@ impl Watcher {
                 adapter: Arc::clone(adapter),
                 polled,
                 slow,
+                layout: None,
                 watched: Vec::new(),
                 next_sweep: now,
                 next_rediscover: now,
@@ -829,6 +879,8 @@ impl Watcher {
             homes.push(home);
         }
         Self {
+            cache_file_discovery: s.cache_file_discovery,
+            byte_file_cursors: s.byte_file_cursors,
             workspace: s.workspace,
             machine: s.machine,
             owner: s.owner,
@@ -844,6 +896,7 @@ impl Watcher {
             tracked: IdMap::default(),
             next_id: 0,
             loaded: Vec::new(),
+            cached: VecDeque::new(),
             by_key: HashMap::new(),
             by_raw: HashMap::new(),
             by_path: HashMap::new(),
@@ -906,7 +959,7 @@ impl Watcher {
             self.check(id)?;
         }
         let all: Vec<usize> = (0..self.homes.len()).collect();
-        self.rediscover(&all)
+        self.rediscover(&all, true)
     }
 
     /// A stored path whose canonical form changed (a folder above it became a symlink) moves to
@@ -947,9 +1000,11 @@ impl Watcher {
             .map(|h| h.next_sweep.min(h.next_rediscover))
             .min()
             .unwrap_or_else(|| after(Instant::now(), Duration::MAX));
-        for t in self.tracked.values() {
-            if t.hot && self.homes[t.home].polled {
-                deadline = deadline.min(t.next_poll);
+        if self.homes.iter().any(|h| h.polled) {
+            for t in self.tracked.values() {
+                if t.hot && self.homes[t.home].polled {
+                    deadline = deadline.min(t.next_poll);
+                }
             }
         }
         let shared = Arc::clone(&self.shared);
@@ -1032,19 +1087,22 @@ impl Watcher {
             })
             .collect();
         if !due.is_empty() {
-            self.rediscover(&due)?;
+            self.rediscover(&due, wake.rediscover || wake.look || wake.overflow)?;
         }
         for h in 0..self.homes.len() {
             if wake.overflow || self.homes[h].next_sweep <= now {
                 self.sweep(h)?;
             }
         }
-        let polls: Vec<u64> = self
-            .tracked
-            .iter()
-            .filter(|(_, t)| t.hot && self.homes[t.home].polled && t.next_poll <= now)
-            .map(|(id, _)| *id)
-            .collect();
+        let polls: Vec<u64> = if self.homes.iter().any(|h| h.polled) {
+            self.tracked
+                .iter()
+                .filter(|(_, t)| t.hot && self.homes[t.home].polled && t.next_poll <= now)
+                .map(|(id, _)| *id)
+                .collect()
+        } else {
+            Vec::new()
+        };
         for id in polls {
             let changed = self.check(id)?;
             let (poll_min, poll_max) = (self.timing.poll_min, self.timing.poll_max);
@@ -1196,7 +1254,7 @@ impl Watcher {
     }
 
     /// Runs discovery for some homes and indexes the new transcripts, newest first.
-    fn rediscover(&mut self, which: &[usize]) -> Result<(), Hangup> {
+    fn rediscover(&mut self, which: &[usize], force: bool) -> Result<(), Hangup> {
         let now = Instant::now();
         self.last_rediscover = Some(now);
         let mut found: Vec<(TimestampMs, usize, RawKey, TranscriptRef, PathBuf)> = Vec::new();
@@ -1204,6 +1262,31 @@ impl Watcher {
             self.refresh_home(h);
             let home = &mut self.homes[h];
             home.next_rediscover = after(now, home.every(self.timing.rediscover_interval));
+            let cache = self.cache_file_discovery
+                && !home.polled
+                && (matches!(home.engine, Engine::Claude | Engine::Codex)
+                    || (cfg!(unix) && home.engine == Engine::OpenCode))
+                && self.watch_failed.is_empty();
+            if cache
+                && !force
+                && !home.discover_failing
+                && home
+                    .layout
+                    .as_ref()
+                    .is_some_and(|layout| layout.unchanged(&home.path))
+            {
+                continue;
+            }
+            // Capture before discovery, so mutations during its walk are noticed next time.
+            home.layout = cache
+                .then(|| {
+                    if home.engine == Engine::OpenCode {
+                        Layout::capture_databases(&home.path)
+                    } else {
+                        Layout::capture(&home.path)
+                    }
+                })
+                .flatten();
             let adapter = Arc::clone(&home.adapter);
             let list = match guard(|| adapter.discover(&home.path)) {
                 Ok(list) => {
@@ -1426,6 +1509,10 @@ impl Watcher {
             return false;
         };
         if t.loaded.is_some() {
+            if let Some(at) = self.cached.iter().position(|cached| *cached == id) {
+                self.cached.remove(at);
+                self.loaded.push(id);
+            }
             return true;
         }
         let session = t.session;
@@ -1453,19 +1540,31 @@ impl Watcher {
         true
     }
 
-    /// Lets go of the whole rows the index has saved: only what tells a change stays in memory.
+    /// Keeps at most a small cache of saved hot rows, plus every row ahead of the index.
     fn let_go(&mut self) {
         let tracked = &mut self.tracked;
+        let cached = &mut self.cached;
         self.loaded.retain(|id| {
             let Some(t) = tracked.get_mut(id) else {
                 return false;
             };
             let saved = t.loaded.as_deref().is_none_or(Loaded::saved);
+            if saved && t.hot && t.loaded.is_some() {
+                cached.push_back(*id);
+                return false;
+            }
             if saved {
                 t.loaded = None;
             }
             !saved
         });
+        while self.cached.len() > HOT_ROW_CACHE {
+            if let Some(id) = self.cached.pop_front()
+                && let Some(t) = self.tracked.get_mut(&id)
+            {
+                t.loaded = None;
+            }
+        }
     }
 
     /// Hands a batch to the sink thread, counting it against its row until it is saved.
@@ -1582,6 +1681,10 @@ impl Watcher {
         }
         t.hot = hot;
         t.next_poll = Instant::now();
+        if !hot && let Some(at) = self.cached.iter().position(|cached| *cached == id) {
+            self.cached.remove(at);
+            self.loaded.push(id);
+        }
         self.sync_watches(id);
     }
 
@@ -1676,6 +1779,9 @@ impl Watcher {
         };
         let tref = t.tref(st.size, st.mtime);
         let adapter = Arc::clone(&self.homes[t.home].adapter);
+        let byte_cursor = self.byte_file_cursors
+            && t.inner_id.is_none()
+            && matches!(t.engine, Engine::Claude | Engine::Codex);
         if let Some(l) = t.loaded.as_deref_mut()
             && needs_reindex(&l.row, &st)
         {
@@ -1704,11 +1810,12 @@ impl Watcher {
                 Ok(chunk) => {
                     // Any cursor change is progress; OpenCode's lives in `state`, not `offset`.
                     // The last read saves `caught_up`, even when it found nothing new.
-                    let more = chunk.cursor != cursor;
+                    let more = chunk.cursor != *cursor;
+                    let at_end = byte_cursor && chunk.cursor.offset == st.size;
                     t.failed_at = None;
                     t.warned = false;
-                    self.process(id, chunk, &st, !more)?;
-                    if !more {
+                    self.process(id, chunk, &st, !more || at_end)?;
+                    if !more || at_end {
                         break;
                     }
                 }
@@ -1904,7 +2011,7 @@ impl Watcher {
             let id = event_id(session, row.generation, Cause::Item(d.key), seq, d.at);
             events.push((Some(d.key), event(id, d.at, d.body)));
         }
-        row.cursor = chunk.cursor;
+        row.cursor = Arc::new(chunk.cursor);
         row.size = st.size;
         row.mtime = st.mtime;
         row.identity.clone_from(&st.identity);
@@ -2523,7 +2630,7 @@ fn new_row(tref: &TranscriptRef) -> Row {
         engine: tref.engine,
         path: tref.path.clone(),
         inner_id: tref.inner_id.clone(),
-        cursor: Cursor::default(),
+        cursor: Arc::default(),
         size: 0,
         mtime: 0,
         identity: None,
@@ -2541,7 +2648,7 @@ fn new_row(tref: &TranscriptRef) -> Row {
 /// reasons, such as a revert deleting parts, and are not judged this way; but a file that was
 /// deleted and came back is new for everyone.
 fn needs_reindex(row: &Row, st: &FileStat) -> bool {
-    let read_before = row.cursor != Cursor::default();
+    let read_before = *row.cursor != Cursor::default();
     let gone = row.identity.as_deref() == Some(GONE);
     let replaced = !fsinfo::same_file(row.identity.as_deref(), st.identity.as_deref());
     let single = row.inner_id.is_none() && row.engine != Engine::OpenCode;
@@ -2556,7 +2663,7 @@ fn reindex(row: &mut Row, st: &FileStat) {
         now = st.size,
         "transcript was truncated or replaced; re-indexing it from the start"
     );
-    row.cursor = Cursor::default();
+    row.cursor = Arc::default();
     row.generation += 1;
     row.accepted.clear();
     row.facts.open_calls.clear();
@@ -2802,10 +2909,10 @@ mod tests {
             engine: Engine::Claude,
             path: "/t/a.jsonl".into(),
             inner_id: None,
-            cursor: Cursor {
+            cursor: Arc::new(Cursor {
                 offset: 10,
                 state: None,
-            },
+            }),
             size: 10,
             mtime: 1,
             identity: Some("1:1".into()),
@@ -2824,6 +2931,37 @@ mod tests {
             mtime: 2,
             identity: Some(identity.into()),
         }
+    }
+
+    #[test]
+    fn notification_grid_preserves_debounce_and_bounds_extra_latency() {
+        let epoch = Instant::now();
+        for grid in [
+            Duration::from_millis(3),
+            Duration::from_millis(10),
+            Duration::from_millis(175),
+            Duration::MAX,
+        ] {
+            for ms in 0..700 {
+                let due = epoch + Duration::from_millis(ms);
+                let rounded = round_deadline(due, epoch, grid);
+                assert!(rounded >= due);
+                assert!(rounded.duration_since(due) < grid);
+                assert!(rounded.duration_since(due) < MAX_NOTIFICATION_GRID);
+                assert_eq!(round_deadline(due, epoch, Duration::ZERO), due);
+            }
+        }
+        let grid = Duration::from_millis(175);
+        assert_eq!(
+            round_deadline(epoch - Duration::from_millis(1), epoch, grid),
+            epoch - Duration::from_millis(1)
+        );
+        let one = epoch + Duration::from_millis(101);
+        let two = epoch + Duration::from_millis(109);
+        assert_eq!(
+            round_deadline(one, epoch, grid),
+            round_deadline(two, epoch, grid)
+        );
     }
 
     #[test]
@@ -2880,7 +3018,7 @@ mod tests {
         opencode.engine = Engine::OpenCode;
         assert!(!needs_reindex(&opencode, &stat(5, "1:2")));
         let mut fresh = row();
-        fresh.cursor = Cursor::default();
+        fresh.cursor = Arc::default();
         assert!(!needs_reindex(&fresh, &stat(5, "1:2")));
         // Deleted and back, even with the old inode, and even for a multi-session store.
         let mut gone = row();
@@ -3023,14 +3161,31 @@ mod tests {
         Arc<crate::MemoryAgents>,
         std::sync::mpsc::Receiver<Batch>,
     ) {
+        watcher_options(home, state, adapter, PollMode::Always, false)
+    }
+
+    fn watcher_options(
+        home: &Path,
+        state: &Path,
+        adapter: Arc<dyn SourceAdapter>,
+        poll: PollMode,
+        cache_file_discovery: bool,
+    ) -> (
+        Watcher,
+        Arc<crate::MemoryAgents>,
+        std::sync::mpsc::Receiver<Batch>,
+    ) {
         let agents = Arc::new(crate::MemoryAgents::new());
         let (tx, rx) = std::sync::mpsc::sync_channel(64);
         let watcher = Watcher::new(Setup {
+            notification_window: Duration::ZERO,
+            byte_file_cursors: false,
+            cache_file_discovery,
             workspace: WorkspaceId::new(),
             machine: MachineId::new(),
             owner: MemberId::new(),
             timing: Timing::default(),
-            poll: PollMode::Always,
+            poll,
             max_batch: 64,
             homes: vec![EngineHome {
                 engine: Engine::Claude,
@@ -3052,6 +3207,7 @@ mod tests {
     /// offset counting items.
     #[derive(Debug, Default)]
     struct Growing {
+        discoveries: AtomicUsize,
         transcripts: Mutex<Vec<TranscriptRef>>,
         items: Mutex<Vec<pitcrew_interfaces::source::TranscriptItem>>,
     }
@@ -3062,6 +3218,7 @@ mod tests {
         }
 
         fn discover(&self, _home: &Path) -> Result<Vec<TranscriptRef>, SourceError> {
+            self.discoveries.fetch_add(1, Ordering::Relaxed);
             Ok(self.transcripts.lock().unwrap().clone())
         }
 
@@ -3096,6 +3253,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_unchanged_periodic_file_discovery_is_skipped() {
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path().canonicalize().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let adapter = Arc::new(Growing::default());
+        let (mut w, _agents, _rx) =
+            watcher_options(&home, state.path(), adapter.clone(), PollMode::Never, true);
+        assert!(
+            w.notify.is_some(),
+            "test needs the platform's native watcher"
+        );
+        assert!(w.rediscover(&[0], true).is_ok());
+        assert!(w.rediscover(&[0], false).is_ok());
+        assert_eq!(adapter.discoveries.load(Ordering::Relaxed), 1);
+        std::fs::create_dir(home.join("new-project")).unwrap();
+        assert!(w.rediscover(&[0], false).is_ok());
+        assert_eq!(adapter.discoveries.load(Ordering::Relaxed), 2);
+        // Notifications, explicit rescans and overflow ask for forced discovery.
+        assert!(w.rediscover(&[0], true).is_ok());
+        assert_eq!(adapter.discoveries.load(Ordering::Relaxed), 3);
+        w.watch_failed.insert(home.join("failed-watch"));
+        assert!(w.rediscover(&[0], false).is_ok());
+        assert_eq!(adapter.discoveries.load(Ordering::Relaxed), 4);
+        w.watch_failed.clear();
+        let polled_state = tempfile::tempdir().unwrap();
+        let (mut polled, _agents, _rx) = watcher_options(
+            &home,
+            polled_state.path(),
+            adapter.clone(),
+            PollMode::Always,
+            true,
+        );
+        assert!(polled.rediscover(&[0], false).is_ok());
+        assert!(polled.rediscover(&[0], false).is_ok());
+        assert_eq!(
+            adapter.discoveries.load(Ordering::Relaxed),
+            6,
+            "polled homes always discover"
+        );
+        w.cache_file_discovery = false;
+        assert!(w.rediscover(&[0], false).is_ok());
+        assert!(w.rediscover(&[0], false).is_ok());
+        assert_eq!(
+            adapter.discoveries.load(Ordering::Relaxed),
+            8,
+            "custom adapters keep their schedule"
+        );
+    }
+
     /// Hands every queued batch to the index, as the sink thread does once the sink accepts it.
     /// Returns the events.
     fn save_all(w: &Watcher, rx: &std::sync::mpsc::Receiver<Batch>) -> Vec<Event> {
@@ -3114,7 +3321,7 @@ mod tests {
     /// saved; afterwards the watcher keeps only what tells a change, and the next change reads the
     /// row back and goes on from the saved cursor.
     #[test]
-    fn a_saved_row_is_let_go_and_read_back() {
+    fn a_saved_cold_row_is_let_go_and_read_back() {
         use pitcrew_interfaces::source::TranscriptItem;
 
         let home = tempfile::tempdir().unwrap();
@@ -3137,7 +3344,7 @@ mod tests {
         };
         adapter.items.lock().unwrap().extend([turn(0), turn(1)]);
         let (mut w, _agents, rx) = watcher_with(&home, state.path(), adapter.clone());
-
+        w.timing.hot_window = Duration::ZERO;
         assert!(w.start().is_ok());
         let id = *w.tracked.keys().next().unwrap();
         w.let_go();
@@ -3184,6 +3391,103 @@ mod tests {
         assert!(w.loaded.is_empty());
     }
 
+    #[test]
+    fn hot_row_cache_is_bounded_and_never_evicts_unsaved_changes() {
+        let home = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let (mut w, _agents, _rx) = bare_watcher(home.path(), state.path());
+        let mut row = Row {
+            session: SessionId::new(),
+            engine: Engine::Claude,
+            path: home.path().join("s.jsonl"),
+            inner_id: None,
+            cursor: Arc::default(),
+            size: 1,
+            mtime: 0,
+            identity: None,
+            caught_up: true,
+            generation: 0,
+            discovered: true,
+            accepted: HashSet::new(),
+            meta: None,
+            facts: Facts::default(),
+        };
+        let mut ids = Vec::new();
+        for i in 0..HOT_ROW_CACHE + 3 {
+            row.session = SessionId::new();
+            row.path = home.path().join(format!("s{i}.jsonl"));
+            w.store_lock().insert(&row).unwrap();
+            let id = w.track(&Indexed::of(&row), Some(row.clone()), 0, 1, 0);
+            w.tracked.get_mut(&id).unwrap().hot = true;
+            ids.push(id);
+        }
+        // Both kinds of unsaved state must survive, even beyond the cache's bound.
+        w.tracked
+            .get_mut(&ids[0])
+            .unwrap()
+            .loaded
+            .as_mut()
+            .unwrap()
+            .dirty = true;
+        w.tracked[&ids[1]]
+            .loaded
+            .as_ref()
+            .unwrap()
+            .unsaved
+            .store(1, Ordering::Release);
+        w.let_go();
+        assert_eq!(w.cached.len(), HOT_ROW_CACHE);
+        assert_eq!(w.loaded.len(), 2);
+        assert!(w.tracked[&ids[0]].loaded.is_some());
+        assert!(w.tracked[&ids[1]].loaded.is_some());
+        assert!(
+            w.tracked[&ids[2]].loaded.is_none(),
+            "oldest saved row evicted"
+        );
+        assert!(w.load(ids[2]), "evicted row can be read back");
+        assert_eq!(
+            w.tracked[&ids[2]].loaded.as_ref().unwrap().row,
+            row_at(&w, ids[2])
+        );
+        let last = *ids.last().unwrap();
+        w.store_lock().hide_transcripts(true).unwrap();
+        assert!(w.load(last), "cache hit does not query the index");
+        assert!(
+            !w.cached.contains(&last),
+            "in-use row leaves the saved cache"
+        );
+        w.tracked[&last]
+            .loaded
+            .as_ref()
+            .unwrap()
+            .unsaved
+            .store(1, Ordering::Release);
+        w.let_go();
+        assert!(w.loaded.contains(&last), "changed cached row stays pending");
+        assert!(!w.cached.contains(&last));
+        w.tracked[&last]
+            .loaded
+            .as_ref()
+            .unwrap()
+            .unsaved
+            .store(0, Ordering::Release);
+        w.let_go();
+        assert!(w.cached.contains(&last));
+        w.store_lock().hide_transcripts(false).unwrap();
+        // A saved row that cools down leaves the cache, even when space is available.
+        w.timing.hot_window = Duration::ZERO;
+        w.classify(last, 0);
+        w.let_go();
+        assert!(w.tracked[&last].loaded.is_none());
+    }
+
+    fn row_at(w: &Watcher, id: u64) -> Row {
+        w.store_lock()
+            .load(w.tracked[&id].session)
+            .unwrap()
+            .unwrap()
+    }
+
     /// A change no batch carries yet keeps the whole row in memory until one does, as before:
     /// a report that repeats the state still moves when the state was last reported, and a late
     /// hook is judged by that.
@@ -3212,6 +3516,7 @@ mod tests {
         };
         adapter.items.lock().unwrap().push(turn(0));
         let (mut w, _agents, rx) = watcher_with(&home, state.path(), adapter.clone());
+        w.timing.hot_window = Duration::ZERO;
         assert!(w.start().is_ok());
         let id = *w.tracked.keys().next().unwrap();
         save_all(&w, &rx);
@@ -3496,7 +3801,11 @@ mod tests {
     #[test]
     fn lost_events_force_a_full_check() {
         let shared = Arc::new(Shared::default());
-        let mut handler = notify_handler(Arc::clone(&shared), Duration::from_millis(100));
+        let mut handler = notify_handler(
+            Arc::clone(&shared),
+            Duration::from_millis(100),
+            Duration::ZERO,
+        );
         handler(Ok(
             notify::Event::new(EventKind::Other).set_flag(Flag::Rescan)
         ));
@@ -3508,7 +3817,11 @@ mod tests {
     #[test]
     fn only_creations_can_announce_new_files() {
         let shared = Arc::new(Shared::default());
-        let mut handler = notify_handler(Arc::clone(&shared), Duration::from_millis(100));
+        let mut handler = notify_handler(
+            Arc::clone(&shared),
+            Duration::from_millis(100),
+            Duration::ZERO,
+        );
         let ev = |kind, path: &str| Ok(notify::Event::new(kind).add_path(path.into()));
         handler(ev(
             EventKind::Modify(ModifyKind::Data(DataChange::Any)),
@@ -3531,6 +3844,15 @@ mod tests {
     }
 
     #[test]
+    fn a_watcher_error_forces_discovery_and_a_full_sweep() {
+        let shared = Shared::default();
+        shared.watcher_error(&notify::Error::generic("synthetic failure"));
+        let signals = shared.lock();
+        assert!(signals.overflow);
+        assert!(signals.rediscover_at.is_some());
+    }
+
+    #[test]
     fn network_homes_are_polled_and_swept_less_often() {
         let local = Path::new("/");
         assert_eq!(poll_decision(PollMode::Always, local, true), (true, true));
@@ -3550,6 +3872,7 @@ mod tests {
             )),
             polled: true,
             slow: false,
+            layout: None,
             watched: Vec::new(),
             next_sweep: now,
             next_rediscover: now,

@@ -96,6 +96,10 @@ pub enum ErrorCode {
     Invalid,
     /// The resource's machine is unreachable.
     Unavailable,
+    /// File or body exceeds the files API cap.
+    TooLarge,
+    /// File access on another machine is not implemented.
+    Unsupported,
     /// An unexpected failure.
     Internal,
 }
@@ -111,6 +115,8 @@ impl ErrorCode {
             Self::Conflict => 409,
             Self::Invalid => 400,
             Self::Unavailable => 503,
+            Self::TooLarge => 413,
+            Self::Unsupported => 501,
             Self::Internal => 500,
         }
     }

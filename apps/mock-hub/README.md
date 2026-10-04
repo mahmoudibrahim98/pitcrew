@@ -189,3 +189,10 @@ a single entry point.
 
 `tsconfig.json` is for editors only (it needs TypeScript 5.8+ and `@types/node`, which this package
 does not install); nothing is compiled.
+
+## Files
+
+Device-only workstream file routes use a per-location in-memory tree, initially containing
+src/hello.txt, a large.bin above the read cap, and an outside link that cannot be followed.
+They enforce revisions, exclusive creation, path rules and body/file/list caps; writes persist
+only in memory. Remote and WSL locations return 501. No filesystem paths are opened.

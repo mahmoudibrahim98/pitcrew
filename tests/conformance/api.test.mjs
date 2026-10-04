@@ -23,6 +23,8 @@ const statuses = {
   403: 'forbidden',
   404: 'not_found',
   409: 'conflict',
+  413: 'too_large',
+  501: 'unsupported',
   500: 'internal',
   503: 'unavailable',
 };

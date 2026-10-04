@@ -75,6 +75,7 @@ import {
   unavailable,
 } from './validate.ts';
 
+import { files } from './files.ts';
 export const MOCK_VERSION = '0.1.0-mock';
 /** `PROTOCOL_VERSION` and `PROTOCOL_MIN` in crates/protocol/src/version.rs. */
 export const PROTOCOL_VERSION = 1;
@@ -1474,6 +1475,9 @@ const ROUTES: Route[] = [
   ),
   route('POST', '/v1/projects', 'device', createProject),
   route('GET', '/v1/workstreams', 'device', listWorkstreams),
+  route('GET', '/v1/workstreams/:id/files', 'device', (hub, ctx) => files(hub, ctx.param('id'), ctx.query, ctx.body, 'list')),
+  route('GET', '/v1/workstreams/:id/files/content', 'device', (hub, ctx) => files(hub, ctx.param('id'), ctx.query, ctx.body, 'read')),
+  route('PUT', '/v1/workstreams/:id/files/content', 'device', (hub, ctx) => files(hub, ctx.param('id'), ctx.query, ctx.body, 'write')),
   route('GET', '/v1/workstreams/:id', 'device', (hub, ctx) =>
     ok(found(hub.findWorkstream(ctx.param('id')), `No workstream ${ctx.param('id')}.`)),
   ),

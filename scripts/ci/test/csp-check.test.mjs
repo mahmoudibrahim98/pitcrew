@@ -6,6 +6,13 @@ import { checkHtml, checkPolicy } from '../csp-check.mjs';
 const config = (csp) => ({ app: { security: { csp } } });
 const policy = { 'default-src': "'self'", 'script-src': "'self'", 'connect-src': 'ipc: http://ipc.localhost' };
 
+test('images allow local object URLs but reject data and remote sources', () => {
+  assert.deepEqual(checkPolicy(config({ ...policy, 'img-src': "'self' blob:" })), []);
+  for (const source of ['data:', 'https:', 'https://example.com', '*']) {
+    assert.ok(checkPolicy(config({ ...policy, 'img-src': source })).some((error) => error.startsWith('img-src')));
+  }
+});
+
 test('the actual desktop policy allows only local IPC and no executable inline sources', () => {
   const actual = JSON.parse(readFileSync(new URL('../../../apps/desktop/src-tauri/tauri.conf.json', import.meta.url), 'utf8'));
   assert.deepEqual(checkPolicy(actual), []);

@@ -2,6 +2,32 @@
 
 Runner service: watchers, session linking, derived events to the hub, file API.
 
+## Workstream files
+
+`files::Files::new(state)` provides blocking list/read/write operations for a root resolved by the
+hub. Validate relative paths before I/O, retain checked ancestor handles, refuse every link or
+Windows reparse point, and compare opened identities. Unix opens and replacement use directory
+handles; Windows holds ancestors without delete sharing. Lists keep the first 5,000 UTF-8 names
+in byte order and report truncation. Files are capped at 8 MiB, with SHA-256 revisions and UTF-8
+or canonical base64 content.
+
+Writes are serialized, reject `.git` and multi-link targets, recheck revisions, and replace an
+exclusive temporary file in the same folder, preserving permissions (Unix group and mode,
+Windows DACL included). A Unix group change must succeed before the original mode is restored;
+otherwise replacement is refused.
+New files are private. Before replacement, `file-backups` in state retains the newest three
+backups per root/path and 64 MiB total, evicting oldest first by a strictly increasing stored identifier;
+each is at most 8 MiB. Hash keys
+normalize Windows casing. Unix storage is current-user-owned 0700/0600. Windows creates and
+checks protected owner-only DACLs through native Windows security calls in pitcrew-trust;
+ACL failures refuse the write. Existing public, linked, malformed or hard-linked backup storage fails closed.
+
+Same-account concurrent mutation is not a separate security principal: Unix cannot prevent a
+privileged owner moving an already-open directory after the final check, and Windows must close
+the target handle before the atomic rename. Handles prevent link redirection; identity and
+revision checks detect swaps observed before replacement, but do not provide a filesystem-wide
+transaction against another writer. No path, content or OS error is logged or returned in errors.
+
 **Owned by stream D** — see [docs/build/streams/D.md](../../docs/build/streams/D.md).
 
 The crate docs (`src/lib.rs`) describe the watcher and the in-process hub link: the store sink,
@@ -162,6 +188,40 @@ before the dispatch's CLI starts.
   abandons: its terminal is forgotten once its program has ended. Imported transcripts without
   a runner-started terminal remain `Reported`; a missing local index is never evidence that an
   imported CLI exited.
+  Startup refresh keeps the terminal row of a runner-started CLI with a session even when the
+  runtime no longer lists its id. That row preserves provenance: an indexed dispatched session
+  still answers `Exited` if its CLI disappeared while the daemon was down. Hand-linked terminals
+  and unclaimed starts retain the usual refresh behavior; no missing terminal is followed by its
+  old target. Imported transcripts never acquire this exit evidence.
+
+## File discovery and cursors
+
+The daemon opts its Claude and Codex homes into `RunnerConfig::cache_file_discovery`. For these
+file-layout adapters, periodic discovery first checks a bounded snapshot of directory identities
+and modification times, avoiding a walk and sort of unchanged transcript names. Explicit rescans,
+new-file notifications, lost events, failed watches and polling homes always run the adapter.
+On Unix, OpenCode can also skip periodic discovery of unchanged quiet databases: the snapshot
+checks each database's identity, size, mtime and ctime. Any SQLite side file disables that cache,
+so an active WAL or rollback journal always uses the adapter. Other platforms keep OpenCode's
+original discovery schedule. Custom adapters keep the default (`false`). The slow transcript
+sweep keeps its schedule and still detects missed writes, replacements and deletions even when directory names do not change.
+
+The daemon also opts these adapters into `RunnerConfig::byte_file_cursors`: when a read's byte
+cursor reaches the file size just checked, the runner can save it as caught up immediately. It
+avoids a second read and identical cursor write just to establish EOF. Partial lines keep their
+cursor before EOF and still resume normally. OpenCode and custom adapters keep the old loop;
+the flag defaults to `false` and is for the concrete Claude/Codex JSONL adapters only. Layout
+snapshots hold at most 4,096 directories; a link, unreadable folder or larger tree disables the
+cache. Unix directory ctime is checked too, so restoring mtime cannot conceal a name change.
+
+Notification deadlines use a grid capped at 10 ms after the existing 100 ms debounce, even
+when `RunnerConfig::notification_window` requests a larger window (the daemon requests 175 ms).
+The field defaults to zero for other callers. Rounding adds less than 10 ms, so source reads
+are due within 110 ms of the notification; polling and hook reports are not rounded.
+Adjacent completed reads of different transcripts can share one sink acceptance and one cursor
+transaction, preserving order and limiting a group to four batches and `max_batch_events` events (an indivisible source
+item retains its existing exception). Cursors move only after the whole group is accepted; failed
+acceptance retries the same events, and a failed transaction pins every affected row for replay.
 
 ## Memory
 
@@ -173,11 +233,14 @@ identity as last read, `caught_up` and `discovered`, the CLI's id and whether it
 and the parent its hooks are judged by. The tracked transcripts are a vector sorted by id (ids
 only grow), not a `BTreeMap`, whose nodes a run of growing ids leaves half full.
 
-The rest of a row (the cursor with the adapter's state, the session's metadata and facts, the
+The rest of a cold row (the cursor with the adapter's state, the session's metadata and facts, the
 accepted items of a replay) is read from the index (`Store::load`) when the transcript changes, a
 hook reports, the sessions are linked again or the transcript is deleted, and let go once the
-sink thread has saved every batch that carries it (counted per row). A row stays in memory while
-it holds a change no batch carries yet (a report that moved when the state was last reported but
+sink thread has saved every batch that carries it (counted per row). Up to 64 saved hot rows stay
+in a cache, avoiding an index lookup on every live write. An in-use row leaves that cache before
+it changes; its unsaved batches do not count toward the cache limit and cannot be evicted. Cursor
+snapshots are immutable and shared with the sink, while their saved JSON is unchanged.
+A row stays in memory while it holds a change no batch carries yet (a report that moved when the state was last reported but
 not the state, a re-index before a read that failed), while a replay after a crash is under way,
 or after a save that failed (it is then ahead of the index, as before). At start, each row is read
 whole and only that much of it is kept.

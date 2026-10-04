@@ -32,7 +32,7 @@ use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 const USAGE: &str = "usage: pitcrew-bench-scale [scan|start|hook|growth|all|cpu|verbs|hook-cli|hook-live|more] [--sessions N] \
-[--seed N] [--pitcrewd PATH] [--pitcrew PATH] [--cpu-seconds N] [--idle SECONDS] [--starts N] [--probes N] [--growth-turns N] \
+[--seed N] [--pitcrewd PATH] [--pitcrew PATH] [--cpu-seconds N] [--cpu-history] [--idle SECONDS] [--starts N] [--probes N] [--growth-turns N] \
 [--work DIR] [--min-free-gib N] [--keep] [--keep-cache]\n       pitcrew-bench-scale gen --out DIR \
 [--sessions N] [--seed N]";
 
@@ -80,6 +80,7 @@ fn parse(mut args: impl Iterator<Item = String>, pitcrewd: PathBuf) -> Result<Co
                 stage = Stage::parse(name).unwrap_or(Stage::All);
             }
             "--sessions" => options.sessions = count(&arg, &value()?)?,
+            "--cpu-history" => options.cpu_history = true,
             "--seed" => {
                 options.seed = value()?
                     .parse()
@@ -107,7 +108,7 @@ fn parse(mut args: impl Iterator<Item = String>, pitcrewd: PathBuf) -> Result<Co
     if options.sessions < 10 {
         return Err("--sessions must be at least 10".to_owned());
     }
-    if stage.more() && options.sessions < 100 && stage != Stage::Cpu {
+    if stage.more() && options.sessions < 100 && (stage != Stage::Cpu || options.cpu_history) {
         return Err(
             "remaining measurements need at least 100 sessions to generate fifty live transcripts"
                 .to_owned(),
@@ -240,8 +241,18 @@ mod tests {
             "--bogus",
             "scan hook",
             "--starts 0",
+            "cpu --cpu-history --sessions 50",
         ] {
             assert!(args(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn cpu_history_is_explicit_and_keeps_the_full_mix() {
+        assert!(!options("cpu").cpu_history);
+        let o = options("cpu --cpu-history");
+        assert!(o.cpu_history);
+        assert_eq!(o.sessions, homes::TRANSCRIPTS);
+        assert_eq!(o.cpu_window, Duration::from_secs(180));
     }
 }

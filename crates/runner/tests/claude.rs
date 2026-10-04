@@ -4,15 +4,87 @@
 
 mod common;
 
-use common::{CollectSink, append, config, fixture_transcript, labels};
+use common::{CollectSink, append, fixture_transcript, labels};
 use pitcrew_ingest::claude::ClaudeAdapter;
+use pitcrew_interfaces::source::{
+    Cursor, ParseChunk, SourceAdapter, SourceError, TranscriptPage, TranscriptRef,
+};
 use pitcrew_protocol::events::EventBody;
+use pitcrew_protocol::model::Engine;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 const WAIT: Duration = Duration::from_secs(5);
+
+fn config(home: &Path, state: &Path) -> pitcrew_runner::RunnerConfig {
+    let mut cfg = common::config(home, state);
+    cfg.cache_file_discovery = true;
+    cfg.byte_file_cursors = true;
+    cfg.notification_window = Duration::from_millis(175);
+    cfg
+}
+
+#[derive(Debug, Default)]
+struct CountedClaude {
+    reads: AtomicUsize,
+}
+
+impl SourceAdapter for CountedClaude {
+    fn engine(&self) -> Engine {
+        Engine::Claude
+    }
+    fn discover(&self, home: &Path) -> Result<Vec<TranscriptRef>, SourceError> {
+        ClaudeAdapter::new().discover(home)
+    }
+    fn read_from(
+        &self,
+        transcript: &TranscriptRef,
+        cursor: &Cursor,
+    ) -> Result<ParseChunk, SourceError> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        ClaudeAdapter::new().read_from(transcript, cursor)
+    }
+    fn read_page(
+        &self,
+        transcript: &TranscriptRef,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Result<TranscriptPage, SourceError> {
+        ClaudeAdapter::new().read_page(transcript, before, limit)
+    }
+}
+
+#[test]
+fn a_complete_byte_cursor_needs_one_read_and_no_read_after_restart() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let path = session_file(home.path());
+    std::fs::copy(fixture_transcript(), &path).unwrap();
+    let source = Arc::new(CountedClaude::default());
+    let sink = Arc::new(CollectSink::default());
+    let cfg = config(home.path(), state.path());
+    let runner = pitcrew_runner::start(cfg.clone(), vec![source.clone()], sink.clone()).unwrap();
+    sink.wait_for(3, WAIT).expect("fixture events");
+    runner.stop();
+    assert_eq!(
+        source.reads.load(Ordering::Relaxed),
+        1,
+        "no redundant EOF read"
+    );
+    let events = sink.len();
+    let runner = pitcrew_runner::start(cfg, vec![source.clone()], sink.clone()).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    runner.stop();
+    assert_eq!(
+        source.reads.load(Ordering::Relaxed),
+        1,
+        "persisted cursor resumed without reading"
+    );
+    assert_eq!(sink.len(), events, "no events repeated after restart");
+}
 
 /// The fixture's lines, each with its newline.
 fn fixture_lines() -> Vec<Vec<u8>> {

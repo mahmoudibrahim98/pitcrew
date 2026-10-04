@@ -111,6 +111,8 @@ export const ERROR_CODES = [
   'conflict',
   'invalid',
   'unavailable',
+  'too_large',
+  'unsupported',
   'internal',
 ] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];

@@ -17,10 +17,11 @@
 //!   events for an [`EventSink`], through a bounded channel;
 //! - a cursor is saved only after the sink accepts the events read before it, so a crash repeats
 //!   events (with the same ids) rather than losing them;
-//! - in memory the watcher keeps of each transcript only what tells a change (size, mtime, file
+//! - in memory the watcher keeps of each cold transcript only what tells a change (size, mtime, file
 //!   identity) and what routes hooks to its session; the rest of its row (the cursor, the
 //!   session's facts and metadata) is read from the index when the transcript changes or a hook
-//!   reports, and let go once the index has saved it (the README's "Memory").
+//!   reports, and let go once the index has saved it. A bounded cache keeps up to 64 saved hot
+//!   rows; immutable cursor snapshots are shared with the sink (the README's "Memory").
 //!
 //! Connected to a hub in the same process (the solo case in ADR-0009):
 //! - [`StoreSink`] writes the events into the hub's store, once each;
@@ -59,6 +60,8 @@ mod agents;
 mod commands;
 mod config;
 mod derive;
+mod discovery;
+pub mod files;
 mod fsinfo;
 mod held;
 mod hooks;
@@ -280,6 +283,11 @@ pub fn start(
     )?;
     let stopping = Arc::new(AtomicBool::new(false));
     let retry_max = config.timing.sink_retry_max;
+    let group_events = if config.notification_window.is_zero() {
+        0
+    } else {
+        config.max_batch_events
+    };
     let homes = config.homes.clone();
     let session_env = config.session_env.clone();
 
@@ -298,6 +306,9 @@ pub fn start(
         shared: Arc::clone(&shared),
         locations: config.locations,
         agents: config.agents,
+        cache_file_discovery: config.cache_file_discovery,
+        byte_file_cursors: config.byte_file_cursors,
+        notification_window: config.notification_window,
         watched: Arc::clone(&watched),
     });
 
@@ -306,7 +317,9 @@ pub fn start(
         let store = Arc::clone(&store);
         std::thread::Builder::new()
             .name("pitcrew-runner-sink".into())
-            .spawn(move || sink::dispatch(&rx, &*sink, &store, &stopping, retry_max))?
+            .spawn(move || {
+                sink::dispatch(&rx, &*sink, &store, &stopping, retry_max, group_events)
+            })?
     };
     let watcher = std::thread::Builder::new()
         .name("pitcrew-runner-watch".into())
