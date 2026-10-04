@@ -8,7 +8,10 @@
 //!   one at a time: it reads upstream with `pitcrew-sync-github` or `pitcrew-sync-jira` through the
 //!   [`http::Upstream`] transport (HTTPS, or recorded fixtures in tests), applies what changed
 //!   through hub-work's `SyncCommands` (`apply.rs`), then keeps the new sync state and status. A
-//!   rate limit waits until it lifts. Upstream is only ever read.
+//!   rate limit waits until it lifts. A sync only ever reads upstream.
+//! - **Outward writes** (`writes.rs`, api-v1.md "Outward writes"): the loop also proposes what
+//!   people's changes imply upstream (each one an approval ask), and sends what a person approved,
+//!   one write at a time with the syncs. Nothing is sent without an answered approval ask.
 //! - **The routes** (`routes.rs`) are device-only. No route returns a credential, and nothing here
 //!   logs one.
 
@@ -18,6 +21,7 @@ mod routes;
 mod saved;
 pub mod secret;
 mod validate;
+mod writes;
 
 pub use routes::routes;
 
@@ -27,7 +31,7 @@ use http::Upstream;
 use pitcrew_hub_work::WorkService;
 use pitcrew_hub_work::links::{LinkScope, scope_of};
 use pitcrew_protocol::api::{Caller, ErrorCode};
-use pitcrew_protocol::ids::{IntegrationId, MemberId};
+use pitcrew_protocol::ids::{AskId, IntegrationId, MemberId};
 use pitcrew_protocol::integrations::{
     CredentialInfo, CredentialSource, Integration, IntegrationCheck, IntegrationLink,
     IntegrationSettings, JiraDeployment, NewIntegration, ScopeCheck, SyncCounts, SyncProblem,
@@ -181,6 +185,8 @@ pub struct Integrations {
     running: Mutex<HashSet<IntegrationId>>,
     /// Asked for with `POST …/sync`.
     requested: Mutex<HashSet<IntegrationId>>,
+    /// Failed writes a person asked to send again (`POST /v1/writes/{id}/retry`).
+    retries: Mutex<HashSet<AskId>>,
     wake: Notify,
 }
 
@@ -225,6 +231,7 @@ impl Integrations {
             saved: Mutex::new(saved),
             running: Mutex::new(HashSet::new()),
             requested: Mutex::new(HashSet::new()),
+            retries: Mutex::new(HashSet::new()),
             wake: Notify::new(),
         })
     }
@@ -516,11 +523,29 @@ impl Integrations {
         })
     }
 
-    /// Starts the loop on the current runtime. See the [module docs](self).
+    /// Starts the loop on the current runtime. See the [module docs](self). Every append to the
+    /// event log wakes it, so an answered approval is acted on at once.
     pub fn spawn(self: &Arc<Self>) -> Running {
         let (stop, stopped) = watch::channel(false);
+        let appended = self.work().ok().map(|w| w.store().subscribe());
         let task = tokio::spawn(run(Arc::clone(self), stopped));
-        Running { stop, task }
+        let waker = appended.map(|mut appended| {
+            let me = Arc::downgrade(self);
+            tokio::spawn(async move {
+                loop {
+                    match appended.recv().await {
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            match me.upgrade() {
+                                Some(integrations) => integrations.wake.notify_one(),
+                                None => return,
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    }
+                }
+            })
+        });
+        Running { stop, task, waker }
     }
 
     /// The connections due now (or asked for), in order.
@@ -948,11 +973,19 @@ fn jira_check(report: &pitcrew_sync_jira::probe::ProbeReport, at: TimestampMs) -
     }
 }
 
-/// The loop: each connection due, one at a time, until stopped.
+/// The loop: outward writes to propose and to send, then each connection due, one at a time,
+/// until stopped.
 async fn run(integrations: Arc<Integrations>, mut stopped: watch::Receiver<bool>) {
     loop {
         if *stopped.borrow() {
             return;
+        }
+        tokio::select! {
+            () = async {
+                integrations.plan_writes().await;
+                integrations.settle_writes().await;
+            } => {}
+            _ = stopped.changed() => return,
         }
         for id in integrations.due() {
             if *stopped.borrow() {
@@ -977,12 +1010,18 @@ async fn run(integrations: Arc<Integrations>, mut stopped: watch::Receiver<bool>
 pub struct Running {
     stop: watch::Sender<bool>,
     task: JoinHandle<()>,
+    /// Wakes the loop on each append to the event log.
+    waker: Option<JoinHandle<()>>,
 }
 
 impl Running {
     /// Stops the loop and waits for it, at most `within`. A sync under way is dropped: its state
-    /// is kept only when it ends, so the next start reads that much again.
+    /// is kept only when it ends, so the next start reads that much again. A write being sent is
+    /// dropped too: the next start finishes it as failed, and never sends it again by itself.
     pub async fn stop(self, within: Duration) {
+        if let Some(waker) = &self.waker {
+            waker.abort();
+        }
         let _ = self.stop.send(true);
         let mut task = self.task;
         if tokio::time::timeout(within, &mut task).await.is_err() {
@@ -1016,3 +1055,6 @@ pub fn upstream(fixtures: Option<&Path>) -> anyhow::Result<Result<Upstream, Stri
 // Unix only: the sync tests run a stand-in `gh`, a shell script.
 #[cfg(all(test, unix))]
 mod tests;
+// Every platform: these keep a stored secret, and run no `gh`.
+#[cfg(test)]
+mod writes_tests;

@@ -27,8 +27,8 @@ fn task(work: &WorkService) -> TaskId {
     work.create_task(
         &person(SAM),
         NewTask {
-            project: "01JB000000000000000PRJ0001".parse().unwrap(),
-            workstream: Some(SEED_RUNS.parse().unwrap()),
+            project: "01JB000000000000000PRJ0001".parse().expect("project"),
+            workstream: Some(SEED_RUNS.parse().expect("workstream")),
             title: "Write the release notes".into(),
             description: None,
             status: None,

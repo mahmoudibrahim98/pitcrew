@@ -20,3 +20,39 @@ Accept: application/json
 HTTP/1.1 200
 
 {"issues":[{"id":"10005","key":"DEMO-5","fields":{"summary":"Billing","status":{"statusCategory":{"key":"indeterminate"}},"labels":[],"issuetype":{"name":"Epic"},"updated":"2026-01-02T09:00:00.000+0000"}},{"id":"10006","key":"DEMO-6","fields":{"summary":"Send invoices by e-mail","description":{"type":"doc","version":1,"content":[{"type":"paragraph","content":[{"type":"text","text":"Monthly, as a PDF."}]}]},"status":{"statusCategory":{"key":"new"}},"labels":["billing"],"parent":{"key":"DEMO-5"},"issuetype":{"name":"Story"},"updated":"2026-01-02T09:05:00.000+0000"}},{"id":"10007","key":"DEMO-7","fields":{"summary":"Old invoice layout","status":{"statusCategory":{"key":"done"}},"resolution":{"name":"Done"},"labels":[],"parent":{"key":"DEMO-5"},"issuetype":{"name":"Task"},"updated":"2026-01-02T09:10:00.000+0000"}}]}
+
+### pitcrew-github-fixture ###
+GET https://jira.example.com/rest/api/3/issue/DEMO-6/transitions HTTP/1.1
+Accept: application/json
+
+HTTP/1.1 200
+
+{"transitions":[{"id":"11","name":"To Do","to":{"name":"To Do","statusCategory":{"key":"new"}}},{"id":"21","name":"In Progress","to":{"name":"In Progress","statusCategory":{"key":"indeterminate"}}},{"id":"31","name":"Done","to":{"name":"Done","statusCategory":{"key":"done"}}}]}
+
+### pitcrew-github-fixture ###
+POST https://jira.example.com/rest/api/3/issue/DEMO-6/transitions HTTP/1.1
+Accept: application/json
+
+HTTP/1.1 204
+
+### pitcrew-github-fixture ###
+PUT https://jira.example.com/rest/api/3/issue/DEMO-6 HTTP/1.1
+Accept: application/json
+
+HTTP/1.1 204
+
+### pitcrew-github-fixture ###
+POST https://jira.example.com/rest/api/3/issue/DEMO-6/comment HTTP/1.1
+Accept: application/json
+
+HTTP/1.1 201
+
+{"id":"20001","body":{"type":"doc","version":1,"content":[]}}
+
+### pitcrew-github-fixture ###
+POST https://jira.example.com/rest/api/3/issue HTTP/1.1
+Accept: application/json
+
+HTTP/1.1 201
+
+{"id":"10008","key":"DEMO-8","self":"https://jira.example.com/rest/api/3/issue/10008"}

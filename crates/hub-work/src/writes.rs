@@ -247,7 +247,9 @@ impl SyncCommands<'_> {
         let id = ask.id;
         self.work().append(&[
             self.sync_event(EventBody::AskRaised { ask }),
-            self.sync_event(EventBody::WriteProposed { write }),
+            self.sync_event(EventBody::WriteProposed {
+                write: Box::new(write),
+            }),
         ])?;
         self.work().write(&id).map(Some)
     }

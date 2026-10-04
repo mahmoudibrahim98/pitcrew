@@ -12,12 +12,12 @@
 use crate::ids::{
     AskId, DispatchId, EventId, MachineId, MemberId, SessionId, TaskId, WorkspaceId, WorkstreamId,
 };
-use crate::writes::{WriteProposal, WriteResult};
 use crate::model::{
     Answer, Ask, Dispatch, DispatchOutcome, ExternalRef, Health, LinkBasis, Liveness, Machine,
     Member, Mover, Persona, Project, Receipt, Session, SessionState, Subtask, Task, TaskPatch,
     TaskStatus, Team, TimestampMs, Workstream, WorkstreamStatus,
 };
+use crate::writes::{WriteProposal, WriteResult};
 use serde::{Deserialize, Serialize};
 
 pub use crate::model::BriefTarget;
@@ -365,8 +365,8 @@ pub enum EventBody {
     /// A write to GitHub or Jira was proposed, together with the approval ask that names it. Only
     /// a write proposed this way can ever be sent.
     WriteProposed {
-        /// Exactly what will be sent.
-        write: WriteProposal,
+        /// Exactly what will be sent. Boxed: it is the largest body by far.
+        write: Box<WriteProposal>,
     },
     /// An approved write is being sent (one attempt).
     WriteStarted {

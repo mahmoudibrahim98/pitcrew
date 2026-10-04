@@ -32,3 +32,43 @@ HTTP/1.1 200
 ETag: "demo-pulls-1"
 
 [{"number":7,"title":"Fix login flake","body":"Closes #1","state":"closed","merged_at":"2026-01-02T09:30:00Z","updated_at":"2026-01-02T09:30:00Z","html_url":"https://github.com/example-org/demo-repo/pull/7"}]
+
+### pitcrew-github-fixture ###
+PATCH https://api.github.com/repos/example-org/demo-repo/issues/1 HTTP/1.1
+Accept: application/vnd.github+json
+
+HTTP/1.1 200
+
+{"number":1,"title":"Fix flaky login test","state":"closed","state_reason":"completed","html_url":"https://github.com/example-org/demo-repo/issues/1"}
+
+### pitcrew-github-fixture ###
+POST https://api.github.com/repos/example-org/demo-repo/issues/1/comments HTTP/1.1
+Accept: application/vnd.github+json
+
+HTTP/1.1 201
+
+{"id":701,"body":"Synthetic comment.","html_url":"https://github.com/example-org/demo-repo/issues/1#issuecomment-701"}
+
+### pitcrew-github-fixture ###
+POST https://api.github.com/repos/example-org/demo-repo/issues HTTP/1.1
+Accept: application/vnd.github+json
+
+HTTP/1.1 201
+
+{"number":8,"title":"Synthetic new issue","state":"open","html_url":"https://github.com/example-org/demo-repo/issues/8"}
+
+### pitcrew-github-fixture ###
+PATCH https://api.github.com/repos/example-org/demo-repo/issues/8 HTTP/1.1
+Accept: application/vnd.github+json
+
+HTTP/1.1 200
+
+{"number":8,"state":"closed","state_reason":"completed","html_url":"https://github.com/example-org/demo-repo/issues/8"}
+
+### pitcrew-github-fixture ###
+POST https://api.github.com/repos/example-org/demo-repo/issues/8/comments HTTP/1.1
+Accept: application/vnd.github+json
+
+HTTP/1.1 422
+
+{"message":"Validation Failed","errors":[{"resource":"IssueComment","code":"custom","message":"Synthetic refusal"}]}

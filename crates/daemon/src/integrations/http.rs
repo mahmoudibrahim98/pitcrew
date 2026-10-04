@@ -3,20 +3,24 @@
 //! - [`HttpsTransport`]: the real one. HTTP/1.1 over TLS (rustls, with the `ring` provider and
 //!   this machine's own trusted certificates), one connection per request, `https://` only, with
 //!   time limits and a cap on the response body. It adds `User-Agent` (GitHub refuses requests
-//!   without one) and `Host`, and sends the crates' headers as they are. It never logs a header or
-//!   a body.
+//!   without one) and `Host`, and sends the crates' method, headers and body as they are: `GET`
+//!   for the sync, and an approved outward write's one `POST`, `PATCH` or `PUT` (`writes.rs`). It
+//!   never logs a header or a body, and never follows a redirect or retries.
 //! - [`FixtureTransport`]: recorded exchanges from a folder of `*.fixture` files (the sync crates'
 //!   format), answered by method and URL, as often as asked; for tests only (`serve
-//!   --integration-fixtures`). It never reaches the network.
+//!   --integration-fixtures`). It never reaches the network. In unit tests it keeps every request
+//!   it was sent (`FixtureTransport::sent`), so they can show what was, and was not, written.
 
 use bytes::Bytes;
-use http_body_util::{BodyExt as _, Empty, Limited};
+use http_body_util::{BodyExt as _, Full, Limited};
 use hyper_util::rt::TokioIo;
 use pitcrew_sync_github::fixture::{RecordedExchange, parse_fixture};
-use pitcrew_sync_github::transport::{Request, Response, Transport, TransportError};
+use pitcrew_sync_github::transport::{Method, Request, Response, Transport, TransportError};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 /// The largest response body read, in bytes: above the sync crates' own page cap (5 MiB), which
@@ -118,8 +122,14 @@ impl HttpsTransport {
             Some(port) => format!("{host}:{port}"),
             None => host.clone(),
         };
+        let method = match request.method {
+            Method::Get => hyper::Method::GET,
+            Method::Post => hyper::Method::POST,
+            Method::Patch => hyper::Method::PATCH,
+            Method::Put => hyper::Method::PUT,
+        };
         let mut builder = hyper::Request::builder()
-            .method(hyper::Method::GET)
+            .method(method)
             .uri(path)
             .header(hyper::header::HOST, authority)
             .header(hyper::header::USER_AGENT, &self.user_agent);
@@ -127,7 +137,7 @@ impl HttpsTransport {
             builder = builder.header(name.as_str(), value.as_str());
         }
         let outgoing = builder
-            .body(Empty::<Bytes>::new())
+            .body(Full::new(Bytes::from(request.body)))
             .map_err(|_| failed(&request.url, "a bad request header"))?;
         let response = sender
             .send_request(outgoing)
@@ -172,6 +182,9 @@ impl Transport for HttpsTransport {
 #[derive(Debug, Clone, Default)]
 pub struct FixtureTransport {
     exchanges: Arc<HashMap<(String, String), RecordedExchange>>,
+    /// Every request sent, in order (clones share it). Kept for unit tests only.
+    #[cfg(test)]
+    sent: Arc<Mutex<Vec<Request>>>,
 }
 
 impl FixtureTransport {
@@ -198,7 +211,19 @@ impl FixtureTransport {
         }
         Ok(Self {
             exchanges: Arc::new(exchanges),
+            #[cfg(test)]
+            sent: Arc::default(),
         })
+    }
+
+    /// Every request sent through this transport or a clone of it, in order.
+    #[cfg(test)]
+    #[must_use]
+    pub fn sent(&self) -> Vec<Request> {
+        self.sent
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// The exchange for `request`: its URL, else its URL without a `since=` parameter (a fixture
@@ -225,6 +250,11 @@ impl FixtureTransport {
 
 impl Transport for FixtureTransport {
     async fn send(&self, request: Request) -> Result<Response, TransportError> {
+        #[cfg(test)]
+        self.sent
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(request.clone());
         match self.find(&request) {
             Some(exchange) => Ok(Response {
                 status: exchange.status,

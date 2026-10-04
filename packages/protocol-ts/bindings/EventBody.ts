@@ -342,7 +342,7 @@ why?: string,
  */
 receipts: Array<Receipt>, } } | { "type": "write_proposed", "data": { 
 /**
- * Exactly what will be sent.
+ * Exactly what will be sent. Boxed: it is the largest body by far.
  */
 write: WriteProposal, } } | { "type": "write_started", "data": { 
 /**
