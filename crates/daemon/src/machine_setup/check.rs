@@ -273,7 +273,10 @@ async fn slurm(env: &CheckEnv) -> Option<MachineCheckRow> {
     let item = MachineCheckItem::Slurm;
     let sbatch = env.tools.find("sbatch")?;
     let (row, line) = versioned(env, item, "sbatch", &sbatch, &["--version"]).await;
-    let line = line?;
+    // `sbatch` is there but did not answer: its warning row, as for any other tool.
+    let Some(line) = line else {
+        return Some(row);
+    };
     let missing: Vec<&str> = ["squeue", "scancel"]
         .into_iter()
         .filter(|name| env.tools.find(name).is_none())
@@ -433,6 +436,18 @@ mod tests {
         let slurm = super::check(&env(&bin, tmp.path(), None), Some(MachineCheckItem::Slurm)).await;
         assert_eq!(slurm.rows[0].status, MachineCheckStatus::Ok);
         assert_eq!(slurm.rows[0].detail, "slurm 23.02.7");
+
+        // An `sbatch` that is there but fails still has its row: a warning, as for any tool.
+        script(&bin, "sbatch", "echo 'sbatch: error: broken' >&2; exit 1");
+        let failing =
+            super::check(&env(&bin, tmp.path(), None), Some(MachineCheckItem::Slurm)).await;
+        assert_eq!(failing.rows.len(), 1, "the row is kept: {failing:?}");
+        assert_eq!(failing.rows[0].status, MachineCheckStatus::Warn);
+        assert_eq!(
+            failing.rows[0].detail,
+            "Found, but `sbatch --version` did not work: it exited with 1."
+        );
+        assert_eq!(failing.rows[0].fix, None);
     }
 
     #[tokio::test]
