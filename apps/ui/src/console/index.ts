@@ -7,6 +7,7 @@ import { createRoute, lazyRouteComponent, type AnyRoute } from '@tanstack/react-
 import { lazy } from 'react';
 import { defineFeature, type Command, type WorkspaceRoute } from '../shell/index.ts';
 import { requestConsole, type ConsoleIntent } from './intent.ts';
+import { WORKBENCH_ACTIONS, type WorkbenchAction } from './workbench/keys.ts';
 
 function routes(parent: WorkspaceRoute): AnyRoute[] {
   // One page for both paths: the list stays put while the chosen session changes.
@@ -83,6 +84,20 @@ const commands: Command[] = [
   },
 ];
 
+/** The workbench's keys, each as a command (shown in the console's layout only). */
+const workbenchCommands: Command[] = (Object.keys(WORKBENCH_ACTIONS) as WorkbenchAction[]).map((action) => {
+  const { label, keys, keywords } = WORKBENCH_ACTIONS[action];
+  return {
+    id: `console-workbench-${action}`,
+    label,
+    group: 'Workbench',
+    ...(keys === undefined ? {} : { keys }),
+    ...(keywords === undefined ? {} : { keywords }),
+    layout: 'console',
+    run: ask({ kind: 'workbench', action }),
+  };
+});
+
 export const feature = defineFeature({
   id: 'console',
   layout: 'console',
@@ -90,7 +105,7 @@ export const feature = defineFeature({
   // The shell's own "Agent console" entry (with its working and waiting counts) is the console's
   // place in the sidebar; the console adds none of its own. No "+ New" item yet: starting a
   // session needs a flow that does not exist, and an entry cannot be shown disabled with a reason.
-  commands: commands.map((command) => ({ ...command, layout: 'both' })),
+  commands: [...commands.map((command): Command => ({ ...command, layout: 'both' })), ...workbenchCommands],
 });
 
 export const SessionList = lazy(() => import('./session-list.tsx').then((m) => ({ default: m.SessionList })));

@@ -7,7 +7,8 @@ every component are lazy chunks (render the components inside a `<Suspense>`).
 | File | What |
 |---|---|
 | `index.ts` | `feature`: the routes `console` and `console/$session` (one lazy page for both) and the palette commands. The lazy component exports. |
-| `console-page.tsx` | `ConsolePage`: filters, list and session side by side, or one at a time when narrow. See [The page](#the-page). |
+| `console-page.tsx` | `ConsolePage`: filters, list and the workbench side by side, or one at a time when narrow. See [The page](#the-page). |
+| `workbench/` | The workbench: sessions, terminals and files in tabs and splits, the details sidebar. See [The workbench](#the-workbench). |
 | `search.ts` | The facets in the URL's search (`?machine=A,B&state=waiting`), and the session pane's view (`?view=terminal`, `?view=work`). No React. |
 | `view-switch.tsx` | `ViewSwitch`: the session pane's Chat \| Terminal \| Work switch; without a terminal, Terminal stays focusable but does nothing, and the reason shows beside it. Work is always available. |
 | `terminal/` | The terminal, a lazy chunk with xterm.js in it. See [The terminal](#the-terminal). |
@@ -29,11 +30,12 @@ every component are lazy chunks (render the components inside a `<Suspense>`).
 - **Where things are kept.** The chosen session is in the path (`/w/$ws/console/$session`), the
   filters in the search, so a link or a reload reproduces the view. Choosing a session with a
   click or Enter adds a history entry; the arrows' choices and filter changes replace it. Pane
-  widths are per browser (`panes.ts`).
+  widths are per browser (`panes.ts`); the workbench's layout is per workspace
+  (`workbench/store.ts`).
 - **Layout.** Wider than 720 px (the console, not the window), the filters and the list are
-  `ResizablePanel`s beside the session; "Filters" in the list's header shows or hides the filters.
-  Narrower, one pane shows at a time: the list, the filters or the session, each with a way back
-  to the list.
+  `ResizablePanel`s beside the workbench; "Filters" in the list's header shows or hides the filters.
+  Narrower, one pane shows at a time: the list, the filters or the session in the URL (not the
+  workbench: its panes need the width), each with a way back to the list.
 - **Chat, terminal or work.** Under the header, a Chat | Terminal | Work switch. The terminal and
   work views are in the URL's search (`?view=terminal`, `?view=work`, replacing the history entry),
   so a link or a reload shows them again; choosing another session keeps the choice. A session
@@ -48,20 +50,93 @@ every component are lazy chunks (render the components inside a `<Suspense>`).
   it no `ProjectsNavProvider` (that is `ProjectsLayout`'s, `src/projects`), so a block's task shows
   as plain text, not a link, there; the session itself never shows (the console already is that
   session's page).
-- **Keys.** F6 and Shift+F6 move between the panes: the filters, the list, then the transcript and
-  the composer, or the terminal or work view in their place (those on screen). In the list, the
+- **Keys.** F6 and Shift+F6 move between the panes on screen, in the order they are on screen:
+  the filters, the list, then each workbench pane's transcript and composer (or its terminal, work
+  view or file in their place), then the details. In the list, the
   arrows, Page keys, Home and End choose the session beside it once they rest on one (150 ms); Enter
   or Space opens it and goes to the composer. Only a terminal in control mode claims the shell's
   keys (`ownsShellKeys`), and it keeps F6 too. In the composer, Ctrl B, Ctrl J and Ctrl . stay with
   the text field, and Ctrl K opens the palette as everywhere.
 - **Palette.** "Go to the Agent console", "Jump to a session…", "Filter sessions by machine…" and
   "… by state…", "Show sessions waiting for input", "Show working sessions" and "Clear the session
-  filters", in both layouts. A command goes to the console if needed and hands its request over
-  through `intent.ts`.
+  filters", in both layouts; the workbench's commands (below) in the console's. A command goes to
+  the console if needed and hands its request over through `intent.ts`.
 - **Links to the work.** The header links to the task (`paths.task`) and the workstream
   (`paths.workstream`) by path, so they open whatever serves those paths (the Projects layout).
 - **No "+ New" item.** Starting a session needs a flow that does not exist yet, and the shell's
   `CreateEntry` cannot be shown disabled with a reason.
+
+## The workbench
+
+The session area is an IDE's editor area (`workbench/`): **panes** of **tabs**, side by side or
+stacked, each tab a session (its chat, terminal or work, with its own Chat | Terminal | Work
+switch) or a file of a workstream's folder.
+
+| File | What |
+|---|---|
+| `workbench/layout.ts` | The model, no React: panes in nested splits (`row` or `column`, each child's share in `sizes`), tabs, the active pane; open, reveal, close, split, move, drop, resize; `parseLayout`, a strict check of a stored layout. Unit tests: `tests/workbench-layout.test.ts`. |
+| `workbench/store.ts` | The layout per workspace in local storage (`pitcrew.workbench.<ws>`, version 1). Missing, unreadable or malformed (any part of it) gives the empty layout; storage that throws is ignored. |
+| `workbench/workbench.tsx` | `useWorkbench` (the actions) and `Workbench`: panes, tab strips, separators, drag and drop, the details sidebar. |
+| `workbench/session-tab.tsx` | `SessionPane`: a session's header, view switch and view (also the narrow console's session pane). |
+| `workbench/file-tab.tsx` | A file in a pane: `FileViewer` from `src/projects` (the Files tab's), its unsaved edit in `drafts.ts`. |
+| `workbench/drafts.ts` | Unsaved edits by tab, in memory only, with the revision each was read at. |
+| `workbench/details.tsx` | The details sidebar. |
+| `workbench/keys.ts` | The keys and each one's palette command. |
+
+- **Opening.** A session chosen in the list (click, or the arrows resting on it) is shown where it
+  is open already, in the view it has there; otherwise it opens in the active pane as its
+  **preview** tab (in italics), which the next one replaces, so following the list does not pile
+  up tabs. Enter in the list, a double-click on the tab, its menu's "Keep open", switching its view,
+  moving it or splitting it keeps it. A row's menu has "Open in a new tab" and "Open to the side".
+  A link, the history or the palette's "Jump to a session" shows the session in the view the URL
+  names, switching an open tab of it if need be.
+- **The URL** follows the tab on screen in the active pane: a session and its view, or the bare
+  console for a file (or nothing). Switching tabs replaces the history entry.
+- **Splitting.** "Split right" and "Split down" on a pane (or its tab's menu) open a copy of its tab
+  in a new pane beside it, as an editor does; panes of the same direction share one split. At most
+  16 panes. Closing a pane's last tab closes the pane; the only pane stays, empty.
+- **Dragging.** A tab dragged onto another pane's tab strip goes there at that place; onto a pane's
+  edge (its outer quarter) into a new pane on that side; onto its middle into it. Where the target
+  pane already shows the same thing, that tab comes on screen instead. Only the workbench's own tabs
+  are taken; anything else dragged in is left to the browser.
+- **Resizing.** The boundary between panes is a separator (role `separator`, its position as
+  `aria-valuenow`): drag it, or focus it and use the arrows (5% a step), Home and End. No pane
+  gets under 10% of its split.
+- **Persisted.** Panes, tabs, sizes, the active pane and the details' state and width are saved per
+  workspace on every change and read back on load, so a reload shows the same workbench. What is
+  shown is checked again as it loads: a session that is gone says so in its tab, a file says "Gone".
+  File contents are never stored.
+- **Unsaved edits.** A file's tab keeps its edit while another tab is on screen (only the tab on
+  screen in each pane is rendered). Closing it asks first; so does closing its pane or the others;
+  leaving the page warns. Saving sends the revision the edit started from, so a change made
+  meanwhile is a conflict (Reload, Overwrite), as in the Files tab.
+- **Details** (each pane's "Details" button, or the palette): for a session, its task, workstream,
+  machine, state, model and account, with "Link to a task…", "Hand off" (shown, and saying it is not
+  available yet: there is no route for it), "Terminal beside" and "Chat beside", and its
+  workstream's folders, to open files from. The hub reports no model or account on a session: the
+  model shown is the agent's persona's, when it names one, otherwise "Not reported"; the account is
+  always "Not reported". For a file: its workstream, folder and path, and the folders.
+- **Accessibility.** Each pane is a region ("Pane 2"); its tab strip a `tablist` ("Tabs in pane 2")
+  of `tab`s controlling a `tabpanel`, one tab stop per pane (arrows, Home, End; Shift with an arrow
+  moves the tab; Delete closes it; Enter goes into it; the Menu key or a right-click opens its
+  actions; a description on each tab says so). A tab's close button is for the mouse and hidden
+  from assistive technology, as Delete does the same. A pane's chat and "Linked work" landmarks
+  carry the pane's number from the second pane on, so no two landmarks share a name.
+
+### Keys
+
+Alt (Option on macOS) with PageDown or PageUp shows the next or previous tab of the active pane;
+with Shift, moves the tab on screen to the next or previous pane (making one when there is only
+one). Alt W closes the tab on screen; Alt \ and Alt Shift \ split the active pane right and down.
+Each is also a palette command (group "Workbench"), with "Next pane", "Previous pane" (F6, Shift
+F6) and "Show or hide the session details".
+
+- **Why these.** A browser keeps Ctrl W, Ctrl Tab, Ctrl PageDown and Ctrl 1 to 9 for itself (the
+  page never sees them), and the shell owns Ctrl K, J, B and .; Alt with PageDown, PageUp, W and \
+  means nothing to Chromium, Firefox, WebKit or the desktop's webviews.
+- **Where they act.** Alt PageDown and PageUp act anywhere in the workbench; Alt W and Alt \ not
+  in a text field (on macOS they type characters there). A key-owning surface (a terminal in
+  control mode) keeps every key.
 
 ## Transcripts
 
@@ -253,6 +328,12 @@ coloured dot beside `ink-2` text.
   `terminal-boundary.test.tsx` and `work-boundary.test.tsx` their error boundaries. The Work view
   needs no `tz`: it shows `SessionWork`'s blocks (`useRecapBlocks`), not day paragraphs, and the
   mock hub's blocks endpoint takes no `tz` at all (only `GET /v1/recaps/days` does).
+- **The workbench.** `workbench-layout.test.ts` tests the model and its storage (round trips, every
+  kind of damage refused, storage that throws); `workbench.test.tsx` the workbench in the console
+  (preview tabs, splits with a view per pane, the URL, a reload restoring the layout and a corrupt
+  one ignored, the keys and their palette commands, the details and files with an unsaved edit
+  across tabs, dragging tabs). Its tests reset the per-page stores (`resetWorkbenchStores`,
+  `clearDrafts`) after each test, as `console-page.test.tsx` does.
 - **Playwright** (`src/console/tests/e2e`): the acceptance run in the real app against the mock
   hub, axe included (both themes, both layouts), on ports 47450 (hub) and 47451 (UI), which
   `E2E_HUB_PORT` and `E2E_UI_PORT` move. Traces are kept only for failures, in
@@ -268,6 +349,13 @@ coloured dot beside `ink-2` text.
   cd apps/ui
   PLAYWRIGHT_CHANNEL=msedge corepack pnpm exec playwright test -c src/console/tests/e2e/playwright.config.ts
   ```
+
+  `workbench.spec.ts` opens a session, splits it, switches the copy to its terminal, opens the
+  details and a coloured file and a PDF from its folders, drags tabs into a strip and onto a
+  pane's edge, checks axe in both schemes (`e2e/axe.ts`), and reloads to the same layout; then the
+  keys and the palette, and a corrupt stored layout. It seeds its two files through the mock hub's
+  files API and finds the hub from the app's own requests, so it runs under this config and under
+  the UI's own (CI's), which imports it through `e2e/workbench.spec.ts`.
 
 ## Link a session
 
