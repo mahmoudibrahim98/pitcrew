@@ -29,9 +29,9 @@
 //!   (`crate::transcripts`).
 
 use crate::agents::HubAgents;
-use crate::locations::HubLocations;
 use crate::cli::HomeArg;
 use crate::dispatch::{AgentEnv, FollowingSink};
+use crate::locations::HubLocations;
 use crate::runtime::TerminalRuntime;
 use crate::state::StateDir;
 use anyhow::{Context as _, bail};

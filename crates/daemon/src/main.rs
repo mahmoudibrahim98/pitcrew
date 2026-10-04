@@ -24,13 +24,13 @@
 //! **Owned by stream 0.**
 
 mod agents;
-mod locations;
 mod cli;
 mod cors;
 mod dispatch;
 mod files;
 mod host;
 mod init;
+mod locations;
 mod office;
 mod recaps;
 mod refs;

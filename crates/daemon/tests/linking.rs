@@ -90,12 +90,7 @@ fn locations_link_new_sessions_and_relink_old_ones_but_manual_links_stand() {
     };
     let folder = create("Folder", &repo, None);
     let branch = create("Branch", &repo, Some("topic"));
-    transcript(
-        &home,
-        &deep,
-        "2b6f1a8e-4c1d-4f5e-9a37-0c8d1e2f3a4b",
-        "main",
-    );
+    transcript(&home, &deep, "2b6f1a8e-4c1d-4f5e-9a37-0c8d1e2f3a4b", "main");
     transcript(
         &home,
         &repo,

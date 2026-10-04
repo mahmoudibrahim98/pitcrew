@@ -20,8 +20,8 @@ use pitcrew_protocol::ids::{
     AskId, DispatchId, MemberId, SessionId, SubtaskId, TaskId, TaskKey, WorkstreamId,
 };
 use pitcrew_protocol::model::{
-    Answer, Ask, AskKind, AskState, Brief, DispatchOutcome, Health, LinkBasis, MemberKind, Mover, Receipt,
-    Session, Subtask, SubtaskSource, Task, TaskStatus, Workstream, WorkstreamStatus,
+    Answer, Ask, AskKind, AskState, Brief, DispatchOutcome, Health, LinkBasis, MemberKind, Mover,
+    Receipt, Session, Subtask, SubtaskSource, Task, TaskStatus, Workstream, WorkstreamStatus,
 };
 use pitcrew_protocol::transcript::{PlanItem, PlanStatus};
 use pitcrew_store::sql::Connection;
@@ -244,8 +244,9 @@ impl WorkService {
                 return Err(WorkError::invalid("Give a workstream, a task, or both."));
             }
             if let Some(id) = workstream {
-                query::workstream(c, &id)?
-                    .ok_or_else(|| WorkError::invalid(format!("workstream: no workstream {id}.")))?;
+                query::workstream(c, &id)?.ok_or_else(|| {
+                    WorkError::invalid(format!("workstream: no workstream {id}."))
+                })?;
             }
             if let Some(task) = task
                 && workstream.is_some()
