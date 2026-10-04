@@ -11,11 +11,19 @@
 use std::fmt;
 use std::future::Future;
 
-/// HTTP methods this crate needs. Only `GET`: this brief is read-only.
+/// HTTP methods. The sync only ever sends `GET`; the others are for an approved outward write
+/// ([`crate::write`], and `pitcrew_sync_jira::write`), which the hub sends only after a person's
+/// approval.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Method {
     /// `GET`.
     Get,
+    /// `POST`: create an issue, a comment, or a Jira transition.
+    Post,
+    /// `PATCH`: change a GitHub issue.
+    Patch,
+    /// `PUT`: change a Jira issue.
+    Put,
 }
 
 impl Method {
@@ -24,6 +32,9 @@ impl Method {
     pub fn as_str(self) -> &'static str {
         match self {
             Method::Get => "GET",
+            Method::Post => "POST",
+            Method::Patch => "PATCH",
+            Method::Put => "PUT",
         }
     }
 }
@@ -84,7 +95,7 @@ pub struct Request {
     pub url: String,
     /// Header name/value pairs.
     pub headers: Vec<(String, String)>,
-    /// Body bytes (always empty for the `GET`s this crate sends).
+    /// Body bytes: empty for a `GET`, JSON for a write.
     pub body: Vec<u8>,
 }
 

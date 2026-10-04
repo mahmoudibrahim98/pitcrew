@@ -70,7 +70,7 @@ pub(crate) fn expected_web_origin(api_base: Option<&str>) -> WebOrigin {
 /// port on the right host, entirely — O30 closes the port gap; this pins both to the one web
 /// origin this sync is actually about, the same reasoning `origin::trusted_next_url` uses for the
 /// API host).
-fn trusted_html_url(raw: &str, web_origin: &WebOrigin) -> Option<url::Url> {
+pub(crate) fn trusted_html_url(raw: &str, web_origin: &WebOrigin) -> Option<url::Url> {
     if raw.len() > MAX_KEPT_URL_BYTES || contains_hidden(raw) {
         return None;
     }

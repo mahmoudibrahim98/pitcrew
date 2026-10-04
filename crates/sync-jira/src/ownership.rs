@@ -15,7 +15,9 @@ use crate::change::UpstreamChange;
 use pitcrew_protocol::ids::TaskId;
 use pitcrew_protocol::model::{ExternalRef, Mover, Task, TaskStatus};
 use pitcrew_sync_github::ownership::plan_scope_closed;
-pub use pitcrew_sync_github::ownership::{FieldOwner, FieldOwnership, Intent, LinkedWorkstream};
+pub use pitcrew_sync_github::ownership::{
+    FieldOwner, FieldOwnership, Intent, LinkedWorkstream, Outward, outward,
+};
 
 /// The field-ownership table for Jira epics mirrored as the workstreams that link them
 /// (`Workstream::external`): the same rules as GitHub's milestones. [`plan_workstream`] follows
@@ -24,12 +26,14 @@ pub const EPIC_FIELD_OWNERSHIP: &[FieldOwnership] = &[
     FieldOwnership {
         field: "name",
         owner: FieldOwner::Hub,
+        outward: Outward::Never,
         note: "A person named the workstream; an epic's new summary is shown on the link only, \
                and never renames the workstream.",
     },
     FieldOwnership {
         field: "status",
         owner: FieldOwner::Mirrored,
+        outward: Outward::Never,
         note: "An epic moved to a done status proposes `shipped`, from idea, active or paused \
                only, and never while one of the workstream's tasks is in progress: that raises \
                a conflict ask instead. A shipped or dropped workstream is left as it is.",
@@ -53,28 +57,33 @@ pub const ISSUE_FIELD_OWNERSHIP: &[FieldOwnership] = &[
     FieldOwnership {
         field: "title",
         owner: FieldOwner::Upstream,
+        outward: Outward::AskToSend,
         note: "The issue summary always overwrites the task's title.",
     },
     FieldOwnership {
         field: "body",
         owner: FieldOwner::Upstream,
+        outward: Outward::AskToSend,
         note: "The issue description always overwrites the task's description (ADF converted to \
                plain text for Cloud; already plain text for Data Center).",
     },
     FieldOwnership {
         field: "labels",
         owner: FieldOwner::Upstream,
+        outward: Outward::AskToSend,
         note: "Jira labels always overwrite the task's labels.",
     },
     FieldOwnership {
         field: "milestone",
         owner: FieldOwner::Upstream,
+        outward: Outward::AskToSend,
         note: "The issue's epic (fields.parent, or the configured epic-link custom field on Data \
                Center) always overwrites the task's linked workstream reference.",
     },
     FieldOwnership {
         field: "status",
         owner: FieldOwner::Mirrored,
+        outward: Outward::AskToCloseOrReopen,
         note: "Moved only through TaskStatus::can_move(.., Mover::Sync): IssueDone proposes \
                `done`; IssueReopened proposes `todo`, unconditionally — not gated on the hub's \
                own current status, the same way GitHub's IssueReopened is unconditional — so a \
@@ -85,6 +94,7 @@ pub const ISSUE_FIELD_OWNERSHIP: &[FieldOwnership] = &[
     FieldOwnership {
         field: "assignee",
         owner: FieldOwner::Hub,
+        outward: Outward::Never,
         note: "The hub's assignee is never changed by sync. Upstream assignee changes are still \
                recorded as UpstreamChange::IssueReassigned for visibility, but `plan` emits no \
                intent for them.",

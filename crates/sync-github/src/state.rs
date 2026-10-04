@@ -90,6 +90,44 @@ pub struct IssueSnapshot {
     pub(crate) updated_at: GithubTimestamp,
 }
 
+impl IssueSnapshot {
+    /// The title, as last read.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// The body, as last read.
+    #[must_use]
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    /// Whether it was open.
+    #[must_use]
+    pub fn open(&self) -> bool {
+        self.open
+    }
+
+    /// Why it was closed, when it was.
+    #[must_use]
+    pub fn close_reason(&self) -> Option<CloseReason> {
+        self.close_reason
+    }
+
+    /// The labels, as last read.
+    #[must_use]
+    pub fn labels(&self) -> &[String] {
+        &self.labels
+    }
+
+    /// Its milestone's number.
+    #[must_use]
+    pub fn milestone_number(&self) -> Option<u64> {
+        self.milestone_number
+    }
+}
+
 /// The owned fields of one pull request, as last seen.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullSnapshot {

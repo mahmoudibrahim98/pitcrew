@@ -46,6 +46,38 @@ pub struct IssueSnapshot {
     pub(crate) updated: JiraTimestamp,
 }
 
+impl IssueSnapshot {
+    /// The summary, as last read.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// The description, as last read (plain text).
+    #[must_use]
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    /// Its status category.
+    #[must_use]
+    pub fn category(&self) -> StatusCategory {
+        self.category
+    }
+
+    /// The labels, as last read.
+    #[must_use]
+    pub fn labels(&self) -> &[String] {
+        &self.labels
+    }
+
+    /// Its epic's key.
+    #[must_use]
+    pub fn epic_key(&self) -> Option<&str> {
+        self.epic_key.as_deref()
+    }
+}
+
 /// The owned fields of one epic, as last seen.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EpicSnapshot {

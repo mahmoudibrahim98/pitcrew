@@ -1,9 +1,9 @@
 //! # pitcrew-sync-github
 //!
-//! GitHub, read side: read issues, pull requests and milestones for a set of repositories
-//! efficiently and safely, and turn what changed upstream into typed [`UpstreamChange`]s. This
-//! crate is read-only and never writes to GitHub — applying changes to the hub, the write-
-//! approval queue and outward writes are later briefs.
+//! GitHub: read issues, pull requests and milestones for a set of repositories efficiently and
+//! safely, and turn what changed upstream into typed [`UpstreamChange`]s; and build the one
+//! request an approved outward write is sent as ([`write`]). The sync only reads: a write is sent
+//! only by the hub, after a person approved it (api-v1.md, "Outward writes").
 //!
 //! **Owned by stream G.** Build against `pitcrew-protocol` only, never another stream's internals.
 //!
@@ -24,6 +24,8 @@
 //!   [`ownership::plan_workstream`] does the same for a milestone and a workstream that links it
 //!   ([`ownership::MILESTONE_FIELD_OWNERSHIP`]).
 //! - [`probe::probe`]: one read of each repository, for "test this connection".
+//! - [`write::send`]: one approved write (create an issue, comment, or edit one: title, body,
+//!   labels, milestone, close or reopen), sent once.
 
 #![forbid(unsafe_code)]
 
@@ -41,12 +43,13 @@ pub mod sync;
 pub mod time;
 pub mod transport;
 mod wire;
+pub mod write;
 
 pub use change::UpstreamChange;
 pub use client::{ClientError, GithubClient, Outcome};
 pub use ownership::{
     FieldOwner, FieldOwnership, ISSUE_FIELD_OWNERSHIP, Intent, LinkedWorkstream,
-    MILESTONE_FIELD_OWNERSHIP, plan, plan_workstream,
+    MILESTONE_FIELD_OWNERSHIP, Outward, outward, plan, plan_workstream,
 };
 pub use state::{CloseReason, RepoState, SyncState};
 // Not public API: exposed only so stream Q's fuzz harness can call `trusted_next_url` directly,

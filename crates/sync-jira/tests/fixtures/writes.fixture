@@ -1,0 +1,41 @@
+POST https://jira.example.com/rest/api/3/issue HTTP/1.1
+Accept: application/json
+
+HTTP/1.1 201
+
+{"id":"10013","key":"DEMO-13","self":"https://jira.example.com/rest/api/3/issue/10013"}
+### pitcrew-github-fixture ###
+POST https://jira.example.com/rest/api/3/issue/DEMO-13/comment HTTP/1.1
+Accept: application/json
+
+HTTP/1.1 201
+
+{"id":"20001","body":{"type":"doc","version":1,"content":[]}}
+### pitcrew-github-fixture ###
+PUT https://jira.example.com/rest/api/3/issue/DEMO-13 HTTP/1.1
+Accept: application/json
+
+HTTP/1.1 204
+
+
+### pitcrew-github-fixture ###
+GET https://jira.example.com/rest/api/3/issue/DEMO-13/transitions HTTP/1.1
+Accept: application/json
+
+HTTP/1.1 200
+
+{"transitions":[{"id":"11","name":"To Do","to":{"name":"To Do","statusCategory":{"key":"new"}}},{"id":"21","name":"In Progress","to":{"name":"In Progress","statusCategory":{"key":"indeterminate"}}},{"id":"31","name":"Done","to":{"name":"Done","statusCategory":{"key":"done"}}}]}
+### pitcrew-github-fixture ###
+POST https://jira.example.com/rest/api/3/issue/DEMO-13/transitions HTTP/1.1
+Accept: application/json
+
+HTTP/1.1 204
+
+
+### pitcrew-github-fixture ###
+POST https://jira.example.com/rest/api/3/issue/DEMO-1/comment HTTP/1.1
+Accept: application/json
+
+HTTP/1.1 403
+
+{"errorMessages":["You do not have the permission to comment on this issue."],"errors":{}}
