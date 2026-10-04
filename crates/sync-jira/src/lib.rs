@@ -22,7 +22,9 @@
 //!   `Transport` it is given.
 //! - [`change::UpstreamChange`]: what changed upstream, each carrying an `ExternalRef` and the
 //!   upstream time.
-//! - [`ownership::plan`]: turns one `UpstreamChange` into abstract hub `Intent`s.
+//! - [`ownership::plan`]: turns one `UpstreamChange` into abstract hub `Intent`s;
+//!   [`ownership::plan_workstream`] does the same for an epic and a workstream that links it.
+//! - [`probe::probe`]: one read of the account and each project, for "test this connection".
 //!
 //! ## Reuse, not a fork
 //!
@@ -69,6 +71,7 @@ pub mod client;
 pub mod deployment;
 pub mod jql;
 pub mod ownership;
+pub mod probe;
 pub mod state;
 pub mod sync;
 pub mod time;
@@ -79,7 +82,10 @@ pub use change::UpstreamChange;
 pub use client::{ClientError, JiraClient};
 pub use deployment::{Deployment, JiraCloud, JiraDataCenter, PageState};
 pub use jql::{InvalidProjectRef, ProjectRef};
-pub use ownership::{FieldOwner, FieldOwnership, ISSUE_FIELD_OWNERSHIP, Intent, plan};
+pub use ownership::{
+    EPIC_FIELD_OWNERSHIP, FieldOwner, FieldOwnership, ISSUE_FIELD_OWNERSHIP, Intent,
+    LinkedWorkstream, plan, plan_workstream,
+};
 pub use state::{EpicSnapshot, IssueSnapshot, ProjectState, StatusCategory, SyncState};
 // `sync::sync` (the function) is not re-exported at the crate root to avoid shadowing the `sync`
 // module itself; call it as `pitcrew_sync_jira::sync::sync(..)`.
