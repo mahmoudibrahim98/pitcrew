@@ -1,5 +1,7 @@
 //! Finding a tool on this machine's `PATH`, and running it briefly: bounded in time and output,
-//! with no input, and (on Unix) in a process group of its own, which a timeout ends whole.
+//! with no input, and with everything it starts: a process group of its own on Unix, a Job Object
+//! on Windows (`pitcrew_remote::job`), which a timeout ends whole, and so does dropping the run
+//! (a request given up part-way, a `JoinSet` dropped) while it is not finished.
 //!
 //! Only absolute `PATH` entries are searched: a relative one would name a folder relative to the
 //! daemon's working directory, which nobody chose. On Windows the names `PATHEXT` would add are
@@ -112,15 +114,8 @@ impl Tools {
         if let Some(path) = &self.path {
             command.env("PATH", path);
         }
-        #[cfg(unix)]
-        command.process_group(0);
-        #[cfg(windows)]
-        {
-            // CREATE_NO_WINDOW: a console tool run by the daemon opens no window of its own.
-            command.creation_flags(0x0800_0000);
-        }
-        let mut child = match command.spawn() {
-            Ok(child) => child,
+        let mut running = match Running::spawn(command) {
+            Ok(running) => running,
             Err(e) => {
                 return Ran {
                     failed: Some(e.kind().to_string()),
@@ -128,12 +123,10 @@ impl Tools {
                 };
             }
         };
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let pid = child.id();
+        let stdout = running.child.stdout.take();
+        let stderr = running.child.stderr.take();
         let finished = tokio::time::timeout(limit, async {
-            let (out, err, status) = tokio::join!(capped(stdout), capped(stderr), child.wait());
-            (out, err, status)
+            tokio::join!(capped(stdout), capped(stderr), running.child.wait())
         })
         .await;
         match finished {
@@ -145,14 +138,98 @@ impl Tools {
                 failed: None,
             },
             Err(_) => {
-                stop_group(pid);
-                let _ = child.kill().await;
+                running.kill().await;
                 Ran {
                     timed_out: true,
                     ..Ran::default()
                 }
             }
         }
+    }
+}
+
+/// A started tool. Stopping it stops everything it started: its process group on Unix, its Job
+/// Object on Windows (where `claude.cmd` runs `node.exe`, which killing `cmd.exe` alone leaves
+/// running). Dropping it before it is reaped stops them too.
+struct Running {
+    child: tokio::process::Child,
+    /// `None` only if the tool could not be put in it; then only the tool itself is stopped.
+    #[cfg(windows)]
+    job: Option<pitcrew_remote::job::Job>,
+}
+
+impl Running {
+    #[cfg(unix)]
+    fn spawn(mut command: tokio::process::Command) -> std::io::Result<Self> {
+        // A group of its own, so what it starts can be stopped with it.
+        command.process_group(0);
+        Ok(Self {
+            child: command.spawn()?,
+        })
+    }
+
+    #[cfg(windows)]
+    fn spawn(mut command: tokio::process::Command) -> std::io::Result<Self> {
+        // CREATE_NO_WINDOW: a console tool run by the daemon opens no window of its own.
+        command.creation_flags(0x0800_0000);
+        let job = match pitcrew_remote::job::Job::new() {
+            Ok(job) => Some(job),
+            Err(e) => {
+                tracing::debug!(error = %e, "no job object for a version command");
+                None
+            }
+        };
+        let child = command.spawn()?;
+        let job = job.filter(|job| {
+            let assigned = pitcrew_remote::job::handle_of(&child)
+                .ok_or_else(|| std::io::Error::other("it has ended"))
+                .and_then(|handle| job.assign(handle));
+            if let Err(e) = &assigned {
+                tracing::debug!(error = %e, "a version command is not in its job object");
+            }
+            assigned.is_ok()
+        });
+        Ok(Self { child, job })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn spawn(mut command: tokio::process::Command) -> std::io::Result<Self> {
+        Ok(Self {
+            child: command.spawn()?,
+        })
+    }
+
+    /// Stops everything the tool started.
+    /// - Unix: its process group, but only while the tool is not yet reaped (tokio's `id()` is
+    ///   `None` after that): until then the group's id cannot belong to anyone else.
+    /// - Windows: its whole job.
+    fn stop_all(&self) {
+        #[cfg(unix)]
+        if let Some(pid) = self
+            .child
+            .id()
+            .and_then(|id| i32::try_from(id).ok())
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            job.terminate();
+        }
+    }
+
+    /// Stops everything it started, and it, and reaps it.
+    async fn kill(&mut self) {
+        self.stop_all();
+        let _ = self.child.kill().await;
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        // A run given up before its tool ended (tokio's `kill_on_drop` stops only the tool).
+        self.stop_all();
     }
 }
 
@@ -173,18 +250,6 @@ async fn capped(stream: Option<impl AsyncRead + Unpin>) -> String {
         }
     }
     String::from_utf8_lossy(&kept).into_owned()
-}
-
-/// Ends the process group a timed-out run leads (Unix), so what it started ends too.
-fn stop_group(pid: Option<u32>) {
-    #[cfg(unix)]
-    if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok())
-        && let Some(pid) = rustix::process::Pid::from_raw(pid)
-    {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-    }
-    #[cfg(not(unix))]
-    let _ = pid;
 }
 
 /// The names `name` may have in `dir`.
@@ -387,6 +452,56 @@ mod tests {
             assert_eq!(tools.find("missing"), None);
         }
 
+        /// Whether process `pid` has ended (or is a zombie), within five seconds. Linux only.
+        fn gone(pid: i32) -> bool {
+            (0..100).any(|_| {
+                std::thread::sleep(Duration::from_millis(50));
+                !Path::new(&format!("/proc/{pid}")).exists()
+                    || std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                        .is_ok_and(|s| s.contains(") Z "))
+            })
+        }
+
+        /// A run given up before its tool ends (its future dropped, as a `JoinSet` is when a
+        /// request is cancelled) stops what the tool started too, not only the tool.
+        #[tokio::test]
+        async fn a_run_given_up_stops_what_it_started() {
+            let tmp = tempfile::tempdir().unwrap();
+            let bin = tmp.path().to_path_buf();
+            let child_file = bin.join("child");
+            script(
+                &bin,
+                "slow",
+                &format!("sleep 30 & echo $! > '{}'; wait", child_file.display()),
+            );
+            let mut path = bin.as_os_str().to_owned();
+            path.push(":/usr/bin:/bin");
+            let tools = Tools::with_path(path);
+            let program = bin.join("slow");
+            let run =
+                tokio::spawn(
+                    async move { tools.run(&program, &[], Duration::from_secs(60)).await },
+                );
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let child = loop {
+                let read = std::fs::read_to_string(&child_file).unwrap_or_default();
+                if let Ok(pid) = read.trim().parse::<i32>() {
+                    break pid;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the tool never started its child"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            run.abort();
+            assert!(run.await.unwrap_err().is_cancelled());
+            assert!(
+                gone(child) || !cfg!(target_os = "linux"),
+                "the sleep it started still runs after the run was given up"
+            );
+        }
+
         #[tokio::test]
         async fn a_run_is_bounded_in_time_and_output() {
             let tmp = tempfile::tempdir().unwrap();
@@ -430,14 +545,8 @@ mod tests {
                 .trim()
                 .parse()
                 .unwrap();
-            let gone = (0..100).any(|_| {
-                std::thread::sleep(Duration::from_millis(50));
-                !Path::new(&format!("/proc/{child}")).exists()
-                    || std::fs::read_to_string(format!("/proc/{child}/stat"))
-                        .is_ok_and(|s| s.contains(") Z "))
-            });
             assert!(
-                gone || !cfg!(target_os = "linux"),
+                gone(child) || !cfg!(target_os = "linux"),
                 "the sleep it started still runs"
             );
 

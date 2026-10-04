@@ -46,7 +46,9 @@ on Unix; on Windows it is `USERPROFILE` (where Windows' own OpenSSH looks), else
   - **Stopping:** a cancel, a timeout or a dropped call stops ssh and everything it started
     (askpass, `ProxyJump` hops, `Match exec`): its process group on Unix, its **Job Object** on
     Windows (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so the OS also ends it if PitCrew dies). The
-    Job Object needs four Win32 calls; `src/job.rs` is the crate's only unsafe code.
+    Job Object needs four Win32 calls; `src/job.rs` is the crate's only unsafe code. It is public
+    (`pitcrew_remote::job`, Windows only) so the daemon's machine check ends a timed-out version
+    command and what it started (`claude.cmd`'s `node.exe`) the same way.
   - **Errors:** ssh's own messages go to a log (`-E`, at `LogLevel=ERROR`) apart from the remote
     stderr. Exit 255 is an error only when that log shows ssh failing, and its kind comes only
     from ssh's own message formats, matched as whole lines. ssh logs server text without
