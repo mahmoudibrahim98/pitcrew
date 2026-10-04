@@ -5,9 +5,9 @@
 //! the app's resources on macOS), or the one `settings.json` names for development:
 //!
 //! ```text
-//! helpers/pitcrewd-x86_64-unknown-linux-musl     one per platform, named as
-//! helpers/pitcrewd-aarch64-unknown-linux-musl    `pitcrew_remote::Platform::artefact`
-//! helpers/pitcrewd-universal-apple-darwin
+//! helpers/pitcrewd-x86_64-unknown-linux-musl.xz  non-native platforms, named as
+//! helpers/pitcrewd-aarch64-unknown-linux-musl.xz `pitcrew_remote::Platform::artefact`
+//! helpers/pitcrewd-universal-apple-darwin.xz
 //! helpers/manifest.json    { "version": "0.4.0", "sha256": { "pitcrewd-x86_64-unknown-linux-musl": "…", … } }
 //! ```
 //!
@@ -21,8 +21,10 @@
 //! (and a `manifest.json` read) must belong to root or the person and be writable by no one
 //! else, as for `pitcrewd` ([`crate::daemon::locate`]).
 
+mod cache;
+
 use crate::daemon::locate::{self, LocateError};
-use pitcrew_remote::helper::{MAX_HELPER_SIZE, validate_version};
+use pitcrew_remote::helper::validate_version;
 use pitcrew_remote::{Helper, HelperError, Platform};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -60,6 +62,7 @@ pub struct Manifest {
 pub struct Helpers {
     dirs: Vec<PathBuf>,
     compiled: Option<&'static str>,
+    native: Option<PathBuf>,
     /// Whether `manifest.json` may stand in for compiled checksums (debug builds only).
     file_manifest: bool,
 }
@@ -86,6 +89,13 @@ impl Helpers {
         Self::with(dirs, COMPILED, cfg!(debug_assertions))
     }
 
+    /// Installed helpers may share the native daemon beside the desktop.
+    #[must_use]
+    pub fn with_native(mut self, beside: Option<&Path>) -> Self {
+        self.native = beside.map(|dir| dir.join(locate::PITCREWD));
+        self
+    }
+
     /// The helpers in `dir`, with its `manifest.json` (tests; a release build still refuses it).
     #[must_use]
     pub fn in_dir(dir: PathBuf) -> Self {
@@ -96,6 +106,7 @@ impl Helpers {
         Self {
             dirs,
             compiled,
+            native: None,
             file_manifest,
         }
     }
@@ -133,7 +144,17 @@ impl Helpers {
         let sha256 = manifest.sha256.get(artefact).ok_or_else(|| {
             format!("PitCrew has no helper for {platform}: the manifest lists no {artefact}")
         })?;
-        let path = dir.join(artefact);
+        let raw = dir.join(artefact);
+        let compressed = dir.join(format!("{artefact}.xz"));
+        let path = if matches_native(platform) && self.native.is_some() {
+            self.native
+                .clone()
+                .ok_or_else(|| "missing native daemon".to_owned())?
+        } else if compressed.exists() {
+            compressed
+        } else {
+            raw
+        };
         if !path.is_file() {
             return Err(format!(
                 "PitCrew has no helper for {platform}: {} is missing",
@@ -155,17 +176,17 @@ impl Helpers {
     /// # Errors
     /// The file cannot be read, is too large, or does not hash to the manifest's sha256.
     pub fn load(found: &HelperRef) -> Result<Helper, HelperError> {
-        let file = std::fs::File::open(&found.path).map_err(|e| {
-            HelperError::InvalidArgument(format!("cannot read {}: {e}", found.path.display()))
-        })?;
-        let mut bytes = Vec::new();
-        file.take(u64::try_from(MAX_HELPER_SIZE).unwrap_or(u64::MAX) + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|e| {
-                HelperError::InvalidArgument(format!("cannot read {}: {e}", found.path.display()))
-            })?;
-        Helper::new(found.platform, &found.version, &found.sha256, bytes)
+        if found.path.extension().is_some_and(|ext| ext == "xz") {
+            cache::load(found)
+        } else {
+            cache::read_verified(found, &found.path)
+        }
     }
+}
+
+fn matches_native(platform: Platform) -> bool {
+    (cfg!(all(target_os = "linux", target_arch = "x86_64")) && platform == Platform::LinuxX86_64)
+        || (cfg!(target_os = "macos") && platform == Platform::MacOs)
 }
 
 /// Reads `manifest.json`, after the same checks as a helper.
@@ -327,6 +348,82 @@ mod tests {
             .find(Platform::LinuxX86_64)
             .unwrap_err();
         assert!(e.contains("written by other users"), "{e}");
+    }
+
+    #[test]
+    fn installed_compressed_resources_are_found_for_every_remote_platform() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("helpers");
+        std::fs::create_dir(&dir).unwrap();
+        private(&dir);
+        let bytes = b"synthetic executable";
+        let mut sums = BTreeMap::new();
+        for platform in Platform::ALL {
+            let path = dir.join(format!("{}.xz", platform.artefact()));
+            let mut encoder = xz2::write::XzEncoder::new(std::fs::File::create(path).unwrap(), 6);
+            std::io::Write::write_all(&mut encoder, bytes).unwrap();
+            encoder.finish().unwrap();
+            // A previous installer may have left its uncompressed resource behind.
+            std::fs::write(dir.join(platform.artefact()), b"stale helper").unwrap();
+            sums.insert(platform.artefact(), hex_sha256(bytes));
+        }
+        let compiled = Box::leak(
+            serde_json::json!({"version":"1.2.3", "sha256":sums})
+                .to_string()
+                .into_boxed_str(),
+        );
+        let helpers = Helpers::with(vec![dir], Some(compiled), false);
+        for platform in Platform::ALL {
+            let found = helpers.find(platform).unwrap();
+            assert_eq!(found.path.extension().unwrap(), "xz");
+            assert_eq!(found.sha256, hex_sha256(bytes));
+        }
+    }
+
+    #[cfg(any(all(target_os = "linux", target_arch = "x86_64"), target_os = "macos"))]
+    #[test]
+    fn installed_native_daemon_is_shared_and_upgrade_uses_new_compiled_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("helpers");
+        std::fs::create_dir(&dir).unwrap();
+        private(&dir);
+        private(tmp.path());
+        let platform = if cfg!(target_os = "macos") {
+            Platform::MacOs
+        } else {
+            Platform::LinuxX86_64
+        };
+        let path = tmp.path().join(locate::PITCREWD);
+        std::fs::write(
+            dir.join(platform.artefact()),
+            b"stale helper from old installer",
+        )
+        .unwrap();
+        std::fs::write(&path, b"version one").unwrap();
+        let manifest = |version, bytes: &[u8]| -> &'static str {
+            Box::leak(serde_json::json!({"version":version, "sha256":{platform.artefact():hex_sha256(bytes)}})
+                .to_string().into_boxed_str())
+        };
+        let old = Helpers::with(
+            vec![dir.clone()],
+            Some(manifest("1.2.3", b"version one")),
+            false,
+        )
+        .with_native(Some(tmp.path()));
+        let found = old.find(platform).unwrap();
+        assert_eq!(found.path, path);
+        assert_eq!(Helpers::load(&found).unwrap().bytes(), b"version one");
+        std::fs::write(&path, b"version two").unwrap();
+        assert!(matches!(
+            Helpers::load(&found),
+            Err(HelperError::LocalHashMismatch)
+        ));
+        let new = Helpers::with(vec![dir], Some(manifest("1.2.4", b"version two")), false)
+            .with_native(Some(tmp.path()));
+        assert_eq!(
+            Helpers::load(&new.find(platform).unwrap()).unwrap().bytes(),
+            b"version two"
+        );
     }
 
     #[test]

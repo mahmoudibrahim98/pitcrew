@@ -320,6 +320,96 @@ async fn an_upstream_close_never_moves_work_in_progress_it_asks() {
     ));
 }
 
+/// What a sync writes reaches activity and `/v1/stream` only through the hub's shared visibility
+/// check, as `serve.rs` mounts it (`pitcrew_api::visibility` over `crate::visibility`). None of it
+/// names a session, so excluding every session (`/v1/import`, mode `none`) hides none of it, while
+/// the demo sessions' own events are hidden by the same check.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn what_a_sync_writes_passes_the_shared_visibility_check() {
+    use pitcrew_protocol::events::EventBody;
+    use pitcrew_protocol::import::{ImportFilter, ImportMode};
+
+    let hub = hub();
+    let added = hub.integrations.add(&sam(), github()).await.unwrap();
+    link(
+        &hub.work,
+        SEED_RUNS,
+        vec![github_ref("example-org/demo-repo#milestone:1")],
+    );
+    hub.integrations.sync_one(added.id).await;
+    let task = mirrored(&hub.work, "example-org/demo-repo#1").unwrap();
+    // A conflict ask as well: the person starts on the task, then upstream closes it.
+    hub.work
+        .move_task(
+            &sam(),
+            &pitcrew_hub_work::TaskRef::Id(task.id),
+            TaskStatus::InProgress,
+        )
+        .unwrap();
+    let sync_member = lock(&hub.integrations.saved).sync_member.unwrap();
+    let commands = hub.work.sync_commands(sync_member).unwrap();
+    let mut applier = Applier::new(commands, ExternalSystem::Github).unwrap();
+    let closed = pitcrew_sync_github::UpstreamChange::IssueClosed {
+        source: task.source.clone().unwrap(),
+        at: pitcrew_sync_github::GithubTimestamp::new("2026-01-03T00:00:00Z"),
+        reason: pitcrew_sync_github::CloseReason::Completed,
+    };
+    apply::apply_github(&mut applier, std::slice::from_ref(&closed));
+    assert_eq!(applier.finish().counts.conflicts, 1);
+
+    let visibility = pitcrew_api::visibility::Visibility(Some(Arc::new(
+        crate::visibility::WorkVisibility(Arc::clone(&hub.work)),
+    )));
+    hub.work
+        .commit_import(ImportFilter {
+            mode: ImportMode::None,
+            ..ImportFilter::default()
+        })
+        .unwrap();
+    let person = Some(SAM.parse().unwrap());
+    let events = hub.work.store().since(0, 100_000).unwrap();
+    let mut kinds = HashSet::new();
+    for stored in &events {
+        let event = &stored.event;
+        let from_sync = event.author == sync_member
+            || matches!(event.body, EventBody::WorkstreamLinked { .. })
+            || matches!(&event.body, EventBody::MemberAdded { member } if member.id == sync_member);
+        if !from_sync {
+            continue;
+        }
+        let kind = serde_json::to_value(&event.body).unwrap()["type"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            visibility.visible(event, None).unwrap(),
+            "activity hides the sync's {kind}"
+        );
+        assert!(
+            visibility.visible(event, person).unwrap(),
+            "the stream hides the sync's {kind}"
+        );
+        kinds.insert(kind);
+    }
+    for kind in [
+        "member_added",
+        "workstream_linked",
+        "task_created",
+        "comment_posted",
+        "ask_raised",
+    ] {
+        assert!(kinds.contains(kind), "no {kind} in {kinds:?}");
+    }
+    // The same check hides the excluded sessions' events: it is live, not passing everything.
+    let hidden = events
+        .iter()
+        .filter(|e| !matches!(e.event.body, EventBody::CursorMoved { .. }))
+        .filter(|e| !visibility.visible(&e.event, person).unwrap())
+        .count();
+    assert!(hidden > 0, "no session event was hidden");
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_closed_milestone_ships_its_workstream_only_when_seen_closing() {

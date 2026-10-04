@@ -67,6 +67,13 @@ impl Transcripts {
         before: Option<u64>,
         limit: usize,
     ) -> Result<TranscriptPage, ErrorResponse> {
+        if !self
+            .work
+            .session_included(&session)
+            .map_err(|e| ErrorResponse::new(e.code(), "Could not read session inclusion."))?
+        {
+            return Err(not_found(&session));
+        }
         let found = match self.work.session(&session) {
             Ok(found) => found,
             Err(e) if e.code() == ErrorCode::NotFound => {

@@ -235,6 +235,8 @@ function fakeHub(options: FakeHubOptions = {}) {
       label: 'a test hub',
       request: (method, path) => {
         sent.push(`${method} ${path}`);
+        if (path === '/v1/import/dry-run') return Promise.resolve({ status: 200, body: '{"count":6}' });
+        if (path === '/v1/import') return Promise.resolve({ status: 200, body: '{"imported":6}' });
         return Promise.resolve(options.scan ?? SCANNED);
       },
       openSocket: () => {
@@ -302,8 +304,8 @@ describe('the scan, from the hub', () => {
     const api = createHubOnboardingApi({ setUp: () => Promise.reject(new Error('unused')), data: fakeHub().data });
     expect(api.unavailable.has('streamScan')).toBe(false);
     expect(api.unavailable.has('createFromScan')).toBe(false);
-    expect(stepsFor(api).map((s) => s.id)).toEqual(['welcome', 'workspace', 'scan', 'create', 'done']);
-    for (const call of ['checkMachine', 'importSessions', 'hooksDiff', 'saveSafety'] as const) {
+    expect(stepsFor(api).map((s) => s.id)).toEqual(['welcome', 'workspace', 'scan', 'create', 'import', 'done']);
+    for (const call of ['checkMachine', 'hooksDiff', 'saveSafety'] as const) {
       expect(api.unavailable.has(call)).toBe(true);
     }
   });
@@ -455,6 +457,7 @@ describe('the real first run, with the scan', () => {
       'Workspace',
       'Scan',
       'Create',
+      'Import',
       'Done',
     ]);
     fireEvent.click(screen.getByRole('button', { name: 'Get started' }));
@@ -472,6 +475,8 @@ describe('the real first run, with the scan', () => {
     fireEvent.click(screen.getByRole('checkbox', { name: 'Include revision-2' }));
     fireEvent.click(screen.getByRole('button', { name: 'Create' }));
 
+    await screen.findByText('This will import 6 sessions.');
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
     await screen.findByRole('heading', { level: 1, name: "You're set up" });
     expect(screen.getByText('Created 2 projects.')).toBeTruthy();
     expect(hub.projects.map((p) => [p.key, p.name])).toEqual([
@@ -479,7 +484,7 @@ describe('the real first run, with the scan', () => {
       ['TOO', 'tools'],
     ]);
     expect(hub.workstreams.map((w) => w.name)).toEqual(['drafts']);
-    expect(hub.sent).toEqual([`POST /v1/machines/${LAPTOP}/scan`]);
+    expect(hub.sent).toEqual([`POST /v1/machines/${LAPTOP}/scan`, "POST /v1/import/dry-run", "PUT /v1/import"]);
   });
 
   it('says why a scan failed, and tries again on request', async () => {

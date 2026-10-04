@@ -44,6 +44,7 @@ mod setup;
 mod state;
 mod terminals;
 mod transcripts;
+mod visibility;
 
 use clap::{CommandFactory as _, Parser as _};
 use cli::{Cli, Command, TokenCommand};

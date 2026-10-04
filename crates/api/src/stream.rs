@@ -25,8 +25,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Router};
 use pitcrew_auth::{ErrorResponse, Person, WS_PROTOCOL};
+use pitcrew_protocol::MemberId;
 use pitcrew_protocol::api::{ErrorCode, StreamFrame};
-use pitcrew_protocol::{MemberId, events::EventBody};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -87,15 +87,29 @@ pub enum StreamEnd {
 
 /// The routes of the delta stream. Mount them as **device** routes (`RouterParts::device`).
 pub fn routes(source: Arc<dyn EventSource>, config: StreamConfig) -> Router {
+    routes_with_visibility(source, config, crate::visibility::Visibility::default())
+}
+
+/// Stream delivery with hub inclusion rules; source revisions remain unchanged.
+pub fn routes_with_visibility(
+    source: Arc<dyn EventSource>,
+    config: StreamConfig,
+    visibility: crate::visibility::Visibility,
+) -> Router {
     Router::new()
         .route("/v1/stream", get(stream))
-        .with_state(StreamState { source, config })
+        .with_state(StreamState {
+            source,
+            config,
+            visibility,
+        })
 }
 
 #[derive(Clone, Debug)]
 struct StreamState {
     source: Arc<dyn EventSource>,
     config: StreamConfig,
+    visibility: crate::visibility::Visibility,
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,7 +154,14 @@ async fn session(
     person: MemberId,
 ) {
     let (frames, mut queue) = mpsc::channel(state.config.queue_frames.max(1));
-    let pump = pump_for_person(state.source, since, state.config, frames, Some(person));
+    let pump = pump_visible(
+        state.source,
+        since,
+        state.config,
+        frames,
+        Some(person),
+        state.visibility,
+    );
     tokio::pin!(pump);
     let hub_down = HubShutdown::wait(&mut shutdown);
     tokio::pin!(hub_down);
@@ -210,6 +231,17 @@ async fn pump_for_person(
     out: mpsc::Sender<StreamFrame>,
     person: Option<MemberId>,
 ) -> StreamEnd {
+    pump_visible(source, since, config, out, person, Default::default()).await
+}
+
+async fn pump_visible(
+    source: Arc<dyn EventSource>,
+    since: Option<u64>,
+    config: StreamConfig,
+    out: mpsc::Sender<StreamFrame>,
+    person: Option<MemberId>,
+    visibility: crate::visibility::Visibility,
+) -> StreamEnd {
     // Subscribe first: anything appended after this point is announced.
     let mut revs = source.subscribe();
     let rev = match read(&source, |s| s.latest_rev()).await {
@@ -218,6 +250,7 @@ async fn pump_for_person(
     };
     let closed = out.clone();
     let mut pump = Pump {
+        visibility,
         person,
         log: source.log_id(),
         source,
@@ -288,6 +321,7 @@ async fn pump_for_person(
 }
 
 struct Pump {
+    visibility: crate::visibility::Visibility,
     person: Option<MemberId>,
     source: Arc<dyn EventSource>,
     log: String,
@@ -329,18 +363,28 @@ impl Pump {
     async fn send_up_to(&mut self, target: u64) -> Result<(), StreamEnd> {
         while self.last_sent < target {
             let (after, page) = (self.last_sent, self.config.page);
-            let batch = read(&self.source, move |s| s.since(after, page)).await?;
+            let visibility = self.visibility.clone();
+            let person = self.person;
+            let batch = read(&self.source, move |s| {
+                s.since(after, page)?
+                    .into_iter()
+                    .map(|stored| {
+                        visibility
+                            .visible(&stored.event, person)
+                            .map(|visible| (stored, visible))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .await?;
             let (Some(_first), Some(last)) = (batch.first(), batch.last()) else {
                 // The source announced revisions it does not have; try again on the next one.
                 tracing::warn!(after, target, "event source returned nothing to send");
                 break;
             };
-            let to_rev = last.rev;
+            let to_rev = last.0.rev;
             let mut visible = Vec::new();
-            for stored in batch {
-                if matches!(stored.event.body, EventBody::CursorMoved { .. })
-                    && self.person != Some(stored.event.author)
-                {
+            for (stored, visible_to_person) in batch {
+                if !visible_to_person {
                     self.send_visible(&mut visible).await?;
                 } else {
                     visible.push(stored);
@@ -405,6 +449,71 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn excluded_session_replay_and_live_skip_hidden_pages_then_continue() {
+        let excluded = pitcrew_protocol::ids::SessionId::new();
+        let source = Arc::new(MemorySource::new("included", 16));
+        let mut input = events(8);
+        for event in &mut input[1..7] {
+            event.body = EventBody::SessionEnded { session: excluded };
+        }
+        source.append(input);
+        let (tx, mut rx) = mpsc::channel(32);
+        let task = tokio::spawn(pump_visible(
+            source.clone(),
+            Some(0),
+            quick(),
+            tx,
+            None,
+            crate::visibility::Visibility(Some(Arc::new(crate::visibility::ExcludeSession(
+                excluded,
+            )))),
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(StreamFrame::Hello { rev: 8, .. })
+        ));
+        let mut seen = Vec::new();
+        while seen.last() != Some(&8) {
+            if let StreamFrame::Events {
+                from_rev,
+                to_rev,
+                events,
+            } = timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                assert_eq!(events.len() as u64, to_rev - from_rev + 1);
+                seen.extend(from_rev..=to_rev);
+            }
+        }
+        assert_eq!(seen, vec![1, 8]);
+        let mut hidden = events(6);
+        for event in &mut hidden {
+            event.body = EventBody::SessionEnded { session: excluded };
+        }
+        source.append(hidden);
+        // A later visible event proves the pump advanced past the hidden live batch.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        source.append(events(1));
+        loop {
+            if let StreamFrame::Events {
+                from_rev,
+                to_rev,
+                events,
+            } = timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                assert_eq!((from_rev, to_rev, events.len()), (15, 15, 1));
+                break;
+            }
+        }
+        task.abort();
     }
 
     #[tokio::test]

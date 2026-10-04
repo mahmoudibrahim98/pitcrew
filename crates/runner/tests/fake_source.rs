@@ -207,18 +207,24 @@ fn forced_polling_sees_appends() {
     let runner = pitcrew_runner::start(cfg, vec![source.clone()], sink.clone()).unwrap();
     sink.wait_for(2, Duration::from_secs(5)).expect("discovery");
 
-    // Let the poll interval back off to its maximum, then append.
-    std::thread::sleep(Duration::from_secs(1));
+    // Discovery's last event can arrive before its EOF read. Append only once caught up,
+    // so discovery cannot satisfy the polling check.
+    assert!(eventually(Duration::from_secs(5), || source
+        .finished_reads
+        .lock()
+        .unwrap()
+        .contains(&1)));
     source.set_items(vec![turn(0), turn(1)]);
-    let wrote = Instant::now();
     append(&path, b"x");
-    let got = sink
-        .wait_for(3, Duration::from_secs(2))
+    // Allow scheduling and index writes on loaded runners, but stay far below the 600 s
+    // missed-notification sweep. Polling disabled must still time out.
+    sink.wait_for(3, Duration::from_secs(5))
         .expect("polled change");
     runner.stop();
-    let latency = got.duration_since(wrote);
-    println!("polling: write-to-event latency {latency:?}");
-    assert!(latency < Duration::from_millis(600), "{latency:?}");
+    assert_eq!(
+        labels(&sink.events()),
+        ["discovered:Idle", "turn@0", "turn@1"]
+    );
 }
 
 #[test]

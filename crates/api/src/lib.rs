@@ -32,6 +32,7 @@ pub mod source;
 pub mod stream;
 pub mod terminal;
 mod util;
+pub mod visibility;
 
 pub use activity::{Activity, EventRefs, RefFilter};
 pub use hooks::{HookEvent, HookIntake, HookSink, LogHookSink};

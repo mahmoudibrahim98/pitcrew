@@ -211,11 +211,14 @@ try {
     ).trim();
     env.PITCREW_CONFORMANCE_EXPECTED = join(root, 'tests/conformance/daemon-deviations.json');
   }
-  // The integrations' file runs after the others: its syncs append events, which the main suite's
-  // exact-revision checks must not see. The outward writes' file runs last, on its own: it
-  // connects the same repository the integrations' file does.
+  // The main suite first, then one phase per file that changes the hub for every view:
+  // import.test.mjs commits session inclusion (and restores it), and integrations.test.mjs syncs,
+  // appending events that the main suite's exact-revision checks must not see. writes.test.mjs
+  // runs last, on its own: it connects the same repository integrations.test.mjs does. Every phase
+  // runs; the first failure decides the exit code.
   for (const files of [
     ['tests/conformance/api.test.mjs', 'tests/conformance/scan.test.mjs', 'tests/conformance/files.test.mjs'],
+    ['tests/conformance/import.test.mjs'],
     ['tests/conformance/integrations.test.mjs'],
     ['tests/conformance/writes.test.mjs'],
   ]) {
@@ -226,11 +229,7 @@ try {
     });
     const [code] = await once(suite, 'exit');
     suite = undefined;
-    if (code !== 0) {
-      process.exitCode = code ?? 1;
-      break;
-    }
-    process.exitCode = 0;
+    process.exitCode = process.exitCode || (code ?? 1);
   }
 } finally {
   await cleanup();

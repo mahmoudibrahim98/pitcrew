@@ -277,7 +277,8 @@ fn open_with(
         WorkService::new(Arc::clone(&store), workspace)
             .with_setup_listener(Arc::new(signal))
             .with_dispatcher(Arc::new(RunnerLink::new(Arc::clone(&attached))))
-            .with_recap_file(state.root().join(RECAP_FILE)),
+            .with_recap_file(state.root().join(RECAP_FILE))
+            .with_import_file(state.root().join("import.json"))?,
     );
     let session_env = Arc::new(AgentEnv::new(
         &work,
@@ -573,14 +574,22 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
     // The recap index (`GET /v1/recaps/blocks` and `/days`), kept current on every query.
     let index: Arc<WorkService> = Arc::clone(&work);
     let recaps: Arc<dyn RecapSource> = Arc::new(WorkRecaps(index));
+    let visibility: Arc<dyn pitcrew_api::visibility::EventVisibility> =
+        Arc::new(crate::visibility::WorkVisibility(Arc::clone(&work)));
     let parts = RouterParts::new()
         .agent(pitcrew_api::hooks::routes(hooks))
         .agent(pitcrew_hub_work::agent_routes().layer(Extension(Arc::clone(&work))))
-        .device(pitcrew_api::stream::routes(
+        .device(pitcrew_api::stream::routes_with_visibility(
             Arc::clone(&events),
             StreamConfig::default(),
+            pitcrew_api::visibility::Visibility(Some(Arc::clone(&visibility))),
         ))
-        .device(Activity::new(events).with_refs(refs).routes())
+        .device(
+            Activity::new(events)
+                .with_refs(refs)
+                .with_visibility(visibility)
+                .routes(),
+        )
         .device(Recaps::new(recaps).routes())
         .device(crate::scan::routes(Arc::clone(&work), homes.as_deref()))
         .device(crate::files::routes(Arc::clone(&work), state.root()))
