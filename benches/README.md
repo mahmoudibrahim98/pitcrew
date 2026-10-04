@@ -531,7 +531,7 @@ identity, size, mtime and ctime, with SQLite side files forcing full discovery. 
 new-file events, overflow, watcher errors, failed watches and network polling retain full work.
 All transcripts still get their scheduled size/mtime/identity checks, including deletion checks.
 
-The daemon's 100 ms notification debounce is rounded to a 175 ms grid, adding less than 175 ms;
+Before `36e1aa3`, the daemon's 100 ms notification debounce was rounded to a 175 ms grid, adding less than 175 ms;
 source reads are therefore due within 275 ms. Polling and hook reports are not rounded. Adjacent
 completed reads of different sessions can share one sink acceptance and one atomic cursor
 transaction, bounded to four batches and the existing event limit. Partial/backfill batches
@@ -600,3 +600,36 @@ after **102.53 ms**, and kept peak/steady RSS at **39.96 / 39.12 MiB**. It produ
 The merged loaded hook-to-frame run measured **79.17 ms p50**, 79.72 ms p95, 80.84 ms p99 and
 81.47 ms maximum across 200 probes. It wrote 1,099 source lines and again verified every live
 cursor at EOF; the 300 ms budget remains met.
+
+
+#### After the 10 ms notification cap, 2026-10-04 (`36e1aa3`)
+
+Fast-forwarded to `36e1aa3` and rebuilt the benchmark binaries. Repeated both full commands:
+
+```bash
+benches/more.sh cpu --keep-cache
+benches/more.sh cpu --cpu-history --keep-cache
+```
+
+Notification rounding is now capped at 10 ms, even though the daemon requests 175 ms. The
+following values supersede the uncapped merged CPU results above for the current implementation.
+
+| Workload | Original control `6b18a6a` | Uncapped merged `e0cf493` | 10 ms cap `36e1aa3` | Latest ticks / wall |
+|---|---:|---:|---:|---:|
+| Static, 50 files | 0.01% | 0.01% | 0.01% | 1 / 180.06 s |
+| Growing, 50 files | 0.55% | 0.36% | 0.46% | 82 / 180.05 s |
+| Static, 10k history | 0.38% | 0.10% | 0.11% | 20 / 180.07 s |
+| Growing, 10k history | 1.17% | 0.48% | **0.61% (OVER)** | 109 / 180.06 s |
+
+Growing 10k CPU is **0.61% of one core**, **0.11 percentage points above the 0.5% budget**. The budget is not met. The original 0.48% merged result used the
+uncapped notification grid. As requested, measurement work stopped here without changing
+scheduling or making another runtime optimization.
+
+Each static/growing window lasted 180 seconds. Both commands exited 0 (the CPU stage records
+measurements; it does not fail its process on a budget miss). Each writer produced 1,897 lines
+and all fifty persisted cursors reached their new file ends. The 10k history retained the same
+1.50 GiB / 1,345,483-record mix, including the 50 live files. AMD EPYC 9V74 cloud environment
+class, four available threads, 33 GiB RAM, Rust 1.99 and the shipped `opt-level = "z"` profile.
+Page cache was retained, with no concurrent builds, tests or profiler during the windows.
+No baseline was extended. The earlier scan/RSS/hook and test results above predate `36e1aa3`
+and were not repeated in this CPU-only follow-up.
