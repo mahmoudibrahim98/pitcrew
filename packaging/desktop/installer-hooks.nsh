@@ -46,6 +46,10 @@
 
 !macro NSIS_HOOK_PREINSTALL
   !insertmacro PITCREW_MOVE_ASIDE_ALL
+  ; Previous installers stored these resources without compression. They are never run here.
+  Delete "$INSTDIR\helpers\pitcrewd-x86_64-unknown-linux-musl"
+  Delete "$INSTDIR\helpers\pitcrewd-aarch64-unknown-linux-musl"
+  Delete "$INSTDIR\helpers\pitcrewd-universal-apple-darwin"
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
