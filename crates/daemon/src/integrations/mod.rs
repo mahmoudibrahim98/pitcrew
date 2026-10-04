@@ -334,7 +334,8 @@ impl Integrations {
         }) {
             return Err(Refusal::new(
                 ErrorCode::Conflict,
-                "Another integration already syncs one of these repositories or projects.",
+                "Another integration already syncs one of these repositories or projects, on this \
+                 host or another: links and tasks name a repository or project without its host.",
             ));
         }
         let work = self.work()?;

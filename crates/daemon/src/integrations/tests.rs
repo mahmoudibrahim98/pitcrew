@@ -567,6 +567,34 @@ async fn connections_are_checked_and_never_overlap() {
             .code,
         ErrorCode::Conflict
     );
+    // The same repository on an Enterprise server, or a Jira project on two sites: links and
+    // task sources name no host, so one would move the other's tasks.
+    let mut enterprise = github();
+    enterprise.settings = IntegrationSettings::Github {
+        repos: vec!["Example-Org/Demo-Repo".into()],
+        api_base: Some("https://ghe.example.com/api/v3".into()),
+    };
+    assert_eq!(
+        hub.integrations
+            .add(&sam(), enterprise)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
+    hub.integrations.add(&sam(), jira()).await.unwrap();
+    let mut other_site = jira();
+    if let IntegrationSettings::Jira { site, .. } = &mut other_site.settings {
+        *site = "https://jira-b.example.com".into();
+    }
+    assert_eq!(
+        hub.integrations
+            .add(&sam(), other_site)
+            .await
+            .unwrap_err()
+            .code,
+        ErrorCode::Conflict
+    );
     // A gh_cli connection keeps no secret.
     assert_eq!(
         hub.integrations
@@ -601,7 +629,7 @@ async fn connections_are_checked_and_never_overlap() {
         GhCli::with_path(std::ffi::OsString::new()),
     )
     .unwrap();
-    assert_eq!(reopened.list().await.unwrap().len(), 1);
+    assert_eq!(reopened.list().await.unwrap().len(), 2);
     let _ = TaskId::new();
 }
 
