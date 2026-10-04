@@ -219,6 +219,7 @@ pub fn remote_options(
                 .collect(),
         ),
     };
+    let helpers = helpers.with_native(beside);
     let ssh = match &settings.ssh {
         None => Ok(std::path::PathBuf::from("ssh")),
         Some(path) => locate::check_trusted(path)

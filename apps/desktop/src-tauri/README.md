@@ -491,3 +491,13 @@ that remote is removed (or its claim undone), a claim undone only while its entr
 workspace alone (`registry.rs`); and host names cleaned (`host.rs`).
 
 The OS keychain test is `#[ignore]`d: it needs an unlocked keychain (`cargo test -- --ignored`).
+
+### Compressed remote helper resources
+
+Release bundles use the decoded-hash manifest contract documented in
+[`packaging/README.md`](../../../packaging/README.md#size). Remaining helper resources have
+a `.xz` suffix. Linux x86_64 and universal macOS reuse the identical `pitcrewd` sidecar
+next to the desktop; Windows retains all three compressed remote helpers. Resource lookup
+still accepts uncompressed development inputs. Decoding uses an owner-only cache keyed by
+version, platform and decoded hash, verifies before atomic installation, and rechecks every
+cache read. Release builds never trust the adjacent manifest.

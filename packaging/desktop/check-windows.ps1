@@ -67,30 +67,41 @@ foreach ($name in @($appExe) + $sidecars) {
   }
 }
 
-# --- Helpers and their checksums
-$helpers = Join-Path $dir 'helpers'
-$installedManifest = Join-Path $helpers 'manifest.json'
-if ((Test-Path -LiteralPath $installedManifest) -and ([IO.File]::ReadAllText($installedManifest) -ceq $expected)) {
-  Ok 'helpers\manifest.json is the compiled manifest'
-} else {
-  Fail 'helpers\manifest.json is missing or differs from the compiled manifest'
+function Check-Helpers {
+  $helpers = Join-Path $dir 'helpers'
+  $installedManifest = Join-Path $helpers 'manifest.json'
+  if ((Test-Path -LiteralPath $installedManifest) -and ([IO.File]::ReadAllText($installedManifest) -ceq $expected)) {
+    Ok 'helpers\manifest.json is the compiled manifest'
+  } else {
+    Fail 'helpers\manifest.json is missing or differs from the compiled manifest'
+  }
+  $listed = @($manifestJson.sha256.PSObject.Properties | ForEach-Object { $_.Name })
+  foreach ($entry in $manifestJson.sha256.PSObject.Properties) {
+    $file = Join-Path $helpers ($entry.Name + ".xz")
+    if (-not (Test-Path -LiteralPath $file)) { Fail "helpers\$($entry.Name) is missing"; continue }
+    # Git Bash's XZ is also used for staging. Decode bytes before comparing the manifest.
+    $decoded = Join-Path $env:TEMP ('pitcrew-helper-check-' + [guid]::NewGuid().ToString('N'))
+    $env:PITCREW_CHECK_XZ = $file
+    $env:PITCREW_CHECK_DECODED = $decoded
+    & bash -c 'xz -dc -- "$PITCREW_CHECK_XZ" > "$PITCREW_CHECK_DECODED"'
+    if ($LASTEXITCODE -ne 0) { Fail "helpers\$($entry.Name) does not decode"; Remove-Item -LiteralPath $decoded -Force -ErrorAction SilentlyContinue; continue }
+    $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $decoded).Hash.ToLowerInvariant()
+    Remove-Item -LiteralPath $decoded -Force
+    Remove-Item Env:PITCREW_CHECK_XZ, Env:PITCREW_CHECK_DECODED
+    if ($hash -eq $entry.Value) { Ok "helpers\$($entry.Name) matches its sha256" } else { Fail "helpers\$($entry.Name) does not match the manifest's sha256" }
+  }
+  foreach ($file in Get-ChildItem -LiteralPath $helpers -File) {
+    if ($file.Name -ne 'manifest.json' -and $listed -notcontains ($file.Name -replace '\.xz$', '')) { Fail "helpers\$($file.Name) is not in the manifest" }
+  }
+  $latin1 = [Text.Encoding]::GetEncoding(28591)
+  if ($latin1.GetString([IO.File]::ReadAllBytes((Join-Path $dir $appExe))).Contains($expected)) {
+    Ok "the helpers' checksums are compiled into $appExe"
+  } else {
+    Fail "$appExe does not hold the manifest (built without PITCREW_HELPERS_MANIFEST?)"
+  }
+
 }
-$listed = @($manifestJson.sha256.PSObject.Properties | ForEach-Object { $_.Name })
-foreach ($entry in $manifestJson.sha256.PSObject.Properties) {
-  $file = Join-Path $helpers $entry.Name
-  if (-not (Test-Path -LiteralPath $file)) { Fail "helpers\$($entry.Name) is missing"; continue }
-  $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $file).Hash.ToLowerInvariant()
-  if ($hash -eq $entry.Value) { Ok "helpers\$($entry.Name) matches its sha256" } else { Fail "helpers\$($entry.Name) does not match the manifest's sha256" }
-}
-foreach ($file in Get-ChildItem -LiteralPath $helpers -File) {
-  if ($file.Name -ne 'manifest.json' -and $listed -notcontains $file.Name) { Fail "helpers\$($file.Name) is not in the manifest" }
-}
-$latin1 = [Text.Encoding]::GetEncoding(28591)
-if ($latin1.GetString([IO.File]::ReadAllBytes((Join-Path $dir $appExe))).Contains($expected)) {
-  Ok "the helpers' checksums are compiled into $appExe"
-} else {
-  Fail "$appExe does not hold the manifest (built without PITCREW_HELPERS_MANIFEST?)"
-}
+Check-Helpers
 
 # --- The sidecars run
 $version = $manifestJson.version
@@ -181,6 +192,7 @@ if ($ptyd.HasExited) {
   } else {
     Ok "installed again while pitcrew-ptyd ran: it kept running from $($aside[0].FullName)"
   }
+  Check-Helpers # Check the upgraded compressed resources and embedded manifest too.
   Stop-Process -Id $ptyd.Id -Force -ErrorAction SilentlyContinue
   Start-Sleep -Seconds 2
 }

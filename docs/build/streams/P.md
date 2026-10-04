@@ -32,7 +32,30 @@ PitCrew fast.
 | Desktop cold start to interactive | ≤ 1.5 s |
 | Desktop idle RAM, 3 workspaces | ≤ 300 MB |
 | Transcript open to first paint | ≤ 300 ms at any size |
-| Installer size | ≤ 25 MB |
+| Installer size (DMG, deb, RPM, NSIS) | ≤ 25 MB (decimal) |
+| AppImage size | Separate budget: measured size + 10%; exempt from 25 MB because it carries WebKitGTK and GTK |
+
+## Installer-size-2 measurement
+
+Linux lab, 2026-10-04, Rust 1.99, Tauri CLI 2.12.1, WebKitGTK 2.52.6:
+
+| Installer | Before bytes | After bytes | Change |
+|---|---:|---:|---:|
+| deb | 24,946,986 | 17,039,728 | −31.7% |
+| RPM | 16,964,365 | 13,865,913 | −18.3% |
+| AppImage | 118,077,944 | 115,927,544 | −1.8% |
+
+Both Linux package formats meet 25,000,000 bytes. AppImage's measured size plus 10%,
+rounded up to a byte, is **127,520,299 bytes (127.52 MB)**, its separate checker budget.
+WebKitGTK (96.6 MB), JavaScriptCore (32.9 MB) and ICU data (31.9 MB) dominate its raw
+payload; keeping these libraries is part of the AppImage's compatibility promise.
+
+Both comparisons build the desktop and both static musl targets from `origin/main`
+`1b3920a`, with only this brief's changes in the after build. The unavailable universal
+macOS helper uses the same fixed 13,408,512-byte Linux executable stand-in in both;
+these are **local lab measurements, not distributable installers or production sizes**.
+Production DMG, NSIS and Linux measurements are recorded by the release dry runs and
+reported in the PR. This table does not claim macOS or Windows savings.
 
 ## Acceptance
 
