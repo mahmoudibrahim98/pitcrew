@@ -2,7 +2,7 @@
 // moved (ADR-0010); importing is reversible. A dry run always runs before the real import so the
 // count on screen matches what "Continue" is about to do.
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { Engine } from '../../data/index.ts';
 import type { ImportMode } from '../api.ts';
 import { useOnboardingApi } from '../api-context.tsx';
@@ -18,26 +18,35 @@ const MODE_LABEL: Record<ImportMode, string> = {
 };
 
 export function ImportStep() {
-  const { state, patch, next, skip } = useWizard();
+  const { state, patch, next } = useWizard();
   const api = useOnboardingApi();
   const [busy, setBusy] = useState(false);
-  const requestId = useRef(0);
+  const [preview, setPreview] = useState<{ key: string; count: number }>();
+  const [error, setError] = useState<string>();
 
-  const filter = {
+  const filter = useMemo(() => ({
     mode: state.importMode,
-    ...(state.importSince === '' ? {} : { since: state.importSince }),
-    ...(state.importMode === 'filtered' && state.importEngines.length > 0 ? { engines: state.importEngines } : {}),
-  };
+    ...(state.importMode === 'filtered' && state.importSince !== '' ? { since: state.importSince } : {}),
+    ...(state.importMode === 'filtered' ? { engines: state.importEngines, folders: state.importFolders.map((f) => f.trim()).filter(Boolean) } : {}),
+  }), [state.importMode, state.importSince, state.importEngines, state.importFolders]);
   const filterKey = JSON.stringify(filter);
+  const ready = preview?.key === filterKey;
 
   useEffect(() => {
-    const id = (requestId.current += 1);
+    let live = true;
     void api.importSessions(filter).then((result) => {
-      if (requestId.current === id) patch({ importDryRun: result });
+      if (live) {
+        setPreview({ key: JSON.stringify(filter), count: result.count });
+        setError(undefined);
+      }
+    }).catch((cause: unknown) => {
+      if (live) {
+        setPreview(undefined);
+        setError(cause instanceof Error ? cause.message : String(cause));
+      }
     });
-    // `filter` is derived from wizard state each render; `filterKey` captures its identity.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [api, filterKey]);
+    return () => { live = false; };
+  }, [api, filter]);
 
   function toggleEngine(engine: Engine) {
     patch({
@@ -48,11 +57,14 @@ export function ImportStep() {
   }
 
   async function submit() {
+    if (!ready) return;
     setBusy(true);
     try {
       const result = await api.commitImport(filter);
       patch({ importResult: result });
       next();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
       setBusy(false);
     }
@@ -95,6 +107,12 @@ export function ImportStep() {
             />
           </div>
           <div className="flex flex-col gap-1">
+            <label htmlFor="import-folders" className="text-xs font-medium text-ink-2">Folders (one per line)</label>
+            <textarea id="import-folders" value={state.importFolders.join('\n')}
+              onChange={(e) => patch({ importFolders: e.target.value.split('\n') })}
+              className="rounded-sm border border-line-2 bg-card px-2 text-sm text-ink" />
+          </div>
+          <div className="flex flex-col gap-1">
             <span className="text-xs font-medium text-ink-2">Engines</span>
             <div className="flex gap-3">
               {ENGINES.map((engine) => (
@@ -113,12 +131,14 @@ export function ImportStep() {
       )}
 
       <p className="mt-3 text-sm text-ink-2" aria-live="polite">
-        {state.importDryRun === undefined
+        {!ready
           ? 'Counting…'
-          : `This will import ${state.importDryRun.count} session${state.importDryRun.count === 1 ? '' : 's'}.`}
+          : `This will import ${preview.count} session${preview.count === 1 ? '' : 's'}.`}
       </p>
 
-      <StepFooter nextLabel="Continue" onSkip={skip} skipLabel="Skip" busy={busy} />
+      <p className="mt-2 text-xs text-ink-2">Sessions stay in place. You can change this choice later. Start fresh includes only sessions started after confirmation.</p>
+      {error && <p role="alert" className="mt-2 text-sm text-ink">{error}</p>}
+      <StepFooter nextLabel="Continue" nextDisabled={!ready} busy={busy} />
     </form>
   );
 }

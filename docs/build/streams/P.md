@@ -32,7 +32,54 @@ PitCrew fast.
 | Desktop cold start to interactive | ≤ 1.5 s |
 | Desktop idle RAM, 3 workspaces | ≤ 300 MB |
 | Transcript open to first paint | ≤ 300 ms at any size |
-| Installer size | ≤ 25 MB |
+| Installer size (DMG, deb, RPM, NSIS) | ≤ 25 MB (decimal) |
+| AppImage size | ≤ 106,772,011 bytes (production measurement + 10%); exempt from 25 MB because it carries WebKitGTK and GTK |
+
+## Installer-size-2 measurement
+
+Production release dry runs, 2026-10-04: baseline `origin/main` `1b3920a`, changed
+installer code `1326791`. The final documentation/reporting commits do not change the
+installer inputs. Exact bytes and largest files are exposed by the read-only comparison
+[run 37221947114](https://github.com/mahmoudibrahim98/pitcrew/actions/runs/37221947114).
+
+| Installer | Before bytes | After bytes | Change |
+|---|---:|---:|---:|
+| Universal DMG | 35,102,960 | 24,282,548 | −30.8% |
+| deb | 27,757,708 | 19,048,126 | −31.4% |
+| RPM | 18,890,681 | 15,876,893 | −16.0% |
+| Windows NSIS | 18,132,784 | 18,504,084 | +2.0% |
+| AppImage | 99,711,480 | 97,065,464 | −2.7% |
+
+DMG, deb, RPM and NSIS all meet 25,000,000 bytes. NSIS already compresses its payload;
+precompressed resources and the decoder increase its installer size slightly. AppImage's
+production measurement plus 10%, rounded up to a byte, is **106,772,011 bytes (106.77 MB)**,
+its separate checker budget. Its biggest raw libraries remain WebKitGTK (95.2 MB),
+JavaScriptCore (32.6 MB) and ICU data (30.8 MB). The DMG's biggest remaining files are the
+universal desktop (21.7 MB) and shared daemon (20.5 MB), followed by two XZ Linux helpers
+(6.1 MB total). None of the three targeted formats remains over budget.
+
+### Local Linux lab
+
+Linux lab, 2026-10-04, Rust 1.99, Tauri CLI 2.12.1, WebKitGTK 2.52.6:
+
+| Installer | Before bytes | After bytes | Change |
+|---|---:|---:|---:|
+| deb | 24,946,986 | 17,039,982 | −31.7% |
+| RPM | 16,964,365 | 13,876,305 | −18.2% |
+| AppImage | 118,077,944 | 115,927,544 | −1.8% |
+
+Both Linux package formats meet 25,000,000 bytes. The lab AppImage's measured size plus 10%,
+rounded up to a byte, is 127,520,299 bytes; use `--appimage-budget-bytes 127520299`
+when checking these lab bundles. The default budget uses the real production measurement.
+WebKitGTK (96.6 MB), JavaScriptCore (32.9 MB) and ICU data (31.9 MB) dominate its raw
+payload; keeping these libraries is part of the AppImage's compatibility promise.
+
+Both comparisons build the desktop and both static musl targets from `origin/main`
+`1b3920a`, with only this brief's changes in the after build. The unavailable universal
+macOS helper uses the same fixed 13,408,512-byte Linux executable stand-in in both;
+these are **local lab measurements, not distributable installers or production sizes**.
+The production measurements above use real helpers on native CI runners. This lab table
+does not claim macOS or Windows savings.
 
 ## Acceptance
 

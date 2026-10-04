@@ -181,3 +181,5 @@ export const linked: import('../index.ts').EventBody = {
   },
   "type": "workstream_linked"
 };
+export const allImport: import('../index.ts').ImportFilter = { mode: 'all' };
+export const filteredImport: import('../index.ts').ImportFilter = { mode: 'filtered', since: '2026-01-01' };

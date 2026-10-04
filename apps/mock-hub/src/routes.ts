@@ -76,6 +76,7 @@ import {
 } from './validate.ts';
 
 import { files } from './files.ts';
+import { parseImport, includesSession, eventVisible, includedRecaps } from './import.ts';
 import * as integrations from './integrations.ts';
 export const MOCK_VERSION = '0.1.0-mock';
 /** `PROTOCOL_VERSION` and `PROTOCOL_MIN` in crates/protocol/src/version.rs. */
@@ -236,7 +237,11 @@ function known<T>(value: T | undefined, message: string): T {
 }
 
 const taskAt = (hub: Hub, ref: string): Task => found(hub.findTask(ref), `No task ${ref}.`);
-const sessionAt = (hub: Hub, id: string): Session => found(hub.findSession(id), `No session ${id}.`);
+const sessionAt = (hub: Hub, id: string): Session => {
+  const session = found(hub.findSession(id), `No session ${id}.`);
+  if (!includesSession(hub.importChoice, session)) throw notFound(`No session ${id}.`);
+  return session;
+};
 
 const memberRef = (hub: Hub, id: string, field: string): Member =>
   known(hub.findMember(id), `${field}: no member ${id}.`);
@@ -961,6 +966,7 @@ const listSessions: Handler = (hub, ctx) => {
   return ok(
     hub.sessions.filter(
       (s) =>
+        includesSession(hub.importChoice, s) &&
         (machine === undefined || s.machine === machine) &&
         (workstream === undefined || s.workstream === workstream) &&
         (task === undefined || s.task === task) &&
@@ -1306,7 +1312,7 @@ const listEvents: Handler = (hub, ctx) => {
   const revs: number[] = [];
   for (; rev >= floor && revs.length <= limit; rev--) {
     const event = hub.eventAt(rev);
-    if (event !== undefined && event.body.type !== 'cursor_moved' && touches(hub, event.body, filter)) {
+    if (event !== undefined && eventVisible(hub, event) && touches(hub, event.body, filter)) {
       revs.push(rev);
     }
   }
@@ -1506,6 +1512,17 @@ const ROUTES: Route[] = [
   route('POST', '/v1/tasks/:id/comments', 'agent', postComment),
   route('POST', '/v1/tasks/:id/dispatch', 'device', dispatchTask),
   // Sessions.
+  route('GET', '/v1/import', 'device', (hub) => ok(hub.importChoice)),
+  route('POST', '/v1/import/dry-run', 'device', (hub, ctx) => {
+    const filter = parseImport(ctx.body);
+    const count = hub.sessions.filter((s) => includesSession({ filter, committed_at: Date.now() }, s)).length;
+    return ok({ count });
+  }),
+  route('PUT', '/v1/import', 'device', (hub, ctx) => {
+    const filter = parseImport(ctx.body);
+    hub.importChoice = { filter, committed_at: Date.now() };
+    return ok({ imported: hub.sessions.filter((s) => includesSession(hub.importChoice, s)).length });
+  }),
   route('GET', '/v1/sessions', 'device', listSessions),
   route('GET', '/v1/sessions/:id', 'device', (hub, ctx) => ok(sessionAt(hub, ctx.param('id')))),
   route('GET', '/v1/sessions/:id/transcript', 'device', getTranscript),
@@ -1524,7 +1541,7 @@ const ROUTES: Route[] = [
   route('PUT', '/v1/briefs/:kind/:id', 'device', putBrief),
   route('GET', '/v1/events', 'device', listEvents),
   route('GET', '/v1/activity', 'device', listEvents),
-  // Recaps: from the fixture the recap engine wrote (recaps.ts).
+  // Integrations: GitHub and Jira, read-only, over the recorded fixtures (integrations.ts).
   route('GET', '/v1/integrations', 'device', (hub) => integrations.list(hub)),
   route('POST', '/v1/integrations', 'device', (hub, ctx) => integrations.add(hub, ctx.caller.memberId, ctx.body)),
   route('GET', '/v1/integrations/:id', 'device', (hub, ctx) => integrations.get(hub, ctx.param('id'))),
@@ -1532,9 +1549,9 @@ const ROUTES: Route[] = [
   route('POST', '/v1/integrations/:id/test', 'device', (hub, ctx) => integrations.test(hub, ctx.param('id'))),
   route('POST', '/v1/integrations/:id/sync', 'device', (hub, ctx) => integrations.syncNow(hub, ctx.param('id'))),
   route('PUT', '/v1/integrations/:id/credential', 'device', (hub, ctx) => integrations.setCredential(hub, ctx.param('id'), ctx.body)),
-
-  route('GET', '/v1/recaps/blocks', 'device', (hub, ctx) => ok(blocksPage(hub.recaps, ctx.query))),
-  route('GET', '/v1/recaps/days', 'device', (hub, ctx) => ok(daysPage(hub.recaps, ctx.query))),
+  // Recaps: from the fixture the recap engine wrote (recaps.ts).
+  route('GET', '/v1/recaps/blocks', 'device', (hub, ctx) => ok(blocksPage(includedRecaps(hub), ctx.query))),
+  route('GET', '/v1/recaps/days', 'device', (hub, ctx) => ok(daysPage(includedRecaps(hub), ctx.query))),
   route('POST', '/v1/hooks/:engine/:event', 'agent', receiveHook),
   route('GET', '/v1/stream', 'device', needsWebSocket),
 ];

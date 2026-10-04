@@ -6,3 +6,5 @@ creation. File limits are shared constants. `ErrorCode` adds `too_large` (413) a
 (501); ordinary errors retain their existing shape.
 
 Run `cargo test -p pitcrew-protocol --features ts` to regenerate `packages/protocol-ts` explicitly.
+
+Session import types live in `import`: inclusion rules, the durable choice, and dry-run/commit counts. Regenerate the TypeScript exports with `cargo test -p pitcrew-protocol --features ts`.

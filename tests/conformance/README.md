@@ -7,9 +7,10 @@ node tests/conformance/run.mjs mock
 node tests/conformance/run.mjs daemon
 ```
 
-Both commands run the same `api.test.mjs`, `scan.test.mjs` and `files.test.mjs`, then, once those
-have passed, `integrations.test.mjs` on its own (its syncs append events, which the main suite's
-exact-revision checks must not see). No npm dependency is needed. The
+Both commands run the same `api.test.mjs`, `scan.test.mjs` and `files.test.mjs`, then
+`import.test.mjs` on its own, then `integrations.test.mjs` on its own (its syncs append events,
+which the main suite's exact-revision checks must not see). Every phase runs, and the first failure
+decides the exit code. No npm dependency is needed. The
 daemon runner builds `pitcrewd` and `pitcrew-ptyd` with the locked workspace dependencies, starts a
 seeded demo on an OS-assigned free loopback port, and reads its two private token files without
 printing them. Each runner creates an empty temporary home and cleans up its child process and
@@ -72,6 +73,8 @@ binary writes, stale revisions and exclusive creation, bad paths, Git writes, de
 auth, file/body caps, remote refusal and outward-link refusal. The runner creates every file
 and link target inside its own temporary folder. Windows daemon conformance keeps its existing
 Unix-runtime skip; Rust daemon HTTP tests cover Files API routes there.
+
+`run.mjs` runs `import.test.mjs` serially after the shared suite, since committing inclusion affects all views of its disposable hub. Both targets check dry-run/commit agreement, each mode, filters, excluded session/activity/recap reads, restoration, validation and device-only access.
 
 `integrations.test.mjs` covers "Integrations" and "Linking a workstream upstream": every route
 refused without a token (`401`) and to an agent (`403`), unknown ids `404`, malformed connections

@@ -116,6 +116,11 @@ let started = DirectLauncher::default().start(&target).await?;   // or TmuxLaunc
   `uname -s`/`uname -m`. Anything else (FreeBSD, 32-bit ARM, POWER, …) is refused by name, and a
   helper built for another platform is refused before any call. `Helper::new` checks the
   version, the size (at most 256 MiB) and that the bytes hash to the expected sha256.
+- **Desktop bundle storage:** the desktop may reuse an identical native sidecar, or decode a
+  bundled `<artefact>.xz` into an owner-only cache. The manifest still hashes the decoded
+  executable; its compiled version and hash key the cache. `Helper::new` and the remote
+  installer receive only decoded, verified bytes and keep their size/hash/version checks.
+  See `packaging/README.md`, "Helper storage and lookup"; no remote decoder is required.
 - **Layout:** `~/.pitcrew/bin/<version>/pitcrewd`, `bin/current -> <version>` (relative),
   `bin/previous`, `run/endpoint.json`, `run/pitcrewd.sock`, `run/pitcrewd.log`. Every directory
   must be a real directory owned by the user with mode 0700 (`drwx--S---` under a set-group-ID

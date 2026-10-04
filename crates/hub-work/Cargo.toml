@@ -9,6 +9,7 @@ publish.workspace = true
 authors.workspace = true
 
 [dependencies]
+tempfile.workspace = true
 pitcrew-protocol.workspace = true
 pitcrew-store.workspace = true
 # The seed command imports a `DemoWorkspace`.

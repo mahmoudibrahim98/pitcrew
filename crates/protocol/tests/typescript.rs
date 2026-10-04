@@ -1,6 +1,8 @@
 //! Deterministic, explicit export; normal protocol tests never write bindings.
 #![cfg(feature = "ts")]
-use pitcrew_protocol::{api, events, ids, integrations, model, recap, runner, scan, transcript};
+use pitcrew_protocol::{
+    api, events, ids, import, integrations, model, recap, runner, scan, transcript,
+};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{error::Error, fmt::Debug, fs, path::Path};
 use ts_rs::{Config, TS};
@@ -170,6 +172,9 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
     scan::MonthCount::export_all(&config)?;
     scan::ScanCounts::export_all(&config)?;
     scan::ScanFrame::export_all(&config)?;
+    import::ImportChoice::export_all(&config)?;
+    import::ImportDryRun::export_all(&config)?;
+    import::ImportResult::export_all(&config)?;
     scan::ScanProgress::export_all(&config)?;
     scan::ScanReport::export_all(&config)?;
     scan::Suggestion::export_all(&config)?;
@@ -370,6 +375,11 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
             external: vec![],
         },
     )?;
+    // Request dimensions may be omitted even though Rust serializes their defaults.
+    examples.push_str(
+        "export const allImport: import('../index.ts').ImportFilter = { mode: 'all' };\n",
+    );
+    examples.push_str("export const filteredImport: import('../index.ts').ImportFilter = { mode: 'filtered', since: '2026-01-01' };\n");
     fs::write(package.join("tests/fixtures.ts"), examples)?;
     // Never delete checked-in files. A removed type needs an explicit repository change.
     write_exports(&bindings, &destination.join("bindings"))?;

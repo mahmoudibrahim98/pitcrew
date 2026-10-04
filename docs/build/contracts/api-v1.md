@@ -651,6 +651,32 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
 - **The mock** answers with a fixed synthetic report (folders under `/home/sam/`), after about a
   second of progress, by the same rules: the hub's own machine only, `409` while one runs.
 
+### Session import (device tokens only)
+
+- `POST /v1/import/dry-run` accepts `ImportFilter` and returns `{ "count": N }`.
+- `PUT /v1/import` accepts the same filter, stores it durably, and returns `{ "imported": N }`.
+- `GET /v1/import` returns `{ "filter": ImportFilter, "committed_at": <milliseconds or null> }`.
+  Settings may change the choice with the same PUT; no re-scan is required.
+- `ImportFilter` has `mode: "all" | "filtered" | "none"`, optional `since` (`YYYY-MM-DD`,
+  inclusive midnight UTC), `engines` and `folders`. In filtered mode, dimensions combine with
+  AND; engines and folders within a dimension combine with OR. Missing or empty arrays impose
+  no restriction. Folders match the exact working directory or a descendant at a separator
+  boundary (both slash spellings accepted, case preserved). Invalid dates or empty folder names
+  return 400. All/none ignore optional restrictions.
+- All includes every indexed session. None means start fresh: sessions with `started` strictly
+  after the commit time are included. Its dry run evaluates a prospective boundary at request time (normally zero). PUT counts at its commit boundary.
+  Recommitting none establishes a new boundary. Before the first commit the default is all.
+- Counts include sub-agent sessions and describe indexed sessions, not a fresh filesystem scan.
+  A dry run and commit agree if no session was indexed between the requests. Later sessions obey
+  the stored rules automatically. Excluding never deletes events or transcripts, moves or copies
+  files, or stops the runner reading them. Widening the filter restores history immediately.
+- Excluded sessions are absent from session lists and session detail/transcript/terminal reads
+  (404), activity pages, recap blocks and day paragraphs, and replay/live stream events about
+  those sessions. Non-session work remains visible. Cursor privacy still applies. Hidden event
+  revisions are skipped without renumbering the log or ending pagination early. Clients refetch
+  session lists, activity and recaps after committing a choice.
+- All three routes reject agent tokens with 403, before reading a body.
+
 ### Integrations: GitHub and Jira, read-only
 
 A person connects GitHub repositories or Jira projects to the workspace, links workstreams to

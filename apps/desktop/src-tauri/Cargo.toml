@@ -86,6 +86,8 @@ keyring = "4.2"
 pitcrew-remote = { path = "../../../crates/remote" }
 # Random plan and prompt ids. The version pitcrew-remote already uses.
 getrandom = "0.4"
+# XZ resources: bounded liblzma decoding, statically built on every OS.
+xz2 = { version = "=0.1.7", features = ["static"] }
 
 [target.'cfg(unix)'.dependencies]
 # SIGTERM to the daemon, O_NOFOLLOW for the token file, and the host name (`uname`), without

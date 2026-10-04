@@ -218,7 +218,8 @@ pub fn remote_options(
                 .flatten()
                 .map(|dir| dir.join("helpers"))
                 .collect(),
-        ),
+        )
+        .with_native(beside),
     };
     let ssh = match &settings.ssh {
         None => Ok(std::path::PathBuf::from("ssh")),

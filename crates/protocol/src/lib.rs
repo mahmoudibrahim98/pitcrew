@@ -26,6 +26,7 @@ pub mod api;
 pub mod events;
 pub mod files;
 pub mod ids;
+pub mod import;
 pub mod integrations;
 pub mod model;
 pub mod recap;

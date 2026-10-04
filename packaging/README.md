@@ -202,8 +202,9 @@ or the person, and nobody else can write them; on Windows, no `Zone.Identifier`)
 
 ### Size
 
-The budget is 25 MB per installer. The existing checker uses MiB (1,048,576 bytes); the tables
-below use decimal MB (1,000,000 bytes) so the exact byte counts remain unambiguous.
+The budget is 25 decimal MB for DMG, deb, RPM and NSIS. AppImage carries WebKitGTK/GTK
+and is exempt; its separate budget is its measured size plus 10% (see P.md). The checker
+and tables use decimal MB (1,000,000 bytes), with exact bytes in the contents report.
 `bash packaging/desktop/contents.sh dist/desktop/*` unpacks each installer without installing it
 and prints the largest twenty files, installer bytes and total payload bytes. The release
 workflow records this on Linux, macOS and Windows. DMGs are mounted read-only on macOS; NSIS
@@ -274,14 +275,51 @@ x86_64 sidecars ran their version/refusal checks. The aarch64 executables were b
 but not executed (no emulator). A desktop interactive smoke run was not available without a
 display/Xvfb, and this container's ancestor ownership also blocks private Unix sockets.
 
+**Installer-size-2 local comparison (2026-10-04).** From `origin/main` `1b3920a`,
+with real builds of both musl targets and the desktop, the same fixed Linux stand-in in the
+unavailable universal macOS helper slot, before → after: deb 24,946,986 → 17,039,982 bytes
+(−31.7%), RPM 16,964,365 → 13,876,305 (−18.2%), AppImage 118,077,944 → 115,927,544 (−1.8%).
+All installer checks pass. These lab inputs cannot be distributed as production packages.
+AppImage already deduplicates identical raw files and compresses its filesystem, so its
+saving is smaller. The lab uses `--appimage-budget-bytes 127520299` (measured size + 10%); the default
+budget uses the real production measurement below.
+**Production comparison.** Native release dry runs from `1b3920a` → installer code
+`1326791`, with real universal macOS and static musl helpers: DMG 35,102,960 → 24,282,548
+bytes (−30.8%), deb 27,757,708 → 19,048,126 (−31.4%), RPM 18,890,681 → 15,876,893 (−16.0%),
+NSIS 18,132,784 → 18,504,084 (+2.0%), AppImage 99,711,480 → 97,065,464 (−2.7%). DMG,
+deb, RPM and NSIS all meet 25 MB. NSIS already compresses its payload, so precompression
+and the added decoder slightly increase the installer despite the smaller raw resources.
+AppImage's separate production budget is 106,772,011 bytes, its measured size plus 10%.
+Exact counts and largest files are published by the native comparison run linked in P.md.
+When local policy blocks artifact/log storage, the release workflow's `measure_only` input
+compares `desktop-*` artifacts from `before_run` and `after_run` on each native OS. It
+builds and publishes nothing; exact byte counts and largest payload files are written to
+both summaries and API-readable annotations. Its only extra permission is `actions: read`
+for the cross-run artifact download.
+
+**Helper storage and lookup (installer-size-2).** The manifest continues to name decoded
+`Platform::artefact()` executables and their decoded SHA-256; its schema is unchanged.
+Linux reuses `pitcrewd` beside the desktop for the x86_64 musl entry, and macOS reuses its
+universal sidecar for the universal entry. Staging verifies byte identity before omitting
+that resource. Windows has no native remote-helper platform, so all three resources remain.
+The other entries are `helpers/<artefact>.xz` (XZ, level 6). Installed lookup prefers the native sidecar when the platform matches, then the XZ resource,
+then an uncompressed development helper. An explicit helpers override uses only that folder
+(XZ before raw); it never changes the compiled manifest trust rule. This order ignores raw
+resources left behind by a previous installer. NSIS also removes its three known legacy raw
+resources before installing the compressed replacements; its upgrade test plants synthetic
+legacy files and checks removal.
+
+Decoded resources enter an owner-only cache through an exclusively created 0600 temporary
+file (protected owner-only DACL on Windows). Decoding has a 256 MiB output limit and a
+64 MiB decoder-memory limit. The decoded executable must hash to the compiled manifest
+before an atomic rename into the cache. Cache names include platform, version and hash;
+a version upgrade cannot reuse the old entry. Every cache read is bounded and hashed again.
+Symlink/reparse-point cache entries and directories are refused, never repaired. Nothing
+from this cache executes locally; the remote installer still checks bytes, hash and version
+before its own atomic installation. Adjacent manifests remain development-only.
+
 **Proposals, not implemented:**
 
-- Compress helpers in resources, then decompress to an owner-only temporary file with exclusive
-  creation, a bounded decoded length and no symlink following. Hash the **decoded executable**
-  against the manifest compiled into the desktop before atomic installation/execution; never
-  trust a downloaded or adjacent manifest. Version upgrades must invalidate the cache. This
-  saves resource bytes but adds startup CPU, cache space and failure handling; existing installer
-  compression already captures much of the saving.
 - Fetch the Mac helper only when adding a Mac. Fetch from a version-pinned release over HTTPS;
   keep the expected decoded SHA-256 compiled into the desktop, enforce a size limit and atomic
   owner-only cache, and fail closed on hash/version errors. Downloads and their redirect domains
@@ -291,9 +329,6 @@ display/Xvfb, and this container's ancestor ownership also blocks private Unix s
   sacrifices the self-contained installation and compatibility promise and adds platform/version
   checks. Deb/RPM already make that trade-off. Dropping libraries merely because they look large
   is unsafe; WebKit's linked libraries and codec dependencies remain even without media bundling.
-- Avoid carrying an identical native daemon twice by changing resource lookup to share the trusted
-  sidecar. This requires a documented lookup/manifest contract change, cross-platform install
-  tests and upgrade behavior. Packaging-only deduplication cannot silently change those paths.
 
 ## Checksums
 
