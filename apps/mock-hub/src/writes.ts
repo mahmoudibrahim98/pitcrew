@@ -19,7 +19,6 @@ import {
   type ExternalRef,
   type Integration,
   type MemberId,
-  type Task,
   type TaskStatus,
   type UpstreamWrite,
   type WriteFields,
@@ -200,7 +199,6 @@ function propose(hub: Hub, member: MemberId, to: MemberId, write: WriteProposal,
 function planChange(
   hub: Hub,
   body: EventBody,
-  task: Task,
   integration: Integration,
   scope: string,
   seen: integrations.Item | undefined,
@@ -264,7 +262,7 @@ function plan(hub: Hub): void {
     const found = container === undefined ? undefined : integrations.integrationFor(hub, source.system, container);
     if (found === undefined) continue;
     const seen = integrations.upstreamIssue(hub, found.integration, source.key);
-    const planned = planChange(hub, body, task, found.integration, found.container, seen);
+    const planned = planChange(hub, body, found.integration, found.container, seen);
     if (planned === undefined) continue;
     const handle = hub.findMember(event.author)?.handle ?? 'someone';
     const why = body.type === 'task_moved' ? `Because ${handle} moved ${task.key} to ${body.data.to}.` : `Because ${handle} changed ${task.key} in PitCrew.`;
