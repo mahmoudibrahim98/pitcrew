@@ -672,3 +672,70 @@ async fn moving_a_task_to_another_milestones_workstream_asks_to_set_it() {
     assert_eq!(sent.len(), 1);
     assert_eq!(body(&sent[0]), serde_json::json!({"milestone": 2}));
 }
+
+/// Write events and approval asks reach activity and `/v1/stream` only through the hub's shared
+/// visibility check, as `serve.rs` mounts it. None of them names a session, so excluding every
+/// session (`/v1/import`, mode `none`) hides none of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn writes_pass_the_shared_visibility_check() {
+    use pitcrew_protocol::import::{ImportFilter, ImportMode};
+    let hub = Hub::new();
+    hub.connect(
+        github(),
+        SEED_RUNS,
+        vec![link("example-org/demo-repo#milestone:1")],
+    )
+    .await;
+    let task = hub.mirrored("example-org/demo-repo#1");
+    hub.move_task(task.id, TaskStatus::Done);
+    hub.pass().await;
+    let write = hub.writes().remove(0);
+    hub.answer(&write.proposal.ask, 0);
+    hub.pass().await;
+    assert_eq!(
+        hub.work.write(&write.proposal.ask).unwrap().state,
+        WriteState::Sent
+    );
+
+    let visibility = pitcrew_api::visibility::Visibility(Some(Arc::new(
+        crate::visibility::WorkVisibility(Arc::clone(&hub.work)),
+    )));
+    hub.work
+        .commit_import(ImportFilter {
+            mode: ImportMode::None,
+            ..ImportFilter::default()
+        })
+        .unwrap();
+    let person = Some(sam().member);
+    let mut kinds = Vec::new();
+    for stored in hub.work.store().since(0, 100_000).unwrap() {
+        let event = &stored.event;
+        let kind = match &event.body {
+            EventBody::WriteProposed { .. } => "write_proposed",
+            EventBody::WriteStarted { .. } => "write_started",
+            EventBody::WriteFinished { .. } => "write_finished",
+            EventBody::AskRaised { ask } if ask.id == write.proposal.ask => "ask_raised",
+            EventBody::AskAnswered { ask, .. } if *ask == write.proposal.ask => "ask_answered",
+            _ => continue,
+        };
+        assert!(
+            visibility.visible(event, None).unwrap(),
+            "activity hides {kind}"
+        );
+        assert!(
+            visibility.visible(event, person).unwrap(),
+            "the stream hides {kind}"
+        );
+        kinds.push(kind);
+    }
+    assert_eq!(
+        kinds,
+        vec![
+            "ask_raised",
+            "write_proposed",
+            "ask_answered",
+            "write_started",
+            "write_finished"
+        ]
+    );
+}
