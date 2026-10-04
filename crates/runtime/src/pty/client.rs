@@ -287,6 +287,8 @@ fn gone(e: &std::io::Error) -> bool {
             | std::io::ErrorKind::ConnectionReset
             | std::io::ErrorKind::ConnectionAborted
             | std::io::ErrorKind::BrokenPipe
+            // macOS can report ENOTCONN when a connected peer closes before hello is written.
+            | std::io::ErrorKind::NotConnected
     )
 }
 
@@ -544,5 +546,81 @@ async fn connect(
                 )));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::ReadBuf;
+
+    struct FailedHello {
+        kind: ErrorKind,
+        on_read: bool,
+    }
+
+    impl AsyncRead for FailedHello {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(Error::from(self.kind)))
+        }
+    }
+
+    impl AsyncWrite for FailedHello {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(if self.on_read {
+                Ok(bytes.len())
+            } else {
+                Err(Error::from(self.kind))
+            })
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn hello_disconnects_count_as_absent_on_read_and_write() -> Result<(), std::io::Error> {
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        for kind in [
+            ErrorKind::UnexpectedEof,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::NotConnected,
+            ErrorKind::PermissionDenied,
+            ErrorKind::InvalidData,
+        ] {
+            for on_read in [false, true] {
+                let result = runtime.block_on(handshake(FailedHello { kind, on_read }));
+                if matches!(kind, ErrorKind::PermissionDenied | ErrorKind::InvalidData) {
+                    assert!(
+                        matches!(result, Err(ConnectError::Failed(_))),
+                        "{kind:?}, read={on_read}"
+                    );
+                } else {
+                    assert!(
+                        matches!(result, Err(ConnectError::Absent)),
+                        "{kind:?}, read={on_read}"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
