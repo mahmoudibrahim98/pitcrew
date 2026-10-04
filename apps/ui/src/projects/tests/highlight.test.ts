@@ -172,6 +172,40 @@ describe('syntax colouring', () => {
     expect(highlightLines('let x', 'x.ts').language?.id).toBe('javascript');
   });
 
+  it('stays linear on hostile input, in every language', () => {
+    const half = HIGHLIGHT_LIMIT / 2;
+    const hostile = [
+      `a${' '.repeat(half)}`,
+      'a '.repeat(half / 2),
+      'r#"\n'.repeat(half / 4),
+      '/*'.repeat(half / 2),
+      `FROM x ${'a '.repeat(half / 2)}`,
+      '<a b="'.repeat(half / 6),
+      `x${'.'.repeat(half)}`,
+      '"\\'.repeat(half / 3),
+      `- ${'k'.repeat(half)}`,
+      '**['.repeat(half / 3),
+      '`'.repeat(half),
+      '$'.repeat(half),
+      '&'.repeat(half),
+      '@'.repeat(half),
+      '\\'.repeat(half),
+      `${'\t'.repeat(half / 2)}#`,
+      '= '.repeat(half / 2),
+    ];
+    const seen = new Set<string>();
+    for (const path of Object.keys(SAMPLES)) {
+      const language = languageFor(path);
+      if (language === undefined || seen.has(language.id)) continue;
+      seen.add(language.id);
+      for (const text of hostile) {
+        const started = performance.now();
+        expect(tokenize(text, language).map((t) => t.text).join('')).toBe(text);
+        expect(performance.now() - started, `${language.id}: ${JSON.stringify(text.slice(0, 12))}`).toBeLessThan(1_500);
+      }
+    }
+  }, 60_000);
+
   it('colours a large file in reasonable time', () => {
     const text = SAMPLES['a.ts']?.repeat(Math.floor(HIGHLIGHT_LIMIT / (SAMPLES['a.ts']?.length ?? 1))) ?? '';
     const started = performance.now();

@@ -37,6 +37,11 @@ export interface Language {
 /** Above this many characters a file shows as plain text: colouring it would hold up the page. */
 export const HIGHLIGHT_LIMIT = 200_000;
 
+// Every rule must stay linear on any input: a file is untrusted, and a rule that backtracks over
+// a long line could hold up the page (tests/highlight.test.ts feeds each language hostile input).
+// So: alternatives start differently, an unterminated construct runs to the end of the file
+// (`|$`), and a lookbehind only looks back over spaces.
+
 // ─── Pieces ─────────────────────────────────────────────────────────────────────────────────────
 
 const words = (list: string, flags = '') => new RegExp(`\\b(?:${list.trim().split(/\s+/).join('|')})\\b`, `y${flags}`);
@@ -112,7 +117,7 @@ const rust: Language = {
      ref return self Self static struct super trait type unsafe use where while`,
     'true false',
     [
-      ['string', /r(#*)"[\s\S]*?"\1/y],
+      ['string', /r(#*)"[\s\S]*?(?:"\1|$)/y],
       ['meta', /#!?\[[^\]\n]*\]?/y],
       ['string', /'(?:[^'\\\n]|\\.[^'\n]{0,8})'/y],
       ['meta', /'[A-Za-z_]\w*/y],
@@ -293,7 +298,8 @@ const toml: Language = {
     SPACE,
     ['comment', /(?<=^|\s)[#;].*/my],
     ['type', /(?<=^[ \t]*)\[\[?[^\]\n]*\]\]?/my],
-    ['attr', /(?<=^[ \t]*)[\w.\-"' ]+?(?=[ \t]*[=:])/my],
+    // A key, dotted or quoted: no part of it can also be the space before `=` (no backtracking).
+    ['attr', /(?<=^[ \t]*)(?:[\w-]+|"[^"\n]*"|'[^'\n]*')(?:[ \t]*\.[ \t]*(?:[\w-]+|"[^"\n]*"|'[^'\n]*'))*(?=[ \t]*[=:])/my],
     ['string', /"""[\s\S]*?(?:"""|$)/y],
     ['string', /'''[\s\S]*?(?:'''|$)/y],
     DOUBLE,
@@ -326,13 +332,15 @@ const markdown: Language = {
   id: 'markdown',
   label: 'Markdown',
   rules: [
-    ['string', /^(`{3,}|~{3,})[^\n]*\n[\s\S]*?(?:^\1[ \t]*$|(?![\s\S]))/my],
+    // The fence's run of marks is taken whole (`(?![`~])`), so a failed match never retries it shorter.
+    ['string', /^(`{3,}|~{3,})(?![`~])[^\n]*\n[\s\S]*?(?:^\1[ \t]*$|(?![\s\S]))/my],
     ['heading', /^#{1,6}[ \t].*/my],
     ['comment', /^[ \t]*>.*/my],
     ['meta', /^[ \t]*(?:[-*+]|\d+[.)])(?=[ \t])/my],
     ['string', /`[^`\n]+`/y],
     ['keyword', /\*\*[^*\n]+\*\*|__[^_\n]+__/y],
-    ['attr', /!?\[[^\]\n]*\]\([^)\n]*\)/y],
+    // Bounded, so a line of unclosed brackets is not scanned again from each one.
+    ['attr', /!?\[[^\]\n]{0,500}\]\([^)\n]{0,2000}\)/y],
     [null, /[^\n`*_[!#>~\-+\d]+/y],
   ],
 };
@@ -435,7 +443,7 @@ const dockerfile: Language = {
       'keyword',
       /(?<=^[ \t]*)(?:FROM|RUN|CMD|LABEL|EXPOSE|ENV|ADD|COPY|ENTRYPOINT|VOLUME|USER|WORKDIR|ARG|ONBUILD|STOPSIGNAL|HEALTHCHECK|SHELL)\b/imy,
     ],
-    ['keyword', /(?<=^[ \t]*FROM\b.*[ \t])AS\b/imy],
+    ['keyword', /\bAS\b/y],
     DOUBLE,
     SINGLE,
     ['type', /\$\{[^}\n]*\}?|\$\w+/y],
@@ -510,6 +518,9 @@ export function languageFor(path: string): Language | undefined {
 
 // ─── The tokenizer ──────────────────────────────────────────────────────────────────────────────
 
+/** What nothing matched is skipped as plain text: a whole word at once, else one character. */
+const SKIP = /[\w$]+|[\s\S]/y;
+
 function run(text: string, rules: readonly Rule[], out: Token[]): void {
   let plain = '';
   const push = (kind: TokenKind | null, value: string) => {
@@ -542,8 +553,12 @@ function run(text: string, rules: readonly Rule[], out: Token[]): void {
       at += match[0].length;
       continue next;
     }
-    plain += text[at];
-    at += 1;
+    // A whole word, so the rules are not tried again at every letter of it (which, after a rule
+    // that scanned the word and failed, would be quadratic on a long one).
+    SKIP.lastIndex = at;
+    const skipped = (SKIP.exec(text) as RegExpExecArray)[0];
+    plain += skipped;
+    at += skipped.length;
   }
   if (plain !== '') out.push({ kind: null, text: plain });
 }
