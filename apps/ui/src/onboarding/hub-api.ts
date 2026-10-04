@@ -6,7 +6,7 @@
 //   is `POST /v1/projects` and `POST /v1/workstreams` from that scan's suggestions, both through
 //   the data layer's client for the workspace in view;
 // - everything else has no backend yet: it is listed in `unavailable`, rejects if called, and
-//   `stepsFor` leaves its step out. So the real first run is Welcome, Workspace, Scan, Create, Done.
+//   `stepsFor` leaves its step out. So the real first run is Welcome, Workspace, Scan, Create, Import, Done.
 //
 // The transports (the browser's `fetch`, the desktop gateway's `gateway_request`) hand over a whole
 // body, so the scan's progress frames arrive together with its report, at its end; the scan step
@@ -23,6 +23,7 @@ import {
   type Setup,
   type SetupResult,
   type TransportResponse,
+  type Transport,
   type Workstream,
 } from '../data/index.ts';
 import {
@@ -66,6 +67,8 @@ export interface HubOnboardingOptions {
   setUp?: ((setup: Setup) => Promise<SetupResult>) | undefined;
   /** The gateway's remote commands; `null` in a browser. */
   remote?: RemoteGateway | null | undefined;
+  /** The workspace hub transport, including remote hubs; defaults to `data.transport`. */
+  transport?: Transport | undefined;
   /** The workspace's client (`useApi()`), for the scan and creating from it; without it, neither. */
   data?: HubData | undefined;
 }
@@ -154,12 +157,15 @@ interface LastScan {
 export function createHubOnboardingApi(options: HubOnboardingOptions = {}): OnboardingApi {
   const { setUp, data } = options;
   const remote = options.remote ?? null;
+  const transport = options.transport ?? data?.transport;
   const missing = new Set<OnboardingCall>(NOT_YET);
   if (setUp === undefined) missing.add('setupWorkspace');
   if (remote === null) missing.add('discoverHosts');
-  if (data === undefined) {
+  if (transport === undefined) {
     missing.add('importSessions');
     missing.add('commitImport');
+  }
+  if (data === undefined) {
     missing.add('streamScan');
     missing.add('createFromScan');
   }
@@ -311,14 +317,14 @@ export function createHubOnboardingApi(options: HubOnboardingOptions = {}): Onbo
     },
 
     async importSessions(filter) {
-      if (data === undefined) return unavailable('importSessions');
-      const res = await data.transport.request('POST', '/v1/import/dry-run', JSON.stringify(filter));
+      if (transport === undefined) return unavailable('importSessions');
+      const res = await transport.request('POST', '/v1/import/dry-run', JSON.stringify(filter));
       if (res.status !== 200) throw new Error(refusal(res));
       return JSON.parse(res.body) as { count: number };
     },
     async commitImport(filter) {
-      if (data === undefined) return unavailable('commitImport');
-      const res = await data.transport.request('PUT', '/v1/import', JSON.stringify(filter));
+      if (transport === undefined) return unavailable('commitImport');
+      const res = await transport.request('PUT', '/v1/import', JSON.stringify(filter));
       if (res.status !== 200) throw new Error(refusal(res));
       return JSON.parse(res.body) as { imported: number };
     },
