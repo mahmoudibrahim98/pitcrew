@@ -58,9 +58,10 @@ synthetic, and the demo daemon watches none.
 `machine-setup.test.mjs` covers "Machine setup" in a file of its own: the check's shape, fixed order
 and fixes (an `ok` row has none; a missing tool offers its install page; no helper row on the hub's
 own machine), one row with `?row=`, the accounts' shape and rules, a sign-in's answer, the same one
-while it runs, its terminal served (`101`) to a person and refused to an agent and not a session,
-and the refusals (no or unknown token, agent, unknown and other machines, unknown CLI, a method
-the CLI lacks, unknown body fields). On the daemon target the stand-in CLIs answer `--version` and
+while it runs, its terminal served (`101`) to a person and refused to an agent and to another
+person, and not a session, `DELETE` stopping it (`204`, then `404` and its terminal gone), and the
+refusals (no or unknown token, agent, another person's device token on every route, unknown and
+other machines, unknown CLI, a method the CLI lacks, unknown body fields). On the daemon target the stand-in CLIs answer `--version` and
 their status commands at once (not signed in), and a sign-in runs the stand-in's "login", which
 waits like a session; the check also runs the runner's own `git`, `gh` and `tmux` for their
 versions. The mock's are synthetic.

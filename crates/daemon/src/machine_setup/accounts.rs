@@ -56,6 +56,15 @@ fn status_args(engine: Engine) -> Option<&'static [&'static str]> {
     }
 }
 
+/// The status command, for people (`claude auth status`).
+pub fn status_command(engine: Engine) -> Option<String> {
+    Some(format!(
+        "{} {}",
+        program(engine)?,
+        status_args(engine)?.join(" ")
+    ))
+}
+
 /// Every engine's account, each from its own CLI, all at once.
 pub async fn accounts(tools: &Tools) -> Vec<AgentAccount> {
     let mut tasks = tokio::task::JoinSet::new();
@@ -90,7 +99,7 @@ pub async fn account(tools: &Tools, engine: Engine) -> AgentAccount {
         return unknown(false, format!("{} ({name}) is not on PATH.", label(engine)));
     };
     let ran = tools.run(&path, args, STATUS_LIMIT).await;
-    let command = format!("{name} {}", args.join(" "));
+    let command = status_command(engine).unwrap_or_default();
     let read = match engine {
         Engine::Claude => claude(&ran),
         Engine::Codex => codex(&ran),

@@ -4,15 +4,18 @@
 // after `delays.signIn` (or when the person presses Enter in it), after which that CLI reports
 // `sam@example.com`. The mock runs nothing and reads nothing.
 //
-// The rules are the daemon's: device tokens only (the route table says so), the hub's own machine
-// only (its first `local` one; another is 409), `engine` is one of the three (404 otherwise), one
-// sign-in per CLI at a time (asking again while one runs answers it, 200), 409 for a CLI that is
-// not installed, `device_code` for Codex only (400 for the others), unknown body fields 400.
+// The rules are the daemon's: device tokens only (the route table says so), and only the hub's
+// owner, its first person (any other member's device token is 403, before anything else; 409
+// before setup), the hub's own machine only (its first `local` one; another is 409), `engine` is
+// one of the three (404 otherwise), one sign-in per CLI at a time (asking again while one runs
+// answers it, 200), 409 for a CLI that is not installed, `device_code` for Codex only (400 for the
+// others), unknown body fields 400. `DELETE …/sign-in` ends one and forgets it (204; 404 when there
+// is none), and a sign-in's terminal opens only for the member who started it (403).
 
 import type { Hub } from './state.ts';
-import type { Engine, MachineId } from './types.ts';
+import type { Engine, MachineId, MemberId } from './types.ts';
 import { ulid } from './ulid.ts';
-import { conflict, invalid, isRecord, notFound } from './validate.ts';
+import { conflict, forbidden, invalid, isRecord, notFound } from './validate.ts';
 import type { WebSocketConnection } from './ws.ts';
 
 export type MachineCheckItem =
@@ -89,6 +92,8 @@ interface SignInRecord {
   view: SignIn;
   /** Open terminals, told when the login ends. */
   ended: Set<() => void>;
+  /** Who started it: the only member its terminal opens for. */
+  member: MemberId;
 }
 
 interface Setup {
@@ -105,6 +110,20 @@ function setupOf(hub: Hub): Setup {
     setups.set(hub, setup);
   }
   return setup;
+}
+
+/**
+ * Only the member who set the hub up (its first person) may use machine setup: 403 for any other,
+ * 409 before setup. First, before anything else is looked at.
+ */
+function ownerOnly(hub: Hub, member: MemberId): void {
+  const owner = hub.members.find((m) => m.kind === 'human');
+  if (owner === undefined) {
+    throw conflict('This workspace is not set up yet: set it up first.');
+  }
+  if (owner.id !== member) {
+    throw forbidden('Only the person who set this hub up can check its machine or sign its agents in.');
+  }
 }
 
 /** The hub's own machine, or why `id` is not it. */
@@ -134,7 +153,8 @@ function installed(engine: Engine): boolean {
 }
 
 /** `GET /v1/machines/{id}/check[?row=]`. */
-export function checkMachine(hub: Hub, id: string, query: URLSearchParams): { rows: MachineCheckRow[] } {
+export function checkMachine(hub: Hub, member: MemberId, id: string, query: URLSearchParams): { rows: MachineCheckRow[] } {
+  ownerOnly(hub, member);
   const row = query.get('row');
   if (row !== null && !(CHECK_ITEMS as readonly string[]).includes(row)) {
     throw invalid(`No check row "${row}".`);
@@ -145,7 +165,8 @@ export function checkMachine(hub: Hub, id: string, query: URLSearchParams): { ro
 }
 
 /** `GET /v1/machines/{id}/agents`. */
-export function agentAccounts(hub: Hub, id: string): AgentAccount[] {
+export function agentAccounts(hub: Hub, member: MemberId, id: string): AgentAccount[] {
+  ownerOnly(hub, member);
   ownMachine(hub, id);
   const { signedIn } = setupOf(hub);
   return SETUP_ENGINES.map((engine): AgentAccount => {
@@ -158,7 +179,8 @@ export function agentAccounts(hub: Hub, id: string): AgentAccount[] {
 }
 
 /** `GET /v1/machines/{id}/agents/{engine}/sign-in`. */
-export function signInStatus(hub: Hub, id: string, name: string): SignIn {
+export function signInStatus(hub: Hub, member: MemberId, id: string, name: string): SignIn {
+  ownerOnly(hub, member);
   const engine = engineOf(name);
   ownMachine(hub, id);
   const found = setupOf(hub).signIns.get(engine);
@@ -169,7 +191,14 @@ export function signInStatus(hub: Hub, id: string, name: string): SignIn {
 }
 
 /** `POST /v1/machines/{id}/agents/{engine}/sign-in`: the answer's status and body. */
-export function startSignIn(hub: Hub, id: string, name: string, body: unknown): { status: number; body: SignIn } {
+export function startSignIn(
+  hub: Hub,
+  member: MemberId,
+  id: string,
+  name: string,
+  body: unknown,
+): { status: number; body: SignIn } {
+  ownerOnly(hub, member);
   let method: 'browser' | 'device_code' = 'browser';
   if (body !== undefined) {
     if (!isRecord(body) || Object.keys(body).some((key) => key !== 'method')) {
@@ -200,10 +229,30 @@ export function startSignIn(hub: Hub, id: string, name: string, body: unknown): 
   const record: SignInRecord = {
     view: { engine, terminal: ulid(), command: [...command], running: true, started: Date.now() },
     ended: new Set(),
+    member,
   };
   setup.signIns.set(engine, record);
   hub.later(hub.delays.signIn, () => finish(setup, engine, record));
   return { status: 201, body: { ...record.view } };
+}
+
+/**
+ * `DELETE /v1/machines/{id}/agents/{engine}/sign-in`: ends it (its open terminals are told) and
+ * forgets it, so its terminal is gone.
+ */
+export function stopSignIn(hub: Hub, member: MemberId, id: string, name: string): void {
+  ownerOnly(hub, member);
+  const engine = engineOf(name);
+  ownMachine(hub, id);
+  const setup = setupOf(hub);
+  const record = setup.signIns.get(engine);
+  if (record === undefined) {
+    throw notFound(`No sign-in to ${LABEL[engine]} is open here.`);
+  }
+  setup.signIns.delete(engine);
+  record.view.running = false;
+  for (const tell of record.ended) tell();
+  record.ended.clear();
 }
 
 function finish(setup: Setup, engine: Engine, record: SignInRecord): void {
@@ -214,12 +263,23 @@ function finish(setup: Setup, engine: Engine, record: SignInRecord): void {
   record.ended.clear();
 }
 
-/** The sign-in whose terminal `ref` is, if any. */
-export function signInTerminal(hub: Hub, ref: string): { engine: Engine; record: SignInRecord } | undefined {
+/**
+ * The sign-in whose terminal `ref` is, if any. It opens only for the member who started it: 403
+ * for another.
+ */
+export function signInTerminal(
+  hub: Hub,
+  ref: string,
+  member: MemberId,
+): { engine: Engine; record: SignInRecord } | undefined {
   const setup = setups.get(hub);
   if (setup === undefined) return undefined;
   for (const [engine, record] of setup.signIns) {
-    if (record.view.terminal === ref) return { engine, record };
+    if (record.view.terminal !== ref) continue;
+    if (record.member !== member) {
+      throw forbidden('Only the person who started this sign-in can open its terminal.');
+    }
+    return { engine, record };
   }
   return undefined;
 }

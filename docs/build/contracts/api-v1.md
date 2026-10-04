@@ -136,10 +136,11 @@ the task key (`PAP-4`).
 | `POST /v1/setup` | `Setup` → `{ "workspace": Workspace, "me": Member, "machine": Machine }` | The first run (see below). Device tokens only. |
 | `GET /v1/machines` | → `Machine[]` | |
 | `POST /v1/machines/{id}/scan` | → lines of `ScanFrame` (200) | Scans the machine's agent homes for onboarding. Device tokens only. See "Machine scan". |
-| `GET /v1/machines/{id}/check` | → `MachineCheck` | What the machine has for running agents. Device tokens only. See "Machine setup". |
-| `GET /v1/machines/{id}/agents` | → `AgentAccount[]` | Each agent CLI's account, as its own status command reports it. Device tokens only. |
-| `POST /v1/machines/{id}/agents/{engine}/sign-in` | `StartSignIn`? → `SignIn` (201, or 200) | Runs the CLI's own login in a terminal. Device tokens only. |
-| `GET /v1/machines/{id}/agents/{engine}/sign-in` | → `SignIn` | That sign-in, and whether it still runs. Device tokens only. |
+| `GET /v1/machines/{id}/check` | → `MachineCheck` | What the machine has for running agents. The hub's owner only. See "Machine setup". |
+| `GET /v1/machines/{id}/agents` | → `AgentAccount[]` | Each agent CLI's account, as its own status command reports it. The hub's owner only. |
+| `POST /v1/machines/{id}/agents/{engine}/sign-in` | `StartSignIn`? → `SignIn` (201, or 200) | Runs the CLI's own login in a terminal. The hub's owner only. |
+| `GET /v1/machines/{id}/agents/{engine}/sign-in` | → `SignIn` | That sign-in, and whether it still runs. The hub's owner only. |
+| `DELETE /v1/machines/{id}/agents/{engine}/sign-in` | → 204 | Stops that sign-in and removes its terminal. The hub's owner only. |
 | `GET /v1/members` | → `Member[]` | **agent** |
 | `GET /v1/personas` | → `Persona[]` | |
 | `GET /v1/teams` | → `Team[]` | |
@@ -646,11 +647,18 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
 | `GET /v1/machines/{id}/agents` | → `AgentAccount[]` | Claude Code, Codex, OpenCode, in that order. |
 | `POST /v1/machines/{id}/agents/{engine}/sign-in` | `StartSignIn` or none → `SignIn` | `201` when it starts one, `200` with the one still running. |
 | `GET /v1/machines/{id}/agents/{engine}/sign-in` | → `SignIn` | `404` when there is none. |
+| `DELETE /v1/machines/{id}/agents/{engine}/sign-in` | → `204` | Stops it, running or ended, and removes its terminal; `404` when there is none. |
 
 Onboarding's machine steps, and the machine-setup wizard's: check what a machine has for running
 agents, and sign in to each agent CLI with the CLI's own login. The types are in
-`crates/protocol/src/machine_setup.rs`. All four are **device tokens only** (an agent token gets
-`403`).
+`crates/protocol/src/machine_setup.rs`.
+
+- **Who.** All five are for **the hub's owner only**: the member who set the hub up (its first
+  person, `POST /v1/setup`'s). An agent token gets `403`, and so does any other member's device
+  token, on every route and before anything else is looked at (the machine, the engine, the
+  body): on a shared hub, another person cannot sign the owner's machine in to their own account,
+  open the owner's sign-in, or read the owner's accounts. Before setup (no person yet) they are
+  `409`.
 
 - **Which machine.** Only the hub's own (its first `local` machine), as for the scan. An unknown or
   malformed id is `404`; another machine of the workspace is `409 conflict`: a remote machine is
@@ -693,20 +701,30 @@ agents, and sign in to each agent CLI with the CLI's own login. The types are in
     `terminal` is an id for the **terminals route** (`GET /v1/sessions/{terminal}/terminal`, see
     "Terminals"), the only route that knows it: it is not a session, appends no event, and `GET
     /v1/sessions/{terminal}` is `404`. The person drives the login there.
-  - **One per CLI at a time:** asking while one runs answers that one (`200`). An ended one is
-    replaced by the next (`201`).
+  - **The terminal opens only for the member who started the sign-in** (the hub's owner): any
+    other member's device token gets `403` from the terminals route.
+  - **Only a CLI that answers its status command.** The login starts only once the CLI's own
+    status command (as for the accounts) has said whether it is signed in; otherwise `409`
+    ("Update Claude Code first: …"). An older Claude Code without `auth` would read `auth login` as
+    a prompt and start an agent instead.
+  - **One per CLI at a time:** asking while one runs answers that one (`200`); two asks at once
+    get the same one. An ended one is replaced by the next (`201`).
   - Once its login ends (`running: false`), the terminal stays readable for 5 minutes, then it is
-    removed with its output; a login still running after 30 minutes is stopped. A hub that starts
-    removes any sign-in terminal an earlier run left.
-  - `409` when the CLI is not installed; `503` when the machine has no terminal runtime (tmux 3.2
-    or newer, or pitcrew-ptyd), or it does not answer.
+    removed with its output; a login still running after 30 minutes is stopped. `DELETE
+    …/sign-in` stops it at once (the client leaves the sign-in, or skips it). A hub that stops
+    stops its sign-ins, and one that starts removes any sign-in terminal an earlier run left
+    (their ids are kept in its state directory; a session's terminal is never taken for one).
+  - `409` when the CLI is not installed, or does not answer its status command; `503` when the
+    machine has no terminal runtime (tmux 3.2 or newer, or pitcrew-ptyd), or it does not answer.
   - **PitCrew never reads the login.** The terminal relays the CLI's screen and the person's keys,
     which nothing parses, logs or keeps; what the login stores is the CLI's, in its own files.
     After it ends, `GET …/agents` asks the CLI again.
 - **The mock** answers a fixed synthetic check (Claude Code, Codex, tmux and git there; OpenCode and
   gh missing; no SLURM) and accounts (Codex signed in, Claude Code not, OpenCode not installed).
   Its sign-in terminal shows a canned login and ends when Enter is pressed in it, or by itself
-  after about two seconds; Claude Code then reports `sam@example.com`. Same rules otherwise.
+  after about two seconds; Claude Code then reports `sam@example.com`. Its owner is the workspace's
+  first person (`dev-device-token`'s, `@sam`); `dev-second-device-token` is another person. Same
+  rules otherwise.
 
 ### Session import (device tokens only)
 

@@ -6,27 +6,45 @@
 //!   `codex login --device-auth`), `opencode auth login`, found on the daemon's `PATH`, in the
 //!   person's home folder, with nothing added to its environment (no PitCrew variable, no token).
 //!   Never `claude setup-token`, which prints a long-lived token to the screen.
+//! - **Only a CLI that answers its status command.** A login starts only once the CLI's own status
+//!   command (`claude auth status`, …; [`accounts`](super::accounts)) has said, in a way PitCrew
+//!   understands, whether it is signed in. An older Claude Code without `auth` reads
+//!   `auth login` as a prompt and would start an agent in the home folder instead: that is `409`,
+//!   "update it first".
+//! - **Who.** Only the member who set the hub up uses these routes (`super::routes`), and a
+//!   sign-in's terminal opens only for the member who started it ([`SignInTerminals::routes`]).
 //! - **PitCrew never reads the login.** The terminal relays the CLI's screen and the person's keys
 //!   as any terminal does; nothing here parses, logs or stores them. What the login stores is the
 //!   CLI's own business, in its own files, which PitCrew never opens.
 //! - **Not a session.** Its id is a fresh session-shaped id that only the terminals route knows
 //!   ([`SignInTerminals`]): no event is appended, no session listed, no transcript watched.
-//! - **One per CLI at a time.** Asking again while one runs gives that one.
+//! - **One per CLI at a time.** Asking again while one runs gives that one; two asks at once wait
+//!   for each other (one start per CLI at a time), so both get the same terminal.
 //! - **Short-lived.** Once the login has ended, its terminal stays [`LINGER`] for its last screen to
 //!   be read, then it is removed (its output with it). One still running after [`MAX_AGE`] is
-//!   stopped and removed. A daemon that starts removes any sign-in terminal an earlier one left in
-//!   its runtime (by its window name).
+//!   stopped and removed, and so is one the person leaves (`DELETE …/sign-in`). The daemon stops
+//!   every sign-in terminal when it stops ([`SignIns::stop_all`]), and keeps their ids in its
+//!   state directory ([`LEDGER`]), so one that a crash left is removed when it next starts. Only
+//!   ids listed there are removed: a session's terminal is never taken for a sign-in's by its name.
 
-use super::accounts::{label, program};
+use super::accounts::{self, label, program};
 use super::tools::Tools;
+use axum::Router;
+use axum::extract::{Request, State};
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
+use pitcrew_api::terminal::TerminalConfig;
 use pitcrew_api::{Attachment, RuntimeTerminals, TerminalError, Terminals};
+use pitcrew_auth::ErrorResponse;
 use pitcrew_interfaces::runtime::{Runtime, RuntimeError, StartSpec};
-use pitcrew_protocol::ids::{SessionId, TerminalId};
+use pitcrew_protocol::api::Caller;
+use pitcrew_protocol::ids::{MemberId, SessionId, TerminalId};
 use pitcrew_protocol::machine_setup::{SignIn, SignInMethod};
 use pitcrew_protocol::model::{Engine, TimestampMs};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,8 +54,11 @@ pub const LINGER: Duration = Duration::from_secs(5 * 60);
 pub const MAX_AGE: Duration = Duration::from_secs(30 * 60);
 /// How often expired sign-ins are looked for.
 const SWEEP_EVERY: Duration = Duration::from_secs(15);
-/// The start of every sign-in terminal's name, by which a later daemon finds leftovers.
+/// The start of every sign-in terminal's name (for people: a tmux window's name).
 const NAME_PREFIX: &str = "pitcrew sign-in: ";
+/// The file in the state directory that lists the sign-in terminals this daemon has open, for the
+/// next daemon to remove any that a crash left.
+pub const LEDGER: &str = "sign-in-terminals.json";
 /// The terminal's size until the person's view resizes it.
 const COLS: u16 = 100;
 const ROWS: u16 = 30;
@@ -47,6 +68,9 @@ const ROWS: u16 = 30;
 pub enum StartError {
     /// The CLI is not on `PATH` (`409`).
     NotInstalled(String),
+    /// The CLI did not answer its status command in a way PitCrew understands, so it may be too
+    /// old to have the login command (`409`).
+    Outdated(String),
     /// The method does not apply to this CLI (`400`).
     Method(String),
     /// No terminal runtime, or it did not answer (`503`).
@@ -71,6 +95,14 @@ pub struct SignIns {
     runtime: Arc<dyn Runtime>,
     terminals: RuntimeTerminals<dyn Runtime>,
     records: Mutex<HashMap<Engine, Record>>,
+    /// One start per CLI at a time: whether one runs, its status command, and starting it.
+    starting: Mutex<HashMap<Engine, Arc<tokio::sync::Mutex<()>>>>,
+    /// An earlier daemon's sign-in terminals (or this one's) that could not be removed yet.
+    leftovers: Mutex<Vec<TerminalId>>,
+    /// Where the open sign-in terminals' ids are kept ([`LEDGER`]); `None` keeps them nowhere.
+    ledger: Option<PathBuf>,
+    /// One write of the ledger at a time.
+    saving: Mutex<()>,
     tools: Tools,
     /// Where logins run: the person's home folder.
     cwd: PathBuf,
@@ -95,15 +127,37 @@ struct Record {
     since: Instant,
     /// When it was first seen ended.
     ended: Option<Instant>,
+    /// Who started it: the only member whose terminal view it opens in.
+    member: MemberId,
+}
+
+/// The ledger's shape on disk.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Ledger {
+    terminals: Vec<TerminalId>,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl SignIns {
-    /// Sign-ins in `runtime`'s terminals, running the CLIs `tools` finds, in `cwd`.
-    pub fn new(runtime: Arc<dyn Runtime>, tools: Tools, cwd: PathBuf) -> Self {
+    /// Sign-ins in `runtime`'s terminals, running the CLIs `tools` finds, in `cwd`, their ids
+    /// kept in `ledger` (`<state>/`[`LEDGER`]).
+    pub fn new(
+        runtime: Arc<dyn Runtime>,
+        tools: Tools,
+        cwd: PathBuf,
+        ledger: Option<PathBuf>,
+    ) -> Self {
         Self {
             terminals: RuntimeTerminals::new(Arc::clone(&runtime)),
             runtime,
             records: Mutex::new(HashMap::new()),
+            starting: Mutex::new(HashMap::new()),
+            leftovers: Mutex::new(Vec::new()),
+            ledger,
+            saving: Mutex::new(()),
             tools,
             cwd,
             linger: LINGER,
@@ -121,7 +175,7 @@ impl SignIns {
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<Engine, Record>> {
-        self.records.lock().unwrap_or_else(PoisonError::into_inner)
+        lock(&self.records)
     }
 
     /// Removes sign-in terminals an earlier daemon left in the runtime, then looks for expired
@@ -142,17 +196,59 @@ impl SignIns {
         }));
     }
 
-    /// Stops and removes sign-in terminals that no record of this daemon's names.
+    /// Stops and removes the sign-in terminals the ledger lists that no record of this daemon's
+    /// names: an earlier daemon's. A terminal the ledger does not list is never touched, whatever
+    /// its name. Those that cannot be removed now stay listed for the next time.
     fn remove_leftovers(&self) {
+        let Some(path) = &self.ledger else {
+            return;
+        };
+        let earlier = read_ledger(path);
+        if earlier.is_empty() {
+            return;
+        }
         let Ok(listed) = self.runtime.list() else {
+            // The runtime did not answer: try again when the daemon next starts.
+            lock(&self.leftovers).extend(earlier);
             return;
         };
         let ours: Vec<TerminalId> = self.lock().values().map(|r| r.terminal).collect();
+        let mut kept = Vec::new();
         for terminal in listed {
-            if terminal.name.starts_with(NAME_PREFIX) && !ours.contains(&terminal.id) {
-                tracing::info!(terminal = %terminal.id, "removing a sign-in terminal an earlier pitcrewd left");
-                let _ = self.runtime.kill(terminal.id);
+            if !earlier.contains(&terminal.id) || ours.contains(&terminal.id) {
+                continue;
             }
+            tracing::info!(terminal = %terminal.id, "removing a sign-in terminal an earlier pitcrewd left");
+            if let Err(e) = self.runtime.kill(terminal.id) {
+                tracing::debug!(error = %e, "a leftover sign-in terminal could not be removed");
+                kept.push(terminal.id);
+            }
+        }
+        *lock(&self.leftovers) = kept;
+        self.save_or_warn();
+    }
+
+    /// Writes the ledger: this daemon's sign-in terminals, and the leftovers not removed yet.
+    fn save(&self) -> std::io::Result<()> {
+        let Some(path) = &self.ledger else {
+            return Ok(());
+        };
+        let _saving = lock(&self.saving);
+        let mut terminals: Vec<TerminalId> = self.lock().values().map(|r| r.terminal).collect();
+        terminals.extend(lock(&self.leftovers).iter().copied());
+        terminals.sort_unstable();
+        terminals.dedup();
+        let body = serde_json::to_vec(&Ledger { terminals }).map_err(std::io::Error::other)?;
+        let mut temporary = path.as_os_str().to_owned();
+        temporary.push(".tmp");
+        let temporary = PathBuf::from(temporary);
+        std::fs::write(&temporary, body)?;
+        std::fs::rename(&temporary, path)
+    }
+
+    fn save_or_warn(&self) {
+        if let Err(e) = self.save() {
+            tracing::warn!(error = %e, "the list of sign-in terminals could not be written");
         }
     }
 
@@ -202,10 +298,20 @@ impl SignIns {
         }
         drop(records);
         self.terminals.unlink(record.id);
-        if let Err(e) = self.runtime.kill(record.terminal) {
-            tracing::debug!(error = %e, "a sign-in terminal could not be removed");
-        }
+        self.kill(record.terminal);
+        self.save_or_warn();
         tracing::info!(engine = ?engine, terminal = %record.terminal, "a sign-in terminal was removed");
+    }
+
+    /// Stops `terminal`; one that cannot be stopped now is kept for the next daemon.
+    fn kill(&self, terminal: TerminalId) {
+        match self.runtime.kill(terminal) {
+            Ok(()) | Err(RuntimeError::NotFound(_)) => {}
+            Err(e) => {
+                tracing::debug!(error = %e, "a sign-in terminal could not be removed");
+                lock(&self.leftovers).push(terminal);
+            }
+        }
     }
 
     /// The sign-in of `engine`, if there is one. Blocking (asks the runtime whether it runs).
@@ -215,15 +321,47 @@ impl SignIns {
         Some(view(engine, &record, running))
     }
 
-    /// Starts `engine`'s login with `method`, or gives the one running (`false`: not new).
-    /// Blocking: the runtime starts the terminal.
+    /// Stops and removes the sign-in of `engine`, running or ended: whether there was one.
+    /// Blocking.
+    pub fn stop(&self, engine: Engine) -> bool {
+        let Some(record) = self.lock().get(&engine).cloned() else {
+            return false;
+        };
+        self.forget(engine, &record);
+        true
+    }
+
+    /// Stops and removes every sign-in terminal: when the daemon stops, before its runtime is let
+    /// go of, so no login (and no Codex callback listener) outlives it. Blocking.
+    pub fn stop_all(&self) {
+        let records: Vec<(Engine, Record)> = self.lock().drain().collect();
+        for (engine, record) in &records {
+            self.terminals.unlink(record.id);
+            self.kill(record.terminal);
+            tracing::info!(engine = ?engine, terminal = %record.terminal, "a sign-in terminal was stopped with the daemon");
+        }
+        self.save_or_warn();
+    }
+
+    /// Who started sign-in `id`, if it is one of these.
+    fn starter(&self, id: SessionId) -> Option<MemberId> {
+        self.lock().values().find(|r| r.id == id).map(|r| r.member)
+    }
+
+    fn gate(&self, engine: Engine) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(lock(&self.starting).entry(engine).or_default())
+    }
+
+    /// Starts `engine`'s login with `method` for `member`, or gives the one running (`false`: not
+    /// new). One start per CLI at a time: a second ask meanwhile waits, then gets the same one.
     ///
     /// # Errors
     /// See [`StartError`].
-    pub fn start(
-        &self,
+    pub async fn start(
+        this: &Arc<Self>,
         engine: Engine,
         method: SignInMethod,
+        member: MemberId,
     ) -> Result<(SignIn, bool), StartError> {
         let name = program(engine)
             .ok_or_else(|| StartError::Method("PitCrew does not run this CLI.".to_owned()))?;
@@ -237,15 +375,42 @@ impl SignIns {
                 }
             ))
         })?;
-        if let Some(running) = self.get(engine).filter(|s| s.running) {
+        let gate = this.gate(engine);
+        let _starting = gate.lock().await;
+        let running = blocking(this, move |s| s.get(engine))
+            .await?
+            .filter(|s| s.running);
+        if let Some(running) = running {
             return Ok((running, false));
         }
-        if self.tools.find(name).is_none() {
+        // The CLI's own status first: only one that answers it is asked to log in.
+        let account = accounts::account(&this.tools, engine).await;
+        if !account.installed {
             return Err(StartError::NotInstalled(format!(
                 "{} ({name}) is not on this machine's PATH: install it first.",
                 label(engine)
             )));
         }
+        if account.signed_in.is_none() {
+            return Err(StartError::Outdated(format!(
+                "Update {label} first: `{status}` gave no answer PitCrew understands, so this \
+                 {label} may not have `{name} {login}`.",
+                label = label(engine),
+                status = accounts::status_command(engine).unwrap_or_default(),
+                login = args.join(" "),
+            )));
+        }
+        blocking(this, move |s| s.launch(engine, name, args, member)).await?
+    }
+
+    /// Starts the login's terminal. Blocking: the runtime starts it.
+    fn launch(
+        &self,
+        engine: Engine,
+        name: &'static str,
+        args: &'static [&'static str],
+        member: MemberId,
+    ) -> Result<(SignIn, bool), StartError> {
         let cwd = self
             .cwd
             .to_str()
@@ -277,13 +442,23 @@ impl SignIns {
             started: now_ms(),
             since: Instant::now(),
             ended: None,
+            member,
         };
         self.terminals.link(record.id, record.terminal);
         let previous = self.lock().insert(engine, record.clone());
         if let Some(previous) = previous {
             // An ended one, replaced: its terminal goes now.
             self.terminals.unlink(previous.id);
-            let _ = self.runtime.kill(previous.terminal);
+            self.kill(previous.terminal);
+        }
+        if let Err(e) = self.save() {
+            // Unlisted, a crash would leave it for good: it does not run.
+            tracing::warn!(error = %e, "the list of sign-in terminals could not be written");
+            self.forget(engine, &record);
+            return Err(StartError::Failed(
+                "The sign-in could not be noted in PitCrew's state folder, so it was stopped."
+                    .to_owned(),
+            ));
         }
         tracing::info!(engine = name, terminal = %record.terminal, "a sign-in terminal started");
         Ok((view(engine, &record, true), true))
@@ -293,6 +468,35 @@ impl SignIns {
     fn attach(&self, id: SessionId) -> Option<Result<Arc<dyn Attachment>, TerminalError>> {
         let known = self.lock().values().any(|r| r.id == id);
         known.then(|| self.terminals.attach(id))
+    }
+}
+
+/// Runs `f` on `this` on the blocking pool.
+async fn blocking<T: Send + 'static>(
+    this: &Arc<SignIns>,
+    f: impl FnOnce(&SignIns) -> T + Send + 'static,
+) -> Result<T, StartError> {
+    let this = Arc::clone(this);
+    tokio::task::spawn_blocking(move || f(&this))
+        .await
+        .map_err(|_| StartError::Failed("The sign-in could not start.".to_owned()))
+}
+
+/// The terminal ids `path` lists; none when it is missing or unreadable.
+fn read_ledger(path: &Path) -> Vec<TerminalId> {
+    match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<Ledger>(&bytes) {
+            Ok(ledger) => ledger.terminals,
+            Err(e) => {
+                tracing::warn!(error = %e, "the list of sign-in terminals is malformed; ignoring it");
+                Vec::new()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            tracing::warn!(error = %e, "the list of sign-in terminals could not be read");
+            Vec::new()
+        }
     }
 }
 
@@ -326,6 +530,17 @@ impl<T: Terminals> SignInTerminals<T> {
     pub fn new(sign_ins: Arc<SignIns>, inner: T) -> Self {
         Self { sign_ins, inner }
     }
+
+    /// The terminals route (`pitcrew_api::terminal::routes`) over these, where a sign-in's
+    /// terminal opens only for the member who started it: another member's device token gets
+    /// `403`. ([`Terminals::attach`] is not told who asks, so the check is a layer of the route.)
+    /// Mount it as a **device** route.
+    pub fn routes(self, config: TerminalConfig) -> Router {
+        let sign_ins = Arc::clone(&self.sign_ins);
+        pitcrew_api::terminal::routes(Arc::new(self), config).route_layer(
+            axum::middleware::from_fn_with_state(sign_ins, only_its_starter),
+        )
+    }
 }
 
 impl<T: Terminals> Terminals for SignInTerminals<T> {
@@ -335,6 +550,31 @@ impl<T: Terminals> Terminals for SignInTerminals<T> {
             None => self.inner.attach(session),
         }
     }
+}
+
+/// `GET /v1/sessions/{id}/terminal` for a sign-in's id: only for the member who started it.
+async fn only_its_starter(
+    State(sign_ins): State<Arc<SignIns>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let starter = request
+        .uri()
+        .path()
+        .strip_prefix("/v1/sessions/")
+        .and_then(|rest| rest.strip_suffix("/terminal"))
+        .and_then(|id| id.parse::<SessionId>().ok())
+        .and_then(|id| sign_ins.starter(id));
+    if let Some(starter) = starter {
+        let caller = request.extensions().get::<Caller>().map(|c| c.member);
+        if caller != Some(starter) {
+            return ErrorResponse::forbidden(
+                "Only the person who started this sign-in can open its terminal.",
+            )
+            .into_response();
+        }
+    }
+    next.run(request).await
 }
 
 #[cfg(test)]
@@ -369,6 +609,19 @@ mod tests {
                 alive: !self.ended.lock().unwrap().contains(&id),
                 native_target: None,
             })
+        }
+
+        /// The terminals started and not killed.
+        #[cfg(unix)]
+        fn open(&self) -> Vec<TerminalId> {
+            let killed = self.killed.lock().unwrap().clone();
+            self.started
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, _)| *id)
+                .filter(|id| !killed.contains(id))
+                .collect()
         }
     }
 
@@ -429,24 +682,48 @@ mod tests {
         }
     }
 
-    /// `bin` with a stand-in for each CLI.
+    /// A stand-in CLI in `bin`: it answers its status command (not signed in) after a short
+    /// pause, as a Node CLI takes a moment to start, and its login is never run here.
     #[cfg(unix)]
-    fn tools(bin: &std::path::Path) -> Tools {
-        for name in ["claude", "codex", "opencode"] {
-            let path = bin.join(name);
-            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
-        }
-        Tools::with_path(std::ffi::OsString::from(bin))
+    fn stand_in(bin: &Path, name: &str, status: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = bin.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\nsleep 0.2\n{status}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    fn rig(fake: Arc<Fake>, tools: Tools) -> SignIns {
+    /// `bin` with a stand-in for each CLI, each answering its own status command. The rest of
+    /// `PATH` is the system's folders, for `sleep`.
+    #[cfg(unix)]
+    fn tools(bin: &Path) -> Tools {
+        stand_in(
+            bin,
+            "claude",
+            r#"[ "$1 $2" = "auth status" ] && { echo '{"loggedIn":false}'; exit 1; }; exit 9"#,
+        );
+        stand_in(
+            bin,
+            "codex",
+            r#"[ "$1 $2" = "login status" ] && { echo 'Not logged in' >&2; exit 1; }; exit 9"#,
+        );
+        stand_in(
+            bin,
+            "opencode",
+            r#"[ "$1 $2" = "auth list" ] && { echo '0 credentials'; exit 0; }; exit 9"#,
+        );
+        let mut path = bin.as_os_str().to_owned();
+        path.push(":/usr/bin:/bin");
+        Tools::with_path(path)
+    }
+
+    fn rig(fake: Arc<Fake>, tools: Tools, ledger: Option<PathBuf>) -> SignIns {
         let runtime: Arc<dyn Runtime> = fake;
-        SignIns::new(runtime, tools, std::env::temp_dir())
+        SignIns::new(runtime, tools, std::env::temp_dir(), ledger)
+    }
+
+    #[cfg(unix)]
+    fn person() -> MemberId {
+        MemberId::new()
     }
 
     #[test]
@@ -472,15 +749,21 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn a_sign_in_is_a_terminal_only_the_terminals_route_knows() {
+    #[tokio::test]
+    async fn a_sign_in_is_a_terminal_only_the_terminals_route_knows() {
         let tmp = tempfile::tempdir().unwrap();
+        let ledger = tmp.path().join(LEDGER);
         let fake = Arc::new(Fake::default());
-        let sign_ins = Arc::new(rig(Arc::clone(&fake), tools(tmp.path())));
+        let sign_ins = Arc::new(rig(
+            Arc::clone(&fake),
+            tools(tmp.path()),
+            Some(ledger.clone()),
+        ));
         let routes = SignInTerminals::new(Arc::clone(&sign_ins), NoSessions);
+        let sam = person();
 
-        let (first, new) = sign_ins
-            .start(Engine::Claude, SignInMethod::Browser)
+        let (first, new) = SignIns::start(&sign_ins, Engine::Claude, SignInMethod::Browser, sam)
+            .await
             .unwrap();
         assert!(new);
         assert!(first.running);
@@ -495,10 +778,13 @@ mod tests {
             "nothing is added to a login's environment"
         );
         assert_eq!(spec.name, "pitcrew sign-in: claude");
+        assert_eq!(sign_ins.starter(first.terminal), Some(sam));
+        // Its id is noted for a later daemon.
+        assert_eq!(read_ledger(&ledger), [*terminal]);
 
         // Asking again while it runs gives the same one.
-        let (again, new) = sign_ins
-            .start(Engine::Claude, SignInMethod::Browser)
+        let (again, new) = SignIns::start(&sign_ins, Engine::Claude, SignInMethod::Browser, sam)
+            .await
             .unwrap();
         assert!(!new);
         assert_eq!(again.terminal, first.terminal);
@@ -518,10 +804,11 @@ mod tests {
         assert!(sign_ins.get(Engine::Claude).is_some(), "it lingers");
         assert!(routes.attach(first.terminal).is_ok());
 
-        let short =
-            Arc::new(rig(Arc::clone(&fake), tools(tmp.path())).with_times(Duration::ZERO, MAX_AGE));
-        let (ended, _) = short
-            .start(Engine::Codex, SignInMethod::DeviceCode)
+        let short = Arc::new(
+            rig(Arc::clone(&fake), tools(tmp.path()), None).with_times(Duration::ZERO, MAX_AGE),
+        );
+        let (ended, _) = SignIns::start(&short, Engine::Codex, SignInMethod::DeviceCode, sam)
+            .await
             .unwrap();
         assert_eq!(ended.command, ["codex", "login", "--device-auth"]);
         let codex = fake.started.lock().unwrap().last().unwrap().0;
@@ -537,8 +824,12 @@ mod tests {
         assert!(short_routes.attach(ended.terminal).is_err());
 
         // A login that runs too long is stopped.
-        let old = rig(Arc::clone(&fake), tools(tmp.path())).with_times(LINGER, Duration::ZERO);
-        let (open, _) = old.start(Engine::OpenCode, SignInMethod::Browser).unwrap();
+        let old = Arc::new(
+            rig(Arc::clone(&fake), tools(tmp.path()), None).with_times(LINGER, Duration::ZERO),
+        );
+        let (open, _) = SignIns::start(&old, Engine::OpenCode, SignInMethod::Browser, sam)
+            .await
+            .unwrap();
         old.sweep();
         assert!(old.get(Engine::OpenCode).is_none());
         let opencode = fake.started.lock().unwrap().last().unwrap().0;
@@ -546,52 +837,167 @@ mod tests {
         assert!(!open.terminal.to_string().is_empty());
     }
 
+    /// Two asks for one CLI's sign-in at once start one terminal, and both get it: neither is
+    /// left holding a terminal that the other's start replaced.
     #[cfg(unix)]
-    #[test]
-    fn what_cannot_start_says_why() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_starts_at_once_share_one_terminal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Arc::new(Fake::default());
+        let sign_ins = Arc::new(rig(Arc::clone(&fake), tools(tmp.path()), None));
+        let sam = person();
+        let (a, b) = tokio::join!(
+            SignIns::start(&sign_ins, Engine::Claude, SignInMethod::Browser, sam),
+            SignIns::start(&sign_ins, Engine::Claude, SignInMethod::Browser, sam),
+        );
+        let (a, a_new) = a.unwrap();
+        let (b, b_new) = b.unwrap();
+        assert_eq!(a.terminal, b.terminal, "both have the same terminal");
+        assert!(a_new != b_new, "one started it, the other was given it");
+        assert_eq!(fake.started.lock().unwrap().len(), 1, "one terminal");
+        assert!(fake.killed.lock().unwrap().is_empty(), "none replaced");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn what_cannot_start_says_why() {
         let tmp = tempfile::tempdir().unwrap();
         let empty = Tools::with_path(std::ffi::OsString::from(tmp.path()));
         let fake = Arc::new(Fake::default());
-        let sign_ins = rig(Arc::clone(&fake), empty);
+        let sign_ins = Arc::new(rig(Arc::clone(&fake), empty, None));
+        let sam = person();
         assert!(matches!(
-            sign_ins.start(Engine::Claude, SignInMethod::Browser),
+            SignIns::start(&sign_ins, Engine::Claude, SignInMethod::Browser, sam).await,
             Err(StartError::NotInstalled(m)) if m.contains("Claude Code (claude) is not on this machine's PATH")
         ));
         assert!(matches!(
-            sign_ins.start(Engine::Claude, SignInMethod::DeviceCode),
+            SignIns::start(&sign_ins, Engine::Claude, SignInMethod::DeviceCode, sam).await,
             Err(StartError::Method(_))
         ));
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
         let none: Arc<dyn Runtime> = Arc::new(crate::terminals::NoRuntime);
-        let without = SignIns::new(none, tools(tmp.path()), std::env::temp_dir());
+        let without = Arc::new(SignIns::new(none, tools(&bin), std::env::temp_dir(), None));
         assert!(matches!(
-            without.start(Engine::Codex, SignInMethod::Browser),
+            SignIns::start(&without, Engine::Codex, SignInMethod::Browser, sam).await,
             Err(StartError::Unavailable(_))
         ));
         assert!(fake.started.lock().unwrap().is_empty());
     }
 
+    /// An older Claude Code has no `auth` command: it reads `auth status` (and so `auth login`)
+    /// as a prompt for an agent. Its login is never started; the answer says to update it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_older_claude_code_without_auth_is_not_started() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tools = tools(tmp.path());
+        // What an old Claude Code does with `auth status` and no terminal: it tries to run an
+        // agent on the prompt "auth status", and fails for want of a TTY.
+        stand_in(
+            tmp.path(),
+            "claude",
+            "echo 'Error: Raw mode is not supported on the current process.stdin' >&2; exit 1",
+        );
+        let fake = Arc::new(Fake::default());
+        let sign_ins = Arc::new(rig(Arc::clone(&fake), tools, None));
+        let refused = SignIns::start(&sign_ins, Engine::Claude, SignInMethod::Browser, person())
+            .await
+            .unwrap_err();
+        let StartError::Outdated(message) = refused else {
+            panic!("not refused as outdated: {refused:?}");
+        };
+        assert_eq!(
+            message,
+            "Update Claude Code first: `claude auth status` gave no answer PitCrew understands, \
+             so this Claude Code may not have `claude auth login`."
+        );
+        assert!(fake.started.lock().unwrap().is_empty(), "nothing started");
+        assert!(sign_ins.get(Engine::Claude).is_none());
+    }
+
+    /// `DELETE …/sign-in` and the daemon's stop remove sign-in terminals, running or not, and
+    /// the ledger with them.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sign_ins_stop_when_asked_and_with_the_daemon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = tmp.path().join(LEDGER);
+        let fake = Arc::new(Fake::default());
+        let sign_ins = Arc::new(rig(
+            Arc::clone(&fake),
+            tools(tmp.path()),
+            Some(ledger.clone()),
+        ));
+        let routes = SignInTerminals::new(Arc::clone(&sign_ins), NoSessions);
+        let sam = person();
+        let (codex, _) = SignIns::start(&sign_ins, Engine::Codex, SignInMethod::Browser, sam)
+            .await
+            .unwrap();
+        assert_eq!(fake.open().len(), 1);
+        assert!(sign_ins.stop(Engine::Codex), "stopped");
+        assert!(fake.open().is_empty(), "its terminal is gone");
+        assert!(sign_ins.get(Engine::Codex).is_none());
+        assert!(routes.attach(codex.terminal).is_err());
+        assert!(!sign_ins.stop(Engine::Codex), "nothing left to stop");
+        assert!(read_ledger(&ledger).is_empty());
+
+        for engine in [Engine::Claude, Engine::Codex, Engine::OpenCode] {
+            SignIns::start(&sign_ins, engine, SignInMethod::Browser, sam)
+                .await
+                .unwrap();
+        }
+        assert_eq!(fake.open().len(), 3);
+        assert_eq!(read_ledger(&ledger).len(), 3);
+        sign_ins.stop_all();
+        assert!(
+            fake.open().is_empty(),
+            "every sign-in stops with the daemon"
+        );
+        assert!(sign_ins.get(Engine::Claude).is_none());
+        assert!(read_ledger(&ledger).is_empty());
+    }
+
+    /// At start, only the terminals the ledger lists are removed: a session's terminal whose name
+    /// looks like a sign-in's is left alone.
     #[test]
     fn leftovers_of_an_earlier_daemon_are_removed() {
-        let mine = TerminalInfo {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = tmp.path().join(LEDGER);
+        let info = |name: &str| TerminalInfo {
             id: TerminalId::new(),
-            name: "pitcrew sign-in: claude".into(),
+            name: name.into(),
             pid: None,
             alive: true,
             native_target: None,
         };
-        let session = TerminalInfo {
-            id: TerminalId::new(),
-            name: "work".into(),
-            pid: None,
-            alive: true,
-            native_target: None,
-        };
+        let earlier = info("pitcrew sign-in: claude");
+        let session = info("work");
+        let named_like_one = info("pitcrew sign-in: x");
+        let gone = TerminalId::new();
+        std::fs::write(
+            &ledger,
+            serde_json::to_vec(&Ledger {
+                terminals: vec![earlier.id, gone],
+            })
+            .unwrap(),
+        )
+        .unwrap();
         let fake = Arc::new(Fake {
-            leftovers: vec![mine.clone(), session.clone()],
+            leftovers: vec![earlier.clone(), session, named_like_one],
             ..Fake::default()
         });
-        let sign_ins = rig(Arc::clone(&fake), Tools::default());
+        let sign_ins = rig(Arc::clone(&fake), Tools::default(), Some(ledger.clone()));
         sign_ins.remove_leftovers();
-        assert_eq!(*fake.killed.lock().unwrap(), vec![mine.id]);
+        assert_eq!(*fake.killed.lock().unwrap(), vec![earlier.id]);
+        assert!(read_ledger(&ledger).is_empty(), "nothing is left to remove");
+
+        // Without a ledger, nothing is removed at all.
+        let fake = Arc::new(Fake {
+            leftovers: vec![info("pitcrew sign-in: codex")],
+            ..Fake::default()
+        });
+        rig(Arc::clone(&fake), Tools::default(), None).remove_leftovers();
+        assert!(fake.killed.lock().unwrap().is_empty());
     }
 }

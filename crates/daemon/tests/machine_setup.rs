@@ -11,19 +11,23 @@
 //! The rest of `PATH` is the system's own folders (`/usr/bin:/bin`), for `sh` and its tools. The
 //! sign-in terminal runs in tmux on a private socket of the test's own (skipped, with a message,
 //! where tmux 3.2 or newer is not installed, unless `PITCREW_REQUIRE_TMUX=1`).
+//!
+//! A second person's device token (a member who did not set the hub up) is provisioned in the
+//! state directory before the daemon starts, as the conformance suite's is: every route, and a
+//! sign-in's terminal, refuses it.
 
 #![cfg(unix)]
 #![allow(clippy::unwrap_used)]
 
 mod common;
 
-use common::{Daemon, Frame, Tmux, Ws, id};
+use common::{Daemon, Frame, Reply, Tmux, Ws, id, request};
 use serde_json::{Value, json};
 use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const WAIT: Duration = Duration::from_secs(30);
 
@@ -62,6 +66,16 @@ case "$1 $2" in
   "login status") echo "Logged in using an API key - sk-proj-***SYNTHETIC" >&2; exit 0 ;;
 esac
 exit 9
+"#;
+
+/// An older Claude Code, without the `auth` command: it reads `auth status` (or `auth login`) as a
+/// prompt for an agent, which with no terminal fails.
+const OLD_CLAUDE: &str = r#"#!/bin/sh
+case "$1" in
+  --version) echo "0.2.9 (Claude Code)"; exit 0 ;;
+esac
+echo "Error: Raw mode is not supported on the current process.stdin" >&2
+exit 1
 "#;
 
 const OPENCODE: &str = r#"#!/bin/sh
@@ -142,11 +156,69 @@ impl Rig {
         )
     }
 
+    /// The daemon on `state` again, without `--demo` (it refuses the store it seeded).
+    fn restart(&self, state: &Path, tmux: Tmux<'_>) -> Daemon {
+        Daemon::start_with(
+            state,
+            &["--homes", self.homes.to_str().unwrap()],
+            &[("PATH", self.path())],
+            tmux,
+        )
+    }
+
+    /// Replaces the stand-in `name` with `body`.
+    fn stand_in(&self, name: &str, body: &str) {
+        let path = self.bin.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     /// Nothing that installs or downloads ran.
     fn nothing_installed(&self) {
         let tripped = std::fs::read_to_string(&self.tripped).unwrap_or_default();
         assert!(tripped.is_empty(), "a fix or a check ran: {tripped}");
     }
+}
+
+/// A second person's device token in `state` (made now, private, before the daemon starts): a
+/// member of the hub who did not set it up. Random each run, never printed.
+fn second_person(state: &Path) -> String {
+    use sha2::{Digest as _, Sha256};
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::fs::create_dir_all(state).unwrap();
+    std::fs::set_permissions(state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+        | 1;
+    // 32 bytes, unpadded base64url: 43 characters, the last carrying only 2 bits.
+    let mut token = String::from("pcd_");
+    for at in 0..43 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let index = (seed % 64) as usize;
+        token.push(ALPHABET[if at == 42 { index & !3 } else { index }] as char);
+    }
+    let sha256: String = Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let tokens = json!({ "version": 1, "tokens": [{
+        "id": "01J00000000000000000000001",
+        "sha256": sha256,
+        "caller": { "member": "01JB000000000000000MEM0007", "scope": "device" },
+        "created_at": 0,
+    }] });
+    let path = state.join("tokens.json");
+    std::fs::write(&path, tokens.to_string()).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    token
+}
+
+fn delete(daemon: &Daemon, path: &str, token: &str) -> Reply {
+    request(daemon.port, "DELETE", path, Some(token), None, &[])
 }
 
 fn row<'a>(check: &'a Value, id: &str) -> &'a Value {
@@ -163,6 +235,7 @@ fn row<'a>(check: &'a Value, id: &str) -> &'a Value {
 #[test]
 fn the_check_and_the_accounts_come_from_the_tools_themselves() {
     let rig = Rig::new();
+    let second = second_person(&rig.state("state"));
     let daemon = rig.start(&rig.state("state"), Tmux::Refused, &[]);
     let device = daemon.device_token();
     let agent = daemon.agent_token();
@@ -299,6 +372,53 @@ fn the_check_and_the_accounts_come_from_the_tools_themselves() {
     let extra = daemon.post(&sign_in, Some(&device), &json!({ "token": "x" }));
     assert_eq!(extra.status, 400, "{}", extra.body);
     assert_eq!(daemon.post(&sign_in, Some(&agent), &json!({})).status, 403);
+    assert_eq!(delete(&daemon, &sign_in, &device).status, 404, "none open");
+    assert_eq!(delete(&daemon, &sign_in, &agent).status, 403);
+
+    // Only the person who set the hub up: another person's device token is refused on every
+    // route, before anything else is looked at (even a machine that is not the hub's own).
+    assert_eq!(
+        daemon.get("/v1/machines", Some(&second)).status,
+        200,
+        "the second person's token works elsewhere"
+    );
+    let routes = [
+        ("GET", format!("/v1/machines/{laptop}/check")),
+        ("GET", format!("/v1/machines/{laptop}/check?row=cli_claude")),
+        ("GET", format!("/v1/machines/{laptop}/agents")),
+        ("GET", sign_in.clone()),
+        ("POST", sign_in.clone()),
+        ("DELETE", sign_in.clone()),
+        ("GET", format!("/v1/machines/{}/check", id::CLUSTER)),
+        (
+            "POST",
+            format!("/v1/machines/{laptop}/agents/gemini/sign-in"),
+        ),
+    ];
+    for (method, path) in &routes {
+        let body = (*method == "POST").then(|| json!({}));
+        let reply = request(daemon.port, method, path, Some(&second), body.as_ref(), &[]);
+        assert_eq!(reply.status, 403, "{method} {path}: {}", reply.body);
+        assert_eq!(reply.code(), "forbidden");
+        assert!(
+            !reply.body.contains("sam@example.com") && !reply.body.contains("API key"),
+            "nothing of the owner's accounts: {}",
+            reply.body
+        );
+    }
+
+    // An older Claude Code, without `auth`: its login is not started (it would start an agent
+    // on the prompt "auth login"), whatever the terminal runtime.
+    rig.stand_in("claude", OLD_CLAUDE);
+    let old = daemon.post(&sign_in, Some(&device), &json!({}));
+    assert_eq!(old.status, 409, "{}", old.body);
+    assert_eq!(old.code(), "conflict");
+    assert_eq!(
+        old.json()["message"],
+        "Update Claude Code first: `claude auth status` gave no answer PitCrew understands, so \
+         this Claude Code may not have `claude auth login`."
+    );
+    assert_eq!(daemon.get(&sign_in, Some(&device)).status, 404);
 
     rig.nothing_installed();
 }
@@ -414,7 +534,9 @@ fn signing_in_runs_the_clis_own_login_in_a_terminal() {
         tmux: &tmux,
         socket: &socket,
     };
-    let daemon = rig.start(&rig.state("state"), Tmux::At(&socket), &[]);
+    let state = rig.state("state");
+    let second = second_person(&state);
+    let mut daemon = rig.start(&state, Tmux::At(&socket), &[]);
     let device = daemon.device_token();
     let agent = daemon.agent_token();
     let laptop = id::LAPTOP;
@@ -454,6 +576,16 @@ fn signing_in_runs_the_clis_own_login_in_a_terminal() {
         .map(|_| ())
         .unwrap_err();
     assert_eq!(refused.status, 403, "{}", refused.body);
+    // Nor to another person: only the one who started it reads its screen (a device code).
+    let theirs = Ws::connect(daemon.port, &path, &second)
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(theirs.status, 403, "{}", theirs.body);
+    assert_eq!(
+        daemon.get(&sign_in, Some(&second)).status,
+        403,
+        "nor its status"
+    );
     let mut ws = Ws::connect(daemon.port, &path, &device)
         .unwrap_or_else(|reply| panic!("{path}: {} {}", reply.status, reply.body));
     let mut output = Vec::new();
@@ -488,8 +620,78 @@ fn signing_in_runs_the_clis_own_login_in_a_terminal() {
         gone.body
     );
 
+    // Leaving it: `DELETE` stops it and removes its terminal.
+    let next_path = format!(
+        "/v1/sessions/{}/terminal",
+        next.json()["terminal"].as_str().unwrap()
+    );
+    assert_eq!(delete(&daemon, &sign_in, &second).status, 403);
+    assert_eq!(delete(&daemon, &sign_in, &device).status, 204);
+    assert_eq!(daemon.get(&sign_in, Some(&device)).status, 404);
+    let left = Ws::connect(daemon.port, &next_path, &device)
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(left.status, 404, "{}", left.body);
+    assert_eq!(delete(&daemon, &sign_in, &device).status, 404);
+    wait_for_windows(&tmux, &socket, 0);
+
     let log = daemon.stderr();
     assert!(!log.contains("synthetic-code"), "no keystroke in the log");
     assert!(!log.contains("sam@example.com"), "no account in the log");
+
+    // A daemon that stops stops its sign-ins: nothing runs on until its next start.
+    let running = daemon.post(&sign_in, Some(&device), &json!({}));
+    assert_eq!(running.status, 201, "{}", running.body);
+    wait_for_windows(&tmux, &socket, 1);
+    daemon.stop();
+    wait_for_windows(&tmux, &socket, 0);
+    let ledger = state.join("sign-in-terminals.json");
+    assert_eq!(
+        serde_json::from_str::<Value>(&std::fs::read_to_string(&ledger).unwrap()).unwrap(),
+        json!({ "terminals": [] })
+    );
+
+    // One that a crash left is removed when the daemon next starts: its id was noted.
+    let mut daemon = rig.restart(&state, Tmux::At(&socket));
+    let crashed = daemon.post(&sign_in, Some(&device), &json!({}));
+    assert_eq!(crashed.status, 201, "{}", crashed.body);
+    wait_for_windows(&tmux, &socket, 1);
+    daemon.signal("KILL");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(sign_in_windows(&tmux, &socket), 1, "a crash leaves it");
+    let mut daemon = rig.restart(&state, Tmux::At(&socket));
+    wait_for_windows(&tmux, &socket, 0);
+    daemon.stop();
     rig.nothing_installed();
+}
+
+/// How many sign-in terminals' windows the tmux server on `socket` has (none without a server).
+fn sign_in_windows(tmux: &Path, socket: &Path) -> usize {
+    let out = Command::new(tmux)
+        .arg("-S")
+        .arg(socket)
+        .args(["list-windows", "-a", "-F", "#{window_name}"])
+        .env_remove("TMUX")
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|name| name.starts_with("pitcrew sign-in: "))
+        .count()
+}
+
+/// Waits, at most [`WAIT`], until there are `count` sign-in windows.
+fn wait_for_windows(tmux: &Path, socket: &Path, count: usize) {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let found = sign_in_windows(tmux, socket);
+        if found == count {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{found} sign-in windows, not {count}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }

@@ -1,6 +1,7 @@
 // API v1 "Machine setup", against both targets: the machine check, the agents' accounts and a
-// sign-in terminal, on the hub's own machine only and for device tokens only. Its own file, so the
-// shared cases in api.test.mjs stay as they are.
+// sign-in terminal, on the hub's own machine only and for its owner only (a device token, and not
+// another person's: PITCREW_CONFORMANCE_SECOND_PERSON). Its own file, so the shared cases in
+// api.test.mjs stay as they are.
 //
 // What the rows and accounts say depends on the machine (the mock's are synthetic; the daemon's
 // come from the stand-in CLIs run.mjs puts first on its PATH, and the runner's own git, gh and
@@ -15,7 +16,8 @@ import { bool, enumeration, integer, list, object, schemas, text } from './schem
 const base = process.env.PITCREW_CONFORMANCE_URL;
 const person = process.env.PITCREW_CONFORMANCE_PERSON;
 const agent = process.env.PITCREW_CONFORMANCE_AGENT;
-assert.ok(base && person && agent, 'Set PITCREW_CONFORMANCE_URL, _PERSON and _AGENT');
+const second = process.env.PITCREW_CONFORMANCE_SECOND_PERSON;
+assert.ok(base && person && agent && second, 'Set PITCREW_CONFORMANCE_URL, _PERSON, _AGENT and _SECOND_PERSON');
 assert.ok(
   ['127.0.0.1', 'localhost', '[::1]'].includes(new URL(base).hostname),
   'Conformance changes synthetic local state only',
@@ -154,6 +156,24 @@ test('machine setup refusals', { timeout: 60000 }, async () => {
   await refused(signInPath, 400, { method: 'POST', body: { method: 'device_code' } });
   await refused(signInPath, 400, { method: 'POST', body: { method: 'password' } });
   await refused(signInPath, 400, { method: 'POST', body: { token: 'synthetic' } });
+  await refused(signInPath, 403, { method: 'DELETE', token: agent });
+});
+
+test('machine setup is the hub owner’s only', { timeout: 60000 }, async () => {
+  // Another person's device token: refused on every route, before anything else is looked at.
+  const signInPath = `/v1/machines/${own.id}/agents/claude/sign-in`;
+  for (const [method, path] of [
+    ['GET', `/v1/machines/${own.id}/check`],
+    ['GET', `/v1/machines/${own.id}/agents`],
+    ['GET', signInPath],
+    ['POST', signInPath],
+    ['DELETE', signInPath],
+    ['GET', `/v1/machines/${other.id}/check`],
+    ['POST', `/v1/machines/${own.id}/agents/gemini/sign-in`],
+  ])
+    await refused(path, 403, { method, token: second, body: method === 'POST' ? {} : undefined });
+  // Their token itself works.
+  assert.equal((await call('/v1/machines', { token: second })).status, 200);
 });
 
 test('agents accounts shape', { timeout: 60000 }, async () => {
@@ -191,7 +211,16 @@ test('sign-in terminal', { timeout: 60000 }, async () => {
   await refused(`/v1/sessions/${started.body.terminal}`, 404);
   const terminal = `/v1/sessions/${started.body.terminal}/terminal?cols=80&rows=24`;
   assert.equal((await upgrade(terminal, agent)).status, 403);
+  assert.equal((await upgrade(terminal, second)).status, 403, 'only for the person who started it');
   const opened = await upgrade(terminal, person);
   assert.equal(opened.status, 101);
   assert.equal(opened.protocol, 'pitcrew.v1');
+
+  // Leaving it stops it: its terminal is gone.
+  const stopped = await call(path, { method: 'DELETE' });
+  assert.equal(stopped.status, 204, JSON.stringify(stopped.body));
+  assert.equal(stopped.body, undefined);
+  await refused(path, 404);
+  await refused(path, 404, { method: 'DELETE' });
+  assert.equal((await upgrade(terminal, person)).status, 404);
 });

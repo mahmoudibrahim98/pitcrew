@@ -1,5 +1,8 @@
 //! Machine setup (api-v1.md, "Machine setup"): onboarding's machine steps on the hub's own
-//! machine. Device routes (`RouterParts::device`): an agent token gets `403`.
+//! machine. Device routes (`RouterParts::device`): an agent token gets `403`, and so does the
+//! device token of any member but the one who set the hub up (its first person, the workspace's
+//! owner), on every route: another person on a shared hub cannot sign the owner's machine in to
+//! their own account, open the owner's sign-in, or read the owner's accounts.
 //!
 //! | Route | What |
 //! |---|---|
@@ -7,6 +10,7 @@
 //! | `GET /v1/machines/{id}/agents` | [`AgentAccount`]s, as each CLI's own status command reports them ([`accounts`]) |
 //! | `POST /v1/machines/{id}/agents/{engine}/sign-in` | Starts the CLI's own login in a terminal ([`sign_in`]): `201` [`SignIn`], or `200` with the one already running |
 //! | `GET /v1/machines/{id}/agents/{engine}/sign-in` | That sign-in, and whether its login still runs; `404` when there is none |
+//! | `DELETE /v1/machines/{id}/agents/{engine}/sign-in` | Stops that sign-in and removes its terminal: `204`, or `404` when there is none |
 //!
 //! - **Which machine:** only the hub's own (the workspace's first local machine, as the scan). An
 //!   unknown or malformed id is `404`; another machine of the workspace is `409`: it is checked
@@ -32,15 +36,16 @@ use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::rejection::{PathRejection, QueryRejection};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use check::CheckEnv;
-use pitcrew_auth::ErrorResponse;
+use pitcrew_auth::{Authenticated, ErrorResponse};
 use pitcrew_hub_work::WorkService;
 use pitcrew_protocol::api::ErrorCode;
-use pitcrew_protocol::ids::MachineId;
+use pitcrew_protocol::ids::{MachineId, MemberId};
 #[cfg(doc)]
 use pitcrew_protocol::machine_setup::{AgentAccount, MachineCheck, SignIn};
 use pitcrew_protocol::machine_setup::{MachineCheckItem, SignInMethod, StartSignIn};
@@ -73,7 +78,13 @@ impl MachineSetup {
             .map(|dirs| dirs.home_dir().to_path_buf())
             .filter(|home| home.is_absolute() && home.is_dir())
             .unwrap_or_else(|| state.clone());
-        let sign_ins = Arc::new(SignIns::new(runtime.runtime(), tools.clone(), home));
+        let ledger = state.join(sign_in::LEDGER);
+        let sign_ins = Arc::new(SignIns::new(
+            runtime.runtime(),
+            tools.clone(),
+            home,
+            Some(ledger),
+        ));
         Self {
             work,
             check: CheckEnv {
@@ -97,16 +108,71 @@ impl MachineSetup {
     }
 }
 
-/// The routes. Mount them as **device** routes (`RouterParts::device`).
+/// The routes. Mount them as **device** routes (`RouterParts::device`). Only the hub's owner
+/// gets past [`owner_only`].
 pub fn routes(setup: Arc<MachineSetup>) -> Router {
     Router::new()
         .route("/v1/machines/{id}/check", get(check_machine))
         .route("/v1/machines/{id}/agents", get(agents))
         .route(
             "/v1/machines/{id}/agents/{engine}/sign-in",
-            get(sign_in_status).post(start_sign_in),
+            get(sign_in_status).post(start_sign_in).delete(stop_sign_in),
         )
+        .route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&setup),
+            owner_only,
+        ))
         .with_state(setup)
+}
+
+/// Lets through only the member who set the hub up (its first person): `403` for any other,
+/// before anything else is looked at; `409` before the hub is set up, when there is none.
+async fn owner_only(
+    State(setup): State<Arc<MachineSetup>>,
+    Authenticated(caller): Authenticated,
+    request: Request,
+    next: Next,
+) -> Response {
+    match owner(&setup).await {
+        Ok(Some(owner)) if owner == caller.member => next.run(request).await,
+        Ok(Some(_)) => ErrorResponse::forbidden(
+            "Only the person who set this hub up can check its machine or sign its agents in.",
+        )
+        .into_response(),
+        Ok(None) => ErrorResponse::new(
+            ErrorCode::Conflict,
+            "This workspace is not set up yet: set it up first.",
+        )
+        .into_response(),
+        Err(refused) => refused.into_response(),
+    }
+}
+
+/// The member who set the hub up: the workspace's first person; `None` before setup.
+async fn owner(setup: &MachineSetup) -> Result<Option<MemberId>, ErrorResponse> {
+    let work = Arc::clone(&setup.work);
+    lookup(move || work.read(pitcrew_hub_work::query::first_person)).await
+}
+
+/// Reads the workspace off the async threads, within [`LOOKUP_TIMEOUT`].
+async fn lookup<T: Send + 'static>(
+    read: impl FnOnce() -> pitcrew_hub_work::Result<T> + Send + 'static,
+) -> Result<T, ErrorResponse> {
+    match tokio::time::timeout(LOOKUP_TIMEOUT, tokio::task::spawn_blocking(read)).await {
+        Ok(Ok(Ok(found))) => Ok(found),
+        Ok(Ok(Err(e))) => {
+            tracing::error!(error = %e, "cannot read the workspace for machine setup");
+            Err(internal())
+        }
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "reading the workspace for machine setup failed");
+            Err(internal())
+        }
+        Err(_) => Err(ErrorResponse::new(
+            ErrorCode::Unavailable,
+            "The workspace's machines took too long to read.",
+        )),
+    }
 }
 
 /// The hub's own machine: the workspace's first local one, as `serve` picks it.
@@ -126,24 +192,7 @@ async fn hub_machine(setup: &MachineSetup, id: &str) -> Result<Machine, ErrorRes
     let no_machine = || ErrorResponse::not_found(format!("No machine {id}."));
     let machine: MachineId = id.parse().map_err(|_| no_machine())?;
     let work = Arc::clone(&setup.work);
-    let lookup = tokio::task::spawn_blocking(move || work.machines());
-    let machines = match tokio::time::timeout(LOOKUP_TIMEOUT, lookup).await {
-        Ok(Ok(Ok(machines))) => machines,
-        Ok(Ok(Err(e))) => {
-            tracing::error!(error = %e, "cannot list the machines for machine setup");
-            return Err(internal());
-        }
-        Ok(Err(e)) => {
-            tracing::error!(error = %e, "listing the machines for machine setup failed");
-            return Err(internal());
-        }
-        Err(_) => {
-            return Err(ErrorResponse::new(
-                ErrorCode::Unavailable,
-                "The workspace's machines took too long to read.",
-            ));
-        }
-    };
+    let machines = lookup(move || work.machines()).await?;
     let Some(target) = machines.iter().find(|m| m.id == machine) else {
         return Err(no_machine());
     };
@@ -268,6 +317,7 @@ async fn sign_in_status(
 
 async fn start_sign_in(
     State(setup): State<Arc<MachineSetup>>,
+    Authenticated(caller): Authenticated,
     path: Result<Path<(String, String)>, PathRejection>,
     body: Bytes,
 ) -> Response {
@@ -284,12 +334,11 @@ async fn start_sign_in(
         };
         let engine = sign_in_target(&setup, path).await?;
         let method = start.method.unwrap_or(SignInMethod::Browser);
-        let sign_ins = setup.sign_ins();
-        let started = tokio::task::spawn_blocking(move || sign_ins.start(engine, method))
-            .await
-            .map_err(|_| ErrorResponse::new(ErrorCode::Internal, "The sign-in could not start."))?;
+        let started = SignIns::start(&setup.sign_ins, engine, method, caller.member).await;
         started.map_err(|e| match e {
-            sign_in::StartError::NotInstalled(m) => ErrorResponse::new(ErrorCode::Conflict, m),
+            sign_in::StartError::NotInstalled(m) | sign_in::StartError::Outdated(m) => {
+                ErrorResponse::new(ErrorCode::Conflict, m)
+            }
             sign_in::StartError::Method(m) => ErrorResponse::new(ErrorCode::Invalid, m),
             sign_in::StartError::Unavailable(m) => {
                 tracing::warn!(why = %m, "a sign-in terminal could not start");
@@ -304,6 +353,36 @@ async fn start_sign_in(
     match answer.await {
         Ok((found, true)) => (StatusCode::CREATED, Json(found)).into_response(),
         Ok((found, false)) => Json(found).into_response(),
+        Err(refused) => refused.into_response(),
+    }
+}
+
+/// `DELETE …/sign-in`: stops the sign-in and removes its terminal, whether its login still runs
+/// or has ended (the person left the step, or skipped it).
+async fn stop_sign_in(
+    State(setup): State<Arc<MachineSetup>>,
+    path: Result<Path<(String, String)>, PathRejection>,
+) -> Response {
+    let answer = async {
+        let engine = sign_in_target(&setup, path).await?;
+        let sign_ins = setup.sign_ins();
+        let stopped = tokio::task::spawn_blocking(move || sign_ins.stop(engine))
+            .await
+            .map_err(|_| {
+                ErrorResponse::new(ErrorCode::Internal, "The sign-in could not be stopped.")
+            })?;
+        if stopped {
+            tracing::info!(engine = ?engine, "a sign-in was stopped on request");
+            Ok(())
+        } else {
+            Err(ErrorResponse::not_found(format!(
+                "No sign-in to {} is open here.",
+                accounts::label(engine)
+            )))
+        }
+    };
+    match answer.await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(refused) => refused.into_response(),
     }
 }

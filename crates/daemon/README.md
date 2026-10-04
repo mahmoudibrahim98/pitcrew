@@ -664,9 +664,9 @@ link) are not part of this.
 | `GET /v1/events` | `pitcrew-api`'s `Activity` over the store, with the work model's activity index (`with_refs`, through the `WorkRefs` adapter in `src/refs.rs`): `project=` and `workstream=` match events about them, their tasks and their sessions, and `task=` and `session=` also match their sessions' and dispatches' events |
 | `GET /v1/recaps/blocks`, `GET /v1/recaps/days` | `pitcrew-api`'s `Recaps` over the hub's recap index (hub-work's `RecapIndex`, implemented by its `WorkService`), through the `WorkRecaps` adapter in `src/recaps.rs`; see "Recaps" |
 | `POST /v1/machines/{id}/scan` | `src/scan.rs`, a device route, over the runner's homes with `pitcrew_ingest::scan` (see "The machine scan") |
-| `GET /v1/machines/{id}/check`, `GET /v1/machines/{id}/agents`, `GET`/`POST /v1/machines/{id}/agents/{engine}/sign-in` | `src/machine_setup/`, device routes (see "Machine setup") |
+| `GET /v1/machines/{id}/check`, `GET /v1/machines/{id}/agents`, `GET`/`POST`/`DELETE /v1/machines/{id}/agents/{engine}/sign-in` | `src/machine_setup/`, device routes for the hub's owner only (see "Machine setup") |
 | `POST /v1/hooks/{engine}/{event}` | `pitcrew-api` into the runner's `RunnerHooks` (see "The runner"); with `--no-runner`, logged at debug (engine, event, member; never the body) |
-| `GET /v1/sessions/{id}/terminal` | `pitcrew-api` over `SignInTerminals` (machine setup's sign-in terminals by their id) and then `SessionTerminals` (see "Terminals") |
+| `GET /v1/sessions/{id}/terminal` | `pitcrew-api` over `SignInTerminals` (machine setup's sign-in terminals by their id, for the member who started each only) and then `SessionTerminals` (see "Terminals") |
 | `POST /v1/sessions`, `POST /v1/sessions/{id}/send`, `/keys`, `/interrupt`, `/end` | `src/sessions.rs`, device routes, through the runner's `RunnerCommands` (see "Terminals") |
 | `GET /v1/sessions/{id}/transcript` | `src/transcripts.rs`, a device route, from the runner's `RunnerTranscripts` (see "The runner") |
 
@@ -739,19 +739,27 @@ one module and one line of the routes in `src/serve.rs`.
 
 Onboarding's machine steps on the hub's own machine (api-v1, "Machine setup"; device tokens
 only): `src/machine_setup/`, one module, wired with a few lines in `src/serve.rs` (its routes,
-its sign-in terminals before the sessions' on the terminals route, and their sweep).
+its sign-in terminals before the sessions' on the terminals route, their sweep, and stopping them
+when the daemon stops).
 
+- **Who:** only the member who set the hub up (the workspace's first person). A layer over the
+  routes (`owner_only`) answers any other member's device token `403` before anything else, and
+  `409` before setup. A sign-in's terminal opens only for the member who started it
+  (`SignInTerminals::routes`, a layer over the terminals route, since `Terminals::attach` is not
+  told who asks).
 - **Which machine:** the workspace's first local one, as for the scan; an unknown or malformed id
   is `404`, another machine `409`.
 - **The check** (`check.rs`, `tools.rs`, `disk.rs`): each tool found on the daemon's `PATH`
   (absolute entries only; `.exe`, `.cmd`, `.bat`, `.com` on Windows) and asked only its version
   (`--version`, `tmux -V`), all at once, each with no input, for at most 15 seconds, its output
-  capped at 64 KiB and cleaned to a line, and on Unix in a process group of its own that a
-  timeout kills whole. tmux's row says what PitCrew's terminals run in instead when it is missing
+  capped at 64 KiB and cleaned to a line, with everything it starts: in a process group of its own
+  on Unix, a Job Object on Windows (`pitcrew_remote::job`, so `claude.cmd`'s `node.exe` goes too),
+  which a timeout kills whole, and so does dropping the run before it ends (a request given up). tmux's row says what PitCrew's terminals run in instead when it is missing
   or older than 3.2 (pitcrew-ptyd, or nothing); it is left out on Windows. The disk row is the free
   space of the state directory's filesystem (`statvfs` on Unix; Windows PowerShell's `DriveInfo`,
   by its path under `%SystemRoot%`, given the folder in an environment variable); under 5 GB it
-  warns. SLURM's row is there only where `sbatch` is. A missing tool's row offers `install_page`;
+  warns. SLURM's row is there only where `sbatch` is (a warning when `sbatch --version` fails). A
+  missing tool's row offers `install_page`;
   **nothing here installs or fixes anything**.
 - **Accounts** (`accounts.rs`): `claude auth status`, `codex login status` and `opencode auth list`,
   each for at most 20 seconds, and only what they say is kept: signed in or not, and a label
@@ -762,12 +770,17 @@ its sign-in terminals before the sessions' on the terminals route, and their swe
 - **Sign-in** (`sign_in.rs`): the CLI's own login (`claude auth login`, `codex login`, `codex login
   --device-auth`, `opencode auth login`) started in the terminals' runtime (tmux or pitcrew-ptyd),
   in the person's home folder, with no variable added; `503` without a runtime (`--no-runner`, or
-  neither tmux nor pitcrew-ptyd), `409` for a CLI not on `PATH`. Its id is a fresh session-shaped
-  id that only the terminals route knows (`SignInTerminals`): no event, session or transcript. One
-  per CLI at a time; an ended one stays readable for 5 minutes, then its terminal is killed and
-  forgotten; one still running after 30 minutes is stopped. A sweep every 15 seconds does that,
-  and at start removes the sign-in terminals an earlier daemon left in its runtime (by their window
-  name, `pitcrew sign-in: <cli>`).
+  neither tmux nor pitcrew-ptyd), `409` for a CLI not on `PATH`, and `409` ("Update … first") for
+  one whose own status command did not answer in a way PitCrew understands: an older Claude Code
+  without `auth` would read `auth login` as a prompt and start an agent. Its id is a fresh
+  session-shaped id that only the terminals route knows (`SignInTerminals`): no event, session or
+  transcript. One per CLI at a time, and one start per CLI at a time (two asks at once get the same
+  terminal); an ended one stays readable for 5 minutes, then its terminal is killed and forgotten;
+  one still running after 30 minutes is stopped; `DELETE …/sign-in` stops one at once. A sweep
+  every 15 seconds does that. The ids of the open ones are kept in `sign-in-terminals.json` in the
+  state directory: the daemon stops every one when it stops (before it lets go of the runtime),
+  and at start removes those a crash left, **by that list only** (a session's terminal named like
+  one is never touched).
 - **What it logs:** counts (`checked this machine`, `read the agents' accounts from their CLIs`)
   and a sign-in's start and removal (engine and terminal id). Never a command's output, an
   account, or what passes through a sign-in terminal.
@@ -1079,22 +1092,28 @@ it if they run: no real agent CLI ever runs.
 - the check's rows, in order, from what the stand-ins print (`?row=` for one); the accounts as
   their status commands report them, with nothing of Codex's key in the answer or the log;
   refusals (an agent `403`, no token `401`, the demo's cluster `409`, an unknown machine `404`, a
-  bad row or body `400`, an unknown CLI `404`); without a terminal runtime a sign-in is `503`;
+  bad row or body `400`, an unknown CLI `404`); another person's device token (provisioned in the
+  state directory before the start) `403` on every route; without a terminal runtime a sign-in is
+  `503`; an older Claude Code without `auth` is `409`, its login never started;
 - in tmux (a private socket of the test's; skipped without tmux 3.2, unless
   `PITCREW_REQUIRE_TMUX=1`): a sign-in runs the stand-in's own login, the same one is answered
   while it runs, it is not a session, its terminal is served to the person and not to an agent,
   typing the code through the terminal's WebSocket signs it in, its status then says it ended and
-  the CLI reports the account; an ended one is replaced, its old terminal gone; neither the code
-  typed nor the account reaches the log;
+  the CLI reports the account; an ended one is replaced, its old terminal gone; another person
+  cannot open its terminal or read its status; `DELETE` stops it and removes its window; a daemon
+  that stops stops its sign-in (no window left, an empty list), and one that a `SIGKILL` left is
+  removed when the daemon next starts; neither the code typed nor the account reaches the log;
 - in both, none of the tripwires ran.
 
 The unit tests in `src/machine_setup/` check the parsers of each CLI's status (JSON or a sentence,
 the exit code agreeing; Codex's key never kept; OpenCode's credentials counted), account labels
 (no key or token), finding tools (absolute entries, executables only) and bounded runs (output
-capped, a timeout stopping the process group), versions and rows (missing with their install
-page, old tmux, failing tools, SLURM missing a tool), the disk row, and sign-ins over a fake
-runtime (the login's exact program, arguments, empty environment and window name; one at a time;
-lingering, then removed; stopped when too old; leftovers removed; no runtime `Unavailable`).
+capped, a timeout stopping the process group, and so does a run given up), versions and rows
+(missing with their install page, old tmux, failing tools, SLURM missing a tool or with a failing
+`sbatch`), the disk row, and sign-ins over a fake runtime (the login's exact program, arguments,
+empty environment and window name; one at a time, and two starts at once sharing one terminal;
+an older Claude Code not started; lingering, then removed; stopped when too old, when asked and
+with the daemon; leftovers removed by the list only; no runtime `Unavailable`).
 
 `tests/recaps.rs`, with `--demo`, checks what the contract promises of any log (the seeded demo
 is not the mock's fixture):

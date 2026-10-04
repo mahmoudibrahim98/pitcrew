@@ -1,5 +1,5 @@
 // Machine setup (api-v1.md, "Machine setup"): the check, the accounts and a sign-in terminal, on
-// the hub's own machine only, for device tokens only.
+// the hub's own machine only, for the hub's owner only (device tokens, and not another person's).
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
@@ -14,12 +14,15 @@ const CLUSTER = '01JB000000000000000MCH0002';
 const FAST = { delays: { signIn: 60 } };
 const SLOW = { delays: { signIn: 60_000 } };
 
+/** Another person's device token: a member who did not set the hub up. */
+const SECOND = 'dev-second-device-token';
+
 const signInPath = (engine: string, machine = LAPTOP): string => `/v1/machines/${machine}/agents/${engine}/sign-in`;
 
-function terminal(server: RunningServer, id: string): Promise<TestSocket> {
+function terminal(server: RunningServer, id: string, token = DEVICE): Promise<TestSocket> {
   return TestSocket.connect(`${server.url}/v1/sessions/${id}/terminal?cols=80&rows=24`, [
     'pitcrew.v1',
-    `pitcrew.bearer.${DEVICE}`,
+    `pitcrew.bearer.${token}`,
   ]);
 }
 
@@ -69,6 +72,26 @@ describe('machine check', () => {
       assert.equal((await call(server, 'GET', `/v1/machines/${unknown}/check`, { token: DEVICE })).status, 404);
       assert.equal((await call(server, 'POST', signInPath('claude', CLUSTER), { token: DEVICE })).status, 409);
       assert.equal((await call(server, 'POST', signInPath('claude'), { token: AGENT })).status, 403);
+    }));
+
+  it('answers only the person who set the hub up: another person is refused first', () =>
+    withServer(async (server) => {
+      const paths: [string, string][] = [
+        ['GET', `/v1/machines/${LAPTOP}/check`],
+        ['GET', `/v1/machines/${LAPTOP}/agents`],
+        ['GET', signInPath('claude')],
+        ['POST', signInPath('claude')],
+        ['DELETE', signInPath('claude')],
+        ['GET', `/v1/machines/${CLUSTER}/check`],
+        ['POST', signInPath('gemini')],
+      ];
+      for (const [method, path] of paths) {
+        const refused = await call<ApiError>(server, method, path, { token: SECOND });
+        assert.equal(refused.status, 403, `${method} ${path}`);
+        assert.equal(refused.body.code, 'forbidden');
+      }
+      // Their token works elsewhere.
+      assert.equal((await call(server, 'GET', '/v1/machines', { token: SECOND })).status, 200);
     }));
 });
 
@@ -125,6 +148,34 @@ describe('sign-in', () => {
       await sleep(10);
       const status = await call<SignIn>(server, 'GET', signInPath('codex'), { token: DEVICE });
       assert.equal(status.body.running, false);
+    }, SLOW));
+
+  it('opens a sign-in’s terminal only for the person who started it', () =>
+    withServer(async (server) => {
+      const started = await call<SignIn>(server, 'POST', signInPath('claude'), { token: DEVICE });
+      assert.equal(started.status, 201);
+      await assert.rejects(terminal(server, started.body.terminal, SECOND), /403/);
+      const socket = await terminal(server, started.body.terminal);
+      assert.equal((await socket.next()).type, 'binary');
+      socket.close();
+    }, SLOW));
+
+  it('stops a sign-in when asked: its terminal ends and it is gone', () =>
+    withServer(async (server) => {
+      const started = await call<SignIn>(server, 'POST', signInPath('claude'), { token: DEVICE });
+      const socket = await terminal(server, started.body.terminal);
+      assert.equal((await socket.next()).type, 'binary');
+      assert.equal((await call(server, 'DELETE', signInPath('claude'), { token: AGENT })).status, 403);
+      const stopped = await call(server, 'DELETE', signInPath('claude'), { token: DEVICE });
+      assert.equal(stopped.status, 204);
+      const { texts, code } = await readToClose(socket);
+      assert.deepEqual(texts, ['{"type":"exit"}']);
+      assert.equal(code, 1000);
+      assert.equal((await call(server, 'GET', signInPath('claude'), { token: DEVICE })).status, 404);
+      assert.equal((await call(server, 'DELETE', signInPath('claude'), { token: DEVICE })).status, 404);
+      // Not signed in: it was left, not finished.
+      const after = await call<AgentAccount[]>(server, 'GET', `/v1/machines/${LAPTOP}/agents`, { token: DEVICE });
+      assert.equal(after.body[0]?.signed_in, false);
     }, SLOW));
 
   it('says why a sign-in cannot start', () =>
