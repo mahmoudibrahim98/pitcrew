@@ -1,6 +1,9 @@
 // Connect a remote machine (a server, a login node, or a SLURM node through its login node), over
 // the desktop gateway's remote commands (desktop-gateway.md, "Remote workspaces"):
-//   Host → Probe → Launcher → Review → Connect → Setup → Done.
+//   Host → Probe → Launcher → Review → Connect → Setup → Sign in → Done.
+// The probe also checks the machine (each agent CLI, tmux, git, gh, disk, SLURM, PitCrew's helper),
+// with the install page of what is missing; Connect shows the install as a live log; Sign in runs
+// each agent CLI's own login in a terminal there, through the new workspace's hub.
 // Nothing changes on the remote until the person presses Connect on the Review step, which shows
 // the plan's steps and, for SLURM, the exact job script. A plan the gateway refuses (expired, or
 // already used) sends the person back to Review with a fresh plan: a plan is never submitted
@@ -12,6 +15,7 @@
 import { useEffect, useId, useMemo, useRef, useState, type ReactNode, type RefObject } from 'react';
 import {
   GatewayError,
+  useApi,
   useGatewayWorkspace,
   useSetUp,
   useWorkspace,
@@ -28,12 +32,16 @@ import {
 import { Button, CheckIcon, Dialog, DialogContent, DialogFooter } from '../../design/index.ts';
 import { cx } from '../../lib/cx.ts';
 import type { WslDistro, WslTarget } from '../../data/remote.ts';
-import type { DiscoveredHost } from '../api.ts';
+import type { DiscoveredHost, MachineCheckRow } from '../api.ts';
+import { CheckRowLine, InstallPageNote } from '../check-rows.tsx';
 import { createHubOnboardingApi } from '../hub-api.ts';
+import { withLine } from '../install-log.ts';
+import { toCheckRows } from '../machine-wire.ts';
 import { SetupForm } from '../setup-form.tsx';
+import { SignInPanel } from '../sign-in-panel.tsx';
 import { checkCpus, checkHost, checkJobText, scriptHazards, type SetupValues } from '../validation.ts';
 
-type Step = 'host' | 'probe' | 'launcher' | 'review' | 'connect' | 'setup' | 'done';
+type Step = 'host' | 'probe' | 'launcher' | 'review' | 'connect' | 'setup' | 'sign-in' | 'done';
 
 const STEPS: { id: Step; title: string }[] = [
   { id: 'host', title: 'Host' },
@@ -42,6 +50,7 @@ const STEPS: { id: Step; title: string }[] = [
   { id: 'review', title: 'Review' },
   { id: 'connect', title: 'Connect' },
   { id: 'setup', title: 'Setup' },
+  { id: 'sign-in', title: 'Sign in' },
   { id: 'done', title: 'Done' },
 ];
 
@@ -118,6 +127,8 @@ interface State {
   /** Why Review shows a fresh plan. */
   notice?: string | undefined;
   progress: RemoteProgress[];
+  /** The live install log: a line for each progress message, as it came (`install-log.ts`). */
+  log: string[];
   /** The add ended without a workspace: its error's message (the step and detail come from `progress`). */
   failure?: { message: string; cancelled: boolean } | undefined;
   /** The person asked to stop the add (`gateway_remote_cancel`), and why that did not work, if not. */
@@ -138,6 +149,7 @@ const INITIAL: State = {
   job: EMPTY_JOB,
   jobErrors: {},
   progress: [],
+  log: [],
   setup: { workspaceName: '', personName: '', handle: '', machineName: '' },
   handleEdited: false,
 };
@@ -240,11 +252,11 @@ export function ConnectWizard({
   async function connect(shown: RemotePlan, request: RemotePlanRequest) {
     const g = begin();
     let started = false;
-    patch({ step: 'connect', progress: [], failure: undefined, notice: undefined, cancelling: false, cancelError: undefined });
+    patch({ step: 'connect', progress: [], log: [], failure: undefined, notice: undefined, cancelling: false, cancelError: undefined });
     try {
       const workspace = await remote.remoteAdd(shown.plan, (progress) => {
         started = true;
-        if (current(g)) setState((s) => ({ ...s, progress: merge(s.progress, progress) }));
+        if (current(g)) setState((s) => ({ ...s, progress: merge(s.progress, progress), log: withLine(s.log, progress) }));
       });
       if (current(g)) {
         begin();
@@ -378,9 +390,12 @@ export function ConnectWizard({
               patch={patch}
               heading={heading}
               workspace={state.workspace}
-              onDone={() => go('done')}
+              onDone={() => go('sign-in')}
               onLater={onLeave}
             />
+          )}
+          {state.step === 'sign-in' && state.workspace !== undefined && (
+            <SignInStep host={state.host} workspace={state.workspace} heading={heading} onDone={() => go('done')} />
           )}
           {state.step === 'done' && state.workspace !== undefined && (
             <DoneStep host={state.host} workspace={state.workspace} heading={heading} onOpen={onOpen} />
@@ -617,6 +632,7 @@ function ProbeStep({
           <dd>{probe.tmux === undefined ? 'Not known' : probe.tmux.version}</dd>
         </dl>
       )}
+      {probe !== undefined && <MachineCheck rows={checkRows(probe.check)} />}
       <Footer>
         <span className="flex gap-2">
           <Button variant="ghost" onClick={onBack}>
@@ -634,6 +650,54 @@ function ProbeStep({
         </span>
       </Footer>
     </div>
+  );
+}
+
+/** The probe's machine check, read as the hub's is; none when the gateway sent none or a bad one. */
+function checkRows(check: unknown): MachineCheckRow[] {
+  if (check === undefined) return [];
+  try {
+    return toCheckRows(check);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The machine check, made over the same connection: what is missing has its install page (PitCrew
+ * installs nothing there), and the helper's row says Connect installs it.
+ */
+function MachineCheck({ rows }: { rows: MachineCheckRow[] }) {
+  const [shown, setShown] = useState<ReadonlySet<string>>(new Set());
+  if (rows.length === 0) return null;
+  return (
+    <section aria-label="Machine check" className="mt-5">
+      <h2 className="text-sm font-medium text-ink">What it has for agents</h2>
+      <ul className="mt-2 divide-y divide-line rounded-sm border border-line" data-testid="machine-check">
+        {rows.map((row) => (
+          <CheckRowLine
+            key={row.id}
+            row={row}
+            note={shown.has(row.id) ? <InstallPageNote row={row} /> : undefined}
+            action={
+              row.fix === 'install-page' && row.status !== 'ok' && !shown.has(row.id) ? (
+                <button
+                  type="button"
+                  onClick={() => setShown((s) => new Set(s).add(row.id))}
+                  aria-label={`Install ${row.label}…`}
+                  className="h-6 rounded-sm border border-line-2 px-2 text-xs text-ink-2 hover:bg-hover"
+                >
+                  Install…
+                </button>
+              ) : undefined
+            }
+          />
+        ))}
+      </ul>
+      <p className="mt-1.5 text-xs text-ink-2">
+        PitCrew installs nothing there but its own helper: install what is missing yourself, then try again.
+      </p>
+    </section>
   );
 }
 
@@ -948,6 +1012,17 @@ function ConnectStep({
           </li>
         ))}
       </ol>
+      {state.log.length > 0 && (
+        <div
+          role="log"
+          aria-label="Install log"
+          className="mt-4 max-h-48 overflow-auto rounded-sm border border-line bg-sunken p-3 font-mono text-xs text-ink-2"
+        >
+          {state.log.map((line, i) => (
+            <p key={i}>{line}</p>
+          ))}
+        </div>
+      )}
       {failure !== undefined && (
         <Alert>
           {failure.cancelled
@@ -1108,7 +1183,58 @@ function RemoteSetup({
   );
 }
 
-// ─── 7. Done ───────────────────────────────────────────────────────────────────────────────────
+// ─── 7. Sign in ────────────────────────────────────────────────────────────────────────────────
+
+function SignInStep({
+  host,
+  workspace,
+  heading,
+  onDone,
+}: {
+  host: string;
+  workspace: GatewayWorkspace;
+  heading: HeadingRef;
+  onDone(): void;
+}) {
+  return (
+    <div>
+      <Heading heading={heading}>Sign in to your agents on {host}</Heading>
+      <WorkspaceScope
+        ws={workspace.id}
+        fallback={(reason) =>
+          reason.kind === 'failed' ? (
+            <Alert>Could not list the workspaces: {reason.message}</Alert>
+          ) : (
+            <Status>Waiting for {workspace.name} to appear…</Status>
+          )
+        }
+      >
+        <RemoteSignIn host={host} />
+      </WorkspaceScope>
+      <Footer>
+        <Button variant="ghost" onClick={onDone}>
+          Skip for now
+        </Button>
+        <Button variant="primary" onClick={onDone}>
+          Continue
+        </Button>
+      </Footer>
+    </div>
+  );
+}
+
+/** In the new workspace's data scope: its hub's own machine is the remote one. */
+function RemoteSignIn({ host }: { host: string }) {
+  const data = useApi();
+  const api = useMemo(() => createHubOnboardingApi({ transport: data.transport }), [data.transport]);
+  return (
+    <div className="mt-2">
+      <SignInPanel api={api} target={{ kind: 'local' }} machineLabel={host} />
+    </div>
+  );
+}
+
+// ─── 8. Done ───────────────────────────────────────────────────────────────────────────────────
 
 function DoneStep({
   host,

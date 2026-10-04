@@ -205,6 +205,10 @@ describe('connecting a remote machine', () => {
       'Connect and pairWaiting',
     ]);
     expect(screen.getByText(/A SLURM job may wait in the queue for several minutes/)).toBeTruthy();
+    // And the live log: a line for each message, as it came.
+    expect(screen.getByRole('log', { name: 'Install log', hidden: true }).textContent).toContain(
+      'Copy pitcrewd 0.4.0 to ~/.pitcrew (plan-1): 40% sent',
+    );
     fireEvent.change(within(dialog).getByLabelText('Password'), { target: { value: SECRET } });
     fireEvent.click(within(dialog).getByRole('button', { name: 'Send' }));
 
@@ -221,6 +225,9 @@ describe('connecting a remote machine', () => {
     fireEvent.change(screen.getByLabelText('Your name'), { target: { value: 'Sam Rivera' } });
     fireEvent.click(button('Set up'));
 
+    // Signing in to the remote machine's agents, through its hub: skipped here.
+    await heading('Sign in to your agents on hpc-login');
+    fireEvent.click(button('Skip for now'));
     await heading('Connected');
     expect(fresh.setups).toEqual([
       { workspace_name: 'Cluster Lab', person: { name: 'Sam Rivera', handle: '@sam' }, machine_name: 'hpc-login' },

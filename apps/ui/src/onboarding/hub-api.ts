@@ -2,11 +2,21 @@
 // - `setupWorkspace` is `POST /v1/setup`, through the data layer's `setUp` for the workspace in
 //   view (so its cache knows at once that it is set up);
 // - `discoverHosts` is the gateway's `sshHosts`, in the desktop app;
+// - `checkMachine`, `fixMachineRow`, `agentAccounts`, `startSignIn` and `signInRunning` are
+//   machine setup's routes on the hub's own machine (api-v1.md, "Machine setup"), through the
+//   workspace's transport (a remote workspace's goes through the gateway to its hub). A fix only
+//   opens the tool's install page, from this app's own table (`install-pages.ts`), and checks the
+//   row again: nothing is installed;
+// - `launcherOptions` and `streamInstallHelper` are for a machine that needs PitCrew's helper (an
+//   SSH host or a WSL distro, `needsHelper`), through the gateway: the probe, and the add of a
+//   plan the person reviewed, its progress as log lines. The hub's own machine needs none (it runs
+//   the hub), so the first run has no install step;
 // - `streamScan` is `POST /v1/machines/{id}/scan` on the hub's own machine, and `createFromScan`
 //   is `POST /v1/projects` and `POST /v1/workstreams` from that scan's suggestions, both through
 //   the data layer's client for the workspace in view;
 // - everything else has no backend yet: it is listed in `unavailable`, rejects if called, and
-//   `stepsFor` leaves its step out. So the real first run is Welcome, Workspace, Scan, Create, Import, Done.
+//   `stepsFor` leaves its step out. So the real first run is Welcome, Workspace, Machine check,
+//   Sign in, Scan, Create, Import, Done.
 //
 // The transports (the browser's `fetch`, the desktop gateway's `gateway_request`) hand over a whole
 // body, so the scan's progress frames arrive together with its report, at its end; the scan step
@@ -20,6 +30,7 @@ import {
   type Location,
   type Project,
   type RemoteGateway,
+  type RemoteProbe,
   type Setup,
   type SetupResult,
   type TransportResponse,
@@ -28,14 +39,23 @@ import {
 } from '../data/index.ts';
 import {
   SetupRefused,
+  type CheckRowId,
   type CreateFromScanResult,
+  type InstallHelperOptions,
+  type InstallProgressEvent,
+  type LauncherOption,
+  type MachineTarget,
   type OnboardingApi,
   type OnboardingCall,
   type ProjectSelection,
   type ScanProgressEvent,
   type ScanTarget,
+  type SignInMethod,
   type Streamed,
 } from './api.ts';
+import { installLine } from './install-log.ts';
+import { installPage } from './install-pages.ts';
+import { toAccounts, toCheckRows, toSignIn, toStartSignInResult, wireItem } from './machine-wire.ts';
 import { projectKeyFor } from './project-key.ts';
 import {
   parseScanFrames,
@@ -46,18 +66,19 @@ import {
 } from './scan-wire.ts';
 import { fieldOfMessage } from './validation.ts';
 
-const NOT_YET: readonly OnboardingCall[] = [
+const NOT_YET: readonly OnboardingCall[] = ['integrationStatus', 'hooksDiff', 'installHooks', 'saveSafety'];
+
+/** The calls that need the workspace's transport: machine setup's routes. */
+const MACHINE_SETUP: readonly OnboardingCall[] = [
   'checkMachine',
   'fixMachineRow',
-  'launcherOptions',
-  'streamInstallHelper',
   'agentAccounts',
   'startSignIn',
-  'integrationStatus',
-  'hooksDiff',
-  'installHooks',
-  'saveSafety',
+  'signInRunning',
 ];
+
+/** The calls that need the desktop gateway's remote commands. */
+const HELPER_INSTALL: readonly OnboardingCall[] = ['launcherOptions', 'streamInstallHelper'];
 
 /** What the scan and create steps use of the data layer's client (`useApi()`). */
 export type HubData = Pick<Api, 'transport' | 'machines' | 'projects' | 'createProject' | 'createWorkstream'>;
@@ -71,6 +92,17 @@ export interface HubOnboardingOptions {
   transport?: Transport | undefined;
   /** The workspace's client (`useApi()`), for the scan and creating from it; without it, neither. */
   data?: HubData | undefined;
+  /**
+   * Opens a page outside the app (a tool's install page, for a check row's fix). By default a new
+   * browser tab with no way back to this one, in a browser; the desktop app opens no window, so
+   * there the step shows the page to copy instead.
+   */
+  openPage?: ((url: string) => void) | undefined;
+}
+
+/** A new browsing context with no way back to this one. */
+function openInBrowser(url: string): void {
+  window.open(url, '_blank', 'noopener,noreferrer');
 }
 
 /** How many keys `createFromScan` tries for one project while the hub says each is taken. */
@@ -108,6 +140,53 @@ function refusal(res: TransportResponse): string {
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** The JSON body of a `200`/`201` answer, or the hub's refusal as an error. */
+async function answer(transport: Transport, method: 'GET' | 'POST', path: string, body?: string): Promise<unknown> {
+  const res = await transport.request(method, path, body);
+  if (res.status !== 200 && res.status !== 201) throw new Error(refusal(res));
+  try {
+    return JSON.parse(res.body) as unknown;
+  } catch {
+    throw new Error(`The hub answered ${path} with something other than JSON.`);
+  }
+}
+
+/** The hub's own machine, by `GET /v1/machines`: its first local one, as the hub picks it. */
+async function hubMachine(transport: Transport): Promise<string> {
+  const machines = await answer(transport, 'GET', '/v1/machines');
+  const own = Array.isArray(machines)
+    ? (machines as unknown[])
+        .filter((m): m is { id?: unknown; kind?: unknown } => typeof m === 'object' && m !== null)
+        .find((m) => m.kind === 'local')
+    : undefined;
+  if (typeof own?.id !== 'string') throw new Error('This hub has no machine of its own yet: set the workspace up first.');
+  return own.id;
+}
+
+/** Machine setup acts on the hub's own machine; any other target is set up while connecting it. */
+function onlyHubMachine(target: MachineTarget): void {
+  if (target.kind !== 'local') {
+    throw new Error('A remote machine is checked and signed into through its own workspace, once it is connected.');
+  }
+}
+
+/** The launchers a remote machine offers, from the gateway's probe. */
+function launchersFrom(probe: RemoteProbe): LauncherOption[] {
+  const tmux = probe.tmux?.version;
+  const match = tmux === undefined ? null : /(\d+)\.(\d+)/.exec(tmux);
+  const tmuxUsable = match === null ? undefined : Number(match[1]) > 3 || (Number(match[1]) === 3 && Number(match[2]) >= 2);
+  return [
+    { launcher: 'direct', recommended: tmuxUsable !== true && probe.slurm === undefined },
+    tmuxUsable === false
+      ? { launcher: 'tmux', recommended: false, unavailable: `tmux ${tmux ?? ''} is older than 3.2` }
+      : { launcher: 'tmux', recommended: tmuxUsable === true && probe.slurm === undefined },
+    { launcher: 'systemd-user', recommended: false, unavailable: 'Not offered yet' },
+    probe.slurm === undefined
+      ? { launcher: 'slurm', recommended: false, unavailable: 'No SLURM on this machine' }
+      : { launcher: 'slurm', recommended: true },
+  ];
 }
 
 /** The hub's own machine: its first local one, as the hub itself picks it. */
@@ -158,12 +237,33 @@ export function createHubOnboardingApi(options: HubOnboardingOptions = {}): Onbo
   const { setUp, data } = options;
   const remote = options.remote ?? null;
   const transport = options.transport ?? data?.transport;
+  const openPage = options.openPage ?? (transport?.kind === 'browser' ? openInBrowser : undefined);
   const missing = new Set<OnboardingCall>(NOT_YET);
   if (setUp === undefined) missing.add('setupWorkspace');
-  if (remote === null) missing.add('discoverHosts');
+  if (remote === null) {
+    missing.add('discoverHosts');
+    for (const call of HELPER_INSTALL) missing.add(call);
+  }
   if (transport === undefined) {
     missing.add('importSessions');
     missing.add('commitImport');
+    for (const call of MACHINE_SETUP) missing.add(call);
+  }
+  /** The workspace's transport, for machine setup's routes. */
+  function hub(call: OnboardingCall): Transport {
+    if (transport === undefined) return unavailable(call);
+    return transport;
+  }
+  /** One row checked again, on the hub's own machine. */
+  async function recheck(hubTransport: Transport, row: CheckRowId) {
+    const machine = await hubMachine(hubTransport);
+    const checked = toCheckRows(
+      await answer(hubTransport, 'GET', `/v1/machines/${encodeURIComponent(machine)}/check?row=${wireItem(row)}`),
+    );
+    return checked.find((r) => r.id === row);
+  }
+  function signInPath(machine: string, engine: string): string {
+    return `/v1/machines/${encodeURIComponent(machine)}/agents/${encodeURIComponent(engine)}/sign-in`;
   }
   if (data === undefined) {
     missing.add('streamScan');
@@ -215,15 +315,102 @@ export function createHubOnboardingApi(options: HubOnboardingOptions = {}): Onbo
       };
     },
 
-    checkMachine: () => Promise.reject(new Error('checkMachine is not available yet.')),
-    fixMachineRow: () => Promise.reject(new Error('fixMachineRow is not available yet.')),
-    launcherOptions: () => Promise.reject(new Error('launcherOptions is not available yet.')),
-    streamInstallHelper: (_options, onEvent) => {
-      onEvent({ type: 'error', message: 'Installing the helper is not available yet.' });
-      return { cancel() {} };
+    needsHelper: (target) => target.kind !== 'local',
+
+    async checkMachine(target) {
+      const hubTransport = hub('checkMachine');
+      onlyHubMachine(target);
+      const machine = await hubMachine(hubTransport);
+      const rows = toCheckRows(await answer(hubTransport, 'GET', `/v1/machines/${encodeURIComponent(machine)}/check`));
+      return { machine: target, rows };
     },
-    agentAccounts: () => Promise.reject(new Error('agentAccounts is not available yet.')),
-    startSignIn: () => Promise.reject(new Error('startSignIn is not available yet.')),
+
+    async fixMachineRow(target, row) {
+      const hubTransport = hub('fixMachineRow');
+      onlyHubMachine(target);
+      const before = await recheck(hubTransport, row);
+      if (before === undefined) throw new Error('This machine has no such row any more; check it again.');
+      if (before.status === 'ok') return before;
+      const page = before.fix === 'install-page' ? installPage(row) : undefined;
+      if (page === undefined) throw new Error(`PitCrew cannot fix “${before.label}” for you.`);
+      // Nothing is installed: the person installs it from its page, then checks again.
+      openPage?.(page);
+      return before;
+    },
+
+    async launcherOptions(target) {
+      if (remote === null) return unavailable('launcherOptions');
+      if (target.kind === 'local') throw new Error('This machine runs the hub itself: it needs no helper.');
+      const probe =
+        target.kind === 'wsl'
+          ? await remote.remoteProbe('', { kind: 'wsl', distro: target.distro })
+          : await remote.remoteProbe(target.user === undefined ? target.host : `${target.user}@${target.host}`);
+      return launchersFrom(probe);
+    },
+
+    streamInstallHelper(installOptions: InstallHelperOptions, onEvent: (event: InstallProgressEvent) => void): Streamed {
+      if (remote === null) return unavailable('streamInstallHelper');
+      let live = true;
+      const emit = (event: InstallProgressEvent): void => {
+        if (live) onEvent(event);
+      };
+      const { plan } = installOptions;
+      if (installOptions.machine.kind === 'local') {
+        emit({ type: 'error', message: 'This machine runs the hub itself: it needs no helper.' });
+        return { cancel() {} };
+      }
+      if (plan === undefined) {
+        // Never unseen: what is installed, and for SLURM the exact script, is shown first.
+        emit({ type: 'error', message: 'Review what will be installed first: nothing is installed unseen.' });
+        return { cancel() {} };
+      }
+      void (async () => {
+        try {
+          await remote.remoteAdd(plan, (progress) => emit({ type: 'log', line: installLine(progress) }));
+          emit({ type: 'done' });
+        } catch (error) {
+          emit({ type: 'error', message: messageOf(error) });
+        }
+      })();
+      return {
+        cancel() {
+          // Stops the add on the gateway too, which undoes what it started.
+          if (live) void remote.remoteCancel(plan).catch(() => undefined);
+          live = false;
+        },
+      };
+    },
+
+    async agentAccounts() {
+      const hubTransport = hub('agentAccounts');
+      const machine = await hubMachine(hubTransport);
+      return toAccounts(await answer(hubTransport, 'GET', `/v1/machines/${encodeURIComponent(machine)}/agents`));
+    },
+
+    async startSignIn(engine, target, method?: SignInMethod) {
+      const hubTransport = hub('startSignIn');
+      onlyHubMachine(target);
+      const machine = await hubMachine(hubTransport);
+      const body = method === 'device-code' ? JSON.stringify({ method: 'device_code' }) : '{}';
+      return toStartSignInResult(toSignIn(await answer(hubTransport, 'POST', signInPath(machine, engine), body)));
+    },
+
+    async signInRunning(engine, target) {
+      const hubTransport = hub('signInRunning');
+      onlyHubMachine(target);
+      const machine = await hubMachine(hubTransport);
+      const res = await hubTransport.request('GET', signInPath(machine, engine));
+      if (res.status === 404) return false;
+      if (res.status !== 200) throw new Error(refusal(res));
+      let body: unknown;
+      try {
+        body = JSON.parse(res.body);
+      } catch {
+        body = undefined;
+      }
+      return toSignIn(body).running;
+    },
+
     integrationStatus: () => Promise.reject(new Error('integrationStatus is not available yet.')),
 
     streamScan(target: ScanTarget, onEvent: (event: ScanProgressEvent) => void): Streamed {
