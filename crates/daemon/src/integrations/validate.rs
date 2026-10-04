@@ -16,6 +16,8 @@ const NAME_CHARS: usize = 80;
 const URL_BYTES: usize = 2048;
 /// The longest e-mail, in characters.
 const EMAIL_CHARS: usize = 254;
+/// github.com's API root, which `api_base` leaves out.
+const GITHUB_API: &str = "https://api.github.com";
 
 /// A checked [`NewIntegration`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,9 +102,12 @@ pub fn check(new: NewIntegration) -> Result<Checked, String> {
     let settings = match new.settings {
         IntegrationSettings::Github { repos, api_base } => IntegrationSettings::Github {
             repos: distinct(&repos, "repos", is_github_repo, "owner/repo")?,
+            // github.com's own API root is the default: kept as none, so its web host and the
+            // host `gh` is asked about stay `github.com`.
             api_base: api_base
                 .map(|base| https_root(&base, "api_base", true))
-                .transpose()?,
+                .transpose()?
+                .filter(|base| !base.eq_ignore_ascii_case(GITHUB_API)),
         },
         IntegrationSettings::Jira {
             deployment,
@@ -306,5 +311,19 @@ mod tests {
             scope_keys(&a.settings),
             vec!["github:https://api.github.com:example-org/demo-repo".to_string()]
         );
+    }
+
+    #[test]
+    fn githubs_own_api_root_is_the_default() {
+        for base in ["https://api.github.com", "https://API.github.com/"] {
+            let checked = check(github(&["example-org/demo-repo"], Some(base))).unwrap();
+            assert!(
+                matches!(
+                    checked.settings,
+                    IntegrationSettings::Github { api_base: None, .. }
+                ),
+                "{base}"
+            );
+        }
     }
 }

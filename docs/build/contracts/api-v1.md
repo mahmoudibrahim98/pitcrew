@@ -701,16 +701,18 @@ tokens only** (an agent token gets `403`, before anything else is checked). Type
 - `settings` is tagged by `kind`:
   - `{ "kind": "github", "repos": String[], "api_base"?: String }`: 1–50 distinct `owner/repo`
     (GitHub's characters, as for links). `api_base` is a GitHub Enterprise Server API root
-    (`https://ghe.example.com/api/v3`); absent means `https://api.github.com`.
+    (`https://ghe.example.com/api/v3`); absent means `https://api.github.com`, and that root given
+    explicitly is kept as absent.
   - `{ "kind": "jira", "deployment": "cloud" | "data_center", "site": String, "projects":
     String[], "email"?: String, "epic_link_field"?: String }`: `site` is the Jira root
     (`https://jira.example.com`, a path allowed for Data Center); 1–50 distinct project keys;
     `email` (1–254 characters with an `@`) is required for `cloud` and refused for
     `data_center`; `epic_link_field` is `customfield_<digits>` (Data Center's epic link).
   - Every URL is `https://`, at most 2 KiB, with no user name, password, query or fragment.
-- `credential`: `gh_cli` (GitHub only) reads `gh auth token` (with `--hostname` for Enterprise)
-  on the hub's machine at each sync and keeps nothing; `stored` waits for a secret
-  (`PUT …/credential`).
+- `credential`: `gh_cli` (GitHub only) reads `gh auth token --hostname <host>` on the hub's
+  machine at each sync and keeps nothing. The host is always named (`github.com`, or the
+  Enterprise server's), and `GH_HOST` is cleared for `gh`, so its default host never decides
+  which token is sent where. `stored` waits for a secret (`PUT …/credential`).
 - `interval_minutes` is 5–1440; default 15.
 - A repository, or a Jira site and project, already in another integration is `409 conflict`.
   Anything else malformed is `400 invalid`.

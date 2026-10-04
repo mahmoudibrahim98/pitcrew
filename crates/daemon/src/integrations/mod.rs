@@ -114,12 +114,21 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The host `gh auth token --hostname` takes for a GitHub API root.
+/// The host `gh auth token --hostname` takes for a GitHub API root: `github.com` for none (or
+/// `api.github.com`), the server's own host for Enterprise Server (`ghe.example.com/api/v3`), and
+/// `<name>.ghe.com` for an Enterprise Cloud API at `api.<name>.ghe.com`.
 fn github_host(api_base: Option<&str>) -> String {
-    api_base
+    let host = api_base
         .and_then(|base| url::Url::parse(base).ok())
-        .and_then(|u| u.host_str().map(str::to_owned))
-        .unwrap_or_else(|| "github.com".to_owned())
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_else(|| "github.com".to_owned());
+    if host == "api.github.com" {
+        return "github.com".to_owned();
+    }
+    match host.strip_prefix("api.") {
+        Some(rest) if rest.ends_with(".ghe.com") => rest.to_owned(),
+        _ => host,
+    }
 }
 
 /// The repositories or Jira projects a connection syncs.
