@@ -18,8 +18,7 @@
 //!    the draft with it.
 //! 3. **Propose** ([`WorkService::propose_board`], the draft's agent only): a [`BoardProposal`] of
 //!    at most `MAX_PROPOSAL_BYTES` (the route's bound), every text checked against its bound and
-//!    redacted, every
-//!    evidence session one of the workstream's. Once per draft: `board_proposed`.
+//!    redacted, every evidence session one of the workstream's. Once per draft: `board_proposed`.
 //! 4. **Review** ([`WorkService::review_draft`], person): the accepted items become tasks in one
 //!    append with the review: `task_created` for each (in the workstream, at its proposed status,
 //!    labelled [`DRAFTED_LABEL`]), `session_linked` (by hand) for each evidence session not yet

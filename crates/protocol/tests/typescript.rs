@@ -54,6 +54,19 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
     pitcrew_protocol::files::FileList::export_all(&config)?;
     pitcrew_protocol::files::FileContent::export_all(&config)?;
     pitcrew_protocol::files::WriteFile::export_all(&config)?;
+    // Board drafts (api-v1.md, "Board drafts").
+    pitcrew_protocol::board::BoardDraft::export_all(&config)?;
+    pitcrew_protocol::board::BoardProposal::export_all(&config)?;
+    pitcrew_protocol::board::DraftCost::export_all(&config)?;
+    pitcrew_protocol::board::DraftPreview::export_all(&config)?;
+    pitcrew_protocol::board::DraftReview::export_all(&config)?;
+    pitcrew_protocol::board::DraftReviewed::export_all(&config)?;
+    pitcrew_protocol::board::DraftState::export_all(&config)?;
+    pitcrew_protocol::board::DraftedTask::export_all(&config)?;
+    pitcrew_protocol::board::ProposedTask::export_all(&config)?;
+    pitcrew_protocol::board::StartDraft::export_all(&config)?;
+    pitcrew_protocol::board::UsageEstimate::export_all(&config)?;
+    pitcrew_protocol::ids::DraftId::export_all(&config)?;
     api::ReadCursor::export_all(&config)?;
     api::MoveCursor::export_all(&config)?;
     api::Caller::export_all(&config)?;

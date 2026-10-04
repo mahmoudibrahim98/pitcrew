@@ -175,7 +175,8 @@ fn engine_word(engine: Engine) -> &'static str {
     match engine {
         Engine::Claude => "Claude Code",
         Engine::Codex => "Codex",
-        Engine::Opencode => "OpenCode",
+        Engine::OpenCode => "OpenCode",
+        _ => "an agent CLI",
     }
 }
 
