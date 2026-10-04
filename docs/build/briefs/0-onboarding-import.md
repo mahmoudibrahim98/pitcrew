@@ -6,6 +6,8 @@
   - `docs/build/contracts/api-v1.md`, `crates/protocol/**` (regenerate `packages/protocol-ts`);
   - `crates/daemon/**`, `crates/runner/**` (only what the import filter needs), `crates/hub-work/**`
     if the filter is hub state;
+  - `crates/api/**`, for one visibility check shared with read-cursor privacy (#36's
+    `stream.rs` and `activity.rs` already hide events while keeping revisions true);
   - `apps/ui/src/onboarding/**`, `apps/mock-hub/**`, `tests/conformance/**`;
   - the READMEs of what you touch.
 - **First read:**
