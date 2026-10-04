@@ -15,7 +15,7 @@ impl std::fmt::Debug for Installation {
     }
 }
 impl Installation {
-    /// Plan hooks for CLIs found on PATH, using the CLI's automatic hook form and no chaining.
+    /// Plan hooks for CLIs found on PATH or through existing homes, using the CLI's automatic hook form and no chaining.
     /// # Errors
     /// Invalid executable path or non-text/oversized configuration.
     pub fn preview(env: Env<'_>, exe: &Path) -> Result<Self> {
@@ -35,7 +35,20 @@ impl Installation {
             .ok_or_else(|| Error::invalid("Executable path is not UTF-8."))?;
         let mut plans = Vec::new();
         for target in Target::ALL {
-            if found(env, target.name()) {
+            let home = match target {
+                Target::Claude => super::config_dir(env, "CLAUDE_CONFIG_DIR", ".claude")?,
+                Target::Codex => super::config_dir(env, "CODEX_HOME", ".codex")?,
+                Target::OpenCode => opencode::plugin_dir(env)?
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .ok_or_else(|| Error::invalid("No OpenCode home."))?,
+            };
+            let data_home = target == Target::OpenCode
+                && super::env_str(env, "XDG_DATA_HOME")
+                    .map(PathBuf::from)
+                    .or_else(|| super::user_home(env).map(|h| h.join(".local/share")))
+                    .is_some_and(|h| h.join("opencode").is_dir());
+            if found(env, target.name()) || home.is_dir() || data_home {
                 // Bound input before the existing planners read it.
                 let path = match target {
                     Target::Claude => claude::path(env),
@@ -84,6 +97,15 @@ impl Installation {
             })
             .collect()
     }
+    /// Engines skipped because their existing configuration conflicts.
+    #[must_use]
+    pub fn skipped(&self) -> Vec<String> {
+        self.plans
+            .iter()
+            .filter(|p| p.status == Status::Conflicting)
+            .map(|p| p.target.name().to_owned())
+            .collect()
+    }
     /// Retained bytes for the hub's memory budget.
     #[must_use]
     pub fn bytes(&self) -> usize {
@@ -95,15 +117,14 @@ impl Installation {
     }
     /// Apply the exact plan, refusing changed files before any write, and skipping applied files.
     /// # Errors
-    /// A conflict or installer I/O error. Partial writes can be resumed with this same plan.
+    /// A stale file or installer I/O error. Conflicting engines are skipped. Partial writes can be resumed with this same plan.
     pub fn apply(&self) -> Result<()> {
-        if self.plans.iter().any(|p| p.status == Status::Conflicting) {
-            return Err(Error::new(
-                Kind::Conflict,
-                "Resolve conflicting hooks and preview again.",
-            ));
-        }
-        let changes: Vec<_> = self.plans.iter().flat_map(|p| &p.changes).collect();
+        let changes: Vec<_> = self
+            .plans
+            .iter()
+            .filter(|p| p.status != Status::Conflicting)
+            .flat_map(|p| &p.changes)
+            .collect();
         for c in &changes {
             let current = read_optional(&c.path)?;
             if current != c.before && current.as_deref() != Some(c.after.as_slice()) {
@@ -201,6 +222,39 @@ mod tests {
         std::fs::write(&path, "notify = ['foreign-command']\n").unwrap();
         let conflict = Installation::preview(&env, &exe).unwrap();
         assert_eq!(conflict.engines()[0].status, "conflicting");
-        assert_eq!(conflict.apply().unwrap_err().kind, Kind::Conflict);
+        conflict.apply().unwrap();
+        assert_eq!(conflict.skipped(), vec!["codex"]);
+    }
+    #[test]
+    fn homes_detect_engines_without_path_and_conflicts_do_not_block_other_plans() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        std::fs::create_dir_all(home.join(".codex")).unwrap();
+        std::fs::create_dir_all(home.join(".config/opencode")).unwrap();
+        let suffix = if cfg!(windows) { ".exe" } else { "" };
+        let exe = temp.path().join(format!("pitcrew{suffix}"));
+        std::fs::write(&exe, "synthetic executable, never run").unwrap();
+        let config = home.join(".codex/config.toml");
+        std::fs::write(&config, "notify = ['foreign-command']\n").unwrap();
+        let env = |name: &str| match name {
+            "HOME" | "USERPROFILE" => Some(home.clone().into_os_string()),
+            _ => None,
+        };
+        let plan = Installation::preview(&env, &exe).unwrap();
+        assert_eq!(plan.engines().len(), 2);
+        assert_eq!(plan.skipped(), vec!["codex"]);
+        let files = plan.files().unwrap();
+        assert_eq!(files.len(), 1);
+        assert!(files[0].path.ends_with("pitcrew.js"));
+        plan.apply().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "notify = ['foreign-command']\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&files[0].path).unwrap(),
+            files[0].after
+        );
+        plan.apply().unwrap();
     }
 }

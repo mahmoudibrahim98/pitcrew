@@ -123,7 +123,6 @@ export type { TranscriptItem } from './bindings/TranscriptItem.ts';
 export type { TranscriptPage } from './bindings/TranscriptPage.ts';
 export type { Workspace } from './bindings/Workspace.ts';
 export type { WorkspaceId } from './bindings/WorkspaceId.ts';
-export type { WorkspacePermissionMode } from './bindings/WorkspacePermissionMode.ts';
 export type { Workstream } from './bindings/Workstream.ts';
 export type { WorkstreamId } from './bindings/WorkstreamId.ts';
 export type { WorkstreamStatus } from './bindings/WorkstreamStatus.ts';

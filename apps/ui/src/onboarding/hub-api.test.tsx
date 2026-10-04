@@ -236,7 +236,7 @@ function fakeHub(options: FakeHubOptions = {}) {
       request: (method, path) => {
         sent.push(`${method} ${path}`);
         if (path.endsWith('/hooks/diff')) return Promise.resolve({ status: 200, body: JSON.stringify({revision: 'test-preview', files: [], engines: []}) });
-        if (path === '/v1/safety') return Promise.resolve({ status: 200, body: JSON.stringify({permissionMode: 'default', backOfficeEnabled: false, backOfficeCaps: {maxAutoAcceptPerHour: 20}}) });
+        if (path === '/v1/safety') return Promise.resolve({ status: 200, body: JSON.stringify({permission_mode: 'default', back_office_enabled: false, back_office_caps: {max_auto_accept_per_hour: 20}}) });
         if (path === '/v1/import/dry-run') return Promise.resolve({ status: 200, body: '{"count":6}' });
         if (path === '/v1/import') return Promise.resolve({ status: 200, body: '{"imported":6}' });
         return Promise.resolve(options.scan ?? SCANNED);
@@ -529,4 +529,14 @@ describe('the real first run, with the scan', () => {
     await screen.findByText(/Found 2 likely projects/);
     expect(hub.sent).toHaveLength(2);
   });
+});
+
+it('maps safety snake_case wire fields and permission enums at the UI boundary', async () => {
+  const wire = { permission_mode: 'accept_edits', back_office_enabled: true, back_office_caps: { max_auto_accept_per_hour: 8 } };
+  const request = vi.fn().mockResolvedValue({ status: 200, body: JSON.stringify(wire) });
+  const api = createHubOnboardingApi({ transport: { kind: 'browser', label: 'synthetic hub', request, openSocket: () => { throw new Error('Unused socket.'); } } });
+  const settings = await api.readSafety();
+  expect(settings).toEqual({ permissionMode: 'accept-edits', backOfficeEnabled: true, backOfficeCaps: { maxAutoAcceptPerHour: 8 } });
+  await api.saveSafety(settings);
+  expect(request).toHaveBeenLastCalledWith('PUT', '/v1/safety', JSON.stringify(wire));
 });

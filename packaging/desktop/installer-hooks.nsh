@@ -40,6 +40,7 @@
 !macro PITCREW_MOVE_ASIDE_ALL
   !insertmacro PITCREW_SWEEP_OLD
   !insertmacro PITCREW_MOVE_ASIDE_IF_RUNNING "pitcrewd.exe"
+  !insertmacro PITCREW_MOVE_ASIDE_IF_RUNNING "pitcrew.exe"
   !insertmacro PITCREW_MOVE_ASIDE_IF_RUNNING "pitcrew-ptyd.exe"
   !insertmacro PITCREW_MOVE_ASIDE_IF_RUNNING "pitcrew-askpass.exe"
 !macroend

@@ -42,24 +42,8 @@ pub struct InstallHooks {
     /// Revision from the preview.
     pub revision: String,
 }
-/// Workspace default permission mode; skipping prompts is opt-in.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(rename_all = "kebab-case")]
-pub enum WorkspacePermissionMode {
-    /// The CLI's own prompts.
-    #[default]
-    Default,
-    /// Plan before executing.
-    Plan,
-    /// Accept edits, still prompt for commands.
-    AcceptEdits,
-    /// Explicitly skip prompts.
-    BypassPermissions,
-}
 /// Back-office acceptance budget.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct BackOfficeCaps {
     /// Zero disables automatic acceptance; at most 100.
@@ -67,11 +51,10 @@ pub struct BackOfficeCaps {
 }
 /// Durable workspace safety settings.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct SafetySettings {
     /// Default for a new session without an override.
-    pub permission_mode: WorkspacePermissionMode,
+    pub permission_mode: crate::model::PermissionMode,
     /// Allow low-risk automatic acceptance.
     pub back_office_enabled: bool,
     /// Acceptance budget.
@@ -80,7 +63,7 @@ pub struct SafetySettings {
 impl Default for SafetySettings {
     fn default() -> Self {
         Self {
-            permission_mode: WorkspacePermissionMode::Default,
+            permission_mode: crate::model::PermissionMode::Default,
             back_office_enabled: false,
             back_office_caps: BackOfficeCaps {
                 max_auto_accept_per_hour: 20,
@@ -101,13 +84,32 @@ impl SafetySettings {
     }
 }
 
-impl From<WorkspacePermissionMode> for crate::model::PermissionMode {
-    fn from(mode: WorkspacePermissionMode) -> Self {
-        match mode {
-            WorkspacePermissionMode::Default => Self::Default,
-            WorkspacePermissionMode::Plan => Self::Plan,
-            WorkspacePermissionMode::AcceptEdits => Self::AcceptEdits,
-            WorkspacePermissionMode::BypassPermissions => Self::BypassPermissions,
+/// Strict request shape, separate from the forward-compatible stored event.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SaveSafety {
+    /// Default permission mode.
+    pub permission_mode: crate::model::PermissionMode,
+    /// Allow automatic acceptance.
+    pub back_office_enabled: bool,
+    /// Hourly acceptance budget.
+    pub back_office_caps: SaveBackOfficeCaps,
+}
+/// Strict request budget.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SaveBackOfficeCaps {
+    /// At most 100.
+    pub max_auto_accept_per_hour: u32,
+}
+impl From<SaveSafety> for SafetySettings {
+    fn from(request: SaveSafety) -> Self {
+        Self {
+            permission_mode: request.permission_mode,
+            back_office_enabled: request.back_office_enabled,
+            back_office_caps: BackOfficeCaps {
+                max_auto_accept_per_hour: request.back_office_caps.max_auto_accept_per_hour,
+            },
         }
     }
 }

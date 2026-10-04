@@ -708,18 +708,18 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
 ## Onboarding hooks and safety
 
 All routes below are **device only** (agents receive 403). Hook routes act on the hub's own
-machine, including a hub reached remotely: an unknown machine is 404; another registered
+machine (remote-hub onboarding is out of scope): an unknown machine is 404; another registered
 machine is 501 `unsupported`. They never access CLI logins or log configuration contents.
 
 - `POST /v1/machines/{id}/hooks/diff` → 200 `HooksDiff`: `{revision, files, engines}`.
   Each file is `{path, before: string|null, after: string}`; each engine is
-  `{engine, status, detail}`. Only installed CLIs found on the hub's PATH are planned, with the
+  `{engine, status, detail}`. CLIs found on PATH or from their homes are planned, with the
   same installer and automatic Claude hook-form selection as `pitcrew hooks install`.
   Foreign Codex notify commands conflict; chaining is not enabled. No writes occur.
-- `POST /v1/machines/{id}/hooks/install` with `{revision}` → 200 `{installed: true}`.
+- `POST /v1/machines/{id}/hooks/install` with `{revision}` → 200 `{installed: boolean, skipped: string[]}`.
   The revision identifies a server-retained plan belonging to the requesting person, valid
   for ten minutes. No paths or replacement text are accepted from the request. All files are
-  checked against the preview before applying; a changed file, conflicting engine, expired or
+  checked against the preview before applying; conflicting engines are skipped. A changed file, expired or
   unknown revision is 409 `conflict`. Repeating a successful apply is a no-op while every file
   still matches the installed result. Atomic writes and private timestamped backups use the
   CLI installer. Multi-file application is not transactional: an I/O failure may leave a
@@ -728,10 +728,10 @@ machine is 501 `unsupported`. They never access CLI logins or log configuration 
   can be evicted. Config files larger than 1 MiB are refused for this API.
 - `GET /v1/safety` → 200 `SafetySettings`.
 - `PUT /v1/safety` with `SafetySettings` → 200 the saved settings. Shape:
-  `{permissionMode: "default"|"plan"|"accept-edits"|"bypass-permissions",
-  backOfficeEnabled: boolean, backOfficeCaps: {maxAutoAcceptPerHour: integer 0..100}}`.
-  Defaults are `default`, `false`, and 20. Skipping permissions is an explicit selection and
-  the wizard shows a warning before saving. Changes append `safety_changed {settings}`;
+  `{permission_mode: "default"|"plan"|"accept_edits"|"bypass_permissions",
+  back_office_enabled: boolean, back_office_caps: {max_auto_accept_per_hour: integer 0..100}}`.
+  Defaults are `default`, `false`, and 20. Saving `bypass_permissions` is refused with 400
+  while the runner disallows it; the wizard shows this option disabled with the reason. Changes append `safety_changed {settings}`;
   identical saves append nothing. A projection rebuild and daemon restart retain the settings.
 
   New sessions without an explicit `permission_mode` use the saved workspace default.
@@ -740,3 +740,17 @@ machine is 501 `unsupported`. They never access CLI logins or log configuration 
   explicit safety save, existing hubs retain their per-task automatic acceptance policy.
   The hourly acceptance count is derived from the authored log and survives restarts. A capped
   task completion is refused; a brief is still proposed for a person to accept.
+
+Safety uses `model::PermissionMode` on the wire. Saving `bypass_permissions` is
+currently refused with 400 because the runner does not allow it. Session starts
+and dispatches without a persona mode use the saved workspace default. Before
+the first save, GET safety adds `saved: false`: legacy per-task acceptance policy
+remains effective until an explicit policy is saved. Stored safety events accept
+unknown fields for forward replay; PUT requests reject unknown fields.
+
+Hook installation applies nonconflicting engine plans, returning
+`{installed: boolean, skipped: string[]}`; `installed` is false when the preview
+has no changes. Conflicting engines are excluded from preview files and skipped,
+with their status shown to the person. CLI homes also establish engine presence
+when a GUI process lacks CLI binaries on PATH. The desktop ships `pitcrew` beside
+`pitcrewd`, and the Hooks step disables Install when there are no file changes.

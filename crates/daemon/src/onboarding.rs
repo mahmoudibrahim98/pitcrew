@@ -173,7 +173,7 @@ async fn install(
                 WorkError::conflict("The hook preview expired or is unknown. Preview again.")
             })?;
         preview.plan.apply().map_err(installer_error)?;
-        Ok(Json(serde_json::json!({"installed": true})))
+        Ok(Json(serde_json::json!({"installed": !preview.plan.files().map_err(installer_error)?.is_empty(), "skipped": preview.plan.skipped()})))
     })
     .await
     .map_err(|_| WorkError::unavailable("Hook installation failed."))?

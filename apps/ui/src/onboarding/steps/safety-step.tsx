@@ -11,7 +11,7 @@ const PERMISSION_LABEL: Record<PermissionMode, { label: string; hint: string }> 
   default: { label: 'Default', hint: "The CLI's own prompts for risky actions." },
   plan: { label: 'Plan first', hint: 'Agents propose a plan before touching anything.' },
   'accept-edits': { label: 'Accept edits', hint: 'File edits run without asking; commands still prompt.' },
-  'bypass-permissions': { label: 'Skip permissions', hint: 'Nothing prompts. An explicit, risky opt-in.' },
+  'bypass-permissions': { label: 'Skip permissions', hint: 'Unavailable: the runner currently disallows bypassing permissions.' },
 };
 
 /** Clamped to 0-100; an empty field or a non-number (mid-edit) keeps the previous value. */
@@ -67,6 +67,7 @@ export function SafetyStep() {
           <label key={mode} className="flex items-start gap-2 text-sm text-ink">
             <input
               type="radio"
+              disabled={mode === 'bypass-permissions'}
               name="permission-mode"
               className="mt-0.5"
               checked={state.safety.permissionMode === mode}

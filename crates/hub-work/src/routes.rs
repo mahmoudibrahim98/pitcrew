@@ -690,18 +690,24 @@ async fn put_import(
     }))
 }
 
-async fn get_safety(
-    Work(w): Work,
-    Person(_): Person,
-) -> Reply<pitcrew_protocol::onboarding::SafetySettings> {
-    Ok(Json(blocking(w, |w| w.safety()).await?))
+async fn get_safety(Work(w): Work, Person(_): Person) -> Reply<serde_json::Value> {
+    Ok(Json(
+        blocking(w, |w| {
+            let mut value = serde_json::to_value(w.safety()?)?;
+            if !w.safety_saved()? {
+                value["saved"] = serde_json::json!(false);
+            }
+            Ok(value)
+        })
+        .await?,
+    ))
 }
 async fn put_safety(
     Work(w): Work,
     Person(caller): Person,
-    Body(settings): Body<pitcrew_protocol::onboarding::SafetySettings>,
+    Body(settings): Body<pitcrew_protocol::onboarding::SaveSafety>,
 ) -> Reply<pitcrew_protocol::onboarding::SafetySettings> {
     Ok(Json(
-        blocking(w, move |w| w.save_safety(&caller, settings)).await?,
+        blocking(w, move |w| w.save_safety(&caller, settings.into())).await?,
     ))
 }

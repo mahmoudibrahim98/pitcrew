@@ -34,6 +34,7 @@ const env = {
   APPDATA: join(home, 'appdata'),
   LOCALAPPDATA: join(home, 'localappdata'),
   PITCREW_CONFORMANCE_EXPECTED: '',
+  PITCREW_CONFORMANCE_SYNTHETIC_HOOKS: '1',
 };
 let daemon, suite, mock, build;
 // Every process the daemon starts (pitcrew-ptyd, and the stand-in CLIs it runs) inherits this

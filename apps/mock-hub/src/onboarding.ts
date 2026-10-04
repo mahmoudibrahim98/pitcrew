@@ -4,12 +4,12 @@ import { ApiFailure, invalid, isRecord } from './validate.ts';
 import type { Hub } from './state.ts';
 
 export interface SafetySettings {
-  permissionMode: 'default' | 'plan' | 'accept-edits' | 'bypass-permissions';
-  backOfficeEnabled: boolean;
-  backOfficeCaps: { maxAutoAcceptPerHour: number };
+  permission_mode: 'default' | 'plan' | 'accept_edits' | 'bypass_permissions';
+  back_office_enabled: boolean;
+  back_office_caps: { max_auto_accept_per_hour: number };
 }
 export class Onboarding {
-  safety: SafetySettings = { permissionMode: 'default', backOfficeEnabled: false, backOfficeCaps: { maxAutoAcceptPerHour: 20 } };
+  safety: SafetySettings = { permission_mode: 'default', back_office_enabled: false, back_office_caps: { max_auto_accept_per_hour: 20 } };
   safetySaved = false;
   files = new Map<string, string>([['/home/sam/.claude/settings.json', '{\r\n  "hooks": {}\r\n}\r\n']]);
   previews = new Map<string, { owner: string; machine: string; created: number; files: { path: string; before: string | null; after: string }[] }>();
@@ -31,8 +31,8 @@ export function hooksDiff(hub: Hub, owner: string, id: string) {
   return { revision, files, engines: [{ engine: 'claude', status: files.length === 0 ? 'installed' : 'missing', detail: 'Synthetic Claude hook configuration.' }] };
 }
 export function installHooks(hub: Hub, owner: string, id: string, body: unknown) {
-  machine(hub, id);
   if (!isRecord(body) || typeof body['revision'] !== 'string' || Object.keys(body).some((k) => k !== 'revision')) throw invalid('Supply the hook preview revision.');
+  machine(hub, id);
   const preview = hub.onboarding.previews.get(body['revision']);
   if (!preview || preview.owner !== owner || preview.machine !== id || Date.now() - preview.created >= 600_000) throw new ApiFailure('conflict', 'The hook preview expired or is unknown.');
   for (const file of preview.files) {
@@ -40,12 +40,13 @@ export function installHooks(hub: Hub, owner: string, id: string, body: unknown)
     if (current !== file.before && current !== file.after) throw new ApiFailure('conflict', 'Preview again.');
   }
   for (const file of preview.files) hub.onboarding.files.set(file.path, file.after);
-  return { installed: true };
+  return { installed: preview.files.length > 0, skipped: [] };
 }
 export function parseSafety(body: unknown): SafetySettings {
-  if (!isRecord(body) || !['default', 'plan', 'accept-edits', 'bypass-permissions'].includes(String(body['permissionMode'])) || typeof body['backOfficeEnabled'] !== 'boolean' || !isRecord(body['backOfficeCaps'])) throw invalid('Invalid safety settings.');
-  if (Object.keys(body).some((k) => !['permissionMode', 'backOfficeEnabled', 'backOfficeCaps'].includes(k))) throw invalid('Unknown safety field.');
-  const cap = body['backOfficeCaps']['maxAutoAcceptPerHour'];
-  if (typeof cap !== 'number' || !Number.isInteger(cap) || cap < 0 || cap > 100 || Object.keys(body['backOfficeCaps']).some((k) => k !== 'maxAutoAcceptPerHour')) throw invalid('Invalid hourly cap.');
+  if (!isRecord(body) || !['default', 'plan', 'accept_edits', 'bypass_permissions'].includes(String(body['permission_mode'])) || typeof body['back_office_enabled'] !== 'boolean' || !isRecord(body['back_office_caps'])) throw invalid('Invalid safety settings.');
+  if (Object.keys(body).some((k) => !['permission_mode', 'back_office_enabled', 'back_office_caps'].includes(k))) throw invalid('Unknown safety field.');
+  const cap = body['back_office_caps']['max_auto_accept_per_hour'];
+  if (typeof cap !== 'number' || !Number.isInteger(cap) || cap < 0 || cap > 100 || Object.keys(body['back_office_caps']).some((k) => k !== 'max_auto_accept_per_hour')) throw invalid('Invalid hourly cap.');
+  if (body['permission_mode'] === 'bypass_permissions') throw invalid('Bypass permissions cannot be saved as the workspace default while the runner disallows it.');
   return body as unknown as SafetySettings;
 }

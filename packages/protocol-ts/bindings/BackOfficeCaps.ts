@@ -7,4 +7,4 @@ export type BackOfficeCaps = {
 /**
  * Zero disables automatic acceptance; at most 100.
  */
-maxAutoAcceptPerHour: number, };
+max_auto_accept_per_hour: number, };

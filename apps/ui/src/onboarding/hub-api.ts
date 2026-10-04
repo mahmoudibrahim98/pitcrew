@@ -354,11 +354,12 @@ export function createHubOnboardingApi(options: HubOnboardingOptions = {}): Onbo
       if (transport === undefined) return unavailable('readSafety');
       const res = await transport.request('GET', '/v1/safety');
       if (res.status !== 200) throw new Error(refusal(res));
-      return JSON.parse(res.body) as import('./api.ts').SafetySettings;
+      const wire = JSON.parse(res.body) as { permission_mode: string; back_office_enabled: boolean; back_office_caps: { max_auto_accept_per_hour: number } };
+      return { permissionMode: wire.permission_mode.replaceAll('_', '-') as import('./api.ts').PermissionMode, backOfficeEnabled: wire.back_office_enabled, backOfficeCaps: { maxAutoAcceptPerHour: wire.back_office_caps.max_auto_accept_per_hour } };
     },
     async saveSafety(settings) {
       if (transport === undefined) return unavailable('saveSafety');
-      const res = await transport.request('PUT', '/v1/safety', JSON.stringify(settings));
+      const res = await transport.request('PUT', '/v1/safety', JSON.stringify({ permission_mode: settings.permissionMode.replaceAll('-', '_'), back_office_enabled: settings.backOfficeEnabled, back_office_caps: { max_auto_accept_per_hour: settings.backOfficeCaps.maxAutoAcceptPerHour } }));
       if (res.status !== 200) throw new Error(refusal(res));
     },
   };

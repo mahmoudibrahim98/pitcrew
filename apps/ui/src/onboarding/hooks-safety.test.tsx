@@ -39,10 +39,27 @@ it('loads saved safety, retries a read failure, warns and keeps a failed save ed
   const cap = await screen.findByLabelText('Up to');
   expect((cap as HTMLInputElement).value).toBe('7');
   expect((screen.getByRole('radio', { name: /Plan first/ }) as HTMLInputElement).checked).toBe(true);
-  fireEvent.click(screen.getByRole('radio', { name: /Skip permissions/ }));
-  await screen.findByText(/Warning: skipping permissions/);
+  expect(screen.getByRole('radio', { name: /Skip permissions/ })).toHaveProperty('disabled', true);
+  await screen.findByText(/runner currently disallows/);
   fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
   await screen.findByText('Save unavailable.');
-  expect(saveSafety).toHaveBeenCalledWith({ ...settings, permissionMode: 'bypass-permissions' });
+  expect(saveSafety).toHaveBeenCalledWith(settings);
   expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(false);
+});
+
+it('does not install an empty preview and allows nonconflicting files', async () => {
+  const empty = { revision: 'empty', engines: [], files: [] };
+  const installHooks = vi.fn();
+  const api = { ...createFakeOnboardingApi({ speed: 0 }), hooksDiff: vi.fn().mockResolvedValue(empty), installHooks };
+  render(<OnboardingApiProvider api={api}><WizardProvider><HooksStep /></WizardProvider></OnboardingApiProvider>);
+  await screen.findByText('No supported agent CLIs were found on this hub.');
+  expect(screen.getByRole('button', { name: 'Install hooks' })).toHaveProperty('disabled', true);
+  expect(installHooks).not.toHaveBeenCalled();
+  cleanup();
+  api.hooksDiff.mockResolvedValue({ revision: 'mixed', engines: [{engine: 'codex', status: 'conflicting', detail: 'Foreign notify.'}], files: [{path: '/home/sam/.config/opencode/plugin/pitcrew.js', before: null, after: 'synthetic plugin'}] });
+  render(<OnboardingApiProvider api={api}><WizardProvider><HooksStep /></WizardProvider></OnboardingApiProvider>);
+  await screen.findByText('codex: Foreign notify.');
+  expect(screen.getByRole('button', { name: 'Install hooks' })).toHaveProperty('disabled', false);
+  fireEvent.click(screen.getByRole('button', { name: 'Install hooks' }));
+  await waitFor(() => expect(installHooks).toHaveBeenCalledOnce());
 });

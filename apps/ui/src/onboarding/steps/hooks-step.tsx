@@ -2,6 +2,7 @@
 // (`docs/build/streams/O.md`: "hooks (diff first)"). Hooks are fire-and-forget and under 10 ms
 // (ADR-0010); installing them here only writes the CLI config that calls out to the daemon.
 
+import { hookDiff } from '../hook-diff.ts';
 import { useEffect, useState } from 'react';
 import { useOnboardingApi } from '../api-context.tsx';
 import { StepFooter } from '../step-footer.tsx';
@@ -25,7 +26,7 @@ export function HooksStep() {
   }, [api, state.hooksDiff, patch]);
 
   async function install() {
-    if (state.hooksDiff === undefined) return;
+    if (state.hooksDiff === undefined || state.hooksDiff.files.length === 0) return;
     setError(undefined);
     setInstalling(true);
     try {
@@ -60,28 +61,15 @@ export function HooksStep() {
         {state.hooksDiff?.files.map((file) => (
           <li key={file.path} className="rounded-sm border border-line p-3">
             <p className="text-sm font-medium text-ink">{file.path}</p>
-            {file.before === null ? (
-              <p className="mt-1 text-xs text-ink-2">New file.</p>
-            ) : (
-              <pre tabIndex={0} aria-label={`Before: ${file.path}`} className="mt-1.5 overflow-auto rounded-sm bg-risk-soft p-2 text-xs text-ink">
-                {file.before
-                  .split('\n')
-                  .map((line) => `- ${line}`)
-                  .join('\n')}
-              </pre>
-            )}
-            <pre tabIndex={0} aria-label={`After: ${file.path}`} className="mt-1.5 overflow-auto rounded-sm bg-ok-soft p-2 text-xs text-ink">
-              {file.after
-                .split('\n')
-                .map((line) => `+ ${line}`)
-                .join('\n')}
+            <pre tabIndex={0} aria-label={`Diff: ${file.path}`} className="mt-1.5 overflow-auto rounded-sm bg-card p-2 text-xs text-ink">
+              {hookDiff(file.path, file.before, file.after)}
             </pre>
           </li>
         ))}
       </ul>
       <StepFooter
         nextLabel="Install hooks"
-        nextDisabled={state.hooksDiff === undefined || loading || state.hooksDiff.engines.some((engine) => engine.status === 'conflicting')}
+        nextDisabled={state.hooksDiff === undefined || loading || state.hooksDiff.files.length === 0}
         onSkip={skip}
         skipLabel="Skip hooks"
         busy={installing}

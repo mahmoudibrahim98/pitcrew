@@ -63,7 +63,7 @@ describe('the first-run route', () => {
         return { status: 200, body: '{"imported":0}' };
       }
       if (req.path.endsWith('/hooks/diff')) return {status: 200, body: JSON.stringify({revision: 'test-preview', files: [], engines: []})};
-      if (req.path === '/v1/safety') return {status: 200, body: JSON.stringify({permissionMode: 'default', backOfficeEnabled: false, backOfficeCaps: {maxAutoAcceptPerHour: 20}})};
+      if (req.path === '/v1/safety') return {status: 200, body: JSON.stringify({permission_mode: 'default', back_office_enabled: false, back_office_caps: {max_auto_accept_per_hour: 20}})};
       return fresh.daemon(req);
     });
     const router = renderApp('/');
@@ -80,8 +80,7 @@ describe('the first-run route', () => {
     await heading('Import sessions');
     await screen.findByText('This will import 0 sessions.');
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
-    await screen.findByRole('button', {name: 'Skip hooks'});
-    fireEvent.click(screen.getByRole('button', {name: 'Skip hooks'}));
+    expect(screen.queryByRole('button', {name: 'Skip hooks'})).toBeNull();
     await screen.findByLabelText('Let the back office accept low-risk actions automatically');
     await waitFor(() => expect((screen.getByRole('button', {name: 'Continue'}) as HTMLButtonElement).disabled).toBe(false));
     fireEvent.click(screen.getByRole('button', {name: 'Continue'}));
@@ -94,7 +93,7 @@ describe('the first-run route', () => {
     }
     expect(requests.filter((req) => req.path === '/v1/import').map((req) =>
       [req.workspace, req.method, JSON.parse(req.body ?? '{}')])).toEqual([[WS, 'PUT', { mode: 'all' }]]);
-    expect(requests.some((req) => req.path.endsWith('/scan') || req.method === 'POST' && req.path === '/v1/projects')).toBe(false);
+    expect(requests.some((req) => req.path.endsWith('/hooks/diff') || req.path.endsWith('/hooks/install') || req.path.endsWith('/scan') || req.method === 'POST' && req.path === '/v1/projects')).toBe(false);
     expect(fresh.setups).toEqual([
       { workspace_name: 'Cluster Lab', person: { name: 'Sam Rivera', handle: '@sam' }, machine_name: 'hpc-login' },
     ]);

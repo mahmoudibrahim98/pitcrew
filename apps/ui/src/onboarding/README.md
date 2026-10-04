@@ -197,3 +197,10 @@ corepack pnpm --filter @pitcrew/ui exec playwright test --config e2e/fresh.confi
 The real first run now includes Import after Create. It previews the indexed-session count for all sessions, a UTC date/engine/folder filter, or start fresh, then stores the choice with PUT. Requests that fail display an error and keep confirmation disabled until a successful count. Sessions stay in place; widening the hub choice is reversible via `/v1/import`.
 
 Hooks are previewed file by file on the hub’s own machine. Only **Install hooks** confirms the displayed revision; concurrent edits are refused and **Refresh diff** fetches a new preview. Skipping writes nothing. Remote machines within that workspace remain unsupported. Safety loads saved preferences before editing, warns for **Skip permissions**, and saves permission defaults and the back-office hourly acceptance budget. Read/save failures stay on the step.
+
+Onboarding review: hook previews detect supported CLIs on PATH or through their
+homes, skip conflicting engines while applying other changes, and report the
+skipped engines. No-change previews cannot set the wizard's installed flag.
+Desktop packages include the hook CLI beside the daemon. Safety uses snake_case
+wire fields and the shared PermissionMode enum; bypass defaults are currently
+refused. Unsaved safety reports `saved: false` for legacy per-task acceptance.

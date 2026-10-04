@@ -8,7 +8,9 @@ async fn safety_is_validated_authored_idempotent_and_rebuilt() {
     let temp = tempfile::tempdir().unwrap();
     let work = seeded(temp.path());
     let router = app(&work);
-    let settings = json!({"permissionMode":"bypass-permissions", "backOfficeEnabled":true, "backOfficeCaps":{"maxAutoAcceptPerHour":7}});
+    let unsaved = get(&router, person(SAM), "/v1/safety").await;
+    assert_eq!(unsaved.1["saved"], false);
+    let settings = json!({"permission_mode":"plan", "back_office_enabled":true, "back_office_caps":{"max_auto_accept_per_hour":7}});
     assert_eq!(work.safety().unwrap(), SafetySettings::default());
     for method in ["GET", "PUT"] {
         assert_eq!(
@@ -26,7 +28,7 @@ async fn safety_is_validated_authored_idempotent_and_rebuilt() {
     }
     for cap in [json!(-1), json!(101), json!(1.5), json!("7")] {
         let mut invalid = settings.clone();
-        invalid["backOfficeCaps"]["maxAutoAcceptPerHour"] = cap;
+        invalid["back_office_caps"]["max_auto_accept_per_hour"] = cap;
         assert_eq!(
             call(
                 &router,
@@ -50,6 +52,23 @@ async fn safety_is_validated_authored_idempotent_and_rebuilt() {
         )
         .await,
         (200, settings.clone())
+    );
+    let mut bypass = settings.clone();
+    bypass["permission_mode"] = json!("bypass_permissions");
+    let rejected = call(
+        &router,
+        Some(person(SAM)),
+        "PUT",
+        "/v1/safety",
+        Some(bypass),
+    )
+    .await;
+    assert_eq!(rejected.0, 400);
+    assert!(
+        rejected.1["message"]
+            .as_str()
+            .unwrap()
+            .contains("runner disallows")
     );
     let rev = work.store().latest_rev().unwrap();
     assert_eq!(

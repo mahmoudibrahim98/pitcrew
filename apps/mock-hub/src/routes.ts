@@ -1504,7 +1504,7 @@ const ROUTES: Route[] = [
   // Sessions.
   route('POST', '/v1/machines/:id/hooks/diff', 'device', (hub, ctx) => ok(hooksDiff(hub, ctx.caller.memberId, ctx.param('id')))),
   route('POST', '/v1/machines/:id/hooks/install', 'device', (hub, ctx) => ok(installHooks(hub, ctx.caller.memberId, ctx.param('id'), ctx.body))),
-  route('GET', '/v1/safety', 'device', (hub) => ok(hub.onboarding.safety)),
+  route('GET', '/v1/safety', 'device', (hub) => ok(hub.onboarding.safetySaved ? hub.onboarding.safety : { ...hub.onboarding.safety, saved: false })),
   route('PUT', '/v1/safety', 'device', (hub, ctx) => {
     const settings = parseSafety(ctx.body);
     if (!hub.onboarding.safetySaved || JSON.stringify(settings) !== JSON.stringify(hub.onboarding.safety)) {

@@ -10,7 +10,7 @@ async function request(method, path, status, body, token = person) {
   assert.equal(response.status, status, JSON.stringify(value));
   return value;
 }
-test('onboarding: exact preview confirmation, replay, device-only routes and safety persistence', async () => {
+test('onboarding: exact preview confirmation, replay, device-only routes and safety persistence', { skip: process.env.PITCREW_CONFORMANCE_SYNTHETIC_HOOKS !== '1' }, async () => {
   const machines = await request('GET', '/v1/machines', 200);
   const own = machines.find(m => m.kind === 'local');
   const other = machines.find(m => m.kind !== 'local');
@@ -26,16 +26,18 @@ test('onboarding: exact preview confirmation, replay, device-only routes and saf
   assert.ok(diff.files.length > 0);
   await request('POST', applyPath, 409, { revision: diff.revision }, process.env.PITCREW_CONFORMANCE_SECOND_PERSON);
   for (const file of diff.files) { assert.equal(typeof file.path, 'string'); assert.ok(file.before === null || typeof file.before === 'string'); assert.equal(typeof file.after, 'string'); }
-  assert.deepEqual(await request('POST', applyPath, 200, { revision: diff.revision }), { installed: true });
+  assert.deepEqual(await request('POST', applyPath, 200, { revision: diff.revision }), { installed: true, skipped: [] });
   await request('POST', applyPath, 200, { revision: diff.revision });
   assert.deepEqual((await request('POST', diffPath, 200)).files, []);
   const original = await request('GET', '/v1/safety', 200);
-  const settings = { permissionMode: 'plan', backOfficeEnabled: true, backOfficeCaps: { maxAutoAcceptPerHour: 7 } };
+  const settings = { permission_mode: 'plan', back_office_enabled: true, back_office_caps: { max_auto_accept_per_hour: 7 } };
   assert.deepEqual(await request('PUT', '/v1/safety', 200, settings), settings);
   assert.deepEqual(await request('GET', '/v1/safety', 200), settings);
   await request('PUT', '/v1/safety', 200, settings);
-  for (const cap of [-1, 101, 1.5, '7', null]) await request('PUT', '/v1/safety', 400, { ...settings, backOfficeCaps: { maxAutoAcceptPerHour: cap } });
-  await request('PUT', '/v1/safety', 400, { ...settings, permissionMode: 'unexpected' });
+  for (const cap of [-1, 101, 1.5, '7', null]) await request('PUT', '/v1/safety', 400, { ...settings, back_office_caps: { max_auto_accept_per_hour: cap } });
+  await request('PUT', '/v1/safety', 400, { ...settings, permission_mode: 'unexpected' });
+  await request('PUT', '/v1/safety', 400, { ...settings, permission_mode: 'bypass_permissions' });
   assert.deepEqual(await request('GET', '/v1/safety', 200), settings);
-  await request('PUT', '/v1/safety', 200, original);
+  const { saved: _saved, ...restore } = original;
+  await request('PUT', '/v1/safety', 200, restore);
 });

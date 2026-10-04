@@ -337,7 +337,7 @@ export function createFakeOnboardingApi(options: FakeOnboardingApiOptions = {}):
       await wait(delay(150));
       return {
         revision: "synthetic-preview",
-        engines: [],
+        engines: [{ engine: 'claude', status: 'missing', detail: 'Synthetic Claude hooks.' }, { engine: 'codex', status: 'missing', detail: 'Synthetic Codex hooks.' }],
         files: [
           {
             path: '~/.claude/settings.json',

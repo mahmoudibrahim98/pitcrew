@@ -17,7 +17,7 @@ impl Projection for Safety {
         Self::NAME
     }
     fn version(&self) -> u32 {
-        1
+        2
     }
     fn reset(&self, tx: &Transaction<'_>) -> std::result::Result<(), BoxError> {
         tx.execute_batch("CREATE TABLE IF NOT EXISTS work_safety (id INTEGER PRIMARY KEY CHECK(id = 1), settings TEXT NOT NULL); DELETE FROM work_safety;")?;
@@ -36,21 +36,35 @@ impl Projection for Safety {
         Ok(())
     }
 }
+pub(crate) fn settings(conn: &pitcrew_store::sql::Connection) -> Result<SafetySettings> {
+    let text: Option<String> = conn
+        .query_row("SELECT settings FROM work_safety WHERE id=1", [], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    Ok(text
+        .map(|s| serde_json::from_str(&s))
+        .transpose()?
+        .unwrap_or_default())
+}
 impl WorkService {
     /// Workspace defaults; absent preferences use the CLI's own prompts.
     /// # Errors
     /// Database or decoding errors.
     pub fn safety(&self) -> Result<SafetySettings> {
+        self.read(settings)
+    }
+
+    /// Whether the workspace has explicitly saved its policy.
+    /// # Errors
+    /// Database errors.
+    pub fn safety_saved(&self) -> Result<bool> {
         self.read(|conn| {
-            let text: Option<String> = conn
-                .query_row("SELECT settings FROM work_safety WHERE id=1", [], |row| {
+            Ok(
+                conn.query_row("SELECT EXISTS(SELECT 1 FROM work_safety)", [], |row| {
                     row.get(0)
-                })
-                .optional()?;
-            Ok(text
-                .map(|s| serde_json::from_str(&s))
-                .transpose()?
-                .unwrap_or_default())
+                })?,
+            )
         })
     }
     /// Whether this office member has budget for an automatic acceptance right now.
@@ -76,6 +90,11 @@ impl WorkService {
     pub fn save_safety(&self, caller: &Caller, settings: SafetySettings) -> Result<SafetySettings> {
         require_person(caller, "Saving safety settings")?;
         settings.validate().map_err(WorkError::invalid)?;
+        if settings.permission_mode == pitcrew_protocol::model::PermissionMode::BypassPermissions {
+            return Err(WorkError::invalid(
+                "Bypass permissions cannot be saved as the workspace default while the runner disallows it.",
+            ));
+        }
         let _guard = self.lock();
         let saved: bool = self.read(|conn| {
             Ok(

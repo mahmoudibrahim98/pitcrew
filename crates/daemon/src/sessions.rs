@@ -561,7 +561,6 @@ async fn start(
                 .await?
                 .map_err(work_error)?
                 .permission_mode
-                .into()
         }
     };
     let name = window_name(start.engine, &folder.path);

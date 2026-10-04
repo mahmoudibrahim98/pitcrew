@@ -61,7 +61,7 @@ function HubFirstRun() {
   // Create.
   const scanData = remoteName === undefined ? data : undefined;
   const api = useMemo((): OnboardingApi => {
-    const hub = createHubOnboardingApi({ setUp, remote, data: scanData, hooksData: data, transport: data.transport });
+    const hub = createHubOnboardingApi({ setUp, remote, data: scanData, hooksData: scanData, transport: data.transport });
     return {
       ...hub,
       commitImport: async (filter) => {

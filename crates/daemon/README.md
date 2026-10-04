@@ -1155,3 +1155,10 @@ Responses use no-store and nosniff, and failures log counts and fixed reasons wi
 ## Onboarding hooks and safety
 
 Device-only `POST /v1/machines/{id}/hooks/diff` previews hooks using the CLI installer for supported CLIs on PATH. `hooks/install` confirms that exact revision with stale-file checks and existing backups. Previews are person/machine-bound, expire after ten minutes, and are lost on restart. Config contents are never logged. Only this hub’s own machine is supported; other machines return 501. The installed `pitcrew` executable must be beside `pitcrewd` or on its PATH. `GET`/`PUT /v1/safety` persist workspace preferences; new sessions use the saved permission mode unless explicitly overridden.
+
+Onboarding review: hook previews detect supported CLIs on PATH or through their
+homes, skip conflicting engines while applying other changes, and report the
+skipped engines. No-change previews cannot set the wizard's installed flag.
+Desktop packages include the hook CLI beside the daemon. Safety uses snake_case
+wire fields and the shared PermissionMode enum; bypass defaults are currently
+refused. Unsaved safety reports `saved: false` for legacy per-task acceptance.

@@ -78,7 +78,7 @@ fn preview_confirmation_staleness_backups_and_restart() -> Result<(), Box<dyn st
         .find(|file| file.path() != path)
         .ok_or("backup")?;
     assert_eq!(fs::read_to_string(backup.path())?, original);
-    let settings = json!({"permissionMode":"plan", "backOfficeEnabled":true, "backOfficeCaps":{"maxAutoAcceptPerHour":1}});
+    let settings = json!({"permission_mode":"plan", "back_office_enabled":true, "back_office_caps":{"max_auto_accept_per_hour":1}});
     assert_eq!(
         request(
             daemon.port,

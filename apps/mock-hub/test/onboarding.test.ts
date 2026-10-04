@@ -14,11 +14,14 @@ test('synthetic previews are exact, person-bound, stale-safe and idempotent', as
   assert.throws(() => installHooks(hub, 'synthetic-person', machine, { revision: preview.revision }), /Preview again/);
   assert.equal(hub.onboarding.files.get(file.path), 'synthetic concurrent edit');
   hub.onboarding.files.set(file.path, file.before!);
-  for (let i = 0; i < 2; i++) assert.deepEqual(installHooks(hub, 'synthetic-person', machine, { revision: preview.revision }), { installed: true });
+  for (let i = 0; i < 2; i++) assert.deepEqual(installHooks(hub, 'synthetic-person', machine, { revision: preview.revision }), { installed: true, skipped: [] });
   assert.equal(hub.onboarding.files.get(file.path), file.after);
-  assert.equal(hooksDiff(hub, 'synthetic-person', machine).files.length, 0);
+  const noChanges = hooksDiff(hub, 'synthetic-person', machine);
+  assert.equal(noChanges.files.length, 0);
+  assert.deepEqual(installHooks(hub, 'synthetic-person', machine, { revision: noChanges.revision }), { installed: false, skipped: [] });
+  assert.throws(() => installHooks(hub, 'synthetic-person', 'unknown', { extra: 1 }), /revision/);
   hub.onboarding.previews.get(preview.revision)!.created -= 600_000;
   assert.throws(() => installHooks(hub, 'synthetic-person', machine, { revision: preview.revision }), /expired/);
-  assert.throws(() => parseSafety({ permissionMode: 'default', backOfficeEnabled: false, backOfficeCaps: { maxAutoAcceptPerHour: 1.5 } }), /cap/);
+  assert.throws(() => parseSafety({ permission_mode: 'default', back_office_enabled: false, back_office_caps: { max_auto_accept_per_hour: 1.5 } }), /cap/);
   });
 });
