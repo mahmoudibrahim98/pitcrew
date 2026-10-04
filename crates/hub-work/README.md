@@ -1,5 +1,7 @@
 # pitcrew-hub-work
 
+Session import stores reversible rules via `with_import_file` in a private atomic file. API session reads filter the retained projections; internal runner/command reads remain complete. Recaps rebuild when the choice changes, retaining the original event log.
+
 The hub's model of the work: projects, workstreams, tasks and subtasks, sessions and dispatches,
 asks, comments, briefs, and the workspace's machines, members, personas and teams. Everything is
 built from the event log (ADR-0004, ADR-0007).
@@ -667,5 +669,3 @@ right after one new event 1.6 / 0.9 ms. Reading and decoding the log is most of 
   says the hub does (`follow_sessions`, `move_task`).
 - The mock lets a person dispatch any agent; the hub only the caller's own (`403` otherwise), and
   refuses a brief over 64 KiB (`400`). `apps/mock-hub` is outside this crate's paths.
-
-Session import stores reversible rules via `with_import_file` in a private atomic file. API session reads filter the retained projections; internal runner/command reads remain complete. Recaps rebuild when the choice changes, retaining the original event log.

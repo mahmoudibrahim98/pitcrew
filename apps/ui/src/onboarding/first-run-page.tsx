@@ -7,9 +7,10 @@
 // `?onboarding=fake`; a production build cannot (the branch, and the fake with it, is dropped at
 // build time).
 
+import { useQueryClient } from '@tanstack/react-query';
 import { useRouter, useSearch } from '@tanstack/react-router';
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
-import { useApi, useGatewayWorkspace, useRemoteGateway, useSetUp, useWorkspace } from '../data/index.ts';
+import { keys, useApi, useGatewayWorkspace, useRemoteGateway, useSetUp, useWorkspace } from '../data/index.ts';
 import { paths, useWorkspaceId } from '../shell/index.ts';
 import { OnboardingApiProvider } from './api-context.tsx';
 import type { OnboardingApi } from './api.ts';
@@ -44,6 +45,7 @@ function GoHome() {
 }
 
 function HubFirstRun() {
+  const queries = useQueryClient();
   const setUp = useSetUp();
   const remote = useRemoteGateway();
   const data = useApi();
@@ -62,12 +64,18 @@ function HubFirstRun() {
     const hub = createHubOnboardingApi({ setUp, remote, data: scanData });
     return {
       ...hub,
+      commitImport: async (filter) => {
+        const result = await hub.commitImport(filter);
+        await Promise.all([['sessions'], keys.events, keys.recaps.all].map((queryKey) =>
+          queries.resetQueries({ queryKey })));
+        return result;
+      },
       setupWorkspace: (input) => {
         setSent(true);
         return hub.setupWorkspace(input);
       },
     };
-  }, [setUp, remote, scanData]);
+  }, [setUp, remote, scanData, queries]);
   const defaults = useMemo(
     (): WizardDefaults =>
       remoteName === undefined ? {} : { machineName: remoteName, machineLabel: 'The remote machine’s name' },
