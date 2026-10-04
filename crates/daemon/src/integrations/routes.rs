@@ -124,10 +124,14 @@ fn write_id(raw: &str) -> Result<AskId, Refusal> {
         .map_err(|_| Refusal::new(ErrorCode::NotFound, "No such write."))
 }
 
-/// `?task=&state=` (`state` may repeat); other parameters are ignored.
+/// `?task=&state=` (`state` may repeat; empty values are ignored); other parameters are ignored.
 fn write_filter(query: Option<&str>) -> Result<WriteFilter, Refusal> {
     let mut filter = WriteFilter::default();
     for (name, value) in url::form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
+        // An empty value counts as absent, as on the other list routes.
+        if value.is_empty() {
+            continue;
+        }
         match name.as_ref() {
             "task" => {
                 let task: TaskId = value
