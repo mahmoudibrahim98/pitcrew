@@ -1151,3 +1151,7 @@ file-backups: private bounded originals before replacement (runner README, Works
 Responses use no-store and nosniff, and failures log counts and fixed reasons without paths.
 
 `import.json` holds the durable session inclusion choice, scoped to this state directory. `GET /v1/import`, `POST /v1/import/dry-run`, and `PUT /v1/import` are device-only. The runner keeps reading in place; the API visibility adapter hides excluded session events, and transcript/terminal reads return 404 for them.
+
+## Onboarding hooks and safety
+
+Device-only `POST /v1/machines/{id}/hooks/diff` previews hooks using the CLI installer for supported CLIs on PATH. `hooks/install` confirms that exact revision with stale-file checks and existing backups. Previews are person/machine-bound, expire after ten minutes, and are lost on restart. Config contents are never logged. Only this hub’s own machine is supported; other machines return 501. The installed `pitcrew` executable must be beside `pitcrewd` or on its PATH. `GET`/`PUT /v1/safety` persist workspace preferences; new sessions use the saved permission mode unless explicitly overridden.

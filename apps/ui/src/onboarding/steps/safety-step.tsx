@@ -1,7 +1,7 @@
 // Step 11: the CLI's own permission mode by default (ADR-0010: skipping permissions is an
 // explicit opt-in), and the back office's on/off switch with its auto-accept cap.
 
-import { useId, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import type { PermissionMode } from '../api.ts';
 import { useOnboardingApi } from '../api-context.tsx';
 import { StepFooter } from '../step-footer.tsx';
@@ -27,12 +27,25 @@ export function SafetyStep() {
   const api = useOnboardingApi();
   const [busy, setBusy] = useState(false);
   const capsId = useId();
+  const [loaded, setLoaded] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  const [error, setError] = useState<string>();
+  useEffect(() => {
+    let active = true;
+    void api.readSafety().then((safety) => { if (active) { patch({ safety }); setLoaded(true); } })
+      .catch((e: unknown) => { if (active) setError(e instanceof Error ? e.message : String(e)); });
+    return () => { active = false; };
+  }, [api, patch, attempt]);
 
   async function submit() {
+    if (!loaded) return;
+    setError(undefined);
     setBusy(true);
     try {
       await api.saveSafety(state.safety);
       next();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
     }
@@ -45,7 +58,10 @@ export function SafetyStep() {
         void submit();
       }}
     >
-      <fieldset className="flex flex-col gap-1.5">
+      {error !== undefined && <p role="alert">{error}</p>}
+      {!loaded && error !== undefined && <button type="button" onClick={() => { setError(undefined); setAttempt((n) => n + 1); }}>Try again</button>}
+      {state.safety.permissionMode === 'bypass-permissions' && <p role="alert">Warning: skipping permissions lets agents run commands and change files without asking.</p>}
+      <fieldset disabled={!loaded} className="flex flex-col gap-1.5">
         <legend className="text-sm font-medium text-ink">Permission mode</legend>
         {(Object.keys(PERMISSION_LABEL) as PermissionMode[]).map((mode) => (
           <label key={mode} className="flex items-start gap-2 text-sm text-ink">
@@ -64,7 +80,7 @@ export function SafetyStep() {
         ))}
       </fieldset>
 
-      <fieldset className="mt-4 flex flex-col gap-2 rounded-sm border border-line p-3">
+      <fieldset disabled={!loaded} className="mt-4 flex flex-col gap-2 rounded-sm border border-line p-3">
         <label className="flex items-center gap-2 text-sm font-medium text-ink">
           <input
             type="checkbox"
@@ -101,7 +117,7 @@ export function SafetyStep() {
         )}
       </fieldset>
 
-      <StepFooter nextLabel="Continue" busy={busy} />
+      <StepFooter nextLabel="Continue" busy={busy} nextDisabled={!loaded} />
     </form>
   );
 }

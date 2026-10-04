@@ -17,6 +17,7 @@ import type { Mover } from "./Mover.ts";
 import type { Persona } from "./Persona.ts";
 import type { Project } from "./Project.ts";
 import type { Receipt } from "./Receipt.ts";
+import type { SafetySettings } from "./SafetySettings.ts";
 import type { Session } from "./Session.ts";
 import type { SessionId } from "./SessionId.ts";
 import type { SessionState } from "./SessionState.ts";
@@ -33,7 +34,11 @@ import type { WorkstreamStatus } from "./WorkstreamStatus.ts";
 /**
  * What happened. On the wire: `{"type": "task_moved", "data": {…}}`.
  */
-export type EventBody = { "type": "cursor_moved", "data": { 
+export type EventBody = { "type": "safety_changed", "data": { 
+/**
+ * Validated preferences.
+ */
+settings: SafetySettings, } } | { "type": "cursor_moved", "data": { 
 /**
  * `workspace`, `project:<id>` or `workstream:<id>`.
  */

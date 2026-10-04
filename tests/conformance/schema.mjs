@@ -191,6 +191,7 @@ const dispatch = object({
   'summary?': text,
 });
 const eventData = {
+  safety_changed: object({ settings: object({ permissionMode: enumeration("default", "plan", "accept-edits", "bypass-permissions"), backOfficeEnabled: bool, backOfficeCaps: object({ maxAutoAcceptPerHour: integer }) }) }),
   cursor_moved: object({ scope: text, rev: integer }),
   machine_added: object({ machine }),
   member_added: object({ member }),

@@ -545,7 +545,7 @@ arrive, so the data layer refetches them when the activity they cover changes:
 - Keys: `['recaps', 'blocks', filters]` and `['recaps', 'days', { workstream } | { project }, tz]`.
 - On each `events` frame, for each event:
   - `machine_added`, `machine_liveness`, `persona_saved`, `team_saved`, `project_created` and
-    `brief_proposed` are not activity: they change no recap.
+    `brief_proposed` and `safety_changed` are not activity: they change no recap.
   - `member_added` may rename someone a line names: invalidate every `['recaps']` key.
   - Any other event: find its scope as the activity route's filters would. That is the session,
     task, workstream and project it names, plus their parents from the cache (a session's task and
@@ -704,3 +704,39 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
   hub shutting down, 1011 failure, and 1009 a client message over 4 KiB.
 - The mock echoes input back and replays a short canned screen. It does not send WebSocket Pings
   yet, and its message limit is 1 MiB on both sockets.
+
+## Onboarding hooks and safety
+
+All routes below are **device only** (agents receive 403). Hook routes act on the hub's own
+machine, including a hub reached remotely: an unknown machine is 404; another registered
+machine is 501 `unsupported`. They never access CLI logins or log configuration contents.
+
+- `POST /v1/machines/{id}/hooks/diff` → 200 `HooksDiff`: `{revision, files, engines}`.
+  Each file is `{path, before: string|null, after: string}`; each engine is
+  `{engine, status, detail}`. Only installed CLIs found on the hub's PATH are planned, with the
+  same installer and automatic Claude hook-form selection as `pitcrew hooks install`.
+  Foreign Codex notify commands conflict; chaining is not enabled. No writes occur.
+- `POST /v1/machines/{id}/hooks/install` with `{revision}` → 200 `{installed: true}`.
+  The revision identifies a server-retained plan belonging to the requesting person, valid
+  for ten minutes. No paths or replacement text are accepted from the request. All files are
+  checked against the preview before applying; a changed file, conflicting engine, expired or
+  unknown revision is 409 `conflict`. Repeating a successful apply is a no-op while every file
+  still matches the installed result. Atomic writes and private timestamped backups use the
+  CLI installer. Multi-file application is not transactional: an I/O failure may leave a
+  partially installed plan; retry resumes unchanged/already-applied files, or request a new diff.
+  At most 32 previews and 16 MiB of retained configuration text are held at once; older previews
+  can be evicted. Config files larger than 1 MiB are refused for this API.
+- `GET /v1/safety` → 200 `SafetySettings`.
+- `PUT /v1/safety` with `SafetySettings` → 200 the saved settings. Shape:
+  `{permissionMode: "default"|"plan"|"accept-edits"|"bypass-permissions",
+  backOfficeEnabled: boolean, backOfficeCaps: {maxAutoAcceptPerHour: integer 0..100}}`.
+  Defaults are `default`, `false`, and 20. Skipping permissions is an explicit selection and
+  the wizard shows a warning before saving. Changes append `safety_changed {settings}`;
+  identical saves append nothing. A projection rebuild and daemon restart retain the settings.
+
+  New sessions without an explicit `permission_mode` use the saved workspace default.
+  Saving safety settings immediately limits back-office task completion and automatic brief
+  acceptance; other office actions retain their existing rules and caps. Before the first
+  explicit safety save, existing hubs retain their per-task automatic acceptance policy.
+  The hourly acceptance count is derived from the authored log and survives restarts. A capped
+  task completion is refused; a brief is still proposed for a person to accept.

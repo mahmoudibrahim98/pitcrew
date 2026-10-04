@@ -5,8 +5,9 @@
 // - `streamScan` is `POST /v1/machines/{id}/scan` on the hub's own machine, and `createFromScan`
 //   is `POST /v1/projects` and `POST /v1/workstreams` from that scan's suggestions, both through
 //   the data layer's client for the workspace in view;
+// - hooks preview/confirmation and workspace safety use device-only hub routes;
 // - everything else has no backend yet: it is listed in `unavailable`, rejects if called, and
-//   `stepsFor` leaves its step out. So the real first run is Welcome, Workspace, Scan, Create, Import, Done.
+//   `stepsFor` leaves its step out. So the real first run is Welcome, Workspace, Scan, Create, Import, Hooks, Safety, Done.
 //
 // The transports (the browser's `fetch`, the desktop gateway's `gateway_request`) hand over a whole
 // body, so the scan's progress frames arrive together with its report, at its end; the scan step
@@ -54,9 +55,6 @@ const NOT_YET: readonly OnboardingCall[] = [
   'agentAccounts',
   'startSignIn',
   'integrationStatus',
-  'hooksDiff',
-  'installHooks',
-  'saveSafety',
 ];
 
 /** What the scan and create steps use of the data layer's client (`useApi()`). */
@@ -71,6 +69,8 @@ export interface HubOnboardingOptions {
   transport?: Transport | undefined;
   /** The workspace's client (`useApi()`), for the scan and creating from it; without it, neither. */
   data?: HubData | undefined;
+  /** Client used only for hooks when remote scan/create are unavailable. */
+  hooksData?: HubData | undefined;
 }
 
 /** How many keys `createFromScan` tries for one project while the hub says each is taken. */
@@ -156,14 +156,23 @@ interface LastScan {
 
 export function createHubOnboardingApi(options: HubOnboardingOptions = {}): OnboardingApi {
   const { setUp, data } = options;
+  const hooksData = options.hooksData ?? data;
   const remote = options.remote ?? null;
-  const transport = options.transport ?? data?.transport;
+  const transport = options.transport ?? data?.transport ?? options.hooksData?.transport;
   const missing = new Set<OnboardingCall>(NOT_YET);
   if (setUp === undefined) missing.add('setupWorkspace');
   if (remote === null) missing.add('discoverHosts');
   if (transport === undefined) {
     missing.add('importSessions');
     missing.add('commitImport');
+    missing.add('hooksDiff');
+    missing.add('installHooks');
+    missing.add('saveSafety');
+    missing.add('readSafety');
+  }
+  if (hooksData === undefined) {
+    missing.add('hooksDiff');
+    missing.add('installHooks');
   }
   if (data === undefined) {
     missing.add('streamScan');
@@ -328,8 +337,29 @@ export function createHubOnboardingApi(options: HubOnboardingOptions = {}): Onbo
       if (res.status !== 200) throw new Error(refusal(res));
       return JSON.parse(res.body) as { imported: number };
     },
-    hooksDiff: () => Promise.reject(new Error('hooksDiff is not available yet.')),
-    installHooks: () => Promise.reject(new Error('installHooks is not available yet.')),
-    saveSafety: () => Promise.reject(new Error('saveSafety is not available yet.')),
+    async hooksDiff() {
+      if (hooksData === undefined || transport === undefined) return unavailable('hooksDiff');
+      const machine = await ownMachine(hooksData, new AbortController().signal);
+      const res = await transport.request('POST', `/v1/machines/${encodeURIComponent(machine)}/hooks/diff`);
+      if (res.status !== 200) throw new Error(refusal(res));
+      return JSON.parse(res.body) as import('./api.ts').HooksDiff;
+    },
+    async installHooks(preview) {
+      if (hooksData === undefined || transport === undefined) return unavailable('installHooks');
+      const machine = await ownMachine(hooksData, new AbortController().signal);
+      const res = await transport.request('POST', `/v1/machines/${encodeURIComponent(machine)}/hooks/install`, JSON.stringify({ revision: preview.revision }));
+      if (res.status !== 200) throw new Error(refusal(res));
+    },
+    async readSafety() {
+      if (transport === undefined) return unavailable('readSafety');
+      const res = await transport.request('GET', '/v1/safety');
+      if (res.status !== 200) throw new Error(refusal(res));
+      return JSON.parse(res.body) as import('./api.ts').SafetySettings;
+    },
+    async saveSafety(settings) {
+      if (transport === undefined) return unavailable('saveSafety');
+      const res = await transport.request('PUT', '/v1/safety', JSON.stringify(settings));
+      if (res.status !== 200) throw new Error(refusal(res));
+    },
   };
 }

@@ -121,3 +121,5 @@ cargo test -p pitcrew-cli --release --test hook_timing -- --ignored --nocapture
 
 Files API error compatibility: too_large (413) maps to invalid / exit 2; unsupported (501)
 maps to unavailable / exit 5, including a response without an API error body.
+
+The public `install::Installation` library retains the same installer plans for daemon onboarding: `preview` reads supported CLI configurations without writing, `files` returns exact text, and `apply` preflights stale files, preserves backups, and skips already applied files on retry. Plans are opaque and omit configuration contents from Debug output.

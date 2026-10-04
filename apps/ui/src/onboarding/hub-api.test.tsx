@@ -7,7 +7,7 @@
 // client the first run is Welcome, Workspace, Done; with it, Scan and Create come between. The
 // hub's refusals land by the right field, and a workspace set up meanwhile goes Home.
 
-import { cleanup, fireEvent, screen } from '@testing-library/react';
+import { cleanup, fireEvent, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ApiError,
@@ -235,6 +235,8 @@ function fakeHub(options: FakeHubOptions = {}) {
       label: 'a test hub',
       request: (method, path) => {
         sent.push(`${method} ${path}`);
+        if (path.endsWith('/hooks/diff')) return Promise.resolve({ status: 200, body: JSON.stringify({revision: 'test-preview', files: [], engines: []}) });
+        if (path === '/v1/safety') return Promise.resolve({ status: 200, body: JSON.stringify({permissionMode: 'default', backOfficeEnabled: false, backOfficeCaps: {maxAutoAcceptPerHour: 20}}) });
         if (path === '/v1/import/dry-run') return Promise.resolve({ status: 200, body: '{"count":6}' });
         if (path === '/v1/import') return Promise.resolve({ status: 200, body: '{"imported":6}' });
         return Promise.resolve(options.scan ?? SCANNED);
@@ -304,8 +306,8 @@ describe('the scan, from the hub', () => {
     const api = createHubOnboardingApi({ setUp: () => Promise.reject(new Error('unused')), data: fakeHub().data });
     expect(api.unavailable.has('streamScan')).toBe(false);
     expect(api.unavailable.has('createFromScan')).toBe(false);
-    expect(stepsFor(api).map((s) => s.id)).toEqual(['welcome', 'workspace', 'scan', 'create', 'import', 'done']);
-    for (const call of ['checkMachine', 'hooksDiff', 'saveSafety'] as const) {
+    expect(stepsFor(api).map((s) => s.id)).toEqual(['welcome', 'workspace', 'scan', 'create', 'import', 'hooks', 'safety', 'done']);
+    for (const call of ['checkMachine'] as const) {
       expect(api.unavailable.has(call)).toBe(true);
     }
   });
@@ -458,6 +460,8 @@ describe('the real first run, with the scan', () => {
       'Scan',
       'Create',
       'Import',
+      'Hooks',
+      'Safety',
       'Done',
     ]);
     fireEvent.click(screen.getByRole('button', { name: 'Get started' }));
@@ -477,6 +481,11 @@ describe('the real first run, with the scan', () => {
 
     await screen.findByText('This will import 6 sessions.');
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    await screen.findByRole('button', { name: 'Install hooks' });
+    fireEvent.click(screen.getByRole('button', { name: 'Skip hooks' }));
+    await screen.findByLabelText('Let the back office accept low-risk actions automatically');
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
     await screen.findByRole('heading', { level: 1, name: "You're set up" });
     expect(screen.getByText('Created 2 projects.')).toBeTruthy();
     expect(hub.projects.map((p) => [p.key, p.name])).toEqual([
@@ -484,7 +493,7 @@ describe('the real first run, with the scan', () => {
       ['TOO', 'tools'],
     ]);
     expect(hub.workstreams.map((w) => w.name)).toEqual(['drafts']);
-    expect(hub.sent).toEqual([`POST /v1/machines/${LAPTOP}/scan`, "POST /v1/import/dry-run", "PUT /v1/import"]);
+    expect(hub.sent).toEqual([`POST /v1/machines/${LAPTOP}/scan`, "POST /v1/import/dry-run", "PUT /v1/import", `POST /v1/machines/${LAPTOP}/hooks/diff`, "GET /v1/safety", "PUT /v1/safety"]);
   });
 
   it('says why a scan failed, and tries again on request', async () => {

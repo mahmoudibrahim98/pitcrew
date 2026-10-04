@@ -1,3 +1,4 @@
+import { hooksDiff, installHooks, parseSafety } from './onboarding.ts';
 // Every HTTP route in docs/build/contracts/api-v1.md.
 //
 // A route is a method, a path pattern and who may call it: routes marked **agent** in the
@@ -1340,6 +1341,7 @@ function touches(hub: Hub, body: EventBody, filter: EventFilter): boolean {
 /** What an event names directly; `touches` adds the parents. */
 function directRefs(hub: Hub, body: EventBody): EventFilter {
   switch (body.type) {
+    case 'safety_changed':
     case 'cursor_moved':
       return {};
     case 'session_discovered': {
@@ -1500,7 +1502,19 @@ const ROUTES: Route[] = [
   route('POST', '/v1/tasks/:id/comments', 'agent', postComment),
   route('POST', '/v1/tasks/:id/dispatch', 'device', dispatchTask),
   // Sessions.
-  route('GET', '/v1/import', 'device', (hub) => ok(hub.importChoice)),
+  route('POST', '/v1/machines/:id/hooks/diff', 'device', (hub, ctx) => ok(hooksDiff(hub, ctx.caller.memberId, ctx.param('id')))),
+  route('POST', '/v1/machines/:id/hooks/install', 'device', (hub, ctx) => ok(installHooks(hub, ctx.caller.memberId, ctx.param('id'), ctx.body))),
+  route('GET', '/v1/safety', 'device', (hub) => ok(hub.onboarding.safety)),
+  route('PUT', '/v1/safety', 'device', (hub, ctx) => {
+    const settings = parseSafety(ctx.body);
+    if (!hub.onboarding.safetySaved || JSON.stringify(settings) !== JSON.stringify(hub.onboarding.safety)) {
+      hub.onboarding.safetySaved = true;
+      hub.onboarding.safety = settings;
+      hub.append(ctx.caller.memberId, { type: 'safety_changed', data: { settings } });
+    }
+    return ok(settings);
+  }),
+  route('GET', '/v1/import' , 'device', (hub) => ok(hub.importChoice)),
   route('POST', '/v1/import/dry-run', 'device', (hub, ctx) => {
     const filter = parseImport(ctx.body);
     const count = hub.sessions.filter((s) => includesSession({ filter, committed_at: Date.now() }, s)).length;

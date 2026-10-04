@@ -25,6 +25,8 @@ const env = {
   ...process.env,
   HOME: home,
   USERPROFILE: home,
+  CLAUDE_CONFIG_DIR: join(home, ".claude"),
+  CODEX_HOME: join(home, ".codex"),
   XDG_DATA_HOME: join(home, 'data'),
   XDG_CONFIG_HOME: join(home, 'config'),
   XDG_CACHE_HOME: join(home, 'cache'),
@@ -117,7 +119,7 @@ try {
   } else {
     build = spawn(
       'cargo',
-      ['build', '-p', 'pitcrew-daemon', '-p', 'pitcrew-ptyd', '--bins', '--locked'],
+      ['build', '-p', 'pitcrew-daemon', '-p', 'pitcrew-ptyd', '-p', 'pitcrew-cli', '--bins', '--locked'],
       { cwd: root, stdio: 'inherit' },
     );
     const [code] = await once(build, 'exit');
@@ -141,7 +143,7 @@ try {
     // session stays `starting` while the suite runs; pitcrew-ptyd then exits once idle.
     const bin = join(temporary, 'bin');
     await mkdir(bin, { mode: 0o700 });
-    const standIn = `#!/bin/sh\nwhile [ -d '${state}' ]; do sleep 1; done\n`;
+    const standIn = `#!/bin/sh\nif [ \"$1\" = --version ]; then echo 2.1.139; exit 0; fi\nwhile [ -d '${state}' ]; do sleep 1; done\n`;
     for (const cli of ['claude', 'codex', 'opencode'])
       await writeFile(join(bin, cli), standIn, { mode: 0o700 });
     env.PATH = [bin, process.env.PATH].filter(Boolean).join(delimiter);
@@ -201,6 +203,9 @@ try {
     ).trim();
     env.PITCREW_CONFORMANCE_EXPECTED = join(root, 'tests/conformance/daemon-deviations.json');
   }
+  suite = spawn(process.execPath, ['--test', 'tests/conformance/onboarding.test.mjs'], { cwd: root, env, stdio: 'inherit' });
+  const [onboardingCode] = await once(suite, 'exit');
+  process.exitCode = onboardingCode ?? 1;
   suite = spawn(
     process.execPath,
     ['--test', 'tests/conformance/api.test.mjs', 'tests/conformance/scan.test.mjs', 'tests/conformance/files.test.mjs'],
@@ -211,7 +216,7 @@ try {
     },
   );
   const [code] = await once(suite, 'exit');
-  process.exitCode = code ?? 1;
+  process.exitCode = process.exitCode || (code ?? 1);
   {
     suite = spawn(process.execPath, ['--test', 'tests/conformance/import.test.mjs'], { cwd: root, env, stdio: 'inherit' });
     const [importCode] = await once(suite, 'exit');

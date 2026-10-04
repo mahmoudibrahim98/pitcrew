@@ -675,3 +675,5 @@ or inconsistent task/workstream references are 400. A task-only link derives its
 workstream-only link clears the task. Each emits `session_linked` with basis `manual`. Imported
 links are firm, matching the runner; the sessions projection version is bumped so replay applies
 that rule. `tests/manual_links.rs` covers route validation and protection against later inference.
+
+Workspace safety preferences are projected from person-authored `safety_changed` events (`work.safety`), with validated permission modes and a 0–100 hourly automatic-acceptance budget. An explicit save controls low-risk task completion and brief acceptance; disabled or exhausted budgets leave proposals for review. Existing hubs retain their per-task policy until the first explicit save. Rebuilding preferences retains the hourly budget because acceptances remain in the event log.

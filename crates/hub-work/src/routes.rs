@@ -91,6 +91,7 @@ where
         .route("/v1/tasks/{id}", patch(patch_task))
         .route("/v1/tasks/{id}/assign", post(assign_task))
         .route("/v1/tasks/{id}/dispatch", post(dispatch_task))
+        .route("/v1/safety", get(get_safety).put(put_safety))
         .route("/v1/import", get(get_import).put(put_import))
         .route("/v1/import/dry-run", post(dry_run_import))
         .route("/v1/sessions", get(list_sessions))
@@ -687,4 +688,20 @@ async fn put_import(
     Ok(Json(pitcrew_protocol::import::ImportResult {
         imported: blocking(w, move |w| w.commit_import(filter)).await?,
     }))
+}
+
+async fn get_safety(
+    Work(w): Work,
+    Person(_): Person,
+) -> Reply<pitcrew_protocol::onboarding::SafetySettings> {
+    Ok(Json(blocking(w, |w| w.safety()).await?))
+}
+async fn put_safety(
+    Work(w): Work,
+    Person(caller): Person,
+    Body(settings): Body<pitcrew_protocol::onboarding::SafetySettings>,
+) -> Reply<pitcrew_protocol::onboarding::SafetySettings> {
+    Ok(Json(
+        blocking(w, move |w| w.save_safety(&caller, settings)).await?,
+    ))
 }

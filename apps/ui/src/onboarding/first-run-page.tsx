@@ -61,7 +61,7 @@ function HubFirstRun() {
   // Create.
   const scanData = remoteName === undefined ? data : undefined;
   const api = useMemo((): OnboardingApi => {
-    const hub = createHubOnboardingApi({ setUp, remote, data: scanData, transport: data.transport });
+    const hub = createHubOnboardingApi({ setUp, remote, data: scanData, hooksData: data, transport: data.transport });
     return {
       ...hub,
       commitImport: async (filter) => {
@@ -75,7 +75,7 @@ function HubFirstRun() {
         return hub.setupWorkspace(input);
       },
     };
-  }, [setUp, remote, scanData, data.transport, queries]);
+  }, [setUp, remote, scanData, data, queries]);
   const defaults = useMemo(
     (): WizardDefaults =>
       remoteName === undefined ? {} : { machineName: remoteName, machineLabel: 'The remote machine’s name' },
