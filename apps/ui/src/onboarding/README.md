@@ -177,6 +177,21 @@ APIs (and the helper install, integrations, import and safety calls with them). 
 against the fake, and connecting a remote hub is now the connect wizard above. Adding a machine to
 an existing hub (a runner reporting to it) comes back when those routes land.
 
+## Drafting the boards from history (optional)
+
+After Import, the real first run can offer **Draft boards** (`steps/draft-step.tsx`,
+`draft-board.tsx`; brief 0-draft-board, api-v1.md "Board drafts"): for each workstream created in
+this run, what would be sent to an agent the person already uses (no API key: its own CLI), its
+size and the agent's estimated usage, and a start the person confirms per workstream. Proposals
+are reviewed later on each workstream's page ("Draft board"); nothing is created until then.
+
+The step goes through the data layer (`../projects/board-drafts.ts`), not `OnboardingApi`, so
+`api.ts` and `hub-api.ts` are unchanged. It is in the stepper only when `DraftStepProvider` is
+around the wizard (the hub's first run puts it there; the fake and the other tests do not) and the
+run has something to draft (`showDraftStep`: workstreams were created, and the import kept some
+sessions, or was not made). A first run that imports nothing, as against a fresh hub, has no such
+step.
+
 ## Running this stream's tests
 
 ```

@@ -14,6 +14,7 @@ export type StepId =
   | 'scan'
   | 'create'
   | 'import'
+  | 'draft'
   | 'hooks'
   | 'safety'
   | 'done';
@@ -36,6 +37,8 @@ const FIRST_RUN: StepMeta[] = [
   { id: 'scan', title: 'Scan', heading: 'Scanning for sessions', skippable: false },
   { id: 'create', title: 'Create', heading: 'Create projects and workstreams', skippable: true },
   { id: 'import', title: 'Import', heading: 'Import sessions', skippable: true },
+  // Shown only where it applies (`draft-board.tsx`): new workstreams, and history imported.
+  { id: 'draft', title: 'Draft boards', heading: 'Draft the boards from history', skippable: true },
   { id: 'hooks', title: 'Hooks', heading: 'Install hooks', skippable: true },
   { id: 'safety', title: 'Safety', heading: 'Safety settings', skippable: false },
   { id: 'done', title: 'Done', heading: "You're set up", skippable: false },
@@ -53,6 +56,8 @@ const NEEDS: Record<StepId, readonly OnboardingCall[]> = {
   // Its suggestions come from the scan.
   create: ['streamScan', 'createFromScan'],
   import: ['importSessions', 'commitImport'],
+  // Through the data layer, not `OnboardingApi`: `DraftStepProvider` offers it.
+  draft: [],
   hooks: ['hooksDiff', 'installHooks'],
   safety: ['saveSafety'],
   done: [],

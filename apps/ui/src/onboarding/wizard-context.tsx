@@ -4,13 +4,14 @@
 
 import { createContext, use, useCallback, useMemo, useState, type ReactNode } from 'react';
 import { useOnboardingApi } from './api-context.tsx';
+import { showDraftStep, useDraftStepAvailable } from './draft-board.tsx';
 import { stepsFor, type StepMeta } from './steps.ts';
 import { initialWizardState, type WizardState } from './wizard-state.ts';
 
 export type WizardPatch = Partial<WizardState> | ((state: WizardState) => Partial<WizardState>);
 
 export interface WizardContextValue {
-  /** The steps the API can serve (`stepsFor`). */
+  /** The steps the API can serve (`stepsFor`), the draft step only when it applies. */
   steps: readonly StepMeta[];
   state: WizardState;
   patch(update: WizardPatch): void;
@@ -54,8 +55,12 @@ export function useWizard(): WizardContextValue {
 /** Inside an `OnboardingApiProvider`: the steps follow what its API can do. */
 export function WizardProvider({ defaults = {}, children }: { defaults?: WizardDefaults; children: ReactNode }) {
   const api = useOnboardingApi();
-  const steps = useMemo(() => stepsFor(api), [api]);
+  const all = useMemo(() => stepsFor(api), [api]);
   const [state, setState] = useState<WizardState>(() => initialWizardState(defaults.machineName));
+  // The optional draft step shows only where a hub drafts boards and there is something to draft.
+  const drafts = useDraftStepAvailable();
+  const draft = drafts && showDraftStep(state);
+  const steps = useMemo(() => all.filter((step) => step.id !== 'draft' || draft), [all, draft]);
   const [stepIndex, setStepIndex] = useState(0);
   const [furthest, setFurthest] = useState(0);
 
