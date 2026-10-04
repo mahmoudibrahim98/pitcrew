@@ -101,7 +101,11 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [0-docs-followups](0-docs-followups.md) | 0 · Contracts | `integrator/docs-followups` | Codex | **Merged** (PR #35) |
 | [0-read-cursors](0-read-cursors.md) | 0 · Contracts | `integrator/read-cursors` | Codex | **Merged** (PR #36) |
 | [0-files-api](0-files-api.md) | 0 · Contracts | `integrator/files-api` | Codex (local, Windows) | **Merged** (PR #37) |
-| [N-files-tab](N-files-tab.md) | N · Projects layout | `integrator/files-tab` | Codex (local) | PR #43 (review fixes in progress) |
+| [N-files-tab](N-files-tab.md) | N · Projects layout | `integrator/files-tab` | Codex (local) | **Merged** (PR #43) |
+| [0-idle-cpu-2](0-idle-cpu-2.md) | 0 · Composition root | `integrator/idle-cpu-2` | Codex (cloud, Linux) | Ready |
+| [0-flaky-tests-4](0-flaky-tests-4.md) | 0 · Contracts | `integrator/flaky-tests-4` | Codex | Ready |
+| [0-onboarding-import](0-onboarding-import.md) | 0 · Contracts | `integrator/onboarding-import` | Codex | Ready |
+| [P-installer-size-2](P-installer-size-2.md) | P · Packaging | `integrator/installer-size-2` | Codex (cloud, Linux) | Ready |
 | [0-ci-security](0-ci-security.md) | 0 · Contracts | `integrator/ci-security` | Codex | **Merged** (PR #22) |
 | [0-protocol-ts](0-protocol-ts.md) | 0 · Contracts | `integrator/protocol-ts` | Codex | **Merged** (PR #23) |
 | [0-api-conformance](0-api-conformance.md) | 0 · Contracts | `integrator/api-conformance` | Codex | **Merged** (PR #24) |
