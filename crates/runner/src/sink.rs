@@ -41,12 +41,45 @@ pub(crate) fn dispatch(
     store: &Mutex<Store>,
     stop: &AtomicBool,
     retry_max: Duration,
+    group_events: usize,
 ) {
-    for batch in rx {
-        if !batch.events.is_empty() {
+    let mut pending = None;
+    loop {
+        let Some(first) = pending.take().or_else(|| rx.recv().ok()) else {
+            return;
+        };
+        let complete = matches!(&first.commit, Commit::Full(row) if row.caught_up);
+        let mut count = first.events.len();
+        let mut batches = vec![first];
+        if group_events > 0 && complete {
+            while batches.len() < 4 && count < group_events {
+                // One bounded wait lets the watcher finish the other files from this wakeup.
+                let next = match rx.recv_timeout(Duration::from_millis(1)) {
+                    Ok(next) => next,
+                    Err(_) => break,
+                };
+                let other_complete = match &next.commit {
+                    Commit::Full(row) if row.caught_up => batches.iter().all(|batch| {
+                        !matches!(&batch.commit, Commit::Full(previous) if previous.session == row.session)
+                    }),
+                    _ => false,
+                };
+                if !other_complete || count.saturating_add(next.events.len()) > group_events {
+                    pending = Some(next);
+                    break;
+                }
+                count += next.events.len();
+                batches.push(next);
+            }
+        }
+        let mut events = std::mem::take(&mut batches[0].events);
+        for batch in &mut batches[1..] {
+            events.append(&mut batch.events);
+        }
+        if !events.is_empty() {
             let mut wait = Duration::from_millis(50);
             loop {
-                match sink.accept(&batch.events) {
+                match sink.accept(&events) {
                     Ok(()) => break,
                     Err(e) => {
                         if stop.load(Ordering::Relaxed) {
@@ -63,16 +96,24 @@ pub(crate) fn dispatch(
         let saved = store
             .lock()
             .map_err(|_| "runner store lock poisoned".to_owned())
-            .and_then(|s| s.commit(&batch.commit).map_err(|e| e.to_string()));
+            .and_then(|s| {
+                if batches.len() == 1 {
+                    s.commit(&batches[0].commit)
+                } else {
+                    s.commit_many(batches.iter().map(|b| &b.commit))
+                }
+                .map_err(|e| e.to_string())
+            });
         match saved {
             Ok(()) => {
-                if let Some(unsaved) = &batch.unsaved {
-                    unsaved.fetch_sub(1, Ordering::AcqRel);
+                for batch in batches {
+                    if let Some(unsaved) = &batch.unsaved {
+                        unsaved.fetch_sub(1, Ordering::AcqRel);
+                    }
                 }
             }
-            // The events went out but the cursor did not move on disk: they repeat after a
-            // restart, which receivers already handle.
-            Err(e) => tracing::error!(error = %e, "could not save a transcript cursor"),
+            // Accepted events whose transaction failed repeat with their existing ids.
+            Err(e) => tracing::error!(error = %e, "could not save transcript cursors"),
         }
     }
 }
@@ -81,5 +122,113 @@ pub(crate) fn dispatch(
 impl<T: EventSink + ?Sized> EventSink for Arc<T> {
     fn accept(&self, events: &[Event]) -> Result<(), SinkError> {
         (**self).accept(events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::derive::Facts;
+    use crate::store::Row;
+    use pitcrew_interfaces::source::Cursor;
+    use pitcrew_protocol::events::EventBody;
+    use pitcrew_protocol::ids::{EventId, MemberId, SessionId, WorkspaceId};
+    use pitcrew_protocol::model::Engine;
+    use std::collections::HashSet;
+
+    #[derive(Default)]
+    struct RefuseOnce {
+        refused: AtomicBool,
+        offered: Mutex<Vec<Vec<EventId>>>,
+    }
+
+    impl EventSink for RefuseOnce {
+        fn accept(&self, events: &[Event]) -> Result<(), SinkError> {
+            self.offered
+                .lock()
+                .unwrap()
+                .push(events.iter().map(|e| e.id).collect());
+            if !self.refused.swap(true, Ordering::Relaxed) {
+                return Err(SinkError("retry this group".into()));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn completed_sessions_group_within_the_limit_and_retry_without_losing_cursors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Mutex::new(Store::open(dir.path()).unwrap());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut rows = Vec::new();
+        let mut counters = Vec::new();
+        for n in 0..5 {
+            let mut row = Row {
+                session: SessionId::new(),
+                engine: Engine::Claude,
+                path: dir.path().join(format!("{n}.jsonl")),
+                inner_id: None,
+                cursor: Arc::default(),
+                size: 0,
+                mtime: 0,
+                identity: None,
+                caught_up: true,
+                generation: 0,
+                discovered: true,
+                accepted: HashSet::new(),
+                meta: None,
+                facts: Facts::default(),
+            };
+            store.lock().unwrap().insert(&row).unwrap();
+            row.cursor = Arc::new(Cursor {
+                offset: n + 1,
+                state: None,
+            });
+            let unsaved = Arc::new(AtomicUsize::new(1));
+            tx.send(Batch {
+                events: vec![Event::now(
+                    WorkspaceId::new(),
+                    MemberId::new(),
+                    EventBody::SessionEnded {
+                        session: row.session,
+                    },
+                )],
+                commit: Commit::Full(Box::new(row.clone())),
+                unsaved: Some(unsaved.clone()),
+            })
+            .unwrap();
+            counters.push(unsaved);
+            rows.push(row);
+        }
+        drop(tx);
+        let sink = RefuseOnce::default();
+        dispatch(
+            &rx,
+            &sink,
+            &store,
+            &AtomicBool::new(false),
+            Duration::from_millis(50),
+            4,
+        );
+        let offered = sink.offered.lock().unwrap();
+        assert_eq!(offered.iter().map(Vec::len).collect::<Vec<_>>(), [4, 4, 1]);
+        assert_eq!(offered[0], offered[1], "retry the identical ordered group");
+        for (row, pending) in rows.iter().zip(counters) {
+            assert_eq!(
+                store
+                    .lock()
+                    .unwrap()
+                    .load(row.session)
+                    .unwrap()
+                    .unwrap()
+                    .cursor,
+                row.cursor
+            );
+            assert_eq!(
+                pending.load(Ordering::Acquire),
+                0,
+                "only saved rows released"
+            );
+        }
     }
 }

@@ -224,6 +224,7 @@ pub fn transcript_ref(path: &Path) -> TranscriptRef {
 pub fn config(home: &Path, state: &Path) -> RunnerConfig {
     let mut c = RunnerConfig::new(WorkspaceId::new(), MachineId::new(), MemberId::new(), state)
         .with_home(Engine::Claude, home);
+    c.notification_window = Duration::from_millis(175);
     c.timing = Timing {
         cold_interval: Duration::from_secs(600),
         rediscover_interval: Duration::from_secs(600),

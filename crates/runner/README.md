@@ -194,6 +194,35 @@ before the dispatch's CLI starts.
   and unclaimed starts retain the usual refresh behavior; no missing terminal is followed by its
   old target. Imported transcripts never acquire this exit evidence.
 
+## File discovery and cursors
+
+The daemon opts its Claude and Codex homes into `RunnerConfig::cache_file_discovery`. For these
+file-layout adapters, periodic discovery first checks a bounded snapshot of directory identities
+and modification times, avoiding a walk and sort of unchanged transcript names. Explicit rescans,
+new-file notifications, lost events, failed watches and polling homes always run the adapter.
+On Unix, OpenCode can also skip periodic discovery of unchanged quiet databases: the snapshot
+checks each database's identity, size, mtime and ctime. Any SQLite side file disables that cache,
+so an active WAL or rollback journal always uses the adapter. Other platforms keep OpenCode's
+original discovery schedule. Custom adapters keep the default (`false`). The slow transcript
+sweep keeps its schedule and still detects missed writes, replacements and deletions even when directory names do not change.
+
+The daemon also opts these adapters into `RunnerConfig::byte_file_cursors`: when a read's byte
+cursor reaches the file size just checked, the runner can save it as caught up immediately. It
+avoids a second read and identical cursor write just to establish EOF. Partial lines keep their
+cursor before EOF and still resume normally. OpenCode and custom adapters keep the old loop;
+the flag defaults to `false` and is for the concrete Claude/Codex JSONL adapters only. Layout
+snapshots hold at most 4,096 directories; a link, unreadable folder or larger tree disables the
+cache. Unix directory ctime is checked too, so restoring mtime cannot conceal a name change.
+
+Notification deadlines use a grid capped at 10 ms after the existing 100 ms debounce, even
+when `RunnerConfig::notification_window` requests a larger window (the daemon requests 175 ms).
+The field defaults to zero for other callers. Rounding adds less than 10 ms, so source reads
+are due within 110 ms of the notification; polling and hook reports are not rounded.
+Adjacent completed reads of different transcripts can share one sink acceptance and one cursor
+transaction, preserving order and limiting a group to four batches and `max_batch_events` events (an indivisible source
+item retains its existing exception). Cursors move only after the whole group is accepted; failed
+acceptance retries the same events, and a failed transaction pins every affected row for replay.
+
 ## Memory
 
 The watcher tracks every transcript in its index, so what it keeps of one is paid 10,000 times
@@ -204,11 +233,14 @@ identity as last read, `caught_up` and `discovered`, the CLI's id and whether it
 and the parent its hooks are judged by. The tracked transcripts are a vector sorted by id (ids
 only grow), not a `BTreeMap`, whose nodes a run of growing ids leaves half full.
 
-The rest of a row (the cursor with the adapter's state, the session's metadata and facts, the
+The rest of a cold row (the cursor with the adapter's state, the session's metadata and facts, the
 accepted items of a replay) is read from the index (`Store::load`) when the transcript changes, a
 hook reports, the sessions are linked again or the transcript is deleted, and let go once the
-sink thread has saved every batch that carries it (counted per row). A row stays in memory while
-it holds a change no batch carries yet (a report that moved when the state was last reported but
+sink thread has saved every batch that carries it (counted per row). Up to 64 saved hot rows stay
+in a cache, avoiding an index lookup on every live write. An in-use row leaves that cache before
+it changes; its unsaved batches do not count toward the cache limit and cannot be evicted. Cursor
+snapshots are immutable and shared with the sink, while their saved JSON is unchanged.
+A row stays in memory while it holds a change no batch carries yet (a report that moved when the state was last reported but
 not the state, a re-index before a read that failed), while a replay after a crash is under way,
 or after a save that failed (it is then ahead of the index, as before). At start, each row is read
 whole and only that much of it is kept.
