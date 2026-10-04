@@ -72,6 +72,7 @@ pub fn run() -> ExitCode {
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             navigate::open_links(app, args.iter().skip(1));
         }))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(move |app| {
             setup(app)?;
             tracing::info!(ms = started.elapsed().as_millis(), "the main window is up");
@@ -120,6 +121,11 @@ pub fn configure<R: Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
             commands::gateway_workspace_retry,
             commands::gateway_workspace_remove,
             commands::gateway_prompt_reply,
+            crate::updater::gateway_update_status,
+            crate::updater::gateway_update_check,
+            crate::updater::gateway_update_channel,
+            crate::updater::gateway_update_install,
+            crate::updater::gateway_update_notes,
         ])
         .on_page_load(on_page_load)
         .on_window_event(on_window_event)
@@ -309,6 +315,7 @@ fn setup(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     app.manage(remotes);
 
     main_window(app)?;
+    crate::updater::start(&handle);
     // A deep link that launched the app: held until the page listens.
     let args: Vec<String> = std::env::args_os()
         .skip(1)
