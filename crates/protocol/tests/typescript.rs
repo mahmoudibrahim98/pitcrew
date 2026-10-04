@@ -1,6 +1,8 @@
 //! Deterministic, explicit export; normal protocol tests never write bindings.
 #![cfg(feature = "ts")]
-use pitcrew_protocol::{api, events, ids, integrations, model, recap, runner, scan, transcript};
+use pitcrew_protocol::{
+    api, events, ids, integrations, model, recap, runner, scan, transcript, writes,
+};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{error::Error, fmt::Debug, fs, path::Path};
 use ts_rs::{Config, TS};
@@ -178,6 +180,15 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
     transcript::PlanStatus::export_all(&config)?;
     transcript::TranscriptItem::export_all(&config)?;
     transcript::TranscriptPage::export_all(&config)?;
+    writes::CloseReason::export_all(&config)?;
+    writes::IssueState::export_all(&config)?;
+    writes::NewWrite::export_all(&config)?;
+    writes::UpstreamWrite::export_all(&config)?;
+    writes::WriteFields::export_all(&config)?;
+    writes::WriteOperation::export_all(&config)?;
+    writes::WriteProposal::export_all(&config)?;
+    writes::WriteResult::export_all(&config)?;
+    writes::WriteState::export_all(&config)?;
 
     fs::write(
         bindings.join("TimestampMs.ts"),
@@ -368,6 +379,60 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
         events::EventBody::WorkstreamLinked {
             workstream: "01J00000000000000000000000".parse()?,
             external: vec![],
+        },
+    )?;
+    let ask: ids::AskId = "01J00000000000000000000000".parse()?;
+    fixture(
+        &config,
+        &mut examples,
+        "write",
+        writes::UpstreamWrite {
+            proposal: writes::WriteProposal {
+                ask,
+                integration: "01J00000000000000000000000".parse()?,
+                system: model::ExternalSystem::Github,
+                scope: "example-org/demo-repo".into(),
+                target: Some(model::ExternalRef {
+                    system: model::ExternalSystem::Github,
+                    key: "example-org/demo-repo#1".into(),
+                    url: Some("https://github.com/example-org/demo-repo/issues/1".into()),
+                }),
+                task: Some(id),
+                operation: writes::WriteOperation::Close,
+                before: writes::WriteFields {
+                    state: Some(writes::IssueState::Open),
+                    ..writes::WriteFields::default()
+                },
+                after: writes::WriteFields {
+                    state: Some(writes::IssueState::Closed),
+                    close_reason: Some(writes::CloseReason::Completed),
+                    ..writes::WriteFields::default()
+                },
+                requested_by: "01J00000000000000000000000".parse()?,
+                cause: Some("01J00000000000000000000000".parse()?),
+            },
+            state: writes::WriteState::Sent,
+            attempts: 1,
+            proposed_at: 40,
+            answered_at: Some(41),
+            answered_by: Some("01J00000000000000000000000".parse()?),
+            finished_at: Some(42),
+            result: Some(writes::WriteResult::Sent {
+                created: None,
+                url: Some("https://github.com/example-org/demo-repo/issues/1".into()),
+            }),
+        },
+    )?;
+    fixture(
+        &config,
+        &mut examples,
+        "writeFinished",
+        events::EventBody::WriteFinished {
+            ask,
+            task: Some(id),
+            result: writes::WriteResult::NotSent {
+                reason: "Not sent: Sam chose not to.".into(),
+            },
         },
     )?;
     fs::write(package.join("tests/fixtures.ts"), examples)?;

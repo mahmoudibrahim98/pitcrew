@@ -181,3 +181,48 @@ export const linked: import('../index.ts').EventBody = {
   },
   "type": "workstream_linked"
 };
+export const write: import('../index.ts').UpstreamWrite = {
+  "answered_at": 41,
+  "answered_by": "01J00000000000000000000000",
+  "attempts": 1,
+  "finished_at": 42,
+  "proposal": {
+    "after": {
+      "close_reason": "completed",
+      "state": "closed"
+    },
+    "ask": "01J00000000000000000000000",
+    "before": {
+      "state": "open"
+    },
+    "cause": "01J00000000000000000000000",
+    "integration": "01J00000000000000000000000",
+    "operation": "close",
+    "requested_by": "01J00000000000000000000000",
+    "scope": "example-org/demo-repo",
+    "system": "github",
+    "target": {
+      "key": "example-org/demo-repo#1",
+      "system": "github",
+      "url": "https://github.com/example-org/demo-repo/issues/1"
+    },
+    "task": "01J00000000000000000000000"
+  },
+  "proposed_at": 40,
+  "result": {
+    "outcome": "sent",
+    "url": "https://github.com/example-org/demo-repo/issues/1"
+  },
+  "state": "sent"
+};
+export const writeFinished: import('../index.ts').EventBody = {
+  "data": {
+    "ask": "01J00000000000000000000000",
+    "result": {
+      "outcome": "not_sent",
+      "reason": "Not sent: Sam chose not to."
+    },
+    "task": "01J00000000000000000000000"
+  },
+  "type": "write_finished"
+};

@@ -12,6 +12,7 @@
 use crate::ids::{
     AskId, DispatchId, EventId, MachineId, MemberId, SessionId, TaskId, WorkspaceId, WorkstreamId,
 };
+use crate::writes::{WriteProposal, WriteResult};
 use crate::model::{
     Answer, Ask, Dispatch, DispatchOutcome, ExternalRef, Health, LinkBasis, Liveness, Machine,
     Member, Mover, Persona, Project, Receipt, Session, SessionState, Subtask, Task, TaskPatch,
@@ -358,5 +359,35 @@ pub enum EventBody {
         /// Evidence.
         #[serde(default)]
         receipts: Vec<Receipt>,
+    },
+
+    // Outward writes (api-v1.md, "Outward writes"): written by the hub, as its tracker sync.
+    /// A write to GitHub or Jira was proposed, together with the approval ask that names it. Only
+    /// a write proposed this way can ever be sent.
+    WriteProposed {
+        /// Exactly what will be sent.
+        write: WriteProposal,
+    },
+    /// An approved write is being sent (one attempt).
+    WriteStarted {
+        /// The write's approval ask.
+        ask: AskId,
+        /// Its task.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        task: Option<TaskId>,
+        /// Which attempt, from 1.
+        attempt: u32,
+    },
+    /// An attempt ended, or a write was settled without being sent.
+    WriteFinished {
+        /// The write's approval ask.
+        ask: AskId,
+        /// Its task.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        task: Option<TaskId>,
+        /// What came of it.
+        result: WriteResult,
     },
 }

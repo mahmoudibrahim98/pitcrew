@@ -381,6 +381,18 @@ fn other_bodies() -> Vec<EventBody> {
         json!({"type": "team_saved", "data": {"team": demo.teams[0]}}),
         json!({"type": "session_updated", "data": {"session": session.id,
             "title": "Method section, second pass"}}),
+        json!({"type": "write_proposed", "data": {"write": {
+            "ask": demo.asks[1].id, "integration": "01J00000000000000000000001",
+            "system": "github", "scope": "example-org/demo-repo",
+            "target": {"system": "github", "key": "example-org/demo-repo#1"},
+            "task": demo.tasks[4].id, "operation": "close",
+            "before": {"state": "open"}, "after": {"state": "closed", "close_reason": "completed"},
+            "requested_by": demo.members[0].id}}}),
+        json!({"type": "write_started", "data": {"ask": demo.asks[1].id,
+            "task": demo.tasks[4].id, "attempt": 1}}),
+        json!({"type": "write_finished", "data": {"ask": demo.asks[1].id,
+            "task": demo.tasks[4].id, "result": {"outcome": "failed", "message": "Not Found",
+            "status": 404}}}),
     ];
     bodies
         .into_iter()

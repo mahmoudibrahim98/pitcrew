@@ -30,6 +30,8 @@ import type { Team } from "./Team.ts";
 import type { Workstream } from "./Workstream.ts";
 import type { WorkstreamId } from "./WorkstreamId.ts";
 import type { WorkstreamStatus } from "./WorkstreamStatus.ts";
+import type { WriteProposal } from "./WriteProposal.ts";
+import type { WriteResult } from "./WriteResult.ts";
 
 /**
  * What happened. On the wire: `{"type": "task_moved", "data": {…}}`.
@@ -338,4 +340,32 @@ why?: string,
 /**
  * Evidence.
  */
-receipts: Array<Receipt>, } };
+receipts: Array<Receipt>, } } | { "type": "write_proposed", "data": { 
+/**
+ * Exactly what will be sent.
+ */
+write: WriteProposal, } } | { "type": "write_started", "data": { 
+/**
+ * The write's approval ask.
+ */
+ask: AskId, 
+/**
+ * Its task.
+ */
+task?: TaskId, 
+/**
+ * Which attempt, from 1.
+ */
+attempt: number, } } | { "type": "write_finished", "data": { 
+/**
+ * The write's approval ask.
+ */
+ask: AskId, 
+/**
+ * Its task.
+ */
+task?: TaskId, 
+/**
+ * What came of it.
+ */
+result: WriteResult, } };
