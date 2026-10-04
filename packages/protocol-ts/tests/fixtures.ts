@@ -133,5 +133,38 @@ export const command: import('../index.ts').RunnerCommand = {
   "session": "01J00000000000000000000000",
   "type": "end_session"
 };
+export const machineCheck: import('../index.ts').MachineCheck = {
+  "rows": [
+    {
+      "detail": "Not on PATH.",
+      "fix": "install_page",
+      "id": "cli_claude",
+      "status": "missing"
+    },
+    {
+      "detail": "tmux 3.4",
+      "id": "tmux",
+      "status": "ok",
+      "version": "tmux 3.4"
+    }
+  ]
+};
+export const agentAccount: import('../index.ts').AgentAccount = {
+  "account": "ChatGPT",
+  "engine": "codex",
+  "installed": true,
+  "signed_in": true
+};
+export const signIn: import('../index.ts').SignIn = {
+  "command": [
+    "claude",
+    "auth",
+    "login"
+  ],
+  "engine": "claude",
+  "running": true,
+  "started": 42,
+  "terminal": "01J00000000000000000000000"
+};
 export const allImport: import('../index.ts').ImportFilter = { mode: 'all' };
 export const filteredImport: import('../index.ts').ImportFilter = { mode: 'filtered', since: '2026-01-01' };

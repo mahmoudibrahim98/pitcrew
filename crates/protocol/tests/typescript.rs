@@ -1,6 +1,8 @@
 //! Deterministic, explicit export; normal protocol tests never write bindings.
 #![cfg(feature = "ts")]
-use pitcrew_protocol::{api, events, ids, import, model, recap, runner, scan, transcript};
+use pitcrew_protocol::{
+    api, events, ids, import, machine_setup, model, recap, runner, scan, transcript,
+};
 use serde::{Serialize, de::DeserializeOwned};
 use std::{error::Error, fmt::Debug, fs, path::Path};
 use ts_rs::{Config, TS};
@@ -163,6 +165,11 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
     scan::ScanReport::export_all(&config)?;
     scan::Suggestion::export_all(&config)?;
     scan::WorkstreamSuggestion::export_all(&config)?;
+    // Machine setup (api-v1.md, "Machine setup").
+    machine_setup::MachineCheck::export_all(&config)?;
+    machine_setup::AgentAccount::export_all(&config)?;
+    machine_setup::StartSignIn::export_all(&config)?;
+    machine_setup::SignIn::export_all(&config)?;
     transcript::PlanItem::export_all(&config)?;
     transcript::PlanStatus::export_all(&config)?;
     transcript::TranscriptItem::export_all(&config)?;
@@ -310,6 +317,53 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
         runner::RunnerCommand::EndSession {
             session: "01J00000000000000000000000".parse()?,
             mode: runner::EndMode::Graceful,
+        },
+    )?;
+    fixture(
+        &config,
+        &mut examples,
+        "machineCheck",
+        machine_setup::MachineCheck {
+            rows: vec![
+                machine_setup::MachineCheckRow {
+                    id: machine_setup::MachineCheckItem::CliClaude,
+                    status: machine_setup::MachineCheckStatus::Missing,
+                    detail: "Not on PATH.".into(),
+                    version: None,
+                    fix: Some(machine_setup::MachineCheckFix::InstallPage),
+                },
+                machine_setup::MachineCheckRow {
+                    id: machine_setup::MachineCheckItem::Tmux,
+                    status: machine_setup::MachineCheckStatus::Ok,
+                    detail: "tmux 3.4".into(),
+                    version: Some("tmux 3.4".into()),
+                    fix: None,
+                },
+            ],
+        },
+    )?;
+    fixture(
+        &config,
+        &mut examples,
+        "agentAccount",
+        machine_setup::AgentAccount {
+            engine: model::Engine::Codex,
+            installed: true,
+            signed_in: Some(true),
+            account: Some("ChatGPT".into()),
+            detail: None,
+        },
+    )?;
+    fixture(
+        &config,
+        &mut examples,
+        "signIn",
+        machine_setup::SignIn {
+            engine: model::Engine::Claude,
+            terminal: "01J00000000000000000000000".parse()?,
+            command: vec!["claude".into(), "auth".into(), "login".into()],
+            running: true,
+            started: 42,
         },
     )?;
     // Request dimensions may be omitted even though Rust serializes their defaults.

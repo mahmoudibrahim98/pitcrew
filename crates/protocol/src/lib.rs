@@ -25,6 +25,7 @@ pub mod events;
 pub mod files;
 pub mod ids;
 pub mod import;
+pub mod machine_setup;
 pub mod model;
 pub mod recap;
 pub mod runner;
