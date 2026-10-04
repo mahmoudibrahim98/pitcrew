@@ -143,6 +143,8 @@ pub struct Options {
     pub scan_timeout: Duration,
     /// Window for each idle CPU measurement (three minutes by default).
     pub cpu_window: Duration,
+    /// Include the configured history in the CPU stage; otherwise generate only fifty files.
+    pub cpu_history: bool,
     /// CLI binary, normally next to pitcrewd.
     pub pitcrew: PathBuf,
 }
@@ -173,6 +175,7 @@ impl Options {
             min_free_gib: 6,
             scan_timeout: Duration::from_secs(30 * 60),
             cpu_window: Duration::from_secs(180),
+            cpu_history: false,
         }
     }
 }
@@ -734,7 +737,7 @@ fn stages(options: &Options, env: &Env) -> Result<()> {
 
     // 1. The homes.
     let mut spec = Spec::new(options.seed, options.sessions);
-    if options.stage == Stage::Cpu {
+    if options.stage == Stage::Cpu && !options.cpu_history {
         spec.claude = 50;
         spec.subagents = 0;
         spec.codex = 0;

@@ -28,12 +28,10 @@ fn new_items_arrive_fast_and_a_restart_resumes_from_the_cursor() {
     let mut items: Vec<_> = (0..3).map(turn).collect();
     let source = Arc::new(LoggedFake::new(vec![transcript_ref(&path)], items.clone()));
     let sink = Arc::new(CollectSink::default());
-    let runner = pitcrew_runner::start(
-        config(home.path(), state.path()),
-        vec![source.clone()],
-        sink.clone(),
-    )
-    .unwrap();
+    let mut cfg = config(home.path(), state.path());
+    cfg.cache_file_discovery = true;
+    cfg.notification_window = Duration::from_millis(175);
+    let runner = pitcrew_runner::start(cfg.clone(), vec![source.clone()], sink.clone()).unwrap();
 
     // Discovery reads everything there is, one item per read (the fake's way).
     sink.wait_for(4, Duration::from_secs(5))
@@ -42,6 +40,8 @@ fn new_items_arrive_fast_and_a_restart_resumes_from_the_cursor() {
         labels(&sink.events()),
         ["discovered:Idle", "turn@0", "turn@1", "turn@2"]
     );
+    // Sink acceptance can precede the watcher's final read that establishes EOF.
+    assert!(eventually(Duration::from_secs(2), || source.reads().len() >= 4));
     assert_eq!(source.reads(), [0, 1, 2, 3]);
 
     // A loaded runner may delay one notification. Keep the product's 300 ms budget for the
@@ -77,12 +77,7 @@ fn new_items_arrive_fast_and_a_restart_resumes_from_the_cursor() {
 
     // Restart on the same index, with the file unchanged: nothing is read at all.
     source.reads.lock().unwrap().clear();
-    let runner = pitcrew_runner::start(
-        config(home.path(), state.path()),
-        vec![source.clone()],
-        sink.clone(),
-    )
-    .unwrap();
+    let runner = pitcrew_runner::start(cfg, vec![source.clone()], sink.clone()).unwrap();
     std::thread::sleep(Duration::from_millis(400));
     assert!(source.reads().is_empty(), "re-read: {:?}", source.reads());
     assert_eq!(sink.len(), 9, "no events repeated");

@@ -173,6 +173,10 @@ impl Rig {
             RunnerConfig::new(WorkspaceId::new(), MachineId::new(), MemberId::new(), state)
                 .with_home(engine, home)
                 .with_session_env(env.clone());
+        // Exercise dispatch adoption with the same optimizations as the daemon.
+        config.cache_file_discovery = true;
+        config.byte_file_cursors = true;
+        config.notification_window = Duration::from_millis(175);
         config.timing = Timing {
             cold_interval: Duration::from_secs(600),
             rediscover_interval: Duration::from_secs(600),
