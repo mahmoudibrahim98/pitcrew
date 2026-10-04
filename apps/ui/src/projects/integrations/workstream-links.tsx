@@ -7,7 +7,7 @@ import { Button, Dialog, DialogContent, DialogFooter } from '../../design/index.
 import type { ExternalRef, Workstream } from '../../data/index.ts';
 import { formatWhen, isWebUrl } from '../format.ts';
 import { ErrorNote, Field, inputClass } from '../ui.tsx';
-import { describeScope, integrationOf, scopesOf, useIntegrationActions, useIntegrations } from './api.ts';
+import { describeScope, integrationOf, narrowerScope, scopesOf, useIntegrationActions, useIntegrations } from './api.ts';
 
 /** The links dialog's body: the links, each with Unlink, and a form to add one. */
 export function LinkEditor({ workstream, onDone }: { workstream: Workstream; onDone(): void }) {
@@ -16,6 +16,7 @@ export function LinkEditor({ workstream, onDone }: { workstream: Workstream; onD
   const scopes = integrations.flatMap((i) => scopesOf(i).map((scope) => ({ integration: i, scope })));
   const [picked, setPicked] = useState(0);
   const [within, setWithin] = useState('');
+  const [problem, setProblem] = useState<string | undefined>(undefined);
   const current = workstream.external;
   const save = (external: ExternalRef[]) =>
     link.mutate({ workstream: workstream.id, external }, { onSuccess: () => setWithin('') });
@@ -24,14 +25,12 @@ export function LinkEditor({ workstream, onDone }: { workstream: Workstream; onD
     const choice = scopes[picked];
     if (choice === undefined) return;
     const narrower = within.trim();
-    const base = choice.scope;
-    let added: ExternalRef = base;
-    if (narrower !== '' && base.system === 'github') {
-      added = { system: 'github', key: `${base.key}#milestone:${narrower}`, url: `https://github.com/${base.key}/milestone/${narrower}` };
-    } else if (narrower !== '' && base.system === 'jira') {
-      const site = choice.integration.settings.kind === 'jira' ? choice.integration.settings.site : '';
-      added = { system: 'jira', key: narrower, url: `${site}/browse/${narrower}` };
+    const added = narrower === '' ? choice.scope : narrowerScope(choice.integration, choice.scope, narrower);
+    if (typeof added === 'string') {
+      setProblem(added);
+      return;
     }
+    setProblem(undefined);
     if (current.some((l) => l.system === added.system && l.key === added.key)) return;
     save([...current, added]);
   };
@@ -74,10 +73,19 @@ export function LinkEditor({ workstream, onDone }: { workstream: Workstream; onD
           </Field>
           <Field
             label={choice?.scope.system === 'jira' ? 'Only this epic (optional)' : 'Only this milestone (optional)'}
-            hint={choice?.scope.system === 'jira' ? 'An epic’s key, such as DEMO-5.' : 'The milestone’s number, such as 3.'}
+            hint={
+              choice?.scope.system === 'jira'
+                ? `An epic’s key, such as ${choice.scope.key}-5.`
+                : 'The milestone’s number, such as 3.'
+            }
           >
             {(id) => <input id={id} className={inputClass} value={within} onChange={(e) => setWithin(e.target.value)} />}
           </Field>
+          {problem !== undefined && (
+            <p role="alert" className="text-sm text-risk">
+              {problem}
+            </p>
+          )}
           {link.error !== null && <ErrorNote error={link.error} what="change the links" />}
           <DialogFooter>
             <Button onClick={onDone}>Done</Button>

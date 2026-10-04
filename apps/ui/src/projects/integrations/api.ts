@@ -202,13 +202,51 @@ export function describeScope(link: ExternalRef): string {
   return link.key;
 }
 
+/**
+ * Where a GitHub integration's pages are: `https://github.com` for github.com, else the
+ * Enterprise server's own origin (its API root's scheme, host and port, as the sync crate trusts
+ * its `html_url`s).
+ */
+export function githubWebRoot(apiBase: string | undefined): string {
+  if (apiBase === undefined) return 'https://github.com';
+  try {
+    const url = new URL(apiBase);
+    return url.hostname === 'api.github.com' ? 'https://github.com' : url.origin;
+  } catch {
+    return 'https://github.com';
+  }
+}
+
 /** The scopes an integration can be linked to, for the link picker: its repositories or projects. */
 export function scopesOf(integration: Integration): ExternalRef[] {
   const settings = integration.settings;
   if (settings.kind === 'github') {
-    return settings.repos.map((repo) => ({ system: 'github', key: repo, url: `https://github.com/${repo}` }));
+    const web = githubWebRoot(settings.api_base);
+    return settings.repos.map((repo) => ({ system: 'github', key: repo, url: `${web}/${repo}` }));
   }
   return settings.projects.map((project) => ({ system: 'jira', key: project, url: `${settings.site}/browse/${project}` }));
+}
+
+/**
+ * The link to one milestone (GitHub) or epic (Jira) within `scope`, one of `scopesOf(integration)`,
+ * or why `within` names none: a milestone is its number; an epic is an issue key of the scope's
+ * own project (`DEMO-5` for `DEMO`).
+ */
+export function narrowerScope(integration: Integration, scope: ExternalRef, within: string): ExternalRef | string {
+  const settings = integration.settings;
+  if (settings.kind === 'github') {
+    if (!/^[1-9][0-9]{0,17}$/.test(within)) return 'A milestone is its number, such as 3.';
+    return {
+      system: 'github',
+      key: `${scope.key}#milestone:${within}`,
+      url: `${githubWebRoot(settings.api_base)}/${scope.key}/milestone/${within}`,
+    };
+  }
+  const key = within.toUpperCase();
+  if (!key.startsWith(`${scope.key}-`) || !/^[1-9][0-9]{0,17}$/.test(key.slice(scope.key.length + 1))) {
+    return `An epic of ${scope.key} is one of its issue keys, such as ${scope.key}-5.`;
+  }
+  return { system: 'jira', key, url: `${settings.site}/browse/${key}` };
 }
 
 /** The integration whose scopes include `link`, if any. */

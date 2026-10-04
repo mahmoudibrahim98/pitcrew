@@ -37,7 +37,7 @@ none of this folder lands in the initial bundle until a projects route is visite
 | `calendar.tsx`, `calendar-dates.ts` | Calendar route: due tasks by month, filters for me/project/workstream, locale week starts, arrow-key day navigation, Enter to show a day's tasks, and a phone agenda. Calendar arithmetic uses UTC solely to keep date-only values stable. |
 | `timeline.tsx`, `scheduled-task.tsx`, `schedule.css` | Project Timeline: workstream rows on a shared week/month axis, exact due-date labels, a today line, undated tasks apart, and status symbols and borders. Scrolling stays in the timeline; task buttons open the drawer and regain focus when it closes. |
 | `people.tsx`, `ui.tsx` | Avatars; small shared pieces (candidates for `src/design`). |
-| `integrations/` | GitHub and Jira (api-v1.md, "Integrations"; read-only upstream): `api.ts` (the wire types, `integrationClient`, `useIntegrations`, `useIntegrationActions`), `integrations-page.tsx` (Settings › Integrations at `settings/integrations`: connect, credential, test, sync now, status and problems, linked workstreams, remove) and `workstream-links.tsx` (the workstream page's links upstream and their last sync, and the dialog that links or unlinks them). See "Integrations" below. |
+| `integrations/` | GitHub and Jira (api-v1.md, "Integrations"; read-only upstream): `api.ts` (the wire types, `integrationClient`, `useIntegrations`, `useIntegrationActions`, `useStoreCredential`, and the links' `githubWebRoot`, `scopesOf` and `narrowerScope`), `integrations-page.tsx` (Settings › Integrations at `settings/integrations`: connect, credential, test, sync now, status and problems, linked workstreams, remove) and `workstream-links.tsx` (the workstream page's links upstream and their last sync, and the dialog that links or unlinks them). See "Integrations" below. |
 
 ## Integrations
 
@@ -55,7 +55,9 @@ none of this folder lands in the initial bundle until a projects route is visite
   `gateway_request`; in a browser (development) it is `PUT …/credential`.
 - **Links.** A workstream's header shows its links (with the upstream title once synced) and its
   integration's last sync; "Edit links" picks a connected repository or Jira project, optionally
-  narrowed to a milestone number or an epic key, and `PATCH`es the full list. `workstream_linked`
+  narrowed to a milestone number or an epic key of that project (anything else is refused before
+  it is sent), and `PATCH`es the full list. Links point at the integration's own web host: an
+  Enterprise server's origin, not `github.com` (`githubWebRoot`). `workstream_linked`
   refreshes the workstream and the integrations. The list polls every 30 s (2 s while one syncs):
   a sync's status has no event of its own.
 
