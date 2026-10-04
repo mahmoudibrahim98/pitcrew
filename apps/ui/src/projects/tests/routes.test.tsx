@@ -5,10 +5,10 @@
 // pattern this copies): its routes replace the shell's placeholders, and a task page reproduces
 // from its URL alone, with no dialog — see projects/README.md, "The task page".
 
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import type { QueryClient } from '@tanstack/react-query';
 import { createMemoryHistory, RouterProvider } from '@tanstack/react-router';
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { freePort, spawnHub, type HubProcess } from '../../../tests/hub-process.ts';
 import { createApi } from '../../data/api.ts';
 import { createQueryClient, DataProvider } from '../../data/provider.tsx';
@@ -33,6 +33,8 @@ let queryClient: QueryClient | undefined;
 
 afterEach(async () => {
   cleanup();
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   await queryClient?.cancelQueries();
   queryClient?.clear();
   localStorage.clear();
@@ -54,6 +56,27 @@ const heading = (name: string | RegExp) => screen.findByRole('heading', { level:
 const PLACEHOLDER = 'A placeholder until its feature fills this page.';
 
 describe('the projects feature, wired into the shell', () => {
+  it('asks before route navigation with a dirty file and preserves the draft on cancel', async () => {
+    const path = `/w/${WORKSPACE}/projects/${demo.paper}/workstreams/${demo.submission}`;
+    const router = renderApp(path);
+    fireEvent.click(await screen.findByRole('radio', { name: 'Files' }));
+    fireEvent.click(await screen.findByRole('button', { name: '▸ src' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'hello.txt' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    fireEvent.change(screen.getByLabelText('Edit file text'), { target: { value: 'unsaved draft' } });
+    const confirm = vi.fn().mockReturnValue(false);
+    vi.stubGlobal('confirm', confirm);
+    fireEvent.click(screen.getByRole('button', { name: 'Paper · Diffusion study' }));
+    await waitFor(() => expect(confirm).toHaveBeenCalledWith('Discard unsaved changes?'));
+    expect(router.state.location.pathname).toBe(path);
+    expect((screen.getByLabelText('Edit file text') as HTMLTextAreaElement).value).toBe('unsaved draft');
+    void router.navigate({ to: `/w/${WORKSPACE}/home` });
+    await waitFor(() => expect(confirm).toHaveBeenCalledTimes(2));
+    expect(router.state.location.pathname).toBe(path);
+    confirm.mockReturnValue(true);
+    await router.navigate({ to: `/w/${WORKSPACE}/home` });
+    await heading('Home');
+  });
   it('serves Home with live panels where the shell had a placeholder', async () => {
     renderApp(`/w/${WORKSPACE}/home`);
     await heading('Home');

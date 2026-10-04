@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type KeyboardEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
 import { ApiError, useApi, useLiveQuery, type Workstream } from '../data/index.ts';
 import { fileClient, type FileContent } from '../data/files.ts';
 
@@ -17,12 +17,21 @@ export function fileProblem(error: unknown): string {
 
 export function viewerKind(file: FileContent): 'image' | 'text' | 'binary' {
   if (file.media_type === 'image/png' || file.media_type === 'image/jpeg') return 'image';
+  if (file.media_type === 'image/svg+xml') return 'binary';
   return file.encoding === 'utf8' ? 'text' : 'binary';
 }
 
-function imageSource(file: FileContent) {
-  const base64 = file.encoding === 'base64' ? file.content : btoa(Array.from(new TextEncoder().encode(file.content), (byte) => String.fromCharCode(byte)).join(''));
-  return `data:${file.media_type};base64,${base64}`;
+function ImagePreview({ file, path }: { file: FileContent; path: string }) {
+  const image = useRef<HTMLImageElement>(null);
+  useEffect(() => {
+    const bytes = file.encoding === 'base64'
+      ? Uint8Array.from(atob(file.content), (char) => char.charCodeAt(0))
+      : new TextEncoder().encode(file.content);
+    const url = URL.createObjectURL(new Blob([bytes], { type: file.media_type }));
+    if (image.current) image.current.src = url;
+    return () => URL.revokeObjectURL(url);
+  }, [file]);
+  return <img ref={image} alt={path} className="max-w-full" />;
 }
 
 function Folder({ client, scope, path, openFile }: { client: Client; scope: readonly unknown[]; path: string; openFile: (path: string) => void }) {
@@ -111,7 +120,7 @@ function FileView({ client, path, onDirty, onBusy }: { client: Client; path: str
     {file === undefined && error === undefined && <p role="status">Loading file…</p>}
     {saved && <p role="status">Saved</p>}
     {file !== undefined && <>
-      {viewerKind(file) === 'image' && <img alt={path} className="max-w-full" src={imageSource(file)} />}
+      {viewerKind(file) === 'image' && <ImagePreview file={file} path={path} />}
       {viewerKind(file) === 'binary' && <p>Binary, {file.size} bytes</p>}
       {viewerKind(file) === 'text' && <>
         {draft === undefined ? <>
@@ -138,11 +147,11 @@ export function FilesTab({ workstream, onDirty, onBusy }: { workstream: Workstre
   useEffect(() => { onDirty(dirty); }, [dirty, onDirty]);
   useEffect(() => { onBusy(busy); }, [busy, onBusy]);
   useEffect(() => {
-    if (!dirty) return;
+    if (!dirty && !busy) return;
     const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ''; };
     window.addEventListener('beforeunload', warn);
     return () => window.removeEventListener('beforeunload', warn);
-  }, [dirty]);
+  }, [dirty, busy]);
   const canLeave = () => !busy && (!dirty || window.confirm('Discard unsaved changes?'));
   if (workstream.locations.length === 0) return <p>No folders in this workstream.</p>;
   return <section aria-label="Workstream files" className="space-y-3">

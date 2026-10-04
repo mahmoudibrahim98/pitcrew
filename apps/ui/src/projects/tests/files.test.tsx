@@ -21,9 +21,30 @@ it('chooses safe viewers and labels API failures', () => {
   expect(viewerKind({ ...content, encoding: 'base64' })).toBe('binary');
   for (const media_type of ['image/png', 'image/jpeg']) expect(viewerKind({ ...content, media_type, encoding: 'base64' })).toBe('image');
   expect(viewerKind({ ...content, media_type: 'text/html' })).toBe('text');
+  expect(viewerKind({ ...content, media_type: 'image/svg+xml' })).toBe('binary');
   expect(fileProblem(new ApiError('forbidden', 'private', 403))).toBe('Not allowed');
   expect(fileProblem(new ApiError('not_found', 'private', 404))).toBe('Gone');
   expect(fileProblem(new ApiError('too_large', 'large', 413, { size: 9000000 }))).toBe('Too large to show (9000000 bytes)');
+});
+it('decodes image bytes into object URLs and revokes previews on change and unmount', async () => {
+  const create = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:preview');
+  const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+  const view = renderWithHub(<FilesTab workstream={stream} onDirty={vi.fn()} onBusy={vi.fn()} />, hub, { fetch: async (...args) => {
+    if (String(args[0]).includes('/files/content?')) return new Response(JSON.stringify({ ...content, media_type: 'image/png', encoding: 'base64', content: 'AQID' }), { headers: { 'Content-Type': 'application/json' } });
+    return fetch(...args);
+  } });
+  fireEvent.click(await screen.findByRole('button', { name: '▸ src' }));
+  fireEvent.click(await screen.findByRole('button', { name: 'hello.txt' }));
+  await waitFor(() => expect(screen.getByRole('img').getAttribute('src')).toBe('blob:preview'));
+  const blob = create.mock.calls[0]?.[0] as Blob;
+  expect(blob.type).toBe('image/png');
+  expect([...new Uint8Array(await blob.arrayBuffer())]).toEqual([1, 2, 3]);
+  create.mockReturnValue('blob:second');
+  fireEvent.click(screen.getByRole('button', { name: 'large.bin' }));
+  await waitFor(() => expect(screen.getByRole('img').getAttribute('src')).toBe('blob:second'));
+  expect(revoke).toHaveBeenCalledWith('blob:preview');
+  view.unmount();
+  expect(revoke).toHaveBeenCalledWith('blob:second');
 });
 it('loads one level at a time, refuses links and displays the size cap', async () => {
   const reads: string[] = [];

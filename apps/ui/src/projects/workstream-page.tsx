@@ -2,7 +2,7 @@
 // The route is `projects/$project/workstreams/$workstream`; the tab on screen is this component's
 // own state, not the URL.
 
-import { useParams } from '@tanstack/react-router';
+import { useBlocker, useParams } from '@tanstack/react-router';
 import { ToggleGroup } from 'radix-ui';
 import { useState } from 'react';
 import { ReadScope } from './read-scope.tsx';
@@ -46,6 +46,11 @@ export function WorkstreamPage() {
   const [tab, setTab] = useState<Tab>('stands');
   const [filesDirty, setFilesDirty] = useState(false);
   const [filesBusy, setFilesBusy] = useState(false);
+  useBlocker({
+    disabled: !filesDirty && !filesBusy,
+    shouldBlockFn: () => filesBusy || (filesDirty && !window.confirm('Discard unsaved changes?')),
+    enableBeforeUnload: false,
+  });
   const workstreams = useWorkstreams();
   const names = useNames();
   const nav = useProjectsNav();

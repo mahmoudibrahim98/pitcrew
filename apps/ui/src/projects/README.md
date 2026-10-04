@@ -137,10 +137,13 @@ The workstream page's Files tab uses `src/data/files.ts` through the shared tran
 Folders load one level at a time; links stay closed, and capped listings are marked.
 Up/Down and Home/End move between folder controls; Left/Right close/open folders.
 Files show literal UTF-8 text with line numbers, PNG/JPEG images, or a byte count.
+Images use local Blob object URLs, revoked when the preview changes or unmounts;
+SVG files stay binary.
 Text edits send the revision read. Conflicts keep the draft: Reload discards it after
 confirmation, while Overwrite reads the latest revision before trying another write.
 Unsaved edits ask before changing files, locations or workstream tabs, and warn on
-browser unload. A write in progress prevents those switches. Remote locations show
+route navigation and browser unload. A write in progress prevents switches and
+route navigation, and warns on unload. Remote locations show
 the API's unsupported state. No file contents enter the shared query cache.
 
 `tests/files.test.tsx` covers lazy folders, safe viewers, errors and revisions.
