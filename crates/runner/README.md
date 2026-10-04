@@ -214,12 +214,16 @@ the flag defaults to `false` and is for the concrete Claude/Codex JSONL adapters
 snapshots hold at most 4,096 directories; a link, unreadable folder or larger tree disables the
 cache. Unix directory ctime is checked too, so restoring mtime cannot conceal a name change.
 
-Notification deadlines use a grid capped at 10 ms after the existing 100 ms debounce, even
-when `RunnerConfig::notification_window` requests a larger window (the daemon requests 175 ms).
-The field defaults to zero for other callers. Rounding adds less than 10 ms, so source reads
-are due within 110 ms of the notification; polling and hook reports are not rounded.
+With a nonzero `RunnerConfig::notification_window`, the first notification after a quiet period
+is due at the existing 100 ms debounce, without rounding. A notification arriving while another
+read or delivery is due or running can be read immediately. Earlier pending notifications keep
+their own deadlines. The busy window ends when that work completes, including overlapping reads
+and deliveries; there is no timer or deadline grid. The duration's magnitude is retained for
+caller compatibility but no longer sets a grid (the daemon still passes 175 ms). Zero keeps
+ordinary per-file debounce. Polling and hook reports retain their schedules.
 Adjacent completed reads of different transcripts can share one sink acceptance and one cursor
-transaction, preserving order and limiting a group to four batches and `max_batch_events` events (an indivisible source
+transaction when already queued, without waiting for another batch, preserving order and limiting
+a group to four batches and `max_batch_events` events (an indivisible source
 item retains its existing exception). Cursors move only after the whole group is accepted; failed
 acceptance retries the same events, and a failed transaction pins every affected row for replay.
 

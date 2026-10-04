@@ -58,8 +58,6 @@ use ulid::Ulid;
 const MAX_READS_PER_REFRESH: usize = 4096;
 /// Recently used hot rows retained after saving; cold history still lives in the index.
 const HOT_ROW_CACHE: usize = 64;
-/// Leave room in the 300 ms write-to-event budget after notification debounce.
-const MAX_NOTIFICATION_GRID: Duration = Duration::from_millis(10);
 /// Dirty paths held before the watcher falls back to checking everything.
 const MAX_DIRTY_PATHS: usize = 10_000;
 /// Least time between rediscoveries triggered by unknown files.
@@ -121,6 +119,7 @@ pub(crate) enum Target {
 pub(crate) struct Shared {
     signals: Mutex<Signals>,
     cv: Condvar,
+    pub(crate) busy: Arc<AtomicUsize>,
     /// Starts for sessions the hub named whose terminal is not recorded yet (see [`Pending`]).
     pending: Mutex<Vec<Pending>>,
     /// Commands starting a session the hub named, from when they are run until they return: how
@@ -215,6 +214,22 @@ struct Dirty {
     created: bool,
 }
 
+/// A read or delivery in flight; it ends with the work, never with a timer.
+pub(crate) struct Busy(Arc<AtomicUsize>);
+
+impl Busy {
+    pub(crate) fn enter(count: &Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(count))
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, Signals> {
         self.signals
@@ -224,10 +239,38 @@ impl Shared {
 
     fn mark(&self, paths: Vec<PathBuf>, due: Instant, created: bool) {
         let mut s = self.lock();
+        Self::mark_locked(&mut s, paths, due, created);
+        drop(s);
+        self.cv.notify_one();
+    }
+
+    fn notification(
+        &self,
+        paths: Vec<PathBuf>,
+        now: Instant,
+        debounce: Duration,
+        coalesce: bool,
+        created: bool,
+    ) {
+        let mut s = self.lock();
+        let due = if coalesce
+            && (self.busy.load(Ordering::Acquire) > 0 || s.dirty.values().any(|d| d.due <= now))
+        {
+            now
+        } else {
+            after(now, debounce)
+        };
+        Self::mark_locked(&mut s, paths, due, created);
+        drop(s);
+        self.cv.notify_one();
+    }
+
+    fn mark_locked(s: &mut Signals, paths: Vec<PathBuf>, due: Instant, created: bool) {
         for p in paths {
             if let Some(d) = s.dirty.get_mut(&p) {
                 // Keep the earliest due time: a stream of writes is read every `debounce`, not
                 // starved.
+                d.due = d.due.min(due);
                 d.created |= created;
                 continue;
             }
@@ -240,8 +283,6 @@ impl Shared {
             }
             s.dirty.insert(p, Dirty { due, created });
         }
-        drop(s);
-        self.cv.notify_one();
     }
 
     /// Events were lost (inotify queue overflow, FSEvents "must scan subdirectories"): check
@@ -421,7 +462,6 @@ pub(crate) fn notify_handler(
     debounce: Duration,
     window: Duration,
 ) -> impl FnMut(notify::Result<notify::Event>) + Send + 'static {
-    let epoch = Instant::now();
     move |res| match res {
         Ok(ev) if ev.need_rescan() => shared.lost_events(),
         // Reads (ours included) and access-time updates are not changes.
@@ -439,37 +479,16 @@ pub(crate) fn notify_handler(
                     | EventKind::Any
                     | EventKind::Other
             );
-            shared.mark(
+            shared.notification(
                 ev.paths,
-                round_deadline(after(Instant::now(), debounce), epoch, window),
+                Instant::now(),
+                debounce,
+                !window.is_zero(),
                 created,
             );
         }
         Err(e) => shared.watcher_error(&e),
     }
-}
-
-/// Keeps debounce as the minimum delay, adding strictly less than 10 ms.
-fn round_deadline(due: Instant, epoch: Instant, window: Duration) -> Instant {
-    if window.is_zero() {
-        return due;
-    }
-    let Some(elapsed) = due.checked_duration_since(epoch) else {
-        return due;
-    };
-    let width = window.min(MAX_NOTIFICATION_GRID).as_nanos();
-    let Some(rounded) = elapsed
-        .as_nanos()
-        .checked_add(width - 1)
-        .map(|n| n / width)
-        .and_then(|n| n.checked_mul(width))
-    else {
-        return due;
-    };
-    u64::try_from(rounded)
-        .ok()
-        .and_then(|n| epoch.checked_add(Duration::from_nanos(n)))
-        .unwrap_or(due)
 }
 
 /// A CLI home and how it is watched.
@@ -1041,6 +1060,7 @@ impl Watcher {
                 }
                 let overflow = std::mem::take(&mut s.overflow);
                 return Some(Wake {
+                    _busy: (!due.is_empty()).then(|| Busy::enter(&self.shared.busy)),
                     due,
                     overflow,
                     rediscover,
@@ -1771,6 +1791,7 @@ impl Watcher {
 
     /// Reads from the stored cursor until the adapter has nothing more.
     fn refresh(&mut self, id: u64, st: FileStat) -> Result<(), Hangup> {
+        let _busy = Busy::enter(&self.shared.busy);
         if !self.load(id) {
             return Ok(());
         }
@@ -2493,6 +2514,7 @@ impl Watcher {
 }
 
 struct Wake {
+    _busy: Option<Busy>,
     /// Due paths, each with whether it may be a new file.
     due: Vec<(PathBuf, bool)>,
     overflow: bool,
@@ -2934,33 +2956,55 @@ mod tests {
     }
 
     #[test]
-    fn notification_grid_preserves_debounce_and_bounds_extra_latency() {
-        let epoch = Instant::now();
-        for grid in [
-            Duration::from_millis(3),
-            Duration::from_millis(10),
-            Duration::from_millis(175),
-            Duration::MAX,
-        ] {
-            for ms in 0..700 {
-                let due = epoch + Duration::from_millis(ms);
-                let rounded = round_deadline(due, epoch, grid);
-                assert!(rounded >= due);
-                assert!(rounded.duration_since(due) < grid);
-                assert!(rounded.duration_since(due) < MAX_NOTIFICATION_GRID);
-                assert_eq!(round_deadline(due, epoch, Duration::ZERO), due);
-            }
-        }
-        let grid = Duration::from_millis(175);
+    fn notifications_coalesce_only_after_work_is_due_or_while_it_is_running() {
+        let shared = Shared::default();
+        let now = Instant::now();
+        let debounce = Duration::from_millis(100);
+        let mark = |path: &str, at, enabled| {
+            shared.notification(vec![path.into()], at, debounce, enabled, false);
+        };
+        let due = |path: &str| shared.lock().dirty[Path::new(path)].due;
+        mark("first", now, true);
+        assert_eq!(due("first"), now + debounce, "no delay beyond debounce");
+        mark("before", now + Duration::from_millis(90), true);
+        assert_eq!(due("before"), now + Duration::from_millis(190));
+        mark("due", now + debounce, true);
+        assert_eq!(due("due"), now + debounce);
         assert_eq!(
-            round_deadline(epoch - Duration::from_millis(1), epoch, grid),
-            epoch - Duration::from_millis(1)
+            due("before"),
+            now + Duration::from_millis(190),
+            "an earlier arrival retains its deadline"
         );
-        let one = epoch + Duration::from_millis(101);
-        let two = epoch + Duration::from_millis(109);
+        shared.lock().dirty.clear();
+        {
+            let read = Busy::enter(&shared.busy);
+            let delivery = Busy::enter(&shared.busy);
+            drop(read);
+            mark("during", now, true);
+            assert_eq!(due("during"), now);
+            mark("disabled", now, false);
+            assert_eq!(due("disabled"), now + debounce);
+            drop(delivery);
+        }
+        shared.lock().dirty.clear();
+        mark("after", now, true);
         assert_eq!(
-            round_deadline(one, epoch, grid),
-            round_deadline(two, epoch, grid)
+            due("after"),
+            now + debounce,
+            "the window ends with the work"
+        );
+        mark("after", now + Duration::from_millis(50), true);
+        assert_eq!(
+            due("after"),
+            now + debounce,
+            "repeated notifications cannot postpone work"
+        );
+        let _read = Busy::enter(&shared.busy);
+        mark("after", now + Duration::from_millis(60), true);
+        assert_eq!(
+            due("after"),
+            now + Duration::from_millis(60),
+            "a new arrival can join in-flight work"
         );
     }
 

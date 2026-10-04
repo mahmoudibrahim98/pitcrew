@@ -633,3 +633,93 @@ class, four available threads, 33 GiB RAM, Rust 1.99 and the shipped `opt-level 
 Page cache was retained, with no concurrent builds, tests or profiler during the windows.
 No baseline was extended. The earlier scan/RSS/hook and test results above predate `36e1aa3`
 and were not repeated in this CPU-only follow-up.
+
+### Idle CPU without delaying first notifications (`0-idle-cpu-2`)
+
+Profile first, on `main` at `a48d9ba`, before runtime edits: an unstripped bench build with the
+shipped `opt-level = "z"`, thin LTO and one codegen unit, sampled during the growing 10k workload
+with `perf record -e cpu-clock:u -F 999 --call-graph dwarf,16384 -p PID -- sleep 90`.
+It captured **304 user-space samples, none lost**. Each stack is assigned once:
+
+| Call path | Samples | Share |
+|---|---:|---:|
+| Watcher → stat/read/derive | 140 | 46.1% |
+| Sink → runner cursor transaction | 78 | 25.7% |
+| Notification library/callback | 33 | 10.9% |
+| Other watcher/scheduling | 26 | 8.6% |
+| Other daemon/library | 14 | 4.6% |
+| Other hub/work reads | 12 | 3.9% |
+| Periodic discovery | 1 | 0.3% |
+
+The read path includes `Watcher::check → refresh → ClaudeAdapter::read_from → jsonl::read`;
+cursor saves run through `sink::dispatch → Store::commit_many → SQLite`. The existing bounded
+discovery cache is effective. Sampling shares are not wall times and exclude kernel work.
+Raw profile data and decoded stacks were retained outside the repository. The profiling run's
+110-second CPU windows are diagnostic only; official measurements use 180 seconds without a
+profiler, build or test running beside them.
+
+With nonzero `notification_window`, the runner now schedules a quiet burst's first notification
+at its debounce, without a grid. Only a new notification arriving while another read/delivery is
+already due or running may join it immediately; earlier pending notifications keep their own
+deadlines. A counter covers overlapping reads and deliveries and ends with that work, including
+errors and stop. The sink groups only already queued completed reads of different sessions and
+does not wait for another batch. Its existing four-batch/event bounds, order, retry identity and
+atomic cursor commits remain. Zero retains ordinary debounce. Discovery, the slow sweep,
+network polling, deletion and cursor representations keep their existing behavior.
+
+The grid-specific unit test was replaced with exact-debounce and busy-lifetime assertions.
+`crates/runner/tests/fake_source.rs`, including the 300 ms latency/restart test, is unchanged.
+
+Full Linux measurements, percentage of one core (whole-daemon user + system ticks at 100 Hz):
+
+| Workload | Historical 10 ms cap `36e1aa3` | Fresh `main` `a48d9ba` | Coalescing | Before ticks / wall | After ticks / wall |
+|---|---:|---:|---:|---:|---:|
+| Static, 50 files | 0.01% | 0.01% | **0.01%** | 1 / 180.06 s | 1 / 180.06 s |
+| Growing, 50 files | 0.46% | 0.42% | **0.29%** | 76 / 180.06 s | 52 / 180.05 s |
+| Static, 10k history | 0.11% | 0.10% | **0.11%** | 18 / 180.06 s | 19 / 180.06 s |
+| Growing, 10k history | 0.61% | 0.52% | **0.41%** | 93 / 180.05 s | 73 / 180.05 s |
+
+Both branch commands ran in full, with 180-second static and growing windows:
+
+```bash
+benches/more.sh cpu --keep-cache
+benches/more.sh cpu --cpu-history --keep-cache
+```
+
+The fresh main fifty-file control used the first command. Its history control used the same
+`pitcrew-bench-scale cpu --cpu-history --keep-cache` harness directly with `--pitcrewd` pointing
+to the preserved main binary, allowing implementation edits without rebuilding that control.
+Each branch growing run wrote 1,897 lines and verified all fifty saved cursors at their new EOFs.
+The history remains 10,000 transcripts including the 50 live files: Claude 6,000 + 1,000
+sub-agents, Codex 2,000, OpenCode 1,000, 1.50 GiB and 1,345,483 records, plus demo seed sessions.
+AMD EPYC 9V74 cloud class, four available threads, 33 GiB RAM, Debian 13, Rust 1.99,
+`opt-level = "z"`; page cache retained. No builds, tests or profiler overlapped the official
+windows. The CPU stage records a budget miss without a nonzero exit; the values above, not just
+process success, establish that every case is below 0.5%.
+
+The single notification/delivery coalescing change (including removal of the sink's grouping
+wait) saved **24 ticks / 0.13 percentage points** without history and **20 ticks / 0.11 points**
+with history against the fresh controls. No separate saving is attributed to individual parts
+of that change. The one-tick static-history difference is 0.0056 points before rounding.
+Historical controls differ from this fresh main control; no stable repeated-machine comparison
+was established and no performance baseline was extended.
+
+The unchanged latency/restart test passed **20 consecutive Linux runs**, separately from builds
+and CPU windows: medians **0.093–100.549 ms**, largest individual sample **100.824 ms**.
+Runs that join an in-flight delivery may arrive before debounce; the first quiet notification
+keeps its debounce. Every run also passed the exact restart/cursor assertions:
+
+```text
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out
+```
+
+The other original runner budgets were repeated separately from compilation and the CPU windows:
+
+| Check | Result | Budget |
+|---|---:|---:|
+| `pitcrew-bench-scale scan --keep-cache`, 10k first scan | 14.896 s; first session streamed at 202.03 ms | ≤ 60 s |
+| First-scan peak / steady RSS | 39.22 / 38.41 MiB | ≤ 80 MiB |
+| `benches/more.sh hook-live --keep-cache`, 200 probes | 77.98 ms p50; 78.72 p95; 80.00 p99; 81.54 max | ≤ 300 ms p50 |
+
+The scan served 611,924 events; it retained page cache and is not a cold-SSD measurement. The
+loaded hook run wrote 1,099 lines and verified all fifty cursors caught up.
