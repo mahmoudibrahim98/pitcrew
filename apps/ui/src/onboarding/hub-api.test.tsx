@@ -125,7 +125,7 @@ describe('the real first run', () => {
     const setUp = vi.fn<(setup: Setup) => Promise<SetupResult>>(() => Promise.resolve(RESULT));
     const { router } = renderWizard(createHubOnboardingApi({ setUp }));
     await walkToWorkspace();
-    expect(screen.getAllByRole('tab').map((t) => t.textContent?.replace(/^\d/, ''))).toEqual(['Welcome', 'Workspace', 'Done']);
+    expect(screen.getAllByRole('tab').map((t) => t.textContent?.replace(/^\d+/, ''))).toEqual(['Welcome', 'Workspace', 'Done']);
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
     await screen.findByRole('heading', { level: 1, name: "You're set up" });
     expect(setUp).toHaveBeenCalledTimes(1);
@@ -477,7 +477,7 @@ describe('the real first run, with the scan', () => {
     const hub = fakeHub();
     renderWizard(createHubOnboardingApi({ setUp, data: hub.data }));
     await screen.findByRole('heading', { level: 1, name: 'Welcome to PitCrew' });
-    expect(screen.getAllByRole('tab').map((t) => t.textContent?.replace(/^\d/, ''))).toEqual([
+    expect(screen.getAllByRole('tab').map((t) => t.textContent?.replace(/^\d+/, ''))).toEqual([
       'Welcome',
       'Workspace',
       'Machine check',

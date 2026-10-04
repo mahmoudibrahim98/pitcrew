@@ -134,7 +134,8 @@ describe('machine setup through the hub', () => {
     }
     expect(api.needsHelper({ kind: 'local' })).toBe(false);
     expect(api.needsHelper({ kind: 'ssh', host: 'hpc-login' })).toBe(true);
-    expect(stepsFor(api).map((s) => s.id)).toEqual(['welcome', 'machine-check', 'sign-in', 'import', 'done']);
+    // The safety settings need only the transport too; the hooks need the data client.
+    expect(stepsFor(api).map((s) => s.id)).toEqual(['welcome', 'machine-check', 'sign-in', 'import', 'safety', 'done']);
   });
 
   it('says a machine that is not the hub’s own is checked as it is connected, asking nothing', async () => {
