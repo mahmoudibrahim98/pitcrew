@@ -250,6 +250,7 @@ export const recapScopeMap: RecapScopeMap = {
     if (d.workstream !== undefined) parts.push(scopeOfWorkstream(d.workstream, cache));
     return union(parts);
   },
+  safety_changed: () => 'excluded',
   brief_accepted: (d, cache) => (d.target.kind === 'project' ? scope({ project: d.target.id }) : scopeOfWorkstream(d.target.id, cache)),
   decision_recorded: (d, cache) => (d.workstream === undefined ? NONE_SCOPE : scopeOfWorkstream(d.workstream, cache)),
 };

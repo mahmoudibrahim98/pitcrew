@@ -7,7 +7,7 @@ The first-run wizard, and connecting a remote machine in the desktop app. See
 | File | What |
 |---|---|
 | `api.ts` | The `OnboardingApi` contract (below): every call the first-run wizard makes, typed, with `unavailable` (the calls with no backend yet) and `SetupRefused` (why setup was refused, by field). |
-| `hub-api.ts` | `createHubOnboardingApi({ setUp, remote, data })`: the real one. `setupWorkspace` is `POST /v1/setup` (the data layer's `setUp`, through the workspace's own transport); `discoverHosts` is the gateway's `sshHosts`; `streamScan` and `createFromScan` are the scan and creating from it, through the workspace's client (`data`, `useApi()`; without it, unavailable); every other call is unavailable. |
+| `hub-api.ts` | `createHubOnboardingApi({ setUp, remote, data })`: the real one. `setupWorkspace` is `POST /v1/setup` (the data layer's `setUp`, through the workspace's own transport); `discoverHosts` is the gateway's `sshHosts`; `streamScan` and `createFromScan` are the scan and creating from it, through the workspace's client (`data`, `useApi()`; without it, unavailable); hooks use server-held previews and revision confirmation; safety reads/saves authored workspace preferences. Other unfinished calls are unavailable. |
 | `scan-wire.ts` | The scan on the wire (`ScanFrame`, `ScanReport`, snake_case, as `pitcrew_protocol::scan` has them), `parseScanFrames` for its newline-delimited answer, and `toScanResult`, the mapping to this feature's `ScanResult` (camelCase, `byEngine` as a record). |
 | `project-key.ts` | `projectKeyFor(name, taken)`: a new project's key from its name, unique in the workspace (see "Creating from the scan"). |
 | `fake-api.ts` | `createFakeOnboardingApi()`: an in-memory implementation of every call that behaves plausibly (streamed progress, a fixable row, synthetic scan suggestions), refusing a bad setup as the hub would. For tests and a development flag only (below). |
@@ -30,7 +30,7 @@ The first-run wizard, and connecting a remote machine in the desktop app. See
 A fresh hub answers `GET /v1/workspace` with `setup_needed: true`, and the shell sends the
 workspace to `paths.setup(ws)`, this feature's first-run wizard, from any page (see
 `src/shell/README.md`, "The first run"). Against the real hub the wizard is **Welcome, Workspace,
-Scan, Create, Done**, then Home:
+Scan, Create, Import, Hooks, Safety, Done**, then Home:
 
 - **Workspace** is `POST /v1/setup`: the workspace's name, your name, your handle (suggested from
   the first word of your name, `Sam Rivera` → `@sam`, until you type one), and this machine's name
@@ -195,3 +195,12 @@ corepack pnpm --filter @pitcrew/ui exec playwright test --config e2e/fresh.confi
 ```
 
 The real first run now includes Import after Create. It previews the indexed-session count for all sessions, a UTC date/engine/folder filter, or start fresh, then stores the choice with PUT. Requests that fail display an error and keep confirmation disabled until a successful count. Sessions stay in place; widening the hub choice is reversible via `/v1/import`.
+
+Hooks are previewed file by file on the hub’s own machine. Only **Install hooks** confirms the displayed revision; concurrent edits are refused and **Refresh diff** fetches a new preview. Skipping writes nothing. Remote machines within that workspace remain unsupported. Safety loads saved preferences before editing, warns for **Skip permissions**, and saves permission defaults and the back-office hourly acceptance budget. Read/save failures stay on the step.
+
+Onboarding review: hook previews detect supported CLIs on PATH or through their
+homes, skip conflicting engines while applying other changes, and report the
+skipped engines. No-change previews cannot set the wizard's installed flag.
+Desktop packages include the hook CLI beside the daemon. Safety uses snake_case
+wire fields and the shared PermissionMode enum; bypass defaults are currently
+refused. Unsaved safety reports `saved: false` for legacy per-task acceptance.

@@ -177,6 +177,8 @@ export const plainNames: Names = {
 export function describeEvent(event: Event, names: Names): string {
   const { body } = event;
   switch (body.type) {
+    case 'safety_changed':
+      return 'updated workspace safety settings';
     case 'cursor_moved':
       return 'marked changes as read';
     case 'machine_added':

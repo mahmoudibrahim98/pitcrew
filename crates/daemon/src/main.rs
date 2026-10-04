@@ -32,6 +32,7 @@ mod host;
 mod init;
 mod locations;
 mod office;
+mod onboarding;
 mod recaps;
 mod refs;
 mod runner;

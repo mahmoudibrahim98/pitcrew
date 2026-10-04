@@ -336,6 +336,8 @@ export function createFakeOnboardingApi(options: FakeOnboardingApiOptions = {}):
     async hooksDiff(): Promise<HooksDiff> {
       await wait(delay(150));
       return {
+        revision: "synthetic-preview",
+        engines: [{ engine: 'claude', status: 'missing', detail: 'Synthetic Claude hooks.' }, { engine: 'codex', status: 'missing', detail: 'Synthetic Codex hooks.' }],
         files: [
           {
             path: '~/.claude/settings.json',
@@ -355,6 +357,9 @@ export function createFakeOnboardingApi(options: FakeOnboardingApiOptions = {}):
       await wait(delay(250));
     },
 
+    async readSafety() {
+      return { permissionMode: 'default' as const, backOfficeEnabled: false, backOfficeCaps: { maxAutoAcceptPerHour: 20 } };
+    },
     async saveSafety(settings): Promise<void> {
       // A workspace that opts into the back office takes a touch longer, in the fake: it also
       // persists the auto-accept caps, not just the flag.

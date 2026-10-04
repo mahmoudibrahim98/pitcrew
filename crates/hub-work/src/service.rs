@@ -222,7 +222,7 @@ impl WorkService {
         self.dispatcher.clone()
     }
 
-    pub(crate) fn hub_machine(&self) -> Option<MachineId> {
+    pub fn hub_machine(&self) -> Option<MachineId> {
         *self
             .hub_machine
             .lock()

@@ -19,7 +19,7 @@ pub mod display;
 pub mod error;
 pub mod hook;
 pub mod http;
-mod install;
+pub mod install;
 pub mod plan;
 pub mod transport;
 mod verbs;
