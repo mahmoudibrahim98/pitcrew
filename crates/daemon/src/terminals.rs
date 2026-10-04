@@ -41,6 +41,13 @@ impl SessionTerminals {
 
 impl Terminals for SessionTerminals {
     fn attach(&self, session: SessionId) -> Result<Arc<dyn Attachment>, TerminalError> {
+        if !self
+            .work
+            .session_included(&session)
+            .map_err(|_| TerminalError::Failed("Could not read session inclusion.".into()))?
+        {
+            return Err(TerminalError::NotFound(format!("No session {session}.")));
+        }
         let found = match self.work.session(&session) {
             Ok(found) => found,
             Err(e) if e.code() == ErrorCode::NotFound => {

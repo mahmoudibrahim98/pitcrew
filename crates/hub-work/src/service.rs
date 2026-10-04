@@ -89,6 +89,7 @@ pub struct WorkService {
     /// Dispatches whose session has reported `working` while this service runs (see
     /// [`WorkService::follow_sessions`]): their task moved then, and is not moved again.
     working: Mutex<HashSet<DispatchId>>,
+    pub(crate) import: Mutex<crate::import::ImportState>,
 }
 
 impl std::fmt::Debug for WorkService {
@@ -118,6 +119,7 @@ impl WorkService {
             recaps: Mutex::new(RecapSync::default()),
             setup_listener: None,
             working: Mutex::new(HashSet::new()),
+            import: Mutex::default(),
         }
     }
 

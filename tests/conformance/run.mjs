@@ -212,6 +212,11 @@ try {
   );
   const [code] = await once(suite, 'exit');
   process.exitCode = code ?? 1;
+  {
+    suite = spawn(process.execPath, ['--test', 'tests/conformance/import.test.mjs'], { cwd: root, env, stdio: 'inherit' });
+    const [importCode] = await once(suite, 'exit');
+    process.exitCode = process.exitCode || (importCode ?? 1);
+  }
 } finally {
   await cleanup();
 }

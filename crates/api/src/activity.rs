@@ -34,7 +34,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use pitcrew_auth::ErrorResponse;
 use pitcrew_protocol::api::{ErrorCode, EventsPage};
-use pitcrew_protocol::events::{Event, EventBody};
+use pitcrew_protocol::events::Event;
 use pitcrew_protocol::ids::{ProjectId, SessionId, TaskId, WorkstreamId};
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -126,6 +126,7 @@ pub trait EventRefs: Send + Sync + fmt::Debug + 'static {
 pub struct Activity {
     source: Arc<dyn EventSource>,
     refs: Option<Arc<dyn EventRefs>>,
+    visibility: crate::visibility::Visibility,
 }
 
 /// The activity route without an index (`project` and `workstream` answer 400). Mount it as a
@@ -138,7 +139,11 @@ impl Activity {
     /// Activity from `source`, without an index.
     #[must_use]
     pub fn new(source: Arc<dyn EventSource>) -> Self {
-        Self { source, refs: None }
+        Self {
+            source,
+            refs: None,
+            visibility: Default::default(),
+        }
     }
 
     /// Answers `project` and `workstream` through `refs`, and widens `task` and `session` with
@@ -146,6 +151,16 @@ impl Activity {
     #[must_use]
     pub fn with_refs(mut self, refs: Arc<dyn EventRefs>) -> Self {
         self.refs = Some(refs);
+        self
+    }
+
+    /// Applies the hub's inclusion rules without changing the event source.
+    #[must_use]
+    pub fn with_visibility(
+        mut self,
+        visibility: Arc<dyn crate::visibility::EventVisibility>,
+    ) -> Self {
+        self.visibility = crate::visibility::Visibility(Some(visibility));
         self
     }
 
@@ -172,12 +187,21 @@ impl Activity {
         let limit = limit.max(1);
         let source = &*self.source;
         if filter.is_empty() {
-            return unfiltered(source, before, limit);
+            return unfiltered(source, before, limit, &self.visibility);
         }
         match &self.refs {
             None if filter.needs_index() => Err(NEEDS_INDEX.into()),
-            Some(refs) if !filter.keyed() => indexed(source, &**refs, before, limit, filter),
-            refs => scan(source, refs.as_deref(), before, limit, filter),
+            Some(refs) if !filter.keyed() => {
+                indexed(source, &**refs, before, limit, filter, &self.visibility)
+            }
+            refs => scan(
+                source,
+                refs.as_deref(),
+                before,
+                limit,
+                filter,
+                &self.visibility,
+            ),
         }
     }
 }
@@ -251,6 +275,7 @@ fn unfiltered(
     source: &dyn EventSource,
     before: u64,
     limit: usize,
+    visibility: &crate::visibility::Visibility,
 ) -> Result<EventsPage, SourceError> {
     let mut found = Vec::new();
     let mut cursor = before;
@@ -262,7 +287,7 @@ fn unfiltered(
         };
         cursor = first.rev;
         for event in chunk.into_iter().rev() {
-            if matches!(event.event.body, EventBody::CursorMoved { .. }) {
+            if !visibility.visible(&event.event, None)? {
                 continue;
             }
             if found.len() == limit {
@@ -276,6 +301,42 @@ fn unfiltered(
 
 /// `project` and/or `workstream` alone: the index's answer is the page.
 fn indexed(
+    source: &dyn EventSource,
+    refs: &dyn EventRefs,
+    before: u64,
+    limit: usize,
+    filter: &RefFilter,
+    visibility: &crate::visibility::Visibility,
+) -> Result<EventsPage, SourceError> {
+    let mut found = Vec::new();
+    let mut cursor = before;
+    let mut scanned = 0;
+    loop {
+        let requested = limit - found.len();
+        let page = indexed_raw(source, refs, cursor, requested, filter)?;
+        let budget_limited = page.events.len() < requested;
+        scanned += page.events.len();
+        let mut batch = Vec::new();
+        for (rev, event) in page.revisions.into_iter().zip(page.events) {
+            if visibility.visible(&event, None)? {
+                batch.push(StoredEvent { rev, event });
+            }
+        }
+        batch.extend(found);
+        found = batch;
+        cursor = page.from_rev;
+        if page.at_start
+            || found.len() == limit
+            || scanned >= SCAN_BUDGET
+            || cursor == 0
+            || budget_limited
+        {
+            return Ok(page_of(found, page.at_start, cursor));
+        }
+    }
+}
+
+fn indexed_raw(
     source: &dyn EventSource,
     refs: &dyn EventRefs,
     before: u64,
@@ -344,6 +405,7 @@ fn scan(
     before: u64,
     limit: usize,
     filter: &RefFilter,
+    visibility: &crate::visibility::Visibility,
 ) -> Result<EventsPage, SourceError> {
     let matcher = Matcher::new(filter);
     let mut found: Vec<StoredEvent> = Vec::new(); // newest first
@@ -367,7 +429,7 @@ fn scan(
         cursor = first.rev;
         scanned += chunk.len();
         for event in chunk.into_iter().rev() {
-            if matcher.matches(&event, &about) {
+            if visibility.visible(&event.event, None)? && matcher.matches(&event, &about) {
                 found.push(event);
                 if found.len() > limit {
                     found.pop();
@@ -490,9 +552,6 @@ impl Matcher {
     }
 
     fn matches(&self, event: &StoredEvent, about: &About) -> bool {
-        if matches!(event.event.body, EventBody::CursorMoved { .. }) {
-            return false;
-        }
         let rev = event.rev;
         // The index first: it is cheap, and the only way `project` and `workstream` match.
         if self.filter.project.is_some() && !about.project.contains(&rev) {
@@ -620,6 +679,40 @@ mod tests {
             project: Some(id),
             ..RefFilter::default()
         }
+    }
+
+    #[test]
+    fn excluded_sessions_do_not_fill_activity_pages_or_renumber_revisions() {
+        let source = log(3);
+        let excluded = SessionId::new();
+        let mut hidden = filler(600);
+        for event in &mut hidden {
+            event.body = EventBody::SessionEnded { session: excluded };
+        }
+        source.append(hidden);
+        source.append(filler(2));
+        let activity = Activity::new(source)
+            .with_visibility(Arc::new(crate::visibility::ExcludeSession(excluded)));
+        let page = activity.page(606, 4, &RefFilter::default()).unwrap();
+        assert_eq!(page.revisions, vec![2, 3, 604, 605]);
+        assert!(!page.at_start);
+        let older = activity
+            .page(page.from_rev, 4, &RefFilter::default())
+            .unwrap();
+        assert_eq!(older.revisions, vec![1]);
+        assert!(older.at_start);
+        let missing = activity.page(606, 4, &session(excluded)).unwrap();
+        assert!(missing.events.is_empty());
+        assert!(missing.at_start);
+        let refs = Scripted::answering(vec![
+            (vec![602, 603, 604, 605], 602),
+            (vec![2, 3], 2),
+            (vec![1], 0),
+        ]);
+        let indexed = activity.with_refs(refs);
+        let page = indexed.page(606, 4, &project(ProjectId::new())).unwrap();
+        assert_eq!(page.revisions, vec![2, 3, 604, 605]);
+        assert!(!page.at_start);
     }
 
     #[test]
