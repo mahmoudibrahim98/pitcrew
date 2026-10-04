@@ -4,6 +4,10 @@ Read Jira issues and epics, for Jira Cloud and Jira Data Center, safely and incr
 ownership; the write-approval queue and outward writes are later briefs. This crate is read-only
 and never writes to Jira. `pitcrewd` runs it on a timer and applies its intents to the hub
 (`crates/daemon/src/integrations/`); `probe::probe` is the read-only "test this connection".
+`SyncState::created_from_snapshot(source, epic)` gives an issue that is not done as a first read
+would report it (`IssueCreated`), from the snapshot the last read kept: an `IssueReparented` change
+carries none of its fields, so this is how `pitcrewd` makes a task of an issue moved under an epic
+it follows.
 
 See the [crate's own docs](src/lib.rs) ("Shape" and "Reuse, not a fork") for the architecture and
 for exactly what is reused from [`pitcrew-sync-github`](../sync-github/README.md) versus added

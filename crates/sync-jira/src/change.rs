@@ -4,7 +4,7 @@
 
 use crate::adf::adf_to_text;
 use crate::bounds::{MAX_BODY_CHARS, MAX_TITLE_CHARS, cap_chars, cap_labels, strip_hidden};
-use crate::state::{EpicSnapshot, IssueSnapshot, StatusCategory};
+use crate::state::{EpicSnapshot, IssueSnapshot, StatusCategory, SyncState};
 use crate::time::JiraTimestamp;
 use crate::wire::{WireIssue, looks_like_issue_key};
 use pitcrew_protocol::model::{ExternalRef, ExternalSystem};
@@ -34,6 +34,37 @@ fn item_ref(site_base: &str, key: &str) -> Option<ExternalRef> {
         url: Some(format!("{site_base}/browse/{key}")),
         key: key.to_string(),
     })
+}
+
+impl SyncState {
+    /// The issue `source` (`DEMO-12`), not done, as a first read would report it, built from its
+    /// last snapshot: an [`UpstreamChange::IssueCreated`] in `epic`. For a caller that starts
+    /// mirroring an issue it did not mirror before, because a later read moved it under an epic
+    /// the caller follows ([`UpstreamChange::IssueReparented`]): the move alone carries none of
+    /// the issue's fields. `None` when this state has no snapshot of the issue, or it is done.
+    ///
+    /// Call it on the state a sync returned, so the snapshot is the one that read just took.
+    #[must_use]
+    pub fn created_from_snapshot(
+        &self,
+        source: &ExternalRef,
+        epic: Option<&ExternalRef>,
+    ) -> Option<UpstreamChange> {
+        let (project, _) = source.key.split_once('-')?;
+        let snapshot = self
+            .projects
+            .get(project)?
+            .issue_snapshots
+            .get(&source.key)?;
+        (snapshot.category != StatusCategory::Done).then(|| UpstreamChange::IssueCreated {
+            source: source.clone(),
+            at: snapshot.updated.clone(),
+            title: snapshot.title.clone(),
+            body: snapshot.body.clone(),
+            labels: snapshot.labels.clone(),
+            epic: epic.cloned(),
+        })
+    }
 }
 
 /// What changed upstream, discovered by one sync call. Each change carries the [`ExternalRef`] it
@@ -339,6 +370,50 @@ mod tests {
             }
         }))
         .expect("valid wire issue")
+    }
+
+    #[test]
+    fn an_issue_reparented_later_is_created_from_its_snapshot() {
+        let mut wire = issue("2026-01-01T00:00:00.000+0000", "indeterminate");
+        wire.key = "DEMO-8".to_string();
+        let (_, snapshot) =
+            diff_issue("https://jira.example.com", &wire, None, None).expect("well-formed");
+        let mut state = SyncState::new();
+        state
+            .projects
+            .entry("DEMO".to_string())
+            .or_default()
+            .issue_snapshots
+            .insert("DEMO-8".to_string(), snapshot.clone());
+        let source = item_ref("https://jira.example.com", "DEMO-8").unwrap();
+        let epic = item_ref("https://jira.example.com", "DEMO-5").unwrap();
+        assert_eq!(
+            state.created_from_snapshot(&source, Some(&epic)),
+            Some(UpstreamChange::IssueCreated {
+                source: source.clone(),
+                at: JiraTimestamp::new("2026-01-01T00:00:00.000+0000"),
+                title: "Title".to_string(),
+                body: String::new(),
+                labels: Vec::new(),
+                epic: Some(epic.clone()),
+            })
+        );
+        // Unknown issues, and done ones, give nothing.
+        let unknown = item_ref("https://jira.example.com", "DEMO-9").unwrap();
+        assert_eq!(state.created_from_snapshot(&unknown, None), None);
+        let other_project = item_ref("https://jira.example.com", "OTHER-8").unwrap();
+        assert_eq!(state.created_from_snapshot(&other_project, None), None);
+        let done = IssueSnapshot {
+            category: StatusCategory::Done,
+            ..snapshot
+        };
+        state
+            .projects
+            .get_mut("DEMO")
+            .unwrap()
+            .issue_snapshots
+            .insert("DEMO-8".to_string(), done);
+        assert_eq!(state.created_from_snapshot(&source, Some(&epic)), None);
     }
 
     #[test]
