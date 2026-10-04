@@ -186,7 +186,7 @@ A fresh hub has a device token but no person, no machine and no name. The deskto
 | `GET /v1/workstreams?project=` | → `Workstream[]` | |
 | `GET /v1/workstreams/{id}` | → `Workstream` | |
 | `POST /v1/workstreams` | `NewWorkstream` → `Workstream` (201) | See below. `404 not_found` for an unknown project. Emits `workstream_created`. |
-| `PATCH /v1/workstreams/{id}` | `{ "status"?, "health"? }` → `Workstream` | Emits `workstream_changed`. |
+| `PATCH /v1/workstreams/{id}` | `{ "status"?, "health"?, "external"? }` → `Workstream` | Emits `workstream_changed` for status and health, `workstream_linked` for `external`: see "Linking a workstream upstream". |
 
 `NewProject`, `NewWorkstream` and `NewTask` are Rust types in `crates/protocol/src/api.rs`.
 
@@ -208,6 +208,22 @@ A fresh hub has a device token but no person, no machine and no name. The deskto
 - An unknown `project` is `404 not_found`, although it is in the body.
 - `name` must not be blank. `status` defaults to `active`. Each location names a known machine and
   a non-empty path (`400`).
+
+**Linking a workstream upstream.** `PATCH /v1/workstreams/{id}` with `external: ExternalRef[]`
+replaces the workstream's linked external items (an empty list unlinks them all). People only.
+- At most 16 links, no two with the same `system` and `key`. Each `url`, when given, is an
+  `https://` URL of at most 2 KiB with no user name or password. `key` is 1 to 300 characters with
+  no control characters.
+- `github` keys are `owner/repo` (the whole repository) or `owner/repo#milestone:<n>` (one
+  milestone); `jira` keys are a project key `DEMO` (the whole project) or an epic's issue key
+  `DEMO-5`. Owner and repository names use GitHub's characters (`A-Z a-z 0-9 - _ .`, never `.` or
+  `..` alone); Jira keys are an uppercase letter, then uppercase letters, digits or `_`, then for an
+  epic `-<n>`. Other systems' keys are kept as given. Anything else is `400 invalid`.
+- It appends `workstream_linked` `{ "workstream", "external" }` with the full new list. A patch
+  that changes nothing appends nothing. `status` and `health` may come in the same patch (then
+  `workstream_changed` comes first, in the same append); a patch with none of the three is
+  `400 invalid`.
+- Linking is what a sync acts on: see "Integrations".
 
 ### Tasks
 
@@ -633,6 +649,116 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
   the result and its failure together, and closing it is how a client stops listening.
 - **The mock** answers with a fixed synthetic report (folders under `/home/sam/`), after about a
   second of progress, by the same rules: the hub's own machine only, `409` while one runs.
+
+### Integrations: GitHub and Jira, read-only
+
+A person connects GitHub repositories or Jira projects to the workspace, links workstreams to
+upstream scopes ("Linking a workstream upstream"), and the hub keeps tasks in step with upstream.
+**The hub only reads upstream**: no route here writes to GitHub or Jira. Every route is **device
+tokens only** (an agent token gets `403`, before anything else is checked). Types are in
+`crates/protocol/src/integrations.rs`.
+
+| Method and path | Body → response | Notes |
+|---|---|---|
+| `GET /v1/integrations` | → `Integration[]` | Oldest first. |
+| `POST /v1/integrations` | `NewIntegration` → `Integration` (201) | See below. |
+| `GET /v1/integrations/{id}` | → `Integration` | |
+| `DELETE /v1/integrations/{id}` | → 204 | Forgets the connection, its stored credential and its sync state. Links on workstreams stay, as plain links. |
+| `POST /v1/integrations/{id}/test` | → `IntegrationCheck` | Reads upstream once with the credential (see below). Changes nothing. |
+| `POST /v1/integrations/{id}/sync` | → `Integration` (202) | Syncs now, in the background; `status.running` is `true` until it ends. |
+| `PUT /v1/integrations/{id}/credential` | `{ "secret": String }` → 204 | Stores the secret. See "Credentials". |
+
+`NewIntegration`: `{ "name": String, "settings": IntegrationSettings, "credential":
+"gh_cli" | "stored", "interval_minutes"?: u32 }`.
+- `name` is 1–80 characters after trimming (stored trimmed), no control characters.
+- `settings` is tagged by `kind`:
+  - `{ "kind": "github", "repos": String[], "api_base"?: String }`: 1–50 distinct `owner/repo`
+    (GitHub's characters, as for links). `api_base` is a GitHub Enterprise Server API root
+    (`https://ghe.example.com/api/v3`); absent means `https://api.github.com`.
+  - `{ "kind": "jira", "deployment": "cloud" | "data_center", "site": String, "projects":
+    String[], "email"?: String, "epic_link_field"?: String }`: `site` is the Jira root
+    (`https://jira.example.com`, a path allowed for Data Center); 1–50 distinct project keys;
+    `email` (1–254 characters with an `@`) is required for `cloud` and refused for
+    `data_center`; `epic_link_field` is `customfield_<digits>` (Data Center's epic link).
+  - Every URL is `https://`, at most 2 KiB, with no user name, password, query or fragment.
+- `credential`: `gh_cli` (GitHub only) reads `gh auth token` (with `--hostname` for Enterprise)
+  on the hub's machine at each sync and keeps nothing; `stored` waits for a secret
+  (`PUT …/credential`).
+- `interval_minutes` is 5–1440; default 15.
+- A repository, or a Jira site and project, already in another integration is `409 conflict`.
+  Anything else malformed is `400 invalid`.
+- The hub acts through a member of its own, `@sync` (an agent of the person who added the first
+  integration, named "Tracker sync"; `@tracker-sync` when `@sync` is taken), added with
+  `member_added` on the first `POST`. Everything a sync changes is authored by it.
+
+`Integration`: `{ "id", "name", "settings", "credential": { "source": "gh_cli" | "stored",
+"stored": bool }, "interval_minutes", "added_by": MemberId, "added_at": ms, "status":
+SyncStatus, "links": IntegrationLink[] }`.
+- `credential.stored` says whether a secret is kept (always `false` for `gh_cli`). **No route ever
+  returns a credential.**
+- `SyncStatus`: `{ "running": bool, "last_attempt_at"?, "last_success_at"?, "next_at"?,
+  "rate_limited_until"?, "problems": SyncProblem[], "last_run"?: SyncCounts }` (times in ms).
+  `last_success_at` is the end of the last sync that read every scope and applied what it found
+  without a problem; that is the "last sync" people see. `problems` are the last sync's, each
+  `{ "scope": String, "message": String }` (`scope` is a repository, a Jira project, or `""` for
+  the whole integration), never holding a credential. `SyncCounts`: `{ "changes", "applied",
+  "conflicts", "skipped", "malformed" }`.
+- `IntegrationLink`: `{ "workstream": WorkstreamId, "scope": ExternalRef, "title"?: String }`: each
+  workstream link this integration syncs (its repositories, their milestones, its Jira projects and
+  their epics), with the upstream title once a sync has seen it.
+
+`IntegrationCheck` (`POST …/test`): `{ "ok": bool, "at": ms, "checks": [{ "scope", "ok",
+"message" }], "warnings": String[] }`. One check per repository (`GET /repos/{owner}/{repo}`) or
+per Jira project (`GET /myself`, then `GET /project/{key}`), and one with scope `""` for the
+credential itself. `warnings` says when the credential can do more than read (a GitHub
+credential with push or admin rights on a repository, or a classic token's broad scopes): a
+fine-grained, read-only token for these repositories is safer. `ok` is `true` when every check
+passed.
+
+**Credentials.**
+- `PUT /v1/integrations/{id}/credential`: `secret` is 1–4096 characters, no whitespace or control
+  characters. `409 conflict` for a `gh_cli` integration. It replaces any secret stored before. The
+  desktop sends it through the gateway's own command (`gateway_integration_credential`, see
+  `desktop-gateway.md`), never through `gateway_request`.
+- The hub keeps a secret in a private file (0600 in a 0700 folder; an owner-only DACL on Windows)
+  of its state directory, never in the event log, and never logs it.
+- Jira Cloud authenticates with `email` and the secret (an API token); Data Center with the secret
+  as a personal access token; GitHub with the secret or `gh auth token` as a bearer token.
+
+**What a sync does.** On a timer (`interval_minutes`, the first one soon after the hub starts or
+the integration is added) and on `POST …/sync`, one integration at a time:
+- It reads each scope incrementally (`ETag`s and `since` on GitHub, an `updated` cursor in JQL on
+  Jira), and stops at a rate limit until it lifts (`rate_limited_until`).
+- **Issues become tasks only in a linked scope.** An open issue whose milestone (GitHub) or epic
+  (Jira) a workstream links becomes a task in that workstream; otherwise one whose repository or
+  Jira project a workstream links. Issues in no linked scope, and issues already closed when first
+  seen, are skipped (`skipped`). The task's `source` is the issue, its status `todo`.
+- **Field owners.** Title, description and labels belong to upstream: an upstream change
+  overwrites them (`task_updated`). The assignee belongs to the hub. A change of milestone or epic
+  moves the task to the workstream that links the new one (in the same project); otherwise it
+  stays.
+- **Moves follow `can_move(.., sync)`.** An upstream close moves the task to `done`, a reopen moves
+  a done task to `todo` (`task_moved`, mover `sync`). In-progress work is never touched: a move the
+  rules refuse becomes an ask instead (a **conflict**, below).
+- A merged pull request that closes a tracked issue is noted on its task (`comment_posted`, with
+  the pull request's link).
+- **Milestones and epics.** A closed milestone or epic moves the workstreams that link it to
+  `shipped` (`workstream_changed`), unless one of their tasks is in progress (a conflict). The
+  hub owns the workstream's name; the upstream title is shown on the link.
+- **Conflicts become asks**: `ask_raised`, kind `decision`, from `@sync` to the person who added
+  the integration, with the task when there is one. Nothing is changed; the person decides. The
+  same open conflict is not raised twice.
+- Upstream text is untrusted: titles, bodies and labels are capped and stripped of hidden
+  characters, labels are cut to the hub's rules (1–64 characters, at most 32), and links are kept
+  only on the tracker's own host.
+- Changing a scope's links makes the next sync read that scope's issues again from the start, so
+  issues that were out of scope before become tasks.
+
+**The mock** answers every route over the recorded fixtures in `apps/mock-hub/fixtures/`
+(`example-org/demo-repo` on GitHub, project `DEMO` on `https://jira.example.com`), syncs at once
+on `POST …/sync`, and keeps credentials in memory only. The daemon reads them the same way when
+started with the hidden `--integration-fixtures <dir>` (tests only; it then never reaches the
+network).
 
 ## Live updates: `GET /v1/stream?since=<rev>` (WebSocket, device tokens)
 

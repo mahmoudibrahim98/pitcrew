@@ -136,6 +136,10 @@ ulid_id!(
     /// A terminal owned by a runner's runtime (a tmux window or a PTY).
     TerminalId, "term"
 );
+ulid_id!(
+    /// A connection to GitHub or Jira (api-v1.md, "Integrations").
+    IntegrationId, "int"
+);
 
 /// A short project key used in task keys, such as `CMP` in `CMP-104`.
 ///
