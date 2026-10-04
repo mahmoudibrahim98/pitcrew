@@ -141,6 +141,13 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
   overwritten, moves follow the sync's `can_move` with conflicts as asks, and a merged pull request
   is noted on its task. Credentials stay in memory and are never returned. `gh_cli` connections
   always have a credential here.
+- **Outward writes** (`/v1/writes…`, `src/writes.ts`), by the daemon's rules: after every request
+  that may change something, a pass proposes what a person's change implies upstream (an
+  `approval` ask with `write_proposed`), records a denial as not sent, and "sends" an approved or
+  retried write once. The fixtures' answer to its method and URL decides it (2xx sent, else failed
+  with that status; no exchange at all is a failure too). A sent write changes the mock's copy of
+  upstream, so the next sync agrees; a created issue becomes the task's source. Every request
+  "sent" is kept (`sentRequests`) for the tests.
 - **Terminals.** `GET /v1/sessions/{id}/terminal` replays a short ANSI screen, echoes keystrokes,
   accepts `{"type":"resize"}` and ignores unknown control types (malformed JSON closes with 1007),
   sends `{"type":"truncated"}` before the replay for sessions that ran over a day, and sends
@@ -192,7 +199,8 @@ a single entry point.
 | `src/recaps.ts` | The recap routes, paged from the recaps fixture. |
 | `src/scan.ts` | The machine scan: its synthetic report and streamed frames. |
 | `src/integrations.ts` | GitHub and Jira integrations over `fixtures/*.fixture`, and the links' checks. |
-| `fixtures/` | Recorded, synthetic GitHub and Jira answers, shared with the daemon's tests and the conformance runner. |
+| `src/writes.ts` | Outward writes: proposals, approvals and the recorded answers. |
+| `fixtures/` | Recorded, synthetic GitHub and Jira answers (reads, and the writes' answers), shared with the daemon's tests and the conformance runner. |
 | `src/ws.ts` | A minimal WebSocket server (RFC 6455). |
 | `src/types.ts` | Wire types mirroring `crates/protocol`. |
 | `src/rules.ts` | `can_move` and date checks ported from `model.rs`. |

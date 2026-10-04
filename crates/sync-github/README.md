@@ -1,10 +1,10 @@
 # pitcrew-sync-github
 
-GitHub, read side: issues, milestones and pull requests into typed upstream changes; field
-ownership and `plan` (intents for the hub); a read-only `probe` for "test this connection". The
-crate has no HTTP client: `pitcrewd` brings the HTTPS transport, runs the sync on a timer and applies
-the intents (`crates/daemon/src/integrations/`). Outward writes and their approval queue are the
-next brief (G-approval-writes).
+GitHub: issues, milestones and pull requests into typed upstream changes; field ownership, both
+ways, and `plan` (intents for the hub); a read-only `probe` for "test this connection"; and the
+request an approved outward write is sent as (`write`). The crate has no HTTP client: `pitcrewd`
+brings the HTTPS transport, runs the sync on a timer, applies the intents, and sends a write only
+after a person approved it (`crates/daemon/src/integrations/`). The sync only sends `GET`.
 
 - `ownership::plan(change, task)`: issue and pull request changes into task intents
   (`ISSUE_FIELD_OWNERSHIP`). A move to where the task already is gives nothing, so a sync read
@@ -16,6 +16,15 @@ next brief (G-approval-writes).
 - `probe::probe(transport, config)`: `GET /repos/{owner}/{repo}` for each repository, reporting
   whether it is readable and whether the credential could write (push or admin rights, a classic
   token's broad scopes).
+
+- `write::send(transport, config, write)`: one approved write, sent once: `POST …/issues` (create),
+  `POST …/issues/{n}/comments`, or `PATCH …/issues/{n}` with only the fields it sets (title, body,
+  labels, milestone, `state` and `state_reason`). A refusal's message is capped and stripped of
+  hidden characters; a created issue needs a positive number, and its link is kept only on
+  GitHub's web host. `tests/fixtures/writes.fixture` pins exactly what each write sends.
+- The ownership tables say both directions: `FieldOwnership::outward` (`Outward::AskToSend` for the
+  fields upstream owns, `AskToCloseOrReopen` for the state, `Never` for the assignee and the
+  milestone's own fields), and `outward(table, field)` reads it.
 
 ## Known gaps
 

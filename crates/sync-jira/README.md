@@ -1,9 +1,19 @@
 # pitcrew-sync-jira
 
 Read Jira issues and epics, for Jira Cloud and Jira Data Center, safely and incrementally; field
-ownership; the write-approval queue and outward writes are later briefs. This crate is read-only
-and never writes to Jira. `pitcrewd` runs it on a timer and applies its intents to the hub
-(`crates/daemon/src/integrations/`); `probe::probe` is the read-only "test this connection".
+ownership, both ways; and the requests an approved outward write is sent as. `pitcrewd` runs the
+sync on a timer and applies its intents to the hub (`crates/daemon/src/integrations/`);
+`probe::probe` is the read-only "test this connection". The sync only reads.
+
+- `write::send(transport, config, write)`: one write a person approved (api-v1.md, "Outward
+  writes"), sent once: create an issue (type `Task`), comment, edit the summary, description,
+  labels or epic (Cloud's `parent`, Data Center's epic link field), or move the issue into Done
+  or To Do through the first transition its workflow offers (read first; none means nothing is
+  sent). Cloud gets Atlassian Document Format text, Data Center plain text. Keys are checked
+  before they reach a URL; answers are untrusted (messages capped and stripped, created keys
+  checked). `tests/fixtures/writes.fixture` pins exactly what each write sends.
+- The ownership tables (`ISSUE_FIELD_OWNERSHIP`, `EPIC_FIELD_OWNERSHIP`) say both directions: an
+  `Outward` rule per field (ask to send, ask to close or reopen, never).
 
 See the [crate's own docs](src/lib.rs) ("Shape" and "Reuse, not a fork") for the architecture and
 for exactly what is reused from [`pitcrew-sync-github`](../sync-github/README.md) versus added

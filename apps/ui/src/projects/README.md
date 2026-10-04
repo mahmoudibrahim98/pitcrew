@@ -37,7 +37,8 @@ none of this folder lands in the initial bundle until a projects route is visite
 | `calendar.tsx`, `calendar-dates.ts` | Calendar route: due tasks by month, filters for me/project/workstream, locale week starts, arrow-key day navigation, Enter to show a day's tasks, and a phone agenda. Calendar arithmetic uses UTC solely to keep date-only values stable. |
 | `timeline.tsx`, `scheduled-task.tsx`, `schedule.css` | Project Timeline: workstream rows on a shared week/month axis, exact due-date labels, a today line, undated tasks apart, and status symbols and borders. Scrolling stays in the timeline; task buttons open the drawer and regain focus when it closes. |
 | `people.tsx`, `ui.tsx` | Avatars; small shared pieces (candidates for `src/design`). |
-| `integrations/` | GitHub and Jira (api-v1.md, "Integrations"; read-only upstream): `api.ts` (the wire types, `integrationClient`, `useIntegrations`, `useIntegrationActions`), `integrations-page.tsx` (Settings › Integrations at `settings/integrations`: connect, credential, test, sync now, status and problems, linked workstreams, remove) and `workstream-links.tsx` (the workstream page's links upstream and their last sync, and the dialog that links or unlinks them). See "Integrations" below. |
+| `writes/` | Outward writes to GitHub and Jira (api-v1.md, "Outward writes"): `api.ts` (`writeClient`, `useTaskWrites`, `useWriteOf`, `useWriteActions`, `fieldRows`), `approval-card.tsx` (`ApprovalCard`, `WriteDiff`: an approval in the Inbox, field by field, with Send and Don't send) and `task-writes.tsx` (`TaskWrites`, the drawer's Upstream section). See "Outward writes" below. |
+| `integrations/` | GitHub and Jira (api-v1.md, "Integrations"; a sync only reads upstream): `api.ts` (the wire types, `integrationClient`, `useIntegrations`, `useIntegrationActions`), `integrations-page.tsx` (Settings › Integrations at `settings/integrations`: connect, credential, test, sync now, status and problems, linked workstreams, remove) and `workstream-links.tsx` (the workstream page's links upstream and their last sync, and the dialog that links or unlinks them). See "Integrations" below. |
 
 ## Integrations
 
@@ -56,6 +57,22 @@ none of this folder lands in the initial bundle until a projects route is visite
   narrowed to a milestone number or an epic key, and `PATCH`es the full list. `workstream_linked`
   refreshes the workstream and the integrations. The list polls every 30 s (2 s while one syncs):
   a sync's status has no event of its own.
+
+## Outward writes
+
+- **In the Inbox**, an `approval` ask the hub raised for a write (`GET /v1/writes/{ask}` answers)
+  is an `ApprovalCard`: what it does and to which issue, who or what implied it, a row per field
+  sent (upstream's value now, struck through, and exactly what is sent), and the ask's own options
+  (Send, Don't send), answered in place through `POST /v1/asks/{id}/answer`. Any other ask, an
+  approval an agent raised itself included (`404`), stays the console's `QuestionCard`.
+- **In the task drawer**, "Upstream" lists the task's writes newest first (waiting for approval,
+  sent with a link, failed with upstream's message, or not sent and why), each with "What it
+  sends" and, when failed, Retry. A person can ask to create an issue from a task that mirrors
+  none, or to comment on the one it mirrors; both only propose a write, which waits in the Inbox.
+  The section shows when the task mirrors an issue, has writes, or (for a person) when an
+  integration is connected.
+- Write events invalidate the write queries (`keys.writes`), the asks on a proposal, and the task
+  on a result (a created issue becomes its `source`).
 
 ## The task page
 
