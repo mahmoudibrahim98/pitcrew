@@ -14,6 +14,7 @@
 
 mod apply;
 pub mod http;
+mod proxy;
 mod routes;
 mod saved;
 pub mod secret;

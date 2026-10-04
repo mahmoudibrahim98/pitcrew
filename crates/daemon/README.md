@@ -1123,14 +1123,17 @@ GitHub and Jira, **read-only** (api-v1.md, "Integrations"; `src/integrations/`):
   at once when added) and on `POST …/sync`, one at a time. It reads upstream with
   `pitcrew-sync-github` / `pitcrew-sync-jira` over `http.rs`'s transport: HTTP/1.1 over rustls
   (`ring`, this machine's certificates), `https://` only, a 6 MiB body cap, 20 s to connect and 60 s
-  per request, a `User-Agent`, no proxy. `apply.rs` then applies the changes through hub-work's
-  `SyncCommands`: issues become tasks only in a linked scope (a workstream's link to the
-  milestone or epic, else the repository or project), issues closed before they were first seen
-  are skipped, upstream-owned fields are overwritten, moves follow `can_move(.., sync)`, a merged
-  pull request is noted on its task, a closed milestone or epic ships its workstreams, and every
-  refusal is a conflict ask. The sync state is saved after the changes are applied, so a stop in
-  between reads them again next time (every command is idempotent). A rate limit waits until it
-  lifts.
+  per request, a `User-Agent`; behind `HTTPS_PROXY` (an `http://` proxy) it tunnels with
+  `CONNECT`, except for the hosts `NO_PROXY` names (`proxy.rs`). `apply.rs` then applies the
+  changes through hub-work's `SyncCommands`: issues become tasks only in a linked scope (a
+  workstream's link to the milestone or epic, else the repository or project), when first read
+  open or when a later read moves them, open, into a linked milestone or epic (from that read's
+  snapshot); issues closed before they were first seen are skipped, upstream-owned fields are
+  overwritten, moves follow `can_move(.., sync)`, a merged pull request is noted on its task, a
+  closed milestone or epic ships its workstreams, and every refusal is a conflict ask. The sync
+  state is saved after the changes are applied, so a stop in between reads them again next time
+  (every command is idempotent). A connection removed during its sync applies nothing more, and
+  its state is not written back. A rate limit waits until it lifts.
 - When a repository's or project's links change, its issues (and, on GitHub, pull requests) are
   read again from the start at the next sync.
 - `--integration-fixtures <dir>` swaps the transport for recorded exchanges, answered by URL (a
@@ -1162,9 +1165,9 @@ GitHub and Jira, **read-only** (api-v1.md, "Integrations"; `src/integrations/`):
 - `--demo` through the setup path (the demo still seeds its own person, machine and name).
 - Remote machines (the desktop's side of the tunnel, and a supervisor of the local daemon), the
   Tauri shell, auto-start and installers.
-- Integrations: no HTTP proxy (`HTTPS_PROXY` is not read), no HTTP/2 or connection reuse, and no
-  write to GitHub or Jira (G-approval-writes). Removing a connection keeps its workstream links as
-  plain links.
+- Integrations: no `https://` or SOCKS proxy and no `ALL_PROXY` (only an `http://` proxy from
+  `HTTPS_PROXY`), no HTTP/2 or connection reuse, and no write to GitHub or Jira
+  (G-approval-writes). Removing a connection keeps its workstream links as plain links.
 - Scanning another machine of the workspace (`POST /v1/machines/{id}/scan` is `409` for one), and
   stopping a scan part-way: `pitcrew_ingest::scan` takes no cancel, so a scan whose client went
   away runs to its end. A cancel flag in its `ScanOptions` (stream A) would let the route stop it.

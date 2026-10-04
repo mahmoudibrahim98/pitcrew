@@ -760,7 +760,12 @@ passed.
 **What a sync does.** On a timer (`interval_minutes`, the first one soon after the hub starts or
 the integration is added) and on `POST …/sync`, one integration at a time:
 - It reads each scope incrementally (`ETag`s and `since` on GitHub, an `updated` cursor in JQL on
-  Jira), and stops at a rate limit until it lifts (`rate_limited_until`).
+  Jira), and stops at a rate limit until it lifts (`rate_limited_until`). Only what changed
+  upstream since the last read acts: a field, a move or a shipped workstream a person changed in
+  the hub stays as they left it until upstream changes again.
+- It reaches GitHub and Jira directly, or through the `http://` proxy `HTTPS_PROXY` names (not for
+  the hosts `NO_PROXY` names), with `CONNECT`: TLS stays end to end, so the proxy never sees a
+  credential.
 - **Issues become tasks only in a linked scope.** An open issue whose milestone (GitHub) or epic
   (Jira) a workstream links becomes a task in that workstream; otherwise one whose repository or
   Jira project a workstream links. So does an open issue a later sync finds moved into a milestone

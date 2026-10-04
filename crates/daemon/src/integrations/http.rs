@@ -4,13 +4,15 @@
 //!   this machine's own trusted certificates), one connection per request, `https://` only, with
 //!   time limits and a cap on the response body. It adds `User-Agent` (GitHub refuses requests
 //!   without one) and `Host`, and sends the crates' headers as they are. It never logs a header or
-//!   a body.
+//!   a body. Behind a corporate proxy it tunnels through `HTTPS_PROXY` with `CONNECT`, except for
+//!   the hosts `NO_PROXY` names (`proxy.rs`); TLS stays end to end.
 //! - [`FixtureTransport`]: recorded exchanges from a folder of `*.fixture` files (the sync crates'
 //!   format), answered by method and URL, as often as asked; for tests only (`serve
 //!   --integration-fixtures`). The folder is read again for each request, so a test changes
 //!   "upstream" between two syncs by adding a file whose name sorts first. It never reaches the
 //!   network.
 
+use super::proxy::Proxy;
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Empty, Limited};
 use hyper_util::rt::TokioIo;
@@ -44,22 +46,27 @@ fn failed(url: &str, reason: impl Into<String>) -> TransportError {
 pub struct HttpsTransport {
     tls: tokio_rustls::TlsConnector,
     user_agent: String,
+    proxy: Proxy,
 }
 
 impl std::fmt::Debug for HttpsTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpsTransport")
             .field("user_agent", &self.user_agent)
+            .field("proxy", &self.proxy)
             .finish_non_exhaustive()
     }
 }
 
 impl HttpsTransport {
-    /// A transport trusting this machine's certificates.
+    /// A transport trusting this machine's certificates, through the proxy this process's
+    /// environment names (`HTTPS_PROXY`, `NO_PROXY`; see `proxy.rs`).
     ///
     /// # Errors
-    /// No certificate could be loaded, or TLS cannot be set up.
+    /// No certificate could be loaded, TLS cannot be set up, or `HTTPS_PROXY` is not an `http://`
+    /// proxy.
     pub fn new() -> anyhow::Result<Self> {
+        let proxy = Proxy::from_env()?;
         let mut roots = rustls::RootCertStore::empty();
         let found = rustls_native_certs::load_native_certs();
         let (added, _ignored) = roots.add_parsable_certificates(found.certs);
@@ -74,6 +81,7 @@ impl HttpsTransport {
         Ok(Self {
             tls: tokio_rustls::TlsConnector::from(Arc::new(config)),
             user_agent: format!("pitcrewd/{}", env!("CARGO_PKG_VERSION")),
+            proxy,
         })
     }
 
@@ -94,9 +102,11 @@ impl HttpsTransport {
         )
         .map_err(|_| failed(&request.url, "a bad host name"))?;
         let connect = async {
-            let tcp = tokio::net::TcpStream::connect((host.as_str(), port))
+            let tcp = self
+                .proxy
+                .connect(&host, port)
                 .await
-                .map_err(|e| failed(&request.url, format!("cannot connect: {}", e.kind())))?;
+                .map_err(|why| failed(&request.url, why))?;
             self.tls
                 .connect(server, tcp)
                 .await
@@ -274,6 +284,7 @@ impl Transport for Upstream {
 mod tests {
     use super::*;
     use pitcrew_sync_github::transport::Method;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     fn get(url: &str) -> Request {
         Request {
@@ -336,9 +347,9 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn https_refuses_other_schemes_and_user_info_before_connecting() {
-        let https = HttpsTransport {
+    /// A transport that trusts no certificate: TLS never completes, which these tests do not need.
+    fn untrusting(proxy: Proxy) -> HttpsTransport {
+        HttpsTransport {
             tls: tokio_rustls::TlsConnector::from(Arc::new(
                 rustls::ClientConfig::builder_with_provider(Arc::new(
                     rustls::crypto::ring::default_provider(),
@@ -349,7 +360,13 @@ mod tests {
                 .with_no_client_auth(),
             )),
             user_agent: "pitcrewd/test".into(),
-        };
+            proxy,
+        }
+    }
+
+    #[tokio::test]
+    async fn https_refuses_other_schemes_and_user_info_before_connecting() {
+        let https = untrusting(Proxy::default());
         for url in [
             "http://api.github.com/repos/example-org/demo-repo",
             "https://user:pass@api.github.com/repos/example-org/demo-repo",
@@ -358,5 +375,132 @@ mod tests {
         ] {
             assert!(https.send(get(url)).await.is_err(), "{url}");
         }
+    }
+
+    /// What a stand-in on 127.0.0.1 received: as a proxy, the head up to its blank line, then,
+    /// after it answers `reply`, the first bytes sent through; as a server (`reply` `None`), only
+    /// the first bytes.
+    struct Seen {
+        head: String,
+        after: Vec<u8>,
+    }
+
+    async fn stand_in(reply: Option<&'static str>) -> (u16, tokio::task::JoinHandle<Seen>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            if let Some(reply) = reply {
+                while !head.ends_with(b"\r\n\r\n") && head.len() < 8192 {
+                    match socket.read_u8().await {
+                        Ok(byte) => head.push(byte),
+                        Err(_) => break,
+                    }
+                }
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+            let mut after = vec![0_u8; 5];
+            let read = socket.read(&mut after).await.unwrap_or(0);
+            after.truncate(read);
+            Seen {
+                head: String::from_utf8_lossy(&head).into_owned(),
+                after,
+            }
+        });
+        (port, task)
+    }
+
+    #[tokio::test]
+    async fn https_tunnels_through_the_proxy_and_the_token_never_reaches_it() {
+        // The proxy opens the tunnel: what follows it is the TLS handshake, end to end.
+        let (port, proxy) = stand_in(Some("HTTP/1.1 200 Connection established\r\n\r\n")).await;
+        let https = untrusting(
+            Proxy::parse(
+                Some(&format!(
+                    "http://synthetic-user:synthetic-pass@127.0.0.1:{port}"
+                )),
+                Some("localhost"),
+            )
+            .unwrap(),
+        );
+        let err = https
+            .send(get("https://api.github.com/repos/example-org/demo-repo"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("TLS failed"), "{err}");
+        assert!(!err.contains("synthetic-pass"), "{err}");
+        let seen = proxy.await.unwrap();
+        assert!(
+            seen.head
+                .starts_with("CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n"),
+            "{}",
+            seen.head
+        );
+        let credentials = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            "synthetic-user:synthetic-pass",
+        );
+        assert!(
+            seen.head
+                .contains(&format!("Proxy-Authorization: Basic {credentials}\r\n")),
+            "{}",
+            seen.head
+        );
+        assert!(
+            !seen.head.contains("Bearer"),
+            "the token went to the proxy in clear"
+        );
+        assert_eq!(
+            seen.after.first(),
+            Some(&0x16),
+            "a TLS handshake goes through"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_proxy_that_refuses_the_tunnel_is_reported() {
+        let (port, proxy) =
+            stand_in(Some("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")).await;
+        let https = untrusting(Proxy::parse(Some(&format!("127.0.0.1:{port}")), None).unwrap());
+        let err = https
+            .send(get("https://jira.example.com/rest/api/3/myself"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the proxy refused the tunnel (403)"), "{err}");
+        let seen = proxy.await.unwrap();
+        assert!(
+            seen.head
+                .starts_with("CONNECT jira.example.com:443 HTTP/1.1\r\n")
+        );
+        assert!(!seen.head.contains("Proxy-Authorization"));
+    }
+
+    #[tokio::test]
+    async fn no_proxy_hosts_are_reached_directly() {
+        // The proxy would refuse; the server, named in NO_PROXY, is reached without it.
+        let (proxy_port, proxy) = stand_in(Some("HTTP/1.1 403 Forbidden\r\n\r\n")).await;
+        let (server_port, server) = stand_in(None).await;
+        let https = untrusting(
+            Proxy::parse(
+                Some(&format!("http://127.0.0.1:{proxy_port}")),
+                Some("example.org, 127.0.0.1"),
+            )
+            .unwrap(),
+        );
+        let err = https
+            .send(get(&format!(
+                "https://127.0.0.1:{server_port}/rest/api/2/myself"
+            )))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains("proxy"), "{err}");
+        let seen = server.await.unwrap();
+        // No CONNECT: the first bytes are the TLS handshake itself.
+        assert_eq!(seen.after.first(), Some(&0x16), "{:?}", seen.after);
+        proxy.abort();
     }
 }
