@@ -49,3 +49,5 @@ pub use app::run;
 pub fn context<R: tauri::Runtime>() -> tauri::Context<R> {
     tauri::generate_context!()
 }
+
+pub mod updater;

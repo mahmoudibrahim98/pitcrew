@@ -26,6 +26,8 @@ export interface SessionHeaderProps {
   onReview?: () => void;
   /** Only the title row: for a narrow pane given over to the terminal. */
   compact?: boolean;
+  /** The "Linked work" landmark's name; the workbench makes it unique per pane. */
+  linksLabel?: string | undefined;
   className?: string;
 }
 
@@ -131,7 +133,7 @@ export function SessionHeader(props: SessionHeaderProps) {
       )}
 
       {!props.compact && (s.task !== undefined || s.workstream !== undefined) && (
-        <nav aria-label="Linked work" className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+        <nav aria-label={props.linksLabel ?? 'Linked work'} className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
           {linkedTask !== undefined && (
             <LinkedWork
               label="Task"

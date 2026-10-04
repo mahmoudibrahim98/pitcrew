@@ -320,6 +320,26 @@ interface NavigateTarget {
 - **Deep links arrive from any web page,** so they never act: they only navigate. No deep link
   answers an ask, moves a task, or sends input.
 
+## Desktop updates
+
+Main window only; no updater plugin permissions are granted to the webview.
+`gateway_update_status()` returns `{ enabled, prereleases, version?: string, notesUrl?: string }`.
+`gateway_update_check()` checks now and returns the same status.
+`gateway_update_channel({ prereleases: boolean })` saves the choice (default false), discards
+the pending update, and checks again. `gateway://update` carries the status after each check.
+Checks also run at startup and every 24 hours. An empty compiled public key disables checks.
+`gateway_update_install({ version: string })` installs only the pending version shown to the
+person, after explicit consent; the updater verifies its minisign signature before installation.
+Signatures must bind the artifact to the offered version in their authenticated trusted comment.
+It rejects stale versions, concurrent operations, channel changes, and verification failures.
+`gateway_update_notes({ version: string })` opens only that pending version's fixed GitHub
+release page in the system browser. Feed text never becomes a URL or HTML in the webview.
+Successful installation restarts the app (Windows' installer exits the process itself).
+Stable checks use the GitHub latest release's `latest.json`; opting in selects the highest
+eligible semantic version with a feed from GitHub's latest 100 published releases, including
+pre-releases. Downgrades and equal versions are never offered. Linux self-update is for
+AppImage installs; deb/rpm users update through their package manager.
+
 ## Security notes
 
 - Only the app's own windows can call these commands (Tauri capabilities). No remote URL is ever

@@ -102,18 +102,19 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [0-read-cursors](0-read-cursors.md) | 0 · Contracts | `integrator/read-cursors` | Codex | **Merged** (PR #36) |
 | [0-files-api](0-files-api.md) | 0 · Contracts | `integrator/files-api` | Codex (local, Windows) | **Merged** (PR #37) |
 | [N-files-tab](N-files-tab.md) | N · Projects layout | `integrator/files-tab` | Codex (local) | **Merged** (PR #43) |
-| [0-idle-cpu-2](0-idle-cpu-2.md) | 0 · Composition root | `integrator/idle-cpu-2` | Codex (cloud, Linux) | Ready |
-| [0-flaky-tests-4](0-flaky-tests-4.md) | 0 · Contracts | `integrator/flaky-tests-4` | Codex | Ready |
-| [0-onboarding-import](0-onboarding-import.md) | 0 · Contracts | `integrator/onboarding-import` | Codex | Ready |
-| [P-installer-size-2](P-installer-size-2.md) | P · Packaging | `integrator/installer-size-2` | Codex (cloud, Linux) | In progress (Codex, cloud) |
-| [O-onboarding-hooks-safety](O-onboarding-hooks-safety.md) | O · Onboarding | `integrator/onboarding-hooks-safety` | Codex (cloud) | Ready |
-| [O-onboarding-machines](O-onboarding-machines.md) | O · Onboarding | `integrator/onboarding-machines` | Opus-class (Claude cloud) | In progress (Claude cloud) |
-| [G-sync-wiring](G-sync-wiring.md) | G · Integrations | `integrator/sync-wiring` | Opus-class (Claude cloud) | In progress (Claude cloud) |
+| [0-idle-cpu-2](0-idle-cpu-2.md) | 0 · Composition root | `integrator/idle-cpu-2` | Codex (cloud, Linux) | **Merged** (PR #48) |
+| [0-flaky-tests-4](0-flaky-tests-4.md) | 0 · Contracts | `integrator/flaky-tests-4` | Codex | **Merged** (PR #49) |
+| [0-onboarding-import](0-onboarding-import.md) | 0 · Contracts | `integrator/onboarding-import` | Codex | **Merged** (PR #46) |
+| [P-installer-size-2](P-installer-size-2.md) | P · Packaging | `integrator/installer-size-2` | Codex (cloud, Linux) | **Merged** (PR #50) |
+| [O-onboarding-hooks-safety](O-onboarding-hooks-safety.md) | O · Onboarding | `integrator/onboarding-hooks-safety` | Codex (cloud) | In review (PR #56) |
+| [O-onboarding-machines](O-onboarding-machines.md) | O · Onboarding | `integrator/onboarding-machines` | Opus-class (Claude cloud) | In review (PR #55) |
+| [G-sync-wiring](G-sync-wiring.md) | G · Integrations | `integrator/sync-wiring` | Opus-class (Claude cloud) | In review (PR #52) |
 | [G-approval-writes](G-approval-writes.md) | G · Integrations | `integrator/approval-writes` | Opus-class (Claude cloud) | After G-sync-wiring |
-| [M-workbench](M-workbench.md) | M · Agent console | `integrator/workbench` | Opus-class (Claude cloud) | In progress (Claude cloud) |
-| [0-remote-files](0-remote-files.md) | 0 · Composition root | `integrator/remote-files` | Codex (cloud) | Ready |
-| [K-updater](K-updater.md) | K · Desktop shell | `integrator/updater` | Codex (local, Windows) | In progress (Codex, local) |
-| [0-draft-board](0-draft-board.md) | 0 · Composition root | `integrator/draft-board` | Codex (local) | After K-updater |
+| [M-workbench](M-workbench.md) | M · Agent console | `integrator/workbench` | Opus-class (Claude cloud) | **Merged** (PR #53) |
+| [0-remote-files](0-remote-files.md) | 0 · Composition root | `integrator/remote-files` | Codex (cloud) | Deferred: needs a hub-to-runner link (after team hubs); remote workspaces already serve their own files |
+| [K-updater](K-updater.md) | K · Desktop shell | `integrator/updater` | Codex (local, Windows) | **Merged** (PR #51) |
+| [0-draft-board](0-draft-board.md) | 0 · Composition root | `integrator/draft-board` | Opus-class (Claude cloud) | In progress (Claude cloud) |
+| [0-create-dialogs](0-create-dialogs.md) | 0 · Composition root | `integrator/create-dialogs` | Codex (cloud) | Ready |
 | [0-team-hubs](0-team-hubs.md) | 0 · Contracts | `integrator/team-hubs` | Opus-class (Claude cloud) | Last (after the route-heavy briefs) |
 | [0-ci-security](0-ci-security.md) | 0 · Contracts | `integrator/ci-security` | Codex | **Merged** (PR #22) |
 | [0-protocol-ts](0-protocol-ts.md) | 0 · Contracts | `integrator/protocol-ts` | Codex | **Merged** (PR #23) |

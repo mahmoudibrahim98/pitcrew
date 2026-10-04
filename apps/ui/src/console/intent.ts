@@ -1,16 +1,19 @@
-// What the console's palette commands ask of the console page: show the list, open a filter, or
-// filter by state. A command hands its request here; the page acts on it at once if it is on
-// screen, or as it mounts after the command has gone to the console. Small and React-free: the
-// commands live in index.ts, which the app loads at start.
+// What the console's palette commands ask of the console page: show the list, open a filter,
+// filter by state, or act on the workbench. A command hands its request here; the page acts on it
+// at once if it is on screen, or as it mounts after the command has gone to the console. Small and
+// React-free: the commands live in index.ts, which the app loads at start.
 
 import type { SessionState } from '../data/index.ts';
 import type { CommandContext } from '../shell/index.ts';
+import type { WorkbenchAction } from './workbench/keys.ts';
 
 export type ConsoleIntent =
   | { kind: 'list' }
   | { kind: 'facet'; facet: 'machine' | 'state' }
   | { kind: 'state'; state: SessionState }
-  | { kind: 'clear' };
+  | { kind: 'clear' }
+  /** One of the workbench's keys, from its palette command (workbench/keys.ts). */
+  | { kind: 'workbench'; action: WorkbenchAction };
 
 let pending: ConsoleIntent | undefined;
 const listeners = new Set<() => void>();

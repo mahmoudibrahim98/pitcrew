@@ -109,6 +109,10 @@ export const WorkstreamPage = lazy(() => import('./workstream-page.tsx').then((m
 export const TaskPage = lazy(() => import('./task-page.tsx').then((m) => ({ default: m.TaskPage })));
 /** A session's blocks of work under a "Work" heading (`level` 2 or 3), for the console's session page. */
 export const SessionWork = lazy(() => import('./recaps.tsx').then((m) => ({ default: m.SessionWork })));
+/** The Files tab's viewer and folder tree, shared with the console's workbench (`file-viewer.tsx`). */
+export const FileViewer = lazy(() => import('./file-viewer.tsx').then((m) => ({ default: m.FileViewer })));
+export const FileTree = lazy(() => import('./file-viewer.tsx').then((m) => ({ default: m.FileTree })));
+export type { FileDraft, FileViewerProps } from './file-viewer.tsx';
 
 export { ProjectsNavProvider, useProjectsNav, type ProjectsNav } from './nav.tsx';
 /** Open asks to me, for the sidebar's Inbox badge. */
