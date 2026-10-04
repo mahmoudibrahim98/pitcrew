@@ -49,9 +49,17 @@ pitcrew comment <task> <text…> [--mention @member]…
 pitcrew ask <@member> <title…> [--option <text>]… [--body <text>] [--task <task>] [--kind question]
 pitcrew reply <ask> [<text…>] [--option <n>]   # options are numbered from 1, as `check` shows
 pitcrew check                                  # asks for you, mentions, your asks and their answers
+pitcrew board submit <draft>  < proposal.json  # a board draft's proposal (see below)
 ```
 
 A text of `-` is read from stdin.
+
+**`board submit`** answers the board draft an agent was started for (api-v1.md, "Board drafts";
+the prompt names the draft, `drf_…`). It reads the proposal's JSON on stdin,
+`{"tasks": [{"title", "status", "description"?, "evidence": [<session id>]}], "note"?}`, refuses
+one over 32 KiB or that is not a JSON object before anything is sent (exit 2), and posts it with
+the agent's token. Only the draft's own agent may (exit 3 otherwise), once (exit 4 after); the
+daemon checks the rest (exit 2). Nothing is created until a person reviews the proposal.
 
 | Exit | Meaning |
 |---|---|

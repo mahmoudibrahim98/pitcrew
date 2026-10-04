@@ -383,6 +383,41 @@ transcript did not appear within the runner's 15-minute claim window, is abandon
 still under way (the runner link has not had the runner's answer) is never abandoned. A session
 already ended or reported meanwhile is left as it is.
 
+## Board drafts
+
+An agent drafts a workstream's board from its history, and **nothing is created until a person
+accepts it** (`src/board.rs`, `src/board_routes.rs`; api-v1.md, "Board drafts"; brief
+`0-draft-board`):
+
+- **Preview** (`draft_preview`, people only): the workstream's facts (its sessions as `GET
+  /v1/sessions` would list them, without sub-agents and drafts' own sessions; each one's newest
+  50 recap blocks for its counts, edited files and three recap lines; the workstream's tasks)
+  become the office's bounded, redacted summary inside `draft-board/v1`
+  (`pitcrew_office::board::draft_prompt`). The answer carries the summary, its cost and the
+  SHA-256 of the prompt (made with a placeholder draft id of the real one's length, so the sizes
+  are exact). Nothing is appended.
+- **Start** (`start_draft`, people only): the prompt is made again and must have the preview's
+  digest (`409` otherwise: the workstream changed). Under the command lock: the agent (named, or
+  the caller's `@office`) must be one of the caller's own, and no other draft of the workstream
+  may be running or waiting for review. It runs where the workstream is (its first location, the
+  project's root, else the hub's machine in `~`), on a live machine, with a dispatcher whose
+  `can_start` agrees. One append: `session_discovered` (`starting`, the agent, linked to the
+  workstream by hand) and `board_draft_started` (sizes and the prompt's version, never the
+  summary). Then, without the lock, `Dispatcher::start_session` (a `SessionRequest`, the prompt as
+  its brief, the draft's real id in it); a failure ends the session (`abandon_session`) and
+  answers as a dispatch's failure would.
+- **Propose** (`propose_board`): the draft's own agent only (`check_draft_proposer`, which the
+  route asks before reading the body), once, at most 32 KiB, each field bounded and redacted
+  (`checked_shape`), evidence only among the sessions the preview would list. Appends
+  `board_proposed`.
+- **Review** (`review_draft`, people only): accepted indexes (any, all or none). One append:
+  `task_created` per accepted item (next keys of the project, in the workstream, at the proposed
+  status, label `drafted`), `session_linked` (manual) for evidence sessions still without a task,
+  and `board_draft_reviewed`. Rejected items create nothing; a draft is reviewed once.
+- **Where drafts live:** in the log only. `load_drafts` folds the three event types (read through
+  the store's type index), so no projection or migration is needed; a running draft whose
+  session has ended (or is unknown) reads as `ended`.
+
 ## Commands
 
 `WorkService` validates each command against the tables, then appends its events in one
@@ -615,6 +650,14 @@ query `400`; bodies over 1 MiB are `400`. A `500` is logged in full and its body
   Unit tests in `src/recap.rs`: a batch of blocks
   that cannot be stored fails its query, and the next one rebuilds from the log. `tests/recap_common/`
   holds the generator and the oracle.
+- `tests/board.rs`: board drafts through the routes, with a recording dispatcher: the preview
+  sends and stores nothing and keeps secrets in titles, branches, tool runs and files out of the
+  summary; a start needs the preview's digest and starts the CLI where the workstream is, with the
+  prompt it measured; only the drafting agent proposes, once, within the bounds, redacted; nothing
+  is created until the review, which creates the accepted tasks only (labelled `drafted`), links
+  free evidence sessions, and happens once; accepting none creates nothing; one draft at a time;
+  an ended session ends its draft; a failed start ends it; hidden sessions are neither sent nor
+  evidence.
 - `tests/sessions.rs`, `tests/dispatch.rs`, `tests/routes.rs`, `tests/self_moving.rs`: the other
   routes and commands. `tests/task_shape.rs`: the `Task` shape pin.
 

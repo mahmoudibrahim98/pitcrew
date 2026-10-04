@@ -653,6 +653,14 @@ to the task (`src/dispatch.rs`; hub-work's README, "Dispatch", for what is recor
 The queue, per-agent concurrency, hand-off, and runners on other machines (over the JSON-lines
 link) are not part of this.
 
+**Board drafts** (api-v1.md, "Board drafts"; hub-work's `crate::board`) start their agent's CLI
+the same way: `RunnerLink::start_session` runs the draft's `StartSession` under the session the
+hub stored (state `starting`, the agent named), in the workstream's folder checked as above, and
+`AgentEnv` gives that CLI the agent's token file, so the agent answers with `pitcrew board submit`
+as itself. A refusal or a failure ends the session (and so the draft); the reconciliation looks
+after a draft's session as after any the hub stored ahead of the runner. `serve` mounts hub-work's
+`board_agent_routes` (the proposal) and `board_device_routes` (preview, start, list, review).
+
 ## Routes
 
 | Route | From |
@@ -982,6 +990,15 @@ process the daemon starts carries the test's mark, and none is left at the end.
   appended as if the hub stopped before starting it: at the next start the second fails ("did not
   start") and its session ends, while the first is kept and reported under its id once its
   transcript appears; ended without a report, its dispatch is `canceled`.
+
+`tests/board.rs` (Unix), a board draft end to end, with the same rig as `tests/dispatch.rs` and
+the `pitcrew` CLI built next to `pitcrewd` (skipped with a message when it or pitcrew-ptyd is not
+built, unless `CI` or `PITCREW_REQUIRE_PTYD=1`): a stand-in `claude` answers the draft as the
+prompt asks, through the real `pitcrew board submit` with the token file the daemon gave it; its
+proposal arrives and a second is refused (exit 4); the prompt is the one the preview measured, and
+names the draft and the workstream's session; no token is in its environment; no task exists
+until the person reviews it, and the review creates the accepted task only, labelled `drafted`,
+linking its evidence session.
 
 `tests/setup.rs`, the first run, fresh daemons with temporary homes (`--homes`, holding the
 Claude fixture's transcript):
