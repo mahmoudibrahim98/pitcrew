@@ -11,6 +11,8 @@
 //! | `recaps.sqlite3` | The recap index's blocks (`WorkService::with_recap_file`): a cache, made when the index is first built, replaced at every start and removed when the daemon stops; never read from one run to the next. Private (0600). When this directory is on a network filesystem, it is in a private folder (0700) on a local disk instead, in the temporary folder or else `$XDG_RUNTIME_DIR`, or the blocks stay in memory. On Unix that folder is named after this directory and the user, so the next start reuses the one a hard kill left and replaces its file; on Windows (or when something else has that name) its name is random, and a hard kill leaves it until the temporary folder is cleaned. |
 //! | `runner/<log id>/` | The runner's index of the transcripts it watches (`pitcrew-runner`), one per hub log. |
 //! | `agents/<agent id>.token` | An agent token for each agent whose sessions the runner started (a dispatch's), bound to that agent and its owner; the CLI is given its path (`PITCREW_TOKEN_FILE`). The folder is private (0700), each file too (0600). |
+//! | `integrations.json` | The GitHub and Jira connections (no secret), the tracker sync's member, and each connection's last sync status (`crate::integrations`). Private (0600). |
+//! | `integrations/<id>.state.json`, `integrations/<id>.secret` | A connection's sync state (cursors, `ETag`s, snapshots of what it read upstream), and its stored secret when it has one. The folder is private (0700; an owner-only DACL on Windows), each file too (0600). Never in the event log. |
 //! | `run/pitcrewd.sock` | The private socket (Unix). |
 
 use anyhow::Context as _;
@@ -149,7 +151,19 @@ pub fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
 /// # Errors
 /// It is not a regular file, cannot be read, or does not hold `what`.
 pub fn read_json<T: DeserializeOwned>(path: &Path, what: &str) -> io::Result<Option<T>> {
-    let Some(text) = read_regular(path, MAX_JSON_FILE)? else {
+    read_json_up_to(path, what, MAX_JSON_FILE)
+}
+
+/// [`read_json`] for a file of at most `max` bytes; a longer one does not parse.
+///
+/// # Errors
+/// As [`read_json`].
+pub fn read_json_up_to<T: DeserializeOwned>(
+    path: &Path,
+    what: &str,
+    max: u64,
+) -> io::Result<Option<T>> {
+    let Some(text) = read_regular(path, max)? else {
         return Ok(None);
     };
     serde_json::from_str(&text).map(Some).map_err(|e| {

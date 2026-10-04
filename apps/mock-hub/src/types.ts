@@ -400,6 +400,7 @@ export type EventBody =
       type: 'workstream_changed';
       data: { workstream: WorkstreamId; status: WorkstreamStatus; health: Health };
     }
+  | { type: 'workstream_linked'; data: { workstream: WorkstreamId; external: ExternalRef[] } }
   | { type: 'task_created'; data: { task: Task } }
   | { type: 'task_moved'; data: { task: TaskId; from: TaskStatus; to: TaskStatus; mover: Mover } }
   | { type: 'task_assigned'; data: { task: TaskId; assignee?: MemberId } }
@@ -701,3 +702,76 @@ export type ScanFrame =
   | ({ type: 'progress' } & ScanProgress)
   | { type: 'done'; report: ScanReport }
   | { type: 'error'; code: ErrorCode; message: string };
+
+// ─── Integrations (integrations.rs) ─────────────────────────────────────────────────────────────
+
+export const JIRA_DEPLOYMENTS = ['cloud', 'data_center'] as const;
+export type JiraDeployment = (typeof JIRA_DEPLOYMENTS)[number];
+export const CREDENTIAL_SOURCES = ['gh_cli', 'stored'] as const;
+export type CredentialSource = (typeof CREDENTIAL_SOURCES)[number];
+export type IntegrationId = Ulid;
+
+export type IntegrationSettings =
+  | { kind: 'github'; repos: string[]; api_base?: string }
+  | {
+      kind: 'jira';
+      deployment: JiraDeployment;
+      site: string;
+      projects: string[];
+      email?: string;
+      epic_link_field?: string;
+    };
+
+export interface SyncProblem {
+  scope: string;
+  message: string;
+}
+
+export interface SyncCounts {
+  changes: number;
+  applied: number;
+  conflicts: number;
+  skipped: number;
+  malformed: number;
+}
+
+export interface SyncStatus {
+  running: boolean;
+  last_attempt_at?: TimestampMs;
+  last_success_at?: TimestampMs;
+  next_at?: TimestampMs;
+  rate_limited_until?: TimestampMs;
+  problems: SyncProblem[];
+  last_run?: SyncCounts;
+}
+
+export interface IntegrationLink {
+  workstream: WorkstreamId;
+  scope: ExternalRef;
+  title?: string;
+}
+
+export interface Integration {
+  id: IntegrationId;
+  name: string;
+  settings: IntegrationSettings;
+  credential: { source: CredentialSource; stored: boolean };
+  interval_minutes: number;
+  added_by: MemberId;
+  added_at: TimestampMs;
+  status: SyncStatus;
+  links: IntegrationLink[];
+}
+
+export interface ScopeCheck {
+  scope: string;
+  ok: boolean;
+  message: string;
+}
+
+export interface IntegrationCheck {
+  ok: boolean;
+  at: TimestampMs;
+  checks: ScopeCheck[];
+  warnings: string[];
+}

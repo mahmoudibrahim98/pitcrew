@@ -76,6 +76,7 @@ import {
 } from './validate.ts';
 
 import { files } from './files.ts';
+import * as integrations from './integrations.ts';
 export const MOCK_VERSION = '0.1.0-mock';
 /** `PROTOCOL_VERSION` and `PROTOCOL_MIN` in crates/protocol/src/version.rs. */
 export const PROTOCOL_VERSION = 1;
@@ -498,8 +499,11 @@ const patchWorkstream: Handler = (hub, ctx) => {
   const fields = new Fields(ctx.body);
   const status = fields.optEnum('status', WORKSTREAM_STATUSES);
   const health = fields.optEnum('health', HEALTHS);
-  if (status === undefined && health === undefined) {
-    throw invalid('Give a status, a health, or both.');
+  const raw = fields.raw('external');
+  // Links upstream (api-v1.md, "Linking a workstream upstream"): the full new list.
+  const external = raw === undefined ? undefined : integrations.checkLinks(raw);
+  if (status === undefined && health === undefined && external === undefined) {
+    throw invalid('Give a status, a health, links (external), or several.');
   }
   const next = { status: status ?? workstream.status, health: health ?? workstream.health };
   if (next.status !== workstream.status || next.health !== workstream.health) {
@@ -508,6 +512,13 @@ const patchWorkstream: Handler = (hub, ctx) => {
     hub.append(ctx.caller.memberId, {
       type: 'workstream_changed',
       data: { workstream: workstream.id, ...next },
+    });
+  }
+  if (external !== undefined && JSON.stringify(external) !== JSON.stringify(workstream.external)) {
+    workstream.external = external;
+    hub.append(ctx.caller.memberId, {
+      type: 'workstream_linked',
+      data: { workstream: workstream.id, external },
     });
   }
   return ok(workstream);
@@ -1354,6 +1365,7 @@ function directRefs(hub: Hub, body: EventBody): EventFilter {
     case 'workstream_created':
       return { workstream: body.data.workstream.id };
     case 'workstream_changed':
+    case 'workstream_linked':
       return { workstream: body.data.workstream };
     case 'task_created':
       return { task: body.data.task.id };
@@ -1513,6 +1525,14 @@ const ROUTES: Route[] = [
   route('GET', '/v1/events', 'device', listEvents),
   route('GET', '/v1/activity', 'device', listEvents),
   // Recaps: from the fixture the recap engine wrote (recaps.ts).
+  route('GET', '/v1/integrations', 'device', (hub) => integrations.list(hub)),
+  route('POST', '/v1/integrations', 'device', (hub, ctx) => integrations.add(hub, ctx.caller.memberId, ctx.body)),
+  route('GET', '/v1/integrations/:id', 'device', (hub, ctx) => integrations.get(hub, ctx.param('id'))),
+  route('DELETE', '/v1/integrations/:id', 'device', (hub, ctx) => integrations.remove(hub, ctx.param('id'))),
+  route('POST', '/v1/integrations/:id/test', 'device', (hub, ctx) => integrations.test(hub, ctx.param('id'))),
+  route('POST', '/v1/integrations/:id/sync', 'device', (hub, ctx) => integrations.syncNow(hub, ctx.param('id'))),
+  route('PUT', '/v1/integrations/:id/credential', 'device', (hub, ctx) => integrations.setCredential(hub, ctx.param('id'), ctx.body)),
+
   route('GET', '/v1/recaps/blocks', 'device', (hub, ctx) => ok(blocksPage(hub.recaps, ctx.query))),
   route('GET', '/v1/recaps/days', 'device', (hub, ctx) => ok(daysPage(hub.recaps, ctx.query))),
   route('POST', '/v1/hooks/:engine/:event', 'agent', receiveHook),

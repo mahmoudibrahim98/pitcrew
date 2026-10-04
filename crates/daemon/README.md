@@ -52,6 +52,7 @@ in the log when used (see "Terminals"):
 | `--ptyd-idle-exit-ms <ms>` | A pitcrew-ptyd this daemon starts exits after that long idle (its own default is 30 seconds). |
 | `--terminal-runtime pty` | The terminals run in pitcrew-ptyd even where tmux is usable (`auto`, the default, prefers tmux). |
 | `--scan-hold-ms <ms>` | Each machine scan waits that long once accepted, holding its machine, before it walks: a second scan meanwhile can be shown to get `409` (see "The machine scan"). |
+| `--integration-fixtures <dir>` | GitHub and Jira integrations read the recorded exchanges in that folder's `*.fixture` files (`apps/mock-hub/fixtures`) instead of the network (see "Integrations"). |
 
 ## The state directory
 
@@ -67,6 +68,8 @@ in the log when used (see "Terminals"):
 | `recaps.sqlite3` | The recap index's blocks (hub-work's README, "Recaps"): a cache, made when the index is built at start, replaced at every start and removed at a clean stop; never read from one run to the next. Private. On a network or unknown filesystem, kept in a private local fallback folder (temp before `$XDG_RUNTIME_DIR`), or memory if neither works; see "Recaps". |
 | `runner/<log id>/` | The runner's index (`pitcrew-runner`): every transcript it watches, its session id, and how far it has been read into this store. One folder per hub log (the store's `log_id`), so a new store learns every session from the start. |
 | `agents/<agent id>.token` | An agent token for each agent whose CLI the runner started (a dispatch's, or `POST /v1/sessions` with `agent`), bound to that agent and its owner, `pca_…`. The CLI is given its path (`PITCREW_TOKEN_FILE`), never the token. Minted once, reused while it verifies as exactly that. The folder is 0700, each file 0600. |
+| `integrations.json` | The GitHub and Jira connections (never a secret), the tracker sync's member (`@sync`), each connection's last sync status, and the upstream titles of linked milestones and epics. Private. |
+| `integrations/<id>.state.json`, `integrations/<id>.secret` | A connection's sync state (cursors, `ETag`s, snapshots of what it read upstream; never in the event log) and its stored secret, when it has one. The folder is 0700 (an owner-only DACL on Windows), each file 0600. |
 | `run/pitcrewd.sock` | The private socket (Unix). On Windows the API uses the current user's named pipe, `\\.\pipe\pitcrewd-<user SID>`. |
 
 On Unix the directory is created 0700, and an existing one must already be ours and private; on
@@ -668,6 +671,7 @@ link) are not part of this.
 | `GET /v1/sessions/{id}/terminal` | `pitcrew-api` over `SessionTerminals` (see "Terminals") |
 | `POST /v1/sessions`, `POST /v1/sessions/{id}/send`, `/keys`, `/interrupt`, `/end` | `src/sessions.rs`, device routes, through the runner's `RunnerCommands` (see "Terminals") |
 | `GET /v1/sessions/{id}/transcript` | `src/transcripts.rs`, a device route, from the runner's `RunnerTranscripts` (see "The runner") |
+| `/v1/integrations…` | `src/integrations/`, device routes (see "Integrations") |
 
 On development TCP only, the daemon answers CORS as the mock hub does: preflights from
 `http://localhost:<port>`, `http://127.0.0.1:<port>` and the Tauri app's origins get `204` and
@@ -1100,6 +1104,36 @@ directory's socket, or the `--listen` given; `src/setup.rs` that the listener ha
 once, and that an office loop and a runner (real, watching nothing) are kept until the stop begins
 and handed back, not kept, once it has.
 
+## Integrations
+
+GitHub and Jira, **read-only** (api-v1.md, "Integrations"; `src/integrations/`):
+
+- **Connections** live in `integrations.json`, never in the event log. The first one adds the
+  tracker sync's member (`@sync`, an agent of the person; hub-work's `ensure_sync_member`), which
+  authors everything a sync changes.
+- **Credentials**: `gh auth token` (with `--hostname` for Enterprise), found on the daemon's
+  `PATH` (absolute folders only), checked with `pitcrew_trust::check_trusted`, run without a
+  terminal and read at each sync, never kept; or a secret stored by `PUT …/credential` in
+  `integrations/<id>.secret` (`secret.rs`). A `Secret` prints as `Secret(***)`; no route returns
+  one and nothing logs one (`tests/integrations.rs` checks every answer, the log at debug and the
+  saved files).
+- **The loop** syncs each connection on its interval (the first one 30 seconds after a start, or
+  at once when added) and on `POST …/sync`, one at a time. It reads upstream with
+  `pitcrew-sync-github` / `pitcrew-sync-jira` over `http.rs`'s transport: HTTP/1.1 over rustls
+  (`ring`, this machine's certificates), `https://` only, a 6 MiB body cap, 20 s to connect and 60 s
+  per request, a `User-Agent`, no proxy. `apply.rs` then applies the changes through hub-work's
+  `SyncCommands`: issues become tasks only in a linked scope (a workstream's link to the
+  milestone or epic, else the repository or project), issues closed before they were first seen
+  are skipped, upstream-owned fields are overwritten, moves follow `can_move(.., sync)`, a merged
+  pull request is noted on its task, a closed milestone or epic ships its workstreams, and every
+  refusal is a conflict ask. The sync state is saved after the changes are applied, so a stop in
+  between reads them again next time (every command is idempotent). A rate limit waits until it
+  lifts.
+- When a repository's or project's links change, its issues (and, on GitHub, pull requests) are
+  read again from the start at the next sync.
+- `--integration-fixtures <dir>` swaps the transport for recorded exchanges, answered by URL (a
+  `since=` cursor ignored), for tests: `tests/integrations.rs` and the conformance runner.
+
 ## Not wired yet
 
 - Agent tokens for sessions PitCrew did not start: a CLI a person runs by hand has no agent and
@@ -1125,6 +1159,9 @@ and handed back, not kept, once it has.
 - `--demo` through the setup path (the demo still seeds its own person, machine and name).
 - Remote machines (the desktop's side of the tunnel, and a supervisor of the local daemon), the
   Tauri shell, auto-start and installers.
+- Integrations: no HTTP proxy (`HTTPS_PROXY` is not read), no HTTP/2 or connection reuse, and no
+  write to GitHub or Jira (G-approval-writes). Removing a connection keeps its workstream links as
+  plain links.
 - Scanning another machine of the workspace (`POST /v1/machines/{id}/scan` is `409` for one), and
   stopping a scan part-way: `pitcrew_ingest::scan` takes no cancel, so a scan whose client went
   away runs to its end. A cancel flag in its `ScanOptions` (stream A) would let the route stop it.

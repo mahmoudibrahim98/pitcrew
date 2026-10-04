@@ -167,6 +167,7 @@ pub fn serve(state: &StateDir, args: &ServeArgs) -> anyhow::Result<ExitCode> {
         state,
         listen: args.listen.clone(),
         started,
+        integration_fixtures: args.integration_fixtures.clone(),
     }));
     stop_runtime(runtime);
     if store.upgrade().is_none() {
@@ -507,6 +508,8 @@ struct Serving<'a> {
     state: &'a StateDir,
     listen: ListenArg,
     started: Instant,
+    /// `--integration-fixtures`: the integrations read these instead of the network (tests).
+    integration_fixtures: Option<std::path::PathBuf>,
 }
 
 /// Step 8 onwards: serve until a stop signal, then shut down in order.
@@ -521,6 +524,7 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         state,
         listen,
         started,
+        integration_fixtures,
     } = serving;
     let Hub {
         tokens,
@@ -557,6 +561,13 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
     ));
     let transcripts = Transcripts::new(Arc::clone(&work), Arc::clone(&attached));
     let sessions = Sessions::new(Arc::clone(&work), Arc::clone(&attached));
+    // GitHub and Jira (read-only): their connections, credentials and sync loop.
+    let integrations = Arc::new(crate::integrations::Integrations::open(
+        state.root(),
+        &work,
+        crate::integrations::upstream(integration_fixtures.as_deref())?,
+        crate::integrations::secret::GhCli::from_env(),
+    )?);
     // The activity index (`project=`, `workstream=`, and wider `task=` and `session=` matches).
     let refs: Arc<dyn EventRefs> = Arc::new(WorkRefs(Arc::clone(&work)));
     // The recap index (`GET /v1/recaps/blocks` and `/days`), kept current on every query.
@@ -579,6 +590,7 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         ))
         .device(transcripts.routes())
         .device(sessions.routes())
+        .device(crate::integrations::routes(Arc::clone(&integrations)))
         .device(pitcrew_hub_work::device_routes().layer(Extension(Arc::clone(&work))));
     // The roles and capabilities as they are at each request (the runner may start later).
     let info = Arc::new(HostInfoNow::new(Arc::clone(&attached)));
@@ -624,6 +636,8 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
     if let Some(office) = office {
         let _ = workers.keep_office(office.spawn(Arc::clone(&work)));
     }
+    let syncing = integrations.spawn();
+    drop(integrations);
     // A workspace not set up yet: what needed a person starts once it is, without a restart.
     if let Some(set_up) = set_up {
         drop(tokio::spawn(crate::setup::after_setup(
@@ -693,10 +707,16 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
             runner.stop(DRAIN).await;
         }
     };
+    let syncing_stopped = syncing.stop(DRAIN);
     if failed.is_some() {
-        tokio::join!(office_stopped, runner_stopped);
+        tokio::join!(office_stopped, runner_stopped, syncing_stopped);
     } else {
-        tokio::join!(office_stopped, runner_stopped, finish(&mut serving));
+        tokio::join!(
+            office_stopped,
+            runner_stopped,
+            syncing_stopped,
+            finish(&mut serving)
+        );
     }
     drop(tokens);
     // The runner has stopped: let go of its terminals' runtime, so tmux stores where each

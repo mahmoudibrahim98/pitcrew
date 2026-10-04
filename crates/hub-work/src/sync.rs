@@ -227,6 +227,17 @@ impl SyncCommands<'_> {
         })
     }
 
+    /// The task `task`.
+    ///
+    /// # Errors
+    ///
+    /// `not_found` for an unknown task; database errors.
+    pub fn task_by_id(&self, task: &TaskId) -> Result<Task> {
+        let reference = TaskRef::Id(*task);
+        self.work
+            .read(|c| query::task(c, &reference)?.ok_or_else(|| no_task(&reference)))
+    }
+
     /// Every workstream, for routing upstream items by their links.
     ///
     /// # Errors
