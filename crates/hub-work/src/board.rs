@@ -364,7 +364,9 @@ impl WorkService {
             .unwrap_or_else(|_| Err(DispatchError::Failed("the runner link panicked".into())));
         if let Err(error) = started {
             tracing::warn!(%draft, session = %request.session, error = %error, "a board draft's session could not start");
-            self.abandon_session(&request.session, &error.to_string())?;
+            if let Err(e) = self.abandon_session(&request.session, &error.to_string()) {
+                tracing::warn!(%draft, session = %request.session, error = %e, "cannot end a board draft's session that did not start");
+            }
             return Err(refused(&error));
         }
         self.board_draft(&draft)
