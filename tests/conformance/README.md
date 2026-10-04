@@ -86,7 +86,12 @@ connection's status, link title and test (with its warning about write rights); 
 and the sync's events reach activity and a `/v1/stream` replay only as the shared visibility rule
 allows (an agent gets `403` from both; with every session excluded by `/v1/import`, they stay
 visible while an excluded session's events are hidden from the same answers, and the choice is
-restored to `all` afterwards); and removal. Both
-targets read the recorded fixtures in `apps/mock-hub/fixtures`: the daemon runner passes
-`--integration-fixtures` and puts a stand-in `gh` (printing a synthetic credential) first on the
-daemon's `PATH`. Nothing reaches GitHub or Jira.
+restored to `all` afterwards); then upstream changes, which both targets must apply alike: an open
+issue (#4) moved into the linked milestone becomes a task there while a closed one (#2) does not,
+an issue and the milestone closing upstream move the task to `done` and ship the workstream, and a
+task a person reopens stays reopened on the next sync; and removal. Both targets read a copy of
+the recorded fixtures in `apps/mock-hub/fixtures` that `run.mjs` makes
+(`PITCREW_CONFORMANCE_FIXTURES`), again at each sync: the test changes upstream by adding a
+fixture file that sorts first. The daemon runner passes `--integration-fixtures` and puts a
+stand-in `gh` (printing a synthetic credential) first on the daemon's `PATH`; the mock gets
+`startServer({ integrationFixtures })`. Nothing reaches GitHub or Jira.

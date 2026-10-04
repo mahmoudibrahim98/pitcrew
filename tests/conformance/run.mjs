@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readdir, readFile, rm, writeFile, symlink } from 'node:fs/promises';
+import { cp, mkdtemp, mkdir, readdir, readFile, rm, writeFile, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
@@ -108,8 +108,13 @@ try {
     console.log('# skipped: conformance link creation refused by the OS');
   }
   env.PITCREW_FILES_ROOT = filesRoot;
+  // Both targets read GitHub and Jira from this copy of the mock hub's recorded fixtures, again at
+  // each sync: integrations.test.mjs adds a file that sorts first to change what upstream says.
+  const fixtures = join(temporary, 'fixtures');
+  await cp(join(root, 'apps', 'mock-hub', 'fixtures'), fixtures, { recursive: true });
+  env.PITCREW_CONFORMANCE_FIXTURES = fixtures;
   if (target === 'mock') {
-    mock = await startServer({ port: 0 });
+    mock = await startServer({ port: 0, integrationFixtures: fixtures });
     env.PITCREW_CONFORMANCE_URL = mock.url;
     env.PITCREW_CONFORMANCE_PERSON = 'dev-device-token';
     env.PITCREW_CONFORMANCE_AGENT = 'dev-agent-token';
@@ -178,9 +183,9 @@ try {
         // A scan holds its machine this long, so scan.test.mjs can show a second one refused.
         '--scan-hold-ms',
         '1500',
-        // Integrations read the mock hub's recorded fixtures, never the network.
+        // Integrations read the copy of the mock hub's recorded fixtures, never the network.
         '--integration-fixtures',
-        join(root, 'apps', 'mock-hub', 'fixtures'),
+        fixtures,
       ],
       {
         cwd: root,
