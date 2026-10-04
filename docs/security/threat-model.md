@@ -177,6 +177,7 @@ replayed streams deliver them only to the author's devices, never other members 
 | Id | Threat | Required mitigation | Code | Tests | Stream | Status |
 |---|---|---|---|---|---|---|
 | T80 | A file request escapes its workstream, follows a link, junction or swapped ancestor, overwrites a hard-linked file or `.git`, or leaks old bytes through squatted or public backups | Device-only routes resolve roots from workstream locations. Validate before I/O; no-follow opens, held ancestor identities and revisions. Refuse multi-link writes and `.git`; preserve permissions and atomically replace. Private backups fail closed and retain three per file, 64 MiB total, 8 MiB each. Fixed reasons only in errors and logs. | `crates/runner/src/files.rs`, `files/storage.rs`; `crates/daemon/src/files.rs`; `crates/protocol/src/files.rs`; mock `files.ts` | Runner tests `lexical_path_rules_before_io`, `links_and_junctions_are_listed_but_never_followed`, `check_open_swap_is_refused`, `held_ancestor_swap_is_refused_or_prevented`, `a_file_swap_between_check_and_open_is_refused_or_prevented`, `windows_private_acl_and_permissions_survive_replacement`, `revisions_backups_binary_and_hardlinks`, `caps_and_retention`, `public_or_linked_backup_storage_is_refused`, `hardlinked_backup_is_refused`, `unix_permissions_and_public_backups`; daemon `device_files_routes_resolve_roots_and_enforce_limits`; shared `files.test.mjs` | 0, D | In place. Windows ancestor handles deny deletion; Unix creation/replacement use held directory descriptors. Same-account mutation after the final check remains outside a filesystem transaction: a privileged Unix owner can move a held directory, and Windows closes the target handle before rename. Windows private ACLs use native security calls in `crates/trust/src/windows.rs`; failure refuses replacement. Any person in the workspace can read and write inside any workstream location on the hub machine; persons set these locations. This is the same trust dispatch already gives a person on that machine. A multi-person hub will need machine ownership, as #33's S2 did for agents. |
+| T81 | A device token changes agent configuration to execute commands on the hub machine | Device-only, local-machine-only routes; person-bound expiring bounded server plans; exact diff and confirmation; stale-file refusal, backups, skipped conflicts; no configuration or parser-error logging. Shipped hook CLI. | CLI installation library, daemon onboarding routes, UI Hooks step | Library mixed-engine/home tests; daemon onboarding; UI hook tests; gated conformance | O, I, 0 | See onboarding capability discussion below for same-account races, stolen device tokens, partial writes and unused-home detection. |
 
 ### 5.7 Remote machines and SSH (B8)
 
@@ -678,3 +679,28 @@ default-permission personas under the same writer lock. It runs no CLI and raise
 mode. Only a later device-authorized dispatch starts an agent; ownership is checked by dispatch.
 Empty, failed and disconnected scans provision nothing. Real-daemon scan tests and fresh mock
 setup/dispatch tests cover this path.
+
+### Onboarding hook configuration writes (T81, device capability)
+
+A device token can ask the hub to write agent configurations that execute commands
+(`pitcrew hook`) on the hub machine. Only this hub's own machine is accepted; agent
+tokens are refused before reading a body or touching configurations. The existing
+CLI planner selects known engine paths, detects installations on PATH or from
+engine homes, preserves unrelated settings and refuses conflicting engines without
+blocking nonconflicting plans. The desktop ships the hook executable beside the
+daemon; the person sees a per-file unified diff before confirming.
+
+Plans are server-held, person/machine-bound, expire after ten minutes, and have
+count and aggregate-memory bounds. Confirmation accepts only the opaque revision;
+changed files refuse before writes, applied files are idempotent, and the CLI's
+backups remain available. Configurations and parser errors are not logged or
+returned verbatim. Conformance installation is gated to the runner's synthetic
+agent homes. An empty plan cannot mark hooks installed.
+
+Residuals: a stolen device token has the person's same configuration-write
+capability; no per-machine ownership exists yet. A same-account process can race
+after the stale check, and writes across different configuration files are not a
+transaction: failed partial writes can be retried using the held plan. Home-based
+detection can find an unused CLI home; it does not execute the CLI or touch logins.
+Coverage: CLI installation library tests, daemon onboarding tests, UI hooks/safety
+tests, and gated onboarding conformance.

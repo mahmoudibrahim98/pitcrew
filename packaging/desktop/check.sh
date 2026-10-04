@@ -31,7 +31,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 product=PitCrew
 identifier=org.pitcrew.desktop
 app_exe=pitcrew-desktop
-sidecars=(pitcrewd pitcrew-ptyd pitcrew-askpass)
+sidecars=(pitcrewd pitcrew pitcrew-ptyd pitcrew-askpass)
 budget_mb=25
 # AppImage includes WebKitGTK/GTK: measured payload budget plus 10% (P.md).
 appimage_budget_bytes=106772011
@@ -167,6 +167,11 @@ run_sidecars() { # LABEL BIN_DIR [EXE_SUFFIX]
   case "$line" in
     "pitcrewd $version "*) ok "$label: $line" ;;
     *) fail "$label: pitcrewd --version said \"$line\", not version $version" ;;
+  esac
+  line=$("$bin/pitcrew$exe" --version 2>&1 | head -n 1)
+  case "$line" in
+    "pitcrew $version" | "pitcrew $version "*) ok "$label: $line" ;;
+    *) fail "$label: pitcrew --version said \"$line\"" ;;
   esac
   line=$("$bin/pitcrew-ptyd$exe" --version 2>&1 | head -n 1)
   case "$line" in

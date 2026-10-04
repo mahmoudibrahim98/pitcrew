@@ -690,3 +690,12 @@ append, using the project root as its location. This keeps the creation dialog a
 Successful onboarding scans call `ensure_engine_agents`: missing detected engines receive a
 person-owned agent member and default persona in one batch. The writer lock makes concurrent
 scans idempotent; existing owned agents are reused. Service actors without personas do not count.
+
+Workspace safety preferences are projected from person-authored `safety_changed` events (`work.safety`), with validated permission modes and a 0–100 hourly automatic-acceptance budget. An explicit save controls low-risk task completion and brief acceptance; disabled or exhausted budgets leave proposals for review. Existing hubs retain their per-task policy until the first explicit save. Rebuilding preferences retains the hourly budget because acceptances remain in the event log.
+
+Onboarding review: hook previews detect supported CLIs on PATH or through their
+homes, skip conflicting engines while applying other changes, and report the
+skipped engines. No-change previews cannot set the wizard's installed flag.
+Desktop packages include the hook CLI beside the daemon. Safety uses snake_case
+wire fields and the shared PermissionMode enum; bypass defaults are currently
+refused. Unsaved safety reports `saved: false` for legacy per-task acceptance.

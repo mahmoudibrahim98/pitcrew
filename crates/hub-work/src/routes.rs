@@ -97,6 +97,7 @@ where
         .route("/v1/tasks/{id}", patch(patch_task))
         .route("/v1/tasks/{id}/assign", post(assign_task))
         .route("/v1/tasks/{id}/dispatch", post(dispatch_task))
+        .route("/v1/safety", get(get_safety).put(put_safety))
         .route("/v1/import", get(get_import).put(put_import))
         .route("/v1/import/dry-run", post(dry_run_import))
         .route("/v1/sessions", get(list_sessions))
@@ -751,5 +752,27 @@ async fn edit_team(
     let edit: TeamEdit = json(body).await?;
     Ok(Json(
         blocking(w, move |w| w.save_team(&caller, Some(id), edit)).await?,
+    ))
+}
+
+async fn get_safety(Work(w): Work, Person(_): Person) -> Reply<serde_json::Value> {
+    Ok(Json(
+        blocking(w, |w| {
+            let mut value = serde_json::to_value(w.safety()?)?;
+            if !w.safety_saved()? {
+                value["saved"] = serde_json::json!(false);
+            }
+            Ok(value)
+        })
+        .await?,
+    ))
+}
+async fn put_safety(
+    Work(w): Work,
+    Person(caller): Person,
+    Body(settings): Body<pitcrew_protocol::onboarding::SaveSafety>,
+) -> Reply<pitcrew_protocol::onboarding::SafetySettings> {
+    Ok(Json(
+        blocking(w, move |w| w.save_safety(&caller, settings.into())).await?,
     ))
 }

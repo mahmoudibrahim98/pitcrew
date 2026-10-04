@@ -208,3 +208,5 @@ Both conformance targets run the same directory and atomic-project cases.
 A completed setup scan provisions one owned agent/persona per detected engine, matching the
 real hub. Repeated scans reuse them; a disconnected scan creates none. Fresh setup tests dispatch
 tasks through each generated agent.
+
+Onboarding hooks use synthetic in-memory configuration text, person/machine-bound previews, stale refusal and idempotent confirmation. The mock never opens agent homes. Device-only safety read/save validates the same settings as the daemon and appends `safety_changed` on change.

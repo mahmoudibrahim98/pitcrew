@@ -564,6 +564,7 @@ export type EventBody =
       type: 'workstream_changed';
       data: { workstream: WorkstreamId; status: WorkstreamStatus; health: Health };
     }
+  | { type: 'safety_changed'; data: { settings: import('../../../../packages/protocol-ts/bindings/SafetySettings.ts').SafetySettings } }
   | { type: 'task_created'; data: { task: Task } }
   | { type: 'task_moved'; data: { task: TaskId; from: TaskStatus; to: TaskStatus; mover: Mover } }
   | { type: 'task_assigned'; data: { task: TaskId; assignee?: MemberId } }
@@ -594,6 +595,7 @@ export type EventType = EventBody['type'];
 
 /** Every `EventBody` type, so tests and the invalidation map can check they cover them all. */
 export const EVENT_TYPES = [
+  'safety_changed',
   'cursor_moved',
   'machine_added',
   'member_added',

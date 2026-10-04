@@ -81,6 +81,7 @@ pub mod query;
 pub mod recap;
 mod recap_db;
 pub mod routes;
+mod safety;
 mod seed;
 mod service;
 mod setup;

@@ -81,3 +81,7 @@ request creates both. Both targets run these cases.
 
 Directory conformance also dispatches a task through the member created by New agent, exercising
 the recipe/member ownership link against both servers.
+
+Hook-install conformance writes agent configurations. It is disabled unless
+`PITCREW_CONFORMANCE_SYNTHETIC_HOOKS=1`, which `run.mjs` sets only for its managed
+synthetic targets. Do not set it when pointing the suite at an existing hub.
