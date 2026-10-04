@@ -219,8 +219,9 @@ impl GhCli {
         }
     }
 
-    /// `gh` from the given `PATH` value (tests).
-    #[cfg(test)]
+    /// `gh` from the given `PATH` value (tests). Only the Unix tests run a stand-in `gh`, so on
+    /// Windows nothing calls it.
+    #[cfg(all(test, unix))]
     #[must_use]
     pub fn with_path(path: OsString) -> Self {
         Self { path: Some(path) }
