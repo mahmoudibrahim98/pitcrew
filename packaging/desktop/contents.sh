@@ -20,7 +20,14 @@ for input in "$@"; do
   mkdir -p "$root"
   case "$file" in
     *.deb) dpkg-deb -x "$file" "$root" ;;
-    *.rpm) rpm2cpio "$file" | (cd "$root" && cpio -idm --no-absolute-filenames --quiet) ;;
+    *.rpm)
+      # As check.sh: rpm2cpio | cpio, else libarchive's bsdtar.
+      if ! rpm2cpio "$file" 2>/dev/null | (cd "$root" && cpio -idm --no-absolute-filenames --quiet) 2>/dev/null; then
+        rm -rf "$root"
+        mkdir -p "$root"
+        bsdtar -xf "$file" -C "$root"
+      fi
+      ;;
     *.AppImage)
       (cd "$root" && "$file" --appimage-extract >/dev/null)
       root="$root/squashfs-root"
