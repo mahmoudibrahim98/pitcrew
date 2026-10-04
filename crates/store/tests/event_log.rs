@@ -378,6 +378,19 @@ fn other_bodies() -> Vec<EventBody> {
         json!({"type": "team_saved", "data": {"team": demo.teams[0]}}),
         json!({"type": "session_updated", "data": {"session": session.id,
             "title": "Method section, second pass"}}),
+        json!({"type": "board_draft_started", "data": {"draft": "01J00000000000000000000000",
+            "workstream": demo.workstreams[0].id, "agent": demo.members[1].id,
+            "engine": "claude", "session": session.id, "prompt": "draft-board/v1",
+            "cost": {"sessions": 2, "sessions_left_out": 0, "tasks": 4, "summary_bytes": 900,
+                     "prompt_bytes": 3000, "redacted": 1,
+                     "estimate": {"input_tokens": 15750, "output_tokens": 8192}}}}),
+        json!({"type": "board_proposed", "data": {"draft": "01J00000000000000000000000",
+            "workstream": demo.workstreams[0].id,
+            "tasks": [{"title": "Finish the method section", "status": "in_progress",
+                       "evidence": [session.id]}]}}),
+        json!({"type": "board_draft_reviewed", "data": {"draft": "01J00000000000000000000000",
+            "workstream": demo.workstreams[0].id,
+            "accepted": [{"item": 0, "task": demo.tasks[0].id}], "rejected": []}}),
     ];
     bodies
         .into_iter()

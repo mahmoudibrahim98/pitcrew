@@ -21,6 +21,7 @@
 #![forbid(unsafe_code)]
 
 pub mod api;
+pub mod board;
 pub mod events;
 pub mod files;
 pub mod ids;

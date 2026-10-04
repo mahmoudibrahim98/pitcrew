@@ -58,20 +58,46 @@ activity, so the office never feeds on itself.
   saved state restores exactly at any point, and caps hold under a flood.
 - `tests/run_log.rs`: the projection stores what the office did and rebuilds identically, with
   any batch size, registered late, after a reopen, and after a rolled-back append.
+- `tests/board_summary.rs`: the summary holds what it should; synthetic secrets of every kind, in
+  titles, recaps (the activity they describe), files, branches, task titles and names, never reach
+  the prompt, nor a long piece of one; hidden characters and newlines cannot inject lines or close
+  the summary; every bound holds with 100 sessions and 200 tasks of 10,000-character texts, the
+  most recent kept and the rest counted; the estimate follows the prompt's size.
+- Unit tests in `src/redact.rs` (each rule, plain text left alone, bounds after redaction) and
+  `src/prompts.rs` (one-pass rendering).
 
-## Draft board dependency
+## Prompts as files, and what a board draft sends
 
-Brief [0-draft-board](../../docs/build/briefs/0-draft-board.md) requires a dispatched agent to
-return a structured board proposal through the `pitcrew` CLI, before a person accepts any tasks.
-This feature is not implemented. The current CLI has no proposal submission command:
-`report`, `comment`, and `task plan` operate on existing tasks; `ask` and `reply` operate on asks;
-`hook` forwards CLI lifecycle events silently and always exits successfully.
-
-Implementing a proposal submission command requires substantive changes to `crates/cli/**`,
-which the brief does not include in its allowed paths. Extend the brief to include that crate
-and its tests and README before implementation resumes. The submission command should read a
-bounded proposal from stdin, submit it with the dispatched agent's authenticated connection,
-and return a failure when validation or storage fails. The hub must bind the submission to the
-pending draft and its agent, validate evidence session links, and create tasks only when a
-person accepts the proposal. A proposed command spelling is `pitcrew board submit <draft>`,
-to be agreed in the API contract before code; it is not available today.
+- **`prompts/<name>/v<n>.md`** are the versioned prompt templates, built into the binary
+  (`prompts::DRAFT_BOARD`, `prompts/draft-board/v1.md`). A template is never edited once
+  released: a change is a new version, and what was sent records the version (`draft-board/v1`).
+  `Prompt::render` puts each `{{name}}` in, in one pass, so a value never reaches another
+  placeholder.
+- **`board`**: the bounded, redacted summary a board draft (brief
+  [0-draft-board](../../docs/build/briefs/0-draft-board.md)) sends the agent that drafts a
+  workstream's board, inside `draft-board/v1`, and its cost. The hub hands it facts only (titles,
+  states, dates, branches, linked task keys, counts, edited files, the recap engine's one-line
+  summaries of blocks of work, and the workstream's tasks); never a transcript, a prompt or a
+  tool's output.
+  - **Bounds:** 40 sessions, most recently active first; 60 tasks in at most 4 KiB; per session a
+    title of 120 characters, 3 recap lines of 200, 5 files of 100; names of 80; the whole summary
+    at most 12 KiB, the least recently active sessions left out (and counted) when it is full.
+    The prompt is at most the template plus 12 KiB (`MAX_PROMPT_BYTES`), well inside a command
+    line on every platform.
+  - **The estimate:** the agent reads the prompt (a token for every 4 bytes, rounded up) plus a
+    fixed 15,000-token allowance for its CLI's own instructions (`CLI_OVERHEAD_TOKENS`); its
+    answer is at most the proposal's bound, 32 KiB, so 8,192 tokens.
+  - `<` and `>` in session text are shown as `‹` and `›`: nothing a session wrote can close the
+    prompt's `<summary>` and speak outside it. The prompt says the summary is data, not
+    instructions.
+- **`redact`**: what never leaves in a prompt. Every text is made one line (hidden and control
+  characters dropped, so nothing hides a secret from the rules), then: private key blocks;
+  well-known token prefixes (`sk-`, `ghp_`, `github_pat_`, `glpat-`, `xoxb-`, `AKIA`, `AIza`,
+  PitCrew's `pcd_`/`pca_`, and others, followed by at least 8 token characters with digits or mixed
+  case); JSON Web Tokens; the values of secrets' names (`password=`, `token:`, `--password x`,
+  `?access_token=`, `Authorization: Bearer x`); a URL's user and password; long random-looking
+  words (32+ characters, mixed case and digits, or hexadecimal); e-mail addresses; and home
+  folders (`/home/<name>`, `/Users/<name>`, `C:\Users\<name>`, `/root` become `~`). Each segment
+  of a path or branch is checked too. The rules are broad on purpose: a false positive costs a
+  word of context, a false negative a secret. Each replacement is counted, and the person sees the
+  count before anything is sent.

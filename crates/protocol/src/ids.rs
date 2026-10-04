@@ -136,6 +136,10 @@ ulid_id!(
     /// A terminal owned by a runner's runtime (a tmux window or a PTY).
     TerminalId, "term"
 );
+ulid_id!(
+    /// A board draft: one agent drafting a workstream's board from its history.
+    DraftId, "drf"
+);
 
 /// A short project key used in task keys, such as `CMP` in `CMP-104`.
 ///
