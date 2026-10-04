@@ -1,4 +1,4 @@
-# Brief 0 · Two more flaky tests
+# Brief 0 · Three more flaky tests
 
 - **Stream:** 0 · Contracts (cross-stream test fixes).
   **Branch:** `integrator/flaky-tests-4`.
@@ -24,6 +24,14 @@ Keep what each test checks. Make it wait for the condition, not for a guess at a
      passed.
    - **Fix:** find what it waits on (a polling interval, a fixed sleep) and wait on the observed
      append instead, with a deadline that still fails if polling never sees it.
+
+3. **`a_ptyd_that_closes_during_hello_counts_as_none`** (`crates/ptyd/tests/protocol.rs` ~312).
+   - **Seen:** on macOS CI (#44's run): `no ptyd, no terminals: Unavailable("cannot write to
+     pitcrew-ptyd: Socket is not connected (os error 57)")`. On macOS, a peer that closes during the
+     hello can surface as ENOTCONN on the write rather than as a clean close.
+   - **Fix:** decide whether that error should also count as "no ptyd" (the product code, if so;
+     the path list grows by `crates/runtime/**` or `crates/ptyd/**` where the hello is handled), or
+     make the test's stand-in close at a point where the outcome is deterministic. Say which.
 
 ## Acceptance
 
