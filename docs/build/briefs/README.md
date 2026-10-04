@@ -111,8 +111,8 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [G-sync-wiring](G-sync-wiring.md) | G · Integrations | `integrator/sync-wiring` | Opus-class (Claude cloud) | In review (PR #52) |
 | [G-approval-writes](G-approval-writes.md) | G · Integrations | `integrator/approval-writes` | Opus-class (Claude cloud) | After G-sync-wiring |
 | [M-workbench](M-workbench.md) | M · Agent console | `integrator/workbench` | Opus-class (Claude cloud) | **Merged** (PR #53) |
-| [0-remote-files](0-remote-files.md) | 0 · Composition root | `integrator/remote-files` | Codex (cloud) | In progress (Codex, cloud) |
-| [K-updater](K-updater.md) | K · Desktop shell | `integrator/updater` | Codex (local, Windows) | In review (PR #51) |
+| [0-remote-files](0-remote-files.md) | 0 · Composition root | `integrator/remote-files` | Codex (cloud) | Deferred: needs a hub-to-runner link (after team hubs); remote workspaces already serve their own files |
+| [K-updater](K-updater.md) | K · Desktop shell | `integrator/updater` | Codex (local, Windows) | **Merged** (PR #51) |
 | [0-draft-board](0-draft-board.md) | 0 · Composition root | `integrator/draft-board` | Opus-class (Claude cloud) | In progress (Claude cloud) |
 | [0-create-dialogs](0-create-dialogs.md) | 0 · Composition root | `integrator/create-dialogs` | Codex (cloud) | Ready |
 | [0-team-hubs](0-team-hubs.md) | 0 · Contracts | `integrator/team-hubs` | Opus-class (Claude cloud) | Last (after the route-heavy briefs) |
