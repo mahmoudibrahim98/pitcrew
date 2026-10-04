@@ -66,6 +66,12 @@ function projectsRoutes(parent: WorkspaceRoute): AnyRoute[] {
         path: 'tasks/$task',
         component: lazyRouteComponent(() => import('./task-page.tsx'), 'TaskPage'),
       }),
+      createRoute({
+        getParentRoute: () => projectsLayout,
+        path: 'settings/integrations',
+        staticData: { title: 'Integrations' },
+        component: lazyRouteComponent(() => import('./integrations/integrations-page.tsx'), 'IntegrationsPage'),
+      }),
     ]),
   ];
 }
@@ -80,10 +86,18 @@ export const feature = defineFeature({
     { id: 'projects-list', label: 'Projects', to: 'projects', order: 25 },
     { id: 'members', label: 'Members', to: 'members', order: 35 },
     { id: 'calendar', label: 'Calendar', to: 'calendar', order: 37 },
+    { id: 'integrations', label: 'Integrations', to: 'settings/integrations', order: 38 },
   ],
   commands: [
     { id: 'go-projects', label: 'Go to Projects', group: 'Go to', run: (c) => c.go('projects') },
     { id: 'go-calendar', label: 'Go to Calendar', group: 'Go to', run: (c) => c.go('calendar') },
+    {
+      id: 'go-integrations',
+      label: 'Go to Integrations',
+      group: 'Go to',
+      keywords: ['github', 'jira', 'settings', 'sync'],
+      run: (c) => c.go('settings/integrations'),
+    },
   ],
   create: [{ id: 'task', label: 'Task', order: 10, dialog: lazy(() => import('./new-task.tsx').then((m) => ({ default: m.NewTaskDialog }))) }],
 });

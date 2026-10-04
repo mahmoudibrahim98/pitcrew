@@ -204,6 +204,7 @@ export const recapScopeMap: RecapScopeMap = {
   // not be cached yet).
   workstream_created: (d) => scope({ workstream: d.workstream.id, project: d.workstream.project }),
   workstream_changed: (d, cache) => scopeOfWorkstream(d.workstream, cache),
+  workstream_linked: (d, cache) => scopeOfWorkstream(d.workstream, cache),
 
   task_created: (d) => scope({ task: d.task.id, workstream: d.task.workstream, project: d.task.project }),
   task_moved: (d, cache) => scopeOfTask(d.task, cache),
