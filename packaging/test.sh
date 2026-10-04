@@ -113,6 +113,7 @@ stub() { # FILE VERSION-LINE [EXIT [STDERR]]: a stand-in program
 }
 musl=x86_64-unknown-linux-musl
 stub "$bins/pitcrewd-$musl" "pitcrewd 1.2.3 (protocol 1, oldest accepted 1)"
+stub "$bins/pitcrew-$musl" "pitcrew 1.2.3"
 stub "$bins/pitcrew-ptyd-$musl" "pitcrew-ptyd 1.2.3 (protocol 1)"
 stub "$bins/pitcrew-askpass-$musl" "" 2 "pitcrew-askpass: not started by PitCrew (PITCREW_ASKPASS_ADDR unset)"
 printf 'aarch64 helper\n' >"$bins/pitcrewd-aarch64-unknown-linux-musl"
@@ -146,6 +147,8 @@ case "$(uname -s)" in
 esac
 check "the overlay names the stage relative to src-tauri" 0 \
   grep -qF "\"../../../dist/packaging-test-$$/bin/pitcrewd\"" "$stage_dir/tauri.bundle.json"
+check "the overlay ships the CLI needed by hooks" 0 \
+  grep -qF "\"../../../dist/packaging-test-$$/bin/pitcrew\"" "$stage_dir/tauri.bundle.json"
 check "and the helpers as the resources' helpers/" 0 \
   grep -qF "\"../../../dist/packaging-test-$$/helpers\": \"helpers\"" "$stage_dir/tauri.bundle.json"
 check "an unknown desktop target is a usage error" 2 desktop_stage aarch64-unknown-linux-gnu
@@ -160,18 +163,19 @@ check "a version that could name another folder fails" 1 desktop_stage x86_64-un
 stub "$bins/pitcrewd-$musl" "pitcrewd 1.2.3 (protocol 1, oldest accepted 1)"
 check "staged again" 0 desktop_stage x86_64-unknown-linux-gnu
 check "a Linux stage names the sidecars for its target only" 0 \
-  test "$(find "$stage_dir/bin" -type f | wc -l)" -eq 3
+  test "$(find "$stage_dir/bin" -type f | wc -l)" -eq 4
 
 # A universal macOS build compiles the app once per architecture, and tauri-build wants the
 # sidecars under each architecture's name as well as the universal one.
 cp "$bins/pitcrewd-universal-apple-darwin" "$tmp/saved-helper"
 stub "$bins/pitcrewd-universal-apple-darwin" "pitcrewd 1.2.3 (protocol 1, oldest accepted 1)"
+stub "$bins/pitcrew-universal-apple-darwin" "pitcrew 1.2.3"
 stub "$bins/pitcrew-ptyd-universal-apple-darwin" "pitcrew-ptyd 1.2.3 (protocol 1)"
 stub "$bins/pitcrew-askpass-universal-apple-darwin" "" 2 "pitcrew-askpass: not started by PitCrew (PITCREW_ASKPASS_ADDR unset)"
 check "staging the macOS desktop" 0 \
   bash "$here/desktop/build.sh" --stage-only --dist "$bins" --stage "$stage_dir-mac" universal-apple-darwin
 check "macOS reuses the universal daemon" 0 test ! -e "$stage_dir-mac/helpers/pitcrewd-universal-apple-darwin.xz"
-for bin in pitcrewd pitcrew-ptyd pitcrew-askpass; do
+for bin in pitcrewd pitcrew pitcrew-ptyd pitcrew-askpass; do
   for name in universal-apple-darwin aarch64-apple-darwin x86_64-apple-darwin; do
     check "the universal $bin is staged as $bin-$name" 0 \
       cmp -s "$stage_dir-mac/bin/$bin-$name" "$bins/$bin-universal-apple-darwin"
@@ -181,7 +185,7 @@ mv "$tmp/saved-helper" "$bins/pitcrewd-universal-apple-darwin"
 rm -f "$bins/pitcrew-ptyd-universal-apple-darwin" "$bins/pitcrew-askpass-universal-apple-darwin"
 
 # Windows has no native remote helper and retains all three XZ resources.
-for bin in pitcrewd pitcrew-ptyd pitcrew-askpass; do
+for bin in pitcrewd pitcrew pitcrew-ptyd pitcrew-askpass; do
   cp "$bins/$bin-$musl" "$bins/$bin-x86_64-pc-windows-msvc.exe"
 done
 check "staging the Windows desktop" 0 \
@@ -200,7 +204,7 @@ if command -v dpkg-deb >/dev/null 2>&1 && [ "$(uname -s)" = Linux ]; then
     dpkg-deb --root-owner-group --build "$pkg" "$tmp/PitCrew_1.2.3_amd64.deb" >/dev/null
   }
   mkdir -p "$pkg/usr/bin" "$pkg/usr/lib/PitCrew/helpers" "$pkg/usr/share/applications"
-  for bin in pitcrewd pitcrew-ptyd pitcrew-askpass; do
+  for bin in pitcrewd pitcrew pitcrew-ptyd pitcrew-askpass; do
     cp "$stage_dir/bin/$bin-x86_64-unknown-linux-gnu" "$pkg/usr/bin/$bin"
   done
   { printf '#!/bin/sh\n# '; cat "$manifest"; printf '\n'; } >"$pkg/usr/bin/pitcrew-desktop"
@@ -277,7 +281,7 @@ STUB
   make_rpm_tree() {
     rm -rf "$rpm_tree"
     mkdir -p "$rpm_tree/usr/bin" "$rpm_tree/usr/lib/PitCrew/helpers" "$rpm_tree/usr/share/applications"
-    for bin in pitcrewd pitcrew-ptyd pitcrew-askpass; do
+    for bin in pitcrewd pitcrew pitcrew-ptyd pitcrew-askpass; do
       cp "$stage_dir/bin/$bin-x86_64-unknown-linux-gnu" "$rpm_tree/usr/bin/$bin"
     done
     { printf '#!/bin/sh\n# '; cat "$manifest"; printf '\n'; } >"$rpm_tree/usr/bin/pitcrew-desktop"
@@ -317,6 +321,8 @@ STUB
     PATH="$rpm_tools:$PATH" RPM_TEST_TREE="$rpm_tree" RPM_TEST_LISTING="$rpm_listing" \
     bash "$here/desktop/check.sh" --manifest "$manifest" "$rpm_file"
 fi
+
+node --test "$here/updater.test.mjs"
 
 echo "packaging tests: $passed passed, $failed failed"
 [ "$failed" -eq 0 ]

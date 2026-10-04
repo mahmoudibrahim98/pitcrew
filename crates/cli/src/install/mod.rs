@@ -19,6 +19,8 @@
 //! is computed independently, and a failure becomes that one engine's `Conflicting` status rather
 //! than aborting the whole command (`unwrap_or_conflict`).
 
+mod library;
+pub use library::Installation;
 mod claude;
 mod codex;
 mod difftext;

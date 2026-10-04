@@ -25,6 +25,8 @@ const env = {
   ...process.env,
   HOME: home,
   USERPROFILE: home,
+  CLAUDE_CONFIG_DIR: join(home, ".claude"),
+  CODEX_HOME: join(home, ".codex"),
   XDG_DATA_HOME: join(home, 'data'),
   XDG_CONFIG_HOME: join(home, 'config'),
   XDG_CACHE_HOME: join(home, 'cache'),
@@ -32,6 +34,7 @@ const env = {
   APPDATA: join(home, 'appdata'),
   LOCALAPPDATA: join(home, 'localappdata'),
   PITCREW_CONFORMANCE_EXPECTED: '',
+  PITCREW_CONFORMANCE_SYNTHETIC_HOOKS: '1',
 };
 let daemon, suite, mock, build;
 // Every process the daemon starts (pitcrew-ptyd, and the stand-in CLIs it runs) inherits this
@@ -122,7 +125,7 @@ try {
   } else {
     build = spawn(
       'cargo',
-      ['build', '-p', 'pitcrew-daemon', '-p', 'pitcrew-ptyd', '--bins', '--locked'],
+      ['build', '-p', 'pitcrew-daemon', '-p', 'pitcrew-ptyd', '-p', 'pitcrew-cli', '--bins', '--locked'],
       { cwd: root, stdio: 'inherit' },
     );
     const [code] = await once(build, 'exit');
@@ -146,7 +149,7 @@ try {
     // session stays `starting` while the suite runs; pitcrew-ptyd then exits once idle.
     const bin = join(temporary, 'bin');
     await mkdir(bin, { mode: 0o700 });
-    const standIn = `#!/bin/sh\nwhile [ -d '${state}' ]; do sleep 1; done\n`;
+    const standIn = `#!/bin/sh\nif [ \"$1\" = --version ]; then echo 2.1.139; exit 0; fi\nwhile [ -d '${state}' ]; do sleep 1; done\n`;
     for (const cli of ['claude', 'codex', 'opencode'])
       await writeFile(join(bin, cli), standIn, { mode: 0o700 });
     // GitHub integrations read `gh auth token`: a stand-in that prints a synthetic credential,
@@ -216,11 +219,13 @@ try {
     ).trim();
     env.PITCREW_CONFORMANCE_EXPECTED = join(root, 'tests/conformance/daemon-deviations.json');
   }
-  // The main suite first, then one phase per file that changes the hub for every view:
-  // import.test.mjs commits session inclusion (and restores it), and integrations.test.mjs syncs,
-  // appending events that the main suite's exact-revision checks must not see. Every phase runs;
-  // the first failure decides the exit code.
+  // One phase per file (or group) that changes the hub for every view, in this order:
+  // onboarding.test.mjs first, then the main suite, then import.test.mjs, which commits session
+  // inclusion (and restores it), and integrations.test.mjs last, which syncs, appending events that
+  // the main suite's exact-revision checks must not see. Every phase runs; the first failure
+  // decides the exit code.
   for (const files of [
+    ['tests/conformance/onboarding.test.mjs'],
     ['tests/conformance/api.test.mjs', 'tests/conformance/scan.test.mjs', 'tests/conformance/files.test.mjs'],
     ['tests/conformance/import.test.mjs'],
     ['tests/conformance/integrations.test.mjs'],

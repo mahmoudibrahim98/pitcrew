@@ -52,6 +52,9 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
         .with_large_int("number")
         .with_out_dir(&bindings)
         .with_import_extension(Some("ts"));
+    pitcrew_protocol::onboarding::HooksDiff::export_all(&config)?;
+    pitcrew_protocol::onboarding::InstallHooks::export_all(&config)?;
+    pitcrew_protocol::onboarding::SafetySettings::export_all(&config)?;
     api::ApiError::export_all(&config)?;
     pitcrew_protocol::files::FileList::export_all(&config)?;
     pitcrew_protocol::files::FileContent::export_all(&config)?;

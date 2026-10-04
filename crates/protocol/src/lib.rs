@@ -29,6 +29,7 @@ pub mod ids;
 pub mod import;
 pub mod integrations;
 pub mod model;
+pub mod onboarding;
 pub mod recap;
 pub mod runner;
 pub mod scan;

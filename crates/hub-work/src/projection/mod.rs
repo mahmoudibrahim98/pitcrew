@@ -55,11 +55,12 @@ pub fn projections() -> Vec<Box<dyn Projection>> {
         Box::new(Briefs),
         Box::new(Refs),
         Box::new(Cursors),
+        Box::new(crate::safety::Safety),
     ]
 }
 
 /// The names of [`projections`], e.g. for `Store::rebuild`.
-pub const NAMES: [&str; 9] = [
+pub const NAMES: [&str; 10] = [
     Directory::NAME,
     Projects::NAME,
     Tasks::NAME,
@@ -69,10 +70,12 @@ pub const NAMES: [&str; 9] = [
     Briefs::NAME,
     Refs::NAME,
     Cursors::NAME,
+    crate::safety::Safety::NAME,
 ];
 
 /// Every table the work model owns, children before parents (the order `reset` clears them in).
-pub const TABLES: [&str; 24] = [
+pub const TABLES: [&str; 25] = [
+    "work_safety",
     "work_read_cursors",
     "work_team_members",
     "work_teams",

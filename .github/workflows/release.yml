@@ -262,18 +262,30 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-        run: bash packaging/desktop/build.sh --dist dist --out dist/desktop "$TARGET"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+          RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || '' }}
+        run: |
+          export RELEASE_VERSION="${RELEASE_TAG#v}"
+          bash packaging/desktop/build.sh --dist dist --out dist/desktop "$TARGET"
 
       # Sizes against the 25 MB budget (a warning when over), the layout, the helpers' sha256
       # against the compiled manifest, owners and modes, pitcrew:// and, on Windows, a real
       # install, upgrade and removal.
       - name: Check the installers
         shell: bash
-        run: bash packaging/desktop/check.sh --manifest dist/desktop-stage/helpers/manifest.json dist/desktop/*
+        run: |
+          shopt -s nullglob
+          installers=(dist/desktop/*.deb dist/desktop/*.rpm dist/desktop/*.AppImage dist/desktop/*.dmg dist/desktop/*-setup.exe)
+          bash packaging/desktop/check.sh --manifest dist/desktop-stage/helpers/manifest.json "${installers[@]}"
 
       - name: Largest installer payload files
         shell: bash
-        run: bash packaging/desktop/contents.sh dist/desktop/* | tee -a "$GITHUB_STEP_SUMMARY"
+        run: |
+          shopt -s nullglob
+          installers=(dist/desktop/*.deb dist/desktop/*.rpm dist/desktop/*.AppImage dist/desktop/*.dmg dist/desktop/*-setup.exe)
+          bash packaging/desktop/contents.sh "${installers[@]}" | tee -a "$GITHUB_STEP_SUMMARY"
 
       # The app started once, as installed, in a throwaway home: its own pitcrewd and askpass.
       - name: Start the installed app (Linux)
@@ -324,6 +336,17 @@ jobs:
         run: |
           cargo install cargo-cyclonedx --locked --version "${CARGO_CYCLONEDX_VERSION}"
           bash packaging/sbom.sh dist
+      - name: Signed update feed
+        env:
+          REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || '' }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          if [ -z "$version" ]; then
+            version=$(node -p "JSON.parse(require('fs').readFileSync('apps/desktop/src-tauri/tauri.conf.json')).version")
+          fi
+          node --test packaging/updater.test.mjs
+          node packaging/updater-feed.mjs dist "$version" "$REPO"
       - name: SHA256SUMS
         run: bash packaging/sha256sums.sh dist
       - name: Sign SHA256SUMS (placeholder)

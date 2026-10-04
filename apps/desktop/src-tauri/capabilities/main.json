@@ -1,8 +1,10 @@
 {
   "identifier": "main",
-  "description": "The main window: the gateway's commands (workspaces, this computer's host name, requests, an integration's credential, sockets, listing ssh hosts and this computer's WSL distributions, probing, planning, adding (and cancelling an add), retrying and removing remote machines, answering SSH prompts) and listening to its events (gateway://workspaces, gateway://navigate, gateway://prompt, gateway://prompt-closed). No shell, fs, http, opener or notification access, and no events the webview can emit.",
+  "description": "The main window: the gateway's commands (workspaces, this computer's host name, requests, an integration's credential, sockets, listing ssh hosts and this computer's WSL distributions, probing, planning, adding (and cancelling an add), retrying and removing remote machines, answering SSH prompts) signed update status/check/channel/install/notes commands, and listening to its events (gateway://workspaces, gateway://navigate, gateway://prompt, gateway://prompt-closed, gateway://update). No shell, fs, http, opener or notification access, and no events the webview can emit.",
   "local": true,
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "allow-gateway-workspaces",
     "allow-gateway-local-host",
@@ -21,6 +23,11 @@
     "allow-gateway-workspace-remove",
     "allow-gateway-prompt-reply",
     "core:event:allow-listen",
-    "core:event:allow-unlisten"
+    "core:event:allow-unlisten",
+    "allow-gateway-update-status",
+    "allow-gateway-update-check",
+    "allow-gateway-update-channel",
+    "allow-gateway-update-install",
+    "allow-gateway-update-notes"
   ]
 }

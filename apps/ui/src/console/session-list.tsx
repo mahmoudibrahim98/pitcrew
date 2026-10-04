@@ -84,6 +84,9 @@ const PAGE = 10;
 /** How a session was chosen: a click, or Enter or Space in the list. */
 export type SelectVia = 'pointer' | 'keyboard';
 
+/** Where a row's menu opens its session: a new tab, or a new pane to the side. */
+export type OpenWhere = 'tab' | 'side';
+
 export interface SessionListViewProps {
   sessions: readonly Session[];
   places: SessionPlaces;
@@ -91,6 +94,8 @@ export interface SessionListViewProps {
   selectedId?: string | undefined;
   onSelect: (session: Session, via: SelectVia) => void;
   onLink?: ((session: Session) => void) | undefined;
+  /** Adds "Open in a new tab" and "Open to the side" to a row's menu. */
+  onOpen?: ((session: Session, where: OpenWhere) => void) | undefined;
   /**
    * The arrow, Page, Home and End keys moved to `session`. Pass it to make the selection follow
    * the keys (as the console does when the chosen session shows beside the list).
@@ -240,6 +245,7 @@ export function SessionListView(props: SessionListViewProps) {
                   session={row.session}
                   handle={row.session.agent === undefined ? undefined : handles.get(row.session.agent)}
                   onLink={props.onLink === undefined ? undefined : () => props.onLink?.(row.session)}
+                  onOpen={props.onOpen === undefined ? undefined : (where) => props.onOpen?.(row.session, where)}
                   now={now}
                   selected={row.session.id === selectedId}
                   active={row.session.id === activeId}
@@ -283,8 +289,11 @@ function SessionRow(props: {
   active: boolean;
   onClick: () => void;
   onLink: (() => void) | undefined;
+  onOpen: ((where: OpenWhere) => void) | undefined;
 }) {
   const { session } = props;
+  // Opening a tab moves focus to it: the menu must not hand focus back to the row afterwards.
+  const opened = useRef(false);
   const starting = session.state === 'starting';
   const state = STATE[session.state];
   const row = (
@@ -331,13 +340,31 @@ function SessionRow(props: {
       </div>
     </div>
   );
-  if (props.onLink === undefined) return row;
+  if (props.onLink === undefined && props.onOpen === undefined) return row;
+  const item = 'rounded-sm px-2 py-1.5 text-sm outline-none data-highlighted:bg-hover';
+  const { onOpen } = props;
+  const open = (where: OpenWhere) => {
+    opened.current = true;
+    onOpen?.(where);
+  };
   return (
     <ContextMenu.Root modal={false}>
       <ContextMenu.Trigger asChild>{row}</ContextMenu.Trigger>
       <ContextMenu.Portal>
-        <ContextMenu.Content className="z-50 min-w-44 rounded-md border border-line bg-card p-1 shadow-pop">
-          <ContextMenu.Item onSelect={props.onLink} className="rounded-sm px-2 py-1.5 text-sm outline-none data-highlighted:bg-hover">Link to…</ContextMenu.Item>
+        <ContextMenu.Content
+          className="z-50 min-w-44 rounded-md border border-line bg-card p-1 shadow-pop"
+          onCloseAutoFocus={(event) => {
+            if (opened.current) event.preventDefault();
+            opened.current = false;
+          }}
+        >
+          {onOpen !== undefined && (
+            <>
+              <ContextMenu.Item onSelect={() => open('tab')} className={item}>Open in a new tab</ContextMenu.Item>
+              <ContextMenu.Item onSelect={() => open('side')} className={item}>Open to the side</ContextMenu.Item>
+            </>
+          )}
+          {props.onLink !== undefined && <ContextMenu.Item onSelect={props.onLink} className={item}>Link to…</ContextMenu.Item>}
         </ContextMenu.Content>
       </ContextMenu.Portal>
     </ContextMenu.Root>
@@ -348,6 +375,8 @@ export interface SessionListProps {
   facets?: SessionFacets;
   selectedId?: string | undefined;
   onSelect: (session: Session, via: SelectVia) => void;
+  /** See `SessionListViewProps.onOpen`. */
+  onOpen?: ((session: Session, where: OpenWhere) => void) | undefined;
   /** See `SessionListViewProps.onActiveChange`. */
   onActiveChange?: ((session: Session) => void) | undefined;
   className?: string;
@@ -379,6 +408,7 @@ export function SessionList(props: SessionListProps) {
       selectedId={props.selectedId}
       onSelect={props.onSelect}
       onLink={setLinking}
+      onOpen={props.onOpen}
       onActiveChange={props.onActiveChange}
       empty={all.length === 0 ? 'No sessions yet.' : 'No sessions match these filters.'}
       {...(props.className === undefined ? {} : { className: props.className })}

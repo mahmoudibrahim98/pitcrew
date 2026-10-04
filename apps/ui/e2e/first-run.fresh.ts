@@ -29,7 +29,7 @@ test('the first run, from an empty workspace to Home as the new person', async (
   await expect(heading(page, 'Welcome to PitCrew')).toBeVisible();
   await expect(page.getByRole('complementary', { name: 'Sidebar' })).toHaveCount(0);
   // Only the steps the hub can serve.
-  await expect(page.getByRole('tab')).toHaveText([/Welcome/, /Workspace/, /Scan/, /Create/, /Import/, /Done/]);
+  await expect(page.getByRole('tab')).toHaveText([/Welcome/, /Workspace/, /Scan/, /Create/, /Import/, /Hooks/, /Safety/, /Done/]);
   await expectNoAxeViolations(page, 'welcome');
 
   // Any other page goes back to setup while it is not done.
@@ -75,6 +75,13 @@ test('the first run, from an empty workspace to Home as the new person', async (
   expect((await request.get(`${FIRST_RUN_HUB}/v1/import`, { headers: AUTH })).status()).toBe(200);
 
   // Done, then Home, which stays Home.
+  await expect(heading(page, 'Install hooks')).toBeVisible();
+  await expect(page.getByText('/home/sam/.claude/settings.json', {exact: true})).toBeVisible();
+  await expectNoAxeViolations(page, 'hooks');
+  await page.getByRole('button', {name: 'Install hooks'}).click();
+  await expect(page.getByLabel('Let the back office accept low-risk actions automatically')).toBeVisible();
+  await expectNoAxeViolations(page, 'safety');
+  await page.getByRole('button', {name: 'Continue'}).click();
   await expect(heading(page, "You're set up")).toBeVisible();
   await expect(page.getByText('“Demo Lab” is ready, with you as Sam Rivera (@sam) on This laptop.')).toBeVisible();
   await expect(page.getByText('Created 2 projects.')).toBeVisible();

@@ -67,6 +67,14 @@ fn workload(work: &WorkService) {
     work.move_cursor(&person(SAM), "workspace", 1)
         .expect("read cursor");
     let sam = person(SAM);
+    work.save_safety(
+        &sam,
+        pitcrew_protocol::onboarding::SafetySettings {
+            back_office_enabled: true,
+            ..Default::default()
+        },
+    )
+    .expect("safety preferences");
     let writer = agent(WRITER);
     let pap = "01JB000000000000000PRJ0001".parse().expect("project");
     let task = work
