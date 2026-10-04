@@ -7,7 +7,7 @@
 [package]
 name = "pitcrew-desktop"
 description = "The PitCrew desktop app: the Tauri shell, the gateway to each workspace's daemon, and the local daemon's supervisor. Owned by stream K."
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.90"
 license = "Apache-2.0"

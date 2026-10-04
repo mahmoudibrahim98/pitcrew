@@ -23,7 +23,7 @@ later.
 | `pitcrewd init --workspace <name> --name <person> --handle <@handle> --machine <name> [--listen <where>]` | Sets up the fresh workspace of the daemon running on this state directory (see "The first run"). `--listen` is where that daemon listens, as given to its `serve --listen` (default `private`). |
 | `pitcrewd connect --socket <dir>/pitcrewd.sock [--framed] [--nonce <hex>]` | The stdio bridge to a daemon's socket, for a remote helper reached over SSH (see "`pitcrewd connect`"). Uses no state directory. Unix only. |
 | `pitcrewd token show-path` | Prints where the device token is kept. Never the token. Fails if there is none yet. |
-| `pitcrewd --version` | `pitcrewd 0.0.0 (protocol 1, oldest accepted 1)`: the bare version is the second word. Needs no state directory. |
+| `pitcrewd --version` | `pitcrewd 0.1.0 (protocol 1, oldest accepted 1)`: the bare version is the second word. Needs no state directory. |
 
 **For launchers** (e.g. on a remote machine under tmux), `pitcrewd serve` runs in the
 foreground and never daemonizes, so the pid you started is the daemon. It never reads stdin, logs
