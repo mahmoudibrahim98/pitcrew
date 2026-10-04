@@ -277,8 +277,8 @@ display/Xvfb, and this container's ancestor ownership also blocks private Unix s
 
 **Installer-size-2 local comparison (2026-10-04).** From `origin/main` `1b3920a`,
 with real builds of both musl targets and the desktop, the same fixed Linux stand-in in the
-unavailable universal macOS helper slot, before → after: deb 24,946,986 → 17,039,728 bytes
-(−31.7%), RPM 16,964,365 → 13,865,913 (−18.3%), AppImage 118,077,944 → 115,927,544 (−1.8%).
+unavailable universal macOS helper slot, before → after: deb 24,946,986 → 17,039,982 bytes
+(−31.7%), RPM 16,964,365 → 13,876,305 (−18.2%), AppImage 118,077,944 → 115,927,544 (−1.8%).
 All installer checks pass. These lab inputs cannot be distributed as production packages.
 AppImage already deduplicates identical raw files and compresses its filesystem, so its
 saving is smaller. Its separate local budget is 127,520,299 bytes, measured size + 10%.

@@ -41,8 +41,8 @@ Linux lab, 2026-10-04, Rust 1.99, Tauri CLI 2.12.1, WebKitGTK 2.52.6:
 
 | Installer | Before bytes | After bytes | Change |
 |---|---:|---:|---:|
-| deb | 24,946,986 | 17,039,728 | −31.7% |
-| RPM | 16,964,365 | 13,865,913 | −18.3% |
+| deb | 24,946,986 | 17,039,982 | −31.7% |
+| RPM | 16,964,365 | 13,876,305 | −18.2% |
 | AppImage | 118,077,944 | 115,927,544 | −1.8% |
 
 Both Linux package formats meet 25,000,000 bytes. AppImage's measured size plus 10%,
