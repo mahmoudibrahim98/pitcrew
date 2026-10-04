@@ -228,21 +228,24 @@ const withView = (view: SessionView) => (tab: Tab): Tab =>
 /**
  * Shows `ref`, as following a link does: activates it where it is already open (in the active
  * pane first), or switches an open tab of the same session to `ref`'s view, or opens it in the
- * active pane. Opened from the list (`preview`), it replaces the pane's preview tab.
+ * active pane. Opened from the list (`preview`), it replaces the pane's preview tab. With
+ * `anyView`, a session open in any view is shown as it is (choosing a session in the list leaves
+ * the view each of its tabs has).
  */
-export function reveal(layout: Layout, ref: TabRef, options: { preview?: boolean } = {}): Layout {
+export function reveal(layout: Layout, ref: TabRef, options: { preview?: boolean; anyView?: boolean } = {}): Layout {
   const active = activeGroupOf(layout);
   const others = groupsOf(layout).filter((g) => g !== active);
-  for (const match of [
-    (t: Tab) => sameRef(t.ref, ref),
-    (t: Tab) => sameSession(t.ref, ref),
-  ]) {
+  const matchers = options.anyView === true
+    ? [(t: Tab) => sameSession(t.ref, ref) || sameRef(t.ref, ref)]
+    : [(t: Tab) => sameRef(t.ref, ref), (t: Tab) => sameSession(t.ref, ref)];
+  for (const match of matchers) {
     for (const group of [active, ...others]) {
       // The active tab first, so a pane showing the session keeps showing it.
       const current = activeTabOf(group);
       const tab = current !== undefined && match(current) ? current : group.tabs.find(match);
       if (tab !== undefined) {
-        return activateIn(layout, group.id, tab.id, ref.kind === 'session' ? withView(ref.view) : undefined);
+        const switchView = ref.kind === 'session' && options.anyView !== true ? withView(ref.view) : undefined;
+        return activateIn(layout, group.id, tab.id, switchView);
       }
     }
   }
