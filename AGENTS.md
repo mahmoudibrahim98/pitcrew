@@ -30,6 +30,11 @@ Never push to `main`, and never merge. The integrator reviews and merges every p
     the version is pinned in the root `package.json`);
   - tmux, for the runtime's tests;
   - on Linux, the WebKitGTK development libraries, for the desktop crate.
+- **In Codex cloud,** the environment's setup installs all of this under `/workspace`, but its
+  `PATH` doesn't carry over to your shell. Before any cargo, rustup, tmux or packaging command,
+  run `. /workspace/.onboarding/env.sh` (in the same command, if each command runs in a fresh
+  shell). If `cargo` is still missing after that, say so in your report; don't hand-edit generated
+  files in its place.
 - **Disk can run out.** Set these if the environment doesn't:
   - `CARGO_PROFILE_DEV_DEBUG=0`
   - `CARGO_PROFILE_TEST_DEBUG=0`
