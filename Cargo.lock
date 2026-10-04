@@ -1355,7 +1355,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pitcrew-api"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "axum",
  "pitcrew-auth",
@@ -1376,7 +1376,7 @@ dependencies = [
 
 [[package]]
 name = "pitcrew-auth"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1396,7 +1396,7 @@ dependencies = [
 
 [[package]]
 name = "pitcrew-benches"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "criterion",
  "pitcrew-api",
@@ -1415,7 +1415,7 @@ dependencies = [
 
 [[package]]
 name = "pitcrew-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
@@ -1434,7 +1434,7 @@ dependencies = [
 
 [[package]]
 name = "pitcrew-daemon"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1466,7 +1466,7 @@ dependencies = [
 
 [[package]]
 name = "pitcrew-fixtures"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "pitcrew-protocol",
  "pitcrew-recap",
@@ -1477,7 +1477,7 @@ dependencies = [
 
 [[package]]
 name = "pitcrew-hub-work"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "axum",
  "pitcrew-fixtures",
@@ -1499,7 +1499,7 @@ dependencies = [
 
 [[package]]
 name = "pitcrew-ingest"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "insta",
  "pitcrew-fixtures",
@@ -1516,7 +1516,7 @@ dependencies = [
 
 [[package]]
 name = "pitcrew-interfaces"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "pitcrew-protocol",
  "serde",
@@ -1526,14 +1526,14 @@ dependencies = [
 
 [[package]]
 name = "pitcrew-legacy"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "pitcrew-protocol",
 ]
 
 [[package]]
 name = "pitcrew-office"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "insta",
  "pitcrew-fixtures",
@@ -1550,7 +1550,7 @@ dependencies = [
 
 [[package]]
 name = "pitcrew-protocol"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1561,7 +1561,7 @@ dependencies = [
 
 [[package]]
 name = "pitcrew-ptyd"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "pitcrew-interfaces",
  "pitcrew-protocol",
@@ -1575,7 +1575,7 @@ dependencies = [
 
 [[package]]
 name = "pitcrew-recap"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "insta",
  "pitcrew-fixtures",
@@ -1589,7 +1589,7 @@ dependencies = [
 
 [[package]]
 name = "pitcrew-remote"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "getrandom 0.4.3",
  "pitcrew-fixtures",
@@ -1609,7 +1609,7 @@ dependencies = [
 
 [[package]]
 name = "pitcrew-runner"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -1640,7 +1640,7 @@ dependencies = [
 
 [[package]]
 name = "pitcrew-runtime"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "pitcrew-interfaces",
  "pitcrew-protocol",
@@ -1658,7 +1658,7 @@ dependencies = [
 
 [[package]]
 name = "pitcrew-store"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "pitcrew-fixtures",
  "pitcrew-protocol",
@@ -1674,7 +1674,7 @@ dependencies = [
 
 [[package]]
 name = "pitcrew-sync-github"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "insta",
  "pitcrew-protocol",
@@ -1690,7 +1690,7 @@ dependencies = [
 
 [[package]]
 name = "pitcrew-sync-jira"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "jiff",
@@ -1706,7 +1706,7 @@ dependencies = [
 
 [[package]]
 name = "pitcrew-trust"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "rustix",
  "tempfile",

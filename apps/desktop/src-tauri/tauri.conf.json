@@ -1,6 +1,6 @@
 {
   "productName": "PitCrew",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "identifier": "org.pitcrew.desktop",
   "build": {
     "devUrl": "http://127.0.0.1:5173",
