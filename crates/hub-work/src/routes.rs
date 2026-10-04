@@ -16,7 +16,7 @@
 //! task, workstream, project or ask is `404`, and an agent writing to a task that is not its own
 //! gets `403`, even with a malformed or oversized body.
 
-use crate::commands::{AnswerAsk, BriefEdit, NewAsk, NewComment, WorkstreamPatch};
+use crate::commands::{AnswerAsk, BriefEdit, NewAsk, NewComment, SessionLink, WorkstreamPatch};
 use crate::dispatch::NewDispatch;
 use crate::error::WorkError;
 use crate::query::{AskFilter, SessionFilter, TaskFilter, TaskRef};
@@ -93,6 +93,7 @@ where
         .route("/v1/tasks/{id}/dispatch", post(dispatch_task))
         .route("/v1/sessions", get(list_sessions))
         .route("/v1/sessions/{id}", get(get_session))
+        .route("/v1/sessions/{id}/link", post(link_session))
         .route("/v1/briefs", get(list_briefs))
         .route("/v1/briefs/{kind}/{id}", put(put_brief))
 }
@@ -552,6 +553,20 @@ async fn get_session(
 ) -> Reply<Session> {
     let id: SessionId = path_id(&id, "session")?;
     Ok(Json(blocking(w, move |w| w.session(&id)).await?))
+}
+
+async fn link_session(
+    Work(w): Work,
+    Person(caller): Person,
+    Segments(id): Segments<String>,
+    body: RawBody,
+) -> Reply<Session> {
+    let id: SessionId = path_id(&id, "session")?;
+    blocking(Arc::clone(&w), move |w| w.session(&id)).await?;
+    let link: SessionLink = json(body).await?;
+    Ok(Json(
+        blocking(w, move |w| w.link_session(&caller, &id, link)).await?,
+    ))
 }
 
 // ─── Asks and briefs ─────────────────────────────────────────────────────────────────────────────

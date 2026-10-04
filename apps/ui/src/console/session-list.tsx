@@ -4,6 +4,8 @@
 
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { ContextMenu } from 'radix-ui';
+import { LinkSessionDialog } from './link-session.tsx';
 import { ApiError, useMembers, type Member, type Session } from '../data/index.ts';
 import { StatusPill } from '../design/index.ts';
 import { cx } from '../lib/cx.ts';
@@ -88,6 +90,7 @@ export interface SessionListViewProps {
   members?: readonly Member[] | undefined;
   selectedId?: string | undefined;
   onSelect: (session: Session, via: SelectVia) => void;
+  onLink?: ((session: Session) => void) | undefined;
   /**
    * The arrow, Page, Home and End keys moved to `session`. Pass it to make the selection follow
    * the keys (as the console does when the chosen session shows beside the list).
@@ -236,6 +239,7 @@ export function SessionListView(props: SessionListViewProps) {
                 <SessionRow
                   session={row.session}
                   handle={row.session.agent === undefined ? undefined : handles.get(row.session.agent)}
+                  onLink={props.onLink === undefined ? undefined : () => props.onLink?.(row.session)}
                   now={now}
                   selected={row.session.id === selectedId}
                   active={row.session.id === activeId}
@@ -278,11 +282,12 @@ function SessionRow(props: {
   selected: boolean;
   active: boolean;
   onClick: () => void;
+  onLink: (() => void) | undefined;
 }) {
   const { session } = props;
   const starting = session.state === 'starting';
   const state = STATE[session.state];
-  return (
+  const row = (
     <div
       id={optionId(session.id)}
       role="option"
@@ -326,6 +331,17 @@ function SessionRow(props: {
       </div>
     </div>
   );
+  if (props.onLink === undefined) return row;
+  return (
+    <ContextMenu.Root modal={false}>
+      <ContextMenu.Trigger asChild>{row}</ContextMenu.Trigger>
+      <ContextMenu.Portal>
+        <ContextMenu.Content className="z-50 min-w-44 rounded-md border border-line bg-card p-1 shadow-pop">
+          <ContextMenu.Item onSelect={props.onLink} className="rounded-sm px-2 py-1.5 text-sm outline-none data-highlighted:bg-hover">Link to…</ContextMenu.Item>
+        </ContextMenu.Content>
+      </ContextMenu.Portal>
+    </ContextMenu.Root>
+  );
 }
 
 export interface SessionListProps {
@@ -339,6 +355,7 @@ export interface SessionListProps {
 
 /** The session list, live from the hub, filtered by `facets`. */
 export function SessionList(props: SessionListProps) {
+  const [linking, setLinking] = useState<Session | undefined>();
   const facets = props.facets ?? NO_FACETS;
   const { sessions, all, places, isPending, error } = useConsoleSessions(facets);
   const members = useMembers();
@@ -353,15 +370,19 @@ export function SessionList(props: SessionListProps) {
     return <p className="p-6 text-sm text-ink-2">Loading sessions…</p>;
   }
   return (
+    <>
+    {linking !== undefined && <LinkSessionDialog key={linking.id} session={linking} onClose={() => setLinking(undefined)} />}
     <SessionListView
       sessions={sessions}
       places={places}
       members={members.data}
       selectedId={props.selectedId}
       onSelect={props.onSelect}
+      onLink={setLinking}
       onActiveChange={props.onActiveChange}
       empty={all.length === 0 ? 'No sessions yet.' : 'No sessions match these filters.'}
       {...(props.className === undefined ? {} : { className: props.className })}
     />
+    </>
   );
 }

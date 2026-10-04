@@ -682,3 +682,27 @@ fn the_names_version_moves_when_prose_may_read_differently() {
     }));
     assert_eq!(v(&dir), 2);
 }
+
+#[test]
+fn imported_assignment_survives_inference_and_unlinked_discovery() {
+    let w = World::new(3, 5, 2);
+    let (s, agent, task, ws) = (w.sessions[2], w.agents[2], w.tasks[1], w.workstreams[1]);
+    for incoming in [
+        linked(s, w.workstreams[0], w.tasks[0], LinkBasis::Folder),
+        linked(s, w.workstreams[0], w.tasks[0], LinkBasis::Branch),
+        EventBody::SessionDiscovered {
+            session: restated(s),
+        },
+    ] {
+        let mut log = Log::new();
+        log.add(&w, 0, w.person, linked(s, ws, task, LinkBasis::Imported))
+            .add(&w, 60, agent, incoming)
+            .add(&w, 60, agent, tool(s, 1));
+        let (all, _) = log.build(&w.dir);
+        assert!(!all.is_empty());
+        for block in all {
+            assert_eq!(block.workstream, Some(ws));
+            assert_eq!(block.tasks, vec![task]);
+        }
+    }
+}

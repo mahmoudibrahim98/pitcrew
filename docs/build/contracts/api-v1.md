@@ -314,6 +314,19 @@ another person's agent or one with no owner (explicit sharing may come later).
 | `POST /v1/sessions/{id}/end` | `{ "mode": "graceful" \| "kill" }` → 204 | Emits `session_ended` when it has ended; that event **is** the change to state `ended` (no separate `session_state_changed`). |
 | `POST /v1/sessions/{id}/link` | `{ "workstream"?: WorkstreamId, "task"?: TaskId }` → `Session` | A manual link (`link_basis: "manual"`). Emits `session_linked`. |
 
+Manual linking is person-only (`403` for an agent). At least one of `workstream` or `task`
+is required (`400` otherwise). A task alone derives its workstream; when both are given, the
+task must belong to that workstream (`400` otherwise, including a task without a workstream).
+Unknown body references are `400`; an unknown session in the path is `404`. A workstream-only
+link clears the session's task. Every successful link emits `session_linked`, with basis `manual`.
+
+Folder/branch linking uses this machine's workstream locations: the deepest containing folder
+wins, a matching branch wins at equal depth, and a tie between workstreams links neither.
+`dispatch`, `claimed`, `manual`, and `imported` are firm links: folder/branch inference and a
+re-stated discovery without a firm link never replace them. Imported links preserve the
+assignment chosen at import; a person may deliberately replace them with a manual link.
+New workstreams trigger another pass over existing runner sessions.
+
 `StartSession`: `{ "machine": MachineId, "engine": Engine, "cwd": String, "agent"?: MemberId,
 "task"?: TaskId, "brief"?: String, "persona"?: PersonaId, "model"?: String,
 "permission_mode"?: PermissionMode }`. `persona`, `model` and `permission_mode` are launch options

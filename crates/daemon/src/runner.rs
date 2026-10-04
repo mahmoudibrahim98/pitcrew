@@ -31,6 +31,7 @@
 use crate::agents::HubAgents;
 use crate::cli::HomeArg;
 use crate::dispatch::{AgentEnv, FollowingSink};
+use crate::locations::HubLocations;
 use crate::runtime::TerminalRuntime;
 use crate::state::StateDir;
 use anyhow::{Context as _, bail};
@@ -194,6 +195,13 @@ pub struct Runner {
 }
 
 impl Runner {
+    /// Ask the watcher to reconsider its session links after workstream locations change.
+    pub fn locations_changed(&self) {
+        if let Some(handle) = &self.handle {
+            handle.locations_changed();
+        }
+    }
+
     /// What the routes use of it.
     pub fn parts(&self) -> Parts {
         self.parts.clone()
@@ -375,6 +383,7 @@ pub fn start(
 
     let mut config = RunnerConfig::new(work.workspace(), machine, owner, &dir)
         .with_agents(Arc::new(HubAgents::new(Arc::clone(work))))
+        .with_locations(Arc::new(HubLocations::new(Arc::clone(work))))
         .with_session_env(Arc::clone(session_env) as Arc<dyn SessionEnv>);
     let watched: Vec<String> = homes
         .iter()

@@ -84,7 +84,7 @@ mod service;
 mod setup;
 
 pub use activity::EventRefs;
-pub use commands::{AnswerAsk, BriefEdit, NewAsk, NewComment, WorkstreamPatch};
+pub use commands::{AnswerAsk, BriefEdit, NewAsk, NewComment, SessionLink, WorkstreamPatch};
 pub use dispatch::{
     DispatchError, DispatchRequest, Dispatcher, ENDED_WITHOUT_REPORT, MAX_BRIEF, NEVER_STARTED,
     NewDispatch, RecordedStart,

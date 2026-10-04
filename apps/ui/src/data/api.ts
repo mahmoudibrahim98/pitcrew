@@ -205,6 +205,8 @@ export function createApi(options: ApiOptions) {
       get<Session[]>('/v1/sessions', { ...filters }, signal),
     session: (session: string, signal?: AbortSignal) =>
       get<Session>(`/v1/sessions/${id(session)}`, undefined, signal),
+    linkSession: (session: string, link: { workstream?: string; task?: string }) =>
+      request<Session>('POST', `/v1/sessions/${id(session)}/link`, { body: link }),
     /** The newest page without `before`; with it, the page ending before that byte offset. */
     transcript: (session: string, page: TranscriptQuery = {}, signal?: AbortSignal) =>
       get<TranscriptPage>(

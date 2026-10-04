@@ -30,6 +30,7 @@ mod dispatch;
 mod files;
 mod host;
 mod init;
+mod locations;
 mod office;
 mod recaps;
 mod refs;

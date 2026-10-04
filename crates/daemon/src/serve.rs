@@ -543,6 +543,8 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         let _ = workers.keep_runner(runner);
     }
 
+    let _locations = crate::locations::watch(&work, &workers);
+
     let events: Arc<dyn EventSource> =
         Arc::new(StoreSource::new(Arc::clone(&store), store.log_id()));
     // Hooks change sessions' state through the runner, for the senders that may (its README,

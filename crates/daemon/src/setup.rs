@@ -94,6 +94,13 @@ impl Workers {
         None
     }
 
+    /// Notify the runner kept here, including one started after setup.
+    pub fn locations_changed(&self) {
+        if let Some(runner) = &self.kept().runner {
+            runner.locations_changed();
+        }
+    }
+
     /// Whether the stop has begun.
     pub fn stopping(&self) -> bool {
         self.kept().stopping
