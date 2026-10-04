@@ -88,8 +88,9 @@ const SECRET_NAMES = [
 ];
 const SECRET_EXACT = ['pwd', 'pw', 'pat', 'key', 'sig', 'signature'];
 const SCHEMES = ['bearer', 'basic', 'digest'];
+// `pitcrew_protocol::text::is_hidden`, but for the line separators (they become spaces).
 const HIDDEN =
-  /[­͏؜ᅟᅠ᠎​-‏‪-‮⁠-⁤⁦-⁩ㅤ︀-️﻿ﾠ￹-￻]|\uDB40[\uDC00-\uDDEF]/gu;
+  /[\u00AD\u034F\u061C\u115F\u1160\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\u2066-\u2069\u3164\uFE00-\uFE0F\uFEFF\uFFA0\uFFF9-\uFFFB\u{E0000}-\u{E007F}\u{E0100}-\u{E01EF}]/gu;
 const GAP = /[\s"'`()[\]{}<>,;|]/u;
 
 function isSecretName(name: string): boolean {
@@ -238,7 +239,7 @@ function homes(text: string, count: Count): string {
 /** One clean line of at most `max` characters, redacted as the hub redacts it. */
 export function redactLine(text: string, max: number): { text: string; count: number } {
   const limit = max * 4 + 64;
-  let tidy = text.replace(HIDDEN, '').replace(/[\s\p{Cc}  ]+/gu, ' ').trim();
+  let tidy = text.replace(HIDDEN, '').replace(/[\s\p{Cc}\u2028\u2029]+/gu, ' ').trim();
   const chars = [...tidy];
   const cut = chars.length > limit;
   if (cut) tidy = chars.slice(0, limit).join('');

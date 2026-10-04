@@ -340,12 +340,12 @@ pub fn draft_prompt(facts: &DraftFacts, draft: &str) -> DraftPrompt {
         MAX_PROPOSED_TITLE.to_string(),
     );
     let text = DRAFT_BOARD.render(&[
-        ("workstream", &workstream),
-        ("project", &project),
+        ("workstream", workstream.as_str()),
+        ("project", project.as_str()),
         ("draft", draft),
-        ("max_tasks", &max_tasks),
-        ("max_title", &max_title),
-        ("summary", &summary.text),
+        ("max_tasks", max_tasks.as_str()),
+        ("max_title", max_title.as_str()),
+        ("summary", summary.text.as_str()),
     ]);
     let prompt_bytes = u32::try_from(text.len()).unwrap_or(u32::MAX);
     let cost = DraftCost {

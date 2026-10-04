@@ -8,7 +8,6 @@ use pitcrew_office::board::{
 };
 use pitcrew_office::prompts::DRAFT_BOARD;
 use pitcrew_protocol::board::{MAX_PROPOSAL_BYTES, UsageEstimate};
-use pitcrew_protocol::ids::SessionId;
 use pitcrew_protocol::model::{Engine, SessionState, TaskStatus};
 
 /// 2026-10-01T00:00:00Z.

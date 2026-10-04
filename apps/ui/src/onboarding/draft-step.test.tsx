@@ -57,10 +57,10 @@ describe('the draft step', () => {
   it('applies only to new workstreams with imported history', () => {
     const ws = [{ id: demo.submission } as Workstream];
     expect(showDraftStep({ createResult: { projects: [], workstreams: ws }, importResult: { imported: 3 } })).toBe(true);
-    expect(showDraftStep({ createResult: { projects: [], workstreams: ws }, importResult: undefined })).toBe(true);
+    expect(showDraftStep({ createResult: { projects: [], workstreams: ws } })).toBe(true);
     expect(showDraftStep({ createResult: { projects: [], workstreams: ws }, importResult: { imported: 0 } })).toBe(false);
     expect(showDraftStep({ createResult: { projects: [], workstreams: [] }, importResult: { imported: 3 } })).toBe(false);
-    expect(showDraftStep({ createResult: undefined, importResult: undefined })).toBe(false);
+    expect(showDraftStep({})).toBe(false);
   });
 
   it('is offered only by a hub that drafts, and starts a draft per workstream once confirmed', async () => {
