@@ -686,12 +686,7 @@ fn the_names_version_moves_when_prose_may_read_differently() {
 #[test]
 fn imported_assignment_survives_inference_and_unlinked_discovery() {
     let w = World::new(3, 5, 2);
-    let (s, agent, task, ws) = (
-        w.sessions[2],
-        w.agents[2],
-        w.tasks[1],
-        w.workstreams[1],
-    );
+    let (s, agent, task, ws) = (w.sessions[2], w.agents[2], w.tasks[1], w.workstreams[1]);
     for incoming in [
         linked(s, w.workstreams[0], w.tasks[0], LinkBasis::Folder),
         linked(s, w.workstreams[0], w.tasks[0], LinkBasis::Branch),

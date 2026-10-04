@@ -549,8 +549,8 @@ mod tests {
     #[test]
     fn firm_links_are_replaced_only_by_firm_links() {
         use LinkBasis::{Branch, Claimed, Dispatch, Folder, Imported, Manual};
-        let firm = [Dispatch, Manual, Claimed];
-        let inferred = [Folder, Branch, Imported];
+        let firm = [Dispatch, Manual, Claimed, Imported];
+        let inferred = [Folder, Branch];
         for existing in firm {
             for incoming in firm {
                 assert!(replaces_link(Some(existing), Some(incoming)));

@@ -128,7 +128,11 @@ fn imported_links_keep_hub_and_recap_activity_in_agreement() {
                 .expect("synthetic test data");
             builder.push(&event);
             let session = work.session(&id).expect("synthetic test data");
-            assert_eq!(session.link_basis, Some(LinkBasis::Imported), "{inferred:?}");
+            assert_eq!(
+                session.link_basis,
+                Some(LinkBasis::Imported),
+                "{inferred:?}"
+            );
             assert_eq!(session.workstream, Some(imported), "{inferred:?}");
             assert_eq!(session.task, None, "{inferred:?}");
         }
