@@ -8,31 +8,27 @@
 // beside it; Enter opens it and goes to the composer. A terminal in control mode keeps F6 for its
 // program.
 //
-// The session pane shows the chat, its terminal when the session has one (`?view=terminal`), or
-// its work (`?view=work`, src/projects' `SessionWork`, lazy).
+// The session area is the workbench (`workbench/`): sessions, terminals and files in tabs and
+// splits, kept per workspace. The chosen session in the URL is revealed there (a session chosen
+// from the list opens as the active pane's preview tab), and the tab the person brings on screen
+// is put back in the URL. A session tab shows the chat, its terminal when the session has one
+// (`?view=terminal`), or its work (`?view=work`, src/projects' `SessionWork`, lazy). In a narrow
+// console the workbench gives way to the one session in the URL, as before.
 
 import { defaultStringifySearch, useParams, useRouter, useSearch } from '@tanstack/react-router';
 import {
-  createElement,
-  lazy,
-  Suspense,
   useEffect,
   useEffectEvent,
   useLayoutEffect,
   useRef,
   useState,
-  type ComponentType,
   type KeyboardEvent,
-  type LazyExoticComponent,
   type ReactNode,
   type RefObject,
 } from 'react';
-import { ApiError, useSession, type Session } from '../data/index.ts';
-import { Badge, Button, ChevronRightIcon, ConsoleIcon, Kbd, ResizablePanel } from '../design/index.ts';
-import { SessionWork } from '../projects/index.ts';
+import type { Session } from '../data/index.ts';
+import { Badge, Button, ChevronRightIcon, Kbd, ResizablePanel } from '../design/index.ts';
 import { paths, SHELL_KEYS_ATTRIBUTE, useWorkspaceId } from '../shell/index.ts';
-import { ChatView } from './chat-view.tsx';
-import { Composer } from './composer.tsx';
 import { useConsoleSessions } from './data.ts';
 import { NO_FACETS, type SessionFacets } from './facets.ts';
 import { onIntent, takeIntent, type ConsoleIntent } from './intent.ts';
@@ -46,38 +42,44 @@ import {
   type SessionView,
 } from './search.ts';
 import { SessionFilters } from './session-filters.tsx';
-import { SessionHeader } from './session-header.tsx';
-import { SessionList, type SelectVia } from './session-list.tsx';
-import { TerminalBoundary } from './terminal-boundary.tsx';
-import type { TerminalViewProps } from './terminal/terminal-view.tsx';
-import { ViewSwitch } from './view-switch.tsx';
-import { WorkBoundary } from './work-boundary.tsx';
-
-// Its own chunk, with xterm: nothing of it loads until a terminal is shown. One lazy component per
-// attempt: React keeps a failed import's error, so trying again needs a new one.
-const loadTerminalView = () => import('./terminal/terminal-view.tsx').then((m) => ({ default: m.TerminalView }));
-const terminalViews: LazyExoticComponent<ComponentType<TerminalViewProps>>[] = [];
-function terminalView(attempt: number): LazyExoticComponent<ComponentType<TerminalViewProps>> {
-  terminalViews[attempt] ??= lazy(loadTerminalView);
-  return terminalViews[attempt];
-}
+import { SessionList, type OpenWhere, type SelectVia } from './session-list.tsx';
+import { currentTab, keep, openTab, reveal, type TabRef } from './workbench/layout.ts';
+import { Placeholder, SessionPane } from './workbench/session-tab.tsx';
+import { useWorkbench, Workbench } from './workbench/workbench.tsx';
 
 /** How long the arrow keys must rest on a session before the session pane follows. */
 const FOLLOW_MS = 150;
 
-type Pane = 'filters' | 'list' | 'terminal' | 'work' | 'chat' | 'composer';
+type Pane = 'filters' | 'list' | 'terminal' | 'work' | 'chat' | 'composer' | 'file' | 'details';
 
-const PANE_ORDER: readonly Pane[] = ['filters', 'list', 'terminal', 'work', 'chat', 'composer'];
-
-/** What F6 focuses in each pane, if the pane is on screen and has it. */
-const PANE_FOCUS: Record<Pane, string> = {
-  filters: '[data-pane="filters"] input:not(:disabled)',
-  list: '[data-pane="list"] [role="listbox"]',
-  terminal: '[data-pane="terminal"] [data-terminal-focus]',
-  work: '[data-pane="work"] [data-work-focus]',
-  chat: '[data-pane="chat"] [data-chat-scroller]',
-  composer: '[data-pane="composer"] textarea:not(:disabled)',
+/** What F6 focuses in each pane (`[data-pane]`), if the pane is on screen and has it. */
+const FOCUS_IN: Record<Pane, string> = {
+  filters: 'input:not(:disabled)',
+  list: '[role="listbox"]',
+  terminal: '[data-terminal-focus]',
+  work: '[data-work-focus]',
+  chat: '[data-chat-scroller]',
+  composer: 'textarea:not(:disabled)',
+  file: '[data-file-focus]',
+  details: '[data-details-focus]',
 };
+
+const PANE_FOCUS = Object.fromEntries(
+  Object.entries(FOCUS_IN).map(([pane, inner]) => [pane, `[data-pane="${pane}"] ${inner}`]),
+) as Record<Pane, string>;
+
+/** A workbench pane's content, where "next pane" from the palette starts. */
+const CONTENT_FOCUS = '[data-chat-scroller], [data-terminal-focus], [data-work-focus], [data-file-focus]';
+
+/** F6's stops, in the order they are on screen: the filters, the list, each pane's, the details. */
+function paneStops(root: HTMLElement | null): { pane: HTMLElement; target: HTMLElement }[] {
+  if (root === null) return [];
+  return [...root.querySelectorAll<HTMLElement>('[data-pane]')].flatMap((pane) => {
+    const inner = FOCUS_IN[pane.dataset.pane as Pane] as string | undefined;
+    const target = inner === undefined ? null : pane.querySelector<HTMLElement>(inner);
+    return target === null ? [] : [{ pane, target }];
+  });
+}
 
 const find = (root: HTMLElement | null, selector: string) => root?.querySelector<HTMLElement>(selector) ?? null;
 
@@ -166,22 +168,81 @@ export function ConsolePage() {
     void router.navigate({ href: paths.session(ws, sessionId) + stringify(searchWithView(search, next)), replace: true });
   };
 
+  /**
+   * Puts the tab on screen in the URL: a session with its view, or the bare console for a file or
+   * nothing. Switching tabs replaces the history entry; choosing from the list adds one.
+   */
+  const show = (ref: TabRef | undefined, replace = true) => {
+    const href =
+      ref?.kind === 'session'
+        ? paths.session(ws, ref.session) + stringify(searchWithView(search, ref.view))
+        : paths.console(ws) + stringify(searchWithView(search, 'chat'));
+    if (href !== router.state.location.href) void router.navigate({ href, replace });
+  };
+  const workbench = useWorkbench(ws, show);
+
+  // A link, the palette or the history asks for a session (in a view): the workbench shows it.
+  const revealAsked = useEffectEvent((id: string, asked: SessionView) => {
+    workbench.store.update((l) => reveal(l, { kind: 'session', session: id, view: asked }, { preview: true }));
+  });
+  useEffect(() => {
+    if (!narrow && sessionId !== undefined) revealAsked(sessionId, view);
+  }, [narrow, sessionId, view]);
+
+  /**
+   * A session chosen in the list: shown where it is open already (in whatever view it has there),
+   * or opened in the active pane as its preview tab. Enter keeps it.
+   */
+  const openFromList = (session: Session, how: SelectVia | 'arrows') => {
+    if (narrow) {
+      if (session.id !== sessionId) go({ session: session.id }, how === 'arrows');
+      return;
+    }
+    const next = workbench.store.update((l) => {
+      const shown = reveal(l, { kind: 'session', session: session.id, view }, { preview: how !== 'keyboard', anyView: true });
+      const now = currentTab(shown);
+      return how === 'keyboard' && now !== undefined ? keep(shown, now.group.id, now.tab.id) : shown;
+    });
+    show(currentTab(next)?.tab.ref, how === 'arrows');
+  };
+  /** "Open in a new tab" and "Open to the side", from a row's menu. */
+  const openKept = (session: Session, where: OpenWhere) => {
+    if (narrow) {
+      go({ session: session.id });
+      return;
+    }
+    const ref: TabRef = { kind: 'session', session: session.id, view: 'chat' };
+    workbench.change((l) => openTab(l, ref, where === 'side' ? { side: 'right' } : {}), { focus: 'tab' });
+  };
+
   // The arrow keys choose the session beside the list, once they rest on one.
   const followTimer = useRef<number | undefined>(undefined);
   useEffect(() => () => window.clearTimeout(followTimer.current), []);
   const follow = (session: Session) => {
     window.clearTimeout(followTimer.current);
-    followTimer.current = window.setTimeout(() => go({ session: session.id }, true), FOLLOW_MS);
+    followTimer.current = window.setTimeout(() => openFromList(session, 'arrows'), FOLLOW_MS);
   };
+  /** The active pane's content, or the whole console when there are no panes (narrow). */
+  const activeArea = () => root.current?.querySelector<HTMLElement>('[data-active-group]') ?? root.current;
   const focusComposer = () =>
     focusSoon(
-      () => find(root.current, PANE_FOCUS.composer),
-      () => find(root.current, PANE_FOCUS.chat),
+      () => find(activeArea(), PANE_FOCUS.composer),
+      () => find(activeArea(), PANE_FOCUS.chat),
     );
   const select = (session: Session, via: SelectVia) => {
     window.clearTimeout(followTimer.current);
-    if (session.id !== sessionId) go({ session: session.id });
+    openFromList(session, via);
     if (via === 'keyboard') focusComposer();
+  };
+
+  /** F6: the next (or previous) pane on screen, from the one with focus. */
+  const stepPane = (step: 1 | -1, from: Element | null) => {
+    const stops = paneStops(root.current);
+    if (stops.length === 0) return undefined;
+    const here = from?.closest('[data-pane]');
+    const at = stops.findIndex((stop) => stop.pane === here);
+    const next = at === -1 ? (step === 1 ? 0 : stops.length - 1) : (at + step + stops.length) % stops.length;
+    return stops[next]?.target;
   };
 
   const showFilters = (open: boolean) => (narrow ? setNarrowFilters(open) : panes.setFiltersOpen(open));
@@ -189,6 +250,25 @@ export function ConsolePage() {
 
   // Requests from the palette (see intent.ts): this page may have just mounted for one.
   const apply = (intent: ConsoleIntent) => {
+    if (intent.kind === 'workbench') {
+      const { action } = intent;
+      if (action === 'next-pane' || action === 'previous-pane') {
+        // From the active pane: the palette had focus, not a pane.
+        const from = find(activeArea(), CONTENT_FOCUS) ?? activeArea();
+        const target = stepPane(action === 'next-pane' ? 1 : -1, from);
+        if (target !== undefined) focusSoon(() => target);
+        return;
+      }
+      if (narrow) return;
+      workbench.run(action);
+      const open = workbench.store.get().details.open;
+      focusSoon(() =>
+        action === 'toggle-details' && open
+          ? find(root.current, PANE_FOCUS.details)
+          : find(activeArea(), '[role="tab"][aria-selected="true"]'),
+      );
+      return;
+    }
     const toList = narrow && sessionId !== undefined;
     if (intent.kind === 'facet') {
       showFilters(true);
@@ -223,15 +303,10 @@ export function ConsolePage() {
     if (event.key !== 'F6' || event.ctrlKey || event.metaKey || event.altKey) return;
     // A surface that owns the keys (a terminal in control mode) keeps F6 for its program.
     if (event.target instanceof Element && event.target.closest(`[${SHELL_KEYS_ATTRIBUTE}="none"]`) !== null) return;
-    const available = PANE_ORDER.filter((pane) => find(root.current, PANE_FOCUS[pane]) !== null);
-    if (available.length === 0) return;
+    const target = stepPane(event.shiftKey ? -1 : 1, document.activeElement);
+    if (target === undefined) return;
     event.preventDefault();
-    const here = document.activeElement?.closest('[data-pane]')?.getAttribute('data-pane');
-    const at = available.indexOf(here as Pane);
-    const step = event.shiftKey ? -1 : 1;
-    const next = at === -1 ? (event.shiftKey ? available.length - 1 : 0) : (at + step + available.length) % available.length;
-    const pane = available[next];
-    if (pane !== undefined) find(root.current, PANE_FOCUS[pane])?.focus();
+    target.focus();
   };
 
   const active = facetCount(facets);
@@ -261,19 +336,19 @@ export function ConsolePage() {
           facets={facets}
           selectedId={sessionId}
           onSelect={select}
+          onOpen={openKept}
           onActiveChange={narrow ? undefined : follow}
         />
       </div>
     </div>
   );
-  const session =
-    sessionId === undefined ? (
-      <Placeholder title="Choose a session">
+  const choose = (
+    <Placeholder title="Choose a session">
+      <p>
         Pick one from the list to read its chat and talk to its agent. <Kbd keys={['F6']} /> moves between panes.
-      </Placeholder>
-    ) : (
-      <SessionPane key={sessionId} ws={ws} sessionId={sessionId} view={view} onView={setView} narrow={narrow} />
-    );
+      </p>
+    </Placeholder>
+  );
 
   if (narrow) {
     const back = (label: string, onClick: () => void) => (
@@ -297,7 +372,11 @@ export function ConsolePage() {
       pane = (
         <section aria-label="Session" className="flex min-h-0 w-full min-w-0 flex-col">
           {back('Sessions', () => go({ session: undefined }))}
-          {session}
+          {sessionId === undefined ? (
+            choose
+          ) : (
+            <SessionPane key={sessionId} ws={ws} sessionId={sessionId} view={view} onView={setView} narrow />
+          )}
         </section>
       );
     } else {
@@ -342,121 +421,7 @@ export function ConsolePage() {
       >
         {list}
       </ResizablePanel>
-      <section aria-label="Session" className="flex min-w-0 flex-1 flex-col">
-        {session}
-      </section>
+      <Workbench api={workbench} empty={choose} />
     </div>
-  );
-}
-
-function Placeholder({ title, children }: { title: string; children: ReactNode }) {
-  return (
-    <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
-      <ConsoleIcon className="size-6 text-ink-2" />
-      <p className="text-sm font-medium">{title}</p>
-      <p className="max-w-80 text-sm text-ink-2">{children}</p>
-    </div>
-  );
-}
-
-interface SessionPaneProps {
-  ws: string;
-  sessionId: string;
-  view: SessionView;
-  onView(view: SessionView): void;
-  narrow: boolean;
-}
-
-/**
- * One session: its header (with links to its task and workstream), the Chat | Terminal | Work
- * switch, then the chat and composer, the terminal, or its work. In a narrow console the terminal
- * and work views take the pane, with only the header's title row above them.
- */
-function SessionPane({ ws, sessionId, view, onView, narrow }: SessionPaneProps) {
-  const router = useRouter();
-  const session = useSession(sessionId);
-  if (session.error instanceof ApiError && session.error.code === 'not_found') {
-    return (
-      <Placeholder title="No such session">
-        It may have been in another workspace, or the link may be wrong. Choose one from the list.
-      </Placeholder>
-    );
-  }
-  const open = (href: string) => void router.navigate({ href });
-  const taskHref = (task: { key: string }) => paths.task(ws, task.key);
-  const workstreamHref = (w: { id: string; project: string }) => paths.workstream(ws, w.project, w.id);
-  const loaded = session.data !== undefined;
-  const hasTerminal = session.data?.terminal !== undefined;
-  // Until the session is here, a link to its terminal waits for it rather than flashing the chat.
-  // Work needs nothing from the session itself (its own query fetches the blocks), so it shows at
-  // once, like the chat.
-  let shown: SessionView | 'loading' | 'failed' =
-    view === 'terminal' && hasTerminal ? 'terminal' : view === 'work' ? 'work' : 'chat';
-  if (view === 'terminal' && !loaded) shown = session.error === null ? 'loading' : 'failed';
-  const switchValue: SessionView = shown === 'chat' ? 'chat' : shown === 'work' ? 'work' : 'terminal';
-  return (
-    <>
-      <SessionHeader
-        sessionId={sessionId}
-        taskHref={taskHref}
-        onOpenTask={(task) => open(taskHref(task))}
-        workstreamHref={workstreamHref}
-        onOpenWorkstream={(w) => open(workstreamHref(w))}
-        compact={narrow && (shown === 'terminal' || shown === 'work')}
-      />
-      <ViewSwitch
-        value={switchValue}
-        onChange={onView}
-        terminalUnavailable={loaded && !hasTerminal ? 'This session has no terminal.' : undefined}
-      />
-      {shown === 'loading' && <p className="p-4 text-sm text-ink-2">Loading the session…</p>}
-      {shown === 'failed' && (
-        <p role="alert" className="p-4 text-sm text-ink-2">
-          Could not load the session{session.error instanceof ApiError ? `: ${session.error.message}` : '.'}
-        </p>
-      )}
-      {shown === 'terminal' && (
-        <div data-pane="terminal" className="flex min-h-0 flex-1 flex-col">
-          <TerminalBoundary>
-            {(attempt) => (
-              <Suspense fallback={<p className="p-4 text-sm text-ink-2">Loading the terminal…</p>}>
-                {createElement(terminalView(attempt), { sessionId })}
-              </Suspense>
-            )}
-          </TerminalBoundary>
-        </div>
-      )}
-      {shown === 'work' && (
-        <div data-pane="work" className="min-h-0 flex-1 overflow-y-auto">
-          {/* Focusable but not a tab stop, like the chat scroller: F6 lands here. Unlabelled,
-              since SessionWork's own section (role="region", named "Work" by its heading) is the
-              pane's landmark. */}
-          <div
-            tabIndex={-1}
-            data-work-focus=""
-            className="p-4 outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-accent focus-visible:outline-solid"
-          >
-            <WorkBoundary>
-              {(attempt) => (
-                <Suspense fallback={<p className="text-sm text-ink-2">Loading the session's work…</p>}>
-                  {/* The session title above is already an h2; Work nests under it as an h3. */}
-                  <SessionWork key={attempt} session={sessionId} level={3} />
-                </Suspense>
-              )}
-            </WorkBoundary>
-          </div>
-        </div>
-      )}
-      {shown === 'chat' && (
-        <>
-          <div data-pane="chat" className="min-h-0 flex-1">
-            <ChatView sessionId={sessionId} />
-          </div>
-          <div data-pane="composer" className="shrink-0">
-            <Composer sessionId={sessionId} />
-          </div>
-        </>
-      )}
-    </>
   );
 }

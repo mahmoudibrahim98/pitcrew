@@ -44,6 +44,12 @@ export function useWorkstreamById(id: string | undefined) {
   });
 }
 
+/** The workspace's personas (an agent's model comes from its persona). */
+export function usePersonas() {
+  const api = useApi();
+  return useLiveQuery({ queryKey: keys.personas, queryFn: ({ signal }) => api.personas(signal) });
+}
+
 /**
  * Every session, with what grouping needs, filtered by `facets` on the client. The list query is
  * the shared, live-patched `['sessions', 'list', {}]`.
