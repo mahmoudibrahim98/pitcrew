@@ -363,6 +363,122 @@ fn workload(work: &WorkService) {
         },
     );
     edits(work, task.id);
+    writes(work, task.id);
+}
+
+/// Outward writes (`work.writes`): one approved, failed, retried and sent (an issue created from
+/// the task, which gives the task its source), one denied, and a stale start that changes nothing.
+fn writes(work: &WorkService, task: TaskId) {
+    use pitcrew_protocol::model::{ExternalRef, ExternalSystem};
+    use pitcrew_protocol::writes::{WriteFields, WriteOperation, WriteProposal, WriteResult};
+    let sam = person(SAM);
+    let sync = work.ensure_sync_member(member(SAM)).expect("sync member");
+    let commands = work.sync_commands(sync.id).expect("sync commands");
+    let proposal = |operation, after| WriteProposal {
+        ask: pitcrew_protocol::ids::AskId::new(),
+        integration: pitcrew_protocol::ids::IntegrationId::new(),
+        system: ExternalSystem::Github,
+        scope: "example-org/demo-repo".into(),
+        target: None,
+        task: Some(task),
+        operation,
+        before: WriteFields::default(),
+        after,
+        requested_by: member(SAM),
+        cause: None,
+    };
+    let create = commands
+        .propose_write(
+            member(SAM),
+            proposal(
+                WriteOperation::CreateIssue,
+                WriteFields {
+                    title: Some("Created upstream".into()),
+                    ..WriteFields::default()
+                },
+            ),
+            "GitHub: create an issue",
+            "Title: Created upstream",
+        )
+        .expect("propose")
+        .expect("proposed");
+    let ask = create.proposal.ask;
+    work.answer_ask(
+        &sam,
+        &ask,
+        AnswerAsk {
+            option: Some(0),
+            text: None,
+        },
+    )
+    .expect("approve");
+    commands.start_write(&ask).expect("start");
+    commands
+        .finish_write(
+            &ask,
+            WriteResult::Failed {
+                message: "Bad gateway".into(),
+                status: Some(502),
+            },
+        )
+        .expect("fail");
+    commands.start_write(&ask).expect("retry");
+    commands
+        .finish_write(
+            &ask,
+            WriteResult::Sent {
+                created: Some(ExternalRef {
+                    system: ExternalSystem::Github,
+                    key: "example-org/demo-repo#8".into(),
+                    url: Some("https://github.com/example-org/demo-repo/issues/8".into()),
+                }),
+                url: Some("https://github.com/example-org/demo-repo/issues/8".into()),
+            },
+        )
+        .expect("sent");
+    // A start a second writer appended after it was sent changes nothing.
+    raw(
+        work,
+        sync.id,
+        Some(member(SAM)),
+        EventBody::WriteStarted {
+            ask,
+            task: Some(task),
+            attempt: 3,
+        },
+    );
+    let comment = commands
+        .propose_write(
+            member(SAM),
+            proposal(
+                WriteOperation::Comment,
+                WriteFields {
+                    comment: Some("Done here.".into()),
+                    ..WriteFields::default()
+                },
+            ),
+            "GitHub: comment",
+            "Done here.",
+        )
+        .expect("propose")
+        .expect("proposed");
+    work.answer_ask(
+        &sam,
+        &comment.proposal.ask,
+        AnswerAsk {
+            option: Some(1),
+            text: None,
+        },
+    )
+    .expect("deny");
+    commands
+        .finish_write(
+            &comment.proposal.ask,
+            WriteResult::NotSent {
+                reason: "Not sent: Sam chose not to.".into(),
+            },
+        )
+        .expect("not sent");
 }
 
 /// Task edits, new projects and workstreams, and brief proposals.
