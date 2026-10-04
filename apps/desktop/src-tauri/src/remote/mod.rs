@@ -64,12 +64,14 @@ use crate::registry::{
 };
 use crate::token::DeviceToken;
 use link::{Ended, Follow, Link, Outcome, Pairing, RemoteConnector, Tunnel};
+use pitcrew_protocol::machine_setup::MachineCheck;
 use pitcrew_remote::helper::slurm::{Site, check_tools, generic, load_sites, sites_dir};
 use pitcrew_remote::helper::tmux_name;
 use pitcrew_remote::{
-    ConnectorOptions, Daemon, DeployOptions, DirectLauncher, HelperError, JobScript, JobSpec,
-    JobState, LastHop, LaunchOptions, Launcher, Layout, Limits, LinkState, Platform, PromptHandler,
-    SiteRecipe as _, SlurmLauncher, Ssh, SshError, Target, TmuxLauncher, Transport, Unreachable,
+    ConnectorOptions, Daemon, DeployOptions, DeployStep, DirectLauncher, HelperError, JobScript,
+    JobSpec, JobState, LastHop, LaunchOptions, Launcher, Layout, Limits, LinkState, Platform,
+    PromptHandler, SiteRecipe as _, SlurmLauncher, Ssh, SshError, Target, TmuxLauncher, Transport,
+    Unreachable,
 };
 use plan::PlanStore;
 use serde::Serialize;
@@ -202,6 +204,11 @@ pub struct RemoteProbe {
     /// tmux, if the machine has it (the tmux launcher needs 3.2 or newer).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tmux: Option<TmuxFound>,
+    /// The machine check, made over the same connection: each agent CLI and its version, tmux,
+    /// git, gh, free disk in the home folder, SLURM where it is there, and PitCrew's helper
+    /// (`pitcrew_remote::check`). Absent when the check could not run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check: Option<MachineCheck>,
 }
 
 /// tmux on the machine.
@@ -495,6 +502,14 @@ impl Remotes {
             .probe(host)
             .await
             .map_err(|e| self.core.ssh_err(host, &e))?;
+        // The tools' check rides on the same connection; a check that fails leaves it out.
+        let checked = match ssh.check_machine(host).await {
+            Ok(checked) => Some(checked),
+            Err(e) => {
+                tracing::warn!(host, error = %tidy(&e.to_string()), "the machine check did not run");
+                None
+            }
+        };
         let helper = match Target::new(ssh, host, &probe) {
             Ok(target) => helper_status(&target).await,
             Err(_) => None,
@@ -512,6 +527,18 @@ impl Remotes {
         let tmux = probe.tmux_version.as_ref().map(|version| TmuxFound {
             version: tidy(version),
         });
+        let check = checked.map(|mut checked| {
+            checked.rows.push(pitcrew_remote::check::helper_row(
+                helper.as_ref().map(|h| (h.version.as_str(), h.running)),
+            ));
+            // WSL is direct and tmux only: no SLURM there.
+            if target.is_some() {
+                checked.rows.retain(|row| {
+                    row.id != pitcrew_protocol::machine_setup::MachineCheckItem::Slurm
+                });
+            }
+            checked
+        });
         tracing::info!(host, os = %probe.info.os, arch = %probe.info.arch, "probed a machine");
         Ok(RemoteProbe {
             host: host.to_owned(),
@@ -520,6 +547,7 @@ impl Remotes {
             helper,
             slurm,
             tmux,
+            check,
         })
     }
 
@@ -991,8 +1019,18 @@ impl Remotes {
             .map_err(|e| helper_error(&host, &e))?;
         let reported = Arc::new(AtomicU64::new(0));
         let sent = Arc::clone(progress);
+        let told = Arc::clone(progress);
+        let step_name = name.to_owned();
         let name = name.to_owned();
         let options = DeployOptions {
+            // The live log's lines: what the deploy is doing, between the upload's percentages.
+            step: Some(Arc::new(move |step: DeployStep| {
+                told(&AddProgress::new(
+                    &step_name,
+                    StepState::Running,
+                    Some(deploy_detail(step).to_owned()),
+                ));
+            })),
             progress: Some(Arc::new(move |p: pitcrew_remote::helper::Progress| {
                 let percent = p
                     .sent
@@ -1036,6 +1074,16 @@ impl Remotes {
             return Err(cancelled(host));
         }
         if kind != LauncherKind::Slurm {
+            let how = if kind == LauncherKind::Tmux {
+                "starting it in tmux"
+            } else {
+                "starting it in the background"
+            };
+            progress(&AddProgress::new(
+                name,
+                StepState::Running,
+                Some(how.to_owned()),
+            ));
             let launcher = launcher_of(kind);
             let started = launcher
                 .start(target)
@@ -1047,6 +1095,18 @@ impl Remotes {
                 started_now = started.started_now,
                 "the helper runs"
             );
+            progress(&AddProgress::new(
+                name,
+                StepState::Running,
+                Some(
+                    if started.started_now {
+                        "it runs and listens"
+                    } else {
+                        "it was already running"
+                    }
+                    .to_owned(),
+                ),
+            ));
             let undo = if started.started_now {
                 Undo::Helper(Arc::clone(&launcher))
             } else {
@@ -1060,6 +1120,11 @@ impl Remotes {
         let slurm = SlurmLauncher::default();
         let (job, undo) = match script {
             Some(script) => {
+                progress(&AddProgress::new(
+                    name,
+                    StepState::Running,
+                    Some("submitting the job script shown".to_owned()),
+                ));
                 let submitted = slurm
                     .clone()
                     .with_script(script)
@@ -1922,6 +1987,18 @@ fn hop_kind(hop: LastHop) -> HopKind {
     match hop {
         LastHop::SrunOverlap => HopKind::Srun,
         _ => HopKind::Ssh,
+    }
+}
+
+/// A deploy step as a progress detail, for the wizard's live log.
+fn deploy_detail(step: DeployStep) -> &'static str {
+    match step {
+        DeployStep::Checking => "checking for a copy already there",
+        DeployStep::AlreadyInstalled => "already there, and verified (sha256 and version)",
+        DeployStep::Uploading => "uploading",
+        DeployStep::Verifying => "verifying the sha256 and the version on the machine",
+        DeployStep::Installed => "installed and verified",
+        _ => "working",
     }
 }
 

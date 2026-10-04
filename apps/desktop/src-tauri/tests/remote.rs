@@ -584,9 +584,39 @@ mod unix {
         let hosts = w.call("gateway_ssh_hosts", json!({})).unwrap();
         assert_eq!(hosts, json!({ "hosts": [HOST] }));
 
+        // A stand-in Claude Code on the machine (never a real one), for the machine check.
+        let claude = w.machine.dir.join("bin").join("claude");
+        std::fs::write(&claude, "#!/bin/sh\necho '2.1.3 (Claude Code)'\n").unwrap();
+        std::fs::set_permissions(
+            &claude,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
+
         let probe = w
             .call("gateway_remote_probe", json!({ "host": HOST }))
             .unwrap();
+        // The machine check, over the same connection: the stand-in's version, what is missing
+        // with its install page, and the helper that Connect installs.
+        let rows = probe["check"]["rows"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no machine check: {probe}"));
+        let row = |id: &str| {
+            rows.iter()
+                .find(|r| r["id"] == id)
+                .unwrap_or_else(|| panic!("no {id} row: {probe}"))
+                .clone()
+        };
+        assert_eq!(
+            row("cli_claude"),
+            json!({ "id": "cli_claude", "status": "ok", "detail": "2.1.3 (Claude Code)",
+                    "version": "2.1.3 (Claude Code)" })
+        );
+        assert_eq!(row("cli_codex")["status"], "missing", "{probe}");
+        assert_eq!(row("cli_codex")["fix"], "install_page", "{probe}");
+        assert_eq!(row("helper")["status"], "missing", "{probe}");
+        assert_eq!(row("helper")["fix"], "install_helper", "{probe}");
+        assert!(rows.iter().all(|r| r["id"] != "slurm"), "{probe}");
         assert_eq!(probe["host"], HOST);
         assert_eq!(
             probe["os"],
@@ -656,6 +686,25 @@ mod unix {
             }
         }
         assert_eq!(deduped, expected);
+        // The live log's lines: the deploy's steps, then the launch.
+        let details: Vec<String> = w
+            .channel(70)
+            .iter()
+            .filter_map(|m| m["detail"].as_str().map(str::to_owned))
+            .collect();
+        for line in [
+            "checking for a copy already there",
+            "uploading",
+            "verifying the sha256 and the version on the machine",
+            "installed and verified",
+            "starting it in the background",
+            "it runs and listens",
+        ] {
+            assert!(
+                details.iter().any(|d| d == line),
+                "no {line:?} in {details:?}"
+            );
+        }
 
         // A plan is used once.
         let e = w
@@ -735,11 +784,20 @@ mod unix {
             json!({ "id": open.id, "answer": PASSWORD }),
         )
         .unwrap();
-        // That probe sees the helper running.
+        // That probe sees the helper running, and so does its check.
         let probe = probing.join().unwrap().unwrap();
         assert_eq!(
             probe["helper"],
             json!({ "version": version, "running": true })
+        );
+        let helper_row = probe["check"]["rows"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|r| r["id"] == "helper"))
+            .cloned();
+        assert_eq!(
+            helper_row.as_ref().map(|r| r["status"].clone()),
+            Some(json!("ok")),
+            "{probe}"
         );
 
         // The workspace is in the list, ready, and its requests reach the real hub.
