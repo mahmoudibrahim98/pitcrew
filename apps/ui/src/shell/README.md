@@ -299,3 +299,13 @@ Creation entries now come from their owning features; the shell has no placehold
 `CreateEntry.projectContext` restricts an entry to routes with a project parameter in both the
 menu and palette. The Projects feature uses it for Workstream, and its project-page button opens
 the same registered dialog. The shell retains modal trapping, Close/Escape and opener restoration.
+
+## Desktop updates
+
+The root lazily mounts `DesktopUpdates` once in a desktop webview. It listens before reading
+retained status, offers a dismissible update notice and release notes, and asks for confirmation
+before invoking installation with the exact displayed version. It never downloads updates itself.
+Settings (`/w/$ws/settings`, sidebar and routing in `core.tsx`) offers Check now and saved
+pre-release opt-in; browser mode explains that the desktop manages updates. Errors stay visible
+and retryable. See the desktop gateway contract and `tests/updates.test.tsx` for the IPC and
+consent checks. Tauri bindings remain dynamic imports outside the initial browser bundle.

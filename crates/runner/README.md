@@ -213,6 +213,9 @@ cursor before EOF and still resume normally. OpenCode and custom adapters keep t
 the flag defaults to `false` and is for the concrete Claude/Codex JSONL adapters only. Layout
 snapshots hold at most 4,096 directories; a link, unreadable folder or larger tree disables the
 cache. Unix directory ctime is checked too, so restoring mtime cannot conceal a name change.
+File-system clocks are coarse (a clock tick on NTFS, up to two seconds on FAT and some network
+volumes), so a folder or database modified in the last two seconds is never cached: a second
+change in the same tick would keep its stamp.
 
 With a nonzero `RunnerConfig::notification_window`, the first notification after a quiet period
 is due at the existing 100 ms debounce, without rounding. A notification arriving while another

@@ -492,6 +492,25 @@ workspace alone (`registry.rs`); and host names cleaned (`host.rs`).
 
 The OS keychain test is `#[ignore]`d: it needs an unlocked keychain (`cargo test -- --ignored`).
 
+## Updates
+
+`src/updater.rs` uses Tauri updater 2.13.1 (Apache-2.0/MIT), with exact semver 1.0.28 and
+reqwest 0.13.5 pins matching the existing lockfile. They stay in this standalone workspace;
+base64 0.22.1 and minisign-verify 0.2.5 match the plugin's verifier; minisign 0.9.1 is test-only
+(throwaway signing keys). No updater capability
+is exposed to the webview: the five `gateway_update_*` commands hold the pending update in Rust.
+The [contract](../../../docs/build/contracts/desktop-gateway.md#desktop-updates) defines consent,
+channel changes and status/events. Preferences add `updatePrereleases` (false by default).
+Startup and daily checks are independent of the webview; reloading retrieves the retained status.
+
+Builds without a configured public key disable update checks. Release packaging compiles the
+public key from the repository variable only when signing is enabled. See
+[packaging](../../../packaging/README.md#signed-desktop-updates) for key setup, feed production
+and the AppImage/deb/rpm distinction. Never run the installed app in tests: `tests/updater.rs`
+tests Tauri's feed parser and the production install-boundary verifier using a freshly generated
+temporary signing key, without opening a window or running an installer. Signed versions are
+mandatory; changed bytes, wrong keys, unversioned signatures and relabeled versions are refused.
+
 ### Compressed remote helper resources
 
 Release bundles use the decoded-hash manifest contract documented in

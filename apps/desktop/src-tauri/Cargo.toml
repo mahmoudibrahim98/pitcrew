@@ -61,6 +61,11 @@ pitcrew-trust = { path = "../../../crates/trust" }
 # libappindicator, loaded at run time, so a desktop without it still starts).
 tauri = { version = "~2.12", default-features = false, features = ["wry", "compression", "common-controls-v6", "x11", "tray-icon"] }
 tauri-plugin-single-instance = "2.5"
+tauri-plugin-updater = "=2.13.1"
+semver = "=1.0.28"
+base64 = "=0.22.1"
+minisign-verify = "=0.2.5"
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -110,6 +115,7 @@ tauri-winrt-notification = "0.8"
 mac-notification-sys = "0.6"
 
 [dev-dependencies]
+minisign = "=0.9.1"
 axum = { version = "0.8", features = ["ws"] }
 # `temp::short_tempdir`, for the remote cases' sockets on macOS.
 pitcrew-fixtures = { path = "../../../crates/fixtures" }
