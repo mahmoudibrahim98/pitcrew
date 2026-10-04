@@ -42,19 +42,21 @@ pub(crate) fn dispatch(
     stop: &AtomicBool,
     retry_max: Duration,
     group_events: usize,
+    busy: &Arc<AtomicUsize>,
 ) {
     let mut pending = None;
     loop {
         let Some(first) = pending.take().or_else(|| rx.recv().ok()) else {
             return;
         };
+        let _busy = crate::watch::Busy::enter(busy);
         let complete = matches!(&first.commit, Commit::Full(row) if row.caught_up);
         let mut count = first.events.len();
         let mut batches = vec![first];
         if group_events > 0 && complete {
             while batches.len() < 4 && count < group_events {
-                // One bounded wait lets the watcher finish the other files from this wakeup.
-                let next = match rx.recv_timeout(Duration::from_millis(1)) {
+                // Take only already queued work: the first delivery never waits for a group.
+                let next = match rx.try_recv() {
                     Ok(next) => next,
                     Err(_) => break,
                 };
@@ -140,10 +142,12 @@ mod tests {
     struct RefuseOnce {
         refused: AtomicBool,
         offered: Mutex<Vec<Vec<EventId>>>,
+        busy: Arc<AtomicUsize>,
     }
 
     impl EventSink for RefuseOnce {
         fn accept(&self, events: &[Event]) -> Result<(), SinkError> {
+            assert!(self.busy.load(Ordering::Acquire) > 0);
             self.offered
                 .lock()
                 .unwrap()
@@ -209,7 +213,9 @@ mod tests {
             &AtomicBool::new(false),
             Duration::from_millis(50),
             4,
+            &sink.busy,
         );
+        assert_eq!(sink.busy.load(Ordering::Acquire), 0);
         let offered = sink.offered.lock().unwrap();
         assert_eq!(offered.iter().map(Vec::len).collect::<Vec<_>>(), [4, 4, 1]);
         assert_eq!(offered[0], offered[1], "retry the identical ordered group");

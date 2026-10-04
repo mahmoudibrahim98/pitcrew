@@ -315,10 +315,19 @@ pub fn start(
     let dispatcher = {
         let stopping = Arc::clone(&stopping);
         let store = Arc::clone(&store);
+        let busy = Arc::clone(&shared.busy);
         std::thread::Builder::new()
             .name("pitcrew-runner-sink".into())
             .spawn(move || {
-                sink::dispatch(&rx, &*sink, &store, &stopping, retry_max, group_events)
+                sink::dispatch(
+                    &rx,
+                    &*sink,
+                    &store,
+                    &stopping,
+                    retry_max,
+                    group_events,
+                    &busy,
+                )
             })?
     };
     let watcher = std::thread::Builder::new()
