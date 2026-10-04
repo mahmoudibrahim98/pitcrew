@@ -68,8 +68,15 @@ it('hands a Jira secret over once and never keeps or shows it', async () => {
   const one = (await integrationClient(otherClient(hub)).list()).find((i) => i.id === added.id);
   expect(one?.credential).toEqual({ source: 'stored', stored: true });
   expect(document.body.innerHTML).not.toContain(SECRET);
-  expect(JSON.stringify(view.queryClient.getQueryCache().getAll().map((q) => q.state.data))).not.toContain(SECRET);
-  expect(JSON.stringify(view.queryClient.getMutationCache().getAll().map((m) => m.state.data))).not.toContain(SECRET);
+  // Nothing in either cache holds it: no query's key or data, and no mutation's variables, data,
+  // error or context (a mutation keeps its variables until it is garbage-collected).
+  const queries = view.queryClient.getQueryCache().getAll().map((q) => ({ key: q.queryKey, state: q.state }));
+  expect(JSON.stringify(queries)).not.toContain(SECRET);
+  const mutations = view.queryClient
+    .getMutationCache()
+    .getAll()
+    .map((m) => ({ key: m.options.mutationKey, state: m.state }));
+  expect(JSON.stringify(mutations)).not.toContain(SECRET);
 });
 
 it('sends a secret through the transport’s own credential call when it has one', async () => {

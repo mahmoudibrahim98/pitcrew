@@ -47,8 +47,10 @@ none of this folder lands in the initial bundle until a projects route is visite
   warnings about a credential that can do more than read. Connecting GitHub offers `gh auth token`
   on the hub's machine or a token entered next; Jira always takes a stored secret.
 - **Secrets.** The token field is an uncontrolled password input: on Save its value goes to
-  `integrationClient(api).storeCredential` once and the field is cleared, so no React state, query
-  cache or mutation result holds it (tested). In the desktop app the transport's
+  `integrationClient(api).storeCredential` once, through `useStoreCredential` (which keeps only
+  whether it is under way and its error, not a TanStack mutation, whose `variables` the mutation
+  cache would keep), and the field is cleared, so no React state, query or mutation cache holds it
+  (tested). In the desktop app the transport's
   `storeCredential` is the gateway's own command (`gateway_integration_credential`), never
   `gateway_request`; in a browser (development) it is `PUT …/credential`.
 - **Links.** A workstream's header shows its links (with the upstream title once synced) and its

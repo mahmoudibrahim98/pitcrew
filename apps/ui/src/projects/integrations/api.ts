@@ -2,10 +2,13 @@
 // API, and the hooks the settings page and the workstream page use. Read-only upstream: nothing
 // here writes to GitHub or Jira.
 //
-// A secret goes from the form to `storeCredential` once and is kept nowhere: in the desktop app
-// it travels through the gateway's own command, never `gateway_request` (desktop-gateway.md,
-// "Integration credentials"); no answer ever carries it back.
+// A secret goes from the form to `storeCredential` once and is kept nowhere: not in React state,
+// and not in TanStack Query's caches (a mutation would keep it in its `variables` until garbage
+// collection), so `useStoreCredential` calls the client itself. In the desktop app it travels
+// through the gateway's own command, never `gateway_request` (desktop-gateway.md, "Integration
+// credentials"); no answer ever carries it back.
 
+import { useState } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ApiError, useApi, useLiveQuery, type Api, type ExternalRef, type Workstream } from '../../data/index.ts';
 
@@ -153,16 +156,38 @@ export function useIntegrationActions() {
     remove: useMutation({ mutationFn: (id: string) => client.remove(id), onSettled: refresh }),
     test: useMutation({ mutationFn: (id: string) => client.test(id) }),
     sync: useMutation({ mutationFn: (id: string) => client.sync(id), onSettled: refresh }),
-    storeCredential: useMutation({
-      mutationFn: ({ id, secret }: { id: string; secret: string }) => client.storeCredential(id, secret),
-      onSettled: refresh,
-    }),
     link: useMutation({
       mutationFn: ({ workstream, external }: { workstream: string; external: ExternalRef[] }) =>
         client.link(workstream, external),
       onSettled: refresh,
     }),
   };
+}
+
+/**
+ * Hands a secret to the hub, outside TanStack Query: only whether it is under way and its error
+ * are kept, never the secret (see the file's head). Refreshes the integrations when it ends.
+ */
+export function useStoreCredential() {
+  const api = useApi();
+  const queryClient = useQueryClient();
+  const [isPending, setPending] = useState(false);
+  const [error, setError] = useState<Error | null>(null);
+  const store = async (id: string, secret: string): Promise<boolean> => {
+    setPending(true);
+    setError(null);
+    try {
+      await integrationClient(api).storeCredential(id, secret);
+      return true;
+    } catch (e) {
+      setError(e instanceof Error ? e : new Error('The credential could not be stored.'));
+      return false;
+    } finally {
+      setPending(false);
+      void queryClient.invalidateQueries({ queryKey: integrationKeys.all });
+    }
+  };
+  return { store, isPending, error };
 }
 
 /** What a link names, as the hub reads it (`pitcrew_hub_work::links::scope_of`). */
