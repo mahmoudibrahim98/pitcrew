@@ -7,7 +7,9 @@ node tests/conformance/run.mjs mock
 node tests/conformance/run.mjs daemon
 ```
 
-Both commands run the same `api.test.mjs` and `scan.test.mjs`. No npm dependency is needed. The
+Both commands run the same `api.test.mjs`, `scan.test.mjs` and `files.test.mjs`, then, once those
+have passed, `integrations.test.mjs` on its own (its syncs append events, which the main suite's
+exact-revision checks must not see). No npm dependency is needed. The
 daemon runner builds `pitcrewd` and `pitcrew-ptyd` with the locked workspace dependencies, starts a
 seeded demo on an OS-assigned free loopback port, and reads its two private token files without
 printing them. Each runner creates an empty temporary home and cleans up its child process and
@@ -70,3 +72,14 @@ binary writes, stale revisions and exclusive creation, bad paths, Git writes, de
 auth, file/body caps, remote refusal and outward-link refusal. The runner creates every file
 and link target inside its own temporary folder. Windows daemon conformance keeps its existing
 Unix-runtime skip; Rust daemon HTTP tests cover Files API routes there.
+
+`integrations.test.mjs` covers "Integrations" and "Linking a workstream upstream": every route
+refused without a token (`401`) and to an agent (`403`), unknown ids `404`, malformed connections
+and links `400`, a second connection to the same repository and a secret for a `gh_cli` connection
+`409`; a stored secret that is never in any answer; a project and workstream of its own linked to
+milestone 1 of `example-org/demo-repo` (`workstream_linked` in the log); a sync that turns the open
+issue #1 into a `todo` task of that workstream (and not #3, closed before it was first seen); the
+connection's status, link title and test (with its warning about write rights); and removal. Both
+targets read the recorded fixtures in `apps/mock-hub/fixtures`: the daemon runner passes
+`--integration-fixtures` and puts a stand-in `gh` (printing a synthetic credential) first on the
+daemon's `PATH`. Nothing reaches GitHub or Jira.

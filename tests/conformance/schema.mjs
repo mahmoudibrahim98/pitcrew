@@ -235,6 +235,7 @@ const eventData = {
     status: enumeration('idea', 'active', 'paused', 'shipped', 'dropped'),
     health: enumeration('on_track', 'at_risk', 'blocked'),
   }),
+  workstream_linked: object({ workstream: id, external: list(external) }),
   task_created: object({ task }),
   task_moved: object({
     task: id,
@@ -381,6 +382,42 @@ const block = object({
   tool_receipts: list(receipt),
   turn_receipts: list(receipt),
 });
+const integrationSettings = tagged('kind', {
+  github: object({ repos: list(text), 'api_base?': text }),
+  jira: object({
+    deployment: enumeration('cloud', 'data_center'),
+    site: text,
+    projects: list(text),
+    'email?': text,
+    'epic_link_field?': text,
+  }),
+});
+const syncCounts = object({
+  changes: integer,
+  applied: integer,
+  conflicts: integer,
+  skipped: integer,
+  malformed: integer,
+});
+const integration = object({
+  id,
+  name: text,
+  settings: integrationSettings,
+  credential: object({ source: enumeration('gh_cli', 'stored'), stored: bool }),
+  interval_minutes: integer,
+  added_by: id,
+  added_at: integer,
+  status: object({
+    running: bool,
+    'last_attempt_at?': integer,
+    'last_success_at?': integer,
+    'next_at?': integer,
+    'rate_limited_until?': integer,
+    problems: list(object({ scope: text, message: text })),
+    'last_run?': syncCounts,
+  }),
+  links: list(object({ workstream: id, scope: external, 'title?': text })),
+});
 export const schemas = {
   host: object({
     name: text,
@@ -431,6 +468,13 @@ export const schemas = {
     at_start: bool,
   }),
   setup: object({ workspace, me: member, machine }),
+  integration,
+  integrationCheck: object({
+    ok: bool,
+    at: integer,
+    checks: list(object({ scope: text, ok: bool, message: text })),
+    warnings: list(text),
+  }),
   error: object({
     code: enumeration(
       'unauthorized',

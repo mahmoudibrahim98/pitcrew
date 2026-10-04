@@ -144,6 +144,13 @@ try {
     const standIn = `#!/bin/sh\nwhile [ -d '${state}' ]; do sleep 1; done\n`;
     for (const cli of ['claude', 'codex', 'opencode'])
       await writeFile(join(bin, cli), standIn, { mode: 0o700 });
+    // GitHub integrations read `gh auth token`: a stand-in that prints a synthetic credential,
+    // never the machine's own gh.
+    await writeFile(
+      join(bin, 'gh'),
+      "#!/bin/sh\n[ \"$1 $2\" = 'auth token' ] || exit 2\necho synthetic-conformance-gh-credential\n",
+      { mode: 0o700 },
+    );
     env.PATH = [bin, process.env.PATH].filter(Boolean).join(delimiter);
     const ptydEndpoint = join(temporary, 'ptyd');
     await mkdir(ptydEndpoint, { mode: 0o700 });
@@ -171,6 +178,9 @@ try {
         // A scan holds its machine this long, so scan.test.mjs can show a second one refused.
         '--scan-hold-ms',
         '1500',
+        // Integrations read the mock hub's recorded fixtures, never the network.
+        '--integration-fixtures',
+        join(root, 'apps', 'mock-hub', 'fixtures'),
       ],
       {
         cwd: root,
@@ -201,17 +211,25 @@ try {
     ).trim();
     env.PITCREW_CONFORMANCE_EXPECTED = join(root, 'tests/conformance/daemon-deviations.json');
   }
-  suite = spawn(
-    process.execPath,
-    ['--test', 'tests/conformance/api.test.mjs', 'tests/conformance/scan.test.mjs', 'tests/conformance/files.test.mjs'],
-    {
+  // The integrations' file runs after the others: its syncs append events, which the main suite's
+  // exact-revision checks must not see.
+  for (const files of [
+    ['tests/conformance/api.test.mjs', 'tests/conformance/scan.test.mjs', 'tests/conformance/files.test.mjs'],
+    ['tests/conformance/integrations.test.mjs'],
+  ]) {
+    suite = spawn(process.execPath, ['--test', ...files], {
       cwd: root,
       env,
       stdio: 'inherit',
-    },
-  );
-  const [code] = await once(suite, 'exit');
-  process.exitCode = code ?? 1;
+    });
+    const [code] = await once(suite, 'exit');
+    suite = undefined;
+    if (code !== 0) {
+      process.exitCode = code ?? 1;
+      break;
+    }
+    process.exitCode = 0;
+  }
 } finally {
   await cleanup();
 }
