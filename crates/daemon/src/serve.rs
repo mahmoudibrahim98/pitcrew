@@ -588,7 +588,10 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         ))
         .device(transcripts.routes())
         .device(sessions.routes())
-        .device(pitcrew_hub_work::device_routes().layer(Extension(Arc::clone(&work))));
+        .device(pitcrew_hub_work::device_routes().layer(Extension(Arc::clone(&work))))
+        // Board drafts (api-v1.md, "Board drafts"): the drafting agent's proposal, and the rest.
+        .agent(pitcrew_hub_work::board_agent_routes().layer(Extension(Arc::clone(&work))))
+        .device(pitcrew_hub_work::board_device_routes().layer(Extension(Arc::clone(&work))));
     // The roles and capabilities as they are at each request (the runner may start later).
     let info = Arc::new(HostInfoNow::new(Arc::clone(&attached)));
 

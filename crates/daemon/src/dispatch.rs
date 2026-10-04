@@ -49,7 +49,7 @@ use crate::agents::HubAgents;
 use crate::runner::{Attached, Parts};
 use crate::state::{read_token, write_token};
 use pitcrew_auth::TokenStore;
-use pitcrew_hub_work::{DispatchError, DispatchRequest, Dispatcher, WorkService};
+use pitcrew_hub_work::{DispatchError, DispatchRequest, Dispatcher, SessionRequest, WorkService};
 use pitcrew_protocol::api::{Caller, TokenScope};
 use pitcrew_protocol::events::Event;
 use pitcrew_protocol::ids::{CommandId, MachineId, MemberId, SessionId};
@@ -125,6 +125,27 @@ impl Dispatcher for RunnerLink {
         match runner.commands.run(CommandId::new(), &command) {
             CommandOutcome::Ok { .. } => {
                 tracing::info!(dispatch = %request.dispatch, session = %request.session, "started a dispatched session's CLI");
+                self.attached.started();
+                Ok(())
+            }
+            CommandOutcome::Rejected { reason } => Err(DispatchError::Rejected(reason)),
+            CommandOutcome::Failed { error } => Err(DispatchError::Unavailable(error)),
+        }
+    }
+
+    /// A board draft's session: started as a dispatch's is, under the session the hub stored
+    /// (its agent's token comes from [`AgentEnv`], as for any session stored with an agent).
+    fn start_session(&self, request: &SessionRequest) -> Result<(), DispatchError> {
+        let _starting = self.attached.starting(request.session);
+        let runner = self.runner(&request.machine)?;
+        let folder = folder(&request.cwd).map_err(DispatchError::Rejected)?;
+        let mut command = request.start_command();
+        if let RunnerCommand::StartSession { cwd, .. } = &mut command {
+            *cwd = folder;
+        }
+        match runner.commands.run(CommandId::new(), &command) {
+            CommandOutcome::Ok { .. } => {
+                tracing::info!(session = %request.session, agent = %request.agent, "started a board draft's CLI");
                 self.attached.started();
                 Ok(())
             }

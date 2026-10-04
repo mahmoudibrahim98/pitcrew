@@ -184,6 +184,69 @@ pub trait Dispatcher: Send + Sync + std::fmt::Debug {
     ///
     /// [`DispatchError`]: the machine is unreachable, the runner refused, or the start failed.
     fn start(&self, request: &DispatchRequest) -> std::result::Result<(), DispatchError>;
+
+    /// Starts a session the hub stored for an agent outside a dispatch: a board draft's
+    /// (`crate::board`). Called as [`Dispatcher::start`] is, with the session already stored
+    /// (`starting`, the agent named); on an error the hub ends it. The default refuses, as
+    /// [`DispatchError::Unavailable`].
+    ///
+    /// # Errors
+    ///
+    /// [`DispatchError`]: the machine is unreachable, the runner refused, or the start failed.
+    fn start_session(&self, request: &SessionRequest) -> std::result::Result<(), DispatchError> {
+        let _ = request;
+        Err(DispatchError::Unavailable(
+            "this hub's runner link starts only dispatched sessions".into(),
+        ))
+    }
+}
+
+/// A session the hub stored for an agent outside a dispatch (a board draft's), for
+/// [`Dispatcher::start_session`]. Everything is decided: the runner starts exactly this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRequest {
+    /// The id the session **must** have; the hub has stored it (`starting`).
+    pub session: SessionId,
+    /// The agent it runs as.
+    pub agent: MemberId,
+    /// The agent's owner, whom its events act for.
+    pub owner: Option<MemberId>,
+    /// The machine.
+    pub machine: MachineId,
+    /// The working directory on that machine (`~` for the home directory).
+    pub cwd: String,
+    /// The git branch of the location, when it names one.
+    pub branch: Option<String>,
+    /// The CLI.
+    pub engine: Engine,
+    /// The agent's persona.
+    pub persona: Option<PersonaId>,
+    /// The model, when the persona names one for this CLI.
+    pub model: Option<String>,
+    /// The permission mode.
+    pub permission_mode: PermissionMode,
+    /// The session's name.
+    pub name: String,
+    /// The first prompt.
+    pub brief: String,
+}
+
+impl SessionRequest {
+    /// The runner command that starts it.
+    #[must_use]
+    pub fn start_command(&self) -> RunnerCommand {
+        RunnerCommand::StartSession {
+            engine: self.engine,
+            cwd: self.cwd.clone(),
+            name: self.name.clone(),
+            brief: Some(self.brief.clone()),
+            persona: self.persona,
+            model: self.model.clone(),
+            account: None,
+            permission_mode: self.permission_mode,
+            session: Some(self.session),
+        }
+    }
 }
 
 /// Everything decided under the lock.
@@ -772,7 +835,7 @@ impl WorkService {
 
 /// A person runs only their own agents: `forbidden` unless `caller` owns `agent`. An agent with
 /// no owner is no one's to run.
-fn require_owner(caller: &Caller, agent: &Member) -> Result<()> {
+pub(crate) fn require_owner(caller: &Caller, agent: &Member) -> Result<()> {
     if agent.owner == Some(caller.member) {
         return Ok(());
     }
@@ -789,7 +852,7 @@ pub const NEVER_STARTED: &str = "The session ended before its CLI started.";
 
 /// The answer for a start refused before or by the runner: `503` unavailable, `409` rejected,
 /// `500` failed.
-fn refused(error: &DispatchError) -> WorkError {
+pub(crate) fn refused(error: &DispatchError) -> WorkError {
     match error {
         DispatchError::Unavailable(why) => WorkError::unavailable(format!(
             "The session could not start: the machine cannot be reached ({why})."

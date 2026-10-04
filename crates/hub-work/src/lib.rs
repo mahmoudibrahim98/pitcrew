@@ -9,8 +9,11 @@
 //!   `RouterParts::agent` and `RouterParts::device`;
 //! - three seams for other streams: [`EventRefs`] (the activity reference index, for the API
 //!   layer's `GET /v1/events` filters), [`RecapIndex`] (blocks and day recaps, for the recap
-//!   routes; see [`recap`]) and [`Dispatcher`] (starting dispatched sessions, for the runner
-//!   link);
+//!   routes; see [`recap`]) and [`Dispatcher`] (starting dispatched sessions, and board drafts'
+//!   sessions, for the runner link);
+//! - board drafts: an agent drafts a workstream's board from its history, and nothing is created
+//!   until a person accepts it ([`WorkService::start_draft`]; the routes are
+//!   [`board_agent_routes`] and [`board_device_routes`], mounted apart from the others);
 //! - the back office acting on the hub ([`BackOffice`], [`OfficeCommands`]): its run log is a
 //!   projection ([`projections_with_office`]), and the daemon calls [`WorkService::run_office`]
 //!   after each append to apply what it emitted.
@@ -67,6 +70,8 @@
 #![forbid(unsafe_code)]
 
 mod activity;
+mod board;
+mod board_routes;
 mod codec;
 mod commands;
 mod cursors;
@@ -85,10 +90,11 @@ mod service;
 mod setup;
 
 pub use activity::EventRefs;
+pub use board_routes::{board_agent_routes, board_device_routes};
 pub use commands::{AnswerAsk, BriefEdit, NewAsk, NewComment, SessionLink, WorkstreamPatch};
 pub use dispatch::{
     DispatchError, DispatchRequest, Dispatcher, ENDED_WITHOUT_REPORT, MAX_BRIEF, NEVER_STARTED,
-    NewDispatch, RecordedStart,
+    NewDispatch, RecordedStart, SessionRequest,
 };
 pub use edits::{LABEL_CHARS, MAX_LABELS, TITLE_CHARS};
 pub use error::{INTERNAL_MESSAGE, Result, WorkError};

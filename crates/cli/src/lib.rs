@@ -179,6 +179,9 @@ enum Command {
     },
     /// What needs you: open asks for you, recent mentions, and your own asks.
     Check,
+    /// Board drafts: answer the one you were started for.
+    #[command(subcommand)]
+    Board(BoardCommand),
     /// Send an agent CLI's hook event to the daemon. Always silent; always exits 0.
     Hook {
         /// claude, codex or opencode.
@@ -249,6 +252,22 @@ enum HooksAction {
         #[arg(long)]
         yes: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum BoardCommand {
+    /// Propose the board a draft asks for: JSON on stdin, `{"tasks": [{"title", "status",
+    /// "description", "evidence"}], "note"}`. Nothing is created until a person reviews it.
+    Submit {
+        /// The draft's id (drf_…), as the prompt names it.
+        #[arg(value_parser = draft_arg)]
+        draft: String,
+    },
+}
+
+/// Checks a draft argument before anything is sent (see `verbs::draft_ref`).
+fn draft_arg(value: &str) -> std::result::Result<String, String> {
+    verbs::draft_ref(value).map_err(|e| e.message)
 }
 
 #[derive(Debug, Subcommand)]
@@ -405,6 +424,7 @@ fn execute(command: Command, env: Env<'_>, io: &mut Io<'_>, json: bool) -> Resul
         }),
         Command::Reply { ask, text, option } => verb.reply(&ask, &text, option),
         Command::Check => verb.check(),
+        Command::Board(BoardCommand::Submit { draft }) => verb.board_submit(&draft),
         // Handled in `run`, before the client ever connects.
         Command::Hook { .. } | Command::Hooks(_) => Ok(()),
     }

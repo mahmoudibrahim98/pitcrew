@@ -10,7 +10,8 @@ use crate::error::{Error, Kind, Result};
 use crate::http::encode;
 use crate::plan;
 use crate::{Io, MAX_STDIN};
-use pitcrew_protocol::ids::{AskId, MemberId, TaskId, TaskKey};
+use pitcrew_protocol::board::{BoardDraft, MAX_PROPOSAL_BYTES};
+use pitcrew_protocol::ids::{AskId, DraftId, MemberId, TaskId, TaskKey};
 use pitcrew_protocol::model::{Ask, AskKind, AskState, Member, MemberKind, Task, TaskStatus};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -292,6 +293,45 @@ impl<'io, 'a> Verb<'io, 'a> {
         self.print(&format!(
             "{}: plan updated, {done} of {total} steps done.\n",
             task.key
+        ))
+    }
+
+    /// `board submit <draft>`: the proposal a board draft asks for, as JSON on stdin. Checked
+    /// here for its size and shape (a JSON object) before anything is sent; the daemon checks the
+    /// rest, and creates nothing until a person reviews it.
+    pub(crate) fn board_submit(&mut self, draft: &str) -> Result<()> {
+        if self.io.stdin_is_terminal {
+            return Err(Error::invalid(
+                "pipe the proposal on stdin: {\"tasks\": [{\"title\", \"status\", \"evidence\"}], \"note\"}",
+            ));
+        }
+        let id = draft_ref(draft)?;
+        let text = read_stdin(self.io)?;
+        if text.len() > MAX_PROPOSAL_BYTES {
+            return Err(Error::invalid(format!(
+                "the proposal is {} bytes; at most {MAX_PROPOSAL_BYTES} are accepted",
+                text.len()
+            )));
+        }
+        let body: Value = serde_json::from_str(&text)
+            .map_err(|e| Error::invalid(format!("the proposal is not JSON: {e}")))?;
+        if !body.is_object() {
+            return Err(Error::invalid(
+                "the proposal must be a JSON object: {\"tasks\": [...], \"note\": \"...\"}",
+            ));
+        }
+        let value = self
+            .client
+            .post(&format!("/board-drafts/{}/proposal", encode(&id)), &body)?;
+        if self.json {
+            return self.print_json(&value);
+        }
+        let draft: BoardDraft = from_value(value)?;
+        let count = draft.proposal.as_ref().map_or(0, |p| p.tasks.len());
+        self.print(&format!(
+            "Proposed {count} task{} for {}. Nothing is created until a person reviews it.\n",
+            if count == 1 { "" } else { "s" },
+            draft.id
         ))
     }
 
@@ -586,6 +626,18 @@ pub(crate) fn task_ref(reference: &str) -> Result<String> {
     )))
 }
 
+/// A board draft's id as the daemon takes it: a bare ULID, from `drf_…` or a bare ULID.
+///
+/// # Errors
+/// `invalid` for anything else.
+pub(crate) fn draft_ref(reference: &str) -> Result<String> {
+    reference
+        .trim()
+        .parse::<DraftId>()
+        .map(|id| id.0.to_string())
+        .map_err(|_| Error::invalid(format!("{reference:?} is not a board draft id (drf_…)")))
+}
+
 fn task_path(reference: &str, rest: &str) -> Result<String> {
     Ok(format!("/tasks/{}{rest}", encode(&task_ref(reference)?)))
 }
@@ -703,6 +755,16 @@ mod tests {
             let err = task_ref(bad).unwrap_err();
             assert_eq!(err.kind, Kind::Invalid, "{bad:?}");
             assert!(task_path(bad, "/move").is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn draft_refs_are_ids_only() {
+        let bare = "01J00000000000000000000000";
+        assert_eq!(draft_ref(bare).unwrap(), bare);
+        assert_eq!(draft_ref(&format!(" drf_{bare} ")).unwrap(), bare);
+        for bad in ["", "..", "PAP-1", "drf_", "tsk_01J0", "drf_01J0000000000000000000000/x"] {
+            assert!(draft_ref(bad).is_err(), "{bad}");
         }
     }
 
