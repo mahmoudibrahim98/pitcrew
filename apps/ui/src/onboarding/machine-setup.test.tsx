@@ -3,21 +3,25 @@
 // Machine setup in the real `OnboardingApi` (api-v1.md, "Machine setup"), against a stand-in hub:
 // the check and its rows (only the contract's, cut to a line), a fix that only opens the tool's
 // install page from this app's own table and asks again (nothing installed, never a URL from the
-// hub), the accounts, and a sign-in whose terminal the console's view would show; installing the
-// helper on a remote machine through the gateway, only a plan the person reviewed; and the first
-// run through Machine check and Sign in.
+// hub), the accounts, and a sign-in whose terminal the console's view would show and which the
+// panel stops when it closes; a machine that is checked as it is connected saying so; no install
+// step in the first run (the connect wizard installs from a reviewed plan); and the first run
+// through Machine check and Sign in.
 
-import { cleanup, fireEvent, screen, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { RemoteGateway, RemoteProgress, Transport, TransportResponse } from '../data/index.ts';
-import type { InstallProgressEvent } from './api.ts';
-import { createHubOnboardingApi } from './hub-api.ts';
+import type { RemoteGateway, Transport, TransportResponse } from '../data/index.ts';
+import type { OnboardingApi } from './api.ts';
+import { OnboardingApiProvider } from './api-context.tsx';
+import { CHECKED_WHEN_CONNECTED, createHubOnboardingApi } from './hub-api.ts';
 import { INSTALL_PAGES } from './install-pages.ts';
-import { installLine } from './install-log.ts';
-import { toAccounts, toCheckRows, toSignIn } from './machine-wire.ts';
+import { line, toAccounts, toCheckRows, toSignIn } from './machine-wire.ts';
+import { SignInPanel } from './sign-in-panel.tsx';
 import { SignInTerminalProvider } from './sign-in-terminal.tsx';
+import { MachineCheckStep } from './steps/machine-check-step.tsx';
 import { stepsFor } from './steps.ts';
 import { renderWizard } from './test-support.tsx';
+import { WizardProvider } from './wizard-context.tsx';
 
 afterEach(() => {
   cleanup();
@@ -90,6 +94,19 @@ describe('machine setup on the wire', () => {
     expect(() => toCheckRows({ rows: 'nope' })).toThrow();
   });
 
+  it('drops hidden and direction-changing characters, as the hub’s own check does', () => {
+    // U+202E would show "2.1.3" as something else; zero-width and tag characters hide text.
+    expect(line('claude \u202Egnp.lave\u202C 2.1.3')).toBe('claude gnp.lave 2.1.3');
+    expect(line('git\u200B version\uFEFF 2.43.0\u2066\u2069')).toBe('git version 2.43.0');
+    expect(line('gh\u{E0041}\u{E0042} 2.45.0\u00AD')).toBe('gh 2.45.0');
+    // A line separator is a space, not words run together.
+    expect(line('one\u2028two\u2029three')).toBe('one two three');
+    const [row] = toCheckRows({ rows: [{ id: 'cli_codex', status: 'ok', detail: 'codex-cli \u202E0.50.0' }] });
+    expect(row?.detail).toBe('codex-cli 0.50.0');
+    const [account] = toAccounts([{ engine: 'claude', installed: true, signed_in: true, account: 'sam\u200D@example.com' }]);
+    expect(account?.account).toBe('sam@example.com');
+  });
+
   it('reads accounts and sign-ins as the contract has them', () => {
     expect(
       toAccounts([
@@ -112,12 +129,24 @@ describe('machine setup through the hub', () => {
   it('is there once the hub api has a transport, without an install step for the hub’s own machine', () => {
     const { transport } = standInHub();
     const api = createHubOnboardingApi({ transport });
-    for (const call of ['checkMachine', 'fixMachineRow', 'agentAccounts', 'startSignIn', 'signInRunning'] as const) {
+    for (const call of ['checkMachine', 'fixMachineRow', 'agentAccounts', 'startSignIn', 'signInRunning', 'stopSignIn'] as const) {
       expect(api.unavailable.has(call)).toBe(false);
     }
     expect(api.needsHelper({ kind: 'local' })).toBe(false);
     expect(api.needsHelper({ kind: 'ssh', host: 'hpc-login' })).toBe(true);
     expect(stepsFor(api).map((s) => s.id)).toEqual(['welcome', 'machine-check', 'sign-in', 'import', 'done']);
+  });
+
+  it('says a machine that is not the hub’s own is checked as it is connected, asking nothing', async () => {
+    const hub = standInHub();
+    const api = createHubOnboardingApi({ transport: hub.transport });
+    for (const machine of [
+      { kind: 'ssh', host: 'hpc-login' },
+      { kind: 'wsl', distro: 'Ubuntu' },
+    ] as const) {
+      expect(await api.checkMachine(machine)).toEqual({ machine, rows: [], deferred: CHECKED_WHEN_CONNECTED });
+    }
+    expect(hub.sent).toEqual([]);
   });
 
   it('checks the hub’s own machine', async () => {
@@ -129,7 +158,6 @@ describe('machine setup through the hub', () => {
       ['cli-opencode', 'missing', 'install-page'],
       ['disk', 'warn', undefined],
     ]);
-    await expect(api.checkMachine({ kind: 'ssh', host: 'hpc-login' })).rejects.toThrow('its own workspace');
   });
 
   it('fixes only by opening the tool’s install page, from the app’s own table, and asks again', async () => {
@@ -191,6 +219,104 @@ describe('machine setup through the hub', () => {
     expect(await api.signInRunning('claude', { kind: 'local' })).toBe(false);
     await expect(api.startSignIn('claude', { kind: 'local' })).rejects.toThrow('No route');
   });
+
+  it('stops a sign-in: gone, or none there, both resolve', async () => {
+    let status = 204;
+    const hub = standInHub({
+      [`DELETE /v1/machines/${LAPTOP}/agents/codex/sign-in`]: () =>
+        status === 204 ? { status, body: '' } : json({ code: 'forbidden', message: 'Only the person who set this hub up…' }, status),
+    });
+    const api = createHubOnboardingApi({ transport: hub.transport });
+    await api.stopSignIn('codex', { kind: 'local' });
+    expect(hub.sent.filter((r) => r.method === 'DELETE').map((r) => r.path)).toEqual([
+      `/v1/machines/${LAPTOP}/agents/codex/sign-in`,
+    ]);
+    await api.stopSignIn('claude', { kind: 'local' });
+    status = 403;
+    await expect(api.stopSignIn('codex', { kind: 'local' })).rejects.toThrow('Only the person who set this hub up');
+  });
+});
+
+/** An `OnboardingApi` for the sign-in panel alone: every sign-in it starts, and every stop. */
+function panelApi() {
+  const stopped: string[] = [];
+  const started: string[] = [];
+  const api = {
+    agentAccounts: () =>
+      Promise.resolve([
+        { engine: 'claude' as const, installed: true, signedIn: false },
+        { engine: 'codex' as const, installed: true, signedIn: false },
+      ]),
+    startSignIn: (engine: 'claude' | 'codex' | 'opencode') => {
+      started.push(engine);
+      return Promise.resolve({ terminalSessionId: `${TERMINAL.slice(0, -1)}${started.length}`, command: [engine, 'login'] });
+    },
+    signInRunning: () => Promise.resolve(true),
+    stopSignIn: (engine: 'claude' | 'codex' | 'opencode') => {
+      stopped.push(engine);
+      return Promise.resolve();
+    },
+  } satisfies Pick<OnboardingApi, 'agentAccounts' | 'startSignIn' | 'signInRunning' | 'stopSignIn'>;
+  return { api, stopped, started };
+}
+
+describe('the sign-in panel', () => {
+  it('stops a login still running when it closes, and one another CLI’s replaces', async () => {
+    const { api, stopped, started } = panelApi();
+    const { unmount } = render(
+      <SignInTerminalProvider render={({ terminal }) => <p>Terminal {terminal}</p>}>
+        <SignInPanel api={api} target={{ kind: 'local' }} />
+      </SignInTerminalProvider>,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Sign in to Claude Code' }));
+    await screen.findByText(/Terminal .*1$/);
+    expect(stopped).toEqual([]);
+    // Codex's sign-in in its place: Claude Code's login, unfinished, stops.
+    fireEvent.click(screen.getByRole('button', { name: 'Sign in to Codex' }));
+    await screen.findByText(/Terminal .*2$/);
+    expect(started).toEqual(['claude', 'codex']);
+    expect(stopped).toEqual(['claude']);
+    // The person goes on: Codex's login, still running, stops with the panel.
+    act(() => unmount());
+    expect(stopped).toEqual(['claude', 'codex']);
+  });
+
+  it('leaves a login that has ended alone', async () => {
+    const { api, stopped } = panelApi();
+    let running = true;
+    const ended = { ...api, signInRunning: () => Promise.resolve(running) };
+    const { unmount } = render(
+      <SignInTerminalProvider render={({ terminal }) => <p>Terminal {terminal}</p>}>
+        <SignInPanel api={ended} target={{ kind: 'local' }} />
+      </SignInTerminalProvider>,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'Sign in to Claude Code' }));
+    await screen.findByText(/Terminal /);
+    running = false;
+    await screen.findByText(/the login has ended/, undefined, { timeout: 6000 });
+    act(() => unmount());
+    expect(stopped).toEqual([]);
+  });
+});
+
+describe('the machine check step', () => {
+  it('shows a machine checked as it is connected as a note, not an error', async () => {
+    const api = {
+      ...createHubOnboardingApi({ transport: standInHub().transport }),
+      checkMachine: () => Promise.resolve({ machine: { kind: 'local' as const }, rows: [], deferred: CHECKED_WHEN_CONNECTED }),
+    };
+    render(
+      <OnboardingApiProvider api={api}>
+        <WizardProvider>
+          <MachineCheckStep />
+        </WizardProvider>
+      </OnboardingApiProvider>,
+    );
+    expect(await screen.findByText(CHECKED_WHEN_CONNECTED)).toBeTruthy();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Check again' })).toBeNull();
+    expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(false);
+  });
 });
 
 /** A gateway whose remote commands this test answers. */
@@ -211,68 +337,25 @@ function gateway(overrides: Partial<RemoteGateway>): RemoteGateway {
   };
 }
 
-describe('installing the helper on a remote machine', () => {
-  it('offers the launchers the probe found', async () => {
-    const api = createHubOnboardingApi({
-      remote: gateway({
-        remoteProbe: () =>
-          Promise.resolve({ host: 'hpc-login', os: 'linux', arch: 'x86_64', tmux: { version: '3.0a' }, slurm: { version: 'slurm 23.02.7', srunOverlap: true } }),
-      }),
-    });
-    const options = await api.launcherOptions({ kind: 'ssh', host: 'hpc-login' });
-    expect(options).toEqual([
-      { launcher: 'direct', recommended: false },
-      { launcher: 'tmux', recommended: false, unavailable: 'tmux 3.0a is older than 3.2' },
-      { launcher: 'systemd-user', recommended: false, unavailable: 'Not offered yet' },
-      { launcher: 'slurm', recommended: true },
-    ]);
-    await expect(api.launcherOptions({ kind: 'local' })).rejects.toThrow('needs no helper');
-  });
-
-  it('installs nothing unseen: only a plan the person reviewed, its progress as lines', async () => {
+describe('installing the helper', () => {
+  it('is no step of the first run: the connect wizard installs from a plan the person reviewed', async () => {
     const added: string[] = [];
-    let finish: (() => void) | undefined;
-    const cancelled: string[] = [];
-    const progress: RemoteProgress[] = [
-      { step: 'Copy pitcrewd 0.1.0 to ~/.pitcrew', state: 'running', detail: 'uploading' },
-      { step: 'Copy pitcrewd 0.1.0 to ~/.pitcrew', state: 'running', detail: '40% sent' },
-      { step: 'Copy pitcrewd 0.1.0 to ~/.pitcrew', state: 'done' },
-      { step: 'add', state: 'done' },
-    ];
-    const api = createHubOnboardingApi({
-      remote: gateway({
-        remoteAdd: (plan, onProgress) => {
-          added.push(plan);
-          for (const p of progress) onProgress(p);
-          return new Promise((resolve) => {
-            finish = () => resolve({ id: 'ws-remote', name: 'hpc-login', kind: 'remote', state: 'ready' });
-          });
-        },
-        remoteCancel: (plan) => {
-          cancelled.push(plan);
-          return Promise.resolve();
-        },
-      }),
+    const remote = gateway({
+      remoteAdd: (plan) => {
+        added.push(plan);
+        return Promise.reject(new Error('not in this test'));
+      },
     });
-    const events: InstallProgressEvent[] = [];
-    api.streamInstallHelper({ machine: { kind: 'ssh', host: 'hpc-login' }, launcher: 'slurm' }, (e) => events.push(e));
-    expect(events).toEqual([{ type: 'error', message: 'Review what will be installed first: nothing is installed unseen.' }]);
+    const api = createHubOnboardingApi({ transport: standInHub().transport, remote });
+    expect(api.unavailable.has('launcherOptions')).toBe(true);
+    expect(api.unavailable.has('streamInstallHelper')).toBe(true);
+    // Not even for a machine that needs the helper.
+    expect(stepsFor(api, { kind: 'ssh', host: 'hpc-login' }).map((s) => s.id)).not.toContain('install-helper');
+    await expect(api.launcherOptions({ kind: 'ssh', host: 'hpc-login' })).rejects.toThrow('not available');
+    expect(() =>
+      api.streamInstallHelper({ machine: { kind: 'ssh', host: 'hpc-login' }, launcher: 'tmux', plan: 'plan-1' }, () => undefined),
+    ).toThrow('not available');
     expect(added).toEqual([]);
-
-    events.length = 0;
-    const streamed = api.streamInstallHelper(
-      { machine: { kind: 'ssh', host: 'hpc-login' }, launcher: 'tmux', plan: 'plan-1' },
-      (e) => events.push(e),
-    );
-    expect(added).toEqual(['plan-1']);
-    finish?.();
-    await vi.waitFor(() => expect(events.at(-1)).toEqual({ type: 'done' }));
-    expect(events.slice(0, -1)).toEqual(progress.map((p) => ({ type: 'log', line: installLine(p) })));
-    const [, sent, , whole] = progress;
-    expect(sent === undefined ? '' : installLine(sent)).toBe('Copy pitcrewd 0.1.0 to ~/.pitcrew: 40% sent');
-    expect(whole === undefined ? '' : installLine(whole)).toBe('Connected.');
-    streamed.cancel();
-    expect(cancelled).toEqual(['plan-1']);
   });
 });
 

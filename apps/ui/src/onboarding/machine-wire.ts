@@ -82,10 +82,43 @@ function isControl(char: string): boolean {
   return code < 0x20 || (code >= 0x7f && code <= 0x9f) || code === 0x2028 || code === 0x2029;
 }
 
-/** One plain line: control characters and line breaks made spaces, at most `MAX_TEXT` characters. */
+/**
+ * Characters that change how a line reads without being seen: direction marks, embeddings,
+ * overrides (U+202E) and isolates, zero-width characters, fillers, variation selectors and tag
+ * characters. The same table as `pitcrew_protocol::text::is_hidden`, which the hub's own check
+ * (`clean`) applies (T92); the line and paragraph separators, also in it, are spaces here.
+ */
+const HIDDEN: readonly (readonly [number, number])[] = [
+  [0x00ad, 0x00ad],
+  [0x034f, 0x034f],
+  [0x061c, 0x061c],
+  [0x115f, 0x1160],
+  [0x180e, 0x180e],
+  [0x200b, 0x200f],
+  [0x202a, 0x202e],
+  [0x2060, 0x2064],
+  [0x2066, 0x2069],
+  [0x3164, 0x3164],
+  [0xfe00, 0xfe0f],
+  [0xfeff, 0xfeff],
+  [0xffa0, 0xffa0],
+  [0xfff9, 0xfffb],
+  [0xe0000, 0xe007f],
+  [0xe0100, 0xe01ef],
+];
+
+function isHidden(char: string): boolean {
+  const code = char.codePointAt(0) ?? 0;
+  return HIDDEN.some(([from, to]) => code >= from && code <= to);
+}
+
+/**
+ * One plain line: control characters and line breaks made spaces, hidden characters dropped, at
+ * most `MAX_TEXT` characters. A remote hub or machine is another machine's word (T92).
+ */
 export function line(text: string): string {
   const plain = [...text]
-    .map((char) => (isControl(char) ? ' ' : char))
+    .map((char) => (isControl(char) ? ' ' : isHidden(char) ? '' : char))
     .join('')
     .replace(/\s+/g, ' ')
     .trim();

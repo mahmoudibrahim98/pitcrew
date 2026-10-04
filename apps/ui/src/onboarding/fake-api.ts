@@ -160,6 +160,8 @@ export function createFakeOnboardingApi(options: FakeOnboardingApiOptions = {}):
   ]);
   /** Sign-ins whose "login" still runs, by engine: each ends a moment after it starts. */
   const running = new Set<string>();
+  /** Each running sign-in's end, which `stopSignIn` calls off. */
+  const endings = new Map<string, ReturnType<typeof setTimeout>>();
   const integrations = new Map<string, IntegrationStatus>([
     ['github', { id: 'github', connected: true, detail: 'sam' }],
     ['jira', { id: 'jira', connected: false }],
@@ -282,11 +284,16 @@ export function createFakeOnboardingApi(options: FakeOnboardingApiOptions = {}):
       // A real sign-in completes when the CLI's own login exits; the fake's "login" ends a moment
       // after it starts, and its CLI then says it is signed in.
       running.add(engine);
-      setTimeout(() => {
-        running.delete(engine);
-        const current = accounts.get(engine);
-        if (current !== undefined) accounts.set(engine, { ...current, signedIn: true, account: `${engine}@example.com` });
-      }, delay(600));
+      clearTimeout(endings.get(engine));
+      endings.set(
+        engine,
+        setTimeout(() => {
+          running.delete(engine);
+          endings.delete(engine);
+          const current = accounts.get(engine);
+          if (current !== undefined) accounts.set(engine, { ...current, signedIn: true, account: `${engine}@example.com` });
+        }, delay(600)),
+      );
       const command = { claude: ['claude', 'auth', 'login'], codex: ['codex', 'login'], opencode: ['opencode', 'auth', 'login'] };
       return { terminalSessionId: id, command: command[engine] };
     },
@@ -294,6 +301,14 @@ export function createFakeOnboardingApi(options: FakeOnboardingApiOptions = {}):
     async signInRunning(engine): Promise<boolean> {
       await wait(delay(50));
       return running.has(engine);
+    },
+
+    async stopSignIn(engine): Promise<void> {
+      // Left before it finished: it ends now, and the CLI is not signed in.
+      clearTimeout(endings.get(engine));
+      endings.delete(engine);
+      running.delete(engine);
+      await wait(delay(20));
     },
 
     async integrationStatus(): Promise<IntegrationStatus[]> {

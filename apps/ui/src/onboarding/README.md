@@ -7,12 +7,12 @@ The first-run wizard, and connecting a remote machine in the desktop app. See
 | File | What |
 |---|---|
 | `api.ts` | The `OnboardingApi` contract (below): every call the first-run wizard makes, typed, with `unavailable` (the calls with no backend yet) and `SetupRefused` (why setup was refused, by field). |
-| `hub-api.ts` | `createHubOnboardingApi({ setUp, remote, data, transport, openPage })`: the real one. `setupWorkspace` is `POST /v1/setup` (the data layer's `setUp`, through the workspace's own transport); `discoverHosts` is the gateway's `sshHosts`; machine setup (`checkMachine`, `fixMachineRow`, `agentAccounts`, `startSignIn`, `signInRunning`) is api-v1.md's "Machine setup" on the hub's own machine, through `transport`; `launcherOptions` and `streamInstallHelper` are the gateway's probe and the add of a reviewed plan, for a machine that needs the helper (`needsHelper`); `streamScan` and `createFromScan` are the scan and creating from it, through the workspace's client (`data`, `useApi()`; without it, unavailable); the import is `transport`'s; every other call is unavailable. |
-| `machine-wire.ts` | Machine setup on the wire (`pitcrew_protocol::machine_setup`, snake_case) and its checked mapping to this feature's types: rows with unknown ids, statuses or fixes are dropped, text is cut to a line. |
+| `hub-api.ts` | `createHubOnboardingApi({ setUp, remote, data, transport, openPage })`: the real one. `setupWorkspace` is `POST /v1/setup` (the data layer's `setUp`, through the workspace's own transport); `discoverHosts` is the gateway's `sshHosts`; machine setup (`checkMachine`, `fixMachineRow`, `agentAccounts`, `startSignIn`, `signInRunning`, `stopSignIn`) is api-v1.md's "Machine setup" on the hub's own machine, through `transport` (another machine's check is `deferred`: it is checked as it is connected); `launcherOptions` and `streamInstallHelper` are unavailable (the connect wizard installs the helper from a plan the person reviewed); `streamScan` and `createFromScan` are the scan and creating from it, through the workspace's client (`data`, `useApi()`; without it, unavailable); the import is `transport`'s; every other call is unavailable. |
+| `machine-wire.ts` | Machine setup on the wire (`pitcrew_protocol::machine_setup`, snake_case) and its checked mapping to this feature's types: rows with unknown ids, statuses or fixes are dropped, text is cut to a line with control characters made spaces and hidden ones (direction overrides such as U+202E, zero-width and tag characters: `pitcrew_protocol::text::is_hidden`'s table) dropped. |
 | `install-pages.ts` | Each check row's install page: the only place a fix's URL comes from (the hub and a remote machine only say *that* a row has one). |
 | `install-log.ts` | The live install log: one line per progress message of the gateway's add. |
 | `check-rows.tsx` | `CheckRowLine` (a check row, its status and reason) and `InstallPageNote` (where to install a tool from, with "Copy link"). |
-| `sign-in-panel.tsx` | `SignInPanel`: each agent CLI's account and "Sign in", the CLI's own login in a terminal (`sign-in-terminal.tsx`, the console's `TerminalView`), and asking the CLIs again once it ends. Used by the first run and the connect wizard. |
+| `sign-in-panel.tsx` | `SignInPanel`: each agent CLI's account and "Sign in", the CLI's own login in a terminal (`sign-in-terminal.tsx`, the console's `TerminalView`), and asking the CLIs again once it ends. A login still running when the panel closes, or when another CLI's sign-in replaces it, is stopped (`stopSignIn`). Used by the first run and the connect wizard. |
 | `scan-wire.ts` | The scan on the wire (`ScanFrame`, `ScanReport`, snake_case, as `pitcrew_protocol::scan` has them), `parseScanFrames` for its newline-delimited answer, and `toScanResult`, the mapping to this feature's `ScanResult` (camelCase, `byEngine` as a record). |
 | `project-key.ts` | `projectKeyFor(name, taken)`: a new project's key from its name, unique in the workspace (see "Creating from the scan"). |
 | `fake-api.ts` | `createFakeOnboardingApi()`: an in-memory implementation of every call that behaves plausibly (streamed progress, a fixable row, synthetic scan suggestions), refusing a bad setup as the hub would. For tests and a development flag only (below). |
@@ -56,16 +56,21 @@ Machine check, Sign in, Scan, Create, Import, Done**, then Home:
   needing attention or missing, with why. **PitCrew installs nothing**: a missing tool's
   "Install…" asks the row again and shows where to install it from (`install-pages.ts`, with "Copy
   link"; in a browser it also opens that page in a new tab, the desktop app opens no window), and
-  "Check again" asks the machine afresh. A check that fails says why, with "Check again".
+  "Check again" asks the machine afresh. A check that fails says why, with "Check again". Another
+  machine (an SSH host, a WSL distro, an HPC login node) is not checked here: the step says it is
+  "checked when you connect it" (`deferred`), which the connect wizard does over SSH.
 - **Sign in** lists each CLI's account as the CLI's own status command reports it (`GET
   /v1/machines/{id}/agents`: signed in, not, not installed, or "could not tell" with why). "Sign
   in" (and, for Codex, "With a code", `codex login --device-auth`, for a machine the browser cannot
   reach back to) runs the CLI's own login in a terminal on the machine (`POST …/agents/{engine}/
   sign-in`), shown below in the console's terminal view: the person takes control and answers it.
   PitCrew never reads the login. The step asks every two seconds whether it has ended (`GET
-  …/sign-in`), then asks the CLIs again. Skippable.
+  …/sign-in`), then asks the CLIs again. Leaving the step (or skipping it) while a login still
+  runs stops it (`DELETE …/sign-in`). Skippable.
 - **No install step** in the first run: the hub's own machine runs the hub, so it needs no helper
-  (`needsHelper`). Installing it on another machine is the connect wizard's (below).
+  (`needsHelper`), and the real API has no install without a plan the person reviewed
+  (`launcherOptions` and `streamInstallHelper` are unavailable). Installing it on another machine
+  is the connect wizard's (below).
 - **Scan** is `POST /v1/machines/{id}/scan` on the hub's own machine (the first `local` one in
   `GET /v1/machines`): what agent sessions it has, counted by engine and folder, and the projects
   and workstreams they suggest. A refusal (a scan already running, the hub out of reach) says why,
@@ -162,7 +167,9 @@ before any workspace exists. It drives the gateway's remote commands:
    the workspace later leads to its first run.
 7. **Sign in**: the new workspace's `SignInPanel`, through its own gateway transport (in its data
    scope): each agent CLI's account on the remote machine, and its own login in a terminal there.
-   Skippable.
+   With SLURM the helper runs as a job, so the logins run on its compute node, not on the login
+   node: the panel names the new hub's own machine, and warns that compute nodes often have no
+   internet. Skippable.
 8. **Done**: opens the new workspace.
 
 **A plan is never submitted without being shown.** Connect sends the plan on screen. When the
@@ -178,7 +185,7 @@ answer for a step already left is dropped.
 ## The `OnboardingApi` contract
 
 `setupWorkspace`, `discoverHosts`, the machine check and its fixes, the accounts and sign-in,
-the launchers and the helper install, `streamScan`, `createFromScan` and the import are real.
+`streamScan`, `createFromScan` and the import are real.
 Everything else is this stream's proposal for what the real routes should look like (`api-v1.md`
 has no hooks or safety routes yet); `fake-api.ts` is their only implementation. Types are in `api.ts`, reusing `Engine`, `Project`, `Workstream` etc. from
 `src/data`; the scan's wire types, which the data layer does not declare, are in `scan-wire.ts`.
@@ -188,13 +195,14 @@ has no hooks or safety routes yet); `fake-api.ts` is their only implementation. 
 | `unavailable` | `ReadonlySet<OnboardingCall>` | The calls with no backend: they reject, and their steps are left out. Empty in the fake. |
 | `discoverHosts()` | `() → DiscoveredHost[]` | **Real** in the desktop: the gateway's `sshHosts`, as `{ kind: 'ssh', id }`. The fake adds WSL distros. |
 | `setupWorkspace(input)` | `{ workspaceName, person: { name, handle }, machineName } → { workspace, me }` | **Real**: `POST /v1/setup`. Rejects with `SetupRefused` (`field`, or `alreadySetUp`). |
-| `checkMachine(target)` | `MachineTarget → MachineCheckResult` | **Real**: `GET /v1/machines/{id}/check` on the hub's own machine (`local`). CLI versions, tmux, git, gh, disk, and SLURM where it is there. Each row: `status`, `detail`, `fixable`, `fix`. |
+| `checkMachine(target)` | `MachineTarget → MachineCheckResult` | **Real**: `GET /v1/machines/{id}/check` on the hub's own machine (`local`). CLI versions, tmux, git, gh, disk, and SLURM where it is there. Each row: `status`, `detail`, `fixable`, `fix`. Another machine resolves with no rows and `deferred` (checked when it is connected), asking nothing. |
 | `fixMachineRow(target, row)` | `(MachineTarget, CheckRowId) → MachineCheckRow` | **Real**: asks the row again (`?row=`); for `install-page`, opens the tool's page from `install-pages.ts` (in a browser). Installs nothing. Rejects for a row PitCrew cannot fix. |
-| `launcherOptions(target)` | `MachineTarget → LauncherOption[]` | **Real** for an SSH host or WSL distro: the gateway's probe. Rejects for the hub's own machine. |
-| `streamInstallHelper(options, onEvent)` | `(InstallHelperOptions, cb) → Streamed` | **Real** for an SSH host or WSL distro, with `options.plan` (a plan the person reviewed: without one it ends in `error`, nothing installed): the gateway's add, each progress message a `log` line, then `done` or `error`. `cancel()` cancels the add on the gateway. The fake streams a canned log, with a SLURM `script-preview` first. |
+| `launcherOptions(target)` | `MachineTarget → LauncherOption[]` | Unavailable in the real API (the connect wizard probes and plans through the gateway itself). The fake offers all four. |
+| `streamInstallHelper(options, onEvent)` | `(InstallHelperOptions, cb) → Streamed` | Unavailable in the real API: installing needs a plan the person reviewed (and for SLURM, the job script shown), which the connect wizard makes and adds through the gateway itself. The fake streams a canned log, with a SLURM `script-preview` first. |
 | `agentAccounts()` | `() → AgentAccount[]` | **Real**: `GET /v1/machines/{id}/agents`. One row per engine: `installed`, `signedIn` (`undefined` when the CLI could not tell), `account`, `detail`. |
 | `startSignIn(engine, machine, method?)` | `(Engine, MachineTarget, SignInMethod?) → { terminalSessionId, command }` | **Real**: `POST /v1/machines/{id}/agents/{engine}/sign-in`. Runs the CLI's own login in a terminal on that machine (ADR-0010: PitCrew never reads its tokens); `terminalSessionId` opens in the console's terminal view. |
 | `signInRunning(engine, machine)` | `(Engine, MachineTarget) → boolean` | **Real**: `GET …/sign-in`'s `running` (`false` when there is none). |
+| `stopSignIn(engine, machine)` | `(Engine, MachineTarget) → void` | **Real**: `DELETE …/sign-in` (`204`, or `404` when there is none: both resolve). `SignInPanel` calls it when it closes, or when another CLI's sign-in replaces one, while that login still runs. |
 | `needsHelper(target)` | `MachineTarget → boolean` | Whether `target` needs PitCrew's helper installed: not the hub's own machine. `stepsFor` drops the install step otherwise. The fake says yes everywhere. |
 | `integrationStatus()` | `() → IntegrationStatus[]` | Proposed. Stream G owns the real connections. |
 | `streamScan(target, onEvent)` | `(ScanTarget, cb) → Streamed` | **Real**: `POST /v1/machines/{id}/scan` on the hub's own machine. Streams `progress`, ends with `done` carrying counts and suggested projects/workstreams, or `error` with why. |

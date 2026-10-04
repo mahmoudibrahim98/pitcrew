@@ -2,15 +2,17 @@
 // - `setupWorkspace` is `POST /v1/setup`, through the data layer's `setUp` for the workspace in
 //   view (so its cache knows at once that it is set up);
 // - `discoverHosts` is the gateway's `sshHosts`, in the desktop app;
-// - `checkMachine`, `fixMachineRow`, `agentAccounts`, `startSignIn` and `signInRunning` are
-//   machine setup's routes on the hub's own machine (api-v1.md, "Machine setup"), through the
-//   workspace's transport (a remote workspace's goes through the gateway to its hub). A fix only
-//   opens the tool's install page, from this app's own table (`install-pages.ts`), and checks the
-//   row again: nothing is installed;
-// - `launcherOptions` and `streamInstallHelper` are for a machine that needs PitCrew's helper (an
-//   SSH host or a WSL distro, `needsHelper`), through the gateway: the probe, and the add of a
-//   plan the person reviewed, its progress as log lines. The hub's own machine needs none (it runs
-//   the hub), so the first run has no install step;
+// - `checkMachine`, `fixMachineRow`, `agentAccounts`, `startSignIn`, `signInRunning` and
+//   `stopSignIn` are machine setup's routes on the hub's own machine (api-v1.md, "Machine setup"),
+//   through the workspace's transport (a remote workspace's goes through the gateway to its hub).
+//   A fix only opens the tool's install page, from this app's own table (`install-pages.ts`), and
+//   checks the row again: nothing is installed. Another machine (an SSH host, a WSL distro, an HPC
+//   login node) is checked when it is connected, by the connect wizard over SSH: its check here
+//   says so (`deferred`) rather than failing;
+// - `launcherOptions` and `streamInstallHelper` have no backend here: installing the helper needs a
+//   plan the person reviewed (the gateway's plan and add, with the SLURM script shown), which the
+//   connect wizard makes itself, and the first run's machine is the hub's own, which needs none.
+//   So the first run never offers its install step;
 // - `streamScan` is `POST /v1/machines/{id}/scan` on the hub's own machine, and `createFromScan`
 //   is `POST /v1/projects` and `POST /v1/workstreams` from that scan's suggestions, both through
 //   the data layer's client for the workspace in view;
@@ -30,7 +32,6 @@ import {
   type Location,
   type Project,
   type RemoteGateway,
-  type RemoteProbe,
   type Setup,
   type SetupResult,
   type TransportResponse,
@@ -41,9 +42,6 @@ import {
   SetupRefused,
   type CheckRowId,
   type CreateFromScanResult,
-  type InstallHelperOptions,
-  type InstallProgressEvent,
-  type LauncherOption,
   type MachineTarget,
   type OnboardingApi,
   type OnboardingCall,
@@ -53,7 +51,6 @@ import {
   type SignInMethod,
   type Streamed,
 } from './api.ts';
-import { installLine } from './install-log.ts';
 import { installPage } from './install-pages.ts';
 import { toAccounts, toCheckRows, toSignIn, toStartSignInResult, wireItem } from './machine-wire.ts';
 import { projectKeyFor } from './project-key.ts';
@@ -66,7 +63,15 @@ import {
 } from './scan-wire.ts';
 import { fieldOfMessage } from './validation.ts';
 
-const NOT_YET: readonly OnboardingCall[] = ['integrationStatus', 'hooksDiff', 'installHooks', 'saveSafety'];
+const NOT_YET: readonly OnboardingCall[] = [
+  'integrationStatus',
+  'hooksDiff',
+  'installHooks',
+  'saveSafety',
+  // The connect wizard installs the helper itself, from a plan the person reviewed.
+  'launcherOptions',
+  'streamInstallHelper',
+];
 
 /** The calls that need the workspace's transport: machine setup's routes. */
 const MACHINE_SETUP: readonly OnboardingCall[] = [
@@ -75,10 +80,12 @@ const MACHINE_SETUP: readonly OnboardingCall[] = [
   'agentAccounts',
   'startSignIn',
   'signInRunning',
+  'stopSignIn',
 ];
 
-/** The calls that need the desktop gateway's remote commands. */
-const HELPER_INSTALL: readonly OnboardingCall[] = ['launcherOptions', 'streamInstallHelper'];
+/** What a machine that is not the hub's own shows in place of its check: it is checked later. */
+export const CHECKED_WHEN_CONNECTED =
+  'Checked when you connect it: PitCrew checks this machine over SSH while connecting it, before anything is installed there.';
 
 /** What the scan and create steps use of the data layer's client (`useApi()`). */
 export type HubData = Pick<Api, 'transport' | 'machines' | 'projects' | 'createProject' | 'createWorkstream'>;
@@ -172,23 +179,6 @@ function onlyHubMachine(target: MachineTarget): void {
   }
 }
 
-/** The launchers a remote machine offers, from the gateway's probe. */
-function launchersFrom(probe: RemoteProbe): LauncherOption[] {
-  const tmux = probe.tmux?.version;
-  const match = tmux === undefined ? null : /(\d+)\.(\d+)/.exec(tmux);
-  const tmuxUsable = match === null ? undefined : Number(match[1]) > 3 || (Number(match[1]) === 3 && Number(match[2]) >= 2);
-  return [
-    { launcher: 'direct', recommended: tmuxUsable !== true && probe.slurm === undefined },
-    tmuxUsable === false
-      ? { launcher: 'tmux', recommended: false, unavailable: `tmux ${tmux ?? ''} is older than 3.2` }
-      : { launcher: 'tmux', recommended: tmuxUsable === true && probe.slurm === undefined },
-    { launcher: 'systemd-user', recommended: false, unavailable: 'Not offered yet' },
-    probe.slurm === undefined
-      ? { launcher: 'slurm', recommended: false, unavailable: 'No SLURM on this machine' }
-      : { launcher: 'slurm', recommended: true },
-  ];
-}
-
 /** The hub's own machine: its first local one, as the hub itself picks it. */
 async function ownMachine(data: HubData, signal: AbortSignal): Promise<string> {
   const machines = await data.machines(signal);
@@ -240,10 +230,7 @@ export function createHubOnboardingApi(options: HubOnboardingOptions = {}): Onbo
   const openPage = options.openPage ?? (transport?.kind === 'browser' ? openInBrowser : undefined);
   const missing = new Set<OnboardingCall>(NOT_YET);
   if (setUp === undefined) missing.add('setupWorkspace');
-  if (remote === null) {
-    missing.add('discoverHosts');
-    for (const call of HELPER_INSTALL) missing.add(call);
-  }
+  if (remote === null) missing.add('discoverHosts');
   if (transport === undefined) {
     missing.add('importSessions');
     missing.add('commitImport');
@@ -319,7 +306,8 @@ export function createHubOnboardingApi(options: HubOnboardingOptions = {}): Onbo
 
     async checkMachine(target) {
       const hubTransport = hub('checkMachine');
-      onlyHubMachine(target);
+      // Not an error: another machine is checked over SSH as it is connected.
+      if (target.kind !== 'local') return { machine: target, rows: [], deferred: CHECKED_WHEN_CONNECTED };
       const machine = await hubMachine(hubTransport);
       const rows = toCheckRows(await answer(hubTransport, 'GET', `/v1/machines/${encodeURIComponent(machine)}/check`));
       return { machine: target, rows };
@@ -338,48 +326,8 @@ export function createHubOnboardingApi(options: HubOnboardingOptions = {}): Onbo
       return before;
     },
 
-    async launcherOptions(target) {
-      if (remote === null) return unavailable('launcherOptions');
-      if (target.kind === 'local') throw new Error('This machine runs the hub itself: it needs no helper.');
-      const probe =
-        target.kind === 'wsl'
-          ? await remote.remoteProbe('', { kind: 'wsl', distro: target.distro })
-          : await remote.remoteProbe(target.user === undefined ? target.host : `${target.user}@${target.host}`);
-      return launchersFrom(probe);
-    },
-
-    streamInstallHelper(installOptions: InstallHelperOptions, onEvent: (event: InstallProgressEvent) => void): Streamed {
-      if (remote === null) return unavailable('streamInstallHelper');
-      let live = true;
-      const emit = (event: InstallProgressEvent): void => {
-        if (live) onEvent(event);
-      };
-      const { plan } = installOptions;
-      if (installOptions.machine.kind === 'local') {
-        emit({ type: 'error', message: 'This machine runs the hub itself: it needs no helper.' });
-        return { cancel() {} };
-      }
-      if (plan === undefined) {
-        // Never unseen: what is installed, and for SLURM the exact script, is shown first.
-        emit({ type: 'error', message: 'Review what will be installed first: nothing is installed unseen.' });
-        return { cancel() {} };
-      }
-      void (async () => {
-        try {
-          await remote.remoteAdd(plan, (progress) => emit({ type: 'log', line: installLine(progress) }));
-          emit({ type: 'done' });
-        } catch (error) {
-          emit({ type: 'error', message: messageOf(error) });
-        }
-      })();
-      return {
-        cancel() {
-          // Stops the add on the gateway too, which undoes what it started.
-          if (live) void remote.remoteCancel(plan).catch(() => undefined);
-          live = false;
-        },
-      };
-    },
+    launcherOptions: () => Promise.reject(new Error('launcherOptions is not available yet.')),
+    streamInstallHelper: () => unavailable('streamInstallHelper'),
 
     async agentAccounts() {
       const hubTransport = hub('agentAccounts');
@@ -409,6 +357,15 @@ export function createHubOnboardingApi(options: HubOnboardingOptions = {}): Onbo
         body = undefined;
       }
       return toSignIn(body).running;
+    },
+
+    async stopSignIn(engine, target) {
+      const hubTransport = hub('stopSignIn');
+      onlyHubMachine(target);
+      const machine = await hubMachine(hubTransport);
+      const res = await hubTransport.request('DELETE', signInPath(machine, engine));
+      // `404`: there is none (any more) to stop.
+      if (res.status !== 204 && res.status !== 404) throw new Error(refusal(res));
     },
 
     integrationStatus: () => Promise.reject(new Error('integrationStatus is not available yet.')),

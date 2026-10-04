@@ -2,7 +2,9 @@
 // can help, a fix. A fix never installs anything: "Install…" says where the tool is installed from
 // (`install-pages.ts`, and opens that page in a browser tab outside the desktop app), and "Check
 // again" asks the machine afresh once the person has installed it. Re-runs automatically when the
-// target machine changes (e.g. the user went back and picked another one).
+// target machine changes (e.g. the user went back and picked another one). A machine that is
+// checked later, as it is connected (`deferred`: an SSH host, a WSL distro, an HPC login node),
+// says so instead of rows: that is not an error.
 
 import { useEffect, useState } from 'react';
 import type { CheckRowId, MachineCheckRow } from '../api.ts';
@@ -82,6 +84,7 @@ export function MachineCheckStep() {
 
   const rows = cached?.rows ?? [];
   const loading = cached === undefined && failed === undefined;
+  const deferred = cached?.deferred;
 
   return (
     <form
@@ -91,7 +94,10 @@ export function MachineCheckStep() {
       }}
     >
       <p className="text-sm text-ink-2">On {state.setup.machineName.trim() || machineTargetLabel(target)}:</p>
-      <ul className="mt-3 divide-y divide-line rounded-sm border border-line">
+      {deferred !== undefined && (
+        <p className="mt-3 rounded-sm border border-line px-3 py-2.5 text-sm text-ink-2">{deferred}</p>
+      )}
+      <ul className={deferred === undefined ? 'mt-3 divide-y divide-line rounded-sm border border-line' : 'hidden'}>
         {loading && (
           <li className="px-3 py-2.5 text-sm text-ink-2" aria-live="polite">
             Checking the machine…
@@ -127,7 +133,7 @@ export function MachineCheckStep() {
           {failed}
         </p>
       )}
-      {!loading && (
+      {!loading && deferred === undefined && (
         <div className="mt-3">
           <button
             type="button"

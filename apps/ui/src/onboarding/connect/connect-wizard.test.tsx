@@ -223,14 +223,21 @@ describe('connecting a remote machine', () => {
     expect((screen.getByLabelText('hpc-login’s name') as HTMLInputElement).value).toBe('hpc-login');
     fireEvent.change(screen.getByLabelText('Workspace name'), { target: { value: 'Cluster Lab' } });
     fireEvent.change(screen.getByLabelText('Your name'), { target: { value: 'Sam Rivera' } });
+    fireEvent.change(screen.getByLabelText('hpc-login’s name'), { target: { value: 'Cluster job node' } });
     fireEvent.click(button('Set up'));
 
-    // Signing in to the remote machine's agents, through its hub: skipped here.
+    // Signing in to the remote machine's agents, through its hub: skipped here. With SLURM the
+    // logins run where the job runs, a compute node, which the hub's own machine names; and
+    // compute nodes often have no internet.
     await heading('Sign in to your agents on hpc-login');
+    await screen.findByText(/in a terminal on Cluster job node\./, undefined, PATIENCE);
+    const note = screen.getByRole('note');
+    expect(note.textContent).toContain('each login runs on its compute node, not on hpc-login itself');
+    expect(note.textContent).toContain('no internet access');
     fireEvent.click(button('Skip for now'));
     await heading('Connected');
     expect(fresh.setups).toEqual([
-      { workspace_name: 'Cluster Lab', person: { name: 'Sam Rivera', handle: '@sam' }, machine_name: 'hpc-login' },
+      { workspace_name: 'Cluster Lab', person: { name: 'Sam Rivera', handle: '@sam' }, machine_name: 'Cluster job node' },
     ]);
     const setupRequest = desktop
       .commands('gateway_request')

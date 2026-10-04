@@ -80,6 +80,12 @@ export interface MachineCheckRow {
 export interface MachineCheckResult {
   machine: MachineTarget;
   rows: MachineCheckRow[];
+  /**
+   * Set, with no rows, when this machine is not checked here but later, as it is connected (an
+   * SSH host, a WSL distro or an HPC login node, which the connect wizard checks over SSH): what to
+   * tell the person instead of rows. Not an error.
+   */
+  deferred?: string | undefined;
 }
 
 export type Launcher = 'direct' | 'tmux' | 'systemd-user' | 'slurm';
@@ -324,6 +330,12 @@ export interface OnboardingApi {
   startSignIn(engine: Engine, machine: MachineTarget, method?: SignInMethod): Promise<StartSignInResult>;
   /** Whether that CLI's login still runs: once it has ended, `agentAccounts` asks the CLI again. */
   signInRunning(engine: Engine, machine: MachineTarget): Promise<boolean>;
+  /**
+   * Stops that CLI's sign-in and removes its terminal, running or ended (the person left it or
+   * skipped it): no login, and no Codex callback listener, is left running. Resolves when there is
+   * none.
+   */
+  stopSignIn(engine: Engine, machine: MachineTarget): Promise<void>;
 
   /**
    * Whether PitCrew's helper must be installed on `target` before it can be used. Not on the hub's

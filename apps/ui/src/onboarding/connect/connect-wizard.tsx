@@ -17,6 +17,7 @@ import {
   GatewayError,
   useApi,
   useGatewayWorkspace,
+  useMachines,
   useSetUp,
   useWorkspace,
   WorkspaceScope,
@@ -395,7 +396,13 @@ export function ConnectWizard({
             />
           )}
           {state.step === 'sign-in' && state.workspace !== undefined && (
-            <SignInStep host={state.host} workspace={state.workspace} heading={heading} onDone={() => go('done')} />
+            <SignInStep
+              host={state.host}
+              slurm={state.launcher === 'slurm'}
+              workspace={state.workspace}
+              heading={heading}
+              onDone={() => go('done')}
+            />
           )}
           {state.step === 'done' && state.workspace !== undefined && (
             <DoneStep host={state.host} workspace={state.workspace} heading={heading} onOpen={onOpen} />
@@ -1187,11 +1194,14 @@ function RemoteSetup({
 
 function SignInStep({
   host,
+  slurm,
   workspace,
   heading,
   onDone,
 }: {
   host: string;
+  /** PitCrew runs there as a SLURM job: on a compute node, not on `host`. */
+  slurm: boolean;
   workspace: GatewayWorkspace;
   heading: HeadingRef;
   onDone(): void;
@@ -1209,7 +1219,7 @@ function SignInStep({
           )
         }
       >
-        <RemoteSignIn host={host} />
+        <RemoteSignIn host={host} slurm={slurm} />
       </WorkspaceScope>
       <Footer>
         <Button variant="ghost" onClick={onDone}>
@@ -1223,13 +1233,32 @@ function SignInStep({
   );
 }
 
-/** In the new workspace's data scope: its hub's own machine is the remote one. */
-function RemoteSignIn({ host }: { host: string }) {
+/**
+ * In the new workspace's data scope: its hub's own machine is the remote one. With SLURM that is a
+ * compute node, not `host` (the login node): the logins run there, so the hub's own machine names
+ * it, and compute nodes often have no internet.
+ */
+function RemoteSignIn({ host, slurm }: { host: string; slurm: boolean }) {
   const data = useApi();
   const api = useMemo(() => createHubOnboardingApi({ transport: data.transport }), [data.transport]);
+  const machines = useMachines();
+  const own = machines.data?.find((m) => m.kind === 'local')?.name.trim();
+  const label = slurm ? own || `a compute node of ${host}` : host;
   return (
     <div className="mt-2">
-      <SignInPanel api={api} target={{ kind: 'local' }} machineLabel={host} />
+      <SignInPanel
+        api={api}
+        target={{ kind: 'local' }}
+        machineLabel={label}
+        note={
+          slurm ? (
+            <p role="note">
+              PitCrew runs on {host} as a SLURM job, so each login runs on its compute node, not on {host} itself. Compute nodes
+              often have no internet access: a login that cannot reach its sign-in page fails there.
+            </p>
+          ) : undefined
+        }
+      />
     </div>
   );
 }

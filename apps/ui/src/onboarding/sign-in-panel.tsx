@@ -3,9 +3,12 @@
 // `codex login`, `opencode auth login`) in a terminal on the machine, shown below in the console's
 // terminal view, which the person drives. PitCrew never reads or copies what the login stores
 // (ADR-0010). While the login runs the panel asks now and then whether it has ended; then it asks
-// the CLIs again. Used by the first run's Sign in step and by the connect wizard.
+// the CLIs again. A login still running when the panel closes (the person went on, or skipped), or
+// when another CLI's sign-in opens in its place, is stopped (`stopSignIn`): none is left running on
+// the machine, nor a Codex login's callback listener. Used by the first run's Sign in step and by
+// the connect wizard.
 
-import { useEffect, useEffectEvent, useState } from 'react';
+import { useEffect, useEffectEvent, useRef, useState, type ReactNode } from 'react';
 import { StatusPill } from '../design/index.ts';
 import type { Engine } from '../data/index.ts';
 import type { AgentAccount, MachineTarget, OnboardingApi, SignInMethod } from './api.ts';
@@ -43,13 +46,16 @@ export function SignInPanel({
   api,
   target,
   machineLabel,
+  note,
   cached,
   onAccounts,
 }: {
-  api: Pick<OnboardingApi, 'agentAccounts' | 'startSignIn' | 'signInRunning'>;
+  api: Pick<OnboardingApi, 'agentAccounts' | 'startSignIn' | 'signInRunning' | 'stopSignIn'>;
   target: MachineTarget;
   /** The machine's name for people, when `target`'s own label would not say it (a remote hub's). */
   machineLabel?: string | undefined;
+  /** What to know about signing in on this machine, shown under the introduction. */
+  note?: ReactNode;
   /** Accounts already read, shown at once instead of asking the CLIs again. */
   cached?: AgentAccount[] | undefined;
   /** Each time the accounts have been read. */
@@ -63,6 +69,20 @@ export function SignInPanel({
   const [failed, setFailed] = useState<string | undefined>();
   // The caller's, which may be a new function each render: not a reason to ask the CLIs again.
   const reportAccounts = useEffectEvent((read: AgentAccount[]) => onAccounts?.(read));
+  /** The sign-in this panel opened while its login may still run, and how to stop it. */
+  const unfinished = useRef<{ engine: Engine; stop: () => void } | undefined>(undefined);
+  /** Whether the panel is still shown: a start that comes back after it closed is stopped. */
+  const shown = useRef(true);
+
+  // Closing the panel stops a login still running: nothing is left running on the machine.
+  useEffect(() => {
+    shown.current = true;
+    return () => {
+      shown.current = false;
+      unfinished.current?.stop();
+      unfinished.current = undefined;
+    };
+  }, []);
 
   useEffect(() => {
     if (!reading) return;
@@ -94,6 +114,7 @@ export function SignInPanel({
       api.signInRunning(engine, target).then(
         (running) => {
           if (!live || running) return;
+          if (unfinished.current?.engine === engine) unfinished.current = undefined;
           setOpen((o) => (o?.terminal === terminal ? { ...o, ended: true } : o));
           setReading(true);
           setAttempt((n) => n + 1);
@@ -112,6 +133,15 @@ export function SignInPanel({
     setFailed(undefined);
     try {
       const started = await api.startSignIn(engine, target, method);
+      const stop = () => void api.stopSignIn(engine, target).catch(() => undefined);
+      if (!shown.current) {
+        // The panel closed while it started: nobody will drive it.
+        stop();
+        return;
+      }
+      // Another CLI's login, still running, is left for this one: it stops.
+      if (unfinished.current !== undefined && unfinished.current.engine !== engine) unfinished.current.stop();
+      unfinished.current = { engine, stop };
       setOpen({ engine, terminal: started.terminalSessionId, command: started.command, ended: false });
     } catch (error) {
       setFailed(messageOf(error));
@@ -132,6 +162,7 @@ export function SignInPanel({
         Each CLI signs in with its own login, in a terminal on {machineLabel ?? machineTargetLabel(target)}. PitCrew passes your keys
         to it and keeps nothing of the login.
       </p>
+      {note !== undefined && <div className="mt-2 text-sm text-ink-2">{note}</div>}
       <ul className="mt-3 divide-y divide-line rounded-sm border border-line">
         {reading && accounts.length === 0 && (
           <li className="px-3 py-2.5 text-sm text-ink-2" aria-live="polite">
