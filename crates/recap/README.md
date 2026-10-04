@@ -17,10 +17,9 @@ Recap engine: activity blocks, summaries with receipts, and Where-it-stands prop
   dispatches, asks), seeded from projections with `add_*` and kept current from events (members
   too, from `member_added`, so one directory serves both the builder and the names in prose). It
   follows the hub's rules (`crates/hub-work`), so recaps say what the hub shows:
-  - *Firm links stay.* A link made by a dispatch, a person or the agent itself (`dispatch`,
-    `manual`, `claimed`) is replaced only by another firm one, never by an inferred one (`folder`,
-    `branch`, `imported`) or by a re-stated `session_discovered` without a link. A link is replaced
-    whole. A re-stated session that names no agent keeps the one it had. A dispatch links its
+  - *Firm links stay.* An explicit assignment (`dispatch`, `manual`, `claimed`, `imported`) is
+    replaced only by another firm one, never by an inferred one (`folder`, `branch`) or by a
+    re-stated `session_discovered` without a link. A link is replaced whole. A re-stated session that names no agent keeps the one it had. A dispatch links its
     session only when it has no firm link yet (the hub never links from `dispatch_started`; the
     `session_discovered` after it does). A `session_linked` for a session not discovered yet makes
     its entry with that link, so a firm one holds against the discovery that follows.

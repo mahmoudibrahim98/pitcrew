@@ -8,10 +8,9 @@
 //! Where the hub's projections (`crates/hub-work`) decide what is true, the directory follows
 //! them, so that recaps say what the hub shows:
 //!
-//! - **Firm links stay** (`work.sessions`). A link made by a dispatch, a person or the agent itself
-//!   (`dispatch`, `manual`, `claimed`) is replaced only by another firm link: not by an inferred
-//!   one (`folder`, `branch`, `imported`), and not by a re-stated `session_discovered` that has
-//!   none. Anything replaces an inferred link or none. A link is replaced whole (workstream, task
+//! - **Firm links stay** (`work.sessions`). An explicit assignment (`dispatch`, `manual`,
+//!   `claimed`, `imported`) is replaced only by another firm link: not by an inferred one
+//!   (`folder`, `branch`), and not by a re-stated `session_discovered` that has none. Anything replaces an inferred link or none. A link is replaced whole (workstream, task
 //!   and basis). A dispatch links its session firmly to the dispatch's task only when the session
 //!   has no firm link yet (the hub links it through the `session_discovered` that follows). A
 //!   `session_linked` for a session not discovered yet makes its entry with that link, so a firm
@@ -108,11 +107,11 @@ pub(crate) struct AskInfo {
     pub(crate) session: Option<SessionId>,
 }
 
-/// Whether a link was made by a dispatch, a person or the agent itself.
+/// Whether a link was explicit: dispatch, manual, claimed, or imported.
 fn is_firm(basis: Option<LinkBasis>) -> bool {
     matches!(
         basis,
-        Some(LinkBasis::Dispatch | LinkBasis::Manual | LinkBasis::Claimed)
+        Some(LinkBasis::Dispatch | LinkBasis::Manual | LinkBasis::Claimed | LinkBasis::Imported)
     )
 }
 
