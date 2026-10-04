@@ -72,3 +72,13 @@ and link target inside its own temporary folder. Windows daemon conformance keep
 Unix-runtime skip; Rust daemon HTTP tests cover Files API routes there.
 
 `run.mjs` runs `import.test.mjs` serially after the shared suite, since committing inclusion affects all views of its disposable hub. Both targets check dry-run/commit agreement, each mode, filters, excluded session/activity/recap reads, restoration, validation and device-only access.
+
+`board.test.mjs` runs on both targets, alone, after `import.test.mjs` ("Board drafts"): the
+preview's shape, sizes and estimate, and that it stores nothing; a start refused for a stale
+digest, a person or an unknown member as the agent, and while another draft runs; device-only
+routes; only the drafting agent proposes, within the bounds (evidence of another workstream's
+session, `canceled`, a blank title, a body over 32 KiB); a proposal creates no task; a review
+creates exactly the accepted items, labelled `drafted`, and nothing for the rejected one, once;
+and the three events' shapes. On the daemon the draft's CLI is the stand-in `claude`, in the
+temporary home, as for a dispatch; it never proposes by itself (the suite's agent token does).
+

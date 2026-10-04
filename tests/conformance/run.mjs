@@ -217,6 +217,12 @@ try {
     const [importCode] = await once(suite, 'exit');
     process.exitCode = process.exitCode || (importCode ?? 1);
   }
+  {
+    // Board drafts start an agent's CLI (a stand-in on the daemon) and create tasks: run alone.
+    suite = spawn(process.execPath, ['--test', 'tests/conformance/board.test.mjs'], { cwd: root, env, stdio: 'inherit' });
+    const [boardCode] = await once(suite, 'exit');
+    process.exitCode = process.exitCode || (boardCode ?? 1);
+  }
 } finally {
   await cleanup();
 }

@@ -96,6 +96,14 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
 - **Move rules** are `TaskStatus::can_move` ported exactly; a refused move is `409 conflict`.
 - **Dispatch** assigns an unassigned task to the agent (`task_assigned`), then emits
   `dispatch_started` and `session_discovered`. Done or canceled tasks answer 409.
+- **Board drafts** (`src/board.ts`, api-v1.md "Board drafts"): the preview builds the summary as
+  the hub does (the hub's own template from `crates/office/prompts/`, the same bounds, and the
+  redaction rules ported), from the workstream's sessions and the recaps fixture; a start needs the
+  preview's digest and one of the caller's own agents, and runs a simulated session; only the
+  draft's agent proposes; a review creates the accepted tasks, labelled `drafted`, and nothing
+  else. The mock plays the back office: a draft run by `@office` (the default agent) gets a
+  synthetic proposal, a task per session it summarised, once its session works; a draft run by
+  any other agent waits for that agent's proposal (`dev-agent-token` is @writer's).
 - **Creating projects and workstreams** (`POST /v1/projects`, `POST /v1/workstreams`) with the
   contract's defaults; a project key already in use is 409, an unknown project for a workstream 404.
 - **The machine scan** (`POST /v1/machines/{id}/scan`): a fixed synthetic report (14 sessions in

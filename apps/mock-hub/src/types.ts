@@ -427,7 +427,90 @@ export type EventBody =
   | {
       type: 'decision_recorded';
       data: { workstream?: WorkstreamId; text: string; why?: string; receipts: Receipt[] };
+    }
+  | {
+      type: 'board_draft_started';
+      data: {
+        draft: string;
+        workstream: WorkstreamId;
+        agent: MemberId;
+        engine: Engine;
+        session: SessionId;
+        prompt: string;
+        cost: DraftCost;
+      };
+    }
+  | {
+      type: 'board_proposed';
+      data: { draft: string; workstream: WorkstreamId; tasks: ProposedTask[]; note?: string };
+    }
+  | {
+      type: 'board_draft_reviewed';
+      data: { draft: string; workstream: WorkstreamId; accepted: DraftedTask[]; rejected: number[] };
     };
+
+// ─── Board drafts (board.rs) ─────────────────────────────────────────────────────────────────────
+
+export interface UsageEstimate {
+  input_tokens: number;
+  output_tokens: number;
+}
+
+export interface DraftCost {
+  sessions: number;
+  sessions_left_out: number;
+  tasks: number;
+  summary_bytes: number;
+  prompt_bytes: number;
+  redacted: number;
+  estimate: UsageEstimate;
+}
+
+export interface DraftPreview {
+  workstream: WorkstreamId;
+  prompt: string;
+  cost: DraftCost;
+  summary: string;
+  digest: string;
+}
+
+export const DRAFT_STATES = ['running', 'proposed', 'reviewed', 'ended'] as const;
+export type DraftState = (typeof DRAFT_STATES)[number];
+
+export interface ProposedTask {
+  title: string;
+  status: TaskStatus;
+  description?: string;
+  evidence: SessionId[];
+}
+
+export interface BoardProposal {
+  tasks: ProposedTask[];
+  note?: string;
+}
+
+export interface DraftedTask {
+  item: number;
+  task: TaskId;
+}
+
+export interface BoardDraft {
+  id: string;
+  workstream: WorkstreamId;
+  agent: MemberId;
+  engine: Engine;
+  session: SessionId;
+  by: MemberId;
+  prompt: string;
+  cost: DraftCost;
+  started: TimestampMs;
+  state: DraftState;
+  proposal?: BoardProposal;
+  proposed?: TimestampMs;
+  reviewed?: TimestampMs;
+  accepted: DraftedTask[];
+  rejected: number[];
+}
 
 // ─── API (api.rs) ───────────────────────────────────────────────────────────────────────────────
 

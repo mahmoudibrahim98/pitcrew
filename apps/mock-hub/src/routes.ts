@@ -77,6 +77,7 @@ import {
 
 import { files } from './files.ts';
 import { parseImport, includesSession, eventVisible, includedRecaps } from './import.ts';
+import { boardPreview, draftAt, listDrafts, proposeBoard, reviewDraft, startDraft } from './board.ts';
 export const MOCK_VERSION = '0.1.0-mock';
 /** `PROTOCOL_VERSION` and `PROTOCOL_MIN` in crates/protocol/src/version.rs. */
 export const PROTOCOL_VERSION = 1;
@@ -1533,5 +1534,20 @@ const ROUTES: Route[] = [
   route('GET', '/v1/recaps/blocks', 'device', (hub, ctx) => ok(blocksPage(includedRecaps(hub), ctx.query))),
   route('GET', '/v1/recaps/days', 'device', (hub, ctx) => ok(daysPage(includedRecaps(hub), ctx.query))),
   route('POST', '/v1/hooks/:engine/:event', 'agent', receiveHook),
+  // Board drafts (board.ts).
+  route('GET', '/v1/workstreams/:id/board-draft', 'device', (hub, ctx) => ok(boardPreview(hub, ctx.param('id')))),
+  route('POST', '/v1/workstreams/:id/board-drafts', 'device', (hub, ctx) =>
+    accepted(startDraft(hub, ctx.caller.memberId, ctx.param('id'), ctx.body)),
+  ),
+  route('GET', '/v1/board-drafts', 'device', (hub, ctx) =>
+    ok(listDrafts(hub, queryId(ctx.query, 'workstream', 'wst'))),
+  ),
+  route('GET', '/v1/board-drafts/:id', 'device', (hub, ctx) => ok(draftAt(hub, ctx.param('id')))),
+  route('POST', '/v1/board-drafts/:id/proposal', 'agent', (hub, ctx) =>
+    created(proposeBoard(hub, ctx.caller, ctx.param('id'), ctx.body)),
+  ),
+  route('POST', '/v1/board-drafts/:id/review', 'device', (hub, ctx) =>
+    ok(reviewDraft(hub, ctx.caller.memberId, ctx.param('id'), ctx.body)),
+  ),
   route('GET', '/v1/stream', 'device', needsWebSocket),
 ];

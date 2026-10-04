@@ -190,6 +190,41 @@ const dispatch = object({
   'outcome?': enumeration('succeeded', 'failed', 'canceled'),
   'summary?': text,
 });
+// Board drafts (api-v1.md, "Board drafts").
+const draftCost = object({
+  sessions: integer,
+  sessions_left_out: integer,
+  tasks: integer,
+  summary_bytes: integer,
+  prompt_bytes: integer,
+  redacted: integer,
+  estimate: object({ input_tokens: integer, output_tokens: integer }),
+});
+const proposedTask = object({
+  title: text,
+  status: enumeration('backlog', 'todo', 'in_progress', 'review', 'done'),
+  'description?': text,
+  evidence: list(id),
+});
+const boardProposal = object({ tasks: list(proposedTask), 'note?': text });
+const draftedTask = object({ item: integer, task: id });
+const boardDraft = object({
+  id,
+  workstream: id,
+  agent: id,
+  engine: enumeration('claude', 'codex', 'opencode'),
+  session: id,
+  by: id,
+  prompt: text,
+  cost: draftCost,
+  started: integer,
+  state: enumeration('running', 'proposed', 'reviewed', 'ended'),
+  'proposal?': boardProposal,
+  'proposed?': integer,
+  'reviewed?': integer,
+  accepted: list(draftedTask),
+  rejected: list(integer),
+});
 const eventData = {
   cursor_moved: object({ scope: text, rev: integer }),
   machine_added: object({ machine }),
@@ -268,6 +303,22 @@ const eventData = {
     'receipts?': list(receipt),
   }),
   decision_recorded: object({ 'workstream?': id, text, 'why?': text, receipts: list(receipt) }),
+  board_draft_started: object({
+    draft: id,
+    workstream: id,
+    agent: id,
+    engine: enumeration('claude', 'codex', 'opencode'),
+    session: id,
+    prompt: text,
+    cost: draftCost,
+  }),
+  board_proposed: object({ draft: id, workstream: id, tasks: list(proposedTask), 'note?': text }),
+  board_draft_reviewed: object({
+    draft: id,
+    workstream: id,
+    accepted: list(draftedTask),
+    rejected: list(integer),
+  }),
 };
 const eventBody = (v) => {
   object({ type: enumeration(...Object.keys(eventData)), data: empty })(v);
@@ -431,6 +482,9 @@ export const schemas = {
     at_start: bool,
   }),
   setup: object({ workspace, me: member, machine }),
+  boardDraft,
+  draftPreview: object({ workstream: id, prompt: text, cost: draftCost, summary: text, digest: text }),
+  draftReviewed: object({ draft: boardDraft, tasks: list(task) }),
   error: object({
     code: enumeration(
       'unauthorized',
