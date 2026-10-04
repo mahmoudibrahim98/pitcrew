@@ -406,6 +406,7 @@ jobs:
             escaped=${escaped//$'\r'/'%0D'}
             escaped=${escaped//$'\n'/'%0A'}
             echo "::notice title=Installer payload ($comparison)::$escaped"
+          done
 
   attest:
     name: Attest build provenance
