@@ -62,6 +62,17 @@ impl Projection for Projects {
                 )?;
                 Ok(())
             }
+            EventBody::WorkstreamLinked {
+                workstream,
+                external,
+            } => {
+                exec(
+                    tx,
+                    "UPDATE work_workstreams SET external = ?2 WHERE id = ?1",
+                    params![workstream.text(), json(external)?],
+                )?;
+                Ok(())
+            }
             _ => Ok(()),
         }
     }

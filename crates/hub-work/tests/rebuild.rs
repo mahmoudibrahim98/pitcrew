@@ -170,9 +170,23 @@ fn workload(work: &WorkService) {
         WorkstreamPatch {
             status: Some(pitcrew_protocol::model::WorkstreamStatus::Active),
             health: Some(Health::AtRisk),
+            external: None,
         },
     )
     .expect("patch");
+    work.patch_workstream(
+        &sam,
+        &"01JB000000000000000WST0004".parse().expect("ws"),
+        WorkstreamPatch {
+            external: Some(vec![pitcrew_protocol::model::ExternalRef {
+                system: pitcrew_protocol::model::ExternalSystem::Github,
+                key: "example-org/demo-repo#milestone:1".into(),
+                url: Some("https://github.com/example-org/demo-repo/milestone/1".into()),
+            }]),
+            ..WorkstreamPatch::default()
+        },
+    )
+    .expect("link");
 
     // Things without commands yet: runners' session events, dispatches, membership changes.
     let dispatch = Dispatch {

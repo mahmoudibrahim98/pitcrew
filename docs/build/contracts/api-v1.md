@@ -214,11 +214,12 @@ replaces the workstream's linked external items (an empty list unlinks them all)
 - At most 16 links, no two with the same `system` and `key`. Each `url`, when given, is an
   `https://` URL of at most 2 KiB with no user name or password. `key` is 1 to 300 characters with
   no control characters.
-- `github` keys are `owner/repo` (the whole repository) or `owner/repo#milestone:<n>` (one
-  milestone); `jira` keys are a project key `DEMO` (the whole project) or an epic's issue key
-  `DEMO-5`. Owner and repository names use GitHub's characters (`A-Z a-z 0-9 - _ .`, never `.` or
+- **What a sync acts on.** A `github` key `owner/repo` names the whole repository and
+  `owner/repo#milestone:<n>` one milestone; a `jira` key `DEMO` names the whole project and `DEMO-5`
+  an epic. Owner and repository names use GitHub's characters (`A-Z a-z 0-9 - _ .`, never `.` or
   `..` alone); Jira keys are an uppercase letter, then uppercase letters, digits or `_`, then for an
-  epic `-<n>`. Other systems' keys are kept as given. Anything else is `400 invalid`.
+  epic `-<n>`. A key of any other shape is kept as a plain link, which no sync acts on. Anything
+  that breaks the rules above is `400 invalid`.
 - It appends `workstream_linked` `{ "workstream", "external" }` with the full new list. A patch
   that changes nothing appends nothing. `status` and `health` may come in the same patch (then
   `workstream_changed` comes first, in the same append); a patch with none of the three is
