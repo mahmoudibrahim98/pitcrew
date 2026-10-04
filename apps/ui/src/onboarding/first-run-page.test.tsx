@@ -55,6 +55,15 @@ const heading = (name: string | RegExp) => screen.findByRole('heading', { level:
 
 describe('the first-run route', () => {
   it("starts a remote hub's machine name from the gateway's name, and replaces itself with Home", async () => {
+    desktop.daemons.set(WS, (req) => {
+      if (req.method === 'POST' && req.path === '/v1/import/dry-run') {
+        return { status: 200, body: '{"count":0}' };
+      }
+      if (req.method === 'PUT' && req.path === '/v1/import') {
+        return { status: 200, body: '{"imported":0}' };
+      }
+      return fresh.daemon(req);
+    });
     const router = renderApp('/');
     await heading('Welcome to PitCrew');
     expect(router.state.location.pathname).toBe(paths.setup(WS));
@@ -66,7 +75,19 @@ describe('the first-run route', () => {
     fireEvent.change(screen.getByLabelText('Your name'), { target: { value: 'Sam Rivera' } });
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
 
+    await heading('Import sessions');
+    await screen.findByText('This will import 0 sessions.');
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
     await heading("You're set up");
+    const requests = desktop.commands('gateway_request').map((args) => args.req as { workspace: string; method: string; path: string; body?: string });
+    const previews = requests.filter((req) => req.path === '/v1/import/dry-run');
+    expect(previews.length).toBeGreaterThan(0);
+    for (const req of previews) {
+      expect([req.workspace, req.method, JSON.parse(req.body ?? '{}')]).toEqual([WS, 'POST', { mode: 'all' }]);
+    }
+    expect(requests.filter((req) => req.path === '/v1/import').map((req) =>
+      [req.workspace, req.method, JSON.parse(req.body ?? '{}')])).toEqual([[WS, 'PUT', { mode: 'all' }]]);
+    expect(requests.some((req) => req.path.endsWith('/scan') || req.method === 'POST' && req.path === '/v1/projects')).toBe(false);
     expect(fresh.setups).toEqual([
       { workspace_name: 'Cluster Lab', person: { name: 'Sam Rivera', handle: '@sam' }, machine_name: 'hpc-login' },
     ]);

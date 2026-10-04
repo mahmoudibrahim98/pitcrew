@@ -90,6 +90,8 @@ pub struct LoggedFake {
     transcripts: Vec<TranscriptRef>,
     inner: Mutex<FakeSource>,
     pub reads: Mutex<Vec<u64>>,
+    /// Cursor offsets whose reads have completed, rather than just started.
+    pub finished_reads: Mutex<Vec<u64>>,
     /// Items served per read (the plain fake serves one).
     per_read: usize,
     /// How long each read takes.
@@ -104,6 +106,7 @@ impl LoggedFake {
             inner: Mutex::new(FakeSource::new(Engine::Claude, transcripts.clone(), items)),
             transcripts,
             reads: Mutex::new(Vec::new()),
+            finished_reads: Mutex::new(Vec::new()),
             per_read: 1,
             delay: Duration::ZERO,
             panic_on: Mutex::new(None),
@@ -163,6 +166,7 @@ impl SourceAdapter for LoggedFake {
             chunk.items.extend(next.items);
             chunk.cursor = next.cursor;
         }
+        self.finished_reads.lock().unwrap().push(cursor.offset);
         Ok(chunk)
     }
 

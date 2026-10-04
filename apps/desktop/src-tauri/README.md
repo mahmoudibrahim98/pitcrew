@@ -510,3 +510,13 @@ and the AppImage/deb/rpm distinction. Never run the installed app in tests: `tes
 tests Tauri's feed parser and the production install-boundary verifier using a freshly generated
 temporary signing key, without opening a window or running an installer. Signed versions are
 mandatory; changed bytes, wrong keys, unversioned signatures and relabeled versions are refused.
+
+### Compressed remote helper resources
+
+Release bundles use the decoded-hash manifest contract documented in
+[`packaging/README.md`](../../../packaging/README.md#size). Remaining helper resources have
+a `.xz` suffix. Linux x86_64 and universal macOS reuse the identical `pitcrewd` sidecar
+next to the desktop; Windows retains all three compressed remote helpers. Resource lookup
+still accepts uncompressed development inputs. Decoding uses an owner-only cache keyed by
+version, platform and decoded hash, verifies before atomic installation, and rechecks every
+cache read. Release builds never trust the adjacent manifest.

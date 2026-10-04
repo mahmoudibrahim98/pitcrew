@@ -29,7 +29,7 @@ test('the first run, from an empty workspace to Home as the new person', async (
   await expect(heading(page, 'Welcome to PitCrew')).toBeVisible();
   await expect(page.getByRole('complementary', { name: 'Sidebar' })).toHaveCount(0);
   // Only the steps the hub can serve.
-  await expect(page.getByRole('tab')).toHaveText([/Welcome/, /Workspace/, /Scan/, /Create/, /Done/]);
+  await expect(page.getByRole('tab')).toHaveText([/Welcome/, /Workspace/, /Scan/, /Create/, /Import/, /Done/]);
   await expectNoAxeViolations(page, 'welcome');
 
   // Any other page goes back to setup while it is not done.
@@ -68,6 +68,11 @@ test('the first run, from an empty workspace to Home as the new person', async (
   await paper.getByLabel('Project name').fill('Diffusion paper');
   await expectNoAxeViolations(page, 'create');
   await page.getByRole('button', { name: 'Create', exact: true }).click();
+
+  await expect(page.getByText('This will import 0 sessions.')).toBeVisible();
+  await expectNoAxeViolations(page, 'import');
+  await page.getByRole('button', { name: 'Continue' }).click();
+  expect((await request.get(`${FIRST_RUN_HUB}/v1/import`, { headers: AUTH })).status()).toBe(200);
 
   // Done, then Home, which stays Home.
   await expect(heading(page, "You're set up")).toBeVisible();

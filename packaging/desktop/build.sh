@@ -126,10 +126,17 @@ for bin in "${sidecars[@]}"; do
   done
 done
 
-# The helpers are data here: uploaded to remote machines, never run on this one.
+# Reuse the identical native daemon. Other helpers are XZ data, never executed locally.
+command -v xz >/dev/null 2>&1 || { echo "::error::xz is required" >&2; exit 1; }
 for helper in "${helpers[@]}"; do
-  cp "$dist/$helper" "$stage/helpers/$helper"
-  chmod 0644 "$stage/helpers/$helper"
+  if [ "$helper" = "pitcrewd-$from" ]; then
+    cmp -s "$dist/$helper" "$stage/bin/pitcrewd-$target$exe" || {
+      echo "::error::native helper and sidecar differ" >&2; exit 1;
+    }
+  else
+    xz --compress --stdout -6 -- "$dist/$helper" >"$stage/helpers/$helper.xz"
+    chmod 0644 "$stage/helpers/$helper.xz"
+  fi
 done
 
 # `pitcrewd --version`'s second word, which every helper reports (same commit).
@@ -151,7 +158,7 @@ fi
 manifest="{\"version\":\"$version\",\"sha256\":{"
 sep=""
 for helper in "${helpers[@]}"; do
-  manifest+="$sep\"$helper\":\"$(sha256 "$stage/helpers/$helper")\""
+  manifest+="$sep\"$helper\":\"$(sha256 "$dist/$helper")\""
   sep=","
 done
 manifest+="}}"

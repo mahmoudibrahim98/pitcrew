@@ -2,7 +2,7 @@
 # Checks the desktop installers packaging/desktop/build.sh wrote, against the helpers' manifest it
 # compiled into the app (STAGE/helpers/manifest.json):
 #
-#   packaging/desktop/check.sh --manifest FILE [--budget-mb N] INSTALLER...
+#   packaging/desktop/check.sh --manifest FILE [--budget-mb N] [--appimage-budget-bytes N] INSTALLER...
 #
 # For each installer, unpacked as its OS would install it (a .deb with dpkg-deb, an AppImage with
 # --appimage-extract, a DMG with hdiutil on macOS; an NSIS installer is installed and removed by
@@ -33,12 +33,15 @@ identifier=org.pitcrew.desktop
 app_exe=pitcrew-desktop
 sidecars=(pitcrewd pitcrew-ptyd pitcrew-askpass)
 budget_mb=25
+# AppImage includes WebKitGTK/GTK: measured payload budget plus 10% (P.md).
+appimage_budget_bytes=106772011
 manifest=""
 installers=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --manifest) manifest=$2; shift 2 ;;
     --budget-mb) budget_mb=$2; shift 2 ;;
+    --appimage-budget-bytes) appimage_budget_bytes=$2; shift 2 ;;
     -h | --help) usage; exit 0 ;;
     -*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     *) installers+=("$1"); shift ;;
@@ -83,20 +86,23 @@ cleanup() {
 trap cleanup EXIT
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
-  summary "| Installer | Size | Budget ($budget_mb MB) |"
+  summary "| Installer | Size (decimal MB) | Budget |"
   summary "|---|---|---|"
 fi
 
 check_size() { # FILE
-  local bytes mb
+  local bytes mb limit limit_mb
   bytes=$(wc -c <"$1" | tr -d ' ')
-  mb=$(awk -v b="$bytes" 'BEGIN { printf "%.1f", b / 1048576 }')
-  if [ "$bytes" -gt $((budget_mb * 1048576)) ]; then
-    echo "::warning::$(basename "$1") is $mb MB, over the $budget_mb MB budget"
-    summary "| $(basename "$1") | $mb MB | **over** |"
+  limit=$((budget_mb * 1000000))
+  case "$1" in *.AppImage) limit=$appimage_budget_bytes ;; esac
+  mb=$(awk -v b="$bytes" 'BEGIN { printf "%.2f", b / 1000000 }')
+  limit_mb=$(awk -v b="$limit" 'BEGIN { printf "%.2f", b / 1000000 }')
+  if [ "$bytes" -gt "$limit" ]; then
+    echo "::warning::$(basename "$1") is $mb MB, over the $limit_mb MB budget"
+    summary "| $(basename "$1") | $mb MB | **over $limit_mb MB** |"
   else
-    ok "$mb MB, within the $budget_mb MB budget"
-    summary "| $(basename "$1") | $mb MB | within |"
+    ok "$mb MB, within the $limit_mb MB budget"
+    summary "| $(basename "$1") | $mb MB | within $limit_mb MB |"
   fi
 }
 
@@ -118,16 +124,31 @@ check_tree() { # LABEL BIN_DIR HELPERS_DIR [EXE_SUFFIX]
     fail "$label: $helpers/manifest.json is missing or differs from $manifest"
   fi
   while read -r name hex; do
-    if [ ! -f "$helpers/$name" ]; then
+    local source="$helpers/$name" decoded=""
+    if [ -f "$source.xz" ]; then
+      decoded=$(mktemp)
+      if ! xz --decompress --stdout -- "$source.xz" >"$decoded"; then
+        fail "$label: helpers/$name does not decode"
+      fi
+      source=$decoded
+    elif [ ! -f "$source" ]; then
+      case "$label:$name" in
+        deb:pitcrewd-x86_64-unknown-linux-musl | rpm:pitcrewd-x86_64-unknown-linux-musl | AppImage:pitcrewd-x86_64-unknown-linux-musl | DMG:pitcrewd-universal-apple-darwin)
+          source="$bin/pitcrewd$exe" ;;
+      esac
+    fi
+    if [ ! -f "$source" ]; then
       fail "$label: helpers/$name is missing"
-    elif [ "$(sha256 "$helpers/$name")" = "$hex" ]; then
-      ok "$label: helpers/$name matches its sha256"
+    elif [ "$(sha256 "$source")" = "$hex" ]; then
+      ok "$label: helpers/$name matches its sha256 (decoded or shared sidecar)"
     else
       fail "$label: helpers/$name does not match the manifest's sha256"
     fi
+    [ -z "$decoded" ] || rm -f "$decoded"
   done <<<"$entries"
   for f in "$helpers"/*; do
     name=$(basename "$f")
+    name=${name%.xz}
     listed=$(printf '%s\n' "$entries" | awk -v n="$name" '$1 == n')
     if [ "$name" != manifest.json ] && [ -z "$listed" ]; then
       fail "$label: helpers/$name is not in the manifest"
@@ -301,7 +322,7 @@ check_dmg() { # FILE
   else
     fail "DMG: CFBundleIdentifier is not $identifier"
   fi
-  for f in "$app/Contents/MacOS"/* "$app/Contents/Resources/helpers/pitcrewd-universal-apple-darwin"; do
+  for f in "$app/Contents/MacOS"/*; do
     archs=$(lipo -archs "$f" 2>/dev/null)
     # Each name is matched on its own: in " x86_64 arm64 " the two share the space between them.
     if [[ " $archs " == *" x86_64 "* && " $archs " == *" arm64 "* ]]; then

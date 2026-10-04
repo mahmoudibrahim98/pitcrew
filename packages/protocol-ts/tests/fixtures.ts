@@ -133,3 +133,5 @@ export const command: import('../index.ts').RunnerCommand = {
   "session": "01J00000000000000000000000",
   "type": "end_session"
 };
+export const allImport: import('../index.ts').ImportFilter = { mode: 'all' };
+export const filteredImport: import('../index.ts').ImportFilter = { mode: 'filtered', since: '2026-01-01' };

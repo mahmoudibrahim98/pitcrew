@@ -73,6 +73,7 @@ mod cursors;
 mod dispatch;
 mod edits;
 mod error;
+mod import;
 mod office;
 pub mod projection;
 pub mod query;

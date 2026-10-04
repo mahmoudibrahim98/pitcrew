@@ -12,7 +12,7 @@ root=$(cd "$here/.." && pwd)
 tmp=$(mktemp -d)
 # desktop/build.sh stages inside the repository (dist/ is ignored by git).
 stage_dir="$root/dist/packaging-test-$$"
-trap 'rm -rf "$tmp" "$stage_dir" "$stage_dir-mac"' EXIT
+trap 'rm -rf "$tmp" "$stage_dir" "$stage_dir-mac" "$stage_dir-win"' EXIT
 failed=0
 passed=0
 
@@ -127,6 +127,9 @@ want="{\"version\":\"1.2.3\",\"sha256\":{\"pitcrewd-aarch64-unknown-linux-musl\"
 check "the manifest has pitcrewd's version and each helper's sha256" 0 test "$(cat "$manifest")" = "$want"
 cp "$tmp/staged" "$tmp/out"
 output_has "and is what gets compiled in" "PITCREW_HELPERS_MANIFEST=$want"
+check "the native daemon is not duplicated in helpers" 0 test ! -e "$stage_dir/helpers/pitcrewd-$musl.xz"
+check "the non-native helper decodes to the original bytes" 0 \
+  sh -c 'xz -dc "$1" | cmp -s - "$2"' _ "$stage_dir/helpers/pitcrewd-universal-apple-darwin.xz" "$bins/pitcrewd-universal-apple-darwin"
 check "the sidecars are named for Tauri's target" 0 test -x "$stage_dir/bin/pitcrewd-x86_64-unknown-linux-gnu"
 check "the Linux sidecars are the static musl builds" 0 \
   cmp -s "$stage_dir/bin/pitcrew-ptyd-x86_64-unknown-linux-gnu" "$bins/pitcrew-ptyd-$musl"
@@ -138,7 +141,7 @@ case "$(uname -s)" in
       sh -c 'ls -l "$1" | grep -q "^-rwxr-xr-x"' _ "$stage_dir/bin/pitcrewd-x86_64-unknown-linux-gnu"
     # shellcheck disable=SC2016
     check "a staged helper is 0644" 0 \
-      sh -c 'ls -l "$1" | grep -q "^-rw-r--r--"' _ "$stage_dir/helpers/pitcrewd-universal-apple-darwin"
+      sh -c 'ls -l "$1" | grep -q "^-rw-r--r--"' _ "$stage_dir/helpers/pitcrewd-universal-apple-darwin.xz"
     ;;
 esac
 check "the overlay names the stage relative to src-tauri" 0 \
@@ -167,6 +170,7 @@ stub "$bins/pitcrew-ptyd-universal-apple-darwin" "pitcrew-ptyd 1.2.3 (protocol 1
 stub "$bins/pitcrew-askpass-universal-apple-darwin" "" 2 "pitcrew-askpass: not started by PitCrew (PITCREW_ASKPASS_ADDR unset)"
 check "staging the macOS desktop" 0 \
   bash "$here/desktop/build.sh" --stage-only --dist "$bins" --stage "$stage_dir-mac" universal-apple-darwin
+check "macOS reuses the universal daemon" 0 test ! -e "$stage_dir-mac/helpers/pitcrewd-universal-apple-darwin.xz"
 for bin in pitcrewd pitcrew-ptyd pitcrew-askpass; do
   for name in universal-apple-darwin aarch64-apple-darwin x86_64-apple-darwin; do
     check "the universal $bin is staged as $bin-$name" 0 \
@@ -175,6 +179,16 @@ for bin in pitcrewd pitcrew-ptyd pitcrew-askpass; do
 done
 mv "$tmp/saved-helper" "$bins/pitcrewd-universal-apple-darwin"
 rm -f "$bins/pitcrew-ptyd-universal-apple-darwin" "$bins/pitcrew-askpass-universal-apple-darwin"
+
+# Windows has no native remote helper and retains all three XZ resources.
+for bin in pitcrewd pitcrew-ptyd pitcrew-askpass; do
+  cp "$bins/$bin-$musl" "$bins/$bin-x86_64-pc-windows-msvc.exe"
+done
+check "staging the Windows desktop" 0 \
+  bash "$here/desktop/build.sh" --stage-only --dist "$bins" --stage "$stage_dir-win" x86_64-pc-windows-msvc
+for helper in pitcrewd-aarch64-unknown-linux-musl pitcrewd-universal-apple-darwin pitcrewd-x86_64-unknown-linux-musl; do
+  check "Windows carries $helper compressed" 0 test -f "$stage_dir-win/helpers/$helper.xz"
+done
 
 # --- desktop/check.sh on a stand-in .deb laid out as Tauri's
 if command -v dpkg-deb >/dev/null 2>&1 && [ "$(uname -s)" = Linux ]; then
@@ -203,13 +217,13 @@ if command -v dpkg-deb >/dev/null 2>&1 && [ "$(uname -s)" = Linux ]; then
   output_has "its sidecars run" "pitcrewd 1.2.3 (protocol 1"
   output_has "askpass runs" "pitcrew-askpass runs"
   check "over the budget is a warning, not a failure" 0 installer_check --budget-mb 0 "$deb"
-  output_has "and says so" "over the 0 MB budget"
+  output_has "and says so" "over the 0.00 MB budget"
 
-  printf 'tampered\n' >"$pkg/usr/lib/PitCrew/helpers/pitcrewd-aarch64-unknown-linux-musl"
+  printf 'tampered\n' >"$pkg/usr/lib/PitCrew/helpers/pitcrewd-aarch64-unknown-linux-musl.xz"
   make_deb
   check "a helper that does not match the manifest fails" 1 installer_check "$deb"
   output_has "and is named" "helpers/pitcrewd-aarch64-unknown-linux-musl does not match"
-  cp "$stage_dir/helpers/pitcrewd-aarch64-unknown-linux-musl" "$pkg/usr/lib/PitCrew/helpers/"
+  cp "$stage_dir/helpers/pitcrewd-aarch64-unknown-linux-musl.xz" "$pkg/usr/lib/PitCrew/helpers/"
 
   chmod g+w "$pkg/usr/bin/pitcrewd"
   make_deb
@@ -287,7 +301,7 @@ STUB
   printf '%s\n' '-rwxrwxr-x root/root 100 /usr/bin/pitcrewd' >"$rpm_listing"
   check "rpm rejects group-writable entries" 1 rpm_check
   make_rpm_tree
-  printf 'modified\n' >>"$rpm_tree/usr/lib/PitCrew/helpers/pitcrewd-aarch64-unknown-linux-musl"
+  printf 'modified\n' >"$rpm_tree/usr/lib/PitCrew/helpers/pitcrewd-aarch64-unknown-linux-musl.xz"
   check "rpm rejects a helper checksum mismatch" 1 rpm_check
   make_rpm_tree
   sed -i 's/ %u//' "$rpm_tree/usr/share/applications/PitCrew.desktop"
