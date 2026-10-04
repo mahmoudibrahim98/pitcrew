@@ -80,7 +80,8 @@ interface GatewayResponse {
 - **Every daemon answer is a response,** whatever its status: a 404 or 409 comes back as
   `{status, body}` with the `ApiError` body, as over HTTP.
 - **The gateway checks:**
-  - `path` starts with `/v1/`;
+  - `path` starts with `/v1/`, and is not an integration's credential route (see "Integration
+    credentials");
   - it has no `..` segment, no `//`, no `\`, no `#` and no control characters;
   - its query, if any, is passed on as it is;
   - `body` is at most 1 MiB, and is sent with `Content-Type: application/json`.
@@ -97,6 +98,23 @@ interface GatewayError {
   message: string;
 }
 ```
+
+## Integration credentials
+
+`gateway_integration_credential({ workspace, integration, secret }) → GatewayResponse`
+
+- Hands a GitHub or Jira integration's secret to the workspace's daemon once, as
+  `PUT /v1/integrations/{integration}/credential` with body `{ "secret": … }` (api-v1.md,
+  "Integrations"), and resolves with the daemon's answer whatever its status (`204` when stored).
+  `integration` is an id (letters, digits, `_` and `-`, at most 64); anything else is `invalid`
+  before any connection is made.
+- **`gateway_request` refuses that route** (`invalid`), however its path is written (letter case,
+  percent-escapes): the webview's general channel never carries a secret, and no answer ever
+  holds one (the daemon never returns it).
+- The gateway holds the secret only while the request is sent, never logs it (the request is
+  logged like any other: workspace, method, route, status, time), and never stores it: the daemon
+  keeps it, privately, in its own state directory.
+- In a browser (development) the UI sends the same `PUT` itself; there is no gateway there.
 
 ## Sockets
 

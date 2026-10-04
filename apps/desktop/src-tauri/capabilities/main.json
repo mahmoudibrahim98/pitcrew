@@ -1,12 +1,13 @@
 {
   "identifier": "main",
-  "description": "The main window: the gateway's commands (workspaces, this computer's host name, requests, sockets, listing ssh hosts and this computer's WSL distributions, probing, planning, adding (and cancelling an add), retrying and removing remote machines, answering SSH prompts) and listening to its events (gateway://workspaces, gateway://navigate, gateway://prompt, gateway://prompt-closed). No shell, fs, http, opener or notification access, and no events the webview can emit.",
+  "description": "The main window: the gateway's commands (workspaces, this computer's host name, requests, an integration's credential, sockets, listing ssh hosts and this computer's WSL distributions, probing, planning, adding (and cancelling an add), retrying and removing remote machines, answering SSH prompts) and listening to its events (gateway://workspaces, gateway://navigate, gateway://prompt, gateway://prompt-closed). No shell, fs, http, opener or notification access, and no events the webview can emit.",
   "local": true,
   "windows": ["main"],
   "permissions": [
     "allow-gateway-workspaces",
     "allow-gateway-local-host",
     "allow-gateway-request",
+    "allow-gateway-integration-credential",
     "allow-gateway-socket-open",
     "allow-gateway-socket-send",
     "allow-gateway-socket-close",

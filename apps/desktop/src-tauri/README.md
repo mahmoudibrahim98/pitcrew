@@ -196,6 +196,7 @@ Exactly the [contract](../../../docs/build/contracts/desktop-gateway.md):
 invoke('gateway_workspaces')                                   // → GatewayWorkspace[]
 invoke('gateway_local_host')                                   // → { name } (proposed for the contract)
 invoke('gateway_request', { req: { workspace, method, path, body } })  // → { status, contentType?, body }
+invoke('gateway_integration_credential', { workspace, integration, secret })  // → { status, contentType?, body }
 invoke('gateway_socket_open', { workspace, path, events: channel })    // → { socket }
 invoke('gateway_socket_send', { socket, text })                // or { socket, binary }
 invoke('gateway_socket_close', { socket, code, reason })
@@ -205,6 +206,11 @@ invoke('gateway_socket_close', { socket, code, reason })
   default: `uname`'s node name on Unix, `COMPUTERNAME` on Windows, its first label only (no
   domain, no `.local`), cleaned like a notification's text and cut to 60 characters (what
   `POST /v1/setup` takes as `machine_name`); `"This computer"` when nothing is left.
+- `gateway_integration_credential` hands a GitHub or Jira integration's secret to the daemon once
+  (`PUT /v1/integrations/{id}/credential`): held as a `pitcrew_remote::Secret` (zeroed when
+  dropped), logged like any request (route and status, never the body), stored nowhere here.
+  `gateway_request` refuses that route however its path is written, so the webview's general
+  channel never carries a secret (`tests/gateway.rs`, `tests/no_token.rs`, `tests/app.rs`).
 - Every argument is checked here; anything malformed is `invalid`. Paths: `/v1/…` only, no `.`
   or `..` segment (also percent-encoded), no `//`, `\`, `#`, control characters or raw non-ASCII;
   the query goes on as it is. Sockets: `/v1/stream` and `/v1/sessions/{id}/terminal` only.
