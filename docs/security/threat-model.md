@@ -672,3 +672,9 @@ recipe starts no process: the runner's existing permission-bypass opt-in and aud
 apply when an agent is launched. The UI renders names/instructions as text and requires an
 explicit bypass selection. Tests: `crates/hub-work/tests/directory.rs`, directory and atomic-project
 cases in `tests/conformance/api.test.mjs`, and the projects create-dialog unit/browser tests.
+
+A successful setup scan provisions missing detected engines as person-owned agent members and
+default-permission personas under the same writer lock. It runs no CLI and raises no permission
+mode. Only a later device-authorized dispatch starts an agent; ownership is checked by dispatch.
+Empty, failed and disconnected scans provision nothing. Real-daemon scan tests and fresh mock
+setup/dispatch tests cover this path.

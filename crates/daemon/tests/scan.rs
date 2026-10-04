@@ -591,10 +591,7 @@ fn a_fresh_hub_scans_its_machine_once_set_up() {
         assert_eq!(matching.len(), 1, "{engine}: {members:#}");
         assert_ne!(matching[0]["handle"], "@office");
     }
-    let rev = daemon.get("/v1/workspace", Some(&device)).json()["rev"].clone();
     report_of(Scan::start(daemon.port, &machine, Some(&device)));
-    assert_eq!(
-        daemon.get("/v1/workspace", Some(&device)).json()["rev"],
-        rev
-    );
+    assert_eq!(daemon.get("/v1/members", Some(&device)).json(), members);
+    assert_eq!(daemon.get("/v1/personas", Some(&device)).json(), personas);
 }

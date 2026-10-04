@@ -56,7 +56,7 @@ async fn directory_writes_validate_authorize_and_rebuild() {
         &app,
         Some(caller),
         "PUT",
-        &format!("/v1/personas/{id}"),
+        &format!("/v1/personas/per_{id}"),
         Some(json!({"name":"Renamed writer","engine":"claude"})),
     )
     .await;

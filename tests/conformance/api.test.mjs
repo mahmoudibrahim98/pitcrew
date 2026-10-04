@@ -1066,7 +1066,7 @@ check('cursor metadata is private in live/replay and does not consume activity p
 });
 
 check('directory creation and editing are device-only, validated, event-backed and atomic', async () => {
-  const recipe = { name: '  Synthetic author  ', engine: 'codex', model: 'demo-model', instructions: 'Synthetic\nexamples.', permission_mode: 'plan' };
+  const recipe = { name: '  Synthetic author  ', engine: 'claude', model: 'demo-model', instructions: 'Synthetic\nexamples.', permission_mode: 'plan' };
   for (const [path, body] of [['/v1/personas', recipe], ['/v1/teams', { name: 'Synthetic crew', lead: missing, members: [] }]]) {
     await api(path, 401, undefined, { method: 'POST', token: '', body });
     await api(path, 403, undefined, { method: 'POST', token: agent, body });
@@ -1084,13 +1084,15 @@ check('directory creation and editing are device-only, validated, event-backed a
   const member = members.find((m) => m.persona === persona.id);
   const me = await api('/v1/me');
   assert.equal(member.kind, 'agent'); assert.equal(member.owner, me.id);
-  const renamed = await api(`/v1/personas/per_${persona.id}`, 200, undefined, { method: 'PUT', body: { ...recipe, name: 'Renamed author' } });
+  const renamed = await api(`/v1/personas/per_${persona.id.replace(/^per_/, '')}`, 200, undefined, { method: 'PUT', body: { ...recipe, name: 'Renamed author' } });
   assert.equal(renamed.id, persona.id);
   members = await api('/v1/members');
   assert.equal(members.find((m) => m.id === member.id).name, 'Renamed author');
   const dispatchTask = await api('/v1/tasks', 201, schemas.task, { method: 'POST', body: { project: context.project.id, title: 'Dispatch new agent' } });
-  const dispatched = await api(`/v1/tasks/${dispatchTask.id}/dispatch`, 202, schemas.dispatch, { method: 'POST', body: { agent: member.id } });
-  assert.equal(dispatched.task, dispatchTask.id);
+  const dispatchReply = await raw(`/v1/tasks/${dispatchTask.id}/dispatch`, { method: 'POST', body: { agent: member.id } });
+  assert.equal(dispatchReply.status, 202, dispatchReply.data?.message);
+  schemas.dispatch(dispatchReply.data);
+  assert.equal(dispatchReply.data.task, dispatchTask.id);
   const teamBody = { name: 'Synthetic crew', lead: me.id, members: [member.id, member.id] };
   const teamRev = (await api('/v1/workspace')).rev;
   await api('/v1/teams', 400, undefined, { method: 'POST', body: { ...teamBody, members: [missing] } });
@@ -1099,7 +1101,7 @@ check('directory creation and editing are device-only, validated, event-backed a
   assert.equal((await api('/v1/workspace')).rev, teamRev);
   const team = await api('/v1/teams', 201, undefined, { method: 'POST', body: teamBody });
   schemas.teams([team]); assert.deepEqual(team.members, [me.id, member.id]);
-  const updated = await api(`/v1/teams/team_${team.id}`, 200, undefined, { method: 'PUT', body: { ...teamBody, name: 'Renamed crew', lead: member.id, members: [] } });
+  const updated = await api(`/v1/teams/team_${team.id.replace(/^team_/, '')}`, 200, undefined, { method: 'PUT', body: { ...teamBody, name: 'Renamed crew', lead: member.id, members: [] } });
   assert.deepEqual(updated.members, [member.id]); assert.equal(updated.id, team.id);
   for (const path of [`/v1/personas/${persona.id}`, `/v1/teams/${team.id}`]) {
     await api(path, 403, undefined, { method: 'PUT', token: agent, body: {} });

@@ -708,9 +708,10 @@ async fn create_persona(
 async fn edit_persona(
     Work(w): Work,
     Person(caller): Person,
-    Segments(id): Segments<PersonaId>,
+    Segments(id): Segments<String>,
     body: RawBody,
 ) -> Reply<Persona> {
+    let id: PersonaId = path_id(&id, "persona")?;
     exists(&w, move |w| {
         w.personas()?
             .into_iter()
@@ -736,9 +737,10 @@ async fn create_team(
 async fn edit_team(
     Work(w): Work,
     Person(caller): Person,
-    Segments(id): Segments<TeamId>,
+    Segments(id): Segments<String>,
     body: RawBody,
 ) -> Reply<Team> {
+    let id: TeamId = path_id(&id, "team")?;
     exists(&w, move |w| {
         w.teams()?
             .into_iter()
