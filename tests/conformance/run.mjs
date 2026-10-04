@@ -138,10 +138,17 @@ try {
     await writeFile(refused, 'Synthetic runtime refusal\n');
     // A dispatch starts its agent's CLI: stand-ins first on the daemon's PATH, never a real one.
     // Each writes nothing and waits until this run's folder is gone (the cleanup), so its
-    // session stays `starting` while the suite runs; pitcrew-ptyd then exits once idle.
+    // session stays `starting` while the suite runs; pitcrew-ptyd then exits once idle. For
+    // machine-setup.test.mjs they answer their version and status commands at once (not signed
+    // in), and a sign-in's "login" waits like a session.
     const bin = join(temporary, 'bin');
     await mkdir(bin, { mode: 0o700 });
-    const standIn = `#!/bin/sh\nwhile [ -d '${state}' ]; do sleep 1; done\n`;
+    const standIn =
+      `#!/bin/sh\ncase "$1 $2" in\n` +
+      `  "--version ") echo "stand-in 0.0.0"; exit 0 ;;\n` +
+      `  "auth status"|"login status") echo "Not logged in" >&2; exit 1 ;;\n` +
+      `  "auth list") echo "0 credentials"; exit 0 ;;\n` +
+      `esac\nwhile [ -d '${state}' ]; do sleep 1; done\n`;
     for (const cli of ['claude', 'codex', 'opencode'])
       await writeFile(join(bin, cli), standIn, { mode: 0o700 });
     env.PATH = [bin, process.env.PATH].filter(Boolean).join(delimiter);
@@ -203,7 +210,13 @@ try {
   }
   suite = spawn(
     process.execPath,
-    ['--test', 'tests/conformance/api.test.mjs', 'tests/conformance/scan.test.mjs', 'tests/conformance/files.test.mjs'],
+    [
+      '--test',
+      'tests/conformance/api.test.mjs',
+      'tests/conformance/scan.test.mjs',
+      'tests/conformance/files.test.mjs',
+      'tests/conformance/machine-setup.test.mjs',
+    ],
     {
       cwd: root,
       env,

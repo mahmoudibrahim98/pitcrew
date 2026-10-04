@@ -16,6 +16,7 @@ import {
   terminalTarget,
   type TerminalTarget,
 } from './live.ts';
+import { openSignInTerminal, signInTerminal } from './machine-setup.ts';
 import { loadRecaps } from './recaps.ts';
 import { MOCK_VERSION, authenticate, handleApi, type Reply } from './routes.ts';
 import {
@@ -354,7 +355,7 @@ function serveUpgrade(
     const conn =
       target.kind === 'stream'
         ? acceptStream(hub, req, socket, head, streamSince(query), caller.memberId)
-        : acceptTerminal(hub, req, socket, head, terminalTarget(hub, target.session, query));
+        : acceptTerminalOrSignIn(hub, req, socket, head, target.session, query);
     log(`WS ${path} 101`);
     return conn;
   } catch (error) {
@@ -387,6 +388,24 @@ function acceptTerminal(
 ): WebSocketConnection {
   const conn = acceptUpgrade(req, socket, head, SUBPROTOCOL);
   openTerminal(hub, conn, target);
+  return conn;
+}
+
+/** A sign-in's terminal (machine-setup.ts), else a session's. */
+function acceptTerminalOrSignIn(
+  hub: Hub,
+  req: IncomingMessage,
+  socket: Duplex,
+  head: Buffer,
+  ref: string,
+  query: URLSearchParams,
+): WebSocketConnection {
+  const signIn = signInTerminal(hub, ref);
+  if (signIn === undefined) {
+    return acceptTerminal(hub, req, socket, head, terminalTarget(hub, ref, query));
+  }
+  const conn = acceptUpgrade(req, socket, head, SUBPROTOCOL);
+  openSignInTerminal(hub, conn, signIn);
   return conn;
 }
 

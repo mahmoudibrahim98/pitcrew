@@ -7,7 +7,8 @@ node tests/conformance/run.mjs mock
 node tests/conformance/run.mjs daemon
 ```
 
-Both commands run the same `api.test.mjs` and `scan.test.mjs`. No npm dependency is needed. The
+Both commands run the same `api.test.mjs`, `scan.test.mjs`, `files.test.mjs` and
+`machine-setup.test.mjs`. No npm dependency is needed. The
 daemon runner builds `pitcrewd` and `pitcrew-ptyd` with the locked workspace dependencies, starts a
 seeded demo on an OS-assigned free loopback port, and reads its two private token files without
 printing them. Each runner creates an empty temporary home and cleans up its child process and
@@ -53,6 +54,16 @@ and sums; and a second scan while one is under way `409`, the first still ending
 That last case needs the server's scan to last a moment: the mock's takes about a second, and a
 daemon needs `--scan-hold-ms`. It never reads a person's agent homes: the mock's report is
 synthetic, and the demo daemon watches none.
+
+`machine-setup.test.mjs` covers "Machine setup" in a file of its own: the check's shape, fixed order
+and fixes (an `ok` row has none; a missing tool offers its install page; no helper row on the hub's
+own machine), one row with `?row=`, the accounts' shape and rules, a sign-in's answer, the same one
+while it runs, its terminal served (`101`) to a person and refused to an agent and not a session,
+and the refusals (no or unknown token, agent, unknown and other machines, unknown CLI, a method
+the CLI lacks, unknown body fields). On the daemon target the stand-in CLIs answer `--version` and
+their status commands at once (not signed in), and a sign-in runs the stand-in's "login", which
+waits like a session; the check also runs the runner's own `git`, `gh` and `tmux` for their
+versions. The mock's are synthetic.
 
 See [MISMATCHES.md](MISMATCHES.md) for observed differences and ambiguities. Only the daemon
 runner loads `daemon-deviations.json`. A listed failure must raise exactly its recorded status

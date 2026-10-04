@@ -136,6 +136,10 @@ the task key (`PAP-4`).
 | `POST /v1/setup` | `Setup` → `{ "workspace": Workspace, "me": Member, "machine": Machine }` | The first run (see below). Device tokens only. |
 | `GET /v1/machines` | → `Machine[]` | |
 | `POST /v1/machines/{id}/scan` | → lines of `ScanFrame` (200) | Scans the machine's agent homes for onboarding. Device tokens only. See "Machine scan". |
+| `GET /v1/machines/{id}/check` | → `MachineCheck` | What the machine has for running agents. Device tokens only. See "Machine setup". |
+| `GET /v1/machines/{id}/agents` | → `AgentAccount[]` | Each agent CLI's account, as its own status command reports it. Device tokens only. |
+| `POST /v1/machines/{id}/agents/{engine}/sign-in` | `StartSignIn`? → `SignIn` (201, or 200) | Runs the CLI's own login in a terminal. Device tokens only. |
+| `GET /v1/machines/{id}/agents/{engine}/sign-in` | → `SignIn` | That sign-in, and whether it still runs. Device tokens only. |
 | `GET /v1/members` | → `Member[]` | **agent** |
 | `GET /v1/personas` | → `Persona[]` | |
 | `GET /v1/teams` | → `Team[]` | |
@@ -633,6 +637,76 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
   the result and its failure together, and closing it is how a client stops listening.
 - **The mock** answers with a fixed synthetic report (folders under `/home/sam/`), after about a
   second of progress, by the same rules: the hub's own machine only, `409` while one runs.
+
+### Machine setup
+
+| Method and path | Body → response | Notes |
+|---|---|---|
+| `GET /v1/machines/{id}/check?row=` | → `MachineCheck` | `row` (optional) checks one row again. |
+| `GET /v1/machines/{id}/agents` | → `AgentAccount[]` | Claude Code, Codex, OpenCode, in that order. |
+| `POST /v1/machines/{id}/agents/{engine}/sign-in` | `StartSignIn` or none → `SignIn` | `201` when it starts one, `200` with the one still running. |
+| `GET /v1/machines/{id}/agents/{engine}/sign-in` | → `SignIn` | `404` when there is none. |
+
+Onboarding's machine steps, and the machine-setup wizard's: check what a machine has for running
+agents, and sign in to each agent CLI with the CLI's own login. The types are in
+`crates/protocol/src/machine_setup.rs`. All four are **device tokens only** (an agent token gets
+`403`).
+
+- **Which machine.** Only the hub's own (its first `local` machine), as for the scan. An unknown or
+  malformed id is `404`; another machine of the workspace is `409 conflict`: a remote machine is
+  checked through its own hub (a remote workspace's, through the desktop gateway), or over SSH
+  while it is being connected (desktop-gateway.md, `RemoteProbe.check`). `engine` is `claude`,
+  `codex` or `opencode`; any other is `404`.
+- **The check.** `MachineCheck`: `{ "rows": MachineCheckRow[] }`, in this order: `cli_claude`,
+  `cli_codex`, `cli_opencode`, `tmux` (not on Windows, where PitCrew's terminals never use it),
+  `git`, `gh`, `disk`, and `slurm` only where `sbatch` is on the machine's `PATH`. (`helper` is a
+  row only of a check made over SSH before PitCrew is installed.)
+  - `MachineCheckRow`: `{ "id", "status": "ok" | "warn" | "missing", "detail", "version"?,
+    "fix"? }`. `detail` is one line for people: the tool's version line, the free space, or what
+    is wrong. `version` is the tool's first line of `--version` (`-V` for tmux), cleaned of
+    escapes and control characters, at most 120 characters.
+  - A tool is looked for on the `PATH` of the hub (absolute entries only) and asked only its
+    version, with no input, for at most 15 seconds; one that is not there is `missing`, one that
+    fails or does not answer is `warn` with why. tmux older than 3.2 is `warn`. `disk` is the free
+    space of the filesystem that holds the hub's state: `warn` under 5 GB. `slurm` is `warn` when
+    `squeue` or `scancel` is missing.
+  - **`fix`** says what PitCrew can do, and is absent on an `ok` row: `install_page` (the client
+    opens that tool's install page, from **its own** table of pages by the row's `id`; no URL
+    comes from the machine) or `install_helper` (install PitCrew's helper: the connect wizard's
+    next steps). **Nothing installs a system package**, and no route runs a fix: a fix is the
+    client's to show.
+  - `?row=<id>` answers that row alone (none, where it does not apply); an unknown `row` is `400`.
+- **Accounts.** `AgentAccount`: `{ "engine", "installed", "signed_in"?, "account"?, "detail"? }`,
+  from each CLI's **own status command**, never from its files: `claude auth status`, `codex
+  login status`, `opencode auth list`, each for at most 20 seconds.
+  - `signed_in` is what the CLI said; absent when it could not tell (not installed, a CLI too old
+    to have the command, a timeout, output not understood), with why in `detail`.
+  - `account` is a label: the e-mail address Claude Code prints, `ChatGPT` or `API key` for Codex
+    (never the rest of its line, which shows part of a key), the providers OpenCode lists. At most
+    120 characters, and never anything that looks like a key or a token.
+- **Sign-in.** `POST …/sign-in` runs the CLI's own login in a terminal on the machine, in the
+  person's home folder, with nothing added to its environment: `claude auth login`, `codex login`,
+  `opencode auth login`. `StartSignIn` is `{ "method"?: "browser" | "device_code" }`;
+  `device_code` is for a machine the browser cannot reach back to, and only Codex has it (`codex
+  login --device-auth`; `400` for the others). Unknown fields are `400`.
+  - The answer is `SignIn`: `{ "engine", "terminal", "command": String[], "running", "started" }`.
+    `terminal` is an id for the **terminals route** (`GET /v1/sessions/{terminal}/terminal`, see
+    "Terminals"), the only route that knows it: it is not a session, appends no event, and `GET
+    /v1/sessions/{terminal}` is `404`. The person drives the login there.
+  - **One per CLI at a time:** asking while one runs answers that one (`200`). An ended one is
+    replaced by the next (`201`).
+  - Once its login ends (`running: false`), the terminal stays readable for 5 minutes, then it is
+    removed with its output; a login still running after 30 minutes is stopped. A hub that starts
+    removes any sign-in terminal an earlier run left.
+  - `409` when the CLI is not installed; `503` when the machine has no terminal runtime (tmux 3.2
+    or newer, or pitcrew-ptyd), or it does not answer.
+  - **PitCrew never reads the login.** The terminal relays the CLI's screen and the person's keys,
+    which nothing parses, logs or keeps; what the login stores is the CLI's, in its own files.
+    After it ends, `GET …/agents` asks the CLI again.
+- **The mock** answers a fixed synthetic check (Claude Code, Codex, tmux and git there; OpenCode and
+  gh missing; no SLURM) and accounts (Codex signed in, Claude Code not, OpenCode not installed).
+  Its sign-in terminal shows a canned login and ends when Enter is pressed in it, or by itself
+  after about two seconds; Claude Code then reports `sam@example.com`. Same rules otherwise.
 
 ### Session import (device tokens only)
 
