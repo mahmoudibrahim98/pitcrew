@@ -519,6 +519,11 @@ impl OfficeCommands<'_> {
                 status_name(from)
             )));
         }
+        if to == TaskStatus::Done && !w.auto_accept_allowed(self.member)? {
+            return Err(WorkError::conflict(
+                "Workspace safety settings disable or cap automatic acceptance.",
+            ));
+        }
         if to == TaskStatus::Done && !task.accept_auto {
             return Err(WorkError::conflict(format!(
                 "{} does not allow automatic acceptance, so only a person marks it done.",
@@ -721,10 +726,12 @@ impl Commands for OfficeCommands<'_> {
         })?;
         let mut events = vec![self.event(proposal.body())];
         match proposal.accepted_body() {
-            Some(accepted) if !pinned => events.push(self.event(accepted)),
+            Some(accepted) if !pinned && w.auto_accept_allowed(self.member)? => {
+                events.push(self.event(accepted))
+            }
             Some(_) => tracing::info!(
                 brief = ?proposal.target,
-                "the brief is pinned: the back office's proposal is only proposed"
+                "the brief is pinned or the safety budget forbids automatic acceptance: keeping the proposal"
             ),
             None => {}
         }

@@ -16,9 +16,10 @@
 // - `streamScan` is `POST /v1/machines/{id}/scan` on the hub's own machine, and `createFromScan`
 //   is `POST /v1/projects` and `POST /v1/workstreams` from that scan's suggestions, both through
 //   the data layer's client for the workspace in view;
+// - hooks preview/confirmation and workspace safety use device-only hub routes;
 // - everything else has no backend yet: it is listed in `unavailable`, rejects if called, and
 //   `stepsFor` leaves its step out. So the real first run is Welcome, Workspace, Machine check,
-//   Sign in, Scan, Create, Import, Done.
+//   Sign in, Scan, Create, Import, Hooks, Safety, Done.
 //
 // The transports (the browser's `fetch`, the desktop gateway's `gateway_request`) hand over a whole
 // body, so the scan's progress frames arrive together with its report, at its end; the scan step
@@ -65,9 +66,6 @@ import { fieldOfMessage } from './validation.ts';
 
 const NOT_YET: readonly OnboardingCall[] = [
   'integrationStatus',
-  'hooksDiff',
-  'installHooks',
-  'saveSafety',
   // The connect wizard installs the helper itself, from a plan the person reviewed.
   'launcherOptions',
   'streamInstallHelper',
@@ -99,6 +97,8 @@ export interface HubOnboardingOptions {
   transport?: Transport | undefined;
   /** The workspace's client (`useApi()`), for the scan and creating from it; without it, neither. */
   data?: HubData | undefined;
+  /** Client used only for hooks when remote scan/create are unavailable. */
+  hooksData?: HubData | undefined;
   /**
    * Opens a page outside the app (a tool's install page, for a check row's fix). By default a new
    * browser tab with no way back to this one, in a browser; the desktop app opens no window, so
@@ -225,8 +225,9 @@ interface LastScan {
 
 export function createHubOnboardingApi(options: HubOnboardingOptions = {}): OnboardingApi {
   const { setUp, data } = options;
+  const hooksData = options.hooksData ?? data;
   const remote = options.remote ?? null;
-  const transport = options.transport ?? data?.transport;
+  const transport = options.transport ?? data?.transport ?? options.hooksData?.transport;
   const openPage = options.openPage ?? (transport?.kind === 'browser' ? openInBrowser : undefined);
   const missing = new Set<OnboardingCall>(NOT_YET);
   if (setUp === undefined) missing.add('setupWorkspace');
@@ -235,6 +236,14 @@ export function createHubOnboardingApi(options: HubOnboardingOptions = {}): Onbo
     missing.add('importSessions');
     missing.add('commitImport');
     for (const call of MACHINE_SETUP) missing.add(call);
+    missing.add('hooksDiff');
+    missing.add('installHooks');
+    missing.add('saveSafety');
+    missing.add('readSafety');
+  }
+  if (hooksData === undefined) {
+    missing.add('hooksDiff');
+    missing.add('installHooks');
   }
   /** The workspace's transport, for machine setup's routes. */
   function hub(call: OnboardingCall): Transport {
@@ -472,8 +481,30 @@ export function createHubOnboardingApi(options: HubOnboardingOptions = {}): Onbo
       if (res.status !== 200) throw new Error(refusal(res));
       return JSON.parse(res.body) as { imported: number };
     },
-    hooksDiff: () => Promise.reject(new Error('hooksDiff is not available yet.')),
-    installHooks: () => Promise.reject(new Error('installHooks is not available yet.')),
-    saveSafety: () => Promise.reject(new Error('saveSafety is not available yet.')),
+    async hooksDiff() {
+      if (hooksData === undefined || transport === undefined) return unavailable('hooksDiff');
+      const machine = await ownMachine(hooksData, new AbortController().signal);
+      const res = await transport.request('POST', `/v1/machines/${encodeURIComponent(machine)}/hooks/diff`);
+      if (res.status !== 200) throw new Error(refusal(res));
+      return JSON.parse(res.body) as import('./api.ts').HooksDiff;
+    },
+    async installHooks(preview) {
+      if (hooksData === undefined || transport === undefined) return unavailable('installHooks');
+      const machine = await ownMachine(hooksData, new AbortController().signal);
+      const res = await transport.request('POST', `/v1/machines/${encodeURIComponent(machine)}/hooks/install`, JSON.stringify({ revision: preview.revision }));
+      if (res.status !== 200) throw new Error(refusal(res));
+    },
+    async readSafety() {
+      if (transport === undefined) return unavailable('readSafety');
+      const res = await transport.request('GET', '/v1/safety');
+      if (res.status !== 200) throw new Error(refusal(res));
+      const wire = JSON.parse(res.body) as { permission_mode: string; back_office_enabled: boolean; back_office_caps: { max_auto_accept_per_hour: number } };
+      return { permissionMode: wire.permission_mode.replaceAll('_', '-') as import('./api.ts').PermissionMode, backOfficeEnabled: wire.back_office_enabled, backOfficeCaps: { maxAutoAcceptPerHour: wire.back_office_caps.max_auto_accept_per_hour } };
+    },
+    async saveSafety(settings) {
+      if (transport === undefined) return unavailable('saveSafety');
+      const res = await transport.request('PUT', '/v1/safety', JSON.stringify({ permission_mode: settings.permissionMode.replaceAll('-', '_'), back_office_enabled: settings.backOfficeEnabled, back_office_caps: { max_auto_accept_per_hour: settings.backOfficeCaps.maxAutoAcceptPerHour } }));
+      if (res.status !== 200) throw new Error(refusal(res));
+    },
   };
 }

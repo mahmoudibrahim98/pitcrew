@@ -1462,3 +1462,29 @@ async fn an_ended_session_is_not_revived_by_a_restatement() {
         SessionState::Idle
     );
 }
+
+#[tokio::test]
+async fn dispatch_without_persona_uses_workspace_permission_default() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner = Recorder::new(Answer::Start);
+    let work = service(dir.path(), Some(Arc::clone(&runner)));
+    work.save_safety(
+        &person(SAM),
+        pitcrew_protocol::onboarding::SafetySettings {
+            permission_mode: PermissionMode::AcceptEdits,
+            ..Default::default()
+        },
+    )
+    .expect("save safety");
+    let res = dispatch(
+        &work,
+        "PAP-2",
+        json!({"agent": WRITER, "brief": "Synthetic task."}),
+    )
+    .await;
+    expect(&res, 202);
+    assert_eq!(
+        runner.calls()[0].permission_mode,
+        PermissionMode::AcceptEdits
+    );
+}

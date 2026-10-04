@@ -84,3 +84,7 @@ and link target inside its own temporary folder. Windows daemon conformance keep
 Unix-runtime skip; Rust daemon HTTP tests cover Files API routes there.
 
 `run.mjs` runs `import.test.mjs` serially after the shared suite, since committing inclusion affects all views of its disposable hub. Both targets check dry-run/commit agreement, each mode, filters, excluded session/activity/recap reads, restoration, validation and device-only access.
+
+Hook-install conformance writes agent configurations. It is disabled unless
+`PITCREW_CONFORMANCE_SYNTHETIC_HOOKS=1`, which `run.mjs` sets only for its managed
+synthetic targets. Do not set it when pointing the suite at an existing hub.

@@ -7,7 +7,7 @@ The first-run wizard, and connecting a remote machine in the desktop app. See
 | File | What |
 |---|---|
 | `api.ts` | The `OnboardingApi` contract (below): every call the first-run wizard makes, typed, with `unavailable` (the calls with no backend yet) and `SetupRefused` (why setup was refused, by field). |
-| `hub-api.ts` | `createHubOnboardingApi({ setUp, remote, data, transport, openPage })`: the real one. `setupWorkspace` is `POST /v1/setup` (the data layer's `setUp`, through the workspace's own transport); `discoverHosts` is the gateway's `sshHosts`; machine setup (`checkMachine`, `fixMachineRow`, `agentAccounts`, `startSignIn`, `signInRunning`, `stopSignIn`) is api-v1.md's "Machine setup" on the hub's own machine, through `transport` (another machine's check is `deferred`: it is checked as it is connected); `launcherOptions` and `streamInstallHelper` are unavailable (the connect wizard installs the helper from a plan the person reviewed); `streamScan` and `createFromScan` are the scan and creating from it, through the workspace's client (`data`, `useApi()`; without it, unavailable); the import is `transport`'s; every other call is unavailable. |
+| `hub-api.ts` | `createHubOnboardingApi({ setUp, remote, data, hooksData, transport, openPage })`: the real one. `setupWorkspace` is `POST /v1/setup` (the data layer's `setUp`, through the workspace's own transport); `discoverHosts` is the gateway's `sshHosts`; machine setup (`checkMachine`, `fixMachineRow`, `agentAccounts`, `startSignIn`, `signInRunning`, `stopSignIn`) is api-v1.md's "Machine setup" on the hub's own machine, through `transport` (another machine's check is `deferred`: it is checked as it is connected); `launcherOptions` and `streamInstallHelper` are unavailable (the connect wizard installs the helper from a plan the person reviewed); `streamScan` and `createFromScan` are the scan and creating from it, through the workspace's client (`data`, `useApi()`; without it, unavailable); the import is `transport`'s; hooks use server-held previews and revision confirmation (`hooksData`, defaulting to `data`); safety reads/saves authored workspace preferences; every other call is unavailable. |
 | `machine-wire.ts` | Machine setup on the wire (`pitcrew_protocol::machine_setup`, snake_case) and its checked mapping to this feature's types: rows with unknown ids, statuses or fixes are dropped, text is cut to a line with control characters made spaces and hidden ones (direction overrides such as U+202E, zero-width and tag characters: `pitcrew_protocol::text::is_hidden`'s table) dropped. |
 | `install-pages.ts` | Each check row's install page: the only place a fix's URL comes from (the hub and a remote machine only say *that* a row has one). |
 | `install-log.ts` | The live install log: one line per progress message of the gateway's add. |
@@ -35,7 +35,7 @@ The first-run wizard, and connecting a remote machine in the desktop app. See
 A fresh hub answers `GET /v1/workspace` with `setup_needed: true`, and the shell sends the
 workspace to `paths.setup(ws)`, this feature's first-run wizard, from any page (see
 `src/shell/README.md`, "The first run"). Against the real hub the wizard is **Welcome, Workspace,
-Machine check, Sign in, Scan, Create, Import, Done**, then Home:
+Machine check, Sign in, Scan, Create, Import, Hooks, Safety, Done**, then Home:
 
 - **Workspace** is `POST /v1/setup`: the workspace's name, your name, your handle (suggested from
   the first word of your name, `Sam Rivera` → `@sam`, until you type one), and this machine's name
@@ -89,12 +89,13 @@ Machine check, Sign in, Scan, Create, Import, Done**, then Home:
   visit is the one that set it up (its Done step is still to come) or the development flag asks
   for the fake wizard.
 
-The other steps (integrations, hooks, safety) need routes that do not exist yet, so
-`createHubOnboardingApi` lists their calls in `unavailable` and `stepsFor` leaves them out. They
-come back, unchanged, as their routes land. A remote workspace (the desktop's gateway says `kind:
-'remote'`) gets no data client, so its first run has no Scan and Create (scanning a remote machine
-is a later step); its Machine check and Sign in are its hub's, on the remote machine, through the
-gateway.
+The other step (integrations) needs routes that do not exist yet, so `createHubOnboardingApi`
+lists its call in `unavailable` and `stepsFor` leaves it out; it comes back, unchanged, as its
+routes land. The helper install is never a first-run step: the hub's own machine needs no helper,
+and the connect wizard installs it on another machine from a plan the person reviewed. A remote
+workspace (the desktop's gateway says `kind: 'remote'`) gets no data client, so its first run has
+no Scan, Create or Hooks (scanning a remote machine is a later step); its Machine check, Sign in,
+Import and Safety are its hub's, on the remote machine, through the gateway.
 
 ### Creating from the scan
 
@@ -185,9 +186,9 @@ answer for a step already left is dropped.
 ## The `OnboardingApi` contract
 
 `setupWorkspace`, `discoverHosts`, the machine check and its fixes, the accounts and sign-in,
-`streamScan`, `createFromScan` and the import are real.
-Everything else is this stream's proposal for what the real routes should look like (`api-v1.md`
-has no hooks or safety routes yet); `fake-api.ts` is their only implementation. Types are in `api.ts`, reusing `Engine`, `Project`, `Workstream` etc. from
+`streamScan`, `createFromScan`, the import, the hooks and the safety settings are real.
+`integrationStatus` is this stream's proposal for what its route should look like; `fake-api.ts`
+is its only implementation. Types are in `api.ts`, reusing `Engine`, `Project`, `Workstream` etc. from
 `src/data`; the scan's wire types, which the data layer does not declare, are in `scan-wire.ts`.
 
 | Method | Shape | Notes |
@@ -207,12 +208,11 @@ has no hooks or safety routes yet); `fake-api.ts` is their only implementation. 
 | `integrationStatus()` | `() → IntegrationStatus[]` | Proposed. Stream G owns the real connections. |
 | `streamScan(target, onEvent)` | `(ScanTarget, cb) → Streamed` | **Real**: `POST /v1/machines/{id}/scan` on the hub's own machine. Streams `progress`, ends with `done` carrying counts and suggested projects/workstreams, or `error` with why. |
 | `createFromScan(selection)` | `ProjectSelection[] → { projects, workstreams }` | **Real**: `POST /v1/projects` and `POST /v1/workstreams` from the last scan's suggestions (see "Creating from the scan"). |
-| `importSessions(filter)` / `commitImport(filter)` | `ImportFilter → { count }` / `{ imported }` | Proposed. A dry run, then the import (sessions read in place, never moved). |
-| `hooksDiff()` / `installHooks()` | `() → HooksDiff` / `() → void` | Proposed. The diff is always shown before installing. |
-| `saveSafety(settings)` | `SafetySettings → void` | Proposed. `PermissionMode` should be promoted to `crates/protocol`. |
+| `importSessions(filter)` / `commitImport(filter)` | `ImportFilter → { count }` / `{ imported }` | **Real**: `POST /v1/import/dry-run`, then `PUT /v1/import` (sessions read in place, never moved). |
+| `hooksDiff()` / `installHooks(preview)` | `() → HooksDiff` / `HooksDiff → void` | **Real**: `POST /v1/machines/{id}/hooks/diff`, then `…/hooks/install` with the preview's `revision`. The diff is always shown before installing. |
+| `readSafety()` / `saveSafety(settings)` | `() → SafetySettings` / `SafetySettings → void` | **Real**: `GET` and `PUT /v1/safety`. |
 
-**Still proposed, for the integrator:** the hooks APIs (and the integrations and safety calls with
-them). The old
+**Still proposed, for the integrator:** the integrations call. The old
 "Add a machine" wizard and its palette command are retired: its machine-picker-led flow ran only
 against the fake, and connecting a remote hub is now the connect wizard above. Adding a machine to
 an existing hub (a runner reporting to it) comes back when those routes land.
@@ -227,11 +227,20 @@ End to end, from `apps/ui`: the demo-mode suite (`corepack pnpm --filter @pitcre
 includes `e2e/onboarding-fake.spec.ts`, the whole fake wizard with axe, light and dark. The first
 run against a fresh hub, and the connect wizard and the prompt dialog in a simulated desktop, need
 fresh mock hubs (`PITCREW_MOCK_FRESH=1`) and run with their own config. The first run there is
-Welcome, Workspace, Scan (the mock's synthetic report), Create and Done, with axe in both
-themes:
+Welcome, Workspace, Machine check, Sign in, Scan (the mock's synthetic report), Create, Import,
+Hooks, Safety and Done, with axe in both themes:
 
 ```
 corepack pnpm --filter @pitcrew/ui exec playwright test --config e2e/fresh.config.ts
 ```
 
 The real first run now includes Import after Create. It previews the indexed-session count for all sessions, a UTC date/engine/folder filter, or start fresh, then stores the choice with PUT. Requests that fail display an error and keep confirmation disabled until a successful count. Sessions stay in place; widening the hub choice is reversible via `/v1/import`.
+
+Hooks are previewed file by file on the hub’s own machine. Only **Install hooks** confirms the displayed revision; concurrent edits are refused and **Refresh diff** fetches a new preview. Skipping writes nothing. Remote machines within that workspace remain unsupported. Safety loads saved preferences before editing, warns for **Skip permissions**, and saves permission defaults and the back-office hourly acceptance budget. Read/save failures stay on the step.
+
+Onboarding review: hook previews detect supported CLIs on PATH or through their
+homes, skip conflicting engines while applying other changes, and report the
+skipped engines. No-change previews cannot set the wizard's installed flag.
+Desktop packages include the hook CLI beside the daemon. Safety uses snake_case
+wire fields and the shared PermissionMode enum; bypass defaults are currently
+refused. Unsaved safety reports `saved: false` for legacy per-task acceptance.

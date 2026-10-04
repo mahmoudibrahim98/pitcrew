@@ -4,11 +4,12 @@
 // for the data layer's `setUp`), the host list is the gateway's `sshHosts`, the scan is
 // `POST /v1/machines/{id}/scan` and creating from it `POST /v1/projects` and `/v1/workstreams`
 // (here a stand-in for the data layer's client), and machine setup's routes answer the machine
-// check and the accounts (`machine-setup.test.tsx` tests them). Without the client the first run
-// is Welcome, Workspace, Done; with it, Machine check, Sign in, Scan, Create and Import come
-// between. The hub's refusals land by the right field, and a workspace set up meanwhile goes Home.
+// check and the accounts (`machine-setup.test.tsx` tests them), and the hooks and safety routes
+// theirs. Without the client the first run is Welcome, Workspace, Done; with it, Machine check,
+// Sign in, Scan, Create, Import, Hooks and Safety come between. The hub's refusals land by the
+// right field, and a workspace set up meanwhile goes Home.
 
-import { cleanup, fireEvent, screen } from '@testing-library/react';
+import { cleanup, fireEvent, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   ApiError,
@@ -239,6 +240,8 @@ function fakeHub(options: FakeHubOptions = {}) {
       label: 'a test hub',
       request: (method, path) => {
         sent.push(`${method} ${path}`);
+        if (path.endsWith('/hooks/diff')) return Promise.resolve({ status: 200, body: JSON.stringify({revision: 'test-preview', files: [], engines: []}) });
+        if (path === '/v1/safety') return Promise.resolve({ status: 200, body: JSON.stringify({permission_mode: 'default', back_office_enabled: false, back_office_caps: {max_auto_accept_per_hour: 20}}) });
         if (path === '/v1/import/dry-run') return Promise.resolve({ status: 200, body: '{"count":6}' });
         if (path === '/v1/import') return Promise.resolve({ status: 200, body: '{"imported":6}' });
         // Machine setup (`machine-setup.test.tsx` covers it): the hub's machines, its check, its accounts.
@@ -320,9 +323,11 @@ describe('the scan, from the hub', () => {
       'scan',
       'create',
       'import',
+      'hooks',
+      'safety',
       'done',
     ]);
-    for (const call of ['hooksDiff', 'saveSafety', 'integrationStatus'] as const) {
+    for (const call of ['integrationStatus', 'launcherOptions'] as const) {
       expect(api.unavailable.has(call)).toBe(true);
     }
     // No remote gateway here; and the hub's own machine needs no helper anyway.
@@ -467,7 +472,7 @@ describe('creating from the scan', () => {
 });
 
 describe('the real first run, with the scan', () => {
-  it('is Welcome, Workspace, Scan, Create, Done, creating what stayed ticked', async () => {
+  it('is every step the hub serves, in order, creating what stayed ticked', async () => {
     const setUp = vi.fn<(setup: Setup) => Promise<SetupResult>>(() => Promise.resolve(RESULT));
     const hub = fakeHub();
     renderWizard(createHubOnboardingApi({ setUp, data: hub.data }));
@@ -480,6 +485,8 @@ describe('the real first run, with the scan', () => {
       'Scan',
       'Create',
       'Import',
+      'Hooks',
+      'Safety',
       'Done',
     ]);
     fireEvent.click(screen.getByRole('button', { name: 'Get started' }));
@@ -507,6 +514,11 @@ describe('the real first run, with the scan', () => {
 
     await screen.findByText('This will import 6 sessions.');
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    await screen.findByRole('button', { name: 'Install hooks' });
+    fireEvent.click(screen.getByRole('button', { name: 'Skip hooks' }));
+    await screen.findByLabelText('Let the back office accept low-risk actions automatically');
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
     await screen.findByRole('heading', { level: 1, name: "You're set up" });
     expect(screen.getByText('Created 2 projects.')).toBeTruthy();
     expect(hub.projects.map((p) => [p.key, p.name])).toEqual([
@@ -514,11 +526,15 @@ describe('the real first run, with the scan', () => {
       ['TOO', 'tools'],
     ]);
     expect(hub.workstreams.map((w) => w.name)).toEqual(['drafts']);
-    // Machine setup only reads; what changes the hub is the scan, then the import.
-    expect(hub.sent.filter((line) => !line.startsWith('GET '))).toEqual([
+    // Machine setup only reads; what goes to the hub otherwise is the scan, the import, the hooks'
+    // preview (then skipped) and the safety settings, in that order.
+    expect(hub.sent.filter((line) => !line.startsWith('GET ') || line === 'GET /v1/safety')).toEqual([
       `POST /v1/machines/${LAPTOP}/scan`,
       'POST /v1/import/dry-run',
       'PUT /v1/import',
+      `POST /v1/machines/${LAPTOP}/hooks/diff`,
+      'GET /v1/safety',
+      'PUT /v1/safety',
     ]);
   });
 
@@ -561,4 +577,14 @@ describe('the real first run, with the scan', () => {
     await screen.findByText(/Found 2 likely projects/);
     expect(hub.sent.filter((line) => line.endsWith('/scan'))).toHaveLength(2);
   });
+});
+
+it('maps safety snake_case wire fields and permission enums at the UI boundary', async () => {
+  const wire = { permission_mode: 'accept_edits', back_office_enabled: true, back_office_caps: { max_auto_accept_per_hour: 8 } };
+  const request = vi.fn().mockResolvedValue({ status: 200, body: JSON.stringify(wire) });
+  const api = createHubOnboardingApi({ transport: { kind: 'browser', label: 'synthetic hub', request, openSocket: () => { throw new Error('Unused socket.'); } } });
+  const settings = await api.readSafety();
+  expect(settings).toEqual({ permissionMode: 'accept-edits', backOfficeEnabled: true, backOfficeCaps: { maxAutoAcceptPerHour: 8 } });
+  await api.saveSafety(settings);
+  expect(request).toHaveBeenLastCalledWith('PUT', '/v1/safety', JSON.stringify(wire));
 });

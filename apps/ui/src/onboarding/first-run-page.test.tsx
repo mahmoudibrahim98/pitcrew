@@ -5,7 +5,7 @@
 // that machine through its hub; Done replaces the wizard with Home; and a workspace already set up goes Home at once (unless the development flag asks
 // for the fake wizard).
 
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { createMemoryHistory, RouterProvider } from '@tanstack/react-router';
 import { StrictMode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -70,6 +70,8 @@ describe('the first-run route', () => {
       if (req.method === 'PUT' && req.path === '/v1/import') {
         return { status: 200, body: '{"imported":0}' };
       }
+      if (req.path.endsWith('/hooks/diff')) return {status: 200, body: JSON.stringify({revision: 'test-preview', files: [], engines: []})};
+      if (req.path === '/v1/safety') return {status: 200, body: JSON.stringify({permission_mode: 'default', back_office_enabled: false, back_office_caps: {max_auto_accept_per_hour: 20}})};
       return fresh.daemon(req);
     });
     const router = renderApp('/');
@@ -95,6 +97,10 @@ describe('the first-run route', () => {
     await heading('Import sessions');
     await screen.findByText('This will import 0 sessions.');
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    expect(screen.queryByRole('button', {name: 'Skip hooks'})).toBeNull();
+    await screen.findByLabelText('Let the back office accept low-risk actions automatically');
+    await waitFor(() => expect((screen.getByRole('button', {name: 'Continue'}) as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole('button', {name: 'Continue'}));
     await heading("You're set up");
     const requests = desktop.commands('gateway_request').map((args) => args.req as { workspace: string; method: string; path: string; body?: string });
     const previews = requests.filter((req) => req.path === '/v1/import/dry-run');
@@ -104,7 +110,7 @@ describe('the first-run route', () => {
     }
     expect(requests.filter((req) => req.path === '/v1/import').map((req) =>
       [req.workspace, req.method, JSON.parse(req.body ?? '{}')])).toEqual([[WS, 'PUT', { mode: 'all' }]]);
-    expect(requests.some((req) => req.path.endsWith('/scan') || req.method === 'POST' && req.path === '/v1/projects')).toBe(false);
+    expect(requests.some((req) => req.path.endsWith('/hooks/diff') || req.path.endsWith('/hooks/install') || req.path.endsWith('/scan') || req.method === 'POST' && req.path === '/v1/projects')).toBe(false);
     expect(fresh.setups).toEqual([
       { workspace_name: 'Cluster Lab', person: { name: 'Sam Rivera', handle: '@sam' }, machine_name: 'hpc-login' },
     ]);

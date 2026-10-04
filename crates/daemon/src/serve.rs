@@ -592,6 +592,7 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         .device(crate::scan::routes(Arc::clone(&work), homes.as_deref()))
         .device(crate::machine_setup::routes(machine_setup))
         .device(crate::files::routes(Arc::clone(&work), state.root()))
+        .device(crate::onboarding::routes(Arc::clone(&work)))
         // A sign-in's terminal opens only for the member who started it.
         .device(terminals.routes(TerminalConfig::default()))
         .device(transcripts.routes())

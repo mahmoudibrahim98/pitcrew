@@ -33,6 +33,7 @@ mod init;
 mod locations;
 mod machine_setup;
 mod office;
+mod onboarding;
 mod recaps;
 mod refs;
 mod runner;

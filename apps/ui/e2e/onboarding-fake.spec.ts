@@ -107,7 +107,7 @@ async function walkFirstRun(page: Page, theme: 'Light' | 'Dark') {
 
   // 10. Hooks.
   await expect(heading(page, 'Install hooks')).toBeVisible();
-  await expect(page.getByText('~/.claude/settings.json')).toBeVisible(wait);
+  await expect(page.getByText('~/.claude/settings.json', { exact: true })).toBeVisible(wait);
   await expectNoAxeViolations(page, `hooks (${theme})`);
   await page.getByRole('button', { name: 'Install hooks' }).click();
 

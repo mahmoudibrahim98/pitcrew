@@ -245,6 +245,8 @@ export interface HooksDiffFile {
 }
 
 export interface HooksDiff {
+  revision: string;
+  engines: { engine: string; status: string; detail: string }[];
   files: HooksDiffFile[];
 }
 
@@ -355,7 +357,8 @@ export interface OnboardingApi {
   commitImport(filter: ImportFilter): Promise<ImportResult>;
 
   hooksDiff(): Promise<HooksDiff>;
-  installHooks(): Promise<void>;
+  installHooks(preview: HooksDiff): Promise<void>;
+  readSafety(): Promise<SafetySettings>;
 
   saveSafety(settings: SafetySettings): Promise<void>;
 }

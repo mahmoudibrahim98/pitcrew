@@ -56,7 +56,7 @@ const NEEDS: Record<StepId, readonly OnboardingCall[]> = {
   create: ['streamScan', 'createFromScan'],
   import: ['importSessions', 'commitImport'],
   hooks: ['hooksDiff', 'installHooks'],
-  safety: ['saveSafety'],
+  safety: ['readSafety', 'saveSafety'],
   done: [],
 };
 

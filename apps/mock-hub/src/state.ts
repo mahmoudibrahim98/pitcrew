@@ -1,3 +1,4 @@
+import { Onboarding } from './onboarding.ts';
 // In-memory state: the demo workspace, the event log and the session transcripts.
 //
 // The event log is the fixture's 15 events (revisions 1–15) followed by everything the mock
@@ -162,6 +163,7 @@ function bareId(ref: string, prefix: string): string {
 }
 
 export class Hub {
+  onboarding = new Onboarding();
   importChoice: import("./import.ts").ImportChoice = { filter: { mode: "all", engines: [], folders: [] }, committed_at: null };
   readonly cursors = new Map<MemberId, Map<string, number>>();
   readonly workspace: Workspace;

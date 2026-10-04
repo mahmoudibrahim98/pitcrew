@@ -25,6 +25,8 @@ const env = {
   ...process.env,
   HOME: home,
   USERPROFILE: home,
+  CLAUDE_CONFIG_DIR: join(home, ".claude"),
+  CODEX_HOME: join(home, ".codex"),
   XDG_DATA_HOME: join(home, 'data'),
   XDG_CONFIG_HOME: join(home, 'config'),
   XDG_CACHE_HOME: join(home, 'cache'),
@@ -32,6 +34,7 @@ const env = {
   APPDATA: join(home, 'appdata'),
   LOCALAPPDATA: join(home, 'localappdata'),
   PITCREW_CONFORMANCE_EXPECTED: '',
+  PITCREW_CONFORMANCE_SYNTHETIC_HOOKS: '1',
 };
 let daemon, suite, mock, build;
 // Every process the daemon starts (pitcrew-ptyd, and the stand-in CLIs it runs) inherits this
@@ -117,7 +120,7 @@ try {
   } else {
     build = spawn(
       'cargo',
-      ['build', '-p', 'pitcrew-daemon', '-p', 'pitcrew-ptyd', '--bins', '--locked'],
+      ['build', '-p', 'pitcrew-daemon', '-p', 'pitcrew-ptyd', '-p', 'pitcrew-cli', '--bins', '--locked'],
       { cwd: root, stdio: 'inherit' },
     );
     const [code] = await once(build, 'exit');
@@ -138,14 +141,15 @@ try {
     await writeFile(refused, 'Synthetic runtime refusal\n');
     // A dispatch starts its agent's CLI: stand-ins first on the daemon's PATH, never a real one.
     // Each writes nothing and waits until this run's folder is gone (the cleanup), so its
-    // session stays `starting` while the suite runs; pitcrew-ptyd then exits once idle. For
-    // machine-setup.test.mjs they answer their version and status commands at once (not signed
-    // in), and a sign-in's "login" waits like a session.
+    // session stays `starting` while the suite runs; pitcrew-ptyd then exits once idle. They
+    // answer `--version` at once (a Claude Code new enough for onboarding.test.mjs's hooks), and
+    // for machine-setup.test.mjs their status commands too (not signed in); a sign-in's "login"
+    // waits like a session.
     const bin = join(temporary, 'bin');
     await mkdir(bin, { mode: 0o700 });
     const standIn =
       `#!/bin/sh\ncase "$1 $2" in\n` +
-      `  "--version ") echo "stand-in 0.0.0"; exit 0 ;;\n` +
+      `  "--version ") echo 2.1.139; exit 0 ;;\n` +
       `  "auth status"|"login status") echo "Not logged in" >&2; exit 1 ;;\n` +
       `  "auth list") echo "0 credentials"; exit 0 ;;\n` +
       `esac\nwhile [ -d '${state}' ]; do sleep 1; done\n`;
@@ -208,6 +212,9 @@ try {
     ).trim();
     env.PITCREW_CONFORMANCE_EXPECTED = join(root, 'tests/conformance/daemon-deviations.json');
   }
+  suite = spawn(process.execPath, ['--test', 'tests/conformance/onboarding.test.mjs'], { cwd: root, env, stdio: 'inherit' });
+  const [onboardingCode] = await once(suite, 'exit');
+  process.exitCode = onboardingCode ?? 1;
   suite = spawn(
     process.execPath,
     [
@@ -224,7 +231,7 @@ try {
     },
   );
   const [code] = await once(suite, 'exit');
-  process.exitCode = code ?? 1;
+  process.exitCode = process.exitCode || (code ?? 1);
   {
     suite = spawn(process.execPath, ['--test', 'tests/conformance/import.test.mjs'], { cwd: root, env, stdio: 'inherit' });
     const [importCode] = await once(suite, 'exit');

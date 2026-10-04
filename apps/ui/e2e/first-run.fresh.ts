@@ -4,10 +4,10 @@ import { FIRST_RUN_HUB, MOCK_DEVICE_TOKEN } from './fresh-hubs';
 
 // The first run in a browser, against a fresh mock hub (`fresh.config.ts`): the shell sends the
 // empty workspace to the first-run wizard, the wizard is Welcome, Workspace, Machine check, Sign
-// in, Scan, Create, Import, Done against the real `POST /v1/setup`, machine setup's routes (the
-// mock's synthetic check, accounts and sign-in terminal), `POST /v1/machines/{id}/scan` (the mock's
-// synthetic report), `POST /v1/projects` and `POST /v1/workstreams`, and Home stays Home
-// afterwards. `GET /v1/me` is then the new person, and the projects and workstreams are where the
+// in, Scan, Create, Import, Hooks, Safety, Done against the real `POST /v1/setup`, machine setup's
+// routes (the mock's synthetic check, accounts and sign-in terminal), `POST /v1/machines/{id}/scan`
+// (the mock's synthetic report), `POST /v1/projects` and `POST /v1/workstreams`, the hooks preview
+// and the safety settings, and Home stays Home afterwards. `GET /v1/me` is then the new person, and the projects and workstreams are where the
 // scan found them. axe finds nothing on the new screens, light and dark.
 
 const AUTH = { Authorization: `Bearer ${MOCK_DEVICE_TOKEN}` };
@@ -38,6 +38,8 @@ test('the first run, from an empty workspace to Home as the new person', async (
     /Scan/,
     /Create/,
     /Import/,
+    /Hooks/,
+    /Safety/,
     /Done/,
   ]);
   await expectNoAxeViolations(page, 'welcome');
@@ -117,7 +119,14 @@ test('the first run, from an empty workspace to Home as the new person', async (
   await page.getByRole('button', { name: 'Continue' }).click();
   expect((await request.get(`${FIRST_RUN_HUB}/v1/import`, { headers: AUTH })).status()).toBe(200);
 
-  // Done, then Home, which stays Home.
+  // Hooks and Safety, then Done, then Home, which stays Home.
+  await expect(heading(page, 'Install hooks')).toBeVisible();
+  await expect(page.getByText('/home/sam/.claude/settings.json', {exact: true})).toBeVisible();
+  await expectNoAxeViolations(page, 'hooks');
+  await page.getByRole('button', {name: 'Install hooks'}).click();
+  await expect(page.getByLabel('Let the back office accept low-risk actions automatically')).toBeVisible();
+  await expectNoAxeViolations(page, 'safety');
+  await page.getByRole('button', {name: 'Continue'}).click();
   await expect(heading(page, "You're set up")).toBeVisible();
   await expect(page.getByText('“Demo Lab” is ready, with you as Sam Rivera (@sam) on This laptop.')).toBeVisible();
   await expect(page.getByText('Created 2 projects.')).toBeVisible();
