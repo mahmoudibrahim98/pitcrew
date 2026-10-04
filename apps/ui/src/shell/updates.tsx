@@ -1,4 +1,4 @@
-﻿import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
+import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Button, Dialog, DialogContent, DialogFooter } from '../design/index.ts';
 import { Page } from './pages/page.tsx';
 
@@ -48,7 +48,15 @@ export function DesktopUpdates({ children }: { children: ReactNode }) {
     {status?.version !== undefined && status.version !== dismissed && <aside aria-label="Desktop update" className="fixed right-4 bottom-4 z-30 max-w-sm rounded-lg border border-line bg-card p-4 text-sm text-ink shadow-pop">
       <p>PitCrew {status.version} is available.</p>
       <div className="mt-2 flex gap-2">
-        <Button disabled={busy} onClick={() => void run('gateway_update_notes', { version: status.version })}>Release notes</Button>
+        <a
+          href={status.notesUrl}
+          aria-disabled={busy}
+          className="inline-flex items-center font-medium hover:underline"
+          onClick={(event) => {
+            event.preventDefault();
+            if (!busy) void run('gateway_update_notes', { version: status.version });
+          }}
+        >Release notes</a>
         <Button disabled={busy} onClick={() => setConfirm(status.version)}>Update</Button>
         <Button disabled={busy} onClick={() => setDismissed(status.version)}>Later</Button>
       </div>

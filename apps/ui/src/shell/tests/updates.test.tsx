@@ -14,6 +14,11 @@ beforeEach(() => {
   ipc.invoke.mockResolvedValue(available);
 });
 afterEach(cleanup);
+it('opens the retained version release notes through Rust', async () => {
+  render(<DesktopUpdates><UpdateSettings /></DesktopUpdates>);
+  fireEvent.click(await screen.findByRole('link', { name: 'Release notes' }));
+  await waitFor(() => expect(ipc.invoke).toHaveBeenCalledWith('gateway_update_notes', { version: '1.2.3' }));
+});
 it('offers an update without installing and requires explicit confirmation', async () => {
   render(<DesktopUpdates><UpdateSettings /></DesktopUpdates>);
   await screen.findByText('PitCrew 1.2.3 is available.');
