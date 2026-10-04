@@ -17,8 +17,8 @@ since?: string,
 /**
  * Allowed engines.
  */
-engines: Array<Engine>, 
+engines?: Array<Engine>, 
 /**
  * Working directories and their descendants.
  */
-folders: Array<string>, };
+folders?: Array<string>, };

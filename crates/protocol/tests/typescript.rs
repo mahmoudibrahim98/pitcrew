@@ -312,6 +312,11 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
             mode: runner::EndMode::Graceful,
         },
     )?;
+    // Request dimensions may be omitted even though Rust serializes their defaults.
+    examples.push_str(
+        "export const allImport: import('../index.ts').ImportFilter = { mode: 'all' };\n",
+    );
+    examples.push_str("export const filteredImport: import('../index.ts').ImportFilter = { mode: 'filtered', since: '2026-01-01' };\n");
     fs::write(package.join("tests/fixtures.ts"), examples)?;
     // Never delete checked-in files. A removed type needs an explicit repository change.
     write_exports(&bindings, &destination.join("bindings"))?;

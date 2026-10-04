@@ -28,9 +28,11 @@ pub struct ImportFilter {
     pub since: Option<String>,
     /// Allowed engines.
     #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(optional, as = "Option<_>"))]
     pub engines: Vec<Engine>,
     /// Working directories and their descendants.
     #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(optional, as = "Option<_>"))]
     pub folders: Vec<String>,
 }
 
