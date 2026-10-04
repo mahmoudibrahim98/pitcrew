@@ -173,7 +173,8 @@ describe('syntax colouring', () => {
   });
 
   it('stays linear on hostile input, in every language', () => {
-    const half = HIGHLIGHT_LIMIT / 2;
+    // Long enough that a quadratic rule takes many seconds, short enough to keep the suite light.
+    const half = 40_000;
     const hostile = [
       `a${' '.repeat(half)}`,
       'a '.repeat(half / 2),
@@ -201,7 +202,7 @@ describe('syntax colouring', () => {
       for (const text of hostile) {
         const started = performance.now();
         expect(tokenize(text, language).map((t) => t.text).join('')).toBe(text);
-        expect(performance.now() - started, `${language.id}: ${JSON.stringify(text.slice(0, 12))}`).toBeLessThan(1_500);
+        expect(performance.now() - started, `${language.id}: ${JSON.stringify(text.slice(0, 12))}`).toBeLessThan(1_000);
       }
     }
   }, 60_000);
