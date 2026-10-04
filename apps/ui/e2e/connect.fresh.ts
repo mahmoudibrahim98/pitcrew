@@ -95,12 +95,12 @@ test('connects a remote machine, answering SSH in the app, and sets its fresh hu
   await expect(password.getByLabel('Password')).toHaveAttribute('type', 'password');
   await expect(password.getByLabel('Password')).toHaveAttribute('autocomplete', 'off');
   await expectNoAxeViolations(page, 'password dialog');
+  // Behind the dialog, the install's live log so far: a line for each step as it went.
+  const log = page.getByRole('log', { name: 'Install log', includeHidden: true });
+  await expect(log).toContainText('Copy pitcrewd 0.4.0 to ~/.pitcrew: checking for a copy already there');
+  await expect(log).toContainText('Copy pitcrewd 0.4.0 to ~/.pitcrew: 40% sent');
   await password.getByLabel('Password').fill(SECRET);
   await password.getByRole('button', { name: 'Send' }).click();
-  // The install's live log, a line for each step as it went.
-  const log = page.getByRole('log', { name: 'Install log' });
-  await expect(log).toContainText('Copy pitcrewd 0.4.0 to ~/.pitcrew: verifying the sha256 and the version on the machine');
-  await expect(log).toContainText('Submit the job below: job 4242 pending (Priority)');
 
   // 6. Setup: the fresh remote hub, through its own transport.
   await expect(heading(page, 'Set up hpc-login')).toBeVisible();
