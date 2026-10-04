@@ -552,9 +552,16 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
     // "Who may change a session through a hook"); without it they are only logged.
     let hook_sink: Arc<dyn HookSink> = Arc::new(Hooks(Arc::clone(&attached)));
     let hooks = HookIntake::start(hook_sink, HOOK_QUEUE).context("cannot start the hook intake")?;
-    let terminals: Arc<dyn Terminals> = Arc::new(SessionTerminals::new(
+    // Machine setup's routes, and its sign-in terminals, which the terminals route serves too.
+    let machine_setup = Arc::new(crate::machine_setup::MachineSetup::new(
         Arc::clone(&work),
-        Arc::clone(&attached),
+        state.root().to_path_buf(),
+        &runtime,
+    ));
+    machine_setup.start();
+    let terminals: Arc<dyn Terminals> = Arc::new(crate::machine_setup::SignInTerminals::new(
+        machine_setup.sign_ins(),
+        SessionTerminals::new(Arc::clone(&work), Arc::clone(&attached)),
     ));
     let transcripts = Transcripts::new(Arc::clone(&work), Arc::clone(&attached));
     let sessions = Sessions::new(Arc::clone(&work), Arc::clone(&attached));
@@ -581,6 +588,7 @@ async fn run(serving: Serving<'_>) -> anyhow::Result<()> {
         )
         .device(Recaps::new(recaps).routes())
         .device(crate::scan::routes(Arc::clone(&work), homes.as_deref()))
+        .device(crate::machine_setup::routes(machine_setup))
         .device(crate::files::routes(Arc::clone(&work), state.root()))
         .device(pitcrew_api::terminal::routes(
             terminals,

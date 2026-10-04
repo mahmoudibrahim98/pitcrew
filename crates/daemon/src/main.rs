@@ -31,6 +31,7 @@ mod files;
 mod host;
 mod init;
 mod locations;
+mod machine_setup;
 mod office;
 mod recaps;
 mod refs;
