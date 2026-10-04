@@ -2,6 +2,7 @@
 // (`GET /v1/sessions/{id}/terminal`). The server checks the handshake and the token; these
 // functions run the accepted connections.
 
+import { includesSession, eventVisible } from './import.ts';
 import { requireReachable } from './routes.ts';
 import type { Hub } from './state.ts';
 import type { Engine, Event, Session, StreamFrame } from './types.ts';
@@ -37,12 +38,12 @@ export function openStream(hub: Hub, conn: WebSocketConnection, since: number | 
   let cursor = hub.rev;
   sendFrame(conn, { type: 'hello', rev: cursor, log: hub.logId });
   if (since !== undefined && since < cursor) {
-    sendEvents(conn, since, hub.eventsAfter(since), person);
+    sendEvents(hub, conn, since, hub.eventsAfter(since), person);
   }
   const unsubscribe = hub.subscribe(() => {
     const fresh = hub.eventsAfter(cursor);
     if (fresh.length > 0) {
-      sendEvents(conn, cursor, fresh, person);
+      sendEvents(hub, conn, cursor, fresh, person);
       cursor += fresh.length;
     }
   });
@@ -54,12 +55,12 @@ export function openStream(hub: Hub, conn: WebSocketConnection, since: number | 
 }
 
 /** Sends `events` (which follow revision `after`) as one or more `events` frames. */
-function sendEvents(conn: WebSocketConnection, after: number, events: Event[], person?: string): void {
+function sendEvents(hub: Hub, conn: WebSocketConnection, after: number, events: Event[], person?: string): void {
   let i = 0;
   while (i < events.length) {
     const start = i;
     while (i < events.length && i - start < REPLAY_BATCH &&
-      (events[i]?.body.type !== 'cursor_moved' || events[i]?.author === person)) i++;
+      events[i] !== undefined && eventVisible(hub, events[i]!, person)) i++;
     if (i > start) {
       sendFrame(conn, { type: 'events', from_rev: after + start + 1, to_rev: after + i,
         events: events.slice(start, i) });
@@ -84,7 +85,7 @@ export interface TerminalTarget {
 /** The session behind a terminal request: 404 if unknown or without a terminal, 503 if unreachable. */
 export function terminalTarget(hub: Hub, ref: string, query: URLSearchParams): TerminalTarget {
   const session = hub.findSession(ref);
-  if (session === undefined) {
+  if (session === undefined || !includesSession(hub.importChoice, session)) {
     throw notFound(`No session ${ref}.`);
   }
   requireReachable(hub, session);

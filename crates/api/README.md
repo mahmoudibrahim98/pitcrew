@@ -274,3 +274,5 @@ route in `RouterParts`.
 
 Or `Bound::bind(&listen)` first (to report where it listens with `describe()`), then
 `bound.serve(pitcrew_api::router(info, tokens, parts), shutdown)`.
+
+`visibility::Visibility` combines cursor privacy with an optional `EventVisibility` supplied by the hub. `Activity::with_visibility` and `stream::routes_with_visibility` apply it on the blocking pool without filtering the event source. Activity scans past hidden events; stream delivery splits visible runs and advances past hidden revisions in replay and live delivery.

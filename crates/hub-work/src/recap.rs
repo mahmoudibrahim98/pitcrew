@@ -888,6 +888,7 @@ pub(crate) struct RecapSync {
     to_open: bool,
     /// The directory's bound, for tests ([`WorkService::with_recap_directory_limit`]).
     limit: Option<usize>,
+    import_choice: pitcrew_protocol::import::ImportChoice,
 }
 
 impl Default for RecapSync {
@@ -898,6 +899,7 @@ impl Default for RecapSync {
             file: None,
             to_open: false,
             limit: None,
+            import_choice: Default::default(),
         }
     }
 }
@@ -963,6 +965,16 @@ impl RecapSync {
                 .filter(|e| !refused.contains(&e.rev))
                 .map(|e| e.event)
                 .collect();
+            let events = events
+                .into_iter()
+                .map(|e| {
+                    work.event_included_for(&e, &self.import_choice)
+                        .map(|visible| visible.then_some(e))
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
             self.recaps.push(&events);
             if self.recaps.is_broken() {
                 return Err(WorkError::internal(
@@ -1060,6 +1072,11 @@ impl WorkService {
                 tracing::warn!("building the recap index again from the log");
             }
             state.reset();
+        }
+        let choice = self.import_choice();
+        if state.import_choice != choice {
+            state.reset();
+            state.import_choice = choice;
         }
         state.open();
         state.catch_up(self)?;

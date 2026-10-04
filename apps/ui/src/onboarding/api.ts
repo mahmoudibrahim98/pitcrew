@@ -293,7 +293,7 @@ export interface OnboardingApi {
 
   /** A dry run: counts what the filter would import without importing anything. */
   importSessions(filter: ImportFilter): Promise<ImportDryRunResult>;
-  /** Commits the import (reversible: `link_basis: "imported"` sessions can be unlinked later). */
+  /** Stores reversible inclusion rules; no session or transcript is deleted. */
   commitImport(filter: ImportFilter): Promise<ImportResult>;
 
   hooksDiff(): Promise<HooksDiff>;

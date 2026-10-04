@@ -91,6 +91,8 @@ where
         .route("/v1/tasks/{id}", patch(patch_task))
         .route("/v1/tasks/{id}/assign", post(assign_task))
         .route("/v1/tasks/{id}/dispatch", post(dispatch_task))
+        .route("/v1/import", get(get_import).put(put_import))
+        .route("/v1/import/dry-run", post(dry_run_import))
         .route("/v1/sessions", get(list_sessions))
         .route("/v1/sessions/{id}", get(get_session))
         .route("/v1/briefs", get(list_briefs))
@@ -542,7 +544,16 @@ async fn list_sessions(Work(w): Work, Person(_): Person, params: Params) -> Repl
         task: params.one("task")?,
         states: params.all("state")?,
     };
-    Ok(Json(blocking(w, move |w| w.sessions(&filter)).await?))
+    Ok(Json(
+        blocking(w, move |w| {
+            let choice = w.import_choice();
+            Ok(w.sessions(&filter)?
+                .into_iter()
+                .filter(|s| choice.includes(s))
+                .collect())
+        })
+        .await?,
+    ))
 }
 
 async fn get_session(
@@ -551,7 +562,15 @@ async fn get_session(
     Segments(id): Segments<String>,
 ) -> Reply<Session> {
     let id: SessionId = path_id(&id, "session")?;
-    Ok(Json(blocking(w, move |w| w.session(&id)).await?))
+    Ok(Json(
+        blocking(w, move |w| {
+            if !w.session_included(&id)? {
+                return Err(WorkError::not_found("Session is excluded."));
+            }
+            w.session(&id)
+        })
+        .await?,
+    ))
 }
 
 // ─── Asks and briefs ─────────────────────────────────────────────────────────────────────────────
@@ -628,4 +647,29 @@ async fn put_brief(
     Ok(Json(
         blocking(w, move |w| w.put_brief(&caller, target, edit)).await?,
     ))
+}
+
+async fn get_import(
+    Work(w): Work,
+    Person(_): Person,
+) -> Reply<pitcrew_protocol::import::ImportChoice> {
+    Ok(Json(w.import_choice()))
+}
+async fn dry_run_import(
+    Work(w): Work,
+    Person(_): Person,
+    Body(filter): Body<pitcrew_protocol::import::ImportFilter>,
+) -> Reply<pitcrew_protocol::import::ImportDryRun> {
+    Ok(Json(pitcrew_protocol::import::ImportDryRun {
+        count: blocking(w, move |w| w.import_dry_run(filter)).await?,
+    }))
+}
+async fn put_import(
+    Work(w): Work,
+    Person(_): Person,
+    Body(filter): Body<pitcrew_protocol::import::ImportFilter>,
+) -> Reply<pitcrew_protocol::import::ImportResult> {
+    Ok(Json(pitcrew_protocol::import::ImportResult {
+        imported: blocking(w, move |w| w.commit_import(filter)).await?,
+    }))
 }

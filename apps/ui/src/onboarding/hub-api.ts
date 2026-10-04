@@ -53,8 +53,6 @@ const NOT_YET: readonly OnboardingCall[] = [
   'agentAccounts',
   'startSignIn',
   'integrationStatus',
-  'importSessions',
-  'commitImport',
   'hooksDiff',
   'installHooks',
   'saveSafety',
@@ -160,6 +158,8 @@ export function createHubOnboardingApi(options: HubOnboardingOptions = {}): Onbo
   if (setUp === undefined) missing.add('setupWorkspace');
   if (remote === null) missing.add('discoverHosts');
   if (data === undefined) {
+    missing.add('importSessions');
+    missing.add('commitImport');
     missing.add('streamScan');
     missing.add('createFromScan');
   }
@@ -310,8 +310,18 @@ export function createHubOnboardingApi(options: HubOnboardingOptions = {}): Onbo
       return result;
     },
 
-    importSessions: () => Promise.reject(new Error('importSessions is not available yet.')),
-    commitImport: () => Promise.reject(new Error('commitImport is not available yet.')),
+    async importSessions(filter) {
+      if (data === undefined) return unavailable('importSessions');
+      const res = await data.transport.request('POST', '/v1/import/dry-run', JSON.stringify(filter));
+      if (res.status !== 200) throw new Error(refusal(res));
+      return JSON.parse(res.body) as { count: number };
+    },
+    async commitImport(filter) {
+      if (data === undefined) return unavailable('commitImport');
+      const res = await data.transport.request('PUT', '/v1/import', JSON.stringify(filter));
+      if (res.status !== 200) throw new Error(refusal(res));
+      return JSON.parse(res.body) as { imported: number };
+    },
     hooksDiff: () => Promise.reject(new Error('hooksDiff is not available yet.')),
     installHooks: () => Promise.reject(new Error('installHooks is not available yet.')),
     saveSafety: () => Promise.reject(new Error('saveSafety is not available yet.')),

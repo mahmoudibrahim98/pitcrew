@@ -1139,3 +1139,5 @@ the blocking pool. Remote and WSL locations answer 501. Writes require a revisio
 null for creation; JSON bodies are capped at 12 MiB and decoded files at 8 MiB. State now includes
 file-backups: private bounded originals before replacement (runner README, Workstream files).
 Responses use no-store and nosniff, and failures log counts and fixed reasons without paths.
+
+`import.json` holds the durable session inclusion choice, scoped to this state directory. `GET /v1/import`, `POST /v1/import/dry-run`, and `PUT /v1/import` are device-only. The runner keeps reading in place; the API visibility adapter hides excluded session events, and transcript/terminal reads return 404 for them.

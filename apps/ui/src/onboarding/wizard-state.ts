@@ -100,6 +100,7 @@ export interface WizardState {
   importMode: ImportMode;
   importSince: string;
   importEngines: Engine[];
+  importFolders: string[];
   importDryRun?: ImportDryRunResult;
   importResult?: ImportResult;
 
@@ -137,6 +138,7 @@ export function initialWizardState(machineName: string = DEFAULT_MACHINE_NAME): 
     importMode: 'all',
     importSince: '',
     importEngines: [],
+    importFolders: [],
     hooksInstalled: false,
     safety: {
       permissionMode: 'default',

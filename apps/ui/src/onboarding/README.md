@@ -193,3 +193,5 @@ themes:
 ```
 corepack pnpm --filter @pitcrew/ui exec playwright test --config e2e/fresh.config.ts
 ```
+
+The real first run now includes Import after Create. It previews the indexed-session count for all sessions, a UTC date/engine/folder filter, or start fresh, then stores the choice with PUT. Requests that fail display an error and keep confirmation disabled until a successful count. Sessions stay in place; widening the hub choice is reversible via `/v1/import`.
