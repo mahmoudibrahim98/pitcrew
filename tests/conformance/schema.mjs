@@ -190,6 +190,44 @@ const dispatch = object({
   'outcome?': enumeration('succeeded', 'failed', 'canceled'),
   'summary?': text,
 });
+const writeFields = object({
+  'title?': text,
+  'body?': text,
+  'labels?': list(text),
+  'milestone?': text,
+  'epic?': text,
+  'state?': enumeration('open', 'closed'),
+  'close_reason?': enumeration('completed', 'not_planned'),
+  'comment?': text,
+});
+const writeProposal = object({
+  ask: id,
+  integration: id,
+  system: enumeration('github', 'jira'),
+  scope: text,
+  'target?': external,
+  'task?': id,
+  operation: enumeration('create_issue', 'comment', 'update', 'close', 'reopen'),
+  before: writeFields,
+  after: writeFields,
+  requested_by: id,
+  'cause?': id,
+});
+const writeResult = tagged('outcome', {
+  sent: object({ 'created?': external, 'url?': text }),
+  failed: object({ message: text, 'status?': integer }),
+  not_sent: object({ reason: text }),
+});
+const upstreamWrite = object({
+  proposal: writeProposal,
+  state: enumeration('pending', 'approved', 'denied', 'sending', 'sent', 'failed', 'not_sent'),
+  attempts: integer,
+  proposed_at: integer,
+  'answered_at?': integer,
+  'answered_by?': id,
+  'finished_at?': integer,
+  'result?': writeResult,
+});
 const eventData = {
   cursor_moved: object({ scope: text, rev: integer }),
   machine_added: object({ machine }),
@@ -269,6 +307,9 @@ const eventData = {
     'receipts?': list(receipt),
   }),
   decision_recorded: object({ 'workstream?': id, text, 'why?': text, receipts: list(receipt) }),
+  write_proposed: object({ write: writeProposal }),
+  write_started: object({ ask: id, 'task?': id, attempt: integer }),
+  write_finished: object({ ask: id, 'task?': id, result: writeResult }),
 };
 const eventBody = (v) => {
   object({ type: enumeration(...Object.keys(eventData)), data: empty })(v);
@@ -469,6 +510,7 @@ export const schemas = {
   }),
   setup: object({ workspace, me: member, machine }),
   integration,
+  upstreamWrite,
   integrationCheck: object({
     ok: bool,
     at: integer,

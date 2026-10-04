@@ -1,4 +1,4 @@
-// GitHub and Jira integrations (api-v1.md, "Integrations"), read-only, over the recorded fixtures
+// GitHub and Jira integrations (api-v1.md, "Integrations"); a sync only reads, over the recorded fixtures
 // in `apps/mock-hub/fixtures/` (the sync crates' format; `pitcrewd serve --integration-fixtures`
 // reads the same files). Device tokens only. Credentials stay in memory and are never returned.
 //
@@ -8,6 +8,8 @@
 // upstream-owned fields (title, description, labels) are overwritten; moves follow the sync's
 // `can_move` (in-progress work is never touched: a conflict ask instead); a merged pull request is
 // noted on the task it closes. Everything a sync changes is authored by its own member, `@sync`.
+// Outward writes are `writes.ts`'s; what a sent one changed is laid over the fixtures here
+// (`changeUpstream`), so the next sync agrees with it.
 
 import { readFileSync, readdirSync } from 'node:fs';
 import { canMove } from './rules.ts';
@@ -40,7 +42,7 @@ const SYNC_FALLBACK = '@tracker-sync';
 const MAX_SCOPES = 50;
 const MAX_LINKS = 16;
 
-interface Exchange {
+export interface Exchange {
   url: string;
   status: number;
   headers: Map<string, string>;
@@ -49,7 +51,7 @@ interface Exchange {
 
 let exchanges: Map<string, Exchange> | undefined;
 
-/** Every exchange in the fixtures, by URL. */
+/** Every exchange in the fixtures, by method and URL (`GET https://…`). */
 function fixtures(): Map<string, Exchange> {
   if (exchanges !== undefined) return exchanges;
   exchanges = new Map();
@@ -57,7 +59,7 @@ function fixtures(): Map<string, Exchange> {
     const text = readFileSync(new URL(name, FIXTURES), 'utf8');
     for (const block of text.split(SEPARATOR).map((b) => b.trim()).filter(Boolean)) {
       const lines = block.split('\n');
-      const url = (lines[0] ?? '').split(' ')[1] ?? '';
+      const [method = '', url = ''] = (lines[0] ?? '').split(' ');
       let i = 1;
       while (i < lines.length && lines[i] !== '') i++;
       i++;
@@ -71,14 +73,20 @@ function fixtures(): Map<string, Exchange> {
         i++;
       }
       const body = lines.slice(i + 1).join('\n');
-      if (!exchanges.has(url)) exchanges.set(url, { url, status, headers, body });
+      const key = `${method} ${url}`;
+      if (!exchanges.has(key)) exchanges.set(key, { url, status, headers, body });
     }
   }
   return exchanges;
 }
 
+/** The recorded answer to `method url`, if the fixtures hold one. */
+export function exchange(method: string, url: string): Exchange | undefined {
+  return fixtures().get(`${method} ${url}`);
+}
+
 function read(url: string): Exchange | undefined {
-  return fixtures().get(url);
+  return exchange('GET', url);
 }
 
 function json(exchange: Exchange | undefined): unknown {
@@ -122,6 +130,76 @@ function record(hub: Hub, id: string): Record {
   const found = state(hub).records.find((r) => r.integration.id === id.toUpperCase());
   if (found === undefined) throw notFound(`No integration ${id}.`);
   return found;
+}
+
+/** The sync's member, once an integration was added. */
+export function syncMember(hub: Hub): MemberId | undefined {
+  return state(hub).syncMember;
+}
+
+/** The integration with this id, if it is still connected. */
+export function integrationById(hub: Hub, id: string): Integration | undefined {
+  return state(hub).records.find((r) => r.integration.id === id)?.integration;
+}
+
+/** The integration that syncs `container` (a repository or Jira project), and its spelling of it. */
+export function integrationFor(
+  hub: Hub,
+  system: string,
+  container: string,
+): { integration: Integration; container: string } | undefined {
+  for (const r of state(hub).records) {
+    const settings = r.integration.settings;
+    if (settings.kind === 'github' && system === 'github') {
+      const repo = settings.repos.find((x) => x.toLowerCase() === container.toLowerCase());
+      if (repo !== undefined) return { integration: r.integration, container: repo };
+    }
+    if (settings.kind === 'jira' && system === 'jira' && settings.projects.includes(container)) {
+      return { integration: r.integration, container };
+    }
+  }
+  return undefined;
+}
+
+/** What a sent write changed upstream, by issue key: the mock's copy of upstream (see `sync`). */
+export interface Overlay {
+  title?: string;
+  body?: string;
+  labels?: string[];
+  parent?: string;
+  open?: boolean;
+}
+
+const overlays = new WeakMap<Hub, Map<string, Overlay>>();
+
+/** Records what a sent write changed on `key`, so the next sync and the next write see it. */
+export function changeUpstream(hub: Hub, key: string, change: Overlay): void {
+  let map = overlays.get(hub);
+  if (map === undefined) {
+    map = new Map();
+    overlays.set(hub, map);
+  }
+  map.set(key, { ...map.get(key), ...change });
+}
+
+function withOverlay(hub: Hub, item: Item): Item {
+  const change = overlays.get(hub)?.get(item.key);
+  if (change === undefined) return item;
+  const out: Item = { ...item };
+  if (change.title !== undefined) out.title = change.title;
+  if (change.body !== undefined) out.body = change.body;
+  if (change.labels !== undefined) out.labels = [...change.labels].sort();
+  if (change.parent !== undefined) out.parent = change.parent;
+  if (change.open !== undefined) out.open = change.open;
+  return out;
+}
+
+/** One issue as upstream has it now (the fixtures, then what writes changed), if it is known. */
+export function upstreamIssue(hub: Hub, integration: Integration, key: string): Item | undefined {
+  const settings = integration.settings;
+  const read = settings.kind === 'github' ? readGithub(settings) : readJira(settings);
+  const item = read.items.find((i) => i.key === key);
+  return item === undefined ? undefined : withOverlay(hub, item);
 }
 
 // ─── Links ──────────────────────────────────────────────────────────────────────────────────────
@@ -436,6 +514,12 @@ function credentialProblem(rec: Record): string | undefined {
   return undefined;
 }
 
+/** Why the integration `id` has no credential to write with, if it has none. */
+export function missingCredential(hub: Hub, id: string): string | undefined {
+  const rec = state(hub).records.find((r) => r.integration.id === id);
+  return rec === undefined ? 'Its integration was removed.' : credentialProblem(rec);
+}
+
 export function test(hub: Hub, id: string): Reply {
   const rec = record(hub, id);
   const at = Date.now();
@@ -485,7 +569,7 @@ export function test(hub: Hub, id: string): Reply {
 // ─── Sync ───────────────────────────────────────────────────────────────────────────────────────
 
 /** One upstream issue, as either tracker reports it. */
-interface Item {
+export interface Item {
   key: string;
   url: string;
   title: string;
@@ -621,6 +705,7 @@ function sync(hub: Hub, rec: Record): void {
   }
   const settings = rec.integration.settings;
   const upstream = settings.kind === 'github' ? readGithub(settings) : readJira(settings);
+  upstream.items = upstream.items.map((item) => withOverlay(hub, item));
   const counts: SyncCounts = { changes: upstream.items.length + upstream.merged.length, applied: 0, conflicts: 0, skipped: 0, malformed: 0 };
   const member = state(hub).syncMember;
   if (member === undefined) return;

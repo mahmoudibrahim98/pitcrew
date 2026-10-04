@@ -212,10 +212,12 @@ try {
     env.PITCREW_CONFORMANCE_EXPECTED = join(root, 'tests/conformance/daemon-deviations.json');
   }
   // The integrations' file runs after the others: its syncs append events, which the main suite's
-  // exact-revision checks must not see.
+  // exact-revision checks must not see. The outward writes' file runs last, on its own: it
+  // connects the same repository the integrations' file does.
   for (const files of [
     ['tests/conformance/api.test.mjs', 'tests/conformance/scan.test.mjs', 'tests/conformance/files.test.mjs'],
     ['tests/conformance/integrations.test.mjs'],
+    ['tests/conformance/writes.test.mjs'],
   ]) {
     suite = spawn(process.execPath, ['--test', ...files], {
       cwd: root,

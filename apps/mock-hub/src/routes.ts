@@ -77,6 +77,7 @@ import {
 
 import { files } from './files.ts';
 import * as integrations from './integrations.ts';
+import * as writes from './writes.ts';
 export const MOCK_VERSION = '0.1.0-mock';
 /** `PROTOCOL_VERSION` and `PROTOCOL_MIN` in crates/protocol/src/version.rs. */
 export const PROTOCOL_VERSION = 1;
@@ -181,7 +182,13 @@ export async function handleApi(hub: Hub, request: ApiRequest): Promise<Reply> {
     }
     return value;
   };
-  return handler(hub, { caller, query: request.query, body, param });
+  const reply = handler(hub, { caller, query: request.query, body, param });
+  // As the daemon's loop wakes on every append: propose what a change implies upstream, and act
+  // on answered approvals and retries (writes.ts).
+  if (request.method !== 'GET') {
+    writes.pass(hub);
+  }
+  return reply;
 }
 
 function matchRoute(
@@ -1401,6 +1408,11 @@ function directRefs(hub: Hub, body: EventBody): EventFilter {
     case 'persona_saved':
     case 'team_saved':
       return {};
+    case 'write_proposed':
+      return { task: body.data.write.task };
+    case 'write_started':
+    case 'write_finished':
+      return { task: body.data.task };
   }
 }
 
@@ -1532,6 +1544,11 @@ const ROUTES: Route[] = [
   route('POST', '/v1/integrations/:id/test', 'device', (hub, ctx) => integrations.test(hub, ctx.param('id'))),
   route('POST', '/v1/integrations/:id/sync', 'device', (hub, ctx) => integrations.syncNow(hub, ctx.param('id'))),
   route('PUT', '/v1/integrations/:id/credential', 'device', (hub, ctx) => integrations.setCredential(hub, ctx.param('id'), ctx.body)),
+  // Outward writes: every one approved first (writes.ts).
+  route('GET', '/v1/writes', 'device', (hub, ctx) => writes.list(hub, ctx.query)),
+  route('POST', '/v1/writes', 'device', (hub, ctx) => writes.request(hub, ctx.caller.memberId, ctx.body)),
+  route('GET', '/v1/writes/:id', 'device', (hub, ctx) => writes.get(hub, ctx.param('id'))),
+  route('POST', '/v1/writes/:id/retry', 'device', (hub, ctx) => writes.retry(hub, ctx.caller.memberId, ctx.param('id'))),
 
   route('GET', '/v1/recaps/blocks', 'device', (hub, ctx) => ok(blocksPage(hub.recaps, ctx.query))),
   route('GET', '/v1/recaps/days', 'device', (hub, ctx) => ok(daysPage(hub.recaps, ctx.query))),
