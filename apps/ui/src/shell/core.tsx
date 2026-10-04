@@ -124,7 +124,6 @@ export const shellFeature: Feature = {
   layout: 'both',
   routes: placeholderRoutes,
   nav: [
-    { id: 'settings', label: 'Settings', to: 'settings', icon: HomeIcon, order: 90 },
     { id: 'home', label: 'Home', to: 'home', icon: HomeIcon, layout: 'projects', order: 10 },
     { id: 'inbox', label: 'Inbox', to: 'inbox', icon: InboxIcon, badge: InboxCount, order: 20 },
     {
