@@ -2,7 +2,7 @@
 # Checks the desktop installers packaging/desktop/build.sh wrote, against the helpers' manifest it
 # compiled into the app (STAGE/helpers/manifest.json):
 #
-#   packaging/desktop/check.sh --manifest FILE [--budget-mb N] INSTALLER...
+#   packaging/desktop/check.sh --manifest FILE [--budget-mb N] [--appimage-budget-bytes N] INSTALLER...
 #
 # For each installer, unpacked as its OS would install it (a .deb with dpkg-deb, an AppImage with
 # --appimage-extract, a DMG with hdiutil on macOS; an NSIS installer is installed and removed by
@@ -34,7 +34,7 @@ app_exe=pitcrew-desktop
 sidecars=(pitcrewd pitcrew-ptyd pitcrew-askpass)
 budget_mb=25
 # AppImage includes WebKitGTK/GTK: measured payload budget plus 10% (P.md).
-appimage_budget_bytes=127520299
+appimage_budget_bytes=106772011
 manifest=""
 installers=()
 while [ $# -gt 0 ]; do

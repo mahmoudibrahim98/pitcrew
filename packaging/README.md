@@ -281,8 +281,16 @@ unavailable universal macOS helper slot, before → after: deb 24,946,986 → 17
 (−31.7%), RPM 16,964,365 → 13,876,305 (−18.2%), AppImage 118,077,944 → 115,927,544 (−1.8%).
 All installer checks pass. These lab inputs cannot be distributed as production packages.
 AppImage already deduplicates identical raw files and compresses its filesystem, so its
-saving is smaller. Its separate local budget is 127,520,299 bytes, measured size + 10%.
-Release dry runs provide the production comparison, including DMG and NSIS.
+saving is smaller. The lab uses `--appimage-budget-bytes 127520299` (measured size + 10%); the default
+budget uses the real production measurement below.
+**Production comparison.** Native release dry runs from `1b3920a` → installer code
+`1326791`, with real universal macOS and static musl helpers: DMG 35,102,960 → 24,282,548
+bytes (−30.8%), deb 27,757,708 → 19,048,126 (−31.4%), RPM 18,890,681 → 15,876,893 (−16.0%),
+NSIS 18,132,784 → 18,504,084 (+2.0%), AppImage 99,711,480 → 97,065,464 (−2.7%). DMG,
+deb, RPM and NSIS all meet 25 MB. NSIS already compresses its payload, so precompression
+and the added decoder slightly increase the installer despite the smaller raw resources.
+AppImage's separate production budget is 106,772,011 bytes, its measured size plus 10%.
+Exact counts and largest files are published by the native comparison run linked in P.md.
 When local policy blocks artifact/log storage, the release workflow's `measure_only` input
 compares `desktop-*` artifacts from `before_run` and `after_run` on each native OS. It
 builds and publishes nothing; exact byte counts and largest payload files are written to
