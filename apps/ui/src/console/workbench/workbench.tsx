@@ -721,11 +721,3 @@ function TabStrip({
     </div>
   );
 }
-
-/** For tests: the drag in progress, as the drag events set it. */
-export function draggingTab(): { group: string; tab: string } | undefined {
-  return dragging;
-}
-
-export type { WorkbenchAction };
-export { workbenchStore };

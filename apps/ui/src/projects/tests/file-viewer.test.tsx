@@ -15,10 +15,12 @@ const pdf = vi.hoisted(() => {
   const page = { getViewport: ({ scale }: { scale: number }) => ({ width: 300 * scale, height: 144 * scale }), render };
   return {
     render,
-    getDocument: vi.fn((_options: { data: Uint8Array; useWasm: boolean }) => ({
-      promise: Promise.resolve({ numPages: 2, getPage: () => Promise.resolve(page) }),
-      destroy: vi.fn(() => Promise.resolve()),
-    })),
+    getDocument: vi.fn<(options: { data: Uint8Array; useWasm: boolean }) => { promise: Promise<unknown>; destroy(): Promise<void> }>(
+      () => ({
+        promise: Promise.resolve({ numPages: 2, getPage: () => Promise.resolve(page) }),
+        destroy: vi.fn(() => Promise.resolve()),
+      }),
+    ),
   };
 });
 vi.mock('pdfjs-dist/legacy/build/pdf.mjs', () => ({ GlobalWorkerOptions: {}, getDocument: pdf.getDocument }));
