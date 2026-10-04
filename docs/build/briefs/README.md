@@ -105,7 +105,16 @@ git worktree on the brief's branch, opens a Claude Code session in it, and says:
 | [0-idle-cpu-2](0-idle-cpu-2.md) | 0 · Composition root | `integrator/idle-cpu-2` | Codex (cloud, Linux) | Ready |
 | [0-flaky-tests-4](0-flaky-tests-4.md) | 0 · Contracts | `integrator/flaky-tests-4` | Codex | Ready |
 | [0-onboarding-import](0-onboarding-import.md) | 0 · Contracts | `integrator/onboarding-import` | Codex | Ready |
-| [P-installer-size-2](P-installer-size-2.md) | P · Packaging | `integrator/installer-size-2` | Codex (cloud, Linux) | Ready |
+| [P-installer-size-2](P-installer-size-2.md) | P · Packaging | `integrator/installer-size-2` | Codex (cloud, Linux) | In progress (Codex, cloud) |
+| [O-onboarding-hooks-safety](O-onboarding-hooks-safety.md) | O · Onboarding | `integrator/onboarding-hooks-safety` | Codex (cloud) | Ready |
+| [O-onboarding-machines](O-onboarding-machines.md) | O · Onboarding | `integrator/onboarding-machines` | Opus-class (Claude cloud) | In progress (Claude cloud) |
+| [G-sync-wiring](G-sync-wiring.md) | G · Integrations | `integrator/sync-wiring` | Opus-class (Claude cloud) | In progress (Claude cloud) |
+| [G-approval-writes](G-approval-writes.md) | G · Integrations | `integrator/approval-writes` | Opus-class (Claude cloud) | After G-sync-wiring |
+| [M-workbench](M-workbench.md) | M · Agent console | `integrator/workbench` | Opus-class (Claude cloud) | In progress (Claude cloud) |
+| [0-remote-files](0-remote-files.md) | 0 · Composition root | `integrator/remote-files` | Codex (cloud) | Ready |
+| [K-updater](K-updater.md) | K · Desktop shell | `integrator/updater` | Codex (local, Windows) | In progress (Codex, local) |
+| [0-draft-board](0-draft-board.md) | 0 · Composition root | `integrator/draft-board` | Codex (local) | After K-updater |
+| [0-team-hubs](0-team-hubs.md) | 0 · Contracts | `integrator/team-hubs` | Opus-class (Claude cloud) | Last (after the route-heavy briefs) |
 | [0-ci-security](0-ci-security.md) | 0 · Contracts | `integrator/ci-security` | Codex | **Merged** (PR #22) |
 | [0-protocol-ts](0-protocol-ts.md) | 0 · Contracts | `integrator/protocol-ts` | Codex | **Merged** (PR #23) |
 | [0-api-conformance](0-api-conformance.md) | 0 · Contracts | `integrator/api-conformance` | Codex | **Merged** (PR #24) |
