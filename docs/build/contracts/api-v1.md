@@ -780,6 +780,11 @@ the integration is added) and on `POST …/sync`, one integration at a time:
   only on the tracker's own host.
 - Changing a scope's links makes the next sync read that scope's issues again from the start, so
   issues that were out of scope before become tasks.
+- **Who sees it.** What a sync appends (`member_added`, `task_created`, `task_updated`,
+  `task_moved`, `workstream_changed`, `comment_posted`, `ask_raised`), and `workstream_linked`,
+  reaches `/v1/events`, `/v1/activity` and `/v1/stream` through the same visibility rule as every
+  event ("Session import"). None of it names a session, so it is non-session work: an import
+  choice never hides it. Those routes, like these, are device tokens only.
 
 **The mock** answers every route over the recorded fixtures in `apps/mock-hub/fixtures/`
 (`example-org/demo-repo` on GitHub, project `DEMO` on `https://jira.example.com`), syncs at once

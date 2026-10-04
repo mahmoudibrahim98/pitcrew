@@ -82,7 +82,11 @@ and links `400`, a second connection to the same repository and a secret for a `
 `409`; a stored secret that is never in any answer; a project and workstream of its own linked to
 milestone 1 of `example-org/demo-repo` (`workstream_linked` in the log); a sync that turns the open
 issue #1 into a `todo` task of that workstream (and not #3, closed before it was first seen); the
-connection's status, link title and test (with its warning about write rights); and removal. Both
+connection's status, link title and test (with its warning about write rights); that the link's
+and the sync's events reach activity and a `/v1/stream` replay only as the shared visibility rule
+allows (an agent gets `403` from both; with every session excluded by `/v1/import`, they stay
+visible while an excluded session's events are hidden from the same answers, and the choice is
+restored to `all` afterwards); and removal. Both
 targets read the recorded fixtures in `apps/mock-hub/fixtures`: the daemon runner passes
 `--integration-fixtures` and puts a stand-in `gh` (printing a synthetic credential) first on the
 daemon's `PATH`. Nothing reaches GitHub or Jira.
