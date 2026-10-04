@@ -28,6 +28,7 @@ pub mod helper;
 mod job;
 // The askpass pipe's security descriptor and its check, through `pitcrew_trust::windows`: no
 // unsafe code here.
+pub mod check;
 #[cfg(windows)]
 mod pipe_security;
 mod private;
@@ -48,9 +49,9 @@ pub use helper::slurm::{
     JobOptions, JobScript, JobSpec, JobState, LastHop, Site, SiteRecipe, SlurmStatus, SocketPlace,
 };
 pub use helper::{
-    DeployOptions, Deployed, DirectLauncher, Endpoint, Helper, HelperError, HelperState,
-    LaunchOptions, Launcher, Layout, Platform, SlurmLauncher, Started, Status, Stopped, Target,
-    TmuxLauncher, deploy,
+    DeployOptions, DeployStep, Deployed, DirectLauncher, Endpoint, Helper, HelperError,
+    HelperState, LaunchOptions, Launcher, Layout, Platform, SlurmLauncher, Started, Status,
+    Stopped, Target, TmuxLauncher, deploy,
 };
 pub use probe::{PROBE_LIMITS, Probe, SlurmTools};
 pub use ssh::{

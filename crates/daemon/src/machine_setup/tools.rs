@@ -216,7 +216,9 @@ fn is_executable(path: &Path) -> bool {
         meta.permissions().mode() & 0o111 != 0
     }
     #[cfg(not(unix))]
-    true
+    {
+        true
+    }
 }
 
 /// The first line of `text` that has something on it, cleaned for a row (no control or hidden

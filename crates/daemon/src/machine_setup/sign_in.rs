@@ -113,6 +113,7 @@ impl SignIns {
 
     /// As [`SignIns::new`], with other lifetimes (tests).
     #[cfg(test)]
+    #[cfg(unix)]
     fn with_times(mut self, linger: Duration, max_age: Duration) -> Self {
         self.linger = linger;
         self.max_age = max_age;
@@ -239,23 +240,21 @@ impl SignIns {
         if let Some(running) = self.get(engine).filter(|s| s.running) {
             return Ok((running, false));
         }
-        let path = self.tools.find(name).ok_or_else(|| {
-            StartError::NotInstalled(format!(
+        if self.tools.find(name).is_none() {
+            return Err(StartError::NotInstalled(format!(
                 "{} ({name}) is not on this machine's PATH: install it first.",
                 label(engine)
-            ))
-        })?;
-        let program_path = path
-            .to_str()
-            .ok_or_else(|| StartError::Failed(format!("{} is not UTF-8.", path.display())))?
-            .to_owned();
+            )));
+        }
         let cwd = self
             .cwd
             .to_str()
             .ok_or_else(|| StartError::Failed("The home folder's path is not UTF-8.".to_owned()))?
             .to_owned();
+        // By name, as the runner starts the CLIs for sessions: the runtime finds it on the same
+        // `PATH` (and on Windows, pitcrew-ptyd its `.exe` or `.cmd`).
         let spec = StartSpec {
-            program: program_path,
+            program: name.to_owned(),
             args: args.iter().map(|a| (*a).to_owned()).collect(),
             cwd,
             env: Vec::new(),
@@ -489,7 +488,7 @@ mod tests {
         let started = fake.started.lock().unwrap().clone();
         assert_eq!(started.len(), 1);
         let (terminal, spec) = &started[0];
-        assert_eq!(spec.program, tmp.path().join("claude").to_str().unwrap());
+        assert_eq!(spec.program, "claude");
         assert_eq!(spec.args, ["auth", "login"]);
         assert!(
             spec.env.is_empty(),
