@@ -189,13 +189,15 @@ interface RemoteProbe {
 }
 ```
 
-`check` is the machine check, made over the same connection before PitCrew is installed there
-(`pitcrew_remote::check`): the rows of API v1's `MachineCheck` for each agent CLI and its
+`check` is the machine check, made **in the probe's own call** before PitCrew is installed there
+(`pitcrew_remote`'s `Ssh::probe_and_check`: one login, so a host that asks for a password or a
+one-time code asks once for both): the rows of API v1's `MachineCheck` for each agent CLI and its
 version, tmux, git, gh, the free space in the home folder and SLURM where `sbatch` is (never on
 WSL), then a `helper` row from what the probe found (`ok` running, `warn` installed but stopped,
 `missing`; the last two with the fix `install_helper`, which is the add itself). It runs only
 `command -v`, each tool's `--version` (under `timeout 10` where there is one) and `df`: nothing is
-installed or written. A check that fails leaves `check` out, and the probe stands. The UI reads it
+installed or written. Since it is the probe's call, the gateway always answers it; `check` stays
+optional in the type. The UI reads it
 as it reads the hub's (a missing tool's fix is its install page, from the UI's own table).
 
 `gateway_remote_plan(req) → RemotePlan` says what adding would do, without doing it:

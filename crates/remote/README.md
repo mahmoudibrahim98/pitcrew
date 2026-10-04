@@ -96,11 +96,15 @@ on Unix; on Windows it is `USERPROFILE` (where Windows' own OpenSSH looks), else
   possibly networked.
 - `Ssh::run_with_input` streams bytes to the remote command's stdin while reading its output,
   with progress, under the same limits.
-- `Ssh::check_machine(host)` (`check`) is the machine check before PitCrew is there: one
-  POSIX-sh script (`check::SCRIPT`) that runs `command -v` and `--version` for `claude`, `codex`,
-  `opencode`, `git`, `gh`, `sbatch`, `squeue` and `scancel` (each under `timeout 10` where there is
-  one, with no input), `tmux -V` and `df -Pk "$HOME"`, between random markers like the probe's,
-  within `CHECK_LIMITS` (256 KiB, two minutes). It installs and writes nothing (a test reads the
+- `Ssh::probe_and_check(host)` (`probe`, `check`) is the probe and the machine check before
+  PitCrew is there, **in one call** (`probe::CHECKED_SCRIPT`, within `probe::CHECKED_LIMITS`: the
+  probe's and the check's 256 KiB and two minutes): one login where ssh shares no connection
+  (Windows' OpenSSH has no ControlMaster), and one prompt on a host that asks for a password or a
+  one-time code. The check's lines (`check::check_lines!`, keys prefixed `check_`; `check::SCRIPT`
+  is them alone, between the check's own markers) run `command -v` and `--version` for `claude`,
+  `codex`, `opencode`, `git`, `gh`, `sbatch`, `squeue` and `scancel` (each under `timeout 10`
+  where there is one, with no input), `tmux -V` and `df -Pk "$HOME"`. It installs and writes
+  nothing (a test reads the
   script for package managers, `sudo`, downloads and redirects, and another runs it with
   tripwires on `PATH`). The report becomes API v1's `MachineCheck` rows (`ok` with a tool's first
   line, `warn` when it failed or tmux is older than 3.2 or the home folder has under 5 GB free,

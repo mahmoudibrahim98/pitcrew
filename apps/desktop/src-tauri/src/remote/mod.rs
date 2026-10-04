@@ -498,18 +498,12 @@ impl Remotes {
     ) -> Result<RemoteProbe, GatewayError> {
         let (host, ssh) = self.core.transport(host, target).await?;
         let host = host.as_str();
-        let probe = ssh
-            .probe(host)
+        // The tools' check rides in the probe's own call: one login, not two, where ssh shares
+        // no connection (Windows' OpenSSH), and one prompt on a password or one-time-code host.
+        let (probe, checked) = ssh
+            .probe_and_check(host)
             .await
             .map_err(|e| self.core.ssh_err(host, &e))?;
-        // The tools' check rides on the same connection; a check that fails leaves it out.
-        let checked = match ssh.check_machine(host).await {
-            Ok(checked) => Some(checked),
-            Err(e) => {
-                tracing::warn!(host, error = %tidy(&e.to_string()), "the machine check did not run");
-                None
-            }
-        };
         let helper = match Target::new(ssh, host, &probe) {
             Ok(target) => helper_status(&target).await,
             Err(_) => None,
@@ -527,18 +521,17 @@ impl Remotes {
         let tmux = probe.tmux_version.as_ref().map(|version| TmuxFound {
             version: tidy(version),
         });
-        let check = checked.map(|mut checked| {
-            checked.rows.push(pitcrew_remote::check::helper_row(
-                helper.as_ref().map(|h| (h.version.as_str(), h.running)),
-            ));
-            // WSL is direct and tmux only: no SLURM there.
-            if target.is_some() {
-                checked.rows.retain(|row| {
-                    row.id != pitcrew_protocol::machine_setup::MachineCheckItem::Slurm
-                });
-            }
-            checked
-        });
+        let mut check = checked;
+        check.rows.push(pitcrew_remote::check::helper_row(
+            helper.as_ref().map(|h| (h.version.as_str(), h.running)),
+        ));
+        // WSL is direct and tmux only: no SLURM there.
+        if target.is_some() {
+            check
+                .rows
+                .retain(|row| row.id != pitcrew_protocol::machine_setup::MachineCheckItem::Slurm);
+        }
+        let check = Some(check);
         tracing::info!(host, os = %probe.info.os, arch = %probe.info.arch, "probed a machine");
         Ok(RemoteProbe {
             host: host.to_owned(),

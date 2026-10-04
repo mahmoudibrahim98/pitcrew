@@ -1,51 +1,59 @@
-//! The machine check over SSH (or WSL), before PitCrew's helper is there: one call running a small
-//! POSIX-sh script ([`SCRIPT`]) that asks each tool for its version and `df` for the free space of
-//! `$HOME`, and the same rows as the hub's own check (api-v1.md, "Machine setup";
-//! [`MachineCheck`]).
+//! The machine check over SSH (or WSL), before PitCrew's helper is there: a few lines of POSIX sh
+//! ([`check_lines`]) that ask each tool for its version and `df` for the free space of `$HOME`,
+//! and the same rows as the hub's own check (api-v1.md, "Machine setup"; [`MachineCheck`]).
 //!
+//! - **One login:** the lines ride in the probe's own call ([`Ssh::probe_and_check`]), not a call
+//!   of their own: Windows' OpenSSH has no ControlMaster, so every call is a login, and a host that
+//!   asks for a password or a one-time code (typical of HPC) would ask once more. [`SCRIPT`] is
+//!   the same lines between the check's own markers, for a check alone.
 //! - **What runs:** `command -v` and `<tool> --version` for `claude`, `codex`, `opencode`, `git`,
 //!   `gh`, `sbatch`, `squeue` and `scancel` (each under `timeout 10` where there is `timeout`, with
 //!   no input), `tmux -V`, and `df -Pk "$HOME"`. Nothing else: no package manager, no `sudo`, no
 //!   download, nothing written. The report sits between markers that carry a random tag for the
-//!   call, as the probe's does, and the call is bounded by [`CHECK_LIMITS`].
+//!   call, as the probe's does; its keys start with `check_`, so they never meet the probe's.
 //! - **Rows:** each tool found and answering is `ok` with its first line; found but failing is
 //!   `warn`; not there is `missing` with [`MachineCheckFix::InstallPage`] (the client opens the
 //!   tool's install page from its own table). tmux older than 3.2 is `warn`. The disk row warns
 //!   under 5 GB free in `$HOME`. SLURM's row is there only where `sbatch` is. The helper's row is
 //!   the caller's, who knows what the probe found ([`helper_row`]).
 
-use crate::{Limits, Ssh, SshError};
+#[cfg(doc)]
+use crate::Ssh;
+use crate::SshError;
 use pitcrew_protocol::machine_setup::{
     MachineCheck, MachineCheckFix, MachineCheckItem, MachineCheckRow, MachineCheckStatus,
 };
 use std::collections::HashMap;
-use std::time::Duration;
-
-/// Bounds for [`Ssh::check_machine`]: 256 KiB of output, and two minutes not counting time spent
-/// on prompts (eight tools, each at most ten seconds where `timeout` exists).
-pub const CHECK_LIMITS: Limits = Limits {
-    max_output: Some(256 * 1024),
-    timeout: Some(Duration::from_secs(120)),
-};
 
 /// The tools whose version the script asks, in its order.
 pub const TOOLS: [&str; 8] = [
     "claude", "codex", "opencode", "git", "gh", "sbatch", "squeue", "scancel",
 ];
 
-/// The check script. It runs as `sh -c SCRIPT sh <tag>`.
+/// The check's lines, without markers: each key starts with `check_`. The probe's script carries
+/// them too ([`crate::probe::CHECKED_SCRIPT`]), so the check is no login of its own.
+macro_rules! check_lines {
+    () => {
+        concat!(
+            r#"to=; if command -v timeout >/dev/null 2>&1; then to='timeout 10'; fi; "#,
+            r#"for t in claude codex opencode git gh sbatch squeue scancel; do "#,
+            r#"if command -v "$t" >/dev/null 2>&1; then v=$($to "$t" --version </dev/null 2>&1); c=$?; "#,
+            r#"printf 'check_%s=1\ncheck_%s_code=%s\n' "$t" "$t" "$c"; "#,
+            r#"printf 'check_%s_version=%s\n' "$t" "$(printf '%s\n' "$v" | awk 'NF {print; exit}')"; "#,
+            r#"else printf 'check_%s=0\n' "$t"; fi; done; "#,
+            r#"if command -v tmux >/dev/null 2>&1; then echo check_tmux=1; "#,
+            r#"printf 'check_tmux_version=%s\n' "$(tmux -V </dev/null 2>/dev/null | awk 'NF {print; exit}')"; "#,
+            r#"else echo check_tmux=0; fi; "#,
+            r#"printf 'check_disk_kb=%s\n' "$(df -Pk "$HOME" 2>/dev/null | awk 'NR == 2 {print $4}')"; "#,
+        )
+    };
+}
+pub(crate) use check_lines;
+
+/// The check alone, between its own markers. It runs as `sh -c SCRIPT sh <tag>`.
 pub const SCRIPT: &str = concat!(
     r#"printf '@@pitcrew-check-begin-%s\n' "$1"; "#,
-    r#"to=; if command -v timeout >/dev/null 2>&1; then to='timeout 10'; fi; "#,
-    r#"for t in claude codex opencode git gh sbatch squeue scancel; do "#,
-    r#"if command -v "$t" >/dev/null 2>&1; then v=$($to "$t" --version </dev/null 2>&1); c=$?; "#,
-    r#"printf '%s=1\n%s_code=%s\n' "$t" "$t" "$c"; "#,
-    r#"printf '%s_version=%s\n' "$t" "$(printf '%s\n' "$v" | awk 'NF {print; exit}')"; "#,
-    r#"else printf '%s=0\n' "$t"; fi; done; "#,
-    r#"if command -v tmux >/dev/null 2>&1; then echo tmux=1; "#,
-    r#"printf 'tmux_version=%s\n' "$(tmux -V </dev/null 2>/dev/null | awk 'NF {print; exit}')"; "#,
-    r#"else echo tmux=0; fi; "#,
-    r#"printf 'disk_kb=%s\n' "$(df -Pk "$HOME" 2>/dev/null | awk 'NR == 2 {print $4}')"; "#,
+    check_lines!(),
     r#"printf '@@pitcrew-check-end-%s\n' "$1""#,
 );
 
@@ -54,37 +62,18 @@ const LOW_DISK_KB: u64 = 5_000_000;
 /// The longest line kept from a tool.
 const MAX_LINE: usize = 120;
 
-impl Ssh {
-    /// Checks `host` for running agents within [`CHECK_LIMITS`]: the rows of [`check`] for what
-    /// the script found, without the helper's (see [`helper_row`]).
-    ///
-    /// # Errors
-    /// The ssh call fails or breaks the limits, the script exits non-zero, or the report is
-    /// missing, cut off or malformed.
-    pub async fn check_machine(&self, host: &str) -> Result<MachineCheck, SshError> {
-        let tag = crate::askpass::random::<8>().map_err(SshError::Setup)?;
-        let tag = crate::askpass::to_hex(&tag);
-        let output = self
-            .run_limited(host, &["sh", "-c", SCRIPT, "sh", &tag], CHECK_LIMITS)
-            .await?;
-        if !output.success() {
-            return Err(SshError::UnexpectedOutput(format!(
-                "the check exited with {:?}: {}",
-                output.code,
-                crate::ssh::last_line(&String::from_utf8_lossy(&output.stderr))
-            )));
-        }
-        parse(&output.stdout_text(), &tag)
-    }
-}
-
-/// Parses the script's output for the call tagged `tag` into rows.
+/// Parses [`SCRIPT`]'s output for the call tagged `tag` into rows.
 ///
 /// # Errors
 /// [`SshError::UnexpectedOutput`] if a marker is missing or a key appears twice.
 pub fn parse(stdout: &str, tag: &str) -> Result<MachineCheck, SshError> {
     let values = crate::report::parse(stdout, "check", tag).map_err(SshError::UnexpectedOutput)?;
     Ok(rows(&values))
+}
+
+/// A report's `check_` value for `key`.
+fn value<'a>(values: &HashMap<&'a str, &'a str>, key: &str) -> Option<&'a str> {
+    values.get(format!("check_{key}").as_str()).copied()
 }
 
 /// One plain line: control characters dropped, at most [`MAX_LINE`] characters.
@@ -115,17 +104,12 @@ fn row(
 
 /// What the script said of `tool`: `None` when it is not there, else its first line and whether
 /// `--version` succeeded.
-fn tool<'a>(values: &HashMap<&'a str, &'a str>, tool: &str) -> Option<(String, bool)> {
-    if values.get(tool).copied() != Some("1") {
+fn tool(values: &HashMap<&str, &str>, tool: &str) -> Option<(String, bool)> {
+    if value(values, tool) != Some("1") {
         return None;
     }
-    let line = plain(
-        values
-            .get(format!("{tool}_version").as_str())
-            .copied()
-            .unwrap_or(""),
-    );
-    let ok = values.get(format!("{tool}_code").as_str()).copied() == Some("0");
+    let line = plain(value(values, &format!("{tool}_version")).unwrap_or(""));
+    let ok = value(values, &format!("{tool}_code")) == Some("0");
     Some((line, ok))
 }
 
@@ -158,7 +142,8 @@ fn tool_row(
     }
 }
 
-fn rows(values: &HashMap<&str, &str>) -> MachineCheck {
+/// The rows for a report's `check_` values (the check's own, or the probe's with them).
+pub(crate) fn rows(values: &HashMap<&str, &str>) -> MachineCheck {
     let mut rows = vec![
         tool_row(
             values,
@@ -201,7 +186,7 @@ fn rows(values: &HashMap<&str, &str>) -> MachineCheck {
 
 fn tmux_row(values: &HashMap<&str, &str>) -> MachineCheckRow {
     let id = MachineCheckItem::Tmux;
-    if values.get("tmux").copied() != Some("1") {
+    if value(values, "tmux") != Some("1") {
         return row(
             id,
             MachineCheckStatus::Missing,
@@ -210,7 +195,7 @@ fn tmux_row(values: &HashMap<&str, &str>) -> MachineCheckRow {
             Some(MachineCheckFix::InstallPage),
         );
     }
-    let line = plain(values.get("tmux_version").copied().unwrap_or(""));
+    let line = plain(value(values, "tmux_version").unwrap_or(""));
     match crate::helper::parse_tmux_version(&line) {
         Some(version) if version >= crate::helper::MIN_TMUX => {
             row(id, MachineCheckStatus::Ok, line.clone(), Some(line), None)
@@ -234,7 +219,7 @@ fn tmux_row(values: &HashMap<&str, &str>) -> MachineCheckRow {
 
 fn disk_row(values: &HashMap<&str, &str>) -> MachineCheckRow {
     let id = MachineCheckItem::Disk;
-    match values.get("disk_kb").and_then(|kb| kb.parse::<u64>().ok()) {
+    match value(values, "disk_kb").and_then(|kb| kb.parse::<u64>().ok()) {
         Some(kb) if kb >= LOW_DISK_KB => row(
             id,
             MachineCheckStatus::Ok,
@@ -342,7 +327,9 @@ mod tests {
 
     const TAG: &str = "0123456789abcdef";
 
+    /// A report of `body`'s lines, each key given the `check_` prefix.
     fn report(body: &str) -> String {
+        let body: String = body.lines().map(|line| format!("check_{line}\n")).collect();
         format!("banner\n@@pitcrew-check-begin-{TAG}\n{body}@@pitcrew-check-end-{TAG}\n")
     }
 

@@ -254,10 +254,12 @@ invoke('gateway_prompt_reply', { id, answer })                 // or { id, accep
 - **Probe** runs `pitcrew-remote`'s probe, then asks the direct launcher (or, for a SLURM
   helper, the scheduler) what is installed and running: `helper: { version, running }`;
   `slurm` when `sbatch` is there; `tmux: { version }` when tmux is (the tmux launcher needs 3.2
-  or newer). It also runs the machine check over the same connection
-  (`Ssh::check_machine`: each agent CLI's and tool's version, the home folder's free space), adds
-  the helper's row from what it found, and answers it as `check` (API v1's `MachineCheck`); a
-  check that fails is left out, with a warning in the log, and the probe stands.
+  or newer). The machine check rides in the probe's own call (`Ssh::probe_and_check`: each agent
+  CLI's and tool's version, the home folder's free space), so it is no extra login (Windows'
+  OpenSSH has no ControlMaster) and no extra password or one-time-code prompt; the gateway adds
+  the helper's row from what it found, and answers it as `check` (API v1's `MachineCheck`).
+  `tests/remote.rs` counts the logins and the password prompts of a probe: two each (the probe
+  with its check, and the helper's status).
 - **Plan** changes nothing on the machine. It probes again, finds the helper for the machine's
   platform (below), checks the launcher (tmux 3.2 or newer; for SLURM the tools and the site
   recipe: the built-in `generic`, or `~/.pitcrew/sites/<name>.toml`), and for SLURM renders the

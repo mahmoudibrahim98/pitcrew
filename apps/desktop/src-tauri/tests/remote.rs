@@ -593,10 +593,19 @@ mod unix {
         )
         .unwrap();
 
+        let calls_before = w.machine.calls().len();
         let probe = w
             .call("gateway_remote_probe", json!({ "host": HOST }))
             .unwrap();
-        // The machine check, over the same connection: the stand-in's version, what is missing
+        // One login for the probe and the machine check together, and one for the helper's
+        // status: the check is no call of its own.
+        let logins: Vec<String> = w.machine.calls()[calls_before..]
+            .iter()
+            .filter(|c| c.starts_with("run ") || c.starts_with("link "))
+            .cloned()
+            .collect();
+        assert_eq!(logins, ["run hpc-login", "run hpc-login"], "{logins:?}");
+        // The machine check, in the probe's own call: the stand-in's version, what is missing
         // with its install page, and the helper that Connect installs.
         let rows = probe["check"]["rows"]
             .as_array()
@@ -1094,7 +1103,9 @@ mod unix {
                 .iter()
                 .all(|p| p.get("fingerprint").is_none() || p["kind"] == "host_key")
         );
-        assert_eq!(w.machine.asked()[..2], ["yes", "text"]);
+        // A password host asks once for the probe with its check, and once for the helper's
+        // status: the check asks nothing more.
+        assert_eq!(w.machine.asked(), ["yes", "text", "text"]);
         // Every prompt was withdrawn once answered.
         let closed: Vec<Value> = w.events(PROMPT_CLOSED_EVENT);
         for prompt in &prompts {
