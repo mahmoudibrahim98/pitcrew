@@ -675,3 +675,18 @@ or inconsistent task/workstream references are 400. A task-only link derives its
 workstream-only link clears the task. Each emits `session_linked` with basis `manual`. Imported
 links are firm, matching the runner; the sessions projection version is bumped so replay applies
 that rule. `tests/manual_links.rs` covers route validation and protection against later inference.
+
+## Directory writes and creation dialogs
+
+Device-only `POST /v1/personas`, `PUT /v1/personas/{id}`, `POST /v1/teams` and
+`PUT /v1/teams/{id}` validate all fields/references before appending `persona_saved` or
+`team_saved`. `PersonaEdit` and `TeamEdit` are protocol request types. Creating a persona also
+appends its caller-owned agent member in the same batch; editing updates linked member names.
+Teams retain their existing member-id model, deduplicate members and include the lead.
+`NewProject.first_workstream` optionally creates the project's first workstream in the same
+append, using the project root as its location. This keeps the creation dialog atomic.
+`tests/directory.rs` covers refusals, authorization, atomic creation and directory replay.
+
+Successful onboarding scans call `ensure_engine_agents`: missing detected engines receive a
+person-owned agent member and default persona in one batch. The writer lock makes concurrent
+scans idempotent; existing owned agents are reused. Service actors without personas do not count.

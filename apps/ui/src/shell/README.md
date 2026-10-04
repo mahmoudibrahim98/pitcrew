@@ -294,3 +294,8 @@ does nothing, and the palette leaves it out entirely:
 `tests/shell.test.tsx` renders `createAppRouter([stub], { history: createMemoryHistory(…) })`
 inside a `DataProvider` pointed at a mock hub on a free port, checks the stub's nav entry appears
 and routes, and that a feature route replaces a placeholder. Copy it for your feature.
+
+Creation entries now come from their owning features; the shell has no placeholder create forms.
+`CreateEntry.projectContext` restricts an entry to routes with a project parameter in both the
+menu and palette. The Projects feature uses it for Workstream, and its project-page button opens
+the same registered dialog. The shell retains modal trapping, Close/Escape and opener restoration.

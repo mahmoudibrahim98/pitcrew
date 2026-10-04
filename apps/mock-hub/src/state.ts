@@ -14,6 +14,7 @@ import type {
   Dispatch,
   Event,
   EventBody,
+  Engine,
   Machine,
   Member,
   MemberId,
@@ -294,6 +295,26 @@ export class Hub {
     this.#listeners.clear();
   }
 
+  /** Provision detected engines once per person, using owned agent members with personas. */
+  ensureEngineAgents(person: MemberId, engines: readonly Engine[]): Member[] {
+    const owned = new Set(this.members.filter((m) => m.kind === 'agent' && m.owner === person)
+      .flatMap((m) => { const persona = this.personas.find((p) => p.id === m.persona); return persona === undefined ? [] : [persona.engine]; }));
+    const created: Member[] = [];
+    for (const engine of engines) {
+      if (owned.has(engine)) continue;
+      owned.add(engine);
+      const persona: Persona = { id: ulid(), name: { claude: 'Claude', codex: 'Codex', opencode: 'OpenCode' }[engine], engine, permission_mode: 'default' };
+      const id = ulid();
+      const member: Member = { id, kind: 'agent', handle: `@agent-${id.toLowerCase()}`,
+        name: persona.name, owner: person, persona: persona.id };
+      this.personas.push(persona); this.members.push(member);
+      this.append(person, { type: 'persona_saved', data: { persona } });
+      this.append(person, { type: 'member_added', data: { member } });
+      created.push(member);
+    }
+    return created;
+  }
+
   // ─── Lookups ──────────────────────────────────────────────────────────────────────────────────
 
   findMember(id: string): Member | undefined {
@@ -304,6 +325,11 @@ export class Hub {
   findMachine(id: string): Machine | undefined {
     const bare = bareId(id, 'mch');
     return this.machines.find((m) => m.id === bare);
+  }
+
+  findTeam(id: string): Team | undefined {
+    const bare = bareId(id, 'team');
+    return this.teams.find((t) => t.id === bare);
   }
 
   findPersona(id: string): Persona | undefined {

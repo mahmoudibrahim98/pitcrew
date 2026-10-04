@@ -70,6 +70,7 @@ mod activity;
 mod codec;
 mod commands;
 mod cursors;
+mod directory;
 mod dispatch;
 mod edits;
 mod error;
@@ -110,3 +111,5 @@ pub use setup::SetupListener;
 
 /// The protocol version this crate was built against.
 pub const PROTOCOL_VERSION: u32 = pitcrew_protocol::PROTOCOL_VERSION;
+
+pub use pitcrew_protocol::api::{PersonaEdit, TeamEdit};

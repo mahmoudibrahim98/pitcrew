@@ -223,3 +223,19 @@ shows a note instead of an error, with task/session activity unaffected. `tests/
 test.tsx`'s proposal tests use the mock's demo data (the PAP project brief has a pending proposal)
 for Accept and Keep current; a `next` step on the proposal itself is injected at the `fetch` layer
 (`withProposedNext`) since that fixture's own proposal has none.
+
+## Creation dialogs
+
+`new-entities.tsx` owns Project, Agent, Team and contextual Workstream entries. Project suggests an
+editable key, validates an absolute root for the selected machine's reported platform (WSL uses
+Unix paths), and accepts an optional first workstream. Before a machine reports its platform,
+only structurally absolute Unix/drive/UNC forms are accepted. The optional workstream is committed
+atomically by `POST /v1/projects`; standalone creation uses `POST /v1/workstreams`. Success refreshes
+lists and opens the new project/workstream. Agent and Team refresh Members' recipe/team sections
+without a reload; newly created personas have owned agent members selectable in teams. Errors
+stay in the form. All modal/focus behavior belongs to the shell; pending submissions are disabled.
+
+Run `corepack pnpm --filter @pitcrew/ui exec playwright test -c
+src/projects/tests/e2e/create-dialogs.config.ts` for both themes, validation, live lists, palette,
+focus and axe. `E2E_HUB_URL` and `E2E_HUB_TOKEN` select a disposable real demo hub for the same tests;
+defaults start the mock hub. `tests/create-dialogs.test.tsx` covers the forms and platform roots.

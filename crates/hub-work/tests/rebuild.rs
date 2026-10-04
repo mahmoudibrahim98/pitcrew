@@ -358,6 +358,7 @@ fn edits(work: &WorkService, rerun: TaskId) {
         .create_project(
             &sam,
             NewProject {
+                first_workstream: None,
                 key: ProjectKey::new("THS").expect("key"),
                 name: "Thesis".into(),
                 lead: None,

@@ -198,3 +198,13 @@ They enforce revisions, exclusive creation, path rules and body/file/list caps; 
 only in memory. Remote and WSL locations return 501. No filesystem paths are opened.
 
 Session import implements all/filtered/start-fresh rules in memory on the three `/v1/import` routes. Session lists, activity and stream delivery share inclusion; affected recap day paragraphs are reconstructed from retained fixture block lines. The mock still computes no new recap blocks for mutations.
+
+Directory writes (`POST /v1/personas`, `PUT /v1/personas/{id}`, `POST /v1/teams`,
+`PUT /v1/teams/{id}`) mirror the hub's device-only validation, generated ids, events, caller-owned
+agent member creation and linked-member rename. Unknown team members are refused before mutation.
+`POST /v1/projects` accepts an optional `first_workstream` name and creates both objects together.
+Both conformance targets run the same directory and atomic-project cases.
+
+A completed setup scan provisions one owned agent/persona per detected engine, matching the
+real hub. Repeated scans reuse them; a disconnected scan creates none. Fresh setup tests dispatch
+tasks through each generated agent.

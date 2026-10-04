@@ -48,6 +48,8 @@ import {
   type MemberId,
   type Mover,
   type Project,
+  type Persona,
+  type Team,
   type Receipt,
   type Session,
   type Subtask,
@@ -172,6 +174,12 @@ export async function handleApi(hub: Hub, request: ApiRequest): Promise<Reply> {
   const { pattern, access, handler } = match.route;
   if (access === 'device' && caller.scope !== 'device') {
     throw forbidden(`${request.method} ${pattern} needs a device token.`);
+  }
+  if (request.method === 'PUT' && pattern === '/v1/personas/:id') {
+    found(hub.findPersona(match.params.get('id') ?? ''), 'No such persona.');
+  }
+  if (request.method === 'PUT' && pattern === '/v1/teams/:id') {
+    found(hub.findTeam(match.params.get('id') ?? ''), 'No such team.');
   }
   const body = request.method === 'GET' ? undefined : await request.readBody();
   const param = (name: string): string => {
@@ -398,6 +406,60 @@ const setupHub: Handler = (hub, ctx) => {
   return ok({ workspace: hub.workspace, me: member, machine });
 };
 
+
+// Directory writes use the same validation before mutation as the real hub.
+function directoryText(value: string, field: string, max: number): string {
+  const text = value.trim();
+  if (text === '' || [...text].length > max || /[\p{Cc}]/u.test(text)) {
+    throw invalid(`${field} must be 1–${max} characters without controls.`);
+  }
+  return text;
+}
+const savePersona = (editing = false): Handler => (hub, ctx) => {
+  const previous = !editing ? undefined
+    : found(hub.findPersona(ctx.param('id')), 'No such persona.');
+  memberRef(hub, ctx.caller.memberId, 'caller');
+  const f = new Fields(ctx.body);
+  const name = directoryText(f.string('name'), 'name', 80);
+  const modelValue = f.optString('model');
+  const model = modelValue === undefined ? undefined : directoryText(modelValue, 'model', 200);
+  if (f.isNull('permission_mode')) throw invalid('permission_mode must be a permission mode.');
+  const instructions = f.optString('instructions');
+  if (instructions !== undefined && [...instructions].length > 32_000) throw invalid('instructions must be at most 32000 characters.');
+  const persona: Persona = { id: previous?.id ?? ulid(), name, model, instructions,
+    engine: f.enumOf('engine', ENGINES), permission_mode: f.optEnum('permission_mode', PERMISSION_MODES) ?? 'default' };
+  const members: Member[] = previous === undefined ? (() => {
+    const id = ulid();
+    return [{ id, name, handle: `@agent-${id.toLowerCase()}`, kind: 'agent', owner: ctx.caller.memberId, persona: persona.id }];
+  })() : hub.members.filter((m) => m.persona === persona.id).map((m) => ({ ...m, name }));
+  if (previous === undefined) hub.personas.push(persona);
+  else hub.personas[hub.personas.indexOf(previous)] = persona;
+  hub.append(ctx.caller.memberId, { type: 'persona_saved', data: { persona } });
+  for (const member of members) {
+    const at = hub.members.findIndex((m) => m.id === member.id);
+    if (at === -1) hub.members.push(member); else hub.members[at] = member;
+    hub.append(ctx.caller.memberId, { type: 'member_added', data: { member } });
+  }
+  return previous === undefined ? created(persona) : ok(persona);
+};
+const saveTeam = (editing = false): Handler => (hub, ctx) => {
+  const previous = !editing ? undefined
+    : found(hub.findTeam(ctx.param('id')), 'No such team.');
+  memberRef(hub, ctx.caller.memberId, 'caller');
+  const f = new Fields(ctx.body);
+  const name = directoryText(f.string('name'), 'name', 80);
+  const lead = memberRef(hub, f.string('lead'), 'lead').id;
+  const ids = f.optStringArray('members');
+  if (ids === undefined || ids.length > 256) throw invalid('members must be an array of at most 256 ids.');
+  const members = [...new Set(ids.map((id) => memberRef(hub, id, 'members').id))];
+  if (!members.includes(lead)) members.unshift(lead);
+  if (members.length > 256) throw invalid('A team has at most 256 members.');
+  const team: Team = { id: previous?.id ?? ulid(), name, lead, members };
+  if (previous === undefined) hub.teams.push(team); else hub.teams[hub.teams.indexOf(previous)] = team;
+  hub.append(ctx.caller.memberId, { type: 'team_saved', data: { team } });
+  return previous === undefined ? created(team) : ok(team);
+};
+
 // ─── Projects and workstreams ───────────────────────────────────────────────────────────────────
 
 /** `ProjectKey` in ids.rs: 2–10 characters, an uppercase letter, then uppercase letters or digits. */
@@ -414,6 +476,7 @@ const createProject: Handler = (hub, ctx) => {
     throw invalid('key must be 2 to 10 characters: an uppercase letter, then uppercase letters or digits.');
   }
   const name = fields.text('name');
+  const firstWorkstream = fields.optText('first_workstream');
   const leadId = fields.optString('lead');
   const lead = leadId === undefined ? ctx.caller.memberId : memberRef(hub, leadId, 'lead').id;
   const members: MemberId[] = [];
@@ -450,6 +513,12 @@ const createProject: Handler = (hub, ctx) => {
   };
   hub.projects.push(project);
   hub.append(ctx.caller.memberId, { type: 'project_created', data: { project } });
+  if (firstWorkstream !== undefined) {
+    const workstream: Workstream = { id: ulid(), project: project.id, name: firstWorkstream,
+      status: 'active', health: 'on_track', locations: root === undefined ? [] : [root], external: [] };
+    hub.workstreams.push(workstream);
+    hub.append(ctx.caller.memberId, { type: 'workstream_created', data: { workstream } });
+  }
   return created(project);
 };
 
@@ -1469,11 +1538,15 @@ const ROUTES: Route[] = [
   route('GET', '/v1/machines', 'device', (hub) => ok(hub.machines)),
   route('POST', '/v1/machines/:id/scan', 'device', (hub, ctx) => ({
     status: 200,
-    stream: startScan(hub, ctx.param('id')),
+    stream: startScan(hub, ctx.param('id'), ctx.caller.memberId),
   })),
   route('GET', '/v1/members', 'agent', (hub) => ok(hub.members)),
   route('GET', '/v1/personas', 'device', (hub) => ok(hub.personas)),
+  route('POST', '/v1/personas', 'device', savePersona()),
+  route('PUT', '/v1/personas/:id', 'device', savePersona(true)),
   route('GET', '/v1/teams', 'device', (hub) => ok(hub.teams)),
+  route('POST', '/v1/teams', 'device', saveTeam()),
+  route('PUT', '/v1/teams/:id', 'device', saveTeam(true)),
   // Projects and workstreams.
   route('GET', '/v1/projects', 'device', (hub) => ok(hub.projects)),
   route('GET', '/v1/projects/:id', 'device', (hub, ctx) =>

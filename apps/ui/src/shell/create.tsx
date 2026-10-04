@@ -1,6 +1,7 @@
 // "+ New": a menu of the registered create items, each opening its dialog. The palette's "New …"
 // commands open the same dialogs.
 
+import { useParams } from '@tanstack/react-router';
 import { Suspense, useId } from 'react';
 import {
   Button,
@@ -52,6 +53,7 @@ function NewMenuItem({ entry, onOpen }: { entry: ResolvedCreate; onOpen(id: stri
 }
 
 export function NewMenu() {
+  const { project }: { project?: string } = useParams({ strict: false });
   const registry = useRegistry();
   const setCreating = useShell((s) => s.setCreating);
   return (
@@ -70,7 +72,7 @@ export function NewMenu() {
         }}
       >
         <MenuLabel>Create</MenuLabel>
-        {registry.create.map((entry) => (
+        {registry.create.filter((entry) => !entry.projectContext || project !== undefined).map((entry) => (
           <NewMenuItem
             key={entry.id}
             entry={entry}

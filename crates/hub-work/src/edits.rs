@@ -257,6 +257,9 @@ impl WorkService {
             }
         }
         start_before_due(new.start.as_ref(), new.due.as_ref())?;
+        if let Some(name) = &new.first_workstream {
+            not_empty(name, "first_workstream")?;
+        }
         let lead = new.lead.unwrap_or(caller.member);
         let mut members = deduplicated(new.members.unwrap_or_default());
         let _guard = self.lock();
@@ -289,7 +292,25 @@ impl WorkService {
             external: Vec::new(),
         };
         let (id, key) = (project.id, project.key.clone());
-        self.append(&[self.by(caller, EventBody::ProjectCreated { project })])?;
+        let mut events = vec![self.by(
+            caller,
+            EventBody::ProjectCreated {
+                project: project.clone(),
+            },
+        )];
+        if let Some(name) = new.first_workstream {
+            let workstream = Workstream {
+                id: WorkstreamId::new(),
+                project: id,
+                name,
+                status: WorkstreamStatus::Active,
+                health: Health::OnTrack,
+                locations: project.root.into_iter().collect(),
+                external: Vec::new(),
+            };
+            events.push(self.by(caller, EventBody::WorkstreamCreated { workstream }));
+        }
+        self.append(&events)?;
         match self.read(|c| Ok((query::project(c, &id)?, query::project_with_key(c, &key)?)))? {
             (Some(project), _) => Ok(project),
             // Only a second writer can take the key between the check and the append; the

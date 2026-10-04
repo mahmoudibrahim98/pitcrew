@@ -657,3 +657,17 @@ The plan's security table and the ADRs' security commitments (ADR-0003, ADR-0006
 | The back office acts only within its rules, and the hub checks them | T49, T50, R17 |
 | The event log stays whole: one writer on network filesystems, imports whole or not at all | T23, T59, R7, R18 |
 | The hub stays available: bounded queues, caches and indexes | T38, T42, T48, T67 |
+
+## Directory creation (integrator/create-dialogs)
+
+Persona and team POST/PUT routes are device-only, both at the router and in the command service.
+The hub assigns ids and event authors; client-supplied author/owner/id fields never grant authority.
+Names and models are trimmed, bounded and control-free; instructions and membership lists are
+bounded. Every reference is checked under the single-writer lock before appending. Creating a
+persona and its owned agent member, and creating a project with its optional first workstream,
+use one event batch so a validation or storage failure cannot leave half a creation. Team members
+are existing member identities; persona ids cannot masquerade as members. Saving a permission
+recipe starts no process: the runner's existing permission-bypass opt-in and audit rules still
+apply when an agent is launched. The UI renders names/instructions as text and requires an
+explicit bypass selection. Tests: `crates/hub-work/tests/directory.rs`, directory and atomic-project
+cases in `tests/conformance/api.test.mjs`, and the projects create-dialog unit/browser tests.

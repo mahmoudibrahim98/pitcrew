@@ -536,6 +536,7 @@ fn keys_are_allocated_by_key_prefix_not_by_project() {
         .create_project(
             &person(SAM),
             pitcrew_hub_work::NewProject {
+                first_workstream: None,
                 key: ProjectKey::new("TL").expect("key"),
                 name: "Tooling, again".into(),
                 lead: None,

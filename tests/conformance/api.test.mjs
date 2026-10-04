@@ -1064,3 +1064,66 @@ check('cursor metadata is private in live/replay and does not consume activity p
     owner.ws.close(); other.ws.close(); replay?.ws.close();
   }
 });
+
+check('directory creation and editing are device-only, validated, event-backed and atomic', async () => {
+  const recipe = { name: '  Synthetic author  ', engine: 'codex', model: 'demo-model', instructions: 'Synthetic\nexamples.', permission_mode: 'plan' };
+  for (const [path, body] of [['/v1/personas', recipe], ['/v1/teams', { name: 'Synthetic crew', lead: missing, members: [] }]]) {
+    await api(path, 401, undefined, { method: 'POST', token: '', body });
+    await api(path, 403, undefined, { method: 'POST', token: agent, body });
+  }
+  const rev = (await api('/v1/workspace')).rev;
+  await api('/v1/personas', 400, undefined, { method: 'POST', body: { ...recipe, name: ' ' } });
+  await api('/v1/personas', 400, undefined, { method: 'POST', body: { ...recipe, engine: 'invalid' } });
+  await api('/v1/personas', 400, undefined, { method: 'POST', body: { ...recipe, model: 'x'.repeat(201) } });
+  await api('/v1/personas', 400, undefined, { method: 'POST', body: { ...recipe, instructions: 'x'.repeat(32001) } });
+  assert.equal((await api('/v1/workspace')).rev, rev);
+  const persona = await api('/v1/personas', 201, undefined, { method: 'POST', body: { ...recipe, id: missing, author: missing } });
+  assert.equal(persona.name, 'Synthetic author'); assert.notEqual(persona.id, missing);
+  schemas.personas([persona]);
+  let members = await api('/v1/members');
+  const member = members.find((m) => m.persona === persona.id);
+  const me = await api('/v1/me');
+  assert.equal(member.kind, 'agent'); assert.equal(member.owner, me.id);
+  const renamed = await api(`/v1/personas/per_${persona.id}`, 200, undefined, { method: 'PUT', body: { ...recipe, name: 'Renamed author' } });
+  assert.equal(renamed.id, persona.id);
+  members = await api('/v1/members');
+  assert.equal(members.find((m) => m.id === member.id).name, 'Renamed author');
+  const dispatchTask = await api('/v1/tasks', 201, schemas.task, { method: 'POST', body: { project: context.project.id, title: 'Dispatch new agent' } });
+  const dispatched = await api(`/v1/tasks/${dispatchTask.id}/dispatch`, 202, schemas.dispatch, { method: 'POST', body: { agent: member.id } });
+  assert.equal(dispatched.task, dispatchTask.id);
+  const teamBody = { name: 'Synthetic crew', lead: me.id, members: [member.id, member.id] };
+  const teamRev = (await api('/v1/workspace')).rev;
+  await api('/v1/teams', 400, undefined, { method: 'POST', body: { ...teamBody, members: [missing] } });
+  await api('/v1/teams', 400, undefined, { method: 'POST', body: { ...teamBody, lead: missing } });
+  await api('/v1/teams', 400, undefined, { method: 'POST', body: { ...teamBody, members: Array(257).fill(member.id) } });
+  assert.equal((await api('/v1/workspace')).rev, teamRev);
+  const team = await api('/v1/teams', 201, undefined, { method: 'POST', body: teamBody });
+  schemas.teams([team]); assert.deepEqual(team.members, [me.id, member.id]);
+  const updated = await api(`/v1/teams/team_${team.id}`, 200, undefined, { method: 'PUT', body: { ...teamBody, name: 'Renamed crew', lead: member.id, members: [] } });
+  assert.deepEqual(updated.members, [member.id]); assert.equal(updated.id, team.id);
+  for (const path of [`/v1/personas/${persona.id}`, `/v1/teams/${team.id}`]) {
+    await api(path, 403, undefined, { method: 'PUT', token: agent, body: {} });
+  }
+  for (const path of [`/v1/personas/${missing}`, `/v1/teams/${missing}`, '/v1/personas/bad', '/v1/teams/bad']) {
+    await api(path, 404, undefined, { method: 'PUT', body: {} });
+  }
+  const events = (await api('/v1/events?limit=100')).events;
+  assert.ok(events.some((e) => e.body.type === 'persona_saved' && e.body.data.persona.id === persona.id && e.author === me.id));
+  assert.ok(events.some((e) => e.body.type === 'team_saved' && e.body.data.team.id === team.id && e.author === me.id));
+});
+
+check('project and optional first workstream are created together or neither is created', async () => {
+  const key = 'ATOMIC';
+  const body = { key, name: 'Atomic project', first_workstream: '  ' };
+  const rev = (await api('/v1/workspace')).rev;
+  await api('/v1/projects', 400, undefined, { method: 'POST', body });
+  assert.equal((await api('/v1/workspace')).rev, rev);
+  assert.ok(!(await api('/v1/projects')).some((p) => p.key === key));
+  const project = await api('/v1/projects', 201, schemas.project, { method: 'POST', body: { ...body, first_workstream: 'First stream' } });
+  const streams = await api(`/v1/workstreams?project=${project.id}`);
+  assert.equal(streams.length, 1); assert.equal(streams[0].name, 'First stream');
+  const after = (await api('/v1/workspace')).rev;
+  await api('/v1/projects', 409, undefined, { method: 'POST', body: { ...body, first_workstream: 'Second stream' } });
+  assert.equal((await api('/v1/workspace')).rev, after);
+  assert.equal((await api(`/v1/workstreams?project=${project.id}`)).length, 1);
+});
