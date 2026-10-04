@@ -283,6 +283,11 @@ All installer checks pass. These lab inputs cannot be distributed as production 
 AppImage already deduplicates identical raw files and compresses its filesystem, so its
 saving is smaller. Its separate local budget is 127,520,299 bytes, measured size + 10%.
 Release dry runs provide the production comparison, including DMG and NSIS.
+When local policy blocks artifact/log storage, the release workflow's `measure_only` input
+compares `desktop-*` artifacts from `before_run` and `after_run` on each native OS. It
+builds and publishes nothing; exact byte counts and largest payload files are written to
+both summaries and API-readable annotations. Its only extra permission is `actions: read`
+for the cross-run artifact download.
 
 **Helper storage and lookup (installer-size-2).** The manifest continues to name decoded
 `Platform::artefact()` executables and their decoded SHA-256; its schema is unchanged.

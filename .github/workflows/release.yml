@@ -17,6 +17,17 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      measure_only:
+        description: Compare existing installer artifacts without building or publishing
+        type: boolean
+        default: false
+      before_run:
+        description: Baseline release workflow run ID (measure_only)
+        type: string
+      after_run:
+        description: Changed release workflow run ID (measure_only)
+        type: string
 
 permissions: {}
 
@@ -37,6 +48,7 @@ env:
 
 jobs:
   build:
+    if: ${{ !inputs.measure_only }}
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
@@ -327,6 +339,69 @@ jobs:
           path: dist/*
           if-no-files-found: error
           retention-days: 7
+
+  measure:
+    name: Measure existing installers (${{ matrix.target }})
+    if: github.event_name == 'workflow_dispatch' && inputs.measure_only
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: universal-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Validate comparison inputs
+        shell: bash
+        env:
+          BEFORE_RUN: ${{ inputs.before_run }}
+          AFTER_RUN: ${{ inputs.after_run }}
+        run: |
+          if [[ ! "$BEFORE_RUN" =~ ^[1-9][0-9]*$ || ! "$AFTER_RUN" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::before_run and after_run must be release workflow run IDs"
+            exit 1
+          fi
+      - name: Linux extraction tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends squashfs-tools rpm rpm2cpio cpio libarchive-tools
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: desktop-${{ matrix.target }}
+          run-id: ${{ inputs.before_run }}
+          github-token: ${{ github.token }}
+          path: before
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: desktop-${{ matrix.target }}
+          run-id: ${{ inputs.after_run }}
+          github-token: ${{ github.token }}
+          path: after
+      # Summaries are convenient in the UI; annotations also expose exact measurements through
+      # GitHub's API when the reader cannot access the log/artifact storage redirect hosts.
+      - name: Report exact sizes and largest files
+        shell: bash
+        run: |
+          set -euo pipefail
+          for comparison in before after; do
+            report=$(bash packaging/desktop/contents.sh "$comparison"/*)
+            printf '## %s\n\n%s\n' "$comparison" "$report" >> "$GITHUB_STEP_SUMMARY"
+            escaped=${report//'%'/'%25'}
+            escaped=${escaped//$'\r'/'%0D'}
+            escaped=${escaped//$'\n'/'%0A'}
+            echo "::notice title=Installer payload ($comparison)::$escaped"
 
   attest:
     name: Attest build provenance
