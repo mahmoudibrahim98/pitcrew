@@ -85,18 +85,32 @@ describe('TaskDrawer', () => {
     const other = otherClient(hub);
     renderWithHub(drawer(demo.pap7), hub);
     const dialog = await screen.findByRole('dialog', { name: 'Set up the submission checklist' });
-    const box = within(dialog).getByRole('checkbox', { name: 'Anonymisation check' }) as HTMLInputElement;
+    const box = await within(dialog).findByRole('checkbox', { name: 'Anonymisation check' }) as HTMLInputElement;
     await eventually(() => expect(box.disabled).toBe(false));
+    expect(box.checked).toBe(true);
     fireEvent.click(box);
     await eventually(async () =>
       expect((await other.task('PAP-7')).subtasks.map((s) => s.done)).toEqual([true, false]),
     );
+    // The hub can save before the mutation response and live refetch reach the drawer.
+    await eventually(() => {
+      expect(box.checked).toBe(false);
+      expect(box.disabled).toBe(false);
+      expect((within(dialog).getByRole('button', { name: 'Add' }) as HTMLButtonElement).disabled).toBe(false);
+    });
     fireEvent.change(within(dialog).getByRole('textbox', { name: 'New subtask' }), {
       target: { value: 'Supplementary material' },
     });
     fireEvent.click(within(dialog).getByRole('button', { name: 'Add' }));
-    await within(dialog).findByRole('checkbox', { name: 'Supplementary material' });
+    await eventually(() => {
+      const added = within(dialog).getByRole('checkbox', { name: 'Supplementary material' }) as HTMLInputElement;
+      expect(added.checked).toBe(false);
+      expect(added.disabled).toBe(false);
+      expect(box.checked).toBe(false);
+      expect((within(dialog).getByRole('textbox', { name: 'New subtask' }) as HTMLInputElement).value).toBe('');
+    });
     const saved = await other.task('PAP-7');
+    expect(saved.subtasks.map((s) => s.done)).toEqual([true, false, false]);
     expect(saved.subtasks.at(-1)).toMatchObject({ text: 'Supplementary material', done: false, source: { kind: 'human' } });
     expect(saved.subtasks.at(-1)?.id).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
   });
