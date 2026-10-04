@@ -16,6 +16,7 @@ import {
   terminalTarget,
   type TerminalTarget,
 } from './live.ts';
+import * as integrations from './integrations.ts';
 import { loadRecaps } from './recaps.ts';
 import { MOCK_VERSION, authenticate, handleApi, type Reply } from './routes.ts';
 import {
@@ -60,6 +61,11 @@ export interface ServerOptions {
   fresh?: boolean;
   /** Receives one line per request. Silent by default. */
   log?: (line: string) => void;
+  /**
+   * The folder of recorded GitHub and Jira exchanges integrations read (`*.fixture`), instead of
+   * `fixtures/`. It is read again at each sync, so a test can change what "upstream" says.
+   */
+  integrationFixtures?: string;
 }
 
 export interface RunningServer {
@@ -81,6 +87,7 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
     options.scanWindow ?? DEFAULT_SCAN_WINDOW,
     options.fresh === true ? undefined : loadRecaps(RECAPS),
   );
+  if (options.integrationFixtures !== undefined) integrations.useFixtures(hub, options.integrationFixtures);
   const log = options.log ?? ((): void => {});
   const sockets = new Set<WebSocketConnection>();
   const server = createServer((req, res) => {
