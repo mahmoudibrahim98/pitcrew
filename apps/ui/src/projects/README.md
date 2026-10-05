@@ -277,6 +277,12 @@ recursive filename search across locations, skips links, and ranks fuzzy matches
 `file-breadcrumbs.tsx` provides folder navigation and full-path copying. Hidden dot
 names and the API’s ignored hints are off by default and can be shown explicitly.
 The shared viewer accepts an optional line target, including virtualized text.
+## Start session
+
+A workstream's **Start session** opens the console's shared New session dialog with its
+machine and folder prefilled from the workstream's locations. Multiple locations remain
+selectable. The console owns launching and opens the resulting session's terminal in the
+workbench; this entry does not register another shell create item.
 
 ## Creation dialogs
 

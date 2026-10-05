@@ -121,6 +121,17 @@ pub(crate) fn relink(
     (current != Some(best)).then_some(best)
 }
 
+/// The unambiguous workstream containing a new session's folder, before its branch is known.
+/// Uses the same path normalization, depth and tie rules as transcript linking.
+#[must_use]
+pub fn workstream_at(
+    machine: MachineId,
+    locations: &[WorkstreamLocation],
+    cwd: &str,
+) -> Option<WorkstreamId> {
+    choose(machine, locations, cwd, None).map(|linked| linked.workstream)
+}
+
 /// The best location for a session in `cwd` on `branch`, by the rules in the module docs.
 pub(crate) fn choose(
     machine: MachineId,

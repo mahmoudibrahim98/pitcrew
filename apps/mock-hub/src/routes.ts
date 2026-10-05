@@ -1066,6 +1066,17 @@ const getTranscript: Handler = (hub, ctx) => {
   return ok(transcriptPage(hub.transcripts.get(session.id) ?? [], before, limit));
 };
 
+const sessionOptions: Handler = (hub, ctx) => {
+  const machine = hub.findMachine(ctx.param('id'));
+  if (machine === undefined) throw notFound('No such machine.');
+  if (machine.kind !== 'local' || machine.liveness !== 'live') throw unavailable('This machine has no reachable session terminal runtime.');
+  return ok({ platform: 'unix', engines: [
+    { engine: 'claude', permission_modes: ['default', 'accept_edits', 'plan'], first_prompt_forbidden: [] },
+    { engine: 'codex', permission_modes: ['default', 'accept_edits'], first_prompt_forbidden: [] },
+    { engine: 'opencode', permission_modes: ['default'], first_prompt_forbidden: [] },
+  ] });
+};
+
 const startSession: Handler = (hub, ctx) => {
   const fields = new Fields(ctx.body);
   const machineId = fields.string('machine');
@@ -1083,18 +1094,26 @@ const startSession: Handler = (hub, ctx) => {
   const brief = fields.optString('brief');
   // Checked for the contract's sake; a session does not record them.
   fields.optString('model');
-  fields.optEnum('permission_mode', PERMISSION_MODES);
+  const mode = fields.optEnum('permission_mode', PERMISSION_MODES) ?? hub.onboarding.safety.permission_mode;
+  if ((engine === 'codex' && mode === 'plan') || (engine === 'opencode' && mode !== 'default') || mode === 'bypass_permissions') throw invalid('This permission mode is not allowed on this runner.');
+  const rawTitle = fields.optString('title');
+  const title = rawTitle?.trim();
+  if (rawTitle !== undefined && (rawTitle.trim().length === 0 || [...rawTitle.trim()].length > 200 || /[\u0000-\u001f\u007f-\u009f]/u.test(rawTitle))) throw invalid('title must be 1–200 characters without control characters.');
+  if (machine.kind !== 'local') throw unavailable('This hub cannot start a session on another machine.');
   requireLive(machine);
+  const workstreamId = fields.optString('workstream');
+  const selectedStream = workstreamId === undefined ? undefined : known(hub.findWorkstream(workstreamId), 'No such workstream.');
+  if (task !== undefined && selectedStream !== undefined && task.workstream !== selectedStream.id) throw invalid('The task is not in this workstream.');
   const folder = task === undefined ? workstreamByFolder(hub, machine.id, cwd) : undefined;
   const session = createSession(hub, {
     engine,
     machine: machine.id,
     cwd,
-    title: task?.title,
+    title: title ?? task?.title,
     agent: agent?.id,
-    workstream: task?.workstream ?? folder?.id,
+    workstream: selectedStream?.id ?? task?.workstream ?? folder?.id,
     task: task?.id,
-    link_basis: task !== undefined ? 'manual' : folder !== undefined ? 'folder' : undefined,
+    link_basis: selectedStream !== undefined || task !== undefined ? 'manual' : folder !== undefined ? 'folder' : undefined,
     brief,
   });
   announceSession(hub, session);
@@ -1651,6 +1670,7 @@ const ROUTES: Route[] = [
   route('GET', '/v1/sessions/:id', 'device', (hub, ctx) => ok(sessionAt(hub, ctx.param('id')))),
   route('GET', '/v1/sessions/:id/transcript', 'device', getTranscript),
   route('GET', '/v1/sessions/:id/terminal', 'device', needsWebSocket),
+  route('GET', '/v1/machines/:id/session-options', 'device', sessionOptions),
   route('POST', '/v1/sessions', 'device', startSession),
   route('POST', '/v1/sessions/:id/send', 'device', sendToSession),
   route('POST', '/v1/sessions/:id/keys', 'device', sendKeys),

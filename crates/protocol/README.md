@@ -12,6 +12,8 @@ Session import types live in `import`: inclusion rules, the durable choice, and 
 FileEntry’s additive `ignored` boolean defaults to false when deserializing an older
 listing and is generated in protocol-ts. It describes location-local ignore rules
 for presentation only; the Files API’s access rules and wire paths are unchanged.
+`api::SessionOptions` and `SessionEngine` describe machine-scoped launch availability. Their
+TypeScript bindings are exported by the same explicit regeneration test.
 
 Directory write bodies are `api::PersonaEdit` and `api::TeamEdit`, using the existing persona/team
 fields without client-assigned ids. `NewProject.first_workstream` is an optional name for an
