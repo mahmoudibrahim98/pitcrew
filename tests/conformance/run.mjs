@@ -230,9 +230,10 @@ try {
   // One phase per file (or group) that changes the hub for every view, in this order:
   // onboarding.test.mjs first, then the main suite, then import.test.mjs, which commits session
   // inclusion (and restores it), then integrations.test.mjs, which syncs, appending events that
-  // the main suite's exact-revision checks must not see, and writes.test.mjs last, on its own: it
-  // connects the same repository integrations.test.mjs does. Every phase runs; the first failure
-  // decides the exit code.
+  // the main suite's exact-revision checks must not see, then writes.test.mjs on its own (it
+  // connects the same repository integrations.test.mjs does), and board.test.mjs last: board
+  // drafts start an agent's CLI (a stand-in on the daemon) and create tasks. Every phase runs; the
+  // first failure decides the exit code.
   for (const files of [
     ['tests/conformance/onboarding.test.mjs'],
     [
@@ -244,6 +245,7 @@ try {
     ['tests/conformance/import.test.mjs'],
     ['tests/conformance/integrations.test.mjs'],
     ['tests/conformance/writes.test.mjs'],
+    ['tests/conformance/board.test.mjs'],
   ]) {
     suite = spawn(process.execPath, ['--test', ...files], {
       cwd: root,
@@ -253,12 +255,6 @@ try {
     const [code] = await once(suite, 'exit');
     suite = undefined;
     process.exitCode = process.exitCode || (code ?? 1);
-  }
-  {
-    // Board drafts start an agent's CLI (a stand-in on the daemon) and create tasks: run alone.
-    suite = spawn(process.execPath, ['--test', 'tests/conformance/board.test.mjs'], { cwd: root, env, stdio: 'inherit' });
-    const [boardCode] = await once(suite, 'exit');
-    process.exitCode = process.exitCode || (boardCode ?? 1);
   }
 } finally {
   await cleanup();
