@@ -77,6 +77,40 @@ function updateLists<T, F>(
   }
 }
 
+function rediscovered(old: Session | undefined, incoming: Session): Session {
+  if (old === undefined) return incoming;
+  const firm = (basis: Session['link_basis']) =>
+    basis !== undefined && basis !== null && ['dispatch', 'manual', 'claimed', 'imported'].includes(basis);
+  const next = { ...incoming };
+  if (old.state === 'ended') {
+    next.state = 'ended';
+    delete next.status_line;
+    if (old.status_line !== undefined) next.status_line = old.status_line;
+  }
+  if (firm(old.link_basis) && !firm(incoming.link_basis)) {
+    delete next.workstream;
+    delete next.task;
+    delete next.link_basis;
+    if (old.workstream !== undefined) next.workstream = old.workstream;
+    if (old.task !== undefined) next.task = old.task;
+    if (old.link_basis !== undefined) next.link_basis = old.link_basis;
+  }
+  if (next.agent === undefined && old.agent !== undefined) next.agent = old.agent;
+  // As the hub does: a model or account once recorded stays until a re-statement names another.
+  if (old.recorded !== undefined) next.recorded = { ...old.recorded, ...incoming.recorded };
+  return next;
+}
+
+function changeSession(qc: QueryClient, id: string, change: (s: Session) => Session) {
+  updateDetail<Session>(qc, keys.sessions.detail(id), (old) => old && change(old));
+  updateLists<Session, SessionFilters>(qc, keys.sessions.lists, (list, filters) => {
+    const old = list.find((s) => s.id === id);
+    if (old === undefined) return list;
+    const next = change(old);
+    return place(list, next, sessionMatches(filters, next));
+  });
+}
+
 export const patches: PatchMap = {
   task_created: {
     keys: ({ task }) => [keys.tasks.detail(task.id), keys.tasks.lists],
@@ -97,13 +131,29 @@ export const patches: PatchMap = {
       );
     },
   },
+  session_ended: {
+    keys: ({ session }) => [keys.sessions.detail(session), keys.sessions.lists],
+    apply: ({ session }, qc) => changeSession(qc, session, (s) => ({ ...s, state: 'ended' })),
+  },
+  session_state_changed: {
+    keys: ({ session }) => [keys.sessions.detail(session), keys.sessions.lists],
+    apply: ({ session, to, status_line }, qc) => changeSession(qc, session, (s) => {
+      const next = { ...s, state: to };
+      delete next.status_line;
+      if (status_line !== undefined) next.status_line = status_line;
+      return next;
+    }),
+  },
   session_discovered: {
     keys: ({ session }) => [keys.sessions.detail(session.id), keys.sessions.lists],
     apply: ({ session }, qc) => {
-      updateDetail<Session>(qc, keys.sessions.detail(session.id), () => session);
-      updateLists<Session, SessionFilters>(qc, keys.sessions.lists, (list, filters) =>
-        place(list, session, sessionMatches(filters, session)),
-      );
+      const cached = qc.getQueryData<Session>(keys.sessions.detail(session.id)) ??
+        qc.getQueriesData<Session[]>({ queryKey: keys.sessions.lists }).flatMap(([, list]) => list ?? []).find((s) => s.id === session.id);
+      updateDetail<Session>(qc, keys.sessions.detail(session.id), (old) => rediscovered(old, session));
+      updateLists<Session, SessionFilters>(qc, keys.sessions.lists, (list, filters) => {
+        const next = rediscovered(list.find((s) => s.id === session.id) ?? cached, session);
+        return place(list, next, sessionMatches(filters, next));
+      });
     },
   },
 };

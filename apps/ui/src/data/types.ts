@@ -90,6 +90,7 @@ export interface Machine {
   id: MachineId;
   name: string;
   kind: MachineKind;
+  info?: { os: string };
   liveness: Liveness;
 }
 
@@ -781,6 +782,7 @@ export interface EventsQuery extends EventFilters {
 
 /** `POST /v1/projects`. The hub assigns `id`; `external` starts empty. */
 export interface NewProject {
+  first_workstream?: string;
   /** `ProjectKey`: 2 to 10 characters, an uppercase letter, then uppercase letters or digits. */
   key: string;
   name: string;
@@ -844,3 +846,20 @@ export interface BriefEdit {
   next?: string;
   pinned: boolean;
 }
+
+export interface SessionOptions {
+  platform: 'windows' | 'unix';
+  engines: { engine: Engine; permission_modes: PermissionMode[]; first_prompt_forbidden?: string[] }[];
+}
+export interface StartSession {
+  workstream?: WorkstreamId;
+  machine: MachineId;
+  engine: Engine;
+  cwd: string;
+  permission_mode?: PermissionMode;
+  brief?: string;
+  title?: string;
+}
+
+export type PersonaEdit = Omit<Persona, 'id'>;
+export type TeamEdit = Omit<Team, 'id'>;

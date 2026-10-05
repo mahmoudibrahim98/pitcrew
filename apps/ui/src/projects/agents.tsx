@@ -15,7 +15,26 @@ export function runningFirst(a: Session, b: Session): number {
   return SESSION_STATE[a.state].rank - SESSION_STATE[b.state].rank || b.last_activity - a.last_activity;
 }
 
-/** Recent (ended) sessions shown after the active ones, until "Show all". */
+/**
+ * Whether a session is at work now: working, waiting or starting, or idle in a terminal PitCrew
+ * keeps open (its person may type next). A session found on disk goes idle once it is quiet and
+ * never ends unless its CLI says so (api-v1.md, "Sessions"), so idle alone is not "now".
+ */
+export function isActive(session: Session): boolean {
+  switch (session.state) {
+    case 'working':
+    case 'waiting':
+    case 'starting':
+      return true;
+    case 'idle':
+      return session.terminal !== undefined;
+    case 'ended':
+    case 'unreachable':
+      return false;
+  }
+}
+
+/** Recent sessions (neither active nor sub-agents) shown after the active ones, until "Show all". */
 export const RECENT_SHOWN = 3;
 
 export function AgentsNow({
@@ -41,8 +60,8 @@ export function AgentsNow({
     (s.task !== undefined && tasks.has(s.task));
   // Sub-agents are left out of the whole list (also of a workstream's), not only of this view.
   const agents = topLevel(sessions.data ?? []).filter(belongs);
-  const running = agents.filter((s) => s.state !== 'ended').sort(runningFirst);
-  const recent = agents.filter((s) => s.state === 'ended').sort((a, b) => b.last_activity - a.last_activity);
+  const running = agents.filter(isActive).sort(runningFirst);
+  const recent = agents.filter((s) => !isActive(s)).sort((a, b) => b.last_activity - a.last_activity);
   const shown = showAll ? [...running, ...recent] : [...running, ...recent.slice(0, RECENT_SHOWN)];
   const hidden = running.length + recent.length - shown.length;
   const openTask = nav.openTask;

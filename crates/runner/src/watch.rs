@@ -414,6 +414,16 @@ impl Shared {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(terminals.downgrade());
     }
 
+    fn live_sessions(&self) -> Option<HashSet<SessionId>> {
+        let terminals = self
+            .terminals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(WeakTerminals::upgrade);
+        terminals.map_or_else(|| Some(HashSet::new()), |t| t.live_sessions())
+    }
+
     /// Whether `terminal`'s program has certainly ended: its runtime says so, or no longer has
     /// it. False while it runs, and when that cannot be told (no terminals yet, or a runtime that
     /// does not answer). Blocking: it asks the runtime, for at most its call timeout.
@@ -530,6 +540,7 @@ impl Home {
 /// hooks to its session. The rest of its row (the cursor, the session's facts and metadata) is
 /// read from the index while it is in use, and let go once the index has saved it ([`Loaded`]).
 struct Tracked {
+    active_until: Option<TimestampMs>,
     session: SessionId,
     engine: Engine,
     /// Shared with the keys that find it, and with the transcript pages.
@@ -619,6 +630,7 @@ impl Tracked {
             failed_at: None,
             warned: false,
             loaded: None,
+            active_until: Some(0),
         }
     }
 
@@ -642,6 +654,7 @@ impl Tracked {
         self.discovered = row.discovered;
         self.subagent = row.meta.as_ref().is_some_and(|m| m.is_subagent);
         self.parent = row.facts.parent;
+        self.active_until = derive::active_until(&row.facts, row.mtime);
     }
 
     /// The transcript as the adapter reads it, at size `size` and modification time `modified`.
@@ -774,9 +787,11 @@ impl Ids {
 }
 
 /// Why the watcher stopped early.
+#[derive(Debug)]
 struct Hangup;
 
 pub(crate) struct Watcher {
+    live_cache: Option<(Instant, HashSet<SessionId>)>,
     byte_file_cursors: bool,
     cache_file_discovery: bool,
     workspace: WorkspaceId,
@@ -903,6 +918,7 @@ impl Watcher {
         }
         Self {
             cache_file_discovery: s.cache_file_discovery,
+            live_cache: None,
             byte_file_cursors: s.byte_file_cursors,
             workspace: s.workspace,
             machine: s.machine,
@@ -960,7 +976,7 @@ impl Watcher {
                 return Err(Hangup);
             }
             // Deleted earlier: discovery resumes the row if the file comes back.
-            if row.identity.as_deref() == Some(GONE) || !self.follow_canonical(&mut row) {
+            if !self.follow_canonical(&mut row) {
                 continue;
             }
             let Some(home) = self.home_for(row.engine, &row.path) else {
@@ -1604,6 +1620,16 @@ impl Watcher {
     /// so that file is read from the start.
     fn drop_deleted(&mut self, id: u64) -> Result<(), Hangup> {
         self.load(id);
+        let Some(session) = self.tracked.get(&id).map(|t| t.session) else {
+            return Ok(());
+        };
+        let Some(live) = self.live(session) else {
+            return Ok(());
+        };
+        // Keep checking a missing transcript while its known terminal is alive.
+        if live {
+            return Ok(());
+        }
         let Some(t) = self.tracked.remove(&id) else {
             return Ok(());
         };
@@ -1632,8 +1658,44 @@ impl Watcher {
         };
         l.row.identity = Some(GONE.to_owned());
         l.row.caught_up = false;
+        let mut events = Vec::new();
+        if l.row.discovered
+            && matches!(
+                l.row.facts.state,
+                SessionState::Working | SessionState::Waiting | SessionState::Starting
+            )
+        {
+            let from = l.row.facts.state;
+            l.row.facts.state = SessionState::Idle;
+            l.row.facts.status_line = None;
+            l.row.facts.reports += 1;
+            events.push(Event {
+                id: event_id(
+                    session,
+                    l.row.generation,
+                    Cause::Report(l.row.facts.reports),
+                    0,
+                    crate::now_ms(),
+                ),
+                at: l
+                    .row
+                    .facts
+                    .last_activity
+                    .max(l.row.mtime)
+                    .max(l.row.facts.reported_at.unwrap_or(0)),
+                workspace: self.workspace,
+                author: self.owner,
+                on_behalf_of: None,
+                body: EventBody::SessionStateChanged {
+                    session,
+                    from,
+                    to: SessionState::Idle,
+                    status_line: None,
+                },
+            });
+        }
         self.send(Batch {
-            events: Vec::new(),
+            events,
             commit: Commit::Full(Box::new(l.row)),
             unsaved: None,
         })
@@ -1688,10 +1750,86 @@ impl Watcher {
                 && t.mtime == st.mtime
                 && fsinfo::same_file(t.identity.as_deref(), st.identity.as_deref()))
         {
+            self.expire(id, st.mtime)?;
             return Ok(false);
         }
         self.refresh(id, st)?;
+        self.expire(id, self.tracked.get(&id).map_or(0, |t| t.mtime))?;
         Ok(true)
+    }
+
+    fn live(&mut self, session: SessionId) -> Option<bool> {
+        if self
+            .live_cache
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= Duration::from_secs(30))
+        {
+            self.live_cache = self.shared.live_sessions().map(|ids| (Instant::now(), ids));
+        }
+        self.live_cache
+            .as_ref()
+            .map(|(_, ids)| ids.contains(&session))
+    }
+
+    fn expire(&mut self, id: u64, modified: TimestampMs) -> Result<(), Hangup> {
+        let now = crate::now_ms();
+        if self
+            .tracked
+            .get(&id)
+            .is_none_or(|t| !t.discovered || t.active_until.is_none_or(|until| until > now))
+            || !self.load(id)
+        {
+            return Ok(());
+        }
+        let Some(session) = self.tracked.get(&id).map(|t| t.session) else {
+            return Ok(());
+        };
+        let Some(live) = self.live(session) else {
+            return Ok(());
+        };
+        let Some(t) = self.tracked.get_mut(&id) else {
+            return Ok(());
+        };
+        let Some(l) = t.loaded.as_deref_mut() else {
+            return Ok(());
+        };
+        let row = &mut l.row;
+        let Some(from) = derive::expire(&mut row.facts, modified, live, now) else {
+            t.sync();
+            return Ok(());
+        };
+        row.facts.reports += 1;
+        let event = Event {
+            id: event_id(
+                session,
+                row.generation,
+                Cause::Report(row.facts.reports),
+                0,
+                now,
+            ),
+            at: row
+                .facts
+                .last_activity
+                .max(modified)
+                .max(row.facts.reported_at.unwrap_or(0)),
+            workspace: self.workspace,
+            author: self.owner,
+            on_behalf_of: None,
+            body: EventBody::SessionStateChanged {
+                session,
+                from,
+                to: SessionState::Idle,
+                status_line: None,
+            },
+        };
+        let commit = Commit::Full(Box::new(row.clone()));
+        let unsaved = Some(l.sending());
+        t.sync();
+        self.send(Batch {
+            events: vec![event],
+            commit,
+            unsaved,
+        })
     }
 
     fn classify(&mut self, id: u64, mtime: TimestampMs) {
@@ -1971,6 +2109,8 @@ impl Watcher {
         };
         let places = (first || moved).then(|| self.places(session)).flatten();
 
+        let live = self.live(session);
+        let title = self.store_lock().title(session).ok().flatten();
         let Some(t) = self.tracked.get_mut(&id) else {
             return Ok(());
         };
@@ -1978,6 +2118,11 @@ impl Watcher {
             return Ok(());
         };
         let row = &mut l.row;
+        if let Some(title) = title
+            && let Some(meta) = &mut row.meta
+        {
+            meta.title = Some(title);
+        }
         // Kept with the row, so its hooks are judged by the parent its discovery names, after a
         // restart too. A failed lookup is not kept: it is tried again at the next hook.
         if first
@@ -2001,6 +2146,9 @@ impl Watcher {
             let mut changed = false;
             for r in &held {
                 changed |= derive::report(&mut row.facts, r).is_some();
+            }
+            if let Some(live) = live {
+                derive::expire(&mut row.facts, st.mtime, live, crate::now_ms());
             }
             let ended = changed && row.facts.state == SessionState::Ended;
             let s = session_of(row, st.mtime, machine, parent, terminal, account.clone());
@@ -3607,6 +3755,411 @@ mod tests {
         ) -> Result<pitcrew_interfaces::source::TranscriptPage, SourceError> {
             Err(SourceError::Io(io::Error::other("not paged in this test")))
         }
+    }
+
+    fn quiet_transcript(home: &Path) -> (Arc<Growing>, PathBuf) {
+        let path = home.join("quiet.jsonl");
+        std::fs::write(&path, b"x").unwrap();
+        let adapter = Arc::new(Growing::default());
+        adapter.transcripts.lock().unwrap().push(TranscriptRef {
+            engine: Engine::Claude,
+            path: path.clone(),
+            inner_id: None,
+            size: 1,
+            modified: 1,
+        });
+        adapter.items.lock().unwrap().push(
+            pitcrew_interfaces::source::TranscriptItem::UserPrompt {
+                text: "synthetic prompt".into(),
+                at: 1,
+                offset: 0,
+            },
+        );
+        (adapter, path)
+    }
+
+    fn age_transcript(path: &Path) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(SystemTime::now() - Duration::from_secs(7200)),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn hooks_renew_a_quiet_transcript_through_the_watcher_and_sweep() {
+        use pitcrew_protocol::api::{Caller, TokenScope};
+        for ago in [60_000, derive::ACTIVE_LEASE_MS + 10_000] {
+            let home = tempfile::tempdir().unwrap();
+            let state = tempfile::tempdir().unwrap();
+            let (adapter, path) = quiet_transcript(home.path());
+            age_transcript(&path);
+            let (mut w, agents, rx) = watcher_with(home.path(), state.path(), adapter);
+            w.start().unwrap();
+            save_all(&w, &rx);
+            let session = w.tracked.values().next().unwrap().session;
+            agents.set(session, crate::SessionAgent::NoAgent);
+            let reported_at = crate::now_ms() - ago;
+            w.apply_reports(vec![Signal {
+                target: Target::Session(session),
+                report: Reported {
+                    at: reported_at,
+                    to: SessionState::Working,
+                    status_line: None,
+                },
+                origin: Origin::Hook(Sender::new(Caller {
+                    member: w.owner,
+                    scope: TokenScope::Device,
+                    on_behalf_of: None,
+                })),
+            }])
+            .unwrap();
+            let events = save_all(&w, &rx);
+            assert!(events.iter().any(|e| matches!(
+                e.body,
+                EventBody::SessionStateChanged {
+                    to: SessionState::Working,
+                    ..
+                }
+            )));
+            w.sweep(0).unwrap();
+            let events = save_all(&w, &rx);
+            let expired = ago > derive::ACTIVE_LEASE_MS;
+            assert_eq!(
+                events.iter().any(|e| matches!(
+                    e.body,
+                    EventBody::SessionStateChanged {
+                        to: SessionState::Idle,
+                        ..
+                    }
+                )),
+                expired
+            );
+            let row = w.store_lock().load(session).unwrap().unwrap();
+            assert_eq!(
+                row.facts.state,
+                if expired {
+                    SessionState::Idle
+                } else {
+                    SessionState::Working
+                }
+            );
+            assert_eq!(row.facts.reported_at, Some(reported_at));
+            assert_eq!(std::fs::read(&path).unwrap(), b"x");
+        }
+    }
+
+    #[test]
+    fn deleted_transcripts_emit_idle_and_stay_idle_after_restart() {
+        let home = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let (adapter, path) = quiet_transcript(home.path());
+        let (mut w, _, rx) = watcher_with(home.path(), state.path(), adapter.clone());
+        w.start().unwrap();
+        save_all(&w, &rx);
+        let session = w.tracked.values().next().unwrap().session;
+        std::fs::remove_file(&path).unwrap();
+        w.sweep(0).unwrap();
+        let events = save_all(&w, &rx);
+        assert!(events.iter().any(|e| matches!(
+            e.body,
+            EventBody::SessionStateChanged {
+                to: SessionState::Idle,
+                ..
+            }
+        )));
+        assert!(w.tracked.values().next().is_none());
+        let row = w.store_lock().load(session).unwrap().unwrap();
+        assert_eq!(row.identity.as_deref(), Some(GONE));
+        assert_eq!(row.facts.state, SessionState::Idle);
+        // Older indexes could mark a deleted transcript gone while leaving it Working.
+        let mut legacy = row;
+        legacy.facts.state = SessionState::Working;
+        w.store_lock()
+            .commit(&Commit::Full(Box::new(legacy)))
+            .unwrap();
+        let rows = w.store_lock().load_index().unwrap();
+        drop(w);
+        let (mut restarted, _, rx) = watcher_with(home.path(), state.path(), adapter);
+        restarted.rows = rows;
+        restarted.start().unwrap();
+        let events = save_all(&restarted, &rx);
+        assert!(events.iter().any(|e| matches!(
+            e.body,
+            EventBody::SessionStateChanged {
+                to: SessionState::Idle,
+                ..
+            }
+        )));
+        assert_eq!(
+            restarted
+                .store_lock()
+                .load(session)
+                .unwrap()
+                .unwrap()
+                .facts
+                .state,
+            SessionState::Idle
+        );
+    }
+
+    #[derive(Debug, Default)]
+    struct FailingList {
+        inner: pitcrew_interfaces::fake::FakeRuntime,
+        fail: std::sync::atomic::AtomicBool,
+        lists: AtomicUsize,
+    }
+
+    impl pitcrew_interfaces::runtime::Runtime for FailingList {
+        fn kind(&self) -> pitcrew_interfaces::runtime::RuntimeKind {
+            self.inner.kind()
+        }
+        fn start(
+            &self,
+            spec: &pitcrew_interfaces::runtime::StartSpec,
+        ) -> Result<
+            pitcrew_interfaces::runtime::TerminalInfo,
+            pitcrew_interfaces::runtime::RuntimeError,
+        > {
+            self.inner.start(spec)
+        }
+        fn write(
+            &self,
+            id: pitcrew_protocol::ids::TerminalId,
+            bytes: &[u8],
+        ) -> Result<(), pitcrew_interfaces::runtime::RuntimeError> {
+            self.inner.write(id, bytes)
+        }
+        fn send_keys(
+            &self,
+            id: pitcrew_protocol::ids::TerminalId,
+            keys: &[pitcrew_protocol::runner::Key],
+        ) -> Result<(), pitcrew_interfaces::runtime::RuntimeError> {
+            self.inner.send_keys(id, keys)
+        }
+        fn resize(
+            &self,
+            id: pitcrew_protocol::ids::TerminalId,
+            cols: u16,
+            rows: u16,
+        ) -> Result<(), pitcrew_interfaces::runtime::RuntimeError> {
+            self.inner.resize(id, cols, rows)
+        }
+        fn screen(
+            &self,
+            id: pitcrew_protocol::ids::TerminalId,
+        ) -> Result<pitcrew_interfaces::runtime::Screen, pitcrew_interfaces::runtime::RuntimeError>
+        {
+            self.inner.screen(id)
+        }
+        fn read_output(
+            &self,
+            id: pitcrew_protocol::ids::TerminalId,
+            from: u64,
+            max: usize,
+        ) -> Result<
+            pitcrew_interfaces::runtime::OutputChunk,
+            pitcrew_interfaces::runtime::RuntimeError,
+        > {
+            self.inner.read_output(id, from, max)
+        }
+        fn info(
+            &self,
+            id: pitcrew_protocol::ids::TerminalId,
+        ) -> Result<
+            pitcrew_interfaces::runtime::TerminalInfo,
+            pitcrew_interfaces::runtime::RuntimeError,
+        > {
+            self.inner.info(id)
+        }
+        fn list(
+            &self,
+        ) -> Result<
+            Vec<pitcrew_interfaces::runtime::TerminalInfo>,
+            pitcrew_interfaces::runtime::RuntimeError,
+        > {
+            self.lists.fetch_add(1, Ordering::Relaxed);
+            if self.fail.load(Ordering::Relaxed) {
+                Err(pitcrew_interfaces::runtime::RuntimeError::Unavailable(
+                    "synthetic list failure".into(),
+                ))
+            } else {
+                self.inner.list()
+            }
+        }
+        fn kill(
+            &self,
+            id: pitcrew_protocol::ids::TerminalId,
+        ) -> Result<(), pitcrew_interfaces::runtime::RuntimeError> {
+            self.inner.kill(id)
+        }
+    }
+
+    #[test]
+    fn unknown_terminal_lists_are_not_cached_or_expired_and_a_dead_terminal_expires() {
+        use pitcrew_interfaces::runtime::{Runtime, StartSpec};
+        let home = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let (adapter, path) = quiet_transcript(home.path());
+        let (mut w, _, rx) = watcher_with(home.path(), state.path(), adapter);
+        w.start().unwrap();
+        save_all(&w, &rx);
+        let session = w.tracked.values().next().unwrap().session;
+        let runtime = Arc::new(FailingList::default());
+        let terminal = runtime
+            .start(&StartSpec {
+                program: "synthetic".into(),
+                args: vec![],
+                cwd: "/w".into(),
+                env: vec![],
+                name: "quiet".into(),
+                cols: 80,
+                rows: 24,
+            })
+            .unwrap()
+            .id;
+        let terminals = RunnerTerminals::new(
+            runtime.clone(),
+            w.store.clone(),
+            crate::terminals::TerminalOptions::default(),
+        )
+        .unwrap();
+        terminals.link(session, terminal).unwrap();
+        w.shared.set_terminals(&terminals);
+        runtime.fail.store(true, Ordering::Relaxed);
+        age_transcript(&path);
+        w.live_cache = None;
+        w.sweep(0).unwrap();
+        save_all(&w, &rx);
+        assert_eq!(
+            w.store_lock().load(session).unwrap().unwrap().facts.state,
+            SessionState::Working
+        );
+        assert!(w.live_cache.is_none());
+        let calls = runtime.lists.load(Ordering::Relaxed);
+        w.sweep(0).unwrap();
+        save_all(&w, &rx);
+        assert!(
+            runtime.lists.load(Ordering::Relaxed) > calls,
+            "failed lists are retried without the 30-second cache"
+        );
+        runtime.fail.store(false, Ordering::Relaxed);
+        w.sweep(0).unwrap();
+        save_all(&w, &rx);
+        assert_eq!(
+            w.store_lock().load(session).unwrap().unwrap().facts.state,
+            SessionState::Working
+        );
+        assert!(w.live_cache.is_some());
+        runtime.kill(terminal).unwrap();
+        w.live_cache = None;
+        w.sweep(0).unwrap();
+        let events = save_all(&w, &rx);
+        assert!(events.iter().any(|e| matches!(
+            e.body,
+            EventBody::SessionStateChanged {
+                to: SessionState::Idle,
+                ..
+            }
+        )));
+        assert_eq!(
+            w.store_lock().load(session).unwrap().unwrap().facts.state,
+            SessionState::Idle
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"x");
+    }
+
+    #[test]
+    fn old_transcripts_discover_idle_restart_idle_and_a_later_write_resumes() {
+        use pitcrew_interfaces::source::TranscriptItem;
+        let home = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let path = home.path().join("old.jsonl");
+        std::fs::write(&path, b"x").unwrap();
+        let age = |path: &Path| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(SystemTime::now() - Duration::from_secs(600)),
+                )
+                .unwrap()
+        };
+        age(&path);
+        let adapter = Arc::new(Growing::default());
+        adapter.transcripts.lock().unwrap().push(TranscriptRef {
+            engine: Engine::Claude,
+            path: path.clone(),
+            inner_id: None,
+            size: 1,
+            modified: 1,
+        });
+        adapter
+            .items
+            .lock()
+            .unwrap()
+            .push(TranscriptItem::UserPrompt {
+                text: "old prompt".into(),
+                at: 1,
+                offset: 0,
+            });
+        let (mut w, _, rx) = watcher_with(home.path(), state.path(), adapter.clone());
+        assert!(w.start().is_ok());
+        let id = *w.tracked.keys().next().unwrap();
+        let session = w.tracked[&id].session;
+        let events = save_all(&w, &rx);
+        assert!(events.iter().any(|e| matches!(&e.body, EventBody::SessionDiscovered { session: s } if s.state == SessionState::Idle)));
+        assert_eq!(
+            w.store_lock().load(session).unwrap().unwrap().facts.state,
+            SessionState::Idle
+        );
+        let rows = w.store_lock().load_index().unwrap();
+        drop(w);
+        let (mut w, _, rx) = watcher_with(home.path(), state.path(), adapter.clone());
+        w.rows = rows;
+        assert!(w.start().is_ok());
+        let id = *w.tracked.keys().next().unwrap();
+        save_all(&w, &rx);
+        assert_eq!(
+            w.store_lock().load(session).unwrap().unwrap().facts.state,
+            SessionState::Idle
+        );
+        adapter
+            .items
+            .lock()
+            .unwrap()
+            .push(TranscriptItem::UserPrompt {
+                text: "new prompt".into(),
+                at: crate::now_ms(),
+                offset: 1,
+            });
+        std::fs::write(&path, b"xy").unwrap();
+        assert!(w.check(id).is_ok_and(|changed| changed));
+        let events = save_all(&w, &rx);
+        assert!(events.iter().any(|e| matches!(
+            e.body,
+            EventBody::SessionStateChanged {
+                to: SessionState::Working,
+                ..
+            }
+        )));
+        age(&path);
+        assert!(w.check(id).is_ok());
+        let events = save_all(&w, &rx);
+        assert!(events.iter().any(|e| matches!(
+            e.body,
+            EventBody::SessionStateChanged {
+                to: SessionState::Idle,
+                ..
+            }
+        )));
+        assert_eq!(std::fs::read(&path).unwrap(), b"xy");
     }
 
     #[test]

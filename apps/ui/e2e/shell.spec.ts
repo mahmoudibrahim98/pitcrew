@@ -195,19 +195,19 @@ test('a task moved through the API updates the sidebar counts without a reload',
   expect(await page.evaluate(() => (window as unknown as { marker?: boolean }).marker)).toBe(true);
 });
 
-test('"+ New" opens placeholder dialogs from the keyboard', async ({ page }, info) => {
+test('"+ New" opens creation dialogs from the keyboard', async ({ page }, info) => {
   await openShell(page);
   const trigger = page.getByRole('button', { name: 'New', exact: true });
   await trigger.focus();
   await page.keyboard.press('Enter');
   const items = page.getByRole('menuitem');
-  await expect(items).toHaveText(['Task', 'Agent', 'Project', 'Team']);
+  await expect(items).toHaveText(['Task', 'Agent', 'Project', 'Team', 'Session']);
   await page.screenshot({ path: info.outputPath('new-menu.png') });
   await page.keyboard.press('ArrowDown');
   await page.keyboard.press('Enter');
   const dialog = page.getByRole('dialog', { name: 'New agent' });
   await expect(dialog).toBeVisible();
-  await expect(dialog.getByRole('button', { name: 'Close' }).first()).toBeFocused();
+  await expect(dialog.getByLabel('Name', { exact: true })).toBeFocused();
   await page.screenshot({ path: info.outputPath('new-dialog.png') });
   await page.keyboard.press('Escape');
   await expect(dialog).toHaveCount(0);

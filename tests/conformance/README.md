@@ -88,6 +88,20 @@ Unix-runtime skip; Rust daemon HTTP tests cover Files API routes there.
 
 `run.mjs` runs `import.test.mjs` serially after the shared suite, since committing inclusion affects all views of its disposable hub. Both targets check dry-run/commit agreement, each mode, filters, excluded session/activity/recap reads, restoration, validation and device-only access.
 
+Session launch coverage now checks person-only machine options, platform and supported modes,
+unknown/unreachable machines, title validation, and an unnamed no-prompt start returning a
+terminal immediately. It reads the session back and ends it; the daemon uses only its temporary
+stand-in CLI, with PITCREW_FILES_ROOT as the safe launch folder.
+
+Directory creation/editing cases cover all four POST/PUT routes, device-only access, bounded
+fields, unknown members/targets, forged metadata, persona-linked membership, lead inclusion,
+deduplication, event authors and unchanged revisions on refusal. Atomic-project cases prove an
+invalid first workstream or key conflict creates neither a project nor a workstream, and a valid
+request creates both. Both targets run these cases.
+
+Directory conformance also dispatches a task through the member created by New agent, exercising
+the recipe/member ownership link against both servers.
+
 Hook-install conformance writes agent configurations. It is disabled unless
 `PITCREW_CONFORMANCE_SYNTHETIC_HOOKS=1`, which `run.mjs` sets only for its managed
 synthetic targets. Do not set it when pointing the suite at an existing hub.
@@ -125,3 +139,7 @@ it and records it as sent without commenting again; a retry by a person the ask 
 to (`403`) and of a sent write (`409`); the task's writes and their events in order; and an
 approval ask an agent raised itself, which proposes nothing. The daemon sends writes in the
 background, so the test polls for each outcome.
+
+Start-session review coverage also checks raw-title controls before trimming, non-local starts,
+preflight refusals leaving no sessions, omitted mode using saved safety, supported prompt limits,
+and two no-prompt person starts sharing a folder with distinct terminals.

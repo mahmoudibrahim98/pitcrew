@@ -29,6 +29,7 @@ import {
 import type { Session } from '../data/index.ts';
 import { Badge, Button, ChevronRightIcon, Kbd, ResizablePanel } from '../design/index.ts';
 import { paths, SHELL_KEYS_ATTRIBUTE, useWorkspaceId } from '../shell/index.ts';
+import { StartSessionButton } from './start-session-button.tsx';
 import { useConsoleSessions } from './data.ts';
 import { NO_FACETS, type SessionFacets } from './facets.ts';
 import { onIntent, takeIntent, type ConsoleIntent } from './intent.ts';
@@ -322,6 +323,7 @@ export function ConsolePage() {
         <span className="truncate text-xs text-ink-2 tabular-nums" data-testid="session-count">
           {active > 0 ? `${sessions.length} of ${all.length}` : all.length} {all.length === 1 ? 'session' : 'sessions'}
         </span>
+        <StartSessionButton />
         <Button variant="ghost" className="ml-auto" aria-pressed={filtersShown} onClick={() => showFilters(!filtersShown)}>
           Filters
           {active > 0 && (

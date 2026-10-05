@@ -44,6 +44,7 @@ export {
   startedByPerson,
   subagentsByParent,
   topLevel,
+  withoutRestatements,
   type Actor,
 } from './sessions.ts';
 export { setUp, SetupConflict, useSetUp, useSetup } from './setup.ts';

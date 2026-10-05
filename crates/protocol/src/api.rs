@@ -9,11 +9,33 @@
 use crate::events::Event;
 use crate::ids::{MemberId, ProjectId, ProjectKey, WorkstreamId};
 use crate::model::{
-    Date, Location, Machine, MachineInfo, Member, Priority, ProjectStatus, TaskStatus, TimestampMs,
-    Workspace, WorkstreamStatus,
+    Date, Engine, Location, Machine, MachineInfo, Member, PermissionMode, Priority, ProjectStatus,
+    TaskStatus, TimestampMs, Workspace, WorkstreamStatus,
 };
 use crate::runner::Capability;
 use serde::{Deserialize, Serialize};
+
+/// Launch choices advertised by a reachable machine's runner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SessionOptions {
+    /// Absolute path syntax: `windows` or `unix`.
+    pub platform: String,
+    /// Executable agent CLIs, with their supported permission modes.
+    pub engines: Vec<SessionEngine>,
+}
+
+/// One installed CLI's launch options.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct SessionEngine {
+    /// CLI engine.
+    pub engine: crate::model::Engine,
+    /// Modes supported by this engine and allowed by this runner.
+    pub permission_modes: Vec<crate::model::PermissionMode>,
+    /// Characters a first prompt cannot pass through this installed CLI's wrapper.
+    pub first_prompt_forbidden: Vec<String>,
+}
 
 /// The revision a person has read in a workspace, project or workstream.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,6 +254,10 @@ pub struct NewProject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub root: Option<Location>,
+    /// Optional first workstream, committed atomically with the project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub first_workstream: Option<String>,
 }
 
 /// `POST /v1/workstreams`: a new workstream in a project. The hub assigns the id; its health
@@ -337,4 +363,37 @@ pub enum StreamFrame {
         /// Server time.
         at: TimestampMs,
     },
+}
+
+/// Editable fields of an agent recipe; the hub assigns the id.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PersonaEdit {
+    /// Display name.
+    pub name: String,
+    /// CLI engine.
+    pub engine: Engine,
+    /// Optional model identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub model: Option<String>,
+    /// Optional standing instructions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub instructions: Option<String>,
+    /// CLI permission policy, explicitly selected by the person.
+    #[serde(default)]
+    pub permission_mode: PermissionMode,
+}
+
+/// Editable fields of a team; references are member ids, not persona ids.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TeamEdit {
+    /// Display name.
+    pub name: String,
+    /// Lead, always included in members.
+    pub lead: MemberId,
+    /// Existing people or agents.
+    pub members: Vec<MemberId>,
 }

@@ -100,11 +100,31 @@ export type Actor =
   | { kind: 'session'; session: Session; engine: Engine; name: string };
 
 /**
- * Whether `session` was started from PitCrew by a person: PitCrew owns its terminal and it runs as
- * no agent. Only then is "@person started the session" true.
+ * Whether `session` was started from PitCrew by a person: it runs as no agent, and PitCrew owns its
+ * terminal, or it is the hub's record of the start, made before the CLI ran (no `native_id` yet;
+ * the runner states every session it finds with one). Only then is "@person started the session"
+ * true.
  */
 export function startedByPerson(session: Session): boolean {
-  return session.terminal !== undefined && session.agent === undefined;
+  return session.agent === undefined && (session.terminal !== undefined || session.native_id === '');
+}
+
+/**
+ * Activity worth a line: a session's second and later `session_discovered` (the hub's record of a
+ * start, then its terminal, then the runner finding its transcript) say nothing new, so only the
+ * oldest in `items` stays. `items` may be in any order; theirs is kept.
+ */
+export function withoutRestatements<T extends { event: Event; rev: number }>(items: readonly T[]): T[] {
+  const first = new Map<SessionId, number>();
+  for (const { event, rev } of items) {
+    if (event.body.type !== 'session_discovered') continue;
+    const id = event.body.data.session.id;
+    const seen = first.get(id);
+    if (seen === undefined || rev < seen) first.set(id, rev);
+  }
+  return items.filter(
+    ({ event, rev }) => event.body.type !== 'session_discovered' || first.get(event.body.data.session.id) === rev,
+  );
 }
 
 /**
@@ -121,7 +141,7 @@ export function actorOf(event: Event, sessions: ReadonlyMap<SessionId, Session>)
   if (own === undefined) return { kind: 'member', member: event.author };
   const root = rootOf(own, sessions);
   if (root.agent !== undefined) return { kind: 'member', member: root.agent };
-  if (root.id === own.id && stated !== undefined && startedByPerson(stated)) {
+  if (root.id === own.id && stated !== undefined && (startedByPerson(stated) || startedByPerson(own))) {
     return { kind: 'member', member: event.author };
   }
   return { kind: 'session', session: root, engine: root.engine, name: sessionName(root) };

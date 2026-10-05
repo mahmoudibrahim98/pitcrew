@@ -50,6 +50,31 @@ describe('the activity feed', () => {
     ]);
     expect(feed.some((f) => f.who === '@alex')).toBe(false);
   });
+
+  it('names the person who started a session from PitCrew, once, however often it is stated', () => {
+    const { sessions } = auditSessions();
+    const terminal = '01JB000000000000000TRM0003';
+    // The hub records the start before the CLI runs (no native id, no terminal yet), states it
+    // again with its terminal, and the runner states it once more when its transcript appears.
+    const recorded = session('started', { native_id: '', state: 'starting', title: 'Fix the parser' });
+    const launched = { ...recorded, terminal };
+    const adopted = { ...launched, native_id: 'c-started', state: 'working' as const };
+    const items = [
+      { event: event({ type: 'session_discovered', data: { session: recorded } }, 1_000), rev: 1 },
+      { event: event({ type: 'session_discovered', data: { session: launched } }, 1_100), rev: 2 },
+      { event: event({ type: 'session_discovered', data: { session: adopted } }, 1_200), rev: 3 },
+      { event: event({ type: 'turn_ended', data: { session: recorded.id, receipt: receipt(recorded.id) } }, 2_000), rev: 4 },
+    ];
+    for (const current of [recorded, adopted]) {
+      const feed = attributedFeed(items, sessionsById([...sessions, current]), names);
+      expect(feed.map((f) => `${f.who} ${f.what}`)).toEqual([
+        'Claude · Fix the parser finished a turn',
+        '@alex started the session “Fix the parser”',
+      ]);
+    }
+    // And it is mine: not news to me.
+    expect(changesSince(items.slice(0, 3), sessionsById([...sessions, adopted]), names, ALEX)).toEqual([]);
+  });
 });
 
 describe('since you last looked', () => {

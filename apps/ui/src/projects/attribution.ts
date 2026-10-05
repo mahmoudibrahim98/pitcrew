@@ -13,6 +13,7 @@ import {
   rootOf,
   sessionName,
   startedByPerson,
+  withoutRestatements,
   type Actor,
   type Event,
   type MemberId,
@@ -90,7 +91,7 @@ export function attributedFeed(
   sessions: ReadonlyMap<SessionId, Session>,
   names: Names,
 ): Attributed[] {
-  return byTimeNewestFirst(items).map(({ event, rev }) => attribute(event, rev, sessions, names));
+  return byTimeNewestFirst(withoutRestatements(items)).map(({ event, rev }) => attribute(event, rev, sessions, names));
 }
 
 /** One line of "Since you last looked". */
@@ -153,7 +154,7 @@ export function changesSince(
 ): ChangeLine[] {
   const lines: (ChangeLine | SessionTally)[] = [];
   const tallies = new Map<SessionId, SessionTally>();
-  for (const { event, rev } of byTimeNewestFirst(items)) {
+  for (const { event, rev } of byTimeNewestFirst(withoutRestatements(items))) {
     const actor = actorOf(event, sessions);
     if (actor.kind === 'member' && me !== undefined && actor.member === me) continue;
     const id = eventSession(event);
@@ -191,11 +192,13 @@ export function changesSince(
     tally.revs.push(rev);
     const nested = aboutSubagent(event, sessions);
     switch (event.body.type) {
-      case 'session_discovered':
+      case 'session_discovered': {
+        const stated = event.body.data.session;
         if (nested) tally.subagents += 1;
-        else if (startedByPerson(event.body.data.session) || event.body.data.session.agent !== undefined) tally.started = true;
+        else if (startedByPerson(stated) || startedByPerson(own) || stated.agent !== undefined) tally.started = true;
         else tally.found = true;
         break;
+      }
       case 'turn_ended':
         tally.turns += 1;
         break;

@@ -31,7 +31,7 @@ keeps its cursor cache separate, and failed mutations retain the previous cursor
 | `live.ts` | Wires it together: patches, then coalesced invalidation (250 ms window). Fetches in flight are not cancelled; each query whose fetch was in flight when an event touched it is refetched once, by its exact key, after that fetch settles. `resetQueries()` on a reset; failed queries refetch when the stream comes back. After 3 connection failures, and every 5 more, it reports `problem: 'unauthorized' \| 'unreachable' \| 'needs_pairing'`: from the gateway's reason when the socket gave one, otherwise by probing `GET /v1/me` (none when the probe succeeds and only the stream fails). `recapCacheLookup()`/`recapKeysForScope()` resolve recap scope through the cache into query keys: `Invalidator.addExact()` invalidates a key by itself only, never as a prefix, for the unfiltered-blocks case (TanStack matches `{}` against any object, so the usual prefix invalidation would reach every filtered blocks query too). |
 | `provider.tsx` | `<DataProvider>` (a browser's one hub), `<DataScope>`, `useApi()`, `useConnection()` (`status`, `synced`, `problem`), `useLiveQuery()`, `useLiveInfiniteQuery()`, `useOpenSocket()`, `useGatewayWorkspace()`, `createQueryClient()`. |
 | `hooks.ts` | Shared hooks: workspace, machines, members, projects, workstreams, tasks, sessions, asks, and `useMoveTask`. |
-| `sessions.ts` | Sub-agents and attribution, pure: `topLevel`, `subagentsByParent`, `rootOf` and `isNested` (a sub-agent whose parent is not in the list stands on its own), `actorOf` (the agent, or the session itself, for the runner's session events; a person only for a session they started from PitCrew), `byTimeNewestFirst`. The console, Home, activity and the sidebar's count use them, so they agree on what is an agent. |
+| `sessions.ts` | Sub-agents and attribution, pure: `topLevel`, `subagentsByParent`, `rootOf` and `isNested` (a sub-agent whose parent is not in the list stands on its own), `actorOf` (the agent, or the session itself, for the runner's session events; a person only for a session they started from PitCrew, judged on the session as it is now, so the hub's first record of a start counts too), `withoutRestatements` (a session stated again is one line), `byTimeNewestFirst`. The console, Home, activity and the sidebar's count use them, so they agree on what is an agent. |
 
 ## Transports: the browser and the desktop app
 
@@ -221,3 +221,13 @@ it (e2e suites included), must pass `{ tz: 0 }`** — it only has days for `tz=0
 splits `summary.text` into its receipted clauses and the plain joining text, converting the UTF-8
 byte spans correctly — never `summary.text.slice(span.range.start, span.range.end)`, which is
 wrong as soon as the text holds a character outside ASCII.
+
+`api.sessionOptions(machine)` reads installed engines/platform/allowed modes;
+`api.startSession(start)` sends the launch request and returns the new session with its terminal.
+The console's shared dialog sets that detail cache immediately and invalidates session lists;
+the stream also carries the discovery. Titles and first prompts remain in the dialog until sent.
+
+`api.createPersona`/`editPersona` and `createTeam`/`editTeam` use the device-only directory write
+routes. Their `persona_saved`, `member_added` and `team_saved` events already invalidate the shared
+lists; creation forms also refresh their own lists on success. Machines expose their optional
+reported `info.os` to validate creation roots against that machine rather than the browser OS.

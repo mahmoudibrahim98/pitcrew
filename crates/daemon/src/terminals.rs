@@ -222,6 +222,7 @@ mod tests {
         .unwrap();
         let terminals = runner.terminals(Arc::new(NoRuntime)).unwrap();
         let parts = Parts {
+            publication: Arc::new(std::sync::Mutex::new(())),
             machine: here,
             hooks: runner.hooks(),
             commands: runner.commands(&terminals),

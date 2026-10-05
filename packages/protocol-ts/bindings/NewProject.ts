@@ -40,4 +40,8 @@ due?: Date,
 /**
  * The root folder.
  */
-root?: Location, };
+root?: Location, 
+/**
+ * Optional first workstream, committed atomically with the project.
+ */
+first_workstream?: string, };

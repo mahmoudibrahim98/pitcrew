@@ -42,6 +42,23 @@ use std::fmt;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+/// A start rejected before a session is recorded.
+#[derive(Debug, thiserror::Error)]
+pub enum StartError {
+    /// CLI arguments, availability or permission policy do not permit this start.
+    #[error("{0}")]
+    Invalid(String),
+    /// Another named start still waits in the same folder.
+    #[error("{FOLDER_BUSY}")]
+    FolderBusy,
+    /// The runner cannot check its pending starts.
+    #[error("{0}")]
+    Unavailable(String),
+}
+
+/// A folder conflict, distinct from invalid launch options.
+pub const FOLDER_BUSY: &str = "Another start waits in this folder. Wait for it to write its transcript or choose another folder.";
+
 /// Tuning and policy for [`RunnerCommands`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommandOptions {
@@ -138,6 +155,117 @@ impl RunnerCommands {
         }
     }
 
+    /// Remember a person's title separately from the CLI's transcript.
+    ///
+    /// # Errors
+    /// The runner index cannot be written.
+    pub fn set_title(&self, session: SessionId, title: &str) -> Result<(), StoreError> {
+        self.inner.terminals.store().set_title(session, title)
+    }
+
+    /// Read the person's title for a session.
+    ///
+    /// # Errors
+    /// The runner index cannot be read.
+    pub fn title(&self, session: SessionId) -> Result<Option<String>, StoreError> {
+        self.inner.terminals.store().title(session)
+    }
+
+    /// Installed CLIs and the launch modes this runner allows. Does not execute a CLI.
+    pub fn session_options(&self) -> pitcrew_protocol::api::SessionOptions {
+        use pitcrew_protocol::api::{SessionEngine, SessionOptions};
+        let engines = [
+            (Engine::Claude, "claude"),
+            (Engine::Codex, "codex"),
+            (Engine::OpenCode, "opencode"),
+        ]
+        .into_iter()
+        .filter(|(_, program)| executable_on_path(program).is_some())
+        .map(|(engine, program)| {
+            let mut permission_modes = vec![PermissionMode::Default];
+            if engine != Engine::OpenCode {
+                permission_modes.push(PermissionMode::AcceptEdits);
+                if engine == Engine::Claude {
+                    permission_modes.push(PermissionMode::Plan);
+                }
+                if self.inner.options.allow_bypass_permissions {
+                    permission_modes.push(PermissionMode::BypassPermissions);
+                }
+            }
+            SessionEngine {
+                engine,
+                permission_modes,
+                first_prompt_forbidden: executable_on_path(program)
+                    .filter(|p| windows_batch(p))
+                    .map_or_else(Vec::new, |_| prompt_forbidden()),
+            }
+        })
+        .collect();
+        SessionOptions {
+            platform: if cfg!(windows) { "windows" } else { "unix" }.into(),
+            engines,
+        }
+    }
+
+    /// Validates a start without launching a CLI or recording a session.
+    ///
+    /// # Errors
+    /// Invalid CLI/options/policy, an occupied named-start folder, or a failed pending lookup.
+    pub fn check_start(&self, command: &RunnerCommand, unclaimed: bool) -> Result<(), StartError> {
+        let RunnerCommand::StartSession {
+            engine,
+            cwd,
+            name,
+            brief,
+            model,
+            account,
+            permission_mode,
+            session,
+            ..
+        } = command
+        else {
+            return Err(StartError::Invalid("Expected a session start.".into()));
+        };
+        let launch = Launch {
+            unclaimed,
+            engine: *engine,
+            cwd,
+            name,
+            brief: brief.as_deref(),
+            model: model.as_deref(),
+            account: account.as_deref(),
+            mode: *permission_mode,
+            resume: None,
+            session: session.or_else(|| (!unclaimed).then(SessionId::new)),
+        };
+        if launch.mode == PermissionMode::BypassPermissions
+            && !self.inner.options.allow_bypass_permissions
+        {
+            return Err(StartError::Invalid(
+                "Bypass permissions is not allowed on this runner.".into(),
+            ));
+        }
+        let spec = start_spec(&launch, None, Vec::new(), &self.inner.options)
+            .map_err(StartError::Invalid)?;
+        let found = executable_on_path(&spec.program).ok_or_else(|| {
+            StartError::Invalid(format!(
+                "The {} CLI is not installed on this machine's PATH. Install it, then retry.",
+                spec.program
+            ))
+        })?;
+        check_batch_arguments(&spec, &found).map_err(StartError::Invalid)?;
+        if launch.engine != Engine::Claude
+            && let Some(reason) = self.ambiguous(&launch)
+        {
+            return Err(if reason == FOLDER_BUSY {
+                StartError::FolderBusy
+            } else {
+                StartError::Unavailable(reason)
+            });
+        }
+        Ok(())
+    }
+
     /// Where `session`, one the hub named for a start, stands here: reported (its transcript is
     /// indexed under it), running (its start is under way, or its terminal's program runs and the
     /// transcript is not found yet), too late (matched by folder, and past the claim window),
@@ -168,7 +296,7 @@ impl RunnerCommands {
                     return Started::Reported;
                 }
                 let window_over = crate::now_ms().saturating_sub(row.started_at) > CLAIM_WINDOW_MS;
-                if row.native_id.is_none() && window_over {
+                if !row.unclaimed && row.native_id.is_none() && window_over {
                     Started::TooLate
                 } else {
                     Started::Running
@@ -230,6 +358,23 @@ impl RunnerCommands {
     /// Runs a command once per id, and answers its outcome. Blocking: starting a program or
     /// ending one gracefully can take seconds.
     pub fn run(&self, id: CommandId, command: &RunnerCommand) -> CommandOutcome {
+        self.run_with_claim(id, command, false)
+    }
+
+    /// Runs a person's start without an exclusive folder claim or transcript deadline.
+    pub fn run_unclaimed(&self, id: CommandId, command: &RunnerCommand) -> CommandOutcome {
+        if !matches!(command, RunnerCommand::StartSession { .. }) {
+            return rejected("Only a session start may be unclaimed.".into());
+        }
+        self.run_with_claim(id, command, true)
+    }
+
+    fn run_with_claim(
+        &self,
+        id: CommandId,
+        command: &RunnerCommand,
+        unclaimed: bool,
+    ) -> CommandOutcome {
         let inner = &*self.inner;
         // A start for a session the hub named is under way from now until this returns.
         let _under_way = match command {
@@ -255,7 +400,7 @@ impl RunnerCommands {
             running.insert(id);
         }
         let _running = Running { inner, id };
-        let outcome = self.execute(command);
+        let outcome = self.execute(command, unclaimed);
         if let Err(e) = inner
             .terminals
             .store()
@@ -266,7 +411,7 @@ impl RunnerCommands {
         outcome
     }
 
-    fn execute(&self, command: &RunnerCommand) -> CommandOutcome {
+    fn execute(&self, command: &RunnerCommand, unclaimed: bool) -> CommandOutcome {
         match command {
             RunnerCommand::StartSession {
                 engine,
@@ -279,6 +424,7 @@ impl RunnerCommands {
                 permission_mode,
                 session,
             } => self.start(&Launch {
+                unclaimed,
                 engine: *engine,
                 cwd,
                 name,
@@ -295,6 +441,7 @@ impl RunnerCommands {
                 cwd,
                 name,
             } => self.start(&Launch {
+                unclaimed: false,
                 engine: *engine,
                 cwd,
                 name,
@@ -424,6 +571,7 @@ impl RunnerCommands {
             (None, None) => None,
         };
         let saved = inner.terminals.store().put_terminal(&TerminalRow {
+            unclaimed: launch.unclaimed,
             terminal: info.id,
             native_target: info.native_target.clone(),
             session,
@@ -477,7 +625,10 @@ impl RunnerCommands {
         for t in waiting {
             match terminals.info(t.terminal) {
                 Ok(info) if info.alive => {
-                    if blocking.is_none() && (launch.session.is_some() || t.session.is_some()) {
+                    if blocking.is_none()
+                        && ((launch.session.is_some() && !launch.unclaimed)
+                            || (t.session.is_some() && !t.unclaimed))
+                    {
                         blocking = Some(t);
                     }
                 }
@@ -503,15 +654,8 @@ impl RunnerCommands {
                 Err(_) => {}
             }
         }
-        let blocking = blocking?;
-        let secs = (now.saturating_sub(blocking.started_at) / 1000).max(0);
-        Some(format!(
-            "Another {:?} session started in {} {secs} s ago has not written its transcript yet, \
-             and {:?} sessions are told apart only by folder and start time, so a second one \
-             started there now could be taken for it. Start this one once that one appears, or \
-             in another folder.",
-            launch.engine, launch.cwd, launch.engine
-        ))
+        blocking?;
+        Some(FOLDER_BUSY.to_owned())
     }
 
     /// The environment that selects an account home: one of the configured homes for the CLI.
@@ -643,6 +787,7 @@ impl Drop for Running<'_> {
 /// What to start.
 #[derive(Debug)]
 pub(crate) struct Launch<'a> {
+    pub unclaimed: bool,
     pub engine: Engine,
     pub cwd: &'a str,
     pub name: &'a str,
@@ -806,6 +951,76 @@ fn rejected(reason: String) -> CommandOutcome {
     CommandOutcome::Rejected { reason }
 }
 
+fn executable_on_path(program: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let extensions = if cfg!(windows) {
+        std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+    } else {
+        String::new()
+    };
+    for dir in std::env::split_paths(&path).filter(|dir| dir.is_absolute()) {
+        for ext in extensions
+            .split(';')
+            .filter(|e| !cfg!(windows) || (e.starts_with('.') && e.len() > 1))
+        {
+            let found = dir.join(format!("{program}{ext}"));
+            let Ok(meta) = std::fs::metadata(&found) else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                if meta.permissions().mode() & 0o111 == 0 {
+                    continue;
+                }
+            }
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn windows_batch(path: &std::path::Path) -> bool {
+    cfg!(windows)
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"))
+}
+
+fn prompt_forbidden() -> Vec<String> {
+    (0..=0x9f)
+        .filter_map(char::from_u32)
+        .filter(|c| c.is_control())
+        .chain("\"%!^&|<>()".chars())
+        .map(|c| c.to_string())
+        .collect()
+}
+
+fn check_batch_arguments(spec: &StartSpec, found: &std::path::Path) -> Result<(), String> {
+    if !windows_batch(found) {
+        return Ok(());
+    }
+    let forbidden = prompt_forbidden();
+    if spec
+        .args
+        .iter()
+        .any(|a| forbidden.iter().any(|c| a.contains(c)))
+    {
+        return Err("This Windows CLI uses a batch wrapper. First prompts cannot contain control characters or \" % ! ^ & | < > ( ). Start without a first prompt and enter it in the terminal.".into());
+    }
+    let path = found.to_string_lossy();
+    if path.chars().any(|c| {
+        c.is_control() || "\"%!^&|<>".contains(c) || (!path.contains(' ') && "()".contains(c))
+    }) {
+        return Err("The CLI wrapper's path contains characters Windows cannot pass safely. Move it to a plain path.".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,6 +1069,7 @@ mod tests {
                 .lock()
                 .expect("store")
                 .put_terminal(&TerminalRow {
+                    unclaimed: false,
                     terminal: info.id,
                     native_target: None,
                     session: Some(session),
@@ -872,12 +1088,22 @@ mod tests {
         assert_eq!(commands.started(late), Started::TooLate);
         assert_eq!(commands.started(fresh), Started::Running);
         assert_eq!(commands.started(by_id), Started::Running);
-        // Still running: not retired.
+        // Personal starts have no transcript deadline, even after reopening the index.
+        let person = named(Engine::OpenCode, None, past);
+        {
+            let mut row = store.lock().unwrap().terminal_of(person).unwrap().unwrap();
+            row.unclaimed = true;
+            store.lock().unwrap().put_terminal(&row).unwrap();
+        }
+        assert_eq!(commands.started(person), Started::Running);
+        assert!(!commands.retire(person).expect("retire"));
+        // Named dispatch rules still apply.
         assert!(!commands.retire(late).expect("retire"));
     }
 
     fn launch(engine: Engine, mode: PermissionMode) -> Launch<'static> {
         Launch {
+            unclaimed: false,
             engine,
             cwd: "/w",
             name: "writer",
