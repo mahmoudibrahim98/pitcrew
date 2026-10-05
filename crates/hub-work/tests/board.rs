@@ -273,16 +273,32 @@ async fn a_preview_shows_what_would_be_sent_and_sends_nothing() {
         "PAP-1",
         "PAP-7",
     ] {
-        assert!(summary.contains(want), "missing {want} in\n{summary}");
+        assert!(summary.contains(want), "{want} is missing from the summary");
     }
-    assert!(!summary.contains(SES2), "{summary}");
-    assert!(!summary.contains("PAP-4"), "{summary}");
-    // Secrets in its title, its branch, its activity and its files never reach the summary.
-    assert!(!summary.contains(TOKEN), "{summary}");
-    assert!(!summary.contains("16C7e42F"), "{summary}");
-    assert!(!summary.contains("sam@example.com"), "{summary}");
-    assert!(!summary.contains("/home/sam"), "{summary}");
-    assert!(summary.contains("[redacted]"), "{summary}");
+    assert!(
+        !summary.contains(SES2),
+        "another workstream's session is in it"
+    );
+    assert!(
+        !summary.contains("PAP-4"),
+        "another workstream's task is in it"
+    );
+    // Secrets in its title, its branch, its activity and its files never reach the summary. The
+    // messages are labels only: a failure must not print the synthetic token.
+    assert!(!summary.contains(TOKEN), "the token reached the summary");
+    assert!(
+        !summary.contains("16C7e42F"),
+        "a piece of the token reached the summary"
+    );
+    assert!(
+        !summary.contains("sam@example.com"),
+        "an address reached the summary"
+    );
+    assert!(
+        !summary.contains("/home/sam"),
+        "a home folder reached the summary"
+    );
+    assert!(summary.contains("[redacted]"), "nothing was redacted");
     let cost = &shown["cost"];
     assert_eq!(cost["sessions"], 3);
     assert_eq!(cost["sessions_left_out"], 0);
@@ -715,10 +731,17 @@ async fn proposals_are_bounded_checked_and_redacted() {
     .await;
     expect(&res, 201);
     let proposed = &res.1["proposal"];
-    assert_eq!(proposed["tasks"][0]["title"], "Rotate [redacted]");
+    // Compared without printing: on a failure they would hold the synthetic token.
+    assert!(
+        proposed["tasks"][0]["title"] == "Rotate [redacted]",
+        "the title is not trimmed and redacted"
+    );
     assert_eq!(proposed["tasks"][0]["description"], "Mail [email]");
     assert_eq!(proposed["tasks"][0]["evidence"], json!([noisy]));
-    assert_eq!(proposed["note"], "password=[redacted]");
+    assert!(
+        proposed["note"] == "password=[redacted]",
+        "the note is not redacted"
+    );
 
     // Accepted, the task takes its evidence session, which had no task.
     let res = review(&work, &id, json!([0])).await;

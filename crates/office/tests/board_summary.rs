@@ -118,21 +118,28 @@ fn secrets_in_titles_recaps_activity_and_names_never_reach_the_prompt() {
     facts.workstream = format!("Keys {}", SECRETS[0]);
     facts.project = "Mail sam@example.com".into();
     let prompt = draft_prompt(&facts, "drf_01J00000000000000000000000");
-    for secret in SECRETS.iter().chain(&["hunter2hunter2"]) {
+    // A failure names the case by its index only: the values and the prompt hold synthetic
+    // secrets, which a failure must not print either.
+    for (case, value) in SECRETS.iter().chain(&["hunter2hunter2"]).enumerate() {
         assert!(
-            !prompt.text.contains(secret),
-            "{secret} leaked:\n{}",
-            prompt.text
+            !prompt.text.contains(value),
+            "case {case} reached the prompt whole"
         );
         // Nor a long piece of one.
-        if !secret.contains('@') {
-            let piece: String = secret.chars().skip(4).take(12).collect();
-            assert!(!prompt.text.contains(&piece), "{piece} of {secret} leaked");
+        if !value.contains('@') {
+            let piece: String = value.chars().skip(4).take(12).collect();
+            assert!(
+                !prompt.text.contains(&piece),
+                "a piece of case {case} reached the prompt"
+            );
         }
     }
-    assert!(!prompt.text.contains("/home/sam"), "{}", prompt.text);
-    assert!(prompt.text.contains("~/work/"), "{}", prompt.text);
-    assert!(prompt.text.contains("[redacted]"), "{}", prompt.text);
+    assert!(
+        !prompt.text.contains("/home/sam"),
+        "a home folder reached the prompt"
+    );
+    assert!(prompt.text.contains("~/work/"), "a home folder is not ~");
+    assert!(prompt.text.contains("[redacted]"), "nothing was redacted");
     assert!(prompt.cost.redacted >= u32::try_from(SECRETS.len() * 3).unwrap());
     assert!(prompt.cost.redacted > prompt.summary.redacted);
 }
@@ -228,10 +235,14 @@ fn redactions_are_counted_only_in_what_is_sent() {
         .collect();
     let summary = summarize(&facts(sessions));
     assert!(summary.sessions_left_out > 0);
-    assert_eq!(summary.redacted, summary.sessions, "{}", summary.text);
-    assert_eq!(
-        summary.text.matches("[redacted]").count(),
-        summary.sessions as usize
+    // Labels only: the summary holds a synthetic secret's redaction, or the secret on a failure.
+    assert!(
+        summary.redacted == summary.sessions,
+        "the count is not of the sessions sent"
+    );
+    assert!(
+        summary.text.matches("[redacted]").count() == summary.sessions as usize,
+        "a session sent is not redacted once"
     );
 }
 

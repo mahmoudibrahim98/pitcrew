@@ -134,6 +134,7 @@ describe('board drafts', () => {
     }, FAST));
 
   it('redacts as the hub does', () => {
+    // A failure names the case only: the texts hold synthetic secrets, which it must not print.
     for (const [text, want] of [
       ['push with ghp_16C7e42F292c6912E7710c838347Ae178B4a', 'push with [redacted]'],
       ["curl -H 'Authorization: Bearer abc.def.ghi' x", "curl -H 'Authorization: Bearer [redacted]' x"],
@@ -144,7 +145,7 @@ describe('board drafts', () => {
       ['Draft the method section', 'Draft the method section'],
       ['uses sk-learn-tutorial', 'uses sk-learn-tutorial'],
     ] as const) {
-      assert.equal(redactLine(text, 500).text, want, text);
+      assert.ok(redactLine(text, 500).text === want, `case ${want}: not redacted as expected`);
     }
   });
 });

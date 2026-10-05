@@ -578,103 +578,184 @@ mod tests {
         }
     }
 
+    /// Checks that `text` redacts to `want`. A failure names the case only, never the texts or
+    /// what came out: they hold synthetic secrets, and a failure must not print those either.
+    #[track_caller]
+    fn redacts(case: &str, text: &str, want: &str) {
+        assert!(r(text) == want, "{case}: not redacted as expected");
+    }
+
     #[test]
     fn known_tokens_are_replaced() {
-        for (text, want) in [
+        for (case, text, want) in [
             (
+                "an API key in an assignment",
                 "export OPENAI_API_KEY=sk-proj-abcdefghijklmnop1234",
                 "export OPENAI_API_KEY=[redacted]",
             ),
-            ("key sk-ant-api03-AbCdEfGhIjKlMnOp", "key [redacted]"),
             (
+                "an sk- key",
+                "key sk-ant-api03-AbCdEfGhIjKlMnOp",
+                "key [redacted]",
+            ),
+            (
+                "a GitHub token",
                 "push with ghp_16C7e42F292c6912E7710c838347Ae178B4a",
                 "push with [redacted]",
             ),
             (
+                "a fine-grained GitHub token",
                 "token github_pat_11ABCDEFG0123456789_abcdefghijklmnop",
                 "token [redacted]",
             ),
-            ("slack xoxb-123456789012-abcdefghijkl", "slack [redacted]"),
-            ("aws AKIAIOSFODNN7EXAMPLE done", "aws [redacted] done"),
             (
+                "a Slack token",
+                "slack xoxb-123456789012-abcdefghijkl",
+                "slack [redacted]",
+            ),
+            (
+                "an AWS key id",
+                "aws AKIAIOSFODNN7EXAMPLE done",
+                "aws [redacted] done",
+            ),
+            (
+                "a Google key",
                 "maps AIzaSyD-1234567890abcdefghijklmnopqrstu",
                 "maps [redacted]",
             ),
-            ("pitcrew pca_Zm9vYmFyYmF6cXV4", "pitcrew [redacted]"),
-            ("gitlab glpat-xxxxyyyyzzzz1234", "gitlab [redacted]"),
             (
+                "a PitCrew token",
+                "pitcrew pca_Zm9vYmFyYmF6cXV4",
+                "pitcrew [redacted]",
+            ),
+            (
+                "a GitLab token",
+                "gitlab glpat-xxxxyyyyzzzz1234",
+                "gitlab [redacted]",
+            ),
+            (
+                "words that only start like tokens",
                 "uses sk-learn-tutorial and ASIAN data",
                 "uses sk-learn-tutorial and ASIAN data",
             ),
         ] {
-            assert_eq!(r(text), want, "{text}");
+            redacts(case, text, want);
         }
     }
 
     #[test]
     fn named_values_are_replaced() {
-        for (text, want) in [
+        for (case, text, want) in [
             (
+                "a bearer header",
                 "curl -H 'Authorization: Bearer abc.def.ghi' x",
                 "curl -H 'Authorization: Bearer [redacted]' x",
             ),
-            ("password=hunter22 and more", "password=[redacted] and more"),
-            ("DB_PASSWORD: hunter22", "DB_PASSWORD: [redacted]"),
             (
+                "an assignment",
+                "password=hunter22 and more",
+                "password=[redacted] and more",
+            ),
+            (
+                "a name and a colon",
+                "DB_PASSWORD: hunter22",
+                "DB_PASSWORD: [redacted]",
+            ),
+            (
+                "an option",
                 "login --password hunter22 --user sam",
                 "login --password [redacted] --user sam",
             ),
             (
+                "a query string",
                 "GET /api?user=sam&access_token=abcdef123&page=2",
                 "GET /api?user=sam&access_token=[redacted]&page=2",
             ),
-            ("secret:topsecretvalue", "secret:[redacted]"),
-            ("Basic dXNlcjpwYXNz", "Basic [redacted]"),
-            ("set PGPASSWORD=s3cr3t-value", "set PGPASSWORD=[redacted]"),
             (
+                "a name and a colon in one word",
+                "secret:topsecretvalue",
+                "secret:[redacted]",
+            ),
+            (
+                "basic credentials",
+                "Basic dXNlcjpwYXNz",
+                "Basic [redacted]",
+            ),
+            (
+                "an environment variable",
+                "set PGPASSWORD=s3cr3t-value",
+                "set PGPASSWORD=[redacted]",
+            ),
+            (
+                "words that only look like names",
                 "author: sam, tokens used 1200",
                 "author: sam, tokens used 1200",
             ),
         ] {
-            assert_eq!(r(text), want, "{text}");
+            redacts(case, text, want);
         }
     }
 
     #[test]
     fn urls_lose_their_credentials() {
-        assert_eq!(
-            r("clone https://sam:hunter2@git.example.com/lab/repo.git now"),
-            "clone https://[redacted]@git.example.com/lab/repo.git now"
+        redacts(
+            "a URL's user and password",
+            "clone https://sam:hunter2@git.example.com/lab/repo.git now",
+            "clone https://[redacted]@git.example.com/lab/repo.git now",
         );
-        assert_eq!(
-            r("see https://example.com/a?b=c"),
-            "see https://example.com/a?b=c"
+        redacts(
+            "a URL without credentials",
+            "see https://example.com/a?b=c",
+            "see https://example.com/a?b=c",
         );
     }
 
     #[test]
     fn jwts_and_random_words_are_replaced() {
         let jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
-        assert_eq!(r(&format!("token={jwt}")), "token=[redacted]");
-        assert_eq!(r(&format!("sent {jwt}")), "sent [redacted]");
-        assert_eq!(r("key Zx9Qm2Lp8Rt4Vw6Yb1Nc3Hd5Jf7Kg0Ab"), "key [redacted]");
-        assert_eq!(
-            r("hex 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"),
-            "hex [redacted]"
+        redacts(
+            "a JWT as a value",
+            &format!("token={jwt}"),
+            "token=[redacted]",
+        );
+        redacts(
+            "a JWT on its own",
+            &format!("sent {jwt}"),
+            "sent [redacted]",
+        );
+        redacts(
+            "a random word",
+            "key Zx9Qm2Lp8Rt4Vw6Yb1Nc3Hd5Jf7Kg0Ab",
+            "key [redacted]",
+        );
+        redacts(
+            "a long hexadecimal word",
+            "hex 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "hex [redacted]",
         );
     }
 
     #[test]
     fn secrets_in_paths_and_branches_are_replaced() {
-        assert_eq!(
-            r("/home/sam/work/sk-ant-api03-AbCdEfGh12345678/notes.md"),
-            "~/work/[redacted]/notes.md"
+        redacts(
+            "a key as a folder",
+            "/home/sam/work/sk-ant-api03-AbCdEfGh12345678/notes.md",
+            "~/work/[redacted]/notes.md",
         );
-        assert_eq!(r("branch fix/sam@example.com"), "branch fix/[email]");
-        assert_eq!(r("fix/AKIAIOSFODNN7EXAMPLE"), "fix/[redacted]");
-        assert_eq!(
-            r(r"C:\Users\sam\ghp_16C7e42F292c6912E7710c838347Ae178B4a\x"),
-            r"~\[redacted]\x"
+        redacts(
+            "an address in a branch",
+            "branch fix/sam@example.com",
+            "branch fix/[email]",
+        );
+        redacts(
+            "a key id in a branch",
+            "fix/AKIAIOSFODNN7EXAMPLE",
+            "fix/[redacted]",
+        );
+        redacts(
+            "a token as a Windows folder",
+            r"C:\Users\sam\ghp_16C7e42F292c6912E7710c838347Ae178B4a\x",
+            r"~\[redacted]\x",
         );
     }
 
@@ -701,35 +782,40 @@ mod tests {
             "-----BEGIN OPENSSH PRIVATE KEY----- b3BlbnNzaC1rZXktdjEAAAAA -----END OPENSSH PRIVATE KEY-----",
             500,
         );
-        assert_eq!(
-            out,
-            Redacted {
-                text: REDACTED.to_owned(),
-                count: 1
-            }
+        assert!(
+            out.text == REDACTED && out.count == 1,
+            "a private key block is not replaced whole"
         );
     }
 
     #[test]
     fn hidden_and_control_characters_cannot_split_a_secret() {
-        assert_eq!(
-            r("ghp_\u{200B}16C7e42F292c6912E7710c838347Ae178B4a"),
-            "[redacted]"
+        redacts(
+            "a token split by a zero-width space",
+            "ghp_\u{200B}16C7e42F292c6912E7710c838347Ae178B4a",
+            "[redacted]",
         );
         assert_eq!(r("pass\u{0}word"), "pass word");
         assert_eq!(r("a\n\tb\u{2028}c"), "a b c");
-        assert_eq!(r("password=\u{202E}hunter22"), "password=[redacted]");
+        redacts(
+            "a value after a direction mark",
+            "password=\u{202E}hunter22",
+            "password=[redacted]",
+        );
     }
 
     #[test]
     fn lines_are_bounded_after_redaction() {
         let long = format!("{} ghp_{}", "word ".repeat(10), "A1b2C3d4".repeat(20));
         let out = line(&long, 40);
-        assert!(out.text.chars().count() <= 40, "{}", out.text);
-        assert!(!out.text.contains("A1b2C3d4"), "{}", out.text);
+        assert!(out.text.chars().count() <= 40, "longer than its bound");
+        assert!(!out.text.contains("A1b2C3d4"), "a cut token leaked");
         // A secret that starts before the cut is still long enough to match.
         let out = line(&format!("x ghp_{}", "A1b2C3d4".repeat(200)), 40);
-        assert!(!out.text.contains("A1b2"), "{}", out.text);
+        assert!(
+            !out.text.contains("A1b2"),
+            "a token cut at the scan's bound leaked"
+        );
         assert_eq!(line("short", 40).text, "short");
         assert_eq!(line("a b c d e f", 5).text, "a b…");
         assert_eq!(line(&" ".repeat(100_000), 10).text, "");

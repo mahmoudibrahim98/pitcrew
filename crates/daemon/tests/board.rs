@@ -334,7 +334,7 @@ fn a_stand_in_agent_drafts_a_board_through_pitcrew_and_only_accepted_tasks_are_m
     let token_file = read("token-file");
     assert!(
         token_file.ends_with(&format!("{}.token", id::WRITER)),
-        "{token_file}"
+        "the CLI was not given the drafting agent's own token file"
     );
 
     let proposed = current();

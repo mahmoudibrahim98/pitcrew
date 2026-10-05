@@ -882,7 +882,11 @@ mod tests {
             note: Some(" mail sam@example.com ".into()),
         })
         .unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(shape.tasks[0].title, "Rotate [redacted]");
+        // Compared without printing: on a failure the title would hold the synthetic token.
+        assert!(
+            shape.tasks[0].title == "Rotate [redacted]",
+            "the title is not trimmed and redacted"
+        );
         assert_eq!(shape.tasks[0].description, None);
         assert_eq!(shape.tasks[0].evidence, vec![session]);
         assert_eq!(shape.note.as_deref(), Some("mail [email]"));
