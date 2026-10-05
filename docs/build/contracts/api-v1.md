@@ -545,7 +545,9 @@ arrive, so the data layer refetches them when the activity they cover changes:
 - Keys: `['recaps', 'blocks', filters]` and `['recaps', 'days', { workstream } | { project }, tz]`.
 - On each `events` frame, for each event:
   - `machine_added`, `machine_liveness`, `persona_saved`, `team_saved`, `project_created` and
-    `brief_proposed` and `safety_changed` are not activity: they change no recap.
+    `brief_proposed` and `safety_changed` are not activity: they change no recap. Nor are the
+    board drafts' `board_draft_started`, `board_proposed` and `board_draft_reviewed` (the tasks
+    and links a review makes come as their own `task_created` and `session_linked`).
   - `member_added` may rename someone a line names: invalidate every `['recaps']` key.
   - Any other event: find its scope as the activity route's filters would. That is the session,
     task, workstream and project it names, plus their parents from the cache (a session's task and

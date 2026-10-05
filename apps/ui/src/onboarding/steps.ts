@@ -56,13 +56,19 @@ const NEEDS: Record<StepId, readonly OnboardingCall[]> = {
   // Its suggestions come from the scan.
   create: ['streamScan', 'createFromScan'],
   import: ['importSessions', 'commitImport'],
-  // Through the data layer, not `OnboardingApi`: `DraftStepProvider` offers it.
+  // Through the data layer, not `OnboardingApi`: `stepsFor`'s `draft` says when it shows.
   draft: [],
   hooks: ['hooksDiff', 'installHooks'],
   safety: ['readSafety', 'saveSafety'],
   done: [],
 };
 
-export function stepsFor(api: Pick<OnboardingApi, 'unavailable'>): StepMeta[] {
-  return FIRST_RUN.filter((step) => NEEDS[step.id].every((call) => !api.unavailable.has(call)));
+/**
+ * The steps `api` can serve. The optional draft step only with `draft` (`draft-board.tsx`: a hub
+ * that drafts boards, and something to draft).
+ */
+export function stepsFor(api: Pick<OnboardingApi, 'unavailable'>, draft = false): StepMeta[] {
+  return FIRST_RUN.filter(
+    (step) => (step.id !== 'draft' || draft) && NEEDS[step.id].every((call) => !api.unavailable.has(call)),
+  );
 }

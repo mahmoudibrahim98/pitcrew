@@ -1397,6 +1397,10 @@ function directRefs(hub: Hub, body: EventBody): EventFilter {
     case 'member_added':
     case 'persona_saved':
     case 'team_saved':
+    // Board drafts are indexed with no work, as the hub's reference index does.
+    case 'board_draft_started':
+    case 'board_proposed':
+    case 'board_draft_reviewed':
       return {};
   }
 }

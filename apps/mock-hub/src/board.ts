@@ -9,6 +9,8 @@
 
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { includedRecaps, includesSession } from './import.ts';
 import { announceSession, createSession } from './simulate.ts';
 import type { Hub } from './state.ts';
@@ -32,11 +34,18 @@ import {
 import { isUlid, ulid } from './ulid.ts';
 import { ApiFailure, Fields, conflict, forbidden, invalid, notFound, unavailable } from './validate.ts';
 
-/** The prompt template the hub builds into its binary. */
-const TEMPLATE = readFileSync(
-  new URL('../../../crates/office/prompts/draft-board/v1.md', import.meta.url),
-  'utf8',
-);
+/**
+ * The prompt template the hub builds into its binary, read on first use. Resolved as a path, not
+ * through the global `URL`: a DOM test environment replaces that, and imports this module too.
+ */
+let template: string | undefined;
+function draftTemplate(): string {
+  template ??= readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), '../../../crates/office/prompts/draft-board/v1.md'),
+    'utf8',
+  );
+  return template;
+}
 const PROMPT = 'draft-board/v1';
 const PLACEHOLDER_ID = 'drf_00000000000000000000000000';
 
@@ -393,7 +402,7 @@ function makePrompt(hub: Hub, workstream: Workstream, draft: string) {
     max_title: String(MAX_PROPOSED_TITLE),
     summary,
   };
-  const text = TEMPLATE.replace(/\{\{([^{}]*)\}\}/g, (whole, name: string) => values[name] ?? whole);
+  const text = draftTemplate().replace(/\{\{([^{}]*)\}\}/g, (whole, name: string) => values[name] ?? whole);
   const promptBytes = bytes(text);
   const cost: DraftCost = {
     sessions: blocks.length,

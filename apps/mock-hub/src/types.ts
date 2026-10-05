@@ -281,6 +281,8 @@ export interface Session {
   started: TimestampMs;
   last_activity: TimestampMs;
   terminal?: TerminalId;
+  /** The session that started this one, for a sub-agent's. The mock's sessions have none. */
+  parent?: SessionId;
 }
 
 export interface Dispatch {

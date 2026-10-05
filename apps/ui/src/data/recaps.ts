@@ -155,7 +155,7 @@ function scopeOfSession(id: SessionId, cache: RecapCacheLookup): RecapScope | 'e
 type DataOf<T extends EventType> = Extract<Event['body'], { type: T }>['data'];
 
 /**
- * One entry per event type: 'excluded' for the six kinds the contract says are not activity,
+ * One entry per event type: 'excluded' for the kinds the contract says are not activity,
  * 'everything' for `member_added` (it may rename someone a line names), and otherwise this
  * event's scope (empty when it names nothing recaps track, e.g. a `decision_recorded` without a
  * workstream). The mapped type makes a missing entry a compile error.
@@ -251,6 +251,10 @@ export const recapScopeMap: RecapScopeMap = {
     return union(parts);
   },
   safety_changed: () => 'excluded',
+  // Board drafts change no recap: the hub's recap engine reads none of them.
+  board_draft_started: () => 'excluded',
+  board_proposed: () => 'excluded',
+  board_draft_reviewed: () => 'excluded',
   brief_accepted: (d, cache) => (d.target.kind === 'project' ? scope({ project: d.target.id }) : scopeOfWorkstream(d.target.id, cache)),
   decision_recorded: (d, cache) => (d.workstream === undefined ? NONE_SCOPE : scopeOfWorkstream(d.workstream, cache)),
 };

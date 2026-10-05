@@ -588,6 +588,37 @@ export type EventBody =
   | {
       type: 'decision_recorded';
       data: { workstream?: WorkstreamId; text: string; why?: string; receipts: Receipt[] };
+    }
+  // Board drafts (api-v1.md, "Board drafts"); the projects views use them (`projects/board-drafts.ts`).
+  | {
+      type: 'board_draft_started';
+      data: {
+        draft: string;
+        workstream: WorkstreamId;
+        agent: MemberId;
+        engine: Engine;
+        session: SessionId;
+        prompt: string;
+        cost: import('../../../../packages/protocol-ts/bindings/DraftCost.ts').DraftCost;
+      };
+    }
+  | {
+      type: 'board_proposed';
+      data: {
+        draft: string;
+        workstream: WorkstreamId;
+        tasks: import('../../../../packages/protocol-ts/bindings/ProposedTask.ts').ProposedTask[];
+        note?: string;
+      };
+    }
+  | {
+      type: 'board_draft_reviewed';
+      data: {
+        draft: string;
+        workstream: WorkstreamId;
+        accepted: import('../../../../packages/protocol-ts/bindings/DraftedTask.ts').DraftedTask[];
+        rejected: number[];
+      };
     };
 
 export type EventType = EventBody['type'];
@@ -625,6 +656,9 @@ export const EVENT_TYPES = [
   'brief_proposed',
   'brief_accepted',
   'decision_recorded',
+  'board_draft_started',
+  'board_proposed',
+  'board_draft_reviewed',
 ] as const satisfies readonly EventType[];
 
 // Fails to compile if EVENT_TYPES misses a type of EventBody.

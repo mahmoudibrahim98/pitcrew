@@ -173,34 +173,8 @@ export const plainNames: Names = {
   ask: () => undefined,
 };
 
-/**
- * Board drafts' events (api-v1.md, "Board drafts"), which the data layer's event types do not list
- * yet: their sentence, or `undefined` for any other event.
- */
-function boardEvent(body: { type: string; data?: unknown }, names: Names): string | undefined {
-  const data = (typeof body.data === 'object' && body.data !== null ? body.data : {}) as Record<string, unknown>;
-  const workstream = typeof data.workstream === 'string' ? names.workstream(data.workstream) : 'a workstream';
-  const count = (list: unknown) => (Array.isArray(list) ? list.length : 0);
-  switch (body.type) {
-    case 'board_draft_started':
-      return `asked an agent to draft the board of ${workstream}`;
-    case 'board_proposed': {
-      const n = count(data.tasks);
-      return `proposed a board of ${n} task${n === 1 ? '' : 's'} for ${workstream}`;
-    }
-    case 'board_draft_reviewed': {
-      const n = count(data.accepted);
-      return `reviewed the drafted board of ${workstream}: ${n} task${n === 1 ? '' : 's'} accepted`;
-    }
-    default:
-      return undefined;
-  }
-}
-
 /** What an event did, as the rest of a sentence whose subject is its author. */
 export function describeEvent(event: Event, names: Names): string {
-  const board = boardEvent(event.body as { type: string; data?: unknown }, names);
-  if (board !== undefined) return board;
   const { body } = event;
   switch (body.type) {
     case 'safety_changed':
@@ -281,6 +255,18 @@ export function describeEvent(event: Event, names: Names): string {
       return `${body.data.pinned ? 'pinned' : 'updated'} where ${targetName(body.data.target, names)} stands`;
     case 'decision_recorded':
       return `recorded a decision: ${body.data.text}`;
+    case 'board_draft_started':
+      return `asked ${names.member(body.data.agent)} to draft the board of ${names.workstream(body.data.workstream)}`;
+    case 'board_proposed': {
+      const n = body.data.tasks.length;
+      return `proposed a board of ${n} task${n === 1 ? '' : 's'} for ${names.workstream(body.data.workstream)}`;
+    }
+    case 'board_draft_reviewed': {
+      const n = body.data.accepted.length;
+      return `reviewed the drafted board of ${names.workstream(body.data.workstream)}: ${n} task${
+        n === 1 ? '' : 's'
+      } accepted`;
+    }
   }
 }
 

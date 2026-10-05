@@ -108,9 +108,9 @@ describe('DraftBoardPanel', () => {
   it('tells the board events in the activity feed', () => {
     const event = (type: string, data: unknown) =>
       ({ id: 'e', at: 0, workspace: 'w', author: demo.sam, body: { type, data } }) as unknown as Event;
-    const names = { ...plainNames, workstream: () => 'Submission' };
-    expect(describeEvent(event('board_draft_started', { workstream: demo.submission }), names)).toBe(
-      'asked an agent to draft the board of Submission',
+    const names = { ...plainNames, workstream: () => 'Submission', member: () => '@office' };
+    expect(describeEvent(event('board_draft_started', { workstream: demo.submission, agent: 'M' }), names)).toBe(
+      'asked @office to draft the board of Submission',
     );
     expect(describeEvent(event('board_proposed', { workstream: demo.submission, tasks: [{}, {}] }), names)).toBe(
       'proposed a board of 2 tasks for Submission',

@@ -2,9 +2,9 @@
 // workstream's board from its history; the person sees what will be sent and an estimate first,
 // confirms per workstream, and reviews the proposal; nothing is created until they accept it.
 //
-// The data layer does not know these events yet: a `board_*` event is a type newer than it, on
-// which it refetches everything (`keysToInvalidate`). The hooks here also refresh their own keys
-// after a write, and poll while a draft is running (its end comes as a session event).
+// The data layer's invalidation map refreshes `draftKeys.all` on each `board_*` event. The hooks
+// here also refresh their own keys after a write, and poll while a draft is running (its end comes
+// as a session event).
 
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import {

@@ -70,6 +70,11 @@ export const invalidationMap: InvalidationMap = {
   brief_proposed: () => [keys.briefs],
   brief_accepted: () => [keys.briefs],
   decision_recorded: () => [],
+  // Board drafts' own keys (`projects/board-drafts.ts`); the tasks a review creates come as
+  // `task_created`, and its links as `session_linked`.
+  board_draft_started: () => [['board-drafts']],
+  board_proposed: () => [['board-drafts']],
+  board_draft_reviewed: () => [['board-drafts']],
 };
 
 function keysFor(body: EventBody, cache: CacheLookup): QueryKey[] {
