@@ -971,6 +971,17 @@ const getTranscript: Handler = (hub, ctx) => {
   return ok(transcriptPage(hub.transcripts.get(session.id) ?? [], before, limit));
 };
 
+const sessionOptions: Handler = (hub, ctx) => {
+  const machine = hub.findMachine(ctx.param('id'));
+  if (machine === undefined) throw notFound('No such machine.');
+  if (machine.kind !== 'local' || machine.liveness !== 'live') throw unavailable('This machine has no reachable session terminal runtime.');
+  return ok({ platform: 'unix', engines: [
+    { engine: 'claude', permission_modes: ['default', 'accept_edits', 'plan'] },
+    { engine: 'codex', permission_modes: ['default', 'accept_edits'] },
+    { engine: 'opencode', permission_modes: ['default'] },
+  ] });
+};
+
 const startSession: Handler = (hub, ctx) => {
   const fields = new Fields(ctx.body);
   const machineId = fields.string('machine');
@@ -988,14 +999,17 @@ const startSession: Handler = (hub, ctx) => {
   const brief = fields.optString('brief');
   // Checked for the contract's sake; a session does not record them.
   fields.optString('model');
-  fields.optEnum('permission_mode', PERMISSION_MODES);
+  const mode = fields.optEnum('permission_mode', PERMISSION_MODES) ?? 'default';
+  if ((engine === 'codex' && mode === 'plan') || (engine === 'opencode' && mode !== 'default') || mode === 'bypass_permissions') throw invalid('This permission mode is not allowed on this runner.');
+  const title = fields.optString('title')?.trim();
+  if (title !== undefined && (title.length === 0 || [...title].length > 200 || /[\u0000-\u001f\u007f]/u.test(title))) throw invalid('title must be 1–200 characters without control characters.');
   requireLive(machine);
   const folder = task === undefined ? workstreamByFolder(hub, machine.id, cwd) : undefined;
   const session = createSession(hub, {
     engine,
     machine: machine.id,
     cwd,
-    title: task?.title,
+    title: title ?? task?.title,
     agent: agent?.id,
     workstream: task?.workstream ?? folder?.id,
     task: task?.id,
@@ -1515,6 +1529,7 @@ const ROUTES: Route[] = [
   route('GET', '/v1/sessions/:id', 'device', (hub, ctx) => ok(sessionAt(hub, ctx.param('id')))),
   route('GET', '/v1/sessions/:id/transcript', 'device', getTranscript),
   route('GET', '/v1/sessions/:id/terminal', 'device', needsWebSocket),
+  route('GET', '/v1/machines/:id/session-options', 'device', sessionOptions),
   route('POST', '/v1/sessions', 'device', startSession),
   route('POST', '/v1/sessions/:id/send', 'device', sendToSession),
   route('POST', '/v1/sessions/:id/keys', 'device', sendKeys),

@@ -414,6 +414,16 @@ impl Shared {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(terminals.downgrade());
     }
 
+    fn live_sessions(&self) -> HashSet<SessionId> {
+        let terminals = self
+            .terminals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .and_then(WeakTerminals::upgrade);
+        terminals.map_or_else(HashSet::new, |t| t.live_sessions())
+    }
+
     /// Whether `terminal`'s program has certainly ended: its runtime says so, or no longer has
     /// it. False while it runs, and when that cannot be told (no terminals yet, or a runtime that
     /// does not answer). Blocking: it asks the runtime, for at most its call timeout.
@@ -527,6 +537,7 @@ impl Home {
 /// hooks to its session. The rest of its row (the cursor, the session's facts and metadata) is
 /// read from the index while it is in use, and let go once the index has saved it ([`Loaded`]).
 struct Tracked {
+    active_until: Option<TimestampMs>,
     session: SessionId,
     engine: Engine,
     /// Shared with the keys that find it, and with the transcript pages.
@@ -616,6 +627,7 @@ impl Tracked {
             failed_at: None,
             warned: false,
             loaded: None,
+            active_until: Some(0),
         }
     }
 
@@ -639,6 +651,7 @@ impl Tracked {
         self.discovered = row.discovered;
         self.subagent = row.meta.as_ref().is_some_and(|m| m.is_subagent);
         self.parent = row.facts.parent;
+        self.active_until = derive::active_until(&row.facts, row.mtime);
     }
 
     /// The transcript as the adapter reads it, at size `size` and modification time `modified`.
@@ -774,6 +787,7 @@ impl Ids {
 struct Hangup;
 
 pub(crate) struct Watcher {
+    live_cache: Option<(Instant, HashSet<SessionId>)>,
     byte_file_cursors: bool,
     cache_file_discovery: bool,
     workspace: WorkspaceId,
@@ -899,6 +913,7 @@ impl Watcher {
         }
         Self {
             cache_file_discovery: s.cache_file_discovery,
+            live_cache: None,
             byte_file_cursors: s.byte_file_cursors,
             workspace: s.workspace,
             machine: s.machine,
@@ -1684,10 +1699,84 @@ impl Watcher {
                 && t.mtime == st.mtime
                 && fsinfo::same_file(t.identity.as_deref(), st.identity.as_deref()))
         {
+            self.expire(id, st.mtime)?;
             return Ok(false);
         }
         self.refresh(id, st)?;
+        self.expire(id, self.tracked.get(&id).map_or(0, |t| t.mtime))?;
         Ok(true)
+    }
+
+    fn live(&mut self, session: SessionId) -> bool {
+        if self
+            .live_cache
+            .as_ref()
+            .is_none_or(|(at, _)| at.elapsed() >= Duration::from_secs(30))
+        {
+            self.live_cache = Some((Instant::now(), self.shared.live_sessions()));
+        }
+        self.live_cache
+            .as_ref()
+            .is_some_and(|(_, ids)| ids.contains(&session))
+    }
+
+    fn expire(&mut self, id: u64, modified: TimestampMs) -> Result<(), Hangup> {
+        let now = crate::now_ms();
+        if self
+            .tracked
+            .get(&id)
+            .is_none_or(|t| !t.discovered || t.active_until.is_none_or(|until| until > now))
+            || !self.load(id)
+        {
+            return Ok(());
+        }
+        let Some(session) = self.tracked.get(&id).map(|t| t.session) else {
+            return Ok(());
+        };
+        let live = self.live(session);
+        let Some(t) = self.tracked.get_mut(&id) else {
+            return Ok(());
+        };
+        let Some(l) = t.loaded.as_deref_mut() else {
+            return Ok(());
+        };
+        let row = &mut l.row;
+        let Some(from) = derive::expire(&mut row.facts, modified, live, now) else {
+            t.sync();
+            return Ok(());
+        };
+        row.facts.reports += 1;
+        let event = Event {
+            id: event_id(
+                session,
+                row.generation,
+                Cause::Report(row.facts.reports),
+                0,
+                now,
+            ),
+            at: row
+                .facts
+                .last_activity
+                .max(modified)
+                .max(row.facts.reported_at.unwrap_or(0)),
+            workspace: self.workspace,
+            author: self.owner,
+            on_behalf_of: None,
+            body: EventBody::SessionStateChanged {
+                session,
+                from,
+                to: SessionState::Idle,
+                status_line: None,
+            },
+        };
+        let commit = Commit::Full(Box::new(row.clone()));
+        let unsaved = Some(l.sending());
+        t.sync();
+        self.send(Batch {
+            events: vec![event],
+            commit,
+            unsaved,
+        })
     }
 
     fn classify(&mut self, id: u64, mtime: TimestampMs) {
@@ -1957,6 +2046,8 @@ impl Watcher {
         };
         let places = (first || moved).then(|| self.places(session)).flatten();
 
+        let live = self.live(session);
+        let title = self.store_lock().title(session).ok().flatten();
         let Some(t) = self.tracked.get_mut(&id) else {
             return Ok(());
         };
@@ -1964,6 +2055,11 @@ impl Watcher {
             return Ok(());
         };
         let row = &mut l.row;
+        if let Some(title) = title
+            && let Some(meta) = &mut row.meta
+        {
+            meta.title = Some(title);
+        }
         // Kept with the row, so its hooks are judged by the parent its discovery names, after a
         // restart too. A failed lookup is not kept: it is tried again at the next hook.
         if first
@@ -1988,6 +2084,7 @@ impl Watcher {
             for r in &held {
                 changed |= derive::report(&mut row.facts, r).is_some();
             }
+            derive::expire(&mut row.facts, st.mtime, live, crate::now_ms());
             let ended = changed && row.facts.state == SessionState::Ended;
             let s = session_of(row, st.mtime, machine, parent, terminal);
             let at = discovered_id_time(row);
@@ -3295,6 +3392,95 @@ mod tests {
         ) -> Result<pitcrew_interfaces::source::TranscriptPage, SourceError> {
             Err(SourceError::Io(io::Error::other("not paged in this test")))
         }
+    }
+
+    #[test]
+    fn old_transcripts_discover_idle_restart_idle_and_a_later_write_resumes() {
+        use pitcrew_interfaces::source::TranscriptItem;
+        let home = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let path = home.path().join("old.jsonl");
+        std::fs::write(&path, b"x").unwrap();
+        let age = |path: &Path| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_modified(SystemTime::now() - Duration::from_secs(600)),
+                )
+                .unwrap()
+        };
+        age(&path);
+        let adapter = Arc::new(Growing::default());
+        adapter.transcripts.lock().unwrap().push(TranscriptRef {
+            engine: Engine::Claude,
+            path: path.clone(),
+            inner_id: None,
+            size: 1,
+            modified: 1,
+        });
+        adapter
+            .items
+            .lock()
+            .unwrap()
+            .push(TranscriptItem::UserPrompt {
+                text: "old prompt".into(),
+                at: 1,
+                offset: 0,
+            });
+        let (mut w, _, rx) = watcher_with(home.path(), state.path(), adapter.clone());
+        assert!(w.start().is_ok());
+        let id = *w.tracked.keys().next().unwrap();
+        let session = w.tracked[&id].session;
+        let events = save_all(&w, &rx);
+        assert!(events.iter().any(|e| matches!(&e.body, EventBody::SessionDiscovered { session: s } if s.state == SessionState::Idle)));
+        assert_eq!(
+            w.store_lock().load(session).unwrap().unwrap().facts.state,
+            SessionState::Idle
+        );
+        let rows = w.store_lock().load_index().unwrap();
+        drop(w);
+        let (mut w, _, rx) = watcher_with(home.path(), state.path(), adapter.clone());
+        w.rows = rows;
+        assert!(w.start().is_ok());
+        let id = *w.tracked.keys().next().unwrap();
+        save_all(&w, &rx);
+        assert_eq!(
+            w.store_lock().load(session).unwrap().unwrap().facts.state,
+            SessionState::Idle
+        );
+        adapter
+            .items
+            .lock()
+            .unwrap()
+            .push(TranscriptItem::UserPrompt {
+                text: "new prompt".into(),
+                at: crate::now_ms(),
+                offset: 1,
+            });
+        std::fs::write(&path, b"xy").unwrap();
+        assert!(w.check(id).is_ok_and(|changed| changed));
+        let events = save_all(&w, &rx);
+        assert!(events.iter().any(|e| matches!(
+            e.body,
+            EventBody::SessionStateChanged {
+                to: SessionState::Working,
+                ..
+            }
+        )));
+        age(&path);
+        assert!(w.check(id).is_ok());
+        let events = save_all(&w, &rx);
+        assert!(events.iter().any(|e| matches!(
+            e.body,
+            EventBody::SessionStateChanged {
+                to: SessionState::Idle,
+                ..
+            }
+        )));
+        assert_eq!(std::fs::read(&path).unwrap(), b"xy");
     }
 
     #[test]

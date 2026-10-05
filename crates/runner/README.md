@@ -368,3 +368,21 @@ now), and an optional field says what caused a state change, e.g. on `session_st
 delivered the events, and the cause is better recorded as what it is. A also cannot cover the
 remote runner, which is where hooks from many agents on a cluster will come from. Until B lands,
 hook-caused state stays authored as the session's person.
+
+## Active state leases
+
+Working, Waiting and Starting expire to Idle after five minutes without a transcript write or
+accepted hook, unless the runtime lists the session's terminal as alive. Five minutes tolerates
+long gaps in streamed output; known terminals keep long silent commands active. Existing safety
+sweeps apply expiry (30 seconds locally, 120 seconds on network homes), and first discovery
+normalizes old transcripts before publishing them. Ended/Unreachable are preserved. Expiry
+clears a stale status line but does not advance reported_at, so a later transcript turn works
+normally. No transcript is rewritten. Inactive rows stay unloaded during subsequent checks;
+terminal liveness is a bounded list call cached for at most 30 seconds. The daemon supplies
+`RunnerConfig::with_runtime` before the watcher starts, so an old transcript with a live terminal
+is not expired during the startup gap before command routes attach.
+
+`RunnerCommands::session_options` detects executable CLIs on PATH without executing them and
+reports launch-supported modes, including bypass only where enabled. `set_title` stores a
+person's title in the separate session_titles table (migration 0004); adoption and restart apply
+it over the transcript's title.

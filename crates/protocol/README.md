@@ -8,3 +8,6 @@ creation. File limits are shared constants. `ErrorCode` adds `too_large` (413) a
 Run `cargo test -p pitcrew-protocol --features ts` to regenerate `packages/protocol-ts` explicitly.
 
 Session import types live in `import`: inclusion rules, the durable choice, and dry-run/commit counts. Regenerate the TypeScript exports with `cargo test -p pitcrew-protocol --features ts`.
+
+`api::SessionOptions` and `SessionEngine` describe machine-scoped launch availability. Their
+TypeScript bindings are exported by the same explicit regeneration test.

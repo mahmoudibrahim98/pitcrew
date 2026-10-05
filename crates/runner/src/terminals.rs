@@ -101,6 +101,14 @@ impl fmt::Debug for WeakTerminals {
 }
 
 impl RunnerTerminals {
+    pub(crate) fn uses_runtime(
+        &self,
+        runtime: &Arc<dyn Runtime>,
+        options: TerminalOptions,
+    ) -> bool {
+        Arc::ptr_eq(&self.inner.runtime, runtime) && self.inner.options == options
+    }
+
     /// Starts the call threads, and brings the stored links up to date with what the runtime has.
     pub(crate) fn new(
         runtime: Arc<dyn Runtime>,
@@ -170,6 +178,24 @@ impl RunnerTerminals {
             .into_iter()
             .find(|t| t.terminal == terminal)
             .and_then(|t| t.session))
+    }
+
+    pub(crate) fn live_sessions(&self) -> std::collections::HashSet<SessionId> {
+        let Ok(listed) = self.call(self.inner.options.call_timeout, |rt| rt.list()) else {
+            return Default::default();
+        };
+        let Ok(rows) = self.store().terminals() else {
+            return Default::default();
+        };
+        let alive: std::collections::HashSet<_> = listed
+            .into_iter()
+            .filter(|t| t.alive)
+            .map(|t| t.id)
+            .collect();
+        rows.into_iter()
+            .filter(|row| alive.contains(&row.terminal))
+            .filter_map(|row| row.session)
+            .collect()
     }
 
     /// Forgets the terminals the runtime no longer lists by their id, except CLI starts with a

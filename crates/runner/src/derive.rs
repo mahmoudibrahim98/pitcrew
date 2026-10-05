@@ -13,6 +13,38 @@ const MAX_OPEN_CALLS: usize = 256;
 /// Longest status line, in characters.
 const MAX_STATUS_CHARS: usize = 120;
 
+/// A quiet active state gets at most five minutes of transcript/hook evidence.
+pub(crate) const ACTIVE_LEASE_MS: TimestampMs = 5 * 60 * 1000;
+
+pub(crate) fn active_until(facts: &Facts, modified: TimestampMs) -> Option<TimestampMs> {
+    matches!(
+        facts.state,
+        SessionState::Working | SessionState::Waiting | SessionState::Starting
+    )
+    .then(|| {
+        modified
+            .max(facts.reported_at.unwrap_or(0))
+            .saturating_add(ACTIVE_LEASE_MS)
+    })
+}
+
+pub(crate) fn expire(
+    facts: &mut Facts,
+    modified: TimestampMs,
+    live: bool,
+    now: TimestampMs,
+) -> Option<SessionState> {
+    if live || active_until(facts, modified).is_none_or(|until| now < until) {
+        return None;
+    }
+    let from = facts.state;
+    facts.state = SessionState::Idle;
+    facts.status_line = None;
+    // This is derived inactivity, not a hook: don't block later transcript items by advancing
+    // reported_at, and don't manufacture activity at the time of expiry.
+    Some(from)
+}
+
 /// What the runner remembers about a session between reads. Saved with the cursor.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Facts {
@@ -706,5 +738,64 @@ mod tests {
         assert_eq!(relative_to("/w/pq/a", Some("/w/p")), "/w/pq/a");
         assert_eq!(relative_to(r"C:\w\p\a.rs", Some(r"C:\w\p")), "a.rs");
         assert_eq!(relative_to("/w/p/a", None), "/w/p/a");
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+    #[test]
+    fn leases_use_writes_hooks_and_live_terminals_without_inventing_activity() {
+        let now = 1_800_000;
+        for state in [
+            SessionState::Working,
+            SessionState::Waiting,
+            SessionState::Starting,
+        ] {
+            let old = Facts {
+                state,
+                status_line: Some("old status".into()),
+                last_activity: 42,
+                ..Facts::default()
+            };
+            let mut fresh = old.clone();
+            assert_eq!(
+                expire(&mut fresh, now - ACTIVE_LEASE_MS + 1, false, now),
+                None
+            );
+            assert_eq!(expire(&mut fresh, now - ACTIVE_LEASE_MS, true, now), None);
+            report(
+                &mut fresh,
+                &Reported {
+                    at: now - 1,
+                    to: state,
+                    status_line: None,
+                },
+            );
+            assert_eq!(fresh.reported_at, Some(now - 1));
+            assert_eq!(expire(&mut fresh, 0, false, now), None);
+            let mut restarted: Facts =
+                serde_json::from_str(&serde_json::to_string(&old).unwrap()).unwrap();
+            assert_eq!(
+                expire(&mut restarted, now - ACTIVE_LEASE_MS, false, now),
+                Some(state)
+            );
+            assert_eq!(restarted.state, SessionState::Idle);
+            assert_eq!(restarted.status_line, None);
+            assert_eq!(restarted.last_activity, 42);
+            assert_eq!(restarted.reported_at, None);
+        }
+        for state in [
+            SessionState::Ended,
+            SessionState::Unreachable,
+            SessionState::Idle,
+        ] {
+            let mut f = Facts {
+                state,
+                ..Facts::default()
+            };
+            assert_eq!(expire(&mut f, 0, false, now), None);
+            assert_eq!(f.state, state);
+        }
     }
 }

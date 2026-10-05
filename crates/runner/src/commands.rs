@@ -138,6 +138,55 @@ impl RunnerCommands {
         }
     }
 
+    /// Remember a person's title separately from the CLI's transcript.
+    ///
+    /// # Errors
+    /// The runner index cannot be written.
+    pub fn set_title(&self, session: SessionId, title: &str) -> Result<(), StoreError> {
+        self.inner.terminals.store().set_title(session, title)
+    }
+
+    /// Read the person's title for a session.
+    ///
+    /// # Errors
+    /// The runner index cannot be read.
+    pub fn title(&self, session: SessionId) -> Result<Option<String>, StoreError> {
+        self.inner.terminals.store().title(session)
+    }
+
+    /// Installed CLIs and the launch modes this runner allows. Does not execute a CLI.
+    pub fn session_options(&self) -> pitcrew_protocol::api::SessionOptions {
+        use pitcrew_protocol::api::{SessionEngine, SessionOptions};
+        let engines = [
+            (Engine::Claude, "claude"),
+            (Engine::Codex, "codex"),
+            (Engine::OpenCode, "opencode"),
+        ]
+        .into_iter()
+        .filter(|(_, program)| executable_on_path(program))
+        .map(|(engine, _)| {
+            let mut permission_modes = vec![PermissionMode::Default];
+            if engine != Engine::OpenCode {
+                permission_modes.push(PermissionMode::AcceptEdits);
+                if engine == Engine::Claude {
+                    permission_modes.push(PermissionMode::Plan);
+                }
+                if self.inner.options.allow_bypass_permissions {
+                    permission_modes.push(PermissionMode::BypassPermissions);
+                }
+            }
+            SessionEngine {
+                engine,
+                permission_modes,
+            }
+        })
+        .collect();
+        SessionOptions {
+            platform: if cfg!(windows) { "windows" } else { "unix" }.into(),
+            engines,
+        }
+    }
+
     /// Where `session`, one the hub named for a start, stands here: reported (its transcript is
     /// indexed under it), running (its start is under way, or its terminal's program runs and the
     /// transcript is not found yet), too late (matched by folder, and past the claim window),
@@ -804,6 +853,36 @@ fn failed(error: String) -> CommandOutcome {
 
 fn rejected(reason: String) -> CommandOutcome {
     CommandOutcome::Rejected { reason }
+}
+
+fn executable_on_path(program: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|dir| {
+        let extensions: &[&str] = if cfg!(windows) {
+            &[".exe", ".cmd", ".bat"]
+        } else {
+            &[""]
+        };
+        extensions.iter().any(|ext| {
+            let Ok(meta) = std::fs::metadata(dir.join(format!("{program}{ext}"))) else {
+                return false;
+            };
+            if !meta.is_file() {
+                return false;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                meta.permissions().mode() & 0o111 != 0
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        })
+    })
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@
 import { useBlocker, useParams } from '@tanstack/react-router';
 import { ToggleGroup } from 'radix-ui';
 import { useState } from 'react';
+import { StartSessionButton } from '../console/start-session-button.tsx';
 import { ReadScope } from './read-scope.tsx';
 import { StatusPill } from '../design/index.ts';
 import { ActivityFeed } from './activity.tsx';
@@ -82,6 +83,7 @@ export function WorkstreamPage() {
           <h1 className="text-2xl font-semibold">{workstream?.name ?? 'Loading…'}</h1>
           {workstream !== undefined && (
             <>
+              <StartSessionButton locations={workstream.locations} />
               <StatusPill tone={WORKSTREAM_STATUS[workstream.status].tone}>
                 {WORKSTREAM_STATUS[workstream.status].label}
               </StatusPill>

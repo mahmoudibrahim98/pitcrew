@@ -9,28 +9,11 @@
 //! | `POST /v1/sessions/{id}/interrupt` (→ 204) | Escape |
 //! | `POST /v1/sessions/{id}/end` (`{ "mode" }` → 204) | two Ctrl-C and a wait (`graceful`), or kills it (`kill`) |
 //!
-//! **Starting.** The runner learns a session's id only when the CLI writes its transcript (Claude
-//! is started with a session id of the runner's choosing, so the match is exact; other CLIs are
-//! matched by folder and start time). So `POST /v1/sessions` starts the CLI, then waits up to
-//! [`DISCOVERY`] for the runner to link the session to that terminal, and answers it as the hub
-//! stores it. If it does not appear in time (Claude writes its transcript at its first prompt, so
-//! a start without a brief may wait for a person), it answers `503 unavailable`: the CLI keeps
-//! running in its terminal, and its session appears on the stream once its transcript does.
+//! **Starting.** Every start is recorded before launch, even without an agent, task or prompt.
+//! It answers `202` with its terminal once the CLI starts; the transcript later adopts that id.
+//! Owned-agent authentication, folder claims, bounded commands and failed-start reconciliation
+//! apply equally to unnamed starts. A person's title is kept separately in the runner index.
 //!
-//! - **With `agent` or `task`**, the hub stores the session first (`WorkService::record_start`:
-//!   state `starting`, the agent named, linked to the task by hand; `400` for an unknown agent or
-//!   task, or a person as the agent), then the runner starts the CLI under that id, which its
-//!   transcript adopts, as a dispatch's does (`crate::dispatch`): the CLI of a session run as an
-//!   agent gets that agent's token file, never the person's token. A person may name only an
-//!   agent they own (`403` otherwise), as for a dispatch. The start answers `202` with the
-//!   session as stored, at once. If the runner refuses or fails, the session ends
-//!   (`WorkService::abandon_session`) and the error is answered; one the runner answers only
-//!   after the request gave up ([`COMMAND_TIMEOUT`]) is answered `503` and left `starting`, the
-//!   hub's start of it under way (`Attached::starting`) until the runner answers: a refusal or a
-//!   failure then ends it, and a CLI that never reports its session is reconciled later
-//!   (`crate::dispatch::reconcile`). A second start of Codex or OpenCode in a folder where one
-//!   started for an agent or a task still waits is refused (`400`): the two could not be told
-//!   apart.
 //! - `persona` is passed on; the runner does not use it yet.
 //! - `machine` must be a machine of the workspace (`400` otherwise) and the runner's (`503` for
 //!   another).
@@ -66,26 +49,22 @@ use axum::body::Body;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use pitcrew_auth::{Authenticated, ErrorResponse};
 use pitcrew_hub_work::routes::MAX_BODY;
 use pitcrew_hub_work::{RecordedStart, WorkError, WorkService};
 use pitcrew_protocol::api::{Caller, ErrorCode, TokenScope};
-use pitcrew_protocol::ids::{
-    CommandId, MachineId, MemberId, PersonaId, SessionId, TaskId, TerminalId,
-};
+use pitcrew_protocol::ids::{CommandId, MachineId, MemberId, PersonaId, SessionId, TaskId};
 use pitcrew_protocol::model::{Engine, PermissionMode, Session, SessionState};
 use pitcrew_protocol::runner::{CommandOutcome, EndMode, Key, RunnerCommand};
 use pitcrew_runner::{SessionAgent, SessionAgents as _};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Semaphore;
 
-/// How long `POST /v1/sessions` waits for the runner to discover the session it started.
-pub const DISCOVERY: Duration = Duration::from_secs(30);
 /// Commands running at once; past it a command answers `503` at once.
 pub const MAX_COMMANDS: usize = 16;
 /// Starts under way at once, each from its command to the end of its wait for the session.
@@ -103,17 +82,6 @@ pub const MAX_KEYS: usize = 64;
 pub const MAX_BRIEF: usize = pitcrew_hub_work::MAX_BRIEF;
 /// The longest `cwd`, in bytes.
 pub const MAX_CWD: usize = 4096;
-/// How often the runner's index is looked at while waiting for a started session.
-const POLL: Duration = Duration::from_millis(200);
-/// When, after a start, the runner is asked to look for new transcripts again, in case its folder
-/// watches missed the new one.
-const RESCANS: [Duration; 4] = [
-    Duration::from_secs(1),
-    Duration::from_secs(3),
-    Duration::from_secs(7),
-    Duration::from_secs(15),
-];
-
 /// The routes' state.
 #[derive(Debug)]
 pub struct Sessions {
@@ -152,6 +120,7 @@ impl Sessions {
     /// The routes. Mount them as **device** routes (`RouterParts::device`).
     pub fn routes(self) -> Router {
         Router::new()
+            .route("/v1/machines/{id}/session-options", get(options))
             .route("/v1/sessions", post(start))
             .route("/v1/sessions/{id}/send", post(send))
             .route("/v1/sessions/{id}/keys", post(keys))
@@ -169,7 +138,7 @@ impl Sessions {
 
     /// Runs `command` on the blocking pool, bounded, and answers its outcome. Its permit is
     /// released only when the command returns, even if this gives up on it first.
-    async fn run(&self, runner: &Parts, command: RunnerCommand) -> Result<Done, ErrorResponse> {
+    async fn run(&self, runner: &Parts, command: RunnerCommand) -> Result<(), ErrorResponse> {
         let Ok(permit) = Arc::clone(&self.commands).try_acquire_owned() else {
             return Err(unavailable(
                 "Too many session commands are running; try again in a moment.",
@@ -182,7 +151,7 @@ impl Sessions {
             outcome
         });
         match tokio::time::timeout(self.command_timeout, running).await {
-            Ok(Ok(CommandOutcome::Ok { detail })) => Ok(Done { detail }),
+            Ok(Ok(CommandOutcome::Ok { .. })) => Ok(()),
             Ok(Ok(CommandOutcome::Rejected { reason })) => Err(invalid(reason)),
             Ok(Ok(CommandOutcome::Failed { error })) => Err(unavailable(error)),
             Ok(Err(e)) => {
@@ -264,53 +233,6 @@ impl Sessions {
         Ok(StatusCode::NO_CONTENT)
     }
 
-    /// Waits up to [`DISCOVERY`] for the runner to link a session to `terminal`, and for the hub
-    /// to hold it.
-    async fn discovered(
-        &self,
-        runner: &Parts,
-        terminal: TerminalId,
-    ) -> Result<Option<Session>, ErrorResponse> {
-        let started = Instant::now();
-        let mut rescans = RESCANS.iter().peekable();
-        loop {
-            let terminals = runner.terminals.clone();
-            match bounded(move || terminals.session_of(terminal)).await? {
-                Ok(Some(id)) => {
-                    let work = Arc::clone(&self.work);
-                    match bounded(move || work.session(&id)).await? {
-                        Ok(session) => return Ok(Some(session)),
-                        // The runner's report of it is on its way to the store.
-                        Err(e) if e.code() == ErrorCode::NotFound => {}
-                        Err(e) => {
-                            tracing::error!(error = %e, session = %id, "cannot look up a started session");
-                            return Err(ErrorResponse::new(
-                                ErrorCode::Internal,
-                                "The started session could not be looked up.",
-                            ));
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::error!(error = %e, %terminal, "cannot look up a terminal's session");
-                    return Err(ErrorResponse::new(
-                        ErrorCode::Internal,
-                        "The started session could not be looked up.",
-                    ));
-                }
-            }
-            let waited = started.elapsed();
-            if waited >= DISCOVERY {
-                return Ok(None);
-            }
-            if rescans.next_if(|at| waited >= **at).is_some() {
-                self.rescan(runner);
-            }
-            tokio::time::sleep(POLL).await;
-        }
-    }
-
     /// Starts `command`, the CLI of `session`, which the hub has stored: answers it as stored once
     /// the runner has started its CLI, or ends it and answers why the runner could not. A start
     /// the runner has not answered in time is answered `503` and left `starting`: the hub's start
@@ -321,6 +243,7 @@ impl Sessions {
         runner: &Parts,
         command: RunnerCommand,
         session: Session,
+        caller: Caller,
     ) -> Result<(StatusCode, Json<Session>), ErrorResponse> {
         let id = session.id;
         // Taken first: until the runner answers, the session is not one whose CLI did not start.
@@ -342,7 +265,7 @@ impl Sessions {
             drop(permit);
             match &outcome {
                 CommandOutcome::Ok { .. } => {
-                    tracing::info!(session = %id, "started the CLI of a session stored for an agent or a task");
+                    tracing::info!(session = %id, "started the CLI of a recorded session");
                 }
                 CommandOutcome::Rejected { reason: why }
                 | CommandOutcome::Failed { error: why } => {
@@ -358,9 +281,48 @@ impl Sessions {
         });
         match tokio::time::timeout(self.command_timeout, running).await {
             Ok(Ok(CommandOutcome::Ok { .. })) => {
+                let commands = runner.commands.clone();
+                let terminals = runner.terminals.clone();
+                let terminal = bounded(move || terminals.terminal_of(id))
+                    .await?
+                    .map_err(|_| unavailable("The session terminal could not be read."))?;
+                let title = bounded(move || commands.title(id))
+                    .await?
+                    .map_err(|_| unavailable("The session title could not be read."))?;
                 let work = Arc::clone(&self.work);
-                let stored = bounded(move || work.session(&id)).await?;
-                Ok((StatusCode::ACCEPTED, Json(stored.unwrap_or(session))))
+                let publication = Arc::clone(&runner.publication);
+                let session = bounded(move || {
+                    let _publication = publication
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut session = work.session(&id).map_err(work_error)?;
+                    if session.terminal == terminal
+                        && title
+                            .as_ref()
+                            .is_none_or(|t| session.title.as_ref() == Some(t))
+                    {
+                        return Ok(session);
+                    }
+                    session.terminal = terminal;
+                    if title.is_some() {
+                        session.title = title;
+                    }
+                    work.store()
+                        .append(&[pitcrew_protocol::events::Event {
+                            id: pitcrew_protocol::ids::EventId::new(),
+                            at: session.last_activity,
+                            workspace: work.workspace(),
+                            author: caller.member,
+                            on_behalf_of: None,
+                            body: pitcrew_protocol::events::EventBody::SessionDiscovered {
+                                session: session.clone(),
+                            },
+                        }])
+                        .map_err(|_| unavailable("The session terminal could not be published."))?;
+                    Ok::<_, ErrorResponse>(session)
+                })
+                .await??;
+                Ok((StatusCode::ACCEPTED, Json(session)))
             }
             Ok(Ok(CommandOutcome::Rejected { reason })) => Err(invalid(reason)),
             Ok(Ok(CommandOutcome::Failed { error })) => Err(unavailable(error)),
@@ -401,19 +363,6 @@ impl Sessions {
             }
         }
     }
-
-    /// Asks the runner to look for new transcripts now (discovery runs on its watcher thread),
-    /// unless every command permit is taken.
-    fn rescan(&self, runner: &Parts) {
-        let Ok(permit) = Arc::clone(&self.commands).try_acquire_owned() else {
-            return;
-        };
-        let commands = runner.commands.clone();
-        drop(tokio::task::spawn_blocking(move || {
-            commands.run(CommandId::new(), &RunnerCommand::Scan { roots: Vec::new() });
-            drop(permit);
-        }));
-    }
 }
 
 /// Whether `caller` may command a session that runs as `agent`: the runner's rule for hooks. A
@@ -427,11 +376,6 @@ fn may_command(caller: Caller, agent: SessionAgent) -> bool {
         (TokenScope::Agent, SessionAgent::NoAgent) => false,
         (TokenScope::Agent, SessionAgent::Agent { agent, .. }) => agent == caller.member,
     }
-}
-
-/// A command that went well, with the runner's detail.
-struct Done {
-    detail: Option<serde_json::Value>,
 }
 
 /// `StartSession` (api-v1, "Sessions").
@@ -452,11 +396,20 @@ struct StartSession {
     model: Option<String>,
     #[serde(default)]
     permission_mode: Option<PermissionMode>,
+    #[serde(default)]
+    title: Option<String>,
 }
 
 impl StartSession {
     /// The bounds a start must keep before anything is looked up.
     fn check(&self) -> Result<(), ErrorResponse> {
+        if self.title.as_ref().is_some_and(|t| {
+            t.trim().is_empty() || t.trim().chars().count() > 200 || t.chars().any(char::is_control)
+        }) {
+            return Err(invalid(
+                "title must be 1–200 characters without control characters.",
+            ));
+        }
         if self.cwd.len() > MAX_CWD {
             return Err(invalid(format!("cwd must be at most {MAX_CWD} bytes.")));
         }
@@ -501,6 +454,36 @@ impl SendKeys {
 #[derive(Debug, Deserialize)]
 struct End {
     mode: EndMode,
+}
+
+async fn options(
+    State(sessions): State<Arc<Sessions>>,
+    Authenticated(caller): Authenticated,
+    Path(id): Path<MachineId>,
+) -> Result<Json<pitcrew_protocol::api::SessionOptions>, ErrorResponse> {
+    if caller.scope != TokenScope::Device {
+        return Err(ErrorResponse::forbidden(
+            "Only a person may read session launch options.",
+        ));
+    }
+    let work = Arc::clone(&sessions.work);
+    if !bounded(move || work.machines())
+        .await?
+        .map_err(work_error)?
+        .iter()
+        .any(|m| m.id == id)
+    {
+        return Err(ErrorResponse::new(ErrorCode::NotFound, "No such machine."));
+    }
+    let runner = sessions.runner()?;
+    if runner.machine != id || runner.runtime.is_none() {
+        return Err(unavailable(
+            "This machine has no reachable session terminal runtime.",
+        ));
+    }
+    Ok(Json(
+        bounded(move || runner.commands.session_options()).await?,
+    ))
 }
 
 async fn start(
@@ -554,24 +537,31 @@ async fn start(
         );
     }
     let name = window_name(start.engine, &folder.path);
-    // For an agent or a task, the hub stores the session first, and the CLI is started under it.
-    let recorded = if start.agent.is_some() || start.task.is_some() {
-        let work = Arc::clone(&sessions.work);
-        let record = RecordedStart {
-            machine: start.machine,
-            engine: start.engine,
-            cwd: folder.path.clone(),
-            agent: start.agent,
-            task: start.task,
-        };
-        Some(
-            bounded(move || work.record_start(&caller, record))
-                .await?
-                .map_err(work_error)?,
-        )
-    } else {
-        None
+    let work = Arc::clone(&sessions.work);
+    let record = RecordedStart {
+        machine: start.machine,
+        engine: start.engine,
+        cwd: folder.path.clone(),
+        agent: start.agent,
+        task: start.task,
     };
+    let recorded = bounded(move || work.record_start(&caller, record))
+        .await?
+        .map_err(work_error)?;
+    if let Some(title) = &start.title {
+        let commands = runner.commands.clone();
+        let id = recorded.id;
+        let title = title.trim().to_owned();
+        if bounded(move || commands.set_title(id, &title))
+            .await?
+            .is_err()
+        {
+            sessions
+                .abandon(id, "the session title could not be stored")
+                .await;
+            return Err(unavailable("The session title could not be stored."));
+        }
+    }
     let command = RunnerCommand::StartSession {
         engine: start.engine,
         cwd: folder.path,
@@ -581,45 +571,11 @@ async fn start(
         model: start.model,
         account: None,
         permission_mode: start.permission_mode.unwrap_or_default(),
-        session: recorded.as_ref().map(|s| s.id),
+        session: Some(recorded.id),
     };
-    if let Some(session) = recorded {
-        return sessions.start_recorded(&runner, command, session).await;
-    }
-    let done = sessions.run(&runner, command).await?;
-    let detail = done.detail.unwrap_or_default();
-    let Some(terminal) = detail
-        .get("terminal")
-        .and_then(|t| serde_json::from_value::<TerminalId>(t.clone()).ok())
-    else {
-        tracing::error!(
-            ?detail,
-            "the runner started a session but named no terminal"
-        );
-        return Err(ErrorResponse::new(
-            ErrorCode::Internal,
-            "The session's terminal is not known.",
-        ));
-    };
-    let target = detail
-        .get("native_target")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned);
-    tracing::info!(%terminal, target = ?target, "started a session's CLI in a terminal");
-    match sessions.discovered(&runner, terminal).await? {
-        Some(session) => Ok((StatusCode::ACCEPTED, Json(session))),
-        None => {
-            let attach = target.map_or_else(String::new, |t| {
-                format!(" A person can attach to it by hand (tmux target {t}).")
-            });
-            Err(unavailable(format!(
-                "The CLI started in terminal {terminal}, but its session did not appear within \
-                 {} seconds (Claude writes its transcript at its first prompt). It keeps \
-                 running, and its session appears on the stream once its transcript does.{attach}",
-                DISCOVERY.as_secs()
-            )))
-        }
-    }
+    sessions
+        .start_recorded(&runner, command, recorded, caller)
+        .await
 }
 
 /// A folder a CLI may start in ([`checked_cwd`]).
@@ -854,6 +810,7 @@ mod tests {
     use pitcrew_protocol::ids::WorkspaceId;
     use pitcrew_protocol::model::{Liveness, Machine, MachineKind, Member, MemberKind, Workspace};
     use pitcrew_store::{Store, StoreOptions};
+    use std::time::Instant;
 
     #[test]
     fn windows_are_named_by_cli_and_folder() {
@@ -915,6 +872,7 @@ mod tests {
             persona: None,
             model: None,
             permission_mode: None,
+            title: None,
         };
         assert_eq!(code(start(MAX_CWD, MAX_BRIEF).check()), None);
         assert_eq!(

@@ -63,8 +63,14 @@ every component are lazy chunks (render the components inside a `<Suspense>`).
   the console if needed and hands its request over through `intent.ts`.
 - **Links to the work.** The header links to the task (`paths.task`) and the workstream
   (`paths.workstream`) by path, so they open whatever serves those paths (the Projects layout).
-- **No "+ New" item.** Starting a session needs a flow that does not exist yet, and the shell's
-  `CreateEntry` cannot be shown disabled with a reason.
+- **Start session.** The console feature registers the lazy Session create entry, and its list
+  and each workstream offer Start session. All three use `new-session.tsx`: machine-scoped
+  installed engines and allowed modes from session-options, platform-aware absolute paths,
+  optional prompt/title, inline errors retaining input, and navigation to the new terminal tab.
+  Workstream locations prefill the machine/folder; the runner still checks safety and existence.
+  `tests/new-session.test.tsx` covers all entries and errors against the mock hub;
+  `tests/e2e/start-sessions.spec.ts` also supports a disposable real hub through the root browser
+  config's E2E_HUB_URL/TOKEN and E2E_SESSION_CWD. A mechanical root e2e import includes it in CI.
 
 ## The workbench
 
@@ -365,3 +371,15 @@ dialog open for retry. The mutation leaves the cache to the existing `session_li
 invalidation, so sessions move out of Unsorted without a reload. `link-session.test.tsx` tests
 selection and retry; `tests/e2e/link-session.spec.ts` covers the row action and axe checks. The
 root e2e suite imports that spec through a one-line discovery shim.
+
+Run the three entry points against a disposable real daemon (never a real agent CLI):
+
+```sh
+cargo build -p pitcrew-daemon -p pitcrew-ptyd --bins --locked
+node apps/ui/src/console/tests/e2e/run-real.mjs
+```
+
+In Codex cloud source `/workspace/.onboarding/env.sh` before building. Install the frozen UI
+dependencies and Playwright Chromium during setup. The runner works on Linux, macOS and Windows,
+creates temporary homes and a synthetic Claude shim, and removes its own processes and files.
+`PITCREW_SESSION_UI_CONFIG` can point at a Playwright config using an installed browser.

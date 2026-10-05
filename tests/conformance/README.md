@@ -72,3 +72,8 @@ and link target inside its own temporary folder. Windows daemon conformance keep
 Unix-runtime skip; Rust daemon HTTP tests cover Files API routes there.
 
 `run.mjs` runs `import.test.mjs` serially after the shared suite, since committing inclusion affects all views of its disposable hub. Both targets check dry-run/commit agreement, each mode, filters, excluded session/activity/recap reads, restoration, validation and device-only access.
+
+Session launch coverage now checks person-only machine options, platform and supported modes,
+unknown/unreachable machines, title validation, and an unnamed no-prompt start returning a
+terminal immediately. It reads the session back and ends it; the daemon uses only its temporary
+stand-in CLI, with PITCREW_FILES_ROOT as the safe launch folder.

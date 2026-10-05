@@ -762,3 +762,16 @@ export interface BriefEdit {
   next?: string;
   pinned: boolean;
 }
+
+export interface SessionOptions {
+  platform: 'windows' | 'unix';
+  engines: { engine: Engine; permission_modes: PermissionMode[] }[];
+}
+export interface StartSession {
+  machine: MachineId;
+  engine: Engine;
+  cwd: string;
+  permission_mode?: PermissionMode;
+  brief?: string;
+  title?: string;
+}

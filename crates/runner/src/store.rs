@@ -24,6 +24,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_transcripts.sql"),
     include_str!("../migrations/0002_links_and_commands.sql"),
     include_str!("../migrations/0003_folder_claims.sql"),
+    include_str!("../migrations/0004_session_titles.sql"),
 ];
 
 const DB_FILE: &str = "runner.sqlite3";
@@ -205,6 +206,22 @@ pub(crate) struct Store {
 }
 
 impl Store {
+    pub(crate) fn set_title(&self, session: SessionId, title: &str) -> Result<(), StoreError> {
+        self.conn.execute("INSERT INTO session_titles VALUES (?1, ?2) ON CONFLICT(session_id) DO UPDATE SET title = excluded.title", params![session.to_string(), title])?;
+        Ok(())
+    }
+
+    pub(crate) fn title(&self, session: SessionId) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT title FROM session_titles WHERE session_id = ?1",
+                [session.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         create_state_dir(dir)?;
         let lock = InstanceLock::acquire(dir)?;
@@ -1507,7 +1524,7 @@ mod tests {
                 err,
                 StoreError::TooNew {
                     found: 99,
-                    known: 3
+                    known: 4
                 }
             ),
             "{err}"

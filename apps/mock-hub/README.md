@@ -198,3 +198,8 @@ They enforce revisions, exclusive creation, path rules and body/file/list caps; 
 only in memory. Remote and WSL locations return 501. No filesystem paths are opened.
 
 Session import implements all/filtered/start-fresh rules in memory on the three `/v1/import` routes. Session lists, activity and stream delivery share inclusion; affected recap day paragraphs are reconstructed from retained fixture block lines. The mock still computes no new recap blocks for mutations.
+
+Session-options advertises the mock local machine's three synthetic CLIs and supported modes
+(Claude plan/accept-edits, Codex accept-edits, OpenCode default; bypass disabled). Unreachable
+machines return 503. Session start accepts and validates an optional title and returns its
+synthetic terminal without waiting for a transcript, matching the real daemon's launch flow.

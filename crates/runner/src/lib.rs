@@ -119,6 +119,7 @@ pub enum RunnerError {
 /// runner on the same state directory again only once they are dropped.
 #[derive(Debug)]
 pub struct RunnerHandle {
+    startup_terminals: Option<RunnerTerminals>,
     shared: Arc<watch::Shared>,
     store: Arc<Mutex<store::Store>>,
     watched: Arc<pages::Watched>,
@@ -167,6 +168,11 @@ impl RunnerHandle {
         runtime: Arc<dyn Runtime>,
         options: TerminalOptions,
     ) -> Result<RunnerTerminals, RunnerError> {
+        if let Some(terminals) = &self.startup_terminals
+            && terminals.uses_runtime(&runtime, options)
+        {
+            return Ok(terminals.clone());
+        }
         Ok(RunnerTerminals::new(
             runtime,
             Arc::clone(&self.store),
@@ -275,6 +281,15 @@ pub fn start(
     let store = Arc::new(Mutex::new(store));
     let (tx, rx) = std::sync::mpsc::sync_channel(config.channel_capacity.max(1));
     let shared = Arc::new(watch::Shared::default());
+    let startup_terminals = config
+        .startup_runtime
+        .map(|runtime| {
+            RunnerTerminals::new(runtime.0, Arc::clone(&store), TerminalOptions::default())
+        })
+        .transpose()?;
+    if let Some(terminals) = &startup_terminals {
+        shared.set_terminals(terminals);
+    }
     let watched = Arc::new(pages::Watched::default());
     let transcripts = RunnerTranscripts::new(
         Arc::clone(&watched),
@@ -334,6 +349,7 @@ pub fn start(
         .name("pitcrew-runner-watch".into())
         .spawn(move || watcher.run());
     let mut handle = RunnerHandle {
+        startup_terminals,
         shared,
         store,
         watched,

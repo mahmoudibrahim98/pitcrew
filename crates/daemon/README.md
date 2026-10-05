@@ -521,14 +521,11 @@ would go the same way (the runtime's README: call it from a blocking thread).
 | `POST /v1/sessions/{id}/interrupt` | Escape. |
 | `POST /v1/sessions/{id}/end` | `graceful`: Ctrl-C twice, then waits up to 10 seconds for the CLI to exit; `kill`: SIGTERM to its process group, SIGKILL half a second later, and the window closes. Either reports the session ended (`session_ended`). |
 
-- **Starting.** The runner learns a session's id only when the CLI writes its transcript; Claude
-  is started with a session id of the runner's choosing (`--session-id`), so the match is exact,
-  and other CLIs are matched by folder and start time. So `POST /v1/sessions` starts the CLI,
-  waits up to 30 seconds for the runner to discover its session in that terminal (asking it to
-  look again after 1, 3, 7 and 15 seconds), and answers `202` with the session as the hub stores
-  it (`terminal` set). If it does not appear (Claude writes its transcript at its first prompt, so
-  a start without a brief waits for a person), it answers `503` saying so: the CLI keeps running
-  in its terminal, and its session appears on the stream once its transcript does.
+- **Starting.** The hub stores every session before launch. A successful start answers `202`
+  with its terminal immediately, including when no first prompt or transcript exists. Claude's
+  transcript is matched by the chosen native id; Codex and OpenCode by folder and start time.
+  Each transcript adopts the recorded session's id. A person's optional title is stored in the
+  runner index, separate from the transcript, and survives adoption and restart.
 - **With `agent` or `task`** the hub stores the session first (state `starting`, the agent
   named, linked to the task with `link_basis: manual`; `400` for an unknown agent or task, or a
   person as the agent; `403` for an agent the caller does not own), and the runner starts the CLI
@@ -1151,3 +1148,20 @@ file-backups: private bounded originals before replacement (runner README, Works
 Responses use no-store and nosniff, and failures log counts and fixed reasons without paths.
 
 `import.json` holds the durable session inclusion choice, scoped to this state directory. `GET /v1/import`, `POST /v1/import/dry-run`, and `PUT /v1/import` are device-only. The runner keeps reading in place; the API visibility adapter hides excluded session events, and transcript/terminal reads return 404 for them.
+
+## Starting from the app
+
+GET /v1/machines/{id}/session-options is person-only and reports platform path syntax, executable
+engines and permitted modes from the reachable local runner. Unknown machines are 404; no
+runner/runtime or another machine is 503. Detection does not run an agent CLI.
+
+Every POST /v1/sessions records a Starting session before launch, including unnamed starts with
+no prompt. A successful 202 includes the terminal immediately; the transcript adopts that id
+later, so the person can enter their first prompt there. An optional trimmed 1–200-character
+title is retained separately by the runner. Existing ownership, safe-folder checks, claims and
+failed-start reconciliation apply. The cross-platform PTY stand-in test gates its transcript,
+checks the immediate terminal and send, then verifies adoption, title preservation and restart.
+
+Terminal publication and runner batches share one lock around the hub read and write, so a
+fast transcript adoption or hook cannot be overwritten by the start response. A session
+already carrying the same terminal and title needs no extra discovery event.

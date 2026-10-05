@@ -201,7 +201,7 @@ test('"+ New" opens placeholder dialogs from the keyboard', async ({ page }, inf
   await trigger.focus();
   await page.keyboard.press('Enter');
   const items = page.getByRole('menuitem');
-  await expect(items).toHaveText(['Task', 'Agent', 'Project', 'Team']);
+  await expect(items).toHaveText(['Task', 'Agent', 'Project', 'Team', 'Session']);
   await page.screenshot({ path: info.outputPath('new-menu.png') });
   await page.keyboard.press('ArrowDown');
   await page.keyboard.press('Enter');

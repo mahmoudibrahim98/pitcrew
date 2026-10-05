@@ -329,7 +329,9 @@ New workstreams trigger another pass over existing runner sessions.
 
 `StartSession`: `{ "machine": MachineId, "engine": Engine, "cwd": String, "agent"?: MemberId,
 "task"?: TaskId, "brief"?: String, "persona"?: PersonaId, "model"?: String,
-"permission_mode"?: PermissionMode }`. `persona`, `model` and `permission_mode` are launch options
+"permission_mode"?: PermissionMode, "title"?: String }`. A title is trimmed, 1–200 Unicode
+characters, with no control characters. It overrides the transcript's title without changing it.
+`persona`, `model` and `permission_mode` are launch options
 and are not echoed on `Session`. With a `task`, the session is linked with `link_basis: "manual"`.
 - With an `agent` or a `task`, the hub stores the session before its CLI starts
   (`session_discovered`, state `starting`, the agent named, linked to the task) and answers it
@@ -340,7 +342,25 @@ and are not echoed on `Session`. With a `task`, the session is linked with `link
   the start, the session ends (`session_ended`) and the start answers why. If the runner does not
   answer in time, the start answers `503` and the session stays `starting`: the hub ends it later
   only if its CLI did not start, as for a dispatch. It moves no task: only a dispatch does.
-- Without them, the start answers once the runner has found the CLI's transcript.
+- Without them, the hub also records a `starting` session before launching. Every successful
+  start answers `202` with its terminal, even without a prompt or transcript yet. The transcript
+  adopts that id later. This makes the terminal available for the first prompt.
+
+`GET /v1/machines/{id}/session-options` (person-only) returns
+`SessionOptions`: `{ "platform": "windows" | "unix", "engines":
+[{ "engine": Engine, "permission_modes": PermissionMode[] }] }`. Only executable CLIs
+on that runner's PATH are listed; none are run to detect availability. Modes reflect launch
+support and the runner's bypass policy (Codex has no plan mode; OpenCode uses its settings).
+Unknown machines are `404`; no runner, no terminal runtime or an unreachable machine is `503`.
+Availability is advisory: a CLI removed after the check can still fail at launch.
+
+Working, Waiting and Starting from transcripts become Idle after **five minutes** without
+transcript writes, accepted hooks or a known live terminal. The runner checks this during its
+existing safety sweeps (normally 30 seconds; 120 seconds on polled network homes). Old transcripts
+are normalized before discovery, including after restart. Expiry clears the status line, emits
+`session_state_changed` and never edits a transcript. A later write/hook can resume activity;
+ended and unreachable states are preserved. Terminal/process evidence is obtained from the
+runner's bounded runtime calls, never by guessing a process from its name.
 
 **Transcript paging.** Tail-first: without `before`, the newest page; pass a page's `from` as
 `before` to get the previous one. `limit` counts items (default 200, max 1000). Pages hold
