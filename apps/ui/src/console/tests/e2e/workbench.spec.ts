@@ -109,6 +109,15 @@ test('opens, splits, drags, and a reload restores the layout', async ({ page, re
   // Split right: the same session beside it, switched to its terminal.
   await pane(page, 1).getByRole('button', { name: 'Split right' }).click();
   await expect(pane(page, 2)).toBeVisible();
+  await page.setViewportSize({ width: 1100, height: 900 });
+  await expect(page.locator('[data-split][data-stacked="true"]')).toHaveCount(1);
+  for (const number of [1, 2]) {
+    expect((await pane(page, number).boundingBox())?.width).toBeGreaterThanOrEqual(320);
+  }
+  await page.setViewportSize({ width: 1600, height: 900 });
+  await expect(page.locator('[data-split][data-stacked="true"]')).toHaveCount(0);
+  await expect(tabs(page, 1)).toHaveCount(1);
+  await expect(tabs(page, 2)).toHaveCount(1);
   await pane(page, 2).getByRole('radio', { name: 'Terminal' }).click();
   await expect(pane(page, 2).getByRole('group', { name: 'Terminal' })).toBeVisible();
   await expect(pane(page, 1).getByRole('group', { name: 'Transcript' })).toBeVisible();

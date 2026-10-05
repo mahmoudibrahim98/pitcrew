@@ -269,10 +269,7 @@ describe('the workbench', () => {
     await eventually(() => expect(value('Model')).toBe("The CLI's default (Writer)"));
     expect(value('Account')).toBe('Not reported');
     expect(value('State')).toBe('Working');
-    // Hand off is shown, and says why it does nothing yet.
-    const handOff = within(details).getByRole('button', { name: 'Hand off' });
-    expect(handOff.getAttribute('aria-disabled')).toBe('true');
-    expect(document.getElementById(handOff.getAttribute('aria-describedby') ?? '')?.textContent).toMatch(/not available yet/);
+    expect(within(details).queryByRole('button', { name: 'Hand off' })).toBeNull();
 
     const tree = await within(details).findByRole('navigation', { name: 'Folder tree' });
     fireEvent.click(await within(tree).findByRole('button', { name: '▸ src' }));

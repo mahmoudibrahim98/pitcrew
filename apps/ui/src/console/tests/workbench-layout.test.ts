@@ -2,6 +2,17 @@
 // The workbench's layout model (no React) and its storage per workspace.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
+
+it('stacks row splits when any pane would fall below its minimum width', () => {
+  const [layout] = splitGroup(emptyLayout(), 'g1', 'right');
+  const split = layout.root;
+  if (split.type !== 'split') throw new Error('Expected a split');
+  expect(minimumWidth(split)).toBe(640);
+  expect(splitFits(split, 639)).toBe(false);
+  expect(splitFits(split, 640)).toBe(true);
+  expect(splitFits({ ...split, sizes: [0.2, 0.8] }, 1000)).toBe(false);
+  expect(splitFits({ ...split, direction: 'column' }, 400)).toBe(true);
+});
 import {
   activate,
   activeGroupOf,
@@ -28,6 +39,8 @@ import {
   shiftTab,
   splitGroup,
   stepGroup,
+  minimumWidth,
+  splitFits,
   stepTab,
   toStored,
   type Layout,

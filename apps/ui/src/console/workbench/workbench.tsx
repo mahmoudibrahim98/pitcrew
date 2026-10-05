@@ -15,6 +15,7 @@ import {
   Fragment,
   useEffect,
   useId,
+  useLayoutEffect,
   useRef,
   useState,
   type DragEvent,
@@ -53,6 +54,8 @@ import {
   setView,
   shiftTab,
   splitGroup,
+  splitFits,
+  PANE_MIN_WIDTH,
   stepTab,
   type DropSide,
   type Group,
@@ -204,6 +207,19 @@ export interface WorkbenchProps {
 
 export function Workbench({ api, empty }: WorkbenchProps) {
   const { layout, ws } = api;
+  const box = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(0);
+  useLayoutEffect(() => {
+    const element = box.current;
+    if (element === null) return;
+    const measure = () => setWidth(element.clientWidth);
+    measure();
+    if (typeof ResizeObserver !== 'function') return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  const stackDetails = width > 0 && width < PANE_MIN_WIDTH + layout.details.width;
   const groups = groupsOf(layout);
   const numbers = new Map(groups.map((g, i) => [g.id, i + 1]));
   const current = currentTab(layout);
@@ -227,12 +243,14 @@ export function Workbench({ api, empty }: WorkbenchProps) {
   };
 
   return (
-    <div data-workbench="" onKeyDown={onKeyDown} className="flex min-h-0 min-w-0 flex-1">
+    <div ref={box} data-workbench="" onKeyDown={onKeyDown} className={cx('flex min-h-0 min-w-0 flex-1', stackDetails && 'flex-col')}>
       {/* The panes are the landmarks ("Pane 1"…); this is only their frame. */}
       <div className="flex min-h-0 min-w-0 flex-1 flex-col">
         <NodeView api={api} node={layout.root} numbers={numbers} count={groups.length} empty={empty} />
       </div>
-      {layout.details.open && (
+      {layout.details.open && (stackDetails ? <aside aria-label="Details" className="max-h-[40%] shrink-0 overflow-auto border-t border-line bg-sidebar">
+        <Details ws={ws} tab={current?.tab} onOpenFile={api.openFile} onOpenBeside={api.openBeside} />
+      </aside> : (
         <ResizablePanel
           as="aside"
           side="right"
@@ -245,7 +263,7 @@ export function Workbench({ api, empty }: WorkbenchProps) {
         >
           <Details ws={ws} tab={current?.tab} onOpenFile={api.openFile} onOpenBeside={api.openBeside} />
         </ResizablePanel>
-      )}
+      ))}
     </div>
   );
 }
@@ -263,16 +281,30 @@ function NodeView({ node, ...props }: NodeProps & { node: LayoutNode }) {
 
 function SplitView({ split, ...props }: NodeProps & { split: Split }) {
   const box = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(0);
+  useLayoutEffect(() => {
+    const element = box.current;
+    if (element === null) return;
+    const measure = () => setWidth(element.clientWidth);
+    measure();
+    if (typeof ResizeObserver !== 'function') return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  const stacked = !splitFits(split, width);
+  const shown = stacked ? { ...split, direction: 'column' as const } : split;
   return (
     <div
       ref={box}
       data-split={split.id}
-      className={cx('flex min-h-0 min-w-0 flex-1', split.direction === 'row' ? 'flex-row' : 'flex-col')}
+      data-stacked={stacked || undefined}
+      className={cx('flex min-h-0 min-w-0 flex-1 overflow-auto', shown.direction === 'row' ? 'flex-row' : 'flex-col')}
     >
       {split.children.map((child, i) => (
         <Fragment key={child.id}>
-          {i > 0 && <Splitter api={props.api} split={split} index={i - 1} box={box} />}
-          <div className="flex min-h-0 min-w-0" style={{ flex: `${split.sizes[i] ?? 1} 1 0px` }}>
+          {i > 0 && <Splitter api={props.api} split={shown} index={i - 1} box={box} />}
+          <div className="flex min-h-0 min-w-0" style={{ flex: `${split.sizes[i] ?? 1} 1 0px`, minHeight: shown.direction === 'column' ? 160 : undefined }}>
             <NodeView node={child} {...props} />
           </div>
         </Fragment>

@@ -7,7 +7,7 @@ import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { ContextMenu } from 'radix-ui';
 import { LinkSessionDialog } from './link-session.tsx';
 import { ApiError, useMembers, type Member, type Session } from '../data/index.ts';
-import { StatusPill } from '../design/index.ts';
+import { EngineLogo, StatusPill } from '../design/index.ts';
 import { cx } from '../lib/cx.ts';
 import { useConsoleSessions } from './data.ts';
 import { NO_FACETS, placeOf, UNSORTED, type SessionFacets, type SessionPlaces } from './facets.ts';
@@ -312,6 +312,7 @@ function SessionRow(props: {
       )}
     >
       <div className="flex min-w-0 items-center gap-2">
+        <EngineLogo engine={session.engine} className="text-ink-2" />
         <span className="shrink-0 font-mono text-[10px] tracking-wide text-ink-2 uppercase">
           {ENGINE_LABEL[session.engine]}
         </span>

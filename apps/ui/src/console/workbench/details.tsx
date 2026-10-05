@@ -82,7 +82,6 @@ function SessionDetails({
   const workstream = useWorkstreamById(session.data?.workstream);
   const follow = useNavigateLink();
   const [linking, setLinking] = useState(false);
-  const handOff = useId();
   if (session.data === undefined) {
     return <p className="text-ink-2">{session.error !== null ? 'Could not load the session.' : 'Loading the session…'}</p>;
   }
@@ -138,15 +137,9 @@ function SessionDetails({
         <h3 className="font-medium">Actions</h3>
         <div className="flex flex-wrap gap-1.5">
           <Button onClick={() => setLinking(true)}>Link to a task…</Button>
-          <Button aria-disabled="true" aria-describedby={handOff} className="cursor-not-allowed opacity-60">
-            Hand off
-          </Button>
           {s.terminal !== undefined && <Button onClick={() => onOpenBeside(s.id, 'terminal')}>Terminal beside</Button>}
           <Button onClick={() => onOpenBeside(s.id, 'chat')}>Chat beside</Button>
         </div>
-        <p id={handOff} className="text-xs text-ink-2">
-          Hand off is not available yet: the hub has no way to pass a session on.
-        </p>
       </div>
       {linking && <LinkSessionDialog session={s} onClose={() => setLinking(false)} />}
 

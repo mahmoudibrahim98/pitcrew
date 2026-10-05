@@ -72,6 +72,17 @@ export const LIMITS = {
 } as const;
 
 export const DETAILS_WIDTH = { min: 240, max: 520, initial: 300 } as const;
+export const PANE_MIN_WIDTH = 320;
+
+export function minimumWidth(node: LayoutNode): number {
+  if (node.type === 'group') return PANE_MIN_WIDTH;
+  const widths = node.children.map(minimumWidth);
+  return node.direction === 'row' ? widths.reduce((a, b) => a + b, 0) : Math.max(...widths);
+}
+
+export function splitFits(split: Split, width: number): boolean {
+  return width <= 0 || split.direction === 'column' || split.children.every((child, index) => width * (split.sizes[index] ?? 0) >= minimumWidth(child));
+}
 
 // ─── Reading ────────────────────────────────────────────────────────────────────────────────────
 

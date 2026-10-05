@@ -1,5 +1,12 @@
 # console (stream M)
 
+Workbench row splits stack when a pane's allocated width falls below 320 px (including nested
+splits). Stacking is a view adjustment; the saved split stays intact and returns when it fits.
+Stacked panes retain at least 160 px of height and scroll when necessary. Tab strips scroll
+without showing scrollbars. Below 960 px of console width the filter column starts collapsed;
+it can still be opened explicitly. Side columns clamp to leave 320 px for the workbench; Details
+stacks underneath when it cannot fit alongside. Unavailable hand-off, fork and review actions stay hidden.
+
 The Agent console. See `docs/build/streams/M.md`. `index.ts` registers it with the shell (`feature`)
 and exports its components. The app imports `index.ts` at start, so it stays small: the page and
 every component are lazy chunks (render the components inside a `<Suspense>`).

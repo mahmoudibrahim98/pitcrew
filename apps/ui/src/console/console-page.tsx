@@ -43,7 +43,7 @@ import {
 } from './search.ts';
 import { SessionFilters } from './session-filters.tsx';
 import { SessionList, type OpenWhere, type SelectVia } from './session-list.tsx';
-import { currentTab, keep, openTab, reveal, type TabRef } from './workbench/layout.ts';
+import { currentTab, keep, openTab, PANE_MIN_WIDTH, reveal, type TabRef } from './workbench/layout.ts';
 import { Placeholder, SessionPane } from './workbench/session-tab.tsx';
 import { useWorkbench, Workbench } from './workbench/workbench.tsx';
 
@@ -84,15 +84,19 @@ function paneStops(root: HTMLElement | null): { pane: HTMLElement; target: HTMLE
 const find = (root: HTMLElement | null, selector: string) => root?.querySelector<HTMLElement>(selector) ?? null;
 
 /** Whether the console is narrower than `NARROW_BELOW`: one pane at a time. */
-function useNarrow(root: RefObject<HTMLElement | null>): boolean {
-  const [narrow, setNarrow] = useState(false);
+function useNarrow(root: RefObject<HTMLElement | null>): { narrow: boolean; width: number } {
+  const [width, setWidth] = useState(0);
   useLayoutEffect(() => {
     const element = root.current;
     if (element === null) return;
     // A width of 0 is no layout at all (a hidden tab, a test), not a narrow console.
+    let below = false;
     const measure = () => {
       const width = element.clientWidth;
-      setNarrow(width > 0 && width < NARROW_BELOW);
+      setWidth(width);
+      const compact = width > 0 && width < 960;
+      if (compact && !below) usePanes.getState().setFiltersOpen(false);
+      below = compact;
     };
     // Measured before the first paint, so a narrow window does not flash the wide layout.
     measure();
@@ -101,7 +105,7 @@ function useNarrow(root: RefObject<HTMLElement | null>): boolean {
     observer.observe(element);
     return () => observer.disconnect();
   }, [root]);
-  return narrow;
+  return { narrow: width > 0 && width < NARROW_BELOW, width };
 }
 
 /** Focus is nowhere in particular: on the page itself, as a closing palette or dialog leaves it. */
@@ -147,8 +151,13 @@ export function ConsolePage() {
   const facets = facetsFromSearch(search);
   const { sessions, all } = useConsoleSessions(facets);
   const root = useRef<HTMLDivElement>(null);
-  const narrow = useNarrow(root);
+  const measured = useNarrow(root);
+  const width = measured.width;
   const panes = usePanes();
+  const narrow = measured.narrow || (panes.filtersOpen && width > 0 && width < PANE_WIDTH.filters.min + PANE_WIDTH.list.min + PANE_MIN_WIDTH);
+  const filterMax = width > 0 ? Math.max(PANE_WIDTH.filters.min, width - PANE_WIDTH.list.min - PANE_MIN_WIDTH) : PANE_WIDTH.filters.max;
+  const filterWidth = Math.min(panes.filtersWidth, filterMax);
+  const listMax = width > 0 ? Math.max(PANE_WIDTH.list.min, width - PANE_MIN_WIDTH - (panes.filtersOpen ? filterWidth : 0)) : PANE_WIDTH.list.max;
   const [narrowFilters, setNarrowFilters] = useState(false);
   const focusSoon = useFocusSoon();
 
@@ -400,10 +409,10 @@ export function ConsolePage() {
           as="section"
           side="left"
           label="Filters"
-          width={panes.filtersWidth}
+          width={filterWidth}
           onWidthChange={panes.setFiltersWidth}
           min={PANE_WIDTH.filters.min}
-          max={PANE_WIDTH.filters.max}
+          max={Math.min(PANE_WIDTH.filters.max, filterMax)}
           className="border-r border-line bg-sidebar"
         >
           {filters}
@@ -413,10 +422,10 @@ export function ConsolePage() {
         as="section"
         side="left"
         label="Sessions"
-        width={panes.listWidth}
+        width={Math.min(panes.listWidth, listMax)}
         onWidthChange={panes.setListWidth}
         min={PANE_WIDTH.list.min}
-        max={PANE_WIDTH.list.max}
+        max={Math.min(PANE_WIDTH.list.max, listMax)}
         className="border-r border-line"
       >
         {list}
