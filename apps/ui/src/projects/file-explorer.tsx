@@ -49,7 +49,7 @@ export function FileExplorer({ workstream, openFile, previewFile }: { workstream
           <button className="rounded-sm border border-line px-2 py-1 text-sm" onClick={() => setQuick(true)}>Quick open… <kbd>Ctrl P</kbd></button>
           <label className="block text-xs"><input type="checkbox" checked={hidden} onChange={e => setHidden(e.target.checked)} /> Show hidden</label>
           {rootPath && <button className="text-xs text-accent-text underline" onClick={() => setRootPath('')}>Root / {rootPath}</button>}
-          <FileTree key={`${location}:${rootPath}`} rootPath={rootPath} client={client} scope={['files', workstream.id, location]} openFile={open} showHidden={hidden} />
+          <FileTree label="Explorer folder tree" key={`${location}:${rootPath}`} rootPath={rootPath} client={client} scope={['files', workstream.id, location]} openFile={open} showHidden={hidden} />
         </>}
       </div>
     </details>

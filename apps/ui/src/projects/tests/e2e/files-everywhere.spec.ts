@@ -6,7 +6,8 @@ const WS = '01JB000000000000000WSP0001';
 const SES = '01JB000000000000000SES0001';
 
 for (const theme of ['light', 'dark'] as const) {
-  test(`explorer, hidden entries, quick open, file tabs, breadcrumbs and split in ${theme}`, async ({ page, request }) => {
+  test(`explorer, hidden entries, quick open, file tabs, breadcrumbs and split in ${theme}`, async ({ page, request, context }) => {
+    await context.grantPermissions(['clipboard-read', 'clipboard-write']);
     const machines = await (await request.get(`${HUB_URL}/v1/machines`, { headers: HUB_AUTH })).json();
     const local = machines.find((machine: { kind: string }) => machine.kind === 'local');
     const created = await request.post(`${HUB_URL}/v1/workstreams`, { headers: HUB_AUTH, data: {
@@ -33,6 +34,7 @@ for (const theme of ['light', 'dark'] as const) {
     await expect(pane.getByRole('navigation', { name: 'File breadcrumbs' })).toContainText('src');
     await pane.getByRole('button', { name: 'Copy path' }).click();
     await expect(pane.getByText('Path copied')).toBeVisible();
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(`${stream.locations[0].path}/src/hello.txt`);
     await pane.getByRole('button', { name: 'Split right', exact: true }).click();
     await expect(page.getByRole('region', { name: 'Pane 2', exact: true }).getByLabel('File text')).toContainText('hello');
     await expectNoAxeViolations(page, `file explorer and split in ${theme}`);

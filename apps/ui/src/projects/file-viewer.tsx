@@ -425,6 +425,7 @@ export function FileTree({
   className,
   showHidden = false,
   rootPath = '',
+  label = 'Folder tree',
 }: {
   client: FileClient;
   scope: readonly unknown[];
@@ -432,9 +433,10 @@ export function FileTree({
   className?: string;
   showHidden?: boolean;
   rootPath?: string;
+  label?: string;
 }) {
   return (
-    <nav aria-label="Folder tree" onKeyDown={treeKeys} className={cx('min-w-0', className)}>
+    <nav aria-label={label} onKeyDown={treeKeys} className={cx('min-w-0', className)}>
       <Folder client={client} scope={scope} path={rootPath} openFile={openFile} showHidden={showHidden} />
     </nav>
   );
