@@ -1,8 +1,14 @@
 import { expect, it } from 'vitest';
-import { changedLine, resolveFilePath } from '../file-links.tsx';
+import { changedLine, resolveFilePath, toolFileTarget } from '../file-links.tsx';
 import type { Workstream } from '../../data/index.ts';
 
 const stream = { id: 'stream', locations: [{ machine: 'local', path: '/home/sam/paper' }, { machine: 'remote', path: '/scratch/paper' }, { machine: 'local', path: '/home/sam/paper/sections' }] } as Workstream;
+it('recognizes file tools and recorded line offsets without treating shell targets as paths', () => {
+  expect(toolFileTarget('Read', 'short target', { file_path: '/home/sam/paper/sections/method.tex', offset: 14 })).toEqual({ path: '/home/sam/paper/sections/method.tex', line: 14 });
+  expect(toolFileTarget('functions.read_file', 'src/file.ts', { start_line: 20 })?.line).toBe(20);
+  expect(toolFileTarget('Write', 'src/file.ts', { offset: -1 })?.line).toBeUndefined();
+  expect(toolFileTarget('Bash', 'cat /home/sam/paper/main.tex', {})).toBeUndefined();
+});
 it('resolves relative and absolute transcript paths at the deepest location on the session machine', () => {
   expect(resolveFilePath('sections/method.tex', '/home/sam/paper', 'local', stream)).toEqual({ kind: 'file', workstream: 'stream', location: 2, path: 'method.tex' });
   expect(resolveFilePath('/home/sam/paper/main.tex', '/elsewhere', 'local', stream)?.path).toBe('main.tex');

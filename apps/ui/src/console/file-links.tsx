@@ -5,6 +5,15 @@ import type { TabRef } from './workbench/layout.ts';
 
 export const FileOpenContext = createContext<((ref: TabRef) => void) | undefined>(undefined);
 
+export function toolFileTarget(tool: string, target: string, input: unknown) {
+  if (!/^(?:read|edit|multiedit|write|read_file|edit_file|write_file)$/i.test(tool.split('.').at(-1) ?? '')) return undefined;
+  const values = input !== null && typeof input === 'object' ? input as Record<string, unknown> : {};
+  const path = [values.file_path, values.filePath, values.path, target].find(value => typeof value === 'string' && value.length > 0);
+  if (typeof path !== 'string') return undefined;
+  const line = [values.offset, values.start_line, values.line_number, values.line].find(value => typeof value === 'number' && Number.isSafeInteger(value) && value > 0);
+  return { path, line: typeof line === 'number' ? line : undefined };
+}
+
 /** A transcript path becomes a file target only inside a location on this session's machine. */
 export function resolveFilePath(path: string, cwd: string, machine: string, stream: Workstream) {
   const normalize = (value: string) => value.replaceAll('\\', '/').replace(/\/$/, '');
