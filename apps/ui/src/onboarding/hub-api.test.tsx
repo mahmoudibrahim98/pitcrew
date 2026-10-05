@@ -3,9 +3,11 @@
 // The real `OnboardingApi` (`createHubOnboardingApi`): setup is `POST /v1/setup` (here a stand-in
 // for the data layer's `setUp`), the host list is the gateway's `sshHosts`, the scan is
 // `POST /v1/machines/{id}/scan` and creating from it `POST /v1/projects` and `/v1/workstreams`
-// (here a stand-in for the data layer's client), and every other call is unavailable. Without the
-// client the first run is Welcome, Workspace, Done; with it, Scan and Create come between. The
-// hub's refusals land by the right field, and a workspace set up meanwhile goes Home.
+// (here a stand-in for the data layer's client), and machine setup's routes answer the machine
+// check and the accounts (`machine-setup.test.tsx` tests them), and the hooks and safety routes
+// theirs. Without the client the first run is Welcome, Workspace, Done; with it, Machine check,
+// Sign in, Scan, Create, Import, Hooks and Safety come between. The hub's refusals land by the
+// right field, and a workspace set up meanwhile goes Home.
 
 import { cleanup, fireEvent, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -123,7 +125,7 @@ describe('the real first run', () => {
     const setUp = vi.fn<(setup: Setup) => Promise<SetupResult>>(() => Promise.resolve(RESULT));
     const { router } = renderWizard(createHubOnboardingApi({ setUp }));
     await walkToWorkspace();
-    expect(screen.getAllByRole('tab').map((t) => t.textContent?.replace(/^\d/, ''))).toEqual(['Welcome', 'Workspace', 'Done']);
+    expect(screen.getAllByRole('tab').map((t) => t.textContent?.replace(/^\d+/, ''))).toEqual(['Welcome', 'Workspace', 'Done']);
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
     await screen.findByRole('heading', { level: 1, name: "You're set up" });
     expect(setUp).toHaveBeenCalledTimes(1);
@@ -197,6 +199,9 @@ function ndjson(...frames: unknown[]): string {
   return frames.map((frame) => `${JSON.stringify(frame)}\n`).join('');
 }
 
+const CHECKED = { rows: [{ id: 'git', status: 'ok', detail: 'git version 2.43.0', version: 'git version 2.43.0' }] };
+const ACCOUNTS = [{ engine: 'claude', installed: true, signed_in: false }];
+
 const SCANNED: TransportResponse = {
   status: 200,
   contentType: 'application/x-ndjson',
@@ -239,6 +244,10 @@ function fakeHub(options: FakeHubOptions = {}) {
         if (path === '/v1/safety') return Promise.resolve({ status: 200, body: JSON.stringify({permission_mode: 'default', back_office_enabled: false, back_office_caps: {max_auto_accept_per_hour: 20}}) });
         if (path === '/v1/import/dry-run') return Promise.resolve({ status: 200, body: '{"count":6}' });
         if (path === '/v1/import') return Promise.resolve({ status: 200, body: '{"imported":6}' });
+        // Machine setup (`machine-setup.test.tsx` covers it): the hub's machines, its check, its accounts.
+        if (path === '/v1/machines') return Promise.resolve({ status: 200, body: JSON.stringify(MACHINES) });
+        if (path === `/v1/machines/${LAPTOP}/check`) return Promise.resolve({ status: 200, body: JSON.stringify(CHECKED) });
+        if (path === `/v1/machines/${LAPTOP}/agents`) return Promise.resolve({ status: 200, body: JSON.stringify(ACCOUNTS) });
         return Promise.resolve(options.scan ?? SCANNED);
       },
       openSocket: () => {
@@ -306,10 +315,24 @@ describe('the scan, from the hub', () => {
     const api = createHubOnboardingApi({ setUp: () => Promise.reject(new Error('unused')), data: fakeHub().data });
     expect(api.unavailable.has('streamScan')).toBe(false);
     expect(api.unavailable.has('createFromScan')).toBe(false);
-    expect(stepsFor(api).map((s) => s.id)).toEqual(['welcome', 'workspace', 'scan', 'create', 'import', 'hooks', 'safety', 'done']);
-    for (const call of ['checkMachine'] as const) {
+    expect(stepsFor(api).map((s) => s.id)).toEqual([
+      'welcome',
+      'workspace',
+      'machine-check',
+      'sign-in',
+      'scan',
+      'create',
+      'import',
+      'hooks',
+      'safety',
+      'done',
+    ]);
+    for (const call of ['integrationStatus', 'launcherOptions'] as const) {
       expect(api.unavailable.has(call)).toBe(true);
     }
+    // No remote gateway here; and the hub's own machine needs no helper anyway.
+    expect(api.unavailable.has('streamInstallHelper')).toBe(true);
+    expect(api.needsHelper({ kind: 'local' })).toBe(false);
   });
 
   it('scans the hub’s own machine, passing on its progress and then the mapped result', async () => {
@@ -449,14 +472,16 @@ describe('creating from the scan', () => {
 });
 
 describe('the real first run, with the scan', () => {
-  it('is Welcome, Workspace, Scan, Create, Done, creating what stayed ticked', async () => {
+  it('is every step the hub serves, in order, creating what stayed ticked', async () => {
     const setUp = vi.fn<(setup: Setup) => Promise<SetupResult>>(() => Promise.resolve(RESULT));
     const hub = fakeHub();
     renderWizard(createHubOnboardingApi({ setUp, data: hub.data }));
     await screen.findByRole('heading', { level: 1, name: 'Welcome to PitCrew' });
-    expect(screen.getAllByRole('tab').map((t) => t.textContent?.replace(/^\d/, ''))).toEqual([
+    expect(screen.getAllByRole('tab').map((t) => t.textContent?.replace(/^\d+/, ''))).toEqual([
       'Welcome',
       'Workspace',
+      'Machine check',
+      'Sign in',
       'Scan',
       'Create',
       'Import',
@@ -469,6 +494,14 @@ describe('the real first run, with the scan', () => {
     fireEvent.change(screen.getByLabelText('Workspace name'), { target: { value: 'Demo Lab' } });
     fireEvent.change(screen.getByLabelText('Your name'), { target: { value: 'Sam Rivera' } });
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+
+    // The machine check and the accounts, from the hub's own machine.
+    await screen.findByRole('heading', { level: 1, name: 'Checking the machine' });
+    await screen.findByText('git version 2.43.0');
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    await screen.findByRole('heading', { level: 1, name: 'Sign in to your agents' });
+    await screen.findByText('Not signed in');
+    fireEvent.click(screen.getByRole('button', { name: 'Skip for now' }));
 
     await screen.findByRole('heading', { level: 1, name: 'Scanning for sessions' });
     await screen.findByText(/Found 2 likely projects/);
@@ -493,7 +526,16 @@ describe('the real first run, with the scan', () => {
       ['TOO', 'tools'],
     ]);
     expect(hub.workstreams.map((w) => w.name)).toEqual(['drafts']);
-    expect(hub.sent).toEqual([`POST /v1/machines/${LAPTOP}/scan`, "POST /v1/import/dry-run", "PUT /v1/import", `POST /v1/machines/${LAPTOP}/hooks/diff`, "GET /v1/safety", "PUT /v1/safety"]);
+    // Machine setup only reads; what goes to the hub otherwise is the scan, the import, the hooks'
+    // preview (then skipped) and the safety settings, in that order.
+    expect(hub.sent.filter((line) => !line.startsWith('GET ') || line === 'GET /v1/safety')).toEqual([
+      `POST /v1/machines/${LAPTOP}/scan`,
+      'POST /v1/import/dry-run',
+      'PUT /v1/import',
+      `POST /v1/machines/${LAPTOP}/hooks/diff`,
+      'GET /v1/safety',
+      'PUT /v1/safety',
+    ]);
   });
 
   it('says why a scan failed, and tries again on request', async () => {
@@ -508,6 +550,8 @@ describe('the real first run, with the scan', () => {
       transport: {
         ...hub.data.transport,
         request: (method, path, body, signal) => {
+          // Only the scan answers in turn; machine setup's reads are the hub's.
+          if (!path.endsWith('/scan')) return hub.data.transport.request(method, path, body, signal);
           const [next, ...rest] = answers;
           answers = rest;
           void hub.data.transport.request(method, path, body, signal);
@@ -522,12 +566,16 @@ describe('the real first run, with the scan', () => {
     fireEvent.change(screen.getByLabelText('Workspace name'), { target: { value: 'Demo Lab' } });
     fireEvent.change(screen.getByLabelText('Your name'), { target: { value: 'Sam Rivera' } });
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    await screen.findByText('git version 2.43.0');
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    await screen.findByRole('heading', { level: 1, name: 'Sign in to your agents' });
+    fireEvent.click(screen.getByRole('button', { name: 'Skip for now' }));
 
     expect((await screen.findByRole('alert')).textContent).toBe(message);
     expect((screen.getByRole('button', { name: 'Continue' }) as HTMLButtonElement).disabled).toBe(true);
     fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
     await screen.findByText(/Found 2 likely projects/);
-    expect(hub.sent).toHaveLength(2);
+    expect(hub.sent.filter((line) => line.endsWith('/scan'))).toHaveLength(2);
   });
 });
 

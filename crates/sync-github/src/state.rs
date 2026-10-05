@@ -88,6 +88,63 @@ pub struct IssueSnapshot {
     pub(crate) assignees: Vec<String>,
     pub(crate) milestone_number: Option<u64>,
     pub(crate) updated_at: GithubTimestamp,
+    /// Whether `title` is exactly the title GitHub sent: nothing hidden was stripped, nothing was
+    /// cut. `false` in a state saved before this was kept, until the issue is read again.
+    #[serde(default)]
+    pub(crate) title_lossless: bool,
+    /// Whether `body` is exactly the body GitHub sent (as for `title_lossless`).
+    #[serde(default)]
+    pub(crate) body_lossless: bool,
+}
+
+impl IssueSnapshot {
+    /// The title, as last read.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// The body, as last read.
+    #[must_use]
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    /// Whether it was open.
+    #[must_use]
+    pub fn open(&self) -> bool {
+        self.open
+    }
+
+    /// Why it was closed, when it was.
+    #[must_use]
+    pub fn close_reason(&self) -> Option<CloseReason> {
+        self.close_reason
+    }
+
+    /// The labels, as last read.
+    #[must_use]
+    pub fn labels(&self) -> &[String] {
+        &self.labels
+    }
+
+    /// Its milestone's number.
+    #[must_use]
+    pub fn milestone_number(&self) -> Option<u64> {
+        self.milestone_number
+    }
+
+    /// Whether [`Self::title`] is exactly what GitHub sent, so writing it back loses nothing.
+    #[must_use]
+    pub fn title_lossless(&self) -> bool {
+        self.title_lossless
+    }
+
+    /// Whether [`Self::body`] is exactly what GitHub sent, so writing it back loses nothing.
+    #[must_use]
+    pub fn body_lossless(&self) -> bool {
+        self.body_lossless
+    }
 }
 
 /// The owned fields of one pull request, as last seen.

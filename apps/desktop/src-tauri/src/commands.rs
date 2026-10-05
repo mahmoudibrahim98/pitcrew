@@ -5,6 +5,7 @@
 //! invoke('gateway_workspaces')
 //! invoke('gateway_local_host')                                   // → { name }
 //! invoke('gateway_request', { req: { workspace, method, path, body } })
+//! invoke('gateway_integration_credential', { workspace, integration, secret })
 //! invoke('gateway_socket_open', { workspace, path, events: new Channel() })  // → { socket }
 //! invoke('gateway_socket_send', { socket, text })   // or { socket, binary }
 //! invoke('gateway_socket_close', { socket, code, reason })
@@ -211,6 +212,28 @@ pub async fn gateway_request(
     let req: GatewayRequest = serde_json::from_value(required(req, "req")?)
         .map_err(|e| GatewayError::invalid(format!("req is not a GatewayRequest: {e}")))?;
     gateway.request(req).await
+}
+
+/// `gateway_integration_credential({ workspace, integration, secret }) → GatewayResponse`: an
+/// integration's secret, handed to the workspace's daemon once (`PUT
+/// /v1/integrations/{id}/credential`), never through `gateway_request`. The secret is held as a
+/// `Secret` (zeroed when dropped) and goes nowhere else.
+#[tauri::command]
+pub async fn gateway_integration_credential(
+    gateway: State<'_, Gateway>,
+    workspace: Option<Value>,
+    integration: Option<Value>,
+    secret: Option<Value>,
+) -> Result<GatewayResponse, GatewayError> {
+    let workspace = string(workspace, "workspace")?;
+    let integration = string(integration, "integration")?;
+    let secret = match required(secret, "secret")? {
+        Value::String(text) => Secret::new(text),
+        _ => return Err(GatewayError::invalid("secret must be a string")),
+    };
+    gateway
+        .store_credential(&workspace, &integration, &secret)
+        .await
 }
 
 /// What `gateway_socket_open` resolves with.

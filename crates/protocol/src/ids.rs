@@ -137,6 +137,10 @@ ulid_id!(
     TerminalId, "term"
 );
 ulid_id!(
+    /// A connection to GitHub or Jira (api-v1.md, "Integrations").
+    IntegrationId, "int"
+);
+ulid_id!(
     /// A board draft: one agent drafting a workstream's board from its history.
     DraftId, "drf"
 );

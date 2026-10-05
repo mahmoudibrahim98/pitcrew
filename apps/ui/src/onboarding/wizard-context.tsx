@@ -58,7 +58,7 @@ export function WizardProvider({ defaults = {}, children }: { defaults?: WizardD
   const [state, setState] = useState<WizardState>(() => initialWizardState(defaults.machineName));
   // The optional draft step shows only where a hub drafts boards and there is something to draft.
   const draft = useDraftStepAvailable() && showDraftStep(state);
-  const steps = useMemo(() => stepsFor(api, draft), [api, draft]);
+  const steps = useMemo(() => stepsFor(api, { draft }), [api, draft]);
   const [stepIndex, setStepIndex] = useState(0);
   const [furthest, setFurthest] = useState(0);
 

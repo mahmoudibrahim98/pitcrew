@@ -1,8 +1,11 @@
 // The first-run wizard's steps, in order. A step whose calls have no backend yet
-// (`OnboardingApi.unavailable`) is left out, so against the real hub the first run is Welcome,
-// Workspace, Done; the other steps come back as their routes land. The fake has them all.
+// (`OnboardingApi.unavailable`) is left out. So are installing the helper on a machine that needs
+// none (the hub's own, which runs the hub: `needsHelper`) and the optional draft step where it does
+// not apply (`draft-board.tsx`). Against the real hub the first run is Welcome, Workspace, Machine
+// check, Sign in, Scan, Create, Import, Draft boards (when it applies), Hooks, Safety, Done; the
+// other steps come back as their routes land. The fake has them all.
 
-import type { OnboardingApi, OnboardingCall } from './api.ts';
+import type { MachineTarget, OnboardingApi, OnboardingCall } from './api.ts';
 
 export type StepId =
   | 'welcome'
@@ -50,25 +53,36 @@ const NEEDS: Record<StepId, readonly OnboardingCall[]> = {
   workspace: ['setupWorkspace'],
   'machine-check': ['checkMachine', 'fixMachineRow'],
   'install-helper': ['launcherOptions', 'streamInstallHelper'],
-  'sign-in': ['agentAccounts', 'startSignIn'],
+  'sign-in': ['agentAccounts', 'startSignIn', 'signInRunning'],
   integrations: ['integrationStatus'],
   scan: ['streamScan'],
   // Its suggestions come from the scan.
   create: ['streamScan', 'createFromScan'],
   import: ['importSessions', 'commitImport'],
-  // Through the data layer, not `OnboardingApi`: `stepsFor`'s `draft` says when it shows.
+  // Through the data layer, not `OnboardingApi`: `stepsFor`'s `draft` option says when it shows.
   draft: [],
   hooks: ['hooksDiff', 'installHooks'],
   safety: ['readSafety', 'saveSafety'],
   done: [],
 };
 
-/**
- * The steps `api` can serve. The optional draft step only with `draft` (`draft-board.tsx`: a hub
- * that drafts boards, and something to draft).
- */
-export function stepsFor(api: Pick<OnboardingApi, 'unavailable'>, draft = false): StepMeta[] {
+/** Which steps to offer, besides what the API can serve. */
+export interface StepOptions {
+  /** The machine the machine steps are about: the hub's own by default. */
+  target?: MachineTarget;
+  /** Offer the optional draft step (`draft-board.tsx`: a hub that drafts boards, and something to draft). */
+  draft?: boolean;
+}
+
+/** The steps for `api`: the install step only where `target` needs the helper, the draft step only with `draft`. */
+export function stepsFor(
+  api: Pick<OnboardingApi, 'unavailable' | 'needsHelper'>,
+  { target = { kind: 'local' }, draft = false }: StepOptions = {},
+): StepMeta[] {
   return FIRST_RUN.filter(
-    (step) => (step.id !== 'draft' || draft) && NEEDS[step.id].every((call) => !api.unavailable.has(call)),
+    (step) =>
+      NEEDS[step.id].every((call) => !api.unavailable.has(call)) &&
+      (step.id !== 'install-helper' || api.needsHelper(target)) &&
+      (step.id !== 'draft' || draft),
   );
 }

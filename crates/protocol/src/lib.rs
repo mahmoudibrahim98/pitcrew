@@ -11,6 +11,9 @@
 //! - [`recap`]: activity blocks, summaries with receipts and day paragraphs, as the API serves
 //!   them.
 //!
+//! [`integrations`] holds the GitHub and Jira connections' routes' types, and [`writes`] the
+//! outward writes to them that a person approves first.
+//!
 //! Besides the six, [`text`] holds the one set of hidden characters every crate drops from
 //! untrusted text.
 //!
@@ -26,6 +29,8 @@ pub mod events;
 pub mod files;
 pub mod ids;
 pub mod import;
+pub mod integrations;
+pub mod machine_setup;
 pub mod model;
 pub mod onboarding;
 pub mod recap;
@@ -34,6 +39,7 @@ pub mod scan;
 pub mod text;
 pub mod transcript;
 pub mod version;
+pub mod writes;
 
 pub use ids::*;
 pub use version::{PROTOCOL_MIN, PROTOCOL_VERSION, is_compatible};

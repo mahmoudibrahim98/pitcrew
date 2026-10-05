@@ -1,8 +1,8 @@
 // @vitest-environment happy-dom
 // @vitest-environment-options {"url": "http://localhost:5173/"}
 // The first-run route itself, in the desktop app over a fake gateway: a remote hub reaching it
-// through the redirect starts from the gateway's name for its machine; Done replaces the wizard
-// with Home; and a workspace already set up goes Home at once (unless the development flag asks
+// through the redirect starts from the gateway's name for its machine, and checks and signs in on
+// that machine through its hub; Done replaces the wizard with Home; and a workspace already set up goes Home at once (unless the development flag asks
 // for the fake wizard).
 
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
@@ -55,7 +55,15 @@ const heading = (name: string | RegExp) => screen.findByRole('heading', { level:
 
 describe('the first-run route', () => {
   it("starts a remote hub's machine name from the gateway's name, and replaces itself with Home", async () => {
+    const own = '01JB000000000000000MAC0001';
     desktop.daemons.set(WS, (req) => {
+      // Machine setup on the remote hub's own machine (the remote one), through the gateway.
+      if (req.method === 'GET' && req.path === `/v1/machines/${own}/check`) {
+        return { status: 200, body: JSON.stringify({ rows: [{ id: 'git', status: 'ok', detail: 'git version 2.43.0' }] }) };
+      }
+      if (req.method === 'GET' && req.path === `/v1/machines/${own}/agents`) {
+        return { status: 200, body: JSON.stringify([{ engine: 'codex', installed: true, signed_in: true, account: 'ChatGPT' }]) };
+      }
       if (req.method === 'POST' && req.path === '/v1/import/dry-run') {
         return { status: 200, body: '{"count":0}' };
       }
@@ -76,6 +84,15 @@ describe('the first-run route', () => {
     fireEvent.change(screen.getByLabelText('Workspace name'), { target: { value: 'Cluster Lab' } });
     fireEvent.change(screen.getByLabelText('Your name'), { target: { value: 'Sam Rivera' } });
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+
+    // Its machine check and sign-in are the remote machine's, through its hub.
+    await heading('Checking the machine');
+    await screen.findByText('git version 2.43.0', undefined, PATIENCE);
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    await heading('Sign in to your agents');
+    await screen.findByText('ChatGPT', undefined, PATIENCE);
+    expect(screen.getByText(/in a terminal on hpc-login/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Skip for now' }));
 
     await heading('Import sessions');
     await screen.findByText('This will import 0 sessions.');

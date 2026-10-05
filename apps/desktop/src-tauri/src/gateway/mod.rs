@@ -209,9 +209,14 @@ impl Gateway {
     /// # Errors
     /// A `GatewayError` when the call is malformed or the daemon never answered.
     pub async fn request(&self, req: GatewayRequest) -> Result<GatewayResponse, GatewayError> {
-        let started = Instant::now();
         let method = parse_method(&req.method)?;
         let path = path::check_request_path(&req.path)?;
+        if path::is_credential_route(path) {
+            return Err(GatewayError::invalid(
+                "an integration's credential goes through gateway_integration_credential, not \
+                 gateway_request",
+            ));
+        }
         let body = match req.body {
             Some(body) if body.len() > self.limits.request_body => {
                 return Err(GatewayError::too_large(format!(
@@ -221,9 +226,59 @@ impl Gateway {
             }
             other => other.map(Bytes::from),
         };
+        self.forward(&req.workspace, method, path, body).await
+    }
+
+    /// `gateway_integration_credential`: hands `secret` to the workspace's daemon as
+    /// `PUT /v1/integrations/{integration}/credential` (api-v1.md, "Integrations"), with the
+    /// workspace's token, and returns the daemon's answer whatever its status. The secret is in
+    /// the request body only: never logged, never in an error, and no daemon answer holds it.
+    ///
+    /// # Errors
+    /// `invalid` for a malformed integration id; a `GatewayError` when the daemon never answered.
+    pub async fn store_credential(
+        &self,
+        workspace: &str,
+        integration: &str,
+        secret: &pitcrew_remote::Secret,
+    ) -> Result<GatewayResponse, GatewayError> {
+        if !path::is_integration_id(integration) {
+            return Err(GatewayError::invalid(
+                "integration must be an integration id",
+            ));
+        }
+        let body = serde_json::to_vec(&serde_json::json!({ "secret": secret.expose() }))
+            .map_err(|_| GatewayError::internal("the credential could not be encoded"))?;
+        if body.len() > self.limits.request_body {
+            return Err(GatewayError::too_large(format!(
+                "the credential is over {} bytes",
+                self.limits.request_body
+            )));
+        }
+        let path = format!("/v1/integrations/{integration}/credential");
+        self.forward(
+            workspace,
+            ::http::Method::PUT,
+            &path,
+            Some(Bytes::from(body)),
+        )
+        .await
+    }
+
+    /// Sends one checked request to `workspace`'s daemon with its token, and returns the answer
+    /// whatever its status. Logs the workspace (shortened), the method, the route, the status and
+    /// the time; never a body.
+    async fn forward(
+        &self,
+        workspace_id: &str,
+        method: ::http::Method,
+        path: &str,
+        body: Option<Bytes>,
+    ) -> Result<GatewayResponse, GatewayError> {
+        let started = Instant::now();
         // Webview-supplied: logged only through `shorten`.
-        let workspace = error::shorten(&req.workspace);
-        let connector = self.registry.connector(&req.workspace)?;
+        let workspace = error::shorten(workspace_id);
+        let connector = self.registry.connector(workspace_id)?;
         let timeout = self.limits.request_timeout;
         let connected = tokio::time::timeout(timeout, connector.connect())
             .await

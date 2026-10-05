@@ -23,6 +23,12 @@ export interface RemoteProbe {
   slurm?: { version: string; defaultPartition?: string | undefined; srunOverlap: boolean } | undefined;
   /** tmux, if it is there: the tmux launcher needs 3.2 or newer. Absent means not known. */
   tmux?: { version: string } | undefined;
+  /**
+   * The machine check made over the same connection (api-v1.md, "Machine setup", rows): passed on
+   * as sent, for onboarding to check and read (`onboarding/machine-wire.ts`). Absent when the
+   * gateway made none.
+   */
+  check?: { rows: unknown[] } | undefined;
 }
 
 /** How the remote's helper runs. */
@@ -265,6 +271,9 @@ export function parseRemoteProbe(value: unknown): RemoteProbe | undefined {
     if (tmux === undefined || typeof tmux.version !== 'string') return undefined;
     probe.tmux = { version: cleanLine(tmux.version) };
   }
+  // A check that is not one is left out, not the probe: the rows are read where they are shown.
+  const check = record(v.check);
+  if (check !== undefined && Array.isArray(check.rows)) probe.check = { rows: check.rows.slice(0, 32) };
   return probe;
 }
 

@@ -190,6 +190,47 @@ const dispatch = object({
   'outcome?': enumeration('succeeded', 'failed', 'canceled'),
   'summary?': text,
 });
+const writeFields = object({
+  'title?': text,
+  'body?': text,
+  'labels?': list(text),
+  'add_labels?': list(text),
+  'remove_labels?': list(text),
+  'milestone?': text,
+  'epic?': text,
+  'state?': enumeration('open', 'closed'),
+  'close_reason?': enumeration('completed', 'not_planned'),
+  'comment?': text,
+});
+const writeProposal = object({
+  ask: id,
+  integration: id,
+  system: enumeration('github', 'jira'),
+  scope: text,
+  'target?': external,
+  'task?': id,
+  operation: enumeration('create_issue', 'comment', 'update', 'close', 'reopen'),
+  before: writeFields,
+  after: writeFields,
+  requested_by: id,
+  'cause?': id,
+});
+const writeResult = tagged('outcome', {
+  sent: object({ 'created?': external, 'url?': text }),
+  failed: object({ message: text, 'status?': integer }),
+  not_sent: object({ reason: text }),
+});
+const upstreamWrite = object({
+  proposal: writeProposal,
+  state: enumeration('pending', 'approved', 'denied', 'sending', 'sent', 'failed', 'not_sent'),
+  attempts: integer,
+  proposed_at: integer,
+  'answered_at?': integer,
+  'answered_by?': id,
+  'finished_at?': integer,
+  'result?': writeResult,
+  'retry_requested_by?': id,
+});
 // Board drafts (api-v1.md, "Board drafts").
 const draftCost = object({
   sessions: integer,
@@ -271,6 +312,7 @@ const eventData = {
     status: enumeration('idea', 'active', 'paused', 'shipped', 'dropped'),
     health: enumeration('on_track', 'at_risk', 'blocked'),
   }),
+  workstream_linked: object({ workstream: id, external: list(external) }),
   task_created: object({ task }),
   task_moved: object({
     task: id,
@@ -304,6 +346,10 @@ const eventData = {
     'receipts?': list(receipt),
   }),
   decision_recorded: object({ 'workstream?': id, text, 'why?': text, receipts: list(receipt) }),
+  write_proposed: object({ write: writeProposal }),
+  write_started: object({ ask: id, 'task?': id, attempt: integer }),
+  write_retry_requested: object({ ask: id, 'task?': id, by: id }),
+  write_finished: object({ ask: id, 'task?': id, result: writeResult }),
   board_draft_started: object({
     draft: id,
     workstream: id,
@@ -433,6 +479,42 @@ const block = object({
   tool_receipts: list(receipt),
   turn_receipts: list(receipt),
 });
+const integrationSettings = tagged('kind', {
+  github: object({ repos: list(text), 'api_base?': text }),
+  jira: object({
+    deployment: enumeration('cloud', 'data_center'),
+    site: text,
+    projects: list(text),
+    'email?': text,
+    'epic_link_field?': text,
+  }),
+});
+const syncCounts = object({
+  changes: integer,
+  applied: integer,
+  conflicts: integer,
+  skipped: integer,
+  malformed: integer,
+});
+const integration = object({
+  id,
+  name: text,
+  settings: integrationSettings,
+  credential: object({ source: enumeration('gh_cli', 'stored'), stored: bool }),
+  interval_minutes: integer,
+  added_by: id,
+  added_at: integer,
+  status: object({
+    running: bool,
+    'last_attempt_at?': integer,
+    'last_success_at?': integer,
+    'next_at?': integer,
+    'rate_limited_until?': integer,
+    problems: list(object({ scope: text, message: text })),
+    'last_run?': syncCounts,
+  }),
+  links: list(object({ workstream: id, scope: external, 'title?': text })),
+});
 export const schemas = {
   host: object({
     name: text,
@@ -483,6 +565,14 @@ export const schemas = {
     at_start: bool,
   }),
   setup: object({ workspace, me: member, machine }),
+  integration,
+  upstreamWrite,
+  integrationCheck: object({
+    ok: bool,
+    at: integer,
+    checks: list(object({ scope: text, ok: bool, message: text })),
+    warnings: list(text),
+  }),
   boardDraft,
   draftPreview: object({ workstream: id, prompt: text, cost: draftCost, summary: text, digest: text }),
   draftReviewed: object({ draft: boardDraft, tasks: list(task) }),
