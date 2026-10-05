@@ -1144,22 +1144,31 @@ reads; a write goes upstream only after a person approves it:
 - **Outward writes** (`writes.rs`), on the same loop, before the syncs, woken by every append to
   the log:
   - the **planner** reads the log from `integrations.json`'s `writes_rev` (the log's end the first
-    time): a person's (or agent's, or the office's) move across the open/closed line, or change of
-    a field upstream owns (the crates' ownership tables, both directions), on a task mirroring an
-    issue a connection syncs, becomes an approval ask with `write_proposed` (hub-work's
-    `propose_write`, once per cause). `before` is upstream's value from the sync state's
-    snapshots; nothing is proposed when upstream already has the value. The sync's own changes
-    never imply a write;
-  - the **executor** records a denial as not sent; sends an approved write once (checked against
-    the task as it is now, then `start_write`, which hub-work allows only for the sync's own
-    approval ask answered "Send" by a person), with the connection's credential, through
-    `pitcrew_sync_github::write` or `pitcrew_sync_jira::write`; and records the result. A write
-    left `sending` (the daemon stopped mid-send) is finished as failed, never resent by itself; a
-    failed one is sent again only when a person retries it;
+    time, and again, with a warning, when the saved place is beyond the log): a person's (or
+    agent's, or the office's) move across the open/closed line, or change of a field upstream owns
+    (the crates' ownership tables, both directions), on a task mirroring an issue a connection
+    syncs, becomes an approval ask from that connection's sync member with `write_proposed`
+    (hub-work's `propose_write`, once per cause). `before` is upstream's value from the sync
+    state's snapshots; nothing is proposed when upstream already has the value. Only what the hub
+    holds exactly goes back: a title or description is proposed only from a lossless read (the
+    snapshots' `title_lossless` and `body_lossless`), and labels go as the labels added and
+    removed (`label_change`). No connection's sync member's changes ever imply a write;
+  - the **executor** records a denial as not sent; checks an approved write against the task as it
+    is now; reads the issue as upstream has it now before an edit, close or reopen (`reconcile`:
+    a field changed since sends nothing, what upstream holds is not sent again) and looks upstream
+    for the earlier attempt before a retried create or comment (`find_earlier`); then
+    `start_write` (hub-work allows it only for the connection's own member's approval ask
+    answered "Send" by a person, or a person's logged retry request), sends what is left once,
+    with the connection's credential, through `pitcrew_sync_github::write` or
+    `pitcrew_sync_jira::write`; and records the result. A result the store cannot record is kept
+    in memory and recorded first at the next pass; a write still `sending` after that (the daemon
+    stopped mid-send) is finished as failed, never resent by itself; a failed one is sent again
+    only after a person's `POST …/retry`, which hub-work logs as `write_retry_requested`;
   - routes (device only): `GET /v1/writes`, `GET /v1/writes/{id}`, `POST /v1/writes` (create an
     issue from a task, or comment on its issue) and `POST /v1/writes/{id}/retry`.
-- `writes_tests.rs` shows the guarantee with a transport that keeps every request it was sent:
-  nothing before an approval, after a denial, or twice for one approval or one retry.
+- `writes_tests.rs` shows the guarantee with a transport that keeps every request it was sent, over
+  a copy of the fixtures each test can change: nothing before an approval, after a denial, twice
+  for one approval or one retry, over a change upstream made since, or from a lossy copy.
 
 ## Not wired yet
 

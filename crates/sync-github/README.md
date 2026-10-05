@@ -21,11 +21,21 @@ after a person approved it (`crates/daemon/src/integrations/`). The sync only se
   whether it is readable and whether the credential could write (push or admin rights, a classic
   token's broad scopes).
 
-- `write::send(transport, config, write)`: one approved write, sent once: `POST …/issues` (create),
-  `POST …/issues/{n}/comments`, or `PATCH …/issues/{n}` with only the fields it sets (title, body,
-  labels, milestone, `state` and `state_reason`). A refusal's message is capped and stripped of
-  hidden characters; a created issue needs a positive number, and its link is kept only on
-  GitHub's web host. `tests/fixtures/writes.fixture` pins exactly what each write sends.
+- `write::send(transport, config, write)`: one approved write, each request sent once and in
+  order, stopping at a refusal: `POST …/issues` (create), `POST …/issues/{n}/comments`, or an edit:
+  `PATCH …/issues/{n}` with only the fields it sets (title, body, milestone, `state` and
+  `state_reason`), then labels as a change, never the whole list (`POST …/issues/{n}/labels`
+  with those to add, one `DELETE …/labels/{name}` per label to remove; a `404` there is already
+  gone). A refusal's message is capped and stripped of hidden characters; a created issue needs a
+  positive number, and its link is kept only on GitHub's web host. `tests/fixtures/writes.fixture`
+  pins exactly what each write sends.
+- `write::read_issue` (`GET …/issues/{n}`) reads an issue as GitHub has it now, raw, for the hub
+  to compare with what an edit expects just before it is sent; `write::find_earlier` looks for an
+  earlier attempt at a create (the same title and body) or a comment (the same text) created since
+  a time, before either is sent again. Both are one `GET`, and neither is the sync's.
+- `IssueSnapshot::title_lossless` and `body_lossless` say whether the snapshot's title and body are
+  exactly what GitHub sent (nothing hidden stripped, nothing cut): only those are ever written
+  back.
 - The ownership tables say both directions: `FieldOwnership::outward` (`Outward::AskToSend` for the
   fields upstream owns, `AskToCloseOrReopen` for the state, `Never` for the assignee and the
   milestone's own fields), and `outward(table, field)` reads it.

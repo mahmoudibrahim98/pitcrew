@@ -12,6 +12,14 @@ sync on a timer and applies its intents to the hub (`crates/daemon/src/integrati
   sent). Cloud gets Atlassian Document Format text, Data Center plain text. Keys are checked
   before they reach a URL; answers are untrusted (messages capped and stripped, created keys
   checked). `tests/fixtures/writes.fixture` pins exactly what each write sends.
+- Labels change as a change (`update.labels`, `add` and `remove`), never the whole list.
+  `write::read_issue` (`GET …/issue/{key}?fields=…`) reads an issue as Jira has it now, and
+  `write::find_earlier` looks for an earlier create (the same summary and description, reported by
+  the credential's account) or comment (the same text) since a time, before either is sent again.
+- `IssueSnapshot::title_lossless` and `body_lossless`: whether the summary and description were
+  read whole. A description is lossless only as plain text, or as ADF that is exactly plain
+  paragraphs of unformatted text (`change::description_is_lossless`); lists, code, links,
+  mentions and marks make it lossy, and then PitCrew never writes it back.
 - The ownership tables (`ISSUE_FIELD_OWNERSHIP`, `EPIC_FIELD_OWNERSHIP`) say both directions: an
   `Outward` rule per field (ask to send, ask to close or reopen, never).
 - `SyncState::created_from_snapshot(source, epic)` gives an issue that is not done as a first read
