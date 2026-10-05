@@ -92,6 +92,7 @@ test('a reader token reads the routes marked read or agent, and is refused every
     `/v1/machines/${machine}/check`,
     `/v1/machines/${machine}/agents`,
     `/v1/machines/${machine}/agents/claude/sign-in`,
+    `/v1/machines/${machine}/session-options`,
   ]) {
     await expect(403, 'GET', path, undefined, reader);
   }

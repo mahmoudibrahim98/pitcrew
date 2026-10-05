@@ -181,7 +181,7 @@ describe('a reader token', () => {
       for (const path of ['/v1/me/cursors', '/v1/safety', '/v1/import', '/v1/board-drafts', `/v1/sessions/${ID.ses1}/transcript`,
         // Integrations, outward writes and machine setup: device-only reads.
         '/v1/integrations', '/v1/writes', `/v1/machines/${LAPTOP}/check`, `/v1/machines/${LAPTOP}/agents`,
-        `/v1/machines/${LAPTOP}/agents/claude/sign-in`]) {
+        `/v1/machines/${LAPTOP}/agents/claude/sign-in`, `/v1/machines/${LAPTOP}/session-options`]) {
         assert.equal((await call(server, 'GET', path, { token: READER })).status, 403, path);
       }
       for (const [method, path] of [

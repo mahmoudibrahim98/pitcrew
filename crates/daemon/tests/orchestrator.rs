@@ -548,6 +548,7 @@ fn a_stand_in_cli_answers_what_my_agents_did_today_with_working_links_and_cannot
         &format!("/v1/machines/{}/check", id::LAPTOP),
         &format!("/v1/machines/{}/agents", id::LAPTOP),
         &format!("/v1/machines/{}/agents/claude/sign-in", id::LAPTOP),
+        &format!("/v1/machines/{}/session-options", id::LAPTOP),
     ] {
         let reply = daemon.get(path, Some(&reader));
         assert_eq!(reply.status, 403, "GET {path}: {}", reply.body);
