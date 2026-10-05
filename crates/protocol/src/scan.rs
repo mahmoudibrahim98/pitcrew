@@ -104,12 +104,17 @@ pub struct MonthCount {
 /// only: a sub-agent session shares its parent's folder and month, so folding it in would double
 /// those buckets without adding information. Sub-agent sessions are counted once, separately, in
 /// `subagent_sessions`.
+///
+/// A sub-agent counts as one only when its parent session was found too (in the same home), since
+/// it is shown nested under its parent: one whose transcript names no parent, or a parent the scan
+/// did not find, is shown as a session of its own, and counted as one. So these counts are what an
+/// import shows.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct ScanCounts {
-    /// Ordinary (non-sub-agent) sessions found.
+    /// Ordinary sessions found: sessions, and sub-agents whose parent was not found.
     pub sessions: usize,
-    /// Sub-agent sessions found, counted separately.
+    /// Sub-agent sessions found with their parent, counted separately.
     pub subagent_sessions: usize,
     /// Per engine.
     pub by_engine: Vec<EngineCount>,
@@ -130,17 +135,42 @@ pub struct ScanCounts {
     pub last_activity: Option<TimestampMs>,
 }
 
-/// A suggested workstream inside a [`Suggestion`]'s project: either an active sub-folder
-/// (`branch` absent, named after the folder) or a non-default branch (`branch` set, named after
-/// it). A project can suggest both kinds, and a session can count toward one of each.
+/// What a [`WorkstreamSuggestion`] stands for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+#[serde(rename_all = "snake_case")]
+pub enum WorkstreamSuggestionKind {
+    /// The project's default workstream, at its root: a repository's main checkout (named after
+    /// its branch), or a folder without git (named `Main`). Every project suggests exactly one,
+    /// first, so every session under the project has a workstream to be linked to.
+    Main,
+    /// A linked git worktree of the project's repository (`git worktree add`, or a CLI's own,
+    /// such as `.claude/worktrees/<name>`), named after its branch. Its `id` is its folder.
+    Worktree,
+    /// An active first-level sub-folder of the main checkout.
+    Folder,
+    /// A non-default branch checked out in the main checkout (`branch` set).
+    Branch,
+}
+
+/// A suggested workstream inside a [`Suggestion`]'s project: the project's default workstream
+/// (its root), a linked worktree, an active sub-folder of the main checkout (named after the
+/// folder), or a non-default branch of the main checkout (`branch` set, named after it). A
+/// session in a linked worktree counts toward that worktree only; one in the main checkout counts
+/// toward the default workstream, and can count toward one sub-folder and one branch too.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
 pub struct WorkstreamSuggestion {
-    /// Stable within its project. For a sub-folder, the folder's own path (the project's `path`
-    /// joined with `name`, with the machine's separator): also where it is. For a branch,
-    /// `<project path>#<branch>`.
+    /// Stable within its project. For the default workstream, the project's `path`; for a
+    /// worktree, its folder; for a sub-folder, the folder's own path (the project's `path` joined
+    /// with `name`, with the machine's separator). Each of those is also where it is. For a
+    /// branch, `<project path>#<branch>`.
     pub id: String,
-    /// Display name: the folder's name, or the branch.
+    /// What it stands for.
+    pub kind: WorkstreamSuggestionKind,
+    /// Display name: for the default workstream and a worktree, the branch checked out there
+    /// (else the folder's name, or `Main` for a folder without git); a sub-folder's name; or the
+    /// branch.
     pub name: String,
     /// Set for a branch-based suggestion.
     #[serde(default, skip_serializing_if = "Option::is_none")]

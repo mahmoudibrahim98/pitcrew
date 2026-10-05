@@ -157,7 +157,11 @@ title?: string,
 /**
  * New git branch, if it changed.
  */
-branch?: string, } } | { "type": "session_linked", "data": { 
+branch?: string, 
+/**
+ * New model, if the transcript records another one (or its first).
+ */
+model?: string, } } | { "type": "session_linked", "data": { 
 /**
  * The session.
  */

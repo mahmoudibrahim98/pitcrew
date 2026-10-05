@@ -154,6 +154,7 @@ export type { Workstream } from './bindings/Workstream.ts';
 export type { WorkstreamId } from './bindings/WorkstreamId.ts';
 export type { WorkstreamStatus } from './bindings/WorkstreamStatus.ts';
 export type { WorkstreamSuggestion } from './bindings/WorkstreamSuggestion.ts';
+export type { WorkstreamSuggestionKind } from './bindings/WorkstreamSuggestionKind.ts';
 export type { WriteFields } from './bindings/WriteFields.ts';
 export type { WriteFile } from './bindings/WriteFile.ts';
 export type { WriteOperation } from './bindings/WriteOperation.ts';

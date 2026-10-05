@@ -78,6 +78,19 @@ last_activity: number,
  */
 terminal?: TerminalId, 
 /**
- * For a sub-agent's session, the session that started it.
+ * For a sub-agent's session, the session that started it. A sub-agent is shown nested under
+ * its parent, never as an agent of its own; one whose parent could not be found has none,
+ * and is shown as a session of its own.
  */
-parent?: SessionId, };
+parent?: SessionId, 
+/**
+ * The model, as the transcript last recorded it (e.g. `claude-sonnet-4-5`). Absent until the
+ * transcript records one.
+ */
+model?: string, 
+/**
+ * The CLI account home its transcript is in (`~/.claude`, or a `CLAUDE_CONFIG_DIR`,
+ * `CODEX_HOME` or OpenCode data folder): which account ran it, where a machine has several.
+ * `~` stands for the machine user's home. Absent for a session the runner has not read.
+ */
+account?: string, };

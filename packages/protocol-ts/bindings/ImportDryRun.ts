@@ -5,6 +5,11 @@
  */
 export type ImportDryRun = { 
 /**
- * Included indexed sessions.
+ * Included indexed sessions, sub-agents left out: they come with their parents.
  */
-count: number, };
+count: number, 
+/**
+ * Included sub-agent sessions (those with a `parent`), nested under the sessions counted in
+ * `count`.
+ */
+subagents: number, };

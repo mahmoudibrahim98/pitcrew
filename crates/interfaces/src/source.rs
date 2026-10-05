@@ -54,6 +54,13 @@ pub struct SessionMeta {
     pub started: Option<TimestampMs>,
     /// Whether this is a sub-agent's transcript (to be hidden or nested).
     pub is_subagent: bool,
+    /// For a sub-agent, its parent session's own id (the CLI's, as in `native_id`), where the
+    /// transcript names it: Claude's `sessionId` on a sub-agent's records (or the session folder
+    /// above `subagents/`), Codex's `source.subagent.thread_spawn.parent_thread_id`, OpenCode's
+    /// `parent_id`. `None` for a session, or for a sub-agent whose transcript names no parent (a
+    /// Codex review sub-agent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
 }
 
 /// Transcript items are wire types (the API serves them), so they live in the protocol crate.
