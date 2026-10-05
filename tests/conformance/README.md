@@ -11,7 +11,8 @@ Both commands run `onboarding.test.mjs` on its own, then the same `api.test.mjs`
 `files.test.mjs` and `machine-setup.test.mjs`, then `import.test.mjs` on its own, then `integrations.test.mjs` on its own
 (its syncs append events, which the main suite's exact-revision checks must not see), then
 `writes.test.mjs` on its own (it connects the same repository), then `board.test.mjs` on its own
-(board drafts start an agent's CLI and create tasks). Every phase runs, and the first failure
+(board drafts start an agent's CLI and create tasks), and `orchestrator.test.mjs` on its own, last
+(a question starts an agent's CLI too). Every phase runs, and the first failure
 decides the exit code. No npm dependency is needed. The
 daemon runner builds `pitcrewd` and `pitcrew-ptyd` with the locked workspace dependencies, starts a
 seeded demo on an OS-assigned free loopback port, and reads its two private token files without
@@ -89,7 +90,7 @@ Unix-runtime skip; Rust daemon HTTP tests cover Files API routes there.
 
 `run.mjs` runs `import.test.mjs` serially after the shared suite, since committing inclusion affects all views of its disposable hub. Both targets check dry-run/commit agreement, each mode, filters, excluded session/activity/recap reads, restoration, validation and device-only access.
 
-`board.test.mjs` runs on both targets, alone, last ("Board drafts"): the
+`board.test.mjs` runs on both targets, alone, just before the Orchestrator ("Board drafts"): the
 preview's shape, sizes and estimate, and that it stores nothing; a start refused for a stale
 digest, a person or an unknown member as the agent, and while another draft runs; device-only
 routes; only the drafting agent proposes, within the bounds (evidence of another workstream's

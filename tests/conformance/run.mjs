@@ -241,9 +241,10 @@ try {
   // onboarding.test.mjs first, then the main suite, then import.test.mjs, which commits session
   // inclusion (and restores it), then integrations.test.mjs, which syncs, appending events that
   // the main suite's exact-revision checks must not see, then writes.test.mjs on its own (it
-  // connects the same repository integrations.test.mjs does), and board.test.mjs last: board
-  // drafts start an agent's CLI (a stand-in on the daemon) and create tasks. Every phase runs; the
-  // first failure decides the exit code.
+  // connects the same repository integrations.test.mjs does), then board.test.mjs: board drafts
+  // start an agent's CLI (a stand-in on the daemon) and create tasks, and orchestrator.test.mjs
+  // last: the Orchestrator starts an agent's CLI too, and ends it. Every phase runs; the first
+  // failure decides the exit code.
   for (const files of [
     ['tests/conformance/onboarding.test.mjs'],
     [
@@ -256,6 +257,7 @@ try {
     ['tests/conformance/integrations.test.mjs'],
     ['tests/conformance/writes.test.mjs'],
     ['tests/conformance/board.test.mjs'],
+    ['tests/conformance/orchestrator.test.mjs'],
   ]) {
     suite = spawn(process.execPath, ['--test', ...files], {
       cwd: root,
@@ -265,12 +267,6 @@ try {
     const [code] = await once(suite, 'exit');
     suite = undefined;
     process.exitCode = process.exitCode || (code ?? 1);
-  }
-  {
-    // The Orchestrator starts an agent's CLI too, and ends it: run alone, last.
-    suite = spawn(process.execPath, ['--test', 'tests/conformance/orchestrator.test.mjs'], { cwd: root, env, stdio: 'inherit' });
-    const [orchestratorCode] = await once(suite, 'exit');
-    process.exitCode = process.exitCode || (orchestratorCode ?? 1);
   }
 } finally {
   await cleanup();
