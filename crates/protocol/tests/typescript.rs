@@ -328,6 +328,48 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
             mode: runner::EndMode::Graceful,
         },
     )?;
+    // A board draft waiting for review: optional fields omitted, the proposal's included.
+    fixture(
+        &config,
+        &mut examples,
+        "boardDraft",
+        pitcrew_protocol::board::BoardDraft {
+            id: "01J00000000000000000000000".parse()?,
+            workstream: "01J00000000000000000000000".parse()?,
+            agent: "01J00000000000000000000000".parse()?,
+            engine: model::Engine::Claude,
+            session: "01J00000000000000000000000".parse()?,
+            by: "01J00000000000000000000000".parse()?,
+            prompt: "draft-board/v1".into(),
+            cost: pitcrew_protocol::board::DraftCost {
+                sessions: 1,
+                sessions_left_out: 0,
+                tasks: 0,
+                summary_bytes: 300,
+                prompt_bytes: 2400,
+                redacted: 0,
+                estimate: pitcrew_protocol::board::UsageEstimate {
+                    input_tokens: 15_600,
+                    output_tokens: 8192,
+                },
+            },
+            started: 42,
+            state: pitcrew_protocol::board::DraftState::Proposed,
+            proposal: Some(pitcrew_protocol::board::BoardProposal {
+                tasks: vec![pitcrew_protocol::board::ProposedTask {
+                    title: "Synthetic task".into(),
+                    status: model::TaskStatus::Todo,
+                    description: None,
+                    evidence: vec!["01J00000000000000000000000".parse()?],
+                }],
+                note: None,
+            }),
+            proposed: Some(43),
+            reviewed: None,
+            accepted: Vec::new(),
+            rejected: Vec::new(),
+        },
+    )?;
     // Request dimensions may be omitted even though Rust serializes their defaults.
     examples.push_str(
         "export const allImport: import('../index.ts').ImportFilter = { mode: 'all' };\n",

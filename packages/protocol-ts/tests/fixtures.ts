@@ -133,5 +133,42 @@ export const command: import('../index.ts').RunnerCommand = {
   "session": "01J00000000000000000000000",
   "type": "end_session"
 };
+export const boardDraft: import('../index.ts').BoardDraft = {
+  "accepted": [],
+  "agent": "01J00000000000000000000000",
+  "by": "01J00000000000000000000000",
+  "cost": {
+    "estimate": {
+      "input_tokens": 15600,
+      "output_tokens": 8192
+    },
+    "prompt_bytes": 2400,
+    "redacted": 0,
+    "sessions": 1,
+    "sessions_left_out": 0,
+    "summary_bytes": 300,
+    "tasks": 0
+  },
+  "engine": "claude",
+  "id": "01J00000000000000000000000",
+  "prompt": "draft-board/v1",
+  "proposal": {
+    "tasks": [
+      {
+        "evidence": [
+          "01J00000000000000000000000"
+        ],
+        "status": "todo",
+        "title": "Synthetic task"
+      }
+    ]
+  },
+  "proposed": 43,
+  "rejected": [],
+  "session": "01J00000000000000000000000",
+  "started": 42,
+  "state": "proposed",
+  "workstream": "01J00000000000000000000000"
+};
 export const allImport: import('../index.ts').ImportFilter = { mode: 'all' };
 export const filteredImport: import('../index.ts').ImportFilter = { mode: 'filtered', since: '2026-01-01' };

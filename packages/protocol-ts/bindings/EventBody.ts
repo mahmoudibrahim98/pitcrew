@@ -6,6 +6,10 @@ import type { BriefTarget } from "./BriefTarget.ts";
 import type { Dispatch } from "./Dispatch.ts";
 import type { DispatchId } from "./DispatchId.ts";
 import type { DispatchOutcome } from "./DispatchOutcome.ts";
+import type { DraftCost } from "./DraftCost.ts";
+import type { DraftId } from "./DraftId.ts";
+import type { DraftedTask } from "./DraftedTask.ts";
+import type { Engine } from "./Engine.ts";
 import type { Health } from "./Health.ts";
 import type { LinkBasis } from "./LinkBasis.ts";
 import type { Liveness } from "./Liveness.ts";
@@ -16,6 +20,7 @@ import type { MemberId } from "./MemberId.ts";
 import type { Mover } from "./Mover.ts";
 import type { Persona } from "./Persona.ts";
 import type { Project } from "./Project.ts";
+import type { ProposedTask } from "./ProposedTask.ts";
 import type { Receipt } from "./Receipt.ts";
 import type { SafetySettings } from "./SafetySettings.ts";
 import type { Session } from "./Session.ts";
@@ -334,4 +339,64 @@ why?: string,
 /**
  * Evidence.
  */
-receipts: Array<Receipt>, } };
+receipts: Array<Receipt>, } } | { "type": "board_draft_started", "data": { 
+/**
+ * The draft.
+ */
+draft: DraftId, 
+/**
+ * The workstream it drafts.
+ */
+workstream: WorkstreamId, 
+/**
+ * The agent drafting it.
+ */
+agent: MemberId, 
+/**
+ * The CLI it runs in.
+ */
+engine: Engine, 
+/**
+ * The session it runs in.
+ */
+session: SessionId, 
+/**
+ * The prompt's name and version.
+ */
+prompt: string, 
+/**
+ * What was sent, and the estimate the person confirmed.
+ */
+cost: DraftCost, } } | { "type": "board_proposed", "data": { 
+/**
+ * The draft.
+ */
+draft: DraftId, 
+/**
+ * Its workstream.
+ */
+workstream: WorkstreamId, 
+/**
+ * The proposed tasks.
+ */
+tasks: Array<ProposedTask>, 
+/**
+ * The agent's note.
+ */
+note?: string, } } | { "type": "board_draft_reviewed", "data": { 
+/**
+ * The draft.
+ */
+draft: DraftId, 
+/**
+ * Its workstream.
+ */
+workstream: WorkstreamId, 
+/**
+ * The proposed tasks accepted, and the tasks they became.
+ */
+accepted: Array<DraftedTask>, 
+/**
+ * The proposed tasks rejected.
+ */
+rejected: Array<number>, } };

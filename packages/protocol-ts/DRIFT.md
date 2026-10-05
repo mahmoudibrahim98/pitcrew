@@ -21,10 +21,10 @@ recap fact discriminants and UTF-8 span ranges. No UI declaration or wire format
 
 **Board drafts** (2026-10, brief 0-draft-board): `EventBody` gained `board_draft_started`,
 `board_proposed` and `board_draft_reviewed`, and `BoardDraft`, `DraftPreview`, `DraftReviewed` and
-their parts are new. The UI's `data/types.ts` does not list them (stream L's): the data layer
-treats an event type it does not know as newer than itself and refetches everything, and the
-projects views declare the board types they use in `apps/ui/src/projects/board-drafts.ts`, the same
-shapes as the generated ones.
+their parts are new. The UI's `data/types.ts` lists the three events (their payloads' board parts
+from these bindings) and `data/invalidation.ts` refreshes the drafts' queries on them; the projects
+views declare the board types they use in `apps/ui/src/projects/board-drafts.ts`, the same shapes
+as the generated ones.
 
 ## Different names and missing declarations
 
