@@ -274,3 +274,21 @@ A workstream's **Start session** opens the console's shared New session dialog w
 machine and folder prefilled from the workstream's locations. Multiple locations remain
 selectable. The console owns launching and opens the resulting session's terminal in the
 workbench; this entry does not register another shell create item.
+
+## Creation dialogs
+
+`new-entities.tsx` owns Project, Agent, Team and contextual Workstream entries. Project suggests an
+editable key, validates an absolute root for the selected machine's reported platform (WSL uses
+Unix paths), and accepts an optional first workstream. Before a machine reports its platform,
+only structurally absolute Unix/drive/UNC forms are accepted. The optional workstream is committed
+atomically by `POST /v1/projects`; standalone creation uses `POST /v1/workstreams`. Success refreshes
+lists and opens the new project/workstream. Agent and Team refresh Members' recipe/team sections
+without a reload; newly created personas have owned agent members selectable in teams. Errors
+stay in the form. All modal/focus behavior belongs to the shell; pending submissions are disabled.
+
+Run `corepack pnpm --filter @pitcrew/ui exec playwright test -c
+src/projects/tests/e2e/create-dialogs.config.ts` for both themes, validation, live lists, palette,
+focus and axe. `E2E_HUB_URL` and `E2E_HUB_TOKEN` select a disposable real demo hub for the same tests;
+defaults start the mock hub. `tests/create-dialogs.test.tsx` covers the forms and platform roots.
+
+Directory creation uses friendly engine handles, ownership-checked persona edits, and runner-safe model/permission values. Dispatch lists and accepts only persona-linked agents. Every successful scan provisions missing owned agents idempotently. Local setup records OS/architecture and local project roots must be absolute on that platform. Creation dialogs focus Name; tasks default to the current project and filter its workstreams.

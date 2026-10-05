@@ -255,3 +255,15 @@ Session starts apply the workspace safety default when permission mode is omitte
 title controls before trimming, refuse non-local machines with 503, and link an explicit
 workstream immediately (manual basis). Session options include first-prompt constraints; the
 synthetic Unix CLIs have none.
+
+Directory writes (`POST /v1/personas`, `PUT /v1/personas/{id}`, `POST /v1/teams`,
+`PUT /v1/teams/{id}`) mirror the hub's device-only validation, generated ids, events, caller-owned
+agent member creation and linked-member rename. Unknown team members are refused before mutation.
+`POST /v1/projects` accepts an optional `first_workstream` name and creates both objects together.
+Both conformance targets run the same directory and atomic-project cases.
+
+A completed setup scan provisions one owned agent/persona per detected engine, matching the
+real hub. Repeated scans reuse them; a disconnected scan creates none. Fresh setup tests dispatch
+tasks through each generated agent.
+
+Directory creation uses friendly engine handles, ownership-checked persona edits, and runner-safe model/permission values. Dispatch lists and accepts only persona-linked agents. Every successful scan provisions missing owned agents idempotently. Local setup records OS/architecture and local project roots must be absolute on that platform. Creation dialogs focus Name; tasks default to the current project and filter its workstreams.

@@ -2,7 +2,7 @@
 // and sessions from the live query cache, plus the features' commands and "+ New" items. Keyboard
 // first (the ARIA combobox pattern); results are virtualised. Loaded on demand.
 
-import { useRouter } from '@tanstack/react-router';
+import { useParams, useRouter } from '@tanstack/react-router';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { useId, useRef, useState, type KeyboardEvent } from 'react';
 import { useProjects, useSessions, useTasks, useWorkstreams } from '../data/index.ts';
@@ -59,6 +59,7 @@ function useItems(opener: Element | null): Item[] {
   const ws = useWorkspaceId();
   const layout = useLayout();
   const registry = useRegistry();
+  const { project }: { project?: string } = useParams({ strict: false });
   const setCreating = useShell((s) => s.setCreating);
   const projects = useProjects().data ?? [];
   const workstreams = useWorkstreams().data ?? [];
@@ -87,7 +88,7 @@ function useItems(opener: Element | null): Item[] {
         run: () => c.run(context),
       })),
     ...registry.create
-      .filter((e) => e.disabled === undefined)
+      .filter((e) => e.disabled === undefined && (!e.projectContext || project !== undefined))
       .map<Item>((e) => ({
         id: `create:${e.id}`,
         kind: 'create',

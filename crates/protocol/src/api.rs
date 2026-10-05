@@ -9,8 +9,8 @@
 use crate::events::Event;
 use crate::ids::{MemberId, ProjectId, ProjectKey, WorkstreamId};
 use crate::model::{
-    Date, Location, Machine, MachineInfo, Member, Priority, ProjectStatus, TaskStatus, TimestampMs,
-    Workspace, WorkstreamStatus,
+    Date, Engine, Location, Machine, MachineInfo, Member, PermissionMode, Priority, ProjectStatus,
+    TaskStatus, TimestampMs, Workspace, WorkstreamStatus,
 };
 use crate::runner::Capability;
 use serde::{Deserialize, Serialize};
@@ -254,6 +254,10 @@ pub struct NewProject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "ts", ts(optional))]
     pub root: Option<Location>,
+    /// Optional first workstream, committed atomically with the project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub first_workstream: Option<String>,
 }
 
 /// `POST /v1/workstreams`: a new workstream in a project. The hub assigns the id; its health
@@ -359,4 +363,37 @@ pub enum StreamFrame {
         /// Server time.
         at: TimestampMs,
     },
+}
+
+/// Editable fields of an agent recipe; the hub assigns the id.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct PersonaEdit {
+    /// Display name.
+    pub name: String,
+    /// CLI engine.
+    pub engine: Engine,
+    /// Optional model identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub model: Option<String>,
+    /// Optional standing instructions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "ts", ts(optional))]
+    pub instructions: Option<String>,
+    /// CLI permission policy, explicitly selected by the person.
+    #[serde(default)]
+    pub permission_mode: PermissionMode,
+}
+
+/// Editable fields of a team; references are member ids, not persona ids.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS))]
+pub struct TeamEdit {
+    /// Display name.
+    pub name: String,
+    /// Lead, always included in members.
+    pub lead: MemberId,
+    /// Existing people or agents.
+    pub members: Vec<MemberId>,
 }

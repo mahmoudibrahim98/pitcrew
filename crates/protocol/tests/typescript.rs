@@ -70,6 +70,8 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
     api::SessionEngine::export_all(&config)?;
     api::HostRole::export_all(&config)?;
     api::NewProject::export_all(&config)?;
+    api::PersonaEdit::export_all(&config)?;
+    api::TeamEdit::export_all(&config)?;
     api::NewTask::export_all(&config)?;
     api::NewWorkstream::export_all(&config)?;
     api::Setup::export_all(&config)?;
