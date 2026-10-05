@@ -108,12 +108,17 @@ const stream = new WebSocket('ws://127.0.0.1:47317/v1/stream?since=15', [
   Codex read as installed, OpenCode not. It never times out or cuts an answer.
 - **Board drafts** (`src/board.ts`, api-v1.md "Board drafts"): the preview builds the summary as
   the hub does (the hub's own template from `crates/office/prompts/`, the same bounds, and the
-  redaction rules ported), from the workstream's sessions and the recaps fixture; a start needs the
-  preview's digest and one of the caller's own agents, and runs a simulated session; only the
-  draft's agent proposes; a review creates the accepted tasks, labelled `drafted`, and nothing
-  else. The mock plays the back office: a draft run by `@office` (the default agent) gets a
-  synthetic proposal, a task per session it summarised, once its session works; a draft run by
-  any other agent waits for that agent's proposal (`dev-agent-token` is @writer's).
+  redaction and path rules ported), from the workstream's sessions and the recaps fixture, and
+  keeps the workstream's latest preview 10 minutes; a start sends that preview (else needs the
+  prompt's digest now) with one of the caller's own agents, and runs a simulated session on the
+  local machine in a private folder (`~/.cache/pitcrew/scratch/<session>`), with one line as its
+  first prompt; it mints the draft a **session token** (`pcs_…`, in memory; also written to
+  `<sessionTokenDir>/<session>.token` when the server is started with `sessionTokenDir`, or
+  `PITCREW_MOCK_SESSION_TOKENS` from the command line). Only that token proposes (`dev-agent-token`
+  is refused), and it reaches no other route (`session` routes only); the proposal revokes it and
+  ends the session, as does 30 minutes. A review creates the accepted tasks, labelled `drafted`,
+  and nothing else. The mock plays the back office: a draft run by `@office` (the default agent)
+  gets a synthetic proposal, a task per session it summarised, once its session works.
 - **Creating projects and workstreams** (`POST /v1/projects`, `POST /v1/workstreams`) with the
   contract's defaults; a project key already in use is 409, an unknown project for a workstream 404.
 - **The machine scan** (`POST /v1/machines/{id}/scan`): a fixed synthetic report (14 sessions in
@@ -263,4 +268,26 @@ only in memory. Remote and WSL locations return 501. No filesystem paths are ope
 
 Session import implements all/filtered/start-fresh rules in memory on the three `/v1/import` routes. Session lists, activity and stream delivery share inclusion; affected recap day paragraphs are reconstructed from retained fixture block lines. The mock still computes no new recap blocks for mutations.
 
+Session-options advertises the mock local machine's three synthetic CLIs and supported modes
+(Claude plan/accept-edits, Codex accept-edits, OpenCode default; bypass disabled). Unreachable
+machines return 503. Session start accepts and validates an optional title and returns its
+synthetic terminal without waiting for a transcript, matching the real daemon's launch flow.
+
 Onboarding hooks use synthetic in-memory configuration text, person/machine-bound previews, stale refusal and idempotent confirmation. The mock never opens agent homes. Device-only safety read/save validates the same settings as the daemon and appends `safety_changed` on change.
+
+Session starts apply the workspace safety default when permission mode is omitted, reject raw
+title controls before trimming, refuse non-local machines with 503, and link an explicit
+workstream immediately (manual basis). Session options include first-prompt constraints; the
+synthetic Unix CLIs have none.
+
+Directory writes (`POST /v1/personas`, `PUT /v1/personas/{id}`, `POST /v1/teams`,
+`PUT /v1/teams/{id}`) mirror the hub's device-only validation, generated ids, events, caller-owned
+agent member creation and linked-member rename. Unknown team members are refused before mutation.
+`POST /v1/projects` accepts an optional `first_workstream` name and creates both objects together.
+Both conformance targets run the same directory and atomic-project cases.
+
+A completed setup scan provisions one owned agent/persona per detected engine, matching the
+real hub. Repeated scans reuse them; a disconnected scan creates none. Fresh setup tests dispatch
+tasks through each generated agent.
+
+Directory creation uses friendly engine handles, ownership-checked persona edits, and runner-safe model/permission values. Dispatch lists and accepts only persona-linked agents. Every successful scan provisions missing owned agents idempotently. Local setup records OS/architecture and local project roots must be absolute on that platform. Creation dialogs focus Name; tasks default to the current project and filter its workstreams.

@@ -14,7 +14,7 @@
 //!   sessions, for the runner link);
 //! - board drafts: an agent drafts a workstream's board from its history, and nothing is created
 //!   until a person accepts it ([`WorkService::start_draft`]; the routes are
-//!   [`board_agent_routes`] and [`board_device_routes`], mounted apart from the others);
+//!   [`board_session_routes`] and [`board_device_routes`], mounted apart from the others);
 //! - the Orchestrator panel's conversations: a person's questions, answered by an agent CLI they
 //!   use with a token that may only read, followed from its transcript
 //!   ([`WorkService::ask_orchestrator`], [`WorkService::follow_orchestrator`]; the routes are
@@ -85,6 +85,7 @@ mod board_routes;
 mod codec;
 mod commands;
 mod cursors;
+mod directory;
 mod dispatch;
 mod edits;
 mod error;
@@ -106,11 +107,11 @@ mod sync;
 pub mod writes;
 
 pub use activity::EventRefs;
-pub use board_routes::{board_agent_routes, board_device_routes};
+pub use board_routes::{board_device_routes, board_session_routes};
 pub use commands::{AnswerAsk, BriefEdit, NewAsk, NewComment, SessionLink, WorkstreamPatch};
 pub use dispatch::{
-    DispatchError, DispatchRequest, Dispatcher, ENDED_WITHOUT_REPORT, MAX_BRIEF, NEVER_STARTED,
-    NewDispatch, RecordedStart, SessionRequest,
+    CONFINED_BRIEF, Confinement, DispatchError, DispatchRequest, Dispatcher, ENDED_WITHOUT_REPORT,
+    MAX_BRIEF, NEVER_STARTED, NewDispatch, PROMPT_FILE, RecordedStart, SessionRequest,
 };
 pub use edits::{LABEL_CHARS, MAX_LABELS, TITLE_CHARS};
 pub use error::{INTERNAL_MESSAGE, Result, WorkError};
@@ -139,3 +140,5 @@ pub use writes::WriteFilter;
 
 /// The protocol version this crate was built against.
 pub const PROTOCOL_VERSION: u32 = pitcrew_protocol::PROTOCOL_VERSION;
+
+pub use pitcrew_protocol::api::{PersonaEdit, TeamEdit};

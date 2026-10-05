@@ -102,9 +102,9 @@ export const feature = defineFeature({
   id: 'console',
   layout: 'console',
   routes,
+  create: [{ id: 'session', label: 'Session', dialog: lazy(() => import('./new-session.tsx')) }],
   // The shell's own "Agent console" entry (with its working and waiting counts) is the console's
-  // place in the sidebar; the console adds none of its own. No "+ New" item yet: starting a
-  // session needs a flow that does not exist, and an entry cannot be shown disabled with a reason.
+  // place in the sidebar; the console adds none of its own.
   commands: [...commands.map((command): Command => ({ ...command, layout: 'both' })), ...workbenchCommands],
 });
 

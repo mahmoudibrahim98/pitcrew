@@ -92,6 +92,8 @@ pub struct WorkService {
     pub(crate) import: Mutex<crate::import::ImportState>,
     /// The Orchestrator's conversations (see [`crate::orchestrator`]).
     pub(crate) orchestrator: Mutex<crate::orchestrator::OrchestratorState>,
+    /// Each workstream's latest board-draft preview, for its start (see `crate::board`).
+    pub(crate) previews: Mutex<crate::board::Previews>,
 }
 
 impl std::fmt::Debug for WorkService {
@@ -123,6 +125,7 @@ impl WorkService {
             working: Mutex::new(HashSet::new()),
             import: Mutex::default(),
             orchestrator: Mutex::default(),
+            previews: Mutex::default(),
         }
     }
 
@@ -289,7 +292,7 @@ impl WorkService {
     pub(crate) fn by(&self, caller: &Caller, body: EventBody) -> Event {
         // A reader writes nothing (the API refuses it first); were it to, it acts for its owner.
         let on_behalf_of = match caller.scope {
-            TokenScope::Agent | TokenScope::Reader => caller.on_behalf_of,
+            TokenScope::Agent | TokenScope::Reader | TokenScope::Session(_) => caller.on_behalf_of,
             TokenScope::Device => None,
         };
         self.event(caller.member, on_behalf_of, body)

@@ -38,8 +38,13 @@ planted by another user never receives a token:
   [`pitcrew-auth`](../auth/README.md) for how routes read it.
 - Failures are `ApiError` bodies: `401 unauthorized` (none, unknown, revoked, or not `Bearer`),
   `403 forbidden` (an agent on a device route; a reader's request that is not a plain `GET` or
-  `HEAD`, or is a WebSocket upgrade, refused before routing), `404 not_found` (unknown route or
-  method).
+  `HEAD`, or is a WebSocket upgrade, refused before routing; a session token on any route not
+  mounted with `RouterParts::session`), `404 not_found` (unknown route or method).
+- `RouterParts`: `agent` routes take device, agent and reader tokens (session tokens get `403`,
+  by `pitcrew_auth::no_session`); `read` routes take device and reader tokens; `session` routes
+  take every scope, session tokens included, and check themselves that one answers only for its
+  own session (api-v1.md's **session** routes: today a board draft's proposal); `device` routes
+  take device tokens only. Unmarked routes are device-only, so forgetting fails closed.
 
 ## Live updates: `GET /v1/stream?since=`
 
@@ -198,6 +203,7 @@ let parts = RouterParts::new()
     .agent(pitcrew_api::hooks::routes(hooks))
     .agent(hub_work::agent_routes())    // routes marked **agent** in api-v1.md
     .read(hub_work::read_routes())      // device routes a reader may GET (marked **read**)
+    .session(hub_work::board_session_routes()) // routes marked **session**: a draft's proposal
     .device(pitcrew_api::stream::routes(source.clone(), StreamConfig::default()))
     .read(pitcrew_api::Activity::new(source).with_refs(refs).routes())
     .read(pitcrew_api::Recaps::new(recap_source).routes())

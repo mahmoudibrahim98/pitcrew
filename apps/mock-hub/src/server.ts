@@ -68,6 +68,12 @@ export interface ServerOptions {
    * `fixtures/`. It is read again at each sync, so a test can change what "upstream" says.
    */
   integrationFixtures?: string;
+  /**
+   * A private folder where each board draft's session token is also written, as
+   * `<session>.token`, as the hub gives it to the draft's CLI: for the conformance suite, which
+   * proposes as that CLI would. Unset, the tokens stay in memory only.
+   */
+  sessionTokenDir?: string;
 }
 
 export interface RunningServer {
@@ -90,6 +96,7 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
     options.fresh === true ? undefined : loadRecaps(RECAPS),
   );
   if (options.integrationFixtures !== undefined) integrations.useFixtures(hub, options.integrationFixtures);
+  hub.sessionTokenDir = options.sessionTokenDir;
   const log = options.log ?? ((): void => {});
   const sockets = new Set<WebSocketConnection>();
   const server = createServer((req, res) => {
@@ -292,6 +299,7 @@ function send(res: ServerResponse, reply: Reply): void {
     // A client that went away misses the rest; the route's work goes on to its end regardless.
     const open = (): boolean => !res.destroyed && !res.writableEnded;
     reply.stream.start({
+      canceled: () => !open(),
       write: (line) => {
         if (open()) res.write(line);
       },
@@ -473,6 +481,9 @@ async function main(): Promise<void> {
     scanWindow: parseScanWindow(process.env['PITCREW_MOCK_SCAN_WINDOW']),
     fresh,
     log: (line) => console.log(line),
+    // A folder where board drafts' session tokens are also written, for tests that propose as a
+    // draft's CLI would.
+    ...(process.env['PITCREW_MOCK_SESSION_TOKENS'] ? { sessionTokenDir: process.env['PITCREW_MOCK_SESSION_TOKENS'] } : {}),
   });
   console.log(`PitCrew mock hub on ${server.url}`);
   if (fresh) {

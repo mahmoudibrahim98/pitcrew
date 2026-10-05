@@ -101,7 +101,8 @@ export type HostRole = (typeof HOST_ROLES)[number];
 export const CAPABILITIES = ['tmux', 'pty', 'slurm', 'watch', 'scan'] as const;
 export type Capability = (typeof CAPABILITIES)[number];
 
-export const TOKEN_SCOPES = ['device', 'agent', 'reader'] as const;
+/** The mock's token kinds: a session token (`pcs_…`) also names its session (`Caller.session`). */
+export const TOKEN_SCOPES = ['device', 'agent', 'reader', 'session'] as const;
 export type TokenScope = (typeof TOKEN_SCOPES)[number];
 
 export const ERROR_CODES = [

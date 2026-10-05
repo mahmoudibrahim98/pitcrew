@@ -349,12 +349,16 @@ enum RecapCommand {
 
 #[derive(Debug, Subcommand)]
 enum BoardCommand {
-    /// Propose the board a draft asks for: JSON on stdin, `{"tasks": [{"title", "status",
-    /// "description", "evidence"}], "note"}`. Nothing is created until a person reviews it.
+    /// Propose the board a draft asks for: JSON, `{"tasks": [{"title", "status", "description",
+    /// "evidence"}], "note"}`, from a file (`--file proposal.json`) or on stdin. Nothing is created
+    /// until a person reviews it. Only the token the draft's session was given may.
     Submit {
         /// The draft's id (drf_…), as the prompt names it.
         #[arg(value_parser = draft_arg)]
         draft: String,
+        /// The file holding the proposal; `-` (or no `--file`) reads it from stdin.
+        #[arg(long, value_name = "PATH")]
+        file: Option<std::path::PathBuf>,
     },
 }
 
@@ -486,6 +490,11 @@ pub fn run(args: Vec<OsString>, env: Env<'_>, io: &mut Io<'_>) -> i32 {
 fn execute(command: Command, env: Env<'_>, io: &mut Io<'_>, json: bool) -> Result<()> {
     let client = client::Client::from_env(env, Timeouts::VERB)?;
     client.check_version()?;
+    // A draft's proposal is sent with the session token its run was given, which may do nothing
+    // else, not even say whose it is (`GET /v1/me`): the daemon checks it on the route.
+    if let Command::Board(BoardCommand::Submit { draft, file }) = &command {
+        return verbs::board_submit(client, io, json, draft, file.as_deref());
+    }
     let mut verb = verbs::Verb::connect(client, io, json)?;
     match command {
         Command::Whoami => verb.whoami(),
@@ -517,7 +526,6 @@ fn execute(command: Command, env: Env<'_>, io: &mut Io<'_>, json: bool) -> Resul
         }),
         Command::Reply { ask, text, option } => verb.reply(&ask, &text, option),
         Command::Check => verb.check(),
-        Command::Board(BoardCommand::Submit { draft }) => verb.board_submit(&draft),
         Command::Session(SessionCommand::List {
             since,
             state,
@@ -538,8 +546,8 @@ fn execute(command: Command, env: Env<'_>, io: &mut Io<'_>, json: bool) -> Resul
         }
         Command::Activity { scope, limit } => verb.activity(&scope.into(), limit),
         Command::Search { words } => verb.search(&words),
-        // Handled in `run`, before the client ever connects.
-        Command::Hook { .. } | Command::Hooks(_) => Ok(()),
+        // Handled above, and in `run`, before the client ever connects.
+        Command::Board(_) | Command::Hook { .. } | Command::Hooks(_) => Ok(()),
     }
 }
 

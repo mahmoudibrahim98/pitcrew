@@ -191,8 +191,31 @@ before the dispatch's CLI starts.
   Startup refresh keeps the terminal row of a runner-started CLI with a session even when the
   runtime no longer lists its id. That row preserves provenance: an indexed dispatched session
   still answers `Exited` if its CLI disappeared while the daemon was down. Hand-linked terminals
-  and unclaimed starts retain the usual refresh behavior; no missing terminal is followed by its
+  and anonymous terminals without a hub session retain the usual refresh behavior; no missing terminal is followed by its
   old target. Imported transcripts never acquire this exit evidence.
+
+## Confined runs
+
+A `StartSession` with `confined` (a run the hub starts on its own behalf: a board draft's, the
+Orchestrator's later) starts its CLI in that CLI's **confined, read-mostly shape**, whatever the
+person's own settings for the CLI say (`start_spec`). The hub has prepared `cwd`, a fresh private
+folder holding the run's `prompt.md` and the CLI's settings files, and `brief` is one plain line
+telling the CLI to read `prompt.md`. Its permission mode must be `default` and it never resumes,
+or the start is refused:
+
+- **Claude Code**: `--permission-mode=default --setting-sources=project --strict-mcp-config`.
+  Only the folder's `.claude/settings.json` is read (no user or local settings, so no user hooks,
+  allow rules or bypass default), and no MCP server is started.
+- **Codex**: `--sandbox=read-only --ask-for-approval=on-request --config=web_search=disabled`. Its
+  commands can read but neither write nor reach the network (Unix sockets and loopback included:
+  checked with Codex 0.160 on Linux), unless the person approves one in its terminal. Codex 0.160
+  rejects `untrusted` (as a flag and as `approval_policy`), so `on-request` is the strictest it
+  accepts.
+- **OpenCode**: no flag; the folder's `opencode.json` is its confinement. Refused on Windows: its
+  commands run in `cmd.exe`, which cannot pass the proposal on standard input, and its edits are
+  denied.
+
+Every argument of a confined launch passes a Windows `.cmd` shim (no `" % ! ^ & | < > ( )`).
 
 ## File discovery and cursors
 
@@ -368,3 +391,35 @@ now), and an optional field says what caused a state change, e.g. on `session_st
 delivered the events, and the cause is better recorded as what it is. A also cannot cover the
 remote runner, which is where hooks from many agents on a cluster will come from. Until B lands,
 hook-caused state stays authored as the session's person.
+
+## Active state leases
+
+Working and Starting expire to Idle after five minutes without a transcript write or accepted
+hook. Waiting and sessions with open tool calls get sixty minutes: permission decisions and long
+silent builds/tests commonly exceed five minutes, but abandoned prompts and interrupted tools
+must still become idle within a bounded time. Completing the calls restores the five-minute lease.
+A known live terminal keeps the session active regardless of the lease. If listing terminals or
+reading their links fails, expiry is skipped and that unknown result is not cached. Deleted
+transcripts emit Idle when no terminal is alive; unknown/live terminals are checked again on the
+next sweep. Restart applies the same rules to missing files, including previously marked gone rows.
+Existing safety
+sweeps apply expiry (30 seconds locally, 120 seconds on network homes), and first discovery
+normalizes old transcripts before publishing them. Ended/Unreachable are preserved. Expiry
+clears a stale status line but does not advance reported_at, so a later transcript turn works
+normally. No transcript is rewritten. Inactive rows stay unloaded during subsequent checks;
+terminal liveness is a bounded list call cached for at most 30 seconds. The daemon supplies
+`RunnerConfig::with_runtime` before the watcher starts, so an old transcript with a live terminal
+is not expired during the startup gap before command routes attach.
+
+`RunnerCommands::session_options` detects executable CLIs on PATH without executing them and
+reports launch-supported modes, including bypass only where enabled. `set_title` stores a
+person's title in the separate session_titles table (migration 0004); adoption and restart apply
+it over the transcript's title.
+
+Personal starts (no agent or task) use `run_unclaimed` and persist `terminals.unclaimed` in migration
+0005. Their terminal stays associated with the returned session without the named dispatch's
+15-minute transcript deadline or exclusive folder claim; a late transcript can adopt that id.
+Named dispatches retain their deadlines, scoped exit scans, closed folder claims and terminal names.
+`check_start` checks argument construction, bypass policy, the executable on PATH and named folder
+conflicts before the daemon records a session. Windows batch-wrapper options expose unsupported
+first-prompt characters; preflight refuses them with a plain validation error, without launching.

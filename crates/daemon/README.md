@@ -527,14 +527,11 @@ would go the same way (the runtime's README: call it from a blocking thread).
 | `POST /v1/sessions/{id}/interrupt` | Escape. |
 | `POST /v1/sessions/{id}/end` | `graceful`: Ctrl-C twice, then waits up to 10 seconds for the CLI to exit; `kill`: SIGTERM to its process group, SIGKILL half a second later, and the window closes. Either reports the session ended (`session_ended`). |
 
-- **Starting.** The runner learns a session's id only when the CLI writes its transcript; Claude
-  is started with a session id of the runner's choosing (`--session-id`), so the match is exact,
-  and other CLIs are matched by folder and start time. So `POST /v1/sessions` starts the CLI,
-  waits up to 30 seconds for the runner to discover its session in that terminal (asking it to
-  look again after 1, 3, 7 and 15 seconds), and answers `202` with the session as the hub stores
-  it (`terminal` set). If it does not appear (Claude writes its transcript at its first prompt, so
-  a start without a brief waits for a person), it answers `503` saying so: the CLI keeps running
-  in its terminal, and its session appears on the stream once its transcript does.
+- **Starting.** The hub stores every session before launch. A successful start answers `202`
+  with its terminal immediately, including when no first prompt or transcript exists. Claude's
+  transcript is matched by the chosen native id; Codex and OpenCode by folder and start time.
+  Each transcript adopts the recorded session's id. A person's optional title is stored in the
+  runner index, separate from the transcript, and survives adoption and restart.
 - **With `agent` or `task`** the hub stores the session first (state `starting`, the agent
   named, linked to the task with `link_basis: manual`; `400` for an unknown agent or task, or a
   person as the agent; `403` for an agent the caller does not own), and the runner starts the CLI
@@ -660,12 +657,52 @@ The queue, per-agent concurrency, hand-off, and runners on other machines (over 
 link) are not part of this.
 
 **Board drafts** (api-v1.md, "Board drafts"; hub-work's `crate::board`) start their agent's CLI
-the same way: `RunnerLink::start_session` runs the draft's `StartSession` under the session the
-hub stored (state `starting`, the agent named), in the workstream's folder checked as above, and
-`AgentEnv` gives that CLI the agent's token file, so the agent answers with `pitcrew board submit`
-as itself. A refusal or a failure ends the session (and so the draft); the reconciliation looks
-after a draft's session as after any the hub stored ahead of the runner. `serve` mounts hub-work's
-`board_agent_routes` (the proposal) and `board_device_routes` (preview, start, list, review).
+as a **confined run**: `RunnerLink::start_session` runs the draft's `StartSession` under the
+session the hub stored (state `starting`, the agent named), confined as below. A refusal or a
+failure ends the session (and so the draft); the reconciliation looks after a draft's session as
+after any the hub stored ahead of the runner. `serve` mounts hub-work's `board_session_routes`
+(the proposal, with `RouterParts::session`) and `board_device_routes` (preview, start, list,
+review).
+
+### Confined runs and session tokens (shared plumbing)
+
+A run PitCrew starts **on its own behalf** (a board draft's now; the Orchestrator's later) is a
+`SessionRequest` with a `Confinement` (hub-work: the `pitcrew` commands it may run, the files in
+its folder it may write, its longest running time). `crate::confined` carries it out, the same
+for every such run and every CLI, whatever the agent's persona or the person's own settings for
+that CLI say; a later confined run only names its own `Confinement`:
+
+- **A fresh private folder** (`ConfinedRuns`): `scratch/<session>` in PitCrew's cache folder
+  (`~/.cache/pitcrew` on Linux, `~/Library/Caches/PitCrew` on macOS, `%LOCALAPPDATA%\PitCrew\cache`
+  on Windows; `XDG_CACHE_HOME` is honoured), never the state directory (refused if the two would
+  nest) nor the person's repository. The scratch folder is 0700 (repaired if it is open; an
+  owner-only ACL on Windows); each run's folder is made new for its start (an old one of that name
+  is removed), owner-only, holding only `prompt.md` (the prompt, 0600) and the CLI's settings
+  (Claude Code's `.claude/settings.json` from `claude_settings`, OpenCode's `opencode.json` from
+  `opencode_settings`; Codex reads none from an untrusted folder). At each start, whatever in the
+  scratch folder is not a running run's folder is removed (the CLIs read their folders' parents,
+  so an injected `CLAUDE.md` there would reach later runs); when the daemon starts, all of it is.
+  `Dispatcher::confined_folder` names the folder before the session is stored, so its `cwd` is
+  right from the start.
+- **Its launch**: the runner's `StartSession` with `confined` and `CONFINED_BRIEF`, one plain line
+  telling the CLI to read `prompt.md` (cmd-safe, so Windows `.cmd` shims pass, and nothing of the
+  prompt on `/proc/<pid>/cmdline`); the runner's `start_spec` gives each CLI its confined shape
+  (see the runner's README).
+- **A session token** (`TokenScope::Session`, `pcs_…`): bound to the session, acting as its agent
+  for the agent's owner, minted into an in-memory registry (`HubTokens` layers it over the token
+  registry for the API, so none outlives the daemon or reaches `tokens.json`), and written to
+  `sessions/<session>.token` in the state directory (0600). `AgentEnv` gives a confined run's CLI
+  that file in place of its agent's, and refuses any token to a board draft's session whose run is
+  gone (fail closed). The API reaches a session token only to routes mounted with
+  `RouterParts::session`; each checks the token is for its own session's resource.
+- **Its end** (`Ender`): `Dispatcher::finish_session` (a draft's proposal is in) revokes the token
+  at once and ends the CLI after `GRACE` (3 s; gracefully, else killed); a watch per run removes
+  its folder and token once its session has ended (looked at every 5 s), and ends it after its
+  `max_runtime` (30 minutes for a draft). At the daemon's start, drafts left running are ended
+  (`WorkService::end_running_drafts`), and their CLIs too once the runner is attached.
+
+The Orchestrator reuses all of it: its own `Confinement` (its read verbs as `commands`, no
+`writes`) and its own session routes.
 
 ## The Orchestrator
 
@@ -771,6 +808,10 @@ one module and one line of the routes in `src/serve.rs`.
   prefix of each transcript, one indexed row of an OpenCode store). A first `progress` frame goes
   out at once; the walk's ticks (at most every 100 ms) wait for no client: one reading slowly
   misses some, never the last tick or the last frame.
+- **Detected agents:** before a successful report is sent, the hub atomically creates an owned
+  agent member and default-permission persona for each engine with a positive session count.
+  Existing owned agents with that engine are reused; `@office` has no persona and does not count.
+  Repeated scans create no duplicates. Empty, failed and disconnected scans provision nothing.
 - **What it logs:** one line per scan, `scanned this machine's agent homes`, with its counts and
   how long it took, at info. Never a path: the report goes to the person who asked, and nowhere
   else.
@@ -1087,11 +1128,15 @@ conversation and ends its session.
 `tests/board.rs` (Unix), a board draft end to end, with the same rig as `tests/dispatch.rs` and
 the `pitcrew` CLI built next to `pitcrewd` (skipped with a message when it or pitcrew-ptyd is not
 built, unless `CI` or `PITCREW_REQUIRE_PTYD=1`): a stand-in `claude` answers the draft as the
-prompt asks, through the real `pitcrew board submit` with the token file the daemon gave it; its
-proposal arrives and a second is refused (exit 4); the prompt is the one the preview measured, and
-names the draft and the workstream's session; no token is in its environment; no task exists
-until the person reviews it, and the review creates the accepted task only, labelled `drafted`,
-linking its evidence session.
+prompt asks, writing `proposal.json` and running the real `pitcrew board submit --file
+proposal.json` with the session token's file the daemon gave it. It was started confined (the
+three flags, one line on its command line), in a fresh 0700 folder outside the state directory and
+the workstream's folder holding only `prompt.md` (the prompt the preview measured, naming the
+draft and the workstream's session) and `.claude/settings.json`; no token is in its environment;
+its token's file is the session's, not the agent's; `pitcrew task list` with it is refused; its
+proposal arrives and a second is refused once its token is gone; its session ends soon after and
+its folder and token file go; no task exists until the person reviews it, and the review creates
+the accepted task only, labelled `drafted`, linking its evidence session.
 
 `tests/setup.rs`, the first run, fresh daemons with temporary homes (`--homes`, holding the
 Claude fixture's transcript):
@@ -1363,6 +1408,26 @@ Responses use no-store and nosniff, and failures log counts and fixed reasons wi
 
 `import.json` holds the durable session inclusion choice, scoped to this state directory. `GET /v1/import`, `POST /v1/import/dry-run`, and `PUT /v1/import` are device-only. The runner keeps reading in place; the API visibility adapter hides excluded session events, and transcript/terminal reads return 404 for them.
 
+## Starting from the app
+
+GET /v1/machines/{id}/session-options is person-only and reports platform path syntax, executable
+engines and permitted modes from the reachable local runner. Unknown machines are 404; no
+runner/runtime or another machine is 503. Detection does not run an agent CLI.
+
+Every valid POST /v1/sessions records a Starting session before launch, including person starts with
+no prompt. A successful 202 includes the terminal immediately; the transcript adopts that id
+later, so the person can enter their first prompt there. An optional trimmed 1–200-character
+title is retained separately by the runner. Existing ownership, safe-folder checks, claims and
+failed-start reconciliation apply. CLI/PATH, permission and batch-wrapper preflight run before
+recording, so validation failures leave no session. Person starts have no transcript deadline and
+may share a folder; reconciliation ends them only when their terminal exits. Named agent/task
+starts retain their exclusive folder claims (conflicts answer 409). The cross-platform PTY stand-in test gates its transcript,
+checks the immediate terminal and send, then verifies adoption, title preservation and restart.
+
+Terminal publication and runner batches share one lock around the hub read and write, so a
+fast transcript adoption or hook cannot be overwritten by the start response. A session
+already carrying the same terminal and title needs no extra discovery event.
+
 ## Onboarding hooks and safety
 
 Device-only `POST /v1/machines/{id}/hooks/diff` previews hooks using the CLI installer for supported CLIs on PATH. `hooks/install` confirms that exact revision with stale-file checks and existing backups. Previews are person/machine-bound, expire after ten minutes, and are lost on restart. Config contents are never logged. Only this hub’s own machine is supported; other machines return 501. The installed `pitcrew` executable must be beside `pitcrewd` or on its PATH. `GET`/`PUT /v1/safety` persist workspace preferences; new sessions use the saved permission mode unless explicitly overridden.
@@ -1373,3 +1438,10 @@ skipped engines. No-change previews cannot set the wizard's installed flag.
 Desktop packages include the hook CLI beside the daemon. Safety uses snake_case
 wire fields and the shared PermissionMode enum; bypass defaults are currently
 refused. Unsaved safety reports `saved: false` for legacy per-task acceptance.
+
+Session options expose `first_prompt_forbidden` for Windows `.cmd`/`.bat` programs. The API returns
+400 for those first prompts, with advice to start without a prompt and enter it in the terminal.
+No automatic prompt typing or shell escaping is attempted. Omitted permission mode reads the
+saved `/v1/safety` default before recording. Optional `workstream` links the returned session at
+start (manual); without it, a folder match links immediately with folder basis. Task links retain
+priority. Send errors for sessions without a PitCrew terminal explain the limitation without IDs.

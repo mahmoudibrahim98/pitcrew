@@ -15,7 +15,9 @@ use crate::service::WorkService;
 use pitcrew_protocol::api::{Caller, Setup, SetupDone};
 use pitcrew_protocol::events::EventBody;
 use pitcrew_protocol::ids::MachineId;
-use pitcrew_protocol::model::{Liveness, Machine, MachineKind, Member, MemberKind, Workspace};
+use pitcrew_protocol::model::{
+    Liveness, Machine, MachineInfo, MachineKind, Member, MemberKind, Workspace,
+};
 
 /// Longest `workspace_name` and `person.name`, in characters (Unicode code points).
 const NAME_CHARS: usize = 80;
@@ -167,9 +169,16 @@ impl WorkService {
         };
         let machine = Machine {
             id: MachineId::new(),
-            name: checked.machine_name,
+            name: checked.machine_name.clone(),
             kind: MachineKind::Local,
-            info: None,
+            info: Some(MachineInfo {
+                hostname: checked.machine_name,
+                os: std::env::consts::OS.to_owned(),
+                arch: std::env::consts::ARCH.to_owned(),
+                has_tmux: false,
+                scheduler: None,
+                home_on_network_fs: false,
+            }),
             liveness: Liveness::Live,
         };
         self.append(&[
@@ -186,6 +195,7 @@ impl WorkService {
                 },
             ),
         ])?;
+        self.set_hub_machine(machine.id);
         self.set_workspace_name(checked.workspace_name.clone());
         let done = SetupDone {
             workspace: Workspace {

@@ -1,16 +1,30 @@
 // Board drafts (api-v1.md, "Board drafts"), against either target. Run serially after the shared
 // suite: a draft starts an agent's CLI (a stand-in on the daemon) and creates tasks.
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { test } from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 import { list, schemas } from './schema.mjs';
 
 const base = process.env.PITCREW_CONFORMANCE_URL;
 const person = process.env.PITCREW_CONFORMANCE_PERSON;
 const agent = process.env.PITCREW_CONFORMANCE_AGENT;
-assert.ok(base && person && agent, 'Set PITCREW_CONFORMANCE_URL, _PERSON and _AGENT');
+const sessionTokens = process.env.PITCREW_CONFORMANCE_SESSION_TOKENS;
+assert.ok(base && person && agent && sessionTokens, 'Set PITCREW_CONFORMANCE_URL, _PERSON, _AGENT and _SESSION_TOKENS');
 assert.ok(['127.0.0.1', 'localhost', '[::1]'].includes(new URL(base).hostname));
 const missing = '01J00000000000000000000000';
-const codes = { 400: 'invalid', 403: 'forbidden', 404: 'not_found', 409: 'conflict' };
+const codes = { 400: 'invalid', 401: 'unauthorized', 403: 'forbidden', 404: 'not_found', 409: 'conflict' };
+
+/** The session token a draft's CLI was given, as the target hands it to the suite. Never printed. */
+async function sessionToken(session) {
+  for (let i = 0; i < 300; i += 1) {
+    const token = await readFile(join(sessionTokens, `${session}.token`), 'utf8').catch(() => undefined);
+    if (token !== undefined && token.trim() !== '') return token.trim();
+    await delay(50);
+  }
+  throw new Error('The draft\'s session token never reached the suite.');
+}
 
 async function call(method, path, body, token = person) {
   const response = await fetch(base + path, {
@@ -42,7 +56,7 @@ const proposal = {
   note: 'Synthetic note.',
 };
 
-test('board drafts: preview first, only the drafting agent proposes, nothing created until reviewed', async () => {
+test('board drafts: preview first, only the draft\'s session token proposes, nothing created until reviewed', async () => {
   const me = await expect(200, 'GET', '/v1/me', undefined, person, schemas.member);
   const agentMe = await expect(200, 'GET', '/v1/me', undefined, agent, schemas.member);
   const project = await expect(201, 'POST', '/v1/projects', { key: 'DRFT', name: 'Draft conformance' }, person, schemas.project);
@@ -97,10 +111,17 @@ test('board drafts: preview first, only the drafting agent proposes, nothing cre
   const one = await expect(200, 'GET', `/v1/board-drafts/${draft.id}`, undefined, person, schemas.boardDraft);
   assert.equal(one.id, draft.id);
 
-  // Only the drafting agent proposes, and only within the bounds.
+  // Only the draft's own session token proposes, and only within the bounds; it does nothing
+  // else, and its agent's own token does not propose.
   const proposalPath = `/v1/board-drafts/${draft.id}/proposal`;
+  const drafter = await sessionToken(draft.session);
+  assert.match(drafter, /^pcs_/);
   await expect(403, 'POST', proposalPath, proposal, person);
-  await expect(404, 'POST', `/v1/board-drafts/${missing}/proposal`, proposal, agent);
+  await expect(403, 'POST', proposalPath, proposal, agent);
+  await expect(403, 'GET', '/v1/me', undefined, drafter);
+  await expect(403, 'GET', '/v1/tasks', undefined, drafter);
+  await expect(403, 'GET', '/v1/board-drafts', undefined, drafter);
+  await expect(404, 'POST', `/v1/board-drafts/${missing}/proposal`, proposal, drafter);
   const demoSession = (await expect(200, 'GET', '/v1/sessions', undefined, person, list(schemas.session))).find(
     (s) => s.workstream !== workstream.id,
   );
@@ -112,13 +133,14 @@ test('board drafts: preview first, only the drafting agent proposes, nothing cre
     { tasks: [{ title: 'Synthetic', status: 'todo', description: 'd'.repeat(33 * 1024) }] },
     { note: 'no tasks' },
   ]) {
-    await expect(400, 'POST', proposalPath, bad, agent);
+    await expect(400, 'POST', proposalPath, bad, drafter);
   }
   const before = await expect(200, 'GET', `/v1/tasks?workstream=${workstream.id}`, undefined, person, list(schemas.task));
-  const proposed = await expect(201, 'POST', proposalPath, proposal, agent, schemas.boardDraft);
+  const proposed = await expect(201, 'POST', proposalPath, proposal, drafter, schemas.boardDraft);
   assert.equal(proposed.state, 'proposed');
   assert.deepEqual(proposed.proposal.tasks.map((t) => t.title), proposal.tasks.map((t) => t.title));
-  await expect(409, 'POST', proposalPath, proposal, agent);
+  // Its token stops once it has proposed.
+  await expect(401, 'POST', proposalPath, proposal, drafter);
   // A proposal creates nothing.
   const still = await expect(200, 'GET', `/v1/tasks?workstream=${workstream.id}`, undefined, person, list(schemas.task));
   assert.equal(still.length, before.length);

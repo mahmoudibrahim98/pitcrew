@@ -65,18 +65,24 @@ pub const PROTOCOL_VERSION: u32 = pitcrew_protocol::PROTOCOL_VERSION;
 
 /// The routes to serve behind authentication, split by who may call them.
 ///
-/// - `agent` routes accept every scope (the routes marked **agent** in `api-v1.md`).
-/// - `read` routes accept device and reader tokens (the routes marked **read**); agents get
-///   `403 forbidden`.
-/// - `device` routes accept only device tokens; agents and readers get `403 forbidden`.
+/// - `agent` routes accept device, agent and reader tokens (the routes marked **agent** in
+///   `api-v1.md`); session tokens get `403 forbidden`.
+/// - `read` routes accept device and reader tokens (the routes marked **read**); agents and
+///   session tokens get `403 forbidden`.
+/// - `session` routes accept every scope, session tokens included (the routes marked **session**
+///   in `api-v1.md`). Each must check itself that a session token answers only for its own
+///   session's resource.
+/// - `device` routes accept only device tokens; agents, readers and sessions get `403 forbidden`.
 ///
 /// A reader token reaches any route only with a `GET` or `HEAD` (see `auth`), so only reads go in
-/// `read`. Routes are device-only unless added with [`RouterParts::agent`] or
-/// [`RouterParts::read`], so forgetting to mark a route fails closed.
+/// `read`. Routes are device-only unless added with [`RouterParts::agent`], [`RouterParts::read`]
+/// or [`RouterParts::session`], so forgetting to mark a route fails closed; and a session token
+/// reaches only the routes added with [`RouterParts::session`].
 #[derive(Debug, Default)]
 pub struct RouterParts {
     agent: Router,
     read: Router,
+    session: Router,
     device: Router,
 }
 
@@ -101,6 +107,14 @@ impl RouterParts {
         self
     }
 
+    /// Adds routes that a session token may call too (and agents and people): each checks that
+    /// a session token acts only for its own session.
+    #[must_use]
+    pub fn session(mut self, routes: Router) -> Self {
+        self.session = self.session.merge(routes);
+        self
+    }
+
     /// Adds routes that only a person's device may call.
     #[must_use]
     pub fn device(mut self, routes: Router) -> Self {
@@ -118,9 +132,9 @@ impl RouterParts {
 /// them to `parts` instead.
 pub fn router(host_info: HostInfo, tokens: Arc<dyn TokenStore>, parts: RouterParts) -> Router {
     let host_info = Arc::new(host_info);
-    let authenticated = parts
-        .agent
+    let authenticated = pitcrew_auth::no_session(parts.agent)
         .merge(pitcrew_auth::readable(parts.read))
+        .merge(parts.session)
         .merge(pitcrew_auth::device_only(parts.device))
         .layer(middleware::from_fn_with_state(tokens, auth::authenticate));
     Router::new()

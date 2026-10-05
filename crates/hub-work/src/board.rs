@@ -3,22 +3,29 @@
 //!
 //! 1. **Preview** ([`WorkService::draft_preview`], person): the workstream's facts (its sessions,
 //!    as its routes would list them, without sub-agents and drafting sessions; their recap lines
-//!    and counts; its tasks) become the office's bounded, redacted summary inside the versioned
-//!    prompt (`pitcrew_office::board`). Nothing is sent or stored. The answer holds the summary, its
-//!    sizes, the estimate, and the prompt's digest.
+//!    and counts, their files relative to their folders; its tasks) become the office's bounded,
+//!    redacted summary inside the versioned prompt (`pitcrew_office::board`). Nothing is sent or
+//!    stored; the prompt is kept in memory for [`PREVIEW_KEPT_MS`], the workstream's latest only.
+//!    The answer holds the summary, its sizes, the estimate, and the prompt's digest.
 //! 2. **Start** ([`WorkService::start_draft`], person): with the digest the person confirmed. The
-//!    prompt is made again; if it differs (the workstream changed), `409`. Then, under the command
-//!    lock: the agent is one of the caller's own (`403` otherwise; the back office, `@office`,
-//!    when none is named), no other draft of the workstream is running or waiting for review
-//!    (`409`), and a session can start where the workstream's folder is (its first location,
-//!    else its project's root, else the hub's own machine in `~`; `503` when none can). It
-//!    appends `session_discovered` (state `starting`, the agent, linked to the workstream by hand)
-//!    and `board_draft_started`, then asks the [`Dispatcher`](crate::Dispatcher) to start the
-//!    agent's CLI with the prompt ([`SessionRequest`]). A start that fails ends the session, and
-//!    the draft with it.
-//! 3. **Propose** ([`WorkService::propose_board`], the draft's agent only): a [`BoardProposal`] of
-//!    at most `MAX_PROPOSAL_BYTES` (the route's bound), every text checked against its bound and
-//!    redacted, every evidence session one of the workstream's. Once per draft: `board_proposed`.
+//!    workstream's latest preview, while it is kept and has that digest, is what is sent, exactly;
+//!    else the prompt is made again, and if it differs (the workstream changed), `409`. Then,
+//!    under the command lock: the agent is one of the caller's own (`403` otherwise; the back
+//!    office, `@office`, when none is named), no other draft of the workstream is running or
+//!    waiting for review (`409`), and the hub's own machine is live (`503` otherwise). It appends
+//!    `session_discovered` (state `starting`, the agent, linked to the workstream by hand, in the
+//!    folder the dispatcher names) and `board_draft_started`, then asks the
+//!    [`Dispatcher`](crate::Dispatcher) to start the agent's CLI **confined**
+//!    ([`Confinement`]: a fresh private folder, never the workstream's, with the prompt in
+//!    [`PROMPT_FILE`](crate::PROMPT_FILE); the CLI's read-mostly launch shape, whatever its
+//!    persona's mode; only `pitcrew board submit` and writing [`PROPOSAL_FILE`] pre-approved; a
+//!    session token in place of the agent's; at most [`DRAFT_MAX_RUNTIME`]). A start that fails
+//!    ends the session, and the draft with it.
+//! 3. **Propose** ([`WorkService::propose_board`], the draft's session token only): a
+//!    [`BoardProposal`] of at most `MAX_PROPOSAL_BYTES` (the route's bound), every text checked
+//!    against its bound and redacted, every evidence session one of the workstream's. Once per
+//!    draft: `board_proposed`. Then the dispatcher [finishes](crate::Dispatcher::finish_session)
+//!    the session: its token stops working at once, and its CLI is ended.
 //! 4. **Review** ([`WorkService::review_draft`], person): the accepted items become tasks in one
 //!    append with the review: `task_created` for each (in the workstream, at its proposed status,
 //!    labelled [`DRAFTED_LABEL`]), `session_linked` (by hand) for each evidence session not yet
@@ -26,31 +33,35 @@
 //!    draft.
 //!
 //! Drafts are read from the log itself (their three event types, by the store's type index):
-//! there are few, and they need no table of their own. A running draft whose session has ended is
-//! [`DraftState::Ended`].
+//! there are few, and they need no table of their own; an event that cannot be read is logged and
+//! skipped. A running draft whose session has ended is [`DraftState::Ended`]: when its CLI exits,
+//! when it runs past [`DRAFT_MAX_RUNTIME`], or when the hub restarts ([`WorkService::end_running_drafts`]:
+//! its session token is gone).
 
-use crate::dispatch::{DispatchError, SessionRequest, own_agent, refused};
+use crate::dispatch::{Confinement, DispatchError, SessionRequest, own_agent, refused};
 use crate::error::{Result, WorkError};
 use crate::query::{self, SessionFilter, TaskFilter};
 use crate::recap::{BlockFilter, RecapIndex};
 use crate::service::WorkService;
 use pitcrew_office::board::{DraftFacts, SessionFacts, TaskFacts, draft_prompt};
 use pitcrew_office::redact;
-use pitcrew_protocol::api::Caller;
+use pitcrew_protocol::api::{Caller, NewTask, TokenScope};
 use pitcrew_protocol::board::{
     BoardDraft, BoardProposal, DRAFTED_LABEL, DraftPreview, DraftReview, DraftReviewed, DraftState,
     DraftedTask, MAX_EVIDENCE, MAX_NOTE, MAX_PROPOSED_DESCRIPTION, MAX_PROPOSED_TASKS,
     MAX_PROPOSED_TITLE, ProposedTask, StartDraft,
 };
 use pitcrew_protocol::events::{Event, EventBody};
-use pitcrew_protocol::ids::{DraftId, MemberId, SessionId, TaskId, TaskKey, WorkstreamId};
+use pitcrew_protocol::ids::{DraftId, MemberId, SessionId, TaskId, WorkstreamId};
 use pitcrew_protocol::model::{
-    Engine, LinkBasis, Liveness, Machine, Session, SessionState, Task, TaskStatus, Workstream,
+    Engine, LinkBasis, Liveness, Machine, PermissionMode, Session, SessionState, TaskStatus,
+    TimestampMs, Workstream,
 };
 use pitcrew_store::sql::{Connection, params};
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::time::Duration;
 
 /// The event types a draft is made of.
 const TYPES: [&str; 3] = [
@@ -65,17 +76,60 @@ const BLOCKS_PER_SESSION: usize = 50;
 /// What the preview's prompt names as its draft: as long as a real id, so the sizes are exact.
 const PLACEHOLDER_ID: &str = "drf_00000000000000000000000000";
 
-/// The prompt for a workstream, as made now.
+/// The longest a draft's session runs: then its CLI is ended, and the draft with it, so an idle
+/// CLI, or one that is not signed in, never blocks the workstream's next draft for long.
+pub const DRAFT_MAX_RUNTIME: Duration = Duration::from_secs(30 * 60);
+
+/// The file a draft's CLI may write its proposal to, in its folder, for `pitcrew board submit
+/// <draft> --file proposal.json`.
+pub const PROPOSAL_FILE: &str = "proposal.json";
+
+/// How long a preview's prompt is kept for its start, in milliseconds.
+pub const PREVIEW_KEPT_MS: i64 = 10 * 60 * 1000;
+
+/// The most workstreams whose latest preview is kept.
+const PREVIEWS_KEPT: usize = 64;
+
+/// The prompt for a workstream, as made at a preview or now.
+#[derive(Clone)]
 struct Made {
     prompt: pitcrew_office::board::DraftPrompt,
     digest: String,
 }
 
-/// Where a draft's agent runs.
-struct Place {
-    machine: Machine,
-    cwd: String,
-    branch: Option<String>,
+/// Each workstream's latest previewed prompt, while it is kept ([`PREVIEW_KEPT_MS`]): a start
+/// with its digest sends exactly it, however the workstream's live facts moved since.
+#[derive(Default)]
+pub(crate) struct Previews(Vec<(WorkstreamId, TimestampMs, Made)>);
+
+impl Previews {
+    fn keep(&mut self, workstream: WorkstreamId, at: TimestampMs, made: Made) {
+        self.0.retain(|(w, ..)| *w != workstream);
+        self.0.push((workstream, at, made));
+        if self.0.len() > PREVIEWS_KEPT {
+            self.0.remove(0);
+        }
+    }
+
+    fn take(&mut self, workstream: WorkstreamId, digest: &str, now: TimestampMs) -> Option<Made> {
+        self.0
+            .retain(|(_, at, _)| now.saturating_sub(*at) <= PREVIEW_KEPT_MS);
+        let i = self
+            .0
+            .iter()
+            .position(|(w, _, made)| *w == workstream && made.digest == digest)?;
+        Some(self.0.remove(i).2)
+    }
+}
+
+/// The confinement of a draft's run: `pitcrew board submit`, the proposal's file, and
+/// [`DRAFT_MAX_RUNTIME`].
+fn draft_confinement() -> Confinement {
+    Confinement {
+        commands: vec!["board submit".to_owned()],
+        writes: vec![PROPOSAL_FILE.to_owned()],
+        max_runtime: DRAFT_MAX_RUNTIME,
+    }
 }
 
 impl WorkService {
@@ -93,6 +147,10 @@ impl WorkService {
         crate::commands::require_person(caller, "Previewing a board draft")?;
         let workstream = self.workstream(workstream)?;
         let made = self.make_prompt(&workstream)?;
+        self.previews
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keep(workstream.id, self.now(), made.clone());
         Ok(DraftPreview {
             workstream: workstream.id,
             prompt: pitcrew_office::prompts::DRAFT_BOARD.id(),
@@ -135,6 +193,16 @@ impl WorkService {
         })?;
         let keys: HashMap<TaskId, String> =
             tasks.iter().map(|t| (t.id, t.key.to_string())).collect();
+        // The workstream's folders, which a session's files are made relative to (after the
+        // session's own folder).
+        let mut folders: Vec<String> = workstream
+            .locations
+            .iter()
+            .map(|l| l.path.clone())
+            .collect();
+        if let Some(root) = project.as_ref().and_then(|p| p.root.as_ref()) {
+            folders.push(root.path.clone());
+        }
         let mut facts = DraftFacts {
             workstream: workstream.name.clone(),
             project: project.map(|p| p.name).unwrap_or_default(),
@@ -155,17 +223,19 @@ impl WorkService {
             {
                 continue;
             }
-            let facts_of = self.session_facts(&session, &keys)?;
+            let facts_of = self.session_facts(&session, &keys, &folders)?;
             facts.sessions.push(facts_of);
         }
         Ok(facts)
     }
 
-    /// One session's facts, from the recap index: its newest blocks' counts, files and lines.
+    /// One session's facts, from the recap index: its newest blocks' counts, files and lines. Its
+    /// files are relative to its folder, else to one of the workstream's `folders`.
     fn session_facts(
         &self,
         session: &Session,
         keys: &HashMap<TaskId, String>,
+        folders: &[String],
     ) -> Result<SessionFacts> {
         let page = self.recap_blocks(
             &BlockFilter {
@@ -212,7 +282,12 @@ impl WorkService {
         }
         // Most edited first; a stable order among equals.
         files.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        facts.files = files.into_iter().map(|(path, _)| path).collect();
+        let mut within: Vec<&str> = vec![session.cwd.as_str()];
+        within.extend(folders.iter().map(String::as_str));
+        facts.files = files
+            .into_iter()
+            .map(|(path, _)| pitcrew_office::board::relative_to(&path, &within))
+            .collect();
         Ok(facts)
     }
 
@@ -234,10 +309,18 @@ impl WorkService {
     ) -> Result<BoardDraft> {
         crate::commands::require_person(caller, "Drafting a board")?;
         let workstream = self.workstream(workstream)?;
-        let made = self.make_prompt(&workstream)?;
+        let previewed = self
+            .previews
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take(workstream.id, &start.digest, self.now());
+        let made = match previewed {
+            Some(made) => made,
+            None => self.make_prompt(&workstream)?,
+        };
         let (draft, request, dispatcher) = {
             let _guard = self.lock();
-            let (agent, place, persona) = self.read(|c| {
+            let (agent, machine, persona) = self.read(|c| {
                 let agent = own_agent(c, caller, start.agent.as_ref(), "draft the board")?;
                 if made.digest != start.digest {
                     return Err(WorkError::conflict(
@@ -264,17 +347,17 @@ impl WorkService {
                         }
                     )));
                 }
-                let place = self.draft_place(c, &workstream)?;
+                let machine = self.draft_machine(c)?;
                 let persona = match &agent.persona {
                     Some(id) => query::persona(c, id)?,
                     None => None,
                 };
-                Ok((agent, place, persona))
+                Ok((agent, machine, persona))
             })?;
             let dispatcher = self.dispatcher().ok_or_else(|| {
                 WorkError::unavailable("This hub cannot start sessions: it has no runner link.")
             })?;
-            let ready = catch_unwind(AssertUnwindSafe(|| dispatcher.can_start(&place.machine.id)))
+            let ready = catch_unwind(AssertUnwindSafe(|| dispatcher.can_start(&machine.id)))
                 .unwrap_or_else(|_| Err(DispatchError::Failed("the runner link panicked".into())));
             if let Err(error) = ready {
                 return Err(refused(&error));
@@ -285,13 +368,19 @@ impl WorkService {
                 .unwrap_or(Engine::Claude);
             let id = DraftId::new();
             let now = self.now();
+            let session_id = SessionId::new();
+            // Its own private folder, never the workstream's: the summary is all it needs.
+            let cwd = catch_unwind(AssertUnwindSafe(|| dispatcher.confined_folder(&session_id)))
+                .ok()
+                .flatten()
+                .unwrap_or_default();
             let session = Session {
-                id: SessionId::new(),
+                id: session_id,
                 engine,
                 native_id: String::new(),
-                machine: place.machine.id,
-                cwd: place.cwd.clone(),
-                branch: place.branch.clone(),
+                machine: machine.id,
+                cwd: cwd.clone(),
+                branch: None,
                 title: Some(format!("Drafting the board of {}", workstream.name)),
                 agent: Some(agent.id),
                 workstream: Some(workstream.id),
@@ -308,9 +397,9 @@ impl WorkService {
                 session: session.id,
                 agent: agent.id,
                 owner: agent.owner,
-                machine: place.machine.id,
-                cwd: place.cwd,
-                branch: place.branch,
+                machine: machine.id,
+                cwd,
+                branch: None,
                 engine,
                 persona: persona.as_ref().map(|p| p.id),
                 // A persona's model is for its own CLI; another CLI chosen here takes its default.
@@ -318,15 +407,15 @@ impl WorkService {
                     .as_ref()
                     .filter(|p| p.engine == engine)
                     .and_then(|p| p.model.clone()),
-                permission_mode: persona
-                    .as_ref()
-                    .map(|p| p.permission_mode)
-                    .unwrap_or_default(),
+                // Never the persona's mode: a draft runs confined, whatever its agent may do
+                // elsewhere.
+                permission_mode: PermissionMode::Default,
                 name: format!("Draft board {}", workstream.name),
                 brief: made
                     .prompt
                     .text
                     .replacen(PLACEHOLDER_ID, &id.to_string(), 1),
+                confinement: Some(draft_confinement()),
             };
             let started = EventBody::BoardDraftStarted {
                 draft: id,
@@ -356,50 +445,82 @@ impl WorkService {
         self.board_draft(&draft)
     }
 
-    /// Where a draft of `workstream` runs: its first location, else its project's root, else the
-    /// hub's own machine in `~`. The machine must be live.
-    fn draft_place(&self, c: &Connection, workstream: &Workstream) -> Result<Place> {
-        let mut locations = workstream.locations.clone();
-        if let Some(root) = query::project(c, &workstream.project)?.and_then(|p| p.root) {
-            locations.push(root);
-        }
-        let place = match locations.first() {
-            Some(location) => {
-                let machine = query::machine(c, &location.machine)?.ok_or_else(|| {
-                    WorkError::unavailable(format!(
-                        "The workstream's folder is on machine {}, which this hub does not know.",
-                        location.machine
-                    ))
-                })?;
-                Place {
-                    machine,
-                    cwd: location.path.clone(),
-                    branch: location.branch.clone(),
-                }
-            }
-            None => {
-                let none = || {
-                    WorkError::unavailable(
-                        "No machine can run the draft: the workstream has no folder and this hub \
-                         has no machine of its own.",
-                    )
-                };
-                let id = self.hub_machine().ok_or_else(none)?;
-                Place {
-                    machine: query::machine(c, &id)?.ok_or_else(none)?,
-                    cwd: "~".to_owned(),
-                    branch: None,
-                }
-            }
+    /// Where a draft runs: the hub's own machine, which must be live. Never the workstream's
+    /// folder: a draft runs in a private folder of its own there, from the summary alone.
+    fn draft_machine(&self, c: &Connection) -> Result<Machine> {
+        let none = || {
+            WorkError::unavailable(
+                "No machine can run the draft: this hub has no machine of its own.",
+            )
         };
-        if place.machine.liveness != Liveness::Live {
-            let liveness = crate::codec::enum_text(&place.machine.liveness).unwrap_or_default();
+        let id = self.hub_machine().ok_or_else(none)?;
+        let machine = query::machine(c, &id)?.ok_or_else(none)?;
+        if machine.liveness != Liveness::Live {
+            let liveness = crate::codec::enum_text(&machine.liveness).unwrap_or_default();
             return Err(WorkError::unavailable(format!(
                 "{} is {liveness}; its runner cannot be reached.",
-                place.machine.name
+                machine.name
             )));
         }
-        Ok(place)
+        Ok(machine)
+    }
+
+    /// Whether `session` is a board draft's (whatever the draft's state): its CLI is only ever
+    /// given its own session token, never its agent's.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub fn is_draft_session(&self, session: &SessionId) -> Result<bool> {
+        Ok(self
+            .read(load_drafts)?
+            .iter()
+            .any(|d| d.session == *session))
+    }
+
+    /// The sessions of the drafts still running: what the daemon ends when it starts
+    /// ([`Self::end_running_drafts`]).
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub fn running_draft_sessions(&self) -> Result<Vec<SessionId>> {
+        Ok(self
+            .read(load_drafts)?
+            .into_iter()
+            .filter(|d| d.state == DraftState::Running)
+            .map(|d| d.session)
+            .collect())
+    }
+
+    /// Ends every draft still running, with its session: called when the daemon starts, since a
+    /// draft's session token lived in the daemon's memory, so its CLI could never propose. Each
+    /// session is ended in the log ([`Self::end_confined_session`]) and handed to the dispatcher
+    /// to finish (its CLI, if it still runs, is ended). How many were.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub fn end_running_drafts(&self, reason: &str) -> Result<usize> {
+        let sessions = self.running_draft_sessions()?;
+        for session in &sessions {
+            self.end_confined_session(session, reason)?;
+            self.finish_confined(session);
+        }
+        Ok(sessions.len())
+    }
+
+    /// Asks the dispatcher to finish a confined session: its token stops at once, and its CLI is
+    /// ended. A failure is logged.
+    pub(crate) fn finish_confined(&self, session: &SessionId) {
+        let Some(dispatcher) = self.dispatcher() else {
+            return;
+        };
+        let done = catch_unwind(AssertUnwindSafe(|| dispatcher.finish_session(session)))
+            .unwrap_or_else(|_| Err(DispatchError::Failed("the runner link panicked".into())));
+        if let Err(error) = done {
+            tracing::warn!(%session, error = %error, "cannot finish a confined session");
+        }
     }
 
     /// Every board draft, newest first; only `workstream`'s when given.
@@ -424,19 +545,14 @@ impl WorkService {
     }
 
     /// Whether `caller` may propose for draft `id`: `not_found` for an unknown draft, `forbidden`
-    /// for anyone but its agent. The route asks before it reads the body.
+    /// for anyone but the session token made for its session (its agent's own token and a person
+    /// included). The route asks before it reads the body.
     ///
     /// # Errors
     ///
     /// `not_found`, `forbidden`, or database errors.
     pub fn check_draft_proposer(&self, caller: &Caller, id: &DraftId) -> Result<()> {
-        let draft = self.board_draft(id)?;
-        if caller.is_person() || caller.member != draft.agent {
-            return Err(WorkError::forbidden(format!(
-                "Only the agent drafting {id} may propose its board."
-            )));
-        }
-        Ok(())
+        proposer(caller, &self.board_draft(id)?)
     }
 
     /// `POST /v1/board-drafts/{id}/proposal`: the drafting agent's proposal. See the
@@ -456,14 +572,10 @@ impl WorkService {
         self.check_draft_proposer(caller, id)?;
         let shape = checked_shape(proposal)?;
         let choice = self.import_choice();
-        let _guard = self.lock();
+        let guard = self.lock();
         let (draft, proposal) = self.read(|c| {
             let draft = find(c, id)?;
-            if caller.is_person() || caller.member != draft.agent {
-                return Err(WorkError::forbidden(format!(
-                    "Only the agent drafting {id} may propose its board."
-                )));
-            }
+            proposer(caller, &draft)?;
             let drafting: HashSet<SessionId> =
                 load_drafts(c)?.into_iter().map(|d| d.session).collect();
             for (i, task) in shape.tasks.iter().enumerate() {
@@ -501,6 +613,10 @@ impl WorkService {
                 note: proposal.note,
             },
         )])?;
+        drop(guard);
+        // Its one thing is done: its token stops now, and its CLI is ended (without the command
+        // lock: the runner link never waits on the service, but it need not hold it either).
+        self.finish_confined(&draft.session);
         self.board_draft(id)
     }
 
@@ -555,37 +671,29 @@ impl WorkService {
             accepted.sort_unstable();
             let workstream = query::workstream(c, &draft.workstream)?
                 .ok_or_else(|| WorkError::conflict("The draft's workstream is no longer known."))?;
-            let project = query::project(c, &workstream.project)?
-                .ok_or_else(|| WorkError::conflict("The draft's project is no longer known."))?;
-            let mut number = query::highest_task_number(c, &project.key)?;
+            let mut taken: Option<u32> = None;
             let mut tasks = Vec::with_capacity(accepted.len());
             let mut links: Vec<(SessionId, TaskId)> = Vec::new();
             let mut linked: HashSet<SessionId> = HashSet::new();
             for (item, index) in &accepted {
                 let proposed = &proposal.tasks[*index];
-                number = number.checked_add(1).ok_or_else(|| {
-                    WorkError::conflict(format!("{} has no task numbers left.", project.key))
-                })?;
-                let key = TaskKey::new(project.key.clone(), number)
-                    .map_err(|e| WorkError::internal(e.to_string()))?;
-                let task = Task {
-                    id: TaskId::new(),
-                    key,
-                    project: project.id,
-                    workstream: Some(workstream.id),
-                    title: proposed.title.clone(),
-                    description: proposed.description.clone().unwrap_or_default(),
-                    status: proposed.status,
-                    priority: pitcrew_protocol::model::Priority::default(),
-                    assignee: None,
-                    labels: vec![DRAFTED_LABEL.to_owned()],
-                    start: None,
-                    due: None,
-                    blocked_by: Vec::new(),
-                    source: None,
-                    accept_auto: false,
-                    subtasks: Vec::new(),
-                };
+                // Made as `POST /v1/tasks` makes a task, numbered on from the one before.
+                let task = crate::commands::plan_task(
+                    c,
+                    NewTask {
+                        project: workstream.project,
+                        workstream: Some(workstream.id),
+                        title: proposed.title.clone(),
+                        description: proposed.description.clone(),
+                        status: Some(proposed.status),
+                        priority: None,
+                        assignee: None,
+                        labels: Some(vec![DRAFTED_LABEL.to_owned()]),
+                        due: None,
+                    },
+                    taken,
+                )?;
+                taken = Some(task.key.number);
                 for session in &proposed.evidence {
                     let free = query::session(c, session)?
                         .is_some_and(|s| s.task.is_none() && s.workstream == Some(workstream.id));
@@ -735,6 +843,18 @@ fn checked_shape(proposal: BoardProposal) -> Result<BoardProposal> {
     })
 }
 
+/// Whether `caller` may propose for `draft`: only the session token made for its session, which
+/// acts as its agent. Its agent's own token, another session's, and people are `forbidden`.
+fn proposer(caller: &Caller, draft: &BoardDraft) -> Result<()> {
+    if caller.scope == TokenScope::Session(draft.session) && caller.member == draft.agent {
+        return Ok(());
+    }
+    Err(WorkError::forbidden(format!(
+        "Only the session drafting {} may propose its board, with the token it was given.",
+        draft.id
+    )))
+}
+
 /// Lowercase hex.
 fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -770,9 +890,18 @@ fn load_drafts(c: &Connection) -> Result<Vec<BoardDraft>> {
     let mut drafts: Vec<BoardDraft> = Vec::new();
     for row in rows {
         let (at, author, kind, data) = row?;
-        let data: serde_json::Value = serde_json::from_str(&data)?;
-        let body: EventBody =
-            serde_json::from_value(serde_json::json!({ "type": kind, "data": data }))?;
+        // One event that cannot be read (written by a newer hub, or damaged) must not hide every
+        // draft: it is logged and skipped.
+        let body = serde_json::from_str::<serde_json::Value>(&data).and_then(|data| {
+            serde_json::from_value::<EventBody>(serde_json::json!({ "type": kind, "data": data }))
+        });
+        let body = match body {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::warn!(kind, at, error = %error, "skipped a board-draft event that cannot be read");
+                continue;
+            }
+        };
         match body {
             EventBody::BoardDraftStarted {
                 draft,

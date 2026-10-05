@@ -6,14 +6,16 @@
 // - `DraftBoardPanel`: the workstream page's panel. Shows the newest draft's review when one waits,
 //   its progress while it runs, and otherwise the preview and the start (`DraftStart`).
 // - `DraftStart`: cost first. The sizes, the number of sessions, the redactions and the estimate;
-//   what will be sent, on request; the agent and the CLI; then the start, with the preview's digest.
-// - `DraftReview`: accept or reject each proposed task, or all, or none.
+//   what will be sent, on request; the agent and the CLI (only those found on the hub's own
+//   machine, where drafts run); then the start, with the preview's digest.
+// - `DraftReview`: accept or reject each proposed task, or all, or none. Nothing starts accepted:
+//   the person chooses.
 //
 // Everything the agent wrote is shown as text, never as markup.
 
 import { useId, useMemo, useState } from 'react';
 import { Button, StatusPill } from '../design/index.ts';
-import { ApiError, type Engine, type MemberId, type WorkstreamId } from '../data/index.ts';
+import { ApiError, useApi, useLiveQuery, type Engine, type MemberId, type WorkstreamId } from '../data/index.ts';
 import {
   costLine,
   estimateLine,
@@ -25,13 +27,31 @@ import {
   type BoardDraft,
   type DraftReviewed,
 } from './board-drafts.ts';
-import { useMe, useMembers, useNames } from './data.ts';
+import { useMachines, useMe, useMembers, useNames } from './data.ts';
 import { TASK_STATUS } from './format.ts';
 import { useProjectsNav } from './nav.tsx';
 import { ErrorNote, Field, Panel, inputClass } from './ui.tsx';
 
 const ENGINE_LABEL: Record<Engine, string> = { claude: 'Claude Code', codex: 'Codex', opencode: 'OpenCode' };
-const ENGINES: Engine[] = ['claude', 'codex', 'opencode'];
+
+/**
+ * The agent CLIs found on the hub's own machine, where every draft runs (its runner's
+ * `session-options`). `loading` until known; none when the machine has none, or cannot be asked.
+ */
+export function useDraftEngines() {
+  const api = useApi();
+  const machines = useMachines();
+  const machine = machines.data?.find((m) => m.kind === 'local')?.id;
+  const options = useLiveQuery({
+    queryKey: ['session-options', machine ?? ''],
+    queryFn: ({ signal }) => api.sessionOptions(machine ?? '', signal),
+    enabled: machine !== undefined,
+  });
+  const engines = useMemo(() => (options.data?.engines ?? []).map((e) => e.engine), [options.data]);
+  const error = machines.error ?? options.error;
+  const none = machines.data !== undefined && machine === undefined;
+  return { engines, error, loading: error === null && !none && options.data === undefined };
+}
 
 /**
  * The caller's own agents, the back office first: those a draft may run as. `loading` until both
@@ -61,12 +81,15 @@ export function DraftStart({
 }) {
   const preview = useDraftPreview(workstream);
   const { agents, error: agentsError, loading: agentsLoading } = useMyAgents();
+  const { engines, error: enginesError, loading: enginesLoading } = useDraftEngines();
   const start = useStartDraft(workstream);
   const [agent, setAgent] = useState<MemberId | ''>('');
   const [engine, setEngine] = useState<Engine | ''>('');
   const [showSummary, setShowSummary] = useState(!compact);
   const summaryId = useId();
   const chosen = agent !== '' ? agent : agents[0]?.id;
+  // Only a CLI found where the draft runs: the one picked, else the first found.
+  const cli = engine !== '' && engines.includes(engine) ? engine : engines[0];
 
   if (preview.error !== null) return <ErrorNote error={preview.error} what="preview the draft" />;
   if (preview.data === undefined) {
@@ -112,22 +135,29 @@ export function DraftStart({
       </div>
       {agentsError !== null ? (
         <ErrorNote error={agentsError} what="load your agents" />
-      ) : agentsLoading ? (
+      ) : enginesError !== null ? (
+        <ErrorNote error={enginesError} what="find the agent CLIs on this hub's machine" />
+      ) : agentsLoading || enginesLoading ? (
         <p role="status" className="text-sm text-ink-2">
           Loading your agents…
         </p>
       ) : agents.length === 0 ? (
         <p className="text-sm text-ink-2">None of your agents can draft: add an agent to this workspace first.</p>
+      ) : engines.length === 0 ? (
+        <p className="text-sm text-ink-2">
+          No agent CLI was found on this hub’s machine, where drafts run: install Claude Code, Codex or OpenCode, and
+          check the machine in Settings.
+        </p>
       ) : (
         <form
           className="flex flex-wrap items-end gap-3"
           onSubmit={(e) => {
             e.preventDefault();
-            if (chosen === undefined || preview.data === undefined) return;
+            if (chosen === undefined || cli === undefined || preview.data === undefined) return;
             start.mutate(
               {
                 agent: chosen,
-                ...(engine === '' ? {} : { engine }),
+                engine: cli,
                 digest: preview.data.digest,
               },
               { onSuccess: (draft) => onStarted?.(draft) },
@@ -149,12 +179,11 @@ export function DraftStart({
             {(id) => (
               <select
                 id={id}
-                value={engine}
-                onChange={(e) => setEngine(e.target.value as Engine | '')}
+                value={cli ?? ''}
+                onChange={(e) => setEngine(e.target.value as Engine)}
                 className={inputClass}
               >
-                <option value="">The agent’s own</option>
-                {ENGINES.map((e) => (
+                {engines.map((e) => (
                   <option key={e} value={e}>
                     {ENGINE_LABEL[e]}
                   </option>
@@ -162,7 +191,7 @@ export function DraftStart({
               </select>
             )}
           </Field>
-          <Button type="submit" variant="primary" disabled={start.isPending || chosen === undefined}>
+          <Button type="submit" variant="primary" disabled={start.isPending || chosen === undefined || cli === undefined}>
             {start.isPending ? 'Starting…' : 'Send and draft'}
           </Button>
         </form>
@@ -187,8 +216,9 @@ function DraftRunning({ draft }: { draft: BoardDraft }) {
   return (
     <div className="flex flex-col gap-2 text-sm">
       <p role="status">
-        {names.member(draft.agent)} is drafting the board in {ENGINE_LABEL[draft.engine]}. Its proposal shows here
-        when it is ready; it may ask you to allow a command in its terminal first.
+        {names.member(draft.agent)} is drafting the board in {ENGINE_LABEL[draft.engine]}, in a private folder of its own
+        and allowed only to read its prompt and send its proposal. Its proposal shows here when it is ready; it may ask
+        you to allow a command in its terminal first (Codex asks before it sends). A draft stops after 30 minutes.
       </p>
       <div className="flex gap-2">
         {nav.openSession !== undefined && (
@@ -207,9 +237,10 @@ function DraftRunning({ draft }: { draft: BoardDraft }) {
 export function DraftReview({ draft, onReviewed }: { draft: BoardDraft; onReviewed?: (done: DraftReviewed) => void }) {
   const names = useNames();
   const review = useReviewDraft(draft.workstream);
-  // A draft's proposal never changes, so its review keeps its own choices (keyed by draft).
+  // A draft's proposal never changes, so its review keeps its own choices (keyed by draft). Nothing
+  // starts accepted: each task is the person's choice.
   const tasks = draft.proposal?.tasks ?? [];
-  const [accepted, setAccepted] = useState<boolean[]>(() => tasks.map(() => true));
+  const [accepted, setAccepted] = useState<boolean[]>(() => tasks.map(() => false));
   const count = accepted.filter(Boolean).length;
   const send = (accept: number[]) =>
     review.mutate({ draft: draft.id, accept }, { onSuccess: (done) => onReviewed?.(done) });

@@ -286,3 +286,51 @@ fn the_prompt_names_its_draft_and_the_estimate_follows_its_size() {
     let other = draft_prompt(&facts, "drf_01J99999999999999999999999");
     assert_eq!(other.cost, prompt.cost);
 }
+
+/// Files are made relative to the session's or the workstream's folder by the hub
+/// (`relative_to`); any other absolute path keeps only its end, so no user name goes, and a long
+/// one keeps its file name.
+#[test]
+fn file_paths_say_which_file_and_not_whose_folder() {
+    use pitcrew_office::board::relative_to;
+    let cwd = "/scratch/grp/sam/paper";
+    assert_eq!(
+        relative_to("/scratch/grp/sam/paper/src/a.rs", &[cwd]),
+        "src/a.rs"
+    );
+    assert_eq!(
+        relative_to(r"C:\Users\sam\paper\src\a.rs", &["c:/Users/sam/paper"]),
+        "src/a.rs"
+    );
+    assert_eq!(
+        relative_to("/scratch/grp/sam/paperless/x", &[cwd]),
+        "/scratch/grp/sam/paperless/x"
+    );
+    assert_eq!(relative_to("/etc/hosts", &["/", "~", ""]), "/etc/hosts");
+    assert_eq!(relative_to("src/a.rs", &[cwd]), "src/a.rs");
+
+    let mut s = session(1, DAY);
+    s.files = vec![
+        relative_to("/scratch/grp/sam/paper/method/intro.tex", &[cwd]),
+        "/scratch/grp/sam/run.sh".into(),
+        "/scratch/grp/sam/other/deep/build.sh".into(),
+        "/mnt/c/Users/sam/notes/todo.md".into(),
+        r"\\?\C:\Users\sam\plan.md".into(),
+    ];
+    let mut long = session(2, DAY + 1);
+    long.files = vec![format!("src/{}main.rs", "deep/".repeat(40))];
+    let summary = summarize(&facts(vec![s, long])).text;
+    assert!(summary.contains("method/intro.tex"), "{summary}");
+    assert!(summary.contains("…/run.sh"), "{summary}");
+    assert!(summary.contains("…/deep/build.sh"), "{summary}");
+    assert!(summary.contains("~/notes/todo.md"), "{summary}");
+    assert!(summary.contains(r"~\plan.md"), "{summary}");
+    assert!(
+        summary.contains("/main.rs"),
+        "a long path lost its file name: {summary}"
+    );
+    assert!(
+        !summary.contains("sam"),
+        "a user name reached the summary: {summary}"
+    );
+}

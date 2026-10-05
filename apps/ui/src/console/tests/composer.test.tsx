@@ -42,6 +42,22 @@ describe('Composer against the mock hub', () => {
     hub = undefined;
   });
 
+  it('disables input for a session without a PitCrew terminal and explains it without an id', async () => {
+    hub = await startHub();
+    const { requests } = renderWithHub(hub, <Pane sessionId={ID.ses4} />, { fetch: async (input, init) => {
+      const response = await fetch(input, init);
+      if (!String(input).endsWith(`/v1/sessions/${ID.ses4}`)) return response;
+      const session = await response.json();
+      delete session.terminal;
+      return new Response(JSON.stringify(session), { headers: { 'Content-Type': 'application/json' } });
+    } });
+    const reason = await screen.findByText(/PitCrew did not start this session/);
+    expect(reason.textContent).not.toContain(ID.ses4);
+    expect(screen.getByRole('textbox', { name: 'Message to the agent' })).toHaveProperty('disabled', true);
+    for (const name of ['Send', 'Send Escape', 'Send Ctrl+C']) expect(screen.getByRole('button', { name })).toHaveProperty('disabled', true);
+    expect(requests.filter((r) => r.method === 'POST')).toHaveLength(0);
+  });
+
   it('sends on Enter and the canned reply appears in the chat', async () => {
     hub = await startHub();
     const { requests } = renderWithHub(hub, <Pane sessionId={ID.ses4} />);

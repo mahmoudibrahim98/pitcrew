@@ -46,6 +46,7 @@
 //!   an adoption still on its way to the hub is allowed to arrive first.
 
 use crate::agents::HubAgents;
+use crate::confined::{ConfinedRuns, Ender, GRACE};
 use crate::runner::{Attached, Parts};
 use crate::state::{read_token, write_token};
 use pitcrew_auth::TokenStore;
@@ -84,15 +85,19 @@ pub struct RunnerLink {
     attached: Arc<Attached>,
     /// Where scratch folders are made (`scratch/` in the state directory), if anywhere.
     scratch: Option<PathBuf>,
+    /// Confined runs (board drafts): their folders, files, tokens and ends.
+    confined: Option<Ender>,
 }
 
 impl RunnerLink {
-    /// Starts dispatched sessions with the runner `attached` has, once it has one.
+    /// Starts dispatched sessions with the runner `attached` has, once it has one. No confined
+    /// run starts: see [`RunnerLink::with_confined`].
     #[must_use]
     pub fn new(attached: Arc<Attached>) -> Self {
         Self {
             attached,
             scratch: None,
+            confined: None,
         }
     }
 
@@ -100,6 +105,22 @@ impl RunnerLink {
     #[must_use]
     pub fn with_scratch(mut self, dir: PathBuf) -> Self {
         self.scratch = Some(dir);
+        self
+    }
+
+    /// Starts confined runs too (`SessionRequest::confinement`, a board draft's) with `runs`; the
+    /// work model is given to `work` once it is made (see [`crate::confined`]).
+    #[must_use]
+    pub fn with_confined(
+        mut self,
+        runs: Arc<ConfinedRuns>,
+        work: Arc<OnceLock<Weak<WorkService>>>,
+    ) -> Self {
+        self.confined = Some(Ender {
+            attached: Arc::clone(&self.attached),
+            runs,
+            work,
+        });
         self
     }
 
@@ -147,24 +168,67 @@ impl Dispatcher for RunnerLink {
         }
     }
 
-    /// A board draft's session: started as a dispatch's is, under the session the hub stored
-    /// (its agent's token comes from [`AgentEnv`], as for any session stored with an agent).
+    /// A session the hub stored for an agent outside a dispatch (a board draft's): started as a
+    /// dispatch's is, under the session the hub stored. A confined one (all board drafts) is
+    /// prepared first ([`ConfinedRuns::prepare`]: its fresh folder, its files, its session token,
+    /// which [`AgentEnv`] gives its CLI in place of its agent's), started in its confined shape,
+    /// and watched until it ends or runs past its time.
     fn start_session(&self, request: &SessionRequest) -> Result<(), DispatchError> {
         let _starting = self.attached.starting(request.session);
         let runner = self.runner(&request.machine)?;
-        let folder = folder(&request.cwd).map_err(DispatchError::Rejected)?;
         let mut command = request.start_command();
+        let confined = match (&request.confinement, &self.confined) {
+            (Some(confinement), Some(ender)) => {
+                let (folder, stop) = ender
+                    .runs
+                    .prepare(request, confinement)
+                    .map_err(DispatchError::Unavailable)?;
+                let folder = folder.into_os_string().into_string().map_err(|_| {
+                    DispatchError::Unavailable("the scratch folder is not UTF-8".into())
+                });
+                let folder = match folder {
+                    Ok(folder) => folder,
+                    Err(e) => {
+                        ender.runs.finish(&request.session);
+                        return Err(e);
+                    }
+                };
+                Some((ender, folder, stop, confinement.max_runtime))
+            }
+            (Some(_), None) => {
+                return Err(DispatchError::Unavailable(
+                    "this hub's runner link starts no confined runs".into(),
+                ));
+            }
+            (None, _) => None,
+        };
+        let cwd_for = match &confined {
+            Some((_, folder, ..)) => folder.clone(),
+            None => folder(&request.cwd).map_err(DispatchError::Rejected)?,
+        };
         if let RunnerCommand::StartSession { cwd, .. } = &mut command {
-            *cwd = folder;
+            *cwd = cwd_for;
         }
-        match runner.commands.run(CommandId::new(), &command) {
-            CommandOutcome::Ok { .. } => {
-                tracing::info!(session = %request.session, agent = %request.agent, "started a session the hub stored for an agent");
+        let outcome = runner.commands.run(CommandId::new(), &command);
+        match (outcome, confined) {
+            (CommandOutcome::Ok { .. }, confined) => {
+                tracing::info!(session = %request.session, agent = %request.agent, confined = confined.is_some(), "started a session's CLI for an agent");
+                if let Some((ender, _, stop, max_runtime)) = confined {
+                    ender.watch(request.session, max_runtime, stop);
+                }
                 self.attached.started();
                 Ok(())
             }
-            CommandOutcome::Rejected { reason } => Err(DispatchError::Rejected(reason)),
-            CommandOutcome::Failed { error } => Err(DispatchError::Unavailable(error)),
+            (failed, confined) => {
+                if let Some((ender, ..)) = confined {
+                    ender.runs.finish(&request.session);
+                }
+                match failed {
+                    CommandOutcome::Rejected { reason } => Err(DispatchError::Rejected(reason)),
+                    CommandOutcome::Failed { error } => Err(DispatchError::Unavailable(error)),
+                    CommandOutcome::Ok { .. } => Ok(()),
+                }
+            }
         }
     }
 
@@ -223,6 +287,27 @@ impl Dispatcher for RunnerLink {
             .ok()
             .map(|_| crate::orchestrator::installed(engine))
     }
+
+    fn confined_folder(&self, session: &SessionId) -> Option<String> {
+        let ender = self.confined.as_ref()?;
+        ender
+            .runs
+            .folder_of(session)?
+            .into_os_string()
+            .into_string()
+            .ok()
+    }
+
+    /// The run has done its one thing: its token stops now; its CLI is ended after [`GRACE`]
+    /// (gracefully, else killed), on a thread of its own, and its folder goes with it.
+    fn finish_session(&self, session: &SessionId) -> Result<(), DispatchError> {
+        let Some(ender) = &self.confined else {
+            return Ok(());
+        };
+        ender.runs.revoke(session);
+        ender.end_later(*session, GRACE, "its run is done");
+        Ok(())
+    }
 }
 
 /// A dispatch's folder, as the CLI starts in it: `~` (or `~/…`) in this user's home, then checked
@@ -265,6 +350,8 @@ pub struct AgentEnv {
     endpoint: OnceLock<(&'static str, String)>,
     /// One token file written at a time.
     writing: Mutex<()>,
+    /// Confined runs, whose CLIs get their session token's file instead of their agent's.
+    confined: Option<Arc<ConfinedRuns>>,
 }
 
 impl fmt::Debug for AgentEnv {
@@ -287,7 +374,15 @@ impl AgentEnv {
             dir,
             endpoint: OnceLock::new(),
             writing: Mutex::new(()),
+            confined: None,
         }
+    }
+
+    /// A confined run's CLI gets the file of its session token from `runs`, never its agent's.
+    #[must_use]
+    pub fn with_confined(mut self, runs: Arc<ConfinedRuns>) -> Self {
+        self.confined = Some(runs);
+        self
     }
 
     /// This daemon listens there now: `variable` (`PITCREW_SOCKET`, `PITCREW_PIPE` or
@@ -354,16 +449,31 @@ impl SessionEnv for AgentEnv {
                 owner: Some(owner),
             } => (agent, owner),
         };
+        // A confined run's CLI gets its session token, which can do only its run's one thing;
+        // and a board draft's session never gets its agent's token, even once its run is gone.
         // The Orchestrator's sessions only read: their CLI's token can do nothing else.
+        let confined = self
+            .confined
+            .as_ref()
+            .and_then(|runs| runs.token_file(&session));
         let scope = if work.reads_only(&session) {
             TokenScope::Reader
         } else {
             TokenScope::Agent
         };
-        let file = self.token_file(agent, owner, scope).map_err(|e| {
-            tracing::error!(%agent, error = %format!("{e:#}"), "cannot write an agent's token file");
-            "the agent's token file cannot be written".to_owned()
-        })?;
+        let file = match confined {
+            Some(file) => file,
+            None if work.is_draft_session(&session).unwrap_or(true) => {
+                return Err(format!(
+                    "session {session} is a board draft's, and its run's token is gone, so its \
+                     CLI cannot be given one"
+                ));
+            }
+            None => self.token_file(agent, owner, scope).map_err(|e| {
+                tracing::error!(%agent, error = %format!("{e:#}"), "cannot write an agent's token file");
+                "the agent's token file cannot be written".to_owned()
+            })?,
+        };
         let file = file
             .into_os_string()
             .into_string()
@@ -412,13 +522,23 @@ pub(crate) fn private_dir(dir: &Path) -> std::io::Result<()> {
 pub struct FollowingSink {
     inner: StoreSink,
     work: Arc<WorkService>,
+    publication: Arc<Mutex<()>>,
 }
 
 impl FollowingSink {
     /// `inner`'s batches, followed by `work`.
     #[must_use]
     pub fn new(inner: StoreSink, work: Arc<WorkService>) -> Self {
-        Self { inner, work }
+        Self {
+            inner,
+            work,
+            publication: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// Serializes terminal publication with transcript adoption and state reports.
+    pub fn publication(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.publication)
     }
 }
 
@@ -432,6 +552,10 @@ impl fmt::Debug for FollowingSink {
 
 impl EventSink for FollowingSink {
     fn accept(&self, events: &[Event]) -> Result<(), SinkError> {
+        let _publication = self
+            .publication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         self.inner.accept(events)?;
         if let Err(e) = self.work.follow_sessions(events) {
             tracing::warn!(error = %e, "the work model could not follow what the runner reported");
@@ -684,6 +808,49 @@ mod tests {
             .collect();
         store.append(&events).unwrap();
         Arc::new(WorkService::new(store, workspace))
+    }
+
+    #[test]
+    fn terminal_publication_and_transcript_adoption_are_serialized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sam = member(MemberKind::Human, "@sam", None);
+        let initial = session(None);
+        let work = work(tmp.path(), &[&sam], &[&initial]);
+        let sink = Arc::new(FollowingSink::new(
+            StoreSink::new(work.store().clone(), sam.id),
+            work.clone(),
+        ));
+        let publication = sink.publication();
+        let held = publication.lock().unwrap();
+        let mut adopted = initial.clone();
+        adopted.native_id = "synthetic-native".into();
+        adopted.state = SessionState::Working;
+        adopted.terminal = Some(pitcrew_protocol::ids::TerminalId::new());
+        adopted.title = Some("Synthetic title".into());
+        let event = Event::now(
+            work.workspace(),
+            sam.id,
+            EventBody::SessionDiscovered {
+                session: adopted.clone(),
+            },
+        );
+        let (ready, waiting) = std::sync::mpsc::channel();
+        let (done, completed) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            ready.send(()).unwrap();
+            sink.accept(&[event]).unwrap();
+            done.send(()).unwrap();
+        });
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            completed.recv_timeout(Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(work.session(&initial.id).unwrap(), initial);
+        drop(held);
+        completed.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        assert_eq!(work.session(&adopted.id).unwrap(), adopted);
     }
 
     /// A CLI started for a session run as an agent gets a file holding an agent token for that
@@ -1011,6 +1178,7 @@ mod tests {
                 account: None,
                 permission_mode: PermissionMode::Default,
                 session: Some(named),
+                confined: false,
             };
             assert!(matches!(
                 commands.run(CommandId::new(), &command(pending.id)),
@@ -1130,17 +1298,20 @@ mod tests {
             let config =
                 RunnerConfig::new(work.workspace(), machine, sam, tmp.path().join("runner"))
                     .with_home(Engine::Codex, &home);
+            let sink = Arc::new(FollowingSink::new(
+                StoreSink::new(work.store().clone(), sam),
+                work.clone(),
+            ));
+            let publication = sink.publication();
             let runner = pitcrew_runner::start(
                 config,
                 vec![Arc::new(pitcrew_ingest::codex::CodexAdapter::new())],
-                Arc::new(FollowingSink::new(
-                    StoreSink::new(work.store().clone(), sam),
-                    work.clone(),
-                )),
+                sink,
             )
             .unwrap();
             let terminals = runner.terminals(runtime).unwrap();
             attached.set(Parts {
+                publication,
                 machine,
                 hooks: runner.hooks(),
                 commands: runner.commands(&terminals),

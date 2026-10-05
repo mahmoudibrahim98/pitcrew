@@ -85,6 +85,16 @@ mod tests {
         }
     }
 
+    /// The draft's prompt asks for the proposal in a file (PowerShell and `cmd.exe` have no
+    /// heredoc), and to read nothing but itself.
+    #[test]
+    fn the_draft_prompt_submits_from_a_file_and_reads_nothing_else() {
+        let template = DRAFT_BOARD.template;
+        assert!(template.contains("pitcrew board submit {{draft}} --file proposal.json"));
+        assert!(!template.contains("<<"), "no heredoc");
+        assert!(template.contains("read no other file"));
+    }
+
     #[test]
     fn the_orchestrator_prompt_names_its_version_and_placeholders() {
         assert_eq!(ORCHESTRATOR.id(), "orchestrator/v1");

@@ -143,6 +143,62 @@ fn require_own_task(conn: &Connection, caller: &Caller, task: &Task) -> Result<(
     Ok(())
 }
 
+/// A new task as [`WorkService::create_task`] makes it, under the command lock: checked (a title;
+/// a well-formed due date; the project known, the workstream in it, the assignee known) and
+/// numbered after `taken`, the highest number this append has used in the project already (the
+/// project's highest stored when `None`). Board-draft reviews make the tasks a person accepts
+/// with it too.
+pub(crate) fn plan_task(c: &Connection, new: NewTask, taken: Option<u32>) -> Result<Task> {
+    not_empty(&new.title, "title")?;
+    if let Some(due) = &new.due
+        && !due.is_well_formed()
+    {
+        return Err(WorkError::invalid("due must be a date written YYYY-MM-DD."));
+    }
+    let project = query::project(c, &new.project)?
+        .ok_or_else(|| WorkError::invalid(format!("project: no project {}.", new.project)))?;
+    if let Some(id) = &new.workstream {
+        let workstream = query::workstream(c, id)?
+            .ok_or_else(|| WorkError::invalid(format!("workstream: no workstream {id}.")))?;
+        if workstream.project != project.id {
+            return Err(WorkError::invalid(format!(
+                "workstream \"{}\" belongs to another project.",
+                workstream.name
+            )));
+        }
+    }
+    if let Some(id) = &new.assignee {
+        known_member(c, id, "assignee")?;
+    }
+    let highest = match taken {
+        Some(number) => number,
+        None => query::highest_task_number(c, &project.key)?,
+    };
+    let number = highest
+        .checked_add(1)
+        .ok_or_else(|| WorkError::conflict(format!("{} has no task numbers left.", project.key)))?;
+    let key = TaskKey::new(project.key.clone(), number)
+        .map_err(|e| WorkError::internal(e.to_string()))?;
+    Ok(Task {
+        id: TaskId::new(),
+        key,
+        project: project.id,
+        workstream: new.workstream,
+        title: new.title,
+        description: new.description.unwrap_or_default(),
+        status: new.status.unwrap_or(TaskStatus::Todo),
+        priority: new.priority.unwrap_or_default(),
+        assignee: new.assignee,
+        labels: new.labels.unwrap_or_default(),
+        start: None,
+        due: new.due,
+        blocked_by: Vec::new(),
+        source: None,
+        accept_auto: false,
+        subtasks: Vec::new(),
+    })
+}
+
 pub(crate) fn not_empty(text: &str, field: &str) -> Result<()> {
     if text.trim().is_empty() {
         Err(WorkError::invalid(format!("{field} must not be empty.")))
@@ -332,57 +388,8 @@ impl WorkService {
     /// writer took the key first (see "One writer" on [`WorkService`]).
     pub fn create_task(&self, caller: &Caller, new: NewTask) -> Result<Task> {
         require_person(caller, "Creating a task")?;
-        not_empty(&new.title, "title")?;
-        if let Some(due) = &new.due
-            && !due.is_well_formed()
-        {
-            return Err(WorkError::invalid("due must be a date written YYYY-MM-DD."));
-        }
         let _guard = self.lock();
-        let (project, number) = self.read(|c| {
-            let project = query::project(c, &new.project)?.ok_or_else(|| {
-                WorkError::invalid(format!("project: no project {}.", new.project))
-            })?;
-            if let Some(id) = &new.workstream {
-                let workstream = query::workstream(c, id)?.ok_or_else(|| {
-                    WorkError::invalid(format!("workstream: no workstream {id}."))
-                })?;
-                if workstream.project != project.id {
-                    return Err(WorkError::invalid(format!(
-                        "workstream \"{}\" belongs to another project.",
-                        workstream.name
-                    )));
-                }
-            }
-            if let Some(id) = &new.assignee {
-                known_member(c, id, "assignee")?;
-            }
-            let highest = query::highest_task_number(c, &project.key)?;
-            Ok((project, highest))
-        })?;
-        let number = number.checked_add(1).ok_or_else(|| {
-            WorkError::conflict(format!("{} has no task numbers left.", project.key))
-        })?;
-        let key = TaskKey::new(project.key.clone(), number)
-            .map_err(|e| WorkError::internal(e.to_string()))?;
-        let task = Task {
-            id: TaskId::new(),
-            key,
-            project: project.id,
-            workstream: new.workstream,
-            title: new.title,
-            description: new.description.unwrap_or_default(),
-            status: new.status.unwrap_or(TaskStatus::Todo),
-            priority: new.priority.unwrap_or_default(),
-            assignee: new.assignee,
-            labels: new.labels.unwrap_or_default(),
-            start: None,
-            due: new.due,
-            blocked_by: Vec::new(),
-            source: None,
-            accept_auto: false,
-            subtasks: Vec::new(),
-        };
+        let task = self.read(|c| plan_task(c, new, None))?;
         let (id, key) = (task.id, task.key.clone());
         self.append(&[self.by(caller, EventBody::TaskCreated { task })])?;
         match self.read(|c| {

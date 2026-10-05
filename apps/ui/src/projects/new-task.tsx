@@ -1,5 +1,6 @@
 // "+ New" → "Task": replaces the shell's placeholder. Minimal fields; the hub assigns the key.
 
+import { useRouter } from '@tanstack/react-router';
 import { useId, useState, type FormEvent } from 'react';
 import { Button, DialogFooter } from '../design/index.ts';
 import { useCreateTask, useMembers, useProjects, useWorkstreams } from './data.ts';
@@ -12,13 +13,15 @@ export function NewTaskDialog({ close }: { close(): void }) {
   const members = useMembers();
   const create = useCreateTask();
   const nav = useProjectsNav();
-  const [project, setProject] = useState('');
+  const router = useRouter({ warn: false });
+  const context = router?.state.matches.map((match) => (match.params as { project?: string }).project).find((id) => id !== undefined);
+  const [project, setProject] = useState(context ?? '');
   const [workstream, setWorkstream] = useState('');
   const [title, setTitle] = useState('');
   const [assignee, setAssignee] = useState('');
   const [due, setDue] = useState('');
-  const workstreams = useWorkstreams(project === '' ? undefined : project);
   const projectId = project !== '' ? project : (projects.data?.[0]?.id ?? '');
+  const workstreams = useWorkstreams(projectId || undefined);
 
   const submit = (e: FormEvent) => {
     e.preventDefault();
@@ -52,6 +55,7 @@ export function NewTaskDialog({ close }: { close(): void }) {
           <input
             id={id}
             required
+            data-create-focus
             autoFocus
             value={title}
             onChange={(e) => setTitle(e.target.value)}
@@ -82,7 +86,7 @@ export function NewTaskDialog({ close }: { close(): void }) {
         {(id) => (
           <select id={id} value={workstream} onChange={(e) => setWorkstream(e.target.value)} className={inputClass}>
             <option value="">None</option>
-            {(workstreams.data ?? []).map((w) => (
+            {(workstreams.data ?? []).filter((w) => w.project === projectId).map((w) => (
               <option key={w.id} value={w.id}>
                 {w.name}
               </option>

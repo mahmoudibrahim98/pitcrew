@@ -7,87 +7,30 @@
 // as a session event).
 
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import {
-  useApi,
-  useLiveQuery,
-  type Engine,
-  type MemberId,
-  type SessionId,
-  type Task,
-  type TaskId,
-  type TaskStatus,
-  type WorkstreamId,
-} from '../data/index.ts';
+import type { BoardDraft } from '../../../../packages/protocol-ts/bindings/BoardDraft.ts';
+import type { DraftCost } from '../../../../packages/protocol-ts/bindings/DraftCost.ts';
+import type { DraftPreview } from '../../../../packages/protocol-ts/bindings/DraftPreview.ts';
+import type { StartDraft } from '../../../../packages/protocol-ts/bindings/StartDraft.ts';
+import { useApi, useLiveQuery, type SessionId, type Task, type WorkstreamId } from '../data/index.ts';
 
-export interface UsageEstimate {
-  input_tokens: number;
-  output_tokens: number;
-}
+// The board types are the protocol's own, generated from `crates/protocol` (`board.rs`).
+export type { BoardDraft } from '../../../../packages/protocol-ts/bindings/BoardDraft.ts';
+export type { BoardProposal } from '../../../../packages/protocol-ts/bindings/BoardProposal.ts';
+export type { DraftCost } from '../../../../packages/protocol-ts/bindings/DraftCost.ts';
+export type { DraftPreview } from '../../../../packages/protocol-ts/bindings/DraftPreview.ts';
+export type { DraftState } from '../../../../packages/protocol-ts/bindings/DraftState.ts';
+export type { DraftedTask } from '../../../../packages/protocol-ts/bindings/DraftedTask.ts';
+export type { ProposedTask } from '../../../../packages/protocol-ts/bindings/ProposedTask.ts';
+export type { StartDraft } from '../../../../packages/protocol-ts/bindings/StartDraft.ts';
+export type { UsageEstimate } from '../../../../packages/protocol-ts/bindings/UsageEstimate.ts';
 
-export interface DraftCost {
-  sessions: number;
-  sessions_left_out: number;
-  tasks: number;
-  summary_bytes: number;
-  prompt_bytes: number;
-  redacted: number;
-  estimate: UsageEstimate;
-}
-
-export interface DraftPreview {
-  workstream: WorkstreamId;
-  prompt: string;
-  cost: DraftCost;
-  summary: string;
-  digest: string;
-}
-
-export type DraftState = 'running' | 'proposed' | 'reviewed' | 'ended';
-
-export interface ProposedTask {
-  title: string;
-  status: TaskStatus;
-  description?: string;
-  evidence: SessionId[];
-}
-
-export interface BoardProposal {
-  tasks: ProposedTask[];
-  note?: string;
-}
-
-export interface DraftedTask {
-  item: number;
-  task: TaskId;
-}
-
-export interface BoardDraft {
-  id: string;
-  workstream: WorkstreamId;
-  agent: MemberId;
-  engine: Engine;
-  session: SessionId;
-  by: MemberId;
-  prompt: string;
-  cost: DraftCost;
-  started: number;
-  state: DraftState;
-  proposal?: BoardProposal;
-  proposed?: number;
-  reviewed?: number;
-  accepted: DraftedTask[];
-  rejected: number[];
-}
-
+/**
+ * The review's answer: the generated `DraftReviewed`, with its tasks as the UI's `Task` (the data
+ * layer's, which the rest of the UI holds; the same wire shape, see `packages/protocol-ts/DRIFT.md`).
+ */
 export interface DraftReviewed {
   draft: BoardDraft;
   tasks: Task[];
-}
-
-export interface StartDraft {
-  agent?: MemberId;
-  engine?: Engine;
-  digest: string;
 }
 
 /** How often a running draft is looked at again. */

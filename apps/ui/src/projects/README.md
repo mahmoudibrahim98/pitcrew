@@ -24,7 +24,7 @@ none of this folder lands in the initial bundle until a projects route is visite
 | `my-tasks.tsx`, `projects-list.tsx`, `members.tsx` | My tasks (the board filtered to me), the projects list, and members (people and agents, owners shown). |
 | `new-task.tsx` | `NewTaskDialog`: the "+ New" → "Task" item, replacing the shell's placeholder. |
 | `inbox.tsx` | `Inbox`: open asks to me by kind, answered in place with stream M's `QuestionCard` (`src/console`); receipts and the task link are the Inbox's own, shown alongside it. |
-| `board-draft.tsx`, `board-drafts.ts` | "Draft board" on a workstream (api-v1.md, "Board drafts"): `DraftStart` shows what will be sent (the summary, as text), its size, the number of sessions and redactions, and the agent's estimated usage before anything is; the person picks the agent (their own; the back office first) and the CLI and sends; `DraftReview` accepts or rejects each proposed task (or all, or none), and only the accepted ones become tasks, labelled `drafted`. `DraftBoardPanel` is the workstream page's panel; the page also says when a proposal waits. The hooks poll while a draft runs; `board_*` events are new to the data layer, which refetches everything on them. |
+| `board-draft.tsx`, `board-drafts.ts` | "Draft board" on a workstream (api-v1.md, "Board drafts"): `DraftStart` shows what will be sent (the summary, as text), its size, the number of sessions and redactions, and the agent's estimated usage before anything is; the person picks the agent (their own; the back office first) and the CLI, offered only among those found on the hub's machine, where drafts run (`useDraftEngines`, its `session-options`), and sends; `DraftReview` starts with nothing accepted and lets the person accept or reject each proposed task (or all, or none), and only the accepted ones become tasks, labelled `drafted`. `DraftBoardPanel` is the workstream page's panel; the page also says when a proposal waits. The board types are the generated ones (`packages/protocol-ts/bindings`), re-exported by `board-drafts.ts`. The hooks poll while a draft runs; `board_*` events are new to the data layer, which refetches everything on them. `tests/board-draft.test.tsx` and the browser walk `tests/e2e/board-draft.spec.ts` (in the root `pnpm e2e`, against the mock hub) cover it. |
 | `where-it-stands.tsx` | `WhereItStands`: the brief with receipts; edit and pin for people; the back office's pending proposal (`brief.proposal`), accepted or kept aside — see "Pending proposals" below. |
 | `receipts.tsx` | Receipt chips: web links for pull requests, `openReceipt` buttons, a transcript's session (`openSession`) when there is no `openReceipt`, or plain chips otherwise. |
 | `activity.tsx` | `ActivityFeed` (Summary / All events, "Load older") and `EventList`. Summary is the recap for the same filters (`recaps.tsx`). In All events, a `project` or `workstream` filter that comes back `400 invalid` (a hub without its activity index) shows "Activity isn't available here yet." instead of an error. |
@@ -268,3 +268,28 @@ shows a note instead of an error, with task/session activity unaffected. `tests/
 test.tsx`'s proposal tests use the mock's demo data (the PAP project brief has a pending proposal)
 for Accept and Keep current; a `next` step on the proposal itself is injected at the `fetch` layer
 (`withProposedNext`) since that fixture's own proposal has none.
+
+## Start session
+
+A workstream's **Start session** opens the console's shared New session dialog with its
+machine and folder prefilled from the workstream's locations. Multiple locations remain
+selectable. The console owns launching and opens the resulting session's terminal in the
+workbench; this entry does not register another shell create item.
+
+## Creation dialogs
+
+`new-entities.tsx` owns Project, Agent, Team and contextual Workstream entries. Project suggests an
+editable key, validates an absolute root for the selected machine's reported platform (WSL uses
+Unix paths), and accepts an optional first workstream. Before a machine reports its platform,
+only structurally absolute Unix/drive/UNC forms are accepted. The optional workstream is committed
+atomically by `POST /v1/projects`; standalone creation uses `POST /v1/workstreams`. Success refreshes
+lists and opens the new project/workstream. Agent and Team refresh Members' recipe/team sections
+without a reload; newly created personas have owned agent members selectable in teams. Errors
+stay in the form. All modal/focus behavior belongs to the shell; pending submissions are disabled.
+
+Run `corepack pnpm --filter @pitcrew/ui exec playwright test -c
+src/projects/tests/e2e/create-dialogs.config.ts` for both themes, validation, live lists, palette,
+focus and axe. `E2E_HUB_URL` and `E2E_HUB_TOKEN` select a disposable real demo hub for the same tests;
+defaults start the mock hub. `tests/create-dialogs.test.tsx` covers the forms and platform roots.
+
+Directory creation uses friendly engine handles, ownership-checked persona edits, and runner-safe model/permission values. Dispatch lists and accepts only persona-linked agents. Every successful scan provisions missing owned agents idempotently. Local setup records OS/architecture and local project roots must be absolute on that platform. Creation dialogs focus Name; tasks default to the current project and filter its workstreams.

@@ -51,7 +51,10 @@ function sessionFeature(): Feature {
   return defineFeature({
     id: 'console',
     layout: 'console',
-    create: [{ id: 'session', label: 'Session', dialog: () => <p>Starting…</p>, disabled: REASON }],
+    create: [
+      { id: 'task', label: 'Task', order: 10, dialog: () => <p>Task form</p> },
+      { id: 'session', label: 'Session', dialog: () => <p>Starting…</p>, disabled: REASON },
+    ],
   });
 }
 

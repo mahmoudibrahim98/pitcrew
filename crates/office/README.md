@@ -62,12 +62,16 @@ activity, so the office never feeds on itself.
   titles, recaps (the activity they describe), files, branches, task titles and names, never reach
   the prompt, nor a long piece of one; hidden characters and newlines cannot inject lines or close
   the summary; every bound holds with 100 sessions and 200 tasks of 10,000-character texts, the
-  most recent kept and the rest counted; the estimate follows the prompt's size.
-- Unit tests in `src/redact.rs` (each rule, plain text left alone, bounds after redaction),
-  `src/prompts.rs` (one-pass rendering) and `src/orchestrator.rs` (references found once with
-  their punctuation trimmed; suggestion lines taken out and others kept; questions cleaned, and
-  follow-ups one line and never a CLI command; the prompt holds the question last and bounded,
-  data-only context).
+  most recent kept and the rest counted; the estimate follows the prompt's size; files say which
+  file and not whose folder (`relative_to`, the end of other absolute paths, the file name of a
+  long one).
+- Unit tests in `src/redact.rs` (each rule, plain text left alone, bounds after redaction, a value
+  after a lone separator or in quotes, a token behind punctuation, control characters that would
+  split a secret, other absolute paths), `src/prompts.rs` (one-pass rendering; the draft's
+  prompt asks for `--file proposal.json` and to read nothing else) and `src/orchestrator.rs`
+  (references found once with their punctuation trimmed; suggestion lines taken out and others
+  kept; questions cleaned, and follow-ups one line and never a CLI command; the prompt holds the
+  question last and bounded, data-only context).
 
 ## Prompts as files, and what a board draft sends
 
@@ -75,6 +79,9 @@ activity, so the office never feeds on itself.
   (`prompts::DRAFT_BOARD`, `prompts/draft-board/v1.md`; `prompts::ORCHESTRATOR`,
   `prompts/orchestrator/v1.md`). A template is never edited once
   released: a change is a new version, and what was sent records the version (`draft-board/v1`).
+  (`draft-board/v1` was changed before it was released, with #54: the proposal goes in
+  `proposal.json` and `pitcrew board submit <draft> --file proposal.json`, since PowerShell and
+  `cmd.exe` have no heredoc, and the draft reads nothing but its prompt.)
   `Prompt::render` puts each `{{name}}` in, in one pass, so a value never reaches another
   placeholder.
 - **`board`**: the bounded, redacted summary a board draft (brief
@@ -84,10 +91,13 @@ activity, so the office never feeds on itself.
   summaries of blocks of work, and the workstream's tasks); never a transcript, a prompt or a
   tool's output.
   - **Bounds:** 40 sessions, most recently active first; 60 tasks in at most 4 KiB; per session a
-    title of 120 characters, 3 recap lines of 200, 5 files of 100; names of 80; the whole summary
-    at most 12 KiB, the least recently active sessions left out (and counted) when it is full.
-    The prompt is at most the template plus 12 KiB (`MAX_PROMPT_BYTES`), well inside a command
-    line on every platform.
+    title of 120 characters, 3 recap lines of 200, 5 files of 100 (cut at their start, so the
+    file name stays); names of 80; the whole summary at most 12 KiB, the least recently active
+    sessions left out (and counted) when it is full. The prompt is at most the template plus
+    12 KiB (`MAX_PROMPT_BYTES`); it goes in the draft's `prompt.md`, never on a command line.
+  - **Files** are named relative to the session's folder or the workstream's
+    (`relative_to`, which the hub calls); any other absolute path keeps only its end
+    (`redact::path_tail`).
   - **The estimate:** the agent reads the prompt (a token for every 4 bytes, rounded up) plus a
     fixed 15,000-token allowance for its CLI's own instructions (`CLI_OVERHEAD_TOKENS`); its
     answer is at most the proposal's bound, 32 KiB, so 8,192 tokens.
@@ -110,14 +120,20 @@ activity, so the office never feeds on itself.
     and `recap:wst_…`/`recap:prj_…` with an optional `@YYYY-MM-DD`, each word trimmed of `-`, `:`
     and `@` at its ends, each once, and the lines `Suggestion: move <task> to <status>` and
     `Suggestion: open <reference>` (at most 10), taken out of the text.
-- **`redact`**: what never leaves in a prompt. Every text is made one line (hidden and control
-  characters dropped, so nothing hides a secret from the rules), then: private key blocks;
-  well-known token prefixes (`sk-`, `ghp_`, `github_pat_`, `glpat-`, `xoxb-`, `AKIA`, `AIza`,
-  PitCrew's `pcd_`/`pca_`/`pcr_`, and others, followed by at least 8 token characters with digits or mixed
-  case); JSON Web Tokens; the values of secrets' names (`password=`, `token:`, `--password x`,
-  `?access_token=`, `Authorization: Bearer x`); a URL's user and password; long random-looking
-  words (32+ characters, mixed case and digits, or hexadecimal); e-mail addresses; and home
-  folders (`/home/<name>`, `/Users/<name>`, `C:\Users\<name>`, `/root` become `~`). Each segment
-  of a path or branch is checked too. The rules are broad on purpose: a false positive costs a
+- **`redact`**: what never leaves in a prompt. Every text is made one line (hidden characters and
+  control characters other than whitespace dropped, never made spaces, so nothing hides or splits
+  a secret), then: private key blocks; well-known token prefixes (`sk-`, `ghp_`, `github_pat_`,
+  `glpat-`, `xoxb-`, `AKIA`, `AIza`, PitCrew's `pcd_`/`pca_`/`pcr_`/`pcs_`, and others, followed
+  by at least 8 token characters with digits or mixed case), also behind or inside punctuation
+  (`**ghp_…**`, `$sk-…`, `#glpat-…`, the punctuation kept); JSON Web Tokens; the values of secrets'
+  names (`password=`, `token:`, `--password x`, `?access_token=`, `Authorization: Bearer x`, and
+  with a lone `:`/`=`/`:=`/`=>` or quotes between, `"password": "x"`, `password = x`); a URL's user
+  and password; long random-looking words (32+ characters, mixed case and digits, or
+  hexadecimal); e-mail addresses; home folders (`/home/<name>`, `/Users/<name>`,
+  `C:\Users\<name>`, also as `\\?\C:\Users\<name>` and WSL's `/mnt/c/Users/<name>`, and `/root`
+  become `~`); and any other absolute path, cut to its end (`path_tail`: its last two parts after
+  `…/` when it has five or more, its file name when it has one, else `…`), so a user name in
+  `/scratch/<group>/<user>` does not go. Each segment of a path or branch is checked too; `path`
+  is `line` for a path, cut at its start. The rules are broad on purpose: a false positive costs a
   word of context, a false negative a secret. Each replacement is counted, and the person sees the
   count before anything is sent.

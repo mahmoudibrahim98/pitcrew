@@ -1,5 +1,5 @@
-//! A small app for the API tests: agent routes (a read and a write), a read route, a device
-//! route, and a device WebSocket.
+//! A small app for the API tests: agent routes (a read and a write), a read route, a session
+//! route, a device route, and a device WebSocket.
 
 #![allow(dead_code)]
 
@@ -23,9 +23,11 @@ pub struct Fixture {
     pub agent: Caller,
     /// The agent, as a reader: a token that may only read.
     pub reader: Caller,
+    pub session: Caller,
     pub device_token: String,
     pub agent_token: String,
     pub reader_token: String,
+    pub session_token: String,
 }
 
 impl Fixture {
@@ -45,17 +47,24 @@ impl Fixture {
             scope: TokenScope::Reader,
             ..agent
         };
+        let session = Caller {
+            scope: TokenScope::Session(pitcrew_protocol::SessionId::new()),
+            ..agent
+        };
         let (_, device_token) = tokens.mint(person).unwrap();
         let (_, agent_token) = tokens.mint(agent).unwrap();
         let (_, reader_token) = tokens.mint(reader).unwrap();
+        let (_, session_token) = tokens.mint(session).unwrap();
         Self {
             tokens,
             person,
             agent,
             reader,
+            session,
             device_token: device_token.into_string(),
             agent_token: agent_token.into_string(),
             reader_token: reader_token.into_string(),
+            session_token: session_token.into_string(),
         }
     }
 
@@ -76,6 +85,7 @@ impl Fixture {
                     .nest("/v1/agent-files", nested("agent fallback")),
             )
             .read(Router::new().route("/v1/read", whoami.clone()))
+            .session(Router::new().route("/v1/session-answer", whoami.clone()))
             .device(
                 Router::new()
                     .route("/v1/device-only", whoami.clone())

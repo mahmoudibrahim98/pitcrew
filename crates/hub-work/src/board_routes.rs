@@ -1,10 +1,10 @@
 //! The board-draft routes of API v1 (api-v1.md, "Board drafts"; see [`crate::board`]), apart
 //! from the work routes, so a composition mounts them on purpose:
 //!
-//! - [`board_agent_routes`]: `POST /v1/board-drafts/{id}/proposal`, the drafting agent's answer.
-//!   Mount with `RouterParts::agent`; only the draft's own agent may call it (`403` for anyone
-//!   else, a person included, before the body is read). The body is at most
-//!   [`MAX_PROPOSAL_BYTES`].
+//! - [`board_session_routes`]: `POST /v1/board-drafts/{id}/proposal`, the drafting CLI's answer.
+//!   Mount with `RouterParts::session`; only the draft's own session token may call it (`403` for
+//!   anyone else, its agent's own token and a person included, before the body is read). The
+//!   body is at most [`MAX_PROPOSAL_BYTES`].
 //! - [`board_device_routes`]: the preview, the start, the list, one draft, and the review. Mount
 //!   with `RouterParts::device`; each handler refuses agents itself too.
 
@@ -26,8 +26,8 @@ use pitcrew_protocol::board::{
 use pitcrew_protocol::ids::{DraftId, WorkstreamId};
 use std::sync::Arc;
 
-/// The agent's route. See the [module docs](self).
-pub fn board_agent_routes<S>() -> Router<S>
+/// The drafting session's route. See the [module docs](self).
+pub fn board_session_routes<S>() -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {

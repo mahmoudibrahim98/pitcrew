@@ -1,4 +1,5 @@
-//! `pitcrew board submit`: a board draft's proposal, on stdin, against an in-process fake daemon.
+//! `pitcrew board submit`: a board draft's proposal, from a file or on stdin, against an
+//! in-process fake daemon.
 
 #![allow(clippy::unwrap_used)]
 
@@ -129,16 +130,103 @@ fn the_daemons_refusals_keep_their_exit_codes() {
 }
 
 #[test]
-fn a_persons_token_is_refused() {
+fn a_persons_token_is_refused_unsent() {
     let server = FakeServer::tcp(routes(&[
         ("GET /v1/me", 200, sam()),
         (route().as_str(), 201, draft(proposal())),
     ]));
-    let (code, _, err) = run_on(
-        &server,
+    let (code, _, err) = run(
         &["board", "submit", DRAFT],
+        &[
+            ("PITCREW_URL", &server.url),
+            ("PITCREW_TOKEN", "pcd_synthetic-device"),
+        ],
         &proposal().to_string(),
     );
     assert_eq!(code, 2, "{err}");
+    assert!(err.contains("device token"), "{err}");
     assert!(server.api_requests().iter().all(|r| r.route() != route()));
+}
+
+/// A draft's run proposes with its session token, which may not even ask whose it is: the verb
+/// sends the proposal alone, never `GET /v1/me`.
+#[test]
+fn a_session_token_proposes_without_asking_whose_it_is() {
+    let server = FakeServer::tcp(routes(&[(route().as_str(), 201, draft(proposal()))]));
+    let (code, _, err) = run(
+        &["board", "submit", DRAFT],
+        &[
+            ("PITCREW_URL", &server.url),
+            ("PITCREW_TOKEN", "pcs_synthetic-session"),
+        ],
+        &proposal().to_string(),
+    );
+    assert_eq!((code, err.as_str()), (0, ""));
+    let routes: Vec<String> = server.api_requests().iter().map(|r| r.route()).collect();
+    assert_eq!(routes, [route()]);
+}
+
+/// `--file`: the proposal from a file the run wrote in its folder (PowerShell and `cmd.exe` have
+/// no heredoc); `--file -` is stdin.
+#[test]
+fn the_proposal_comes_from_a_file() {
+    let server = FakeServer::tcp(routes(&[(route().as_str(), 201, draft(proposal()))]));
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("proposal.json");
+    std::fs::write(&file, proposal().to_string()).unwrap();
+    let path = file.to_str().unwrap();
+    let (code, out, err) = run_on(&server, &["board", "submit", DRAFT, "--file", path], "");
+    assert_eq!((code, err.as_str()), (0, ""));
+    assert!(out.starts_with("Proposed 2 tasks"), "{out}");
+    let posted = server
+        .api_requests()
+        .into_iter()
+        .find(|r| r.route() == route())
+        .unwrap();
+    assert_eq!(posted.json(), proposal());
+
+    let (code, _, err) = run_on(
+        &server,
+        &["board", "submit", DRAFT, "--file", "-"],
+        &proposal().to_string(),
+    );
+    assert_eq!((code, err.as_str()), (0, ""));
+
+    // Refused before anything is sent: a missing file, a folder, one past the bound, not JSON.
+    let posted = |server: &FakeServer| {
+        server
+            .api_requests()
+            .iter()
+            .filter(|r| r.route() == route())
+            .count()
+    };
+    assert_eq!(posted(&server), 2);
+    let big = dir.path().join("big.json");
+    std::fs::write(
+        &big,
+        json!({"tasks": [], "note": "n".repeat(40 * 1024)}).to_string(),
+    )
+    .unwrap();
+    let bad = dir.path().join("bad.json");
+    std::fs::write(&bad, "not json").unwrap();
+    for (path, says) in [
+        (dir.path().join("missing.json"), "cannot read"),
+        (dir.path().to_path_buf(), "not a file"),
+        (big, "at most"),
+        (bad, "not JSON"),
+    ] {
+        let (code, out, err) = run_on(
+            &server,
+            &["board", "submit", DRAFT, "--file", path.to_str().unwrap()],
+            "",
+        );
+        assert_eq!(code, 2, "{}: {err}", path.display());
+        assert!(out.is_empty());
+        assert!(err.contains(says), "{err}");
+    }
+    assert_eq!(
+        posted(&server),
+        2,
+        "nothing refused here reaches the daemon"
+    );
 }

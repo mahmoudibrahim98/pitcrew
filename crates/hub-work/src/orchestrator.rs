@@ -586,6 +586,7 @@ impl WorkService {
                         permission_mode: PermissionMode::Default,
                         name: SESSION_TITLE.to_owned(),
                         brief,
+                        confinement: None,
                     };
                     let turn = StoredTurn {
                         turn: new_turn(text, now, session.id),

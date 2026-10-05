@@ -22,23 +22,33 @@ The daemon's HTTP and WebSocket API, as the desktop UI and the `pitcrew` CLI use
 - A WebSocket cannot set headers from a browser, so WebSocket routes take the token as a
   subprotocol: `Sec-WebSocket-Protocol: pitcrew.v1, pitcrew.bearer.<token>`. The server answers
   with `pitcrew.v1`.
-- Three scopes (`TokenScope`):
-  - `device`, a person's desktop: every route.
-  - `agent`, an agent or hook: only routes marked **agent** below.
+- Four scopes (`TokenScope`):
+  - `device` (`pcd_…`), a person's desktop: every route.
+  - `agent` (`pca_…`), an agent or hook: only routes marked **agent** below.
     - **Reads** on those routes see the whole workspace, so agents can coordinate.
     - **Writes** are limited to the agent's **own** tasks (it is the assignee, or holds the task's
       active dispatch) and its own sessions. A write on anything else is `403 forbidden`.
-  - `reader`, an agent that may only read: the Orchestrator's CLI (see "Orchestrator"). Only
-    `GET` and `HEAD` requests, on the routes marked **agent** or **read** below (`403` on the
+  - `reader` (`pcr_…`), an agent that may only read: the Orchestrator's CLI (see "Orchestrator").
+    Only `GET` and `HEAD` requests, on the routes marked **agent** or **read** below (`403` on the
     others). **Every other request of a reader to a route is `403 forbidden`** before its body is
     read: any `POST`, `PUT`, `PATCH` or `DELETE`, and any WebSocket upgrade (the stream,
     terminals); as for anyone, a route or method that does not exist is `404`. Its reads see what
-    those routes show anyone. Reader tokens start `pcr_` (device `pcd_`, agent `pca_`), and name
-    an agent and its owner, as agent tokens do.
-  - The hub stamps `author` (the caller) and, for agents, `on_behalf_of` (the owner) from the
-    token, never from the body. A reader never authors an event.
+    those routes show anyone. Reader tokens name an agent and its owner, as agent tokens do.
+  - `{ "session": SessionId }` (`pcs_…`), a **session token**: minted by the hub for one session
+    it starts on its own behalf (a confined run: a board draft's, see "Board drafts"), bound to
+    that session, and given to its CLI (`PITCREW_TOKEN_FILE`) in place of its agent's token. It
+    acts as the session's agent for the agent's owner, but reaches **only routes marked
+    session** below, and each of those only for its own session's resource; every other route
+    is `403 forbidden` (an agent route too). It lives in the daemon's memory only (never in the
+    token registry), and is revoked when its run has done its one thing, when its session ends,
+    when the run passes its time, and with the daemon. This is shared plumbing: a later confined
+    run (the Orchestrator's) gets its own session token the same way.
+  - The hub stamps `author` (the caller) and, for agents and session tokens, `on_behalf_of` (the
+    owner) from the token, never from the body. A reader never authors an event.
 - Mock tokens: `dev-device-token` (acts as `@sam`), `dev-agent-token` (acts as `@writer`) and
-  `dev-reader-token` (a reader acting as `@office`, for `@sam`).
+  `dev-reader-token` (a reader acting as `@office`, for `@sam`). The mock mints a session token
+  per board draft, as the hub does, kept in memory (and written to
+  `<sessionTokenDir>/<session>.token` when started with that option, for the conformance suite).
 
 ## Errors
 
@@ -151,7 +161,11 @@ the task key (`PAP-4`).
 | `DELETE /v1/machines/{id}/agents/{engine}/sign-in` | → 204 | Stops that sign-in and removes its terminal. The hub's owner only. |
 | `GET /v1/members` | → `Member[]` | **agent** |
 | `GET /v1/personas` | → `Persona[]` | **read** |
+| `POST /v1/personas` | `PersonaEdit` → `Persona` (201) | Device only; emits `persona_saved` and an owned agent `member_added` in one append. |
+| `PUT /v1/personas/{id}` | `PersonaEdit` → `Persona` | Device only; unknown id 404; emits `persona_saved`. |
 | `GET /v1/teams` | → `Team[]` | **read** |
+| `POST /v1/teams` | `TeamEdit` → `Team` (201) | Device only; emits `team_saved`. |
+| `PUT /v1/teams/{id}` | `TeamEdit` → `Team` | Device only; unknown id 404; emits `team_saved`. |
 
 #### The first run: `POST /v1/setup`
 
@@ -189,6 +203,21 @@ A fresh hub has a device token but no person, no machine and no name. The deskto
   `409`. Start it with `PITCREW_MOCK_FRESH=1` for an empty workspace (no members, machines or
   work) whose setup succeeds once.
 
+`PersonaEdit`: `{ "name": String, "engine": Engine, "model"?: String,
+"instructions"?: String, "permission_mode"?: PermissionMode }` (default `default`). Names are
+trimmed, 1–80 code points, with no control characters; model is nonblank, control-free and at
+most 200 code points when supplied; instructions are at most 32,000 code points (multiline).
+Invalid fields answer 400 and append nothing. Ids and event authors are assigned by the hub.
+Creating an agent recipe also creates an agent member owned by the caller, with that persona,
+name and a friendly engine handle (`@claude`, `@codex`, `@opencode`, with a numeric suffix only on collision). This makes it selectable in teams without
+changing `Persona` or `Team` fields. Editing a recipe updates its linked members' names in the
+same append, only when every linked member is owned by the caller (otherwise 403; unlinked recipes are editable). Bypass permissions and models beginning with `-` are refused (400); saving a recipe launches nothing.
+
+`TeamEdit`: `{ "name": String, "lead": MemberId, "members": MemberId[] }`. Name follows the
+same rule. Members are existing people or agent members (including those linked to personas),
+never persona ids. Unknown ids answer 400; duplicate ids are dropped and the lead is included.
+At most 256 members; validation completes before any event is appended.
+
 ### Projects and workstreams
 
 | Method and path | Body → response | Notes |
@@ -204,7 +233,7 @@ A fresh hub has a device token but no person, no machine and no name. The deskto
 `NewProject`, `NewWorkstream` and `NewTask` are Rust types in `crates/protocol/src/api.rs`.
 
 `NewProject`: `{ "key": ProjectKey, "name": String, "lead"?: MemberId, "members"?: MemberId[],
-"status"?: ProjectStatus, "start"?: Date, "due"?: Date, "root"?: Location }`. The hub assigns `id`;
+"status"?: ProjectStatus, "start"?: Date, "due"?: Date, "root"?: Location, "first_workstream"?: String }`. The hub assigns `id`;
 `external` starts empty.
 - `key` is a `ProjectKey`: 2 to 10 characters, an uppercase ASCII letter, then uppercase letters or
   digits (`PAP`, `TL2`). Any other key is `400 invalid`; a key another project has is
@@ -214,7 +243,14 @@ A fresh hub has a device token but no person, no machine and no name. The deskto
   (put first when the list leaves it out), and duplicates are dropped. An unknown member is `400`.
 - `status` defaults to `in_progress`.
 - Dates are `YYYY-MM-DD`, and `start` ≤ `due` when both are set (`400`).
-- `root` names a known machine and a non-empty path (`400`).
+- `root` names a known machine and a non-empty path (`400`). The creation dialog requires an
+  absolute path for the selected platform (drive/UNC on Windows, `/` on Unix). The hub also
+  rejects relative or incompatible paths for its local machine. Setup records its OS and
+  architecture from the hub platform.
+- `first_workstream`, when supplied, is a nonblank workstream name. Both objects are validated
+  before one atomic append of `project_created` and `workstream_created`; its location is the
+  project's root. This optional extension avoids a half-created project if a second HTTP request
+  fails. Standalone workstreams use `POST /v1/workstreams` as before.
 
 `NewWorkstream`: `{ "project": ProjectId, "name": String, "status"?: WorkstreamStatus,
 "locations"?: Location[] }`. The hub assigns `id`; `health` starts `on_track` and `external` empty.
@@ -359,7 +395,9 @@ New workstreams trigger another pass over existing runner sessions.
 
 `StartSession`: `{ "machine": MachineId, "engine": Engine, "cwd": String, "agent"?: MemberId,
 "task"?: TaskId, "brief"?: String, "persona"?: PersonaId, "model"?: String,
-"permission_mode"?: PermissionMode }`. `persona`, `model` and `permission_mode` are launch options
+"permission_mode"?: PermissionMode, "title"?: String, "workstream"?: WorkstreamId }`. A title is trimmed, 1–200 Unicode
+characters, with no control characters. It overrides the transcript's title without changing it.
+`persona`, `model` and `permission_mode` are launch options
 and are not echoed on `Session`. With a `task`, the session is linked with `link_basis: "manual"`.
 - With an `agent` or a `task`, the hub stores the session before its CLI starts
   (`session_discovered`, state `starting`, the agent named, linked to the task) and answers it
@@ -370,7 +408,42 @@ and are not echoed on `Session`. With a `task`, the session is linked with `link
   the start, the session ends (`session_ended`) and the start answers why. If the runner does not
   answer in time, the start answers `503` and the session stays `starting`: the hub ends it later
   only if its CLI did not start, as for a dispatch. It moves no task: only a dispatch does.
-- Without them, the start answers once the runner has found the CLI's transcript.
+- Without them, the hub also records a `starting` session before launching. Every successful
+  start answers `202` with its terminal, even without a prompt or transcript yet. The transcript
+  adopts that id later. This makes the terminal available for the first prompt. Person starts without an agent or task
+  are not subject to the 15-minute named-start deadline; a running terminal keeps them alive,
+  and multiple such starts in one folder retain the existing best-effort folder matching.
+- CLI availability, permission modes, bypass policy and argument constraints are checked before
+  recording a start (400 with a plain reason). An ambiguous named start in the same folder is
+  409 `conflict`. A runtime failure after validation can still end a recorded start.
+- An explicit `workstream` links the session by hand before launching. Without one, a workstream
+  whose location contains the resolved folder is inferred at start. Firm links survive adoption.
+
+`GET /v1/machines/{id}/session-options` (person-only) returns
+`SessionOptions`: `{ "platform": "windows" | "unix", "engines":
+[{ "engine": Engine, "permission_modes": PermissionMode[], "first_prompt_forbidden": String[] }] }`. Only executable CLIs
+on that runner's PATH are listed; none are run to detect availability. Modes reflect launch
+support and the runner's bypass policy (Codex has no plan mode; OpenCode uses its settings).
+Unknown machines are `404`; no runner, no terminal runtime or an unreachable machine is `503`.
+Availability is advisory: a CLI removed after the check can still fail at launch.
+`first_prompt_forbidden` lists characters that cannot be passed through an installed Windows
+batch wrapper (control characters and `" % ! ^ & | < > ( )`); it is empty for native programs and
+Unix CLIs. Such a prompt is refused before recording, with 400 and advice to enter it in the
+terminal after starting. The dialog checks these limits and selects the saved safety default
+only when supported by the chosen engine.
+
+Working and Starting from transcripts become Idle after **five minutes** without
+transcript writes, accepted hooks or a known live terminal. **Waiting or an open tool call gets
+60 minutes**: a quiet permission decision or a long tool run should not look abandoned after
+five minutes, while abandoned waits still expire within an hour. An unavailable terminal list
+is unknown evidence: expiry is skipped and that failure is not cached. A deleted transcript
+emits Idle (unless terminal evidence is alive or unknown), including after restart.
+The runner checks this during its
+existing safety sweeps (normally 30 seconds; 120 seconds on polled network homes). Old transcripts
+are normalized before discovery, including after restart. Expiry clears the status line, emits
+`session_state_changed` and never edits a transcript. A later write/hook can resume activity;
+ended and unreachable states are preserved. Terminal/process evidence is obtained from the
+runner's bounded runtime calls, never by guessing a process from its name.
 
 **Transcript paging.** Tail-first: without `before`, the newest page; pass a page's `from` as
 `before` to get the previous one. `limit` counts items (default 200, max 1000). Pages hold
@@ -612,8 +685,14 @@ suggest. The types are in `crates/protocol/src/scan.rs`.
   `~/.codex`, OpenCode's data folder, or where `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and
   `XDG_DATA_HOME` point). On the daemon these are the runner's homes: `--homes` when given, none
   with `--demo` alone. It reads a prefix of each transcript (one indexed row of an OpenCode
-  store), never a whole transcript, and never prompt text. It is not an import: it appends no
-  event and creates nothing.
+  store), never a whole transcript, and never prompt text. It does not import sessions. During
+  setup, every successful scan also ensures one dispatchable, caller-owned agent per detected engine
+  (`counts.by_engine` with a positive count), before the `done` frame. Missing recipes and members
+  are appended together as `persona_saved`/`member_added`, using default permissions. A person who
+  already owns an agent with that engine's persona gets no duplicate; repeat/concurrent scans are
+  idempotent. `@office` (no persona) never satisfies this requirement. Empty, failed or canceled
+  scans create no agents; partial scans provision only engines actually detected. A provisioning
+  failure returns an `error` frame and appends none of the new agents.
 - **Which machine.** Only the hub's own (its first `local` machine). An unknown or malformed id
   is `404`. Another machine of the workspace is `409 conflict`: scanning it is not supported yet.
   A hub that reads no agent homes (the daemon with `--no-runner`) is `409` too. The body is
@@ -1084,9 +1163,10 @@ writes from the same files.
 ### Board drafts
 
 A person asks an agent they already use to draft a workstream's board from its history: open
-tasks, what is in progress, what looks done. The agent's CLI starts with a versioned prompt and a
-bounded, redacted summary of the workstream's sessions, and answers with a proposal through
-`pitcrew board submit`. **Nothing is created until the person reviews the proposal.** Types:
+tasks, what is in progress, what looks done. The agent's CLI starts **confined**, in a private
+folder of its own with a versioned prompt holding a bounded, redacted summary of the workstream's
+sessions, and answers with a proposal through `pitcrew board submit`, with a session token that
+can do nothing else. **Nothing is created until the person reviews the proposal.** Types:
 `crates/protocol/src/board.rs`.
 
 | Method and path | Body → response | Notes |
@@ -1095,31 +1175,38 @@ bounded, redacted summary of the workstream's sessions, and answers with a propo
 | `POST /v1/workstreams/{id}/board-drafts` | `StartDraft` → `BoardDraft` (202) | Starts the agent's CLI. Emits `session_discovered`, `board_draft_started`. |
 | `GET /v1/board-drafts?workstream=` | → `BoardDraft[]` | Newest first. |
 | `GET /v1/board-drafts/{id}` | → `BoardDraft` | |
-| `POST /v1/board-drafts/{id}/proposal` | `BoardProposal` → `BoardDraft` (201) | The drafting agent's answer. Emits `board_proposed`. **agent** |
+| `POST /v1/board-drafts/{id}/proposal` | `BoardProposal` → `BoardDraft` (201) | The drafting session's answer, with its session token. Emits `board_proposed`. **session** |
 | `POST /v1/board-drafts/{id}/review` | `DraftReview` → `DraftReviewed` | Creates the accepted tasks. Emits `task_created`s, `session_linked`s, `board_draft_reviewed`. |
 
-All but the proposal are for device tokens only (`403` for an agent). Ids in paths are bare ULIDs
-(the `wst_…` and `drf_…` forms are accepted too).
+All but the proposal are for device tokens only (`403` for an agent or a session token). Ids in
+paths are bare ULIDs (the `wst_…` and `drf_…` forms are accepted too).
 
 **The preview** (`DraftPreview`: `{ "workstream", "prompt", "cost": DraftCost, "summary",
 "digest" }`). `prompt` is the template's name and version (`draft-board/v1`), `summary` the text
 the agent would read, exactly, and `digest` the lowercase hex SHA-256 of the whole prompt. `404`
-for an unknown workstream.
+for an unknown workstream. Nothing is stored in the log; the hub keeps the workstream's latest
+preview's prompt in memory for 10 minutes, for its start.
 - **What the summary holds**: the workstream's tasks (key, status, title) and, for each of its
   sessions most recently active first: its id, CLI, state, the dates it ran, its branch and linked
   task, its title, its counts (turns, tool runs and failures, file edits), up to 5 files it edited
-  and up to 3 recap lines (the one-line summaries of its newest blocks of work). Only sessions the
+  and up to 3 recap lines (the one-line summaries of its newest blocks of work). Files are named
+  relative to the session's folder, else to one of the workstream's folders or its project's
+  root; any other absolute path keeps only its end (`…/<file>`, or its last two parts when it has
+  five or more, or `…`), and a path too long is cut at its start. Only sessions the
   session routes would list (the import choice applies), without sub-agents and without drafts'
   own sessions. **Never** a transcript, a prompt, a tool's output or a secret.
 - **Bounds**: 40 sessions, 60 tasks (at most 4 KiB of them), titles of 120 characters, recap lines
   of 200, file paths and branches of 100, names of 80, and at most 12 KiB in all: the least
   recently active sessions that do not fit are left out, and counted.
-- **Redaction**: every text is made one line (control and hidden characters dropped) and then has
-  private keys, tokens of known shapes (`sk-…`, `ghp_…`, `github_pat_…`, `xoxb-…`, `AKIA…`,
-  `pca_…`, JWTs and others), the values of secrets' names (`password=…`, `token: …`,
-  `Authorization: Bearer …`, `--password …`, `?access_token=…`), a URL's user and password, long
-  random-looking words, e-mail addresses (`[email]`) and home folders (`~`) replaced; `<` and `>`
-  are shown as `‹` and `›`. `cost.redacted` counts the replacements.
+- **Redaction**: every text is made one line (control and hidden characters dropped, never made
+  spaces) and then has private keys, tokens of known shapes (`sk-…`, `ghp_…`, `github_pat_…`,
+  `xoxb-…`, `AKIA…`, `pca_…`, `pcs_…`, JWTs and others, also behind or inside punctuation such as
+  `**ghp_…**` or `$sk-…`), the values of secrets' names (`password=…`, `token: …`,
+  `"password": "…"`, `password = …`, `Authorization: Bearer …`, `--password …`,
+  `?access_token=…`), a URL's user and password, long random-looking words, e-mail addresses
+  (`[email]`) and home folders (`~`, also `\\?\C:\Users\<name>` and `/mnt/c/Users/<name>`)
+  replaced, and other absolute paths cut to their end; `<` and `>` are shown as `‹` and `›`.
+  `cost.redacted` counts the replacements.
 - **`DraftCost`**: `{ "sessions", "sessions_left_out", "tasks", "summary_bytes", "prompt_bytes",
   "redacted", "estimate": { "input_tokens", "output_tokens" } }`. The estimate: the agent reads
   the prompt (a token for every 4 bytes, rounded up) plus 15,000 tokens for its CLI's own
@@ -1129,19 +1216,37 @@ for an unknown workstream.
 Refusals, with nothing recorded: `404` an unknown workstream (before the body); `400` a malformed
 body, an unknown agent, a person named as the agent, or no agent named when the caller has no back
 office (`@office`, the default); `403` an agent the caller does not own; `409` a `digest` that is
-not the prompt's now (the workstream changed since its preview: preview again), or a draft of the
-workstream that is running or waiting for review (one at a time); `503` when no session can start
-(as for a dispatch: no runner attached, no live machine). The engine defaults to the agent's
-persona's, else `claude`; the permission mode is the persona's, else the CLI's own.
-- The CLI runs where the workstream is: its first location, else its project's root, else the
-  hub's own machine in `~`.
+not the workstream's latest preview while it is kept (10 minutes) nor the prompt as it would be
+made now (the workstream changed since its preview: preview again), or a draft of the workstream
+that is running or waiting for review (one at a time); `503` when no session can start (no runner
+attached, the hub's own machine not live, or no scratch folder for confined runs). The engine
+defaults to the agent's persona's, else `claude`; the person's UI offers only the CLIs found on
+the hub's machine (`GET /v1/machines/{id}/session-options`). A start with the latest preview's
+digest sends exactly that preview's prompt.
+- **The CLI runs confined** (a confined run; the daemon's `crates/daemon/src/confined.rs`), whatever
+  the agent's persona's permission mode and the person's own settings for that CLI:
+  - on the hub's own machine, in a **fresh private folder** `scratch/<session>` in PitCrew's cache
+    folder (0700, an owner-only ACL on Windows), never the workstream's folder nor the state
+    directory, removed when its session ends;
+  - with its prompt in `prompt.md` there (0600) and one plain line on its command line
+    (`Read the file prompt.md in this folder and follow its instructions.`);
+  - in its CLI's confined shape: Claude Code `--permission-mode=default --setting-sources=project
+    --strict-mcp-config` with a project `.claude/settings.json` that pre-approves only `pitcrew
+    board submit` and writing `proposal.json`, and denies web fetch and search and the state
+    directory; Codex `--sandbox=read-only --ask-for-approval=on-request
+    --config=web_search=disabled` (its sandbox blocks the network, so the person approves the
+    submit in its terminal); OpenCode with a deny-all `opencode.json` but reading its folder and
+    `pitcrew board submit …` (refused on Windows);
+  - with a **session token** (see "Transport and auth") for the draft's session, never the
+    agent's token;
+  - for at most **30 minutes**: then its CLI is ended, and the draft with it (`ended`).
 - The hub stores the session first (`session_discovered`: state `starting`, the agent named,
-  linked to the workstream with `link_basis: manual`), then `board_draft_started` (the draft, its
-  workstream, agent, engine, session, the prompt's version and the `cost` the person confirmed;
-  never the summary), and starts the CLI under that session with the prompt as its first prompt,
-  and an **agent** token for that agent, as a dispatch's (see "Dispatch"). A start the runner
-  refuses or fails ends the session (`409`, `503` or `500`, as for a dispatch); the draft is then
-  `ended`.
+  linked to the workstream with `link_basis: manual`, its `cwd` the private folder), then
+  `board_draft_started` (the draft, its workstream, agent, engine, session, the prompt's version
+  and the `cost` the person confirmed; never the summary), and starts the CLI under that session.
+  A start the runner refuses or fails ends the session (`409`, `503` or `500`, as for a
+  dispatch); the draft is then `ended`. When the daemon starts, drafts left running are ended
+  (their session tokens were in the last daemon's memory).
 
 **`BoardDraft`**: `{ "id", "workstream", "agent", "engine", "session", "by", "prompt", "cost",
 "started", "state", "proposal"?: BoardProposal, "proposed"?, "reviewed"?, "accepted":
@@ -1151,21 +1256,23 @@ DraftedTask[], "rejected": u32[] }`. `state` is `running`, `proposed` (waiting f
 
 **The proposal** (`BoardProposal`: `{ "tasks": ProposedTask[], "note"?: String }`, where
 `ProposedTask` is `{ "title", "status", "description"?, "evidence": SessionId[] }`). Only the
-draft's own agent may send it: `404` for an unknown draft, then `403` for anyone else (a person
-included), both before the body is read. `400` for a body over 32 KiB or not a JSON object, more
+session token of the draft's own session may send it: `404` for an unknown draft, then `403` for
+anyone else (its agent's own token, another session's token and a person included), both before
+the body is read. `400` for a body over 32 KiB or not a JSON object, more
 than 50 tasks, a title that is empty or over 200 characters (trimmed), a status of `canceled`, a
 description or a note over 2,000 characters, more than 20 evidence sessions, or evidence that is
 not one of the workstream's sessions (as the preview would list them). `409` once the draft has a
 proposal, or has ended. Texts are trimmed and redacted as the summary's are; repeated evidence
 counts once. It appends `board_proposed` (`{ "draft", "workstream", "tasks", "note"? }`, authored by
-the agent for its owner) and nothing else.
+the agent for its owner) and nothing else. Then the session token is revoked (a second call is
+`401`), and the draft's CLI is ended a few seconds later.
 
 **The review** (`DraftReview`: `{ "accept": u32[] }`, indexes into the proposal's tasks; `[]`
 accepts none). `404` for an unknown draft (before the body); `400` for an index past the tasks, or
 given twice; `409` when the draft has no proposal yet, or was reviewed already. In one append:
-- `task_created` for each accepted item, in the proposal's order: the next key of the workstream's
-  project, in the workstream, at the proposed status, with the description, label `drafted`, no
-  assignee;
+- `task_created` for each accepted item, in the proposal's order, made by the same checks as
+  `POST /v1/tasks`: the next key of the workstream's project, in the workstream, at the proposed
+  status, with the description, label `drafted`, no assignee;
 - `session_linked` (`basis: manual`) for each evidence session of an accepted item that is still
   in the workstream and has no task yet (the first accepted item citing it wins);
 - `board_draft_reviewed` (`{ "draft", "workstream", "accepted": DraftedTask[], "rejected": u32[]
@@ -1174,8 +1281,11 @@ given twice; `409` when the draft has no proposal yet, or was reviewed already. 
 Rejected items create nothing. The answer is `DraftReviewed`: `{ "draft": BoardDraft, "tasks":
 Task[] }`.
 
-**The CLI**: `pitcrew board submit <draft>` reads the proposal's JSON on stdin, refuses one over
-32 KiB or that is not a JSON object before sending it, and posts it with the agent's token.
+**The CLI**: `pitcrew board submit <draft> [--file <path>]` reads the proposal's JSON from the
+file (the prompt asks for `--file proposal.json`, which works in every shell), or on stdin with
+`--file -` or no `--file`; refuses one over 32 KiB or that is not a JSON object, and a person's
+device token, before sending it; and posts it with the token it was given (the draft's session
+token), without asking whose it is (`GET /v1/me` is not a session route).
 
 ### Orchestrator
 
@@ -1396,3 +1506,15 @@ has no changes. Conflicting engines are excluded from preview files and skipped,
 with their status shown to the person. CLI homes also establish engine presence
 when a GUI process lacks CLI binaries on PATH. The desktop ships `pitcrew` beside
 `pitcrewd`, and the Hooks step disables Install when there are no file changes.
+
+### Directory write safeguards
+
+`PUT /v1/personas/{id}` answers `403` unless every member linked to the persona is owned by
+the caller; an unlinked persona is editable by any person. Refusals append no events and rename
+no members. Both persona write routes reject `bypass_permissions` with the same message as
+saving safety settings, and reject a trimmed model beginning with `-` (`400 invalid`).
+New agents use `@claude`, `@codex`, or `@opencode`, adding `-2`, `-3`, … only when a handle is
+already taken. Handles remain stable on edits. Dispatch requires an agent linked to an existing
+persona; service actors such as `@office` and `@sync` cannot be dispatched (`400 invalid`).
+Every successful machine scan provisions missing owned agents for the engines it detected;
+repeated scans reuse existing owned, persona-linked agents.

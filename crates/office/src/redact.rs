@@ -10,21 +10,27 @@
 //! Replaced, as `[redacted]` (each counts once):
 //! - a private key block (`-----BEGIN … PRIVATE KEY-----`): the whole text;
 //! - well-known token shapes, by prefix: `sk-`, `sk_live_`, `ghp_`, `github_pat_`, `glpat-`,
-//!   `xoxb-`, `AKIA…`, `AIza…`, PitCrew's own `pcd_`/`pca_`/`pcr_`, and others ([`PREFIXES`]);
+//!   `xoxb-`, `AKIA…`, `AIza…`, PitCrew's own `pcd_`/`pca_`/`pcr_`/`pcs_`, and others
+//!   ([`PREFIXES`]), also behind or inside punctuation (`**ghp_…**`, `$sk-…`, `#glpat-…`), which
+//!   is kept;
 //! - JSON Web Tokens (`eyJ….eyJ….…`);
 //! - the value after a secret's name: `password=…`, `token: …`, `api_key=…`, `?access_token=…`,
-//!   `--password …`, and the word after `Bearer` or `Basic`;
+//!   `--password …`, also with the `:` or `=` standing alone and the name or value quoted
+//!   (`"password": "…"`, `password = …`), and the word after `Bearer` or `Basic`;
 //! - the user and password of a URL (`https://user:pass@host` → `https://[redacted]@host`);
 //! - long random-looking words: 32 or more characters of letters, digits and `+/=_-` with
 //!   upper- and lowercase letters and digits, or 32 or more hexadecimal digits with letters and
 //!   digits;
 //! - e-mail addresses, as `[email]`;
-//! - a home folder: `/home/<name>`, `/Users/<name>` and `C:\Users\<name>` become `~`, and
-//!   `/root` too.
+//! - a home folder: `/home/<name>`, `/Users/<name>`, `C:\Users\<name>` (also as
+//!   `\\?\C:\Users\<name>` and WSL's `/mnt/c/Users/<name>`) become `~`, and `/root` too;
+//! - any other absolute path (`/scratch/<group>/<user>/…`, `D:\data\<user>\…`) keeps only its
+//!   end, `…/<file>` ([`path_tail`]), so a user name in it does not go; the end of a path is what
+//!   says which file it is.
 //!
-//! Control and hidden characters (`pitcrew_protocol::text::is_hidden`) are dropped, and
-//! whitespace runs become one space, before anything is matched, so a secret cannot hide behind
-//! them.
+//! Hidden characters (`pitcrew_protocol::text::is_hidden`) and control characters other than
+//! whitespace are dropped, and whitespace runs become one space, before anything is matched, so a
+//! secret can neither hide behind them nor be split by them.
 
 use pitcrew_protocol::text::{is_hidden, is_line_separator};
 
@@ -63,6 +69,7 @@ pub const PREFIXES: &[&str] = &[
     "pcd_",
     "pca_",
     "pcr_",
+    "pcs_",
     "npm_",
     "pypi-",
     "hf_",
@@ -146,17 +153,17 @@ pub fn line(text: &str, max: usize) -> Redacted {
     out
 }
 
-/// Hidden characters dropped, control characters and whitespace runs as one space, the ends
-/// trimmed; at most `limit` characters. Whether it was cut.
+/// Hidden characters and control characters other than whitespace dropped, whitespace runs as
+/// one space, the ends trimmed; at most `limit` characters. Whether it was cut.
 fn tidy(text: &str, limit: usize) -> (String, bool) {
     let mut out = String::new();
     let mut count = 0usize;
     let mut space = false;
     for c in text.chars() {
-        if is_hidden(c) && !is_line_separator(c) {
+        if (is_hidden(c) && !is_line_separator(c)) || (c.is_control() && !c.is_whitespace()) {
             continue;
         }
-        if c.is_whitespace() || c.is_control() || is_line_separator(c) {
+        if c.is_whitespace() || is_line_separator(c) {
             space = count > 0;
             continue;
         }
@@ -186,9 +193,17 @@ fn redact(text: &str) -> Redacted {
     let mut out = String::with_capacity(text.len());
     // Whether the word before asked for its value: `Bearer`, `password:`, `--token`.
     let mut value_next = false;
+    // Whether the word before was a secret's name whose `:` or `=` stands alone after it
+    // (`"password": "…"`, `password = …`).
+    let mut named = false;
     for piece in pieces(text) {
         match piece {
             Piece::Gap(gap) => out.push_str(gap),
+            Piece::Word(word) if is_separator(word) => {
+                value_next = value_next || named;
+                named = false;
+                out.push_str(word);
+            }
             Piece::Word(word) => {
                 let (core, tail) = split_tail(word);
                 let scheme = SCHEMES.contains(&core.to_ascii_lowercase().as_str());
@@ -199,6 +214,7 @@ fn redact(text: &str) -> Redacted {
                     word_rules(core, &mut count)
                 };
                 value_next = asks_for_value(core, tail);
+                named = !value_next && tail.is_empty() && is_secret_name(core);
                 out.push_str(&replaced);
                 out.push_str(tail);
             }
@@ -206,7 +222,15 @@ fn redact(text: &str) -> Redacted {
     }
     let (text, homes) = homes(&out);
     count += homes;
-    Redacted { text, count }
+    Redacted {
+        text: tails(&text),
+        count,
+    }
+}
+
+/// A word that only joins a name to its value: `:`, `=`, `:=`, `=>`.
+fn is_separator(word: &str) -> bool {
+    matches!(word, ":" | "=" | ":=" | "=>")
 }
 
 enum Piece<'a> {
@@ -346,7 +370,7 @@ fn pairs(word: &str, count: &mut u32) -> String {
 fn scrub(part: &str, count: &mut u32) -> String {
     if let Some(replaced) = replacement(part) {
         *count += 1;
-        return replaced.to_owned();
+        return replaced;
     }
     if !part.contains(['/', '\\']) {
         return part.to_owned();
@@ -368,23 +392,42 @@ fn push_segment(out: &mut String, segment: &str, count: &mut u32) {
     match replacement(segment) {
         Some(replaced) => {
             *count += 1;
-            out.push_str(replaced);
+            out.push_str(&replaced);
         }
         None => out.push_str(segment),
     }
 }
 
-/// What replaces `part` whole, if it is an e-mail address or a token.
-fn replacement(part: &str) -> Option<&'static str> {
+/// What replaces `part`, if it is an e-mail address or a token, also behind or inside
+/// punctuation that is not part of one (`**ghp_…**`, `$sk-…`, `#glpat-…`): the punctuation is
+/// kept around the replacement.
+fn replacement(part: &str) -> Option<String> {
     if part.is_empty() {
-        None
-    } else if is_email(part) {
-        Some(EMAIL)
-    } else if is_token(part) {
-        Some(REDACTED)
-    } else {
-        None
+        return None;
     }
+    if is_email(part) {
+        return Some(EMAIL.to_owned());
+    }
+    if is_token(part) {
+        return Some(REDACTED.to_owned());
+    }
+    let core = part.trim_matches(|c: char| !c.is_alphanumeric());
+    if core.is_empty() || core.len() == part.len() {
+        return None;
+    }
+    let lead = part.len()
+        - part
+            .trim_start_matches(|c: char| !c.is_alphanumeric())
+            .len();
+    let (before, after) = (&part[..lead], &part[lead + core.len()..]);
+    let replaced = if is_email(core) {
+        EMAIL
+    } else if is_token(core) {
+        REDACTED
+    } else {
+        return None;
+    };
+    Some(format!("{before}{replaced}{after}"))
 }
 
 /// `scheme://user:pass@host…` with its user and password replaced, if it has them.
@@ -510,6 +553,28 @@ fn at_boundary(before: &str) -> bool {
 
 /// The length of the home folder `text` starts with, if it does.
 fn home_at(text: &str) -> Option<usize> {
+    // Windows' verbatim prefix, and WSL's view of a Windows drive, before a `Users` folder.
+    for verbatim in [r"\\?\", "//?/", r"\\.\", "//./"] {
+        if let Some(rest) = text.strip_prefix(verbatim) {
+            return home_at(rest).map(|len| verbatim.len() + len);
+        }
+    }
+    let bytes = text.as_bytes();
+    if bytes.len() > 7
+        && text.starts_with("/mnt/")
+        && bytes[5].is_ascii_alphabetic()
+        && bytes[6] == b'/'
+        && let Some(rest) = text[7..]
+            .strip_prefix("Users/")
+            .or_else(|| text[7..].strip_prefix("users/"))
+    {
+        let name = rest
+            .find(|c: char| c == '/' || is_gap(c))
+            .unwrap_or(rest.len());
+        if name > 0 {
+            return Some(7 + "Users/".len() + name);
+        }
+    }
     for prefix in ["/home/", "/Users/", "/users/"] {
         if let Some(rest) = text.strip_prefix(prefix) {
             let name = rest
@@ -542,6 +607,89 @@ fn home_at(text: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Each absolute path left in `text` (a home folder is `~` already), as a word or after `=`, cut
+/// to its end ([`path_tail`]).
+fn tails(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for piece in pieces(text) {
+        match piece {
+            Piece::Gap(gap) => out.push_str(gap),
+            Piece::Word(word) => {
+                let (core, tail) = split_tail(word);
+                let start = if is_absolute(core) {
+                    Some(0)
+                } else {
+                    core.find('=')
+                        .map(|i| i + 1)
+                        .filter(|&i| is_absolute(&core[i..]))
+                };
+                match start {
+                    Some(at) => {
+                        out.push_str(&core[..at]);
+                        out.push_str(&path_tail(&core[at..]));
+                        out.push_str(tail);
+                    }
+                    None => out.push_str(word),
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether `text` is an absolute path: `/…` (not a URL's `//host`), `\\…`, or `C:\…`/`C:/…`.
+fn is_absolute(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    let drive = bytes.len() > 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    let rooted = text.len() > 1
+        && (text.starts_with('/') || text.starts_with('\\'))
+        && text[1..].contains(|c: char| c.is_alphanumeric());
+    drive || rooted
+}
+
+/// The end of an absolute path, enough to say which file it is but not whose folder it is in:
+/// its last two parts after `…/` when it has five or more, else its file name when it has one
+/// (a last part with an extension), else `…`; a path of one part is kept. Any other text is
+/// returned as it is.
+#[must_use]
+pub fn path_tail(path: &str) -> String {
+    if !is_absolute(path) {
+        return path.to_owned();
+    }
+    let parts: Vec<&str> = path
+        .split(['/', '\\'])
+        .filter(|p| !p.is_empty() && *p != "?" && *p != "." && !p.ends_with(':'))
+        .collect();
+    match parts.as_slice() {
+        [] | [_] => path.to_owned(),
+        [.., parent, file] if parts.len() >= 5 => format!("…/{parent}/{file}"),
+        [.., file] if file.trim_start_matches('.').contains('.') => format!("…/{file}"),
+        _ => "…".to_owned(),
+    }
+}
+
+/// A path as one clean line of at most `max` characters, redacted as [`line`] does, and cut at
+/// its start instead of its end when it is too long, so its file name stays.
+#[must_use]
+pub fn path(text: &str, max: usize) -> Redacted {
+    // Matched over its end only, as `line` matches over its start: what is cut there is past
+    // the end kept.
+    let limit = max.saturating_mul(SCAN_FACTOR).saturating_add(64);
+    let all = text.chars().count();
+    let end: String = text.chars().skip(all.saturating_sub(limit)).collect();
+    let mut out = line(&end, limit);
+    let chars = out.text.chars().count();
+    if chars > max {
+        let keep = max.saturating_sub(1);
+        let tail: String = out.text.chars().skip(chars - keep).collect();
+        out.text = format!("…{}", tail.trim_start());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -773,8 +921,120 @@ mod tests {
             r"opened ~\work\notes.md"
         );
         assert_eq!(r("in /root/.config"), "in ~/.config");
-        assert_eq!(r("in /rooted/x and a/home/b"), "in /rooted/x and a/home/b");
+        assert_eq!(r("in /rooted/x and a/home/b"), "in … and a/home/b");
+        // Windows' verbatim prefix and WSL's view of a Windows drive.
+        assert_eq!(r(r"opened \\?\C:\Users\sam\notes.md"), r"opened ~\notes.md");
+        assert_eq!(
+            r("opened /mnt/c/Users/sam/work/notes.md"),
+            "opened ~/work/notes.md"
+        );
+        assert_eq!(r("opened /mnt/d/users/sam"), "opened ~");
         assert_eq!(line("cwd=/home/sam", 100).count, 1);
+    }
+
+    /// `"password": "…"` and `password = …`: the `:` or `=` standing alone, and quotes, keep the
+    /// value a secret's.
+    #[test]
+    fn a_value_after_a_lone_separator_or_quotes_is_a_secret() {
+        for (case, text, want) in [
+            (
+                "a JSON pair",
+                r#"{"password": "hunter22"}"#,
+                r#"{"password": "[redacted]"}"#,
+            ),
+            (
+                "a JSON pair without spaces",
+                r#"{"api_key":"hunter22x"}"#,
+                r#"{"api_key":"[redacted]"}"#,
+            ),
+            (
+                "an assignment with spaces",
+                "password = hunter22",
+                "password = [redacted]",
+            ),
+            (
+                "a quoted name",
+                "'token' => 'hunter22'",
+                "'token' => '[redacted]'",
+            ),
+            ("a walrus", "secret := hunter22", "secret := [redacted]"),
+        ] {
+            redacts(case, text, want);
+        }
+        // A secret's name in a sentence, with no separator, keeps the next word.
+        assert_eq!(r("rotate the token today"), "rotate the token today");
+        assert_eq!(r("the password : is weak"), "the password : is weak");
+    }
+
+    /// Punctuation before or around a token does not hide it, and stays.
+    #[test]
+    fn a_token_behind_punctuation_is_replaced() {
+        for (case, text, want) in [
+            (
+                "bold markdown",
+                "use **ghp_16C7e42F292c6912E7710c838347Ae178B4a** here",
+                "use **[redacted]** here",
+            ),
+            (
+                "a shell variable's value",
+                "echo $sk-ant-api03-AbCdEfGhIjKlMnOp",
+                "echo $[redacted]",
+            ),
+            (
+                "a hash before it",
+                "#glpat-AbCdEf1234567890xyz",
+                "#[redacted]",
+            ),
+            (
+                "a random key in stars",
+                "*Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MEFCQ0RFRkdISUpL*",
+                "*[redacted]*",
+            ),
+        ] {
+            redacts(case, text, want);
+        }
+        assert_eq!(r("**bold** and #hashtag"), "**bold** and #hashtag");
+    }
+
+    /// An absolute path outside a home keeps only its end: a user name in it does not go, the
+    /// file name does.
+    #[test]
+    fn other_absolute_paths_keep_only_their_end() {
+        assert_eq!(r("ran /scratch/grp/sam/run.sh"), "ran …/run.sh");
+        assert_eq!(r("in /scratch/grp/sam"), "in …");
+        assert_eq!(
+            r("edited /scratch/grp/sam/paper/src/main.py."),
+            "edited …/src/main.py."
+        );
+        assert_eq!(r(r"edited D:\data\sam\notes.md"), "edited …/notes.md");
+        assert_eq!(r("cwd=/scratch/grp/sam/x.py"), "cwd=…/x.py");
+        assert_eq!(r("see /tmp"), "see /tmp");
+        // URLs and relative paths are not paths to cut.
+        assert_eq!(
+            r("see https://example.com/a/b/c and src/a/b/c.rs"),
+            "see https://example.com/a/b/c and src/a/b/c.rs"
+        );
+        assert_eq!(path_tail("src/a.rs"), "src/a.rs");
+        assert_eq!(path_tail("/a/b/c/d/e.rs"), "…/d/e.rs");
+        assert_eq!(path_tail(r"\\server\share\sam\x"), "…");
+    }
+
+    /// A path too long for its bound keeps its end, so its file name stays.
+    #[test]
+    fn a_long_path_keeps_its_file_name() {
+        let long = format!("src/{}/main.rs", "deep/".repeat(40));
+        let out = path(&long, 30);
+        assert!(out.text.chars().count() <= 30, "{}", out.text);
+        assert!(
+            out.text.starts_with('…') && out.text.ends_with("/main.rs"),
+            "{}",
+            out.text
+        );
+        assert_eq!(path("src/main.rs", 30).text, "src/main.rs");
+        assert!(
+            path("src/sk-ant-api03-AbCdEfGh12345678/x.rs", 100).text == "src/[redacted]/x.rs",
+            "a token in a path is not redacted"
+        );
     }
 
     #[test]
@@ -796,7 +1056,18 @@ mod tests {
             "ghp_\u{200B}16C7e42F292c6912E7710c838347Ae178B4a",
             "[redacted]",
         );
-        assert_eq!(r("pass\u{0}word"), "pass word");
+        // Control characters are dropped, not turned into spaces that split a secret.
+        assert_eq!(r("pass\u{0}word"), "password");
+        redacts(
+            "a token split by a bell",
+            "ghp_16C7e42F\u{7}292c6912E7710c838347Ae178B4a",
+            "[redacted]",
+        );
+        redacts(
+            "a value split by an escape",
+            "password=hun\u{1b}ter22",
+            "password=[redacted]",
+        );
         assert_eq!(r("a\n\tb\u{2028}c"), "a b c");
         redacts(
             "a value after a direction mark",

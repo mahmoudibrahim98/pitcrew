@@ -93,11 +93,29 @@ Unix-runtime skip; Rust daemon HTTP tests cover Files API routes there.
 `board.test.mjs` runs on both targets, alone, just before the Orchestrator ("Board drafts"): the
 preview's shape, sizes and estimate, and that it stores nothing; a start refused for a stale
 digest, a person or an unknown member as the agent, and while another draft runs; device-only
-routes; only the drafting agent proposes, within the bounds (evidence of another workstream's
-session, `canceled`, a blank title, a body over 32 KiB); a proposal creates no task; a review
-creates exactly the accepted items, labelled `drafted`, and nothing for the rejected one, once;
-and the three events' shapes. On the daemon the draft's CLI is the stand-in `claude`, in the
-temporary home, as for a dispatch; it never proposes by itself (the suite's agent token does).
+routes; only the draft's session token proposes (its agent's token is refused, and the session
+token reaches no other route: `GET /v1/me`, `/v1/tasks`, `/v1/board-drafts`), within the bounds
+(evidence of another workstream's session, `canceled`, a blank title, a body over 32 KiB), and
+stops once it has (`401`); a proposal creates no task; a review creates exactly the accepted
+items, labelled `drafted`, and nothing for the rejected one, once; and the three events' shapes.
+The suite proposes with the session token as the draft's CLI would: `run.mjs` makes a private
+folder (`PITCREW_CONFORMANCE_SESSION_TOKENS`) where the mock writes each draft's token
+(`sessionTokenDir`) and, on the daemon, the stand-in `claude` (confined, in its private folder in
+the temporary home's cache) copies the one it was given; it never proposes by itself.
+
+Session launch coverage now checks person-only machine options, platform and supported modes,
+unknown/unreachable machines, title validation, and an unnamed no-prompt start returning a
+terminal immediately. It reads the session back and ends it; the daemon uses only its temporary
+stand-in CLI, with PITCREW_FILES_ROOT as the safe launch folder.
+
+Directory creation/editing cases cover all four POST/PUT routes, device-only access, bounded
+fields, unknown members/targets, forged metadata, persona-linked membership, lead inclusion,
+deduplication, event authors and unchanged revisions on refusal. Atomic-project cases prove an
+invalid first workstream or key conflict creates neither a project nor a workstream, and a valid
+request creates both. Both targets run these cases.
+
+Directory conformance also dispatches a task through the member created by New agent, exercising
+the recipe/member ownership link against both servers.
 
 `orchestrator.test.mjs` runs on both targets, alone and last ("Orchestrator", and the reader
 scope in "Transport and auth"). With `PITCREW_CONFORMANCE_READER`, a reader token (the mock's
@@ -147,3 +165,7 @@ it and records it as sent without commenting again; a retry by a person the ask 
 to (`403`) and of a sent write (`409`); the task's writes and their events in order; and an
 approval ask an agent raised itself, which proposes nothing. The daemon sends writes in the
 background, so the test polls for each outcome.
+
+Start-session review coverage also checks raw-title controls before trimming, non-local starts,
+preflight refusals leaving no sessions, omitted mode using saved safety, supported prompt limits,
+and two no-prompt person starts sharing a folder with distinct terminals.

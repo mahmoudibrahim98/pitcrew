@@ -51,7 +51,15 @@ permission_mode: PermissionMode,
  * a second time under another id. Without it, the runner mints the id when the
  * transcript appears.
  */
-session?: SessionId, } | { "type": "resume_session", 
+session?: SessionId, 
+/**
+ * A run PitCrew starts on its own behalf (a board draft's): the runner starts the CLI in
+ * its confined, read-mostly shape, whatever the person's own settings for it say, in
+ * `cwd`, a private folder the hub prepared with the run's prompt and settings files. The
+ * permission mode must be `default`; OpenCode is refused on Windows. See the runner's
+ * README, "Confined runs".
+ */
+confined?: boolean, } | { "type": "resume_session", 
 /**
  * The CLI.
  */

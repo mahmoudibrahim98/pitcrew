@@ -22,17 +22,17 @@
 //! The walk runs on tokio's blocking pool; its reads are bounded (a prefix of each transcript, or
 //! one indexed row of an OpenCode store) and run on the scan's own threads.
 
-use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use axum::{Extension, Router};
 use pitcrew_auth::ErrorResponse;
 use pitcrew_hub_work::WorkService;
 use pitcrew_ingest::scan::{ScanHome, ScanOptions};
-use pitcrew_protocol::api::ErrorCode;
+use pitcrew_protocol::api::{Caller, ErrorCode};
 use pitcrew_protocol::ids::MachineId;
 use pitcrew_protocol::model::{Machine, MachineKind};
 use pitcrew_protocol::scan::{ScanFrame, ScanProgress};
@@ -149,9 +149,10 @@ fn conflict(message: impl Into<String>) -> ErrorResponse {
 
 async fn scan(
     State(scans): State<Arc<Scans>>,
+    Extension(caller): Extension<Caller>,
     id: Result<Path<String>, PathRejection>,
 ) -> Response {
-    match start(&scans, id).await {
+    match start(&scans, id, caller).await {
         Ok(frames) => (
             StatusCode::OK,
             [
@@ -173,6 +174,7 @@ async fn scan(
 async fn start(
     scans: &Arc<Scans>,
     id: Result<Path<String>, PathRejection>,
+    caller: Caller,
 ) -> Result<Frames, ErrorResponse> {
     let Path(id) = id.map_err(|_| {
         ErrorResponse::new(ErrorCode::Invalid, "The machine id must be plain text.")
@@ -237,8 +239,15 @@ async fn start(
     let hold = scans.hold;
     let cancel = Arc::new(AtomicBool::new(false));
     let worker_cancel = Arc::clone(&cancel);
+    let scans = Arc::clone(scans);
     drop(tokio::task::spawn_blocking(move || {
-        walk(&homes, hold, &frames, worker_cancel);
+        walk(
+            &homes,
+            hold,
+            &frames,
+            worker_cancel,
+            Some((&scans.work, &caller)),
+        );
         // Its place is given back only once the walk has ended, whether or not anyone listens.
         drop(claim);
     }));
@@ -246,7 +255,13 @@ async fn start(
 }
 
 /// The walk, on the blocking pool: sends its ticks and then its last frame to `frames`.
-fn walk(homes: &[ScanHome], hold: Duration, frames: &mpsc::Sender<Bytes>, cancel: Arc<AtomicBool>) {
+fn walk(
+    homes: &[ScanHome],
+    hold: Duration,
+    frames: &mpsc::Sender<Bytes>,
+    cancel: Arc<AtomicBool>,
+    provision: Option<(&WorkService, &Caller)>,
+) {
     if !hold.is_zero() {
         std::thread::sleep(hold);
     }
@@ -283,7 +298,25 @@ fn walk(homes: &[ScanHome], hold: Duration, frames: &mpsc::Sender<Bytes>, cancel
                 ms = started.elapsed().as_millis(),
                 "scanned this machine's agent homes"
             );
-            ScanFrame::Done { report }
+            let engines: Vec<_> = report
+                .counts
+                .by_engine
+                .iter()
+                .filter(|e| e.count > 0)
+                .map(|e| e.engine)
+                .collect();
+            if !cancel.load(Ordering::Relaxed)
+                && let Some((work, caller)) = provision
+                && let Err(error) = work.ensure_engine_agents(caller, &engines)
+            {
+                tracing::error!(%error, "creating scan-detected agents failed");
+                ScanFrame::Error {
+                    code: ErrorCode::Internal,
+                    message: "Creating detected agents failed; try scanning again.".to_owned(),
+                }
+            } else {
+                ScanFrame::Done { report }
+            }
         }
         Err(_) => {
             tracing::error!("the scan of this machine's agent homes panicked");
@@ -423,6 +456,7 @@ mod tests {
             Duration::ZERO,
             &frames,
             Arc::new(AtomicBool::new(false)),
+            None,
         );
         drop(frames);
         let mut got = Vec::new();
@@ -456,6 +490,7 @@ mod tests {
             Duration::ZERO,
             &frames,
             Arc::new(AtomicBool::new(false)),
+            None,
         );
     }
 

@@ -2,7 +2,8 @@
 //! breaking change to the protocol. Bump `PROTOCOL_VERSION` and tell the affected streams.
 
 use pitcrew_protocol::api::{
-    HostInfo, HostRole, NewProject, NewTask, NewWorkstream, Setup, SetupPerson, StreamFrame,
+    HostInfo, HostRole, NewProject, NewTask, NewWorkstream, PersonaEdit, Setup, SetupPerson,
+    StreamFrame, TeamEdit,
 };
 use pitcrew_protocol::events::{BriefTarget, Event, EventBody};
 use pitcrew_protocol::ids::{
@@ -214,6 +215,7 @@ fn runner_frames_round_trip_as_single_lines() {
             account: None,
             permission_mode: PermissionMode::Default,
             session: Some(SessionId::new()),
+            confined: false,
         },
     };
     let line = encode_line(&cmd).unwrap();
@@ -233,6 +235,15 @@ fn runner_frames_round_trip_as_single_lines() {
     assert!(matches!(
         serde_json::from_value::<RunnerCommand>(older).unwrap(),
         RunnerCommand::StartSession { session: None, .. }
+    ));
+    // A start for a person is not confined, and says nothing of it; a confined one says so, and
+    // an older runner's start without the field is a person's.
+    assert!(v["command"].get("confined").is_none());
+    let mut confined = v["command"].clone();
+    confined["confined"] = serde_json::Value::Bool(true);
+    assert!(matches!(
+        serde_json::from_value::<RunnerCommand>(confined).unwrap(),
+        RunnerCommand::StartSession { confined: true, .. }
     ));
 
     let ok = RunnerToHub::CommandResult {
@@ -561,6 +572,7 @@ fn new_project_round_trips_with_defaults() {
     assert_eq!(
         minimal,
         NewProject {
+            first_workstream: None,
             key: ProjectKey::new("PAP").unwrap(),
             name: "Paper".into(),
             lead: None,
@@ -626,4 +638,44 @@ fn setup_has_the_documented_shape() {
     );
     // Every field is required.
     assert!(serde_json::from_value::<Setup>(json!({"workspace_name": "Demo Lab"})).is_err());
+}
+
+#[test]
+fn directory_edit_bodies_preserve_existing_model_fields() {
+    let recipe: PersonaEdit =
+        serde_json::from_value(json!({"name":"Writer","engine":"codex"})).unwrap();
+    assert_eq!(recipe.permission_mode, PermissionMode::Default);
+    let every: PersonaEdit = round_trip(
+        &json!({"name":"Writer","engine":"codex","model":"demo-model","instructions":"Synthetic examples.","permission_mode":"plan"}),
+    );
+    assert_eq!(every.model.as_deref(), Some("demo-model"));
+    let lead = MemberId::new();
+    let team: TeamEdit = round_trip(&json!({"name":"Demo crew","lead":lead,"members":[lead]}));
+    assert_eq!(team.members, vec![lead]);
+    let atomic: NewProject =
+        round_trip(&json!({"key":"ATM","name":"Atomic","first_workstream":"First"}));
+    assert_eq!(atomic.first_workstream.as_deref(), Some("First"));
+}
+
+/// A session token's scope names its session; the other scopes stay plain words, as stored
+/// registries and older clients have them.
+#[test]
+fn a_session_scope_names_its_session() {
+    use pitcrew_protocol::api::{Caller, TokenScope};
+    let session = SessionId::new();
+    let scope = TokenScope::Session(session);
+    let v = serde_json::to_value(scope).unwrap();
+    assert_eq!(v, serde_json::json!({ "session": session.0.to_string() }));
+    assert_eq!(serde_json::from_value::<TokenScope>(v).unwrap(), scope);
+    assert_eq!(scope.session(), Some(session));
+    for (plain, word) in [(TokenScope::Device, "device"), (TokenScope::Agent, "agent")] {
+        assert_eq!(serde_json::to_value(plain).unwrap(), word);
+        assert_eq!(plain.session(), None);
+    }
+    let caller = Caller {
+        member: pitcrew_protocol::ids::MemberId::new(),
+        scope,
+        on_behalf_of: Some(pitcrew_protocol::ids::MemberId::new()),
+    };
+    assert!(!caller.is_person());
 }

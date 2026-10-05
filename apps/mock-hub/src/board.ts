@@ -4,15 +4,20 @@
 // The mock builds the summary as the hub does (the same template, `crates/office/prompts/`, the
 // same bounds and the same redaction rules, ported), from its sessions and its recaps fixture.
 // It plays the back office: a draft run by `@office` gets a synthetic proposal (a task per session
-// it summarised) once its session is working; any other agent's draft waits for that agent's
-// `POST /v1/board-drafts/{id}/proposal` (the dev agent token is @writer's).
+// it summarised) once its session is working; any other agent's draft waits for a
+// `POST /v1/board-drafts/{id}/proposal` with the session token the mock minted for the draft's
+// session (`pcs_…`, kept in memory; written to `<sessionTokenDir>/<session>.token` when the server
+// is started with that option, which the conformance suite uses). As the hub's, a draft runs in
+// a private folder of its own, its session token is revoked once it has proposed or its session
+// ends, its session is ended after its proposal, and after 30 minutes at most.
 
-import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+
+import { createHash, randomBytes } from 'node:crypto';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { includedRecaps, includesSession } from './import.ts';
-import { announceSession, createSession } from './simulate.ts';
+import { announceSession, createSession, endSession } from './simulate.ts';
 import type { Hub } from './state.ts';
 import {
   ENGINES,
@@ -68,6 +73,12 @@ const MAX_PROPOSED_DESCRIPTION = 2000;
 const MAX_EVIDENCE = 20;
 const MAX_NOTE = 2000;
 export const DRAFTED_LABEL = 'drafted';
+/** `pitcrew_hub_work::CONFINED_BRIEF`: all a draft's CLI is given on its command line. */
+export const CONFINED_BRIEF = 'Read the file prompt.md in this folder and follow its instructions.';
+/** `DRAFT_MAX_RUNTIME`: then a draft's session is ended. */
+export const DRAFT_MAX_RUNTIME_MS = 30 * 60 * 1000;
+/** `PREVIEW_KEPT_MS`: how long a workstream's latest preview is kept for its start. */
+export const PREVIEW_KEPT_MS = 10 * 60 * 1000;
 
 /** Each hub's drafts, oldest first. */
 const DRAFTS = new WeakMap<Hub, BoardDraft[]>();
@@ -81,6 +92,62 @@ function draftsOf(hub: Hub): BoardDraft[] {
   return drafts;
 }
 
+// ─── Session tokens (api-v1.md, "Tokens") ──────────────────────────────────────────────────────
+
+/** Each hub's session tokens: the agent each acts as, and the session it is bound to. */
+const SESSION_TOKENS = new WeakMap<Hub, Map<string, { member: string; session: string }>>();
+
+function sessionTokensOf(hub: Hub): Map<string, { member: string; session: string }> {
+  let tokens = SESSION_TOKENS.get(hub);
+  if (tokens === undefined) {
+    tokens = new Map();
+    SESSION_TOKENS.set(hub, tokens);
+  }
+  return tokens;
+}
+
+/** What a session token may act as, while its session runs; `undefined` for any other text. */
+export function sessionTokenGrant(hub: Hub, token: string): { member: string; session: string } | undefined {
+  const grant = sessionTokensOf(hub).get(token);
+  if (grant === undefined) return undefined;
+  if (hub.findSession(grant.session)?.state !== 'ended') return grant;
+  revokeSessionTokens(hub, grant.session);
+  return undefined;
+}
+
+function mintSessionToken(hub: Hub, member: string, session: string): void {
+  const token = `pcs_${randomBytes(32).toString('base64url')}`;
+  sessionTokensOf(hub).set(token, { member, session });
+  if (hub.sessionTokenDir !== undefined) {
+    writeFileSync(join(hub.sessionTokenDir, `${session}.token`), token, { mode: 0o600 });
+  }
+}
+
+function revokeSessionTokens(hub: Hub, session: string): void {
+  const tokens = sessionTokensOf(hub);
+  for (const [token, grant] of tokens) if (grant.session === session) tokens.delete(token);
+  if (hub.sessionTokenDir !== undefined) rmSync(join(hub.sessionTokenDir, `${session}.token`), { force: true });
+}
+
+/** A draft's run has done its one thing, or given up: its token stops, its session ends. */
+function finishRun(hub: Hub, sessionId: string, mode: 'graceful' | 'kill'): void {
+  revokeSessionTokens(hub, sessionId);
+  const session = hub.findSession(sessionId);
+  if (session !== undefined && session.state !== 'ended') endSession(hub, session, mode);
+}
+
+/** Each hub's latest preview of each workstream, for its start. */
+const PREVIEWS = new WeakMap<Hub, Map<string, { at: number; digest: string; made: ReturnType<typeof makePrompt> }>>();
+
+function previewsOf(hub: Hub): Map<string, { at: number; digest: string; made: ReturnType<typeof makePrompt> }> {
+  let previews = PREVIEWS.get(hub);
+  if (previews === undefined) {
+    previews = new Map();
+    PREVIEWS.set(hub, previews);
+  }
+  return previews;
+}
+
 // ─── Redaction (crates/office/src/redact.rs) ───────────────────────────────────────────────────
 
 const REDACTED = '[redacted]';
@@ -88,7 +155,7 @@ const EMAIL = '[email]';
 const PREFIXES = [
   'sk-', 'sk_live_', 'sk_test_', 'rk_live_', 'rk_test_', 'pk_live_', 'ghp_', 'gho_', 'ghu_', 'ghs_',
   'ghr_', 'github_pat_', 'glpat-', 'gldt-', 'xoxa-', 'xoxb-', 'xoxp-', 'xoxr-', 'xoxs-', 'xapp-',
-  'AKIA', 'ASIA', 'AIza', 'ya29.', 'pcd_', 'pca_', 'npm_', 'pypi-', 'hf_', 'dop_v1_', 'doo_v1_',
+  'AKIA', 'ASIA', 'AIza', 'ya29.', 'pcd_', 'pca_', 'pcs_', 'npm_', 'pypi-', 'hf_', 'dop_v1_', 'doo_v1_',
   'shpat_', 'shpss_', 'SG.', 'glc_', 'sq0atp-', 'EAAC', 'ATATT',
 ];
 const SECRET_NAMES = [
@@ -160,10 +227,18 @@ interface Count {
   n: number;
 }
 
+/** What replaces `part`, also behind or inside punctuation, which is kept (`**ghp_…**`). */
 function replacement(part: string): string | undefined {
   if (part === '') return undefined;
   if (isEmail(part)) return EMAIL;
   if (isToken(part)) return REDACTED;
+  const core = /^[^\p{L}\p{N}]*(.*?)[^\p{L}\p{N}]*$/su.exec(part)?.[1] ?? '';
+  if (core === '' || core.length === part.length) return undefined;
+  const lead = part.length - part.replace(/^[^\p{L}\p{N}]+/u, '').length;
+  const before = part.slice(0, lead);
+  const after = part.slice(lead + core.length);
+  if (isEmail(core)) return `${before}${EMAIL}${after}`;
+  if (isToken(core)) return `${before}${REDACTED}${after}`;
   return undefined;
 }
 
@@ -244,7 +319,7 @@ function asksForValue(core: string, tail: string): boolean {
 
 function homes(text: string, count: Count): string {
   return text.replace(
-    /(^|[\s"'`()[\]{}<>,;|=:@])(\/home\/[^/\s"'`()[\]{}<>,;|]+|\/[Uu]sers\/[^/\s"'`()[\]{}<>,;|]+|[A-Za-z]:[\\/][Uu][Ss][Ee][Rr][Ss][\\/][^\\/\s"'`()[\]{}<>,;|]+|\/root(?=[/\s]|$))/g,
+    /(^|[\s"'`()[\]{}<>,;|=:@])((?:\\\\[?.]\\|\/\/[?.]\/)?(?:\/home\/[^/\s"'`()[\]{}<>,;|]+|\/[Uu]sers\/[^/\s"'`()[\]{}<>,;|]+|\/mnt\/[A-Za-z]\/[Uu]sers\/[^/\s"'`()[\]{}<>,;|]+|[A-Za-z]:[\\/][Uu][Ss][Ee][Rr][Ss][\\/][^\\/\s"'`()[\]{}<>,;|]+|\/root(?=[/\s]|$)))/g,
     (_, before: string) => {
       count.n += 1;
       return `${before}~`;
@@ -252,10 +327,50 @@ function homes(text: string, count: Count): string {
   );
 }
 
+/** Whether `text` is an absolute path: `/…` (not a URL's `//host`), `\\…`, or `C:\…`. */
+function isAbsolute(text: string): boolean {
+  if (/^[A-Za-z]:[\\/]./.test(text)) return true;
+  return text.length > 1 && (text.startsWith('/') || text.startsWith('\\')) && /[\p{L}\p{N}]/u.test(text.slice(1));
+}
+
+/** The end of an absolute path (crates/office/src/redact.rs, `path_tail`). */
+export function pathTail(path: string): string {
+  if (!isAbsolute(path)) return path;
+  const parts = path.split(/[/\\]/).filter((p) => p !== '' && p !== '?' && p !== '.' && !p.endsWith(':'));
+  if (parts.length <= 1) return path;
+  const file = parts[parts.length - 1] ?? '';
+  if (parts.length >= 5) return `…/${parts[parts.length - 2] ?? ''}/${file}`;
+  if (file.replace(/^\.+/, '').includes('.')) return `…/${file}`;
+  return '…';
+}
+
+/** Each absolute path left in `text`, as a word or after `=`, cut to its end. */
+function tails(text: string): string {
+  return text
+    .split(/([\s"'`()[\]{}<>,;|]+)/u)
+    .map((piece) => {
+      if (piece === '' || GAP.test(piece[0] ?? '')) return piece;
+      const core = trimEndOf(piece, '.:!?');
+      const tail = piece.slice(core.length);
+      if (isAbsolute(core)) return `${pathTail(core)}${tail}`;
+      const eq = core.indexOf('=');
+      if (eq !== -1 && isAbsolute(core.slice(eq + 1))) return `${core.slice(0, eq + 1)}${pathTail(core.slice(eq + 1))}${tail}`;
+      return piece;
+    })
+    .join('');
+}
+
+const SEPARATORS = new Set([':', '=', ':=', '=>']);
+
 /** One clean line of at most `max` characters, redacted as the hub redacts it. */
 export function redactLine(text: string, max: number): { text: string; count: number } {
   const limit = max * 4 + 64;
-  let tidy = text.replace(HIDDEN, '').replace(/[\s\p{Cc}\u2028\u2029]+/gu, ' ').trim();
+  // Control characters other than whitespace are dropped, not turned into spaces.
+  let tidy = text
+    .replace(HIDDEN, '')
+    .replace(/(?![\s\u0085])\p{Cc}/gu, '')
+    .replace(/[\s\u0085\u2028\u2029]+/gu, ' ')
+    .trim();
   const chars = [...tidy];
   const cut = chars.length > limit;
   if (cut) tidy = chars.slice(0, limit).join('');
@@ -263,8 +378,16 @@ export function redactLine(text: string, max: number): { text: string; count: nu
   const count: Count = { n: 0 };
   let out = '';
   let valueNext = false;
+  // The word before was a secret's name whose `:` or `=` stands alone after it.
+  let named = false;
   for (const piece of tidy.split(/([\s"'`()[\]{}<>,;|]+)/u)) {
     if (piece === '' || GAP.test(piece[0] ?? '')) {
+      out += piece;
+      continue;
+    }
+    if (SEPARATORS.has(piece)) {
+      valueNext = valueNext || named;
+      named = false;
       out += piece;
       continue;
     }
@@ -278,9 +401,10 @@ export function redactLine(text: string, max: number): { text: string; count: nu
       out += wordRules(core, count);
     }
     valueNext = asksForValue(core, tail);
+    named = !valueNext && tail === '' && isSecretName(core);
     out += tail;
   }
-  out = homes(out, count);
+  out = tails(homes(out, count));
   const all = [...out];
   if (all.length > max || (cut && all.length === max)) {
     out = `${all.slice(0, max - 1).join('').trimEnd()}…`;
@@ -292,14 +416,49 @@ export function redactLine(text: string, max: number): { text: string; count: nu
 
 // ─── The summary (crates/office/src/board.rs) ──────────────────────────────────────────────────
 
+/** A path as one clean line of at most `max` characters, cut at its start (`redact::path`). */
+function redactPath(text: string, max: number): { text: string; count: number } {
+  const limit = max * 4 + 64;
+  const all = [...text];
+  const r = redactLine(all.slice(Math.max(0, all.length - limit)).join(''), limit);
+  const chars = [...r.text];
+  if (chars.length > max) r.text = `…${chars.slice(chars.length - (max - 1)).join('').trimStart()}`;
+  return r;
+}
+
+/**
+ * `path` relative to the first of `folders` it is inside, else as it is (`board::relative_to`):
+ * a session's files are named relative to its folder or the workstream's.
+ */
+export function relativeTo(path: string, folders: string[]): string {
+  const normal = (p: string): string => {
+    let out = p.replaceAll('\\', '/');
+    while (out.length > 1 && out.endsWith('/')) out = out.slice(0, -1);
+    if (out[1] === ':') out = out[0]!.toLowerCase() + out.slice(1);
+    return out;
+  };
+  const file = normal(path);
+  for (const folder of folders.map(normal)) {
+    if (folder === '' || folder === '/' || folder === '~' || folder.endsWith(':')) continue;
+    if (file.startsWith(`${folder}/`) && file.length > folder.length + 1) return file.slice(folder.length + 1);
+  }
+  return path;
+}
+
 function cleaner() {
   const total = { n: 0 };
+  const quiet = (text: string): string => text.replaceAll('<', '‹').replaceAll('>', '›');
   return {
     total,
     line(text: string, max: number): string {
       const r = redactLine(text, max);
       total.n += r.count;
-      return r.text.replaceAll('<', '‹').replaceAll('>', '›');
+      return quiet(r.text);
+    },
+    path(text: string, max: number): string {
+      const r = redactPath(text, max);
+      total.n += r.count;
+      return quiet(r.text);
     },
   };
 }
@@ -350,8 +509,14 @@ function sessionBlock(hub: Hub, session: Session, keys: Map<string, string>, cle
     out += `  Title: ${clean.line(session.title, MAX_TITLE_CHARS)}\n`;
   }
   out += `  Work: ${turns} turns, ${tools} tool runs (${failed} failed), ${edits} file edits\n`;
+  const workstream = session.workstream === undefined ? undefined : hub.findWorkstream(session.workstream);
+  const root = workstream === undefined ? undefined : hub.findProject(workstream.project)?.root;
+  const folders = [session.cwd, ...(workstream?.locations ?? []).map((l) => l.path), ...(root ? [root.path] : [])];
   const sorted = [...files].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)).map(([p]) => p);
-  const shown = sorted.slice(0, MAX_FILES).map((f) => clean.line(f, MAX_PATH_CHARS)).filter((f) => f !== '');
+  const shown = sorted
+    .slice(0, MAX_FILES)
+    .map((f) => clean.path(relativeTo(f, folders), MAX_PATH_CHARS))
+    .filter((f) => f !== '');
   if (shown.length > 0) {
     const more = sorted.length - MAX_FILES;
     out += `  Files: ${shown.join(', ')}${more > 0 ? ` and ${more} more` : ''}\n`;
@@ -468,18 +633,17 @@ function stored(hub: Hub, id: string): BoardDraft {
 export function boardPreview(hub: Hub, workstreamId: string): DraftPreview {
   const workstream = workstreamAt(hub, workstreamId);
   const made = makePrompt(hub, workstream, PLACEHOLDER_ID);
-  return { workstream: workstream.id, prompt: PROMPT, cost: made.cost, summary: made.summary, digest: digestOf(made.text) };
+  const digest = digestOf(made.text);
+  previewsOf(hub).set(workstream.id, { at: Date.now(), digest, made });
+  return { workstream: workstream.id, prompt: PROMPT, cost: made.cost, summary: made.summary, digest };
 }
 
-/** Where the draft runs: the workstream's first location, the project's root, or the hub's `~`. */
-function placeOf(hub: Hub, workstream: Workstream): { machine: Machine; path: string; branch?: string | undefined } {
-  const root = hub.findProject(workstream.project)?.root;
-  const location = [...workstream.locations, ...(root ? [root] : [])][0];
-  const machine =
-    location === undefined ? hub.machines.find((m) => m.kind === 'local') : hub.findMachine(location.machine);
-  if (machine === undefined) throw unavailable('No machine can run the draft.');
+/** Where a draft runs: the hub's own machine, in a private folder of its own; never the workstream's. */
+function draftMachine(hub: Hub): Machine {
+  const machine = hub.machines.find((m) => m.kind === 'local');
+  if (machine === undefined) throw unavailable('No machine can run the draft: this hub has no machine of its own.');
   if (machine.liveness !== 'live') throw unavailable(`${machine.name} is ${machine.liveness}; its runner cannot be reached.`);
-  return { machine, path: location?.path ?? '~', branch: location?.branch };
+  return machine;
 }
 
 /** `POST /v1/workstreams/{id}/board-drafts`. */
@@ -502,7 +666,10 @@ export function startDraft(hub: Hub, me: string, workstreamId: string, body: unk
   if (chosen.owner !== me) {
     throw forbidden(`${chosen.handle} is not your agent: a person may run only their own agents.`);
   }
-  const made = makePrompt(hub, workstream, PLACEHOLDER_ID);
+  // The workstream's latest preview, while it is kept and has this digest, is what is sent.
+  const previewed = previewsOf(hub).get(workstream.id);
+  const kept = previewed !== undefined && previewed.digest === digest && Date.now() - previewed.at <= PREVIEW_KEPT_MS;
+  const made = kept ? previewed.made : makePrompt(hub, workstream, PLACEHOLDER_ID);
   if (digestOf(made.text) !== digest) {
     throw conflict('The workstream has changed since its preview: preview it again, and confirm what will be sent.');
   }
@@ -512,20 +679,27 @@ export function startDraft(hub: Hub, me: string, workstreamId: string, body: unk
   if (open !== undefined) {
     throw conflict(`${workstream.name} already has a board draft ${open.state === 'running' ? 'running' : 'waiting for review'}.`);
   }
-  const place = placeOf(hub, workstream);
+  const machine = draftMachine(hub);
   const persona = chosen.persona === undefined ? undefined : hub.findPersona(chosen.persona);
   const engine = engineGiven ?? persona?.engine ?? 'claude';
+  if (chosen.owner === undefined) throw invalid(`${chosen.handle} has no owner, so its run cannot be given a token.`);
+  previewsOf(hub).delete(workstream.id);
   const id = ulid();
+  // Confined: its own folder, and one line on its command line (the prompt is in prompt.md).
   const session = createSession(hub, {
     engine,
-    machine: place.machine.id,
-    cwd: place.path,
-    branch: place.branch,
+    machine: machine.id,
+    cwd: '',
     title: `Drafting the board of ${workstream.name}`,
     agent: chosen.id,
     workstream: workstream.id,
     link_basis: 'manual',
-    brief: made.text.replace(PLACEHOLDER_ID, `drf_${id}`),
+    brief: CONFINED_BRIEF,
+  });
+  session.cwd = `~/.cache/pitcrew/scratch/${session.id}`;
+  mintSessionToken(hub, chosen.id, session.id);
+  hub.later(DRAFT_MAX_RUNTIME_MS, () => {
+    if (stateOf(hub, draft).state === 'running') finishRun(hub, session.id, 'kill');
   });
   const draft: BoardDraft = {
     id,
@@ -620,13 +794,20 @@ function record(hub: Hub, author: string, draft: BoardDraft, proposal: BoardProp
     type: 'board_proposed',
     data: { draft: draft.id, workstream: draft.workstream, tasks: proposal.tasks, ...(proposal.note === undefined ? {} : { note: proposal.note }) },
   });
+  // Its one thing is done: its token stops now, and its session is ended.
+  finishRun(hub, draft.session, 'graceful');
 }
 
-/** `POST /v1/board-drafts/{id}/proposal`: the drafting agent's only. */
-export function proposeBoard(hub: Hub, caller: { memberId: string; scope: string }, ref: string, body: unknown): BoardDraft {
+/** `POST /v1/board-drafts/{id}/proposal`: the draft's own session token only. */
+export function proposeBoard(
+  hub: Hub,
+  caller: { memberId: string; scope: string; session?: string | undefined },
+  ref: string,
+  body: unknown,
+): BoardDraft {
   const draft = draftAt(hub, ref);
-  if (caller.scope !== 'agent' || caller.memberId !== draft.agent) {
-    throw forbidden(`Only the agent drafting drf_${draft.id} may propose its board.`);
+  if (caller.scope !== 'session' || caller.session !== draft.session || caller.memberId !== draft.agent) {
+    throw forbidden(`Only the session drafting drf_${draft.id} may propose its board, with the token it was given.`);
   }
   const proposal = checkedProposal(hub, draft, body);
   if (draft.state === 'proposed' || draft.state === 'reviewed') throw conflict(`drf_${draft.id} already has a proposal.`);
