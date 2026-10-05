@@ -115,7 +115,7 @@ mod tests {
         let info: serde_json::Value =
             serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
                 .unwrap();
-        assert_eq!(info["owner"], caller.member.to_string());
+        assert_eq!(info["owner"], serde_json::json!(caller.member));
         let response = app
             .oneshot(
                 Request::builder()

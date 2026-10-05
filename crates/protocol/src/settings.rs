@@ -34,5 +34,6 @@ pub struct SavePersona {
     /// Optional standing instructions.
     pub instructions: Option<String>,
     /// Permission mode for new sessions.
+    #[serde(default)]
     pub permission_mode: crate::model::PermissionMode,
 }
