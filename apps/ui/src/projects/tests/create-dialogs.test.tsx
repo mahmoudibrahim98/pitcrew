@@ -4,7 +4,7 @@ import { cleanup, fireEvent, render, screen, within } from '@testing-library/rea
 import type { QueryClient } from '@tanstack/react-query';
 import { createMemoryHistory, RouterProvider } from '@tanstack/react-router';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { createApi, createQueryClient, DataProvider } from '../../data/index.ts';
+import { createApi, createQueryClient, DataProvider, type Machine } from '../../data/index.ts';
 import { createAppRouter } from '../../shell/routes.tsx';
 import { useShell } from '../../shell/store.ts';
 import { feature } from '../index.ts';
@@ -21,7 +21,15 @@ afterEach(async () => {
   await stopHub(hub); localStorage.clear();
 });
 function app(path = 'members') {
-  const api = createApi({ baseUrl: hub.url, token: 'dev-device-token' });
+  const api = createApi({ baseUrl: hub.url, token: 'dev-device-token', fetch: async (input, init) => {
+    const response = await fetch(input, init);
+    // The demo says Linux; local path validation in the child hub uses its actual host OS.
+    if (process.platform === 'win32' && String(input).endsWith('/v1/machines')) {
+      const machines: Machine[] = await response.json();
+      return new Response(JSON.stringify(machines.map(m => m.kind === 'local' ? { ...m, info: { ...m.info, os: 'windows' } } : m)), { headers: { 'Content-Type': 'application/json' } });
+    }
+    return response;
+  } });
   client = createQueryClient();
   const router = createAppRouter([feature], { history: createMemoryHistory({ initialEntries: [`/w/${WS}/${path}`] }) });
   render(<DataProvider api={api} queryClient={client} token="dev-device-token"><RouterProvider router={router} /></DataProvider>);

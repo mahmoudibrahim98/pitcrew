@@ -88,6 +88,11 @@ Unix-runtime skip; Rust daemon HTTP tests cover Files API routes there.
 
 `run.mjs` runs `import.test.mjs` serially after the shared suite, since committing inclusion affects all views of its disposable hub. Both targets check dry-run/commit agreement, each mode, filters, excluded session/activity/recap reads, restoration, validation and device-only access.
 
+Session launch coverage now checks person-only machine options, platform and supported modes,
+unknown/unreachable machines, title validation, and an unnamed no-prompt start returning a
+terminal immediately. It reads the session back and ends it; the daemon uses only its temporary
+stand-in CLI, with PITCREW_FILES_ROOT as the safe launch folder.
+
 Directory creation/editing cases cover all four POST/PUT routes, device-only access, bounded
 fields, unknown members/targets, forged metadata, persona-linked membership, lead inclusion,
 deduplication, event authors and unchanged revisions on refusal. Atomic-project cases prove an
@@ -140,3 +145,6 @@ background, so the test polls for each outcome.
 `settings.test.mjs` runs in its own phase after writes on both targets: metadata/workspace
 ownership, device-only profile and recipe writes, field validation, handle conflicts, live
 readback and idempotent profile saves. Daemon conformance keeps its existing Windows skip.
+Start-session review coverage also checks raw-title controls before trimming, non-local starts,
+preflight refusals leaving no sessions, omitted mode using saved safety, supported prompt limits,
+and two no-prompt person starts sharing a folder with distinct terminals.

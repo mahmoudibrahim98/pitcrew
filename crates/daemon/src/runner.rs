@@ -57,6 +57,8 @@ use std::time::Duration;
 /// What the routes use of a running runner.
 #[derive(Clone, Debug)]
 pub struct Parts {
+    /// Serializes terminal publication with runner reports.
+    pub publication: Arc<Mutex<()>>,
     /// The machine it runs on.
     pub machine: MachineId,
     /// The API's hook sink.
@@ -236,8 +238,14 @@ impl Runner {
         }
         let handle = pitcrew_runner::start(config, Vec::new(), Arc::new(Nowhere))
             .expect("an idle runner starts");
-        let parts = parts_of(&handle, machine, &TerminalRuntime::none(), false)
-            .expect("its terminals start");
+        let parts = parts_of(
+            &handle,
+            machine,
+            &TerminalRuntime::none(),
+            false,
+            Arc::new(Mutex::new(())),
+        )
+        .expect("its terminals start");
         Self {
             parts,
             handle: Some(handle),
@@ -325,9 +333,11 @@ fn parts_of(
     machine: MachineId,
     runtime: &TerminalRuntime,
     watches: bool,
+    publication: Arc<Mutex<()>>,
 ) -> Result<Parts, pitcrew_runner::RunnerError> {
     let terminals = handle.terminals(runtime.runtime())?;
     Ok(Parts {
+        publication,
         machine,
         hooks: handle.hooks(),
         commands: handle.commands(&terminals),
@@ -382,6 +392,7 @@ pub fn start(
     ];
 
     let mut config = RunnerConfig::new(work.workspace(), machine, owner, &dir)
+        .with_runtime(runtime.runtime())
         .with_agents(Arc::new(HubAgents::new(Arc::clone(work))))
         .with_locations(Arc::new(HubLocations::new(Arc::clone(work))))
         .with_session_env(Arc::clone(session_env) as Arc<dyn SessionEnv>);
@@ -398,13 +409,14 @@ pub fn start(
         StoreSink::new(Arc::clone(store), owner),
         Arc::clone(work),
     ));
+    let publication = sink.publication();
     let handle = pitcrew_runner::start(config, adapters, sink).with_context(|| {
         format!(
             "cannot start the runner with its index in {}",
             dir.display()
         )
     })?;
-    let parts = match parts_of(&handle, machine, runtime, watches) {
+    let parts = match parts_of(&handle, machine, runtime, watches, publication) {
         Ok(parts) => parts,
         Err(e) => {
             stop_aside(handle);

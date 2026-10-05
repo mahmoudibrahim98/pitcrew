@@ -66,6 +66,8 @@ fn export_bindings() -> Result<(), Box<dyn Error>> {
     api::ErrorCode::export_all(&config)?;
     api::EventsPage::export_all(&config)?;
     api::HostInfo::export_all(&config)?;
+    api::SessionOptions::export_all(&config)?;
+    api::SessionEngine::export_all(&config)?;
     api::HostRole::export_all(&config)?;
     api::NewProject::export_all(&config)?;
     api::PersonaEdit::export_all(&config)?;

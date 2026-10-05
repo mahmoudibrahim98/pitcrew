@@ -68,6 +68,7 @@ impl Default for Timing {
 /// Everything the runner needs to start.
 #[derive(Clone, Debug)]
 pub struct RunnerConfig {
+    pub(crate) startup_runtime: Option<StartupRuntime>,
     /// The workspace events belong to.
     pub workspace: WorkspaceId,
     /// This machine.
@@ -118,6 +119,7 @@ impl RunnerConfig {
         state_dir: impl Into<PathBuf>,
     ) -> Self {
         Self {
+            startup_runtime: None,
             workspace,
             machine,
             owner,
@@ -134,6 +136,14 @@ impl RunnerConfig {
             notification_window: Duration::ZERO,
             session_env: None,
         }
+    }
+
+    /// Attach runtime evidence before initial transcript reads, so restart cannot expire a
+    /// session whose owned terminal is still alive.
+    #[must_use]
+    pub fn with_runtime(mut self, runtime: Arc<dyn pitcrew_interfaces::runtime::Runtime>) -> Self {
+        self.startup_runtime = Some(StartupRuntime(runtime));
+        self
     }
 
     /// Adds a CLI home.
@@ -166,5 +176,15 @@ impl RunnerConfig {
     pub fn with_session_env(mut self, env: Arc<dyn SessionEnv>) -> Self {
         self.session_env = Some(env);
         self
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct StartupRuntime(pub Arc<dyn pitcrew_interfaces::runtime::Runtime>);
+impl std::fmt::Debug for StartupRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("StartupRuntime")
+            .field(&self.0.kind())
+            .finish()
     }
 }

@@ -244,6 +244,18 @@ only in memory. Remote and WSL locations return 501. No filesystem paths are ope
 
 Session import implements all/filtered/start-fresh rules in memory on the three `/v1/import` routes. Session lists, activity and stream delivery share inclusion; affected recap day paragraphs are reconstructed from retained fixture block lines. The mock still computes no new recap blocks for mutations.
 
+Session-options advertises the mock local machine's three synthetic CLIs and supported modes
+(Claude plan/accept-edits, Codex accept-edits, OpenCode default; bypass disabled). Unreachable
+machines return 503. Session start accepts and validates an optional title and returns its
+synthetic terminal without waiting for a transcript, matching the real daemon's launch flow.
+
+Onboarding hooks use synthetic in-memory configuration text, person/machine-bound previews, stale refusal and idempotent confirmation. The mock never opens agent homes. Device-only safety read/save validates the same settings as the daemon and appends `safety_changed` on change.
+
+Session starts apply the workspace safety default when permission mode is omitted, reject raw
+title controls before trimming, refuse non-local machines with 503, and link an explicit
+workstream immediately (manual basis). Session options include first-prompt constraints; the
+synthetic Unix CLIs have none.
+
 Directory writes (`POST /v1/personas`, `PUT /v1/personas/{id}`, `POST /v1/teams`,
 `PUT /v1/teams/{id}`) mirror the hub's device-only validation, generated ids, events, caller-owned
 agent member creation and linked-member rename. Unknown team members are refused before mutation.
