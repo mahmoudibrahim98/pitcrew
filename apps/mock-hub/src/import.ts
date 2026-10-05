@@ -18,7 +18,24 @@ export function parseImport(value: unknown): ImportFilter {
   }
   return { mode: value['mode'] as ImportFilter['mode'], ...(since === undefined ? {} : { since }), engines, folders };
 }
-export function includesSession(choice: ImportChoice, session: Session): boolean {
+/** Sub-agents are followed up their chain of parents for at most this many sessions. */
+const MAX_PARENT_CHAIN = 16;
+/**
+ * The session whose inclusion decides `session`'s: a sub-agent follows its parent, up the chain,
+ * to the first session without one (a parent the hub does not know, or a loop, stops there).
+ */
+export function deciding(hub: Pick<Hub, 'findSession'>, session: Session): Session {
+  let at = session;
+  for (let i = 1; i < MAX_PARENT_CHAIN && at.parent !== undefined; i += 1) {
+    const parent = hub.findSession(at.parent);
+    if (parent === undefined || parent.id === session.id) break;
+    at = parent;
+  }
+  return at;
+}
+/** Whether `session` is included; with `hub`, a sub-agent exactly when its parent is. */
+export function includesSession(choice: ImportChoice, session: Session, hub?: Pick<Hub, 'findSession'>): boolean {
+  if (hub !== undefined) session = deciding(hub, session);
   const f = choice.filter;
   if (f.mode === 'all') return true;
   if (f.mode === 'none') return choice.committed_at !== null && session.started > choice.committed_at;
@@ -51,13 +68,13 @@ export function eventVisible(hub: Hub, event: Event, person?: string): boolean {
   }
   return ids.every((id) => {
     const session = hub.findSession(id);
-    return session === undefined || includesSession(hub.importChoice, session);
+    return session === undefined || includesSession(hub.importChoice, session, hub);
   });
 }
 // Rebuild affected day paragraphs from retained block lines; never retain text from excluded blocks.
 export function includedRecaps(hub: Hub): DemoRecaps {
   const blocks = hub.recaps.blocks.filter(({ block }) => block.session === undefined ||
-    includesSession(hub.importChoice, hub.findSession(block.session)!));
+    includesSession(hub.importChoice, hub.findSession(block.session)!, hub));
   const byId = new Map(blocks.map((b) => [b.block.id, b]));
   return { ...hub.recaps, blocks, projects: hub.recaps.projects.map((project) => ({ ...project,
     days: project.days.flatMap((day) => {
@@ -76,4 +93,15 @@ export function includedRecaps(hub: Hub): DemoRecaps {
       return [{ ...day, blocks: retained, summary: { text, spans } }];
     }),
   })) };
+}
+/** Included sessions without a parent, and included sub-agents, as the import counts them. */
+export function importCounts(hub: Hub, choice: ImportChoice): { sessions: number; subagents: number } {
+  let sessions = 0;
+  let subagents = 0;
+  for (const s of hub.sessions) {
+    if (!includesSession(choice, s, hub)) continue;
+    if (s.parent === undefined) sessions += 1;
+    else subagents += 1;
+  }
+  return { sessions, subagents };
 }

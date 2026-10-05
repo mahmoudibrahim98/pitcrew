@@ -134,7 +134,16 @@ export function scanReport(): ScanReport {
         recent_90d: 7,
         workstreams: [
           {
+            id: '/home/sam/work/diffusion-paper',
+            kind: 'main',
+            name: 'main',
+            session_count: 7,
+            recent_30d: 5,
+            recent_90d: 7,
+          },
+          {
             id: '/home/sam/work/diffusion-paper/paper',
+            kind: 'folder',
             name: 'paper',
             session_count: 4,
             recent_30d: 3,
@@ -142,6 +151,7 @@ export function scanReport(): ScanReport {
           },
           {
             id: '/home/sam/work/diffusion-paper#revision-2',
+            kind: 'branch',
             name: 'revision-2',
             branch: 'revision-2',
             session_count: 2,
@@ -150,6 +160,7 @@ export function scanReport(): ScanReport {
           },
           {
             id: '/home/sam/work/diffusion-paper/experiments',
+            kind: 'folder',
             name: 'experiments',
             session_count: 2,
             recent_30d: 0,
@@ -167,7 +178,16 @@ export function scanReport(): ScanReport {
         recent_90d: 4,
         workstreams: [
           {
+            id: '/home/sam/work/lab-tools',
+            kind: 'main',
+            name: 'main',
+            session_count: 4,
+            recent_30d: 3,
+            recent_90d: 4,
+          },
+          {
             id: '/home/sam/work/lab-tools#parsers',
+            kind: 'branch',
             name: 'parsers',
             branch: 'parsers',
             session_count: 2,
@@ -184,7 +204,16 @@ export function scanReport(): ScanReport {
         session_count: 3,
         recent_30d: 0,
         recent_90d: 3,
-        workstreams: [],
+        workstreams: [
+          {
+            id: '/scratch/sam/diffusion-runs',
+            kind: 'main',
+            name: 'Main',
+            session_count: 3,
+            recent_30d: 0,
+            recent_90d: 3,
+          },
+        ],
       },
     ],
     unreadable: 0,

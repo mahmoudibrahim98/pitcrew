@@ -19,6 +19,7 @@ const codes = { 401: 'unauthorized', 403: 'forbidden', 404: 'not_found', 409: 'c
 const engine = enumeration('claude', 'codex', 'opencode');
 const workstreamSuggestion = object({
   id: text,
+  kind: enumeration('main', 'worktree', 'folder', 'branch'),
   name: text,
   'branch?': text,
   session_count: integer,
@@ -76,9 +77,14 @@ function consistent(r) {
     assert.ok(s.recent_30d <= s.recent_90d && s.recent_90d <= s.session_count);
     const ids = s.workstreams.map((w) => w.id);
     assert.equal(new Set(ids).size, ids.length, 'workstream ids are unique in a project');
+    // Every project's default workstream comes first, at its root, and only once.
+    assert.equal(s.workstreams[0]?.kind, 'main', 'the default workstream first');
+    assert.equal(s.workstreams[0]?.id, s.path, 'the default workstream at the root');
+    assert.equal(s.workstreams.filter((w) => w.kind === 'main').length, 1);
     for (const w of s.workstreams) {
       assert.ok(w.recent_30d <= w.recent_90d && w.recent_90d <= w.session_count);
       assert.ok(w.session_count <= s.session_count);
+      assert.equal(w.branch !== undefined, w.kind === 'branch', 'only a branch suggestion names a branch');
     }
   }
 }

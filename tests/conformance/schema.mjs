@@ -136,6 +136,8 @@ const session = object({
   last_activity: integer,
   'terminal?': id,
   'parent?': id,
+  'model?': text,
+  'account?': text,
 });
 const answer = object({ by: id, 'option?': integer, 'text?': text, at: integer });
 const ask = object({
@@ -262,7 +264,7 @@ const eventData = {
     removed: integer,
     'receipt?': receipt,
   }),
-  session_updated: object({ session: id, 'title?': text, 'branch?': text }),
+  session_updated: object({ session: id, 'title?': text, 'branch?': text, 'model?': text }),
   session_linked: object({
     session: id,
     'workstream?': id,

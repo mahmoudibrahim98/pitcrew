@@ -85,7 +85,7 @@ export interface TerminalTarget {
 /** The session behind a terminal request: 404 if unknown or without a terminal, 503 if unreachable. */
 export function terminalTarget(hub: Hub, ref: string, query: URLSearchParams): TerminalTarget {
   const session = hub.findSession(ref);
-  if (session === undefined || !includesSession(hub.importChoice, session)) {
+  if (session === undefined || !includesSession(hub.importChoice, session, hub)) {
     throw notFound(`No session ${ref}.`);
   }
   requireReachable(hub, session);
