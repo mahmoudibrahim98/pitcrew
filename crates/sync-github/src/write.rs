@@ -496,6 +496,22 @@ fn created_since(item: &Value, since: &GithubTimestamp) -> bool {
         .is_some_and(|at| at.is_well_formed() && at.as_str() >= since.as_str())
 }
 
+/// Whether `item` (an issue or a comment from a listing) has exactly the text `write` sends: an
+/// issue, not a pull request, with its title and body; a comment with its text.
+fn same_text(write: &IssueWrite, item: &Value) -> bool {
+    match write {
+        IssueWrite::Create { title, body, .. } => {
+            item.get("pull_request").is_none()
+                && item.get("title").and_then(Value::as_str) == Some(title.as_str())
+                && item.get("body").and_then(Value::as_str).unwrap_or_default() == body
+        }
+        IssueWrite::Comment { body, .. } => {
+            item.get("body").and_then(Value::as_str) == Some(body.as_str())
+        }
+        IssueWrite::Edit { .. } => false,
+    }
+}
+
 /// Looks upstream for an earlier attempt at `write`, made since `since` (`YYYY-MM-DDTHH:MM:SSZ`):
 /// for a create, an issue (not a pull request) with exactly its title and body, among the 100
 /// newest updated since; for a comment, one with exactly its text. One request; an edit has none
@@ -518,35 +534,15 @@ pub async fn find_earlier<T: Transport>(
     }
     let api = config.api();
     let after = since.as_str().replace(':', "%3A");
-    let (url, matches): (String, Box<dyn Fn(&Value) -> bool + Send + Sync>) = match write {
-        IssueWrite::Create {
-            repo, title, body, ..
-        } => {
-            let (title, body) = (title.clone(), body.clone());
-            (
-                format!(
-                    "{api}/repos/{}/issues?state=all&sort=created&direction=desc&per_page=100&since={after}",
-                    repo.as_str()
-                ),
-                Box::new(move |item: &Value| {
-                    item.get("pull_request").is_none()
-                        && item.get("title").and_then(Value::as_str) == Some(title.as_str())
-                        && item.get("body").and_then(Value::as_str).unwrap_or_default() == body
-                }),
-            )
-        }
-        IssueWrite::Comment { repo, number, body } => {
-            let body = body.clone();
-            (
-                format!(
-                    "{api}/repos/{}/issues/{number}/comments?since={after}&per_page=100",
-                    repo.as_str()
-                ),
-                Box::new(move |item: &Value| {
-                    item.get("body").and_then(Value::as_str) == Some(body.as_str())
-                }),
-            )
-        }
+    let url = match write {
+        IssueWrite::Create { repo, .. } => format!(
+            "{api}/repos/{}/issues?state=all&sort=created&direction=desc&per_page=100&since={after}",
+            repo.as_str()
+        ),
+        IssueWrite::Comment { repo, number, .. } => format!(
+            "{api}/repos/{}/issues/{number}/comments?since={after}&per_page=100",
+            repo.as_str()
+        ),
         IssueWrite::Edit { .. } => return Ok(None),
     };
     let answer = read_json(&exchange(transport, read_request(config, url)).await?)?;
@@ -556,7 +552,7 @@ pub async fn find_earlier<T: Transport>(
     let web = expected_web_origin(config.api_base.as_deref());
     Ok(items
         .iter()
-        .find(|item| created_since(item, since) && matches(item))
+        .find(|item| created_since(item, since) && same_text(write, item))
         .map(|item| Written {
             number: match write {
                 IssueWrite::Create { .. } => item
