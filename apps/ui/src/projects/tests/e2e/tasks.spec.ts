@@ -30,7 +30,7 @@ test('task drawer edits, traps keyboard focus, archives with Undo and retains a 
   await page.keyboard.press('Enter');
   await drawer.getByRole('button', { name: 'Edit task', exact: true }).click();
   await drawer.getByLabel('Title', { exact: true }).fill('Edited in drawer');
-  await drawer.getByLabel('Description', { exact: true }).fill('**Ready** <script>alert(1)</script>');
+  await drawer.getByRole('textbox', { name: 'Description', exact: true }).fill('**Ready** <script>alert(1)</script>');
   await drawer.getByLabel('Priority', { exact: true }).selectOption('high');
   await drawer.getByLabel('Labels', { exact: true }).fill('review\ntests');
   await drawer.getByLabel('Start date', { exact: true }).fill('2026-09-30');
