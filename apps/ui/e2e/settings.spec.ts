@@ -1,0 +1,21 @@
+import { expect, test } from '@playwright/test';
+import AxeBuilder from '@axe-core/playwright';
+const base='/w/01JB000000000000000WSP0001/settings';
+test('Settings routes, appearance, shortcuts, browser omissions and accessibility', async ({page})=>{
+  await page.goto(`${base}/appearance`);
+  await expect(page.getByRole('navigation',{name:'Settings sections'})).toBeVisible();
+  await page.getByLabel('Density').selectOption('compact');
+  await expect(page.locator('html')).toHaveAttribute('data-density','compact');
+  await page.getByRole('region',{name:'Appearance'}).getByRole('radio',{name:'Dark',exact:true}).click();
+  await expect(page.locator('html')).toHaveAttribute('data-theme','dark');
+  const nav=page.getByRole('navigation',{name:'Settings sections'});
+  await expect(nav.getByRole('link',{name:'Updates',exact:true})).toHaveCount(0);
+  await expect(nav.getByRole('link',{name:'Notifications',exact:true})).toHaveCount(0);
+  await nav.getByRole('link',{name:'Keyboard shortcuts',exact:true}).click();
+  await expect(page.getByText('Open command palette', {exact:false})).toBeVisible();
+  const results=await new AxeBuilder({page}).analyze(); expect(results.violations).toEqual([]);
+  await nav.getByRole('link',{name:'About',exact:true}).click();
+  await expect(page.getByText('Protocol: 1', {exact:true})).toBeVisible();
+  await page.getByRole('button',{name:'Collapse sidebar',exact:true}).click();
+  await expect(page.getByRole('complementary',{name:'Sidebar'}).getByRole('link',{name:'Settings',exact:true})).toBeVisible();
+});

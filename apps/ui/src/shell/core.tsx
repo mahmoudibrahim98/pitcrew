@@ -19,6 +19,8 @@ import type { CreateEntry, Feature } from './feature.ts';
 import { OpenWorkstream } from './pages/open.tsx';
 import type { WorkspaceRoute } from './routes.tsx';
 import { useShell } from './store.ts';
+import { SECTIONS } from '../settings/sections.ts';
+import { isDesktop } from '../data/transport.ts';
 
 function InboxCount() {
   const n = useMyOpenAsks().data?.length ?? 0;
@@ -99,7 +101,7 @@ function placeholderRoutes(parent: WorkspaceRoute): AnyRoute[] {
     staticData: { layout: Feature['layout']; title?: string; setup?: boolean },
   ) => createRoute({ getParentRoute: () => parent, path, component: pages(component), staticData });
   return [
-    createRoute({ getParentRoute: () => parent, path: 'settings', component: lazyRouteComponent(() => import('./updates.tsx'), 'UpdateSettings'), staticData: { layout: 'both', title: 'Settings' } }),
+    ...['settings', 'settings/$section'].map((path) => createRoute({ getParentRoute: () => parent, path, component: lazyRouteComponent(() => import('../settings/page.tsx'), 'SettingsPage'), staticData: { layout: 'both', title: 'Settings' } })),
     route('home', 'HomePage', { layout: 'projects', title: 'Home' }),
     route('inbox', 'InboxPage', { layout: 'both', title: 'Inbox' }),
     route('my-tasks', 'MyTasksPage', { layout: 'projects', title: 'My tasks' }),
@@ -138,6 +140,8 @@ export const shellFeature: Feature = {
     { id: 'console', label: 'Agent console', to: 'console', icon: ConsoleIcon, badge: ConsoleCount, order: 40 },
   ],
   commands: [
+    { id: 'open-settings', label: 'Open settings', group: 'Settings', run: (c) => c.go('settings/profile') },
+    ...SECTIONS.filter(([id]) => id !== 'updates' || isDesktop()).map(([id, label]) => ({ id: `settings-${id}`, label: `Open settings: ${label}`, group: 'Settings', run: (c: import('./feature.ts').CommandContext) => c.go(`settings/${id}`) })),
     { id: 'go-home', label: 'Go to Home', group: 'Go to', layout: 'projects', run: (c) => c.go('home') },
     { id: 'go-inbox', label: 'Go to Inbox', group: 'Go to', run: (c) => c.go('inbox') },
     { id: 'go-my-tasks', label: 'Go to My tasks', group: 'Go to', layout: 'projects', run: (c) => c.go('my-tasks') },

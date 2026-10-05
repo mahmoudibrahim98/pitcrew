@@ -305,23 +305,12 @@ pre-release opt-in; browser mode explains that the desktop manages updates. Erro
 and retryable. See the desktop gateway contract and `tests/updates.test.tsx` for the IPC and
 consent checks. Tauri bindings remain dynamic imports outside the initial browser bundle.
 
-## Settings brief: scope blockers
+## Settings
 
-Brief `0-settings` requires desktop notification controls and hook removal after reviewing an
-exact diff. Neither can currently be implemented through the shell's available interfaces:
-
-- Desktop notifications read `Shell.preferences` in
-  `apps/desktop/src-tauri/src/shell.rs`. Only the native tray changes the notification preference;
-  the command registration in `app.rs` exposes no preference read or write command. The preference
-  model has a single notification switch and no event selection. Making Settings control actual
-  notifications requires new desktop commands, event filtering, and a gateway contract extension.
-- `crates/cli/src/install/library.rs` exposes `Installation::preview` for installation only.
-  Uninstall planners are private to the CLI module. A retained uninstall preview must preserve
-  its stale-file checks, ownership checks and exact deletion semantics before a daemon route can
-  safely confirm removal. Running the standalone uninstall command after showing an independently
-  produced diff would not confirm the retained plan.
-
-These are substantive changes under `apps/desktop/**`, `crates/cli/**`, and
-`docs/build/contracts/desktop-gateway.md`, outside the brief's paths. Implementation is stopped
-under the task's scope rule until those paths are assigned to this brief or the interfaces land
-from their owning streams. No Settings feature or replacement persistence has been added.
+The shell serves `/w/$ws/settings` (Profile) and `/w/$ws/settings/$section` in both layouts.
+The gear stays in the sidebar footer when collapsed and in browser builds. The palette opens
+Settings or a specific section. `src/settings` owns the section list, forms and local density
+preference; its page is loaded lazily. Integrations keeps its existing deep link and is composed
+inside Settings instead of the Projects layout. Updates is listed only in the desktop app.
+Native notification preferences remain controlled by the tray; hook removal awaits retained
+uninstall plans in the CLI. See `src/settings/README.md` for persistence and existing API reuse.

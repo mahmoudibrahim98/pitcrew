@@ -28,7 +28,6 @@ import {
   ThemeToggle,
   Tooltip,
 } from '../design/index.ts';
-import { isDesktop } from '../data/transport.ts';
 import { cx } from '../lib/cx.ts';
 import { useRegistry } from './context.ts';
 import { inLayout } from './feature.ts';
@@ -210,13 +209,10 @@ function Footer({ collapsed }: { collapsed: boolean }) {
           )}
         </div>
       )}
-      {/* Settings sits here, after the Projects tree, so Tab from the main nav still reaches the
-          tree first. Its only settings so far are the desktop updater's. */}
-      {!collapsed && isDesktop() && (
-        <Link to={paths.under(ws, 'settings')} data-nav="settings" className={ITEM}>
-          <span className="min-w-0 flex-1 truncate">Settings</span>
-        </Link>
-      )}
+      <Link to={paths.under(ws, 'settings/profile')} aria-label="Settings" data-nav="settings" className={cx(ITEM, collapsed && 'justify-center px-0')}>
+        <svg aria-hidden viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" className="size-4 shrink-0"><path d="m9 3-1 3-3 1-2 3 2 2-1 3 3 2 3-1 2 3 3-1 1-3 3-1 1-3-2-2 1-3-3-2-3 1Z" /><circle cx="12" cy="12" r="3" /></svg>
+        {!collapsed && <span className="min-w-0 flex-1 truncate">Settings</span>}
+      </Link>
       {!collapsed && <ThemeToggle />}
     </div>
   );

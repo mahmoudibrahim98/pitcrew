@@ -54,7 +54,7 @@
       "name": "UI foundation",
       "paths": [
         "apps/ui/*", "apps/ui/public/**", "apps/ui/src/*",
-        "apps/ui/src/design/**", "apps/ui/src/shell/**", "apps/ui/src/data/**",
+        "apps/ui/src/design/**", "apps/ui/src/shell/**", "apps/ui/src/data/**", "apps/ui/src/settings/**",
         "apps/ui/src/lib/**", "apps/ui/src/assets/**", "apps/ui/tests/**", "apps/ui/e2e/**"
       ]
     },
