@@ -6,6 +6,7 @@ import type { BriefTarget } from "./BriefTarget.ts";
 import type { Dispatch } from "./Dispatch.ts";
 import type { DispatchId } from "./DispatchId.ts";
 import type { DispatchOutcome } from "./DispatchOutcome.ts";
+import type { ExternalRef } from "./ExternalRef.ts";
 import type { Health } from "./Health.ts";
 import type { LinkBasis } from "./LinkBasis.ts";
 import type { Liveness } from "./Liveness.ts";
@@ -17,6 +18,7 @@ import type { Mover } from "./Mover.ts";
 import type { Persona } from "./Persona.ts";
 import type { Project } from "./Project.ts";
 import type { Receipt } from "./Receipt.ts";
+import type { SafetySettings } from "./SafetySettings.ts";
 import type { Session } from "./Session.ts";
 import type { SessionId } from "./SessionId.ts";
 import type { SessionState } from "./SessionState.ts";
@@ -29,11 +31,17 @@ import type { Team } from "./Team.ts";
 import type { Workstream } from "./Workstream.ts";
 import type { WorkstreamId } from "./WorkstreamId.ts";
 import type { WorkstreamStatus } from "./WorkstreamStatus.ts";
+import type { WriteProposal } from "./WriteProposal.ts";
+import type { WriteResult } from "./WriteResult.ts";
 
 /**
  * What happened. On the wire: `{"type": "task_moved", "data": {…}}`.
  */
-export type EventBody = { "type": "cursor_moved", "data": { 
+export type EventBody = { "type": "safety_changed", "data": { 
+/**
+ * Validated preferences.
+ */
+settings: SafetySettings, } } | { "type": "cursor_moved", "data": { 
 /**
  * `workspace`, `project:<id>` or `workstream:<id>`.
  */
@@ -189,7 +197,15 @@ status: WorkstreamStatus,
 /**
  * New health.
  */
-health: Health, } } | { "type": "task_created", "data": { 
+health: Health, } } | { "type": "workstream_linked", "data": { 
+/**
+ * The workstream.
+ */
+workstream: WorkstreamId, 
+/**
+ * The full new list.
+ */
+external: Array<ExternalRef>, } } | { "type": "task_created", "data": { 
 /**
  * The task.
  */
@@ -329,4 +345,44 @@ why?: string,
 /**
  * Evidence.
  */
-receipts: Array<Receipt>, } };
+receipts: Array<Receipt>, } } | { "type": "write_proposed", "data": { 
+/**
+ * Exactly what will be sent. Boxed: it is the largest body by far.
+ */
+write: WriteProposal, } } | { "type": "write_started", "data": { 
+/**
+ * The write's approval ask.
+ */
+ask: AskId, 
+/**
+ * Its task.
+ */
+task?: TaskId, 
+/**
+ * Which attempt, from 1.
+ */
+attempt: number, } } | { "type": "write_retry_requested", "data": { 
+/**
+ * The write's approval ask.
+ */
+ask: AskId, 
+/**
+ * Its task.
+ */
+task?: TaskId, 
+/**
+ * The person who asked.
+ */
+by: MemberId, } } | { "type": "write_finished", "data": { 
+/**
+ * The write's approval ask.
+ */
+ask: AskId, 
+/**
+ * Its task.
+ */
+task?: TaskId, 
+/**
+ * What came of it.
+ */
+result: WriteResult, } };

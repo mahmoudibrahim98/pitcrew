@@ -6,7 +6,7 @@ use crate::bounds::{
     strip_hidden,
 };
 use crate::links::linked_issues;
-use crate::state::{CloseReason, IssueSnapshot, MilestoneSnapshot, PullSnapshot};
+use crate::state::{CloseReason, IssueSnapshot, MilestoneSnapshot, PullSnapshot, SyncState};
 use crate::time::GithubTimestamp;
 use crate::wire::{WireIssue, WireMilestone, WirePullRequest};
 use pitcrew_protocol::model::{ExternalRef, ExternalSystem};
@@ -70,7 +70,7 @@ pub(crate) fn expected_web_origin(api_base: Option<&str>) -> WebOrigin {
 /// port on the right host, entirely — O30 closes the port gap; this pins both to the one web
 /// origin this sync is actually about, the same reasoning `origin::trusted_next_url` uses for the
 /// API host).
-fn trusted_html_url(raw: &str, web_origin: &WebOrigin) -> Option<url::Url> {
+pub(crate) fn trusted_html_url(raw: &str, web_origin: &WebOrigin) -> Option<url::Url> {
     if raw.len() > MAX_KEPT_URL_BYTES || contains_hidden(raw) {
         return None;
     }
@@ -292,6 +292,40 @@ impl UpstreamChange {
     }
 }
 
+impl SyncState {
+    /// The open issue `source` (`owner/repo#<n>`) as a first read would report it, built from its
+    /// last snapshot: an [`UpstreamChange::IssueOpened`] in `milestone`. For a caller that starts
+    /// mirroring an issue it did not mirror before, because a later read moved it into a milestone
+    /// the caller follows ([`UpstreamChange::IssueMilestoned`]): the move alone carries none of
+    /// the issue's fields. `None` when this state has no snapshot of the issue, or it is closed.
+    ///
+    /// Call it on the state a sync returned, so the snapshot is the one that read just took.
+    #[must_use]
+    pub fn opened_from_snapshot(
+        &self,
+        source: &ExternalRef,
+        milestone: Option<&ExternalRef>,
+    ) -> Option<UpstreamChange> {
+        let (repo, number) = source.key.rsplit_once('#')?;
+        let number: u64 = number.parse().ok()?;
+        let repo_state = self.repos.get(repo).or_else(|| {
+            self.repos
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(repo))
+                .map(|(_, state)| state)
+        })?;
+        let snapshot = repo_state.issue_snapshots.get(&number)?;
+        snapshot.open.then(|| UpstreamChange::IssueOpened {
+            source: source.clone(),
+            at: snapshot.updated_at.clone(),
+            title: snapshot.title.clone(),
+            body: snapshot.body.clone(),
+            labels: snapshot.labels.clone(),
+            milestone: milestone.cloned(),
+        })
+    }
+}
+
 /// Builds the issue snapshot for a freshly read (and bounds-capped) issue.
 fn snapshot_of(issue: &WireIssue) -> IssueSnapshot {
     let mut labels: Vec<String> = issue.labels.iter().map(|l| l.name.clone()).collect();
@@ -306,9 +340,14 @@ fn snapshot_of(issue: &WireIssue) -> IssueSnapshot {
         .map(|a| strip_hidden(&a.login))
         .collect();
     assignees.sort();
+    let title = cap_chars(&issue.title, MAX_TITLE_CHARS);
+    let raw_body = issue.body.as_deref().unwrap_or("");
+    let body = cap_chars(raw_body, MAX_BODY_CHARS);
     IssueSnapshot {
-        title: cap_chars(&issue.title, MAX_TITLE_CHARS),
-        body: cap_chars(issue.body.as_deref().unwrap_or(""), MAX_BODY_CHARS),
+        title_lossless: title == issue.title,
+        body_lossless: body == raw_body,
+        title,
+        body,
         open: issue.state != "closed",
         close_reason: (issue.state == "closed").then_some(CloseReason::from_state_reason(
             issue.state_reason.as_deref(),
@@ -615,6 +654,118 @@ mod malformed_timestamp_tests {
             host: "github.com".to_string(),
             port: 443,
         }
+    }
+
+    #[test]
+    fn a_snapshot_says_whether_its_title_and_body_are_exactly_what_github_sent() {
+        let snap = |title: &str, body: Option<&str>| {
+            let mut wire = issue("2026-01-01T00:00:00Z");
+            wire.title = title.to_string();
+            wire.body = body.map(str::to_string);
+            let mut malformed = 0u32;
+            diff_issue(
+                "example-org/demo-repo",
+                &wire,
+                None,
+                &github_com(),
+                &mut malformed,
+            )
+            .unwrap()
+            .1
+        };
+        let plain = snap("Fix the login test", Some("Line one.\n\n- a list item\n"));
+        assert!(plain.title_lossless() && plain.body_lossless());
+        assert!(
+            snap("No body", None).body_lossless(),
+            "an absent body is an empty one"
+        );
+        // A zero-width joiner (an emoji sequence) is stripped from the copy: not exact.
+        let joined = snap(
+            "Ship it \u{1F469}\u{200D}\u{1F4BB}",
+            Some("Ok \u{200D} then"),
+        );
+        assert!(!joined.title_lossless() && !joined.body_lossless());
+        assert_eq!(joined.body(), "Ok  then");
+        // A body over the cap is cut: not exact.
+        let long = "x".repeat(MAX_BODY_CHARS + 1);
+        assert!(!snap("t", Some(&long)).body_lossless());
+        // A state saved before the flags were kept reads as not exact.
+        let old: IssueSnapshot = serde_json::from_value(serde_json::json!({
+            "title": "t", "body": "b", "open": true, "close_reason": null, "labels": [],
+            "assignees": [], "milestone_number": null, "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(!old.title_lossless() && !old.body_lossless());
+    }
+
+    #[test]
+    fn an_issue_milestoned_later_is_opened_from_its_snapshot() {
+        let mut malformed_fields = 0u32;
+        let mut wire = issue("2026-01-01T00:00:00Z");
+        wire.number = 4;
+        wire.body = Some("Body".to_string());
+        wire.labels = vec![crate::wire::WireLabel {
+            name: "docs".to_string(),
+        }];
+        let (_, snapshot) = diff_issue(
+            "example-org/demo-repo",
+            &wire,
+            None,
+            &github_com(),
+            &mut malformed_fields,
+        )
+        .unwrap();
+        let mut state = SyncState::new();
+        state
+            .repos
+            .entry("example-org/demo-repo".to_string())
+            .or_default()
+            .issue_snapshots
+            .insert(4, snapshot.clone());
+        let source = ExternalRef {
+            system: ExternalSystem::Github,
+            key: "Example-Org/Demo-Repo#4".to_string(),
+            url: Some("https://github.com/example-org/demo-repo/issues/4".to_string()),
+        };
+        let milestone = ExternalRef {
+            system: ExternalSystem::Github,
+            key: "example-org/demo-repo#milestone:1".to_string(),
+            url: None,
+        };
+        assert_eq!(
+            state.opened_from_snapshot(&source, Some(&milestone)),
+            Some(UpstreamChange::IssueOpened {
+                source: source.clone(),
+                at: GithubTimestamp::new("2026-01-01T00:00:00Z"),
+                title: "Title".to_string(),
+                body: "Body".to_string(),
+                labels: vec!["docs".to_string()],
+                milestone: Some(milestone.clone()),
+            })
+        );
+        // Unknown issues, and closed ones, give nothing.
+        let other = ExternalRef {
+            key: "example-org/demo-repo#5".to_string(),
+            ..source.clone()
+        };
+        assert_eq!(state.opened_from_snapshot(&other, None), None);
+        let bad = ExternalRef {
+            key: "example-org/demo-repo".to_string(),
+            ..source.clone()
+        };
+        assert_eq!(state.opened_from_snapshot(&bad, None), None);
+        let closed = IssueSnapshot {
+            open: false,
+            close_reason: Some(CloseReason::Completed),
+            ..snapshot
+        };
+        state
+            .repos
+            .get_mut("example-org/demo-repo")
+            .unwrap()
+            .issue_snapshots
+            .insert(4, closed);
+        assert_eq!(state.opened_from_snapshot(&source, Some(&milestone)), None);
     }
 
     #[test]

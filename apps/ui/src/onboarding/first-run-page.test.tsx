@@ -1,11 +1,11 @@
 // @vitest-environment happy-dom
 // @vitest-environment-options {"url": "http://localhost:5173/"}
 // The first-run route itself, in the desktop app over a fake gateway: a remote hub reaching it
-// through the redirect starts from the gateway's name for its machine; Done replaces the wizard
-// with Home; and a workspace already set up goes Home at once (unless the development flag asks
+// through the redirect starts from the gateway's name for its machine, and checks and signs in on
+// that machine through its hub; Done replaces the wizard with Home; and a workspace already set up goes Home at once (unless the development flag asks
 // for the fake wizard).
 
-import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { createMemoryHistory, RouterProvider } from '@tanstack/react-router';
 import { StrictMode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -55,13 +55,23 @@ const heading = (name: string | RegExp) => screen.findByRole('heading', { level:
 
 describe('the first-run route', () => {
   it("starts a remote hub's machine name from the gateway's name, and replaces itself with Home", async () => {
+    const own = '01JB000000000000000MAC0001';
     desktop.daemons.set(WS, (req) => {
+      // Machine setup on the remote hub's own machine (the remote one), through the gateway.
+      if (req.method === 'GET' && req.path === `/v1/machines/${own}/check`) {
+        return { status: 200, body: JSON.stringify({ rows: [{ id: 'git', status: 'ok', detail: 'git version 2.43.0' }] }) };
+      }
+      if (req.method === 'GET' && req.path === `/v1/machines/${own}/agents`) {
+        return { status: 200, body: JSON.stringify([{ engine: 'codex', installed: true, signed_in: true, account: 'ChatGPT' }]) };
+      }
       if (req.method === 'POST' && req.path === '/v1/import/dry-run') {
         return { status: 200, body: '{"count":0}' };
       }
       if (req.method === 'PUT' && req.path === '/v1/import') {
         return { status: 200, body: '{"imported":0}' };
       }
+      if (req.path.endsWith('/hooks/diff')) return {status: 200, body: JSON.stringify({revision: 'test-preview', files: [], engines: []})};
+      if (req.path === '/v1/safety') return {status: 200, body: JSON.stringify({permission_mode: 'default', back_office_enabled: false, back_office_caps: {max_auto_accept_per_hour: 20}})};
       return fresh.daemon(req);
     });
     const router = renderApp('/');
@@ -75,9 +85,22 @@ describe('the first-run route', () => {
     fireEvent.change(screen.getByLabelText('Your name'), { target: { value: 'Sam Rivera' } });
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
 
+    // Its machine check and sign-in are the remote machine's, through its hub.
+    await heading('Checking the machine');
+    await screen.findByText('git version 2.43.0', undefined, PATIENCE);
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    await heading('Sign in to your agents');
+    await screen.findByText('ChatGPT', undefined, PATIENCE);
+    expect(screen.getByText(/in a terminal on hpc-login/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Skip for now' }));
+
     await heading('Import sessions');
     await screen.findByText('This will import 0 sessions.');
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    expect(screen.queryByRole('button', {name: 'Skip hooks'})).toBeNull();
+    await screen.findByLabelText('Let the back office accept low-risk actions automatically');
+    await waitFor(() => expect((screen.getByRole('button', {name: 'Continue'}) as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByRole('button', {name: 'Continue'}));
     await heading("You're set up");
     const requests = desktop.commands('gateway_request').map((args) => args.req as { workspace: string; method: string; path: string; body?: string });
     const previews = requests.filter((req) => req.path === '/v1/import/dry-run');
@@ -87,7 +110,7 @@ describe('the first-run route', () => {
     }
     expect(requests.filter((req) => req.path === '/v1/import').map((req) =>
       [req.workspace, req.method, JSON.parse(req.body ?? '{}')])).toEqual([[WS, 'PUT', { mode: 'all' }]]);
-    expect(requests.some((req) => req.path.endsWith('/scan') || req.method === 'POST' && req.path === '/v1/projects')).toBe(false);
+    expect(requests.some((req) => req.path.endsWith('/hooks/diff') || req.path.endsWith('/hooks/install') || req.path.endsWith('/scan') || req.method === 'POST' && req.path === '/v1/projects')).toBe(false);
     expect(fresh.setups).toEqual([
       { workspace_name: 'Cluster Lab', person: { name: 'Sam Rivera', handle: '@sam' }, machine_name: 'hpc-login' },
     ]);

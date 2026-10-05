@@ -168,6 +168,66 @@ fn requests_come_back_whatever_their_status() {
 }
 
 #[test]
+fn an_integration_credential_goes_only_through_its_own_command() {
+    let w = world();
+    let secret = pitcrew_remote::Secret::new("synthetic-gateway-secret");
+    let stored =
+        w.rt.block_on(w.gateway.store_credential(WORKSPACE_ID, "01J9ZQ3", &secret))
+            .unwrap();
+    assert_eq!((stored.status, stored.body.as_str()), (204, ""));
+    let seen = w.daemon.seen.lock().unwrap().credentials.clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, "01J9ZQ3");
+    let body: serde_json::Value = serde_json::from_str(&seen[0].1).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({ "secret": "synthetic-gateway-secret" })
+    );
+    assert!(
+        w.daemon
+            .seen
+            .lock()
+            .unwrap()
+            .authorizations
+            .contains(&format!("Bearer {TOKEN}"))
+    );
+
+    // A refusal comes back as the daemon's answer, without the secret.
+    let refused =
+        w.rt.block_on(w.gateway.store_credential(WORKSPACE_ID, "gh", &secret))
+            .unwrap();
+    assert_eq!(refused.status, 409);
+    assert!(!refused.body.contains("synthetic-gateway-secret"));
+
+    // A malformed id is refused before anything is sent.
+    for bad in ["", "../x", "a/b", "id?x=1", "a b"] {
+        let err =
+            w.rt.block_on(w.gateway.store_credential(WORKSPACE_ID, bad, &secret))
+                .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Invalid, "{bad:?}");
+    }
+
+    // `gateway_request` never carries one, however the path is written.
+    for path in [
+        "/v1/integrations/01J9ZQ3/credential",
+        "/v1/integrations/01J9ZQ3/%63redential",
+        "/v1/Integrations/01J9ZQ3/CREDENTIAL",
+    ] {
+        let err = w
+            .request(
+                WORKSPACE_ID,
+                "PUT",
+                path,
+                Some(r#"{"secret":"synthetic-gateway-secret"}"#.into()),
+            )
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Invalid, "{path}");
+        assert!(!err.message.contains("synthetic-gateway-secret"));
+    }
+    assert_eq!(w.daemon.seen.lock().unwrap().credentials.len(), 1);
+}
+
+#[test]
 fn the_size_limits() {
     let w = world();
     // A request body of 1 MiB goes; one byte more does not.

@@ -14,6 +14,8 @@ import type {
   TaskStatus,
   TimestampMs,
   WorkstreamStatus,
+  WriteOperation,
+  WriteState,
 } from '../data/index.ts';
 
 type Labelled = { label: string; tone: Tone };
@@ -177,6 +179,8 @@ export const plainNames: Names = {
 export function describeEvent(event: Event, names: Names): string {
   const { body } = event;
   switch (body.type) {
+    case 'safety_changed':
+      return 'updated workspace safety settings';
     case 'cursor_moved':
       return 'marked changes as read';
     case 'machine_added':
@@ -223,6 +227,10 @@ export function describeEvent(event: Event, names: Names): string {
       return `created the workstream ${body.data.workstream.name}`;
     case 'workstream_changed':
       return `marked ${names.workstream(body.data.workstream)} ${WORKSTREAM_STATUS[body.data.status].label.toLowerCase()}, ${HEALTH[body.data.health].label.toLowerCase()}`;
+    case 'workstream_linked':
+      return body.data.external.length === 0
+        ? `unlinked ${names.workstream(body.data.workstream)} from upstream`
+        : `linked ${names.workstream(body.data.workstream)} to ${body.data.external.map((l) => l.key).join(', ')}`;
     case 'task_created':
       return `created ${body.data.task.key} “${body.data.task.title}”`;
     case 'task_moved':
@@ -253,8 +261,48 @@ export function describeEvent(event: Event, names: Names): string {
       return `${body.data.pinned ? 'pinned' : 'updated'} where ${targetName(body.data.target, names)} stands`;
     case 'decision_recorded':
       return `recorded a decision: ${body.data.text}`;
+    case 'write_proposed': {
+      const w = body.data.write;
+      return `asked to ${WRITE_OPERATION[w.operation]} ${w.target?.key ?? w.scope} on ${tracker(w.system)}`;
+    }
+    case 'write_started':
+      return `sent a write${body.data.task === undefined ? '' : ` for ${names.task(body.data.task)}`} upstream${body.data.attempt > 1 ? ` (attempt ${body.data.attempt})` : ''}`;
+    case 'write_retry_requested':
+      return `asked to send a failed write${body.data.task === undefined ? '' : ` for ${names.task(body.data.task)}`} again`;
+    case 'write_finished': {
+      const r = body.data.result;
+      const about = body.data.task === undefined ? '' : ` for ${names.task(body.data.task)}`;
+      if (r.outcome === 'sent') return `wrote upstream${about}${r.created === undefined ? '' : `: created ${r.created.key}`}`;
+      if (r.outcome === 'failed') return `could not write upstream${about}: ${r.message}`;
+      return `did not write upstream${about}: ${r.reason}`;
+    }
   }
 }
+
+/** The tracker's name for people. */
+export function tracker(system: string): string {
+  return system === 'jira' ? 'Jira' : 'GitHub';
+}
+
+/** What an outward write does, as a verb phrase ("close", "create an issue in"). */
+export const WRITE_OPERATION: Record<WriteOperation, string> = {
+  create_issue: 'create an issue in',
+  comment: 'comment on',
+  update: 'change',
+  close: 'close',
+  reopen: 'reopen',
+};
+
+/** Where an outward write stands, for people, with a pill tone. */
+export const WRITE_STATE: Record<WriteState, Labelled> = {
+  pending: { label: 'Waiting for approval', tone: 'accent' },
+  approved: { label: 'Approved', tone: 'progress' },
+  denied: { label: 'Not approved', tone: 'neutral' },
+  sending: { label: 'Sending', tone: 'progress' },
+  sent: { label: 'Sent', tone: 'ok' },
+  failed: { label: 'Failed', tone: 'risk' },
+  not_sent: { label: 'Not sent', tone: 'neutral' },
+};
 
 function targetName(target: { kind: 'project' | 'workstream'; id: string }, names: Names): string {
   return target.kind === 'project' ? names.project(target.id) : names.workstream(target.id);

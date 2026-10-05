@@ -121,3 +121,12 @@ cargo test -p pitcrew-cli --release --test hook_timing -- --ignored --nocapture
 
 Files API error compatibility: too_large (413) maps to invalid / exit 2; unsupported (501)
 maps to unavailable / exit 5, including a response without an API error body.
+
+The public `install::Installation` library retains the same installer plans for daemon onboarding: `preview` reads supported CLI configurations without writing, `files` returns exact text, and `apply` preflights stale files, preserves backups, and skips already applied files on retry. Plans are opaque and omit configuration contents from Debug output.
+
+Onboarding review: hook previews detect supported CLIs on PATH or through their
+homes, skip conflicting engines while applying other changes, and report the
+skipped engines. No-change previews cannot set the wizard's installed flag.
+Desktop packages include the hook CLI beside the daemon. Safety uses snake_case
+wire fields and the shared PermissionMode enum; bypass defaults are currently
+refused. Unsaved safety reports `saved: false` for legacy per-task acceptance.

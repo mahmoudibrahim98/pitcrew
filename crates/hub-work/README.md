@@ -407,7 +407,7 @@ whatever it sent.
 | `raise_ask` | anyone; an agent only about its own task and session | 400 unknown task or session; 403; 400 empty title, unknown addressee |
 | `answer_ask` | the addressee, or a person for their agents; decisions, approvals and reviews only by people | 404; 403; 400 no option and no non-blank text, option out of range; 409 already answered |
 | `put_brief` | person | 404 unknown target. With the pending proposal's text and next, `brief_accepted` carries its receipts (and the brief is the back office's) |
-| `patch_workstream` | person | 404; 400 empty patch |
+| `patch_workstream` | person | 404; 400 empty patch, or links that break `links::check_links` (over 16, repeated, a key with control or hidden characters, a URL that is not `https://` or has a user name). `external` appends `workstream_linked` with the full new list (after `workstream_changed` when status or health changed too) |
 | `dispatch_task` | person | see "Dispatch" |
 | `dispatch_working` | the runner link (through `follow_sessions`) | moves the dispatched task to in progress as the agent, when the rules allow; 409 for an ended dispatch, or a racing writer that moved the task first |
 | `follow_sessions` | the runner link | see "Dispatch": a dispatched session's first `working` moves its task, its end finishes its dispatch |
@@ -417,6 +417,8 @@ whatever it sent.
 | `seed` | the daemon | imports a `DemoWorkspace` into an empty work model |
 | `ensure_office_member(owner)` | the daemon | finds or adds the back office's member (see "The back office"); 400 `owner` is not a person; 409 `@office` held by a person, another person's agent or no one's agent |
 | `run_office`, `OfficeCommands` | the back office | see "The back office" |
+| `ensure_sync_member(owner)` | the daemon, when a person connects a tracker (each connection keeps its own) | finds or adds the tracker sync's member: an agent of `owner` named `@sync` (`@tracker-sync` when `@sync` is someone else's); 400 `owner` is not a person; 409 both handles taken |
+| `SyncCommands` | a tracker sync (`sync_commands(member)`) | see "Tracker sync" and "Outward writes" |
 
 "Own task" means the agent is the assignee or holds an active (not ended) dispatch on it.
 
@@ -429,6 +431,54 @@ Lists in a body (up to 1 MiB) cost time linear in their length: the checks that 
 before the command lock, labels in one pass that stops at the 33rd distinct one, repeats dropped
 with a hash set; the checks against the tables take one query per list (`json_each`), and a
 `blocked_by` cycle is one recursive query over the tasks waiting on the edited one.
+
+## Tracker sync (`SyncCommands`)
+
+A GitHub or Jira sync (`pitcrewd`'s `integrations`, api-v1.md "Integrations") changes the work
+model only through `SyncCommands`, as its own member (`@sync`, an agent of the person who connected
+the tracker), each command re-checked under the command lock like any caller's:
+
+- `create_task(workstream, source, title, description, labels)`: status `todo`, the upstream item
+  as `source`, text made to fit (`fit_title`, `fit_labels`: hidden characters dropped, 1–500
+  characters, labels trimmed and cut to 64 characters, at most 32). A source already mirrored
+  returns that task and appends nothing.
+- `update_task(task, title?, description?, labels?, workstream?)`: upstream-owned fields and the
+  workstream (of the task's project); `task_updated` with what differs, or nothing.
+- `move_task(task, to)`: `can_move(.., Mover::Sync)` from the status the task is in now: in-progress
+  work is never touched (`Refused`), and a move to where the task already is appends nothing.
+- `set_workstream_status(workstream, shipped)`: refused while one of its tasks is in progress.
+- `note(task, text)` (a merged pull request) and `raise_conflict(task?, title, body)` (a `decision`
+  ask to the owner): never posted or raised twice while the same one stands.
+- `task_by_source`, `workstreams`, `work_in_progress`: what routing and planning read.
+
+`links::scope_of(link)` says what a workstream link names (a repository or milestone, a Jira
+project or epic); the sync routes issues by it. Nothing here knows GitHub or Jira: the daemon reads
+them and plans with `pitcrew-sync-github` and `pitcrew-sync-jira`.
+
+## Outward writes (`writes.rs`, `work.writes`)
+
+A write to GitHub or Jira (api-v1.md, "Outward writes") is approved by a person first; these
+commands are the gate the daemon sends through:
+
+- `propose_write(to, write, title, body)`: an `approval` ask from the sync's member (each
+  integration's own) to `to` (a person), with the task, `["Send", "Don't send"]` and the cause as
+  a receipt, and `write_proposed`, in one append; `None` when a write was already proposed for that
+  cause.
+- `WorkService::request_retry(caller, ask)`: `write_retry_requested { ask, task, by }`, authored
+  by a person who may answer the write's ask, for a `failed` write; a second request while one
+  waits appends nothing.
+- `start_write(ask)`: `write_started`, only for a write whose ask is this member's own approval ask
+  answered "Send" by a person, or a failed one with a person's retry request no attempt has used
+  yet (the start uses it). Anything else is `Refused`.
+- `finish_write(ask, result)`: `write_finished`; `sent` and `failed` only after a start, `not_sent`
+  only before one (or after a failure).
+- `writes(filter)`, `write(ask)`, `check_retry(caller, ask)` (who may answer its ask; `failed`
+  only) are what the routes read; `UpstreamWrite.retry_requested_by` says whose retry waits.
+
+The `work.writes` projection (migrations `0401_work_writes.sql` and `0402_work_write_retries.sql`)
+applies the same transitions from the log, so a rebuild gives the same rows. A `write_finished` that created an issue gives its task
+that issue as `source` (`work.tasks` v4), and write events are their task's activity (`work.refs`
+v3).
 
 ## The back office
 
@@ -675,3 +725,12 @@ or inconsistent task/workstream references are 400. A task-only link derives its
 workstream-only link clears the task. Each emits `session_linked` with basis `manual`. Imported
 links are firm, matching the runner; the sessions projection version is bumped so replay applies
 that rule. `tests/manual_links.rs` covers route validation and protection against later inference.
+
+Workspace safety preferences are projected from person-authored `safety_changed` events (`work.safety`), with validated permission modes and a 0–100 hourly automatic-acceptance budget. An explicit save controls low-risk task completion and brief acceptance; disabled or exhausted budgets leave proposals for review. Existing hubs retain their per-task policy until the first explicit save. Rebuilding preferences retains the hourly budget because acceptances remain in the event log.
+
+Onboarding review: hook previews detect supported CLIs on PATH or through their
+homes, skip conflicting engines while applying other changes, and report the
+skipped engines. No-change previews cannot set the wizard's installed flag.
+Desktop packages include the hook CLI beside the daemon. Safety uses snake_case
+wire fields and the shared PermissionMode enum; bypass defaults are currently
+refused. Unsaved safety reports `saved: false` for legacy per-task acceptance.

@@ -1,3 +1,4 @@
+import { Onboarding } from './onboarding.ts';
 // In-memory state: the demo workspace, the event log and the session transcripts.
 //
 // The event log is the fixture's 15 events (revisions 1–15) followed by everything the mock
@@ -71,9 +72,11 @@ export interface Delays {
   end: number;
   /** A machine scan, from its first progress frame to its report (`scan.ts`). */
   scan: number;
+  /** A sign-in terminal, from its start to its login ending by itself (`machine-setup.ts`). */
+  signIn: number;
 }
 
-export const DEFAULT_DELAYS: Delays = { start: 1500, reply: 800, end: 300, scan: 1000 };
+export const DEFAULT_DELAYS: Delays = { start: 1500, reply: 800, end: 300, scan: 1000, signIn: 2000 };
 
 /** How many revisions one filtered `GET /v1/events` request examines at most. */
 export const DEFAULT_SCAN_WINDOW = 500;
@@ -160,6 +163,7 @@ function bareId(ref: string, prefix: string): string {
 }
 
 export class Hub {
+  onboarding = new Onboarding();
   importChoice: import("./import.ts").ImportChoice = { filter: { mode: "all", engines: [], folders: [] }, committed_at: null };
   readonly cursors = new Map<MemberId, Map<string, number>>();
   readonly workspace: Workspace;

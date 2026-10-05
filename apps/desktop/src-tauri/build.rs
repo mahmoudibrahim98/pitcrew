@@ -7,6 +7,7 @@ fn main() {
         "gateway_workspaces",
         "gateway_local_host",
         "gateway_request",
+        "gateway_integration_credential",
         "gateway_socket_open",
         "gateway_socket_send",
         "gateway_socket_close",

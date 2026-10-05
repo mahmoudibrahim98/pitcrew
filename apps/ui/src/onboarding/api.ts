@@ -1,8 +1,10 @@
 // The onboarding wizards' backend contract. Setup (`POST /v1/setup`), the host list
-// (`gateway_ssh_hosts`), the scan (`POST /v1/machines/{id}/scan`) and creating from it
-// (`POST /v1/projects`, `POST /v1/workstreams`) are real (`hub-api.ts`); the other routes do not
-// exist on the hub yet (see README.md for the proposed shapes), and `createFakeOnboardingApi` in
-// `fake-api.ts` is their only implementation. Every step is built against the `OnboardingApi`
+// (`gateway_ssh_hosts`), the machine check, the agents' accounts and sign-in (api-v1.md, "Machine
+// setup"), installing the helper on a remote machine (the gateway's plan and add), the scan
+// (`POST /v1/machines/{id}/scan`), creating from it (`POST /v1/projects`, `POST /v1/workstreams`)
+// and the import are real (`hub-api.ts`); the other routes do not exist on the hub yet (see
+// README.md for the proposed shapes), and `createFakeOnboardingApi` in `fake-api.ts` is their only
+// implementation. Every step is built against the `OnboardingApi`
 // interface below, so a real call replaces a fake one without touching a step component.
 //
 // Reuses wire types from `../data` (`Engine`, `Machine`, `Project`, `Workstream`, …) rather than
@@ -42,9 +44,26 @@ export interface DiscoveredHost {
   detail?: string;
 }
 
-export type CheckRowId = 'cli-claude' | 'cli-codex' | 'cli-opencode' | 'tmux' | 'git' | 'gh' | 'disk' | 'slurm';
+export type CheckRowId =
+  | 'cli-claude'
+  | 'cli-codex'
+  | 'cli-opencode'
+  | 'tmux'
+  | 'git'
+  | 'gh'
+  | 'disk'
+  | 'slurm'
+  /** PitCrew's helper, in a check made over SSH before it is installed. */
+  | 'helper';
 
 export type CheckRowStatus = 'ok' | 'warn' | 'missing' | 'checking';
+
+/**
+ * What "Fix" does. Never installing a system package: `install-page` opens the tool's install page
+ * (from `install-pages.ts`, this app's own table: no URL comes from the machine), and
+ * `install-helper` is installing PitCrew's own helper, the connect wizard's next steps.
+ */
+export type CheckFix = 'install-page' | 'install-helper';
 
 export interface MachineCheckRow {
   id: CheckRowId;
@@ -54,11 +73,19 @@ export interface MachineCheckRow {
   detail?: string;
   /** Whether "Fix" can do something about it (install a CLI, free disk space is not). */
   fixable: boolean;
+  /** What "Fix" does, when `fixable`. */
+  fix?: CheckFix | undefined;
 }
 
 export interface MachineCheckResult {
   machine: MachineTarget;
   rows: MachineCheckRow[];
+  /**
+   * Set, with no rows, when this machine is not checked here but later, as it is connected (an
+   * SSH host, a WSL distro or an HPC login node, which the connect wizard checks over SSH): what to
+   * tell the person instead of rows. Not an error.
+   */
+  deferred?: string | undefined;
 }
 
 export type Launcher = 'direct' | 'tmux' | 'systemd-user' | 'slurm';
@@ -74,6 +101,12 @@ export interface LauncherOption {
 export interface InstallHelperOptions {
   machine: MachineTarget;
   launcher: Launcher;
+  /**
+   * The plan the person reviewed (the gateway's `remotePlan`): the real install carries out
+   * exactly that plan, and refuses to start without one, so nothing is installed or submitted
+   * unseen. The fake ignores it.
+   */
+  plan?: string | undefined;
 }
 
 /** One line of a live install log, or the terminal event that ends the stream. */
@@ -103,16 +136,27 @@ export interface Streamed {
   cancel(): void;
 }
 
+/** One agent CLI's account, as the CLI's own status command reports it (never from its files). */
 export interface AgentAccount {
   engine: Engine;
-  /** The signed-in account's label (email or handle), absent when not signed in. */
-  account?: string;
-  signedIn: boolean;
+  /** Whether the CLI is on the machine. */
+  installed: boolean;
+  /** What the CLI says; `undefined` when it could not tell (`detail` says why). */
+  signedIn: boolean | undefined;
+  /** The signed-in account's label (an e-mail address, `ChatGPT`, `API key`), when it says. */
+  account?: string | undefined;
+  /** Why `signedIn` is unknown, or why the CLI is not there. */
+  detail?: string | undefined;
 }
 
+/** How a CLI's login proves who the person is: `device-code` is Codex's, for remote machines. */
+export type SignInMethod = 'browser' | 'device-code';
+
 export interface StartSignInResult {
-  /** Opens in the console's terminal view (a placeholder link until the console exists). */
+  /** The sign-in terminal, which the console's terminal view shows (`/v1/sessions/{id}/terminal`). */
   terminalSessionId: string;
+  /** The command it runs, for people (`claude auth login`). */
+  command: string[];
 }
 
 export type IntegrationId = 'github' | 'jira' | 'linear' | 'gitlab';
@@ -201,6 +245,8 @@ export interface HooksDiffFile {
 }
 
 export interface HooksDiff {
+  revision: string;
+  engines: { engine: string; status: string; detail: string }[];
   files: HooksDiffFile[];
 }
 
@@ -252,7 +298,7 @@ export class SetupRefused extends Error {
 }
 
 /** Every call; `unavailable` lists those with no backend yet. */
-export type OnboardingCall = Exclude<keyof OnboardingApi, 'unavailable'>;
+export type OnboardingCall = Exclude<keyof OnboardingApi, 'unavailable' | 'needsHelper'>;
 
 /**
  * The onboarding wizards' backend contract (see README.md). Every method is called from a step
@@ -283,7 +329,21 @@ export interface OnboardingApi {
 
   agentAccounts(): Promise<AgentAccount[]>;
   /** Opens the CLI's own login in a terminal on the target machine (never reads its tokens). */
-  startSignIn(engine: Engine, machine: MachineTarget): Promise<StartSignInResult>;
+  startSignIn(engine: Engine, machine: MachineTarget, method?: SignInMethod): Promise<StartSignInResult>;
+  /** Whether that CLI's login still runs: once it has ended, `agentAccounts` asks the CLI again. */
+  signInRunning(engine: Engine, machine: MachineTarget): Promise<boolean>;
+  /**
+   * Stops that CLI's sign-in and removes its terminal, running or ended (the person left it or
+   * skipped it): no login, and no Codex callback listener, is left running. Resolves when there is
+   * none.
+   */
+  stopSignIn(engine: Engine, machine: MachineTarget): Promise<void>;
+
+  /**
+   * Whether PitCrew's helper must be installed on `target` before it can be used. Not on the hub's
+   * own machine (`local`), which runs the hub itself; `stepsFor` leaves the install step out then.
+   */
+  needsHelper(target: MachineTarget): boolean;
 
   integrationStatus(): Promise<IntegrationStatus[]>;
 
@@ -297,7 +357,8 @@ export interface OnboardingApi {
   commitImport(filter: ImportFilter): Promise<ImportResult>;
 
   hooksDiff(): Promise<HooksDiff>;
-  installHooks(): Promise<void>;
+  installHooks(preview: HooksDiff): Promise<void>;
+  readSafety(): Promise<SafetySettings>;
 
   saveSafety(settings: SafetySettings): Promise<void>;
 }

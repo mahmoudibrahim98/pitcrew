@@ -746,6 +746,19 @@ impl Ws {
         self.stream.write_all(&[0x8a, 0x80, 0, 0, 0, 0])
     }
 
+    /// Sends `bytes` as one binary frame (masked, as a client's frames are; at most 125 bytes):
+    /// keystrokes, on a terminal.
+    pub fn send_binary(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let len = u8::try_from(bytes.len())
+            .ok()
+            .filter(|len| *len < 126)
+            .expect("a short frame");
+        // A zero mask leaves the payload as it is.
+        let mut frame = vec![0x82, 0x80 | len, 0, 0, 0, 0];
+        frame.extend_from_slice(bytes);
+        self.stream.write_all(&frame)
+    }
+
     /// The next text frame as JSON, skipping pings.
     pub fn next_json(&mut self, within: Duration) -> Value {
         loop {

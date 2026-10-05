@@ -410,6 +410,12 @@ and read the same secrets. To sign for real, the maintainer provides:
 
 Each kind stays off until all of its secrets are set and its step is implemented.
 
+The desktop sidecars include `pitcrew` alongside `pitcrewd`, `pitcrew-ptyd` and
+`pitcrew-askpass` on Linux, macOS and Windows. Hook installation requires this CLI
+even when an app starts without the developer's PATH. Staging and extracted
+installer checks require the CLI and verify its version; NSIS moves a running CLI
+aside during upgrades with the other sidecars.
+
 ## Signed desktop updates
 
 The desktop uses [Tauri's updater](https://v2.tauri.app/plugin/updater/). Checks run at startup

@@ -669,6 +669,7 @@ mod unix {
             lock_wait: Duration::from_secs(5),
             stale_lock: Duration::from_secs(5 * 60),
             progress: None,
+            step: None,
         }
     }
 
@@ -1136,6 +1137,37 @@ mod unix {
         assert!(seen.windows(2).all(|w| w[0].sent <= w[1].sent));
         assert!(seen.iter().all(|p| p.total == helper.len()));
         assert_eq!(seen.last().unwrap().sent, helper.len());
+    }
+
+    /// The steps a live log shows: checking, uploading, verifying, installed; and for the same
+    /// version again, checking and already installed, with nothing uploaded.
+    fn steps_are_reported() {
+        use pitcrew_remote::DeployStep;
+        let m = Machine::new();
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let options = DeployOptions {
+            step: Some(Arc::new({
+                let steps = steps.clone();
+                move |s: DeployStep| steps.lock().unwrap().push(s)
+            })),
+            ..quick()
+        };
+        let helper = big_helper("1.0.0", 64 * 1024);
+        block_on(deploy(&m.plain(), &helper, &options)).unwrap();
+        assert_eq!(
+            std::mem::take(&mut *steps.lock().unwrap()),
+            [
+                DeployStep::Checking,
+                DeployStep::Uploading,
+                DeployStep::Verifying,
+                DeployStep::Installed
+            ]
+        );
+        block_on(deploy(&m.plain(), &helper, &options)).unwrap();
+        assert_eq!(
+            *steps.lock().unwrap(),
+            [DeployStep::Checking, DeployStep::AlreadyInstalled]
+        );
     }
 
     fn a_hash_mismatch_removes_the_upload() {
@@ -1769,6 +1801,7 @@ mod unix {
             lock_wait: Duration::from_secs(1),
             stale_lock: Duration::from_secs(60),
             progress: None,
+            step: None,
         };
         let start = Instant::now();
         let err = block_on(deploy(&m.target(&fake), &helper, &options)).unwrap_err();
@@ -2862,6 +2895,7 @@ mod unix {
                 full_deploy_then_idempotent_rerun,
             ),
             ("progress_is_reported", progress_is_reported),
+            ("steps_are_reported", steps_are_reported),
             (
                 "a_hash_mismatch_removes_the_upload",
                 a_hash_mismatch_removes_the_upload,

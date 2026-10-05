@@ -138,6 +138,11 @@ pub struct ServeArgs {
     #[arg(long, value_name = "MS", hide = true)]
     pub scan_hold_ms: Option<u64>,
 
+    /// For tests only: GitHub and Jira integrations read the recorded exchanges in this folder's
+    /// `*.fixture` files instead of the network.
+    #[arg(long, value_name = "DIR", hide = true)]
+    pub integration_fixtures: Option<PathBuf>,
+
     /// For tests and development only: `pty` runs the terminals in pitcrew-ptyd even where tmux
     /// is usable; `auto` (the default) prefers tmux.
     #[arg(long, value_name = "RUNTIME", hide = true, value_enum, default_value_t = TerminalRuntimeArg::Auto)]

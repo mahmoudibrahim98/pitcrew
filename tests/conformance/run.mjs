@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readdir, readFile, rm, writeFile, symlink } from 'node:fs/promises';
+import { cp, mkdtemp, mkdir, readdir, readFile, rm, writeFile, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { delimiter, join, resolve } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
@@ -25,6 +25,8 @@ const env = {
   ...process.env,
   HOME: home,
   USERPROFILE: home,
+  CLAUDE_CONFIG_DIR: join(home, ".claude"),
+  CODEX_HOME: join(home, ".codex"),
   XDG_DATA_HOME: join(home, 'data'),
   XDG_CONFIG_HOME: join(home, 'config'),
   XDG_CACHE_HOME: join(home, 'cache'),
@@ -32,6 +34,7 @@ const env = {
   APPDATA: join(home, 'appdata'),
   LOCALAPPDATA: join(home, 'localappdata'),
   PITCREW_CONFORMANCE_EXPECTED: '',
+  PITCREW_CONFORMANCE_SYNTHETIC_HOOKS: '1',
 };
 let daemon, suite, mock, build;
 // Every process the daemon starts (pitcrew-ptyd, and the stand-in CLIs it runs) inherits this
@@ -108,8 +111,13 @@ try {
     console.log('# skipped: conformance link creation refused by the OS');
   }
   env.PITCREW_FILES_ROOT = filesRoot;
+  // Both targets read GitHub and Jira from this copy of the mock hub's recorded fixtures, again at
+  // each sync: integrations.test.mjs adds a file that sorts first to change what upstream says.
+  const fixtures = join(temporary, 'fixtures');
+  await cp(join(root, 'apps', 'mock-hub', 'fixtures'), fixtures, { recursive: true });
+  env.PITCREW_CONFORMANCE_FIXTURES = fixtures;
   if (target === 'mock') {
-    mock = await startServer({ port: 0 });
+    mock = await startServer({ port: 0, integrationFixtures: fixtures });
     env.PITCREW_CONFORMANCE_URL = mock.url;
     env.PITCREW_CONFORMANCE_PERSON = 'dev-device-token';
     env.PITCREW_CONFORMANCE_AGENT = 'dev-agent-token';
@@ -117,7 +125,7 @@ try {
   } else {
     build = spawn(
       'cargo',
-      ['build', '-p', 'pitcrew-daemon', '-p', 'pitcrew-ptyd', '--bins', '--locked'],
+      ['build', '-p', 'pitcrew-daemon', '-p', 'pitcrew-ptyd', '-p', 'pitcrew-cli', '--bins', '--locked'],
       { cwd: root, stdio: 'inherit' },
     );
     const [code] = await once(build, 'exit');
@@ -138,12 +146,27 @@ try {
     await writeFile(refused, 'Synthetic runtime refusal\n');
     // A dispatch starts its agent's CLI: stand-ins first on the daemon's PATH, never a real one.
     // Each writes nothing and waits until this run's folder is gone (the cleanup), so its
-    // session stays `starting` while the suite runs; pitcrew-ptyd then exits once idle.
+    // session stays `starting` while the suite runs; pitcrew-ptyd then exits once idle. They
+    // answer `--version` at once (a Claude Code new enough for onboarding.test.mjs's hooks), and
+    // for machine-setup.test.mjs their status commands too (not signed in); a sign-in's "login"
+    // waits like a session.
     const bin = join(temporary, 'bin');
     await mkdir(bin, { mode: 0o700 });
-    const standIn = `#!/bin/sh\nwhile [ -d '${state}' ]; do sleep 1; done\n`;
+    const standIn =
+      `#!/bin/sh\ncase "$1 $2" in\n` +
+      `  "--version ") echo 2.1.139; exit 0 ;;\n` +
+      `  "auth status"|"login status") echo "Not logged in" >&2; exit 1 ;;\n` +
+      `  "auth list") echo "0 credentials"; exit 0 ;;\n` +
+      `esac\nwhile [ -d '${state}' ]; do sleep 1; done\n`;
     for (const cli of ['claude', 'codex', 'opencode'])
       await writeFile(join(bin, cli), standIn, { mode: 0o700 });
+    // GitHub integrations read `gh auth token`: a stand-in that prints a synthetic credential,
+    // never the machine's own gh.
+    await writeFile(
+      join(bin, 'gh'),
+      "#!/bin/sh\n[ \"$1 $2\" = 'auth token' ] || exit 2\necho synthetic-conformance-gh-credential\n",
+      { mode: 0o700 },
+    );
     env.PATH = [bin, process.env.PATH].filter(Boolean).join(delimiter);
     const ptydEndpoint = join(temporary, 'ptyd');
     await mkdir(ptydEndpoint, { mode: 0o700 });
@@ -171,6 +194,9 @@ try {
         // A scan holds its machine this long, so scan.test.mjs can show a second one refused.
         '--scan-hold-ms',
         '1500',
+        // Integrations read the copy of the mock hub's recorded fixtures, never the network.
+        '--integration-fixtures',
+        fixtures,
       ],
       {
         cwd: root,
@@ -201,21 +227,32 @@ try {
     ).trim();
     env.PITCREW_CONFORMANCE_EXPECTED = join(root, 'tests/conformance/daemon-deviations.json');
   }
-  suite = spawn(
-    process.execPath,
-    ['--test', 'tests/conformance/api.test.mjs', 'tests/conformance/scan.test.mjs', 'tests/conformance/files.test.mjs'],
-    {
+  // One phase per file (or group) that changes the hub for every view, in this order:
+  // onboarding.test.mjs first, then the main suite, then import.test.mjs, which commits session
+  // inclusion (and restores it), then integrations.test.mjs, which syncs, appending events that
+  // the main suite's exact-revision checks must not see, and writes.test.mjs last, on its own: it
+  // connects the same repository integrations.test.mjs does. Every phase runs; the first failure
+  // decides the exit code.
+  for (const files of [
+    ['tests/conformance/onboarding.test.mjs'],
+    [
+      'tests/conformance/api.test.mjs',
+      'tests/conformance/scan.test.mjs',
+      'tests/conformance/files.test.mjs',
+      'tests/conformance/machine-setup.test.mjs',
+    ],
+    ['tests/conformance/import.test.mjs'],
+    ['tests/conformance/integrations.test.mjs'],
+    ['tests/conformance/writes.test.mjs'],
+  ]) {
+    suite = spawn(process.execPath, ['--test', ...files], {
       cwd: root,
       env,
       stdio: 'inherit',
-    },
-  );
-  const [code] = await once(suite, 'exit');
-  process.exitCode = code ?? 1;
-  {
-    suite = spawn(process.execPath, ['--test', 'tests/conformance/import.test.mjs'], { cwd: root, env, stdio: 'inherit' });
-    const [importCode] = await once(suite, 'exit');
-    process.exitCode = process.exitCode || (importCode ?? 1);
+    });
+    const [code] = await once(suite, 'exit');
+    suite = undefined;
+    process.exitCode = process.exitCode || (code ?? 1);
   }
 } finally {
   await cleanup();

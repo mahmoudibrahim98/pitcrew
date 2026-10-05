@@ -291,7 +291,9 @@ impl WorkService {
             engine: persona.as_ref().map_or(Engine::Claude, |p| p.engine),
             persona: persona.as_ref().map(|p| p.id),
             model: persona.as_ref().and_then(|p| p.model.clone()),
-            permission_mode: persona.map(|p| p.permission_mode).unwrap_or_default(),
+            permission_mode: persona.map_or(crate::safety::settings(conn)?.permission_mode, |p| {
+                p.permission_mode
+            }),
             machine,
             task,
             brief,

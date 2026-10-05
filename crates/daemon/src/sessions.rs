@@ -536,6 +536,16 @@ async fn start(
             "a session starts in a folder that members of its group can change"
         );
     }
+    let permission_mode = match start.permission_mode {
+        Some(mode) => mode,
+        None => {
+            let work = Arc::clone(&sessions.work);
+            bounded(move || work.safety())
+                .await?
+                .map_err(work_error)?
+                .permission_mode
+        }
+    };
     let name = window_name(start.engine, &folder.path);
     let work = Arc::clone(&sessions.work);
     let record = RecordedStart {
@@ -570,7 +580,7 @@ async fn start(
         persona: start.persona,
         model: start.model,
         account: None,
-        permission_mode: start.permission_mode.unwrap_or_default(),
+        permission_mode,
         session: Some(recorded.id),
     };
     sessions

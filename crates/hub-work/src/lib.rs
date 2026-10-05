@@ -11,6 +11,10 @@
 //!   layer's `GET /v1/events` filters), [`RecapIndex`] (blocks and day recaps, for the recap
 //!   routes; see [`recap`]) and [`Dispatcher`] (starting dispatched sessions, for the runner
 //!   link);
+//! - [`SyncCommands`]: what a tracker sync (GitHub, Jira) changes in the hub, as the sync's own
+//!   member with `Mover::Sync`, and [`links`], the workstream links a sync routes issues by;
+//! - [`writes`]: outward writes to GitHub and Jira, each proposed with an approval ask and started
+//!   only once a person answered "Send" (the commands are on [`SyncCommands`]);
 //! - the back office acting on the hub ([`BackOffice`], [`OfficeCommands`]): its run log is a
 //!   projection ([`projections_with_office`]), and the daemon calls [`WorkService::run_office`]
 //!   after each append to apply what it emitted.
@@ -74,15 +78,19 @@ mod dispatch;
 mod edits;
 mod error;
 mod import;
+pub mod links;
 mod office;
 pub mod projection;
 pub mod query;
 pub mod recap;
 mod recap_db;
 pub mod routes;
+mod safety;
 mod seed;
 mod service;
 mod setup;
+mod sync;
+pub mod writes;
 
 pub use activity::EventRefs;
 pub use commands::{AnswerAsk, BriefEdit, NewAsk, NewComment, SessionLink, WorkstreamPatch};
@@ -107,6 +115,11 @@ pub use routes::{agent_routes, device_routes, routes};
 pub use seed::demo_events;
 pub use service::{Clock, WorkService, WorkspaceAt};
 pub use setup::SetupListener;
+pub use sync::{
+    Outcome as SyncOutcome, SYNC_FALLBACK_HANDLE, SYNC_HANDLE, SYNC_NAME, SyncCommands, fit_labels,
+    fit_title,
+};
+pub use writes::WriteFilter;
 
 /// The protocol version this crate was built against.
 pub const PROTOCOL_VERSION: u32 = pitcrew_protocol::PROTOCOL_VERSION;

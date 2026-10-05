@@ -58,12 +58,12 @@ async function walkFirstRun(page: Page, theme: 'Light' | 'Dark') {
   await expectNoAxeViolations(page, `workspace (${theme})`);
   await page.getByRole('button', { name: 'Continue' }).click();
 
-  // 3. Machine check: fix the missing row.
+  // 3. Machine check: the missing tool's fix (the fake pretends it was installed from its page).
   await expect(heading(page, 'Checking the machine')).toBeVisible();
   const opencodeRow = page.locator('li', { hasText: 'OpenCode CLI' });
   await expect(opencodeRow.getByText('Missing')).toBeVisible(wait);
   await expectNoAxeViolations(page, `machine check (${theme})`);
-  await opencodeRow.getByRole('button', { name: 'Fix' }).click();
+  await opencodeRow.getByRole('button', { name: 'Install OpenCode CLI…' }).click();
   await expect(opencodeRow.getByText('OK')).toBeVisible(wait);
   await page.getByRole('button', { name: 'Continue' }).click();
 
@@ -107,7 +107,7 @@ async function walkFirstRun(page: Page, theme: 'Light' | 'Dark') {
 
   // 10. Hooks.
   await expect(heading(page, 'Install hooks')).toBeVisible();
-  await expect(page.getByText('~/.claude/settings.json')).toBeVisible(wait);
+  await expect(page.getByText('~/.claude/settings.json', { exact: true })).toBeVisible(wait);
   await expectNoAxeViolations(page, `hooks (${theme})`);
   await page.getByRole('button', { name: 'Install hooks' }).click();
 
