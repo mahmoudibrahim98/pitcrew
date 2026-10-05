@@ -35,6 +35,8 @@ import type {
   RecapDayScope,
   Session,
   SessionFilters,
+  SessionOptions,
+  StartSession,
   Setup,
   SetupResult,
   Subtask,
@@ -207,6 +209,10 @@ export function createApi(options: ApiOptions) {
     /** A field left out is unchanged; `null` clears `workstream`, `start` or `due`. */
     patchTask: (task: string, patch: TaskPatch) =>
       request<Task>('PATCH', `/v1/tasks/${id(task)}`, { body: patch }),
+    safety: (signal?: AbortSignal) => get<{ permission_mode: import('./types.ts').PermissionMode }>('/v1/safety', undefined, signal),
+    sessionOptions: (machine: string, signal?: AbortSignal) =>
+      get<SessionOptions>(`/v1/machines/${id(machine)}/session-options`, undefined, signal),
+    startSession: (start: StartSession) => request<Session>('POST', '/v1/sessions', { body: start }),
     sessions: (filters: SessionFilters = {}, signal?: AbortSignal) =>
       get<Session[]>('/v1/sessions', { ...filters }, signal),
     session: (session: string, signal?: AbortSignal) =>

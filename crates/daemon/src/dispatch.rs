@@ -305,13 +305,23 @@ fn private_dir(dir: &Path) -> std::io::Result<()> {
 pub struct FollowingSink {
     inner: StoreSink,
     work: Arc<WorkService>,
+    publication: Arc<Mutex<()>>,
 }
 
 impl FollowingSink {
     /// `inner`'s batches, followed by `work`.
     #[must_use]
     pub fn new(inner: StoreSink, work: Arc<WorkService>) -> Self {
-        Self { inner, work }
+        Self {
+            inner,
+            work,
+            publication: Arc::new(Mutex::new(())),
+        }
+    }
+
+    /// Serializes terminal publication with transcript adoption and state reports.
+    pub fn publication(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.publication)
     }
 }
 
@@ -325,6 +335,10 @@ impl fmt::Debug for FollowingSink {
 
 impl EventSink for FollowingSink {
     fn accept(&self, events: &[Event]) -> Result<(), SinkError> {
+        let _publication = self
+            .publication
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         self.inner.accept(events)?;
         if let Err(e) = self.work.follow_sessions(events) {
             tracing::warn!(error = %e, "the work model could not follow what the runner reported");
@@ -577,6 +591,49 @@ mod tests {
             .collect();
         store.append(&events).unwrap();
         Arc::new(WorkService::new(store, workspace))
+    }
+
+    #[test]
+    fn terminal_publication_and_transcript_adoption_are_serialized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sam = member(MemberKind::Human, "@sam", None);
+        let initial = session(None);
+        let work = work(tmp.path(), &[&sam], &[&initial]);
+        let sink = Arc::new(FollowingSink::new(
+            StoreSink::new(work.store().clone(), sam.id),
+            work.clone(),
+        ));
+        let publication = sink.publication();
+        let held = publication.lock().unwrap();
+        let mut adopted = initial.clone();
+        adopted.native_id = "synthetic-native".into();
+        adopted.state = SessionState::Working;
+        adopted.terminal = Some(pitcrew_protocol::ids::TerminalId::new());
+        adopted.title = Some("Synthetic title".into());
+        let event = Event::now(
+            work.workspace(),
+            sam.id,
+            EventBody::SessionDiscovered {
+                session: adopted.clone(),
+            },
+        );
+        let (ready, waiting) = std::sync::mpsc::channel();
+        let (done, completed) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            ready.send(()).unwrap();
+            sink.accept(&[event]).unwrap();
+            done.send(()).unwrap();
+        });
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(matches!(
+            completed.recv_timeout(Duration::from_millis(20)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert_eq!(work.session(&initial.id).unwrap(), initial);
+        drop(held);
+        completed.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        assert_eq!(work.session(&adopted.id).unwrap(), adopted);
     }
 
     /// A CLI started for a session run as an agent gets a file holding an agent token for that
@@ -1023,17 +1080,20 @@ mod tests {
             let config =
                 RunnerConfig::new(work.workspace(), machine, sam, tmp.path().join("runner"))
                     .with_home(Engine::Codex, &home);
+            let sink = Arc::new(FollowingSink::new(
+                StoreSink::new(work.store().clone(), sam),
+                work.clone(),
+            ));
+            let publication = sink.publication();
             let runner = pitcrew_runner::start(
                 config,
                 vec![Arc::new(pitcrew_ingest::codex::CodexAdapter::new())],
-                Arc::new(FollowingSink::new(
-                    StoreSink::new(work.store().clone(), sam),
-                    work.clone(),
-                )),
+                sink,
             )
             .unwrap();
             let terminals = runner.terminals(runtime).unwrap();
             attached.set(Parts {
+                publication,
                 machine,
                 hooks: runner.hooks(),
                 commands: runner.commands(&terminals),

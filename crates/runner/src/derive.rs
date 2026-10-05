@@ -13,6 +13,44 @@ const MAX_OPEN_CALLS: usize = 256;
 /// Longest status line, in characters.
 const MAX_STATUS_CHARS: usize = 120;
 
+/// A quiet active state gets at most five minutes of transcript/hook evidence.
+pub(crate) const ACTIVE_LEASE_MS: TimestampMs = 5 * 60 * 1000;
+/// Tool runs and permission decisions can be quiet for much longer than streamed output.
+pub(crate) const WAIT_LEASE_MS: TimestampMs = 60 * 60 * 1000;
+
+pub(crate) fn active_until(facts: &Facts, modified: TimestampMs) -> Option<TimestampMs> {
+    matches!(
+        facts.state,
+        SessionState::Working | SessionState::Waiting | SessionState::Starting
+    )
+    .then(|| {
+        modified.max(facts.reported_at.unwrap_or(0)).saturating_add(
+            if facts.state == SessionState::Waiting || !facts.open_calls.is_empty() {
+                WAIT_LEASE_MS
+            } else {
+                ACTIVE_LEASE_MS
+            },
+        )
+    })
+}
+
+pub(crate) fn expire(
+    facts: &mut Facts,
+    modified: TimestampMs,
+    live: bool,
+    now: TimestampMs,
+) -> Option<SessionState> {
+    if live || active_until(facts, modified).is_none_or(|until| now < until) {
+        return None;
+    }
+    let from = facts.state;
+    facts.state = SessionState::Idle;
+    facts.status_line = None;
+    // This is derived inactivity, not a hook: don't block later transcript items by advancing
+    // reported_at, and don't manufacture activity at the time of expiry.
+    Some(from)
+}
+
 /// What the runner remembers about a session between reads. Saved with the cursor.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Facts {
@@ -392,7 +430,7 @@ fn relative_to(path: &str, cwd: Option<&str>) -> String {
 mod tests {
     use super::*;
 
-    fn use_(offset: u64, id: &str, tool: &str) -> TranscriptItem {
+    pub(super) fn use_(offset: u64, id: &str, tool: &str) -> TranscriptItem {
         TranscriptItem::ToolUse {
             at: 1,
             call_id: id.into(),
@@ -403,7 +441,7 @@ mod tests {
         }
     }
 
-    fn result(offset: u64, id: &str, is_error: bool) -> TranscriptItem {
+    pub(super) fn result(offset: u64, id: &str, is_error: bool) -> TranscriptItem {
         TranscriptItem::ToolResult {
             at: 2,
             call_id: id.into(),
@@ -413,7 +451,7 @@ mod tests {
         }
     }
 
-    fn run_with(facts: &mut Facts, items: &[TranscriptItem]) -> Vec<Derived> {
+    pub(super) fn run_with(facts: &mut Facts, items: &[TranscriptItem]) -> Vec<Derived> {
         let mut out = Vec::new();
         let ctx = Ctx {
             session: SessionId::new(),
@@ -706,5 +744,108 @@ mod tests {
         assert_eq!(relative_to("/w/pq/a", Some("/w/p")), "/w/pq/a");
         assert_eq!(relative_to(r"C:\w\p\a.rs", Some(r"C:\w\p")), "a.rs");
         assert_eq!(relative_to("/w/p/a", None), "/w/p/a");
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+    #[test]
+    fn quiet_tools_and_waiting_have_one_hour_but_completed_tools_return_to_five_minutes() {
+        let now = WAIT_LEASE_MS * 2;
+        let mut tools = Facts::default();
+        super::tests::run_with(&mut tools, &[super::tests::use_(0, "call", "Bash")]);
+        assert_eq!(
+            expire(&mut tools, now - WAIT_LEASE_MS + 1, false, now),
+            None
+        );
+        let mut persisted: Facts =
+            serde_json::from_str(&serde_json::to_string(&tools).unwrap()).unwrap();
+        assert_eq!(
+            expire(&mut persisted, now - WAIT_LEASE_MS, false, now),
+            Some(SessionState::Working)
+        );
+        super::tests::run_with(&mut tools, &[super::tests::result(1, "call", false)]);
+        assert!(tools.open_calls.is_empty());
+        assert_eq!(
+            expire(&mut tools, now - ACTIVE_LEASE_MS, false, now),
+            Some(SessionState::Working)
+        );
+        let mut waiting = Facts {
+            state: SessionState::Waiting,
+            ..Facts::default()
+        };
+        assert_eq!(
+            expire(&mut waiting, now - WAIT_LEASE_MS + 1, false, now),
+            None
+        );
+        assert_eq!(
+            expire(&mut waiting, now - WAIT_LEASE_MS, false, now),
+            Some(SessionState::Waiting)
+        );
+    }
+
+    #[test]
+    fn leases_use_writes_hooks_and_live_terminals_without_inventing_activity() {
+        let now = 7_200_000;
+        for state in [
+            SessionState::Working,
+            SessionState::Waiting,
+            SessionState::Starting,
+        ] {
+            let old = Facts {
+                state,
+                status_line: Some("old status".into()),
+                last_activity: 42,
+                ..Facts::default()
+            };
+            let mut fresh = old.clone();
+            assert_eq!(
+                expire(&mut fresh, now - ACTIVE_LEASE_MS + 1, false, now),
+                None
+            );
+            assert_eq!(expire(&mut fresh, now - ACTIVE_LEASE_MS, true, now), None);
+            report(
+                &mut fresh,
+                &Reported {
+                    at: now - 1,
+                    to: state,
+                    status_line: None,
+                },
+            );
+            assert_eq!(fresh.reported_at, Some(now - 1));
+            assert_eq!(expire(&mut fresh, 0, false, now), None);
+            let mut restarted: Facts =
+                serde_json::from_str(&serde_json::to_string(&old).unwrap()).unwrap();
+            assert_eq!(
+                expire(
+                    &mut restarted,
+                    now - if state == SessionState::Waiting {
+                        WAIT_LEASE_MS
+                    } else {
+                        ACTIVE_LEASE_MS
+                    },
+                    false,
+                    now
+                ),
+                Some(state)
+            );
+            assert_eq!(restarted.state, SessionState::Idle);
+            assert_eq!(restarted.status_line, None);
+            assert_eq!(restarted.last_activity, 42);
+            assert_eq!(restarted.reported_at, None);
+        }
+        for state in [
+            SessionState::Ended,
+            SessionState::Unreachable,
+            SessionState::Idle,
+        ] {
+            let mut f = Facts {
+                state,
+                ..Facts::default()
+            };
+            assert_eq!(expire(&mut f, 0, false, now), None);
+            assert_eq!(f.state, state);
+        }
     }
 }

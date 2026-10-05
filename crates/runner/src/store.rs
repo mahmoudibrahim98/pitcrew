@@ -24,6 +24,8 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_transcripts.sql"),
     include_str!("../migrations/0002_links_and_commands.sql"),
     include_str!("../migrations/0003_folder_claims.sql"),
+    include_str!("../migrations/0004_session_titles.sql"),
+    include_str!("../migrations/0005_unclaimed.sql"),
 ];
 
 const DB_FILE: &str = "runner.sqlite3";
@@ -32,7 +34,7 @@ const LOCK_FILE: &str = "runner.lock";
 const COLUMNS: &str = "session_id, engine, path, inner_id, cursor, size, mtime, identity, \
                        caught_up, generation, discovered, meta, facts";
 const TERMINAL_COLUMNS: &str =
-    "terminal_id, native_target, session_id, engine, native_id, cwd, started_at";
+    "terminal_id, native_target, session_id, engine, native_id, cwd, started_at, unclaimed";
 
 /// A terminal started for a CLI whose session id is not known in advance is claimed by a session
 /// in its folder that starts within this long.
@@ -160,6 +162,8 @@ pub(crate) enum Commit {
 /// A terminal the runner started.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TerminalRow {
+    /// A person start: no named-start deadline or exclusive folder claim.
+    pub unclaimed: bool,
     pub terminal: TerminalId,
     pub native_target: Option<String>,
     /// The session it runs: once its transcript is found, or from the start for a session the hub
@@ -205,6 +209,22 @@ pub(crate) struct Store {
 }
 
 impl Store {
+    pub(crate) fn set_title(&self, session: SessionId, title: &str) -> Result<(), StoreError> {
+        self.conn.execute("INSERT INTO session_titles VALUES (?1, ?2) ON CONFLICT(session_id) DO UPDATE SET title = excluded.title", params![session.to_string(), title])?;
+        Ok(())
+    }
+
+    pub(crate) fn title(&self, session: SessionId) -> Result<Option<String>, StoreError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT title FROM session_titles WHERE session_id = ?1",
+                [session.to_string()],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         create_state_dir(dir)?;
         let lock = InstanceLock::acquire(dir)?;
@@ -462,8 +482,8 @@ impl Store {
         }
         tx.execute(
             "INSERT OR REPLACE INTO terminals
-                (terminal_id, native_target, session_id, engine, native_id, cwd, started_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (terminal_id, native_target, session_id, engine, native_id, cwd, started_at, unclaimed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 terminal,
                 t.native_target,
@@ -472,6 +492,7 @@ impl Store {
                 t.native_id,
                 t.cwd,
                 t.started_at,
+                t.unclaimed,
             ],
         )?;
         tx.commit()?;
@@ -579,7 +600,7 @@ impl Store {
             .filter(|t| {
                 t.native_id.is_none()
                     && same_dir(cwd, &t.cwd)
-                    && t.started_at >= now.saturating_sub(CLAIM_WINDOW_MS)
+                    && (t.unclaimed || t.started_at >= now.saturating_sub(CLAIM_WINDOW_MS))
             })
             .collect())
     }
@@ -745,7 +766,7 @@ fn move_row(
 pub(crate) fn by_folder(t: &TerminalRow, found: &Found<'_>, now: TimestampMs) -> bool {
     t.native_id.is_none()
         && found.cwd.is_some_and(|c| same_dir(c, &t.cwd))
-        && t.started_at >= now.saturating_sub(CLAIM_WINDOW_MS)
+        && (t.unclaimed || t.started_at >= now.saturating_sub(CLAIM_WINDOW_MS))
         && found.started >= t.started_at.saturating_sub(CLAIM_SLACK_MS)
 }
 
@@ -917,6 +938,7 @@ fn raw_terminal(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawTerminal> {
         native_id: r.get(4)?,
         cwd: r.get(5)?,
         started_at: r.get(6)?,
+        unclaimed: r.get(7)?,
     })
 }
 
@@ -928,11 +950,13 @@ struct RawTerminal {
     native_id: Option<String>,
     cwd: String,
     started_at: i64,
+    unclaimed: bool,
 }
 
 impl RawTerminal {
     fn decode(self) -> Result<TerminalRow, StoreError> {
         Ok(TerminalRow {
+            unclaimed: self.unclaimed,
             terminal: parse_id(&self.terminal)?,
             native_target: self.native_target,
             session: self.session.as_deref().map(parse_id).transpose()?,
@@ -1230,6 +1254,7 @@ mod tests {
 
     fn terminal(engine: Engine, native_id: Option<&str>, cwd: &str, at: i64) -> TerminalRow {
         TerminalRow {
+            unclaimed: false,
             terminal: TerminalId::new(),
             native_target: None,
             session: None,
@@ -1238,6 +1263,40 @@ mod tests {
             cwd: cwd.into(),
             started_at: at,
         }
+    }
+
+    #[test]
+    fn unclaimed_personal_starts_can_adopt_a_late_transcript_after_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let started = 10_000_000;
+        let session = SessionId::new();
+        let mut pending = terminal(Engine::OpenCode, None, "/w", started);
+        pending.session = Some(session);
+        pending.unclaimed = true;
+        store.put_terminal(&pending).unwrap();
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        let now = started + CLAIM_WINDOW_MS * 3;
+        assert_eq!(
+            store.waiting_in(Engine::OpenCode, "/w", now).unwrap(),
+            vec![pending.clone()]
+        );
+        let transcript = row("/h/late.jsonl");
+        store.insert(&transcript).unwrap();
+        let discovered = found(transcript.session, Engine::OpenCode, "late", "/w", now);
+        let claim = store
+            .claim_terminal(&discovered, now, &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.terminal, pending.terminal);
+        assert_eq!(claim.adopted, Some(session));
+        assert!(
+            store
+                .waiting_in(Engine::OpenCode, "/w", now)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1507,7 +1566,7 @@ mod tests {
                 err,
                 StoreError::TooNew {
                     found: 99,
-                    known: 3
+                    known: 5
                 }
             ),
             "{err}"
