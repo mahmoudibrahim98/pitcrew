@@ -17,6 +17,7 @@ import {
   type TerminalTarget,
 } from './live.ts';
 import * as integrations from './integrations.ts';
+import { openSignInTerminal, signInTerminal } from './machine-setup.ts';
 import { loadRecaps } from './recaps.ts';
 import { MOCK_VERSION, authenticate, handleApi, type Reply } from './routes.ts';
 import {

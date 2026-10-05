@@ -260,7 +260,12 @@ invoke('gateway_prompt_reply', { id, answer })                 // or { id, accep
 - **Probe** runs `pitcrew-remote`'s probe, then asks the direct launcher (or, for a SLURM
   helper, the scheduler) what is installed and running: `helper: { version, running }`;
   `slurm` when `sbatch` is there; `tmux: { version }` when tmux is (the tmux launcher needs 3.2
-  or newer).
+  or newer). The machine check rides in the probe's own call (`Ssh::probe_and_check`: each agent
+  CLI's and tool's version, the home folder's free space), so it is no extra login (Windows'
+  OpenSSH has no ControlMaster) and no extra password or one-time-code prompt; the gateway adds
+  the helper's row from what it found, and answers it as `check` (API v1's `MachineCheck`).
+  `tests/remote.rs` counts the logins and the password prompts of a probe: two each (the probe
+  with its check, and the helper's status).
 - **Plan** changes nothing on the machine. It probes again, finds the helper for the machine's
   platform (below), checks the launcher (tmux 3.2 or newer; for SLURM the tools and the site
   recipe: the built-in `generic`, or `~/.pitcrew/sites/<name>.toml`), and for SLURM renders the
@@ -269,9 +274,13 @@ invoke('gateway_prompt_reply', { id, answer })                 // or { id, accep
   running is used instead: the plan says so and holds no script. The plan is kept under a
   random id for 10 minutes, at most 32 at once, and used once: `add` takes it whatever happens.
 - **Add** carries the plan out, step by step, with progress on `events`: each step of the plan
-  as `{ step, state: "running" }` then `"done"` or `"failed"` (with `detail`; the upload adds
-  `"running"` messages with `"N% sent"`, and a SLURM job its state, e.g.
-  `"job 4242 pending (Priority)"`), ending with one `{ step: "add", state: "done" | "failed" }`.
+  as `{ step, state: "running" }` then `"done"` or `"failed"` (with `detail`; the deploy adds
+  `"running"` messages for its steps, `"checking for a copy already there"`, `"uploading"`,
+  `"N% sent"`, `"verifying the sha256 and the version on the machine"` and `"installed and
+  verified"` (or `"already there, and verified …"`), the launch `"starting it …"` and `"it runs and
+  listens"`, and a SLURM job `"submitting the job script shown"` and its state, e.g. `"job 4242
+  pending (Priority)"`: onboarding's live log), ending with one `{ step: "add", state: "done" |
+  "failed" }`.
   1. *Deploy*: the helper's bytes are checked against their sha256 before anything is sent, and
      again on the machine (`pitcrew_remote::deploy`).
   2. *Launch*: the direct or tmux launcher starts it; for SLURM, exactly the plan's script is

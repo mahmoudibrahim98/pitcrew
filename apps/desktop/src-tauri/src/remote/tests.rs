@@ -98,6 +98,7 @@ fn progress_is_the_contracts_shape() {
         tmux: Some(TmuxFound {
             version: "3.3a".into(),
         }),
+        check: None,
     };
     assert_eq!(
         serde_json::to_value(probe).unwrap(),

@@ -227,7 +227,12 @@ try {
   // decides the exit code.
   for (const files of [
     ['tests/conformance/onboarding.test.mjs'],
-    ['tests/conformance/api.test.mjs', 'tests/conformance/scan.test.mjs', 'tests/conformance/files.test.mjs'],
+    [
+      'tests/conformance/api.test.mjs',
+      'tests/conformance/scan.test.mjs',
+      'tests/conformance/files.test.mjs',
+      'tests/conformance/machine-setup.test.mjs',
+    ],
     ['tests/conformance/import.test.mjs'],
     ['tests/conformance/integrations.test.mjs'],
     ['tests/conformance/writes.test.mjs'],

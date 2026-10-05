@@ -76,10 +76,10 @@ function baseRows(): MachineCheckRow[] {
   return [
     { id: 'cli-claude', label: 'Claude Code CLI', status: 'ok', detail: '2.1.4', fixable: false },
     { id: 'cli-codex', label: 'Codex CLI', status: 'ok', detail: '0.44.0', fixable: false },
-    { id: 'cli-opencode', label: 'OpenCode CLI', status: 'missing', detail: 'not on PATH', fixable: true },
+    { id: 'cli-opencode', label: 'OpenCode CLI', status: 'missing', detail: 'not on PATH', fixable: true, fix: 'install-page' },
     { id: 'tmux', label: 'tmux', status: 'ok', detail: '3.4', fixable: false },
     { id: 'git', label: 'git', status: 'ok', detail: '2.45.2', fixable: false },
-    { id: 'gh', label: 'GitHub CLI (gh)', status: 'warn', detail: 'not signed in', fixable: true },
+    { id: 'gh', label: 'GitHub CLI (gh)', status: 'missing', detail: 'not on PATH', fixable: true, fix: 'install-page' },
     { id: 'disk', label: 'Disk space', status: 'ok', detail: '128 GB free', fixable: false },
   ];
 }
@@ -154,10 +154,14 @@ export function createFakeOnboardingApi(options: FakeOnboardingApiOptions = {}):
   const delay = (ms: number) => Math.round(ms * speed);
   const checks = new Map<string, MachineCheckRow[]>();
   const accounts = new Map<string, AgentAccount>([
-    ['claude', { engine: 'claude', signedIn: true, account: 'sam@example.com' }],
-    ['codex', { engine: 'codex', signedIn: false }],
-    ['opencode', { engine: 'opencode', signedIn: false }],
+    ['claude', { engine: 'claude', installed: true, signedIn: true, account: 'sam@example.com' }],
+    ['codex', { engine: 'codex', installed: true, signedIn: false }],
+    ['opencode', { engine: 'opencode', installed: true, signedIn: false }],
   ]);
+  /** Sign-ins whose "login" still runs, by engine: each ends a moment after it starts. */
+  const running = new Set<string>();
+  /** Each running sign-in's end, which `stopSignIn` calls off. */
+  const endings = new Map<string, ReturnType<typeof setTimeout>>();
   const integrations = new Map<string, IntegrationStatus>([
     ['github', { id: 'github', connected: true, detail: 'sam' }],
     ['jira', { id: 'jira', connected: false }],
@@ -206,6 +210,9 @@ export function createFakeOnboardingApi(options: FakeOnboardingApiOptions = {}):
       return { machine: target, rows };
     },
 
+    // The fake installs the helper anywhere, so its every step can be tried on this computer.
+    needsHelper: () => true,
+
     async fixMachineRow(target: MachineTarget, row: CheckRowId): Promise<MachineCheckRow> {
       const key = targetKey(target);
       const rows = checks.get(key) ?? rowsFor(target);
@@ -213,10 +220,11 @@ export function createFakeOnboardingApi(options: FakeOnboardingApiOptions = {}):
       if (found === undefined) throw new Error(`No check row "${row}"`);
       if (!found.fixable) throw new Error(`"${found.label}" cannot be fixed automatically`);
       await wait(delay(500));
+      // A real fix opens the tool's install page; the fake pretends the person installed it.
       const fixed: MachineCheckRow =
         row === 'cli-opencode'
-          ? { ...found, status: 'ok', detail: '0.9.2 (installed)' }
-          : { ...found, status: 'ok', detail: 'signed in' };
+          ? { ...found, status: 'ok', detail: '0.9.2 (installed)', fixable: false, fix: undefined }
+          : { ...found, status: 'ok', detail: 'gh version 2.45.0 (installed)', fixable: false, fix: undefined };
       const next = rows.map((r) => (r.id === row ? fixed : r));
       checks.set(key, next);
       return fixed;
@@ -273,11 +281,34 @@ export function createFakeOnboardingApi(options: FakeOnboardingApiOptions = {}):
       await wait(delay(150));
       nextSignIn += 1;
       const id = `onboarding-signin-${engine}-${targetKey(machine)}-${nextSignIn}`;
-      // A real sign-in completes when the CLI's own login flow exits; the fake marks it signed in
-      // right away so the step can be exercised without a terminal.
-      const current = accounts.get(engine);
-      if (current !== undefined) accounts.set(engine, { ...current, signedIn: true, account: `${engine}@example.com` });
-      return { terminalSessionId: id };
+      // A real sign-in completes when the CLI's own login exits; the fake's "login" ends a moment
+      // after it starts, and its CLI then says it is signed in.
+      running.add(engine);
+      clearTimeout(endings.get(engine));
+      endings.set(
+        engine,
+        setTimeout(() => {
+          running.delete(engine);
+          endings.delete(engine);
+          const current = accounts.get(engine);
+          if (current !== undefined) accounts.set(engine, { ...current, signedIn: true, account: `${engine}@example.com` });
+        }, delay(600)),
+      );
+      const command = { claude: ['claude', 'auth', 'login'], codex: ['codex', 'login'], opencode: ['opencode', 'auth', 'login'] };
+      return { terminalSessionId: id, command: command[engine] };
+    },
+
+    async signInRunning(engine): Promise<boolean> {
+      await wait(delay(50));
+      return running.has(engine);
+    },
+
+    async stopSignIn(engine): Promise<void> {
+      // Left before it finished: it ends now, and the CLI is not signed in.
+      clearTimeout(endings.get(engine));
+      endings.delete(engine);
+      running.delete(engine);
+      await wait(delay(20));
     },
 
     async integrationStatus(): Promise<IntegrationStatus[]> {

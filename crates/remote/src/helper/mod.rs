@@ -56,8 +56,8 @@ pub(crate) mod script;
 pub mod slurm;
 
 pub use deploy::{
-    DeployOptions, Deployed, HashTool, Helper, MAX_HELPER_SIZE, Platform, Progress, deploy,
-    validate_version,
+    DeployOptions, DeployStep, Deployed, HashTool, Helper, MAX_HELPER_SIZE, Platform, Progress,
+    deploy, validate_version,
 };
 pub use launch::{
     DirectLauncher, Endpoint, HelperFuture, HelperState, LaunchOptions, Launcher, MIN_TMUX,

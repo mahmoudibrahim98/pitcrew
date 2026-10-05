@@ -212,6 +212,7 @@ a single entry point.
 | `src/scan.ts` | The machine scan: its synthetic report and streamed frames. |
 | `src/integrations.ts` | GitHub and Jira integrations over `fixtures/*.fixture`, and the links' checks. |
 | `src/writes.ts` | Outward writes: proposals, approvals and the recorded answers. |
+| `src/machine-setup.ts` | Machine setup: the synthetic check, the accounts, and sign-in terminals. |
 | `fixtures/` | Recorded, synthetic GitHub and Jira answers (reads, and the writes' answers), shared with the daemon's tests and the conformance runner. |
 | `src/ws.ts` | A minimal WebSocket server (RFC 6455). |
 | `src/types.ts` | Wire types mirroring `crates/protocol`. |

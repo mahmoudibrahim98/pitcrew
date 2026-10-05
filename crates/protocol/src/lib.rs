@@ -29,6 +29,7 @@ pub mod files;
 pub mod ids;
 pub mod import;
 pub mod integrations;
+pub mod machine_setup;
 pub mod model;
 pub mod onboarding;
 pub mod recap;

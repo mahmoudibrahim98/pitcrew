@@ -7,8 +7,8 @@ node tests/conformance/run.mjs mock
 node tests/conformance/run.mjs daemon
 ```
 
-Both commands run `onboarding.test.mjs` on its own, then the same `api.test.mjs`, `scan.test.mjs`
-and `files.test.mjs`, then `import.test.mjs` on its own, then `integrations.test.mjs` on its own
+Both commands run `onboarding.test.mjs` on its own, then the same `api.test.mjs`, `scan.test.mjs`,
+`files.test.mjs` and `machine-setup.test.mjs`, then `import.test.mjs` on its own, then `integrations.test.mjs` on its own
 (its syncs append events, which the main suite's exact-revision checks must not see), then
 `writes.test.mjs` on its own (it connects the same repository). Every phase runs, and the first
 failure decides the exit code. No npm dependency is needed. The

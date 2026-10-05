@@ -3,11 +3,12 @@ import { expectNoAxeViolations } from './axe';
 import { FIRST_RUN_HUB, MOCK_DEVICE_TOKEN } from './fresh-hubs';
 
 // The first run in a browser, against a fresh mock hub (`fresh.config.ts`): the shell sends the
-// empty workspace to the first-run wizard, the wizard is Welcome, Workspace, Scan, Create, Done
-// against the real `POST /v1/setup`, `POST /v1/machines/{id}/scan` (the mock's synthetic report),
-// `POST /v1/projects` and `POST /v1/workstreams`, and Home stays Home afterwards. `GET /v1/me` is
-// then the new person, and the projects and workstreams are where the scan found them. axe finds
-// nothing on the new screens, light and dark.
+// empty workspace to the first-run wizard, the wizard is Welcome, Workspace, Machine check, Sign
+// in, Scan, Create, Import, Hooks, Safety, Done against the real `POST /v1/setup`, machine setup's
+// routes (the mock's synthetic check, accounts and sign-in terminal), `POST /v1/machines/{id}/scan`
+// (the mock's synthetic report), `POST /v1/projects` and `POST /v1/workstreams`, the hooks preview
+// and the safety settings, and Home stays Home afterwards. `GET /v1/me` is then the new person, and the projects and workstreams are where the
+// scan found them. axe finds nothing on the new screens, light and dark.
 
 const AUTH = { Authorization: `Bearer ${MOCK_DEVICE_TOKEN}` };
 
@@ -29,7 +30,18 @@ test('the first run, from an empty workspace to Home as the new person', async (
   await expect(heading(page, 'Welcome to PitCrew')).toBeVisible();
   await expect(page.getByRole('complementary', { name: 'Sidebar' })).toHaveCount(0);
   // Only the steps the hub can serve.
-  await expect(page.getByRole('tab')).toHaveText([/Welcome/, /Workspace/, /Scan/, /Create/, /Import/, /Hooks/, /Safety/, /Done/]);
+  await expect(page.getByRole('tab')).toHaveText([
+    /Welcome/,
+    /Workspace/,
+    /Machine check/,
+    /Sign in/,
+    /Scan/,
+    /Create/,
+    /Import/,
+    /Hooks/,
+    /Safety/,
+    /Done/,
+  ]);
   await expectNoAxeViolations(page, 'welcome');
 
   // Any other page goes back to setup while it is not done.
@@ -53,6 +65,39 @@ test('the first run, from an empty workspace to Home as the new person', async (
   await expectNoAxeViolations(page, 'workspace');
   await page.getByRole('button', { name: 'Continue' }).click();
 
+  // Machine check: the hub's own machine. A missing tool's fix opens its install page (stubbed:
+  // nothing leaves the test) and says where it is; nothing is installed.
+  await expect(heading(page, 'Checking the machine')).toBeVisible();
+  const opencode = page.getByRole('listitem').filter({ hasText: 'OpenCode CLI' });
+  await expect(opencode.getByText('Missing')).toBeVisible();
+  await expect(page.getByRole('listitem').filter({ hasText: 'Claude Code CLI' }).getByText('2.1.3 (Claude Code)')).toBeVisible();
+  await page.context().route('https://opencode.ai/**', (route) => route.fulfill({ body: 'An install page.' }));
+  const opened = page.context().waitForEvent('page');
+  await opencode.getByRole('button', { name: 'Install OpenCode CLI…' }).click();
+  const tab = await opened;
+  await tab.waitForLoadState();
+  expect(tab.url()).toBe('https://opencode.ai/docs/');
+  await tab.close();
+  await expect(opencode.getByText('https://opencode.ai/docs/')).toBeVisible();
+  await expectNoAxeViolations(page, 'machine check');
+  await page.getByRole('button', { name: 'Check again' }).click();
+  await expect(opencode.getByText('Missing')).toBeVisible();
+  await page.getByRole('button', { name: 'Continue' }).click();
+
+  // Sign in: Claude Code's own login in the console's terminal view; once it ends, the CLI says
+  // who is signed in.
+  await expect(heading(page, 'Sign in to your agents')).toBeVisible();
+  const claude = page.getByRole('listitem').filter({ hasText: 'Claude Code' });
+  await expect(claude.getByText('Not signed in')).toBeVisible();
+  await expectNoAxeViolations(page, 'sign in');
+  await page.getByRole('button', { name: 'Sign in to Claude Code' }).click();
+  const login = page.getByRole('region', { name: 'Claude Code sign-in' });
+  await expect(login.getByText('claude auth login', { exact: true })).toBeVisible();
+  await expect(claude.getByText('sam@example.com')).toBeVisible({ timeout: 15_000 });
+  await expect(claude.getByText('Signed in', { exact: true })).toBeVisible();
+  await expect(login.getByText(/the login has ended/)).toBeVisible();
+  await page.getByRole('button', { name: 'Continue' }).click();
+
   // Scan: the hub's own machine, its counts and suggestions.
   await expect(heading(page, 'Scanning for sessions')).toBeVisible();
   await expect(page.getByText(/Found 3 likely projects/)).toBeVisible({ timeout: 15_000 });
@@ -74,7 +119,7 @@ test('the first run, from an empty workspace to Home as the new person', async (
   await page.getByRole('button', { name: 'Continue' }).click();
   expect((await request.get(`${FIRST_RUN_HUB}/v1/import`, { headers: AUTH })).status()).toBe(200);
 
-  // Done, then Home, which stays Home.
+  // Hooks and Safety, then Done, then Home, which stays Home.
   await expect(heading(page, 'Install hooks')).toBeVisible();
   await expect(page.getByText('/home/sam/.claude/settings.json', {exact: true})).toBeVisible();
   await expectNoAxeViolations(page, 'hooks');

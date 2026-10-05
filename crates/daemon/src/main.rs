@@ -32,6 +32,7 @@ mod host;
 mod init;
 mod integrations;
 mod locations;
+mod machine_setup;
 mod office;
 mod onboarding;
 mod recaps;

@@ -10,6 +10,7 @@ import { hooksDiff, installHooks, parseSafety } from './onboarding.ts';
 import { blocksPage, daysPage } from './recaps.ts';
 import { canMove } from './rules.ts';
 import { startScan, type StreamedBody } from './scan.ts';
+import { agentAccounts, checkMachine, signInStatus, startSignIn, stopSignIn } from './machine-setup.ts';
 import {
   announceSession,
   createSession,
@@ -1498,6 +1499,23 @@ const ROUTES: Route[] = [
     status: 200,
     stream: startScan(hub, ctx.param('id')),
   })),
+  // Machine setup (machine-setup.ts).
+  route('GET', '/v1/machines/:id/check', 'device', (hub, ctx) =>
+    ok(checkMachine(hub, ctx.caller.memberId, ctx.param('id'), ctx.query)),
+  ),
+  route('GET', '/v1/machines/:id/agents', 'device', (hub, ctx) =>
+    ok(agentAccounts(hub, ctx.caller.memberId, ctx.param('id'))),
+  ),
+  route('GET', '/v1/machines/:id/agents/:engine/sign-in', 'device', (hub, ctx) =>
+    ok(signInStatus(hub, ctx.caller.memberId, ctx.param('id'), ctx.param('engine'))),
+  ),
+  route('POST', '/v1/machines/:id/agents/:engine/sign-in', 'device', (hub, ctx) =>
+    startSignIn(hub, ctx.caller.memberId, ctx.param('id'), ctx.param('engine'), ctx.body),
+  ),
+  route('DELETE', '/v1/machines/:id/agents/:engine/sign-in', 'device', (hub, ctx) => {
+    stopSignIn(hub, ctx.caller.memberId, ctx.param('id'), ctx.param('engine'));
+    return noContent();
+  }),
   route('GET', '/v1/members', 'agent', (hub) => ok(hub.members)),
   route('GET', '/v1/personas', 'device', (hub) => ok(hub.personas)),
   route('GET', '/v1/teams', 'device', (hub) => ok(hub.teams)),
