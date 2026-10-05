@@ -28,6 +28,7 @@ import {
   loadFixture,
   type Delays,
 } from './state.ts';
+import type { MemberId } from './types.ts';
 import { ApiFailure, forbidden, invalid, notFound } from './validate.ts';
 import {
   acceptUpgrade,
@@ -362,7 +363,7 @@ function serveUpgrade(
     const conn =
       target.kind === 'stream'
         ? acceptStream(hub, req, socket, head, streamSince(query), caller.memberId)
-        : acceptTerminal(hub, req, socket, head, terminalTarget(hub, target.session, query));
+        : acceptTerminalOrSignIn(hub, req, socket, head, target.session, query, caller.memberId);
     log(`WS ${path} 101`);
     return conn;
   } catch (error) {
@@ -395,6 +396,25 @@ function acceptTerminal(
 ): WebSocketConnection {
   const conn = acceptUpgrade(req, socket, head, SUBPROTOCOL);
   openTerminal(hub, conn, target);
+  return conn;
+}
+
+/** A sign-in's terminal (machine-setup.ts), else a session's. */
+function acceptTerminalOrSignIn(
+  hub: Hub,
+  req: IncomingMessage,
+  socket: Duplex,
+  head: Buffer,
+  ref: string,
+  query: URLSearchParams,
+  member: MemberId,
+): WebSocketConnection {
+  const signIn = signInTerminal(hub, ref, member);
+  if (signIn === undefined) {
+    return acceptTerminal(hub, req, socket, head, terminalTarget(hub, ref, query));
+  }
+  const conn = acceptUpgrade(req, socket, head, SUBPROTOCOL);
+  openSignInTerminal(hub, conn, signIn);
   return conn;
 }
 
