@@ -11,7 +11,7 @@ for (const theme of ['light', 'dark'] as const) {
     const machines = await (await request.get(`${HUB_URL}/v1/machines`, { headers: HUB_AUTH })).json();
     const local = machines.find((machine: { kind: string }) => machine.kind === 'local');
     const created = await request.post(`${HUB_URL}/v1/workstreams`, { headers: HUB_AUTH, data: {
-      project: '01JB000000000000000PRJ0001', name: `Synthetic explorer ${theme}`, locations: [{ machine: local.id, path: process.env.E2E_FILES_ROOT ?? '/home/sam/synthetic-explorer' }],
+      project: '01JB000000000000000PRJ0001', name: `Synthetic explorer ${theme}`, locations: [{ machine: local.id, path: process.env.E2E_FILES_ROOT ?? (process.platform === 'win32' ? 'C:/synthetic-explorer' : '/home/sam/synthetic-explorer') }],
     } });
     expect(created.status()).toBe(201);
     const stream = await created.json();
