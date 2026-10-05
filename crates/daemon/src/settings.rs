@@ -41,6 +41,31 @@ struct Rename {
     name: String,
 }
 
+async fn rename(
+    State(settings): State<Settings>,
+    Extension(caller): Extension<Caller>,
+    body: Result<Json<Rename>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<Workspace>, WorkError> {
+    let work = Arc::clone(&settings.work);
+    tokio::task::spawn_blocking(move || work.require_owner(&caller))
+        .await
+        .map_err(|_| WorkError::unavailable("Workspace settings are unavailable."))??;
+    let Json(body) = body.map_err(|_| WorkError::invalid("Supply a workspace name only."))?;
+    tokio::task::spawn_blocking(move || {
+        settings
+            .work
+            .rename_workspace(&caller, &body.name, |workspace| {
+                crate::state::write_workspace(&settings.root.join("workspace.json"), workspace)
+                    .map_err(|_| {
+                        WorkError::unavailable("Could not save the workspace name. Retry.")
+                    })
+            })
+            .map(Json)
+    })
+    .await
+    .map_err(|_| WorkError::unavailable("Workspace settings are unavailable."))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,29 +155,4 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), 403);
     }
-}
-
-async fn rename(
-    State(settings): State<Settings>,
-    Extension(caller): Extension<Caller>,
-    body: Result<Json<Rename>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<Workspace>, WorkError> {
-    let work = Arc::clone(&settings.work);
-    tokio::task::spawn_blocking(move || work.require_owner(&caller))
-        .await
-        .map_err(|_| WorkError::unavailable("Workspace settings are unavailable."))??;
-    let Json(body) = body.map_err(|_| WorkError::invalid("Supply a workspace name only."))?;
-    tokio::task::spawn_blocking(move || {
-        settings
-            .work
-            .rename_workspace(&caller, &body.name, |workspace| {
-                crate::state::write_workspace(&settings.root.join("workspace.json"), workspace)
-                    .map_err(|_| {
-                        WorkError::unavailable("Could not save the workspace name. Retry.")
-                    })
-            })
-            .map(Json)
-    })
-    .await
-    .map_err(|_| WorkError::unavailable("Workspace settings are unavailable."))?
 }

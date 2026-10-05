@@ -250,6 +250,7 @@ mod tests {
             name: name.into(),
             owner: (n != 1).then(|| id(1)),
             persona: None,
+            avatar: None,
         }
     }
 

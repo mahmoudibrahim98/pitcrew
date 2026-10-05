@@ -346,7 +346,6 @@ pub enum StreamFrame {
 /// Editable fields of an agent recipe; the hub assigns the id.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS))]
-#[serde(deny_unknown_fields)]
 pub struct PersonaEdit {
     /// Display name.
     pub name: String,

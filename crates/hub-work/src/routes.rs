@@ -751,7 +751,14 @@ async fn edit_persona(
             .ok_or_else(|| WorkError::not_found("No such persona."))
     })
     .await?;
-    let edit: PersonaEdit = json(body).await?;
+    let input: pitcrew_protocol::settings::SavePersona = json(body).await?;
+    let edit = PersonaEdit {
+        name: input.name,
+        engine: input.engine,
+        model: input.model,
+        instructions: input.instructions,
+        permission_mode: input.permission_mode,
+    };
     Ok(Json(
         blocking(w, move |w| w.save_persona(&caller, Some(id), edit)).await?,
     ))

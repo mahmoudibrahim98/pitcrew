@@ -21,3 +21,18 @@ pub struct SaveProfile {
     /// Avatar appearance.
     pub avatar: Avatar,
 }
+/// Strict replacement fields for an existing recipe; creation still ignores server-owned fields.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SavePersona {
+    /// Display name.
+    pub name: String,
+    /// CLI engine.
+    pub engine: crate::model::Engine,
+    /// Optional model.
+    pub model: Option<String>,
+    /// Optional standing instructions.
+    pub instructions: Option<String>,
+    /// Permission mode for new sessions.
+    pub permission_mode: crate::model::PermissionMode,
+}
