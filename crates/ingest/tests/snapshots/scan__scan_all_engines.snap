@@ -79,7 +79,16 @@ expression: v
       "session_count": 3,
       "workstreams": [
         {
+          "id": "<ROOT>/work/proj-a",
+          "kind": "main",
+          "name": "main",
+          "recent_30d": 3,
+          "recent_90d": 3,
+          "session_count": 3
+        },
+        {
           "id": "<ROOT>/work/proj-a/apps",
+          "kind": "folder",
           "name": "apps",
           "recent_30d": 1,
           "recent_90d": 1,
@@ -88,6 +97,7 @@ expression: v
         {
           "branch": "feat/x",
           "id": "<ROOT>/work/proj-a#feat/x",
+          "kind": "branch",
           "name": "feat/x",
           "recent_30d": 1,
           "recent_90d": 1,
@@ -105,7 +115,16 @@ expression: v
       "session_count": 2,
       "workstreams": [
         {
+          "id": "<ROOT>/work/notes",
+          "kind": "main",
+          "name": "Main",
+          "recent_30d": 1,
+          "recent_90d": 1,
+          "session_count": 2
+        },
+        {
           "id": "<ROOT>/work/notes/y",
+          "kind": "folder",
           "name": "y",
           "recent_30d": 1,
           "recent_90d": 1,
@@ -113,6 +132,7 @@ expression: v
         },
         {
           "id": "<ROOT>/work/notes/x",
+          "kind": "folder",
           "name": "x",
           "recent_30d": 0,
           "recent_90d": 0,
@@ -128,7 +148,16 @@ expression: v
       "recent_30d": 1,
       "recent_90d": 1,
       "session_count": 1,
-      "workstreams": []
+      "workstreams": [
+        {
+          "id": "<ROOT>/work/proj-b",
+          "kind": "main",
+          "name": "master",
+          "recent_30d": 1,
+          "recent_90d": 1,
+          "session_count": 1
+        }
+      ]
     }
   ],
   "unreadable": 0

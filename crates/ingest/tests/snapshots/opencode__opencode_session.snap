@@ -487,7 +487,8 @@ expression: "Golden\n{ meta: c.meta, items: c.items, sub_session: sub.meta, sub_
     "title": "List every script under scripts/ that writes files.",
     "model": "demo-coder-2",
     "started": 1790756412165,
-    "is_subagent": true
+    "is_subagent": true,
+    "parent": "ses_f0e99d47fffeKy9Pf34qY6Nb3w"
   },
   "sub_items": [
     {

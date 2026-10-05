@@ -337,6 +337,7 @@ fn meta_comes_from_records_not_folders() {
             model: Some("claude-x".into()),
             started: Some(1_767_225_600_000),
             is_subagent: false,
+            parent: None,
         }
     );
 
@@ -411,6 +412,10 @@ fn discovery_finds_sessions_and_subagents() {
         .map(|m| (m.native_id.as_str(), m.is_subagent))
         .collect();
     assert_eq!(flags, [("sess-0", true), ("ag-7", true), ("s-1", false)]);
+    // A sub-agent names its parent by the session id its records carry; one naming itself (an
+    // older sidechain file without an agent id) names none.
+    let parents: Vec<_> = metas.iter().map(|m| m.parent.as_deref()).collect();
+    assert_eq!(parents, [None, Some("sess-1"), None]);
 
     assert!(read_retry(|| ClaudeAdapter.discover(&home.path().join("missing"))).is_empty());
 }

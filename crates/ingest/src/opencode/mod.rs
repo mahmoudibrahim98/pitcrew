@@ -84,7 +84,7 @@ mod store;
 pub use crate::jsonl::ReadReport;
 pub use parse::{MessageInfo, PartItems, Phase, Role, parse_part};
 
-use crate::bound::{MAX_PATH_BYTES, MAX_TITLE_CHARS, bounded};
+use crate::bound::{MAX_ID_BYTES, MAX_PATH_BYTES, MAX_TITLE_CHARS, bounded};
 use crate::jsonl::Skips;
 use crate::lines::{MAX_LINE_BYTES, SkipReason, SkippedLine};
 use crate::text::title;
@@ -515,6 +515,8 @@ pub(crate) struct LightMeta {
     pub cwd: Option<String>,
     pub started: Option<TimestampMs>,
     pub is_subagent: bool,
+    /// The parent session a child session names (`parent_id`).
+    pub parent: Option<String>,
 }
 
 /// Bounded retries for a batch that hits `WouldBlock` (the store changed, or a writer holds it,
@@ -571,6 +573,7 @@ pub(crate) fn light_meta(
                             cwd: bounded(row.directory.as_deref(), MAX_PATH_BYTES),
                             started: (row.created > 0).then_some(row.created),
                             is_subagent: row.parent_id.as_deref().is_some_and(|p| !p.is_empty()),
+                            parent: parent_of(id, row.parent_id.as_deref()),
                         },
                     );
                 }
@@ -1183,7 +1186,13 @@ fn session_meta(session: &store::SessionRow, state: &ReadState) -> SessionMeta {
         model: state.model.clone(),
         started: (session.created > 0).then_some(session.created),
         is_subagent: session.parent_id.as_deref().is_some_and(|p| !p.is_empty()),
+        parent: parent_of(&session.id, session.parent_id.as_deref()),
     }
+}
+
+/// The parent a child session names: its `parent_id`, bounded, and never the session itself.
+fn parent_of(id: &str, parent_id: Option<&str>) -> Option<String> {
+    bounded(parent_id, MAX_ID_BYTES).filter(|p| p != id)
 }
 
 #[cfg(test)]

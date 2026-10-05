@@ -190,6 +190,17 @@ impl SourceAdapter for ClaudeAdapter {
     }
 }
 
+/// For a sub-agent transcript `<project>/<session>/subagents/<agent>.jsonl`, its parent's session
+/// id: the `<session>` folder's name. `None` for a transcript anywhere else.
+pub(crate) fn subagent_session_folder(path: &Path) -> Option<String> {
+    let subagents = path.parent()?;
+    if subagents.file_name()? != "subagents" {
+        return None;
+    }
+    let session = subagents.parent()?.file_name()?;
+    Some(session.to_string_lossy().into_owned())
+}
+
 /// A folder that is not a symbolic link (or a Windows junction).
 fn is_real_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
@@ -326,16 +337,21 @@ impl MetaAcc {
     }
 
     fn to_meta(&self, path: &Path) -> SessionMeta {
-        let in_subagents =
-            path.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("subagents"));
-        let is_subagent = in_subagents || self.sidechain == Some(true);
+        let session_folder = subagent_session_folder(path);
+        let is_subagent = session_folder.is_some() || self.sidechain == Some(true);
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned());
-        // Sub-agent records carry their parent's session id, so they are named by agent id.
-        let native_id = if is_subagent {
-            self.agent_id.clone().or(stem)
+        // Sub-agent records carry their parent's session id, so they are named by agent id, and
+        // that session id names their parent; in `<session>/subagents/`, so does the folder.
+        let (native_id, parent) = if is_subagent {
+            (
+                self.agent_id.clone().or(stem),
+                self.session_id.clone().or(session_folder),
+            )
         } else {
-            self.session_id.clone().or(stem)
+            (self.session_id.clone().or(stem), None)
         };
+        // A transcript is never its own parent.
+        let parent = parent.filter(|p| Some(p) != native_id.as_ref());
         SessionMeta {
             native_id: native_id.unwrap_or_default(),
             cwd: self.cwd.clone(),
@@ -348,6 +364,7 @@ impl MetaAcc {
             model: self.model.clone(),
             started: self.started,
             is_subagent,
+            parent,
         }
     }
 }

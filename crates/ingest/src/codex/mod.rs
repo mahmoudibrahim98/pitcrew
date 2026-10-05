@@ -231,6 +231,8 @@ struct MetaAcc {
     started: Option<TimestampMs>,
     first_prompt: Option<String>,
     subagent: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent: Option<String>,
 }
 
 impl MetaAcc {
@@ -242,6 +244,7 @@ impl MetaAcc {
         changed |= set_first(&mut self.cwd, f.cwd.as_ref());
         changed |= set_first(&mut self.started, f.timestamp.as_ref());
         changed |= set_first(&mut self.subagent, f.is_subagent.as_ref());
+        changed |= set_first(&mut self.parent, f.parent.as_ref());
         changed |= set_first(&mut self.branch, f.branch.as_ref());
         changed |= set_latest(&mut self.model, f.model.as_ref());
         if self.first_prompt.is_none() {
@@ -260,6 +263,12 @@ impl MetaAcc {
                 .map(|s| id_from_stem(&s.to_string_lossy()).to_owned())
                 .unwrap_or_default()
         });
+        let is_subagent = self.subagent == Some(true);
+        // Only a sub-agent has a parent, and never itself.
+        let parent = self
+            .parent
+            .clone()
+            .filter(|p| is_subagent && *p != native_id);
         SessionMeta {
             native_id,
             cwd: self.cwd.clone(),
@@ -268,13 +277,14 @@ impl MetaAcc {
             title: self.first_prompt.clone(),
             model: self.model.clone(),
             started: self.started,
-            is_subagent: self.subagent == Some(true),
+            is_subagent,
+            parent,
         }
     }
 }
 
 /// The session id at the end of `rollout-<time>-<uuid>`, else the whole stem.
-fn id_from_stem(stem: &str) -> &str {
+pub(crate) fn id_from_stem(stem: &str) -> &str {
     let tail = stem
         .len()
         .checked_sub(36)
