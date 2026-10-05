@@ -2,9 +2,8 @@
 // dependencies, comments with @mentions, its writes upstream (GitHub, Jira), the blocks of work on
 // it (recaps), and the task's history from activity.
 
-import { Dialog } from 'radix-ui';
 import { useId, useState, type ComponentType, type FormEvent, type ReactNode } from 'react';
-import { Button, StatusPill } from '../design/index.ts';
+import { Button, StatusPill, SideDrawer, SideDrawerTitle, SideDrawerClose, toast, CheckCircleIcon, WorkstreamIcon, FolderIcon } from '../design/index.ts';
 import type { Member, MemberId, Session, Subtask, Task, TaskId, TaskStatus } from '../data/index.ts';
 import { cx } from '../lib/cx.ts';
 import { AuthorAvatar, EventList } from './activity.tsx';
@@ -14,6 +13,8 @@ import {
   useActivity,
   useAssignTask,
   useDispatchTask,
+  useDispatches,
+  usePatchTask,
   useMe,
   useMemberMap,
   useMembers,
@@ -30,6 +31,9 @@ import { useProjectsNav } from './nav.tsx';
 import { MemberChip, memberLabel } from './people.tsx';
 import { WorkBlocks } from './recaps.tsx';
 import { ErrorNote, Field, MaybeLink, inputClass } from './ui.tsx';
+import { TaskEditor } from './task-editor.tsx';
+import { Markdown } from './markdown.tsx';
+import { taskLink } from './nav.tsx';
 import { TaskWrites } from './writes/task-writes.tsx';
 
 type TitleComponent = ComponentType<{ className?: string; children?: ReactNode }> | 'h2';
@@ -44,27 +48,11 @@ export function TaskDrawer({
   onOpenChange: (open: boolean) => void;
 }) {
   return (
-    <Dialog.Root open={open} onOpenChange={onOpenChange}>
-      <Dialog.Portal>
-        <Dialog.Overlay className="fixed inset-0 z-40 bg-ink/20" />
-        <Dialog.Content
-          aria-describedby={undefined}
-          className="fixed inset-y-0 right-0 z-50 flex w-full max-w-2xl flex-col overflow-y-auto border-l border-line bg-bg p-5 shadow-pop"
-        >
-          <TaskDetail
-            taskId={taskId}
-            Title={Dialog.Title}
-            close={
-              <Dialog.Close asChild>
-                <Button variant="ghost" aria-label="Close">
-                  <span aria-hidden>✕</span>
-                </Button>
-              </Dialog.Close>
-            }
-          />
-        </Dialog.Content>
-      </Dialog.Portal>
-    </Dialog.Root>
+    <SideDrawer open={open} onOpenChange={onOpenChange}>
+      <TaskDetail key={taskId} taskId={taskId} Title={SideDrawerTitle} closeDrawer={() => onOpenChange(false)} close={
+        <SideDrawerClose asChild><Button variant="ghost" aria-label="Close"><span aria-hidden>✕</span></Button></SideDrawerClose>
+      } />
+    </SideDrawer>
   );
 }
 
@@ -74,14 +62,20 @@ export function TaskDetail({
   Title = 'h2',
   close,
   combineHeading = false,
+  closeDrawer,
 }: {
   taskId: TaskId;
   Title?: TitleComponent;
   close?: ReactNode;
   /** One heading reading "KEY · Title" instead of the key on its own line above it (a page of its own, not a drawer). */
   combineHeading?: boolean;
+  closeDrawer?: () => void;
 }) {
   const task = useTask(taskId);
+  const [editing, setEditing] = useState(false);
+  const patch = usePatchTask();
+  const move = useMoveTask();
+  const nav = useProjectsNav();
   const me = useMe();
   const person = me.data?.kind === 'human';
 
@@ -117,11 +111,24 @@ export function TaskDetail({
         )}
         <span className="ml-auto">{close}</span>
       </header>
+      <div className="flex flex-wrap gap-2">
+        {!combineHeading && <Button onClick={() => { if (nav.openTaskPage !== undefined) nav.openTaskPage(data.id); else window.location.assign(taskLink(data.id)); }}>Open full page</Button>}
+        <Button onClick={() => { navigator.clipboard.writeText(nav.taskLink?.(data.id) ?? taskLink(data.id)).then(() => toast('Task link copied')).catch(() => toast('Could not copy the link. Copy the address from the full page.', { error: true })); }}>Copy link</Button>
+        {person && <>
+          <Button onClick={() => setEditing(true)}>Edit task</Button>
+          {data.status !== 'done' && <Button disabled={move.isPending} onClick={() => move.mutate({ task: data.id, to: 'done' })}>Mark complete</Button>}
+          <Button disabled={patch.isPending} onClick={() => patch.mutate({ task: data.id, patch: { archived: !data.archived } }, { onSuccess: () => { if (!data.archived) closeDrawer?.(); } })}>{data.archived ? 'Restore task' : 'Archive task'}</Button>
+        </>}
+      </div>
+      {data.archived && <p role="status" className="text-sm text-ink-2">Archived · hidden from work views.</p>}
+      {patch.error !== null && <ErrorNote error={patch.error} what="archive or restore the task" />}
+      {move.error !== null && <ErrorNote error={move.error} what="complete the task" />}
+      {editing && <TaskEditor key={data.id} task={data} close={() => setEditing(false)} />}
       <Fields task={data} person={person} />
-      {data.description !== '' && <p className="text-md leading-relaxed whitespace-pre-wrap">{data.description}</p>}
+      <section aria-label="Description"><Markdown text={data.description || 'No description yet.'} /></section>
       <Subtasks task={data} person={person} level={level} />
       <AgentRun task={data} person={person} level={level} />
-      <Dependencies task={data} level={level} />
+      <Dependencies task={data} person={person} level={level} />
       <Comments task={data} level={level} />
       <TaskWrites
         task={data}
@@ -182,7 +189,7 @@ function Fields({ task, person }: { task: Task; person: boolean }) {
   return (
     <div className="flex flex-col gap-2">
       <dl className="grid grid-cols-[8rem_1fr] items-center gap-x-3 gap-y-2 text-sm">
-        <dt className="text-ink-2">Status</dt>
+        <dt className="flex items-center gap-1 text-ink-2"><CheckCircleIcon />Status</dt>
         <dd>
           {person ? (
             <select
@@ -227,6 +234,7 @@ function Fields({ task, person }: { task: Task; person: boolean }) {
             'Unassigned'
           )}
         </dd>
+        <dt className="text-ink-2">Start</dt><dd>{task.start === undefined ? 'No start date' : formatDay(task.start)}</dd>
         <dt className="text-ink-2">Due</dt>
         <dd>{task.due === undefined ? 'No due date' : formatDay(task.due)}</dd>
         {task.labels.length > 0 && (
@@ -241,7 +249,7 @@ function Fields({ task, person }: { task: Task; person: boolean }) {
             </dd>
           </>
         )}
-        <dt className="text-ink-2">Project</dt>
+        <dt className="flex items-center gap-1 text-ink-2"><FolderIcon />Project</dt>
         <dd>
           <MaybeLink onOpen={openProject === undefined ? undefined : () => openProject(task.project)}>
             {names.project(task.project)}
@@ -249,7 +257,7 @@ function Fields({ task, person }: { task: Task; person: boolean }) {
         </dd>
         {workstream !== undefined && (
           <>
-            <dt className="text-ink-2">Workstream</dt>
+            <dt className="flex items-center gap-1 text-ink-2"><WorkstreamIcon />Workstream</dt>
             <dd>
               <MaybeLink onOpen={openWorkstream === undefined ? undefined : () => openWorkstream(workstream)}>
                 {names.workstream(workstream)}
@@ -297,6 +305,7 @@ function Subtasks({ task, person, level }: { task: Task; person: boolean; level:
 
   return (
     <Section title="Subtasks" level={level}>
+      <p className="text-xs text-ink-2">{subtasks.filter((item) => item.done).length} / {subtasks.length} complete</p>
       {hasPlan && (
         <p id={noteId} className="text-xs text-ink-2">
           Lines marked “Agent plan” mirror the agent’s own plan; only the agent changes them.
@@ -352,11 +361,13 @@ function Subtasks({ task, person, level }: { task: Task; person: boolean; level:
 
 function AgentRun({ task, person, level }: { task: Task; person: boolean; level: SectionLevel }) {
   const sessions = useSessions({ task: task.id });
+  const dispatches = useDispatches(task.id);
   const members = useMemberMap();
   const all = [...(sessions.data ?? [])].sort(
     (a, b) => SESSION_STATE[a.state].rank - SESSION_STATE[b.state].rank || b.last_activity - a.last_activity,
   );
-  const running = all.filter((s) => s.state !== 'ended');
+  const finishedSessions = new Set((dispatches.data ?? []).filter((dispatch) => dispatch.ended !== undefined).map((dispatch) => dispatch.session));
+  const running = all.filter((s) => s.state !== 'ended' && !finishedSessions.has(s.id));
   const ended = all.filter((s) => s.state === 'ended');
   return (
     <Section title="Agent run" level={level} className="rounded-md border border-line bg-card p-3">
@@ -364,6 +375,8 @@ function AgentRun({ task, person, level }: { task: Task; person: boolean; level:
       {running.length === 0 && sessions.data !== undefined && (
         <p className="text-sm text-ink-2">No agent is working on this task.</p>
       )}
+      {dispatches.error !== null && <ErrorNote error={dispatches.error} what="load the dispatch status" />}
+      {(dispatches.data ?? []).filter((dispatch) => dispatch.ended !== undefined).map((dispatch) => <p key={dispatch.id} role={dispatch.outcome === 'failed' ? 'alert' : undefined} className="text-sm">Run {dispatch.outcome}{dispatch.summary === undefined ? '' : `: ${dispatch.summary}`}</p>)}
       {running.map((session) => (
         <RunRow key={session.id} session={session} members={members} />
       ))}
@@ -405,13 +418,13 @@ function RunRow({ session, members }: { session: Session; members: ReadonlyMap<M
         >
           Open chat
         </Button>
-        <Button
+        {session.terminal !== undefined && <Button
           disabled={openSession === undefined}
           title={openSession === undefined ? soon : undefined}
           onClick={() => openSession?.(session.id, 'terminal')}
         >
           Open terminal
-        </Button>
+        </Button>}
         <span className="text-xs text-ink-2">Last activity {formatWhen(session.last_activity)}</span>
       </div>
     </div>
@@ -466,25 +479,21 @@ function DispatchForm({ task }: { task: Task }) {
   );
 }
 
-function Dependencies({ task, level }: { task: Task; level: SectionLevel }) {
+function Dependencies({ task, person, level }: { task: Task; person: boolean; level: SectionLevel }) {
   const tasks = useTaskMap();
   const nav = useProjectsNav();
+  const patch = usePatchTask();
+  const [blocker, setBlocker] = useState('');
   const blockedBy = task.blocked_by.map((id) => tasks.get(id) ?? id);
   const blocks = [...tasks.values()].filter((t) => t.blocked_by.includes(task.id));
   // One below the section's own heading, so nothing skips a level in either mode.
   const SubHeading = level === 2 ? 'h3' : 'h4';
-  if (blockedBy.length === 0 && blocks.length === 0) {
-    return (
-      <Section title="Dependencies" level={level}>
-        <p className="text-sm text-ink-2">No dependencies.</p>
-      </Section>
-    );
-  }
   const openTask = nav.openTask;
   const row = (t: Task | string) =>
     typeof t === 'string' ? (
       <li key={t} className="font-mono text-xs text-ink-2">
         {t}
+        {person && <Button disabled={patch.isPending} aria-label={`Remove dependency ${t}`} onClick={() => patch.mutate({ task: task.id, patch: { blocked_by: task.blocked_by.filter((id) => id !== t) } })}>Remove</Button>}
       </li>
     ) : (
       <li key={t.id} className="flex items-center gap-2 text-sm">
@@ -493,10 +502,17 @@ function Dependencies({ task, level }: { task: Task; level: SectionLevel }) {
         <StatusPill tone={TASK_STATUS[t.status].tone} className="ml-auto">
           {TASK_STATUS[t.status].label}
         </StatusPill>
+        {person && task.blocked_by.includes(t.id) && <Button disabled={patch.isPending} aria-label={`Remove dependency ${t.key}`} onClick={() => patch.mutate({ task: task.id, patch: { blocked_by: task.blocked_by.filter((id) => id !== t.id) } })}>Remove</Button>}
       </li>
     );
   return (
     <Section title="Dependencies" level={level}>
+      {blockedBy.length === 0 && blocks.length === 0 && <p className="text-sm text-ink-2">No dependencies.</p>}
+      {person && <form className="flex gap-2" onSubmit={(event) => { event.preventDefault(); if (blocker !== '') patch.mutate({ task: task.id, patch: { blocked_by: [...task.blocked_by, blocker] } }, { onSuccess: () => setBlocker('') }); }}>
+        <select aria-label="Add dependency" className={inputClass} value={blocker} onChange={(event) => setBlocker(event.target.value)}><option value="">Choose a task</option>{[...tasks.values()].filter((item) => item.id !== task.id && !task.blocked_by.includes(item.id) && !item.archived).map((item) => <option key={item.id} value={item.id}>{item.key} · {item.title}</option>)}</select>
+        <Button type="submit" disabled={patch.isPending || blocker === ''}>Add dependency</Button>
+      </form>}
+      {patch.error !== null && <ErrorNote error={patch.error} what="change dependencies; remove the circular dependency and try again" />}
       {blockedBy.length > 0 && (
         <>
           <SubHeading className="text-xs font-medium text-ink-2">Blocked by</SubHeading>

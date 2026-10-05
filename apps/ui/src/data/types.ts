@@ -176,6 +176,7 @@ export interface Task {
   workstream?: WorkstreamId;
   title: string;
   description: string;
+  archived?: boolean;
   status: TaskStatus;
   priority: Priority;
   assignee?: MemberId;
@@ -196,6 +197,7 @@ export interface TaskPatch {
   workstream?: WorkstreamId | null;
   title?: string;
   description?: string;
+  archived?: boolean;
   priority?: Priority;
   labels?: string[];
   start?: CalendarDate | null;

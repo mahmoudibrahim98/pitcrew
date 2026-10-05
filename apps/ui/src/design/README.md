@@ -1,5 +1,12 @@
 # design (stream L)
 
+`SideDrawer` is a Radix modal anchored to the right edge. It traps focus, closes on Escape,
+and restores the opener; consumers supply `SideDrawerTitle` and `SideDrawerClose`.
+`toast(text, { error?, action? })` posts a shared notification. Mount one `Toaster` in the
+workspace shell. Errors announce as alerts; other messages as status. Actions remain for
+20 seconds, and failed actions show a retry instruction. Close a modal after archiving so
+its Undo notification is reachable.
+
 Components built on `@pitcrew/tokens` and Radix primitives. Import from `index.ts`. Every one is
 keyboard operable, works light and dark (Tailwind classes resolve to the `--pc-*` tokens), and
 honours reduced motion through the tokens' durations. See `docs/build/streams/L.md`.

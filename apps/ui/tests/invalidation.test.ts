@@ -129,12 +129,12 @@ describe('invalidation map', () => {
     expect(touched).toEqual([keys.events, keys.tasks.detail('T1'), keys.tasks.lists]);
   });
 
-  it('session events touch that session and not tasks', () => {
+  it('ending a session refreshes its dispatch result and task lists', () => {
     const touched = keysToInvalidate(
       [event({ type: 'session_ended', data: { session: 'S1' } })],
       noCache,
     );
-    expect(touched).toEqual([keys.events, keys.sessions.detail('S1'), keys.sessions.lists]);
+    expect(touched).toEqual([keys.events, keys.sessions.detail('S1'), keys.sessions.lists, keys.dispatches, keys.tasks.lists]);
   });
 
   it('a state change also touches the newest transcript page (a question or a turn may have landed)', () => {

@@ -22,7 +22,7 @@ export function CalendarPage() {
   const projects = useProjects();
   const workstreams = useWorkstreams(project || undefined);
   const tasks = useTasks({ ...(project === '' ? {} : { project }), ...(workstream === '' ? {} : { workstream }) });
-  const filtered = (tasks.data ?? []).filter((task) => !mine || (me.data !== undefined && task.assignee === me.data.id));
+  const filtered = (tasks.data ?? []).filter((task) => !task.archived && (!mine || (me.data !== undefined && task.assignee === me.data.id)));
   const byDay = tasksByDay(filtered);
   const days = monthDays(month, weekStart());
   const inMonth = days.filter((date) => date.slice(0, 7) === month.slice(0, 7));

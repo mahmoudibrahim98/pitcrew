@@ -1,6 +1,7 @@
 // The frame every page lives in: sidebar, top bar, the page, and the Orchestrator panel. It sits
 // inside the workspace's data scope (in the desktop app, each workspace has its own).
 
+import { Toaster } from '../design/toast.tsx';
 import { Outlet, useRouter, useRouterState } from '@tanstack/react-router';
 import { lazy, Suspense, useEffect, useRef, type MouseEvent } from 'react';
 import {
@@ -84,6 +85,7 @@ export function WorkspaceFrame() {
   return (
     <WorkspaceScope key={ws} ws={ws} fallback={(reason) => <ScopeMissing reason={reason} />}>
       <Frame />
+      <Toaster />
     </WorkspaceScope>
   );
 }

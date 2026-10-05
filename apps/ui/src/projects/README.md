@@ -1,5 +1,28 @@
 # projects (stream N)
 
+## Task editing and views
+
+Tasks opened from boards and lists use the shared side drawer; direct task URLs retain their
+full page. The drawer offers Open full page, Copy link, Mark complete and Edit task. Edit task
+updates title, description, priority, dates, labels, workstream and automatic acceptance together;
+dependency controls add and remove blockers through the hub's cycle validation. Archived tasks
+retain their id, key, plan and history, disappear from work views, and can be restored by the
+notification's Undo action or their full page. Archiving closes the drawer so Undo is reachable.
+
+Description Markdown uses React text nodes: emphasis, code, fenced code, headings, bullet lists,
+quotes and HTTP(S) links. Raw HTML stays literal text; images never load and unsafe link schemes
+stay text. Agent run reads dispatches as well as sessions, shows terminal links only for sessions
+with terminals, and reports finished dispatch outcomes and summaries after live invalidation.
+
+My tasks defaults to a list grouped Overdue, Today, Upcoming, No date and Completed (canceled
+tasks included in Completed), with a board alternative remembered in local storage per person.
+New task accepts explicit project/workstream/status defaults; board columns provide these.
+The shell dialog infers project/workstream from the current route. Workstream choices always
+belong to the selected project. Description, labels and priority are included on creation.
+
+Dispatchable-agent provisioning/selection awaits the separate create-dialogs PR. The shell's
+search/palette continues to navigate directly to a task page: this brief does not own the palette.
+
 The Projects layout: where everything stands, what happened lately, and what needs you, with
 agents visible where the work is. See `docs/build/streams/N.md` and ADR-0007/0008.
 

@@ -33,6 +33,9 @@ import {
   type WorkstreamId,
 } from '../data/index.ts';
 import { plainNames, type Names } from './format.ts';
+import { toast } from '../design/toast.tsx';
+import { taskLink, useProjectsNav } from './nav.tsx';
+import type { TaskPatch } from '../data/index.ts';
 
 export {
   useMe,
@@ -265,13 +268,46 @@ export function useAssignTask() {
   return useMutation({
     mutationFn: ({ task, assignee }: { task: TaskId; assignee: MemberId | null }) =>
       api.request<Task>('POST', `/v1/tasks/${id(task)}/assign`, { body: { assignee } }),
+    onSuccess: (task) => toast(`${task.key} assigned`),
+    onError: taskError,
   });
 }
 
 export function useCreateTask() {
   const api = useApi();
+  const nav = useProjectsNav();
   return useMutation({
     mutationFn: (task: NewTask) => api.request<Task>('POST', '/v1/tasks', { body: task }),
+    onSuccess: (task) => toast(`${task.key} created`, { action: { label: 'Open', run: () => {
+      if (nav.openTask !== undefined) nav.openTask(task.id);
+      else window.location.assign(taskLink(task.id));
+    } } }),
+    onError: taskError,
+  });
+}
+
+export function taskError(error: Error) {
+  toast(`${error instanceof Error ? error.message : String(error)} Check the task and try again.`, { error: true });
+}
+
+export function usePatchTask() {
+  const api = useApi();
+  return useMutation({
+    mutationFn: ({ task, patch }: { task: TaskId; patch: TaskPatch }) => api.patchTask(task, patch),
+    onSuccess: (task, { patch }) => toast(`${task.key} ${patch.archived === true ? 'archived' : patch.archived === false ? 'restored' : 'updated'}`,
+      patch.archived === true ? { action: { label: 'Undo', run: async () => {
+        await api.patchTask(task.id, { archived: false });
+        toast(`${task.key} restored`);
+      } } } : {}),
+    onError: taskError,
+  });
+}
+
+export function useDispatches(task: TaskId) {
+  const api = useApi();
+  return useLiveQuery({
+    queryKey: [...keys.dispatches, { task }],
+    queryFn: ({ signal }) => api.request<Dispatch[]>('GET', `/v1/tasks/${id(task)}/dispatches`, { signal }),
   });
 }
 

@@ -19,7 +19,7 @@ export function TasksList({ workstream }: { workstream: WorkstreamId }) {
   const members = useMemberMap();
   const nav = useProjectsNav();
   const openTask = nav.openTask;
-  const list = [...(tasks.data ?? [])].sort(
+  const list = [...(tasks.data ?? []).filter((task) => !task.archived)].sort(
     (a, b) => rank(a.status) - rank(b.status) || PRIORITY[a.priority].rank - PRIORITY[b.priority].rank,
   );
 

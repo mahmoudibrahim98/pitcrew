@@ -12,7 +12,8 @@ import {
   type PointerEvent,
   type ReactNode,
 } from 'react';
-import { Button } from '../design/index.ts';
+import { Button, Dialog, DialogContent } from '../design/index.ts';
+import { NewTaskDialog } from './new-task.tsx';
 import {
   keys,
   type Member,
@@ -114,9 +115,10 @@ export function Board({ project, workstream, assignee, groupBy = 'status', title
 
   const [grouping, setGrouping] = useState<BoardGrouping>(groupBy);
   const [drawerTask, setDrawerTask] = useState<TaskId | null>(null);
+  const [newTask, setNewTask] = useState<{ project: string; workstream?: string; status: TaskStatus } | null>(null);
 
   const workstreamNames = new Map((workstreams.data ?? []).map((w) => [w.id, w.name]));
-  const list = tasks.data ?? [];
+  const list = (tasks.data ?? []).filter((task) => !task.archived);
   const lanes: Lane[] = [];
   if (grouping === 'status') {
     lanes.push({ id: 'all' });
@@ -203,12 +205,19 @@ export function Board({ project, workstream, assignee, groupBy = 'status', title
           onMove={moves.move}
           onOpen={open}
           {...(createIn === undefined ? {} : { onCreate: createIn })}
+          onNewTask={projectId === undefined ? undefined : (status, lane) => {
+            const inWorkstream = lane !== 'all' && lane !== NO_WORKSTREAM ? lane : workstream;
+            setNewTask({ project: projectId, status, ...(inWorkstream === undefined ? {} : { workstream: inWorkstream }) });
+          }}
         />
       )}
 
       {drawerTask !== null && (
         <TaskDrawer taskId={drawerTask} open onOpenChange={(isOpen) => !isOpen && setDrawerTask(null)} />
       )}
+      {newTask !== null && <Dialog open onOpenChange={(open) => { if (!open) setNewTask(null); }}>
+        <DialogContent title="New task"><NewTaskDialog defaults={newTask} close={() => setNewTask(null)} /></DialogContent>
+      </Dialog>}
     </section>
   );
 }
@@ -236,6 +245,7 @@ export interface BoardViewProps {
   onMove: (task: Task, to: TaskStatus) => void;
   onOpen: (task: Task) => void;
   onCreate?: (status: TaskStatus, lane: string, title: string, done: () => void) => void;
+  onNewTask?: ((status: TaskStatus, lane: string) => void) | undefined;
 }
 
 const cellKey = (lane: string, status: TaskStatus) => `${lane}/${status}`;
@@ -253,6 +263,7 @@ export function BoardView({
   onMove,
   onOpen,
   onCreate,
+  onNewTask,
 }: BoardViewProps) {
   const instructionsId = useId();
   const [drag, setDrag] = useState<Drag | null>(null);
@@ -436,6 +447,7 @@ export function BoardView({
                   adding={adding === key}
                   onAdd={onCreate === undefined ? undefined : () => setAdding(key)}
                   onCancelAdd={() => setAdding(null)}
+                  onNewTask={onNewTask === undefined ? undefined : () => onNewTask(status, lane.id)}
                   onSubmitAdd={
                     onCreate === undefined
                       ? undefined
@@ -484,6 +496,7 @@ function Column({
   onAdd,
   onCancelAdd,
   onSubmitAdd,
+  onNewTask,
   children,
 }: {
   status: TaskStatus;
@@ -497,6 +510,7 @@ function Column({
   onAdd: (() => void) | undefined;
   onCancelAdd: () => void;
   onSubmitAdd: ((title: string) => void) | undefined;
+  onNewTask: (() => void) | undefined;
   children: ReactNode;
 }) {
   const headingId = useId();
@@ -535,6 +549,7 @@ function Column({
         )}
       </div>
       {adding && onSubmitAdd !== undefined && <AddTask label={label} onSubmit={onSubmitAdd} onCancel={onCancelAdd} />}
+      {onNewTask !== undefined && <Button variant="ghost" onClick={onNewTask}>New task in {label}</Button>}
       {children}
     </div>
   );
