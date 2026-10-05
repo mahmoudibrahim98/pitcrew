@@ -1,10 +1,13 @@
-// The Orchestrator panel frame (Ctrl J): resizable, with its open state and width persisted. Its
-// conversation comes later; for now it shows an empty state.
+// The Orchestrator panel (Ctrl J): resizable, with its open state and width persisted. Its
+// conversation (`orchestrator-chat.tsx`) is a lazy chunk, loaded when the panel first opens.
 
+import { lazy, Suspense } from 'react';
 import { CloseIcon, FOCUS_RING, ResizablePanel, SparkleIcon, Tooltip } from '../design/index.ts';
 import { cx } from '../lib/cx.ts';
 import { SHORTCUTS } from './shortcuts.ts';
 import { ORCHESTRATOR_WIDTH, useShell } from './store.ts';
+
+const OrchestratorChat = lazy(() => import('./orchestrator-chat.tsx').then((m) => ({ default: m.OrchestratorChat })));
 
 export function OrchestratorPanel() {
   const width = useShell((s) => s.orchestratorWidth);
@@ -36,16 +39,9 @@ export function OrchestratorPanel() {
           </button>
         </Tooltip>
       </div>
-      <div className="flex flex-1 flex-col items-center justify-center gap-2 p-6 text-center">
-        <span className="inline-flex size-10 items-center justify-center rounded-pill bg-accent-soft text-accent-text">
-          <SparkleIcon className="size-5" />
-        </span>
-        <p className="text-sm font-medium">Ask about your work</p>
-        <p className="max-w-64 text-sm text-ink-2">
-          The Orchestrator will answer questions across your projects, sessions and machines. Its
-          conversation arrives in a later version.
-        </p>
-      </div>
+      <Suspense fallback={<p className="p-4 text-sm text-ink-2">Loading…</p>}>
+        <OrchestratorChat />
+      </Suspense>
     </ResizablePanel>
   );
 }

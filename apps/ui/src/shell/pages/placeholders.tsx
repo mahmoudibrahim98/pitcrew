@@ -233,6 +233,36 @@ export function SetupPage() {
   );
 }
 
+/** The agent CLIs the Orchestrator answers with, and how each signs in, in its own terminal. */
+const SIGN_IN: { engine: string; install: string; signIn: string }[] = [
+  { engine: 'Claude Code', install: 'claude', signIn: 'claude, then /login' },
+  { engine: 'Codex', install: 'codex', signIn: 'codex login' },
+  { engine: 'OpenCode', install: 'opencode', signIn: 'opencode auth login' },
+];
+
+/** `paths.signIn`, until the onboarding feature serves its sign-in step there. */
+export function SignInPage() {
+  return (
+    <Page title="Sign in to your agents">
+      <p className="text-sm text-ink-2">
+        The Orchestrator answers with an agent CLI you already use, on this hub&apos;s machine, signed in as
+        you. Install one there and sign in once, in a terminal:
+      </p>
+      <List label="Agent CLIs" empty="">
+        {SIGN_IN.map((row) => (
+          <Row key={row.engine}>
+            <span className="w-28 font-medium">{row.engine}</span>
+            <span className="text-ink-2">
+              On the PATH as <code className="font-mono text-xs">{row.install}</code>; sign in with{' '}
+              <code className="font-mono text-xs">{row.signIn}</code>
+            </span>
+          </Row>
+        ))}
+      </List>
+    </Page>
+  );
+}
+
 export function SessionPage() {
   const { session: id } = useRouteParams();
   const sessions = useSessions().data;

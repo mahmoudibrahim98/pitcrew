@@ -4,6 +4,25 @@ export { fileClient, type FileContent, type FileListing } from './files.ts';
 export { useMoveCursor, useReadCursors, type ReadCursor } from './cursors.ts';
 export { invalidationMap, keysToInvalidate } from './invalidation.ts';
 export { keys } from './keys.ts';
+export {
+  answering,
+  ANSWER_POLL_MS,
+  useAsk,
+  useCancelAnswer,
+  useClearConversations,
+  useOrchestrator,
+  type AnswerReference,
+  type AnswerSuggestion,
+  type AnswerUsage,
+  type Conversation,
+  type EngineStatus,
+  type Orchestrator,
+  type OrchestratorLimits,
+  type OrchestratorTurn,
+  type Question,
+  type ReferenceTarget,
+  type TurnState,
+} from './orchestrator.ts';
 export type { LiveProblem } from './live.ts';
 export {
   createQueryClient,

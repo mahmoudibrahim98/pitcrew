@@ -99,12 +99,25 @@ fn session_list_shows_ids_states_names_and_filters() {
     assert!(lines[1].ends_with("Orchestrator"));
     assert!(lines[2].contains("Paper"), "{out}");
     assert!(lines[2].contains("PAP-1"), "{out}");
-    assert!(lines[2].ends_with("Draft[2J the paper"), "escapes are dropped: {out}");
+    assert!(
+        lines[2].ends_with("Draft[2J the paper"),
+        "escapes are dropped: {out}"
+    );
 
     // --since filters here; --state and --task (by its id) go to the daemon.
     let (code, out, _) = run_on(
         &server,
-        &["--json", "session", "list", "--since", "2026-09-30", "--state", "working", "--task", "pap-1"],
+        &[
+            "--json",
+            "session",
+            "list",
+            "--since",
+            "2026-09-30",
+            "--state",
+            "working",
+            "--task",
+            "pap-1",
+        ],
         "",
     );
     assert_eq!(code, 0);
@@ -116,7 +129,10 @@ fn session_list_shows_ids_states_names_and_filters() {
         .filter(|r| r.route() == "GET /v1/sessions")
         .last()
         .unwrap();
-    assert_eq!(asked.target, format!("/v1/sessions?task={TASK1}&state=working"));
+    assert_eq!(
+        asked.target,
+        format!("/v1/sessions?task={TASK1}&state=working")
+    );
     let (code, _, err) = run_on(&server, &["session", "list", "--since", "yesterday"], "");
     assert_eq!(code, 2);
     assert!(err.contains("not a day"), "{err}");
@@ -126,7 +142,11 @@ fn session_list_shows_ids_states_names_and_filters() {
 #[test]
 fn session_show_prints_its_facts_and_recent_work() {
     let server = FakeServer::tcp(reads(&[
-        (&format!("GET /v1/sessions/{SES1}"), 200, sessions()[0].clone()),
+        (
+            &format!("GET /v1/sessions/{SES1}"),
+            200,
+            sessions()[0].clone(),
+        ),
         (
             "GET /v1/machines",
             200,
@@ -135,7 +155,10 @@ fn session_show_prints_its_facts_and_recent_work() {
     ]));
     let (code, out, err) = run_on(&server, &["session", "show", &format!("ses_{SES1}")], "");
     assert_eq!((code, err.as_str()), (0, ""));
-    assert!(out.starts_with(&format!("ses_{SES1}  Draft[2J the paper\n")), "{out}");
+    assert!(
+        out.starts_with(&format!("ses_{SES1}  Draft[2J the paper\n")),
+        "{out}"
+    );
     assert!(out.contains("machine: This laptop"));
     assert!(out.contains(&format!("workstream: wst_{WST1} Paper")));
     assert!(out.contains("task: PAP-1"));
@@ -146,7 +169,10 @@ fn session_show_prints_its_facts_and_recent_work() {
         .into_iter()
         .find(|r| r.route() == "GET /v1/recaps/blocks")
         .unwrap();
-    assert_eq!(asked.target, format!("/v1/recaps/blocks?session={SES1}&limit=10"));
+    assert_eq!(
+        asked.target,
+        format!("/v1/recaps/blocks?session={SES1}&limit=10")
+    );
     let (code, out, _) = run_on(&server, &["--json", "session", "show", SES1], "");
     assert_eq!(code, 0);
     let both: Value = serde_json::from_str(&out).unwrap();
@@ -168,7 +194,16 @@ fn recaps_print_their_lines_and_days_cite_themselves() {
     let server = FakeServer::tcp(reads(&[("GET /v1/recaps/days", 200, days.clone())]));
     let (code, out, err) = run_on(
         &server,
-        &["recap", "blocks", "--task", "PAP-1", "--workstream", &format!("wst_{WST1}"), "--limit", "5"],
+        &[
+            "recap",
+            "blocks",
+            "--task",
+            "PAP-1",
+            "--workstream",
+            &format!("wst_{WST1}"),
+            "--limit",
+            "5",
+        ],
         "",
     );
     assert_eq!((code, err.as_str()), (0, ""));
@@ -183,7 +218,10 @@ fn recaps_print_their_lines_and_days_cite_themselves() {
         .into_iter()
         .find(|r| r.route() == "GET /v1/recaps/blocks")
         .unwrap();
-    assert_eq!(asked.target, format!("/v1/recaps/blocks?task={TASK1}&workstream={WST1}&limit=5"));
+    assert_eq!(
+        asked.target,
+        format!("/v1/recaps/blocks?task={TASK1}&workstream={WST1}&limit=5")
+    );
 
     let (code, out, err) = run_on(&server, &["recap", "days", "--workstream", WST1], "");
     assert_eq!((code, err.as_str()), (0, ""));
@@ -191,7 +229,11 @@ fn recaps_print_their_lines_and_days_cite_themselves() {
         out,
         format!("recap:wst_{WST1}@2026-09-29  Paper\n  @writer drafted the method.\n")
     );
-    let (code, out, _) = run_on(&server, &["--json", "recap", "days", "--workstream", WST1], "");
+    let (code, out, _) = run_on(
+        &server,
+        &["--json", "recap", "days", "--workstream", WST1],
+        "",
+    );
     assert_eq!(code, 0);
     assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), days);
     for bad in [
@@ -219,7 +261,11 @@ fn activity_describes_events_by_what_they_name() {
         "from_rev": 7, "to_rev": 7, "at_start": true
     });
     let server = FakeServer::tcp(reads(&[("GET /v1/events", 200, page)]));
-    let (code, out, err) = run_on(&server, &["activity", "--session", SES1, "--limit", "3"], "");
+    let (code, out, err) = run_on(
+        &server,
+        &["activity", "--session", SES1, "--limit", "3"],
+        "",
+    );
     assert_eq!((code, err.as_str()), (0, ""));
     assert_eq!(
         out,
@@ -246,7 +292,9 @@ fn search_finds_every_word_across_kinds() {
     assert_eq!((code, err.as_str()), (0, ""));
     assert_eq!(
         out,
-        format!("Recent work:\n  2026-09-29 10:00  ses_{SES1}  @writer edited method.tex (+3 −1)\n")
+        format!(
+            "Recent work:\n  2026-09-29 10:00  ses_{SES1}  @writer edited method.tex (+3 −1)\n"
+        )
     );
     let (code, out, _) = run_on(&server, &["search", "synthetic", "pap-1"], "");
     assert_eq!(code, 0);
@@ -272,7 +320,10 @@ fn a_write_a_reader_may_not_make_exits_3() {
     let server = FakeServer::tcp(routes(&[(
         "POST /v1/tasks/PAP-1/move",
         403,
-        api_error("forbidden", "POST /v1/tasks/PAP-1/move is refused: this token may only read."),
+        api_error(
+            "forbidden",
+            "POST /v1/tasks/PAP-1/move is refused: this token may only read.",
+        ),
     )]));
     let (code, _, err) = run_on(&server, &["task", "move", "PAP-1", "done"], "");
     assert_eq!(code, 3);

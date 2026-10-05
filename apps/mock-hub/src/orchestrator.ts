@@ -485,7 +485,7 @@ function target(hub: Hub, c: Cited): { target: ReferenceTarget; label: string } 
     }
     case 'task_id':
     case 'task_key': {
-      const t = c.kind === 'task_id' ? hub.findTaskById(c.id) : hub.findTask(c.key);
+      const t = c.kind === 'task_key' ? hub.findTask(c.key) : hub.findTaskById(c.id);
       return t === undefined ? undefined : { target: { kind: 'task', id: t.id, key: t.key }, label: `${t.key} ${t.title}` };
     }
     case 'workstream': {
